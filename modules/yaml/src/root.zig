@@ -1,58 +1,65 @@
 // SPDX-License-Identifier: MIT
-//! yaml — a YAML **1.2** scanner + parser producing a streaming *event* view
-//! of a document stream (Part 1 of the module: no native-value composer yet).
+//! yaml — a YAML **1.2** reader: scanner + parser + composer, from source bytes
+//! to native `Value` trees, with core-schema tag resolution.
 //!
 //! ## Pipeline
 //!
 //! ```text
-//! bytes ──► scanner.zig ──► parser.zig ──► Event stream ──► events.zig (text)
-//!           tokens          state machine                   test-suite form
+//! bytes ─► scanner.zig ─► parser.zig ─► Event ─► compose.zig ─► Value
+//!          tokens         state machine          + core schema
+//!                                       └──────► events.zig (test-suite text)
 //! ```
 //!
-//! The three-stage split is the one every production YAML implementation
-//! converged on, and it is load-bearing rather than decorative: indentation
-//! and the "is this scalar a mapping key?" lookahead are *scanner* problems
-//! (the scanner synthesizes `BlockMappingStart`/`BlockEnd` tokens that have no
-//! textual form and splices `Key` tokens in retroactively), while node shape
-//! and implicit empty scalars are *parser* problems. Fusing them produces the
-//! classic YAML parser that cannot decide where a block ends.
+//! The staging is the one every production YAML implementation converged on,
+//! and it is load-bearing rather than decorative: indentation and the "is this
+//! scalar a mapping key?" lookahead are *scanner* problems (the scanner
+//! synthesizes `BlockMappingStart`/`BlockEnd` tokens that have no textual form
+//! and splices `Key` tokens in retroactively), node shape and implicit empty
+//! scalars are *parser* problems, and anchors, aliases and tag resolution are
+//! *composer* problems. Fusing any two produces the classic YAML parser that
+//! cannot decide where a block ends.
 //!
-//! ## Scope of this part
+//! ## Two entry points
 //!
-//! Everything up to and including events: block and flow collections, the five
-//! scalar styles with their folding/chomping rules, multi-document streams,
-//! `%YAML`/`%TAG` directives, anchors/aliases, explicit `?`/`:` keys, tag
-//! shorthands and verbatim tags. **Not** here: the composer (alias resolution
-//! into a graph), the core schema (`null`/`bool`/`int`/`float` recognition)
-//! and any native-value API. Those are Part 2 — an event consumer, not a
-//! change to this layer.
-//!
-//! ## Lifetime
-//!
-//! `Parser` owns an arena. Every slice reachable from an `Event` — scalar
-//! text, anchor names, resolved tags — lives in that arena and stays valid
-//! until `deinit()`. Events are therefore cheap to hold on to across `next()`
-//! calls, at the cost of the arena growing with the document. A consumer that
-//! must bound memory over a huge stream should copy what it needs and run one
-//! `Parser` per document.
-//!
-//! ## Verification
-//!
-//! The oracle is the **yaml-test-suite** (`github.com/yaml/yaml-test-suite`,
-//! `data` branch): 402 cases, each a byte-exact expected event dump, 94 of
-//! them inputs that must be *rejected*. `src/suite_test.zig` runs all 402 and
-//! asserts a committed ledger (`src/testdata/ledger.txt`) exactly — in both
-//! directions, so a case that starts passing without the ledger being updated
-//! fails the build just as loudly as a regression. See SPEC.md.
+//! Most callers want `composeAll` / `compose` — native `Value` trees with the
+//! YAML 1.2 core schema applied. Reach for `Parser` directly when the event
+//! stream itself is the point: streaming over a document too large to hold, or
+//! preserving distinctions the value layer deliberately drops (scalar style,
+//! which nodes were aliases, tag text on unknown tags).
 //!
 //! ```zig
+//! // values
+//! const doc = try yaml.compose(gpa, "port: 8080\nhosts: [a, b]\n", .{});
+//! defer doc.deinit();
+//! const port = doc.root.get("port").?.int; // 8080, an int — not "8080"
+//!
+//! // events
 //! var p = yaml.Parser.init(gpa, source);
 //! defer p.deinit();
 //! while (try p.next()) |ev| switch (ev) {
 //!     .scalar => |s| std.debug.print("scalar {s}\n", .{s.value}),
 //!     else => {},
-//! }
+//! };
 //! ```
+//!
+//! ## Lifetime
+//!
+//! Both layers are arena-backed. `Parser` owns an arena and every slice
+//! reachable from an `Event` lives in it until `deinit()`. `Composed`/`Single`
+//! own one too — necessarily, because aliases *share* nodes rather than copying
+//! them, and a shared DAG cannot be freed node by node. Pass your own arena to
+//! `composeAllLeaky` if you would rather own the lifetime. In every case the
+//! source slice is borrowed only for the duration of the call.
+//!
+//! ## Verification
+//!
+//! The oracle is the **yaml-test-suite** (`github.com/yaml/yaml-test-suite`,
+//! `data` branch), both layers: 402 byte-exact event dumps (94 of them inputs
+//! that must be *rejected*) and 279 `in.json` value oracles.
+//! `src/suite_test.zig` runs every case and asserts a committed ledger
+//! (`src/testdata/ledger.txt`) exactly — in both directions, so a case that
+//! starts passing without the ledger being updated fails the build just as
+//! loudly as a regression. See SPEC.md.
 
 const std = @import("std");
 
@@ -67,6 +74,7 @@ pub const meta = .{
 pub const scanner = @import("scanner.zig");
 pub const parser = @import("parser.zig");
 pub const events = @import("events.zig");
+pub const compose_mod = @import("compose.zig");
 
 pub const Parser = parser.Parser;
 pub const Event = parser.Event;
@@ -77,6 +85,20 @@ pub const Mark = parser.Mark;
 /// `error.InvalidYaml` for every malformed input; `Parser.problem` /
 /// `Parser.problem_mark` carry the human-readable detail.
 pub const Error = parser.Error;
+
+pub const Value = compose_mod.Value;
+pub const Pair = compose_mod.Pair;
+pub const Composed = compose_mod.Composed;
+pub const Single = compose_mod.Single;
+pub const ComposeOptions = compose_mod.Options;
+pub const ComposeError = compose_mod.Error;
+
+/// Compose every document in `source` into native `Value` trees (Part 2).
+pub const composeAll = compose_mod.composeAll;
+/// As `composeAll`, allocating from a caller-owned arena and freeing nothing.
+pub const composeAllLeaky = compose_mod.composeAllLeaky;
+/// Compose a stream that must hold exactly one document.
+pub const compose = compose_mod.compose;
 
 pub const Token = scanner.Token;
 pub const TokenKind = scanner.TokenKind;
@@ -105,6 +127,7 @@ test {
     _ = scanner;
     _ = parser;
     _ = events;
+    _ = compose_mod;
     _ = @import("suite_test.zig");
 }
 

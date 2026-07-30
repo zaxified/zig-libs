@@ -1,422 +1,437 @@
-# yaml-test-suite ledger — the expected outcome of THIS parser on every case of
+# yaml-test-suite ledger — the expected outcome of THIS module on every case of
 # github.com/yaml/yaml-test-suite (`data` branch), asserted by src/suite_test.zig.
 #
 # The suite itself is NOT vendored here (fetch it and point ZIG_LIBS_YAML_SUITE
 # at it, or the harness skips loudly). This file is the committed claim about it.
 #
-#   event  <id>            parses, and the dumped event stream equals test.event
-#                          byte for byte
-#   reject <id>            the suite marks this input invalid (an `error` file);
-#                          our parser must return an error for it
-#   fail   <id>  <reason>  KNOWN-FAIL — the case does NOT reach the outcome above.
-#                          A reason is mandatory and must be specific.
+# ONE ROW PER CASE, three columns, then an optional reason:
 #
-# The assertion runs in BOTH directions: a listed pass that fails is red, and a
-# known-fail that starts passing is red too. The id set must match the suite's
-# exactly, so a case appearing or disappearing upstream is also red — that is
-# what keeps this file from quietly drifting into a lie.
+#   <id>  <events>  <json>  [reason]
 #
-# 402 cases, 94 of them must-reject. Currently 402/402: there are no `fail`
-# lines. Do not add one without a specific reason.
-event   229Q
-reject  236B
-event   26DV
-event   27NA
-event   2AUY
-reject  2CMS
-event   2EBW
-reject  2G84/00
-reject  2G84/01
-event   2G84/02
-event   2G84/03
-event   2JQS
-event   2LFX
-event   2SXE
-event   2XXW
-event   33X3
-event   35KP
-event   36F6
-event   3ALJ
-event   3GZX
-reject  3HFZ
-event   3MYT
-event   3R3P
-event   3RLN/00
-event   3RLN/01
-event   3RLN/02
-event   3RLN/03
-event   3RLN/04
-event   3RLN/05
-event   3UYS
-event   4ABK
-event   4CQQ
-reject  4EJS
-event   4FJ6
-event   4GC6
-reject  4H7K
-reject  4HVU
-reject  4JVG
-event   4MUZ/00
-event   4MUZ/01
-event   4MUZ/02
-event   4Q9F
-event   4QFQ
-event   4RWC
-event   4UYU
-event   4V8U
-event   4WA9
-event   4ZYM
-event   52DL
-event   54T7
-reject  55WF
-event   565N
-event   57H4
-event   58MP
-event   5BVJ
-event   5C5M
-event   5GBF
-event   5KJE
-reject  5LLU
-event   5MUD
-event   5NYZ
-event   5T43
-reject  5TRB
-event   5TYM
-reject  5U3A
-event   5WE3
-reject  62EZ
-event   652Z
-event   65WH
-event   6BCT
-event   6BFJ
-event   6CA3
-event   6CK3
-event   6FWR
-event   6H3V
-event   6HB6
-event   6JQW
-reject  6JTT
-event   6JWB
-event   6KGN
-event   6LVF
-event   6M2F
-event   6PBE
-reject  6S55
-event   6SLA
-event   6VJK
-event   6WLZ
-event   6WPF
-event   6XDY
-event   6ZKB
-event   735Y
-event   74H7
-event   753E
-event   7A4E
-event   7BMT
-event   7BUB
-event   7FWL
-reject  7LBH
-reject  7MNF
-event   7T8X
-event   7TMG
-event   7W2P
-event   7Z25
-event   7ZZ5
-event   82AN
-event   87E4
-event   8CWC
-event   8G76
-event   8KB6
-event   8MK2
-event   8QBE
-event   8UDB
-reject  8XDJ
-event   8XYN
-event   93JH
-event   93WF
-event   96L6
-event   96NN/00
-event   96NN/01
-event   98YD
-event   9BXH
-reject  9C9N
-reject  9CWY
-event   9DXL
-event   9FMG
-reject  9HCY
-event   9J7A
-reject  9JBA
-event   9KAX
-reject  9KBC
-reject  9MAG
-reject  9MMA
-event   9MMW
-event   9MQT/00
-reject  9MQT/01
-event   9SA2
-event   9SHH
-event   9TFX
-event   9U5K
-event   9WXW
-event   9YRD
-event   A2M4
-event   A6F9
-event   A984
-event   AB8U
-event   AVM7
-event   AZ63
-event   AZW3
-event   B3HG
-reject  B63P
-reject  BD7L
-event   BEC7
-reject  BF9H
-reject  BS4K
-event   BU8L
-event   C2DT
-reject  C2SP
-event   C4HZ
-event   CC74
-event   CFD4
-reject  CML9
-event   CN3R
-event   CPZ3
-reject  CQ3W
-event   CT4Q
-reject  CTN5
-event   CUP7
-reject  CVW2
-reject  CXX2
-reject  D49Q
-event   D83L
-event   D88J
-event   D9TU
-event   DBG4
-event   DC7X
-event   DE56/00
-event   DE56/01
-event   DE56/02
-event   DE56/03
-event   DE56/04
-event   DE56/05
-event   DFF7
-event   DHP8
-event   DK3J
-reject  DK4H
-event   DK95/00
-reject  DK95/01
-event   DK95/02
-event   DK95/03
-event   DK95/04
-event   DK95/05
-reject  DK95/06
-event   DK95/07
-event   DK95/08
-reject  DMG6
-event   DWX9
-event   E76Z
-reject  EB22
-event   EHF6
-reject  EW3V
-event   EX5H
-event   EXG3
-event   F2C7
-event   F3CP
-event   F6MC
-event   F8F9
-event   FBC9
-event   FH7J
-event   FP8R
-event   FQ7F
-event   FRK4
-event   FTA2
-event   FUP4
-event   G4RS
-reject  G5U8
-reject  G7JE
-event   G992
-reject  G9HC
-reject  GDY7
-event   GH63
-reject  GT5M
-event   H2RW
-event   H3Z8
-reject  H7J7
-reject  H7TQ
-event   HM87/00
-event   HM87/01
-event   HMK4
-event   HMQ5
-reject  HRE5
-event   HS5T
-reject  HU3P
-event   HWV9
-event   J3BT
-event   J5UC
-event   J7PZ
-event   J7VC
-event   J9HZ
-event   JEF9/00
-event   JEF9/01
-event   JEF9/02
-event   JHB9
-reject  JKF3
-event   JQ4R
-event   JR7V
-event   JS2J
-event   JTV5
-reject  JY7Z
-event   K3WX
-event   K4SU
-event   K527
-event   K54U
-event   K858
-event   KH5V/00
-event   KH5V/01
-event   KH5V/02
-event   KK5P
-event   KMK3
-reject  KS4U
-event   KSS4
-event   L24T/00
-event   L24T/01
-event   L383
-event   L94M
-event   L9U5
-event   LE5A
-reject  LHL4
-event   LP6E
-event   LQZ7
-event   LX3P
-event   M29M
-event   M2N8/00
-event   M2N8/01
-event   M5C3
-event   M5DY
-event   M6YH
-event   M7A3
-event   M7NX
-event   M9B4
-event   MJS9
-reject  MUS6/00
-reject  MUS6/01
-event   MUS6/02
-event   MUS6/03
-event   MUS6/04
-event   MUS6/05
-event   MUS6/06
-event   MXS3
-event   MYW6
-event   MZX3
-reject  N4JP
-reject  N782
-event   NAT4
-event   NB6Z
-event   NHX8
-event   NJ66
-event   NKF9
-event   NP9H
-event   P2AD
-reject  P2EQ
-event   P76L
-event   P94K
-event   PBJ2
-event   PRH3
-event   PUW8
-event   PW8X
-reject  Q4CL
-event   Q5MG
-event   Q88A
-event   Q8AD
-event   Q9WF
-reject  QB6E
-event   QF4Y
-reject  QLJ7
-event   QT73
-event   R4YG
-event   R52L
-reject  RHX7
-event   RLU9
-event   RR7F
-event   RTP8
-reject  RXY3
-event   RZP5
-event   RZT7
-event   S3PD
-reject  S4GJ
-event   S4JQ
-event   S4T7
-event   S7BG
-reject  S98Z
-event   S9E8
-event   SBG9
-reject  SF5V
-event   SKE5
-event   SM9W/00
-event   SM9W/01
-reject  SR86
-event   SSW6
-reject  SU5Z
-reject  SU74
-reject  SY6V
-event   SYW4
-event   T26H
-event   T4YY
-event   T5N4
-reject  T833
-reject  TD5N
-event   TE2A
-event   TL85
-event   TS54
-event   U3C3
-event   U3XV
-reject  U44R
-reject  U99R
-event   U9NS
-event   UDM2
-event   UDR7
-event   UGM3
-event   UKK6/00
-event   UKK6/01
-event   UKK6/02
-event   UT92
-event   UV7Q
-event   V55R
-event   V9D5
-reject  VJP3/00
-event   VJP3/01
-event   W42U
-event   W4TN
-event   W5VH
-reject  W9L4
-event   WZ62
-event   X38W
-reject  X4QW
-event   X8DW
-event   XLQ9
-event   XV9V
-event   XW4D
-event   Y2GN
-reject  Y79Y/000
-event   Y79Y/001
-event   Y79Y/002
-reject  Y79Y/003
-reject  Y79Y/004
-reject  Y79Y/005
-reject  Y79Y/006
-reject  Y79Y/007
-reject  Y79Y/008
-reject  Y79Y/009
-event   Y79Y/010
-event   YD5X
-reject  YJV2
-event   Z67P
-event   Z9M4
-reject  ZCZ6
-event   ZF4X
-event   ZH7C
-event   ZK9H
-reject  ZL4Z
-reject  ZVH3
-event   ZWK4
-reject  ZXT5
+# <events> — the Part 1 event layer, against `test.event`:
+#   event    parses, and the dumped event stream equals test.event byte for byte
+#   reject   the suite marks the input invalid (an `error` file); we must error
+#   fail     KNOWN-FAIL against the above; a specific reason is mandatory
+#
+# <json> — the Part 2 compose + core-schema layer, against `in.json`:
+#   json     composes, and the value tree equals in.json (type-exact: 1, 1.0 and
+#            "1" are three different answers)
+#   none     no oracle for this case — either the suite ships no in.json (its
+#            YAML has non-string mapping keys, so it has no JSON form) or the
+#            case is a must-reject one
+#   fail     KNOWN-FAIL against in.json; a specific reason is mandatory
+#
+# Enforced in BOTH directions and cross-checked against the suite itself:
+#   - a listed pass that fails is red; a listed KNOWN-FAIL that passes is red
+#   - the id set must equal the suite's exactly
+#   - `reject` must agree with the presence of an `error` file
+#   - `json`/`fail` requires an in.json to exist; `none` requires it not to
+#     (or the case to be must-reject)
+#   - `events fail` forces `json none` — what does not parse cannot compose
+#   - a `fail` in either column requires a non-empty reason
+#
+# 402 cases. Events: 402/402. JSON: 279 cases carry an oracle (282 in.json
+# files, less the 3 that belong to must-reject cases); 29 non-error cases have
+# no JSON form at all. Do not add a `fail` without a specific reason.
+229Q      event   json
+236B      reject  none
+26DV      event   json
+27NA      event   json
+2AUY      event   json
+2CMS      reject  none
+2EBW      event   json
+2G84/00   reject  none
+2G84/01   reject  none
+2G84/02   event   json
+2G84/03   event   json
+2JQS      event   none
+2LFX      event   json
+2SXE      event   json
+2XXW      event   json
+33X3      event   json
+35KP      event   json
+36F6      event   json
+3ALJ      event   json
+3GZX      event   json
+3HFZ      reject  none
+3MYT      event   json
+3R3P      event   json
+3RLN/00   event   json
+3RLN/01   event   json
+3RLN/02   event   json
+3RLN/03   event   json
+3RLN/04   event   json
+3RLN/05   event   json
+3UYS      event   json
+4ABK      event   none
+4CQQ      event   json
+4EJS      reject  none
+4FJ6      event   none
+4GC6      event   json
+4H7K      reject  none
+4HVU      reject  none
+4JVG      reject  none
+4MUZ/00   event   json
+4MUZ/01   event   json
+4MUZ/02   event   json
+4Q9F      event   json
+4QFQ      event   json
+4RWC      event   json
+4UYU      event   json
+4V8U      event   json
+4WA9      event   json
+4ZYM      event   json
+52DL      event   json
+54T7      event   json
+55WF      reject  none
+565N      event   json
+57H4      event   json
+58MP      event   json
+5BVJ      event   json
+5C5M      event   json
+5GBF      event   json
+5KJE      event   json
+5LLU      reject  none
+5MUD      event   json
+5NYZ      event   json
+5T43      event   json
+5TRB      reject  none
+5TYM      event   json
+5U3A      reject  none
+5WE3      event   json
+62EZ      reject  none
+652Z      event   json
+65WH      event   json
+6BCT      event   json
+6BFJ      event   none
+6CA3      event   json
+6CK3      event   json
+6FWR      event   json
+6H3V      event   json
+6HB6      event   json
+6JQW      event   json
+6JTT      reject  none
+6JWB      event   json
+6KGN      event   json
+6LVF      event   json
+6M2F      event   none
+6PBE      event   none
+6S55      reject  none
+6SLA      event   json
+6VJK      event   json
+6WLZ      event   json
+6WPF      event   json
+6XDY      event   json
+6ZKB      event   json
+735Y      event   json
+74H7      event   json
+753E      event   json
+7A4E      event   json
+7BMT      event   json
+7BUB      event   json
+7FWL      event   json
+7LBH      reject  none
+7MNF      reject  none
+7T8X      event   json
+7TMG      event   json
+7W2P      event   json
+7Z25      event   json
+7ZZ5      event   json
+82AN      event   json
+87E4      event   json
+8CWC      event   json
+8G76      event   json
+8KB6      event   json
+8MK2      event   json
+8QBE      event   json
+8UDB      event   json
+8XDJ      reject  none
+8XYN      event   json
+93JH      event   json
+93WF      event   json
+96L6      event   json
+96NN/00   event   json
+96NN/01   event   json
+98YD      event   json
+9BXH      event   json
+9C9N      reject  none
+9CWY      reject  none
+9DXL      event   json
+9FMG      event   json
+9HCY      reject  none
+9J7A      event   json
+9JBA      reject  none
+9KAX      event   json
+9KBC      reject  none
+9MAG      reject  none
+9MMA      reject  none
+9MMW      event   none
+9MQT/00   event   json
+9MQT/01   reject  none
+9SA2      event   json
+9SHH      event   json
+9TFX      event   json
+9U5K      event   json
+9WXW      event   json
+9YRD      event   json
+A2M4      event   json
+A6F9      event   json
+A984      event   json
+AB8U      event   json
+AVM7      event   json
+AZ63      event   json
+AZW3      event   json
+B3HG      event   json
+B63P      reject  none
+BD7L      reject  none
+BEC7      event   json
+BF9H      reject  none
+BS4K      reject  none
+BU8L      event   json
+C2DT      event   json
+C2SP      reject  none
+C4HZ      event   json
+CC74      event   json
+CFD4      event   none
+CML9      reject  none
+CN3R      event   json
+CPZ3      event   json
+CQ3W      reject  none
+CT4Q      event   json
+CTN5      reject  none
+CUP7      event   json
+CVW2      reject  none
+CXX2      reject  none
+D49Q      reject  none
+D83L      event   json
+D88J      event   json
+D9TU      event   json
+DBG4      event   json
+DC7X      event   json
+DE56/00   event   json
+DE56/01   event   json
+DE56/02   event   json
+DE56/03   event   json
+DE56/04   event   json
+DE56/05   event   json
+DFF7      event   none
+DHP8      event   json
+DK3J      event   json
+DK4H      reject  none
+DK95/00   event   json
+DK95/01   reject  none
+DK95/02   event   json
+DK95/03   event   json
+DK95/04   event   json
+DK95/05   event   json
+DK95/06   reject  none
+DK95/07   event   json
+DK95/08   event   json
+DMG6      reject  none
+DWX9      event   json
+E76Z      event   json
+EB22      reject  none
+EHF6      event   json
+EW3V      reject  none
+EX5H      event   json
+EXG3      event   json
+F2C7      event   json
+F3CP      event   json
+F6MC      event   json
+F8F9      event   json
+FBC9      event   json
+FH7J      event   none
+FP8R      event   json
+FQ7F      event   json
+FRK4      event   none
+FTA2      event   json
+FUP4      event   json
+G4RS      event   json
+G5U8      reject  none
+G7JE      reject  none
+G992      event   json
+G9HC      reject  none
+GDY7      reject  none
+GH63      event   json
+GT5M      reject  none
+H2RW      event   json
+H3Z8      event   json
+H7J7      reject  none
+H7TQ      reject  none
+HM87/00   event   json
+HM87/01   event   json
+HMK4      event   json
+HMQ5      event   json
+HRE5      reject  none
+HS5T      event   json
+HU3P      reject  none
+HWV9      event   json
+J3BT      event   json
+J5UC      event   json
+J7PZ      event   json
+J7VC      event   json
+J9HZ      event   json
+JEF9/00   event   json
+JEF9/01   event   json
+JEF9/02   event   json
+JHB9      event   json
+JKF3      reject  none
+JQ4R      event   json
+JR7V      event   json
+JS2J      event   json
+JTV5      event   json
+JY7Z      reject  none
+K3WX      event   json
+K4SU      event   json
+K527      event   json
+K54U      event   json
+K858      event   json
+KH5V/00   event   json
+KH5V/01   event   json
+KH5V/02   event   json
+KK5P      event   none
+KMK3      event   json
+KS4U      reject  none
+KSS4      event   json
+L24T/00   event   json
+L24T/01   event   json
+L383      event   json
+L94M      event   json
+L9U5      event   json
+LE5A      event   json
+LHL4      reject  none
+LP6E      event   json
+LQZ7      event   json
+LX3P      event   none
+M29M      event   json
+M2N8/00   event   none
+M2N8/01   event   none
+M5C3      event   json
+M5DY      event   none
+M6YH      event   json
+M7A3      event   json
+M7NX      event   json
+M9B4      event   json
+MJS9      event   json
+MUS6/00   reject  none
+MUS6/01   reject  none
+MUS6/02   event   json
+MUS6/03   event   json
+MUS6/04   event   json
+MUS6/05   event   json
+MUS6/06   event   json
+MXS3      event   json
+MYW6      event   json
+MZX3      event   json
+N4JP      reject  none
+N782      reject  none
+NAT4      event   json
+NB6Z      event   json
+NHX8      event   none
+NJ66      event   json
+NKF9      event   none
+NP9H      event   json
+P2AD      event   json
+P2EQ      reject  none
+P76L      event   json
+P94K      event   json
+PBJ2      event   json
+PRH3      event   json
+PUW8      event   json
+PW8X      event   none
+Q4CL      reject  none
+Q5MG      event   json
+Q88A      event   json
+Q8AD      event   json
+Q9WF      event   none
+QB6E      reject  none
+QF4Y      event   json
+QLJ7      reject  none
+QT73      event   json
+R4YG      event   json
+R52L      event   json
+RHX7      reject  none
+RLU9      event   json
+RR7F      event   json
+RTP8      event   json
+RXY3      reject  none
+RZP5      event   none
+RZT7      event   json
+S3PD      event   none
+S4GJ      reject  none
+S4JQ      event   json
+S4T7      event   json
+S7BG      event   json
+S98Z      reject  none
+S9E8      event   json
+SBG9      event   none
+SF5V      reject  none
+SKE5      event   json
+SM9W/00   event   json
+SM9W/01   event   none
+SR86      reject  none
+SSW6      event   json
+SU5Z      reject  none
+SU74      reject  none
+SY6V      reject  none
+SYW4      event   json
+T26H      event   json
+T4YY      event   json
+T5N4      event   json
+T833      reject  none
+TD5N      reject  none
+TE2A      event   json
+TL85      event   json
+TS54      event   json
+U3C3      event   json
+U3XV      event   json
+U44R      reject  none
+U99R      reject  none
+U9NS      event   json
+UDM2      event   json
+UDR7      event   json
+UGM3      event   json
+UKK6/00   event   none
+UKK6/01   event   json
+UKK6/02   event   none
+UT92      event   json
+UV7Q      event   json
+V55R      event   json
+V9D5      event   none
+VJP3/00   reject  none
+VJP3/01   event   json
+W42U      event   json
+W4TN      event   json
+W5VH      event   json
+W9L4      reject  none
+WZ62      event   json
+X38W      event   none
+X4QW      reject  none
+X8DW      event   json
+XLQ9      event   json
+XV9V      event   json
+XW4D      event   none
+Y2GN      event   json
+Y79Y/000  reject  none
+Y79Y/001  event   json
+Y79Y/002  event   json
+Y79Y/003  reject  none
+Y79Y/004  reject  none
+Y79Y/005  reject  none
+Y79Y/006  reject  none
+Y79Y/007  reject  none
+Y79Y/008  reject  none
+Y79Y/009  reject  none
+Y79Y/010  event   json
+YD5X      event   json
+YJV2      reject  none
+Z67P      event   json
+Z9M4      event   json
+ZCZ6      reject  none
+ZF4X      event   json
+ZH7C      event   json
+ZK9H      event   json
+ZL4Z      reject  none
+ZVH3      reject  none
+ZWK4      event   json
+ZXT5      reject  none

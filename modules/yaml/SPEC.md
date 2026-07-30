@@ -8,11 +8,12 @@ expected outputs. No existing YAML implementation's source was read or ported;
 where the spec and a suite expectation appeared to disagree, the suite won and
 the reasoning is recorded at the call site.
 
-## 1. Why three stages
+## 1. Why the stages are separate
 
 ```
-bytes ──► scanner.zig ──► parser.zig ──► Event ──► events.zig (test.event text)
-          tokens          state machine
+bytes ─► scanner.zig ─► parser.zig ─► Event ─► compose.zig ─► Value
+         tokens         state machine          + core schema
+                                      └──────► events.zig (test.event text)
 ```
 
 The split is load-bearing, not decorative. Two of YAML's hardest features are
@@ -35,6 +36,11 @@ The split is load-bearing, not decorative. Two of YAML's hardest features are
 `events.zig` is deliberately separate and trivial: it is the serialization the
 external oracle speaks, and keeping it out of the parser means the event model
 is not shaped by a test format.
+
+`compose.zig` is separate for a different reason: it is the only stage that is
+*lossy*. Scalar style, which nodes were aliases and the text of unrecognised
+tags all stop existing once a `Value` exists, and a consumer that needs them has
+to be able to tap the stage below. Fusing the two would delete that option.
 
 ## 2. Termination — the invariant that matters most
 
@@ -138,7 +144,12 @@ loop, never allocate without bound on arbitrary input** (CONVENTIONS.md §7.1).
   Scalar text is passed through as bytes and never decoded, so no case can index
   past the end. Invalid UTF-8 is **not** rejected: this layer is byte-transparent
   and validation belongs to the composer.
-- *Nesting exhaustion* — bounded by `max_depth` (§2).
+- *Nesting exhaustion* — bounded by `max_depth` (§2), and independently by the
+  composer's own `Options.max_depth`, which also keeps `composeNode`'s recursion
+  off the end of the stack.
+- *Alias expansion bombs* — aliases share rather than copy, so "billion laughs"
+  composes into O(n) nodes rather than O(2^n); `Options.max_nodes` bounds the
+  total regardless. Cyclic aliases are rejected outright (§7).
 - *Quadratic behaviour* — a simple key is abandoned after 1024 characters, so
   the retroactive-insertion lookahead cannot be driven arbitrarily far.
 - *Panics generally* — `test "arbitrary input never panics"` drives 4000
@@ -150,23 +161,126 @@ loop, never allocate without bound on arbitrary input** (CONVENTIONS.md §7.1).
 ## 5. Verification
 
 The whole verification story is the external anchor, because self-written tests
-share whatever this code misreads about YAML: **402/402 of yaml-test-suite**,
-including all 94 must-reject cases, asserted against a committed ledger in both
-directions (`src/testdata/ledger.txt`, harness in `src/suite_test.zig`).
+share whatever this code misreads about YAML. yaml-test-suite anchors **both**
+layers, and one ledger (`src/testdata/ledger.txt`, harness in
+`src/suite_test.zig`) carries one row per case with all of its expected
+outcomes:
 
-The anchor was checked to be load-bearing rather than assumed: mutating the
-block-scalar chomping default from clip to strip — one character — turned **63**
-cases red, each named individually. The ledger's reverse direction was checked
-the same way: marking a passing case as a known-fail, and deleting a case from
-the ledger, are both red.
+| layer | oracle | score |
+|---|---|---|
+| events | `test.event`, byte-exact | **402/402**, incl. all 94 must-reject |
+| values | `in.json`, structural | **279/279** |
+
+279 and not 282: three `in.json` files belong to must-reject cases, where they
+are a truncated artefact rather than a pass condition — the same trap
+`test.event` sets for the event layer. A further 29 non-error cases ship no
+`in.json` at all, because their YAML has non-string mapping keys and so has no
+JSON form.
+
+**What the JSON oracle cannot police is int vs float.** JSON has one number
+type; whether a literal carries a `.` is a choice of whatever serialiser wrote
+the file. The suite settles it: `UGM3`'s YAML says `450.00` — a float beyond
+argument — and its `in.json` says `450`. Numbers are therefore compared by
+*value* across both kinds, never through a formatted string, while every
+distinction JSON genuinely makes (number vs string vs bool vs null vs array vs
+object) stays exact — which is where the core-schema bugs worth catching live.
+The int/float resolution itself is pinned by `compose.zig`'s unit tests, the
+only place it can be.
+
+Both anchors were checked to be load-bearing rather than assumed, by mutation:
+
+| mutation (one line) | cases turned red |
+|---|---|
+| block-scalar chomping default clip → strip | **63** events |
+| core schema applied to quoted scalars too | **4** json |
+| aliases resolve to `null` instead of the anchored node | **13** json |
+| core schema removed — every plain scalar stays a string | **54** json |
+
+Each failure names the case and, for the value layer, the path inside it
+(`doc0.product[0].price: yaml=float json=integer`). The ledger's other
+direction and its cross-checks were verified the same way: fabricating a
+known-fail, deleting a row, claiming a JSON oracle for a case that has none, and
+writing an incoherent row (`events fail` with a JSON claim) are each red.
 
 The suite is not vendored. It is a separate repository with its own history, and
 pinning a copy here would turn a live oracle into a stale one; the harness skips
 loudly when it is absent.
 
-## 6. Backlog
+## 6. The core schema, and what "1.2 core" excludes
 
-- **Part 2** — composer, core schema, native values, emitter (README, Deferred).
+Resolution order for an untagged **plain** scalar is null, bool, int, float,
+str (§10.2.2). Three things are worth stating because they are where a YAML
+implementation quietly becomes a 1.1 one:
+
+- **No `yes`/`no`/`on`/`off` booleans.** Only the `true`/`True`/`TRUE` and
+  `false`/`False`/`FALSE` sextet. A config reader that treats `no` as false is
+  reading 1.1.
+- **No bare-leading-zero octal, and no sexagesimals.** `0777` matches
+  `[-+]?[0-9]+` and is decimal **777**; octal is spelled `0o777`. `1:30` is a
+  string.
+- **Only plain scalars are resolved at all.** `"true"`, `'42'` and any literal
+  or folded block scalar are strings whatever they spell.
+
+The float *shape* is validated here rather than delegated to
+`std.fmt.parseFloat`, which is far more permissive: it accepts bare `inf`,
+`nan` and hex floats, none of which the core schema resolves as numbers. Only
+`.inf`/`.nan` (with their case variants) are float.
+
+An explicit tag overrides resolution. A tag the core schema does not know —
+`!foo`, `!<!bar>`, `tag:example.com,2000:app/light` — leaves the scalar as its
+literal text: only the application that defined the tag can say what it means,
+and guessing is worse than handing over the bytes. The suite agrees (`5TYM`,
+`CC74`, `6WLZ`, `7FWL`).
+
+## 7. Cyclic aliases — rejected, deliberately
+
+YAML 1.2 §3.2.1 permits a **cyclic** representation graph: an alias may name an
+ancestor, as in `&a [ *a ]`. This composer rejects that with
+`error.AliasCycle`. The decision, and why it is not merely the easy option:
+
+1. **A cyclic `Value` is unusable by its own consumers.** `Value` is a by-value
+   union that any Zig program can walk with ordinary recursion. Admit cycles and
+   every consumer — equality, serialization, a config reader looking for one
+   key — must carry a visited-set or hang. That cost lands on every user of the
+   API to serve a construct essentially no real document uses.
+2. **Rejection is a security posture, not just a simplification.** A cyclic
+   alias is an unbounded-expansion primitive; any consumer that walks the graph
+   without expecting cycles becomes a hang or an OOM on hostile input.
+3. **No oracle requires the alternative.** JSON cannot represent a cycle, so no
+   `in.json` case in the suite exercises one, and nothing was traded away to get
+   the score in §5.
+
+The detection is **structural rather than a graph search**: a collection
+registers its anchor *before* composing its children, marked in-progress, and an
+alias that resolves to an in-progress anchor is by definition an ancestor
+reference. A cycle is therefore never constructed in the first place, which is
+precisely what lets `Value` stay a plain by-value union.
+
+Aliases that are *not* cycles **share** the anchored node rather than copying
+it. That is also the defence against the "billion laughs" bomb (`&a [x,x]`,
+`&b [*a,*a]`, `&c [*b,*b]`, …): each alias costs one union copy, so an input
+that would expand to 2^n nodes composes into n. A consumer that walks the DAG
+*as if* it were a tree still sees 2^n paths — inherent to the format, and why
+`Options.max_nodes` exists as a second bound.
+
+## 8. Integer range — the one place resolution is lossy
+
+`Value.int` is an `i64`. An int-shaped scalar that does not fit stays a
+**string** holding its exact original text, tagged or not.
+
+The alternative that had to be ruled out is worse and was live in an early
+draft: `parseFloat` accepts bare digits, so falling through to the float branch
+turned `123456789012345678901234567890` into `1.2345678901234568e29` — a silent,
+lossy reinterpretation of a value the schema says is an integer. Testing int by
+*shape* first, and never falling through on a shape match, is what prevents it.
+
+No suite case exercises this (the corpus has no oversized integers), so the unit
+test in `compose.zig` is the only thing keeping the behaviour deliberate. A
+consumer needing bignums has the exact text and can parse it itself.
+
+## 9. Backlog
+
+- **Emitter, `parseInto(T, …)`, schemas beyond core** — see README, Deferred.
 - **Fuzz harness.** The module ships an adversarial-input test but not yet a
   `std.testing.fuzz` target wired into the repo's fuzz corpus, which is where a
   parser of this size belongs.
