@@ -1,0 +1,851 @@
+{
+ "cases": {
+  "adjacent_string_literals": {
+   "out": "foobar",
+   "status": "ok"
+  },
+  "arith_basic": {
+   "out": "3|-3|12",
+   "status": "ok"
+  },
+  "attribute_access": {
+   "out": "7",
+   "status": "ok"
+  },
+  "autoescape_filter_block": {
+   "out": "&LT;B&GT;",
+   "status": "ok"
+  },
+  "bool_arithmetic": {
+   "out": "2|3|1",
+   "status": "ok"
+  },
+  "chained_filters_on_dict": {
+   "out": "('a', 2)",
+   "status": "ok"
+  },
+  "comment_multiline": {
+   "out": "ab",
+   "status": "ok"
+  },
+  "comment_removed": {
+   "out": "ab",
+   "status": "ok"
+  },
+  "compare_chained": {
+   "out": "True|False|True",
+   "status": "ok"
+  },
+  "compare_lists": {
+   "out": "True|True",
+   "status": "ok"
+  },
+  "compare_mismatched_types_errors": {
+   "kind": "TypeError",
+   "msg": "'<' not supported between instances of 'int' and 'str'",
+   "status": "error"
+  },
+  "compare_ops": {
+   "out": "True|True|False|True|True|True",
+   "status": "ok"
+  },
+  "compare_strings": {
+   "out": "True|True",
+   "status": "ok"
+  },
+  "concat_with_none": {
+   "out": "[Nonex]|[12]",
+   "status": "ok"
+  },
+  "conditional_expression": {
+   "out": "yes|no",
+   "status": "ok"
+  },
+  "conditional_nested": {
+   "out": "b",
+   "status": "ok"
+  },
+  "conditional_without_else": {
+   "out": "[]|[a]",
+   "status": "ok"
+  },
+  "config_acl_with_namespace": {
+   "out": "10 permit ip any any\n20 deny tcp 10.0.0.0/8 any\n",
+   "status": "ok"
+  },
+  "config_interfaces": {
+   "out": "hostname sw1\n!\ninterface Gi0/1\n description uplink\n ip address 10.0.0.1 255.255.255.0\n no shutdown\n!\ninterface Gi0/2\n no ip address\n shutdown\n!\n",
+   "status": "ok"
+  },
+  "config_json_payload": {
+   "out": "{\"name\": \"a\\\"b\", \"tags\": [\"x\", \"y\"]}",
+   "status": "ok"
+  },
+  "crlf_trailing_dropped": {
+   "out": "line",
+   "status": "ok"
+  },
+  "dict_items_render_directly": {
+   "out": "[('a', 1)]",
+   "status": "ok"
+  },
+  "dict_literal_trailing_close": {
+   "out": "1",
+   "status": "ok"
+  },
+  "dict_methods": {
+   "out": "['a', 'b']|[1, 2]|1|dflt",
+   "status": "ok"
+  },
+  "div_by_zero_errors": {
+   "kind": "ZeroDivisionError",
+   "msg": "division by zero",
+   "status": "error"
+  },
+  "dot_integer_index": {
+   "out": "20",
+   "status": "ok"
+  },
+  "escape_filter_when_off": {
+   "out": "&lt;b&gt;",
+   "status": "ok"
+  },
+  "escape_forceescape_double": {
+   "out": "&lt;b&gt;",
+   "status": "ok"
+  },
+  "escape_join_escapes_items": {
+   "out": "&lt;a&gt;&lt;&gt;&lt;b&gt;",
+   "status": "ok"
+  },
+  "escape_markup_add": {
+   "out": "<b>&lt;i&gt;",
+   "status": "ok"
+  },
+  "escape_markup_concat": {
+   "out": "<b>&lt;i&gt;",
+   "status": "ok"
+  },
+  "escape_non_string_values": {
+   "out": "[&#39;&lt;a&gt;&#39;]",
+   "status": "ok"
+  },
+  "escape_off_passes_through": {
+   "out": "<b>&'\"",
+   "status": "ok"
+  },
+  "escape_on_escapes": {
+   "out": "&lt;b&gt;&amp;&#39;&#34;",
+   "status": "ok"
+  },
+  "escape_on_safe": {
+   "out": "<b>",
+   "status": "ok"
+  },
+  "escape_safe_then_escape_is_noop": {
+   "out": "<b>",
+   "status": "ok"
+  },
+  "escape_set_block_is_markup": {
+   "out": "&lt;b&gt;",
+   "status": "ok"
+  },
+  "escape_tojson_is_safe": {
+   "out": "{\"k\": \"\\u003cv\\u003e\"}",
+   "status": "ok"
+  },
+  "escape_upper_preserves_markup": {
+   "out": "<B>X",
+   "status": "ok"
+  },
+  "escape_xmlattr": {
+   "out": "<a href=\"a&amp;b\">",
+   "status": "ok"
+  },
+  "filter_abs_round": {
+   "out": "3|2.0|4.0|2.67|3.0|2.0",
+   "status": "ok"
+  },
+  "filter_arg_evaluation_order": {
+   "out": "y",
+   "status": "ok"
+  },
+  "filter_batch": {
+   "out": "[[1, 2], [3, 4], [5]]|[[1, 2], [3, 0]]",
+   "status": "ok"
+  },
+  "filter_block": {
+   "out": "QUIET",
+   "status": "ok"
+  },
+  "filter_capitalize_title": {
+   "out": "Hello world|Hello World",
+   "status": "ok"
+  },
+  "filter_center": {
+   "out": "[   ab  ]",
+   "status": "ok"
+  },
+  "filter_chain": {
+   "out": "heLLo",
+   "status": "ok"
+  },
+  "filter_default": {
+   "out": "[D]|[]|[D]",
+   "status": "ok"
+  },
+  "filter_default_short": {
+   "out": "5",
+   "status": "ok"
+  },
+  "filter_default_then_arithmetic": {
+   "out": "2",
+   "status": "ok"
+  },
+  "filter_dictsort": {
+   "out": "[('A', 2), ('b', 1)]|[('b', 1), ('A', 2)]",
+   "status": "ok"
+  },
+  "filter_first_last_list": {
+   "out": "['a', 'b', 'c']|1|3",
+   "status": "ok"
+  },
+  "filter_indent": {
+   "out": "[a\n  b\n  c]",
+   "status": "ok"
+  },
+  "filter_indent_first": {
+   "out": "[  a\n  b]",
+   "status": "ok"
+  },
+  "filter_int_float": {
+   "out": "42|0|9|1|3|2.5|1.5",
+   "status": "ok"
+  },
+  "filter_items": {
+   "out": "[('b', 1), ('a', 2)]",
+   "status": "ok"
+  },
+  "filter_join_attribute": {
+   "out": "1, 2",
+   "status": "ok"
+  },
+  "filter_join_plain": {
+   "out": "ab|1+2",
+   "status": "ok"
+  },
+  "filter_length_count": {
+   "out": "3|3|1",
+   "status": "ok"
+  },
+  "filter_map_attribute": {
+   "out": "1,2",
+   "status": "ok"
+  },
+  "filter_map_name": {
+   "out": "A,B",
+   "status": "ok"
+  },
+  "filter_min_max": {
+   "out": "1|3|A",
+   "status": "ok"
+  },
+  "filter_on_expression": {
+   "out": "3",
+   "status": "ok"
+  },
+  "filter_rejectattr": {
+   "out": "1",
+   "status": "ok"
+  },
+  "filter_replace": {
+   "out": "bbb|bba",
+   "status": "ok"
+  },
+  "filter_reverse": {
+   "out": "[3, 2, 1]|cba",
+   "status": "ok"
+  },
+  "filter_round_ties_and_precision": {
+   "out": "0.0|2.0|-2.0|1.0|2.35|0.07812|1200|1200",
+   "status": "ok"
+  },
+  "filter_select_reject": {
+   "out": "[1, 3]|[2, 4]",
+   "status": "ok"
+  },
+  "filter_select_truthy": {
+   "out": "[1, 2]",
+   "status": "ok"
+  },
+  "filter_selectattr": {
+   "out": "1",
+   "status": "ok"
+  },
+  "filter_selectattr_test": {
+   "out": "2,3",
+   "status": "ok"
+  },
+  "filter_slice": {
+   "out": "[[1, 2], [3, 4], [5]]",
+   "status": "ok"
+  },
+  "filter_sort_case_sensitive": {
+   "out": "A,b,c",
+   "status": "ok"
+  },
+  "filter_sort_default_is_case_insensitive": {
+   "out": "A,b,c",
+   "status": "ok"
+  },
+  "filter_sort_reverse_attribute": {
+   "out": "3,2,1",
+   "status": "ok"
+  },
+  "filter_string": {
+   "out": "42!",
+   "status": "ok"
+  },
+  "filter_striptags": {
+   "out": "bold and & more",
+   "status": "ok"
+  },
+  "filter_sum": {
+   "out": "6|3|0",
+   "status": "ok"
+  },
+  "filter_tojson_escapes": {
+   "out": "\"\\u003ca\\u003e\\u0026\\u0027\\\"\\n\"",
+   "status": "ok"
+  },
+  "filter_tojson_indent": {
+   "out": "{\n  \"a\": [\n    1,\n    2\n  ]\n}",
+   "status": "ok"
+  },
+  "filter_tojson_scalars": {
+   "out": "{\"a\": \"x\", \"b\": 1, \"c\": [true, null, 1.5]}",
+   "status": "ok"
+  },
+  "filter_trim": {
+   "out": "[pad]|[hi]",
+   "status": "ok"
+  },
+  "filter_truncate": {
+   "out": "the...|the quick...",
+   "status": "ok"
+  },
+  "filter_unique": {
+   "out": "a,b|a,A,b",
+   "status": "ok"
+  },
+  "filter_upper_lower": {
+   "out": "MIXED|mixed",
+   "status": "ok"
+  },
+  "filter_urlencode": {
+   "out": "a%20b/c%3Fd%3De",
+   "status": "ok"
+  },
+  "filter_wordcount": {
+   "out": "4",
+   "status": "ok"
+  },
+  "floordiv_float": {
+   "out": "3.0|-4.0",
+   "status": "ok"
+  },
+  "floordiv_negatives": {
+   "out": "3|-4|-4|3",
+   "status": "ok"
+  },
+  "for_basic": {
+   "out": "1,2,3,",
+   "status": "ok"
+  },
+  "for_else_empty": {
+   "out": "none",
+   "status": "ok"
+  },
+  "for_filtered_else": {
+   "out": "none",
+   "status": "ok"
+  },
+  "for_filtered_length": {
+   "out": "1:1/3 3:2/3 5:3/3 ",
+   "status": "ok"
+  },
+  "for_loop_changed": {
+   "out": "True False True False True ",
+   "status": "ok"
+  },
+  "for_loop_cycle": {
+   "out": "odd even odd even odd ",
+   "status": "ok"
+  },
+  "for_loop_fields": {
+   "out": "1/0/3/2/True/False/3 2/1/2/1/False/False/3 3/2/1/0/False/True/3 ",
+   "status": "ok"
+  },
+  "for_loop_previtem_nextitem": {
+   "out": "[-<1>2][1<2>3][2<3>-]",
+   "status": "ok"
+  },
+  "for_nested_loop_shadows": {
+   "out": "x1:1/2 x2:2/2 |y1:1/2 y2:2/2 |",
+   "status": "ok"
+  },
+  "for_nested_outer_loop_saved": {
+   "out": "1.1 1.2 2.1 2.2 ",
+   "status": "ok"
+  },
+  "for_over_dict_yields_keys": {
+   "out": "b,a,",
+   "status": "ok"
+  },
+  "for_over_items_unpack": {
+   "out": "b=1;a=2;",
+   "status": "ok"
+  },
+  "for_over_range": {
+   "out": "012|25|321",
+   "status": "ok"
+  },
+  "for_over_string": {
+   "out": "[a][b][c]",
+   "status": "ok"
+  },
+  "for_over_undefined_errors_strict": {
+   "kind": "UndefinedError",
+   "msg": "'nope' is undefined",
+   "status": "error"
+  },
+  "for_over_undefined_is_empty_lenient": {
+   "out": "[]",
+   "status": "ok"
+  },
+  "global_dict": {
+   "out": "{'a': 1, 'b': 2}",
+   "status": "ok"
+  },
+  "global_range_repr": {
+   "out": "[0, 1, 2]",
+   "status": "ok"
+  },
+  "if_elif_else": {
+   "out": "mid",
+   "status": "ok"
+  },
+  "if_falsey_values": {
+   "out": "-",
+   "status": "ok"
+  },
+  "if_nested": {
+   "out": "a",
+   "status": "ok"
+  },
+  "in_operator": {
+   "out": "True|True|True|True",
+   "status": "ok"
+  },
+  "index_out_of_range_is_undefined": {
+   "out": "[]",
+   "status": "ok"
+  },
+  "list_concat_repeat": {
+   "out": "[1, 2, 3]|[0, 0, 0]",
+   "status": "ok"
+  },
+  "list_literal": {
+   "out": "1-2-3",
+   "status": "ok"
+  },
+  "list_methods": {
+   "out": "2|2",
+   "status": "ok"
+  },
+  "logic_returns_operand": {
+   "out": "[x]|[None]|[2]|[0]",
+   "status": "ok"
+  },
+  "loop_index_inside_if": {
+   "out": "2;3;",
+   "status": "ok"
+  },
+  "loop_var_does_not_leak": {
+   "out": "[gone]",
+   "status": "ok"
+  },
+  "map_string_then_join": {
+   "out": "1+2|abc",
+   "status": "ok"
+  },
+  "missing_key_is_undefined": {
+   "out": "[]",
+   "status": "ok"
+  },
+  "mod_by_zero_errors": {
+   "kind": "ZeroDivisionError",
+   "msg": "division by zero",
+   "status": "error"
+  },
+  "mod_float": {
+   "out": "1.5|0.5",
+   "status": "ok"
+  },
+  "mod_negatives": {
+   "out": "1|1|-1|-1",
+   "status": "ok"
+  },
+  "namespace_survives_loop": {
+   "out": "6",
+   "status": "ok"
+  },
+  "nested_loop_first_last": {
+   "out": "TrueFalse FalseTrue TrueFalse|TrueFalse FalseTrue FalseTrue|",
+   "status": "ok"
+  },
+  "not_binds_looser_than_compare": {
+   "out": "True",
+   "status": "ok"
+  },
+  "number_forms": {
+   "out": "31|15|5|1000|150.0",
+   "status": "ok"
+  },
+  "out_dict_repr": {
+   "out": "{'a': 1, 'b': [2, 3]}",
+   "status": "ok"
+  },
+  "out_float_big": {
+   "out": "1e+100|1.5e-08",
+   "status": "ok"
+  },
+  "out_float_exponent": {
+   "out": "1e+16|1000000000000000.0|1e-05|0.0001",
+   "status": "ok"
+  },
+  "out_float_integral": {
+   "out": "1.0|3.0|-2.0",
+   "status": "ok"
+  },
+  "out_float_repr": {
+   "out": "0.1|1.5|0.6666666666666666",
+   "status": "ok"
+  },
+  "out_int": {
+   "out": "42",
+   "status": "ok"
+  },
+  "out_list_repr": {
+   "out": "[1, 'a', True, None]",
+   "status": "ok"
+  },
+  "out_negative_int": {
+   "out": "-7",
+   "status": "ok"
+  },
+  "out_nested_repr": {
+   "out": "{'k': ['a', 1.5, None]}",
+   "status": "ok"
+  },
+  "out_none": {
+   "out": "[None]|[None]",
+   "status": "ok"
+  },
+  "out_str_repr_quotes": {
+   "out": "[\"it's\", 'say \"hi\"', 'a\\nb']",
+   "status": "ok"
+  },
+  "out_string": {
+   "out": "hi",
+   "status": "ok"
+  },
+  "out_true": {
+   "out": "True|True|False",
+   "status": "ok"
+  },
+  "plain_text": {
+   "out": "hello world",
+   "status": "ok"
+  },
+  "power": {
+   "out": "1024|1|0.5",
+   "status": "ok"
+  },
+  "precedence_mixed": {
+   "out": "5.0",
+   "status": "ok"
+  },
+  "raw_block": {
+   "out": "{{ not_a_var }} {% if %}",
+   "status": "ok"
+  },
+  "raw_with_whitespace_control": {
+   "out": "a{{x}}b",
+   "status": "ok"
+  },
+  "set_basic": {
+   "out": "5",
+   "status": "ok"
+  },
+  "set_block": {
+   "out": "[hi bob]",
+   "status": "ok"
+  },
+  "set_block_filtered": {
+   "out": "[HI]",
+   "status": "ok"
+  },
+  "set_in_for_does_not_leak": {
+   "out": "0",
+   "status": "ok"
+  },
+  "set_in_for_visible_within_loop": {
+   "out": "246",
+   "status": "ok"
+  },
+  "set_in_if_leaks": {
+   "out": "2",
+   "status": "ok"
+  },
+  "set_tuple": {
+   "out": "12",
+   "status": "ok"
+  },
+  "slice_basic": {
+   "out": "[1, 2]|[0, 1]|[2, 3, 4]",
+   "status": "ok"
+  },
+  "slice_negative_and_step": {
+   "out": "[3, 4]|[0, 2, 4]|[4, 3, 2, 1, 0]",
+   "status": "ok"
+  },
+  "slice_step_zero_errors": {
+   "kind": "ValueError",
+   "msg": "slice step cannot be zero",
+   "status": "error"
+  },
+  "slice_string": {
+   "out": "bcd|fedcba",
+   "status": "ok"
+  },
+  "strict_default_filter_still_works": {
+   "out": "ok",
+   "status": "ok"
+  },
+  "strict_defined_test_still_works": {
+   "out": "False|True",
+   "status": "ok"
+  },
+  "strict_if_errors": {
+   "kind": "UndefinedError",
+   "msg": "'missing' is undefined",
+   "status": "error"
+  },
+  "strict_output_errors": {
+   "kind": "UndefinedError",
+   "msg": "'missing' is undefined",
+   "status": "error"
+  },
+  "strict_present_value_fine": {
+   "out": "1",
+   "status": "ok"
+  },
+  "string_concat_plus": {
+   "out": "ab",
+   "status": "ok"
+  },
+  "string_escapes": {
+   "out": "a\tb\nc|q\"q",
+   "status": "ok"
+  },
+  "string_index": {
+   "out": "h|o",
+   "status": "ok"
+  },
+  "string_join_method": {
+   "out": "a-b",
+   "status": "ok"
+  },
+  "string_methods": {
+   "out": "HELLO|True|['he', '', 'o']|heLLo|2",
+   "status": "ok"
+  },
+  "string_multiplied_by_zero": {
+   "out": "[]|[]",
+   "status": "ok"
+  },
+  "string_repeat": {
+   "out": "-----|ababab",
+   "status": "ok"
+  },
+  "subscript_int": {
+   "out": "10|30",
+   "status": "ok"
+  },
+  "subscript_string_key": {
+   "out": "1",
+   "status": "ok"
+  },
+  "sum_with_start": {
+   "out": "16",
+   "status": "ok"
+  },
+  "tag_at_very_start_and_end": {
+   "out": "1mid2",
+   "status": "ok"
+  },
+  "test_comparison_tests": {
+   "out": "True|False|True|True",
+   "status": "ok"
+  },
+  "test_defined_undefined": {
+   "out": "True|False|True",
+   "status": "ok"
+  },
+  "test_even_odd_divisibleby": {
+   "out": "True|False|True|False",
+   "status": "ok"
+  },
+  "test_in": {
+   "out": "True|False",
+   "status": "ok"
+  },
+  "test_negated_in_condition": {
+   "out": "no",
+   "status": "ok"
+  },
+  "test_none": {
+   "out": "True|False|False",
+   "status": "ok"
+  },
+  "test_types": {
+   "out": "True|True|True|True|True|True|True",
+   "status": "ok"
+  },
+  "test_upper_lower": {
+   "out": "True|False|True",
+   "status": "ok"
+  },
+  "text_with_braces": {
+   "out": "a { b } c {not-a-tag} d",
+   "status": "ok"
+  },
+  "tilde_concat_mixed": {
+   "out": "n=5/True",
+   "status": "ok"
+  },
+  "trailing_newline_dropped": {
+   "out": "line",
+   "status": "ok"
+  },
+  "trailing_newline_kept": {
+   "out": "line\n",
+   "status": "ok"
+  },
+  "true_division_is_float": {
+   "out": "2.0|3.5|-3.5",
+   "status": "ok"
+  },
+  "unary_minus_binds_after_pow": {
+   "out": "4",
+   "status": "ok"
+  },
+  "undefined_arithmetic_errors_lenient": {
+   "kind": "UndefinedError",
+   "msg": "'missing' is undefined",
+   "status": "error"
+  },
+  "undefined_attribute_errors_lenient": {
+   "kind": "UndefinedError",
+   "msg": "'missing' is undefined",
+   "status": "error"
+  },
+  "undefined_default_filter_lenient": {
+   "out": "ok",
+   "status": "ok"
+  },
+  "undefined_equality_lenient": {
+   "out": "True|False|False",
+   "status": "ok"
+  },
+  "undefined_is_falsey_lenient": {
+   "out": "no",
+   "status": "ok"
+  },
+  "undefined_iteration_is_empty_lenient": {
+   "out": "[[]]",
+   "status": "ok"
+  },
+  "undefined_renders_empty_lenient": {
+   "out": "[]",
+   "status": "ok"
+  },
+  "whitespace_only_template": {
+   "out": "   \n   ",
+   "status": "ok"
+  },
+  "with_scope": {
+   "out": "1[gone]",
+   "status": "ok"
+  },
+  "ws_both_options": {
+   "out": "x\n  body\ny",
+   "status": "ok"
+  },
+  "ws_comment_dash": {
+   "out": "ab",
+   "status": "ok"
+  },
+  "ws_dash_beats_options": {
+   "out": "xbodyy",
+   "status": "ok"
+  },
+  "ws_dash_both": {
+   "out": "abc",
+   "status": "ok"
+  },
+  "ws_dash_left": {
+   "out": "ab",
+   "status": "ok"
+  },
+  "ws_dash_right": {
+   "out": "b",
+   "status": "ok"
+  },
+  "ws_loop_trim_blocks": {
+   "out": "1\n2\n",
+   "status": "ok"
+  },
+  "ws_lstrip_blocks": {
+   "out": "x\n\n  body\n\ny",
+   "status": "ok"
+  },
+  "ws_lstrip_not_for_output_tags": {
+   "out": "x\n    1\ny",
+   "status": "ok"
+  },
+  "ws_output_dash": {
+   "out": "axb",
+   "status": "ok"
+  },
+  "ws_plus_defeats_trim": {
+   "out": "\nline\n",
+   "status": "ok"
+  },
+  "ws_realistic_config": {
+   "out": "interface Gi0/1\n vlan 10\n vlan 20\n!",
+   "status": "ok"
+  },
+  "ws_trim_blocks": {
+   "out": "line\ntail",
+   "status": "ok"
+  },
+  "ws_trim_blocks_off": {
+   "out": "\nline\n\ntail",
+   "status": "ok"
+  }
+ },
+ "jinja2": "3.1.6",
+ "python": "3.14.4"
+}

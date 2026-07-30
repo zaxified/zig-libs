@@ -157,6 +157,7 @@ const module_list = [_]Module{
     .{ .name = "diagnostics" },
     .{ .name = "json5" },
     .{ .name = "yaml" },
+    .{ .name = "jinja" },
     .{ .name = "cbor" },
     .{ .name = "protobuf" },
     .{ .name = "grpc", .deps = &.{ "http", "protobuf" } },

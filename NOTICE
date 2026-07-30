@@ -893,4 +893,18 @@ re-examined 2026-07-29 (both recorded in the project git history).
                one place where an upstream artifact is carried rather than
                reproduced, and `modules/rescue/SPEC.md` says so.
 
+`jinja`    —  clean-room from the Jinja2 documentation (the template-designer
+               and API docs at jinja.palletsprojects.com) plus the observable
+               behaviour of the installed reference implementation. NO Jinja2
+               (or MarkupSafe) source was read or ported. Python Jinja2 3.1.6
+               is used as a byte-exact black-box test ORACLE — the policy §0
+               relationship, needing no attribution — and is recorded here for
+               provenance because the module's behaviour, operator precedence,
+               filter/test vocabulary and API shape are deliberately modelled
+               on it (pallets/jinja, BSD-3-Clause; pallets/markupsafe,
+               BSD-3-Clause — behaviour only, no source copied). The Python
+               language semantics reproduced along the way (floored `//`/`%`,
+               `repr` forms, banker's rounding) are facts of a published
+               language specification, not of any implementation.
+
 See each module's README "Provenance" note for its specific design references.

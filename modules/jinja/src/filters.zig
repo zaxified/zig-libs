@@ -1,0 +1,1490 @@
+// SPDX-License-Identifier: MIT
+//! The built-in filters, tests and value methods.
+//!
+//! Every name here is resolved at **compile time** by the parser, so a template
+//! that mentions a filter this table does not have fails when it is compiled,
+//! never mid-render. README.md carries the full table of what is present and
+//! SPEC.md the table of what is deliberately absent; nothing is silently
+//! approximated.
+
+const std = @import("std");
+const value = @import("value.zig");
+
+const Value = value.Value;
+
+pub const Error = value.Error;
+
+pub const Kwarg = struct {
+    name: []const u8,
+    value: Value,
+};
+
+pub const Args = struct {
+    pos: []const Value = &.{},
+    kw: []const Kwarg = &.{},
+
+    /// The `i`-th positional argument, or the keyword of that name.
+    pub fn get(self: Args, i: usize, name: []const u8) ?Value {
+        if (i < self.pos.len) return self.pos[i];
+        for (self.kw) |k| if (std.mem.eql(u8, k.name, name)) return k.value;
+        return null;
+    }
+
+    pub fn byName(self: Args, name: []const u8) ?Value {
+        for (self.kw) |k| if (std.mem.eql(u8, k.name, name)) return k.value;
+        return null;
+    }
+};
+
+pub const Ctx = struct {
+    arena: std.mem.Allocator,
+    autoescape: bool,
+    /// Under the strict policy a filter must refuse an undefined input rather
+    /// than quietly turning it into `""`.
+    strict: bool,
+    user: *const anyopaque,
+    callFilter: *const fn (ctx: *Ctx, name: []const u8, input: Value, args: Args) Error!Value,
+    callTest: *const fn (ctx: *Ctx, name: []const u8, input: Value, args: Args) Error!bool,
+
+    /// `str(v)`, refusing undefined when the policy is strict. This is the one
+    /// place the undefined policy reaches the filter library.
+    pub fn toStr(self: *Ctx, v: Value) Error![]const u8 {
+        if (v == .undef and self.strict) return error.UndefinedValue;
+        return value.strAlloc(self.arena, v);
+    }
+};
+
+pub const Fn = *const fn (ctx: *Ctx, input: Value, args: Args) Error!Value;
+pub const TestFn = *const fn (ctx: *Ctx, input: Value, args: Args) Error!bool;
+
+pub const Entry = struct { name: []const u8, func: Fn };
+pub const TestEntry = struct { name: []const u8, func: TestFn };
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+fn intArg(v: Value, dflt: i64) Error!i64 {
+    return switch (v) {
+        .integer => |i| i,
+        .boolean => |b| @intFromBool(b),
+        .float => |f| @intFromFloat(f),
+        .none, .undef => dflt,
+        else => error.BadArgument,
+    };
+}
+
+fn boolArg(args: Args, i: usize, name: []const u8, dflt: bool) bool {
+    const v = args.get(i, name) orelse return dflt;
+    return v.truthy();
+}
+
+fn strArg(ctx: *Ctx, args: Args, i: usize, name: []const u8, dflt: []const u8) Error![]const u8 {
+    const v = args.get(i, name) orelse return dflt;
+    return ctx.toStr(v);
+}
+
+fn markupAware(ctx: *Ctx, input: Value, bytes: []const u8) Value {
+    const safe = ctx.autoescape and input == .string and input.string.safe;
+    return .{ .string = .{ .bytes = bytes, .safe = safe } };
+}
+
+/// The elements a sequence filter works on.
+fn seq(ctx: *Ctx, v: Value) Error![]const Value {
+    // Matches the reference: its default `Undefined` is an empty iterable, so
+    // `missing|list` is `[]`; `StrictUndefined` refuses.
+    if (v == .undef) return if (ctx.strict) error.UndefinedValue else &.{};
+    return value.iterate(ctx.arena, v);
+}
+
+/// `attribute=` support, shared by sort/min/max/sum/unique/map/groupby-likes.
+/// A dotted path (`a.b`) and an integer index both work, as in the reference.
+fn attrOf(ctx: *Ctx, item: Value, spec: Value) Error!Value {
+    switch (spec) {
+        .integer => |i| {
+            const items = value.iterate(ctx.arena, item) catch return .{ .undef = .{ .name = "index" } };
+            if (i < 0 or i >= items.len) return .{ .undef = .{ .name = "index" } };
+            return items[@intCast(i)];
+        },
+        .string => |s| {
+            var cur = item;
+            var it = std.mem.splitScalar(u8, s.bytes, '.');
+            while (it.next()) |part| {
+                if (std.fmt.parseInt(i64, part, 10) catch null) |idx| {
+                    const items = value.iterate(ctx.arena, cur) catch return .{ .undef = .{ .name = part } };
+                    if (idx < 0 or idx >= items.len) return .{ .undef = .{ .name = part } };
+                    cur = items[@intCast(idx)];
+                    continue;
+                }
+                cur = switch (cur) {
+                    .map => |m| m.get(part) orelse return .{ .undef = .{ .name = part } },
+                    .namespace => |ns| ns.get(part) orelse return .{ .undef = .{ .name = part } },
+                    else => return .{ .undef = .{ .name = part } },
+                };
+            }
+            return cur;
+        },
+        else => return error.BadArgument,
+    }
+}
+
+// ── string filters ──────────────────────────────────────────────────────────
+
+fn fUpper(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const s = try ctx.toStr(input);
+    const out = try ctx.arena.dupe(u8, s);
+    for (out) |*c| c.* = std.ascii.toUpper(c.*);
+    return markupAware(ctx, input, out);
+}
+
+fn fLower(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const s = try ctx.toStr(input);
+    const out = try ctx.arena.dupe(u8, s);
+    for (out) |*c| c.* = std.ascii.toLower(c.*);
+    return markupAware(ctx, input, out);
+}
+
+fn fCapitalize(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const s = try ctx.toStr(input);
+    const out = try ctx.arena.dupe(u8, s);
+    for (out, 0..) |*c, i| c.* = if (i == 0) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
+    return Value.str(out);
+}
+
+fn fTitle(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const s = try ctx.toStr(input);
+    const out = try ctx.arena.dupe(u8, s);
+    var at_start = true;
+    for (out) |*c| {
+        const alpha = std.ascii.isAlphabetic(c.*) or c.* == '\'';
+        if (at_start) c.* = std.ascii.toUpper(c.*) else c.* = std.ascii.toLower(c.*);
+        at_start = !alpha;
+    }
+    return Value.str(out);
+}
+
+fn fTrim(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const s = try ctx.toStr(input);
+    const cut = try strArg(ctx, args, 0, "chars", " \t\r\n\x0b\x0c");
+    return markupAware(ctx, input, std.mem.trim(u8, s, cut));
+}
+
+fn fReplace(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const s = try ctx.toStr(input);
+    const old = try strArg(ctx, args, 0, "old", "");
+    const new = try strArg(ctx, args, 1, "new", "");
+    const count_v = args.get(2, "count");
+    const limit: usize = if (count_v == null or count_v.? == .none)
+        std.math.maxInt(usize)
+    else
+        @intCast(try intArg(count_v.?, 0));
+    if (old.len == 0) return markupAware(ctx, input, s);
+
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    var done: usize = 0;
+    while (i < s.len) {
+        if (done < limit and std.mem.startsWith(u8, s[i..], old)) {
+            try out.appendSlice(ctx.arena, new);
+            i += old.len;
+            done += 1;
+        } else {
+            try out.append(ctx.arena, s[i]);
+            i += 1;
+        }
+    }
+    return markupAware(ctx, input, out.items);
+}
+
+fn fIndent(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const s = try ctx.toStr(input);
+    const width_v = args.get(0, "width") orelse Value{ .integer = 4 };
+    const indention: []const u8 = switch (width_v) {
+        .string => |x| x.bytes,
+        else => blk: {
+            const n: usize = @intCast(try intArg(width_v, 4));
+            const buf = try ctx.arena.alloc(u8, n);
+            @memset(buf, ' ');
+            break :blk buf;
+        },
+    };
+    const first = boolArg(args, 1, "first", false);
+    const blank = boolArg(args, 2, "blank", false);
+
+    var out: std.ArrayList(u8) = .empty;
+    if (first) try out.appendSlice(ctx.arena, indention);
+    var it = std.mem.splitScalar(u8, s, '\n');
+    var idx: usize = 0;
+    while (it.next()) |line| : (idx += 1) {
+        if (idx != 0) {
+            try out.append(ctx.arena, '\n');
+            if (line.len != 0 or blank) try out.appendSlice(ctx.arena, indention);
+        }
+        try out.appendSlice(ctx.arena, line);
+    }
+    return markupAware(ctx, input, out.items);
+}
+
+fn fCenter(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const s = try ctx.toStr(input);
+    const width: usize = @intCast(try intArg(args.get(0, "width") orelse Value{ .integer = 80 }, 80));
+    const len = std.unicode.utf8CountCodepoints(s) catch s.len;
+    if (len >= width) return Value.str(s);
+    const total = width - len;
+    // CPython's exact rule (`Objects/stringlib/transmute.h`): the odd space
+    // goes LEFT when both the margin and the width are odd.
+    const left = total / 2 + (total & width & 1);
+    const right = total - left;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendNTimes(ctx.arena, ' ', left);
+    try out.appendSlice(ctx.arena, s);
+    try out.appendNTimes(ctx.arena, ' ', right);
+    return Value.str(out.items);
+}
+
+fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const s = try ctx.toStr(input);
+    const length: usize = @intCast(try intArg(args.get(0, "length") orelse Value{ .integer = 255 }, 255));
+    const killwords = boolArg(args, 1, "killwords", false);
+    const end = try strArg(ctx, args, 2, "end", "...");
+    const leeway: usize = @intCast(try intArg(args.get(3, "leeway") orelse Value{ .integer = 5 }, 5));
+    if (s.len <= length + leeway) return Value.str(s);
+    if (length < end.len) return error.BadArgument;
+    const keep = length - end.len;
+    var cut = s[0..keep];
+    if (!killwords) {
+        if (std.mem.lastIndexOfScalar(u8, cut, ' ')) |sp| {
+            cut = cut[0..sp];
+        } else {
+            cut = cut[0..0];
+        }
+    }
+    return Value.str(try std.mem.concat(ctx.arena, u8, &.{ cut, end }));
+}
+
+fn fWordcount(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const s = try ctx.toStr(input);
+    var n: i64 = 0;
+    var it = std.mem.tokenizeAny(u8, s, " \t\r\n\x0b\x0c");
+    while (it.next()) |_| n += 1;
+    return .{ .integer = n };
+}
+
+fn fStriptags(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const s = try ctx.toStr(input);
+    var stripped: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '<') {
+            const close = std.mem.indexOfScalarPos(u8, s, i, '>') orelse break;
+            i = close + 1;
+            continue;
+        }
+        try stripped.append(ctx.arena, s[i]);
+        i += 1;
+    }
+    const unescaped = try unescapeEntities(ctx.arena, stripped.items);
+    // Collapse runs of whitespace, then strip.
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, unescaped, " \t\r\n\x0b\x0c");
+    var first = true;
+    while (it.next()) |w| {
+        if (!first) try out.append(ctx.arena, ' ');
+        try out.appendSlice(ctx.arena, w);
+        first = false;
+    }
+    return Value.str(out.items);
+}
+
+fn unescapeEntities(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            const table = .{
+                .{ "&amp;", "&" },   .{ "&lt;", "<" },   .{ "&gt;", ">" },
+                .{ "&quot;", "\"" }, .{ "&#34;", "\"" }, .{ "&#39;", "'" },
+                .{ "&apos;", "'" },
+            };
+            var matched = false;
+            inline for (table) |e| {
+                if (!matched and std.mem.startsWith(u8, s[i..], e[0])) {
+                    try out.appendSlice(arena, e[1]);
+                    i += e[0].len;
+                    matched = true;
+                }
+            }
+            if (matched) continue;
+        }
+        try out.append(arena, s[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+fn fEscape(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    if (input == .string and input.string.safe) return input;
+    if (input == .undef and ctx.strict) return error.UndefinedValue;
+    const s = try value.strAlloc(ctx.arena, input);
+    return .{ .string = .{ .bytes = try value.escapeAlloc(ctx.arena, s), .safe = true } };
+}
+
+fn fForceEscape(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    if (input == .undef and ctx.strict) return error.UndefinedValue;
+    const s = try value.strAlloc(ctx.arena, input);
+    return .{ .string = .{ .bytes = try value.escapeAlloc(ctx.arena, s), .safe = true } };
+}
+
+fn fSafe(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    if (input == .undef and ctx.strict) return error.UndefinedValue;
+    const s = try value.strAlloc(ctx.arena, input);
+    return .{ .string = .{ .bytes = s, .safe = true } };
+}
+
+fn fString(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    if (input == .string) return input;
+    const s = try ctx.toStr(input);
+    return Value.str(s);
+}
+
+fn fUrlencode(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    switch (input) {
+        .map, .namespace => {
+            const pairs: []const value.Pair = switch (input) {
+                .map => |m| m.pairs,
+                .namespace => |ns| ns.pairs.items,
+                else => unreachable,
+            };
+            var out: std.ArrayList(u8) = .empty;
+            for (pairs, 0..) |p, i| {
+                if (i != 0) try out.append(ctx.arena, '&');
+                try quoteInto(ctx, &out, try ctx.toStr(p.key), "");
+                try out.append(ctx.arena, '=');
+                try quoteInto(ctx, &out, try ctx.toStr(p.value), "");
+            }
+            return Value.str(out.items);
+        },
+        else => {
+            const s = try ctx.toStr(input);
+            var out: std.ArrayList(u8) = .empty;
+            try quoteInto(ctx, &out, s, "/");
+            return Value.str(out.items);
+        },
+    }
+}
+
+fn quoteInto(ctx: *Ctx, out: *std.ArrayList(u8), s: []const u8, extra_safe: []const u8) Error!void {
+    for (s) |c| {
+        const unreserved = std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-' or c == '~' or
+            std.mem.indexOfScalar(u8, extra_safe, c) != null;
+        if (unreserved) {
+            try out.append(ctx.arena, c);
+        } else {
+            var buf: [3]u8 = undefined;
+            const hex = std.fmt.bufPrint(&buf, "%{X:0>2}", .{c}) catch unreachable;
+            try out.appendSlice(ctx.arena, hex);
+        }
+    }
+}
+
+fn fXmlattr(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const autospace = boolArg(args, 0, "autospace", true);
+    const pairs: []const value.Pair = switch (input) {
+        .map => |m| m.pairs,
+        .namespace => |ns| ns.pairs.items,
+        else => return error.TypeMismatch,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    var first = true;
+    for (pairs) |p| {
+        if (p.value == .none or p.value == .undef) continue;
+        if (!first or autospace) try out.append(ctx.arena, ' ');
+        first = false;
+        var aw: std.Io.Writer.Allocating = .init(ctx.arena);
+        try value.escapeTo(&aw.writer, try ctx.toStr(p.key));
+        try out.appendSlice(ctx.arena, aw.written());
+        try out.appendSlice(ctx.arena, "=\"");
+        var vw: std.Io.Writer.Allocating = .init(ctx.arena);
+        try value.escapeTo(&vw.writer, try ctx.toStr(p.value));
+        try out.appendSlice(ctx.arena, vw.written());
+        try out.append(ctx.arena, '"');
+    }
+    return .{ .string = .{ .bytes = out.items, .safe = true } };
+}
+
+// ── numeric filters ─────────────────────────────────────────────────────────
+
+fn fAbs(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = ctx;
+    _ = args;
+    return switch (input) {
+        .integer => |i| .{ .integer = if (i < 0) (std.math.negate(i) catch return error.OutOfRange) else i },
+        .float => |f| .{ .float = @abs(f) },
+        .boolean => |b| .{ .integer = @intFromBool(b) },
+        .undef => error.UndefinedValue,
+        else => error.TypeMismatch,
+    };
+}
+
+fn fInt(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const dflt = args.get(0, "default") orelse Value{ .integer = 0 };
+    const base: u8 = @intCast(try intArg(args.get(1, "base") orelse Value{ .integer = 10 }, 10));
+    _ = ctx;
+    return switch (input) {
+        .integer => input,
+        .boolean => |b| .{ .integer = @intFromBool(b) },
+        .float => |f| if (std.math.isNan(f) or std.math.isInf(f)) dflt else .{ .integer = @intFromFloat(@trunc(f)) },
+        .string => |s| blk: {
+            const t = std.mem.trim(u8, s.bytes, " \t\r\n");
+            const stripped = if (base != 10 and t.len > 2 and t[0] == '0' and !std.ascii.isDigit(t[1])) t[2..] else t;
+            if (std.fmt.parseInt(i64, stripped, base)) |v| break :blk .{ .integer = v } else |_| {}
+            if (base == 10) {
+                if (std.fmt.parseFloat(f64, t)) |f| break :blk .{ .integer = @intFromFloat(@trunc(f)) } else |_| {}
+            }
+            break :blk dflt;
+        },
+        else => dflt,
+    };
+}
+
+fn fFloat(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = ctx;
+    const dflt = args.get(0, "default") orelse Value{ .float = 0.0 };
+    return switch (input) {
+        .float => input,
+        .integer => |i| .{ .float = @floatFromInt(i) },
+        .boolean => |b| .{ .float = if (b) 1.0 else 0.0 },
+        .string => |s| blk: {
+            const t = std.mem.trim(u8, s.bytes, " \t\r\n");
+            if (std.fmt.parseFloat(f64, t)) |f| break :blk .{ .float = f } else |_| {}
+            break :blk dflt;
+        },
+        else => dflt,
+    };
+}
+
+fn fRound(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = ctx;
+    const precision: i32 = @intCast(try intArg(args.get(0, "precision") orelse Value{ .integer = 0 }, 0));
+    const method_v = args.get(1, "method");
+    const method: []const u8 = if (method_v) |m| switch (m) {
+        .string => |s| s.bytes,
+        else => return error.BadArgument,
+    } else "common";
+
+    const x: f64 = switch (input) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        .boolean => |b| if (b) 1.0 else 0.0,
+        .undef => return error.UndefinedValue,
+        else => return error.TypeMismatch,
+    };
+    if (std.mem.eql(u8, method, "common")) {
+        // Python's `round(int, p)` stays an int; `round(float, p)` stays a
+        // float. Both reach templates, and the two render differently.
+        if (input == .integer or input == .boolean) {
+            const iv: i64 = if (input == .boolean) @intFromBool(input.boolean) else input.integer;
+            return .{ .integer = try roundIntHalfEven(iv, precision) };
+        }
+        return .{ .float = roundHalfEven(x, precision) };
+    }
+    // `ceil`/`floor` are what the reference does verbatim: scale, apply the
+    // math function, scale back.
+    const scale = powTen(precision);
+    const scaled = x * scale;
+    const r: f64 = if (std.mem.eql(u8, method, "ceil"))
+        @ceil(scaled)
+    else if (std.mem.eql(u8, method, "floor"))
+        @floor(scaled)
+    else
+        return error.BadArgument;
+    return .{ .float = r / scale };
+}
+
+/// `round(int, p)`. A non-negative precision leaves an integer alone; a
+/// negative one rounds to a multiple of `10^-p`, ties to even.
+fn roundIntHalfEven(x: i64, p: i32) Error!i64 {
+    if (p >= 0) return x;
+    const d: i128 = @intCast(mulPow10(1, @intCast(-p)) orelse return error.OutOfRange);
+    const neg = x < 0;
+    const a: i128 = if (neg) -@as(i128, x) else @as(i128, x);
+    const q = @divTrunc(a, d);
+    const r = @rem(a, d);
+    var res = q;
+    if (r * 2 > d) {
+        res += 1;
+    } else if (r * 2 == d and @rem(q, 2) != 0) {
+        res += 1;
+    }
+    res *= d;
+    const signed = if (neg) -res else res;
+    return std.math.cast(i64, signed) orelse error.OutOfRange;
+}
+
+/// An exact power of ten. `std.math.pow(10, 2)` can come back as
+/// 100.00000000000001, which is enough to move a rounding decision.
+fn powTen(p: i32) f64 {
+    var acc: f64 = 1.0;
+    var n = @abs(p);
+    while (n > 0) : (n -= 1) acc *= 10.0;
+    return if (p < 0) 1.0 / acc else acc;
+}
+
+/// Python's `round(x, p)`: banker's rounding of the value's **exact** binary
+/// magnitude, not of its printed form.
+///
+/// The obvious `@round(x * 10^p) / 10^p` is wrong in a way that shows: `2.675`
+/// is really 2.67499999999999982…, so the exact answer at two places is 2.67,
+/// yet `2.675 * 100` rounds *up* to exactly 267.5 in f64 and any tie rule then
+/// says 2.68. Formatting to 25 digits does not help either — Zig pads the
+/// shortest round-trip form with zeros, reproducing "2.6750000…".
+///
+/// So the comparison is done on integers. Every finite f64 is exactly
+/// `m · 2^e`; the question "which side of the midpoint is `m · 2^e · 10^p`"
+/// is then a shift and a remainder, with no rounding anywhere until the final
+/// decimal string is parsed back (once, correctly rounded). Inputs that would
+/// overflow `u128` fall back to the scaled form — they are past the precision
+/// f64 can express anyway.
+fn roundHalfEven(x: f64, p: i32) f64 {
+    if (x == 0 or std.math.isNan(x) or std.math.isInf(x)) return x;
+    const neg = x < 0;
+    const mag = @abs(x);
+
+    const bits: u64 = @bitCast(mag);
+    const raw_exp: u32 = @truncate((bits >> 52) & 0x7ff);
+    var m: u128 = bits & ((@as(u64, 1) << 52) - 1);
+    var e: i32 = undefined;
+    if (raw_exp == 0) {
+        e = -1074;
+    } else {
+        m |= @as(u128, 1) << 52;
+        e = @as(i32, @intCast(raw_exp)) - 1075;
+    }
+
+    const n = scaledRoundHalfEven(m, e, p) orelse {
+        const scale = powTen(p);
+        const scaled = mag * scale;
+        const f = @floor(scaled);
+        const diff = scaled - f;
+        const r = if (diff > 0.5) f + 1 else if (diff < 0.5) f else (if (@mod(f, 2.0) == 0.0) f else f + 1);
+        return if (neg) -(r / scale) else r / scale;
+    };
+
+    var buf: [64]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}e{d}", .{ n, -p }) catch return x;
+    const out = std.fmt.parseFloat(f64, text) catch return x;
+    return if (neg) -out else out;
+}
+
+/// `round_half_even(m · 2^e · 10^p)` as an exact integer, or null when it does
+/// not fit in `u128`.
+fn scaledRoundHalfEven(m: u128, e: i32, p: i32) ?u128 {
+    // numerator / denominator, both exact.
+    var num: u128 = m;
+    var den: u128 = 1;
+    if (p >= 0) {
+        num = mulPow10(num, @intCast(p)) orelse return null;
+    } else {
+        den = mulPow10(1, @intCast(-p)) orelse return null;
+    }
+    if (e >= 0) {
+        if (e >= 127) return null;
+        num = std.math.shlExact(u128, num, @intCast(e)) catch return null;
+    } else {
+        const k: u32 = @intCast(-e);
+        // Denominator beyond u128: the magnitude is far below half a unit in
+        // the last place asked for, so the answer is 0 either way.
+        if (k >= 127) return 0;
+        den = std.math.shlExact(u128, den, @intCast(k)) catch return 0;
+    }
+    const q = num / den;
+    const r = num % den;
+    const twice = std.math.mul(u128, r, 2) catch return if (r > den / 2) q + 1 else q;
+    if (twice > den) return q + 1;
+    if (twice < den) return q;
+    return if (q % 2 == 0) q else q + 1;
+}
+
+fn mulPow10(v: u128, p: u32) ?u128 {
+    var acc = v;
+    var i: u32 = 0;
+    while (i < p) : (i += 1) acc = std.math.mul(u128, acc, 10) catch return null;
+    return acc;
+}
+
+fn fSum(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const attribute = args.get(0, "attribute");
+    var acc: Value = args.get(1, "start") orelse Value{ .integer = 0 };
+    for (items) |it| {
+        const v = if (attribute != null and attribute.? != .none) try attrOf(ctx, it, attribute.?) else it;
+        acc = try value.binary(ctx.arena, .add, acc, v);
+    }
+    return acc;
+}
+
+// ── sequence filters ────────────────────────────────────────────────────────
+
+fn fLength(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = ctx;
+    _ = args;
+    return .{ .integer = @intCast(try value.length(input)) };
+}
+
+fn fList(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    return .{ .list = try seq(ctx, input) };
+}
+
+fn fFirst(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const items = try seq(ctx, input);
+    return if (items.len == 0) .{ .undef = .{ .name = "first" } } else items[0];
+}
+
+fn fLast(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const items = try seq(ctx, input);
+    return if (items.len == 0) .{ .undef = .{ .name = "last" } } else items[items.len - 1];
+}
+
+fn fReverse(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    if (input == .string) {
+        // Reversed by codepoint, like Python's `s[::-1]`.
+        const cs = try value.chars(ctx.arena, input.string);
+        var out: std.ArrayList(u8) = .empty;
+        var i = cs.len;
+        while (i > 0) {
+            i -= 1;
+            try out.appendSlice(ctx.arena, cs[i].string.bytes);
+        }
+        return markupAware(ctx, input, out.items);
+    }
+    const items = try seq(ctx, input);
+    const out = try ctx.arena.alloc(Value, items.len);
+    for (items, 0..) |it, i| out[items.len - 1 - i] = it;
+    return .{ .list = out };
+}
+
+fn fJoin(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const sep_val = args.get(0, "d") orelse Value.empty_string;
+    const attribute = args.byName("attribute");
+
+    var parts: std.ArrayList(Value) = .empty;
+    for (items) |it| {
+        const v = if (attribute != null and attribute.? != .none) try attrOf(ctx, it, attribute.?) else it;
+        try parts.append(ctx.arena, v);
+    }
+    if (!ctx.autoescape) {
+        var out: std.ArrayList(u8) = .empty;
+        const sep = try ctx.toStr(sep_val);
+        for (parts.items, 0..) |p, i| {
+            if (i != 0) try out.appendSlice(ctx.arena, sep);
+            try out.appendSlice(ctx.arena, try ctx.toStr(p));
+        }
+        return Value.str(out.items);
+    }
+    // Autoescaping: every non-markup part is escaped and the result is markup.
+    var out: std.ArrayList(u8) = .empty;
+    const sep_esc = try escapedBytes(ctx, sep_val);
+    for (parts.items, 0..) |p, i| {
+        if (i != 0) try out.appendSlice(ctx.arena, sep_esc);
+        try out.appendSlice(ctx.arena, try escapedBytes(ctx, p));
+    }
+    return .{ .string = .{ .bytes = out.items, .safe = true } };
+}
+
+fn escapedBytes(ctx: *Ctx, v: Value) Error![]const u8 {
+    if (v == .string and v.string.safe) return v.string.bytes;
+    return value.escapeAlloc(ctx.arena, try ctx.toStr(v));
+}
+
+fn fBatch(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const n: usize = @intCast(try intArg(args.get(0, "linecount") orelse return error.BadArgument, 1));
+    if (n == 0) return error.BadArgument;
+    const fill = args.get(1, "fill_with");
+    var rows: std.ArrayList(Value) = .empty;
+    var i: usize = 0;
+    while (i < items.len) : (i += n) {
+        const end = @min(i + n, items.len);
+        var row: std.ArrayList(Value) = .empty;
+        try row.appendSlice(ctx.arena, items[i..end]);
+        if (fill != null and fill.? != .none) {
+            while (row.items.len < n) try row.append(ctx.arena, fill.?);
+        }
+        try rows.append(ctx.arena, .{ .list = row.items });
+    }
+    return .{ .list = rows.items };
+}
+
+fn fSlice(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const n: usize = @intCast(try intArg(args.get(0, "slices") orelse return error.BadArgument, 1));
+    if (n == 0) return error.BadArgument;
+    const fill = args.get(1, "fill_with");
+    const per = items.len / n;
+    const extra = items.len % n;
+    var rows: std.ArrayList(Value) = .empty;
+    var idx: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const start = idx * per + @min(idx, extra);
+        var end = start + per;
+        if (idx < extra) end += 1;
+        var row: std.ArrayList(Value) = .empty;
+        try row.appendSlice(ctx.arena, items[start..@min(end, items.len)]);
+        if (fill != null and fill.? != .none and idx >= extra and extra != 0)
+            try row.append(ctx.arena, fill.?);
+        try rows.append(ctx.arena, .{ .list = row.items });
+    }
+    return .{ .list = rows.items };
+}
+
+const SortKey = struct {
+    idx: usize,
+    num: f64 = 0,
+    text: []const u8 = "",
+};
+
+fn lessNum(_: void, a: SortKey, b: SortKey) bool {
+    return a.num < b.num;
+}
+
+fn lessText(_: void, a: SortKey, b: SortKey) bool {
+    return std.mem.order(u8, a.text, b.text) == .lt;
+}
+
+/// Build the comparison keys for sort/min/max/unique. Returns null when the
+/// values are not uniformly numeric or uniformly textual — the reference would
+/// raise a `TypeError` there and so do we.
+fn sortKeys(ctx: *Ctx, items: []const Value, attribute: ?Value, case_sensitive: bool) Error!struct {
+    keys: []SortKey,
+    numeric: bool,
+} {
+    const keys = try ctx.arena.alloc(SortKey, items.len);
+    var numeric = true;
+    var textual = true;
+    for (items, 0..) |it, i| {
+        const v = if (attribute != null and attribute.? != .none) try attrOf(ctx, it, attribute.?) else it;
+        keys[i] = .{ .idx = i };
+        switch (v) {
+            .integer => |n| keys[i].num = @floatFromInt(n),
+            .float => |f| keys[i].num = f,
+            .boolean => |b| keys[i].num = if (b) 1 else 0,
+            else => numeric = false,
+        }
+        switch (v) {
+            .string => |s| {
+                if (case_sensitive) {
+                    keys[i].text = s.bytes;
+                } else {
+                    const low = try ctx.arena.dupe(u8, s.bytes);
+                    for (low) |*c| c.* = std.ascii.toLower(c.*);
+                    keys[i].text = low;
+                }
+            },
+            else => textual = false,
+        }
+    }
+    if (!numeric and !textual) return error.TypeMismatch;
+    return .{ .keys = keys, .numeric = numeric };
+}
+
+fn fSort(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const reverse = boolArg(args, 0, "reverse", false);
+    const case_sensitive = boolArg(args, 1, "case_sensitive", false);
+    const attribute = args.get(2, "attribute");
+    const k = try sortKeys(ctx, items, attribute, case_sensitive);
+    if (k.numeric) std.sort.block(SortKey, k.keys, {}, lessNum) else std.sort.block(SortKey, k.keys, {}, lessText);
+    const out = try ctx.arena.alloc(Value, items.len);
+    for (k.keys, 0..) |key, i| out[if (reverse) items.len - 1 - i else i] = items[key.idx];
+    return .{ .list = out };
+}
+
+fn extremum(ctx: *Ctx, input: Value, args: Args, want_max: bool) Error!Value {
+    const items = try seq(ctx, input);
+    if (items.len == 0) return .{ .undef = .{ .name = if (want_max) "max" else "min" } };
+    const case_sensitive = boolArg(args, 0, "case_sensitive", false);
+    const attribute = args.get(1, "attribute");
+    const k = try sortKeys(ctx, items, attribute, case_sensitive);
+    var best: usize = 0;
+    for (k.keys[1..]) |key| {
+        const better = if (k.numeric)
+            (if (want_max) key.num > k.keys[best].num else key.num < k.keys[best].num)
+        else
+            (if (want_max)
+                std.mem.order(u8, key.text, k.keys[best].text) == .gt
+            else
+                std.mem.order(u8, key.text, k.keys[best].text) == .lt);
+        if (better) best = key.idx;
+    }
+    return items[k.keys[best].idx];
+}
+
+fn fMin(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    return extremum(ctx, input, args, false);
+}
+
+fn fMax(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    return extremum(ctx, input, args, true);
+}
+
+fn fUnique(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const case_sensitive = boolArg(args, 0, "case_sensitive", false);
+    const attribute = args.get(1, "attribute");
+    var out: std.ArrayList(Value) = .empty;
+    var seen: std.ArrayList(Value) = .empty;
+    for (items) |it| {
+        var key = if (attribute != null and attribute.? != .none) try attrOf(ctx, it, attribute.?) else it;
+        if (!case_sensitive and key == .string) {
+            const low = try ctx.arena.dupe(u8, key.string.bytes);
+            for (low) |*c| c.* = std.ascii.toLower(c.*);
+            key = Value.str(low);
+        }
+        var dup = false;
+        for (seen.items) |s| if (value.valueEql(s, key)) {
+            dup = true;
+            break;
+        };
+        if (dup) continue;
+        try seen.append(ctx.arena, key);
+        try out.append(ctx.arena, it);
+    }
+    return .{ .list = out.items };
+}
+
+fn fItems(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const pairs: []const value.Pair = switch (input) {
+        .map => |m| m.pairs,
+        .namespace => |ns| ns.pairs.items,
+        .undef => return error.UndefinedValue,
+        else => return error.TypeMismatch,
+    };
+    return pairsToList(ctx, pairs);
+}
+
+fn pairsToList(ctx: *Ctx, pairs: []const value.Pair) Error!Value {
+    const out = try ctx.arena.alloc(Value, pairs.len);
+    for (pairs, 0..) |p, i| {
+        const two = try ctx.arena.alloc(Value, 2);
+        two[0] = p.key;
+        two[1] = p.value;
+        out[i] = .{ .tuple = two };
+    }
+    return .{ .list = out };
+}
+
+fn fDictsort(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const pairs: []const value.Pair = switch (input) {
+        .map => |m| m.pairs,
+        .namespace => |ns| ns.pairs.items,
+        .undef => return error.UndefinedValue,
+        else => return error.TypeMismatch,
+    };
+    const case_sensitive = boolArg(args, 0, "case_sensitive", false);
+    const by = try strArg(ctx, args, 1, "by", "key");
+    const reverse = boolArg(args, 2, "reverse", false);
+    const use_value = std.mem.eql(u8, by, "value");
+    if (!use_value and !std.mem.eql(u8, by, "key")) return error.BadArgument;
+
+    const picked = try ctx.arena.alloc(Value, pairs.len);
+    for (pairs, 0..) |p, i| picked[i] = if (use_value) p.value else p.key;
+    const k = try sortKeys(ctx, picked, null, case_sensitive);
+    if (k.numeric) std.sort.block(SortKey, k.keys, {}, lessNum) else std.sort.block(SortKey, k.keys, {}, lessText);
+
+    const ordered = try ctx.arena.alloc(value.Pair, pairs.len);
+    for (k.keys, 0..) |key, i| ordered[if (reverse) pairs.len - 1 - i else i] = pairs[key.idx];
+    return pairsToList(ctx, ordered);
+}
+
+fn fDefault(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = ctx;
+    const dflt = args.get(0, "default_value") orelse Value.empty_string;
+    const boolean = boolArg(args, 1, "boolean", false);
+    if (input == .undef) return dflt;
+    if (boolean and !input.truthy()) return dflt;
+    return input;
+}
+
+fn fMap(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const out = try ctx.arena.alloc(Value, items.len);
+    if (args.byName("attribute")) |attribute| {
+        const dflt = args.byName("default");
+        for (items, 0..) |it, i| {
+            const v = try attrOf(ctx, it, attribute);
+            out[i] = if (v == .undef and dflt != null) dflt.? else v;
+        }
+        return .{ .list = out };
+    }
+    if (args.pos.len == 0) return error.BadArgument;
+    const name = switch (args.pos[0]) {
+        .string => |s| s.bytes,
+        else => return error.BadArgument,
+    };
+    const rest: Args = .{ .pos = args.pos[1..], .kw = args.kw };
+    for (items, 0..) |it, i| out[i] = try ctx.callFilter(ctx, name, it, rest);
+    return .{ .list = out };
+}
+
+fn selectLike(ctx: *Ctx, input: Value, args: Args, keep: bool, by_attr: bool) Error!Value {
+    const items = try seq(ctx, input);
+    var out: std.ArrayList(Value) = .empty;
+    var attribute: ?Value = null;
+    var pos = args.pos;
+    if (by_attr) {
+        if (pos.len == 0) return error.BadArgument;
+        attribute = pos[0];
+        pos = pos[1..];
+    }
+    const test_name: ?[]const u8 = if (pos.len == 0) null else switch (pos[0]) {
+        .string => |s| s.bytes,
+        else => return error.BadArgument,
+    };
+    const rest: Args = .{ .pos = if (pos.len == 0) &.{} else pos[1..], .kw = args.kw };
+
+    for (items) |it| {
+        const subject = if (attribute) |a| try attrOf(ctx, it, a) else it;
+        const ok = if (test_name) |n| try ctx.callTest(ctx, n, subject, rest) else subject.truthy();
+        if (ok == keep) try out.append(ctx.arena, it);
+    }
+    return .{ .list = out.items };
+}
+
+fn fSelect(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    return selectLike(ctx, input, args, true, false);
+}
+fn fReject(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    return selectLike(ctx, input, args, false, false);
+}
+fn fSelectattr(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    return selectLike(ctx, input, args, true, true);
+}
+fn fRejectattr(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    return selectLike(ctx, input, args, false, true);
+}
+
+// ── tojson ──────────────────────────────────────────────────────────────────
+
+fn fTojson(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const indent_v = args.get(0, "indent");
+    const indent: ?usize = if (indent_v == null or indent_v.? == .none)
+        null
+    else
+        @intCast(try intArg(indent_v.?, 0));
+    var aw: std.Io.Writer.Allocating = .init(ctx.arena);
+    try jsonWrite(ctx, &aw.writer, input, indent, 0);
+    // Jinja escapes the four characters that could break out of a <script> or
+    // an attribute, then marks the result safe.
+    var out: std.ArrayList(u8) = .empty;
+    for (aw.written()) |c| switch (c) {
+        '<' => try out.appendSlice(ctx.arena, "\\u003c"),
+        '>' => try out.appendSlice(ctx.arena, "\\u003e"),
+        '&' => try out.appendSlice(ctx.arena, "\\u0026"),
+        '\'' => try out.appendSlice(ctx.arena, "\\u0027"),
+        else => try out.append(ctx.arena, c),
+    };
+    return .{ .string = .{ .bytes = out.items, .safe = true } };
+}
+
+fn jsonWrite(ctx: *Ctx, w: *std.Io.Writer, v: Value, indent: ?usize, depth: usize) Error!void {
+    switch (v) {
+        .undef => return error.UndefinedValue,
+        .none => w.writeAll("null") catch return error.OutOfMemory,
+        .boolean => |b| w.writeAll(if (b) "true" else "false") catch return error.OutOfMemory,
+        .integer => |i| w.print("{d}", .{i}) catch return error.OutOfMemory,
+        .float => |f| {
+            if (std.math.isNan(f) or std.math.isInf(f)) return error.BadArgument;
+            try value.floatTo(w, f);
+        },
+        .string => |s| try jsonString(w, s.bytes),
+        .list, .tuple => |items| {
+            w.writeAll("[") catch return error.OutOfMemory;
+            for (items, 0..) |e, i| {
+                if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
+                try jsonSep(w, indent, depth + 1, i != 0);
+                try jsonWrite(ctx, w, e, indent, depth + 1);
+            }
+            if (items.len != 0 and indent != null) try jsonSep(w, indent, depth, true);
+            w.writeAll("]") catch return error.OutOfMemory;
+        },
+        .map, .namespace => {
+            const pairs: []const value.Pair = switch (v) {
+                .map => |m| m.pairs,
+                .namespace => |ns| ns.pairs.items,
+                else => unreachable,
+            };
+            // The reference's default policy sorts object keys.
+            const order = try ctx.arena.alloc(SortKey, pairs.len);
+            for (pairs, 0..) |p, i| {
+                order[i] = .{ .idx = i, .text = switch (p.key) {
+                    .string => |s| s.bytes,
+                    else => return error.BadArgument,
+                } };
+            }
+            std.sort.block(SortKey, order, {}, lessText);
+            w.writeAll("{") catch return error.OutOfMemory;
+            for (order, 0..) |o, i| {
+                if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
+                try jsonSep(w, indent, depth + 1, i != 0);
+                try jsonString(w, pairs[o.idx].key.string.bytes);
+                w.writeAll(": ") catch return error.OutOfMemory;
+                try jsonWrite(ctx, w, pairs[o.idx].value, indent, depth + 1);
+            }
+            if (pairs.len != 0 and indent != null) try jsonSep(w, indent, depth, true);
+            w.writeAll("}") catch return error.OutOfMemory;
+        },
+        .loop => return error.BadArgument,
+    }
+}
+
+fn jsonSep(w: *std.Io.Writer, indent: ?usize, depth: usize, comma: bool) Error!void {
+    if (indent) |n| {
+        w.writeAll("\n") catch return error.OutOfMemory;
+        w.splatByteAll(' ', n * depth) catch return error.OutOfMemory;
+    } else if (comma) {
+        w.writeAll(" ") catch return error.OutOfMemory;
+    }
+}
+
+fn jsonString(w: *std.Io.Writer, s: []const u8) Error!void {
+    w.writeAll("\"") catch return error.OutOfMemory;
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => w.writeAll("\\\"") catch return error.OutOfMemory,
+                '\\' => w.writeAll("\\\\") catch return error.OutOfMemory,
+                '\n' => w.writeAll("\\n") catch return error.OutOfMemory,
+                '\r' => w.writeAll("\\r") catch return error.OutOfMemory,
+                '\t' => w.writeAll("\\t") catch return error.OutOfMemory,
+                0x08 => w.writeAll("\\b") catch return error.OutOfMemory,
+                0x0c => w.writeAll("\\f") catch return error.OutOfMemory,
+                else => if (c < 0x20)
+                    w.print("\\u{x:0>4}", .{c}) catch return error.OutOfMemory
+                else
+                    w.writeByte(c) catch return error.OutOfMemory,
+            }
+            i += 1;
+            continue;
+        }
+        // `ensure_ascii=True` is the reference's default: non-ASCII becomes
+        // \uXXXX, with surrogate pairs above the BMP.
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            w.print("\\u{x:0>4}", .{s[i]}) catch return error.OutOfMemory;
+            i += 1;
+            continue;
+        };
+        if (i + n > s.len) return error.BadArgument;
+        const cp = std.unicode.utf8Decode(s[i .. i + n]) catch return error.BadArgument;
+        if (cp < 0x10000) {
+            w.print("\\u{x:0>4}", .{cp}) catch return error.OutOfMemory;
+        } else {
+            const v2 = cp - 0x10000;
+            const hi = 0xD800 + (v2 >> 10);
+            const lo = 0xDC00 + (v2 & 0x3FF);
+            w.print("\\u{x:0>4}\\u{x:0>4}", .{ hi, lo }) catch return error.OutOfMemory;
+        }
+        i += n;
+    }
+    w.writeAll("\"") catch return error.OutOfMemory;
+}
+
+// ── registry ────────────────────────────────────────────────────────────────
+
+pub const builtin_filters = [_]Entry{
+    .{ .name = "abs", .func = fAbs },
+    .{ .name = "batch", .func = fBatch },
+    .{ .name = "capitalize", .func = fCapitalize },
+    .{ .name = "center", .func = fCenter },
+    .{ .name = "count", .func = fLength },
+    .{ .name = "d", .func = fDefault },
+    .{ .name = "default", .func = fDefault },
+    .{ .name = "dictsort", .func = fDictsort },
+    .{ .name = "e", .func = fEscape },
+    .{ .name = "escape", .func = fEscape },
+    .{ .name = "first", .func = fFirst },
+    .{ .name = "float", .func = fFloat },
+    .{ .name = "forceescape", .func = fForceEscape },
+    .{ .name = "indent", .func = fIndent },
+    .{ .name = "int", .func = fInt },
+    .{ .name = "items", .func = fItems },
+    .{ .name = "join", .func = fJoin },
+    .{ .name = "last", .func = fLast },
+    .{ .name = "length", .func = fLength },
+    .{ .name = "list", .func = fList },
+    .{ .name = "lower", .func = fLower },
+    .{ .name = "map", .func = fMap },
+    .{ .name = "max", .func = fMax },
+    .{ .name = "min", .func = fMin },
+    .{ .name = "reject", .func = fReject },
+    .{ .name = "rejectattr", .func = fRejectattr },
+    .{ .name = "replace", .func = fReplace },
+    .{ .name = "reverse", .func = fReverse },
+    .{ .name = "round", .func = fRound },
+    .{ .name = "safe", .func = fSafe },
+    .{ .name = "select", .func = fSelect },
+    .{ .name = "selectattr", .func = fSelectattr },
+    .{ .name = "slice", .func = fSlice },
+    .{ .name = "sort", .func = fSort },
+    .{ .name = "string", .func = fString },
+    .{ .name = "striptags", .func = fStriptags },
+    .{ .name = "sum", .func = fSum },
+    .{ .name = "title", .func = fTitle },
+    .{ .name = "tojson", .func = fTojson },
+    .{ .name = "trim", .func = fTrim },
+    .{ .name = "truncate", .func = fTruncate },
+    .{ .name = "unique", .func = fUnique },
+    .{ .name = "upper", .func = fUpper },
+    .{ .name = "urlencode", .func = fUrlencode },
+    .{ .name = "wordcount", .func = fWordcount },
+    .{ .name = "xmlattr", .func = fXmlattr },
+};
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+fn tDefined(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input != .undef;
+}
+fn tUndefined(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .undef;
+}
+fn tNone(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .none;
+}
+fn tBoolean(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .boolean;
+}
+fn tTrue(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .boolean and input.boolean;
+}
+fn tFalse(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .boolean and !input.boolean;
+}
+fn tInteger(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .integer;
+}
+fn tFloatTest(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .float;
+}
+fn tNumber(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .integer or input == .float or input == .boolean;
+}
+fn tString(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .string;
+}
+fn tMapping(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .map or input == .namespace;
+}
+fn tSequence(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return switch (input) {
+        .list, .string, .map, .namespace => true,
+        else => false,
+    };
+}
+fn tIterable(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    return tSequence(ctx, input, args);
+}
+fn tEscaped(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    return input == .string and input.string.safe;
+}
+fn tEven(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    if (input != .integer) return error.TypeMismatch;
+    return @mod(input.integer, 2) == 0;
+}
+fn tOdd(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    if (input != .integer) return error.TypeMismatch;
+    return @mod(input.integer, 2) != 0;
+}
+fn tDivisibleby(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    const by = args.get(0, "num") orelse return error.BadArgument;
+    if (input != .integer or by != .integer) return error.TypeMismatch;
+    if (by.integer == 0) return error.DivisionByZero;
+    return @mod(input.integer, by.integer) == 0;
+}
+fn tUpperTest(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = args;
+    const s = try ctx.toStr(input);
+    var has_alpha = false;
+    for (s) |c| {
+        if (std.ascii.isAlphabetic(c)) has_alpha = true;
+        if (std.ascii.isLower(c)) return false;
+    }
+    return has_alpha;
+}
+fn tLowerTest(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = args;
+    const s = try ctx.toStr(input);
+    var has_alpha = false;
+    for (s) |c| {
+        if (std.ascii.isAlphabetic(c)) has_alpha = true;
+        if (std.ascii.isUpper(c)) return false;
+    }
+    return has_alpha;
+}
+
+fn cmpTest(comptime op: value.CmpOp) TestFn {
+    return struct {
+        fn f(ctx: *Ctx, input: Value, args: Args) Error!bool {
+            _ = ctx;
+            const other = args.get(0, "other") orelse return error.BadArgument;
+            return value.compare(op, input, other);
+        }
+    }.f;
+}
+
+fn tIn(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    const container = args.get(0, "seq") orelse return error.BadArgument;
+    return value.contains(container, input);
+}
+
+pub const builtin_tests = [_]TestEntry{
+    .{ .name = "boolean", .func = tBoolean },
+    .{ .name = "defined", .func = tDefined },
+    .{ .name = "divisibleby", .func = tDivisibleby },
+    .{ .name = "eq", .func = cmpTest(.eq) },
+    .{ .name = "equalto", .func = cmpTest(.eq) },
+    .{ .name = "escaped", .func = tEscaped },
+    .{ .name = "even", .func = tEven },
+    .{ .name = "false", .func = tFalse },
+    .{ .name = "float", .func = tFloatTest },
+    .{ .name = "ge", .func = cmpTest(.ge) },
+    .{ .name = "greaterthan", .func = cmpTest(.gt) },
+    .{ .name = "gt", .func = cmpTest(.gt) },
+    .{ .name = "in", .func = tIn },
+    .{ .name = "integer", .func = tInteger },
+    .{ .name = "iterable", .func = tIterable },
+    .{ .name = "le", .func = cmpTest(.le) },
+    .{ .name = "lessthan", .func = cmpTest(.lt) },
+    .{ .name = "lower", .func = tLowerTest },
+    .{ .name = "lt", .func = cmpTest(.lt) },
+    .{ .name = "mapping", .func = tMapping },
+    .{ .name = "ne", .func = cmpTest(.ne) },
+    .{ .name = "none", .func = tNone },
+    .{ .name = "number", .func = tNumber },
+    .{ .name = "odd", .func = tOdd },
+    .{ .name = "sequence", .func = tSequence },
+    .{ .name = "string", .func = tString },
+    .{ .name = "true", .func = tTrue },
+    .{ .name = "undefined", .func = tUndefined },
+    .{ .name = "upper", .func = tUpperTest },
+};
+
+// ── value methods (`s.upper()`, `d.items()`, …) ─────────────────────────────
+
+/// `error.Unsupported` means "no such method on this type", which the renderer
+/// turns into a message naming both.
+pub fn callMethod(
+    arena: std.mem.Allocator,
+    obj: Value,
+    name: []const u8,
+    args: Args,
+    autoescape: bool,
+) Error!Value {
+    var ctx: Ctx = .{
+        .arena = arena,
+        .autoescape = autoescape,
+        .strict = true,
+        .user = undefined,
+        .callFilter = unavailableFilter,
+        .callTest = unavailableTest,
+    };
+    switch (obj) {
+        .undef => return error.UndefinedValue,
+        .string => |s| return stringMethod(&ctx, s, name, args),
+        .map, .namespace => {
+            const pairs: []const value.Pair = switch (obj) {
+                .map => |m| m.pairs,
+                .namespace => |ns| ns.pairs.items,
+                else => unreachable,
+            };
+            if (std.mem.eql(u8, name, "items")) return pairsToList(&ctx, pairs);
+            if (std.mem.eql(u8, name, "keys")) {
+                const out = try arena.alloc(Value, pairs.len);
+                for (pairs, 0..) |p, i| out[i] = p.key;
+                return .{ .list = out };
+            }
+            if (std.mem.eql(u8, name, "values")) {
+                const out = try arena.alloc(Value, pairs.len);
+                for (pairs, 0..) |p, i| out[i] = p.value;
+                return .{ .list = out };
+            }
+            if (std.mem.eql(u8, name, "get")) {
+                const key = args.get(0, "key") orelse return error.BadArgument;
+                for (pairs) |p| if (value.valueEql(p.key, key)) return p.value;
+                return args.get(1, "default") orelse .none;
+            }
+            return error.Unsupported;
+        },
+        .list, .tuple => |items| {
+            if (std.mem.eql(u8, name, "count")) {
+                const needle = args.get(0, "value") orelse return error.BadArgument;
+                var n: i64 = 0;
+                for (items) |e| if (value.valueEql(e, needle)) {
+                    n += 1;
+                };
+                return .{ .integer = n };
+            }
+            if (std.mem.eql(u8, name, "index")) {
+                const needle = args.get(0, "value") orelse return error.BadArgument;
+                for (items, 0..) |e, i| if (value.valueEql(e, needle)) return .{ .integer = @intCast(i) };
+                return error.BadArgument;
+            }
+            return error.Unsupported;
+        },
+        else => return error.Unsupported,
+    }
+}
+
+fn unavailableFilter(ctx: *Ctx, name: []const u8, input: Value, args: Args) Error!Value {
+    _ = ctx;
+    _ = name;
+    _ = input;
+    _ = args;
+    return error.Unsupported;
+}
+
+fn unavailableTest(ctx: *Ctx, name: []const u8, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = name;
+    _ = input;
+    _ = args;
+    return error.Unsupported;
+}
+
+fn stringMethod(ctx: *Ctx, s: value.Str, name: []const u8, args: Args) Error!Value {
+    const input: Value = .{ .string = s };
+    if (std.mem.eql(u8, name, "upper")) return fUpper(ctx, input, args);
+    if (std.mem.eql(u8, name, "lower")) return fLower(ctx, input, args);
+    if (std.mem.eql(u8, name, "title")) return fTitle(ctx, input, args);
+    if (std.mem.eql(u8, name, "capitalize")) return fCapitalize(ctx, input, args);
+    if (std.mem.eql(u8, name, "strip")) return fTrim(ctx, input, args);
+    if (std.mem.eql(u8, name, "replace")) return fReplace(ctx, input, args);
+    if (std.mem.eql(u8, name, "lstrip")) {
+        const cut = try strArg(ctx, args, 0, "chars", " \t\r\n\x0b\x0c");
+        return markupAware(ctx, input, std.mem.trimStart(u8, s.bytes, cut));
+    }
+    if (std.mem.eql(u8, name, "rstrip")) {
+        const cut = try strArg(ctx, args, 0, "chars", " \t\r\n\x0b\x0c");
+        return markupAware(ctx, input, std.mem.trimEnd(u8, s.bytes, cut));
+    }
+    if (std.mem.eql(u8, name, "startswith")) {
+        const p = try strArg(ctx, args, 0, "prefix", "");
+        return .{ .boolean = std.mem.startsWith(u8, s.bytes, p) };
+    }
+    if (std.mem.eql(u8, name, "endswith")) {
+        const p = try strArg(ctx, args, 0, "suffix", "");
+        return .{ .boolean = std.mem.endsWith(u8, s.bytes, p) };
+    }
+    if (std.mem.eql(u8, name, "count")) {
+        const p = try strArg(ctx, args, 0, "sub", "");
+        if (p.len == 0) return error.BadArgument;
+        var n: i64 = 0;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, s.bytes, i, p)) |at| : (i = at + p.len) n += 1;
+        return .{ .integer = n };
+    }
+    if (std.mem.eql(u8, name, "find")) {
+        const p = try strArg(ctx, args, 0, "sub", "");
+        const at = std.mem.indexOf(u8, s.bytes, p) orelse return .{ .integer = -1 };
+        return .{ .integer = @intCast(at) };
+    }
+    if (std.mem.eql(u8, name, "split")) {
+        const sep_v = args.get(0, "sep");
+        var out: std.ArrayList(Value) = .empty;
+        if (sep_v == null or sep_v.? == .none) {
+            var it = std.mem.tokenizeAny(u8, s.bytes, " \t\r\n\x0b\x0c");
+            while (it.next()) |part| try out.append(ctx.arena, Value.str(part));
+        } else {
+            const sep = try ctx.toStr(sep_v.?);
+            if (sep.len == 0) return error.BadArgument;
+            var it = std.mem.splitSequence(u8, s.bytes, sep);
+            while (it.next()) |part| try out.append(ctx.arena, Value.str(part));
+        }
+        return .{ .list = out.items };
+    }
+    if (std.mem.eql(u8, name, "splitlines")) {
+        var out: std.ArrayList(Value) = .empty;
+        var it = std.mem.splitScalar(u8, s.bytes, '\n');
+        var pending: ?[]const u8 = null;
+        while (it.next()) |part| {
+            if (pending) |pv| try out.append(ctx.arena, Value.str(pv));
+            pending = std.mem.trimEnd(u8, part, "\r");
+        }
+        if (pending) |pv| if (pv.len != 0) try out.append(ctx.arena, Value.str(pv));
+        return .{ .list = out.items };
+    }
+    if (std.mem.eql(u8, name, "join")) {
+        const items = args.get(0, "iterable") orelse return error.BadArgument;
+        return fJoin(ctx, items, .{ .pos = &.{input} });
+    }
+    if (std.mem.eql(u8, name, "isdigit")) {
+        if (s.bytes.len == 0) return .{ .boolean = false };
+        for (s.bytes) |c| if (!std.ascii.isDigit(c)) return .{ .boolean = false };
+        return .{ .boolean = true };
+    }
+    if (std.mem.eql(u8, name, "isalpha")) {
+        if (s.bytes.len == 0) return .{ .boolean = false };
+        for (s.bytes) |c| if (!std.ascii.isAlphabetic(c)) return .{ .boolean = false };
+        return .{ .boolean = true };
+    }
+    if (std.mem.eql(u8, name, "removeprefix")) {
+        const p = try strArg(ctx, args, 0, "prefix", "");
+        if (std.mem.startsWith(u8, s.bytes, p)) return markupAware(ctx, input, s.bytes[p.len..]);
+        return input;
+    }
+    if (std.mem.eql(u8, name, "removesuffix")) {
+        const p = try strArg(ctx, args, 0, "suffix", "");
+        if (p.len != 0 and std.mem.endsWith(u8, s.bytes, p))
+            return markupAware(ctx, input, s.bytes[0 .. s.bytes.len - p.len]);
+        return input;
+    }
+    return error.Unsupported;
+}
