@@ -1048,7 +1048,7 @@ fn jsonWrite(ctx: *Ctx, w: *std.Io.Writer, v: Value, indent: ?usize, depth: usiz
             if (pairs.len != 0 and indent != null) try jsonSep(w, indent, depth, true);
             w.writeAll("}") catch return error.OutOfMemory;
         },
-        .loop => return error.BadArgument,
+        .loop, .macro => return error.BadArgument,
     }
 }
 

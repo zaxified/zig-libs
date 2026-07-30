@@ -112,6 +112,78 @@ pub const With = struct {
     body: []const Node,
 };
 
+/// A macro parameter: a name and, optionally, a default expression evaluated
+/// at call time in the macro's own scope.
+pub const Param = struct {
+    name: []const u8,
+    default: ?*const Expr = null,
+};
+
+/// A `{% macro %}` definition, and also the synthetic macro a `{% call %}`
+/// block's body becomes so that `caller()` can invoke it.
+pub const MacroDef = struct {
+    name: []const u8,
+    params: []const Param,
+    body: []const Node,
+    /// Whether the body mentions these special names. The reference decides
+    /// statically whether a macro will *accept* extra positional/keyword
+    /// arguments, so this has to be known at parse time, not at call time.
+    catch_varargs: bool = false,
+    catch_kwargs: bool = false,
+    uses_caller: bool = false,
+    line: usize = 0,
+};
+
+/// A `{% block %}` body, stored in the template's block table. The `Node` that
+/// marks the block's *position* carries only the name — which definition runs
+/// is a property of the inheritance chain, not of the node.
+pub const BlockDef = struct {
+    name: []const u8,
+    body: []const Node,
+    /// `{% block x scoped %}` — the body can see the enclosing loop's
+    /// variables. Without it a block sees only template-level names.
+    scoped: bool = false,
+    /// `{% block x required %}` — a derived template must override it.
+    required: bool = false,
+    line: usize = 0,
+};
+
+pub const Include = struct {
+    /// A single name or a list of candidates; the first that loads wins.
+    names: *const Expr,
+    ignore_missing: bool,
+    /// `{% include %}` defaults to **with** context.
+    with_context: bool,
+    line: usize,
+};
+
+pub const Import = struct {
+    name: *const Expr,
+    /// `{% import 'm' as target %}`
+    target: []const u8,
+    /// `{% import %}` defaults to **without** context — the opposite of
+    /// `{% include %}`.
+    with_context: bool,
+    line: usize,
+};
+
+pub const FromImport = struct {
+    pub const Alias = struct { name: []const u8, as: []const u8 };
+
+    template: *const Expr,
+    names: []const Alias,
+    with_context: bool,
+    line: usize,
+};
+
+pub const CallBlock = struct {
+    /// The macro invocation the body is handed to.
+    call: *const Expr,
+    /// `{% call(a, b) m() %}` — the parameters `caller()` is invoked with.
+    caller: MacroDef,
+    line: usize,
+};
+
 pub const Node = union(enum) {
     text: []const u8,
     output: struct { expr: *const Expr, line: usize },
@@ -123,6 +195,26 @@ pub const Node = union(enum) {
     with: With,
     /// `{% do expr %}` — evaluate for effect, emit nothing.
     do: struct { expr: *const Expr, line: usize },
+    /// `{% extends expr %}` — records the parent; the renderer builds the
+    /// chain before any output is produced.
+    extends: struct { name: *const Expr, line: usize },
+    /// The *position* of a block in this template. The body lives in the
+    /// template's block table so the chain can override it.
+    block: struct { name: []const u8, line: usize },
+    include: Include,
+    import: Import,
+    from_import: FromImport,
+    macro: struct { def: *const MacroDef, line: usize },
+    call_block: CallBlock,
+};
+
+/// What `parser.parse` produces for one template.
+pub const Parsed = struct {
+    nodes: []const Node,
+    /// Every `{% block %}` in the template, wherever it is nested.
+    blocks: []const BlockDef,
+    /// The `{% extends %}` name expression, when the template has one.
+    extends: ?*const Expr = null,
 };
 
 /// The placeholder `Expr` a `{% filter %}` block's chain is applied to.

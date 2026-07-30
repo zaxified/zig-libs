@@ -36,13 +36,17 @@ pub fn renderCase(gpa: std.mem.Allocator, c: corpus.Case) !Outcome {
         return .{ .failed = "context is not valid JSON" };
     const ctx = try jinja.valueFromJson(a, parsed.value);
 
-    var env = try jinja.Environment.init(gpa, .{
+    var entries = try a.alloc(jinja.MapLoader.Entry, c.templates.len);
+    for (c.templates, 0..) |t, i| entries[i] = .{ .name = t.name, .source = t.source };
+    var map: jinja.MapLoader = .{ .entries = entries };
+
+    var env = try jinja.Environment.initWithLoader(gpa, .{
         .autoescape = c.autoescape,
         .undefined_policy = if (c.strict) .strict else .lenient,
         .trim_blocks = c.trim_blocks,
         .lstrip_blocks = c.lstrip_blocks,
         .keep_trailing_newline = c.keep_trailing_newline,
-    });
+    }, map.loader());
     defer env.deinit();
 
     var diag: jinja.Diagnostic = .{};

@@ -97,6 +97,21 @@ pub const Undefined = struct {
     name: []const u8 = "",
 };
 
+/// A macro — a `{% macro %}`, or the body a `{% call %}` block hands to
+/// `caller()` — closed over the scope it was defined in.
+///
+/// The payload is **opaque here on purpose**. A macro necessarily refers to
+/// syntax (`ast`) and to live scopes (`render`), and both of those sit above
+/// this file in the import graph; making `Value` name them would put a cycle at
+/// the very bottom of the module. `render.zig` allocates the implementation and
+/// owns the only casts of `impl`, so the unsafety is one file wide. `name` is
+/// carried in the clear because `repr()` and `macro.name` need it without a
+/// cast.
+pub const MacroRef = struct {
+    name: []const u8,
+    impl: *const anyopaque,
+};
+
 pub const Value = union(enum) {
     undef: Undefined,
     none,
@@ -112,6 +127,7 @@ pub const Value = union(enum) {
     map: Map,
     namespace: *Namespace,
     loop: *Loop,
+    macro: MacroRef,
 
     pub const empty_string: Value = .{ .string = .{ .bytes = "" } };
 
@@ -142,6 +158,7 @@ pub const Value = union(enum) {
             .map => |m| m.pairs.len != 0,
             .namespace => true,
             .loop => |l| l.items.len != 0,
+            .macro => true,
         };
     }
 
@@ -156,6 +173,7 @@ pub const Value = union(enum) {
             .string => "str",
             .list => "list",
             .tuple => "tuple",
+            .macro => "macro",
             .map, .namespace, .loop => "dict",
         };
     }
@@ -321,6 +339,11 @@ pub fn reprTo(writer: *std.Io.Writer, v: Value) Error!void {
         .map => |m| try reprPairs(writer, m.pairs),
         .namespace => |ns| try reprPairs(writer, ns.pairs.items),
         .loop => try w(writer, "<loop>"),
+        .macro => |m| {
+            try w(writer, "<Macro '");
+            try w(writer, m.name);
+            try w(writer, "'>");
+        },
         else => try strTo(writer, v),
     }
 }
@@ -686,6 +709,7 @@ pub fn valueEql(a: Value, b: Value) bool {
         .map => |m| b == .map and pairsEql(m.pairs, b.map.pairs),
         .namespace => |n| b == .namespace and n == b.namespace,
         .loop => |l| b == .loop and l == b.loop,
+        .macro => |m| b == .macro and m.impl == b.macro.impl,
         else => false,
     };
 }

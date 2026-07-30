@@ -15,9 +15,19 @@
 
 const std = @import("std");
 
+/// An extra template the case's loader can serve, so composition tags have
+/// something to name.
+pub const Tpl = struct {
+    name: []const u8,
+    source: []const u8,
+};
+
 pub const Case = struct {
     name: []const u8,
     template: []const u8,
+    /// The loader's contents. Zig builds a `MapLoader`; the reference driver
+    /// builds a `DictLoader` from the same table.
+    templates: []const Tpl = &.{},
     /// The render context, as JSON (so the Python side gets it verbatim).
     context: []const u8 = "{}",
     autoescape: bool = false,
@@ -275,6 +285,410 @@ pub const cases = [_]Case{
     .{ .name = "whitespace_only_template", .template = "   \n   " },
     .{ .name = "tag_at_very_start_and_end", .template = "{{ 1 }}mid{{ 2 }}" },
 
+    // ── inheritance ─────────────────────────────────────────────────────────
+    .{
+        .name = "extends_basic",
+        .templates = &.{.{ .name = "base", .source = "[{% block body %}base{% endblock %}]" }},
+        .template = "{% extends 'base' %}{% block body %}child{% endblock %}",
+    },
+    .{
+        .name = "extends_block_not_overridden",
+        .templates = &.{.{ .name = "base", .source = "[{% block a %}A{% endblock %}{% block b %}B{% endblock %}]" }},
+        .template = "{% extends 'base' %}{% block a %}a!{% endblock %}",
+    },
+    .{
+        .name = "extends_child_text_is_discarded",
+        .templates = &.{.{ .name = "base", .source = "[{% block x %}base{% endblock %}]" }},
+        .template = "{% extends 'base' %}THIS TEXT VANISHES{% block x %}c{% endblock %}",
+    },
+    .{
+        .name = "extends_child_toplevel_set_is_visible_in_block",
+        .templates = &.{.{ .name = "base", .source = "[{% block x %}base{% endblock %}]" }},
+        .template = "{% extends 'base' %}{% set v = 42 %}{% block x %}{{ v }}{% endblock %}",
+    },
+    .{
+        .name = "extends_computed_name",
+        .templates = &.{.{ .name = "b1", .source = "ONE {% block x %}{% endblock %}" }},
+        .template = "{% extends n %}{% block x %}!{% endblock %}",
+        .context = "{\"n\": \"b1\"}",
+    },
+    .{
+        .name = "extends_name_from_set_above_it",
+        .templates = &.{.{ .name = "b2", .source = "TWO {% block x %}{% endblock %}" }},
+        .template = "{% set which = 'b2' %}{% extends which %}{% block x %}!{% endblock %}",
+    },
+    .{
+        .name = "super_three_levels",
+        .templates = &.{
+            .{ .name = "a", .source = "A[{% block x %}a{% endblock %}]" },
+            .{ .name = "b", .source = "{% extends 'a' %}{% block x %}b({{ super() }}){% endblock %}" },
+        },
+        .template = "{% extends 'b' %}{% block x %}c({{ super() }}){% endblock %}",
+    },
+    .{
+        .name = "super_twice_in_one_block",
+        .templates = &.{.{ .name = "a", .source = "{% block x %}a{% endblock %}" }},
+        .template = "{% extends 'a' %}{% block x %}{{ super() }}{{ super() }}{% endblock %}",
+    },
+    .{
+        .name = "super_skips_a_level_that_does_not_define_it",
+        .templates = &.{
+            .{ .name = "a", .source = "{% block x %}a{% endblock %}" },
+            .{ .name = "b", .source = "{% extends 'a' %}" },
+        },
+        .template = "{% extends 'b' %}{% block x %}[{{ super() }}]{% endblock %}",
+    },
+    .{
+        .name = "nested_blocks",
+        .templates = &.{.{ .name = "base", .source = "[{% block o %}o({% block i %}i{% endblock %}){% endblock %}]" }},
+        .template = "{% extends 'base' %}{% block i %}I{% endblock %}",
+    },
+    .{
+        .name = "nested_blocks_outer_overridden_drops_inner",
+        .templates = &.{.{ .name = "base", .source = "[{% block o %}o({% block i %}i{% endblock %}){% endblock %}]" }},
+        .template = "{% extends 'base' %}{% block o %}O{% endblock %}{% block i %}I{% endblock %}",
+    },
+    .{
+        .name = "block_in_for_is_not_scoped_by_default",
+        .templates = &.{.{ .name = "base", .source = "{% for i in [1,2] %}{% block x %}[{{ i }}]{% endblock %}{% endfor %}" }},
+        .template = "{% extends 'base' %}{% block x %}<{{ i }}>{% endblock %}",
+    },
+    .{
+        .name = "block_in_for_scoped_sees_the_loop_var",
+        .templates = &.{.{ .name = "base", .source = "{% for i in [1,2] %}{% block x scoped %}[{{ i }}]{% endblock %}{% endfor %}" }},
+        .template = "{% extends 'base' %}{% block x scoped %}<{{ i }}>{% endblock %}",
+    },
+    .{
+        .name = "block_sees_template_level_set_of_the_root",
+        .templates = &.{.{ .name = "base", .source = "{% set r = 'R' %}{% block x %}{{ r }}{% endblock %}" }},
+        .template = "{% extends 'base' %}{% block x %}[{{ r }}]{% endblock %}",
+    },
+    .{
+        .name = "block_body_may_contain_a_for",
+        .templates = &.{.{ .name = "base", .source = "{% block x %}{% endblock %}" }},
+        .template = "{% extends 'base' %}{% block x %}{% for i in [1,2] %}{{ i }}{% endfor %}{% endblock %}",
+    },
+    .{
+        .name = "required_block_overridden",
+        .templates = &.{.{ .name = "base", .source = "[{% block x required %}{% endblock %}]" }},
+        .template = "{% extends 'base' %}{% block x %}ok{% endblock %}",
+    },
+    .{
+        .name = "required_block_not_overridden_errors",
+        .templates = &.{.{ .name = "base", .source = "[{% block x required %}{% endblock %}]" }},
+        .template = "{% extends 'base' %}",
+        .expect_error = true,
+    },
+    .{
+        .name = "endblock_may_repeat_the_name",
+        .templates = &.{.{ .name = "base", .source = "[{% block x %}b{% endblock x %}]" }},
+        .template = "{% extends 'base' %}{% block x %}c{% endblock x %}",
+    },
+    .{
+        .name = "self_block_reference",
+        .templates = &.{.{ .name = "base", .source = "{% block x %}X{% endblock %}|{{ self.x() }}" }},
+        .template = "{% extends 'base' %}{% block x %}Y{% endblock %}",
+    },
+    .{
+        .name = "extends_missing_template_errors",
+        .template = "{% extends 'nope' %}",
+        .expect_error = true,
+    },
+    .{
+        .name = "extends_cycle_errors",
+        .templates = &.{.{ .name = "a", .source = "{% extends 'a' %}" }},
+        .template = "{% extends 'a' %}",
+        .expect_error = true,
+    },
+
+    // ── include ─────────────────────────────────────────────────────────────
+    .{
+        .name = "include_basic",
+        .templates = &.{.{ .name = "inc", .source = "<included>" }},
+        .template = "a{% include 'inc' %}b",
+    },
+    .{
+        .name = "include_sees_context_by_default",
+        .templates = &.{.{ .name = "inc", .source = "<{{ v }}>" }},
+        .template = "{% set v = 1 %}{% include 'inc' %}",
+    },
+    .{
+        .name = "include_without_context_sees_nothing",
+        .templates = &.{.{ .name = "inc", .source = "<{{ v }}><{{ ctxvar }}>" }},
+        .template = "{% set v = 1 %}{% include 'inc' without context %}",
+        .context = "{\"ctxvar\": \"C\"}",
+    },
+    .{
+        .name = "include_sees_the_loop_variable",
+        .templates = &.{.{ .name = "inc", .source = "<{{ i }}>" }},
+        .template = "{% for i in [1,2] %}{% include 'inc' %}{% endfor %}",
+    },
+    .{
+        .name = "include_set_does_not_leak_back",
+        .templates = &.{.{ .name = "inc", .source = "{% set w = 9 %}[{{ w }}]" }},
+        .template = "{% include 'inc' %}[{{ w }}]",
+    },
+    .{
+        .name = "include_ignore_missing",
+        .template = "{% include 'nope' ignore missing %}[end]",
+    },
+    .{
+        .name = "include_missing_without_ignore_errors",
+        .template = "{% include 'nope' %}",
+        .expect_error = true,
+    },
+    .{
+        .name = "include_candidate_list_picks_the_first_that_exists",
+        .templates = &.{.{ .name = "b", .source = "B" }},
+        .template = "{% include ['nope', 'b'] %}",
+    },
+    .{
+        .name = "include_candidate_list_all_missing_errors",
+        .template = "{% include ['nope', 'alsonope'] %}",
+        .expect_error = true,
+    },
+    .{
+        .name = "include_candidate_list_all_missing_ignored",
+        .template = "[{% include ['nope', 'alsonope'] ignore missing %}]",
+    },
+    .{
+        .name = "include_of_a_template_that_extends",
+        .templates = &.{
+            .{ .name = "base", .source = "B[{% block x %}b{% endblock %}]" },
+            .{ .name = "c", .source = "{% extends 'base' %}{% block x %}C{% endblock %}" },
+        },
+        .template = "{% include 'c' %}",
+    },
+    .{
+        .name = "include_inside_a_macro_sees_the_parameter",
+        .templates = &.{.{ .name = "inc", .source = "<{{ a }}>" }},
+        .template = "{% macro m(a) %}{% include 'inc' %}{% endmacro %}{{ m(7) }}",
+    },
+    .{
+        .name = "include_runs_in_order_with_surrounding_sets",
+        .templates = &.{.{ .name = "inc", .source = "<{{ v }}>" }},
+        .template = "{% include 'inc' %}{% set v = 1 %}{% include 'inc' %}",
+    },
+    .{
+        .name = "include_self_errors",
+        .templates = &.{.{ .name = "loop", .source = "x{% include 'loop' %}" }},
+        .template = "{% include 'loop' %}",
+        .expect_error = true,
+    },
+
+    // ── import ──────────────────────────────────────────────────────────────
+    .{
+        .name = "import_defaults_to_without_context",
+        .templates = &.{.{ .name = "m", .source = "{% macro f() %}<{{ v }}>{% endmacro %}" }},
+        .template = "{% set v = 1 %}{% import 'm' as m %}{{ m.f() }}",
+    },
+    .{
+        .name = "import_with_context",
+        .templates = &.{.{ .name = "m", .source = "{% macro f() %}<{{ v }}>{% endmacro %}" }},
+        .template = "{% set v = 1 %}{% import 'm' as m with context %}{{ m.f() }}",
+    },
+    .{
+        .name = "import_without_context_hides_the_render_context_too",
+        .templates = &.{.{ .name = "m", .source = "{% macro f() %}<{{ ctxvar }}>{% endmacro %}" }},
+        .template = "{% import 'm' as m %}{{ m.f() }}",
+        .context = "{\"ctxvar\": \"C\"}",
+    },
+    .{
+        .name = "import_with_context_is_a_snapshot_not_a_view",
+        .templates = &.{.{ .name = "m", .source = "{% macro f() %}<{{ v }}>{% endmacro %}" }},
+        .template = "{% import 'm' as m with context %}{% set v = 'later' %}{{ m.f() }}",
+    },
+    .{
+        .name = "import_module_level_set_is_visible_to_its_macros",
+        .templates = &.{.{ .name = "m", .source = "{% set mv = 'M' %}{% macro f() %}<{{ mv }}>{% endmacro %}" }},
+        .template = "{% import 'm' as m %}{{ m.f() }}",
+    },
+    .{
+        .name = "import_macro_sees_a_module_set_written_after_it",
+        .templates = &.{.{ .name = "m", .source = "{% macro f() %}<{{ mv }}>{% endmacro %}{% set mv = 'LATE' %}" }},
+        .template = "{% import 'm' as m %}{{ m.f() }}",
+    },
+    .{
+        .name = "import_produces_no_output",
+        .templates = &.{.{ .name = "m", .source = "LOOSE TEXT{% macro f() %}F{% endmacro %}" }},
+        .template = "[{% import 'm' as m %}]{{ m.f() }}",
+    },
+    .{
+        .name = "import_exposes_module_variables_not_just_macros",
+        .templates = &.{.{ .name = "m", .source = "{% set answer = 42 %}" }},
+        .template = "{% import 'm' as m %}{{ m.answer }}",
+    },
+    .{
+        .name = "from_import_with_alias",
+        .templates = &.{.{ .name = "m", .source = "{% macro f(a) %}f={{ a }}{% endmacro %}" }},
+        .template = "{% from 'm' import f as g %}{{ g(3) }}",
+    },
+    .{
+        .name = "from_import_several",
+        .templates = &.{.{ .name = "m", .source = "{% macro a() %}A{% endmacro %}{% macro b() %}B{% endmacro %}" }},
+        .template = "{% from 'm' import a, b %}{{ a() }}{{ b() }}",
+    },
+    .{
+        .name = "from_import_missing_name_is_undefined_not_an_error",
+        .templates = &.{.{ .name = "m", .source = "{% macro f() %}{% endmacro %}" }},
+        .template = "[{% from 'm' import g %}{{ g }}]",
+    },
+    .{
+        .name = "from_import_with_context",
+        .templates = &.{.{ .name = "m", .source = "{% macro f() %}<{{ v }}>{% endmacro %}" }},
+        .template = "{% set v = 'V' %}{% from 'm' import f with context %}{{ f() }}",
+    },
+    .{
+        .name = "import_missing_template_errors",
+        .template = "{% import 'nope' as m %}",
+        .expect_error = true,
+    },
+    .{
+        .name = "import_ignores_blocks_in_the_module",
+        .templates = &.{.{ .name = "m", .source = "{% block b %}B{% endblock %}{% macro f() %}F{% endmacro %}" }},
+        .template = "{% import 'm' as m %}{{ m.f() }}",
+    },
+
+    // ── macros ──────────────────────────────────────────────────────────────
+    .{ .name = "macro_local_definition_and_call", .template = "{% macro m(a) %}[{{ a }}]{% endmacro %}{{ m(1) }}{{ m('x') }}" },
+    .{ .name = "macro_defaults_and_keywords", .template = "{% macro f(a, b=2) %}{{ a }}{{ b }}{% endmacro %}{{ f(1) }}{{ f(1,9) }}{{ f(b=8,a=7) }}" },
+    .{ .name = "macro_missing_argument_is_undefined", .template = "{% macro f(a) %}[{{ a }}]{% endmacro %}{{ f() }}" },
+    .{ .name = "macro_sees_a_later_template_level_set", .template = "{% macro m(a) %}[{{ a }}{{ v }}]{% endmacro %}{% set v='V' %}{{ m(1) }}" },
+    .{ .name = "macro_varargs_and_kwargs", .template = "{% macro f(a) %}{{ a }}|{{ varargs }}|{{ kwargs }}{% endmacro %}{{ f(1,2,3,k=4) }}" },
+    .{ .name = "macro_varargs_empty", .template = "{% macro f(a) %}{{ varargs }}{% endmacro %}{{ f(1) }}" },
+    .{ .name = "macro_extra_positional_without_varargs_errors", .template = "{% macro f(a) %}{{ a }}{% endmacro %}{{ f(1,2) }}", .expect_error = true },
+    .{ .name = "macro_unexpected_keyword_errors", .template = "{% macro f(a) %}{{ a }}{% endmacro %}{{ f(1, zzz=2) }}", .expect_error = true },
+    .{ .name = "macro_introspection_attributes", .template = "{% macro f(a, b=1) %}{% endmacro %}{{ f.name }}|{{ f.arguments }}|{{ f.catch_kwargs }}|{{ f.catch_varargs }}|{{ f.caller }}" },
+    .{ .name = "macro_repr", .template = "{% macro f() %}x{% endmacro %}{{ f }}" },
+    .{ .name = "macro_recursive_by_name", .template = "{% macro f(n) %}{{ n }}{% if n > 0 %}{{ f(n-1) }}{% endif %}{% endmacro %}{{ f(3) }}" },
+    .{ .name = "macro_infinite_recursion_errors", .template = "{% macro f() %}{{ f() }}{% endmacro %}{{ f() }}", .expect_error = true },
+    .{ .name = "macro_inside_a_for_body", .template = "{% for i in [1,2] %}{% macro m() %}[{{ i }}]{% endmacro %}{{ m() }}{% endfor %}" },
+    .{ .name = "macro_output_is_a_value", .template = "{% macro m() %}  pad  {% endmacro %}[{{ m()|trim }}]" },
+    .{
+        .name = "imported_macro_uses_a_caller_registered_filter",
+        .templates = &.{.{ .name = "m", .source = "{% macro f(x) %}{{ x|upper }}!{% endmacro %}" }},
+        .template = "{% import 'm' as m %}{{ m.f('hi') }}",
+    },
+    .{
+        .name = "imported_macro_calls_another_macro_in_its_module",
+        .templates = &.{.{ .name = "m", .source = "{% macro a() %}A{% endmacro %}{% macro b() %}[{{ a() }}]{% endmacro %}" }},
+        .template = "{% from 'm' import b %}{{ b() }}",
+    },
+
+    // ── call / caller ───────────────────────────────────────────────────────
+    .{ .name = "call_block_basic", .template = "{% macro m() %}<{{ caller() }}>{% endmacro %}{% call m() %}BODY{% endcall %}" },
+    .{ .name = "call_block_with_arguments", .template = "{% macro m() %}{{ caller('X', 2) }}{% endmacro %}{% call(a, b) m() %}<{{ a }}{{ b }}>{% endcall %}" },
+    .{ .name = "call_block_with_keyword_argument", .template = "{% macro m() %}{{ caller(x=1) }}{% endmacro %}{% call(x) m() %}[{{ x }}]{% endcall %}" },
+    .{ .name = "call_block_body_sees_the_enclosing_loop", .template = "{% macro m() %}({{ caller() }}){% endmacro %}{% for i in [1,2] %}{% call m() %}{{ i }}{% endcall %}{% endfor %}" },
+    .{ .name = "call_block_caller_invoked_twice", .template = "{% macro m() %}{{ caller() }}{{ caller() }}{% endmacro %}{% call m() %}x{% endcall %}" },
+    .{ .name = "call_block_on_a_macro_without_caller_errors", .template = "{% macro m() %}M{% endmacro %}{% call m() %}body{% endcall %}", .expect_error = true },
+    .{
+        .name = "call_block_on_an_imported_macro",
+        .templates = &.{.{ .name = "m", .source = "{% macro wrap() %}[{{ caller() }}]{% endmacro %}" }},
+        .template = "{% import 'm' as m %}{% call m.wrap() %}inner{% endcall %}",
+    },
+
+    // ── recursive loops ─────────────────────────────────────────────────────
+    .{
+        .name = "for_recursive_tree",
+        .template = "{% for i in t recursive %}[{{ i.n }}{{ loop(i.c) if i.c }}]{% endfor %}",
+        .context = "{\"t\": [{\"n\": 1, \"c\": [{\"n\": 2, \"c\": []}]}, {\"n\": 3, \"c\": []}]}",
+    },
+    .{
+        .name = "for_recursive_depth_and_length",
+        .template = "{% for i in t recursive %}{{ loop.depth }}/{{ loop.length }} {{ loop(i.c) }}{% endfor %}",
+        .context = "{\"t\": [{\"c\": [{\"c\": []}, {\"c\": []}]}]}",
+    },
+    .{
+        .name = "for_recursive_indent",
+        .template = "{% for i in t recursive %}{{ '  ' * (loop.depth0) }}{{ i.n }}\n{{ loop(i.c) }}{% endfor %}",
+        .context = "{\"t\": [{\"n\": \"a\", \"c\": [{\"n\": \"b\", \"c\": []}]}]}",
+    },
+
+    // ── composition + autoescape ────────────────────────────────────────────
+    .{ .name = "autoescape_macro_output_is_markup", .template = "{% macro m() %}<b>{{ x }}</b>{% endmacro %}{{ m() }}", .context = "{\"x\": \"<i>\"}", .autoescape = true },
+    .{
+        .name = "autoescape_block_and_super",
+        .templates = &.{.{ .name = "base", .source = "{% block x %}<b>{% endblock %}" }},
+        .template = "{% extends 'base' %}{% block x %}{{ super() }}{{ v }}{% endblock %}",
+        .context = "{\"v\": \"<i>\"}",
+        .autoescape = true,
+    },
+    .{
+        .name = "autoescape_included_output_is_not_double_escaped",
+        .templates = &.{.{ .name = "inc", .source = "<b>{{ v }}</b>" }},
+        .template = "{% include 'inc' %}",
+        .context = "{\"v\": \"<i>\"}",
+        .autoescape = true,
+    },
+    .{ .name = "autoescape_caller_output", .template = "{% macro m() %}[{{ caller() }}]{% endmacro %}{% call m() %}<i>{{ v }}{% endcall %}", .context = "{\"v\": \"<b>\"}", .autoescape = true },
+
+    // ── composition + whitespace control ────────────────────────────────────
+    .{
+        .name = "extends_with_trim_and_lstrip",
+        .templates = &.{.{ .name = "base", .source = "start\n    {% block x %}\n    body\n    {% endblock %}\nend\n" }},
+        .template = "{% extends 'base' %}\n{% block x %}\n  child\n{% endblock %}\n",
+        .trim_blocks = true,
+        .lstrip_blocks = true,
+    },
+    .{
+        .name = "include_with_trim_blocks",
+        .templates = &.{.{ .name = "inc", .source = "{% for i in [1,2] %}\n{{ i }}\n{% endfor %}" }},
+        .template = "A\n{% include 'inc' %}\nB",
+        .trim_blocks = true,
+        .lstrip_blocks = true,
+    },
+    .{
+        .name = "macro_whitespace_control",
+        .template = "{% macro m(x) -%}\n  {{ x }}\n{%- endmacro %}[{{ m(1) }}]",
+    },
+
+    // ── a realistic composed configuration ──────────────────────────────────
+    .{
+        .name = "config_composed_device",
+        .templates = &.{
+            .{
+                .name = "device_base",
+                .source =
+                \\hostname {{ host }}
+                \\!
+                \\{% block interfaces %}{% endblock %}
+                \\!
+                \\{% block routing %}no ip routing{% endblock %}
+                \\!
+                ,
+            },
+            .{
+                .name = "macros",
+                .source =
+                \\{% macro iface(name, addr, mask, desc=none) %}
+                \\interface {{ name }}
+                \\{% if desc %} description {{ desc }}
+                \\{% endif %} ip address {{ addr }} {{ mask }}
+                \\{% endmacro %}
+                ,
+            },
+        },
+        .template =
+        \\{% extends 'device_base' %}
+        \\{% import 'macros' as m %}
+        \\{% block interfaces %}
+        \\{% for i in interfaces %}{{ m.iface(i.name, i.addr, i.mask, i.desc) }}{% endfor %}
+        \\{% endblock %}
+        \\{% block routing %}{{ super() }}
+        \\ip routing
+        \\{% endblock %}
+        ,
+        .context =
+        \\{"host": "sw1", "interfaces": [
+        \\  {"name": "Gi0/1", "addr": "10.0.0.1", "mask": "255.255.255.0", "desc": "uplink"},
+        \\  {"name": "Gi0/2", "addr": "10.0.1.1", "mask": "255.255.255.0", "desc": null}
+        \\]}
+        ,
+        .trim_blocks = true,
+        .lstrip_blocks = true,
+    },
+
     // ── realistic device-configuration templates ────────────────────────────
     .{
         .name = "config_interfaces",
@@ -350,6 +764,14 @@ pub fn toJson(gpa: std.mem.Allocator) ![]u8 {
         try std.json.Stringify.value(c.template, .{}, w);
         try w.writeAll(",\"context\":");
         try std.json.Stringify.value(c.context, .{}, w);
+        try w.writeAll(",\"templates\":{");
+        for (c.templates, 0..) |t, ti| {
+            if (ti != 0) try w.writeAll(",");
+            try std.json.Stringify.value(t.name, .{}, w);
+            try w.writeAll(":");
+            try std.json.Stringify.value(t.source, .{}, w);
+        }
+        try w.writeAll("}");
         try w.print(
             ",\"autoescape\":{},\"strict\":{},\"trim_blocks\":{},\"lstrip_blocks\":{},\"keep_trailing_newline\":{},\"expect_error\":{}}}",
             .{ c.autoescape, c.strict, c.trim_blocks, c.lstrip_blocks, c.keep_trailing_newline, c.expect_error },

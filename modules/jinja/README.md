@@ -3,11 +3,14 @@
 A Jinja2-compatible template engine in pure Zig. It takes a template string and
 a context value and produces bytes: `{{ expression }}` output, `{# comments #}`,
 `{% if %}` / `{% for %}` / `{% set %}` / `{% filter %}` / `{% with %}` /
-`{% do %}` / `{% raw %}` statements, the full Jinja expression grammar (chained
-comparisons, conditional expressions, slices, list/dict literals, filters, tests
-and method calls), 46 built-in filters, 29 built-in tests, the complete `loop`
-object, `namespace()`, and every whitespace control the reference implementation
-has. Semantics follow Python, not C: `/` always yields a float, `//` and `%`
+`{% do %}` / `{% raw %}` statements, template composition (`{% extends %}` +
+`{% block %}` with `super()`, `scoped` and `required`; `{% include %}`;
+`{% import %}` / `{% from … import … %}`; `{% macro %}` and `{% call %}` /
+`caller()`), the full Jinja expression grammar (chained comparisons, conditional
+expressions, slices, list/dict literals, filters, tests and method calls), 46
+built-in filters, 29 built-in tests, the complete `loop` object including
+`{% for … recursive %}`, `namespace()`, and every whitespace control the
+reference implementation has. Semantics follow Python, not C: `/` always yields a float, `//` and `%`
 floor (`-7 % 2 == 1`), `round` is banker's rounding of the value's exact binary
 magnitude, and values print with CPython's `repr` — `True`, `None`, `1.0`,
 `['a', 1]`, `('a', 1)`, `{'a': 1}`. It is built for generating configuration
@@ -16,9 +19,10 @@ corrupt such output — what happens to an undefined variable, and whether outpu
 is HTML-escaped — are explicit options rather than defaults you discover in
 production.
 
-Template **inheritance and reuse** (`{% extends %}`, `{% block %}`,
-`{% include %}`, `{% import %}`, `{% macro %}`) is not implemented. Naming one
-of those tags is a compile error that says so; it is never a silent no-op.
+Anything the reference has that this does not — i18n (`{% trans %}`), the
+`{% autoescape %}` block, eight filters, four tests, three globals — is a
+**compile error naming the tag or name**, never a silent no-op. `SPEC.md` §6
+lists every one.
 
 Provenance: see the `jinja` entry in the repository `NOTICE` — clean-room from
 the Jinja2 documentation and the observable behaviour of the reference
@@ -148,6 +152,9 @@ fn fromYaml(arena: std.mem.Allocator, v: yaml.Value) !jinja.Value {
 | `lstrip_blocks` | `false` | Strip leading whitespace from line start to a statement or comment tag. |
 | `keep_trailing_newline` | `false` | Keep the template's final newline. |
 | `max_output_bytes` | 64 MiB | Ceiling on rendered output; a runaway loop fails loudly. |
+| `max_template_depth` | 32 | Combined `{% extends %}`/`{% include %}`/`{% import %}` nesting bound. |
+| `max_call_depth` | 64 | Macro, `{% call %}` and `loop()` recursion bound. |
+| `max_templates` | 256 | Distinct templates one render may load. |
 
 **The `.strict` default inverts the reference implementation's.** That is
 deliberate and is the module's one behavioural divergence in the default path:
@@ -160,6 +167,94 @@ Autoescaping is off unless you ask for it, and there is no guessing from a file
 extension (this module has no loader). With it on, `|safe` marks a string as
 markup, `|escape` produces markup, and markup propagates through `~`, `+`,
 `|join` and the case-changing filters exactly as markupsafe's `Markup` does.
+
+## Composition
+
+Everything that needs a second template needs a **loader** — without one, every
+composition tag is `error.NoLoader` rather than a quiet nothing:
+
+```zig
+var map: jinja.MapLoader = .{ .entries = &.{
+    .{ .name = "base",   .source = @embedFile("templates/base.j2") },
+    .{ .name = "macros", .source = @embedFile("templates/macros.j2") },
+} };
+var env = try jinja.Environment.initWithLoader(gpa, .{}, map.loader());
+```
+
+```jinja
+{% extends 'base' %}
+{% import 'macros' as m %}
+{% block interfaces %}
+{% for i in interfaces %}{{ m.iface(i.name, i.addr, i.mask) }}{% endfor %}
+{% endblock %}
+{% block routing %}{{ super() }}
+ip routing
+{% endblock %}
+```
+
+Supported in full: multi-level `{% extends %}` chains with a computed
+(non-literal) parent name, `{% block %}` with `super()`, nesting, `scoped` and
+`required`, `{{ self.blockname() }}`, `{% include %}` with `ignore missing`,
+`with`/`without context` and a list of candidates, `{% import %}` and
+`{% from … import … as … %}`, `{% macro %}` with defaults, `varargs`, `kwargs`
+and the `name`/`arguments`/`catch_varargs`/`catch_kwargs`/`caller` introspection
+attributes, and `{% call(args) %}` / `caller()`.
+
+Four behaviours are worth knowing because guessing them wrong is easy — all four
+are pinned against the reference:
+
+- **`{% include %}` defaults to *with* context; `{% import %}` defaults to
+  *without*.** An included template sees everything currently in scope,
+  including loop variables; an imported one sees nothing at all — not even the
+  render context — unless you write `with context`.
+- **`import … with context` is a snapshot, not a live view.** A `{% set %}`
+  *after* the import is not visible to the imported macros.
+- **A block does not see the loop it sits in.** `{% block x %}` inside a
+  `{% for %}` renders with the loop variable *undefined*; `{% block x scoped %}`
+  is the opt-in.
+- **A child template's top-level `{% set %}` still runs.** Its output is
+  discarded, but the assignment is visible to every block — which is how
+  `{% set which = 'b' %}{% extends which %}` works at all.
+
+## Loaders
+
+```zig
+pub const Loader = struct {
+    ctx: *const anyopaque,
+    /// Source for `name` from `arena`, or null when there is no such template.
+    load: *const fn (ctx: *const anyopaque, arena, name: []const u8) LoaderError!?[]const u8,
+};
+```
+
+`null` means "absent" and drives `ignore missing` and the candidate-list form;
+an error means "the loader refused or failed". Two are shipped:
+
+- **`MapLoader`** — a slice of `{ name, source }`, which can be a comptime
+  constant. The natural choice for `@embedFile`d template sets and for tests.
+- **`DirLoader`** — a directory, and **contained within it**. Name validation
+  refuses absolute paths, `..`, `.`, backslashes, NULs and empty components;
+  then the path is walked one component at a time with `follow_symlinks = false`
+  on every open, so no symlink anywhere along it is traversed and no re-resolved
+  string is ever handed back to the kernel. `resolve_beneath` is requested too,
+  where the platform has it. See `SPEC.md` §10 for the guarantee, the two
+  deliberate strictnesses, and the one thing it does not promise.
+
+```zig
+var dl: jinja.DirLoader = .{
+    .io = io,
+    .root = try std.Io.Dir.cwd().openDir(io, "templates", .{}),
+    .options = .{ .suffix = ".j2", .max_bytes = 1 << 20 },
+};
+var env = try jinja.Environment.initWithLoader(gpa, .{}, dl.loader());
+```
+
+A caller's own loader is just a `Loader` — reuse `jinja.checkTemplateName` if it
+touches a filesystem.
+
+Cycles and runaway expansion are bounded structurally, not by hoping: an
+inheritance cycle is caught by *name* while the chain is built, and include /
+import nesting, macro recursion and `loop()` recursion each hit a depth cap.
+`SPEC.md` §10 names the tests that fire the bombs.
 
 ## Whitespace control
 
@@ -278,7 +373,7 @@ ZIG_LIBS_VERBOSE_SKIP=1 zig build test-jinja # say why a live test skipped
 zig build test-jinja --fuzz --release=safe   # fuzz the compiler
 ```
 
-The conformance suite renders a 209-case corpus with **Python Jinja2 3.1.6** in
+The conformance suite renders a 292-case corpus with **Python Jinja2 3.1.6** in
 a subprocess and compares byte for byte, and separately against a committed
 golden file produced by that same reference so an offline host still asserts
 conformance. Python is a test oracle only — nothing links against it. If

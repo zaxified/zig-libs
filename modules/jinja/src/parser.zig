@@ -37,9 +37,7 @@ pub const Registry = struct {
 /// not. They get a named error rather than "unknown tag", so the message says
 /// what is going on instead of looking like a typo.
 const unimplemented_tags = [_][]const u8{
-    "extends", "block",    "endblock",  "include",    "import",
-    "from",    "macro",    "endmacro",  "call",       "endcall",
-    "trans",   "endtrans", "pluralize", "autoescape", "endautoescape",
+    "trans", "endtrans", "pluralize", "autoescape", "endautoescape",
 };
 
 pub fn parse(
@@ -47,11 +45,11 @@ pub fn parse(
     pieces: []const lex.Piece,
     registry: Registry,
     diag: *Diagnostic,
-) Error![]const Node {
+) Error!ast.Parsed {
     var p: Parser = .{ .arena = arena, .pieces = pieces, .registry = registry, .diag = diag };
     const body = try p.parseBody(&.{});
     if (p.idx < pieces.len) return p.failAt(pieces[p.idx].line, "unexpected end tag");
-    return body.nodes;
+    return .{ .nodes = body.nodes, .blocks = p.blocks.items, .extends = p.extends };
 }
 
 const Body = struct {
@@ -68,6 +66,10 @@ const Parser = struct {
     idx: usize = 0,
     registry: Registry,
     diag: *Diagnostic,
+    /// Every `{% block %}` seen, at any nesting depth.
+    blocks: std.ArrayList(ast.BlockDef) = .empty,
+    /// The first top-level `{% extends %}`.
+    extends: ?*const Expr = null,
 
     fn failAt(self: *Parser, line: usize, comptime msg: []const u8) Error {
         self.diag.set(line, "{s}", .{msg});
@@ -134,6 +136,13 @@ const Parser = struct {
         if (std.mem.eql(u8, kw.text, "set")) return self.parseSet(rest, line, out);
         if (std.mem.eql(u8, kw.text, "filter")) return self.parseFilterBlock(rest, line, out);
         if (std.mem.eql(u8, kw.text, "with")) return self.parseWith(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "extends")) return self.parseExtends(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "block")) return self.parseBlock(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "include")) return self.parseInclude(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "import")) return self.parseImport(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "from")) return self.parseFromImport(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "macro")) return self.parseMacro(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "call")) return self.parseCallBlock(rest, line, out);
         if (std.mem.eql(u8, kw.text, "do")) {
             var ts: Stream = .{ .toks = rest, .p = self };
             const e = try ts.parseExpression(line, true);
@@ -182,7 +191,7 @@ const Parser = struct {
         const iterable = try ts.parseExpression(line, false);
         var cond: ?*const Expr = null;
         if (ts.eatName("if")) cond = try ts.parseExpression(line, false);
-        if (ts.eatName("recursive")) return self.failAt(line, "`recursive` loops are not implemented (see SPEC.md)");
+        const recursive = ts.eatName("recursive");
         try ts.expectEnd(line);
 
         const body = try self.parseBody(&.{ "else", "endfor" });
@@ -197,7 +206,7 @@ const Parser = struct {
             .cond = cond,
             .body = body.nodes,
             .empty = empty,
-            .recursive = false,
+            .recursive = recursive,
         } });
     }
 
@@ -255,7 +264,280 @@ const Parser = struct {
         const body = try self.parseBody(&.{"endwith"});
         try out.append(self.arena, .{ .with = .{ .assignments = assigns.items, .body = body.nodes } });
     }
+
+    // ── composition ─────────────────────────────────────────────────────────
+
+    fn parseExtends(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        const name = try ts.parseExpression(line, true);
+        try ts.expectEnd(line);
+        if (self.extends != null) return self.failAt(line, "a template may only extend once");
+        self.extends = name;
+        try out.append(self.arena, .{ .extends = .{ .name = name, .line = line } });
+    }
+
+    fn parseBlock(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        const name_tok = try ts.expect(.name, line, "expected a block name");
+        var scoped = false;
+        var required = false;
+        while (ts.peek() != null) {
+            if (ts.eatName("scoped")) {
+                scoped = true;
+            } else if (ts.eatName("required")) {
+                required = true;
+            } else break;
+        }
+        try ts.expectEnd(line);
+
+        for (self.blocks.items) |b| if (std.mem.eql(u8, b.name, name_tok.text))
+            return self.failAt(line, "block defined twice in the same template");
+
+        // Reserve the slot before parsing the body so a nested block of the
+        // same name is caught, and so nested blocks keep source order.
+        const slot = self.blocks.items.len;
+        try self.blocks.append(self.arena, .{
+            .name = name_tok.text,
+            .body = &.{},
+            .scoped = scoped,
+            .required = required,
+            .line = line,
+        });
+
+        const body = try self.parseBody(&.{"endblock"});
+        // `{% endblock name %}` may repeat the name; if it does, it must match.
+        var end: Stream = .{ .toks = body.end_toks, .p = self };
+        if (end.peek()) |t| {
+            if (t.kind == .name) {
+                _ = end.next();
+                if (!std.mem.eql(u8, t.text, name_tok.text))
+                    return self.failAt(body.end_line, "endblock name does not match the block");
+            }
+        }
+        try end.expectEnd(body.end_line);
+
+        if (required and body.nodes.len != 0)
+            return self.failAt(line, "a `required` block must have an empty body");
+
+        self.blocks.items[slot].body = body.nodes;
+        try out.append(self.arena, .{ .block = .{ .name = name_tok.text, .line = line } });
+    }
+
+    /// Shared tail of include/import/from: `[with|without] context`.
+    fn parseContextModifier(self: *Parser, ts: *Stream, dflt: bool) bool {
+        _ = self;
+        if (ts.peek()) |t| {
+            if (t.isName("with") and ts.peekAt(1) != null and ts.peekAt(1).?.isName("context")) {
+                ts.i += 2;
+                return true;
+            }
+            if (t.isName("without") and ts.peekAt(1) != null and ts.peekAt(1).?.isName("context")) {
+                ts.i += 2;
+                return false;
+            }
+        }
+        return dflt;
+    }
+
+    fn parseInclude(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        const names = try ts.parseExpression(line, true);
+        var ignore_missing = false;
+        if (ts.peek() != null and ts.peek().?.isName("ignore")) {
+            if (ts.peekAt(1) == null or !ts.peekAt(1).?.isName("missing"))
+                return self.failAt(line, "expected `missing` after `ignore`");
+            ts.i += 2;
+            ignore_missing = true;
+        }
+        const with_context = self.parseContextModifier(&ts, true);
+        try ts.expectEnd(line);
+        try out.append(self.arena, .{ .include = .{
+            .names = names,
+            .ignore_missing = ignore_missing,
+            .with_context = with_context,
+            .line = line,
+        } });
+    }
+
+    fn parseImport(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        const name = try ts.parseExpression(line, true);
+        if (!ts.eatName("as")) return self.failAt(line, "expected `as` in import-tag");
+        const target = try ts.expect(.name, line, "expected a name after `as`");
+        const with_context = self.parseContextModifier(&ts, false);
+        try ts.expectEnd(line);
+        try out.append(self.arena, .{ .import = .{
+            .name = name,
+            .target = target.text,
+            .with_context = with_context,
+            .line = line,
+        } });
+    }
+
+    fn parseFromImport(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        const template = try ts.parseExpression(line, true);
+        if (!ts.eatName("import")) return self.failAt(line, "expected `import` in from-tag");
+        var names: std.ArrayList(ast.FromImport.Alias) = .empty;
+        while (true) {
+            if (ts.peek() == null) break;
+            if (ts.peek().?.isName("with") or ts.peek().?.isName("without")) break;
+            const n = try ts.expect(.name, line, "expected an imported name");
+            var as = n.text;
+            if (ts.eatName("as")) as = (try ts.expect(.name, line, "expected a name after `as`")).text;
+            try names.append(self.arena, .{ .name = n.text, .as = as });
+            if (!ts.eat(.comma)) break;
+        }
+        if (names.items.len == 0) return self.failAt(line, "from-tag imports nothing");
+        const with_context = self.parseContextModifier(&ts, false);
+        try ts.expectEnd(line);
+        try out.append(self.arena, .{ .from_import = .{
+            .template = template,
+            .names = names.items,
+            .with_context = with_context,
+            .line = line,
+        } });
+    }
+
+    fn parseParams(self: *Parser, ts: *Stream, line: usize) Error![]const ast.Param {
+        var params: std.ArrayList(ast.Param) = .empty;
+        _ = try ts.expect(.lparen, line, "expected `(`");
+        while (!ts.eat(.rparen)) {
+            if (params.items.len != 0) _ = try ts.expect(.comma, line, "expected `,` between parameters");
+            if (ts.eat(.rparen)) break;
+            const n = try ts.expect(.name, line, "expected a parameter name");
+            var default: ?*const Expr = null;
+            if (ts.eat(.assign)) default = try ts.parseExpression(line, true);
+            try params.append(self.arena, .{ .name = n.text, .default = default });
+        }
+        return params.items;
+    }
+
+    fn parseMacro(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        const name = try ts.expect(.name, line, "expected a macro name");
+        const params = try self.parseParams(&ts, line);
+        try ts.expectEnd(line);
+        const body = try self.parseBody(&.{"endmacro"});
+
+        const def = try self.arena.create(ast.MacroDef);
+        def.* = .{
+            .name = name.text,
+            .params = params,
+            .body = body.nodes,
+            .catch_varargs = mentionsName(body.nodes, "varargs"),
+            .catch_kwargs = mentionsName(body.nodes, "kwargs"),
+            .uses_caller = mentionsName(body.nodes, "caller"),
+            .line = line,
+        };
+        try out.append(self.arena, .{ .macro = .{ .def = def, .line = line } });
+    }
+
+    fn parseCallBlock(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        var params: []const ast.Param = &.{};
+        if (ts.peek() != null and ts.peek().?.kind == .lparen) params = try self.parseParams(&ts, line);
+        const call = try ts.parseExpression(line, true);
+        try ts.expectEnd(line);
+        if (call.* != .call and call.* != .method)
+            return self.failAt(line, "a call-tag must invoke a macro");
+        const body = try self.parseBody(&.{"endcall"});
+        try out.append(self.arena, .{ .call_block = .{
+            .call = call,
+            .caller = .{
+                .name = "caller",
+                .params = params,
+                .body = body.nodes,
+                .catch_varargs = mentionsName(body.nodes, "varargs"),
+                .catch_kwargs = mentionsName(body.nodes, "kwargs"),
+                .line = line,
+            },
+            .line = line,
+        } });
+    }
 };
+
+// ── static "does this body mention that name?" ──────────────────────────────
+//
+// The reference decides at COMPILE time whether a macro accepts extra
+// positional or keyword arguments — a macro whose body never says `varargs`
+// rejects a third argument outright. Reproducing that means the same question
+// has to be answered here, by walking the body rather than by watching what
+// happens at call time.
+
+fn mentionsName(nodes: []const Node, name: []const u8) bool {
+    for (nodes) |n| if (nodeMentions(n, name)) return true;
+    return false;
+}
+
+fn nodeMentions(n: Node, name: []const u8) bool {
+    return switch (n) {
+        .text => false,
+        .output => |o| exprMentions(o.expr, name),
+        .do => |d| exprMentions(d.expr, name),
+        .if_ => |b| exprMentions(b.cond, name) or mentionsName(b.body, name) or mentionsName(b.orelse_, name),
+        .for_ => |f| exprMentions(f.iterable, name) or
+            (f.cond != null and exprMentions(f.cond.?, name)) or
+            mentionsName(f.body, name) or mentionsName(f.empty, name),
+        .set => |st| exprMentions(st.expr, name),
+        .set_block => |sb| mentionsName(sb.body, name) or (sb.filter != null and exprMentions(sb.filter.?, name)),
+        .filter_block => |fb| exprMentions(fb.filter, name) or mentionsName(fb.body, name),
+        .with => |w| blk: {
+            for (w.assignments) |a| if (exprMentions(a.expr, name)) break :blk true;
+            break :blk mentionsName(w.body, name);
+        },
+        .extends => |e| exprMentions(e.name, name),
+        .block => false,
+        .include => |i| exprMentions(i.names, name),
+        .import => |i| exprMentions(i.name, name),
+        .from_import => |i| exprMentions(i.template, name),
+        // A nested macro has its own `varargs`/`kwargs`/`caller`; mentions
+        // inside it do not belong to the enclosing one.
+        .macro => false,
+        .call_block => |c| exprMentions(c.call, name),
+    };
+}
+
+fn argsMention(a: ast.Args, name: []const u8) bool {
+    for (a.positional) |p| if (exprMentions(p, name)) return true;
+    for (a.keyword) |k| if (exprMentions(k.value, name)) return true;
+    return false;
+}
+
+fn exprMentions(e: *const Expr, name: []const u8) bool {
+    return switch (e.*) {
+        .literal => false,
+        .name => |n| std.mem.eql(u8, n, name),
+        .list, .tuple => |items| blk: {
+            for (items) |i| if (exprMentions(i, name)) break :blk true;
+            break :blk false;
+        },
+        .dict => |entries| blk: {
+            for (entries) |en| if (exprMentions(en.key, name) or exprMentions(en.value, name)) break :blk true;
+            break :blk false;
+        },
+        .getattr => |g| exprMentions(g.obj, name),
+        .getitem => |g| exprMentions(g.obj, name) or exprMentions(g.index, name),
+        .slice => |s| exprMentions(s.obj, name) or
+            (s.start != null and exprMentions(s.start.?, name)) or
+            (s.stop != null and exprMentions(s.stop.?, name)) or
+            (s.step != null and exprMentions(s.step.?, name)),
+        .binop => |b| exprMentions(b.lhs, name) or exprMentions(b.rhs, name),
+        .neg, .pos, .not => |inner| exprMentions(inner, name),
+        .compare => |c| blk: {
+            if (exprMentions(c.first, name)) break :blk true;
+            for (c.links) |l| if (exprMentions(l.right, name)) break :blk true;
+            break :blk false;
+        },
+        .logical => |l| exprMentions(l.lhs, name) or exprMentions(l.rhs, name),
+        .cond => |c| exprMentions(c.then, name) or exprMentions(c.cond, name) or
+            (c.otherwise != null and exprMentions(c.otherwise.?, name)),
+        .filter => |f| exprMentions(f.input, name) or argsMention(f.args, name),
+        .do_test => |t| exprMentions(t.input, name) or argsMention(t.args, name),
+        .call => |c| exprMentions(c.callee, name) or argsMention(c.args, name),
+        .method => |m| exprMentions(m.obj, name) or argsMention(m.args, name),
+    };
+}
 
 /// A cursor over one tag's tokens plus the whole expression grammar.
 const Stream = struct {

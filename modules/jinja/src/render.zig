@@ -11,6 +11,8 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const value = @import("value.zig");
 const filters = @import("filters.zig");
+const loader_mod = @import("loader.zig");
+const parser = @import("parser.zig");
 const Diagnostic = @import("diag.zig").Diagnostic;
 
 const Value = value.Value;
@@ -24,6 +26,23 @@ pub const Error = value.Error || error{
     NotCallable,
     /// A filter/test named at compile time vanished from the registry.
     UnknownFilter,
+    /// A composition tag named a template the loader does not have.
+    TemplateNotFound,
+    /// A composition tag was reached with no loader configured.
+    NoLoader,
+    /// `a extends b extends a` — caught structurally, before it can recurse.
+    TemplateCycle,
+    /// A depth cap was hit: template nesting, macro calls, or `loop()`.
+    TooDeep,
+    /// A loaded template failed to compile.
+    TemplateSyntaxError,
+    /// `{% block x required %}` reached without a derived template overriding
+    /// it, or `{{ super() }}` with no parent definition.
+    BlockError,
+    /// A macro was called with arguments it does not accept.
+    BadCall,
+    /// The loader itself failed (I/O, size cap, a name it refuses).
+    LoaderFailed,
 };
 
 pub const UndefinedPolicy = enum {
@@ -45,6 +64,14 @@ pub const Options = struct {
     /// A ceiling on rendered bytes, so a runaway loop fails loudly rather than
     /// eating the machine.
     max_output_bytes: usize = 64 << 20,
+    /// How deeply templates may nest through `{% extends %}`, `{% include %}`
+    /// and `{% import %}` combined. A cycle in the inheritance chain is caught
+    /// exactly by its names; this bounds everything else.
+    max_template_depth: usize = 32,
+    /// How deeply macros (and `{% call %}` bodies, and `loop()`) may nest.
+    max_call_depth: usize = 64,
+    /// How many distinct templates one render may load.
+    max_templates: usize = 256,
 };
 
 /// How the renderer reaches the environment's filter/test registries without
@@ -53,13 +80,68 @@ pub const Lookup = struct {
     ctx: *const anyopaque,
     filter: *const fn (ctx: *const anyopaque, name: []const u8) ?filters.Fn,
     test_fn: *const fn (ctx: *const anyopaque, name: []const u8) ?filters.TestFn,
+    /// Where `{% extends %}`/`{% include %}`/`{% import %}` get their bytes.
+    /// `null` makes every composition tag `error.NoLoader` — a template that
+    /// names another template on an environment with no loader is a mistake
+    /// worth reporting, not something to render around.
+    loader: ?loader_mod.Loader = null,
+    /// Compiles loaded source into a tree using the render arena. Owned by the
+    /// environment so this file never has to know about filter registries.
+    compile: *const fn (
+        ctx: *const anyopaque,
+        arena: std.mem.Allocator,
+        source: []const u8,
+        diag: *Diagnostic,
+    ) parser.Error!ast.Parsed,
 };
 
+/// A scope. Held by POINTER everywhere (`[]const *Frame`), never by value: a
+/// macro closes over the frames it was defined in, and a hash map copied by
+/// value would be left pointing at freed storage the moment the original grew.
 const Frame = std.StringArrayHashMapUnmanaged(Value);
+
+/// One loaded, compiled template.
+const Unit = struct {
+    name: []const u8,
+    parsed: ast.Parsed,
+};
+
+/// The scope a macro carries with it, allocated in the render arena so it
+/// outlives the statement that created it. `render.zig` owns every cast of
+/// `value.MacroRef.impl` to this type.
+const MacroImpl = struct {
+    def: *const ast.MacroDef,
+    /// The frame stack visible to the body, innermost last.
+    captured: []const *Frame,
+    /// Whether the render context is still visible. `{% import %}` without
+    /// context hides it; a locally defined macro keeps it.
+    keep_context: bool,
+    /// A block rendered through `self.name()` — it must not be re-entered as a
+    /// chain block, and it has no parameters.
+    block_body: ?[]const Node = null,
+};
+
+/// The state a `{% for … recursive %}` body needs so `loop()` can re-enter it.
+const RecursiveLoop = struct {
+    def: ast.For,
+    depth: usize,
+};
+
+/// A macro with no parameters and no body of its own — the shape `self.x()`
+/// needs, where the body comes from `MacroImpl.block_body`.
+const empty_macro_def: ast.MacroDef = .{ .name = "block", .params = &.{}, .body = &.{} };
+
+/// One entry of the block-resolution stack, so `{{ super() }}` knows which
+/// definition it is standing on.
+const BlockFrame = struct {
+    name: []const u8,
+    /// Index into `chain` of the definition currently rendering.
+    chain_index: usize,
+};
 
 pub fn render(
     arena: std.mem.Allocator,
-    nodes: []const Node,
+    parsed: ast.Parsed,
     context: Value,
     opts: Options,
     lookup: Lookup,
@@ -75,8 +157,10 @@ pub fn render(
         .diag = diag,
         .context = context,
     };
-    try r.frames.append(arena, .empty);
-    try r.renderNodes(nodes);
+    const entry = try arena.create(Unit);
+    entry.* = .{ .name = "<string>", .parsed = parsed };
+    try r.pushFrame();
+    try r.renderUnit(entry);
 }
 
 /// Enforces `max_output_bytes`. Not a `std.Io.Writer` implementation — the
@@ -101,9 +185,34 @@ const Renderer = struct {
     out: *Counting,
     diag: *Diagnostic,
     context: Value,
-    frames: std.ArrayList(Frame) = .empty,
+    frames: std.ArrayList(*Frame) = .empty,
     /// Bound while a `{% filter %}`/`{% set %}` block's chain is evaluated.
     block_input: ?Value = null,
+    /// The inheritance chain, most-derived first. Empty until a unit renders.
+    chain: []const *Unit = &.{},
+    /// Which block definitions are currently on the stack, for `super()`.
+    block_stack: std.ArrayList(BlockFrame) = .empty,
+    /// The `{% call %}` body available to the macro being rendered.
+    caller: ?Value = null,
+    /// The loop a `{% for … recursive %}` body may re-enter via `loop()`.
+    recursive: ?RecursiveLoop = null,
+    /// Per-render template cache: a name is loaded and compiled at most once.
+    cache: std.StringHashMapUnmanaged(*Unit) = .empty,
+    template_depth: usize = 0,
+    call_depth: usize = 0,
+    loads: usize = 0,
+    /// Set while a child template's top-level nodes run for their side effects
+    /// only — output goes nowhere and block positions are skipped.
+    prelude: bool = false,
+    /// Lazily built `self` object.
+    self_ns: ?*value.Namespace = null,
+    /// Set by an `{% extends %}` node during a prelude pass.
+    pending_parent: ?[]const u8 = null,
+    /// The `{% call %}` body waiting to be handed to the macro being invoked.
+    pending_caller: ?Value = null,
+    /// True while an `{% import %}`ed template runs, so macros defined there
+    /// do not capture the importing render's context.
+    in_module: bool = false,
 
     fn fail(self: *Renderer, line: usize, comptime fmt: []const u8, args: anytype, e: Error) Error {
         self.diag.set(line, fmt, args);
@@ -112,8 +221,14 @@ const Renderer = struct {
 
     // ── scopes ──────────────────────────────────────────────────────────────
 
-    fn push(self: *Renderer) Error!void {
-        try self.frames.append(self.arena, .empty);
+    fn newFrame(self: *Renderer) Error!*Frame {
+        const f = try self.arena.create(Frame);
+        f.* = .empty;
+        return f;
+    }
+
+    fn pushFrame(self: *Renderer) Error!void {
+        try self.frames.append(self.arena, try self.newFrame());
     }
 
     fn pop(self: *Renderer) void {
@@ -121,8 +236,7 @@ const Renderer = struct {
     }
 
     fn define(self: *Renderer, name: []const u8, v: Value) Error!void {
-        const top = &self.frames.items[self.frames.items.len - 1];
-        try top.put(self.arena, name, v);
+        try self.frames.items[self.frames.items.len - 1].put(self.arena, name, v);
     }
 
     fn resolve(self: *Renderer, name: []const u8) Value {
@@ -136,7 +250,25 @@ const Renderer = struct {
             .namespace => |ns| if (ns.get(name)) |v| return v,
             else => {},
         }
+        if (std.mem.eql(u8, name, "self")) {
+            if (self.selfObject()) |ns| return .{ .namespace = ns } else |_| {}
+        }
         return .{ .undef = .{ .name = name } };
+    }
+
+    /// Swap in a whole new scope stack — what a macro call, an `{% import %}`
+    /// and a non-`scoped` block all need. The caller restores.
+    fn swapFrames(self: *Renderer, frames: std.ArrayList(*Frame)) std.ArrayList(*Frame) {
+        const old = self.frames;
+        self.frames = frames;
+        return old;
+    }
+
+    fn framesFrom(self: *Renderer, captured: []const *Frame) Error!std.ArrayList(*Frame) {
+        var list: std.ArrayList(*Frame) = .empty;
+        try list.appendSlice(self.arena, captured);
+        try list.append(self.arena, try self.newFrame());
+        return list;
     }
 
     // ── nodes ───────────────────────────────────────────────────────────────
@@ -147,8 +279,13 @@ const Renderer = struct {
 
     fn renderNode(self: *Renderer, n: Node) Error!void {
         switch (n) {
-            .text => |t| try self.out.writeAll(t),
+            .text => |t| if (!self.prelude) try self.out.writeAll(t),
             .output => |o| {
+                // In a child template's prelude, output is suppressed and the
+                // expression is not evaluated at all — the reference discards
+                // everything outside a block, and evaluating it anyway would
+                // invent errors a real render never sees.
+                if (self.prelude) return;
                 const v = try self.eval(o.expr, o.line);
                 try self.emit(v, o.line);
             },
@@ -189,7 +326,7 @@ const Renderer = struct {
                 try self.emit(v, 0);
             },
             .with => |wth| {
-                try self.push();
+                try self.pushFrame();
                 defer self.pop();
                 for (wth.assignments) |a| {
                     const v = try self.eval(a.expr, 0);
@@ -198,7 +335,452 @@ const Renderer = struct {
                 try self.renderNodes(wth.body);
             },
             .do => |d| _ = try self.eval(d.expr, d.line),
+
+            // ── composition ────────────────────────────────────────────────
+            .extends => |e| {
+                // Only ever reached inside a prelude pass; `renderUnit` has
+                // already decided the template extends something, and the name
+                // is evaluated HERE so it can depend on a `{% set %}` above it.
+                const name = try self.eval(e.name, e.line);
+                self.pending_parent = try self.templateName(name, e.line);
+            },
+            .block => |b| {
+                if (self.prelude) return;
+                try self.renderBlockNamed(b.name, b.line);
+            },
+            .include => |i| try self.renderInclude(i),
+            .import => |i| {
+                const ns = try self.importModule(i.name, i.with_context, i.line);
+                try self.define(i.target, .{ .namespace = ns });
+            },
+            .from_import => |i| {
+                const ns = try self.importModule(i.template, i.with_context, i.line);
+                for (i.names) |alias| {
+                    // A name the module does not define is undefined, not an
+                    // error — verified against the reference.
+                    try self.define(alias.as, ns.get(alias.name) orelse .{ .undef = .{ .name = alias.name } });
+                }
+            },
+            .macro => |m| try self.define(m.def.name, try self.makeMacro(m.def, null)),
+            .call_block => |c| try self.renderCallBlock(c),
         }
+    }
+
+    // ── templates: loading, the inheritance chain, blocks ───────────────────
+
+    fn templateName(self: *Renderer, v: Value, line: usize) Error![]const u8 {
+        if (v == .undef) return self.fail(line, "template name '{s}' is undefined", .{v.undef.name}, error.UndefinedValue);
+        if (v != .string) return self.fail(line, "a template name must be a string, not {s}", .{v.typeName()}, error.TypeMismatch);
+        return v.string.bytes;
+    }
+
+    /// Load + compile `name`, or null when the loader has no such template.
+    /// Cached for the whole render, so a template included in a loop compiles
+    /// once and a diamond inheritance graph loads each side once.
+    fn loadUnit(self: *Renderer, name: []const u8, line: usize) Error!?*Unit {
+        if (self.cache.get(name)) |u| return u;
+        const ldr = self.lookup.loader orelse
+            return self.fail(line, "'{s}' cannot be loaded: this environment has no loader", .{name}, error.NoLoader);
+        if (self.loads >= self.opts.max_templates)
+            return self.fail(line, "this render has already loaded {d} templates", .{self.loads}, error.TooDeep);
+
+        const source = ldr.load(ldr.ctx, self.arena, name) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LoaderFailed => return self.fail(line, "the loader refused or failed on '{s}'", .{name}, error.LoaderFailed),
+        } orelse return null;
+
+        self.loads += 1;
+        const parsed = self.lookup.compile(self.lookup.ctx, self.arena, source, self.diag) catch {
+            // The compile diagnostic lives in `self.diag`'s own buffer, so it
+            // has to be copied out before that buffer is rewritten — printing
+            // straight from it aliases source and destination.
+            var copy: [512]u8 = undefined;
+            const msg = self.diag.message();
+            const n = @min(msg.len, copy.len);
+            @memcpy(copy[0..n], msg[0..n]);
+            return self.fail(self.diag.line, "in template '{s}': {s}", .{ name, copy[0..n] }, error.TemplateSyntaxError);
+        };
+
+        const u = try self.arena.create(Unit);
+        u.* = .{ .name = try self.arena.dupe(u8, name), .parsed = parsed };
+        try self.cache.put(self.arena, u.name, u);
+        return u;
+    }
+
+    fn requireUnit(self: *Renderer, name: []const u8, line: usize) Error!*Unit {
+        return (try self.loadUnit(name, line)) orelse
+            self.fail(line, "template '{s}' not found", .{name}, error.TemplateNotFound);
+    }
+
+    /// Render one template as the entry of its own inheritance chain.
+    ///
+    /// A template that extends does not render its own body: its top-level
+    /// nodes run once for their side effects (a `{% set %}` there IS visible to
+    /// the blocks — verified against the reference), output suppressed, and the
+    /// chain's ROOT-most template is what actually produces bytes, with block
+    /// positions resolving to the most derived definition.
+    fn renderUnit(self: *Renderer, entry: *Unit) Error!void {
+        if (self.template_depth >= self.opts.max_template_depth)
+            return self.fail(0, "template nesting deeper than {d}", .{self.opts.max_template_depth}, error.TooDeep);
+        self.template_depth += 1;
+        defer self.template_depth -= 1;
+
+        const saved_chain = self.chain;
+        defer self.chain = saved_chain;
+
+        if (entry.parsed.extends == null) {
+            const one = try self.arena.alloc(*Unit, 1);
+            one[0] = entry;
+            self.chain = one;
+            return self.renderNodes(entry.parsed.nodes);
+        }
+
+        var chain: std.ArrayList(*Unit) = .empty;
+        try chain.append(self.arena, entry);
+
+        var cur = entry;
+        while (cur.parsed.extends != null) {
+            // The prelude runs the child's top-level statements for effect.
+            const was_prelude = self.prelude;
+            self.prelude = true;
+            self.pending_parent = null;
+            self.renderNodes(cur.parsed.nodes) catch |e| {
+                self.prelude = was_prelude;
+                return e;
+            };
+            self.prelude = was_prelude;
+
+            const parent_name = self.pending_parent orelse
+                return self.fail(0, "template extends something that never resolved", .{}, error.TemplateNotFound);
+            self.pending_parent = null;
+
+            for (chain.items) |seen| if (std.mem.eql(u8, seen.name, parent_name))
+                return self.fail(0, "inheritance cycle: '{s}' is already in the chain", .{parent_name}, error.TemplateCycle);
+            if (chain.items.len >= self.opts.max_template_depth)
+                return self.fail(0, "inheritance chain longer than {d}", .{self.opts.max_template_depth}, error.TooDeep);
+
+            const parent = try self.requireUnit(parent_name, 0);
+            try chain.append(self.arena, parent);
+            cur = parent;
+        }
+
+        self.chain = chain.items;
+        try self.renderNodes(cur.parsed.nodes);
+    }
+
+    /// The most derived definition of `name`, as an index into `chain`.
+    fn resolveBlock(self: *Renderer, name: []const u8, from: usize) ?struct { idx: usize, def: ast.BlockDef } {
+        var i = from;
+        while (i < self.chain.len) : (i += 1) {
+            for (self.chain[i].parsed.blocks) |b| {
+                if (std.mem.eql(u8, b.name, name)) return .{ .idx = i, .def = b };
+            }
+        }
+        return null;
+    }
+
+    fn renderBlockNamed(self: *Renderer, name: []const u8, line: usize) Error!void {
+        const found = self.resolveBlock(name, 0) orelse return;
+        try self.renderBlockDef(name, found.idx, found.def, line);
+    }
+
+    fn renderBlockDef(self: *Renderer, name: []const u8, idx: usize, def: ast.BlockDef, line: usize) Error!void {
+        if (def.required)
+            return self.fail(line, "required block '{s}' was not overridden by a derived template", .{name}, error.BlockError);
+
+        try self.block_stack.append(self.arena, .{ .name = name, .chain_index = idx });
+        defer _ = self.block_stack.pop();
+
+        if (def.scoped) {
+            // `scoped` is the opt-in that lets the body see the enclosing
+            // loop's variables.
+            try self.pushFrame();
+            defer self.pop();
+            return self.renderNodes(def.body);
+        }
+        // Without it a block sees only template-level names — which is why a
+        // block inside a `{% for %}` cannot read the loop variable.
+        var sub: std.ArrayList(*Frame) = .empty;
+        try sub.append(self.arena, self.frames.items[0]);
+        try sub.append(self.arena, try self.newFrame());
+        const saved = self.swapFrames(sub);
+        defer _ = self.swapFrames(saved);
+        try self.renderNodes(def.body);
+    }
+
+    /// `{{ super() }}` — the next definition of the block currently rendering.
+    fn doSuper(self: *Renderer, line: usize) Error!Value {
+        if (self.block_stack.items.len == 0)
+            return self.fail(line, "super() outside a block", .{}, error.BlockError);
+        const top = self.block_stack.items[self.block_stack.items.len - 1];
+        const found = self.resolveBlock(top.name, top.chain_index + 1) orelse
+            return self.fail(line, "super() in block '{s}' has no parent definition", .{top.name}, error.BlockError);
+
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        var sub: Counting = .{ .inner = &aw.writer, .limit = self.out.limit, .written = self.out.written };
+        const saved = self.out;
+        self.out = &sub;
+        self.renderBlockDef(top.name, found.idx, found.def, line) catch |e| {
+            self.out = saved;
+            return e;
+        };
+        self.out = saved;
+        self.out.written = sub.written;
+        return .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
+    }
+
+    /// `self` — every block of the current chain as a callable, resolved the
+    /// same way a block position resolves.
+    fn selfObject(self: *Renderer) Error!*value.Namespace {
+        if (self.self_ns) |ns| return ns;
+        const ns = try self.arena.create(value.Namespace);
+        ns.* = .{};
+        for (self.chain) |u| {
+            for (u.parsed.blocks) |b| {
+                if (ns.get(b.name) != null) continue;
+                const found = self.resolveBlock(b.name, 0) orelse continue;
+                const impl = try self.arena.create(MacroImpl);
+                impl.* = .{
+                    .def = &empty_macro_def,
+                    .captured = try self.arena.dupe(*Frame, self.frames.items[0..1]),
+                    .keep_context = true,
+                    .block_body = found.def.body,
+                };
+                try ns.set(self.arena, b.name, .{ .macro = .{ .name = b.name, .impl = impl } });
+            }
+        }
+        self.self_ns = ns;
+        return ns;
+    }
+
+    // ── include / import ───────────────────────────────────────────────────
+
+    fn renderInclude(self: *Renderer, i: ast.Include) Error!void {
+        const v = try self.eval(i.names, i.line);
+        const candidates: []const Value = switch (v) {
+            .list, .tuple => |items| items,
+            else => blk: {
+                const one = try self.arena.alloc(Value, 1);
+                one[0] = v;
+                break :blk one;
+            },
+        };
+        for (candidates) |c| {
+            const name = try self.templateName(c, i.line);
+            const unit = try self.loadUnit(name, i.line) orelse continue;
+            return self.renderNested(unit, i.with_context);
+        }
+        if (i.ignore_missing) return;
+        return self.fail(i.line, "none of the included templates could be loaded", .{}, error.TemplateNotFound);
+    }
+
+    /// Render `unit` inside the current render. With context it sees everything
+    /// currently in scope (including loop variables) but its own `{% set %}`s
+    /// do not leak back; without context it starts from nothing at all — not
+    /// even the render context, which the reference also hides.
+    fn renderNested(self: *Renderer, unit: *Unit, with_context: bool) Error!void {
+        const saved_ctx = self.context;
+        const saved_self = self.self_ns;
+        defer {
+            self.context = saved_ctx;
+            self.self_ns = saved_self;
+        }
+        self.self_ns = null;
+
+        var frames: std.ArrayList(*Frame) = .empty;
+        if (with_context) {
+            try frames.appendSlice(self.arena, self.frames.items);
+        } else {
+            self.context = .{ .map = .{ .pairs = &.{} } };
+        }
+        try frames.append(self.arena, try self.newFrame());
+        const saved = self.swapFrames(frames);
+        defer _ = self.swapFrames(saved);
+
+        try self.renderUnit(unit);
+    }
+
+    /// `{% import %}` / `{% from … import … %}` — run a template for its
+    /// definitions, discard its output, and hand back its namespace.
+    fn importModule(self: *Renderer, name_expr: *const Expr, with_context: bool, line: usize) Error!*value.Namespace {
+        const name = try self.templateName(try self.eval(name_expr, line), line);
+        const unit = try self.requireUnit(name, line);
+
+        const module_frame = try self.newFrame();
+        if (with_context) {
+            // A snapshot, not a live view: the reference passes the context at
+            // import time, so a `{% set %}` after the import is not visible.
+            switch (self.context) {
+                .map => |m| for (m.pairs) |pr| switch (pr.key) {
+                    .string => |k| try module_frame.put(self.arena, k.bytes, pr.value),
+                    else => {},
+                },
+                .namespace => |ns| for (ns.pairs.items) |pr| switch (pr.key) {
+                    .string => |k| try module_frame.put(self.arena, k.bytes, pr.value),
+                    else => {},
+                },
+                else => {},
+            }
+            for (self.frames.items) |f| {
+                var it = f.iterator();
+                while (it.next()) |e| try module_frame.put(self.arena, e.key_ptr.*, e.value_ptr.*);
+            }
+        }
+
+        var frames: std.ArrayList(*Frame) = .empty;
+        try frames.append(self.arena, module_frame);
+
+        const saved_ctx = self.context;
+        const saved_module = self.in_module;
+        const saved_self = self.self_ns;
+        self.context = .{ .map = .{ .pairs = &.{} } };
+        self.in_module = true;
+        self.self_ns = null;
+        const saved_frames = self.swapFrames(frames);
+
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        var sink: Counting = .{ .inner = &aw.writer, .limit = self.out.limit };
+        const saved_out = self.out;
+        self.out = &sink;
+
+        const result = self.renderUnit(unit);
+
+        self.out = saved_out;
+        _ = self.swapFrames(saved_frames);
+        self.context = saved_ctx;
+        self.in_module = saved_module;
+        self.self_ns = saved_self;
+        try result;
+
+        const ns = try self.arena.create(value.Namespace);
+        ns.* = .{};
+        var it = module_frame.iterator();
+        while (it.next()) |e| try ns.set(self.arena, e.key_ptr.*, e.value_ptr.*);
+        return ns;
+    }
+
+    // ── macros ─────────────────────────────────────────────────────────────
+
+    fn makeMacro(self: *Renderer, def: *const ast.MacroDef, block_body: ?[]const Node) Error!Value {
+        const impl = try self.arena.create(MacroImpl);
+        impl.* = .{
+            .def = def,
+            // The frames are captured by POINTER, so a macro defined before a
+            // later `{% set %}` still sees it — which is what the reference
+            // does.
+            .captured = try self.arena.dupe(*Frame, self.frames.items),
+            .keep_context = !self.in_module,
+            .block_body = block_body,
+        };
+        return .{ .macro = .{ .name = def.name, .impl = impl } };
+    }
+
+    fn callMacro(self: *Renderer, ref: value.MacroRef, args: filters.Args, line: usize) Error!Value {
+        const impl: *const MacroImpl = @ptrCast(@alignCast(ref.impl));
+        const def = impl.def;
+
+        if (self.call_depth >= self.opts.max_call_depth)
+            return self.fail(line, "macro/loop recursion deeper than {d} — '{s}'", .{ self.opts.max_call_depth, ref.name }, error.TooDeep);
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+
+        const supplied_caller = self.pending_caller;
+        self.pending_caller = null;
+        if (supplied_caller != null and !def.uses_caller and impl.block_body == null)
+            return self.fail(line, "macro '{s}' does not use caller(), so it cannot take a {{% call %}} body", .{ref.name}, error.BadCall);
+
+        const frames = try self.framesFrom(impl.captured);
+        const params_frame = frames.items[frames.items.len - 1];
+
+        const saved_ctx = self.context;
+        const saved_caller = self.caller;
+        const saved_recursive = self.recursive;
+        const saved_self = self.self_ns;
+        if (!impl.keep_context) self.context = .{ .map = .{ .pairs = &.{} } };
+        // A macro body is not inside the caller's loop.
+        self.recursive = null;
+        self.self_ns = null;
+        const saved_frames = self.swapFrames(frames);
+        defer {
+            _ = self.swapFrames(saved_frames);
+            self.context = saved_ctx;
+            self.caller = saved_caller;
+            self.recursive = saved_recursive;
+            self.self_ns = saved_self;
+        }
+
+        if (impl.block_body == null) try self.bindMacroArgs(def, params_frame, args, ref.name, line);
+        if (supplied_caller) |c| try params_frame.put(self.arena, "caller", c);
+
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        var sink: Counting = .{ .inner = &aw.writer, .limit = self.out.limit, .written = self.out.written };
+        const saved_out = self.out;
+        self.out = &sink;
+        const body = impl.block_body orelse def.body;
+        const result = self.renderNodes(body);
+        self.out = saved_out;
+        self.out.written = sink.written;
+        try result;
+
+        return .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
+    }
+
+    fn bindMacroArgs(
+        self: *Renderer,
+        def: *const ast.MacroDef,
+        frame: *Frame,
+        args: filters.Args,
+        name: []const u8,
+        line: usize,
+    ) Error!void {
+        const used_kw = try self.arena.alloc(bool, args.kw.len);
+        @memset(used_kw, false);
+
+        for (def.params, 0..) |p, i| {
+            var bound: ?Value = null;
+            if (i < args.pos.len) {
+                bound = args.pos[i];
+            } else {
+                for (args.kw, 0..) |k, ki| {
+                    if (std.mem.eql(u8, k.name, p.name)) {
+                        bound = k.value;
+                        used_kw[ki] = true;
+                        break;
+                    }
+                }
+            }
+            if (bound == null and p.default != null) bound = try self.eval(p.default.?, line);
+            // A parameter with no argument and no default is undefined, not an
+            // error — the reference renders it as empty under its default
+            // policy rather than refusing the call.
+            try frame.put(self.arena, p.name, bound orelse .{ .undef = .{ .name = p.name } });
+        }
+
+        if (args.pos.len > def.params.len) {
+            if (!def.catch_varargs)
+                return self.fail(line, "macro '{s}' takes at most {d} positional argument(s)", .{ name, def.params.len }, error.BadCall);
+            try frame.put(self.arena, "varargs", .{ .tuple = args.pos[def.params.len..] });
+        } else if (def.catch_varargs) {
+            try frame.put(self.arena, "varargs", .{ .tuple = &.{} });
+        }
+
+        var extra: std.ArrayList(value.Pair) = .empty;
+        for (args.kw, 0..) |k, ki| {
+            if (used_kw[ki]) continue;
+            try extra.append(self.arena, .{ .key = Value.str(k.name), .value = k.value });
+        }
+        if (extra.items.len != 0 and !def.catch_kwargs)
+            return self.fail(line, "macro '{s}' got an unexpected keyword argument '{s}'", .{ name, extra.items[0].key.string.bytes }, error.BadCall);
+        if (def.catch_kwargs) try frame.put(self.arena, "kwargs", .{ .map = .{ .pairs = extra.items } });
+    }
+
+    fn renderCallBlock(self: *Renderer, c: ast.CallBlock) Error!void {
+        const caller_macro = try self.makeMacro(&c.caller, null);
+        const saved = self.pending_caller;
+        self.pending_caller = caller_macro;
+        defer self.pending_caller = saved;
+        const v = try self.eval(c.call, c.line);
+        try self.emit(v, c.line);
     }
 
     fn evalWithBlockInput(self: *Renderer, chain: *const Expr, input: Value) Error!Value {
@@ -216,7 +798,7 @@ const Renderer = struct {
         // EMPTY rather than raising, unlike attribute access on it.
         const raw: []const Value = if (seq_val == .undef) &.{} else try value.iterate(self.arena, seq_val);
 
-        try self.push();
+        try self.pushFrame();
         defer self.pop();
 
         var items: []const Value = raw;
@@ -233,15 +815,55 @@ const Renderer = struct {
             try self.renderNodes(f.empty);
             return;
         }
+        try self.runLoop(f, items, 0);
+    }
 
+    /// One level of a loop. `depth` is non-zero only for a `recursive` loop
+    /// re-entered through `loop()`.
+    fn runLoop(self: *Renderer, f: ast.For, items: []const Value, depth: usize) Error!void {
         const loop = try self.arena.create(value.Loop);
-        loop.* = .{ .items = items };
+        loop.* = .{ .items = items, .depth0 = depth };
         try self.define("loop", .{ .loop = loop });
+
+        const saved_recursive = self.recursive;
+        defer self.recursive = saved_recursive;
+        self.recursive = if (f.recursive) .{ .def = f, .depth = depth } else null;
+
         for (items, 0..) |item, i| {
             loop.index0 = i;
             try self.bindTarget(f.target, item);
             try self.renderNodes(f.body);
         }
+    }
+
+    /// `{{ loop(children) }}` inside a `{% for … recursive %}` body.
+    fn recurseLoop(self: *Renderer, args: filters.Args, line: usize) Error!Value {
+        const rec = self.recursive orelse
+            return self.fail(line, "loop() is only callable inside a `{{% for … recursive %}}` body", .{}, error.NotCallable);
+        if (args.pos.len != 1) return self.fail(line, "loop() takes exactly one sequence", .{}, error.BadCall);
+        if (self.call_depth >= self.opts.max_call_depth)
+            return self.fail(line, "recursive loop deeper than {d}", .{self.opts.max_call_depth}, error.TooDeep);
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+
+        const items = try value.iterate(self.arena, args.pos[0]);
+
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        var sink: Counting = .{ .inner = &aw.writer, .limit = self.out.limit, .written = self.out.written };
+        const saved_out = self.out;
+        self.out = &sink;
+
+        try self.pushFrame();
+        const result = if (items.len == 0)
+            self.renderNodes(rec.def.empty)
+        else
+            self.runLoop(rec.def, items, rec.depth + 1);
+        self.pop();
+
+        self.out = saved_out;
+        self.out.written = sink.written;
+        try result;
+        return .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
     }
 
     fn bindTarget(self: *Renderer, t: ast.Target, item: Value) Error!void {
@@ -432,8 +1054,17 @@ const Renderer = struct {
     fn callFilterThunk(ctx: *filters.Ctx, name: []const u8, input: Value, args: filters.Args) filters.Error!Value {
         const self: *Renderer = @ptrCast(@alignCast(@constCast(ctx.user)));
         return self.applyFilter(name, input, args, 0) catch |e| switch (e) {
-            error.OutputTooLarge, error.NotCallable, error.UnknownFilter => error.BadArgument,
-            else => |other| other,
+            error.OutOfMemory => error.OutOfMemory,
+            error.UndefinedValue => error.UndefinedValue,
+            error.TypeMismatch => error.TypeMismatch,
+            error.DivisionByZero => error.DivisionByZero,
+            error.OutOfRange => error.OutOfRange,
+            error.BadArgument => error.BadArgument,
+            error.Unsupported => error.Unsupported,
+            // Everything a nested filter can raise that the filter ABI has no
+            // word for collapses to BadArgument; the diagnostic already carries
+            // the real reason.
+            else => error.BadArgument,
         };
     }
 
@@ -458,6 +1089,11 @@ const Renderer = struct {
         if (c.callee.* == .name) {
             const name = c.callee.name;
             const args = try self.evalArgs(c.args, c.line);
+            if (std.mem.eql(u8, name, "super") and self.block_stack.items.len != 0)
+                return self.doSuper(c.line);
+            const bound = self.resolve(name);
+            if (bound == .macro) return self.callMacro(bound.macro, args, c.line);
+            if (std.mem.eql(u8, name, "loop")) return self.recurseLoop(args, c.line);
             if (std.mem.eql(u8, name, "range")) return self.globalRange(args, c.line);
             if (std.mem.eql(u8, name, "dict")) return self.globalDict(args);
             if (std.mem.eql(u8, name, "namespace")) return self.globalNamespace(args);
@@ -528,8 +1164,23 @@ const Renderer = struct {
             .map => |m| return m.get(name) orelse .{ .undef = .{ .name = name } },
             .namespace => |ns| return ns.get(name) orelse .{ .undef = .{ .name = name } },
             .loop => |l| return self.loopAttr(l, name),
+            .macro => |m| return self.macroAttr(m, name),
             else => return .{ .undef = .{ .name = name } },
         }
+    }
+
+    fn macroAttr(self: *Renderer, m: value.MacroRef, name: []const u8) Error!Value {
+        const impl: *const MacroImpl = @ptrCast(@alignCast(m.impl));
+        if (std.mem.eql(u8, name, "name")) return Value.str(m.name);
+        if (std.mem.eql(u8, name, "arguments")) {
+            const out = try self.arena.alloc(Value, impl.def.params.len);
+            for (impl.def.params, 0..) |p, i| out[i] = Value.str(p.name);
+            return .{ .tuple = out };
+        }
+        if (std.mem.eql(u8, name, "catch_varargs")) return .{ .boolean = impl.def.catch_varargs };
+        if (std.mem.eql(u8, name, "catch_kwargs")) return .{ .boolean = impl.def.catch_kwargs };
+        if (std.mem.eql(u8, name, "caller")) return .{ .boolean = impl.def.uses_caller };
+        return .{ .undef = .{ .name = name } };
     }
 
     fn loopAttr(self: *Renderer, l: *value.Loop, name: []const u8) Error!Value {
@@ -601,6 +1252,16 @@ const Renderer = struct {
     }
 
     fn callMethod(self: *Renderer, obj: Value, name: []const u8, args: filters.Args, line: usize) Error!Value {
+        // `{% import 'm' as m %}{{ m.hello() }}` — the attribute IS the macro.
+        switch (obj) {
+            .namespace => |ns| if (ns.get(name)) |v| {
+                if (v == .macro) return self.callMacro(v.macro, args, line);
+            },
+            .map => |m| if (m.get(name)) |v| {
+                if (v == .macro) return self.callMacro(v.macro, args, line);
+            },
+            else => {},
+        }
         if (obj == .loop) {
             const l = obj.loop;
             if (std.mem.eql(u8, name, "cycle")) {

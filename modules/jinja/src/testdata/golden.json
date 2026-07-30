@@ -12,12 +12,73 @@
    "out": "7",
    "status": "ok"
   },
+  "autoescape_block_and_super": {
+   "out": "<b>&lt;i&gt;",
+   "status": "ok"
+  },
+  "autoescape_caller_output": {
+   "out": "[<i>&lt;b&gt;]",
+   "status": "ok"
+  },
   "autoescape_filter_block": {
    "out": "&LT;B&GT;",
    "status": "ok"
   },
+  "autoescape_included_output_is_not_double_escaped": {
+   "out": "<b>&lt;i&gt;</b>",
+   "status": "ok"
+  },
+  "autoescape_macro_output_is_markup": {
+   "out": "<b>&lt;i&gt;</b>",
+   "status": "ok"
+  },
+  "block_body_may_contain_a_for": {
+   "out": "12",
+   "status": "ok"
+  },
+  "block_in_for_is_not_scoped_by_default": {
+   "out": "<><>",
+   "status": "ok"
+  },
+  "block_in_for_scoped_sees_the_loop_var": {
+   "out": "<1><2>",
+   "status": "ok"
+  },
+  "block_sees_template_level_set_of_the_root": {
+   "out": "[R]",
+   "status": "ok"
+  },
   "bool_arithmetic": {
    "out": "2|3|1",
+   "status": "ok"
+  },
+  "call_block_basic": {
+   "out": "<BODY>",
+   "status": "ok"
+  },
+  "call_block_body_sees_the_enclosing_loop": {
+   "out": "(1)(2)",
+   "status": "ok"
+  },
+  "call_block_caller_invoked_twice": {
+   "out": "xx",
+   "status": "ok"
+  },
+  "call_block_on_a_macro_without_caller_errors": {
+   "kind": "TypeError",
+   "msg": "macro 'm' was invoked with two values for the special caller argument. This is most likely a bug.",
+   "status": "error"
+  },
+  "call_block_on_an_imported_macro": {
+   "out": "[inner]",
+   "status": "ok"
+  },
+  "call_block_with_arguments": {
+   "out": "<X2>",
+   "status": "ok"
+  },
+  "call_block_with_keyword_argument": {
+   "out": "[1]",
    "status": "ok"
   },
   "chained_filters_on_dict": {
@@ -73,6 +134,10 @@
    "out": "10 permit ip any any\n20 deny tcp 10.0.0.0/8 any\n",
    "status": "ok"
   },
+  "config_composed_device": {
+   "out": "hostname sw1\n!\ninterface Gi0/1\n description uplink\n ip address 10.0.0.1 255.255.255.0\ninterface Gi0/2\n ip address 10.0.1.1 255.255.255.0\n!\nno ip routing\nip routing\n!",
+   "status": "ok"
+  },
   "config_interfaces": {
    "out": "hostname sw1\n!\ninterface Gi0/1\n description uplink\n ip address 10.0.0.1 255.255.255.0\n no shutdown\n!\ninterface Gi0/2\n no ip address\n shutdown\n!\n",
    "status": "ok"
@@ -104,6 +169,10 @@
   },
   "dot_integer_index": {
    "out": "20",
+   "status": "ok"
+  },
+  "endblock_may_repeat_the_name": {
+   "out": "[c]",
    "status": "ok"
   },
   "escape_filter_when_off": {
@@ -160,6 +229,44 @@
   },
   "escape_xmlattr": {
    "out": "<a href=\"a&amp;b\">",
+   "status": "ok"
+  },
+  "extends_basic": {
+   "out": "[child]",
+   "status": "ok"
+  },
+  "extends_block_not_overridden": {
+   "out": "[a!B]",
+   "status": "ok"
+  },
+  "extends_child_text_is_discarded": {
+   "out": "[c]",
+   "status": "ok"
+  },
+  "extends_child_toplevel_set_is_visible_in_block": {
+   "out": "[42]",
+   "status": "ok"
+  },
+  "extends_computed_name": {
+   "out": "ONE !",
+   "status": "ok"
+  },
+  "extends_cycle_errors": {
+   "kind": "RecursionError",
+   "msg": "maximum recursion depth exceeded",
+   "status": "error"
+  },
+  "extends_missing_template_errors": {
+   "kind": "TemplateNotFound",
+   "msg": "nope",
+   "status": "error"
+  },
+  "extends_name_from_set_above_it": {
+   "out": "TWO !",
+   "status": "ok"
+  },
+  "extends_with_trim_and_lstrip": {
+   "out": "start\n  child\nend",
    "status": "ok"
   },
   "filter_abs_round": {
@@ -423,6 +530,34 @@
    "out": "[]",
    "status": "ok"
   },
+  "for_recursive_depth_and_length": {
+   "out": "1/1 2/2 2/2 ",
+   "status": "ok"
+  },
+  "for_recursive_indent": {
+   "out": "a\n  b\n",
+   "status": "ok"
+  },
+  "for_recursive_tree": {
+   "out": "[1[2]][3]",
+   "status": "ok"
+  },
+  "from_import_missing_name_is_undefined_not_an_error": {
+   "out": "[]",
+   "status": "ok"
+  },
+  "from_import_several": {
+   "out": "AB",
+   "status": "ok"
+  },
+  "from_import_with_alias": {
+   "out": "f=3",
+   "status": "ok"
+  },
+  "from_import_with_context": {
+   "out": "<V>",
+   "status": "ok"
+  },
   "global_dict": {
    "out": "{'a': 1, 'b': 2}",
    "status": "ok"
@@ -443,8 +578,120 @@
    "out": "a",
    "status": "ok"
   },
+  "import_defaults_to_without_context": {
+   "out": "<>",
+   "status": "ok"
+  },
+  "import_exposes_module_variables_not_just_macros": {
+   "out": "42",
+   "status": "ok"
+  },
+  "import_ignores_blocks_in_the_module": {
+   "out": "F",
+   "status": "ok"
+  },
+  "import_macro_sees_a_module_set_written_after_it": {
+   "out": "<LATE>",
+   "status": "ok"
+  },
+  "import_missing_template_errors": {
+   "kind": "TemplateNotFound",
+   "msg": "nope",
+   "status": "error"
+  },
+  "import_module_level_set_is_visible_to_its_macros": {
+   "out": "<M>",
+   "status": "ok"
+  },
+  "import_produces_no_output": {
+   "out": "[]F",
+   "status": "ok"
+  },
+  "import_with_context": {
+   "out": "<1>",
+   "status": "ok"
+  },
+  "import_with_context_is_a_snapshot_not_a_view": {
+   "out": "<>",
+   "status": "ok"
+  },
+  "import_without_context_hides_the_render_context_too": {
+   "out": "<>",
+   "status": "ok"
+  },
+  "imported_macro_calls_another_macro_in_its_module": {
+   "out": "[A]",
+   "status": "ok"
+  },
+  "imported_macro_uses_a_caller_registered_filter": {
+   "out": "HI!",
+   "status": "ok"
+  },
   "in_operator": {
    "out": "True|True|True|True",
+   "status": "ok"
+  },
+  "include_basic": {
+   "out": "a<included>b",
+   "status": "ok"
+  },
+  "include_candidate_list_all_missing_errors": {
+   "kind": "TemplatesNotFound",
+   "msg": "none of the templates given were found: nope, alsonope",
+   "status": "error"
+  },
+  "include_candidate_list_all_missing_ignored": {
+   "out": "[]",
+   "status": "ok"
+  },
+  "include_candidate_list_picks_the_first_that_exists": {
+   "out": "B",
+   "status": "ok"
+  },
+  "include_ignore_missing": {
+   "out": "[end]",
+   "status": "ok"
+  },
+  "include_inside_a_macro_sees_the_parameter": {
+   "out": "<7>",
+   "status": "ok"
+  },
+  "include_missing_without_ignore_errors": {
+   "kind": "TemplateNotFound",
+   "msg": "nope",
+   "status": "error"
+  },
+  "include_of_a_template_that_extends": {
+   "out": "B[C]",
+   "status": "ok"
+  },
+  "include_runs_in_order_with_surrounding_sets": {
+   "out": "<><1>",
+   "status": "ok"
+  },
+  "include_sees_context_by_default": {
+   "out": "<1>",
+   "status": "ok"
+  },
+  "include_sees_the_loop_variable": {
+   "out": "<1><2>",
+   "status": "ok"
+  },
+  "include_self_errors": {
+   "kind": "RecursionError",
+   "msg": "maximum recursion depth exceeded",
+   "status": "error"
+  },
+  "include_set_does_not_leak_back": {
+   "out": "[9][]",
+   "status": "ok"
+  },
+  "include_with_trim_blocks": {
+   "out": "A\n1\n2\nB",
+   "status": "ok"
+  },
+  "include_without_context_sees_nothing": {
+   "out": "<><>",
    "status": "ok"
   },
   "index_out_of_range_is_undefined": {
@@ -475,6 +722,69 @@
    "out": "[gone]",
    "status": "ok"
   },
+  "macro_defaults_and_keywords": {
+   "out": "121978",
+   "status": "ok"
+  },
+  "macro_extra_positional_without_varargs_errors": {
+   "kind": "TypeError",
+   "msg": "macro 'f' takes not more than 1 argument(s)",
+   "status": "error"
+  },
+  "macro_infinite_recursion_errors": {
+   "kind": "RecursionError",
+   "msg": "maximum recursion depth exceeded",
+   "status": "error"
+  },
+  "macro_inside_a_for_body": {
+   "out": "[1][2]",
+   "status": "ok"
+  },
+  "macro_introspection_attributes": {
+   "out": "f|('a', 'b')|False|False|False",
+   "status": "ok"
+  },
+  "macro_local_definition_and_call": {
+   "out": "[1][x]",
+   "status": "ok"
+  },
+  "macro_missing_argument_is_undefined": {
+   "out": "[]",
+   "status": "ok"
+  },
+  "macro_output_is_a_value": {
+   "out": "[pad]",
+   "status": "ok"
+  },
+  "macro_recursive_by_name": {
+   "out": "3210",
+   "status": "ok"
+  },
+  "macro_repr": {
+   "out": "<Macro 'f'>",
+   "status": "ok"
+  },
+  "macro_sees_a_later_template_level_set": {
+   "out": "[1V]",
+   "status": "ok"
+  },
+  "macro_unexpected_keyword_errors": {
+   "kind": "TypeError",
+   "msg": "macro 'f' takes no keyword argument 'zzz'",
+   "status": "error"
+  },
+  "macro_varargs_and_kwargs": {
+   "out": "1|(2, 3)|{'k': 4}",
+   "status": "ok"
+  },
+  "macro_varargs_empty": {
+   "out": "()",
+   "status": "ok"
+  },
+  "macro_whitespace_control": {
+   "out": "[1]",
+   "status": "ok"
+  },
   "map_string_then_join": {
    "out": "1+2|abc",
    "status": "ok"
@@ -498,6 +808,14 @@
   },
   "namespace_survives_loop": {
    "out": "6",
+   "status": "ok"
+  },
+  "nested_blocks": {
+   "out": "[o(I)]",
+   "status": "ok"
+  },
+  "nested_blocks_outer_overridden_drops_inner": {
+   "out": "[O]",
    "status": "ok"
   },
   "nested_loop_first_last": {
@@ -582,6 +900,19 @@
   },
   "raw_with_whitespace_control": {
    "out": "a{{x}}b",
+   "status": "ok"
+  },
+  "required_block_not_overridden_errors": {
+   "kind": "TemplateRuntimeError",
+   "msg": "Required block 'x' not found",
+   "status": "error"
+  },
+  "required_block_overridden": {
+   "out": "[ok]",
+   "status": "ok"
+  },
+  "self_block_reference": {
+   "out": "Y|Y",
    "status": "ok"
   },
   "set_basic": {
@@ -689,6 +1020,18 @@
   },
   "sum_with_start": {
    "out": "16",
+   "status": "ok"
+  },
+  "super_skips_a_level_that_does_not_define_it": {
+   "out": "[a]",
+   "status": "ok"
+  },
+  "super_three_levels": {
+   "out": "A[c(b(a))]",
+   "status": "ok"
+  },
+  "super_twice_in_one_block": {
+   "out": "aa",
    "status": "ok"
   },
   "tag_at_very_start_and_end": {

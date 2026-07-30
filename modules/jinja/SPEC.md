@@ -13,11 +13,13 @@ source bytes
    ▼
  pieces
    │  parser.zig   recursive descent mirroring the reference's layering;
-   │               filter + test NAMES resolved here against the environment
+   │               filter + test NAMES resolved here against the environment;
+   │               blocks collected into a per-template table
    ▼
- ast.Node tree ── owned by an arena inside `Template`, immutable
-   │  render.zig   scope frames, evaluation, output; filters.zig supplies
-   │               the builtin library and value methods
+ ast.Parsed ───── nodes + block table + extends; arena-owned, immutable
+   │  render.zig   scope frames, inheritance chain, macros, evaluation, output
+   │               loader.zig supplies bytes for named templates
+   │               filters.zig supplies the builtin library and value methods
    ▼
  bytes
 ```
@@ -40,7 +42,15 @@ it is used, not halfway through emitting a device configuration.
 **A compiled template is immutable and shareable.** It owns an arena holding a
 copy of the source and the tree; nothing is mutated at render time, and each
 render allocates its own scratch arena. That is what makes `Template` safe to
-render from several threads.
+render from several threads — and it is why the loader is wired the way §9
+describes rather than as an environment-level template cache.
+
+**Where `{% for … recursive %}` belongs.** The brief asked for a decision, and
+the answer is that it is *not* composition: it needs no second template and
+nothing from a loader. It belongs with Part 1's `{% for %}`, and it landed here
+only because it shares machinery with macros — `loop()` re-enters the loop body
+the way a macro call re-enters a macro body, against the same `max_call_depth`,
+and building that twice would have been the wrong shape.
 
 ## 2. The value model — why a fourth `Value` type, and why no `yaml` dependency
 
@@ -121,6 +131,28 @@ implemented as the model's only mutable value: a pointer to a pair list, with
 aliasing the reference has, and the only way to read an outer loop's index from
 an inner one.
 
+Frames are held **by pointer** (`[]const *Frame`), never by value. That is not
+tidiness: a macro closes over the frames it was defined in, and a hash map
+copied by value would be left pointing at freed storage the moment the original
+grew. Holding pointers is also what makes a macro see a `{% set %}` written
+*after* it — which is the reference's behaviour, verified.
+
+Composition adds three scope rules, each read off the reference rather than
+reasoned about:
+
+- **A block sees only template-level names.** Rendering a non-`scoped` block
+  swaps the stack for `[template frame, fresh frame]`, which is why a block
+  inside a `{% for %}` cannot read the loop variable. `scoped` pushes onto the
+  live stack instead.
+- **An `{% include %}` with context sees the whole current stack** (loop
+  variables included) plus a fresh frame of its own, so its `{% set %}`s do not
+  leak back. Without context it starts from an empty stack *and* an empty
+  render context — the reference hides the context too, not just the locals.
+- **A macro carries its frames, not its caller's.** `{% import %}`ed macros
+  capture the module's frame and lose the importing render's context;
+  `with context` copies the importer's visible names into the module frame at
+  import time — a snapshot, so a later `{% set %}` is invisible to them.
+
 ## 4. Undefined — divergence D1, stated once here
 
 The default is `.strict`; the reference's default is lenient. This is the
@@ -173,19 +205,22 @@ or a documented, tested behaviour.
 | # | Divergence | Kind |
 |---|---|---|
 | D1 | Default `undefined_policy` is `.strict` (see §4) | default, opt-out |
-| D2 | Template inheritance/reuse — `extends`, `block`, `include`, `import`, `from`, `macro`, `call`, and i18n `trans` — is not implemented | **compile error naming the tag** |
+| D2 | i18n (`{% trans %}`/`{% pluralize %}`) and the `{% autoescape %}` block are not implemented — autoescaping is an environment option here, not a per-region switch | **compile error naming the tag** |
 | D3 | Integers are `i64`; Python's are arbitrary precision. Overflow is `error.OutOfRange` where Python grows the number | runtime error |
 | D4 | `upper`/`lower`/`capitalize`/`title` and the `is upper`/`is lower` tests are ASCII-only; Python applies Unicode case mapping. Length, indexing, slicing and iteration of strings *are* codepoint-correct | silent, ASCII-identical |
 | D5 | `map`/`select`/`reject`/`selectattr`/`rejectattr`/`items`/`dictsort`/`batch`/`slice` return lists, not generators, so rendering one directly prints `[…]` where the reference prints `<generator object …>` | silent, strictly more useful |
 | D6 | Filters absent: `attr`, `filesizeformat`, `format`, `groupby`, `pprint`, `random`, `urlize`, `wordwrap` | **compile error** |
 | D7 | Tests absent: `callable`, `sameas`, `filter`, `test`, and the symbolic aliases (`is ==`, `is >`, …) — the named forms `eq`, `gt`, … are present | **compile error** |
 | D8 | Globals absent: `lipsum`, `cycler`, `joiner` | **compile error** |
-| D9 | `{% for … recursive %}`, `*args`/`**kwargs` in calls, line statements/comments, custom delimiters, and calling anything other than the built-in globals | **compile error** |
+| D9 | `*args`/`**kwargs` *at a call site*, line statements/comments, and custom delimiters (macro `varargs`/`kwargs` on the receiving side are implemented) | **compile error** |
 | D10 | `{% do %}` and `{% with %}` need no extension to be enabled | superset |
 | D11 | String methods are a documented subset (README); an unknown one is a render error naming the type and method | runtime error |
 | D12 | `round(x, p)` falls back to scaled arithmetic when the exact integer form would exceed `u128` (roughly `|p| > 22`) | silent, beyond f64 precision |
 | D13 | `max_output_bytes` (64 MiB) and a 4 Mi-element cap on `range()`/`'x' * n` have no reference equivalent | extra refusal |
-| D14 | No loader and no file system: templates are strings | API |
+| D14 | A loader is explicit: without one, a composition tag is `error.NoLoader`. There is no implicit filesystem access and no default search path | API |
+| D15 | Calling a name that is not a macro and not one of the three built-in globals is `error.NotCallable`; the reference would call any callable in the context | **runtime error** |
+| D16 | `super.super()` (reaching two levels up in one expression) is not implemented; `{{ super() }}` inside a block that itself overrides is the supported form | **runtime error** |
+| D17 | A template name a loader *refuses* (an escape attempt) is `error.LoaderFailed` even under `ignore missing` — only genuine absence is ignorable | deliberate, stricter |
 
 Why `attr` was dropped rather than implemented (D6): the reference's `attr`
 filter is `getattr` *without* the `getitem` fallback, so applied to a mapping —
@@ -198,8 +233,10 @@ the reference too.
 ## 7. Verification
 
 The anchor is **Python Jinja2 3.1.6**, the reference implementation, and the
-comparison is byte-for-byte: `src/corpus.zig` holds 209 cases (template +
-JSON context + syntax options), and both oracles render exactly that table.
+comparison is byte-for-byte: `src/corpus.zig` holds 292 cases (template + the
+other templates its loader serves + JSON context + syntax options), and both
+oracles render exactly that table — Zig against a `MapLoader`, Python against a
+`DictLoader` built from the same table.
 
 **Live peer** (`reference_test.zig`). `testdata/reference.py` renders the whole
 corpus in a `python3` subprocess and returns JSON; every case is compared
@@ -231,11 +268,15 @@ ZIG_LIBS_JINJA_REGEN=$PWD/modules/jinja/src/testdata/golden.json \
 The hook lives inside the live test, so the golden can only ever be produced by
 the same procedure the live comparison uses.
 
-**Load-bearing check.** The oracle was verified to be load-bearing by mutation:
-changing `pyMod` from Python's floored remainder to `@rem` (C truncation) — a
-change no unit test in this module notices — turns `mod_negatives` red in both
-the live and the golden test (`1|1|-1|-1` vs `1|-1|1|-1`). That mutation was
-reverted.
+**Load-bearing check.** The oracle is verified to be load-bearing by mutation,
+once per surface. For the expression engine: changing `pyMod` from Python's
+floored remainder to `@rem` (C truncation) — a change no unit test notices —
+turns `mod_negatives` red in both oracles (`1|1|-1|-1` vs `1|-1|1|-1`). For
+composition: making every `{% block %}` behave as if it were `scoped` — the
+single most tempting simplification in the whole inheritance implementation,
+and one that no self-written test would catch because it makes blocks see
+*more* — turns `block_in_for_is_not_scoped_by_default` red in both oracles
+(`<><>` vs `<1><2>`). Both mutations were reverted.
 
 **What the corpus is weighted towards.** Not the easy paths: whitespace-control
 combinations including `+` and the option interactions, `loop` inside nested
@@ -245,6 +286,17 @@ rounding at ties and at values like `2.675` that are not the decimal they look
 like, filter argument evaluation, autoescape interacting with `|safe`/`|escape`/
 `~`/`|join`, `repr` of every value kind, and the cases where the reference
 *errors* (each marked, and required to fail on our side too).
+
+For composition specifically: `super()` in a three-level chain and across a
+level that does not define the block, a block inside a `{% for %}` with and
+without `scoped`, a child's top-level `{% set %}` reaching its blocks, an
+`{% extends %}` whose name comes from a `{% set %}` above it, `{% set %}`
+visibility across an `{% include %}` in both directions, `import` with and
+without context and the snapshot-vs-view question, a macro reading a module-level
+`{% set %}` written *after* it, `caller()` with positional and keyword arguments
+and a caller body that reads the enclosing loop, macro `varargs`/`kwargs` and the
+argument counts that must be *refused*, recursive loops with `loop.depth`, and
+composition crossed with autoescape and with whitespace control.
 
 **Fuzzing** (`fuzz_test.zig`): arbitrary bytes as template source, with and
 without the whitespace-rewriting options, must never trip a safety check. Any
@@ -279,21 +331,125 @@ module never escapes anything, and with it on the safe bit is the only way to
 opt a value out. Because `|safe` is representable in a value, a caller can mark
 trusted fragments in the *context* rather than in the template.
 
-## 9. Backlog
+## 9. The loader and Zig's ownership model
 
-- **Part 2: inheritance and reuse** — `{% extends %}`, `{% block %}` (with
-  `super()` and `scoped`), `{% include %}` (with `ignore missing` / `without
-  context`), `{% import %}` / `{% from %}`, `{% macro %}` + `{% call %}` +
-  `caller()`, and the `Loader` abstraction they all need. The parser already
-  reserves every one of those tag names with a "not implemented" error, so
-  adding them cannot silently change the meaning of an existing template.
-- `{% for … recursive %}` and `loop()` — small once macros exist, since both
-  need a callable body.
+The brief for this half sketched the loader as plumbing. One thing about it is
+not plumbing, and it is worth writing down because the obvious design costs a
+property Part 1 established.
+
+The reference caches **compiled templates** on the environment: `get_template`
+is memoised, and a render reaches into that cache. Doing the same here would
+mean a render needs `*Environment` rather than `*const Environment` — and with
+that, `Template` stops being immutable and two threads rendering the same
+template race on the cache. The alternatives are a lock inside `Environment`
+(paid by every consumer, including single-threaded ones) or giving that up.
+
+So the cache is **per render, in the render arena**. `Environment` holds only
+the `Loader` and stays `const` throughout; a template loaded during a render is
+compiled at most once for that render (so an `{% include %}` inside a loop is
+linear, and a diamond inheritance graph loads each side once) and is thrown away
+with the arena. The cost is recompilation across renders; the gain is that
+`Template` remains immutable, `Environment` remains shareable, and lifetimes are
+trivially correct — a loaded template's bytes and tree live exactly as long as
+the render that asked for them, which is the one thing a borrowed-source loader
+API makes easy to get wrong.
+
+If recompilation ever shows up in a profile, the fix is a caller-owned cache
+passed *into* `render`, not a mutable environment.
+
+## 10. Loader containment and expansion bounds
+
+Part 1 had no way to name another template. Part 2 has one, so it has an attack
+surface, and it is treated as one.
+
+### Path containment
+
+`DirLoader` enforces containment twice, and the second half is the load-bearing
+one:
+
+1. **Lexically** (`checkName`, exported so a caller's own loader can reuse it):
+   an absolute path, a `..` or `.` component, a backslash, a NUL, an empty
+   component, an over-long name or component — all refused. `..` is *rejected*,
+   never resolved: accepting `a/../b` would require this checker and the kernel
+   to agree about normalization, and every containment bug of this class is a
+   disagreement about exactly that.
+2. **Structurally**: the path is walked one component at a time, each directory
+   opened relative to the previously held handle with `follow_symlinks = false`,
+   and the final file opened the same way.
+
+The brief anticipated that symlink containment might not be achievable without
+`openat`-style primitives. In Zig 0.16 it is: `std.Io.Dir.openDir` and
+`openFile` both take `follow_symlinks`, and `openFile` additionally takes
+`resolve_beneath`. Walking components with `follow_symlinks = false` gives a
+**portable** guarantee that does not depend on the kernel — no symlink anywhere
+along the path is traversed, so a link planted inside the root cannot redirect a
+read outside it. Because every open is relative to a held file descriptor rather
+than to a re-resolved string, there is also no check-then-open window for
+anything to be swapped underneath. `resolve_beneath` is requested as well but
+nothing depends on it: std documents it as *silently ignored* where unsupported,
+which makes it unfit to be the guarantee.
+
+**What this deliberately does not promise:**
+
+- It is **stricter than containment requires**. A symlink pointing at another
+  file *inside* the root is refused too. `allow_symlinks = true` trades the
+  portable guarantee for the kernel's (`resolve_beneath` alone: airtight on a
+  Linux with `openat2`, absent elsewhere) — a documented downgrade, not a
+  default.
+- A hard link inside the root to a file outside it is **not** detectable this
+  way, and is not claimed to be. A hard link needs write access to the root
+  already; if an attacker has that, they can simply write a template.
+- The bound is on *reading through the loader*. It says nothing about what a
+  caller's own `Loader` does, which is why `checkTemplateName` is exported.
+- A refused name is `error.LoaderFailed`, and `ignore missing` does **not**
+  swallow it (D17). Only genuine absence is ignorable; an escape attempt is a
+  signal, not a missing file.
+
+Tested by attack, not by assertion (`loader_test.zig`): a real tree is built
+with a secret outside the root and both a symlinked file and a symlinked
+*directory component* pointing at it, and twelve escape spellings plus both
+symlink routes are attempted through the loader — including a name arriving from
+the render context rather than from template source, which is the realistic
+shape (`{% include theme %}`).
+
+### Cycles and unbounded expansion
+
+Two mechanisms, because they answer different questions:
+
+- **An inheritance cycle is caught by name.** While the `{% extends %}` chain is
+  built, each parent is checked against the chain so far; `a extends b extends a`
+  is `error.TemplateCycle` immediately, at chain-building time, before anything
+  renders. A depth cap alone would catch it too, but only after doing the work.
+- **Everything else is caught by a depth cap.** `max_template_depth` (32) bounds
+  `{% extends %}` + `{% include %}` + `{% import %}` nesting combined;
+  `max_call_depth` (64) bounds macro calls, `{% call %}` bodies and `loop()`;
+  `max_templates` (256) bounds distinct loads per render; `max_output_bytes`
+  bounds the output. All are `Options` fields.
+
+The proof is a set of bombs, not a comment. `loader_test.zig` renders a
+self-including template, a mutually-including pair, an **exponential** include
+bomb (each level includes the next twice — the shape that cost this repository's
+author a desktop and 15.4 GB elsewhere), an infinitely recursive macro, a
+mutually recursive macro pair, a self-feeding recursive loop, and an import
+cycle. Each assertion is on the *specific* cap error, with the render arena
+confined to a 1 MiB `FixedBufferAllocator`: a bomb that outran its bound would
+exhaust the buffer and come back `OutOfMemory`, failing the test. That is what
+makes these bound tests rather than "it errored eventually" tests.
+
+## 11. Backlog
+
 - The eight absent filters (D6). `groupby` and `pprint` need a decision about
   what to render for a namedtuple and for Python's pretty-printer layout before
   they can be byte-exact; `random` needs a seed in the environment to be
   testable at all; `wordwrap` needs `textwrap`'s exact algorithm.
+- i18n (`{% trans %}`) and the `{% autoescape %}` block (D2). The latter needs
+  autoescaping to become a per-region property of the renderer rather than an
+  environment option; worth doing only alongside the former.
+- `super.super()` (D16) and callables in the context (D15) — both small, both
+  waiting for a consumer that wants them.
 - Line statements and configurable delimiters — cheap in the lexer, wanted only
   if a real consumer asks.
+- A caller-owned template cache passed into `render` (§9), if recompilation ever
+  shows up in a profile.
 - A lazy context adapter (§2), if a context ever appears that is too large to
   convert eagerly.

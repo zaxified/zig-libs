@@ -15,7 +15,7 @@ import json
 import sys
 
 import jinja2
-from jinja2 import Environment, StrictUndefined, Undefined
+from jinja2 import DictLoader, Environment, StrictUndefined, Undefined
 
 
 def main() -> int:
@@ -25,6 +25,7 @@ def main() -> int:
     results = {}
     for case in corpus:
         env = Environment(
+            loader=DictLoader(case.get("templates", {})),
             autoescape=case["autoescape"],
             trim_blocks=case["trim_blocks"],
             lstrip_blocks=case["lstrip_blocks"],

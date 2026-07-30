@@ -26,15 +26,22 @@
 //! ## What is covered
 //!
 //! `{{ … }}`, `{# … #}`, `{% if/elif/else %}`, `{% for %}` (with the full
-//! `loop` object, an inline `if` filter and `{% else %}`), `{% set %}` in both
-//! inline and block form, `{% filter %}`, `{% with %}`, `{% do %}`,
-//! `{% raw %}`, the whole expression grammar including chained comparisons,
-//! conditional expressions, slices, filters and tests, and every whitespace
-//! control (`{%-`, `-%}`, `trim_blocks`, `lstrip_blocks`,
-//! `keep_trailing_newline`). Template **inheritance and reuse** —
-//! `{% extends %}`, `{% block %}`, `{% include %}`, `{% import %}`,
-//! `{% macro %}` — are not implemented; naming one is a compile error, never a
-//! silent no-op.
+//! `loop` object, an inline `if` filter, `{% else %}` and `recursive`),
+//! `{% set %}` in both inline and block form, `{% filter %}`, `{% with %}`,
+//! `{% do %}`, `{% raw %}`, the whole expression grammar including chained
+//! comparisons, conditional expressions, slices, filters and tests, and every
+//! whitespace control (`{%-`, `-%}`, `trim_blocks`, `lstrip_blocks`,
+//! `keep_trailing_newline`).
+//!
+//! Template composition needs a `Loader` (`Environment.initWithLoader`):
+//! `{% extends %}` + `{% block %}` with `super()`, `scoped`, `required` and
+//! `{{ self.name() }}`; `{% include %}` with `ignore missing`,
+//! `with`/`without context` and candidate lists; `{% import %}` and
+//! `{% from … import … as … %}`; `{% macro %}` with defaults, `varargs`,
+//! `kwargs` and introspection attributes; `{% call %}` / `caller()`. Without a
+//! loader those tags are `error.NoLoader`, never a quiet nothing. What remains
+//! unimplemented (i18n, the `{% autoescape %}` block, eight filters) is a
+//! compile error naming it — see SPEC.md §6.
 //!
 //! ## Two things a caller must decide, and this module refuses to guess
 //!
@@ -72,6 +79,7 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const ast = @import("ast.zig");
 const value_mod = @import("value.zig");
+const loader_mod = @import("loader.zig");
 const render_mod = @import("render.zig");
 const filters_mod = @import("filters.zig");
 
@@ -93,6 +101,15 @@ pub const valueFromJson = value_mod.fromJson;
 pub const escapeAlloc = value_mod.escapeAlloc;
 
 pub const Diagnostic = @import("diag.zig").Diagnostic;
+
+/// Where `{% extends %}`, `{% include %}` and `{% import %}` find templates.
+pub const Loader = loader_mod.Loader;
+pub const MapLoader = loader_mod.MapLoader;
+pub const DirLoader = loader_mod.DirLoader;
+pub const LoaderError = loader_mod.Error;
+/// The lexical half of `DirLoader`'s containment, exported so a caller writing
+/// its own filesystem loader can reuse exactly the same rules.
+pub const checkTemplateName = loader_mod.checkName;
 pub const UndefinedPolicy = render_mod.UndefinedPolicy;
 
 pub const Options = struct {
@@ -102,6 +119,14 @@ pub const Options = struct {
     lstrip_blocks: bool = false,
     keep_trailing_newline: bool = false,
     max_output_bytes: usize = 64 << 20,
+    /// Combined nesting bound for `{% extends %}`/`{% include %}`/
+    /// `{% import %}`. An inheritance *cycle* is caught by name before this
+    /// ever fires; this bounds everything a name check cannot see.
+    max_template_depth: usize = 32,
+    /// Nesting bound for macro calls, `{% call %}` bodies and `loop()`.
+    max_call_depth: usize = 64,
+    /// How many distinct templates one render may load.
+    max_templates: usize = 256,
 };
 
 pub const CompileError = parser.Error;
@@ -124,9 +149,22 @@ pub const Environment = struct {
     options: Options,
     filters: std.StringHashMapUnmanaged(FilterFn) = .empty,
     tests: std.StringHashMapUnmanaged(TestFn) = .empty,
+    /// Optional; without one, any composition tag is `error.NoLoader`.
+    loader: ?Loader = null,
 
     pub fn init(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!Environment {
-        var env: Environment = .{ .gpa = gpa, .options = options };
+        return initWithLoader(gpa, options, null);
+    }
+
+    /// As `init`, with the loader that `{% extends %}`, `{% include %}` and
+    /// `{% import %}` will use. The loader is borrowed and must outlive the
+    /// environment.
+    pub fn initWithLoader(
+        gpa: std.mem.Allocator,
+        options: Options,
+        template_loader: ?Loader,
+    ) error{OutOfMemory}!Environment {
+        var env: Environment = .{ .gpa = gpa, .options = options, .loader = template_loader };
         errdefer env.deinit();
         for (filters_mod.builtin_filters) |e| try env.filters.put(gpa, e.name, e.func);
         for (filters_mod.builtin_tests) |e| try env.tests.put(gpa, e.name, e.func);
@@ -167,13 +205,13 @@ pub const Environment = struct {
             .keep_trailing_newline = self.options.keep_trailing_newline,
         }, d) catch |e| return e;
 
-        const nodes = try parser.parse(a, lexed.pieces, .{
+        const parsed = try parser.parse(a, lexed.pieces, .{
             .ctx = self,
             .hasFilter = hasFilterThunk,
             .hasTest = hasTestThunk,
         }, d);
 
-        return .{ .arena = arena, .nodes = nodes, .env = self };
+        return .{ .arena = arena, .parsed = parsed, .env = self };
     }
 
     /// Compile and render in one step, for the one-shot case.
@@ -208,6 +246,29 @@ pub const Environment = struct {
         const self: *const Environment = @ptrCast(@alignCast(ctx));
         return self.tests.get(name);
     }
+
+    /// Compiles a *loaded* template into the render arena. Loaded templates go
+    /// through exactly the same lexer, options and name resolution as the entry
+    /// template — an included template naming a missing filter fails as loudly
+    /// as a top-level one, just later, because it is only compiled when reached.
+    fn compileInto(
+        ctx: *const anyopaque,
+        arena: std.mem.Allocator,
+        source: []const u8,
+        diag: *Diagnostic,
+    ) parser.Error!ast.Parsed {
+        const self: *const Environment = @ptrCast(@alignCast(ctx));
+        const lexed = try lexer.lex(arena, source, .{
+            .trim_blocks = self.options.trim_blocks,
+            .lstrip_blocks = self.options.lstrip_blocks,
+            .keep_trailing_newline = self.options.keep_trailing_newline,
+        }, diag);
+        return parser.parse(arena, lexed.pieces, .{
+            .ctx = self,
+            .hasFilter = hasFilterThunk,
+            .hasTest = hasTestThunk,
+        }, diag);
+    }
 };
 
 /// A compiled template: an arena holding the source copy and the tree, plus a
@@ -216,7 +277,7 @@ pub const Environment = struct {
 /// (each render allocates its own scratch arena).
 pub const Template = struct {
     arena: std.heap.ArenaAllocator,
-    nodes: []const ast.Node,
+    parsed: ast.Parsed,
     env: *const Environment,
 
     pub fn deinit(self: *Template) void {
@@ -250,14 +311,19 @@ pub const Template = struct {
         const d = diag orelse &scratch;
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
-        try render_mod.render(arena.allocator(), self.nodes, context, .{
+        try render_mod.render(arena.allocator(), self.parsed, context, .{
             .autoescape = self.env.options.autoescape,
             .undefined_policy = self.env.options.undefined_policy,
             .max_output_bytes = self.env.options.max_output_bytes,
+            .max_template_depth = self.env.options.max_template_depth,
+            .max_call_depth = self.env.options.max_call_depth,
+            .max_templates = self.env.options.max_templates,
         }, .{
             .ctx = self.env,
             .filter = Environment.filterLookup,
             .test_fn = Environment.testLookup,
+            .loader = self.env.loader,
+            .compile = Environment.compileInto,
         }, out, d);
     }
 };
@@ -288,4 +354,6 @@ test {
     _ = @import("golden_test.zig");
     _ = @import("reference_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("loader.zig");
+    _ = @import("loader_test.zig");
 }

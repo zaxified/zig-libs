@@ -58,20 +58,33 @@ test "an unknown test is a compile error too" {
     try testing.expectError(error.TemplateSyntaxError, env.compile("{% if x is nosuchtest %}{% endif %}", null));
 }
 
-test "inheritance tags are named as unimplemented, not as typos" {
+test "the tags that remain unimplemented are named as such, not as typos" {
     const gpa = testing.allocator;
     var env = try jinja.Environment.init(gpa, .{});
     defer env.deinit();
     for ([_][]const u8{
-        "{% extends 'base.html' %}",
-        "{% block body %}{% endblock %}",
-        "{% include 'x.html' %}",
-        "{% macro m() %}{% endmacro %}",
-        "{% import 'x.html' as x %}",
+        "{% trans %}hi{% endtrans %}",
+        "{% autoescape true %}{% endautoescape %}",
     }) |src| {
         var diag: jinja.Diagnostic = .{};
         try testing.expectError(error.TemplateSyntaxError, env.compile(src, &diag));
         try testing.expect(std.mem.indexOf(u8, diag.message(), "not implemented") != null);
+    }
+}
+
+test "a composition tag without a loader is a named error, not a silent nothing" {
+    const gpa = testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{});
+    defer env.deinit();
+    for ([_][]const u8{
+        "{% include 'x' %}",
+        "{% import 'x' as m %}",
+        "{% extends 'x' %}{% block b %}{% endblock %}",
+    }) |src| {
+        var diag: jinja.Diagnostic = .{};
+        const r = env.renderAlloc(gpa, src, .{ .map = .{ .pairs = &.{} } }, &diag);
+        try testing.expectError(error.NoLoader, r);
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "no loader") != null);
     }
 }
 
@@ -231,5 +244,86 @@ test "an unterminated tag is rejected rather than swallowing the rest" {
         "{{ 'unterminated }}",
     }) |src| {
         try testing.expectError(error.TemplateSyntaxError, env.compile(src, null));
+    }
+}
+
+test "a macro in an imported template can use a filter the CALLER registered" {
+    // The brief's sharpest composition question: loaded templates are compiled
+    // against the same environment, so a custom filter registered before
+    // compilation is available inside a template the loader supplies later.
+    const gpa = testing.allocator;
+    var map: jinja.MapLoader = .{ .entries = &.{
+        .{ .name = "macros", .source = "{% macro cidr(a, b) %}{{ a }}/{{ b|netbits }}{% endmacro %}" },
+    } };
+    var env = try jinja.Environment.initWithLoader(gpa, .{}, map.loader());
+    defer env.deinit();
+    try env.addFilter("netbits", struct {
+        fn f(ctx: *jinja.FilterCtx, input: jinja.Value, args: jinja.FilterArgs) jinja.FilterError!jinja.Value {
+            _ = ctx;
+            _ = args;
+            const s = switch (input) {
+                .string => |x| x.bytes,
+                else => return error.TypeMismatch,
+            };
+            var bits: i64 = 0;
+            var it = std.mem.splitScalar(u8, s, '.');
+            while (it.next()) |octet| {
+                const v = std.fmt.parseInt(u8, octet, 10) catch return error.BadArgument;
+                bits += @popCount(v);
+            }
+            return .{ .integer = bits };
+        }
+    }.f);
+
+    const out = try env.renderAlloc(
+        gpa,
+        "{% import 'macros' as m %}{{ m.cidr('10.0.0.0', '255.255.255.0') }}",
+        .{ .map = .{ .pairs = &.{} } },
+        null,
+    );
+    defer gpa.free(out);
+    try testing.expectEqualStrings("10.0.0.0/24", out);
+}
+
+test "an unknown filter inside a LOADED template is still a resolution error" {
+    // Part 1 resolves filter names when the entry template compiles. A loaded
+    // template compiles when it is first reached, so the same guarantee holds
+    // — just later, and it must not degrade into a render-time surprise with no
+    // explanation.
+    const gpa = testing.allocator;
+    var map: jinja.MapLoader = .{ .entries = &.{.{ .name = "bad", .source = "{{ x|nosuchfilter }}" }} };
+    var env = try jinja.Environment.initWithLoader(gpa, .{}, map.loader());
+    defer env.deinit();
+
+    var diag: jinja.Diagnostic = .{};
+    try testing.expectError(
+        error.TemplateSyntaxError,
+        env.renderAlloc(gpa, "{% include 'bad' %}", .{ .map = .{ .pairs = &.{} } }, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "bad") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "unknown filter") != null);
+}
+
+test "a Template stays immutable across renders that load other templates" {
+    // The loader deliberately does NOT let the Environment cache compiled
+    // templates: that would need a mutable environment at render time and
+    // would cost the thread-safety Part 1 established. Caching is per render,
+    // so two renders of the same Template are independent.
+    const gpa = testing.allocator;
+    var map: jinja.MapLoader = .{ .entries = &.{.{ .name = "row", .source = "<{{ n }}>" }} };
+    var env = try jinja.Environment.initWithLoader(gpa, .{}, map.loader());
+    defer env.deinit();
+
+    var tmpl = try env.compile("{% include 'row' %}{% include 'row' %}", null);
+    defer tmpl.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    for ([_]i64{ 1, 2 }) |n| {
+        const ctx = try jinja.valueFrom(arena.allocator(), .{ .n = n });
+        const out = try tmpl.render(gpa, ctx, null);
+        defer gpa.free(out);
+        var buf: [16]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "<{d}><{d}>", .{ n, n }), out);
     }
 }
