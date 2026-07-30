@@ -511,6 +511,11 @@ cmd_changed() {
 
     local -a valid_seeds=()
     for name in $seeds; do
+        # A module can be seeded twice -- once because its own files changed and
+        # once because build.zig gained a graph row for it, which is exactly what
+        # adding a module does. The closure below dedups, so a duplicate here
+        # only corrupted the reported counts (a NEGATIVE reverse-dep count).
+        case " ${valid_seeds[*]} " in *" $name "*) continue ;; esac
         if module_exists "$name"; then
             valid_seeds+=("$name")
         else
