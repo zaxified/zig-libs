@@ -118,6 +118,7 @@ const module_list = [_]Module{
     .{ .name = "iec104" },
     .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" } },
     .{ .name = "smtp", .deps = &.{"netaddr"} },
+    .{ .name = "imap" },
     .{ .name = "iec61850", .deps = &.{"xml"} },
     .{ .name = "iec62351", .deps = &.{ "x509", "rsa" } },
     .{ .name = "s7comm" },

@@ -1,0 +1,53 @@
+imap — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+carries THREE further copyright holders, whose notice MIT requires be preserved
+in any copy or substantial portion. Redistributing this module — alone or as
+part of zig-libs — must keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to different
+authors. It is recorded here, at the module, and NOT in the repository root
+NOTICE, which stays free of any third-party condition.
+
+## emersion/go-imap v2  (wire layer)
+
+The `imap` module is a PORT of `github.com/emersion/go-imap` v2, not a
+clean-room implementation from RFC 9051. Ported so far:
+
+  * `utf7.zig` — `internal/utf7/{utf7,decoder,encoder}.go`: the modified-UTF-7
+    codec, including its rejection rules (padding, null shift, non-canonical
+    base64 runs, unpaired surrogates). The vector table in this module's tests
+    is `internal/utf7/decoder_test.go`.
+
+go-imap is under the MIT license, reproduced here as its terms require:
+
+    The MIT License (MIT)
+
+    Copyright (c) 2013 The Go-IMAP Authors
+    Copyright (c) 2016 Proton Technologies AG
+    Copyright (c) 2023 Simon Ser
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+Intentional divergences from the Go source are listed at the bottom of each
+ported file (`utf7.zig`: D1 invalid-UTF-8 handling on encode, D2 where the
+padding rejection happens). Where this module's behaviour is derived from the
+RFCs rather than from go-imap, the file says so.
