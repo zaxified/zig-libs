@@ -126,13 +126,24 @@ graph_save() {
     printf '%s\n' "$G_TSV" > "$GRAPH_SNAPSHOT" 2>/dev/null || true
 }
 
-# Sets GRAPH_ADDED to the names of modules the graph GAINED and returns 0, or
-# returns 1 if anything else changed (so the caller must run everything).
-# Requires graph_load to have run.
+# Sets GRAPH_ADDED to the modules whose graph row was ADDED or ALTERED and
+# returns 0. Returns 1 only when the delta cannot be turned into a seed set:
+# no snapshot to compare against, or a module DISAPPEARED.
+#
+# A module that gained or lost a dependency is a precisely answerable question,
+# not a reason to run everything: the module itself changed shape, so retest it
+# and — via the ordinary reverse-dependency closure, computed from the NEW graph
+# — everything built on top of it. That is the same rule the rest of this driver
+# already uses; there is nothing special about the edge having moved.
+#
+# A REMOVED module is the one case that stays conservative. What needs retesting
+# is whatever used to depend on it, and that edge exists only in the old graph —
+# so the new graph, the driver's single authority, cannot answer it. Deleting a
+# module is rare enough that paying the full run for it is the right trade.
 graph_added_only() {
     GRAPH_ADDED=""
     [[ -f "$GRAPH_SNAPSHOT" ]] || return 1
-    local gone
+    local gone gone_names alive
     # LC_ALL=C on BOTH sorts, and it is load-bearing: `sort` collates by locale
     # while `comm` compares bytewise, so under cs_CZ (or any non-C locale) comm
     # reads its input as unsorted and silently returns a WRONG answer. The wrong
@@ -141,12 +152,54 @@ graph_added_only() {
     # order" warning, which is easy to miss because the result still looks
     # plausible.
     #
-    # Rows present before but not now: a removal OR an edit (an edited row
-    # shows up as one removal + one addition). Either way the closure is stale.
+    # A row present before but not now is either a removal or an edit; an edit
+    # also shows up as an addition, so the two are told apart by whether the
+    # name still exists in the new graph.
     gone="$(comm -23 <(LC_ALL=C sort "$GRAPH_SNAPSHOT") <(printf '%s\n' "$G_TSV" | LC_ALL=C sort))"
-    [[ -n "$gone" ]] && return 1
+    if [[ -n "$gone" ]]; then
+        gone_names="$(printf '%s\n' "$gone" | cut -f1)"
+        while IFS= read -r alive; do
+            [[ -z "$alive" ]] && continue
+            module_exists "$alive" || return 1   # genuinely deleted -> full run
+        done <<< "$gone_names"
+    fi
     GRAPH_ADDED="$(comm -13 <(LC_ALL=C sort "$GRAPH_SNAPSHOT") <(printf '%s\n' "$G_TSV" | LC_ALL=C sort) | cut -f1 | tr '\n' ' ')"
     return 0
+}
+
+# The harness itself changed (this script, test-lib.sh, capped, or a CI lane).
+#
+# There is no dependency edge to follow here: what changed is the mechanism that
+# decides the narrow set, so it cannot vouch for its own narrowing. The honest
+# answer is not to silently pick a smaller set and call it verified — it is to
+# run what actually exercises the harness's own branches, and to say plainly
+# that this is not the gate.
+#
+# `run_modules` distinguishes exactly two classes, plain and netns-wrapped, so
+# one live module from each covers both paths end to end (select -> build ->
+# run -> report) in seconds. Heavy modules are NOT included: "heavy" is a
+# build.zig optimisation choice, invisible to this script, and one of them costs
+# minutes. Picked from the graph rather than hardcoded, so the set cannot rot.
+harness_smoke() {
+    local plain="" netns="" n
+    for n in "${G_NAMES[@]}"; do
+        case " $NETNS_MODULES " in
+            *" $n "*) [[ -z "$netns" ]] && netns="$n" ;;
+            *) [[ -z "$plain" ]] && plain="$n" ;;
+        esac
+        [[ -n "$plain" && -n "$netns" ]] && break
+    done
+
+    echo "changed: the harness or a CI lane definition changed."
+    echo "  The thing that narrows the module set is the thing that moved, so it cannot"
+    echo "  narrow itself. Running a smoke set that exercises the driver's own branches"
+    echo "  instead — this is NOT the gate:"
+    echo "      scripts/test.sh all      <- run this before committing a harness change"
+    step "fmt check" zig fmt --check build.zig build.zig.zon modules
+    step "check-catalog" zig build check-catalog
+    run_modules "$plain $netns"
+    graph_save
+    summary
 }
 
 module_exists() {
@@ -433,24 +486,23 @@ cmd_changed() {
         fi
     fi
 
+    graph_load
+
     if [[ $trigger_all -eq 1 ]]; then
-        echo "changed: the harness or the CI lane definition changed -> running ALL modules"
-        cmd_all
+        harness_smoke
         return
     fi
-
-    graph_load
 
     if [[ $trigger_graph -eq 1 ]]; then
         if graph_added_only; then
             if [[ -n "${GRAPH_ADDED// /}" ]]; then
-                echo "changed: build.zig touched, but the module graph only GAINED rows -> testing those, not all: ${GRAPH_ADDED% }"
+                echo "changed: build.zig touched -> graph rows added/altered: ${GRAPH_ADDED% } (seeded; the reverse-dep closure below covers the rest)"
                 seeds="$seeds$GRAPH_ADDED"
             else
                 echo "changed: build.zig touched, but the module graph is byte-identical -> no escalation"
             fi
         else
-            echo "changed: the module graph lost or altered a row -> every reverse-dep closure is stale -> running ALL modules"
+            echo "changed: a module DISAPPEARED from the graph -> what depended on it is only knowable from the old graph -> running ALL modules"
             cmd_all
             return
         fi
