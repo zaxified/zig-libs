@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Run any command under the same memory cap `scripts/test.sh` applies to every
+# step it runs. For ad-hoc invocations that bypass the driver:
+#
+#     scripts/capped zig build test-yaml --summary all
+#     ZIGLIBS_MEM_MAX=24G scripts/capped zig build test
+#
+# Why this exists: a Zig test binary that allocates without bound is killed by
+# the KERNEL's global OOM killer, which chooses its victim by size. Under an
+# IDE every build and test is a child of the editor's own cgroup, so the
+# editor is what dies — that is not hypothetical, it happened here (a `test`
+# process at 15.4 GB RSS, `global_oom`, and the desktop went with it).
+#
+# Inside a capped scope the same runaway is killed by its own cgroup instead:
+# one red step, exit 137, nothing else on the machine notices.
+#
+# Degrades to a plain exec where the cap is unavailable (macOS, non-systemd
+# Linux, containers without a delegated `memory` controller).
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test-lib.sh"
+
+if [[ $# -eq 0 ]]; then
+    echo "usage: scripts/capped CMD [ARGS...]" >&2
+    exit 2
+fi
+
+_zl_cap_argv
+exec ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} "$@"

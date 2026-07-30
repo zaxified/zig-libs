@@ -67,6 +67,35 @@ Skip reasons are silent by default, so **any stderr output means a real
 problem**. Set `ZIG_LIBS_VERBOSE_SKIP=1` to see why something skipped; the skip
 *count* is always in the summary either way.
 
+## Memory cap
+
+Every command `test.sh` runs goes inside a transient cgroup limited to
+`ZIGLIBS_MEM_MAX` (default `12G`). A test that allocates without bound is then
+killed by **its own** cgroup — one red step with exit 137 and an explicit
+message — instead of by the kernel's global OOM killer, which picks its victim
+by size and so takes down whatever is biggest on the machine. Under an IDE that
+is the editor, because every build and test is a child of the editor's cgroup.
+This is not a hypothetical: a `test` binary at 15.4 GB RSS killed the whole
+session here, `constraint=CONSTRAINT_NONE, global_oom` in the kernel log.
+
+The `12G` default is measured: a full `zig build test` across every module
+peaks at **4.1 GiB** for the whole parallel build, and the largest individual
+test binary is 115 MB. That leaves roughly 3x headroom over a legitimate full
+run while still stopping a runaway an order of magnitude smaller than the one
+that caused the crash.
+
+    ZIGLIBS_MEM_MAX=24G scripts/test.sh all    # raise it
+    ZIGLIBS_MEM_MAX=off scripts/test.sh        # disable the wrapper
+
+For anything that bypasses the driver — a bare `zig build test-<module>` while
+iterating — use the same cap through `scripts/capped`:
+
+    scripts/capped zig build test-yaml --summary all
+
+The cap needs cgroup v2 with the `memory` controller delegated to the user
+manager (any modern systemd). It is probed for, not assumed, and degrades to a
+plain exec on macOS, non-systemd Linux and containers without delegation.
+
 ## Optimization modes
 
 Compute-heavy modules (pairings, hash-based signatures, FHE, scrypt, RSA) build
