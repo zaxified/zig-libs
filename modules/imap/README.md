@@ -5,9 +5,9 @@ socket and speaks no TLS, so it drops onto plain TCP, `std.crypto.tls.Client`,
 or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 
 **Status: part 1 of 2, in progress.** Landed: the modified-UTF-7 mailbox-name
-codec. Next: the response decoder (literals, `NIL`, nested lists with a depth
-guard), the command encoder, and the session — `CAPABILITY` / `LOGIN` /
-`SELECT`. Then part 2: `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
+codec and the wire grammar (decode side). Next: the response reader on top of
+it, the command encoder, and the session — `CAPABILITY` / `LOGIN` / `SELECT`.
+Then part 2: `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
 
 **Provenance:** a PORT of [`emersion/go-imap`](https://github.com/emersion/go-imap)
 v2 (MIT), chosen over `rust-imap` and Python `imapclient` on the transport
@@ -42,16 +42,54 @@ runs back to back, no unpaired surrogate, no CR/LF inside a run. That matters
 because mailbox names are compared as byte strings — a second spelling of one
 name is a bug waiting to happen, not a tolerance.
 
+## The wire grammar
+
+`wire.Decoder` reads RFC 9051 §9 primitives from a `std.Io.Reader` — atoms,
+quoted strings, literals, `NIL`, numbers, parenthesised lists, mailbox names:
+
+```zig
+var r = std.Io.Reader.fixed("* 172 EXISTS\r\n");
+var d = imap.wire.Decoder.init(arena, &r, .{});
+
+try d.expect('*');
+try d.expectSp();
+const n = try d.expectNumber();       // 172
+try d.expectSp();
+const kind = try d.expectAtom();      // "EXISTS"
+try d.expectCrlf();
+```
+
+Two decisions in here are load-bearing rather than stylistic:
+
+- **A literal's length arrives from the network and is used to allocate**, so
+  `Options.max_literal` is checked *before* the allocation. That is the exact
+  shape of three real bugs found elsewhere in this repo.
+- **A server may not send `{123+}`.** The non-synchronising literal is a
+  client-to-server construct (RFC 7888); go-imap accepts it only when decoding
+  as a server, and so this rejects it outright rather than being liberal about
+  a frame no legitimate peer produces.
+
+It also carries go-imap's tolerances for what servers actually send, each with
+a test naming the behaviour: a space immediately before CRLF is trailing
+whitespace and not a field separator; a missing space before a parenthesised
+list is accepted; a lone LF ends a line; `body-fld-octets` of `-1` reads as 0.
+
 ## Tests
 
 `zig build test-imap`. Anchoring is stated per tier (CONVENTIONS §5):
 
 - **Tier 1** — the worked example published in RFC 3501 §5.1.3, asserted in
   both directions, plus the alphabet distinction from RFC 2152 UTF-7.
+- **Tier 1** — for the grammar, field-by-field parses of the response shapes
+  printed in RFC 9051 (`* 172 EXISTS`, the `FLAGS` list, a `{n}` literal).
 - **Tier 2** — the vector table from go-imap's own `internal/utf7`
   `decoder_test.go`, including all 25 rejection cases. This is the source that
   was ported, so it catches transcription slips and **cannot** catch a shared
   misreading of the RFC; it is not counted as an external anchor.
 
-Each canonicality rule has a test proven to fail when that rule is removed
-(alphabet, canonical-run check, null shift, surrogate arithmetic).
+Every rule that could be quietly dropped has a test proven to fail when it is:
+four in the UTF-7 codec (alphabet, canonical-run check, null shift, surrogate
+arithmetic) and six in the grammar (non-sync literal rejection, the literal cap
+firing before allocation, the trailing-space rule, the depth guard, `]` in
+astrings, INBOX case-folding). Verified by planting each defect and watching
+the suite go red, then confirming the revert byte-for-byte.

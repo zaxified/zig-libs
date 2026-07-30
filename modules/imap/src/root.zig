@@ -31,11 +31,15 @@ pub const meta = .{
 /// Modified UTF-7 (RFC 3501 §5.1.3), the encoding IMAP mailbox names use.
 pub const utf7 = @import("utf7.zig");
 
+/// The wire grammar (RFC 9051 §9), decode side.
+pub const wire = @import("wire.zig");
+
 test {
     // A `pub const x = @import(...)` re-export does NOT pull x's tests into
     // the test binary (CONVENTIONS §6.3 — this is what hid 52 never-run tests
     // in `websocket`). Every submodule must be named here.
     _ = utf7;
+    _ = wire;
 }
 
 test "meta is well-formed" {
