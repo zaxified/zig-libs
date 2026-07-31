@@ -370,6 +370,26 @@ test "golden: exact replication next-hops, RPF ingress, is_member" {
     for ([_]NodeId{ 3, 5 }) |x| try testing.expect(bt.isMember(x));
 }
 
+test "plan: matches the per-field accessors and returns null out of range" {
+    const gpa = testing.allocator;
+    var g = try goldenGraph(gpa);
+    defer g.deinit();
+
+    var bt = try build(gpa, &g, 0, &.{ 3, 5 });
+    defer bt.deinit();
+
+    var node: NodeId = 0;
+    while (node < bt.node_count) : (node += 1) {
+        const p = bt.plan(node).?;
+        try testing.expectEqual(bt.rpfIngress(node), p.rpf_ingress);
+        try testing.expectEqual(bt.isMember(node), p.is_member);
+        try testing.expectEqualSlices(NodeId, bt.replicateTo(node), p.replicate_to);
+    }
+    // Exactly at and beyond node_count: out of range, defined null.
+    try testing.expectEqual(@as(?NodePlan, null), bt.plan(bt.node_count));
+    try testing.expectEqual(@as(?NodePlan, null), bt.plan(bt.node_count + 50));
+}
+
 test "member pruning: a member-less branch is absent until it gains a member" {
     const gpa = testing.allocator;
     var g = try goldenGraph(gpa);
@@ -667,6 +687,26 @@ test "degenerate: source not in graph, no members, single member == source, isol
         // Members are flagged even though unreachable (they never receive).
         try testing.expect(bt.isMember(1) and bt.isMember(2));
     }
+}
+
+test "out-of-range member id (including exactly node_count) is ignored, not a bounds violation" {
+    const gpa = testing.allocator;
+    var g = try goldenGraph(gpa);
+    defer g.deinit();
+
+    // node_count == 7 (ids 0..6). Mix valid members with out-of-range ones,
+    // including the boundary id == node_count itself.
+    var bt = try build(gpa, &g, 0, &.{ 3, 5, g.nodeCount(), 999 });
+    defer bt.deinit();
+
+    try testing.expectEqual(g.nodeCount(), bt.node_count);
+    // Valid members still recognized and still drive replication normally.
+    try testing.expect(bt.isMember(3));
+    try testing.expect(bt.isMember(5));
+    try testing.expectEqualSlices(NodeId, &.{3}, bt.replicateTo(1)); // 6 still pruned
+    try testing.expectEqualSlices(NodeId, &.{5}, bt.replicateTo(4));
+    // Out-of-range ids are simply ignored (bounds-safe accessors, not a crash).
+    try testing.expect(!bt.isMember(g.nodeCount()));
 }
 
 test "unreachable member: flagged but never a replication target" {

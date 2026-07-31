@@ -409,6 +409,12 @@ test "SetCookie: invalid Path/Domain rejected" {
     try testing.expectError(error.InvalidCookie, bad_path.bufPrint(&buf));
     const ctl_domain: SetCookie = .{ .name = "n", .value = "v", .domain = "ex\x01.com" };
     try testing.expectError(error.InvalidCookie, ctl_domain.bufPrint(&buf));
+    // Mutation audit: DEL (0x7f) was never tested for Path/Domain — only the
+    // 0x01 control byte and ';' were exercised.
+    const del_path: SetCookie = .{ .name = "n", .value = "v", .path = "/a\x7fb" };
+    try testing.expectError(error.InvalidCookie, del_path.bufPrint(&buf));
+    const del_domain: SetCookie = .{ .name = "n", .value = "v", .domain = "ex\x7f.com" };
+    try testing.expectError(error.InvalidCookie, del_domain.bufPrint(&buf));
 }
 
 test "SetCookie: SameSite=None requires Secure" {
@@ -418,6 +424,13 @@ test "SetCookie: SameSite=None requires Secure" {
 
     const ok: SetCookie = .{ .name = "n", .value = "v", .secure = true, .same_site = .none };
     try testing.expectEqualStrings("n=v; Secure; SameSite=None", try ok.bufPrint(&buf));
+
+    // Mutation audit: only .strict was ever proven to NOT require Secure;
+    // .lax shares that same requirement (only .none needs Secure) but was
+    // never exercised insecure, so a regression over-requiring Secure for
+    // .lax would pass unnoticed.
+    const lax_insecure: SetCookie = .{ .name = "n", .value = "v", .same_site = .lax };
+    try testing.expectEqualStrings("n=v; SameSite=Lax", try lax_insecure.bufPrint(&buf));
 }
 
 test "SetCookie: bufPrint into too-small buffer" {

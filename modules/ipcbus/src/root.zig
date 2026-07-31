@@ -410,9 +410,12 @@ test "Bus: set/get/list + eviction at max_keys (no transport)" {
     try testing.expectEqual(@as(usize, 0), bus.count());
     try testing.expect(bus.get("nope") == null);
 
+    // fresh inserts (not just overwrites) must also bump version
+    const v_init = bus.version;
     try bus.set("a", "1");
     try bus.set("b", "2");
     try bus.set("c", "3");
+    try testing.expect(bus.version > v_init);
     try testing.expectEqual(@as(usize, 3), bus.count());
     try testing.expectEqualStrings("1", bus.get("a").?);
     try testing.expectEqualStrings("3", bus.get("c").?);
@@ -429,8 +432,11 @@ test "Bus: set/get/list + eviction at max_keys (no transport)" {
     const keys = bus.list(&keybuf);
     try testing.expectEqual(@as(usize, 3), keys.len);
 
-    // inserting a 4th key evicts one → count stays at the cap
+    // inserting a 4th key evicts one → count stays at the cap; the
+    // eviction-insert path must also bump version
+    const v_before_evict = bus.version;
     try bus.set("d", "4");
+    try testing.expect(bus.version > v_before_evict);
     try testing.expectEqual(@as(usize, 3), bus.count());
     try testing.expectEqualStrings("4", bus.get("d").?);
 
@@ -438,6 +444,14 @@ test "Bus: set/get/list + eviction at max_keys (no transport)" {
     bus.clear();
     try testing.expectEqual(@as(usize, 0), bus.count());
     try testing.expect(bus.get("d") == null);
+}
+
+test "unixAddr: overlong path is truncated to 107 bytes, leaving path[107] as NUL" {
+    var long_path: [200:0]u8 = undefined;
+    @memset(&long_path, 'x');
+    const addr = unixAddr(&long_path);
+    try testing.expectEqual(@as(u8, 'x'), addr.path[106]);
+    try testing.expectEqual(@as(u8, 0), addr.path[107]);
 }
 
 test "Bus: list into an undersized buffer is truncated, never overflows" {

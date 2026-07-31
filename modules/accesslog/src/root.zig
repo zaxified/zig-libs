@@ -456,6 +456,16 @@ test "writeCombined: null timestamp fallback prints raw ns inside the brackets" 
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "[1734000000000000000]") != null);
 }
 
+test "combined: response_bytes of exactly 0 prints the digit '0', not the '-' absent-marker" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var entry = sampleEntry();
+    entry.response_bytes = 0;
+    try writeCombined(entry, &w);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "\" 200 0 \"") != null);
+}
+
 test "write: enum dispatch matches the dedicated per-format functions" {
     inline for ([_]Format{ .json_lines, .logfmt, .combined }) |fmt| {
         var direct_buf: [512]u8 = undefined;
@@ -589,6 +599,20 @@ test "logfmt: a value containing only '=' is quoted (no ambiguous bare key=value
     try testing.expectEqualStrings("\"a=b\"", w.buffered());
 }
 
+test "logfmt: an empty value is quoted (an unquoted empty value would vanish, misreading as an absent key)" {
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLogfmtValue(&w, "");
+    try testing.expectEqualStrings("\"\"", w.buffered());
+}
+
+test "logfmt: control bytes escape to their own exact \\xHH value, not just 'something'" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLogfmtValue(&w, "\x01\x1f\x7f");
+    try testing.expectEqualStrings("\"\\x01\\x1f\\x7f\"", w.buffered());
+}
+
 test "combined: injection payload cannot forge a second line or break the quoted fields" {
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -710,6 +734,26 @@ test "entryFromRequest: HTTP/1.0 protocol, no peer, no UA/referer, request_bytes
     try testing.expectEqual(@as(?u64, 7), entry.request_bytes); // override wins over content_length
 }
 
+test "entryFromRequest: addr_buf too small to hold the peer address leaves remote_addr null" {
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const peer = try std.Io.net.IpAddress.parse("192.0.2.9", 5555);
+    const req = testRequest("", "/", false, &body, peer);
+
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    res.setStatus(200);
+
+    // "192.0.2.9:5555" is 14 bytes; 1 byte is nowhere near enough, forcing
+    // the write-failure path instead of the happy path.
+    var addr_buf: [1]u8 = undefined;
+    const entry = entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 1 });
+
+    try testing.expectEqual(@as(?[]const u8, null), entry.remote_addr);
+}
+
 test "entryFromRequest output feeds straight into writeCombined without extra glue" {
     var body: http.Server.RequestBody = .{ .none = .fixed("") };
     const peer = try std.Io.net.IpAddress.parse("203.0.113.5", 443);
@@ -730,4 +774,52 @@ test "entryFromRequest output feeds straight into writeCombined without extra gl
     try writeCombined(entry, &w);
     try testing.expect(std.mem.startsWith(u8, w.buffered(), "203.0.113.5:443 - - "));
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"GET /health HTTP/1.1\" 200") != null);
+}
+
+test "entryFromRequest: 204 response streamed through .discard maps response_bytes to 0, not null" {
+    // `responseBytesOf` has a 5-way switch over `res.body`; every other
+    // test in this file only ever exercises the `.buffering` arm (the
+    // default until the body is actually streamed). Force a `.discard`
+    // body (HEAD/204/304, per `noBody()`) by flushing before `end()`, and
+    // confirm the mapping is the documented `0` — not `null` (that would
+    // read as "unknown", which is wrong: a discarded body's length is
+    // exactly known to be zero) and not some other constant.
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = testRequest("", "/", false, &body, null);
+
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    res.setStatus(204);
+    try res.writeAll("ignored-per-noBody");
+    try res.flush();
+
+    var addr_buf: [64]u8 = undefined;
+    const entry = entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 1 });
+    try testing.expectEqual(@as(?u64, 0), entry.response_bytes);
+}
+
+test "entryFromRequest: identity-framed response maps response_bytes to the declared Content-Length" {
+    // The `.identity` arm reads `res.declared_len.?` — the original
+    // declared total, not the shrinking remaining-bytes counter in
+    // `res.body.identity`. Confirm it reports the full declared length
+    // after the whole body has been written (remaining counter at 0).
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = testRequest("", "/", false, &body, null);
+
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    res.setStatus(200);
+    try res.setHeader("Content-Length", "2");
+    try res.writeAll("hi");
+    try res.flush();
+
+    var addr_buf: [64]u8 = undefined;
+    const entry = entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 1 });
+    try testing.expectEqual(@as(?u64, 2), entry.response_bytes);
 }

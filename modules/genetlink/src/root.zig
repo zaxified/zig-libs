@@ -458,12 +458,32 @@ test "buildGetFamilyRequest rejects a name too long for GENL_NAMSIZ" {
     ));
 }
 
+test "buildGetFamilyRequest: GENL_NAMSIZ boundary — one under fits, exactly at it rejects" {
+    // GENL_NAMSIZ (16) includes the NUL terminator, so the longest name that
+    // fits is 15 bytes; a name of exactly 16 bytes must be rejected even
+    // though it is nowhere near the "way too long" case above.
+    const fits = "a" ** (GENL_NAMSIZ - 1);
+    const req = try buildGetFamilyRequest(testing.allocator, 1, fits);
+    testing.allocator.free(req);
+
+    const boundary = "a" ** GENL_NAMSIZ;
+    try testing.expectError(error.NameTooLong, buildGetFamilyRequest(testing.allocator, 1, boundary));
+}
+
 test "splitPayload rejects a truncated genlmsghdr" {
     try testing.expectError(error.Truncated, splitPayload(&.{}));
     try testing.expectError(error.Truncated, splitPayload(&.{ 1, 1, 0 }));
     const p = try splitPayload(&.{ 0, 1, 0, 0, 0xaa });
     try testing.expectEqual(@as(u8, 0), p.cmd);
     try testing.expectEqualSlices(u8, &.{0xaa}, p.attrs);
+}
+
+test "splitPayload accepts a payload of exactly header_len bytes (empty attrs)" {
+    // The boundary itself: exactly 4 bytes is a complete genlmsghdr with no
+    // attributes following, not a truncation.
+    const p = try splitPayload(&.{ 7, 1, 0, 0 });
+    try testing.expectEqual(@as(u8, 7), p.cmd);
+    try testing.expectEqualSlices(u8, &.{}, p.attrs);
 }
 
 test "appendHeader encodes cmd/version with a zeroed reserved field" {

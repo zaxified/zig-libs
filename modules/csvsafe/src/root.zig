@@ -135,6 +135,15 @@ fn expectSafe(value: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, w.buffered());
 }
 
+/// Drives `writeSafeSep` (custom decimal separator) through a fixed buffer
+/// and asserts the emitted bytes.
+fn expectSafeSep(value: []const u8, decimal_sep: u8, expected: []const u8) !void {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeSafeSep(&w, value, decimal_sep);
+    try testing.expectEqualStrings(expected, w.buffered());
+}
+
 // ── Formula-injection guard tests ──────────────
 
 test "writeSafe: formula-injection leads get an apostrophe guard" {
@@ -214,6 +223,14 @@ test "needsGuard predicate matches writeSafe behavior" {
     try testing.expect(!needsGuard("normal"));
 }
 
+test "writeSafeSep: the writer path itself honors a non-default decimal separator" {
+    // Regression: writeSafeSep must consult the *passed* decimal_sep, not
+    // just the predicate-level needsGuardSep (which was the only thing
+    // previously exercised with a non-default separator).
+    try expectSafeSep("-,5", ',', "-,5"); // comma-led decimal, comma locale: safe
+    try expectSafeSep("-,5", '.', "'-,5"); // same value, '.' locale: not a number, guarded
+}
+
 test "needsGuardSep honors a comma decimal separator" {
     // With ',' as the decimal separator, "-12,34" is a signed number.
     try testing.expect(!needsGuardSep("-12,34", ','));
@@ -241,4 +258,19 @@ test "guard allocates a guarded or copied cell" {
     const empty = try guard(a, "");
     defer a.free(empty);
     try testing.expectEqualStrings("", empty);
+}
+
+test "guardSep honors a non-default decimal separator" {
+    const a = testing.allocator;
+
+    // "-,5" is a safe signed number under a ',' locale...
+    const safe = try guardSep(a, "-,5", ',');
+    defer a.free(safe);
+    try testing.expectEqualStrings("-,5", safe);
+
+    // ...but under the default '.' locale, ',' isn't the separator, so it's
+    // guarded.
+    const dangerous = try guardSep(a, "-,5", '.');
+    defer a.free(dangerous);
+    try testing.expectEqualStrings("'-,5", dangerous);
 }

@@ -248,6 +248,12 @@ test "raw CBC rejects an undersized out buffer" {
     try testing.expectError(error.BufferTooSmall, encrypt(Aes128, f_2_1_key, f_2_1_iv, &pt, &out));
 }
 
+test "raw CBC decrypt rejects an undersized out buffer" {
+    var out: [16]u8 = undefined; // ciphertext is 2 blocks, out is 1
+    const ct = [_]u8{0x41} ** 32;
+    try testing.expectError(error.BufferTooSmall, decrypt(Aes128, f_2_1_key, f_2_1_iv, &ct, &out));
+}
+
 test "raw CBC round-trip: empty message" {
     var out: [0]u8 = undefined;
     const n = try encrypt(Aes128, f_2_1_key, f_2_1_iv, "", &out);
@@ -355,6 +361,12 @@ test "XML-Enc unpad accepts a valid pad with arbitrary non-final pad bytes" {
     buf[block_len - 4] = 0xFF; // arbitrary
     const n = try unpadXmlEnc(&buf);
     try testing.expectEqual(@as(usize, block_len - 4), n);
+}
+
+test "XML-Enc unpad accepts: pad length == block_len with a full pad block, empty-ish message" {
+    const buf = [_]u8{0x10} ** block_len; // valid: N=16, all 16 bytes are pad
+    const n = try unpadXmlEnc(&buf);
+    try testing.expectEqual(@as(usize, 0), n);
 }
 
 test "XML-Enc unpad rejects: zero-length pad byte" {

@@ -371,6 +371,16 @@ test "CharClass length bounds" {
     try testing.expect(zero_ok.check("")); // explicit empty allowed
 }
 
+test "CharClass first_char == .not_dash rejects a leading dash directly" {
+    // Mutation audit: `.not_dash` was never exercised by any test — a class
+    // with `reject_leading_dash = false` so `.not_dash` is the ONLY guard
+    // against a leading '-', isolating it the same way the reject_leading_dash
+    // isolation test does below.
+    const c: CharClass = .{ .extra = "-", .first_char = .not_dash, .reject_leading_dash = false };
+    try testing.expect(!c.check("-x"));
+    try testing.expect(c.check("x-y")); // '-' elsewhere is fine
+}
+
 test "CharClass.predicate adapts to a plain fn" {
     const p = (CharClass{ .extra = "_-", .first_char = .alnum }).predicate();
     try testing.expect(p("eth0"));
@@ -404,6 +414,7 @@ test "isSafeUrl: scheme + no quoting metachars" {
     try testing.expect(!isSafeUrl("http://a b/x")); // space
     try testing.expect(!isSafeUrl("http://a`id`b/x")); // backtick
     try testing.expect(!isSafeUrl("http://a\"b/x")); // quote
+    try testing.expect(!isSafeUrl("http://a'b/x")); // single quote
     try testing.expect(!isSafeUrl("http://")); // too short (7 < 8)
 }
 
@@ -427,6 +438,8 @@ test "isSafeCidrList" {
     try testing.expect(!isSafeCidrList("10.0.0.0/24;rm", ',')); // metachar
     try testing.expect(!isSafeCidrList("", ','));
     try testing.expect(!isSafeCidrList("-10.0.0.0/8", ',')); // '-' not in class
+    try testing.expect(!isSafeCidrList("10.0.0.g/24", ',')); // non-hex letter rejected
+    try testing.expect(!isSafeCidrList("wg0.0.0.0/24", ',')); // non-hex alnum prefix rejected
 }
 
 test "isSafeCidrList: leading dash rejected even when sep collides with '-'" {

@@ -246,6 +246,10 @@ test "length + KEK validation (incl. the 192-bit-KEK std gap), with positive con
     try std.testing.expectError(error.InvalidLength, unwrap(&kek, &[_]u8{0} ** 16, &buf)); // < 24
     try std.testing.expectError(error.BufferTooSmall, wrap(&kek, &[_]u8{0} ** 16, buf[0..16]));
     try std.testing.expectError(error.BufferTooSmall, unwrap(&kek, &ct, pt[0..8]));
+    // Boundary: out short by exactly one byte must also be rejected, not just
+    // a wildly-undersized buffer.
+    try std.testing.expectError(error.BufferTooSmall, wrap(&kek, &[_]u8{0} ** 16, buf[0..23]));
+    try std.testing.expectError(error.BufferTooSmall, unwrap(&kek, &ct, pt[0..15]));
 
     const kek192 = [_]u8{0} ** 24;
     try std.testing.expectError(error.UnsupportedKeyLength, wrap(&kek192, &[_]u8{0} ** 16, &buf));

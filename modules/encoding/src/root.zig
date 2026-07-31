@@ -345,6 +345,24 @@ test "encode: invalid UTF-8 passes through verbatim" {
     try expectEncode(.iso_8859_1, "ab\xffcd", "ab\xffcd");
 }
 
+test "canonicalName: round-trips through parse for every Encoding (audit F2)" {
+    // canonicalName() had zero test coverage — a wrong string for one arm
+    // (e.g. windows_1250 mislabeled as "windows-1252") stayed green.
+    inline for (@typeInfo(Encoding).@"enum".fields) |f| {
+        const e: Encoding = @enumFromInt(f.value);
+        try testing.expectEqual(e, Encoding.parse(e.canonicalName()).?);
+    }
+    try testing.expectEqualStrings("windows-1250", Encoding.windows_1250.canonicalName());
+}
+
+test "encode: cp U+0080 boundary — ASCII cutoff is strictly '< 0x80' (audit F3)" {
+    // 0x80 is the first non-ASCII codepoint. windows_1252 overrides byte 0x80's
+    // identity mapping (to €), so no byte maps back to raw cp U+0080 there —
+    // it must fall to '?', not be truncated into the ASCII branch.
+    try expectEncode(.iso_8859_1, "\u{80}", "\x80"); // identity: still round-trips
+    try expectEncode(.windows_1252, "\u{80}", "?"); // 0x80 is remapped to €; no byte left for raw U+0080
+}
+
 test "encode: a valid multi-byte lead truncated at buffer end passes through, no OOB (audit F1)" {
     // The invalid-leading-byte case above (0xFF) is caught by utf8ByteSequenceLength;
     // the SEPARATE truncated-trailing-sequence bounds check (a valid lead byte with

@@ -562,6 +562,35 @@ test "static entry is never aged and not overwritten by dynamic learn" {
     try testing.expect(t.lookup(5, macOf(0x99), 10) == null);
 }
 
+test "learnStatic pins an already-dynamic entry: it stops ageing after the upgrade" {
+    var t = testTable(); // aging_ticks = 100
+    defer t.deinit();
+    try t.learn(6, macOf(0xAA), 2, 0); // dynamic, learned at t=0
+    // Still dynamic: it would expire past the aging window.
+    try testing.expect(t.lookup(6, macOf(0xAA), 1000) == null);
+
+    // Re-learn at t=0 doesn't matter here; pin it via learnStatic instead.
+    try t.learnStatic(6, macOf(0xAA), 3);
+    // Now pinned behind PE 3, and never expires — even far past the window
+    // that would have aged out the original dynamic entry.
+    try testing.expectEqual(@as(?PeId, 3), t.lookup(6, macOf(0xAA), 1000));
+    try testing.expectEqual(@as(?PeId, 3), t.lookup(6, macOf(0xAA), std.math.maxInt(Time)));
+    t.tick(std.math.maxInt(Time));
+    try testing.expectEqual(@as(usize, 1), t.fdbCount(6)); // not reclaimed
+}
+
+test "isExpired clock-skew clamp: now before learned_at is treated as age 0 (fresh), not a crash" {
+    var t = testTable(); // aging_ticks = 100
+    defer t.deinit();
+    // Learn "in the future" relative to a later query with a smaller `now`
+    // (e.g. a clock adjustment). age must clamp to 0, never underflow.
+    try t.learn(7, macOf(0xBB), 2, 1_000);
+    var buf: [16]PeId = undefined;
+    const d = try t.forward(7, macOf(0xBB), 9, 10, &buf); // now(10) < learned_at(1000)
+    try testing.expectEqual(Decision{ .unicast = 2 }, d);
+    try testing.expectEqual(@as(?PeId, 2), t.lookup(7, macOf(0xBB), 0));
+}
+
 test "capacity: per-tenant MAC-flood is bounded; existing entries unaffected; reclaim on ageing" {
     var t = testTable(); // max_macs_per_isid = 8, aging = 100
     defer t.deinit();

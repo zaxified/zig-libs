@@ -432,6 +432,18 @@ test "semantics: split-horizon drops a BUM frame reflected to its own ingress PE
     try testing.expect(!droppedBySplitHorizon(own_unicast, this_pe));
 }
 
+test "semantics: looksLikeEthernet is a pure length check at the eth_hdr_len boundary" {
+    var buf: [eth_hdr_len]u8 = @splat(0);
+    // Exactly eth_hdr_len bytes: long enough to hold an Ethernet II header.
+    try testing.expect(looksLikeEthernet(&buf));
+    // One byte short: not long enough.
+    try testing.expect(!looksLikeEthernet(buf[0 .. eth_hdr_len - 1]));
+    // Well past the minimum is still fine; empty is not.
+    var longer: [eth_hdr_len + 50]u8 = @splat(0);
+    try testing.expect(looksLikeEthernet(&longer));
+    try testing.expect(!looksLikeEthernet(&.{}));
+}
+
 test "semantics: two I-SIDs decode to distinct tenants (isolation key round-trips)" {
     const frame = "customer payload";
     const a: Fields = .{ .isid = 100, .ttl = 64, .bum = false, .ingress_pe = 1 };

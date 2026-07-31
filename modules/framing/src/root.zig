@@ -127,6 +127,28 @@ test "writeFrame rejects oversize payload" {
     try t.expectError(error.FrameTooLarge, writeFrame(&w, fake, limits));
 }
 
+test "writeFrame accepts a payload exactly at max_frame (audit F1)" {
+    // Boundary: payload.len == max_frame must succeed, not be rejected — only
+    // payload.len > max_frame is oversize. Only the +1-over case was tested.
+    var out: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    const limits = Limits{ .max_frame = 8 };
+    try writeFrame(&w, "01234567", limits); // exactly 8 bytes == max_frame
+}
+
+test "readFrame accepts a payload exactly filling buf (audit F2)" {
+    // Boundary: len == buf.len must succeed — only the strictly-larger case
+    // (10-byte payload into a 4-byte buf) was tested.
+    const t = std.testing;
+    var out: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try writeFrame(&w, "abcd", .{}); // 4-byte payload
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var exact: [4]u8 = undefined; // buf.len == payload len exactly
+    try t.expectEqualStrings("abcd", try readFrame(&r, &exact, .{}));
+}
+
 test "readFrame enforces max_frame even when the buffer is larger" {
     const t = std.testing;
     var out: [64]u8 = undefined;

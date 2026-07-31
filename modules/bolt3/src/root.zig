@@ -224,8 +224,8 @@ test "per-commitment secret feeds the revocation derivation end-to-end" {
     const revpub = try deriveRevocationPublicKey(tv_base_point, (try Secp256k1.combMulBase(pcs, .big)).toCompressedSec1());
     const revpriv = try deriveRevocationPrivateKey(tv_base_secret, pcs);
     // revpub must be revpriv·G (mirrors the App-E cross-check, but sourced from a real shachain secret).
-    _ = revpub;
-    _ = revpriv;
+    const revpub_from_priv = (try Secp256k1.combMulBase(revpriv, .big)).toCompressedSec1();
+    try std.testing.expectEqualSlices(u8, &revpub, &revpub_from_priv);
 }
 
 test "invalid point / secret surface as typed errors" {
@@ -233,6 +233,15 @@ test "invalid point / secret surface as typed errors" {
     try std.testing.expectError(error.InvalidPoint, derivePublicKey(bad33, tv_pcp));
     const bad32 = [_]u8{0} ** 32; // zero is a non-canonical secret
     try std.testing.expectError(error.InvalidSecret, derivePrivateKey(bad32, tv_pcs));
+}
+
+test "revocation derivation: invalid point / secret surface as typed errors" {
+    const bad33 = [_]u8{0} ** 33;
+    const bad32 = [_]u8{0} ** 32; // zero is a non-canonical secret
+    try std.testing.expectError(error.InvalidPoint, deriveRevocationPublicKey(bad33, tv_pcp));
+    try std.testing.expectError(error.InvalidPoint, deriveRevocationPublicKey(tv_base_point, bad33));
+    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(bad32, tv_pcs));
+    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(tv_base_secret, bad32));
 }
 
 fn hex32(comptime s: *const [64]u8) [32]u8 {

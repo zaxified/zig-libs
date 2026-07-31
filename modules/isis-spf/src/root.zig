@@ -676,6 +676,40 @@ test "asymmetric metrics: the lower-system-id endpoint's advertisement wins" {
     try testing.expectEqual(@as(u64, 7), table.lookup(b).?.metric);
 }
 
+test "addDirected: the same ordered pair advertised twice keeps the minimum metric" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+
+    // A's LSP advertises B twice (e.g. duplicate/fragmented entries): 20 then 5.
+    // The directed a->b advertisement must keep the minimum (5), not the last
+    // or the first value seen.
+    try insertReachLsp(&db, a, 1, &.{ .{ .nbr = b, .metric = 20 }, .{ .nbr = b, .metric = 5 } });
+    try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 5 }});
+
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    try testing.expectEqual(@as(u64, 5), table.lookup(b).?.metric);
+}
+
+test "two-way check with require_two_way=false: only the hi->lo advertisement exists (hi_lo fallback)" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+
+    // Only B (the lexicographically-larger id) advertises A; A advertises
+    // nothing. This exercises the `hi_lo` fallback in the undirected-weight
+    // selection (the `lo_hi` advertisement is absent).
+    try insertReachLsp(&db, a, 1, &.{});
+    try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 15 }});
+
+    var table = try computeWith(testing.allocator, &db, a, 0, .{ .require_two_way = false });
+    defer table.deinit();
+    try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 15 }, table.lookup(b).?);
+}
+
 test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.util, meta.role);

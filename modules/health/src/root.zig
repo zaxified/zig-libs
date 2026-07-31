@@ -134,6 +134,19 @@ fn respondReady(h: *const Health, res: *http.Server.ResponseWriter) anyerror!voi
 // ── tests (offline — through http.Server.serveStream) ───────────────────────
 
 const testing = std.testing;
+
+test "isProbeMethod: GET and HEAD are probe methods, everything else is not (audit F1)" {
+    // Doc comment + module docs both say "GET/HEAD", but every wire-level test
+    // below only ever issues GET — HEAD had zero coverage, so a regression
+    // that dropped HEAD support (e.g. mismatched to .post) would go unnoticed.
+    try testing.expect(isProbeMethod(.get));
+    try testing.expect(isProbeMethod(.head));
+    try testing.expect(!isProbeMethod(.post));
+    try testing.expect(!isProbeMethod(.put));
+    try testing.expect(!isProbeMethod(.delete));
+    try testing.expect(!isProbeMethod(.patch));
+    try testing.expect(!isProbeMethod(.options));
+}
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 

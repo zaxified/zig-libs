@@ -128,6 +128,12 @@ fn snpa(last: u8) Snpa {
 const me: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 0xA }, .priority = 64, .snpa = snpa(0x0A), .pseudonode_id = 1 };
 const higher: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 0xB }, .priority = 100, .snpa = snpa(0x0B) };
 
+test "pre-recompute: isLocalDis and currentResult default before any recompute" {
+    var e = Election.init(me);
+    try testing.expect(!e.isLocalDis());
+    try testing.expectEqual(@as(?Result, null), e.currentResult());
+}
+
 test "first recompute (local alone) establishes local as DIS via became_dis" {
     var e = Election.init(me);
     const eff = e.recompute(&.{}, 1);

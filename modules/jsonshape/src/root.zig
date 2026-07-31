@@ -112,7 +112,16 @@ fn shapeXY(a: std.mem.Allocator, items: []const std.json.Value, spec: ShapeSpec)
             },
             else => .{ null, item }, // scalar → [index, item]
         };
-        row[0] = if (xv) |v| try jsonToValue(a, v, .text) else .{ .int = @intCast(ri) };
+        // `cols[0]` is declared `.text`, so the fallback index must be text
+        // too. It used to be stored as `.int`, which made the column
+        // heterogeneous and the declaration a lie: a consumer trusting the
+        // declared type and reading `.text` panics on the union, and one
+        // using `dataset.Value.asText()` silently gets null for exactly the
+        // rows that took this branch. Found by mutation audit (1A).
+        row[0] = if (xv) |v|
+            try jsonToValue(a, v, .text)
+        else
+            .{ .text = try std.fmt.allocPrint(a, "{d}", .{ri}) };
         row[1] = if (yv) |v| try jsonToValue(a, v, .float) else .null;
         rows[ri] = row;
     }
@@ -729,6 +738,109 @@ test "shape: numeric filter operators (>, no spaces around op)" {
     try testing.expectEqual(@as(i64, 10), d.cell(0, "n").?.int);
 }
 
+test "shape: numeric filter operators — ne, lt, le, ge (all previously untested)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = "{\"arr\":[{\"n\":1},{\"n\":5},{\"n\":10}]}";
+
+    const ne = try shape(a, json, .{ .path = "arr[?(@.n != 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
+    try testing.expectEqual(@as(usize, 2), ne.rows.len);
+
+    const lt = try shape(a, json, .{ .path = "arr[?(@.n < 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
+    try testing.expectEqual(@as(usize, 1), lt.rows.len);
+    try testing.expectEqual(@as(i64, 1), lt.cell(0, "n").?.int);
+
+    const le = try shape(a, json, .{ .path = "arr[?(@.n <= 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
+    try testing.expectEqual(@as(usize, 2), le.rows.len);
+
+    // `>=` — distinguishes from `>`: 5 must be INCLUDED here.
+    const ge = try shape(a, json, .{ .path = "arr[?(@.n >= 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
+    try testing.expectEqual(@as(usize, 2), ge.rows.len);
+    try testing.expectEqual(@as(i64, 5), ge.cell(0, "n").?.int);
+    try testing.expectEqual(@as(i64, 10), ge.cell(1, "n").?.int);
+}
+
+test "shape: string filter operators — ne, lt, le, gt, ge (all previously untested)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = "{\"arr\":[{\"s\":\"a\"},{\"s\":\"b\"},{\"s\":\"c\"}]}";
+
+    const ne = try shape(a, json, .{ .path = "arr[?(@.s != \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
+    try testing.expectEqual(@as(usize, 2), ne.rows.len);
+
+    const lt = try shape(a, json, .{ .path = "arr[?(@.s < \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
+    try testing.expectEqual(@as(usize, 1), lt.rows.len);
+    try testing.expectEqualStrings("a", lt.cell(0, "s").?.text);
+
+    const gt = try shape(a, json, .{ .path = "arr[?(@.s > \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
+    try testing.expectEqual(@as(usize, 1), gt.rows.len);
+    try testing.expectEqualStrings("c", gt.cell(0, "s").?.text);
+
+    // `<=` / `>=` must include the boundary "b", distinguishing them from `<`/`>`.
+    const le = try shape(a, json, .{ .path = "arr[?(@.s <= \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
+    try testing.expectEqual(@as(usize, 2), le.rows.len);
+
+    const ge = try shape(a, json, .{ .path = "arr[?(@.s >= \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
+    try testing.expectEqual(@as(usize, 2), ge.rows.len);
+}
+
+test "shape: boolean and null filter literals (cmpBool/cmpNull were entirely dead code)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{ "arr": [
+        \\  { "id": 1, "active": true },
+        \\  { "id": 2, "active": false },
+        \\  { "id": 3, "note": null }
+        \\ ] }
+    ;
+
+    const eq_true = try shape(a, json, .{ .path = "arr[?(@.active == true)]", .columns = &.{.{ .name = "id", .key = "id", .type = .int }} });
+    try testing.expectEqual(@as(usize, 1), eq_true.rows.len);
+    try testing.expectEqual(@as(i64, 1), eq_true.cell(0, "id").?.int);
+
+    const ne_true = try shape(a, json, .{ .path = "arr[?(@.active != true)]", .columns = &.{.{ .name = "id", .key = "id", .type = .int }} });
+    try testing.expectEqual(@as(usize, 1), ne_true.rows.len);
+    try testing.expectEqual(@as(i64, 2), ne_true.cell(0, "id").?.int);
+
+    const is_null = try shape(a, json, .{ .path = "arr[?(@.note == null)]", .columns = &.{.{ .name = "id", .key = "id", .type = .int }} });
+    try testing.expectEqual(@as(usize, 1), is_null.rows.len);
+    try testing.expectEqual(@as(i64, 3), is_null.cell(0, "id").?.int);
+}
+
+test "shape: [x,y] default from a top-level array of bare scalars (else branch of shapeXY, untested)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try shape(a, "[10, 20, 30]", .{});
+    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    // scalar item → x = positional index, y = the scalar itself. The index is
+    // TEXT: `cols[0]` declares `.text`, and this branch used to contradict it
+    // by storing `.int` (fixed in the 1A audit — see `shapeXY`).
+    try testing.expectEqualStrings("1", d.cell(1, "x").?.text);
+    try testing.expectEqual(@as(f64, 20), d.cell(1, "y").?.float);
+}
+
+test "shape: stringified-number JSON values coerce through number_string/string paths (untested)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = "{\"arr\":[{\"n\":\"42\"}]}";
+    const d = try shape(a, json, .{
+        .path = "arr",
+        .columns = &.{
+            .{ .name = "as_int", .key = "n", .type = .int },
+            .{ .name = "as_float", .key = "n", .type = .float },
+        },
+    });
+    try testing.expectEqual(@as(usize, 1), d.rows.len);
+    try testing.expectEqual(@as(i64, 42), d.cell(0, "as_int").?.int);
+    try testing.expectEqual(@as(f64, 42), d.cell(0, "as_float").?.float);
+}
+
 test "shape: malformed JSONPath syntax → empty dataset, not a crash" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -740,4 +852,26 @@ test "shape: malformed JSONPath syntax → empty dataset, not a crash" {
         .columns = &.{.{ .name = "v", .type = .int }},
     });
     try testing.expectEqual(@as(usize, 0), d.rows.len);
+}
+
+test "shape: the x column honours its declared .text type on every branch" {
+    // The declared type is the contract `dataset` consumers rely on. Before
+    // this, the index fallback stored `.int` into a column declared `.text`,
+    // so the two branches of the same column had different active union
+    // fields — invisible to every test that only exercised the object branch.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A top-level array of bare scalars takes the index fallback for x.
+    const d = try shape(a, "[10, 20, 30]", .{});
+    try testing.expectEqual(ColumnType.text, d.columns[0].type);
+    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    for (d.rows, 0..) |row, i| {
+        // `.asText()` must answer for EVERY row, not just the ones that
+        // happened to come from an object.
+        const got = row[0].asText() orelse return error.XColumnNotText;
+        var buf: [8]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d}", .{i}), got);
+    }
 }
