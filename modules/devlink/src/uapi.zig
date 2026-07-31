@@ -484,6 +484,13 @@ test "attribute numbers match the ones seen on the wire" {
     try testing.expectEqual(@as(u16, 0x51), ATTR.PARAM_NAME);
     try testing.expectEqual(@as(u16, 0x57), ATTR.PARAM_VALUE_CMODE);
     try testing.expectEqual(@as(u16, 0x58), ATTR.REGION_NAME);
+    // REGION_SIZE and REGION_MAX_SNAPSHOTS are otherwise only exercised via
+    // `appendAttrU64`/`parseRegion`, which both read the same symbol — a
+    // swap of their two numeric values is invisible to that round trip
+    // (different width, u64 vs u32, so it would not even fail to decode).
+    // Pin the real kernel numbers here so a swap has an anchor to break.
+    try testing.expectEqual(@as(u16, 0x59), ATTR.REGION_SIZE);
+    try testing.expectEqual(@as(u16, 0xaa), ATTR.REGION_MAX_SNAPSHOTS);
     try testing.expectEqual(@as(u16, 0x5c), ATTR.REGION_SNAPSHOT_ID);
     try testing.expectEqual(@as(u16, 0x60), ATTR.REGION_CHUNK_ADDR);
     try testing.expectEqual(@as(u16, 0x61), ATTR.REGION_CHUNK_LEN);

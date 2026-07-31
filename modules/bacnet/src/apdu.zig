@@ -629,6 +629,10 @@ test "SimpleACK, Reject, Abort and SegmentACK are fixed-size" {
     try testing.expectEqualSlices(u8, &ab, try encode(a, &out));
     // Bits 1..3 of an Abort's first octet are reserved.
     try testing.expectError(error.InvalidPduType, decode(&.{ 0x72, 0x01, 0x04 }));
+    // An Abort carries no service data; trailing octets are a malformed PDU,
+    // not an Abort with a payload it has no field for.
+    try testing.expectError(error.Truncated, decode(&.{ 0x71, 0x01 }));
+    try testing.expectError(error.Truncated, decode(&.{ 0x71, 0x01, 0x04, 0x00 }));
 
     const segack = [_]u8{ 0x42, 0x01, 0x03, 0x10 };
     const sa = try decode(&segack);

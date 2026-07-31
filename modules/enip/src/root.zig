@@ -353,6 +353,129 @@ test "round trip: a Class 3 connection carries messages with sequence counts" {
     try testing.expectError(error.NoConnection, c.sendConnectedCip(read));
 }
 
+test "Forward_Close only closes the connection whose full originator triple matches" {
+    // adapter.zig's Forward_Close handler matches on {serial, vendor,
+    // originator_serial} because the message carries no connection id. Only
+    // the round-trip tests exercise a *matching* close; nothing before this
+    // sent a Forward_Close with a wrong originator_serial and checked that
+    // the still-open connection survives it.
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var paired = PairedTransport{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+
+    const conn = try c.forwardOpen(.{ .size = 500 });
+    try testing.expect(conn.o_to_t_id != 0);
+    try testing.expect(target.connections[0].in_use);
+
+    // Same connection_serial and vendor id as the open connection, but a
+    // different originator_serial: this must NOT close it.
+    var path_buf: [8]u8 = undefined;
+    var b = epath.Builder.init(&path_buf);
+    b.class(@intFromEnum(cip.ClassCode.message_router)) catch unreachable;
+    b.instance(1) catch unreachable;
+    const mismatched = connmgr.ForwardClose{
+        .connection_serial = c.connection.?.serial,
+        .originator_vendor_id = c.cfg.originator_vendor_id,
+        .originator_serial = c.cfg.originator_serial +% 1,
+        .connection_path = b.bytes(),
+    };
+    var wire_buf: [128]u8 = undefined;
+    const wire = try mismatched.wrap(&wire_buf);
+    const reply = try c.sendCip(wire);
+    try testing.expect(!reply.general_status.isSuccess());
+    try testing.expectEqual(cip.GeneralStatus.connection_failure, reply.general_status);
+    try testing.expectEqual(
+        @as(u16, @intFromEnum(connmgr.ExtendedStatus.connection_not_found)),
+        reply.extendedStatus().?,
+    );
+    try testing.expect(target.connections[0].in_use); // still open
+
+    // The real Forward_Close (matching triple) does close it.
+    try c.forwardClose();
+    try testing.expect(!target.connections[0].in_use);
+}
+
+test "Forward_Open past the connection pool's capacity is refused, not stolen from another originator" {
+    // The adapter has a fixed-size connection pool (`connections: [4]`).
+    // Nothing before this ever opened more than one connection at a time
+    // against a single adapter, so the pool-exhaustion path in
+    // `freeConnection`/Forward_Open's slot search had no test at all.
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+
+    var path_buf: [8]u8 = undefined;
+    var b = epath.Builder.init(&path_buf);
+    b.class(@intFromEnum(cip.ClassCode.message_router)) catch unreachable;
+    b.instance(1) catch unreachable;
+
+    const params = connmgr.ConnectionParameters{ .size = 500, .variable = true };
+    var out: [256]u8 = undefined;
+
+    var opened: [4]u32 = undefined;
+    for (0..4) |i| {
+        var wire_buf: [256]u8 = undefined;
+        const fo = connmgr.ForwardOpen{
+            .o_to_t_connection_id = 0,
+            .t_to_o_connection_id = 0,
+            .connection_serial = @intCast(100 + i),
+            .originator_vendor_id = 0x1234,
+            .originator_serial = 1,
+            .o_to_t_rpi = 10_000,
+            .o_to_t_params = params,
+            .t_to_o_rpi = 10_000,
+            .t_to_o_params = params,
+            .connection_path = b.bytes(),
+        };
+        const wire = try fo.wrap(&wire_buf);
+        const raw = try target.messageRouter(wire, &out);
+        const reply = try cip.Reply.decode(raw);
+        try testing.expect(reply.general_status.isSuccess());
+        const fr = try connmgr.ForwardOpenReply.decode(reply.data);
+        opened[i] = fr.o_to_t_connection_id;
+    }
+    for (&target.connections) |c| try testing.expect(c.in_use);
+
+    // A 5th Forward_Open finds no free slot.
+    var wire_buf5: [256]u8 = undefined;
+    const fo5 = connmgr.ForwardOpen{
+        .o_to_t_connection_id = 0,
+        .t_to_o_connection_id = 0,
+        .connection_serial = 200,
+        .originator_vendor_id = 0x1234,
+        .originator_serial = 1,
+        .o_to_t_rpi = 10_000,
+        .o_to_t_params = params,
+        .t_to_o_rpi = 10_000,
+        .t_to_o_params = params,
+        .connection_path = b.bytes(),
+    };
+    const wire5 = try fo5.wrap(&wire_buf5);
+    const raw5 = try target.messageRouter(wire5, &out);
+    const reply5 = try cip.Reply.decode(raw5);
+    try testing.expect(!reply5.general_status.isSuccess());
+    try testing.expectEqual(cip.GeneralStatus.connection_failure, reply5.general_status);
+    try testing.expectEqual(
+        @as(u16, @intFromEnum(connmgr.ExtendedStatus.connection_limit_reached)),
+        reply5.extendedStatus().?,
+    );
+
+    // None of the four already-open connections were disturbed.
+    for (target.connections, 0..) |c, i| {
+        try testing.expect(c.in_use);
+        try testing.expectEqual(@as(u16, @intCast(100 + i)), c.serial);
+        try testing.expectEqual(opened[i], c.o_to_t_id);
+    }
+}
+
 test "round trip: a large connection uses the Large_Forward_Open form" {
     var scada: [64]u8 = @splat(0);
     var dint: [8]u8 = @splat(0);

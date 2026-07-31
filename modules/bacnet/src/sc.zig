@@ -835,6 +835,29 @@ fn hex(comptime s: []const u8, buf: []u8) []u8 {
     return std.fmt.hexToBytes(buf, s) catch unreachable;
 }
 
+test "isConnectionControl: exactly the six setup/teardown functions" {
+    const control_functions = [_]Function{
+        .connect_request,
+        .connect_accept,
+        .disconnect_request,
+        .disconnect_ack,
+        .heartbeat_request,
+        .heartbeat_ack,
+    };
+    for (control_functions) |f| try testing.expect(f.isConnectionControl());
+
+    const other_functions = [_]Function{
+        .result,
+        .encapsulated_npdu,
+        .address_resolution,
+        .address_resolution_ack,
+        .advertisement,
+        .advertisement_solicitation,
+        .proprietary_message,
+    };
+    for (other_functions) |f| try testing.expect(!f.isConnectionControl());
+}
+
 test "the minimal message is four octets and round-trips" {
     var buf: [16]u8 = undefined;
     const frame = hex("0a000001", &buf);
@@ -1037,6 +1060,31 @@ test "the negotiated maximum is the smaller of the two proposals" {
     const n = mine.negotiate(theirs);
     try testing.expectEqual(@as(u16, 900), n.bvlc);
     try testing.expectEqual(@as(u16, 1497), n.npdu);
+}
+
+test "Advertisement is exactly 6 octets of body, no more and no less" {
+    var buf: [16]u8 = undefined;
+    // function=0x04, control=0, message_id=1, then hub_status=1,
+    // direct_connections=1, max_bvlc_length=1400, max_npdu_length=1300.
+    const frame = hex("04000001010105780514", &buf);
+    const m = try decode(frame);
+    const a = m.payload.advertisement;
+    try testing.expectEqual(HubConnectionStatus.connected_to_primary, a.hub_status);
+    try testing.expectEqual(DirectConnectionSupport.supported, a.direct_connections);
+    try testing.expectEqual(@as(u16, 1400), a.max_bvlc_length);
+    try testing.expectEqual(@as(u16, 1300), a.max_npdu_length);
+
+    // Unlike Connect-Request/Accept, Advertisement does not distinguish
+    // too-short from too-long: any body other than exactly `wire_len` is
+    // InvalidBody.
+    var short: [4 + Advertisement.wire_len - 1]u8 = undefined;
+    @memcpy(&short, frame[0 .. frame.len - 1]);
+    try testing.expectError(error.InvalidBody, decode(&short));
+
+    var long: [4 + Advertisement.wire_len + 1]u8 = undefined;
+    @memcpy(long[0..frame.len], frame);
+    long[frame.len] = 0;
+    try testing.expectError(error.InvalidBody, decode(&long));
 }
 
 test "the empty-body functions refuse a body" {

@@ -576,6 +576,20 @@ test "a tag that is not a Data alternative is refused" {
     try testing.expectError(error.WrongDataType, Data.decode(&[_]u8{ 0xA5, 0x00 }));
 }
 
+test "the withdrawn REAL alternative still decodes, per its doc comment" {
+    // Kind.real (tag [8]) has no writer, no accessor and, until this test,
+    // no coverage at all: nothing exercised `Kind.fromTag`'s `1...17` range
+    // at the one member that isn't reachable through any other alternative's
+    // test. "decoded so a legacy peer does not wedge the parser" was an
+    // unverified claim.
+    const d = try Data.decode(&[_]u8{ 0x88, 0x04, 0x3F, 0x80, 0x00, 0x00 });
+    try testing.expectEqual(Kind.real, d.kind);
+    try testing.expectEqual(@as(usize, 4), d.content.len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x04, 0x3F, 0x80, 0x00, 0x00 }, d.raw);
+    // A constructed [8] is refused just like every other primitive-only kind.
+    try testing.expectError(error.WrongDataType, Data.decode(&[_]u8{ 0xA8, 0x00 }));
+}
+
 test "accessors refuse the wrong alternative" {
     const b = try Data.decode(&[_]u8{ 0x83, 0x01, 0x01 });
     try testing.expectError(error.WrongDataType, b.integer(i32));

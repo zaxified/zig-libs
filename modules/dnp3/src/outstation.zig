@@ -2381,6 +2381,17 @@ test "event buffer: overflow drops the oldest and latches, confirm retires the p
 
 /// Builds a CROB command fragment with a 1-byte index prefix.
 fn buildCrob(buf: []u8, seq: u4, function: FunctionCode, index: u8, op: objects.g12.OpType) ![]u8 {
+    return buildCrobTcc(buf, seq, function, index, op, .nul);
+}
+
+fn buildCrobTcc(
+    buf: []u8,
+    seq: u4,
+    function: FunctionCode,
+    index: u8,
+    op: objects.g12.OpType,
+    tcc: objects.g12.TripCloseCode,
+) ![]u8 {
     var pos = (try application.encodeRequestHeader(
         .{ .control = .{ .fir = true, .fin = true, .seq = seq }, .function = function },
         buf,
@@ -2394,7 +2405,7 @@ fn buildCrob(buf: []u8, seq: u4, function: FunctionCode, index: u8, op: objects.
     buf[pos] = index;
     pos += 1;
     pos += (try (objects.g12.V1{
-        .control_code = .{ .op_type = op },
+        .control_code = .{ .op_type = op, .tcc = tcc },
         .count = 1,
         .on_time_ms = 100,
         .off_time_ms = 100,
@@ -2530,6 +2541,29 @@ test "CROB operations map to the right output state and raise an event" {
     try testing.expect(fix.bouts[0].value);
 }
 
+test "CROB pulse_on/pulse_off with an explicit trip-close code is not the .nul default" {
+    // `buildCrob` always leaves TCC at its .nul default, so the
+    // .close/.trip arms of pulse_on/pulse_off's op_type switch were never
+    // reached by any other test — only the `else` (.nul) arm was.
+    var fix = Fixture{};
+    var station = fix.station(.{});
+    var out: [256]u8 = undefined;
+    var req: [64]u8 = undefined;
+
+    const cases = [_]struct { op: objects.g12.OpType, tcc: objects.g12.TripCloseCode, want: bool }{
+        .{ .op = .pulse_on, .tcc = .close, .want = true },
+        .{ .op = .pulse_on, .tcc = .trip, .want = false },
+        .{ .op = .pulse_off, .tcc = .close, .want = false },
+        .{ .op = .pulse_off, .tcc = .trip, .want = true },
+    };
+    for (cases, 0..) |c, i| {
+        const direct = try buildCrobTcc(&req, @intCast(i), .direct_operate, 0, c.op, c.tcc);
+        const reply = (try station.handle(direct, 100 + i * 10, &out)).?;
+        try testing.expectEqual(CommandStatus.success, try commandStatus(reply.fragment));
+        try testing.expectEqual(c.want, fix.bouts[0].value);
+    }
+}
+
 test "commands against a nonexistent or command-less point are NOT_SUPPORTED" {
     var fix = Fixture{};
     var station = fix.station(.{});
@@ -2581,6 +2615,95 @@ test "analog output block: value written, bounds enforced" {
     reply = (try station.handle(too_big, 200, &out)).?;
     try testing.expectEqual(CommandStatus.out_of_range, try commandStatus(reply.fragment));
     try testing.expectEqual(@as(f64, 42), fix.aouts[0].value); // unchanged
+}
+
+test "analog output block: variations 2 (i16), 3 (f32) and 4 (f64) all decode" {
+    // The V1 (i32) test above is the only g41 coverage otherwise: the
+    // record-length table the dispatcher uses to walk the object list
+    // (outstation.zig's `doCommand`) has one entry per variation, and a
+    // wrong length for a variation nothing else exercises would silently
+    // misparse the rest of the fragment instead of failing loudly.
+    var fix = Fixture{};
+    var station = fix.station(.{});
+    var out: [256]u8 = undefined;
+    var req: [64]u8 = undefined;
+
+    const build = struct {
+        fn v2(buf: []u8, seq: u4, index: u8, value: i16) ![]u8 {
+            var pos = (try application.encodeRequestHeader(
+                .{ .control = .{ .fir = true, .fin = true, .seq = seq }, .function = .direct_operate },
+                buf,
+            )).len;
+            pos += (try objects.encodeObjectHeader(.{
+                .group = 41,
+                .variation = 2,
+                .qualifier = .{ .prefix_code = .index_1b, .range_code = .count_1b },
+                .range = .{ .count = 1 },
+            }, buf[pos..])).len;
+            buf[pos] = index;
+            pos += 1;
+            pos += (try (objects.g41.V2{ .value = value }).encode(buf[pos..])).len;
+            return buf[0..pos];
+        }
+        fn v3(buf: []u8, seq: u4, index: u8, value: f32) ![]u8 {
+            var pos = (try application.encodeRequestHeader(
+                .{ .control = .{ .fir = true, .fin = true, .seq = seq }, .function = .direct_operate },
+                buf,
+            )).len;
+            pos += (try objects.encodeObjectHeader(.{
+                .group = 41,
+                .variation = 3,
+                .qualifier = .{ .prefix_code = .index_1b, .range_code = .count_1b },
+                .range = .{ .count = 1 },
+            }, buf[pos..])).len;
+            buf[pos] = index;
+            pos += 1;
+            pos += (try (objects.g41.V3{ .value = value }).encode(buf[pos..])).len;
+            return buf[0..pos];
+        }
+        fn v4(buf: []u8, seq: u4, index: u8, value: f64) ![]u8 {
+            var pos = (try application.encodeRequestHeader(
+                .{ .control = .{ .fir = true, .fin = true, .seq = seq }, .function = .direct_operate },
+                buf,
+            )).len;
+            pos += (try objects.encodeObjectHeader(.{
+                .group = 41,
+                .variation = 4,
+                .qualifier = .{ .prefix_code = .index_1b, .range_code = .count_1b },
+                .range = .{ .count = 1 },
+            }, buf[pos..])).len;
+            buf[pos] = index;
+            pos += 1;
+            std.mem.writeInt(u64, buf[pos..][0..8], @bitCast(value), .little);
+            buf[pos + 8] = @intFromEnum(objects.g12.CommandStatus.success);
+            pos += 9;
+            return buf[0..pos];
+        }
+    };
+
+    const req2 = try build.v2(&req, 0, 0, 17);
+    var reply = (try station.handle(req2, 100, &out)).?;
+    try testing.expectEqual(CommandStatus.success, try commandStatus(reply.fragment));
+    try testing.expectEqual(@as(f64, 17), fix.aouts[0].value);
+
+    var req_buf3: [64]u8 = undefined;
+    const req3 = try build.v3(&req_buf3, 1, 0, 18.5);
+    reply = (try station.handle(req3, 200, &out)).?;
+    try testing.expectEqual(CommandStatus.success, try commandStatus(reply.fragment));
+    try testing.expectEqual(@as(f64, 18.5), fix.aouts[0].value);
+
+    var req_buf4: [64]u8 = undefined;
+    const req4 = try build.v4(&req_buf4, 2, 0, 19.5);
+    reply = (try station.handle(req4, 300, &out)).?;
+    try testing.expectEqual(CommandStatus.success, try commandStatus(reply.fragment));
+    try testing.expectEqual(@as(f64, 19.5), fix.aouts[0].value);
+    // A wrong record length for v4 leaves a dangling byte after the record,
+    // which the header walk then tries to parse as a new object header and
+    // fails -- catch that via the response IIN, not just the status byte
+    // (whose position a length bug can shift onto a byte that happens to
+    // still read back as `.success`).
+    const decoded4 = try application.decodeResponseHeader(reply.fragment);
+    try testing.expect(!decoded4.header.iin.parameter_error);
 }
 
 test "the command hook can veto, and sees select and operate separately" {

@@ -597,6 +597,25 @@ test "findMcastGroupId picks the named group out of CTRL_ATTR_MCAST_GROUPS" {
     try testing.expectEqual(@as(?u32, null), try findMcastGroupId(&.{}, "scan"));
 }
 
+test "golden: findMcastGroupId decodes a real CTRL_ATTR_MCAST_GROUPS nest byte-for-byte" {
+    // Captured shape of a CTRL_CMD_NEWFAMILY reply's mcast-group nest for
+    // nlctrl itself (one group, "notify", id 0x15) — literal wire bytes per
+    // linux/genetlink.h (CTRL_ATTR_MCAST_GRP_NAME = 1, _GRP_ID = 2), not
+    // built via `codec.appendAttr*` with this module's own symbolic
+    // constants. `buildMcastGroupsAttrs` below round-trips through those same
+    // constants, so a swap of NAME/ID's numeric values would be invisible to
+    // every other test in this file; this one pins the real kernel encoding.
+    if (native_endian != .little) return error.SkipZigTest;
+    const attrs = [_]u8{
+        0x1c, 0x00, 0x07, 0x00, // outer nest, len 28, CTRL_ATTR_MCAST_GROUPS
+        0x18, 0x00, 0x01, 0x00, // inner nest #1, len 24
+        0x0b, 0x00, 0x01, 0x00, 'n', 'o', 't', 'i', 'f', 'y', 0x00, 0x00, // GRP_NAME=1 "notify" + pad
+        0x08, 0x00, 0x02, 0x00, 0x15, 0x00, 0x00, 0x00, // GRP_ID=2, 0x15
+    };
+    try testing.expectEqual(@as(?u32, 0x15), try findMcastGroupId(&attrs, "notify"));
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(&attrs, "config"));
+}
+
 test "findMcastGroupId rejects a matching group with no id" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(testing.allocator);

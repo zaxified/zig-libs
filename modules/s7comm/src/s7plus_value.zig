@@ -538,6 +538,49 @@ test "scalar round trips through decode for every fixed and VLQ type" {
     try testing.expectEqualSlices(u8, "abc", (try decodeScalar(bl)).value.bytes);
 }
 
+test "scalar round trips for every fixed-width type, one per decode-switch group" {
+    // The test above only touches one member of each *shared* switch arm
+    // (uint covers uint/word, udint covers udint/aid, ...). The other
+    // member of each shared arm, plus the arms nothing above touches at
+    // all (usint/byte, sint, dword/rid, lword/timestamp, ulint,
+    // lint/timespan), were never round-tripped -- `rid` in particular is
+    // documented as "4 octets (fixed)" while its sibling `aid` is a VLQ,
+    // and only encode/decode agreeing on that split keeps them from silently
+    // desyncing a struct/array walk that mixes the two.
+    var buf: [16]u8 = undefined;
+
+    const us = try encodeScalar(.usint, i64, 200, &buf);
+    try testing.expectEqual(@as(u64, 200), (try decodeScalar(us)).value.unsigned);
+    const by = try encodeScalar(.byte, i64, 201, &buf);
+    try testing.expectEqual(@as(u64, 201), (try decodeScalar(by)).value.unsigned);
+
+    const si = try encodeScalar(.sint, i64, -100, &buf);
+    try testing.expectEqual(@as(i64, -100), (try decodeScalar(si)).value.signed);
+
+    const wo = try encodeScalar(.word, i64, 0x5678, &buf);
+    try testing.expectEqual(@as(u64, 0x5678), (try decodeScalar(wo)).value.unsigned);
+
+    const dw = try encodeScalar(.dword, i64, 0x12345678, &buf);
+    try testing.expectEqual(@as(u64, 0x12345678), (try decodeScalar(dw)).value.unsigned);
+    const rid = try encodeScalar(.rid, i64, 0x0A0B0C0D, &buf);
+    const dec_rid = try decodeScalar(rid);
+    try testing.expectEqual(@as(u64, 0x0A0B0C0D), dec_rid.value.unsigned);
+    try testing.expectEqual(@as(usize, 6), dec_rid.len); // flags + tag + 4 fixed octets
+
+    const lw = try encodeScalar(.lword, i64, 0x1122334455667788, &buf);
+    try testing.expectEqual(@as(u64, 0x1122334455667788), (try decodeScalar(lw)).value.unsigned);
+    const ts = try encodeScalar(.timestamp, i64, 0x1122334455667788, &buf);
+    try testing.expectEqual(@as(u64, 0x1122334455667788), (try decodeScalar(ts)).value.unsigned);
+
+    const ul = try encodeScalar(.ulint, i64, 5_000_000_000, &buf);
+    try testing.expectEqual(@as(u64, 5_000_000_000), (try decodeScalar(ul)).value.unsigned);
+
+    const li = try encodeScalar(.lint, i64, -5_000_000_000, &buf);
+    try testing.expectEqual(@as(i64, -5_000_000_000), (try decodeScalar(li)).value.signed);
+    const tsp = try encodeScalar(.timespan, i64, -5_000_000_000, &buf);
+    try testing.expectEqual(@as(i64, -5_000_000_000), (try decodeScalar(tsp)).value.signed);
+}
+
 test "valueLen walks a nested struct exactly" {
     // struct { id1: usint=7, id2: struct { id1: uint=0x0102 } }
     var buf: [64]u8 = undefined;

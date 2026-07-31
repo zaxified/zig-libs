@@ -1147,6 +1147,36 @@ test "every modelled type round-trips element bytes" {
     }
 }
 
+test "the parameter-loading types (P_ME/P_AC) round-trip too" {
+    // p_me_na_1/nb_1/nc_1 (-> .parameter, 3 octets) and p_ac_na_1 (-> .qrp,
+    // "same width" per its comment) are the only four `shapeOf` rows neither
+    // of the two tables above touches — "recognised, elements not modelled"
+    // in the TypeId doc comment does not mean the codec path is untested,
+    // but it was: nothing else in this module builds or decodes a
+    // `.parameter` element or a P_AC_NA_1 ASDU.
+    var buf: [64]u8 = undefined;
+
+    for ([_]TypeId{ .p_me_na_1, .p_me_nb_1, .p_me_nc_1 }) |t| {
+        try testing.expectEqual(@as(usize, 3), elementSize(t).?);
+        const e: Element = .{ .parameter = .{ .raw = .{ 0xAB, 0xCD }, .qpm = 0x42 } };
+        const enc = try buildSingle(&buf, default_params, t, .{ .cot = .activation }, 47, 9, e, .none);
+        const dec = try decode(enc, default_params);
+        var it = dec.objects();
+        const o = (try it.next()).?;
+        try testing.expectEqual(@as(u32, 9), o.ioa);
+        try testing.expectEqual(e, o.element);
+    }
+
+    try testing.expectEqual(@as(usize, 1), elementSize(.p_ac_na_1).?);
+    const e = Element{ .qrp = .general_reset };
+    const enc = try buildSingle(&buf, default_params, .p_ac_na_1, .{ .cot = .activation }, 47, 3, e, .none);
+    const dec = try decode(enc, default_params);
+    var it = dec.objects();
+    const o = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 3), o.ioa);
+    try testing.expectEqual(e, o.element);
+}
+
 test "builder refuses an element or time tag that does not match the type" {
     var buf: [64]u8 = undefined;
     var b = try Builder.init(&buf, default_params, .m_sp_na_1, .{}, 1, false);

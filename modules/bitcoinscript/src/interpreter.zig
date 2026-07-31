@@ -937,3 +937,73 @@ test "OP_CHECKLOCKTIMEVERIFY without the flag is a plain NOP" {
     try eval(arena.allocator(), &stack, &.{ 0x01, 0x05, 0xb1 }, dummyCtx(), .base, ScriptFlags.none);
     try testing.expectEqual(@as(usize, 1), stack.items.len); // arg still on stack, untouched
 }
+
+// BIP65's own text is explicit that this is `<=`, not `<`: "the top item on
+// the stack MUST be less than or equal to the nLockTime field in the
+// transaction". None of `script_tests_vectors.zig`'s CHECKLOCKTIMEVERIFY
+// entries exercise the numeric comparison at all (both the crediting and
+// spending transactions in that harness always have `locktime == 0`), so
+// this is the only place the `locktime == tx.locktime` boundary — and the
+// ordinary less-than/greater-than cases either side of it — get checked
+// against a real, nonzero transaction locktime.
+test "OP_CHECKLOCKTIMEVERIFY: locktime <= tx.locktime passes, > fails (BIP65 boundary)" {
+    const flags: ScriptFlags = .{ .checklocktimeverify = true };
+
+    const ctxWithLocktime = struct {
+        fn f(locktime: u32) TxContext {
+            return .{
+                .tx = .{
+                    .version = 2,
+                    .vin = @constCast(&[_]bitcointx.TxIn{.{
+                        .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 },
+                        .script_sig = &.{},
+                        .sequence = 0, // not 0xffffffff: CLTV's final-input check must not fire here
+                    }}),
+                    .vout = &.{},
+                    .witness = &.{},
+                    .locktime = locktime,
+                    .has_witness = false,
+                },
+                .input_index = 0,
+                .spent_outputs = &.{},
+            };
+        }
+    }.f;
+
+    const cltvScript = struct {
+        fn f(arg: u8) [3]u8 {
+            return .{ 0x01, arg, 0xb1 }; // push 1-byte CScriptNum <arg>, OP_CHECKLOCKTIMEVERIFY
+        }
+    }.f;
+
+    // Argument strictly less than tx.locktime: passes.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var stack: Stack = .empty;
+        const script = cltvScript(5);
+        try eval(arena.allocator(), &stack, &script, ctxWithLocktime(6), .base, flags);
+        try testing.expectEqual(@as(usize, 1), stack.items.len);
+    }
+    // Argument exactly equal to tx.locktime: BIP65 says this passes too —
+    // the boundary a `>` vs `>=` mutation of the comparison flips.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var stack: Stack = .empty;
+        const script = cltvScript(6);
+        try eval(arena.allocator(), &stack, &script, ctxWithLocktime(6), .base, flags);
+        try testing.expectEqual(@as(usize, 1), stack.items.len);
+    }
+    // Argument strictly greater than tx.locktime: fails.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var stack: Stack = .empty;
+        const script = cltvScript(7);
+        try testing.expectError(
+            error.UnsatisfiedLocktime,
+            eval(arena.allocator(), &stack, &script, ctxWithLocktime(6), .base, flags),
+        );
+    }
+}

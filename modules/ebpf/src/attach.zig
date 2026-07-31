@@ -1830,10 +1830,16 @@ test "netlink errno mapping covers the XDP-specific failures" {
         }
     }.f;
     try testing.expectError(error.PermissionDenied, asUnion(-@as(i32, @intFromEnum(linux.E.PERM))));
+    try testing.expectError(error.PermissionDenied, asUnion(-@as(i32, @intFromEnum(linux.E.ACCES))));
     try testing.expectError(error.NoSuchInterface, asUnion(-@as(i32, @intFromEnum(linux.E.NODEV))));
+    try testing.expectError(error.NoSuchInterface, asUnion(-@as(i32, @intFromEnum(linux.E.NXIO))));
     try testing.expectError(error.AlreadyAttached, asUnion(-@as(i32, @intFromEnum(linux.E.BUSY))));
+    try testing.expectError(error.AlreadyAttached, asUnion(-@as(i32, @intFromEnum(linux.E.EXIST))));
     try testing.expectError(error.ModeNotSupported, asUnion(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
     try testing.expectError(error.InvalidFlags, asUnion(-@as(i32, @intFromEnum(linux.E.INVAL))));
+    // Previously untested arm: NOMEM/NOBUFS both map to OutOfMemory.
+    try testing.expectError(error.OutOfMemory, asUnion(-@as(i32, @intFromEnum(linux.E.NOMEM))));
+    try testing.expectError(error.OutOfMemory, asUnion(-@as(i32, @intFromEnum(linux.E.NOBUFS))));
     // A non-negative code is not an errno at all.
     try testing.expectError(error.Unexpected, asUnion(0));
     try testing.expectError(error.Unexpected, asUnion(5));

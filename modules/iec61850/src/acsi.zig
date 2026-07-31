@@ -349,6 +349,26 @@ test "every functional constraint parses and names itself" {
     try testing.expect(!FunctionalConstraint.ST.isOperational());
 }
 
+test "isOperational and isControlBlock cover every FC, not just a sample" {
+    // The two callers of these predicates (a "GOOSE control block parses"
+    // and a "report control block parses" test) only ever exercised .GO and
+    // .RP true; nothing checked .SV/.SG/.SE for isOperational or
+    // .BR/.LG/.GS/.MS/.US for isControlBlock at all, in either direction.
+    const operational = [_]FunctionalConstraint{ .CO, .SP, .SV, .SG, .SE };
+    const control_block = [_]FunctionalConstraint{ .BR, .RP, .LG, .GO, .GS, .MS, .US };
+    inline for (@typeInfo(FunctionalConstraint).@"enum".fields) |f| {
+        const fc: FunctionalConstraint = @enumFromInt(f.value);
+        const want_op = for (operational) |o| {
+            if (o == fc) break true;
+        } else false;
+        const want_cb = for (control_block) |c| {
+            if (c == fc) break true;
+        } else false;
+        try testing.expectEqual(want_op, fc.isOperational());
+        try testing.expectEqual(want_cb, fc.isControlBlock());
+    }
+}
+
 test "an unknown functional constraint is refused, not passed through" {
     try testing.expectError(error.UnknownFunctionalConstraint, FunctionalConstraint.parse("XX"));
     try testing.expectError(error.UnknownFunctionalConstraint, FunctionalConstraint.parse("M"));

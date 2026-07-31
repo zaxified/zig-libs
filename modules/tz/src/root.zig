@@ -281,6 +281,28 @@ test "offsetAt: POSIX footer applies far in the future (Prague 2040 summer)" {
     try testing.expectEqual(@as(i32, 3600), offsetAt(z, winter).off);
 }
 
+test "offsetAt: the exact transition instant already carries the NEW offset" {
+    // Every other transition test in this file uses an arbitrary instant
+    // well inside a transition period ("12:00 UTC"); none lands exactly ON
+    // a transition's own timestamp, which is the one input that actually
+    // exercises the binary search's `<=` boundary (an off-by-one there —
+    // `<` instead of `<=` — would apply the OLD offset one second too
+    // long and go undetected by every other test here). A transition's own
+    // `ts` is defined as "the offset becomes X starting at this instant"
+    // (tzfile semantics), so `ts` itself must read as the new offset and
+    // `ts - 1` must still read as the old one.
+    const z = find("Europe/Prague").?;
+    const tr = z.trans;
+    // Prague's first transition: 1970-05-31 22:00:00Z, CEST begins (+7200,
+    // DST). Picking the very first entry keeps "old offset" unambiguous:
+    // it is `z.init_off`/`z.init_dst`, not some earlier transition.
+    const ts = tr[0].ts;
+    try testing.expectEqual(z.init_off, offsetAt(z, ts - 1).off);
+    try testing.expectEqual(z.init_dst, offsetAt(z, ts - 1).dst);
+    try testing.expectEqual(tr[0].off, offsetAt(z, ts).off);
+    try testing.expectEqual(tr[0].dst, offsetAt(z, ts).dst);
+}
+
 test "offsetAt: fixed UTC" {
     const z = find("UTC").?;
     try testing.expectEqual(@as(i32, 0), offsetAt(z, 1721044800).off);

@@ -593,6 +593,38 @@ test "encode/decode: float variations" {
     try testing.expectEqual(@as(f64, -1.5), (try decode(f64_layout, .analog_input, b64)).value.analog_float);
 }
 
+test "encode/decode: g40 Analog Output Status, all four variations" {
+    // Only g30 (Analog Input) variations were round-tripped by value type
+    // before; g40 shares the same shapes but is a distinct table row and a
+    // type-vs-width mixup here (e.g. v3 encoded as i32 instead of f32) would
+    // corrupt every fractional Analog Output Status a master reads back.
+    var out: [16]u8 = undefined;
+
+    const v1 = layoutOf(40, 1).?; // i32, no flags-time
+    const b1 = try encode(v1, .{ .online = true }, .{ .analog_int = -100000 }, 0, 0, &out);
+    try testing.expectEqual(@as(usize, 5), b1.len);
+    try testing.expectEqual(@as(i64, -100000), (try decode(v1, .analog_output_status, b1)).value.asInt());
+
+    const v2 = layoutOf(40, 2).?; // i16
+    const b2 = try encode(v2, .{ .online = true }, .{ .analog_int = -12345 }, 0, 0, &out);
+    try testing.expectEqual(@as(usize, 3), b2.len);
+    try testing.expectEqual(@as(i64, -12345), (try decode(v2, .analog_output_status, b2)).value.asInt());
+
+    const v3 = layoutOf(40, 3).?; // f32 — same wire length as v1's i32, different bit pattern
+    const b3 = try encode(v3, .{ .online = true }, .{ .analog_float = 3.25 }, 0, 0, &out);
+    try testing.expectEqual(@as(usize, 5), b3.len);
+    const d3 = try decode(v3, .analog_output_status, b3);
+    try testing.expect(d3.value == .analog_float);
+    try testing.expectEqual(@as(f64, 3.25), d3.value.analog_float);
+
+    const v4 = layoutOf(40, 4).?; // f64
+    const b4 = try encode(v4, .{ .online = true }, .{ .analog_float = -7.5 }, 0, 0, &out);
+    try testing.expectEqual(@as(usize, 9), b4.len);
+    const d4 = try decode(v4, .analog_output_status, b4);
+    try testing.expect(d4.value == .analog_float);
+    try testing.expectEqual(@as(f64, -7.5), d4.value.analog_float);
+}
+
 test "encode: narrow variations reject values that do not fit" {
     var out: [16]u8 = undefined;
     const u16_layout = layoutOf(20, 2).?;

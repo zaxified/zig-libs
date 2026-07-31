@@ -838,6 +838,34 @@ test "extended ACK: hostile offsets are rejected, never over-read" {
     try testing.expectError(error.Truncated, overm.errorAttrs());
 }
 
+test "extended ACK: unaligned echoed length is padded before the TLVs" {
+    // nlmsg_len is the echoed request's *unpadded* size (linux/netlink.h:
+    // NLMSG_LENGTH), so a header-only echo of `header_len + 1` bytes is a
+    // legal, if unusual, encoding on the wire — the sender still pads the
+    // buffer to a 4-byte boundary before appending the TLVs. `errorAttrs`
+    // must apply that same NLMSG_ALIGN before reading, or it desyncs by up
+    // to 3 bytes and returns garbage instead of the real attributes (or a
+    // spurious Truncated/BadLength).
+    const gpa = testing.allocator;
+    var full: std.ArrayList(u8) = .empty;
+    defer full.deinit(gpa);
+    const h = try appendHeader(gpa, &full, NLMSG_ERROR, NLM_F_ACK_TLVS, 3, 42);
+    var code: [4]u8 = undefined;
+    std.mem.writeInt(i32, &code, -22, native_endian);
+    try appendPadded(gpa, &full, &code);
+    // Declared echoed length = header_len + 1 (unaligned); the bytes on the
+    // wire are still padded to a 4-byte boundary, per appendPadded below.
+    var echoed: [header_len + 1]u8 = @splat(0);
+    std.mem.writeInt(u32, echoed[0..4], echoed.len, native_endian);
+    try appendPadded(gpa, &full, &echoed); // pads to header_len + 4 on the wire
+    try appendAttrString(gpa, &full, NLMSGERR_ATTR.MSG, "unaligned echo");
+    finishHeader(&full, h);
+
+    var it: MessageIterator = .{ .buf = full.items };
+    const m = (try it.next()).?;
+    try testing.expectEqualStrings("unaligned echo", (try m.errorMessage()).?);
+}
+
 test "big-endian accessors read network order and reject wrong widths" {
     const a16: Attr = .{ .type = 1, .raw_type = 1, .data = &.{ 0x00, 0x16 } };
     try testing.expectEqual(@as(u16, 22), try a16.asBe16());

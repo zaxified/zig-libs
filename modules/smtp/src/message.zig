@@ -764,6 +764,28 @@ test "header injection through subject, display name or a custom header" {
         m.body = .{ .attachment = .{ .filename = "a\r\nb.txt", .data = "x" } };
         try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
     }
+    // message_id, in_reply_to and references are as caller-controlled as
+    // subject or a custom header (an In-Reply-To is routinely built from a
+    // Message-ID lifted out of an incoming message this library did not
+    // render), but unlike every other field above, nothing exercised
+    // injecting through them until now — message_id/in_reply_to rely
+    // entirely on `writeRawHeader`'s internal check, with no field-local
+    // backstop the way references/filename/content_id have.
+    {
+        var m = base;
+        m.message_id = "a\r\nX-Injected: yes";
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.in_reply_to = "a\r\nX-Injected: yes";
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.references = &.{"a\r\nX-Injected: yes"};
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
 }
 
 test "Bcc never reaches the message unless the caller asks" {

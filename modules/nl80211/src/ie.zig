@@ -579,6 +579,39 @@ test "RSN: every field after version may legitimately be absent" {
     try testing.expectError(error.Truncated, parseRsn(&.{}));
 }
 
+test "RSN: an element ending exactly at the end of the PMKID list is not Malformed" {
+    // version, group cipher, empty pairwise + akm lists, capabilities,
+    // PMKID count = 0, nothing after — the element stops exactly on the
+    // PMKID-count/body boundary (no group management cipher). This is the
+    // exact-fit case `body.len - off == pmkid_bytes`, distinct from the
+    // "claims more PMKIDs than are present" hostile case above.
+    var r = try parseRsn(&.{
+        0x01, 0x00, // version
+        0x00, 0x0f, 0xac, 0x04, // group cipher CCMP
+        0x00, 0x00, // pairwise count = 0
+        0x00, 0x00, // akm count = 0
+        0x00, 0x00, // capabilities
+        0x00, 0x00, // pmkid_count = 0
+    });
+    try testing.expectEqual(@as(u16, 0), r.pmkid_count);
+    try testing.expectEqual(@as(?u32, null), r.group_mgmt_cipher);
+
+    // Same, but with one real PMKID filling out the rest of the element
+    // exactly (16 bytes, none left over for a group management cipher).
+    const one_pmkid = [_]u8{
+        0x01, 0x00,
+        0x00, 0x0f,
+        0xac, 0x04,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x01, 0x00, // pmkid_count = 1
+    } ++ [_]u8{0xaa} ** 16;
+    r = try parseRsn(&one_pmkid);
+    try testing.expectEqual(@as(u16, 1), r.pmkid_count);
+    try testing.expectEqual(@as(?u32, null), r.group_mgmt_cipher);
+}
+
 test "hostile RSN: a suite count that does not fit is Malformed" {
     // Claims 0xffff pairwise suites with none present.
     try testing.expectError(error.Malformed, parseRsn(&.{

@@ -193,6 +193,90 @@ test "gated: RM128.decodeSymbol is exhaustively correct on error-free input" {
     }
 }
 
+// `decodeSymbol`'s doc comment calls out a specific documented choice: on a
+// genuine tie between two peaks of equal absolute value, `find_peaks` keeps
+// the FIRST (smallest-index) one -- strict `>`, not `>=`, in the comparison
+// (matching the reference's own comment on the same tie-break). Every OTHER
+// test in this suite only ever feeds `decodeSymbol` either a clean,
+// error-free codeword (a unique peak, no tie possible) or a within-capacity
+// corruption whose nearest codeword is still unique -- none of them can
+// exercise this branch. This test builds a genuine two-way tie by hand and
+// checks the documented rule holds.
+test "gated: RM128.decodeSymbol ties resolve to the smallest index (documented strict `>`)" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+
+    // encodeBlock(0) is the all-zero block; encodeBlock(1) has weight
+    // exactly 64 -- every nonzero RM(1,7) codeword other than the all-ones
+    // "DC" row (message bit 7) is exactly balanced (the code's bent-like
+    // structure: each of the 7 non-DC generator rows, and every XOR of a
+    // nonempty subset of them, has exactly 64 of 128 bits set). So flipping
+    // exactly half of those 64 differing bits from the all-zero block lands
+    // exactly as close (Hamming distance 32 of 128) to BOTH message 0 and
+    // message 1 -- a real tie between two DIFFERENT peak indices, not the
+    // separate "transform[i]==0 exact sign ambiguity" case.
+    const block0 = RM128.encodeBlock(0);
+    const block1 = RM128.encodeBlock(1);
+    var diff_bits: [128]usize = undefined;
+    var n_diff: usize = 0;
+    for (0..128) |bit| {
+        const byte = bit / 8;
+        const shift: u3 = @intCast(bit % 8);
+        if (((block0[byte] >> shift) & 1) != ((block1[byte] >> shift) & 1)) {
+            diff_bits[n_diff] = bit;
+            n_diff += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 64), n_diff); // the balanced-code property this construction relies on
+
+    var corrupted = block0;
+    for (diff_bits[0..32]) |bit| {
+        const byte = bit / 8;
+        const shift: u3 = @intCast(bit % 8);
+        corrupted[byte] ^= @as(u8, 1) << shift;
+    }
+
+    // Self-validating precondition, independent of the Hadamard-transform
+    // implementation under test: brute-force nearest-codeword Hamming
+    // distance (minimum-distance decoding is the textbook equivalent of
+    // maximum-likelihood decoding over a binary symmetric channel, which is
+    // exactly what `decodeSymbol` claims to implement) confirms messages 0
+    // and 1 are both tied for closest, at distance 32 -- confirming the
+    // tie the mutation targets is real, without assuming they are the
+    // ONLY two tied (the code's symmetry in fact ties two more indices at
+    // the same distance; that does not weaken the assertion below, since
+    // 0 is still the smallest index in the tied set either way).
+    var best_dist: u32 = std.math.maxInt(u32);
+    var tied_at_0 = false;
+    var tied_at_1 = false;
+    for (0..256) |m| {
+        const cand = RM128.encodeBlock(@intCast(m));
+        var dist: u32 = 0;
+        for (corrupted, cand) |a, b| dist += @popCount(a ^ b);
+        if (dist < best_dist) {
+            best_dist = dist;
+            tied_at_0 = (m == 0);
+            tied_at_1 = (m == 1);
+        } else if (dist == best_dist) {
+            if (m == 0) tied_at_0 = true;
+            if (m == 1) tied_at_1 = true;
+        }
+    }
+    try testing.expectEqual(@as(u32, 32), best_dist);
+    try testing.expect(tied_at_0);
+    try testing.expect(tied_at_1);
+
+    // Uniform corruption across every duplicated copy keeps the tie exact
+    // after expand-and-sum (every copy agrees, so each bit's sum is either
+    // 0 or `multiplicity`, just `multiplicity`-scaled from the single-block
+    // case above -- scaling by a positive constant preserves which indices
+    // are tied for the peak).
+    var sym: RM128.Symbol = undefined;
+    for (0..RM128.multiplicity) |c| @memcpy(sym[c * 16 ..][0..16], &corrupted);
+
+    // Documented rule: the smaller index (0) wins the tie, not the larger (1).
+    try testing.expectEqual(@as(u8, 0), RM128.decodeSymbol(sym));
+}
+
 // ── hqc-192/256 decode coverage: the additive-FFT `radixBig` path ──────
 // hqc-128 has PARAM_FFT == 4, so its RS root-finding uses only the
 // unrolled `radix` small cases (reedsolomon.zig's `radixConv`). hqc-192

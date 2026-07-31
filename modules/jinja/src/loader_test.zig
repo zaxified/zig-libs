@@ -292,6 +292,43 @@ test "a self-feeding recursive loop hits the call cap" {
     );
 }
 
+test "an include of many distinct templates (no recursion) hits the total-load cap" {
+    // `max_templates` (default 256) bounds the total COUNT of templates
+    // loaded in one render; `max_template_depth` (32) bounds NESTING. A
+    // wide, flat template that includes many distinct siblings in
+    // sequence — no recursion, no cycle, nesting depth 1 throughout —
+    // exercises `max_templates` specifically. Every other bomb test in
+    // this file is a depth/cycle bomb that trips `max_template_depth`
+    // long before `max_templates` could ever matter, so this is the only
+    // place the total-load cap itself gets checked.
+    const gpa = testing.allocator;
+    const n = 300; // > the default max_templates (256)
+
+    var entries: std.ArrayList(jinja.MapLoader.Entry) = .empty;
+    defer entries.deinit(gpa);
+    var owned_names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_names.items) |nm| gpa.free(nm);
+        owned_names.deinit(gpa);
+    }
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+
+    for (0..n) |i| {
+        const name = try std.fmt.allocPrint(gpa, "t{d}", .{i});
+        try owned_names.append(gpa, name);
+        try entries.append(gpa, .{ .name = name, .source = "x" });
+        const tag = try std.fmt.allocPrint(gpa, "{{% include '{s}' %}}", .{name});
+        defer gpa.free(tag);
+        try src.appendSlice(gpa, tag);
+    }
+
+    try testing.expectEqual(
+        @as(anyerror, error.TooDeep),
+        renderBombErr(entries.items, src.items, 1 << 20),
+    );
+}
+
 test "an import cycle hits the depth cap" {
     try testing.expectEqual(@as(anyerror, error.TooDeep), renderBombErr(&.{
         .{ .name = "a", .source = "{% import 'b' as b %}" },

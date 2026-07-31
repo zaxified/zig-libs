@@ -463,6 +463,28 @@ test "PLC control is refused unless explicitly enabled" {
     try testing.expect(r2.stopped);
 }
 
+test "an unrecognized job function code gets a typed error reply, not silence" {
+    // handleJob's `else` arm (unrecognized/unimplemented function code) had
+    // no test at all -- only the *specific* function codes' own error paths
+    // (e.g. PLC control refused) were covered. Built from the "PLC stop"
+    // frame above with its function-code octet (0x29) replaced by 0xAA,
+    // which is not one of `s7.Function`'s named values.
+    var db: [16]u8 = @splat(0);
+    var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};
+    var r = Responder.init(.{}, &areas);
+    var setup_buf: [64]u8 = undefined;
+    var bad_buf: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const setup_req = hex("0300001902f08032010000000100080000f0000001000101e0", &setup_buf);
+    const bad = hex("0300002102f08032010000020000100000aa000000000009505f50524f4752414d", &bad_buf);
+    _ = try r.handle(setup_req, &out);
+    const rep = (try r.handle(bad, &out)).?;
+    // Ack-Data (rosctr) with error_class = error_on_service_processing (0x84)
+    // and error_code = 0x04, same shape as the refused-PLC-control reply.
+    try testing.expectEqual(@as(u8, 0x84), rep[17]);
+    try testing.expectEqual(@as(u8, 0x04), rep[18]);
+}
+
 test "read SZL 0x0424 reflects the configured and the stopped state" {
     var db: [16]u8 = @splat(0);
     var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};
