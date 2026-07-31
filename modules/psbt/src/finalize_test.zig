@@ -274,6 +274,67 @@ test "finalize+extract: real P2WPKH spend, byte-exact FINAL_SCRIPTWITNESS; a tam
     try testing.expect(bad_results[0] != null); // verify-on-finalize must fail closed
 }
 
+test "finalize: SIGHASH_TYPE mismatch is rejected (BIP174's own sighash-type enforcement rule)" {
+    // BIP174 SS"Input Finalizer": "finalizers must fail to finalize inputs
+    // which have signatures that do not match the specified sighash
+    // type." No existing test set PSBT_IN_SIGHASH_TYPE at all, so this
+    // check (`sighashMatches` in finalize.zig) had zero coverage — every
+    // other finalize test either omits SIGHASH_TYPE entirely (the check
+    // is vacuously true) or uses a signature whose trailing byte already
+    // happens to agree.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seed: [32]u8 = [_]u8{0x55} ** 32;
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &pkh);
+
+    var script_code: [25]u8 = undefined;
+    script_code[0] = 0x76;
+    script_code[1] = 0xa9;
+    script_code[2] = 0x14;
+    @memcpy(script_code[3..23], &pkh);
+    script_code[23] = 0x88;
+    script_code[24] = 0xac;
+
+    const unsigned = try buildUnsignedTx(a, 900);
+    const credit_value: i64 = 5000;
+    const sighash = try bitcointx.bip143.sighash(a, unsigned, 0, &script_code, credit_value, SIGHASH_ALL);
+    const sig = normalizeLowS(try kp.signPrehashed(sighash, null));
+    // Signed with SIGHASH_ALL (0x01) trailing byte...
+    const sig_ht = try derSigWithHashtype(a, sig, 0x01);
+
+    const witness_utxo_value = try buildWitnessUtxoValue(a, credit_value, &script_pubkey);
+
+    // ...but PSBT_IN_SIGHASH_TYPE declares SIGHASH_SINGLE (0x03): the
+    // PARTIAL_SIG on hand does NOT match the input's own declared type.
+    var sighash_type_value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &sighash_type_value, 0x03, .little);
+
+    var input_records = [_]psbt.Record{
+        .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+        .{ .keytype = psbt.input_key.SIGHASH_TYPE, .keydata = &.{}, .value = &sighash_type_value },
+    };
+    var input_maps = [_]psbt.Map{.{ .records = &input_records }};
+    const ps = try wrapPsbt(a, unsigned, &input_maps);
+
+    const results = try psbt.finalize(a, ps);
+    try testing.expect(results[0] != null);
+    try testing.expectEqual(psbt.InputFinalizeError.MissingSignature, results[0].?);
+    // Nothing was finalized: no FINAL_SCRIPTWITNESS/SCRIPTSIG got written,
+    // and the (mismatched) PARTIAL_SIG is left in place, not cleared.
+    try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
+    try testing.expect(ps.inputs[0].findKeyed(psbt.input_key.PARTIAL_SIG, &pubkey) != null);
+}
+
 // ── C: real P2SH 2-of-2 multisig (self-authored, real legacy sighash) ──
 
 test "finalize+extract: real P2SH 2-of-2 multisig, byte-exact FINAL_SCRIPTSIG; insufficient signatures fails closed" {

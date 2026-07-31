@@ -492,6 +492,21 @@ test "xonlyBytesOf: 33-byte compressed drops the prefix, 32-byte passes through,
     try std.testing.expectError(error.BadPointLength, xonlyBytesOf(&too_long));
 }
 
+test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1])" {
+    // No official BIP340 test vector exercises this (all 8 secret-key
+    // vectors are valid, nonzero scalars) — the zero-scalar guard is
+    // otherwise unexercised by any KAT test.
+    try std.testing.expectError(error.InvalidSecretKey, SecretKey.fromBytes([_]u8{0} ** 32));
+}
+
+test "KeyPair.fromSecretKey REJECTS a hand-constructed all-zero SecretKey (defense-in-depth re-check)" {
+    // SecretKey.bytes is a public field, so a SecretKey can be
+    // hand-constructed bypassing fromBytes's own zero-check entirely —
+    // KeyPair.fromSecretKey re-validates for exactly this reason.
+    const zero_sk = SecretKey{ .bytes = [_]u8{0} ** 32 };
+    try std.testing.expectError(error.InvalidSecretKey, KeyPair.fromSecretKey(zero_sk));
+}
+
 test "KeyPair.deinit zeroizes the effective signing scalar but leaves public untouched (regression: fails if secureZero is removed)" {
     const sk = try SecretKey.fromBytes([_]u8{0x01} ** 32);
     var kp = try KeyPair.fromSecretKey(sk);

@@ -559,6 +559,16 @@ test "body PDU-length lying beyond the buffer is rejected" {
     try testing.expectError(error.BadPduLength, P2pHello.decode(mangled[0..wire.len]));
 }
 
+test "a PDU with zero TLVs (pdu_length == fixed_len exactly) decodes fine" {
+    var buf: [64]u8 = undefined;
+    var b = try P2pHelloBuilder.init(&buf, .{ .source_id = @splat(0), .holding_time = 1 });
+    // No TLVs added: finish() with an empty tlv stream.
+    const wire = b.finish();
+    try testing.expectEqual(@as(usize, p2p_iih_fixed_len), wire.len);
+    const p = try P2pHello.decode(wire);
+    try testing.expectEqual(@as(usize, 0), p.tlv_bytes.len);
+}
+
 test "TruncatedBody when the buffer is shorter than the fixed header" {
     // Length-indicator 8 passes the common-header check, but a P2P IIH needs a
     // 20-octet fixed header — only 10 bytes here, so the body decode trips.

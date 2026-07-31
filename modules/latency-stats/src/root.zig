@@ -794,6 +794,23 @@ test "Histogram: max relative representation error <= 1/2^significant_bits" {
     }
 }
 
+test "Histogram: mean() uses the bucket's median-equivalent value, not its floor" {
+    // Bucket 0 (values < 2048 at sigfigs=3) has unit-width sub-buckets, so a
+    // ramp over 1..1000 can't distinguish "median of the slot" from "floor of
+    // the slot" — both are the same integer there. Pick a value large enough
+    // to land in a bucket whose slot width is > 1, where the distinction is
+    // observable.
+    var h = try Histogram.init(testing.allocator, .{ .highest = 10_000_000, .sigfigs = 3 });
+    defer h.deinit();
+    const v: u64 = 500_000;
+    h.record(v);
+    const lo = h.lowestEquivalent(v);
+    const hi = h.highestEquivalent(v);
+    try testing.expect(hi > lo); // this slot's width is > 1 (a real test, not vacuous)
+    const want_mid = lo + (hi - lo + 1) / 2;
+    try testing.expectApproxEqAbs(@as(f64, @floatFromInt(want_mid)), h.mean(), eps);
+}
+
 test "Histogram: recordCount equals repeated record" {
     var a = try Histogram.init(testing.allocator, .{ .highest = 1_000_000 });
     defer a.deinit();

@@ -208,6 +208,25 @@ test "hostile: Addr rejects a count over MAX_ADDR_ENTRIES" {
     try testing.expectError(error.TooManyItems, decodeAddr(allocator, w.list.items));
 }
 
+test "hostile: Addr rejects a count over MAX_ADDR_ENTRIES even with genuinely enough bytes behind it (isolates the wiki's own cap from the separate insufficient-bytes guard)" {
+    // The previous test's count (MAX_ADDR_ENTRIES + 1) has NO bytes behind
+    // it at all, so it can't tell whether MAX_ADDR_ENTRIES's own ceiling
+    // check (line above) or the separate "not enough bytes for this many
+    // entries" guard is what actually rejected it — removing the
+    // MAX_ADDR_ENTRIES check entirely still passed every existing test.
+    // This test supplies REAL, fully-decodable entries past the cap so
+    // only the explicit ceiling can catch it.
+    const allocator = testing.allocator;
+    const over_cap = MAX_ADDR_ENTRIES + 1;
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    try w.putCompactSize(allocator, over_cap);
+    const one_entry: TimedNetAddr = .{ .time = 0, .addr = .{ .services = 0, .ip = @splat(0), .port = 0 } };
+    var i: u64 = 0;
+    while (i < over_cap) : (i += 1) try one_entry.encode(&w, allocator);
+    try testing.expectError(error.TooManyItems, decodeAddr(allocator, w.list.items));
+}
+
 test "hostile: Addr rejects a huge count with insufficient bytes behind it" {
     const allocator = testing.allocator;
     var w: Writer = .{};

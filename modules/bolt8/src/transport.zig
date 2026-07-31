@@ -217,6 +217,29 @@ test "Transport.sendMessage: rejects an oversized message and a wrong-size buffe
     try testing.expectError(error.MessageTooLong, t.sendMessage(too_big, big_out));
 }
 
+test "Transport.recvMessage: rejects a mismatched-size out buffer BEFORE decrypting anything into it" {
+    // Unlike sendMessage's own wrong-size check (tested above),
+    // recvMessage's `c.len != out.len + 16` guard had no direct test —
+    // `noise`'s underlying `CipherState.decryptWithAd` only asserts
+    // `out.len >= msg_len` (see its own doc), so an oversized `out` here
+    // would otherwise silently decrypt into just the LEADING bytes of
+    // `out`, leaving the rest of the caller's buffer untouched (stale/
+    // uninitialized) while looking like a normal successful call — this
+    // guard is what turns that into an explicit, loud rejection instead.
+    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
+    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
+
+    var out: [length_frame_len + 5 + 16]u8 = undefined;
+    try sender.sendMessage("hello", &out);
+    _ = try receiver.recvLength(out[0..length_frame_len]);
+
+    const c = out[length_frame_len..]; // 5 + 16 = 21 bytes of real ciphertext
+    var too_big_out: [10]u8 = undefined; // out.len + 16 = 26 != c.len (21)
+    try testing.expectError(error.BufferWrongSize, receiver.recvMessage(c, &too_big_out));
+    var too_small_out: [2]u8 = undefined;
+    try testing.expectError(error.BufferWrongSize, receiver.recvMessage(c, &too_small_out));
+}
+
 test "Transport.recvMessage: a tampered ciphertext fails closed with DecryptionFailed" {
     var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
     var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });

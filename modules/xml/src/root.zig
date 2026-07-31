@@ -1190,6 +1190,44 @@ test "not-wf: char ref out of Unicode range" {
     try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#x110000;</a>", .{}));
 }
 
+test "not-wf: char ref onto a lone UTF-16 surrogate is rejected" {
+    // D800..DFFF is carved out of XML 1.0's Char production (a lone surrogate
+    // is not a valid Unicode scalar value) — the gap between isXmlChar's two
+    // adjoining ranges (0x20..D7FF, E000..FFFD) exists precisely for this.
+    // NOTE: `std.unicode.utf8Encode` also independently rejects a surrogate
+    // half, so a mutation that widened isXmlChar's ranges to cover D800..DFFF
+    // is an equivalent mutant for THIS call site today — the encode step
+    // catches it regardless. The assertion is kept anyway: it pins the
+    // documented spec contract (isXmlChar's own job, not an accident of
+    // which stdlib helper happens to run after it), and it stops being
+    // redundant the moment either check changes.
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#xD800;</a>", .{})); // low end
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#xDFFF;</a>", .{})); // high end
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#55296;</a>", .{})); // decimal 0xD800
+    // The adjoining valid boundaries must still be accepted.
+    var lo = try parse(testing.allocator, "<a>&#xD7FF;</a>", .{});
+    defer lo.deinit();
+    var hi = try parse(testing.allocator, "<a>&#xE000;</a>", .{});
+    defer hi.deinit();
+}
+
+test "not-wf: char ref onto a forbidden control character is rejected" {
+    // XML 1.0's Char production excludes every C0 control code except TAB
+    // (x9), LF (xA) and CR (xD) — unlike the surrogate case above, nothing
+    // downstream (`std.unicode.utf8Encode` happily encodes a NUL byte) backs
+    // this up, so isXmlChar's low bound (`cp >= 0x20`) is the ONLY guard.
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#x0;</a>", .{})); // NUL
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#x1;</a>", .{}));
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#xB;</a>", .{})); // vertical tab
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#x1F;</a>", .{})); // last forbidden C0
+    // The explicitly-whitelisted C0 controls and the adjoining valid boundary
+    // must still be accepted.
+    var tab = try parse(testing.allocator, "<a>&#x9;</a>", .{});
+    defer tab.deinit();
+    var space = try parse(testing.allocator, "<a>&#x20;</a>", .{});
+    defer space.deinit();
+}
+
 test "wf control: default-namespace undeclaration IS allowed" {
     var doc = try parse(testing.allocator, "<a xmlns=\"urn:d\"><b xmlns=\"\"/></a>", .{});
     defer doc.deinit();
@@ -1272,6 +1310,32 @@ test "security depth positive control: at-limit nesting is accepted" {
     try testing.expectEqualStrings("a", doc.root.local);
 }
 
+test "security depth: exact boundary — max_depth levels accepted, max_depth+1 rejected" {
+    // The existing "positive control" test checks depth 200 against a cap of
+    // 256 — nowhere near the boundary, so an off-by-one in the depth guard
+    // (rejecting one level early, or accepting one level too many) would not
+    // be caught there. Pin the boundary itself, at a small cap so the
+    // buffers stay readable.
+    const gpa = testing.allocator;
+    const cap = 5;
+
+    var at_cap: std.ArrayList(u8) = .empty;
+    defer at_cap.deinit(gpa);
+    var k: usize = 0;
+    while (k < cap) : (k += 1) try at_cap.appendSlice(gpa, "<a>");
+    while (k > 0) : (k -= 1) try at_cap.appendSlice(gpa, "</a>");
+    var doc = try parse(gpa, at_cap.items, .{ .max_depth = cap });
+    defer doc.deinit();
+    try testing.expectEqualStrings("a", doc.root.local);
+
+    var over_cap: std.ArrayList(u8) = .empty;
+    defer over_cap.deinit(gpa);
+    k = 0;
+    while (k < cap + 1) : (k += 1) try over_cap.appendSlice(gpa, "<a>");
+    while (k > 0) : (k -= 1) try over_cap.appendSlice(gpa, "</a>");
+    try testing.expectError(error.MaxDepthExceeded, parse(gpa, over_cap.items, .{ .max_depth = cap }));
+}
+
 test "security bounds: too many attributes rejected" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1282,6 +1346,32 @@ test "security bounds: too many attributes rejected" {
     }
     try buf.appendSlice(testing.allocator, "/>");
     try testing.expectError(error.TooManyAttributes, parse(testing.allocator, buf.items, .{ .max_attributes = 8 }));
+}
+
+test "security bounds: exact boundary — max_attributes accepted, max_attributes+1 rejected" {
+    // The existing test checks 20 attributes against a cap of 8 — nowhere
+    // near the boundary, so an off-by-one (allowing one attribute too many,
+    // or rejecting one too few) would not be caught there.
+    const gpa = testing.allocator;
+    const cap = 4;
+
+    var at_cap: std.ArrayList(u8) = .empty;
+    defer at_cap.deinit(gpa);
+    try at_cap.appendSlice(gpa, "<a");
+    var k: usize = 0;
+    while (k < cap) : (k += 1) try at_cap.print(gpa, " a{d}=\"v\"", .{k});
+    try at_cap.appendSlice(gpa, "/>");
+    var doc = try parse(gpa, at_cap.items, .{ .max_attributes = cap });
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, cap), doc.root.attributes.len);
+
+    var over_cap: std.ArrayList(u8) = .empty;
+    defer over_cap.deinit(gpa);
+    try over_cap.appendSlice(gpa, "<a");
+    k = 0;
+    while (k < cap + 1) : (k += 1) try over_cap.print(gpa, " a{d}=\"v\"", .{k});
+    try over_cap.appendSlice(gpa, "/>");
+    try testing.expectError(error.TooManyAttributes, parse(gpa, over_cap.items, .{ .max_attributes = cap }));
 }
 
 test "security: duplicate ID rejected (signature-wrapping guard)" {

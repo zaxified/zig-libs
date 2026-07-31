@@ -341,3 +341,39 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
         blindrsa.finalize(kp.public_key, Sha384, tampered[0..blind_sig.len], &ctx, &out2),
     );
 }
+
+// A rigged `std.Random` that always returns `p` (a prime factor of the RFC
+// 9474 KAT modulus `n = p*q`), zero-padded to whatever width is requested —
+// so every `sampleFe` draw `blind` makes (both the blinding factor `r` and
+// `maskedInvert`'s internal masking scalar `u`) comes back as `p` itself:
+// non-invertible mod `n` (gcd(p, n) == p), and the mask can never rescue
+// it (`v = p*u mod n` still shares the factor `p` with `n`). This is the
+// ONLY way to reach `blind`'s retry-exhausted `error.InvalidBlindingFactor`
+// path through the PUBLIC API without inverting SHA-384 — no existing test
+// exercises it (the retry-exhaustion path was previously unreachable by
+// any test in this suite).
+const RiggedRandom = struct {
+    p: []const u8,
+
+    fn fill(self: *const RiggedRandom, buf: []u8) void {
+        @memset(buf, 0);
+        if (buf.len >= self.p.len) {
+            @memcpy(buf[buf.len - self.p.len ..], self.p);
+        } else {
+            @memcpy(buf, self.p[self.p.len - buf.len ..]);
+        }
+    }
+};
+
+test "blind gives up and reports InvalidBlindingFactor rather than proceed with a non-invertible r (RNG rigged to always draw a factor of n)" {
+    const pk = try kat.publicKey();
+    var rigged = RiggedRandom{ .p = &kat.p };
+    const random = std.Random.init(&rigged, RiggedRandom.fill);
+
+    var ctx: blindrsa.Context = undefined;
+    var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
+    try testing.expectError(
+        error.InvalidBlindingFactor,
+        blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, random, &ctx, &blinded_msg),
+    );
+}

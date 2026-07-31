@@ -449,6 +449,20 @@ test "parseAiaOcspUrl: single AccessDescription, id-ad-ocsp with a URI" {
     try testing.expectEqualStrings(url, got);
 }
 
+test "parseAiaOcspUrl: id-ad-ocsp with a non-URI accessLocation yields null (not the OID's content)" {
+    // Same id-ad-ocsp OID as the matching case, but accessLocation is a
+    // directoryName [4] choice, not a uniformResourceIdentifier [6] — the
+    // module's documented contract treats this as "no usable entry", not an
+    // error, and MUST NOT return the non-URI bytes as if they were a URL.
+    const dir_name_content = "not a url, a directoryName content instead";
+    const method = [_]u8{ 0x06, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+    const loc = [_]u8{ 0xa4, dir_name_content.len } ++ dir_name_content.*;
+    const ad = [_]u8{ 0x30, method.len + loc.len } ++ method ++ loc;
+    const value = [_]u8{ 0x30, ad.len } ++ ad;
+
+    try testing.expect((try parseAiaOcspUrl(&value)) == null);
+}
+
 test "parseAiaOcspUrl: caIssuers-only (no id-ad-ocsp) yields null" {
     const oid_ad_ca_issuers = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02 }; // 1.3.6.1.5.5.7.48.2
     const url = "http://ca.example.org/issuer.crt";

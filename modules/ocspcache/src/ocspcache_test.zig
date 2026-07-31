@@ -397,6 +397,11 @@ test "Cache.needsRefresh/getStapled: refresh-margin proactive flip vs actual nex
     // Past the actual nextUpdate: no longer fresh enough to serve at all.
     try testing.expect(cache.needsRefresh(subject_with_aia, next_update_unix + 1));
     try testing.expect(cache.getStapled(subject_with_aia, next_update_unix + 1) == null);
+
+    // Exactly AT nextUpdate: the doc contract is "expired iff now_unix >
+    // nextUpdate" (strict), so the response is still servable at the exact
+    // boundary instant — only the instant AFTER it is too late.
+    try testing.expect(cache.getStapled(subject_with_aia, next_update_unix) != null);
 }
 
 test "Cache.refresh: tampered response fails verification and is never cached" {
@@ -444,6 +449,28 @@ test "Cache.refresh: responder HTTP error status is soft-failed; nothing cached 
     const now = this_update_unix + 100;
     try testing.expectError(error.ResponderHttpError, cache.refresh(subject_with_aia, issuer_der, now));
     try testing.expect(cache.getStapled(subject_with_aia, now) == null);
+}
+
+test "Cache.refresh: re-refreshing an already-cached subject frees the old entry (no leak)" {
+    const gpa = testing.allocator;
+
+    var mock: MockTransport = .{ .status = 200, .body = good_response };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{});
+    defer cache.deinit();
+
+    // First refresh: creates the entry.
+    try cache.refresh(subject_with_aia, issuer_der, this_update_unix + 100);
+    try testing.expectEqual(@as(usize, 1), cache.entries.count());
+
+    // Second successful refresh of the SAME subject: `getOrPut` finds the
+    // existing slot, so the old `response_der` allocation must be freed
+    // before it is overwritten — otherwise `testing.allocator` flags a leak
+    // at `cache.deinit()` below (this test's whole point).
+    mock.body = good_response;
+    try cache.refresh(subject_with_aia, issuer_der, this_update_unix + 200);
+    try testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try testing.expect(cache.getStapled(subject_with_aia, this_update_unix + 200) != null);
 }
 
 test "Cache.refresh: subject certificate without AIA -> NoResponderUrl, nothing cached" {

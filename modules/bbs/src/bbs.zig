@@ -773,6 +773,45 @@ test "proofGen validates disclosed_indexes/random_scalars count before touching 
     ));
 }
 
+test "proofGen REJECTS a duplicate disclosed index instead of silently under-counting undisclosed messages" {
+    // disclosed_indexes = {0, 0} makes the FORMULA's undisclosed_count
+    // (messages.len - disclosed_indexes.len = 3 - 2 = 1) diverge from the
+    // TRUE undisclosed set ({1, 2}, length 2) once duplicates collapse —
+    // this is the exact case root.zig's doc comment on `undisclosedIndexes`
+    // calls out as "callers' duplicate-detection signal". A caller that
+    // supplies random_scalars sized to the (wrong) formula count must be
+    // rejected, not silently proceed with a mismatched undisclosed/m_tilde
+    // pairing (which would zip two different-length slices).
+    const messages = [_][]const u8{ "a", "b", "c" };
+    var sig_bytes: [Signature.encoded_bytes]u8 = @splat(0);
+    sig_bytes[0..G1.compressed_bytes].* = G1.toBytesCompressed(G1.Affine.generator);
+    var e_bytes = [_]u8{0} ** 32;
+    e_bytes[31] = 1;
+    sig_bytes[G1.compressed_bytes..].* = e_bytes;
+    var sk_bytes = [_]u8{0} ** 32;
+    sk_bytes[31] = 1;
+    const sk = try SecretKey.fromBytes(sk_bytes);
+    const pk = keys.skToPk(sk);
+
+    // NONZERO scalars throughout — critically r1 != 0, so this exercises
+    // the duplicate-index guard itself rather than the separate `r1 == 0`
+    // rejection at `r1.inv()`.
+    var one_bytes = [_]u8{0} ** 32;
+    one_bytes[31] = 1;
+    const one = try Fr.fromBytes(one_bytes);
+    const random_scalars = [_]Fr{one} ** 4; // 3 + formula's undisclosed_count(1)
+    try testing.expectError(error.RandomScalarCountMismatch, proofGen(
+        testing.allocator,
+        pk,
+        sig_bytes,
+        "",
+        "",
+        &messages,
+        &.{ 0, 0 },
+        &random_scalars,
+    ));
+}
+
 test "proofVerify validates disclosed_messages/disclosed_indexes count before touching the core" {
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 1;

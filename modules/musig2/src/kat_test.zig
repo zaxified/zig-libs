@@ -268,6 +268,41 @@ test "KAT sign_verify: sign_error_test_cases (5) — secnonce is invalid (nonce 
     try std.testing.expectError(error.InvalidSecNonce, musig2.sign(secnonce, sk, ctx));
 }
 
+test "sign REJECTS a secnonce bound to a DIFFERENT signer's pubkey (SecretKeyMismatch) — no official vector for this; module-added defense" {
+    // BIP327's "Signing with Tweaked Individual Keys" remark: `secnonce`
+    // carries the pubkey `nonceGen` was called with, and `sign` must
+    // re-derive `sk`'s own pubkey and check it matches — this is NOT one
+    // of the official sign_error_test_cases categories (those cover
+    // "pubkey not in session"/"invalid pubkey"/"aggregate nonce
+    // invalid"/"secnonce invalid" only), so it had zero test coverage
+    // before this.
+    const std_ecc = std.crypto.ecc.Secp256k1;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const sk_a_bytes = [_]u8{0x11} ** 32;
+    const pk_a_point = try std_ecc.basePoint.mul(sk_a_bytes, .big);
+    const pk_a = try musig2.PlainPublicKey.fromBytes(pk_a_point.toCompressedSec1());
+
+    const sk_b_bytes = [_]u8{0x22} ** 32;
+    const sk_b = try bip340.SecretKey.fromBytes(sk_b_bytes);
+    const pk_b_point = try std_ecc.basePoint.mul(sk_b_bytes, .big);
+    const pk_b = try musig2.PlainPublicKey.fromBytes(pk_b_point.toCompressedSec1());
+    try std.testing.expect(!std.mem.eql(u8, &pk_a.bytes, &pk_b.bytes));
+
+    // secnonce is bound to pk_a (via nonceGen's `pk` argument)...
+    const rand_prime = [_]u8{0xCC} ** 32;
+    const ng = try musig2.nonceGen(sk_a_bytes, pk_a.bytes, null, "msg", null, rand_prime, io);
+
+    // ...but sign is called with sk_b — a genuine mismatch.
+    const pks = [_]musig2.PlainPublicKey{ pk_a, pk_b };
+    const pubnonces = [_]musig2.PubNonce{ng.pubnonce};
+    const aggnonce = try musig2.nonceAgg(&pubnonces);
+    const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = "msg" };
+    try std.testing.expectError(error.SecretKeyMismatch, musig2.sign(ng.secnonce, sk_b, ctx));
+}
+
 test "KAT sign_verify: valid_test_cases — partial signatures byte-exact; partialSigVerify accepts each" {
     const gpa = std.testing.allocator;
     const sk = try bip340.SecretKey.fromBytes(hexN(32, v.sign_verify.sk));

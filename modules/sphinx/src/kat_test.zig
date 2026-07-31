@@ -228,3 +228,36 @@ test "KAT: a 1-bit hmac tamper on the official onion is IntegrityCheckFailed" {
         sphinx.process(hexN(32, v.node_privkeys[1]), good, &associated_data),
     );
 }
+
+test "KAT: a hop_payloads tamper that would decode to a RESERVED bigsize length is STILL IntegrityCheckFailed, not a parse error (MAC-before-decrypt ordering)" {
+    // process()'s doc comment/step 2-4 comment is explicit: the HMAC MUST
+    // be checked "BEFORE touching hop_payloads' content in any
+    // data-dependent way." The existing hmac-tamper test only flips a bit
+    // in the `hmac` FIELD itself, leaving `hop_payloads` untouched — the
+    // deobfuscated plaintext still parses structurally fine regardless of
+    // check order, so that test can't distinguish "checked first" from
+    // "checked last, parsed fine anyway, rejected at the end instead".
+    //
+    // This test computes the REAL rho keystream for hop 0 (from the
+    // published `shared_secrets[0]`, exactly `generateKey(.rho, ss)` —
+    // `core.zig`'s own step 5) and picks a `hop_payloads[0]` byte whose
+    // DEOBFUSCATED value is `1` — a "reserved" bigsize length
+    // (`hopframe.readHopFrame` rejects any length `< 2`). If the HMAC
+    // check ever moved to run AFTER deobfuscation/parsing (the exact bug
+    // class this guards against), this input would surface
+    // `error.ReservedPayloadLength` instead of `error.IntegrityCheckFailed`
+    // — a live parse-error oracle over the tampered ciphertext, reached
+    // before the integrity check ever ran.
+    const ss0 = hexN(32, v.shared_secrets[0]);
+    const rho = sphinx.generateKey(.rho, ss0);
+    var stream_byte: [1]u8 = undefined;
+    sphinx.generateCipherStream(rho, &stream_byte);
+
+    var pkt = try sphinx.OnionPacket.fromBytes(hexN(sphinx.packet_len, v.onion));
+    pkt.hop_payloads[0] = stream_byte[0] ^ 1; // deobfuscates to exactly 1
+    const associated_data = hexN(32, v.associated_data);
+    try testing.expectError(
+        error.IntegrityCheckFailed,
+        sphinx.process(hexN(32, v.node_privkeys[0]), pkt, &associated_data),
+    );
+}

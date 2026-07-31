@@ -33,6 +33,9 @@ const std = @import("std");
 const adaptor = @import("root.zig");
 const bip340 = @import("bip340");
 const v = @import("kat_vectors.zig");
+const k256 = @import("k256");
+const Secp256k1 = k256.Secp256k1;
+const Scalar = Secp256k1.scalar.Scalar;
 
 fn hexN(comptime n: usize, hex_str: []const u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -233,4 +236,69 @@ test "property: adapt REJECTS an all-zero adaptor secret" {
         .needs_negation = vec.needs_negation,
     };
     try std.testing.expectError(error.InvalidAdaptorSecret, adaptor.adapt(presig, [_]u8{0} ** 32));
+}
+
+// ── malleability: preVerify must REJECT non-canonical s_prime, not reduce it ─
+//
+// Every KAT vector's s_prime is already canonical (< n), so byte-exact and
+// property tests above never exercise `preVerify`'s defensive `s_prime < n`
+// re-check (root.zig step 3) on a value that actually fails it. This test
+// builds its OWN presignature from scratch — independent of kat_vectors.zig
+// — specifically so that the "true" s_prime value is small enough
+// (X = 12345) that `X + n` still fits in 32 bytes: a non-canonical wire
+// encoding of the SAME residue mod n. A verifier that reduces mod n instead
+// of rejecting non-canonical scalars (classic ECDSA/Schnorr malleability
+// class) would accept both encodings as the same signature; `preVerify` must
+// accept only the canonical one.
+test "property: preVerify REJECTS a non-canonical (>= n) re-encoding of an otherwise-valid s_prime" {
+    const px = try bip340.XOnlyPublicKey.fromBytes(hexN(32, "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"));
+
+    // R = 42*G; lift_x(x(R)) is the canonical even-y point preVerify will
+    // reconstruct — record which sign of 42 has that parity.
+    const m_bytes = hexN(32, "000000000000000000000000000000000000000000000000000000000000002A");
+    const m_scalar = try Scalar.fromBytes(m_bytes, .big);
+    const r_point = try Secp256k1.combMulBase(m_bytes, .big);
+    const r_xy = r_point.affineCoordinates();
+    const r_bytes = r_xy.x.toBytes(.big);
+    const r_dl = if (r_xy.y.isOdd()) m_scalar.neg() else m_scalar;
+
+    const msg = "malleability probe";
+    var challenge_hasher = bip340.hash.taggedHasher(bip340.hash.challenge_tag);
+    challenge_hasher.update(&r_bytes);
+    challenge_hasher.update(&px.x);
+    challenge_hasher.update(msg);
+    var wide = [_]u8{0} ** 48;
+    wide[16..48].* = challenge_hasher.finalResult();
+    const e = Scalar.fromBytes48(wide, .big);
+
+    const x_scalar = try Scalar.fromBytes(hexN(32, "0000000000000000000000000000000000000000000000000000000000003039"), .big); // X = 12345
+
+    // Solve t = r_dl + e - X (mod n) so that lhs = s_prime*G - e*P equals
+    // rhs = R_even - T for needs_negation=false, with T = t*G.
+    const t_scalar = r_dl.add(e).sub(x_scalar);
+    try std.testing.expect(!t_scalar.isZero());
+    const t_point = try adaptor.AdaptorPoint.fromSecret(t_scalar.toBytes(.big));
+
+    const presig_canonical = adaptor.PreSignature{
+        .r = r_bytes,
+        .s_prime = x_scalar.toBytes(.big),
+        .needs_negation = false,
+    };
+    try std.testing.expect(adaptor.preVerify(px, msg, t_point, presig_canonical));
+
+    // Non-canonical re-encoding: X + n. n's bit length is 256 and X is tiny
+    // (12345), so X + n still fits in 32 bytes — it is NOT the same 32
+    // bytes as X, but reduces to the identical scalar mod n.
+    const n_u256: u256 = Secp256k1.scalar.field_order;
+    const noncanonical_u256: u256 = @as(u256, 12345) + n_u256;
+    var noncanonical_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &noncanonical_bytes, noncanonical_u256, .big);
+    try std.testing.expect(!std.mem.eql(u8, &noncanonical_bytes, &x_scalar.toBytes(.big)));
+
+    const presig_noncanonical = adaptor.PreSignature{
+        .r = r_bytes,
+        .s_prime = noncanonical_bytes,
+        .needs_negation = false,
+    };
+    try std.testing.expect(!adaptor.preVerify(px, msg, t_point, presig_noncanonical));
 }

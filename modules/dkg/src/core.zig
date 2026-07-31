@@ -239,6 +239,16 @@ test "computeQual: undefended complaint, >t distinct complainers, dedup, EmptyQu
     try testing.expect(!qual[0]);
     try testing.expect(qual[1] and qual[2] and qual[3]);
 
+    // Rule (b) EXACT BOUNDARY: the GJKR rule is "MORE THAN t" — exactly
+    // t=2 distinct (defended) complainants must NOT evict the dealer. The
+    // 3-complainant case below is comfortably over the threshold and would
+    // not, by itself, distinguish this ">" from a subtly-wrong ">=".
+    try computeQual(&qual, cfg, &.{
+        .{ .complainant = 1, .accused = 4 },
+        .{ .complainant = 2, .accused = 4 },
+    }, &.{ true, true });
+    try testing.expect(qual[3]); // exactly t=2: still qualified
+
     // Rule (b): 3 > t=2 DISTINCT complainants evict dealer 4 even though
     // every single complaint was defended.
     try computeQual(&qual, cfg, &.{

@@ -626,9 +626,23 @@ test "psSignWithSecret / psVerifyPlain: valid credential accepted, tamper reject
     const wrong = [_]Fr{ frOf(10), frOf(99), frOf(30) };
     try std.testing.expect(!psVerifyPlain(kk.master_vk, cred, &wrong));
 
-    // h == identity → reject (guard)
+    // h == identity, s == a REAL (nonzero) signature value → reject. NOTE:
+    // this specific combination is already rejected by the pairing math
+    // alone (e(1, kappa) = 1, but e(s, g2) != 1 for a nonzero s), so on its
+    // own it does NOT prove the `h != 1` guard in `psVerifyPlain` is
+    // load-bearing — see the DEGENERATE FORGERY case right below, which is
+    // the actual attack the guard exists to stop.
     const id_cred = Credential{ .h = g1.Affine.identity, .s = cred.s };
     try std.testing.expect(!psVerifyPlain(kk.master_vk, id_cred, &attrs));
+
+    // DEGENERATE FORGERY: h == identity AND s == identity. Both sides of
+    // the pairing equation collapse to e(1, x) == 1 for ANY vk/attributes —
+    // e(h, kappa) = e(1, kappa) = 1 and e(-s, g2) = e(-1, g2) = 1, so
+    // 1 * 1 == 1 regardless of the verification key or claimed attributes.
+    // This is the universal forgery the explicit `h != 1` guard exists to
+    // block; without it, `(identity, identity)` verifies against EVERY key.
+    const forged = Credential{ .h = g1.Affine.identity, .s = g1.Affine.identity };
+    try std.testing.expect(!psVerifyPlain(kk.master_vk, forged, &attrs));
 }
 
 test "Credential / PartialCredential codec round-trips" {

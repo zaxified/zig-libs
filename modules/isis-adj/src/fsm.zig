@@ -468,6 +468,42 @@ test "a neighbour that echoes us (and is past Down) brings us Up" {
     try testing.expectEqual(Transition{ .from = .down, .to = .up }, e.transition.?);
 }
 
+test "echo requires BOTH system-id and circuit-id to match, not just one" {
+    // system-id matches ours but the extended circuit-id does not.
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    const e1 = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xFF },
+        },
+    }, 1);
+    try testing.expectEqual(State.initializing, adj.currentState());
+    try testing.expect(e1.adjacency_up == false);
+
+    // extended circuit-id matches ours but the system-id does not.
+    var adj2 = Adjacency.init(cfgA());
+    _ = adj2.start(0);
+    const e2 = adj2.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_b, .extended_local_circuit_id = 0xA1 },
+        },
+    }, 1);
+    try testing.expectEqual(State.initializing, adj2.currentState());
+    try testing.expect(e2.adjacency_up == false);
+}
+
 test "echo with neighbour claiming Down does NOT bring us Up" {
     var adj = Adjacency.init(cfgA());
     _ = adj.start(0);

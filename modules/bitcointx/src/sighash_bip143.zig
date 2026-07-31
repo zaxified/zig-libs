@@ -165,6 +165,81 @@ pub fn sighash(
 
 const testing = std.testing;
 
+// The two published BIP143 examples (`bip143_kat_vectors.zig`) both use
+// hash_type 0x01 (ALL) — neither SIGHASH_SINGLE nor ANYONECANPAY is
+// byte-exact-KAT-covered. In particular, BIP143 deliberately PRESERVES the
+// historical "SIGHASH_SINGLE bug" (a SINGLE hash_type with no corresponding
+// output leaves `hashOutputs` all-zero rather than erroring, unlike
+// BIP341's `MissingCorrespondingOutput`) — see this file's `midstates` doc
+// comment / line comment. That branch had no test at all before the two
+// below.
+
+test "SIGHASH_SINGLE with a corresponding output hashes exactly that output (not all outputs)" {
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{
+            .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = [_]u8{1} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+        }),
+        .vout = @constCast(&[_]tx.TxOut{
+            .{ .value = 111, .script_pubkey = &[_]u8{0xAA} },
+            .{ .value = 222, .script_pubkey = &[_]u8{0xBB} },
+        }),
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const mid = try midstates(testing.allocator, t, 1, SINGLE);
+
+    // Hand-built (not via this file's own append* helpers) preimage of
+    // JUST vout[1]: value(8, LE) . compactsize(len) . script.
+    var expected_preimage: [8 + 1 + 1]u8 = undefined;
+    std.mem.writeInt(i64, expected_preimage[0..8], 222, .little);
+    expected_preimage[8] = 1; // compactsize(1)
+    expected_preimage[9] = 0xBB;
+    const want = hash256.sha256d(&expected_preimage);
+    try testing.expectEqualSlices(u8, &want, &mid.hash_outputs);
+
+    // And it must NOT be the all-outputs hash (which would be the ALL-type
+    // bug: hashing every vout instead of only the matching one).
+    const all_outputs_hash = (try midstates(testing.allocator, t, 1, ALL)).hash_outputs;
+    try testing.expect(!std.mem.eql(u8, &all_outputs_hash, &mid.hash_outputs));
+    _ = &t;
+}
+
+test "SIGHASH_SINGLE with NO corresponding output preserves the historical bug: hashOutputs stays all-zero" {
+    // 2 inputs, only 1 output: input_index=1 has no matching vout.
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{
+            .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = [_]u8{1} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+        }),
+        .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const mid = try midstates(testing.allocator, t, 1, SINGLE);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &mid.hash_outputs);
+    _ = &t;
+}
+
+test "ANYONECANPAY leaves hashPrevouts/hashSequence all-zero (not derived from vin at all)" {
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{7} ** 32, .vout = 3 }, .script_sig = &.{}, .sequence = 99 }}),
+        .vout = @constCast(&[_]tx.TxOut{.{ .value = 5, .script_pubkey = &.{} }}),
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const mid = try midstates(testing.allocator, t, 0, ALL | ANYONECANPAY);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &mid.hash_prevouts);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &mid.hash_sequence);
+    _ = &t;
+}
+
 test "input_index out of range is a typed error (midstates and sighash)" {
     var t: tx.Transaction = .{
         .version = 1,

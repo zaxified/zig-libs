@@ -554,6 +554,29 @@ fn elemFromBytesBE(comptime M: type, bytes: []const u8) M.Error!M.Elem {
     return v;
 }
 
+test "Modint.bits reports the exact bit-length of the modulus, not the limb width" {
+    const M = Modint(256);
+    // A 1-limb-ish modulus with a nonzero high (3rd) limb: only that limb's
+    // own bit-length should count, not `L * 64`.
+    var mv = std.mem.zeroes(M.Elem);
+    mv[0] = 1; // odd
+    mv[2] = 0b101; // top set bit is bit 2 of limb index 2
+    const m = try M.fromElem(mv);
+    try std.testing.expectEqual(@as(usize, 2 * 64 + 3), m.bits());
+
+    // A modulus that fits entirely in the low limb.
+    var mv2 = std.mem.zeroes(M.Elem);
+    mv2[0] = 0b1011; // bits 0..3, top bit is bit 3
+    const m2 = try M.fromElem(mv2);
+    try std.testing.expectEqual(@as(usize, 4), m2.bits());
+
+    // The all-ones-low-limb modulus: exactly 64 bits.
+    var mv3 = std.mem.zeroes(M.Elem);
+    mv3[0] = 0xffff_ffff_ffff_ffff;
+    const m3 = try M.fromElem(mv3);
+    try std.testing.expectEqual(@as(usize, 64), m3.bits());
+}
+
 test "negInvMod2_64: m·(-m⁻¹) ≡ -1 mod 2^64" {
     for ([_]u64{ 3, 5, 0xffff_ffff_ffff_ffff, 0x1234_5678_9abc_def1 }) |m| {
         const ni = negInvMod2_64(m);

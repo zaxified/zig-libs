@@ -1432,6 +1432,28 @@ test "Element.fromBytes rejects the identity element" {
     try std.testing.expectError(error.InvalidElement, Element.fromBytes([_]u8{0} ** 33));
 }
 
+test "deriveInterpolatingValue rejects x_i absent from participant_list" {
+    // Only ever reached today through round2Sign/verifySignatureShare's
+    // wrapped InvalidCommitmentList (always via a well-formed
+    // commitment_list where identifier IS present), so this direct error
+    // path had no test at all.
+    const one = try Identifier.fromU16(1);
+    const two = try Identifier.fromU16(2);
+    const three = try Identifier.fromU16(3);
+    const list = [_]Identifier{ one, two };
+    try std.testing.expectError(error.NotInList, deriveInterpolatingValue(&list, three));
+}
+
+test "deriveInterpolatingValue rejects a duplicate x-coordinate in participant_list" {
+    // Same as above: no test exercised this branch — every KAT/round-trip
+    // caller builds `participant_list` from a real commitment_list with
+    // distinct identifiers, so a hand-built list is needed to reach it.
+    const one = try Identifier.fromU16(1);
+    const two = try Identifier.fromU16(2);
+    const list = [_]Identifier{ one, two, one };
+    try std.testing.expectError(error.DuplicateParticipant, deriveInterpolatingValue(&list, one));
+}
+
 test "sortCommitmentsByIdentifier sorts ascending by identifier" {
     var list = [_]SigningCommitments{
         .{ .identifier = try Identifier.fromU16(3), .hiding = undefined, .binding = undefined },

@@ -98,6 +98,16 @@ test "reconstructsToQ / allSameQ discriminate a correct sharing from a corrupted
     try testing.expect(!verifyingShareConsistent(bad[1]));
     // Q agreement is unaffected (only the secret was corrupted).
     try testing.expect(allSameQ(&bad));
+
+    // A genuinely MISMATCHED group public key (e.g. a party that ran a
+    // different DKG session, or a malicious dealer handing out a different
+    // Q to one party) MUST be caught — this is the case the existing
+    // "corrupted secret" scenario above never exercises (there, every
+    // output still carries the same Q; only a secret_share differs).
+    var mismatched = outs;
+    mismatched[2].group_public_key = try pointOf(commitScalar(999));
+    try testing.expect(!allSameQ(&mismatched));
+    try testing.expect(allSameQ(mismatched[0..2])); // the still-agreeing subset is fine
 }
 
 fn commitScalar(v: u32) Scalar {

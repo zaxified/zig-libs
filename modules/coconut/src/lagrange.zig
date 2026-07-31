@@ -78,6 +78,16 @@ pub fn coefficientAtZero(indices: []const u64, i: u64) LagrangeError!Fr {
 
 test "coefficientAtZero: reconstructs a degree-(t-1) polynomial's constant term" {
     // f(x) = 7 + 3x + 5x^2 over Fr; sample at x=1,2,3; Lagrange-combine at 0 → 7.
+    //
+    // NOTE on why this is checked at BOTH t=3 and t=4 below: with t=3 indices,
+    // each coefficient's numerator product skips exactly 1 index, leaving an
+    // EVEN count (2) of `(0 - xk) = -xk` factors — so a mutant that drops the
+    // negation entirely (`num.mul(xk)` instead of `num.mul(xk.neg())`) flips
+    // an even number of signs per coefficient and the errors cancel: this
+    // t=3 case alone does NOT distinguish the correct sign convention from
+    // its negation-free mutant (an "oracle blind to the answer", the exact
+    // shape this campaign's method calls out). The t=4 case below has an ODD
+    // count (3) of such factors per coefficient, where the sign is load-bearing.
     const c0 = Fr.fromBytes(scalarFromU64(7)) catch unreachable;
     const c1 = Fr.fromBytes(scalarFromU64(3)) catch unreachable;
     const c2 = Fr.fromBytes(scalarFromU64(5)) catch unreachable;
@@ -90,6 +100,19 @@ test "coefficientAtZero: reconstructs a degree-(t-1) polynomial's constant term"
         acc = acc.add(l.mul(fx));
     }
     try std.testing.expect(acc.eql(c0));
+
+    // t=4: an odd (3) number of numerator factors per coefficient, where a
+    // dropped negation does NOT cancel out and must change the result.
+    const c3 = Fr.fromBytes(scalarFromU64(2)) catch unreachable;
+    const indices4 = [_]u64{ 1, 2, 3, 4 };
+    var acc4 = Fr.zero;
+    for (indices4) |i| {
+        const x = indexScalar(i);
+        const fx = c0.add(c1.mul(x)).add(c2.mul(x.square())).add(c3.mul(x.square().mul(x)));
+        const l = try coefficientAtZero(&indices4, i);
+        acc4 = acc4.add(l.mul(fx));
+    }
+    try std.testing.expect(acc4.eql(c0));
 }
 
 test "coefficientAtZero: rejects bad inputs" {

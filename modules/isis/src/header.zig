@@ -237,6 +237,37 @@ test "truncated below 8 bytes is Truncated at every length" {
     _ = try decode(&full);
 }
 
+test "isLsp / isCsnp / isPsnp classify each PDU type, no other type" {
+    const lsp_types = [_]PduType{ .l1_lsp, .l2_lsp };
+    const csnp_types = [_]PduType{ .l1_csnp, .l2_csnp };
+    const psnp_types = [_]PduType{ .l1_psnp, .l2_psnp };
+    const other_types = [_]PduType{ .l1_lan_iih, .l2_lan_iih, .p2p_iih };
+
+    for (lsp_types) |t| try testing.expect(t.isLsp());
+    for (csnp_types) |t| try testing.expect(t.isCsnp());
+    for (psnp_types) |t| try testing.expect(t.isPsnp());
+
+    // Cross-check: none of the "other" (non-LSP/CSNP/PSNP) types classify as
+    // any of the three, and each family rejects the other two families' types.
+    for (other_types) |t| {
+        try testing.expect(!t.isLsp());
+        try testing.expect(!t.isCsnp());
+        try testing.expect(!t.isPsnp());
+    }
+    for (lsp_types) |t| {
+        try testing.expect(!t.isCsnp());
+        try testing.expect(!t.isPsnp());
+    }
+    for (csnp_types) |t| {
+        try testing.expect(!t.isLsp());
+        try testing.expect(!t.isPsnp());
+    }
+    for (psnp_types) |t| {
+        try testing.expect(!t.isLsp());
+        try testing.expect(!t.isCsnp());
+    }
+}
+
 test "unknown PDU type stays representable, never panics" {
     const wire = [_]u8{ 0x83, 0x14, 0x01, 0x06, 0x01, 0x01, 0x00, 0x03 }; // type 1
     const h = try decode(&wire);
