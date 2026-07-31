@@ -151,6 +151,79 @@ test "KAT: verifierFinish reproduces Z, V, TT, key schedule, confirmV, and K_sha
     try std.testing.expectEqualSlices(u8, &hexN(32, vec.k_shared), &result.k_shared);
 }
 
+// ── RFC 9383 §6 mandatory group-membership check ("MUST abort... upon
+// receiving any value V such that V*h = I") ─────────────────────────────
+//
+// None of the tests above ever feed a degenerate (identity-element) share
+// or registration record into proverFinish/verifierFinish — every KAT and
+// property test above uses the vector's genuine, non-identity points, so
+// the `rejectIdentity()` guards inside proverFinish/verifierFinish (the
+// actual §6 abort condition) had no test making them fail. The
+// P256.fromSec1 fuzz test nearby only exercises the bare decode+reject
+// primitive in isolation, not the guard as wired into this module's own
+// public entry points.
+//
+// The P-256 identity element's affine coordinates are (x=0, y=1) — see
+// `p256`'s `group.zig` `P256.identityElement` / `AffineCoordinates.
+// identityElement` — so its uncompressed SEC1 encoding is the fixed byte
+// pattern below (0x04 || 32 zero bytes || 31 zero bytes || 0x01), built
+// directly rather than via an unexported `P256` type from this module.
+const identity_share_v1: [65]u8 = [_]u8{0x04} ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 31 ++ [_]u8{0x01};
+
+test "proverFinish REJECTS an identity-element share_v (RFC 9383 §6 group-membership check)" {
+    const vec = v.vectors[0];
+    const identity_share = identity_share_v1;
+
+    try std.testing.expectError(error.InvalidShareV, spake2plus.proverFinish(
+        std.testing.allocator,
+        vec.context,
+        vec.id_prover,
+        vec.id_verifier,
+        hexN(32, vec.w0),
+        hexN(32, vec.w1),
+        hexN(32, vec.x),
+        hexN(65, vec.share_p),
+        identity_share,
+        hexN(32, vec.confirm_v),
+    ));
+}
+
+test "verifierFinish REJECTS an identity-element share_p (RFC 9383 §6 group-membership check)" {
+    const vec = v.vectors[0];
+    const identity_share = identity_share_v1;
+
+    try std.testing.expectError(error.InvalidShareP, spake2plus.verifierFinish(
+        std.testing.allocator,
+        vec.context,
+        vec.id_prover,
+        vec.id_verifier,
+        hexN(32, vec.w0),
+        hexN(65, vec.l),
+        hexN(32, vec.y),
+        identity_share,
+        hexN(65, vec.share_v),
+        hexN(32, vec.confirm_p),
+    ));
+}
+
+test "verifierFinish REJECTS an identity-element registration record L (RFC 9383 §6 group-membership check)" {
+    const vec = v.vectors[0];
+    const identity_l = identity_share_v1;
+
+    try std.testing.expectError(error.InvalidShareP, spake2plus.verifierFinish(
+        std.testing.allocator,
+        vec.context,
+        vec.id_prover,
+        vec.id_verifier,
+        hexN(32, vec.w0),
+        identity_l,
+        hexN(32, vec.y),
+        hexN(65, vec.share_p),
+        hexN(65, vec.share_v),
+        hexN(32, vec.confirm_p),
+    ));
+}
+
 // ── property / round-trip / tamper-rejection harness ────────────────────
 
 test "property: end-to-end Prover<->Verifier run (public API only) agrees on K_shared" {

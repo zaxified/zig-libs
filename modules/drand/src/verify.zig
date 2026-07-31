@@ -80,6 +80,18 @@ pub const VerifyError = error{
 /// holds decoded points (e.g. from `tlock`) can reuse the exact same
 /// check `tlock`'s trust-boundary note points at.
 pub fn verifyRoundPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
+    // ⚠ Reject the identity on BOTH operands before pairing. A pairing with
+    // an identity operand is the target-group identity, so with
+    // `pubkey == 1` and `sig == 1` the equation degenerates to `1 == 1` and
+    // this returned TRUE for every round — a total forgery of this
+    // primitive. `verifyRound` happened to be safe only because
+    // `chaininfo.parseInfo` rejects an identity-encoded public key upstream;
+    // `round.parseRound` does not reject an identity signature, and this
+    // function's own doc comment invites callers to skip both parsers. A
+    // guard living in a caller is not a guard this function has.
+    // Found by the 1A mutation audit.
+    if (pubkey.infinity or sig.infinity) return false;
+
     const qid = ciphersuite.h1(ciphersuite.beaconId(round));
     const neg_qid = g1.Jacobian.fromAffine(qid).negate().toAffine();
     return pairing.pairingCheck(&.{
@@ -209,6 +221,21 @@ test "verifyRound: tampered randomness (valid signature) → RandomnessMismatch"
     try testing.expectError(error.RandomnessMismatch, verifyRound(&info, &rnd));
 }
 
+test "verifyRound: quicknet chain info against a G2 (chained-shaped) round → SchemeGroupMismatch" {
+    // Gap found by mutation testing: this branch had NO discriminating
+    // test — disabling it left every test green (the code still errors,
+    // just via the `MissingSignature` fallback instead of the specific
+    // `SchemeGroupMismatch` this mismatch is supposed to report). A
+    // realistic way to hit this: a caller fetches `/info` from a
+    // verifiable (quicknet) chain but round data from a different,
+    // chained-scheme beacon (96-byte G2 signature).
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    const g2_shaped_round = "{\"round\":1000,\"signature\":\"" ++ ("ab" ** 96) ++ "\"}";
+    const rnd = try round_mod.parseRound(testing.allocator, g2_shaped_round);
+    try testing.expect(rnd.sig_g1 == null);
+    try testing.expectError(error.SchemeGroupMismatch, verifyRound(&info, &rnd));
+}
+
 test "verifyRound: an unsupported (chained) scheme → UnsupportedScheme" {
     const chained =
         \\{"public_key":"868f005eb8e6e4ca0a47c8a77ceaa5309a47978a7c71bc5cce96366b5d7a569937c529eeda66c7293784a9402801af31","period":30,"genesis_time":1595431050,"hash":"8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce","groupHash":"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a","schemeID":"pedersen-bls-chained","metadata":{"beaconID":"default"}}
@@ -274,4 +301,17 @@ fn fuzzParseVerify(_: void, smith: *std.testing.Smith) !void {
             verifyRound(&info, &rnd) catch {};
         }
     }
+}
+
+test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
+    // Both operands identity => every pairing is the target-group identity,
+    // so the equation was `1 == 1` and this returned true for ANY round.
+    // The higher-level entry point was protected only by parseInfo's own
+    // identity rejection, which is a different function's guard.
+    try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.identity));
+    try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 12345, g1.Affine.identity));
+
+    // Each alone must fail too — a caller could supply one legitimate point.
+    try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.generator));
+    try std.testing.expect(!verifyRoundPoints(g2.Affine.generator, 1, g1.Affine.identity));
 }

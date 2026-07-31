@@ -232,6 +232,51 @@ test "decrypt KAT: noiseless Δ-rescale round-trips; margin boundary bites (dete
     try testing.expect(inst.decrypt(&sk, &ct_bad).coeffs[0] != m.coeffs[0]);
 }
 
+// ── 2d. noiseBudget KAT: exercises the `vmax == 0` special case directly ──────
+// Gap found by mutation testing: every existing noiseBudget call (the
+// "multiply DEPTH" anchor below) only checks RELATIVE ordering
+// (fresh > after-1-mul > after-2-mul, and > 0) on ciphertexts that always
+// carry genuine ternary-sampled noise — vmax is never exactly 0 there, so the
+// `if (vmax == 0) return log2(q/2)` branch (the exact-noiseless case) had NO
+// discriminating test: mutating it to `return 0` left all 37 tests green.
+// Reuse the same hand-built noiseless ciphertext as the decrypt KAT above
+// (construction independent of keyGen/encrypt) to pin that branch, plus one
+// call with known injected noise to confirm the budget strictly decreases
+// away from the vmax==0 case.
+test "noiseBudget KAT: noiseless ciphertext hits the exact vmax==0 case; added noise strictly lowers it" {
+    if (!gate.scheme_core_implemented or !gate.fable_core_implemented) return error.SkipZigTest;
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    const engines = try ring.makeEngines(P.n, P.primes.len, &primes8);
+    const Pt = encode.Plaintext(P.n);
+    const m = Pt.fromCoeffs(P.t, .{ 1, 2, 3, 0, 1, 2, 3, 0 });
+
+    const s = Ring8.fromCoeffs(&primes8, .{ [_]u64{ 1, 0, 16, 1, 0, 16, 1, 0 }, [_]u64{ 1, 0, 96, 1, 0, 96, 1, 0 } });
+    const c1 = Ring8.fromCoeffs(&primes8, .{ [_]u64{ 3, 5, 7, 9, 11, 13, 15, 2 }, [_]u64{ 30, 50, 70, 90, 11, 33, 55, 77 } });
+    const target = scaledPlaintext(&m, deltaLimbs());
+    const c1s = c1.mul(&s, &engines, &primes8);
+    var c0 = target;
+    c0.subAssign(&c1s, &primes8);
+
+    const sk = B.SecretKey{ .s = s };
+    const ct = B.Ciphertext{ .components = .{ c0, c1, Ring8.zero(.coeff) }, .len = 2 };
+    // Exactly noiseless (v == Δ·m exactly, so the reconstructed `v` used
+    // inside noiseBudget has zero deviation from Δ·m): the true max budget,
+    // `log2(q/2)`, not the "exhausted" 0 a broken vmax==0 branch would give.
+    const q: u128 = 17 * 97;
+    const want_max: u32 = @intCast(std.math.log2_int(u128, q / 2));
+    try testing.expectEqual(want_max, inst.noiseBudget(&sk, &ct));
+
+    // Same ciphertext plus known noise at one coefficient: budget must drop
+    // strictly below the noiseless maximum (and stay > 0, well under Δ/2=206).
+    var c0_noisy = c0;
+    c0_noisy.addAssign(&noiseAtCoeff0(100), &primes8);
+    const ct_noisy = B.Ciphertext{ .components = .{ c0_noisy, c1, Ring8.zero(.coeff) }, .len = 2 };
+    const budget_noisy = inst.noiseBudget(&sk, &ct_noisy);
+    try testing.expect(budget_noisy < want_max);
+    try testing.expect(budget_noisy > 0);
+}
+
 // ── 3. Homomorphic end-to-end anchors (SKIP-gated until scheme cores land) ────
 
 test "homomorphic ADD end-to-end: Dec(Enc(a) ⊕ Enc(b)) == a+b (mod t)" {

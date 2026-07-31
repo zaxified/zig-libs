@@ -361,3 +361,28 @@ test "Proof.fromBytes rejects non-canonical scalars" {
     @memset(bytes[0..32], 0xff); // c >= group order
     try testing.expectError(error.InvalidScalar, Proof.fromBytes(bytes));
 }
+
+test "finalize REJECTS a zero blind scalar (degenerate unblind, RFC 9497 InvalidBlind)" {
+    // A zero blind is canonical (deserializeScalar accepts it — see
+    // root.zig's "zero is canonical" test), so the ONLY thing standing
+    // between a degenerate blind and a silently-wrong Finalize is
+    // unblind's explicit zero check (`blind` itself already independently
+    // rejects blinding BY zero — std's own Ristretto255.mul refuses to
+    // produce the identity element — so this test drives a genuine,
+    // properly-blinded evaluation through the real protocol and only
+    // substitutes a zero blind_scalar at the FINALIZE call, exactly the
+    // shape a caller-side bug — e.g. losing track of which blind matches
+    // which evaluation — would take). No test anywhere in this suite
+    // (KAT or e2e) ever exercises unblind's own zero-blind guard — every
+    // vector's/e2e test's blind scalar is a genuine nonzero value, so
+    // this guard could be deleted without any existing test noticing.
+    const seed = [_]u8{0x99} ** 32;
+    const kp = try voprf.deriveKeyPair(.oprf, seed, "zero blind test");
+    const real_blind = voprf.scalarFromWideBytes([_]u8{0x77} ** 64);
+    const zero_blind = [_]u8{0} ** voprf.Ns;
+    const input = "zero blind input";
+
+    const blinded = try voprf.blind(.oprf, input, real_blind);
+    const evaluated = try voprf.blindEvaluate(kp.sk, blinded);
+    try testing.expectError(error.InvalidBlind, voprf.finalize(input, zero_blind, evaluated));
+}

@@ -1615,6 +1615,42 @@ test "CRT and non-CRT decrypt agree at a real 512-bit key size" {
     try testing.expect(via_crt.eql(via_full));
 }
 
+test "topBitsMatch: FIPS 186-5 closeness guard fires exactly at the 100-bit boundary" {
+    // Gap found by mutation testing: `generate`'s random prime search almost
+    // never actually exercises this guard's true-branch (matching the top
+    // 100 bits of two independently-drawn primes has probability ~2^-100),
+    // so nothing in the round-trip/keygen tests above can ever discriminate
+    // a broken guard from a working one. Exercise it directly instead.
+    var p: [16]u8 = [_]u8{0} ** 16;
+    var q: [16]u8 = [_]u8{0} ** 16;
+    for (0..12) |i| {
+        p[i] = @intCast(i + 1);
+        q[i] = @intCast(i + 1);
+    }
+
+    // Bytes 0..11 (96 bits) equal, high nibble of byte 12 (bits 96-99) equal
+    // too (low nibble differs, irrelevant to the 100-bit window) -> matches.
+    p[12] = 0xF3;
+    q[12] = 0xF7;
+    try testing.expect(topBitsMatch(&p, &q));
+
+    // Same first 96 bits, but the high nibble of byte 12 now differs ->
+    // exactly 96 bits match, not 100 -> must NOT match.
+    p[12] = 0x0F;
+    q[12] = 0xF0;
+    try testing.expect(!topBitsMatch(&p, &q));
+
+    // Differ well before the 96-bit mark -> never matches.
+    p[12] = 0xF3;
+    q[12] = 0xF3;
+    q[0] = 0xFF;
+    try testing.expect(!topBitsMatch(&p, &q));
+
+    // p == q (every real bit matches) is of course caught too.
+    q[0] = p[0];
+    try testing.expect(topBitsMatch(&p, &q));
+}
+
 test "generate rejects invalid bit sizes" {
     var prng = std.Random.DefaultPrng.init(1);
     const random = prng.random();

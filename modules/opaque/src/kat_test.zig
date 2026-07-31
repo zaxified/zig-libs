@@ -219,6 +219,64 @@ test "mismatched identities fail closed on the client (EnvelopeRecovery)" {
     );
 }
 
+test "identity-element client_public_keyshare in KE1 is rejected (InvalidPublicKey)" {
+    // §6.4.1.1's "DH shared secret MUST NOT be the identity" / §10.7
+    // input validation, exercised end to end through generateKE2: the
+    // ristretto255 identity element (32 zero bytes) MUST fail
+    // Element.fromBytes's decode-time identity rejection, not just be
+    // accepted and silently produce a degenerate shared secret. No
+    // other test in this suite ever supplies a malformed/identity
+    // keyshare, so this path was previously unexercised.
+    const v = kat.real_1;
+    const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
+    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    var poisoned_ke1 = client.ke1;
+    poisoned_ke1.auth_request.client_public_keyshare = [_]u8{0} ** opaque_pake.Npk; // identity element
+
+    try testing.expectError(error.InvalidPublicKey, opaque_pake.generateKE2(
+        v.server_private_key,
+        v.server_public_key,
+        record,
+        v.credential_identifier,
+        v.oprf_seed,
+        poisoned_ke1,
+        identitiesOf(v),
+        v.context,
+        v.masking_nonce,
+        v.server_nonce,
+        v.server_keyshare_seed,
+    ));
+}
+
+test "identity-element server_public_keyshare in KE2 is rejected (InvalidPublicKey) on the client" {
+    // The mirror image on the client side: generateKE3 must reject a
+    // KE2 whose server_public_keyshare is the identity element, rather
+    // than deriving a degenerate DH1/DH3 shared secret from it.
+    const v = kat.real_1;
+    const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
+    const client = try opaque_pake.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const server = try opaque_pake.generateKE2(
+        v.server_private_key,
+        v.server_public_key,
+        record,
+        v.credential_identifier,
+        v.oprf_seed,
+        client.ke1,
+        identitiesOf(v),
+        v.context,
+        v.masking_nonce,
+        v.server_nonce,
+        v.server_keyshare_seed,
+    );
+    var poisoned_ke2 = server.ke2;
+    poisoned_ke2.auth_response.server_public_keyshare = [_]u8{0} ** opaque_pake.Npk; // identity element
+
+    try testing.expectError(
+        error.InvalidPublicKey,
+        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, poisoned_ke2),
+    );
+}
+
 // ── (5) fresh end-to-end round trip (non-vector randomness) ──────────────
 
 test "fresh end-to-end registration + login agree on session_key and export_key" {

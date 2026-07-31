@@ -117,4 +117,8 @@ test "validate rejects malformed sets" {
     try testing.expectError(error.RingDegreeNotPowerOfTwo, (Params{ .n = 8, .N = 6, .bg_bits = 4, .ell = 2, .bks_bits = 4, .ell_ks = 2, .err_bound = 1 }).validate());
     try testing.expectError(error.BadGgswGadget, (Params{ .n = 8, .N = 8, .bg_bits = 8, .ell = 5, .bks_bits = 4, .ell_ks = 2, .err_bound = 1 }).validate());
     try testing.expectError(error.ZeroError, (Params{ .n = 8, .N = 8, .bg_bits = 4, .ell = 2, .bks_bits = 4, .ell_ks = 2, .err_bound = 0 }).validate());
+    // Gap found by mutation testing: neither of these two branches had ANY
+    // discriminating test — disabling both guards left every test green.
+    try testing.expectError(error.ZeroLweDimension, (Params{ .n = 0, .N = 8, .bg_bits = 4, .ell = 2, .bks_bits = 4, .ell_ks = 2, .err_bound = 1 }).validate());
+    try testing.expectError(error.BadKeySwitchGadget, (Params{ .n = 8, .N = 8, .bg_bits = 4, .ell = 2, .bks_bits = 8, .ell_ks = 5, .err_bound = 1 }).validate());
 }

@@ -299,6 +299,29 @@ test "parseInfo: wrong-length key for quicknet → InvalidLength" {
     try testing.expectError(error.InvalidLength, parseInfo(testing.allocator, bad));
 }
 
+test "parseInfo: identity (infinity) public key for quicknet → InvalidPoint, not silently accepted" {
+    // Gap found by mutation testing: the `if (pt.infinity) return
+    // error.InvalidPoint;` KeyValidate guard had NO test at all — disabling
+    // it left every existing test in this module green. This matters more
+    // than an ordinary missing-branch gap: `verify.verifyRoundPoints` (the
+    // low-level primitive this module's decoded key ultimately feeds) has
+    // no defense of its own against a degenerate identity point — an
+    // identity G2 "public key" paired with an identity G1 "signature"
+    // forges `e(sig,G2gen) == e(H1(round),pubkey)` for EVERY round (both
+    // sides pair to the target-group identity). This parse-time guard is
+    // the ONLY thing standing between a malicious/corrupted `/info`
+    // document and that forgery for any caller going through
+    // `chaininfo.parseInfo` + `verify.verifyRound`.
+    //
+    // Compressed-G2 identity encoding (see bls12_381 g2.zig
+    // `toBytesCompressed`): byte 0 = compression|infinity flags (0xc0),
+    // remaining 95 bytes zero.
+    const identity_key_hex = "c0" ++ ("00" ** 95);
+    const bad = "{\"public_key\":\"" ++ identity_key_hex ++
+        "\",\"period\":3,\"genesis_time\":1,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\"}";
+    try testing.expectError(error.InvalidPoint, parseInfo(testing.allocator, bad));
+}
+
 test "parseInfo: missing field → MalformedJson" {
     const bad = "{\"period\":3,\"genesis_time\":1,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\"}";
     try testing.expectError(error.MalformedJson, parseInfo(testing.allocator, bad));
