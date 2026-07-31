@@ -453,6 +453,74 @@ test "knn: ranks nearest-first and handles k > item_count" {
     for (1..r.items.len) |i| try testing.expect(r.items[i].dist2 >= r.items[i - 1].dist2);
 }
 
+test "knn: tied distance between a direct-child point and a node-wrapped point breaks by value, not discovery order" {
+    // Hand-crafted 4-node buffer (bypasses the builder/Hilbert path) to pin an
+    // exact heap-ordering scenario that no round-trip through `build` can
+    // reliably reach: two points at the IDENTICAL distance from the query,
+    // one a direct leaf child of the root, the other wrapped one level down
+    // inside its own solo internal node. Expanding the root therefore pushes
+    // one "point" heap entry and one "node" heap entry, tied at the same
+    // dist2. `entryBefore`'s doc comment requires a node to be expanded
+    // before an equal-distance point is emitted, precisely so the wrapped
+    // point is discovered in time to compete on the documented value-asc
+    // tie-break — if that ordering were wrong, the direct point would be
+    // emitted first purely because it started the search already-expanded,
+    // regardless of which one the tie-break should actually prefer.
+    var buf: [format.header_size + 4 * format.node_size_bytes]u8 = undefined;
+
+    // index0: leaf P (value=1) at (0, -5) — wrapped one level down; must win.
+    const base0 = format.header_size + 0 * format.node_size_bytes;
+    buf[base0 + format.off_flags] = format.leaf_bit;
+    format.writeF64(&buf, base0 + format.off_min_lat, 0);
+    format.writeF64(&buf, base0 + format.off_min_lon, -5);
+    format.writeF64(&buf, base0 + format.off_max_lat, 0);
+    format.writeF64(&buf, base0 + format.off_max_lon, -5);
+    std.mem.writeInt(u32, buf[base0 + format.off_data ..][0..4], 1, .little);
+    std.mem.writeInt(u16, buf[base0 + format.off_child_count ..][0..2], 0, .little);
+
+    // index1: leaf Q (value=9) at (0, 5) — direct child of root; must lose.
+    const base1 = format.header_size + 1 * format.node_size_bytes;
+    buf[base1 + format.off_flags] = format.leaf_bit;
+    format.writeF64(&buf, base1 + format.off_min_lat, 0);
+    format.writeF64(&buf, base1 + format.off_min_lon, 5);
+    format.writeF64(&buf, base1 + format.off_max_lat, 0);
+    format.writeF64(&buf, base1 + format.off_max_lon, 5);
+    std.mem.writeInt(u32, buf[base1 + format.off_data ..][0..4], 9, .little);
+    std.mem.writeInt(u16, buf[base1 + format.off_child_count ..][0..2], 0, .little);
+
+    // index2: internal node wrapping only P (index0) — its bbox degenerates to
+    // P's point, so its lower-bound distance equals P's exact distance: a tie.
+    const base2 = format.header_size + 2 * format.node_size_bytes;
+    buf[base2 + format.off_flags] = 0;
+    format.writeF64(&buf, base2 + format.off_min_lat, 0);
+    format.writeF64(&buf, base2 + format.off_min_lon, -5);
+    format.writeF64(&buf, base2 + format.off_max_lat, 0);
+    format.writeF64(&buf, base2 + format.off_max_lon, -5);
+    std.mem.writeInt(u32, buf[base2 + format.off_data ..][0..4], 0, .little); // child = index0
+    std.mem.writeInt(u16, buf[base2 + format.off_child_count ..][0..2], 1, .little);
+
+    // index3: root, children [index1, index2] (data=1, count=2).
+    const base3 = format.header_size + 3 * format.node_size_bytes;
+    buf[base3 + format.off_flags] = 0;
+    format.writeF64(&buf, base3 + format.off_min_lat, 0);
+    format.writeF64(&buf, base3 + format.off_min_lon, -5);
+    format.writeF64(&buf, base3 + format.off_max_lat, 0);
+    format.writeF64(&buf, base3 + format.off_max_lon, 5);
+    std.mem.writeInt(u32, buf[base3 + format.off_data ..][0..4], 1, .little); // children start at index1
+    std.mem.writeInt(u16, buf[base3 + format.off_child_count ..][0..2], 2, .little);
+
+    const header = format.Header{ .flags = 0, .node_count = 4, .fanout = 16, .item_count = 2, .root_index = 3 };
+    header.encode(&buf, buf[format.header_size..]);
+
+    const f = try Frozen.load(&buf);
+    var out: [1]Neighbor = undefined;
+    var scratch: [8]HeapEntry = undefined;
+    const r = try f.knn(0, 0, 1, &out, &scratch, .{});
+    try testing.expectEqual(@as(usize, 1), r.items.len);
+    try testing.expectEqual(@as(f64, 25), r.items[0].dist2); // confirms the tie is real
+    try testing.expectEqual(@as(u32, 1), r.items[0].value); // P (wrapped), not Q (direct)
+}
+
 test "knn: scratch too small is a typed error, not a crash" {
     var b = builder.Builder.init(testing.allocator);
     defer b.deinit();

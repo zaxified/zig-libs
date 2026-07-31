@@ -410,6 +410,58 @@ test "topN: budget exhaustion is reported as truncated" {
     try testing.expectEqual(TopNStatus.truncated_budget, r.status);
 }
 
+test "prefixIterator.next: undersized key_buf is KeyTooLong, not a truncated/corrupt key" {
+    // `emit`'s bounds check (`error.KeyTooLong` on `path.len > key_buf.len`) had
+    // no call site anywhere in the suite before this test — an off-by-one here
+    // (e.g. accepting a `key_buf` exactly `path.len` bytes short) would have
+    // gone unnoticed, silently or by @memcpy panicking on an untrusted-sized
+    // caller buffer instead of returning the documented typed error.
+    const buf = try build(&.{.{ .key = "hello", .value = 1 }});
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+
+    var it1 = try f.prefixIterator(testing.allocator, "");
+    defer it1.deinit();
+    var too_small: [4]u8 = undefined; // "hello" is 5 bytes
+    try testing.expectError(error.KeyTooLong, it1.next(&too_small));
+
+    // A fresh iterator (the failed attempt above already advanced `it1` past
+    // "hello" — `next` does not retry a slot it already tried to emit).
+    var it2 = try f.prefixIterator(testing.allocator, "");
+    defer it2.deinit();
+    var just_right: [5]u8 = undefined; // boundary: exactly key.len must succeed
+    const c = try it2.next(&just_right);
+    try testing.expectEqualStrings("hello", c.?.key);
+}
+
+test "topN: a reconstructed key crossing max_depth is KeyTooLong via the path_len gate specifically" {
+    // `topNInto`'s DFS depth gate is `path_len >= path_store.len or sp >=
+    // stack.len` — two conditions with no call site anywhere in the suite
+    // before this. Naively pushing a single very long stored key past
+    // `max_depth` from an EMPTY prefix moves `path_len` and `sp` (the DFS
+    // stack depth) in lockstep, so it can't tell the two conditions apart —
+    // an off-by-one in the `path_len` half specifically would go unnoticed
+    // (as verified: reverting that half to `>` alone left this suite green).
+    // Using a long PREFIX instead decouples them: `seek` walks the prefix
+    // bytes BEFORE topNInto's DFS stack exists at all, so `path_len` starts
+    // near the limit already while `sp` starts fresh at 1 and only grows by
+    // the short remaining suffix — isolating the `path_len` check.
+    var b = try builder.Builder.init(testing.allocator);
+    defer b.deinit();
+    const prefix_len = max_depth - 5;
+    var long_key: [prefix_len + 10]u8 = undefined;
+    @memset(long_key[0..prefix_len], 'a');
+    @memcpy(long_key[prefix_len..], "bcdefghijk");
+    try b.insert(&long_key, 1);
+    const buf = try b.freeze(testing.allocator);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+
+    var results: [1]Completion = undefined;
+    var kb: [long_key.len]u8 = undefined;
+    try testing.expectError(error.KeyTooLong, f.topN(long_key[0..prefix_len], &results, &kb, .{}));
+}
+
 test "loadVerified rejects a body bit-flip that load accepts" {
     const buf = try build(&.{.{ .key = "hello", .value = 7 }});
     defer testing.allocator.free(buf);

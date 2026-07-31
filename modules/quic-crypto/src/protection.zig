@@ -274,3 +274,32 @@ test "Protection.open: App. A.3 round-trip + tamper->DecryptionFailed" {
     const tiny = [_]u8{ 1, 2, 3 };
     try testing.expectError(error.PacketTooShort, P.open(rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &tiny, &back));
 }
+
+test "Protection.open: App. A.5 ChaCha20-Poly1305 round-trip + tamper->DecryptionFailed" {
+    // The AES-128-GCM instantiation above is the only one `open` was ever
+    // exercised through — `Protection` is a comptime-generic struct, so
+    // that leaves the entire ChaCha20-Poly1305 instantiation's `open`
+    // (used for every 1-RTT/0-RTT QUIC packet, not just Initial) with
+    // nothing but a `seal`-only positive test. A bug specific to that
+    // instantiation (e.g. a broken catch) would compile clean and pass
+    // every test in this file.
+    const P = Protection(ChaCha20Poly1305);
+    var back: [rfc_a5_plain.len]u8 = undefined;
+    const n = try P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &rfc_a5_ct, &back);
+    try testing.expectEqualSlices(u8, &rfc_a5_plain, back[0..n]);
+
+    var t1 = rfc_a5_ct;
+    t1[0] ^= 1; // flip a ciphertext byte
+    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &t1, &back));
+
+    var t2 = rfc_a5_ct;
+    t2[t2.len - 1] ^= 1; // flip a tag byte
+    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &t2, &back));
+
+    var bad_header = rfc_a5_header;
+    bad_header[0] ^= 1;
+    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &bad_header, &rfc_a5_ct, &back));
+
+    // Wrong packet number => wrong nonce => open fails.
+    try testing.expectError(error.DecryptionFailed, P.open(rfc_a5_key, rfc_a5_iv, rfc_a5_pn + 1, &rfc_a5_header, &rfc_a5_ct, &back));
+}

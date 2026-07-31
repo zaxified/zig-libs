@@ -1263,6 +1263,27 @@ test "HandshakeState: reading a truncated message fails cleanly" {
     try testing.expectError(error.MessageTooShort, rsp.readMessage(&[_]u8{1} ** 16, &plain));
 }
 
+test "HandshakeState: identity-point remote static key is rejected (invalid-point DH)" {
+    // Spec §4.1 explicitly allows rejecting DH outputs that are the
+    // all-zero identity element — the classic small-subgroup attack
+    // where an attacker plants a low-order public key so every party's
+    // DH computation collapses to the same known value regardless of
+    // its own secret. Nothing else in this suite ever hands mixDh() an
+    // invalid remote key, so this reject path (error.DhFailed) had no
+    // test at all before this one.
+    const S = TestSuite;
+    var prng = std.Random.DefaultPrng.init(0x1d1d1d);
+    const random = prng.random();
+    var ini: S.HandshakeState = .{};
+    const zero_rs: [S.DHLEN]u8 = [_]u8{0} ** S.DHLEN;
+    // NK's pre-message gives the initiator the responder's static key
+    // out of band; plant the identity element there so message 1's
+    // `es` token (DH(e, rs)) computes against it.
+    ini.initialize(patterns.NK, true, "", null, null, zero_rs, null, &.{});
+    var m: [64]u8 = undefined;
+    try testing.expectError(error.DhFailed, ini.writeMessage(random, "", &m));
+}
+
 fn fuzzReadMessage(_: void, smith: *std.testing.Smith) !void {
     var msg: [256]u8 = undefined;
     smith.bytes(&msg);

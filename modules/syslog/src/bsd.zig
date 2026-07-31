@@ -106,6 +106,26 @@ test "RFC 3164 line without a pid" {
     );
 }
 
+test "day 10 (the space-pad boundary) is NOT space-padded" {
+    // The `< 10` vs `<= 10` boundary had no test pinned exactly at day 10 —
+    // every other test uses a single-digit day (9). One day later than the
+    // other fixtures (2026-07-10, same time of day) exercises the boundary
+    // directly.
+    const msg = Message{
+        .facility = .user,
+        .severity = .notice,
+        .timestamp = .{ .unix_ms = 1783686896000 }, // 2026-07-10T12:34:56Z
+        .hostname = "host",
+        .tag = "app",
+        .msg = "hi",
+    };
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings(
+        "<13>Jul 10 12:34:56 host app: hi",
+        try bufPrint(&msg, &buf),
+    );
+}
+
 test "TAG longer than 32 bytes is truncated" {
     const msg = Message{
         .facility = .user,

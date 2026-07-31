@@ -91,6 +91,25 @@ test "negative: tampered payload fails verification of a real signature" {
     try std.testing.expectError(error.SignatureVerificationFailed, m.verifyMessage(pub_key.key, tampered, parsed.signature));
 }
 
+test "negative: tampered payload fails verification of a real LEGACY signature" {
+    // The prehashed-vs-legacy switch in verifyMessage picks which bytes get
+    // signed (raw message vs BLAKE2b-512 prehash) — everything downstream
+    // (the actual Ed25519 verify call) is shared code, but the ONLY reject
+    // test before this one (`m.verifyMessage` returning
+    // error.SignatureVerificationFailed on a tampered message) used the
+    // `.prehashed` fixture exclusively. A bug confined to the `.legacy`
+    // arm specifically (e.g. one that silently skipped hashing/verifying
+    // for that variant) would have passed every existing test in this
+    // file, including "legacy KAT: parse + verify" above, since that one
+    // only exercises the ACCEPT path.
+    const pub_key = try m.parsePublicKeyFile(kat.unencrypted_public_key_file);
+    const parsed = try m.parseSignatureFile(kat.legacy_signature_file);
+    try std.testing.expectEqual(m.Algorithm.legacy, parsed.algorithm);
+
+    const tampered = "Hello, minisign!\nThis is a TAMPERED file for byte-exact KAT vectors.\n";
+    try std.testing.expectError(error.SignatureVerificationFailed, m.verifyMessage(pub_key.key, tampered, parsed.signature));
+}
+
 test "negative: tampered trusted comment fails verification of a real signature" {
     const gpa = std.testing.allocator;
     const pub_key = try m.parsePublicKeyFile(kat.unencrypted_public_key_file);

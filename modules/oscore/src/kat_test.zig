@@ -430,3 +430,80 @@ test "end-to-end: deriveContext -> protect -> unprotect round trip with fresh ke
 
     try std.testing.expectEqualSlices(u8, plaintext, recovered);
 }
+
+test "protect rejects a Sender Sequence Number beyond max_partial_iv (nonce-reuse guard)" {
+    // §7.2.1: the Sender Sequence Number must never exceed max_partial_iv
+    // (2^40 - 1) — going past it would force `computeNonce` to reuse a
+    // 5-byte Partial IV field, i.e. reuse an AEAD nonce under the same
+    // key, which breaks AES-CCM's confidentiality/integrity guarantees
+    // outright. Nothing in this suite previously drove `protect` to this
+    // boundary (or past it) at all: this check could be deleted and every
+    // other test would still pass.
+    const allocator = std.testing.allocator;
+
+    var ctx = try oscore.deriveContext(allocator, "boundary test master secret 32b", "salt", null, "client", "server", .aes_ccm_16_64_128);
+
+    // Exactly at the ceiling: still a legal Partial IV, must succeed and
+    // then advance one past it.
+    ctx.sender.sequence_number = oscore.max_partial_iv;
+    const at_boundary = try oscore.protect(allocator, &ctx, "ok", .{
+        .request_kid = "client",
+        .request_piv = &.{0x00},
+    }, true, null);
+    allocator.free(at_boundary.ciphertext);
+    try std.testing.expectEqual(oscore.max_partial_iv + 1, ctx.sender.sequence_number);
+
+    // One past the ceiling: must fail closed rather than silently wrap
+    // the Partial IV and reuse a nonce.
+    try std.testing.expectError(error.SequenceNumberExhausted, oscore.protect(allocator, &ctx, "no", .{
+        .request_kid = "client",
+        .request_piv = &.{0x00},
+    }, true, null));
+    // The rejected attempt must not have burned/advanced the counter either.
+    try std.testing.expectEqual(oscore.max_partial_iv + 1, ctx.sender.sequence_number);
+}
+
+test "unprotect: a failed-auth attempt does not poison the replay window (§8.4)" {
+    // The ReplayWindow.update doc comment says a Partial IV is recorded
+    // as seen only AFTER the AEAD verifies — never on a tag-check
+    // failure. Otherwise an attacker who cannot forge the key at all
+    // could still DoS a legitimate exchange for free: send one message
+    // with a tampered tag but the CORRECT (guessed/observed) Partial IV,
+    // and if that Partial IV got recorded anyway, the real message
+    // carrying it would later be rejected as `error.Replayed` even
+    // though it never actually reached the peer. Nothing before this
+    // test drove `unprotect` down the failed-auth path and then replayed
+    // the same Partial IV correctly afterward to check for this.
+    const allocator = std.testing.allocator;
+    const vec = v.message_vectors[0]; // C.4
+    var sender_id_buf: [8]u8 = undefined;
+    var sender_key_buf: [oscore.key_length]u8 = undefined;
+    var common_iv_buf: [oscore.nonce_length]u8 = undefined;
+    var ctx = contextFor(vec, &sender_id_buf, &sender_key_buf, &common_iv_buf);
+    ctx.recipient.key = sender_key_buf;
+    ctx.recipient.id = &.{};
+
+    var ct_buf: [32]u8 = undefined;
+    const good_ciphertext = hexBytes(&ct_buf, vec.ciphertext);
+    var tampered_buf: [32]u8 = undefined;
+    @memcpy(tampered_buf[0..good_ciphertext.len], good_ciphertext);
+    tampered_buf[0] ^= 0xFF;
+
+    var kid_buf: [4]u8 = undefined;
+    var piv_buf: [4]u8 = undefined;
+    const aad = oscore.AadParams{
+        .request_kid = hexBytes(&kid_buf, vec.request_kid),
+        .request_piv = hexBytes(&piv_buf, vec.request_piv),
+    };
+
+    // First: a tampered message using the SAME Partial IV — must fail
+    // authentication (not replay-rejected, since this Partial IV was
+    // never seen before).
+    const failed = oscore.unprotect(allocator, &ctx, .{ .partial_iv = vec.option_partial_iv }, tampered_buf[0..good_ciphertext.len], aad, null, true);
+    try std.testing.expectError(error.AuthenticationFailed, failed);
+
+    // Then: the genuine message with that SAME Partial IV must still
+    // succeed — the failed attempt above must not have recorded it.
+    const plaintext = try oscore.unprotect(allocator, &ctx, .{ .partial_iv = vec.option_partial_iv }, good_ciphertext, aad, null, true);
+    allocator.free(plaintext);
+}

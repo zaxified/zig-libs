@@ -848,6 +848,24 @@ test "weighted_round_robin distributes exactly by weight (smooth WRR)" {
     try testing.expect(max_streak <= 2);
 }
 
+test "weighted_round_robin: equal-weight tie breaks to the lower registration index" {
+    // The distribution test above only pins AGGREGATE counts over 600 picks,
+    // which are conserved regardless of which peer wins a same-credit tie
+    // (a mutation of the tie-break's `>` to `>=` was verified to leave that
+    // test fully green). Equal weights make the very first pick a genuine
+    // tie (both start at wrr_current 0, both gain the same credit) — pin
+    // the deterministic winner directly, matching `least_connections`'
+    // documented "ties → lowest registration index".
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .weighted_round_robin });
+    defer pool.deinit();
+    _ = try pool.add(.{ .id = "a", .address = "10.0.0.1:80", .weight = 1 });
+    _ = try pool.add(.{ .id = "b", .address = "10.0.0.2:80", .weight = 1 });
+
+    try testing.expectEqualStrings("a", pickReport(&pool).?.id);
+    try testing.expectEqualStrings("b", pickReport(&pool).?.id);
+    try testing.expectEqualStrings("a", pickReport(&pool).?.id);
+}
+
 test "random: seeded and deterministic, covers all healthy, never picks a down one" {
     var seq_a: [12]u8 = undefined;
     var seq_b: [12]u8 = undefined;

@@ -346,6 +346,27 @@ test "structured-data value escaping of \" \\ ]" {
     );
 }
 
+test "SD-ID and param name: the four reserved bytes ('=', SP, ']', '\"') become '-'" {
+    // `writeSdName`'s doc comment claims these four bytes are excluded, but
+    // nothing exercised that filter — every other test's SD-ID/param names
+    // are already reserved-byte-free. A reserved byte reaching the wire
+    // unescaped here (unlike param VALUEs, which are backslash-escaped)
+    // would corrupt the `[ID param="v"]` framing itself — e.g. a raw ']'
+    // in an SD-ID closes the element early.
+    const msg = Message{
+        .facility = .user,
+        .severity = .notice,
+        .structured_data = &.{
+            .{ .id = "a=b c]d\"e", .params = &.{.{ .name = "x=y z]w\"v", .value = "ok" }} },
+        },
+    };
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings(
+        "<13>1 - - - - - [a-b-c-d-e x-y-z-w-v=\"ok\"]",
+        try bufPrint(&msg, &buf),
+    );
+}
+
 test "timestamp with a positive UTC offset" {
     const msg = Message{
         .facility = .user,

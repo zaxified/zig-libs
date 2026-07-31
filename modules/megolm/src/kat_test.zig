@@ -308,3 +308,51 @@ test "CannotRatchetBackward (Ratchet primitive) is distinct from MessageIndexToo
     defer in.deinit();
     try testing.expectError(error.MessageIndexTooOld, in.decrypt(testing.allocator, &early));
 }
+
+// ── reject-teeth: the MAC is checked BEFORE CBC decryption is attempted ──
+
+test "decrypt() checks the MAC before touching CBC/PKCS7 (no padding-oracle ordering)" {
+    // cipher.zig's own module doc warns `decryptCbc` "has no way to
+    // distinguish 'genuinely malformed padding' from 'attacker-controlled
+    // bytes decrypted under the wrong key' — the classic CBC padding-oracle
+    // setup" and says the mitigation lives entirely in `session.zig`
+    // checking the MAC first and "never surfac[ing] this function to a
+    // caller directly" on unauthenticated bytes. Nothing before this test
+    // actually drove `decrypt()` with a ciphertext that (a) fails the MAC
+    // and (b) ALSO decrypts to invalid PKCS7 padding, so a version that
+    // swapped the order (CBC-decrypt first, MAC second — still typed,
+    // still fails closed, just fails with the WRONG distinguishing error)
+    // would pass every existing test in this file.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = session_mod.OutboundSession.init(io);
+    defer out.deinit();
+    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    defer in.deinit();
+
+    // "hello megolm" is 12 bytes -> PKCS7-pads to a single 16-byte block —
+    // the exact plaintext cipher.zig's own "decryptCbc rejects a
+    // corrupted-padding ciphertext" test uses, flipped the same way
+    // (`^= 0xFF` on the last ciphertext byte), which that test proves
+    // deterministically yields invalid PKCS7 padding on decrypt.
+    var msg = try out.encrypt(testing.allocator, "hello megolm");
+    defer msg.deinit(testing.allocator);
+    msg.ciphertext[msg.ciphertext.len - 1] ^= 0xFF;
+
+    // Re-sign over the corrupted ciphertext (test-held private key) so the
+    // signature check passes and decrypt() actually reaches the MAC/CBC
+    // stage rather than rejecting at the signature step.
+    const sig_bytes = try msg.signatureBytes(testing.allocator);
+    defer testing.allocator.free(sig_bytes);
+    const sig = try out.signing_key.sign(sig_bytes, null);
+    msg.signature = sig.toBytes();
+
+    // The stale MAC no longer matches the corrupted ciphertext AND (per
+    // cipher.zig's proof above) that same corruption breaks PKCS7 padding.
+    // MAC-first order => error.InvalidMac. A decrypt-first ordering would
+    // surface error.InvalidPadding instead — a real, observable
+    // distinguishing oracle for an attacker probing without the key.
+    try testing.expectError(error.InvalidMac, in.decrypt(testing.allocator, &msg));
+}

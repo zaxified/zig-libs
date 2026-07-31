@@ -842,6 +842,31 @@ test "encrypted secret key: seal + open round-trip, wrong password rejected" {
     try std.testing.expectError(error.PasswordRequired, openSecretKey(gpa, raw, null));
 }
 
+test "openSecretKey rejects an unrecognized sig_alg/chk_alg/kdf_alg tag" {
+    // Three typed rejections, none of which any earlier test ever drove:
+    // `UnsupportedSignatureAlgorithm`/`UnsupportedChecksumAlgorithm`/
+    // `UnsupportedKdf` all guard fields that come straight off the wire
+    // (an attacker- or corruption-controlled key file), so "delete the
+    // check" is a real, silent reachable bug class here, not just
+    // defense-in-depth against this module's own constructors.
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const kp = KeyPair.generate(io);
+    const raw = kp.toRawSecretKeyPlain();
+
+    var bad_sig_alg = raw;
+    bad_sig_alg.sig_alg = .{ 'X', 'X' };
+    try std.testing.expectError(error.UnsupportedSignatureAlgorithm, openSecretKey(gpa, bad_sig_alg, null));
+
+    var bad_chk_alg = raw;
+    bad_chk_alg.chk_alg = .{ 'X', 'X' };
+    try std.testing.expectError(error.UnsupportedChecksumAlgorithm, openSecretKey(gpa, bad_chk_alg, null));
+
+    var bad_kdf_alg = raw;
+    bad_kdf_alg.kdf_alg = .{ 'X', 'X' };
+    try std.testing.expectError(error.UnsupportedKdf, openSecretKey(gpa, bad_kdf_alg, "some password"));
+}
+
 test "parse: truncated / missing-line signature file, missing prefixes" {
     // Empty text still yields one (empty) "line" from the split iterator,
     // so this fails the prefix check, not a missing-line check.

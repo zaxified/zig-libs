@@ -842,6 +842,27 @@ test "error: line too long" {
     try testing.expectEqual(@as(usize, 1), diag.line);
 }
 
+test "line exactly at max_line_len is accepted; one byte more is LineTooLong" {
+    // The existing "line too long" test only exercises `max_line_len + 10`,
+    // well past the boundary — never the boundary itself. Pin both sides of
+    // `line.len > max_line_len`.
+    const gpa = testing.allocator;
+
+    var at_limit: [max_line_len]u8 = undefined;
+    @memset(&at_limit, 'a');
+    @memcpy(at_limit[0..7], "config ");
+    var pkg = try parse(gpa, &at_limit);
+    defer pkg.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), pkg.sections.len);
+
+    var diag: Diagnostics = .{};
+    var over_limit: [max_line_len + 1]u8 = undefined;
+    @memset(&over_limit, 'a');
+    @memcpy(over_limit[0..7], "config ");
+    try testing.expectError(error.LineTooLong, parseDiag(gpa, &over_limit, &diag));
+    try testing.expectEqual(@as(usize, 1), diag.line);
+}
+
 test "error: input too large" {
     const gpa = testing.allocator;
     const bytes = try gpa.alloc(u8, max_input_len + 1);
