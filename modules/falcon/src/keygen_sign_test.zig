@@ -138,3 +138,25 @@ test "randomized keygen -> sign -> verify round trip, fresh key" {
     const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce, &sig_buf);
     try kp.public_key.verify(message, &nonce, sig_buf[0..len]);
 }
+
+test "randomized keygen -> sign -> verify: a tampered message is rejected by PublicKey.verify directly" {
+    // Every reject-path test elsewhere in this module's suite goes through
+    // `openNistSignedMessage` against the ONE fixed NIST KAT public key —
+    // never through `PublicKey.verify` directly on a freshly generated
+    // keypair. A `verify` defect that happened to still reject that one
+    // pinned vector's specific numeric range (by coincidence, or because
+    // `openNistSignedMessage`'s own framing catches it first) would not
+    // be caught by any of them.
+    var prng = std.Random.DefaultPrng.init(0xfa1c05eed);
+    const rng = prng.random();
+    const kp = try falcon.generateKeyPair(rng);
+    const message = "falcon keygen round-trip";
+    var nonce: [falcon.nonce_length]u8 = undefined;
+    var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
+    const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce, &sig_buf);
+
+    try std.testing.expectError(
+        error.SignatureVerificationFailed,
+        kp.public_key.verify("a different message entirely", &nonce, sig_buf[0..len]),
+    );
+}

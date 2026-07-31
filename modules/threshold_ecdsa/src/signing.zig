@@ -798,6 +798,73 @@ test "signWithShares: rejects a subset with fewer than 2 shares or mismatched gr
     try testing.expectError(error.InvalidParameters, signWithShares(allocator, &mixed, "m", random));
 }
 
+/// A `std.Random` that hands back `scripted[i]` (exactly `48` bytes each) for
+/// its first `scripted.len` calls to `.bytes()`, then falls through to
+/// `fallback` for everything after. `signWithShares`'s Phase 1 loop is the
+/// FIRST thing that draws randomness (`randomScalar` = one 48-byte
+/// `.bytes()` call each for `k_i` then `gamma_i`, per party, before
+/// anything else touches `random`) — so scripting exactly `2*t` chunks lets
+/// a test dictate every party's `k_i`/`gamma_i` and leave every later draw
+/// (commit-reveal PoK nonces, MtA/zkproof randomness) genuinely random.
+const RiggedRandom = struct {
+    scripted: []const [48]u8,
+    calls: usize = 0,
+    fallback: std.Random,
+
+    fn fill(ptr: *anyopaque, buf: []u8) void {
+        const self: *RiggedRandom = @ptrCast(@alignCast(ptr));
+        if (self.calls < self.scripted.len and buf.len == 48) {
+            @memcpy(buf, &self.scripted[self.calls]);
+            self.calls += 1;
+        } else {
+            self.fallback.bytes(buf);
+        }
+    }
+
+    fn random(self: *RiggedRandom) std.Random {
+        return .{ .ptr = self, .fillFn = fill };
+    }
+};
+
+/// `Scalar` `s`'s wide-reduction encoding: `randomScalar` reduces a 48-byte
+/// big-endian buffer mod q, so 16 zero bytes followed by `s`'s own 32-byte
+/// encoding reduces right back to `s` (no-op reduction, since `s < q`
+/// already by construction).
+fn wide48(s: Scalar) [48]u8 {
+    var buf = [_]u8{0} ** 48;
+    @memcpy(buf[16..48], &s.toBytes(.big));
+    return buf;
+}
+
+test "signWithShares: gamma_i values that sum to ZERO abort with SigningAborted, not a bad/degenerate signature" {
+    // The exact class this audit's mandate calls out: "the zero scalar ...
+    // on every public entry point." `delta_sum.isZero()` (Phase 4) is
+    // reachable in honest operation only if Sigma gamma_i == 0 — astronomically
+    // unlikely with real random draws, hence untested by every other test in
+    // this file (none of them ever calls `expectError(error.SigningAborted,
+    // ...)`). Rigging `gamma_1 = 1`, `gamma_2 = -1` forces the ALGEBRAIC
+    // IDENTITY `delta = k * gamma = k * 0 = 0` exactly — not approximately —
+    // so this is a reliable trigger, not a probabilistic one.
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x646567656e657261); // "degenera"
+    const setup_random = prng.random();
+
+    const kg = try testKeygen(allocator, setup_random, 2, 2);
+    defer kg.deinit(allocator);
+    const subset = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1] };
+
+    const k1 = Scalar.one.add(Scalar.one); // 2, arbitrary nonzero
+    const k2 = Scalar.one.add(Scalar.one).add(Scalar.one); // 3, arbitrary nonzero
+    const gamma1 = Scalar.one;
+    const gamma2 = Scalar.zero.sub(Scalar.one); // -1 mod q, so gamma1+gamma2 == 0
+
+    const scripted = [_][48]u8{ wide48(k1), wide48(gamma1), wide48(k2), wide48(gamma2) };
+    var rigged = RiggedRandom{ .scripted = &scripted, .fallback = setup_random };
+
+    try testing.expectError(error.SigningAborted, signWithShares(allocator, &subset, "message", rigged.random()));
+}
+
 test "round-message codecs round-trip" {
     var prng = std.Random.DefaultPrng.init(0x636f6465635f7274); // "codec_rt"
     const random = prng.random();

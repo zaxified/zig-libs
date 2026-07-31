@@ -864,6 +864,29 @@ test "verify rejects the identity public key (KeyValidate fires, fail-closed, no
     try std.testing.expect(!(try aggregateVerify(&.{ good_pk, identity_pk }, two_msgs, sig)));
 }
 
+test "fastAggregateVerify rejects a ROGUE-KEY pair (cancels to identity) + the trivial identity signature" {
+    // The complete forgery `keyValidate`'s aggregate-level check exists to
+    // stop, spelled out: TWO individually-valid, non-identity, subgroup-
+    // valid public keys whose SUM is the identity (`pk2 = -pk1`), paired
+    // with the TRIVIAL identity signature. For an identity `PK`, the
+    // verify equation `e(PK, Q) == e(G, sig)` becomes `1_GT ==
+    // e(G, sig)`, which holds iff `sig` is ALSO the identity in G2 — and
+    // the identity has order 1, so `signature_subgroup_check` (order
+    // divides r for every element, including the identity) does not
+    // reject it either. Nothing in the pairing arithmetic itself can
+    // catch this forgery; ONLY `keyValidate`'s explicit check on the
+    // aggregated key stands between an attacker who controls no secret
+    // key at all and a signature that "verifies" for any message.
+    const sk = try keyGen(&([_]u8{0x77} ** 32), "");
+    const pk1 = skToPk(sk);
+    try std.testing.expect(keyValidate(pk1)); // precondition: pk1 alone is fine
+    const pk2: PublicKey = .{ .point = g1.Jacobian.fromAffine(pk1.point).negate().toAffine() };
+    try std.testing.expect(keyValidate(pk2)); // precondition: pk2 alone is fine too
+
+    const identity_sig: Signature = .{ .point = g2.Affine.identity };
+    try std.testing.expect(!(try fastAggregateVerify(&.{ pk1, pk2 }, "any message at all", identity_sig)));
+}
+
 test "verify rejects a non-subgroup G2 signature (signature_subgroup_check fires, fail-closed, no panic)" {
     // Craft an on-curve E'(Fp2) point OUTSIDE the order-r subgroup:
     // `mapToCurveG2` (Part 3's SSWU + 3-isogeny) lands on the curve but

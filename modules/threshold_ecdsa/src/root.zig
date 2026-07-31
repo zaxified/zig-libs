@@ -1550,6 +1550,25 @@ test "Element fromPoint/fromBytes/point round-trip and reject the identity" {
     try testing.expectError(error.InvalidElement, Element.fromPoint(Secp256k1.identityElement));
 }
 
+test "splitSecretKey: a ZERO secret key is rejected (group public key would be the identity)" {
+    // The zero scalar across a public entry point — this audit's mandate,
+    // item 1. `splitSecretKey` never checks `secret_key` itself; a
+    // zero-secret's `commitments[0]` would be `[0]*G = O`, the identity —
+    // exactly what a legitimate dealing must never produce (an all-zero
+    // group secret). NOTHING previously called `splitSecretKey` itself with
+    // a zero secret key, so this path had no regression coverage at this
+    // entry point. Mutation testing during this audit found the rejection
+    // is defense-in-depth two layers deep: std's own `Secp256k1.basePoint
+    // .mul` already refuses a zero scalar (confirmed by bypassing
+    // `Element.fromPoint`'s `rejectIdentity` and observing this test still
+    // pass) — `Element.fromPoint`'s own identity check is a second,
+    // currently-redundant backstop for this specific input, not the sole
+    // guard the surrounding doc comments suggest.
+    const allocator = testing.allocator;
+    const coeffs = [_]Scalar{testScalar(2)};
+    try testing.expectError(error.InvalidElement, splitSecretKey(allocator, Scalar.zero, 2, 3, &coeffs));
+}
+
 test "splitSecretKey (t=2,n=3): any 2 shares Lagrange-reconstruct the secret; X == x*G" {
     const allocator = testing.allocator;
     const secret = testScalar(1);
