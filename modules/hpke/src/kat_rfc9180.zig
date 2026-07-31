@@ -1181,6 +1181,79 @@ test "A.3.2/A.3.3/A.3.4: the same single-shot wrappers over the P-256 KEM (Npk=6
     }
 }
 
+// ── §5.1's REAL random-ephemeral entry points (`setupBaseS`/`setupPskS`/
+// `setupAuthS`/`setupAuthPskS`) ─────────────────────────────────────────
+//
+// Every test above drives ONLY the `*Deterministic` KAT seam — no test
+// anywhere in this module ever calls `setupBaseS`/`setupPskS`/`setupAuthS`/
+// `setupAuthPskS` themselves (grep confirms zero call sites outside their
+// own definitions), even though those four ARE the entry points a real
+// caller uses (they draw the ephemeral from `std.Io` via `Kem.
+// generateKeyPair(io)` instead of taking one as a KAT-injected parameter).
+// There is no RFC vector to check a fresh random ephemeral against, but
+// `std.Io.Threaded` (already used elsewhere in this repo, e.g.
+// `adaptor/src/kat_test.zig`'s `testIo()`) stands up a real event loop
+// cheaply enough to exercise the actual wiring end-to-end: sender and
+// receiver must derive the SAME context (key/base_nonce/exporter_secret)
+// and a message sealed by one must open under the other — for all four
+// modes.
+test "setupBaseS/setupPskS/setupAuthS/setupAuthPskS: real std.Io random-ephemeral path round-trips (no test called these before)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Kem = dhkem.X25519Kem;
+    const Aead = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const info = "hpke setup*S io-path smoke test";
+    const psk = [_]u8{0x42} ** 32;
+    const psk_id = "psk-id";
+
+    const skR = Kem.generateKeyPair(io);
+    const skS = Kem.generateKeyPair(io);
+
+    const Fixture = struct {
+        fn check(setup: schedule.Setup(Kem, Aead, 32), receiver: schedule.Context(Aead, 32)) !void {
+            try testing.expectEqualSlices(u8, &setup.context.key, &receiver.key);
+            try testing.expectEqualSlices(u8, &setup.context.base_nonce, &receiver.base_nonce);
+            try testing.expectEqualSlices(u8, &setup.context.exporter_secret, &receiver.exporter_secret);
+
+            var sender_ctx = setup.context;
+            var receiver_ctx = receiver;
+            const pt = "hpke setup*S/R real io-path round trip";
+            var ct: [pt.len + 16]u8 = undefined;
+            try sender_ctx.seal("aad", pt, &ct);
+            var got_pt: [pt.len]u8 = undefined;
+            try receiver_ctx.open("aad", &ct, &got_pt);
+            try testing.expectEqualSlices(u8, pt, &got_pt);
+        }
+    };
+
+    // base
+    {
+        const setup = try schedule.setupBaseS(Kem, Aead, 32, skR.public_key, io, info);
+        const receiver = try schedule.setupBaseR(Kem, Aead, 32, setup.enc, skR, info);
+        try Fixture.check(setup, receiver);
+    }
+    // psk
+    {
+        const setup = try schedule.setupPskS(Kem, Aead, 32, skR.public_key, io, info, &psk, psk_id);
+        const receiver = try schedule.setupPskR(Kem, Aead, 32, setup.enc, skR, info, &psk, psk_id);
+        try Fixture.check(setup, receiver);
+    }
+    // auth
+    {
+        const setup = try schedule.setupAuthS(Kem, Aead, 32, skR.public_key, skS, io, info);
+        const receiver = try schedule.setupAuthR(Kem, Aead, 32, setup.enc, skR, skS.public_key, info);
+        try Fixture.check(setup, receiver);
+    }
+    // auth_psk
+    {
+        const setup = try schedule.setupAuthPskS(Kem, Aead, 32, skR.public_key, skS, io, info, &psk, psk_id);
+        const receiver = try schedule.setupAuthPskR(Kem, Aead, 32, setup.enc, skR, skS.public_key, info, &psk, psk_id);
+        try Fixture.check(setup, receiver);
+    }
+}
+
 test "RFC 9180 A.1.2/A.1.4's own psk is exactly Nh bytes — the §5.1.2 floor keySchedule enforces accepts the spec's vectors" {
     try testing.expectEqual(@as(usize, 32), a1_psk.psk.len);
     try testing.expectEqual(@as(usize, 32), a1_auth_psk.psk.len);

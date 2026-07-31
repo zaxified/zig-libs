@@ -1141,6 +1141,40 @@ test "raw seam: an unmodelled algorithm round-trips and still rejects tampering"
     try testing.expectError(error.AuthenticationFailed, verify(frame_bytes, .ed2020, verifier));
 }
 
+/// A deliberately careless `RawVerifier` callback: it ignores `tag` entirely
+/// and always says yes. Stands in for an implementer who forgot to check the
+/// tag length themselves and relies on the module's own defense-in-depth.
+fn alwaysTrueRaw(_: *anyopaque, _: []const u8, _: ?[12]u8, _: []const u8) bool {
+    return true;
+}
+
+test "checkTag: a RawVerifier's declared tag_len is enforced even if verifyFn itself is careless" {
+    // `DemoRaw` above always checks length correctly (via `constantTimeEql`),
+    // so it alone could never distinguish `checkTag`'s own `r.tag_len ==
+    // tag.len` guard from redundancy: the guard is what actually matters when
+    // a `RawVerifier` implementation, like this one, does not check length —
+    // without it, a verifier configured for one tag length would accept a
+    // frame carrying a tag of any other length as long as `verifyFn` (here,
+    // unconditionally) says yes.
+    var demo: DemoRaw = .{ .key = &sample_key };
+    const sealer: Sealer = .{ .raw = .{ .ctx = &demo, .tag_len = 20, .sealFn = DemoRaw.compute } };
+
+    var out: [512]u8 = undefined;
+    const frame_bytes = try build(&out, .{ .appid = 7, .apdu = &sample_apdu, .auth = .{ .tag = &.{} } }, sealer);
+
+    // The frame carries a 20-byte tag on the wire. A verifier misconfigured
+    // with tag_len = 32 must be rejected outright — the naive `verifyFn`
+    // would happily say yes to anything, so only the length guard saves this.
+    const mismatched_verifier: Verifier = .{ .raw = .{ .ctx = &demo, .tag_len = 32, .verifyFn = alwaysTrueRaw } };
+    try testing.expectError(error.AuthenticationFailed, verify(frame_bytes, .ed2020, mismatched_verifier));
+
+    // Sanity: the matching tag_len (with the same careless verifyFn) does
+    // "verify" — this test is about the length guard, not about `alwaysTrueRaw`
+    // being a real check.
+    const matched_verifier: Verifier = .{ .raw = .{ .ctx = &demo, .tag_len = 20, .verifyFn = alwaysTrueRaw } };
+    _ = try verify(frame_bytes, .ed2020, matched_verifier);
+}
+
 test "constantTimeEql agrees with mem.eql on every length it special-cases" {
     var a: [64]u8 = undefined;
     for (&a, 0..) |*x, i| x.* = @truncate(i *% 31);

@@ -561,6 +561,47 @@ test "parseReply: multiple rpc-errors are all kept, in order" {
     try testing.expectEqual(@as(?[]const u8, null), r.errors[1].app_tag);
 }
 
+test "ErrorTag.parse: every RFC 6241 Appendix A tag maps to its own enum value" {
+    // Each published error-tag string must round-trip to the enum value of
+    // the SAME name — a copy/paste in the lookup table (e.g. two entries
+    // mapping to the same tag, leaving a third value dead) parses without
+    // error and is otherwise invisible: only `lock-denied`, `data-missing`
+    // and `operation-failed` had dedicated coverage elsewhere in this file,
+    // so a swap among any of the other 17 tags went undetected.
+    const cases = [_]struct { text: []const u8, tag: ErrorTag }{
+        .{ .text = "in-use", .tag = .in_use },
+        .{ .text = "invalid-value", .tag = .invalid_value },
+        .{ .text = "too-big", .tag = .too_big },
+        .{ .text = "missing-attribute", .tag = .missing_attribute },
+        .{ .text = "bad-attribute", .tag = .bad_attribute },
+        .{ .text = "unknown-attribute", .tag = .unknown_attribute },
+        .{ .text = "missing-element", .tag = .missing_element },
+        .{ .text = "bad-element", .tag = .bad_element },
+        .{ .text = "unknown-element", .tag = .unknown_element },
+        .{ .text = "unknown-namespace", .tag = .unknown_namespace },
+        .{ .text = "access-denied", .tag = .access_denied },
+        .{ .text = "lock-denied", .tag = .lock_denied },
+        .{ .text = "resource-denied", .tag = .resource_denied },
+        .{ .text = "rollback-failed", .tag = .rollback_failed },
+        .{ .text = "data-exists", .tag = .data_exists },
+        .{ .text = "data-missing", .tag = .data_missing },
+        .{ .text = "operation-not-supported", .tag = .operation_not_supported },
+        .{ .text = "operation-failed", .tag = .operation_failed },
+        .{ .text = "partial-operation", .tag = .partial_operation },
+        .{ .text = "malformed-message", .tag = .malformed_message },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.tag, ErrorTag.parse(c.text));
+        // And every other case's text must NOT parse to this case's tag —
+        // catches a table entry accidentally mapped to a neighbour's value.
+        for (cases) |other| {
+            if (std.mem.eql(u8, other.text, c.text)) continue;
+            try testing.expect(ErrorTag.parse(other.text) != c.tag);
+        }
+    }
+    try testing.expectEqual(ErrorTag.unknown, ErrorTag.parse("not-a-real-tag"));
+}
+
 test "parseReply: an unmodelled error-tag keeps its text" {
     const gpa = testing.allocator;
     const src =

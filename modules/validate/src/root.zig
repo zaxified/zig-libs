@@ -1753,6 +1753,23 @@ test "pattern: literal / prefix / suffix / charset → string_pattern_mismatch" 
     for (bad.errors) |e| try testing.expectEqualStrings("string_pattern_mismatch", e.code);
 }
 
+test "pattern: charset stops at the FIRST bad byte — one error, not one per bad byte" {
+    // The single-bad-char case above ("c0ffee!") can't distinguish a codec
+    // that breaks on the first violation from one that keeps scanning and
+    // appends once per violating byte — both produce exactly one error when
+    // there is only one bad byte. A string with several bytes outside the
+    // set is the only way to tell them apart.
+    const schema = [_]Rule{
+        .{ .field = "hex", .kind = .string, .pattern = .{ .charset = "0123456789abcdef" } },
+    };
+    var r = try validateJson(testing.allocator,
+        \\{"hex":"c0!ffee!!"}
+    , &schema);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try expectError(&r, "hex", "string_pattern_mismatch");
+}
+
 // ── tests: string formats ───────────────────────────────────────────────────
 
 fn expectFormat(f: Format, valid: []const []const u8, invalid: []const []const u8) !void {
@@ -2244,6 +2261,42 @@ test "limits: malformed JSON still surfaces json_invalid, not a limit code" {
     var r = try validateJsonLimited(testing.allocator, "{\"a\":", &schema, .{ .max_depth = 1 });
     defer r.deinit();
     try expectError(&r, "", "json_invalid");
+}
+
+test "Builder.dedupeFrom: only a matching (path, code) PAIR is a duplicate" {
+    // A second-pass entry that shares only the path (not the code) with a
+    // first-pass entry, or only the code (not the path), is a genuinely
+    // distinct error and must survive. Testing this only through
+    // `parseIntoLimited`'s two real schema passes made it hard to force a
+    // partial-match case on purpose, so this drives `dedupeFrom` directly.
+    var b = Builder.init(testing.allocator);
+    defer b.abort();
+    try b.append("a", "code1", "first-pass entry on a");
+    try b.append("b", "code2", "first-pass entry on b");
+    const first_pass_len = b.list.items.len;
+    try testing.expectEqual(@as(usize, 2), first_pass_len);
+
+    // Second pass: same path as the first entry, but a different code —
+    // NOT a duplicate of it.
+    try b.append("a", "code2", "second-pass entry on a, different code");
+    // Second pass: same code as the second entry, but a different path —
+    // NOT a duplicate of it either.
+    try b.append("c", "code2", "second-pass entry on c, same code as b");
+    // Second pass: an exact (path, code) repeat of the first entry — THIS
+    // one is the real duplicate `dedupeFrom` exists to remove.
+    try b.append("a", "code1", "second-pass exact repeat of the first entry");
+
+    b.dedupeFrom(first_pass_len);
+
+    try testing.expectEqual(@as(usize, 4), b.list.items.len);
+    try testing.expectEqualStrings("a", b.list.items[0].path);
+    try testing.expectEqualStrings("code1", b.list.items[0].code);
+    try testing.expectEqualStrings("b", b.list.items[1].path);
+    try testing.expectEqualStrings("code2", b.list.items[1].code);
+    try testing.expectEqualStrings("a", b.list.items[2].path);
+    try testing.expectEqualStrings("code2", b.list.items[2].code);
+    try testing.expectEqualStrings("c", b.list.items[3].path);
+    try testing.expectEqualStrings("code2", b.list.items[3].code);
 }
 
 test "limits: parseIntoLimited rejects over-limit body before decoding T" {

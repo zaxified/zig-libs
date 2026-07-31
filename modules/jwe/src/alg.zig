@@ -229,6 +229,36 @@ test "GCMKW real round-trip" {
     try std.testing.expectEqualSlices(u8, &cek, got);
 }
 
+test "GCMKW A256 (32-byte KEK): every byte of the KEK is load-bearing, not just the first 16" {
+    // A round-trip test alone (like "GCMKW real round-trip" above) cannot
+    // tell "correctly uses all 32 KEK bytes with AES-256-GCM" apart from "
+    // silently truncates to the first 16 bytes and uses AES-128-GCM" — wrap
+    // and unwrap would apply the SAME (wrong) truncation consistently and
+    // still round-trip. This test discriminates that class directly: two
+    // 32-byte KEKs that agree on the first 16 bytes but differ in the last
+    // 16 MUST wrap the same CEK to a DIFFERENT ciphertext/tag — if they
+    // didn't, only the first half of the KEK would actually be in play.
+    const cek = [_]u8{0x99} ** 32;
+    const iv = [_]u8{0x11} ** 12;
+
+    const kek_a = [_]u8{0x55} ** 16 ++ [_]u8{0xAA} ** 16;
+    const kek_b = [_]u8{0x55} ** 16 ++ [_]u8{0xBB} ** 16;
+
+    var ct_a: [32]u8 = undefined;
+    var tag_a: [16]u8 = undefined;
+    _ = try gcmkwWrap(&kek_a, iv, &cek, &ct_a, &tag_a);
+
+    var ct_b: [32]u8 = undefined;
+    var tag_b: [16]u8 = undefined;
+    _ = try gcmkwWrap(&kek_b, iv, &cek, &ct_b, &tag_b);
+
+    try std.testing.expect(!std.mem.eql(u8, &ct_a, &ct_b) or !std.mem.eql(u8, &tag_a, &tag_b));
+
+    // And each KEK only unwraps its OWN wrap correctly.
+    var recovered: [32]u8 = undefined;
+    try std.testing.expectError(error.UnwrapFailed, gcmkwUnwrap(&kek_b, iv, tag_a, &ct_a, &recovered));
+}
+
 test "GCMKW A192 (24-byte KEK) is a documented std gap" {
     const kek = [_]u8{0x55} ** 24;
     const cek = [_]u8{0x99} ** 32;

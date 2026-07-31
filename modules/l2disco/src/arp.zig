@@ -287,6 +287,17 @@ test "ARP: gratuitous + probe recognition" {
 
     const probe = EthIpv4.request(Mac.parse("a4:5e:60:d4:2b:11").?, .{ 0, 0, 0, 0 }, .{ 10, 0, 0, 7 });
     try testing.expect((try EthIpv4.parse(&probe.encode())).isProbe());
+
+    // A zero sender IP alone is not enough: RFC 5227's probe is specifically
+    // a *request*. A reply carrying an all-zero sender IP is malformed/
+    // unusual, not a probe.
+    const reply_zero_sender = EthIpv4.reply(
+        Mac.parse("a4:5e:60:d4:2b:11").?,
+        .{ 0, 0, 0, 0 },
+        Mac.parse("00:1b:21:3c:9d:f8").?,
+        .{ 10, 0, 0, 7 },
+    );
+    try testing.expect(!(try EthIpv4.parse(&reply_zero_sender.encode())).isProbe());
 }
 
 test "ARP: generic Packet parse + encode round-trip" {

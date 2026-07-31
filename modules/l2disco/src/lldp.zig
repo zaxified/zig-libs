@@ -717,6 +717,50 @@ test "LLDP: unknown optional TLV passes through, never fails parse" {
     try testing.expect(saw_unknown);
 }
 
+test "LLDP: a repeated optional TLV keeps the FIRST occurrence in the typed field" {
+    // The doc comment on `Lldpdu`'s optional fields promises "first
+    // occurrence", but nothing exercised a *second* occurrence of any of
+    // them — a parser that kept overwriting with the last one instead would
+    // decode every KAT/round-trip test above identically (they each carry at
+    // most one of each optional TLV) and only misbehave on a device that
+    // repeats a TLV, which none of those fixtures do.
+    var buf: [256]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.addChassisIdMac(kat_mac);
+    try b.addPortIdIfName("Gi0/1");
+    try b.addTtl(60);
+    try b.addPortDescription("first-desc");
+    try b.addPortDescription("second-desc");
+    try b.addSystemName("first-name");
+    try b.addSystemName("second-name");
+    try b.addSystemDescription("first-sysdesc");
+    try b.addSystemDescription("second-sysdesc");
+    try b.addSystemCapabilities(.{ .bridge = true }, .{});
+    try b.addSystemCapabilities(.{ .router = true }, .{ .router = true });
+    try b.addManagementAddress(.{ .ip = .{ .v4 = .{ 10, 0, 0, 1 } } });
+    try b.addManagementAddress(.{ .ip = .{ .v4 = .{ 10, 0, 0, 2 } } });
+    const bytes = try b.finish();
+
+    const du = try Lldpdu.parse(bytes);
+    try testing.expectEqualStrings("first-desc", du.port_description.?);
+    try testing.expectEqualStrings("first-name", du.system_name.?);
+    try testing.expectEqualStrings("first-sysdesc", du.system_description.?);
+    try testing.expect(du.capabilities.?.capabilities.bridge);
+    try testing.expect(!du.capabilities.?.capabilities.router);
+    var ipbuf: [netaddr.max_ip_text_len]u8 = undefined;
+    try testing.expectEqualStrings("10.0.0.1", netaddr.formatIp(du.management_address.?.ip().?, &ipbuf));
+
+    // Both occurrences are still reachable through the raw/management-address
+    // iterators — "first occurrence wins" is a typed-field convenience, not
+    // data loss.
+    var ma = du.managementAddressIterator();
+    const first = (try ma.next()).?;
+    const second = (try ma.next()).?;
+    try testing.expectEqualStrings("10.0.0.1", netaddr.formatIp(first.ip().?, &ipbuf));
+    try testing.expectEqualStrings("10.0.0.2", netaddr.formatIp(second.ip().?, &ipbuf));
+    try testing.expectEqual(@as(?ManagementAddress, null), try ma.next());
+}
+
 test "LLDP: VLAN name org TLV" {
     const info = [_]u8{ 0x00, 0x0a, 0x04 } ++ "VLAN".*; // vlan 10, name "VLAN"
     const o = try OrgSpecific.parse(&(oui_ieee_8021 ++ [_]u8{3} ++ info));

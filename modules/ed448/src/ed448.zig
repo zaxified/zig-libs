@@ -621,6 +621,20 @@ fn verifyInternal(sig: Signature, ph_message: []const u8, ctx: []const u8, pubke
     const r_point = try Point.fromBytes(sig.r);
     const a_point = try Point.fromBytes(pubkey.bytes);
 
+    // ⚠ UNIVERSAL FORGERY GUARD. `PublicKey.fromBytes` validates nothing (it
+    // is a bare byte wrapper) and `Point.fromBytes` accepts the identity as a
+    // legitimate decode. With `A' = O` the `[k]A'` term vanishes whatever the
+    // message hash `k` is, so `s = 0` and `R = O` collapse BOTH sides of the
+    // cofactored equation to the identity and the signature verifies for
+    // EVERY message. Reject the degenerate points before the equation, where
+    // the equation itself cannot distinguish them.
+    //
+    // Clearing the cofactor first also rejects the small-order points, which
+    // collapse the same way after `clearCofactor()`.
+    // Found by the 1A mutation audit; same class as the `drand` finding.
+    if (a_point.clearCofactor().equivalent(Point.identityElement)) return error.SignatureVerificationFailed;
+    if (r_point.clearCofactor().equivalent(Point.identityElement)) return error.SignatureVerificationFailed;
+
     const k_digest = try shake114(phflag, ctx, &.{ &sig.r, &pubkey.bytes, ph_message });
     const k_scalar = scalar.reduceWide(k_digest);
 
@@ -809,4 +823,42 @@ fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const sig = Signature.fromBytes(buf) catch return;
     _ = sig.toBytes();
+}
+
+test "verify rejects an identity public key (universal forgery)" {
+    // Before the guard in `verifyInternal`, this signature verified for EVERY
+    // message: with A' = O the `[k]A'` term drops out regardless of the hash,
+    // and s = 0 with R = O collapses both sides of the cofactored equation to
+    // the identity. `PublicKey.fromBytes` validates nothing, so a caller can
+    // hand these bytes straight in.
+    const id_bytes = Point.identityElement.toBytes();
+    const pk = PublicKey.fromBytes(id_bytes);
+    const sig: Signature = .{ .r = id_bytes, .s = [_]u8{0} ** 57 };
+
+    for ([_][]const u8{ "", "any message at all", "a completely different one" }) |msg| {
+        try std.testing.expectError(error.SignatureVerificationFailed, verify(sig, msg, "", pk));
+    }
+
+    // A genuine signature must still verify — the guard must not be a blanket
+    // rejection that would make this test pass for the wrong reason.
+    const kp = KeyPair.create([_]u8{7} ** 57);
+    const good = try sign(kp, "hello", "");
+    try verify(good, "hello", "", kp.public_key);
+
+    // ⚠ THE TWO GUARDS ARE NOT INDEPENDENTLY PINNABLE, and that is a fact
+    // about the attack rather than a weakness of this test. The forgery needs
+    // A' = O *and* (s = 0, R = O) together, so either guard alone blocks it —
+    // removing just one is an EQUIVALENT MUTANT with respect to this attack
+    // (measured: disabling either one leaves all 54 tests green). The cases
+    // below keep one operand legitimate, and they are rejected by the
+    // verification equation itself, not by the guards; they are here to prove
+    // the guards did not turn into a blanket reject.
+    try std.testing.expectError(
+        error.SignatureVerificationFailed,
+        verify(good, "hello", "", PublicKey.fromBytes(id_bytes)),
+    );
+    try std.testing.expectError(
+        error.SignatureVerificationFailed,
+        verify(.{ .r = id_bytes, .s = good.s }, "hello", "", kp.public_key),
+    );
 }

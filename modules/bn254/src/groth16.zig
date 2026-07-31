@@ -417,6 +417,47 @@ test "tampered proof: B.x.c0 + 1 (lands off-curve, subgroupCheck rejects) verifi
     try std.testing.expect(!ok);
 }
 
+test "tampered proof: B on-curve but OUTSIDE the r-subgroup verifies FALSE" {
+    // Same on-twist-but-not-in-subgroup G2 point as precompiles.zig's own
+    // "on-twist-but-not-in-subgroup G2 operand is rejected" test (x = u,
+    // c0 = 0, c1 = 1) — on-curve (isOnCurve would accept it) but NOT a
+    // member of the order-r subgroup, independently confirmed there. Before
+    // this test, NO test in this file ever fed verify a proof.b that was
+    // on-curve-but-not-in-subgroup at all (only "off-curve" B was tested).
+    //
+    // NOTE (mutation testing, not overclaiming): mutating this call site's
+    // `subgroupCheck()` to `isOnCurve()` does NOT make this test fail — a
+    // wrong/unrelated B still fails the pairing equation for ordinary
+    // reasons, so this is an equivalent mutant *for a naively substituted
+    // B*. Actually forcing a divergence needs a genuine small-subgroup
+    // malleability construction (add a nontrivial cofactor-order point to a
+    // real proof's B and show the pairing equation still holds without the
+    // subgroup check) — a nontrivial crypto construction, not just a KAT
+    // substitution. Documented as a gap, not closed: see module doc
+    // comment's "Trust boundary" section for why the check is still
+    // required (EIP-197's own precedent), even though this test alone
+    // cannot discriminate its removal.
+    var c1_bytes = [_]u8{0} ** 32;
+    c1_bytes[31] = 1;
+    var y_c0_bytes: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&y_c0_bytes, "0cf32d3c49a2cb8a092f24ec3201e68dc299b6216e6321ee60573e3a7f596ea8");
+    var y_c1_bytes: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&y_c1_bytes, "07bca656753ef8cbee60335acbffe3def91636952d4ab9eb0b839c7f3566c0e2");
+    const bad_b = G2.Affine{
+        .x = .{ .c0 = Fp.zero, .c1 = try Fp.fromBytes(c1_bytes) },
+        .y = .{ .c0 = try Fp.fromBytes(y_c0_bytes), .c1 = try Fp.fromBytes(y_c1_bytes) },
+    };
+    // Sanity, independent of verify: on-curve, but not subgroup (matches
+    // precompiles.zig's own sanity check on the identical point).
+    try std.testing.expect(G2.Jacobian.fromAffine(bad_b).isOnCurve());
+    try std.testing.expect(!G2.Jacobian.fromAffine(bad_b).subgroupCheck());
+
+    var bad = kat_proof();
+    bad.b = bad_b;
+    const ok = try verify(kat_vk(), bad, &kat_public);
+    try std.testing.expect(!ok);
+}
+
 test "tampered public input: pub[0] + 1 verifies FALSE" {
     var bad_public = kat_public;
     bad_public[0] = bad_public[0].add(Fr.one);

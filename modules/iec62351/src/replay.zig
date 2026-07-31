@@ -510,6 +510,19 @@ test "SV: a jump beyond the forward window is refused" {
     try testing.expectEqual(Verdict.accept_in_sequence, g.accept(.{ .smp_cnt = 108 }, t0 + 1));
 }
 
+test "SV: the forward-gap window is closed, not open — exactly max_forward_gap is still in" {
+    // A delta strictly greater than max_forward_gap is refused, but a delta
+    // of EXACTLY max_forward_gap must still be accepted (`>`, not `>=`) — the
+    // gap test above only exercised deltas well inside (8) and well outside
+    // (400) the window, leaving the boundary itself unchecked.
+    var g: SvGuard = .init(.{ .smp_rate = 4000, .max_forward_gap = 10 });
+    _ = g.accept(.{ .smp_cnt = 100 }, t0);
+    try testing.expectEqual(Verdict.accept_in_sequence, g.accept(.{ .smp_cnt = 110 }, t0 + 1)); // delta 10: in
+    var g2: SvGuard = .init(.{ .smp_rate = 4000, .max_forward_gap = 10 });
+    _ = g2.accept(.{ .smp_cnt = 100 }, t0);
+    try testing.expectEqual(Verdict.reject_sample_out_of_window, g2.accept(.{ .smp_cnt = 111 }, t0 + 1)); // delta 11: out
+}
+
 test "SV: configuration revision changes and lost synchronisation are refused" {
     var g: SvGuard = .init(.{ .smp_rate = 4000, .require_synchronised = true });
     try testing.expectEqual(Verdict.reject_not_synchronised, g.accept(.{ .smp_cnt = 0, .smp_synch = 0 }, t0));

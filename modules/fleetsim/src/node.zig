@@ -257,6 +257,14 @@ test "framing: every length rule agrees with a real frame from its protocol" {
     // LEN 5 + 10 user bytes -> 10 + 10 + 2 (one block CRC).
     const link2 = [_]u8{ 0x05, 0x64, 15, 0xC4, 0x01, 0x00, 0x00, 0x04 } ++ [_]u8{0} ** 14;
     try testing.expectEqual(@as(?usize, 22), try Framing.dnp3_link.frameLen(&link2));
+    // LEN 5 + exactly 16 user bytes (one whole 16-byte block, no remainder)
+    // -> 10 + 16 + 2 (still just ONE block CRC, not two). Every other case
+    // in this file uses a user-data length that isn't a multiple of 16, so
+    // this is the only place `(user + 15) / 16` and an off-by-one
+    // `(user + 16) / 16` actually disagree (they agree on every non-multiple
+    // of 16, including the 10-byte case just above).
+    const link3 = [_]u8{ 0x05, 0x64, 16 + 5, 0xC4, 0x01, 0x00, 0x00, 0x04 };
+    try testing.expectEqual(@as(?usize, 10 + 16 + 2), try Framing.dnp3_link.frameLen(&link3));
 
     // IEC 104 STARTDT act.
     const apci = [_]u8{ 0x68, 0x04, 0x07, 0x00, 0x00, 0x00 };

@@ -3700,6 +3700,31 @@ test "elicitation: form mode refuses credential-shaped fields (phishing guard)" 
     try testing.expect(aw.written().len != 0);
 }
 
+test "looksLikeSecretField: every documented needle is individually caught" {
+    // The truth-table test below exercises a hand-picked SAMPLE of the
+    // needles in various separator/case forms, which cannot notice a needle
+    // silently dropped from (or mistyped in) `secret_needles` — every needle
+    // is matched by the exact same substring-search loop, so a missing one
+    // is invisible unless something asks about that specific word. This list
+    // is independent of `secret_needles` (not derived from it — iterating
+    // the mutated array over itself would trivially "pass" no matter what
+    // got deleted) and must be kept in sync with it by hand.
+    const expected_needles = [_][]const u8{
+        "password",   "passwd",       "passphrase",   "secret",
+        "credential", "apikey",       "accesskey",    "secretkey",
+        "privatekey", "accesstoken",  "refreshtoken", "bearertoken",
+        "authtoken",  "sessiontoken", "idtoken",      "securitycode",
+        "pincode",    "seedphrase",   "mnemonic",     "cardnumber",
+        "creditcard", "cvv",          "cvc",
+    };
+    for (expected_needles) |needle| {
+        testing.expect(looksLikeSecretField(needle)) catch {
+            std.debug.print("expected needle not recognized: {s}\n", .{needle});
+            return error.TestUnexpectedResult;
+        };
+    }
+}
+
 test "looksLikeSecretField: separator/case forms and the words it does NOT claim" {
     for ([_][]const u8{
         "password", "Password",      "passwd",      "pass_phrase",   "user-password",
@@ -3736,6 +3761,12 @@ test "elicitation: url mode rejects non-navigable schemes and empty ids" {
         "data:text/html,<script>x</script>",
         "file:///etc/passwd",
         "http://evil.example/steal", // plain http to a non-loopback host
+        // Host-confusion: a prefix match on "localhost"/"127.0.0.1" alone
+        // would accept these — the loopback host name must end exactly at
+        // '/', ':', '?' or the URL's end, not run on into a real hostname.
+        "http://localhost.evil.example/steal",
+        "http://127.0.0.1.evil.example/steal",
+        "http://localhostage.example/steal",
         "https://",
         "",
     };

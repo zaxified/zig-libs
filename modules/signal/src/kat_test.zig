@@ -141,6 +141,44 @@ test "X3DH: a DIFFERENT bob_ik makes the agreement disagree (sanity check the te
     try std.testing.expect(!std.mem.eql(u8, &alice_out.agreement.shared_secret, &wrong_agreement.shared_secret));
 }
 
+test "X3DH: a low-order (identity-inducing) bob signed-prekey makes initiateUnverified fail closed" {
+    // No test before this one ever fed a degenerate (low-order) X25519
+    // public key into the x3dh layer end-to-end — `dh()`'s `catch
+    // error.KeyAgreementFailed` (x3dh.zig) relies entirely on
+    // `std.crypto.dh.X25519.scalarmult`'s own RFC 7748 §6.1 all-zero
+    // -output rejection, untested at THIS integration point. Mutation
+    // testing confirms the gap: swallowing that error (substituting an
+    // all-zero DH output instead of propagating the failure) leaves every
+    // existing test green. The all-zero public key is the canonical
+    // low-order X25519 input — scalarmult on it always lands on the
+    // identity, which must surface as error.KeyAgreementFailed here, not a
+    // predictable all-zero contribution to the shared secret.
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const alice_ik = X25519.KeyPair.generate(io);
+    const bob_ik = X25519.KeyPair.generate(io);
+    const low_order_pub = [_]u8{0} ** 32;
+
+    const bob_spk = x3dh.SignedPreKey{
+        .key_pair = .{ .secret_key = X25519.KeyPair.generate(io).secret_key, .public_key = low_order_pub },
+        .signature = dummySignature(),
+        .id = 1,
+    };
+    const bundle = x3dh.PreKeyBundle{
+        .identity_key = bob_ik.public_key,
+        .signed_prekey = low_order_pub,
+        .signed_prekey_id = bob_spk.id,
+        .signed_prekey_signature = bob_spk.signature,
+    };
+
+    try std.testing.expectError(
+        error.KeyAgreementFailed,
+        x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "msg", io),
+    );
+}
+
 test "codec: PreKeyBundle round-trips through toBytes/fromBytes, WITH an OPK" {
     var threaded = testIo();
     defer threaded.deinit();

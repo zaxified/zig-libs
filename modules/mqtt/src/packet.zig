@@ -853,6 +853,26 @@ test "CONNECT: validation" {
     @memcpy(bad[0..ok.len], ok);
     bad[9] |= 0x01; // reserved connect flag set
     try testing.expectError(error.MalformedPacket, decode(bad[0..ok.len]));
+
+    // Password flag set without the username flag (spec 3.1.2-22). The
+    // encoder can never produce this combination (it rejects it earlier, at
+    // `encodeConnect` — see `PasswordWithoutUsername` above), so the decode
+    // guard is only reachable from a hand-crafted wire frame. The frame below
+    // is otherwise fully well-formed — a valid client id and a valid,
+    // correctly-length-prefixed password with nothing left over — so a
+    // missing/inverted guard would decode it successfully instead of
+    // rejecting it; the failure can't come from anything else running out of
+    // bytes.
+    const password_without_username = [_]u8{
+        0x10, 16, // CONNECT, remaining length 16
+        0x00, 0x04, 'M', 'Q', 'T', 'T', // protocol name
+        0x04, // protocol level 4
+        0x40, // flags: password flag only (username flag clear)
+        0x00, 0x00, // keep-alive 0
+        0x00, 0x01, 'x', // client id "x"
+        0x00, 0x01, 'p', // password "p"
+    };
+    try testing.expectError(error.MalformedPacket, decode(&password_without_username));
 }
 
 test "CONNACK: decode golden bytes and all return codes" {

@@ -235,6 +235,34 @@ test "recoverPubkey: a bit-flipped signature recovers a DIFFERENT (or non-recove
     } else |_| {} // also acceptable: recovery can fail outright
 }
 
+test "recoverPubkey: r=0 and s=0 are rejected (error.InvalidScalar), not silently recovered" {
+    // Neither zero-r nor zero-s had ever been fed to recoverPubkey by any
+    // test before this one (grep-confirmed). Mutation testing shows they
+    // are NOT equally defended: disabling `r_scalar.isZero()` alone still
+    // fails closed by accident (`r`'s null coefficient forces `r_inv = 0`
+    // — std's documented `invert(0) == 0` — which zeroes BOTH scalar-mult
+    // coefficients, hitting the already-checked identity path with
+    // `error.IdentityElement` instead of `error.InvalidScalar`: same
+    // fail-closed *outcome*, different declared reason). Disabling
+    // `s_scalar.isZero()` alone is a REAL divergence: `s=0` makes the `R`
+    // coefficient zero but leaves the `G` coefficient (`-e·r⁻¹`, from the
+    // hash and `r` alone) nonzero in general, so `recoverPubkey` would
+    // return a "recovered" point derived ONLY from the hash and `r` —
+    // completely ignoring `s`/`R` — instead of failing. This test pins the
+    // real contract: both must error, explicitly.
+    var privkey: [32]u8 = undefined;
+    @memset(&privkey, 0);
+    privkey[31] = 0x42;
+    var hash: [32]u8 = undefined;
+    @memset(&hash, 0);
+    hash[31] = 0x99;
+    const sig = try sign(privkey, hash);
+
+    const zero = [_]u8{0} ** 32;
+    try testing.expectError(error.InvalidScalar, recoverPubkey(hash, zero, sig.s, sig.recid));
+    try testing.expectError(error.InvalidScalar, recoverPubkey(hash, sig.r, zero, sig.recid));
+}
+
 test "isLowS: half-order boundary" {
     var half: [32]u8 = undefined;
     std.mem.writeInt(u256, &half, scalarmod.field_order >> 1, .big);

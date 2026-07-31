@@ -588,6 +588,44 @@ test "dialect switch is only legal at a message boundary" {
     try testing.expectEqualStrings("<rpc>]]>]]>", m);
 }
 
+test "chunked: a stray LF from a `]]>]]>\\n`-terminated hello is tolerated, not a header error" {
+    // A peer that printed its <hello> delimiter on its own line (as RFC 6242's
+    // examples do) leaves one extra LF in front of the first chunk header once
+    // the session switches to .chunked. Without the tolerance this LF would
+    // make the header parser see "\n\n#4\n..." and reject it as
+    // ExpectedChunkHeader (ordinary bytes, not a header, at the front of the
+    // stream); with it the stray LF is skipped and the message decodes
+    // normally.
+    const gpa = testing.allocator;
+
+    // Whole-read.
+    {
+        var f: Framer = .init(gpa, .chunked, .{});
+        defer f.deinit();
+        try f.feed("\n\n#4\n<rpc\n##\n");
+        const m = (try f.next()).?;
+        try testing.expectEqualStrings("<rpc", m);
+    }
+    // Byte-at-a-time must agree.
+    {
+        var msgs = try collectByteAtATime(gpa, .chunked, "\n\n#4\n<rpc\n##\n");
+        defer freeAll(gpa, &msgs);
+        try testing.expectEqual(@as(usize, 1), msgs.items.len);
+        try testing.expectEqualStrings("<rpc", msgs.items[0]);
+    }
+    // The tolerance only fires before any chunk of the message has been
+    // decoded: a stray "\n\n" *between* chunks of the same message is
+    // ordinary data flowing into the next chunk header check, not something
+    // to be silently skipped, so it is rejected exactly like any other
+    // malformed header.
+    {
+        var f: Framer = .init(gpa, .chunked, .{});
+        defer f.deinit();
+        try f.feed("\n#4\n<rpc" ++ "\n\n#5\n");
+        try testing.expectError(error.ExpectedChunkHeader, f.next());
+    }
+}
+
 test "writeMessage: eom refuses a payload containing the delimiter" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);

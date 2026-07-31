@@ -1011,6 +1011,72 @@ test "faults: one-shot drop / dup / delay behave exactly once" {
     try testing.expectEqual(@as(usize, 1), fleet.outbound().len);
 }
 
+test "faults: an explicit delay_next pre-empts the random reorder check, not both" {
+    // `submit`'s inbound path checks delay_next first and only falls back to
+    // the random reorder roll `else if` it did not fire — an explicit
+    // scheduled delay is what "this frame is delayed" already means, so a
+    // reorder roll on top would double-count the same event. Set
+    // reorder_permille so high (1000 == always) that a version which checks
+    // both independently (dropping the "else") stacks reorder_extra_ms on
+    // top of delay_next's extra_ms; the exact `.delivered` timestamp is the
+    // only way to tell the two apart, since either way *something* is
+    // delayed.
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node(), .link = .{
+        .reorder_permille = 1000,
+        .reorder_extra_ms = 500,
+    } });
+    try fleet.addFault(.{ .at_ms = 0, .node = id, .kind = .{ .delay_next = .{ .count = 1, .extra_ms = 7 } } });
+    _ = try fleet.advance(1);
+
+    try fleet.submit(id, "x", 1);
+    _ = try fleet.advance(8); // 1 (submit time) + 7 (delay_next only)
+
+    var buf: [16]TraceEntry = undefined;
+    const trace = fleet.traceInto(&buf);
+    var delivered_at: ?Time = null;
+    for (trace) |e| {
+        if (e.kind == .delivered) delivered_at = e.time;
+    }
+    try testing.expectEqual(@as(?Time, 8), delivered_at);
+}
+
+test "faults: an explicit dup_next pre-empts the random dup roll, not both" {
+    // Same shape as the delay_next case above, for the dup_next/dup_permille
+    // pair. `link.dup_permille` governs BOTH directions independently (the
+    // echoed reply gets its own roll going back out), and `stats.duplicated`
+    // is shared by both, so neither is a clean signal here. `.duplicated_in`
+    // trace entries are recorded only on the inbound path this check lives
+    // in: exactly one submitted frame duplicated via `dup_next` alone must
+    // produce exactly one such entry. A version that checks `dup_next` and
+    // the guaranteed (permille = 1000) random roll independently (dropping
+    // the "else") would record it twice — once per branch — even though the
+    // frame is still only duplicated into 2 copies either way (`copies = 2`
+    // is idempotent), which is why `.delivered`/`outbound()` counts alone
+    // can't tell the two apart.
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node(), .link = .{ .dup_permille = 1000 } });
+    try fleet.addFault(.{ .at_ms = 0, .node = id, .kind = .{ .dup_next = .{ .count = 1 } } });
+    _ = try fleet.advance(1);
+
+    try fleet.submit(id, "x", 1);
+    _ = try fleet.advance(10);
+
+    try testing.expectEqual(@as(u64, 2), fleet.stats(id).delivered); // really duplicated
+
+    var buf: [16]TraceEntry = undefined;
+    const trace = fleet.traceInto(&buf);
+    var duplicated_in_count: usize = 0;
+    for (trace) |e| {
+        if (e.kind == .duplicated_in) duplicated_in_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), duplicated_in_count);
+}
+
 test "faults: trouble is reported unsupported when the protocol has no word for it" {
     const Mute = struct {
         fn deliverFn(_: *anyopaque, _: []const u8, _: []u8, _: Time) node_mod.NodeError!?[]const u8 {

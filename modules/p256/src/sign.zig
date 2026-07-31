@@ -137,6 +137,34 @@ test "ecdsa sign→verify round-trip (fixed key + nonce)" {
     try std.testing.expect(!ecdsaVerify(&pk, msg, bad));
 }
 
+test "ecdsaVerify: r=0 and s=0 are rejected explicitly (never fed to any test before)" {
+    // No existing test had ever called ecdsaVerify with a zero r or s.
+    // Mutation testing (disable the `r.isZero() or s.isZero()` guard)
+    // shows this module's downstream math happens to fail closed anyway
+    // for BOTH cases against a real signature — s=0 forces sinv=0 (std's
+    // documented invert(0)==0), zeroing both mulDoubleBasePublic
+    // coefficients and hitting the already-checked identity rejection;
+    // r=0 zeroes only the Q-coefficient, leaving u1v*G's x-coordinate
+    // essentially never equal to r=0 by chance — so this guard is an
+    // explicit, defense-in-depth check of a documented invariant (RFC
+    // 6979-adjacent "r, s in [1, n-1]") rather than the only thing
+    // standing between here and a forgery. Pinned directly regardless,
+    // matching this module's own sign-side r=0/s=0 rejection tests.
+    const sk = [_]u8{0x11} ** 32;
+    const k = [_]u8{0x22} ** 32;
+    const msg = "p256 zero r/s smoke";
+    const sig = try ecdsaSign(sk, msg, k);
+    const pk = (P256.combMulBase(sk, .big) catch unreachable).toUncompressedSec1();
+
+    var zero_r = sig;
+    @memset(zero_r[0..32], 0);
+    try std.testing.expect(!ecdsaVerify(&pk, msg, zero_r));
+
+    var zero_s = sig;
+    @memset(zero_s[32..64], 0);
+    try std.testing.expect(!ecdsaVerify(&pk, msg, zero_s));
+}
+
 // The std-compatible `EcdsaP256Sha256` must interoperate byte-for-byte with
 // `std.crypto.sign.ecdsa.EcdsaP256Sha256`: same keypair from the same seed,
 // each side's signature verifies under the other. This pins the drop-in the

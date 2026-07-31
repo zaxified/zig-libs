@@ -476,6 +476,37 @@ test "DHCP KAT: parse DISCOVER" {
     try testing.expect(m.lease_time_s == null);
 }
 
+test "DHCP: clientMac requires BOTH Ethernet htype and hlen 6" {
+    var buf: [300]u8 = undefined;
+    // Non-Ethernet hardware type (e.g. IEEE 802 Token Ring = 6), hlen still 6:
+    // the address bytes look plausible but this is not an Ethernet MAC.
+    {
+        var b = try Builder.init(&buf, .{
+            .op = .boot_request,
+            .xid = 1,
+            .htype = 6,
+            .hlen = 6,
+            .chaddr = Builder.chaddrFromMac(kat_mac),
+        });
+        const bytes = try b.finish(.{});
+        const m = try Message.parse(bytes);
+        try testing.expectEqual(@as(?Mac, null), m.clientMac());
+    }
+    // Ethernet htype but a non-6 hlen: also not a usable MAC.
+    {
+        var b = try Builder.init(&buf, .{
+            .op = .boot_request,
+            .xid = 1,
+            .htype = 1,
+            .hlen = 4,
+            .chaddr = Builder.chaddrFromMac(kat_mac),
+        });
+        const bytes = try b.finish(.{});
+        const m = try Message.parse(bytes);
+        try testing.expectEqual(@as(?Mac, null), m.clientMac());
+    }
+}
+
 test "DHCP KAT: parse ACK" {
     const m = try Message.parse(&kat_ack);
     try testing.expectEqual(Op.boot_reply, m.op);
