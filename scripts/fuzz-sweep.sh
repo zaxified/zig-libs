@@ -75,6 +75,18 @@ for m in "${MODS[@]}"; do
         esac
     fi
 
+    # ⭐ PRESERVE THE CRASHING INPUT, not just the trace. The Zig fuzzer writes
+    # it to .zig-cache/f/crash, and the NEXT module's run overwrites it — so a
+    # sweep that kept only the log left a finding that could not be reproduced
+    # except by fuzzing until it happened again. Worse, the traces are built in
+    # ReleaseSafe and their line attribution is inlined-away: `json5`'s pointed
+    # at a guarded expression and at a COMMENT line, so the input is the only
+    # reliable evidence of what actually failed.
+    if [[ "$verdict" == "FINDING" && -f .zig-cache/f/crash ]]; then
+        cp .zig-cache/f/crash "$OUT/$m.crash-input"
+        echo "  saved crashing input -> $OUT/$m.crash-input"
+    fi
+
     printf '%s\t%s\t%s\t%s\n' "$m" "$rc" "$dur" "$verdict" >> "$OUT/summary.tsv"
     if [[ "$verdict" != "clean" ]]; then
         {

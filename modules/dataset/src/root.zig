@@ -372,11 +372,29 @@ const Cursor = struct {
     fn byte(self: *Cursor) DeserializeError!u8 {
         return (try self.take(1))[0];
     }
+    fn remaining(self: *const Cursor) usize {
+        return self.bytes.len - self.pos;
+    }
 };
+
+/// Fewest bytes a single column's header can occupy: a 4-byte name length, a
+/// zero-length name, and a 1-byte type tag.
+const min_encoded_column_bytes = 5;
 
 pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dataset {
     var cur = Cursor{ .bytes = bytes };
     const ncol = try cur.u32v();
+    // ⚠ `ncol` is an attacker-supplied u32 and the next statement hands it
+    // straight to an allocator. Unbounded, a 12-byte input can claim 4.29e9
+    // columns and reserve ~100 GB — observed as a 32 GB `total-vm` OOM kill
+    // during the first real fuzz sweep, which is how this was found.
+    //
+    // The bound is not an arbitrary cap but a consequence of the encoding:
+    // every column costs at least `min_encoded_column_bytes`, so a claim
+    // larger than the remaining input can supply is provably a lie and can be
+    // rejected before a single byte is allocated. Same shape as the `raft`,
+    // `df-elect` and `threshold_ecdsa` findings.
+    if (ncol > cur.remaining() / min_encoded_column_bytes) return DeserializeError.Corrupt;
     const cols = try a.alloc(Column, ncol);
     for (cols) |*col| {
         const nlen = try cur.u32v();
@@ -386,6 +404,14 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
         col.type = @enumFromInt(tb);
     }
     const nrow = try cur.u32v();
+    // Same rule for rows, and it multiplies: each row allocates `ncol` values,
+    // so an unchecked `nrow` scales an already-large per-row cost. Every value
+    // costs at least its 1-byte type tag, so a row costs at least `ncol`
+    // bytes. `@max(1, ...)` covers the degenerate zero-column case, where a
+    // row encodes to nothing at all and the count would otherwise stay
+    // unbounded — such rows carry no data, so bounding them by the input
+    // length loses nothing.
+    if (nrow > cur.remaining() / @max(1, ncol)) return DeserializeError.Corrupt;
     const rows = try a.alloc([]const Value, nrow);
     for (rows) |*row| {
         const r = try a.alloc(Value, ncol);
@@ -844,6 +870,39 @@ test "Builder: incremental row-at-a-time construction" {
 // documented ownership model — `Dataset` has no per-field free) so a
 // successful decode is cleaned up in one shot regardless of how many
 // strings it allocated.
+
+test "deserialize: a wire-supplied count larger than the input can supply is rejected before allocating" {
+    // The regression for the OOM found by the first real fuzz sweep. Twelve
+    // bytes claiming 4.29e9 columns used to reach `alloc` and reserve tens of
+    // GB; the process died to the cgroup's OOM killer rather than returning an
+    // error. Both counts get their own case, because the row bound multiplies
+    // by `ncol` and could plausibly be fixed for one and not the other.
+    // Every case runs on an arena: this module's memory model is that a
+    // failed `deserialize` does NOT unwind its partial allocations, because
+    // callers own an arena for the whole pipeline. Handing it
+    // `testing.allocator` reports a leak that is really the contract working.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ncol = 0xFFFFFFFF, nothing else. Nowhere near 5 bytes per column left.
+    const huge_ncol = "\xff\xff\xff\xff";
+    try testing.expectError(DeserializeError.Corrupt, deserialize(a, huge_ncol));
+
+    // One real column, then nrow = 0xFFFFFFFF with no row bytes behind it.
+    const huge_nrow = "\x01\x00\x00\x00" ++ // ncol = 1
+        "\x00\x00\x00\x00" ++ // name length 0
+        "\x01" ++ // type tag
+        "\xff\xff\xff\xff"; // nrow = 4294967295
+    try testing.expectError(DeserializeError.Corrupt, deserialize(a, huge_nrow));
+
+    // And the bound must not reject a legitimate document: a truncated-but-
+    // plausible claim still has to fail on the DATA, not on the count, so the
+    // check cannot simply be "reject anything large".
+    const built = try deserialize(a, huge_nrow[0..9] ++ "\x00\x00\x00\x00");
+    try testing.expectEqual(@as(usize, 1), built.columns.len);
+    try testing.expectEqual(@as(usize, 0), built.rows.len);
+}
 
 test "fuzz: deserialize never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzDeserialize, .{});
