@@ -15,12 +15,18 @@
 //! writes `{n}` and then **waits for the server's `+` continuation** before
 //! sending the bytes.
 //!
-//! That wait is a session concern, not an encoder one, so this encoder never
-//! performs it. When a value needs a synchronising literal and the connection
-//! has no capability that would avoid one, it returns
-//! `error.SyncLiteralRequired` and the session layer drives the exchange. With
-//! `LITERAL+` (any size) or `LITERAL-` (up to 4096) the encoder emits `{n+}`
-//! and no wait is needed.
+//! The encoder cannot do that wait itself — it holds no reader. So it takes a
+//! **seam**: `Options.on_sync`, a callback the session installs, which the
+//! encoder invokes after writing `{n}` and before writing the payload. With
+//! `LITERAL+` (any size) or `LITERAL-` (up to 4096) no wait is needed and the
+//! encoder emits `{n+}` directly. With neither, and no callback installed, it
+//! returns `error.SyncLiteralRequired` rather than emitting something the
+//! server will misread.
+//!
+//! The seam exists because it was originally missing: the handshake was wired
+//! into `LOGIN` alone, so a `SEARCH BODY "a\r\nb"` — perfectly legal, and
+//! literal-only — failed against a real server. One callback covers every
+//! command instead of one command.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -29,8 +35,14 @@ const testing = std.testing;
 const utf7 = @import("utf7.zig");
 const wire = @import("wire.zig");
 
+/// Run the synchronising-literal wait: the caller reads until the server's
+/// `+` continuation. Installed by the session; see the module note.
+pub const SyncFn = *const fn (ctx: ?*anyopaque) anyerror!void;
+
 pub const Error = error{
     WriteFailed,
+    /// The `on_sync` callback failed. The session keeps the underlying error.
+    SyncFailed,
     /// The value can only be sent as a synchronising literal, which the
     /// session must drive. See the note above.
     SyncLiteralRequired,
@@ -48,6 +60,9 @@ pub const Options = struct {
     literal_minus: bool = false,
     /// `LITERAL+`: non-synchronising literals of any size.
     literal_plus: bool = false,
+    /// Drives the continuation wait when a synchronising literal is needed.
+    on_sync: ?SyncFn = null,
+    sync_ctx: ?*anyopaque = null,
 };
 
 /// The largest string servers must accept in quoted form, and `LITERAL-`'s
@@ -135,15 +150,29 @@ pub const Encoder = struct {
         return e.literal(s);
     }
 
-    /// A literal. Only emits the non-synchronising form; see the module note.
+    /// A literal, in whichever form the connection allows.
     pub fn literal(e: *Encoder, s: []const u8) Error!void {
         const non_sync = e.opts.literal_plus or
             (e.opts.literal_minus and s.len <= max_quoted);
-        if (!non_sync) return error.SyncLiteralRequired;
 
+        if (non_sync) {
+            try e.raw("{");
+            try e.number(@intCast(s.len));
+            try e.raw("+}\r\n");
+            try e.raw(s);
+            return;
+        }
+
+        const wait = e.opts.on_sync orelse return error.SyncLiteralRequired;
+
+        // `{n}` CRLF, flush, wait for the server's `+`, then the payload. The
+        // flush matters: the server cannot answer a request still sitting in
+        // our buffer.
         try e.raw("{");
         try e.number(@intCast(s.len));
-        try e.raw("+}\r\n");
+        try e.raw("}\r\n");
+        e.w.flush() catch return error.WriteFailed;
+        wait(e.opts.sync_ctx) catch return error.SyncFailed;
         try e.raw(s);
     }
 

@@ -40,9 +40,13 @@ pub const response = @import("response.zig");
 /// Commands (RFC 9051 §6), encode side.
 pub const command = @import("command.zig");
 
-/// The client session (RFC 9051 §3): state, tag matching, literal handshake.
+/// `FETCH` (RFC 9051 §6.4.5, §7.5.2): envelopes, body structures, sections.
 pub const fetch = @import("fetch.zig");
+
+/// `SEARCH` (RFC 9051 §6.4.4), both reply shapes.
 pub const search = @import("search.zig");
+
+/// The client session (RFC 9051 §3): state, tag matching, literal handshake.
 pub const client = @import("client.zig");
 pub const Client = client.Client;
 
@@ -57,6 +61,8 @@ test {
     _ = fetch;
     _ = search;
     _ = client;
+    // LIVE interop; skips loudly when the peer is not installed.
+    _ = @import("live_test.zig");
 }
 
 test "meta is well-formed" {

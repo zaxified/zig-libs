@@ -8,10 +8,22 @@ or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 the command encoder, the session, and — from part 2 — `FETCH` with `ENVELOPE`
 and `BODYSTRUCTURE`, `SEARCH` in both reply shapes, and `IDLE`.
 
-**Not yet anchored against a live server.** Every transcript in the tests is
-copied from RFC 9051, which pins the parsing; the *sequencing* is checked only
-against a scripted peer of our own, so it is self-anchored and says so. A real
-peer is the next thing this module owes.
+**Anchored against a live server.** Alongside the RFC transcripts (which pin
+the *parsing*), a LIVE test drives the client against **pymap** — an
+independent IMAP server: different author, different language, no shared code
+with the go-imap this module was ported from. That independence is the point;
+go-imap ships its own server, but there client and server share one wire layer,
+so a shared misreading of the grammar would be invisible to both.
+
+```
+python3 -m venv ~/.cache/zig-libs-imap
+~/.cache/zig-libs-imap/bin/pip install pymap
+```
+
+The test starts the server itself on a high port, runs greet -> login ->
+select -> fetch -> search -> idle -> logout, and **skips loudly** when pymap is
+not installed (`scripts/test.sh` prints the install line). It never touches a
+service it did not start.
 
 **Provenance:** a PORT of [`emersion/go-imap`](https://github.com/emersion/go-imap)
 v2 (MIT), chosen over `rust-imap` and Python `imapclient` on the transport
@@ -206,6 +218,19 @@ this client runs no timer because it owns no thread.
 
 FETCH and SEARCH results are allocated from an allocator **you** pass, not the
 session's per-line arena, because they span many response lines.
+
+## What the live peer found
+
+The offline suite was 107 tests green. The first run against a real server
+failed — and the cause was a design gap no scripted peer would have shown: the
+synchronising-literal handshake had been wired into `LOGIN` **only**. A
+perfectly legal `SEARCH BODY "a\r\nb"`, which can travel no other way, came
+back as `error.SyncLiteralRequired` instead of doing the handshake.
+
+The fix moved the wait behind a seam in the encoder (`Options.on_sync`) that
+the session installs, so every command gets it rather than one. Arming happens
+in each command entry rather than in the caller: a forgotten call would
+silently lose the handshake, which is the bug the seam exists to prevent.
 
 ## Tests
 

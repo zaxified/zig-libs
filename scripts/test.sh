@@ -392,6 +392,12 @@ capability_check() {
         gaps+=("python lacks asyncua/cryptography|1 opcua live asyncua-interop test skips|python3 -m venv ~/.cache/zig-libs-opcua && ~/.cache/zig-libs-opcua/bin/pip -q install asyncua cryptography && echo 'export OPCUA_PYTHON=~/.cache/zig-libs-opcua/bin/python3' >> ~/.bashrc")
     fi
 
+    # imap's live interop drives a real IMAP server (pymap -- an INDEPENDENT
+    # implementation, not the one imap was ported from, which is the point).
+    if [[ ! -x "${IMAP_PYMAP:-$HOME/.cache/zig-libs-imap/bin/pymap}" ]]; then
+        gaps+=("no pymap IMAP server|1 imap live interop test skips (the only test that proves the client's SEQUENCING, not just its parsing)|python3 -m venv ~/.cache/zig-libs-imap && ~/.cache/zig-libs-imap/bin/pip -q install pymap")
+    fi
+
     # Always present: RTM_NEWACTION checks CAP_NET_ADMIN in the INITIAL user
     # namespace, so `unshare -rn` cannot grant it however userns is configured.
     #

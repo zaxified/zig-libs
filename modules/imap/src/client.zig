@@ -108,6 +108,9 @@ pub const Client = struct {
     mailbox: Mailbox = .{},
     /// Non-null while an IDLE is running; owns the tag.
     idle_tag: ?[]u8 = null,
+    /// The real error behind `command.Error.SyncFailed`, which cannot travel
+    /// through the encoder's callback signature.
+    sync_err: ?Error = null,
 
     pub fn init(
         gpa: Allocator,
@@ -120,6 +123,7 @@ pub const Client = struct {
             .arena = std.heap.ArenaAllocator.init(gpa),
             .rd = response.Reader.init(undefined, r, opts.wire),
             .enc = command.Encoder.init(gpa, w, .{}),
+            .sync_err = null,
             .opts = opts,
         };
     }
@@ -160,6 +164,33 @@ pub const Client = struct {
 
     // ── reading ─────────────────────────────────────────────────────────────
 
+    /// Install the encoder's continuation seam. `init` cannot do it — it does
+    /// not know the final address of the value it returns — and leaving it to
+    /// the caller means a forgotten call silently loses the handshake, which
+    /// is the bug this seam exists to fix. So every command arms it, and
+    /// arming is idempotent.
+    fn arm(c: *Client) void {
+        c.enc.opts.on_sync = syncThunk;
+        c.enc.opts.sync_ctx = c;
+    }
+
+    fn syncThunk(ctx: ?*anyopaque) anyerror!void {
+        const c: *Client = @ptrCast(@alignCast(ctx.?));
+        c.awaitContinuation() catch |e| {
+            c.sync_err = e;
+            return error.ContinuationFailed;
+        };
+    }
+
+    /// Translate the encoder's opaque `SyncFailed` back into what actually
+    /// went wrong while waiting.
+    fn unmask(c: *Client, e: Error) Error {
+        if (e != error.SyncFailed) return e;
+        const real = c.sync_err orelse return e;
+        c.sync_err = null;
+        return real;
+    }
+
     /// Read one response line into the arena, which is reset first — so the
     /// returned value is valid only until the next call.
     fn readLine(c: *Client) Error!response.Response {
@@ -172,6 +203,7 @@ pub const Client = struct {
     /// already authenticated (a pre-authenticated transport, e.g. a local
     /// socket), `BYE` means the server refused it outright.
     pub fn greet(c: *Client) Error!Completion {
+        c.arm();
         const resp = try c.readLine();
         const st = switch (resp) {
             .data => |d| switch (d) {
@@ -286,25 +318,6 @@ pub const Client = struct {
 
     // ── writing ─────────────────────────────────────────────────────────────
 
-    /// Write an astring, running the continuation handshake when the value can
-    /// only travel as a synchronising literal.
-    fn writeString(c: *Client, s: []const u8) Error!void {
-        if (c.enc.quotable(s)) return c.enc.quoted(s);
-        c.enc.literal(s) catch |e| switch (e) {
-            error.SyncLiteralRequired => {
-                // {n} CRLF, flush, wait for '+', then the payload.
-                try c.enc.special('{');
-                try c.enc.number(@intCast(s.len));
-                try c.enc.special('}');
-                try c.enc.crlf();
-                c.enc.w.flush() catch return error.WriteFailed;
-                try c.awaitContinuation();
-                c.enc.w.writeAll(s) catch return error.WriteFailed;
-            },
-            else => return e,
-        };
-    }
-
     fn finish(c: *Client) Error!void {
         try c.enc.crlf();
         c.enc.w.flush() catch return error.WriteFailed;
@@ -316,6 +329,7 @@ pub const Client = struct {
     /// capability list, so calling it is only necessary after a state change
     /// the server did not annotate.
     pub fn capability(c: *Client) Error!Completion {
+        c.arm();
         const tag = try c.tagger.next(c.gpa);
         defer c.gpa.free(tag);
         try c.enc.capability(tag);
@@ -324,6 +338,7 @@ pub const Client = struct {
     }
 
     pub fn noop(c: *Client) Error!Completion {
+        c.arm();
         const tag = try c.tagger.next(c.gpa);
         defer c.gpa.free(tag);
         try c.enc.noop(tag);
@@ -335,6 +350,7 @@ pub const Client = struct {
     /// required to reject it, so this refuses locally rather than sending a
     /// command that leaks a password into a session that cannot use it.
     pub fn login(c: *Client, user: []const u8, pass: []const u8) Error!Completion {
+        c.arm();
         if (c.state != .not_authenticated) return error.BadState;
 
         const tag = try c.tagger.next(c.gpa);
@@ -344,9 +360,9 @@ pub const Client = struct {
         try c.enc.sp();
         try c.enc.atom("LOGIN");
         try c.enc.sp();
-        try c.writeString(user);
+        c.enc.string(user) catch |e| return c.unmask(e);
         try c.enc.sp();
-        try c.writeString(pass);
+        c.enc.string(pass) catch |e| return c.unmask(e);
         try c.finish();
 
         const done = try c.expectOk(tag);
@@ -359,6 +375,7 @@ pub const Client = struct {
     /// mailbox's state before the new one, since a failed SELECT leaves the
     /// connection with NO selected mailbox at all.
     pub fn select(c: *Client, name: []const u8, read_only: bool) Error!Completion {
+        c.arm();
         if (c.state != .authenticated and c.state != .selected) return error.BadState;
 
         const tag = try c.tagger.next(c.gpa);
@@ -371,7 +388,7 @@ pub const Client = struct {
         try c.enc.sp();
         try c.enc.atom(if (read_only) "EXAMINE" else "SELECT");
         try c.enc.sp();
-        try c.enc.mailbox(name);
+        c.enc.mailbox(name) catch |e| return c.unmask(e);
         try c.finish();
 
         const done = c.expectOk(tag) catch |e| {
@@ -390,6 +407,7 @@ pub const Client = struct {
     /// completion, so `ServerClosed` from the BYE is the expected path here
     /// rather than a failure.
     pub fn logout(c: *Client) Error!void {
+        c.arm();
         const tag = try c.tagger.next(c.gpa);
         defer c.gpa.free(tag);
         try c.enc.logout(tag);
@@ -417,6 +435,7 @@ pub const Client = struct {
         by_uid: bool,
         req: fetchmod.Request,
     ) Error![]const fetchmod.Message {
+        c.arm();
         if (c.state != .selected) return error.NoMailbox;
 
         const tag = try c.tagger.next(c.gpa);
@@ -456,11 +475,12 @@ pub const Client = struct {
         ret: searchmod.Return,
         crit: *const searchmod.Criteria,
     ) Error!searchmod.Result {
+        c.arm();
         if (c.state != .selected) return error.NoMailbox;
 
         const tag = try c.tagger.next(c.gpa);
         defer c.gpa.free(tag);
-        try searchmod.encode(&c.enc, tag, by_uid, ret, crit);
+        searchmod.encode(&c.enc, tag, by_uid, ret, crit) catch |e| return c.unmask(e);
         c.enc.w.flush() catch return error.WriteFailed;
 
         var result: searchmod.Result = .{};
@@ -491,6 +511,7 @@ pub const Client = struct {
     /// every 29 minutes or servers may drop the connection; this client does
     /// not run a timer, because it owns no thread.
     pub fn idleBegin(c: *Client) Error!void {
+        c.arm();
         if (c.state != .selected and c.state != .authenticated) return error.BadState;
         if (c.idle_tag != null) return error.NotIdle;
 
