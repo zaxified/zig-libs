@@ -786,6 +786,7 @@ test "loader error IS cached when cache_loader_errors is on, then retried after 
     rig.clock.t = 40; // cached error → CachedLoaderError, no loader call
     try testing.expectError(error.CachedLoaderError, c.get("k"));
     try testing.expectEqual(@as(u64, 1), rig.ldr.calls.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), c.getStats().negative_hits);
 
     rig.clock.t = 60; // past negative TTL → retried
     try testing.expectError(error.BackendDown, c.get("k"));
@@ -815,6 +816,32 @@ test "ifCached: zero-alloc hit hands the borrowed value to a callback; miss retu
     c.free(try c.get("k")); // populate
     try testing.expect(c.ifCached("k", &sink, Sink.cb)); // now a hit
     try testing.expectEqualStrings("hello", sink.buf[0..sink.len]);
+}
+
+test "ifCached: a negatively-cached (missing) entry is NOT surfaced as a hit" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    // "gone" is absent from the loader table → negatively cached as .missing.
+    var c = rig.open(.{ .negative_ttl_ns = 1000 });
+    defer c.deinit();
+
+    try testing.expect((try c.get("gone")) == .missing); // populates the negative entry
+    try testing.expectEqual(@as(u64, 1), c.getStats().misses);
+
+    const Sink = struct {
+        called: bool = false,
+        fn cb(ctx: ?*anyopaque, value: []const u8) void {
+            _ = value;
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            s.called = true;
+        }
+    };
+    var sink: Sink = .{};
+    // A fresh negative entry exists, but ifCached only fast-paths POSITIVE
+    // hits — it must return false and never invoke the callback.
+    try testing.expect(!c.ifCached("gone", &sink, Sink.cb));
+    try testing.expect(!sink.called);
 }
 
 test "value is copied out of the cache (caller owns it across an invalidation)" {

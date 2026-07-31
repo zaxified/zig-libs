@@ -624,6 +624,53 @@ test "reassembler enforces max_frame_len (oversized reassembled length)" {
     try testing.expectEqual(@as(usize, 0), r.inflightCount());
 }
 
+test "insert() itself evicts a stale entry before accepting a fresh fragment (no explicit expireOlderThan)" {
+    // Distinct from the "gap then timeout" test below: there, the stale
+    // entry is removed by an explicit expireOlderThan() sweep before the
+    // late fragment ever reaches insert(), so insert()'s OWN inline
+    // "is this tracked entry already stale?" check (right at the top of
+    // insert(), before getOrPut) is never exercised. Here no sweep is
+    // called — the second insert() call must detect the staleness itself.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    defer r.deinit();
+
+    // First fragment of frag_id=50: bytes [0,5) = 'A'*5, non-final.
+    var first: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 50, .offset = 0, .length = 5, .more = true }).encode(first[0..header_len]);
+    @memset(first[header_len..], 'A');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&first, 0));
+    try testing.expectEqual(@as(usize, 1), r.inflightCount());
+
+    // Well past the timeout, a fragment covering a DIFFERENT, non-
+    // overlapping range [5,10) arrives as the datagram's final piece — no
+    // expireOlderThan() call in between. If insert() fails to notice the
+    // tracked entry is stale, this fragment is wrongly accepted into the
+    // *old* entry (it doesn't overlap [0,5), so the overlap guard alone
+    // can't catch it): covered would reach total_len=10 immediately and
+    // .complete would splice in the stale 'A' bytes from a datagram whose
+    // reassembly window already elapsed. The correct behaviour is a fresh
+    // entry that is still incomplete (only 5 of its 10 declared bytes in).
+    var second: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 50, .offset = 5, .length = 5, .more = false }).encode(second[0..header_len]);
+    @memset(second[header_len..], 'B');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&second, 1000));
+    try testing.expectEqual(@as(usize, 1), r.inflightCount());
+
+    // Finishing with the real [0,5) bytes must produce the fresh datagram
+    // ('C'*5 ++ 'B'*5), never the stale 'A' bytes.
+    var third: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 50, .offset = 0, .length = 5, .more = true }).encode(third[0..header_len]);
+    @memset(third[header_len..], 'C');
+    const res = try r.insert(&third, 1001);
+    switch (res) {
+        .complete => |bytes| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualSlices(u8, "CCCCCBBBBB", bytes);
+        },
+        .incomplete => return error.TestUnexpectedResult,
+    }
+}
+
 test "gap then timeout: incomplete datagram is pruned and never published" {
     var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
     defer r.deinit();

@@ -743,6 +743,17 @@ test "rbac: static SoD sibling — a non-conflicting role assigns fine" {
     try e.assignRole("dave", "viewer"); // no conflict declared with "viewer"
 }
 
+test "rbac: addRole is idempotent — re-adding a known role does not wipe its permissions" {
+    var e = try buildBasicEngine(testing.allocator);
+    defer e.deinit();
+    try e.assignRole("alice", "viewer");
+    try testing.expectEqual(Result.permit, e.check("alice", "read", "doc").result);
+
+    // Documented contract: "re-adding a known role name is a no-op."
+    try e.addRole("viewer");
+    try testing.expectEqual(Result.permit, e.check("alice", "read", "doc").result);
+}
+
 test "rbac: addPermission/addHierarchy/addStaticSoD reject an unknown role" {
     var e = rbac.Engine.init(testing.allocator);
     defer e.deinit();
@@ -966,6 +977,37 @@ test "abac: permit-overrides sibling — the SAME rule set flips to permit" {
     const d = abac.evaluate(.{ .rules = &rules, .algorithm = .permit_overrides }, &attrs);
     try testing.expectEqual(Result.permit, d.result);
     try testing.expectEqualStrings("allow-all", d.reason);
+}
+
+test "abac: permit-overrides with only a matching Deny (no Permit) falls back to Deny" {
+    // Unlike the deny/permit-both-match sibling test above, exercise
+    // combinePermitOverrides' NON-immediate-return path: no rule in the set
+    // ever permits, so the loop must fall through to the accumulated
+    // `saw_deny` result rather than the immediate `.permit => return d` leaf.
+    var attrs: abac.Attributes = .{};
+    defer attrs.deinit(testing.allocator);
+    try attrs.put(testing.allocator, .subject, "role", abac.str("contractor"));
+    const rules = [_]abac.Rule{
+        .{ .id = "deny-contractors", .effect = .deny, .condition = abac.eq(abac.attr(.subject, "role"), abac.lit(abac.str("contractor"))) },
+    };
+    const d = abac.evaluate(.{ .rules = &rules, .algorithm = .permit_overrides }, &attrs);
+    try testing.expectEqual(Result.deny, d.result);
+    try testing.expectEqualStrings("deny-contractors", d.reason);
+}
+
+test "abac: permit-overrides sibling — no rule matches at all falls to not_applicable/deny" {
+    // Minimal flip: the rule's condition never matches, so the loop
+    // contributes nothing (not_applicable) — the true fallback branch of
+    // combinePermitOverrides, distinct from the saw_deny case above.
+    var attrs: abac.Attributes = .{};
+    defer attrs.deinit(testing.allocator);
+    try attrs.put(testing.allocator, .subject, "role", abac.str("employee"));
+    const rules = [_]abac.Rule{
+        .{ .id = "deny-contractors", .effect = .deny, .condition = abac.eq(abac.attr(.subject, "role"), abac.lit(abac.str("contractor"))) },
+    };
+    const d = abac.evaluate(.{ .rules = &rules, .algorithm = .permit_overrides }, &attrs);
+    try testing.expectEqual(Result.deny, d.result);
+    try testing.expectEqualStrings("default-deny: no rule matched", d.reason);
 }
 
 test "abac: default combining algorithm is deny_overrides" {

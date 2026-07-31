@@ -908,6 +908,38 @@ test "disableCoreDumps sets RLIMIT_CORE to zero in the child" {
     try testing.expect(res.exitedWith(0));
 }
 
+// limitProcesses / limitAddressSpace are thin `setLimit` wrappers with no
+// enforcement test of their own (NPROC/AS enforcement is awkward to probe
+// deterministically without disturbing the test host) — so nothing caught a
+// wrong resource constant. This reads the rlimit back via getrlimit to prove
+// each wrapper actually targets its named resource, not some other one.
+fn childLimitProcessesSetsNproc() void {
+    limitProcesses(4321) catch linux.exit(63);
+    var rl: linux.rlimit = undefined;
+    if (linux.errno(linux.getrlimit(.NPROC, &rl)) != .SUCCESS) linux.exit(64);
+    if (rl.cur != 4321 or rl.max != 4321) linux.exit(65);
+    linux.exit(0);
+}
+
+test "limitProcesses sets RLIMIT_NPROC to the requested value" {
+    const res = try runInChild(childLimitProcessesSetsNproc);
+    try testing.expect(res.exitedWith(0));
+}
+
+fn childLimitAddressSpaceSetsAs() void {
+    const bytes: linux.rlim_t = 512 * 1024 * 1024;
+    limitAddressSpace(bytes) catch linux.exit(66);
+    var rl: linux.rlimit = undefined;
+    if (linux.errno(linux.getrlimit(.AS, &rl)) != .SUCCESS) linux.exit(67);
+    if (rl.cur != bytes or rl.max != bytes) linux.exit(68);
+    linux.exit(0);
+}
+
+test "limitAddressSpace sets RLIMIT_AS to the requested value" {
+    const res = try runInChild(childLimitAddressSpaceSetsAs);
+    try testing.expect(res.exitedWith(0));
+}
+
 // ── real: privilege drop (root-gated, skips cleanly) ─────────────────────────
 
 const nobody_uid: linux.uid_t = 65534;
@@ -938,6 +970,37 @@ fn childDropBoundingSet() void {
 test "capability bounding-set drop succeeds or cleanly reports EPERM (needs root)" {
     if (linux.geteuid() != 0) return error.SkipZigTest;
     const res = try runInChild(childDropBoundingSet);
+    try testing.expect(res.exitedWith(0));
+}
+
+// clearCapabilities zeros a set the calling process already holds (or lacks),
+// which — unlike the bounding-set drop — needs no privilege: reducing your own
+// effective/permitted/inheritable sets to nothing is always allowed. So this
+// runs unconditionally (no root gate) and reads the sets back via `capget` to
+// prove they actually became zero, not just that the syscall returned success.
+fn childClearCapabilities() void {
+    // Reducing your own capability sets to nothing is a kernel-guaranteed
+    // no-privilege-required operation (you can always give capabilities up),
+    // so — unlike the bounding-set drop — this must always succeed here; no
+    // PermissionDenied escape hatch to accidentally swallow a real break.
+    clearCapabilities() catch linux.exit(96);
+    var hdr = extern struct { version: u32, pid: c_int }{
+        .version = linux_capability_version_3,
+        .pid = 0,
+    };
+    var data = [2]extern struct { effective: u32, permitted: u32, inheritable: u32 }{
+        .{ .effective = 1, .permitted = 1, .inheritable = 1 }, // poisoned; capget must overwrite
+        .{ .effective = 1, .permitted = 1, .inheritable = 1 },
+    };
+    const rc = linux.syscall2(.capget, @intFromPtr(&hdr), @intFromPtr(&data));
+    if (linux.errno(rc) != .SUCCESS) linux.exit(97);
+    if (data[0].effective != 0 or data[0].permitted != 0 or data[0].inheritable != 0) linux.exit(98);
+    if (data[1].effective != 0 or data[1].permitted != 0 or data[1].inheritable != 0) linux.exit(99);
+    linux.exit(0);
+}
+
+test "clearCapabilities: effective/permitted/inheritable read back as zero" {
+    const res = try runInChild(childClearCapabilities);
     try testing.expect(res.exitedWith(0));
 }
 

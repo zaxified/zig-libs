@@ -1134,6 +1134,23 @@ test "writeText: golden exact bytes (families, ordering, histogram, +Inf, escapi
         "req_seconds_count{route=\"/x\"} 4\n", w.buffered());
 }
 
+test "writeText: a literal quote in HELP text is NOT escaped (only label values escape quotes)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const c = try reg.counter("x_total", "Has a \" quote, unescaped per spec.", &.{});
+    c.inc();
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeText(&w);
+    try testing.expectEqualStrings(
+        "# HELP x_total Has a \" quote, unescaped per spec.\n" ++
+            "# TYPE x_total counter\n" ++
+            "x_total 1\n",
+        w.buffered(),
+    );
+}
+
 test "writeText: empty registry emits nothing; unlabeled histogram gets bare le braces" {
     var reg = Registry.init(testing.allocator);
     defer reg.deinit();
@@ -1323,6 +1340,12 @@ fn hMoved(ctx: *router.Ctx) anyerror!void {
 fn hBoom(_: *router.Ctx) anyerror!void {
     return error.Boom;
 }
+/// A status code outside the 100-599 HTTP range — exercises `classLabel`'s
+/// `else => "other"` fallback (`counterFor`'s `ci = ... else 0` path).
+fn hWeirdStatus(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(999);
+    try ctx.res.writeAll("weird");
+}
 /// Proves the in-flight gauge is up *during* the request (ctx.state is the
 /// RequestMetrics in these tests; a failed expectation → error → 500).
 fn hInFlightProbe(ctx: *router.Ctx) anyerror!void {
@@ -1385,6 +1408,24 @@ test "middleware: counts by method + status class, times with the injected clock
     // (the whole http_requests_total family sums to 7).
     try expectBodyLine(got, "http_requests_in_flight 0");
     try testing.expect(std.mem.indexOf(u8, bodyOf(got), "/metrics") == null);
+}
+
+test "middleware: a status outside 100-599 falls into the 'other' class" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try RequestMetrics.init(&reg, .{});
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware());
+    try r.get("/weird", hWeirdStatus);
+
+    var buf: [8192]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/weird"), &buf), "999");
+
+    try testing.expectEqual(1, (try reg.counter("http_requests_total", rm.options.counter_help, &.{
+        .{ .name = "method", .value = "get" }, .{ .name = "code", .value = "other" },
+    })).value());
 }
 
 test "middleware: .code granularity uses exact status codes" {

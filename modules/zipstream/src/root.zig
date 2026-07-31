@@ -1162,6 +1162,32 @@ test "ArchiveWriter.addEntry rejects zip-slip names, mirroring the reader's isSa
     try testing.expect(archive.find("ok.txt") != null);
 }
 
+test "ArchiveWriter: classic-format 32-bit overflow guards fail closed (ZipWriteTooLarge)" {
+    const a = testing.allocator;
+
+    // addEntry: running offset already past the classic 32-bit ceiling.
+    {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        var zw = ArchiveWriter.init(a, &aw.writer);
+        defer zw.deinit();
+        zw.offset = @as(u64, std.math.maxInt(u32)) + 1; // whitebox: fake a huge prior archive
+        try testing.expectError(Error.ZipWriteTooLarge, zw.addEntry("x.txt", "data", .{ .method = .store }));
+    }
+
+    // finish(): cd_offset (== running offset once all entries are written)
+    // past the classic 32-bit ceiling — exercised without writing gigabytes.
+    {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        var zw = ArchiveWriter.init(a, &aw.writer);
+        defer zw.deinit();
+        try zw.addEntry("x.txt", "data", .{ .method = .store });
+        zw.offset = @as(u64, std.math.maxInt(u32)) + 1; // whitebox: force cd_offset over the ceiling
+        try testing.expectError(Error.ZipWriteTooLarge, zw.finish());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // zip64 read tests
 // ---------------------------------------------------------------------------

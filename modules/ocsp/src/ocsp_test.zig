@@ -118,7 +118,8 @@ const StatusKind = union(enum) {
 const RespSpec = struct {
     issuer: IssuerBits,
     subject_serial: []const u8,
-    responder_by_name: []const u8, // Name TLV
+    responder_by_name: ?[]const u8 = null, // Name TLV
+    responder_by_key: ?[]const u8 = null, // KeyHash (SHA-1 digest bytes)
     status: StatusKind = .good,
     this_update: []const u8 = this_update,
     next_update: ?[]const u8 = next_update,
@@ -188,8 +189,13 @@ fn buildResponse(gpa: std.mem.Allocator, spec: RespSpec) ![]u8 {
     const single = try b.seq(single_parts.items);
     const responses = try b.seqOf(&.{single});
 
-    // ResponseData (tbs): responderID byName [1], producedAt, responses [, exts]
-    const responder_id = try b.explicit(1, spec.responder_by_name);
+    // ResponseData (tbs): responderID byName [1] or byKey [2], producedAt, responses [, exts]
+    const responder_id = if (spec.responder_by_name) |name|
+        try b.explicit(1, name)
+    else if (spec.responder_by_key) |kh|
+        try b.explicit(2, try b.octet(kh))
+    else
+        return error.NoResponderId;
     var rd_parts = std.ArrayList([]const u8).empty;
     try rd_parts.append(b.a, responder_id);
     try rd_parts.append(b.a, try b.generalizedTime(spec.this_update));
@@ -259,6 +265,28 @@ fn buildDelegateCert(
     delegate_name: []const u8,
     with_eku: bool,
 ) ![]u8 {
+    return buildDelegateCertValidity(
+        gpa,
+        issuer_sk,
+        issuer_name,
+        delegate_spki,
+        delegate_name,
+        with_eku,
+        "200101000000Z",
+        "400101000000Z",
+    );
+}
+
+fn buildDelegateCertValidity(
+    gpa: std.mem.Allocator,
+    issuer_sk: rsa.SecretKey,
+    issuer_name: []const u8,
+    delegate_spki: []const u8,
+    delegate_name: []const u8,
+    with_eku: bool,
+    not_before: []const u8,
+    not_after: []const u8,
+) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const b: der_writer.Builder = .{ .a = arena.allocator() };
@@ -267,8 +295,8 @@ fn buildDelegateCert(
     const serial = try b.integerU8(9);
     const sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
     const validity = try b.seq(&.{
-        try b.tlv(0x17, "200101000000Z"), // UTCTime notBefore
-        try b.tlv(0x17, "400101000000Z"), // UTCTime notAfter
+        try b.tlv(0x17, not_before), // UTCTime notBefore
+        try b.tlv(0x17, not_after), // UTCTime notAfter
     });
 
     var tbs_parts = std.ArrayList([]const u8).empty;
@@ -559,6 +587,31 @@ test "verify: nonce mismatch → NonceMismatch; matching nonce accepted" {
     try testing.expectError(error.NonceMismatch, ocsp.verify(parsed, fx.issuer_der, fx.subject_der, bad));
 }
 
+test "verify: successful status but unrecognized responseType → UnsupportedResponseType" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+
+    // successful status, but responseBytes carries an OID this module does
+    // not decode (any OID other than id-pkix-ocsp-basic).
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const response_bytes = try b.seq(&.{ try b.oid(&oid_sha256), try b.octet("not-basic-ocsp") });
+    const ocsp_response = try b.seq(&.{
+        try b.enumerated(0), // successful
+        try b.explicit(0, response_bytes),
+    });
+
+    const parsed = try ocsp.parseResponse(ocsp_response);
+    try testing.expectEqual(ocsp.ResponseStatus.successful, parsed.status);
+    try testing.expect(parsed.basic == null);
+    try testing.expectError(
+        error.UnsupportedResponseType,
+        ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()),
+    );
+}
+
 test "verify: responseStatus != successful → UnsuccessfulResponse" {
     const gpa = testing.allocator;
     var fx = try makeRsaFixture(gpa);
@@ -647,6 +700,96 @@ test "verify: delegated responder WITHOUT OCSPSigning EKU rejected" {
 
     const parsed = try ocsp.parseResponse(resp_der);
     try testing.expectError(error.ResponderMissingOcspSigning, ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()));
+}
+
+test "verify: responder identified byKey (KeyHash) accepted; wrong key hash rejected" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    var issuer_key_hash: [20]u8 = undefined;
+    Sha1.hash(issuer.key_bits, &issuer_key_hash, .{});
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_key = &issuer_key_hash,
+        .sign_rsa = fx.kp.secret_key,
+    });
+    defer gpa.free(resp_der);
+
+    const parsed = try ocsp.parseResponse(resp_der);
+    const verdict = try ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts());
+    try testing.expect(verdict.status == .good);
+    try testing.expect(!verdict.delegated);
+
+    // A KeyHash that does not match the issuer's key, and no delegate cert
+    // present to fall back on, must be rejected as unauthorized.
+    var wrong_hash = issuer_key_hash;
+    wrong_hash[0] ^= 0xff;
+    const resp_der2 = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_key = &wrong_hash,
+        .sign_rsa = fx.kp.secret_key,
+    });
+    defer gpa.free(resp_der2);
+    const parsed2 = try ocsp.parseResponse(resp_der2);
+    try testing.expectError(
+        error.UntrustedResponder,
+        ocsp.verify(parsed2, fx.issuer_der, fx.subject_der, defaultOpts()),
+    );
+}
+
+test "verify: delegated responder cert outside its validity window → ResponderCertExpired" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    var prng = std.Random.DefaultPrng.init(0xe401eed);
+    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
+        .common_name = "expired responder",
+        .serial = 11,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = false,
+    });
+    defer gpa.free(delegate_self);
+    const dbits = try extractBits(delegate_self);
+    const dspki = try spkiOf(delegate_self);
+
+    // Delegate cert's own validity window already expired before `now_2027`.
+    const delegate_cert = try buildDelegateCertValidity(
+        gpa,
+        fx.kp.secret_key,
+        issuer.subject_name,
+        dspki,
+        dbits.subject_name,
+        true,
+        "200101000000Z",
+        "260101000000Z", // notAfter 2026-01-01, well before now_2027 (2027-01-15)
+    );
+    defer gpa.free(delegate_cert);
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = dbits.subject_name,
+        .certs = delegate_cert,
+        .sign_rsa = dkp.secret_key,
+    });
+    defer gpa.free(resp_der);
+
+    const parsed = try ocsp.parseResponse(resp_der);
+    try testing.expectError(
+        error.ResponderCertExpired,
+        ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()),
+    );
 }
 
 test "verify: ECDSA-P256 direct-issuer signature accepted" {

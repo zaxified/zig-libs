@@ -1013,6 +1013,66 @@ test "garbage block -> error.BadHeader, no panic" {
     try testing.expectError(error.BadHeader, tr.next());
 }
 
+test "pax extended header ('x') is skipped, not fatal, including its padding" {
+    var buf: [6 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+
+    // pax extended-attributes header ('x'): 30-byte payload, NOT a multiple
+    // of 512 — the reader must skip the payload AND its block padding
+    // (content_pad), or it desyncs on the real header that follows.
+    var pax_block: [block_size]u8 = undefined;
+    emitHeader(&pax_block, "PaxHeaders/real.txt", "", 0, 0, 0, 30, 0, 'x');
+    try dst.writeAll(&pax_block);
+    try dst.writeAll("30 path=some.attr=value\n" ++ "\x00\x00\x00\x00\x00\x00"); // 30 bytes
+    try writeZeros(&dst, padding(30));
+
+    // The real entry the pax header was describing.
+    var real_block: [block_size]u8 = undefined;
+    emitHeader(&real_block, "real.txt", "", 0o644, 0, 0, 5, 0, '0');
+    try dst.writeAll(&real_block);
+    try dst.writeAll("hello");
+    try writeZeros(&dst, padding(5));
+    try writeZeros(&dst, 2 * block_size); // trailer
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+
+    const e = (try tr.next()).?;
+    try testing.expectEqualStrings("real.txt", e.path);
+    try testing.expectEqual(@as(u64, 5), e.size);
+    var content: [8]u8 = undefined;
+    const n = try tr.read(&content);
+    try testing.expectEqualStrings("hello", content[0..n]);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
+test "unrecognized typeflag surfaces as .other, content still streamable" {
+    var buf: [4 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    // 'V' = GNU volume-label header — not one of the kinds this module
+    // models; the reader must not misclassify it as .file/.dir/etc.
+    emitHeader(&block, "volume-id", "", 0, 0, 0, 4, 0, 'V');
+    try dst.writeAll(&block);
+    try dst.writeAll("data");
+    try writeZeros(&dst, padding(4));
+    try writeZeros(&dst, 2 * block_size); // trailer
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+
+    const e = (try tr.next()).?;
+    try testing.expectEqual(Kind.other, e.kind);
+    try testing.expectEqual(@as(u8, 'V'), e.typeflag);
+    try testing.expectEqualStrings("volume-id", e.path);
+    var content: [8]u8 = undefined;
+    const n = try tr.read(&content);
+    try testing.expectEqualStrings("data", content[0..n]);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
 test "hostile GNU 'L' size -> error.BadHeader" {
     var buf: [4 * block_size]u8 = undefined;
     var dst: std.Io.Writer = .fixed(&buf);

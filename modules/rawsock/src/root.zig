@@ -647,6 +647,13 @@ test "LinkAddr.fromSockaddr decode" {
     var cooked = sll;
     cooked.halen = 0;
     try testing.expectEqual([_]u8{0} ** hwaddr_len, LinkAddr.fromSockaddr(cooked).hwaddr);
+
+    // A malformed/oversized halen (sll_addr is only 8 bytes; a hostile or
+    // buggy peer could report more than the Ethernet hwaddr_len) must clamp
+    // to 6, not read/write past the fixed-size hwaddr buffer.
+    var oversized = sll;
+    oversized.halen = 8;
+    try testing.expectEqual([_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, LinkAddr.fromSockaddr(oversized).hwaddr);
 }
 
 test "etherTypeFilter encodes the classic ether-proto program" {

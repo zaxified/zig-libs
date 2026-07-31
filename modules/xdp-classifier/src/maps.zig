@@ -211,6 +211,19 @@ test "smoke: map size/entry constants have the shape the LPM trie key layout exp
     try testing.expectEqual(@as(u32, 1), scratch_max_entries);
 }
 
+// A bad fd is rejected by the kernel's fd-lookup before any privilege check,
+// so this exercises mapPopulateError's BadFd mapping without needing
+// CAP_BPF/root — unlike every other test in this file, this one is not
+// skipped on an unprivileged host.
+test "populateRule/populateCpu: an invalid map fd surfaces PopulateError.BadFd" {
+    const rule: rules.ClassifierRule = .{
+        .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 },
+        .class = 1,
+    };
+    try testing.expectError(PopulateError.BadFd, populateRule(-1, rule));
+    try testing.expectError(PopulateError.BadFd, populateCpu(-1, 0, 192, null));
+}
+
 test "createLpmTrieMap + populateRule + real lookup round-trip (needs CAP_BPF/root)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) return error.SkipZigTest;

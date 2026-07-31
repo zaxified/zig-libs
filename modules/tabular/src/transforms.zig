@@ -1052,6 +1052,62 @@ test "resample: monthly compound + sum" {
     try testing.expectApproxEqAbs(@as(f64, 0.5), comp.cell(1, "value").?.float, 1e-9);
 }
 
+test "resample: sum/mean/first/last aggregations" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{ .{ .name = "d", .type = .date }, .{ .name = "r", .type = .float } };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2024-01-10" }, .{ .float = 1 } },
+        &.{ .{ .text = "2024-01-20" }, .{ .float = 2 } },
+        &.{ .{ .text = "2024-01-25" }, .{ .float = 3 } },
+    };
+    const sum_out = try resample(f.a(), .{ .columns = &cols, .rows = &rows }, .{
+        .date_col = "d",
+        .value_col = "r",
+        .freq = .month,
+        .agg = .sum,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 6), sum_out.cell(0, "value").?.float, 1e-9);
+
+    const mean_out = try resample(f.a(), .{ .columns = &cols, .rows = &rows }, .{
+        .date_col = "d",
+        .value_col = "r",
+        .freq = .month,
+        .agg = .mean,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 2), mean_out.cell(0, "value").?.float, 1e-9);
+
+    const first_out = try resample(f.a(), .{ .columns = &cols, .rows = &rows }, .{
+        .date_col = "d",
+        .value_col = "r",
+        .freq = .month,
+        .agg = .first,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 1), first_out.cell(0, "value").?.float, 1e-9);
+
+    const last_out = try resample(f.a(), .{ .columns = &cols, .rows = &rows }, .{
+        .date_col = "d",
+        .value_col = "r",
+        .freq = .month,
+        .agg = .last,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 3), last_out.cell(0, "value").?.float, 1e-9);
+}
+
+test "formatColumn: numeric cells formatted, non-numeric -> empty string" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{ .{ .name = "amt", .type = .float }, .{ .name = "tag", .type = .text } };
+    const rows = [_][]const Value{
+        &.{ .{ .float = 1234.5 }, .{ .text = "x" } },
+        &.{ .{ .text = "n/a" }, .{ .text = "y" } }, // non-numeric src cell
+    };
+    const out = try formatColumn(f.a(), .{ .columns = &cols, .rows = &rows }, "amt", "amt_fmt", .{ .kind = .money, .symbol = "$" });
+    try testing.expectEqual(@as(usize, 3), out.columns.len);
+    try testing.expectEqualStrings("$1234.50", out.cell(0, "amt_fmt").?.text);
+    try testing.expectEqualStrings("", out.cell(1, "amt_fmt").?.text);
+}
+
 test "reduce: table to one KPI row" {
     var f = Fix.init();
     defer f.deinit();
@@ -1084,6 +1140,23 @@ test "clampRange: inclusive date window" {
     });
     try testing.expectEqual(@as(usize, 1), out.rows.len);
     try testing.expectEqual(@as(f64, 2), out.cell(0, "v").?.float);
+}
+
+test "clampRange: from/to bounds are inclusive at the exact edge" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{ .{ .name = "d", .type = .date }, .{ .name = "v", .type = .float } };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2024-03-01" }, .{ .float = 1 } }, // exactly `from`
+        &.{ .{ .text = "2024-06-15" }, .{ .float = 2 } },
+        &.{ .{ .text = "2024-09-01" }, .{ .float = 3 } }, // exactly `to`
+    };
+    const out = try clampRange(f.a(), .{ .columns = &cols, .rows = &rows }, .{
+        .date_col = "d",
+        .from = "2024-03-01",
+        .to = "2024-09-01",
+    });
+    try testing.expectEqual(@as(usize, 3), out.rows.len); // all three kept, boundaries included
 }
 
 test "format: kinds" {

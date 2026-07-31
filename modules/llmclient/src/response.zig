@@ -361,6 +361,17 @@ test "parseMessage: unrecognized content block type falls back to .other" {
     try testing.expect(msg.content[0] == .other);
 }
 
+test "parseMessage: unrecognized stop_reason forward-compats to .unknown" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\{"id":"msg_3","model":"claude-opus-4-8","role":"assistant","content":[],
+        \\"stop_reason":"some_future_reason","usage":{"input_tokens":1,"output_tokens":1}}
+    ;
+    const msg = try parseMessage(arena.allocator(), body);
+    try testing.expectEqual(StopReason.unknown, msg.stop_reason.?);
+}
+
 test "parseStreamEvent: full sequence via sse_parse (message_start .. message_stop)" {
     const sse_parse = @import("sse_parse.zig");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -442,6 +453,24 @@ test "parseStreamEvent: tool_use content_block_start + input_json_delta + error 
 
     const ping_ev = try parseStreamEvent(a, "{\"type\":\"ping\"}");
     try testing.expect(ping_ev == .ping);
+}
+
+test "parseStreamEvent: unrecognized top-level type is a MalformedResponse error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        error.MalformedResponse,
+        parseStreamEvent(arena.allocator(), "{\"type\":\"some_future_event\"}"),
+    );
+}
+
+test "parseStreamEvent: missing content_block on content_block_start is a MalformedResponse error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        error.MalformedResponse,
+        parseStreamEvent(arena.allocator(), "{\"type\":\"content_block_start\",\"index\":0}"),
+    );
 }
 
 // ── fuzz: untrusted JSON bytes never panic ──────────────────────────────────

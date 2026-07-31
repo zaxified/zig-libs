@@ -148,6 +148,24 @@ test "per-queue minor/prio counters are independent; cake majors are global" {
     try testing.expectEqual(@as(u16, 1), try hs.nextPrio(1)); // per-queue prio
 }
 
+test "exhaustion: class minor, prio and cake major all fail closed past their ceiling" {
+    const gpa = testing.allocator;
+    var hs = try HandleSpace.init(gpa, 1);
+    defer hs.deinit(gpa);
+
+    hs.minor_next[0] = 0xFFFF;
+    try testing.expectEqual(@as(u16, 0xFFFF), try hs.nextClassMinor(0));
+    try testing.expectError(error.HandleExhausted, hs.nextClassMinor(0));
+
+    hs.prio_next[0] = 0xFFFF;
+    try testing.expectEqual(@as(u16, 0xFFFF), try hs.nextPrio(0));
+    try testing.expectError(error.HandleExhausted, hs.nextPrio(0));
+
+    hs.cake_major_next = max_major;
+    try testing.expectEqual(@as(u16, max_major), try hs.nextCakeMajor());
+    try testing.expectError(error.HandleExhausted, hs.nextCakeMajor());
+}
+
 test "cake major counter skips the reserved mq major" {
     const gpa = testing.allocator;
     var hs = try HandleSpace.init(gpa, 1);

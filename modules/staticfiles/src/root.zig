@@ -46,7 +46,14 @@
 //!    `follow_symlinks = false` by default. Because no component is ever a
 //!    symlink that is traversed and no `..` is ever present, the opened file is
 //!    provably within the root. `resolve_beneath` is additionally requested as
-//!    defense-in-depth where the OS supports it.
+//!    defense-in-depth where the OS supports it — which, to be precise, does
+//!    **NOT include Linux**: `std.Io` sets the flag under
+//!    `@hasField(posix.O, "RESOLVE_BENEATH")`, and `std.os.linux.O` has no
+//!    such field (it is a FreeBSD flag; Linux exposes the equivalent only
+//!    through `openat2`, which std does not use here). So on Linux the option
+//!    is a silent no-op and containment rests ENTIRELY on `sanitizePath`, the
+//!    no-follow component walk, and `verifyContained`. Do not read the
+//!    option's presence as a kernel-level backstop.
 //!
 //! **Symlink policy**: NOT followed by default — a symlinked component yields
 //! an open error → 403, so a symlink pointing outside the root is unreachable.
@@ -763,6 +770,9 @@ const Fixture = struct {
         try root.writeFile(io, .{ .sub_path = "sub/dir/file.txt", .data = "nested" });
         // A symlink inside root pointing OUT of root (to ../secret.txt).
         root.symLink(io, "../secret.txt", "escape", .{}) catch {};
+        // A symlink inside root pointing to another file INSIDE root — safe
+        // under `follow_symlinks = true` (unlike `escape` above).
+        root.symLink(io, "hello.txt", "inside_link", .{}) catch {};
         return .{ .tmp = tmp, .root = root };
     }
 
@@ -927,6 +937,24 @@ test "serve: symlink escaping root refused (no-follow), the target is real" {
     try testing.expect(mem.indexOf(u8, resp, "TOP SECRET") == null);
 }
 
+test "serve: follow_symlinks=true serves an in-root symlink but still refuses an escaping one" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .follow_symlinks = true });
+    var out: [4096]u8 = undefined;
+
+    // Symlink target stays under root → verifyContained passes → served.
+    const ok = get(&h, "/inside_link", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(ok));
+    try testing.expect(mem.endsWith(u8, ok, "hello world"));
+
+    // Symlink target escapes root → verifyContained must still refuse it even
+    // though symlinks are now followed.
+    const escaped = get(&h, "/escape", &out);
+    try testing.expect(statusOf(escaped) >= 400);
+    try testing.expect(mem.indexOf(u8, escaped, "TOP SECRET") == null);
+}
+
 test "serve: 304 on matching If-None-Match / If-Modified-Since" {
     var fx = try Fixture.init();
     defer fx.deinit();
@@ -964,6 +992,18 @@ test "serve: 206 + Content-Range on a range, 416 on unsatisfiable" {
     const r416 = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=50-60\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 416), statusOf(r416));
     try testing.expect(mem.indexOf(u8, r416, "Content-Range: bytes */11\r\n") != null);
+}
+
+test "serve: multi-range request falls back to a full 200, not a 206/416" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    // Two disjoint ranges — RFC 7233 permits ignoring Range entirely here.
+    const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-2,4-6\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "Content-Range:") == null);
+    try testing.expect(mem.endsWith(u8, resp, "hello world")); // full body, not a slice
 }
 
 test "serve: directory listing (opt-in) escapes names, off = 403" {

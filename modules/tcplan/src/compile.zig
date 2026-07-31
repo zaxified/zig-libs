@@ -290,6 +290,39 @@ test "invariant: child ceil may not exceed parent ceil" {
     try testing.expectError(error.CeilExceedsParent, compile(gpa, .{ .queue_count = 1, .roots = &roots }, 1));
 }
 
+test "flowerFor: dir picks src vs dst field for both ipv4 and ipv6" {
+    const classid = tc.Handle.init(1, 3);
+
+    // ipv4, default dir (.dst)
+    const m4_dst: Match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 }, .prefix_len = 24 } };
+    const f4_dst = flowerFor(m4_dst, classid);
+    try testing.expectEqual(tc.ETH_P.IP, f4_dst.eth_type);
+    try testing.expect(f4_dst.ipv4_src == null);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, &f4_dst.ipv4_dst.?.addr);
+    try testing.expectEqual(@as(u6, 24), f4_dst.ipv4_dst.?.prefix_len);
+
+    // ipv4, dir = .src — the branch the golden/silent-leaf tests never exercise.
+    const m4_src: Match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 2 }, .dir = .src } };
+    const f4_src = flowerFor(m4_src, classid);
+    try testing.expect(f4_src.ipv4_dst == null);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &f4_src.ipv4_src.?.addr);
+
+    // ipv6, default dir (.dst) — field values, not just "a filter exists".
+    const m6_dst: Match = .{ .ipv6 = .{ .addr = [_]u8{0xab} ** 16, .prefix_len = 64 } };
+    const f6_dst = flowerFor(m6_dst, classid);
+    try testing.expectEqual(tc.ETH_P.IPV6, f6_dst.eth_type);
+    try testing.expect(f6_dst.ipv6_src == null);
+    try testing.expectEqualSlices(u8, &([_]u8{0xab} ** 16), &f6_dst.ipv6_dst.?.addr);
+    try testing.expectEqual(@as(u8, 64), f6_dst.ipv6_dst.?.prefix_len);
+
+    // ipv6, dir = .src.
+    const m6_src: Match = .{ .ipv6 = .{ .addr = [_]u8{0xcd} ** 16, .dir = .src } };
+    const f6_src = flowerFor(m6_src, classid);
+    try testing.expect(f6_src.ipv6_dst == null);
+    try testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16), &f6_src.ipv6_src.?.addr);
+    try testing.expectEqual(classid.raw, f6_src.classid.?.raw);
+}
+
 test "invariant: classifier on an interior node, zero rate, duplicate name" {
     const gpa = testing.allocator;
 

@@ -331,6 +331,16 @@ test "acceptHandshake: rejects key with invalid base64 characters" {
     try testing.expectError(error.InvalidKey, acceptHandshake(head, .{}));
 }
 
+test "acceptHandshake: client's first-choice protocol unsupported, second choice matches" {
+    // Client offers "superchat, chat" (its own preference order); the server
+    // only supports "chat". This must still find "chat" further down the
+    // offered list, not just check the first token.
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: superchat, chat\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    const accept = try acceptHandshake(head, .{ .protocols = &.{"chat"} });
+    try testing.expectEqualStrings("chat", accept.protocol.?);
+}
+
 test "acceptHandshake: no protocols offered -> no negotiation, always null" {
     const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
     const head = try h1.RequestHead.parse(req);

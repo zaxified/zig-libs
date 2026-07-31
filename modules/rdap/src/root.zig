@@ -1100,6 +1100,29 @@ test "parse: RDAP error object → typed error document (RFC 7480 §5.3)" {
     try testing.expectEqualStrings("Try a different beverage", e.description[1]);
 }
 
+test "parse: jCard structured value (org as array of components) uses first text" {
+    const json =
+        \\{
+        \\  "objectClassName": "domain",
+        \\  "handle": "STRUCT-1",
+        \\  "entities": [
+        \\    {
+        \\      "objectClassName": "entity",
+        \\      "handle": "E-1",
+        \\      "roles": ["registrant"],
+        \\      "vcardArray": ["vcard", [
+        \\        ["org", {}, "text", ["", "Example Registrar", "Suite 100"]]
+        \\      ]]
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed = try parseResponse(testing.allocator, json);
+    defer parsed.deinit();
+    const o = &parsed.document.object;
+    try testing.expectEqualStrings("Example Registrar", o.entities[0].org.?);
+}
+
 test "parse: sparse response (objectClassName + handle only)" {
     var parsed = try parseResponse(testing.allocator,
         \\{"objectClassName": "entity", "handle": "SPARSE-1"}
@@ -1454,6 +1477,9 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(isSpecialUseHost("169.254.169.254")); // cloud metadata
     try testing.expect(isSpecialUseHost("::1"));
     try testing.expect(isSpecialUseHost("fe80::1"));
+    try testing.expect(isSpecialUseHost("224.0.0.1")); // IPv4 multicast
+    try testing.expect(isSpecialUseHost("ff02::1")); // IPv6 multicast
+    try testing.expect(isSpecialUseHost("fc00::1")); // IPv6 unique-local
     try testing.expect(isSpecialUseHost("localhost"));
     try testing.expect(!isSpecialUseHost("rdap.markmonitor.com"));
 }
