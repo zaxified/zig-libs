@@ -607,3 +607,52 @@ test "FETCH, SEARCH and ESEARCH now come back parsed, not as raw text" {
     try testing.expectEqualStrings("A282", s2.tag.?);
     try testing.expectEqual(@as(u32, 3), s2.count.?);
 }
+
+// ── fuzz ─────────────────────────────────────────────────────────────────
+//
+// `Reader.next` is the module's whole untrusted-input surface: every byte a
+// server sends reaches it, before authentication and before any of it has
+// been believed. It fans out into the RFC 9051 §9 wire decoder, the three
+// response shapes, and the FETCH / SEARCH parsers, so one harness covers the
+// lot.
+//
+// Two properties are being asserted, and neither is "it parses":
+//
+//   - It always TERMINATES. Every `Decoder` primitive either consumes a byte
+//     or returns, so a hostile line cannot spin -- but `readStatusTail` and
+//     the list walkers loop, and a loop whose exit depends on attacker bytes
+//     is exactly where that argument can fail.
+//   - It never allocates on a promise. A literal's length comes off the wire
+//     (`{4294967295}` is a legal thing for a server to claim) and is checked
+//     against `max_literal` BEFORE the allocation, so a fuzzer feeding huge
+//     announced sizes must not OOM. The arena below would make such a bug
+//     loud rather than hidden.
+//
+// The budget is deliberately small: the interesting inputs are short, and a
+// 512-byte window keeps the fuzzer's mutation density on the grammar rather
+// than on payload bytes it will never reach.
+
+test "fuzz: response parsing never panics on arbitrary server bytes" {
+    try testing.fuzz({}, fuzzResponse, .{});
+}
+
+fn fuzzResponse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var r = std.Io.Reader.fixed(buf[0..len]);
+    var rd = Reader.init(arena.allocator(), &r, .{});
+
+    // Keep reading until the input is exhausted or rejected. A single call
+    // would leave everything after the first CRLF unexercised, and the
+    // multi-line paths (untagged data preceding a tagged status) are where
+    // the state actually accumulates.
+    var guard: usize = 0;
+    while (guard < 64) : (guard += 1) {
+        _ = rd.next() catch return;
+    }
+}

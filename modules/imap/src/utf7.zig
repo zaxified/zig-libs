@@ -385,3 +385,35 @@ test "invalid UTF-8 is rejected by both directions" {
 // D2. Go's `Decode` rejects a run whose LAST byte is '='; a '=' anywhere else
 //     is rejected later by the base64 decoder. This rejects any '=' up front.
 //     The accepted set is identical; only the error's provenance differs.
+
+// ── fuzz ─────────────────────────────────────────────────────────────────
+//
+// Mailbox names arrive from the server in modified UTF-7 and are decoded
+// before anything else looks at them, so this is untrusted input on the same
+// footing as the wire grammar. The decoder is also the strictest thing in the
+// module -- it rejects padding, a null shift, non-canonical runs, unpaired
+// surrogates and CR/LF inside a run -- and every one of those rejections is a
+// branch reached only by input no legitimate server sends.
+//
+// The property is that it always returns: either bytes or a typed error, for
+// any input at all. Base64 decoding into a UTF-16 buffer and then folding
+// surrogate pairs is the kind of index arithmetic where a truncated run at
+// the very end of the input is the classic off-by-one.
+
+test "fuzz: modified UTF-7 decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    const out = decodeAlloc(testing.allocator, buf[0..len]) catch return;
+    defer testing.allocator.free(out);
+
+    // Whatever came back must be valid UTF-8 -- the decoder's contract, and a
+    // stronger check than "it did not crash". A surrogate mishandled as a
+    // lone code point would produce well-formed-looking bytes that are not.
+    try testing.expect(std.unicode.utf8ValidateSlice(out));
+}
