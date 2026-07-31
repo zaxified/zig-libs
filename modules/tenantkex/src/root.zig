@@ -550,6 +550,21 @@ test "message length helpers match the actual wire sizes" {
     try testing.expectEqual(@as(usize, 48), message2Len(0));
 }
 
+test "SessionKeys.wipe zeroizes both secret keys but leaves the transcript hash intact" {
+    const out = try runHandshake(demo_ctx, demo_ctx);
+    var keys = out.i;
+    const zero = [_]u8{0} ** 32;
+    try testing.expect(!std.mem.eql(u8, &keys.send_key, &zero));
+    try testing.expect(!std.mem.eql(u8, &keys.recv_key, &zero));
+    const saved_transcript = keys.transcript_hash;
+
+    keys.wipe();
+    try testing.expectEqualSlices(u8, &zero, &keys.send_key);
+    try testing.expectEqualSlices(u8, &zero, &keys.recv_key);
+    // The transcript hash is not secret — wipe must not touch it.
+    try testing.expectEqualSlices(u8, &saved_transcript, &keys.transcript_hash);
+}
+
 test "meta.deps is exactly {noise}" {
     try testing.expectEqual(@as(usize, 1), meta.deps.len);
     try testing.expectEqualStrings("noise", meta.deps[0]);

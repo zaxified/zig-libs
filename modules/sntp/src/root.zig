@@ -581,6 +581,18 @@ test "NTP↔Unix epoch conversion at a known instant" {
     try testing.expectEqual(@as(u32, 0), back.fraction);
 }
 
+test "fromUnixNanos clamps to zero at (and just past) the pre-1900 boundary" {
+    // Exactly at the NTP epoch (unix_ns = -ntp_unix_offset_ns): ntp_ns == 0,
+    // which the <=0 clamp catches — must not underflow into fromNanosSinceNtpEpoch.
+    try testing.expectEqual(Timestamp.zero, Timestamp.fromUnixNanos(-ntp_unix_offset_ns));
+    // A moment before 1900: still clamped.
+    try testing.expectEqual(Timestamp.zero, Timestamp.fromUnixNanos(-ntp_unix_offset_ns - 5));
+    // One second after the epoch: no longer clamped, decodes normally.
+    const just_after = Timestamp.fromUnixNanos(-ntp_unix_offset_ns + std.time.ns_per_s);
+    try testing.expectEqual(@as(u32, 1), just_after.seconds);
+    try testing.expectEqual(@as(u32, 0), just_after.fraction);
+}
+
 test "fixed-point fraction ↔ nanoseconds" {
     // fraction 0x8000_0000 = half a second = 500_000_000 ns.
     const half: Timestamp = .{ .seconds = 0, .fraction = 0x8000_0000 };

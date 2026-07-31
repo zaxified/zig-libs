@@ -552,6 +552,43 @@ test "positive control: keying by the next hop makes the golden dest lookup RED"
 
 // ── Part B ───────────────────────────────────────────────────────────────────
 
+test "sort tie-break: colliding key B-MACs order ascending by destination system-id" {
+    const gpa = testing.allocator;
+    const a = sysId(0xA);
+    const d = sysId(0xD);
+    const e = sysId(0xE);
+
+    // Two distinct destinations (D, E) both reached via next-hop A — under
+    // key_by_next_hop_bmac their entries collide on the same key B-MAC, which
+    // forces the tie-break (by dest_system_id) to actually decide the order.
+    var table = try makeTable(gpa, &.{
+        .{ .dest = a, .next_hop = a, .metric = 0 },
+        .{ .dest = e, .next_hop = a, .metric = 10 },
+        .{ .dest = d, .next_hop = a, .metric = 10 },
+    });
+    defer table.deinit();
+    const map = [_]BmacEntry{
+        .{ .system_id = a, .b_mac = bmac(0xA) },
+        .{ .system_id = d, .b_mac = bmac(0xD) },
+        .{ .system_id = e, .b_mac = bmac(0xE) },
+    };
+
+    var fib = try buildWith(gpa, &table, &map, .{ .key_by_next_hop_bmac = true });
+    defer fib.deinit();
+
+    // D and E both key on bmac(0xA) (their shared next hop); the sort must
+    // still land D before E because 0xD < 0xE, not insertion order (E was
+    // inserted first) and not the reverse.
+    var seen_colliding: usize = 0;
+    for (fib.entries[0..fib.entries.len -| 1], fib.entries[1..]) |x, y| {
+        if (std.mem.eql(u8, &x.dest_bmac, &y.dest_bmac)) {
+            seen_colliding += 1;
+            try testing.expect(std.mem.order(u8, &x.dest_system_id, &y.dest_system_id) == .lt);
+        }
+    }
+    try testing.expect(seen_colliding >= 1); // the collision actually happened
+}
+
 test "groupDa: exact bytes vs RFC 6329 §4.4 hand-derived worked examples" {
     // I-SID 200 (0xC8), SPSourceID 0x04001 ⇒ 03:40:01:00:00:C8.
     try testing.expectEqual(

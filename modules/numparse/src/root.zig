@@ -107,6 +107,16 @@ test "parseGroupedNumber: American format" {
     try testing.expect(parseGroupedNumber("1,2345", ',', '.') == null);
 }
 
+test "parseGroupedNumber: more than 3 leading digits before the first group is rejected" {
+    // "1234,567" has 4 leading digits before the separator — the grammar
+    // requires 1-3, even though "567" is itself a well-formed 3-digit group.
+    try testing.expect(parseGroupedNumber("1234,567", ',', '.') == null);
+}
+
+test "parseGroupedNumber: trailing decimal separator with no digits after it is rejected" {
+    try testing.expect(parseGroupedNumber("1,234.", ',', '.') == null);
+}
+
 test "parseGroupedNumber: European format" {
     try testing.expectEqual((try Decimal.parse("1234.56")).raw, parseGroupedNumber("1.234,56", '.', ',').?.raw);
     try testing.expectEqual((try Decimal.parse("-1234567.89")).raw, parseGroupedNumber("-1.234.567,89", '.', ',').?.raw);

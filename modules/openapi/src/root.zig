@@ -481,6 +481,26 @@ test "generate: method grouping is deterministic (enum order, not registration o
         "}}}", json);
 }
 
+test "generate: colliding (method, path) from two different patterns — first registration wins, no duplicate key" {
+    // "/users/:id" and the literal "/users/{id}" both convert to the same
+    // OpenAPI path template. Per the module doc, the first registration
+    // wins and the method is emitted exactly once (a duplicate JSON key
+    // would otherwise be produced).
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/users/:id", hOk, .{ .summary = "First" });
+    try r.addDoc(.get, "/users/{id}", hOk, .{ .summary = "Second" });
+
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const path_item = parsed.value.object.get("paths").?.object.get("/users/{id}").?.object;
+    try testing.expectEqual(@as(usize, 1), path_item.count()); // one "get" key, not merged twice
+    try testing.expectEqualStrings("First", path_item.get("get").?.object.get("summary").?.string);
+}
+
 test "generate: malformed request_schema → error.InvalidRequestSchema" {
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
@@ -564,6 +584,11 @@ test "endpoint: serves the spec, 405 on other methods, passthrough elsewhere" {
         const got = runWire(&r, wire("POST", "/openapi.json"), &buf);
         try expectStatus(got, "405");
         try expectHeaderLine(got, "Allow: GET, HEAD");
+    }
+    { // HEAD is accepted too (the Allow header above advertises it)
+        const got = runWire(&r, wire("HEAD", "/openapi.json"), &buf);
+        try expectStatus(got, "200");
+        try expectHeaderLine(got, "Content-Type: application/json");
     }
     { // other paths pass through to the routes
         const got = runWire(&r, wire("GET", "/hello"), &buf);

@@ -594,6 +594,9 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(isSpecialUseHost("fe80::1"));
     try testing.expect(isSpecialUseHost("fc00::1"));
     try testing.expect(isSpecialUseHost("0.0.0.0"));
+    try testing.expect(isSpecialUseHost("224.0.0.1")); // IPv4 multicast
+    try testing.expect(isSpecialUseHost("239.255.255.255")); // IPv4 multicast, top of range
+    try testing.expect(isSpecialUseHost("ff02::1")); // IPv6 multicast
     try testing.expect(isSpecialUseHost("localhost"));
     try testing.expect(isSpecialUseHost("LOCALHOST"));
     try testing.expect(isSpecialUseHost("foo.localhost"));

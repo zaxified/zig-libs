@@ -422,6 +422,18 @@ const FakeConnector = struct {
     }
 };
 
+test "LiveConnector.classifyErr: refused/timeout/other map to distinct Status" {
+    // Only the `.up` path is reachable from the hermetic live test below (a
+    // bound-but-not-accepting listener never actually refuses or times out),
+    // so the connect-error classification is exercised directly here.
+    try testing.expectEqual(Status.refused, LiveConnector.classifyErr(error.ConnectionRefused).status);
+    try testing.expectEqual(Status.timeout, LiveConnector.classifyErr(error.Timeout).status);
+    try testing.expectEqual(Status.@"error", LiveConnector.classifyErr(error.NameResolutionFailed).status);
+    // None of the three collapse into each other.
+    try testing.expect(LiveConnector.classifyErr(error.ConnectionRefused).status !=
+        LiveConnector.classifyErr(error.Timeout).status);
+}
+
 test "Target.parse KATs" {
     {
         const t = try Target.parse("example.com:443");
@@ -497,6 +509,32 @@ test "N repetitions aggregate to min/avg/max and loss%" {
     try testing.expectEqual(@as(f64, @floatFromInt(20 * ms)), r.stats.mean_ns);
     try testing.expectEqual(@as(f64, 25.0), r.lossPct());
     try testing.expect(r.reachable());
+}
+
+test "count is clamped to [1, max_repetitions]" {
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "svc", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+
+    // count = 0 clamps up to 1, not 0 (which would allocate an empty, useless sample set).
+    {
+        const r = try probeTarget(testing.allocator, .{ .host = "svc", .port = 1 }, .{
+            .connector = fake.connector(),
+            .count = 0,
+        });
+        defer r.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), r.samples.len);
+    }
+    // count above the hard cap clamps down to `max_repetitions`, not the caller's value.
+    {
+        const r = try probeTarget(testing.allocator, .{ .host = "svc", .port = 1 }, .{
+            .connector = fake.connector(),
+            .count = max_repetitions + 1000,
+        });
+        defer r.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, max_repetitions), r.samples.len);
+    }
 }
 
 test "app_check downgrades an up connect to error" {

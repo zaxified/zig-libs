@@ -349,6 +349,22 @@ test "no allocation after init: tens of thousands of add/fetch/fetchPtr/release/
     m.clear(); // also allocation-free
 }
 
+test "clear frees slots across the whole id space, not just the low end" {
+    var m = try SeqMap.init(testing.allocator);
+    defer m.deinit(testing.allocator);
+
+    // Drive the cursor past the halfway point so the reserved slot lives in
+    // the upper half of the table, then confirm clear() reaches it too.
+    var i: usize = 0;
+    while (i < capacity / 2 + 100) : (i += 1) _ = try m.add(1, 0, 0);
+    const seq: u16 = @intCast(capacity / 2 + 99);
+    try testing.expect(m.fetch(seq) != null);
+
+    m.clear();
+    try testing.expect(m.fetch(seq) == null);
+    try testing.expect(m.fetch(capacity - 1) == null);
+}
+
 test "capacity is the full 16-bit id space" {
     try testing.expectEqual(@as(usize, 65536), capacity);
 }

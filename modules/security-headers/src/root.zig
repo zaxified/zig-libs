@@ -415,6 +415,21 @@ test "CSP: absent by default, present exactly as configured; Report-Only indepen
     try expectHeaderLine(got, "Content-Security-Policy-Report-Only: default-src 'self'");
 }
 
+test "csp_helmet_default: reproduced helmet.js v7 posture, byte-exact through the middleware" {
+    const sh: SecurityHeaders = .init(.{ .content_security_policy = csp_helmet_default });
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, wire("/t"), &buf);
+    try expectHeaderLine(got, "Content-Security-Policy: default-src 'self';base-uri 'self';" ++
+        "font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';" ++
+        "img-src 'self' data:;object-src 'none';script-src 'self';script-src-attr 'none';" ++
+        "style-src 'self' https: 'unsafe-inline';upgrade-insecure-requests");
+}
+
 test "COEP: off by default, opt-in emits it" {
     const sh: SecurityHeaders = .init(.{ .cross_origin_embedder_policy = "require-corp" });
     var r = router.Router.init(testing.allocator);

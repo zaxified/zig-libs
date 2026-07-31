@@ -301,6 +301,19 @@ test "tap_tweak_tag is the BIP341 domain tag string" {
     try std.testing.expectEqualStrings("TapTweak", tap_tweak_tag);
 }
 
+test "tweakPublicKey: rejects an internal key that is not on the curve" {
+    // BIP340's own KAT vector index 5 ("public key not on the curve").
+    // XOnlyPublicKey.fromBytes would already reject this at parse time, so
+    // to reach tweakPublicKey's own lift()-failure branch (step 3) the
+    // struct is built directly, bypassing that earlier validation — this is
+    // the only way to exercise taproot's *own* InvalidInternalKey path
+    // rather than bip340's parse-time one.
+    var bad_x: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bad_x, "EEFDEA4CDB677750A420FEE807EACF21EB9898AE79B9768766E4FAA04A2D4A34");
+    const bad_internal = bip340.XOnlyPublicKey{ .x = bad_x };
+    try std.testing.expectError(error.InvalidInternalKey, tweakPublicKey(bad_internal, null));
+}
+
 test "tweakSecretKey's internal bip340.KeyPair.deinit zeroizes the normalized scalar (regression: fails if secureZero is removed)" {
     // tweakSecretKey (above) defers kp.deinit() on exactly this type;
     // this test exercises that same deinit path directly so a regression

@@ -299,6 +299,20 @@ test "million 'a' vector — LE-length padding stress" {
     try testing.expectEqualSlices(u8, &out, &out2);
 }
 
+test "final() padding boundary: message length 55 (mod 64) needs no extra block" {
+    // buf_len after the 0x80 terminator is exactly 56, leaving exactly the 8
+    // bytes needed for the LE length suffix — the single-block path, not the
+    // "pad+compress, then a fresh zero block" path `final` takes when there
+    // isn't room. None of the other vectors' lengths land exactly here.
+    // Reference computed independently with both Python hashlib and
+    // `openssl dgst -rmd160` (agree).
+    var msg: [55]u8 = undefined;
+    for (&msg, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var out: [Ripemd160.digest_length]u8 = undefined;
+    Ripemd160.hash(&msg, &out, .{});
+    try expectHex("3c86963b3ff646a65ae42996e9664c747cc7e5e6", out);
+}
+
 test "streaming: chunked update equals one-shot, across block boundaries" {
     for (kats) |v| {
         var one_shot: [Ripemd160.digest_length]u8 = undefined;

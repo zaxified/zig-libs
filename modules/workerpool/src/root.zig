@@ -591,6 +591,39 @@ test "idle → wake: a submit into an idle pool runs promptly" {
     try testing.expectEqual(@as(u64, 1), c.n.load(.seq_cst));
 }
 
+test "drain is idempotent: a second call (and a shutdownNow after) is a safe no-op" {
+    // The documented contract on both `drain` and `shutdownNow` is "a second
+    // call is a no-op" -- guarded by a cmpxchg from `.running`. Nothing in the
+    // suite previously called either lifecycle method twice on the same pool,
+    // so a broken guard (e.g. an unconditional state store that re-enters the
+    // join loop on already-joined threads) went unnoticed.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 10_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    for (0..100) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+
+    pool.drain();
+    try testing.expectEqual(@as(u64, 100), c.n.load(.seq_cst));
+
+    // Second drain(): must not re-join already-joined threads or re-wake.
+    pool.drain();
+    try testing.expectEqual(@as(u64, 100), c.n.load(.seq_cst));
+
+    // shutdownNow() after a completed drain() must also be a no-op, not a
+    // second join of the same threads.
+    pool.shutdownNow();
+    try testing.expectEqual(@as(u64, 100), c.n.load(.seq_cst));
+}
+
 test "shutdown while idle terminates cleanly" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();

@@ -329,6 +329,23 @@ fn decodeStatus(status: u32) ProcResult {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+test "decodeStatus: normal exit (zero and nonzero code) and signal-killed (with/without core dump)" {
+    // Normal exit: low 7 bits of the wait(2) status are 0; the code is bits 8..15.
+    try std.testing.expectEqual(ProcResult{ .ok = true, .exit_code = 0, .term_signal = null, .spawn_failed = false }, decodeStatus(0 << 8));
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = 1, .term_signal = null, .spawn_failed = false }, decodeStatus(1 << 8));
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = 137, .term_signal = null, .spawn_failed = false }, decodeStatus(137 << 8));
+
+    // Killed by a signal: low 7 bits are the signal number (nonzero), no exit code.
+    // SIGKILL = 9.
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = null, .term_signal = 9, .spawn_failed = false }, decodeStatus(9));
+    // The core-dump flag (bit 7, 0x80) must not leak into the reported signal.
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = null, .term_signal = 9, .spawn_failed = false }, decodeStatus(0x80 | 9));
+    // SIGSEGV = 11.
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = null, .term_signal = 11, .spawn_failed = false }, decodeStatus(11));
+    // A high real-time-signal number (bit 6 set) must round-trip too.
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = null, .term_signal = 64, .spawn_failed = false }, decodeStatus(64));
+}
+
 test "Loop.poll: pipe becomes readable within timeout" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var fds: [2]i32 = undefined;
@@ -433,6 +450,24 @@ test "JobTable: claim/finish/drain handoff + slot reuse under N>capacity" {
 
     try std.testing.expectEqual(@as(u32, 6), Drainer.count);
     try std.testing.expectEqual(@as(u32, 1 + 2 + 3 + 4 + 5 + 6), Drainer.sum);
+}
+
+test "JobTable.release: rolls a claimed-but-unused slot back to FREE, not DONE" {
+    const Job = struct { value: u32 = 0 };
+    const Table = JobTable(2, Job);
+    var table: Table = .{};
+
+    const job = table.claim().?;
+    try std.testing.expectEqual(@as(usize, 1), table.busy());
+    table.release(job);
+    // If release left the slot DONE instead of FREE, `busy()` would still
+    // report it as occupied, and `drain` (not `claim`) would be the only way
+    // to recycle it.
+    try std.testing.expectEqual(@as(usize, 0), table.busy());
+    // A genuinely FREE slot is reclaimable by `claim`, without going through
+    // `drain` first.
+    try std.testing.expect(table.claim() != null);
+    try std.testing.expectEqual(@as(usize, 1), table.busy());
 }
 
 test "JobTable.spawnDetached: /bin/true succeeds, /bin/false fails (real fork/exec)" {

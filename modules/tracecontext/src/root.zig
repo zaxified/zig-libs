@@ -441,6 +441,24 @@ test "echo=false omits the header but keeps current()" {
     try testing.expectEqual(@as(usize, TraceParent.header_len), bodyOf(got).len); // current() set
 }
 
+test "trust_incoming=false always starts a fresh trace, even with a valid incoming traceparent" {
+    var tc = TraceContext{ .options = .{ .trust_incoming = false } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(tc.middleware());
+    try r.get("/", hEchoCurrent);
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "traceparent: " ++ sample ++ "\r\nConnection: close\r\n\r\n", &buf);
+
+    const hdr = headerValue(got, "traceparent").?;
+    const parsed = try TraceParent.parse(hdr); // still a valid fresh context
+    // The incoming trace-id must NOT have been kept: a fresh trace-id was minted.
+    try testing.expect(!std.mem.eql(u8, sample_trace, hdr[3..35]));
+    _ = parsed;
+}
+
 test "tracestate is carried through unchanged" {
     var tc = TraceContext{};
     var r = router.Router.init(testing.allocator);
@@ -456,6 +474,69 @@ test "tracestate is carried through unchanged" {
         "rojo=00f067aa0ba902b7,congo=t61rcWkgMzE",
         headerValue(got, "tracestate").?,
     );
+}
+
+test "tracestate: invalid values (empty, too long, control char) are dropped, not passed through" {
+    // Empty value: dropped.
+    {
+        var tc = TraceContext{};
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoCurrent);
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+            "traceparent: " ++ sample ++ "\r\ntracestate: \r\n" ++
+            "Connection: close\r\n\r\n", &buf);
+        try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+    }
+    // Longer than max_state_len (512): dropped, at the exact boundary + 1.
+    {
+        var tc = TraceContext{};
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoCurrent);
+
+        var req_buf: [4096]u8 = undefined;
+        const too_long = [_]u8{'a'} ** (max_state_len + 1);
+        const req = try std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+            "traceparent: " ++ sample ++ "\r\ntracestate: {s}\r\n" ++
+            "Connection: close\r\n\r\n", .{too_long});
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, req, &buf);
+        try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+    }
+    // A control character (below 0x20): dropped.
+    {
+        var tc = TraceContext{};
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoCurrent);
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+            "traceparent: " ++ sample ++ "\r\ntracestate: rojo=\x01bad\r\n" ++
+            "Connection: close\r\n\r\n", &buf);
+        try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+    }
+    // Exactly at the boundary (max_state_len): kept.
+    {
+        var tc = TraceContext{};
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoCurrent);
+
+        var req_buf: [4096]u8 = undefined;
+        const at_boundary = [_]u8{'a'} ** max_state_len;
+        const req = try std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+            "traceparent: " ++ sample ++ "\r\ntracestate: {s}\r\n" ++
+            "Connection: close\r\n\r\n", .{at_boundary});
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, req, &buf);
+        try testing.expectEqualStrings(&at_boundary, headerValue(got, "tracestate").?);
+    }
 }
 
 test "parse / write round-trip" {

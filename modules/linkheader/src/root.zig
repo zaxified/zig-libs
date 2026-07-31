@@ -418,6 +418,17 @@ test "parse: comma inside the URI does not split the link" {
     try testing.expect(it.next() == null);
 }
 
+test "parse: backslash-escaped quote inside a quoted value is not mistaken for the closing quote" {
+    // Raw bytes of the title param value: a \ " b  (backslash-escaped quote,
+    // per RFC 8288 quoted-string escaping). The parser must skip the escaped
+    // byte and keep scanning, returning the value verbatim (escape included).
+    var it = parse("<u>; rel=\"next\"; title=\"a\\\"b\"");
+    const l = it.next().?;
+    try testing.expectEqualStrings("next", l.rel);
+    try testing.expectEqualStrings("a\\\"b", l.title.?);
+    try testing.expect(it.next() == null);
+}
+
 test "parse: comma and semicolon inside a quoted value" {
     var it = parse("<u>; rel=\"next\"; title=\"a, b; c\", <v>; rel=\"prev\"");
     const a = it.next().?;
@@ -438,6 +449,14 @@ test "parse: first occurrence of a param wins" {
     const l = it.next().?;
     try testing.expectEqualStrings("next", l.rel);
     try testing.expectEqualStrings("A", l.title.?);
+}
+
+test "parse: stray empty param name (double semicolon) does not stop later params" {
+    var it = parse("<u>;;rel=\"next\";title=\"T\"");
+    const l = it.next().?;
+    try testing.expectEqualStrings("next", l.rel);
+    try testing.expectEqualStrings("T", l.title.?);
+    try testing.expect(it.next() == null);
 }
 
 test "parse: case-insensitive param names" {

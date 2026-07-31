@@ -246,6 +246,41 @@ test "adopts a valid incoming ID" {
     try testing.expectEqualStrings("edge-abc-123", bodyOf(got));
 }
 
+test "isAdoptable: DEL (0x7f) and high-bit bytes are rejected, 0x7e is fine" {
+    try testing.expect(!isAdoptable("abc\x7fdef"));
+    try testing.expect(!isAdoptable("abc\xffdef"));
+    try testing.expect(isAdoptable("abc\x7edef")); // '~', the last printable ASCII byte
+    try testing.expect(!isAdoptable("")); // empty is never adoptable
+}
+
+test "adopt length boundary: exactly max_adopt_len is adopted, one over is regenerated" {
+    var ri = RequestId{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(ri.middleware());
+    try r.get("/", hEchoCurrent);
+
+    var req_buf: [1024]u8 = undefined;
+    var resp_buf: [1024]u8 = undefined;
+
+    // Exactly max_adopt_len ('a' * 200): must be adopted verbatim.
+    {
+        const val: [max_adopt_len]u8 = @splat('a');
+        const req = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{val}) catch unreachable;
+        const got = runWire(&r, req, &resp_buf);
+        try testing.expectEqualStrings(&val, headerValue(got, "X-Request-Id").?);
+    }
+    // One byte over max_adopt_len: rejected, a fresh generated ID is used instead.
+    {
+        const val: [max_adopt_len + 1]u8 = @splat('a');
+        const req = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{val}) catch unreachable;
+        const got = runWire(&r, req, &resp_buf);
+        const hdr = headerValue(got, "X-Request-Id").?;
+        try testing.expectEqual(@as(usize, generated_len), hdr.len);
+        try testing.expect(!std.mem.eql(u8, &val, hdr));
+    }
+}
+
 test "regenerates when the incoming ID is malformed (spaces) or trust is off" {
     // Malformed incoming (contains a space) → not adopted, a fresh one is used.
     {
