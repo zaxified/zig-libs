@@ -26,6 +26,26 @@ mkdir -p "$OUT"
 mapfile -t MODS < <(grep -rl 'testing\.fuzz(' modules/*/src/*.zig 2>/dev/null |
     sed 's|modules/||; s|/src/.*||' | sort -u)
 total=${#MODS[@]}
+
+# ⭐ WARM THE BUILD CACHE FIRST, or the budget is a lie. Each module's window
+# is spent on `zig build`, COMPILE INCLUDED — so a module with a slow
+# ReleaseSafe build gets a fraction of its nominal seconds actually fuzzing,
+# and reports "clean" for a sweep that barely ran. Measured on `imap`: a
+# planted 1-byte trigger was NOT found in 45s cold and WAS found within 60s
+# once the build was cached.
+#
+# This is a different failure from NEVER-FUZZED below. That one catches a run
+# that never reached the loop at all; it cannot see one that reached it with
+# five seconds left, which looks identical to a clean result.
+echo "warming $total ReleaseSafe builds so the budget is spent fuzzing, not compiling..."
+warm_start=$(date +%s)
+for m in "${MODS[@]}"; do
+    ./scripts/capped zig build "test-$m" --release=safe > /dev/null 2>&1 ||
+        echo "  warm FAILED: $m (its window will include a compile)"
+done
+echo "warmed in $(( $(date +%s) - warm_start ))s"
+echo
+
 i=0
 for m in "${MODS[@]}"; do
     i=$((i + 1))
