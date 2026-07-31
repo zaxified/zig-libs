@@ -41,7 +41,11 @@ mis-keyed MACs ⇒ `error.ServerAuthentication` /
 `error.ClientAuthentication` — all timing-safe, all fail closed.
 
 See `SPEC.md` for the threat model, the internal-keying envelope, and
-the 3DH schedule; `NOTICE` for provenance (clean-room from the RFC
-text).
+the 3DH schedule.
+
+Provenance: clean-room from RFC 9807, a public IRTF specification, with its own
+test vectors as the byte-exact anchor. No reference implementation consulted.
+Detail in this module's own [`NOTICE`](NOTICE); it carries no condition beyond
+zig-libs' MIT license.
 
 Test: `zig build test-opaque`

@@ -28,6 +28,12 @@ different challenge hash), and the full threat model.
 | `kat_vectors.zig` | RFC 9591 Appendix E.5's official secp256k1/SHA-256 test vector, embedded |
 | `kat_test.zig` | KAT assertions against every embedded value + an end-to-end (2,3) round-trip test |
 
+Provenance: clean-room from RFC 9591 (FROST) and RFC 9380 (hash-to-curve), both
+public IRTF/IETF specifications with no reference implementation consulted; the
+secp256k1 group comes from the sibling [`k256`](../k256) module. Detail in this
+module's own [`NOTICE`](NOTICE); it carries no condition beyond zig-libs' MIT
+license.
+
 ## Import
 
 ```zig

@@ -36,6 +36,12 @@ substantial < high; exact match for non-eIDAS class refs). See `SPEC.md` for the
 encrypted-ID/attribute error model, the full HoK matching matrix, the
 sender-vouches trust assumption, and the LoA semantics.
 
+Provenance: clean-room from OASIS SAML 2.0 (SAMLCore / SAMLProf), a public
+specification, hardened per the published *On Breaking SAML* signature-wrapping
+analysis. No third-party SAML implementation was consulted, so no `NOTICE`
+entry is required (root [`NOTICE`](../../NOTICE) §0). Per-fixture provenance —
+which vectors are captured and which are constructed — is in `SPEC.md`.
+
 ## Worked example — verify a POST-binding Response
 
 ```zig

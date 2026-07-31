@@ -1,7 +1,7 @@
 # csvstream — spec
 
 Streaming RFC 4180 CSV reader that preserves byte offsets. Usage: see ./README.md.
-Attribution/provenance: see /NOTICE.
+Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 - **Two layers, one record model:** both emit `LineSlice { bytes, byte_offset, unbalanced_quote }`.

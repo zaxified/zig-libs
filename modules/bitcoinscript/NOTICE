@@ -1,0 +1,39 @@
+bitcoinscript — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test vectors.
+
+## Bitcoin Core `script_tests.json`
+
+`src/script_tests_vectors.zig` reproduces a filtered subset of the official
+script-conformance corpus published by the Bitcoin Core project at
+`src/test/data/script_tests.json` (fetched 2026-07 from `master`). Each row's
+`scriptSig` / `scriptPubKey` assembly text, flag set, expected result and
+comment are transcribed verbatim by script, never hand-typed. The filter is
+mechanical and documented in `SPEC.md` ("script_tests.json coverage").
+
+The synthetic crediting/spending transaction pair the vectors are evaluated
+against follows `script_tests.cpp`'s `BuildCreditingTransaction` /
+`BuildSpendingTransaction` — behavior reproduced from the published test
+harness so the expected results mean the same thing they do upstream.
+
+  Copyright (c) 2009-2010 Satoshi Nakamoto
+  Copyright (c) 2009-present The Bitcoin Core developers
+  Distributed under the MIT software license, see
+  https://opensource.org/licenses/MIT
+
+No Bitcoin Core C++ source is present in this module. The script interpreter
+itself is clean-room from the published consensus rules and the BIPs; see this
+module's README "Provenance" note. What is reproduced here, and only here, is
+conformance DATA — which is precisely why the notice lives beside it.
+
+The sibling `bitcointx` module cites Bitcoin Core as a design reference for the
+legacy sighash algorithm; that is a §2-style provenance record and is in the
+root `NOTICE`, not here, because nothing of theirs is reproduced there.

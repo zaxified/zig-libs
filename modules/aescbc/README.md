@@ -12,6 +12,11 @@ the padding-oracle caveat, and the AES-192 exclusion.
   padding); W3C XML-Encryption Syntax and Processing 1.1 §5.2 (xmlenc
   padding).
 
+Provenance: clean-room from NIST SP800-38A §6.2, RFC 5652 §6.3 (PKCS#7) and
+W3C XML-Encryption 1.1 §5.2 — all public specs; the AES block cipher itself is
+`std.crypto.core.aes`. No third-party source ported or studied, so no `NOTICE`
+entry is required (root [`NOTICE`](../../NOTICE) §0).
+
 ## Usage
 
 ```zig

@@ -19,6 +19,14 @@ parameter set nobody has published constants for.
 **Model-after:** `iden3/circomlib` + `iden3/circomlibjs` (what deployed circom
 circuits use), and the Poseidon authors' own `hadeshash` sage reference.
 
+Provenance: ⚠ **this module carries required attribution.** The parameter
+generator and the MDS acceptance checks **port** the Poseidon authors'
+`hadeshash` reference (MIT), whose copyright notice must be preserved in any
+copy — the terms are in this module's own [`NOTICE`](NOTICE), beside the code
+that owes them. `iden3/circomlib` + `circomlibjs` are design references for the
+deployed constants, recorded in the root [`NOTICE`](../../NOTICE). Neither
+imposes a condition beyond MIT's own.
+
 ## Read this first
 
 > **The permutation is the easy part.** Twenty lines. Every implementation

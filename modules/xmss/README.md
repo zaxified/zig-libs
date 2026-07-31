@@ -59,3 +59,10 @@ reference at every leaf for two heights, plus a dedicated resync test).
 - **Deps:** none (std only — `std.crypto.hash.sha2.Sha256`).
 - **Consumer:** SCADA firmware signing (IEC 62443-style code-signing
   chains standardize on SP 800-208 stateful HBS).
+
+Provenance: clean-room from RFC 8391, a public IRTF specification. The XMSS
+reference implementation was exercised only as a **black-box KAT oracle** —
+built, run, and its output diffed against ours; no source was read or ported,
+which per the root [`NOTICE`](../../NOTICE) §0 is neither a port nor a design
+reference. Detail in this module's own [`NOTICE`](NOTICE); it carries no
+condition beyond zig-libs' MIT license.

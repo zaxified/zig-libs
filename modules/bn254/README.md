@@ -46,6 +46,13 @@ see `SPEC.md`. Parts 5-6 (`precompiles.zig`, `groth16.zig`) are pure
 composition on top — no new field/curve/pairing algorithm, see
 `SPEC.md`'s "Part 5"/"Part 6" sections for the tier accounting.
 
+Provenance: clean-room from the public BN254 / alt-bn128 construction as
+specified by EIP-196/197, sharing the sibling [`bls12_381`](../bls12_381)
+module's structure with BN254's own constants substituted in and independently
+re-verified. Curve parameters are numeric facts, not copyrightable expression.
+Detail in this module's own [`NOTICE`](NOTICE); it carries no condition beyond
+zig-libs' MIT license.
+
 ## The multi-part arc
 
 | Part | Scope | Status |

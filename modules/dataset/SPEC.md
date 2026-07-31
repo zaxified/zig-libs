@@ -1,7 +1,7 @@
 # dataset — spec
 
 Canonical in-memory columnar-typed table — the seam between data sources and consumers. Usage: see
-./README.md. Attribution/provenance: see /NOTICE.
+./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 - Every origin normalizes to one shape: `{ columns: [{name,type}], rows: [[Value…]] }`; consumers

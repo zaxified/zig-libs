@@ -17,6 +17,11 @@ RFC 4231; plus full two-sided protocol round-trips). See `SPEC.md`.
 | `kat_vectors.zig` | NIST SP 800-38A CBC + RFC 5869 HKDF + RFC 5903 ECDH + RFC 4231 HMAC vectors, cited |
 | `kat_test.zig` | Byte-exact KAT assertions + protocol round-trip/tamper/length tests |
 
+Provenance: clean-room from the FIDO Alliance CTAP 2.1 specification §6.5.6–6.5.8,
+a public specification; every KAT is a published NIST/RFC vector. No third-party
+authenticator or client source was consulted. Detail in this module's own
+[`NOTICE`](NOTICE); it carries no condition beyond zig-libs' MIT license.
+
 ## Import
 
 ```zig

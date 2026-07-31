@@ -1,7 +1,7 @@
 # argsafe — spec
 
 Allowlist validators + a typed argv builder neutralizing argument/flag injection into an exec argv.
-Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 - **`CharClass`** — the one composable predicate every convenience function collapses to: byte-class

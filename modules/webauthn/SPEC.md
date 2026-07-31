@@ -1,6 +1,8 @@
 # webauthn — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance:
+see this module's README "Provenance" note — clean-room from the W3C spec, so
+there is deliberately no root `/NOTICE` entry to point at.
 
 ## Design & invariants
 

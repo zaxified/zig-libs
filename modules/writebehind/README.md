@@ -21,6 +21,14 @@ speed while keeping durability. It is a pure **composition** of four modules:
   `kv`'s `Storage`/`FsStorage`/`SimStorage` seam — `writebehind` re-exports them
   too, so a consumer needs no direct `kv` import for the WAL backend).
 
+Provenance: original work of the zig-libs authors (MIT) — a pure composition of
+[`ramcache`](../ramcache) + [`jobqueue`](../jobqueue) +
+[`workerpool`](../workerpool) + [`kvtree`](../kvtree), with no new crypto and no
+new storage engine. Caffeine's `writeBehind` and a DB buffer pool are named as
+conceptual analogues of the *pattern*; neither was consulted as an
+implementation, so no `NOTICE` entry is required (root
+[`NOTICE`](../../NOTICE) §0).
+
 ## Guarantee
 
 - **Durability:** when `put(k, v)` returns, `v`'s WAL record has been fsync'd — a

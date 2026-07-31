@@ -169,4 +169,9 @@ master 1, port 20000) so the oracle needs no patching.
 What was actually run against real third-party masters (all seven protocols,
 with the transcript of what each master did), the determinism proof, the
 measured scale numbers and the deferred list are in [SPEC.md](./SPEC.md).
-Provenance: see [/NOTICE](../../NOTICE).
+Provenance: original work of the zig-libs authors (MIT), composed over
+[`netsim`](../netsim) — which carries its own entry for the TigerBeetle VOPR
+methodology reference. The device-behavior envelope follows what SCADA device
+simulators (ModbusPal, Kepware's simulation driver) expose in their public
+documentation — observable behavior only, no source consulted. Recorded in the
+root [`NOTICE`](../../NOTICE).

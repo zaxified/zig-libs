@@ -52,9 +52,12 @@ closely, is not "derived from" anyone's code. Accordingly:
 NONE at the repository level. zig-libs imposes no redistribution condition
 beyond its own MIT license.
 
-Where a module ports third-party code, that module carries its own `NOTICE`
-file next to its source, and the notice travels with the module. Currently
-one module does:
+Where a module ports third-party code, or reproduces third-party data whose
+notice must be preserved, that module carries its own `NOTICE` file next to its
+source, and the notice travels with the module. FIVE modules do, and these are
+the ONLY files in the repository that carry a condition naming anyone other
+than the zig-libs authors. Each such file's first line says
+`<name> — third-party attribution`:
 
   falcon   — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
              a second copyright holder, no condition beyond MIT's own)
@@ -62,10 +65,29 @@ one module does:
              with permission; test vectors only, no source code)
   poseidon — `modules/poseidon/NOTICE` (hadeshash reference sage script, MIT;
              the parameter generator and the MDS acceptance checks port it)
+  imap     — `modules/imap/NOTICE` (emersion/go-imap v2, MIT; three further
+             copyright holders, no condition beyond MIT's own)
+  bitcoinscript — `modules/bitcoinscript/NOTICE` (Bitcoin Core
+             `script_tests.json` conformance rows, MIT; test data only, no
+             source code)
 
 New modules that reproduce third-party code OR third-party data whose notice
 must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`
 beside the files that owe it, not an entry here.
+
+A SECOND, DIFFERENT KIND of `modules/<name>/NOTICE` file also exists, and must
+not be confused with the four above: a **provenance note**, whose first line
+says `<name> — provenance note`. Those are §2-style design-reference records
+that live beside the module instead of in this file — the practice grew up
+around the self-contained crypto/protocol modules, whose provenance runs to
+hundreds of lines per module (`bls12_381` alone is over 800) and would drown
+this file. They record what was consulted and argue why nothing is owed;
+**none of them imposes any condition**, and `zig build check-catalog` enforces
+that the two kinds stay distinguishable by that first line. Which kind a
+module needs is decided by CONVENTIONS.md §5, not by module size.
+
+So: to answer "does consuming zig-libs oblige me to anything beyond MIT?",
+read the four files listed above and nothing else.
 
 ====================================================================
 2. DESIGN REFERENCES — clean-room (recorded for provenance)
@@ -880,19 +902,6 @@ re-examined 2026-07-29 (both recorded in the project git history).
                P-256 has no efficiently-computable endomorphism, so — unlike
                k256 — there is no GLV construction to attribute.
 
-`rescue`   —  Rescue-Prime Optimized (RPO). The permutation, its parameters
-               and the constant-derivation rule are public specification facts
-               from the RPO report (github.com/ASDiscreteMathematics/rpo) and
-               eprint 2020/1143. The 38 published test vectors in that report,
-               Winterfell's Rescue-XLIX permutation KAT, and miden-crypto's
-               `EXPECTED` digests are used as byte-exact test ORACLES — policy
-               §0's black-box-oracle relationship, needing no attribution and
-               recorded here only for provenance. Winterfell's Rescue-XLIX
-               round constants could NOT be re-derived from the published
-               generator and are embedded as a pinned blob; that table is the
-               one place where an upstream artifact is carried rather than
-               reproduced, and `modules/rescue/SPEC.md` says so.
-
 `jinja`    —  clean-room from the Jinja2 documentation (the template-designer
                and API docs at jinja.palletsprojects.com) plus the observable
                behaviour of the installed reference implementation. NO Jinja2
@@ -906,6 +915,19 @@ re-examined 2026-07-29 (both recorded in the project git history).
                language semantics reproduced along the way (floored `//`/`%`,
                `repr` forms, banker's rounding) are facts of a published
                language specification, not of any implementation.
+
+`rescue`   —  Rescue-Prime Optimized (RPO). The permutation, its parameters
+               and the constant-derivation rule are public specification facts
+               from the RPO report (github.com/ASDiscreteMathematics/rpo) and
+               eprint 2020/1143. The 38 published test vectors in that report,
+               Winterfell's Rescue-XLIX permutation KAT, and miden-crypto's
+               `EXPECTED` digests are used as byte-exact test ORACLES — policy
+               §0's black-box-oracle relationship, needing no attribution and
+               recorded here only for provenance. Winterfell's Rescue-XLIX
+               round constants could NOT be re-derived from the published
+               generator and are embedded as a pinned blob; that table is the
+               one place where an upstream artifact is carried rather than
+               reproduced, and `modules/rescue/SPEC.md` says so.
 
 `reconcilable`
            —  clean-room from DOCUMENTATION only: the Kubernetes
@@ -924,5 +946,98 @@ re-examined 2026-07-29 (both recorded in the project git history).
                confirm-or-revert behaviour of Juniper `commit confirmed` and
                Cisco IOS-XE `configure replace ... commit timeout` — vendor
                documentation of a configuration workflow, not anyone's code.
+
+  netsim     — the deterministic seeded discrete-event simulator, the
+               failure-schedule fuzzer, the byte-exact replay oracle and the
+               ddmin counterexample minimizer are the authors' own original
+               work. The METHODOLOGY — a simulator that is a pure function of
+               its seed, driving a real implementation under a fuzzed fault
+               schedule with invariants checked after every event — follows
+               TigerBeetle's VOPR (Apache-2.0), a design reference only: no
+               TigerBeetle source was consulted or copied, and this module's
+               engine, event queue and API are unrelated to it. The splitmix64
+               mixer is Sebastiano Vigna's public-domain algorithm.
+
+  pping      — the passive-RTT technique (match a TCP TSecr back to the TSval
+               that produced it, seen earlier in the opposite direction) and
+               its first-echo-match-and-consume rule are Kathleen Nichols'
+               pping (Pollere LLC, <https://github.com/pollere/pping>,
+               GPL-3.0-or-later) — ALGORITHM AND BEHAVIOR ONLY, described in
+               its public documentation and papers. No pping source was
+               consulted, read or ported: this module is an independent Zig
+               implementation of a published measurement technique (a
+               technique is not a copyrightable work — see §0), and it
+               deliberately shares no code with, and derives nothing from,
+               that GPL codebase. The wire format is RFC 7323.
+
+  bitcointx  — BIP141/143/144/340/341 are public specifications, so those
+               sighash paths are clean-room. The LEGACY sighash predates the
+               BIP process and was never specified: its behavior — including
+               the `SIGHASH_SINGLE` bug, which is consensus and must be
+               reproduced bit-for-bit — is modeled on Bitcoin Core's
+               reference implementation (MIT), `SignatureHash()` in
+               `src/script/interpreter.cpp`, as a design reference for
+               behavior only; no source ported or copied.
+
+  btcp2p     — message shapes are clean-room from the public Bitcoin protocol
+               documentation (en.bitcoin.it/wiki/Protocol_documentation),
+               whose published `verack`/`version` hex dumps are used as
+               byte-exact test vectors. The constants that are DEPLOYED
+               rather than documented — `MAX_PROTOCOL_MESSAGE_LENGTH`
+               (`src/net.h`) and the network magic bytes
+               (`src/chainparams.cpp`) — were read from Bitcoin Core (MIT) as
+               a design reference: values and behavior only, no source ported.
+
+  conntrack  — clean-room from the kernel UAPI headers
+               (`linux/netfilter/nfnetlink.h`, `nfnetlink_conntrack.h`,
+               `nf_conntrack_common.h`, `nf_conntrack_tcp.h`;
+               GPL-2.0 WITH Linux-syscall-note) plus on-the-wire captures —
+               only the uncopyrightable ABI facts they document are used, the
+               same Linux-syscall-note mechanism `netlink`/`ebpf`/`tc` rely
+               on. `conntrack-tools`/`libnetfilter_conntrack` (GPL-2.0) are
+               named for WIRE BEHAVIOR observed by capture; no source was read
+               or ported, and this module derives nothing from that codebase.
+
+  fuzzysearch — the trie index, the bounded-edit-distance walk and the ranking
+               are the authors' own original work. Design references, approach
+               only: Steve Hanov's published trie + dynamic-programming
+               Levenshtein walk, Lucene's `FuzzyQuery` (Apache-2.0), and the
+               Schulz-Mihov Levenshtein-automaton papers. No source consulted
+               or copied.
+
+  geoindex   — the spatial index is the authors' own original work. Design
+               reference, approach only: Flatbush (mourner/flatbush, ISC) —
+               the packed-Hilbert-R-tree bulk-load idea. No source consulted
+               or copied.
+
+  trie       — the frozen autocomplete index is the authors' own original
+               work. Design references, approach only: BurntSushi's `fst`
+               (Rust, MIT OR Unlicense) and Lucene's FST (Apache-2.0). No
+               source consulted or copied.
+
+  xdp-classifier — clean-room from the public LibreQoS (GPL-2.0) architecture
+               DESCRIPTION — the classify-then-shape split, where an XDP
+               classification stage feeds a downstream tc/CAKE queueing
+               stage — as a design reference for structure only. No LibreQoS
+               source was read or ported and this module shares no code with
+               it. The wire ABI and instruction emission come from the sibling
+               `ebpf` module and the kernel UAPI/verifier documentation it
+               already cites.
+
+  fleetsim   — the fleet simulator is the authors' own original work,
+               composed over this repo's `netsim` (whose own entry records the
+               TigerBeetle VOPR methodology reference). The device-behavior
+               envelope follows what SCADA device simulators such as
+               ModbusPal (LGPL-3.0) and Kepware's simulation driver expose in
+               their PUBLIC DOCUMENTATION — observable behavior only, no
+               source consulted or copied.
+
+  readthrough — the read-through cache, its cross-thread miss coalescing and
+               its invalidation semantics are the authors' own original work.
+               The single-flight shape follows Go's `singleflight`
+               (golang.org/x/sync, BSD-3-Clause) and the loader shape follows
+               Caffeine's `LoadingCache` (Apache-2.0) — behavior and API shape
+               only, no source consulted or copied. The W-TinyLFU store
+               underneath is this repo's own `ramcache`; see its entry.
 
 See each module's README "Provenance" note for its specific design references.

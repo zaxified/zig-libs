@@ -442,8 +442,296 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
     }
 
     checkNonGoals(readme, b, &failed);
+    try checkProvenance(b, io, &failed);
 
     if (failed) return step.fail("catalog drift — see errors above", .{});
+}
+
+/// Provenance gate: every module says where it came from, and the repository
+/// can still answer "what do I owe a third party?" from ONE file.
+///
+/// Three claims, each of which was false somewhere when this was written:
+///
+///  1. Every module has a `README.md` carrying a `Provenance:` line
+///     (CONVENTIONS §6.1). 22 modules had no such line and 5 -- `ethfrag`,
+///     `liveness-hyst`, `netsim`, `pping`, `spf-ect` -- had no README at all.
+///     The old catalog check only ever read the ROOT README, so a module could
+///     ship with no documentation of its own and stay green.
+///
+///  2. Every `modules/<m>/NOTICE` declares its kind on line 1: either
+///     `<m> — third-party attribution` (carries a condition) or
+///     `<m> — provenance note` (record only). Without a discriminator the two
+///     are indistinguishable without reading all 42, and one of them is the
+///     one that matters legally.
+///
+///  3. The root NOTICE §1 list of condition-bearing modules is EXACTLY the set
+///     of `third-party attribution` files -- no missing entry (root §1 said
+///     "one module does" while listing three, when four existed: `imap` had
+///     been added a day earlier and root §1 was not) and no stale one.
+///
+///  4. Every `modules/<x>/NOTICE` §1 cites is a real module. Checks 1-3 are
+///     driven FROM `module_list`, so they can only ever see a module whose
+///     files disagree with §1 -- never a §1 row corresponding to nothing. A
+///     planted `modules/ghost/NOTICE` row passed all three.
+///
+///  5. A module's provenance note either STATES an answer (clean-room /
+///     original work / no entry needed) or has somewhere real to send the
+///     reader. `fleetsim`'s entire note was "Provenance: see /NOTICE." and
+///     NOTICE had never heard of it; five more cited entries that did not
+///     exist. A pointer to nothing is worse than silence -- the reader cannot
+///     tell "clean-room" from "somebody forgot".
+///
+/// Claim 3 is the load-bearing one. §1 is what lets a consumer conclude
+/// "zig-libs is plain MIT" without opening every module; an unlisted
+/// attribution file makes that conclusion wrong, which no test would ever
+/// notice. Claim 5 found the one real license defect of the sweep:
+/// `bitcoinscript` reproduces ~2000 rows of Bitcoin Core's `script_tests.json`
+/// verbatim -- the same shape as `decimal`'s decTest corpus -- with no
+/// attribution file at all.
+///
+/// Every claim was verified by planting the defect it describes and watching
+/// this step go red. Two lessons are baked into the code above:
+///
+///   - Claim 4 exists BECAUSE its mutation was the one that stayed green: the
+///     other checks are all driven FROM `module_list` and are structurally
+///     blind to a §1 row that corresponds to nothing.
+///   - Judge these mutations by the step's EXIT CODE. Grepping for `^error:`
+///     silently passed a build that did not compile (`build.zig:657: error:`
+///     does not start the line with `error:`), so two mutations "survived"
+///     against a binary that was never built.
+fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
+    const notice = try b.build_root.handle.readFileAlloc(io, "NOTICE", b.allocator, .limited(4 * 1024 * 1024));
+    const sec1 = sectionSlice(notice, "1. REQUIRED ATTRIBUTION", "2. DESIGN REFERENCES") orelse {
+        std.log.err("NOTICE has no \"1. REQUIRED ATTRIBUTION\" section for the provenance gate to check", .{});
+        failed.* = true;
+        return;
+    };
+
+    for (module_list) |m| {
+        const readme_path = b.fmt("modules/{s}/README.md", .{m.name});
+        if (b.build_root.handle.readFileAlloc(io, readme_path, b.allocator, .limited(4 * 1024 * 1024))) |mod_readme| {
+            // Two spellings are in use and both are fine: an inline
+            // `Provenance: …` line (the short case) and a `## Provenance`
+            // section (the crypto modules, whose provenance needs paragraphs).
+            // What is NOT accepted is the word appearing incidentally, e.g.
+            // "fixture provenance" or "see kat_vectors.zig for provenance" --
+            // that names where provenance lives without stating it.
+            if (std.mem.indexOf(u8, mod_readme, "Provenance:") == null and
+                std.mem.indexOf(u8, mod_readme, "## Provenance") == null)
+            {
+                std.log.err(
+                    "modules/{s}/README.md has no `Provenance:` line — say whether it is clean-room " ++
+                        "from a spec, a studied design reference (root NOTICE), or ported source " ++
+                        "(modules/{s}/NOTICE). See CONVENTIONS.md §5.",
+                    .{ m.name, m.name },
+                );
+                failed.* = true;
+            }
+        } else |_| {
+            std.log.err("module '{s}' has no modules/{s}/README.md (CONVENTIONS §6.1)", .{ m.name, m.name });
+            failed.* = true;
+        }
+
+        // A provenance statement that sends the reader to NOTICE must have
+        // something there to find. `fleetsim` said only "Provenance: see
+        // /NOTICE." and NOTICE had never heard of it; five more named real
+        // design references (Flatbush, BurntSushi/fst, Lucene, LibreQoS,
+        // conntrack-tools) and pointed at entries that did not exist. A
+        // pointer to nothing is worse than silence: the reader cannot tell
+        // "clean-room" from "somebody forgot".
+        if (b.build_root.handle.readFileAlloc(io, readme_path, b.allocator, .limited(4 * 1024 * 1024))) |mod_readme| {
+            if (provenanceStatement(mod_readme)) |raw_claim| {
+                // Match against a whitespace-collapsed copy. READMEs are hard
+                // wrapped, so "no `NOTICE`\nentry is required" and "No\n`NOTICE`
+                // entry required" both hide the disclaimer from a literal
+                // search -- this check reported 27 false positives, `raft` and
+                // half my own new lines among them, until it normalized first.
+                const claim = collapseWhitespace(b.allocator, raw_claim);
+                // The target is a statement that says NOTHING and merely
+                // points -- `fleetsim`'s entire note was "Provenance: see
+                // /NOTICE." and NOTICE had never heard of it. A note that
+                // states its own answer ("clean-room", "no source ported",
+                // "original work", "no entry needed") is fine whatever NOTICE
+                // says: the reader already has the answer. So this fires only
+                // when the note neither answers nor has anywhere real to send
+                // you.
+                // Case-insensitive: `x509` opens its section with "Clean-room"
+                // and a lowercase-only needle flagged it.
+                const answers = containsAnyIgnoreCase(claim, &.{
+                    "clean-room",           "clean room",     "original work",   "original composition",
+                    "no entry",             "none needed",    "none required",   "not required",
+                    "entry required",       "entry needed",   "no root",         "source ported",
+                    "source is ported",     "source read",    "source was read", "source consulted",
+                    "source was consulted", "no third-party",
+                });
+                if (!answers and !hasNoticeEntry(notice, m.name) and !fileExists(b, io, b.fmt("modules/{s}/NOTICE", .{m.name}))) {
+                    std.log.err(
+                        "modules/{s}/README.md's Provenance note neither states an answer " ++
+                            "(clean-room / original work / no entry needed) nor has anything to point " ++
+                            "at: no `{s}` entry in NOTICE and no modules/{s}/NOTICE",
+                        .{ m.name, m.name, m.name },
+                    );
+                    failed.* = true;
+                }
+            }
+        } else |_| {}
+
+        // The module-local NOTICE, if there is one, must declare its kind, and
+        // §1 must agree about whether it carries a condition.
+        const notice_path = b.fmt("modules/{s}/NOTICE", .{m.name});
+        const mod_notice = b.build_root.handle.readFileAlloc(io, notice_path, b.allocator, .limited(4 * 1024 * 1024)) catch {
+            // No module-local NOTICE: §1 must not claim there is one.
+            if (std.mem.indexOf(u8, sec1, notice_path) != null) {
+                std.log.err(
+                    "NOTICE §1 lists `{s}`, but that file does not exist",
+                    .{notice_path},
+                );
+                failed.* = true;
+            }
+            continue;
+        };
+
+        const first_line = mod_notice[0 .. std.mem.indexOfScalar(u8, mod_notice, '\n') orelse mod_notice.len];
+        const attribution = b.fmt("{s} — third-party attribution", .{m.name});
+        const provenance = b.fmt("{s} — provenance note", .{m.name});
+        const is_attribution = std.mem.eql(u8, std.mem.trim(u8, first_line, " \r"), attribution);
+        const is_provenance = std.mem.eql(u8, std.mem.trim(u8, first_line, " \r"), provenance);
+
+        if (!is_attribution and !is_provenance) {
+            std.log.err(
+                "{s} line 1 is \"{s}\" — it must be exactly \"{s}\" (carries a condition) or " ++
+                    "\"{s}\" (record only). CONVENTIONS.md §5.",
+                .{ notice_path, first_line, attribution, provenance },
+            );
+            failed.* = true;
+            continue;
+        }
+
+        const listed = std.mem.indexOf(u8, sec1, notice_path) != null;
+        if (is_attribution and !listed) {
+            std.log.err(
+                "{s} carries required attribution but NOTICE §1 does not list it — a consumer " ++
+                    "reading §1 would wrongly conclude zig-libs owes nothing beyond MIT",
+                .{notice_path},
+            );
+            failed.* = true;
+        } else if (is_provenance and listed) {
+            std.log.err(
+                "NOTICE §1 lists {s}, but that file is a provenance note and carries no condition — " ++
+                    "§1 must contain exactly the condition-bearing files",
+                .{notice_path},
+            );
+            failed.* = true;
+        }
+    }
+
+    // The other direction. Everything above is driven FROM module_list, so it
+    // can only see a module whose file disagrees with §1 -- never a §1 entry
+    // that corresponds to no module at all. A planted `modules/ghost/NOTICE`
+    // row sailed through until this loop existed, which is the same
+    // one-directional blind spot the catalog check itself had.
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, sec1, scan, "`modules/")) |open| {
+        const after = open + "`modules/".len;
+        const close = std.mem.indexOfScalarPos(u8, sec1, after, '`') orelse break;
+        scan = close + 1;
+        const cited = sec1[after..close];
+        if (!std.mem.endsWith(u8, cited, "/NOTICE")) continue;
+        const name = cited[0 .. cited.len - "/NOTICE".len];
+        // §1's prose spells the pattern itself as `modules/<name>/NOTICE`.
+        if (std.mem.indexOfScalar(u8, name, '<') != null) continue;
+        const known = for (module_list) |m| {
+            if (std.mem.eql(u8, m.name, name)) break true;
+        } else false;
+        if (!known) {
+            std.log.err(
+                "NOTICE §1 cites `modules/{s}` but there is no module '{s}'",
+                .{ cited, name },
+            );
+            failed.* = true;
+        }
+    }
+}
+
+/// The module README's provenance statement: from the first `Provenance:` or
+/// `## Provenance` marker to the end of that paragraph (a blank line following
+/// at least one line of text), or to the next `## ` heading. Null if the README
+/// has no marker at all -- that case is already reported separately.
+fn provenanceStatement(readme: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, readme, "Provenance:") orelse
+        std.mem.indexOf(u8, readme, "## Provenance") orelse return null;
+    const rest = readme[start..];
+    // A `## Provenance` SECTION runs to the next heading; an inline
+    // `Provenance:` line runs to the end of its paragraph.
+    if (std.mem.startsWith(u8, rest, "## ")) {
+        const next = std.mem.indexOfPos(u8, rest, 3, "\n## ") orelse return rest;
+        return rest[0..next];
+    }
+    const para_end = std.mem.indexOf(u8, rest, "\n\n") orelse return rest;
+    return rest[0..para_end];
+}
+
+/// Every run of whitespace becomes one space, so a hard-wrapped sentence
+/// matches the same needle a single-line one does.
+fn collapseWhitespace(gpa: std.mem.Allocator, s: []const u8) []const u8 {
+    const out = gpa.alloc(u8, s.len) catch @panic("OOM");
+    var n: usize = 0;
+    var in_ws = false;
+    for (s) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            in_ws = true;
+            continue;
+        }
+        if (in_ws and n > 0) {
+            out[n] = ' ';
+            n += 1;
+        }
+        in_ws = false;
+        out[n] = c;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |n| {
+        if (std.ascii.indexOfIgnoreCase(haystack, n) != null) return true;
+    }
+    return false;
+}
+
+fn fileExists(b: *std.Build, io: std.Io, path: []const u8) bool {
+    b.build_root.handle.access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// Whether the root NOTICE has an entry for `name`. Two layouts are in use --
+/// `  name  — …` and `` `name`  — … `` -- and both must count, or the check
+/// reports a missing entry that is right there (this bit me: a first pass
+/// matched only the unquoted form and called `jinja` and `reconcilable`
+/// undocumented).
+fn hasNoticeEntry(notice: []const u8, name: []const u8) bool {
+    var it = std.mem.splitScalar(u8, notice, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trimStart(u8, line, " ");
+        const body = if (std.mem.startsWith(u8, t, "`")) t[1..] else t;
+        if (!std.mem.startsWith(u8, body, name)) continue;
+        const after = body[name.len..];
+        const tail = if (std.mem.startsWith(u8, after, "`")) after[1..] else after;
+        const trimmed = std.mem.trimStart(u8, tail, " ");
+        if (std.mem.startsWith(u8, trimmed, "—") or std.mem.startsWith(u8, trimmed, "-")) return true;
+    }
+    return false;
+}
+
+/// The slice of `haystack` between the first occurrence of `from` and the next
+/// occurrence of `to` after it. Null if either marker is missing or `to`
+/// precedes `from`.
+fn sectionSlice(haystack: []const u8, from: []const u8, to: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, haystack, from) orelse return null;
+    const rest = haystack[start..];
+    const end = std.mem.indexOf(u8, rest, to) orelse return null;
+    return rest[0..end];
 }
 
 /// Non-goals gate: the "Non-goals — deliberately not built here" section must

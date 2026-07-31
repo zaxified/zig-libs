@@ -15,6 +15,11 @@ double-SHA256 digest each gossip message's signature(s) sign).
   ("P2P Node and Channel Discovery") — `lightning/bolts`, the public Lightning Network
   specification repository.
 
+Provenance: clean-room from BOLT#1/#2/#7 (`lightning/bolts`), a public
+specification; the TLV/BigSize codec is pinned byte-exact against the spec's own
+Appendix A and B vectors. No third-party Lightning implementation was consulted,
+so no `NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).
+
 ## Scope
 
 Implemented — see `SPEC.md` for the full design/threat-model writeup and exactly what's deferred:

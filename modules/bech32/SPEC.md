@@ -1,7 +1,7 @@
 # bech32 — spec
 
 Bitcoin address encodings: bech32 (BIP173) + bech32m (BIP350) segwit addresses, and
-base58/base58check (P2PKH/P2SH/WIF). Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+base58/base58check (P2PKH/P2SH/WIF). Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 

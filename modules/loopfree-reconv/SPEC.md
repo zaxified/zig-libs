@@ -2,7 +2,7 @@
 
 Loop-free reconvergence for a link-state fabric: an ordered-FIB update schedule
 that keeps forwarding acyclic at every step of a topology transition, verified
-in `netsim`. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+in `netsim`. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## The problem
 

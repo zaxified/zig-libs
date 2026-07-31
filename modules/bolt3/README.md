@@ -6,6 +6,12 @@ the BOLT#3 spec plus the per-commitment secret source that feeds them; the
 surrounding commitment-transaction / HTLC-output serialization (non-crypto) is
 deliberately out of scope for this pass.
 
+Provenance: clean-room from BOLT#3 (`lightning/bolts`), a public specification;
+the secp256k1 group comes from the sibling [`k256`](../k256) module. Full
+provenance detail — including why no third-party Lightning source was consulted
+— is in this module's own [`NOTICE`](NOTICE); it carries no condition beyond
+zig-libs' MIT license.
+
 ## What it does
 
 | Function | BOLT#3 section |

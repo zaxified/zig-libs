@@ -114,6 +114,27 @@ its license terms are reproduced in `modules/<name>/NOTICE`, beside the code tha
 notice travels with the module (see `falcon`). Never add such an entry to the root NOTICE: keeping
 the root free of redistribution conditions is what lets zig-libs be consumed as plain MIT.
 
+**Two kinds of `modules/<name>/NOTICE`, and the first line says which.** A module-local NOTICE is
+either
+
+| First line | Kind | Meaning |
+|---|---|---|
+| `<name> — third-party attribution` | **condition-bearing** | ported source/data; its terms are reproduced here and travel with the module |
+| `<name> — provenance note` | **record only** | a §2-style design-reference record kept beside the module instead of in the root NOTICE |
+
+A provenance note is the right home when a module's provenance is long enough to drown the root
+file — the self-contained crypto/protocol modules run to hundreds of lines each (`bls12_381` is
+over 800). It is a placement choice, nothing more: a provenance note **must not** carry any
+condition, and the root NOTICE §1 lists the condition-bearing files exhaustively so a consumer can
+answer "what do I owe?" by reading those and nothing else. `zig build check-catalog` enforces the
+first-line discriminator, that every condition-bearing file is listed in root §1, and that no
+provenance note is.
+
+**Never justify placement by pointing at a sibling.** Cite this section instead. Chained
+"same placement as the sibling X/Y/Z modules" reasoning is how the practice drifted for 38 modules
+without anyone deciding it, and how the root NOTICE came to claim one module carried its own file
+while four did.
+
 Running an installed third-party binary purely as a black-box compatibility
 test oracle (e.g. diffing output against `tar`/`nft`) is neither of the above and needs no entry.
 

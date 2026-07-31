@@ -1,7 +1,7 @@
 # blobstore — spec
 
 Content-addressed blob store (git-object/restic style) + a name-addressed raw layer and opaque
-named records. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+named records. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 - **Layout:** `<base>/cas/<hh...>/<hex>` (content-addressed, dedup, `hh...` = `Options.fanout`

@@ -10,6 +10,11 @@ Decryption only (we are the relying party with the private key). Encryption,
 of scope and rejected. See `SPEC.md` for the full algorithm allow-list and
 security posture.
 
+Provenance: clean-room from W3C *XML Encryption* 1.1 (xmlenc-core-1) plus
+RFC 8017 (RSA-OAEP), RFC 3394 (AES key wrap) and NIST SP800-38A/D — all public
+specifications. No third-party XML-Enc implementation was consulted, so no
+`NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).
+
 ## Supported algorithms
 
 - **Key transport:** `rsa-oaep-mgf1p` (SHA-1), xenc11 `rsa-oaep` (SHA-1/SHA-256,

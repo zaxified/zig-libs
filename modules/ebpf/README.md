@@ -30,6 +30,14 @@ the XDP attach path. Two ways in: hand-built programs for a fixed, named set
   the ELF symbol reader, and both consumers' record walks — are fully tested
   with no privilege at all.
 
+Provenance: clean-room from the kernel UAPI headers (`linux/bpf.h`,
+`linux/btf.h`, `linux/perf_event.h`, `linux/if_link.h`) — only the
+uncopyrightable ABI facts they document are used (struct layouts, constants,
+instruction encoding), under the same Linux-syscall-note exception `netlink` /
+`genetlink` / `wireguard` / `tc` rely on. `libbpf` is a **design reference** for
+API shape only, no source ported or read while implementing. Both recorded in
+the root [`NOTICE`](../../NOTICE).
+
 ## Status: complete
 
 All parts are implemented — see `modules/ebpf/src/*.zig` doc comments for

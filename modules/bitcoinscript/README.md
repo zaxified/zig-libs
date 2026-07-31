@@ -101,6 +101,11 @@ BIP341 wallet-test-vector KATs for the taproot commitment (`tapscript.zig`), and
 see `SPEC.md` "Verification" for what's pinned and why, including three real cross-cutting bugs the
 official corpus caught that isolated unit tests did not.
 
-Provenance: `script_tests_vectors.zig`'s rows are machine-transcribed (not hand-typed) from
-`bitcoin/bitcoin`'s `src/test/data/script_tests.json` — see that file's own doc comment and
-`SPEC.md` for the exact filter/sampling method.
+Provenance: the interpreter is clean-room from the published consensus rules and
+the BIPs — no Bitcoin Core source is ported. ⚠ But `script_tests_vectors.zig`'s
+rows are machine-transcribed (not hand-typed) from `bitcoin/bitcoin`'s
+`src/test/data/script_tests.json`, so this module **reproduces third-party test
+data** and carries its own [`NOTICE`](NOTICE) beside it (MIT; the same shape as
+`decimal`'s decTest corpus — a preserve-the-notice requirement, no condition
+beyond MIT's own). See that vectors file's doc comment and `SPEC.md` for the
+exact filter/sampling method.

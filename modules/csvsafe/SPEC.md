@@ -1,7 +1,7 @@
 # csvsafe — spec
 
 OWASP CSV formula-injection guard — and nothing else. Usage: see ./README.md.
-Attribution/provenance: see /NOTICE.
+Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 - Neutralizes a cell a spreadsheet would read as a formula (leading `=`, `+`, `-`, `@`, tab, CR) by

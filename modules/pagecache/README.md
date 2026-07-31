@@ -10,6 +10,11 @@ resident pages — without any change to kvtree or its durability guarantees.
 real backend, so it is a drop-in: hand `pc.storage()` to `kvtree.Db.open`
 instead of the raw `FsStorage`.
 
+Provenance: original work of the zig-libs authors (MIT). LMDB's mmap'd pages and
+Postgres' `shared_buffers` are named as conceptual analogues of the
+buffer-pool *pattern*; neither was consulted as an implementation, so no
+`NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).
+
 ## Usage
 
 ```zig

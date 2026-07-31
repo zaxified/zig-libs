@@ -19,6 +19,11 @@ deferred and why).
   Protocol for Lightning Payments") — `lightning/bolts`, the public Lightning Network
   specification repository.
 
+Provenance: clean-room from BOLT#11 and BOLT#12 (`lightning/bolts`), a public
+specification whose own worked examples are the byte-exact anchors. No
+third-party Lightning implementation was consulted, so no `NOTICE` entry is
+required (root [`NOTICE`](../../NOTICE) §0).
+
 ## Scope
 
 Implemented — see `SPEC.md` for the full design/threat-model writeup and exactly what's deferred:

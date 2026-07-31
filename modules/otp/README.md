@@ -16,6 +16,12 @@ RFC 6238 Appendix B table (all 6 times × 3 hash functions).** See
 | `src/kat_vectors.zig` | RFC 4226 Appendix D + RFC 6238 Appendix B tables, embedded |
 | `src/kat_test.zig` | Full KAT assertions + verify-window tests |
 
+Provenance: clean-room from RFC 4226 (HOTP) and RFC 6238 (TOTP) — the algorithms
+are given as pseudocode in the RFCs themselves, and both appendices' vectors are
+embedded byte-exact. No third-party OTP source consulted. Detail in this
+module's own [`NOTICE`](NOTICE); it carries no condition beyond zig-libs' MIT
+license.
+
 ## Import
 
 ```zig

@@ -27,7 +27,11 @@ const output = try voprf.finalizeVerifiable(
     input, blind_scalar, eval.evaluated_element, blinded, kp.pk, eval.proof);
 ```
 
-See `SPEC.md` for the threat model and the DLEQ transcript details;
-`NOTICE` for provenance (clean-room from the RFC text).
+See `SPEC.md` for the threat model and the DLEQ transcript details.
+
+Provenance: clean-room from RFC 9497, a public IRTF specification, with its own
+test vectors as the byte-exact anchor. No reference implementation consulted.
+Detail in this module's own [`NOTICE`](NOTICE); it carries no condition beyond
+zig-libs' MIT license.
 
 Test: `zig build test-voprf`

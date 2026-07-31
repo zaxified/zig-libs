@@ -20,6 +20,13 @@ for the full threat model and deferred-work rationale.
 | `assertion_test.zig` | `verifyAssertion` — real-vector anchors (ES256/EdDSA/RS256) + reject-teeth |
 | `attestation_test.zig` | `verifyAttestation` — real-vector anchors (`none`/`packed`/`fido-u2f`) + deferred-format + reject-teeth |
 
+Provenance: clean-room from the W3C WebAuthn Level 3 recommendation, a public
+specification; the §16 test vectors were fetched from w3.org and mechanically
+extracted (an early hand-copy introduced a transcription slip, which is why they
+are machine-extracted). Every signature check routes through an already-KAT'd
+primitive — no new crypto here. No third-party relying-party source consulted,
+so no `NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).
+
 ## Import
 
 ```zig

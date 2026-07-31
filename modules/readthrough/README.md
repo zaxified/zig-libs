@@ -20,6 +20,13 @@ invalidation.
   at once.
 - **Deps:** `ramcache` (storage) + `std`.
 
+Provenance: original work of the zig-libs authors (MIT). The single-flight
+coalescing shape follows Go's `singleflight` and the loader shape follows
+Caffeine's `LoadingCache` — both **design references** (behavior and API shape
+only, no source consulted or copied), recorded in the root
+[`NOTICE`](../../NOTICE). The W-TinyLFU store underneath is
+[`ramcache`](../ramcache), which carries its own entry.
+
 ## Contracts
 
 - **Read-through:** a miss runs the loader exactly once (per coalesced set), the

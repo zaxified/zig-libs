@@ -1,6 +1,6 @@
 # seqmap — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 Fixed 65536-slot table indexed by a 16-bit id; ids handed out round-robin (`next` wraps at 2^16) so
