@@ -307,7 +307,16 @@ pub const Nsec3Param = struct {
 pub fn parseNsec3Param(rdata: []const u8) ParseError!Nsec3Param {
     if (rdata.len < 5) return error.Truncated;
     const salt_len = rdata[4];
-    if (rdata.len != 5 + salt_len) return error.BadRecord;
+    // `5 + salt_len` is u8 arithmetic -- `5` is a comptime_int, so the result
+    // type comes from `salt_len` -- and a wire-supplied salt length above 250
+    // overflows it. Found by the fuzzer as an integer-overflow panic, i.e. a
+    // remotely triggerable abort on a malformed NSEC3PARAM. Widen first.
+    //
+    // The sibling `parseNsec3` is fine only by accident: its `pos + salt_len`
+    // promotes to usize because `pos` already is one. Length arithmetic on a
+    // wire-supplied byte must be widened deliberately, not left to whichever
+    // operand happens to be next to it.
+    if (rdata.len != 5 + @as(usize, salt_len)) return error.BadRecord;
     return .{
         .hash_algorithm = rdata[0],
         .flags = rdata[1],
@@ -472,6 +481,25 @@ test "parseNsec3Param: fields split correctly" {
 test "parseNsec3Param: trailing garbage rejected" {
     const rdata = "\x01" ++ "\x00" ++ "\x00\x0a" ++ "\x00" ++ "\xff";
     try testing.expectError(error.BadRecord, parseNsec3Param(rdata));
+}
+
+test "parseNsec3Param: a salt length that overflows u8 arithmetic is rejected, not a panic" {
+    // Regression, found by the fuzzer: `5 + salt_len` was u8 arithmetic, so a
+    // declared salt length above 250 overflowed and aborted the process --
+    // remotely triggerable by any malformed NSEC3PARAM.
+    //
+    // Every value in the overflowing range, not one sample: the wrap lands on
+    // 0..4, all below the 5-byte minimum, so each must come back BadRecord.
+    // A one-value test would pass against a fix that widened only that case.
+    for (251..256) |salt_len| {
+        const rdata = [_]u8{ 0x01, 0x00, 0x00, 0x0a, @intCast(salt_len) };
+        try testing.expectError(error.BadRecord, parseNsec3Param(&rdata));
+    }
+
+    // And the boundary that must still WORK: a salt filling the record.
+    const ok = [_]u8{ 0x01, 0x00, 0x00, 0x0a, 0x02, 0xaa, 0xbb };
+    const p = try parseNsec3Param(&ok);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, p.salt);
 }
 
 // ── fuzz: every RDATA parser off a hostile DNS response, never panics ──────
