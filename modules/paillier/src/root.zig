@@ -1679,20 +1679,77 @@ test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzPublicKeyFromBytes, .{});
 }
 
+// ⚠ This helper is the HARNESS, and it was the thing that crashed -- twice --
+// the first time this module was ever really fuzzed. Both were u8 arithmetic
+// on values that do not fit in a u8:
+//
+//   - `modulus_bytes - 4 + valueRangeAtMost(u8, 0, 8)` took its result type
+//     from the u8, so `modulus_bytes - 4` (252 at 2048 bits) plus up to 8
+//     overflowed. `@min` was applied AFTER the overflow, so it could not help.
+//   - `@intCast(buf.len)` to the u8/u16 range bound aborted outright for the
+//     `modulus_sq_bytes + 16` buffers, which are far larger than 255.
+//
+// A harness that aborts before calling the parser leaves the parser with ZERO
+// fuzz coverage while the sweep records a FINDING -- worse than a red test,
+// because it looks like the library was exercised and found wanting.
 fn fuzzedFieldBytes(smith: *std.testing.Smith, buf: []u8) []const u8 {
     smith.bytes(buf);
     // Occasionally force a run of leading zeros (stripLeadingZeros path).
     if (smith.value(bool)) {
-        const n_zeros: usize = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+        const n_zeros: usize = @min(buf.len, smith.valueRangeAtMost(u16, 0, 512));
         @memset(buf[0..n_zeros], 0);
     }
     // Bias length toward at/over the modulus_bytes boundary as well as
     // fully random.
     const len: usize = if (smith.value(bool))
-        @min(buf.len, modulus_bytes - 4 + smith.valueRangeAtMost(u8, 0, 8))
+        boundaryLen(buf.len, smith.valueRangeAtMost(u8, 0, 8))
     else
-        smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+        @min(buf.len, smith.valueRangeAtMost(u16, 0, 65535));
     return buf[0..len];
+}
+
+/// The boundary-biased length, as a pure function of its inputs.
+///
+/// Split out because the bug lived here and a Smith-driven test could not
+/// reliably reach it: restoring the overflow left the harness test green,
+/// which made it a toothless test rather than a redundant fix. Exhaustive over
+/// `r` below instead -- eight values, no randomness, no ambiguity.
+fn boundaryLen(buf_len: usize, r: u8) usize {
+    // `modulus_bytes - 4` is 252 at 2048 bits, so `+ r` overflowed when this
+    // was u8 arithmetic. Widen BEFORE adding; `@min` afterwards cannot undo an
+    // overflow that already trapped.
+    return @min(buf_len, modulus_bytes - 4 + @as(usize, r));
+}
+
+test "boundaryLen does not overflow for any value the harness can draw" {
+    // Every `r` in the drawn range, not a sample: the overflow starts at r=4
+    // and a one-value test would pass against a fix covering only that value.
+    for (0..9) |r| {
+        const n = boundaryLen(modulus_sq_bytes + 16, @intCast(r));
+        try testing.expectEqual(modulus_bytes - 4 + r, n);
+        try testing.expect(n <= modulus_sq_bytes + 16);
+    }
+    // And the clamp still binds when the buffer is the smaller of the two.
+    try testing.expectEqual(@as(usize, 8), boundaryLen(8, 8));
+}
+
+test "fuzzedFieldBytes stays in bounds for the largest buffer it is given" {
+    // The harness's own regression test. `modulus_sq_bytes + 16` is the widest
+    // buffer any caller passes, and it is precisely the size that broke both
+    // range bounds -- so a harness helper needs a test like any other code.
+    //
+    // `Smith{ .in = null }` only works under `builtin.fuzz`; outside it the
+    // byte source must be supplied, or `smith.bytes` hits `unreachable`. That
+    // cost a red test before this comment existed.
+    var seed: [4096]u8 = undefined;
+    for (&seed, 0..) |*b, k| b.* = @truncate(k *% 131 +% 7);
+
+    var buf: [modulus_sq_bytes + 16]u8 = undefined;
+    for (0..64) |k| {
+        var smith: std.testing.Smith = .{ .in = seed[k * 8 ..] };
+        const out = fuzzedFieldBytes(&smith, &buf);
+        try testing.expect(out.len <= buf.len);
+    }
 }
 
 fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
