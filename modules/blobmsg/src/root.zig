@@ -627,6 +627,10 @@ fn mockHandle(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !bool {
 const mock_objects = [_]struct { name: []const u8, id: u32, method: []const u8 }{
     .{ .name = "system", .id = 0x10, .method = "board" },
     .{ .name = "network", .id = 0x11, .method = "restart" },
+    // Empty method = "the daemon sent no SIGNATURE attr for this object" —
+    // the documented `signature_json == null` case (a real daemon omits it
+    // for some internal objects); mockLookup below skips the attr entirely.
+    .{ .name = "nosig", .id = 0x12, .method = "" },
 };
 
 fn mockLookup(fd: i32, gpa: std.mem.Allocator, msg: Msg) !void {
@@ -637,14 +641,16 @@ fn mockLookup(fd: i32, gpa: std.mem.Allocator, msg: Msg) !void {
     }
     for (mock_objects) |obj| {
         if (pattern) |p| if (!std.mem.eql(u8, p, obj.name)) continue;
-        var sig: std.ArrayList(u8) = .empty;
-        defer sig.deinit(gpa);
-        try codec.appendTable(gpa, &sig, obj.method, &.{}); // {"<method>":{}}
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);
         try codec.appendAttrU32(gpa, &out, codec.ATTR.OBJID, obj.id);
         try codec.appendAttrString(gpa, &out, codec.ATTR.OBJPATH, obj.name);
-        try codec.appendAttr(gpa, &out, codec.ATTR.SIGNATURE, sig.items);
+        if (obj.method.len > 0) {
+            var sig: std.ArrayList(u8) = .empty;
+            defer sig.deinit(gpa);
+            try codec.appendTable(gpa, &sig, obj.method, &.{}); // {"<method>":{}}
+            try codec.appendAttr(gpa, &out, codec.ATTR.SIGNATURE, sig.items);
+        }
         try sendMessage(fd, gpa, codec.MSG.DATA, msg.seq, 0, out.items);
     }
     try sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &.{});
@@ -751,11 +757,17 @@ test "client vs scripted daemon: list, invoke, void, error, DATA gotcha" {
     // list: objects with ids + decoded signatures, wire order.
     const objs = try c.list(null);
     defer freeObjects(gpa, objs);
-    try testing.expectEqual(@as(usize, 2), objs.len);
+    try testing.expectEqual(@as(usize, 3), objs.len);
     try testing.expectEqualStrings("system", objs[0].name);
     try testing.expectEqual(@as(u32, 0x10), objs[0].id);
     try testing.expectEqualStrings("{\"board\":{}}", objs[0].signature_json.?);
     try testing.expectEqualStrings("network", objs[1].name);
+    // Documented case: the daemon sent no SIGNATURE attr at all for this
+    // object -> signature_json is null, not an empty string or a dropped
+    // entry (name/id are the only mandatory attrs).
+    try testing.expectEqualStrings("nosig", objs[2].name);
+    try testing.expectEqual(@as(u32, 0x12), objs[2].id);
+    try testing.expectEqual(@as(?[]u8, null), objs[2].signature_json);
 
     // filtered list.
     const one = try c.list("network");

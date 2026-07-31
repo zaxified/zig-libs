@@ -952,6 +952,48 @@ test "format: token vocabulary round-trip" {
     }
 }
 
+test "format: lowercase am/pm ('a' token) — only 'A' (uppercase) was ever exercised" {
+    const a = testing.allocator;
+    const morning = try format(a, .{ .year = 2024, .month = 3, .day = 7, .hour = 9 }, "hh:mm a");
+    defer a.free(morning);
+    try testing.expectEqualStrings("09:00 am", morning);
+    const afternoon = try format(a, .{ .year = 2024, .month = 3, .day = 7, .hour = 21 }, "hh:mm a");
+    defer a.free(afternoon);
+    try testing.expectEqualStrings("21:00 pm", afternoon);
+}
+
+test "format+parse: day-of-week ('e' token) — zero coverage in either direction before this" {
+    // 2024-03-07 is a Thursday: ISO weekday 4.
+    const a = testing.allocator;
+    const s = try format(a, .{ .year = 2024, .month = 3, .day = 7 }, "e");
+    defer a.free(s);
+    try testing.expectEqualStrings("4", s);
+
+    const p = try parse("4", "e");
+    // The token is "informational, not stored" (no year/month/day carried) —
+    // parse must still accept a valid 1-7 value and reject out-of-range ones.
+    try testing.expectEqual(@as(i32, 1970), p.year); // untouched default
+    try testing.expectError(ParseError.InvalidDate, parse("8", "e"));
+    try testing.expectError(ParseError.InvalidDate, parse("0", "e"));
+}
+
+test "format+parse: day-name-short (EEE/EE/E) and day-name-long (EEEE) — parse side had zero coverage" {
+    // Format side: only EEEE (full name) had a test; EEE/EE/E never did.
+    const a = testing.allocator;
+    const short = try format(a, .{ .year = 2024, .month = 3, .day = 7 }, "EEE"); // Thursday
+    defer a.free(short);
+    try testing.expectEqualStrings("Thu", short);
+
+    // Parse side: parseDayName (shared by EEEE and EEE/EE/E) had NO call site
+    // via the public `parse()` entry point anywhere in this suite.
+    const got_short = try parse("Thu, 2024-03-07", "EEE, YYYY-MM-DD");
+    try testing.expectEqual(DateParts{ .year = 2024, .month = 3, .day = 7 }, got_short);
+    const got_long = try parse("Thursday, 2024-03-07", "EEEE, YYYY-MM-DD");
+    try testing.expectEqual(DateParts{ .year = 2024, .month = 3, .day = 7 }, got_long);
+    // An unrecognized day name is rejected, not silently skipped.
+    try testing.expectError(ParseError.InvalidFormat, parse("Blah, 2024-03-07", "EEE, YYYY-MM-DD"));
+}
+
 test "format: pre-1970 date renders correctly" {
     const a = testing.allocator;
     const got = try format(a, .{ .year = 1924, .month = 10, .day = 10 }, "YYYY-MM-DD");

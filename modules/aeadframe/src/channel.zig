@@ -328,6 +328,57 @@ test "seal rejects an undersized output buffer" {
     try testing.expectError(error.BufferTooSmall, s.seal(&small, "three", ""));
 }
 
+test "open rejects an undersized output buffer (mirrors seal's check)" {
+    inline for (channels) |Ch| {
+        var s = Ch.Sealer.init(testKey(11), 0);
+        const msg = "twelve-bytes"; // 12 bytes of plaintext
+        var rec: [Ch.Sealer.sealedLen(msg.len)]u8 = undefined;
+        const n = try s.seal(&rec, msg, "ad");
+
+        var o = Ch.Opener.init(testKey(11), 0);
+        var too_small: [msg.len - 1]u8 = undefined;
+        try testing.expectError(error.BufferTooSmall, o.open(&too_small, rec[0..n], "ad"));
+
+        // And the exact-size buffer (the boundary) still works.
+        var out: [msg.len]u8 = undefined;
+        const m = try o.open(&out, rec[0..n], "ad");
+        try testing.expectEqualSlices(u8, msg, out[0..m]);
+    }
+}
+
+test "bumpEpoch refuses to wrap at the u32 ceiling (both Sealer and Opener)" {
+    inline for (channels) |Ch| {
+        var s = Ch.Sealer.init(testKey(12), std.math.maxInt(u32));
+        try testing.expectError(error.EpochExhausted, s.bumpEpoch());
+        try testing.expectEqual(std.math.maxInt(u32), s.epoch); // unchanged
+
+        var o = Ch.Opener.init(testKey(12), std.math.maxInt(u32));
+        try testing.expectError(error.EpochExhausted, o.bumpEpoch());
+        try testing.expectEqual(std.math.maxInt(u32), o.epoch); // unchanged
+    }
+}
+
+test "initWindow honors a narrower window than the 64-byte default" {
+    // Zero call sites for initWindow anywhere else in this suite: without
+    // this test a regression that ignored `window_size` (defaulting to 64
+    // regardless) would go unnoticed.
+    var s = ChaChaChannel.Sealer.init(testKey(13), 0);
+    var o = ChaChaChannel.Opener.initWindow(testKey(13), 0, 4);
+    try testing.expectEqual(@as(u7, 4), o.window.size);
+
+    var recs: [6][record.overhead + 1]u8 = undefined;
+    for (0..6) |i| _ = try s.seal(&recs[i], "x", "c");
+    var pt: [1]u8 = undefined;
+
+    // Advance the high-water mark to seq 5 first...
+    _ = try o.open(&pt, &recs[5], "c");
+    // ...then seq 0 (diff 5) is now outside the narrow 4-wide window, even
+    // though it would still be inside the library's 64-byte default.
+    try testing.expectError(error.Replayed, o.open(&pt, &recs[0], "c"));
+    // ...while seq 1 (diff 4, exactly at the edge) is still in-window.
+    _ = try o.open(&pt, &recs[1], "c");
+}
+
 test "anti-replay: duplicate and reordered-fresh across the channel (both AEADs)" {
     inline for (channels) |Ch| {
         var s = Ch.Sealer.init(testKey(7), 0);

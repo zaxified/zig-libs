@@ -995,6 +995,24 @@ test "decode: bad rdata lengths are rejected" {
         "\x00\x00\x00\x00" ++ "\x00\x03" ++ "\x00\x00x");
 }
 
+test "decode: opcode field decodes from the right flag bits" {
+    // header.opcode is written into the model but no other test ever reads
+    // it back — pin the exact bit position (11..14) against every named
+    // value, not just the QUERY=0 default every golden packet uses.
+    const cases = [_]struct { flags: u16, op: Opcode }{
+        .{ .flags = 0x8000, .op = .query }, // opcode 0, response bit set
+        .{ .flags = 0x8000 | (1 << 11), .op = .iquery },
+        .{ .flags = 0x8000 | (2 << 11), .op = .status },
+    };
+    for (cases) |c| {
+        var buf: [12]u8 = @splat(0);
+        std.mem.writeInt(u16, buf[2..4], c.flags, .big);
+        var msg = try decode(testing.allocator, &buf);
+        defer msg.deinit();
+        try testing.expectEqual(c.op, msg.header.opcode);
+    }
+}
+
 test "decode: empty and header-only packets" {
     try expectDecodeError(error.Truncated, "");
     try expectDecodeError(error.Truncated, "\x00\x01\x80");

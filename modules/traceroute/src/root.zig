@@ -909,7 +909,7 @@ test "malformed and hostile bytes are ignored, never panic" {
     }
 }
 
-test "responses with a foreign ident or unknown seq are ignored" {
+test "responses with a foreign ident are ignored" {
     // A garbage packet that IS a well-formed echo reply, but for someone
     // else's ident — must not resolve any probe.
     var alien: [echo.echo_header_len]u8 = @splat(0);
@@ -920,6 +920,60 @@ test "responses with a foreign ident or unknown seq are ignored" {
     var tr = try runFake(&f, .{ .probes_per_hop = 1, .ident = 0x2222 });
     defer tr.deinit(testing.allocator);
     try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+}
+
+test "responses with an out-of-range seq (matching ident) are ignored" {
+    // `slotOf` maps seq -> flat slot via wraparound subtraction then a
+    // range check against `total`; a reply whose seq lands exactly one
+    // past the last valid slot (idx == total) must be rejected just like
+    // a wildly out-of-range one — pin both, not just the "foreign ident"
+    // case above.
+    const ident: u16 = 0x2222;
+    const seq_base: u16 = 5;
+    // probes_per_hop=1, max_hops=1 -> total = 1; only seq 5 (idx 0) is valid.
+    const bad_seqs = [_]u16{ 6, 9999 };
+    for (bad_seqs) |bad_seq| {
+        var alien: [echo.echo_header_len]u8 = @splat(0);
+        echo.writeEchoRequest(.v4, &alien, ident, bad_seq);
+        alien[0] = echo.v4.echo_reply;
+        var f: FakeTransport = .{ .behaviors = &.{.{ .garbage = &alien }} };
+        defer f.deinit();
+        var tr = try runFake(&f, .{
+            .probes_per_hop = 1,
+            .max_hops = 1,
+            .ident = ident,
+            .seq_base = seq_base,
+        });
+        defer tr.deinit(testing.allocator);
+        try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+    }
+}
+
+test "ICMP redirect is not treated as a hop answer (keeps waiting, then times out)" {
+    // Every canned Behavior in this file is either time_exceeded or
+    // dest_unreachable — the `else => continue :recv` arm for redirect /
+    // param-problem / packet-too-big has no coverage at all. Hand-build a
+    // well-formed ICMP Redirect quoting probe #0 (default ident 0x7472,
+    // seq_base 1) and confirm it is swallowed rather than resolving the
+    // probe as a hop answer.
+    var redirect_pkt: [8 + 20 + echo.echo_header_len]u8 = @splat(0);
+    redirect_pkt[0] = echo.v4.redirect;
+    redirect_pkt[8] = 0x45; // quoted IPv4 header, ihl=5
+    const orig = redirect_pkt[8 + 20 ..];
+    orig[0] = echo.v4.echo_request;
+    std.mem.writeInt(u16, orig[4..6], 0x7472, .big); // default Options.ident
+    std.mem.writeInt(u16, orig[6..8], 1, .big); // seq_base=1 -> probe #0
+
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .garbage = &redirect_pkt }, .reply } };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .timeout_ms = 50 });
+    defer tr.deinit(testing.allocator);
+
+    // The redirect must not resolve hop 1's probe as any kind of answer —
+    // it keeps waiting and eventually times out; hop 2 still reaches dest.
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(Probe.Kind.reply, tr.hops[1].probes[0].kind);
 }
 
 test "options are validated" {

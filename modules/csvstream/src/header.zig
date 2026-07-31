@@ -128,6 +128,14 @@ test "Header.get: a short (ragged) row returns null instead of an out-of-bounds 
     try t.expectEqual(@as(?[]const u8, null), h.get(&short_row, "c"));
 }
 
+test "Header.init: duplicate column names — the LAST occurrence's index wins (documented, previously untested)" {
+    var h = try Header.init(t.allocator, &.{ "a", "b", "a" });
+    defer h.deinit();
+    try t.expectEqual(@as(usize, 3), h.len()); // names array keeps every column
+    try t.expectEqual(@as(?usize, 2), h.indexOf("a")); // last "a" (index 2) wins, not the first (0)
+    try t.expectEqual(@as(?usize, 1), h.indexOf("b"));
+}
+
 test "Header.validateArity: matching and mismatching row lengths" {
     var h = try Header.init(t.allocator, &.{ "a", "b", "c" });
     defer h.deinit();

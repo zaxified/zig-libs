@@ -284,6 +284,115 @@ test "icmp v4 dest unreachable quoting our echo" {
     try std.testing.expectEqual(@as(u16, 77), parsed.icmp_error.orig_seq);
 }
 
+test "icmp v4 error kinds map correctly for every quoted-error type" {
+    // Each v4 error type must map to its OWN ErrorKind, not just "some
+    // non-dest_unreachable value" — a mutation that permutes the switch
+    // arms (e.g. swaps time_exceeded/redirect) must be caught here.
+    const cases = [_]struct { wire: u8, kind: ErrorKind }{
+        .{ .wire = v4.dest_unreachable, .kind = .dest_unreachable },
+        .{ .wire = v4.time_exceeded, .kind = .time_exceeded },
+        .{ .wire = v4.redirect, .kind = .redirect },
+        .{ .wire = v4.param_problem, .kind = .param_problem },
+        .{ .wire = v4.source_quench, .kind = .other },
+    };
+    for (cases) |c| {
+        var pkt: [echo_header_len + 20 + echo_header_len]u8 = @splat(0);
+        pkt[0] = c.wire;
+        pkt[8] = 0x45; // quoted IP header, ihl=5
+        const orig = pkt[8 + 20 ..];
+        orig[0] = v4.echo_request;
+        std.mem.writeInt(u16, orig[4..6], 0x1234, .big);
+        std.mem.writeInt(u16, orig[6..8], 77, .big);
+        const parsed = parseV4(&pkt, false);
+        try std.testing.expectEqual(c.kind, parsed.icmp_error.kind);
+    }
+}
+
+test "icmp v4 error quoting a timestamp request is accepted" {
+    // parseV4 explicitly accepts a quoted timestamp_request as "ours", not
+    // just echo_request — the accessor `orig[0] != echo_request and
+    // orig[0] != timestamp_request` must reject anything else.
+    var pkt: [echo_header_len + 20 + echo_header_len]u8 = @splat(0);
+    pkt[0] = v4.time_exceeded;
+    pkt[8] = 0x45;
+    const orig = pkt[8 + 20 ..];
+    orig[0] = v4.timestamp_request;
+    std.mem.writeInt(u16, orig[4..6], 0x55, .big);
+    std.mem.writeInt(u16, orig[6..8], 66, .big);
+    const parsed = parseV4(&pkt, false);
+    try std.testing.expectEqual(ErrorKind.time_exceeded, parsed.icmp_error.kind);
+    try std.testing.expectEqual(@as(u16, 0x55), parsed.icmp_error.orig_ident);
+    try std.testing.expectEqual(@as(u16, 66), parsed.icmp_error.orig_seq);
+
+    // A quoted type that is neither echo_request nor timestamp_request
+    // must be ignored, not accepted as "close enough".
+    orig[0] = v4.echo_reply;
+    try std.testing.expectEqual(Reply.ignored, parseV4(&pkt, false));
+}
+
+test "icmp v4 quoted-header boundary is exact at qihl + echo_header_len" {
+    // The binding constraint on the quoted region is
+    // `quoted.len < qihl + echo_header_len`, not the earlier `quoted.len <
+    // 20` sanity check (which a fixed 20-byte IHL quote always also
+    // satisfies or fails together with the second check — a mutation there
+    // alone is unobservable). Pin the real edge: with qihl=20, exactly 27
+    // bytes of quote (one short of the required 28) must be rejected, and
+    // exactly 28 must be accepted.
+    var pkt27: [echo_header_len + 27]u8 = @splat(0);
+    pkt27[0] = v4.time_exceeded;
+    pkt27[8] = 0x45; // ihl=5 -> qihl=20; only 7 bytes follow, need 8
+    pkt27[28] = v4.echo_request; // quoted[20] = orig[0], so it isn't the reason for rejection
+    try std.testing.expectEqual(Reply.ignored, parseV4(&pkt27, false));
+
+    var pkt28: [echo_header_len + 28]u8 = @splat(0);
+    pkt28[0] = v4.time_exceeded;
+    pkt28[8] = 0x45;
+    const orig = pkt28[8 + 20 ..];
+    orig[0] = v4.echo_request;
+    const parsed = parseV4(&pkt28, false);
+    try std.testing.expectEqual(ErrorKind.time_exceeded, parsed.icmp_error.kind);
+}
+
+test "icmp v6 error kinds map correctly for every quoted-error type" {
+    const cases = [_]struct { wire: u8, kind: ErrorKind }{
+        .{ .wire = v6.dest_unreachable, .kind = .dest_unreachable },
+        .{ .wire = v6.packet_too_big, .kind = .packet_too_big },
+        .{ .wire = v6.time_exceeded, .kind = .time_exceeded },
+        .{ .wire = v6.param_problem, .kind = .param_problem },
+    };
+    for (cases) |c| {
+        var pkt: [echo_header_len + 40 + echo_header_len]u8 = @splat(0);
+        pkt[0] = c.wire;
+        const quoted = pkt[echo_header_len..];
+        quoted[6] = 58; // next header = ICMPv6
+        const orig = quoted[40..];
+        orig[0] = v6.echo_request;
+        std.mem.writeInt(u16, orig[4..6], 0xbeef, .big);
+        std.mem.writeInt(u16, orig[6..8], 9, .big);
+        const parsed = parseV6(&pkt);
+        try std.testing.expectEqual(c.kind, parsed.icmp_error.kind);
+        try std.testing.expectEqual(@as(u16, 0xbeef), parsed.icmp_error.orig_ident);
+        try std.testing.expectEqual(@as(u16, 9), parsed.icmp_error.orig_seq);
+    }
+}
+
+test "icmp v6 error rejects wrong next-header and wrong quoted type" {
+    var pkt: [echo_header_len + 40 + echo_header_len]u8 = @splat(0);
+    pkt[0] = v6.time_exceeded;
+    const quoted = pkt[echo_header_len..];
+    const orig = quoted[40..];
+    orig[0] = v6.echo_request;
+
+    // next header != 58 (not ICMPv6) must be ignored.
+    quoted[6] = 6; // TCP
+    try std.testing.expectEqual(Reply.ignored, parseV6(&pkt));
+
+    // Fix next header, but quote something other than echo_request.
+    quoted[6] = 58;
+    orig[0] = v6.echo_reply;
+    try std.testing.expectEqual(Reply.ignored, parseV6(&pkt));
+}
+
 test "echo reply v6" {
     var pkt: [echo_header_len]u8 = @splat(0);
     pkt[0] = v6.echo_reply;

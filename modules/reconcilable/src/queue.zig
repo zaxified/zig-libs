@@ -595,6 +595,28 @@ test "a mid-pass enqueueAfter beats a longer disposition" {
     try testing.expectEqual(@as(?Instant, 110), q.nextTimer());
 }
 
+test "a mid-pass enqueueAfter survives a drop disposition" {
+    // The sibling test above ("beats a longer disposition") only exercises
+    // `.after` dispositions racing a mid-pass enqueueAfter. A `.drop`
+    // disposition (the pass converged) must NOT discard a re-check that
+    // arrived while it was running — `finish` takes @min(asked, dirty_due)
+    // where `asked` is nil_due for `.drop`, so dirty_due alone must win.
+    var q = try Q.init(testing.allocator, 8);
+    defer q.deinit();
+
+    _ = try q.enqueue(7);
+    const idx = q.takeReady().?;
+    _ = try q.enqueueAfter(7, 100, 10); // due 110, arrives mid-pass
+    q.finish(idx, 100, .drop); // the pass says "converged, drop it"
+
+    // The deferred re-check must have survived: key is still tracked and
+    // parked on its timer, not gone.
+    try testing.expect(q.contains(7));
+    try testing.expectEqual(@as(?Instant, 110), q.nextTimer());
+    try testing.expectEqual(Q.State.waiting, q.stateOf(7).?);
+    q.assertInvariants();
+}
+
 test "capacity is a hard admission bound" {
     var q = try Q.init(testing.allocator, 4);
     defer q.deinit();

@@ -588,11 +588,65 @@ test "columnIndex / cell / floatColumn" {
     try testing.expectEqual(@as(f64, 20), mv[1]); // int coerced
 }
 
+test "Dataset.seriesXY: projects distinct x/y columns; non-numeric x falls back to the row index" {
+    // Zero call sites anywhere else in the module — this is the only test.
+    const cols = [_]Column{
+        .{ .name = "sym", .type = .text },
+        .{ .name = "day", .type = .int },
+        .{ .name = "mv", .type = .float },
+    };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "AAA" }, .{ .int = 1 }, .{ .float = 10 } },
+        &.{ .{ .text = "BBB" }, .{ .int = 2 }, .{ .float = 20 } },
+    };
+    const ds = Dataset{ .columns = &cols, .rows = &rows };
+
+    // Numeric x: uses the actual column value, and y is genuinely the OTHER
+    // column (a swapped x/y bug would still pass if this test only checked
+    // one of the two coordinates against the same source column).
+    const xy = try ds.seriesXY(testing.allocator, "day", "mv");
+    defer testing.allocator.free(xy);
+    try testing.expectEqual(@as(f64, 1), xy[0][0]);
+    try testing.expectEqual(@as(f64, 10), xy[0][1]);
+    try testing.expectEqual(@as(f64, 2), xy[1][0]);
+    try testing.expectEqual(@as(f64, 20), xy[1][1]);
+
+    // Non-numeric x (text column) -> the row index is used as x instead.
+    const xy2 = try ds.seriesXY(testing.allocator, "sym", "mv");
+    defer testing.allocator.free(xy2);
+    try testing.expectEqual(@as(f64, 0), xy2[0][0]);
+    try testing.expectEqual(@as(f64, 10), xy2[0][1]);
+    try testing.expectEqual(@as(f64, 1), xy2[1][0]);
+    try testing.expectEqual(@as(f64, 20), xy2[1][1]);
+
+    try testing.expectError(error.NoSuchColumn, ds.seriesXY(testing.allocator, "nope", "mv"));
+    try testing.expectError(error.NoSuchColumn, ds.seriesXY(testing.allocator, "day", "nope"));
+}
+
 test "Value.eql and order" {
     try testing.expect(Value.eql(.{ .int = 3 }, .{ .float = 3.0 }));
     try testing.expect(!Value.eql(.{ .text = "a" }, .{ .text = "b" }));
     try testing.expectEqual(std.math.Order.lt, Value.order(.{ .float = 1 }, .{ .float = 2 }));
     try testing.expectEqual(std.math.Order.lt, Value.order(.null, .{ .int = 0 }));
+}
+
+test "Value.eql/order: bool values compared by actual value, and bool's type rank sits between null and numeric" {
+    // Neither eql's .bool arm nor order's .bool arm (nor typeRank's bool=1
+    // placement) had ANY test anywhere in this suite before this — every
+    // existing eql/order test used int/float/text/decimal/null only.
+    try testing.expect(Value.eql(.{ .bool = true }, .{ .bool = true }));
+    try testing.expect(Value.eql(.{ .bool = false }, .{ .bool = false }));
+    try testing.expect(!Value.eql(.{ .bool = true }, .{ .bool = false }));
+    try testing.expect(!Value.eql(.{ .bool = false }, .{ .bool = true }));
+
+    try testing.expectEqual(std.math.Order.eq, Value.order(.{ .bool = true }, .{ .bool = true }));
+    try testing.expectEqual(std.math.Order.lt, Value.order(.{ .bool = false }, .{ .bool = true }));
+    try testing.expectEqual(std.math.Order.gt, Value.order(.{ .bool = true }, .{ .bool = false }));
+
+    // Documented ordering: null < bool < numeric < text.
+    try testing.expectEqual(std.math.Order.lt, Value.order(.null, .{ .bool = false }));
+    try testing.expectEqual(std.math.Order.lt, Value.order(.{ .bool = true }, .{ .int = 0 }));
+    try testing.expectEqual(std.math.Order.lt, Value.order(.{ .bool = true }, .{ .text = "" }));
 }
 
 test "Value.asInt and cast" {

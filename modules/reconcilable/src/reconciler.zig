@@ -471,6 +471,32 @@ test "ticking an empty reconciler is free and reports idle" {
     try testing.expectEqual(@as(usize, 0), rec.calls.items.len);
 }
 
+test "sleepFor: zero when something is ready now, the exact gap when only a timer is pending" {
+    // The only existing sleepFor test covers just the null (idle) branch —
+    // both non-null arms (`due <= now -> 0`, `due > now -> due - now`) had
+    // no coverage, including the underflow-prone subtraction if the clamp
+    // were ever dropped.
+    var rec = newRecorder();
+    defer rec.deinit();
+    var r = try R.init(testing.allocator, &rec, recorderFn, .{ .capacity = 4 });
+    defer r.deinit();
+
+    // Ready right now: nextDue == now, so sleepFor must be exactly 0.
+    _ = try r.enqueue(1);
+    try testing.expectEqual(@as(?u64, 0), r.sleepFor(100));
+
+    // Drain it, then park a future timer: sleepFor must be the exact gap.
+    _ = r.tick(100);
+    _ = try r.enqueueAfter(2, 100, 5000);
+    try testing.expectEqual(@as(?u64, 5000), r.sleepFor(100));
+    try testing.expectEqual(@as(?u64, 3000), r.sleepFor(2100));
+
+    // An overdue timer (deadline already in the past relative to `now`,
+    // because nothing has ticked to promote it yet) must clamp to 0, not
+    // underflow the unsigned subtraction into a huge wraparound value.
+    try testing.expectEqual(@as(?u64, 0), r.sleepFor(10_000));
+}
+
 test "a struct key works and forget drops it" {
     const Filter = struct { ifindex: u32, handle: u32 };
     const Noop = struct {

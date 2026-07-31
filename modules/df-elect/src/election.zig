@@ -175,6 +175,86 @@ fn winsTotalOrder(view: SegmentView) bool {
 
 const testing = std.testing;
 
+test "decide: the priority order actually picks the LOWER-priority member as DF" {
+    // This is THE documented rule ("lowest priority value wins") and it had
+    // zero direct coverage: every existing test either avoided calling
+    // `decide` at all, or drove it only through the full netsim scenario,
+    // whose safety invariants (no duplicate delivery, no split-horizon
+    // violation) are satisfied EQUALLY whichever member wins — they never
+    // check WHICH one does. A `winsTotalOrder` with the comparison
+    // backwards (higher priority wins) would still pass every other test in
+    // this module because the safety proof only needs "exactly one member
+    // answers DF, consistently" — not "the right one".
+    const lower_is_self = SegmentView{
+        .self_id = 3,
+        .self_priority = 10,
+        .peer_id = 4,
+        .peer_priority = 20,
+        .peer_alive = true,
+    };
+    try testing.expect(winsTotalOrder(lower_is_self));
+
+    const higher_is_self = SegmentView{
+        .self_id = 4,
+        .self_priority = 20,
+        .peer_id = 3,
+        .peer_priority = 10,
+        .peer_alive = true,
+    };
+    try testing.expect(!winsTotalOrder(higher_is_self));
+}
+
+test "decide: equal-priority tie-break by lowest node id — an entirely dead branch in the sim scenario" {
+    // Neither SEG_A ({10,20}) nor SEG_B ({15,5}) ever has equal priorities,
+    // so this branch of `winsTotalOrder` is unreachable from ANY netsim-
+    // driven test in this module, including the seed-sweep fuzzers — a
+    // reversed tie-break (`self_id > peer_id`) would never be exercised.
+    const lower_id_is_self = SegmentView{
+        .self_id = 3,
+        .self_priority = 10,
+        .peer_id = 4,
+        .peer_priority = 10,
+        .peer_alive = true,
+    };
+    try testing.expect(winsTotalOrder(lower_id_is_self));
+
+    const higher_id_is_self = SegmentView{
+        .self_id = 4,
+        .self_priority = 10,
+        .peer_id = 3,
+        .peer_priority = 10,
+        .peer_alive = true,
+    };
+    try testing.expect(!winsTotalOrder(higher_id_is_self));
+}
+
+test "decide: the documented owner/backup x alive/stale table, incl. the crucial asymmetric backup-stale cell" {
+    // From the module doc's table: owner is DF whether the peer is alive or
+    // stale; the backup is NOT DF even when the peer (owner) looks stale —
+    // the one counter-intuitive cell that the whole duplicate-freedom proof
+    // hinges on (`is_df` must be independent of `peer_alive`).
+    const owner_peer_alive = SegmentView{ .self_id = 3, .self_priority = 10, .peer_id = 4, .peer_priority = 20, .peer_alive = true };
+    const owner_peer_stale = SegmentView{ .self_id = 3, .self_priority = 10, .peer_id = 4, .peer_priority = 20, .peer_alive = false };
+    const backup_peer_alive = SegmentView{ .self_id = 4, .self_priority = 20, .peer_id = 3, .peer_priority = 10, .peer_alive = true };
+    const backup_peer_stale = SegmentView{ .self_id = 4, .self_priority = 20, .peer_id = 3, .peer_priority = 10, .peer_alive = false };
+
+    try testing.expect(decide(owner_peer_alive, null, 1).is_df);
+    try testing.expect(decide(owner_peer_stale, null, 1).is_df);
+    try testing.expect(!decide(backup_peer_alive, null, 1).is_df);
+    try testing.expect(!decide(backup_peer_stale, null, 1).is_df); // the asymmetric cell
+}
+
+test "decide: split-horizon gate — forwards everywhere except back onto the ingress segment" {
+    const view = SegmentView{ .self_id = 3, .self_priority = 10, .peer_id = 4, .peer_priority = 20, .peer_alive = true };
+    // No ingress (network/WAN-side origin): always forwards.
+    try testing.expect(decide(view, null, 1).allow_forward);
+    // CE-side frame ingressing from a DIFFERENT segment: forwards.
+    try testing.expect(decide(view, 2, 1).allow_forward);
+    // CE-side frame ingressing from THIS segment: must be blocked, with zero
+    // tolerance, independent of is_df.
+    try testing.expect(!decide(view, 1, 1).allow_forward);
+}
+
 test "SegmentView / Decision are plain data (compiles, no stub call)" {
     const view = SegmentView{
         .self_id = 1,

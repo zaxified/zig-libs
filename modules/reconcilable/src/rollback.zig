@@ -206,6 +206,39 @@ test "re-arm supersedes an expired timer" {
     try testing.expectEqual(RollbackTimer.Confirm.committed, t.confirm(29));
 }
 
+test "reset drops back to idle from any state, and a fresh arm works after" {
+    // `reset` had no call site anywhere in this test file at all.
+    var t: RollbackTimer = .idle;
+
+    // From `.rolled_back` (the documented use: after the caller has
+    // executed the rollback).
+    _ = t.arm(0, 10);
+    try testing.expectEqual(RollbackTimer.Status.expired, t.poll(10));
+    t.reset();
+    try testing.expectEqual(RollbackTimer.State.idle, t.state);
+    try testing.expectEqual(RollbackTimer.Status.idle, t.poll(10));
+    try testing.expectEqual(@as(?u64, null), t.remaining(10));
+
+    // From `.armed` (abandoned mid-window, never confirmed or expired).
+    _ = t.arm(100, 1000);
+    try testing.expectEqual(RollbackTimer.Status.armed, t.poll(150));
+    t.reset();
+    try testing.expectEqual(RollbackTimer.State.idle, t.state);
+    try testing.expectEqual(RollbackTimer.Confirm.not_armed, t.confirm(150));
+
+    // From `.confirmed`.
+    _ = t.arm(200, 50);
+    try testing.expectEqual(RollbackTimer.Confirm.committed, t.confirm(210));
+    t.reset();
+    try testing.expectEqual(RollbackTimer.State.idle, t.state);
+
+    // A fresh arm after reset behaves exactly like a first arm — the old
+    // deadline must be gone, not lingering to fire early.
+    const g = t.arm(1_000, 500);
+    try testing.expectEqual(RollbackTimer.Status.armed, t.poll(1_400));
+    try testing.expectEqual(RollbackTimer.Confirm.committed, t.confirmGeneration(1_400, g));
+}
+
 test "PROPERTY: over random interleavings, expired fires exactly once iff never confirmed in time" {
     var prng = std.Random.DefaultPrng.init(0x5EED);
     const rnd = prng.random();

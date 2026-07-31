@@ -253,6 +253,39 @@ test "ChunkReader: residual + chunk_start_in_file bookkeeping" {
     try t.expect((try cr.nextChunk()) == null);
 }
 
+test "ChunkReader: chunk_size 0 falls back to default_chunk_size, not a zero-length read" {
+    // init's ternary (chunk_size == 0 -> default_chunk_size) was never
+    // exercised — every existing test passes a nonzero chunk_size or the
+    // named default constant directly. A dropped fallback silently reads
+    // zero bytes per iteration and yields no records at all.
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "a,1\nb,2\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    var cr = try ChunkReader.init(t.io, t.allocator, f, 0);
+    defer cr.deinit();
+    try t.expectEqual(default_chunk_size, cr.chunk_size);
+    const c0 = (try cr.nextChunk()) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings(body, c0);
+}
+
+test "ChunkReader: max_record_len floor tracks a configured chunk_size larger than the default" {
+    // max_record_len = @max(resolved_chunk, default_chunk_size); every other
+    // test uses a chunk_size well below the 10 MiB default, so the branch
+    // where the CONFIGURED size wins the max (not the default) was dead.
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = "x\n" });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    const big: usize = default_chunk_size + 1024;
+    var cr = try ChunkReader.init(t.io, t.allocator, f, big);
+    defer cr.deinit();
+    try t.expectEqual(big, cr.max_record_len);
+}
+
 test "ChunkReader: a newline-free record past max_record_len is rejected, not buffered unbounded (audit MED)" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();

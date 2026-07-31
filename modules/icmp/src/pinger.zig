@@ -982,6 +982,17 @@ test "stats helpers" {
     try std.testing.expectEqual(@as(u64, 1_000_000), s.avgNs().?);
 }
 
+test "stats helpers: no probes sent yet" {
+    // Zero-sent must not be treated as 100% loss (or any other non-zero
+    // permille) just because `lost() == 0 - 0 == 0` happens to also be 0;
+    // this pins the early-return guard, not the arithmetic.
+    const s: Stats = .{};
+    try std.testing.expect(!s.alive());
+    try std.testing.expectEqual(@as(u32, 0), s.lost());
+    try std.testing.expectEqual(@as(u32, 0), s.lossPermille());
+    try std.testing.expectEqual(@as(?u64, null), s.avgNs());
+}
+
 test "pinger init/deinit and target bookkeeping" {
     var p = try Pinger.init(std.testing.allocator, .{});
     defer p.deinit();

@@ -335,6 +335,27 @@ test "COSE_Key: missing required field -> MissingField" {
     try testing.expectError(error.MissingField, parseKey(.{ .map = &entries }));
 }
 
+test "COSE_Key: wrong-typed x/y -> WrongType (not silently coerced to empty)" {
+    // KeyError.WrongType is declared but was never exercised — bstrField's
+    // "not a byte string" branch (x/y arrive as e.g. a text string or an
+    // int) had no reject test at all.
+    const entries_bad_x = [_]MapEntry{
+        .{ .key = .{ .uint = 1 }, .value = .{ .uint = 2 } }, // kty=EC2
+        .{ .key = Value.fromI64(-1), .value = .{ .uint = 1 } }, // crv
+        .{ .key = Value.fromI64(-2), .value = .{ .text = "not-bytes" } }, // x: wrong type
+        .{ .key = Value.fromI64(-3), .value = .{ .bytes = "y" } },
+    };
+    try testing.expectError(error.WrongType, parseKey(.{ .map = &entries_bad_x }));
+
+    const entries_bad_y = [_]MapEntry{
+        .{ .key = .{ .uint = 1 }, .value = .{ .uint = 2 } },
+        .{ .key = Value.fromI64(-1), .value = .{ .uint = 1 } },
+        .{ .key = Value.fromI64(-2), .value = .{ .bytes = "x" } },
+        .{ .key = Value.fromI64(-3), .value = .{ .uint = 7 } }, // y: wrong type
+    };
+    try testing.expectError(error.WrongType, parseKey(.{ .map = &entries_bad_y }));
+}
+
 test "COSE_Key: unsupported kty -> UnsupportedKty" {
     const entries = [_]MapEntry{
         .{ .key = .{ .uint = 1 }, .value = .{ .uint = 4 } }, // kty=4 (symmetric) — not modeled
@@ -417,4 +438,50 @@ test "COSE_Sign1: not an array -> NotSign1" {
 test "COSE_Sign1: wrong element count -> NotSign1" {
     const arr = [_]Value{ .{ .uint = 1 }, .{ .uint = 2 } };
     try testing.expectError(error.NotSign1, parseSign1(.{ .array = &arr }));
+}
+
+test "COSE_Sign1: each of the 4 fields rejects the wrong CBOR type -> WrongType" {
+    // Sign1Error.WrongType is declared but every field-type-mismatch branch
+    // in parseSign1 (protected/unprotected/payload/signature) was
+    // completely unexercised — only the array-shape errors (NotSign1) had
+    // reject tests.
+    const good_unprotected = [_]MapEntry{};
+    const good_bytes = [_]u8{1};
+
+    // protected: not a bstr.
+    try testing.expectError(error.WrongType, parseSign1(.{
+        .array = &[_]Value{
+            .{ .uint = 0 }, // should be bytes
+            .{ .map = &good_unprotected },
+            .{ .bytes = &good_bytes },
+            .{ .bytes = &good_bytes },
+        },
+    }));
+    // unprotected: not a map.
+    try testing.expectError(error.WrongType, parseSign1(.{
+        .array = &[_]Value{
+            .{ .bytes = &good_bytes },
+            .{ .uint = 0 }, // should be a map
+            .{ .bytes = &good_bytes },
+            .{ .bytes = &good_bytes },
+        },
+    }));
+    // payload: neither bytes nor CBOR null.
+    try testing.expectError(error.WrongType, parseSign1(.{
+        .array = &[_]Value{
+            .{ .bytes = &good_bytes },
+            .{ .map = &good_unprotected },
+            .{ .uint = 0 }, // should be bytes or null_value
+            .{ .bytes = &good_bytes },
+        },
+    }));
+    // signature: not a bstr.
+    try testing.expectError(error.WrongType, parseSign1(.{
+        .array = &[_]Value{
+            .{ .bytes = &good_bytes },
+            .{ .map = &good_unprotected },
+            .{ .bytes = &good_bytes },
+            .{ .uint = 0 }, // should be bytes
+        },
+    }));
 }

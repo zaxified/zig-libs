@@ -581,6 +581,58 @@ test "DoH-JSON schema parses a canned Cloudflare response" {
     try testing.expect(netaddr.parseIp(parsed.value.Answer[0].data) != null);
 }
 
+test "decodeResponse rejects id mismatch and non-response packets (anti-spoofing)" {
+    // decodeResponse is the only place the id/QR correlation check lives;
+    // every live test above only ever sees a genuine, correctly-matched
+    // reply, so this check has no coverage without a dedicated offline
+    // test. `io` is unused by decodeResponse itself, so `undefined` is
+    // fine here.
+    var r: Resolver = .{
+        .io = undefined,
+        .gpa = testing.allocator,
+        .options = .{},
+        .http_client = null,
+        .conf = null,
+        .conf_text = null,
+    };
+
+    // A minimal, well-formed response: header only, QR set, id 0x1234.
+    var good: [message.header_len]u8 = @splat(0);
+    std.mem.writeInt(u16, good[0..2], 0x1234, .big);
+    good[2] = 0x80; // QR=1
+
+    var msg = try r.decodeResponse(&good, 0x1234);
+    msg.deinit();
+
+    // Same packet, wrong expected id: rejected, not silently accepted.
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(&good, 0x1235));
+
+    // QR=0 (a query, not a response) with the matching id: also rejected.
+    var not_response = good;
+    not_response[2] = 0x00;
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(&not_response, 0x1234));
+}
+
+test "serverList falls back to default_servers when resolv.conf is missing/empty" {
+    // Every live test above runs against the sandbox's real /etc/resolv.conf,
+    // which always names servers — so the "conf read failed or named none"
+    // fallback to 127.0.0.1 / ::1 (Go's behavior) has no coverage without a
+    // dedicated offline test pointed at a path that can't be read.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var r = Resolver.init(io, testing.allocator, .{
+        .resolv_conf_path = "/nonexistent/zig-libs-dns-test-resolv.conf",
+    });
+    defer r.deinit();
+
+    const servers = try r.serverList();
+    try testing.expectEqual(@as(usize, 2), servers.len);
+    try testing.expect(servers[0].eql(netaddr.parseIp("127.0.0.1").?));
+    try testing.expect(servers[1].eql(netaddr.parseIp("::1").?));
+}
+
 test "toNetAddress maps netaddr.Ip to std.Io.net.IpAddress" {
     const v4 = toNetAddress(netaddr.parseIp("192.0.2.1").?, 53);
     try testing.expectEqual([4]u8{ 192, 0, 2, 1 }, v4.ip4.bytes);

@@ -1397,6 +1397,37 @@ test "middleware: malformed Authorization never panics, always 401" {
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization:   Bearer s3cr3t  \r\n"), &buf), "200");
 }
 
+test "isMutating: every http.Method classified — all four write verbs, all three read verbs" {
+    // Direct unit test of the private classifier: the wire-level
+    // protect=.mutations test below only exercises POST as "the" mutating
+    // method, which would not notice PUT/PATCH/DELETE silently falling
+    // into the read bucket.
+    inline for (.{ .post, .put, .patch, .delete }) |m| {
+        try testing.expect(isMutating(m));
+    }
+    inline for (.{ .get, .head, .options }) |m| {
+        try testing.expect(!isMutating(m));
+    }
+}
+
+test "middleware: protect=.mutations gates PUT/PATCH/DELETE too, not just POST" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .protect = .mutations });
+    defer g.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.put("/t", hHello);
+    try r.patch("/t", hHello);
+    try r.delete("/t", hHello);
+    var buf: [1024]u8 = undefined;
+
+    inline for (.{ "PUT", "PATCH", "DELETE" }) |method| {
+        try expectStatus(runWire(&r, wire(method, "/t", ""), &buf), "401");
+        try expectStatus(runWire(&r, wire(method, "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "200");
+    }
+}
+
 test "middleware: protect=.mutations lets reads through unauthenticated (no identity), gates writes" {
     var sink: Sink = .{};
     var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .protect = .mutations });
@@ -1572,13 +1603,26 @@ test "audit throttle over the wire: one key coalesces, keys are isolated by the 
     try expectStatus(runWire(&gr.r, wire("POST", "/t", client_b), &buf), "401");
     try testing.expectEqual(@as(usize, 2), sink.len);
 
+    // Documented contract: when a request carries MULTIPLE X-Forwarded-For
+    // header lines, the LAST one wins (not the first) — a proxy chain
+    // rewriting XFF is expected to append a new header line, and only the
+    // outermost trusted hop's is authoritative. Exercise it with two
+    // distinct XFF headers pointing at otherwise-untested client "9.9.0.1".
+    const client_multi_first = "X-Forwarded-For: 1.2.3.4\r\nX-Forwarded-For: 9.9.0.1\r\n";
+    const client_multi_again = "X-Forwarded-For: 9.9.9.9\r\nX-Forwarded-For: 9.9.0.1\r\n";
+    try expectStatus(runWire(&gr.r, wire("POST", "/t", client_multi_first), &buf), "401");
+    try testing.expectEqual(@as(usize, 3), sink.len); // last header's IP is new -> admitted
+    try expectStatus(runWire(&gr.r, wire("POST", "/t", client_multi_again), &buf), "401");
+    // Different FIRST header, same LAST header -> same throttle key -> coalesced.
+    try testing.expectEqual(@as(usize, 3), sink.len);
+
     // Past the window the next denial is admitted, folding the 2
     // suppressed attempts into its entry.
     tc.advanceMs(5_001);
     try expectStatus(runWire(&gr.r, wire("POST", "/t", client_a), &buf), "401");
-    try testing.expectEqual(@as(usize, 3), sink.len);
-    try testing.expectEqual(@as(u64, 2), sink.recs[2].suppressed);
-    try testing.expect(!sink.recs[2].authed);
+    try testing.expectEqual(@as(usize, 4), sink.len);
+    try testing.expectEqual(@as(u64, 2), sink.recs[3].suppressed);
+    try testing.expect(!sink.recs[3].authed);
 }
 
 test "throttle keying: X-Real-IP fallback, socket peer (port-insensitive, v4-mapped unified), fallback key" {
@@ -1942,6 +1986,16 @@ fn fuzzApiKeyPresented(_: void, smith: *std.testing.Smith) !void {
 }
 test "fuzz apiKeyPresented never panics" {
     try testing.fuzz({}, fuzzApiKeyPresented, .{});
+}
+
+test "queryValue: finds a param that isn't the first pair in a multi-param query" {
+    // The wire-level tests only ever send a single-param query string, so a
+    // wrong split delimiter (or a "only check pair 0" bug) would slip
+    // through unnoticed. Exercise the actual multi-pair split directly.
+    try testing.expectEqualStrings("sekret", queryValue("foo=1&api_key=sekret", "api_key").?);
+    try testing.expectEqualStrings("sekret", queryValue("api_key=sekret&foo=1", "api_key").?);
+    try testing.expectEqualStrings("sekret", queryValue("foo=1&api_key=sekret&bar=2", "api_key").?);
+    try testing.expectEqual(@as(?[]const u8, null), queryValue("foo=1&bar=2", "api_key"));
 }
 
 fn fuzzQueryValue(_: void, smith: *std.testing.Smith) !void {

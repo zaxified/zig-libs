@@ -557,6 +557,62 @@ test "preflight: failing any gate → 204 with Vary but zero CORS headers" {
     try testing.expect(!flag.hit); // intercepted every time
 }
 
+test "preflight: .list allowed_headers with NO Access-Control-Request-Headers still emits Allow-Headers" {
+    // The gate at handlePreflight only checks requestedHeadersAllowed when
+    // ACRH is present — a preflight requesting no extra headers at all must
+    // still pass and advertise the configured list. Every other .list test
+    // sends an ACRH, so this "absent" branch was never exercised.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_headers = .{ .list = &.{"Content-Type"} },
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+
+    const got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+        "Access-Control-Request-Method: POST\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    try expectHeaderLine(got, "Access-Control-Allow-Headers: Content-Type");
+}
+
+test "methodTokenAllowed is genuinely case-insensitive (not just same-case by construction)" {
+    // Every wire-level test sends canonical-case method tokens (they're what
+    // http.Method.token() and real HTTP verbs produce), so the
+    // eqlIgnoreCase in methodTokenAllowed was never exercised on a mismatched
+    // case — call the private helper directly with a lowercase token.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .any,
+        .allowed_methods = &.{.get},
+    });
+    defer c.deinit();
+    try testing.expect(c.methodTokenAllowed("get")); // lowercase, configured as .get
+    try testing.expect(c.methodTokenAllowed("GeT"));
+    try testing.expect(c.methodTokenAllowed("options")); // lowercase OPTIONS bypass
+    try testing.expect(!c.methodTokenAllowed("post"));
+}
+
+test "actual: Vary is withheld (not just Allow-Origin) when the method gate fails" {
+    // The existing "method outside allowed_methods" test only checks that
+    // Access-Control-Allow-Origin is absent; it never checked Vary
+    // specifically, so a Vary-before-the-method-gate ordering bug would
+    // have gone unnoticed.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{.get},
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+
+    const got = runWire(&r, wire("POST", "/t", "Origin: https://app.example\r\n"), &buf);
+    try expectStatus(got, "200");
+    try expectNoHeader(got, "Vary");
+}
+
 test "preflight: intercepted before 405 and 404 (the global-middleware point)" {
     var c: Cors = try .init(testing.allocator, .{
         .allowed_origins = .{ .list = &.{"https://app.example"} },

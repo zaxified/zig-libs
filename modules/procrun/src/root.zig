@@ -1264,6 +1264,31 @@ test "waitTolerant: ECHILD after out-of-band reap yields .unknown (no panic)" {
     try testing.expect(term == .unknown);
 }
 
+test "statusToTerm: decodes every wait-status shape from raw bits" {
+    // Every OTHER Term test drives a real subprocess, which only ever
+    // produces `.exited` or `.signal` statuses (nothing here ever sends
+    // SIGSTOP to a child). `.stopped` and the unmatched-status `.unknown`
+    // fallback have no coverage without hand-built status words — build
+    // them directly per the raw wait(2) encoding (low byte 0x7f = stopped;
+    // stop/term signal in the next byte up).
+    const posix = std.posix;
+
+    // WIFEXITED: low byte 0, exit code in bits 8-15.
+    try testing.expectEqual(Term{ .exited = 7 }, statusToTerm(7 << 8));
+
+    // WIFSIGNALED: low 7 bits carry the signal, top bit is the core-dump flag.
+    try testing.expectEqual(Term{ .signal = posix.SIG.KILL }, statusToTerm(@intFromEnum(posix.SIG.KILL)));
+
+    // WIFSTOPPED: low byte exactly 0x7f, stop signal in bits 8-15.
+    const stopped_status: u32 = 0x7f | (@as(u32, @intFromEnum(posix.SIG.STOP)) << 8);
+    try testing.expectEqual(Term{ .stopped = posix.SIG.STOP }, statusToTerm(stopped_status));
+
+    // None of IFEXITED/IFSIGNALED/IFSTOPPED match this status word: falls
+    // to `.unknown` carrying the raw status, not misparsed as one of the
+    // other three.
+    try testing.expectEqual(Term{ .unknown = 0x101 }, statusToTerm(0x101));
+}
+
 test "ensureChildReaping: idempotent and leaves a real disposition alone" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const posix = std.posix;
@@ -1283,10 +1308,22 @@ test "ensureChildReaping: idempotent and leaves a real disposition alone" {
     posix.sigaction(posix.SIG.CHLD, null, &after);
     try testing.expect(after.handler.handler == posix.SIG.DFL);
 
-    // A non-IGN disposition must be left untouched.
+    // A non-IGN disposition must be left untouched — DFL->DFL alone can't
+    // prove this (a mutant that unconditionally resets to DFL would pass
+    // it too), so install a genuine custom handler and confirm it
+    // survives `restoreChildReaping` unchanged.
+    const H = struct {
+        fn handler(_: posix.SIG) callconv(.c) void {}
+    };
+    const custom: posix.Sigaction = .{
+        .handler = .{ .handler = H.handler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.CHLD, &custom, null);
     restoreChildReaping();
     posix.sigaction(posix.SIG.CHLD, null, &after);
-    try testing.expect(after.handler.handler == posix.SIG.DFL);
+    try testing.expect(after.handler.handler == H.handler);
 }
 
 test "run: merge env overlays the child environment" {

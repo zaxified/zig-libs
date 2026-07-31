@@ -917,6 +917,29 @@ test "golden: delete request header + tuple match the captured `conntrack -D`" {
     );
 }
 
+test "buildGetRequest: dir=.reply keys on CTA_TUPLE_REPLY, not ORIG (only .orig had a golden)" {
+    // The single golden test for this builder only ever drives dir=.orig;
+    // a bug that mapped .reply to CTA_TUPLE_ORIG too would still pass it.
+    const gpa = testing.allocator;
+    const req = try buildGetRequest(gpa, 1, .ipv4, .reply, .{
+        .src = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .dst = .{ .v4 = .{ 10, 0, 0, 2 } },
+        .proto = IPPROTO.UDP,
+        .src_port = 1,
+        .dst_port = 2,
+    });
+    defer gpa.free(req);
+    const hdr = try parseNfgenmsg(req[codec.header_len..]);
+    var it = hdr.attrIterator();
+    var saw_reply = false;
+    while (try it.next()) |a| switch (a.type) {
+        CTA.TUPLE_REPLY => saw_reply = true,
+        CTA.TUPLE_ORIG => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try testing.expect(saw_reply);
+}
+
 test "delete with expect_id appends CTA_ID and a flush carries no tuple" {
     const with_id = try buildDeleteRequest(testing.allocator, 1, .ipv4, .reply, .{
         .src = .{ .v4 = .{ 10, 0, 0, 1 } },
@@ -1160,10 +1183,45 @@ test "invert maps ICMP request types to their answers" {
     v6.proto = IPPROTO.ICMPV6;
     v6.icmp_type = 128;
     try testing.expectEqual(@as(u8, 129), v6.invert().icmp_type.?);
+    // …and the reverse ICMPv6 direction (129 -> 128), otherwise untested.
+    v6.icmp_type = 129;
+    try testing.expectEqual(@as(u8, 128), v6.invert().icmp_type.?);
+
     // An unpaired type is left alone.
     var dest_unreach = t;
     dest_unreach.icmp_type = 3;
     try testing.expectEqual(@as(u8, 3), dest_unreach.invert().icmp_type.?);
+}
+
+test "invertIcmpType: every mapped pair, both directions (only 8->0 had a reject/positive test)" {
+    // invertIcmpType has 8 non-trivial branches (4 ICMP pairs + 2 ICMPv6);
+    // the test above only ever exercised 8->0 and 128->129 — the reverse
+    // of every pair, and the timestamp/info/address-mask trio entirely,
+    // had no test at all.
+    const pairs = [_][2]u8{
+        .{ 8, 0 }, .{ 0, 8 }, // echo
+        .{ 13, 14 }, .{ 14, 13 }, // timestamp
+        .{ 15, 16 }, .{ 16, 15 }, // information
+        .{ 17, 18 }, .{ 18, 17 }, // address mask
+    };
+    for (pairs) |p| {
+        try testing.expectEqual(p[1], invertIcmpType(p[0], IPPROTO.ICMP));
+    }
+}
+
+test "decodeCounters: legacy 32-bit PACKETS32/BYTES32 forms decode to the right field" {
+    // Dead in every current kernel (which emits the 64-bit forms), but the
+    // module still decodes them "rather than ignoring a real counter" per
+    // the doc comment — a claim that had zero test coverage: a
+    // packets/bytes field swap in this branch would have gone unnoticed.
+    const gpa = testing.allocator;
+    var nest: std.ArrayList(u8) = .empty;
+    defer nest.deinit(gpa);
+    try codec.appendAttrBe32(gpa, &nest, CTA_COUNTERS.PACKETS32, 11);
+    try codec.appendAttrBe32(gpa, &nest, CTA_COUNTERS.BYTES32, 2222);
+    const c = try decodeCounters(nest.items);
+    try testing.expectEqual(@as(u64, 11), c.packets);
+    try testing.expectEqual(@as(u64, 2222), c.bytes);
 }
 
 test "decoder rejects wrong-sized scalars, not unknown attributes" {

@@ -1024,7 +1024,7 @@ test "parseIp6 rejects malformed input" {
         "1:2:3:4:5:6:7:8:9", "1::2::3",          "12345::",               "1:2:3:4:5:6:7:8::",
         "::1:2:3:4:5:6:7:8", "fe80::1%eth0",     "g::1",                  "1:2:3:4:5:6:1.2.3",
         "1.2.3.4::",         "::1.2.3.400",      "1:2:3:4:5:6:7:1.2.3.4", ":1::2",
-        "1::2:",             "::ffff:1.2.3.4.5",
+        "1::2:",             "::ffff:1.2.3.4.5", "::1.2.3.4:5",
     };
     for (bad) |t| try testing.expectEqual(@as(?[16]u8, null), parseIp6(t));
 }
@@ -1256,6 +1256,22 @@ test "selectSource: appropriate scope (rule 2)" {
     // Link-local destination: prefer the link-local source (smallest
     // sufficient scope).
     try testing.expectEqual(@as(?usize, 0), selectSource(&cands, mkIp("fe80::99")));
+}
+
+test "selectSource: appropriate scope (rule 2), candidate scope order reversed" {
+    // `sourceBefore`'s scope check has two symmetric branches
+    // (`scope_a < scope_b` and `scope_b < scope_a`); the tests above only
+    // ever compare a later, *larger*-scope candidate against an earlier,
+    // smaller-scope one, so the `scope_a < scope_b` branch (later candidate
+    // has the SMALLER scope) never runs. Put the global address first and
+    // the link-local one second to force it.
+    const cands = [_]Ip{ mkIp("2001:db8::1"), mkIp("fe80::1") };
+    // Global destination: the global candidate (already best) must stay
+    // best — scope_a(link) >= scope_d(global) is false.
+    try testing.expectEqual(@as(?usize, 0), selectSource(&cands, mkIp("2606:4700::1111")));
+    // Link-local destination: the later, smaller-scope candidate must take
+    // over — scope_a(link) >= scope_d(link) is true.
+    try testing.expectEqual(@as(?usize, 1), selectSource(&cands, mkIp("fe80::99")));
 }
 
 test "selectSource: matching label (rule 6)" {

@@ -780,6 +780,31 @@ test "encode args -> blobmsg -> decode round-trips (string/bool/int/nested/array
     try testing.expectEqualStrings(src, json);
 }
 
+test "appendU32: BE-encoded INT32 wire attr, incl. values above maxInt(i32) (event registry object ids)" {
+    // Zero call sites anywhere in this suite otherwise (only production use
+    // is root.zig's subscribe() sending the listener object id to the event
+    // registry) — a wrong byte order or a value >maxInt(i32) mishandled
+    // would go unnoticed.
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try appendU32(gpa, &buf, "object", 0xdeadbeef); // > maxInt(i32)
+    try testing.expectEqualSlices(u8, &.{
+        0x85, 0x00, 0x00, 0x14, // EXTENDED | INT32<<24 | 20
+        0x00, 0x06, 'o',  'b',
+        'j',  'e',  'c',  't',
+        0x00, 0x00, 0x00, 0x00, // blobmsg_hdr NUL + pad
+        0xde, 0xad, 0xbe, 0xef, // raw BE bits, no sign handling
+    }, buf.items);
+
+    var it = FieldIterator.init(buf.items);
+    const f = (try it.next()).?;
+    // Decoded as the module's signed INT32 Value (same wire type as
+    // appendInt32) — the raw bit pattern round-trips even though it reads
+    // back negative through the signed accessor.
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xdeadbeef))), f.value.int32);
+}
+
 test "DOUBLE: golden BE bits + value round-trip" {
     const gpa = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
@@ -949,6 +974,10 @@ test "encode limits: oversized name and attr are rejected" {
     try testing.expectError(error.TooLarge, appendAttr(gpa, &out, ATTR.DATA, huge));
     try testing.expectError(error.TooLarge, appendField(gpa, &out, BM.TABLE, "t", huge));
     try testing.expectError(error.TooLarge, encodeMessage(gpa, MSG.DATA, 0, 0, huge));
+    // appendAttrString has its own TooLarge check (a raw top-level ubus
+    // attr, not a blobmsg field) — a separate branch from appendString's,
+    // otherwise untested.
+    try testing.expectError(error.TooLarge, appendAttrString(gpa, &out, ATTR.OBJPATH, huge));
     try testing.expect(out.items.len == 0); // nothing partial appended
 }
 
