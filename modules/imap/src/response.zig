@@ -22,8 +22,10 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const wire = @import("wire.zig");
+const fetchmod = @import("fetch.zig");
+const searchmod = @import("search.zig");
 
-pub const Error = wire.Error || error{
+pub const Error = wire.Error || fetchmod.Error || searchmod.Error || error{
     /// A status word that is not OK / NO / BAD / PREAUTH / BYE.
     BadStatus,
     /// A tagged response may only carry OK, NO or BAD.
@@ -86,6 +88,12 @@ pub const Data = union(enum) {
     exists: u32,
     recent: u32,
     expunge: u32,
+    /// `* n FETCH (...)`
+    fetch: fetchmod.Message,
+    /// `* SEARCH ...` — the IMAP4rev1 shape, with no tag to correlate on.
+    search: searchmod.Result,
+    /// `* ESEARCH (TAG "x") ...` — the IMAP4rev2 shape.
+    esearch: searchmod.Result,
     /// A kind this module does not parse yet. `rest` is the remainder of the
     /// line, verbatim, so a caller can handle it and the reader stays in sync.
     other: struct {
@@ -106,6 +114,7 @@ pub const Response = union(enum) {
 
 pub const Reader = struct {
     d: wire.Decoder,
+    fetch_opts: fetchmod.Options = .{},
 
     pub fn init(gpa: Allocator, r: *std.Io.Reader, opts: wire.Options) Reader {
         return .{ .d = wire.Decoder.init(gpa, r, opts) };
@@ -178,7 +187,26 @@ pub const Reader = struct {
             return .{ .flags = flags };
         }
 
+        if (std.ascii.eqlIgnoreCase(word, "SEARCH")) {
+            const r = try searchmod.parseSearch(d);
+            try d.expectCrlf();
+            return .{ .search = r };
+        }
+        if (std.ascii.eqlIgnoreCase(word, "ESEARCH")) {
+            try d.expectSp();
+            const r = try searchmod.parseESearch(d);
+            try d.expectCrlf();
+            return .{ .esearch = r };
+        }
+
         if (number) |n| {
+            if (std.ascii.eqlIgnoreCase(word, "FETCH")) {
+                try d.expectSp();
+                var p = fetchmod.Parser{ .d = d, .opts = self.fetch_opts };
+                const m = try p.message(n);
+                try d.expectCrlf();
+                return .{ .fetch = m };
+            }
             if (std.ascii.eqlIgnoreCase(word, "EXISTS")) {
                 try d.expectCrlf();
                 return .{ .exists = n };
@@ -508,14 +536,15 @@ test "an unknown response code is skipped without losing the line" {
 }
 
 test "an unknown untagged kind keeps its number and its remainder" {
-    var f = Fixture.init("* 42 FETCH (UID 7)\r\nA1 OK done\r\n");
+    // A kind this module does not model at all -- VANISHED belongs to QRESYNC.
+    var f = Fixture.init("* 42 VANISHED (EARLIER) 41:42\r\nA1 OK done\r\n");
     defer f.deinit();
     var rd = f.reader();
 
     const o = (try rd.next()).data.other;
-    try testing.expectEqualStrings("FETCH", o.kind);
+    try testing.expectEqualStrings("VANISHED", o.kind);
     try testing.expectEqual(@as(u32, 42), o.number.?);
-    try testing.expectEqualStrings("(UID 7)", o.rest.?);
+    try testing.expectEqualStrings("(EARLIER) 41:42", o.rest.?);
 
     // ...and the reader is still in sync for the next line, which is the whole
     // reason for handing back the remainder instead of erroring.
@@ -556,4 +585,25 @@ test "EXISTS / RECENT / EXPUNGE all take their number from the prefix" {
     try testing.expectEqual(@as(u32, 23), (try rd.next()).data.exists);
     try testing.expectEqual(@as(u32, 5), (try rd.next()).data.recent);
     try testing.expectEqual(@as(u32, 44), (try rd.next()).data.expunge);
+}
+
+test "FETCH, SEARCH and ESEARCH now come back parsed, not as raw text" {
+    var f = Fixture.init(
+        "* 12 FETCH (UID 4827313 FLAGS (\\Seen))\r\n" ++
+            "* SEARCH 2 84 882\r\n" ++
+            "* ESEARCH (TAG \"A282\") MIN 2 COUNT 3\r\n",
+    );
+    defer f.deinit();
+    var rd = f.reader();
+
+    const m = (try rd.next()).data.fetch;
+    try testing.expectEqual(@as(u32, 12), m.seq);
+    try testing.expectEqual(@as(u32, 4827313), m.uid().?);
+
+    const s1 = (try rd.next()).data.search;
+    try testing.expectEqual(@as(usize, 3), s1.numbers.len);
+
+    const s2 = (try rd.next()).data.esearch;
+    try testing.expectEqualStrings("A282", s2.tag.?);
+    try testing.expectEqual(@as(u32, 3), s2.count.?);
 }

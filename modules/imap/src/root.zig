@@ -41,6 +41,8 @@ pub const response = @import("response.zig");
 pub const command = @import("command.zig");
 
 /// The client session (RFC 9051 §3): state, tag matching, literal handshake.
+pub const fetch = @import("fetch.zig");
+pub const search = @import("search.zig");
 pub const client = @import("client.zig");
 pub const Client = client.Client;
 
@@ -52,6 +54,8 @@ test {
     _ = wire;
     _ = response;
     _ = command;
+    _ = fetch;
+    _ = search;
     _ = client;
 }
 

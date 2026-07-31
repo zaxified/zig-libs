@@ -32,10 +32,16 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const command = @import("command.zig");
+const fetchmod = @import("fetch.zig");
+const searchmod = @import("search.zig");
 const response = @import("response.zig");
 const wire = @import("wire.zig");
 
 pub const Error = response.Error || command.Error || error{
+    /// A command that only makes sense with a mailbox selected.
+    NoMailbox,
+    /// `idlePoll` was called outside an IDLE, or a command was sent inside one.
+    NotIdle,
     /// The command is not legal in the current connection state.
     BadState,
     /// A tagged response arrived carrying a tag we never sent.
@@ -100,6 +106,8 @@ pub const Client = struct {
     state: State = .not_authenticated,
     caps: std.StringHashMapUnmanaged(void) = .empty,
     mailbox: Mailbox = .{},
+    /// Non-null while an IDLE is running; owns the tag.
+    idle_tag: ?[]u8 = null,
 
     pub fn init(
         gpa: Allocator,
@@ -117,6 +125,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(c: *Client) void {
+        if (c.idle_tag) |t| c.gpa.free(t);
         c.freeCaps();
         c.freeMailbox();
         c.arena.deinit();
@@ -391,6 +400,136 @@ pub const Client = struct {
             else => return e,
         };
         c.state = .logout;
+    }
+
+    // ── FETCH / SEARCH / IDLE ───────────────────────────────────────────────
+
+    /// `FETCH`, collecting every `* n FETCH` into `out_gpa`.
+    ///
+    /// Results are allocated from `out_gpa` rather than the session's arena
+    /// because a FETCH spans many response lines and the arena is reset on
+    /// each one. Hand it an arena of your own and free it when done with the
+    /// messages.
+    pub fn fetchMessages(
+        c: *Client,
+        out_gpa: Allocator,
+        seq_set: []const u8,
+        by_uid: bool,
+        req: fetchmod.Request,
+    ) Error![]const fetchmod.Message {
+        if (c.state != .selected) return error.NoMailbox;
+
+        const tag = try c.tagger.next(c.gpa);
+        defer c.gpa.free(tag);
+        try fetchmod.encode(&c.enc, tag, seq_set, by_uid, req);
+        c.enc.w.flush() catch return error.WriteFailed;
+
+        var out: std.ArrayList(fetchmod.Message) = .empty;
+        errdefer out.deinit(out_gpa);
+
+        while (true) {
+            // Collected data must outlive the line it arrived on.
+            c.rd.d.gpa = out_gpa;
+            const resp = c.rd.next() catch |e| return e;
+            switch (resp) {
+                .continuation => return error.NoContinuation,
+                .tagged => |t| {
+                    if (!std.mem.eql(u8, t.tag, tag)) return error.UnknownTag;
+                    try c.absorbCode(t.status.code);
+                    if (t.status.type != .ok) return error.CommandFailed;
+                    return out.toOwnedSlice(out_gpa);
+                },
+                .data => |d| switch (d) {
+                    .fetch => |m| try out.append(out_gpa, m),
+                    else => try c.handleData(d),
+                },
+            }
+        }
+    }
+
+    /// `SEARCH`. Accepts either reply shape; `Result.tag` is null for the
+    /// IMAP4rev1 form, which carries no correlator.
+    pub fn searchMessages(
+        c: *Client,
+        out_gpa: Allocator,
+        by_uid: bool,
+        ret: searchmod.Return,
+        crit: *const searchmod.Criteria,
+    ) Error!searchmod.Result {
+        if (c.state != .selected) return error.NoMailbox;
+
+        const tag = try c.tagger.next(c.gpa);
+        defer c.gpa.free(tag);
+        try searchmod.encode(&c.enc, tag, by_uid, ret, crit);
+        c.enc.w.flush() catch return error.WriteFailed;
+
+        var result: searchmod.Result = .{};
+        while (true) {
+            c.rd.d.gpa = out_gpa;
+            const resp = try c.rd.next();
+            switch (resp) {
+                .continuation => return error.NoContinuation,
+                .tagged => |t| {
+                    if (!std.mem.eql(u8, t.tag, tag)) return error.UnknownTag;
+                    try c.absorbCode(t.status.code);
+                    if (t.status.type != .ok) return error.CommandFailed;
+                    return result;
+                },
+                .data => |d| switch (d) {
+                    .search, .esearch => |r| result = r,
+                    else => try c.handleData(d),
+                },
+            }
+        }
+    }
+
+    /// Begin `IDLE` (RFC 2177 / RFC 9051 §6.3.13): send the command and wait
+    /// for the server's continuation. Until `idleDone`, **no other command may
+    /// be sent** — that is the protocol's rule, not this client's.
+    ///
+    /// The caller owns the timing. RFC 2177 requires re-issuing IDLE at least
+    /// every 29 minutes or servers may drop the connection; this client does
+    /// not run a timer, because it owns no thread.
+    pub fn idleBegin(c: *Client) Error!void {
+        if (c.state != .selected and c.state != .authenticated) return error.BadState;
+        if (c.idle_tag != null) return error.NotIdle;
+
+        const tag = try c.tagger.next(c.gpa);
+        errdefer c.gpa.free(tag);
+        try c.enc.atom(tag);
+        try c.enc.sp();
+        try c.enc.atom("IDLE");
+        try c.finish();
+
+        try c.awaitContinuation();
+        c.idle_tag = tag;
+    }
+
+    /// Read one piece of unsolicited data while idling. Blocks on the
+    /// underlying reader, so the caller decides what "waiting" costs.
+    pub fn idlePoll(c: *Client) Error!response.Data {
+        if (c.idle_tag == null) return error.NotIdle;
+        const resp = try c.readLine();
+        return switch (resp) {
+            .data => |d| blk: {
+                try c.handleData(d);
+                break :blk d;
+            },
+            // A tagged response during IDLE means the server ended it itself.
+            .tagged, .continuation => error.NotIdle,
+        };
+    }
+
+    /// End `IDLE`: send `DONE` and read to the completion.
+    pub fn idleDone(c: *Client) Error!Completion {
+        const tag = c.idle_tag orelse return error.NotIdle;
+        defer {
+            c.gpa.free(tag);
+            c.idle_tag = null;
+        }
+        try c.enc.atom("DONE");
+        try c.finish();
+        return c.awaitCompletion(tag);
     }
 
     fn expectOk(c: *Client, tag: []const u8) Error!Completion {
@@ -669,6 +808,135 @@ test "a non-ASCII mailbox name goes out as modified UTF-7 unless UTF-8 is on" {
     _ = try c.greet();
     _ = try c.select("\u{53f0}\u{5317}", false);
     try testing.expectEqualStrings("T1 SELECT \"&U,BTFw-\"\r\n", p.sent());
+}
+
+test "FETCH collects across lines, into an allocator that outlives them" {
+    var p: Peer = undefined;
+    p.init("* PREAUTH ok\r\n" ++
+        "T1 OK [READ-WRITE] SELECT completed\r\n" ++
+        "* 12 FETCH (UID 4827313 FLAGS (\\Seen) RFC822.SIZE 4286)\r\n" ++
+        "* 13 FETCH (UID 4827314 FLAGS (\\Seen \\Answered) RFC822.SIZE 512)\r\n" ++
+        "T2 OK FETCH completed\r\n");
+
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    _ = try c.select("INBOX", false);
+
+    // The session arena is reset per line, so results go somewhere that is not.
+    var out = std.heap.ArenaAllocator.init(testing.allocator);
+    defer out.deinit();
+
+    const msgs = try c.fetchMessages(out.allocator(), "12:13", false, .{
+        .uid = true,
+        .flags = true,
+        .rfc822_size = true,
+    });
+    try testing.expectEqual(@as(usize, 2), msgs.len);
+    // The FIRST message must still be readable after the second line was read
+    // -- that is the whole point of not using the per-line arena.
+    try testing.expectEqual(@as(u32, 4827313), msgs[0].uid().?);
+    try testing.expectEqualStrings("\\Seen", msgs[0].items[1].flags[0]);
+    try testing.expectEqual(@as(u32, 4827314), msgs[1].uid().?);
+    try testing.expectEqual(@as(usize, 2), msgs[1].items[1].flags.len);
+
+    try testing.expectEqualStrings(
+        "T1 SELECT INBOX\r\n" ++
+            "T2 FETCH 12:13 (UID FLAGS RFC822.SIZE)\r\n",
+        p.sent(),
+    );
+}
+
+test "FETCH is refused without a selected mailbox" {
+    var p: Peer = undefined;
+    p.init("* PREAUTH ok\r\n");
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+
+    var out = std.heap.ArenaAllocator.init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(
+        error.NoMailbox,
+        c.fetchMessages(out.allocator(), "1", false, .{ .uid = true }),
+    );
+}
+
+test "SEARCH accepts both reply shapes" {
+    var p: Peer = undefined;
+    p.init("* PREAUTH ok\r\n" ++
+        "T1 OK [READ-WRITE] SELECT completed\r\n" ++
+        "* SEARCH 2 84 882\r\n" ++
+        "T2 OK SEARCH completed\r\n" ++
+        "* ESEARCH (TAG \"T3\") UID COUNT 3\r\n" ++
+        "T3 OK SEARCH completed\r\n");
+
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    _ = try c.select("INBOX", false);
+
+    var out = std.heap.ArenaAllocator.init(testing.allocator);
+    defer out.deinit();
+
+    const rev1 = try c.searchMessages(out.allocator(), false, .{}, &.{ .flag = &.{"\\Flagged"} });
+    try testing.expectEqual(@as(usize, 3), rev1.numbers.len);
+    try testing.expect(rev1.tag == null);
+
+    const rev2 = try c.searchMessages(out.allocator(), true, .{ .count = true }, &.{ .larger = 1000 });
+    try testing.expectEqual(@as(u32, 3), rev2.count.?);
+    try testing.expect(rev2.uid);
+
+    try testing.expectEqualStrings(
+        "T1 SELECT INBOX\r\n" ++
+            "T2 SEARCH FLAGGED\r\n" ++
+            "T3 UID SEARCH RETURN (COUNT) LARGER 1000\r\n",
+        p.sent(),
+    );
+}
+
+test "IDLE: wait for the continuation, take data, then DONE" {
+    var p: Peer = undefined;
+    p.init("* PREAUTH ok\r\n" ++
+        "T1 OK [READ-WRITE] SELECT completed\r\n" ++
+        "+ idling\r\n" ++
+        "* 4 EXISTS\r\n" ++
+        "* 3 EXPUNGE\r\n" ++
+        "T2 OK IDLE terminated\r\n");
+
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    _ = try c.select("INBOX", false);
+
+    try c.idleBegin();
+    // The command is only "running" once the server has agreed to it.
+    try testing.expectEqual(@as(u32, 4), (try c.idlePoll()).exists);
+    try testing.expectEqual(@as(u32, 3), (try c.idlePoll()).expunge);
+
+    const done = try c.idleDone();
+    try testing.expectEqual(response.StatusType.ok, done.status);
+    try testing.expectEqualStrings(
+        "T1 SELECT INBOX\r\n" ++ "T2 IDLE\r\n" ++ "DONE\r\n",
+        p.sent(),
+    );
+}
+
+test "IDLE: polling outside an IDLE, and nesting one, are both refused" {
+    var p: Peer = undefined;
+    p.init("* PREAUTH ok\r\n" ++
+        "T1 OK [READ-WRITE] SELECT completed\r\n" ++
+        "+ idling\r\n");
+
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    _ = try c.select("INBOX", false);
+
+    try testing.expectError(error.NotIdle, c.idlePoll());
+    try c.idleBegin();
+    // No command may be sent while IDLE runs -- including another IDLE.
+    try testing.expectError(error.NotIdle, c.idleBegin());
 }
 
 // ── divergence from the Go original ─────────────────────────────────────────

@@ -4,11 +4,9 @@ An **IMAP4rev2 (RFC 9051) client** in pure Zig, transport-agnostic: it owns no
 socket and speaks no TLS, so it drops onto plain TCP, `std.crypto.tls.Client`,
 or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 
-**Status: part 1 of 2 COMPLETE.** The modified-UTF-7 codec, the wire grammar,
-the response reader, the command encoder, and the session that drives them —
-greeting, `CAPABILITY`, `LOGIN` (with the synchronising-literal handshake),
-`SELECT`/`EXAMINE`, `NOOP`, `LOGOUT`. Part 2 next: `FETCH` /
-`BODYSTRUCTURE` / `SEARCH` / `IDLE`.
+**Status: COMPLETE.** Modified UTF-7, the wire grammar, the response reader,
+the command encoder, the session, and — from part 2 — `FETCH` with `ENVELOPE`
+and `BODYSTRUCTURE`, `SEARCH` in both reply shapes, and `IDLE`.
 
 **Not yet anchored against a live server.** Every transcript in the tests is
 copied from RFC 9051, which pins the parsing; the *sequencing* is checked only
@@ -170,6 +168,45 @@ A failed `SELECT` leaves **no** mailbox selected (RFC 9051 §6.3.2) — includin
 when the server emitted untagged data before refusing, which is what makes
 clearing state on failure load-bearing rather than redundant.
 
+## FETCH, SEARCH, IDLE
+
+```zig
+var out = std.heap.ArenaAllocator.init(gpa);   // results outlive the response lines
+defer out.deinit();
+
+const msgs = try c.fetchMessages(out.allocator(), "1:*", false, .{
+    .uid = true, .flags = true, .envelope = true, .body_structure = true,
+});
+
+const hits = try c.searchMessages(out.allocator(), true, .{ .count = true },
+    &.{ .since = "1-Feb-1994", .flag = &.{"\\Flagged"} });
+
+try c.idleBegin();
+const data = try c.idlePoll();     // unsolicited EXISTS / EXPUNGE / FETCH
+_ = try c.idleDone();
+```
+
+**`BODYSTRUCTURE` recurses and the input is remote**, so nesting is bounded by
+`fetch.Options.max_depth`, checked on the way *in* rather than discovered when
+the stack runs out. A `message/rfc822` part carries a whole nested message —
+envelope, structure and line count — so the recursion is real, not theoretical.
+
+**`BODY.PEEK[…]` is the default.** Fetching a body with plain `BODY[…]` sets
+`\Seen`, so the naive spelling marks mail as read behind the user's back.
+
+**`SEARCH` has two reply shapes and both are parsed.** IMAP4rev1 answers `*
+SEARCH 2 84 882` — no tag, no aggregates. IMAP4rev2 answers `* ESEARCH (TAG
+"A282") MIN 2 COUNT 3`. The `ALL` set is kept **verbatim**: expanding
+`1:4294967295` into numbers is how a client runs out of memory.
+
+**`IDLE` is explicit.** `idleBegin` waits for the server's continuation before
+reporting success, and no other command may be sent until `idleDone`. The
+caller owns the timing — RFC 2177 wants IDLE re-issued within 29 minutes, and
+this client runs no timer because it owns no thread.
+
+FETCH and SEARCH results are allocated from an allocator **you** pass, not the
+session's per-line arena, because they span many response lines.
+
 ## Tests
 
 `zig build test-imap`. Anchoring is stated per tier (CONVENTIONS §5):
@@ -192,10 +229,13 @@ flag-perm wildcard, the capability exceptions, both server tolerances, the
 unknown-code skip, tagged PREAUTH/BYE rejection, the numeric prefix, and
 keeping an unknown line's remainder), eight in the encoder (each rule that
 decides quoted-vs-literal, `&` escaping, the INBOX atom, quote escaping, the
-flag grammar, and `LITERAL-`'s ceiling), and eight in the session (tag
+flag grammar, and `LITERAL-`'s ceiling), eight in the session (tag
 matching, the continuation wait, the state gate, capability-driven literal
 policy, BYE handling, response-code absorption, and both halves of the
-failed-SELECT cleanup). Verified by planting each defect and
+failed-SELECT cleanup), and ten across part 2 (the BODYSTRUCTURE depth guard,
+the 7bit default, `text/*` line counts, parameter-key folding, `BODY.PEEK`,
+system-flag search keys, the `ALL` fallback, the ESEARCH correlator, the IDLE
+state gate, and FETCH results being allocated where they can outlive the line). Verified by planting each defect and
 watching the suite go red, then confirming the revert byte-for-byte. A planted
 defect that fails to COMPILE proves nothing, so six of those were rewritten
 until they built and then failed — and one of them turned out to pass, which
