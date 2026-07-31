@@ -269,7 +269,36 @@ fn skipValue(input: []const u8, start: usize) usize {
             else => {},
         }
     }
-    return i;
+    // Clamp: a trailing backslash inside a string advances `i` TWICE -- once
+    // here for the escaped byte and once more by the loop's `: (i += 1)`,
+    // which `continue` also runs -- so `i` can leave the loop at `len + 1`.
+    // Every caller slices `input[..this]`, so returning it read out of bounds
+    // (found by the fuzzer on `{a"\`, and the guard's own comment claimed
+    // "we never slice past the buffer"). The contract is an index INTO input.
+    return @min(i, input.len);
+}
+
+test "skipValue never returns an index past the end of the input" {
+    // Regression, found by the fuzzer as four separate out-of-bounds panics in
+    // `preprocess` and `preprocessAnnotated`, all with the same signature:
+    // index == len + 1. A trailing backslash inside a string advanced `i`
+    // twice -- once for the escaped byte, once by the loop's `: (i += 1)`,
+    // which `continue` also runs -- and every caller slices `input[..this]`.
+    //
+    // Asserted on the CONTRACT rather than on one caller, because the callers
+    // are five separate slice sites and a per-caller clamp would have to be
+    // right five times.
+    const cases = [_][]const u8{
+        "\\",
+        "\"\\",
+        "{a\"\\",
+        "[\'\\",
+        "{a: \"x\\",
+    };
+    for (cases) |c| {
+        try std.testing.expect(skipValue(c, 0) <= c.len);
+        try std.testing.expect(skipValue(c, c.len) <= c.len);
+    }
 }
 
 /// Append `s` as a JSON-escaped double-quoted string to `out`.
