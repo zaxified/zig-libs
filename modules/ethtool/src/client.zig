@@ -139,7 +139,7 @@ pub const CTRL_ATTR_MCAST_GRP_ID = genl.CTRL_ATTR_MCAST_GRP_ID;
 /// The longest kernel extended-ACK sentence kept. Now the shared netlink
 /// transport's own cap rather than a second, smaller buffer here; anything
 /// longer is truncated rather than allocated.
-pub const max_error_message = @FieldType(genl.Socket, "ext_ack_buf").len;
+pub const max_error_message = @typeInfo(@FieldType(genl.Socket, "ext_ack_buf")).array.len;
 
 /// Fold the shared resolver's error set onto this module's. `FamilyNotFound`
 /// becomes `NoSuchDevice`, which is exactly what an `ENOENT` from nlctrl

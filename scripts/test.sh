@@ -195,6 +195,7 @@ harness_smoke() {
     echo "      scripts/test.sh all      <- run this before committing a harness change"
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     step "check-catalog" zig build check-catalog
+    step "check-testonly" zig build check-testonly
     run_modules "$plain $netns"
     graph_save
     summary
@@ -557,6 +558,11 @@ cmd_changed() {
         step "check-catalog (README.md changed)" zig build check-catalog
     fi
 
+    # Always: a testkit leak into published code is introduced by editing a
+    # MODULE, not build.zig, so there is no change signal to gate this on --
+    # and it is ~0.5s cold, ~0.15s warm, so gating would save nothing.
+    step "check-testonly" zig build check-testonly
+
     if [[ -z "$closure" ]]; then
         graph_save
         summary
@@ -583,6 +589,7 @@ cmd_all() {
     echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     step "check-catalog" zig build check-catalog
+    step "check-testonly" zig build check-testonly
     run_modules "$all_mods"
     graph_save
     summary

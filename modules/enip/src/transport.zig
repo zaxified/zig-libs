@@ -193,7 +193,7 @@ pub const UdpDiscovery = struct {
     pub fn send(self: *UdpDiscovery, ip: netaddr.Ip, port: u16, bytes: []const u8) !void {
         const dest: std.Io.net.IpAddress = switch (ip) {
             .v4 => |q| .{ .ip4 = .{ .bytes = q, .port = port } },
-            .v6 => |b| .{ .ip6 = .{ .bytes = b, .port = port, .flowinfo = 0, .scope_id = 0 } },
+            .v6 => |b| .{ .ip6 = .{ .bytes = b, .port = port } },
         };
         try self.socket.send(self.io, &dest, bytes);
     }

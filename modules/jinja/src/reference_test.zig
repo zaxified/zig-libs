@@ -24,10 +24,8 @@ const testing = std.testing;
 const corpus = @import("corpus.zig");
 const conform = @import("conform.zig");
 
-fn verboseSkip() bool {
-    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
-    return v.len > 0;
-}
+const testkit = @import("testkit");
+const verboseSkip = testkit.verboseSkip;
 
 fn skip(comptime reason: []const u8) error{SkipZigTest} {
     if (verboseSkip()) std.debug.print("SKIPPED: " ++ reason ++ "\n", .{});

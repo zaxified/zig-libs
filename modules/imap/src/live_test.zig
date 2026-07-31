@@ -41,11 +41,8 @@ const port: u16 = 11143;
 const demo_user = "demouser";
 const demo_pass = "demopass";
 
-fn verboseSkip() bool {
-    const v = std.process.Environ.getPosix(testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse
-        return false;
-    return v.len > 0;
-}
+const testkit = @import("testkit");
+const verboseSkip = testkit.verboseSkip;
 
 fn envVar(name: []const u8) ?[]const u8 {
     return std.process.Environ.getPosix(testing.environ, name);

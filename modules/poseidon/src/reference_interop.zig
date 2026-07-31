@@ -49,10 +49,8 @@ const grain = @import("grain.zig");
 const small_field = @import("small_field.zig");
 const bn254 = @import("bn254");
 
-fn verboseSkip() bool {
-    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
-    return v.len > 0;
-}
+const testkit = @import("testkit");
+const verboseSkip = testkit.verboseSkip;
 
 fn skip(comptime reason: []const u8) error{SkipZigTest} {
     if (verboseSkip()) std.debug.print("SKIPPED: " ++ reason ++ "\n", .{});

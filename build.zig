@@ -13,6 +13,17 @@ const std = @import("std");
 const Module = struct {
     name: []const u8,
     deps: []const []const u8 = &.{},
+    /// Modules this one imports ONLY from its tests (in practice: `testkit`).
+    ///
+    /// These are wired into the test binary and NOT into the module a
+    /// downstream consumer imports, so `@import("frost")` does not drag a test
+    /// harness along. That separation is the whole point of the field --
+    /// putting testkit in `deps` would work and would also publish it.
+    ///
+    /// They DO appear in `module-graph`'s deps column, because that graph
+    /// exists to tell `scripts/test.sh` what to re-test, and a change to
+    /// testkit must re-test everything whose tests use it.
+    test_deps: []const []const u8 = &.{},
     /// Compute-bound: the tests are dominated by arithmetic (pairings,
     /// hash-based signatures, FHE, scrypt, RSA), which an unoptimized Debug
     /// build makes ~5x slower — `bls12_381` alone goes 35s -> 182s. These
@@ -25,12 +36,14 @@ const Module = struct {
 };
 
 const module_list = [_]Module{
+    // Test-only harness. Consumers reach it through `test_deps`, never `deps`.
+    .{ .name = "testkit" },
     .{ .name = "netaddr" },
-    .{ .name = "http", .deps = &.{"netaddr"} },
+    .{ .name = "http", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "websocket", .deps = &.{"http"} },
     .{ .name = "accesslog", .deps = &.{"http"} },
     .{ .name = "staticfiles", .deps = &.{"http"} },
-    .{ .name = "brotli" },
+    .{ .name = "brotli", .test_deps = &.{"testkit"} },
     .{ .name = "dns", .deps = &.{ "netaddr", "http" } },
     .{ .name = "ramcache" },
     .{ .name = "router", .deps = &.{"http"} },
@@ -55,11 +68,11 @@ const module_list = [_]Module{
     .{ .name = "aaa-gate", .deps = &.{ "router", "http" } },
     .{ .name = "resilience" },
     .{ .name = "acme", .deps = &.{ "http", "router" } },
-    .{ .name = "netlink" },
+    .{ .name = "netlink", .test_deps = &.{"testkit"} },
     .{ .name = "genetlink", .deps = &.{"netlink"} },
-    .{ .name = "nl80211", .deps = &.{ "genetlink", "netlink" } },
-    .{ .name = "ethtool", .deps = &.{ "genetlink", "netlink" } },
-    .{ .name = "devlink", .deps = &.{ "genetlink", "netlink" } },
+    .{ .name = "nl80211", .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
+    .{ .name = "ethtool", .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
+    .{ .name = "devlink", .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
     .{ .name = "decimal" },
     .{ .name = "seqmap" },
     .{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" } },
@@ -105,8 +118,8 @@ const module_list = [_]Module{
     .{ .name = "rsa", .deps = &.{"montint"}, .heavy = true },
     .{ .name = "blindrsa", .deps = &.{"rsa"} },
     .{ .name = "ssh", .deps = &.{"rsa"}, .heavy = true },
-    .{ .name = "netconf", .deps = &.{ "ssh", "xml" } },
-    .{ .name = "nftables", .deps = &.{"netlink"} },
+    .{ .name = "netconf", .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"} },
+    .{ .name = "nftables", .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "trie" },
     .{ .name = "fuzzysearch", .deps = &.{"trie"} },
     .{ .name = "geoindex" },
@@ -115,21 +128,21 @@ const module_list = [_]Module{
     .{ .name = "drand", .deps = &.{ "bls12_381", "tlock" } },
     .{ .name = "tcplan", .deps = &.{"tc"} },
     .{ .name = "modbus" },
-    .{ .name = "iec104" },
-    .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" } },
-    .{ .name = "smtp", .deps = &.{"netaddr"} },
-    .{ .name = "imap" },
-    .{ .name = "iec61850", .deps = &.{"xml"} },
+    .{ .name = "iec104", .test_deps = &.{"testkit"} },
+    .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"} },
+    .{ .name = "smtp", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    .{ .name = "imap", .test_deps = &.{"testkit"} },
+    .{ .name = "iec61850", .deps = &.{"xml"}, .test_deps = &.{"testkit"} },
     .{ .name = "iec62351", .deps = &.{ "x509", "rsa" } },
-    .{ .name = "s7comm" },
-    .{ .name = "enip", .deps = &.{"netaddr"} },
-    .{ .name = "bacnet", .deps = &.{ "netaddr", "websocket" } },
+    .{ .name = "s7comm", .test_deps = &.{"testkit"} },
+    .{ .name = "enip", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    .{ .name = "bacnet", .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },
     .{ .name = "whois", .deps = &.{"netaddr"} },
     .{ .name = "uci" },
     .{ .name = "mqtt" },
-    .{ .name = "snmp" },
+    .{ .name = "snmp", .test_deps = &.{"testkit"} },
     .{ .name = "wireguard", .deps = &.{ "netlink", "genetlink" } },
-    .{ .name = "tc", .deps = &.{"netlink"} },
+    .{ .name = "tc", .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" } },
     .{ .name = "l2disco", .deps = &.{"netaddr"} },
@@ -146,7 +159,7 @@ const module_list = [_]Module{
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .deps = &.{"netaddr"} },
-    .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" } },
+    .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"} },
     .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset" },
     .{ .name = "tabular", .deps = &.{"dataset"} },
@@ -158,10 +171,10 @@ const module_list = [_]Module{
     .{ .name = "diagnostics" },
     .{ .name = "json5" },
     .{ .name = "yaml" },
-    .{ .name = "jinja" },
+    .{ .name = "jinja", .test_deps = &.{"testkit"} },
     .{ .name = "cbor" },
-    .{ .name = "protobuf" },
-    .{ .name = "grpc", .deps = &.{ "http", "protobuf" } },
+    .{ .name = "protobuf", .test_deps = &.{"testkit"} },
+    .{ .name = "grpc", .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"} },
     .{ .name = "webauthn", .deps = &.{ "cbor", "rsa", "p256" } },
     .{ .name = "zipstream" },
     .{ .name = "tz", .deps = &.{"datefmt"} },
@@ -180,7 +193,7 @@ const module_list = [_]Module{
     .{ .name = "syslog" },
     .{ .name = "sntp" },
     .{ .name = "stun", .deps = &.{"netaddr"} },
-    .{ .name = "opcua", .deps = &.{ "rsa", "x509" }, .heavy = true },
+    .{ .name = "opcua", .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "noise" },
     .{ .name = "x509", .deps = &.{"rsa"} },
     .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
@@ -190,7 +203,7 @@ const module_list = [_]Module{
     .{ .name = "slhdsa", .heavy = true },
     .{ .name = "falcon" },
     .{ .name = "hqc", .heavy = true },
-    .{ .name = "dtls", .deps = &.{ "rsa", "x509" } },
+    .{ .name = "dtls", .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsresume" },
     .{ .name = "quic-crypto" },
     .{ .name = "sandbox" },
@@ -233,7 +246,7 @@ const module_list = [_]Module{
     .{ .name = "signal" },
     .{ .name = "mls", .deps = &.{"hpke"} },
     .{ .name = "megolm", .deps = &.{"aescbc"} },
-    .{ .name = "ebpf", .deps = &.{"netlink"} },
+    .{ .name = "ebpf", .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "xdp-classifier", .deps = &.{"ebpf"} },
     .{ .name = "ecvrf" },
     .{ .name = "fss" },
@@ -244,7 +257,7 @@ const module_list = [_]Module{
     // -Dstrict-debug, well under the >15s threshold (and a Debug compile of
     // this module is ~1s against ~27s at ReleaseSafe, so marking it heavy
     // would cost more than it saves).
-    .{ .name = "poseidon", .deps = &.{ "bn254", "bls12_381" } },
+    .{ .name = "poseidon", .deps = &.{ "bn254", "bls12_381" }, .test_deps = &.{"testkit"} },
     // Not heavy, despite the inverse S-box (72 multiplies per element per
     // half-round). Measured serially on this host: strict-Debug compile ~8.5s
     // + run ~1.0s = 9.5s, under the >15s threshold — and a ReleaseSafe compile
@@ -298,7 +311,23 @@ pub fn build(b: *std.Build) void {
         const mod = mods.get(m.name).?;
         for (m.deps) |dep| mod.addImport(dep, mods.get(dep).?);
 
-        const unit_tests = b.addTest(.{ .root_module = mod });
+        // A module with test-only deps gets a SECOND module object over the
+        // same source, carrying the extra imports. `mod` -- the one
+        // `b.addModule` published above, and the one a consumer gets -- never
+        // sees them. Modules without test_deps test `mod` directly, so the
+        // common path is unchanged.
+        const test_root = if (m.test_deps.len == 0) mod else blk: {
+            const t = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/src/root.zig", .{m.name})),
+                .target = target,
+                .optimize = if (m.heavy) heavy_optimize else optimize,
+            });
+            for (m.deps) |dep| t.addImport(dep, mods.get(dep).?);
+            for (m.test_deps) |dep| t.addImport(dep, mods.get(dep).?);
+            break :blk t;
+        };
+
+        const unit_tests = b.addTest(.{ .root_module = test_root });
         const run = b.addRunArtifact(unit_tests);
         test_step.dependOn(&run.step);
 
@@ -306,6 +335,63 @@ pub fn build(b: *std.Build) void {
         const one = b.step(b.fmt("test-{s}", .{m.name}), b.fmt("Test the {s} module", .{m.name}));
         one.dependOn(&run.step);
     }
+
+    // `zig build check-testonly` — prove a test-only dep really is test-only.
+    //
+    // The claim `test_deps` makes is that the PUBLISHED module never needs
+    // them. Nothing checked it, and no ordinary build could: Zig analyses
+    // container-level decls lazily, so an `@import("testkit")` sitting unused
+    // in a module's non-test code is simply never looked at. Verified by
+    // planting `pub const leaked_probe = testkit.verbose_skip_env;` in
+    // `netlink` -- every dependent still built green.
+    //
+    // So force the analysis: for each such module, compile a consumer-shaped
+    // probe that imports ONLY the published module (deps, no test_deps) and
+    // calls `refAllDeclsRecursive` on it. A leak into public non-test code is
+    // then a compile error naming the missing module.
+    const testonly = b.step("check-testonly", "Prove each test_deps module isn't needed by the published module");
+    for (module_list) |m| {
+        if (m.test_deps.len == 0) continue;
+        const wf = b.addWriteFiles();
+        const src = wf.add(b.fmt("probe_{s}.zig", .{m.name}), b.fmt(
+            \\// Generated by build.zig's check-testonly step. See it for why.
+            \\//
+            \\// The reference walk is hand-rolled because `std.testing.refAllDecls`
+            \\// opens with `if (!builtin.is_test) return;` -- in a non-test build,
+            \\// which is exactly this probe, it does nothing at all. Using it here
+            \\// would have produced a check that always passes.
+            \\const published = @import("{s}");
+            \\
+            \\fn refAll(comptime T: type, comptime depth: u8) void {{
+            \\    @setEvalBranchQuota(200_000);
+            \\    switch (@typeInfo(T)) {{
+            \\        .@"struct", .@"enum", .@"union", .@"opaque" => {{}},
+            \\        else => return,
+            \\    }}
+            \\    inline for (comptime std.meta.declarations(T)) |d| {{
+            \\        const f = @field(T, d.name);
+            \\        _ = &f;
+            \\        if (depth > 0 and @TypeOf(f) == type) refAll(f, depth - 1);
+            \\    }}
+            \\}}
+            \\
+            \\const std = @import("std");
+            \\comptime {{
+            \\    refAll(published, 3);
+            \\}}
+            \\
+        , .{m.name}));
+        const probe = b.createModule(.{
+            .root_source_file = src,
+            .target = target,
+            .optimize = .Debug,
+        });
+        // Exactly what a consumer gets: the published module and nothing else.
+        probe.addImport(m.name, mods.get(m.name).?);
+        const obj = b.addObject(.{ .name = b.fmt("testonly-{s}", .{m.name}), .root_module = probe });
+        testonly.dependOn(&obj.step);
+    }
+    test_step.dependOn(testonly);
 
     // Machine-readable module graph: `zig build module-graph`.
     // One TSV line per module — `name<TAB>heavy<TAB>dep,dep,...` (deps empty
@@ -364,9 +450,19 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
 
     for (module_list) |m| {
         try w.print("{s}\t{s}\t", .{ m.name, if (m.heavy) "heavy" else "light" });
-        for (m.deps, 0..) |dep, i| {
-            if (i != 0) try w.writeAll(",");
+        // deps + test_deps: this graph answers "what must be re-tested when X
+        // changes", and a test-only import is a real answer to that question
+        // even though it is not part of the published module.
+        var n: usize = 0;
+        for (m.deps) |dep| {
+            if (n != 0) try w.writeAll(",");
             try w.writeAll(dep);
+            n += 1;
+        }
+        for (m.test_deps) |dep| {
+            if (n != 0) try w.writeAll(",");
+            try w.writeAll(dep);
+            n += 1;
         }
         try w.writeAll("\n");
     }

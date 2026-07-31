@@ -63,10 +63,8 @@ const Tree = struct {
     }
 };
 
-fn verboseSkip() bool {
-    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
-    return v.len > 0;
-}
+const testkit = @import("testkit");
+const verboseSkip = testkit.verboseSkip;
 
 test "DirLoader serves what is inside the root" {
     var tree = try Tree.init(testing.io);

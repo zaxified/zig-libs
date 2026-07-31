@@ -48,10 +48,8 @@ const Server = @import("Server.zig");
 
 const Writer = std.Io.Writer;
 
-fn verboseSkip() bool {
-    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
-    return v.len > 0;
-}
+const testkit = @import("testkit");
+const verboseSkip = testkit.verboseSkip;
 
 /// The handler the live tests are served by: one route per framing shape,
 /// each ending in a trailer section a client can check.

@@ -41,10 +41,8 @@ const psk_identity = "zig-libs-dtls";
 
 const peer_source = @embedFile("testdata/wolfssl_peer.c");
 
-fn verboseSkip() bool {
-    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
-    return v.len > 0;
-}
+const testkit = @import("testkit");
+const verboseSkip = testkit.verboseSkip;
 
 /// Compiles the wolfSSL peer inside `dir` as `./wolfssl_peer`. Skips loudly
 /// when `cc` or wolfSSL is unavailable — that is an environment gap, not a

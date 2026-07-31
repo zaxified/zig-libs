@@ -74,13 +74,11 @@ const builtin = @import("builtin");
 // success (any stderr triggers the build runner's `failed command:`
 // line even when the step succeeded), while the skip *count* still
 // shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
-// non-empty value to see the reasons. (std.posix.getenv doesn't exist
-// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
-// existing env-read pattern for tests, see netconf's `envVar`.)
-fn verboseSkip() bool {
-    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
-    return v.len > 0;
-}
+// non-empty value to see the reasons. Shared with 25 other modules that
+// had their own copy of this: `testkit` is a TEST-ONLY dep (build.zig's
+// `test_deps`), so it is absent from the module a consumer imports.
+const testkit = @import("testkit");
+const verboseSkip = testkit.verboseSkip;
 const linux = std.os.linux;
 const native_endian = builtin.cpu.arch.endian();
 

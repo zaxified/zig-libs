@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 222 modules (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 223 modules (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -167,6 +167,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `netconf` | NETCONF client (RFC 6241) over SSH — RFC 6242 end-of-message + chunked framing, hello/capability exchange, get/get-config/edit-config/commit RPCs with typed replies | any | ssh, xml |
 | `ebpf` | eBPF program generation over `std.os.linux.bpf` — verifier-passing bytecode builders (kprobe counter / XDP bounds-checked filter / ring-buffer emitter, clang-cross-checked goldens); syscall attach + ringbuf consumer scaffolded. Real-kernel verifier acceptance unverified in unprivileged CI | **linux** | netlink |
 | `xdp-classifier` | XDP packet classifier for a LibreQoS-style edge shaper — IPv4 subscriber-prefix → traffic-class handle: verifier-safe Ethernet+IPv4 parse, `BPF_MAP_TYPE_LPM_TRIE` longest-prefix-match lookup, per-CPU scratch-map class handoff, plus `BPF_MAP_TYPE_CPUMAP` steering (redirect a matched flow to a chosen CPU via `bpf_redirect_map`). Mechanical composition of `ebpf`'s already-proven bounds-check/map-lookup patterns — no Fable core | **linux** | ebpf |
+| `testkit` | **Test-only** shared harness (`hex` decoding for KAT vectors, golden byte-comparison that names the first differing offset, the verbose-skip convention) — wired via build.zig's `test_deps`, so it is absent from the module a consumer imports | any | — |
 | `netsim` | Deterministic seeded discrete-event network simulator (VOPR-style: nodes/links/latency/loss/partition/clock-skew, failure-schedule fuzzer, byte-exact replay, ddmin counterexample minimizer) — the model-checking harness for fabric algorithms + fleet-sim | any | — |
 | `spf-ect` | Deterministic symmetric shortest-path (Dijkstra) with a reversal-invariant ECT tie-break (`path(A→B) == reverse(path(B→A))`, RFC 6329 idea generalized) + maximally-disjoint second tree (PRP mode). Pure graph algorithm | any | — |
 | `loopfree-reconv` | Loop-free reconvergence transitions — two-class ordered-FIB schedule (provably no transient forwarding loop, TTL backstop), netsim-verified across fuzzed reconvergence schedules incl. overlapping transitions | any | netsim, spf-ect |

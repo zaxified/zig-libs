@@ -171,6 +171,32 @@ reference, not a re-explanation of everything the README already covers.
    actually ported third-party source, its terms go in `modules/<name>/NOTICE` instead —
    never in the root file.
 
+### 6.1 Test-only dependencies
+
+A module a consumer imports must not carry a test harness. Use `test_deps`, not `deps`:
+
+```zig
+.{ .name = "netlink", .test_deps = &.{"testkit"} },
+```
+
+`build.zig` then compiles the tests against a second module object with the extra
+imports; the object `b.addModule` publishes never sees them. They still appear in
+`module-graph`'s deps column, because that graph answers "what must be re-tested when
+X changes" and a test-only import is a real answer to it.
+
+**`zig build check-testonly` is what makes the claim true rather than aspirational.**
+Zig analyses container-level decls lazily, so an unused `@import("testkit")` sitting in
+a module's non-test code is never looked at and no ordinary build notices — verified by
+planting `pub const leaked_probe = testkit.verbose_skip_env;` in `netlink`, after which
+every dependent still built green. The step forces the analysis with a consumer-shaped
+probe. It is part of `zig build test`.
+
+Reach for [`testkit`](modules/testkit) rather than writing a local helper when one of
+its pieces fits, and **only add to testkit what is already duplicated** — every entry
+there replaced at least 18 copies. Anything that legitimately differs per module
+(netns setup, capability probing) stays local: a shared abstraction over those hides
+the distinctions that make the skips correct.
+
 ## 7. Verification harness per module type
 
 - **Protocol codecs** (`icmp`, `dns`, `l2disco`, `http` h2): golden bytes / **h2spec**
