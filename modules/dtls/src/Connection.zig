@@ -3660,6 +3660,42 @@ test "handshake: full client<->server loopback interop — ChaCha20-Poly1305" {
     try loopbackHandshake(.chacha20_poly1305_sha256);
 }
 
+test "cipher suite negotiation: SERVER's own preference order wins, not the client's offer order" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    // Both sides support the same two suites, but list them in OPPOSITE
+    // order: the client offers ChaCha20-Poly1305 first, the server prefers
+    // AES-128-GCM first. RFC 8446 leaves tie-breaking to local policy, and
+    // `selectCipherSuite` is written to walk `ours` (the server's own list)
+    // in the outer loop specifically so the SERVER's configured preference
+    // decides — a server that instead deferred to whatever order the
+    // (attacker-influenced) ClientHello listed suites in would let a
+    // downgrading peer steer the choice away from an operator's intended
+    // default suite, even when both suites are otherwise acceptable.
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{ .chacha20_poly1305_sha256, .aes_128_gcm_sha256 },
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 },
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x99} ** 32);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+
+    try testing.expectEqual(CipherSuite.aes_128_gcm_sha256, server.suite);
+    try testing.expectEqual(CipherSuite.aes_128_gcm_sha256, client.suite);
+}
+
 // ── RFC 9147 §5.2 reassembly across datagrams ───────────────────────────
 //
 // Every fragment below is built BYTE BY BYTE by the two helpers that
@@ -4330,6 +4366,35 @@ test "handshake: a second HelloRetryRequest is refused (RFC 8446 §4.1.4 abort)"
     const second = try hrrDatagramSeq(&exts, 1);
     var buf4: [1500]u8 = undefined;
     try testing.expectError(error.UnexpectedMessage, client.handleFlight(second.bytes[0..second.len], rnd, 0, &buf4));
+}
+
+test "handshake: a HelloRetryRequest negotiating DTLS 1.2 (real legacy value) is a downgrade and is rejected" {
+    // Sibling of the ServerHello downgrade guard (`handleFlightClient`,
+    // §4.2.1): `handleHelloRetryRequest` decodes its OWN `supported_versions`
+    // independently and has its own `!= version_dtls13` check. Same RFC
+    // clause, same wire ambiguity (every version field on an HRR is frozen at
+    // legacy DTLS 1.2 too), different code path — nothing shares the check
+    // between the two, so a defect in one is invisible from tests of the
+    // other.
+    const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
+    var client = try Connection.clientInit(cfg);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x43} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1);
+
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.legacy_version_dtls12, &sh_versions_buf);
+    var cookie_buf: [64]u8 = undefined;
+    const cookie_ext = try messages.encodeCookieExtension("a-real-cookie", &cookie_buf);
+    const exts = [_]messages.Extension{
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+    };
+    const datagram = try hrrDatagram(&exts);
+
+    var buf2: [1500]u8 = undefined;
+    try testing.expectError(error.UnsupportedVersion, client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf2));
 }
 
 test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie" {
@@ -6111,6 +6176,48 @@ test "cert-DHE: a ServerHello answering in a DIFFERENT group than the client off
 
     var buf2: [1500]u8 = undefined;
     try testing.expectError(error.MissingKeyShare, client.handleFlight(wire[0 .. hdr_slice.len + fragment.len], rnd, 0, &buf2));
+}
+
+test "cert-DHE: a ServerHello negotiating DTLS 1.2 (real legacy value, not garbage) is a downgrade and is rejected" {
+    // RFC 8446 §4.2.1 downgrade guard: the wire-level version fields are
+    // FROZEN at DTLS 1.2 for compatibility with middleboxes — the only place
+    // the real negotiated version appears is `supported_versions`. A peer
+    // that named `legacy_version_dtls12` there (a real, meaningful value —
+    // not a parse-breaking one) has actually negotiated a version this
+    // module does not speak, and continuing would derive DTLS-1.3-shaped
+    // keys for a connection that only agreed on 1.2.
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x89} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1); // offers x25519
+
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.legacy_version_dtls12, &sh_versions_buf);
+    var ks_buf: [4 + max_key_share_len]u8 = undefined;
+    const dummy_share = [_]u8{0x11} ** 32;
+    const ks = try messages.encodeKeyShareServerHello(.{ .group = x25519_group, .key_exchange = &dummy_share }, &ks_buf);
+    var sh_body_buf: [256]u8 = undefined;
+    const sh_body = try messages.encodeServerHello(.{
+        .random = [_]u8{0x5c} ** 32,
+        .legacy_session_id_echo = &.{},
+        .cipher_suite = @intFromEnum(CipherSuite.aes_128_gcm_sha256),
+        .extensions = &.{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks },
+        },
+    }, &sh_body_buf);
+
+    var frag_buf: [256 + handshake.header_len]u8 = undefined;
+    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
+    var wire: [400]u8 = undefined;
+    const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
+    const hdr_slice = try record.encodePlaintext(hdr, &wire);
+    @memcpy(wire[hdr_slice.len..][0..fragment.len], fragment);
+
+    var buf2: [1500]u8 = undefined;
+    try testing.expectError(error.UnsupportedVersion, client.handleFlight(wire[0 .. hdr_slice.len + fragment.len], rnd, 0, &buf2));
 }
 
 test "cert-DHE HRR self-interop: our own server's stateless cookie exchange works in certificate mode too" {

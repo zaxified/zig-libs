@@ -1116,6 +1116,21 @@ test "fuzz: parse never panics on arbitrary text" {
     try testing.fuzz({}, fuzzParse, .{});
 }
 
+test "parse hardening: mantissa width cap prevents i256 accumulator overflow" {
+    // 90 significant digits: past i256's ~77-digit capacity. The width cap
+    // (digits_seen > 60) must fire during the digit loop, BEFORE the
+    // `mant = mant * 10 + digit` multiply ever risks overflowing the i256
+    // accumulator itself. A cap that is merely "wide enough to also be
+    // caught later by the final i128-range check" is not enough — the
+    // 61-digit case above passes even with a much larger (buggy) cap because
+    // the i128 bounds check independently rejects it too. Only an input this
+    // long distinguishes "cap fires early and cleanly" from "accumulator
+    // traps with an unchecked overflow panic".
+    var buf: [90]u8 = undefined;
+    @memset(&buf, '9');
+    try testing.expectError(error.Overflow, Decimal.parse(buf[0..90]));
+}
+
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "0123456789+-.eE";
     var buf: [80]u8 = undefined;

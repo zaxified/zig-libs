@@ -752,3 +752,66 @@ test "an ed25519 userauth signature verifies only against its own session id" {
         transport.verifySignature("ssh-ed25519", blob, sig, ow.buffered()),
     );
 }
+
+test "servePublickey: an ed25519 key blob, its OWN valid signature, wrapped in a signature blob that LIES about the algorithm name, is refused (RFC 8332 §3 blob-type check)" {
+    // The blob-type guard the module doc comment calls out by name
+    // ("announce ed25519, present an RSA blob"). This is not a strawman:
+    // `transport.verifySignature`'s `ssh-ed25519` branch never looks at the
+    // signature blob's OWN algorithm-name field at all (see its source) —
+    // only `key_type` (derived from the KEY BLOB) selects that branch. So a
+    // forged outer signature blob can claim ANY algorithm name and still
+    // carry a genuine raw ed25519 signature that verifies fine once that
+    // branch is reached. The one thing standing between "genuine ed25519
+    // signature, mislabelled rsa-sha2-256" and a successful login is the
+    // blob-type cross-check at the top of `servePublickey` — `signedBlob`
+    // folds the request's declared `algorithm` into what gets signed, so the
+    // signature is cryptographically valid over exactly this forged request.
+    const t = std.testing;
+    const gpa = t.allocator;
+    const seed: [32]u8 = [_]u8{9} ** 32;
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const key: AuthKey = .{ .ed25519 = kp };
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+
+    const session_id = "session-mismatch";
+    const user = "alice";
+    const lying_algorithm = "rsa-sha2-256"; // keyBlobTypeFor => "ssh-rsa", but `blob` is "ssh-ed25519"
+
+    var mbuf: [512]u8 = undefined;
+    var mw: std.Io.Writer = .fixed(&mbuf);
+    try signedBlob(&mw, session_id, user, connection_service, lying_algorithm, blob);
+    const raw_sig = try kp.sign(mw.buffered(), null);
+
+    // Hand-build the OUTER signature blob with a forged algorithm name,
+    // wrapping the genuine raw ed25519 bytes — exactly what
+    // `HostKey.sign` never does (it always names the real key type), and
+    // exactly what an attacker who controls the wire is free to send.
+    var sbuf: [512]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sbuf);
+    try messages.writeString(&sw, lying_algorithm);
+    try messages.writeString(&sw, &raw_sig.toBytes());
+    const forged_sig_blob = sw.buffered();
+
+    var rbuf: [4096]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&rbuf);
+    try rw.writeByte(1); // has_signature = TRUE
+    try messages.writeString(&rw, lying_algorithm);
+    try messages.writeString(&rw, blob);
+    try messages.writeString(&rw, forged_sig_blob);
+
+    var dummy_in: std.Io.Reader = .fixed(&.{});
+    var dummy_out_buf: [64]u8 = undefined;
+    var dummy_out: std.Io.Writer = .fixed(&dummy_out_buf);
+    var tr = transport.Transport.init(&dummy_in, &dummy_out);
+
+    var c = Cursor{ .b = rw.buffered() };
+    const outcome = try servePublickey(&tr, &c, user, connection_service, session_id, .{
+        .authorized_key = struct {
+            fn f(_: []const u8, _: []const u8, _: []const u8) bool {
+                return true;
+            }
+        }.f,
+    });
+    try t.expectEqual(PublickeyOutcome.failure, outcome);
+}

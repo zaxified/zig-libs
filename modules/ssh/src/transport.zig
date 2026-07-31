@@ -1907,6 +1907,104 @@ fn fakeKexdhReply(f_mag: []const u8, out: []u8) ![]const u8 {
     return w.buffered();
 }
 
+/// Builds a raw (unencrypted, `.none` cipher) `SSH_MSG_KEXDH_REPLY` packet
+/// carrying `q_s` as the peer's curve25519 public value, written into `out`.
+/// `K_S`/`sig` are throwaway bytes — `curve25519Kex` must reject a
+/// degenerate `q_s` before it ever parses them as a real host key or
+/// signature (mirrors `fakeKexdhReply` for the classic-DH KEX above).
+fn fakeKexEcdhReply(q_s: []const u8, out: []u8) ![]const u8 {
+    var payload_buf: [256]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try messages.writeString(&pw, "not-a-real-host-key-blob");
+    try messages.writeString(&pw, q_s);
+    try messages.writeString(&pw, "not-a-real-signature");
+
+    var none: CipherState = .none;
+    var w: std.Io.Writer = .fixed(out);
+    try writePacket(&w, &none, pw.buffered());
+    return w.buffered();
+}
+
+test "curve25519Kex (client): rejects a KEX_ECDH_REPLY carrying the identity point as Q_S" {
+    // RFC 7748's own recommendation, echoed by `std.crypto.dh.X25519`'s
+    // `scalarmult`: a low-order/identity peer value forces a known (often
+    // all-zero) shared secret regardless of this side's private scalar —
+    // exactly the class of degenerate input this audit's mandate calls out
+    // by name. `curve25519Kex` never adds its own check on top of std's; this
+    // proves std's rejection is actually reached and actually propagated as
+    // `error.KexFailed`, not silently producing a shared secret an attacker
+    // predicted in advance.
+    const q_s_identity = [_]u8{0} ** 32;
+    var reply_buf: [1024]u8 = undefined;
+    const reply = try fakeKexEcdhReply(&q_s_identity, &reply_buf);
+
+    var r: std.Io.Reader = .fixed(reply);
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .none;
+
+    try std.testing.expectError(
+        error.KexFailed,
+        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier),
+    );
+}
+
+fn alwaysRejectHostKey(key_type: []const u8, key_blob: []const u8) bool {
+    _ = key_type;
+    _ = key_blob;
+    return false;
+}
+
+test "curve25519Kex (client): a caller `HostKeyVerifier` that returns false actually aborts the handshake" {
+    // The caller's host-key TRUST decision (known_hosts pinning / TOFU) —
+    // `if (!verify_host_key(...)) return error.HostKeyVerificationFailed`.
+    // Reading the source, this looks obviously right, which is exactly why
+    // it has no test: nothing here has ever needed the callback to say no.
+    // A regression that ignored the return value would silently turn host-
+    // key pinning into decoration — this module would still "work" against
+    // any host, including a MITM's.
+    //
+    // `K_S` deliberately names an algorithm `verifySignature` does not
+    // implement: real code must never reach it (the gate returns
+    // `HostKeyVerificationFailed` first), so if a mutation ever lets control
+    // flow fall through to `verifySignature`, this fails with
+    // `error.UnsupportedAlgorithm` instead — a different, loudly wrong
+    // error — rather than coincidentally reproducing the same error the gate
+    // itself would have produced.
+    var k_s_buf: [64]u8 = undefined;
+    var ksw: std.Io.Writer = .fixed(&k_s_buf);
+    try messages.writeString(&ksw, "not-a-supported-algorithm");
+    try messages.writeString(&ksw, "blob");
+    const k_s = ksw.buffered();
+
+    // A non-degenerate Q_S so the earlier identity check does not short-
+    // circuit before the host-key gate is even reached.
+    const q_s = (try X25519.KeyPair.generateDeterministic([_]u8{0x5c} ** 32)).public_key;
+
+    var reply_buf: [16384]u8 = undefined;
+    var payload_buf: [256]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try messages.writeString(&pw, k_s);
+    try messages.writeString(&pw, &q_s);
+    try messages.writeString(&pw, "not-a-real-signature");
+    var none_w: CipherState = .none;
+    var w0: std.Io.Writer = .fixed(&reply_buf);
+    try writePacket(&w0, &none_w, pw.buffered());
+    const reply = w0.buffered();
+
+    var r: std.Io.Reader = .fixed(reply);
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .none;
+
+    try std.testing.expectError(
+        error.HostKeyVerificationFailed,
+        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", alwaysRejectHostKey),
+    );
+}
+
 test "dhGroupKex (client): rejects a KEXDH_REPLY carrying f == p or f == p-1" {
     const kex_name = "diffie-hellman-group14-sha256";
     const group = DhGroup.forName(kex_name).?;

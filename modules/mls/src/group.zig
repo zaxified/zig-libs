@@ -3836,6 +3836,61 @@ test "§12.4.1: a tampered Commit is rejected by the receiver, so the round trip
     try testing.expectError(error.DecryptionFailed, carol.join(gpa, bad_welcome, &.{}));
 }
 
+test "§12.4.2 bullet 1: a Commit from a STALE epoch (a replay of one already processed) is rejected before anything else runs" {
+    // `processCommit`'s very first check is `content.epoch == self.epoch`.
+    // Skipping it does not read as "accept a forged Commit" in the obvious
+    // way, because the rest of `processCommit` still depends on state
+    // (`old_gc`, `confirmed_transcript_hash`) that has already moved on —
+    // but that dependency is exactly why this needs its own test rather
+    // than trusting a later check to catch it: NOTHING else in this
+    // function's ~500 lines is labelled "the epoch guard", so a defect
+    // here is invisible to every other assertion in this file.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 24);
+    const bob = try TestClient.init(aa, "bob", 25);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "stale-epoch",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    // A real Commit for epoch 1 -> 2.
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    defer c.deinit(gpa);
+    try b.processCommit(.{ .commit_msg = c.commit });
+    try expectSameEpoch(&a, &b);
+    try testing.expectEqual(@as(u64, 2), b.epoch);
+
+    // The SAME message again: `content.epoch == 1`, bob is at epoch 2. A
+    // network that can replay a datagram can replay this. Must be
+    // `error.WrongEpoch`, not a signature/MAC failure (those would still be
+    // "safe", but for the wrong reason, and would not tell an implementer
+    // that the epoch guard itself is what to fix if it ever regressed) and
+    // never success.
+    try testing.expectError(error.WrongEpoch, b.processCommit(.{ .commit_msg = c.commit }));
+    try testing.expectEqual(@as(u64, 2), b.epoch);
+}
+
 // ── §12.4.3.2: external Commits ───────────────────────────────────────────
 //
 // **What anchors these, and what does not.** There is no external-Commit

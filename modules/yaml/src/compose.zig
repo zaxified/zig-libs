@@ -689,3 +689,17 @@ test "the node budget bounds a hostile input" {
 test "a malformed document still fails as a parse error" {
     try testing.expectError(error.InvalidYaml, single("[\n"));
 }
+
+test "'---' as a mapping value, not at column 0, is plain content — not a document marker" {
+    // YAML 1.2 §9.1.3: `c-directives-end`/document markers are recognized
+    // only at the start of a line. Neither the yaml-test-suite ledger above
+    // nor any other local test happens to put "---" as an unquoted scalar
+    // *value* (as opposed to at the very start of a line/document), so a
+    // scanner that dropped the `self.column == 0` guard would still pass
+    // everything else and only misparse exactly this shape — splitting one
+    // document into two instead of reading a three-character string.
+    const r = try single("a: ---\nb: 1\n");
+    defer r.deinit();
+    try testing.expectEqualStrings("---", r.root.get("a").?.string);
+    try testing.expectEqual(@as(i64, 1), r.root.get("b").?.int);
+}

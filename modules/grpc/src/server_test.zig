@@ -142,6 +142,25 @@ fn metaImpl(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
     return .{ .text = probe, .index = @intCast(bin_copy.len), .blob = bin_copy };
 }
 
+/// Drives one of the three handler-facing metadata gates with a
+/// caller-forged reserved name (`grpc-status`), selected by `req.count`:
+/// 1 = `addInitialMetadata`, 2 = `declareTrailingMetadata`,
+/// 3 = `setTrailingMetadata`. Each must refuse with `error.ReservedMetadata`
+/// — a handler cannot forge the framing fields through any of the three
+/// entry points, not just through the pure `isReserved` helper.
+fn reservedMetaImpl(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
+    switch (req.count) {
+        1 => try c.addInitialMetadata(.{ .name = "grpc-status", .value = "0" }),
+        2 => try c.declareTrailingMetadata(&.{"grpc-status"}),
+        3 => {
+            try c.declareTrailingMetadata(&.{"x-tail"});
+            try c.setTrailingMetadata(.{ .name = "grpc-status", .value = "0" });
+        },
+        else => {},
+    }
+    return .{ .text = "unreachable" };
+}
+
 /// Reports the deadline the client asked for, in milliseconds remaining
 /// (−1 when there is none). The clock is injected, so this is exact.
 fn deadlineImpl(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
@@ -179,6 +198,7 @@ const echo_service: server.Service = .{
         M.serverStreaming("StreamFail", streamFailImpl),
         M.serverStreaming("Empty", emptyImpl),
         M.unary("Meta", metaImpl),
+        M.unary("ReservedMeta", reservedMetaImpl),
         M.unary("Deadline", deadlineImpl),
         M.unary("Big", bigImpl),
         server.Method.raw("Raw", rawImpl),
@@ -920,6 +940,31 @@ test "server: a handler cannot forge a reserved field" {
     try testing.expect(md.isReserved("GRPC-Status"));
     try testing.expect(md.isReserved("content-type"));
     try testing.expect(!md.isReserved("x-tail"));
+}
+
+test "server: each of the three handler-facing metadata gates actually refuses" {
+    // The test above only checks the pure `isReserved` predicate — it never
+    // calls through `addInitialMetadata` / `declareTrailingMetadata` /
+    // `setTrailingMetadata` themselves, so a missing `isReserved` check at
+    // any one of those three call sites is invisible to it. Drive each gate
+    // through a real handler and confirm the forged field turns the call
+    // into an INTERNAL error at the wire, per `statusForError`.
+    const gpa = testing.allocator;
+    var router = defaultRouter();
+
+    for ([_]i32{ 1, 2, 3 }) |mode| {
+        var peer: TestPeer = .init(gpa);
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const req = try encodeReq(gpa, .{ .count = mode });
+        defer gpa.free(req);
+        const sid = try startCall(&peer, "/echo.Echo/ReservedMeta", &.{req});
+        try runOffline(&peer, &router);
+
+        const r = peer.resp(sid);
+        try testing.expect(r.isTrailersOnly());
+        try testing.expectEqualStrings("13", r.header("grpc-status").?); // INTERNAL
+    }
 }
 
 // ── deadlines ───────────────────────────────────────────────────────────────

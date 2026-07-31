@@ -79,6 +79,29 @@ test "hadeshash poseidonperm_x5_254_3 (BN254, t=3)" {
     try expectFr("0e7ae82e40091e63cbd4f16a6d16310b3729d4b6e138fcf54110e2867045a30c", out[2]);
 }
 
+// ── the all-zero state ────────────────────────────────────────────────────
+//
+// Every other vector in this file has at least one nonzero input; a coding
+// bug that special-cases zero (a stray `if (x.isZero()) return x/state`
+// shortcut, an S-box that mishandles `0^5`, an MDS row that only mixes
+// nonzero entries correctly) would be invisible to all of them. This vector
+// — capacity element AND both inputs zero — is source 3's methodology
+// (circomlibjs `poseidon_reference.js`/`poseidon_opt.js`, executed, cross-
+// checked against each other) applied to `inputs=[0,0]`, `initState=0`,
+// `nOut=3`, so it pins the full permuted state exactly like the hadeshash
+// vector above, not just one hash output.
+test "circomlibjs (executed): the all-zero permutation state (BN254, t=3)" {
+    const P = bn.Perm(3).init();
+    const out = P.permute(.{ bn.Fr.zero, bn.Fr.zero, bn.Fr.zero });
+    try expectFr("2098f5fb9e239eab3ceac3f27b81e481dc3124d55ffed523a839ee8446b64864", out[0]);
+    try expectFr("13a545a13f1d91dddb87f46679dfaec0900ce24791a924bee7fa4d69a9569d85", out[1]);
+    try expectFr("06be479e5fcd717c6c21b32f108033bf1da6cf4d8e3e8c48042c475e0b121480", out[2]);
+    // `hash`/`compress` must agree with the raw permutation, the same
+    // identity the non-zero "bridge" test below checks.
+    try expectFr("2098f5fb9e239eab3ceac3f27b81e481dc3124d55ffed523a839ee8446b64864", P.hash(.{ bn.Fr.zero, bn.Fr.zero }));
+    try expectFr("2098f5fb9e239eab3ceac3f27b81e481dc3124d55ffed523a839ee8446b64864", P.compress(bn.Fr.zero, bn.Fr.zero));
+}
+
 test "hadeshash poseidonperm_x5_254_5 (BN254, t=5)" {
     const P = bn.Perm(5).init();
     var st: [5]bn.Fr = undefined;

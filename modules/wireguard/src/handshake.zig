@@ -838,6 +838,42 @@ test "auth failures: tampering, wrong PSK, wrong peer are all rejected" {
     }
 }
 
+test "hostile: an all-zero ephemeral (X25519 identity element) is rejected, not crashed on" {
+    // Every DH in this handshake feeds an attacker-controlled public key
+    // (`unencrypted_ephemeral` travels in the clear) straight into
+    // `X25519.scalarmult`, which is `IdentityElementError!` — std itself
+    // rejects the all-zero output an all-zero/low-order input point
+    // produces (RFC 7748's contributory-behaviour concern). Both `catch
+    // return error.InvalidPublicKey`/`DecryptionFailed` sites this exercises
+    // are real code, but nothing in the suite ever supplies a key that
+    // trips them: every KAT and every other adversarial test uses a
+    // genuine, non-degenerate ephemeral. This is the identity-element case
+    // the module doc's own DH calls implicitly assume can't reach them
+    // unhandled.
+    const io = std.testing.io;
+
+    // Responder side: initiator's message 1 carries an all-zero ephemeral.
+    {
+        var ini = kat.initiator();
+        var rsp = kat.responder();
+        var msg1 = try ini.createInitiation(io, kat.timestamp);
+        msg1.unencrypted_ephemeral = @splat(0);
+        msg1.mac1 = ini.computeMac1(std.mem.asBytes(&msg1)[0..@offsetOf(MessageInitiation, "mac1")]);
+        try testing.expectError(error.DecryptionFailed, rsp.consumeInitiation(msg1));
+    }
+    // Initiator side: responder's message 2 carries an all-zero ephemeral.
+    {
+        var ini = kat.initiator();
+        var rsp = kat.responder();
+        const msg1 = try ini.createInitiation(io, kat.timestamp);
+        try rsp.consumeInitiation(msg1);
+        var msg2 = try rsp.createResponse(io);
+        msg2.unencrypted_ephemeral = @splat(0);
+        msg2.mac1 = rsp.computeMac1(std.mem.asBytes(&msg2)[0..@offsetOf(MessageResponse, "mac1")]);
+        try testing.expectError(error.DecryptionFailed, ini.consumeResponse(msg2));
+    }
+}
+
 test "auth failure does not corrupt pending initiator state" {
     const io = std.testing.io;
     var ini = kat.initiator();

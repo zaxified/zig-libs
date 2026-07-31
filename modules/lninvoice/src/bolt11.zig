@@ -903,6 +903,55 @@ test "fuzz: decode never panics on arbitrary attacker-supplied invoice strings" 
     try testing.fuzz({}, fuzzDecode, .{});
 }
 
+test "hostile: an out-of-range recovery id (4) is a typed error, not an @intCast panic" {
+    // The fuzz test above throws unstructured bytes at `decode` and almost
+    // never survives bech32's own checksum, so it essentially never reaches
+    // this far into the parse. Reaching it deliberately: take a real,
+    // checksummed invoice, tamper only the signature's trailing recovery-id
+    // byte to an out-of-range value (4; valid range is 0-3), and rebuild a
+    // validly-checksummed invoice around it. `sig_bytes[64] > 3` must catch
+    // this before `@intCast(sig_bytes[64])` to `u2` ever runs — that cast
+    // panics on any value past 3, on a field that arrived over the wire in a
+    // user-pasted string.
+    const allocator = testing.allocator;
+    const invoice = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
+    var raw = try bech32raw.decode(allocator, invoice);
+    defer raw.deinit(allocator);
+
+    const sig_start = raw.data.len - 104;
+    const sig_bytes = try bitpack.quintetsToBytesStrict(allocator, raw.data[sig_start..]);
+    defer allocator.free(sig_bytes);
+    sig_bytes[64] = 4; // out-of-range recovery id
+
+    const new_sig_quintets = try bitpack.bytesToQuintets(allocator, sig_bytes);
+    defer allocator.free(new_sig_quintets);
+
+    const new_data = try allocator.alloc(u5, raw.data.len);
+    defer allocator.free(new_data);
+    @memcpy(new_data[0..sig_start], raw.data[0..sig_start]);
+    @memcpy(new_data[sig_start..], new_sig_quintets);
+
+    const tampered = try bech32raw.encode(allocator, raw.hrp, new_data);
+    defer allocator.free(tampered);
+
+    try testing.expectError(error.InvalidRecoveryId, decode(allocator, tampered));
+}
+
+test "hostile: an amount digit run past u128 capacity is rejected before it can overflow the accumulator" {
+    // 45 digits: past u128's ~39-digit capacity. The width cap
+    // (digits.len > 20) must fire before `v = v * 10 + digit` ever risks
+    // overflowing the u128 accumulator itself. A cap that is merely "large
+    // enough that the amount would be rejected anyway" is not the same
+    // property — a cap raised as far as, say, 30 digits would still be
+    // caught later by `msat > maxInt(u64)`, so only an input this long
+    // distinguishes "the cap fires early and cleanly" from "the accumulator
+    // traps with an unchecked overflow panic".
+    try testing.expectError(
+        error.AmountTooLarge,
+        parseAmountMsat("999999999999999999999999999999999999999999999m"),
+    );
+}
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
 
