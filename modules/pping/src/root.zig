@@ -288,6 +288,21 @@ test "smoke: Estimator.reset empties tables and zeroes counters without touching
     try testing.expectEqual(@as(usize, 4), est.tables[0].capacity());
 }
 
+test "smoke: observe() increments observations_total by exactly one per call" {
+    // Regression: no existing test ever checked observations_total's actual
+    // increment behavior via observe() -- only that it starts (and resets
+    // back to) zero. A mutation double-counting (or never counting) survived
+    // the whole suite.
+    var est = try Estimator.init(testing.allocator, .{});
+    defer est.deinit(testing.allocator);
+    _ = est.observe(.{ .dir = .a_to_b, .tsval = 1, .tsecr = 0, .now = 0 });
+    try testing.expectEqual(@as(u64, 1), est.observations_total);
+    _ = est.observe(.{ .dir = .b_to_a, .tsval = 2, .tsecr = 1, .now = 10 });
+    try testing.expectEqual(@as(u64, 2), est.observations_total);
+    _ = est.observe(.{ .dir = .a_to_b, .tsval = 3, .tsecr = 0, .now = 20 });
+    try testing.expectEqual(@as(u64, 3), est.observations_total);
+}
+
 test "smoke: fable_core_implemented resolves and is true once the core is in" {
     try testing.expectEqual(true, fable_core_implemented);
 }

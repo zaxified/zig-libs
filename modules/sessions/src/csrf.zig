@@ -275,6 +275,21 @@ test "middleware: safe GET passes and issues a JS-readable token cookie" {
     try testing.expect(c.verify("abc123", c.token("abc123", &buf)));
 }
 
+test "middleware: issue_on_safe = false suppresses the token cookie on safe GET" {
+    // Regression: `issue_on_safe` was read but nothing exercised the false
+    // branch -- a mutation that always issued the cookie regardless of the
+    // flag stayed green.
+    const c = Csrf{ .key = @splat(0x55), .issue_on_safe = false };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try makeRouter(&r, &c);
+
+    var out: [4096]u8 = undefined;
+    const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session=abc123\r\nConnection: close\r\n\r\n", &out);
+    try expectStatus(got, "200");
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "Set-Cookie"));
+}
+
 test "middleware: unsafe POST is 403 without a token, passes with the right one" {
     const c = Csrf{ .key = @splat(0x22) };
     var r = router.Router.init(testing.allocator);

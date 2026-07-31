@@ -878,6 +878,36 @@ test "annotated: newline inside unquoted key" {
     try std.testing.expect(std.mem.indexOf(u8, err.string, "newline in key") != null);
 }
 
+test "annotated: error message reports the correct line number (mutation guard)" {
+    // Regression: lineOf's line count is never checked against a specific
+    // number anywhere else in this file -- every other test only greps for
+    // a substring like "missing colon" or "invalid literal", so a wrong line
+    // number (e.g. lineOf counting '\n' twice) would sail through unnoticed.
+    const alloc = std.testing.allocator;
+    const src = "{\n  a: 1,\n  bad key: 2\n}";
+    const r = try preprocessAnnotated(alloc, src);
+    defer alloc.free(r.out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, r.out, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("$err_1") orelse return error.Missing;
+    try std.testing.expect(std.mem.indexOf(u8, err.string, "at line 3") != null);
+}
+
+test "annotated: tab inside a malformed key is labeled 'tab', not 'newline' (mutation guard)" {
+    // whitespaceKind() has three return paths ("newline", "tab", "whitespace")
+    // but no existing test supplies an actual tab byte between a key and its
+    // colon, so the "tab" branch was reachable only by inspection, never by
+    // an assertion on its output.
+    const alloc = std.testing.allocator;
+    const src = "{a: 1, bad\tkey: 2}";
+    const r = try preprocessAnnotated(alloc, src);
+    defer alloc.free(r.out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, r.out, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("$err_1") orelse return error.Missing;
+    try std.testing.expect(std.mem.indexOf(u8, err.string, "tab in key") != null);
+}
+
 test "annotated: missing colon after key" {
     const alloc = std.testing.allocator;
     const src = "{foo \"bar\", b: 1}";

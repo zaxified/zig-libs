@@ -637,6 +637,43 @@ pub fn run(gpa: Allocator, case: Case, fault_cfg: fault.Config) anyerror!GenResu
 
 const testing = std.testing;
 
+test "drive: an event scheduled exactly at `until` is still processed (inclusive boundary)" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var fired: usize = 0;
+
+    const Hooks = struct {
+        fn onMessage(ctx: *anyopaque, s: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+            _ = ctx;
+            _ = s;
+            _ = node;
+            _ = from;
+            _ = payload;
+        }
+        fn onTimer(ctx: *anyopaque, s: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+            _ = s;
+            _ = node;
+            _ = timer_id;
+            const count: *usize = @ptrCast(@alignCast(ctx));
+            count.* += 1;
+        }
+    };
+    const protocol = Protocol{
+        .ctx = &fired,
+        .onMessageFn = Hooks.onMessage,
+        .onTimerFn = Hooks.onTimer,
+    };
+
+    var sim = Sim.init(gpa, 1, protocol, &log, 100, 1000);
+    defer sim.deinit();
+    _ = try sim.addNode(.{});
+    try sim.setTimer(0, 100, 0); // fires at exactly `until` == 100
+    _ = try sim.drive();
+
+    try testing.expectEqual(@as(usize, 1), fired);
+}
+
 test "event heap: pops in (time, seq) order" {
     var h = EventHeap{};
     defer h.deinit(testing.allocator);

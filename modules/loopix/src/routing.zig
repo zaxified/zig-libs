@@ -168,6 +168,17 @@ test "pickRoute: one mix per layer, all in-range, dest in the final slot" {
     try testing.expectEqual(cfg.clientNode(1), h.route[3]); // dest slot
 }
 
+test "pickDestClient: clients <= 1 falls back to self (only choice available)" {
+    // No prior test ever configured clients <= 1, so this early-return branch
+    // was reachable only by inspection. With a single client there is no
+    // other destination to pick, so falling back to self is the documented,
+    // correct degenerate behavior -- but nothing pinned the exact value.
+    const cfg = LoopixConfig{ .layers = 2, .width = 2, .clients = 1 };
+    try testing.expectEqual(cfg.clientNode(0), pickDestClient(cfg, 999, 0));
+    const cfg0 = LoopixConfig{ .layers = 2, .width = 2, .clients = 0 };
+    try testing.expectEqual(cfg0.clientNode(0), pickDestClient(cfg0, 999, 0));
+}
+
 test "pickDestClient: never returns self, always a valid client" {
     const cfg = LoopixConfig{ .layers = 2, .width = 2, .clients = 4 };
     var key: u64 = 0;

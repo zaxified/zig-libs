@@ -328,3 +328,73 @@ test "smoke: snapshot() and listProcesses() run against the real /proc" {
     defer testing.allocator.free(procs);
     try testing.expect(procs.len > 0); // at least this test process itself
 }
+
+// Gated live smoke test: `readSockets`/`readArp`/`readRoutes`/`readConntrack`
+// (mutation guard) -- unlike `snapshot`/`listProcesses` above, NOTHING in the
+// test suite ever called these four `readX` convenience wrappers before this
+// test existed: not the golden-fixture parser tests (which call `parseX`
+// directly on embedded text, never touching `readVirtualFile`), and not any
+// other smoke test. A typo'd path (e.g. "/proc/net/xcp") or a dropped table
+// in `readSockets`'s four-file loop would have silently returned fewer/zero
+// entries and nothing would have noticed. Cross-checking each against an
+// independent direct read + parse of the same file(s) catches exactly that,
+// rather than merely proving "ran without crashing".
+test "smoke: readSockets/readArp/readRoutes/readConntrack are wired to the right /proc files" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // readSockets combines four tables (tcp/tcp6/udp/udp6); cross-check its
+    // total against directly reading + parsing each one independently.
+    var direct_total: usize = 0;
+    inline for (.{ "/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6" }) |path| {
+        if (readVirtualFile(testing.allocator, io, path, 512 * 1024)) |text| {
+            defer testing.allocator.free(text);
+            const rows = try parseTcp(testing.allocator, text); // proto tag is irrelevant here, only row count
+            defer testing.allocator.free(rows);
+            direct_total += rows.len;
+        }
+    }
+    const socks = try readSockets(testing.allocator, io);
+    defer testing.allocator.free(socks);
+    try testing.expectEqual(direct_total, socks.len);
+
+    // readArp: cross-check against a direct read + parse of /proc/net/arp.
+    var direct_arp_len: usize = 0;
+    if (readVirtualFile(testing.allocator, io, "/proc/net/arp", 256 * 1024)) |text| {
+        defer testing.allocator.free(text);
+        const rows = try parseArp(testing.allocator, text);
+        defer testing.allocator.free(rows);
+        direct_arp_len = rows.len;
+    }
+    const neigh = try readArp(testing.allocator, io);
+    defer testing.allocator.free(neigh);
+    try testing.expectEqual(direct_arp_len, neigh.len);
+
+    // readRoutes: cross-check against a direct read + parse of /proc/net/route.
+    var direct_routes_len: usize = 0;
+    if (readVirtualFile(testing.allocator, io, "/proc/net/route", 256 * 1024)) |text| {
+        defer testing.allocator.free(text);
+        const rows = try parseRoutes(testing.allocator, text);
+        defer testing.allocator.free(rows);
+        direct_routes_len = rows.len;
+    }
+    const rts = try readRoutes(testing.allocator, io);
+    defer testing.allocator.free(rts);
+    try testing.expectEqual(direct_routes_len, rts.len);
+
+    // readConntrack: cross-check against a direct read + parse of
+    // /proc/net/nf_conntrack (module may not be loaded / may need root --
+    // both paths then consistently see "file absent", so this holds either way).
+    var direct_ct_total: usize = 0;
+    if (readVirtualFile(testing.allocator, io, "/proc/net/nf_conntrack", 4 * 1024 * 1024)) |text| {
+        defer testing.allocator.free(text);
+        var parsed = try parseConntrack(testing.allocator, text, 64);
+        defer parsed.deinit(testing.allocator);
+        direct_ct_total = parsed.total;
+    }
+    var ct = try readConntrack(testing.allocator, io, 64);
+    defer ct.deinit(testing.allocator);
+    try testing.expectEqual(direct_ct_total, ct.total);
+}

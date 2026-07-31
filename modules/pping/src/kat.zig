@@ -132,6 +132,29 @@ test "KAT: an aged-out TSval no longer matches once max_age has elapsed" {
     try testing.expectEqual(@as(?root.RttSample, null), sample);
 }
 
+test "KAT: retransmission dedup check is load-bearing under a tight capacity (mutation guard)" {
+    if (!root.fable_core_implemented) return error.SkipZigTest;
+    // Regression: the existing "retransmission does not reset first-seen"
+    // test below uses the default capacity (256), so it stays green even if
+    // `matchEcho`'s "same_dir.indexOf(obs.tsval) == null" dedup guard is
+    // deleted entirely -- TsTable.indexOf's forward scan still returns the
+    // FIRST-inserted (correct) entry, and there's always room for the
+    // now-unguarded duplicate insert to just pile up harmlessly. An oracle
+    // blind to the answer. With capacity=1, an unconditional insert on the
+    // retransmit is forced to EVICT the only slot (the original t=0 entry)
+    // to make room for a "new" one at t=30, corrupting first_seen -- so this
+    // only stays correct if the dedup check actually runs.
+    var est = try Estimator.init(testing.allocator, .{ .capacity = 1 });
+    defer est.deinit(testing.allocator);
+
+    _ = est.observe(.{ .dir = .a_to_b, .tsval = 55, .tsecr = 0, .now = 0 });
+    _ = est.observe(.{ .dir = .a_to_b, .tsval = 55, .tsecr = 0, .now = 30 }); // retransmit
+
+    const sample = est.observe(.{ .dir = .b_to_a, .tsval = 999, .tsecr = 55, .now = 40 });
+    try testing.expect(sample != null);
+    try testing.expectEqual(@as(u64, 40), sample.?.rtt); // 40 - 0, not 40 - 30
+}
+
 test "KAT: retransmission of the same TSval does not reset its first-seen time" {
     if (!root.fable_core_implemented) return error.SkipZigTest;
     var est = try Estimator.init(testing.allocator, .{});

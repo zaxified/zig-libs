@@ -246,6 +246,55 @@ test "changedNodes: identical trees report no changes" {
     try testing.expectEqual(@as(usize, 0), changed.len);
 }
 
+/// Build a synthetic `Tree` directly from `dist`/`pred` arrays (no `Graph`/SPF
+/// run involved) — the only way to construct an (old, new) tree PAIR where
+/// BOTH ordering classes are populated at once. A single real topology event
+/// (one edge up or down) can never do this: removing an edge cannot decrease
+/// any node's shortest-path distance, and restoring one cannot increase any —
+/// so every `computeUpdateOrder` call driven by `fabric.zig`'s single-edge
+/// fault model sees an ALL-decrease or ALL-increase changed set, never a mix.
+/// That means the class-A-before-class-B rule (the algorithm's central
+/// safety property, and the whole reason `computeUpdateOrder` exists instead
+/// of `naiveBadOrder`) is never exercised by the netsim-driven suite — not
+/// even by the 5000-seed sweep in `root.zig`'s "teeth-at-scale" test. This
+/// helper drives `computeUpdateOrder` directly so the ordering rule itself
+/// has a pinned, table-driven answer independent of any simulation.
+fn synthTree(gpa: std.mem.Allocator, dist: []const spf.Distance, pred: []const ?NodeId) !Tree {
+    const d = try gpa.dupe(spf.Distance, dist);
+    const p = try gpa.dupe(?NodeId, pred);
+    return .{ .gpa = gpa, .root = 0, .dist = d, .pred = p };
+}
+
+test "computeUpdateOrder: mixed increase+decrease set — class A entirely before class B, correct intra-class direction" {
+    const gpa = testing.allocator;
+    // 6 nodes (0 = dest/root, unchanged). Distances chosen so every node's
+    // classification and relative rank is unambiguous:
+    //   node1: 10 -> 5   (class A, new_dist=5)
+    //   node2: 20 -> 12  (class A, new_dist=12)
+    //   node3: 30 -> 45  (class B, old_dist=30)
+    //   node4: 40 -> 42  (class B, old_dist=40)
+    //   node5: 50 -> 50  (class B: distance TIED but next-hop shifted, old_dist=50)
+    var old_tree = try synthTree(
+        gpa,
+        &.{ 0, 10, 20, 30, 40, 50 },
+        &.{ null, 0, 0, 0, 0, 0 },
+    );
+    defer old_tree.deinit();
+    var new_tree = try synthTree(
+        gpa,
+        &.{ 0, 5, 12, 45, 42, 50 },
+        &.{ null, 9, 9, 9, 9, 9 }, // all differ from old_tree's pred so every node of 1..5 is "changed"
+    );
+    defer new_tree.deinit();
+
+    const order = try computeUpdateOrder(gpa, &old_tree, &new_tree);
+    defer gpa.free(order);
+
+    // Class A (ascending new_dist: 1 before 2), THEN class B (descending
+    // old_dist: 5, 4, 3).
+    try testing.expectEqualSlices(NodeId, &.{ 1, 2, 5, 4, 3 }, order);
+}
+
 test "naiveBadOrder: returns exactly the changed set, ascending by id (not a stub)" {
     const gpa = testing.allocator;
     // 0 -- 1 -- 2, then a cheaper direct 0--2 edge appears (simulating a

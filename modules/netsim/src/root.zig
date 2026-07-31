@@ -363,13 +363,20 @@ test "partition severs delivery across the cut; heal restores it" {
     const gpa = testing.allocator;
     const cut = [_]NodeId{ 3, 4 }; // isolates {3,4} from {0,1,2} (origin side)
 
-    // Never healed: the far side (node 4) receives nothing.
+    // Never healed: the far side (node 4) receives nothing, but the near side
+    // (nodes 0-2, entirely outside the cut) still floods normally among itself —
+    // this pins down that severing is scoped to links CROSSING the cut, not to
+    // every link touching a cut partition (a same-side-severs inversion would
+    // still zero out node 4 by accident on a chain topology, since it would cut
+    // the near-side relay links too; asserting the near side stays live rules
+    // that out).
     var f_b = try Flood.init(gpa, FLOOD_N);
     defer f_b.deinit(gpa);
     const case_b = Case{ .seed = 7, .scenario = floodScenario, .protocol = f_b.protocol(), .until = 1000 };
     const trace_b = [_]FaultEvent{.{ .time = 0, .kind = .{ .partition = .{ .id = 1, .cut = &cut } } }};
     _ = try replay(gpa, case_b, &trace_b, null);
     try testing.expectEqual(@as(u32, 0), f_b.received[4]);
+    try testing.expect(f_b.received[2] > 0);
 
     // Healed at t=500: the far side receives epochs originated after the heal.
     var f_a = try Flood.init(gpa, FLOOD_N);

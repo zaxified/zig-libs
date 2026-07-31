@@ -1080,6 +1080,10 @@ test "middleware: fresh request gets a hardened Set-Cookie; round-trips" {
     try testing.expect(std.mem.indexOf(u8, sc, "HttpOnly") != null);
     try testing.expect(std.mem.indexOf(u8, sc, "Secure") != null);
     try testing.expect(std.mem.indexOf(u8, sc, "SameSite=Lax") != null);
+    // maxAgeSeconds(idle_timeout_ns) must be the exact idle window in
+    // seconds (10s here) -- no prior test checked the numeric value, only
+    // that "Max-Age=-1" appears on a *destroy* cookie.
+    try testing.expect(std.mem.indexOf(u8, sc, "Max-Age=10;") != null);
     const id = cookieId(sc);
     try testing.expectEqual(@as(usize, 64), id.len);
     try testing.expectEqualStrings(id, bodyOf(first)); // body echoed the cookie id

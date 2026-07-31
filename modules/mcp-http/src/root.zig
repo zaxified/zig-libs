@@ -1303,6 +1303,59 @@ test "SSE mode: a tool's outbound request streams as its own event before the re
     try testing.expect(std.mem.count(u8, got, "data: ") >= 2);
 }
 
+test "Sessions.push: past replay_depth, the OLDEST event is evicted (mutation guard)" {
+    // No prior test ever set a small replay_depth, so the FIFO-eviction branch
+    // in push() (`s.events.items.len >= self.replay_depth`) was reachable only
+    // by inspection: a mutation loosening it to '>' (keeping one extra event)
+    // built and passed the whole suite.
+    var s = Sessions.init(testing.allocator);
+    defer s.deinit();
+    s.replay_depth = 2;
+    const id = try s.create();
+
+    _ = try s.push(id, "a");
+    _ = try s.push(id, "b");
+    _ = try s.push(id, "c"); // over the cap -> "a" (event id 1) evicted
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var batch: std.ArrayList(Sessions.StoredEvent) = .empty;
+    _ = (try s.drainAfter(id, 0, arena_state.allocator(), &batch)).?;
+    try testing.expectEqual(@as(usize, 2), batch.items.len);
+    try testing.expectEqualStrings("b", batch.items[0].data);
+    try testing.expectEqualStrings("c", batch.items[1].data);
+}
+
+test "GET: a malformed Last-Event-ID header replays the whole buffer, not nothing (mutation guard)" {
+    // parseLastEventId's error fallback (catch 0) is documented as "replay the
+    // whole buffer" but no test ever sent an actually malformed header value
+    // -- every existing GET test either omits it or sends a valid number.
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const init = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+    const sid_hdr = headerValue(init, "Mcp-Session-Id").?;
+    var sidbuf: [64]u8 = undefined;
+    @memcpy(sidbuf[0..sid_hdr.len], sid_hdr);
+    const sid = sidbuf[0..sid_hdr.len];
+
+    _ = try sessions.push(sid, "{\"n\":1}");
+
+    const got = runWire(&r, getWithSession(&rbuf, sid, "not-a-number"), &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got, "data: {\"n\":1}") != null);
+}
+
 test "Sessions.create: refuses new sessions past max_sessions (audit MED)" {
     // Batch-10 audit MED: create() had no cap, so an unauthenticated peer
     // spamming `initialize` grew the registry (and per-session replay buffers)

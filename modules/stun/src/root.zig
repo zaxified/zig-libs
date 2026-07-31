@@ -777,6 +777,37 @@ test "MAPPED-ADDRESS (plain) and XMA encode round-trip" {
     try testing.expectEqual(@as(u16, 4242), xored.port);
 }
 
+test "mappedAddress() prefers XOR-MAPPED-ADDRESS over plain MAPPED-ADDRESS (mutation guard)" {
+    // Regression: the existing round-trip test built both attributes with the
+    // SAME address, so a comparator/preference swap (plain-first instead of
+    // XOR-first) would still pass it -- an oracle blind to the answer. Here
+    // the two attributes carry DIFFERENT addresses so the preference is
+    // actually observable.
+    const plain_ip = netaddr.parseIp("198.51.100.9").?;
+    const xor_ip = netaddr.parseIp("203.0.113.7").?;
+    var out: [64]u8 = undefined;
+    var b = try Builder.init(&out, .success_response, .binding, rfc5769_txid);
+    try b.addMappedAddress(plain_ip, 1111, false); // MAPPED-ADDRESS
+    try b.addMappedAddress(xor_ip, 2222, true); // XOR-MAPPED-ADDRESS
+    const m = try decode(b.finish());
+
+    const preferred = (try m.mappedAddress()).?;
+    try testing.expect(preferred.ip.eql(xor_ip));
+    try testing.expectEqual(@as(u16, 2222), preferred.port);
+}
+
+test "find() returns the FIRST occurrence of a duplicated attribute type (mutation guard)" {
+    // Message.find's doc comment: "Later duplicates are ignored" -- no
+    // existing test ever put two attributes of the same type in one message,
+    // so a first-vs-last swap in find() had nothing to catch it.
+    var out: [64]u8 = undefined;
+    var b = try Builder.init(&out, .success_response, .binding, rfc5769_txid);
+    try b.addSoftware("first");
+    try b.addSoftware("second");
+    const m = try decode(b.finish());
+    try testing.expectEqualStrings("first", m.find(attrCode(.software)).?.value);
+}
+
 test "bindingRequest builds a bare 20-byte Binding request" {
     var out: [32]u8 = undefined;
     const req = try bindingRequest(rfc5769_txid, &out);

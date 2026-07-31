@@ -1209,6 +1209,25 @@ test "quantile linear interp + histogram" {
     try testing.expectEqual(@as(i64, 1), h.cell(4, "count").?.int); // the 10 lands in last bin
 }
 
+test "quantile: unsorted-slice wrapper sorts a COPY and matches quantileSorted (mutation guard)" {
+    // `quantile` had no test call site at all -- only `quantileSorted` (the
+    // pre-sorted primitive) was ever exercised directly. Feed it genuinely
+    // unsorted input so the sort step is load-bearing, and confirm the
+    // original slice is left untouched (it dupes before sorting).
+    var f = Fix.init();
+    defer f.deinit();
+    // q = 0.25, deliberately NOT 0.5 -- a 0.5 probe is symmetric under a
+    // q -> 1-q mutation (the wrong answer would equal the right one).
+    const xs = [_]f64{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    const got = try quantile(f.a(), &xs, 0.25);
+    var sorted_copy = xs;
+    std.mem.sort(f64, &sorted_copy, {}, f64lt);
+    try testing.expectApproxEqAbs(quantileSorted(&sorted_copy, 0.25), got, 1e-9);
+    // The caller's original slice must be untouched (unsorted-order proof).
+    try testing.expectEqual(@as(f64, 3), xs[0]);
+    try testing.expectEqual(@as(f64, 6), xs[7]);
+}
+
 test "quantileSorted: out-of-range q is clamped instead of panicking (audit F1)" {
     // Batch: q was fed straight into @intFromFloat(@floor(q*(n-1))); a q < 0
     // (e.g. a 0-100 vs 0-1 convention mixup) panicked in ReleaseSafe / OOB-read
@@ -1434,6 +1453,27 @@ test "omegaRatio: hand-computed threshold-0 ratio + infinite-when-no-losses cont
 
     const flat = [_]f64{ 0, 0, 0 };
     try testing.expectApproxEqAbs(@as(f64, 1.0), omegaRatio(&flat, 0), 1e-9); // flat at threshold -> 1.0
+}
+
+test "omegaRatioNode: Dataset wiring passes the configured threshold through (mutation guard)" {
+    // `omegaRatioNode` (the Dataset-wired node around the scalar `omegaRatio`)
+    // had no test call site at all -- only the raw scalar fn was ever
+    // exercised. Use a NON-ZERO threshold so a mutation that ignores/mangles
+    // `spec.threshold` is observable (threshold=0 would collide with the
+    // scalar test's own default and hide such a bug).
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "ret", .type = .float }};
+    const rows = [_][]const Value{
+        &.{.{ .float = 0.01 }}, &.{.{ .float = -0.02 }}, &.{.{ .float = 0.03 }}, &.{.{ .float = -0.01 }}, &.{.{ .float = 0.02 }},
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const out = try omegaRatioNode(f.a(), d, .{ .ret_col = "ret", .threshold = 0.015 });
+    // Per-value diff = x - 0.015: 0.01->-0.005(loss), -0.02->-0.035(loss),
+    // 0.03->+0.015(gain), -0.01->-0.025(loss), 0.02->+0.005(gain).
+    // gains = 0.015+0.005 = 0.02; losses = 0.005+0.035+0.025 = 0.065.
+    const want = 0.02 / 0.065;
+    try testing.expectApproxEqAbs(want, out.cell(0, "omega").?.float, 1e-9);
 }
 
 test "rollingApply: sliding-window mean/vol/sharpe + a custom comptime reducer" {

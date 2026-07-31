@@ -193,6 +193,45 @@ test "Prng: identical seed reproduces the identical unit stream" {
     try testing.expect(seen_low and seen_high); // spans the range
 }
 
+test "sampleExpDelay: mean <= 1 degenerates to an immediate (0-tick) release" {
+    // No test anywhere in this module ever calls sampleExpDelay/scheduleRelease/
+    // nextCover with mean <= 1 (every protocol.zig config uses mean_delay=40,
+    // cover_mean_interval=15) -- the degenerate early-return was reachable only
+    // by inspection. mutation guard: caught a change from `return 0` to
+    // `return 1` here that the whole suite otherwise missed.
+    var p = Prng.init(1);
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        try testing.expectEqual(@as(Time, 0), sampleExpDelay(&p, 0));
+        try testing.expectEqual(@as(Time, 0), sampleExpDelay(&p, 1));
+    }
+}
+
+test "sampleExpDelay: non-degenerate mean produces a geometric-shaped draw averaging near its mean" {
+    // Direct sanity check on the primitive itself (as opposed to only via the
+    // emergent netsim-level anonymity statistics in protocol.zig): over many
+    // draws at a fixed mean, the sample mean must land in the same ballpark,
+    // and both very-short and much-longer-than-mean holds must occur (the
+    // long right tail is what a floored/clamped implementation would lose).
+    var p = Prng.init(0xC0FFEE);
+    const mean: Time = 40;
+    var total: u64 = 0;
+    var saw_short = false;
+    var saw_long = false;
+    const trials = 20_000;
+    var i: usize = 0;
+    while (i < trials) : (i += 1) {
+        const d = sampleExpDelay(&p, mean);
+        total += d;
+        if (d <= 2) saw_short = true;
+        if (d >= mean * 3) saw_long = true;
+    }
+    const avg = @as(f64, @floatFromInt(total)) / @as(f64, trials);
+    try testing.expect(avg > 32.0 and avg < 48.0); // within ~20% of mean=40
+    try testing.expect(saw_short);
+    try testing.expect(saw_long);
+}
+
 test "gated core: the three stubs compile with their real signatures (no call)" {
     // Referencing without calling proves the signatures type-check against the
     // config/PRNG the real implementation will use — a call would @panic and

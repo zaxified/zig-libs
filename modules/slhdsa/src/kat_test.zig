@@ -179,6 +179,16 @@ test "keygen -> sign -> verify round-trip; tampering rejects, never panics" {
     @memset(big_ctx, 0xAB);
     try std.testing.expectError(error.ContextTooLong, Scheme.sign(sig[0..sig_len], msg, kp.sk, big_ctx, null));
     try std.testing.expect(!Scheme.verify(sig, msg, kp.pk, big_ctx));
+
+    // Exactly at the boundary: ctx.len == 255 is the FIPS 205 §10.2 LIMIT,
+    // not past it -- must still succeed. No prior test probed this boundary
+    // from the accepted side (only 256, well past it, was ever tried), so an
+    // off-by-one (`> 255` mutated to `>= 255`) went uncaught.
+    const max_ctx = try gpa.alloc(u8, 255);
+    defer gpa.free(max_ctx);
+    @memset(max_ctx, 0xCD);
+    try Scheme.sign(sig[0..sig_len], msg, kp.sk, max_ctx, null);
+    try std.testing.expect(Scheme.verify(sig, msg, kp.pk, max_ctx));
 }
 
 test "SHAKE-128f keygen -> pure sign -> verify round-trip with context" {

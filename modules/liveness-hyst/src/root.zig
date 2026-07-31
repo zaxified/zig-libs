@@ -230,6 +230,28 @@ test "smoke: Estimator constructs with defaults and starts .up with no history" 
     try std.testing.expectEqual(@as(u64, 0), s.received);
 }
 
+test "recentProbes: returns the most recent probes, oldest-first, across a wraparound" {
+    var est = Estimator.init(.{});
+    // Push more than history_capacity so the ring wraps at least once, then
+    // request fewer than the full window: `recentProbes` must hand back
+    // exactly the LAST `out.len` probes, oldest-first, not an off-by-one
+    // rotation of them.
+    const total = history_capacity + 5;
+    var i: Time = 0;
+    while (i < total) : (i += 1) {
+        est.onProbeReply(i, 20);
+    }
+    var buf: [10]Probe = undefined;
+    const n = est.recentProbes(&buf);
+    try std.testing.expectEqual(@as(usize, 10), n);
+    var j: usize = 0;
+    while (j < 10) : (j += 1) {
+        // The most recent probe was fed at `at == total - 1`; the window of
+        // the last 10 is oldest-first, so buf[j].at == total - 10 + j.
+        try std.testing.expectEqual(@as(Time, total - 10 + j), buf[j].at);
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
     _ = @import("core.zig");
