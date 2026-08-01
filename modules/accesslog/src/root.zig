@@ -283,7 +283,7 @@ fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 /// second line — the record stays exactly one line no matter what the
 /// caller's method/target/protocol/referer/user-agent/remote_addr contain.
 pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    if (entry.remote_addr) |a| try writeClfEscaped(w, a) else try w.writeByte('-');
+    if (entry.remote_addr) |a| try writeClfEscaped(w, hostOnly(a)) else try w.writeByte('-');
     try w.writeAll(" - - [");
     if (entry.time_formatted) |t| try writeClfEscaped(w, t) else try w.print("{d}", .{entry.timestamp_ns});
     try w.writeAll("] \"");
@@ -299,6 +299,28 @@ pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("\" \"");
     if (entry.user_agent) |u| try writeClfEscaped(w, u) else try w.writeByte('-');
     try w.writeAll("\"\n");
+}
+
+/// Combined's `%h` is the remote *host* — never `host:port`. `remote_addr`
+/// carries the full peer address (`entryFromRequest` formats an
+/// `IpAddress`, which includes the port), so the port is stripped here and
+/// only here: the JSON/logfmt formats keep the address verbatim, where a
+/// structured consumer wants the port.
+///
+/// Real Combined-format consumers reject a port in this slot outright —
+/// goaccess 1.10.2 fails the whole line with `Token '192.0.2.1:54321'
+/// doesn't match specifier '%h'`. IPv6 is logged bare (`::1`), matching
+/// Apache, so the `[…]` brackets go too.
+fn hostOnly(addr: []const u8) []const u8 {
+    if (addr.len != 0 and addr[0] == '[') {
+        // `[::1]:8080` / `[::1]` → `::1`
+        if (std.mem.indexOfScalar(u8, addr, ']')) |close| return addr[1..close];
+        return addr;
+    }
+    // A bare IPv6 literal has several colons and no port — leave it alone.
+    if (std.mem.count(u8, addr, ":") > 1) return addr;
+    if (std.mem.lastIndexOfScalar(u8, addr, ':')) |colon| return addr[0..colon];
+    return addr;
 }
 
 fn writeClfEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
@@ -441,7 +463,7 @@ test "writeCombined: byte-exact golden for a representative entry" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeCombined(sampleEntry(), &w);
     try testing.expectEqualStrings(
-        "192.0.2.1:54321 - - [22/Jul/2026:10:00:00 +0000] \"GET /status?x=1 HTTP/1.1\" " ++
+        "192.0.2.1 - - [22/Jul/2026:10:00:00 +0000] \"GET /status?x=1 HTTP/1.1\" " ++
             "200 512 \"https://example.org/\" \"curl/8.0\"\n",
         w.buffered(),
     );
@@ -645,7 +667,7 @@ test "combined: benign fields render verbatim (positive control)" {
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "\"https://example.org/\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"curl/8.0\"") != null);
-    try testing.expect(std.mem.startsWith(u8, out, "192.0.2.1:54321 - - ["));
+    try testing.expect(std.mem.startsWith(u8, out, "192.0.2.1 - - ["));
 }
 
 // ── entryFromRequest ─────────────────────────────────────────────────────
@@ -772,7 +794,10 @@ test "entryFromRequest output feeds straight into writeCombined without extra gl
     var line_buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&line_buf);
     try writeCombined(entry, &w);
-    try testing.expect(std.mem.startsWith(u8, w.buffered(), "203.0.113.5:443 - - "));
+    // The Entry still carries the full peer address — JSON/logfmt want the
+    // port — but Combined's `%h` slot gets the host alone.
+    try testing.expectEqualStrings("203.0.113.5:443", entry.remote_addr.?);
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), "203.0.113.5 - - "));
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"GET /health HTTP/1.1\" 200") != null);
 }
 
@@ -822,4 +847,175 @@ test "entryFromRequest: identity-framed response maps response_bytes to the decl
     var addr_buf: [64]u8 = undefined;
     const entry = entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 1 });
     try testing.expectEqual(@as(?u64, 2), entry.response_bytes);
+}
+
+// ── external anchor: goaccess ────────────────────────────────────────────
+//
+// Oracle: goaccess 1.10.2 (`GoAccess - version 1.10.2 - Apr  1 2026`), an
+// independent Apache/NGINX log analyser. The exact bytes asserted below were
+// written to a file and fed to it:
+//
+//     goaccess -f al.log --log-format=COMBINED --no-global-config -o report.json
+//
+// and its `general.valid_requests` / `general.failed_requests` counters plus
+// the `requests` panel were read back. Verdicts are recorded per test. The
+// tool is NOT invoked by the test suite — the bytes are frozen here so the
+// gate stays offline; re-run the command above to re-derive.
+//
+// The finding that justified this anchor: with `remote_addr` emitted verbatim
+// (`192.0.2.1:54321`) goaccess failed **every** line —
+// `Token '192.0.2.1:54321' doesn't match specifier '%h'`, valid=0 failed=2.
+// See `hostOnly`. With the port stripped: valid=3, failed=0.
+
+test "Combined: external anchor — CRLF injection stays one line" {
+    // goaccess verdict: valid=1, failed=0, and the requests panel shows a
+    // single entry `crlf\x0d\x0ainjection crlf\x0d\x0ainjection HTTP/1.1` —
+    // the escaped CRLF did not forge a second record.
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const entry: Entry = .{
+        .timestamp_ns = 1000000005,
+        .time_formatted = "22/Jul/2026:10:00:00 +0000",
+        .remote_addr = "192.0.2.1:54321",
+        .method = "crlf\r\ninjection",
+        .target = "crlf\r\ninjection",
+        .protocol = "HTTP/1.1",
+        .status = 200,
+        .response_bytes = 512,
+        .user_agent = "crlf\r\ninjection",
+        .referer = "crlf\r\ninjection",
+    };
+    try writeCombined(entry, &w);
+    const out = w.buffered();
+
+    // Exactly one final newline, no carriage returns, no raw LF bytes
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+    try testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
+
+    // Ends with the real closing quote-newline
+    try testing.expect(std.mem.endsWith(u8, out, "\"\n"));
+
+    // Expected byte-exact output (CRLF escaped as \x0d\x0a per spec)
+    try testing.expectEqualStrings(
+        "192.0.2.1 - - [22/Jul/2026:10:00:00 +0000] \"crlf\\x0d\\x0ainjection crlf\\x0d\\x0ainjection HTTP/1.1\" 200 512 \"crlf\\x0d\\x0ainjection\" \"crlf\\x0d\\x0ainjection\"\n",
+        out,
+    );
+}
+
+test "Combined: %h carries the host without the port (goaccess rejects a port)" {
+    // The regression this pins: `remote_addr` is `host:port`, but Combined's
+    // `%h` slot is host-only. Emitting the port made goaccess fail 100% of
+    // lines — see the anchor note above.
+    try testing.expectEqualStrings("192.0.2.1", hostOnly("192.0.2.1:54321"));
+    try testing.expectEqualStrings("192.0.2.1", hostOnly("192.0.2.1"));
+    try testing.expectEqualStrings("::1", hostOnly("[::1]:8080"));
+    try testing.expectEqualStrings("2001:db8::1", hostOnly("[2001:db8::1]:443"));
+    // A bare IPv6 literal has no port to strip.
+    try testing.expectEqualStrings("2001:db8::1", hostOnly("2001:db8::1"));
+    try testing.expectEqualStrings("", hostOnly(""));
+
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeCombined(.{
+        .timestamp_ns = 1,
+        .time_formatted = "22/Jul/2026:10:00:00 +0000",
+        .remote_addr = "[2001:db8::1]:443",
+        .method = "GET",
+        .target = "/a",
+        .protocol = "HTTP/1.1",
+        .status = 200,
+        .response_bytes = 512,
+    }, &w);
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), "2001:db8::1 - - ["));
+}
+
+test "Combined: external anchor — quote escape prevents field breakout" {
+    // goaccess verdict: valid=1, failed=0; the requests panel shows the whole
+    // `quote\"inside quote\"inside HTTP/1.1` as one request field, i.e. the
+    // escaped quote did not terminate it early.
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const entry: Entry = .{
+        .timestamp_ns = 1000000001,
+        .time_formatted = "22/Jul/2026:10:00:00 +0000",
+        .remote_addr = "192.0.2.1:54321",
+        .method = "quote\"inside",
+        .target = "quote\"inside",
+        .protocol = "HTTP/1.1",
+        .status = 200,
+        .response_bytes = 512,
+        .user_agent = "quote\"inside",
+        .referer = "quote\"inside",
+    };
+    try writeCombined(entry, &w);
+    try testing.expectEqualStrings(
+        "192.0.2.1 - - [22/Jul/2026:10:00:00 +0000] \"quote\\\"inside quote\\\"inside HTTP/1.1\" 200 512 \"quote\\\"inside\" \"quote\\\"inside\"\n",
+        w.buffered(),
+    );
+}
+
+test "JSON Lines: round-trips through std.json — CRLF stays escaped" {
+    // NOT a foreign-ecosystem anchor: the only parser here is `std.json`. That
+    // is still an implementation written outside this module (so it catches
+    // malformed output and raw control bytes per RFC 8259), but it cannot
+    // catch a misreading this module and Zig's std would share. No external
+    // JSON tool was run against these bytes.
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const entry: Entry = .{
+        .timestamp_ns = 1000000005,
+        .remote_addr = "192.0.2.1:54321",
+        .method = "crlf\r\ninjection",
+        .target = "crlf\r\ninjection",
+        .protocol = "HTTP/1.1",
+        .status = 200,
+        .response_bytes = 512,
+        .user_agent = "crlf\r\ninjection",
+        .referer = "crlf\r\ninjection",
+    };
+    try writeJsonLines(entry, &w);
+    const out = w.buffered();
+
+    // Exactly one line (no raw control bytes)
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+    try testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
+
+    // Parse back through std.json to verify round-trip matches original payload
+    const without_nl = out[0 .. out.len - 1];
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, without_nl, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("crlf\r\ninjection", obj.get("method").?.string);
+    try testing.expectEqualStrings("crlf\r\ninjection", obj.get("target").?.string);
+}
+
+test "JSON Lines: round-trips through std.json — null byte escapes" {
+    // Same caveat as above: `std.json` only, no external JSON tool.
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const entry: Entry = .{
+        .timestamp_ns = 1000000007,
+        .remote_addr = "192.0.2.1:54321",
+        .method = "null\x00byte",
+        .target = "null\x00byte",
+        .protocol = "HTTP/1.1",
+        .status = 200,
+        .response_bytes = 512,
+        .user_agent = "null\x00byte",
+        .referer = "null\x00byte",
+    };
+    try writeJsonLines(entry, &w);
+    const out = w.buffered();
+
+    // No raw null bytes on wire
+    try testing.expect(std.mem.indexOfScalar(u8, out, 0x00) == null);
+
+    // Verify null bytes are escaped as \\u0000
+    try testing.expect(std.mem.indexOf(u8, out, "\\u0000") != null);
+
+    // Must round-trip exactly
+    const without_nl = out[0 .. out.len - 1];
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, without_nl, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("null\x00byte", parsed.value.object.get("method").?.string);
 }

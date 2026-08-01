@@ -48,7 +48,8 @@ try accesslog.write(entry, .logfmt, &w);
 // protocol=HTTP/1.1 status=200 response_bytes=512 latency_ns=1500000 user_agent=curl/8.0
 
 try accesslog.write(entry, .combined, &w);
-// 192.0.2.1:54321 - - [1734000000000000000] "GET /status?x=1 HTTP/1.1" 200 512 "-" "curl/8.0"
+// 192.0.2.1 - - [1734000000000000000] "GET /status?x=1 HTTP/1.1" 200 512 "-" "curl/8.0"
+// (note: `%h` is the host alone — Combined-format consumers reject a port here)
 ```
 
 (Combined's `[%t]` bracket falls back to the raw nanosecond epoch when `Entry.time_formatted`

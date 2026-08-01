@@ -60,6 +60,13 @@ literally, matching real servers — it is not treated as "unknown"). A missing 
 prints the literal `"-"` (quoted dash), matching `mod_log_config`'s own behavior for a missing
 header on what is normally a quoted field.
 
+`%h` is the client **host alone** — never `host:port`. `remote_addr` carries the full peer
+address (the JSON and logfmt formats emit it verbatim, port included, because a structured
+consumer wants it), so `writeCombined` strips the port for this slot only; an IPv6 address is
+logged bare (`::1`, not `[::1]`), as Apache does. This is externally anchored: with the port
+present, goaccess 1.10.2 rejects **every** line with `Token '192.0.2.1:54321' doesn't match
+specifier '%h'` (valid=0, failed=2); with it stripped, valid=3, failed=0.
+
 ## Log-injection escaping guarantees (the primary requirement)
 
 Threat model: `method`, `target`, `user_agent`, `referer` (and, on a hand-built `Entry`, any
