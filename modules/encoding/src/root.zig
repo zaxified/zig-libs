@@ -371,3 +371,11 @@ test "encode: a valid multi-byte lead truncated at buffer end passes through, no
     try expectEncode(.iso_8859_1, "ab\xc2", "ab\xc2"); // 2-byte lead (0xC2), 0 continuation
     try expectEncode(.iso_8859_1, "ab\xe2\x82", "ab\xe2\x82"); // 3-byte lead (0xE2), only 1 continuation
 }
+
+test {
+    // Exhaustive cross-check of all five high-tables against vendored
+    // normative sources (WHATWG index-*.txt / Unicode.org 8859-1.TXT) — see
+    // normative_test.zig and ../../NOTICE.
+    _ = @import("normative_vectors.zig");
+    _ = @import("normative_test.zig");
+}

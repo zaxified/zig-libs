@@ -1,0 +1,67 @@
+encoding — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to different
+authors. No third-party SOURCE CODE is present — only normative conformance
+tables used exclusively to drive tests.
+
+## WHATWG Encoding Standard — `index-*.txt` normative index tables
+
+`src/testdata/index-windows-1250.txt`, `index-windows-1252.txt`,
+`index-iso-8859-2.txt`, and `index-iso-8859-15.txt` are vendored verbatim from
+the Encoding Standard published at https://encoding.spec.whatwg.org/, each
+file's own header carrying `Date: 2024-09-18` (the version fetched). Each is
+the normative byte-0x80..0xFF -> codepoint mapping for that code page. Driven
+mechanically by `src/normative_vectors.zig` (parser) and `src/normative_test.zig`
+(the exhaustive 128-entry-per-page cross-check against `root.zig`'s tables).
+
+The Encoding Standard's own terms (`LICENSE` in the `whatwg/encoding`
+repository):
+
+    Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+    This work is licensed under a Creative Commons Attribution 4.0
+    International License. To the extent portions of it are incorporated
+    into source code, such portions in the source code are licensed under
+    the BSD 3-Clause License instead.
+
+## Unicode.org — `8859-1.TXT`
+
+`src/testdata/8859-1.TXT` is vendored verbatim from
+https://www.unicode.org/Public/MAPPINGS/ISO8859/8859-1.TXT (table version 2.0,
+dated 1999-07-27, header last updated 2015-12-02): the normative ISO/IEC
+8859-1:1998 -> Unicode mapping. WHATWG does not publish a separate index table
+for this page — in the WHATWG algorithm the *label* "iso-8859-1" is an alias
+for the windows-1252 *encoding*, but this module's `iso_8859_1` is the true,
+distinct ISO/IEC 8859-1 code page (pure Latin-1 identity high half), so
+Unicode.org is the correct normative source here instead. Driven by the same
+`normative_vectors.zig` / `normative_test.zig` pair (a second parser, since the
+column layout differs from the WHATWG files).
+
+The file's own header:
+
+    # 8859-1.TXT
+    # © 2015 Unicode®, Inc.
+    # For terms of use, see http://www.unicode.org/terms_of_use.html
+
+Under the Unicode License v3 (https://www.unicode.org/license.txt):
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of data files and any associated documentation (the "Data Files") ...
+    to deal in the Data Files ... without restriction ... provided that
+    either (a) this copyright and permission notice appear with all copies
+    of the Data Files ... or (b) this copyright and permission notice appear
+    in associated Documentation.
+
+Only conformance DATA is reproduced from either source — no WHATWG or
+Unicode.org source code is present in this module. The implementation under
+test (`decodeToUtf8`/`encodeFromUtf8`/the per-page tables in `root.zig`) is
+the authors' own (MIT), modeled after the WHATWG Encoding Standard's
+single-byte European subset as design reference (recorded in the root
+`NOTICE` §2), not copied from it.

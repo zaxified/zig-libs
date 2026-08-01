@@ -9,12 +9,15 @@ the read edge (decode → UTF-8) and the write edge (encode ← UTF-8).
 - **Platform:** any (pure logic, no OS calls). **Role:** codec.
   **Concurrency:** reentrant (no shared state — the tables are `const`).
 
-Provenance: original work of the zig-libs authors (MIT).
+Provenance: original work of the zig-libs authors (MIT) — no third-party
+source code. Tests are anchored against vendored third-party normative DATA
+(the WHATWG Encoding Standard's `index-*.txt` tables and Unicode.org's
+`8859-1.TXT`); see `modules/encoding/NOTICE` for the attribution that data
+carries.
 This is the WHATWG **single-byte European subset** — the deliberate, complete
 scope of this module (the legacy code pages a European broker / Excel export is
 realistically saved in). Broader coverage (other single-byte pages, multi-byte/
-CJK, UTF-16) is intentionally **out of scope**, not planned — see below. No
-third-party code.
+CJK, UTF-16) is intentionally **out of scope**, not planned — see below.
 
 ## Supported encodings
 
@@ -65,3 +68,8 @@ text should handle that at its own edge. Reopen only on a concrete requirement.
 ```
 zig build test-encoding
 ```
+
+Every high-table entry (128 bytes × 5 code pages = 640 byte/codepoint pairs)
+is cross-checked in both directions (decode and encode) against the vendored
+normative tables in `src/testdata/` — see `normative_test.zig` and
+`modules/encoding/NOTICE`.

@@ -1,6 +1,10 @@
 # encoding — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the
+transcoding logic itself is clean-room (root `NOTICE` §0 — no root entry needed for a
+clean-room spec implementation). The test suite additionally vendors third-party
+normative DATA (WHATWG `index-*.txt` tables + Unicode.org `8859-1.TXT`) to anchor every
+table entry; see `modules/encoding/NOTICE` and root `NOTICE` §1 for that attribution.
 
 ## Design & invariants
 Legacy single-byte code page ↔ UTF-8 transcoding for the five European code pages a legacy broker /
@@ -13,8 +17,11 @@ buffer. Each page's low half (0x00–0x7F) is ASCII and maps to itself, so struc
 runs only at the read edge (decode → UTF-8) and the write edge (encode ← UTF-8) — internal currency
 everywhere else is always UTF-8. Platform: any (pure logic, no OS calls). Role: codec. Concurrency:
 reentrant (tables are `const`, no shared state). Modeled after the WHATWG Encoding Standard's
-single-byte European subset; original work of the zig-libs authors — no third-party code, no NOTICE
-entry beyond the standard's public definitions.
+single-byte European subset; original work of the zig-libs authors — no third-party code ported.
+The five high-tables ARE anchored against vendored third-party normative DATA (WHATWG `index-*.txt`
+for windows-1250/1252 and iso-8859-2/15; Unicode.org `8859-1.TXT` for iso-8859-1, since WHATWG
+aliases the "iso-8859-1" *label* to the windows-1252 *encoding* and does not publish a separate
+index for the true ISO/IEC 8859-1 page) — see `modules/encoding/NOTICE`.
 
 ## Threat model / out of scope
 **Data-lenient — never traps.** On decode, an unmappable codepoint falls back to the verbatim
@@ -28,11 +35,15 @@ GBK/GB18030, Big5), and UTF-16. The `build(&overrides)` table pattern would gene
 no in-house need beyond the European subset; reopen only on a concrete requirement.
 
 ## Verification
-Tests cover: round-trip decode/encode for all five code pages across the full high-half table,
-ASCII-identity of the low half, alias parsing (case-insensitive + all listed aliases per page),
-lenient-fallback behavior on unmappable codepoints (encode → `'?'`) and unmappable bytes (decode →
-verbatim passthrough), and invalid/truncated UTF-8 passthrough on encode. Run: `zig build
-test-encoding`.
+Tests cover: exhaustive decode+encode cross-check of all five code pages' full 128-entry high
+tables against vendored EXTERNAL normative sources — not a self-round-trip of our own tables (see
+`normative_vectors.zig` / `normative_test.zig`, 640 byte/codepoint pairs total, plus a count
+assertion per page guarding against a silently-truncated re-vendor); ASCII-identity of the low
+half; alias parsing (case-insensitive + all listed aliases per page); lenient-fallback behavior on
+unmappable codepoints (encode → `'?'`) and unmappable bytes (decode → verbatim passthrough); and
+invalid/truncated UTF-8 passthrough on encode. All five normative sources define every one of their
+128 high-byte entries (zero holes) — verified, not assumed — so there is no genuinely-undefined-byte
+case to anchor for these five pages specifically. Run: `zig build test-encoding`.
 
 ## Backlog / deferred
 Per the 2026-07-09 extraction-scope note: broader/CJK coverage is explicitly out of scope, not

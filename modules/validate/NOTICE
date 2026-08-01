@@ -1,0 +1,83 @@
+validate — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test fixtures (JSON
+schema + test-case files).
+
+## json-schema-org/JSON-Schema-Test-Suite — `optional/format/`
+
+The `Rule.format` assertions (`email`, `uri`, `uri_reference`, `uuid`, `ipv4`,
+`ipv6`, `hostname`, `date`, `time`, `date_time`, `duration`, `json_pointer`)
+are anchored against the official corpus published at
+https://github.com/json-schema-org/JSON-Schema-Test-Suite, pinned at commit
+`be54236db6e8e6bb2e098ed16fb4c61e73f5a9ac` (2026-08, `tests/draft2020-12/`):
+
+  * vendored verbatim under `src/testdata/json-schema-test-suite/optional/format/`
+    (12 files — every `optional/format/*.json` file whose `format` value is
+    one this module implements)
+  * driven mechanically by `src/json_schema_format_vectors.zig` (one entry
+    per file, `@embedFile`d) and `src/json_schema_format_test.zig` (the
+    runner, both directions — `valid: true` must pass and `valid: false`
+    must be rejected)
+
+This module implements JSON Schema 2020-12's `format` VOCABULARY (a set of
+independent string-shape assertions), not the full JSON Schema document
+model (`type`/`properties`/`$ref`/`allOf`/etc. composition) — its `Rule`
+struct is this module's own vocabulary, only modeled after JSON Schema's
+keyword semantics (see root NOTICE §2 and root.zig's module doc). So only the
+`format`-keyword sub-corpus is in scope; the main per-keyword suite
+(`tests/draft2020-12/*.json`, outside `optional/`) tests a document model this
+module does not have and is not vendored.
+
+Not vendored, deliberately: `optional/format/idn-email.json`,
+`idn-hostname.json`, `iri.json`, `iri-reference.json`, `uri-template.json`,
+`relative-json-pointer.json`, `regex.json`, `ecmascript-regex.json`,
+`unknown.json` — formats this module's `Format` enum does not implement (see
+json_schema_format_vectors.zig's doc comment and the "vendored file count
+matches expectation" canary in json_schema_format_test.zig).
+
+Within the vendored files, `json_schema_format_test.zig`'s `group_skips` /
+`case_skips` name specific corpus material outside this module's documented
+subset (with a reason each, counted by a canary, never silently dropped):
+the "A-label (punycode) host names" group in `hostname.json` (IDNA/Unicode
+BIDI semantic validation, not RFC 1123 label shape); five `email.json` cases
+requiring a quoted-string local part or a domain address-literal (`isEmail`'s
+documented "practical RFC 5321 subset"); the `uri.json` authority-shape
+(userinfo/port) cases (`isUri`'s documented "not a full parser: component
+splitting and authority shape are out of scope"); and the `time.json` /
+`date-time.json` leap-second-outside-23:59 and offset-optional cases (both
+pre-existing, documented `isTime` design choices — see root.zig).
+
+The suite's own terms (`LICENSE` at the pinned commit):
+
+    Copyright (c) 2012 Julian Berman
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    THE SOFTWARE.
+
+Only test-fixture text is reproduced. The implementation under test
+(`validateFormat` and friends in `src/root.zig`) is the authors' own (MIT);
+its DESIGN reference (JSON Schema 2020-12 + the cited RFCs) is recorded in
+the repository NOTICE §2 as provenance, not as a condition.

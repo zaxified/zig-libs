@@ -54,7 +54,7 @@ beyond its own MIT license.
 
 Where a module ports third-party code, or reproduces third-party data whose
 notice must be preserved, that module carries its own `NOTICE` file next to its
-source, and the notice travels with the module. SEVEN modules do, and these are
+source, and the notice travels with the module. NINE modules do, and these are
 the ONLY files in the repository that carry a condition naming anyone other
 than the zig-libs authors. Each such file's first line says
 `<name> — third-party attribution`:
@@ -75,6 +75,13 @@ than the zig-libs authors. Each such file's first line says
              code)
   json5    — `modules/json5/NOTICE` (json5/json5-tests conformance corpus,
              MIT; test fixtures only, no source code)
+  encoding — `modules/encoding/NOTICE` (WHATWG Encoding Standard
+             `index-*.txt` normative tables, CC BY 4.0 / BSD-3-Clause, plus
+             Unicode.org `8859-1.TXT`, Unicode License v3; test data only,
+             no source code)
+  validate — `modules/validate/NOTICE` (json-schema-org/JSON-Schema-Test-Suite
+             `optional/format/` conformance corpus, MIT; test fixtures only,
+             no source code)
 
 New modules that reproduce third-party code OR third-party data whose notice
 must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`

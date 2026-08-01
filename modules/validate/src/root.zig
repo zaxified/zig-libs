@@ -919,21 +919,30 @@ fn isDateTime(s: []const u8) bool {
 }
 
 /// ISO 8601 duration per the RFC 3339 appendix-A grammar (what JSON Schema
-/// `duration` cites): `P` + date components in Y→M→D order and/or `T` +
-/// time components in H→M→S order, each at most once, at least one overall;
-/// or the exclusive week form `P<n>W`.
+/// `duration` cites): `P` + date components and/or `T` + time components, or
+/// the exclusive week form `P<n>W`. The grammar is not just "increasing
+/// order" — each section (`dur-year = N "Y" [dur-month]`, `dur-month = N "M"
+/// [dur-day]`; `dur-hour = N "H" [dur-minute]`, `dur-minute = N "M"
+/// [dur-second]`) only ever permits the immediately NEXT unit, so a
+/// component may START at any position (`Y`, `M`, or `D` alone are each a
+/// valid `dur-date`) but once started, subsequent components must be
+/// contiguous with no gaps: `P1Y2D` (year + day, no month) and `PT1H2S`
+/// (hour + second, no minute) are both invalid, not merely "out of order".
 fn isDuration(s: []const u8) bool {
     if (s.len < 3 or s[0] != 'P') return false;
     const body = s[1..];
     if (body[body.len - 1] == 'W') return allDigits(body[0 .. body.len - 1]);
     var i: usize = 0;
     var in_time = false;
-    var order: usize = 0; // strictly increasing index into "YMD" / "HMS"
+    // The unit index the NEXT component must land on, or null if this
+    // section (date/time) hasn't seen a component yet (any starting unit is
+    // allowed once, per the grammar's YM D / HMS chain each being optional).
+    var next: ?usize = null;
     var any = false;
     while (i < body.len) {
         if (!in_time and body[i] == 'T') {
             in_time = true;
-            order = 0;
+            next = null;
             i += 1;
             if (i == body.len) return false; // bare trailing 'T'
             continue;
@@ -943,8 +952,10 @@ fn isDuration(s: []const u8) bool {
         if (i == start or i == body.len) return false; // need digits + unit
         const units: []const u8 = if (in_time) "HMS" else "YMD";
         const pos = std.mem.indexOfScalar(u8, units, body[i]) orelse return false;
-        if (pos < order) return false; // out of order or repeated
-        order = pos + 1;
+        if (next) |want| {
+            if (pos != want) return false; // gap or repeat: not the immediate next unit
+        }
+        next = pos + 1;
         i += 1;
         any = true;
     }
@@ -3198,4 +3209,11 @@ fn fuzzValidateFormat(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
     for (0..len) |i| buf[i] = alphabet[smith.index(alphabet.len)];
     _ = validateFormat(format, buf[0..len]);
+}
+
+// ── external anchor: json-schema-org/JSON-Schema-Test-Suite (format) ───────
+// See json_schema_format_test.zig / json_schema_format_vectors.zig / NOTICE.
+test {
+    _ = @import("json_schema_format_vectors.zig");
+    _ = @import("json_schema_format_test.zig");
 }
