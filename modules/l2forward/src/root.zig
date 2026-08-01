@@ -730,6 +730,41 @@ test "deinit frees all nested membership + FDB maps (leak check via testing.allo
     // No explicit frees here: testing.allocator asserts no leak at deinit.
 }
 
+// External anchor (2026-08-01): a real Linux bridge, `bridge fdb show`.
+//
+// `Options.aging_ticks`'s default (300) is documented above as "the 802.1D
+// default ageing time is 300 seconds" — a claim read from the spec until now.
+// It was checked once against a REAL kernel bridge in a throwaway unprivileged
+// namespace (`unshare --user --net`, a plain 3-port `br0` over veth pairs, no
+// `-Z`/tcpdump involved — a Python `AF_PACKET` socket and `ip`/`bridge` did the
+// observing): `ip -d link show br0` reported `ageing_time 30000` — centiseconds,
+// i.e. exactly 300 s — confirming the constant this module ships is the real
+// 802.1D default, not merely the spec's stated one. Frozen here as a literal;
+// this test does not touch a socket or a namespace, it only pins the number.
+//
+// The same live bridge also confirmed, qualitatively (see SPEC.md — not
+// wired in as an automated assertion, because it is either not expressible in
+// this module's abstract {Isid, PeId, Mac, Time} terms, or genuinely
+// timing-dependent and therefore flake-prone, exactly the class of test this
+// audit was told to avoid):
+//   - learn-on-receipt: a frame's source MAC appeared in `bridge fdb show`
+//     against its ingress port immediately, before any forwarding decision;
+//   - flood-on-unknown-dst: a frame to an unlearned/broadcast destination
+//     reached every other port;
+//   - learned-unicast is NOT flooded: once a destination MAC was learned
+//     behind one port, a frame to it reached only that port, not the third;
+//   - age-out: with `ageing_time` lowered to 2 s, the dynamic entry vanished
+//     from `bridge fdb show` after the ageing window elapsed.
+// All four match this module's documented learn/flood/forward/tick semantics.
+test "external anchor: our default aging_ticks matches a live kernel bridge's default ageing_time" {
+    // Captured 2026-08-01: `ip -d link show br0` on a freshly created bridge
+    // (no explicit ageing_time set) reported `ageing_time 30000` (centiseconds).
+    const kernel_bridge_default_ageing_time_centiseconds: u64 = 30000;
+    const kernel_bridge_default_ageing_time_seconds = kernel_bridge_default_ageing_time_centiseconds / 100;
+    const default_options = Options{};
+    try testing.expectEqual(kernel_bridge_default_ageing_time_seconds, default_options.aging_ticks);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

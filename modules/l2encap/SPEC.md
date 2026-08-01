@@ -143,6 +143,63 @@ caller-buffer≡alloc equivalence; decode truncation-at-every-length,
 wrong-version, and reserved-bit rejection; and the `std.testing.fuzz` target.
 Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean.
 
+### External-anchor investigation: kernel VXLAN/Geneve capture (2026-08-01, refuted)
+
+An audit task asked whether the kernel's real VXLAN and Geneve encapsulation
+(created in a throwaway unprivileged `unshare --user --net` namespace, a veth
+pair as underlay so the frames are genuine off-the-wire traffic rather than a
+loopback-local shortcut, a static ARP entry to avoid resolution flakiness) could
+anchor this module's outer-header/VNI-placement/flags bytes against the kernel
+instead of against our reading of RFC 7348 / RFC 8926. It was actually run — a
+real `vxlan` interface (VNI 424242, i.e. `0x067932`) and a real `geneve`
+interface (same VNI) were built and a frame captured off each via a plain
+`AF_PACKET` socket (no `tcpdump`, so no `-Z` risk) — and it disproves its own
+premise: **this module's 8-byte header is not VXLAN or Geneve on the wire**, so
+there is nothing shared to anchor.
+
+The real kernel bytes captured, decoded field-by-field:
+
+```
+VXLAN  (dst UDP 4789): 08 00 00 00 06 79 32 00
+                        ^^ flags(I=1)  ^^^^^^ VNI=0x067932  ^^ reserved
+                        byte0          bytes4-6            byte7
+Geneve (dst UDP 6081): 00 00 65 58 06 79 32 00
+                        ^^ ^^ ver/opt  ^^^^^ ^^^^^^ VNI=0x067932  ^^ reserved
+                        |  proto-type=0x6558 (transparent Ethernet bridging)
+                        ver=0,optlen=0
+```
+
+versus this module's own header (`writeHeader`, `src/root.zig`):
+
+```
+l2encap: 01 01 0A BB CC 40 12 34
+         ^^ version  ^^^^^^^^ I-SID (bytes 2-4)  ^^ TTL  ^^^^^ ingress-PE (6-7)
+            ^^ flags (byte 1, bum bit)
+```
+
+Both real encapsulations put the 24-bit VNI at **bytes 4‥6**, confirming the
+"Model-after" table's claim that the 24-bit tenant-scope width is the real VXLAN
+VNI / Geneve VNI convention (both, independently, big-endian) — that part of the
+provenance claim is now kernel-verified, not merely RFC-read. But `l2encap`
+carries the same-width **I-SID at bytes 2‥4**, has a **version byte** neither
+protocol has, and has **no counterpart at all** for VXLAN's flags byte, Geneve's
+ver/optlen/protocol-type bytes, or its own TTL/ingress-PE bytes in either real
+protocol. Byte-for-byte, `l2encap` frames are not parseable by a VXLAN or Geneve
+decoder and vice versa — exactly what the module doc comment and this SPEC's
+design section already say ("that single omission is the whole 'lean over-WG'
+claim"; no payload-length field; WireGuard replaces backbone MAC addressing).
+
+Consequently no golden test was added here: a "golden" built from real VXLAN/
+Geneve bytes would assert nothing about `encode`/`decode`, which never produce
+or consume that wire format — the mandate is to assert real content against
+code under test, not to freeze an unrelated protocol's bytes next to code that
+doesn't speak it. The genuine, narrower fact this capture *does* establish
+(24-bit VNI at a fixed offset, big-endian, in both real sibling protocols) is
+recorded above as design-provenance confirmation, not as a code anchor. No
+`/NOTICE` entry: this was a black-box run of the kernel's own network stack —
+observed behavior only, no source or design consulted beyond the two RFCs
+already cited (root `NOTICE` §0).
+
 ## Backlog / deferred
 
 No Fable-tier piece was needed: the header is a clean-room layout from published

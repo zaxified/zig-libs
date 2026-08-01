@@ -167,6 +167,61 @@ split-horizon (so a regression there goes red); and a `testing.allocator` leak
 check that `deinit` frees every nested membership + FDB map. `zig fmt --check`
 clean; `zig build check-catalog` green.
 
+### External-anchor investigation: a real Linux bridge FDB (2026-08-01, partly)
+
+An audit task asked whether a real Linux bridge's FDB, observed in a namespace,
+could anchor this module's MAC-learning/ageing/flooding semantics against the
+kernel instead of against our reading of 802.1D. **This module never touches a
+real interface or a raw frame** — `Table` operates on abstract `{Isid, PeId,
+Mac, Time}` values the caller already parsed, so there is no wire format or
+socket for a kernel bridge to share with it; the literal request ("capture what
+the kernel's FDB does... and freeze those observations") cannot become a golden
+byte test the way `l2encap`'s frames might have. What the live kernel *can*
+validate is whether this module's documented semantic model — learn on receipt,
+flood unknown, age out — actually matches a conformant 802.1D device, which is a
+design-fidelity check, not a wire anchor.
+
+That check was run: a 3-port bridge (`br0` + 3 veth pairs, one port used to
+inject/observe each side) in an unprivileged `unshare --user --net` namespace
+(no `tcpdump`/`-Z`; a small `AF_PACKET` Python script sent/observed raw frames).
+Findings, with the exact commands/output:
+
+- **The real kernel default `ageing_time` is 300 s** — `ip -d link show br0`
+  (freshly created, nothing configured) reported `ageing_time 30000`
+  (centiseconds). This is a genuine, freezable numeric fact and is now a golden
+  test (`external anchor: our default aging_ticks matches...`, `src/root.zig`):
+  `Options{}.aging_ticks == 300` is pinned against this real, live-captured
+  kernel default, not merely against the 802.1D document.
+- **Learn-on-receipt.** A crafted frame (`src=02:00:00:00:00:01`, broadcast
+  dst) sent into port `veth1a` immediately produced, in `bridge fdb show br0`:
+  `02:00:00:00:00:01 dev veth1a master br0` — learned before any forwarding
+  decision, matching `learn`'s contract.
+- **Flood on unknown/broadcast destination.** The same broadcast frame was
+  observed (via raw sockets) arriving at *both* other ports (`veth2b` and
+  `veth3b`) — matching `forward`'s BUM → flood-to-all-members-minus-source path.
+- **Learned unicast is not flooded.** After also learning
+  `02:00:00:00:00:02` behind the second port, a frame from the first port
+  addressed to that MAC arrived *only* at the port it was learned behind
+  (`veth2b`), not the third (`veth3b`) — matching known-unicast's single-PE
+  `Decision.unicast`, distinct from flood.
+- **Age-out.** With `ageing_time` lowered to `200` (2 s, for a practical test
+  window — the *default* 300 s was confirmed separately above, not used for
+  this timed part), the learned entry present in `bridge fdb show` right after
+  learning was gone from `bridge fdb show` after waiting past the window —
+  matching `tick`'s reclaim-after-expiry contract.
+
+All four match this module's documented contract exactly; **no disagreement
+was found**. None of the three behavioral findings (learn/flood/age-out) is
+wired into the automated suite: `learn`/`flood` have no real-frame counterpart
+in this module to assert against (there is nothing here that consumes a MAC
+learned from an actual received Ethernet frame — the caller already extracts
+`src_mac` before calling `learn`), and the age-out timing is real-wall-clock and
+therefore exactly the kind of flaky, non-reproducible assertion this audit was
+told to avoid pinning byte-for-byte. Only the one genuinely freezable number
+(the 300 s default) was promoted to an automated, offline, kernel-anchored test.
+No `/NOTICE` entry: black-box kernel behavior only, no source or design
+consulted (root `NOTICE` §0).
+
 ## Status
 
 `gap · any · util · single_owner` · deps: none (std only) — canonical source is

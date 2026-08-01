@@ -121,3 +121,67 @@ test "nowTimestamp returns a plausible post-2020 instant" {
     // 2020-01-01T00:00:00Z in ms; guards against a zeroed/failed clock read.
     try std.testing.expect(now.unix_ms > 1_577_836_800_000);
 }
+
+// External anchor (2026-08-01): a real rsyslogd, both transports.
+//
+// This exact message was sent for real — via this module's own `UdpEmitter`
+// and `TcpEmitter`, not hand-crafted bytes — to a real `rsyslogd 8.2512.0`
+// listening on UDP and TCP (RFC 6587 octet-counted) in a throwaway
+// unprivileged namespace, and rsyslogd's own independent RFC 5424 parser
+// re-rendered every field back correctly on BOTH transports:
+//
+//   RCVD facility=local3 severity=warning pri=156
+//     timereported=[2026-07-09T13:34:56.123+01:00] hostname=[probe-host]
+//     appname=[live-probe] procid=[4242] msgid=[ORACLE]
+//     structured-data=[[exampleSDID@32473 iut="3" eventSource="Application"
+//     eventID="1011"]]
+//     msg=[live rsyslogd oracle probe: quotes " backslash \ bracket ] end]
+//     protocol=imudp
+//   (byte-identical second line, protocol=imtcp)
+//
+// `timereported` is rsyslogd's own parse of our RFC 3339 TIMESTAMP field
+// (distinct from `timegenerated`, the local receipt clock) — so the
+// +01:00-shifted, millisecond-precision instant, the PRI arithmetic
+// (local3*8+warning = 19*8+4 = 156), the SD element/param syntax (validating
+// our escaping didn't corrupt real SD grammar), and the free-text MSG
+// containing raw `"`, `\`, `]` bytes all round-tripped through an independent,
+// non-`libc`, non-zig-libs parser. This is the frozen wire line that produced
+// that result — a true external anchor (see SPEC.md for the full
+// investigation, the AppArmor workaround needed to run rsyslogd unprivileged,
+// and why this is pinned as a literal rather than re-run live).
+test "external anchor: message live-verified by a real rsyslogd (UDP + TCP octet-counted)" {
+    const msg = Message{
+        .facility = .local3,
+        .severity = .warning,
+        .timestamp = .{ .unix_ms = 1783600496123, .offset_minutes = 60 },
+        .hostname = "probe-host",
+        .app_name = "live-probe",
+        .procid = "4242",
+        .msgid = "ORACLE",
+        .structured_data = &.{.{
+            .id = "exampleSDID@32473",
+            .params = &.{
+                .{ .name = "iut", .value = "3" },
+                .{ .name = "eventSource", .value = "Application" },
+                .{ .name = "eventID", .value = "1011" },
+            },
+        }},
+        .msg = "live rsyslogd oracle probe: quotes \" backslash \\ bracket ] end",
+    };
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "<156>1 2026-07-09T13:34:56.123+01:00 probe-host live-probe 4242 ORACLE " ++
+            "[exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] " ++
+            "live rsyslogd oracle probe: quotes \" backslash \\ bracket ] end",
+        try bufPrint(&msg, &buf),
+    );
+
+    // The same bytes, RFC 6587 octet-counted — the exact frame `TcpEmitter`
+    // put on the wire to rsyslogd's `imtcp` listener.
+    const wire = try bufPrint(&msg, &buf);
+    var framed_buf: [600]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&framed_buf);
+    try writeOctetCounted(&w, wire);
+    try std.testing.expectEqualStrings("202 ", w.buffered()[0..4]);
+    try std.testing.expectEqual(@as(usize, 202), wire.len);
+}
