@@ -538,6 +538,74 @@ test "pagination: empty opts yields no links" {
     try testing.expectEqual(@as(usize, 0), pagination(&slots, .{}).len);
 }
 
+// ── RFC 8288 §3.5 worked examples (external anchor) ─────────────────────────
+//
+// The header values below are reconstructed byte-for-byte from RFC 8288
+// §3.5's own "Link:" examples (fetched from rfc-editor.org, not recalled from
+// memory) — only the document's print line-wrapping is undone (each was one
+// logical field value, wrapped for page width). The expected `rel`/`title`
+// readings are the RFC's own stated interpretation of each example, not this
+// module's. The errata list for RFC 8288 was checked: the two verified errata
+// (5319: §1.1 LOALPHA cross-reference; 5878: §B.2 var-name typo) and the two
+// reported-not-verified ones (5168/5169: capitalization in §B.3/§B.4) all
+// concern grammar/pseudocode prose elsewhere in the document, not §3.5's
+// examples or the Link-header grammar itself, so none of them touch these
+// fixtures.
+//
+// One further §3.5 example is deliberately NOT used: the `title*=UTF-8'de'...`
+// RFC 8187 extended-notation title. This module does not implement extended
+// (`*`-suffixed) parameter notation — see SPEC.md's "Threat model / out of
+// scope" — so `title*` is correctly treated as an unrecognized param name
+// distinct from `title` and dropped; that's already covered generically by
+// the "unknown params ignored" test below and isn't a *-notation anchor.
+
+test "RFC 8288 §3.5: chapter2 previous-chapter example" {
+    var it = parse("<http://example.com/TheBook/chapter2>; rel=\"previous\"; title=\"previous chapter\"");
+    const l = it.next().?;
+    try testing.expectEqualStrings("http://example.com/TheBook/chapter2", l.uri);
+    try testing.expectEqualStrings("previous", l.rel);
+    try testing.expectEqualStrings("previous chapter", l.title.?);
+    try testing.expect(it.next() == null);
+}
+
+test "RFC 8288 §3.5: extension relation type expressed as a full URI" {
+    var it = parse("</>; rel=\"http://example.net/foo\"");
+    const l = it.next().?;
+    try testing.expectEqualStrings("/", l.uri);
+    try testing.expectEqualStrings("http://example.net/foo", l.rel);
+    try testing.expect(it.next() == null);
+}
+
+test "RFC 8288 §3.5: an unmodeled param (anchor) is tolerated without desync" {
+    // `anchor` is not in this module's modeled param set (rel/title/type/
+    // hreflang; see SPEC.md) — it must be skipped harmlessly and `rel` must
+    // still come through, exactly the RFC's own copyright-terms example.
+    var it = parse("</terms>; rel=\"copyright\"; anchor=\"#foo\"");
+    const l = it.next().?;
+    try testing.expectEqualStrings("/terms", l.uri);
+    try testing.expectEqualStrings("copyright", l.rel);
+    try testing.expect(it.next() == null);
+}
+
+test "RFC 8288 §3.5: one link value can carry multiple relation types" {
+    var it = parse("<http://example.org/>; rel=\"start http://example.net/relation/other\"");
+    const l = it.next().?;
+    try testing.expectEqualStrings("http://example.org/", l.uri);
+    try testing.expectEqualStrings("start http://example.net/relation/other", l.rel);
+    try testing.expect(it.next() == null);
+}
+
+test "RFC 8288 §3.5: a comma-joined value carries two links, same as two header lines" {
+    var it = parse("<https://example.org/>; rel=\"start\", <https://example.org/index>; rel=\"index\"");
+    const a = it.next().?;
+    try testing.expectEqualStrings("https://example.org/", a.uri);
+    try testing.expectEqualStrings("start", a.rel);
+    const b = it.next().?;
+    try testing.expectEqualStrings("https://example.org/index", b.uri);
+    try testing.expectEqualStrings("index", b.rel);
+    try testing.expect(it.next() == null);
+}
+
 // ── fuzz: untrusted `Link` header parsing never panics ──────────────────────
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {

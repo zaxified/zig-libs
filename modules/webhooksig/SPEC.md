@@ -38,6 +38,18 @@ An HMAC-SHA256 known-answer check, sign→verify round-trip and GitHub-style
 (old+new secret) acceptance, tamper negatives (wrong secret, mutated body → reject). There is no
 Stripe-format test — no Stripe parsing exists to test (see above). Run: `zig build test-webhooksig`.
 
+**External anchor, and one refuted.** RFC 4231 (HMAC-SHA-2 test vectors) was evaluated and
+deliberately **not** adopted: this module's `Hmac` is `std.crypto.auth.hmac.sha2.HmacSha256` used
+directly, so RFC 4231 anchors a primitive already covered by Zig std's own test suite, not this
+module's contribution — adding it would test std.crypto through a pass-through, not this code. The
+module's actual contribution — the `sha256=<hex>` framing (`computeHex`'s hex formatting,
+`sign`/`verify`'s prefix handling) — has a real anchor instead: GitHub's own webhook-validation docs
+publish a canonical secret/payload/signature triple (`secret = "It's a Secret to Everybody"`,
+`body = "Hello, World!"`, `sha256=757107ea0eb2...`) explicitly so third-party implementations can
+self-check against it; independently re-verified here with `openssl dgst -sha256 -hmac` before
+adoption. Recorded as a provenance note in the root NOTICE §2 entry (a short factual test-oracle
+triple, not a vendored corpus — no dedicated `modules/webhooksig/NOTICE` file).
+
 ## Backlog / deferred
 Stripe's `t=…,v1=…` header format and its `timestamp.body` MAC construction (not implemented — see
 above); a base64 signature encoding (only lowercase hex exists today); beyond that, the documented

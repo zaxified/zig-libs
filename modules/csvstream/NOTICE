@@ -1,0 +1,51 @@
+csvstream — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test fixtures (plain
+CSV + JSON data files).
+
+## maxogden/csv-spectrum — CSV parsing acid-test corpus
+
+The conformance tests reproduce the full corpus published at
+https://github.com/maxogden/csv-spectrum, pinned at commit
+`d30e80f8b99d2eecb3778f1d7b9ed1cb425502ec` (tag `2.0.0`, 2024-07-04):
+
+  * vendored verbatim under `src/testdata/csv-spectrum/` (12 `csvs/*.csv` +
+    12 `json/*.json` fixture pairs, matched by basename per the corpus's own
+    `index.js`)
+  * driven mechanically by `src/csv_spectrum_vectors.zig` (one entry per
+    pair, `@embedFile`d) and `src/csv_spectrum_test.zig` (the runner, which
+    compares this module's parse of each `.csv` against its paired `.json` —
+    never against this module's own prior output)
+
+Excluded from vendoring, deliberately: the repository's own `.git/`,
+`readme.md`, `index.js`, `test.js`, `package.json`/`package-lock.json`
+metadata (none of it is test-fixture data).
+
+The package declares its license as BSD-2-Clause in `package.json` (`"license":
+"BSD-2-Clause"`); the repository carries no separate `LICENSE` file at the
+pinned commit (confirmed via `git log --all -- LICENSE LICENSE.md
+LICENSE.txt`, which returns nothing), so there is no license TEXT to reproduce
+beyond that declaration and the author attribution below:
+
+  csv-spectrum
+  Copyright (c) max ogden
+  https://github.com/maxogden/csv-spectrum
+  License: BSD-2-Clause (as declared in package.json)
+
+Only test-fixture text is reproduced. The implementation under test
+(`LineIterator`/`splitFields` in `src/line.zig`) is the authors' own (MIT);
+its DESIGN reference (RFC 4180) needs no entry per root `NOTICE` §0 (a public
+spec is not itself a copyrightable work), and this codec's own README
+"Provenance" note already says clean-room. Four of the corpus's 12 fixtures
+are out of this module's documented scope (see `csv_spectrum_vectors.zig` for
+the reason each is excluded) and are not asserted against, though they are
+still counted and still driven through the parser to confirm it does not
+crash on them.

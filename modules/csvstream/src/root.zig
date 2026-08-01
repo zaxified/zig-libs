@@ -115,3 +115,10 @@ test {
     _ = header;
     _ = coerce;
 }
+
+// ── external anchor: maxogden/csv-spectrum corpus ───────────────────────────
+// See csv_spectrum_test.zig / csv_spectrum_vectors.zig / NOTICE.
+test {
+    _ = @import("csv_spectrum_vectors.zig");
+    _ = @import("csv_spectrum_test.zig");
+}

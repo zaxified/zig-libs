@@ -1,7 +1,10 @@
 # csvstream — spec
 
 Streaming RFC 4180 CSV reader that preserves byte offsets. Usage: see ./README.md.
-Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Attribution/provenance: the codec itself is clean-room original work (root `NOTICE` §0 — no
+entry needed for that). The conformance test suite separately vendors the third-party
+`maxogden/csv-spectrum` fixture corpus (test data only) — see this module's own `NOTICE`,
+listed in root `NOTICE` §1.
 
 ## Design & invariants
 - **Two layers, one record model:** both emit `LineSlice { bytes, byte_offset, unbalanced_quote }`.
@@ -59,6 +62,14 @@ two positive controls that would fail if quoting/escaping were wrong) plus a fil
 `coerce.zig` covers `parseInt`/`parseFloat`/`parseBool` valid + invalid inputs. `root.zig` is a
 dark-tests aggregator (`test { _ = line; _ = stream; _ = writer; _ = header; _ = coerce; }`) so all
 submodules' tests run under a bare re-export.
+
+`csv_spectrum_test.zig` + `csv_spectrum_vectors.zig` drive the vendored `maxogden/csv-spectrum`
+corpus (12 fixtures) through `LineIterator`/`splitFields`, comparing field-by-field against the
+corpus's own expected JSON (never against this module's own output) via an explicit
+header→value adapter (built on `Header`, header.zig). A count canary (12 vendored / 4 out-of-scope)
+fails loudly if the corpus is re-vendored without re-classifying a case. 8 fixtures are in scope and
+assert equality; 4 are out of scope (still driven through the parser to prove no crash, but not
+asserted) — see csv_spectrum_vectors.zig for the reason each is excluded.
 
 ## Backlog / deferred
 From README "Deferred (not implemented in v1)", now trimmed to what's still actually deferred:

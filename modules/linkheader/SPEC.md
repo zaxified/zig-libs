@@ -41,6 +41,17 @@ first-occurrence-wins, case-insensitive names, malformed-segments-skipped, empty
 unterminated `<`. A build→parse round-trip, and `find`/`pagination` coverage (incl. a rel-list
 token match). Run: `zig build test-linkheader`.
 
+**External anchor:** five fixtures are transcribed byte-for-byte from RFC 8288 §3.5's own worked
+`Link:` examples (fetched from rfc-editor.org, not recalled from memory), with expected `rel`/`title`
+readings taken from the RFC's own prose — the previous-chapter example, an extension relation
+expressed as a full URI, an unmodeled `anchor` param tolerated without desync, a multi-relation-type
+`rel` list, and the comma-joined-equals-two-header-lines equivalence. The RFC 8288 errata list was
+checked (2026-08-01): none of the four errata (5319, 5878, 5168, 5169) touch §3, §3.3, §3.4 or §3.5,
+so none affect these fixtures. One further §3.5 example — the `title*=UTF-8'de'...` RFC 8187
+extended-notation title — is out of scope and not used, since this module does not implement
+extended (`*`-suffixed) parameter notation (see "Threat model / out of scope" above). Public-spec test
+data under NOTICE policy §0 — needs no attribution entry.
+
 ## Backlog / deferred
 
 None recorded — no deferred-gap note found (only a build-history mention among the

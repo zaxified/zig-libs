@@ -416,15 +416,51 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     _ = verifyWithPrefix("sha256=", secret, body, presented);
 }
 
-test "computeHex is lowercase hex and matches the GitHub HMAC-SHA256 test vector shape" {
-    // Known RFC-style vector: HMAC-SHA256(key="key", msg="The quick brown
-    // fox jumps over the lazy dog") = f7bc83f430538424b13298e6aa6fb143
-    // ef4d59a14946175997479dbc2d1a3cd8.
+test "computeHex is lowercase hex and matches a well-known HMAC-SHA256 demo vector" {
+    // NOT an RFC 4231 vector (RFC 4231's HMAC-SHA256 keys/data are the
+    // 0x0b*20/"Jefe"/0xaa*20/... test cases) — this key="key" /
+    // "The quick brown fox jumps over the lazy dog" pairing is a widely
+    // circulated illustrative HMAC-SHA256 example (previously mislabeled
+    // here as "RFC-style"); numerically re-verified against `openssl dgst
+    // -sha256 -hmac`. See the RFC 4231 / GitHub-docs anchor discussion below
+    // for what this module's own external anchor actually is.
     const hex = computeHex("key", "The quick brown fox jumps over the lazy dog");
     try testing.expectEqualStrings(
         "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
         &hex,
     );
+}
+
+// ── external anchor: RFC 4231 refuted, GitHub's own published vector adopted ─
+//
+// RFC 4231 (HMAC-SHA-224/256/384/512 test vectors) anchors the bare HMAC-
+// SHA256 PRIMITIVE — but this module's `Hmac` is `std.crypto.auth.hmac.
+// sha2.HmacSha256` used directly (see the type alias above); the primitive
+// is already anchored upstream, in Zig std's own test suite. Feeding RFC
+// 4231's key/data pairs through `computeHex` would just re-verify
+// std.crypto's HMAC through a one-line pass-through, i.e. testing someone
+// else's code, not this module's contribution — so those vectors are
+// deliberately NOT adopted here.
+//
+// This module's own contribution is the `sha256=<hex>` GitHub-style webhook
+// FRAMING on top (computeHex's hex formatting + sign/verify's prefix
+// handling) — RFC 4231 says nothing about that framing. A real external
+// anchor for it does exist: GitHub's own webhook-validation docs
+// (https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
+// publish a canonical secret/payload/signature triple specifically so a
+// third-party implementation can self-check against it. Independently
+// reproduced here with `openssl dgst -sha256 -hmac "It's a Secret to
+// Everybody"` over the literal bytes "Hello, World!", which reproduces
+// GitHub's published "sha256=757107ea0eb2..." value exactly — this is the
+// module's real framing-level anchor, not RFC 4231.
+test "GitHub docs' published canonical webhook signature (framing anchor, not RFC 4231)" {
+    const secret = "It's a Secret to Everybody";
+    const body = "Hello, World!";
+    const want = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+
+    var buf: [signatureBufLen(default_prefix)]u8 = undefined;
+    try testing.expectEqualStrings(want, sign(secret, body, &buf));
+    try testing.expect(verify(secret, body, want));
 }
 
 test "custom prefix (empty / non-default) signs and verifies" {

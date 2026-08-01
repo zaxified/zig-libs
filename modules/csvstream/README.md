@@ -13,6 +13,8 @@ memory** — peak is the chunk size, not the file size.
 Provenance: original work of the zig-libs authors (MIT). Two layers — an
 in-memory `LineIterator`/`splitFields` core (pinned by dedicated oracle tests) and a
 record-aligned `ChunkReader` — composed by `StreamReader`. No third-party code.
+The conformance test suite additionally vendors the `maxogden/csv-spectrum`
+acid-test fixture corpus (test data only, no source code) — see NOTICE.
 
 ## Two layers, one record model
 
@@ -135,6 +137,14 @@ capture/lookup/arity), and `coerce.zig` (typed parsing). `root.zig` carries a
 dark-tests aggregator (`test { _ = line; _ = stream; _ = writer; _ = header; _ =
 coerce; }`) so all submodules' tests run — a bare re-export would not pull them
 in.
+
+External anchor: `csv_spectrum_test.zig` drives `LineIterator`/`splitFields`
+through the vendored `maxogden/csv-spectrum` acid-test corpus
+(`csv_spectrum_vectors.zig`), comparing against the corpus's own expected JSON
+— 8 of 12 fixtures are in documented scope; 4 are out of scope (3 test
+multi-line quoted fields, which this module deliberately does not support —
+see "Quoting semantics" above — and 1 has an internally inconsistent
+fixture pair). See NOTICE for provenance.
 
 ## Deferred (not implemented)
 
