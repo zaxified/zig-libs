@@ -76,15 +76,15 @@ l2encap	A	SELF	golden byte-layout KAT hand-authored from spec layouts; SPEC.md: 
 l2forward	A	SELF	FDB/split-horizon decisions per 802.1D/EVPN; SPEC.md: offline logic only, no live-interop	DONE	-	DONE a58d626: aging default pinned to live kernel bridge 300s; rest is timing-dependent
 mcp-http	A	SELF	own self-contained HTTP/SSE tests; Dart/mcp_dart parity is a prose claim, no captured bytes	CLI:mcp_dart (Dart pub package, the existing behavioral reference)	M	write live HTTP/SSE interop harness against mcp_dart instead of prose parity claim
 mqtt	A	SELF	golden bytes are hand-authored (KAT) per OASIS spec text, no captured broker session	DAEMON:mosquitto	M	every packet golden hand-authored; SPEC.md says mosquitto is a behaviour ref only
-saml	A	MIXED	core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips	CLI:xmlsec1	M	XSW/HoK already anchored; only the encrypted sub-path is self-composed
+saml	A	MIXED	core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips	DONE	-	DONE 9f9d238: genuine xmlsec1 EncryptedAssertion over the already-anchored signed one
 staticfiles	A	SELF	hand-authored fixtures only, no real client/browser interop test exists	CLI:nginx (or Apache) side-by-side comparison via curl	M	stand up nginx on the same fixture tree, diff Range/ETag/conditional-GET responses
 syslog	A	SELF	hand-authored fixtures/round-trip only; live UDP path always SkipZigTest	DONE	-	DONE a58d626: real rsyslogd receives+re-renders both transports; MSG escaping bug class
 tracecontext	A	SELF	8 offline hand-authored tests; one traceparent value copied from spec text	DONE	-	DONE e269090: 73 W3C vectors; found MUST-not-parse-tracestate bug; 1 gap logged
 uci	A	SELF	golden_network fixture hand-authored, not captured from real OpenWrt config	CLI:openwrt/uci + libubox (build from source)	M	build the real uci binary to capture actual `uci show`/`export` output for goldens
 wireguard	A	MIXED	KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDERIVED(Python); netlink codec SELF, root kernel test skips	DONE	-	DONE be61caa: real kernel SET/GET_DEVICE netlink frozen; closes the last self-RT layer
 xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used	DONE	-	DONE 6cc02e8: 130 xmlconf cases, FIVE real bugs; xmltest excluded on licence grounds
-xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip	CLI:xmlsec1	M	verify() fixture self-constructed; C14N already externally anchored
-xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only	CLI:xmlsec1	M	no real external EncryptedAssertion fixture was available
+xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip	DONE	-	DONE 9f9d238: xmlsec1 + signxml, two independent oracles; enveloping + ECDSA + tamper
+xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only	DONE	-	DONE 9f9d238: real xmlsec1 EncryptedData incl. xenc11 omitted-MGF default path
 acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed	DONE	-	DONE b830ef5: openssl-built TLS-ALPN-01 extension; provenance, not extra detection
 bitcointx	A	MIXED	BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector	DONE	-	DONE 4523b96: 7 -> 290 Core sighash.json rows, attribution added
 bls12_381	B	MIXED	IETF draft/py_ecc byte-exact KATs; KeyGen deliberately NOT KAT-verified, self round-trip only	NONE	-	VERIFIED: we do BLS-draft KeyGen, EIP-2333 is a DIFFERENT algorithm; no KAT exists (draft-07 App.B = TBA)
