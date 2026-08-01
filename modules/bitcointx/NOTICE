@@ -1,0 +1,41 @@
+bitcointx — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test vectors.
+
+## Bitcoin Core `sighash.json`
+
+`src/legacy_kat_vectors.zig` reproduces the official legacy (pre-segwit)
+`SignatureHash()` reference-oracle corpus published by the Bitcoin Core
+project at `src/test/data/sighash.json` (fetched 2026-08 from `master`).
+Every row is included except those whose `script` field contains byte `0xab`
+(`OP_CODESEPARATOR`, out of scope — see `sighash_legacy.zig`'s module doc
+comment): 290 of the 500 rows pass that mechanical, row-content-based filter
+and are vendored, unfiltered further. Each row's `raw_transaction` / `script`
+/ `input_index` / `hashType` / `signature_hash` is transcribed by script,
+never hand-typed.
+
+  Copyright (c) 2009-2010 Satoshi Nakamoto
+  Copyright (c) 2009-present The Bitcoin Core developers
+  Distributed under the MIT software license, see
+  https://opensource.org/licenses/MIT
+
+No Bitcoin Core C++ source is present in this module. The legacy sighash
+algorithm itself is clean-room from Bitcoin Core's documented reference
+behavior (there is no BIP for it — see `sighash_legacy.zig`'s module doc
+comment and `SPEC.md`'s "Verification" section). What is reproduced here, and
+only here, is conformance DATA — which is precisely why the notice lives
+beside it.
+
+This module's BIP143/BIP341 signature-hashing tests are anchored against
+public BIP/spec-published examples (`bip-0143.mediawiki`, `bip-0341/
+wallet-test-vectors.json`), which are not third-party CODE or DATA in the
+sense this file exists to flag — see the root `NOTICE` §2 for that design
+reference instead.

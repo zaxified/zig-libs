@@ -28,3 +28,33 @@ test "legacy sighash: byte-exact against every sighash.json vector (ALL/NONE/SIN
         };
     }
 }
+
+test "teeth: corrupting one byte of a vector's expected sighash makes the byte-exact comparison fail" {
+    // Proves this KAT can actually detect a wrong answer, not just echo
+    // whatever bytes `sighash` computes (a degenerate oracle would pass no
+    // matter what). Mirrors the manual demonstration performed against the
+    // vendored fixture file itself (flip one byte, confirm RED, restore,
+    // confirm md5 matches the original) -- this is the permanent, automated
+    // version of that same check, run against an in-memory copy so it never
+    // needs the fixture file to be (even transiently) wrong on disk.
+    const allocator = testing.allocator;
+    const v = vectors.vectors[0];
+    const raw = try testutil.hexToBytesAlloc(allocator, v.raw_tx_hex);
+    defer allocator.free(raw);
+    const script_code = try testutil.hexToBytesAlloc(allocator, v.script_code_hex);
+    defer allocator.free(script_code);
+
+    var t = try tx.deserialize(allocator, raw);
+    defer t.deinit(allocator);
+    const got = try legacy.sighash(allocator, t, v.input_index, script_code, v.hash_type);
+
+    // Control: the real recorded expectation matches (guards against the
+    // corruption step below being silently skipped).
+    var want = testutil.hexToArray(32, v.expected_sighash_hex);
+    try testing.expectEqualSlices(u8, &want, &got);
+
+    // Flip one byte of a LOCAL copy of the expectation and confirm the
+    // comparison now fails closed.
+    want[31] ^= 0x01;
+    try testing.expect(!std.mem.eql(u8, &want, &got));
+}

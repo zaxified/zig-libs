@@ -90,11 +90,12 @@ transcription/byte-order pitfall before it ever reached this module's Zig tests 
 this caught" below).
 
 - **Legacy sighash** — `bitcoin/bitcoin`'s own `src/test/data/sighash.json` (the reference-oracle
-  fixture `SignatureHash()` is checked against upstream): 7 rows, one per
-  `{ALL, NONE, SINGLE, unrecognized-low-5-bits} × {plain, ANYONECANPAY}`-ish coverage (all 3 named
-  base types × both ANYONECANPAY states, plus one row whose low-5-bit hashType isn't 1/2/3 at all,
-  proving the "falls back to ALL-like" classification), pre-filtered to exclude any row whose
-  `script` contains byte `0xab` (would need the deferred `FindAndDelete` step — see above).
+  fixture `SignatureHash()` is checked against upstream): 290 of the file's 500 rows, every one
+  that doesn't need the deferred `FindAndDelete` step (a mechanical, row-content-based filter —
+  any row whose `script` contains byte `0xab` is excluded, not a hand-picked subset), covering all
+  3 named base types (`ALL`/`NONE`/`SINGLE`) × both `ANYONECANPAY` states plus many rows whose
+  low-5-bit hashType isn't 1/2/3 at all (the "falls back to ALL-like" classification). See
+  `modules/bitcointx/NOTICE` for the required Bitcoin Core attribution this data carries.
 - **BIP143** — `bip-0143.mediawiki`'s own two published "Example" cases (Native P2WPKH,
   P2SH-P2WPKH): `hashPrevouts`/`hashSequence`/`hashOutputs` AND the full preimage AND the final
   sighash, all four asserted byte-exact per case.
