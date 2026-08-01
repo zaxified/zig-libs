@@ -1,0 +1,61 @@
+json5 — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test fixtures (small
+JSON5/JSON/JS/text files whose file extension IS the expected verdict).
+
+## json5/json5-tests — Parse Test Cases for JSON5
+
+The conformance tests reproduce a subset of the official corpus published at
+https://github.com/json5/json5-tests, pinned at commit
+`ceb24d4080137d70833f86c25659c1331b80a387` (2026-02-19):
+
+  * vendored verbatim under `src/testdata/json5-tests/` (112 fixture files:
+    `arrays/`, `comments/`, `misc/`, `new-lines/`, `numbers/`, `objects/`,
+    `strings/`)
+  * driven mechanically by `src/json5_tests_vectors.zig` (one entry per file,
+    `@embedFile`d) and `src/json5_tests_test.zig` (the runner)
+
+Excluded from vendoring, deliberately: the repository's own `.git/`,
+`README.md`, `LICENSE.md` metadata; the `.errorSpec` companion files (exact
+reference-parser error positions, not needed to assert pass/reject); and the
+upstream `todo/` directory (two cases the corpus's own authors have not yet
+asserted a verdict for, and which additionally require Unicode-escape support
+this module does not implement).
+
+The suite's own terms (`LICENSE.md` at the pinned commit):
+
+    MIT License
+
+    Copyright (c) 2012-2016 Aseem Kishore, and others
+    (https://github.com/json5/json5/contributors).
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Only test-fixture text is reproduced. The implementation under test
+(`preprocess`/`preprocessAnnotated` in `src/root.zig`) is the authors' own
+(MIT); its DESIGN reference (the JSON5 spec at json5.org) is recorded in the
+repository NOTICE §2 as provenance, not as a condition.

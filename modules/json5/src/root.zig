@@ -78,17 +78,39 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
         if (c == '/' and i + 1 < input.len) {
             if (input[i + 1] == '/') { // single-line
                 i += 2;
-                while (i < input.len and input[i] != '\n') i += 1;
+                // Line terminator is '\n' OR bare '\r' (old Mac-style line
+                // endings, no LF at all) -- stopping at '\n' only meant a
+                // bare-CR file had no line terminator anywhere for this loop
+                // to find, so it silently consumed the rest of the input
+                // (including any closing braces) as "comment". Found by the
+                // json5-tests corpus: new-lines/comment-cr.json5.
+                while (i < input.len and input[i] != '\n' and input[i] != '\r') i += 1;
                 continue;
             }
             if (input[i + 1] == '*') { // multi-line
+                const comment_start = i;
                 i += 2;
+                var closed = false;
                 while (i + 1 < input.len) {
                     if (input[i] == '*' and input[i + 1] == '/') {
                         i += 2;
+                        closed = true;
                         break;
                     }
                     i += 1;
+                }
+                if (!closed) {
+                    // Ran off the end of input without finding the closing
+                    // `*/`. Silently stripping to EOF here would make an
+                    // unterminated block comment vanish -- turning
+                    // otherwise-invalid input into something that
+                    // (accidentally) parses. Instead, copy the unterminated
+                    // comment's bytes through verbatim so std.json sees the
+                    // stray `/*` and rejects downstream, matching the
+                    // json5-tests corpus: comments/unterminated-block-comment.txt
+                    // is a must-reject case the old silent-swallow accepted.
+                    try out.appendSlice(alloc, input[comment_start..input.len]);
+                    i = input.len;
                 }
                 continue;
             }
@@ -221,6 +243,26 @@ fn removeTrailingComma(out: *std.ArrayList(u8)) void {
         switch (out.items[j]) {
             ' ', '\t', '\n', '\r' => {},
             ',' => {
+                // A comma preceded (skipping whitespace) by nothing but an
+                // opening bracket or another comma is a LONE or LEADING
+                // comma ("[,]", "{,}", "[1,,]"), not a legitimate trailing
+                // comma after a real element. Leave it in place so the
+                // surrounding structure stays invalid JSON and std.json
+                // rejects it downstream, instead of silently eliding it into
+                // a valid (and wrong) empty/short container. Found by the
+                // json5-tests corpus: arrays/lone-trailing-comma-array.js and
+                // objects/lone-trailing-comma-object.txt are must-reject
+                // cases the old unconditional strip accepted as `[]`/`{}`.
+                var k = j;
+                const has_value_before = while (k > 0) {
+                    k -= 1;
+                    switch (out.items[k]) {
+                        ' ', '\t', '\n', '\r' => continue,
+                        '{', '[', ',' => break false,
+                        else => break true,
+                    }
+                } else false;
+                if (!has_value_before) return;
                 out.items.len = j;
                 return;
             },
@@ -510,7 +552,9 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
         if (c == '/' and i + 1 < input.len) {
             if (input[i + 1] == '/') {
                 i += 2;
-                while (i < input.len and input[i] != '\n') i += 1;
+                // See preprocess()'s identical fix: bare '\r' is also a line
+                // terminator (old Mac-style line endings), not just '\n'.
+                while (i < input.len and input[i] != '\n' and input[i] != '\r') i += 1;
                 continue;
             }
             if (input[i + 1] == '*') {
@@ -1068,4 +1112,11 @@ fn fuzzPreprocessAnnotated(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     const r = preprocessAnnotated(alloc, buf[0..len]) catch return;
     alloc.free(r.out);
+}
+
+// ── external anchor: json5/json5-tests corpus ───────────────────────────────
+// See json5_tests_test.zig / json5_tests_vectors.zig / NOTICE.
+test {
+    _ = @import("json5_tests_vectors.zig");
+    _ = @import("json5_tests_test.zig");
 }
