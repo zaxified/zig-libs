@@ -54,8 +54,13 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
 
 No official CTAP2 pinUvAuthProtocol KAT table exists; each composed
 primitive is anchored byte-exact to its own official vector
-(`kat_vectors.zig`), and the protocol layer is proven by two-sided
-round-trips (`kat_test.zig`):
+(`kat_vectors.zig`), the protocol layer is proven by two-sided round-trips
+(`kat_test.zig`), and — closing the gap round-trips alone leave (a
+self-consistent implementation can round-trip against itself while still
+being wrong) — the FRAMING is additionally anchored against a single live
+run of Yubico's `python-fido2` SDK (`fido2.ctap2.pin`, v2.2.1), captured
+once and frozen offline (`pin_protocol_oracle_vectors.zig` /
+`pin_protocol_oracle_test.zig`; the test suite opens no socket):
 
 | Piece | Oracle | Assertion |
 |---|---|---|
@@ -64,9 +69,29 @@ round-trips (`kat_test.zig`):
 | P-256 ECDH | RFC 5903 §8.1 | both pubkeys + Z (`girx`) byte-exact |
 | HMAC-SHA-256 | RFC 4231 §4.3 TC2 | byte-exact |
 | Protocols One/Two | round-trip | two-sided `encapsulate` agreement; `decrypt∘encrypt = id`; `verify∘authenticate = true`; tamper/length rejection |
+| Protocol framing (One/Two) | live `python-fido2` capture | `encapsulate`'s platform pubkey + shared secret; `pinHashEnc`; a simulated `pinUvAuthToken` exchange; `pinUvAuthParam` keyed by the shared secret AND by the token — all byte-exact |
 
 Green in Debug and ReleaseFast (`zig build test-ctap2pin
-[-Doptimize=ReleaseFast]`).
+[-Doptimize=ReleaseFast]`), 37 tests.
+
+### Real finding: `authenticate`/`verify`'s `key` type was too narrow
+
+Building the `python-fido2`-anchored framing tests surfaced a genuine API
+gap (not a numeric divergence): `One.authenticate`/`Two.authenticate` and
+their `verify` counterparts previously took `key: SharedSecret` — a
+fixed-size array (32 bytes for One, 64 for Two). But CTAP2's own
+per-command `pinUvAuthParam` (used by every command after `getPinToken`,
+e.g. `makeCredential`/`getAssertion`) computes `authenticate(pinUvAuthToken,
+clientDataHash)`, where `pinUvAuthToken` is 16 or 32 bytes for protocol One
+and always 32 bytes for protocol Two — never the same length as
+`SharedSecret`. For protocol Two this made the token-keyed call
+**impossible to express at all** (a `[32]u8` cannot coerce to `[64]u8`);
+for protocol One it worked only when the token happened to be 32 bytes.
+Fixed by widening both to `key: []const u8` (§6.5.7/§6.5.8's own
+`authenticate` abstract operation is generic over `key`; `Two.authenticate`
+already only reads `key[0..32]`, which is correct unchanged for both a
+64-byte shared secret and a 32-byte token). All existing call sites
+updated; behavior for shared-secret keys is bit-for-bit unchanged.
 
 ## Non-goals
 

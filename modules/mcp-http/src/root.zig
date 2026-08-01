@@ -667,6 +667,47 @@ fn workTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
     return false;
 }
 
+// ── tools mirroring the real python-mcp reference capture (oracle tests) ────
+
+/// Echoes back the `text` argument wrapped as `{"result": <value>}`, matching
+/// the wrapping convention the official python `mcp` SDK's FastMCP-style
+/// server (`mcp.server.mcpserver.MCPServer`) uses for a scalar tool return —
+/// see `oracle_vectors.zig`'s `echo_call_response_json`, captured from a real
+/// run of that SDK.
+fn oracleEchoTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+    const text = call.strArg("text") orelse return call.fail("missing 'text'");
+    call.print("{{\"result\":\"{s}\"}}", .{text});
+    return false;
+}
+
+/// Reports the same two progress steps the real captured `work` tool did
+/// (`oracle_vectors.zig`'s `progress_1_json`/`progress_2_json`), then returns
+/// `{"result":"done"}` in the same wrapping convention as `oracleEchoTool`.
+fn oracleWorkTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+    call.reportProgress(1, 2, "step one");
+    call.reportProgress(2, 2, "step two");
+    call.write("{\"result\":\"done\"}");
+    return false;
+}
+
+fn buildOracleServer(gpa: std.mem.Allocator) !mcp.Server {
+    var server = mcp.Server.init(gpa, .{ .name = "test", .version = "1.0" });
+    errdefer server.deinit();
+    try server.addTool(.{
+        .name = "echo",
+        .description = "Echo the given text back.",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = oracleEchoTool,
+    });
+    try server.addTool(.{
+        .name = "work",
+        .description = "Do some work, reporting progress twice.",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = oracleWorkTool,
+    });
+    return server;
+}
+
 fn buildServer(gpa: std.mem.Allocator) !mcp.Server {
     var server = mcp.Server.init(gpa, .{ .name = "test", .version = "1.0" });
     errdefer server.deinit();
@@ -1366,4 +1407,169 @@ test "Sessions.create: refuses new sessions past max_sessions (audit MED)" {
     _ = try s.create();
     _ = try s.create();
     try testing.expectError(error.TooManySessions, s.create());
+}
+
+// ── oracle: replay of a real python-mcp SDK session (see oracle_vectors.zig) ─
+//
+// The tests below feed the EXACT request bytes a real run of the official
+// `mcp` Python SDK's client sent to a real run of its server (captured once,
+// frozen in `oracle_vectors.zig`, no socket opened here) through this
+// module's own `Transport`, via the same offline `runWire` harness every
+// other test in this file uses. This closes the gap `NOTICE`/`README.md`
+// used to describe ("cross-checked for parity against a reference Dart
+// server") without any captured bytes or live check ever backing it: the
+// reference is now the specification's own SDK, exercised as a black-box
+// oracle, and the check is real and offline.
+
+const oracle = @import("oracle_vectors.zig");
+
+test "oracle: the real python-mcp client's initialize request negotiates the real protocolVersion" {
+    const gpa = testing.allocator;
+    var server = try buildOracleServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [4096]u8 = undefined;
+    // The real client's own Accept header, byte-exact — see oracle_vectors.zig.
+    const got = runWire(&r, postAccept("application/json, text/event-stream", oracle.init_request), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
+    try testing.expect(headerValue(got, "Mcp-Session-Id") != null);
+    const b = bodyOf(got);
+    try testing.expect(std.mem.indexOf(u8, b, "\"jsonrpc\":\"2.0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, b, "\"id\":1") != null);
+    // The exact protocolVersion string the real reference SDK negotiated for
+    // this exact request (both request and response frozen from the same
+    // live capture, so this is not a value we invented).
+    try testing.expect(std.mem.indexOf(u8, oracle.init_response_json, "\"protocolVersion\":\"2025-11-25\"") != null);
+    try testing.expect(std.mem.indexOf(u8, b, "\"protocolVersion\":\"2025-11-25\"") != null);
+}
+
+test "oracle: notifications/initialized (real client bytes) -> 202, matching the real server" {
+    const gpa = testing.allocator;
+    var server = try buildOracleServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, post("/mcp", oracle.notifications_initialized_request), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 202"));
+    try testing.expectEqualStrings("", bodyOf(got));
+    // The real reference server answered the identical bytes the same way.
+    try testing.expect(std.mem.startsWith(u8, oracle.notifications_initialized_status, "HTTP/1.1 202"));
+}
+
+test "oracle: tools/list (real client bytes) lists this module's tools" {
+    const gpa = testing.allocator;
+    var server = try buildOracleServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, postAccept("application/json, text/event-stream", oracle.tools_list_request), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    const b = bodyOf(got);
+    try testing.expect(std.mem.indexOf(u8, b, "\"echo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, b, "\"work\"") != null);
+    // Same two tool names the real reference server reported for this
+    // module's own tools/list request (frozen from the live capture).
+    try testing.expect(std.mem.indexOf(u8, oracle.tools_list_response_json, "\"echo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, oracle.tools_list_response_json, "\"work\"") != null);
+}
+
+test "oracle: tools/call \"echo\" (real client bytes) reproduces the real argument" {
+    const gpa = testing.allocator;
+    var server = try buildOracleServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [4096]u8 = undefined;
+    // The real client's captured tools/call request, byte-exact, including
+    // its real argument value "hello-mcp-http-oracle". Plain `post` (no SSE
+    // Accept) so the response is a single `application/json` object,
+    // directly parseable — the SSE-framing path is exercised separately by
+    // the "work" oracle test below.
+    const got = runWire(&r, post("/mcp", oracle.echo_call_request), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    const b = bodyOf(got);
+
+    // structuredContent is byte-comparable field-by-field (this module's tool
+    // deliberately wrote the same `{"result": <value>}` wrapping FastMCP used
+    // for the real capture — see oracleEchoTool's doc comment).
+    var ours = try std.json.parseFromSlice(std.json.Value, gpa, b, .{});
+    defer ours.deinit();
+    var real = try std.json.parseFromSlice(std.json.Value, gpa, oracle.echo_call_response_json, .{});
+    defer real.deinit();
+    const our_sc = ours.value.object.get("result").?.object.get("structuredContent").?.object.get("result").?.string;
+    const real_sc = real.value.object.get("result").?.object.get("structuredContent").?.object.get("result").?.string;
+    try testing.expectEqualStrings("hello-mcp-http-oracle", real_sc); // sanity: this IS the real captured value
+    try testing.expectEqualStrings(real_sc, our_sc);
+
+    // content[0].text is NOT byte-comparable: the real SDK's framework layer
+    // (FastMCP) puts the bare scalar there for a plain-string tool return,
+    // while this module's lower-level ToolCall.write is opaque raw text (the
+    // caller supplied the whole `{"result":...}` object as the text) — a
+    // real, benign convention difference between the two layers, not a bug.
+    // The marker value is still present in both, which is what we assert.
+    try testing.expect(std.mem.indexOf(u8, b, "hello-mcp-http-oracle") != null);
+    try testing.expect(std.mem.indexOf(u8, oracle.echo_call_response_json, "hello-mcp-http-oracle") != null);
+}
+
+test "oracle: tools/call \"work\" (real client bytes) reproduces the real progress frames byte-exact" {
+    const gpa = testing.allocator;
+    var server = try buildOracleServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [8192]u8 = undefined;
+    // The real client's captured tools/call request (progressToken: 4, a
+    // bare JSON number), byte-exact.
+    const got = runWire(&r, postAccept("text/event-stream", oracle.work_call_request), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
+
+    // Byte-exact: this module's own notifications/progress field order
+    // matches the real reference server's, so the captured lines are
+    // asserted as literal substrings of THIS module's own SSE output.
+    try testing.expect(std.mem.indexOf(u8, got, oracle.progress_1_json) != null);
+    try testing.expect(std.mem.indexOf(u8, got, oracle.progress_2_json) != null);
+    try testing.expect(std.mem.count(u8, got, "data: ") >= 3); // 2 progress + 1 result
+
+    // Final result: structural comparison, same convention note as the echo
+    // test above (content.text differs by framework convention; compare
+    // structuredContent, which was deliberately written to match).
+    const last_data = std.mem.lastIndexOf(u8, got, "data: ") orelse return error.NoResultEvent;
+    const after = got[last_data + "data: ".len ..];
+    const line_end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+    const result_line = after[0..line_end];
+    var ours = try std.json.parseFromSlice(std.json.Value, gpa, result_line, .{});
+    defer ours.deinit();
+    var real = try std.json.parseFromSlice(std.json.Value, gpa, oracle.work_call_response_json, .{});
+    defer real.deinit();
+    try testing.expectEqualStrings(
+        real.value.object.get("result").?.object.get("structuredContent").?.object.get("result").?.string,
+        ours.value.object.get("result").?.object.get("structuredContent").?.object.get("result").?.string,
+    );
 }

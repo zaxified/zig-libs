@@ -8,8 +8,9 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `application/json` (one result) or, when the client sends `Accept: text/event-stream`, a live
   SSE stream where each JSON-RPC line becomes one `data:` event (tool-call
   `notifications/progress` delivered as they happen); a pure notification → `202`. Clean-room from
-  the MCP "Streamable HTTP" transport spec (2025-06-18); a reference Dart server wrapping the
-  third-party `mcp_dart` client is the behavioral reference — see NOTICE.
+  the MCP "Streamable HTTP" transport spec (2025-06-18) + JSON-RPC 2.0 — see NOTICE. The
+  behavioral contract is verified against a live capture of the official `mcp` Python SDK (see
+  Verification below), superseding an earlier, unbacked claim of parity against a Dart reference.
 - **Sessions (optional):** an `Mcp-Session-Id` is minted at `initialize` and validated thereafter
   (unknown → 404); `GET /mcp` opens a server→client SSE stream; `DELETE /mcp` tears it down.
 - **`GET` is drain-and-close, not held-open** — io-less handlers can't park a connection on a
@@ -57,7 +58,42 @@ server→client requests: a response POST → 202 with the handler run, cross-se
 refused (session B's answer leaves session A's request pending, and the request lands only on A's
 `GET` stream), the `application/json` body carrying exactly one object while the tool's elicitation
 goes to the session queue, and the SSE ordering (request event precedes the tool result). 18 tests.
-Run: `zig build test-mcp-http`.
+
+### Oracle: a real captured session from the official `mcp` Python SDK
+
+This module's README/NOTICE previously described the behavioral contract as "cross-checked for
+parity against a reference Dart server (`mcp_dart`)" with no captured bytes and no live check
+behind that claim — the worst of the false-anchor shapes, since it told a reader the opposite of
+the truth. Fixed: a single live run of the **official `mcp` Python SDK** (modelcontextprotocol.io,
+package `mcp` 2.0.0) — its real `ClientSession` + `streamable_http_client` talking to its real
+`MCPServer.streamable_http_app()` (via uvicorn) over an actual loopback TCP connection, with a raw
+byte-logging proxy observing (not altering) the exchange — captured `initialize`,
+`notifications/initialized`, `GET` session-stream open, `tools/list`, and two `tools/call`s (one
+with two live `notifications/progress` events), through `DELETE`. Frozen once in
+`oracle_vectors.zig`; `root.zig`'s 8 "oracle:" tests replay those exact request bytes through this
+module's own `Transport` (offline, the same in-memory `runWire` harness every other test uses — no
+socket) and assert:
+
+| Piece | Assertion |
+|---|---|
+| `initialize` | this module's response negotiates the identical `protocolVersion` the real SDK did, and mints a session id |
+| `notifications/initialized` | → `202`, matching the reference server |
+| `tools/list` | lists this module's tools, matching the real response's tool names |
+| `tools/call` (`echo`) | `structuredContent` byte-comparable to the real captured value (both use the same `{"result": <value>}` wrapping) |
+| `tools/call` (`work`) | the two `notifications/progress` SSE frames are asserted **as literal substrings of this module's own output** — this module's field order (`jsonrpc, method, params.{progressToken,progress,total,message}`) is identical to the reference server's, so this is a byte-exact match, not merely a parsed-and-compared one |
+
+Two differences the capture surfaced, both confirmed benign (not bugs — recorded because they were
+observed, not assumed): the reference server's `GET` stream never closed on its own (a genuine
+held-open long-poll) where this module is deliberately drain-and-close (documented above — an
+io-less handler cannot park a connection); and `DELETE` got `200 OK` from the reference vs. this
+module's `204 No Content` (both valid 2xx responses; the spec does not mandate one). A third,
+cosmetic-only difference: the reference names every SSE event `event: message` explicitly, this
+module omits `event:` — WHATWG SSE defines the absent case as the same default type, so the two are
+wire-identical to any `EventSource`. See `oracle_vectors.zig`'s doc comment for the full capture
+recap and provenance. `mcp` run as a black-box test oracle needs no root `NOTICE` entry (§0); no
+`mcp_dart`, the official SDK, or any other MCP-transport source was ported or copied.
+
+26 tests total (18 + 8). Run: `zig build test-mcp-http`.
 
 ## Backlog / deferred
 

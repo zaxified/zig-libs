@@ -6,16 +6,21 @@ ECDH-P256 key agreement, AES-256-CBC encryption, and HMAC-SHA-256
 authentication protecting the PIN/UV during CTAP2. The crypto layer both
 a CTAP2 platform and an authenticator implementation sit on.
 
-**Status: complete — both protocols, KAT-validated** (AES-256-CBC vs NIST
-SP 800-38A F.2.5/F.2.6 — CBC is this module's own, it is **not** in
-`std.crypto`; HKDF vs RFC 5869 A.1; P-256 ECDH vs RFC 5903 §8.1; HMAC vs
-RFC 4231; plus full two-sided protocol round-trips). See `SPEC.md`.
+**Status: complete — both protocols, KAT-validated AND oracle-validated**
+(AES-256-CBC vs NIST SP 800-38A F.2.5/F.2.6 — CBC is this module's own, it
+is **not** in `std.crypto`; HKDF vs RFC 5869 A.1; P-256 ECDH vs RFC 5903
+§8.1; HMAC vs RFC 4231; plus the protocol FRAMING — encapsulate, the
+pinHashEnc/pinUvAuthToken exchange, and pinUvAuthParam in both keying
+shapes — byte-exact against a live capture of Yubico's `python-fido2` SDK).
+See `SPEC.md`.
 
 | File | Contents |
 |---|---|
 | `root.zig` | `Aes256Cbc` (NIST-validated CBC mode), `PublicKey`/`publicKeyFromScalar`/`ecdhZ` (P-256 ECDH), `One`, `Two`, `Protocol` + `Impl()` dispatch |
 | `kat_vectors.zig` | NIST SP 800-38A CBC + RFC 5869 HKDF + RFC 5903 ECDH + RFC 4231 HMAC vectors, cited |
 | `kat_test.zig` | Byte-exact KAT assertions + protocol round-trip/tamper/length tests |
+| `pin_protocol_oracle_vectors.zig` | Real PIN protocol framing material captured from a live `python-fido2` run (`encapsulate`, `pinHashEnc`, the `pinUvAuthToken` exchange, `pinUvAuthParam`), frozen |
+| `pin_protocol_oracle_test.zig` | Assertions that this module's framing reproduces the captured `python-fido2` bytes, both protocols |
 
 Provenance: clean-room from the FIDO Alliance CTAP 2.1 specification §6.5.6–6.5.8,
 a public specification; every KAT is a published NIST/RFC vector. No third-party
@@ -55,12 +60,17 @@ try ctap2pin.Two.encrypt(secret, fresh_iv, ct[0..pt.len + 16], pt);
 try ctap2pin.Two.decrypt(secret, pt2[0..try ctap2pin.Two.decryptedLength(ct.len)], ct);
 ```
 
-**Authenticate / verify** (verify is constant-time, fail-closed):
+**Authenticate / verify** (verify is constant-time, fail-closed). `key` is
+generic (`[]const u8`), not the fixed-size shared secret: CTAP2 calls
+`authenticate`/`verify` both with the shared secret (`setPin`/`getPinToken`'s
+`pinUvAuthParam`) and with the shorter `pinUvAuthToken` obtained from
+`getPinToken` (every later command's per-request `pinUvAuthParam`) — the two
+keys differ in length, so a fixed `SharedSecret` type cannot express both:
 
 ```zig
-const sig1 = ctap2pin.One.authenticate(secret, msg); // [16]u8 (truncated HMAC)
-const sig2 = ctap2pin.Two.authenticate(secret, msg); // [32]u8 (full HMAC, hmacKey half)
-if (!ctap2pin.Two.verify(secret, msg, sig)) return error.PinAuthInvalid;
+const sig1 = ctap2pin.One.authenticate(&secret, msg); // [16]u8 (truncated HMAC); or &pin_uv_token
+const sig2 = ctap2pin.Two.authenticate(&secret, msg); // [32]u8 (full HMAC, hmacKey half); or &pin_uv_token
+if (!ctap2pin.Two.verify(&secret, msg, sig)) return error.PinAuthInvalid;
 ```
 
 **Raw CBC** (the std-gap primitive, usable on its own):

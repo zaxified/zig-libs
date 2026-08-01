@@ -52,19 +52,36 @@ Body reads and response framing happen outside the lock.
   `http`, `mcp`.
 
 Provenance: clean-room from the MCP Streamable HTTP transport specification
-(2025-06-18) + JSON-RPC 2.0; the behavioral contract was cross-checked for
-parity against a reference Dart server wrapping the third-party `mcp_dart`
-package — no `mcp_dart` or other MCP-transport source consulted or copied.
+(2025-06-18) + JSON-RPC 2.0. Earlier revisions of this note claimed the
+behavioral contract was "cross-checked for parity against a reference Dart
+server (`mcp_dart`)" — no captured bytes or live check ever backed that claim,
+so it is corrected here: this module's Streamable HTTP transport is verified
+against a single live capture of the **official `mcp` Python SDK**
+(modelcontextprotocol.io, the specification's own reference implementation) —
+its real client and real server, talking over an actual loopback connection —
+frozen offline in `oracle_vectors.zig` and replayed through this module's own
+`Transport` with no socket at test time. See `SPEC.md`'s Verification section
+for exactly what that capture covers and two benign differences it surfaced.
+No `mcp_dart`, the official SDK, or any other MCP-transport source was ported
+or copied; the SDK ran only as a black-box test oracle.
 
 ## Verification
 
-`zig build test-mcp-http` — 14 offline tests through a real `router` +
-`http.Server.serveStream`: request/response (initialize, tools/list, tools/call,
-notification → 202), SSE-on-POST (streamed result, **live tool progress**,
-notification → 202, `stream=.off`), Origin allowlist (match/mismatch/absent),
-sessions (assign + validate + 404 + DELETE, `GET` push + `Last-Event-ID` replay
-+ heartbeat, unknown-session 404, `max_sessions` cap rejected), path
-pass-through / 405, oversized → 413. Green in Debug + ReleaseFast.
+`zig build test-mcp-http` — 26 offline tests through a real `router` +
+`http.Server.serveStream`, in two groups:
+
+- 18 tests built from the spec text directly: request/response (initialize,
+  tools/list, tools/call, notification → 202), SSE-on-POST (streamed result,
+  **live tool progress**, notification → 202, `stream=.off`), Origin allowlist
+  (match/mismatch/absent), sessions (assign + validate + 404 + DELETE, `GET`
+  push + `Last-Event-ID` replay + heartbeat, unknown-session 404,
+  `max_sessions` cap rejected), path pass-through / 405, oversized → 413.
+- 8 tests replaying a real session captured once from the **official `mcp`
+  Python SDK** (initialize, `notifications/initialized`, `tools/list`, two
+  `tools/call`s — one with live progress notifications — all byte-exact
+  against the captured request/response bytes; see `oracle_vectors.zig`).
+
+Green in Debug + ReleaseFast.
 
 ## Server→client requests (sampling / elicitation)
 

@@ -697,11 +697,19 @@ re-examined 2026-07-29 (both recorded in the project git history).
 
   mcp-http   — clean-room from the Model Context Protocol "Streamable HTTP"
                transport specification (2025-06-18 revision) and the JSON-RPC
-               2.0 spec; the behavioral contract (POST /mcp, Mcp-Session-Id,
-               GET/DELETE, 202-for-notifications) was cross-checked for parity
-               against a reference Dart server that wraps the third-party
-               mcp_dart package — no mcp_dart or other MCP-transport source was
+               2.0 spec; no mcp_dart or other MCP-transport source was
                consulted or copied. Builds on the `mcp` module (JSON-RPC core).
+               An earlier version of this entry additionally claimed the
+               behavioral contract (POST /mcp, Mcp-Session-Id, GET/DELETE,
+               202-for-notifications) was "cross-checked for parity against a
+               reference Dart server wrapping the third-party mcp_dart
+               package" — no captured bytes or live check ever backed that
+               claim, so it is corrected here rather than repeated. The
+               transport is now verified against a single live capture of the
+               official `mcp` Python SDK (modelcontextprotocol.io), exercised
+               purely as a black-box test oracle (§0 exemption — no entry
+               needed for that; recorded in the module's own SPEC.md
+               Verification section and `oracle_vectors.zig`).
 
   linkheader — clean-room from RFC 8288 (Web Linking — the `Link` header
                grammar). No third-party source consulted or copied.

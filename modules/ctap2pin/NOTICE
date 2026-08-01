@@ -48,8 +48,23 @@ authenticator implementation sit directly on top of it (`clientPin` /
 `getPinUvAuthTokenUsingPinWithPermissions` etc. are CBOR command framing
 around exactly these five operations).
 
-**Status: complete — both protocols implemented and validated (25/25
+Oracle note (`pin_protocol_oracle_vectors.zig` / `pin_protocol_oracle_test.zig`):
+the CTAP2 PIN protocol FRAMING this module composes on top of its KAT'd
+primitives (encapsulate, pinHashEnc, the pinUvAuthToken exchange,
+pinUvAuthParam) had no official KAT table and was previously anchored only
+by round-trips against itself. It is now additionally anchored against a
+single live run of Yubico's `python-fido2` SDK (`fido2.ctap2.pin`,
+v2.2.1) exercised purely as a black-box test oracle — no source consulted
+or copied, no design referenced (root `NOTICE` §0's black-box-oracle
+exemption applies; this SDK usage needs no entry there). The captured
+bytes are frozen offline in `pin_protocol_oracle_vectors.zig`; the test
+suite opens no socket and runs no python at test time.
+
+**Status: complete — both protocols implemented and validated (37/37
 tests, Debug + ReleaseFast): AES-256-CBC byte-exact vs NIST SP 800-38A
 F.2.5/F.2.6, HKDF vs RFC 5869 A.1, ECDH vs RFC 5903 §8.1, HMAC vs
-RFC 4231, plus two-sided encapsulation agreement, encrypt/decrypt
-round-trips, and tamper/length rejection for both protocols.**
+RFC 4231, two-sided encapsulation agreement, encrypt/decrypt round-trips,
+and tamper/length rejection for both protocols, PLUS the protocol
+FRAMING (encapsulate → kdf → pinHashEnc → pinUvAuthToken exchange →
+pinUvAuthParam, both keying shapes) byte-exact against a live
+`python-fido2` capture.**

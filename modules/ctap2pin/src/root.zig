@@ -226,16 +226,23 @@ pub const One = struct {
     }
 
     /// §6.5.7 `authenticate(key, message)`: the first 16 bytes of
-    /// `HMAC-SHA-256(key, message)`.
-    pub fn authenticate(key: SharedSecret, message: []const u8) [signature_length]u8 {
+    /// `HMAC-SHA-256(key, message)`. `key` is generic per the spec's
+    /// `authenticate` abstract operation: CTAP2 calls this both with the
+    /// 32-byte shared secret (`setPin`/`getPinToken`'s `pinUvAuthParam`) and
+    /// with a 16- or 32-byte `pinUvAuthToken` (every later command's
+    /// per-request `pinUvAuthParam`, keyed by the token obtained from
+    /// `getPinToken` — CTAP 2.1 §6.5.7 note under `getPinToken`) — the two
+    /// keys differ in length, so this cannot be typed as `SharedSecret`.
+    pub fn authenticate(key: []const u8, message: []const u8) [signature_length]u8 {
         var mac: [HmacSha256.mac_length]u8 = undefined;
-        HmacSha256.create(&mac, message, &key);
+        HmacSha256.create(&mac, message, key);
         return mac[0..signature_length].*;
     }
 
     /// §6.5.7 `verify(key, message, signature)`: recompute and compare in
     /// constant time. Fail-closed: a wrong-length signature is `false`.
-    pub fn verify(key: SharedSecret, message: []const u8, signature: []const u8) bool {
+    /// `key`: see `authenticate` — shared secret or `pinUvAuthToken`.
+    pub fn verify(key: []const u8, message: []const u8, signature: []const u8) bool {
         if (signature.len != signature_length) return false;
         const expected = authenticate(key, message);
         return std.crypto.timing_safe.eql([signature_length]u8, expected, signature[0..signature_length].*);
@@ -308,8 +315,15 @@ pub const Two = struct {
     }
 
     /// §6.5.8 `authenticate(key, message)`: the full 32-byte
-    /// `HMAC-SHA-256(hmacKey, message)` (the HMAC-key half of the secret).
-    pub fn authenticate(key: SharedSecret, message: []const u8) [signature_length]u8 {
+    /// `HMAC-SHA-256(hmacKey, message)`. `key` is generic per the spec's
+    /// `authenticate` abstract operation, and must be at least 32 bytes:
+    /// pass the 64-byte shared secret (`hmacKey` is its first 32 bytes,
+    /// `key[0..32]` below) for `setPin`/`getPinToken`'s `pinUvAuthParam`, or
+    /// pass a 32-byte `pinUvAuthToken` directly (already exactly `hmacKey`
+    /// length, so `key[0..32]` is the whole token unchanged) for every later
+    /// command's per-request `pinUvAuthParam` — CTAP 2.1 §6.5.7 note under
+    /// `getPinToken`.
+    pub fn authenticate(key: []const u8, message: []const u8) [signature_length]u8 {
         var mac: [signature_length]u8 = undefined;
         HmacSha256.create(&mac, message, key[0..32]);
         return mac;
@@ -317,7 +331,8 @@ pub const Two = struct {
 
     /// §6.5.8 `verify(key, message, signature)`: recompute and compare in
     /// constant time. Fail-closed: a wrong-length signature is `false`.
-    pub fn verify(key: SharedSecret, message: []const u8, signature: []const u8) bool {
+    /// `key`: see `authenticate` — shared secret or `pinUvAuthToken`.
+    pub fn verify(key: []const u8, message: []const u8, signature: []const u8) bool {
         if (signature.len != signature_length) return false;
         const expected = authenticate(key, message);
         return std.crypto.timing_safe.eql([signature_length]u8, expected, signature[0..signature_length].*);
@@ -327,6 +342,8 @@ pub const Two = struct {
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("pin_protocol_oracle_vectors.zig");
+    _ = @import("pin_protocol_oracle_test.zig");
 }
 
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
