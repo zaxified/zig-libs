@@ -42,9 +42,41 @@ missing/too-many arguments, line-too-long, input-too-large. Plus accessor lookup
 `package` header serialization, and quoted keys/types round-tripping. Run: `zig build
 test-uci`.
 
+**Real `uci` capture (OpenWRT 25.12.4 VM lane).** Two hand-written configs were pushed into
+`/etc/config/` inside the `scripts/vm/` OpenWRT VM and run through the real `uci` binary; the raw
+config bytes plus the real `uci export`/`uci show` stdout are frozen in `root.zig`'s "real uci
+capture" section — exercising the real binary purely as a black-box test oracle (root `NOTICE`
+policy §0). One config concentrates on quoting/escaping (one option per escape sequence); the other
+covers anonymous sections + their `@type[N]` generated addressing, list options, and mixed
+quoting/bare-word styles.
+
+**Two real, reproducible bugs were found this way and fixed (not papered over in a golden):**
+1. Real `uci`'s double-quote escapes are only `\\`, `\"`, `\'` — a backslash before any OTHER
+   character (n/t/r included) drops the backslash and keeps that character literally; UCI text has
+   **no escape that produces an actual control byte**. This module previously converted `\n`/`\t`/
+   `\r` to real control bytes — invisible to every existing test because they only ever round-tripped
+   through this module's own encoder/decoder pair (a self-consistent "blind oracle"; even the fuzz
+   round-trip harness can't see a symmetric bug). Confirmed with 8 independent escape probes
+   (`\\`,`\"`,`\'`,`\n`,`\t`,`\r`,`\y`, plus single-quote-takes-no-escapes) against the real binary.
+   Fixed in the parser and serializer (the latter now rejects ALL sub-0x20 bytes, not just
+   "other" ones, since none of them have a working escape).
+2. Real `uci export` prints a bare, unquoted `package <name>` header when the name is
+   identifier-safe (`package testcfg`, not `package 'testcfg'`). Fixed (`serialize` now treats the
+   package name like a section-type word).
+
+**One style-only difference found and deliberately NOT changed:** a value containing a literal `'`
+is double-quoted by this module (`"a'b"`); real `uci` instead splices single-quoted segments the
+POSIX-shell way (`'a'\''b'`). Both encode the identical value; changing this module's simpler,
+single-segment choice to replicate real `uci`'s multi-segment splicing was judged not worth it for a
+cosmetic difference with no behavioral impact. Also not replicated: real `uci export` emits one
+extra trailing blank line after the very last section (this module's blank line is only ever
+*between* blocks) — a CLI-output-only convention, not a canonical-serialization invariant, and
+changing it would touch every other hand test asserting no trailing blank line.
+
 ## Backlog / deferred
-None beyond the documented UCI-CLI-layer/typed-coercion out-of-scope
-list above.
+None beyond the documented UCI-CLI-layer/typed-coercion out-of-scope list above, and the two
+deliberate style differences from real `uci export` noted above (literal-value quoting-segment style;
+one trailing blank line).
 
 ## Status
 `gap · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta` in

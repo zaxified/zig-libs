@@ -18,8 +18,11 @@
 //! is byte-identical to the first.
 //!
 //! Quoting follows the documented format: single quotes take no escapes;
-//! double quotes take `\"`, `\'`, `\\`, `\n`, `\t`, `\r` (a backslash before
-//! any other character yields that character); bare words end at whitespace.
+//! double quotes take `\"`, `\'`, `\\` (a backslash before any other
+//! character — including `n`/`t`/`r` — drops the backslash and yields that
+//! character verbatim; UCI text has no escape that produces an actual
+//! control byte, confirmed against a real `uci` binary — see SPEC.md);
+//! bare words end at whitespace.
 //! Adjacent segments of one token concatenate (`'a'"b"c` -> `abc`), quotes
 //! may not span lines. `#` starts a comment at the start of a token; inside
 //! a token or inside quotes it is literal.
@@ -80,8 +83,9 @@ pub const ParseError = error{
 };
 
 pub const SerializeError = error{
-    /// A value contains a control character with no UCI escape
-    /// (anything below 0x20 other than `\n`, `\t`, `\r`).
+    /// A value contains a control character with no UCI escape (anything
+    /// below 0x20 — UCI text has no escape that produces an actual control
+    /// byte, `\n`/`\t`/`\r` included; see the parser's double-quote comment).
     UnserializableValue,
     OutOfMemory,
 };
@@ -341,12 +345,18 @@ const Parser = struct {
                         if (d == '\\') {
                             i += 1;
                             if (i >= line.len) return error.UnterminatedQuote;
-                            try buf.append(p.arena, switch (line[i]) {
-                                'n' => '\n',
-                                't' => '\t',
-                                'r' => '\r',
-                                else => |e| e, // covers \" \' \\ and anything else
-                            });
+                            // A backslash always just escapes-and-drops: the
+                            // following character is kept verbatim, whatever
+                            // it is. Verified against the real `uci` binary
+                            // (see SPEC.md's "real uci capture" section):
+                            // `\n`/`\t`/`\r` are NOT special-cased to
+                            // control bytes there either — `"a\nb"` round-
+                            // trips through real `uci export` as the
+                            // literal text `anb`, backslash dropped, 'n'
+                            // kept as-is, same as any other `\<char>`. UCI
+                            // text has no escape that produces an actual
+                            // control byte.
+                            try buf.append(p.arena, line[i]);
                             i += 1;
                         } else {
                             try buf.append(p.arena, d);
@@ -415,7 +425,8 @@ const Parser = struct {
 // ── serializer ──────────────────────────────────────────────────────────────
 
 /// Serialize a `Package` to canonical UCI text (caller frees with `gpa`):
-/// optional `package '<name>'` header, blank line between blocks, options
+/// optional `package <name>` header (bare when identifier-safe, matching
+/// real `uci export`'s own rendering), blank line between blocks, options
 /// tab-indented, values quoted (single quotes by default, double quotes with
 /// escapes when the value contains `'` or a control character).
 pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
@@ -424,7 +435,10 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
 
     if (pkg.name) |n| {
         try out.appendSlice(gpa, "package ");
-        try writeValue(gpa, &out, n);
+        // Bare when identifier-safe, matching real `uci export`'s own
+        // rendering (verified: it prints `package testcfg`, not
+        // `package 'testcfg'`) — same rule as a section type name.
+        try writeWord(gpa, &out, n);
         try out.append(gpa, '\n');
     }
     for (pkg.sections, 0..) |*sec, i| {
@@ -484,17 +498,20 @@ fn writeValue(gpa: Allocator, out: *std.ArrayList(u8), value: []const u8) Serial
         try out.append(gpa, '\'');
         return;
     }
+    // Double-quote mode only round-trips `\\` and `\"` (the parser's
+    // backslash rule drops the backslash and keeps ANY other character
+    // literally — including n/t/r, verified against the real `uci` binary,
+    // see the parser comment above). So any actual control byte other than
+    // the quote-triggering `'` has no representable escape here and must be
+    // rejected, not silently mis-escaped as `\n`/`\t`/`\r`.
+    for (value) |c| {
+        if (c < 0x20) return error.UnserializableValue;
+    }
     try out.append(gpa, '"');
     for (value) |c| switch (c) {
         '\\' => try out.appendSlice(gpa, "\\\\"),
         '"' => try out.appendSlice(gpa, "\\\""),
-        '\n' => try out.appendSlice(gpa, "\\n"),
-        '\t' => try out.appendSlice(gpa, "\\t"),
-        '\r' => try out.appendSlice(gpa, "\\r"),
-        else => {
-            if (c < 0x20) return error.UnserializableValue;
-            try out.append(gpa, c);
-        },
+        else => try out.append(gpa, c),
     };
     try out.append(gpa, '"');
 }
@@ -596,10 +613,15 @@ test "canonical serialization bytes" {
 }
 
 test "double-quote escapes" {
+    // Only \\, \" and \' are true escapes; a backslash before any other
+    // character (n/t/r included) just drops the backslash and keeps that
+    // character literally — verified against a real `uci` binary (see
+    // SPEC.md's "real uci capture"): `\n`/`\t`/`\r` do NOT become control
+    // bytes here.
     const gpa = testing.allocator;
     var pkg = try parse(gpa, "config t\n\toption v \"a\\'b\\\"c\\\\d\\ne\\tf\\rg\"\n");
     defer pkg.deinit(gpa);
-    try testing.expectEqualStrings("a'b\"c\\d\ne\tf\rg", pkg.sections[0].get("v").?);
+    try testing.expectEqualStrings("a'b\"c\\dnetfrg", pkg.sections[0].get("v").?);
 }
 
 test "single quotes take no escapes" {
@@ -733,7 +755,10 @@ test "serializer quoting choices" {
             "\toption spaces 'hello world'\n" ++
             "\toption squote \"it's\"\n" ++
             "\toption bslash 'a\\b'\n" ++
-            "\toption ctrl \"a\\nb\\tc\"\n" ++
+            // `\n`/`\t` are NOT control-byte escapes (see "double-quote
+            // escapes" above) — this parses to the literal text "anbtc",
+            // which needs no quoting beyond a plain single-quoted word.
+            "\toption not_ctrl \"a\\nb\\tc\"\n" ++
             "\toption both \"a'\\\\b\"\n",
     );
     defer pkg.deinit(gpa);
@@ -744,7 +769,7 @@ test "serializer quoting choices" {
             "\toption spaces 'hello world'\n" ++
             "\toption squote \"it's\"\n" ++
             "\toption bslash 'a\\b'\n" ++
-            "\toption ctrl \"a\\nb\\tc\"\n" ++
+            "\toption not_ctrl 'anbtc'\n" ++
             "\toption both \"a'\\\\b\"\n",
         text,
     );
@@ -757,6 +782,21 @@ test "serializer rejects unescapable control chars" {
     const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
     const pkg: Package = .{ .sections = &secs };
     try testing.expectError(error.UnserializableValue, serialize(gpa, &pkg));
+}
+
+test "serializer rejects \\n \\t \\r too — UCI text has no escape that produces them (real-uci finding)" {
+    // Before the fix, these were treated as escapable via \n/\t/\r; the real
+    // `uci` binary's parser proves those aren't actual control-byte escapes
+    // (see "double-quote escapes" above), so a value containing a REAL
+    // newline/tab/CR byte cannot be represented in UCI text at all and must
+    // be rejected the same as any other sub-0x20 control byte.
+    const gpa = testing.allocator;
+    for ([_][]const u8{ "a\nb", "a\tb", "a\rb" }) |bad| {
+        const opts = [_]Option{.{ .key = "k", .kind = .single, .values = &.{bad} }};
+        const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
+        const pkg: Package = .{ .sections = &secs };
+        try testing.expectError(error.UnserializableValue, serialize(gpa, &pkg));
+    }
 }
 
 test "error: unterminated single quote with line number" {
@@ -909,8 +949,24 @@ test "package keyword and header serialization" {
     try testing.expectEqualStrings("dhcp", pkg.name.?);
     const text = try serialize(gpa, &pkg);
     defer gpa.free(text);
+    // Bare, unquoted — matches real `uci export`'s own rendering (see the
+    // "real uci capture" section below: `package testcfg`, not
+    // `package 'testcfg'`).
     try testing.expectEqualStrings(
-        "package 'dhcp'\n\nconfig dnsmasq\n\toption domain 'lan'\n",
+        "package dhcp\n\nconfig dnsmasq\n\toption domain 'lan'\n",
+        text,
+    );
+    try expectRoundTrip(text);
+}
+
+test "package name needing quotes still gets them (not identifier-safe)" {
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, "package 'weird name'\n\nconfig t\n\toption a 'b'\n");
+    defer pkg.deinit(gpa);
+    const text = try serialize(gpa, &pkg);
+    defer gpa.free(text);
+    try testing.expectEqualStrings(
+        "package 'weird name'\n\nconfig t\n\toption a 'b'\n",
         text,
     );
     try expectRoundTrip(text);
@@ -957,9 +1013,10 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 }
 
 /// Fill `buf` with `smith`-chosen random bytes and return the whole slice —
-/// including bytes below 0x20 (other than `\n`/`\t`/`\r`), which `serialize`
-/// legitimately rejects with `error.UnserializableValue`; the caller is
-/// expected to propagate that as an early, no-bug return.
+/// including bytes below 0x20, which `serialize` legitimately rejects with
+/// `error.UnserializableValue` (UCI text has no escape producing a control
+/// byte, `\n`/`\t`/`\r` included — see the parser's double-quote comment);
+/// the caller is expected to propagate that as an early, no-bug return.
 fn fuzzToken(smith: *std.testing.Smith, buf: []u8, min_len: usize) []const u8 {
     smith.bytes(buf);
     const len: usize = @max(min_len, smith.valueRangeAtMost(u16, 0, @intCast(buf.len)));
@@ -1043,4 +1100,224 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
     const s2 = try serialize(gpa, &reparsed);
     defer gpa.free(s2);
     try testing.expectEqualStrings(s1, s2);
+}
+
+// ── real uci capture (OpenWRT 25.12.4 VM lane) ──────────────────────────────
+//
+// Everything below is frozen from real runs of the real `uci` binary inside
+// the OpenWRT image in `scripts/vm/images/` (see scripts/vm/README.md): a
+// hand-written config was pushed into the guest's `/etc/config/`, then the
+// real `uci export`/`uci show` stdout was captured verbatim — nothing here
+// is derived from this module's own parser/serializer (per the project's
+// governing rule: never derive a golden from your own output).
+//
+// Two real, reproducible disagreements were found this way and FIXED above
+// (not papered over in a golden):
+//  1. Real `uci`'s double-quote escapes are ONLY `\\`, `\"`, `\'` — a
+//     backslash before any other character (n/t/r included) drops the
+//     backslash and keeps that character literally; there is no UCI escape
+//     that produces an actual control byte. This module previously
+//     converted `\n`/`\t`/`\r` to real control bytes, which no test caught
+//     because the (self-consistent) hand goldens only ever round-tripped
+//     through this module's own encoder/decoder pair — a real second
+//     implementation was needed to expose it. Fixed in the parser and
+//     serializer above; see "double-quote escapes" and the two
+//     "serializer rejects" tests.
+//  2. Real `uci export` prints an unquoted `package <name>` header (a bare
+//     word, not `package '<name>'`) when the name is identifier-safe.
+//     Fixed above (`serialize` now uses `writeWord` for the package name);
+//     see "package keyword and header serialization".
+//
+// One STYLE-ONLY difference was found and deliberately NOT changed: when a
+// value contains a literal `'`, this module double-quotes it (`"a'b"`); the
+// real `uci` binary instead splices single-quoted segments the POSIX-shell
+// way (`'a'\''b'`). Both are valid UCI encodings of the identical value —
+// this module's simpler single-segment choice is an explicit, documented
+// design decision (SPEC.md), not a bug, so the golden below asserts VALUE
+// equality for that field rather than raw text equality with real `uci`'s
+// own splice-quoting.
+
+const captured_testcfg_raw = "\n" ++
+    "config interface 'lan'\n" ++
+    "\toption proto 'static'\n" ++
+    "\toption ipaddr '192.168.1.1'\n" ++
+    "\toption netmask '255.255.255.0'\n" ++
+    "\tlist dns '8.8.8.8'\n" ++
+    "\tlist dns '1.1.1.1'\n" ++
+    "\n" ++
+    "config rule\n" ++
+    "\toption name 'weird \"quote\" and back\\slash'\n" ++
+    "\toption enabled '1'\n" ++
+    "\toption note \"line1\\nline2\\ttabbed\"\n" ++
+    "\n" ++
+    "config rule\n" ++
+    "\toption name 'second anon rule, with a comma and # not-a-comment'\n" ++
+    "\n" ++
+    "config switch 'globals'\n" ++
+    "\toption bare_word_value_here 1\n" ++
+    "\tlist ports '1'\n" ++
+    "\tlist ports '2'\n" ++
+    "\tlist ports '6t'\n";
+
+// Real `uci export testcfg` stdout for the config above (the real binary
+// always synthesizes a bare `package <name>` header from the requested
+// config name — a CLI-layer convention this module's own parser doesn't
+// need to replicate for raw-file parsing, but which `serialize` matches
+// byte-for-byte once `pkg.name` is set the same way, as the test below
+// shows).
+const captured_testcfg_export = "package testcfg\n" ++
+    "\n" ++
+    "config interface 'lan'\n" ++
+    "\toption proto 'static'\n" ++
+    "\toption ipaddr '192.168.1.1'\n" ++
+    "\toption netmask '255.255.255.0'\n" ++
+    "\tlist dns '8.8.8.8'\n" ++
+    "\tlist dns '1.1.1.1'\n" ++
+    "\n" ++
+    "config rule\n" ++
+    "\toption name 'weird \"quote\" and back\\slash'\n" ++
+    "\toption enabled '1'\n" ++
+    "\toption note 'line1nline2ttabbed'\n" ++
+    "\n" ++
+    "config rule\n" ++
+    "\toption name 'second anon rule, with a comma and # not-a-comment'\n" ++
+    "\n" ++
+    "config switch 'globals'\n" ++
+    "\toption bare_word_value_here '1'\n" ++
+    "\tlist ports '1'\n" ++
+    "\tlist ports '2'\n" ++
+    "\tlist ports '6t'\n" ++
+    "\n";
+
+// Real `uci show testcfg` stdout for the SAME config — dotted notation,
+// revealing the generated anonymous-section addressing (`@rule[0]`,
+// `@rule[1]`: a per-type, 0-based, file-order index — NOT a random/hashed
+// name). This module's own model doesn't expose `@type[N]` addressing
+// (out of scope, CLI layer — see SPEC.md), so the test below checks the
+// same file-order/per-type semantics through `Package.iterate`.
+const captured_testcfg_show = "testcfg.lan=interface\n" ++
+    "testcfg.lan.proto='static'\n" ++
+    "testcfg.lan.ipaddr='192.168.1.1'\n" ++
+    "testcfg.lan.netmask='255.255.255.0'\n" ++
+    "testcfg.lan.dns='8.8.8.8' '1.1.1.1'\n" ++
+    "testcfg.@rule[0]=rule\n" ++
+    "testcfg.@rule[0].name='weird \"quote\" and back\\slash'\n" ++
+    "testcfg.@rule[0].enabled='1'\n" ++
+    "testcfg.@rule[0].note='line1nline2ttabbed'\n" ++
+    "testcfg.@rule[1]=rule\n" ++
+    "testcfg.@rule[1].name='second anon rule, with a comma and # not-a-comment'\n" ++
+    "testcfg.globals=switch\n" ++
+    "testcfg.globals.bare_word_value_here='1'\n" ++
+    "testcfg.globals.ports='1' '2' '6t'\n";
+
+test "real uci capture: parse(raw file) matches the real `uci show` structure — sections, list accumulation, two distinct anonymous `rule` sections in file order" {
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, captured_testcfg_raw);
+    defer pkg.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 4), pkg.sections.len);
+
+    const lan = &pkg.sections[0];
+    try testing.expectEqualStrings("interface", lan.type);
+    try testing.expectEqualStrings("lan", lan.name.?);
+    try testing.expectEqualStrings("static", lan.get("proto").?);
+    try testing.expectEqualStrings("192.168.1.1", lan.get("ipaddr").?);
+    const dns = lan.getList("dns");
+    try testing.expectEqual(@as(usize, 2), dns.len);
+    try testing.expectEqualStrings("8.8.8.8", dns[0]);
+    try testing.expectEqualStrings("1.1.1.1", dns[1]);
+
+    // The two anonymous `rule` sections — real uci addresses these as
+    // @rule[0]/@rule[1] in exactly this file order; this module's
+    // `iterate` gives the same order without needing that addressing.
+    var it = pkg.iterate("rule");
+    const r0 = it.next().?;
+    try testing.expect(r0.anonymous);
+    try testing.expectEqualStrings("weird \"quote\" and back\\slash", r0.get("name").?);
+    try testing.expectEqualStrings("1", r0.get("enabled").?);
+    // Confirms the real-bug fix: \n/\t are literal, not control bytes.
+    try testing.expectEqualStrings("line1nline2ttabbed", r0.get("note").?);
+    const r1 = it.next().?;
+    try testing.expect(r1.anonymous);
+    try testing.expectEqualStrings("second anon rule, with a comma and # not-a-comment", r1.get("name").?);
+    try testing.expect(it.next() == null);
+
+    const globals = &pkg.sections[3];
+    try testing.expectEqualStrings("switch", globals.type);
+    try testing.expectEqualStrings("globals", globals.name.?);
+    try testing.expectEqualStrings("1", globals.get("bare_word_value_here").?);
+    const ports = globals.getList("ports");
+    try testing.expectEqual(@as(usize, 3), ports.len);
+    try testing.expectEqualStrings("6t", ports[2]);
+
+    // Confirm the real `@type[N]` addressing convention this capture
+    // demonstrates is exactly the file-order-per-type index `iterate`
+    // reflects (0 then 1, for the two `rule` sections above).
+    try testing.expect(std.mem.indexOf(u8, captured_testcfg_show, "testcfg.@rule[0]=rule\n") != null);
+    try testing.expect(std.mem.indexOf(u8, captured_testcfg_show, "testcfg.@rule[1]=rule\n") != null);
+}
+
+test "real uci capture: our serialize() reproduces real `uci export`'s canonical bytes exactly (package header, quoting, blank lines)" {
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, captured_testcfg_raw);
+    defer pkg.deinit(gpa);
+    pkg.name = "testcfg"; // `uci export <name>` synthesizes this; see header comment
+    const text = try serialize(gpa, &pkg);
+    defer gpa.free(text);
+    // One further, deliberately-NOT-replicated difference: the real `uci
+    // export` ends its output with an extra trailing blank line (verified
+    // in the raw capture — a real blank line, not a terminal artifact) even
+    // after the LAST block, where this module's `serialize` only inserts a
+    // blank line BETWEEN blocks. Trimming that one trailing byte makes the
+    // rest byte-identical; changing `serialize`'s general blank-line rule
+    // for this one CLI-only trailing newline was judged not worth the
+    // blast radius on every other hand test that asserts no trailing
+    // blank line.
+    try testing.expectEqualStrings(captured_testcfg_export[0 .. captured_testcfg_export.len - 1], text);
+
+    // And it round-trips through this module's own parser back to an
+    // equal model (the governing invariant `serialize` promises).
+    var reparsed = try parse(gpa, text);
+    defer reparsed.deinit(gpa);
+    try testing.expect(pkg.eql(&reparsed));
+}
+
+// Second capture: one option per escape sequence, isolating exactly which
+// backslash sequences are true escapes in real double-quoted UCI text.
+const captured_esctest_raw = "config t\n" ++
+    "\toption bslash \"a\\\\b\"\n" ++
+    "\toption dquote \"a\\\"b\"\n" ++
+    "\toption squote \"a\\'b\"\n" ++
+    "\toption newline \"a\\nb\"\n" ++
+    "\toption tab \"a\\tb\"\n" ++
+    "\toption cr \"a\\rb\"\n" ++
+    "\toption arbitrary \"a\\yb\"\n" ++
+    "\toption single_no_escape 'a\\nb\\tc\\\\d'\n";
+
+test "real uci capture: escape-table probe — only \\\\ \\\" \\' are true escapes; \\n \\t \\r \\y all drop the backslash and keep the literal char" {
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, captured_esctest_raw);
+    defer pkg.deinit(gpa);
+    const sec = &pkg.sections[0];
+
+    // Real `uci export`/`uci show` for this file (frozen, for reference):
+    //   option bslash 'a\b'      option dquote 'a"b'
+    //   option squote 'a'\''b'   option newline 'anb'
+    //   option tab 'atb'         option cr 'arb'
+    //   option arbitrary 'ayb'   option single_no_escape 'a\nb\tc\\d'
+    try testing.expectEqualStrings("a\\b", sec.get("bslash").?);
+    try testing.expectEqualStrings("a\"b", sec.get("dquote").?);
+    try testing.expectEqualStrings("a'b", sec.get("squote").?); // value equal; see header re: splice-quoting style
+    try testing.expectEqualStrings("anb", sec.get("newline").?);
+    try testing.expectEqualStrings("atb", sec.get("tab").?);
+    try testing.expectEqualStrings("arb", sec.get("cr").?);
+    try testing.expectEqualStrings("ayb", sec.get("arbitrary").?);
+    // Single quotes take NO escapes at all — backslashes stay literal.
+    try testing.expectEqualStrings("a\\nb\\tc\\\\d", sec.get("single_no_escape").?);
+}
+
+test "real uci count canary: frozen raw configs + real capture, byte lengths unchanged" {
+    try testing.expectEqual(@as(usize, 445), captured_testcfg_raw.len);
+    try testing.expectEqual(@as(usize, 462), captured_testcfg_export.len);
+    try testing.expectEqual(@as(usize, 198), captured_esctest_raw.len);
 }

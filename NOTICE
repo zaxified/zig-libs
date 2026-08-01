@@ -508,18 +508,21 @@ re-examined 2026-07-29 (both recorded in the project git history).
                layout and the ubus protocol constants (MSG_*/ATTR_*) as
                declared in ubus ubusmsg.h (LGPL-2.1); these are uncopyrightable
                protocol facts (integer constants + a packed struct),
-               re-derivable from the documented header layout (not from a
-               captured `ubus -S` transcript — none exists in this repo, see
-               modules/blobmsg/SPEC.md's backlog). libubus-io.c (LGPL-2.1)
-               contributed NO code: the unix-socket transport (blocking
-               read/write loops, single-buffer send, fixed-header framing,
-               seq-matched request/reply) is an independent implementation —
-               none of libubus-io.c's expression (writev/iovec scatter-gather,
-               chunked reader, SCM_RIGHTS fd-passing, callback
-               request-registry, reconnect state machine) is present. A real
-               ubusd integration test (connect, list, invoke) passes against a
-               live daemon when present; a byte-parity comparison against
-               `ubus -S` output on real hardware has not yet been done.
+               re-derivable from the documented header layout. libubus-io.c
+               (LGPL-2.1) contributed NO code: the unix-socket transport
+               (blocking read/write loops, single-buffer send, fixed-header
+               framing, seq-matched request/reply) is an independent
+               implementation — none of libubus-io.c's expression (writev/
+               iovec scatter-gather, chunked reader, SCM_RIGHTS fd-passing,
+               callback request-registry, reconnect state machine) is present.
+               A real ubusd integration test (connect, list, invoke) passes
+               against a live daemon when present. `codec.zig`'s "real ubusd
+               capture" tests freeze wire bytes and matching `ubus -S` JSON
+               text from a real `ubus`/`ubusd` pair run once inside the
+               `scripts/vm/` OpenWRT VM, exercising it purely as a black-box
+               test oracle (policy §0 — no libubus/ubus source consulted,
+               needing no attribution beyond this existing entry); see
+               modules/blobmsg/SPEC.md for the byte-parity findings.
                Published under MIT; the only copyleft touchpoint is the
                uncopyrightable ubus protocol facts above.
 
@@ -640,7 +643,13 @@ re-examined 2026-07-29 (both recorded in the project git history).
                Configuration Interface) file format (OpenWRT wiki/docs).
                libuci (LGPL-2.1) is referenced for the format only — no
                libuci source was consulted or copied; the file format is the
-               documented interface.
+               documented interface. `root.zig`'s "real uci capture" tests
+               freeze raw config bytes and the real `uci` binary's own
+               `export`/`show` stdout for them, run once inside the
+               `scripts/vm/` OpenWRT VM, exercising it purely as a black-box
+               test oracle (policy §0 — no libuci/uci source consulted,
+               needing no attribution beyond this existing entry); see
+               modules/uci/SPEC.md for the findings.
 
   decimal    — the rounding modes (half_even/half_up/half_down/up/down/
                ceiling/floor + rescale/quantize/divRound) and `BigDecimal`

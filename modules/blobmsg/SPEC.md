@@ -41,23 +41,44 @@ whose values all have a blobmsg mapping (null/non-object → `error.Unsupported`
 A scripted in-process daemon (unix socket + thread) speaks the exact reply choreography and asserts
 both required daemon behaviors from the daemon side, covering list/filtered-list/invoke-with-args/
 void/error/unknown-object and subscribe→event-delivery→EOF. Codec tests pin golden wire bytes
-(hand-derived from the documented libubox `blob.h`/`blobmsg.h` format, not captured from a real
-device — see "Backlog" below), decode nested TABLE/ARRAY, round-trip JSON→blobmsg→JSON, split
-INT32/INT64 at the i32 boundary, golden DOUBLE bits, reject truncated/bad-length/OOB/hostile-nesting/
-oversized input; a `std.testing.fuzz` case asserts walkers + JSON decoder never crash/loop/read OOB.
-A real-ubusd integration test runs when `/var/run/ubus/ubus.sock` exists and skips cleanly
-otherwise — it exercises `list()` (asserts ≥1 object returned) and `invoke("system", "board", null)`
-(asserts the result decodes as JSON object), i.e. that the client talks to a real daemon and gets
-back well-formed data; it is **not** a byte-for-byte comparison against anything. Run:
-`zig build test-blobmsg`.
+(hand-derived from the documented libubox `blob.h`/`blobmsg.h` format), decode nested TABLE/ARRAY,
+round-trip JSON→blobmsg→JSON, split INT32/INT64 at the i32 boundary, golden DOUBLE bits, reject
+truncated/bad-length/OOB/hostile-nesting/oversized input; a `std.testing.fuzz` case asserts walkers +
+JSON decoder never crash/loop/read OOB. A real-ubusd integration test runs when
+`/var/run/ubus/ubus.sock` exists and skips cleanly otherwise.
+
+**Real-daemon capture (closes the byte-parity backlog below).** `codec.zig`'s "real ubusd capture"
+section freezes bytes from a single real run inside the `scripts/vm/` OpenWRT VM (25.12.4): a
+throwaway byte-relay (never committed) was spliced between the real `ubus` CLI and the real `ubusd`
+via `ubus -s <socket>`, capturing the exact wire bytes of a LOOKUP + reply, an INVOKE with an empty
+args gotcha + reply, and an INVOKE with JSON args + reply, across four different real provider
+objects (`system.board`, `system.info`, `network.device.status`, `network.interface.lan.status`).
+The frozen DATA replies are asserted to decode **byte-identical** to the real `ubus -S` CLI's own
+JSON stdout for the same calls (captured in the same run) — a genuine textual byte-parity check, not
+merely "parses without error". Two encode-direction tests independently confirm this module's own
+`encodeMessage`/`appendAttr*`/`encodeArgs` reproduce the real `ubus` CLI's INVOKE bytes exactly, for
+both the empty-args and the JSON-args case. The real signature table also confirms this module's
+`BM.*` type constants match the daemon's own encoding (`"Boolean"` decodes to `7 == BM.INT8`,
+`"Table"` to `2 == BM.TABLE`, etc.).
+
+**Findings from the capture:**
+- The client-visible INVOKE reply is exactly DATA then a completion STATUS (OBJID + status code) —
+  confirmed across all four real provider objects above. No separate "ack STATUS (no OBJID)" was
+  ever observed before DATA on the client's own connection, though `Client.invoke`'s loop already
+  tolerates zero-or-more such acks before the completion, so this is not a functional bug — only the
+  scripted mock daemon's ack is exercised by any test; the real corpus never hits that branch.
+- The real `ubus` CLI independently confirms daemon gotcha #1 (an INVOKE always carries
+  `UBUS_ATTR_DATA`, empty when there are no arguments) — previously verified only against this
+  module's own scripted mock daemon.
+- No `BM.DOUBLE` or `BM.INT16` value appears anywhere in this real corpus (`ubus`'s own blobmsg-JSON
+  codec only ever emits STRING/INT8(bool)/INT32/INT64/TABLE/ARRAY); both remain covered only by the
+  hand-derived goldens, which is documented rather than left silently unstated.
+- No disagreement between this module's encoder and the real client's bytes was found.
 
 ## Backlog / deferred
-No captured `ubus -S` transcript exists in this repo, and no qemu automation runs one — the
-`scripts/vm/` VM lane (see its README) does not include a blobmsg/ubus entry. A genuine byte-parity
-check — this client's decoded output diffed against `ubus -S`'s own output for the same calls,
-captured on real OpenWRT hardware or scripted against the qemu OpenWRT image — has not yet been
-built. Until it exists, "byte-parity with `ubus -S`" is a design goal the wire-format documentation
-(RFC-less, header-derived) supports, not a verified fact.
+None beyond the documented DOUBLE/INT16 real-corpus gap noted above (the module's own encode/decode
+API supports both; the real daemon's JSON codepath simply never produces them on the captured
+OpenWRT build).
 
 ## Status
 `extract · linux (codec: any) · client · reentrant` + deps: none (std only — `std.json` for the
