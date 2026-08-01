@@ -73,9 +73,17 @@ of the classic EOCD) on a small member, covering both Store and Deflate through 
 round-trip `ArchiveWriter`'s output (Store + Deflate) back through this module's own `Archive`/
 `EntryReader` byte-for-byte, cross-check the written CRC-32/sizes independently via `std.zip.Iterator`
 directly (so a wrong field written by `ArchiveWriter` can't hide behind a lenient reader), and confirm
-`addEntry` rejects zip-slip names. Ad hoc (not a standing test — no external-tool dependency added to
-the suite): a small `ArchiveWriter`-produced archive was verified against the real `unzip`/`zipinfo`
-(`unzip -t` clean, `unzip -p` byte-exact for both a Store and a Deflate entry). Run: `zig build
+`addEntry` rejects zip-slip names.
+
+`write_golden_test.zig` freezes what used to be an ad hoc, uncommitted check: a small
+`ArchiveWriter`-produced archive (`testdata/write_golden.zip`, 327 bytes, Store + Deflate entries) was
+verified once against the real `unzip`/`zipinfo` (`unzip -t` clean, `zipinfo -v` confirms CRC-32/sizes/
+EOCD/central-directory offsets, `unzip -p` byte-exact for both entries) and committed. `ArchiveWriter`
+is asserted to reproduce those exact bytes offline (no subprocess); local-header-vs-central-directory
+consistency, CRC-32, sizes, and the end-of-central-directory record are each asserted directly against
+the frozen bytes, and this module's own `Archive`/`EntryReader` are asserted to decode them back to the
+original plaintext. `std.zip.Iterator`'s agreement is kept as an extra internal-consistency check but
+is not counted as the external oracle (see that file's doc comment for the reasoning). Run: `zig build
 test-zipstream`.
 
 ## Backlog / deferred

@@ -39,7 +39,18 @@ survive, incl. >100-byte GNU 'L'/'K' long names, dirs, symlinks, hard links; a g
 header/content, mid-archive truncation, bad checksum, garbage block, hostile 'L' size, empty archive.
 A live external cross-check writes an archive that system GNU `tar` must list (`tvf`) and extract
 (`xf`), and reads a GNU-tar-produced archive back (skips cleanly with no `tar` on PATH); `packDir`
-round-trips real statx attrs on Linux. Run: `zig build test-tar`.
+round-trips real statx attrs on Linux.
+
+The live cross-check only anchors the writer on a machine with `tar` installed. `write_golden_test.zig`
+closes that gap offline: five archives (`testdata/write_golden_*.tar`) captured once from real GNU tar
+1.35 (`--format=ustar` for four — byte-identical magic to this module's own writer, so those are
+asserted fully byte-exact, incl. the 512-byte content padding and the two-zero-block trailer; `--format=gnu`
+for the >100-byte long-name case, asserted field-by-field since GNU's own magic/uname/gname differ by
+design) cover the writer's header field padding/octal formatting, the checksum field, every typeflag
+(file/dir/symlink/hardlink), the GNU 'L' long-name extension, and — read back through this module's own
+`Reader` — the real 10240-byte record-blocking-factor padding GNU tar itself emits (which this module's
+`Writer.finish()` deliberately does not replicate; a design choice, not a gap — see that file's doc
+comment). No subprocess, no skip path. Run: `zig build test-tar`.
 
 ## Backlog / deferred
 None beyond the documented out-of-scope list (pax interpretation,

@@ -1329,3 +1329,12 @@ test "GNU tar extracts + lists our archive (external cross-check)" {
         try testing.expectEqual(@as(?Entry, null), try tr.next());
     }
 }
+
+// ── offline write-path anchor (real GNU tar captures, no subprocess) ──────
+//
+// Complements the live cross-check above (host-gated, skips without a `tar`
+// on PATH): frozen bytes captured once from real GNU tar, asserted with no
+// subprocess and no skip path — see write_golden_test.zig's doc comment.
+test {
+    _ = @import("write_golden_test.zig");
+}

@@ -1290,3 +1290,13 @@ fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
     archive.init(testing.io, testing.allocator, f) catch return;
     defer archive.deinit();
 }
+
+// ── offline write-path anchor (real unzip/zipinfo capture, no subprocess) ─
+//
+// Complements SPEC.md's documented ad hoc `unzip`/`zipinfo` check (never
+// previously committed as a standing test): a frozen archive verified once
+// against the real tools, asserted with no subprocess — see
+// write_golden_test.zig's doc comment.
+test {
+    _ = @import("write_golden_test.zig");
+}
