@@ -165,12 +165,45 @@ of the W3C *Exclusive XML Canonicalization 1.0* and *Canonical XML 1.0* specs.
   DTD-typed rows of §3.4 (`normNames`/`normId`) are omitted — DTD attribute
   typing is out of scope.
 
-**Signature verification — constructed round-trip fixtures (honestly labelled):**
-built by signing `<SignedInfo>` / computing reference digests with the sibling
-`rsa` / `p256` signers (test-only), then driving `verify` end to end. The
-byte-exact interop guarantee lives in the C14N vector tests above; these fixtures
-prove reference-digest + SignedInfo-signature + enveloped-transform verification
-agree with a real signer, and that each mutation fails:
+**Signature verification — EXTERNAL anchor (`test_external.zig`, byte-exact
+cross-tool interop):** every fixture below was produced ONCE, offline, by a
+genuinely independent tool and committed as a literal byte string; nothing
+shells out at test time.
+
+- **`xmlsec1`** (C, OpenSSL backend) signed: an enveloped RSA-SHA256 document
+  (and its tampered-content twin, which `xmlsec1 --verify` itself rejects with
+  `Failure reason: REFERENCE`); an **enveloping** RSA-SHA256 document (the
+  `<ds:Signature>` is the document root, the signed content a same-document
+  `#id` `<ds:Object>` reference — the first test in this module to exercise
+  successful non-empty-URI reference resolution, every prior test used
+  `URI=""`); and an enveloped ECDSA-P256-SHA256 document (confirming
+  `xmlsec1`'s OpenSSL backend emits the raw 64-byte IEEE-P1363 `r‖s` form this
+  module requires, not DER).
+- **`signxml`** (pure Python, shares no code with xmlsec1/OpenSSL) signed an
+  enveloped RSA-SHA256 document independently, then `xmlsec1 --verify`
+  re-confirmed it — so two mutually-independent external verifiers agree with
+  this module's verifier on the same bytes. signxml's `<KeyInfo>` carries a
+  real `<ds:RSAKeyValue>` (not `X509Certificate`), exercising the
+  never-trust-KeyInfo path with genuine key material instead of an opaque
+  blob.
+- **The reverse direction** ("`xmlsec1` verifies OUR signature") is anchored
+  via determinism rather than a shell-out: RSASSA-PKCS1-v1_5 (RFC 8017 §8.2)
+  has no salt or nonce, so for a fixed key and message there is exactly one
+  valid signature. `openssl dgst -sha256 -sign` was run OFFLINE over the
+  identical canonical `<SignedInfo>` bytes `buildSignedRsaDoc` constructs
+  (computed independently with `xmllint --exc-c14n`) under the SAME embedded
+  test key, and `xmlsec1 --verify` confirmed the result — then a test asserts
+  `buildSignedRsaDoc`'s own output is byte-identical to that externally-signed
+  value. See the `EXTERNAL anchor` test next to `buildSignedRsaDoc` in
+  `root.zig` for the exact reproduction commands.
+
+**Signature verification — constructed round-trip fixtures (honestly labelled,
+`root.zig`):** built by signing `<SignedInfo>` / computing reference digests
+with the sibling `rsa` / `p256` signers (test-only), then driving `verify` end
+to end. These fixtures prove reference-digest + SignedInfo-signature +
+enveloped-transform verification agree with a real signer, and that each
+mutation fails; the EXTERNAL anchors above are what make that signer's output
+authoritative rather than merely self-consistent:
 
 - valid RSA-SHA256 enveloped signature → `valid`.
 - tampered signed content → reference digest mismatch → invalid.

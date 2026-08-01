@@ -127,9 +127,24 @@ for A192*). The CEK length must match the content algorithm's key size, else
   mismatched SHA-256-digest/MGF1-SHA1 pair, PKCS1-v1.5, or kw-aes256) and a
   plaintext `<saml:Assertion>` (AES-128/256 GCM and CBC); the public decrypt
   path recovers the exact plaintext. These are self-consistency /
-  interop-shape tests, **not** external byte-exact vectors — **no real external
-  SAML EncryptedAssertion fixture with its private key was available**; if one is
-  obtained later it should be added and cited here.
+  interop-shape tests, **not** external byte-exact vectors.
+- **EXTERNAL anchor** (`test_external.zig`): a real `<xenc:EncryptedData>`
+  produced ONCE, offline, by `xmlsec1 --encrypt` (C, OpenSSL backend — a
+  genuinely independent XML-Enc implementation) against a freshly-generated
+  2048-bit RSA keypair, committed as a literal fixture:
+  - RSA-OAEP-mgf1p key transport + AES-256-GCM content — decrypts to the exact
+    plaintext.
+  - xenc11 `rsa-oaep` (DigestMethod=SHA-256, **MGF element omitted** — a real
+    interop shape that exercises the xenc11-spec MGF1-SHA1 default, not merely
+    an explicit MGF value) + AES-256-CBC content — decrypts to the exact
+    plaintext.
+  - A tampered copy (one base64 char flipped in the content `CipherValue`)
+    that `xmlsec1 --decrypt` itself refuses is refused here too
+    (`error.DecryptionError`).
+  `xmlsec1 --decrypt` independently confirmed all three outcomes on these exact
+  bytes before they were pasted in. The reverse direction ("xmlsec1 decrypts
+  what we produce") does not apply: this module is decrypt-only by design (see
+  README "Scope") and has no encrypt API to hand xmlsec1 anything.
 - **Teeth (with positive controls):** GCM tag tamper → `DecryptionError`; CBC
   corrupted block → `DecryptionError`; unknown content/key algorithm →
   `UnsupportedAlgorithm`; AES-192 → `UnsupportedAlgorithm`; `rsa-1_5` without

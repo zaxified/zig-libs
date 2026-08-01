@@ -478,6 +478,26 @@ Note on the common public fixtures: the widely-circulated `python3-saml`
 dynamically at test time). It is unsuitable as a static end-to-end signature
 fixture, which is precisely why the independent-toolchain fixture above is used.
 
+### Encrypted assertion — EXTERNAL anchor (`test_encrypted_external.zig`)
+
+`test_encrypted.zig`'s encrypted-assertion fixtures are CONSTRUCTED (this
+module's own test helpers encrypt the plaintext with locally-driven AES-GCM/
+RSA-OAEP, mirroring `xmlenc`'s own round-trip posture). `test_encrypted_external.zig`
+adds a genuine external one: `xmlsec1 --encrypt` (C, OpenSSL backend) encrypted
+the SAME genuinely-signed assertion `test_fixture.zig` anchors (made
+self-contained, unchanged otherwise) under a freshly-generated 2048-bit RSA
+keypair, producing a real `<xenc:EncryptedData>`/`<xenc:EncryptedKey>`
+(RSA-OAEP-mgf1p + AES-256-GCM) committed verbatim. `xmlsec1 --decrypt`
+independently confirmed, offline, that it recovers the exact self-contained
+signed assertion byte-for-byte before this fixture was pasted in — so
+decrypt → verify → extract through the full `saml` pipeline is now anchored
+against a real external ciphertext, not merely `xmlenc`'s decrypt primitive in
+isolation. A paired negative (one base64 character flipped in the content
+`CipherValue` — a tamper `xmlsec1 --decrypt` itself was confirmed to refuse)
+is refused here too (`error.AssertionDecryptionFailed`). The 2048-bit SP key is
+test material only; its private half was generated for this fixture and is
+committed here (never used for anything but test decryption).
+
 ### EncryptedID / EncryptedAttribute / Holder-of-Key / sender-vouches / LoA fixtures (constructed)
 
 These features put new content **inside** the signed assertion (an encrypted

@@ -539,6 +539,7 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     _ = @import("test_roundtrip.zig");
+    _ = @import("test_external.zig");
 }
 
 test "classifyContent allow-list" {

@@ -472,6 +472,7 @@ fn decodeBase64(arena: std.mem.Allocator, text: []const u8) VerifyError![]u8 {
 // Pull in the canonicalization test suite (byte-exact W3C vectors).
 test {
     _ = c14n;
+    _ = @import("test_external.zig");
 }
 
 const testing = std.testing;
@@ -615,6 +616,51 @@ test "verify: valid RSA-SHA256 enveloped signature round-trips" {
     try testing.expect(res.valid);
     try testing.expectEqual(@as(usize, 1), res.references.len);
     try testing.expect(res.references[0].digest_valid);
+}
+
+test "EXTERNAL anchor: our own signer's output is byte-identical to openssl's over the same canonical bytes" {
+    // RSASSA-PKCS1-v1_5 (RFC 8017 §8.2) is DETERMINISTIC — no salt, no nonce —
+    // so for a FIXED key and FIXED message there is exactly one valid
+    // signature, and any correct implementation must produce it. That lets us
+    // cross-check `buildSignedRsaDoc`'s own signer (used by every OTHER test in
+    // this file) against `openssl dgst -sha256 -sign` run OFFLINE over the
+    // identical canonical `<SignedInfo>` bytes, computed with `xmllint
+    // --exc-c14n` (independent of this module's own C14N). Reproduction
+    // commands (not run by the test suite):
+    //   xmllint --exc-c14n ref_input.xml | openssl dgst -sha256 -binary | base64
+    //   xmllint --exc-c14n si_input.xml | openssl dgst -sha256 -sign priv.pem -binary | base64
+    //   xmlsec1 --verify --lax-key-search --pubkey-pem pub.pem final_doc.xml   # => OK
+    // `ref_input.xml`/`si_input.xml` are the exact `with_empty`/`with_digest`
+    // documents `buildSignedRsaDoc` constructs for content="Hello World" under
+    // the SAME `test_rsa_priv_pem` embedded above. This is the same "EXTERNAL
+    // anchor" pattern `saml`'s `test_redirect_binding.zig` already uses for its
+    // Redirect-signing primitive.
+    const external_digest_b64 = "qp5qp7UvMAZZZNnPy5biqRM83FVVRSmnkEymMrZATJE=";
+    const external_signature_b64 =
+        "hN3vrcjhR4T8Qa4i9XYStjFbbKWaNi26+ekfD8wxiFk1b+FkKEkgkRCk34000nnLqV2PVy9jVYFhw8ApaW9gTH/O/+rkOXys1u7Ye1vUBQFx+tuP0icIesNPp1BrD9h7cQGo3RSvjJXG67x+XdXHRjYGehHhVhicffTsA1ji0T40dUK05Crny68WwJD4Jq626ZCTvUMZwRToNbxoLUmHyBClymP/34Jrzln9bSQTgABBwZ1MxMFE5KuW/qcbCbcT5OhJ0eXGx4Zo5kmce1iW8EDBsVpZ3xg9QMbr9vzQQN7Puw3lWZK7OnQsX+sFU+QoIHxwZBB+4S/+aerQ9+Shqw==";
+
+    var sd = try buildSignedRsaDoc(testing.allocator, false, false);
+    defer sd.deinit(testing.allocator);
+    var doc = try xml.parse(testing.allocator, sd.xml, .{});
+    defer doc.deinit();
+    const sig = childByName(doc.root, "Signature").?;
+    const digest_el = childByName(childByName(childByName(sig, "SignedInfo").?, "Reference").?, "DigestValue").?;
+    const sig_val_el = childByName(sig, "SignatureValue").?;
+    const got_digest = try digest_el.textContent(testing.allocator);
+    defer testing.allocator.free(got_digest);
+    const got_sig = try sig_val_el.textContent(testing.allocator);
+    defer testing.allocator.free(got_sig);
+
+    try testing.expectEqualStrings(external_digest_b64, got_digest);
+    try testing.expectEqualStrings(external_signature_b64, got_sig);
+
+    // And, as belt-and-suspenders, our own verifier accepts the reconstructed
+    // externally-signed document too (xmlsec1 --verify already confirmed OK
+    // offline against this exact digest+signature pair).
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    var res = try verify(testing.allocator, &doc, sig, .{ .key = .{ .rsa = pk } });
+    defer res.deinit(testing.allocator);
+    try testing.expect(res.valid);
 }
 
 test "verify: tampered signed content fails the reference digest" {

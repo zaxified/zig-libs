@@ -66,8 +66,10 @@ zig build test-xmlenc -Doptimize=ReleaseFast
 ```
 
 CBC core is byte-exact against NIST SP800-38A; AES key unwrap against RFC 3394;
-round-trips are locally constructed (no external SAML EncryptedAssertion fixture
-was available — see SPEC.md).
+most round-trips are locally constructed, plus two genuine external fixtures —
+`<xenc:EncryptedData>` produced by `xmlsec1 --encrypt` (RSA-OAEP-mgf1p +
+AES-256-GCM, and xenc11 rsa-oaep/SHA-256 + AES-256-CBC) — that this module
+decrypts to the exact expected plaintext; see `SPEC.md`.
 
 ## License
 

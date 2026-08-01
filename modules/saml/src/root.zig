@@ -2972,6 +2972,7 @@ test {
     _ = @import("test_xsw.zig");
     _ = @import("test_fixture.zig");
     _ = @import("test_encrypted.zig");
+    _ = @import("test_encrypted_external.zig");
     _ = @import("test_sign.zig");
     _ = @import("test_encrypted_id_attr.zig");
     _ = @import("test_hok.zig");
