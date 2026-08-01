@@ -246,6 +246,22 @@ pub const Outstation = struct {
             return;
         };
 
+        // A deactivation (cause 8) asks for a *pending* command to be
+        // cancelled. It must never operate the output — a "cancel" that fires
+        // the breaker is the worst direction a control system can fail in — so
+        // it short-circuits ahead of the select/execute machine below.
+        //
+        // §7.2.3: the answer is a deactivation confirmation (cause 9), with
+        // the P/N bit set when there was nothing to cancel. Here "pending"
+        // means exactly one thing: an outstanding select. A direct-mode point
+        // never holds one, so it always negative-confirms.
+        if (a.header.cause.cot == .deactivation) {
+            const had_pending = p.selected;
+            p.selected = false;
+            try self.echoDecoded(a, .deactivation_con, !had_pending, sink);
+            return;
+        }
+
         const se = o.element.selectExecute() orelse info.SelectExecute.execute;
         if (p.command_mode == .select_and_execute) {
             if (se == .select) {
@@ -640,6 +656,102 @@ test "outstation: select-before-operate needs the select first" {
     try o.handle(&hex("2d0106002f002d010001"), s.sink());
     a = try asdu_mod.decode(s.get(0), asdu_mod.default_params);
     try testing.expect(a.header.cause.negative);
+}
+
+test "outstation: a deactivation with nothing pending is negatively confirmed" {
+    var points = demoPoints();
+    var o = try Outstation.init(.{ .common_address = 47 }, &points);
+    var s = CollectSink{};
+
+    // C_SC_NA_1, cause 8 (deactivation), S/E = execute, SCO on. There is no
+    // select outstanding, so there is nothing to cancel.
+    // Effect first, status second: the value must be the assertion that trips.
+    try o.handle(&hex("2d0108002f002d010001"), s.sink());
+    try testing.expect(!points[3].element.sco.on);
+    try testing.expect(!points[3].selected);
+    // Cause 9 with the P/N bit.
+    try testing.expectEqual(@as(usize, 1), s.count);
+    try testing.expectEqualSlices(u8, &hex("2d0149002f002d010001"), s.get(0));
+
+    // The same with the S/E bit set. A deactivation must not *arm* the point
+    // either — cause 8 is never a select.
+    s.reset();
+    try o.handle(&hex("2d0108002f002d010081"), s.sink());
+    try testing.expect(!points[3].selected);
+    try testing.expect(!points[3].element.sco.on);
+    try testing.expectEqual(@as(usize, 1), s.count);
+    try testing.expectEqualSlices(u8, &hex("2d0149002f002d010081"), s.get(0));
+
+    // A direct-mode point never holds a selection, so it answers the same way
+    // and, again, does not operate.
+    var direct = [_]Point{
+        .{ .ioa = 302, .type_id = .c_dc_na_1, .element = .{ .dco = .{} }, .command_mode = .direct },
+    };
+    var od = try Outstation.init(.{ .common_address = 47 }, &direct);
+    s.reset();
+    try od.handle(&hex("2e0108002f002e010002"), s.sink());
+    try testing.expectEqual(info.DoublePoint.off, direct[0].element.dco.state);
+    try testing.expectEqual(@as(usize, 1), s.count);
+    try testing.expectEqualSlices(u8, &hex("2e0149002f002e010002"), s.get(0));
+}
+
+test "outstation: a deactivation cancels the select instead of executing it" {
+    var points = demoPoints();
+    var o = try Outstation.init(.{ .common_address = 47 }, &points);
+    var s = CollectSink{};
+
+    // Select the point.
+    try o.handle(&hex("2d0106002f002d010081"), s.sink());
+    try testing.expectEqualSlices(u8, &hex("2d0107002f002d010081"), s.get(0));
+    try testing.expect(points[3].selected);
+
+    // Cancel it, with the S/E bit clear — the form that used to fall straight
+    // through into the execute branch and operate the output. The value is
+    // asserted before the reply bytes on purpose: the regression this test
+    // exists for must show up as a *value* failure, not merely a wrong COT.
+    s.reset();
+    try o.handle(&hex("2d0108002f002d010001"), s.sink());
+    try testing.expect(!points[3].element.sco.on);
+    try testing.expect(!points[3].selected);
+    // Cause 9, no P/N — there really was something to cancel — and no
+    // activation termination, because nothing was activated.
+    try testing.expectEqual(@as(usize, 1), s.count);
+    try testing.expectEqualSlices(u8, &hex("2d0109002f002d010001"), s.get(0));
+
+    // The execute that follows the cancelled select is now refused, and — the
+    // assertion the whole bug turns on — the point value is still untouched.
+    s.reset();
+    try o.handle(&hex("2d0106002f002d010001"), s.sink());
+    try testing.expect(!points[3].element.sco.on);
+    try testing.expectEqual(@as(usize, 1), s.count);
+    try testing.expectEqualSlices(u8, &hex("2d0147002f002d010001"), s.get(0));
+
+    // The same cancel sent with the S/E bit still set (a master mirroring its
+    // own select) must also clear the selection rather than re-arm the point.
+    s.reset();
+    try o.handle(&hex("2d0106002f002d010081"), s.sink());
+    try testing.expect(points[3].selected);
+    s.reset();
+    try o.handle(&hex("2d0108002f002d010081"), s.sink());
+    try testing.expect(!points[3].selected);
+    try testing.expect(!points[3].element.sco.on);
+    try testing.expectEqualSlices(u8, &hex("2d0109002f002d010081"), s.get(0));
+    s.reset();
+    try o.handle(&hex("2d0106002f002d010001"), s.sink());
+    try testing.expect(!points[3].element.sco.on);
+    try testing.expectEqualSlices(u8, &hex("2d0147002f002d010001"), s.get(0));
+
+    // A fresh select/execute pair still works, so cancelling did not wedge the
+    // point: the activation path survives end to end.
+    s.reset();
+    try o.handle(&hex("2d0106002f002d010081"), s.sink());
+    try o.handle(&hex("2d0106002f002d010001"), s.sink());
+    try testing.expectEqual(@as(usize, 3), s.count);
+    try testing.expectEqualSlices(u8, &hex("2d0107002f002d010081"), s.get(0));
+    try testing.expectEqualSlices(u8, &hex("2d0107002f002d010001"), s.get(1));
+    try testing.expectEqualSlices(u8, &hex("2d010a002f002d010001"), s.get(2));
+    try testing.expect(points[3].element.sco.on);
+    try testing.expect(!points[3].selected);
 }
 
 test "outstation: a direct-mode point refuses a select" {
