@@ -68,7 +68,7 @@ cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic	DONE
 cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only	DONE	-	DONE 9dee82e: flask_cors oracle; its wildcard+credentials default is the unsafe one
 ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only	DONE	-	DONE 0341464: fido2 anchors the FRAMING; found unexpressible protocol-Two pinUvAuthParam
 ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation	DONE	-	DONE b8612e1: kernel reassembly oracle; UNINITIALISED-MEMORY bug fixed; 1 policy divergence
-finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external numeric check	CLI:empyrical/ffn (pip)	M	Run the actual Python libraries this module models, capture outputs as literals
+finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external numeric check	DONE	-	DONE 1e757f4: ffn oracle on 8-return series; conventions established first
 http	A	MIXED	HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self	DONE	-	DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments
 iec62351	A	MIXED	RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested	DONE	-	DONE 941bbfe: header anchored; 493 real frames show NO 62351-6 extension exists in the wild
 l2disco	A	SELF	golden byte KATs hand-transcribed from LLDP/CDP/ARP/DHCP specs, no live capture	DONE	-	DONE 941bbfe: 15 tcpdump-suite frames incl. 4 upstream crash reproducers
