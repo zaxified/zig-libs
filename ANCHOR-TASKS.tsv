@@ -67,11 +67,11 @@ coap	A	SELF	hand-built CON GET datagrams round-tripped, no third-party CoAP orac
 cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic	DONE	-	DONE be61caa: python http.cookies oracle; quote-aware split BUG fixed; 5 divergences judged
 cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only	CLI:expressjs/cors or rs/cors	M	Run a real CORS middleware with matching config, diff preflight/actual headers
 ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only	CLI:python-fido2	M	Yubico's python-fido2 ClientPin can generate/verify real PIN-protocol framing
-ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation	CLI:scapy + Linux netns	M	Craft overlapping IPv6 fragments, compare accept/drop vs real kernel RFC5722 defrag
+ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation	DONE	-	DONE b8612e1: kernel reassembly oracle; UNINITIALISED-MEMORY bug fixed; 1 policy divergence
 finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external numeric check	CLI:empyrical/ffn (pip)	M	Run the actual Python libraries this module models, capture outputs as literals
 http	A	MIXED	HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self	CLI:smuggler (defparam)	M	Extend curl_interop harness with a published smuggling probe tool vs h1 goldens
-iec62351	A	MIXED	RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested	CAPTURE:Wireshark/goosestalker GOOSE pcap samples	M	Public GOOSE pcap captures exist; cross-check frame layout, no live stack needed
-l2disco	A	SELF	golden byte KATs hand-transcribed from LLDP/CDP/ARP/DHCP specs, no live capture	CAPTURE:Wireshark/packetlife LLDP-CDP-ARP-DHCP samples	M	Public captures widely available; transcribe real frames as goldens
+iec62351	A	MIXED	RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested	DONE	-	DONE 941bbfe: header anchored; 493 real frames show NO 62351-6 extension exists in the wild
+l2disco	A	SELF	golden byte KATs hand-transcribed from LLDP/CDP/ARP/DHCP specs, no live capture	DONE	-	DONE 941bbfe: 15 tcpdump-suite frames incl. 4 upstream crash reproducers
 l2encap	A	SELF	golden byte-layout KAT hand-authored from spec layouts; SPEC.md: no live-interop surface	NONE	-	REFUTED a58d626: own 8-byte format, shares no wire shape with VXLAN/Geneve (captured)
 l2forward	A	SELF	FDB/split-horizon decisions per 802.1D/EVPN; SPEC.md: offline logic only, no live-interop	DONE	-	DONE a58d626: aging default pinned to live kernel bridge 300s; rest is timing-dependent
 mcp-http	A	SELF	own self-contained HTTP/SSE tests; Dart/mcp_dart parity is a prose claim, no captured bytes	CLI:mcp_dart (Dart pub package, the existing behavioral reference)	M	write live HTTP/SSE interop harness against mcp_dart instead of prose parity claim
