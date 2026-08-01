@@ -604,11 +604,13 @@ fn srvMeta(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
 /// (29 s, 31 s], 2 = a deadline somewhere else.
 ///
 /// The band is narrow enough to be evidence and wide enough to be stable. For
-/// a 30 s call the reference sends `grpc-timeout: 30100m` — it pads the
-/// deadline by 100 ms — so the upper edge has to be above 30 s. It is 31 s
-/// and not 31 *minutes*, which is what makes the band prove the **unit** too:
-/// reading `m` as minutes instead of milliseconds turns 30100 into three
-/// weeks, and a wider band would have accepted that silently.
+/// a 30 s call the reference usually pads the deadline by around 100 ms when
+/// it renders `grpc-timeout` (typically `30100m`, though the exact literal
+/// varies with scheduling — sometimes it lands on an exact `30S` instead), so
+/// the upper edge has to be above 30 s regardless. It is 31 s and not 31
+/// *minutes*, which is what makes the band prove the **unit** too: reading
+/// `m` as minutes instead of milliseconds turns 30100 into three weeks, and a
+/// wider band would have accepted that silently.
 fn srvDeadline(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
     _ = req;
     // `text` carries the reference's own `grpc-timeout` rendering back, so a
@@ -660,6 +662,37 @@ const Report = struct {
             std.debug.print(
                 "\n`{s}`: reference client reported `{s}`, expected `{s}`\nfull report:\n{s}\n",
                 .{ key, got, want, r.text },
+            );
+            return error.WrongObservation;
+        }
+    }
+
+    /// Like `expect`, but for a raw `grpc-timeout` header rendering: checks
+    /// the *shape* (decimal digits followed by one of grpc's timeout unit
+    /// letters) rather than one exact literal.
+    ///
+    /// grpcio's C-core chooses both the quantization and the unit from the
+    /// wall-clock gap between "the deadline was set" and "the request was
+    /// actually framed onto the wire", so the same 30 s call can legitimately
+    /// render as `30100m` on one run and `30S` on another depending on
+    /// scheduling — confirmed by running this suite repeatedly. Pinning the
+    /// literal string makes the test flaky for a reason that has nothing to
+    /// do with this module's correctness. What must never vary is that a
+    /// well-formed value arrived at all; whether it was parsed correctly is
+    /// `deadline.band`'s job, not this one's.
+    fn expectTimeoutShape(r: Report, key: []const u8) !void {
+        const got = r.get(key) orelse {
+            std.debug.print("\nreference client never reported `{s}`; full report:\n{s}\n", .{ key, r.text });
+            return error.MissingObservation;
+        };
+        const valid = got.len >= 2 and switch (got[got.len - 1]) {
+            'H', 'M', 'S', 'm', 'u', 'n' => std.mem.indexOfNone(u8, got[0 .. got.len - 1], "0123456789") == null,
+            else => false,
+        };
+        if (!valid) {
+            std.debug.print(
+                "\n`{s}`: reference client reported `{s}`, which is not a well-formed grpc-timeout value\nfull report:\n{s}\n",
+                .{ key, got, r.text },
             );
             return error.WrongObservation;
         }
@@ -831,9 +864,12 @@ test "LIVE grpcio (as CLIENT): the reference drives all four shapes against OUR 
     // ── grpc-timeout ──
     // Band 1 = the server saw a deadline in (29 s, 31 s] for a 30 s call,
     // which needs both the value and the unit read correctly (see
-    // `srvDeadline`). The reference's own rendering, for the record — it
-    // pads the deadline by 100 ms, which is why the band is not (…, 30 s].
-    try report.expect("deadline.raw", "30100m");
+    // `srvDeadline`). `deadline.raw` is the reference's own rendering of the
+    // header it sent — evidence for *why* the band came out as it did — but
+    // its exact literal form (e.g. `30100m` vs `30S`) is grpcio's own timing
+    // artifact, not ours, so only its shape is asserted; `deadline.band` is
+    // what actually proves our parsing.
+    try report.expectTimeoutShape("deadline.raw");
     try report.expect("deadline.band", "1");
     try report.expect("deadline.none", "-1");
 
