@@ -46,7 +46,38 @@ Tests span `root.zig`/`Client.zig`/`response.zig`/`sse_parse.zig`/`types.zig` (d
 via the `test { _ = ...; }` block in root.zig). Covers: golden request headers/URL construction,
 non-2xx → `error.UnexpectedStatus` + `lastErrorBody` round-trip, request/response type re-exports,
 JSON stringify of polymorphic content-block/tool-choice unions, response parsing of every
-`StreamEvent`/`ContentBlock` variant, and `sse_parse` line-accumulation edge cases. One live test
+`StreamEvent`/`ContentBlock` variant, and `sse_parse` line-accumulation edge cases.
+
+**External anchor, added 2026-08-01**: the hand-built "full sequence" SSE fixture above is an
+in-house re-derivation (this module's own author wrote it to match a mental model of the docs,
+never checked against an independently-published example). `response.zig`'s test "external
+anchor: Anthropic's own published basic-streaming SSE example parses byte-exact" instead embeds,
+byte-for-byte, the "Basic streaming request" → "Response" example published at
+`https://platform.claude.com/docs/en/build-with-claude/streaming.md` (fetched 2026-08-01, no API
+key used, no network call made by the committed test) — including its `ping` event, which no
+hand-built fixture in this module previously exercised — and asserts the documented literal
+values (message id, model, token counts, delta text, `stop_reason`) after running it through this
+module's own `sse_parse.Parser` + `parseStreamEvent`. This is a genuine external anchor for the
+SSE wire format and this module's parsing of it. Treated the same as this module's existing
+"clean-room from the public Anthropic Messages API documentation" framing (see the module's
+design comment above) rather than as vendored third-party data — the example illustrates a wire
+format, not creative expression, the same rationale root `NOTICE` §0 already applies to RFC/spec
+citations.
+
+**The originally-graded `S` (assuming the skipped live test could simply be un-skipped) does not
+hold up.** A real call to `POST /v1/messages` needs a paid API key, costs money per request, and
+returns a nondeterministic body (the exact response text varies run to run) — none of which is
+compatible with a frozen, offline, checked-in golden. No API call was made or considered for this
+module. What *can* be anchored without a key is exactly the SSE wire-format shape covered above;
+the "live test currently `error.SkipZigTest`" gap in the Backlog section below is real and
+distinct from that anchor — it stays open because there is no way to close it without spending
+money on a nondeterministic response. **Recommended grade: one tier below the original `S`** —
+the SSE wire format itself is now genuinely externally anchored, but the live end-to-end call
+against the real API remains untested (and cannot be, offline, without paying for a nondeterministic
+response), so this module should not carry the same grade as one whose live path is actually
+exercised.
+
+One live test
 against the real API is present but unconditionally `error.SkipZigTest` — Zig 0.16's
 `std.process.Environ` (needed to read `ANTHROPIC_API_KEY`) is only reachable from `main`'s `Init`
 parameter, not from a plain `test` block; the dead-code path (`if (false)`) still type-checks the

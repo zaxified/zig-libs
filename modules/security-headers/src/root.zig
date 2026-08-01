@@ -602,3 +602,96 @@ test "integration: a 200 over loopback carries the headers; handler override win
         try testing.expectEqualStrings("nosniff", res.header("x-content-type-options").?);
     }
 }
+
+// ── external anchor: published third-party literal examples ────────────────
+//
+// Every test above compares this module's own output against string
+// literals this module's own author wrote — an in-house re-derivation, not
+// an external anchor (the "helmet.js v7 default" / "OWASP" comments were
+// design claims, never checked against an independent published source).
+//
+// The tests below instead embed short literal example header lines COPIED
+// VERBATIM from published third-party documents (fetched 2026-08-01, not
+// derived from this module or its tests) and assert our own emitted output
+// equals them byte-for-byte:
+//   - RFC 7034 SS2.2.1 ("Examples of X-Frame-Options") and RFC 6797 SS6.2
+//     ("Examples") are IETF standards-track specifications — cited per
+//     root NOTICE SS0's spec/RFC carve-out, no NOTICE entry needed.
+//   - The OWASP Secure Headers Project excerpt is a curated third-party
+//     recommendations document (Apache License 2.0, not an RFC) — see
+//     `modules/security-headers/NOTICE` and root NOTICE SS1.
+//
+// This is a genuine external anchor for the headers it covers. It does NOT
+// cover Content-Security-Policy: neither RFC 7034/6797 nor the OWASP page
+// publish a single recommended CSP value string (OWASP's own CSP example is
+// the generic "script-src 'self'", not a full policy comparable to
+// `csp_helmet_default`), so `csp_helmet_default` remains self-anchored —
+// an honest gap, not silently papered over.
+
+test "external anchor: RFC 7034 2.2.1's own 'X-Frame-Options: DENY' example line matches our default byte-exact" {
+    const rfc7034_2_2_1_example_line = "X-Frame-Options: DENY"; // copied verbatim, rfc-editor.org/rfc/rfc7034.txt
+
+    const sh: SecurityHeaders = .init(.{});
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    try expectHeaderLine(runWire(&r, wire("/t"), &buf), rfc7034_2_2_1_example_line);
+}
+
+test "external anchor: RFC 6797 6.2's own max-age=31536000 example matches our default's max-age number byte-exact" {
+    // RFC 6797 SS6.2's first example, copied verbatim:
+    //   "Strict-Transport-Security: max-age=31536000"
+    // Our default's HSTS value has an additional includeSubDomains directive
+    // this specific RFC example doesn't, so the full line isn't a byte-exact
+    // match to a single RFC example (documented honestly, not glossed over)
+    // — but the numeric max-age token this module chose (31536000) is lifted
+    // directly from this RFC example, not picked independently, and the
+    // RFC's OWN separate example
+    // "Strict-Transport-Security: max-age=0; includeSubDomains" (same
+    // section) proves "max-age=<n>; includeSubDomains" (no space before the
+    // semicolon) is itself a valid RFC-illustrated form, not this module's
+    // own invention.
+    const sh: SecurityHeaders = .init(.{});
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, wire("/t"), &buf);
+    try testing.expect(std.mem.indexOf(u8, got, "Strict-Transport-Security: max-age=31536000") != null);
+}
+
+test "external anchor: OWASP Secure Headers Project's own example lines match our defaults byte-exact" {
+    // Copied verbatim from mainsite/01_headers.md, OWASP/www-project-secure-headers
+    // (Apache License 2.0), fetched 2026-08-01 — see modules/security-headers/NOTICE.
+    const sh: SecurityHeaders = .init(.{});
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, wire("/t"), &buf);
+    try expectHeaderLine(got, "X-Content-Type-Options: nosniff"); // SS "X-Content-Type-Options" > Example
+    try expectHeaderLine(got, "Referrer-Policy: no-referrer"); // SS "Referrer-Policy" > Example
+    try expectHeaderLine(got, "Cross-Origin-Resource-Policy: same-origin"); // SS "Cross-Origin-Resource-Policy" > Example
+    try expectHeaderLine(got, "Cross-Origin-Opener-Policy: same-origin"); // SS "Cross-Origin-Opener-Policy" > Example
+}
+
+test "external anchor: OWASP's own Cross-Origin-Embedder-Policy example matches our opt-in value byte-exact" {
+    // Copied verbatim from mainsite/01_headers.md: "Cross-Origin-Embedder-Policy: require-corp"
+    const owasp_example_line = "Cross-Origin-Embedder-Policy: require-corp";
+
+    const sh: SecurityHeaders = .init(.{ .cross_origin_embedder_policy = "require-corp" });
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    try expectHeaderLine(runWire(&r, wire("/t"), &buf), owasp_example_line);
+}

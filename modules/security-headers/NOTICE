@@ -1,0 +1,38 @@
+security-headers — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces a handful of short third-party EXAMPLE HEADER LINES whose
+copyright notice must be preserved in any copy. Redistributing this module —
+alone or as part of zig-libs — must keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only a few one-line header
+examples reproduced from published documentation.
+
+## OWASP Secure Headers Project — example header lines
+
+`src/root.zig`'s tests "external anchor: OWASP Secure Headers Project's own
+example lines match our defaults byte-exact" and "external anchor: OWASP's
+own Cross-Origin-Embedder-Policy example matches our opt-in value
+byte-exact" embed verbatim, one-line example header values copied from
+`mainsite/01_headers.md` in https://github.com/OWASP/www-project-secure-headers
+(fetched 2026-08-01, `master` branch): the `X-Content-Type-Options`,
+`Referrer-Policy`, `Cross-Origin-Resource-Policy`, `Cross-Origin-Opener-Policy`,
+and `Cross-Origin-Embedder-Policy` "Example" code blocks. That repository is
+licensed under the Apache License 2.0 (its `LICENSE.txt`), copyright the
+OWASP Foundation.
+
+Purpose: these lines are used purely as a frozen, offline external ANCHOR —
+proving this module's own precomputed default/opt-in header VALUES match an
+independently-published third-party recommendation byte-for-byte, not merely
+this module's own prior test expectations (see the governing-rule discussion
+in `SPEC.md`). No OWASP Secure Headers Project source code, tooling, or
+design (beyond the cited literal example lines) is used, ported, or
+consulted.
+
+Note: the module's `X-Frame-Options: DENY` and HSTS `max-age` anchors are
+instead lifted directly from RFC 7034 SS2.2.1 and RFC 6797 SS6.2 — IETF
+specifications, which fall under root NOTICE SS0's "clean-room from a public
+spec/RFC" carve-out and need no attribution entry.

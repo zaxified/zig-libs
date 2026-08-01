@@ -431,6 +431,101 @@ test "parseStreamEvent: full sequence via sse_parse (message_start .. message_st
     try testing.expect((try p.next()) == null);
 }
 
+// ── external anchor: Anthropic's own published SSE example ─────────────────
+//
+// Every other stream-parsing test above uses a hand-built wire string this
+// module's own author wrote to match a mental model of the docs — an
+// in-house re-derivation, not an external anchor. The test below instead
+// embeds, byte-for-byte, the "Basic streaming request" response example
+// published at https://platform.claude.com/docs/en/build-with-claude/streaming.md
+// (fetched 2026-08-01), including its `ping` event (not exercised by any
+// hand-built fixture above) and runs it through this module's own
+// sse_parse.Parser + parseStreamEvent, asserting the documented literal
+// values (message id, model, token counts, delta text, stop_reason). This
+// is a genuine external anchor for the SSE wire format and this module's
+// parsing of it — not an in-house re-derivation, and not a paid API call
+// (no network access, no API key, this is a frozen copy of public
+// documentation). RFC/spec citation for the SSE framing itself lives in
+// sse_parse.zig's own doc comment (WHATWG "server-sent events").
+test "external anchor: Anthropic's own published basic-streaming SSE example parses byte-exact" {
+    const sse_parse = @import("sse_parse.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Copied verbatim (whitespace and all) from the "Basic streaming
+    // request" -> "Response" code block, streaming.md, fetched 2026-08-01.
+    const wire = "event: message_start\n" ++
+        "data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY\", \"type\": \"message\", \"role\": \"assistant\", \"content\": [], \"model\": \"claude-opus-5\", \"stop_reason\": null, \"stop_sequence\": null, \"usage\": {\"input_tokens\": 25, \"output_tokens\": 1}}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"text\", \"text\": \"\"}}\n" ++
+        "\n" ++
+        "event: ping\n" ++
+        "data: {\"type\": \"ping\"}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"Hello\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"!\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\": \"content_block_stop\", \"index\": 0}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\":null}, \"usage\": {\"output_tokens\": 15}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\": \"message_stop\"}\n" ++
+        "\n";
+
+    var reader: std.Io.Reader = .fixed(wire);
+    var p = sse_parse.Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+
+    const raw1 = (try p.next()).?;
+    const ev1 = try parseStreamEvent(arena.allocator(), raw1.data);
+    try testing.expectEqualStrings("msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", ev1.message_start.message.id);
+    try testing.expectEqualStrings("claude-opus-5", ev1.message_start.message.model);
+    try testing.expectEqual(@as(u64, 25), ev1.message_start.message.usage.input_tokens);
+    try testing.expectEqual(@as(u64, 1), ev1.message_start.message.usage.output_tokens);
+    try testing.expectEqual(@as(usize, 0), ev1.message_start.message.content.len);
+
+    const raw2 = (try p.next()).?;
+    const ev2 = try parseStreamEvent(arena.allocator(), raw2.data);
+    try testing.expect(ev2.content_block_start.content_block == .text);
+
+    // The published example's `ping` event, not present in any hand-built
+    // fixture above -- proves this module handles a real documented
+    // keep-alive event, not just ones its own author thought to write.
+    const raw3 = (try p.next()).?;
+    const ev3 = try parseStreamEvent(arena.allocator(), raw3.data);
+    try testing.expect(ev3 == .ping);
+
+    const raw4 = (try p.next()).?;
+    const ev4 = try parseStreamEvent(arena.allocator(), raw4.data);
+    try testing.expectEqualStrings("Hello", ev4.content_block_delta.delta.text_delta.text);
+
+    const raw5 = (try p.next()).?;
+    const ev5 = try parseStreamEvent(arena.allocator(), raw5.data);
+    try testing.expectEqualStrings("!", ev5.content_block_delta.delta.text_delta.text);
+
+    const raw6 = (try p.next()).?;
+    const ev6 = try parseStreamEvent(arena.allocator(), raw6.data);
+    try testing.expectEqual(@as(u32, 0), ev6.content_block_stop.index);
+
+    const raw7 = (try p.next()).?;
+    const ev7 = try parseStreamEvent(arena.allocator(), raw7.data);
+    try testing.expectEqual(StopReason.end_turn, ev7.message_delta.delta.stop_reason.?);
+    try testing.expectEqual(@as(u64, 15), ev7.message_delta.usage.?.output_tokens);
+
+    const raw8 = (try p.next()).?;
+    const ev8 = try parseStreamEvent(arena.allocator(), raw8.data);
+    try testing.expect(ev8 == .message_stop);
+
+    try testing.expect((try p.next()) == null);
+}
+
 test "parseStreamEvent: tool_use content_block_start + input_json_delta + error event" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

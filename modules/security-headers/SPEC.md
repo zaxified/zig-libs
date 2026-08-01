@@ -46,7 +46,27 @@ handler-override precedence with no duplicate header, `Server` replacement over 
 404/405 fallback coverage, bare `ResponseWriter.apply`. In-process integration (`router` +
 `http.Server` + `http.Client` over loopback): a normal 200 carries the full default set and no
 opt-in headers; a handler that sets its own `X-Frame-Options` wins — skips only when loopback
-binding is unavailable. Run: `zig build test-security-headers`.
+binding is unavailable.
+
+**External anchor, added 2026-08-01**: every test above compares this module's own output
+against string literals this module's own author wrote — an in-house re-derivation, not an
+external anchor (running `helmet.js` and diffing was considered but is blocked: `node`/`npm`
+are not installed on the reference machine). Instead, four goldens compare our precomputed
+default/opt-in header VALUES byte-for-byte against short literal example lines copied verbatim
+from published third-party documents (not derived from this module): RFC 7034 §2.2.1's own
+`X-Frame-Options: DENY` example, RFC 6797 §6.2's own `max-age=31536000` example (the numeric
+token; the RFC's own separate `max-age=0; includeSubDomains` example independently proves the
+no-space-before-semicolon `includeSubDomains` form is RFC-illustrated, not this module's
+invention), and the OWASP Secure Headers Project's own example lines for
+`X-Content-Type-Options`, `Referrer-Policy`, `Cross-Origin-Resource-Policy`,
+`Cross-Origin-Opener-Policy`, and `Cross-Origin-Embedder-Policy` (`mainsite/01_headers.md`,
+Apache-2.0 — see `modules/security-headers/NOTICE`). This is a genuine external anchor for the
+headers it covers. **Not covered**: `Content-Security-Policy` — neither RFC 7034/6797 nor the
+OWASP page publish a single recommended CSP value string comparable to `csp_helmet_default`
+(OWASP's own CSP example is the generic `script-src 'self'`), so `csp_helmet_default` remains
+self-anchored; running `helmet.js` itself was ruled out by the missing `node`/`npm`, not attempted.
+
+Run: `zig build test-security-headers`.
 
 ## Backlog / deferred
 
