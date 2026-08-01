@@ -1,0 +1,30 @@
+openapi — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces one short third-party EXAMPLE DOCUMENT whose copyright notice must
+be preserved in any copy. Redistributing this module — alone or as part of
+zig-libs — must keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only one small, complete
+example OpenAPI document.
+
+## OAI/OpenAPI-Specification — `webhook-example.json`
+
+`src/root.zig`'s test `"conformance: the checker accepts the OpenAPI
+Initiative's own published v3.1 example"` embeds (`oai_webhook_example`) a
+verbatim copy of `examples/v3.1/webhook-example.json` from
+https://github.com/OAI/OpenAPI-Specification, pinned at the `3.1.0` tag
+(commit path `examples/v3.1/webhook-example.json`, fetched 2026-08-01). The
+repository is licensed Apache License 2.0 (its `LICENSE` file), copyright the
+OpenAPI Initiative.
+
+Purpose: this document is used purely as a frozen, offline ANCHOR for a
+hand-written OpenAPI 3.1 structural validator (`validateOpenApi31`) —
+proving the checker accepts a real, externally-authored conformant document
+(one that deliberately omits `paths` in favor of `webhooks`/`components`, a
+shape this module's own generator never produces), not merely this module's
+own output shape. No OpenAPI Initiative source code of any kind is used,
+ported, or consulted — only this one example JSON document.

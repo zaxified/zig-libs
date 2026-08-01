@@ -1,0 +1,37 @@
+metrics — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces a short excerpt of third-party DOCUMENTATION TEXT whose copyright
+notice must be preserved in any copy. Redistributing this module — alone or
+as part of zig-libs — must keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only a worked example of
+plain text reproduced from published documentation.
+
+## Prometheus exposition-format worked example
+
+`src/root.zig`'s test `"conformance: the checker accepts Prometheus's own
+published exposition-format example"` embeds (`prom_golden_example`) a
+verbatim excerpt of the worked example published at
+https://prometheus.io/docs/instrumenting/exposition_formats/, fetched
+2026-08-01. The Prometheus documentation site states its content is
+available under the Apache License 2.0
+(http://www.apache.org/licenses/LICENSE-2.0), copyright The Linux Foundation
+/ Prometheus Authors.
+
+The excerpt deliberately omits the page's "UTF-8 metric and label names"
+example line and the closing "summary" section: those exercise format
+extensions/metric kinds (bare-brace UTF-8 metric names; the `summary` type
+with `quantile` labels) that this module's writer never emits and that the
+accompanying grammar checker (`validateExpositionText`) does not need to
+accept to do its job here.
+
+Purpose: this text is used purely as a frozen, offline ANCHOR for a hand-
+written exposition-format grammar checker — proving the checker accepts
+real, externally-authored conformant text, not merely this module's own
+output shape (see the governing rule discussion in `src/root.zig`). No
+Prometheus/OpenMetrics source code of any kind is used, ported, or
+consulted; only this one short block of example prose/text.

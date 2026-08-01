@@ -388,6 +388,206 @@ const docs_html_tail =
     \\</script>
 ;
 
+// ── conformance: a real OpenAPI 3.1 structural validator ────────────────────
+//
+// Every generation test below checked the emitted JSON only for (a) exact
+// byte-identity with a hand-typed string and (b) `std.json` well-formedness —
+// which proves the writer produces *some* JSON matching what a human typed,
+// never that the document is *valid OpenAPI*. No OpenAPI validator
+// (`openapi-spec-validator`, `redocly`/`spectral`) is installed on this
+// machine (checked: no matching Python package, no `node`/`npm` at all), and
+// this task must not install one, so the tool-oracle route is blocked here.
+//
+// This module only ever *generates* documents — it has no parser for
+// arbitrary third-party OpenAPI text, so "adopt an official example and feed
+// it through our parser" (the suggested alternative) does not apply as
+// written. What plays the equivalent role: `oai_webhook_example` below is a
+// frozen, verbatim copy of the OpenAPI Initiative's OWN official example
+// document (see NOTICE for provenance/license), and `validateOpenApi31`
+// implements the structural rules a real OpenAPI 3.1 document must satisfy
+// (info.title/version required; at least one of paths/webhooks/components —
+// the actual 3.1 relaxation of 3.0's "paths always required"; every
+// operation's `responses` non-empty with a `description` per response).
+// That checker is run against BOTH the adopted official document — which
+// deliberately omits `paths` entirely in favor of `webhooks`+`components`,
+// exercising a shape none of this module's own tests produce — and this
+// module's own generated goldens below, closing the actual gap: those
+// goldens now assert structural OpenAPI validity, not merely a string match
+// against what a human transcribed.
+pub const ConformanceError = error{
+    NotAnObject,
+    MissingOpenApiVersion,
+    UnsupportedOpenApiVersion,
+    MissingInfo,
+    MissingInfoTitle,
+    MissingInfoVersion,
+    MissingTopLevelContent,
+    InvalidPathKey,
+    InvalidPathItem,
+    InvalidOperation,
+    MissingResponses,
+    EmptyResponses,
+    InvalidResponse,
+    MissingResponseDescription,
+};
+
+pub fn validateOpenApi31(doc: std.json.Value) ConformanceError!void {
+    if (doc != .object) return error.NotAnObject;
+    const root = doc.object;
+
+    const openapi_val = root.get("openapi") orelse return error.MissingOpenApiVersion;
+    if (openapi_val != .string) return error.MissingOpenApiVersion;
+    if (!std.mem.startsWith(u8, openapi_val.string, "3.1.")) return error.UnsupportedOpenApiVersion;
+
+    const info_val = root.get("info") orelse return error.MissingInfo;
+    if (info_val != .object) return error.MissingInfo;
+    const title = info_val.object.get("title") orelse return error.MissingInfoTitle;
+    if (title != .string or title.string.len == 0) return error.MissingInfoTitle;
+    const version = info_val.object.get("version") orelse return error.MissingInfoVersion;
+    if (version != .string or version.string.len == 0) return error.MissingInfoVersion;
+
+    // OAS 3.1 §4.8.1: unlike 3.0 (where `paths` was always required), 3.1
+    // makes `paths` optional PROVIDED `webhooks` or `components` describes
+    // something instead — a document with none of the three describes
+    // nothing at all.
+    if (root.get("paths") == null and root.get("webhooks") == null and root.get("components") == null) {
+        return error.MissingTopLevelContent;
+    }
+
+    if (root.get("paths")) |v| try validatePathsObject(v, .paths);
+    if (root.get("webhooks")) |v| try validatePathsObject(v, .webhooks);
+}
+
+const PathsKind = enum { paths, webhooks };
+
+fn validatePathsObject(paths_val: std.json.Value, comptime kind: PathsKind) ConformanceError!void {
+    if (paths_val != .object) return error.InvalidPathItem;
+    var it = paths_val.object.iterator();
+    while (it.next()) |entry| {
+        if (kind == .paths and (entry.key_ptr.len == 0 or entry.key_ptr.*[0] != '/')) return error.InvalidPathKey;
+        try validatePathItem(entry.value_ptr.*);
+    }
+}
+
+const http_method_keys = [_][]const u8{ "get", "put", "post", "delete", "options", "head", "patch", "trace" };
+
+fn validatePathItem(item_val: std.json.Value) ConformanceError!void {
+    if (item_val != .object) return error.InvalidPathItem;
+    var it = item_val.object.iterator();
+    while (it.next()) |entry| {
+        var is_method = false;
+        for (http_method_keys) |m| {
+            if (std.mem.eql(u8, entry.key_ptr.*, m)) {
+                is_method = true;
+                break;
+            }
+        }
+        // Non-method keys ($ref, summary, description, servers, parameters)
+        // are legal path-item members this checker does not deeply verify.
+        if (!is_method) continue;
+        try validateOperation(entry.value_ptr.*);
+    }
+}
+
+fn validateOperation(op_val: std.json.Value) ConformanceError!void {
+    if (op_val != .object) return error.InvalidOperation;
+    const responses_val = op_val.object.get("responses") orelse return error.MissingResponses;
+    if (responses_val != .object) return error.MissingResponses;
+    if (responses_val.object.count() == 0) return error.EmptyResponses;
+    var rit = responses_val.object.iterator();
+    while (rit.next()) |rentry| {
+        if (rentry.value_ptr.* != .object) return error.InvalidResponse;
+        const desc = rentry.value_ptr.*.object.get("description") orelse return error.MissingResponseDescription;
+        if (desc != .string) return error.MissingResponseDescription;
+    }
+}
+
+/// A frozen, verbatim copy of `examples/v3.1/webhook-example.json` from the
+/// OpenAPI Initiative's own `OAI/OpenAPI-Specification` repository, pinned at
+/// the `3.1.0` tag (fetched 2026-08-01; Apache License 2.0 — see NOTICE).
+/// Deliberately chosen because it omits `paths` entirely (using `webhooks` +
+/// `components` instead) — a shape this module's own generator never
+/// produces (it always emits a `paths` key, even when empty), so validating
+/// this document exercises a real branch of `validateOpenApi31` that this
+/// module's own goldens below cannot reach on their own.
+const oai_webhook_example =
+    \\{
+    \\  "openapi": "3.1.0",
+    \\  "info": {
+    \\    "title": "Webhook Example",
+    \\    "version": "1.0.0"
+    \\  },
+    \\  "webhooks": {
+    \\    "newPet": {
+    \\      "post": {
+    \\        "requestBody": {
+    \\          "description": "Information about a new pet in the system",
+    \\          "content": {
+    \\            "application/json": {
+    \\              "schema": {
+    \\                "$ref": "#/components/schemas/Pet"
+    \\              }
+    \\            }
+    \\          }
+    \\        },
+    \\        "responses": {
+    \\          "200": {
+    \\            "description": "Return a 200 status to indicate that the data was received successfully"
+    \\          }
+    \\        }
+    \\      }
+    \\    }
+    \\  },
+    \\  "components": {
+    \\    "schemas": {
+    \\      "Pet": {
+    \\        "required": [
+    \\          "id",
+    \\          "name"
+    \\        ],
+    \\        "properties": {
+    \\          "id": {
+    \\            "type": "integer",
+    \\            "format": "int64"
+    \\          },
+    \\          "name": {
+    \\            "type": "string"
+    \\          },
+    \\          "tag": {
+    \\            "type": "string"
+    \\          }
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "conformance: the checker accepts the OpenAPI Initiative's own published v3.1 example" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, oai_webhook_example, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
+}
+
+test "conformance: the checker rejects documents missing required structure (sanity: it is not vacuous)" {
+    const allocator = std.testing.allocator;
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"}}", .{});
+        defer parsed.deinit();
+        try testing.expectError(error.MissingTopLevelContent, validateOpenApi31(parsed.value));
+    }
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{\"/x\":{\"get\":{}}}}", .{});
+        defer parsed.deinit();
+        try testing.expectError(error.MissingResponses, validateOpenApi31(parsed.value));
+    }
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"openapi\":\"2.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{}}", .{});
+        defer parsed.deinit();
+        try testing.expectError(error.UnsupportedOpenApiVersion, validateOpenApi31(parsed.value));
+    }
+}
+
 // ── tests: generation (offline) ─────────────────────────────────────────────
 
 const testing = std.testing;
@@ -452,6 +652,11 @@ test "generate: golden OpenAPI 3.1 document for a known route set" {
     try testing.expectEqualStrings("3.1.0", parsed.value.object.get("openapi").?.string);
     try testing.expectEqualStrings("Test API", parsed.value.object.get("info").?.object.get("title").?.string);
     try testing.expectEqual(@as(usize, 4), parsed.value.object.get("paths").?.object.count());
+    // Byte-identity with our own hand-typed string, and bare JSON
+    // well-formedness, prove nothing about real OpenAPI 3.1 validity (see the
+    // conformance-checker section above) — also run the real structural
+    // checker against it.
+    try validateOpenApi31(parsed.value);
 }
 
 test "generate: empty router → valid empty-paths document, no panic" {
@@ -464,6 +669,7 @@ test "generate: empty router → valid empty-paths document, no panic" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 0), parsed.value.object.get("paths").?.object.count());
+    try validateOpenApi31(parsed.value); // an empty `paths` object still satisfies §4.8.1
 }
 
 test "generate: method grouping is deterministic (enum order, not registration order)" {

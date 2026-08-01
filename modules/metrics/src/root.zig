@@ -1081,6 +1081,219 @@ test "registration copies its inputs (stack temporaries are safe)" {
     , w.buffered());
 }
 
+// ── conformance: exposition-format grammar checker ──────────────────────────
+//
+// The tests below this point compared `writeText` output only against
+// hand-typed expected strings — which proves the encoder is *consistent with
+// itself* (or with a human's transcription of the spec), never that the text
+// is *valid Prometheus exposition format*. Neither `promtool` (Prometheus)
+// nor any OpenAPI-style external validator binary/package is installed on
+// this machine (checked: no `promtool` on PATH, no cached image, and this
+// task must not install one), so the tool-oracle route from the module's
+// sibling anchor-gap tasks is blocked here. Instead: the Prometheus project's
+// own exposition-format documentation publishes worked examples of the text
+// format it defines — an authoritative document this module needs no tool to
+// consult. `promGoldenExample` below is a frozen excerpt of that published
+// text (see NOTICE for provenance/license); `validateExpositionText` is a
+// grammar checker for the format it documents (comment lines / `# HELP` /
+// `# TYPE` / sample lines with an optional `{label="value",...}` block, a
+// numeric-or-`+Inf`/`-Inf`/`NaN` value, and an optional integer timestamp).
+// The checker is exercised two ways: against the frozen official example
+// (proving it accepts real, externally-authored conformant text, not just
+// this module's own shape) and against this module's OWN `writeText` output
+// in the golden tests below (closing the actual gap — those goldens now
+// assert grammar validity, not merely byte-identity with a hand-typed
+// string). Per the governing rule, this checker is never used to invent a
+// grammar to match our encoder; it existed before touching whether our
+// encoder passes.
+const ExpositionError = error{
+    InvalidLine,
+    InvalidMetricName,
+    InvalidLabelName,
+    InvalidLabelValue,
+    InvalidValue,
+    InvalidTimestamp,
+    InvalidType,
+    UnterminatedLabelBlock,
+};
+
+fn validateExpositionText(text: []const u8) ExpositionError!void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, " \r");
+        if (line.len == 0) continue;
+        if (line[0] == '#') {
+            if (std.mem.startsWith(u8, line, "# HELP ")) {
+                try validateHelpOrTypeLine(line["# HELP ".len..], .help);
+            } else if (std.mem.startsWith(u8, line, "# TYPE ")) {
+                try validateHelpOrTypeLine(line["# TYPE ".len..], .type);
+            }
+            // Any other `#` line is a free-form comment — ignored, per the
+            // format (the published example uses these between families).
+            continue;
+        }
+        try validateSampleLine(line);
+    }
+}
+
+fn validateHelpOrTypeLine(rest: []const u8, comptime kind: enum { help, type }) ExpositionError!void {
+    const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    if (!validMetricName(rest[0..sp])) return error.InvalidMetricName;
+    if (kind == .help) return; // anything after the name is free HELP text
+    const type_str = if (sp < rest.len) rest[sp + 1 ..] else "";
+    inline for (.{ "counter", "gauge", "histogram", "summary", "untyped" }) |known| {
+        if (std.mem.eql(u8, type_str, known)) return;
+    }
+    return error.InvalidType;
+}
+
+fn validateSampleLine(line: []const u8) ExpositionError!void {
+    var i: usize = 0;
+    const name_start = i;
+    while (i < line.len and (std.ascii.isAlphabetic(line[i]) or line[i] == '_' or line[i] == ':' or
+        (i > name_start and std.ascii.isDigit(line[i])))) : (i += 1)
+    {}
+    if (i == name_start or !validMetricName(line[name_start..i])) return error.InvalidMetricName;
+
+    if (i < line.len and line[i] == '{') {
+        i = try validateLabelBlock(line, i + 1);
+    }
+
+    if (i >= line.len or line[i] != ' ') return error.InvalidLine;
+    while (i < line.len and line[i] == ' ') : (i += 1) {}
+    const value_start = i;
+    while (i < line.len and line[i] != ' ') : (i += 1) {}
+    if (!isValidExpositionNumber(line[value_start..i])) return error.InvalidValue;
+
+    while (i < line.len and line[i] == ' ') : (i += 1) {}
+    if (i == line.len) return; // no timestamp — legal
+    const ts_start = i;
+    while (i < line.len and line[i] != ' ') : (i += 1) {}
+    if (!isValidExpositionInteger(line[ts_start..i])) return error.InvalidTimestamp;
+    while (i < line.len and line[i] == ' ') : (i += 1) {}
+    if (i != line.len) return error.InvalidLine; // nothing may follow the timestamp
+}
+
+/// Parse `name="value"(,name="value")*}` starting right after the opening
+/// `{`; returns the index right after the closing `}`.
+fn validateLabelBlock(line: []const u8, start: usize) ExpositionError!usize {
+    var i = start;
+    if (i < line.len and line[i] == '}') return i + 1; // `{}` — degenerate but not our concern to reject
+    while (true) {
+        const name_start = i;
+        while (i < line.len and (std.ascii.isAlphabetic(line[i]) or line[i] == '_' or
+            (i > name_start and std.ascii.isDigit(line[i])))) : (i += 1)
+        {}
+        if (i == name_start or !validLabelName(line[name_start..i])) return error.InvalidLabelName;
+        if (i >= line.len or line[i] != '=') return error.InvalidLine;
+        i += 1;
+        if (i >= line.len or line[i] != '"') return error.InvalidLabelValue;
+        i += 1;
+        while (i < line.len and line[i] != '"') {
+            if (line[i] == '\\') {
+                i += 1;
+                if (i >= line.len) return error.InvalidLabelValue;
+                switch (line[i]) {
+                    '\\', '"', 'n' => {},
+                    else => return error.InvalidLabelValue,
+                }
+            }
+            i += 1;
+        }
+        if (i >= line.len) return error.UnterminatedLabelBlock;
+        i += 1; // consume the closing quote
+        if (i < line.len and line[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (i < line.len and line[i] == '}') return i + 1;
+        return error.UnterminatedLabelBlock;
+    }
+}
+
+fn isValidExpositionNumber(tok: []const u8) bool {
+    if (std.mem.eql(u8, tok, "+Inf") or std.mem.eql(u8, tok, "-Inf") or std.mem.eql(u8, tok, "NaN")) return true;
+    if (tok.len == 0) return false;
+    var i: usize = 0;
+    if (tok[i] == '+' or tok[i] == '-') i += 1;
+    var saw_digit = false;
+    while (i < tok.len and std.ascii.isDigit(tok[i])) : (i += 1) saw_digit = true;
+    if (i < tok.len and tok[i] == '.') {
+        i += 1;
+        while (i < tok.len and std.ascii.isDigit(tok[i])) : (i += 1) saw_digit = true;
+    }
+    if (!saw_digit) return false;
+    if (i < tok.len and (tok[i] == 'e' or tok[i] == 'E')) {
+        i += 1;
+        if (i < tok.len and (tok[i] == '+' or tok[i] == '-')) i += 1;
+        var saw_exp_digit = false;
+        while (i < tok.len and std.ascii.isDigit(tok[i])) : (i += 1) saw_exp_digit = true;
+        if (!saw_exp_digit) return false;
+    }
+    return i == tok.len;
+}
+
+fn isValidExpositionInteger(tok: []const u8) bool {
+    if (tok.len == 0) return false;
+    var i: usize = 0;
+    if (tok[0] == '+' or tok[0] == '-') i += 1;
+    if (i == tok.len) return false;
+    while (i < tok.len) : (i += 1) {
+        if (!std.ascii.isDigit(tok[i])) return false;
+    }
+    return true;
+}
+
+/// A frozen excerpt of the worked example from Prometheus's own exposition-
+/// format documentation (`docs/instrumenting/exposition_formats/` on
+/// prometheus.io, Apache-2.0 — see NOTICE), fetched once (2026-08-01) and
+/// reproduced verbatim. Deliberately excludes the page's "UTF-8 metric and
+/// label names" line: that is an OpenMetrics naming EXTENSION this module's
+/// classic 0.0.4 writer never emits and `validateExpositionText` does not
+/// (and need not) accept.
+const prom_golden_example =
+    \\# HELP http_requests_total The total number of HTTP requests.
+    \\# TYPE http_requests_total counter
+    \\http_requests_total{method="post",code="200"} 1027 1395066363000
+    \\http_requests_total{method="post",code="400"}    3 1395066363000
+    \\
+    \\# Escaping in label values:
+    \\msdos_file_access_time_seconds{path="C:\\DIR\\FILE.TXT",error="Cannot find file:\n\"FILE.TXT\""} 1.458255915e9
+    \\
+    \\# Minimalistic line:
+    \\metric_without_timestamp_and_labels 12.47
+    \\
+    \\# A weird metric from before the epoch:
+    \\something_weird{problem="division by zero"} +Inf -3982045
+    \\
+    \\# A histogram, which has a pretty complex representation in the text format:
+    \\# HELP http_request_duration_seconds A histogram of the request duration.
+    \\# TYPE http_request_duration_seconds histogram
+    \\http_request_duration_seconds_bucket{le="0.05"} 24054
+    \\http_request_duration_seconds_bucket{le="0.1"} 33444
+    \\http_request_duration_seconds_bucket{le="0.2"} 100392
+    \\http_request_duration_seconds_bucket{le="0.5"} 129389
+    \\http_request_duration_seconds_bucket{le="1"} 133988
+    \\http_request_duration_seconds_bucket{le="+Inf"} 144320
+    \\http_request_duration_seconds_sum 53423
+    \\http_request_duration_seconds_count 144320
+;
+
+test "conformance: the checker accepts Prometheus's own published exposition-format example" {
+    try validateExpositionText(prom_golden_example);
+}
+
+test "conformance: the checker rejects an unterminated label value (sanity: it is not vacuous)" {
+    try testing.expectError(error.UnterminatedLabelBlock, validateExpositionText(
+        \\# TYPE x counter
+        \\x{k="unterminated} 1
+    ));
+    try testing.expectError(error.InvalidValue, validateExpositionText(
+        \\# TYPE x counter
+        \\x not_a_number
+    ));
+}
+
 // ── tests: exposition golden bytes ──────────────────────────────────────────
 
 test "writeText: golden exact bytes (families, ordering, histogram, +Inf, escaping)" {
@@ -1132,6 +1345,11 @@ test "writeText: golden exact bytes (families, ordering, histogram, +Inf, escapi
         "req_seconds_bucket{route=\"/x\",le=\"+Inf\"} 4\n" ++
         "req_seconds_sum{route=\"/x\"} 9.5\n" ++
         "req_seconds_count{route=\"/x\"} 4\n", w.buffered());
+    // Byte-identity with our own hand-typed string proves nothing about
+    // real Prometheus conformance (see the conformance-checker section
+    // above) — so also run the actual output through the same grammar
+    // checker the published example was validated against.
+    try validateExpositionText(w.buffered());
 }
 
 test "writeText: a literal quote in HELP text is NOT escaped (only label values escape quotes)" {
@@ -1149,6 +1367,7 @@ test "writeText: a literal quote in HELP text is NOT escaped (only label values 
             "x_total 1\n",
         w.buffered(),
     );
+    try validateExpositionText(w.buffered());
 }
 
 test "writeText: empty registry emits nothing; unlabeled histogram gets bare le braces" {
@@ -1169,6 +1388,7 @@ test "writeText: empty registry emits nothing; unlabeled histogram gets bare le 
         "t_seconds_bucket{le=\"+Inf\"} 1\n" ++
         "t_seconds_sum 0.5\n" ++
         "t_seconds_count 1\n", w.buffered());
+    try validateExpositionText(w.buffered());
 }
 
 test "writeText: NaN observations poison _sum, land in +Inf only (client_golang)" {
@@ -1185,6 +1405,7 @@ test "writeText: NaN observations poison _sum, land in +Inf only (client_golang)
         "n_seconds_bucket{le=\"+Inf\"} 1\n" ++
         "n_seconds_sum NaN\n" ++
         "n_seconds_count 1\n", w.buffered());
+    try validateExpositionText(w.buffered());
 }
 
 // ── tests: multi-thread stress ──────────────────────────────────────────────

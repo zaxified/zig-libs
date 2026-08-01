@@ -649,6 +649,75 @@ test "query: live network (skipped offline)" {
     return error.SkipZigTest;
 }
 
+// ── golden: one real SNTP exchange, captured once ───────────────────────────
+//
+// Every packet in every test above is built by hand from this module's own
+// field constants (LI/VN/Mode spelled out per RFC 4330, timestamps chosen as
+// small round numbers for arithmetic convenience) — a bug that is consistent
+// between what this module *encodes* and what it *decodes* (e.g. a field
+// swapped the same way on both sides) would still pass every one of them.
+// These 48 bytes did NOT come from this module: they are the real reply from
+// the public `time.google.com` NTP service (216.239.35.4:123, stratum-1,
+// reference id "GOOG") to a genuine SNTP client-mode request, captured once
+// with a throwaway UDP client and frozen here (2026-08-01). `t1` below is the
+// timestamp that request actually sent (also captured), so `verifyOriginate`
+// is exercised against a real echoed value, not a hand-typed one.
+//
+// Exempt from a NOTICE entry under root NOTICE §0: querying a public server
+// once and freezing its bytes is exercising a black-box protocol oracle, the
+// same category as running an installed third-party binary (`tar`, `icmp`'s
+// live ping) — no source or design was consulted, only wire bytes RFC 4330
+// already requires the server to produce.
+test "golden: real SNTP reply captured from time.google.com, frozen" {
+    const t1: Timestamp = .{ .seconds = 3_994_581_532, .fraction = 0xEF6B2800 };
+
+    const captured_reply = [_]u8{
+        0x24, 0x01, 0x00, 0xec, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x07, 0x47, 0x4f, 0x4f, 0x47,
+        0xee, 0x18, 0x7a, 0x1c, 0xf6, 0x98, 0x9f, 0x83,
+        0xee, 0x18, 0x7a, 0x1c, 0xef, 0x6b, 0x28, 0x00,
+        0xee, 0x18, 0x7a, 0x1c, 0xf6, 0x98, 0x9f, 0x84,
+        0xee, 0x18, 0x7a, 0x1c, 0xf6, 0x98, 0x9f, 0x86,
+    };
+
+    const reply = try decodeResponse(&captured_reply);
+    try testing.expectEqual(LeapIndicator.no_warning, reply.leap);
+    try testing.expectEqual(@as(u3, 4), reply.version);
+    try testing.expectEqual(Mode.server, reply.mode);
+    try testing.expectEqual(@as(u8, 1), reply.stratum); // primary (GNSS-disciplined) reference
+    try testing.expectEqual(@as(i8, 0), reply.poll);
+    try testing.expectEqual(@as(i8, -20), reply.precision);
+    try testing.expectEqual(@as(u32, 0), reply.root_delay);
+    try testing.expectEqual(@as(u32, 7), reply.root_dispersion);
+    try testing.expectEqual(@as(f64, 7.0 / 65536.0), reply.rootDispersionSeconds());
+    try testing.expectEqualSlices(u8, "GOOG", &reply.reference_id);
+
+    try testing.expectEqual(@as(u32, 3_994_581_532), reply.reference.seconds);
+    try testing.expectEqual(@as(u32, 0xF6989F83), reply.reference.fraction);
+    try testing.expectEqual(t1, reply.originate); // RFC 4330 §5 origin-timestamp echo
+    try testing.expectEqual(@as(u32, 3_994_581_532), reply.receive.seconds);
+    try testing.expectEqual(@as(u32, 0xF6989F84), reply.receive.fraction);
+    try testing.expectEqual(@as(u32, 3_994_581_532), reply.transmit.seconds);
+    try testing.expectEqual(@as(u32, 0xF6989F86), reply.transmit.fraction);
+
+    try verifyOriginate(reply, t1);
+
+    // T4 (this client's local receive instant) is likewise a captured value
+    // from the same one-shot exchange — NOT `nowUnixNanos()`. Pinning it as a
+    // literal constant is deliberate: an offset/delay assertion computed
+    // against the live wall clock would start failing on its own the moment
+    // the clock moves on, which is exactly the trap this golden must avoid.
+    const t4: Timestamp = .{ .seconds = 3_994_581_532, .fraction = 0xF9AC1000 };
+    const sample: Sample = .{
+        .originate = reply.originate,
+        .receive = reply.receive,
+        .transmit = reply.transmit,
+        .destination = t4,
+    };
+    try testing.expectEqual(@as(i128, 8_011_074), sample.offsetNanos());
+    try testing.expectEqual(@as(i128, 40_052_890), sample.roundtripDelayNanos());
+}
+
 // ── fuzz: server response decode off the wire, never panics ────────────────
 //
 // `decodeResponse` (and `verifyOriginate` behind it) is what a client runs on
