@@ -1,5 +1,12 @@
 # Anchor classification — one line per module, generated 2026-08-01
 #
+# ⚠ THIS IS A DATED SNAPSHOT OF THE CLASSIFICATION, NOT LIVE STATUS. The CLASS
+#   column stays true (a module's relationship to the outside world does not
+#   change), but the ANCHOR column is only accurate as of the generation date.
+#   ANCHOR-TASKS.tsv is the single ownership place for current anchor state and
+#   wins wherever the two disagree — e.g. isis reads SELF here and MIXED there,
+#   because it was anchored against Wireshark after this file was generated.
+#
 # CLASS: does this module have an external truth at all?
 #   A  wire / interop format — other implementations must byte-agree with it
 #   B  published cryptographic or algorithmic construction with published vectors
