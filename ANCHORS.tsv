@@ -1,0 +1,250 @@
+# Anchor classification — one line per module, generated 2026-08-01
+#
+# CLASS: does this module have an external truth at all?
+#   A  wire / interop format — other implementations must byte-agree with it
+#   B  published cryptographic or algorithmic construction with published vectors
+#   C  internal algorithm or data structure — NO outside exists; correctness is
+#      defined by invariants or a brute-force reference. NOT anchor debt.
+#   D  our own design — no third party exists to agree with, by construction
+#
+# ANCHOR (class A and B only): where does the test oracle's authority come from?
+#   EXTERNAL   published vectors, goldens captured from a foreign implementation,
+#              or a test run against a live foreign peer
+#   REDERIVED  an in-house oracle re-deriving the answer by a different route.
+#              Catches implementation typos; does NOT catch a shared misreading
+#              of the spec. A middle tier — never record it as EXTERNAL.
+#   MIXED      anchored for some paths, SELF for others; EVIDENCE names which
+#   SELF       round-trip and/or hand-authored fixtures only — the weakest
+#
+# Five things that look like an anchor and are not (each caught real cases here):
+#   1. a sibling module's anchor does not transfer
+#   2. reading a foreign implementation's source is not running it
+#   3. a live test that skips on this host is not an anchor today
+#   4. anchored primitives do not anchor the protocol framing above them
+#   5. a prose claim of parity in a README is not an anchor unless the tests
+#      actually contain captured bytes or a live check
+#
+# module	CLASS	ANCHOR	EVIDENCE
+aaa-gate	C	n/a	bearer-gate middleware; RFC 6750 header parse trivial, no interop surface, internal goldens
+abuseguard	C	n/a	internal rate-limit/gate store; nginx/fail2ban are design refs only, no wire format
+accesslog	A	SELF	Combined/logfmt/JSON logs consumed by real tools; goldens hand-authored, not captured
+acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed
+adaptor	B	REDERIVED	no official spec/vectors; kat_vectors.zig computed independently in Python (NOTICE)
+aeadframe	D	n/a	own composed record framing inspired by RFC4303/9147, wire format defined in SPEC.md
+aescbc	B	EXTERNAL	NIST SP800-38A Appendix F.2.5 byte-exact vector in kat_vectors.zig
+aeskw	B	EXTERNAL	RFC 3394 wrap/unwrap KATs (README Provenance)
+argsafe	C	n/a	internal char-class validators; golden allow/reject tables, no wire format
+bacnet	A	EXTERNAL	bacpypes3/bacnet-stack black-box oracles + bacpypes3 live peer (README)
+bbs	B	EXTERNAL	KAT vectors drawn from published reference implementation (NOTICE)
+bech32	A	EXTERNAL	BIP173/BIP350 test vectors fetched directly from bitcoin/bips repo
+bfv	B	REDERIVED	NTT/RNS/BFV KAT vectors from independent Python re-derivation (SPEC.md)
+bip32	B	EXTERNAL	official BIP-32 Test Vectors 1/2/3/5 in bip32_vectors.zig
+bip340	B	EXTERNAL	official BIP340 19 test vectors embedded verbatim in kat_vectors.zig
+bitcoinscript	A	EXTERNAL	machine-transcribed bitcoin/bitcoin src/test/data/script_tests.json
+bitcointx	A	MIXED	BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector
+blindrsa	B	EXTERNAL	RFC 9474 Appendix A.1/A.4 byte-exact KATs
+blobmsg	A	MIXED	hand-derived libubox-spec goldens (SELF); live ubusd peer test when reachable (EXTERNAL)
+blobstore	C	n/a	local content-addressed store; git/restic modeled behavior only, no external reader
+bls12_381	B	MIXED	IETF draft/py_ecc byte-exact KATs; KeyGen deliberately NOT KAT-verified, self round-trip only
+bn254	B	EXTERNAL	byte-exact against py_ecc external library (SPEC.md)
+bolt3	B	EXTERNAL	BOLT#3 Appendix D/E official test vectors, byte-exact (NOTICE)
+bolt8	A	EXTERNAL	official BOLT#8 Appendix A Transport Test Vectors (NOTICE)
+brotli	A	EXTERNAL	reference_interop.zig round-trips streams through real google/brotli via Python ext
+btcp2p	A	EXTERNAL	published verack/version hex dumps used as byte-exact test vectors
+bulletproofs	B	SELF	published vectors tied to producing impl's transcript, unusable; property/soundness KAT only
+bumtree	A	SELF	802.1aq modeled; SPEC.md: "offline only, no live-interop surface", hand-built golden topology
+cbor	A	EXTERNAL	RFC 8949 App. A + RFC 9052 C.2.1 byte-exact vectors, kat_vectors.zig
+coap	A	SELF	hand-built CON GET datagrams round-tripped, no third-party CoAP oracle
+coconut	B	SELF	SPEC.md §3: "no external byte-exact vector" for Coconut, explicit Fable tier
+conntrack	A	EXTERNAL	raw ctnetlink frames captured off the wire via nlmon/tcpdump, goldens.zig
+cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic
+cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only
+csvsafe	C	n/a	OWASP CSV-injection escape heuristic, no wire byte-agreement question
+csvstream	A	SELF	RFC 4180 reader/writer, hand-authored fixtures, no captured third-party CSVs
+ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only
+dataset	C	n/a	internal tabular Value/Dataset abstraction, no wire format
+datefmt	C	n/a	internal calendar/date-epoch arithmetic (Hinnant's algorithm), no wire
+decaf448	B	EXTERNAL	RFC 9496 Appendix B official test vectors, byte-exact, kat_test.zig
+decimal	C	n/a	arbitrary-precision decimal arithmetic; no wire format, invariant-checked
+devlink	A	EXTERNAL	goldens captured from real devlink binary + kernel via strace, goldens.zig
+df-elect	D	n/a	own DF-election design re-derived from RFC 7432 for a link-state fabric, no BGP peer
+diagnostics	C	n/a	LSP-style internal diagnostics collector, no wire format
+dkg	B	SELF	README/SPEC: "no external byte-exact KAT" for randomized GJKR DKG
+dnp3	A	EXTERNAL	goldens.zig: live captured sessions vs real opendnp3 peer, both directions
+dns	A	MIXED	message.zig goldens hand-built; Resolver has live UDP/TCP/DoH tests vs real 8.8.8.8
+dnssec	A	EXTERNAL	oracle_vectors.zig: real zones signed by ldns-signzone, accepted by ldns-verify-zone
+drand	A	EXTERNAL	quicknet KAT is live-fetched public drand network data, same pins tlock uses
+dtls	A	EXTERNAL	live interop vs real wolfSSL 5.9.1 peer, both roles, multiple flows
+ebpf	A	EXTERNAL	golden bytecode derived from clang -target bpf output + bpftool verifier dump
+ecvrf	B	EXTERNAL	RFC 9381 Appendix B.3 official ECVRF-EDWARDS25519-SHA512-TAI vectors, byte-exact
+ed448	B	EXTERNAL	RFC 8032 / RFC 7748 official test vectors, byte-exact, kat_test.zig
+encoding	A	SELF	hand-authored spot-check fixtures (e.g. windows-1252 euro), no WHATWG table/iconv cross-check
+enip	A	EXTERNAL	61 goldens captured from real traffic between 3rd-party stacks + live round trips
+ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation
+ethtool	A	EXTERNAL	real ethtool binary as capture oracle under strace, goldens.zig
+falcon	B	EXTERNAL	official NIST Round-3 falcon512/1024-KAT.rsp files, byte-exact
+filestore	C	n/a	own JSON snapshot format on disk, no interop; atomic write, no wire (README)
+finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external numeric check
+fleetsim	A	EXTERNAL	7 protocols live vs real masters: pymodbus/pycomm3/bacpypes3/opendnp3/c104/snap7/asyncua
+framing	D	n/a	own length-prefix + JSON envelope wire shape invented here, no external spec
+frost	B	EXTERNAL	RFC 9591 Appendix E.5 official KAT, byte-exact (README/SPEC)
+fss	B	REDERIVED	independent Python re-derivation from BGI16 emits KAT vectors (SPEC.md)
+fuzzysearch	C	n/a	in-process trie+DP fuzzy match; brute-force self oracle only (SPEC.md)
+genetlink	A	MIXED	offline goldens self-built; live nlctrl test vs real Linux kernel is external
+geoindex	C	n/a	in-process Hilbert R-tree; naive linear-scan self oracle only (SPEC.md)
+groth16	B	MIXED	verifier anchored via bn254 Dark Forest snarkjs KAT; QAP/R1CS layer self-oracle only
+grpc	A	EXTERNAL	python grpcio driven as black-box oracle both directions (README/SPEC)
+hashdigest	C	n/a	thin streaming wrapper over std.crypto Sha256, no custom crypto (README)
+health	D	n/a	own JSON /healthz-/readyz design, k8s model referenced not specced (README)
+hpke	B	EXTERNAL	RFC 9180 Appendix A KAT, byte-exact in all 4 modes (README)
+hqc	B	EXTERNAL	official NIST KAT, byte-exact pk/sk/ct/ss (README)
+http	A	MIXED	HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self
+chachapoly	B	EXTERNAL	RFC 8439 KATs byte-exact + std oracle differential (README/SPEC)
+ibe	B	SELF	SPEC.md: no external BF-IBE vector exists; round-trip + algebraic identities only
+icmp	A	MIXED	RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test
+idempotency	D	n/a	own design over Stripe/IETF-draft pattern, no byte wire format (SPEC.md)
+iec104	A	EXTERNAL	72 byte-exact goldens captured from real c104/lib60870 traffic (SPEC.md)
+iec61850	A	EXTERNAL	82+15 goldens captured from libiec61850, live peer both directions (SPEC.md)
+iec62351	A	MIXED	RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested
+imap	A	EXTERNAL	RFC 3501 worked example, byte-exact, plus a live IMAP server peer (README)
+ipcbus	C	n/a	internal unix-socket dispatch loop, framing delegated, no protocol of its own
+isis	A	SELF	hand-authored goldens from spec reading; no dissector/router used (README/SPEC)
+isis-adj	A	SELF	SPEC.md: no external oracle needed, checked only via golden-tested sibling isis
+isis-dis	A	SELF	SPEC.md: no external oracle needed, lan_id/LSP-ID checked via sibling isis only
+isis-flood	A	SELF	SPEC.md: no external oracle needed, wire exercised via sibling isis codec only
+isis-lsdb	A	MIXED	checksum tie-break (§7.3.16.1) cross-checked vs FRR isis_lsp.c; rest of KAT table hand-authored only
+isis-sim	C	n/a	composes siblings over netsim; convergence/determinism invariants, no wire format of its own
+isis-spf	A	SELF	golden line-topology fixtures hand-built; no external SPF vectors or peer cross-check
+jinja	A	EXTERNAL	golden.json captured from real Python Jinja2 3.1.6 output + live subprocess oracle
+jobqueue	C	n/a	internal partition-FIFO dispatch queue; original design, no wire format
+json5	A	SELF	hand-authored fixtures; deliberately partial subset, no json5.org test corpus used
+jsonshape	D	n/a	original jq-style bounded path-projection dialect invented here, not full JSONPath
+jwe	A	EXTERNAL	RFC 7516 App A full-token KAT (kat_rfc7516.zig) + RFC 7518 App B/C KATs
+jwt	A	EXTERNAL	RFC 7515 A.1-A.3/8037 A.4 full JWS compact-token vectors + PKCE 7636 App B
+k256	B	EXTERNAL	official BIP340 vectors (kat_vectors.zig) + bit-exact vs std.crypto.ecc.Secp256k1
+kv	C	n/a	embedded Bitcask-style log+keydir store; design references only, no interop target
+kvtree	C	n/a	embedded COW B-tree; LMDB/BoltDB design inspiration only, own format
+l2disco	A	SELF	golden byte KATs hand-transcribed from LLDP/CDP/ARP/DHCP specs, no live capture
+l2encap	A	SELF	golden byte-layout KAT hand-authored from spec layouts; SPEC.md: no live-interop surface
+l2forward	A	SELF	FDB/split-horizon decisions per 802.1D/EVPN; SPEC.md: offline logic only, no live-interop
+latency-stats	C	n/a	in-process stats/histogram; hand-computed KAT + sorted-oracle check, no wire format
+linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked examples cited
+liveness-hyst	C	n/a	local estimator "modeled after" BFD/Babel; scored via trace corpus + invariants, not wire-compat
+llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs
+lninvoice	A	MIXED	BOLT11/12 mostly externally anchored (bolts vectors); BOLT12 offer ENCODE round-trip self-constructed
+lnwire	A	MIXED	BigSize/TLV base wire externally anchored (BOLT#1 App A/B); BOLT#2/#7 messages round-trip only
+lockfree	C	n/a	canonical class-C case (MPMC queue + EBR); litmus/ = internal weak-memory verification
+loopfree-reconv	C	n/a	ordered-FIB scheduling algorithm proven via own loop-freedom invariant, no wire messages
+loopix	C	n/a	netsim anonymity simulation of Loopix paper; modeled header, not byte-compat with real Loopix/Nym
+mcp	A	MIXED	sampling/elicitation lines byte-identical to spec's own JSON examples; init/tools/resources goldens + peer concept self-only (SPEC.md: "no external anchor")
+mcp-http	A	SELF	own self-contained HTTP/SSE tests; Dart/mcp_dart parity is a prose claim, no captured bytes
+megolm	B	MIXED	libolm KAT byte-exact ratchet/message but session.zig 2-sided round-trip is self-only (SPEC grade 3)
+metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check
+minisign	A	EXTERNAL	byte-exact vs real minisign 0.12 binary, README
+mls	A	EXTERNAL	mlswg/mls-implementations official interop KAT (tree-operations.json etc.)
+modbus	A	EXTERNAL	CAPTURED pymodbus 3.14.0 live session, baked-in bytes in goldens.zig
+montint	C	n/a	internal Montgomery bignum arithmetic; ground truth is brute-force CPython bignum
+mqtt	A	SELF	golden bytes are hand-authored (KAT) per OASIS spec text, no captured broker session
+musig2	B	EXTERNAL	official BIP327 vectors (key_agg/nonce/sig_agg/tweak), NOTICE
+netaddr	C	n/a	local RFC 6724 address-selection logic, no wire peer; self-tested only
+netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips
+netlink	A	EXTERNAL	golden bytes captured from iproute2 via strace+nlmon/tcpdump, SPEC.md
+netsim	C	n/a	in-process deterministic sim/test harness, no wire; correctness = determinism/invariants
+nftables	A	MIXED	native path anchored by captured real nft traffic; JSON builder path is self golden
+nl80211	A	EXTERNAL	goldens captured from real iw under strace; live kernel tests skip cleanly (bonus)
+noise	A	EXTERNAL	official cacophony vectors from rweather/noise-c, byte-exact incl. handshake hash
+numparse	D	n/a	original design, no external spec/vectors; ICU named as loose model only
+ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures
+ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data
+opaque	A	EXTERNAL	RFC 9807 Appendix C.1 official vectors, full registration/KE1-3/session_key byte-exact
+opcua	A	MIXED	P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable
+openapi	A	SELF	hand-authored golden JSON document; only checked to be valid JSON, no real OpenAPI validator
+oscore	A	EXTERNAL	RFC 8613 Appendix C official vectors (key derivation + protected-message C.4-C.8)
+otp	B	EXTERNAL	RFC 4226/6238 appendix vectors embedded byte-exact
+p256	B	EXTERNAL	RFC 6979 Appendix A.2.5 ECDSA-P256 vectors; field ops also cross-checked vs std.crypto
+pagecache	C	n/a	internal buffer-pool page cache, no wire, LMDB/Postgres named as concept analogues only
+paillier	B	EXTERNAL	cross-checked against phe (python-paillier) 1.5.0 real library output
+pbb	A	SELF	hand-assembled golden frames per IEEE 802.1ah spec, no capture available (README explicit)
+pir	B	SELF	SPEC.md: no external test vector exists for this DPF construction
+pollworker	C	n/a	internal job/event-loop scheduler (single-owner controller), no wire
+poseidon	B	EXTERNAL	circomlibjs JSON consts byte-identical (constants_test.zig)
+pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture
+probe	C	n/a	TCP connect timing via std connect(); no wire codec of its own
+procnet	A	EXTERNAL	testdata/*.txt captured from real kernel /proc snapshots (README)
+procrun	C	n/a	process reap/spawn robustness util, no wire format
+protobuf	A	MIXED	codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing
+psbt	A	MIXED	kat_vectors.zig = official BIP174 vectors; finalize P2WPKH/P2SH/P2WSH self-authored
+quic-crypto	A	EXTERNAL	RFC 9001 Appendix A vectors verbatim in initial/headerprot/protection.zig
+raft	C	n/a	netsim model-checking vs Raft safety properties, no wire byte format
+ramcache	C	n/a	pure in-process W-TinyLFU cache, no wire
+ratelimit	C	n/a	token-bucket internal utility, no wire
+rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only
+rbac	C	n/a	in-process NIST RBAC/XACML decision engine, no wire exchange
+rdap	A	SELF	RFC 7480-9224 JSON client; hand-authored fixtures, no captured registry resp
+readthrough	C	n/a	singleflight+cache loader, in-process, no wire
+reconcilable	C	n/a	in-process reconcile loop modeled after k8s controller-runtime, no wire
+requestid	C	n/a	opaque correlation-ID generator/passthrough, no codec
+rescue	B	EXTERNAL	RPO's 38 published vectors + miden-crypto's own vectors + Winterfell KAT
+resilience	C	n/a	circuit breaker/retry/bulkhead, in-process state machines
+ripemd160	B	EXTERNAL	official RIPEMD-160 spec Appendix vectors, incl. million-'a' KAT
+router	C	n/a	path trie + middleware dispatch, in-process; wire parsing is sibling http
+rsa	B	EXTERNAL	RFC 8017 + OpenSSL/ssh-keygen-generated KATs (root.zig provenance)
+s7comm	A	MIXED	classic goldens from snap7 live peer; S7CommPlus body self, rawshark envelope only
+saml	A	MIXED	core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips
+sandbox	A	EXTERNAL	seccomp/landlock/rlimit enforcement tested against the real running kernel
+sealedbox	B	EXTERNAL	libsodium C lib called via FFI to compute expected ciphertexts (kat_vectors.zig)
+security-headers	A	SELF	golden header fixtures hand-authored; helmet.js value read not executed - SELF
+seqmap	C	n/a	clean-room internal correlation table (id allocation), no wire format at all
+sessions	D	n/a	own session/CSRF design guided by OWASP cheat sheets, no third-party spec
+shardstore	C	n/a	internal key-sharding composition over single-writer stores, no wire format
+signal	B	MIXED	X3DH agreement+codec only self round-trip; XEdDSA has libsignal KAT (kat_test.zig)
+slhdsa	B	EXTERNAL	NIST ACVP FIPS 205 KAT vectors, kat_vectors.zig/kat_test.zig
+smtp	A	EXTERNAL	live_golden.zig: byte-exact transcript captured from real aiosmtpd 1.4.6 session
+snmp	A	EXTERNAL	interop.zig: byte-exact goldens captured from real net-snmp 5.9.4 exchange
+sntp	A	SELF	canned server-reply fixtures only; live query test always error.SkipZigTest
+spake2plus	B	EXTERNAL	RFC 9383 Appendix C official P-256/SHA-256 vector, kat_vectors.zig
+spbfib	A	SELF	groupDa: hand-derived worked-example bytes from RFC 6329 formula, not captured
+spf-ect	C	n/a	generalized Dijkstra/ECT graph algorithm; brute-force cross-check property tests
+sphinx	A	EXTERNAL	official BOLT#4 onion-test.json vector + independent Python rederivation of secrets
+ssh	A	MIXED	self loopback client<->server baseline; live OpenSSH interop skips if sshd absent
+staticfiles	A	SELF	hand-authored fixtures only, no real client/browser interop test exists
+stun	A	EXTERNAL	RFC 5769 sections 2.1-2.3 published test vectors, root.zig
+syslog	A	SELF	hand-authored fixtures/round-trip only; live UDP path always SkipZigTest
+tabular	C	n/a	internal dataset-algebra library (pandas/dplyr-modeled API), no wire format
+taproot	B	EXTERNAL	official BIP341 wallet test vectors, kat_vectors.zig/kat_test.zig
+tar	A	MIXED	read path: real GNU tar 1.35 golden header; write path only via skippable live tar test
+tc	A	EXTERNAL	netlink datagrams captured from real iproute2 tc via strace, goldens.zig
+tcplan	C	n/a	pure Topology->Plan compiler, internal data structure, no wire I/O
+tenantkex	D	n/a	own tenant-isolation composition atop noise; sibling's anchor does not transfer
+testkit	C	n/a	in-process test-utility layer over std.testing, no wire/crypto
+tfhe	B	SELF	no external byte-exact KAT exists (root.zig/gate.zig); cleartext oracle + property tests
+threshold_ecdsa	B	SELF	no official KAT exists for GG18/20 (SPEC.md); self-consistency + reject-contract tests
+throttle	C	n/a	in-process concurrency-limiter/semaphore algorithm, no wire format
+timelock_envelope	B	MIXED	drand quicknet vector real+pairing-checked; envelope AND-composition only round-tripped
+tlock	B	EXTERNAL	byte-exact vs genuine drand Go tle ciphertext + live-fetched quicknet beacon sig
+tlsresume	A	EXTERNAL	RFC 8448 KAT byte-exact: ticket/psk-binder/earlydata/replay real vectors
+tracecontext	A	SELF	8 offline hand-authored tests; one traceparent value copied from spec text
+traceroute	A	MIXED	canned ICMP fixtures (SELF); loopback live test skips without CAP_NET_RAW
+trie	D	n/a	own frozen-index wire format (ZTR1 magic), invented in-repo, no third party
+tsdb	C	n/a	embedded time-series store; row-key shape Prometheus-like but no wire interop
+tz	A	MIXED	600 zones from real IANA-generated table; Jn/n forms only synthetic hand zones
+uci	A	SELF	golden_network fixture hand-authored, not captured from real OpenWrt config
+upstream	C	n/a	in-process LB/health-check library, no wire format of its own
+validate	A	SELF	JSON Schema 2020-12 semantics; own tests only, no official Test Suite run
+vdf	B	REDERIVED	eval KAT vs independent Python pow() oracle over real RSA-2048 challenge N
+voprf	B	EXTERNAL	RFC 9497 own published test vectors, byte-exact
+webauthn	A	EXTERNAL	W3C sec.16 vectors, cross-checked vs go-webauthn's re-hosting of same vectors
+webhooksig	A	SELF	HMAC-SHA256 sample value hand-cited in test, no named published KAT source
+websocket	A	EXTERNAL	RFC 6455 sec.1.3/sec.5.7 worked-example bytes, byte-exact parse AND write
+whois	A	SELF	scripted/canned transport only; no captured real registry responses
+wireguard	A	MIXED	KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDERIVED(Python); netlink codec SELF, root kernel test skips
+workerpool	C	n/a	internal thread pool over own lockfree MS-queue + EBR, no wire
+writebehind	C	n/a	pure composition of internal cache/queue/pool modules, no wire
+x509	A	EXTERNAL	chains generated by real OpenSSL 3.5, cross-checked with openssl verify
+xdp-classifier	A	MIXED	classifier bytecode clang-cross-checked(EXTERNAL); CAP_BPF kernel-load test skips unprivileged
+xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used
+xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip
+xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only
+xmss	B	MIXED	core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only
+yaml	A	MIXED	yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution self-tested only
+zipstream	A	MIXED	writer bytes cross-checked live via std.zip.Iterator; real unzip/zipinfo check was ad hoc, not standing
