@@ -1,0 +1,122 @@
+# Anchor tasks — the 88 modules from ANCHORS.tsv that face outside and are not
+# anchored yet. Generated 2026-08-01. Read ANCHORS.tsv's header first.
+#
+# THE JOB: move the expected values in the tests from "we wrote them, from our
+# own reading of the spec" to "they came from outside". The foreign tool
+# normally runs ONCE, at capture time; the bytes it produced are committed as
+# literals and the test stays offline, deterministic and dependency-free.
+#
+# SOURCE   VECTOR:<where>  published byte-level vectors covering the gap
+#          CLI:<tool>      a command-line tool can emit or check the bytes
+#          DAEMON:<tool>   needs a service standing up — much dearer
+#          CAPTURE:<where> real artifacts obtainable from a public source
+#          NONE            nothing external exists; a legitimate end state
+#
+# COST     S  drop in published vectors, or re-run a harness THAT ALREADY
+#             EXISTS here with a different input
+#          M  build a harness around a CLI, or transcribe a vector set
+#          L  stand up a daemon/toolchain, or write a foreign-format parser
+#          -  SOURCE is NONE, nothing to do
+#
+# ⚠ TWO TRAPS, both already paid for once in this repo:
+#   1. Do NOT close one of these by un-skipping a live test into the default
+#      gate. Capture the bytes once, commit them, keep the test offline. A
+#      flake in the gate costs more than the anchor is worth (see cba13a4).
+#   2. NEVER compute a "vector" from our own output. An open, labelled gap is
+#      strictly better than a fake anchor.
+#
+# ⚠ THIS IS A LOWER BOUND. Classification is per module, so a module that is
+#   EXTERNAL overall can still have one uncovered path inside it — enip is
+#   EXTERNAL (goldens captured from cpppo/pycomm3) yet its symbolic-segment
+#   pad byte is never exercised, because the one captured sample has an
+#   even-length tag name. Those per-path gaps are not counted here.
+#
+# module	CLASS	ANCHOR	EVIDENCE	SOURCE	COST	NOTE
+adaptor	B	REDERIVED	no official spec/vectors; kat_vectors.zig computed independently in Python (NOTICE)	NONE	-	No schnorr adaptor vectors exist; DLC's ECDSA-adaptor.json is a different scheme
+bfv	B	REDERIVED	NTT/RNS/BFV KAT vectors from independent Python re-derivation (SPEC.md)	NONE	-	SEAL/OpenFHE ciphertext layout is implementation-defined; no portable vector exists
+bulletproofs	B	SELF	published vectors tied to producing impl's transcript, unusable; property/soundness KAT only	NONE	-	SPEC.md: no third-party vector matchable; transcript is implementation-defined
+bumtree	A	SELF	802.1aq modeled; SPEC.md: "offline only, no live-interop surface", hand-built golden topology	NONE	-	No open-source 802.1aq/SPB implementation or freely available worked example exists
+coconut	B	SELF	SPEC.md §3: "no external byte-exact vector" for Coconut, explicit Fable tier	NONE	-	SPEC §3: no public vector; asonnino/nymtech impls use incompatible serialization
+dkg	B	SELF	README/SPEC: "no external byte-exact KAT" for randomized GJKR DKG	NONE	-	GJKR DKG is randomized; SPEC/README already show no published answer vector can exist
+ibe	B	SELF	SPEC.md: no external BF-IBE vector exists; round-trip + algebraic identities only	NONE	-	No BF-IBE-over-BLS12-381 implementation exists anywhere to compare against
+megolm	B	MIXED	libolm KAT byte-exact ratchet/message but session.zig 2-sided round-trip is self-only (SPEC grade 3)	NONE	-	SPEC.md: no external vector for a full 2-sided session; self round-trip is the ceiling
+pbb	A	SELF	hand-assembled golden frames per IEEE 802.1ah spec, no capture available (README explicit)	NONE	-	no 802.1ah capture available (README/SPEC); hand-assembled per spec is the ceiling
+pir	B	SELF	SPEC.md: no external test vector exists for this DPF construction	NONE	-	SPEC.md explicit: no published vector for this DPF-PIR composition exists anywhere
+s7comm	A	MIXED	classic goldens from snap7 live peer; S7CommPlus body self, rawshark envelope only	NONE	-	no Wireshark dissector for S7CommPlus, no S7-1200/1500 hardware
+signal	B	MIXED	X3DH agreement+codec only self round-trip; XEdDSA has libsignal KAT (kat_test.zig)	NONE	-	Signal publishes no official X3DH KAT; own Python oracle would be REDERIVED
+spbfib	A	SELF	groupDa: hand-derived worked-example bytes from RFC 6329 formula, not captured	NONE	-	RFC 6329 gives only a bit diagram; only proprietary Avaya/Extreme stacks exist
+ssh	A	MIXED	self loopback client<->server baseline; live OpenSSH interop skips if sshd absent	NONE	-	self-loopback can't be anchored by construction; real anchor already lives in OpenSSH interop
+tfhe	B	SELF	no external byte-exact KAT exists (root.zig/gate.zig); cleartext oracle + property tests	NONE	-	no reference ships byte-exact KATs; noise sampling makes bytes non-reproducible anyway
+threshold_ecdsa	B	SELF	no official KAT exists for GG18/20 (SPEC.md); self-consistency + reject-contract tests	NONE	-	GG18/20 papers publish no KAT; MPC randomness blocks byte cross-check with foreign libs
+timelock_envelope	B	MIXED	drand quicknet vector real+pairing-checked; envelope AND-composition only round-tripped	NONE	-	AND-composition is this module's own addition on drand; no third party publishes it
+tz	A	MIXED	600 zones from real IANA-generated table; Jn/n forms only synthetic hand zones	NONE	-	real zic footers are always M-form; Jn/n is unreachable from any current IANA release
+vdf	B	REDERIVED	eval KAT vs independent Python pow() oracle over real RSA-2048 challenge N	NONE	-	no VDF paper/impl publishes a worked byte-level example over a real large modulus
+fss	B	REDERIVED	independent Python re-derivation from BGI16 emits KAT vectors (SPEC.md)	VECTOR:google/distributed_point_functions	L	Byte-exact needs swapping SHA-256 PRG for fixed-key-AES to match Google's DPF vectors
+groth16	B	MIXED	verifier anchored via bn254 Dark Forest snarkjs KAT; QAP/R1CS layer self-oracle only	CLI:snarkjs	L	prover bytes only checked by sibling bn254 verifier; needs .zkey/.wtns parser
+isis	A	SELF	hand-authored goldens from spec reading; no dissector/router used (README/SPEC)	DAEMON:FRR isisd (netns)	L	Stand up real isisd, capture live PDUs; shared harness would cover all isis-* siblings
+isis-adj	A	SELF	SPEC.md: no external oracle needed, checked only via golden-tested sibling isis	DAEMON:FRR isisd (netns)	L	Same shared FRR harness as isis; adjacency TLVs captured from a real running instance
+isis-dis	A	SELF	SPEC.md: no external oracle needed, lan_id/LSP-ID checked via sibling isis only	DAEMON:FRR isisd (netns)	L	Same shared FRR harness; DIS election/LAN-ID captured live, not just sibling-checked
+isis-flood	A	SELF	SPEC.md: no external oracle needed, wire exercised via sibling isis codec only	DAEMON:FRR isisd (netns)	L	Same shared FRR harness; flooding/PSNP-CSNP exchange captured live
+isis-lsdb	A	MIXED	checksum tie-break (§7.3.16.1) cross-checked vs FRR isis_lsp.c; rest of KAT table hand-authored only	DAEMON:FRR isisd (netns)	L	Same shared FRR harness; rest of KAT table beyond checksum tie-break needs live capture
+isis-spf	A	SELF	golden line-topology fixtures hand-built; no external SPF vectors or peer cross-check	DAEMON:FRR isisd (netns)	L	Same shared FRR harness; SPF topology/results checked against real router computation
+lnwire	A	MIXED	BigSize/TLV base wire externally anchored (BOLT#1 App A/B); BOLT#2/#7 messages round-trip only	DAEMON:LND/CLN regtest	L	BOLT#2 channel-mgmt round-trip only; BOLT#7 gossip via public dumps is M
+psbt	A	MIXED	kat_vectors.zig = official BIP174 vectors; finalize P2WPKH/P2SH/P2WSH self-authored	DAEMON:bitcoind regtest `finalizepsbt` RPC	L	no daemon exists yet; needed for real finalized P2WPKH/P2SH/P2WSH multisig bytes
+accesslog	A	SELF	Combined/logfmt/JSON logs consumed by real tools; goldens hand-authored, not captured	DAEMON:apache httpd	M	Real apache httpd (mod_log_config) as escaping oracle for CRLF/quote-injection edges
+blobmsg	A	MIXED	hand-derived libubox-spec goldens (SELF); live ubusd peer test when reachable (EXTERNAL)	CLI:ubus	M	Live ubusd harness exists; needs qemu OpenWRT image (not built) or real hardware
+coap	A	SELF	hand-built CON GET datagrams round-tripped, no third-party CoAP oracle	DAEMON:libcoap/aiocoap CLI	M	whole module self-authored; clean-room from RFC 7252, no third-party CoAP consulted
+cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic	CLI:Python http.cookies	M	Cross-check quoted/valueless/empty-name parsing vs a mature independent parser
+cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only	CLI:expressjs/cors or rs/cors	M	Run a real CORS middleware with matching config, diff preflight/actual headers
+ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only	CLI:python-fido2	M	Yubico's python-fido2 ClientPin can generate/verify real PIN-protocol framing
+ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation	CLI:scapy + Linux netns	M	Craft overlapping IPv6 fragments, compare accept/drop vs real kernel RFC5722 defrag
+finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external numeric check	CLI:empyrical/ffn (pip)	M	Run the actual Python libraries this module models, capture outputs as literals
+http	A	MIXED	HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self	CLI:smuggler (defparam)	M	Extend curl_interop harness with a published smuggling probe tool vs h1 goldens
+iec62351	A	MIXED	RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested	CAPTURE:Wireshark/goosestalker GOOSE pcap samples	M	Public GOOSE pcap captures exist; cross-check frame layout, no live stack needed
+l2disco	A	SELF	golden byte KATs hand-transcribed from LLDP/CDP/ARP/DHCP specs, no live capture	CAPTURE:Wireshark/packetlife LLDP-CDP-ARP-DHCP samples	M	Public captures widely available; transcribe real frames as goldens
+l2encap	A	SELF	golden byte-layout KAT hand-authored from spec layouts; SPEC.md: no live-interop surface	CLI:iproute2 vxlan/geneve	M	Real kernel vxlan/geneve interfaces give live-captured frames; SPB portion stays NONE
+l2forward	A	SELF	FDB/split-horizon decisions per 802.1D/EVPN; SPEC.md: offline logic only, no live-interop	CLI:iproute2 bridge	M	Real Linux bridge gives live FDB learning/aging behavior for the 802.1D portion
+mcp-http	A	SELF	own self-contained HTTP/SSE tests; Dart/mcp_dart parity is a prose claim, no captured bytes	CLI:mcp_dart (Dart pub package, the existing behavioral reference)	M	write live HTTP/SSE interop harness against mcp_dart instead of prose parity claim
+mqtt	A	SELF	golden bytes are hand-authored (KAT) per OASIS spec text, no captured broker session	DAEMON:mosquitto	M	every packet golden hand-authored; SPEC.md says mosquitto is a behaviour ref only
+saml	A	MIXED	core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips	CLI:xmlsec1	M	XSW/HoK already anchored; only the encrypted sub-path is self-composed
+staticfiles	A	SELF	hand-authored fixtures only, no real client/browser interop test exists	CLI:nginx (or Apache) side-by-side comparison via curl	M	stand up nginx on the same fixture tree, diff Range/ETag/conditional-GET responses
+syslog	A	SELF	hand-authored fixtures/round-trip only; live UDP path always SkipZigTest	CLI:a real RFC 5424 parser (rsyslog imudp, or a Python rfc5424 lib)	M	UDP/TCP send path is compile-check only; build a harness with a real receiving parser
+tracecontext	A	SELF	8 offline hand-authored tests; one traceparent value copied from spec text	VECTOR:w3c/trace-context repo's own test fixtures	M	adapt the official W3C trace-context test-suite cases beyond the one spec-text example
+uci	A	SELF	golden_network fixture hand-authored, not captured from real OpenWrt config	CLI:openwrt/uci + libubox (build from source)	M	build the real uci binary to capture actual `uci show`/`export` output for goldens
+wireguard	A	MIXED	KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDERIVED(Python); netlink codec SELF, root kernel test skips	CAPTURE:kernel netlink	M	KDF EXTERNAL, handshake REDERIVED, netlink config-plane codec still SELF
+xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used	VECTOR:W3C XML Conformance Test Suite (xmlconf)	M	swap the modeled-on-xmlconf goldens for the actual xmlconf well-formed/not-wf files
+xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip	CLI:xmlsec1	M	verify() fixture self-constructed; C14N already externally anchored
+xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only	CLI:xmlsec1	M	no real external EncryptedAssertion fixture was available
+acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed	CLI:openssl	S	Extend existing openssl-fixture harness to parse the RFC8737 TLS-ALPN-01 DER extension
+bitcointx	A	MIXED	BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector	VECTOR:bitcoin/bitcoin src/test/data/sighash.json	S	Official legacy-sighash vectors; sibling bitcoinscript already parses this JSON shape
+bls12_381	B	MIXED	IETF draft/py_ecc byte-exact KATs; KeyGen deliberately NOT KAT-verified, self round-trip only	VECTOR:EIP-2333 test vectors	S	Official seed/master_SK/child_SK vectors for KeyGen, drop-in
+csvstream	A	SELF	RFC 4180 reader/writer, hand-authored fixtures, no captured third-party CSVs	VECTOR:max-mapper/csv-spectrum	S	Public CSV acid-test corpus (quoted commas, CRLF, escapes) with expected output
+dns	A	MIXED	message.zig goldens hand-built; Resolver has live UDP/TCP/DoH tests vs real 8.8.8.8	CLI:dig/kdig + capture	S	codec goldens hand-computed per RFC 1035; live resolver test exists but skips offline
+encoding	A	SELF	hand-authored spot-check fixtures (e.g. windows-1252 euro), no WHATWG table/iconv cross-check	VECTOR:WHATWG encoding index-*.txt + Unicode.org 8859-x.TXT	S	Official byte-exact tables for all 5 code pages, drop-in
+genetlink	A	MIXED	offline goldens self-built; live nlctrl test vs real Linux kernel is external	CLI:nlctrl (live kernel)	S	Live nlctrl test already runs unconditionally; extend to cover offline-golden shapes
+icmp	A	MIXED	RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test	CLI:ping + tcpdump	S	checksums hand-computed; trivial capture off loopback
+json5	A	SELF	hand-authored fixtures; deliberately partial subset, no json5.org test corpus used	VECTOR:json5/json5-tests	S	Official json5.org corpus; module explicitly hasn't adopted it yet
+linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked examples cited	VECTOR:RFC 8288 §3.5	S	RFC's own worked Link-header examples aren't cited yet, drop-in
+llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs	CAPTURE:live LLM API response	S	Existing test is unconditionally SkipZigTest; un-skip and capture one real SSE response
+lninvoice	A	MIXED	BOLT11/12 mostly externally anchored (bolts vectors); BOLT12 offer ENCODE round-trip self-constructed	CLI:bootstrap.bolt12.org decode API	S	Feed our BOLT12 offer encoding through the real public decoder, capture agreement
+mcp	A	MIXED	sampling/elicitation lines byte-identical to spec's own JSON examples; init/tools/resources goldens + peer concept self-only (SPEC.md: "no external anchor")	VECTOR:MCP spec's own JSON examples (modelcontextprotocol/modelcontextprotocol docs)	S	same pattern as sampling/elicitation; peer concept stays unanchorable (spec-invented)
+metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check	CLI:promtool (Prometheus)	S	pipe golden exposition text through `promtool check metrics` instead of hand-eyeballing
+netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips	CAPTURE:existing python-netconf live harness (NETCONF_TEST_SERVER)	S	capture rpc.zig wire bytes from the live py-netconf server already used for interop
+nftables	A	MIXED	native path anchored by captured real nft traffic; JSON builder path is self golden	CLI:nft (existing JSON<->native consistency + `nft -c -j` check)	S	extend existing live consistency/check harness to more statement shapes than one ruleset
+ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures	CAPTURE:public CA responder	S	fixtures CONSTRUCTED not captured; one real Let's Encrypt response fixes it
+ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data	CAPTURE:public CA responder	S	same fixtures as ocsp; live fetch path is M
+opcua	A	MIXED	P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable	CAPTURE:open62541 (existing OPCUA_CAPTURE_DIR + rawshark harness)	S	rerun existing capture harness in Sign/SignAndEncrypt mode, not just #None
+openapi	A	SELF	hand-authored golden JSON document; only checked to be valid JSON, no real OpenAPI validator	CLI:openapi-spec-validator (or redocly-cli lint)	S	validate golden doc with a real OpenAPI 3.1 validator, not just JSON well-formedness
+pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture	CAPTURE:tcpdump/pcap of a real TCP handshake with timestamps	S	swap hand-built TS-option fixtures for bytes off a real captured connection
+protobuf	A	MIXED	codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing	CLI:python-protobuf (existing oracle, currently skips if absent)	S	just ensure the package is installed so the existing oracle harness stops skipping
+rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only	CAPTURE:tcpdump of real Ethernet/ARP frames on a live interface	S	swap self-built ARP/Ethernet frames for bytes captured off a real LAN
+rdap	A	SELF	RFC 7480-9224 JSON client; hand-authored fixtures, no captured registry resp	CAPTURE:public RDAP servers (rdap.org/IANA bootstrap, ARIN)	S	one HTTPS GET against a live registry captures a real response as golden
+security-headers	A	SELF	golden header fixtures hand-authored; helmet.js value read not executed - SELF	CLI:node + helmet.js (npm package)	S	actually run helmet.js and diff headers, instead of reading its source for values
+sntp	A	SELF	canned server-reply fixtures only; live query test always error.SkipZigTest	CLI:public NTP server	S	live harness EXISTS but unconditionally skips; keep it OUT of the default gate
+tar	A	MIXED	read path: real GNU tar 1.35 golden header; write path only via skippable live tar test	CAPTURE:GNU tar (existing live tvf/xf harness, currently skip-only)	S	capture the write-path bytes once with tar present instead of leaving it host-gated
+traceroute	A	MIXED	canned ICMP fixtures (SELF); loopback live test skips without CAP_NET_RAW	CAPTURE:existing CAP_NET_RAW live loopback trace harness (currently skips)	S	run the existing live path with the capability instead of leaving it skip-gated
+validate	A	SELF	JSON Schema 2020-12 semantics; own tests only, no official Test Suite run	VECTOR:json-schema-org/JSON-Schema-Test-Suite (2020-12)	S	drop in the official suite's schema/data/valid triples instead of self-tested resolution
+webhooksig	A	SELF	HMAC-SHA256 sample value hand-cited in test, no named published KAT source	VECTOR:RFC 4231 HMAC-SHA-256 test vectors	S	HMAC core anchored by RFC4231; the sha256= wrapping is a trivial fixed format around it
+whois	A	SELF	scripted/canned transport only; no captured real registry responses	CLI:whois (or CAPTURE from a public whois server, port 43)	S	one real query against a public registry captures actual bytes, not canned transport
+xdp-classifier	A	MIXED	classifier bytecode clang-cross-checked(EXTERNAL); CAP_BPF kernel-load test skips unprivileged	CAPTURE:existing CAP_BPF kernel-load harness (currently skips unprivileged)	S	run the existing load test with CAP_BPF/root instead of leaving it skip-gated
+xmss	B	MIXED	core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only	CLI:xmss-reference (existing oracle, github.com/XMSS/xmss-reference)	S	drive the existing reference oracle over leaves 0-3 to byte-anchor the h=2 stateful walk
+yaml	A	MIXED	yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution self-tested only	VECTOR:yaml-test-suite (existing, already vendored 402/402)	S	the already-vendored suite likely has core-schema resolution cases not yet wired in
+zipstream	A	MIXED	writer bytes cross-checked live via std.zip.Iterator; real unzip/zipinfo check was ad hoc, not standing	CLI:unzip/zipinfo (already exercised, but ad hoc)	S	promote the existing ad-hoc real-unzip check into a standing committed test
