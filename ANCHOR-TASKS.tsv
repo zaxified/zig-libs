@@ -64,7 +64,7 @@ psbt	A	MIXED	kat_vectors.zig = official BIP174 vectors; finalize P2WPKH/P2SH/P2W
 accesslog	A	SELF	Combined/logfmt/JSON logs consumed by real tools; goldens hand-authored, not captured	DAEMON:apache httpd	M	Real apache httpd (mod_log_config) as escaping oracle for CRLF/quote-injection edges
 blobmsg	A	MIXED	hand-derived libubox-spec goldens (SELF); live ubusd peer test when reachable (EXTERNAL)	CLI:ubus	M	Live ubusd harness exists; needs qemu OpenWRT image (not built) or real hardware
 coap	A	SELF	hand-built CON GET datagrams round-tripped, no third-party CoAP oracle	DAEMON:libcoap/aiocoap CLI	M	whole module self-authored; clean-room from RFC 7252, no third-party CoAP consulted
-cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic	CLI:Python http.cookies	M	Cross-check quoted/valueless/empty-name parsing vs a mature independent parser
+cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic	DONE	-	DONE be61caa: python http.cookies oracle; quote-aware split BUG fixed; 5 divergences judged
 cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only	CLI:expressjs/cors or rs/cors	M	Run a real CORS middleware with matching config, diff preflight/actual headers
 ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only	CLI:python-fido2	M	Yubico's python-fido2 ClientPin can generate/verify real PIN-protocol framing
 ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation	CLI:scapy + Linux netns	M	Craft overlapping IPv6 fragments, compare accept/drop vs real kernel RFC5722 defrag
@@ -81,8 +81,8 @@ staticfiles	A	SELF	hand-authored fixtures only, no real client/browser interop t
 syslog	A	SELF	hand-authored fixtures/round-trip only; live UDP path always SkipZigTest	DONE	-	DONE a58d626: real rsyslogd receives+re-renders both transports; MSG escaping bug class
 tracecontext	A	SELF	8 offline hand-authored tests; one traceparent value copied from spec text	DONE	-	DONE e269090: 73 W3C vectors; found MUST-not-parse-tracestate bug; 1 gap logged
 uci	A	SELF	golden_network fixture hand-authored, not captured from real OpenWrt config	CLI:openwrt/uci + libubox (build from source)	M	build the real uci binary to capture actual `uci show`/`export` output for goldens
-wireguard	A	MIXED	KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDERIVED(Python); netlink codec SELF, root kernel test skips	CAPTURE:kernel netlink	M	KDF EXTERNAL, handshake REDERIVED, netlink config-plane codec still SELF
-xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used	VECTOR:W3C XML Conformance Test Suite (xmlconf)	M	swap the modeled-on-xmlconf goldens for the actual xmlconf well-formed/not-wf files
+wireguard	A	MIXED	KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDERIVED(Python); netlink codec SELF, root kernel test skips	DONE	-	DONE be61caa: real kernel SET/GET_DEVICE netlink frozen; closes the last self-RT layer
+xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used	DONE	-	DONE 6cc02e8: 130 xmlconf cases, FIVE real bugs; xmltest excluded on licence grounds
 xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip	CLI:xmlsec1	M	verify() fixture self-constructed; C14N already externally anchored
 xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only	CLI:xmlsec1	M	no real external EncryptedAssertion fixture was available
 acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed	DONE	-	DONE b830ef5: openssl-built TLS-ALPN-01 extension; provenance, not extra detection
