@@ -54,9 +54,9 @@ beyond its own MIT license.
 
 Where a module ports third-party code, or reproduces third-party data whose
 notice must be preserved, that module carries its own `NOTICE` file next to its
-source, and the notice travels with the module. FIFTEEN modules do, and these
-are the ONLY files in the repository that carry a condition naming anyone
-other than the zig-libs authors. Each such file's first line says
+source, and the notice travels with the module. SEVENTEEN modules do, and
+these are the ONLY files in the repository that carry a condition naming
+anyone other than the zig-libs authors. Each such file's first line says
 `<name> — third-party attribution`:
 
   falcon   — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
@@ -108,6 +108,13 @@ other than the zig-libs authors. Each such file's first line says
              EXCLUDED ENTIRELY on license grounds — its own terms permit
              redistribution only as the unmodified xmltest.zip; test
              fixtures only, no source code)
+  iec62351 — `modules/iec62351/NOTICE` (cutaway-security/goosestalker real
+             IEC 61850-8-1 GOOSE capture frames, MIT; three raw device
+             frames reproduced as test fixtures, no source code)
+  l2disco  — `modules/l2disco/NOTICE` (the-tcpdump-group/tcpdump dissector
+             test-suite capture files, 3-clause BSD; fifteen raw
+             LLDP/CDP/ARP/DHCP frames reproduced as test fixtures, no
+             source code)
 
 New modules that reproduce third-party code OR third-party data whose notice
 must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`

@@ -372,6 +372,35 @@ interoperability is claimed.** What was available was used, as a black box:
 - **`asn1crypto`** decoded the two OID constants to `2.2.3.1` and `1.0.62351.4`,
   confirming the hand-encoded content octets.
 
+### Real GOOSE captures — header/APDU boundary anchor, not an interop claim
+
+`libiec61850` remaining unavailable (previous section), three real IEC
+61850-8-1 GOOSE frames — a GE F650 relay and two IEDs from a mock four-bus
+substation, all captured from genuine devices, none of them this module's own
+output — were vendored instead (`cutaway-security/goosestalker`, MIT; see
+`../NOTICE`) and driven through `parse`/`verify` in
+`src/goose_capture_test.zig`. Since `goose.zig` never parses the `goosePdu`
+(the layering decision above), what a real frame can anchor is exactly the
+header: EtherType, APPID, `Length`, `Reserved 1`/`Reserved 2`, and the
+APDU/extension boundary `Length` derives — all confirmed byte-exact against
+genuine wire data, including the VLAN-tagged case (stripped before `parse`,
+per this module's documented contract).
+
+**All 493 GOOSE frames surveyed across the five source `.pcap` files carry
+`Reserved 1` = `Reserved 2` = `0x0000` — no IEC 62351-6 security extension in
+any of them.** That is the anchored finding: real-world GOOSE traffic
+essentially never turns the layer-2 security profile on, so a real capture
+cannot substitute for the `libiec61850` 62351-6 interop test this section
+already says is unavailable. The security extension's wire shape (the `0x85`
+tag, the field order, the covered range) remains this module's own model, as
+documented above — but it composes correctly over a genuine captured APDU:
+`goose_capture_test.zig` wraps one of the real APDUs with this module's own
+HMAC extension, round-trips it, and confirms tampering inside the real
+`gocbRef` text is still caught. As a bonus check of the shared `ber.zig`
+reader (not a claim about `goose.zig`'s own scope), the same file also walks
+each real `goosePdu`'s `gocbRef`/`stNum`/`sqNum`/`allData` fields with
+`ber.iterate`, cross-checked against a hand-decode of the same bytes.
+
 ### Negative tests
 
 Not a sample — the full list, because for a security module they are the point:

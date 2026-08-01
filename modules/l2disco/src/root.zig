@@ -76,6 +76,7 @@ test {
     _ = @import("arp.zig");
     _ = @import("dhcp.zig");
     _ = @import("mac.zig");
+    _ = @import("capture_test.zig");
 }
 
 test "meta is well-formed" {

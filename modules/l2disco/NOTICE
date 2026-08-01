@@ -1,0 +1,97 @@
+l2disco — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party CAPTURED WIRE DATA (raw LLDP/CDP/ARP/DHCP frame bytes,
+not source code) whose copyright notice must be preserved in any copy.
+Redistributing this module — alone or as part of zig-libs — must keep this
+file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+project. No third-party SOURCE CODE is present — only fifteen raw frames
+(real LLDP/CDP/ARP/DHCP traffic and dissector test fixtures), reproduced as
+byte-literal test fixtures in `src/capture_test.zig`.
+
+## the-tcpdump-group/tcpdump — dissector test-suite capture files
+
+Vendored from https://github.com/the-tcpdump-group/tcpdump, `tests/`
+directory, pinned at commit `57ca8734c0c14ad4ab294fe67100dadc4fb6ce31`
+(`master` branch, 2026-07-30):
+
+  * `tests/lldp_mudurl.pcap` — a real Ubuntu 14.04 host's LLDPDU (frame 1).
+  * `tests/LLDP_and_CDP.pcap` — two real Cisco IOS switches, `S1`/`S2`: their
+    CDPv2 frames (frames 1-2) and LLDP frames (frames 3-4).
+  * `tests/3560_CDP.pcap` — a real Cisco 3560 switch's CDPv2 frame (frame 1).
+  * `tests/lldp-infinite-loop-1.pcap` — the exact bytes that once hung
+    tcpdump's own LLDP dissector (frame 1; named upstream for that bug).
+  * `tests/lldp_8021_linkagg.pcap` — an org-specific (IEEE 802.1 Link
+    Aggregation) TLV fragment (frame 1; the TLV *value* only, its 2-byte
+    header stripped here).
+  * `tests/lldp_mgmt_addr_tlv_asan.pcap` — the exact bytes that once caused
+    an AddressSanitizer-caught heap-buffer-overflow READ in tcpdump's own
+    LLDP Management Address TLV decode (frame 1 of 2; the TLV *value* only).
+  * `tests/lldp_8023_mtu-oobr.pcap` — the exact bytes that once caused an
+    out-of-bounds read in tcpdump's own LLDP IEEE 802.3 Maximum Frame Size
+    TLV decode (frame 1; the TLV *value* only).
+  * `tests/arp-oobr.pcap` — a real ARP request (frame 1 of 2282) plus one
+    fuzzer-mutated frame from the same corpus (frame 164 of 2282,
+    `hlen=plen=170` in a 46-octet frame — the out-of-bounds-read shape named
+    in the file itself).
+  * `tests/dhcp-mud.pcap` — a real Raspberry Pi's DHCPREQUEST and the
+    matching server DHCPACK (frames 1-2).
+  * `tests/dhcp-option-33.pcap` — a real DHCPOFFER carrying a Static Route
+    option (frame 1 of 5).
+
+Excluded from vendoring, deliberately:
+
+  * `tests/lldp-infinite-loop-2.pcap`, `lldp_asan.pcap`,
+    `lldp_8023_mtu-oobr.pcap`'s sibling files, and the remaining ~2100
+    "normal traffic" frames of `arp-oobr.pcap` / ~2100 fuzzed frames of the
+    same corpus, and the remaining frames of `dhcp-option-33.pcap` (4 of 5,
+    each just one more Static-Route entry appended to the same base OFFER) —
+    each already represented in shape by a sibling frame that IS vendored;
+    vendoring every near-duplicate would multiply file size without
+    anchoring anything new.
+  * `tests/dhcp-rfc3004.pcap`, `dhcp-rfc4388.pcap`, `dhcp-rfc5859.pcap`,
+    `dhcp6-*.pcap`, `dhcpv6-*.pcap` and the other DHCP fixtures in the same
+    directory — DHCPv6 or option shapes already covered by the two vendored
+    DHCPv4 captures; not vendored to keep scope to what is actually anchored.
+  * `tests/aarp-*.pcap`, `arcnet-*-arp-*.pcap` — AppleTalk ARP and ARP over
+    ARCNET, both outside this module's documented Ethernet+IPv4 `EthIpv4`
+    scope (the generic `arp.Packet` handles arbitrary hardware/protocol
+    lengths already, and is exercised by the vendored `arp-oobr.pcap` frame).
+
+The repository's `LICENSE` file (a 3-clause BSD license, no separate license
+for `tests/`) applies repository-wide:
+
+    License: BSD
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+      1. Redistributions of source code must retain the above copyright
+         notice, this list of conditions and the following disclaimer.
+      2. Redistributions in binary form must reproduce the above copyright
+         notice, this list of conditions and the following disclaimer in
+         the documentation and/or other materials provided with the
+         distribution.
+      3. The names of the authors may not be used to endorse or promote
+         products derived from this software without specific prior
+         written permission.
+
+    THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+    IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+
+Only raw frame bytes are reproduced (as test fixtures), not tcpdump's own C
+dissector source, none of which was read or ported. The implementation under
+test (`lldp.zig`/`cdp.zig`/`arp.zig`/`dhcp.zig`) is the authors' own
+clean-room work from the public IEEE/RFC specifications, as the root `NOTICE`
+§2 `l2disco` entry and this module's README "Provenance" note already record;
+these captures anchor that implementation against genuine wire bytes,
+including — for several of the LLDP fixtures — the exact byte sequences that
+are publicly documented (by the fixture's own file name in the upstream
+project) to have broken another independent implementation's dissector for
+the same protocol.

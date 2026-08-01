@@ -1,0 +1,96 @@
+iec62351 — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party CAPTURED WIRE DATA (raw GOOSE frame bytes, not source
+code) whose copyright notice must be preserved in any copy. Redistributing
+this module — alone or as part of zig-libs — must keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only three raw Ethernet
+frames (IEC 61850-8-1 GOOSE publications captured from real substation IEDs),
+reproduced as byte-literal test fixtures in `src/goose_capture_test.zig`.
+
+## cutaway-security/goosestalker — real GOOSE capture frames
+
+Vendored from https://github.com/cutaway-security/goosestalker, pinned at
+commit `c68185dc6a9e4c9e28b6e14b499b1c2c251c5e49` (`main` branch,
+2021-12-15):
+
+  * `PCAPs/GOOSE.pcap`, frame 1 of 8 — a GE (General Electric) F650
+    protection relay's GOOSE publication (`GEDeviceF650/LLN0$GO$gcb01`,
+    `APPID` 0x0001, no VLAN tag in the source capture). The other seven
+    frames are the same publisher's unchanged heartbeat retransmissions
+    (`stNum`/`sqNum` differ only), so one is vendored, not all eight.
+  * `PCAPs/Sample_File_GOOSE.pcap`, frame 1 of 451 — a mock four-bus/18-IED
+    substation's `AA1C1Q01A1LD0/LLN0$GO$gcb_A` GOOSE publication (`APPID`
+    0x3001). The source capture carries an IEEE 802.1Q VLAN tag between the
+    MAC addresses and the GOOSE EtherType; the 4 VLAN octets are stripped
+    before the frame is embedded, matching `goose.zig`'s documented contract
+    that the caller resolves the MAC domain (VLAN included) before calling
+    `parse` — see that file's module doc comment. The remaining 450 frames in
+    this capture are the same 18 IEDs' repeated heartbeats of the same
+    shapes, already represented by the one frame vendored (and by the
+    `Sample_File_MMS_and_GOOSE.pcap` frame below, a different IED in the same
+    family).
+  * `PCAPs/Sample_File_MMS_and_GOOSE.pcap`, frame 39 of 301 (the first GOOSE
+    frame in a capture that interleaves GOOSE with MMS/TCP traffic) — the
+    sibling IED `AA1C1Q05A1LD0/LLN0$GO$gcb_A` (`APPID` 0x3001), VLAN-stripped
+    as above.
+
+Excluded from vendoring, deliberately:
+
+  * `PCAPs/GOOSE_wireshark.pcap` — byte-identical to `GOOSE.pcap` (same 8
+    frames), a duplicate kept upstream for a different tool's default file
+    name. Vendoring it would add nothing.
+  * `PCAPs/GOOSE_DEMO.pcap` — a 1-frame synthetic demo GOOSE (`goID`s
+    `"111"`/`"222"`/`"333"`, plainly placeholder data, not a real device
+    capture) bundled in the same repository. Excluded as redundant with the
+    three genuine device captures above.
+  * The remaining ~484 frames across `Sample_File_GOOSE.pcap` and
+    `Sample_File_MMS_and_GOOSE.pcap` — repeated heartbeats of the same
+    publishers already represented; every frame surveyed (493 total, across
+    all five `.pcap` files in the source repository) has `Reserved 1` =
+    `Reserved 2` = `0x0000`, i.e. **no IEC 62351-6 security extension in any
+    of them** — see `SPEC.md`'s "Real GOOSE captures" section for what that
+    means for this module's interoperability claim.
+
+The repository's `LICENSE` file (MIT, copyright Keith Gray, 2016) applies
+repository-wide, with no separate license carved out for `PCAPs/`:
+
+    MIT License
+
+    Copyright (c) 2016 Keith Gray
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Only raw frame bytes are reproduced (as test fixtures), not goosestalker's own
+Python/Scapy source, none of which was read or ported. The implementation
+under test (`goose.zig`'s header/extension/MAC logic) is the authors' own,
+modelled from public descriptions of IEC 62351-6 as `SPEC.md` already
+documents; these captures anchor the frame *header* (EtherType/APPID/Length/
+Reserved fields) and the APDU/extension boundary against genuine wire bytes,
+not the security extension itself, which no surveyed real-world capture
+carries. `src/goose_capture_test.zig`'s doc comment explains the scope in
+full, and additionally uses this module's own `ber.zig` TLV reader to decode
+the real `goosePdu` fields (`gocbRef`/`stNum`/`sqNum`/`allData`) as a bonus
+anchor of that shared primitive — `goose.zig` itself never interprets those
+fields (see its module doc comment); their semantic model belongs to the
+sibling `iec61850` module, not this one.
