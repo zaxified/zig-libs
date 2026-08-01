@@ -29,12 +29,22 @@ response through the `set` helper (the server's `setHeader` replaces by name). T
 deliberately non-validating on read.
 
 ## Verification
-16 offline tests, green in Debug + ReleaseFast. Parser (6): simple pairs + `find`, OWS trimming,
-valueless cookies, quoted/unbalanced-quote values, empty-name/first-`=` splitting, degenerate
-headers. Builder (10): full attribute set in RFC order, minimal `name=value`, Domain + pre-formatted
-Expires, negative Max-Age, `SameSite=Strict`, invalid name/value/Path/Domain rejection, `SameSite=None`
-both branches, `BufferTooSmall`. Plus an end-to-end `get`+`set` over `http.Server.serveStream`. Run:
+Offline tests, green in Debug + ReleaseFast. Parser (7): simple pairs + `find`, OWS trimming,
+valueless cookies, quoted/unbalanced-quote values (incl. a quoted value containing a `;`, which
+does not end the segment), empty-name/first-`=` splitting, degenerate headers. Builder (10): full
+attribute set in RFC order, minimal `name=value`, Domain + pre-formatted Expires, negative Max-Age,
+`SameSite=Strict`, invalid name/value/Path/Domain rejection, `SameSite=None` both branches,
+`BufferTooSmall`. Plus an end-to-end `get`+`set` over `http.Server.serveStream`. Run:
 `zig build test-cookies`.
+
+**External anchor** (`golden_test.zig`): python3's stdlib `http.cookies` run once as a black-box
+oracle over the same awkward header shapes (quoted values incl. an embedded `;`, valueless
+attributes, empty names, duplicate names, attribute-keyword collisions), frozen and asserted
+offline — no python3 needed to run the suite. This comparison caught one real bug (the quoted-`;`
+segment split, fixed in `root.zig`'s `Iterator.next`) and surfaced several judged, NOT-adopted
+divergences (python's whole-header abort on one bad segment; its Set-Cookie-attribute-keyword
+capture applied to what is really a `Cookie` request header; last-write-wins on duplicate names;
+DQUOTE-in-name rejection) — each argued against RFC 6265 at its test site, not copied blind.
 
 ## Backlog / deferred
 None.

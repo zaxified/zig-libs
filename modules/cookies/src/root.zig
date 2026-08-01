@@ -37,8 +37,23 @@ pub const Iterator = struct {
     pub fn next(it: *Iterator) ?Cookie {
         const ows = " \t";
         while (it.rest.len != 0) {
-            // Take up to the next `;` → one segment; advance past it.
-            const seg_end = std.mem.indexOfScalar(u8, it.rest, ';') orelse it.rest.len;
+            // Take up to the next `;` → one segment; advance past it. A `;`
+            // inside a DQUOTE-wrapped span does not end the segment — found
+            // via python's `http.cookies` oracle (see golden_test.zig):
+            // naively splitting first broke `s="x;y"` into `s="x` + `y"`.
+            // No backslash-escaping is recognized (RFC 6265's cookie-value
+            // grammar has none — that's a Python-only legacy extension), so
+            // any `"` simply toggles the span, matching how a properly
+            // paired DQUOTE value can appear.
+            var seg_end: usize = it.rest.len;
+            var in_quotes = false;
+            for (it.rest, 0..) |c, i| {
+                if (c == '"') in_quotes = !in_quotes;
+                if (c == ';' and !in_quotes) {
+                    seg_end = i;
+                    break;
+                }
+            }
             const segment = it.rest[0..seg_end];
             it.rest = if (seg_end == it.rest.len) "" else it.rest[seg_end + 1 ..];
 
@@ -296,6 +311,23 @@ test "quoted value: matching DQUOTEs stripped, unbalanced kept" {
     try testing.expectEqualStrings("\"", find("s=\"", "s").?);
 }
 
+test "quoted value containing a separator is not split mid-value (audit, python-oracle)" {
+    // Found via the python http.cookies oracle (golden_test.zig): the naive
+    // "split on the next ';'" scan broke a `;` living inside a quoted value
+    // into two bogus pairs (`s="x` and orphan `y"`). The scan must not treat
+    // a `;` as a segment boundary while inside a DQUOTE-wrapped span.
+    var it = parse("s=\"x;y\"; b=2");
+    try expectPair(&it, "s", "x;y");
+    try expectPair(&it, "b", "2");
+    try testing.expectEqual(@as(?Cookie, null), it.next());
+
+    // Two quoted values in the same header, the first containing a `;`.
+    var it2 = parse("a=\"p;q\"; b=\"r\"");
+    try expectPair(&it2, "a", "p;q");
+    try expectPair(&it2, "b", "r");
+    try testing.expectEqual(@as(?Cookie, null), it2.next());
+}
+
 test "empty-name segments skipped; first '=' splits" {
     var it = parse("=1; a=1");
     try expectPair(&it, "a", "1");
@@ -484,4 +516,10 @@ test "get + set over serveStream" {
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nabc"));
     // set() emitted the Set-Cookie with attributes.
     try testing.expect(std.mem.indexOf(u8, got, "Set-Cookie: session=s3; Path=/; Secure; HttpOnly; SameSite=Lax\r\n") != null);
+}
+
+// External anchor: python3's `http.cookies` used as a black-box oracle for
+// `Cookie`-header parsing (see golden_test.zig's module doc-comment).
+test {
+    _ = @import("golden_test.zig");
 }

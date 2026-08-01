@@ -56,6 +56,19 @@ family-resolve integration test (this module's own, over the WireGuard family sp
 root-gated test (skipped otherwise) that set+get round-trips a config on a real `wg` interface
 created via `ip link add … type wireguard`. Run: `zig build test-wireguard`.
 
+**External anchor** (`kernel_goldens.zig`): the netlink configuration-plane codec above was, before
+this file, only ever round-tripped through its OWN encoder/decoder pair — self-consistent but blind
+to a bug that is wrong the same way on both sides. `kernel_goldens.zig` freezes two bytestreams
+captured ONCE inside a throwaway `unshare --user --map-root-user --net` namespace: the real
+`wg`(8) tool's WG_CMD_SET_DEVICE request (an independent encoder), and — the stronger anchor — the
+real kernel's own WG_CMD_GET_DEVICE reply to that configuration. Both are decoded through this
+module's actual `DeviceParser`/`genl.splitPayload`, asserted against every configured field
+offline, no root/kernel access needed to run the suite. `wg`'s own attribute order differs from
+this module's `buildSetRequests` (netlink attribute order is not semantically significant); rather
+than asserting a byte-identity that was never true between two conformant encoders, the SET
+direction is cross-checked by decoding both this module's own request and `wg`'s real one to an
+equal semantic `Device`.
+
 ## Backlog / deferred
 The root-gated live test's `runIp()` helper shells out to the `ip` binary — the one external-process
 use in the whole repo (zig-libs is otherwise 100% pure-Zig/no-exec). Flagged as a known item

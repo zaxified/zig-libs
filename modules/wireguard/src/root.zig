@@ -1523,4 +1523,7 @@ test "integration (root): set + get round-trip on a real wg interface" {
 test {
     _ = noise;
     _ = handshake;
+    // External anchor: real kernel + real `wg`-tool netlink bytes, captured
+    // once and frozen (see kernel_goldens.zig's module doc-comment).
+    _ = @import("kernel_goldens.zig");
 }
