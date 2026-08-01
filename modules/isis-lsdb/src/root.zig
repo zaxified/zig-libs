@@ -173,4 +173,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("compare.zig");
     _ = @import("store.zig");
+    _ = @import("goldens.zig");
 }
