@@ -278,25 +278,38 @@ test "BDS: out-of-band index jump resynchronizes to a byte-exact auth path" {
     try expectAuthMatchesFromScratch(Xmss6, &seeds.sk_seed, &seeds.pub_seed, 32, &sig6);
 }
 
-test "round-trip h=2: stateful index walk and exhaustion" {
-    var sk_seed: [n]u8 = undefined;
-    var sk_prf: [n]u8 = undefined;
-    var pub_seed: [n]u8 = undefined;
-    for (&sk_seed, &sk_prf, &pub_seed, 0..) |*a, *b, *c, i| {
-        a.* = @truncate(97 * i + 1);
-        b.* = @truncate(89 * i + 2);
-        c.* = @truncate(83 * i + 3);
-    }
-    var kp = Xmss2.keyGen(sk_seed, sk_prf, pub_seed);
+test "KAT: h=2 sequential stateful walk byte-exact vs reference (leaves 0-2), exhaustion at leaf 3" {
+    // Same keypair-seed convention as the h=4/h=10 vectors (byte i = i,
+    // 0..95); see kat_vectors.zig for the full provenance note, including
+    // why leaf 3 (the last of the 4 one-time keys) is excluded from the
+    // byte comparison: the reference implementation itself corrupts that
+    // leaf's index field before it leaves the reference's own signer.
+    const seeds = refSeeds();
+    var kp = Xmss2.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+
+    const pk_ref = decodeHex(vec.xmss2_pk);
+    try std.testing.expectEqualSlices(u8, pk_ref[0..n], &kp.pk.root);
+    try std.testing.expectEqualSlices(u8, pk_ref[n..], &kp.pk.seed);
+
+    const walk_msg = "XMSS h=2 stateful walk test";
+    const ref_sigs = .{ vec.xmss2_sig_idx0, vec.xmss2_sig_idx1, vec.xmss2_sig_idx2 };
 
     var sigs: [4][Xmss2.signature_length]u8 = undefined;
-    for (&sigs, 0..) |*sig, i| {
+    inline for (ref_sigs, 0..) |ref_hex, i| {
         try std.testing.expectEqual(@as(u32, @intCast(i)), kp.sk.idx);
-        try Xmss2.sign(&kp.sk, sig, "stateful message");
-        try std.testing.expect(Xmss2.verify(kp.pk, "stateful message", sig));
-        // Each signature consumes a distinct one-time key.
-        try std.testing.expectEqual(@as(u32, @intCast(i)), std.mem.readInt(u32, sig[0..4], .big));
+        try Xmss2.sign(&kp.sk, &sigs[i], walk_msg);
+        try std.testing.expectEqualSlices(u8, &decodeHex(ref_hex), &sigs[i]);
+        try std.testing.expect(Xmss2.verify(kp.pk, walk_msg, &sigs[i]));
+        try std.testing.expectEqual(@as(u32, @intCast(i)), std.mem.readInt(u32, sigs[i][0..4], .big));
     }
+
+    // Leaf 3 (idx = 3 = 2^2 - 1): last valid one-time key. Not byte-anchored
+    // (see above), but must still sign, verify, and carry the correct idx —
+    // this module does not have the reference's terminal-leaf bug.
+    try std.testing.expectEqual(@as(u32, 3), kp.sk.idx);
+    try Xmss2.sign(&kp.sk, &sigs[3], walk_msg);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, sigs[3][0..4], .big));
+    try std.testing.expect(Xmss2.verify(kp.pk, walk_msg, &sigs[3]));
 
     // All 2^2 one-time keys used: the key is exhausted, permanently.
     var overflow_sig: [Xmss2.signature_length]u8 = undefined;

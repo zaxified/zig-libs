@@ -214,8 +214,12 @@ fn findObject(
     return null;
 }
 
-/// All `rule` bodies of our test table, in listing order.
-fn collectRules(gpa: std.mem.Allocator, listing: std.json.Value) ![]std.json.Value {
+/// All `rule` bodies of our test table and `chain`, in listing order. Rules
+/// are grouped by chain (rather than a single flat index) so the ruleset can
+/// span several chains — a base filter chain, a jump target, and NAT base
+/// chains — without the comparison depending on where each chain's rules
+/// happen to land in nft's overall emission order.
+fn collectRulesInChain(gpa: std.mem.Allocator, listing: std.json.Value, chain_name: []const u8) ![]std.json.Value {
     var out: std.ArrayList(std.json.Value) = .empty;
     errdefer out.deinit(gpa);
     const arr = listing.object.get("nftables") orelse return out.toOwnedSlice(gpa);
@@ -226,17 +230,106 @@ fn collectRules(gpa: std.mem.Allocator, listing: std.json.Value) ![]std.json.Val
         if (body != .object) continue;
         const t = body.object.get("table") orelse continue;
         if (t != .string or !std.mem.eql(u8, t.string, table_name)) continue;
+        const c = body.object.get("chain") orelse continue;
+        if (c != .string or !std.mem.eql(u8, c.string, chain_name)) continue;
         try out.append(gpa, body);
     }
     return out.toOwnedSlice(gpa);
 }
 
+/// The `add rule` command bodies **our own JSON builder** emitted for
+/// `chain_name`, in emission order — the JSON-side counterpart to
+/// `collectRulesInChain`, so both halves of the comparison are grouped by
+/// chain rather than by a positional index into the whole command list.
+fn collectOurRulesInChain(gpa: std.mem.Allocator, ours: std.json.Value, chain_name: []const u8) ![]std.json.Value {
+    var out: std.ArrayList(std.json.Value) = .empty;
+    errdefer out.deinit(gpa);
+    const arr = ours.object.get("nftables") orelse return out.toOwnedSlice(gpa);
+    if (arr != .array) return out.toOwnedSlice(gpa);
+    for (arr.array.items) |item| {
+        if (item != .object) continue;
+        const add = item.object.get("add") orelse continue;
+        if (add != .object) continue;
+        const body = add.object.get("rule") orelse continue;
+        if (body != .object) continue;
+        const c = body.object.get("chain") orelse continue;
+        if (c != .string or !std.mem.eql(u8, c.string, chain_name)) continue;
+        try out.append(gpa, body);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Compare every rule of one chain, in order: same count, same statements.
+fn expectSameChainRules(
+    gpa: std.mem.Allocator,
+    kernel: std.json.Value,
+    ours: std.json.Value,
+    chain_name: []const u8,
+    raw_stdout_on_failure: []const u8,
+) !void {
+    const k_rules = try collectRulesInChain(gpa, kernel, chain_name);
+    defer gpa.free(k_rules);
+    const o_rules = try collectOurRulesInChain(gpa, ours, chain_name);
+    defer gpa.free(o_rules);
+    if (k_rules.len != o_rules.len) {
+        std.debug.print(
+            "\nchain '{s}': rule count differs: builder {d}, nft {d}\n",
+            .{ chain_name, o_rules.len, k_rules.len },
+        );
+        return error.TestUnexpectedResult;
+    }
+    for (k_rules, o_rules, 0..) |k_rule, o_rule, i| {
+        expectSameStatements(
+            o_rule.object.get("expr").?,
+            k_rule.object.get("expr").?,
+        ) catch |err| {
+            std.debug.print(
+                "\nchain '{s}' rule #{d} differs; nft says:\n{s}\n",
+                .{ chain_name, i, raw_stdout_on_failure },
+            );
+            return err;
+        };
+    }
+}
+
 // ── the two descriptions of one ruleset ─────────────────────────────────────
+//
+// One `inet` table, four chains, one named set — chosen to cover the
+// module's own statement/expression list beyond the original three rules
+// (ip-prefix match + counter + drop, tcp dport + accept, iifname + accept):
+// ct state, udp dport, a named-set lookup, meta (oifname) stacked with a
+// second match, limit + log, jump/return verdicts, masquerade, snat, dnat.
+// `reject` is deliberately not exercised here: expr.Program (the native
+// backend) has no `reject` expression builder yet (see the report), so it
+// cannot appear in a JSON<->native consistency check.
+
+const set_name = "blocked_ips";
+const helper_chain = "helper";
+const post_chain = "post";
+const pre_chain = "pre";
+const rule_count = 13;
+
+/// Static storage for the set's initial elements — `Set.elem` is a borrowed
+/// slice, and `buildJson` returns before `Ruleset.toJson` is called, so an
+/// inline `&.{...}` literal (a stack temporary scoped to `buildJson`) would
+/// dangle by the time serialization reads it.
+const blocked_ips_elems = [_]root.Expr{ root.str("10.0.0.5"), root.str("10.0.0.9") };
 
 /// The JSON-builder half.
 fn buildJson(rs: *root.Ruleset) !void {
     try rs.addTable(.inet, table_name);
     try rs.addChain(root.Chain.base(.inet, table_name, "input", .filter, .input, 0, .drop));
+    try rs.addChain(root.Chain.regular(.inet, table_name, helper_chain));
+    try rs.addChain(root.Chain.base(.inet, table_name, post_chain, .nat, .postrouting, 100, .accept));
+    try rs.addChain(root.Chain.base(.inet, table_name, pre_chain, .nat, .prerouting, -100, .accept));
+
+    try rs.addSet(.{
+        .family = .inet,
+        .table = table_name,
+        .name = set_name,
+        .elem_type = .ipv4_addr,
+        .elem = &blocked_ips_elems,
+    });
 
     var r1 = rs.rule(.inet, table_name, "input");
     try r1.ipSaddr(root.cidr("10.0.0.0", 12)).counter().drop().apply();
@@ -246,10 +339,40 @@ fn buildJson(rs: *root.Ruleset) !void {
 
     var r3 = rs.rule(.inet, table_name, "input");
     try r3.iifname("lo").accept().apply();
+
+    var r4 = rs.rule(.inet, table_name, "input");
+    try r4.ctState(&.{ "established", "related" }).accept().apply();
+
+    var r5 = rs.rule(.inet, table_name, "input");
+    try r5.udpDport(root.num(53)).accept().apply();
+
+    var r6 = rs.rule(.inet, table_name, "input");
+    try r6.ipSaddr(root.setRef(set_name)).drop().apply();
+
+    var r7 = rs.rule(.inet, table_name, "input");
+    try r7.ipDaddr(root.cidr("192.0.2.0", 24)).oifname("eth0").drop().apply();
+
+    var r8 = rs.rule(.inet, table_name, "input");
+    try r8.limit(.{ .rate = 10, .per = .second }).log("rl: ").drop().apply();
+
+    var r9 = rs.rule(.inet, table_name, "input");
+    try r9.jump(helper_chain).apply();
+
+    var rh = rs.rule(.inet, table_name, helper_chain);
+    try rh.ret().apply();
+
+    var rp1 = rs.rule(.inet, table_name, post_chain);
+    try rp1.masquerade().apply();
+
+    var rp2 = rs.rule(.inet, table_name, post_chain);
+    try rp2.ipSaddr(root.cidr("10.0.0.0", 24)).snat(.{ .addr = "203.0.113.5", .family = .ip }).apply();
+
+    var rq1 = rs.rule(.inet, table_name, pre_chain);
+    try rq1.tcpDport(root.num(80)).dnat(.{ .addr = "10.0.0.8", .family = .ip, .port = 8080 }).apply();
 }
 
 /// The native half — the *same* ruleset, over nfnetlink.
-fn buildNative(gpa: std.mem.Allocator, b: *wire.Batch, programs: *[3]expr.Program) !void {
+fn buildNative(gpa: std.mem.Allocator, b: *wire.Batch, programs: *[rule_count]expr.Program) !void {
     try b.addTable(.{ .family = .inet, .name = table_name });
     try b.addChain(.{
         .family = .inet,
@@ -260,6 +383,45 @@ fn buildNative(gpa: std.mem.Allocator, b: *wire.Batch, programs: *[3]expr.Progra
         .prio = 0,
         .policy = .drop,
     });
+    try b.addChain(.{ .family = .inet, .table = table_name, .name = helper_chain });
+    try b.addChain(.{
+        .family = .inet,
+        .table = table_name,
+        .name = post_chain,
+        .chain_type = .nat,
+        .hook = .postrouting,
+        .prio = 100,
+        .policy = .accept,
+    });
+    try b.addChain(.{
+        .family = .inet,
+        .table = table_name,
+        .name = pre_chain,
+        .chain_type = .nat,
+        .hook = .prerouting,
+        .prio = -100,
+        .policy = .accept,
+    });
+
+    const set_id: u32 = 1;
+    try b.addSet(.{
+        .family = .inet,
+        .table = table_name,
+        .name = set_name,
+        .key_type = .ipv4_addr,
+        .id = set_id,
+    });
+    try b.addSetElems(.inet, table_name, set_name, set_id, &.{
+        .{ .key = &.{ 10, 0, 0, 5 } },
+        .{ .key = &.{ 10, 0, 0, 9 } },
+    });
+
+    const chains = [rule_count][]const u8{
+        "input", "input", "input", "input", "input", "input", "input", "input", "input",
+        helper_chain,
+        post_chain, post_chain,
+        pre_chain,
+    };
 
     programs[0] = expr.Program.init(gpa, .inet);
     _ = programs[0].ipSaddrPrefix(.{ 10, 0, 0, 0 }, 12).counter().drop();
@@ -267,12 +429,32 @@ fn buildNative(gpa: std.mem.Allocator, b: *wire.Batch, programs: *[3]expr.Progra
     _ = programs[1].tcpDport(22).accept();
     programs[2] = expr.Program.init(gpa, .inet);
     _ = programs[2].ifnameCmp(.iifname, .eq, "lo").accept();
+    programs[3] = expr.Program.init(gpa, .inet);
+    _ = programs[3].ctStateAny(expr.CT_STATE.ESTABLISHED | expr.CT_STATE.RELATED).accept();
+    programs[4] = expr.Program.init(gpa, .inet);
+    _ = programs[4].udpDport(53).accept();
+    programs[5] = expr.Program.init(gpa, .inet);
+    _ = programs[5].ipSaddrSet(set_name, set_id, false).drop();
+    programs[6] = expr.Program.init(gpa, .inet);
+    _ = programs[6].ipDaddrPrefix(.{ 192, 0, 2, 0 }, 24).ifnameCmp(.oifname, .eq, "eth0").drop();
+    programs[7] = expr.Program.init(gpa, .inet);
+    _ = programs[7].limit(.{ .rate = 10, .per = .second }).log(.{ .prefix = "rl: " }).drop();
+    programs[8] = expr.Program.init(gpa, .inet);
+    _ = programs[8].jump(helper_chain);
+    programs[9] = expr.Program.init(gpa, .inet);
+    _ = programs[9].ret();
+    programs[10] = expr.Program.init(gpa, .inet);
+    _ = programs[10].masquerade();
+    programs[11] = expr.Program.init(gpa, .inet);
+    _ = programs[11].ipSaddrPrefix(.{ 10, 0, 0, 0 }, 24).nat(.snat, .ip, &.{ 203, 0, 113, 5 }, null, 0);
+    programs[12] = expr.Program.init(gpa, .inet);
+    _ = programs[12].tcpDport(80).nat(.dnat, .ip, &.{ 10, 0, 0, 8 }, 8080, 0);
 
-    for (programs) |*p| {
+    for (programs, chains) |*p, chain_name| {
         try b.addRule(.{
             .family = .inet,
             .table = table_name,
-            .chain = "input",
+            .chain = chain_name,
             .exprs = try p.finish(),
         });
     }
@@ -302,7 +484,7 @@ test "consistency: the native batch and the JSON builder describe the same rules
         sock.commit(&pre) catch {};
     }
 
-    var programs: [3]expr.Program = undefined;
+    var programs: [rule_count]expr.Program = undefined;
     var initialized: usize = 0;
     defer for (programs[0..initialized]) |*p| p.deinit();
 
@@ -390,31 +572,60 @@ test "consistency: the native batch and the JSON builder describe the same rules
     // `prio` is `prio` in the builder and in nft's output alike.
     try testing.expect(jsonEql(o_chain.object.get("prio").?, k_chain.object.get("prio").?));
 
-    // 3) the rules, in order, statement by statement.
-    const k_rules = try collectRules(gpa, kernel.value);
-    defer gpa.free(k_rules);
-    try testing.expectEqual(@as(usize, 3), k_rules.len);
-
-    const cmds = ours.value.object.get("nftables").?.array.items;
-    for (k_rules, 0..) |k_rule, i| {
-        const o_rule = cmds[2 + i].object.get("add").?.object.get("rule").?;
-        try testing.expectEqualStrings(
-            o_rule.object.get("chain").?.string,
-            k_rule.object.get("chain").?.string,
-        );
-        expectSameStatements(
-            o_rule.object.get("expr").?,
-            k_rule.object.get("expr").?,
-        ) catch |err| {
-            std.debug.print("\nrule #{d} differs; nft says:\n{s}\n", .{ i, run.stdout });
-            return err;
+    // 2b) the two NAT base chains, same field-by-field check as `input`.
+    for ([_]struct { name: []const u8, idx: usize }{
+        .{ .name = post_chain, .idx = 3 },
+        .{ .name = pre_chain, .idx = 4 },
+    }) |c| {
+        const k_c = findObject(kernel.value, "chain", "name", c.name) orelse {
+            std.debug.print("\nnft does not list our chain '{s}'\n", .{c.name});
+            return error.TestUnexpectedResult;
         };
+        const o_c = ours.value.object.get("nftables").?.array.items[c.idx]
+            .object.get("add").?.object.get("chain").?;
+        for ([_][]const u8{ "family", "table", "name", "type", "hook", "policy" }) |field| {
+            const want = o_c.object.get(field).?;
+            const got = k_c.object.get(field) orelse {
+                std.debug.print("\nnft chain '{s}' is missing '{s}'\n", .{ c.name, field });
+                return error.TestUnexpectedResult;
+            };
+            if (!jsonEql(want, got)) {
+                std.debug.print("\nchain '{s}' field '{s}' differs\n", .{ c.name, field });
+                return error.TestUnexpectedResult;
+            }
+        }
+        try testing.expect(jsonEql(o_c.object.get("prio").?, k_c.object.get("prio").?));
+    }
+
+    // 2c) the named set: same family/type, same element count (elements
+    // compared by count only — nft renders a plain-host `ipv4_addr` element
+    // as a bare dotted string on both sides, but the exact wording of a
+    // decompiled set element is not the part this test is about).
+    {
+        const k_set = findObject(kernel.value, "set", "name", set_name) orelse {
+            std.debug.print("\nnft does not list our set\n", .{});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqualStrings("inet", k_set.object.get("family").?.string);
+        try testing.expectEqualStrings("ipv4_addr", k_set.object.get("type").?.string);
+        const k_elem = k_set.object.get("elem") orelse {
+            std.debug.print("\nnft set has no elements\n", .{});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqual(@as(usize, 2), k_elem.array.items.len);
+    }
+
+    // 3) the rules of every chain, in order, statement by statement.
+    for ([_][]const u8{ "input", helper_chain, post_chain, pre_chain }) |chain_name| {
+        try expectSameChainRules(gpa, kernel.value, ours.value, chain_name, run.stdout);
     }
 
     // Success-path diagnostic — see socket.zig's note.
     if (verboseSkip()) std.debug.print(
         "\nJSON<->native consistency: native batch applied, `nft -j list ruleset` " ++
-            "decompiles all 3 rules to the JSON builder's own statements.\n",
-        .{},
+            "decompiles all {d} rules across 4 chains (verdicts, counters, a named " ++
+            "set, ct state, meta, limit+log, masquerade, snat, dnat) to the JSON " ++
+            "builder's own statements.\n",
+        .{rule_count},
     );
 }

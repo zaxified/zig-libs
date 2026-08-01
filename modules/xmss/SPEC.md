@@ -94,9 +94,26 @@ keygen costs ~40 s): `XmssSha2_10_256.keyGen` on the reference seed
 reproduces the reference public-key root byte-exactly. h = 16/20 are the
 same comptime code path, exercised only at h ≤ 10.
 
-Round-trip-only (no external bytes involved): the h = 2 stateful walk —
-sign 4 messages, verify each, index monotonicity, `KeyExhausted` on the
-5th, cross-message rejection.
+5. **h = 2 sequential stateful walk, byte-exact against the oracle for
+   leaves 0-2:** the same fixed keypair seed as the h = 4/h = 10 vectors,
+   signed leaf-by-leaf (idx 0, then 1, then 2 — a plain in-order advance,
+   which nothing above exercises: the h = 4 vectors cover idx = 0 and an
+   out-of-band jump to idx = 11, never idx -> idx+1 -> idx+2). Leaf 3
+   (idx = 2^h - 1, the last one-time key) is deliberately NOT byte-anchored:
+   capturing it exposed a bug in the reference implementation itself —
+   `xmssmt_core_sign` wipes the secret key's index field to all-0xFF
+   *before* copying it into the outgoing signature when
+   `idx >= 2^h - 1`, so the reference's own emitted signature for the
+   final leaf carries a corrupted index word and the reference's own
+   `xmss_core_sign_open` rejects it (confirmed empirically while capturing
+   these vectors: leaves 0-2 round-trip through the reference's own
+   verifier, leaf 3 does not). This module's `sign` has no such bug — it
+   writes the correct idx at every leaf, including the last, which the
+   h = 4/h = 6 exhaustive BDS sweeps already check byte-for-byte against
+   an independent from-scratch auth-path build — so leaf 3 stays a
+   behavioral check (signs, verifies, then `KeyExhausted` on the 5th
+   attempt) rather than an external byte anchor. See kat_vectors.zig for
+   the full provenance note.
 
 **BDS traversal, differential against a from-scratch reference (no
 external oracle for this — RFC 8391 leaves it implementation-defined, so

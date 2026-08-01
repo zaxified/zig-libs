@@ -641,6 +641,83 @@ test "findMcastGroupId reports a truncated nest instead of reading past it" {
 
 // ── integration tests (real kernel; unprivileged) ───────────────────────────
 
+test "golden: real nlctrl CTRL_CMD_GETFAMILY request+reply captured from the live kernel" {
+    // Unlike every other golden in this file, these bytes were not built by
+    // hand from the UAPI header — both sides of an actual
+    // `CTRL_CMD_GETFAMILY("nlctrl")` exchange were captured once against this
+    // machine's real kernel (`Socket.send`/`recvDatagram`, unprivileged
+    // NETLINK_GENERIC, seq fixed at 1 so the request side reproduces
+    // byte-for-byte) and frozen here. This is what a swapped attribute
+    // constant slips past when the offline goldens are all self-built: every
+    // other golden in this file round-trips this module's OWN encoder against
+    // its OWN decoder (or hand-typed bytes matching the encoder's own
+    // constants), so a `CTRL_ATTR_MCAST_GRP_NAME`/`_ID` swap made consistently
+    // in both directions would still pass every one of them. These bytes came
+    // out of a real kernel that was never told our constant values, so they
+    // fail if this module's parser stops agreeing with the kernel's actual
+    // encoding. See NOTICE for the black-box-oracle provenance.
+    if (native_endian != .little) return error.SkipZigTest;
+
+    const captured_req = [_]u8{
+        0x20, 0x00, 0x00, 0x00, // nlmsg_len = 32
+        0x10, 0x00, // type = GENL_ID_CTRL
+        0x05, 0x00, // flags = REQUEST | ACK
+        0x01, 0x00, 0x00, 0x00, // seq = 1
+        0x00, 0x00, 0x00, 0x00, // pid
+        0x03, 0x01, 0x00, 0x00, // genlmsghdr: cmd GETFAMILY, version 1
+        0x0b, 0x00, 0x02, 0x00, // attr len 11, CTRL_ATTR_FAMILY_NAME
+        'n',  'l',  'c',  't',
+        'r',  'l',  0x00, 0x00, // "nlctrl" + NUL + pad to 4
+    };
+    const req = try buildGetFamilyRequest(testing.allocator, 1, "nlctrl");
+    defer testing.allocator.free(req);
+    try testing.expectEqualSlices(u8, &captured_req, req);
+
+    // The kernel's real CTRL_CMD_NEWFAMILY reply to that exact request: nlctrl
+    // resolving itself. FAMILY_ID=0x10, VERSION=2, HDRSIZE=0, MAXATTR=0, an
+    // OPS nest (two op ids, not modeled by this module), and the MCAST_GROUPS
+    // nest with the real "notify" group and its real (kernel-assigned) id.
+    const captured_reply = [_]u8{
+        0x88, 0x00, 0x00, 0x00, // nlmsg_len = 136
+        0x10, 0x00, // type = GENL_ID_CTRL
+        0x00, 0x00, // flags
+        0x01, 0x00, 0x00, 0x00, // seq = 1 (echoed)
+        0x22, 0x09, 0x25, 0x00, // pid (kernel-assigned, opaque to this test)
+        0x01, 0x02, 0x00, 0x00, // genlmsghdr: cmd NEWFAMILY, version 2
+        0x0b, 0x00, 0x02, 0x00, 'n', 'l', 'c', 't', 'r', 'l', 0x00, 0x00, // FAMILY_NAME
+        0x06, 0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00, // FAMILY_ID = 0x10
+        0x08, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, // CTRL_ATTR_VERSION = 2
+        0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // CTRL_ATTR_HDRSIZE = 0
+        0x08, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, // CTRL_ATTR_MAXATTR = 0
+        0x2c, 0x00, 0x06, 0x00, // CTRL_ATTR_OPS nest, len 44 (2 op entries, unmodeled)
+        0x14, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00, 0x02, 0x00, 0x0e, 0x00, 0x00, 0x00,
+        0x14, 0x00, 0x02, 0x00, 0x08, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x08, 0x00, 0x02, 0x00, 0x0c, 0x00, 0x00, 0x00,
+        0x1c, 0x00, 0x07, 0x00, // CTRL_ATTR_MCAST_GROUPS nest, len 28
+        0x18, 0x00, 0x01, 0x00, // group entry #1, len 24
+        0x08, 0x00, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, // MCAST_GRP_ID = 0x10
+        0x0b, 0x00, 0x01, 0x00, 'n', 'o', 't', 'i', 'f', 'y', 0x00, 0x00, // MCAST_GRP_NAME = "notify"
+    };
+
+    var it: codec.MessageIterator = .{ .buf = &captured_reply };
+    const msg = (try it.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, GENL_ID_CTRL), msg.type);
+    try testing.expectEqual(@as(?codec.Message, null), try it.next()); // exactly one record
+
+    const p = try splitPayload(msg.payload);
+    try testing.expectEqual(@as(u8, 1), p.cmd); // CTRL_CMD_NEWFAMILY
+
+    var family_id: ?u16 = null;
+    var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+    while (try attrs.next()) |a| {
+        if (a.type == CTRL_ATTR_FAMILY_ID) family_id = try a.asU16();
+    }
+    try testing.expectEqual(@as(?u16, GENL_ID_CTRL), family_id);
+
+    const notify_id = try findMcastGroupId(p.attrs, "notify");
+    try testing.expectEqual(@as(?u32, 0x10), notify_id);
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(p.attrs, "config"));
+}
+
 test "integration: nlctrl family resolve (unprivileged)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;

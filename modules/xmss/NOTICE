@@ -22,8 +22,10 @@ Section 7; CC0/public-domain per its LICENSE). It was used as a
 BLACK-BOX oracle only — built unmodified and driven by a small local
 generator with fixed deterministic inputs to produce the byte-exact
 known-answer vectors embedded in src/kat_vectors.zig (primitive outputs,
-WOTS+ keys/signatures, XMSS public keys and signatures at h = 4 and
-h = 10). No source code from xmss-reference was ported into the module;
+WOTS+ keys/signatures, XMSS public keys and signatures at h = 2, h = 4 and
+h = 10 — h = 2 added to byte-anchor a full sequential stateful-index walk
+of all-but-the-last one-time key, see kat_vectors.zig for why the tree's
+final leaf is excluded). No source code from xmss-reference was ported into the module;
 two implementation-defined conventions were intentionally matched for
 interoperability and are documented in SPEC.md: (a) the NIST SP 800-208
 PRF_keygen WOTS+ secret-key derivation (toByte(4, 32) domain prefix),

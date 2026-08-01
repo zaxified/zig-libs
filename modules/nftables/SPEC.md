@@ -171,18 +171,27 @@ order because the captured message also carried the userdata stamp).
   `commit` returns `error.NotFound`, `lastFailure()` reports `stage = .message`, `index = 1`,
   `command = "NEWRULE"`, `code = -2`, and the table created by command #0 is **not** in the
   ruleset — the transaction was rolled back whole.
-- *JSON ↔ native consistency.* One ruleset (a `/12` prefix + counter + drop, a `tcp dport 22`
-  accept, an `iifname "lo"` accept, under a default-drop base chain) is described twice: once
-  through the JSON builder, once through `Batch`/`Program`. The **native** batch is applied over
-  netlink, then `nft -j list ruleset` decompiles the kernel's own view and it is compared against
-  the JSON builder's output: table and chain fields (`family`/`table`/`name`/`type`/`hook`/
-  `prio`/`policy`) exactly, and each rule's statement array position by position — `match`
-  statements deeply (operator, left, right must be JSON-identical), other statements by name
-  (`nft` renders a fresh counter as `{"counter":{"packets":0,"bytes":0}}` where the builder emits
-  `{"counter":null}`). Statement *counts* must agree too, which additionally checks that the
-  protocol dependencies the native path emits explicitly (`meta l4proto tcp`, `meta nfproto ipv4`)
-  land exactly where `nft` folds them back. The check was negative-controlled: changing the native
-  prefix to `/13` while leaving the JSON at `/12` fails the test with `match statement differs`.
+- *JSON ↔ native consistency.* One `inet` table, four chains (a default-drop `input` base chain,
+  a `helper` regular chain reached by `jump`, and `post`/`pre` NAT base chains), a named
+  `ipv4_addr` set, and 13 rules spanning the statement/expression list this survey tracks:
+  verdicts (`accept`/`drop`/`jump`/`return`), a counter, `ct state established,related`, `udp
+  dport`, a named-set `ip saddr @set` lookup, a stacked `ip daddr` prefix + `meta oifname` match,
+  `limit` + `log`, and `masquerade`/`snat`/`dnat`. Each is described twice: once through the JSON
+  builder, once through `Batch`/`Program`. The **native** batch is applied over netlink, then
+  `nft -j list ruleset` decompiles the kernel's own view and it is compared against the JSON
+  builder's output, chain by chain: table/chain fields (`family`/`table`/`name`/`type`/`hook`/
+  `prio`/`policy`) exactly for all three base chains, the set's family/type/element-count, and
+  each chain's rules' statement arrays position by position — `match` statements deeply (operator,
+  left, right must be JSON-identical), other statements by name (`nft` renders a fresh counter as
+  `{"counter":{"packets":0,"bytes":0}}` where the builder emits `{"counter":null}`). Statement
+  *counts* must agree too, which additionally checks that the protocol dependencies the native
+  path emits explicitly (`meta l4proto tcp`/`udp`, `meta nfproto ipv4`) land exactly where `nft`
+  folds them back. The check was negative-controlled twice: changing the native prefix to `/13`
+  while leaving the JSON at `/12` fails with `match statement differs`, and giving `udp dport`'s
+  native builder a `tcp` protocol dependency instead of `udp`'s fails the same way on the newly
+  covered rule. `reject` is not covered: `expr.Program` (the native backend) has no `reject`
+  expression builder, so it cannot appear on both sides of this comparison — see "Backlog /
+  deferred" below ("Expressions not modelled").
 
 **Hostile input.** Truncated/over-long/zero-length TLVs, an `NFTA_TABLE_FLAGS` of the wrong width,
 a payload shorter than `nfgenmsg`, and expression nests whose declared length runs past the buffer

@@ -103,7 +103,14 @@ Offline unit tests over the pure half: golden `CTRL_CMD_GETFAMILY` request bytes
 LE-only), a name-too-long rejection (`GENL_NAMSIZ`), `appendHeader`'s genlmsghdr encoding,
 `splitPayload` truncation handling, and `findMcastGroupId` over a synthesised
 `CTRL_ATTR_MCAST_GROUPS` nest (hit/miss/prefix-miss/empty, a named group with no id →
-`error.BadLength`, a chopped nest → `error.Truncated`). Linux integration tests (unprivileged,
+`error.BadLength`, a chopped nest → `error.Truncated`). One golden is genuinely captured rather
+than self-built: `Socket.send`/`recvDatagram` against this machine's real nlctrl, both the request
+and the `CTRL_CMD_NEWFAMILY` reply frozen byte-for-byte, offline-parsed with `codec.MessageIterator`
++ `splitPayload` + `findMcastGroupId` — every other offline test here round-trips this module's own
+encoder against its own decoder (or hand-typed bytes matching its own constants), so a
+`CTRL_ATTR_MCAST_GRP_NAME`/`_ID` swap made consistently in both directions passes them all; this one
+came out of a kernel that was never told this module's constant values, so it does not. Linux
+integration tests (unprivileged,
 skipped only if the socket won't open): nlctrl resolves to itself (`GENL_ID_CTRL`), a nonexistent
 family name yields `error.FamilyNotFound`, an over-length name yields `error.NameTooLong`; nlctrl's
 own `notify` group resolves to a nonzero dynamic id while an unknown group on a known family yields
