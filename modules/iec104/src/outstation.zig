@@ -181,7 +181,15 @@ pub const Outstation = struct {
         var it = a.objects();
         const o = (try it.next()) orelse return;
         const qoi = o.element.qoi;
-        try self.echoDecoded(a, .activation_con, false, sink);
+        // §7.2.3 pairs each activation cause with its own confirmation cause:
+        // a deactivation (cause 8, which this function never actually
+        // performs — it only confirms and returns, below) must be answered
+        // with deactivation_con (cause 9), not activation_con.
+        const con_cause: asdu_mod.Cot = if (a.header.cause.cot == .deactivation)
+            .deactivation_con
+        else
+            .activation_con;
+        try self.echoDecoded(a, con_cause, false, sink);
         if (a.header.cause.cot == .deactivation) return;
 
         const qoi_value = @intFromEnum(qoi);
@@ -241,7 +249,14 @@ pub const Outstation = struct {
         const o = (try it.next()) orelse return;
 
         const p = self.find(o.ioa, a.header.type_id) orelse {
-            try self.echoDecoded(a, .activation_con, true, sink);
+            // Same cause-pairing rule as onInterrogation above: an unknown
+            // IOA is still negatively confirmed, but a deactivation naming
+            // it must get deactivation_con (cause 9), not activation_con.
+            const con_cause: asdu_mod.Cot = if (a.header.cause.cot == .deactivation)
+                .deactivation_con
+            else
+                .activation_con;
+            try self.echoDecoded(a, con_cause, true, sink);
             try self.echoDecoded(a, .unknown_ioa, false, sink);
             return;
         };
@@ -752,6 +767,36 @@ test "outstation: a deactivation cancels the select instead of executing it" {
     try testing.expectEqualSlices(u8, &hex("2d010a002f002d010001"), s.get(2));
     try testing.expect(points[3].element.sco.on);
     try testing.expect(!points[3].selected);
+}
+
+test "outstation: an interrogation deactivation is confirmed with cause 9, not 7" {
+    var points = demoPoints();
+    var o = try Outstation.init(.{ .common_address = 47 }, &points);
+    var s = CollectSink{};
+
+    // The same C_IC_NA_1 station interrogation as the general-interrogation
+    // test, but with cause 8 (deactivation) instead of 6. onInterrogation
+    // already refuses to perform the scan for this cause — this only checks
+    // that the confirmation names the cause it actually is.
+    try o.handle(&hex("640108002f0000000014"), s.sink());
+    try testing.expectEqual(@as(usize, 1), s.count);
+    try testing.expectEqualSlices(u8, &hex("640109002f0000000014"), s.get(0));
+}
+
+test "outstation: a command deactivation naming an unknown IOA gets cause 9" {
+    var points = demoPoints();
+    var o = try Outstation.init(.{ .common_address = 47 }, &points);
+    var s = CollectSink{};
+
+    // C_SC_NA_1, cause 8 (deactivation), IOA 999 — the same unknown address
+    // as the "three error causes" test, but as a deactivation. The negative
+    // confirmation must still name cause 9 (deactivation_con), not 7
+    // (activation_con); the trailing cause-47 (unknown_ioa) ASDU is
+    // unaffected by which activation-class cause triggered it.
+    try o.handle(&hex("2d0108002f00e7030001"), s.sink());
+    try testing.expectEqual(@as(usize, 2), s.count);
+    try testing.expectEqualSlices(u8, &hex("2d0149002f00e7030001"), s.get(0));
+    try testing.expectEqualSlices(u8, &hex("2d012f002f00e7030001"), s.get(1));
 }
 
 test "outstation: a direct-mode point refuses a select" {
