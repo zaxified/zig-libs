@@ -973,6 +973,42 @@ test "raw escape hatch keeps the correlated envelope" {
     , got);
 }
 
+// External anchor (2026-08-01): both requests below are exactly what this
+// module's own `buildRpc` produced during a real session against the Python
+// `netconf` 2.1.0 package (a real, independent NETCONF server implementation)
+// — captured on the wire by temporarily instrumenting `Client.sendRaw` — and
+// the server accepted both: message-id 1 got back a real `<data>` reply,
+// message-id 3 got back a real `<rpc-error>` (`operation-not-supported`), the
+// matching goldens frozen in `reply.zig`. This closes the loop the RFC-
+// literal builder goldens above cannot: not just "structurally what the RFC
+// describes" but "byte-for-byte what a real peer parsed and acted on". See
+// SPEC.md "External-anchor investigation".
+test "external anchor: buildRpc output is exactly what a real NETCONF server accepted (frozen 2026-08-01)" {
+    const gpa = testing.allocator;
+
+    const get_config = try build(gpa, 1, .{ .get_config = .{ .source = .running } });
+    defer gpa.free(get_config);
+    try testing.expectEqualStrings(
+        \\<rpc message-id="1" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <get-config>
+        \\    <source>
+        \\      <running/>
+        \\    </source>
+        \\  </get-config>
+        \\</rpc>
+        \\
+    , get_config);
+
+    const unsupported_op = try build(gpa, 3, .{ .raw = "<no-such-operation xmlns=\"urn:example:test\"/>" });
+    defer gpa.free(unsupported_op);
+    try testing.expectEqualStrings(
+        \\<rpc message-id="3" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <no-such-operation xmlns="urn:example:test"/>
+        \\</rpc>
+        \\
+    , unsupported_op);
+}
+
 test "every builder emits well-formed XML with the right envelope" {
     const gpa = testing.allocator;
     const all = [_]Rpc{

@@ -155,6 +155,72 @@ was extracted and run unprivileged, but its `netconf-subsystem` bridge ignores
 without emitting a server `<hello>`; that path was abandoned in favour of the Python
 server above rather than faked.
 
+### External-anchor investigation: frozen bytes from the live server (2026-08-01, done)
+
+The live tests above prove interop but are gated: without `NETCONF_TEST_SERVER`
+they print `SKIPPED:` and the byte-level detail of what actually crossed the
+wire is never asserted when no operator supplies a server. To close that gap
+per the governing rule ("run the foreign thing once, freeze its bytes, assert
+offline"), the Python `netconf` 2.1.0 package was actually stood up using the
+recipe already documented above, and this module's own `Client`/`buildRpc`
+were driven against it for real, exactly once.
+
+**One environment wrinkle, worked around without installing anything.**
+`sshutil` 1.5.0 (2016-era) unconditionally does `import paramiko.dsskey`;
+paramiko 5.0.0 (what is actually installed) dropped DSS/DSA key support and
+the module no longer exists, so `import netconf.server` raised
+`ModuleNotFoundError` outright — the tool did not work out of the box and
+needed to be re-verified before anything was built on it. Since only an RSA
+host key is used (`from_private_key_file` tries RSA first), a two-line stub
+module (`sys.modules["paramiko.dsskey"] = <a dummy class that only exists to
+satisfy the import>`) let `netconf.server` import cleanly. Nothing was
+installed; nothing in the stub is ever called.
+
+**What ran.** A throwaway RSA host key (`ssh-keygen`, discarded after), a
+~40-line script subclassing `netconf.server.NetconfMethods` with
+`rpc_get`/`rpc_get_config` returning a static `<probe:top>` element (a
+deliberately *prefixed* namespace, `xmlns:probe="urn:example:probe"` — unlike
+every RFC-literal golden below, which uses default namespaces, this exercises
+the parser's prefixed-namespace path for real), served via
+`netconf.server.NetconfSSHServer` on `127.0.0.1:8300`. This module's own
+existing (env-gated) live test in `client.zig` was then pointed at it
+(`NETCONF_TEST_SERVER=127.0.0.1:8300 NETCONF_TEST_USER=probe
+NETCONF_TEST_PASSWORD=probe-pw`) and ran for real, both dialects: hello →
+`get-config` → `get` → an intentionally unsupported operation → `close-session`.
+All 65 tests passed, live, including the two normally-skipped ones.
+
+**What was frozen.** `Client.receive`/`sendRaw` were temporarily instrumented
+(one `std.debug.print` each, `client.zig`, reverted immediately after — no
+trace of it remains) to print the exact unframed message bytes crossing the
+transport, in both directions, for the whole session. From the `.chunked`
+session (session-id 3) three exchanges were captured and are now permanent
+offline tests (no socket, no env var):
+
+  - the server's real `<hello>` — `capabilities.zig`, `live_netconf_2_1_0_server_hello`
+  - a real `<rpc-reply>` to our own `get-config` request (source `running`,
+    no filter), including the prefixed-namespace `<probe:top>` body —
+    `reply.zig`, `live_netconf_2_1_0_get_config_reply`
+  - a real `<rpc-error>` (`operation-not-supported`/`protocol`) answering a
+    deliberately unsupported operation sent through the `raw` escape hatch —
+    `reply.zig`, `live_netconf_2_1_0_rpc_error_reply`
+  - the exact request bytes `buildRpc` produced for both of the above, which
+    the server accepted — `rpc.zig`, "external anchor: buildRpc output is
+    exactly what a real NETCONF server accepted"
+
+Together these are strictly stronger than the RFC-literal goldens below: not
+"structurally what RFC 6241 describes" (`expectSameStructure`) but "byte-for-
+byte what an independent implementation neither authored by nor consulted
+during this module's development actually parsed, acted on, and emitted" —
+including a real XML prolog (`<?xml version="1.0" encoding="UTF-8"?>`) and a
+real prefixed namespace, neither of which any hand-typed RFC excerpt here
+happens to exercise. **No disagreement was found**: every byte this module
+sent was accepted, and every byte the server sent parses exactly as intended.
+
+No `/NOTICE` entry: exactly the black-box-oracle relationship root `NOTICE`
+§0 already describes for `protobuf`/`syslog`/`opcua`/`wireguard`/`xmlsec1` —
+the `netconf` package's own behavior was observed, nothing was read from or
+copied out of its source.
+
 ### Byte-exact goldens, and which RFC section each comes from
 
 Every literal below is copied verbatim out of the RFC text; the section is named next to

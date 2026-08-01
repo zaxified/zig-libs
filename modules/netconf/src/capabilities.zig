@@ -381,6 +381,39 @@ test "writeHello round-trips through parseHello" {
     try testing.expect(h2.capabilities.candidate);
 }
 
+// External anchor (2026-08-01): a real, independent NETCONF server — the
+// Python `netconf` 2.1.0 package (Christian Hopps' implementation), the same
+// one the live interop tests in `client.zig` dial. Unlike the RFC-literal
+// goldens above (hand-copied from the spec text), this `<hello>` is byte-for-
+// byte what that server actually put on the wire, captured once by
+// temporarily instrumenting `Client.receive`/`sendRaw` during a real session
+// against it (session-id 3, `:base:1.0`+`:base:1.1` negotiated `.chunked`),
+// then frozen here — this test does not open a socket. See SPEC.md
+// "External-anchor investigation" for the full setup (throwaway RSA host
+// key, static `rpc_get_config` responder, the `paramiko.dsskey` shim needed
+// because paramiko 5.0.0 dropped the module `sshutil` 1.5.0 still imports).
+const live_netconf_2_1_0_server_hello =
+    \\<?xml version="1.0" encoding="UTF-8"?><hello xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><capabilities><capability>urn:ietf:params:netconf:base:1.0</capability><capability>urn:ietf:params:netconf:base:1.1</capability></capabilities><session-id>3</session-id></hello>
+;
+
+test "external anchor: parseHello on a real server hello from the `netconf` 2.1.0 package (frozen 2026-08-01)" {
+    const gpa = testing.allocator;
+    var h = try parseHello(gpa, live_netconf_2_1_0_server_hello, .server);
+    defer h.deinit();
+    try testing.expectEqual(@as(?u32, 3), h.session_id);
+    try testing.expectEqual(@as(usize, 2), h.capabilities.list.len);
+    try testing.expect(h.capabilities.base_1_0);
+    try testing.expect(h.capabilities.base_1_1);
+
+    // The dialect this hello actually negotiated, live, against our own
+    // default client capabilities: `.chunked`, matching what the client
+    // printed during the real session (`live NETCONF: session-id=3
+    // dialect=chunked`).
+    var ours: Capabilities = try .fromSlice(gpa, &default_client_capabilities);
+    defer ours.deinit();
+    try testing.expectEqual(framing.Dialect.chunked, try negotiate(&ours, &h.capabilities));
+}
+
 test "fuzz: parseHello never crashes on arbitrary XML-ish input" {
     try testing.fuzz({}, fuzzHello, .{});
 }

@@ -49,6 +49,25 @@ checked for zero external asset references. In-process integration: a real `http
 endpoint bound to `127.0.0.1:0`, fetched with `http.Client` — the served document parses and
 contains the registered routes/operations.
 
+### External-anchor investigation: `openapi_spec_validator` (2026-08-01, done)
+
+The in-house structural checker (`validateOpenApi31`) and the adopted OAI example (both above)
+prove this module accepts a real document and that its own rules fire — not that a real,
+schema-driven validator agrees. `openapi_spec_validator` (JSON-Schema-backed, the reference
+OAS validator) was run once, offline, in a throwaway venv (`~/.cache/zig-libs-openapi`),
+against two documents: (1) the exact JSON `Generator.build` produces for the route set in
+"generate: golden OpenAPI 3.1 document for a known route set" — `validate()` raised no
+exception, confirming this module's own generated output is genuinely valid OAS 3.1, not
+merely self-consistent; (2) a deliberately invalid document missing a response
+`description` — rejected with `OpenAPIValidationError: 'description' is a required
+property`, the same structural defect this module's own checker already reports as
+`error.MissingResponseDescription`, now independently confirmed rather than assumed. **No
+disagreement was found.** Both documents and the real verdict are frozen as permanent
+offline tests in `src/root.zig` (`external anchor: …`); per the governing rule the tool was
+run once and is not re-invoked at test time. No `/NOTICE` entry (black-box validating
+oracle, root NOTICE §0); the module's existing NOTICE for the adopted OAI example document
+is unrelated and unaffected.
+
 ## Backlog / deferred
 OpenAPI 3.0/Swagger 2.0 output, request/response runtime validation, and client SDK generation are
 explicitly out of scope, not planned. Richer path-parameter typing beyond `string` would require

@@ -36,6 +36,26 @@ a concurrent get-or-register convergence stress; middleware tests over socket-fr
 `http.Server.serveStream`; an in-process `router`+`http.Server`+`http.Client` loopback integration
 run (mixed 2xx/3xx/4xx/5xx traffic → scrape asserts exact values).
 
+### External-anchor investigation: `prometheus_client` (2026-08-01, done)
+
+The in-house grammar checker (`validateExpositionText`) and the frozen published-example
+excerpt (both above) close the "is this syntactically valid exposition format" gap but were,
+until now, the only oracle — self-consistency, not independent verification. A real
+independent parser is now available: `prometheus_client`'s
+`parser.text_string_to_metric_families`, the same reader library code that talks to a
+Prometheus server, run in a throwaway venv (`~/.cache/zig-libs-metrics`). It was run once,
+offline, feeding it the exact byte string this module's own `writeText` produces for a
+representative registry (counter + gauge + histogram, covering backslash/quote/newline
+escaping and cumulative buckets) — see `src/root.zig`, "external anchor: exposition text
+independently parsed by prometheus_client", for the full quoted parse and the frozen text.
+**No disagreement was found**; every value, label and escape was extracted correctly. One
+finding, not a bug: `prometheus_client` strips the `_total` counter suffix at the *family*
+level (`api_requests`, not `api_requests_total`) while samples keep it — a real client-library
+convention this module's own checker has no notion of either way, confirmed rather than
+assumed. Per the governing rule the tool was run once and its verdict frozen as a permanent
+offline test; no `/NOTICE` entry (black-box parsing oracle, root NOTICE §0 — the module's
+existing NOTICE for the vendored documentation excerpt is unrelated and unaffected).
+
 ## Backlog / deferred
 A bounded route-pattern label for the request middleware, once `router` exposes the matched
 pattern (currently deliberately not labeled by raw path — cardinality risk). `metrics.handler(registry)

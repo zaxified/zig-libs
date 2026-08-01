@@ -717,6 +717,106 @@ test "generate: malformed request_schema → error.InvalidRequestSchema" {
     );
 }
 
+// ── external anchor: independently validated by `openapi_spec_validator` ───
+//
+// The structural checker above (`validateOpenApi31`) and the adopted OAI
+// example prove this module accepts a real document and that its own hand-
+// written rules fire — neither proves a real, schema-driven OpenAPI 3.1
+// validator agrees. `openapi_spec_validator` (the JSON-Schema-backed
+// reference implementation) was run ONCE, offline, in a throwaway venv
+// (`~/.cache/zig-libs-openapi`), against two documents:
+//
+//   1. The exact JSON this module's own `Generator.build` produces for the
+//      route set in "generate: golden OpenAPI 3.1 document for a known
+//      route set" below (reproduced verbatim as `own_generated_document`).
+//      `openapi_spec_validator.validate()` raised no exception — a real,
+//      independent, schema-based validator confirms this module's own
+//      output is a genuinely valid OpenAPI 3.1 document, not merely
+//      "well-formed JSON that satisfies our own checker".
+//   2. A deliberately invalid document, `response_missing_description`,
+//      missing the (real, OAS-required) `description` on a response object.
+//      `openapi_spec_validator` rejected it: `OpenAPIValidationError:
+//      'description' is a required property` (2026-08-01, verbatim) — the
+//      SAME reason this module's own `validateOpenApi31` already reports as
+//      `error.MissingResponseDescription`, confirmed against the real spec
+//      rather than assumed. This is the negative direction the governing
+//      task asked for: an anchor with teeth in both directions.
+//
+// **No disagreement was found** for either document. Per the governing
+// rule, the tool was run once and its verdict frozen; this test does not
+// shell out or open a socket. No `/NOTICE` entry: `openapi_spec_validator`
+// is used purely as a black-box validating oracle (root NOTICE §0, the
+// relationship already recorded for `protobuf`/`syslog`/`opcua`/
+// `wireguard`/`xmlsec1`) — the module's existing NOTICE for the adopted OAI
+// example document is unrelated and unaffected.
+const own_generated_document = "{\"openapi\":\"3.1.0\"," ++
+    "\"info\":{\"title\":\"Test API\",\"version\":\"1.2.3\",\"description\":\"A test.\"}," ++
+    "\"paths\":{" ++
+    "\"/health\":{\"get\":{\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}," ++
+    "\"/users/{id}\":{" ++
+    "\"get\":{\"tags\":[\"users\"],\"summary\":\"Fetch a user\",\"description\":\"Returns one user by id.\"," ++
+    "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
+    "\"responses\":{\"200\":{\"description\":\"The user\"},\"404\":{\"description\":\"No such user\"}}}," ++
+    "\"delete\":{" ++
+    "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
+    "\"responses\":{\"200\":{\"description\":\"Successful Response\"}},\"deprecated\":true}}," ++
+    "\"/users\":{\"post\":{\"summary\":\"Create a user\"," ++
+    "\"requestBody\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"required\":[\"name\"]}}},\"required\":true}," ++
+    "\"responses\":{\"201\":{\"description\":\"Created\"}}}}," ++
+    "\"/static/{path}\":{\"get\":{" ++
+    "\"parameters\":[{\"name\":\"path\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
+    "\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}" ++
+    "}}";
+
+test "external anchor: our generator's own output is genuinely valid OpenAPI 3.1 (frozen 2026-08-01)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/health", hOk);
+    try r.addDoc(.get, "/users/:id", hOk, .{
+        .summary = "Fetch a user",
+        .description = "Returns one user by id.",
+        .tags = &.{"users"},
+        .responses = &.{
+            .{ .status = 200, .description = "The user" },
+            .{ .status = 404, .description = "No such user" },
+        },
+    });
+    try r.addDoc(.post, "/users", hOk, .{
+        .summary = "Create a user",
+        .request_schema = "{\"type\":\"object\",\"required\":[\"name\"]}",
+        .responses = &.{.{ .status = 201, .description = "Created" }},
+    });
+    try r.addDoc(.delete, "/users/:id", hOk, .{ .deprecated = true });
+    try r.get("/static/*path", hOk);
+
+    const json = try Generator.build(testing.allocator, &r, .{
+        .title = "Test API",
+        .version = "1.2.3",
+        .description = "A test.",
+    });
+    defer testing.allocator.free(json);
+
+    // The exact bytes `openapi_spec_validator.validate()` accepted with no
+    // exception raised.
+    try testing.expectEqualStrings(own_generated_document, json);
+}
+
+test "external anchor: a document our checker rejects, a real validator rejects too — same reason (frozen 2026-08-01)" {
+    const allocator = testing.allocator;
+    const response_missing_description =
+        \\{"openapi":"3.1.0","info":{"title":"Bad API","version":"1.0.0"},
+        \\ "paths":{"/broken":{"get":{"responses":{"200":{}}}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_missing_description, .{});
+    defer parsed.deinit();
+    // Our own checker: error.MissingResponseDescription.
+    // openapi_spec_validator (2026-08-01, verbatim): OpenAPIValidationError:
+    // 'description' is a required property (validating
+    // .paths./broken.get.responses.200 against the OAS 3.1 Response Object
+    // schema) — the same structural defect, independently confirmed.
+    try testing.expectError(error.MissingResponseDescription, validateOpenApi31(parsed.value));
+}
+
 // ── tests: endpoint over the socket-free server codec ───────────────────────
 
 const Reader = std.Io.Reader;

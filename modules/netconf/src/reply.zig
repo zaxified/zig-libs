@@ -693,6 +693,66 @@ test "classify: routes the four message kinds without a full parse" {
     try testing.expectEqual(MessageKind.unknown, classify("<!--"));
 }
 
+// External anchor (2026-08-01): the same real, independent NETCONF server as
+// `capabilities.zig`'s live-hello anchor — the Python `netconf` 2.1.0 package.
+// These two replies are byte-for-byte what it put on the wire in the same
+// session (session-id 3, `.chunked` framing) that produced the hello frozen
+// there: message-id 1 is the reply to our own `get-config` request (built by
+// `buildRpc` — see the matching anchor in `rpc.zig`), message-id 3 is the
+// reply to a deliberately unsupported operation, a REAL `<rpc-error>` from a
+// server that never saw our code, not a hand-typed one. Captured once by
+// instrumenting `Client.receive` during the live interop test; this test
+// itself opens no socket. See SPEC.md "External-anchor investigation".
+const live_netconf_2_1_0_get_config_reply =
+    \\<?xml version="1.0" encoding="UTF-8"?><rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="1">
+    \\  <data>
+    \\    <probe:top xmlns:probe="urn:example:probe">
+    \\      <probe:name>oracle-probe</probe:name>
+    \\      <probe:value>42</probe:value>
+    \\    </probe:top>
+    \\  </data>
+    \\</rpc-reply>
+;
+
+const live_netconf_2_1_0_rpc_error_reply =
+    \\<?xml version="1.0" encoding="UTF-8"?><rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="3"><rpc-error><error-type>protocol</error-type><error-tag>operation-not-supported</error-tag><error-severity>error</error-severity></rpc-error></rpc-reply>
+;
+
+test "external anchor: parseReply on a real get-config reply from the `netconf` 2.1.0 package (frozen 2026-08-01)" {
+    const gpa = testing.allocator;
+    var r = try parseReply(gpa, live_netconf_2_1_0_get_config_reply);
+    defer r.deinit();
+    try r.expectMessageId(1);
+    try testing.expect(!r.hasErrors());
+
+    const data = try r.expectData();
+    try testing.expect(std.mem.indexOf(u8, data, "<probe:name>oracle-probe</probe:name>") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "<probe:value>42</probe:value>") != null);
+
+    // The parsed tree keeps the `probe:` namespace binding the raw span
+    // cannot see standalone (the same caveat `rfc_7_1_reply`'s test proves).
+    const de = r.data_element.?;
+    const top = de.firstElementChild().?;
+    try testing.expectEqualStrings("top", top.local);
+    try testing.expectEqualStrings("urn:example:probe", top.uri);
+}
+
+test "external anchor: parseReply on a real rpc-error from the `netconf` 2.1.0 package (frozen 2026-08-01)" {
+    const gpa = testing.allocator;
+    var r = try parseReply(gpa, live_netconf_2_1_0_rpc_error_reply);
+    defer r.deinit();
+    try r.expectMessageId(3);
+    try testing.expect(r.hasErrors());
+    const e = r.firstError().?;
+    try testing.expectEqual(ErrorType.protocol, e.error_type.?);
+    try testing.expectEqualStrings("protocol", e.type_text);
+    try testing.expectEqual(ErrorTag.operation_not_supported, e.tag);
+    try testing.expectEqualStrings("operation-not-supported", e.tag_text);
+    try testing.expectEqual(ErrorSeverity.err, e.severity.?);
+    try testing.expectError(error.RpcError, r.expectOk());
+    try testing.expectError(error.RpcError, r.expectData());
+}
+
 test "fuzz: parseReply / classify never crash" {
     try testing.fuzz({}, fuzzReply, .{});
 }

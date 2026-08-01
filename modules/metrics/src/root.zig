@@ -1408,6 +1408,98 @@ test "writeText: NaN observations poison _sum, land in +Inf only (client_golang)
     try validateExpositionText(w.buffered());
 }
 
+// ── external anchor: independently parsed by `prometheus_client` ───────────
+//
+// The grammar checker above proves this module's text is syntactically valid
+// exposition format; it does not prove a real Prometheus client parses out
+// the families/samples/values this module actually intended. `prometheus_client`
+// (`parser.text_string_to_metric_families`), an independent Python
+// implementation of the reader Prometheus itself uses, was run ONCE, offline,
+// against the exact byte string produced by the `Registry` below (identical
+// setup to "writeText: golden exact bytes"), and what it parsed out is
+// quoted verbatim here (2026-08-01):
+//
+//   FAMILY api_requests counter 'Total API requests.'
+//     SAMPLE api_requests_total {'method': 'get', 'code': '2xx'} 3
+//     SAMPLE api_requests_total {'method': 'post', 'code': '5xx'} 1
+//   FAMILY queue_depth gauge 'Depth\nwith \\ inside.'
+//     SAMPLE queue_depth {'q': 'a\\b"c\nd'} 42
+//   FAMILY req_seconds histogram 'Request latency.'
+//     SAMPLE req_seconds_bucket {'route': '/x', 'le': '0.25'} 1
+//     SAMPLE req_seconds_bucket {'route': '/x', 'le': '0.5'} 2
+//     SAMPLE req_seconds_bucket {'route': '/x', 'le': '2'} 3
+//     SAMPLE req_seconds_bucket {'route': '/x', 'le': '+Inf'} 4
+//     SAMPLE req_seconds_sum {'route': '/x'} 9.5
+//     SAMPLE req_seconds_count {'route': '/x'} 4
+//
+// Every value, label and escape this module intended was extracted correctly
+// — including the backslash/quote/newline escaping in both HELP text and a
+// label value, and the cumulative histogram buckets. **No disagreement was
+// found.** One thing this run taught that this module's own grammar checker
+// has no notion of either way: `prometheus_client` strips the `_total`
+// suffix from the *family* name (`api_requests`, not `api_requests_total`)
+// while the per-sample name keeps it — a real client-library convention,
+// confirmed here rather than assumed.
+//
+// Per the governing rule, the tool was run once and its verdict frozen; this
+// test does not shell out or open a socket — it only re-runs this module's
+// own `writeText` and checks the bytes are still what was fed to the real
+// parser. No `/NOTICE` entry: `prometheus_client` is used purely as a
+// black-box parsing oracle here (root NOTICE §0, the relationship already
+// recorded for `protobuf`/`syslog`/`opcua`/`wireguard`/`xmlsec1`) — nothing
+// was read from or copied out of its source; the module's own vendored
+// exposition-format *documentation excerpt* NOTICE entry above is unrelated
+// and unaffected.
+test "external anchor: exposition text independently parsed by prometheus_client (frozen 2026-08-01)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    const c1 = try reg.counter("api_requests_total", "Total API requests.", &.{
+        .{ .name = "method", .value = "get" },
+        .{ .name = "code", .value = "2xx" },
+    });
+    c1.inc();
+    c1.add(2);
+    const c2 = try reg.counter("api_requests_total", "Total API requests.", &.{
+        .{ .name = "method", .value = "post" },
+        .{ .name = "code", .value = "5xx" },
+    });
+    c2.inc();
+    const g = try reg.gauge("queue_depth", "Depth\nwith \\ inside.", &.{
+        .{ .name = "q", .value = "a\\b\"c\nd" },
+    });
+    g.set(42);
+    const h = try reg.histogram("req_seconds", "Request latency.", &.{
+        .{ .name = "route", .value = "/x" },
+    }, &.{ 0.25, 0.5, 2 });
+    h.observe(0.25);
+    h.observe(0.5);
+    h.observe(0.75);
+    h.observe(8);
+
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeText(&w);
+
+    // The exact bytes fed to, and successfully parsed by, `prometheus_client`
+    // into the families/samples quoted above.
+    try testing.expectEqualStrings("# HELP api_requests_total Total API requests.\n" ++
+        "# TYPE api_requests_total counter\n" ++
+        "api_requests_total{method=\"get\",code=\"2xx\"} 3\n" ++
+        "api_requests_total{method=\"post\",code=\"5xx\"} 1\n" ++
+        "# HELP queue_depth Depth\\nwith \\\\ inside.\n" ++
+        "# TYPE queue_depth gauge\n" ++
+        "queue_depth{q=\"a\\\\b\\\"c\\nd\"} 42\n" ++
+        "# HELP req_seconds Request latency.\n" ++
+        "# TYPE req_seconds histogram\n" ++
+        "req_seconds_bucket{route=\"/x\",le=\"0.25\"} 1\n" ++
+        "req_seconds_bucket{route=\"/x\",le=\"0.5\"} 2\n" ++
+        "req_seconds_bucket{route=\"/x\",le=\"2\"} 3\n" ++
+        "req_seconds_bucket{route=\"/x\",le=\"+Inf\"} 4\n" ++
+        "req_seconds_sum{route=\"/x\"} 9.5\n" ++
+        "req_seconds_count{route=\"/x\"} 4\n", w.buffered());
+}
+
 // ── tests: multi-thread stress ──────────────────────────────────────────────
 
 test "stress: shared counter/gauge/histogram across threads lose no updates" {
