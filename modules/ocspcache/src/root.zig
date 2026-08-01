@@ -520,4 +520,5 @@ test "buildGetUrl: percent-encodes reserved base64 characters" {
 
 test {
     _ = @import("ocspcache_test.zig");
+    _ = @import("goldens.zig");
 }

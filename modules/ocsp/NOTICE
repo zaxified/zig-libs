@@ -29,7 +29,25 @@ Built on the public APIs of sibling modules and Zig std only:
 - `std.crypto.hash.Sha1` / `sha2.Sha256`/`Sha384`/`Sha512` and
   `std.crypto.Certificate.der` types (MIT, part of Zig itself).
 
-Test fixtures are constructed (signed with the sibling `rsa`/`p256` modules),
-not captured from any third party; see SPEC.md "Fixture provenance".
+Test fixtures in `ocsp_test.zig` are constructed (signed with the sibling
+`rsa`/`p256` modules), not captured from any third party. `goldens.zig` (added
+2026-08-01) additionally holds two REAL OCSP responses captured live from
+public CA responders (DigiCert, GoDaddy) plus the certificate chains they
+answer for — see SPEC.md "Fixture provenance" for what each exercises.
+
+Attribution for the captured responses: NONE required, by the same reasoning
+CONVENTIONS.md §5 and root NOTICE §0 give for running an installed
+third-party binary as a black-box compatibility test oracle (e.g. `tar`/`nft`
+goldens elsewhere in this repo) — no third-party source or design was
+consulted, only the observable output of a live server implementing the
+public RFC 6960 wire protocol was captured, exactly as those local-binary
+captures are. A signed OCSP response's bytes are themselves almost entirely
+protocol-structure (ASN.1 DER dictated by the RFC) plus facts (timestamps, a
+serial number, a cryptographic signature) — not copyrightable expression —
+so this is neither a vendored third-party corpus (root NOTICE §1, e.g.
+`csvstream`'s CSV acid-test suite) nor a design reference (§2): no entry in
+either place, and no root NOTICE change accompanies this addition. See
+`goldens.zig`'s own doc comment for the exact capture recipe and what each
+response exercises that the constructed fixtures do not.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

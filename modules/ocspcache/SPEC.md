@@ -169,6 +169,37 @@ certificate with no AIA entry rejected before ever calling the transport;
 the GET-form request path; and `Config.max_entries` rejecting a second
 distinct certificate once the bound is reached without disturbing the first.
 
+## Real captured fixture (`goldens.zig`, added 2026-08-01)
+
+The fixtures above (this file's earlier "Fixture provenance" section) are all
+CONSTRUCTED — an offline generator, never a real CA — and their `CertID`s are
+SHA-256-hashed like `ocsp`'s own constructed fixtures. `goldens.zig` adds a
+real, live-captured round trip reusing the GoDaddy capture documented in
+`ocsp`'s own `SPEC.md`/`goldens.zig` (delegated responder, real AIA
+extension, SHA-1 `CertID`): `discoverResponderUrl` against the real leaf
+certificate's actual Authority Information Access extension (resolves
+`http://ocsp.godaddy.com/`, independently confirmed via
+`openssl x509 -text`), and a full `Cache.refresh` → verify (delegated
+responder, real 4096-bit RSA responder key) → cache → `getStapled` round trip
+via a mock `Transport` that returns the real captured response bytes
+verbatim. `now_unix` is pinned to a fixed instant inside the response's real
+`[thisUpdate, nextUpdate]` window, never the wall clock.
+
+A shared-root-cause teeth-check: re-applying the same mutation used for
+`ocsp`'s own teeth-check (dropping the SHA-1 arm of `hashAlgoFromOid` in
+`ocsp/src/root.zig`) turns exactly the real-fixture `Cache.refresh` test red
+(`VerifyFailed` ← `CertIdMismatch`) while all twelve constructed-fixture
+tests in `ocspcache_test.zig` — and the other two real-fixture tests, which
+don't touch `CertID` verification — stay green. The blind spot in `ocsp`
+propagates transitively through this module's dependency, and only the real
+captured response in `ocspcache`'s own suite catches it.
+
+Attribution: none required (same reasoning as `ocsp`'s `NOTICE` — a
+black-box compatibility test oracle, CONVENTIONS.md §5 / root NOTICE §0); no
+root NOTICE change accompanies this addition. `ocspcache` has no
+module-local `NOTICE` file of its own (nothing here ports third-party source
+or a design reference), so this note lives in SPEC.md only.
+
 ## Deferred (out of scope, not silently skipped)
 
 - **TLS handshake stapling wire integration** (RFC 6066 `status_request`) —

@@ -21,7 +21,10 @@ and matches a request nonce if one was sent. `zig build test-ocsp` (Debug +
 ReleaseFast) covers good / revoked / unknown, tampered signature,
 CertID mismatch, stale, not-yet-valid, missing-nextUpdate max-age, nonce
 mismatch, unsuccessful status, both delegated-responder cases, the ECDSA path,
-and a malformed-DER fuzz batch.
+and a malformed-DER fuzz batch — plus (`goldens.zig`) two REAL OCSP responses
+captured live from public CAs (DigiCert direct/byKey, GoDaddy delegated/byName
+with a real 4096-bit responder cert), the first real-world exercise of the
+response-side SHA-1 `CertID` branch. See SPEC.md "Fixture provenance".
 
 ```zig
 const ocsp = @import("ocsp");

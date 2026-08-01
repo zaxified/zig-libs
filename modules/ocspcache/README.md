@@ -24,7 +24,10 @@ a full fetch→verify→cache→serve round trip via a mock transport (no
 network), the proactive-margin vs. hard-expiry distinction, a tampered
 response never being cached, a `tryLater` response being soft-failed while
 the prior good entry keeps serving, a non-200 HTTP status, a
-certificate with no AIA entry, the GET-form path, and the cache-size bound.
+certificate with no AIA entry, the GET-form path, and the cache-size bound —
+plus (`goldens.zig`) a real fetch→verify→cache round trip against a live-CA
+delegated OCSP response and a real Authority Information Access extension.
+See SPEC.md "Real captured fixture".
 
 ```zig
 const ocspcache = @import("ocspcache");

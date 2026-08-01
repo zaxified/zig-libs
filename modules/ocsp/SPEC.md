@@ -127,9 +127,50 @@ accepted and mismatch → `NonceMismatch`; `responseStatus != successful` →
 `ResponderMissingOcspSigning`; ECDSA-P256 direct-issuer signature accepted; a
 malformed/truncated-DER batch that must never panic.
 
-A real captured Let's Encrypt / DigiCert response + issuer could be dropped in
-as an additional fixture later (parse + verify against the real issuer key); the
-constructed fixtures already exercise the full verification path.
+## Real captured responses (`goldens.zig`, added 2026-08-01)
+
+The constructed fixtures above are hermetic by construction — they are DER
+this module's own writer built, signed by the sibling `rsa`/`p256` modules.
+That is the classic "encoder and decoder agree on the same misreading" blind
+spot: nothing in this module had ever been fed DER an actual CA emits. Two
+real, live-captured OCSP responses close that gap, obtained via
+`openssl s_client` (fetch the chain) + `openssl ocsp` (query the real
+responder named in the leaf's AIA extension) against public CAs that still
+run OCSP as of 2026-08-01 — see `goldens.zig`'s doc comment for the exact
+recipe and reference timestamps. (RFC 6960 does not obligate a CA to run
+OCSP forever — Let's Encrypt in particular has been winding its responder
+down — so which CA answers on a given day varies; DigiCert and GoDaddy both
+answered at capture time, as did Sectigo, not kept as a fixture.)
+
+- **DigiCert** — a *direct* responder: `ResponderID` **byKey**, no delegate
+  cert. `CertID.hashAlgorithm` is **SHA-1** — every constructed response
+  fixture above hashes its `CertID` with SHA-256, so this is the only place
+  `certIdBinds`'s SHA-1 branch runs against an actual `verify()` call.
+  RSA-SHA256 signature over a 2048-bit key (constructed fixtures use
+  1024-bit).
+- **GoDaddy** — a **delegated** responder: `ResponderID` **byName**, and
+  `certs [0]` embeds a certificate directly signed by the leaf's issuing CA,
+  carrying `id-kp-OCSPSigning`, on a **4096-bit** RSA key — the first time
+  `resolveDelegate` authorizes a certificate this module did not build
+  itself. SHA-1 `CertID`, RSA-SHA256 signature.
+
+Both are asserted past "it parsed": responder form, delegated/direct,
+`this_update_unix`/`next_update_unix` against the response's actual
+`Cert Status: good`, and the freshness boundary at the real `nextUpdate` —
+with `now_unix` pinned to a fixed instant inside the captured validity
+window (never the wall clock, so the test does not go stale as time passes;
+see `goldens.zig` for the exact epoch values and how they were independently
+computed).
+
+Attribution: none required — see `NOTICE` ("black-box compatibility test
+oracle" reasoning, CONVENTIONS.md §5 / root NOTICE §0). No root NOTICE change
+accompanies this addition.
+
+A mutation teeth-check confirmed the goldens are load-bearing: dropping the
+SHA-1 arm of `hashAlgoFromOid` turns exactly the three real-response tests
+red (`CertIdMismatch`) while all nineteen constructed-fixture tests above
+stay green, because none of them ever hashes a response `CertID` with SHA-1
+— precisely the blind spot real data and only real data catches here.
 
 ## Deferred (out of scope, not silently skipped)
 

@@ -1015,4 +1015,5 @@ fn putInt32(int_bytes: []const u8, out: *[32]u8) bool {
 
 test {
     _ = @import("ocsp_test.zig");
+    _ = @import("goldens.zig");
 }
