@@ -55,18 +55,26 @@ abandoned datagrams never reads a clock itself, so a test can drive it (and
 ## Verify
 
 ```
-zig build test-ethfrag                          # Debug       — 21 pass
-zig build test-ethfrag -Doptimize=ReleaseFast   # ReleaseFast — 21 pass
+zig build test-ethfrag                          # Debug       — 26 pass
+zig build test-ethfrag -Doptimize=ReleaseFast   # ReleaseFast — 26 pass
 ```
 
 Round-trip smoke, a 300-iteration seeded property test (fragment → shuffle →
 reassemble → byte-identical, across random frame lengths / MTUs / overheads),
-and **one targeted adversarial test per threat-model bullet**: overlap,
+**one targeted adversarial test per threat-model bullet**: overlap,
 duplicate, teardrop overrun, contradictory `more=false`, tiny-fragment flood,
-concurrent-datagram cap, and timeout reclamation. A frame is returned only once
-every byte is accounted for by non-overlapping fragments; there is no code path
-that returns a partial frame.
+concurrent-datagram cap, and timeout reclamation, and an **external anchor**
+(`kernel_oracle.zig`) comparing this module's accept/drop/deliver decision
+against the real Linux kernel's own IPv4/IPv6 fragment reassembly for
+structurally equivalent fragment sets — see that file's doc comment for the
+capture recipe and the one confirmed, deliberate divergence (this module
+rejects an exact-duplicate fragment; the kernel tolerates it as a harmless
+retransmission). A frame is returned only once every byte is accounted for by
+non-overlapping fragments; there is no code path that returns a partial frame.
 
 Provenance: clean-room from RFC 791 §3.2 and RFC 5722 §3 — both public specs,
 no third-party source ported or studied, so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0).
+[`NOTICE`](../../NOTICE) §0). Exercising the kernel's own reassembly as a
+black-box RFC-policy oracle (`kernel_oracle.zig`) is likewise exempt under
+`NOTICE` §0 — no kernel source consulted or copied, only its observable
+accept/drop behavior against fragments built by hand.

@@ -16,7 +16,18 @@ fragments sum to exactly its established total length (see the completion-correc
 argument in `src/root.zig`'s `insert` doc comment: non-overlapping intervals within
 `[0, total_len)` whose lengths sum to `total_len` necessarily tile it with zero gaps —
 so "sum of accepted lengths == total_len" is sufficient to prove full coverage without a
-separate gap scan). `offset`/`length` are `u16`, which is both the wire format and the
+separate gap scan). **That premise — every accepted interval lies within
+`[0, total_len)` — used to be unenforced for fragments accepted before any `more=false`
+fragment had established `total_len` in the first place**: an out-of-range fragment
+arriving first (while the bound is still unknown) sailed through the bounds check that
+only exists once `total_len` IS known, then its length still counted toward `covered`.
+A specific offset/order combination could make `covered` reach `total_len` via bytes
+that lived entirely OUTSIDE the real frame while a genuine gap remained INSIDE it,
+returning `.complete` over uninitialized allocator memory for that gap — found and
+fixed while building `kernel_oracle.zig`'s teeth check; see `insert`'s retroactive
+bounds check (fires the moment `total_len` is newly established) and the regression
+test "reassembler rejects a fragment retroactively found to exceed a LATER-established
+total length" in `root.zig`. `offset`/`length` are `u16`, which is both the wire format and the
 `max_frame_len` ceiling (65535 bytes) — a width tied directly to the header, not a
 separate policy knob. Concurrency: `.reentrant` free functions; a `Reassembler` instance
 is single-owner (no internal lock — one caller drives it, matching `ratelimit`/`jobqueue`
@@ -82,17 +93,30 @@ weakness introduced by this module).
 
 ## Verification
 
-Offline only — this is a pure codec, no live-interop surface. `zig build test-ethfrag`:
-round-trip smoke (no-frag, zero-length, multi-fragment, reordered delivery),
-a 300-iteration seeded property test (`fragment` → shuffle → `Reassembler` → exact
-byte-identical output, across random frame lengths/MTUs/header-overheads), a targeted
+Offline by default — this is a pure codec, no live-interop surface at runtime.
+`zig build test-ethfrag`: round-trip smoke (no-frag, zero-length, multi-fragment,
+reordered delivery), a 300-iteration seeded property test (`fragment` → shuffle →
+`Reassembler` → exact byte-identical output, across random frame lengths/MTUs/header-overheads), a targeted
 adversarial corpus (one test per threat-model bullet above: overlap, duplicate, teardrop
 overrun, contradictory final-length claims, oversized frame, tiny-fragment flood,
 resource-cap exhaustion, gap-then-timeout, malformed header, truncated bytes, length
-mismatch, out-of-bounds), and `std.testing.fuzz` over the reassembler's raw wire-byte
+mismatch, out-of-bounds), `std.testing.fuzz` over the reassembler's raw wire-byte
 input (structurally-valid-but-hostile fragments plus fully arbitrary bytes), asserting
-only "never panics" + "`inflightCount()` never exceeds `max_inflight`". Green in Debug and
-`-Doptimize=ReleaseFast`.
+only "never panics" + "`inflightCount()` never exceeds `max_inflight`", and an
+**external anchor** (`src/kernel_oracle.zig`) freezing 12 real IPv4/IPv6 fragment
+captures (six scenarios × two address families — in-order, out-of-order,
+missing-middle, exact-duplicate, conflicting-overlap, content-consistent-but-
+differently-sliced-overlap) plus the real Linux kernel's own observed accept/drop
+verdict for each, captured once inside an unprivileged
+`unshare --user --map-root-user --net` namespace with hand-built raw sockets (no
+`scapy`). Every capture's fragment shape is replayed through this module's own
+production `Reassembler` (re-encoded into its own wire format) and the two verdicts
+are compared offline thereafter — no kernel access needed to run the suite. Ten of
+twelve match; the remaining two are ethfrag's one confirmed, deliberate divergence
+from the kernel (see that file's doc comment): this module treats an exact-duplicate
+fragment as just another overlap and drops the whole datagram, while this host's
+kernel tolerates it as a harmless retransmission for both IPv4 and IPv6. Green in
+Debug and `-Doptimize=ReleaseFast`.
 
 ## Backlog / deferred
 

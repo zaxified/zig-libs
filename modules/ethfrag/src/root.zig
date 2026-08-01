@@ -388,6 +388,26 @@ pub const Reassembler = struct {
                     return error.ProtocolViolation;
                 }
             } else {
+                // Newly established total length: every interval accepted
+                // BEFORE this fragment arrived was accepted while
+                // `entry.total_len` was still null, so the bounds check
+                // just below (`if (entry.total_len) |t| { if (frag_end > t)
+                // ... }`) never ran for it -- it could freely land beyond
+                // where the datagram turns out to actually end. Left
+                // unchecked, its length still counts toward `covered`, so
+                // `covered == total_len` can become true via bytes that
+                // live OUTSIDE [0, total_len) while a real gap remains
+                // INSIDE it: `.complete` would then fire and hand the
+                // caller uninitialized allocator memory for that gap. This
+                // is the out-of-order mirror of the teardrop-style overrun
+                // already rejected below for fragments arriving AFTER
+                // total_len is known -- reject it the same way, retroactively.
+                for (entry.intervals.items) |iv| {
+                    if (@as(usize, iv.offset) + @as(usize, iv.length) > frag_end) {
+                        self.dropEntry(hdr.frag_id);
+                        return error.OutOfBounds;
+                    }
+                }
                 entry.total_len = frag_end;
             }
         }
@@ -589,6 +609,51 @@ test "reassembler rejects a fragment extending past a claimed final length (tear
     (Header{ .frag_id = 3, .offset = 15, .length = 5, .more = true }).encode(over[0..header_len]);
     @memset(over[header_len..], 'e');
     try testing.expectError(error.OutOfBounds, r.insert(&over, 1));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "reassembler rejects a fragment retroactively found to exceed a LATER-established total length (out-of-order teardrop mirror, regression)" {
+    // Real bug, found while designing this file's kernel-oracle teeth
+    // check (not a hypothetical): a fragment accepted BEFORE any more=false
+    // fragment has arrived is accepted while entry.total_len is still
+    // null, so the `if (entry.total_len) |t| { if (frag_end > t) ... }`
+    // bounds check never runs for it. If a LATER more=false fragment then
+    // establishes a total_len smaller than that earlier fragment's own end,
+    // the earlier fragment's length still counted toward `covered` even
+    // though its bytes live entirely OUTSIDE [0, total_len). `covered` can
+    // then reach `total_len` via bytes from outside the frame while a real
+    // gap remains inside it, and `.complete` fired over that gap --
+    // handing the caller uninitialized allocator memory for the hole.
+    // Confirmed via reproduction before the fix: the returned "complete"
+    // 100-byte frame was 30 bytes of 'D', 50 bytes of allocator poison
+    // (0xaa, from the never-written gap), then 20 bytes of 'C'.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 200, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    // Fragment A: offset=150, length=50, more=true -- arrives while
+    // total_len is still unknown, so nothing bounds-checks it yet.
+    var a: [header_len + 50]u8 = undefined;
+    (Header{ .frag_id = 77, .offset = 150, .length = 50, .more = true }).encode(a[0..header_len]);
+    @memset(a[header_len..], 'A');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&a, 0));
+
+    // Fragment D: offset=0, length=30, more=true -- non-overlapping with A.
+    var d: [header_len + 30]u8 = undefined;
+    (Header{ .frag_id = 77, .offset = 0, .length = 30, .more = true }).encode(d[0..header_len]);
+    @memset(d[header_len..], 'D');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&d, 1));
+
+    // Fragment C: offset=80, length=20, more=false -- establishes
+    // total_len=100. Non-overlapping with A ([150,200)) or D ([0,30)).
+    // Before the fix: covered = 50+30+20 = 100 == total_len -> wrongly
+    // ".complete" with bytes [30,80) never written. After the fix: A's
+    // interval ([150,200)) is checked against the newly-established
+    // total_len (100) the moment it is set, found to exceed it, and the
+    // whole datagram is dropped instead.
+    var c: [header_len + 20]u8 = undefined;
+    (Header{ .frag_id = 77, .offset = 80, .length = 20, .more = false }).encode(c[0..header_len]);
+    @memset(c[header_len..], 'C');
+    try testing.expectError(error.OutOfBounds, r.insert(&c, 2));
     try testing.expectEqual(@as(usize, 0), r.inflightCount());
 }
 
@@ -896,4 +961,10 @@ fn fuzzReassembler(_: void, smith: *std.testing.Smith) !void {
 
         try testing.expect(r.inflightCount() <= max_inflight);
     }
+}
+
+test {
+    // External anchor: real Linux kernel IPv4/IPv6 fragment reassembly,
+    // captured once and frozen (see kernel_oracle.zig's module doc-comment).
+    _ = @import("kernel_oracle.zig");
 }
