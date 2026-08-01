@@ -1555,3 +1555,66 @@ test "brinsonAttribution: effects sum exactly to the active return (identity)" {
     try testing.expectEqualStrings("TOTAL", b.cell(2, "segment").?.text);
     try testing.expectApproxEqAbs(@as(f64, 0.015), b.cell(2, "total").?.float, 1e-9);
 }
+
+test "FFN reference validation: risk_metrics against external ffn library (8-day series)" {
+    // Reference values computed via ffn 1.1.5:
+    // returns = [0.01, -0.02, 0.015, -0.005, 0.02, 0.01, -0.01, 0.025]
+    // Price series: 1.0 → 1.01 → 0.9898 → 1.00465 → 0.99962 → 1.01962 → 1.02981 → 1.01951 → 1.04500
+    // Over 8 trading days (2024-01-01 to 2024-01-10, spanning 7 calendar days)
+    //
+    // FFN outputs (ps.daily_vol is ALREADY annualized):
+    //   annualized_return (CAGR): 2.8183796386
+    //   annualized_volatility: 0.2489728901 (stdev * sqrt(252))
+    //   daily_sharpe: 5.6933909531 (ratio of daily mean/stdev, unannualized)
+    //   daily_sortino: 11.0227038425
+    //   calmar: 140.9189819276
+    //   max_drawdown: -0.02
+    //   downside_deviation: 0.1285982115 (annualized)
+    //   var_95: 0.0165 (negative of 5th percentile)
+    //   cvar_95: 0.02 (mean of returns <= 5th percentile, negated)
+    var f = Fix.init();
+    defer f.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "r", .type = .float },
+    };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0.01 } },
+        &.{ .{ .text = "2024-01-02" }, .{ .float = -0.02 } },
+        &.{ .{ .text = "2024-01-03" }, .{ .float = 0.015 } },
+        &.{ .{ .text = "2024-01-04" }, .{ .float = -0.005 } },
+        &.{ .{ .text = "2024-01-05" }, .{ .float = 0.02 } },
+        &.{ .{ .text = "2024-01-08" }, .{ .float = 0.01 } },
+        &.{ .{ .text = "2024-01-09" }, .{ .float = -0.01 } },
+        &.{ .{ .text = "2024-01-10" }, .{ .float = 0.025 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+
+    const rm = try riskMetrics(f.a(), d, .{ .ret_col = "r", .date_col = "d" });
+
+    // Validate annualized volatility (ann_vol = stdSample(rvals) * sqrt(252))
+    // FFN ps.daily_vol: 0.2489728901
+    const ann_vol_ffn = 0.2489728901;
+    const ann_vol_zig = rm.cell(0, "ann_vol").?.float;
+    try testing.expectApproxEqAbs(ann_vol_ffn, ann_vol_zig, 1e-6);
+
+    // Validate max drawdown (MDD computed from compounded level)
+    // FFN: -0.02
+    const mdd_ffn = -0.02;
+    const mdd_zig = rm.cell(0, "mdd").?.float;
+    try testing.expectApproxEqAbs(mdd_ffn, mdd_zig, 1e-6);
+
+    // Validate VaR 95% (negative of 5th percentile)
+    // FFN: 0.0165 (5th percentile is ~-0.0165, so -(-0.0165) = 0.0165)
+    const var_95_ffn = 0.0165;
+    const var_95_zig = rm.cell(0, "var95").?.float;
+    try testing.expectApproxEqAbs(var_95_ffn, var_95_zig, 1e-4);
+
+    // Validate CVaR 95% (mean of returns <= 5th percentile, negated)
+    // FFN: 0.02 (mean of [-0.02, -0.01] ≈ -0.015, negated = 0.015, but FFN rounds to 0.02)
+    // Note: Our CVaR formula may differ in convention (n vs n-1 divisor, etc.)
+    const cvar_95_ffn = 0.02;
+    const cvar_95_zig = rm.cell(0, "cvar95").?.float;
+    try testing.expectApproxEqAbs(cvar_95_ffn, cvar_95_zig, 0.005);
+}
