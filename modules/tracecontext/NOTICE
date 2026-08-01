@@ -1,0 +1,108 @@
+tracecontext — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test-case data (request
+header name/value pairs and their pass/fail verdicts), hand-transcribed from
+third-party test methods since the upstream corpus is Python source, not a
+static data file.
+
+## w3c/trace-context — conformance test-suite cases
+
+`src/w3c_vectors.zig`'s `vectors` hand-transcribes the request-header/verdict
+data encoded in the W3C `trace-context` conformance suite's
+`test/test.py` (classes `TraceContextTest`, `AdvancedTest`,
+`TraceContext2Test`), published at https://github.com/w3c/trace-context,
+pinned at commit `acab820be9db7b3433668baa5cdd43f57f4c4be0` (`main` branch,
+2026-06-29):
+
+  * transcribed by hand into `src/w3c_vectors.zig` (one entry per
+    `self.make_single_request_and_get_tracecontext(...)`/`self.make_request(...)`
+    call in the cited `source_test`, since the suite itself is a live
+    two-way HTTP harness — Python `client.py`/`server.py` driving a running
+    vendor service and inspecting its outgoing headers — with no separate
+    JSON/CSV corpus file to `@embedFile`)
+  * driven mechanically by `src/w3c_conformance_test.zig` (the runner, which
+    replays each vector's headers through this module's own
+    `TraceContext` middleware over the offline `http.Server.serveStream`
+    wire harness already used by this module's hand-written tests, and
+    checks the resulting `traceparent`/`tracestate` against the vector's
+    verdict)
+
+Excluded from vendoring, deliberately (each `out_of_scope` vector is still
+counted by `w3c_conformance_test.zig`'s canary, never silently dropped — see
+its header comment for the full reasoning):
+
+  * forward-compatible parsing of `traceparent` versions other than `"00"`
+    (upstream's `test_traceparent_version_0xcc`): the spec's "Versioning of
+    traceparent" section uses SHOULD, not MUST, for this fallback parse, and
+    this module deliberately does not implement it — recorded as a scope
+    decision in `SPEC.md`'s Backlog, not a silent gap.
+  * strict tracestate list-member GRAMMAR (illegal key/value characters, the
+    256-char key cap, the 32-member cap): this module's tracestate
+    validation is a deliberate light byte-class guard over the whole
+    combined value, not a per-member parser (see `src/root.zig`'s
+    `isValidState` doc). Every excluded vector here comes from an upstream
+    test the suite itself gates behind `STRICT_LEVEL >= 2` — upstream
+    already treats this as an opt-in stricter tier, not its Level-1
+    baseline.
+  * session/connection-repetition tests (`AdvancedTest`): properties of a
+    stateful vendor HTTP service across several round trips, already
+    covered by this module's own pre-existing id-generation tests.
+  * Trace Context Level 2 (`TraceContext2Test`, the random-trace-id flag):
+    explicitly out of this module's documented Level-1-only scope, and
+    gated by the suite's own `SPEC_LEVEL >= 2` (off by default upstream).
+
+  Also excluded entirely, not vendored as vectors at all: `test/tracecontext/
+  test_traceparent.py`, `test_tracestate.py`, `traceparent.py`, `tracestate.py`
+  — these test the SUITE'S OWN Python helper classes
+  (`BaseTraceparent`/`Traceparent`/`Tracestate`), not wire-format conformance
+  of a vendor implementation; there is nothing in them to transcribe as a
+  request/verdict case.
+
+The suite's own terms (`LICENSE.md` at the pinned commit):
+
+    All Reports in this Repository are licensed by contributors under the
+    W3C Software and Document License (https://www.w3.org/Consortium/Legal/copyright-software).
+
+    All tests in this Repository are licensed by contributors to be distributed under the
+    W3C 3-clause BSD License (https://www.w3.org/Consortium/Legal/2008/03-bsd-license.html).
+
+`test/test.py` is a TEST, so the second license applies: the W3C 3-clause BSD
+License (in effect since 2008-08-20, derived from the OSI 3-clause BSD),
+copyright the W3C and its contributors:
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met: Redistributions of works must retain the original copyright notice,
+    this list of conditions and the following disclaimer. Redistributions in
+    binary form must reproduce the original copyright notice, this list of
+    conditions and the following disclaimer in the documentation and/or
+    other materials provided with the distribution. Neither the name of W3C
+    nor the names of its contributors may be used to endorse or promote
+    products derived from this work without specific prior written
+    permission. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+    CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING,
+    BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+    FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+    NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+    USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+    ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+    THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Only test-case TEXT (header values and their pass/fail verdicts) is
+reproduced. The implementation under test (`TraceContext.middleware`,
+`TraceParent.parse`, `isValidState`, `combinedHeader`, `singleHeader` in
+`src/root.zig`) is the authors' own (MIT), clean-room from the W3C Trace
+Context Level 1 recommendation itself (a public specification — see root
+`NOTICE` §2's existing `tracecontext` entry, which this file supplements,
+not replaces).

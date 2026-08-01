@@ -27,18 +27,40 @@ security tokens — do not rely on trace-id/span-id being unguessable; mint your
 accept it from a trusted upstream proxy) is the caller's network topology. Only Level 1 is
 implemented — no Level 2 (not yet published), no vendor-specific `tracestate` interpretation, no
 sampling-decision logic beyond forwarding/setting the `sampled` bit, no span export/collector
-integration (propagation only, not a tracer).
+integration (propagation only, not a tracer). `tracestate` validation is a deliberate light
+byte-class guard over the WHOLE combined value (non-empty, within `max_state_len`, printable
+ASCII + horizontal tab as OWS) — NOT a per-list-member grammar parser: no key charset/length
+checks, no 32-member cap, no duplicate-key detection. A tracing backend that needs those must do
+its own parsing; see the W3C conformance corpus's excluded `STRICT_LEVEL >= 2` vectors
+(`src/w3c_conformance_test.zig`) for exactly which upstream checks this stops short of.
+
+A `traceparent` version other than `"00"` is rejected outright (same as malformed input — a fresh
+trace is started) rather than attempting the spec's own "Versioning of traceparent" forward-compat
+fallback parse for higher versions (trust the fixed-position trace-id/parent-id/sampled-bit fields
+when the header is long enough and correctly delimited, even for a version this code doesn't
+understand). That spec section uses SHOULD, not MUST, for the fallback, so this is a conformant,
+deliberately simpler choice — but it does mean the W3C conformance suite's own
+`test_traceparent_version_0xcc` does not pass here; see the Backlog entry below and the excluded
+vectors in `src/w3c_conformance_test.zig`.
 
 ## Verification
-8 offline tests through `http.Server.serveStream`: valid incoming traceparent carried into the child
-(fresh span-id) with `current()` agreement, absent/malformed inputs start a fresh valid trace,
-`tracestate` passthrough, `echo=false`, parse/write round-trip, invalid inputs rejected (bad version,
-length, delimiter, uppercase hex, all-zero ids), `childOf` plus id uniqueness/non-zero generation.
-Run: `zig build test-tracecontext`.
+11 offline unit tests through `http.Server.serveStream`: valid incoming traceparent carried into the
+child (fresh span-id) with `current()` agreement, absent/malformed inputs start a fresh valid trace,
+duplicated-traceparent rejection, multi-instance `tracestate` combining + OWS handling, `echo=false`,
+parse/write round-trip, invalid inputs rejected (bad version, length, delimiter, uppercase hex,
+all-zero ids), `childOf` plus id uniqueness/non-zero generation. PLUS a vendored W3C `trace-context`
+conformance corpus (`src/w3c_vectors.zig` + `src/w3c_conformance_test.zig`; provenance in
+`../NOTICE`): 73 hand-transcribed request/verdict vectors from the suite's `test/test.py`, 58 driven
+both must-accept and must-reject through this module's own middleware, 15 excluded with a recorded
+reason apiece (a count canary fails loudly on unreclassified drift). Run: `zig build
+test-tracecontext`.
 
 ## Backlog / deferred
-None beyond the documented Level-2/vendor-tracestate/sampling-logic/
-tracer-export out-of-scope list above.
+- Forward-compatible parsing of `traceparent` versions other than `"00"` (see Threat model /
+  out of scope above) — a deliberate, spec-conformant (SHOULD-level) scope narrowing, not
+  implemented. Revisit if a real upstream actually emits a higher-version `traceparent`.
+- Otherwise none beyond the documented Level-2/vendor-tracestate/sampling-logic/
+  tracer-export out-of-scope list above.
 
 ## Status
 `gap · any · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in

@@ -23,7 +23,12 @@
 //!    hop — the child context of the incoming one.
 //! 2. If absent or malformed, **starts a new trace** (fresh trace-id + span-id,
 //!    flags from `sampled`).
-//! 3. Carries the opaque `tracestate` along unchanged (light validation only).
+//! 3. When (and only when) a trusted `traceparent` was continued in step 1,
+//!    carries the opaque `tracestate` along (light validation only; multiple
+//!    header instances are combined per RFC 9110 §5.3). A `tracestate`
+//!    arriving without a valid incoming `traceparent` is dropped outright —
+//!    per spec, a vendor that fails to parse `traceparent` MUST NOT attempt
+//!    to parse `tracestate`.
 //! 4. Exposes the current hop's context via `tracecontext.current()` (a
 //!    thread-local, like `requestid.current()`) and, when `echo` is set, writes
 //!    the outgoing `traceparent`/`tracestate` back on the response.
@@ -171,6 +176,11 @@ pub const TraceContext = struct {
 threadlocal var current_ctx: ?TraceParent = null;
 threadlocal var current_state: ?[]const u8 = null;
 threadlocal var out_buf: [TraceParent.header_len]u8 = undefined;
+// Scratch for combining multiple `tracestate` header instances (RFC 9110
+// §5.3 field order — see `combinedHeader`) before validation. Sized to
+// `max_state_len` since anything that would overflow it is dropped anyway
+// under the existing coarse length gate.
+threadlocal var state_buf: [max_state_len]u8 = undefined;
 threadlocal var counter: u64 = 0;
 
 /// The current hop's trace context, or null if no `TraceContext` middleware has
@@ -192,7 +202,11 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
     const incoming: ?TraceParent = blk: {
         if (!opt.trust_incoming) break :blk null;
-        const raw = ctx.req.header(opt.traceparent_header) orelse break :blk null;
+        // A duplicated traceparent is ambiguous (which of the two is the real
+        // parent?), so it is discarded exactly like an absent/malformed one —
+        // per the W3C conformance suite's `test_traceparent_duplicated`, NOT a
+        // normative sentence in the spec's traceparent section itself.
+        const raw = singleHeader(ctx.req, opt.traceparent_header) orelse break :blk null;
         break :blk TraceParent.parse(raw) catch null;
     };
 
@@ -202,10 +216,21 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         newTrace(if (opt.sampled) flag_sampled else 0);
     current_ctx = hop;
 
-    // tracestate passthrough: carry a valid value along unchanged (borrows the
-    // request head, stable for the response), else drop it.
+    // tracestate passthrough: the spec is explicit — "If the vendor failed to
+    // parse traceparent, it MUST NOT attempt to parse tracestate" (spec
+    // `20-http_request_header_format.md`, "Tracestate Header"; the W3C
+    // conformance suite's `test_tracestate_included_traceparent_missing`
+    // exercises exactly this). So without a trusted, successfully-parsed
+    // incoming traceparent, tracestate is dropped outright — there is no
+    // parent to correlate it with — regardless of how well-formed it looks.
+    // Otherwise: RFC 9110 §5.3 requires multiple same-name header instances
+    // to be combined (comma-joined, in wire order) before use — the spec's
+    // own "tracestate MAY be split into multiple header fields" text depends
+    // on this. Carry the combined value along unchanged when valid, else
+    // drop it.
     current_state = blk: {
-        const ts = ctx.req.header(opt.tracestate_header) orelse break :blk null;
+        if (incoming == null) break :blk null;
+        const ts = combinedHeader(ctx.req, opt.tracestate_header, &state_buf) orelse break :blk null;
         break :blk if (isValidState(ts)) ts else null;
     };
 
@@ -217,14 +242,58 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 }
 
 /// A `tracestate` is carried unchanged when non-empty, within `max_state_len`,
-/// and every byte is printable non-control ASCII (a light guard — full grammar
-/// validation is intentionally left to the tracing backend).
+/// and every byte is either printable non-control ASCII or horizontal tab
+/// (`\t`, part of the spec's `OWS` — optional whitespace legally surrounds
+/// list-members) — a light guard, full grammar validation is intentionally
+/// left to the tracing backend.
 fn isValidState(v: []const u8) bool {
     if (v.len == 0 or v.len > max_state_len) return false;
     for (v) |c| {
+        if (c == '\t') continue;
         if (c < 0x20 or c >= 0x7f) return false;
     }
     return true;
+}
+
+/// The value of header `name` only when it occurs EXACTLY once; null if
+/// absent OR duplicated. A single-valued header (`traceparent`) sent twice is
+/// ambiguous — neither occurrence can be trusted over the other — so it is
+/// treated the same as absent/malformed (see `middlewareRun`).
+fn singleHeader(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = req.iterateHeaders();
+    var found: ?[]const u8 = null;
+    while (it.next()) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+        if (found != null) return null; // duplicate — ambiguous, discard both
+        found = entry.value;
+    }
+    return found;
+}
+
+/// Every occurrence of header `name`, comma-joined in wire order into `buf`
+/// (RFC 9110 §5.3 field-order combining — `tracestate` MAY legally arrive as
+/// several header instances that must be combined before use). Returns null
+/// when absent, or when combining would overflow `buf` (the existing coarse
+/// `max_state_len` gate then drops it entirely, same as an over-long single
+/// header already did).
+fn combinedHeader(req: *const http.Server.Request, name: []const u8, buf: []u8) ?[]const u8 {
+    var it = req.iterateHeaders();
+    var len: usize = 0;
+    var any = false;
+    while (it.next()) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+        const piece = entry.value;
+        const sep_len: usize = if (any) 1 else 0;
+        if (len + sep_len + piece.len > buf.len) return null;
+        if (any) {
+            buf[len] = ',';
+            len += 1;
+        }
+        @memcpy(buf[len..][0..piece.len], piece);
+        len += piece.len;
+        any = true;
+    }
+    return if (any) buf[0..len] else null;
 }
 
 // ── id generation (portable, no OS entropy — see module doc) ─────────────────
@@ -330,7 +399,10 @@ const sample = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 const sample_trace = "4bf92f3577b34da6a3ce929d0e0e4736";
 const sample_span = "00f067aa0ba902b7";
 
-fn runWire(r: *router.Router, bytes: []const u8, out_buf_wire: []u8) []const u8 {
+// `runWire`/`headerValue` are `pub` (not just file-local) so the vendored
+// W3C-corpus runner (`w3c_conformance_test.zig`) can drive the same offline
+// wire harness instead of duplicating it.
+pub fn runWire(r: *router.Router, bytes: []const u8, out_buf_wire: []u8) []const u8 {
     var in: Reader = .fixed(bytes);
     var out: Writer = .fixed(out_buf_wire);
     var head_buf: [2048]u8 = undefined;
@@ -355,7 +427,7 @@ fn bodyOf(got: []const u8) []const u8 {
     return got[i + 4 ..];
 }
 
-fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
+pub fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
@@ -591,4 +663,10 @@ test "childOf keeps the trace and generated ids are unique / non-zero" {
     try testing.expect(!std.mem.eql(u8, &a, &b));
     try testing.expect(!isZero(&a));
     try testing.expect(!isZero(&newSpanId()));
+}
+
+// See w3c_conformance_test.zig / w3c_vectors.zig / NOTICE.
+test {
+    _ = @import("w3c_vectors.zig");
+    _ = @import("w3c_conformance_test.zig");
 }
