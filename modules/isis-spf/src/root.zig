@@ -354,6 +354,28 @@ fn insertReachLsp(
     _ = try db.insert(b.finish(), null, 0);
 }
 
+/// Like `insertReachLsp`, but the caller supplies the full 7-octet neighbour
+/// id (system-id + pseudonode octet) instead of a plain `SystemId` — needed to
+/// build fixtures that reference an actual LAN pseudonode (octet 6 != 0).
+fn insertReachLspRaw(
+    db: *lsdb.Lsdb,
+    origin: SystemId,
+    seq: u32,
+    reach: []const struct { nbr7: [7]u8, metric: u24 },
+) !void {
+    var buf: [512]u8 = undefined;
+    var b = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = .{ origin[0], origin[1], origin[2], origin[3], origin[4], origin[5], 0, 0 },
+        .sequence_number = seq,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    for (reach) |r| {
+        try isis.tlvs.addExtendedIsReach(&b.tlvs, r.nbr7, r.metric, &.{});
+    }
+    _ = try db.insert(b.finish(), null, 0);
+}
+
 fn cfgFor(local: SystemId) lsdb.Config {
     return .{ .local_system_id = local, .interface_count = 2, .capacity = 64 };
 }
@@ -542,6 +564,144 @@ test "old-style #2 IS reachability is extracted too" {
     var table = try compute(testing.allocator, &db, a, 0);
     defer table.deinit();
     try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 7 }, table.lookup(b).?);
+}
+
+// ── LAN pseudonode neighbour filter ──────────────────────────────────────────
+//
+// A LAN's designated IS (DIS) originates a pseudonode LSP whose LSP-ID has a
+// non-zero pseudonode octet (octet 6), and every router on the LAN — including
+// the DIS's own *real* LSP — advertises reachability to that pseudonode id,
+// not to each other directly (ISO 10589 §7.2.5 / RFC 1195). This module's
+// scope note (top of file) is explicit that LAN transit through the
+// pseudonode-as-zero-cost-vertex is NOT modelled here (deferred); the filter
+// at the two `neighbour_id[6] != 0` sites exists so that a reachability entry
+// *pointing at* a pseudonode is simply dropped rather than being silently
+// mistaken for a direct edge to whatever router happens to share the
+// pseudonode's first six octets (its DIS).
+//
+// A bare single-LAN fixture (three routers, one pseudonode, nothing else)
+// cannot distinguish "filter present" from "filter deleted": every non-DIS
+// router's entry collapses to an edge *into* the DIS, but the DIS's own
+// mirror entry collapses to a self-loop that `addDirected` already drops
+// unconditionally — so the two-way check fails identically whether or not the
+// filter runs, and the route table comes out empty either way (a green-
+// either-way trap). The fixture below adds one genuine, independently-two-way
+// point-to-point adjacency between the DIS and one LAN member, deliberately
+// costed *higher* than the LAN's advertised cost to the pseudonode. If the
+// filter is deleted, the cheap LAN-collapsed entry merges into the same
+// (from, to) directed key as the real P2P entry and `addDirected` keeps the
+// minimum — silently undercutting a real link's metric with a bogus one. That
+// corruption is exactly what the filter prevents, and it shows up as a wrong
+// `Route.metric`, not as a missing/extra route — so it survives even though
+// the edge exists (and is two-way-valid) in both cases.
+test "pseudonode neighbour filter (#22 extended): a LAN must not cheapen a real router adjacency" {
+    const d = sysId(0x50); // the LAN's DIS; owns the pseudonode
+    const x = sysId(0x10); // LAN member; also has a genuine, pricier P2P link to D
+    const y = sysId(0x90); // LAN-only member: no other connectivity, stays unreachable
+
+    const pn_d: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0x01 }; // D's pseudonode neighbour id
+    const d7: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0 };
+    const x7: [7]u8 = .{ x[0], x[1], x[2], x[3], x[4], x[5], 0 };
+
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(x));
+    defer db.deinit();
+
+    // The pseudonode's own LSP (LSP-ID octet 6 = 0x01): lists every attached
+    // router at cost 0, per ISO 10589. Included for fixture realism; this
+    // module's separate P2P-only *origin* filter (root.zig, `lsp.lsp_id[6] !=
+    // 0`) skips this LSP entirely regardless of the filter under test here.
+    {
+        var buf: [256]u8 = undefined;
+        var lb = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 1000,
+            .lsp_id = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0x01, 0 },
+            .sequence_number = 1,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        try isis.tlvs.addExtendedIsReach(&lb.tlvs, x7, 0, &.{});
+        try isis.tlvs.addExtendedIsReach(&lb.tlvs, d7, 0, &.{});
+        const y7: [7]u8 = .{ y[0], y[1], y[2], y[3], y[4], y[5], 0 };
+        try isis.tlvs.addExtendedIsReach(&lb.tlvs, y7, 0, &.{});
+        _ = try db.insert(lb.finish(), null, 0);
+    }
+
+    // X: reachability to the pseudonode (cheap, cost 5) AND a genuine,
+    // independent P2P adjacency to D (expensive, cost 100).
+    try insertReachLspRaw(&db, x, 1, &.{
+        .{ .nbr7 = pn_d, .metric = 5 },
+        .{ .nbr7 = d7, .metric = 100 },
+    });
+    // D: its own mirror reachability to the pseudonode (collapses to a
+    // self-loop; `addDirected` drops it) AND the reciprocal P2P to X.
+    try insertReachLspRaw(&db, d, 1, &.{
+        .{ .nbr7 = pn_d, .metric = 5 },
+        .{ .nbr7 = x7, .metric = 100 },
+    });
+    // Y: LAN-only — its sole advertisement is to the pseudonode.
+    try insertReachLspRaw(&db, y, 1, &.{
+        .{ .nbr7 = pn_d, .metric = 5 },
+    });
+
+    var table = try compute(testing.allocator, &db, x, 0);
+    defer table.deinit();
+
+    // Correct (filter present): the LAN contributes no edges at all. The only
+    // route is the real P2P adjacency to D, at its real cost (100) — NOT the
+    // LAN's cost (5). Y is unreachable (its one-way LAN advertisement never
+    // gets a reciprocal, regardless of this filter).
+    try testing.expectEqual(@as(usize, 2), table.routes.len);
+    try testing.expectEqual(Route{ .dest = x, .next_hop = x, .metric = 0 }, table.lookup(x).?);
+    try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 100 }, table.lookup(d).?);
+    try testing.expect(table.lookup(y) == null);
+}
+
+test "pseudonode neighbour filter (#2 old-style): a LAN must not cheapen a real router adjacency" {
+    const d = sysId(0x51);
+    const x = sysId(0x11);
+    const y = sysId(0x91);
+
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(x));
+    defer db.deinit();
+
+    const Entry = struct { origin: SystemId, seq: u32, reach: []const struct { nbr7: [7]u8, metric: u8 } };
+    const pn_d: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0x01 };
+    const d7: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0 };
+    const x7: [7]u8 = .{ x[0], x[1], x[2], x[3], x[4], x[5], 0 };
+    const entries = [_]Entry{
+        .{ .origin = x, .seq = 1, .reach = &.{ .{ .nbr7 = pn_d, .metric = 5 }, .{ .nbr7 = d7, .metric = 50 } } },
+        .{ .origin = d, .seq = 1, .reach = &.{ .{ .nbr7 = pn_d, .metric = 5 }, .{ .nbr7 = x7, .metric = 50 } } },
+        .{ .origin = y, .seq = 1, .reach = &.{.{ .nbr7 = pn_d, .metric = 5 }} },
+    };
+    for (entries) |e| {
+        var buf: [256]u8 = undefined;
+        var lb = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 1000,
+            .lsp_id = .{ e.origin[0], e.origin[1], e.origin[2], e.origin[3], e.origin[4], e.origin[5], 0, 0 },
+            .sequence_number = e.seq,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        var val: [128]u8 = undefined;
+        var n: usize = 1; // leading virtual flag, left 0
+        val[0] = 0;
+        for (e.reach) |r| {
+            val[n + 0] = r.metric;
+            val[n + 1] = 0x80;
+            val[n + 2] = 0x80;
+            val[n + 3] = 0x80;
+            @memcpy(val[n + 4 ..][0..7], &r.nbr7);
+            n += 11;
+        }
+        try lb.tlvs.addTlv(isis.tlvs.code.is_neighbours_lsp, val[0..n]);
+        _ = try db.insert(lb.finish(), null, 0);
+    }
+
+    var table = try compute(testing.allocator, &db, x, 0);
+    defer table.deinit();
+
+    try testing.expectEqual(@as(usize, 2), table.routes.len);
+    try testing.expectEqual(Route{ .dest = x, .next_hop = x, .metric = 0 }, table.lookup(x).?);
+    try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 50 }, table.lookup(d).?);
+    try testing.expect(table.lookup(y) == null);
 }
 
 test "robustness: a malformed reachability TLV is skipped; the valid rest still routes" {
