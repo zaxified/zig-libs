@@ -704,6 +704,80 @@ test "pseudonode neighbour filter (#2 old-style): a LAN must not cheapen a real 
     try testing.expect(table.lookup(y) == null);
 }
 
+// ── LAN pseudonode *origin*-side filter ──────────────────────────────────────
+//
+// The companion filter, at the OTHER site (root.zig, `lsp.lsp_id[6] != 0`,
+// near the top of the main LSP walk): it skips the pseudonode's *own* LSP
+// entirely, so that LSP never becomes a source of directed advertisements —
+// per ISO 10589 the pseudonode LSP lists every attached router at cost 0, and
+// without this filter it would let the LAN silently supply a bogus zero(ish)-
+// cost edge between whichever two attached routers, exactly like the
+// neighbour-side finding above but injected from the *origin* end instead of
+// the *neighbour* end of an entry.
+//
+// The fixture above (and bab3b37's) is blind to THIS filter for a subtly
+// different reason than the bare-LAN trap documented there: `computeWith`
+// picks its canonical undirected weight from the advertisement running from
+// the lexicographically-LOWER system-id to the higher one (`lo_hi`, see the
+// comment at its use site). In that fixture the DIS (0x50/0x51) is the
+// numerically-HIGHER id, so the canonical weight is always the untouched
+// member→DIS advertisement; corruption injected into the DIS's own outgoing
+// entry (which is what the pseudonode LSP, parsed as an origin, would add)
+// never gets selected. Reversing which endpoint is numerically lower flips
+// that: here the DIS is deliberately the LOWER id, so its outgoing entry IS
+// the canonical weight, and the pseudonode LSP's fake zero-cost entry to the
+// same neighbour lands directly on top of the real, expensive P2P metric via
+// `addDirected`'s min-merge — this is the origin-side counterpart to the
+// undercutting bab3b37 proved on the neighbour side.
+test "pseudonode ORIGIN filter: the pseudonode's own LSP must not itself supply a route" {
+    const d = sysId(0x10); // the LAN's DIS — a LOWER system-id than the member below
+    const x = sysId(0x50); // LAN member with a genuine, pricier P2P link to D
+
+    const pn_d: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0x01 }; // D's pseudonode id
+    const d7: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0 };
+    const x7: [7]u8 = .{ x[0], x[1], x[2], x[3], x[4], x[5], 0 };
+
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(x));
+    defer db.deinit();
+
+    // The pseudonode's own LSP (LSP-ID octet 6 = 0x01): lists X and D (itself)
+    // at cost 0, per ISO 10589. If the origin filter is disabled, this LSP is
+    // walked as if D originated it, injecting a fake D→X advertisement at the
+    // clamped-minimum cost of 1.
+    {
+        var buf: [256]u8 = undefined;
+        var lb = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 1000,
+            .lsp_id = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0x01, 0 },
+            .sequence_number = 1,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        try isis.tlvs.addExtendedIsReach(&lb.tlvs, x7, 0, &.{});
+        try isis.tlvs.addExtendedIsReach(&lb.tlvs, d7, 0, &.{}); // self; addDirected ignores it anyway
+        _ = try db.insert(lb.finish(), null, 0);
+    }
+
+    // D's own real LSP: the genuine, expensive P2P adjacency to X.
+    try insertReachLspRaw(&db, d, 1, &.{
+        .{ .nbr7 = pn_d, .metric = 5 }, // dropped by the neighbour-side filter regardless
+        .{ .nbr7 = x7, .metric = 100 },
+    });
+    // X: reciprocal P2P to D, plus its own LAN entry to the pseudonode.
+    try insertReachLspRaw(&db, x, 1, &.{
+        .{ .nbr7 = pn_d, .metric = 5 },
+        .{ .nbr7 = d7, .metric = 100 },
+    });
+
+    var table = try compute(testing.allocator, &db, x, 0);
+    defer table.deinit();
+
+    // Correct (origin filter present): the pseudonode LSP contributes nothing;
+    // D is reachable only via the real P2P link, at its real cost (100) — NOT
+    // the fake cost (1) the pseudonode LSP would otherwise inject.
+    try testing.expectEqual(@as(usize, 2), table.routes.len);
+    try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 100 }, table.lookup(d).?);
+}
+
 test "robustness: a malformed reachability TLV is skipped; the valid rest still routes" {
     const a = sysId(0xA);
     const b = sysId(0xB);
