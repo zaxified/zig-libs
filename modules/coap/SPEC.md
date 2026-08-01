@@ -66,6 +66,23 @@ an untrusted network is DTLS (peer authentication) terminated by the caller, fee
 `source_id` and `admit_fn` policy into `Registry.tryRegister`.
 
 ## Verification
+**External anchor (`external_goldens.zig`, +8 tests).** README/SPEC previously described this
+module as clean-room from RFC 7252 with no third-party CoAP source consulted — true, but every
+golden datagram and both end-to-end block/observe tests above were self-authored AND
+self-round-tripped, which cannot catch a convention that is wrong the same way on both sides of a
+pair (see the teeth-check on `Block.encode`/`decode`'s byte order in the file's own doc comment: a
+mutation invisible to every hand-built test here, including this file's own multi-byte-NUM
+round-trip, since it never leaves this module's own encoder/decoder pair). This anchor uses real
+`aiocoap` (0.4.17) datagrams from two independent real endpoints: a real `aiocoap-client` and a real
+`aiocoap.resource.Site` server — a plain GET, a full real 3-block Block2 GET reassembly, a real
+Block1 PUT with a genuine chained Block1+Size1 option delta, a real Observe registration followed by
+two genuinely live-pushed notifications (driving this module's own `Registry`/`Sequence` with the
+real sequence numbers), and a real multi-byte (2-byte) Block value from a 17-block transfer. A real,
+reported (non-bug) finding: `aiocoap-client` elides `Uri-Host` for a destination-matching IP literal
+(RFC 7252 §6.4 SHOULD); this module's `options.optionsFromUri` never elides it. See the file's doc
+comment for the full capture recipe and attribution (root `NOTICE` §0 — black-box oracle, no source
+consulted).
+
 `zig build test-coap` — 65 offline tests. Codec (7): golden-byte CON GET round-trip, extended
 option nibbles at the 13/269 boundaries, payload-marker edge cases, full parse/serialize error
 matrix, `encodedLen` agreement. Options (20): class bits, uint codec boundaries + round-trip, typed

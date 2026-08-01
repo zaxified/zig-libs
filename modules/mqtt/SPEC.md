@@ -105,6 +105,20 @@ targets the thread-per-connection `TcpServer`; the offline core remains single-o
 and fully socket-free for testing.
 
 ## Verification
+**External anchor (`external_goldens.zig`).** Every KAT below this point is hand-authored from the
+spec text and driven by a scripted fake peer — SPEC.md previously said mosquitto/Paho were
+"behavior references only" and were never run. They now have been: real `paho-mqtt` bytes talking
+to a real `amqtt` broker (both foreign) for a full CONNECT/SUBSCRIBE/PUBLISH-QoS-0/1/2/PING/
+DISCONNECT session, a retained-message round trip, and a Will/LWT delivery on ungraceful loss; this
+module's own `Client`, live, against real `amqtt` (QoS 0/1/2 + CONNECT-with-Will, byte-exact
+encoder reproduction plus real-broker decode); and this module's own `Broker`, live, against real
+`paho` (QoS 0/1 fan-out with the RETAIN bit correctly cleared on a live delivery — a case no prior
+offline test asserted — retain-before-subscribe, and the documented QoS-2-tears-the-connection-down
+behavior against a genuine client). A real, reported (not "fixed") finding: `amqtt` does not perform
+the spec 3.3.5 QoS-downgrade-on-delivery that this module's own `Broker` does. See the file's doc
+comment for capture provenance and attribution (root `NOTICE` §0 — black-box oracle, no source
+consulted).
+
 Client + codec offline tests — golden-byte KATs against
 the spec wire layout, every remaining-length varint boundary, a scripted fake broker driving full
 QoS 1/QoS 2 handshakes, DUP retransmit + receive dedup, keep-alive/ping timeout, packet-id wrap +

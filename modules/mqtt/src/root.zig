@@ -49,6 +49,7 @@ pub const packet = @import("packet.zig");
 pub const topic = @import("topic.zig");
 
 const client_mod = @import("client.zig");
+const external_goldens = @import("external_goldens.zig");
 
 pub const Client = client_mod.Client;
 pub const Transport = client_mod.Transport;
@@ -92,4 +93,5 @@ test {
     _ = topic;
     _ = client_mod;
     _ = broker;
+    _ = external_goldens;
 }

@@ -69,6 +69,8 @@ pub const block = @import("block.zig");
 /// "lollipop" freshness test (`isNewer`).
 pub const observe = @import("observe.zig");
 
+const external_goldens = @import("external_goldens.zig");
+
 // Flat convenience re-exports of the extensions' primary types.
 pub const Block = block.Block;
 pub const BlockAssembler = block.Assembler;
@@ -85,6 +87,7 @@ test {
     _ = server;
     _ = block;
     _ = observe;
+    _ = external_goldens;
 }
 
 /// CoAP version in the 2-bit Ver field (always 1 for RFC 7252).
