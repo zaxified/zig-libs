@@ -85,7 +85,7 @@ wireguard	A	MIXED	KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDE
 xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used	VECTOR:W3C XML Conformance Test Suite (xmlconf)	M	swap the modeled-on-xmlconf goldens for the actual xmlconf well-formed/not-wf files
 xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip	CLI:xmlsec1	M	verify() fixture self-constructed; C14N already externally anchored
 xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only	CLI:xmlsec1	M	no real external EncryptedAssertion fixture was available
-acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed	CLI:openssl	S	Extend existing openssl-fixture harness to parse the RFC8737 TLS-ALPN-01 DER extension
+acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed	DONE	-	DONE b830ef5: openssl-built TLS-ALPN-01 extension; provenance, not extra detection
 bitcointx	A	MIXED	BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector	DONE	-	DONE 4523b96: 7 -> 290 Core sighash.json rows, attribution added
 bls12_381	B	MIXED	IETF draft/py_ecc byte-exact KATs; KeyGen deliberately NOT KAT-verified, self round-trip only	NONE	-	VERIFIED: we do BLS-draft KeyGen, EIP-2333 is a DIFFERENT algorithm; no KAT exists (draft-07 App.B = TBA)
 csvstream	A	SELF	RFC 4180 reader/writer, hand-authored fixtures, no captured third-party CSVs	DONE	-	DONE 9ca8ed7: csv-spectrum 8/12 asserted, 1 fixture is itself broken upstream
@@ -95,11 +95,11 @@ genetlink	A	MIXED	offline goldens self-built; live nlctrl test vs real Linux ker
 icmp	A	MIXED	RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test	DONE	-	DONE a326e4a: 8 real fixtures via unprivileged netns capture; unreachable types named
 json5	A	SELF	hand-authored fixtures; deliberately partial subset, no json5.org test corpus used	DONE	-	DONE b8d7144: json5-tests corpus adopted, THREE real bugs fixed
 linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked examples cited	DONE	-	DONE 9ca8ed7: RFC 8288 3.5 worked examples transcribed, errata checked
-llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs	CAPTURE:live LLM API response	S	Existing test is unconditionally SkipZigTest; un-skip and capture one real SSE response
-lninvoice	A	MIXED	BOLT11/12 mostly externally anchored (bolts vectors); BOLT12 offer ENCODE round-trip self-constructed	CLI:bootstrap.bolt12.org decode API	S	Feed our BOLT12 offer encoding through the real public decoder, capture agreement
+llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs	DONE	-	DONE 88eda93: Anthropic published SSE example; S grade was WRONG (paid, nondeterministic)
+lninvoice	A	MIXED	BOLT11/12 mostly externally anchored (bolts vectors); BOLT12 offer ENCODE round-trip self-constructed	BLOCKED	M	BLOCKED: bootstrap.bolt12.org is NXDOMAIN from 4 resolvers; decode already anchored
 mcp	A	MIXED	sampling/elicitation lines byte-identical to spec's own JSON examples; init/tools/resources goldens + peer concept self-only (SPEC.md: "no external anchor")	DONE	-	DONE e3b4a52: 8 literal + 6 partial spec anchors, canary on the classification
 metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check	REDERIVED	M	PARTIAL d0e30ca: promtool NOT installed; in-house checker + official excerpt = middle tier
-netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips	CAPTURE:existing python-netconf live harness (NETCONF_TEST_SERVER)	S	capture rpc.zig wire bytes from the live py-netconf server already used for interop
+netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips	BLOCKED	M	BLOCKED: python netconf+sshutil absent, pip install not permitted; no packaged server either
 nftables	A	MIXED	native path anchored by captured real nft traffic; JSON builder path is self golden	DONE	-	DONE 5938bfc: 3 rules -> 13 across 4 chains; reject has no builder (documented gap)
 ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures	DONE	-	DONE 6c2d6d9: real DigiCert + GoDaddy responses captured; delegated responder now exercised
 ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data	DONE	-	DONE 6c2d6d9: same real CA fixtures; blind spot shown to propagate through the sibling
@@ -109,7 +109,7 @@ pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture	
 protobuf	A	MIXED	codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing	DONE	-	DONE e080479: live python oracle frozen into committed goldens, survives CI
 rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only	DONE	-	DONE a326e4a: real ARP + IPv4 frames off a veth pair (loopback cannot do ARP)
 rdap	A	SELF	RFC 7480-9224 JSON client; hand-authored fixtures, no captured registry resp	DONE	-	DONE ea2d000: real registry response; GDPR-redacted handle + nested entities
-security-headers	A	SELF	golden header fixtures hand-authored; helmet.js value read not executed - SELF	CLI:node + helmet.js (npm package)	S	actually run helmet.js and diff headers, instead of reading its source for values
+security-headers	A	SELF	golden header fixtures hand-authored; helmet.js value read not executed - SELF	DONE	-	DONE 88eda93: RFC 7034/6797 + OWASP lines byte-exact; full CSP stays self-anchored
 sntp	A	SELF	canned server-reply fixtures only; live query test always error.SkipZigTest	DONE	-	DONE d0e30ca: real time.google.com reply frozen; live test stays skipped by design
 tar	A	MIXED	read path: real GNU tar 1.35 golden header; write path only via skippable live tar test	DONE	-	DONE 23312c0: 5 real GNU tar archives frozen, write path anchored offline
 traceroute	A	MIXED	canned ICMP fixtures (SELF); loopback live test skips without CAP_NET_RAW	DONE	-	DONE 466cc70: real 2-hop veth router; Time Exceeded from a real TTL decrement
