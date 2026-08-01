@@ -1,0 +1,32 @@
+dns — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling `ocsp`/`rdap`/
+`whois` modules, which document the same live-capture reasoning).
+
+Provenance
+----------
+
+dns — clean-room implementation from RFC 1035 (message format), RFC 2782
+(SRV), RFC 3596 (AAAA/reverse), RFC 8484 (DoH) and RFC 8659 (CAA), modeled
+after the public behavior of Go's `net`/`x/net/dns/dnsmessage` and
+miekg/dns (see the module doc comments) — no third-party source was ported
+or copied.
+
+`modules/dns/src/goldens.zig` (added 2026-08-01) holds six real DNS
+responses captured live from Google Public DNS (`8.8.8.8`): `example.com`
+A/AAAA/TXT, a real `www.wikipedia.org` CNAME chain, a real `iana.org` MX
+answer set, and a real NXDOMAIN with its authority-section SOA — see that
+file's own doc comment for the exact capture recipe and what each response
+exercises that the hand-built goldens in `message.zig` do not (principally:
+real-server name-compression pointer placement).
+
+Attribution for the captured responses: NONE required, by the same
+reasoning `ocsp`'s `NOTICE` gives for its live CA captures (root NOTICE §0's
+black-box-oracle relationship): no third-party source or design was
+consulted, only the observable wire output of a public resolver answering a
+stock RFC 1035 query — protocol structure (dictated by the RFC) plus facts
+(IP addresses, TTLs, already-published hostnames), not copyrightable
+expression. No root NOTICE change accompanies this addition.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

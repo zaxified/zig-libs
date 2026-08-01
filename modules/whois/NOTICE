@@ -1,0 +1,33 @@
+whois — provenance note
+=======================
+
+Kept as a module-local NOTICE (same placement as the sibling `ocsp`/`dns`/
+`rdap` modules, which document the same live-capture reasoning).
+
+Provenance
+----------
+
+whois — clean-room implementation from RFC 3912 plus the documented IANA and
+registry line conventions; no third-party source was ported or copied.
+
+`modules/whois/src/goldens.zig` (added 2026-08-01) holds two real WHOIS
+replies captured live over port 43: IANA's answer for `com` (bare `\n` line
+endings) and Verisign's `.com` registry answer for `domain example.com`
+(real CRLF). See that file's own doc comment for the capture recipe and for
+what the real replies exercise that the hand-typed fixtures in `root.zig`
+could not — principally real line-ending and key-prefix shapes, and the
+genuine referral cycle that arises because `example.com` is IANA-reserved,
+so the registry's reply points back at `whois.iana.org`.
+
+Attribution for the captured replies: NONE required, by the same reasoning
+`ocsp`'s NOTICE gives for its live CA captures (root NOTICE §0's
+black-box-oracle relationship): no third-party source or design was
+consulted, only the observable port-43 output of public registries answering
+a stock RFC 3912 query — protocol structure plus already-published registry
+facts, not copyrightable expression. Registry boilerplate (the NOTICE and
+TERMS-OF-USE prose each reply carries) is retained verbatim in the captured
+bytes because a WHOIS reply is only a faithful fixture if it is unmodified;
+it is not asserted against and carries no condition this repository
+redistributes under. No root NOTICE change accompanies this addition.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

@@ -1,0 +1,32 @@
+rdap — provenance note
+=======================
+
+Kept as a module-local NOTICE (same placement as the sibling `ocsp`/`dns`/
+`whois` modules, which document the same live-capture reasoning).
+
+Provenance
+----------
+
+rdap — clean-room implementation from RFC 7480-7484 and their RFC 9082/9083
+renumbering (query URLs, response model, bootstrap). See `root.zig`'s
+module doc comment; no third-party RDAP implementation's source or design
+was consulted or copied.
+
+`modules/rdap/src/goldens.zig` (added 2026-08-01) holds one real RDAP
+domain response captured live from Public Interest Registry
+(`rdap.publicinterestregistry.org`, via the `rdap.org` RFC 7484 bootstrap
+redirect) for `iana.org` — see that file's own doc comment for the capture
+recipe and what it exercises (ICANN's GDPR "redacted" extension, nested
+entities, a missing top-level `handle`) that the hand-typed KATs in
+`root.zig` do not.
+
+Attribution for the captured response: NONE required, by the same reasoning
+`ocsp`'s `NOTICE` gives for its live CA captures (root NOTICE §0's
+black-box-oracle relationship): no third-party source or design was
+consulted, only the observable JSON output of a public registry answering a
+stock RDAP query over a public protocol (RFC 9082/9083) — protocol
+structure plus facts (nameserver names, dates, a registrar name already
+published in RDAP), not copyrightable expression. No root NOTICE change
+accompanies this addition.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

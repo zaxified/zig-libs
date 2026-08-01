@@ -785,3 +785,7 @@ fn fuzzParseServerRef(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
     _ = parseServerRef(buf[0..len]);
 }
+
+test {
+    _ = @import("goldens.zig");
+}

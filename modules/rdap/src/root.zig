@@ -1589,3 +1589,7 @@ fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
     var bootstrap = parseBootstrap(testing.allocator, buf[0..len]) catch return;
     bootstrap.deinit();
 }
+
+test {
+    _ = @import("goldens.zig");
+}

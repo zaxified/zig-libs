@@ -110,6 +110,7 @@ test {
     _ = message;
     _ = config;
     _ = Resolver;
+    _ = @import("goldens.zig");
 }
 
 test "reverseName: IPv4" {
