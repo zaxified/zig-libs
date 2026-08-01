@@ -300,6 +300,52 @@ test "round trip: a multiple service packet batches three tags in one exchange" 
     try testing.expectEqual(@as(usize, 0), paired.failures);
 }
 
+test "a multiple service packet larger than the reply table is refused, not truncated" {
+    var scada: [200]u8 = @splat(0);
+    var dint: [40]u8 = @splat(0);
+    var real: [20]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+
+    // One more embedded request than the adapter's fixed reply table
+    // (`Adapter.max_batch`) holds. Each is a harmless, side-effect-free
+    // `Get_Attributes_All` on Identity so the only thing under test is
+    // whether the batch itself is accepted or refused.
+    const over_cap = adapter.Adapter.max_batch + 1;
+    var storage: [over_cap][32]u8 = undefined;
+    var reqs: [over_cap][]const u8 = undefined;
+    for (0..over_cap) |i| {
+        reqs[i] = cip.getAttributesAll(@intFromEnum(cip.ClassCode.identity), 1, &storage[i]) catch unreachable;
+    }
+    var payload_buf: [1024]u8 = undefined;
+    const payload = cip.MultipleService.encode(&reqs, &payload_buf) catch unreachable;
+
+    var path_buf: [16]u8 = undefined;
+    const router_path = epath.logicalPath(
+        @intFromEnum(cip.ClassCode.message_router),
+        1,
+        null,
+        &path_buf,
+    ) catch unreachable;
+    var wire_buf: [2048]u8 = undefined;
+    const wire = (cip.Request{
+        .service = @intFromEnum(cip.Service.multiple_service_packet),
+        .path = router_path,
+        .data = payload,
+    }).encode(&wire_buf) catch unreachable;
+
+    var out: [4096]u8 = undefined;
+    const reply_bytes = try target.messageRouter(wire, &out);
+    const reply = try cip.Reply.decode(reply_bytes);
+
+    // A batch that cannot be fulfilled in full must come back as a CIP
+    // error. The old behaviour silently capped the batch and replied
+    // `success` with only `max_batch` embedded replies — indistinguishable
+    // on the wire from every request having been honored, which drops the
+    // request past the cap (e.g. a write) with no signal to the caller.
+    try testing.expectEqual(cip.GeneralStatus.too_much_data, reply.general_status);
+}
+
 test "round trip: a routed client and an adapter that unwraps the route" {
     var scada: [64]u8 = @splat(0);
     var dint: [8]u8 = @splat(0);

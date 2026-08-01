@@ -406,15 +406,28 @@ pub const Adapter = struct {
         return null;
     }
 
+    /// The number of embedded requests one `Multiple_Service_Packet` can
+    /// batch. Fixed so the reply table (`replies` below) stays a bounded
+    /// stack array rather than an unbounded allocation; a batch larger than
+    /// this is refused outright (see `multipleService`), never silently cut
+    /// down to this many.
+    pub const max_batch: usize = 16;
+
     fn multipleService(self: *Adapter, req: cip.Request, out: []u8, depth: usize) Error![]const u8 {
         const ms = cip.MultipleService.decode(req.data) catch
             return errorReply(req.service, .invalid_parameter_value, out);
-        var replies: [16][]const u8 = undefined;
+        // A batch that does not fit the reply table must be reported as an
+        // error, not silently truncated: a truncated-but-`success` reply
+        // makes a dropped embedded request (e.g. a write) invisible to the
+        // caller. `too_much_data` is this module's own convention for "more
+        // was supplied than this operation can hold" — see `writeTag`'s use
+        // of the same status when a write overruns its tag's storage.
+        if (ms.count > max_batch) return errorReply(req.service, .too_much_data, out);
+        var replies: [max_batch][]const u8 = undefined;
         var scratch: [4096]u8 = undefined;
         var used: usize = 0;
-        const n = @min(ms.count, replies.len);
         var i: usize = 0;
-        while (i < n) : (i += 1) {
+        while (i < ms.count) : (i += 1) {
             const embedded = ms.at(i) catch
                 return errorReply(req.service, .invalid_parameter_value, out);
             const r = try self.route(embedded, scratch[used..], depth + 1);
@@ -422,7 +435,7 @@ pub const Adapter = struct {
             used += r.len;
         }
         var payload: [4096]u8 = undefined;
-        const encoded = cip.MultipleService.encode(replies[0..n], &payload) catch
+        const encoded = cip.MultipleService.encode(replies[0..ms.count], &payload) catch
             return error.BufferTooSmall;
         return (cip.Reply{
             .service = req.service,
