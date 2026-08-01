@@ -30,6 +30,38 @@
 //! (traceroute's `*`). Hop count and probes per hop are bounded
 //! (`Options.validate`).
 //!
+//! **Real-capture anchor.** The canned-bytes tests below are hand-built RFC
+//! 792 shapes, never checked against a real kernel. A separate "real-capture
+//! goldens" section near the end of this file freezes bytes captured from an
+//! ACTUAL Linux network stack: a genuine Time Exceeded from a real forwarding
+//! router, a genuine Destination Host Unreachable from a real routing-table
+//! miss, and a genuine Echo Reply — all captured inside a throwaway,
+//! unprivileged `unshare --user --net` sandbox (two nested `unshare --net`
+//! namespaces joined by a veth pair, one of them doing real IPv4 forwarding
+//! with `net.ipv4.ip_forward=1`, entirely inside the sandbox's own user
+//! namespace). No sudo, no setcap, nothing on the host changed — every
+//! namespace and interface vanished when the capturing shell exited. This is
+//! the traceroute equivalent of the sibling `icmp` module's own real-capture
+//! section (see `../../icmp/src/echo.zig`), but goes one step further: that
+//! module's notes say time_exceeded needs "CAP_NET_RAW on the host itself"
+//! and calls it out of scope — a plain loopback send genuinely cannot
+//! produce it (loopback delivery never enters the kernel's *forwarding*
+//! path, so no TTL is ever decremented against a router). A second veth-
+//! connected namespace acting as a real one-hop router sidesteps that
+//! entirely: it is a real Linux router, forwarding real packets, decrementing
+//! a real TTL to zero — no elevated host privilege needed, only two more
+//! disposable namespaces. What is still NOT captured this way, and why: a
+//! load-balanced hop (would need >= 2 real parallel routers on the same TTL,
+//! not attempted), IPv6 (the topology above was only built for v4), and a
+//! path longer than one real hop (this module's per-hop classification logic
+//! is exercised identically regardless of hop count once one real hop is
+//! proven, so a longer chain would add sandbox complexity without covering
+//! any new code path). The existing loopback-gated live test below (`trace
+//! to 127.0.0.1`) remains a real-CAP_NET_RAW reachability smoke test on
+//! whatever host runs it, but by itself could only ever prove Echo Reply —
+//! never Time Exceeded or Destination Unreachable, which is exactly the gap
+//! the real-capture section closes offline.
+//!
 //! Basic usage (live; needs CAP_NET_RAW):
 //!
 //! ```zig
@@ -1013,6 +1045,163 @@ test "first_ttl offsets the hop window" {
     try testing.expectEqual(@as(u8, 2), tr.hops[0].ttl);
     try testing.expect(tr.hops[0].address().?.eql(router_b));
     try testing.expectEqual(@as(u8, 2), f.sent.items[0].ttl);
+}
+
+// ── real-capture goldens (veth 2-hop router sandbox, 2026-08-02) ───────────
+//
+// See this file's module doc comment ("Real-capture anchor") for the full
+// methodology and honest limitations. Summary: inside a throwaway, fully
+// unprivileged `unshare --user --net` sandbox, two more `unshare --net`
+// namespaces were joined by veth pairs into client -> router -> server, with
+// `net.ipv4.ip_forward=1` set in the router namespace (a real Linux router,
+// just confined to disposable interfaces). A raw ICMP socket in the client
+// namespace sent real echo-request probes (ident 0x7472 — this module's
+// `Options` default) and the bytes below are the UNMODIFIED replies a real
+// kernel sent back, IP header included (raw ICMP sockets deliver it, hence
+// `strip_ip_header = true` below, matching `LinuxTransport`'s own v4 setting).
+// No sudo, no setcap, no host-visible state: every interface and namespace
+// existed only for the life of the capturing shell.
+//
+//   - `real_time_exceeded_icmp`: probe sent with TTL=1 (seq=1) toward the
+//     server — the ROUTER's real forwarding code decremented TTL to zero and
+//     replied Time Exceeded from its own address (10.0.0.2). This is the
+//     genuine kernel forwarding path; a loopback send can never produce it
+//     (see the module doc comment).
+//   - `real_dest_unreachable_icmp`: probe sent (seq=2) to an address the
+//     router has an explicit `ip route add unreachable 10.0.2.0/24` for — a
+//     real routing-table miss, synthesized by the real Linux IP stack as
+//     Destination Host Unreachable (code 1), not by iptables/nftables.
+//   - `real_echo_reply_icmp`: probe sent (seq=3) straight to the server
+//     (10.0.1.2), which really answered with Echo Reply.
+//
+// All three verify byte-for-byte under this module's own `echo.checksum`
+// (see the count-canary test below) — the checksum is the KERNEL's, this
+// only confirms `checksum()` agrees it's zero, same cross-check style as the
+// sibling `icmp` module's real-capture section.
+
+const real_time_exceeded_icmp = [_]u8{
+    0x45, 0xc0, 0x00, 0x50, 0x0c, 0x10, 0x00, 0x00, 0x40, 0x01, 0x59, 0xdb, 0x0a, 0x00, 0x00, 0x02,
+    0x0a, 0x00, 0x00, 0x01, 0x0b, 0x00, 0xf4, 0xff, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x34,
+    0x4a, 0x59, 0x40, 0x00, 0x01, 0x01, 0x1a, 0x6e, 0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x01, 0x02,
+    0x08, 0x00, 0x83, 0x8c, 0x74, 0x72, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+const real_dest_unreachable_icmp = [_]u8{
+    0x45, 0xc0, 0x00, 0x50, 0x0c, 0xaa, 0x00, 0x00, 0x40, 0x01, 0x59, 0x41, 0x0a, 0x00, 0x00, 0x02,
+    0x0a, 0x00, 0x00, 0x01, 0x03, 0x01, 0xfc, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x34,
+    0x27, 0x9d, 0x40, 0x00, 0x40, 0x01, 0xfd, 0x26, 0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x02, 0x05,
+    0x08, 0x00, 0x83, 0x8b, 0x74, 0x72, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+const real_echo_reply_icmp = [_]u8{
+    0x45, 0x00, 0x00, 0x34, 0x6d, 0x9e, 0x00, 0x00, 0x3f, 0x01, 0xf9, 0x28, 0x0a, 0x00, 0x01, 0x02,
+    0x0a, 0x00, 0x00, 0x01, 0x00, 0x00, 0x8b, 0x8a, 0x74, 0x72, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+
+const real_router_addr = ip4(10, 0, 0, 2);
+const real_server_addr = ip4(10, 0, 1, 2);
+
+/// Minimal transport for the real-capture goldens: on each recv, hands back
+/// the NEXT captured packet verbatim — no synthesis, no recomputed checksum,
+/// nothing derived from this module's own encoder. `sendFn` is a no-op: the
+/// golden's whole value is the kernel's real reply, and the canned-bytes
+/// tests above already anchor this module's own request encoding.
+const ReplayTransport = struct {
+    packets: []const struct { bytes: []const u8, from: netaddr.Ip },
+    i: usize = 0,
+    clock: u64 = 0,
+
+    fn transport(r: *ReplayTransport) Transport {
+        return .{
+            .ctx = r,
+            .strip_ip_header = true, // real raw-socket capture includes the IP header
+            .sendFn = sendImpl,
+            .recvFn = recvImpl,
+            .nowFn = nowImpl,
+        };
+    }
+
+    fn sendImpl(_: *anyopaque, _: u8, _: []const u8) TransportError!void {}
+
+    fn nowImpl(ctx: *anyopaque) u64 {
+        const r: *ReplayTransport = @ptrCast(@alignCast(ctx));
+        r.clock += std.time.ns_per_ms;
+        return r.clock;
+    }
+
+    fn recvImpl(ctx: *anyopaque, buf: []u8, _: u64) TransportError!?Packet {
+        const r: *ReplayTransport = @ptrCast(@alignCast(ctx));
+        if (r.i >= r.packets.len) return null; // exhausted -> the caller times out
+        const p = r.packets[r.i];
+        r.i += 1;
+        if (p.bytes.len > buf.len) return error.RecvFailed;
+        @memcpy(buf[0..p.bytes.len], p.bytes);
+        return .{ .len = p.bytes.len, .from = p.from };
+    }
+};
+
+test "REAL CAPTURE: genuine kernel Time Exceeded, then genuine Destination Host Unreachable, from a live 2-hop router" {
+    try testing.expectEqual(@as(u16, 0), echo.checksum(real_time_exceeded_icmp[20..]));
+    try testing.expectEqual(@as(u16, 0), echo.checksum(real_dest_unreachable_icmp[20..]));
+
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &real_time_exceeded_icmp, .from = real_router_addr },
+        .{ .bytes = &real_dest_unreachable_icmp, .from = real_router_addr },
+    } };
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, .{
+        .max_hops = 2,
+        .probes_per_hop = 1,
+        .ident = 0x7472,
+        .seq_base = 1,
+        .timeout_ms = 500,
+    });
+    defer tr.deinit(testing.allocator);
+
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+    try testing.expectEqual(@as(?u8, 1), tr.unreachable_code); // real Host Unreachable
+
+    const hop1 = tr.hops[0].probes[0];
+    try testing.expectEqual(Probe.Kind.time_exceeded, hop1.kind);
+    try testing.expect(hop1.address.?.eql(real_router_addr));
+
+    const hop2 = tr.hops[1].probes[0];
+    try testing.expectEqual(Probe.Kind.dest_unreachable, hop2.kind);
+    try testing.expectEqual(@as(?u8, 1), hop2.code);
+    try testing.expect(hop2.address.?.eql(real_router_addr));
+}
+
+test "REAL CAPTURE: genuine kernel Echo Reply reaches the destination" {
+    try testing.expectEqual(@as(u16, 0), echo.checksum(real_echo_reply_icmp[20..]));
+
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &real_echo_reply_icmp, .from = real_server_addr },
+    } };
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, .{
+        .max_hops = 1,
+        .probes_per_hop = 1,
+        .ident = 0x7472,
+        .seq_base = 3,
+        .timeout_ms = 500,
+    });
+    defer tr.deinit(testing.allocator);
+
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
+    const hop1 = tr.hops[0].probes[0];
+    try testing.expectEqual(Probe.Kind.reply, hop1.kind);
+    try testing.expect(hop1.address.?.eql(real_server_addr));
+}
+
+test "REAL CAPTURE: fixture count + size canary — 3 real veth-router captures" {
+    // Pins fixture shapes so a future re-capture silently changing sizes
+    // (e.g. a kernel quoting more/less of the original datagram) doesn't
+    // slip by unnoticed.
+    try testing.expectEqual(@as(usize, 80), real_time_exceeded_icmp.len);
+    try testing.expectEqual(@as(usize, 80), real_dest_unreachable_icmp.len);
+    try testing.expectEqual(@as(usize, 52), real_echo_reply_icmp.len);
 }
 
 test "live: trace to 127.0.0.1 (skipped without CAP_NET_RAW)" {
