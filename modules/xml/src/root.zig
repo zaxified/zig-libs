@@ -439,14 +439,29 @@ const Parser = struct {
         if (!std.mem.eql(u8, ver, "1.0")) return error.UnsupportedVersion;
         version.* = ver;
 
-        self.skipWs();
+        // Grammar: XMLDecl ::= '<?xml' VersionInfo (S EncodingDecl)?
+        // (S SDDecl)? S? '?>' -- S is REQUIRED immediately before EncodingDecl
+        // or SDDecl when either is present, but only OPTIONAL before the
+        // final '?>' when neither follows. skipWs() alone can't tell those
+        // apart, so track whether whitespace was actually consumed and
+        // require it retroactively once we know what comes next (xmlconf
+        // not-wf-sa-096: `version="1.0"encoding="UTF-8"` must be rejected).
+        var had_ws = blk: {
+            const before = self.i;
+            self.skipWs();
+            break :blk self.i != before;
+        };
         if (self.starts("encoding")) {
+            if (!had_ws) return error.MalformedPI;
             const enc = try self.parsePseudoAttr("encoding");
             if (!asciiEqualIgnoreCase(enc, "utf-8")) return error.UnsupportedEncoding;
             encoding.* = enc;
+            const before = self.i;
             self.skipWs();
+            had_ws = self.i != before;
         }
         if (self.starts("standalone")) {
+            if (!had_ws) return error.MalformedPI;
             const sa = try self.parsePseudoAttr("standalone");
             if (std.mem.eql(u8, sa, "yes")) {
                 standalone.* = true;
@@ -549,7 +564,35 @@ const Parser = struct {
             const c = self.src[self.i];
             if (c == '[') {
                 self.i += 1;
-                while (!self.eof() and self.src[self.i] != ']') self.i += 1;
+                // A `]` inside a quoted literal (EntityValue/AttValue/
+                // ExternalID literal, e.g. `<!ENTITY rsqb "]">`) or inside a
+                // `<!-- comment -->` is NOT the internal subset's closing
+                // bracket -- naively stopping at the first raw `]` byte
+                // truncates the subset early and misparses everything after
+                // it as document content (xmlconf valid-sa-114/117/118: an
+                // entity value literally containing "]" or "]]"). Track
+                // quote state and skip comments wholesale so only an
+                // unquoted, uncommented `]` ends the subset.
+                var quote: ?u8 = null;
+                while (!self.eof()) {
+                    const cc = self.src[self.i];
+                    if (quote) |q| {
+                        if (cc == q) quote = null;
+                        self.i += 1;
+                    } else if (cc == '"' or cc == '\'') {
+                        quote = cc;
+                        self.i += 1;
+                    } else if (cc == '<' and self.starts("<!--")) {
+                        self.i += "<!--".len;
+                        while (!self.eof() and !self.starts("-->")) self.i += 1;
+                        if (self.eof()) return error.UnexpectedEof;
+                        self.i += "-->".len;
+                    } else if (cc == ']') {
+                        break;
+                    } else {
+                        self.i += 1;
+                    }
+                }
                 if (self.eof()) return error.UnexpectedEof;
                 self.i += 1; // ']'
             } else if (c == '>') {
@@ -586,6 +629,12 @@ const Parser = struct {
         self.i += 1;
         const target = try self.parseNameRaw();
         if (asciiEqualIgnoreCase(target, "xml")) return error.MalformedPI; // reserved
+        // Namespaces in XML 1.0 Section 8 (Namespace Constraints): "in XML
+        // documents conforming to this specification, no ... PI targets ...
+        // contain any colons." This module always applies namespace
+        // processing, so this NSC is enforced unconditionally (xmlconf
+        // rmt-ns10-042, errata NE08).
+        if (std.mem.indexOfScalar(u8, target, ':') != null) return error.NamespaceError;
         var data: []const u8 = "";
         if (!self.starts("?>")) {
             try self.requireWs();
@@ -637,10 +686,26 @@ const Parser = struct {
                 try out.append(self.a, '\n');
                 self.i += 1;
                 if (self.i < self.src.len and self.src[self.i] == '\n') self.i += 1;
-            } else {
+            } else if (c < 0x80) {
                 if (c < 0x20 and c != '\t' and c != '\n') return error.InvalidCharacter;
                 try out.append(self.a, c);
                 self.i += 1;
+            } else {
+                // Multi-byte UTF-8: the whole source was already validated as
+                // well-formed UTF-8 (parse()'s utf8ValidateSlice), but that
+                // says nothing about the XML Char production itself, which
+                // additionally excludes the Unicode noncharacters #xFFFE and
+                // #xFFFF (xmlconf not-wf-sa-166/167/171-174: a LITERAL
+                // (non-charref) #xFFFF/#xFFFE in content must still be
+                // rejected, same as the already-enforced numeric-charref
+                // path in decodeReference/isXmlChar).
+                const len = std.unicode.utf8ByteSequenceLength(c) catch return error.InvalidCharacter;
+                if (self.i + len > self.src.len) return error.InvalidCharacter;
+                const seq = self.src[self.i .. self.i + len];
+                const cp = std.unicode.utf8Decode(seq) catch return error.InvalidCharacter;
+                if (!isXmlChar(cp)) return error.InvalidCharacter;
+                try out.appendSlice(self.a, seq);
+                self.i += len;
             }
         }
         const text = try out.toOwnedSlice(self.a);
@@ -659,7 +724,11 @@ const Parser = struct {
         if (name.len == 0) return error.UndefinedEntity;
         if (name[0] == '#') {
             var cp: u32 = 0;
-            if (name.len >= 2 and (name[1] == 'x' or name[1] == 'X')) {
+            // CharRef ::= '&#' [0-9]+ ';' | '&#x' [0-9a-fA-F]+ ';' -- the 'x'
+            // introducing a hex reference is fixed lowercase in the grammar
+            // (hex digits themselves may be upper/lower); '&#X41;' is not-wf
+            // (xmlconf not-wf-sa-093).
+            if (name.len >= 2 and name[1] == 'x') {
                 if (name.len == 2) return error.InvalidCharRef;
                 for (name[2..]) |d| {
                     const v = hexVal(d) orelse return error.InvalidCharRef;
@@ -912,10 +981,21 @@ const Parser = struct {
                 try out.append(self.a, ' ');
                 self.i += 1;
                 if (self.i < self.src.len and self.src[self.i] == '\n') self.i += 1;
-            } else {
+            } else if (c < 0x80) {
                 if (c < 0x20) return error.InvalidCharacter;
                 try out.append(self.a, c);
                 self.i += 1;
+            } else {
+                // See parseText's identical branch: a well-formed-UTF-8 byte
+                // sequence can still decode to a codepoint the XML Char
+                // production forbids (#xFFFE, #xFFFF).
+                const len = std.unicode.utf8ByteSequenceLength(c) catch return error.InvalidCharacter;
+                if (self.i + len > self.src.len) return error.InvalidCharacter;
+                const seq = self.src[self.i .. self.i + len];
+                const cp = std.unicode.utf8Decode(seq) catch return error.InvalidCharacter;
+                if (!isXmlChar(cp)) return error.InvalidCharacter;
+                try out.appendSlice(self.a, seq);
+                self.i += len;
             }
         }
         if (self.eof()) return error.UnexpectedEof;
@@ -925,11 +1005,22 @@ const Parser = struct {
 
     fn validateChars(self: *Parser, s: []const u8) ParseError!void {
         _ = self;
-        // Reject control chars other than tab/LF/CR in comment/PI/CDATA bodies.
+        // Reject control chars other than tab/LF/CR, and Unicode
+        // noncharacters #xFFFE/#xFFFF, in comment/PI/CDATA bodies (XML Char
+        // production, XML §2.2).
         var idx: usize = 0;
-        while (idx < s.len) : (idx += 1) {
+        while (idx < s.len) {
             const c = s[idx];
-            if (c < 0x20 and c != '\t' and c != '\n' and c != '\r') return error.InvalidCharacter;
+            if (c < 0x80) {
+                if (c < 0x20 and c != '\t' and c != '\n' and c != '\r') return error.InvalidCharacter;
+                idx += 1;
+            } else {
+                const len = std.unicode.utf8ByteSequenceLength(c) catch return error.InvalidCharacter;
+                if (idx + len > s.len) return error.InvalidCharacter;
+                const cp = std.unicode.utf8Decode(s[idx .. idx + len]) catch return error.InvalidCharacter;
+                if (!isXmlChar(cp)) return error.InvalidCharacter;
+                idx += len;
+            }
         }
     }
 };
@@ -1228,6 +1319,65 @@ test "not-wf: char ref onto a forbidden control character is rejected" {
     defer space.deinit();
 }
 
+// The four regressions below were each found by running the vendored xmlconf
+// corpus (xmlconf_test.zig) during that corpus's own validation. The specific
+// xmlconf cases that caught them (xmltest not-wf-sa-093/096/166-174,
+// valid-sa-114/117/118) live in the James Clark `xmltest` sub-suite, which was
+// later excluded from vendoring entirely on license grounds (see NOTICE) — so
+// these hand-written regressions are what now pins each fix against silent
+// regression, in place of the xmlconf case that originally caught it.
+
+test "not-wf: hex char ref must use lowercase 'x' (uppercase 'X' rejected)" {
+    // CharRef ::= '&#' [0-9]+ ';' | '&#x' [0-9a-fA-F]+ ';' — the 'x' itself is
+    // fixed lowercase in the grammar; only the hex digits may vary case.
+    try testing.expectError(error.InvalidCharRef, parse(testing.allocator, "<a>&#X41;</a>", .{}));
+    var ok = try parse(testing.allocator, "<a>&#x41;</a>", .{});
+    defer ok.deinit();
+}
+
+test "not-wf: XMLDecl requires whitespace before encoding/standalone" {
+    // XMLDecl ::= '<?xml' VersionInfo (S EncodingDecl)? (S SDDecl)? S? '?>' —
+    // S is required immediately before EncodingDecl/SDDecl when present, but
+    // only optional before the final '?>' when neither follows.
+    try testing.expectError(error.MalformedPI, parse(testing.allocator, "<?xml version=\"1.0\"encoding=\"UTF-8\"?><a/>", .{}));
+    try testing.expectError(error.MalformedPI, parse(testing.allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"standalone=\"no\"?><a/>", .{}));
+    // No encoding/standalone at all: no whitespace required before '?>'.
+    var ok = try parse(testing.allocator, "<?xml version=\"1.0\"?><a/>", .{});
+    defer ok.deinit();
+}
+
+test "not-wf: literal noncharacter U+FFFE/U+FFFF rejected in text, attr value, comment, PI" {
+    // isXmlChar already excluded #xFFFE/#xFFFF for numeric character
+    // references (decodeReference), but plain text/attribute/comment/PI
+    // parsing only checked raw bytes < 0x20 and let any well-formed-UTF-8
+    // multi-byte sequence through unchecked — so a LITERAL (non-charref)
+    // U+FFFF in content slipped past every existing guard.
+    try testing.expectError(error.InvalidCharacter, parse(testing.allocator, "<a>\u{FFFF}</a>", .{}));
+    try testing.expectError(error.InvalidCharacter, parse(testing.allocator, "<a>\u{FFFE}</a>", .{}));
+    try testing.expectError(error.InvalidCharacter, parse(testing.allocator, "<a x=\"\u{FFFF}\"/>", .{}));
+    try testing.expectError(error.InvalidCharacter, parse(testing.allocator, "<a><!--\u{FFFF}--></a>", .{}));
+    try testing.expectError(error.InvalidCharacter, parse(testing.allocator, "<a><?pi \u{FFFF}?></a>", .{}));
+    // The adjoining valid boundary must still be accepted.
+    var ok = try parse(testing.allocator, "<a>\u{FFFD}</a>", .{});
+    defer ok.deinit();
+}
+
+test "doctype=.ignore: internal subset skip is quote- and comment-aware" {
+    // parseDoctype's `[ ... ]` skip used to stop at the FIRST raw ']' byte,
+    // even inside a quoted literal or a comment — so an internal subset
+    // containing e.g. `<!ENTITY rsqb "]">` truncated the subset early and
+    // misparsed everything after it as document content (TrailingContent),
+    // instead of skipping the whole subset and reaching &rsqb; as an
+    // (expected, unsupported) UndefinedEntity.
+    const quoted = "<!DOCTYPE doc [<!ELEMENT doc (#PCDATA)><!ENTITY rsqb \"]\">]><doc>&rsqb;</doc>";
+    try testing.expectError(error.UndefinedEntity, parse(testing.allocator, quoted, .{ .doctype = .ignore }));
+    const double_bracket = "<!DOCTYPE doc [<!ELEMENT doc (#PCDATA)><!ENTITY rsqb \"]]\">]><doc>&rsqb;</doc>";
+    try testing.expectError(error.UndefinedEntity, parse(testing.allocator, double_bracket, .{ .doctype = .ignore }));
+    const bracket_in_comment = "<!DOCTYPE doc [<!-- ] --><!ELEMENT doc (#PCDATA)>]><doc/>";
+    var ok = try parse(testing.allocator, bracket_in_comment, .{ .doctype = .ignore });
+    defer ok.deinit();
+}
+
 test "wf control: default-namespace undeclaration IS allowed" {
     var doc = try parse(testing.allocator, "<a xmlns=\"urn:d\"><b xmlns=\"\"/></a>", .{});
     defer doc.deinit();
@@ -1414,4 +1564,10 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 
     var doc = parse(testing.allocator, buf[0..len], .{}) catch return;
     doc.deinit();
+}
+
+// ── vendored W3C XML Conformance Test Suite (xmlconf) ────────────────────────
+// See xmlconf_test.zig / xmlconf_vectors.zig / NOTICE.
+test {
+    _ = @import("xmlconf_test.zig");
 }

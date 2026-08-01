@@ -1,0 +1,165 @@
+xml — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT (a small slice of the W3C XML
+Conformance Test Suite) whose copyright notices must be preserved in any copy.
+Redistributing this module — alone or as part of zig-libs — must keep this
+file with it. This adds no condition beyond MIT's own: it is the same
+"preserve the notice" requirement already applied elsewhere in this repository
+(see e.g. `modules/csvstream/NOTICE`, `modules/json5/NOTICE`), owed here to
+several different authors. No third-party SOURCE CODE is present — only test
+fixtures (tiny standalone XML documents whose only content is markup, plus a
+one-line English description each).
+
+## W3C XML Conformance Test Suite (xmlconf) — a license-filtered slice
+
+The vendored fixtures reproduce a subset of the official W3C XML Conformance
+Test Suite, release `xmlts20080827.zip`
+(https://www.w3.org/XML/Test/xmlts20080827.zip, published 2008-08-27, the
+release current as of this vendoring), whose overall manifest is
+`xmlconf/xmlconf.xml`. That manifest aggregates SEVERAL independently
+copyrighted sub-suites contributed by different organizations over the life
+of the XML Core Working Group's conformance effort; their terms are NOT
+uniform, so each is accounted for separately below rather than treated as one
+blanket grant.
+
+  * vendored verbatim under `src/testdata/xmlconf/` (130 fixture files,
+    grouped by originating sub-suite: `sun-valid/`, `sun-not-wf/`,
+    `ibm-valid/`, `ibm-not-wf/`, `eduni-ns10/`)
+  * driven mechanically by `src/xmlconf_vectors.zig` (one entry per file,
+    `@embedFile`d, tagged `reject`/`accept` by the manifest's own TYPE) and
+    `src/xmlconf_test.zig` (the runner)
+
+### Sub-suites vendored, with their own terms
+
+  * **Sun Microsystems** (`sun-valid/`, `sun-not-wf/` — from xmlconf's
+    `sun/sun-valid.xml` and `sun/sun-not-wf.xml`): each file's own header
+    reads verbatim:
+
+        Copyright 1998 by Sun Microsystems, Inc.
+        All Rights Reserved.
+
+    No further restriction is stated in the file. Sun contributed this
+    sub-suite to the W3C XML Conformance Test Suite specifically so that,
+    per the suite's own public landing page (https://www.w3.org/XML/Test/,
+    "Overview"), "Implementors [are] encouraged to write a harness around
+    these tests to test their implementation for XML conformance" — exactly
+    the use made of it here.
+
+  * **IBM Corp.** (`ibm-valid/`, `ibm-not-wf/` — from xmlconf's
+    `ibm/ibm_oasis_valid.xml` and `ibm/ibm_oasis_not-wf.xml`): each file's own
+    header reads verbatim:
+
+        (C) Copyright IBM Corp. 2000  All rights reserved.
+
+        US Government Users Restricted Rights Use, duplication or
+        disclosure restricted by GSA ADP Schedule Contract with IBM Corp.
+
+        The program is provided "as is" without any warranty express or
+        implied, including the warranty of non-infringement and the implied
+        warranties of merchantibility and fitness for a particular purpose.
+        IBM will not be liable for any damages suffered by you as a result
+        of using the Program. In no event will IBM be liable for any
+        special, indirect or consequential damages or lost profits even if
+        IBM has been advised of the possibility of their occurrence. IBM
+        will not be liable for any third party claims against you.
+
+    This is a warranty disclaimer, not a redistribution grant, but IBM (via
+    Karin Donker, per the suite's own Contributors list) submitted this
+    sub-suite to the same public W3C conformance effort and for the same
+    stated purpose as Sun's above; it carries no restriction narrower than
+    that context.
+
+  * **Richard Tobin / University of Edinburgh** (`eduni-ns10/` — from
+    xmlconf's `eduni/namespaces/1.0/rmt-ns10.xml`, "Richard Tobin's XML
+    Namespaces 1.0 test suite 14 Feb 2003"): no per-file copyright header at
+    all; contributed to the same W3C effort (Henry S. Thompson / Richard
+    Tobin, University of Edinburgh, per the Contributors list) under the same
+    public-conformance-suite context as the two above.
+
+  * **NIST/OASIS** (`oasis/oasis.xml`): read and considered, but contributes
+    ZERO files to the vendored set (every one of its TEST entries fell into
+    an excluded category below), so no attribution is owed for it — noted
+    here only so the accounting above is legibly complete.
+
+### Sub-suite excluded entirely on LICENSE grounds (not scope)
+
+  * **James Clark's `xmltest` sub-suite** (xmlconf's largest single
+    contributor — `xmltest/xmltest.xml`, and the largest source of
+    candidate not-wf and valid cases during this vendoring) is EXCLUDED IN
+    FULL, even though it is squarely in this module's technical scope. Its
+    own `xmltest/readme.html` states, verbatim:
+
+        Copyright (C) 1998 James Clark.  All rights reserved.  Permission is
+        granted to copy and modify this collection in any way for internal use
+        within a company or organization.  Permission is granted to
+        redistribute the file xmltest.zip containing this collection to third
+        parties provided that no modifications of any kind are made to this
+        file.  Note that permission to distribute the collection in any other
+        form is not granted.
+
+    Vendoring an extracted, filtered, re-packaged subset (which is what every
+    other module's testdata/ directory in this repository does) is
+    redistribution "in [an]other form" than the unmodified `xmltest.zip` —
+    explicitly outside what this text grants, however permissive the rest of
+    xmlconf is and however common it is elsewhere to see `xmltest` cases
+    embedded piecemeal in other projects' test suites. No `xmltest`-derived
+    file is present anywhere under `src/testdata/xmlconf/`.
+
+### Accounting
+
+xmlconf's `xmlconf.xml` manifest lists 1377 TEST entries across the
+sub-suites actually parsed for this vendoring (xmltest, sun-valid,
+sun-not-wf, ibm-valid, ibm-not-wf, oasis, eduni namespaces-1.0 + its
+errata-1e addendum). Of those, 130 are vendored (25 not-wf "reject" cases +
+105 valid "accept" cases); the rest are excluded, each with a specific reason
+recorded mechanically as each is classified (see `xmlconf_test.zig`'s module
+comment for the categories and `xmlconf_vectors.zig`'s canary test for the
+exact counts). In descending order of how much they excluded:
+
+  * DOCTYPE-bearing not-wf case (894 of the pre-xmltest-exclusion total, most
+    of which were themselves inside `xmltest`): this module's default policy
+    (`doctype = .reject`) rejects ANY `<!DOCTYPE>` before ever looking at what
+    is wrong inside it, so a not-wf case whose labeled defect lives in the
+    DTD would "pass" trivially without exercising that defect at all.
+  * `xmltest` sub-suite (359 entries): license, see above.
+  * valid case's DOCTYPE has an external subset (70): no filesystem/network
+    access exists in this parser by construction (see README "Hardening").
+  * valid case declares a custom GENERAL entity, directly or indirectly via
+    parameter-entity expansion (66 + 1): this module never supports
+    user-defined entities, by design (the billion-laughs guard) — under
+    `doctype = .ignore` the entire internal subset is skipped unparsed, so
+    any later reference to a declared-but-unsupported entity fails as
+    `UndefinedEntity`. (xmlconf's own `ENTITIES` manifest attribute turned out
+    NOT to reliably predict this — several `ENTITIES="none"` cases, e.g.
+    `valid-sa-023`, still declare-and-use a custom entity — so this is
+    detected directly from each file's own DOCTYPE content, not trusted from
+    the manifest attribute.)
+  * `type="invalid"` (21): a DTD *validity* constraint — this is a
+    non-validating parser by design (see README "Out of scope").
+  * `type="error"` (5): xmlconf's own "error" category is explicitly an
+    OPTIONAL condition an XML processor "must" not necessarily detect
+    (deprecated/ambiguous constructs), not a well-formedness requirement.
+  * XML/Namespaces 1.1 cases: this module is XML 1.0 (+ Namespaces 1.0) only.
+  * wide/multi-byte-NUL (e.g. UTF-16) encoded cases: UTF-8 only, no
+    transcoding (all such cases in this parse happened to be inside the now
+    wholly-excluded `xmltest`, so this bucket is empty in the FINAL count, but
+    the check remains in the vendoring script for any future re-vendor).
+  * one bare-colon-Name case (`xmltest`'s `valid-sa-012`, now moot — already
+    covered by the blanket `xmltest` exclusion above, but named individually
+    in the vendoring script because it is its OWN scope boundary: mandatory
+    Namespaces-in-XML processing rejects a bare `:` as a whole Name, which
+    plain (non-namespace) XML 1.0 permits) and one indirect-entity case
+    (`sun-valid`'s `v-pe02`, NOT in `xmltest` — excluded on its own merits:
+    it builds a general entity declaration indirectly through
+    parameter-entity expansion inside the DTD, invisible to both static file
+    inspection and this module's design, which never processes parameter
+    entities either).
+
+Only test-fixture text (tiny hand-written-looking XML snippets and their
+one-line English descriptions, copied verbatim from the sub-suites above) is
+reproduced. The implementation under test (`parse` and friends in
+`src/root.zig`) is the authors' own (MIT); its design references (W3C XML 1.0
+5th ed., Namespaces in XML 1.0 3rd ed., OWASP XXE guidance) are recorded in
+`SPEC.md`, not as a condition.
