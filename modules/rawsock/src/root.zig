@@ -703,6 +703,76 @@ test "arp build/parse round-trip (surfaces netaddr.Ip)" {
     try testing.expect(got.ip.eql(.{ .v4 = target_ip }));
 }
 
+// ── real-capture goldens (veth pair, tcpdump, 2026-08-01) ───────────────────
+//
+// The round-trip test above only ever parses this module's *own* encoder
+// output — a hand-computed fixture never checked against a real kernel or a
+// real L2 segment. Loopback can't fill that gap: `lo` never does ARP (local
+// delivery skips neighbor resolution entirely, and it has no real hwaddr).
+// So this is captured off a genuine layer-2 segment instead: a veth pair,
+// each end moved into its own network namespace (`ip link set <dev> netns
+// <pid>` across two nested `unshare --net` children sharing one throwaway
+// `unshare --user --net` owner) — this is the only way to get real ARP
+// resolution without touching the host (no setcap, no persistent interface,
+// the whole namespace tree is torn down when the owning process exits).
+// `tcpdump -i veth1` captured a real `ping` between the two ends: kernel-
+// assigned random MACs, a genuine ARP who-has/is-at exchange, and (as a
+// bonus) the resulting Ethernet+IPv4+ICMP frames.
+//
+// This anchors real Ethernet framing (real MACs, not `aa:bb:cc:dd:ee:ff`)
+// and the real ARP wire layout independently of `buildRequest`/`parseReply`
+// agreeing with themselves.
+
+const arp_request_frame = [_]u8{
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x98, 0xd4, 0x25, 0xce, 0x67, 0x08, 0x06, 0x00, 0x01,
+    0x08, 0x00, 0x06, 0x04, 0x00, 0x01, 0x02, 0x98, 0xd4, 0x25, 0xce, 0x67, 0x0a, 0x37, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x37, 0x00, 0x02,
+};
+const arp_reply_frame = [_]u8{
+    0x02, 0x98, 0xd4, 0x25, 0xce, 0x67, 0xba, 0x89, 0xdd, 0xc5, 0x71, 0x9a, 0x08, 0x06, 0x00, 0x01,
+    0x08, 0x00, 0x06, 0x04, 0x00, 0x02, 0xba, 0x89, 0xdd, 0xc5, 0x71, 0x9a, 0x0a, 0x37, 0x00, 0x02,
+    0x02, 0x98, 0xd4, 0x25, 0xce, 0x67, 0x0a, 0x37, 0x00, 0x01,
+};
+// A real Ethernet+IPv4+ICMP frame from the same exchange, for EthHeader.
+const ip_echo_request_frame = [_]u8{
+    0xba, 0x89, 0xdd, 0xc5, 0x71, 0x9a, 0x02, 0x98, 0xd4, 0x25, 0xce, 0x67, 0x08, 0x00, 0x45, 0x00,
+    0x00, 0x54, 0x1c, 0x75, 0x40, 0x00, 0x40, 0x01, 0x09, 0xc4, 0x0a, 0x37, 0x00, 0x01, 0x0a, 0x37,
+    0x00, 0x02, 0x08, 0x00, 0x99, 0xc5, 0xa0, 0x5b, 0x00, 0x01, 0x42, 0xe0, 0x6d, 0x6a, 0x00, 0x00,
+    0x00, 0x00, 0x42, 0xc0, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+    0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+    0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+    0x36, 0x37,
+};
+
+test "golden: real capture — EthHeader.parse on a real ARP request frame" {
+    const eth = EthHeader.parse(&arp_request_frame).?;
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, &eth.dst);
+    try testing.expectEqualSlices(u8, &.{ 0x02, 0x98, 0xd4, 0x25, 0xce, 0x67 }, &eth.src);
+    try testing.expectEqual(eth_p.arp, eth.ethertype);
+}
+
+test "golden: real capture — EthHeader.parse on a real IPv4 frame" {
+    const eth = EthHeader.parse(&ip_echo_request_frame).?;
+    try testing.expectEqualSlices(u8, &.{ 0xba, 0x89, 0xdd, 0xc5, 0x71, 0x9a }, &eth.dst);
+    try testing.expectEqualSlices(u8, &.{ 0x02, 0x98, 0xd4, 0x25, 0xce, 0x67 }, &eth.src);
+    try testing.expectEqual(eth_p.ip, eth.ethertype);
+}
+
+test "golden: real capture — arp.parseReply on a real who-has/is-at exchange" {
+    // The request is not a reply — a real one, not a synthesized one.
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&arp_request_frame));
+
+    const got = arp.parseReply(&arp_reply_frame).?;
+    try testing.expect(got.ip.eql(.{ .v4 = .{ 10, 55, 0, 2 } }));
+    try testing.expectEqualSlices(u8, &.{ 0xba, 0x89, 0xdd, 0xc5, 0x71, 0x9a }, &got.mac);
+}
+
+test "golden: real-capture fixture count + size canary — 3 real veth-pair captures" {
+    try testing.expectEqual(@as(usize, 42), arp_request_frame.len);
+    try testing.expectEqual(@as(usize, 42), arp_reply_frame.len);
+    try testing.expectEqual(@as(usize, 98), ip_echo_request_frame.len);
+}
+
 // ── fuzz: frame-off-the-wire parsers, never panic ──────────────────────────
 //
 // `EthHeader.parse`, `parseHwaddr` and `arp.parseReply` are the three pure

@@ -48,7 +48,11 @@ Root-free tests (pure helpers, `sockaddr_ll` decode, BPF encoding, struct ABI si
 never-panic checks) always run; the two socket tests need `CAP_NET_RAW` and `SkipZigTest`
 without it. Under an unprivileged network namespace where root has the capability
 (`unshare -rn zig build test-rawsock`) all tests pass, including open/filter/promisc and an
-inject→capture loopback round-trip on `lo`. Run:
+inject→capture loopback round-trip on `lo`. Also real-capture goldens: a genuine ARP who-has/
+is-at exchange and Ethernet+IPv4 framing captured with `tcpdump` off a real layer-2 segment — a
+veth pair with each end in its own throwaway network namespace (`lo` never does ARP, so it can't
+anchor this; a real L2 segment is required) — anchoring real Ethernet framing and the ARP wire
+layout independently of `buildRequest`/`parseReply` agreeing with themselves. Run:
 `zig build test-rawsock` (add `-Doptimize=ReleaseFast` for the release check; `unshare -rn` prefix
 for the full socket path).
 

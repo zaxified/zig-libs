@@ -30,7 +30,14 @@ and any anti-spoofing token.
 ## Verification
 Offline: RFC 1071 checksum goldens (vector + wire-byte goldens v4/v6, comptime + property
 variants), build→parse round trips, error-quote parsing, fuzzed parsers (never panic on garbage),
-scheduler/pacing units, seqmap correlation. Integration: pings `127.0.0.1` / `::1` end-to-end and
+scheduler/pacing units, seqmap correlation. Also real-capture goldens (`echo.zig`): genuine echo
+request/reply (v4+v6), ICMP timestamp request/reply, and dest-unreachable-quoting-UDP bytes
+captured off a real Linux kernel via `tcpdump -i lo` inside a throwaway unprivileged network
+namespace — anchoring the wire layout and the kernel's own checksum arithmetic independently of
+this module's `checksum()`. `source_quench`/`redirect`/`param_problem`/`time_exceeded` (v4) and
+`time_exceeded`/`packet_too_big` (v6) aren't reachable that way (no reachable Linux path still
+emits the first three; the rest need a real forwarding router or path-MTU condition) and remain
+hand-computed from RFC 792/4443. Integration: pings `127.0.0.1` / `::1` end-to-end and
 asserts a correlated reply with plausible RTT, skipped via `error.SkipZigTest` when no ICMP socket
 can be opened. Run: `zig build test-icmp`.
 

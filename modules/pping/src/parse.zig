@@ -180,6 +180,52 @@ test "parseTcpTimestamps: huge declared length (255) on a short buffer -> null, 
     try testing.expectEqual(@as(?Timestamps, null), parseTcpTimestamps(&bytes));
 }
 
+// ── real-capture goldens (loopback TCP handshake, tcpdump, 2026-08-01) ─────
+//
+// Every fixture above this point is a hand-built options blob — plausible,
+// but never checked against what a real TCP stack actually puts on the
+// wire. These two are the raw TCP options bytes from a genuine SYN and
+// SYN-ACK of one real loopback TCP connection (a Python client/server),
+// captured with `tcpdump -i lo` inside a throwaway, unprivileged
+// `unshare --user --net` namespace (CAP_NET_RAW exists only inside that
+// disposable namespace — no host capability change, no setcap, nothing
+// persistent). They anchor the option *ordering* a real stack actually
+// uses (MSS, SACK-permitted, Timestamps, NOP, Window-scale — not the
+// bare-option or single-other-option shapes every hand-built fixture above
+// picks) and a real, correlated tsval/tsecr pair (the SYN-ACK's tsecr
+// really is the SYN's tsval — an RTT-computation input, not just a parser
+// input).
+const syn_tcp_options = [_]u8{
+    0x02, 0x04, 0xff, 0xd7, 0x04, 0x02, 0x08, 0x0a, 0xbd, 0x38, 0x76, 0xfd, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x03, 0x03, 0x0a,
+};
+const synack_tcp_options = [_]u8{
+    0x02, 0x04, 0xff, 0xd7, 0x04, 0x02, 0x08, 0x0a, 0x0a, 0xb3, 0xb7, 0xd4, 0xbd, 0x38, 0x76, 0xfd,
+    0x01, 0x03, 0x03, 0x0a,
+};
+
+test "golden: real capture — SYN options from a genuine loopback TCP handshake" {
+    // options: [mss 65495, sackOK, TS val 3174594301 ecr 0, nop, wscale 10]
+    const ts = parseTcpTimestamps(&syn_tcp_options).?;
+    try testing.expectEqual(@as(u32, 3174594301), ts.tsval);
+    try testing.expectEqual(@as(u32, 0), ts.tsecr);
+}
+
+test "golden: real capture — SYN-ACK options echo the SYN's tsval as tsecr" {
+    // options: [mss 65495, sackOK, TS val 179550164 ecr 3174594301, nop, wscale 10]
+    const ts = parseTcpTimestamps(&synack_tcp_options).?;
+    try testing.expectEqual(@as(u32, 179550164), ts.tsval);
+    // The real, kernel-computed correlation this module's whole RTT
+    // computation depends on: the peer's tsecr genuinely is our tsval.
+    const syn_ts = parseTcpTimestamps(&syn_tcp_options).?;
+    try testing.expectEqual(syn_ts.tsval, ts.tsecr);
+}
+
+test "golden: real-capture fixture count + size canary — 2 real loopback captures" {
+    try testing.expectEqual(@as(usize, 20), syn_tcp_options.len);
+    try testing.expectEqual(@as(usize, 20), synack_tcp_options.len);
+}
+
 // ── fuzz-style: hostile random input never reads out of bounds / never panics ──
 
 /// Deterministic 64-bit LCG (Knuth MMIX constants), same construction
