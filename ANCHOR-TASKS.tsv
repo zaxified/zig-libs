@@ -89,9 +89,9 @@ acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encodi
 bitcointx	A	MIXED	BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector	DONE	-	DONE 4523b96: 7 -> 290 Core sighash.json rows, attribution added
 bls12_381	B	MIXED	IETF draft/py_ecc byte-exact KATs; KeyGen deliberately NOT KAT-verified, self round-trip only	NONE	-	VERIFIED: we do BLS-draft KeyGen, EIP-2333 is a DIFFERENT algorithm; no KAT exists (draft-07 App.B = TBA)
 csvstream	A	SELF	RFC 4180 reader/writer, hand-authored fixtures, no captured third-party CSVs	DONE	-	DONE 9ca8ed7: csv-spectrum 8/12 asserted, 1 fixture is itself broken upstream
-dns	A	MIXED	message.zig goldens hand-built; Resolver has live UDP/TCP/DoH tests vs real 8.8.8.8	CLI:dig/kdig + capture	S	codec goldens hand-computed per RFC 1035; live resolver test exists but skips offline
+dns	A	MIXED	message.zig goldens hand-built; Resolver has live UDP/TCP/DoH tests vs real 8.8.8.8	DONE	-	DONE ea2d000: 6 real Google DNS responses incl. compression, CNAME chain, NXDOMAIN
 encoding	A	SELF	hand-authored spot-check fixtures (e.g. windows-1252 euro), no WHATWG table/iconv cross-check	DONE	-	DONE 76f9d9c: exhaustive WHATWG tables, 640 pairs, 5 code pages
-genetlink	A	MIXED	offline goldens self-built; live nlctrl test vs real Linux kernel is external	CLI:nlctrl (live kernel)	S	Live nlctrl test already runs unconditionally; extend to cover offline-golden shapes
+genetlink	A	MIXED	offline goldens self-built; live nlctrl test vs real Linux kernel is external	DONE	-	DONE 5938bfc: real nlctrl exchange frozen; CLOSES the audit blind spot, measured
 icmp	A	MIXED	RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test	DONE	-	DONE a326e4a: 8 real fixtures via unprivileged netns capture; unreachable types named
 json5	A	SELF	hand-authored fixtures; deliberately partial subset, no json5.org test corpus used	DONE	-	DONE b8d7144: json5-tests corpus adopted, THREE real bugs fixed
 linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked examples cited	DONE	-	DONE 9ca8ed7: RFC 8288 3.5 worked examples transcribed, errata checked
@@ -100,7 +100,7 @@ lninvoice	A	MIXED	BOLT11/12 mostly externally anchored (bolts vectors); BOLT12 o
 mcp	A	MIXED	sampling/elicitation lines byte-identical to spec's own JSON examples; init/tools/resources goldens + peer concept self-only (SPEC.md: "no external anchor")	DONE	-	DONE e3b4a52: 8 literal + 6 partial spec anchors, canary on the classification
 metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check	CLI:promtool (Prometheus)	S	pipe golden exposition text through `promtool check metrics` instead of hand-eyeballing
 netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips	CAPTURE:existing python-netconf live harness (NETCONF_TEST_SERVER)	S	capture rpc.zig wire bytes from the live py-netconf server already used for interop
-nftables	A	MIXED	native path anchored by captured real nft traffic; JSON builder path is self golden	CLI:nft (existing JSON<->native consistency + `nft -c -j` check)	S	extend existing live consistency/check harness to more statement shapes than one ruleset
+nftables	A	MIXED	native path anchored by captured real nft traffic; JSON builder path is self golden	DONE	-	DONE 5938bfc: 3 rules -> 13 across 4 chains; reject has no builder (documented gap)
 ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures	DONE	-	DONE 6c2d6d9: real DigiCert + GoDaddy responses captured; delegated responder now exercised
 ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data	DONE	-	DONE 6c2d6d9: same real CA fixtures; blind spot shown to propagate through the sibling
 opcua	A	MIXED	P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable	DONE	-	DONE 02ecea2: real open62541 Sign+SignAndEncrypt handshakes captured and frozen
@@ -108,15 +108,15 @@ openapi	A	SELF	hand-authored golden JSON document; only checked to be valid JSON
 pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture	DONE	-	DONE a326e4a: real SYN/SYN-ACK timestamp options, tsecr<-tsval correlation anchored
 protobuf	A	MIXED	codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing	DONE	-	DONE e080479: live python oracle frozen into committed goldens, survives CI
 rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only	DONE	-	DONE a326e4a: real ARP + IPv4 frames off a veth pair (loopback cannot do ARP)
-rdap	A	SELF	RFC 7480-9224 JSON client; hand-authored fixtures, no captured registry resp	CAPTURE:public RDAP servers (rdap.org/IANA bootstrap, ARIN)	S	one HTTPS GET against a live registry captures a real response as golden
+rdap	A	SELF	RFC 7480-9224 JSON client; hand-authored fixtures, no captured registry resp	DONE	-	DONE ea2d000: real registry response; GDPR-redacted handle + nested entities
 security-headers	A	SELF	golden header fixtures hand-authored; helmet.js value read not executed - SELF	CLI:node + helmet.js (npm package)	S	actually run helmet.js and diff headers, instead of reading its source for values
 sntp	A	SELF	canned server-reply fixtures only; live query test always error.SkipZigTest	CLI:public NTP server	S	live harness EXISTS but unconditionally skips; keep it OUT of the default gate
 tar	A	MIXED	read path: real GNU tar 1.35 golden header; write path only via skippable live tar test	DONE	-	DONE 23312c0: 5 real GNU tar archives frozen, write path anchored offline
 traceroute	A	MIXED	canned ICMP fixtures (SELF); loopback live test skips without CAP_NET_RAW	CAPTURE:existing CAP_NET_RAW live loopback trace harness (currently skips)	S	run the existing live path with the capability instead of leaving it skip-gated
 validate	A	SELF	JSON Schema 2020-12 semantics; own tests only, no official Test Suite run	DONE	-	DONE 76f9d9c: format vocabulary only (rest out of scope), isDuration bug fixed
 webhooksig	A	SELF	HMAC-SHA256 sample value hand-cited in test, no named published KAT source	DONE	-	DONE 9ca8ed7: RFC 4231 REFUTED (tests std.crypto); GitHub published triple used
-whois	A	SELF	scripted/canned transport only; no captured real registry responses	CLI:whois (or CAPTURE from a public whois server, port 43)	S	one real query against a public registry captures actual bytes, not canned transport
+whois	A	SELF	scripted/canned transport only; no captured real registry responses	DONE	-	DONE ea2d000: real IANA+Verisign port-43 replies; real referral CYCLE exercised
 xdp-classifier	A	MIXED	classifier bytecode clang-cross-checked(EXTERNAL); CAP_BPF kernel-load test skips unprivileged	CAPTURE:existing CAP_BPF kernel-load harness (currently skips unprivileged)	S	run the existing load test with CAP_BPF/root instead of leaving it skip-gated
-xmss	B	MIXED	core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only	CLI:xmss-reference (existing oracle, github.com/XMSS/xmss-reference)	S	drive the existing reference oracle over leaves 0-3 to byte-anchor the h=2 stateful walk
+xmss	B	MIXED	core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only	DONE	-	DONE 5938bfc: h=2 anchored on XMSS/xmss-reference; leaf 3 = BUG IN THE REFERENCE
 yaml	A	EXTERNAL	yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution self-tested only	DONE	-	VERIFIED 2026-08-01: survey was WRONG, all 402 cases already execute; teeth-checked
 zipstream	A	MIXED	writer bytes cross-checked live via std.zip.Iterator; real unzip/zipinfo check was ad hoc, not standing	DONE	-	DONE 23312c0: unzip/zipinfo agreement was PROSE ONLY; now a committed archive
