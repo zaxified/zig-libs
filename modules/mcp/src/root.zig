@@ -123,6 +123,55 @@ pub const error_code = struct {
     pub const url_elicitation_required: i32 = -32042;
 };
 
+/// How one JSON-RPC method this server sends or dispatches is anchored
+/// against the MCP specification's own literal JSON examples (see the "tests"
+/// section of each `docs/specification/2025-11-25/**` page) — as opposed to
+/// self-consistency (a golden value this module invented and then asserted
+/// against itself).
+///
+///   * `.literal_example` — a spec page embeds a request/response (or
+///     notification) whose wire text this module reproduces byte-for-byte in
+///     a test: the spec's literal JSON decodes through our parser and/or our
+///     encoder's output matches the spec's literal text exactly.
+///   * `.partial` — the spec's literal request decodes verbatim (proving
+///     format compatibility), but the spec's illustrative response also shows
+///     optional fields (`title`, `icons`, `execution`, …) this module does not
+///     implement, so the response cannot be byte-identical; `reason` says
+///     what is and isn't covered.
+///   * `.no_example` — the spec publishes no JSON example for this method, or
+///     this module deliberately does not implement the path the example
+///     shows; `reason` is mandatory.
+pub const SpecAnchor = enum { literal_example, partial, no_example };
+
+pub const MethodAnchor = struct {
+    method: []const u8,
+    anchor: SpecAnchor,
+    reason: []const u8 = "",
+};
+
+/// Every JSON-RPC method this server dispatches or originates, classified per
+/// `SpecAnchor`. This is the "nothing silently filtered" index: a method
+/// added to (or removed from) `handleMessage`'s dispatch chain, or to the
+/// server→client send surface, without a matching update here (and to the
+/// canary counts in the "mcp: spec-anchor classification" test) is a
+/// classification bug, not just a missing test.
+pub const spec_anchor_index = [_]MethodAnchor{
+    .{ .method = "initialize", .anchor = .partial, .reason = "spec's lifecycle.mdx request (roots/sampling/elicitation/tasks capabilities, extended clientInfo) decodes verbatim; the response cannot be byte-identical because this server always advertises its own fixed, narrower capability set (no logging, no tasks, listChanged:false) -- a deliberate design choice (SPEC.md), not a gap" },
+    .{ .method = "notifications/initialized", .anchor = .literal_example, .reason = "" },
+    .{ .method = "ping", .anchor = .literal_example, .reason = "" },
+    .{ .method = "tools/list", .anchor = .partial, .reason = "spec's tools.mdx request (with a pagination cursor, which this module ignores by design -- pagination is out of scope) decodes verbatim; the response cannot be byte-identical because the spec's example Tool carries title/icons/execution fields this module's Tool struct does not have" },
+    .{ .method = "tools/call", .anchor = .literal_example, .reason = "" },
+    .{ .method = "resources/list", .anchor = .partial, .reason = "spec's resources.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response cannot be byte-identical because the spec's example Resource carries a title/icons field this module's Resource struct does not have" },
+    .{ .method = "resources/read", .anchor = .literal_example, .reason = "" },
+    .{ .method = "resources/templates/list", .anchor = .partial, .reason = "spec's resources.mdx request (no params) decodes trivially; the response cannot be byte-identical because the spec's example ResourceTemplate carries title/icons fields this module's ResourceTemplate struct does not have" },
+    .{ .method = "prompts/list", .anchor = .partial, .reason = "spec's prompts.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response cannot be byte-identical because the spec's example Prompt carries title/icons fields this module's Prompt struct does not have" },
+    .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
+    .{ .method = "notifications/progress", .anchor = .literal_example, .reason = "" },
+    .{ .method = "sampling/createMessage", .anchor = .literal_example, .reason = "" },
+    .{ .method = "elicitation/create", .anchor = .literal_example, .reason = "" },
+    .{ .method = "notifications/cancelled", .anchor = .partial, .reason = "field order and `reason` text match the spec's cancellation.mdx example exactly; `requestId` is always a bare JSON integer (this server's own monotonic ids), where the spec's illustrative id happens to be a quoted string -- JSON-RPC ids may be either, so this is not a divergence. Also: this module only ever SENDS notifications/cancelled (giving up on its own outbound sampling/elicitation request); it has no dispatch branch for a client cancelling an in-progress tools/call (an unknown id-less notification is silently dropped, which the spec explicitly permits)" },
+};
+
 /// Everything `handleMessage`/`serve` can fail with. Malformed *input* never
 /// surfaces here (it becomes a JSON-RPC error response); only allocation
 /// failure and transport write failure do.
@@ -2563,6 +2612,8 @@ test "notifications/initialized: no response, flag set" {
     var s = testServer(null);
     defer s.deinit();
     try testing.expect(!s.client_initialized);
+    // This line is already the spec's own (basic/lifecycle.mdx) verbatim, byte
+    // for byte -- a full spec-literal anchor, no adaptation needed.
     try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", "");
     try testing.expect(s.client_initialized);
 }
@@ -4269,6 +4320,343 @@ test "server capabilities do not advertise sampling/elicitation (they are the CL
     , &aw.writer);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "\"sampling\"") == null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "\"elicitation\"") == null);
+}
+
+// ── spec-literal anchors: the rest of the surface ───────────────────────────
+//
+// Sampling/elicitation were already anchored on the spec's own JSON examples
+// (see above). Everything below extends the same treatment to every other
+// method this server dispatches or emits — retrieved verbatim from
+// modelcontextprotocol/modelcontextprotocol (2025-11-25 spec pages), never
+// reconstructed from memory. See `spec_anchor_index` for the classification
+// (`.literal_example` / `.partial` / `.no_example`) and why.
+
+test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
+    // If this trips, a method was added to/removed from handleMessage's
+    // dispatch chain (or the server->client send surface) without updating
+    // `spec_anchor_index` -- reclassify, don't just bump the numbers.
+    try testing.expectEqual(@as(usize, 14), spec_anchor_index.len);
+    var literal: usize = 0;
+    var partial: usize = 0;
+    var no_example: usize = 0;
+    for (spec_anchor_index) |m| {
+        switch (m.anchor) {
+            .literal_example => literal += 1,
+            .partial => {
+                partial += 1;
+                try testing.expect(m.reason.len != 0); // every partial entry must say what's missing and why
+            },
+            .no_example => {
+                no_example += 1;
+                try testing.expect(m.reason.len != 0);
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 8), literal);
+    try testing.expectEqual(@as(usize, 6), partial);
+    try testing.expectEqual(@as(usize, 0), no_example);
+}
+
+test "initialize: decodes the spec's own request verbatim (lifecycle.mdx)" {
+    var s = testServer(null);
+    defer s.deinit();
+    // Verbatim from the MCP 2025-11-25 lifecycle page's "Initialization"
+    // section (the client->server initialize request), compacted. Exercises
+    // capability shapes and clientInfo fields (title/description/icons/
+    // websiteUrl, a `tasks` capability) this module doesn't otherwise
+    // register or use, to prove they decode without crashing or mis-parsing
+    // the fields we DO read.
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true},"sampling":{},"elicitation":{"form":{},"url":{}},"tasks":{"requests":{"elicitation":{"create":{}},"sampling":{"createMessage":{}}}}},"clientInfo":{"name":"ExampleClient","title":"Example Client Display Name","version":"1.0.0","description":"An example MCP client application","icons":[{"src":"https://example.com/icon.png","mimeType":"image/png","sizes":["48x48"]}],"websiteUrl":"https://example.com"}}}
+    );
+    try testing.expectEqualStrings("2025-11-25", s.negotiated_version);
+    try testing.expect(s.client_capabilities.roots);
+    try testing.expect(s.client_capabilities.roots_list_changed);
+    try testing.expect(s.client_capabilities.sampling);
+    try testing.expect(!s.client_capabilities.sampling_tools);
+    try testing.expect(!s.client_capabilities.sampling_context);
+    try testing.expect(s.client_capabilities.elicitation);
+    try testing.expect(s.client_capabilities.elicitation_form);
+    try testing.expect(s.client_capabilities.elicitation_url);
+    // The response itself cannot be byte-identical to the spec's (see
+    // spec_anchor_index) -- this server's capability shape is fixed and
+    // narrower (no `logging`, no `tasks`, listChanged always false).
+}
+
+test "ping: byte-identical to the spec's example (basic/utilities/ping.mdx)" {
+    var s = testServer(null);
+    defer s.deinit();
+    // Verbatim from the ping page (the id "123" is the spec's own).
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":"123","method":"ping"}
+    ,
+        \\{"jsonrpc":"2.0","id":"123","result":{}}
+        \\
+    );
+}
+
+test "tools/list: the spec's cursor-bearing request decodes verbatim (pagination ignored by design)" {
+    var s = testServer(null);
+    defer s.deinit();
+    // Verbatim request from server/tools.mdx ("Listing Tools"); this module
+    // doesn't implement pagination (SPEC.md), so `cursor` is accepted and
+    // ignored rather than rejected -- the catalog comes back exactly as it
+    // would without the param. The spec's illustrative response (`title`,
+    // `icons`, `execution` on the Tool) can't be reproduced byte-for-byte:
+    // this module's `Tool` has none of those fields (see spec_anchor_index).
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"optional-cursor-value"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo the 'text' argument back.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"outputSchema":{"type":"object","properties":{"echo":{"type":"string"},"calls":{"type":"integer"}}}}]}}
+        \\
+    );
+}
+
+fn getWeatherHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    call.write("Current weather in New York:\nTemperature: 72°F\nConditions: Partly cloudy");
+    return false;
+}
+
+test "tools/call: byte-identical to the spec's get_weather example (server/tools.mdx)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "get_weather",
+        .description = "Get current weather information for a location",
+        .input_schema =
+        \\{"type":"object","properties":{"location":{"type":"string","description":"City name or zip code"}},"required":["location"]}
+        ,
+        .handler = &getWeatherHandler,
+    });
+    // Verbatim request + response from "Calling Tools".
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_weather","arguments":{"location":"New York"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Current weather in New York:\nTemperature: 72°F\nConditions: Partly cloudy"}],"isError":false}}
+        \\
+    );
+}
+
+fn getWeatherDataHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    call.write("{\"temperature\": 22.5, \"conditions\": \"Partly cloudy\", \"humidity\": 65}");
+    return false;
+}
+
+test "tools/call: structuredContent is byte-identical to the spec's output-schema example" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "get_weather_data",
+        .description = "Get current weather data for a location",
+        .input_schema =
+        \\{"type":"object","properties":{"location":{"type":"string","description":"City name or zip code"}},"required":["location"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"temperature":{"type":"number","description":"Temperature in celsius"},"conditions":{"type":"string","description":"Weather conditions description"},"humidity":{"type":"number","description":"Humidity percentage"}},"required":["temperature","conditions","humidity"]}
+        ,
+        .handler = &getWeatherDataHandler,
+    });
+    // The spec (server/tools.mdx "Output Schema") shows this tool's
+    // definition and its response verbatim, but not the triggering request
+    // for that specific exchange -- the request's `arguments.location` value
+    // is ours; the tool definition and the whole response (content.text +
+    // structuredContent, byte-for-byte, including the response's own
+    // internal whitespace) are the spec's literal text.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_weather_data","arguments":{"location":"Paris"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"temperature\": 22.5, \"conditions\": \"Partly cloudy\", \"humidity\": 65}"}],"structuredContent":{"temperature": 22.5, "conditions": "Partly cloudy", "humidity": 65},"isError":false}}
+        \\
+    );
+}
+
+test "tools/call: Unknown tool error code matches the spec's example (message text is not spec-mandated)" {
+    var s = testServer(null);
+    defer s.deinit();
+    // Spec's own "Example protocol error" (server/tools.mdx "Error Handling"):
+    // {"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Unknown tool:
+    // invalid_tool_name"}}. JSON-RPC/MCP fixes the *code* (-32602, invalid
+    // params) for an unknown tool name; the message string is human-readable
+    // prose, not part of the wire contract -- this module's own "Unknown
+    // tool" (no name suffix) is a stylistic choice, not a disagreement.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"invalid_tool_name"}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Unknown tool"}}
+        \\
+    );
+}
+
+fn flightValidationHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    call.write("Invalid departure date: must be in the future. Current date is 08/08/2025.");
+    return true;
+}
+
+test "tools/call: execution-error content is byte-identical to the spec's example (isError:true)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    // The tool name is ours (the spec's "Example tool execution error" names
+    // none); the id and the content text are its literal bytes.
+    try s.addTool(.{
+        .name = "book_flight",
+        .description = "d",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = &flightValidationHandler,
+    });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"book_flight","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"Invalid departure date: must be in the future. Current date is 08/08/2025."}],"isError":true}}
+        \\
+    );
+}
+
+const spec_main_rs_body =
+    \\fn main() {
+    \\    println!("Hello world!");
+    \\}
+;
+
+fn mainRsReader(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    _ = ctx;
+    req.text(req.uri, "text/x-rust", spec_main_rs_body);
+    return true;
+}
+
+test "resources/read: byte-identical to the spec's example (server/resources.mdx)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResource(.{
+        .uri = "file:///project/src/main.rs",
+        .name = "main.rs",
+        .mime_type = "text/x-rust",
+        .handler = &mainRsReader,
+    });
+    // Verbatim request + response from "Reading Resources".
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"file:///project/src/main.rs"}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"contents":[{"uri":"file:///project/src/main.rs","mimeType":"text/x-rust","text":"fn main() {\n    println!(\"Hello world!\");\n}"}]}}
+        \\
+    );
+}
+
+test "resources/list: the spec's cursor-bearing request decodes verbatim (pagination ignored by design)" {
+    var lib = TestLibrary{};
+    var s = try libraryServer(&lib);
+    defer s.deinit();
+    // Verbatim request from server/resources.mdx ("Listing Resources"). The
+    // spec's illustrative response (`title`, `icons` on the Resource) can't
+    // be reproduced byte-for-byte: this module's `Resource` has neither (see
+    // spec_anchor_index) -- covered instead by the existing golden
+    // resources/list test, unmodified.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{"cursor":"optional-cursor-value"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"resources":[{"uri":"mem://readme","name":"readme","description":"Project readme.","mimeType":"text/plain"},{"uri":"mem://logo","name":"logo"},{"uri":"mem://gone","name":"gone"}]}}
+        \\
+    );
+}
+
+test "prompts/list: the spec's cursor-bearing request decodes verbatim (pagination ignored by design)" {
+    var lib = TestLibrary{};
+    var s = try libraryServer(&lib);
+    defer s.deinit();
+    // Verbatim request from server/prompts.mdx ("Listing Prompts"). The
+    // spec's illustrative response (`title`, `icons` on the Prompt) can't be
+    // reproduced byte-for-byte: this module's `Prompt` has neither.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{"cursor":"optional-cursor-value"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"prompts":[{"name":"greet","description":"Render a greeting request.","arguments":[{"name":"who","description":"Who to greet.","required":true},{"name":"tone","description":"Optional tone."}]},{"name":"broken"}]}}
+        \\
+    );
+}
+
+fn codeReviewHandler(ctx: ?*anyopaque, req: *PromptRequest) bool {
+    _ = ctx;
+    const code = req.strArg("code") orelse return false;
+    req.printMessage(.user, "Please review this Python code:\n{s}", .{code});
+    return true;
+}
+
+test "prompts/get: byte-identical to the spec's code_review example (server/prompts.mdx)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    const args = [_]PromptArgument{.{ .name = "code", .description = "The code to review", .required = true }};
+    try s.addPrompt(.{
+        .name = "code_review",
+        .description = "Code review prompt",
+        .arguments = &args,
+        .handler = &codeReviewHandler,
+    });
+    // Verbatim request + response from "Getting a Prompt".
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"code_review","arguments":{"code":"def hello():\n    print('world')"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"description":"Code review prompt","messages":[{"role":"user","content":{"type":"text","text":"Please review this Python code:\ndef hello():\n    print('world')"}}]}}
+        \\
+    );
+}
+
+fn reticulateHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    call.reportProgress(50, 100, "Reticulating splines...");
+    call.write("{\"done\":true}");
+    return false;
+}
+
+test "notifications/progress: byte-identical to the spec's example (basic/utilities/progress.mdx)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "reticulate",
+        .description = "d",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = &reticulateHandler,
+    });
+    // The triggering tools/call is ours (the spec's progress page illustrates
+    // the token-carrying request generically, as method "some_method", which
+    // isn't a dispatchable method here). The notification line the receiver
+    // "MAY then send" is the spec's literal text, verbatim; the trailing
+    // tools/call result line is this module's own (self-authored) shape.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reticulate","_meta":{"progressToken":"abc123"}}}
+    ,
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"abc123","progress":50,"total":100,"message":"Reticulating splines..."}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"done\":true}"}],"structuredContent":{"done":true},"isError":false}}
+        \\
+    );
+}
+
+test "notifications/cancelled: field shape matches the spec's example (basic/utilities/cancellation.mdx)" {
+    var s = try serverWithCaps("{\"sampling\":{}}");
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    // Force the next outbound id to 123 to line up with the spec's
+    // illustrative `requestId` -- this module's ids are always its own
+    // monotonic u64s, so the value is ours to pick; the spec's id happens to
+    // be a quoted string ("123") where ours is a bare integer (JSON-RPC
+    // permits either as a request id; see spec_anchor_index).
+    s.next_request_id = 123;
+    const id = try s.sendSamplingRequest(&aw.writer, .{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+        .max_tokens = 1,
+    }, .{});
+    try testing.expectEqual(@as(u64, 123), id);
+    aw.clearRetainingCapacity();
+
+    try s.cancelRequest(&aw.writer, id, "User requested cancellation");
+    // Verbatim `params` shape (requestId, reason) and reason text from the
+    // cancellation page.
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":123,"reason":"User requested cancellation"}}
+        \\
+    , aw.written());
 }
 
 // ── fuzz: one JSON-RPC message dispatch, never panics ───────────────────────

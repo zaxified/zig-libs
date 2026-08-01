@@ -121,6 +121,42 @@ own tests, and therefore only as good as the reasoning behind them: the image/au
 the never-reuse id rule, `max_pending`, and the whole `peer` concept (an implementation invention —
 the spec says nothing about multiplexing one server over several sessions).
 
+The rest of the protocol surface is anchored the same way, extending the sampling/elicitation
+treatment to every other method this server dispatches or emits: `initialize`'s request (the
+lifecycle page's full example, including `roots`/`tasks` capabilities and clientInfo fields this
+module ignores, decoded without crashing or mis-parsing what it does read), `ping`, `tools/call`
+(the `get_weather` text example and the `get_weather_data` output-schema/`structuredContent`
+example, byte-identical down to the response's own internal whitespace; the "Unknown tool"
+protocol-error *code* and the execution-error *content*, both from tools.mdx), `resources/read`
+(the `main.rs` example), `prompts/get` (the `code_review` example), and the `notifications/progress`
+wire shape (progress/total/message field order and values). `initialize`'s response, and the
+`tools/list`/`resources/list`/`resources/templates/list`/`prompts/list` responses, cannot be
+byte-identical to the spec's own illustrative responses: this server's capability shape is fixed
+and narrower (no `logging`/`tasks`, `listChanged` always false), and its `Tool`/`Resource`/
+`ResourceTemplate`/`Prompt` types carry none of `title`/`icons`/`execution` — so those methods are
+anchored on request-decode only (the spec's literal request, including an ignored pagination
+`cursor`, parses without error). `notifications/cancelled` matches the spec's `requestId`/`reason`
+shape and reason text exactly, except `requestId` is always a bare integer (this server's own
+monotonic ids) where the spec's illustrative id is a quoted string — JSON-RPC permits either as a
+request id, so this is not a divergence. The full classification (`.literal_example` / `.partial` /
+`.no_example`, with a `reason` for every non-full entry) lives in `pub const spec_anchor_index` in
+src/root.zig, guarded by a count-canary test so a method added to (or dropped from) the dispatch
+surface without updating the classification fails loudly — the same protection sibling modules use
+for a vendored-corpus count. **No disagreements were found**: every spec example this server can
+reproduce byte-for-byte, it does. Retrieved from
+`modelcontextprotocol/modelcontextprotocol` (2025-11-25 spec pages) directly, never reconstructed
+from memory.
+
+Provenance: these are literal JSON snippets from the MCP specification quoted as test-oracle data,
+the same clean-room-from-a-public-spec relationship this module already has with the MCP spec as a
+whole (root NOTICE §0) — no third-party source was read or ported, so this needs no NOTICE entry
+(module-level or root), matching how `linkheader` cites RFC 8288 in its own SPEC.md rather than
+NOTICE. (The spec's docs are dual-licensed Apache-2.0/MIT, both permissive; Apache-2.0's
+NOTICE-preservation clause (§4(d)) applies to redistributing the specification itself as a
+Derivative Work, not to citing a handful of short wire-format examples as our own original test
+fixtures — the same merger-doctrine reasoning NOTICE §0 already states for protocol/format
+descriptions.)
+
 Every central invariant was **mutation-tested**: 21 deliberate mutations (drop the capability gate;
 accept a nested/array-of-objects schema; treat `decline` as an error; surface content on `decline`;
 reuse an id after a failed send; correlate by arrival order instead of id; drop the peer check; set
@@ -129,7 +165,11 @@ round trip; answer a response instead of consuming it; record both request kinds
 misspell `maxTokens`; emit `mode` to a 2025-06-18 peer; reorder the URL-mode keys; remove the
 pending cap; remove the credential refusal; drop the empty-`elicitation:{}` form default; silently
 decode tool-use content; and, in `mcp-http`, let the JSON body keep every line and let all sessions
-share peer 0). All 21 turned a test red on behaviour, none on a compile error alone.
+share peer 0). All 21 turned a test red on behaviour, none on a compile error alone. The newly added
+spec-literal anchors were spot-checked the same way: swapping `progress`/`total` in
+`Progress.report`'s formatted values turned both the pre-existing progress test and the new
+`notifications/progress` spec-anchor test red (wrong numbers on the wire), confirming a compile-only
+mutation was not mistaken for coverage; reverted byte-for-byte (`md5sum` before/after matched).
 Run: `zig build test-mcp`.
 
 ## Backlog / deferred
