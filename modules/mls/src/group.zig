@@ -169,6 +169,30 @@ pub const Error = error{
     /// whose `KeyPackage` names a different cipher suite or protocol
     /// version than the group's.
     KeyPackageMismatch,
+    /// The Commit being processed removes THIS client. Not a rejection of
+    /// the message — the Commit is valid and the removal has taken effect
+    /// for everyone else; it is the only outcome §12.4.2 leaves a removed
+    /// member, which is why it is an error rather than a silent success.
+    ///
+    /// §12.4.2's closing note: "Note that clients need to be prepared to
+    /// receive a valid Commit message that removes them from the group. In
+    /// this case, the client cannot send any more messages in the group and
+    /// SHOULD promptly delete its group state and secret tree. (A client
+    /// might keep the secret tree for a short time to decrypt late messages
+    /// in the previous epoch.)" That is the whole of what it asks, and it
+    /// is NOT "advance an epoch": §12.3 blanks this client's leaf before the
+    /// path is decrypted, so no `UpdatePath` ciphertext is addressed to it,
+    /// no `commit_secret` can be derived, and §12.4.2's `confirmation_tag`
+    /// bullet has nothing to check against. A removed member therefore
+    /// cannot reach the new epoch at all — no implementation can.
+    ///
+    /// The group object is left AT THE PREVIOUS EPOCH and unpoisoned, which
+    /// is exactly the state the note's parenthesis describes: still able to
+    /// decrypt late messages from the epoch that just ended, and — because
+    /// the caller now knows — obliged to stop sending and to drop the state
+    /// promptly. `Group` cannot enforce either of those; the deletion is the
+    /// caller's, and this error is how it is told to perform it.
+    RemovedFromGroup,
 
     // ── §12.2's SECOND procedure: an external Commit's proposal list.
     // Five errors rather than one `InvalidProposalList`, because unlike a
@@ -932,6 +956,34 @@ pub fn Group(comptime S: type) type {
                 try self.validateProposalList(gpa, resolved, member_committer);
             }
 
+            // §12.4.2's closing note, which is the ONLY thing that section
+            // asks of a member the Commit removes — see
+            // `Error.RemovedFromGroup` for the quotation and for why
+            // "process it like anyone else" is not among the options.
+            // Answered HERE, at the last point where all three of these
+            // hold:
+            //
+            //   * the Commit has been authenticated as far as a removed
+            //     member ever can authenticate it (signature + membership
+            //     tag + §12.2's list validation). It cannot go further: the
+            //     `confirmation_tag` bullet needs the new epoch's
+            //     `confirmation_key`, and deriving that needs the
+            //     `commit_secret` this client can no longer obtain;
+            //   * the tree is still the one this client belongs to, so the
+            //     answer does not depend on whether §7.7's truncation is
+            //     about to drop this client's own leaf out of the array;
+            //   * the poison flag is not yet set, so the previous epoch's
+            //     state survives for the "short time to decrypt late
+            //     messages" the same note allows.
+            //
+            // Deliberately AFTER §12.2's validation: a removed member is
+            // still a conformant peer and must not report a malformed
+            // proposal list as its own removal.
+            for (resolved) |rp| switch (rp.proposal) {
+                .remove => |idx| if (idx == self.my_leaf_index) return error.RemovedFromGroup,
+                else => {},
+            };
+
             // From here on the tree is mutated; any failure poisons.
             self.poisoned = true;
 
@@ -1002,8 +1054,11 @@ pub fn Group(comptime S: type) type {
                 const provisional_bytes = try provisional.encodeAlloc(gpa);
                 defer gpa.free(provisional_bytes);
 
-                // A Commit that removed us leaves nothing to decrypt with;
-                // §12.4.2's closing note says such a Commit is still valid.
+                // The receiver is still in the tree: a Commit that removes
+                // it returned `RemovedFromGroup` above, before any of this
+                // ran. That is what makes the failures below real failures
+                // — nothing that reaches this call is expected to be
+                // undecryptable.
                 const processed = try treekem.processUpdatePath(
                     S,
                     arena,
@@ -3386,9 +3441,10 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
         try expectSameEpoch(&a, &d_grp);
     }
 
-    // epoch 5: bob removes alice by value. The removed member processes
-    // the Commit too — §12.4.2's closing note makes that valid, and it is
-    // the path where `processUpdatePath` has nothing it can decrypt.
+    // epoch 5: bob removes alice by value, and the SURVIVORS follow it.
+    // What alice herself does with that Commit is §12.4.2's closing note
+    // and is measured in its own test below — this one measures only that
+    // removing a member does not disturb the members who remain.
     {
         const c = try b.createCommit(gpa, .{
             .io = io,
@@ -3402,6 +3458,126 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
         try expectSameEpoch(&b, &c_grp);
         try expectSameEpoch(&b, &d_grp);
         try testing.expectEqual(@as(u64, 5), b.epoch);
+    }
+}
+
+test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, in both the truncating and the non-truncating shape" {
+    // Two shapes, and the difference between them is the whole point of
+    // running both.
+    //
+    //   * an INTERIOR leaf goes. §7.7 truncates only TRAILING blanks, so the
+    //     tree stays as wide as it was and the removed member's own node
+    //     index is still in bounds. What stopped it one step later was that
+    //     no `UpdatePath` ciphertext is addressed to a leaf §12.3 had just
+    //     blanked — `error.Malformed`;
+    //   * the HIGHEST OCCUPIED leaf goes. §7.7 now drops the trailing blanks
+    //     and the node array shrinks BELOW that member's own node index, so
+    //     `treekem.processUpdatePath`'s bounds check speaks first —
+    //     `error.InvalidLeafIndex`, a message about a leaf index the caller
+    //     never supplied.
+    //
+    // Both answers are true and neither is usable, and both arrived with the
+    // group poisoned although nothing had gone wrong with it. §12.4.2 asks
+    // for one thing from a removed member and an epoch transition is not it;
+    // see `Error.RemovedFromGroup` for the note's own words and for why no
+    // implementation can do better than report the removal.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 91);
+    const bob = try TestClient.init(aa, "bob", 92);
+    const carol = try TestClient.init(aa, "carol", 93);
+    const dave = try TestClient.init(aa, "dave", 94);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "closing-note",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    var b: Group(TestSuite) = undefined;
+    var c_grp: Group(TestSuite) = undefined;
+    var d_grp: Group(TestSuite) = undefined;
+    {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .proposals = &.{
+            .{ .by_value = .{ .add = bob.kp } },
+            .{ .by_value = .{ .add = carol.kp } },
+            .{ .by_value = .{ .add = dave.kp } },
+        } });
+        defer c.deinit(gpa);
+        b = try bob.join(gpa, c.welcome.?, &.{});
+        c_grp = try carol.join(gpa, c.welcome.?, &.{});
+        d_grp = try dave.join(gpa, c.welcome.?, &.{});
+    }
+    defer b.deinit();
+    defer c_grp.deinit();
+    defer d_grp.deinit();
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+    try testing.expectEqual(@as(u32, 2), c_grp.my_leaf_index);
+    try testing.expectEqual(@as(u32, 3), d_grp.my_leaf_index);
+
+    // ── Shape 1: carol's leaf 2 is INTERIOR, dave still holds leaf 3.
+    {
+        const carol_before = c_grp.epochAuthenticator();
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .remove = 2 } }},
+        });
+        defer c.deinit(gpa);
+
+        // The Commit is valid — the survivors take it. Whatever carol does
+        // with it is therefore about carol's ROLE, not about the message.
+        try b.processCommit(.{ .commit_msg = c.commit });
+        try d_grp.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &b);
+        try expectSameEpoch(&a, &d_grp);
+        try testing.expectEqual(@as(usize, 4), a.treeSize()); // no truncation
+
+        try testing.expectError(error.RemovedFromGroup, c_grp.processCommit(.{ .commit_msg = c.commit }));
+        // Not poisoned, not advanced, and byte-for-byte the state carol had
+        // before she read the message: §12.4.2's note lets her keep it "for
+        // a short time to decrypt late messages in the previous epoch", and
+        // she cannot do that out of a group this library has declared dead.
+        try testing.expect(!c_grp.poisoned);
+        try testing.expectEqual(@as(u64, 1), c_grp.epoch);
+        try testing.expectEqualSlices(u8, &carol_before, &c_grp.epochAuthenticator());
+        try testing.expectEqual(@as(usize, 4), c_grp.treeSize());
+    }
+
+    // ── Shape 2: dave's leaf 3 is now the HIGHEST OCCUPIED leaf, and leaf 2
+    // beside it is blank — so §7.7 drops the whole right half and the tree
+    // shrinks past dave's own position.
+    {
+        const dave_before = d_grp.epochAuthenticator();
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .remove = 3 } }},
+        });
+        defer c.deinit(gpa);
+
+        try b.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &b);
+        // The truncation is REAL and it is what used to break this: four
+        // leaves down to two, i.e. three nodes, against dave's own node
+        // index `2 * 3`.
+        try testing.expectEqual(@as(usize, 2), a.treeSize());
+
+        try testing.expectError(error.RemovedFromGroup, d_grp.processCommit(.{ .commit_msg = c.commit }));
+        try testing.expect(!d_grp.poisoned);
+        try testing.expectEqual(@as(u64, 2), d_grp.epoch);
+        try testing.expectEqualSlices(u8, &dave_before, &d_grp.epochAuthenticator());
+        // Dave's OWN copy of the tree never shrank — the Commit was refused
+        // before §12.3 was applied to it.
+        try testing.expectEqual(@as(usize, 4), d_grp.treeSize());
     }
 }
 

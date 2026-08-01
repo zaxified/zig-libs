@@ -527,6 +527,15 @@ per epoch is not this object's job. `error.GroupPoisoned` — a previous
 `processCommit` failed after the tree was already mutated, so the object is
 unusable rather than silently half-applied.
 
+`error.RemovedFromGroup` is the one that is not a refusal: the Commit is
+valid and it removes THIS client. §12.4.2's closing note asks a removed
+member to stop sending and to "promptly delete its group state and secret
+tree" — not to advance an epoch, which it could not do in any case, since
+no `UpdatePath` ciphertext is addressed to the leaf §12.3 just blanked. The
+group is left at the previous epoch and unpoisoned, so the same note's "keep
+the secret tree for a short time to decrypt late messages" stays open to the
+caller; `deinit` is the caller's to call, and should be soon.
+
 **What it does not do:** send or accept `PrivateMessage` handshakes, follow
 through on a `ReInit` (§11.2) or branch (§11.3), or apply the §7.3/§10.1
 admission rules that

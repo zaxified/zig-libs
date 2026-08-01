@@ -691,6 +691,14 @@ pub fn processUpdatePath(
 ) Error!ProcessedUpdatePath {
     const sender_node = 2 * sender_leaf_index;
     const receiver_node = 2 * receiver.leaf_index;
+    // A receiver whose own leaf the SAME Commit removed can land past the end
+    // here — §7.7 truncates the trailing blanks that removal creates, and if
+    // the removed leaf was the highest occupied one the array shrinks below
+    // its index. That is not the case this bounds check is for: `group.zig`
+    // answers §12.4.2's closing note (`Error.RemovedFromGroup`) before it ever
+    // gets this far, because a removed member has no path secret to decrypt
+    // regardless of whether its index still fits. What is left for this line
+    // is a leaf index that was never in this tree.
     if (sender_node >= t.nodes.len or receiver_node >= t.nodes.len) return error.InvalidLeafIndex;
 
     // §7.6: UpdatePath.nodes mirrors the sender's filtered direct path,
