@@ -837,6 +837,14 @@ pub const NodeStore = struct {
     /// a Variable is writable in this implementation — everything else is
     /// `BadNotWritable`, which is exactly what a server that models an
     /// immutable type system should answer. Deep-copies on success.
+    ///
+    /// Two independent gates apply to the Value attribute, per OPC 10000-3
+    /// §8.57: `AccessLevel` is the node's static, session-independent
+    /// capability ("can this Variable ever be written") and `UserAccessLevel`
+    /// is the effective, per-user capability the server advertises for the
+    /// current session ("can *this* user write it"). A client is told about
+    /// both (both are readable attributes); a write must honor both — clear
+    /// static bit -> `BadNotWritable`, clear user bit -> `BadUserAccessDenied`.
     pub fn writeAttribute(
         s: *NodeStore,
         node_id: encoding.NodeId,
@@ -857,6 +865,7 @@ pub const NodeStore = struct {
         switch (node.attributes) {
             .variable => |*v| {
                 if (v.access_level & access_level.current_write == 0) return status.bad_not_writable;
+                if (v.user_access_level & access_level.current_write == 0) return status.bad_user_access_denied;
                 const incoming = value.value orelse return status.bad_type_mismatch;
                 if (!builtinTypeMatches(v.data_type, incoming)) return status.bad_type_mismatch;
                 if (!valueRankMatches(v.value_rank, incoming)) return status.bad_type_mismatch;
@@ -1024,6 +1033,14 @@ pub const NodeStore = struct {
         data_type: encoding.NodeId = n0(id.base_data_type),
         value_rank: i32 = value_rank.scalar,
         access_level: u8 = access_level.current_read,
+        /// The effective, per-user `AccessLevel` (OPC 10000-3 §8.57) —
+        /// `null` (the default) mirrors `access_level`, matching this
+        /// server's historical behavior where the two were never
+        /// distinguishable. Set explicitly to advertise (and enforce) a
+        /// user-level capability narrower than the static one, e.g. a
+        /// Variable that is statically read/write but read-only for the
+        /// current user.
+        user_access_level: ?u8 = null,
         timestamp: ?encoding.DateTime = null,
     }) StoreError!void {
         try s.addNode(.{
@@ -1041,7 +1058,7 @@ pub const NodeStore = struct {
                 .data_type = opts.data_type,
                 .value_rank = opts.value_rank,
                 .access_level = opts.access_level,
-                .user_access_level = opts.access_level,
+                .user_access_level = opts.user_access_level orelse opts.access_level,
             } },
         });
         try s.addReference(opts.parent_id, opts.reference_type_id, opts.node_id);
@@ -1058,6 +1075,12 @@ pub const NodeStore = struct {
         implementation: ?MethodFn = null,
         user_context: ?*anyopaque = null,
         executable: bool = true,
+        /// The effective, per-user `Executable` — `null` (the default)
+        /// mirrors `executable`. `Call` already honors both bits
+        /// (`server.zig`), so this only makes the narrower user-level
+        /// capability expressible, exactly as `user_access_level` does for
+        /// Variables.
+        user_executable: ?bool = null,
     }) StoreError!void {
         try s.addNode(.{
             .node_id = opts.node_id,
@@ -1065,7 +1088,7 @@ pub const NodeStore = struct {
             .display_name = if (opts.display_name.text == null) .{ .text = opts.browse_name.name } else opts.display_name,
             .attributes = .{ .method = .{
                 .executable = opts.executable,
-                .user_executable = opts.executable,
+                .user_executable = opts.user_executable orelse opts.executable,
                 .implementation = opts.implementation,
                 .user_context = opts.user_context,
             } },
@@ -1560,6 +1583,74 @@ test "writeAttribute: Good on a writable variable, BadNotWritable / BadTypeMisma
     try testing.expectEqual(status.bad_attribute_id_invalid, try s.writeAttribute(n0(id.server), services.attribute_id.value, .{ .value = .{ .scalar = .{ .int32 = 1 } } }, 1000));
     // A node that does not exist.
     try testing.expectEqual(status.bad_node_id_unknown, try s.writeAttribute(n0(999_999), services.attribute_id.value, .{ .value = .{ .scalar = .{ .int32 = 1 } } }, 1000));
+}
+
+test "writeAttribute: AccessLevel and UserAccessLevel are enforced independently" {
+    var s = try testStore();
+    defer s.deinit();
+    const ns = try s.addNamespace("urn:zig-libs:opcua:test");
+
+    // Both the static AccessLevel and the per-user UserAccessLevel allow
+    // writing: the write must go through.
+    const both_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "both" } };
+    try s.addVariable(.{
+        .node_id = both_id,
+        .parent_id = n0(id.objects_folder),
+        .browse_name = .{ .namespace_index = ns, .name = "both" },
+        .value = .{ .scalar = .{ .int32 = 1 } },
+        .data_type = n0(id.int32),
+        .access_level = access_level.read_write,
+        .user_access_level = access_level.read_write,
+    });
+    try testing.expectEqual(status.good, try s.writeAttribute(both_id, services.attribute_id.value, .{ .value = .{ .scalar = .{ .int32 = 2 } } }, 1000));
+
+    // Static AccessLevel forbids writing (read-only node type), even though
+    // UserAccessLevel alone would allow it -> BadNotWritable.
+    const static_only_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "static_only" } };
+    try s.addVariable(.{
+        .node_id = static_only_id,
+        .parent_id = n0(id.objects_folder),
+        .browse_name = .{ .namespace_index = ns, .name = "static_only" },
+        .value = .{ .scalar = .{ .int32 = 1 } },
+        .data_type = n0(id.int32),
+        .access_level = access_level.current_read,
+        .user_access_level = access_level.read_write,
+    });
+    try testing.expectEqual(status.bad_not_writable, try s.writeAttribute(static_only_id, services.attribute_id.value, .{ .value = .{ .scalar = .{ .int32 = 2 } } }, 1000));
+
+    // Static AccessLevel allows writing, but the current user's effective
+    // UserAccessLevel does not -> BadUserAccessDenied. This is the case the
+    // server used to get wrong: it advertised UserAccessLevel to clients but
+    // never enforced it, so a write went through even with the user-level
+    // write bit clear.
+    const user_denied_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "user_denied" } };
+    try s.addVariable(.{
+        .node_id = user_denied_id,
+        .parent_id = n0(id.objects_folder),
+        .browse_name = .{ .namespace_index = ns, .name = "user_denied" },
+        .value = .{ .scalar = .{ .int32 = 1 } },
+        .data_type = n0(id.int32),
+        .access_level = access_level.read_write,
+        .user_access_level = access_level.current_read,
+    });
+    try testing.expectEqual(status.bad_user_access_denied, try s.writeAttribute(user_denied_id, services.attribute_id.value, .{ .value = .{ .scalar = .{ .int32 = 2 } } }, 1000));
+    // The value must be unchanged: the write was refused, not merely
+    // reported as refused.
+    try testing.expectEqual(@as(i32, 1), s.readAttribute(user_denied_id, services.attribute_id.value).value.?.scalar.int32);
+
+    // Backward compatibility: omitting `user_access_level` mirrors
+    // `access_level`, exactly like before this attribute could be set
+    // independently.
+    const default_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "default_mirrors_access" } };
+    try s.addVariable(.{
+        .node_id = default_id,
+        .parent_id = n0(id.objects_folder),
+        .browse_name = .{ .namespace_index = ns, .name = "default_mirrors_access" },
+        .value = .{ .scalar = .{ .int32 = 1 } },
+        .data_type = n0(id.int32),
+        .access_level = access_level.read_write,
+    });
+    try testing.expectEqual(status.good, try s.writeAttribute(default_id, services.attribute_id.value, .{ .value = .{ .scalar = .{ .int32 = 2 } } }, 1000));
 }
 
 test "setValue deep-copies (the caller's buffer may die immediately after)" {
