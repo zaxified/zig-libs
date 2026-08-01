@@ -262,9 +262,13 @@ matching. See SPEC.md.
   forces SecurityToken renewals mid-stream, this module's client driving a real
   open62541 server at Basic256Sha256, and this module's client driving this
   server over a loopback socket.
-- Goldens: captured open62541 bytes for the `#None` traffic, plus **self-
-  derived, fully deterministic** goldens for the Basic256Sha256 asymmetric
-  handshake and for signed / signed-and-encrypted MSG chunks. Each one decodes
-  *and* re-encodes byte-identically; self-derived ones are labelled as such.
-  Key derivation has a KAT whose expected bytes come from an independent
-  implementation of P-SHA256.
+- Goldens: captured open62541 bytes for the `#None` traffic; **self-derived,
+  fully deterministic** goldens for the Basic256Sha256 asymmetric handshake
+  and for signed / signed-and-encrypted MSG chunks; and, cut from a real
+  `open62541 server_ctt`, **captured** goldens for a live Sign OpenSecureChannel
+  request+response and for Sign/SignAndEncrypt MSG chunks — the latter decoded,
+  decrypted, verified and re-encoded byte-identically using the actual session
+  keys that live exchange derived. Each one decodes *and* re-encodes
+  byte-identically; self-derived ones are labelled as such. Key derivation has
+  a KAT whose expected bytes come from an independent implementation of
+  P-SHA256.

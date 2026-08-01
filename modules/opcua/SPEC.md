@@ -233,21 +233,36 @@ whether a state machine in `root` (client) or `server` (server) uses it.
     `server_ctt`, including Basic256Sha256 Sign and SignAndEncrypt;
   - *our client → our server*: over a real loopback socket, with the server
     driven from a second thread.
-- **Basic256Sha256 goldens** — all **self-derived** and labelled so, because
-  no published OPC UA vector exists for a secured chunk and a captured one
-  would have to embed a real peer's certificate: a full asymmetric
-  `OpenSecureChannel` message (791 bytes, from a fixed key seed and a fixed
-  OAEP seed, so the whole stack under it — `rsa.generate`,
-  `rsa.selfSignedCert`, RSA-OAEP, RSA-PKCS1v1.5 — is pinned byte-for-byte) and
-  one MSG chunk at each of Sign and SignAndEncrypt. Each is re-encoded and
-  re-opened identically. **Key derivation KAT:** `deriveKeys` over two fixed
-  32-byte nonces against expected bytes computed by an *independent* Python
-  implementation of RFC 5246 §5's P_hash with SHA-256 (OPC 10000-6 §6.7.5's
-  construction); `pSha256` itself is separately anchored by the published
-  TLS-1.2 PRF/SHA-256 vector, and the *layout* (which slice is which key, and
-  which nonce is secret vs seed per direction) is cross-checked by the live
-  interop — a real asyncua/open62541 client cannot exchange one signed chunk
-  with this server if any of the six outputs is wrong or swapped.
+- **Basic256Sha256 goldens** — two families, both in `server_interop.zig`:
+  - **Self-derived**, labelled as such: a full asymmetric `OpenSecureChannel`
+    message (791 bytes, from a fixed key seed and a fixed OAEP seed, so the
+    whole stack under it — `rsa.generate`, `rsa.selfSignedCert`, RSA-OAEP,
+    RSA-PKCS1v1.5 — is pinned byte-for-byte) and one MSG chunk at each of
+    Sign and SignAndEncrypt. Each is re-encoded and re-opened identically.
+  - **Captured**, from a real `open62541 server_ctt`: the OPN request +
+    response of a live Sign handshake (real client and server X.509
+    certificates, cross-checked against each other's thumbprints; the
+    encrypted region is asserted opaque and block-aligned rather than
+    decrypted, since that needs the ephemeral, OS-entropy-seeded client RSA
+    key this repository does not persist), and one Read request/response MSG
+    chunk at each of Sign and SignAndEncrypt — decoded, decrypted, verified
+    *and* re-encoded byte-identically using the actual session keys that
+    exchange derived (dumped straight out of `ch.io.security.?.keys` right
+    after the live handshake succeeded, since re-deriving them offline would
+    need that same non-reproducible RSA key). Cut from `root.zig`'s "LIVE
+    open62541 secure interop" test with `OPCUA_CAPTURE_DIR` set, the same
+    mechanism as the `#None` goldens below. Not covered: no live capture here
+    triggered multi-chunk (`'C'`-type) secured framing — see `server.zig`'s
+    own multi-chunk-secured-Browse test for that, self-derived rather than
+    captured.
+  - **Key derivation KAT:** `deriveKeys` over two fixed 32-byte nonces
+    against expected bytes computed by an *independent* Python implementation
+    of RFC 5246 §5's P_hash with SHA-256 (OPC 10000-6 §6.7.5's construction);
+    `pSha256` itself is separately anchored by the published TLS-1.2
+    PRF/SHA-256 vector, and the *layout* (which slice is which key, and which
+    nonce is secret vs seed per direction) is cross-checked by the live
+    interop — a real asyncua/open62541 client cannot exchange one signed
+    chunk with this server if any of the six outputs is wrong or swapped.
 - **`#None` goldens** cut from live traffic (`OPCUA_CAPTURE_DIR=… zig build
   test-opcua` dumps the raw streams): Hello, OpenSecureChannel, GetEndpoints,
   CreateSession, ActivateSession, Read, Browse, CreateSubscription,

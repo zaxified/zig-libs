@@ -2044,3 +2044,268 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
     defer gpa.free(opened);
     try testing.expectEqualSlices(u8, plain_body, opened);
 }
+
+// ── CAPTURED Basic256Sha256 goldens (live open62541 server_ctt) ────────────
+//
+// The self-derived goldens above pin exact byte-for-byte stack behavior from
+// fixed, deterministic inputs, with only the *live interop above* as their
+// third-party cross-check — no committed bytes actually came from a real
+// peer. These close that gap: real wire bytes from `root.zig`'s "LIVE
+// open62541 secure interop" test, a genuine `open62541 server_ctt` container
+// (not this repository's own code) exercising both Sign and SignAndEncrypt.
+//
+// Captured with `OPCUA_CAPTURE_DIR=<dir> zig build test-opcua` — the test's
+// own `dumpSecureCapture` (raw c2s/s2c byte streams) and `dumpSecureKeys`
+// (the ACTUAL derived session keys, read straight out of
+// `ch.io.security.?.keys` right after the real OPN handshake succeeded).
+// The keys have to be captured this way rather than re-derived here: the
+// client's RSA keypair is generated from a real OS-entropy CSPRNG for that
+// test (deliberately — it is the strongest real-world security test this
+// module has), so it is not reproducible, and the OPN response is encrypted
+// to it. Freezing the resulting keys is safe: they belong to one already-
+// closed channel to a local, single-run container, with no life beyond this
+// test file.
+//
+// The four MSG chunks below are all the same request: `Read` of
+// `Server_ServerStatus_CurrentTime` (i=2258) — small enough to read
+// comfortably, and exercised at both modes so the size delta (Sign only
+// signs; SignAndEncrypt also pads and encrypts) is a real, not asserted,
+// number.
+//
+// Not covered here: no live capture triggered multi-chunk ('C'-type)
+// framing (every message here fit in one 'F' chunk under the negotiated
+// 64KB limits) — multi-chunk secured framing already has offline coverage
+// elsewhere in this module (see `server.zig`'s "a bigger response" comment
+// near its Browse tests), just not from a live third-party peer.
+
+const captured_opn_sign_req_hex =
+    "4f504e46840500000000000039000000687474703a2f2f6f7063666f756e646174696f6e2e6f72672f55412f5365637572" ++
+    "697479506f6c6963792342617369633235365368613235361f0300003082031b30820203a003020102020101300d06092a" ++
+    "864886f70d01010b0500302d312b302906035504030c227a69672d6c696273206f706375612073656375726520696e7465" ++
+    "726f702074657374301e170d3236303130313030303030305a170d3237303130313030303030305a302d312b3029060355" ++
+    "04030c227a69672d6c696273206f706375612073656375726520696e7465726f70207465737430820122300d06092a8648" ++
+    "86f70d01010105000382010f003082010a0282010100b52bcb8c54abfe3f96468e8c3879d16311021d006ae432fa34ceda" ++
+    "ae0005fda15f7b768154754a8a83c566dbddffa9e60efba4437278789d784ac344cf3b5410e4e50748dbb1f274277b3ebb" ++
+    "781ee4c846974fb54dd79367282819ccff9f1557947764bdf38594d663efbc30f9f82dc27872dc62605a7b57b0b28ab0cc" ++
+    "6da32fc83fac5fde88c6ba526a353a77666cc6a82ebcc95eec67629f1eb350518c16d0923d95706d3d6790de732de74d5f" ++
+    "e2d4eca107526c573c608eb8381c2d16d720fbea7f5be8aa6cf67f3c1275f95342c8891628ebd52143b2b9fa2e663f69e2" ++
+    "19565e1d81fd5cc92b717bc223bdc3dba2409b1ba01d20980a23abad54adf3f7530203010001a3463044300c0603551d13" ++
+    "0101ff04023000300e0603551d0f0101ff04040302078030240603551d11041d301b861975726e3a7a69672d6c6962733a" ++
+    "6f706375613a636c69656e74300d06092a864886f70d01010b050003820101001fea8299856ebf260899c72cc7cd77e8d4" ++
+    "5d38dbd2cefcc69e407ea72fed99661077288f6ef08e0db075715a43d61acd671591a7aaaa4fc98134d1effead1750199c" ++
+    "0ec42f4e60c1081bbd2b8647b0ac1d9094064feede47330e12afb2280071fcec42cc154ada79d5f76179d0cb25ccc67d5a" ++
+    "703559819158177ab1461e41da61faf3083b5b3e572efaa607f38be974aa24b2ca58df24e9a26caa4c82f3a4ab480e7587" ++
+    "afd9b0b77181efefba16febe6130d7fac70b9c3aefeac827805fa14e5c782eaf2b4264f231ea137523ad596416a85ffc6c" ++
+    "96a19457da76010be71006afe3dfe1b3ce5c476ab63612e1dfe235bb2650032a50d73d3256bbff5576d9a9140000002937" ++
+    "5bce4cd4c180d910d7a8777a5398b5bdcdd93e5a149c305e6c3e9b3b68efb268d4cec089bdaeee99976739f0b7e3a38b46" ++
+    "8bf1e6a2c7f3bb70a14c5f4178511046e959a69413214e8d877273e3813ee901819cee4e5b1ec968d346b5d96af4c8bd8d" ++
+    "b1e1496fe5114e9078d9d96a5c1dc5bfa87715fe620cb8cf01d9927981f5d516274cc3354a1f049e735573247a8f656da3" ++
+    "d44d1d1d183a54bed5e8a820860e4613315bc3a629f05ddcbf976829133fdeb05b63f7ec1230f30f14bc50c3aac84ffeb4" ++
+    "9fa1bc9b4678f980638b82e43d0df95112536cf26520b1088c6ed5f025f952cfa7cc8f00e0bf7e294bbb79a5949b0d3434" ++
+    "272c02db62526c920c01a702d18ba663957b30f5a499fb7ea42bd2912c9625612a1519d9749b5b00a2186d437e0fc67470" ++
+    "02ea4926a5d4049b34e676643c33a5a7f6d7634e850f3aa342072c015fa93ebd3badd67f8579a42d5a012d563dc7ab5a6b" ++
+    "cb2cc6af9ef8c0a3d8d4c4195299dfb1962dd6e83affdcabed9bfe7becf77b55c11bfa6ae414889030969ff2353c200768" ++
+    "1bd6c2ddeaf5f8923f58c9f173e3a2c3185d292606150e2f1b78c18d670bfa803c2f154a4d6059c947ad639e7a98589f4b" ++
+    "92e792df0a302d41a011fa4a447af0eb0515dc91e23b674ce00c3e5a7d5912eabe9c4123988c4432e6188ad2203c7cefa3" ++
+    "8bf958cffbd8c0735d58dfcb1dd9b643e042a1cf9c6072868c6842018ba39dd5d70a3c5a79ccfe62";
+const captured_opn_sign_resp_hex =
+    "4f504e46510600000200000039000000687474703a2f2f6f7063666f756e646174696f6e2e6f72672f55412f5365637572" ++
+    "697479506f6c696379234261736963323536536861323536ec030000308203e8308202d0a0030201020214199bfaf0958e" ++
+    "b262bad7202a2bc9ae1483e57a49300d06092a864886f70d01010b05003045310b30090603550406130244453112301006" ++
+    "0355040a0c096f70656e36323534313122302006035504030c196f70656e3632353431536572766572406c6f63616c686f" ++
+    "7374301e170d3231303130353133343131365a170d3232303130353133343131365a3045310b3009060355040613024445" ++
+    "31123010060355040a0c096f70656e36323534313122302006035504030c196f70656e3632353431536572766572406c6f" ++
+    "63616c686f737430820122300d06092a864886f70d01010105000382010f003082010a0282010100c0600ee9769406fddd" ++
+    "21ebf8911d6a57a7e794439c2c59b2cec064f221ffd3cd2360e530d18c21809bfa6c37d307fc6be7680f85df26e411d0f8" ++
+    "3f47b50dbaec6cc1a1be8efad019f9e5308787a4f8b06ba7ca55f149a49da84bf0620343f26d3d7b1140c37fda91f3b0f6" ++
+    "7b9d63be503518860df1ddfed1447467c6a38a7866559c2d2c2b0c417782a703aa19718646bed3c2d3f04032e1b676b871" ++
+    "5a500ece408d7764ab97355a43bd65511c778378482fb1b8addd4004aed93fd3dbedce9b0a6a249c331c626b5b1fa9707b" ++
+    "74679e36db53b7950214a2db54b68bfc0bbc6c7523b3f0625d8d24a9f47137a76e2d13aeeb0de5e2cd3d9b180b8211e277" ++
+    "835b0203010001a381cf3081cc301d0603551d0e0416041437e2b4ea617b94526a81b2eb2bf12e2924e0ed22301f060355" ++
+    "1d2304183016801437e2b4ea617b94526a81b2eb2bf12e2924e0ed2230090603551d1304023000300b0603551d0f040403" ++
+    "0202f4301d0603551d250416301406082b0601050507030106082b0601050507030230530603551d11044c304a820c6635" ++
+    "30313062363766336435820c6635303130623637663364358704ac11000387047f000001862075726e3a6f70656e363235" ++
+    "34312e7365727665722e6170706c69636174696f6e300d06092a864886f70d01010b05000382010100a42f874dccae2975" ++
+    "c128fa26a49569304ec255665a34bffd1d08f375d203b020fc123aeb0f0b5359470268ff483bf75d490a87129ca9c17da3" ++
+    "3957be69829b9381e9d1b856ee650884628db6e9e34e7575a38df0f0953173b483deceb5cfa424ccfb8d6b18bad9faf6cc" ++
+    "8e6e13a54bca04e9aeec7d52674f7cf84cde750634cf50b9ba9f586904502acf6bbf47938e61b3689a986cb7bb6accc2ef" ++
+    "d0d5f6cfdb40fa133ef24d20eb17e104a0884f595ac57fdb1bb94b772d5d6851d1d229000d07119744a854912b248fdd40" ++
+    "9abe0a2b95ef63ee3ed5989305394661e72d7c98d6f9bc6702f3520f6f2d285a6c137985129fa7d4c83ed2889d87e9eb5b" ++
+    "21f85e140000000483a990dc18cb53bc21a630bcc94446d566dcf1a0f43a65cda49a164f6b1000c3935a9c1dc682e832b8" ++
+    "df2b14456c6250d9d3a56b9e213e7cb22594372562e425011a98984956ea30c513e53107367f3b6fea79a52bab0f57afe5" ++
+    "3ad98d990ca6ef21d6058280aaf4fa66b82e7fc9f07ad117eb019dce090791782c7a6d32cde8a33ab105114647a30d71be" ++
+    "16c77559628b9b99f1f70d8aa87f5a0b272393e25d418a753646fad759c110a61dfcb9224ab42bc153b10213307b2b125d" ++
+    "ee7ea4eccfb37f38227d0943222a02519a30762828954df5ba441a13f757cee3fbfc8840733306e5cd0cdcc336067d2403" ++
+    "4297e8ce7355f762693f6e4b5db93b55dca757b7697736e68070634cd5c9601ca98f6ab4d94b1ff56a6c75929922721431" ++
+    "af840ebbe983d56798bd674d88e9e9c8bd744d0f60143257101c326f56c3ca59f1da3c379ac3c16e4e4a38dca6e0784391" ++
+    "f655798240ef36d2e9f0861e33535112f177be2d2cf88cdbd1c5695440a66230e33121b5a6ce7649be7352e6975127cd1e" ++
+    "4c8a7fa478da21f43d927b05d63dbc4ba50126eb86da4aaa0431fa9205c94b1e6293042f68925153418b193b03689f3a8b" ++
+    "925126b0e9358b96d946354dd9680fda41f26476ffe95fd3618ae896815d6c341e610ba2f4eaea9e5d61822ddbffd171d9" ++
+    "0f42f2980b321f62b55619de0bf37f48ba919b7866f9aa2c7ff7a865462ad0d86200d0be932a407fb801b7eb8efc49da89";
+const captured_msg_sign_req_hex =
+    "4d5347468c000000020000000200000004000000040000000100770204010048a40d1eb5b4ef92388358c559c58c080000" ++
+    "0000000000000400000000000000ffffffff10270000000000000000000000000002000000010000000100d2080d000000" ++
+    "ffffffff0000ffffffff2b597809ec1a6b1096b4802bcc1357b7cc5fd7c815ec21f00adb31a965cb47c9";
+const captured_msg_sign_resp_hex =
+    "4d534746760000000200000002000000040000000400000001007a02725c2b4ca521dd01040000000000000000ffffffff" ++
+    "000000010000000d0d685c2b4ca521dd01725c2b4ca521dd01725c2b4ca521dd01ffffffffa3987c188f64c426176c8412" ++
+    "c27023968471a68c6ef7be72aa7bc1fd617e7331";
+const captured_msg_sign_and_encrypt_req_hex =
+    "4d534746900000000100000001000000b19c1d018d02cfe8a7433d55e2f0fb2ecc9e8a599f959b1a3948bc95ad82d1f3ff" ++
+    "f764c61dab90afb713e829710f2964135c588b77d4cd5d4c3f2166a0c198a6138533bc2bb80a0b1532896e3e27a2b3513c" ++
+    "20a0365b0d1918eb8b812b42b44a2e4b07d044ab0dd953e456c2d892d3d368aaa684764d81efaa6cf4e850a10e31";
+const captured_msg_sign_and_encrypt_resp_hex =
+    "4d534746800000000100000001000000164c43066f68261571d26b85161ff9a81f2e2e89d2c219f07d5429f222ed10befb" ++
+    "e1b30701f134ec5bbef1a6e5662c3902b41b9b065ffa42ce6063bcb52bbf24ff1d2b8a86336e5ffc18bdd6b40e2270cdc3" ++
+    "9d4d430fa1a4c9c77c11cd1e3c5eee206018a9ad99de14bcc76fdc48e7b2";
+const captured_sign_keys_hex =
+    "1c3f8456622f4cec9194060293e61cdad45c50f396f294908e65c2e9d11fb99f688d934744d4846f0ae69d5cbedcf87265" ++
+    "d3d18a822770ff02fbd3da641db7bb8805258b97a670def6bfabe8cbc8c1db042e16110de7b1dd16f72073d498fb10c604" ++
+    "1b83d8b49cb08b5df7c3de49c51c129b3c497a9bf6821d212e627e8e95c44709c5aa3d3dc2f60e1c819a5a4bb966026dd5" ++
+    "5fac47c9ab049a704444005f64";
+const captured_sign_and_encrypt_keys_hex =
+    "f5ee3432e84bd7408609feb80aa68eaa5c893c7062fcbe870135f47018a74fa56575b258bc0355a359e6861343a6333d7b" ++
+    "93a981a000fbcf9afc09bc94397d447ebd999a1a39aee40e9c5b2b02883b803cac50761af3548c3f08c2412bd7c5527776" ++
+    "34bc8c51867ec1a305e67ab2c76cfea18b1d40d9984f929a4fb798b4cea169ae15a4425a7e99661d7f57a32b329feb2dad" ++
+    "1fc2f4fb5ced2cebc461c6a596";
+
+/// Unpack a `dumpSecureKeys`-format 160-byte hex blob (client
+/// signing/encrypting/iv, then server signing/encrypting/iv) into a
+/// `security.ChannelKeys` — the exact keys one live captured exchange
+/// actually derived.
+fn channelKeysFromHex(hex: []const u8) security.ChannelKeys {
+    var buf: [160]u8 = undefined;
+    const b = std.fmt.hexToBytes(&buf, hex) catch unreachable;
+    return .{
+        .client_signing_key = b[0..32].*,
+        .client_encrypting_key = b[32..64].*,
+        .client_iv = b[64..80].*,
+        .server_signing_key = b[80..112].*,
+        .server_encrypting_key = b[112..144].*,
+        .server_iv = b[144..160].*,
+    };
+}
+
+test "golden (captured, live open62541 server_ctt): OpenSecureChannel request+response (Basic256Sha256/Sign)" {
+    const gpa = testing.allocator;
+
+    var req_buf: [1412]u8 = undefined;
+    const req = try std.fmt.hexToBytes(&req_buf, captured_opn_sign_req_hex);
+    var resp_buf: [1617]u8 = undefined;
+    const resp = try std.fmt.hexToBytes(&resp_buf, captured_opn_sign_resp_hex);
+
+    try testing.expectEqualStrings("OPN", req[0..3]);
+    try testing.expectEqual(@as(u8, 'F'), req[3]);
+    try testing.expectEqual(@as(u32, @intCast(req.len)), std.mem.readInt(u32, req[4..8], .little));
+    try testing.expectEqualStrings("OPN", resp[0..3]);
+    try testing.expectEqual(@as(u32, @intCast(resp.len)), std.mem.readInt(u32, resp[4..8], .little));
+
+    // The plaintext security header rides in the clear (§6.7.2.3) — this is
+    // the MessageSecurityMode negotiation's cert exchange, both certificates
+    // genuine (this client's own generated one; open62541's real one, pulled
+    // straight out of the running container by the live test). The mode
+    // field itself lives in the encrypted OpenSecureChannelRequest/Response
+    // body, which needs the matching RSA private key to open — the symmetric
+    // MSG goldens below are what a chosen mode then does to the wire.
+    const req_view = security.viewAsymmetricHeader(req[8..]).?;
+    const resp_view = security.viewAsymmetricHeader(resp[8..]).?;
+    try testing.expectEqualStrings(security.SecurityPolicy.basic256sha256.uri(), req_view.security_policy_uri);
+    try testing.expectEqualStrings(security.SecurityPolicy.basic256sha256.uri(), resp_view.security_policy_uri);
+
+    // Each side's ReceiverCertificateThumbprint is the SHA-1 of the OTHER
+    // side's SenderCertificate — the two independently-generated real
+    // certificates cross-reference each other correctly.
+    const client_cert = req_view.sender_certificate.?;
+    const server_cert = resp_view.sender_certificate.?;
+    const client_thumb = security.certificateThumbprint(client_cert);
+    const server_thumb = security.certificateThumbprint(server_cert);
+    try testing.expectEqualSlices(u8, &server_thumb, req_view.receiver_certificate_thumbprint.?);
+    try testing.expectEqualSlices(u8, &client_thumb, resp_view.receiver_certificate_thumbprint.?);
+    // A real X.509 DER certificate open62541 generated at container start —
+    // not one of this repository's own fixtures.
+    try testing.expect(server_cert.len > 500);
+
+    // Re-encoding the decoded envelope fields reproduces the real bytes
+    // exactly, up to the encrypted region: full OAEP fidelity would need the
+    // ephemeral (OS-entropy-seeded, never persisted) client private key —
+    // see the module docs on why that is not carried here.
+    var bw = std.Io.Writer.Allocating.init(gpa);
+    defer bw.deinit();
+    {
+        var e = encoding.Encoder.init(&bw.writer);
+        try bw.writer.writeInt(u32, 0, .little); // SecureChannelId: 0 on a fresh channel
+        try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+            .security_policy_uri = req_view.security_policy_uri,
+            .sender_certificate = req_view.sender_certificate,
+            .receiver_certificate_thumbprint = req_view.receiver_certificate_thumbprint,
+        });
+        try testing.expectEqualSlices(u8, req[8..][0..req_view.encrypted_region_offset], bw.writer.buffered());
+    }
+    bw.clearRetainingCapacity();
+    {
+        var e = encoding.Encoder.init(&bw.writer);
+        try bw.writer.writeInt(u32, std.mem.readInt(u32, resp[8..12], .little), .little); // the server-assigned SecureChannelId
+        try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+            .security_policy_uri = resp_view.security_policy_uri,
+            .sender_certificate = resp_view.sender_certificate,
+            .receiver_certificate_thumbprint = resp_view.receiver_certificate_thumbprint,
+        });
+        try testing.expectEqualSlices(u8, resp[8..][0..resp_view.encrypted_region_offset], bw.writer.buffered());
+    }
+
+    // The encrypted region is a whole number of 64-byte RSA blocks either way.
+    try testing.expectEqual(@as(usize, 0), (req.len - 8 - req_view.encrypted_region_offset) % 64);
+    try testing.expectEqual(@as(usize, 0), (resp.len - 8 - resp_view.encrypted_region_offset) % 64);
+}
+
+test "golden (captured, live open62541 server_ctt): symmetric MSG chunks (Read i=2258) at Sign and SignAndEncrypt" {
+    const gpa = testing.allocator;
+
+    const Case = struct {
+        mode: services.MessageSecurityMode,
+        keys: security.ChannelKeys,
+        req_hex: []const u8,
+        resp_hex: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .mode = .sign, .keys = channelKeysFromHex(captured_sign_keys_hex), .req_hex = captured_msg_sign_req_hex, .resp_hex = captured_msg_sign_resp_hex },
+        .{
+            .mode = .sign_and_encrypt,
+            .keys = channelKeysFromHex(captured_sign_and_encrypt_keys_hex),
+            .req_hex = captured_msg_sign_and_encrypt_req_hex,
+            .resp_hex = captured_msg_sign_and_encrypt_resp_hex,
+        },
+    };
+
+    for (cases) |c| {
+        var req_buf: [256]u8 = undefined;
+        const req = try std.fmt.hexToBytes(&req_buf, c.req_hex);
+        var resp_buf: [256]u8 = undefined;
+        const resp = try std.fmt.hexToBytes(&resp_buf, c.resp_hex);
+
+        // Decode + verify + decrypt real `open62541 server_ctt` bytes with
+        // the ACTUAL session keys this exchange derived (dumped straight out
+        // of `ch.io.security.?.keys` — see `root.zig`'s `dumpSecureKeys`).
+        const opened_req = try security.symmetricDecryptAndVerify(gpa, req[0..8], req[8..], c.mode, c.keys, .client_to_server);
+        defer gpa.free(opened_req);
+        const opened_resp = try security.symmetricDecryptAndVerify(gpa, resp[0..8], resp[8..], c.mode, c.keys, .server_to_client);
+        defer gpa.free(opened_resp);
+
+        // Re-encode: AES-256-CBC/HMAC-SHA256 are deterministic given the same
+        // key/IV/plaintext, so this reproduces the real wire bytes exactly —
+        // a true byte-identical round trip against genuine third-party
+        // ciphertext, not just a decode check.
+        const produced_req = try security.symmetricSignAndEncrypt(gpa, "MSG", opened_req, c.mode, c.keys, .client_to_server);
+        defer gpa.free(produced_req);
+        try testing.expectEqualSlices(u8, req, produced_req);
+        const produced_resp = try security.symmetricSignAndEncrypt(gpa, "MSG", opened_resp, c.mode, c.keys, .server_to_client);
+        defer gpa.free(produced_resp);
+        try testing.expectEqualSlices(u8, resp, produced_resp);
+    }
+
+    // Sign carries only the HMAC-SHA256 MAC; SignAndEncrypt pads to a whole
+    // AES block first and encrypts — the size delta this real exchange
+    // actually produced, not a self-derived arithmetic claim.
+    try testing.expect(captured_msg_sign_and_encrypt_req_hex.len > captured_msg_sign_req_hex.len);
+    try testing.expect(captured_msg_sign_and_encrypt_resp_hex.len > captured_msg_sign_resp_hex.len);
+}

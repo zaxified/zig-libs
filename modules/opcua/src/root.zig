@@ -2250,10 +2250,79 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
 
 const live_secure_container_name = "opcua-zig-libs-live-test-secure";
 
+/// A `Hasher`-shaped byte sink for `Reader.hashed`/`Writer.hashed`: instead of
+/// hashing, it appends every byte that streams through to an owned
+/// `ArrayList` — a zero-behavioral-effect tee (the bytes still flow to the
+/// real socket unchanged) used to cut the Sign/SignAndEncrypt goldens below
+/// from a genuine `open62541 server_ctt` exchange. `bytes` is a pointer so
+/// copying this value (which `Reader.hashed`/`Writer.hashed` does internally)
+/// still targets the caller's own list.
+const ByteCapture = struct {
+    gpa: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+
+    pub fn update(self: ByteCapture, data: []const u8) void {
+        self.bytes.appendSlice(self.gpa, data) catch @panic("OOM capturing live OPC UA interop bytes (test-only path)");
+    }
+};
+
+/// `Writer.hashed`'s default `flush` only drains ITS OWN buffer into the
+/// inner writer's buffer — with `Hashed`'s vtable unmodified, bytes can sit
+/// in the *real* socket writer's buffer indefinitely, since nothing ever
+/// calls the inner writer's own `flush`. This is swapped in as the outer
+/// writer's `flush` (its `drain` is left as `Writer.hashed`'s own, correct,
+/// already-tested one): reach through `Hashed(ByteCapture).out` — the real
+/// writer — and flush it too, so bytes actually reach the socket exactly
+/// when the caller (`transport.zig`) asks them to.
+fn flushThrough(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try std.Io.Writer.defaultFlush(w);
+    const hashed: *std.Io.Writer.Hashed(ByteCapture) = @alignCast(@fieldParentPtr("writer", w));
+    try hashed.out.flush();
+}
+
+/// Dump one secure sequence's raw exchange when `OPCUA_CAPTURE_DIR` is set —
+/// the client-side counterpart of `server_interop.zig`'s `Driver.dumpCapture`.
+fn dumpSecureCapture(io: std.Io, tag: []const u8, c2s: []const u8, s2c: []const u8) void {
+    const dir_path = std.process.Environ.getPosix(std.testing.environ, "OPCUA_CAPTURE_DIR") orelse return;
+    var path_buf: [256]u8 = undefined;
+    if (std.fmt.bufPrint(&path_buf, "{s}/{s}-c2s.bin", .{ dir_path, tag })) |path| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c2s }) catch {};
+    } else |_| {}
+    if (std.fmt.bufPrint(&path_buf, "{s}/{s}-s2c.bin", .{ dir_path, tag })) |path| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = s2c }) catch {};
+    } else |_| {}
+}
+
+/// Dump the actual derived session keys (P-SHA256 output, `deriveKeys` — see
+/// `security.zig`) from THIS live exchange when `OPCUA_CAPTURE_DIR` is set.
+/// Test-only, one-off material: the channel these keys belong to is closed
+/// before the test function returns, so freezing them alongside the captured
+/// MSG bytes lets an offline golden fully decrypt/verify/re-encode real
+/// third-party ciphertext without needing the (ephemeral, OS-entropy-seeded,
+/// never persisted) RSA keypair that produced them via the OPN handshake.
+fn dumpSecureKeys(io: std.Io, tag: []const u8, keys: security.ChannelKeys) void {
+    const dir_path = std.process.Environ.getPosix(std.testing.environ, "OPCUA_CAPTURE_DIR") orelse return;
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}-keys.bin", .{ dir_path, tag }) catch return;
+    var blob: [32 + 32 + 16 + 32 + 32 + 16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&blob);
+    w.writeAll(&keys.client_signing_key) catch return;
+    w.writeAll(&keys.client_encrypting_key) catch return;
+    w.writeAll(&keys.client_iv) catch return;
+    w.writeAll(&keys.server_signing_key) catch return;
+    w.writeAll(&keys.server_encrypting_key) catch return;
+    w.writeAll(&keys.server_iv) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &blob }) catch {};
+}
+
 /// One full secure client sequence against the live server: connect ->
 /// Hello -> OpenSecureChannel (Basic256Sha256, `mode`) -> CreateSession ->
 /// ActivateSession (clientSignature over serverCertificate ‖ serverNonce)
 /// -> Read i=2258 over the signed(-and-encrypted) channel -> teardown.
+///
+/// `capture_tag` names the pair of raw byte dumps `OPCUA_CAPTURE_DIR` writes
+/// (`<tag>-c2s.bin` / `<tag>-s2c.bin`) — how the Sign/SignAndEncrypt goldens
+/// below were cut from a real `open62541 server_ctt`.
 fn liveSecureSequence(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -2261,6 +2330,7 @@ fn liveSecureSequence(
     credentials: security.ClientCredentials,
     server_certificate: []const u8,
     random: std.Random,
+    capture_tag: []const u8,
 ) !void {
     const testing = std.testing;
 
@@ -2272,7 +2342,28 @@ fn liveSecureSequence(
     var write_buf: [8192]u8 = undefined;
     var stream_reader = stream.reader(io, &read_buf);
     var stream_writer = stream.writer(io, &write_buf);
-    var conn = transport.Connection.init(&stream_reader.interface, &stream_writer.interface);
+
+    // Tee every byte crossing the wire into `c2s_bytes`/`s2c_bytes` — the
+    // hashed wrapper is a pass-through (the real reader/writer underneath is
+    // untouched), so this has no effect on the exchange itself.
+    var c2s_bytes: std.ArrayList(u8) = .empty;
+    defer c2s_bytes.deinit(gpa);
+    var s2c_bytes: std.ArrayList(u8) = .empty;
+    defer s2c_bytes.deinit(gpa);
+    // Zero-length outer buffer: `drain` fires synchronously on every write
+    // instead of deferring to a `flush` this layer would otherwise never see
+    // (see `flushThrough`).
+    var hashed_writer = stream_writer.interface.hashed(ByteCapture{ .gpa = gpa, .bytes = &c2s_bytes }, &.{});
+    const capture_write_vtable: std.Io.Writer.VTable = .{
+        .drain = hashed_writer.writer.vtable.drain,
+        .flush = flushThrough,
+    };
+    hashed_writer.writer.vtable = &capture_write_vtable;
+    var hashed_read_buf: [8192]u8 = undefined;
+    var hashed_reader = stream_reader.interface.hashed(ByteCapture{ .gpa = gpa, .bytes = &s2c_bytes }, &hashed_read_buf);
+    defer dumpSecureCapture(io, capture_tag, c2s_bytes.items, s2c_bytes.items);
+
+    var conn = transport.Connection.init(&hashed_reader.reader, &hashed_writer.writer);
     _ = try conn.hello(.{
         .protocol_version = 0,
         .receive_buffer_size = 65536,
@@ -2293,6 +2384,7 @@ fn liveSecureSequence(
     });
     defer ch.close() catch {};
     try testing.expect(ch.io.security.?.keys != null);
+    dumpSecureKeys(io, capture_tag, ch.io.security.?.keys.?);
 
     var session = try Session.create(&ch, gpa, .{
         .client_description = .{
@@ -2432,6 +2524,6 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
     // SignAndEncrypt is the headline mode; Sign proves the
     // signature-only symmetric framing (no padding, no encryption) against
     // the same server.
-    try liveSecureSequence(gpa, io, .sign_and_encrypt, credentials, server_certificate, random);
-    try liveSecureSequence(gpa, io, .sign, credentials, server_certificate, random);
+    try liveSecureSequence(gpa, io, .sign_and_encrypt, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign_and_encrypt");
+    try liveSecureSequence(gpa, io, .sign, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign");
 }
