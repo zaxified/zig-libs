@@ -927,7 +927,7 @@ pub fn Group(comptime S: type) type {
             const resolved = try self.resolveProposals(arena, gpa, commit.proposals, params.proposal_msgs, old_gc);
             defer gpa.free(resolved);
             if (external) {
-                try validateExternalProposalList(resolved);
+                try self.validateExternalProposalList(resolved);
             } else {
                 try self.validateProposalList(gpa, resolved, member_committer);
             }
@@ -1400,7 +1400,7 @@ pub fn Group(comptime S: type) type {
             // the same procedure, and the same CHOICE of procedure, that
             // every receiver will.
             if (external) {
-                try validateExternalProposalList(resolved);
+                try self.validateExternalProposalList(resolved);
             } else {
                 try self.validateProposalList(gpa, resolved, self.my_leaf_index);
             }
@@ -2254,7 +2254,24 @@ pub fn Group(comptime S: type) type {
             };
             for (resolved) |rp| switch (rp.proposal) {
                 .remove => |idx| {
-                    if (idx * 2 >= self.ratchet_tree.nodes.len) return error.UnknownMember;
+                    // §12.1.3's validity condition, re-checked HERE and not
+                    // only in the §12.2 pass, so this function's own
+                    // contract ("a leaf index named by a Remove names a
+                    // non-blank leaf") holds for every caller. It is judged
+                    // against the tree as it stands at this point of §12.3's
+                    // order, which is the SAME occupancy the §12.2 pass saw:
+                    // the only step that ran before it is the Update loop,
+                    // and an Update replaces an occupied leaf with another
+                    // occupied leaf. A Remove earlier in this same list
+                    // cannot have blanked this leaf either — §12.2 rejects
+                    // "multiple Update and/or Remove proposals that apply to
+                    // the same leaf", and an external Commit's list carries
+                    // at most one Remove — so the sequential reading and the
+                    // "judge the whole list against the pre-Commit tree"
+                    // reading coincide, and the sequential one additionally
+                    // catches a same-leaf duplicate that ever slipped past
+                    // §12.2.
+                    try self.validateRemoveProposal(idx);
                     try self.ratchet_tree.removeLeaf(idx);
                 },
                 else => {},
@@ -2384,6 +2401,21 @@ pub fn Group(comptime S: type) type {
                     // "It contains a Remove proposal that removes the
                     // committer."
                     if (idx == committer) return error.InvalidProposalList;
+                    // §12.2's first bullet: "it contains an individual
+                    // proposal that is invalid as specified in Section
+                    // 12.1". §12.1.3's condition is the one below. Run here,
+                    // BEFORE the poison flag is set, so a Commit refused for
+                    // it does not also destroy the group — the same reason
+                    // the Add KeyPackage checks were hoisted out of
+                    // `applyProposals` into `commitInner`'s pre-mutation
+                    // phase. It stays enforced in `applyProposals` as well;
+                    // see the note there.
+                    //
+                    // AFTER the committer check, deliberately: a self-Remove
+                    // names an occupied leaf, so the two never compete, and
+                    // keeping §12.2's own rule first preserves the error a
+                    // caller already sees for it.
+                    try self.validateRemoveProposal(idx);
                     try appendUnique(gpa, &touched, idx);
                     try removed.append(gpa, idx);
                 },
@@ -2451,8 +2483,16 @@ pub fn Group(comptime S: type) type {
         /// Adds, Updates, GroupContextExtensions and ReInits from a party
         /// that is not yet a member, which is exactly what the split
         /// procedure exists to prevent. It takes no committer index because
-        /// there is no committer leaf yet, and consults no tree because
-        /// none of the four lines reads one.
+        /// there is no committer leaf yet.
+        ///
+        /// It DOES consult the tree, for one thing and in a second pass:
+        /// §12.1's per-proposal validity, which §12.2 folds into both
+        /// procedures and which for a Remove (§12.1.3) is a question about
+        /// the tree. The second pass is not cosmetic — the four list-shape
+        /// rules above are about the LIST and must keep reporting first, so
+        /// that a list with two Removes is still refused as
+        /// `MultipleRemoveInExternalCommit` rather than as whichever of the
+        /// two happens to name a blank leaf.
         ///
         /// **Two rules deliberately NOT carried over from the regular
         /// procedure**, both because §12.2's external list is closed and
@@ -2478,7 +2518,7 @@ pub fn Group(comptime S: type) type {
         /// removed participant") is an Authentication Service question, and
         /// so stays the application's for the same reason §7.3's credential
         /// bullet does — see this file's §7.3 boundary note.
-        fn validateExternalProposalList(list: []const Resolved) !void {
+        fn validateExternalProposalList(self: *const Self, list: []const Resolved) !void {
             var n_external_init: usize = 0;
             var n_remove: usize = 0;
             for (list) |rp| {
@@ -2502,6 +2542,15 @@ pub fn Group(comptime S: type) type {
             if (n_external_init == 0) return error.MissingExternalInit;
             if (n_external_init > 1) return error.MultipleExternalInit;
             if (n_remove > 1) return error.MultipleRemoveInExternalCommit;
+
+            // §12.1's per-proposal validity, after the list-shape rules. For
+            // §12.4.3.2's resync flavor the Remove names the joiner's OWN
+            // earlier leaf, so a stale one is the likeliest mistake there of
+            // all the places a Remove appears.
+            for (list) |rp| switch (rp.proposal) {
+                .remove => |idx| try self.validateRemoveProposal(idx),
+                else => {},
+            };
         }
 
         /// RFC 9420 §12.1.4's three conditions that make a `PreSharedKey`
@@ -2525,6 +2574,35 @@ pub fn Group(comptime S: type) type {
         /// the implementable form of the same gate is a resumption PSK with
         /// usage `application`, which demonstrates presence in a prior epoch
         /// exactly as well. Noted in `SPEC.md`.
+        /// RFC 9420 §12.1.3's condition that makes a `Remove` PROPOSAL
+        /// invalid: `removed` must name a member of the group as the tree
+        /// currently stands. (Paraphrased, not quoted — §12.1.3 states it as
+        /// a sentence about the removed member, not as a tree predicate.)
+        ///
+        /// **A blank leaf that is still IN BOUNDS is the case worth naming.**
+        /// §7.7 only truncates trailing blanks, so removing leaf 1 of a
+        /// three-member group leaves the tree exactly as wide as it was, with
+        /// `nodes[2]` blank. A bounds test alone therefore accepts a second
+        /// Remove of leaf 1, and `RatchetTree.removeLeaf` blanks an
+        /// already-blank slot without complaint — the Commit applies as a
+        /// no-op and nothing looks wrong locally. That is precisely why it is
+        /// worth rejecting: every conformant peer refuses that Commit, so
+        /// accepting it does not produce a weaker group, it produces two
+        /// groups that disagree about which Commits exist.
+        ///
+        /// Stated by §12.1 about the PROPOSAL and not about the list, so —
+        /// exactly like `validatePskProposal` — it applies under both of
+        /// §12.2's procedures.
+        fn validateRemoveProposal(self: *const Self, idx: u32) !void {
+            // `@as(usize, idx)` before the doubling, not after: `idx` is the
+            // wire's `uint32` and `idx * 2` in u32 wraps for `idx >= 2^31`,
+            // which in a safety build is a panic reachable from a decoded
+            // message rather than a rejection.
+            const node_index = @as(usize, idx) * 2;
+            if (node_index >= self.ratchet_tree.nodes.len) return error.UnknownMember;
+            if (self.ratchet_tree.nodes[node_index] == null) return error.UnknownMember;
+        }
+
         fn validatePskProposal(id: keyschedule.PreSharedKeyId) !void {
             // "The psk_nonce is not of length KDF.Nh." §8.4's reason: the
             // nonce is what stops a re-used PSK from producing a re-used
@@ -3325,6 +3403,248 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
         try expectSameEpoch(&b, &d_grp);
         try testing.expectEqual(@as(u64, 5), b.epoch);
     }
+}
+
+/// Re-frame a MEMBER's Commit around a different proposal list: re-sign with
+/// the sender's own key and recompute the `membership_tag` from the group's
+/// own `membership_key`. Strictly what a misbehaving MEMBER can do and nothing
+/// an outsider can — which is the point, since a conformant sender will not
+/// build the list this forges. `path`/`confirmation_tag` are left as they
+/// were: every check it is used to drive runs at §12.4.2's bullet 4, before
+/// either is read.
+fn resignMemberCommit(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    commit_msg: []const u8,
+    signer: TestSuite.Sig.KeyPair,
+    membership_key: [TestSuite.Nh]u8,
+    old_gc: []const u8,
+    proposals: []const content.ProposalOrRef,
+) ![]u8 {
+    var r = codec.Reader.init(commit_msg);
+    const msg = try framing.MLSMessage.decode(arena, &r);
+    try testing.expect(r.atEnd());
+    var pm = msg.public_message;
+    var commit = pm.content.body.commit;
+    commit.proposals = proposals;
+    pm.content.body = .{ .commit = commit };
+
+    const sig = try framing.signFramedContent(TestSuite, gpa, signer, .mls_public_message, pm.content, old_gc);
+    const sig_bytes = sig.toBytes();
+    pm.auth.signature = &sig_bytes;
+    const tag = try framing.membershipTag(TestSuite, gpa, membership_key, pm.content, pm.auth, old_gc);
+    pm.membership_tag = &tag;
+    const out: framing.MLSMessage = .{ .public_message = pm };
+    return out.encodeAlloc(gpa);
+}
+
+test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refused, and Removes of distinct leaves are not" {
+    // The case a bounds test alone cannot see. §7.7 truncates only TRAILING
+    // blanks, so vacating an interior leaf leaves the tree exactly as wide as
+    // it was and `idx * 2 < nodes.len` still holds for the leaf nobody
+    // occupies. `RatchetTree.removeLeaf` then blanks an already-blank slot
+    // without complaining, so the second Remove applies as a silent no-op —
+    // which is why it survived: nothing local looks wrong. What is wrong is
+    // remote. Every conformant peer refuses that Commit under §12.1.3, so
+    // accepting it does not weaken this group, it forks it.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 71);
+    const bob = try TestClient.init(aa, "bob", 72);
+    const carol = try TestClient.init(aa, "carol", 73);
+    const dave = try TestClient.init(aa, "dave", 74);
+    const erin = try TestClient.init(aa, "erin", 75);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "blank-remove",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    // epoch 1: alice fills leaves 1, 2 and 3. FOUR members, not three,
+    // because leaf 3 is what keeps the tree from shrinking when leaf 1 goes —
+    // in a three-member group the same Remove would leave a two-leaf tree and
+    // the second Remove would be caught by the bounds test that already
+    // existed, proving nothing.
+    var c_grp: Group(TestSuite) = undefined;
+    var d_grp: Group(TestSuite) = undefined;
+    {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{
+                .{ .by_value = .{ .add = bob.kp } },
+                .{ .by_value = .{ .add = carol.kp } },
+                .{ .by_value = .{ .add = dave.kp } },
+            },
+        });
+        defer c.deinit(gpa);
+        c_grp = try carol.join(gpa, c.welcome.?, &.{});
+        d_grp = try dave.join(gpa, c.welcome.?, &.{});
+    }
+    defer c_grp.deinit();
+    defer d_grp.deinit();
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+
+    // epoch 2: alice removes bob (leaf 1). The tree does NOT shrink.
+    {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
+        });
+        defer c.deinit(gpa);
+        try c_grp.processCommit(.{ .commit_msg = c.commit });
+        try d_grp.processCommit(.{ .commit_msg = c.commit });
+    }
+    try testing.expectEqual(@as(u64, 2), a.epoch);
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+    try expectSameEpoch(&a, &c_grp);
+    try expectSameEpoch(&a, &d_grp);
+
+    // ── THE REPRODUCTION: remove leaf 1 again. In bounds, blank, and until
+    // §12.1.3 was enforced this returned a perfectly good Commit.
+    try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
+    }));
+    // Refused at §12.2, BEFORE the tree was touched — so the sender's own
+    // group survives its own mistake. (`applyProposals` enforces the same
+    // condition, but reaching it would mean reaching it past the poison
+    // flag.)
+    try testing.expect(!a.poisoned);
+    try testing.expectEqual(@as(u64, 2), a.epoch);
+
+    // Past the end of the tree: the case the old bounds test did catch, kept
+    // so that removing the bounds arm cannot pass unnoticed.
+    try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .remove = 9 } }},
+    }));
+    // A leaf index whose DOUBLING overflows `u32`. The old test computed
+    // `idx * 2` in the wire's own width, so this was an integer-overflow
+    // panic in a safety build, reachable from a decoded message.
+    try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .remove = 0x8000_0000 } }},
+    }));
+
+    // Unchanged, and checked here so the new condition cannot be what is
+    // reporting them: §12.2's own two Remove rules still win where they
+    // apply. The committer's leaf is occupied, so the self-Remove rule is not
+    // shadowed by §12.1.3 …
+    try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .remove = 0 } }},
+    }));
+    // … and the SAME leaf twice in one list is still §12.2's "multiple
+    // Update and/or Remove proposals that apply to the same leaf", even
+    // though both name an occupied leaf.
+    try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{
+            .{ .by_value = .{ .remove = 2 } },
+            .{ .by_value = .{ .remove = 2 } },
+        },
+    }));
+    try testing.expect(!a.poisoned);
+    try testing.expectEqual(@as(u64, 2), a.epoch);
+
+    // ── The RECEIVING half. A conformant sender will not build the list
+    // above, so the only way a receiver ever sees one is a member that
+    // re-frames its own Commit — which is exactly what a divergent or
+    // malicious implementation is.
+    {
+        const old_gc = try c_grp.groupContextAlloc(gpa);
+        defer gpa.free(old_gc);
+        const membership_key = c_grp.secrets.membership_key;
+
+        // epoch 3: an ordinary Commit from alice, to be spoiled. It refills
+        // blank leaf 1 with erin (§12.1.1 places an Add in the leftmost
+        // blank), which the legal-multi-Remove step below needs.
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = erin.kp } }},
+        });
+        defer c.deinit(gpa);
+
+        const bad = try resignMemberCommit(gpa, aa, c.commit, alice.sig, membership_key, old_gc, &.{
+            .{ .proposal = .{ .remove = 1 } },
+        });
+        defer gpa.free(bad);
+        try testing.expectError(error.UnknownMember, c_grp.processCommit(.{ .commit_msg = bad }));
+        // Refused at bullet 4, so carol is not poisoned and can still follow
+        // the REAL Commit — which is what makes the refusal a rejection of
+        // the message rather than a denial of service against the receiver.
+        try testing.expect(!c_grp.poisoned);
+        try testing.expectEqual(@as(u64, 2), c_grp.epoch);
+
+        try c_grp.processCommit(.{ .commit_msg = c.commit });
+        try d_grp.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &c_grp);
+        try expectSameEpoch(&a, &d_grp);
+        try testing.expectEqual(@as(u64, 3), a.epoch);
+        try testing.expectEqual(@as(usize, 4), a.treeSize());
+    }
+
+    // ── And the legal shape stays legal: TWO Removes in one Commit naming
+    // DISTINCT occupied leaves (erin at 1 and carol at 2). §12.2 forbids two
+    // proposals against the SAME leaf, not two Removes; refusing this would
+    // be the obvious over-correction. Dave, who survives at leaf 3, follows
+    // it — so the two sides are shown to agree, not merely not to error.
+    {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{
+                .{ .by_value = .{ .remove = 1 } },
+                .{ .by_value = .{ .remove = 2 } },
+            },
+        });
+        defer c.deinit(gpa);
+        try d_grp.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &d_grp);
+    }
+    try testing.expectEqual(@as(u64, 4), a.epoch);
+    // Leaf 3 is still occupied, so §7.7 truncates nothing — which is the very
+    // condition that made the blank interior leaf reachable in the first
+    // place, re-asserted here rather than assumed.
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+
+    // …and §7.7's truncation still runs when the LAST leaf goes: removing
+    // dave leaves alice alone and the tree collapses to one leaf. The
+    // shrinking path is downstream of the new check and must be untouched.
+    {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .remove = 3 } }},
+        });
+        defer c.deinit(gpa);
+    }
+    try testing.expectEqual(@as(u64, 5), a.epoch);
+    try testing.expectEqual(@as(usize, 1), a.treeSize());
+    // And a Remove of a leaf the truncation just dropped is refused by the
+    // bounds arm, not by the blankness arm — both are live.
+    try testing.expectError(error.UnknownMember, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .remove = 3 } }},
+    }));
 }
 
 test "§7.5: adding a member into the committer's OWN sibling leaf keeps that node in the path with an empty ciphertext vector, and the result is §7.9.2-valid" {
