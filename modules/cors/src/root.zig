@@ -926,3 +926,227 @@ test "integration: preflight 204 (handler not invoked), allowed GET gets Allow-O
         try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
     }
 }
+
+// ── external anchor: flask_cors (independent Fetch/CORS-algorithm oracle) ───
+//
+// `rs/cors` and `expressjs/cors` (the module doc's `model_after`) are DESIGN
+// references only, never test oracles — this whole file has been our own
+// assertions about our own output until now. `flask_cors` 6.0.5 (on Flask
+// 3.1.3, Python 3.14.4) is an independent third-party implementation of the
+// same W3C/Fetch CORS algorithm, run here purely as a black-box test oracle
+// (root `NOTICE` §0's black-box-oracle carve-out applies — no flask_cors
+// source was read to write these tests, only its observable request/response
+// behavior; confirmed via `check-catalog`, no NOTICE entry needed).
+//
+// Captured ONCE, offline, via a throwaway Python script driving flask_cors's
+// Flask test client (in-process WSGI calls — no socket even at capture time)
+// against configurations chosen to mirror this module's own. Reproduction:
+//   ~/.cache/zig-libs-misc/bin/python -c "import flask, flask_cors; ..."
+// (see this campaign's session notes for the exact script). The tests below
+// assert our module's ACTUAL output against those frozen values — offline,
+// no socket, no Python at test time. Every AGREEMENT is asserted as byte
+// equality; every DIVERGENCE is asserted as OUR OWN behavior with the
+// oracle's answer quoted in a comment and judged against the Fetch spec /
+// RFC 9110 / RFC 7231 — never adjusted to match the oracle (a mature library
+// is an oracle, not an authority).
+//
+// ── full divergence ledger (captured bytes in parentheses) ──────────────────
+//
+// 1. Allow-Headers casing/ordering (`.list` mode). Ours advertises the
+//    CONFIGURED list verbatim (case + order as configured) on every
+//    successful preflight, regardless of what was requested. flask_cors
+//    instead advertises the *intersection* with the actually-REQUESTED
+//    headers, lower-cased and alphabetically sorted (config
+//    `["Content-Type","Authorization"]`, request "content-type,
+//    authorization" → flask_cors answers "authorization, content-type"; see
+//    the agreement test below, which asserts our differing value). Both are
+//    Fetch-spec compliant (the browser only checks case-insensitive
+//    presence); this is a cheaper, simpler design choice on our side (no
+//    per-request filtering), not a bug.
+//
+// 2. `Vary: Origin` on actual responses. Ours ALWAYS emits it for a
+//    non-wildcard echoed origin. flask_cors only emits it when the
+//    configured origin set is ambiguous (more than one literal origin, or a
+//    regex) — a SINGLE configured origin gets no `Vary` at all from
+//    flask_cors (captured: single-origin config → no Vary header;
+//    multi-origin config → `Vary: Origin`). Judged: our unconditional Vary
+//    is the more correct reading of RFC 7231 §7.1.4 — even with one
+//    configured origin, the response genuinely differs by Origin (absent or
+//    mismatched Origin gets NO CORS headers at all; a matching one gets
+//    `Access-Control-Allow-Origin`), so a downstream cache still needs the
+//    hint. flask_cors's narrower heuristic is a known-common simplification
+//    across CORS libraries, not something to adopt. See the divergence test
+//    below.
+//
+// 3. Credentials + wildcard origin. Ours REJECTS the combination at `init`,
+//    unconditionally (`error.CredentialsWithWildcardOrigin`) — see the
+//    existing "wildcard + credentials is rejected at init" test above.
+//    flask_cors only hard-errors when the caller ALSO sets its
+//    `send_wildcard=True` knob; with `origins="*", supports_credentials=True`
+//    and its default `send_wildcard=False`, flask_cors does NOT raise —
+//    captured: it silently REFLECTS the specific request origin (not the
+//    literal `*`) plus `Access-Control-Allow-Credentials: true` and
+//    `Vary: Origin`. That default configuration is the textbook
+//    reflect-any-origin-with-credentials anti-pattern (OWASP's CORS
+//    misconfiguration class): it grants every website on the internet
+//    credentialed access, which is exactly what the Fetch spec's wildcard/
+//    credentials prohibition exists to prevent. This is not something our
+//    module can even express (no `send_wildcard`-equivalent knob — `.any` +
+//    `allow_credentials` is refused unconditionally, full stop) and is not
+//    adopted; it confirms our stricter posture is justified, not an
+//    oversight.
+//
+// 4. Disallowed preflight METHOD: partial leak vs. fail-closed. flask_cors
+//    still emits `Access-Control-Allow-Origin` (+ configured
+//    `Access-Control-Expose-Headers` / `Access-Control-Allow-Credentials`)
+//    on a preflight whose `Access-Control-Request-Method` isn't in its
+//    allow-list — only `-Allow-Methods`/`-Allow-Headers`/`-Max-Age` are
+//    withheld (captured: origin `https://app.example`, methods=[GET],
+//    credentials on, expose=[X-Request-Id], ACRM: DELETE → 200 with
+//    `Access-Control-Allow-Origin: https://app.example`,
+//    `Access-Control-Expose-Headers: X-Request-Id`,
+//    `Access-Control-Allow-Credentials: true`, no Allow-Methods/Max-Age).
+//    Ours withholds EVERY CORS header on ANY gate failure (see "preflight:
+//    failing any gate → 204 with Vary but zero CORS headers" above, whose
+//    "disallowed requested method" sub-case is the same scenario). Judged:
+//    the Fetch spec only defines what the BROWSER checks against the
+//    advertised lists — a missing Allow-Methods already fails the browser's
+//    preflight regardless of what else leaked, so flask_cors's partial leak
+//    is not unsafe to a conformant browser, but it does leak an
+//    origin-allowlist oracle (and credentials/expose-headers configuration)
+//    to a probing, non-browser client. Our fail-closed, zero-information
+//    posture is the more conservative design; not adopted from flask_cors,
+//    kept as-is.
+//
+// 5. Disallowed preflight HEADER (`.list` mode): partial-allow vs.
+//    fail-closed. flask_cors advertises the INTERSECTION of what was
+//    requested and what is configured, dropping only the disallowed names —
+//    the preflight still "succeeds" overall (Allow-Origin + Allow-Methods
+//    present). Captured: configured `["Content-Type"]`, requested
+//    "content-type, x-evil" → `Access-Control-Allow-Headers: content-type`
+//    (x-evil silently dropped, everything else still emitted); requested
+//    "x-evil, x-also-evil" (nothing allowed) → `Access-Control-Allow-Headers`
+//    omitted entirely, but Allow-Origin + Allow-Methods still present. Ours
+//    treats ANY disallowed requested header as an all-or-nothing preflight
+//    failure (see "disallowed requested header in .list mode" in the
+//    existing "failing any gate" test — exact same request bytes). Judged:
+//    both postures are Fetch-spec compliant (the spec only requires the
+//    advertised Allow-Headers value to be accurate; a browser then refuses
+//    to send any of ITS future headers not covered by it, regardless of
+//    server posture) — this is a server design choice, not a spec violation
+//    either way. Our SPEC.md documents the fail-closed posture as
+//    deliberate; not adopted.
+//
+// 6. Actual (non-preflight) requests are NOT gated by method in flask_cors
+//    at all — only preflight OPTIONS checks `methods`. Captured: config
+//    `methods=["GET"]`, actual DELETE request with the allowed origin still
+//    gets `Access-Control-Allow-Origin`. Ours withholds CORS headers on an
+//    actual request whose method isn't in `allowed_methods` too (see
+//    "actual: method outside allowed_methods gets no CORS headers (rs/cors
+//    gate)" above). Judged: the Fetch spec's actual-response CORS check is
+//    only about Origin (and credentials-mode consistency) — the method
+//    allow-list is properly a preflight-only concept, so flask_cors's
+//    narrower gating is the more literal spec reading. Our extra gate is a
+//    deliberate, documented (`model_after` rs/cors) defense-in-depth
+//    margin beyond what the spec requires: it never lets a script read a
+//    response for a method the policy never declared. Not adopted away.
+//
+// 7. `Access-Control-Allow-Methods` ordering. flask_cors ALWAYS sorts
+//    alphabetically regardless of configured order (captured: config
+//    `["POST","GET","DELETE"]` → advertised "DELETE, GET, POST"). Ours
+//    preserves caller order verbatim (see "config joins: ... dedup-free
+//    caller order" above). Cosmetic only — a browser checks membership, not
+//    order — not adopted.
+//
+// 8. `.reflect` allow-headers mode. flask_cors's default (`allow_headers:
+//    "*"`) matches any requested header but re-serializes the response as
+//    the SORTED, lower-cased request list (captured: request order "x-zeta,
+//    content-type, x-alpha" → answered "content-type, x-alpha, x-zeta"). Our
+//    `.reflect` echoes the request's `Access-Control-Request-Headers` value
+//    byte-for-byte, same order, same case (see "preflight: .reflect echoes
+//    Access-Control-Request-Headers verbatim" above). Not adopted (verbatim
+//    echo is simpler and, per the module doc, deliberate).
+
+test "interop (flask_cors oracle): baseline preflight agrees on Origin echo, Methods, Max-Age; Allow-Headers casing/order diverges by design (see ledger #1)" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{ .get, .post },
+        .allowed_headers = .{ .list = &.{ "Content-Type", "Authorization" } },
+        .max_age_s = 600,
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+
+    // Identical request bytes to the captured flask_cors scenario "1a": a
+    // preflight for POST with ACRH "content-type, authorization".
+    const got = runWire(&r, preflight_wire, &buf);
+    try expectStatus(got, "204");
+    // AGREES with flask_cors byte-for-byte on these three:
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, POST");
+    try expectHeaderLine(got, "Access-Control-Max-Age: 600");
+    // DIVERGES (ledger #1): flask_cors answered
+    // "Access-Control-Allow-Headers: authorization, content-type" (the
+    // requested subset, lower-cased + sorted); we answer the configured
+    // list verbatim.
+    try expectHeaderLine(got, "Access-Control-Allow-Headers: Content-Type, Authorization");
+}
+
+test "interop (flask_cors oracle): Vary is emitted even for a SINGLE configured origin — flask_cors omits it there (ledger #2)" {
+    // Captured "2a": origins=["https://app.example"] (ONE origin), actual GET
+    // with that Origin → flask_cors answered Allow-Origin WITHOUT Vary at
+    // all. We always emit it (see module doc: "the literal `*` does not [get
+    // Vary]" — everything else does, regardless of list length).
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+
+    const got = runWire(&r, wire("GET", "/t", "Origin: https://app.example\r\n"), &buf);
+    try expectStatus(got, "200");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    // Divergence: flask_cors's captured answer here had NO Vary header at
+    // all. RFC 7231 §7.1.4 judgment favors emitting it regardless (see the
+    // ledger above) — not adopting flask_cors's narrower heuristic.
+    try expectHeaderLine(got, "Vary: Origin");
+}
+
+test "interop (flask_cors oracle): null/opaque Origin — exact byte compare, no special-casing, agrees both directions" {
+    // Captured "6a"/"6b": flask_cors treats the literal string "null" as an
+    // ordinary origin value with no special-casing whatsoever — denied when
+    // not configured, echoed back when explicitly (if unusually) configured
+    // to allow it. This is the classic implementer trap (some CORS
+    // middlewares special-case "null" — either always denying it even when
+    // configured, or worse treating it as a global allow — neither of which
+    // flask_cors does, and neither of which we do either).
+    var buf: [2048]u8 = undefined;
+    { // not configured to allow it → denied, agrees with flask_cors's "6a"
+        // (captured: no Access-Control-Allow-Origin at all).
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .{ .list = &.{"https://app.example"} },
+        });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWire(&r, wire("GET", "/t", "Origin: null\r\n"), &buf);
+        try expectStatus(got, "200");
+        try expectNoCorsHeaders(got);
+    }
+    { // explicitly configured to allow "null" → echoed, agrees with
+        // flask_cors's "6b" (captured: Access-Control-Allow-Origin: null).
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .{ .list = &.{"null"} },
+        });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWire(&r, wire("GET", "/t", "Origin: null\r\n"), &buf);
+        try expectStatus(got, "200");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: null");
+    }
+}

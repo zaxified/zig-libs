@@ -61,13 +61,17 @@ pub const HeadParseError = error{
 pub const HeaderEntry = struct { name: []const u8, value: []const u8 };
 
 /// Strict line unwrap for a CRLF-framed head: `raw` is one segment of the
-/// block split on `\n`, and must carry the preceding `\r`. Per RFC 9112 §2.2
-/// a recipient MUST NOT treat a bare LF as a line terminator — accepting one
-/// opens a request-smuggling desync where a front-end and back-end disagree
-/// on message framing. Returns the line with its trailing CR removed, or
-/// `error.MalformedHead` if the CR is missing (a bare-LF terminator). Callers
-/// must skip the trailing empty split (the segment after the final CRLF)
-/// before calling this.
+/// block split on `\n`, and must carry the preceding `\r`. RFC 9112 §2.2
+/// permits (does not require) a recipient to recognize a bare LF as a line
+/// terminator ("a recipient MAY recognize a single LF as a line terminator
+/// and ignore any preceding CR") — this module deliberately does NOT take
+/// that leniency: accepting a bare LF opens a request-smuggling desync where
+/// a front-end and back-end disagree on message framing (confirmed
+/// divergent from `h11`, an independent HTTP/1.1 state machine that DOES
+/// exercise the RFC's leniency — see `h11_interop.zig`). Returns the line
+/// with its trailing CR removed, or `error.MalformedHead` if the CR is
+/// missing (a bare-LF terminator). Callers must skip the trailing empty
+/// split (the segment after the final CRLF) before calling this.
 fn stripCrlf(raw: []const u8) HeadParseError![]const u8 {
     if (raw.len == 0 or raw[raw.len - 1] != '\r') return error.MalformedHead;
     return raw[0 .. raw.len - 1];

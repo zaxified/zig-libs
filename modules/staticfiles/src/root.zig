@@ -1050,3 +1050,220 @@ fn extractHeader(resp: []const u8, prefix: []const u8) ?[]const u8 {
     const end = mem.indexOfScalarPos(u8, resp, start, '\r') orelse return null;
     return resp[start..end];
 }
+
+// ── external anchor: starlette.staticfiles (independent Range/ETag/       ──
+// ── conditional-request oracle)                                          ──
+//
+// `starlette` 1.3.1 (Python 3.14.4) implements the same Range/ETag/
+// conditional-request semantics independently (`starlette.responses.
+// FileResponse` for Range/If-Range, `starlette.staticfiles.StaticFiles.
+// is_not_modified` for If-None-Match/If-Modified-Since). Run here purely as
+// a black-box test oracle (root `NOTICE` §0's carve-out applies — no
+// starlette source was consulted as a design reference while writing this
+// module, only its observable request/response behavior read here for the
+// FIRST time during this audit; confirmed via `check-catalog`, no NOTICE
+// entry needed).
+//
+// Captured ONCE, offline, via a throwaway Python script driving
+// `starlette.staticfiles.StaticFiles` directly over the ASGI interface (a
+// plain in-process async function call with hand-built scope/receive/send
+// callables — no `httpx`, no TestClient, no socket, even at capture time).
+// Fixture: a single 11-byte file `hello.txt` = "hello world", mtime pinned
+// to a fixed Unix timestamp (1700000000) so Last-Modified/ETag are
+// reproducible. Reproduction: see this campaign's session notes for the
+// exact script.
+//
+// Our `buildETag` (size+mtime, hex) and starlette's (`md5(mtime-size)`,
+// hex) are two independently-chosen, RFC-9110-legal validator schemes —
+// RFC 9110 §8.8.3 only requires an ETag to be a quoted opaque string that
+// changes when the representation does, not any particular construction.
+// The tests below therefore compare STATUS CODES, `Content-Range`,
+// `Content-Length` and body bytes (all directly comparable), never literal
+// ETag values — a matching-ETag test instead round-trips OUR OWN computed
+// ETag back as `If-None-Match`, which is a same-implementation check, not
+// an external anchor (already covered by the existing "serve: 304 on
+// matching If-None-Match / If-Modified-Since" test above).
+//
+// ── divergence ledger ────────────────────────────────────────────────────
+//
+// 1. `If-None-Match: *` (wildcard). RFC 9110 §13.1.2 defines `*` as
+//    matching "any current representation of the target resource" — a GET
+//    for an existing resource with `If-None-Match: *` MUST get 304. Our
+//    `http.conditional.listMatches` implements this (`std.mem.eql(u8, elem,
+//    "*")` short-circuits to a match; see conditional.zig's "evaluate:
+//    If-None-Match ... star" test). Captured: starlette's
+//    `is_not_modified` does `etag in [tag.strip().removeprefix("W/") for
+//    tag in if_none_match.split(",")]` — a literal string-membership test
+//    that never special-cases `"*"`, so `If-None-Match: *` against an
+//    existing file returns a plain 200, NOT 304. This is a real RFC 9110
+//    §13.1.2 conformance gap in starlette's `StaticFiles`, found by this
+//    audit. Judgement: our wildcard handling is correct per spec; NOT
+//    changed to match starlette's gap. See the divergence test below.
+//
+// 2. A `Range` header with a unit other than `bytes` (e.g. malformed/
+//    unrecognized). RFC 7233 §2.1 / §3.1: "An origin server MUST ignore a
+//    Range header field that contains a range unit it does not
+//    understand" — the request is served as if `Range` were absent (200).
+//    Our `http.range.parse` reports `error.InvalidUnit`, and `apply`'s
+//    caller (this module's `sendFile`) treats any parse error identically
+//    to "no Range" (falls through to `.no_range`, full 200). Captured:
+//    starlette's `FileResponse._parse_range_header` instead raises
+//    `MalformedRangeHeader("Only support bytes range")`, which
+//    `starlette.staticfiles` (via `FileResponse.__call__`) turns into an
+//    explicit `400 Bad Request` + a plain-text body. Judgement: RFC 7233's
+//    "MUST ignore" is unambiguous for an unrecognized UNIT (as opposed to a
+//    malformed byte-range-set under the recognized `bytes` unit, where
+//    server discretion is more defensible) — starlette's 400 here is the
+//    non-compliant side of this divergence. NOT adopted; we keep the
+//    RFC-mandated ignore→200. See the divergence test below.
+//
+// 3. Multi-range requests. Starlette's `FileResponse` fully implements
+//    `multipart/byteranges` (RFC 7233 §4.1) for a request with more than
+//    one satisfiable range — captured: two disjoint ranges → 206,
+//    `Content-Type: multipart/byteranges; boundary=...`, a real multipart
+//    body. This module deliberately does NOT implement multipart ranges
+//    (see the module doc: "a documented amplification vector... out of
+//    scope") — RFC 7233 §6.1 explicitly permits ignoring `Range` entirely
+//    in this case, which is what "serve: multi-range request falls back to
+//    a full 200" (above) already tests. Scoped down per campaign policy
+//    ("do not adopt behaviour we do not implement") — no golden to freeze
+//    for functionality we don't have; starlette's fuller implementation is
+//    simply out of our scope, not a bug on either side.
+//
+// 4. `If-Match` / `If-Unmodified-Since` (412 Precondition Failed).
+//    Starlette's `StaticFiles.is_not_modified` implements ONLY the
+//    not-modified (304) direction — there is no 412 code path anywhere in
+//    `starlette.staticfiles` or `FileResponse`; `If-Match`/
+//    `If-Unmodified-Since` request headers are read nowhere in either
+//    (captured: both send a 200 as if the headers were absent). This
+//    module DOES implement 412 via `http.conditional.apply` (see
+//    conditional.zig's "evaluate: If-Match hit / miss / star / weak-current"
+//    tests and this file's own SPEC.md). No oracle is available for this
+//    half of the module at all — scoped down per campaign policy; our
+//    existing in-house tests are the only anchor for 412 and stay as-is.
+//
+// 5. `If-Range`. NEITHER `http.range` NOR this module implements `If-Range`
+//    at all (confirmed: no reference to it anywhere in `range.zig`,
+//    `conditional.zig`, or this file — grepped during this audit). A
+//    `Range` request is honored UNCONDITIONALLY today, regardless of any
+//    `If-Range` header. This is a genuine, real GAP relative to RFC 7233
+//    §3.2 found by comparing against starlette (which implements it: a
+//    `Range` + a STALE `If-Range` value — compared with plain string
+//    equality against the current ETag or Last-Modified, per starlette's
+//    `_should_use_range` — makes it ignore `Range` and serve a full 200;
+//    a matching `If-Range` honors the Range as normal). Practical
+//    consequence: a client that resumed a download expecting "if the file
+//    changed, send me the whole thing instead of a stale byte range" does
+//    not get that safety net from this module — it always gets the range
+//    of whatever the CURRENT file contains, silently, which can splice
+//    together bytes from two different file versions client-side. This is
+//    reported here as a real finding for the module's SPEC.md / backlog,
+//    not fixed in this pass (implementing `If-Range` is a new feature, not
+//    a test-anchoring change, and campaign scope here is anchor tests, not
+//    feature work) — see the canary test below, which locks in and clearly
+//    flags the CURRENT (gap) behavior so it fails loudly the moment
+//    `If-Range` support is added and this comment must be updated.
+
+test "interop (starlette oracle): single/open-ended/suffix ranges agree on Content-Range, Content-Length, and body bytes" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+
+    // Captured "3": Range: bytes=0-4 on the 11-byte "hello world" fixture →
+    // 206, Content-Range: bytes 0-4/11, Content-Length: 5, body "hello".
+    const single = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(single));
+    try testing.expect(mem.indexOf(u8, single, "Content-Range: bytes 0-4/11\r\n") != null);
+    try testing.expect(mem.indexOf(u8, single, "Content-Length: 5\r\n") != null);
+    try testing.expect(mem.endsWith(u8, single, "hello"));
+
+    // Captured "4": Range: bytes=6- (open-ended) → 206, Content-Range:
+    // bytes 6-10/11, body "world".
+    const open = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=6-\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(open));
+    try testing.expect(mem.indexOf(u8, open, "Content-Range: bytes 6-10/11\r\n") != null);
+    try testing.expect(mem.endsWith(u8, open, "world"));
+
+    // Captured "5": Range: bytes=-5 (last 5 bytes) → identical result to
+    // "6-" on an 11-byte file (both resolve to bytes 6-10).
+    const suffix = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=-5\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(suffix));
+    try testing.expect(mem.indexOf(u8, suffix, "Content-Range: bytes 6-10/11\r\n") != null);
+    try testing.expect(mem.endsWith(u8, suffix, "world"));
+
+    // Captured "7": Range: bytes=0-100 (end past EOF) → clamps to the
+    // actual length, 206, Content-Range: bytes 0-10/11, full body.
+    const clamped = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-100\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(clamped));
+    try testing.expect(mem.indexOf(u8, clamped, "Content-Range: bytes 0-10/11\r\n") != null);
+    try testing.expect(mem.endsWith(u8, clamped, "hello world"));
+}
+
+test "interop (starlette oracle): HEAD + Range still answers 206 with the range's Content-Length and no body" {
+    // Captured "23": HEAD with Range: bytes=0-4 → 206, Content-Length: 5,
+    // empty body. Not previously covered by this module's own tests (the
+    // existing HEAD test has no Range, the existing Range tests are all
+    // GET).
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    const resp = runRequest(&h, "HEAD /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "Content-Range: bytes 0-4/11\r\n") != null);
+    try testing.expect(mem.indexOf(u8, resp, "Content-Length: 5\r\n") != null);
+    try testing.expect(mem.endsWith(u8, resp, "\r\n\r\n")); // no body after headers
+}
+
+test "interop (starlette oracle) DIVERGES: If-None-Match: * gets 304 from us (RFC 9110 §13.1.2), 200 from starlette's StaticFiles (ledger #1)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    var out2: [4096]u8 = undefined;
+
+    const first = get(&h, "/hello.txt", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(first));
+
+    const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n", &out2);
+    // We correctly treat `*` as "matches any current representation" → 304.
+    // Captured: starlette's StaticFiles answered 200 here (a real
+    // conformance gap in starlette, not adopted).
+    try testing.expectEqual(@as(u16, 304), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "TOP SECRET") == null);
+}
+
+test "interop (starlette oracle) DIVERGES: a Range with an unrecognized unit is ignored (RFC 7233 MUST) -> 200, not starlette's 400 (ledger #2)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+
+    // Captured "18": Range: lines=0-4 (not "bytes") -> starlette answers 400
+    // "Only support bytes range". RFC 7233 explicitly requires ignoring an
+    // unrecognized unit, which is what we do: full 200, whole body, no
+    // Content-Range.
+    const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: lines=0-4\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "Content-Range:") == null);
+    try testing.expect(mem.endsWith(u8, resp, "hello world"));
+}
+
+test "GAP CANARY: If-Range is not implemented -- Range is honored unconditionally regardless of a stale If-Range (ledger #5, a real finding, not yet fixed)" {
+    // This test exists to fail loudly (forcing this comment and the ledger
+    // above to be updated) the moment If-Range support is added. Today: a
+    // Range request accompanied by an If-Range value that could not
+    // possibly match anything real (`If-Range` is entirely unread) still
+    // gets honored as a plain Range request -- the same 206 as if If-Range
+    // had never been sent. starlette, by contrast, would fall back to a
+    // full 200 here (its `_should_use_range` requires an exact string match
+    // against the current ETag or Last-Modified).
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nIf-Range: \"not-a-real-etag\"\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(resp)); // the gap: should arguably be 200 if If-Range were honored
+    try testing.expect(mem.endsWith(u8, resp, "hello"));
+}

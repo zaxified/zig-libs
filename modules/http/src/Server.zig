@@ -2756,9 +2756,12 @@ test "serveStream: malformed request line → golden 400, connection closes" {
 test "serveStream: bare-LF in the request head → 400, connection closes (smuggling guard)" {
     var hits: Hits = .init(0);
     var out_buf: [4096]u8 = undefined;
-    // Bare LF terminating the request line (RFC 9112 §2.2: a recipient MUST
-    // NOT treat it as a line terminator) — answered 400 like any malformed
-    // head, and the pipelined request behind it is never served.
+    // Bare LF terminating the request line (RFC 9112 §2.2 permits, but does
+    // not require, a recipient to accept a bare LF as a line terminator —
+    // this server deliberately declines that leniency for request-smuggling
+    // hardening; see h1.zig's `stripCrlf` and `h11_interop.zig`) — answered
+    // 400 like any malformed head, and the pipelined request behind it is
+    // never served.
     const req_line = runStream(&hits, "GET /hello HTTP/1.1\nHost: t\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, req_line, "HTTP/1.1 400 Bad Request\r\n"));

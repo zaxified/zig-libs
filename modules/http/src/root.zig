@@ -459,11 +459,17 @@ test {
     _ = range;
     _ = conneg;
     _ = curl_interop;
+    _ = h11_interop;
 }
 
 /// LIVE third-party interop (response trailers vs real curl/nghttp2) — tests
 /// only, nothing importable, so it is not part of the public surface.
 const curl_interop = @import("curl_interop.zig");
+
+/// OFFLINE third-party interop (wire-framing edge cases vs h11, captured
+/// once and frozen) — tests only, nothing importable, so it is not part of
+/// the public surface.
+const h11_interop = @import("h11_interop.zig");
 
 test "protocolFromAlpn: exact ALPN ids dispatch, anything else is unknown" {
     try testing.expectEqual(AlpnProtocol.h2, protocolFromAlpn("h2"));
