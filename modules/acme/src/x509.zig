@@ -855,6 +855,90 @@ test "TLS-ALPN-01 cert: tlsAlpnCert convenience generates a usable key + cert" {
     try testing.expect(std.mem.indexOf(u8, cert.cert_der, &point) != null);
 }
 
+// openssl-built fixture for the `id-pe-acmeIdentifier` extension (RFC 8737
+// §3): the double-wrap encoding above (extnValue OCTET STRING wrapping the
+// DER of `Authorization ::= OCTET STRING (SIZE (32))`) is this module's own
+// construction, so it needed a real, independent oracle. openssl has no
+// built-in name for this OID, but its generic-extension syntax (`DER:<hex>`)
+// accepts caller-supplied extnValue content, builds a real self-signed
+// certificate around it, and `openssl x509 -text` / `openssl asn1parse`
+// re-parse that certificate back into the SEQUENCE/OID/BOOLEAN/OCTET STRING
+// shown below — a genuine build-and-reparse round trip, not a self-check.
+// Reproduced with (P-256 key in `key.pem`, hash = the same 32-byte
+// `acme_id` used by the test above and by jws.zig's `acmeIdentifier` test):
+//
+//   openssl req -x509 -new -key key.pem -subj "/" -days 3650 -sha256 \
+//     -out cert.pem \
+//     -addext "subjectAltName=critical,DNS:example.org" \
+//     -addext "1.3.6.1.5.5.7.1.31=critical,DER:0420548865...61c5"
+//
+//   $ openssl x509 -in cert.pem -noout -text
+//     1.3.6.1.5.5.7.1.31: critical
+//         . T.e9.5.+3.h...$H%.k...AT.1..."a.
+//   $ openssl asn1parse -in cert.der -inform DER | grep -A2 1.3.6.1.5.5.7.1.31
+//     288:d=4  hl=2 l=  49 cons: SEQUENCE
+//     290:d=5  hl=2 l=   8 prim: OBJECT   :1.3.6.1.5.5.7.1.31
+//     300:d=5  hl=2 l=   1 prim: BOOLEAN  :255
+//     303:d=5  hl=2 l=  34 prim: OCTET STRING [HEX DUMP]:0420548865...61c5
+//
+// (openssl also default-adds subjectKeyIdentifier/authorityKeyIdentifier/
+// basicConstraints, harmless noise around the extension under test.)
+const test_tls_alpn_openssl_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBpTCCAUugAwIBAgIULccuKbyy5iea5LEYnXfYRWUz124wCgYIKoZIzj0EAwIw
+    \\ADAeFw0yNjA4MDExNDI2NTJaFw0zNjA3MjkxNDI2NTJaMAAwWTATBgcqhkjOPQIB
+    \\BggqhkjOPQMBBwNCAAROuQlU2wcguLnwZh1LmNttftSuMXTH3TNzFOTo6mOle2Nz
+    \\LdA9225cMBJe/GrszwZyyRcO7sUX8OOeVr7Zot6Wo4GiMIGfMB0GA1UdDgQWBBS2
+    \\Z7RCabPsFuzW/TJZyzg/bloYFTAfBgNVHSMEGDAWgBS2Z7RCabPsFuzW/TJZyzg/
+    \\bloYFTAPBgNVHRMBAf8EBTADAQH/MBkGA1UdEQEB/wQPMA2CC2V4YW1wbGUub3Jn
+    \\MDEGCCsGAQUFBwEfAQH/BCIEIFSIZTm1NeErM7hoiY2BJEgls2vfl/lBVLsxodUL
+    \\ImHFMAoGCCqGSM49BAMCA0gAMEUCIQCorf12038TiYhtWhmaAEdFxHzI3/lcCe+Z
+    \\4lzoneFx9wIgeyMQEPrYYNsD9cC2RPbAEa45gZU0GNuAOQUwXs07lF8=
+    \\-----END CERTIFICATE-----
+    \\
+;
+
+test "TLS-ALPN-01 extension: openssl builds + re-parses the same bytes we do" {
+    const acme_id = [_]u8{
+        0x54, 0x88, 0x65, 0x39, 0xb5, 0x35, 0xe1, 0x2b, 0x33, 0xb8, 0x68, 0x89, 0x8d, 0x81, 0x24, 0x48,
+        0x25, 0xb3, 0x6b, 0xdf, 0x97, 0xf9, 0x41, 0x54, 0xbb, 0x31, 0xa1, 0xd5, 0x0b, 0x22, 0x61, 0xc5,
+    };
+    // Byte-exact, frozen from the `openssl asn1parse` dump above: SEQUENCE {
+    // OID id-pe-acmeIdentifier, critical TRUE, extnValue OCTET STRING(34) {
+    // OCTET STRING(32) acme_id } } — the real oracle's answer, not derived
+    // from this module's own encoder.
+    const acme_ext_oracle =
+        "\x30\x31" ++
+        "\x06\x08\x2b\x06\x01\x05\x05\x07\x01\x1f" ++
+        "\x01\x01\xff" ++
+        "\x04\x22\x04\x20" ++
+        acme_id;
+    try testing.expectEqual(@as(usize, 51), acme_ext_oracle.len); // count canary
+
+    const oracle_der = try pemDecode(testing.allocator, "CERTIFICATE", test_tls_alpn_openssl_cert_pem);
+    defer testing.allocator.free(oracle_der);
+    try testing.expect(std.mem.indexOf(u8, oracle_der, acme_ext_oracle) != null);
+    // The oracle certificate is itself a well-formed, self-signed P-256 cert
+    // (extra confidence the fixture is real, not truncated/garbled).
+    try verifySelfSigned(oracle_der);
+
+    // Our own encoder, fed the identical acme_id, produces the identical
+    // extension bytes — the cross-check the governing rule requires: an
+    // external answer, compared byte-for-byte against our own output.
+    const kp = testKeyPair(70);
+    const ours_der = try tlsAlpnCertDer(
+        testing.allocator,
+        kp,
+        "example.org",
+        acme_id,
+        "\x01",
+        tls_alpn_not_before,
+        tls_alpn_not_after,
+    );
+    defer testing.allocator.free(ours_der);
+    try testing.expect(std.mem.indexOf(u8, ours_der, acme_ext_oracle) != null);
+}
+
 test "PEM: encode/decode round-trip, wrapping, labels, garbage" {
     const payload = "\x01\x02\x03" ++ ("D" ** 100); // forces a 2-line body
     const pem = try pemEncode(testing.allocator, "CERTIFICATE", payload);

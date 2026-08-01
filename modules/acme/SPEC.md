@@ -53,9 +53,14 @@ responder over the socket-free server codec. Mock-ACME integration (HTTP-01): a 
 drives it — the mock verifies every JWS signature, enforces one-time nonce freshness, injects a
 `badNonce` rejection to prove the retry, fetches the key authorization over real HTTP, and
 parses+verifies the CSR before issuing the fixture chain. Skips only if the loopback bind fails. The
-TLS-ALPN-01 extension encoding is asserted structurally + self-verified (labeled **constructed** — not
-cross-checked against a live `acme-tls/1` handshake, since running the TLS listener is out of scope);
-the E2E `acme-tls/1` handshake against a CA is app/ianic territory.
+TLS-ALPN-01 `id-pe-acmeIdentifier` extension's DER shape (RFC 8737 §3's double-`OCTET STRING` wrap) is
+now also cross-checked against `openssl`: since the OID has no built-in name in openssl, its generic
+`DER:<hex>` extension syntax was used to build a real self-signed certificate carrying our exact bytes,
+which `openssl x509 -text`/`asn1parse` re-parsed back into the expected SEQUENCE/OID/BOOLEAN/OCTET
+STRING shape; those re-parsed bytes are frozen as a golden and compared byte-for-byte against our own
+encoder's output (see `x509.zig`'s "openssl builds + re-parses the same bytes we do" test). A live
+`acme-tls/1` TLS handshake against a real CA remains out of scope, since running the TLS listener is
+app/ianic territory — that is a distinct gap from the extension encoding closed here.
 
 ## Backlog / deferred
 Reviewed 2026-07-10 (adversarial security pass) — clean: JWS/ES256/nonce/CSR construction and the
