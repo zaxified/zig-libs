@@ -117,7 +117,7 @@ const Ref = struct {
 
 // ── generic structural comparison ───────────────────────────────────────────
 
-fn expectMessageEqual(comptime T: type, want: T, got: T) !void {
+pub fn expectMessageEqual(comptime T: type, want: T, got: T) !void {
     inline for (comptime schema.infos(T)) |info| {
         const a = @field(want, info.name);
         const b = @field(got, info.name);
@@ -150,7 +150,7 @@ fn expectElemEqual(comptime kind: pb.Kind, comptime E: type, a: E, b: E) !void {
 
 // ── the shared case table ───────────────────────────────────────────────────
 
-fn Case(comptime T: type) type {
+pub fn Case(comptime T: type) type {
     return struct { name: []const u8, value: T };
 }
 
@@ -159,7 +159,7 @@ const MAX32 = std.math.maxInt(i32);
 const MIN64 = std.math.minInt(i64);
 const MAX64 = std.math.maxInt(i64);
 
-const wide_cases = [_]Case(ct.Wide){
+pub const wide_cases = [_]Case(ct.Wide){
     .{ .name = "spec150", .value = .{ .i32_ = 150 } },
     .{ .name = "neg_int32", .value = .{ .i32_ = -1 } },
     .{ .name = "neg_int64", .value = .{ .i64_ = -2 } },
@@ -190,7 +190,7 @@ const wide_cases = [_]Case(ct.Wide){
     .{ .name = "empty", .value = .{} },
 };
 
-const repeated_cases = [_]Case(ct.Repeated){
+pub const repeated_cases = [_]Case(ct.Repeated){
     .{ .name = "packed", .value = .{ .nums = &.{ 1, 2, 150 } } },
     .{ .name = "packed_neg", .value = .{ .nums = &.{ -1, 0, 1, 150, MAX32 } } },
     .{ .name = "unpacked", .value = .{ .unpacked = &.{ 1, 2, 150 } } },
@@ -203,7 +203,7 @@ const repeated_cases = [_]Case(ct.Repeated){
     .{ .name = "rep_empty", .value = .{} },
 };
 
-const presence_cases = [_]Case(ct.Presence){
+pub const presence_cases = [_]Case(ct.Presence){
     .{ .name = "pres_default", .value = .{ .implicit = 0 } },
     .{ .name = "pres_set", .value = .{ .implicit = 1 } },
     .{ .name = "pres_expl_0", .value = .{ .explicit = 0 } },

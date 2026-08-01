@@ -140,7 +140,7 @@ every offset x five patch values, both requiring a *typed error* and never a pan
 
 ## Verification
 
-Three layers, in increasing order of what they can prove.
+Four layers, in increasing order of what they can prove.
 
 1. **Round trip.** Necessary, and close to worthless alone. The strongest defects in this format
    are *consistent* between encoder and decoder and stay completely invisible to it.
@@ -161,7 +161,26 @@ Three layers, in increasing order of what they can prove.
      — packing flipped in both directions, and a message reassembled out of preserved unknown
      fields.
 
-   Tests skip loudly (`ZIG_LIBS_VERBOSE_SKIP=1` to see why) when python3 or the package is absent.
+   Tests skip loudly (`ZIG_LIBS_VERBOSE_SKIP=1` to see why) when python3 or the package is absent
+   — which is every CI run, since nothing in this repository depends on a Python package at build
+   time. A skip is not a failure, but it is also not an anchor: a machine without the package gets
+   none of layer 3's evidence, silently falling back to layers 1-2 alone.
+4. **Frozen reference bytes** (`golden_test.zig` + `testdata/golden_bytes.zig`), which closes that
+   gap. The bytes in `golden_bytes.zig` are not hand-derived — they are
+   `msg.SerializeToString(deterministic=True)` output that the Python `protobuf` package actually
+   produced, captured once (see that file's header for the exact command) and committed. Every
+   case in layer 3's tables is checked against them, both directions, with no subprocess and no
+   skip path: our encoder must reproduce the frozen bytes, and our decoder must recover the
+   matching value from them. This is what layer 3 degrades to when python3 or the package is
+   absent — the same external anchor, minus the ability to re-derive the bytes fresh each run. A
+   comptime lookup (`@compileError` if a case has no frozen counterpart) and a count-canary test
+   keep the two tables from silently drifting apart.
+
+   Deliberately NOT frozen: the two tests in layer 3 that check whether the reference's *parser*
+   accepts shapes it would never itself emit (packing flipped, a message reassembled from
+   preserved unknown fields). Freezing those would only re-check our own decoder against itself —
+   the whole point was a foreign judgment call. `codec_test.zig` covers the same shapes offline via
+   independently hand-derived bytes instead.
 
 ### Mutation testing
 
@@ -171,7 +190,7 @@ was caught; what matters is *by which layer*.
 | # | Mutation | Caught by | Round trip alone? |
 |---|---|---|---|
 | M1 | zigzag transform dropped in **both** encoder and decoder | zigzag unit vectors, golden bytes, 3 reference tests | **NO — stayed green** |
-| M2 | negative `int32` not sign-extended (naive `i32`→`u32`, 5 bytes not 10) | golden bytes, 2 reference tests | **NO — stayed green** (the reference decoder truncates to 32 bits, so even *their* parser reads the right value back; only the byte comparison sees it) |
+| M2 | negative `int32` not sign-extended (naive `i32`→`u32`, 5 bytes not 10) | golden bytes, 2 reference tests, 2 frozen-golden tests (`golden_test.zig`, needs no python) | **NO — stayed green** (the reference decoder truncates to 32 bits, so even *their* parser reads the right value back; only the byte comparison sees it) |
 | M3 | proto3 default packing turned off | schema derivation test, golden bytes, 2 reference tests | **NO — stayed green** |
 | M4b | one specific **non-default** scalar value wrongly treated as the default and omitted | golden bytes, 2 reference tests | no |
 | M5 | declared length allowed to overrun the buffer by one | off-by-one adversarial test; truncation sweep aborts | n/a |

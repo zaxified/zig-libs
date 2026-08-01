@@ -101,6 +101,7 @@ test {
     _ = @import("codec_test.zig");
     _ = @import("adversarial.zig");
     _ = @import("reference_interop.zig");
+    _ = @import("golden_test.zig");
 }
 
 test "readme example round trips" {
