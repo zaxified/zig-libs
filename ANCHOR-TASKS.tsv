@@ -92,7 +92,7 @@ csvstream	A	SELF	RFC 4180 reader/writer, hand-authored fixtures, no captured thi
 dns	A	MIXED	message.zig goldens hand-built; Resolver has live UDP/TCP/DoH tests vs real 8.8.8.8	CLI:dig/kdig + capture	S	codec goldens hand-computed per RFC 1035; live resolver test exists but skips offline
 encoding	A	SELF	hand-authored spot-check fixtures (e.g. windows-1252 euro), no WHATWG table/iconv cross-check	DONE	-	DONE 76f9d9c: exhaustive WHATWG tables, 640 pairs, 5 code pages
 genetlink	A	MIXED	offline goldens self-built; live nlctrl test vs real Linux kernel is external	CLI:nlctrl (live kernel)	S	Live nlctrl test already runs unconditionally; extend to cover offline-golden shapes
-icmp	A	MIXED	RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test	CLI:ping + tcpdump	S	checksums hand-computed; trivial capture off loopback
+icmp	A	MIXED	RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test	DONE	-	DONE a326e4a: 8 real fixtures via unprivileged netns capture; unreachable types named
 json5	A	SELF	hand-authored fixtures; deliberately partial subset, no json5.org test corpus used	DONE	-	DONE b8d7144: json5-tests corpus adopted, THREE real bugs fixed
 linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked examples cited	DONE	-	DONE 9ca8ed7: RFC 8288 3.5 worked examples transcribed, errata checked
 llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs	CAPTURE:live LLM API response	S	Existing test is unconditionally SkipZigTest; un-skip and capture one real SSE response
@@ -101,13 +101,13 @@ mcp	A	MIXED	sampling/elicitation lines byte-identical to spec's own JSON example
 metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check	CLI:promtool (Prometheus)	S	pipe golden exposition text through `promtool check metrics` instead of hand-eyeballing
 netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips	CAPTURE:existing python-netconf live harness (NETCONF_TEST_SERVER)	S	capture rpc.zig wire bytes from the live py-netconf server already used for interop
 nftables	A	MIXED	native path anchored by captured real nft traffic; JSON builder path is self golden	CLI:nft (existing JSON<->native consistency + `nft -c -j` check)	S	extend existing live consistency/check harness to more statement shapes than one ruleset
-ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures	CAPTURE:public CA responder	S	fixtures CONSTRUCTED not captured; one real Let's Encrypt response fixes it
-ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data	CAPTURE:public CA responder	S	same fixtures as ocsp; live fetch path is M
+ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures	DONE	-	DONE 6c2d6d9: real DigiCert + GoDaddy responses captured; delegated responder now exercised
+ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data	DONE	-	DONE 6c2d6d9: same real CA fixtures; blind spot shown to propagate through the sibling
 opcua	A	MIXED	P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable	DONE	-	DONE 02ecea2: real open62541 Sign+SignAndEncrypt handshakes captured and frozen
 openapi	A	SELF	hand-authored golden JSON document; only checked to be valid JSON, no real OpenAPI validator	CLI:openapi-spec-validator (or redocly-cli lint)	S	validate golden doc with a real OpenAPI 3.1 validator, not just JSON well-formedness
-pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture	CAPTURE:tcpdump/pcap of a real TCP handshake with timestamps	S	swap hand-built TS-option fixtures for bytes off a real captured connection
+pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture	DONE	-	DONE a326e4a: real SYN/SYN-ACK timestamp options, tsecr<-tsval correlation anchored
 protobuf	A	MIXED	codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing	DONE	-	DONE e080479: live python oracle frozen into committed goldens, survives CI
-rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only	CAPTURE:tcpdump of real Ethernet/ARP frames on a live interface	S	swap self-built ARP/Ethernet frames for bytes captured off a real LAN
+rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only	DONE	-	DONE a326e4a: real ARP + IPv4 frames off a veth pair (loopback cannot do ARP)
 rdap	A	SELF	RFC 7480-9224 JSON client; hand-authored fixtures, no captured registry resp	CAPTURE:public RDAP servers (rdap.org/IANA bootstrap, ARIN)	S	one HTTPS GET against a live registry captures a real response as golden
 security-headers	A	SELF	golden header fixtures hand-authored; helmet.js value read not executed - SELF	CLI:node + helmet.js (npm package)	S	actually run helmet.js and diff headers, instead of reading its source for values
 sntp	A	SELF	canned server-reply fixtures only; live query test always error.SkipZigTest	CLI:public NTP server	S	live harness EXISTS but unconditionally skips; keep it OUT of the default gate
