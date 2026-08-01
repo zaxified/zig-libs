@@ -66,7 +66,7 @@ blobmsg	A	MIXED	hand-derived libubox-spec goldens (SELF); live ubusd peer test w
 coap	A	SELF	hand-built CON GET datagrams round-tripped, no third-party CoAP oracle	DONE	-	DONE 0b466d6: real aiocoap block-wise + observe; self-consistent endianness mutation caught
 cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic	DONE	-	DONE be61caa: python http.cookies oracle; quote-aware split BUG fixed; 5 divergences judged
 cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only	CLI:expressjs/cors or rs/cors	M	Run a real CORS middleware with matching config, diff preflight/actual headers
-ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only	CLI:python-fido2	M	Yubico's python-fido2 ClientPin can generate/verify real PIN-protocol framing
+ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only	DONE	-	DONE 0341464: fido2 anchors the FRAMING; found unexpressible protocol-Two pinUvAuthParam
 ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation	DONE	-	DONE b8612e1: kernel reassembly oracle; UNINITIALISED-MEMORY bug fixed; 1 policy divergence
 finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external numeric check	CLI:empyrical/ffn (pip)	M	Run the actual Python libraries this module models, capture outputs as literals
 http	A	MIXED	HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self	CLI:smuggler (defparam)	M	Extend curl_interop harness with a published smuggling probe tool vs h1 goldens
@@ -74,7 +74,7 @@ iec62351	A	MIXED	RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, 
 l2disco	A	SELF	golden byte KATs hand-transcribed from LLDP/CDP/ARP/DHCP specs, no live capture	DONE	-	DONE 941bbfe: 15 tcpdump-suite frames incl. 4 upstream crash reproducers
 l2encap	A	SELF	golden byte-layout KAT hand-authored from spec layouts; SPEC.md: no live-interop surface	NONE	-	REFUTED a58d626: own 8-byte format, shares no wire shape with VXLAN/Geneve (captured)
 l2forward	A	SELF	FDB/split-horizon decisions per 802.1D/EVPN; SPEC.md: offline logic only, no live-interop	DONE	-	DONE a58d626: aging default pinned to live kernel bridge 300s; rest is timing-dependent
-mcp-http	A	SELF	own self-contained HTTP/SSE tests; Dart/mcp_dart parity is a prose claim, no captured bytes	CLI:mcp_dart (Dart pub package, the existing behavioral reference)	M	write live HTTP/SSE interop harness against mcp_dart instead of prose parity claim
+mcp-http	A	SELF	own self-contained HTTP/SSE tests; Dart/mcp_dart parity is a prose claim, no captured bytes	DONE	-	DONE 0341464: real MCP Python SDK session; unbacked mcp_dart parity claim RETRACTED
 mqtt	A	SELF	golden bytes are hand-authored (KAT) per OASIS spec text, no captured broker session	DONE	-	DONE 0b466d6: 9 real paho/amqtt sessions both directions; amqtt itself violates 3.3.5
 saml	A	MIXED	core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips	DONE	-	DONE 9f9d238: genuine xmlsec1 EncryptedAssertion over the already-anchored signed one
 staticfiles	A	SELF	hand-authored fixtures only, no real client/browser interop test exists	CLI:nginx (or Apache) side-by-side comparison via curl	M	stand up nginx on the same fixture tree, diff Range/ETag/conditional-GET responses
@@ -98,13 +98,13 @@ linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked example
 llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs	DONE	-	DONE 88eda93: Anthropic published SSE example; S grade was WRONG (paid, nondeterministic)
 lninvoice	A	MIXED	BOLT11/12 mostly externally anchored (bolts vectors); BOLT12 offer ENCODE round-trip self-constructed	BLOCKED	M	BLOCKED: bootstrap.bolt12.org is NXDOMAIN from 4 resolvers; decode already anchored
 mcp	A	MIXED	sampling/elicitation lines byte-identical to spec's own JSON examples; init/tools/resources goldens + peer concept self-only (SPEC.md: "no external anchor")	DONE	-	DONE e3b4a52: 8 literal + 6 partial spec anchors, canary on the classification
-metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check	REDERIVED	M	PARTIAL d0e30ca: promtool NOT installed; in-house checker + official excerpt = middle tier
-netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips	BLOCKED	M	BLOCKED: python netconf+sshutil absent, pip install not permitted; no packaged server either
+metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check	DONE	-	DONE 0bbcefe: prometheus_client parser is now the anchor; in-house checker demoted
+netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips	DONE	-	DONE 0bbcefe: real python-netconf server; hello/rpc-reply/rpc-error frozen
 nftables	A	MIXED	native path anchored by captured real nft traffic; JSON builder path is self golden	DONE	-	DONE 5938bfc: 3 rules -> 13 across 4 chains; reject has no builder (documented gap)
 ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures	DONE	-	DONE 6c2d6d9: real DigiCert + GoDaddy responses captured; delegated responder now exercised
 ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data	DONE	-	DONE 6c2d6d9: same real CA fixtures; blind spot shown to propagate through the sibling
 opcua	A	MIXED	P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable	DONE	-	DONE 02ecea2: real open62541 Sign+SignAndEncrypt handshakes captured and frozen
-openapi	A	SELF	hand-authored golden JSON document; only checked to be valid JSON, no real OpenAPI validator	REDERIVED	M	PARTIAL d0e30ca: no validator installed; in-house checker + OAI webhook example = middle tier
+openapi	A	SELF	hand-authored golden JSON document; only checked to be valid JSON, no real OpenAPI validator	DONE	-	DONE 0bbcefe: real validator both directions; found in-house checker blind to path-param rule
 pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture	DONE	-	DONE a326e4a: real SYN/SYN-ACK timestamp options, tsecr<-tsval correlation anchored
 protobuf	A	MIXED	codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing	DONE	-	DONE e080479: live python oracle frozen into committed goldens, survives CI
 rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only	DONE	-	DONE a326e4a: real ARP + IPv4 frames off a veth pair (loopback cannot do ARP)
