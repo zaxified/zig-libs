@@ -98,52 +98,52 @@ reroutes); **old-style #2** extraction; **robustness** (a malformed reachability
 TLV is skipped, the valid rest still routes; a dangling neighbour is unreachable,
 not a crash); **empty/degenerate** cases (empty LSDB → empty table, local absent
 → empty, local isolated → self only); **asymmetric metrics**; a **determinism**
-check (identical databases → byte-identical, sorted tables); and a
-`std.testing.allocator` leak check (graph, tree, intern tables all freed). Green
-in Debug and ReleaseFast; `zig fmt` clean.
+check (identical databases → byte-identical, sorted tables); a
+`std.testing.allocator` leak check (graph, tree, intern tables all freed); and
+an **FRR anchor** — a 5-router topology with an asymmetric metric and an
+equal-cost tie, run once through a real `isisd` and frozen (see "Anchored"
+below). Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from ISO/IEC 10589 §7.2; the ECT tie-break lives in
 `spf-ect`. See `/NOTICE` (no entry required — public spec). License: MIT.
 
-## Not anchored — and the open question about how to fix that
+## Anchored (2026-08-02) — FRR, capture-and-freeze
 
-Every expectation above is **ours**. The topologies are hand-built and the
-routes are what we believe ISO/IEC 10589 §7.2 requires, so the tests and the
-implementation rest on the same reading of the same document. That is the one
-failure they cannot catch: a misreading shared by both. The sibling wire modules
-(`isis`, `isis-adj`, `isis-dis`, `isis-flood`, `isis-lsdb`) are checked against
-Wireshark's dissector, but **a sibling's anchor does not transfer**, and a
+Historically every expectation above was **ours**: hand-built topologies,
+routes we believed ISO/IEC 10589 §7.2 requires, tests and implementation
+sharing one reading of one document. The sibling wire modules (`isis`,
+`isis-adj`, `isis-dis`, `isis-flood`, `isis-lsdb`) are checked against
+Wireshark's dissector, but a sibling's anchor does not transfer, and a
 dissector only grades bytes on a wire — an SPF *result* has no wire form.
 
-An oracle does exist and does **not** require running anything. FRR ships
-`tests/topotests/isis_topo1/`: an `isisd.conf` defining a five-router topology,
-and alongside it `r1_topology.json` / `r1_route.json` — the SPF output a real
-router produced for it (vertex, parent, metric, interface, for both levels).
-That is captured output, not source code: the same capture-and-freeze shape used
-elsewhere in this repo, where a foreign tool runs once and its verdict is
-committed as literals.
+The owner's call on 2026-08-02 was **option B**: not vendoring FRR's
+GPL-licensed `tests/topotests/isis_topo1` fixtures, but running FRR ourselves
+and capturing its own output for a topology this task built from scratch.
+`frr` was added to `VM_DEBIAN_PACKAGES` (`scripts/vm/manifest.sh`), the
+Debian VM lane (`scripts/vm/`) re-provisioned, and a real `isisd` 10.3 —
+five instances, one per network namespace, joined by veth, real p2p
+adjacencies, asymmetric per-interface metrics on one link, one deliberate
+equal-cost tie — computed SPF once. That output is now frozen into a
+permanent test: see `src/root.zig`, test `"FRR anchor: 5-router topology,
+asymmetric r3<->r5 metric, r4 ECMP tie"`, which quotes the exact `vtysh`
+commands, FRR's version, and the relevant printed lines in its own comment
+block, and explains — with the ISO 10589 §7.2 reasoning — the one place this
+module's output legitimately diverges from FRR's (the undirected-engine
+approximation this README's "Metric handling" section and `SPEC.md` §3.3
+already documented, not a bug).
 
-**It is not used, and the reason is licensing, not technique.** FRR is
-GPL-2.0-or-later; this repo is MIT. Whether those expected values may be
-vendored — or even transcribed, since transcription of a data set is not
-obviously distinct from copying it — is a question about MIT contamination that
-the repository owner has to answer, not one to settle by quietly adding a file.
-The precedent is `modules/xml/NOTICE`, where the James Clark `xmltest` suite was
-excluded in full once its terms turned out to permit only unmodified
-redistribution of the whole archive.
+This is a one-shot capture: the test above asserts against literals and does
+not boot a VM, run FRR, or touch the network. Licence note: FRR is
+GPL-2.0-or-later and this repo is MIT; nothing here is FRR source or FRR's
+own test fixtures, and GPLv2 §0 restricts the covered Program, not a routing
+table it computed for a topology we authored — the same reasoning already
+applied to goaccess/Wireshark captures elsewhere in this repo. See the test's
+own comment for the full citation.
 
-Worth separating two things that look alike when that decision is made:
-
-- **Reading a foreign implementation's source** and writing tests from it is a
-  false anchor. It moves their reading of the spec into our head and then checks
-  our head against itself.
-- **Freezing a foreign implementation's published output** is a real anchor. It
-  is the result of that implementation actually running, and it fails
-  independently of whoever wrote our code.
-
-`r1_topology.json` is the second kind. The licence question is therefore genuine
-and independent of whether the anchor would be sound.
-
-Deferred to the owner (2026-08-02). If the answer is no, the fallback is the
-original route: add `frr` to `VM_DEBIAN_PACKAGES` in `scripts/vm/manifest.sh`,
-re-provision the Debian VM, and capture from a live `isisd` instead.
+What is still not FRR-anchored: the golden-line/4-node-path/diamond/
+two-way-check/reconvergence/old-style-#2/robustness/degenerate/determinism
+tests above remain self-authored (SELF in `ANCHOR-TASKS.tsv`) — they were not
+individually re-derived against FRR captures, only the one dedicated FRR
+topology test was added. LAN pseudonodes and multi-level leaking remain out
+of scope (`SPEC.md` §6) and so are not anchored either, by construction
+rather than by gap.

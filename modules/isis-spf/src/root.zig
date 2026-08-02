@@ -944,6 +944,173 @@ test "two-way check with require_two_way=false: only the hi->lo advertisement ex
     try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 15 }, table.lookup(b).?);
 }
 
+// ── FRR anchor: capture-and-freeze against a real IS-IS speaker ─────────────
+//
+// Everything above this point rests on our own reading of ISO/IEC 10589
+// §7.2 — hand-built topologies, routes we believe the spec requires, tests
+// and implementation sharing one author's interpretation of one document
+// (see README.md, "Not anchored" — now superseded by this section for the
+// cases below). This test fixes that for the cases a real router can grade:
+// it is `frr`'s own `isisd` (10.3), run inside this repo's throwaway Debian
+// VM lane (`scripts/vm/`, `frr` in `VM_DEBIAN_PACKAGES`), computing SPF over
+// a topology we built, from the LSPs it actually flooded.
+//
+// Licence note (read before touching this block): FRR is GPL-2.0-or-later;
+// this repo is MIT. Nothing here is copied from FRR's source, and nothing
+// here is FRR's own test data (its GPL-licensed `tests/topotests/isis_topo1`
+// fixtures were deliberately never opened for this task). What is frozen
+// below is FRR's *output* for a topology this task authored from scratch.
+// GPLv2 §0 restricts the covered *Program*, and expressly limits itself to
+// output only "if its contents constitute a work based on the Program" — a
+// routing table `isisd` computed for our own hand-built topology is not a
+// work based on FRR any more than a compiler's object code is a work based
+// on the compiler. This is the same capture-and-freeze pattern already used
+// in this repo against goaccess and Wireshark (also GPL), and the run is
+// ONE-SHOT: nothing below boots a VM, invokes FRR, or touches the network —
+// the values are literals from here on.
+//
+// ── the topology (5 routers, 7 links, one asymmetric pair, one ECMP tie) ──
+//
+//   r1(0000.0000.0001) --10-- r2(...0002)
+//   r1 --100-- r3(...0003)
+//   r1 --20-- r4(...0004)
+//   r1 --10-- r5(...0005)
+//   r2 --10-- r4
+//   r3 --10-- r4
+//   r3 --50--> r5   (r3's OWN outgoing metric, level-1, toward r5)
+//   r5 --5--> r3    (r5's OWN outgoing metric, level-1, toward r3 -- the
+//                    asymmetric pair: same physical link, different cost
+//                    per direction, exactly ISO 10589's per-interface metric
+//                    model and exactly what a single-weight undirected
+//                    engine (spf-ect) cannot represent, see SPEC.md §3.3)
+//
+// All five `isisd` instances ran as real p2p adjacencies (`isis network
+// point-to-point`, `is-type level-1`, `metric-style wide`) in their own
+// network namespace, joined by veth pairs, each with a `/30` (an IPv4
+// address turned out to be load-bearing for the P2P 3-way handshake to
+// leave Down even though Hellos were already flowing both ways at L2 --
+// found by tcpdump, fixed by addressing the interfaces).
+//
+// `vtysh -c "show version"` (once, after convergence):
+//   FRRouting 10.3 (localhost) on Linux(6.12.96+deb13-amd64).
+//
+// `vtysh -c "show isis database detail"` on r1 (verifies the LSDB the
+// fixture below encodes is the SAME graph FRR actually converged on, not
+// just what this task intended to configure -- the two are not
+// automatically the same, and this is what makes them so; only the
+// Extended Reachability lines are quoted, one per originating LSP):
+//   r1.00-00: Extended Reachability: 0000.0000.0002.00 (Metric: 10)
+//             Extended Reachability: 0000.0000.0003.00 (Metric: 100)
+//             Extended Reachability: 0000.0000.0004.00 (Metric: 20)
+//             Extended Reachability: 0000.0000.0005.00 (Metric: 10)
+//   r2.00-00: Extended Reachability: 0000.0000.0001.00 (Metric: 10)
+//             Extended Reachability: 0000.0000.0004.00 (Metric: 10)
+//   r3.00-00: Extended Reachability: 0000.0000.0001.00 (Metric: 100)
+//             Extended Reachability: 0000.0000.0004.00 (Metric: 10)
+//             Extended Reachability: 0000.0000.0005.00 (Metric: 50)
+//   r4.00-00: Extended Reachability: 0000.0000.0001.00 (Metric: 20)
+//             Extended Reachability: 0000.0000.0002.00 (Metric: 10)
+//             Extended Reachability: 0000.0000.0003.00 (Metric: 10)
+//   r5.00-00: Extended Reachability: 0000.0000.0001.00 (Metric: 10)
+//             Extended Reachability: 0000.0000.0003.00 (Metric: 5)
+//
+// `vtysh -c "show isis topology"` on r1 (the oracle; IP-prefix leaf rows
+// omitted -- out of this module's scope, SPEC.md §6):
+//    Vertex  Type  Metric  Next-Hop  Interface  Parent
+//    r1
+//    r2      TE-IS   10     r2        eth-r2     r1(4)
+//    r5      TE-IS   10     r5        eth-r5     r1(4)
+//    r3      TE-IS   15     r5        eth-r5     r5(4)
+//    r4      TE-IS   20     r4        eth-r4     r1(4)
+//                            r2        eth-r2     r2(4)
+//
+// ── reading the result: two matches, one designed, documented divergence ──
+//
+// r2, r5 (direct neighbours) and r4 (the ECMP tie) match FRR exactly: this
+// module's undirected-engine approximation (SPEC.md §3.3, the canonical
+// edge weight is the LOWER-system-id endpoint's advertised metric) happens
+// to equal the true directed cost on every edge that matters for THOSE
+// three, because the root (r1) is the lower-id endpoint of every edge it
+// uses directly, and {r2,r4} / {r1,r4} are symmetric.
+//
+// r3 is the case SPEC.md §3.3 predicts by name. FRR's real, directed SPF
+// reaches r3 via the r5→r3 arc, whose cost is r5's OWN advertised metric:
+// 5, total 15. This module's edge weight for the *undirected* pair {r3,r5}
+// is canonicalised to the LOWER system-id's advertisement -- r3 (id 3) is
+// lower than r5 (id 5), so the weight used is r3's advertisement (50), not
+// r5's (5), regardless of which direction a path actually needs. That makes
+// the r4 path (20 + 10 = 30) look cheaper than the r5 path (10 + 50 = 60)
+// to this module, even though the real network's cheapest path is 15 via
+// r5. This is not a bug: it is the documented, deliberate limitation of
+// modelling a directed protocol on an undirected single-weight graph (ISO
+// 10589 has no notion of a single link cost -- §7.2's SPF relaxes the arc
+// A→B using A's own advertised metric, which this module cannot represent
+// exactly without a directed engine, SPEC.md §6 "Directed (asymmetric)
+// metrics"). The assertion below pins CURRENT behaviour (30, via r4) so a
+// regression is still caught; the FRR-true answer (15, via r5) is recorded
+// above for anyone who later builds the directed engine to compare against.
+test "FRR anchor: 5-router topology, asymmetric r3<->r5 metric, r4 ECMP tie" {
+    const r1 = sysId(1);
+    const r2 = sysId(2);
+    const r3 = sysId(3);
+    const r4 = sysId(4);
+    const r5 = sysId(5);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(r1));
+    defer db.deinit();
+
+    try insertReachLsp(&db, r1, 1, &.{
+        .{ .nbr = r2, .metric = 10 },
+        .{ .nbr = r3, .metric = 100 },
+        .{ .nbr = r4, .metric = 20 },
+        .{ .nbr = r5, .metric = 10 },
+    });
+    try insertReachLsp(&db, r2, 1, &.{
+        .{ .nbr = r1, .metric = 10 },
+        .{ .nbr = r4, .metric = 10 },
+    });
+    try insertReachLsp(&db, r3, 1, &.{
+        .{ .nbr = r1, .metric = 100 },
+        .{ .nbr = r4, .metric = 10 },
+        .{ .nbr = r5, .metric = 50 }, // r3's own outgoing metric (asymmetric)
+    });
+    try insertReachLsp(&db, r4, 1, &.{
+        .{ .nbr = r1, .metric = 20 },
+        .{ .nbr = r2, .metric = 10 },
+        .{ .nbr = r3, .metric = 10 },
+    });
+    try insertReachLsp(&db, r5, 1, &.{
+        .{ .nbr = r1, .metric = 10 },
+        .{ .nbr = r3, .metric = 5 }, // r5's own outgoing metric (asymmetric)
+    });
+
+    var table = try compute(testing.allocator, &db, r1, 0);
+    defer table.deinit();
+
+    try testing.expectEqual(@as(usize, 5), table.routes.len);
+
+    // Direct neighbours: exact match with FRR ("show isis topology": r2/r5,
+    // metric 10, next-hop themselves).
+    try testing.expectEqual(Route{ .dest = r2, .next_hop = r2, .metric = 10 }, table.lookup(r2).?);
+    try testing.expectEqual(Route{ .dest = r5, .next_hop = r5, .metric = 10 }, table.lookup(r5).?);
+
+    // r4: FRR shows an ECMP tie (direct @20, via r2 @20); this module
+    // resolves to exactly one of the two legitimate first hops (spf-ect's
+    // ECT tie-break), same shape as the pre-existing "diamond" test above.
+    const r4_route = table.lookup(r4).?;
+    try testing.expectEqual(@as(u64, 20), r4_route.metric);
+    try testing.expect(std.mem.eql(u8, &r4_route.next_hop, &r4) or std.mem.eql(u8, &r4_route.next_hop, &r2));
+
+    // r3: DIVERGES from FRR's real answer (15, via r5) -- see the comment
+    // above. Pinned to this module's actual, documented-limitation output:
+    // cost 30 via the r4 branch of the tie (r1->r2->r4->r3, first hop r2 --
+    // which branch of the r4 tie carries the r3 sub-path is itself the
+    // ECT tie-break's choice, so only the metric is asserted exactly; the
+    // next-hop is checked against the same two-way set as r4's).
+    const r3_route = table.lookup(r3).?;
+    try testing.expectEqual(@as(u64, 30), r3_route.metric);
+    try testing.expect(std.mem.eql(u8, &r3_route.next_hop, &r4) or std.mem.eql(u8, &r3_route.next_hop, &r2));
+}
+
 test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.util, meta.role);
