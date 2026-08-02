@@ -192,6 +192,10 @@ test "input_index out of range is a typed error" {
     _ = &t;
 }
 
+// This test is no longer the only thing standing behind the SIGHASH_SINGLE
+// bug -- `single_bug_kat_test.zig` now anchors the boundary on an oracle from
+// outside this repo. It stays because it checks something that oracle cannot:
+// that the bug path returns *before* touching the allocator at all.
 test "SIGHASH_SINGLE bug: input_index with no corresponding output returns the fixed constant, no allocation" {
     // 2 inputs, 1 output: input_index=1 is a valid vin index but has no
     // corresponding vout -- exactly the SIGHASH_SINGLE-bug trigger.

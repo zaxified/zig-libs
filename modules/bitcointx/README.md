@@ -87,7 +87,10 @@ zig fmt --check modules/bitcointx
 
 Byte-exact against: a real mainnet block-170 legacy transaction (txid), BIP143's own published
 Native-P2WPKH signed example (round-trip + txid + wtxid), Bitcoin Core's `sighash.json` reference
-fixture (7 vectors), BIP143's own two worked examples (intermediates + preimage + sighash), and the
+fixture (290 of its 500 rows — every row that does not need `FindAndDelete(OP_CODESEPARATOR)`),
+python-bitcoinlib's `RawSignatureHash` for the **SIGHASH_SINGLE boundary** (a corner `sighash.json`
+does not reach: 17 of its rows use SINGLE, none with `input_index >= len(vout)`), BIP143's own two
+worked examples (intermediates + preimage + sighash), and the
 official `bip-0341/wallet-test-vectors.json` `keyPathSpending` vectors (SigMsg + sighash, all 7
 hashType cases) — plus hostile-input teeth (truncated/oversized-count/non-minimal-CompactSize, all
 typed errors, never a panic or unbounded allocation). See `SPEC.md` for exactly what was verified

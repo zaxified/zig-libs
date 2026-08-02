@@ -76,6 +76,8 @@ test {
     _ = @import("tx_kat_test.zig");
     _ = @import("legacy_kat_vectors.zig");
     _ = @import("legacy_kat_test.zig");
+    _ = @import("single_bug_kat_vectors.zig");
+    _ = @import("single_bug_kat_test.zig");
     _ = @import("bip143_kat_vectors.zig");
     _ = @import("bip143_kat_test.zig");
     _ = @import("bip341_kat_vectors.zig");
