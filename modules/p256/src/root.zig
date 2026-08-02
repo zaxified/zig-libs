@@ -78,6 +78,7 @@ test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("wycheproof_kat_vectors.zig");
+    _ = @import("wycheproof_der_kat_vectors.zig");
     _ = @import("wycheproof_kat_test.zig");
     _ = @import("oracle_test.zig");
     _ = @import("bench.zig");

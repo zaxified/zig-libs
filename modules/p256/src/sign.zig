@@ -101,6 +101,98 @@ pub fn ecdsaSign(secret_key: [32]u8, msg: []const u8, nonce_k: [32]u8) SignError
     return sig;
 }
 
+// ── signature encoding: DER ↔ IEEE P1363 (raw r||s) ─────────────────────────
+//
+// X.509, OCSP, CMS and TLS 1.2 carry ECDSA signatures as the ASN.1
+// `Ecdsa-Sig-Value`; JWS/COSE/XML-DSig and this module's own API use raw
+// `r || s`. Converting between them is where signature malleability creeps in:
+// a decoder that accepts non-minimal INTEGERs, negative INTEGERs, or trailing
+// bytes inside the SEQUENCE lets the same signature be re-encoded many ways,
+// all of which still verify. `derToRaw` therefore enforces DER strictly rather
+// than accepting the wider BER, and is anchored on the 484 Wycheproof
+// `ecdsa_secp256r1_sha256` vectors, 310 of which are malformed encodings.
+//
+// Deliberately self-contained: p256 declares no module dependencies, and
+// pulling in an ASN.1 module for two INTEGERs would trade that for far more
+// code than the parser below.
+
+/// Longest DER `Ecdsa-Sig-Value` for P-256: `30 46 02 21 00 <32> 02 21 00 <32>`.
+pub const der_max_len = 2 + 2 * (2 + 33);
+
+/// Decode a DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` into
+/// raw `r || s` (32 bytes each, big-endian). Returns null for anything that is
+/// not valid DER for this type, including encodings that are legal BER.
+///
+/// Rejected on purpose, each one a way to mint a second encoding of the same
+/// signature: a non-minimal length octet, a leading `0x00` that is not needed
+/// for the sign bit, a negative INTEGER (high bit set), an empty INTEGER, a
+/// value wider than 32 bytes, bytes left over inside the SEQUENCE, and bytes
+/// after it. Zero values are left to the verifier, which rejects `r` or `s`
+/// of zero anyway.
+pub fn derToRaw(sig_der: []const u8) ?[64]u8 {
+    if (sig_der.len < 2 or sig_der[0] != 0x30) return null;
+    const body = readLen(sig_der[1..]) orelse return null;
+    if (body.len_bytes + 1 + body.len != sig_der.len) return null; // trailing data
+    var rest = sig_der[1 + body.len_bytes ..][0..body.len];
+
+    var out = [_]u8{0} ** 64;
+    inline for (.{ 0, 32 }) |off| {
+        if (rest.len < 2 or rest[0] != 0x02) return null;
+        const int = readLen(rest[1..]) orelse return null;
+        const start = 1 + int.len_bytes;
+        if (start + int.len > rest.len) return null;
+        const v = rest[start..][0..int.len];
+        if (v.len == 0) return null; // INTEGER must have content
+        if (v[0] & 0x80 != 0) return null; // negative
+        if (v[0] == 0 and (v.len == 1 or v[1] & 0x80 == 0)) return null; // non-minimal
+        const mag = if (v[0] == 0) v[1..] else v;
+        if (mag.len > 32) return null;
+        @memcpy(out[off + 32 - mag.len ..][0..mag.len], mag);
+        rest = rest[start + int.len ..];
+    }
+    if (rest.len != 0) return null; // extra content inside the SEQUENCE
+    return out;
+}
+
+const Len = struct { len: usize, len_bytes: usize };
+
+/// DER definite-form length: short form below 128, otherwise the minimal
+/// number of length octets with no leading zero. Indefinite form (`0x80`) is
+/// BER only and rejected.
+fn readLen(bytes: []const u8) ?Len {
+    if (bytes.len == 0) return null;
+    const first = bytes[0];
+    if (first < 0x80) return .{ .len = first, .len_bytes = 1 };
+    const n = first & 0x7f;
+    if (n == 0 or n > 2 or bytes.len < 1 + n) return null; // 2 octets spans any P-256 sig
+    if (bytes[1] == 0) return null; // non-minimal
+    var v: usize = 0;
+    for (bytes[1..][0..n]) |b| v = (v << 8) | b;
+    if (v < 0x80) return null; // should have used the short form
+    return .{ .len = v, .len_bytes = 1 + n };
+}
+
+/// Encode raw `r || s` as a DER `Ecdsa-Sig-Value` into `buf` (at least
+/// `der_max_len` bytes) and return the written slice.
+pub fn rawToDer(sig_rs: [64]u8, buf: *[der_max_len]u8) []const u8 {
+    var body: [2 * (2 + 33)]u8 = undefined;
+    var n: usize = 0;
+    inline for (.{ 0, 32 }) |off| {
+        var v: []const u8 = sig_rs[off..][0..32];
+        while (v.len > 1 and v[0] == 0) v = v[1..];
+        const pad: usize = @intFromBool(v[0] & 0x80 != 0);
+        body[n] = 0x02;
+        body[n + 1] = @intCast(v.len + pad);
+        if (pad != 0) body[n + 2] = 0x00;
+        @memcpy(body[n + 2 + pad ..][0..v.len], v);
+        n += 2 + pad + v.len;
+    }
+    buf[0] = 0x30;
+    buf[1] = @intCast(n); // always < 0x80 for P-256
+    @memcpy(buf[2..][0..n], body[0..n]);
+    return buf[0 .. 2 + n];
+}
+
 // ── RFC 6979 §3.2 deterministic nonce (HMAC-SHA256 DRBG) ────────────────────
 
 /// The RFC 6979 nonce for `(privkey, hash32)`.

@@ -4,7 +4,7 @@
 
 //! Wycheproof ECDSA P-256 / SHA-256 verification vectors, IEEE P1363
 //! (raw `r || s`) form, from C2SP/wycheproof `testvectors_v1`
-//! (`ECDSA`).
+//! (`ecdsa_secp256r1_sha256_p1363_test.json`).
 //!
 //! 241 vectors: 173 must verify, 68 must not.
 //! 21 further rows in the upstream file are omitted: their signature is
@@ -18,7 +18,7 @@ pub const Vector = struct {
     /// Upstream `tcId`, so a failure names the row to look up.
     tc_id: u32,
     msg_hex: []const u8,
-    /// `r (32) || s (32)`, big-endian.
+    /// `r (32) || s (32)`, big-endian -- or the DER TLV in the DER file.
     sig_hex: []const u8,
     should_verify: bool,
     comment: []const u8,

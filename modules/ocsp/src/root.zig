@@ -986,31 +986,66 @@ fn verifySignature(
 }
 
 /// Decode a DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` into a
-/// fixed 64-byte `r || s` big-endian buffer, using the bounds-safe reader. Any
-/// malformed shape or oversized integer yields null (⇒ signature invalid).
+/// fixed 64-byte `r || s` big-endian buffer. Any malformed shape yields null
+/// (⇒ signature invalid).
+///
+/// This used to be a local parser. It was replaced by `p256.sign.derToRaw`
+/// because the local one accepted encodings DER forbids — most concretely a
+/// SEQUENCE whose declared length runs past `s` (Wycheproof tcId 23), since it
+/// checked that the SEQUENCE ended at the buffer end but never that `s` ended
+/// at the SEQUENCE end. It also stripped every leading zero of an INTEGER
+/// rather than exactly the sign octet, and read a negative INTEGER as a
+/// positive magnitude. Each of those turns one signature into many accepted
+/// encodings. The replacement is anchored on 484 Wycheproof vectors.
 fn ecdsaDerToRs(sig: []const u8) ?[64]u8 {
-    const seq = ext.parseElement(sig, 0) catch return null;
-    if (seq.identifier.tag != .sequence) return null;
-    if (seq.slice.end != sig.len) return null; // no trailing garbage
-    const r = ext.parseElement(sig, seq.slice.start) catch return null;
-    if (r.identifier.tag != .integer) return null;
-    const s = ext.parseElement(sig, r.slice.end) catch return null;
-    if (s.identifier.tag != .integer) return null;
-
-    var out = [_]u8{0} ** 64;
-    if (!putInt32(sig[r.slice.start..r.slice.end], out[0..32])) return null;
-    if (!putInt32(sig[s.slice.start..s.slice.end], out[32..64])) return null;
-    return out;
+    return p256.sign.derToRaw(sig);
 }
 
-/// Right-align a DER INTEGER magnitude (leading sign/zero octet stripped) into
-/// a 32-byte slot; false if it does not fit or is empty.
-fn putInt32(int_bytes: []const u8, out: *[32]u8) bool {
-    var v = int_bytes;
-    while (v.len > 0 and v[0] == 0) v = v[1..];
-    if (v.len == 0 or v.len > 32) return false;
-    @memcpy(out[32 - v.len ..], v);
-    return true;
+test "ECDSA DER: encodings that DER forbids are rejected (Wycheproof rows)" {
+    // Regression pins for the shapes the previous local parser let through.
+    // All four carry the SAME otherwise-valid r and s as Wycheproof's tcId 1,
+    // so nothing here is rejected for being a bad signature — only for being a
+    // bad encoding.
+    const cases = [_]struct { tc: u32, why: []const u8, hex: []const u8 }{
+        .{
+            .tc = 23,
+            .why = "SEQUENCE length covers two extra 0x00 bytes after s",
+            .hex = "304702202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18" ++
+                "022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db0000",
+        },
+        .{
+            .tc = 25,
+            .why = "0x00 bytes appended after the SEQUENCE",
+            .hex = "304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18" ++
+                "022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db0000",
+        },
+        .{
+            .tc = 9,
+            .why = "non-minimal long-form length on the SEQUENCE",
+            .hex = "3082004502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18" ++
+                "022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+        },
+        .{
+            .tc = 6,
+            .why = "s omits the 0x00 sign octet, so it decodes as negative",
+            .hex = "304402202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18" ++
+                "0220b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+        },
+    };
+    for (cases) |c| {
+        var buf: [128]u8 = undefined;
+        const sig_der = std.fmt.hexToBytes(&buf, c.hex) catch unreachable;
+        if (ecdsaDerToRs(sig_der) != null) {
+            std.debug.print("accepted malformed DER (Wycheproof tcId {d}): {s}\n", .{ c.tc, c.why });
+            return error.MalformedDerAccepted;
+        }
+    }
+
+    // Positive control: the well-formed encoding of the same signature decodes.
+    var ok_buf: [128]u8 = undefined;
+    const ok_der = std.fmt.hexToBytes(&ok_buf, "304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18" ++
+        "022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db") catch unreachable;
+    try std.testing.expect(ecdsaDerToRs(ok_der) != null);
 }
 
 test {

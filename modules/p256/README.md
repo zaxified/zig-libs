@@ -67,6 +67,11 @@ const sig = try p256.sign.ecdsaSign(secret_key, msg, nonce_k);
 // Or let RFC 6979 derive the nonce (no RNG, reproducible, KAT'd byte-exact):
 const dsig = try p256.sign.ecdsaSignDeterministic(secret_key, msg);
 const ok  = p256.sign.ecdsaVerify(pubkey_sec1, msg, sig);
+
+// X.509/OCSP/CMS carry the signature as DER; JWS/COSE/XML-DSig use raw r||s.
+const raw = p256.sign.derToRaw(sig_der) orelse return error.BadSignature;
+var der_buf: [p256.sign.der_max_len]u8 = undefined;
+const der = p256.sign.rawToDer(raw, &der_buf);
 ```
 
 `p256.Scalar` (arithmetic mod the group order `n`) is re-exported from std on
@@ -95,7 +100,8 @@ so it cannot stand in for that), an ECDSA differential against std's signer (bot
 directions: p256 verifies std's signatures, and std verifies p256-produced ones),
 **241 Wycheproof ECDSA-P256/SHA-256 P1363 vectors** (173 must verify, 68 must
 not — run through both `ecdsaVerify` and the std-generic path, so the two cannot
-drift apart unnoticed), and two positive controls — a broken-Solinas-constant
+drift apart unnoticed) and **484 Wycheproof DER vectors** (310 malformed
+encodings) behind `derToRaw`, and two positive controls — a broken-Solinas-constant
 reduction and a corrupted-comb-table gather — the harness flags RED.
 
 Provenance: clean-room from the NIST P-256 domain parameters; OpenSSL's nistz256

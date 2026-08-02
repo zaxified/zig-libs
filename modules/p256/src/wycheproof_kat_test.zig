@@ -22,6 +22,7 @@ const std = @import("std");
 const testing = std.testing;
 const sign = @import("sign.zig");
 const vectors = @import("wycheproof_kat_vectors.zig");
+const der_vectors = @import("wycheproof_der_kat_vectors.zig");
 
 fn hexAlloc(a: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try a.alloc(u8, hex.len / 2);
@@ -83,4 +84,67 @@ test "Wycheproof ECDSA P-256/SHA-256: std's generic ECDSA over our group agrees 
             return err;
         };
     }
+}
+
+test "Wycheproof ECDSA P-256/SHA-256: DER vectors, decode strictly then verify" {
+    // `derToRaw` and `ecdsaVerify` are checked as one pipeline because that is
+    // how a caller uses them: an X.509/OCSP/CMS signature arrives as DER and a
+    // verdict comes out. A decoder that quietly accepted BER would show up
+    // here as an "invalid" row that verifies.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var accepted: usize = 0;
+    var rejected_by_decoder: usize = 0;
+    for (der_vectors.vectors) |v| {
+        const pk = try hexAlloc(a, v.pubkey_hex);
+        const msg = try hexAlloc(a, v.msg_hex);
+        const der = try hexAlloc(a, v.sig_hex);
+
+        const got = if (sign.derToRaw(der)) |raw| blk: {
+            break :blk sign.ecdsaVerify(pk, msg, raw);
+        } else blk: {
+            rejected_by_decoder += 1;
+            break :blk false;
+        };
+        testing.expectEqual(v.should_verify, got) catch |err| {
+            std.debug.print("wycheproof DER tcId {d} ({s}): expected {}, got {}\n", .{
+                v.tc_id, v.comment, v.should_verify, got,
+            });
+            return err;
+        };
+        if (got) accepted += 1;
+    }
+    try testing.expect(accepted > 0);
+    // Most of this file is malformed DER, so the decoder — not the curve
+    // arithmetic — has to be doing the rejecting.
+    try testing.expect(rejected_by_decoder > 100);
+}
+
+test "rawToDer round-trips through derToRaw, including the sign-bit padding case" {
+    // A magnitude with the high bit set needs a 0x00 prefix, and one with
+    // leading zero bytes must not keep them. Both directions have to agree, or
+    // a signature we emit would be one we refuse to read back.
+    var raw: [64]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xDE_12_34_56);
+    const rand = prng.random();
+
+    var saw_padded: usize = 0;
+    var saw_short: usize = 0;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        rand.bytes(&raw);
+        // Force the interesting shapes often enough to be sure they occur.
+        if (i % 3 == 0) raw[0] |= 0x80;
+        if (i % 5 == 0) raw[32] = 0x00;
+        var buf: [sign.der_max_len]u8 = undefined;
+        const der = sign.rawToDer(raw, &buf);
+        const back = sign.derToRaw(der) orelse return error.RoundTripFailed;
+        try testing.expectEqualSlices(u8, &raw, &back);
+        if (raw[0] & 0x80 != 0) saw_padded += 1;
+        if (raw[32] == 0x00) saw_short += 1;
+    }
+    try testing.expect(saw_padded > 0);
+    try testing.expect(saw_short > 0);
 }
