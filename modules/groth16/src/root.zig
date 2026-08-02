@@ -55,6 +55,7 @@ pub const msm = @import("msm.zig");
 pub const r1cs = @import("r1cs.zig");
 pub const qap = @import("qap.zig");
 pub const prover = @import("prover.zig");
+pub const snarkjs_export = @import("snarkjs_export.zig");
 
 // Convenience re-exports.
 pub const Fr = field.Fr;
@@ -86,7 +87,9 @@ test {
     _ = r1cs;
     _ = qap;
     _ = prover;
+    _ = snarkjs_export;
     _ = @import("harness_test.zig");
+    _ = @import("snarkjs_kat_test.zig");
 }
 
 test "meta names the Groth16 construction and the bn254 dep" {

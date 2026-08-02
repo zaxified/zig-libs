@@ -27,6 +27,7 @@ longer `@panic`. The core was an **Opus** task, not a Fable one, because the
 | `r1cs.zig` | rank-1 constraint system + witness satisfaction |
 | `qap.zig` | R1CS→QAP interpolation + the `A·B−C` divisibility oracle |
 | `prover.zig` | **real** `setup`/`prove` (the toy CRS + proof assembly) + `brokenProof` positive control |
+| `snarkjs_export.zig` | renders our `Proof`/`VerifyingKey`/public inputs into the exact JSON shape `snarkjs` parses — closes the one blind spot the `bn254`-verifier anchor can't see (it decodes our own encoding; see `SPEC.md` §5a) |
 
 ## The anchor
 
@@ -48,6 +49,13 @@ end-to-end test itself:
 - **End-to-end:** `prove(setup(…)) → bn254.groth16Verify == true`, plus
   tamper/wrong-public-input/non-satisfying-witness cases → `false`
   (`harness_test.zig`).
+- **Foreign-verifier cross-check (encoding, not just algebra):** a real
+  `snarkjs@0.7.6` (fetched via `bunx`, run OUTSIDE the test suite) accepts a
+  proof from this module's own `setup`/`prove`, exported through
+  `snarkjs_export.zig`, and rejects a one-limb-tampered copy. Frozen as
+  literals, with the exact commands/output, in `snarkjs_kat_test.zig` — see
+  `SPEC.md` §5a for why this closes a gap the sibling `bn254` verifier alone
+  could not.
 
 ## Using it
 

@@ -125,6 +125,33 @@ saying so protects the Fable budget for cores that actually need it.
 **Recommendation: Phase 2 (the toy-setup + `prove` core) goes to Opus.** Fable
 is not warranted for any part of this module.
 
+### 5a. Correction (2026-08-02) — the "complete oracle" claim had one blind spot
+
+The tier call above is right about the **algebra**: `bn254.groth16Verify` does
+catch any wrong QAP coefficient, witness index, sign, or randomizer. But it is
+this SAME implementation's own decoder reading this SAME implementation's own
+encoder — it cannot see a *serialization* convention (coordinate order,
+endianness, a swapped `G2` pair) that both sides silently agreed on, because
+such a bug round-trips through our own `Proof`/`VerifyingKey` structs cleanly
+forever. That gap needed a genuinely FOREIGN verifier judging our own encoded
+bytes, not another reading of the same in-repo types.
+
+Closed: `src/snarkjs_export.zig` renders this module's `Proof`/
+`VerifyingKey`/public inputs into the exact JSON shape `snarkjs` parses
+(reverse-engineered from `snarkjs@0.7.6`'s own bundled source, not guessed),
+and `src/snarkjs_kat_test.zig` freezes a run of the real, independently
+-authored `snarkjs@0.7.6` (fetched via `bunx`, Apache-2.0, never vendored)
+accepting a proof from this module's own `setup`/`prove` — first try, no
+serialization deviation found — and rejecting a one-limb-tampered copy. See
+that file's module doc comment for the full transcript (including a Bun
+-runtime crash on the literal CLI invocation, worked around without touching
+snarkjs's own verification logic) and `ANCHOR-TASKS.tsv`'s `groth16` row for
+the bookkeeping. What remains self-oracle, correctly: the QAP/R1CS layer —
+`snarkjs` was only ever shown the final group elements, never our R1CS, so it
+has no opinion on whether a proof corresponds to its circuit's intended
+semantics. That is a legitimate end state (no external vector exists for a
+custom circuit's intermediate polynomials), not remaining anchor debt.
+
 ## 6. Verification harness — teeth today
 
 Runs today, no gated code (see `fft.zig`/`msm.zig`/`qap.zig`/`prover.zig`
