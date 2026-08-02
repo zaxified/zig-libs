@@ -513,11 +513,20 @@ pub const Handler = struct {
 
         // Range resolution (RFC 7233): single range → 206 + Content-Range,
         // unsatisfiable → 416, multi-range → fall back to a full 200.
-        var rbuf: [http.range.default_max_ranges]http.range.ResolvedRange = undefined;
-        const applied = http.range.apply(req, rw, total, &rbuf) catch return sendStatus(rw, 500);
-
+        //
+        // `If-Range` (RFC 9110 §13.1.5) gates the whole range path: when the
+        // client's validator no longer matches this file, its copy is stale
+        // and it wants the entire resource, so the `Range` is ignored and the
+        // full 200 below is exactly the right answer. Skipping `range.apply`
+        // also keeps `Content-Range` off the response.
         var start: u64 = 0;
         var length: u64 = total;
+        var rbuf: [http.range.default_max_ranges]http.range.ResolvedRange = undefined;
+        const applied = if (http.conditional.ifRangeAllows(req, .{ .etag = etag, .last_modified = mtime_s }))
+            http.range.apply(req, rw, total, &rbuf) catch return sendStatus(rw, 500)
+        else
+            http.range.Applied{ .outcome = .no_range, .ranges = &.{} };
+
         switch (applied.outcome) {
             .no_range => {},
             .single => {
@@ -1142,27 +1151,20 @@ fn extractHeader(resp: []const u8, prefix: []const u8) ?[]const u8 {
 //    half of the module at all — scoped down per campaign policy; our
 //    existing in-house tests are the only anchor for 412 and stay as-is.
 //
-// 5. `If-Range`. NEITHER `http.range` NOR this module implements `If-Range`
-//    at all (confirmed: no reference to it anywhere in `range.zig`,
-//    `conditional.zig`, or this file — grepped during this audit). A
-//    `Range` request is honored UNCONDITIONALLY today, regardless of any
-//    `If-Range` header. This is a genuine, real GAP relative to RFC 7233
-//    §3.2 found by comparing against starlette (which implements it: a
-//    `Range` + a STALE `If-Range` value — compared with plain string
-//    equality against the current ETag or Last-Modified, per starlette's
-//    `_should_use_range` — makes it ignore `Range` and serve a full 200;
-//    a matching `If-Range` honors the Range as normal). Practical
-//    consequence: a client that resumed a download expecting "if the file
-//    changed, send me the whole thing instead of a stale byte range" does
-//    not get that safety net from this module — it always gets the range
-//    of whatever the CURRENT file contains, silently, which can splice
-//    together bytes from two different file versions client-side. This is
-//    reported here as a real finding for the module's SPEC.md / backlog,
-//    not fixed in this pass (implementing `If-Range` is a new feature, not
-//    a test-anchoring change, and campaign scope here is anchor tests, not
-//    feature work) — see the canary test below, which locks in and clearly
-//    flags the CURRENT (gap) behavior so it fails loudly the moment
-//    `If-Range` support is added and this comment must be updated.
+// 5. `If-Range` — FIXED 2026-08-02, was a real gap this comparison found.
+//    Neither `http.range` nor this module read `If-Range` at all, so a
+//    `Range` was honored unconditionally. A client resuming a download
+//    ("if the file changed, send me the whole thing instead of a stale
+//    byte range") silently got a range of whatever the CURRENT file holds
+//    and could splice bytes from two file versions together.
+//    `http.conditional.ifRangeAllows` now gates the range path; the canary
+//    test below became the conformance test for it. One deliberate
+//    divergence from starlette: it compares the `If-Range` value with plain
+//    string equality against the current ETag or Last-Modified
+//    (`_should_use_range`), which accepts a weak entity-tag and rejects a
+//    date written in a different-but-equivalent HTTP-date format. We follow
+//    RFC 9110 §13.1.5 instead — strong comparison for tags, parsed-date
+//    equality for dates.
 
 test "interop (starlette oracle): single/open-ended/suffix ranges agree on Content-Range, Content-Length, and body bytes" {
     var fx = try Fixture.init();
@@ -1250,20 +1252,52 @@ test "interop (starlette oracle) DIVERGES: a Range with an unrecognized unit is 
     try testing.expect(mem.endsWith(u8, resp, "hello world"));
 }
 
-test "GAP CANARY: If-Range is not implemented -- Range is honored unconditionally regardless of a stale If-Range (ledger #5, a real finding, not yet fixed)" {
-    // This test exists to fail loudly (forcing this comment and the ledger
-    // above to be updated) the moment If-Range support is added. Today: a
-    // Range request accompanied by an If-Range value that could not
-    // possibly match anything real (`If-Range` is entirely unread) still
-    // gets honored as a plain Range request -- the same 206 as if If-Range
-    // had never been sent. starlette, by contrast, would fall back to a
-    // full 200 here (its `_should_use_range` requires an exact string match
-    // against the current ETag or Last-Modified).
+// This was the "GAP CANARY" test for ledger #5: it pinned the pre-fix
+// behavior (a stale `If-Range` was ignored and the Range honored anyway) so
+// it would fail the moment support landed. It did exactly that, and is now
+// the conformance test for the implementation — kept, not deleted, because
+// the starlette comparison that found the gap is what makes it an anchor.
+test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, a current one keeps the 206" {
     var fx = try Fixture.init();
     defer fx.deinit();
     var h = Handler.init(testing.io, fx.root, .{});
     var out: [4096]u8 = undefined;
-    const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nIf-Range: \"not-a-real-etag\"\r\nConnection: close\r\n\r\n", &out);
-    try testing.expectEqual(@as(u16, 206), statusOf(resp)); // the gap: should arguably be 200 if If-Range were honored
-    try testing.expect(mem.endsWith(u8, resp, "hello"));
+    var wire: [512]u8 = undefined;
+
+    // Stale entity-tag: the client's copy is not this file, so it gets the
+    // whole resource — and no Content-Range, since no range was applied.
+    const stale = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        "If-Range: \"not-a-real-etag\"\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(stale));
+    try testing.expect(mem.indexOf(u8, stale, "Content-Range:") == null);
+    try testing.expect(mem.endsWith(u8, stale, "hello world"));
+
+    // The current validators, read off a plain response, must let the range
+    // through — otherwise "always 200" would pass the check above vacuously.
+    const first = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    const etag = extractHeader(first, "ETag: ") orelse return error.NoETag;
+    const lm = extractHeader(first, "Last-Modified: ") orelse return error.NoLastModified;
+
+    for ([_][]const u8{ etag, lm }) |validator| {
+        const req = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+            "If-Range: {s}\r\nConnection: close\r\n\r\n", .{validator}) catch unreachable;
+        var buf: [4096]u8 = undefined;
+        const resp = runRequest(&h, req, &buf);
+        try testing.expectEqual(@as(u16, 206), statusOf(resp));
+        try testing.expect(mem.endsWith(u8, resp, "hello"));
+    }
+
+    // A weak entity-tag is not a strong validator: §13.1.5 says ignore the
+    // Range even though the tag's value is the current one.
+    const weak = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        "If-Range: W/{s}\r\nConnection: close\r\n\r\n", .{etag}) catch unreachable;
+    var wbuf: [4096]u8 = undefined;
+    const weak_resp = runRequest(&h, weak, &wbuf);
+    try testing.expectEqual(@as(u16, 200), statusOf(weak_resp));
+
+    // An If-Range with no Range at all changes nothing.
+    const no_range = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\n" ++
+        "If-Range: \"not-a-real-etag\"\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(no_range));
+    try testing.expect(mem.endsWith(u8, no_range, "hello world"));
 }

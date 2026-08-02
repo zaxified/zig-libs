@@ -157,6 +157,39 @@ pub fn evaluate(method: http.Method, req: *const Server.Request, v: Validators) 
     return .proceed;
 }
 
+/// Whether a `Range` on this request may be honored, per RFC 9110 §13.1.5.
+///
+/// `If-Range` makes a range request conditional on the client's copy still
+/// being current: if it is not, the client wants the *whole* resource in one
+/// round trip rather than a 206 that it would have to throw away. Callers use
+/// this to decide between serving the range and ignoring it (a plain 200) —
+/// unlike the other preconditions it never produces 304 or 412.
+///
+/// Returns `true` when there is no `If-Range` at all, so it is safe to call
+/// unconditionally on the range path.
+///
+/// The value is an entity-tag or an HTTP-date, told apart by a leading DQUOTE
+/// (§13.1.5). Both are compared **strongly**: a weak entity-tag, an
+/// unparseable date, or a validator the resource cannot produce all mean the
+/// range is ignored — the safe direction, since a stale 206 is silent
+/// corruption while an unnecessary 200 only costs bandwidth.
+pub fn ifRangeAllows(req: *const Server.Request, v: Validators) bool {
+    const raw = std.mem.trim(u8, req.header("if-range") orelse return true, " \t");
+    if (raw.len == 0) return false;
+
+    if (raw[0] == '"') {
+        const want = ETag.parse(raw) orelse return false;
+        if (want.weak) return false; // §13.1.5: only a strong validator counts
+        const have = ETag.parse(v.etag orelse return false) orelse return false;
+        return want.strongEql(have);
+    }
+    // Anything else is an HTTP-date, including a `W/`-prefixed entity-tag,
+    // which fails to parse as a date and is thus ignored — the same answer
+    // the weak-tag rule gives.
+    const want_date = parseHttpDate(raw) orelse return false;
+    return want_date == (v.last_modified orelse return false);
+}
+
 /// Evaluate `evaluate`, then stage the response and tell the caller whether to
 /// stop. On `.not_modified` sets status 304, emits `ETag` (RFC 9110 §15.4.5)
 /// and returns `true`. On `.precondition_failed` sets status 412 and returns

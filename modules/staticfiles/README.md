@@ -27,7 +27,9 @@ Provenance: original work of the zig-libs authors (MIT). No third-party code.
 - **Byte ranges** (RFC 7233) via the `http.range` helper: a single range → **206** +
   `Content-Range`, an unsatisfiable range → **416**, `Accept-Ranges: bytes` always. A multi-range
   request is served as a full **200** (RFC 7233 §6.1 permits ignoring `Range`; multipart/byteranges
-  is out of scope — a known amplification vector).
+  is out of scope — a known amplification vector). **`If-Range`** (RFC 9110 §13.1.5) gates the
+  whole range path: a stale or weak validator means the client's copy is out of date, so the
+  `Range` is ignored and the full resource is served instead of a 206 it would have to discard.
 - **Directory `index`** (`index.html` by default) for a directory request. **Directory listing is
   off by default** (opt-in; entry names are HTML-escaped when on).
 - **`Cache-Control`** when configured (`Options.cache_control`, emitted verbatim).
