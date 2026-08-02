@@ -637,6 +637,7 @@ test {
     _ = @import("finalize_test.zig");
     _ = @import("core_kat_vectors.zig");
     _ = @import("core_kat_test.zig");
+    _ = @import("regtest_kat_test.zig");
 }
 
 test "meta.deps names bitcointx and bitcoinscript" {
