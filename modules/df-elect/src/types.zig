@@ -120,6 +120,14 @@ pub const Hello = struct {
 
     pub fn decode(payload: []const u8) DecodeError!Hello {
         if (payload.len < wire_len) return error.Truncated;
+        // Check the tag here rather than trusting the caller to have called
+        // `tagOf` first. Hello and BumFrame have identical wire lengths and
+        // layouts, so a BUM frame decoded as a Hello is silent type confusion:
+        // its `ingress_segment` — routinely `no_ingress` (0xFFFFFFFF) — would
+        // become a `segment` id. Every dispatch site does check the tag today;
+        // this makes that an invariant of the decoder instead of a convention
+        // a new call site can forget.
+        if (payload[0] != @intFromEnum(MsgTag.hello)) return error.InvalidEncoding;
         return .{
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
@@ -153,6 +161,7 @@ pub const BumFrame = struct {
 
     pub fn decode(payload: []const u8) DecodeError!BumFrame {
         if (payload.len < wire_len) return error.Truncated;
+        if (payload[0] != @intFromEnum(MsgTag.bum)) return error.InvalidEncoding;
         return .{
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
@@ -261,4 +270,28 @@ fn fuzzFrames(_: void, smith: *std.testing.Smith) !void {
         // `id()` is called on every decoded frame by the delivery checker.
         std.mem.doNotOptimizeAway(f.id());
     } else |_| {}
+}
+
+test "decode refuses the sibling message: identical layouts must not cross-decode" {
+    // Hello and BumFrame are both 13 bytes with a u32 triple, so the tag byte
+    // is the ONLY thing separating them. Decoding one as the other used to
+    // succeed and silently reinterpret the third field — `no_ingress`
+    // (0xFFFFFFFF) arriving as a segment id.
+    var hello_buf: [Hello.wire_len]u8 = undefined;
+    (Hello{ .origin = 7, .seq = 1, .segment = 3 }).encode(&hello_buf);
+    var bum_buf: [BumFrame.wire_len]u8 = undefined;
+    (BumFrame{ .origin = 7, .seq = 1, .ingress_segment = no_ingress }).encode(&bum_buf);
+
+    try testing.expectError(error.InvalidEncoding, BumFrame.decode(&hello_buf));
+    try testing.expectError(error.InvalidEncoding, Hello.decode(&bum_buf));
+
+    // A byte that is neither tag is refused by both, not just by `tagOf`.
+    var junk = bum_buf;
+    junk[0] = 0x7f;
+    try testing.expectError(error.InvalidEncoding, BumFrame.decode(&junk));
+    try testing.expectError(error.InvalidEncoding, Hello.decode(&junk));
+
+    // The correct pairing still round-trips.
+    try testing.expectEqual(@as(u32, 3), (try Hello.decode(&hello_buf)).segment);
+    try testing.expectEqual(no_ingress, (try BumFrame.decode(&bum_buf)).ingress_segment);
 }
