@@ -104,3 +104,46 @@ in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from ISO/IEC 10589 §7.2; the ECT tie-break lives in
 `spf-ect`. See `/NOTICE` (no entry required — public spec). License: MIT.
+
+## Not anchored — and the open question about how to fix that
+
+Every expectation above is **ours**. The topologies are hand-built and the
+routes are what we believe ISO/IEC 10589 §7.2 requires, so the tests and the
+implementation rest on the same reading of the same document. That is the one
+failure they cannot catch: a misreading shared by both. The sibling wire modules
+(`isis`, `isis-adj`, `isis-dis`, `isis-flood`, `isis-lsdb`) are checked against
+Wireshark's dissector, but **a sibling's anchor does not transfer**, and a
+dissector only grades bytes on a wire — an SPF *result* has no wire form.
+
+An oracle does exist and does **not** require running anything. FRR ships
+`tests/topotests/isis_topo1/`: an `isisd.conf` defining a five-router topology,
+and alongside it `r1_topology.json` / `r1_route.json` — the SPF output a real
+router produced for it (vertex, parent, metric, interface, for both levels).
+That is captured output, not source code: the same capture-and-freeze shape used
+elsewhere in this repo, where a foreign tool runs once and its verdict is
+committed as literals.
+
+**It is not used, and the reason is licensing, not technique.** FRR is
+GPL-2.0-or-later; this repo is MIT. Whether those expected values may be
+vendored — or even transcribed, since transcription of a data set is not
+obviously distinct from copying it — is a question about MIT contamination that
+the repository owner has to answer, not one to settle by quietly adding a file.
+The precedent is `modules/xml/NOTICE`, where the James Clark `xmltest` suite was
+excluded in full once its terms turned out to permit only unmodified
+redistribution of the whole archive.
+
+Worth separating two things that look alike when that decision is made:
+
+- **Reading a foreign implementation's source** and writing tests from it is a
+  false anchor. It moves their reading of the spec into our head and then checks
+  our head against itself.
+- **Freezing a foreign implementation's published output** is a real anchor. It
+  is the result of that implementation actually running, and it fails
+  independently of whoever wrote our code.
+
+`r1_topology.json` is the second kind. The licence question is therefore genuine
+and independent of whether the anchor would be sound.
+
+Deferred to the owner (2026-08-02). If the answer is no, the fallback is the
+original route: add `frr` to `VM_DEBIAN_PACKAGES` in `scripts/vm/manifest.sh`,
+re-provision the Debian VM, and capture from a live `isisd` instead.
