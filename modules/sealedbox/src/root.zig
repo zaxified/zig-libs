@@ -102,6 +102,27 @@ pub const hex_sk_len = secret_length * 2;
 /// Errors returned by the key text parsers. Typed — malformed text never panics.
 pub const KeyEncodingError = error{ InvalidLength, InvalidKeyEncoding };
 
+/// Overwrite `bytes` with zeros in a way the optimiser may not remove.
+///
+/// A plain `@memset` on a buffer that is never read again is dead code, and
+/// LLVM is entitled to delete it — which is precisely the case for a secret
+/// you are done with. `std.crypto.secureZero` is the guaranteed version; this
+/// is it, re-exported here so it sits next to the functions that hand out
+/// secret material and is found by whoever is holding that material.
+///
+/// The buffer most often forgotten is not the 32-byte scalar but the ENCODED
+/// secret: `encodeSecretKeyBase64` returns 44 bytes and `encodeSecretKeyHex`
+/// 64, and those live in the caller's frame looking like ordinary text.
+///
+///     var text = sealedbox.encodeSecretKeyBase64(sk);
+///     defer sealedbox.wipe(&text);
+///
+/// This is hygiene, not a defense against an attacker who can already read
+/// your process memory at the moment the secret is live.
+pub fn wipe(bytes: []u8) void {
+    std.crypto.secureZero(u8, bytes);
+}
+
 /// Encode a recipient public key as standard base64 (44 chars, `=`-padded).
 pub fn encodePublicKeyBase64(pk: [public_length]u8) [base64_pk_len]u8 {
     return encodeKeyBase64(pk);
@@ -125,7 +146,8 @@ pub fn parsePublicKeyHex(text: []const u8) KeyEncodingError![public_length]u8 {
 }
 
 /// Encode a secret key as standard base64 (44 chars). **SECRET material** —
-/// the output grants full decryption capability; store/transmit accordingly.
+/// the output grants full decryption capability; store/transmit accordingly,
+/// and `wipe` the returned buffer when done with it.
 pub fn encodeSecretKeyBase64(sk: [secret_length]u8) [base64_sk_len]u8 {
     return encodeKeyBase64(sk);
 }
@@ -137,7 +159,8 @@ pub fn parseSecretKeyBase64(text: []const u8) KeyEncodingError![secret_length]u8
     return parseKeyBase64(text);
 }
 
-/// Encode a secret key as lowercase hex (64 chars). **SECRET material.**
+/// Encode a secret key as lowercase hex (64 chars). **SECRET material** —
+/// `wipe` the returned buffer when done with it.
 pub fn encodeSecretKeyHex(sk: [secret_length]u8) [hex_sk_len]u8 {
     return std.fmt.bytesToHex(sk, .lower);
 }
@@ -392,4 +415,25 @@ test "malformed key text: typed errors, no panic" {
     try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64("*" ++ good_b64[1..]));
     try std.testing.expectError(error.InvalidLength, parseSecretKeyHex("abc"));
     try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyHex("g" ++ good_hex[1..]));
+}
+
+test "wipe: the encoded secret really is gone from the buffer" {
+    // Round-trips first, so the test cannot pass by wiping something that was
+    // never a secret in the first place.
+    const sk = [_]u8{0xA5} ** secret_length;
+    var text = encodeSecretKeyBase64(sk);
+    try std.testing.expectEqual(sk, try parseSecretKeyBase64(&text));
+
+    wipe(&text);
+    for (text) |c| try std.testing.expectEqual(@as(u8, 0), c);
+
+    var hex_text = encodeSecretKeyHex(sk);
+    try std.testing.expectEqual(sk, try parseSecretKeyHex(&hex_text));
+    wipe(&hex_text);
+    for (hex_text) |c| try std.testing.expectEqual(@as(u8, 0), c);
+
+    // And the raw scalar itself.
+    var raw = sk;
+    wipe(&raw);
+    try std.testing.expectEqual([_]u8{0} ** secret_length, raw);
 }
