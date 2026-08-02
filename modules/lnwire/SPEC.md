@@ -171,8 +171,33 @@ non-compressed field, and a byte-exact decode→re-encode round trip of the opaq
 checked. `checksums_tlv` has no encoding byte in BOLT#7 (always raw), so it is independently
 checked even in an otherwise-`COMPRESSED_ZLIB` row. `announcement_signatures` and
 `gossip_timestamp_filter` remain unanchored (deferred, not in this module's implemented set — see
-"Scope" above); `channel_announcement`/`node_announcement`/`channel_update` and the whole BOLT#2
-channel-management set remain round-trip-only (need a live daemon peer, `ANCHOR-TASKS.tsv`).
+"Scope" above).
+
+**BOLT#7 announcement/update vectors (added 2026-08-02)** — `channel_announcement`,
+`node_announcement`, and `channel_update` are each additionally checked against
+`lightningdevkit/rust-lightning`'s own encode/decode test hex (`lightning/src/ln/msgs.rs`'s
+`encoding_channel_announcement`/`encoding_node_announcement`/`encoding_channel_update` tests, dual
+MIT/Apache-2.0 — see `modules/lnwire/NOTICE`), vendored as
+`src/bolt7_announcement_update_kat_vectors.zig`: 22 vectors total (4/10/8 respectively), every
+parameter combination the upstream tests drive, none synthesized. `lightning/bolts` (BOLT#7's own
+spec repository) carries no test vectors for these three messages, so this is an independent
+implementation's frozen encoder output rather than the spec authors' own data — the vendored file's
+module doc comment records exactly which upstream test/commit and why that is still a real anchor
+(only hex output taken, never their encoder/decoder read for its own sake). Both directions are
+driven: DECODE parses the official bytes and asserts every field, including `channel_announcement`'s
+4-signature order (`node_signature_1`, `node_signature_2`, `bitcoin_signature_1`,
+`bitcoin_signature_2`) and the excess/trailing-data bytes BOLT#7 requires be preserved verbatim;
+ENCODE builds the message from those same fields and asserts byte-exact output against the official
+bytes — the direction this pass prioritized, since the pre-existing suite only round-tripped through
+this module's own encoder/decoder pair. All 22 vectors are usable in both directions (unlike 4 of the
+extended-query rows above): `node_announcement.addresses` (ipv4/ipv6/torv2/torv3/hostname) and
+`channel_announcement.features` (including an unknown-bits case) are opaque byte slices in this
+module regardless of what they encode, so no vector needed skipping for an unimplemented encoding.
+`channel_update.htlc_maximum_msat` is unconditional in BOLT#7's current spec text (the
+`option_channel_htlc_max` feature that used to gate it is now mandatory), matching every vector.
+
+This closes the "round-trip only" gap previously recorded here for these three messages; the whole
+BOLT#2 channel-management set remains round-trip-only (needs a live daemon peer, `ANCHOR-TASKS.tsv`).
 
 Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 

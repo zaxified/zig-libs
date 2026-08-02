@@ -2,10 +2,12 @@ lnwire — third-party attribution
 ====================================================================
 
 This module's own code is MIT (see the repository LICENSE). It additionally
-reproduces third-party TEST-CASE DATA published under Creative Commons
-Attribution 4.0 International (CC-BY 4.0), whose attribution must be
-preserved in any copy. Redistributing this module — alone or as part of
-zig-libs — must keep this file with it.
+reproduces third-party TEST-CASE DATA from two upstream sources: BOLT#7's
+own spec-repository vectors (Creative Commons Attribution 4.0 International,
+CC-BY 4.0) and `lightningdevkit/rust-lightning`'s encode/decode test hex
+(dual MIT / Apache-2.0). Both require attribution to be preserved in any
+copy. Redistributing this module — alone or as part of zig-libs — must keep
+this file with it.
 
 CC-BY 4.0 permits redistribution and MODIFICATION (unlike a stricter case
 elsewhere in this repository — the `xml` module excludes the James Clark
@@ -19,8 +21,11 @@ file itself) is within what the licence grants, same as every other
 No third-party SOURCE CODE is present anywhere in this module — only test
 vectors. `bolt1.zig`/`bolt2.zig`/`bolt7.zig` are clean-room from the public
 BOLT#1/#2/#7 specifications (see README.md's "Provenance:" line and
-SPEC.md); no third-party Lightning implementation was ported, studied, or
-consulted.
+SPEC.md); no third-party Lightning implementation's CODE was ported,
+studied, or consulted — the `lightningdevkit/rust-lightning` vectors below
+are frozen HEX OUTPUT their tests assert against, extracted mechanically
+without reading how their encoder/decoder is implemented (see "What an
+anchor is" reasoning in the second source's section below).
 
 ## `lightning/bolts` — the BOLT#7 specification repository's own
 ## test-vector suite
@@ -63,13 +68,65 @@ One file is a test-vector source for this module:
     bodies and `ANCHOR-TASKS.tsv`'s `lnwire` row for exactly which rows
     fall on which side.
 
+## `lightningdevkit/rust-lightning` — an independent Lightning
+## implementation's own encode/decode test hex
+
+  https://github.com/lightningdevkit/rust-lightning
+  Dual-licensed MIT / Apache-2.0: `LICENSE-MIT`, `LICENSE-APACHE`, and
+  `LICENSE.md` at the repository root (all three present; this module takes
+  the MIT option, matching the rest of zig-libs).
+  `lightning/src/ln/msgs.rs`, as of the last commit touching that file on
+  the `main` branch at fetch time, commit `8b1c7710959c67742b051a9cfccf75a373ee30f5`
+  (`main` branch tip `676bcb144173d742d4c61663123945a62ecc7736` at fetch
+  time, 2026-08-02).
+
+BOLT#7's own spec repository (`lightning/bolts`, above) carries no test
+vectors for `channel_announcement`/`node_announcement`/`channel_update`.
+`lightningdevkit/rust-lightning` — a separate, independent implementation,
+not the spec — has three `#[test]` functions (`encoding_channel_announcement`,
+`encoding_node_announcement`, `encoding_channel_update`, each calling a
+`do_encoding_*` helper with every boolean-parameter combination the test
+actually drives) that build a message from explicit field values and assert
+the serialized bytes equal a hex literal. What is vendored here is only that
+FROZEN HEX OUTPUT and the field values that produce it — never their
+encoder/decoder's own source, and never read for its own sake (see "What an
+anchor is" in the task that added this: reading an independent
+implementation's CODE and writing tests from it would just relocate their
+reading of BOLT#7 into this module's head; only the hex their encoder
+actually emitted, transcribed mechanically, is an anchor).
+
+  * `lightning/src/ln/msgs.rs` (22 combinations across the three messages,
+    ALL vendored: 4 for `channel_announcement`, 10 for `node_announcement`,
+    8 for `channel_update` — exactly the parameter tuples each upstream
+    `#[test]` function calls its `do_encoding_*` helper with, none
+    synthesized) — transcribed mechanically into
+    `src/bolt7_announcement_update_kat_vectors.zig`; each combination's full
+    wire hex (rust-lightning's `target_value`, which — unlike this module's
+    own `decode*`/`serialize*` pair — never includes BOLT#1's 2-byte `type`
+    field; see that file's module doc comment for how the type is
+    reattached before driving this module's codec) plus every field value
+    that produces it. Driven by `bolt7.zig`'s three "official BOLT#7 vector
+    (rust-lightning msgs.rs encoding_*): ..." tests, which exercise both
+    DECODE (parse the official bytes, assert every field including the
+    4-signature order in `channel_announcement` and the excess/trailing
+    data BOLT#7 requires be preserved) and ENCODE (build from the vector's
+    own fields, assert byte-exact output) — closing the "round-trip only"
+    gap `ANCHOR-TASKS.tsv`'s `lnwire` row previously recorded for these
+    three messages. All 22 vectors are fully usable in both directions —
+    none exercise a `lnwire`-unimplemented encoding (unlike 4 of the
+    `bolt07/extended-queries.json` rows above), since this module's
+    `node_announcement.addresses` and `channel_announcement.features` are
+    opaque byte slices regardless of address-descriptor kind or feature-bit
+    meaning.
+
 Implementation vs. test-data distinction: the BOLT#1/#2/#7 wire-format
 CODEC in `bolt1.zig`/`bolt2.zig`/`bolt7.zig` is this module's own
 clean-room work from the public spec text (`01-messaging.md` /
 `02-peer-protocol.md` / `07-routing-gossip.md`) — that needs no
 attribution per root `NOTICE` §0 (a public spec is not a copyrightable
-work). What is reproduced here, and only here, is the SPECIFICATION
-AUTHORS' OWN TEST-CASE DATA, which is precisely why this notice exists and
-lives beside it rather than in root `NOTICE` (per root `NOTICE` §1's
-policy: attribution for reproduced third-party data travels with the
-module that owes it).
+work). What is reproduced here, and only here, is third-party TEST-CASE
+DATA — the SPECIFICATION AUTHORS' OWN vectors (`lightning/bolts`) and an
+INDEPENDENT IMPLEMENTATION'S frozen encoder output (`rust-lightning`) —
+which is precisely why this notice exists and lives beside it rather than
+in root `NOTICE` (per root `NOTICE` §1's policy: attribution for reproduced
+third-party data travels with the module that owes it).

@@ -101,3 +101,11 @@ and `modules/lnwire/NOTICE` for the required CC-BY 4.0 attribution. 4 of the 10 
 `COMPRESSED_ZLIB` short_channel_id/`query_flags` encoding this module does not implement; those
 rows' compressed content is not independently reconstructed (documented per-row in `bolt7.zig`'s
 tests), only the fields this module's codec actually interprets.
+
+**Also added 2026-08-02:** `channel_announcement`/`node_announcement`/`channel_update` are
+additionally byte-exact against `lightningdevkit/rust-lightning`'s own encode/decode test hex (22
+vectors, both DECODE and ENCODE directions, dual MIT/Apache-2.0) — `lightning/bolts` carries no
+vectors of its own for these three messages. See `SPEC.md`'s "BOLT#7 announcement/update vectors"
+note and `modules/lnwire/NOTICE` for the required attribution. This closes the previous
+round-trip-only gap for these three messages; only the BOLT#2 channel-management set remains
+round-trip-only.

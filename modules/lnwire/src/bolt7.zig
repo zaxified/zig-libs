@@ -405,6 +405,7 @@ pub fn serializeReplyChannelRange(allocator: Allocator, msg: ReplyChannelRange) 
 
 const testing = std.testing;
 const eq_kat = @import("bolt7_extended_queries_kat_vectors.zig");
+const au_kat = @import("bolt7_announcement_update_kat_vectors.zig");
 
 fn fillPattern(comptime n: usize, seed: u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -439,6 +440,20 @@ fn hexDecodeAlloc(allocator: Allocator, hex: []const u8) Allocator.Error![]u8 {
     const out = try allocator.alloc(u8, hex.len / 2);
     _ = std.fmt.hexToBytes(out, hex) catch unreachable;
     return out;
+}
+
+/// rust-lightning's per-message `encode()` (the source of
+/// `bolt7_announcement_update_kat_vectors.zig`'s `payload_hex`) emits only
+/// the message's own fields, not BOLT#1's 2-byte `type` field -- see that
+/// file's module doc comment. Prepend this module's own frame type (BOLT#7's
+/// own published constant, e.g. 256 for `channel_announcement`) so the
+/// result is decodable by `decodeChannelAnnouncement`/etc.
+fn withTypePrefix(allocator: Allocator, t: u16, payload: []const u8) Allocator.Error![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, &frameTypeBytes(t));
+    try buf.appendSlice(allocator, payload);
+    return buf.toOwnedSlice(allocator);
 }
 
 /// `encoding_type` byte (0x00, uncompressed) followed by each `Scid`'s
@@ -676,6 +691,174 @@ test "official BOLT#7 vector (lightning/bolts bolt07/extended-queries.json): que
             defer allocator.free(reencoded);
             try testing.expectEqualSlices(u8, bytes, reencoded);
         }
+    }
+}
+
+// ── rust-lightning `msgs.rs` vectors: channel_announcement /
+// node_announcement / channel_update (added 2026-08-02) ─────────────────
+//
+// Closes the "round-trip only" gap `ANCHOR-TASKS.tsv` recorded for these
+// three messages: `lightning/bolts` (BOLT#7's own spec repo) carries no
+// test vectors for them, but `lightningdevkit/rust-lightning` -- an
+// independent implementation -- has encode/decode tests with full wire hex
+// (see `bolt7_announcement_update_kat_vectors.zig`'s module doc comment for
+// exactly which upstream test/lines and the "no type prefix" convention its
+// `payload_hex` follows). Both directions are driven per vector: DECODE
+// parses the official bytes and asserts every field; ENCODE builds the
+// message from those same fields and asserts byte-exact output -- the
+// direction this pass prioritizes, matching the extended-queries vectors
+// above.
+
+test "official BOLT#7 vector (rust-lightning msgs.rs encoding_channel_announcement): channel_announcement" {
+    const allocator = testing.allocator;
+    for (au_kat.channel_announcement_vectors) |v| {
+        const payload = try hexDecodeAlloc(allocator, v.payload_hex);
+        defer allocator.free(payload);
+        const full = try withTypePrefix(allocator, CHANNEL_ANNOUNCEMENT_TYPE, payload);
+        defer allocator.free(full);
+
+        // DECODE: parse the official bytes, assert every field -- in
+        // particular the 4-signature ORDER (node_sig_1, node_sig_2,
+        // bitcoin_sig_1, bitcoin_sig_2, exactly BOLT#7's field order) since
+        // each signature's bytes are distinct in this vector, a swap would
+        // be caught here.
+        const decoded = try decodeChannelAnnouncement(full);
+        try testing.expectEqualSlices(u8, &hexToArray(64, v.node_signature_1_hex), &decoded.node_signature_1);
+        try testing.expectEqualSlices(u8, &hexToArray(64, v.node_signature_2_hex), &decoded.node_signature_2);
+        try testing.expectEqualSlices(u8, &hexToArray(64, v.bitcoin_signature_1_hex), &decoded.bitcoin_signature_1);
+        try testing.expectEqualSlices(u8, &hexToArray(64, v.bitcoin_signature_2_hex), &decoded.bitcoin_signature_2);
+        const want_features = try hexDecodeAlloc(allocator, v.features_hex);
+        defer allocator.free(want_features);
+        try testing.expectEqualSlices(u8, want_features, decoded.features);
+        try testing.expectEqualSlices(u8, &hexToArray(32, v.chain_hash_hex), &decoded.chain_hash);
+        try testing.expectEqual(v.short_channel_id, decoded.short_channel_id);
+        try testing.expectEqualSlices(u8, &hexToArray(33, v.node_id_1_hex), &decoded.node_id_1);
+        try testing.expectEqualSlices(u8, &hexToArray(33, v.node_id_2_hex), &decoded.node_id_2);
+        try testing.expectEqualSlices(u8, &hexToArray(33, v.bitcoin_key_1_hex), &decoded.bitcoin_key_1);
+        try testing.expectEqualSlices(u8, &hexToArray(33, v.bitcoin_key_2_hex), &decoded.bitcoin_key_2);
+        // Trailing/excess data (BOLT#7: "future fields" the signature still
+        // covers) must be preserved verbatim, not dropped.
+        const want_extra = try hexDecodeAlloc(allocator, v.extra_hex);
+        defer allocator.free(want_extra);
+        try testing.expectEqualSlices(u8, want_extra, decoded.extra);
+
+        // ENCODE: build straight from the vector's own fields (the gap
+        // this pass prioritizes) and assert byte-exact against the
+        // official wire bytes.
+        const msg: ChannelAnnouncement = .{
+            .node_signature_1 = hexToArray(64, v.node_signature_1_hex),
+            .node_signature_2 = hexToArray(64, v.node_signature_2_hex),
+            .bitcoin_signature_1 = hexToArray(64, v.bitcoin_signature_1_hex),
+            .bitcoin_signature_2 = hexToArray(64, v.bitcoin_signature_2_hex),
+            .features = want_features,
+            .chain_hash = hexToArray(32, v.chain_hash_hex),
+            .short_channel_id = v.short_channel_id,
+            .node_id_1 = hexToArray(33, v.node_id_1_hex),
+            .node_id_2 = hexToArray(33, v.node_id_2_hex),
+            .bitcoin_key_1 = hexToArray(33, v.bitcoin_key_1_hex),
+            .bitcoin_key_2 = hexToArray(33, v.bitcoin_key_2_hex),
+            .extra = want_extra,
+        };
+        const reencoded = try serializeChannelAnnouncement(allocator, msg);
+        defer allocator.free(reencoded);
+        try testing.expectEqualSlices(u8, full, reencoded);
+    }
+}
+
+test "official BOLT#7 vector (rust-lightning msgs.rs encoding_node_announcement): node_announcement" {
+    const allocator = testing.allocator;
+    for (au_kat.node_announcement_vectors) |v| {
+        const payload = try hexDecodeAlloc(allocator, v.payload_hex);
+        defer allocator.free(payload);
+        const full = try withTypePrefix(allocator, NODE_ANNOUNCEMENT_TYPE, payload);
+        defer allocator.free(full);
+
+        const decoded = try decodeNodeAnnouncement(full);
+        try testing.expectEqualSlices(u8, &hexToArray(64, v.signature_hex), &decoded.signature);
+        const want_features = try hexDecodeAlloc(allocator, v.features_hex);
+        defer allocator.free(want_features);
+        try testing.expectEqualSlices(u8, want_features, decoded.features);
+        try testing.expectEqual(v.timestamp, decoded.timestamp);
+        try testing.expectEqualSlices(u8, &hexToArray(33, v.node_id_hex), &decoded.node_id);
+        try testing.expectEqualSlices(u8, &hexToArray(3, v.rgb_color_hex), &decoded.rgb_color);
+        try testing.expectEqualSlices(u8, &hexToArray(32, v.alias_hex), &decoded.alias);
+        // `addresses` -- ipv4/ipv6/torv2/torv3/hostname descriptors and any
+        // rust-lightning `excess_address_data` folded into the same
+        // length-prefixed field (see the KAT file's struct doc comment) --
+        // is opaque bytes here (SPEC.md's Scope: no address-descriptor
+        // parsing), so only byte-exact presence is asserted, never
+        // per-descriptor interpretation.
+        const want_addresses = try hexDecodeAlloc(allocator, v.addresses_hex);
+        defer allocator.free(want_addresses);
+        try testing.expectEqualSlices(u8, want_addresses, decoded.addresses);
+        const want_extra = try hexDecodeAlloc(allocator, v.extra_hex);
+        defer allocator.free(want_extra);
+        try testing.expectEqualSlices(u8, want_extra, decoded.extra);
+
+        const msg: NodeAnnouncement = .{
+            .signature = hexToArray(64, v.signature_hex),
+            .features = want_features,
+            .timestamp = v.timestamp,
+            .node_id = hexToArray(33, v.node_id_hex),
+            .rgb_color = hexToArray(3, v.rgb_color_hex),
+            .alias = hexToArray(32, v.alias_hex),
+            .addresses = want_addresses,
+            .extra = want_extra,
+        };
+        const reencoded = try serializeNodeAnnouncement(allocator, msg);
+        defer allocator.free(reencoded);
+        try testing.expectEqualSlices(u8, full, reencoded);
+    }
+}
+
+test "official BOLT#7 vector (rust-lightning msgs.rs encoding_channel_update): channel_update" {
+    const allocator = testing.allocator;
+    for (au_kat.channel_update_vectors) |v| {
+        const payload = try hexDecodeAlloc(allocator, v.payload_hex);
+        defer allocator.free(payload);
+        const full = try withTypePrefix(allocator, CHANNEL_UPDATE_TYPE, payload);
+        defer allocator.free(full);
+
+        const decoded = try decodeChannelUpdate(full);
+        try testing.expectEqualSlices(u8, &hexToArray(64, v.signature_hex), &decoded.signature);
+        try testing.expectEqualSlices(u8, &hexToArray(32, v.chain_hash_hex), &decoded.chain_hash);
+        try testing.expectEqual(v.short_channel_id, decoded.short_channel_id);
+        try testing.expectEqual(v.timestamp, decoded.timestamp);
+        // message_flags/channel_flags bit layout: message_flags is always 1
+        // (BOLT#7's `must_be_one` bit) across every vector; channel_flags
+        // exercises both the direction bit (bit 0) and the disable bit
+        // (bit 1), all 4 combinations (0/1/2/3).
+        try testing.expectEqual(v.message_flags, decoded.message_flags);
+        try testing.expectEqual(v.channel_flags, decoded.channel_flags);
+        try testing.expectEqual(v.cltv_expiry_delta, decoded.cltv_expiry_delta);
+        try testing.expectEqual(v.htlc_minimum_msat, decoded.htlc_minimum_msat);
+        try testing.expectEqual(v.fee_base_msat, decoded.fee_base_msat);
+        try testing.expectEqual(v.fee_proportional_millionths, decoded.fee_proportional_millionths);
+        // `htlc_maximum_msat`: BOLT#7's current spec text has this field
+        // unconditional (see the KAT file's doc comment) -- every vector
+        // carries it, none tests "field absent".
+        try testing.expectEqual(v.htlc_maximum_msat, decoded.htlc_maximum_msat);
+        const want_extra = try hexDecodeAlloc(allocator, v.extra_hex);
+        defer allocator.free(want_extra);
+        try testing.expectEqualSlices(u8, want_extra, decoded.extra);
+
+        const msg: ChannelUpdate = .{
+            .signature = hexToArray(64, v.signature_hex),
+            .chain_hash = hexToArray(32, v.chain_hash_hex),
+            .short_channel_id = v.short_channel_id,
+            .timestamp = v.timestamp,
+            .message_flags = v.message_flags,
+            .channel_flags = v.channel_flags,
+            .cltv_expiry_delta = v.cltv_expiry_delta,
+            .htlc_minimum_msat = v.htlc_minimum_msat,
+            .fee_base_msat = v.fee_base_msat,
+            .fee_proportional_millionths = v.fee_proportional_millionths,
+            .htlc_maximum_msat = v.htlc_maximum_msat,
+            .extra = want_extra,
+        };
+        const reencoded = try serializeChannelUpdate(allocator, msg);
+        defer allocator.free(reencoded);
+        try testing.expectEqualSlices(u8, full, reencoded);
     }
 }
 

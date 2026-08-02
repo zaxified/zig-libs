@@ -122,7 +122,10 @@ anyone other than the zig-libs authors. Each such file's first line says
              source code)
   lnwire   — `modules/lnwire/NOTICE` (lightning/bolts BOLT#7
              `bolt07/extended-queries.json` official test vectors, CC-BY
-             4.0; test vectors only, no source code)
+             4.0, plus lightningdevkit/rust-lightning `msgs.rs` encode/
+             decode-test hex for channel_announcement/node_announcement/
+             channel_update, dual MIT/Apache-2.0; test vectors only, no
+             source code)
   psbt     — `modules/psbt/NOTICE` (BIP174 "Test Vectors" section worked
              examples, bitcoin/bips, BSD-2-Clause; test vectors only, no
              source code)
