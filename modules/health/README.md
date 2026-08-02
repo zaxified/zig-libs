@@ -8,10 +8,13 @@ Kubernetes / load-balancer health-check contract.
   can run this handler is alive, so an orchestrator restarts only on *no
   response*.
 - **Readiness** (`/readyz`): **200** when every registered `Check` passes, else
-  **503** with one `not ready: <name>` line per failing check. A readiness
-  failure means *remove me from the LB rotation but do not restart* — use it
-  for recoverable dependencies (database reconnecting, cache warming, load
-  shedding).
+  **503** with one `not ready: <name>` line per failing check (set
+  `detail = false` to keep the status but drop the names when the probe is
+  reachable from outside the cluster — dependency names are internal
+  topology). Every check runs exactly once per probe, so the body always
+  matches the status. A readiness failure means *remove me from the LB
+  rotation but do not restart* — use it for recoverable dependencies
+  (database reconnecting, cache warming, load shedding).
 
 It is a middleware (not handlers) because `router.Handler` carries no
 per-instance state: the middleware owns the config and intercepts the two probe

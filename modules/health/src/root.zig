@@ -78,6 +78,15 @@ pub const Health = struct {
     live_path: []const u8 = "/healthz",
     /// Readiness path (exact match, GET/HEAD).
     ready_path: []const u8 = "/readyz",
+    /// Whether a 503 body names the checks that failed.
+    ///
+    /// On by default because that is what makes the probe useful to an
+    /// operator. Turn it off when the probe is reachable from outside the
+    /// cluster: the names are internal topology ("database", "kafka",
+    /// "billing-api"), and a 503 that enumerates them tells an attacker what
+    /// you depend on and which dependency is currently down. The status code
+    /// is unchanged either way — Kubernetes only reads that.
+    detail: bool = true,
 
     pub fn middleware(h: *const Health) router.Middleware {
         return .{ .state = @constCast(h), .run = middlewareRun };
@@ -106,12 +115,38 @@ fn respondLive(res: *http.Server.ResponseWriter) anyerror!void {
     try res.writeAll("OK\n");
 }
 
+/// Bytes of "not ready: <name>" lines a 503 body carries. Past this the body
+/// is truncated with a marker rather than growing — a probe response is not a
+/// place to let an unbounded number of names size a buffer.
+const detail_buf_len = 512;
+
 fn respondReady(h: *const Health, res: *http.Server.ResponseWriter) anyerror!void {
-    // Evaluate every check (no early exit — the body lists all failures).
+    // Every check runs EXACTLY ONCE. It used to run twice — once to decide the
+    // status, once to write the body — so a flag that flipped in between could
+    // produce a 503 whose body listed nothing (or listed a check that had
+    // since recovered). The predicates are explicitly allowed to be plain
+    // atomic loads, so that race is real, not theoretical.
     var all_ok = true;
+    var detail_buf: [detail_buf_len]u8 = undefined;
+    var detail_len: usize = 0;
+    var truncated = false;
+
     for (h.checks) |c| {
-        if (!c.checkFn(c.ctx)) all_ok = false;
+        if (c.checkFn(c.ctx)) continue;
+        all_ok = false;
+        if (!h.detail) continue;
+        const line_len = "not ready: ".len + c.name.len + 1;
+        if (detail_len + line_len > detail_buf.len) {
+            truncated = true;
+            continue;
+        }
+        var w = detail_buf[detail_len..];
+        @memcpy(w[0.."not ready: ".len], "not ready: ");
+        @memcpy(w["not ready: ".len..][0..c.name.len], c.name);
+        w[line_len - 1] = '\n';
+        detail_len += line_len;
     }
+
     try res.setHeader("Content-Type", "text/plain");
     try res.setHeader("Cache-Control", "no-store");
     if (all_ok) {
@@ -119,16 +154,13 @@ fn respondReady(h: *const Health, res: *http.Server.ResponseWriter) anyerror!voi
         try res.writeAll("OK\n");
         return;
     }
-    // 503 + one "not ready: <name>" line per failing check. Each writeAll
-    // copies into the response buffer, so borrowing `c.name` is safe.
     res.setStatus(503);
-    for (h.checks) |c| {
-        if (!c.checkFn(c.ctx)) {
-            try res.writeAll("not ready: ");
-            try res.writeAll(c.name);
-            try res.writeAll("\n");
-        }
+    if (!h.detail) {
+        try res.writeAll("not ready\n");
+        return;
     }
+    try res.writeAll(detail_buf[0..detail_len]);
+    if (truncated) try res.writeAll("not ready: ...\n");
 }
 
 // ── tests (offline — through http.Server.serveStream) ───────────────────────
@@ -257,4 +289,54 @@ test "custom probe paths" {
     var buf: [1024]u8 = undefined;
     try testing.expect(std.mem.startsWith(u8, runWire(&r, wire("/alive"), &buf), "HTTP/1.1 200"));
     try testing.expectEqualStrings("app", bodyOf(runWire(&r, wire("/healthz"), &buf)));
+}
+
+/// Counts its calls so a test can prove the probe evaluates each check once.
+var eval_count: usize = 0;
+fn countingFailingCheck(_: ?*anyopaque) bool {
+    eval_count += 1;
+    return false;
+}
+
+test "readiness: each check is evaluated exactly once per probe" {
+    // It used to run twice — once for the status, once for the body — so a
+    // predicate that flipped in between could yield a 503 listing nothing.
+    var checks = [_]Check{
+        .{ .name = "a", .checkFn = countingFailingCheck },
+        .{ .name = "b", .checkFn = countingFailingCheck },
+    };
+    var h = Health{ .checks = &checks };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(h.middleware());
+    try r.get("/", hApp);
+
+    var buf: [1024]u8 = undefined;
+    eval_count = 0;
+    const down = runWire(&r, wire("/readyz"), &buf);
+    try testing.expect(std.mem.startsWith(u8, down, "HTTP/1.1 503"));
+    try testing.expectEqualStrings("not ready: a\nnot ready: b\n", bodyOf(down));
+    try testing.expectEqual(@as(usize, 2), eval_count);
+}
+
+test "readiness: detail=false keeps the status but not the dependency names" {
+    // The probe may be reachable from outside the cluster, where "database"
+    // and friends are internal topology worth not publishing.
+    var checks = [_]Check{.{ .name = "database", .checkFn = flagCheck }};
+    var h = Health{ .checks = &checks, .detail = false };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(h.middleware());
+    try r.get("/", hApp);
+
+    var buf: [1024]u8 = undefined;
+    ready_flag = false;
+    const down = runWire(&r, wire("/readyz"), &buf);
+    try testing.expect(std.mem.startsWith(u8, down, "HTTP/1.1 503")); // unchanged
+    try testing.expectEqualStrings("not ready\n", bodyOf(down));
+    try testing.expect(std.mem.indexOf(u8, down, "database") == null);
+
+    ready_flag = true;
+    const ok = runWire(&r, wire("/readyz"), &buf);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
 }
