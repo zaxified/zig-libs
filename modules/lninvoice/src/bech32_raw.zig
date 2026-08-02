@@ -188,15 +188,37 @@ pub fn encode(allocator: Allocator, hrp: []const u8, data: []const u5) (EncodeEr
 /// each one (BOLT#12 "Requirements": readers MUST remove a `+` and any
 /// following whitespace — used to split a long offer/invoice across
 /// limited-length text fields like a tweet).
+///
+/// **Corrected 2026-08-02 (external anchor: BOLT#12
+/// `bolt12/format-string-test.json`, five "+ must be surrounded by bech32
+/// characters" rows).** The spec's rule is conditional, not unconditional:
+/// "if it encounters a `+` ... BETWEEN TWO bech32 characters: MUST remove
+/// the `+` and whitespace" — a `+` at the very start/end of the string,
+/// immediately adjacent to another `+`, or followed by nothing but
+/// whitespace-then-end-of-string, does NOT sit between two characters and
+/// must NOT be removed. The previous implementation stripped every `+`
+/// unconditionally, which wrongly ACCEPTED strings the vectors require
+/// rejected — e.g. a leading `+` ("+lno1...") was silently deleted,
+/// recovering the exact valid offer underneath instead of leaving the `+`
+/// in place to fail as `error.InvalidDataChar` (or, if it lands in the HRP
+/// portion, `error.UnknownPrefix`) the way an unstripped `+` naturally does.
+/// Left un-stripped, a disqualified `+` simply flows through to
+/// `charValue`/`splitHrp` and is rejected there — no new error variant
+/// needed.
 pub fn stripContinuation(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '+') {
-            i += 1;
-            while (i < s.len and std.ascii.isWhitespace(s[i])) : (i += 1) {}
-            continue;
+            const has_before = i > 0 and s[i - 1] != '+' and !std.ascii.isWhitespace(s[i - 1]);
+            var j = i + 1;
+            while (j < s.len and std.ascii.isWhitespace(s[j])) : (j += 1) {}
+            const has_after = j < s.len and s[j] != '+';
+            if (has_before and has_after) {
+                i = j;
+                continue;
+            }
         }
         try out.append(allocator, s[i]);
         i += 1;

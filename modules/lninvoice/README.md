@@ -24,6 +24,12 @@ specification whose own worked examples are the byte-exact anchors. No
 third-party Lightning implementation was consulted, so no `NOTICE` entry is
 required (root [`NOTICE`](../../NOTICE) §0).
 
+**Added 2026-08-02:** that disclaimer covers the CODE, which remains
+clean-room. The module now separately vendors `lightning/bolts`' own
+BOLT#12 test-vector DATA (`offers-test.json`/`format-string-test.json`,
+CC-BY 4.0), which does require attribution — see
+[`NOTICE`](./NOTICE), a module-local file per root NOTICE §1's policy.
+
 ## Scope
 
 Implemented — see `SPEC.md` for the full design/threat-model writeup and exactly what's deferred:

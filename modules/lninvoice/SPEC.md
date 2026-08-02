@@ -160,6 +160,47 @@ strings byte-for-byte from `lightning/bolts` `bolt12/offers-test.json` ("Minimal
 ("Malformed: unknown even TLV type 78") proving the even/odd rejection against a genuine malformed
 wire string, not just a self-constructed one.
 
+**BOLT#12 offer ENCODE, externally anchored as of 2026-08-02** (closing the
+gap this section previously flagged — "BOLT12 offer ENCODE round-trip
+self-constructed" in `ANCHOR-TASKS.tsv` — where the only check was feeding
+this module's own encode pipeline back into its own decoder): ALL 53 rows of
+`lightning/bolts` `bolt12/offers-test.json` are now vendored
+(`bolt12_offers_kat_vectors.zig`). The 22 rows carrying a `fields` breakdown
+(all 20 `"valid": true` rows, plus 2 wire-well-formed-but-semantically-invalid
+`"valid": false` rows) are built from those fields via
+`lnwire.tlv.appendStream` → `bitpack.bytesToQuintets` →
+`bech32_raw.encodeNoChecksum` and asserted BYTE-EXACT against the vector's own
+published `lno1…` string — the first time this module's encoder is checked
+against an oracle other than its own decoder. The same 22 rows are also
+DECODED and their recovered TLV records compared field-by-field against the
+vector's `fields` list. 12 more `"valid": false` rows (out-of-order fields,
+truncated-at-type/-in-length/-after-length/-in-description, a non-32-byte
+`offer_chains`, a present-but-empty `offer_chains`, TLV type ≥ 80, unknown
+even type 1000000002, TLV type > 1999999999, and 5-plus-bit bech32 padding)
+are asserted rejected with the SPECIFIC error each names, not just "some
+error". The remaining 21 `"valid": false` rows exercise UTF-8 validation,
+`offer_paths`/`blinded_path` internal structure, `offer_issuer_id`
+curve-point validity, `offer_features` bit semantics, and reader
+"MUST NOT respond to the offer" business policy — all explicitly out of this
+module's documented scope (see `bolt12.zig`'s comment enumerating each, right
+before its Merkle/signature test section) and deliberately not asserted
+against. `lightning/bolts` `bolt12/format-string-test.json` (12 rows, the
+`+`-continuation / upper-vs-lowercase acceptance rules) is likewise fully
+vendored and driven through `decodeOffer`.
+
+Two real bugs surfaced by this sweep, both fixed: `bech32_raw.stripContinuation`
+used to strip EVERY `+` unconditionally, when BOLT#12 only permits removing
+one that sits between two ordinary characters — a leading/trailing/doubled
+`+` was wrongly accepted before the fix (caught by `format-string-test.json`'s
+five "+ must be surrounded by bech32 characters" rows). And
+`bitpack.quintetsToBytesStrict`'s decode never rejected 5-or-more leftover
+padding bits (only a NONZERO remainder), when BOLT#12's checksum-less
+whole-data-part conversion requires leftover < 5 bits regardless of value —
+now split into a new `quintetsToBytesMinimal` (used by BOLT#12's three
+whole-stream decoders) so BOLT#11's per-field decode, which legitimately can
+carry ≥5 leftover zero bits, keeps its original (correct, unchanged)
+behavior. See both functions' own doc comments.
+
 **BOLT#12 signature calculation**, byte-exact against the spec's own vectors
 (`lightning/bolts` `bolt12/signature-test.json`, "Signature Calculation"):
 - **`n1` Merkle roots** (1/2/3 leaves) — `merkleRoot` reproduces `b013756c…`, `c3774abb…`,

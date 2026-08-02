@@ -24,13 +24,24 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const PaddingError = error{NonZeroPadding};
+pub const PaddingError = error{ NonZeroPadding, PaddingTooLong };
 
 /// Strict byte-string decode (BIP173 `convertbits(5, 8, pad=false)`): packs
 /// `quintets` MSB-first into bytes; any leftover bits after the last full
 /// byte (0..7 of them) MUST be zero, matching what a compliant encoder would
 /// have zero-padded — a nonzero remainder means the input was tampered with
 /// or malformed, and is rejected rather than silently truncated.
+///
+/// Deliberately does NOT enforce "leftover < 5 bits": that stronger rule
+/// only holds when `quintets` is an entire bech32 DATA PART with no other
+/// length signal (BOLT#12's whole-stream conversion — see
+/// `quintetsToBytesMinimal` below, which adds it for exactly that case).
+/// Here, `quintets` is routinely a BOLT#11 tagged field's OWN `data_length`
+/// slice, whose quintet count BOLT#11 never requires to be minimal for the
+/// byte string it holds — a real, valid invoice's field can carry more
+/// quintets than the tightest possible encoding and still be legitimate, as
+/// long as the extra bits are zero. Conflating the two lost real BOLT#11
+/// vectors during development (see `quintetsToBytesMinimal`'s doc comment).
 pub fn quintetsToBytesStrict(allocator: Allocator, quintets: []const u5) (PaddingError || Allocator.Error)![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -49,6 +60,33 @@ pub fn quintetsToBytesStrict(allocator: Allocator, quintets: []const u5) (Paddin
         if ((acc & mask) != 0) return error.NonZeroPadding;
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// `quintetsToBytesStrict` PLUS the "leftover < 5 bits" invariant that only
+/// holds for a bech32-style string's WHOLE data part (BOLT#12's
+/// `decodeOffer`/`decodeInvoiceRequest`/`decodeInvoice`, none of which carry
+/// a separate length field the way a BOLT#11 tagged field does — the
+/// quintet count itself is the only signal of how many bytes were meant).
+///
+/// **`error.PaddingTooLong` (added 2026-08-02, external anchor: BOLT#12
+/// `bolt12/offers-test.json` "Bech32 padding exceeds 4-bit limit")** —
+/// reference `convertbits(5, 8, pad=false)` (the same algorithm
+/// `quintetsToBytesStrict` implements) rejects whenever `bits >= frombits`
+/// (`frombits` = 5): five-plus leftover bits can never be genuine
+/// zero-padding (padding exists only to round the last partial byte up to 8
+/// bits, and a partial byte can never need a whole extra quintet's worth of
+/// filler) — a leftover of 5+ bits means the quintet count itself is wrong
+/// (one extra all-zero quintet appended beyond the minimal encoding), which
+/// is exactly the vector this catches: it is `offers-test.json`'s "Minimal
+/// bolt12 offer" string with one extra trailing zero-value bech32 char
+/// (`q`) appended. `bolt12.zig` used to call `quintetsToBytesStrict`
+/// directly for this and missed the case; this wrapper is now the one it
+/// calls instead, so BOLT#11's field-level decode (which must NOT apply
+/// this extra rule) stays untouched.
+pub fn quintetsToBytesMinimal(allocator: Allocator, quintets: []const u5) (PaddingError || Allocator.Error)![]u8 {
+    const leftover_bits = (quintets.len * 5) % 8;
+    if (leftover_bits >= 5) return error.PaddingTooLong;
+    return quintetsToBytesStrict(allocator, quintets);
 }
 
 /// Lenient byte-string decode (BIP173 `convertbits(5, 8, pad=true)`-style,

@@ -1,0 +1,87 @@
+lninvoice — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE DATA published under Creative Commons
+Attribution 4.0 International (CC-BY 4.0), whose attribution must be
+preserved in any copy. Redistributing this module — alone or as part of
+zig-libs — must keep this file with it.
+
+CC-BY 4.0 permits redistribution and MODIFICATION (unlike a stricter case
+elsewhere in this repository — the `xml` module excludes the James Clark
+`xmltest` sub-suite entirely because ITS terms permit only unmodified
+redistribution of the whole archive; see `modules/xml/NOTICE`). This module's
+CC-BY 4.0 source imposes no such restriction, so a filtered/re-packaged
+subset (a mechanically-generated Zig vectors file, not the upstream JSON
+files themselves) is within what the licence grants, same as every other
+`modules/<name>/NOTICE` "third-party attribution" file in this repository.
+
+No third-party SOURCE CODE is present anywhere in this module — only test
+vectors. `bolt11.zig`/`bolt12.zig` are clean-room from the public BOLT#11/
+BOLT#12 specifications (see README.md's "Provenance:" line and SPEC.md); no
+third-party Lightning implementation was ported, studied, or consulted.
+
+## `lightning/bolts` — the BOLT#11/BOLT#12 specification repository's own
+## test-vector suite
+
+  https://github.com/lightning/bolts
+  Licensed under CC-BY 4.0: http://creativecommons.org/licenses/by/4.0/
+  (stated in the repository's own README.md; there is no separate LICENSE
+  file — CC-BY 4.0 has none to reproduce beyond the attribution above).
+  Fetched 2026-08-02 at commit `35e79db504560b9d3494a0ed07bf1e8379c3663a`
+  (branch `master`).
+
+Four files under `bolt12/` are test-vector sources for this module; two are
+vendored as generated Zig data files, two are reproduced as inline hex
+literals directly in `bolt12.zig`'s own test bodies (a pre-existing style
+this pass did not change):
+
+  * `bolt12/offers-test.json` (53 rows, ALL vendored verbatim) —
+    transcribed mechanically (never hand-typed) into
+    `src/bolt12_offers_kat_vectors.zig`; each row's `description`/`valid`/
+    `bolt12`/`fields` is reproduced byte-exact. Driven by `bolt12.zig`'s
+    "BOLT#12 KAT: offer ENCODE ..." / "... offer DECODE ..." tests (all 20
+    `"valid": true` rows plus the 2 `"valid": false` rows whose TLV bytes
+    are still wire-well-formed — 22 of 53 rows carry a `fields` breakdown to
+    drive ENCODE/DECODE against) and by 12 targeted rejection tests for the
+    remaining wire-malformed rows. The other 21 `"valid": false` rows
+    exercise checks this module does not implement (UTF-8 validation,
+    blinded-path internal structure, curve-point validity, feature-bit
+    semantics, reader "MUST NOT respond" business policy) — listed
+    individually, with the BOLT#12 reasoning for each, in the comment block
+    immediately preceding `bolt12.zig`'s Merkle/signature test section.
+
+  * `bolt12/format-string-test.json` (12 rows, ALL vendored verbatim) —
+    transcribed mechanically into `src/bolt12_format_string_kat_vectors.zig`;
+    drives `bech32_raw.stripContinuation`/`splitHrp`'s `+`-continuation and
+    upper/lowercase acceptance rules end-to-end through `decodeOffer`.
+
+  * `bolt12/signature-test.json` — NOT vendored as a separate file; specific
+    hex values (the `n1` 1/2/3-leaf Merkle-root test TLVs, and the full
+    `invoice_request` worked example: Alice/Bob's offer fields, the 6-leaf
+    Merkle root, and the BIP-340 signature) are reproduced as inline hex
+    string literals directly in `bolt12.zig`'s own "BOLT#12 KAT: n1 Merkle
+    roots" / "BOLT#12 KAT: invoice_request Merkle root + signature verify"
+    tests, predating this pass.
+
+  * `bolt12/payer-proof-test.json` — likewise not vendored separately; the
+    `"full_disclosure"` vector's raw `invoice_hex` TLV stream, Merkle root,
+    and `invoice_signature` are reproduced as inline hex literals in
+    `bolt12.zig`'s "BOLT#12 KAT: invoice Merkle root + signature verify"
+    test, predating this pass.
+
+A fifth file, `bolt12/format-string-test.json`'s sibling
+`bootstrap.bolt12.org`-hosted vector set, was never fetched or used: that
+hostname is NXDOMAIN and was the reason `ANCHOR-TASKS.tsv` previously marked
+this module BLOCKED. It was never needed — the official vectors live in
+`lightning/bolts` (this file's own source), reachable without it.
+
+Implementation vs. test-data distinction: the BOLT#11/BOLT#12 wire-format
+CODEC and Merkle/BIP-340 signature machinery in `bolt11.zig`/`bolt12.zig` are
+this module's own clean-room work from the public spec text (`11-payment-
+encoding.md` / `12-offer-encoding.md`) — that needs no attribution per root
+`NOTICE` §0 (a public spec is not a copyrightable work). What is reproduced
+here, and only here, is the SPECIFICATION AUTHORS' OWN TEST-CASE DATA, which
+is precisely why this notice exists and lives beside it rather than in root
+`NOTICE` (per root `NOTICE` §1's policy: attribution for reproduced
+third-party data travels with the module that owes it).
