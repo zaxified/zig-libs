@@ -172,4 +172,10 @@ VM_DEBIAN_PACKAGES=(
     ethtool
     kmod
     bpftool
+    # isis-spf's anchor: a real IS-IS speaker whose SPF result we capture
+    # ourselves. FRR is GPL, but GPLv2 §0 restricts only the program, not its
+    # output — a routing table computed from our topology is not a work based
+    # on FRR, so capturing here is licence-clean where vendoring their
+    # GPL-licensed topotest fixtures would not be.
+    frr
 )
