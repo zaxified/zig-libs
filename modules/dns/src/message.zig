@@ -945,6 +945,50 @@ test "decode: label/pointer cycle terminates with an error" {
     try expectDecodeError(error.PointerLoop, p);
 }
 
+test "decode: compression pointer reaches the whole 14-bit offset range" {
+    // RFC 1035 §4.1.4 gives a pointer 14 offset bits, so targets up to 16383
+    // are legal — reachable in TCP responses and large EDNS(0) answers. A
+    // decoder that masked only 13 bits would silently aim somewhere else
+    // instead of failing, so this pins the arithmetic rather than the error.
+    //
+    // The pointed-at name sits inside an unhandled record's opaque RDATA,
+    // which is how a target past 8191 shows up in a real packet.
+    const rdlen = 14000;
+    const target_off = 12000; // inside that RDATA, needs bit 13 of the offset
+    const ans2_off = 31 + rdlen;
+
+    const pkt = try testing.allocator.alloc(u8, ans2_off + 16);
+    defer testing.allocator.free(pkt);
+    @memset(pkt, 0);
+
+    std.mem.writeInt(u16, pkt[2..][0..2], 0x8000, .big); // response
+    std.mem.writeInt(u16, pkt[4..][0..2], 1, .big); // QDCOUNT
+    std.mem.writeInt(u16, pkt[6..][0..2], 2, .big); // ANCOUNT
+
+    @memcpy(pkt[12..][0..3], "\x01a\x00"); // QNAME "a."
+    std.mem.writeInt(u16, pkt[15..][0..2], 1, .big); // QTYPE A
+    std.mem.writeInt(u16, pkt[17..][0..2], 1, .big); // QCLASS IN
+
+    pkt[19] = 0xc0; // answer 1 name → offset 12
+    pkt[20] = 12;
+    std.mem.writeInt(u16, pkt[21..][0..2], 0x1234, .big); // unhandled type
+    std.mem.writeInt(u16, pkt[23..][0..2], 1, .big);
+    std.mem.writeInt(u16, pkt[29..][0..2], rdlen, .big);
+    @memcpy(pkt[target_off..][0..9], "\x03www\x03com\x00");
+
+    pkt[ans2_off] = 0xc0 | @as(u8, @intCast(target_off >> 8));
+    pkt[ans2_off + 1] = @truncate(target_off);
+    std.mem.writeInt(u16, pkt[ans2_off + 2 ..][0..2], 1, .big); // TYPE A
+    std.mem.writeInt(u16, pkt[ans2_off + 4 ..][0..2], 1, .big); // CLASS IN
+    std.mem.writeInt(u16, pkt[ans2_off + 10 ..][0..2], 4, .big); // RDLENGTH
+    @memcpy(pkt[ans2_off + 12 ..][0..4], "\x01\x02\x03\x04");
+
+    var msg = try decode(testing.allocator, pkt);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 2), msg.answers.len);
+    try testing.expectEqualStrings("www.com", msg.answers[1].name);
+}
+
 test "decode: reserved label types are rejected" {
     const p40 = "\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x41a\x00" ++ "\x00\x01\x00\x01";
     try expectDecodeError(error.BadLabel, p40);
