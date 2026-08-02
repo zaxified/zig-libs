@@ -89,8 +89,10 @@ build", never a green light. The suite includes the field/group differentials vs
 reduction fold-boundary edge sweep, the RFC 6979 ECDSA-P256/SHA-256 vectors
 (verified by both p256 and std), an ECDSA differential against std's signer (both
 directions: p256 verifies std's signatures, and std verifies p256-produced ones),
-and two positive controls — a broken-Solinas-constant reduction and a
-corrupted-comb-table gather — the harness flags RED.
+**241 Wycheproof ECDSA-P256/SHA-256 P1363 vectors** (173 must verify, 68 must
+not — run through both `ecdsaVerify` and the std-generic path, so the two cannot
+drift apart unnoticed), and two positive controls — a broken-Solinas-constant
+reduction and a corrupted-comb-table gather — the harness flags RED.
 
 Provenance: clean-room from the NIST P-256 domain parameters; OpenSSL's nistz256
 studied as the technique reference (the P-256 Solinas reduction, `MULX/ADX`

@@ -43,8 +43,13 @@ const Fe = @import("field.zig").Fe;
 /// wNAF on PUBLIC inputs only). No secret scalar ever touches a vartime mul.
 ///
 /// Byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`: same construction,
-/// same curve math (p256's group is the byte-exact std oracle), so every RFC
-/// 6979 / Wycheproof vector that passes on std passes here unchanged.
+/// same curve math (p256's group is the byte-exact std oracle).
+///
+/// That argument used to be written here as "so every RFC 6979 / Wycheproof
+/// vector that passes on std passes here unchanged" — which was reasoning, not
+/// evidence, and in any case said nothing about `ecdsaVerify` below, a
+/// separate implementation. Both are now run against all 241 Wycheproof
+/// P1363 vectors in `wycheproof_kat_test.zig`.
 pub const EcdsaP256Sha256 = std.crypto.sign.ecdsa.Ecdsa(P256, Sha256);
 
 pub const SignError = error{ InvalidSecretKey, InvalidNonce };
