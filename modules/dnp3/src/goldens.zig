@@ -594,17 +594,25 @@ test "SELF-DERIVED: our own master-side codecs drive our own outstation" {
         rest = rest[hdr.consumed..];
         groups_seen += 1;
         const layout = records.layoutOf(hdr.header.group, hdr.header.variation) orelse break;
-        const count: usize = @intCast(hdr.header.range.objectCount() orelse break);
+        const count: u64 = hdr.header.range.objectCount() orelse break;
+        // Bound the declared span against the bytes actually present BEFORE
+        // slicing: both factors come off the wire, and this walk is the shape
+        // a consumer copies. Without the check a hostile header slices past
+        // the end and panics.
         if (layout.isPacked()) {
-            rest = rest[records.packedBitBytes(count)..];
+            const span = records.packedBitBytes(@intCast(count));
+            if (span > rest.len) break;
+            rest = rest[span..];
             continue;
         }
         const each = layout.wireLen().?;
+        const span = hdr.header.range.objectSpanBytes(each).?;
+        if (span > rest.len) break;
         if (hdr.header.group == 30 and first_analog == null) {
             const rec = try records.decode(layout, .analog_input, rest);
             first_analog = rec.value.analog_int;
         }
-        rest = rest[count * each ..];
+        rest = rest[@intCast(span)..];
     }
     try testing.expectEqual(@as(usize, 7), groups_seen);
     // The fixture seeds analog input 0 at (0 * 10 - 20) = -20.

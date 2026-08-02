@@ -87,6 +87,25 @@ pub const Range = union(enum) {
             .count => |c| c,
         };
     }
+
+    /// Bytes the object instances occupy at `bytes_per_object`, or null when
+    /// the count is not fixed (`all_values`).
+    ///
+    /// This exists because `objectCount` alone is a trap for the caller. Both
+    /// factors come off the wire, so the product is up to `2^32 * 255` — it
+    /// overflows `usize` on a 32-bit target and, more importantly, the obvious
+    /// consumer loop is `rest = rest[count * each ..]`, which panics on a
+    /// slice out of bounds long before any allocator is involved. (There is no
+    /// allocation to guard here: nothing in this module allocates from a
+    /// decoded count.) Computing the span in `u64` lets a caller reject a
+    /// header with one comparison against the bytes it actually has:
+    ///
+    ///     const span = hdr.header.range.objectSpanBytes(each) orelse break;
+    ///     if (span > rest.len) return error.TruncatedObjects;
+    pub fn objectSpanBytes(self: Range, bytes_per_object: usize) ?u64 {
+        const n = self.objectCount() orelse return null;
+        return n * @as(u64, bytes_per_object);
+    }
 };
 
 pub const ObjectHeader = struct {
@@ -895,4 +914,22 @@ test "record decode: short buffers are typed errors, never panics" {
     try testing.expectError(error.ShortRecord, g20.V1.decode(&.{0}));
     try testing.expectError(error.ShortRecord, g30.V5.decode(&.{ 0, 0, 0 }));
     try testing.expectError(error.ShortRecord, g50.V1.decode(&.{ 0, 0 }));
+}
+
+test "Range.objectSpanBytes: a hostile count yields a span too big to slice, not a wrap" {
+    // start=0, stop=0xFFFFFFFF is a legal encoding: 2^32 objects. At 5 bytes
+    // each that is ~21 GB — the point is that the caller can SEE that with one
+    // comparison instead of computing `count * each` in usize and slicing.
+    const r: Range = .{ .start_stop = .{ .start = 0, .stop = 0xFFFF_FFFF } };
+    const span = r.objectSpanBytes(5).?;
+    try testing.expectEqual(@as(u64, 0x1_0000_0000 * 5), span);
+    try testing.expect(span > std.math.maxInt(u32)); // would have wrapped in u32
+
+    // A realistic header still gives the plain answer.
+    const small: Range = .{ .count = 10 };
+    try testing.expectEqual(@as(u64, 40), small.objectSpanBytes(4).?);
+
+    // `all_values` has no fixed count, so it has no fixed span either.
+    const all: Range = .all_values;
+    try testing.expectEqual(@as(?u64, null), all.objectSpanBytes(4));
 }
