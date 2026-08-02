@@ -22,7 +22,7 @@ raw escape hatch (`tlv.findFirst(tlv_bytes, 240)` → the value bytes).
 
 This module therefore owns the **240 value codec** (`three_way.zig`) and the
 **FSM** (`fsm.zig`). It parses/emits the 240 value with the same discipline as
-`isis`: fixed-offset reads guarded by an up-front length check against the three
+`isis`: fixed-offset reads guarded by an up-front length check against the four
 legal sizes, no over-read, no allocation.
 
 ## 3. TLV 240 wire format (RFC 5303 §3)
@@ -33,14 +33,25 @@ Value layout (for the modeled 6-octet system id):
 |-------|--------|--------------|
 | Adjacency Three-Way State | 1 | always |
 | Extended Local Circuit ID | 4 | value length ≥ 5 |
-| Neighbour System ID | 6 | value length == 15 |
+| Neighbour System ID | 6 | value length ≥ 11 |
 | Neighbour Extended Local Circuit ID | 4 | value length == 15 |
 
-So the only well-formed value lengths are **1, 5, 15**; anything else is
-`error.BadLength`. The neighbour block is all-or-nothing. The state byte encoding
-is **Up = 0, Initializing = 1, Down = 2** (RFC 5303) — the reverse of intuitive
-order; an unassigned byte is `error.BadState`. `ThreeWayState.fromByte` refuses
-an illegal `@enumFromInt`.
+So the well-formed value lengths are **1, 5, 11, 15**; anything else is
+`error.BadLength`. The state byte encoding is **Up = 0, Initializing = 1,
+Down = 2** (RFC 5303) — the reverse of intuitive order; an unassigned byte is
+`error.BadState`. `ThreeWayState.fromByte` refuses an illegal `@enumFromInt`.
+
+> **CORRECTION (Wireshark-anchored, filed under the anchor task for this
+> module):** this section originally said the neighbour block was all-or-
+> nothing and that only 1/5/15 were legal — that was wrong. RFC 5303 §3.1
+> defines `Length` as "1 to 17 octets" and gives the Neighbour System ID and
+> Neighbour Extended Local Circuit ID fields independent "if known" presence
+> conditions, not a single combined one. Wireshark 4.6.4's IS-IS dissector
+> (`packet-isis-hello.c`, `dissect_hello_ptp_adj_clv`) hardcodes exactly four
+> cases — `1`, `5`, `11`, `15` — and decodes the 11-octet form as the Neighbour
+> System ID present WITHOUT the Neighbour Extended Local Circuit ID. See
+> `three_way.zig`'s file docs and `fsm.zig`'s `echoed` computation for the fix
+> and how the FSM still treats that shape as an unconfirmed echo.
 
 ## 4. The state machine
 
@@ -57,6 +68,10 @@ Logical states: `down`, `initializing`, `up`. Events: `start(now)`, `stop()`,
 
 - **echoed** ≡ the neighbour's TLV 240 carries a neighbour block whose
   (system-id, extended-local-circuit-id) equals **ours**. This is the loop guard.
+  A neighbour block with the system-id but no extended-local-circuit-id (the
+  11-octet wire shape, §3) is *not* echoed: a bare system-id cannot
+  disambiguate which of possibly several parallel P2P circuits to that
+  neighbour the reference is about.
 - **neighbour past-Down** ≡ the neighbour's advertised 240 state is not `down`
   (a router that echoes us but claims Down is mid-reset; we hold at
   `initializing` rather than race it to Up). When the neighbour sent no 240,
@@ -113,9 +128,35 @@ change) — a hostile PDU cannot corrupt the machine. The fuzz test pins this
 
 ## 7. Verification
 
-Per CONVENTIONS §7 this is **pure logic** → unit + property/round-trip, no
-external oracle needed (the wire format is validated end-to-end against the
-sibling `isis` codec, which is itself golden-tested).
+**CORRECTION (this task's finding):** this section previously claimed "no
+external oracle needed... the wire format is validated end-to-end against the
+sibling `isis` codec, which is itself golden-tested." That does not hold: a
+sibling's anchor does not transfer — `isis` being golden-tested says nothing
+about whether *this* module's adjacency-specific content (the TLV 240 codec,
+the states it advertises) is correct, since `isis` treats 240 as an opaque raw
+TLV and never looks inside it. The content that is specific to this module —
+TLV 240's field layout and the three-way state byte values — needed its own
+outside oracle, and (see below) finding one turned up a real bug (§3's
+11-octet shape).
+
+Per CONVENTIONS §7 this is pure logic → unit + property/round-trip **plus**,
+for the TLV 240 wire format specifically, Wireshark 4.6.4 (sharkd, headless,
+via `scripts/dissect.py`) as an external anchor: PDUs produced by this
+module's own `start()`/`rxHelloBytes()`/`helloFields()`/`buildHello` were fed
+through Wireshark's real IS-IS dissector and the frozen bytes + Wireshark's
+printed output are pinned in `root.zig`'s golden tests and `three_way.zig`'s
+11-octet golden. This covers the state byte (Up/Initializing/Down) and the
+5-/11-/15-octet TLV 240 shapes, all three exercised through this module's own
+code paths, not hand-derived. NOT externally covered: the 1-octet (state-only)
+form, since `helloFields()` never emits it (this module always advertises at
+least its own extended-local-circuit-id) — its behavior rests on Wireshark's
+own `case 1` in `packet-isis-hello.c`, read but not independently re-run here.
+The P2P Hello *header* framing (length-indicator, PDU length, circuit-type
+bits, holding-time, local-circuit-id) is the sibling `isis` codec's own
+already-anchored surface (see `modules/isis/ANCHOR-TASKS.tsv` row) — that part
+legitimately IS the sibling's job, since this module calls `isis`'s real
+builder/decoder rather than re-implementing it, so no separate anchor is owed
+for it here.
 
 - **Mutual drive** (the core proof): two `Adjacency` instances fed only each
   other's `isis`-serialized IIH bytes converge to Up on both, asserting the exact
@@ -123,11 +164,13 @@ sibling `isis` codec, which is itself golden-tested).
 - **Hold-timer boundary**: bring Up, `tick` just before the deadline stays Up, a
   refreshing hello moves the deadline, a `tick` at the deadline drops to Down with
   `hold_expired`.
-- **Three-way guard**: a neighbour whose 240 omits the neighbour block holds us at
-  Initializing; only an echo (and neighbour past-Down) reaches Up.
+- **Three-way guard**: a neighbour whose 240 omits the neighbour block, or gives
+  only a bare system-id with no extended-local-circuit-id (the 11-octet shape),
+  holds us at Initializing; only a full echo (system-id + extended-circuit-id,
+  and neighbour past-Down) reaches Up.
 - **Loopback + level-mismatch + not-started** rejects; **round-trip** of the
-  1/5/15-octet 240 forms; **malformed** bytes and a bad-length 240 as typed errors
-  with state unchanged.
+  1/5/11/15-octet 240 forms; **malformed** bytes and a bad-length 240 as typed
+  errors with state unchanged.
 - **Determinism**: identical `(event, now)` streams yield identical transitions.
 - **Positive control** (permanent): the FSM run with the three-way guard dropped
   (`three_way_required = false`) wrongly reaches Up on the half-open hello — so if

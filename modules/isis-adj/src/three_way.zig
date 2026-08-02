@@ -15,12 +15,37 @@
 //! |------------------------------------|--------|---------------------|
 //! | Adjacency Three-Way State          | 1      | always              |
 //! | Extended Local Circuit ID          | 4      | when value ≥ 5      |
-//! | Neighbour System ID                | 6      | when value == 15    |
+//! | Neighbour System ID                | 6      | when value ≥ 11     |
 //! | Neighbour Extended Local Circuit ID| 4      | when value == 15    |
 //!
-//! So exactly three value lengths are well-formed for the modeled 6-octet system
-//! id: **1**, **5**, and **15**. Any other length is `error.BadLength`. The
-//! neighbour block is all-or-nothing (both fields, or neither).
+//! So four value lengths are well-formed for the modeled 6-octet system id:
+//! **1**, **5**, **11**, and **15**. Any other length is `error.BadLength`.
+//!
+//! CORRECTION (Wireshark-anchored, see below): an earlier revision of this file
+//! claimed exactly three lengths (1/5/15), reading the neighbour block as
+//! all-or-nothing. RFC 5303 §3.1's own syntax gives `Length` as "1 to 17 octets"
+//! and defines the four fields with independent presence ("if known" for each of
+//! the two neighbour fields separately) — consistent with 1, 5, 5+idlen, and
+//! 5+idlen+4, not just 1/5/15. Wireshark 4.6.4's IS-IS dissector
+//! (`packet-isis-hello.c`, `dissect_hello_ptp_adj_clv`) hardcodes exactly these
+//! four cases (1/5/11/15 for the default 6-octet system id) and decodes the
+//! 11-octet form as Neighbour System ID present WITHOUT a Neighbour Extended
+//! Local Circuit ID — proof, from an independent implementation, that the
+//! all-or-nothing reading of the neighbour block was wrong. Verified via:
+//!
+//!     scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00
+//!     00 00 00 00 0a 00 1b 00 21 03 f0 0b 00 00 00 00 a1 00 00 00 00 00 0b'
+//!
+//! Wireshark printed (trimmed to the load-bearing lines):
+//!     frame[37:13] == f0:0b:... = Point-to-point Adjacency State (t=240, l=11)
+//!     isis.hello.clv.length == 11 = Length: 11
+//!     isis.hello.adjacency_state == 0 = Adjacency State: Up (0)
+//!     isis.hello.extended_local_circuit_id == 0x000000a1
+//!     isis.hello.neighbor_systemid == 0000.0000.000b = Neighbor SystemID: ...
+//! (no `neighbor_extended_local_circuit_id` line — absent at length 11, exactly
+//! as `packet-isis-hello.c` decodes it). See `fsm.zig` for why the FSM still
+//! treats a neighbour block with no extended-circuit-id as an unconfirmed echo
+//! (it cannot disambiguate parallel circuits to the same neighbour system).
 //!
 //! ## Three-way state encoding — NOTE the values
 //! RFC 5303 numbers the state field **Up = 0, Initializing = 1, Down = 2** — the
@@ -55,24 +80,29 @@ pub const ThreeWayState = enum(u8) {
 };
 
 pub const DecodeError = error{
-    /// The value length is not one of the three well-formed sizes (1, 5, 15).
+    /// The value length is not one of the four well-formed sizes (1, 5, 11, 15).
     BadLength,
     /// The 1-octet state field holds an unassigned value.
     BadState,
 };
 
-/// A neighbour reference: the (system-id, extended-local-circuit-id) pair a
-/// router echoes back to prove it has heard the far end — the heart of the
-/// three-way handshake's loop guard.
+/// A neighbour reference: the system-id a router echoes back to prove it has
+/// heard the far end, plus — when the sender also knows it — the far end's
+/// extended-local-circuit-id, which disambiguates which of possibly several
+/// parallel circuits to that system this echo refers to.
+/// `extended_local_circuit_id == null` is the 11-octet wire shape (Wireshark-
+/// anchored, see the file docs); the FSM (`fsm.zig`) treats it as an
+/// unconfirmed echo, since a bare system-id cannot disambiguate parallel
+/// circuits to the same neighbour.
 pub const Neighbor = struct {
     system_id: [system_id_len]u8,
-    extended_local_circuit_id: u32,
+    extended_local_circuit_id: ?u32 = null,
 };
 
 /// A decoded / to-be-encoded TLV 240 value. `extended_local_circuit_id` is
-/// present for the 5- and 15-octet forms; `neighbor` only for the 15-octet form.
-/// A well-formed 15-octet TLV always carries the extended id as well, so
-/// `neighbor != null` implies `extended_local_circuit_id != null`.
+/// present for the 5-, 11- and 15-octet forms; `neighbor` for the 11- and
+/// 15-octet forms (with its own `extended_local_circuit_id` present only in the
+/// 15-octet form).
 pub const ThreeWayTlv = struct {
     state: ThreeWayState,
     extended_local_circuit_id: ?u32 = null,
@@ -80,13 +110,18 @@ pub const ThreeWayTlv = struct {
 
     /// Parse a raw TLV 240 value (the bytes after code+length). Zero-copy in the
     /// sense that it reads fixed offsets only; never over-reads (the length is
-    /// checked against the three legal sizes first).
+    /// checked against the four legal sizes first).
     pub fn decode(value: []const u8) DecodeError!ThreeWayTlv {
         switch (value.len) {
             1 => return .{ .state = try ThreeWayState.fromByte(value[0]) },
             5 => return .{
                 .state = try ThreeWayState.fromByte(value[0]),
                 .extended_local_circuit_id = std.mem.readInt(u32, value[1..5], .big),
+            },
+            11 => return .{
+                .state = try ThreeWayState.fromByte(value[0]),
+                .extended_local_circuit_id = std.mem.readInt(u32, value[1..5], .big),
+                .neighbor = .{ .system_id = value[5..11].* },
             },
             15 => return .{
                 .state = try ThreeWayState.fromByte(value[0]),
@@ -100,16 +135,17 @@ pub const ThreeWayTlv = struct {
         }
     }
 
-    /// The number of value octets `encode` will write (1, 5, or 15).
+    /// The number of value octets `encode` will write (1, 5, 11, or 15).
     pub fn encodedLen(self: ThreeWayTlv) usize {
-        if (self.neighbor != null) return 15;
+        if (self.neighbor) |nb| return if (nb.extended_local_circuit_id != null) 15 else 11;
         if (self.extended_local_circuit_id != null) return 5;
         return 1;
     }
 
     /// Serialize the value into `out` (which must be ≥ `encodedLen()`), returning
-    /// the written slice. A `neighbor` without an `extended_local_circuit_id` is a
-    /// programming error (the wire format has no such shape) and is rejected.
+    /// the written slice. A `neighbor` without an outer `extended_local_circuit_id`
+    /// is a programming error (the wire format has no such shape, the neighbour
+    /// block always sits after it) and is rejected.
     pub fn encode(self: ThreeWayTlv, out: []u8) error{ BufferTooSmall, MalformedTlv }![]const u8 {
         const n = self.encodedLen();
         if (out.len < n) return error.BufferTooSmall;
@@ -120,7 +156,9 @@ pub const ThreeWayTlv = struct {
         }
         if (self.neighbor) |nb| {
             @memcpy(out[5..11], &nb.system_id);
-            std.mem.writeInt(u32, out[11..15], nb.extended_local_circuit_id, .big);
+            if (nb.extended_local_circuit_id) |nb_ext| {
+                std.mem.writeInt(u32, out[11..15], nb_ext, .big);
+            }
         }
         return out[0..n];
     }
@@ -139,7 +177,7 @@ test "three-way state wire values are RFC 5303 (up==0, down==2)" {
     try testing.expectError(error.BadState, ThreeWayState.fromByte(3));
 }
 
-test "TLV 240 round-trips the 1, 5 and 15 octet forms" {
+test "TLV 240 round-trips the 1, 5, 11 and 15 octet forms" {
     var buf: [16]u8 = undefined;
 
     // state-only (1 octet)
@@ -154,6 +192,21 @@ test "TLV 240 round-trips the 1, 5 and 15 octet forms" {
     try testing.expectEqual(@as(usize, 5), w5.len);
     try testing.expectEqual(t5, try ThreeWayTlv.decode(w5));
 
+    // neighbour system-id WITHOUT its extended-local-circuit-id (11 octets) —
+    // Wireshark-anchored shape, see the file docs.
+    const t11: ThreeWayTlv = .{
+        .state = .up,
+        .extended_local_circuit_id = 0xA1,
+        .neighbor = .{ .system_id = .{ 0, 0, 0, 0, 0, 0xB } },
+    };
+    const w11 = try t11.encode(&buf);
+    try testing.expectEqual(@as(usize, 11), w11.len);
+    const d11 = try ThreeWayTlv.decode(w11);
+    try testing.expectEqual(t11.state, d11.state);
+    try testing.expectEqual(t11.extended_local_circuit_id, d11.extended_local_circuit_id);
+    try testing.expectEqual(@as(u8, 0xB), d11.neighbor.?.system_id[5]);
+    try testing.expectEqual(@as(?u32, null), d11.neighbor.?.extended_local_circuit_id);
+
     // full (15 octets) with neighbour echo
     const t15: ThreeWayTlv = .{
         .state = .up,
@@ -165,14 +218,43 @@ test "TLV 240 round-trips the 1, 5 and 15 octet forms" {
     const d15 = try ThreeWayTlv.decode(w15);
     try testing.expectEqual(t15.state, d15.state);
     try testing.expectEqual(t15.extended_local_circuit_id, d15.extended_local_circuit_id);
-    try testing.expectEqual(@as(u32, 42), d15.neighbor.?.extended_local_circuit_id);
+    try testing.expectEqual(@as(u32, 42), d15.neighbor.?.extended_local_circuit_id.?);
     try testing.expectEqual(@as(u8, 9), d15.neighbor.?.system_id[5]);
+}
+
+// External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) — the
+// 11-octet shape above was not a hypothesis, it is what an independent
+// dissector's hardcoded length switch (`packet-isis-hello.c`,
+// `dissect_hello_ptp_adj_clv`: `case 1/5/11/15`) actually decodes.
+//
+// Command:
+//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00
+//   00 00 00 00 0a 00 1b 00 21 03 f0 0b 00 00 00 00 a1 00 00 00 00 00 0b'
+//
+// Wireshark printed (trimmed to the load-bearing lines):
+//   frame[37:13] == f0:0b:00:00:00:00:a1:00:00:00:00:00:0b = Point-to-point
+//     Adjacency State (t=240, l=11)
+//   isis.hello.clv.length == 11 = Length: 11
+//   isis.hello.adjacency_state == 0 = Adjacency State: Up (0)
+//   isis.hello.extended_local_circuit_id == 0x000000a1
+//   isis.hello.neighbor_systemid == 0000.0000.000b = Neighbor SystemID: ...
+// (no `neighbor_extended_local_circuit_id` field printed for length 11 — it is
+// genuinely absent at this length, per Wireshark, not merely zero.)
+test "golden TLV240 11-octet form (Wireshark-anchored): decode matches what Wireshark printed" {
+    // The 240-value bytes Wireshark parsed above (offset 37, length 13 incl.
+    // type+length octets -> value is the trailing 11).
+    const golden_240_11 = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0xa1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b };
+    const d = try ThreeWayTlv.decode(&golden_240_11);
+    try testing.expectEqual(ThreeWayState.up, d.state);
+    try testing.expectEqual(@as(u32, 0xA1), d.extended_local_circuit_id.?);
+    try testing.expectEqual([6]u8{ 0, 0, 0, 0, 0, 0xB }, d.neighbor.?.system_id);
+    try testing.expectEqual(@as(?u32, null), d.neighbor.?.extended_local_circuit_id);
 }
 
 test "TLV 240 rejects bad length and bad state, never over-reads" {
     try testing.expectError(error.BadLength, ThreeWayTlv.decode(&.{})); // empty
     try testing.expectError(error.BadLength, ThreeWayTlv.decode(&[_]u8{ 0, 1 })); // 2 octets
-    try testing.expectError(error.BadLength, ThreeWayTlv.decode(&[_]u8{0} ** 11)); // 11 octets
+    try testing.expectError(error.BadLength, ThreeWayTlv.decode(&[_]u8{0} ** 12)); // 12 octets
     // 5-octet form with an illegal state value.
     try testing.expectError(error.BadState, ThreeWayTlv.decode(&[_]u8{ 9, 0, 0, 0, 0 }));
 }

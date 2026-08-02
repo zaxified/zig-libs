@@ -321,11 +321,19 @@ pub const Adjacency = struct {
         // ── three-way decision ──────────────────────────────────────────────
         // echoed == the neighbour's 240 names US (our system-id AND our extended
         // circuit id) — proof it has heard us. The loop guard.
+        //
+        // The neighbour's extended-local-circuit-id is itself optional on the
+        // wire (RFC 5303 §3.1's 11-octet shape — system-id present, extended id
+        // absent; Wireshark-anchored, see three_way.zig). A bare system-id match
+        // cannot disambiguate WHICH of possibly several parallel P2P circuits to
+        // that neighbour this echo is about, so it does not count as echoed —
+        // same ceiling as no neighbour block at all (Initializing, never Up).
         const echoed = blk: {
             const tw = rx.three_way orelse break :blk false;
             const nb = tw.neighbor orelse break :blk false;
+            const nb_ext = nb.extended_local_circuit_id orelse break :blk false;
             break :blk std.mem.eql(u8, &nb.system_id, &self.cfg.system_id) and
-                nb.extended_local_circuit_id == self.cfg.extended_local_circuit_id;
+                nb_ext == self.cfg.extended_local_circuit_id;
         };
         // The neighbour must also not itself be Down (a router that echoes us but
         // claims Down is mid-reset — hold at Initializing, don't race it to Up).
@@ -466,6 +474,29 @@ test "a neighbour that echoes us (and is past Down) brings us Up" {
     try testing.expectEqual(State.up, adj.currentState());
     try testing.expect(e.adjacency_up);
     try testing.expectEqual(Transition{ .from = .down, .to = .up }, e.transition.?);
+}
+
+test "neighbour system-id present WITHOUT its extended-circuit-id (11-octet wire shape) is NOT an echo" {
+    // RFC 5303 §3.1 also allows a neighbour block with the system-id but no
+    // extended-local-circuit-id (Wireshark-anchored, see three_way.zig). Our
+    // system-id matches, but with no circuit-id we cannot disambiguate which
+    // parallel circuit this is about, so it must not reach Up — same ceiling as
+    // no neighbour block at all.
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_a }, // no extended_local_circuit_id
+        },
+    }, 1);
+    try testing.expectEqual(State.initializing, adj.currentState());
+    try testing.expect(e.adjacency_up == false);
 }
 
 test "echo requires BOTH system-id and circuit-id to match, not just one" {

@@ -21,7 +21,7 @@ Model after: **ISO/IEC 10589 §8.2** (the P2P adjacency lifecycle) and
 
 | Layer | Covers |
 |-------|--------|
-| `three_way` | The RFC 5303 Point-to-Point Three-Way Adjacency TLV (type 240) value codec: `ThreeWayState` (the `up=0`/`init=1`/`down=2` wire byte), `ThreeWayTlv` (state + extended-local-circuit-id + optional neighbour block), bounds-checked `decode`/`encode` of the 1/5/15-octet forms. `isis` exposes 240 only as a raw TLV, so this file parses/emits its value with the same discipline. |
+| `three_way` | The RFC 5303 Point-to-Point Three-Way Adjacency TLV (type 240) value codec: `ThreeWayState` (the `up=0`/`init=1`/`down=2` wire byte), `ThreeWayTlv` (state + extended-local-circuit-id + optional neighbour block), bounds-checked `decode`/`encode` of the 1/5/11/15-octet forms (Wireshark-anchored — the 11-octet shape, neighbour system-id without its extended-circuit-id, was a gap in an earlier revision of this codec; see `three_way.zig`). `isis` exposes 240 only as a raw TLV, so this file parses/emits its value with the same discipline. |
 | `fsm` | The `Adjacency` state machine: `start`/`stop`, `rxHello`/`rxHelloBytes`, `tick`, the derived hold timer + hello cadence, the acceptance rejects, and the `Effect` result. Plus `buildHello`, a convenience that serializes an outgoing IIH via the `isis` P2P builder + a raw TLV 240. |
 
 ## State table

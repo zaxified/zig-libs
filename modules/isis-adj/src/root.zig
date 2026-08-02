@@ -186,6 +186,128 @@ test "positive control: without the three-way guard a half-open hello reaches Up
     try testing.expect(e.adjacency_up);
 }
 
+// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) ────────
+//
+// Every vector below was produced by THIS module's own `buildHello`/`helloFields`
+// (or, for the 11-octet case, hand-built to the RFC-legal shape Wireshark
+// decodes) and fed through Wireshark's real IS-IS dissector — not hand-derived
+// expected values. See `three_way.zig`'s file docs for the full reasoning on
+// the 11-octet shape (a real bug this task found: the codec used to reject it
+// as `BadLength`).
+
+// Command:
+//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   00 00 00 0a 00 1b 00 1b 03 f0 05 02 00 00 00 a1'
+//
+// Wireshark printed (trimmed to the load-bearing lines):
+//   isis.type == 17 = ...1 0001 = PDU Type: P2P HELLO (17)
+//   isis.hello.circuit_type == 0x03 = Circuit type: Level 1 and 2 (0x3)
+//   isis.hello.source_id == 0000.0000.000a
+//   isis.hello.holding_timer == 27 = Holding timer: 27
+//   isis.hello.pdu_length == 27 = PDU length: 27
+//   isis.hello.local_circuit_id == 3 = Local circuit ID: 3
+//   frame[37:7] == f0:05:02:00:00:00:a1 = Point-to-point Adjacency State (t=240, l=5)
+//   isis.hello.adjacency_state == 2 = Adjacency State: Down (2)
+//   isis.hello.extended_local_circuit_id == 0x000000a1
+const golden_p2p_hello_down_5 = [_]u8{
+    0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00,
+    0x1b, 0x00, 0x1b, 0x03, 0xf0, 0x05, 0x02, 0x00,
+    0x00, 0x00, 0xa1,
+};
+
+test "golden P2P Hello (Wireshark-anchored): our own start() reproduces the exact bytes" {
+    var buf: [128]u8 = undefined;
+    var a = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 0xA1,
+        .circuit_type = .level1_2,
+        .holding_time = 27,
+        .local_circuit_id = 3,
+    });
+    const e = a.start(0);
+    const w = try buildHello(&buf, e.send_hello.?);
+    try testing.expectEqualSlices(u8, &golden_p2p_hello_down_5, w);
+}
+
+// Command:
+//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   00 00 00 0a 00 1b 00 25 03 f0 0f 01 00 00 00 a1 00 00 00 00 00 0b 00 00
+//   00 b1'
+//
+// Wireshark printed:
+//   isis.hello.pdu_length == 37
+//   frame[37:17] == f0:0f:... = Point-to-point Adjacency State (t=240, l=15)
+//   isis.hello.adjacency_state == 1 = Adjacency State: Initializing (1)
+//   isis.hello.extended_local_circuit_id == 0x000000a1
+//   isis.hello.neighbor_systemid == 0000.0000.000b
+//   isis.hello.neighbor_extended_local_circuit_id == 0x000000b1
+const golden_p2p_hello_init_15 = [_]u8{
+    0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00,
+    0x1b, 0x00, 0x25, 0x03, 0xf0, 0x0f, 0x01, 0x00,
+    0x00, 0x00, 0xa1, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0b, 0x00, 0x00, 0x00, 0xb1,
+};
+
+test "golden P2P Hello (Wireshark-anchored): rxHelloBytes+helloFields reproduce the exact bytes after hearing B" {
+    var abuf: [128]u8 = undefined;
+    var bbuf: [128]u8 = undefined;
+    var a = Adjacency.init(.{ .system_id = sys_a, .extended_local_circuit_id = 0xA1, .circuit_type = .level1_2, .holding_time = 27, .local_circuit_id = 3 });
+    _ = a.start(0);
+    // B heard A but has not echoed A yet (no neighbour block on B's side).
+    const b_wire = try buildHello(&bbuf, .{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .local_circuit_id = 1,
+        .circuit_type = .level1_2,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 },
+    });
+    const e = try a.rxHelloBytes(b_wire, 1);
+    try testing.expectEqual(State.initializing, a.currentState());
+    try testing.expect(e.adjacency_up == false);
+    const w = try buildHello(&abuf, a.helloFields());
+    try testing.expectEqualSlices(u8, &golden_p2p_hello_init_15, w);
+}
+
+// Command:
+//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   00 00 00 0b 00 1b 00 21 01 f0 0b 01 00 00 00 b1 00 00 00 00 00 0a'
+//
+// Wireshark printed:
+//   isis.hello.source_id == 0000.0000.000b = SystemID {Sender of PDU}
+//   isis.hello.pdu_length == 33 = PDU length: 33
+//   frame[37:13] == f0:0b:... = Point-to-point Adjacency State (t=240, l=11)
+//   isis.hello.clv.length == 11 = Length: 11
+//   isis.hello.adjacency_state == 1 = Adjacency State: Initializing (1)
+//   isis.hello.extended_local_circuit_id == 0x000000b1
+//   isis.hello.neighbor_systemid == 0000.0000.000a
+//   (no neighbor_extended_local_circuit_id line — absent at length 11)
+//
+// This is the real bug this task found: B's TLV 240 names OUR (A's) system-id
+// as its neighbour WITHOUT knowing our extended-local-circuit-id — a legal
+// wire shape per RFC 5303 §3.1 and Wireshark's independent dissector — but our
+// codec used to reject the *whole PDU* as `error.BadLength`. It now decodes
+// cleanly, and (see fsm.zig) the FSM correctly still refuses to call this an
+// echo — a bare system-id cannot disambiguate parallel circuits to the same
+// neighbour — so A's adjacency stays at Initializing rather than either
+// erroring out or wrongly reaching Up.
+const golden_p2p_hello_240_11 = [_]u8{
+    0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00,
+    0x1b, 0x00, 0x21, 0x01, 0xf0, 0x0b, 0x01, 0x00,
+    0x00, 0x00, 0xb1, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a,
+};
+
+test "golden P2P Hello with 11-octet TLV240 (Wireshark-anchored): rxHelloBytes decodes it and does NOT treat it as echoed" {
+    var a = Adjacency.init(.{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 });
+    _ = a.start(0);
+    const e = try a.rxHelloBytes(&golden_p2p_hello_240_11, 1);
+    try testing.expectEqual(State.initializing, a.currentState());
+    try testing.expect(e.adjacency_up == false);
+}
+
 // ── fuzz: hostile IIH bytes must never panic and never corrupt the FSM ───────
 
 test "fuzz: rxHelloBytes on hostile bytes never panics; a rejected PDU is inert" {
