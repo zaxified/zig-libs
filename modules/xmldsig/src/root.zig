@@ -453,19 +453,39 @@ fn findX509Cert(el: *const xml.Element) ?*xml.Element {
     return null;
 }
 
-/// Decode standard base64, tolerating embedded ASCII whitespace/newlines (which
-/// XML routinely wraps long base64 fields with).
-fn decodeBase64(arena: std.mem.Allocator, text: []const u8) VerifyError![]u8 {
+pub const Base64Error = error{ MalformedBase64, OutOfMemory };
+
+/// Decode standard base64, tolerating embedded ASCII whitespace/newlines.
+///
+/// XML routinely wraps long base64 fields (`SignatureValue`, `X509Certificate`,
+/// `CipherValue`, a SAML POST binding's `SAMLResponse`) across lines, and HTML
+/// forms inject their own, so a strict decoder rejects perfectly ordinary
+/// documents. Public because `saml` — which already depends on this module —
+/// needs exactly the same leniency for the same reason; it is XML-DSig's
+/// problem, not two modules' problem.
+///
+/// Leniency stops at whitespace: padding, alphabet and length are still
+/// std's strict standard decoder, so this does not widen what counts as a
+/// valid signature value. Caller owns the result.
+pub fn base64DecodeLenient(alloc: std.mem.Allocator, text: []const u8) Base64Error![]u8 {
     var clean: std.ArrayList(u8) = .empty;
-    defer clean.deinit(arena);
+    defer clean.deinit(alloc);
     for (text) |c| {
-        if (!std.ascii.isWhitespace(c)) try clean.append(arena, c);
+        if (!std.ascii.isWhitespace(c)) try clean.append(alloc, c);
     }
     const dec = std.base64.standard.Decoder;
-    const n = dec.calcSizeForSlice(clean.items) catch return error.MalformedSignature;
-    const buf = try arena.alloc(u8, n);
-    dec.decode(buf, clean.items) catch return error.MalformedSignature;
+    const n = dec.calcSizeForSlice(clean.items) catch return error.MalformedBase64;
+    const buf = try alloc.alloc(u8, n);
+    errdefer alloc.free(buf);
+    dec.decode(buf, clean.items) catch return error.MalformedBase64;
     return buf;
+}
+
+fn decodeBase64(arena: std.mem.Allocator, text: []const u8) VerifyError![]u8 {
+    return base64DecodeLenient(arena, text) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.MalformedBase64 => error.MalformedSignature,
+    };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

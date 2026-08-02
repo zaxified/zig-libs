@@ -2848,18 +2848,10 @@ fn dupAttr(a: std.mem.Allocator, el: *const xml.Element, name: []const u8) std.m
 }
 
 /// Decode standard base64, tolerating embedded ASCII whitespace/newlines.
+/// Delegates to `xmldsig` (already a dependency) so the two modules cannot
+/// drift on what counts as decodable.
 fn decodeBase64(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    var clean: std.ArrayList(u8) = .empty;
-    defer clean.deinit(alloc);
-    for (text) |c| {
-        if (!std.ascii.isWhitespace(c)) try clean.append(alloc, c);
-    }
-    const dec = std.base64.standard.Decoder;
-    const n = try dec.calcSizeForSlice(clean.items);
-    const buf = try alloc.alloc(u8, n);
-    errdefer alloc.free(buf);
-    try dec.decode(buf, clean.items);
-    return buf;
+    return xmldsig.base64DecodeLenient(alloc, text);
 }
 
 fn appendAttrEscaped(alloc: std.mem.Allocator, w: *std.ArrayList(u8), s: []const u8) std.mem.Allocator.Error!void {
@@ -3136,4 +3128,40 @@ fn fuzzParseIdpMetadata(_: void, smith: *std.testing.Smith) !void {
 
     var m = parseIdpMetadata(testing.allocator, buf[0..len]) catch return;
     m.deinit();
+}
+
+test "decodePostField: base64 wrapped in whitespace decodes (browsers and IdPs both wrap it)" {
+    // A POST binding arrives as an HTML form field, and IdPs commonly emit the
+    // base64 line-wrapped while browsers may add their own whitespace. The
+    // leniency lives in `xmldsig.base64DecodeLenient`; before this test only
+    // xmldsig's own suite covered it, so removing the whitespace filter left
+    // saml green while breaking every real POST response with a wrapped field.
+    const a = std.testing.allocator;
+    const payload = "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\"/>";
+
+    var enc_buf: [256]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const flat = enc.encode(enc_buf[0..enc.calcSize(payload.len)], payload);
+
+    // Wrap at 8 chars with CRLF, and pad the ends with spaces and a newline.
+    var wrapped: std.ArrayList(u8) = .empty;
+    defer wrapped.deinit(a);
+    try wrapped.appendSlice(a, " \n");
+    for (flat, 0..) |c, i| {
+        if (i != 0 and i % 8 == 0) try wrapped.appendSlice(a, "\r\n");
+        try wrapped.append(a, c);
+    }
+    try wrapped.appendSlice(a, "\n ");
+
+    const got = try decodePostField(a, wrapped.items);
+    defer a.free(got);
+    try std.testing.expectEqualStrings(payload, got);
+
+    // Leniency is whitespace only: a stray non-alphabet byte is still refused,
+    // so this does not quietly widen what the binding accepts.
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(a);
+    try bad.appendSlice(a, flat);
+    try bad.append(a, '!');
+    try std.testing.expectError(error.InvalidEncoding, decodePostField(a, bad.items));
 }
