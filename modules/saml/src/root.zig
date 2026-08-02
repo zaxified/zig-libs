@@ -2879,10 +2879,13 @@ fn appendTextEscaped(alloc: std.mem.Allocator, w: *std.ArrayList(u8), s: []const
 // seconds are truncated (second granularity is sufficient for validity windows).
 // A missing timezone is treated as UTC (SAML timestamps are UTC in practice).
 //
-// DRY note: `datefmt.partsToUnix` does the civil→epoch arithmetic, but `saml`
+// DRY note: `datefmt.partsToUnix`/`daysInMonth` do this arithmetic, but `saml`
 // depends only on `xmldsig`+`xml`; the calendar math is reproduced here rather
 // than pulling in `datefmt`. A future `datetime`/`iso8601` helper would let all
-// three (saml, xmldsig-conditions, jwt exp/nbf) share one parser.
+// three (saml, xmldsig-conditions, jwt exp/nbf) share one parser — and the case
+// for it got stronger: this copy had drifted, accepting days that do not exist
+// in their month (`2024-02-31` parsed as `2024-03-02`) where `datefmt.validate`
+// rejects them. Duplicated calendar rules diverge silently.
 //
 // The return type is the minimal `error{InvalidDateTime}` (never allocates),
 // not the wider `ConsumeError` — Zig's error-set coercion widens it back to
@@ -2901,7 +2904,12 @@ fn parseDateTime(s: []const u8) error{InvalidDateTime}!i64 {
     const hour = try parseIntField(i64, s[11..13]);
     const min = try parseIntField(i64, s[14..16]);
     const sec = try parseIntField(i64, s[17..19]);
-    if (month < 1 or month > 12 or day < 1 or day > 31) return error.InvalidDateTime;
+    if (month < 1 or month > 12 or day < 1) return error.InvalidDateTime;
+    // The day must exist in THAT month: `daysFromCivil` is happy to roll an
+    // impossible date over (Feb 31 became Mar 2), which for a `NotOnOrAfter`
+    // silently extends the assertion's validity window instead of rejecting a
+    // malformed timestamp.
+    if (day > daysInMonth(year, @intCast(month))) return error.InvalidDateTime;
     if (hour > 23 or min > 59 or sec > 60) return error.InvalidDateTime;
 
     var i: usize = 19;
@@ -2933,6 +2941,17 @@ fn parseDateTime(s: []const u8) error{InvalidDateTime}!i64 {
     const days = daysFromCivil(year, @intCast(month), @intCast(day));
     const secs = days * 86400 + hour * 3600 + min * 60 + sec;
     return secs - tz_offset;
+}
+
+/// Days in `month` (1-12) of `year`, proleptic Gregorian — the same rule as
+/// `datefmt.daysInMonth`, reproduced here for the reason given above.
+fn daysInMonth(year: i64, month: u4) u5 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (@rem(year, 4) == 0 and (@rem(year, 100) != 0 or @rem(year, 400) == 0)) 29 else 28,
+        else => unreachable,
+    };
 }
 
 fn parseIntField(comptime T: type, s: []const u8) error{InvalidDateTime}!T {
@@ -3164,4 +3183,34 @@ test "decodePostField: base64 wrapped in whitespace decodes (browsers and IdPs b
     try bad.appendSlice(a, flat);
     try bad.append(a, '!');
     try std.testing.expectError(error.InvalidEncoding, decodePostField(a, bad.items));
+}
+
+test "parseDateTime: a day that does not exist in its month is rejected, not rolled over" {
+    // Before this check `daysFromCivil` normalised the overflow, so
+    // "2024-02-31T…" parsed as 2024-03-02 — a `NotOnOrAfter` two days later
+    // than the document actually said, i.e. a validity window an attacker
+    // could stretch with a typo-shaped timestamp rather than a signature.
+    for ([_][]const u8{
+        "2024-02-30T00:00:00Z",
+        "2024-02-31T00:00:00Z",
+        "2023-02-29T00:00:00Z", // 2023 is not a leap year
+        "2024-04-31T00:00:00Z",
+        "2024-06-31T00:00:00Z",
+        "2024-09-31T00:00:00Z",
+        "2024-11-31T00:00:00Z",
+        "2024-01-32T00:00:00Z",
+        "2024-01-00T00:00:00Z",
+    }) |bad| {
+        std.testing.expectError(error.InvalidDateTime, parseDateTime(bad)) catch |e| {
+            std.debug.print("accepted impossible date: {s}\n", .{bad});
+            return e;
+        };
+    }
+
+    // The real boundaries still parse, including both leap-year rules.
+    try std.testing.expectEqual(@as(i64, 1709164800), try parseDateTime("2024-02-29T00:00:00Z"));
+    try std.testing.expectEqual(@as(i64, 951782400), try parseDateTime("2000-02-29T00:00:00Z")); // /400
+    try std.testing.expectError(error.InvalidDateTime, parseDateTime("1900-02-29T00:00:00Z")); // /100
+    try std.testing.expectEqual(@as(i64, 1709251200), try parseDateTime("2024-03-01T00:00:00Z"));
+    try std.testing.expectEqual(@as(i64, 1735603200), try parseDateTime("2024-12-31T00:00:00Z"));
 }
