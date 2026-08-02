@@ -39,10 +39,15 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup:
   (`hashPrevouts`/`hashSequence`/`hashOutputs`) plus the amount-committing preimage.
 - **BIP341 taproot key-path sighash** (`sighash_bip341.zig`) — `SigMsg` over prevout/amount/
   scriptPubKey/sequence/output commitments via `bip340.taggedHash("TapSighash", …)`, all 7
-  hashType combinations (`DEFAULT`/`ALL`/`NONE`/`SINGLE` × plain/`ANYONECANPAY`).
+  hashType combinations (`DEFAULT`/`ALL`/`NONE`/`SINGLE` × plain/`ANYONECANPAY`). `commonSigMsg`
+  exposes the same layout with a caller-chosen `spend_type` and optional annex commitment, so
+  `bitcoinscript`'s BIP342 script-path message appends its extension to this one rather than
+  reproducing a consensus-critical byte order a second time.
 
 Deliberately deferred (structurally noted, not half-built — SPEC.md has the full rationale): BIP342
-tapscript signature hashing, and annex support in the key-path sighash.
+tapscript signature hashing itself (the message layout is shared, the tapscript semantics live in
+`bitcoinscript`), and annex support in the *key-path* sighash (the plumbing exists via
+`CommonOptions.annex_hash`; only the key-path caller does not use it).
 
 ## Use
 

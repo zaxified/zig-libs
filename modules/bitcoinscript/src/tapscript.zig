@@ -18,19 +18,23 @@
 //!   signature (64/65-byte form, sighash-type extraction) against a 32-byte
 //!   x-only public key.
 //!
-//! ## Why the SigMsg is (re)built here rather than reused from `bitcointx`
+//! ## Where the SigMsg comes from
 //!
-//! `bitcointx.bip341.sigMsg` implements the **key-path** message only: it
-//! hard-codes `spend_type = 0x00` (`ext_flag = 0`, no annex) and emits no
-//! extension fields (that module's doc comment says so explicitly). A
-//! script-path signature commits to `spend_type = 0x02` (or `0x03` with an
-//! annex) and the three appended `ext_flag = 1` fields, so the key-path
-//! function cannot be reused as-is. `sigMsg` below reproduces BIP341's
-//! common layout byte-for-byte (cross-checked against `bitcointx`'s
-//! KAT-backed key-path `sigMsg` by `tapscript_test.zig` for the shared
-//! `ext_flag = 0` prefix) and adds the BIP342 tail. A future DRY refactor
-//! could lift a shared `commonSigMsg` helper into `bitcointx`; it is called
-//! out in the coordinator's interop-vector backlog.
+//! `sigMsg` below builds only the BIP342 tail. The common BIP341 layout —
+//! epoch byte through the SINGLE-output commitment, including `spend_type`
+//! and the annex commitment — comes from `bitcointx.bip341.commonSigMsg`,
+//! which the key-path `sigMsg` also calls. This module used to reproduce that
+//! layout byte-for-byte because the key-path function hard-coded
+//! `spend_type = 0x00`; the parameterised helper removed the reason, and with
+//! it a second copy of a consensus-critical byte order that could have
+//! drifted from the KAT-backed one.
+//!
+//! One consequence worth stating: `tapscript_test.zig`'s comparison against
+//! `bitcointx`'s key-path `sigMsg` no longer cross-checks two independent
+//! implementations — both now come from the same code, so it agrees by
+//! construction. What actually validates the common layout is `bitcointx`'s
+//! BIP341 official vectors, which is stronger evidence than two of our own
+//! implementations agreeing ever was.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -226,96 +230,26 @@ pub fn sigMsg(
     spent_outputs: []const bitcointx.TxOut,
     exec: *const ExecData,
 ) SchnorrError![]u8 {
-    try bitcointx.bip341.validateHashType(hash_type);
-    if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
-    if (spent_outputs.len != transaction.vin.len) return error.PrevoutsCountMismatch;
-
-    const anyone_can_pay = (hash_type & 0x80) != 0;
-    const base = hash_type & 0x03;
-    const annex_present = exec.annex != null;
-    // spend_type = 2*ext_flag + annex_present; ext_flag = 1 for tapscript.
-    const spend_type: u8 = 2 + @as(u8, if (annex_present) 1 else 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    try buf.append(allocator, 0x00); // sighash epoch (BIP341)
-    try buf.append(allocator, hash_type);
-    try appendI32LE(&buf, allocator, transaction.version);
-    try appendU32LE(&buf, allocator, transaction.locktime);
-
-    if (!anyone_can_pay) {
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (transaction.vin) |vin| {
-                try tmp.appendSlice(allocator, &vin.prevout.txid);
-                try appendU32LE(&tmp, allocator, vin.prevout.vout);
-            }
-            try buf.appendSlice(allocator, &sha256(tmp.items));
-        }
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (spent_outputs) |o| try appendI64LE(&tmp, allocator, o.value);
-            try buf.appendSlice(allocator, &sha256(tmp.items));
-        }
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (spent_outputs) |o| {
-                try appendCompactSize(&tmp, allocator, o.script_pubkey.len);
-                try tmp.appendSlice(allocator, o.script_pubkey);
-            }
-            try buf.appendSlice(allocator, &sha256(tmp.items));
-        }
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (transaction.vin) |vin| try appendU32LE(&tmp, allocator, vin.sequence);
-            try buf.appendSlice(allocator, &sha256(tmp.items));
-        }
-    }
-
-    if (base == SIGHASH_DEFAULT or base == 0x01) { // DEFAULT or ALL
-        var tmp: std.ArrayList(u8) = .empty;
-        defer tmp.deinit(allocator);
-        for (transaction.vout) |vout| {
-            try appendI64LE(&tmp, allocator, vout.value);
-            try appendCompactSize(&tmp, allocator, vout.script_pubkey.len);
-            try tmp.appendSlice(allocator, vout.script_pubkey);
-        }
-        try buf.appendSlice(allocator, &sha256(tmp.items));
-    }
-
-    try buf.append(allocator, spend_type);
-
-    if (anyone_can_pay) {
-        const o = spent_outputs[input_index];
-        const vin = transaction.vin[input_index];
-        try buf.appendSlice(allocator, &vin.prevout.txid);
-        try appendU32LE(&buf, allocator, vin.prevout.vout);
-        try appendI64LE(&buf, allocator, o.value);
-        try appendCompactSize(&buf, allocator, o.script_pubkey.len);
-        try buf.appendSlice(allocator, o.script_pubkey);
-        try appendU32LE(&buf, allocator, vin.sequence);
-    } else {
-        try appendU32LE(&buf, allocator, @intCast(input_index));
-    }
-
-    // sha_annex = SHA256(compact_size(len) || annex), annex incl. 0x50 prefix.
-    if (exec.annex) |annex| {
+    // The common BIP341 layout comes from `bitcointx` — one implementation of
+    // a consensus-critical byte order, not two that can drift. Only the
+    // BIP342 extension below is this module's own.
+    const annex_hash: ?[32]u8 = if (exec.annex) |annex| blk: {
+        // sha_annex = SHA256(compact_size(len) || annex), annex incl. 0x50 prefix.
         var tmp: std.ArrayList(u8) = .empty;
         defer tmp.deinit(allocator);
         try appendCompactSize(&tmp, allocator, annex.len);
         try tmp.appendSlice(allocator, annex);
-        try buf.appendSlice(allocator, &sha256(tmp.items));
-    }
+        break :blk sha256(tmp.items);
+    } else null;
 
-    if (base == 0x03) { // SIGHASH_SINGLE
-        if (input_index >= transaction.vout.len) return error.MissingCorrespondingOutput;
-        try buf.appendSlice(allocator, &try shaOutput(allocator, transaction.vout[input_index]));
-    }
+    const common = try bitcointx.bip341.commonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, .{
+        // spend_type = 2*ext_flag + annex_present; ext_flag = 1 for tapscript.
+        .spend_type = 2 + @as(u8, if (annex_hash != null) 1 else 0),
+        .annex_hash = annex_hash,
+    });
+
+    var buf: std.ArrayList(u8) = .fromOwnedSlice(common);
+    errdefer buf.deinit(allocator);
 
     // BIP342 ext_flag=1 extension: tapleaf_hash || key_version || codesep_pos.
     try buf.appendSlice(allocator, &exec.tapleaf_hash);
@@ -471,14 +405,14 @@ test "sigMsg ext_flag=0 prefix matches bitcointx key-path sigMsg byte-for-byte" 
         defer a.free(ours);
         const keypath = try bitcointx.bip341.sigMsg(a, t, 1, ht, &spent);
         defer a.free(keypath);
-        // keypath ends with spend_type=0x00; ours has spend_type=0x02 at the
-        // same offset then the same tail, plus a 37-byte extension. Compare
-        // everything up to (and excluding) the spend_type byte, then the
-        // remainder after it.
-        // Locate spend_type position: identical prefixes until then.
-        // Simplest robust check: the two messages agree on every byte that
-        // is not the spend_type byte and not in our appended extension.
-        // We reconstruct: find first differing byte = spend_type index.
+        // NOTE: since both messages are now built by
+        // `bitcointx.bip341.commonSigMsg`, this no longer compares two
+        // independent implementations — it pins the STRUCTURAL relationship
+        // between a key-path and a script-path message: they differ in exactly
+        // one byte (spend_type 0x00 vs 0x02) and the script-path one is longer
+        // by exactly the 37-byte BIP342 extension. That still catches a wrong
+        // spend_type or a mis-sized extension; the common layout itself is
+        // anchored by bitcointx's official BIP341 vectors.
         var diff: usize = 0;
         while (diff < keypath.len and keypath[diff] == ours[diff]) : (diff += 1) {}
         try testing.expectEqual(@as(u8, 0x00), keypath[diff]); // key-path spend_type

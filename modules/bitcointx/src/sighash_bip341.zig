@@ -113,12 +113,35 @@ fn shaOutput(allocator: Allocator, vout: tx.TxOut) Allocator.Error![32]u8 {
 /// `0x00 || SigMsg(hash_type, ext_flag=0)` (key-path spending; the leading
 /// byte is BIP341's fixed sighash epoch — see module doc comment for why
 /// it's included here). Caller owns the returned slice.
-pub fn sigMsg(
+/// What varies between a key-path and a script-path signature message.
+///
+/// BIP341's SigMsg is one layout with two tails: everything from the epoch
+/// byte through the SINGLE output commitment is common, and only `spend_type`,
+/// the optional annex commitment, and (for script paths) a BIP342 extension
+/// differ. `commonSigMsg` below emits the common part so callers do not
+/// reimplement it — a second copy of a consensus-critical byte layout is a
+/// place for the two to drift apart silently.
+pub const CommonOptions = struct {
+    /// `2*ext_flag + annex_present`. 0 for a key-path spend, 2 for a tapscript
+    /// spend without an annex, 3 with one.
+    spend_type: u8 = 0,
+    /// `SHA256(compact_size(annex) || annex)`, emitted right after this
+    /// input's data when present. Must be set exactly when `spend_type` has
+    /// bit 0, which the caller is responsible for.
+    annex_hash: ?[32]u8 = null,
+};
+
+/// The BIP341 SigMsg through the SINGLE-output commitment — everything a
+/// script-path message shares with a key-path one. A tapscript caller appends
+/// its own `ext_flag = 1` fields (tapleaf_hash || key_version || codesep_pos)
+/// to the result.
+pub fn commonSigMsg(
     allocator: Allocator,
     transaction: tx.Transaction,
     input_index: usize,
     hash_type: u8,
     spent_outputs: []const tx.TxOut,
+    opts: CommonOptions,
 ) Bip341Error![]u8 {
     try validateHashType(hash_type);
     if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
@@ -179,9 +202,7 @@ pub fn sigMsg(
         try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
     }
 
-    // spend_type = ext_flag*2 + annex_present; both always 0 here (key-path
-    // only, annex deferred -- module doc comment).
-    try buf.append(allocator, 0x00);
+    try buf.append(allocator, opts.spend_type);
 
     if (anyone_can_pay) {
         const o = spent_outputs[input_index];
@@ -198,12 +219,25 @@ pub fn sigMsg(
 
     // annex: deferred, never signaled/emitted (module doc comment).
 
+    if (opts.annex_hash) |h| try buf.appendSlice(allocator, &h);
+
     if (base == SIGHASH_SINGLE) {
         if (input_index >= transaction.vout.len) return error.MissingCorrespondingOutput;
         try buf.appendSlice(allocator, &try shaOutput(allocator, transaction.vout[input_index]));
     }
 
     return buf.toOwnedSlice(allocator);
+}
+
+/// The key-path SigMsg: `commonSigMsg` with `spend_type = 0` and no annex.
+pub fn sigMsg(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+) Bip341Error![]u8 {
+    return commonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, .{});
 }
 
 /// `bip340.taggedHash("TapSighash", sigMsg(...))` — `sigMsg` already
