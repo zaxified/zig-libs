@@ -40,13 +40,20 @@ const builtin = @import("builtin");
 const noise = @import("noise.zig");
 
 comptime {
-    // Option (a) of the endianness note below: the mac1/mac2 computations and
-    // the KAT/interop tests view the extern structs as wire bytes via
-    // `std.mem.asBytes`, which is only byte-exact on a little-endian host
-    // (matching the sibling `root.zig` and the `genetlink` module, which
-    // assume native endianness). Port the u32/u64 fields to explicit `std.mem.writeInt`
-    // encoding before lifting this guard.
-    std.debug.assert(builtin.cpu.arch.endian() == .little);
+    // The mac1/mac2 computations and the KAT/interop tests view the extern
+    // structs below as wire bytes via `std.mem.asBytes`, which is byte-exact
+    // only on a little-endian host. Fail the build rather than silently emit
+    // byte-swapped handshakes; `@compileError` instead of `assert` so the
+    // message says what is wrong and how to fix it, not "reached unreachable
+    // code".
+    if (builtin.cpu.arch.endian() != .little) @compileError(
+        "wireguard/handshake.zig assumes a little-endian host: WireGuard's wire " ++
+            "integers are little-endian and this file views its `extern struct`s " ++
+            "as wire bytes via `std.mem.asBytes`. To build for a big-endian " ++
+            "target, first encode/decode the u32/u64 fields explicitly with " ++
+            "`std.mem.writeInt`/`readInt` and `.little` (as `root.zig`'s " ++
+            "`parseEndpoint`/`appendEndpoint` already do), then lift this guard.",
+    );
 }
 
 // Note: `pub const meta` is declared once, canonically, in `root.zig` (per
@@ -99,20 +106,16 @@ pub const Keypair = struct {
 
 // ── wire message layouts (WireGuard protocol, byte-exact) ──────────────────
 //
-// NOTE (endianness — flag for owner review): WireGuard's wire integers are
-// little-endian. These are `extern struct`s so their in-memory layout
-// matches the wire byte-for-byte ONLY on a little-endian host (true for all
-// platforms zig-libs currently targets: x86_64/aarch64). Encoding/decoding
-// MUST NOT rely on a raw `@bitCast`/`@ptrCast` of these structs if this
-// module is ever built for a big-endian target — the crypto agent should
-// either (a) add a `comptime { std.debug.assert(builtin.cpu.arch.endian() == .little); }`
-// guard (matching this module's sibling `root.zig`/`genl.zig`, which assume
-// native endianness and are linux/x86-family-only anyway), or (b) encode/
-// decode the `u32`/`u64` fields explicitly via `std.mem.readInt`/`writeInt`
-// with `.little`, the way `root.zig`'s `parseEndpoint`/`appendEndpoint` do
-// for the netlink control-plane messages. Field order below is chosen so no
-// implicit padding is inserted (every multi-byte integer field already
-// falls on a naturally aligned offset).
+// Endianness: WireGuard's wire integers are little-endian, and these are
+// `extern struct`s whose in-memory layout matches the wire byte-for-byte only
+// on a little-endian host. That is enforced by the `comptime` guard at the top
+// of this file, which fails the build on a big-endian target with an
+// explanation — verified to fire by cross-compiling for s390x-linux. Lifting
+// it means encoding the `u32`/`u64` fields explicitly with
+// `std.mem.readInt`/`writeInt` and `.little`, the way `root.zig`'s
+// `parseEndpoint`/`appendEndpoint` do. Field order below is chosen so no
+// implicit padding is inserted (every multi-byte integer field already falls
+// on a naturally aligned offset).
 
 /// Type 1 — Initiator → Responder. 148 bytes on the wire.
 pub const MessageInitiation = extern struct {

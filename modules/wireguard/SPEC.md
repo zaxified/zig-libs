@@ -92,7 +92,10 @@ dependency (std.crypto only).
 Endianness: the `extern struct` wire layouts match the WireGuard byte layout only on a little-endian
 host (true of every platform this repo currently targets); a big-endian target would need explicit
 `std.mem.readInt`/`writeInt(..., .little)`, the same way `root.zig`'s `parseEndpoint`/`appendEndpoint`
-handle the control-plane messages.
+handle the control-plane messages. This is not left to the reader: a `comptime` guard in
+`handshake.zig` turns it into a build failure with that instruction, verified to fire by
+cross-compiling for `s390x-linux`. The failure mode it prevents — silently emitting byte-swapped
+handshakes that no peer accepts — would otherwise surface only as an interop mystery.
 
 Verification: WireGuard publishes no official full-handshake test vector (only KDF vectors, from
 wireguard-go `device/kdf_test.go` — hardcoded here and passing). A fixed-input full-handshake KAT
