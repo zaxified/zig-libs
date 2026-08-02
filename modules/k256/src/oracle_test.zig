@@ -59,6 +59,69 @@ test "ECDSA: k256 verifies every std-produced signature, rejects tampering" {
     }
 }
 
+test "ECDSA malleability: std's own signatures come in both S forms; only low-S survives ecdsaVerifyLowS" {
+    // Two things at once, and the first is what makes the second worth having:
+    //
+    //  1. Malleability is real here, not theoretical. For every signature std
+    //     produces, the twin (r, n - s) is built and `ecdsaVerify` accepts it
+    //     too — two distinct byte strings, same key, same message.
+    //  2. `ecdsaVerifyLowS` accepts exactly one of the pair, whichever way
+    //     round std happened to land, so a verified signature is unique for
+    //     its (key, message).
+    //
+    // std's signer does NOT normalise to low-S, so both orientations actually
+    // occur across the loop; the counters below fail the test if a change ever
+    // made it emit only one of them, which would leave half of this untested.
+    const n = @import("scalar.zig").field_order;
+    var seed: [Ecdsa.KeyPair.seed_length]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x10_5A_9917);
+    const rand = prng.random();
+
+    var std_was_low: usize = 0;
+    var std_was_high: usize = 0;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        rand.bytes(&seed);
+        const kp = Ecdsa.KeyPair.generateDeterministic(seed) catch continue;
+        var msg: [40]u8 = undefined;
+        rand.bytes(&msg);
+        const sig_rs = (kp.sign(&msg, null) catch continue).toBytes();
+        const pk = kp.public_key.toUncompressedSec1();
+
+        // The malleated twin: same r, s replaced by n - s.
+        var twin = sig_rs;
+        const s = std.mem.readInt(u256, sig_rs[32..64], .big);
+        std.mem.writeInt(u256, twin[32..64], n - s, .big);
+
+        // Both verify under plain ECDSA — that IS the malleability.
+        try std.testing.expect(sign.ecdsaVerify(&pk, &msg, sig_rs));
+        try std.testing.expect(sign.ecdsaVerify(&pk, &msg, twin));
+        try std.testing.expect(!std.mem.eql(u8, &sig_rs, &twin));
+
+        // Exactly one of the two is canonical, and it is the one that passes.
+        const orig_low = sign.isLowS(sig_rs[32..64].*);
+        try std.testing.expect(orig_low != sign.isLowS(twin[32..64].*));
+        try std.testing.expectEqual(orig_low, sign.ecdsaVerifyLowS(&pk, &msg, sig_rs));
+        try std.testing.expectEqual(!orig_low, sign.ecdsaVerifyLowS(&pk, &msg, twin));
+        if (orig_low) std_was_low += 1 else std_was_high += 1;
+    }
+    // Neither orientation may be missing, or half the assertions above would
+    // be vacuous.
+    try std.testing.expect(std_was_low > 0);
+    try std.testing.expect(std_was_high > 0);
+}
+
+test "ECDSA low-S boundary: n/2 is canonical, n/2 + 1 is not" {
+    // The rule is `s <= n/2`, so the half-order itself must pass. Off-by-one
+    // here would reject a signature Bitcoin considers canonical.
+    const n = @import("scalar.zig").field_order;
+    var s: [32]u8 = undefined;
+    std.mem.writeInt(u256, &s, n >> 1, .big);
+    try std.testing.expect(sign.isLowS(s));
+    std.mem.writeInt(u256, &s, (n >> 1) + 1, .big);
+    try std.testing.expect(!sign.isLowS(s));
+}
+
 // ── fixed-base comb (CONSTANT-TIME k·G) differential + positive control ──────
 
 const StdCurve = std.crypto.ecc.Secp256k1;

@@ -125,6 +125,20 @@ pub fn bip340Verify(pubkey_xonly: [32]u8, msg: []const u8, sig: [64]u8) bool {
 /// Verify a secp256k1 ECDSA signature over SHA-256(`msg`). `pubkey_sec1` is a
 /// SEC1-encoded public key (compressed 33-byte or uncompressed 65-byte);
 /// `sig_rs` is `r (32) || s (32)` big-endian. Variable-time (all inputs public).
+///
+/// **This is textbook ECDSA, so it is malleable**: `(r, s)` and `(r, n − s)`
+/// are both valid signatures on the same message under the same key, and this
+/// function accepts both — exactly like `std.crypto.sign.ecdsa` (which is what
+/// `oracle_test.zig` differentials it against) and like OpenSSL. That is the
+/// right behavior for a primitive, but it is the wrong behavior for any caller
+/// that treats a signature as an identifier: deriving a transaction id, a
+/// replay-cache key, or a dedup key from signature bytes lets anyone who can
+/// see a signature mint a second distinct-looking one that still verifies.
+///
+/// Callers that need a signature to be unique per (key, message) must use
+/// `ecdsaVerifyLowS` instead. `libsecp256k1`'s `secp256k1_ecdsa_verify` and
+/// Bitcoin (BIP62 rule 5 / BIP146) make that the default; we do not, because
+/// this function's contract is "agree with std".
 pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) bool {
     const Q = Secp256k1.fromSec1(pubkey_sec1) catch return false;
     const r = Scalar.fromBytes(sig_rs[0..32].*, .big) catch return false;
@@ -150,6 +164,29 @@ pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) boo
     const v = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
     return v.equivalent(r);
 }
+
+/// `ecdsaVerify`, plus the low-S rule: a signature whose `s` exceeds `n/2` is
+/// rejected outright rather than accepted as the malleated twin of a valid
+/// one. This is what `libsecp256k1`'s `secp256k1_ecdsa_verify` enforces and
+/// what Bitcoin requires of relayed signatures (BIP62 rule 5, consensus for
+/// segwit inputs via BIP146); use it whenever a verified signature's *bytes*
+/// carry meaning beyond "this verified".
+///
+/// Exactly one of `(r, s)` and `(r, n − s)` passes this, so a signature that
+/// verifies here is unique for its (key, message) pair — which is the whole
+/// point. A signer that emits high-S is producing a valid-but-non-canonical
+/// signature; normalise at the signer (`s = n − s`), do not relax this.
+pub fn ecdsaVerifyLowS(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) bool {
+    // Checked before any curve arithmetic: the cheap rejection first, and it
+    // keeps the malleated form from ever reaching the expensive path.
+    if (!isLowS(sig_rs[32..64].*)) return false;
+    return ecdsaVerify(pubkey_sec1, msg, sig_rs);
+}
+
+/// `true` iff `s <= n/2` — the "low-S" / BIP62-rule-5 canonical form.
+/// Re-exported from `ecdsa_recover` so callers reach it from the same place as
+/// the verifier that enforces it; the two must never disagree on the boundary.
+pub const isLowS = @import("ecdsa_recover.zig").isLowS;
 
 // ── fuzz: bip340Verify never panics on arbitrary signature/pubkey bytes ──
 //

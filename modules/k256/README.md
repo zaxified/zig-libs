@@ -63,7 +63,8 @@ const xy = R.affineCoordinates();
 // Signatures (the end-to-end anchor).
 const sig = try k256.sign.bip340Sign(secret_key, msg, aux_rand);
 const ok  = k256.sign.bip340Verify(pubkey_xonly, msg, sig);
-const ok2 = k256.sign.ecdsaVerify(pubkey_sec1, msg, sig_rs);
+const ok2 = k256.sign.ecdsaVerify(pubkey_sec1, msg, sig_rs);      // malleable, like std
+const ok3 = k256.sign.ecdsaVerifyLowS(pubkey_sec1, msg, sig_rs);  // rejects the high-S twin
 
 // Recoverable ECDSA (RFC 6979 deterministic sign + public-key recovery —
 // e.g. Lightning BOLT#11's invoice signature).
@@ -92,7 +93,9 @@ includes the field/group/scalar differentials vs `std.crypto.ecc.Secp256k1`
 differentials for the amd64 `MULX/ADX` field core and the GLV scalarmul core,
 the GLV decomposition + β-endomorphism checks, the 19 official BIP340 vectors
 (8 sign rows byte-exact, all 19 verify rows), an ECDSA differential against std's
-signer, a broken-Solinas-constant positive control the harness flags RED, and
+signer, a malleability test that builds the `(r, n − s)` twin of every std
+signature and pins that `ecdsaVerify` takes both while `ecdsaVerifyLowS` takes
+exactly one, a broken-Solinas-constant positive control the harness flags RED, and
 `ecdsa_recover`'s own sign/recover round-trip + tampered-signature tests
 (originally `lninvoice`'s, moved here — general secp256k1 machinery, not
 BOLT#11-specific).
