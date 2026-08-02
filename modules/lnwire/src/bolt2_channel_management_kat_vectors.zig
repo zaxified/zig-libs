@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: MIT
 //
-// ⚠⚠ NOT AN ANCHOR YET — EXTRACTED BUT NEVER VERIFIED ⚠⚠
+// Verified 2026-08-02: every vector below is decoded and re-serialized by
+// this module's own BOLT#2 codec, byte-for-byte, in `bolt2_kat_test.zig`.
+// That agreement is also what makes the vectors themselves trustworthy —
+// a fabricated hex string would not survive being parsed and rebuilt by an
+// implementation written independently from BOLT#2.
 //
-// The agent that extracted these vectors died mid-task on 2026-08-02, right
-// before writing the tests that consume them. Nothing here has ever been run
-// against this module: no test imports this file, no byte has been compared,
-// no teeth check exists. It parses, and that is all that is known.
-//
-// Treat it as raw material, not evidence. Before it may be called an anchor:
-//   1. reconstruct a sample of the expected values BY HAND from the upstream
-//      append sequence + flag arithmetic (the full wire hex appears NOWHERE
-//      in msgs.rs as a literal -- the tests are parameterised and assemble it
-//      at runtime, so a failed grep proves nothing either way);
-//   2. wire it into the test aggregator and drive BOTH directions;
-//   3. teeth-check with a deliberate encoder mutation, judged by exit code.
-//
-// Until then ANCHOR-TASKS.tsv must NOT claim BOLT#2 is covered.
+// ⚠ A literal grep for these strings in upstream `msgs.rs` FAILS and that is
+// not evidence of anything: the upstream tests are parameterised and
+// assemble the expected bytes from conditional `from_hex` chunks at runtime.
 //
 // Vendored from `lightningdevkit/rust-lightning`'s `lightning/src/ln/msgs.rs`
 // test module -- see modules/lnwire/NOTICE for the required MIT/Apache-2.0

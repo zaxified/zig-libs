@@ -131,4 +131,5 @@ test {
     _ = bolt1;
     _ = bolt2;
     _ = bolt7;
+    _ = @import("bolt2_kat_test.zig");
 }
