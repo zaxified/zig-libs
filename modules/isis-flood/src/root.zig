@@ -66,6 +66,7 @@ pub const default_complete_snp_interval = scheduler.default_complete_snp_interva
 test {
     _ = @import("scheduler.zig");
     _ = @import("snp.zig");
+    _ = @import("goldens.zig");
 }
 
 test "meta is well-formed" {
