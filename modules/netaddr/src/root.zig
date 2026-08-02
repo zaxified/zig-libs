@@ -120,6 +120,26 @@ pub const Ip = union(enum) {
         };
     }
 
+    /// IPv4 private-use `10/8`, `172.16/12`, `192.168/16` (RFC 1918).
+    ///
+    /// v4-mapped addresses are unwrapped first, so `::ffff:10.0.0.1` counts —
+    /// a check that missed that is exactly how a filter gets bypassed.
+    ///
+    /// Returns false for every IPv6 address: RFC 1918 has no v6 counterpart,
+    /// and the nearest analogue is `fc00::/7`, which `isUniqueLocal` already
+    /// covers. Combining the two (and whatever else — CGNAT `100.64/10`,
+    /// TEST-NET, broadcast) into one "is this safe to connect to" predicate is
+    /// policy, not addressing, so it stays with the caller that has the
+    /// threat model; `rdap`'s SSRF guard is the worked example.
+    pub fn isPrivate(ip: Ip) bool {
+        return switch (ip.unmap()) {
+            .v4 => |q| q[0] == 10 or
+                (q[0] == 172 and q[1] >= 16 and q[1] <= 31) or
+                (q[0] == 192 and q[1] == 168),
+            .v6 => false,
+        };
+    }
+
     fn isV4Mapped(b: [16]u8) bool {
         return std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
     }
@@ -1605,4 +1625,25 @@ fn fuzzParseHostPort(_: void, smith: *std.testing.Smith) !void {
 }
 test "fuzz parseHostPort never panics" {
     try testing.fuzz({}, fuzzParseHostPort, .{});
+}
+
+test "Ip.isPrivate: RFC 1918 ranges and their boundaries" {
+    const yes = [_][]const u8{
+        "10.0.0.0",    "10.255.255.255",
+        "172.16.0.0",  "172.31.255.255",
+        "192.168.0.0", "192.168.255.255",
+        "::ffff:10.0.0.1", // v4-mapped must not slip past
+    };
+    for (yes) |t| try std.testing.expect(parseIp(t).?.isPrivate());
+
+    // The boundaries are where an off-by-one lives: 172.15 and 172.32 are
+    // public, and 192.167/192.169 are not 192.168.
+    const no = [_][]const u8{
+        "9.255.255.255",   "11.0.0.0",
+        "172.15.255.255",  "172.32.0.0",
+        "192.167.255.255", "192.169.0.0",
+        "8.8.8.8", "fc00::1", // unique-local is isUniqueLocal's job
+        "::1",     "fe80::1",
+    };
+    for (no) |t| try std.testing.expect(!parseIp(t).?.isPrivate());
 }

@@ -823,17 +823,14 @@ fn isSpecialUseHost(host: []const u8) bool {
     return isSpecialUseIp(ip);
 }
 
+/// The policy: which address space this module refuses to follow a related
+/// link into. Every term is a `netaddr` predicate — the RFC 1918 check used to
+/// be open-coded here, which is how a filter drifts from the addressing rules
+/// it is supposed to implement. What stays local is the *choice* of terms,
+/// because that is the threat model, not addressing.
 fn isSpecialUseIp(ip: netaddr.Ip) bool {
-    if (ip.isUnspecified() or ip.isLoopback() or ip.isLinkLocalUnicast() or
-        ip.isMulticast() or ip.isUniqueLocal()) return true;
-    // netaddr has no RFC 1918 helper (out of scope for that module); the
-    // three private ranges are cheap enough to check directly here.
-    return switch (ip.unmap()) {
-        .v4 => |q| (q[0] == 10) or
-            (q[0] == 172 and q[1] >= 16 and q[1] <= 31) or
-            (q[0] == 192 and q[1] == 168),
-        .v6 => false,
-    };
+    return ip.isUnspecified() or ip.isLoopback() or ip.isLinkLocalUnicast() or
+        ip.isMulticast() or ip.isUniqueLocal() or ip.isPrivate();
 }
 
 // ── default fetcher over our http client ────────────────────────────────────
