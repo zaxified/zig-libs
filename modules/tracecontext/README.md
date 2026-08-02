@@ -7,7 +7,9 @@ distributed-trace identity per request, carried across services via the
 A `traceparent` is `version-traceid-parentid-flags`, e.g.
 `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`:
 
-- **version** — two lowercase hex; only `00` (Level 1) is accepted.
+- **version** — two lowercase hex. `00` (Level 1) is what we emit; a higher
+  version is parsed forward-compatibly as its Level 1 prefix with any trailing
+  `-<extra>` ignored (W3C §3.2.2.3), and `ff` is reserved as invalid.
 - **trace-id** — 16 bytes / 32 hex; the whole-trace identity, kept end to end;
   the all-zero value is invalid.
 - **parent-id** (span-id) — 8 bytes / 16 hex; the caller's span; the all-zero

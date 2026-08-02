@@ -9,7 +9,9 @@
 //! A `traceparent` value is `version-traceid-parentid-flags`, e.g.
 //! `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`:
 //!
-//! - `version`   two lowercase hex — only `00` (Level 1) is accepted.
+//! - `version`   two lowercase hex. `00` (Level 1) is what we emit; a higher
+//!               version is read forward-compatibly as its Level 1 prefix
+//!               (W3C §3.2.2.3), and `ff` is reserved as invalid.
 //! - `trace-id`  16 bytes / 32 lowercase hex — the whole-trace identity, kept
 //!               end to end. The all-zero value is invalid.
 //! - `parent-id` (a.k.a. span-id) 8 bytes / 16 lowercase hex — the caller's
@@ -98,12 +100,27 @@ pub const TraceParent = struct {
         ZeroParentId,
     };
 
-    /// Parse a Level 1 (`version 00`) traceparent. Rejects a wrong length, a
-    /// non-`00` version, misplaced delimiters, any non-lowercase-hex digit and
-    /// the all-zero trace-id / parent-id (both invalid per spec).
+    /// Parse a traceparent. Rejects a wrong length, misplaced delimiters, any
+    /// non-lowercase-hex digit and the all-zero trace-id / parent-id (both
+    /// invalid per spec).
+    ///
+    /// Future versions are parsed forward-compatibly, as W3C §3.2.2.3
+    /// requires: every version keeps the Level 1 `version-traceid-parentid-
+    /// flags` prefix and may append `-<extra>`, so a header we do not know is
+    /// read as its Level 1 prefix and the remainder is ignored rather than
+    /// restarting the trace. Version `ff` is reserved as invalid, and `00`
+    /// itself is exactly `header_len` — trailing bytes there are malformed,
+    /// not an extension.
     pub fn parse(v: []const u8) ParseError!TraceParent {
-        if (v.len != header_len) return error.BadLength;
-        if (v[0] != '0' or v[1] != '0') return error.BadVersion;
+        if (v.len < header_len) return error.BadLength;
+        var version_byte: [1]u8 = undefined;
+        if (!decodeHex(&version_byte, v[0..2])) return error.BadVersion;
+        if (version_byte[0] == 0xff) return error.BadVersion;
+        if (version_byte[0] == 0x00) {
+            if (v.len != header_len) return error.BadLength;
+        } else if (v.len > header_len and v[header_len] != '-') {
+            return error.BadFormat;
+        }
         if (v[2] != '-' or v[35] != '-' or v[52] != '-') return error.BadFormat;
 
         var tp: TraceParent = undefined;
@@ -618,14 +635,54 @@ test "parse / write round-trip" {
     try testing.expectEqualStrings(sample, tp.write(&b));
 }
 
+test "a future traceparent version is parsed as its Level 1 prefix" {
+    // W3C §3.2.2.3: an unknown *higher* version keeps the version-traceid-
+    // parentid-flags prefix and may append `-<extra>`. Rejecting it would
+    // restart the trace and break the very forward compatibility the field
+    // exists for. We re-emit as `00` because that is all we understand.
+    const future = "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const tp = try TraceParent.parse(future);
+    try testing.expect(tp.sampled());
+    var b: [TraceParent.header_len]u8 = undefined;
+    try testing.expectEqualStrings(sample, tp.write(&b));
+
+    // Same, with a future field appended after the Level 1 prefix.
+    const extended = future ++ "-somethingnew";
+    const tp2 = try TraceParent.parse(extended);
+    try testing.expectEqualStrings(sample, tp2.write(&b));
+
+    // The Level 1 validity rules still apply to the prefix of a future version.
+    try testing.expectError(
+        TraceParent.ParseError.ZeroTraceId,
+        TraceParent.parse("cc-00000000000000000000000000000000-00f067aa0ba902b7-01"),
+    );
+}
+
 test "invalid traceparents are rejected" {
     const E = TraceParent.ParseError;
     // Wrong length.
     try testing.expectError(E.BadLength, TraceParent.parse("00-abcd"));
-    // Non-00 version.
+    // Version `ff` is reserved as invalid (W3C §3.2.2.3).
     try testing.expectError(
         E.BadVersion,
-        TraceParent.parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        TraceParent.parse("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+    );
+    // A version that is not lowercase hex at all.
+    try testing.expectError(
+        E.BadVersion,
+        TraceParent.parse("0X-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+    );
+    // Version `00` is exactly 55 chars: trailing bytes are malformed, not an
+    // extension — only a *higher* version may carry one.
+    try testing.expectError(
+        E.BadLength,
+        TraceParent.parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-xyz"),
+    );
+    // A future version whose 56th char is not `-` cannot be trusted to keep
+    // the Level 1 prefix.
+    try testing.expectError(
+        E.BadFormat,
+        TraceParent.parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01x"),
     );
     // Misplaced delimiter.
     try testing.expectError(
