@@ -24,7 +24,9 @@ mismatch, unsuccessful status, both delegated-responder cases, the ECDSA path,
 and a malformed-DER fuzz batch — plus (`goldens.zig`) two REAL OCSP responses
 captured live from public CAs (DigiCert direct/byKey, GoDaddy delegated/byName
 with a real 4096-bit responder cert), the first real-world exercise of the
-response-side SHA-1 `CertID` branch. See SPEC.md "Fixture provenance".
+response-side SHA-1 `CertID` branch, and an OpenSSL-generated **direct/byName**
+response (the combination no live public CA emitted) that is also the only
+golden with `nextUpdate` absent. See SPEC.md "Fixture provenance".
 
 ```zig
 const ocsp = @import("ocsp");
