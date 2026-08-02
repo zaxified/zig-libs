@@ -64,6 +64,8 @@ const xy = R.affineCoordinates();
 
 // ECDSA-P256/SHA-256 (the end-to-end anchor).
 const sig = try p256.sign.ecdsaSign(secret_key, msg, nonce_k);
+// Or let RFC 6979 derive the nonce (no RNG, reproducible, KAT'd byte-exact):
+const dsig = try p256.sign.ecdsaSignDeterministic(secret_key, msg);
 const ok  = p256.sign.ecdsaVerify(pubkey_sec1, msg, sig);
 ```
 
@@ -87,7 +89,9 @@ host the field differential skips — a skip there means "core not present on th
 build", never a green light. The suite includes the field/group differentials vs
 `std.crypto.ecc.P256` (thousands of random inputs, bit-exact via `toBytes`), the
 reduction fold-boundary edge sweep, the RFC 6979 ECDSA-P256/SHA-256 vectors
-(verified by both p256 and std), an ECDSA differential against std's signer (both
+(verified by both p256 and std, **and reproduced byte-exactly** by
+`ecdsaSignDeterministic` — note std's own deterministic signing is not RFC 6979,
+so it cannot stand in for that), an ECDSA differential against std's signer (both
 directions: p256 verifies std's signatures, and std verifies p256-produced ones),
 **241 Wycheproof ECDSA-P256/SHA-256 P1363 vectors** (173 must verify, 68 must
 not — run through both `ecdsaVerify` and the std-generic path, so the two cannot

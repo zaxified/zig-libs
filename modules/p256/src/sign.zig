@@ -14,17 +14,20 @@
 //!   * `ecdsaSign` — P-256 ECDSA/SHA-256 signing with a caller-supplied nonce
 //!     `k`. Signatures round-trip through both p256's and std's verifier
 //!     (`oracle_test.zig`), proving sign+verify agree with std end-to-end.
+//!   * `ecdsaSignDeterministic` — the same signer with the RFC 6979 nonce, so
+//!     the RFC's own published `(r, s)` come back byte for byte.
 //!
 //! This layer is intentionally thin: it is a verification-harness surface, not
 //! the module's reason to exist. A later phase can grow it into a full drop-in
-//! for `std.crypto.sign.ecdsa` (DER codec, RFC 6979 deterministic nonces) if
-//! desired; for now it proves the primitives against external anchors.
+//! for `std.crypto.sign.ecdsa` (DER codec) if desired; for now it proves the
+//! primitives against external anchors.
 
 const std = @import("std");
 const group = @import("group.zig");
 const scalarmod = @import("scalar.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const P256 = group.P256;
 const Scalar = scalarmod.Scalar;
 const Fe = @import("field.zig").Fe;
@@ -96,6 +99,70 @@ pub fn ecdsaSign(secret_key: [32]u8, msg: []const u8, nonce_k: [32]u8) SignError
     sig[0..32].* = r.toBytes(.big);
     sig[32..64].* = s.toBytes(.big);
     return sig;
+}
+
+// ── RFC 6979 §3.2 deterministic nonce (HMAC-SHA256 DRBG) ────────────────────
+
+/// The RFC 6979 nonce for `(privkey, hash32)`.
+///
+/// Specialised to P-256/SHA-256, where the hash length equals the group-order
+/// byte length (32 == 32), so RFC 6979's `bits2int` is the identity and
+/// `bits2octets(H(m))` is just `H(m) mod n` re-encoded. A curve/hash pairing
+/// with different sizes would need the bit-shifting the RFC describes; this is
+/// deliberately not written generically for a case the module cannot reach.
+/// Mirrors `k256.ecdsa_recover`'s DRBG, which the same reasoning covers.
+fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
+    const h1 = reduceToScalar(hash32).toBytes(.big);
+
+    var v: [32]u8 = [_]u8{0x01} ** 32;
+    var k: [32]u8 = [_]u8{0x00} ** 32;
+
+    var buf: [32 + 1 + 32 + 32]u8 = undefined;
+    buf[0..32].* = v;
+    buf[32] = 0x00;
+    buf[33..65].* = privkey;
+    buf[65..97].* = h1;
+    HmacSha256.create(&k, &buf, &k);
+    HmacSha256.create(&v, &v, &k);
+
+    buf[0..32].* = v;
+    buf[32] = 0x01;
+    buf[33..65].* = privkey;
+    buf[65..97].* = h1;
+    HmacSha256.create(&k, &buf, &k);
+    HmacSha256.create(&v, &v, &k);
+
+    while (true) {
+        HmacSha256.create(&v, &v, &k);
+        // `Scalar.fromBytes` rejects `>= n`, which is exactly RFC 6979's
+        // "discard and re-derive" condition; zero is discarded too.
+        if (Scalar.fromBytes(v, .big)) |cand| {
+            if (!cand.isZero()) return cand;
+        } else |_| {}
+        var buf2: [32 + 1]u8 = undefined;
+        buf2[0..32].* = v;
+        buf2[32] = 0x00;
+        HmacSha256.create(&k, &buf2, &k);
+        HmacSha256.create(&v, &v, &k);
+    }
+}
+
+/// Sign `SHA-256(msg)` with the RFC 6979 deterministic nonce — no entropy
+/// source, and the same message under the same key always yields the same
+/// bytes. That reproducibility is what makes the signer anchorable: the RFC's
+/// own published `(r, s)` for "sample" and "test" must come back byte for
+/// byte (`kat_test.zig`), which `ecdsaSign` with a caller-chosen nonce can
+/// never demonstrate.
+///
+/// Prefer this over `ecdsaSign` unless you have a specific reason to supply
+/// `k` yourself: a nonce that repeats across two different messages leaks the
+/// private key outright, and deriving it from the key and message removes that
+/// failure mode along with any dependence on the platform's RNG.
+pub fn ecdsaSignDeterministic(secret_key: [32]u8, msg: []const u8) SignError![64]u8 {
+    _ = Scalar.fromBytes(secret_key, .big) catch return error.InvalidSecretKey;
+    var h: [32]u8 = undefined;
+    Sha256.hash(msg, &h, .{});
+    return ecdsaSign(secret_key, msg, rfc6979Nonce(secret_key, h).toBytes(.big));
 }
 
 /// Verify a P-256 ECDSA signature over SHA-256(`msg`). `pubkey_sec1` is a

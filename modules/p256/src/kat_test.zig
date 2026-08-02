@@ -30,6 +30,49 @@ fn hexBytes(comptime n: usize, s: []const u8) [n]u8 {
     return out;
 }
 
+test "RFC 6979 P-256/SHA-256: the deterministic signer reproduces the RFC's published bytes" {
+    // The strongest form of this anchor. Verifying the RFC's signature shows
+    // only that we accept it; producing it shows the nonce derivation and the
+    // signing equation both match the reference, and a wrong nonce cannot be
+    // hidden by a verifier that would accept any valid signature.
+    //
+    // Worth stating because it is easy to assume otherwise: std's own
+    // deterministic signing is NOT RFC 6979 — `kp.sign(msg, null)` on the same
+    // key and message yields r = 9c9b6119…, not the RFC's EFD48B2A…, so std
+    // cannot stand in for this and the derivation had to be written out.
+    const sk = hexBytes(32, kv.secret_key);
+    for (kv.vectors) |vec| {
+        var want: [64]u8 = undefined;
+        want[0..32].* = hexBytes(32, vec.r);
+        want[32..64].* = hexBytes(32, vec.s);
+
+        const got = try sign.ecdsaSignDeterministic(sk, vec.message);
+        std.testing.expectEqualSlices(u8, &want, &got) catch |err| {
+            std.debug.print("RFC 6979 vector failed for message \"{s}\"\n", .{vec.message});
+            return err;
+        };
+    }
+}
+
+test "RFC 6979 P-256/SHA-256: determinism is the property, not just the vectors" {
+    // Two calls agree, and a one-byte change to the message moves the nonce
+    // (so `r`, which depends only on k, changes too). A stub that returned a
+    // constant nonce would satisfy the first half and fail the second.
+    const sk = hexBytes(32, kv.secret_key);
+    const a = try sign.ecdsaSignDeterministic(sk, "sample");
+    const b = try sign.ecdsaSignDeterministic(sk, "sample");
+    try std.testing.expectEqualSlices(u8, &a, &b);
+
+    const c = try sign.ecdsaSignDeterministic(sk, "samplf");
+    try std.testing.expect(!std.mem.eql(u8, a[0..32], c[0..32]));
+
+    // A different key over the same message must also move `r`.
+    var sk2 = sk;
+    sk2[31] ^= 0x01;
+    const d = try sign.ecdsaSignDeterministic(sk2, "sample");
+    try std.testing.expect(!std.mem.eql(u8, a[0..32], d[0..32]));
+}
+
 test "RFC 6979 P-256/SHA-256 vectors: p256 verifies TRUE, tamper FALSE, std agrees" {
     // Decode the uncompressed-SEC1 public key once.
     var pk_sec1: [65]u8 = undefined;

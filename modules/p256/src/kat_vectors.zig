@@ -12,6 +12,13 @@
 //! `x = C9AFA9D8…120F6721`. The verify path only needs the public key, encoded
 //! here uncompressed-SEC1 (`04 || Ux || Uy`).
 
+/// The RFC 6979 A.2.5 private key `x`. Present so the deterministic signer can
+/// be checked against the RFC's own published `(r, s)` — verifying a signature
+/// only shows we accept it, while reproducing it byte for byte shows our nonce
+/// derivation and signing equation match the reference.
+pub const secret_key: []const u8 =
+    "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721";
+
 pub const public_key_sec1: []const u8 =
     "04" ++
     "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6" ++ // Ux
