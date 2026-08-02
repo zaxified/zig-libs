@@ -132,4 +132,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("election.zig");
     _ = @import("fsm.zig");
+    _ = @import("goldens.zig");
 }
