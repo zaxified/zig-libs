@@ -1122,3 +1122,39 @@ fn fuzzChunkedReader(_: void, smith: *std.testing.Smith) !void {
     // did loop).
     _ = cr.reader.streamRemaining(&w) catch {};
 }
+
+test "RequestHead: a head packed with minimal headers is bounded by bytes, not by a count" {
+    // The backlog carried "max-header-count cap" as an open hardening item.
+    // There is no per-header allocation to cap: the head is one borrowed byte
+    // block bounded by the server's `max_header_bytes` (16 KiB by default),
+    // and lookups scan it. This pins what that bound actually buys — a head
+    // filled with the smallest legal headers, which is the worst case for a
+    // linear scan, still parses and still answers lookups correctly.
+    //
+    // 16 KiB of `a0:\r\n`-shaped lines is ~2700 headers; ten lookups over that
+    // is a few hundred thousand byte comparisons, which is not a denial of
+    // service. A separate count cap would bound the same thing twice.
+    const allocator = testing.allocator;
+    var head: std.ArrayList(u8) = .empty;
+    defer head.deinit(allocator);
+    try head.appendSlice(allocator, "GET / HTTP/1.1\r\nHost: h\r\n");
+    var i: usize = 0;
+    while (head.items.len < 16 * 1024 - 32) : (i += 1) {
+        var line_buf: [32]u8 = undefined;
+        try head.appendSlice(allocator, try std.fmt.bufPrint(&line_buf, "h{d}: v\r\n", .{i}));
+    }
+    // The header we look for is LAST, so the scan cannot short-circuit early.
+    try head.appendSlice(allocator, "x-needle: found\r\n");
+
+    const parsed = try RequestHead.parse(head.items);
+    try testing.expectEqualStrings("h", parsed.host.?);
+    try testing.expectEqualStrings("found", parsed.header("x-needle").?);
+    try testing.expectEqual(@as(?[]const u8, null), parsed.header("x-absent"));
+    try testing.expect(i > 1000); // the head really is densely packed
+
+    // Every line still iterates in wire order.
+    var seen: usize = 0;
+    var it = parsed.iterate();
+    while (it.next()) |_| seen += 1;
+    try testing.expectEqual(i + 2, seen); // Host + the h<N> lines + x-needle
+}
