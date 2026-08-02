@@ -18,7 +18,13 @@ double-SHA256 digest each gossip message's signature(s) sign).
 Provenance: clean-room from BOLT#1/#2/#7 (`lightning/bolts`), a public
 specification; the TLV/BigSize codec is pinned byte-exact against the spec's own
 Appendix A and B vectors. No third-party Lightning implementation was consulted,
-so no `NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).
+so no `NOTICE` entry is required for the CODE (root [`NOTICE`](../../NOTICE) §0).
+
+**Added 2026-08-02:** that disclaimer covers the CODE, which remains
+clean-room. The module now separately vendors `lightning/bolts`' own BOLT#7
+test-vector DATA (`bolt07/extended-queries.json`, CC-BY 4.0), which does
+require attribution — see [`NOTICE`](./NOTICE), a module-local file per root
+NOTICE §1's policy.
 
 ## Scope
 
@@ -87,3 +93,11 @@ Appendix B's TLV stream test vectors (every decoding-success and decoding-failur
 the ordering/duplicate-type and value-truncation vectors) — see `SPEC.md` for exactly what was
 verified against what, plus every message's decode→serialize round-trip and the announcement-digest
 offset-boundary checks.
+
+**Added 2026-08-02:** `query_channel_range`/`reply_channel_range`/`query_short_channel_ids` are
+additionally byte-exact against `lightning/bolts`' own `bolt07/extended-queries.json` vectors (10
+rows, both DECODE and ENCODE directions) — see `SPEC.md`'s "BOLT#7 extended-query vectors" note
+and `modules/lnwire/NOTICE` for the required CC-BY 4.0 attribution. 4 of the 10 rows exercise the
+`COMPRESSED_ZLIB` short_channel_id/`query_flags` encoding this module does not implement; those
+rows' compressed content is not independently reconstructed (documented per-row in `bolt7.zig`'s
+tests), only the fields this module's codec actually interprets.

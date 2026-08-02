@@ -153,6 +153,27 @@ bytes than remain (`shutdown.scriptpubkey`, `update_fail_htlc.reason`,
 claiming ~4.19 MB more signature bytes than the buffer holds, and an unknown-even top-level TLV
 type in several messages' extensions (`init`, `open_channel`, `query_channel_range`).
 
+**BOLT#7 extended-query vectors (added 2026-08-02)** — `query_channel_range`, `reply_channel_range`,
+and `query_short_channel_ids` are each additionally checked against `lightning/bolts`' own
+`bolt07/extended-queries.json` (10 rows, CC-BY 4.0 — see `modules/lnwire/NOTICE`), vendored as
+`src/bolt7_extended_queries_kat_vectors.zig`. Both directions are driven: DECODE parses the
+official `hex` and asserts `chain_hash`/block-range/`complete` fields, the raw `encoded_short_ids`
+opaque blob, and (independently reconstructed from the vector's own decoded fields, not just
+self-consistency) `timestamps_tlv`/`checksums_tlv` content wherever this module's codec actually
+interprets it; ENCODE builds a message from the vector's decoded fields and asserts the result is
+byte-exact against the official `hex` — the direction this pass prioritized, since the pre-existing
+suite only round-tripped through this module's own encoder/decoder pair. 4 of the 10 rows use the
+`COMPRESSED_ZLIB` short_channel_id (and, in two of those, also `query_flags`/`timestamps_tlv`)
+encoding; this module has no zlib codec (see "Scope" above) and never interprets `query_flags`'
+per-scid bit-array content regardless of its own encoding, so those rows' compressed *content* is
+not reconstructed from the vector's semantic fields — the encoding-type byte itself, every
+non-compressed field, and a byte-exact decode→re-encode round trip of the opaque blob are still
+checked. `checksums_tlv` has no encoding byte in BOLT#7 (always raw), so it is independently
+checked even in an otherwise-`COMPRESSED_ZLIB` row. `announcement_signatures` and
+`gossip_timestamp_filter` remain unanchored (deferred, not in this module's implemented set — see
+"Scope" above); `channel_announcement`/`node_announcement`/`channel_update` and the whole BOLT#2
+channel-management set remain round-trip-only (need a live daemon peer, `ANCHOR-TASKS.tsv`).
+
 Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 
 ## Status

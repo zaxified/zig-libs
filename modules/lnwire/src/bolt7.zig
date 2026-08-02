@@ -404,6 +404,7 @@ pub fn serializeReplyChannelRange(allocator: Allocator, msg: ReplyChannelRange) 
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const eq_kat = @import("bolt7_extended_queries_kat_vectors.zig");
 
 fn fillPattern(comptime n: usize, seed: u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -415,6 +416,267 @@ fn frameTypeBytes(t: u16) [2]u8 {
     var b: [2]u8 = undefined;
     std.mem.writeInt(u16, &b, t, .big);
     return b;
+}
+
+// ── official BOLT#7 extended-queries.json vector helpers ─────────────────
+//
+// `lightning/bolts` `bolt07/extended-queries.json` (CC-BY 4.0, see
+// modules/lnwire/NOTICE) supplies byte-exact `query_channel_range`/
+// `reply_channel_range`/`query_short_channel_ids` wire vectors, vendored as
+// Zig literals in `bolt7_extended_queries_kat_vectors.zig`. These helpers
+// rebuild the raw wire bytes this module's codec treats as opaque
+// (`encoded_short_ids`, `timestamps_tlv`, `checksums_tlv`) directly from a
+// vector's *decoded* semantic fields, so the ENCODE direction is checked
+// against an independently-constructed expectation, not just self-consistency.
+
+fn hexToArray(comptime n: usize, hex: []const u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+fn hexDecodeAlloc(allocator: Allocator, hex: []const u8) Allocator.Error![]u8 {
+    const out = try allocator.alloc(u8, hex.len / 2);
+    _ = std.fmt.hexToBytes(out, hex) catch unreachable;
+    return out;
+}
+
+/// `encoding_type` byte (0x00, uncompressed) followed by each `Scid`'s
+/// `block(3) || tx_index(3) || output_index(2)` big-endian encoding --
+/// BOLT#7's `encoded_short_ids` field, uncompressed form.
+fn buildScidBlob(allocator: Allocator, scids: []const eq_kat.Scid) Allocator.Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try list.append(allocator, 0x00);
+    for (scids) |s| {
+        var tmp: [8]u8 = undefined;
+        std.mem.writeInt(u24, tmp[0..3], s.block, .big);
+        std.mem.writeInt(u24, tmp[3..6], s.tx_index, .big);
+        std.mem.writeInt(u16, tmp[6..8], s.output_index, .big);
+        try list.appendSlice(allocator, &tmp);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// `timestamps_tlv`'s `encoding_type` byte (0x00) followed by each pair's
+/// two big-endian `u32`s, uncompressed form.
+fn buildTimestampsBlob(allocator: Allocator, pairs: []const eq_kat.TimestampPair) Allocator.Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try list.append(allocator, 0x00);
+    for (pairs) |p| {
+        var tmp: [8]u8 = undefined;
+        std.mem.writeInt(u32, tmp[0..4], p.timestamp1, .big);
+        std.mem.writeInt(u32, tmp[4..8], p.timestamp2, .big);
+        try list.appendSlice(allocator, &tmp);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// `checksums_tlv`'s content -- BOLT#7 defines no `encoding_type` byte
+/// here (fixed-width `u32` pairs are never compressed), so this is just
+/// each pair's two big-endian `u32`s back to back.
+fn buildChecksumsBlob(allocator: Allocator, pairs: []const eq_kat.ChecksumPair) Allocator.Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    for (pairs) |p| {
+        var tmp: [8]u8 = undefined;
+        std.mem.writeInt(u32, tmp[0..4], p.checksum1, .big);
+        std.mem.writeInt(u32, tmp[4..8], p.checksum2, .big);
+        try list.appendSlice(allocator, &tmp);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+test "official BOLT#7 vector (lightning/bolts bolt07/extended-queries.json): query_channel_range" {
+    const allocator = testing.allocator;
+    for (eq_kat.query_channel_range_vectors) |v| {
+        const bytes = try hexDecodeAlloc(allocator, v.hex);
+        defer allocator.free(bytes);
+        const chain_hash = hexToArray(32, v.chain_hash_hex);
+
+        var decoded = try decodeQueryChannelRange(allocator, bytes);
+        defer decoded.deinit(allocator);
+        try testing.expectEqualSlices(u8, &chain_hash, &decoded.chain_hash);
+        try testing.expectEqual(v.first_blocknum, decoded.first_blocknum);
+        try testing.expectEqual(v.number_of_blocks, decoded.number_of_blocks);
+
+        if (v.query_option) |flag| {
+            const got = decoded.extension.find(1) orelse return error.TestExpectedTlvPresent;
+            try testing.expectEqualSlices(u8, &.{flag}, got);
+        } else {
+            try testing.expectEqual(@as(usize, 0), decoded.extension.records.len);
+        }
+
+        // ENCODE: build straight from the vector's own decoded fields --
+        // this is the gap this pass prioritizes (see task notes) -- and
+        // check the result is byte-exact against the official hex.
+        var records_buf = [_]message.tlv.RawRecord{.{ .type = 1, .value = &.{v.query_option orelse 0} }};
+        const msg: QueryChannelRange = .{
+            .chain_hash = chain_hash,
+            .first_blocknum = v.first_blocknum,
+            .number_of_blocks = v.number_of_blocks,
+            .extension = if (v.query_option != null) .{ .records = records_buf[0..] } else .{},
+        };
+        const reencoded = try serializeQueryChannelRange(allocator, msg);
+        defer allocator.free(reencoded);
+        try testing.expectEqualSlices(u8, bytes, reencoded);
+    }
+}
+
+test "official BOLT#7 vector (lightning/bolts bolt07/extended-queries.json): reply_channel_range" {
+    const allocator = testing.allocator;
+    for (eq_kat.reply_channel_range_vectors) |v| {
+        const bytes = try hexDecodeAlloc(allocator, v.hex);
+        defer allocator.free(bytes);
+        const chain_hash = hexToArray(32, v.chain_hash_hex);
+
+        var decoded = try decodeReplyChannelRange(allocator, bytes);
+        defer decoded.deinit(allocator);
+        try testing.expectEqualSlices(u8, &chain_hash, &decoded.chain_hash);
+        try testing.expectEqual(v.first_blocknum, decoded.first_blocknum);
+        try testing.expectEqual(v.number_of_blocks, decoded.number_of_blocks);
+        try testing.expectEqual(v.complete, decoded.sync_complete);
+
+        const want_scid_enc_byte: u8 = switch (v.scid_encoding) {
+            .uncompressed => 0,
+            .zlib => 1,
+        };
+        try testing.expect(decoded.encoded_short_ids.len >= 1);
+        try testing.expectEqual(want_scid_enc_byte, decoded.encoded_short_ids[0]);
+        if (v.scid_encoding == .uncompressed) {
+            const want = try buildScidBlob(allocator, v.scids);
+            defer allocator.free(want);
+            try testing.expectEqualSlices(u8, want, decoded.encoded_short_ids);
+        }
+        // .zlib: this module has no zlib decompressor (README's Scope) --
+        // the decoded scid *content* isn't independently checked for these
+        // vectors, only that the opaque blob round-trips byte-exact below.
+
+        if (v.checksums.len > 0) {
+            const want_checksums = try buildChecksumsBlob(allocator, v.checksums);
+            defer allocator.free(want_checksums);
+            const got = decoded.extension.find(3) orelse return error.TestExpectedTlvPresent;
+            try testing.expectEqualSlices(u8, want_checksums, got);
+        } else {
+            try testing.expect(decoded.extension.find(3) == null);
+        }
+
+        if (v.timestamps_encoding) |enc| {
+            const got = decoded.extension.find(1) orelse return error.TestExpectedTlvPresent;
+            try testing.expectEqual(@as(u8, if (enc == .uncompressed) 0 else 1), got[0]);
+            if (enc == .uncompressed) {
+                const want_ts = try buildTimestampsBlob(allocator, v.timestamps);
+                defer allocator.free(want_ts);
+                try testing.expectEqualSlices(u8, want_ts, got);
+            }
+            // .zlib: skipped for the same reason as the main scid list.
+        } else {
+            try testing.expect(decoded.extension.find(1) == null);
+        }
+
+        // Opaque-blob round-trip: re-serializing the DECODED message must
+        // reproduce the official bytes exactly, regardless of whether the
+        // scid/timestamps *content* was independently verified above.
+        const reser = try serializeReplyChannelRange(allocator, decoded);
+        defer allocator.free(reser);
+        try testing.expectEqualSlices(u8, bytes, reser);
+
+        // ENCODE-from-fields: only buildable when every compressible field
+        // in this vector is uncompressed -- this module implements no zlib
+        // compressor, so a `.zlib` scid/timestamps list can't be built from
+        // `msg`'s own decoded semantic fields (only round-tripped above).
+        const fully_buildable = v.scid_encoding == .uncompressed and
+            (v.timestamps_encoding == null or v.timestamps_encoding.? == .uncompressed);
+        if (fully_buildable) {
+            const scid_blob = try buildScidBlob(allocator, v.scids);
+            defer allocator.free(scid_blob);
+            var records_buf: [2]message.tlv.RawRecord = undefined;
+            var n_records: usize = 0;
+            var ts_blob: []u8 = &.{};
+            defer if (ts_blob.len > 0) allocator.free(ts_blob);
+            if (v.timestamps_encoding != null) {
+                ts_blob = try buildTimestampsBlob(allocator, v.timestamps);
+                records_buf[n_records] = .{ .type = 1, .value = ts_blob };
+                n_records += 1;
+            }
+            var cs_blob: []u8 = &.{};
+            defer if (cs_blob.len > 0) allocator.free(cs_blob);
+            if (v.checksums.len > 0) {
+                cs_blob = try buildChecksumsBlob(allocator, v.checksums);
+                records_buf[n_records] = .{ .type = 3, .value = cs_blob };
+                n_records += 1;
+            }
+            const efields: ReplyChannelRange = .{
+                .chain_hash = chain_hash,
+                .first_blocknum = v.first_blocknum,
+                .number_of_blocks = v.number_of_blocks,
+                .sync_complete = v.complete,
+                .encoded_short_ids = scid_blob,
+                .extension = .{ .records = records_buf[0..n_records] },
+            };
+            const reencoded = try serializeReplyChannelRange(allocator, efields);
+            defer allocator.free(reencoded);
+            try testing.expectEqualSlices(u8, bytes, reencoded);
+        }
+    }
+}
+
+test "official BOLT#7 vector (lightning/bolts bolt07/extended-queries.json): query_short_channel_ids" {
+    const allocator = testing.allocator;
+    for (eq_kat.query_short_channel_ids_vectors) |v| {
+        const bytes = try hexDecodeAlloc(allocator, v.hex);
+        defer allocator.free(bytes);
+        const chain_hash = hexToArray(32, v.chain_hash_hex);
+
+        var decoded = try decodeQueryShortChannelIds(allocator, bytes);
+        defer decoded.deinit(allocator);
+        try testing.expectEqualSlices(u8, &chain_hash, &decoded.chain_hash);
+
+        const want_scid_enc_byte: u8 = switch (v.scid_encoding) {
+            .uncompressed => 0,
+            .zlib => 1,
+        };
+        try testing.expect(decoded.encoded_short_ids.len >= 1);
+        try testing.expectEqual(want_scid_enc_byte, decoded.encoded_short_ids[0]);
+        if (v.scid_encoding == .uncompressed) {
+            const want = try buildScidBlob(allocator, v.scids);
+            defer allocator.free(want);
+            try testing.expectEqualSlices(u8, want, decoded.encoded_short_ids);
+        }
+        // .zlib: see reply_channel_range's test above -- content not
+        // independently checked, only round-tripped byte-exact below.
+
+        if (v.has_query_flags_tlv) {
+            // `query_flags`' per-short_channel_id bit array is out of this
+            // module's scope regardless of its own encoding byte (SPEC.md) --
+            // presence only, never content, is asserted.
+            try testing.expect(decoded.extension.find(1) != null);
+        } else {
+            try testing.expectEqual(@as(usize, 0), decoded.extension.records.len);
+        }
+
+        const reser = try serializeQueryShortChannelIds(allocator, decoded);
+        defer allocator.free(reser);
+        try testing.expectEqualSlices(u8, bytes, reser);
+
+        // ENCODE-from-fields: only fully buildable when scids are
+        // uncompressed AND there's no query_flags tlv -- its raw value is
+        // itself zlib-compressed in both vectors that carry one, and this
+        // module has no zlib compressor to reproduce that byte-exact.
+        if (v.scid_encoding == .uncompressed and !v.has_query_flags_tlv) {
+            const scid_blob = try buildScidBlob(allocator, v.scids);
+            defer allocator.free(scid_blob);
+            const efields: QueryShortChannelIds = .{
+                .chain_hash = chain_hash,
+                .encoded_short_ids = scid_blob,
+                .extension = .{},
+            };
+            const reencoded = try serializeQueryShortChannelIds(allocator, efields);
+            defer allocator.free(reencoded);
+            try testing.expectEqualSlices(u8, bytes, reencoded);
+        }
+    }
 }
 
 test "channel_announcement: round-trip + digest matches an independent sha256d over the tail" {

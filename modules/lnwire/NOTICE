@@ -1,0 +1,75 @@
+lnwire — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE DATA published under Creative Commons
+Attribution 4.0 International (CC-BY 4.0), whose attribution must be
+preserved in any copy. Redistributing this module — alone or as part of
+zig-libs — must keep this file with it.
+
+CC-BY 4.0 permits redistribution and MODIFICATION (unlike a stricter case
+elsewhere in this repository — the `xml` module excludes the James Clark
+`xmltest` sub-suite entirely because ITS terms permit only unmodified
+redistribution of the whole archive; see `modules/xml/NOTICE`). This module's
+CC-BY 4.0 source imposes no such restriction, so a filtered/re-packaged
+subset (a mechanically-generated Zig vectors file, not the upstream JSON
+file itself) is within what the licence grants, same as every other
+`modules/<name>/NOTICE` "third-party attribution" file in this repository.
+
+No third-party SOURCE CODE is present anywhere in this module — only test
+vectors. `bolt1.zig`/`bolt2.zig`/`bolt7.zig` are clean-room from the public
+BOLT#1/#2/#7 specifications (see README.md's "Provenance:" line and
+SPEC.md); no third-party Lightning implementation was ported, studied, or
+consulted.
+
+## `lightning/bolts` — the BOLT#7 specification repository's own
+## test-vector suite
+
+  https://github.com/lightning/bolts
+  Licensed under CC-BY 4.0: http://creativecommons.org/licenses/by/4.0/
+  (stated in the repository's own README.md; there is no separate LICENSE
+  file — CC-BY 4.0 has none to reproduce beyond the attribution above).
+  Fetched 2026-08-02 at commit `35e79db504560b9d3494a0ed07bf1e8379c3663a`
+  (branch `master`) — the same commit already cited in the sibling
+  `modules/lninvoice/NOTICE`.
+
+One file is a test-vector source for this module:
+
+  * `bolt07/extended-queries.json` (10 rows, ALL vendored verbatim) —
+    transcribed mechanically (never hand-typed) into
+    `src/bolt7_extended_queries_kat_vectors.zig`; each row's `hex` wire
+    bytes and the `msg` fields this module's codec actually interprets
+    (`chainHash`, `firstBlockNum`/`numberOfBlocks`, `complete`,
+    `shortChannelIds`, `timestamps`, `checksums`, `query_option`) are
+    reproduced. Driven by `bolt7.zig`'s three "official BOLT#7 vector
+    (lightning/bolts bolt07/extended-queries.json): ..." tests, which
+    exercise both DECODE (parse the official `hex`, assert fields) and
+    ENCODE (build from the vector's own decoded fields, assert byte-exact
+    `hex`) for `query_channel_range`, `reply_channel_range`, and
+    `query_short_channel_ids`.
+
+    4 of the 10 rows use the `COMPRESSED_ZLIB` short_channel_id (and, in
+    two of those, `query_flags`/`timestamps_tlv`) encoding — this module
+    has no zlib codec (SPEC.md/README's Scope) and does not interpret
+    `query_flags`' bit-array content at all regardless of its own
+    encoding, so those rows' compressed *content* is not independently
+    reconstructed; the module's codec treats the encoding-type byte plus
+    payload as one opaque blob throughout, and `bolt7.zig`'s tests still
+    check everything they express directly in the wire bytes (the
+    encoding-type byte itself, `chain_hash`, the block-range/complete
+    fields, and — since BOLT#7 never compresses it — `checksums_tlv`'s raw
+    content even in an otherwise-`COMPRESSED_ZLIB` row) plus a byte-exact
+    decode→re-encode round trip of the opaque blob. See `bolt7.zig`'s test
+    bodies and `ANCHOR-TASKS.tsv`'s `lnwire` row for exactly which rows
+    fall on which side.
+
+Implementation vs. test-data distinction: the BOLT#1/#2/#7 wire-format
+CODEC in `bolt1.zig`/`bolt2.zig`/`bolt7.zig` is this module's own
+clean-room work from the public spec text (`01-messaging.md` /
+`02-peer-protocol.md` / `07-routing-gossip.md`) — that needs no
+attribution per root `NOTICE` §0 (a public spec is not a copyrightable
+work). What is reproduced here, and only here, is the SPECIFICATION
+AUTHORS' OWN TEST-CASE DATA, which is precisely why this notice exists and
+lives beside it rather than in root `NOTICE` (per root `NOTICE` §1's
+policy: attribution for reproduced third-party data travels with the
+module that owes it).
