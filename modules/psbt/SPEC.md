@@ -62,6 +62,16 @@ with `error.InvalidWitnessFlag` — a documented, tested limitation, not a silen
 pairs... A combiner which orders keys lexicographically must produce the following PSBT") is pinned
 byte-exact: `combine(a, b)` → `serialize` equals the BIP's own expected result bytes.
 
+**Finalizer/Extractor vectors** (`kat_vectors.zig`'s `finalize_combined_hex`/`finalize_finalized_hex`/
+`finalize_extracted_tx_hex`, driven by `finalize_test.zig`'s "BIP174 official Finalizer/Extractor
+worked example" tests): the same "Test Vectors" section's main multisig-workflow narrative also
+carries a genuine pre-finalize/post-finalize/post-extract triple — a bare P2SH 2-of-2 multisig input
+plus a P2SH-P2WSH 2-of-2 multisig input. `finalize` on the pre-finalize PSBT reproduces the BIP's own
+finalized PSBT byte-exact (with the field-clearing rule checked explicitly per input, not just
+implied by the byte compare), and `extract` on the BIP's own finalized PSBT reproduces its published
+raw transaction byte-exact. P2WPKH finalization and native (non-P2SH) P2WSH multisig remain
+self-authored — BIP174's vectors don't happen to cover those two shapes end-to-end.
+
 **Hostile teeth beyond the BIP set** (`root.zig`'s own test block): truncated map (keylen with no
 key bytes following), `valuelen` claiming far more bytes than remain (both a 1-byte and a
 CompactSize-wide-form declared length), empty global map (no unsigned tx) — every one a typed
@@ -78,16 +88,23 @@ a legitimately-large PSBT can't be turned into a duplicate-key-check DoS.
 violation — see `ParseError`'s doc comments for the complete error catalogue. No path panics or
 reads out of bounds on malformed/truncated/adversarial input.
 
-**Deferred: Signer, Input Finalizer, Transaction Extractor.** All three roles require interpreting
-Bitcoin Script — the Signer to know what it's signing (matching a scriptPubKey/redeemScript/
-witnessScript against a spend policy), the Input Finalizer to assemble a final scriptSig/
-scriptWitness that actually satisfies the input's script, the Transaction Extractor to (optionally)
-validate the result. This repository has no Script interpreter yet — that would be its own future
-`bitcoinscript` module. A finalizer/extractor that can't validate what it's building would be a
-false sense of completeness worse than not having one; structurally deferred, not half-built. This
-module implements exactly the roles that don't need Script: Creator/Updater's wire codec
-(`parse`/`serialize`) and the Combiner (`combine`), which BIP174 itself notes "does not need to know
-how to interpret scripts in order to combine PSBTs."
+**Input Finalizer and Transaction Extractor are now implemented** (`finalize.zig`'s `finalize`/
+`extract`, exported from `root.zig`) — corrected here because this section used to say all three
+non-Script roles were deferred pending a Script interpreter; `bitcoinscript` now exists, so that
+blocker is gone for these two. `finalize` assembles `FINAL_SCRIPTSIG`/`FINAL_SCRIPTWITNESS` for the
+standard spend types (P2PKH, P2WPKH, P2SH-P2WPKH, bare/P2SH/P2WSH/P2SH-P2WSH multisig, P2TR
+key-path), verifying every candidate through `bitcoinscript.verifyScript` before accepting it and
+clearing the now-consumed input fields per BIP174 §"Input Finalizer"; `extract` splices finalized
+inputs into a network-ready `bitcointx.Transaction`. See `finalize.zig`'s own module doc comment for
+the full scope cut (non-standard/timelocked/tapscript spends are `error.NonStandardScript`, never
+silently mis-assembled) and "Verification" below for the anchor.
+
+**Still deferred: Signer.** It needs private-key custody and signing policy this module has no
+opinion about (matching a scriptPubKey/redeemScript/witnessScript against a spend policy, then
+producing a signature) — `PARTIAL_SIG`/`TAP_KEY_SIG` records are expected to already be present by
+the time `finalize` runs. This module implements Creator/Updater's wire codec (`parse`/`serialize`),
+the Combiner (`combine`, which BIP174 itself notes "does not need to know how to interpret scripts
+in order to combine PSBTs"), and now the Input Finalizer/Transaction Extractor above.
 
 **Out of scope: BIP370 (PSBTv2).** BIP174 v0 is what this module implements (the field list in
 `global_key`/`input_key`/`output_key` is the complete BIP174 v0 set); BIP370's PSBTv2 extensions

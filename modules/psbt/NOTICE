@@ -1,0 +1,56 @@
+psbt — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE DATA published under the 2-clause BSD
+license (BSD-2-Clause), whose attribution must be preserved in any copy.
+Redistributing this module — alone or as part of zig-libs — must keep this
+file with it.
+
+No third-party SOURCE CODE is present anywhere in this module — only test
+vectors. `root.zig`/`finalize.zig`'s wire-format codec (`parse`/`serialize`/
+`combine`/`finalize`/`extract`) is clean-room from the public BIP174
+specification text (see README.md's "Provenance:" line and SPEC.md); no
+third-party PSBT implementation was ported, studied, or consulted.
+
+## BIP174 — "Partially Signed Bitcoin Transaction Format"
+
+  https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
+  Author: Ava Chow <me@achow101.com>
+  Licensed under the 2-clause BSD license, per the BIP's own header
+  (`License: BSD-2-Clause`) and its "Copyright" section ("This BIP is
+  licensed under the 2-clause BSD license").
+
+BIP174's "Test Vectors" section is itself part of the BIP text the above
+license covers — its worked hex/Base64 examples are the BIP author's own
+constructed data, not separately-licensed third-party material, but BSD-2-
+Clause still requires this attribution be preserved when that data is
+reproduced outside the BIP document itself, which is what `kat_vectors.zig`
+does. Two groups of vectors are vendored, both hand/mechanically transcribed
+from the section (never computed from this module's own output — see
+`kat_vectors.zig`'s own doc comments for the exact provenance of each):
+
+  * `invalid`/`valid`/`combiner_a`/`combiner_b`/`combiner_result` — the
+    section's standalone Creator/Updater/Combiner example PSBTs, extracted
+    programmatically (regex over the "Bytes in Hex" blocks) per
+    `kat_vectors.zig`'s top-of-file doc comment. Drives `kat_test.zig`.
+
+  * `finalize_combined_hex`/`finalize_finalized_hex`/
+    `finalize_extracted_tx_hex` — the section's main multisig-workflow
+    narrative's pre-finalize / post-finalize / post-extract triple (a bare
+    P2SH 2-of-2 multisig input plus a P2SH-P2WSH 2-of-2 multisig input),
+    hand-transcribed under the captions "a combiner must create this PSBT" /
+    "an input finalizer must create this PSBT" / "a transaction extractor
+    must create this Bitcoin transaction", cross-checked byte-for-byte
+    against each vector's own Base64 sibling line before being committed.
+    Drives `finalize_test.zig`'s "BIP174 official Finalizer/Extractor worked
+    example" tests.
+
+Implementation vs. test-data distinction: the PSBT wire-format CODEC and the
+Input Finalizer/Transaction Extractor logic in `root.zig`/`finalize.zig` are
+this module's own clean-room work from the public spec text — that needs no
+attribution per root `NOTICE` §0 (a public spec is not a copyrightable work).
+What is reproduced here, and only here, is the SPEC AUTHOR'S OWN WORKED-
+EXAMPLE DATA, which is precisely why this notice exists and lives beside it
+rather than in root `NOTICE` (per root `NOTICE` §1's policy: attribution for
+reproduced third-party data travels with the module that owes it).

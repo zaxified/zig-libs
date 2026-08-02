@@ -1,26 +1,39 @@
 // SPDX-License-Identifier: MIT
 //! Teeth for `finalize`/`extract` (`finalize.zig`).
 //!
-//! One anchor is grounded in an official BIP174 vector: `kat_vectors.zig`'s
-//! `valid[1]` ("PSBT with one P2PKH input and one P2SH-P2WPKH input. First
-//! input is signed and finalized...") carries a REAL, byte-exact
-//! `FINAL_SCRIPTSIG` for its first input straight from the BIP itself. The
-//! live `bip-0174.mediawiki` (checked 2026-07, bitcoin/bips master) has no
-//! separate "Finalizer test vectors" section with a pre-finalize/
-//! post-finalize pair, so the anchor here works backwards from that one
-//! genuine finalized field: decompose it into the `PARTIAL_SIG` + pubkey it
-//! must have come from, re-finalize, and assert the byte-exact reproduction
-//! — plus a real negative control for free, since that vector's SECOND
-//! input is deliberately left unsigned (`extract` must refuse it).
+//! Two anchors are grounded in official BIP174 vectors:
 //!
-//! Everything else (P2WPKH, P2SH-multisig, P2WSH-multisig) is self-authored
+//! 1. `kat_vectors.zig`'s `valid[1]` ("PSBT with one P2PKH input and one
+//!    P2SH-P2WPKH input. First input is signed and finalized...") carries a
+//!    REAL, byte-exact `FINAL_SCRIPTSIG` for its first input straight from
+//!    the BIP itself. The anchor here works backwards from that one genuine
+//!    finalized field: decompose it into the `PARTIAL_SIG` + pubkey it must
+//!    have come from, re-finalize, and assert the byte-exact reproduction —
+//!    plus a real negative control for free, since that vector's SECOND
+//!    input is deliberately left unsigned (`extract` must refuse it).
+//!
+//! 2. `kat_vectors.zig`'s `finalize_combined_hex` / `finalize_finalized_hex`
+//!    / `finalize_extracted_tx_hex` -- a correction of a claim this doc
+//!    comment used to make ("no separate Finalizer test vectors section
+//!    exists"): BIP174's own "Test Vectors" section DOES carry a genuine
+//!    pre-finalize/post-finalize/post-extract triple, for its main
+//!    multisig-workflow narrative (a bare P2SH 2-of-2 multisig input plus a
+//!    P2SH-P2WSH 2-of-2 multisig input). Test group F below drives `finalize`
+//!    and `extract` on that triple directly -- no decomposition needed, and
+//!    it explicitly re-checks the BIP's "all fields except UTXO/unknown
+//!    cleared" rule field-by-field rather than trusting the byte-compare
+//!    alone to imply it.
+//!
+//! Everything else (P2WPKH, native P2WSH-multisig) is self-authored
 //! end-to-end: real secp256k1 keys, real BIP143/legacy sighashes, real
 //! `std.crypto.sign.ecdsa` signatures — verified not just by byte-exact
 //! comparison against an independently hand-assembled expected value, but
 //! by `finalize`'s own mandatory `bitcoinscript.verifyScript` pass (a wrong
 //! assembly fails closed, doesn't just mismatch a byte string). This
 //! mirrors `bitcoinscript/src/e2e_test.zig`'s own established pattern for
-//! exactly this class of test.
+//! exactly this class of test. Bare P2SH multisig and P2SH-P2WSH multisig
+//! (test groups C/D below) were self-authored when first written but are
+//! NOW also covered by group F's official vectors above.
 //!
 //! P2TR key-path is exercised only via its two fail-closed paths (missing
 //! `TAP_KEY_SIG`, missing another input's UTXO when BIP341 needs the full
@@ -513,4 +526,89 @@ test "finalize: P2TR key-path fails closed with TaprootMissingAllUtxos when a SI
     const results = try psbt.finalize(a, ps);
     try expectInputError(results, 0, error.TaprootMissingAllUtxos);
     try expectInputError(results, 1, error.MissingUtxo);
+}
+
+// ── F: BIP174 official Finalizer/Extractor worked example ───────────────
+//
+// `kat_vectors.zig`'s `finalize_combined_hex` -> `finalize_finalized_hex` ->
+// `finalize_extracted_tx_hex` -- see that file's doc comment for exactly
+// which BIP174 caption each came from. Two real spend shapes anchored
+// byte-exact: bare P2SH 2-of-2 multisig (input 0, no witness) and
+// P2SH-P2WSH 2-of-2 multisig (input 1, redeemScript push + witness).
+
+/// True if `m` has ANY record of `keytype`, regardless of `keydata` --
+/// unlike `Map.find` (which only matches the "no key data" singleton
+/// shape), this is what's needed to assert a KEYED field type (e.g.
+/// `BIP32_DERIVATION`, `PARTIAL_SIG`) is completely absent after clearing.
+fn hasAnyOfType(m: psbt.Map, keytype: u64) bool {
+    for (m.records) |r| {
+        if (r.keytype == keytype) return true;
+    }
+    return false;
+}
+
+test "BIP174 official Finalizer/Extractor worked example: finalize is byte-exact; all BIP174-mandated fields cleared, UTXO kept" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw = try hexToBytesAlloc(a, vectors.finalize_combined_hex);
+    const ps = try psbt.parse(a, raw);
+
+    // Pre-finalize sanity: both inputs actually carry the fields BIP174
+    // says must be cleared, so the post-finalize absence checks below are
+    // testing something real, not vacuously true.
+    try testing.expect(hasAnyOfType(ps.inputs[0], psbt.input_key.PARTIAL_SIG));
+    try testing.expect(hasAnyOfType(ps.inputs[0], psbt.input_key.BIP32_DERIVATION));
+    try testing.expect(ps.inputs[0].find(psbt.input_key.REDEEM_SCRIPT) != null);
+    try testing.expect(hasAnyOfType(ps.inputs[1], psbt.input_key.PARTIAL_SIG));
+    try testing.expect(hasAnyOfType(ps.inputs[1], psbt.input_key.BIP32_DERIVATION));
+    try testing.expect(ps.inputs[1].find(psbt.input_key.WITNESS_SCRIPT) != null);
+
+    const results = try psbt.finalize(a, ps);
+    try testing.expect(results[0] == null);
+    try testing.expect(results[1] == null);
+
+    const got = try psbt.serialize(a, ps);
+    const want = try hexToBytesAlloc(a, vectors.finalize_finalized_hex);
+    try testing.expectEqualSlices(u8, want, got);
+
+    // BIP174 §"Input Finalizer": UTXO kept, everything else consumed
+    // cleared -- checked explicitly per input, not just implied by the
+    // byte-exact compare above.
+    try testing.expect(ps.inputs[0].find(psbt.input_key.NON_WITNESS_UTXO) != null);
+    try testing.expect(!hasAnyOfType(ps.inputs[0], psbt.input_key.PARTIAL_SIG));
+    try testing.expect(ps.inputs[0].find(psbt.input_key.SIGHASH_TYPE) == null);
+    try testing.expect(ps.inputs[0].find(psbt.input_key.REDEEM_SCRIPT) == null);
+    try testing.expect(!hasAnyOfType(ps.inputs[0], psbt.input_key.BIP32_DERIVATION));
+    try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTSIG) != null);
+    try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null); // bare P2SH -- no witness
+
+    try testing.expect(ps.inputs[1].find(psbt.input_key.WITNESS_UTXO) != null);
+    try testing.expect(!hasAnyOfType(ps.inputs[1], psbt.input_key.PARTIAL_SIG));
+    try testing.expect(ps.inputs[1].find(psbt.input_key.SIGHASH_TYPE) == null);
+    try testing.expect(ps.inputs[1].find(psbt.input_key.REDEEM_SCRIPT) == null);
+    try testing.expect(ps.inputs[1].find(psbt.input_key.WITNESS_SCRIPT) == null);
+    try testing.expect(!hasAnyOfType(ps.inputs[1], psbt.input_key.BIP32_DERIVATION));
+    try testing.expect(ps.inputs[1].find(psbt.input_key.FINAL_SCRIPTSIG) != null);
+    try testing.expect(ps.inputs[1].find(psbt.input_key.FINAL_SCRIPTWITNESS) != null);
+}
+
+test "BIP174 official Finalizer/Extractor worked example: extract (from the BIP's OWN finalized PSBT, not our own output) is byte-exact" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Parsed directly from the BIP's own already-finalized vector -- this
+    // exercises `extract` independent of whether `finalize` itself works,
+    // so a bug in one doesn't mask a bug in (or hide a false pass of) the
+    // other.
+    const raw = try hexToBytesAlloc(a, vectors.finalize_finalized_hex);
+    const ps = try psbt.parse(a, raw);
+
+    const extracted = try psbt.extract(a, ps);
+    try testing.expect(extracted.has_witness); // input 1's P2SH-P2WSH witness makes this a segwit-serialized tx
+    const got = try bitcointx.serialize(a, extracted);
+    const want = try hexToBytesAlloc(a, vectors.finalize_extracted_tx_hex);
+    try testing.expectEqualSlices(u8, want, got);
 }

@@ -1,13 +1,20 @@
 # psbt
 
-BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serialization plus the
-Combiner role, built on `bitcointx` for the embedded unsigned transaction / UTXO tx bodies. Parses
-untrusted PSBT bytes fail-closed. See `SPEC.md` for the full design, threat model, and what's
-deliberately deferred (Signer/Finalizer/Extractor — they need a Bitcoin Script interpreter this
-repo doesn't have yet).
+BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serialization, the Combiner
+role, and (via the sibling `bitcoinscript` Script interpreter) the Input Finalizer and Transaction
+Extractor roles, built on `bitcointx` for the embedded unsigned transaction / UTXO tx bodies. Parses
+untrusted PSBT bytes fail-closed. See `SPEC.md` for the full design, threat model, and what's still
+deliberately deferred — corrected here from an earlier version of this line that said Finalizer/
+Extractor were also deferred: only the **Signer** role remains unimplemented (it needs private-key
+custody and signing policy this module has no opinion about).
 
-Provenance: clean-room from the published BIP174 spec (`bitcoin/bips`), no third-party source
-ported — see `NOTICE`'s doc-ownership rule (`CONVENTIONS.md` §5) for why that means no NOTICE entry.
+Provenance: the wire-format codec (`parse`/`serialize`/`combine`/`finalize`/`extract`) is clean-room
+from the published BIP174 spec (`bitcoin/bips`), no third-party source ported. The official BIP174
+test-vector BYTES this module vendors (`kat_vectors.zig`) are a separate matter — BIP174 itself is
+BSD-2-Clause, which requires attribution on redistribution of its content, including its own worked
+examples — see `NOTICE` for that attribution (corrected here: an earlier version of this line said
+no `NOTICE` entry was needed at all, which conflated "clean-room codec" with "vendored spec-author
+test data").
 
 ## Import
 
@@ -64,6 +71,25 @@ var combined = try psbt.combine(allocator, psbt_a, psbt_b); // error.DifferentTr
 defer combined.deinit(allocator);
 ```
 
+## Finalize inputs, then extract the network-ready transaction
+
+```zig
+// Mutates ps.inputs in place; one ?InputFinalizeError per input, null = finalized (or already was).
+const results = try psbt.finalize(allocator, ps);
+
+// Requires every input finalized (error.InputNotFinalized otherwise).
+var tx = try psbt.extract(allocator, ps);
+defer tx.deinit(allocator);
+const raw = try bitcointx.serialize(allocator, tx);
+```
+
+`finalize` handles P2PKH, native/P2SH-wrapped P2WPKH, bare/P2SH/P2WSH/P2SH-P2WSH multisig, and P2TR
+key-path — see `finalize.zig`'s module doc comment for the exact scope cut (non-standard/timelocked/
+tapscript spends are `error.NonStandardScript`, never silently mis-assembled) and for the
+allocator/ownership contract (an arena is assumed). The **Signer** role — producing the
+`PARTIAL_SIG`/`TAP_KEY_SIG` records `finalize` consumes — is not implemented; that needs private-key
+custody and signing policy this module has no opinion about.
+
 ## Verify
 
 ```
@@ -71,6 +97,10 @@ zig build test-psbt --summary all
 ```
 
 Byte-exact against BIP174's own published test vectors: all 20 official invalid PSBTs (rejected,
-19 with a specific pinned error), 8 of 10 official valid PSBTs (round-trip), and the BIP's own
-worked Combiner example — see `SPEC.md` "Verification" for the full story, including the 2 valid
-vectors this module can't accept (a `bitcointx`-inherited wire-format ambiguity, not a psbt bug).
+19 with a specific pinned error), 8 of 10 official valid PSBTs (round-trip), the BIP's own worked
+Combiner example, and the BIP's own worked Finalizer/Extractor example (a bare P2SH 2-of-2 multisig
+input plus a P2SH-P2WSH 2-of-2 multisig input: `finalize` on the pre-finalize PSBT and `extract` on
+the finalized PSBT both reproduce the BIP's own published bytes exactly) — see `SPEC.md`
+"Verification" for the full story, including the 2 valid vectors this module can't accept (a
+`bitcointx`-inherited wire-format ambiguity, not a psbt bug) and which spend shapes (P2WPKH, native
+P2WSH multisig) remain self-authored rather than vector-anchored.

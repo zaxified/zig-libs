@@ -54,7 +54,7 @@ beyond its own MIT license.
 
 Where a module ports third-party code, or reproduces third-party data whose
 notice must be preserved, that module carries its own `NOTICE` file next to its
-source, and the notice travels with the module. NINETEEN modules do, and
+source, and the notice travels with the module. TWENTY modules do, and
 these are the ONLY files in the repository that carry a condition naming
 anyone other than the zig-libs authors. Each such file's first line says
 `<name> — third-party attribution`:
@@ -123,6 +123,9 @@ anyone other than the zig-libs authors. Each such file's first line says
   lnwire   — `modules/lnwire/NOTICE` (lightning/bolts BOLT#7
              `bolt07/extended-queries.json` official test vectors, CC-BY
              4.0; test vectors only, no source code)
+  psbt     — `modules/psbt/NOTICE` (BIP174 "Test Vectors" section worked
+             examples, bitcoin/bips, BSD-2-Clause; test vectors only, no
+             source code)
 
 New modules that reproduce third-party code OR third-party data whose notice
 must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`
