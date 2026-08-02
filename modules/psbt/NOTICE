@@ -54,3 +54,37 @@ What is reproduced here, and only here, is the SPEC AUTHOR'S OWN WORKED-
 EXAMPLE DATA, which is precisely why this notice exists and lives beside it
 rather than in root `NOTICE` (per root `NOTICE` §1's policy: attribution for
 reproduced third-party data travels with the module that owes it).
+
+## Bitcoin Core `test/functional/data/rpc_psbt.json`
+
+`src/core_kat_vectors.zig` reproduces conformance vectors from the Bitcoin
+Core project's PSBT RPC functional-test data file (fetched 2026-08 from
+`master`):
+
+  Copyright (c) 2009-2010 Satoshi Nakamoto
+  Copyright (c) 2009-present The Bitcoin Core developers
+  Distributed under the MIT software license, see
+  https://opensource.org/licenses/MIT
+
+This adds no condition beyond MIT's own — the same "preserve the notice"
+requirement already owed to BIP174's author above, owed here to a different
+author. No third-party SOURCE CODE is present — only test-case DATA (base64
+PSBTs, converted to hex to match this module's existing hex convention; see
+`core_kat_vectors.zig`'s own doc comment for exactly which of the JSON's
+`invalid`/`invalid_with_msg`/`valid`/`finalizer`/`extractor` arrays are
+vendored, which entries are skipped as byte-identical BIP174 duplicates, and
+what each vendored entry's disposition is (accepted as an intentional,
+documented scope cut vs. rejected) — driven by `core_kat_test.zig`.
+
+Two things worth flagging so a future reader doesn't have to re-derive them:
+first, Core's own `finalizer`/`extractor` entries turned out to be
+byte-identical to `kat_vectors.zig`'s BIP174 Finalizer/Extractor worked
+example already vendored above (Core's functional test reuses BIP174's own
+example verbatim rather than adding a new spend shape) — not re-vendored a
+second time, to avoid duplicating an anchor. Second, working through Core's
+`invalid`/`invalid_with_msg` sets surfaced one genuine BIP174 conformance gap
+this module had (a present `PSBT_GLOBAL_VERSION` was never checked to
+actually be `0`, per BIP174 §"Version 0") — now fixed in `root.zig`, with
+Core's own vector as the external oracle. See `core_kat_test.zig`'s doc
+comment for the full account, including which of Core's vectors are BIP370/
+BIP371/MuSig2 content this module deliberately doesn't validate (not a bug).

@@ -174,6 +174,8 @@ pub const Psbt = struct {
     }
 
     /// `PSBT_GLOBAL_VERSION`, or `null` if omitted (BIP174: version 0).
+    /// `parse` already rejects a nonzero value with `error.UnsupportedPsbtVersion`
+    /// (BIP174 §"Version 0"), so this always returns `0` when non-null.
     pub fn version(self: Psbt) ?u32 {
         const r = self.global.find(global_key.VERSION) orelse return null;
         return std.mem.readInt(u32, r.value[0..4], .little);
@@ -311,6 +313,13 @@ pub const ParseError = bitcointx.tx.DeserializeError || error{
     /// BIP32_DERIVATION: a 4-byte fingerprint plus a whole number of
     /// 4-byte path elements) doesn't match its required shape.
     InvalidFixedFieldLength,
+    /// `PSBT_GLOBAL_VERSION` is present with a nonzero value. BIP174
+    /// §"Version 0": "Version 0 PSBTs must either omit PSBT_GLOBAL_VERSION
+    /// or include it and set it to 0." This module implements BIP174 v0
+    /// only (BIP370/PSBTv2 is out of scope -- see SPEC.md), so a PSBT that
+    /// declares a different version cannot be correctly interpreted and
+    /// must be rejected rather than silently parsed as if it were v0.
+    UnsupportedPsbtVersion,
 };
 
 fn parseMap(allocator: Allocator, bytes: []const u8, offset: *usize) ParseError!Map {
@@ -365,6 +374,8 @@ fn validateGlobalMap(m: Map) ParseError!void {
             global_key.VERSION => {
                 try requireNoKeyData(r);
                 try requireFixedValueLen(r, 4);
+                // BIP174 §"Version 0": a present PSBT_GLOBAL_VERSION must be 0.
+                if (std.mem.readInt(u32, r.value[0..4], .little) != 0) return error.UnsupportedPsbtVersion;
             },
             global_key.XPUB => try requireBip32ValueShape(r),
             else => {}, // unknown / PROPRIETARY -- opaque passthrough
@@ -624,6 +635,8 @@ test {
     _ = @import("kat_test.zig");
     _ = finalize_mod;
     _ = @import("finalize_test.zig");
+    _ = @import("core_kat_vectors.zig");
+    _ = @import("core_kat_test.zig");
 }
 
 test "meta.deps names bitcointx and bitcoinscript" {

@@ -14,7 +14,8 @@ test-vector BYTES this module vendors (`kat_vectors.zig`) are a separate matter 
 BSD-2-Clause, which requires attribution on redistribution of its content, including its own worked
 examples — see `NOTICE` for that attribution (corrected here: an earlier version of this line said
 no `NOTICE` entry was needed at all, which conflated "clean-room codec" with "vendored spec-author
-test data").
+test data"). This module ALSO vendors conformance vectors from Bitcoin Core's `test/functional/data/
+rpc_psbt.json` (`core_kat_vectors.zig`, MIT) — a second, independent source; `NOTICE` covers both.
 
 ## Import
 
@@ -104,3 +105,11 @@ the finalized PSBT both reproduce the BIP's own published bytes exactly) — see
 "Verification" for the full story, including the 2 valid vectors this module can't accept (a
 `bitcointx`-inherited wire-format ambiguity, not a psbt bug) and which spend shapes (P2WPKH, native
 P2WSH multisig) remain self-authored rather than vector-anchored.
+
+Also checked against Bitcoin Core's own `test/functional/data/rpc_psbt.json` (a separate external
+oracle, `core_kat_vectors.zig`/`core_kat_test.zig`) — this is where a real gap was found and fixed:
+a present `PSBT_GLOBAL_VERSION` is now required to be `0` (BIP174 §"Version 0"), which `parse`
+previously didn't check. Core's own `finalizer`/`extractor` vectors turned out to be byte-identical
+to BIP174's worked example above (no new spend shape), so P2WPKH/native-P2WSH finalization are
+still self-authored, not vector-anchored — see `SPEC.md` for the full accounting, including which
+of Core's vectors are BIP370/BIP371/MuSig2 content this module deliberately doesn't validate.

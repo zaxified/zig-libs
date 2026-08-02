@@ -127,8 +127,9 @@ anyone other than the zig-libs authors. Each such file's first line says
              channel_update, dual MIT/Apache-2.0; test vectors only, no
              source code)
   psbt     — `modules/psbt/NOTICE` (BIP174 "Test Vectors" section worked
-             examples, bitcoin/bips, BSD-2-Clause; test vectors only, no
-             source code)
+             examples, bitcoin/bips, BSD-2-Clause, plus Bitcoin Core
+             `test/functional/data/rpc_psbt.json` conformance vectors, MIT;
+             test vectors only, no source code)
 
 New modules that reproduce third-party code OR third-party data whose notice
 must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`

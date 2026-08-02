@@ -72,6 +72,25 @@ implied by the byte compare), and `extract` on the BIP's own finalized PSBT repr
 raw transaction byte-exact. P2WPKH finalization and native (non-P2SH) P2WSH multisig remain
 self-authored — BIP174's vectors don't happen to cover those two shapes end-to-end.
 
+**Bitcoin Core vectors** (`core_kat_vectors.zig`/`core_kat_test.zig`, `test/functional/data/
+rpc_psbt.json`, a SEPARATE external oracle from BIP174): Core's own `finalizer`/`extractor` entries
+were checked first and turned out to be byte-identical to the BIP174 Finalizer/Extractor worked
+example just above — Core's functional test reuses BIP174's own example verbatim, so the "P2WPKH/
+native-P2WSH remain self-authored" gap noted above is NOT closed by this JSON (see
+`ANCHOR-TASKS.tsv`). What Core's JSON DOES give this module: 45 new (non-BIP174-duplicate) `invalid`
+vectors plus all 23 `invalid_with_msg` vectors, individually decoded to determine why each is invalid
+rather than just pattern-matching Core's message. That surfaced one genuine BIP174 gap — a present
+`PSBT_GLOBAL_VERSION` was checked for shape but never for value, though BIP174 §"Version 0" requires
+it be 0 if present — now fixed (`error.UnsupportedPsbtVersion`; `core_kat_vectors.invalid_v0_scope`'s
+`core_index = 19`/`42` are the external oracle for it). Every other vector this module still accepts
+is BIP370(PSBTv2)/BIP371(Taproot)/MuSig2 content, or a BIP174 §"Signer" TXID-cross-check (Signer role
+is deferred, see "Threat model" below) — explicitly out of scope, not a bug; asserted as an accept,
+not silently skipped (`core_kat_vectors.invalid_out_of_scope`). Of Core's 42 new `valid` vectors, 27
+round-trip byte-exact, 14 are pure-PSBTv2 PSBTs this module correctly refuses (out of scope), and one
+(`valid[5]`) hits the SAME 0-vin/BIP144-marker ambiguity as the two BIP174 valid vectors above, just
+surfacing as `error.TooManyItems` instead of `error.InvalidWitnessFlag` — same root cause, new facet,
+not a new bug. See `core_kat_test.zig`'s doc comment for the full per-index account.
+
 **Hostile teeth beyond the BIP set** (`root.zig`'s own test block): truncated map (keylen with no
 key bytes following), `valuelen` claiming far more bytes than remain (both a 1-byte and a
 CompactSize-wide-form declared length), empty global map (no unsigned tx) — every one a typed
