@@ -55,6 +55,29 @@ pub fn readFrame(r: *std.Io.Reader, buf: []u8, limits: Limits) ![]u8 {
     return dst;
 }
 
+/// Read one frame, allocating exactly the announced payload length.
+///
+/// The reason this exists rather than callers sizing a buffer themselves: the
+/// obvious way to write a server loop is to allocate `limits.max_frame` per
+/// connection and hand it to `readFrame`, which makes every connection cost
+/// the CAP — 1 MiB by default — no matter how small the actual request is, and
+/// lets anyone who can open connections choose that cost. Reading the 4-byte
+/// header first and allocating against it keeps the cap as a rejection
+/// threshold instead of a per-connection price.
+///
+/// The length is still checked against `limits.max_frame` BEFORE allocating,
+/// so an announced 4 GiB is refused rather than attempted. Caller owns the
+/// returned slice.
+pub fn readFrameAlloc(r: *std.Io.Reader, gpa: std.mem.Allocator, limits: Limits) ![]u8 {
+    const hdr = try r.takeArray(4);
+    const len = std.mem.readInt(u32, hdr, .little);
+    if (len > limits.max_frame) return error.FrameTooLarge;
+    const dst = try gpa.alloc(u8, len);
+    errdefer gpa.free(dst);
+    try r.readSliceAll(dst);
+    return dst;
+}
+
 // ── generic JSON tagged-union envelope codec ────────────────────────────────
 
 /// A JSON envelope codec over any `T` that is a `union(enum)` whose payload
@@ -309,4 +332,30 @@ test "envelope writeFramed rejects oversize payload" {
     // a data field long enough that the encoded JSON exceeds a tiny cap
     const msg: TestEnvelope = .{ .blob = .{ .id = 1, .data = "0123456789" ** 4 } };
     try t.expectError(error.FrameTooLarge, TestCodec.writeFramed(msg, gpa, &w, .{ .max_frame = 8 }));
+}
+
+test "readFrameAlloc: allocation follows the frame, not the cap" {
+    // A fixed buffer far smaller than `max_frame`: if the implementation ever
+    // goes back to allocating the cap, this runs out of memory instead of
+    // quietly costing a megabyte per connection where nobody would notice.
+    var scratch: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+
+    var wire = [_]u8{ 5, 0, 0, 0 } ++ "hello".*;
+    var r: std.Io.Reader = .fixed(&wire);
+    const got = try readFrameAlloc(&r, fba.allocator(), .{}); // .{} = 1 MiB cap
+    defer fba.allocator().free(got);
+    try std.testing.expectEqualStrings("hello", got);
+    try std.testing.expect(fba.end_index <= 8);
+}
+
+test "readFrameAlloc: an oversize announced length is refused before allocating" {
+    // The header claims 4 GiB and the body never arrives. Checking the cap
+    // first means this is a clean error, not an allocation attempt or a wait.
+    var wire = [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    var r: std.Io.Reader = .fixed(&wire);
+    try std.testing.expectError(
+        error.FrameTooLarge,
+        readFrameAlloc(&r, std.testing.failing_allocator, .{}),
+    );
 }

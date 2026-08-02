@@ -1,6 +1,6 @@
 # framing
 
-Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON
+Length-prefixed stream framing (`writeFrame`/`readFrame`/`readFrameAlloc`) plus a generic JSON
 tagged-union envelope codec (`EnvelopeCodec(T)`) on top — two small layers in
 one module.
 
@@ -32,6 +32,9 @@ try framing.writeFrame(&w, payload, .{ .max_frame = 4096 }); // tighter cap
 var r: std.Io.Reader = ...;
 var buf: [1 << 20]u8 = undefined;
 const payload = try framing.readFrame(&r, &buf, .{});
+
+// Or let the frame size the allocation instead of pre-sizing for the cap:
+const owned = try framing.readFrameAlloc(&r, gpa, .{}); defer gpa.free(owned);
 
 // generic JSON envelope over any union(enum) of json-serializable payloads
 const Message = union(enum) {

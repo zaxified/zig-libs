@@ -245,9 +245,11 @@ pub const Server = struct {
     /// cap is checked before the body is read, so an oversize header never
     /// blocks waiting for a body that will not arrive).
     ///
-    /// Note: `limits.max_frame` bytes are allocated from `gpa` for the request
-    /// buffer, so set it to your protocol's real cap (not the 1 MiB default) if
-    /// per-request allocation matters.
+    /// The request buffer is sized to the frame's announced length (checked
+    /// against `limits.max_frame` first), not to the cap — so a small request
+    /// costs a small allocation even with the 1 MiB default, and the cap stays
+    /// a rejection threshold rather than a per-connection price an unauthorized
+    /// peer gets to impose by connecting.
     pub fn handleOne(
         conn_fd: Fd,
         ctx: anytype,
@@ -259,9 +261,8 @@ pub const Server = struct {
 
         var rbuf: [io_buf_size]u8 = undefined;
         var fr = FdReader.init(conn_fd, &rbuf);
-        const req_store = try gpa.alloc(u8, limits.max_frame);
-        defer gpa.free(req_store);
-        const req = try framing.readFrame(&fr.interface, req_store, limits);
+        const req = try framing.readFrameAlloc(&fr.interface, gpa, limits);
+        defer gpa.free(req);
 
         const reply = try dispatch(ctx, req, gpa);
 

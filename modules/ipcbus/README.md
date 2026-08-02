@@ -59,9 +59,10 @@ var keys: [64][]const u8 = undefined;
 const live = bus.list(&keys);
 ```
 
-`limits` is a `framing.Limits` (`.{}` = 1 MiB default cap). `handleOne`
-allocates `limits.max_frame` bytes for the request buffer, so set it to your
-protocol's real cap if per-request allocation matters.
+`limits` is a `framing.Limits` (`.{}` = 1 MiB default cap). `handleOne` sizes
+the request buffer to the frame's announced length, checked against
+`max_frame` first — so the cap is a rejection threshold, not a per-connection
+price that any peer able to connect gets to impose.
 
 The raw transport helpers (`unixAddr`, `connectUnix`, `listenUnix`,
 `writeAllFd`, `readExact`) and the `FdReader`/`FdWriter` `std.Io` adapters over
