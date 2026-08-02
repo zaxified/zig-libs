@@ -4,7 +4,9 @@ Design + threat notes for auditors. Usage, API and the field-by-field wire
 diagram: see [README.md](README.md) and the `src/root.zig` doc comments.
 Attribution/provenance: see `/NOTICE` — none needed here (clean-room from the
 public IEEE 802.1ah / 802.1Q-2014 standard; a public spec is not a copyrightable
-work, and no third-party source or dissector was ported or studied).
+work, and no third-party source was ported into this codec — the Wireshark
+cross-check below is a behaviour comparison against `encode()`'s own output,
+not a port).
 
 ## What it is
 
@@ -142,18 +144,34 @@ separate layer (802.1AE MACsec on the backbone, or the WireGuard tunnel in the
 
 ## Verification
 
-Offline only — pure codec, no live-interop surface (no capture/oracle was
-available, so the golden frames are hand-assembled field-by-field per the IEEE
-spec). `zig build test-pbb`: two byte-exact golden KATs (full B-Tagged frame +
-untagged-B-VLAN variant) pinning every offset and endianness with decode
-recovering every field; an isolated I-TCI-octet bit-field test; two permanent
-positive-control tests (UCA↔DEI swap, wrong-3-byte I-SID); a 500-iteration seeded
-encode→decode property test (I-SID incl. 0 and `max_isid`, B-Tag present/absent,
-UCA 0/1, empty..4 KiB customer data); truncation-at-every-length for both frame
-shapes; wrong-EtherType and B-Tag-without-I-TAG rejection; reserved-bit
-ignore-on-receipt; I-SID tenant-isolation; encode buffer-too-small and
-caller-buffer≡alloc equivalence; and the `std.testing.fuzz` target. Green in
-Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean.
+Offline only — no live-interop surface (no packet capture was available). Two
+byte-exact golden KATs (full B-Tagged frame + untagged-B-VLAN variant) are
+hand-assembled field-by-field per the IEEE spec; a third golden is externally
+anchored: `encode()`'s own output for a frame whose encapsulated customer frame
+carries its own 802.1Q C-VLAN tag was fed through Wireshark 4.6.4's real IEEE
+802.1ah dissector offline (`scripts/dissect.py`, sharkd — no capture, no
+network), and the frozen bytes plus the quoted Wireshark output live in
+`src/root.zig`. Wireshark independently confirmed the B-TCI and I-TCI bit
+order (including bit 27), the 24-bit I-SID window, C-DA/C-SA placement, the
+0x88E7 ethertype, and — the sharpest check of the encapsulation boundary —
+that its own dissector recurses cleanly through B-Tag → I-Tag → the
+encapsulated frame's own tag → IPv4 → data, which only works if
+`customer_data` starts exactly where this codec says it does. The one
+disagreement that turned up was cosmetic: Wireshark's dissector names the same
+bit `NCA` ("No Customer Addresses") where this module calls it `uca` ("Use
+Customer Addresses") — see the naming note beside the golden in `src/root.zig`
+for why that was left as an open, cited ambiguity rather than "fixed" on the
+strength of one of two conflicting secondary sources.
+
+`zig build test-pbb`: the three goldens above; an isolated I-TCI-octet
+bit-field test; two permanent positive-control tests (UCA↔DEI swap,
+wrong-3-byte I-SID); a 500-iteration seeded encode→decode property test (I-SID
+incl. 0 and `max_isid`, B-Tag present/absent, UCA 0/1, empty..4 KiB customer
+data); truncation-at-every-length for both frame shapes; wrong-EtherType and
+B-Tag-without-I-TAG rejection; reserved-bit ignore-on-receipt; I-SID
+tenant-isolation; encode buffer-too-small and caller-buffer≡alloc equivalence;
+and the `std.testing.fuzz` target. Green in Debug and
+`-Doptimize=ReleaseFast`; `zig fmt --check` clean.
 
 ## Backlog / deferred
 

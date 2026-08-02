@@ -122,6 +122,12 @@ zig fmt --check modules/pbb
 
 Provenance: clean-room from the IEEE 802.1ah / 802.1Q-2014 public standard — no
 NOTICE entry needed (a public spec is not a copyrightable work; no third-party
-source or dissector was ported or studied). The golden frames are hand-assembled
-per the spec (no capture was available). See SPEC.md for the design and threat
-model.
+source was ported into this codec). Two of the golden frames are hand-assembled
+per the spec; a third is this module's own `encode()` output, independently
+cross-checked against Wireshark 4.6.4's real IEEE 802.1ah dissector offline
+(`scripts/dissect.py`, sharkd — no capture, no network needed). Wireshark
+confirmed the I-TCI/B-TCI bit layout, the C-DA/C-SA relocation, and that its own
+dissector recurses correctly into the encapsulated customer frame at exactly the
+offset this codec treats as the boundary. See SPEC.md for the design, threat
+model, and the one naming ambiguity ("UCA" vs Wireshark's "NCA") that check
+turned up.

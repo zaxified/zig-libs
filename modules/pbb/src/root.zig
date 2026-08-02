@@ -153,7 +153,10 @@ pub const Fields = struct {
     i_pcp: u3,
     /// I-TAG drop-eligible indicator.
     i_dei: bool,
-    /// Use Customer Addresses bit.
+    /// Use Customer Addresses bit (I-TCI bit 27). Wireshark's own IEEE 802.1ah
+    /// dissector calls the identical bit `NCA` ("No Customer Addresses") — see
+    /// the naming note on the Wireshark-anchored golden below for why this
+    /// module keeps `uca` rather than picking a side.
     uca: bool,
     /// 24-bit backbone service instance identifier (the tenant/VPN key). Agrees
     /// with `l2encap`'s I-SID width so the two encapsulations map 1:1.
@@ -729,6 +732,123 @@ test "fuzz: decode never panics/OOBs on hostile bytes and stays within input bou
     // decode's customer slice is strictly within the input. Under a plain `zig
     // build test` this runs once as a smoke test (same convention as l2encap).
     try testing.fuzz({}, fuzzDecode, .{});
+}
+
+// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) ───────────
+//
+// The two goldens above were hand-assembled from the spec text — an anchor
+// whose authority comes from the same head that wrote the encoder is not an
+// external anchor (our encoder and our own reading of 802.1ah could share one
+// misunderstanding and both goldens would still "pass"). The vector below was
+// instead produced by this module's own `encode()` and fed through
+// `scripts/dissect.py`, which runs Wireshark 4.6.4's real IEEE 802.1ah
+// dissector (sharkd, offline, no network, no capture), then pinned to what
+// Wireshark actually printed. This is a behaviour cross-check, not a port: no
+// third-party source was copied into this codec (see `/NOTICE` — none needed).
+//
+// Command:
+//   scripts/dissect.py --frame raw --fields '00 1b 21 00 00 01 00 1b 21 00 00
+//   02 88 a8 50 c8 88 e7 90 00 10 00 00 50 56 00 00 01 00 50 56 00 00 02 81 00
+//   00 0a 08 00 45 00 00 1c 00 01 00 00 40 fd 65 e2 0a 00 00 01 0a 00 00 02 41
+//   42 43 44 45 46 47 48'
+//
+// Wireshark printed (verbatim, trimmed to the load-bearing lines):
+//   frame.protocols == "eth:ethertype:ieee8021ad:ethertype:vlan:ethertype:ip:data"
+//   eth.type == 0x88a8 = Type: 802.1ad Provider Bridge (Q-in-Q) (0x88a8)
+//   ieee8021ad.priority == 2 = Priority: 2            (B-TCI PCP)
+//   ieee8021ad.dei == 1                                (B-TCI DEI)
+//   ieee8021ad.id == 200 = ID: 200                     (B-VID)
+//   ieee8021ah.priority == 4 = Priority: 4             (I-TCI I-PCP)
+//   ieee8021ah.drop == 1                               (I-TCI I-DEI)
+//   ieee8021ah.nca == 0                                (I-TCI bit 27 — see note below)
+//   ieee8021ah.res1 == 0 / ieee8021ah.res2 == 0        (reserved, both 0)
+//   ieee8021ah.isid == 4096 = I-SID: 4096
+//   ieee8021ah.cdst == 00:50:56:00:00:01 = C-Destination
+//   ieee8021ah.csrc == 00:50:56:00:00:02 = C-Source
+//   ieee8021ah.etype == 0x8100 = Type: 802.1Q Virtual LAN (0x8100)
+//   vlan.priority == 0 / vlan.dei == False / vlan.id == 10
+//   vlan.etype == 0x0800 = Type: IPv4 (0x0800)
+//   ip = Internet Protocol Version 4, Src: 10.0.0.1, Dst: 10.0.0.2
+//   ip.proto == 253 = Protocol: Unknown (253)
+//   data = Data (8 bytes); data.data == 41:42:43:44:45:46:47:48
+// No `_ws.expert`/`_ws.malformed` anywhere in this frame (checked with --json).
+//
+// This independently confirms the B-TCI bit order, the I-TCI bit order
+// (including bit 27), the 24-bit I-SID window, C-DA/C-SA placement, the
+// 0x88E7 I-TAG ethertype, and — the sharpest test of the encapsulation
+// boundary — that Wireshark's own dissector, handed nothing but our wire
+// bytes, recurses cleanly through B-Tag -> I-Tag -> the encapsulated frame's
+// *own* 802.1Q C-VLAN tag -> IPv4 -> opaque data. That recursion only works if
+// `customer_data` starts at exactly the byte this codec says it does.
+//
+// Naming note (not a wire bug — the earlier README/SPEC claim that no
+// external oracle exists for this module was itself the bug this task fixed;
+// this note is the one substantive disagreement that check turned up).
+// Wireshark's dissector calls this module's `uca` field `ieee8021ah.nca`
+// ("No Customer Addresses") — the identical bit, mask 0x08 in the flag octet
+// / 0x08000000 of the 32-bit I-TCI — under an opposite-sounding name. At least
+// one router vendor's own docs use this module's name for the same bit
+// ("PBB packets with UCA bit set are dropped", Nokia SR OS PBB configuration
+// guidelines). The two industry sources disagree on what to call the bit;
+// neither disagrees on its *position*. Left as `uca`: renaming on the
+// strength of one of two conflicting secondary sources would trade one
+// unverifiable guess for another, and the published 802.1Q-2014 text itself
+// (the only source that could settle it) is paywalled and unavailable here.
+const golden_wireshark_customer_vlan = [_]u8{
+    0x00, 0x1b, 0x21, 0x00, 0x00, 0x01, // B-DA
+    0x00, 0x1b, 0x21, 0x00, 0x00, 0x02, // B-SA
+    0x88, 0xa8, 0x50, 0xc8, //             B-Tag: TPID + TCI(PCP=2,DEI=1,VID=200)
+    0x88, 0xe7, //                         I-TAG EtherType
+    0x90, 0x00, 0x10, 0x00, //             I-TCI: PCP=4 DEI=1 UCA/NCA=0 Res=0 I-SID=0x1000
+    0x00, 0x50, 0x56, 0x00, 0x00, 0x01, // C-DA
+    0x00, 0x50, 0x56, 0x00, 0x00, 0x02, // C-SA
+    // customer_data: the encapsulated frame's OWN 802.1Q C-VLAN tag (VID=10),
+    // its own ethertype (IPv4), a byte-exact IPv4 header (proto=253, an
+    // IANA-reserved-for-experimentation value with no Wireshark sub-dissector,
+    // chosen so the anchor output stays free of unrelated expert info), and 8
+    // opaque payload bytes.
+    0x81, 0x00, 0x00, 0x0a, 0x08, 0x00,
+    0x45, 0x00, 0x00, 0x1c, 0x00, 0x01,
+    0x00, 0x00, 0x40, 0xfd, 0x65, 0xe2,
+    0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00,
+    0x00, 0x02, 0x41, 0x42, 0x43, 0x44,
+    0x45, 0x46, 0x47, 0x48,
+};
+
+test "golden (Wireshark-anchored): customer frame carrying its own 802.1Q tag — builder reproduces the exact bytes" {
+    const fields: Fields = .{
+        .b_da = .{ 0x00, 0x1b, 0x21, 0x00, 0x00, 0x01 },
+        .b_sa = .{ 0x00, 0x1b, 0x21, 0x00, 0x00, 0x02 },
+        .b_tag = .{ .pcp = 2, .dei = true, .vid = 200 },
+        .i_pcp = 4,
+        .i_dei = true,
+        .uca = false,
+        .i_sid = 0x00_1000,
+        .c_da = .{ 0x00, 0x50, 0x56, 0x00, 0x00, 0x01 },
+        .c_sa = .{ 0x00, 0x50, 0x56, 0x00, 0x00, 0x02 },
+    };
+    const customer_data = golden_wireshark_customer_vlan[headerLen(true)..];
+    var buf: [golden_wireshark_customer_vlan.len]u8 = undefined;
+    const out = try encode(fields, customer_data, &buf);
+    try testing.expectEqualSlices(u8, &golden_wireshark_customer_vlan, out);
+}
+
+test "golden (Wireshark-anchored): decode recovers every field, including the recursion boundary" {
+    const dec = try decode(&golden_wireshark_customer_vlan);
+    try testing.expectEqual(@as(u3, 2), dec.fields.b_tag.?.pcp);
+    try testing.expect(dec.fields.b_tag.?.dei);
+    try testing.expectEqual(@as(u12, 200), dec.fields.bvid().?);
+    try testing.expectEqual(@as(u3, 4), dec.fields.i_pcp);
+    try testing.expect(dec.fields.i_dei);
+    try testing.expect(!dec.fields.uca);
+    try testing.expectEqual(@as(u24, 0x00_1000), dec.fields.i_sid);
+    try testing.expectEqual([6]u8{ 0x00, 0x50, 0x56, 0x00, 0x00, 0x01 }, dec.fields.c_da);
+    try testing.expectEqual([6]u8{ 0x00, 0x50, 0x56, 0x00, 0x00, 0x02 }, dec.fields.c_sa);
+    // The customer_data boundary Wireshark recursed on: the encapsulated
+    // frame's own 802.1Q tag (VID=10) starts at byte 0 of customer_data.
+    try testing.expectEqual(@as(u16, 0x8100), std.mem.readInt(u16, dec.customer_data[0..2], .big));
+    try testing.expectEqual(@as(u16, 0x000a), std.mem.readInt(u16, dec.customer_data[2..4], .big));
+    try testing.expectEqualSlices(u8, golden_wireshark_customer_vlan[headerLen(true)..], dec.customer_data);
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
