@@ -83,8 +83,15 @@ processes/machines sharing one store.
 
 ### Not handled
 
-- **Request-fingerprint mismatch**: a client reusing a key with a different
-  body is the client's bug; the recorded response is returned regardless.
+- **Request-fingerprint mismatch**, partially. A key reused across a different
+  method or path is already safe under the default `scope = .target`: those are
+  different cache entries, so a `POST /orders` answer can never replay for
+  `POST /refunds` (only `scope = .key_only` opts out of that). What is NOT
+  detected is the same target with a **different body** — the first response is
+  replayed, so a client library reusing one key for two payloads gets the wrong
+  answer. The IETF Idempotency-Key draft says 422 here; that needs the body
+  hashed, which needs it buffered before the handler reads it, a per-request
+  memory cost not imposed today. Pinned by the `GAP:` test in `root.zig`.
 
 ## Attributes
 

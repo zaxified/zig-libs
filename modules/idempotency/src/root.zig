@@ -54,10 +54,24 @@
 //! the first request reserves the key for the duration of its handler, and a
 //! second same-key request arriving before it completes is answered **409**
 //! (already in flight) rather than running the handler a second time — the
-//! client retries once the original finishes and then gets the replay. **Not**
-//! handled: request-fingerprint mismatch detection (a client reusing a key with
-//! a different body is the client's bug — the recorded response is returned
-//! regardless).
+//! client retries once the original finishes and then gets the replay.
+//!
+//! **Request-fingerprint mismatch** (a client reusing one key for two
+//! different requests) is covered only as far as the cache key goes, and it is
+//! worth being precise about where that line falls:
+//!
+//! - Different method or path, under the default `scope = .target`: these are
+//!   *different cache entries*, so no cross-replay can happen. The dangerous
+//!   confusion — a key from `POST /orders` replaying as the answer to
+//!   `POST /refunds` — cannot occur unless you opt into `scope = .key_only`.
+//! - Same method and path, different **body**: NOT detected. The recorded
+//!   response is replayed, so a client library that reuses a key across two
+//!   genuinely different payloads gets the first one's answer. The IETF
+//!   Idempotency-Key draft says a server SHOULD answer 422 here; doing so
+//!   requires hashing the request body, which means buffering it before the
+//!   handler reads it — a memory cost per in-flight request this module does
+//!   not currently impose. `idempotency: same key, different body` below pins
+//!   the current behavior so the choice stays visible.
 //!
 //! ## Usage
 //!
@@ -798,4 +812,43 @@ test "encode/decode round-trips status, content-type and body" {
 
     // A truncated blob decodes to null rather than reading out of bounds.
     try testing.expectEqual(@as(?RecordedResponse, null), decode("x"));
+}
+
+// Same target, different body: the replay wins. See the module doc comment —
+// detecting this needs a body fingerprint, which needs the body buffered
+// before the handler reads it. This test exists so the limitation is visible
+// in the suite and not only in prose, and so it fails loudly the day a
+// fingerprint lands and the answer becomes 422.
+test "GAP: same key and target with a different body replays instead of answering 422" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+
+    const with_body = "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: dup\r\n" ++
+        "Content-Type: application/json\r\nContent-Length: 12\r\n" ++
+        "Connection: close\r\n\r\n{\"amt\":10}\r\n";
+    const other_body = "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: dup\r\n" ++
+        "Content-Type: application/json\r\nContent-Length: 14\r\n" ++
+        "Connection: close\r\n\r\n{\"amt\":1000}\r\n";
+
+    var b1: [2048]u8 = undefined;
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, with_body, &b1)));
+
+    // A DIFFERENT payload under the same key: today this replays the first
+    // answer. Note the amount differs in length too, so even a Content-Length
+    // fingerprint would have caught this one.
+    var b2: [2048]u8 = undefined;
+    const second = runWire(&r, other_body, &b2);
+    try testing.expectEqualStrings("order-1", bodyOf(second));
+    try testing.expectEqualStrings("true", headerValue(second, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls); // the handler never saw the second request
 }
