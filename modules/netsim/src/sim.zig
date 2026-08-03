@@ -284,6 +284,15 @@ pub const Sim = struct {
     protocol: Protocol,
     nodes: std.ArrayList(NodeRec) = .empty,
     links: std.ArrayList(LinkRec) = .empty,
+    /// Per-node out-adjacency: `out_adj.items[a]` holds the indices into
+    /// `links` of every link whose `a` is that node.
+    ///
+    /// Without it both `findLink` and `neighbors` scan EVERY link. `findLink`
+    /// runs on every `send`, and consumers call `neighbors` per received
+    /// message (`df-elect` does), so a run cost O(messages x links) — the
+    /// reason a 1000-node fleet sim was out of reach. Links are append-only,
+    /// so keeping this current is one append per `addLink`.
+    out_adj: std.ArrayList(std.ArrayList(u32)) = .empty,
     partitions: std.ArrayList(ActivePartition) = .empty,
     queue: EventHeap = .{},
     now: Time = 0,
@@ -310,6 +319,8 @@ pub const Sim = struct {
     pub fn deinit(self: *Sim) void {
         self.nodes.deinit(self.gpa);
         self.links.deinit(self.gpa);
+        for (self.out_adj.items) |*a| a.deinit(self.gpa);
+        self.out_adj.deinit(self.gpa);
         self.partitions.deinit(self.gpa);
         self.queue.deinit(self.gpa);
         self.arena.deinit();
@@ -321,11 +332,16 @@ pub const Sim = struct {
     pub fn addNode(self: *Sim, cfg: NodeConfig) Allocator.Error!NodeId {
         const id: NodeId = @intCast(self.nodes.items.len);
         try self.nodes.append(self.gpa, .{ .clock_offset = cfg.clock_skew });
+        errdefer _ = self.nodes.pop();
+        try self.out_adj.append(self.gpa, .empty);
         return id;
     }
 
     pub fn addLink(self: *Sim, a: NodeId, b: NodeId, cfg: LinkConfig) Allocator.Error!void {
+        const idx: u32 = @intCast(self.links.items.len);
         try self.links.append(self.gpa, .{ .a = a, .b = b, .cfg = cfg });
+        errdefer _ = self.links.pop();
+        try self.out_adj.items[a].append(self.gpa, idx);
     }
 
     /// Add both directions with the same config.
@@ -352,11 +368,10 @@ pub const Sim = struct {
     /// Fill `out` with `node`'s out-neighbors; returns how many were written.
     pub fn neighbors(self: *const Sim, node: NodeId, out: []NodeId) usize {
         var n: usize = 0;
-        for (self.links.items) |l| {
-            if (l.a == node and n < out.len) {
-                out[n] = l.b;
-                n += 1;
-            }
+        for (self.out_adj.items[node].items) |idx| {
+            if (n >= out.len) break;
+            out[n] = self.links.items[idx].b;
+            n += 1;
         }
         return n;
     }
@@ -422,8 +437,10 @@ pub const Sim = struct {
     }
 
     fn findLink(self: *Sim, a: NodeId, b: NodeId) ?*LinkRec {
-        for (self.links.items) |*l| {
-            if (l.a == a and l.b == b) return l;
+        if (a >= self.out_adj.items.len) return null;
+        for (self.out_adj.items[a].items) |idx| {
+            const l = &self.links.items[idx];
+            if (l.b == b) return l;
         }
         return null;
     }
@@ -696,4 +713,70 @@ test "event heap: pops in (time, seq) order" {
         prev_seq = ev.seq;
         first = false;
     }
+}
+
+test "adjacency index stays in agreement with the link list" {
+    // The index is a second representation of `links`, so the failure mode is
+    // that they drift: a link present in one and missing from the other makes
+    // `send` silently drop or `neighbors` under-report, and the simulation
+    // still "runs". This checks them against each other by brute force —
+    // exactly the linear scan the index replaced.
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    const Noop = struct {
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+        fn onTimer(_: *anyopaque, _: *Sim, _: NodeId, _: u64) anyerror!void {}
+    };
+    var unused: usize = 0;
+    var sim = Sim.init(gpa, 1, .{
+        .ctx = &unused,
+        .onMessageFn = Noop.onMessage,
+        .onTimerFn = Noop.onTimer,
+    }, &log, 100, 1000);
+    defer sim.deinit();
+
+    var ids: [6]NodeId = undefined;
+    for (&ids) |*id| id.* = try sim.addNode(.{});
+
+    // A deliberately uneven shape: one hub, one isolated node, one self-loop.
+    try sim.addBiLink(ids[0], ids[1], .{});
+    try sim.addBiLink(ids[0], ids[2], .{});
+    try sim.addBiLink(ids[0], ids[3], .{});
+    try sim.addLink(ids[4], ids[0], .{}); // one-way
+    try sim.addLink(ids[0], ids[0], .{}); // self-loop
+    // ids[5] stays isolated.
+
+    for (0..sim.nodes.items.len) |a| {
+        // Every link with this source must be in the node's adjacency list.
+        var expected: usize = 0;
+        for (sim.links.items) |l| {
+            if (l.a == a) expected += 1;
+        }
+        try testing.expectEqual(expected, sim.out_adj.items[a].items.len);
+
+        // And findLink must agree with a brute-force scan for every target.
+        for (0..sim.nodes.items.len) |b| {
+            var brute: ?*LinkRec = null;
+            for (sim.links.items) |*l| {
+                if (l.a == a and l.b == b) {
+                    brute = l;
+                    break;
+                }
+            }
+            const via_index = sim.findLink(@intCast(a), @intCast(b));
+            try testing.expectEqual(brute, via_index);
+        }
+
+        var out: [8]NodeId = undefined;
+        try testing.expectEqual(expected, sim.neighbors(@intCast(a), &out));
+    }
+
+    // The isolated node has no out-neighbors and no links.
+    var out: [8]NodeId = undefined;
+    try testing.expectEqual(@as(usize, 0), sim.neighbors(ids[5], &out));
+
+    // `neighbors` still honors a short output buffer.
+    var tiny: [2]NodeId = undefined;
+    try testing.expectEqual(@as(usize, 2), sim.neighbors(ids[0], &tiny));
 }
