@@ -322,8 +322,12 @@ fn runFanout(gpa: Allocator, results: []TargetResult, opts: Options) void {
 ///
 /// NOTE: `std.Io.Threaded` in Zig 0.16 panics ("TODO implement
 /// netConnectIpPosix with timeout") if a connect timeout is passed, so the
-/// per-attempt `timeout_ns` is currently advisory — the OS default connect
-/// timeout applies. Re-enable native timeouts here once std implements them.
+/// syscall cannot be aborted early — the OS default connect timeout still
+/// governs how long an attempt BLOCKS. The per-attempt `timeout_ns` is
+/// applied to the RESULT instead (`overBudget`): a connect that succeeds
+/// after the budget is reported `.timeout`, not `.up`. Re-enable native
+/// timeouts here once std implements them, and the blocking time will match
+/// the budget too.
 /// Monotonic clock in nanoseconds (std.time.Instant was removed in 0.16;
 /// mirror the repo's proven CLOCK_MONOTONIC pattern). Linux, like the socket.
 fn monoNs() u64 {
@@ -341,7 +345,6 @@ pub const LiveConnector = struct {
     }
 
     fn connectImpl(ctx: *anyopaque, target: Target, timeout_ns: u64) ConnectOutcome {
-        _ = timeout_ns; // see NOTE above
         const self: *LiveConnector = @ptrCast(@alignCast(ctx));
         const io = self.io;
         const copts: net.IpAddress.ConnectOptions = .{ .mode = .stream };
@@ -359,6 +362,22 @@ pub const LiveConnector = struct {
         };
         const rtt: u64 = monoNs() -| start;
         stream.close(io);
+        return overBudget(rtt, timeout_ns);
+    }
+
+    /// Classify a *successful* connect against the caller's budget.
+    ///
+    /// std cannot abort the syscall (see the NOTE above), so the connect runs
+    /// to the OS default no matter what `timeout_ns` says. The RESULT can
+    /// still respect the budget, and should: a prober asked for "up within
+    /// 1s" learns nothing useful from a connect that succeeded after 30. The
+    /// previous code discarded `timeout_ns` entirely and reported `.up`.
+    ///
+    /// The rtt is kept on the timeout outcome — how long it actually took is
+    /// the interesting part of a budget miss.
+    fn overBudget(rtt: u64, timeout_ns: u64) ConnectOutcome {
+        if (timeout_ns != 0 and rtt > timeout_ns)
+            return .{ .status = .timeout, .rtt_ns = rtt };
         return .{ .status = .up, .rtt_ns = rtt };
     }
 
@@ -657,4 +676,21 @@ test "live: probe a self-bound TCP listener → up" {
     // A bound-but-not-accepting listener still completes the handshake (backlog).
     try testing.expectEqual(Status.up, r.kind);
     try testing.expect(r.rtt_ns != null);
+}
+
+test "LiveConnector.overBudget: a slow success is a timeout, not an up" {
+    // std cannot abort the connect syscall, so the budget is enforced on the
+    // outcome. Before this, `timeout_ns` was discarded and a 30s connect under
+    // a 1s budget reported `.up`.
+    const ms = std.time.ns_per_ms;
+    try testing.expectEqual(Status.up, LiveConnector.overBudget(5 * ms, 100 * ms).status);
+    try testing.expectEqual(Status.up, LiveConnector.overBudget(100 * ms, 100 * ms).status); // exactly on budget
+    try testing.expectEqual(Status.timeout, LiveConnector.overBudget(101 * ms, 100 * ms).status);
+
+    // The measured rtt survives on both outcomes — how long a budget miss took
+    // is the useful part.
+    try testing.expectEqual(@as(u64, 101 * ms), LiveConnector.overBudget(101 * ms, 100 * ms).rtt_ns);
+
+    // A zero budget means "no budget", not "everything times out".
+    try testing.expectEqual(Status.up, LiveConnector.overBudget(30 * std.time.ns_per_s, 0).status);
 }

@@ -7,7 +7,11 @@ and how fast? Complements the sibling `icmp` (host liveness) and `traceroute`
 The technique is `nmap -sT` / `fping`-style: attempt a TCP connection; a completed
 handshake is `up` (with the measured connect RTT), an actively refused connection
 is `refused` (a fast, definitive negative — host present, port closed), no answer
-within the timeout is `timeout`, and a DNS/other failure is `error`. Repeat N times
+within the timeout is `timeout`, and a DNS/other failure is `error`. Caveat on the
+live connector: Zig 0.16's `std.Io.Threaded` cannot abort a connect early, so an
+attempt still BLOCKS for the OS default; `timeout_ms` is applied to the outcome,
+meaning a connect that succeeds past the budget is reported `timeout` (with the
+real RTT) rather than `up`. Repeat N times
 per target for min/avg/max/loss, and fan out across a target list with a bounded
 worker count.
 
