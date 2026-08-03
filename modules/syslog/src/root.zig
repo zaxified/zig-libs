@@ -23,7 +23,12 @@ const std = @import("std");
 
 pub const meta = .{
     .platform = .any,
-    .role = .both,
+    // `.client`, not `.both`: this module FORMATS and SENDS syslog messages
+    // and has no receiver — there is no parser and no listener in its public
+    // surface (`Message`/`bufPrint`/`UdpEmitter`/`TcpEmitter`/`bsd`). It was
+    // classified `.both`, which reads as "also a syslog server" and would put
+    // it on the wrong side of any client/server survey.
+    .role = .client,
     .concurrency = .reentrant,
     .model_after = "RFC 5424 (+ RFC 6587 framing); design after joelreymont/pz",
     .deps = .{},
@@ -95,7 +100,7 @@ test {
 
 test "meta is well-formed" {
     try std.testing.expectEqual(.any, meta.platform);
-    try std.testing.expectEqual(.both, meta.role);
+    try std.testing.expectEqual(.client, meta.role); // sends only; no receiver
     try std.testing.expectEqual(.reentrant, meta.concurrency);
 }
 
