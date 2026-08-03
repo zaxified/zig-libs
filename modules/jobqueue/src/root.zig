@@ -355,6 +355,27 @@ pub const Queue = struct {
     /// Reserve the best ready job: highest `Priority`, ties oldest-first
     /// (FIFO), respecting `run_at`/`delay` visibility and the optional
     /// partition filter. Returns null when nothing is dispatchable.
+    /// Selection is a linear scan of the ready set: O(ready) per call, and with
+    /// `opts.partition` set it still visits every other partition's jobs. That
+    /// is the known scaling limit, and the backlog carries a per-partition
+    /// priority heap for it.
+    ///
+    /// Note for whoever writes that heap, because it is the part that is easy
+    /// to get wrong: a job in `ready` is not necessarily dispatchable. A job
+    /// with `run_at_ns` in the future (a delay, or a nack backoff) sits in the
+    /// ready set and must be SKIPPED, not removed — the scan below just steps
+    /// over it. A single heap ordered by (priority, id) cannot do that: the
+    /// top element may be invisible, and popping it to look past it loses the
+    /// ordering. The shape that works is two structures — a time-ordered
+    /// pending set and a per-partition ready heap, with jobs migrating when
+    /// their `run_at_ns` arrives — which is why this is a design change rather
+    /// than a swap of container.
+    ///
+    /// The ordering contract a replacement must preserve is already pinned by
+    /// tests: "partition FIFO ordering", "priority ordering: high before an
+    /// earlier-enqueued low", "FIFO tiebreak within equal priority", "delay /
+    /// run_at: a job is invisible until its schedule", and the crash-recovery
+    /// pair.
     pub fn dequeue(self: *Queue, opts: DequeueOptions) !?Lease {
         const wall_now = self.wall.now();
         var best_id: ?u64 = null;
