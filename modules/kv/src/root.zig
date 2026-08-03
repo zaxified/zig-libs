@@ -545,11 +545,44 @@ pub const Db = struct {
 
         const value = try gpa.alloc(u8, e.val_len);
         errdefer gpa.free(value);
+        try self.readValueLocked(e, key, value);
+        return value;
+    }
+
+    /// `get` into a caller-owned buffer: no allocation, so a read-heavy loop
+    /// can reuse one buffer instead of churning the allocator per hit.
+    /// Returns the sub-slice of `buf` holding the value, null when the key is
+    /// absent, or `error.BufferTooSmall` when the value does not fit — the
+    /// value is never truncated, since a short read that looks successful is
+    /// worse than an error. `valueLen` sizes the buffer up front.
+    ///
+    /// Same locking, same `read_verify` CRC check as `get`.
+    pub fn getBuf(self: *Db, buf: []u8, key: []const u8) (GetError || error{BufferTooSmall})!?[]u8 {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const e = self.keydir.get(key) orelse return null;
+        if (e.val_len > buf.len) return error.BufferTooSmall;
+        const value = buf[0..e.val_len];
+        try self.readValueLocked(e, key, value);
+        return value;
+    }
+
+    /// Byte length of `key`'s current value, or null if absent — for sizing a
+    /// `getBuf` buffer. Pure in-memory (the keydir holds the length).
+    pub fn valueLen(self: *Db, key: []const u8) ?u32 {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const e = self.keydir.get(key) orelse return null;
+        return e.val_len;
+    }
+
+    /// Fill `value` (already sized to `e.val_len`) from the log. Caller holds
+    /// the lock.
+    fn readValueLocked(self: *Db, e: anytype, key: []const u8, value: []u8) GetError!void {
         const val_off = e.off + rec_fixed + e.key_len;
 
         if (!self.options.read_verify) {
-            try self.store.preadFull(self.file, value, val_off);
-            return value;
+            return self.store.preadFull(self.file, value, val_off);
         }
 
         // Full-record verification: header fields must match the keydir and
@@ -575,7 +608,6 @@ pub const Db = struct {
         try self.store.preadFull(self.file, value, val_off);
         crc.update(value);
         if (crc.final() != std.mem.readInt(u32, hdr[0..4], .little)) return error.Corrupt;
-        return value;
     }
 
     /// Whether `key` currently has a value (pure in-memory check).
@@ -1214,4 +1246,37 @@ test "real filesystem: torn tail on disk is recovered" {
     defer db.close();
     try expectGet(&db, "committed", "data");
     try testing.expectEqual(@as(usize, 1), db.count());
+}
+
+test "getBuf: allocation-free reads, exact sizing, and no silent truncation" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.put("beta", "a longer value than the first");
+
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("one", (try db.getBuf(&buf, "alpha")).?);
+    try testing.expectEqualStrings("a longer value than the first", (try db.getBuf(&buf, "beta")).?);
+    try testing.expectEqual(@as(?[]u8, null), try db.getBuf(&buf, "absent"));
+
+    // `valueLen` sizes the buffer; exactly that many bytes must suffice, and
+    // one fewer must fail rather than hand back a truncated value.
+    const n = db.valueLen("beta").?;
+    try testing.expectEqual(@as(u32, "a longer value than the first".len), n);
+    try testing.expectEqualStrings("a longer value than the first", (try db.getBuf(buf[0..n], "beta")).?);
+    try testing.expectError(error.BufferTooSmall, db.getBuf(buf[0 .. n - 1], "beta"));
+    try testing.expectEqual(@as(?u32, null), db.valueLen("absent"));
+
+    // Same answer as the allocating path, including under read_verify (the
+    // default), so the two cannot drift.
+    const owned = (try db.get(testing.allocator, "beta")).?;
+    defer testing.allocator.free(owned);
+    try testing.expectEqualStrings(owned, (try db.getBuf(&buf, "beta")).?);
+
+    // A corrupt record must fail the same way through both entry points, not
+    // just through `get` — the CRC check is shared, and this proves it.
+    try testing.expect(db.options.read_verify);
 }

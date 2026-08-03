@@ -37,6 +37,11 @@ defer db.close();
 
 try db.put("key", "value");        // durable (fsync'd) when this returns
 const v = try db.get(gpa, "key");  // ?[]u8, caller frees; error.Corrupt never serves bad bytes
+
+// Allocation-free read into a reused buffer (same locking + CRC check):
+var buf: [4096]u8 = undefined;
+const v2 = try db.getBuf(&buf, "key");        // error.BufferTooSmall, never truncated
+const n = db.valueLen("key");                 // ?u32, for sizing the buffer
 try db.delete("key");              // durable tombstone; absent key = no-op
 _ = db.exists("key");              // in-memory
 _ = db.count();                    // in-memory
