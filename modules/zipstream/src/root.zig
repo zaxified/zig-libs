@@ -1299,4 +1299,5 @@ fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
 // write_golden_test.zig's doc comment.
 test {
     _ = @import("write_golden_test.zig");
+    _ = @import("xlsx_fixture_test.zig");
 }
