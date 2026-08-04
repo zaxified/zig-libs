@@ -548,6 +548,66 @@ test "stress: bounded-wait acquire/release across threads keeps every invariant"
     try testing.expect(shared.successes.load(.seq_cst) > 0);
 }
 
+test "STRESS: release must wake a parked waiter promptly (lost-wakeup detector)" {
+    // `acquire`'s own deadline means a lost wakeup can never hang this test —
+    // `futexWaitTimeout` is always bounded by `max_wait_ms`. But that same
+    // deadline is exactly what would HIDE a lost wakeup from a naive test: if
+    // `release` forgets to wake a parked waiter, the waiter still eventually
+    // returns `true` — the slot was freed, and the loop always retries
+    // `tryAcquire` once the futex wait's own timeout elapses — just late, at
+    // (almost) the full `max_wait_ms` instead of promptly. So a lost wakeup
+    // must be caught on TIMING, not on the boolean result: a genuinely woken
+    // waiter returns within a few ms of the release; one that fell through to
+    // the deadline takes close to the whole window. Many short rounds (not
+    // one long one) maximize how often the release lands while the waiter is
+    // actually parked in the futex wait.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const rounds = 30;
+    const max_wait_ms = 300;
+    const release_delay_ms = 10; // gives the waiter time to actually park
+    // A genuine wake returns in low single-digit ms even under scheduler
+    // noise; a lost wakeup falls back to (most of) the full deadline.
+    const slow_threshold_ms = max_wait_ms / 2;
+
+    var slow_wakeups: u32 = 0;
+    var round: u32 = 0;
+    while (round < rounds) : (round += 1) {
+        var th: Throttle = .init(.{
+            .max_in_flight = 1,
+            .max_wait_ms = max_wait_ms,
+            .io = io,
+        });
+        defer th.deinit();
+
+        try testing.expect(th.tryAcquire()); // saturate the only slot
+
+        const Releaser = struct {
+            fn run(t: *Throttle, io_: std.Io) void {
+                sleepMs(io_, release_delay_ms) catch {};
+                t.release();
+            }
+        };
+        const releaser = try std.Thread.spawn(.{}, Releaser.run, .{ &th, io });
+        defer releaser.join();
+
+        const t0 = Clock.monotonic.now();
+        try testing.expect(th.acquire()); // must be woken, not merely outlast the deadline
+        const elapsed_ms = (Clock.monotonic.now() - t0) / std.time.ns_per_ms;
+        th.release(); // on the (already-returned) waiter's behalf
+
+        if (elapsed_ms > slow_threshold_ms) slow_wakeups += 1;
+    }
+
+    // A stray slow round can happen under host scheduling noise; a systemic
+    // lost wakeup makes every round slow (it always falls through to the
+    // deadline) — the threshold catches the systemic case without being
+    // flaky on occasional noise.
+    try testing.expect(slow_wakeups * 2 < rounds); // fewer than half slow
+}
+
 // ── tests: middleware over the socket-free server codec ─────────────────────
 
 const Reader = std.Io.Reader;
