@@ -30,8 +30,10 @@ replay. **Constant-time status**: the `fpr` layer is the reference's
 branchless **integer emulation** of binary64 (`fpr.zig`), so the signing
 hot path runs NO variable-latency FP instruction (`divsd`/`sqrtsd`/`mulsd`)
 on the secret-derived Gram matrix — the earlier native-`f64` timing leak on
-the signing key is closed (a ReleaseFast disassembly of keygen+sign has zero
-scalar-FP instructions). This costs ~5x (host-dependent) on signing vs
+the signing key is closed (a whole-binary `objdump` audit, re-run
+2026-08-05, confirms zero scalar/AVX FP compute instructions reach any
+keygen/signing function — see SPEC.md's Threat model section for the
+methodology and its scope). This costs ~5x (host-dependent) on signing vs
 native f64; that CT tax is accepted and is the security-correct default.
 `gaussian.samplerZ` reproduces the reference's constant-time branch/table
 structure, whose only secret-structured branches are the documented BerExp

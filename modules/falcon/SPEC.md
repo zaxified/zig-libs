@@ -63,9 +63,30 @@ below for the signer/keygen internals and the constant-time caveat). See
   path runs division and sqrt on the SECRET-derived Gram matrix
   (`fft.polyLdlFft`, `ffsampling` leaf sqrt), and hardware `divsd`/`sqrtsd`
   have operand-dependent latency, so native f64 there was a timing side
-  channel on the signing key. A ReleaseFast disassembly of the keygen+sign
-  path now contains ZERO scalar-FP instructions (the only FP in a linked
-  binary is dead `compiler_rt` transcendental code, unreachable from Falcon).
+  channel on the signing key. **Re-verified 2026-08-05** via a one-time
+  `objdump` audit (methodology per `lockfree/SPEC.md`'s disassembly-based
+  lowering check): `zig test src/root.zig -O ReleaseFast --test-no-exec
+  -femit-bin=…` (falcon has zero external deps, so this compiles standalone),
+  then `objdump -d --no-show-raw-insn` over the WHOLE resulting binary,
+  grepped for every scalar AND AVX-encoded (`v`-prefixed) floating-point
+  compute mnemonic (`{,v}{add,sub,mul,div,sqrt,round,ucomis,comis,cvtsi2s,
+  cvts2si}{sd,ss,pd,ps}` and friends). Result: every hit is confined to
+  exactly two functions, `fpr.test."integer emulation matches native
+  IEEE-754 RNE bit-for-bit on random normal doubles"` and `fpr.test."integer
+  emulation: of/rint/floor/trunc agree with native conversions"` — the two
+  tests that INTENTIONALLY cross-check the integer emulation against real
+  hardware FP, exactly as documented below. No keygen or signing function
+  (`fpr.add`/`sign.Signer.signWithRng`/`ffsampling.sampleSignature`/
+  `gaussian.samplerZ`/`ntru.solveNtru` and everything they inline) contains
+  any such instruction. This corrects the previous, unsubstantiated phrasing
+  here ("the only FP in a linked binary is dead `compiler_rt` transcendental
+  code") — the FP that *is* present is live, intentional, test-only code, not
+  dead `compiler_rt`; the substantive claim (the signing/keygen path itself
+  emits none) holds and is now machine-verified rather than asserted. Scope
+  of what this proves: only that no native-latency-variable FP instruction
+  reaches the compiled artifact — it says nothing about `gaussian0`/`berExp`/
+  `sampler`'s branch- or table-index structure, which remains covered by the
+  unchanged "Remaining gate" below.
   The `fpr` emulation flushes subnormal *results* to zero, as the reference
   does; Falcon's signer never enters the subnormal regime (byte-exact KATs
   are the evidence), and the 50k-random-double cross-check tests confine

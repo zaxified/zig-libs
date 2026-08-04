@@ -1810,10 +1810,19 @@ pub fn Ntru(comptime Ring: type) type {
             // Shared u32 pool for all of NTRUSolve; 8n limbs covers the
             // deepest make_fg layout (6n at the top step, offset 2*209)
             // and every solver level (see the per-level layouts above).
+            // `pool`/`rt1`/`rt2`/`rt3` are scratch that carries the secret
+            // (f, g) basis through NTRUSolve's big-integer descent and the
+            // FP Gram-Schmidt norm check; wiped on return. `basis` itself
+            // is NOT wiped here — it is the function's return value (the
+            // actual signing key material the caller still needs).
             var pool: [8 * n + 64]u32 = undefined;
+            defer std.crypto.secureZero(u32, &pool);
             var rt1: [n]f64 = undefined;
+            defer std.crypto.secureZero(f64, &rt1);
             var rt2: [n]f64 = undefined;
+            defer std.crypto.secureZero(f64, &rt2);
             var rt3: [n]f64 = undefined;
+            defer std.crypto.secureZero(f64, &rt3);
             const fg_lim: i32 = @as(i32, 1) << (max_fg_bits[logn] - 1);
 
             outer: while (true) {

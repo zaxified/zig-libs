@@ -144,26 +144,47 @@ pub fn sampleSignature(
     const logn = Ring.logn;
 
     // Per-signature ChaCha PRNG: SHAKE256(seed48) -> 56-byte prng seed.
+    // Every buffer below either carries the per-signature RNG seed/state
+    // or derives directly from the secret NTRU basis (the Gram matrix and
+    // the ffSampling nearest-plane scratch); none of it is the returned
+    // signature candidate itself, so it is wiped on return rather than
+    // left resident on the stack (see the module's secureZero rationale
+    // in `README.md`/`SPEC.md`).
     var seed48: [48]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed48);
     rng.bytes(&seed48);
     var sh = std.crypto.hash.sha3.Shake256.init(.{});
     sh.update(&seed48);
     var pseed: [56]u8 = undefined;
+    defer std.crypto.secureZero(u8, &pseed);
     sh.squeeze(&pseed);
     var prng = gaussian.Prng.init(&pseed);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prng));
 
     var b00: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &b00);
     var b01: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &b01);
     var b10: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &b10);
     var b11: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &b11);
     var g00: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &g00);
     var g01: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &g01);
     var g11: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &g11);
     var t0: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &t0);
     var t1: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &t1);
     var tx: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &tx);
     var ty: [n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &ty);
     var scratch: [4 * n]f64 = undefined;
+    defer std.crypto.secureZero(f64, &scratch);
 
     // Basis B = [[g, -f], [G, -F]] in FFT domain.
     smallToFpr(&b01, &tree.f);

@@ -56,6 +56,28 @@ pub fn Keygen(comptime Ring: type) type {
                 Codec.trimI8Encode(big_f_bits, out[1 + 2 * fg_len ..], &sk.big_f);
                 return out;
             }
+
+            /// Zero the secret NTRU basis (f, g, F, G — both the direct
+            /// fields and the duplicate copy `ffsampling.buildTree` stashed
+            /// in `tree`) in place at end-of-life. Call once the signing
+            /// key is no longer needed (e.g. after persisting
+            /// `toSecretKeyBytes()` to a dedicated secret store) —
+            /// idempotent, safe to call more than once. This struct is the
+            /// caller-owned, long-lived signing key (every `signRandomized`/
+            /// `signDeterministic` call reuses it), so unlike the
+            /// per-signature scratch in `ffsampling.sampleSignature` it is
+            /// never wiped automatically — the caller decides when signing
+            /// is done.
+            pub fn secureZero(sk: *SigningKey) void {
+                std.crypto.secureZero(i8, &sk.f);
+                std.crypto.secureZero(i8, &sk.g);
+                std.crypto.secureZero(i8, &sk.big_f);
+                std.crypto.secureZero(i8, &sk.big_g);
+                std.crypto.secureZero(i8, &sk.tree.f);
+                std.crypto.secureZero(i8, &sk.tree.g);
+                std.crypto.secureZero(i8, &sk.tree.big_f);
+                std.crypto.secureZero(i8, &sk.tree.big_g);
+            }
         };
 
         /// Generate a fresh Falcon key pair. `rng` is the entropy
@@ -122,4 +144,38 @@ test "Keygen(Ring).SigningKey.toSecretKeyBytes round-trips through root.zig's Se
     try std.testing.expectEqualSlices(i8, &sk.f, &decoded.f);
     try std.testing.expectEqualSlices(i8, &sk.g, &decoded.g);
     try std.testing.expectEqualSlices(i8, &sk.big_f, &decoded.big_f);
+}
+
+test "Keygen(Ring).SigningKey.secureZero wipes every secret field, including the tree's duplicate copy" {
+    const poly = @import("poly.zig");
+    const KG = Keygen(poly.Ring512);
+
+    var prng = std.Random.DefaultPrng.init(0x5ec0);
+    const random = prng.random();
+    var sk: KG.SigningKey = undefined;
+    for (&sk.f) |*x| x.* = @intCast(random.intRangeAtMost(i16, -31, 31));
+    for (&sk.g) |*x| x.* = @intCast(random.intRangeAtMost(i16, -31, 31));
+    for (&sk.big_f) |*x| x.* = @intCast(random.intRangeAtMost(i16, -127, 127));
+    for (&sk.big_g) |*x| x.* = @intCast(random.intRangeAtMost(i16, -127, 127));
+    sk.tree = .{ .f = sk.f, .g = sk.g, .big_f = sk.big_f, .big_g = sk.big_g };
+
+    // Sanity: not already all-zero (the random draw would have to be the
+    // all-zero vector, astronomically unlikely with this seed/range).
+    try std.testing.expect(!std.mem.allEqual(i8, &sk.f, 0));
+    try std.testing.expect(!std.mem.allEqual(i8, &sk.tree.big_g, 0));
+
+    sk.secureZero();
+
+    try std.testing.expect(std.mem.allEqual(i8, &sk.f, 0));
+    try std.testing.expect(std.mem.allEqual(i8, &sk.g, 0));
+    try std.testing.expect(std.mem.allEqual(i8, &sk.big_f, 0));
+    try std.testing.expect(std.mem.allEqual(i8, &sk.big_g, 0));
+    try std.testing.expect(std.mem.allEqual(i8, &sk.tree.f, 0));
+    try std.testing.expect(std.mem.allEqual(i8, &sk.tree.g, 0));
+    try std.testing.expect(std.mem.allEqual(i8, &sk.tree.big_f, 0));
+    try std.testing.expect(std.mem.allEqual(i8, &sk.tree.big_g, 0));
+
+    // Idempotent — calling again on already-zeroed fields must not error
+    // or panic.
+    sk.secureZero();
 }
