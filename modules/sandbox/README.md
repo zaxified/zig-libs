@@ -82,6 +82,16 @@ try sandbox.seccomp.install(prog);       // needs noNewPrivs() first
 const custom = [_]std.os.linux.SYS{ .read, .write, .close, .exit_group };
 const p2 = try sandbox.seccomp.build(gpa, &custom, .{ .errno = 1 }); // EPERM
 defer gpa.free(p2);
+
+// W^X preset: layer an argument check onto mmap/mprotect/pkey_mprotect that
+// denies PROT_WRITE|PROT_EXEC together, independent of the plain allow-list.
+const wx = try sandbox.seccomp.buildDefaultWx(gpa, .kill_process, .{ .errno = 1 });
+defer gpa.free(wx);
+try sandbox.seccomp.install(wx);
+
+// Already multi-threaded at hardening time? install() only filters the
+// calling thread — use the seccomp(2)+TSYNC form to cover every thread.
+try sandbox.seccomp.installTsync(prog);
 ```
 
 ### Landlock access rights
@@ -102,6 +112,32 @@ Too tight bricks the process; too loose defeats the sandbox. The filter always
 guards `seccomp_data.arch` first so a foreign ABI (e.g. x86-64's x32) can't slip
 past a number-only allow-list.
 
+### seccomp W^X preset
+
+`seccomp.buildWx` / `buildDefaultWx` layer an argument check onto `mmap`,
+`mprotect` and `pkey_mprotect` (when present in the arch's `linux.SYS`): if a
+call requests `PROT_WRITE` **and** `PROT_EXEC` together, it is denied via a
+separate `wx_action`, independent of the plain `on_deny` used for syscalls
+that aren't allow-listed at all — the same way an arch mismatch is always
+`KILL_PROCESS` regardless of the caller's chosen deny action. The check is a
+bitmask test (`prot & (WRITE|EXEC) == (WRITE|EXEC)`), not an equality, so
+`READ|WRITE|EXEC` doesn't slip past it, and both 32-bit halves of the 64-bit
+argument register are inspected (a non-zero high half is a violation too) —
+a filter that only ever looks at the low half is checking a different value
+than the kernel will actually see if a raw syscall (bypassing libc's normal
+int-argument zero-extension) puts something in the upper 32 bits.
+
+### seccomp(2) + TSYNC
+
+`seccomp.installTsync` installs a program via the `seccomp(2)` syscall with
+`SECCOMP_FILTER_FLAG_TSYNC` instead of `prctl(PR_SET_SECCOMP)`, applying it to
+every thread of the calling process in one atomic step — `install()`'s prctl
+form only ever filters the calling thread, so a worker spawned before
+hardening runs stays unfiltered. `TSYNC`'s failure mode is unusual: on a
+thread-sync failure the raw return value is the tid of the first thread that
+couldn't sync, not a negated errno, so `installTsync` distinguishes
+`error.ThreadSyncFailed` from a plain `error.SeccompFailed`.
+
 ## Testing
 
 The real enforcement tests **fork a child**, apply the restriction, attempt the
@@ -116,7 +152,17 @@ zig build test-sandbox -Doptimize=ReleaseFast
 
 - **seccomp** — a child installs a filter that omits `getpid`; with
   `.kill_process` the child dies of `SIGSYS`, with `.{ .errno = EPERM }` the
-  call returns `-EPERM`; the control child (getpid allowed) runs fine.
+  call returns `-EPERM`; the control child (getpid allowed) runs fine. The
+  same KILL/ERRNO shape is re-verified through `installTsync` (the
+  `seccomp(2)` path, not `prctl`), plus a dedicated test that spawns a worker
+  thread *before* installing the filter and confirms the `TSYNC` sync reaches
+  it too (the worker's own denied syscall brings down the whole process,
+  which `install()`'s prctl form could never do).
+- **seccomp W^X** — a child installs `buildWx`; `mprotect(RW)` and
+  `mmap(RW)` still succeed, `mprotect(RWX)` / `mmap(RWX)` are denied, and a
+  raw syscall with a crafted non-zero high word on an otherwise-safe `prot`
+  value is denied too (proving the 64-bit argument check, not just the low
+  word, is active).
 - **Landlock** — a child restricted to a temp dir cannot open `/etc/passwd`
   but can still read the allowed file. Skips on a pre-5.13 kernel.
 - **rlimit** — a child caps `RLIMIT_NOFILE`, exhausts it (EMFILE at the cap),
@@ -130,11 +176,11 @@ sudo zig build test-sandbox                     # adds the priv-drop tests
 
 ## Deferred (v2)
 
-- seccomp **argument** filtering (match on `seccomp_data.arg*`, not just `nr`) —
-  e.g. allow `socket(AF_INET)` but deny `AF_PACKET`.
-- The `seccomp(2)` syscall form with `TSYNC` to apply a filter across all
-  threads of an already-multi-threaded process (the prctl form here filters the
-  calling thread; install before spawning workers).
+- seccomp **argument** filtering beyond the W^X preset — e.g. allow
+  `socket(AF_INET)` but deny `AF_PACKET`, or gate `ioctl` requests. The W^X
+  preset (`buildWx`/`buildDefaultWx`) and `seccomp(2)`+`TSYNC`
+  (`installTsync`) are both built; general-purpose arg matching on arbitrary
+  syscalls/argument indices is not.
 - Landlock **network** rules (`LANDLOCK_RULE_NET_PORT`, ABI 4+) and the
   scoped-abstraction rules (ABI 6+).
 - Remains Linux-only — the documented ceiling (no OpenBSD `pledge`/`unveil`,

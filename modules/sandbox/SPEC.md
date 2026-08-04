@@ -43,6 +43,30 @@ citation lives here:
   that). The default allow-list is comptime-filtered by `@hasField(linux.SYS, name)` so it stays
   valid on any arch. `sock_filter` is asserted 8 bytes; `landlock_path_beneath_attr` asserted 12
   (packed u64+s32) so the byte layout matches the kernel's `copy_from_user`.
+- **The W^X preset (`seccomp.buildWx`/`buildDefaultWx`) adds argument-checked blocks, not a
+  different filter shape.** For each of `{mmap, mprotect, pkey_mprotect}` present in the allow-list,
+  a self-contained 9-instruction block sits ahead of the plain nr dispatch: reload `nr`, compare to
+  this syscall (local jump, skip the block on mismatch), load the high 32 bits of `arg2` (`prot`) and
+  deny if non-zero, load the low 32 bits, `AND` with `PROT_WRITE|PROT_EXEC`, and deny if the result
+  equals the mask (both bits set) — otherwise `ALLOW` directly. Every jump inside a block is a small
+  local offset (0/1/3/7), so blocks don't need to know the program's total length or each other's
+  position, unlike the plain dispatch chain (which needs the overall count for its descending `jt`).
+  Two things a naive version gets wrong: comparing `prot == (WRITE|EXEC)` instead of a masked AND
+  (misses `READ|WRITE|EXEC`), and inspecting only the low 32-bit half of the 64-bit `arg2` register
+  (a raw syscall bypassing libc's int zero-extension can put anything in the high half, so a
+  low-word-only filter is checking a different value than what actually reaches the kernel — a
+  non-zero high word is treated as a violation here, not ignored). `PROT_WRITE`/`PROT_EXEC` are
+  hardcoded (`0x2`/`0x4`, `mman-common.h`, identical on every Linux arch) rather than taken from
+  std's `linux.PROT`, whose packed-struct field layout isn't a byte-order-independent value to
+  compare inside a BPF program.
+- **`seccomp.installTsync` uses the `seccomp(2)` syscall (not `prctl`) with `SECCOMP_FILTER_FLAG_TSYNC`**
+  to apply a filter to every thread of the process atomically, for the case where hardening happens
+  after workers already exist (`install()`'s prctl form only ever touches the calling thread).
+  `TSYNC`'s failure convention is the trap: on a thread-sync failure the raw return value is the
+  *positive tid* of the first thread that failed to sync — not a negated errno — so reusing
+  `install()`'s `linux.errno(rc) != .SUCCESS` check here would silently read that as success (a
+  positive value decodes to `.SUCCESS` under `linux.errno`'s `(-4096, 0)` window). `installTsync`
+  checks for this explicitly and reports `error.ThreadSyncFailed` rather than `error.SeccompFailed`.
 - **Landlock degrades, never faults, on old kernels.** The ABI version is queried first
   (`landlock_create_ruleset(NULL,0,VERSION)`); the handled-access mask and each rule's allowed-access
   are intersected with the bits that ABI understands, so passing a newer access bit to an older
@@ -66,13 +90,14 @@ aggressively bricks the process (fail-closed) rather than silently leaving it op
 concern is a filter that is too *loose* (defeats the purpose) far more than one too tight. The
 default seccomp allow-list is explicitly a **starting point** to be profiled and tuned per binary,
 not a vetted policy for any given program; shipping it unmodified can either break a program that
-uses a syscall it omits or leave reachable a syscall it includes. seccomp here filters on the
-syscall *number* only — argument filtering (e.g. restricting `socket` address families,
-`ioctl` requests, `mmap` PROT_EXEC) is deferred, so a number-level allow of `ioctl`/`mmap`/`socket`
-still admits every variant. Landlock covers the filesystem (and, when built out, network ports); it
-does not restrict already-open fds, IPC, or ptrace — pair it with seccomp + a namespace for those.
-Out of scope: seccomp arg matching, the `seccomp(2)` TSYNC form, Landlock net/scoped rules, BSD
-sandboxing.
+uses a syscall it omits or leave reachable a syscall it includes. The plain `build`/`install` path
+filters on the syscall *number* only — argument filtering beyond the W^X preset (e.g. restricting
+`socket` address families or `ioctl` requests) is deferred, so a number-level allow of
+`ioctl`/`socket` still admits every variant; `mmap`/`mprotect`/`pkey_mprotect` get the one argument
+check this module ships (`buildWx`/`buildDefaultWx`, PROT_WRITE|PROT_EXEC). Landlock covers the
+filesystem (and, when built out, network ports); it does not restrict already-open fds, IPC, or
+ptrace — pair it with seccomp + a namespace for those. Out of scope: general seccomp arg matching
+(non-PROT), Landlock net/scoped rules, BSD sandboxing.
 
 ## Verification
 
@@ -80,21 +105,27 @@ The enforcement tests **fork a child**, apply one restriction, attempt the forbi
 assert the child terminates exactly as configured, with a control child (no restriction) succeeding —
 the only honest way to test a security boundary; a pure unit test would prove nothing about the
 kernel actually enforcing it. Unprivileged and always-run: seccomp (KILL child dies of `SIGSYS`,
-ERRNO child sees `-EPERM`, control survives), Landlock (child confined to a temp dir is denied
-`/etc/passwd`, allowed its own file — skips pre-5.13), rlimit (`RLIMIT_NOFILE` bites at the cap with
-EMFILE and cannot be raised back; `RLIMIT_CORE=0`). Root-gated + `SkipZigTest` otherwise: privilege
-drop (drops to `nobody`, asserts `setuid(0)` fails) and capability bounding-set drop. Pure/logic
-tests cover the BPF program shape (arch guard + per-syscall compare + allow/deny leaves + descending
-`jt`), struct ABI sizes, and the monotone Landlock access mask. Run: `zig build test-sandbox`
-(add `-Doptimize=ReleaseFast` for the release check; `sudo` prefix to also exercise the two
-root-gated tests).
+ERRNO child sees `-EPERM`, control survives), the same KILL/ERRNO shape re-verified through
+`installTsync`'s `seccomp(2)` path, a cross-thread test that spawns a worker *before* installing
+(via `installTsync`) and confirms the worker's own denied syscall brings the whole process down
+(proof `TSYNC` actually reached a thread that never called into seccomp itself — `install()`'s
+prctl form cannot do this), the W^X preset (RW `mprotect`/`mmap` still succeed; RWX denied; a raw
+syscall with a crafted non-zero high word on the `prot` argument is denied too, proving the 64-bit
+argument check and not just its low half is active), Landlock (child confined to a temp dir is
+denied `/etc/passwd`, allowed its own file — skips pre-5.13), rlimit (`RLIMIT_NOFILE` bites at the
+cap with EMFILE and cannot be raised back; `RLIMIT_CORE=0`). Root-gated + `SkipZigTest` otherwise:
+privilege drop (drops to `nobody`, asserts `setuid(0)` fails) and capability bounding-set drop.
+Pure/logic tests cover the BPF program shape (arch guard + per-syscall compare + allow/deny leaves +
+descending `jt`), struct ABI sizes, and the monotone Landlock access mask. Run:
+`zig build test-sandbox` (add `-Doptimize=ReleaseFast` for the release check; `sudo` prefix to also
+exercise the two root-gated tests).
 
 ## Backlog / deferred
 
-- **seccomp argument filtering** — match on `seccomp_data.arg*`, two loads per 64-bit arg; lets an
-  allow-list gate `socket` families, `ioctl` requests, `mmap` PROT_EXEC. Not built.
-- **`seccomp(2)` SET_MODE_FILTER + `TSYNC`** — apply across all threads of an already-multi-threaded
-  process; the prctl form filters the calling thread only. Not built.
+- **General seccomp argument filtering** — match on `seccomp_data.arg*` for arbitrary
+  syscalls/argument indices (e.g. gate `socket` families, `ioctl` requests). The one instance built
+  so far is the W^X preset (`buildWx`/`buildDefaultWx`, PROT_WRITE|PROT_EXEC on
+  mmap/mprotect/pkey_mprotect) — a general-purpose arg-rule builder for other syscalls is not.
 - **Landlock network + scoped rules** — `LANDLOCK_RULE_NET_PORT` (ABI 4), scoped-abstraction (ABI 6).
 - **Remains Linux-only** — the documented ceiling (no `pledge`/Capsicum) is permanent, not a gap.
 

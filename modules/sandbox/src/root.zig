@@ -428,6 +428,7 @@ const SockFprog = extern struct {
 pub const bpf = struct {
     // class
     pub const ld: u16 = 0x00; // load into accumulator
+    pub const alu: u16 = 0x04; // arithmetic/logic on the accumulator
     pub const jmp: u16 = 0x05; // conditional jump
     pub const ret: u16 = 0x06; // return an action
     // load size / mode
@@ -436,6 +437,8 @@ pub const bpf = struct {
     // jump op / source
     pub const jeq: u16 = 0x10; // A == k
     pub const k: u16 = 0x00; // constant operand
+    // ALU op
+    pub const and_: u16 = 0x50; // A = A & k
 
     pub fn stmt(code: u16, imm: u32) SockFilter {
         return .{ .code = code, .jt = 0, .jf = 0, .k = imm };
@@ -485,6 +488,21 @@ pub const seccomp = struct {
     // seccomp_data field offsets — the "packet" the filter inspects.
     const off_nr = @offsetOf(linux.SECCOMP.data, "nr");
     const off_arch = @offsetOf(linux.SECCOMP.data, "arch");
+
+    /// Low/high 32-bit half of a 64-bit `seccomp_data.argN` field, endian-
+    /// aware: classic BPF only has 32-bit loads, so a 64-bit syscall argument
+    /// needs two `ld [k]` instructions, and which half is "low" swaps on a
+    /// big-endian target (this module's arch table includes s390x). See
+    /// `std.os.linux.SECCOMP`'s doc comment for the same point made against
+    /// OpenSSH's filter.
+    fn argHalves(comptime field: []const u8) struct { lo: u32, hi: u32 } {
+        const base = @offsetOf(linux.SECCOMP.data, field);
+        return switch (builtin.cpu.arch.endian()) {
+            .little => .{ .lo = base, .hi = base + 4 },
+            .big => .{ .lo = base + 4, .hi = base },
+        };
+    }
+    const arg2 = argHalves("arg2"); // mmap/mprotect/pkey_mprotect: (ptr, len, prot, ...)
 
     // Return-action words (UAPI SECCOMP_RET_*).
     const ret_allow = linux.SECCOMP.RET.ALLOW;
@@ -566,10 +584,10 @@ pub const seccomp = struct {
 
     /// Install a built program with `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`.
     /// Requires `noNewPrivs()` to have run first (or CAP_SYS_ADMIN). Irreversible
-    /// and inherited across fork/execve. The equivalent `seccomp(2)` syscall
-    /// (SET_MODE_FILTER) exists for TSYNC across threads; the prctl form used
-    /// here filters the calling thread, which is what a single-threaded startup
-    /// path wants.
+    /// and inherited across fork/execve. This form only filters the calling
+    /// thread — exactly what a single-threaded startup path wants, but a
+    /// no-op for any worker thread already running. See `installTsync` for
+    /// the `seccomp(2)` + `TSYNC` form that also covers those.
     pub fn install(prog: []const SockFilter) InstallError!void {
         if (prog.len == 0 or prog.len > std.math.maxInt(u16)) return error.SeccompFailed;
         const fprog = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
@@ -581,6 +599,47 @@ pub const seccomp = struct {
             0,
         );
         if (linux.errno(rc) != .SUCCESS) return error.SeccompFailed;
+    }
+
+    pub const TsyncError = error{
+        /// `seccomp(2)` failed outright — decoded as a normal negative errno
+        /// (bad program, no `PR_SET_NO_NEW_PRIVS`/`CAP_SYS_ADMIN`, kernel
+        /// lacks `CONFIG_SECCOMP_FILTER`, and so on).
+        SeccompFailed,
+        /// `TSYNC` could not synchronize the filter onto every thread of the
+        /// process. Per `seccomp(2)`, on *this specific* failure the return
+        /// value is not a negated errno at all — it is the positive tid of
+        /// the first thread the sync failed for (typically because that
+        /// thread hasn't set `no_new_privs` and the process lacks
+        /// `CAP_SYS_ADMIN`). `linux.errno()` only decodes values in
+        /// `(-4096, 0)` as an error, so a positive tid reads as `.SUCCESS` to
+        /// a caller that reuses `install`'s plain error check — that
+        /// mis-check is exactly the bug this variant exists to prevent.
+        ThreadSyncFailed,
+    };
+
+    /// Install `prog` via the `seccomp(2)` syscall (not `prctl`) with
+    /// `SECCOMP_FILTER_FLAG_TSYNC`, applying it to every thread of the
+    /// calling process — not just the caller — in one atomic step. Use this
+    /// instead of `install()` once the process is already multi-threaded by
+    /// the time it hardens; `install()`'s prctl form only ever affects the
+    /// calling thread, leaving any worker spawned earlier unfiltered. Every
+    /// thread still needs `PR_SET_NO_NEW_PRIVS` set (do it before spawning
+    /// workers) or `CAP_SYS_ADMIN`, or the sync fails for that thread.
+    pub fn installTsync(prog: []const SockFilter) TsyncError!void {
+        if (prog.len == 0 or prog.len > std.math.maxInt(u16)) return error.SeccompFailed;
+        const fprog = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
+        const rc = linux.syscall3(
+            .seccomp,
+            linux.SECCOMP.SET_MODE_FILTER,
+            linux.SECCOMP.FILTER_FLAG.TSYNC,
+            @intFromPtr(&fprog),
+        );
+        if (linux.errno(rc) != .SUCCESS) return error.SeccompFailed;
+        // See ThreadSyncFailed: a nonzero-but-not-decoded-as-errno return
+        // here is the tid of the first thread whose sync failed, not proof
+        // of success.
+        if (rc != 0) return error.ThreadSyncFailed;
     }
 
     /// Candidate syscall names for a generic non-blocking network server's hot
@@ -642,6 +701,136 @@ pub const seccomp = struct {
     /// Build the default allow-list program. Caller owns + frees the slice.
     pub fn buildDefault(gpa: Allocator, on_deny: Action) BuildError![]SockFilter {
         return build(gpa, default_allowlist, on_deny);
+    }
+
+    // ── W^X preset (argument-filtered mmap/mprotect/pkey_mprotect) ──────────
+
+    /// `PROT_WRITE` / `PROT_EXEC` (UAPI `mman-common.h`). Identical bit values
+    /// on every Linux arch — like the `prctl`/`seccomp` constants already
+    /// hardcoded in this file, these are clean-room from the merger-doctrine
+    /// UAPI, not std's per-arch `linux.PROT` packed-struct shape (whose field
+    /// order isn't a stable ABI contract to lean on inside a BPF program).
+    const prot_write: u32 = 0x2;
+    const prot_exec: u32 = 0x4;
+    const prot_write_exec: u32 = prot_write | prot_exec;
+
+    /// A syscall the W^X preset gives an extra check to: mmap/mprotect/
+    /// pkey_mprotect all share the shape `(ptr, len, int prot, ...)`, so
+    /// their protection flags sit at `arg2` on every arch.
+    const WxRule = struct { sysno: linux.SYS, mask: u32 };
+
+    const wx_names = [_][:0]const u8{ "mmap", "mprotect", "pkey_mprotect" };
+
+    /// W^X-guarded syscalls present on this arch's `linux.SYS`
+    /// (`pkey_mprotect`, Linux 4.9+, isn't modelled for every arch), built the
+    /// same comptime-filtered way as `default_allowlist`.
+    const wx_arg_rules: []const WxRule = blk: {
+        var arr: [wx_names.len]WxRule = undefined;
+        var n: usize = 0;
+        for (wx_names) |name| {
+            if (@hasField(linux.SYS, name)) {
+                arr[n] = .{ .sysno = @field(linux.SYS, name), .mask = prot_write_exec };
+                n += 1;
+            }
+        }
+        const final = arr[0..n].*;
+        break :blk &final;
+    };
+
+    fn containsSyscall(list: []const linux.SYS, needle: linux.SYS) bool {
+        for (list) |s| if (s == needle) return true;
+        return false;
+    }
+
+    /// Build an allow-list program identical in shape to `build`, except that
+    /// any of `{mmap, mprotect, pkey_mprotect}` present in `allowed` gets an
+    /// extra, self-contained argument check on its `prot` (`arg2`) *before*
+    /// the plain nr dispatch below ever sees it: if `PROT_WRITE` and
+    /// `PROT_EXEC` are BOTH set, the call is denied via `wx_action` —
+    /// independent of `on_deny`, the same way an arch mismatch is always
+    /// `KILL_PROCESS` regardless of the caller's chosen deny action, because
+    /// W^X is a hard invariant here, not a soft "missed the allow-list" case.
+    /// A syscall not in `allowed` at all gets no special treatment — it falls
+    /// through to the plain deny leaf like any other unlisted nr, exactly as
+    /// in `build`.
+    ///
+    /// Two correctness points that are easy to get wrong in a BPF W^X filter:
+    ///  - The check is a **bitmask test**, not an equality: `prot ==
+    ///    (WRITE|EXEC)` would miss `READ|WRITE|EXEC`. `(prot & (WRITE|EXEC))
+    ///    == (WRITE|EXEC)` catches the combination regardless of what other
+    ///    bits ride along (implemented as an ALU `AND` then a `JEQ`).
+    ///  - `prot` is a 64-bit seccomp argument register but classic BPF only
+    ///    compares 32-bit words, so both halves are checked: the low 32 bits
+    ///    against the mask, and the high 32 bits against zero. PROT_* flags
+    ///    fit in the low word, but a raw syscall (bypassing libc's normal
+    ///    int-argument zero-extension) can put anything in the high half of
+    ///    the register the kernel reads as `prot`; a filter that inspects
+    ///    only the low word is checking a different, attacker-controlled
+    ///    64-bit value than the one it thinks it is. A non-zero high word is
+    ///    treated as a violation here (fail closed), never silently ignored.
+    pub fn buildWx(gpa: Allocator, allowed: []const linux.SYS, on_deny: Action, wx_action: Action) BuildError![]SockFilter {
+        if (allowed.len > 255) return error.TooManySyscalls;
+        const m: u8 = @intCast(allowed.len);
+
+        var list: std.ArrayList(SockFilter) = .empty;
+        errdefer list.deinit(gpa);
+
+        // Arch check (identical to `build`).
+        try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_arch));
+        try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, audit_arch, 1, 0));
+        try list.append(gpa, bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
+
+        // One self-contained 9-instruction block per W^X-guarded syscall
+        // that is actually in `allowed`. Every jump inside a block is a
+        // LOCAL offset (0, 1, 3 or 7 instructions ahead), so blocks compose
+        // without knowing the total program length or each other's
+        // position — unlike the plain nr chain below, which needs the
+        // overall count to compute descending jt offsets.
+        //
+        //   ld  nr
+        //   jeq this_sysno  jt=0 jf=7   ; no match -> skip the whole block
+        //   ld  arg2_hi
+        //   jeq 0           jt=0 jf=3   ; hi != 0 -> violation, deny
+        //   ld  arg2_lo
+        //   and mask
+        //   jeq mask        jt=0 jf=1   ; masked bits all set -> violation
+        //   ret wx_action                ; violation leaf
+        //   ret ALLOW                    ; clean leaf
+        for (wx_arg_rules) |rule| {
+            if (!containsSyscall(allowed, rule.sysno)) continue;
+            const nr: u32 = @intCast(@intFromEnum(rule.sysno));
+
+            try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+            try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nr, 0, 7));
+            try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, arg2.hi));
+            try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, 0, 0, 3));
+            try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, arg2.lo));
+            try list.append(gpa, bpf.stmt(bpf.alu | bpf.and_ | bpf.k, rule.mask));
+            try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, rule.mask, 0, 1));
+            try list.append(gpa, bpf.stmt(bpf.ret | bpf.k, actionWord(wx_action)));
+            try list.append(gpa, bpf.stmt(bpf.ret | bpf.k, ret_allow));
+        }
+
+        // Plain nr dispatch — identical to `build`. A wx-guarded syscall
+        // whose block above matched already RET'd and never reaches here; a
+        // non-wx-guarded syscall, or one whose block was skipped because its
+        // nr didn't match, is handled exactly as in the non-wx `build`.
+        try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+        for (allowed, 0..) |sysno, j| {
+            const jt: u8 = @intCast(m - @as(u8, @intCast(j)));
+            const nr: u32 = @intCast(@intFromEnum(sysno));
+            try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nr, jt, 0));
+        }
+        try list.append(gpa, bpf.stmt(bpf.ret | bpf.k, actionWord(on_deny)));
+        try list.append(gpa, bpf.stmt(bpf.ret | bpf.k, ret_allow));
+
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// `buildWx` over `default_allowlist` — the network-server preset with a
+    /// W^X guard on mmap/mprotect/pkey_mprotect layered in.
+    pub fn buildDefaultWx(gpa: Allocator, on_deny: Action, wx_action: Action) BuildError![]SockFilter {
+        return buildWx(gpa, default_allowlist, on_deny, wx_action);
     }
 };
 
@@ -803,6 +992,156 @@ test "seccomp ERRNO: denied syscall returns -EPERM instead of dying" {
     const res = try runInChild(childSeccompErrno);
     if (res.exitedWith(102)) return error.SkipZigTest; // no seccomp filter support
     try testing.expect(res.exitedWith(0)); // getpid saw EPERM, not a signal
+}
+
+// ── real: seccomp W^X preset (fork children) ─────────────────────────────────
+
+var g_wx_prog: []const SockFilter = &.{};
+
+fn childWx() void {
+    // A valid RW page, mapped BEFORE the filter goes on, reused by every
+    // check below (mmap is itself W^X-guarded too, but PROT_READ|PROT_WRITE
+    // never trips the guard).
+    const len: usize = 4096;
+    const map_rc = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (linux.errno(map_rc) != .SUCCESS) linux.exit(110);
+    const addr: [*]u8 = @ptrFromInt(map_rc);
+
+    noNewPrivs() catch linux.exit(101);
+    seccomp.install(g_wx_prog) catch linux.exit(102);
+
+    // 1. Safe combo (no EXEC) must still work.
+    if (linux.errno(linux.mprotect(addr, len, .{ .READ = true, .WRITE = true })) != .SUCCESS) linux.exit(30);
+
+    // 2. The actual W^X violation must be denied by our guard: EPERM (our
+    //    configured wx_action), not a SIGSYS/crash — so it's distinguishable
+    //    from the process just dying for some unrelated reason.
+    const bad_rc = linux.mprotect(addr, len, .{ .READ = true, .WRITE = true, .EXEC = true });
+    if (linux.errno(bad_rc) != .PERM) linux.exit(31);
+
+    // 3. A crafted prot register whose LOW 32 bits alone are just PROT_READ
+    //    (would sail past a naive low-word-only AND-mask check) but whose
+    //    HIGH 32 bits are non-zero must ALSO be denied by our filter, not
+    //    reach the real kernel mprotect (which would answer EINVAL for an
+    //    unrecognized prot value, not our EPERM) — proves the hi-word
+    //    compare is load-bearing, not decorative.
+    const crafted: usize = (@as(usize, 1) << 32) | @as(usize, 1); // hi=1, lo=PROT_READ
+    const crafted_rc = linux.syscall3(.mprotect, @intFromPtr(addr), len, crafted);
+    if (linux.errno(crafted_rc) != .PERM) linux.exit(32);
+
+    // 4. mmap's own guard: requesting an executable+writable mapping
+    //    directly must also be denied (both mmap and mprotect share it).
+    const bad_mmap_rc = linux.mmap(null, len, .{ .READ = true, .WRITE = true, .EXEC = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (linux.errno(bad_mmap_rc) != .PERM) linux.exit(33);
+
+    linux.exit(0);
+}
+
+test "seccomp W^X guard: RW mprotect/mmap allowed, RWX and crafted hi-word denied" {
+    const allowed = [_]linux.SYS{ .exit, .exit_group, .mmap, .mprotect };
+    g_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @intFromEnum(E.PERM) });
+    defer testing.allocator.free(g_wx_prog);
+
+    const res = try runInChild(childWx);
+    if (res.exitedWith(102)) return error.SkipZigTest; // kernel lacks CONFIG_SECCOMP_FILTER
+    try testing.expect(res.exitedWith(0));
+}
+
+// ── real: seccomp(2) + TSYNC (fork children, incl. cross-thread) ────────────
+
+var g_tsync_kill_prog: []const SockFilter = &.{};
+var g_tsync_allow_prog: []const SockFilter = &.{};
+
+fn childTsyncKill() void {
+    noNewPrivs() catch linux.exit(101);
+    seccomp.installTsync(g_tsync_kill_prog) catch |e| switch (e) {
+        error.SeccompFailed => linux.exit(102),
+        error.ThreadSyncFailed => linux.exit(103),
+    };
+    _ = linux.getpid(); // not on the list → SIGSYS kills the process
+    linux.exit(0); // unreachable if the filter works
+}
+
+fn childTsyncControl() void {
+    noNewPrivs() catch linux.exit(101);
+    seccomp.installTsync(g_tsync_allow_prog) catch |e| switch (e) {
+        error.SeccompFailed => linux.exit(102),
+        error.ThreadSyncFailed => linux.exit(103),
+    };
+    _ = linux.getpid(); // allowed → runs fine
+    linux.exit(7);
+}
+
+test "seccomp(2)+TSYNC: denied syscall kills the child; control survives (single thread)" {
+    g_tsync_kill_prog = try seccomp.build(testing.allocator, &seccomp_min_no_getpid, .kill_process);
+    defer testing.allocator.free(g_tsync_kill_prog);
+    g_tsync_allow_prog = try seccomp.build(testing.allocator, &seccomp_min_with_getpid, .kill_process);
+    defer testing.allocator.free(g_tsync_allow_prog);
+
+    const killed = try runInChild(childTsyncKill);
+    if (killed.exitedWith(102) or killed.exitedWith(103)) return error.SkipZigTest; // no seccomp(2)/TSYNC
+    try testing.expect(killed.killedBy(.SYS));
+
+    const control = try runInChild(childTsyncControl);
+    try testing.expect(control.exitedWith(7));
+}
+
+// The real point of TSYNC: a filter installed on the MAIN thread must also
+// reach a WORKER thread that was already running beforehand — the prctl form
+// (`install`) provably does not (it only ever touches the calling thread).
+// Allow-list needed for the harness itself to keep working *after* install:
+// futex + munmap (std.Thread.join's internals) and nanosleep (our busy-wait).
+// getpid is the one deliberately denied call.
+const tsync_prop_allowed = [_]linux.SYS{ .exit, .exit_group, .futex, .munmap, .nanosleep };
+var g_tsync_prop_prog: []const SockFilter = &.{};
+
+fn tsyncWorker(ready: *std.atomic.Value(bool), release: *std.atomic.Value(bool)) void {
+    ready.store(true, .release);
+    while (!release.load(.acquire)) {
+        var ts = linux.timespec{ .sec = 0, .nsec = 1_000_000 }; // 1ms
+        _ = linux.nanosleep(&ts, null);
+    }
+    _ = linux.getpid(); // denied by the filter installed on the MAIN thread
+    // Only reached if TSYNC failed to propagate to this thread.
+    linux.exit(1);
+}
+
+fn childTsyncPropagation() void {
+    // Watchdog: if the join/propagation logic below ever wedges, self-
+    // terminate rather than hang the test runner's waitpid forever.
+    _ = linux.syscall1(.alarm, 5);
+
+    var ready = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    const worker = std.Thread.spawn(.{}, tsyncWorker, .{ &ready, &release }) catch linux.exit(120);
+
+    while (!ready.load(.acquire)) {
+        var ts = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    noNewPrivs() catch linux.exit(101);
+    // KILL_PROCESS + TSYNC: if the sync reaches the worker, its getpid()
+    // below brings down the WHOLE process (not just that one thread) — an
+    // unambiguous, race-free signal that doesn't depend on cross-thread
+    // messaging surviving the kill.
+    seccomp.installTsync(g_tsync_prop_prog) catch |e| switch (e) {
+        error.SeccompFailed => linux.exit(102),
+        error.ThreadSyncFailed => linux.exit(103),
+    };
+    release.store(true, .release);
+    worker.join(); // only returns if the worker survived getpid() (no propagation)
+    linux.exit(55); // reached only when TSYNC did NOT propagate to the worker
+}
+
+test "seccomp(2)+TSYNC: filter installed on main thread also kills a pre-existing worker thread" {
+    g_tsync_prop_prog = try seccomp.build(testing.allocator, &tsync_prop_allowed, .kill_process);
+    defer testing.allocator.free(g_tsync_prop_prog);
+
+    const res = try runInChild(childTsyncPropagation);
+    if (res.exitedWith(102) or res.exitedWith(103)) return error.SkipZigTest; // no seccomp(2)/TSYNC
+    if (res.exitedWith(120)) return error.SkipZigTest; // couldn't even spawn a thread here
+    try testing.expect(res.killedBy(.SYS)); // TSYNC propagated: whole process died
 }
 
 // ── real: landlock (fork children) ───────────────────────────────────────────
