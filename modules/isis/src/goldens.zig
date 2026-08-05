@@ -601,3 +601,111 @@ test "encode(decode(golden)) == golden for both PDUs (structural round-trip)" {
         try testing.expectEqualSlices(u8, &golden_l1_lsp, b.finish());
     }
 }
+
+// ── Golden 8: L2 CSNP (PDU type 25) — the L2 type code, untested above ──────
+//
+// ANCHOR-TASKS.tsv remnant on this row: goldens 4/5 above drove the CSNP/PSNP
+// builders only with `is_l2 = false` (type codes 24/26). The body layout is
+// shared between L1 and L2 (only the PDU-type octet differs), but that
+// specific byte was never itself fed to an independent dissector. This golden
+// drives `CsnpBuilder` with `is_l2 = true` (type 25) — same field values as
+// golden 4 otherwise, so the L2 type code is the only variable.
+//
+// Command:
+//   scripts/dissect.py --frame llc --fields '83210106190100030033000000000001
+//   000000000000000000ffffffffffffffff091004ae0000000000010000000000051234'
+//
+// Wireshark printed (verbatim, trimmed to the load-bearing lines):
+//   frame.protocols == "eth:llc:osi:isis:isis.csnp" (full CSNP dissection, not
+//     a generic/"data" fallback)
+//   isis.type == 25 = ...1 1001 = PDU Type: L2 CSNP (25)
+//   isis.csnp.pdu_length == 51 = PDU length: 51
+//   isis.csnp.source_id == 0000.0000.0001 = Source-ID
+//   isis.csnp.start_lsp_id == 0000.0000.0000.00-00 = Start LSP-ID
+//   isis.csnp.end_lsp_id == ffff.ffff.ffff.ff-ff = End LSP-ID
+//   frame[50:18] == 09:10:... = LSP entries (t=9, l=16)
+//   isis.csnp.lsp_seq_num == 0x00000005
+//   isis.csnp.lsp_remain_life == 1198
+//   isis.csnp.lsp_checksum == 0x1234
+//   isis.csnp.lsp_id == 0000.0000.0001.00-00
+const golden_csnp_l2 = [_]u8{
+    0x83, 0x21, 0x01, 0x06, 0x19, 0x01, 0x00, 0x03,
+    0x00, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0x09, 0x10, 0x04, 0xae, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x05, 0x12, 0x34,
+};
+
+test "golden L2 CSNP (Wireshark-anchored): builder reproduces the exact bytes" {
+    var buf: [128]u8 = undefined;
+    var b = try pdu.CsnpBuilder.init(&buf, .{
+        .is_l2 = true,
+        .source_id = .{ 0, 0, 0, 0, 0, 1, 0 },
+        .start_lsp_id = @splat(0),
+        .end_lsp_id = @splat(0xff),
+        .max_area_addresses = 3,
+    });
+    try tlvs.addLspEntries(&b.tlvs, &csnp_entries);
+    const wire = b.finish();
+    try testing.expectEqualSlices(u8, &golden_csnp_l2, wire);
+}
+
+test "golden L2 CSNP (Wireshark-anchored): decode recovers the L2 type code and every field" {
+    const p = try pdu.Csnp.decode(&golden_csnp_l2);
+    try testing.expectEqual(header.PduType.l2_csnp, p.header.pdu_type);
+    try testing.expectEqual(@as(u16, 51), p.pdu_length);
+    var ei = tlvs.LspEntryIterator.init((try tlv.findFirst(p.tlv_bytes, tlvs.code.lsp_entries)).?);
+    const e = (try ei.next()).?;
+    try testing.expectEqual(@as(u32, 5), e.sequence_number);
+    try testing.expectEqual(@as(u16, 0x1234), e.checksum);
+}
+
+// ── Golden 9: L2 PSNP (PDU type 27) — the L2 type code, untested above ──────
+//
+// Same remnant as golden 8, for PSNP. Field values match golden 5 otherwise.
+//
+// Command:
+//   scripts/dissect.py --frame llc --fields '831101061b0100030023000000000001
+//   00091004ae0000000000010000000000051234'
+//
+// Wireshark printed:
+//   frame.protocols == "eth:llc:osi:isis:isis.psnp" (full PSNP dissection)
+//   isis.type == 27 = ...1 1011 = PDU Type: L2 PSNP (27)
+//   isis.psnp.pdu_length == 35 = PDU length: 35
+//   isis.psnp.source_id == 0000.0000.0001 = Source-ID
+//   frame[34:18] == 09:10:... = LSP entries (t=9, l=16)
+//   isis.csnp.lsp_seq_num == 0x00000005 (PSNP reuses the CSNP field names)
+//   isis.csnp.lsp_remain_life == 1198
+//   isis.csnp.lsp_checksum == 0x1234
+//   isis.csnp.lsp_id == 0000.0000.0001.00-00
+const golden_psnp_l2 = [_]u8{
+    0x83, 0x11, 0x01, 0x06, 0x1b, 0x01, 0x00, 0x03,
+    0x00, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x09, 0x10, 0x04, 0xae, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x05, 0x12, 0x34,
+};
+
+test "golden L2 PSNP (Wireshark-anchored): builder reproduces the exact bytes" {
+    var buf: [128]u8 = undefined;
+    var b = try pdu.PsnpBuilder.init(&buf, .{
+        .is_l2 = true,
+        .source_id = .{ 0, 0, 0, 0, 0, 1, 0 },
+        .max_area_addresses = 3,
+    });
+    try tlvs.addLspEntries(&b.tlvs, &csnp_entries);
+    const wire = b.finish();
+    try testing.expectEqualSlices(u8, &golden_psnp_l2, wire);
+}
+
+test "golden L2 PSNP (Wireshark-anchored): decode recovers the L2 type code and every field" {
+    const p = try pdu.Psnp.decode(&golden_psnp_l2);
+    try testing.expectEqual(header.PduType.l2_psnp, p.header.pdu_type);
+    try testing.expectEqual(@as(u16, 35), p.pdu_length);
+    var ei = tlvs.LspEntryIterator.init((try tlv.findFirst(p.tlv_bytes, tlvs.code.lsp_entries)).?);
+    const e = (try ei.next()).?;
+    try testing.expectEqual(@as(u32, 5), e.sequence_number);
+}
+

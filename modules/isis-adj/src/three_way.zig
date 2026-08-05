@@ -251,6 +251,45 @@ test "golden TLV240 11-octet form (Wireshark-anchored): decode matches what Wire
     try testing.expectEqual(@as(?u32, null), d.neighbor.?.extended_local_circuit_id);
 }
 
+// ── External anchor: the 1-octet (state-only) form, the OTHER direction ─────
+//
+// ANCHOR-TASKS.tsv remnant on this row: every golden above was produced by
+// THIS module's own `buildHello`/`helloFields` and then checked against
+// Wireshark. The 1-octet (state-only) TLV 240 shape is never emitted by that
+// API — `fsm.zig`'s `helloFields` always sets `extended_local_circuit_id` from
+// `cfg`, so the encoder only ever writes the 5/11/15-octet forms — so there is
+// nothing of *our own construction* to hand to `dissect.py` for that shape.
+//
+// The honest anchor runs the other direction instead: hand a bare 1-octet
+// TLV 240 value to Wireshark's dissector AND to this module's own `decode`,
+// and check the two independent readings agree. This is NOT a case of "the
+// shape isn't anchorable" — Wireshark's `packet-isis-hello.c` DOES model
+// length 1 explicitly (its length switch is exactly 1/5/11/15, matching this
+// codec's `DecodeError.BadLength` boundary), so the comparison is real.
+//
+// Command (a full P2P Hello carrying a length-1 TLV 240 with state = Down):
+//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   00 00 00 0a 00 1b 00 17 03 f0 01 02'
+//
+// Wireshark printed (verbatim, trimmed to the load-bearing lines):
+//   frame.protocols == "eth:llc:osi:isis:isis.hello" (full Hello dissection,
+//     not a generic/"data" fallback)
+//   isis.hello.pdu_length == 23 = PDU length: 23
+//   frame[37:3] == f0:01:02 = Point-to-point Adjacency State (t=240, l=1)
+//   isis.hello.clv.type == 240 = Type: 240
+//   isis.hello.clv.length == 1 = Length: 1
+//   isis.hello.adjacency_state == 2 = Adjacency State: Down (2)
+// (no extended_local_circuit_id / neighbor_systemid lines — correctly absent
+// at length 1, matching this codec's `ThreeWayTlv.decode` 1-octet case which
+// sets only `state` and leaves `extended_local_circuit_id`/`neighbor` null.)
+test "golden TLV240 1-octet (state-only) form (Wireshark-anchored, reverse direction): our decode agrees with Wireshark, though our own encoder never emits this shape" {
+    const golden_240_1 = [_]u8{0x02}; // Down
+    const d = try ThreeWayTlv.decode(&golden_240_1);
+    try testing.expectEqual(ThreeWayState.down, d.state);
+    try testing.expectEqual(@as(?u32, null), d.extended_local_circuit_id);
+    try testing.expectEqual(@as(?Neighbor, null), d.neighbor);
+}
+
 test "TLV 240 rejects bad length and bad state, never over-reads" {
     try testing.expectError(error.BadLength, ThreeWayTlv.decode(&.{})); // empty
     try testing.expectError(error.BadLength, ThreeWayTlv.decode(&[_]u8{ 0, 1 })); // 2 octets
