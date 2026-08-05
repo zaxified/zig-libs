@@ -26,8 +26,9 @@ exponential-jitter-backoff shapes follow the `resilience` sibling.
 
 `kv` is a point store — `put` / `get` / `delete` by key and **nothing else**
 (no scan, private keydir). A queue must *enumerate* ready work, so jobqueue
-keeps its own index (a `jobs` map, a `ready` set, a `leased` table, a `dlq`
-set) and uses `kv` purely as the durable record of truth, rebuilt on `open`.
+keeps its own index (a `jobs` map, the ready pair described below, a `leased`
+table, a `dlq` set) and uses `kv` purely as the durable record of truth,
+rebuilt on `open`.
 
 **Enumeration without scan — the durable id counter.** Each job is keyed
 `j/<id>` from a durable monotonic counter at `m/next_id`. `enqueue` writes the
@@ -36,6 +37,36 @@ returned `enqueue` is fully durable, and a crash between the two writes leaves
 an orphan record the counter never references. Recovery is a bounded replay —
 for `id in 1..next_id`, `kv.get(j/<id>)`: a `null` (acked ⇒ `kv.delete`d) is
 skipped, a present record is decoded and re-indexed.
+
+## Dispatch: a schedule heap feeding per-partition priority heaps
+
+A ready job is not necessarily *visible*: a `delay_ns` / `run_at` job, or one
+serving a `nack` backoff, is in the ready set but scheduled for later. A single
+heap keyed by `(priority, id)` cannot express that — its top may be exactly
+that invisible job, and popping past it to find a visible one destroys the
+ordering. So the ready set is two structures:
+
+- **`pending`** — one min-heap on `(run_at_ns, id)`: every ready job whose
+  schedule has not been observed to arrive. Every job enters here, fresh,
+  recovered or requeued after a `nack`.
+- **`parts[partition]`** — one max-heap per partition on
+  `(priority desc, id asc)`: the jobs visible *now*.
+
+`dequeue` drains the due prefix of `pending` into the partition heaps, then
+takes the best partition-heap top. With `.partition` set that is an O(1)
+lookup; without, it is O(partitions) — either way plus O(log n) for the pop,
+where the previous version scanned the whole ready set. Visibility is still
+decided on every call rather than cached, so a wall clock that steps backwards
+(NTP) simply demotes the affected job back to `pending`. A partition heap is
+dropped once it empties, so churning through unbounded distinct partitions does
+not accumulate them.
+
+**Ordering is strict priority, ties FIFO by enqueue id — including across
+partitions**, so an unfiltered `dequeue` returns the globally best job and a
+steady stream of `.critical` work **will** starve `.low` work indefinitely.
+That is deliberate: it is what a priority override means. If you need
+isolation, pin a worker to a partition — `dequeue(.{ .partition = … })` is
+unaffected by any other partition's priorities or load.
 
 ## Two clocks (both injected)
 
@@ -101,6 +132,5 @@ consumer **idempotent**.
 - **A background maintenance thread & compaction-trigger policy** — the
   visibility sweep (`reapExpiredLeases`) is caller-driven; `kv.compact` is the
   caller's to schedule.
-- **A per-partition priority heap** — v1 `dequeue` is a linear scan of the
-  in-memory ready set (correct, and simplest given the `run_at` visibility
-  gate); a heap is the noted optimization.
+- **Fair-share / weighted dispatch across partitions** — dispatch is strict
+  priority; there is no round-robin or weighting over partitions (see above).

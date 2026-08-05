@@ -11,8 +11,27 @@ the zig-libs authors (MIT).
   shape is original design work; Faktory/Sidekiq (lease/reserve, retry-with-backoff, dead-letter)
   and the `resilience`/`jwt` sibling clock-injection pattern are behavioral/design references only.
 - **In-memory index over a point store.** `kv` is `put`/`get`/`delete` by key only (no scan); a
-  queue must *enumerate* ready work, so jobqueue keeps its own index (`jobs`, `ready`, `leased`,
-  `dlq`) and uses `kv` purely as the durable record of truth, rebuilt on `open`.
+  queue must *enumerate* ready work, so jobqueue keeps its own index (`jobs`, the ready pair
+  `pending`/`parts`, `leased`, `dlq`) and uses `kv` purely as the durable record of truth,
+  rebuilt on `open`.
+- **Dispatch = two ordered structures, not one heap.** A ready job is not necessarily *visible*:
+  a `delay_ns`/`run_at` job, or one serving a `nack` backoff, is ready but scheduled. A single
+  heap keyed by (priority, id) cannot express that — its top may be the invisible job, and
+  popping past it to find a visible one destroys the ordering. So the ready set is split:
+  `pending`, one min-heap on (`run_at_ns`, id) holding every job whose schedule has not been
+  observed to arrive, and `parts`, one max-heap per partition on (priority desc, id asc) holding
+  the jobs visible now. `dequeue` drains the due prefix of `pending` into the partition heaps,
+  then takes the best partition-heap top — O(1) partition lookup under a `.partition` filter,
+  O(partitions) without, plus O(log n) for the pop. Every job (fresh, recovered or requeued)
+  enters through `pending`, so exactly one structure needs capacity reserved before the durable
+  write. Visibility is still decided per `dequeue` call, never cached: the wall clock may step
+  backwards, and a job that migrated but is no longer due is demoted back to `pending`.
+- **Ordering: strict priority, ties FIFO by id — deliberately starvable.** A partition is a FIFO
+  grouping key and a dispatch filter, not a fair-share class; an unfiltered `dequeue` returns the
+  globally best job, so unbounded high-priority work starves low-priority work. That is what a
+  priority override means, and it is not a regression (v1's linear scan chose identically). The
+  mitigation available to callers is a per-partition worker (`dequeue(.{ .partition = … })`),
+  which is fully isolated from other partitions' load.
 - **Durable monotonic id counter, no scan needed for enumeration.** Each job is keyed `j/<id>` from
   a durable counter at `m/next_id`. `enqueue` writes the job record (fsync'd by `kv`) **then** bumps
   the counter (also fsync'd): a returned `enqueue` is fully durable, and a crash between the two
@@ -44,7 +63,16 @@ Not a security boundary — durability/correctness, not adversarial hardening:
 Tests run over the `kv.SimStorage` fault-injecting fake covering enqueue/dequeue/ack/nack lifecycle,
 lease expiry + `reapExpiredLeases`, retry backoff + DLQ transition, partition-FIFO ordering under
 priority, `run_at`/`delay_ns` visibility gating, `StaleLease` rejection, and crash-recovery replay
-of the durable id-counter/orphan-record invariant. Run: `zig build test-jobqueue`.
+of the durable id-counter/orphan-record invariant. The dispatch order is pinned specifically by:
+priority within one partition; cross-partition independence (an all-`critical` partition must not
+reorder another partition's FIFO); a `critical` job that is *not* returned before its schedule even
+though it outranks everything visible; that same job winning once it is due; deterministic FIFO
+among equal priorities across partitions; and a wall-clock step backwards re-hiding an
+already-eligible job. The `run_at` boundary is pinned **from both sides at nanosecond
+granularity** — invisible at `run_at - 1`, dispatched at exactly `run_at`, and re-hidden by a
+clock step back of a single nanosecond — because both the migration gate and the pop-time
+re-check compare at ns granularity, and a millisecond-scale test cannot tell an off-by-one
+there. Run: `zig build test-jobqueue`.
 
 ## Backlog / deferred
 
@@ -55,8 +83,8 @@ of the durable id-counter/orphan-record invariant. Run: `zig build test-jobqueue
 - **Cron-expression schedules** — v1 has only `delay_ns`/`run_at`; no `* * * * *` parsing.
 - **A background maintenance thread & compaction-trigger policy** — the visibility sweep
   (`reapExpiredLeases`) is caller-driven; `kv.compact` is the caller's to schedule.
-- **A per-partition priority heap** — v1 `dequeue` is a linear scan of the in-memory ready set
-  (correct, simplest given the `run_at` visibility gate); a heap is the noted optimization.
+- **Fair-share / weighted dispatch across partitions** — dispatch is strict priority; there is no
+  round-robin or weighting over partitions. Pin a worker to a partition if you need isolation.
 - An early id-arithmetic priority hack (from an earlier design iteration) silently clobbered
   records — jobqueue's real `priority` field replaces it (already fixed, not an open gap).
 

@@ -8,9 +8,14 @@
 //! `kv` is a Bitcask-style point store: `put` / `get` / `delete` by key and
 //! **nothing else** — no scan, no ordered iteration, its keydir is private.
 //! A queue needs to *enumerate* ready work and pick the best candidate, so
-//! jobqueue keeps its own in-memory index (a `jobs` map, a `ready` set, a
-//! `leased` table, a `dlq` set) and treats `kv` purely as the durable record
-//! of truth. The index is rebuilt from `kv` on `open`.
+//! jobqueue keeps its own in-memory index (a `jobs` map, the `pending`/`parts`
+//! ready pair described at "the two ordered structures behind dispatch"
+//! below, a `leased` table, a `dlq` set) and treats `kv` purely as the durable
+//! record of truth. The index is rebuilt from `kv` on `open`.
+//!
+//! Dispatch order is **strict priority, ties FIFO by enqueue id, across
+//! partitions as well as within one** — so high-priority work can starve
+//! low-priority work indefinitely, by design. See `dequeue`.
 //!
 //! **Enumeration without scan — the durable id counter.** Every job is keyed
 //! `j/<id>` where `<id>` comes from a durable, monotonically increasing
@@ -249,6 +254,104 @@ fn addNs(wall: i64, ns: u64) i64 {
     return wall +| clamped;
 }
 
+// ── the two ordered structures behind dispatch ───────────────────────────────
+//
+// A job in the ready state is in exactly one of them:
+//
+//   `pending` — a single min-heap keyed by (`run_at_ns`, id): every ready job
+//     whose schedule has not been observed to arrive yet. `delay_ns`/`run_at`
+//     jobs and `nack` backoffs live here. Freshly enqueued jobs land here too
+//     (with `run_at_ns` already in the past for the common no-delay case) so
+//     that `enqueue` needs to reserve capacity in exactly one structure.
+//
+//   `parts[partition]` — one max-heap per partition keyed by (priority desc,
+//     id asc): the jobs that are visible *now*.
+//
+// `dequeue` first drains every due entry out of `pending` into its partition
+// heap, then picks a winner among the partition heap tops. That is the whole
+// reason two structures are needed: a single heap ordered by priority would
+// surface a job whose `run_at_ns` has not arrived, and popping past it to look
+// for a visible one destroys the ordering.
+
+/// Ready-but-not-yet-visible: ordered by schedule, ties by enqueue order.
+const PendingEntry = struct { run_at_ns: i64, id: u64 };
+
+fn pendingBefore(a: PendingEntry, b: PendingEntry) bool {
+    if (a.run_at_ns != b.run_at_ns) return a.run_at_ns < b.run_at_ns;
+    return a.id < b.id;
+}
+
+/// Visible now: highest priority first, ties by oldest id (FIFO). The id
+/// tiebreak is what makes dispatch deterministic — never rely on heap layout.
+const ReadyEntry = struct { priority: u8, id: u64 };
+
+fn readyBefore(a: ReadyEntry, b: ReadyEntry) bool {
+    if (a.priority != b.priority) return a.priority > b.priority;
+    return a.id < b.id;
+}
+
+/// Minimal binary heap over an unmanaged array — `before(a, b)` = "a sits
+/// closer to the root". Push is split into a fallible `ensureUnusedCapacity`
+/// and an infallible `pushAssumeCapacity` so callers can reserve *before* the
+/// durable write and keep the post-persist index commit unable to fail.
+fn Heap(comptime T: type, comptime before: fn (T, T) bool) type {
+    return struct {
+        items: std.ArrayListUnmanaged(T) = .empty,
+
+        const Self = @This();
+
+        fn deinit(h: *Self, gpa: Allocator) void {
+            h.items.deinit(gpa);
+        }
+
+        fn len(h: Self) usize {
+            return h.items.items.len;
+        }
+
+        fn peek(h: Self) ?T {
+            return if (h.items.items.len == 0) null else h.items.items[0];
+        }
+
+        fn ensureUnusedCapacity(h: *Self, gpa: Allocator, n: usize) Allocator.Error!void {
+            return h.items.ensureUnusedCapacity(gpa, n);
+        }
+
+        fn pushAssumeCapacity(h: *Self, v: T) void {
+            h.items.appendAssumeCapacity(v);
+            var i = h.items.items.len - 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (!before(h.items.items[i], h.items.items[parent])) break;
+                std.mem.swap(T, &h.items.items[i], &h.items.items[parent]);
+                i = parent;
+            }
+        }
+
+        fn pop(h: *Self) ?T {
+            if (h.items.items.len == 0) return null;
+            const top = h.items.items[0];
+            const last = h.items.pop().?;
+            if (h.items.items.len == 0) return top;
+            h.items.items[0] = last;
+            var i: usize = 0;
+            while (true) {
+                const l = 2 * i + 1;
+                const r = l + 1;
+                var best = i;
+                if (l < h.items.items.len and before(h.items.items[l], h.items.items[best])) best = l;
+                if (r < h.items.items.len and before(h.items.items[r], h.items.items[best])) best = r;
+                if (best == i) break;
+                std.mem.swap(T, &h.items.items[i], &h.items.items[best]);
+                i = best;
+            }
+            return top;
+        }
+    };
+}
+
+const PendingHeap = Heap(PendingEntry, pendingBefore);
+const PartitionHeap = Heap(ReadyEntry, readyBefore);
+
 // ── Queue ────────────────────────────────────────────────────────────────────
 
 pub const Queue = struct {
@@ -260,9 +363,16 @@ pub const Queue = struct {
 
     /// The single source of live in-memory job state (owns every `*Job`).
     jobs: std.AutoHashMapUnmanaged(u64, *Job),
-    /// Ids currently dispatchable (subset of `jobs`; state == ready, not
-    /// leased). Visibility (`run_at`) is checked at `dequeue` time.
-    ready: std.AutoHashMapUnmanaged(u64, void),
+    /// Ready jobs whose schedule has not been observed to arrive: min-heap on
+    /// (`run_at_ns`, id). Drained into `parts` by `dequeue`.
+    pending: PendingHeap,
+    /// Ready and visible now, one max-heap per partition on (priority, id).
+    /// Keys are owned dupes; an entry is dropped once its heap empties, so a
+    /// workload with unbounded distinct partitions does not accumulate them.
+    parts: std.StringHashMapUnmanaged(PartitionHeap),
+    /// Ready-set size = `pending` + every partition heap. Kept incrementally so
+    /// `readyCount` stays O(1) (it used to be one hash map's `count`).
+    ready_n: usize,
     /// Leased ids → monotonic expiry deadline.
     leased: std.AutoHashMapUnmanaged(u64, u64),
     /// Dead-lettered ids (state == dead).
@@ -282,7 +392,9 @@ pub const Queue = struct {
             .wall = options.wall_clock,
             .mono = options.mono_clock,
             .jobs = .empty,
-            .ready = .empty,
+            .pending = .{},
+            .parts = .empty,
+            .ready_n = 0,
             .leased = .empty,
             .dlq = .empty,
             .next_id = 1,
@@ -334,7 +446,9 @@ pub const Queue = struct {
         errdefer self.gpa.free(job.partition);
 
         try self.jobs.ensureUnusedCapacity(self.gpa, 1);
-        try self.ready.ensureUnusedCapacity(self.gpa, 1);
+        // Every new job enters through `pending` regardless of its schedule —
+        // one structure to reserve, and `dequeue` migrates the due ones.
+        try self.pending.ensureUnusedCapacity(self.gpa, 1);
 
         // Durable order: job record first, then the counter. A crash between
         // them orphans the record (never referenced) — a returned enqueue is
@@ -345,7 +459,8 @@ pub const Queue = struct {
         try self.db.put(meta_key, &nb);
 
         self.jobs.putAssumeCapacity(id, job);
-        self.ready.putAssumeCapacity(id, {});
+        self.pending.pushAssumeCapacity(.{ .run_at_ns = run_at, .id = id });
+        self.ready_n += 1;
         self.next_id = id + 1;
         return @enumFromInt(id);
     }
@@ -355,52 +470,55 @@ pub const Queue = struct {
     /// Reserve the best ready job: highest `Priority`, ties oldest-first
     /// (FIFO), respecting `run_at`/`delay` visibility and the optional
     /// partition filter. Returns null when nothing is dispatchable.
-    /// Selection is a linear scan of the ready set: O(ready) per call, and with
-    /// `opts.partition` set it still visits every other partition's jobs. That
-    /// is the known scaling limit, and the backlog carries a per-partition
-    /// priority heap for it.
     ///
-    /// Note for whoever writes that heap, because it is the part that is easy
-    /// to get wrong: a job in `ready` is not necessarily dispatchable. A job
-    /// with `run_at_ns` in the future (a delay, or a nack backoff) sits in the
-    /// ready set and must be SKIPPED, not removed — the scan below just steps
-    /// over it. A single heap ordered by (priority, id) cannot do that: the
-    /// top element may be invisible, and popping it to look past it loses the
-    /// ordering. The shape that works is two structures — a time-ordered
-    /// pending set and a per-partition ready heap, with jobs migrating when
-    /// their `run_at_ns` arrives — which is why this is a design change rather
-    /// than a swap of container.
+    /// Selection is heap-based (see "the two ordered structures" above): the
+    /// due entries of the `pending` schedule heap migrate into their partition
+    /// heaps, then the winner is the best of the partition-heap tops — O(1)
+    /// lookup with `opts.partition` set, O(partitions) without, plus O(log n)
+    /// for the pop, instead of the O(ready) scan v1 used.
     ///
-    /// The ordering contract a replacement must preserve is already pinned by
-    /// tests: "partition FIFO ordering", "priority ordering: high before an
-    /// earlier-enqueued low", "FIFO tiebreak within equal priority", "delay /
-    /// run_at: a job is invisible until its schedule", and the crash-recovery
-    /// pair.
+    /// **Ordering is strict priority, ties FIFO by id — including across
+    /// partitions.** A partition is a FIFO grouping key and a dispatch filter,
+    /// not a fair-share class: an unfiltered `dequeue` still returns the
+    /// globally best job, so a steady stream of `.critical` work *will* starve
+    /// `.low` work indefinitely. That is deliberate (it is what a priority
+    /// override means, and it is v1's behaviour unchanged); a caller that needs
+    /// fairness dequeues with an explicit `.partition` per worker, which is
+    /// isolated from every other partition's load.
+    ///
+    /// The wall clock is not required to be monotonic, so a job that migrated
+    /// into a partition heap can become invisible again if wall time steps
+    /// back. The pop below re-checks `run_at_ns` and demotes such a job back to
+    /// `pending`, which keeps the visibility rule exactly the one the v1 scan
+    /// enforced: visibility is decided at `dequeue` time, never cached.
+    ///
+    /// The ordering contract is pinned by tests: "partition FIFO ordering",
+    /// "priority ordering: high before an earlier-enqueued low", "FIFO tiebreak
+    /// within equal priority", "delay / run_at: a job is invisible until its
+    /// schedule", the cross-partition independence pair, and crash recovery.
     pub fn dequeue(self: *Queue, opts: DequeueOptions) !?Lease {
         const wall_now = self.wall.now();
-        var best_id: ?u64 = null;
-        var best_pri: u8 = 0;
+        try self.migrateDue(wall_now);
 
-        var it = self.ready.keyIterator();
-        while (it.next()) |id_ptr| {
-            const id = id_ptr.*;
-            const job = self.jobs.get(id).?;
-            if (job.run_at_ns > wall_now) continue; // not yet visible
-            if (opts.partition) |p| {
-                if (!std.mem.eql(u8, p, job.partition)) continue;
+        const id = id: while (true) {
+            const found = self.bestReady(opts.partition) orelse return null;
+            const job = self.jobs.get(found.id).?;
+            if (job.run_at_ns > wall_now) {
+                // Wall clock regressed after this job migrated — put it back.
+                try self.demote(found, job.run_at_ns);
+                continue;
             }
-            const pri = @intFromEnum(job.priority);
-            if (best_id == null or pri > best_pri or (pri == best_pri and id < best_id.?)) {
-                best_id = id;
-                best_pri = pri;
-            }
-        }
-
-        const id = best_id orelse return null;
+            // Reserve the lease slot before the pop, so that once the job has
+            // left the ready set the commit below cannot fail (v1 relied on the
+            // same ordering to avoid dropping a job on OOM).
+            try self.leased.ensureUnusedCapacity(self.gpa, 1);
+            self.takeTop(found);
+            self.ready_n -= 1;
+            break :id found.id;
+        };
         const job = self.jobs.get(id).?;
 
-        try self.leased.put(self.gpa, id, self.mono.now() +| opts.visibility_timeout_ns);
-        _ = self.ready.remove(id);
+        self.leased.putAssumeCapacity(id, self.mono.now() +| opts.visibility_timeout_ns);
         job.lease_epoch +%= 1;
         return .{
             .id = @enumFromInt(id),
@@ -490,7 +608,7 @@ pub const Queue = struct {
 
     /// Ready (dispatchable, ignoring not-yet-visible `run_at`) job count.
     pub fn readyCount(self: *const Queue) usize {
-        return self.ready.count();
+        return self.ready_n;
     }
     /// Currently leased (in-flight) job count.
     pub fn leasedCount(self: *const Queue) usize {
@@ -502,6 +620,105 @@ pub const Queue = struct {
     }
 
     // ── internals ─────────────────────────────────────────────────────────────
+
+    // ── dispatch index (`pending` ⇄ `parts`) ──────────────────────────────────
+
+    /// A partition-heap top, plus what is needed to pop it.
+    const Found = struct {
+        /// The map-owned partition key (freed when the heap empties).
+        key: []const u8,
+        heap: *PartitionHeap,
+        id: u64,
+    };
+
+    /// Move every `pending` entry whose schedule has arrived into its partition
+    /// heap. Capacity for the destination is reserved *before* the source pop,
+    /// so an allocation failure leaves the job in `pending` — never dropped —
+    /// and the next `dequeue` retries it.
+    ///
+    /// This boundary is an *optimization* boundary, not the visibility gate:
+    /// `dequeue` re-checks `run_at_ns` on the candidate it picks and demotes a
+    /// job that is not due, so migrating too eagerly only costs churn and can
+    /// never dispatch a job early. Both checks must be wrong together for a job
+    /// to escape its schedule, which is what the nanosecond boundary tests pin.
+    fn migrateDue(self: *Queue, wall_now: i64) Allocator.Error!void {
+        while (self.pending.peek()) |top| {
+            if (top.run_at_ns > wall_now) break; // heap is time-ordered: so is the rest
+            const job = self.jobs.get(top.id).?;
+            const heap = try self.reservePartition(job.partition);
+            _ = self.pending.pop();
+            heap.pushAssumeCapacity(.{ .priority = @intFromEnum(job.priority), .id = top.id });
+        }
+    }
+
+    /// The partition's ready heap (created on demand) with room for one more
+    /// entry. Leaves nothing behind on failure.
+    fn reservePartition(self: *Queue, partition: []const u8) Allocator.Error!*PartitionHeap {
+        if (self.parts.getPtr(partition)) |heap| {
+            try heap.ensureUnusedCapacity(self.gpa, 1);
+            return heap;
+        }
+        const key = try self.gpa.dupe(u8, partition);
+        errdefer self.gpa.free(key);
+        var heap: PartitionHeap = .{};
+        errdefer heap.deinit(self.gpa);
+        try heap.ensureUnusedCapacity(self.gpa, 1);
+        try self.parts.put(self.gpa, key, heap);
+        return self.parts.getPtr(key).?;
+    }
+
+    /// Best visible job: the partition's heap top under a filter, else the best
+    /// top across all partitions (same (priority, id) order as within one).
+    fn bestReady(self: *Queue, filter: ?[]const u8) ?Found {
+        if (filter) |p| {
+            const e = self.parts.getEntry(p) orelse return null;
+            const top = e.value_ptr.peek() orelse return null;
+            return .{ .key = e.key_ptr.*, .heap = e.value_ptr, .id = top.id };
+        }
+        var best: ?Found = null;
+        var best_entry: ReadyEntry = undefined;
+        var it = self.parts.iterator();
+        while (it.next()) |e| {
+            const top = e.value_ptr.peek() orelse continue;
+            if (best == null or readyBefore(top, best_entry)) {
+                best_entry = top;
+                best = .{ .key = e.key_ptr.*, .heap = e.value_ptr, .id = top.id };
+            }
+        }
+        return best;
+    }
+
+    /// Pop `found`'s top, reclaiming the partition entry once it runs dry.
+    /// `found.heap` is dangling afterwards. Does not touch `ready_n`.
+    fn takeTop(self: *Queue, found: Found) void {
+        _ = found.heap.pop();
+        if (found.heap.len() != 0) return;
+        const kve = self.parts.fetchRemove(found.key).?;
+        var heap = kve.value;
+        heap.deinit(self.gpa);
+        self.gpa.free(kve.key);
+    }
+
+    /// Return a no-longer-visible top to `pending`. Reserves first, so a
+    /// failure leaves the job in its partition heap (still found, still
+    /// re-checked) rather than losing it.
+    fn demote(self: *Queue, found: Found, run_at_ns: i64) Allocator.Error!void {
+        try self.pending.ensureUnusedCapacity(self.gpa, 1);
+        const id = found.id;
+        self.takeTop(found);
+        self.pending.pushAssumeCapacity(.{ .run_at_ns = run_at_ns, .id = id });
+    }
+
+    /// Reserve room for one more ready job. Paired with `commitReady`, which
+    /// cannot fail — the two bracket the durable write.
+    fn reserveReady(self: *Queue) Allocator.Error!void {
+        return self.pending.ensureUnusedCapacity(self.gpa, 1);
+    }
+
+    fn commitReady(self: *Queue, job: *const Job) void {
+        self.pending.pushAssumeCapacity(.{ .run_at_ns = job.run_at_ns, .id = job.id });
+        self.ready_n += 1;
+    }
 
     fn validate(self: *Queue, lease: Lease) Error!u64 {
         const id = @intFromEnum(lease.id);
@@ -518,7 +735,10 @@ pub const Queue = struct {
     fn expireLease(self: *Queue, id: u64, backoff_ns: u64) !void {
         const job = self.jobs.get(id).?;
         // Reserve index slots up front so the post-persist commit cannot fail.
-        try self.ready.ensureUnusedCapacity(self.gpa, 1);
+        // A requeued job re-enters through `pending` exactly like a fresh one,
+        // so its backoff `run_at_ns` gates it and it rejoins its partition heap
+        // (at its own priority, behind equal-priority older ids) when due.
+        try self.reserveReady();
         try self.dlq.ensureUnusedCapacity(self.gpa, 1);
 
         const saved_attempts = job.attempts;
@@ -543,7 +763,7 @@ pub const Queue = struct {
         if (job.state == .dead) {
             self.dlq.putAssumeCapacity(id, {});
         } else {
-            self.ready.putAssumeCapacity(id, {});
+            self.commitReady(job);
         }
     }
 
@@ -642,7 +862,10 @@ pub const Queue = struct {
             switch (job.state) {
                 // A job leased-but-not-acked at crash time was persisted as
                 // `ready` (the lease was in-memory only) — it comes back ready.
-                .ready => try self.ready.put(self.gpa, id, {}),
+                .ready => {
+                    try self.reserveReady();
+                    self.commitReady(job);
+                },
                 .dead => try self.dlq.put(self.gpa, id, {}),
             }
         }
@@ -663,7 +886,13 @@ pub const Queue = struct {
         var it = self.jobs.valueIterator();
         while (it.next()) |job_ptr| self.freeJob(job_ptr.*);
         self.jobs.deinit(self.gpa);
-        self.ready.deinit(self.gpa);
+        self.pending.deinit(self.gpa);
+        var pit = self.parts.iterator();
+        while (pit.next()) |e| {
+            e.value_ptr.deinit(self.gpa);
+            self.gpa.free(e.key_ptr.*);
+        }
+        self.parts.deinit(self.gpa);
         self.leased.deinit(self.gpa);
         self.dlq.deinit(self.gpa);
     }
@@ -690,6 +919,11 @@ const FakeWall = struct {
     }
     fn advance(f: *FakeWall, ns: u64) void {
         f.ns += @intCast(ns);
+    }
+    /// Wall time is allowed to go backwards (NTP step) — `MonoClock` is the
+    /// non-decreasing one, not this.
+    fn retreat(f: *FakeWall, ns: u64) void {
+        f.ns -= @intCast(ns);
     }
 };
 
@@ -873,6 +1107,188 @@ test "FIFO tiebreak within equal priority" {
     try testing.expectEqualStrings("first", a.payload);
     const b = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
     try testing.expectEqualStrings("second", b.payload);
+}
+
+test "priority ordering inside one partition" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+
+    // Enqueued in an order that contradicts the expected dispatch order.
+    _ = try q.enqueue("t", "p-low", .{ .partition = "p", .priority = .low });
+    _ = try q.enqueue("t", "p-critical", .{ .partition = "p", .priority = .critical });
+    _ = try q.enqueue("t", "p-normal", .{ .partition = "p", .priority = .normal });
+    _ = try q.enqueue("t", "p-high", .{ .partition = "p", .priority = .high });
+
+    const want = [_][]const u8{ "p-critical", "p-high", "p-normal", "p-low" };
+    for (want) |w| {
+        const lease = (try q.dequeue(.{ .partition = "p", .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqualStrings(w, lease.payload);
+        try q.ack(lease);
+    }
+}
+
+test "partition independence: a busy critical partition never reorders another" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+
+    // "hot" is all-critical, "cold" is all-normal, interleaved at enqueue time.
+    _ = try q.enqueue("t", "cold0", .{ .partition = "cold" }); // id 1
+    _ = try q.enqueue("t", "hot0", .{ .partition = "hot", .priority = .critical }); // id 2
+    _ = try q.enqueue("t", "cold1", .{ .partition = "cold" }); // id 3
+    _ = try q.enqueue("t", "hot1", .{ .partition = "hot", .priority = .critical }); // id 4
+    _ = try q.enqueue("t", "cold2", .{ .partition = "cold" }); // id 5
+
+    // A worker pinned to "cold" folds "cold" in strict FIFO — "hot"'s priority
+    // and its heap churn are invisible to it.
+    const cold = [_][]const u8{ "cold0", "cold1", "cold2" };
+    for (cold) |w| {
+        const lease = (try q.dequeue(.{ .partition = "cold", .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqualStrings(w, lease.payload);
+        try testing.expectEqualStrings("cold", lease.partition);
+        try q.ack(lease);
+    }
+    try testing.expect((try q.dequeue(.{ .partition = "cold", .visibility_timeout_ns = one_ms })) == null);
+
+    // "hot" was untouched by all of that, and is still FIFO within itself.
+    const hot = [_][]const u8{ "hot0", "hot1" };
+    for (hot) |w| {
+        const lease = (try q.dequeue(.{ .partition = "hot", .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqualStrings(w, lease.payload);
+        try q.ack(lease);
+    }
+}
+
+test "unfiltered dequeue is deterministic FIFO among equal priorities across partitions" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+
+    // Equal priority everywhere, alternating partitions: the only tiebreak left
+    // is the enqueue sequence, and it must not depend on heap/hash layout.
+    const seq = [_][]const u8{ "0", "1", "2", "3", "4", "5" };
+    for (seq, 0..) |s, i| {
+        _ = try q.enqueue("t", s, .{ .partition = if (i % 2 == 0) "x" else "y" });
+    }
+    for (seq) |s| {
+        const lease = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqualStrings(s, lease.payload);
+        try q.ack(lease);
+    }
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+}
+
+test "a scheduled critical job does not jump ahead of its own schedule" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+
+    // The highest-priority job in the queue is also the one that is not due:
+    // the case a single (priority, id) heap gets wrong, because its top is
+    // invisible and popping past it destroys the order.
+    _ = try q.enqueue("t", "now-low", .{ .priority = .low });
+    _ = try q.enqueue("t", "later-critical", .{ .priority = .critical, .delay_ns = 100 * one_ms });
+    try testing.expectEqual(@as(usize, 2), q.readyCount());
+
+    const l1 = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("now-low", l1.payload);
+    try q.ack(l1);
+    // Nothing else is due, even though a critical job is sitting there.
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+    try testing.expectEqual(@as(usize, 1), q.readyCount());
+
+    h.wall.advance(100 * one_ms);
+    const l2 = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("later-critical", l2.payload);
+}
+
+test "the run_at boundary is exact to the nanosecond, from both sides" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+
+    // The visibility gate compares at nanosecond granularity, so this test
+    // steps the clock at nanosecond granularity: a millisecond-scale step
+    // pins "visible at run_at" but says nothing about "not visible just
+    // before it", which is the half that the delay feature is actually for.
+    const run_at = h.wall.ns + @as(i64, @intCast(50 * one_ms));
+    _ = try q.enqueue("t", "scheduled", .{ .run_at = run_at, .priority = .critical });
+
+    // One nanosecond early: still invisible, still ready-set member.
+    h.wall.ns = run_at - 1;
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+    try testing.expectEqual(@as(usize, 1), q.readyCount());
+
+    // Exactly at run_at: dispatched. `run_at` is inclusive.
+    h.wall.ns = run_at;
+    const lease = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("scheduled", lease.payload);
+}
+
+test "a scheduled job becomes eligible and then wins on priority" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+
+    _ = try q.enqueue("t", "later-critical", .{ .priority = .critical, .delay_ns = 50 * one_ms });
+    _ = try q.enqueue("t", "now-high", .{ .priority = .high });
+    _ = try q.enqueue("t", "now-normal", .{ .priority = .normal });
+
+    // Before the schedule arrives the visible best is the high job.
+    const l1 = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("now-high", l1.payload);
+    try q.ack(l1);
+
+    // Once it is due it outranks the normal job that was dispatchable all along.
+    h.wall.advance(50 * one_ms);
+    const l2 = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("later-critical", l2.payload);
+    try q.ack(l2);
+    const l3 = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("now-normal", l3.payload);
+}
+
+test "a wall-clock step backwards re-hides an already-eligible job" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+
+    _ = try q.enqueue("t", "a", .{});
+    _ = try q.enqueue("t", "b", .{});
+    // This dequeue makes both eligible and consumes "a"; "b" stays eligible.
+    const la = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("a", la.payload);
+    try q.ack(la);
+
+    // Eligibility is decided per call, never cached: an NTP step backwards
+    // puts "b" behind its schedule again without losing it. One nanosecond is
+    // enough — this comparison is exact too, not just the migration one.
+    h.wall.retreat(1);
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+    try testing.expectEqual(@as(usize, 1), q.readyCount());
+
+    h.wall.retreat(10 * one_ms);
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+    try testing.expectEqual(@as(usize, 1), q.readyCount());
+
+    h.wall.advance(10 * one_ms + 1);
+    const lb = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("b", lb.payload);
 }
 
 test "delay / run_at: a job is invisible until its schedule (wall clock)" {
