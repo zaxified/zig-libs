@@ -69,16 +69,16 @@ carries a genuine pre-finalize/post-finalize/post-extract triple — a bare P2SH
 plus a P2SH-P2WSH 2-of-2 multisig input. `finalize` on the pre-finalize PSBT reproduces the BIP's own
 finalized PSBT byte-exact (with the field-clearing rule checked explicitly per input, not just
 implied by the byte compare), and `extract` on the BIP's own finalized PSBT reproduces its published
-raw transaction byte-exact. P2WPKH finalization and native (non-P2SH) P2WSH multisig remain
-self-authored — BIP174's vectors don't happen to cover those two shapes end-to-end.
+raw transaction byte-exact. P2WPKH finalization and native (non-P2SH) P2WSH multisig are NOT covered
+by BIP174's vectors — see "Regtest vectors" below for how those two are anchored instead.
 
 **Bitcoin Core vectors** (`core_kat_vectors.zig`/`core_kat_test.zig`, `test/functional/data/
 rpc_psbt.json`, a SEPARATE external oracle from BIP174): Core's own `finalizer`/`extractor` entries
 were checked first and turned out to be byte-identical to the BIP174 Finalizer/Extractor worked
-example just above — Core's functional test reuses BIP174's own example verbatim, so the "P2WPKH/
-native-P2WSH remain self-authored" gap noted above is NOT closed by this JSON (see
-`ANCHOR-TASKS.tsv`). What Core's JSON DOES give this module: 45 new (non-BIP174-duplicate) `invalid`
-vectors plus all 23 `invalid_with_msg` vectors, individually decoded to determine why each is invalid
+example just above — Core's functional test reuses BIP174's own example verbatim, so the P2WPKH/
+native-P2WSH gap noted above is NOT closed by this JSON. What Core's JSON DOES give this module: 45
+new (non-BIP174-duplicate) `invalid` vectors plus all 23 `invalid_with_msg` vectors, individually
+decoded to determine why each is invalid
 rather than just pattern-matching Core's message. That surfaced one genuine BIP174 gap — a present
 `PSBT_GLOBAL_VERSION` was checked for shape but never for value, though BIP174 §"Version 0" requires
 it be 0 if present — now fixed (`error.UnsupportedPsbtVersion`; `core_kat_vectors.invalid_v0_scope`'s
@@ -90,6 +90,24 @@ round-trip byte-exact, 14 are pure-PSBTv2 PSBTs this module correctly refuses (o
 (`valid[5]`) hits the SAME 0-vin/BIP144-marker ambiguity as the two BIP174 valid vectors above, just
 surfacing as `error.TooManyItems` instead of `error.InvalidWitnessFlag` — same root cause, new facet,
 not a new bug. See `core_kat_test.zig`'s doc comment for the full per-index account.
+
+**Regtest vectors** (`regtest_kat_vectors.zig`/`regtest_kat_test.zig`, `zig build test-psbt`): the
+two spend shapes neither BIP174's vectors nor Core's `rpc_psbt.json` reach — native P2WPKH and
+native (non-P2SH) P2WSH multisig — are anchored by capturing them from a real Bitcoin Core v28.0.0
+regtest node instead, once, with the resulting bytes frozen as literals (no network access at test
+time; see each vector file's doc comment for the exact `bitcoin-cli` sequence to re-derive them).
+Native P2WPKH (captured 2026-08-02): `walletcreatefundedpsbt` → `walletprocesspsbt … false` →
+`finalizepsbt`. Native P2WSH 2-of-3 multisig (captured 2026-08-05) needed a longer chain — a
+watch-only wallet holding an imported `wsh(multi(2,pk1,pk2,pk3))` descriptor funded via
+`sendtoaddress` (not mined directly, to sidestep coinbase maturity), two independent signer wallets
+each running `walletprocesspsbt … false`, then `combinepsbt` — because it is the ONE spend shape in
+this module that had no outside oracle at all before this capture: an encoder/decoder pair sharing a
+misreading would otherwise satisfy its own test. For both shapes, `finalize` on the pre-finalize
+PSBT reproduces Core's own finalized-PSBT bytes exactly, `extract` on Core's finalized PSBT
+reproduces Core's own extracted-transaction bytes exactly, and (P2WSH multisig only, as the harder
+case) the extracted transaction was independently confirmed acceptable by `testmempoolaccept` on the
+node that produced it — not just something this module's own code would accept. Every spend shape
+`finalize`/`extract` supports is now anchored against an outside oracle.
 
 **Hostile teeth beyond the BIP set** (`root.zig`'s own test block): truncated map (keylen with no
 key bytes following), `valuelen` claiming far more bytes than remain (both a 1-byte and a

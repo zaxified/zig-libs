@@ -103,13 +103,21 @@ Combiner example, and the BIP's own worked Finalizer/Extractor example (a bare P
 input plus a P2SH-P2WSH 2-of-2 multisig input: `finalize` on the pre-finalize PSBT and `extract` on
 the finalized PSBT both reproduce the BIP's own published bytes exactly) — see `SPEC.md`
 "Verification" for the full story, including the 2 valid vectors this module can't accept (a
-`bitcointx`-inherited wire-format ambiguity, not a psbt bug) and which spend shapes (P2WPKH, native
-P2WSH multisig) remain self-authored rather than vector-anchored.
+`bitcointx`-inherited wire-format ambiguity, not a psbt bug).
 
 Also checked against Bitcoin Core's own `test/functional/data/rpc_psbt.json` (a separate external
 oracle, `core_kat_vectors.zig`/`core_kat_test.zig`) — this is where a real gap was found and fixed:
 a present `PSBT_GLOBAL_VERSION` is now required to be `0` (BIP174 §"Version 0"), which `parse`
 previously didn't check. Core's own `finalizer`/`extractor` vectors turned out to be byte-identical
-to BIP174's worked example above (no new spend shape), so P2WPKH/native-P2WSH finalization are
-still self-authored, not vector-anchored — see `SPEC.md` for the full accounting, including which
-of Core's vectors are BIP370/BIP371/MuSig2 content this module deliberately doesn't validate.
+to BIP174's worked example above (no new spend shape), so neither BIP174 nor Core's JSON reaches
+native P2WPKH or native P2WSH multisig — see `SPEC.md` for the full accounting, including which of
+Core's vectors are BIP370/BIP371/MuSig2 content this module deliberately doesn't validate.
+
+Both of those two remaining shapes are now closed too, by capturing against a real Bitcoin Core
+regtest node instead (`regtest_kat_vectors.zig`/`regtest_kat_test.zig`, `zig build test-psbt`):
+native P2WPKH (captured 2026-08-02) and native P2WSH 2-of-3 multisig (captured 2026-08-05, the LAST
+spend shape in this module that had no outside oracle at all — `finalize`/`extract` on the pre-
+finalize PSBT reproduce Core's own finalized-PSBT and extracted-transaction bytes exactly, and the
+extracted transaction was independently confirmed acceptable by `testmempoolaccept` on the node
+that produced it). Every spend shape `finalize`/`extract` supports is now anchored against an
+outside oracle, not just this module's own round-trip.
