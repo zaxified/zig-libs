@@ -68,7 +68,27 @@ this pass did not change):
     `"full_disclosure"` vector's raw `invoice_hex` TLV stream, Merkle root,
     and `invoice_signature` are reproduced as inline hex literals in
     `bolt12.zig`'s "BOLT#12 KAT: invoice Merkle root + signature verify"
-    test, predating this pass.
+    test, predating this pass. **Added 2026-08-05:** that SAME
+    `"full_disclosure"` vector's complete signed `lni1...` wire string
+    (`valid_vectors[0].input.invoice`) and its 12 non-signature TLV field
+    values are additionally reproduced as inline hex/bech32 literals in
+    `bolt12.zig`'s "BOLT#12 KAT: invoice ENCODE byte-exact ... 'full_disclosure'
+    (exercises the type>240 split)" test — the first byte-exact ENCODE anchor
+    for `invoice` (as opposed to `invoice_request`, already covered via
+    `signature-test.json`'s `lnr1...` string in the "decode lnr1
+    invoice_request string end-to-end" test, also predating this pass). The
+    sibling `"minimal_disclosure"` vector (`valid_vectors[1]`, no field
+    above TLV type 240) is vendored the same way as a second, ordinary-case
+    KAT. This anchoring effort found and fixed a real bug in
+    `encodeSignedInvoice`/`encodeSignedInvoiceRequest` — both used to
+    unconditionally append the `signature` TLV last, which is wrong (and
+    produces a wire stream BOLT#12's own ascending-type-order rule forbids)
+    whenever a caller record has a type above 240; "full_disclosure" is the
+    vector that exercises this, which is why it is the one now anchored
+    (not sidestepped in favor of a vector without the field). See
+    `bolt12.zig`'s `appendSignedStream` and SPEC.md's "ENCODE byte-exact
+    anchor" note for the fix. Closes the `lninvoice` row of
+    `ANCHOR-TASKS.tsv`.
 
 A fifth file, `bolt12/format-string-test.json`'s sibling
 `bootstrap.bolt12.org`-hosted vector set, was never fetched or used: that

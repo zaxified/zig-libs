@@ -132,6 +132,33 @@ as an external byte-exact KAT (`bolt12.zig`, "BOLT#12 KAT: invoice Merkle root +
 `invoice`'s Merkle+signature core is now externally anchored, same as `invoice_request`'s; only the
 *offer* round-trip (see the BOLT#12 offer note above) remains self-constructed.
 
+**ENCODE byte-exact anchor, added 2026-08-05:** the Merkle/signature *core* being externally
+anchored (previous paragraph) is a different claim from the full `invoice`/`invoice_request`
+TLV-to-wire-string ENCODE producing the spec's own bytes — that was still round-trip
+(build+decode+verify against itself) only, the exact weakness `ANCHOR-TASKS.tsv`'s `lninvoice` row
+named. Closed for both directions: `invoice_request` ENCODE was already checkable against
+`signature-test.json`'s own `"bolt12"` field (a full `lnr1...` string, already used for a decode
+KAT but never fed through `encodeSignedInvoiceRequest`); `invoice` had no such string until
+`payer-proof-test.json`'s `valid_vectors` array turned out to carry one per vector (`input.invoice`)
+— `payer-proof-test.json` had previously only been read for its Merkle-root/signature hex fields,
+never its `input.invoice` bech32 string. Both are now wired as byte-exact `encodeSignedInvoice*`
+KATs in `bolt12.zig`.
+
+This anchoring pass found and FIXED a real bug, not just a test gap:
+`payer-proof-test.json`'s `"full_disclosure"` vector carries a private/experimental TLV (type
+3000000001) positioned AFTER the signature (type 240) in the wire stream — legal per BOLT#12's
+ascending-type-order rule (240 < 3000000001). `encodeSignedInvoice`/`encodeSignedInvoiceRequest`
+used to unconditionally append the signature record LAST, after every caller-supplied record;
+for "full_disclosure" that produced `[...176, 3000000001, SIGNATURE]` instead of the required
+`[...176, SIGNATURE, 3000000001]` — a stream BOLT#12 itself forbids, not merely one that failed to
+match the vector's byte layout by convention. Fixed by a shared `appendSignedStream` helper (used
+by both encode functions) that assembles the output as `records with type < 240` ++ `signature` ++
+`records with type > 240`, instead of assuming every caller record precedes the signature; the
+signing computation itself (`signMerkle` over the unsigned records in their original order) is
+unchanged, so the Merkle-root/signature KATs above stay byte-identical. `"full_disclosure"` — the
+vector that actually exercises the fix — is now the byte-exact `invoice` ENCODE anchor;
+`"minimal_disclosure"` (no field above type 240) is kept alongside it as the ordinary-invoice case.
+
 ## Verification
 
 **BOLT#11**, pinned against the spec's own worked examples (`11-payment-encoding.md` "Examples"):

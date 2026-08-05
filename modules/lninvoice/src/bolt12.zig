@@ -508,10 +508,46 @@ pub fn decodeInvoiceRequest(allocator: Allocator, str: []const u8) IReqDecodeErr
     return ir;
 }
 
+/// Assemble the final wire TLV stream for a signed `invoice_request`/
+/// `invoice`: `unsigned_records` with type < `SIGNATURE` (240), then the
+/// `signature` record itself, then any `unsigned_records` with type >
+/// `SIGNATURE`. BOLT#12 requires ascending TLV type order across the WHOLE
+/// stream, signature slot included — a caller record with type > 240 (a
+/// private/experimental field; ordinary BOLT#12 `invoice_*`/
+/// `invoice_request_*` field types are all < 240) must therefore be written
+/// AFTER the signature, not unconditionally last. Shared by
+/// `encodeSignedInvoiceRequest`/`encodeSignedInvoice` since both follow the
+/// identical assemble-after-sign shape. `sig` must already be computed (by
+/// the caller, via `signMerkle` over `unsigned_records` in their original
+/// order — that computation is unaffected by this split: `merkleRoot`/
+/// `signMerkle` already exclude signature-range TLVs [240-1000] wherever
+/// they happen to sit in a stream).
+fn appendSignedStream(
+    allocator: Allocator,
+    stream: *std.ArrayList(u8),
+    unsigned_records: []const lnwire.RawRecord,
+    sig: [64]u8,
+) Allocator.Error!void {
+    var below: std.ArrayList(lnwire.RawRecord) = .empty;
+    defer below.deinit(allocator);
+    var above: std.ArrayList(lnwire.RawRecord) = .empty;
+    defer above.deinit(allocator);
+    for (unsigned_records) |r| {
+        if (r.type < SIGNATURE) try below.append(allocator, r) else try above.append(allocator, r);
+    }
+    try lnwire.tlv.appendStream(stream, allocator, below.items);
+    try lnwire.tlv.appendStream(stream, allocator, &.{.{ .type = SIGNATURE, .value = &sig }});
+    try lnwire.tlv.appendStream(stream, allocator, above.items);
+}
+
 /// Sign a set of `invoice_request` fields (given as ascending, signature-free
 /// TLV records — the caller must include `invreq_payer_id` matching
-/// `secret_key`) and encode the result as an `lnr1...` string. Appends the
-/// `signature` record (type 240) after signing over the Merkle root.
+/// `secret_key`) and encode the result as an `lnr1...` string. The
+/// `signature` record (type 240) is inserted in ascending-type position via
+/// `appendSignedStream` — after every record with a lower type, before any
+/// record with a higher one (private/experimental fields only; every
+/// `invreq_*` type BOLT#12 itself defines is < 240, so for those this is
+/// simply "last", same as before).
 pub fn encodeSignedInvoiceRequest(
     allocator: Allocator,
     unsigned_records: []const lnwire.RawRecord,
@@ -519,11 +555,14 @@ pub fn encodeSignedInvoiceRequest(
     aux_rand: [32]u8,
     io: std.Io,
 ) (SignError || bech32raw.EncodeError)![]u8 {
+    var unsigned_stream: std.ArrayList(u8) = .empty;
+    defer unsigned_stream.deinit(allocator);
+    try lnwire.tlv.appendStream(&unsigned_stream, allocator, unsigned_records);
+    const sig = try signMerkle(allocator, unsigned_stream.items, invoice_request_sig_tag, secret_key, aux_rand, io);
+
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(allocator);
-    try lnwire.tlv.appendStream(&stream, allocator, unsigned_records);
-    const sig = try signMerkle(allocator, stream.items, invoice_request_sig_tag, secret_key, aux_rand, io);
-    try lnwire.tlv.appendStream(&stream, allocator, &.{.{ .type = SIGNATURE, .value = &sig }});
+    try appendSignedStream(allocator, &stream, unsigned_records, sig);
 
     const quintets = try bitpack.bytesToQuintets(allocator, stream.items);
     defer allocator.free(quintets);
@@ -640,7 +679,15 @@ pub fn decodeInvoice(allocator: Allocator, str: []const u8) InvoiceDecodeError!I
 
 /// Sign a set of `invoice` fields (ascending, signature-free TLV records —
 /// the caller must include `invoice_node_id` matching `secret_key`) and
-/// encode as an `lni1...` string. Appends the `signature` record (type 240).
+/// encode as an `lni1...` string. The `signature` record (type 240) is
+/// inserted in ascending-type position via `appendSignedStream` — after
+/// every record with a lower type, before any record with a higher one
+/// (private/experimental fields only; every `invoice_*` type BOLT#12
+/// itself defines is < 240, so for those this is simply "last", same as
+/// before). Verified against a real external vector with a type > 240
+/// field (`lightning/bolts` `bolt12/payer-proof-test.json`'s
+/// "full_disclosure", type 3000000001) — see the "invoice ENCODE
+/// byte-exact" KAT tests below.
 pub fn encodeSignedInvoice(
     allocator: Allocator,
     unsigned_records: []const lnwire.RawRecord,
@@ -648,11 +695,14 @@ pub fn encodeSignedInvoice(
     aux_rand: [32]u8,
     io: std.Io,
 ) (SignError || bech32raw.EncodeError)![]u8 {
+    var unsigned_stream: std.ArrayList(u8) = .empty;
+    defer unsigned_stream.deinit(allocator);
+    try lnwire.tlv.appendStream(&unsigned_stream, allocator, unsigned_records);
+    const sig = try signMerkle(allocator, unsigned_stream.items, invoice_sig_tag, secret_key, aux_rand, io);
+
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(allocator);
-    try lnwire.tlv.appendStream(&stream, allocator, unsigned_records);
-    const sig = try signMerkle(allocator, stream.items, invoice_sig_tag, secret_key, aux_rand, io);
-    try lnwire.tlv.appendStream(&stream, allocator, &.{.{ .type = SIGNATURE, .value = &sig }});
+    try appendSignedStream(allocator, &stream, unsigned_records, sig);
 
     const quintets = try bitpack.bytesToQuintets(allocator, stream.items);
     defer allocator.free(quintets);
@@ -1360,6 +1410,157 @@ test "BOLT#12 KAT: invoice Merkle root + signature verify — payer-proof-test.j
     var bad_sig = sig;
     bad_sig[10] ^= 0x01;
     try testing.expect(!try verifyMerkle(allocator, stream, invoice_sig_tag, xonly, bad_sig));
+}
+
+// Byte-exact external KAT for `invoice` ENCODE — closes the last gap
+// ANCHOR-TASKS.tsv named for this module ("invoice_request/invoice's
+// non-signature TLV-to-wire-string ENCODE is round-trip (build+decode+
+// verify) tested only, not byte-compared against an official lnr1/lni1
+// string"). `invoice_request` ENCODE already had one KAT string available
+// (`signature-test.json`'s own `"bolt12"` field, used below in the
+// "decode lnr1 ... end-to-end" test — that test only ever drove it through
+// OUR decoder, never OUR encoder), but `invoice` had none until this vector
+// was found: `payer-proof-test.json`'s `valid_vectors` array (the same file
+// already used above for the Merkle-root/signature KAT, there via
+// `valid_vectors[0]` "full_disclosure") carries a complete signed
+// `lni1...` wire string in each `input.invoice` field (fetched from the
+// same pinned commit as the rest of this module's BOLT#12 vectors — see
+// `../NOTICE`).
+//
+// The first attempt at this anchor used `valid_vectors[0]`
+// ("full_disclosure") directly and it did NOT match byte-exact: that
+// vector's `invoice_hex` carries a private/experimental TLV (type
+// 3000000001) positioned AFTER the type-240 signature record (ascending
+// order: 240 < 3000000001), and `encodeSignedInvoice` at the time
+// unconditionally appended the signature LAST, after every caller-supplied
+// record — producing [...176, 3000000001, SIGNATURE] instead of the
+// vector's [...176, SIGNATURE, 3000000001]. That was not a test-setup
+// mismatch, it was `encodeSignedInvoice` emitting a stream BOLT#12's own
+// ascending-type-order rule forbids. Fixed (this pass): `encodeSignedInvoice`/
+// `encodeSignedInvoiceRequest` now insert the signature via the shared
+// `appendSignedStream` helper, splitting `unsigned_records` at type 240
+// instead of assuming everything comes before it — see that helper's doc
+// comment. The signing computation (`signMerkle` over the unsigned stream
+// in its original order) is untouched, so the pre-existing Merkle-root/
+// signature KATs above stay byte-identical; only the OUTPUT assembly
+// changed. `valid_vectors[0]` "full_disclosure" is used below specifically
+// because it is the vector that exercises the fix (the one with a
+// type > 240 field); `valid_vectors[1]` "minimal_disclosure" (no field
+// above type 240) is kept alongside it as the ordinary-invoice case, which
+// costs nothing extra and covers the common path unaffected by the split.
+const invoice_encode_kat_fields = [_]struct { type: u64, hex: []const u8 }{
+    .{ .type = 0, .hex = "00000000000000000000000000000000" },
+    .{ .type = 22, .hex = "024bc2a31265153f07e70e0bab08724e6b85e217f8cd628ceb62974247bb493382" },
+    .{ .type = 82, .hex = "03e8" },
+    .{ .type = 88, .hex = "0324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c" },
+    .{ .type = 160, .hex = "027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007032c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e6686809910102edabbd16b41c8371b92ef2f04c1185b4f03b6dcd52ba9b78d9d7c89c8f221145001000000000000000000000000000000000" },
+    .{ .type = 162, .hex = "00000001000000020003000000000000000400000000000000050000" },
+    .{ .type = 164, .hex = "67527988" },
+    .{ .type = 168, .hex = "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793" },
+    .{ .type = 170, .hex = "03e8" },
+    .{ .type = 176, .hex = "024bc2a31265153f07e70e0bab08724e6b85e217f8cd628ceb62974247bb493382" },
+};
+const invoice_encode_kat_want = "lni1qqgqqqqqqqqqqqqqqqqqqqqqqqqqq93pqf9u9gcjv52n7pl8pc96kzrjfe4ctcshlrxk9r8tv2t5y3amfyecy5szq059sggry3jnatzrgjyqqtxqdwlm0ug0uxyerc6lnljrqtd75mfr20wq4vw2qasz0uc7h32x9s0aecdhxlk075kn046aafpuuyw8f5j652t3vha2yqrsxtqt0nu4xf9q05znnzeyq96dcrptu3zdj6c4n2nv0aa3ue5xszv3qypwm2aaz66peqm3hyh09uzvzxzmfupmdhx49w5m0rva0jyu3u3pz3gqzqqqqqqqqqqqqqqqqqqqqqqqqqq2y8qqqqqqzqqqqqpqqqcqqqqqqqqqqqzqqqqqqqqqqqq9qqq2gpr82fuc32pqwtxkappzcsrlkmgfs6g0zyct0hkhashh7hsaxz7e65slq9fkx7f65qsrazczzqjtc233yeg48ur7wrst4vy8ynntsh3p07xdv2xwkc5hgfrmkjfnstcyqz3nyfzk3d42umkj2gqjh4l7zpevq04aefl6gnu4kql3e5ymu29s4q7fcvsst9uvmqx6q6yhje3vsraqple9pnxuf5vtwz0l68r6uvvs";
+
+test "BOLT#12 KAT: invoice ENCODE byte-exact against lni1 string — payer-proof-test.json 'minimal_disclosure'" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var values: std.ArrayList([]u8) = .empty;
+    defer {
+        for (values.items) |v| allocator.free(v);
+        values.deinit(allocator);
+    }
+    var records: std.ArrayList(lnwire.RawRecord) = .empty;
+    defer records.deinit(allocator);
+    for (invoice_encode_kat_fields) |f| {
+        const val = try hexAlloc(allocator, f.hex);
+        try values.append(allocator, val);
+        try records.append(allocator, .{ .type = f.type, .value = val });
+    }
+
+    // `invoice_node_id`'s own secret key from `payer-proof-test.json`'s
+    // "keys" object (secret 0x46 repeated 32 times, same as the KAT above).
+    const sk = try bip340.SecretKey.fromBytes([_]u8{0x46} ** 32);
+    const got = try encodeSignedInvoice(allocator, records.items, sk, [_]u8{0} ** 32, io);
+    defer allocator.free(got);
+
+    try testing.expectEqualStrings(invoice_encode_kat_want, got);
+
+    // Decode our freshly-built string and check the typed fields the
+    // module's decoder does model, so a future failure names which side
+    // (encoder vs. decoder) broke.
+    var inv = try decodeInvoice(allocator, got);
+    defer inv.deinit(allocator);
+    try testing.expectEqual(@as(?u64, 0x67527988), inv.invoice_created_at);
+    try testing.expectEqual(@as(?u64, 0x03e8), inv.invoice_amount);
+    const want_payment_hash = try hexAlloc(allocator, "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793");
+    defer allocator.free(want_payment_hash);
+    try testing.expectEqualSlices(u8, want_payment_hash, &inv.invoice_payment_hash.?);
+    try testing.expect(try inv.verify(allocator));
+}
+
+// `valid_vectors[0]` "full_disclosure" — same fields as
+// `invoice_encode_kat_fields` above PLUS `invoice_features` (type 174,
+// ordinary, sits before `invoice_node_id`) PLUS a private/experimental TLV
+// (type 3000000001, sits AFTER the type-240 signature in the official wire
+// stream). This is the vector that actually exercises `appendSignedStream`'s
+// split: with the pre-fix "always append signature last" behavior this
+// test failed (see the comment block above the "minimal_disclosure" test).
+test "BOLT#12 KAT: invoice ENCODE byte-exact against lni1 string — payer-proof-test.json 'full_disclosure' (exercises the type>240 split)" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const fields = [_]struct { type: u64, hex: []const u8 }{
+        .{ .type = 0, .hex = "00000000000000000000000000000000" },
+        .{ .type = 22, .hex = "024bc2a31265153f07e70e0bab08724e6b85e217f8cd628ceb62974247bb493382" },
+        .{ .type = 82, .hex = "03e8" },
+        .{ .type = 88, .hex = "0324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c" },
+        .{ .type = 160, .hex = "027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007032c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e6686809910102edabbd16b41c8371b92ef2f04c1185b4f03b6dcd52ba9b78d9d7c89c8f221145001000000000000000000000000000000000" },
+        .{ .type = 162, .hex = "00000001000000020003000000000000000400000000000000050000" },
+        .{ .type = 164, .hex = "67527988" },
+        .{ .type = 168, .hex = "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793" },
+        .{ .type = 170, .hex = "03e8" },
+        .{ .type = 174, .hex = "08000000000000000000000000" },
+        .{ .type = 176, .hex = "024bc2a31265153f07e70e0bab08724e6b85e217f8cd628ceb62974247bb493382" },
+        .{ .type = 3000000001, .hex = "42" },
+    };
+    const want_lni1 = "lni1qqgqqqqqqqqqqqqqqqqqqqqqqqqqq93pqf9u9gcjv52n7pl8pc96kzrjfe4ctcshlrxk9r8tv2t5y3amfyecy5szq059sggry3jnatzrgjyqqtxqdwlm0ug0uxyerc6lnljrqtd75mfr20wq4vw2qasz0uc7h32x9s0aecdhxlk075kn046aafpuuyw8f5j652t3vha2yqrsxtqt0nu4xf9q05znnzeyq96dcrptu3zdj6c4n2nv0aa3ue5xszv3qypwm2aaz66peqm3hyh09uzvzxzmfupmdhx49w5m0rva0jyu3u3pz3gqzqqqqqqqqqqqqqqqqqqqqqqqqqq2y8qqqqqqzqqqqqpqqqcqqqqqqqqqqqzqqqqqqqqqqqq9qqq2gpr82fuc32pqwtxkappzcsrlkmgfs6g0zyct0hkhashh7hsaxz7e65slq9fkx7f65qsrazhq6zqqqqqqqqqqqqqqqqqqqzczzqjtc233yeg48ur7wrst4vy8ynntsh3p07xdv2xwkc5hgfrmkjfnstcyp7aextn2n4d5mzx2phwfe70cejyqaaq78my4wndgna3ymwyc4vlf60kke258g33nhp23vldqpygemxp54ecl0vr0qfejm3xpm6atq4mlavkstcqszss";
+
+    var values: std.ArrayList([]u8) = .empty;
+    defer {
+        for (values.items) |v| allocator.free(v);
+        values.deinit(allocator);
+    }
+    var records: std.ArrayList(lnwire.RawRecord) = .empty;
+    defer records.deinit(allocator);
+    for (fields) |f| {
+        const val = try hexAlloc(allocator, f.hex);
+        try values.append(allocator, val);
+        try records.append(allocator, .{ .type = f.type, .value = val });
+    }
+
+    const sk = try bip340.SecretKey.fromBytes([_]u8{0x46} ** 32);
+    const got = try encodeSignedInvoice(allocator, records.items, sk, [_]u8{0} ** 32, io);
+    defer allocator.free(got);
+
+    try testing.expectEqualStrings(want_lni1, got);
+
+    // Decode + verify, same posture as the "minimal_disclosure" test above.
+    // `decodeInvoice`'s typed decoder does not model type 3000000001 (an
+    // unknown ODD type, silently skipped per BOLT#1's "ok to be odd" rule —
+    // see `known_invoice_types`), so it does not appear in `inv` below; the
+    // point of this test is the byte-exact ENCODE match plus confirming the
+    // typed fields BOLT#12 does define still round-trip correctly.
+    var inv = try decodeInvoice(allocator, got);
+    defer inv.deinit(allocator);
+    try testing.expectEqual(@as(?u64, 0x67527988), inv.invoice_created_at);
+    try testing.expectEqual(@as(?u64, 0x03e8), inv.invoice_amount);
+    try testing.expect(try inv.verify(allocator));
 }
 
 test "BOLT#12 Merkle: signature TLVs (240-1000) are excluded from the tree" {
