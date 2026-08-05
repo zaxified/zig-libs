@@ -22,7 +22,8 @@
 //!
 //! Everything ELSE in this module is REAL and UNGATED today, proving the
 //! harness has teeth independent of the gated core:
-//!   - `prg.zig` — the SHA-256 length-doubling PRG `G` and `convert`.
+//!   - `prg.zig` — both length-doubling PRGs `G` (`Aes128Mmo`, the default,
+//!     and `Sha256Prg`) and `convert`.
 //!   - `group.zig` — the Z_{2^{8L}} output-group arithmetic.
 //!   - `dpf.zig`'s `Key` struct + `serializeCw`/byte codec.
 //!   - `kat_test.zig`'s DELIBERATELY-BROKEN positive controls

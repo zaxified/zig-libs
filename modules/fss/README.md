@@ -24,9 +24,9 @@ external-reference anchoring.
 | File | Contents |
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports (`Dpf`, `prg`, `group`, `kat_vectors`), dark-tests aggregator |
-| `prg.zig` | **REAL.** SHA-256 length-doubling PRG `G` + seed→group `convert` (exact byte definitions pinned in-file) |
+| `prg.zig` | **REAL.** Two length-doubling PRGs `G` + seed→group `convert`: `Aes128Mmo` (fixed-key AES, **default**) and `Sha256Prg` (exact byte definitions pinned in-file) |
 | `group.zig` | **REAL.** `Z2k(L)` — the `Z_{2^{8L}}` output group (add/sub/neg + byte codec) |
-| `dpf.zig` | `Dpf(n,L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `evalFull`/`evalFullWith` (tree-reuse **prefix** evaluation, ~1 PRG call/point; `evalAll` kept naive as its oracle), `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
+| `dpf.zig` | `Dpf(n,L)` = `DpfWith(prg.default, n, L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `evalFull`/`evalFullWith` (tree-reuse **prefix** evaluation, ~1 PRG call/point; `evalAll` kept naive as its oracle), `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
 | `mpf.zig` | `Mpf(n,L,k)` — **multi-point** FSS: `k` independent `Dpf` instances summed. No new cryptographic surface, no failure probability, keys linear in `k` |
 | `gate.zig` | The single switch (`core_implemented = true`) marking the correction-word core done |
 | `kat_vectors.zig` | Recorded independent-reference KAT vectors (the anti-self-consistency anchor) |
@@ -76,6 +76,17 @@ const bad = D.firstMismatch(&out0, &out1, alpha, beta);
 var buf: [D.Key.serialized_len]u8 = undefined;
 k0.toBytes(&buf);
 const restored = D.Key.fromBytes(&buf);
+
+// STORAGE form: one leading byte naming the PRG, so a key written by a build
+// with a different PRG is rejected instead of decoding into garbage.
+var stored: [D.Key.tagged_len]u8 = undefined;
+k0.toBytesTagged(&stored);
+const reloaded = try D.Key.fromBytesTagged(&stored); // error.UnsupportedKeyFormat
+
+// The PRG is a parameter. `Dpf(n,L)` is the fixed-key-AES default; the
+// SHA-256 instantiation (slower, constant-time on every target, and what the
+// recorded KAT vectors are stated over) stays available:
+const S = fss.DpfWith(fss.prg.Sha256Prg, 8, 4);
 ```
 
 ### Multi-point (`k` points at once)
@@ -115,12 +126,26 @@ Repeated points are a **multiset**: `α_j == α_l` makes the shared function
   the module pure `.any` computation (no OS/CSPRNG dependency). The caller MUST
   pass two independent, unpredictable, secret 16-byte seeds from a real CSPRNG;
   reusing or leaking a seed breaks the hiding property.
-- **PRG is module-defined (SHA-256), NOT interoperable with other DPF
-  libraries.** Keys from this module verify only against this module's `Eval`
-  (like `bulletproofs`' module-defined transcript). Google's DPF vectors use
-  fixed-key AES and are not matched byte-exact — see [SPEC.md](SPEC.md).
-- **`Eval`'s control-bit-gated branches are not yet constant-time reviewed**
-  (side-channel hardening is a scoped-out increment).
+- **The PRG is part of the key format, and the default CHANGED.** `Dpf`/`Mpf`
+  now use fixed-key AES-128 (`prg.Aes128Mmo`, format tag `0x02`); they used
+  SHA-256 (`prg.Sha256Prg`, tag `0x01`), which is still available via
+  `DpfWith`/`MpfWith`. **The two produce keys of the same LENGTH and different
+  contents**, so a key stored before this change decodes without complaint and
+  evaluates to garbage. `Key.toBytesTagged`/`fromBytesTagged` are the storage
+  codec that catches exactly that (`error.UnsupportedKeyFormat`); the wire
+  codec `toBytes`/`fromBytes` is deliberately left header-free, because `pir`
+  asserts a query share contains no constant bytes. Anything that persists a
+  key should store `Key.key_format` (`"fss.dpf/aes128-mmo/v1"`) with it.
+- **Still NOT interoperable with other DPF libraries.** Adopting fixed-key AES
+  narrows the gap to the literature but does not close it: Google's DPF fixes
+  its own keys, tweak convention and (protobuf) key layout, so its vectors are
+  still not matched byte-exact — see [SPEC.md](SPEC.md).
+- **Constant time, with one caveat that is in the PRG, not the tree.** Neither
+  `Gen` nor any evaluator branches on a secret bit any more: the α path bit and
+  the running control bit are XOR-masked selects. The remaining data-dependence
+  is `std.crypto.core.aes`'s T-table fallback on targets WITHOUT hardware AES
+  (`prg.Aes128Mmo.constant_time == false` there); on such a target choose
+  `DpfWith(prg.Sha256Prg, …)`, which is constant time everywhere.
 - **Multi-point seeds must be independent ACROSS instances, not just within a
   pair.** Reusing one seed pair for two instances makes the two points'
   **shared prefix** readable from the correction words — a leak of the
@@ -136,7 +161,9 @@ Repeated points are a **multiset**: `α_j == α_l` makes the shared function
 ## Import graph
 
 ```
-fss → std.crypto.hash.sha2.Sha256   (std-only; meta.deps = .{})
+fss → std.crypto.core.aes.Aes128    (default PRG)
+    → std.crypto.hash.sha2.Sha256   (alternate PRG)
+                                    (std-only; meta.deps = .{})
 ```
 
 ## Verify
@@ -145,7 +172,7 @@ fss → std.crypto.hash.sha2.Sha256   (std-only; meta.deps = .{})
 zig build test-fss                          # Debug — all pass, no skips
 zig build test-fss -Doptimize=ReleaseFast   # all pass, no skips
 zig build test-fss --fuzz --release=safe    # the real fuzzer (NOT Debug — see SPEC.md)
-FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast  # evalFull vs eval-loop bench
+FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast  # PRG A/B + evalFull vs eval-loop bench
 zig fmt --check modules/fss/
 ```
 

@@ -98,7 +98,7 @@ finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external n
 fleetsim	A	EXTERNAL	7 protocols live vs real masters: pymodbus/pycomm3/bacpypes3/opendnp3/c104/snap7/asyncua
 framing	D	n/a	own length-prefix + JSON envelope wire shape invented here, no external spec
 frost	B	EXTERNAL	RFC 9591 Appendix E.5 official KAT, byte-exact (README/SPEC)
-fss	B	REDERIVED	independent Python re-derivation from BGI16 emits KAT vectors (SPEC.md)
+fss	B	REDERIVED	independent Python re-derivation from BGI16 emits KAT vectors, stated over the retained Sha256Prg (SPEC.md); FIPS-197 App. B pins the AES MMO step only
 fuzzysearch	C	n/a	in-process trie+DP fuzzy match; brute-force self oracle only (SPEC.md)
 genetlink	A	MIXED	offline goldens self-built; live nlctrl test vs real Linux kernel is external
 geoindex	C	n/a	in-process Hilbert R-tree; naive linear-scan self oracle only (SPEC.md)

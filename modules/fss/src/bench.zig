@@ -143,8 +143,88 @@ fn benchMulti(
     );
 }
 
+/// SHA-256 PRG vs fixed-key-AES PRG, at the three granularities that matter:
+/// the raw expansion, a full `Gen` (keys/sec), and a full-domain `evalFull`
+/// (evaluations/sec). Deliberately small buffers and many repetitions — the
+/// point is throughput per operation, not a big allocation.
+fn benchPrgPair(comptime n_bits: usize) !void {
+    const reps = 3;
+
+    inline for (.{ fss.prg.Sha256Prg, fss.prg.Aes128Mmo }) |P| {
+        const D = fss.DpfWith(P, n_bits, 8);
+        const s0 = [_]u8{0x3C} ** 16;
+        const s1 = [_]u8{0xC3} ** 16;
+
+        // (a) raw PRG expansions
+        const expansions = 1 << 20;
+        var t_prg: u64 = std.math.maxInt(u64);
+        var acc: u8 = 0;
+        for (0..reps) |_| {
+            const p = P.init();
+            var seed: [16]u8 = @splat(0x17);
+            const a = nowNs();
+            for (0..expansions) |_| {
+                const e = p.expand(seed);
+                seed = e.s_l;
+            }
+            const b = nowNs();
+            t_prg = @min(t_prg, b - a);
+            acc ^= seed[0];
+        }
+
+        // (b) Gen
+        const gens = 1 << 12;
+        var t_gen: u64 = std.math.maxInt(u64);
+        for (0..reps) |_| {
+            const a = nowNs();
+            for (0..gens) |i| {
+                const keys = D.genWithSeeds(@intCast(i % D.domain_size), 1, s0, s1);
+                acc ^= keys[0].cw[0].s_cw[0];
+            }
+            const b = nowNs();
+            t_gen = @min(t_gen, b - a);
+        }
+
+        // (c) evalFull over the whole (small) domain
+        var out: [1 << n_bits]D.Elem = undefined;
+        const keys = D.genWithSeeds(7, 1, s0, s1);
+        var t_eval: u64 = std.math.maxInt(u64);
+        for (0..reps) |_| {
+            const a = nowNs();
+            for (0..16) |_| D.evalFull(0, keys[0], &out);
+            const b = nowNs();
+            t_eval = @min(t_eval, b - a);
+        }
+        std.mem.doNotOptimizeAway(acc);
+        std.mem.doNotOptimizeAway(out[0]);
+
+        const per = struct {
+            fn rate(count: u64, ns: u64) f64 {
+                return @as(f64, @floatFromInt(count)) * 1e9 / @as(f64, @floatFromInt(ns));
+            }
+        }.rate;
+        std.debug.print(
+            "{s:<11} expand {d:>12.0}/s   Gen(n={d}) {d:>10.0} keys/s   evalFull {d:>12.0} evals/s\n",
+            .{
+                P.id,
+                per(expansions, t_prg),
+                n_bits,
+                per(gens, t_gen),
+                per(16 * (1 << n_bits), t_eval),
+            },
+        );
+    }
+}
+
 test "bench (opt-in via FSS_BENCH)" {
     if (std.testing.environ.getPosix("FSS_BENCH") == null) return error.SkipZigTest;
+
+    std.debug.print(
+        "\n=== fss PRG: SHA-256 vs fixed-key AES (hardware AES: {}) ===\n",
+        .{std.crypto.core.aes.has_hardware_support},
+    );
+    try benchPrgPair(12);
+
     std.debug.print("\n=== fss evalFull vs per-point eval ===\n", .{});
     const gpa = std.heap.page_allocator;
 

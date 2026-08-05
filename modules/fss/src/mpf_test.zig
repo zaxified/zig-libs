@@ -543,7 +543,10 @@ test "EXTERNAL: an Mpf key reproduces two independently-derived DPF KAT vectors"
     // header, a shared seed, a different offset — these bytes would not match.
     const v0 = kat_vectors.v0;
     const v3 = kat_vectors.v3;
-    const M = Mpf(4, 4, 2);
+    // The vectors are stated over the SHA-256 PRG (see kat_test.zig); the
+    // construction and the encoding under test here are the same code in every
+    // instantiation, so this still anchors both.
+    const M = mpf_mod.MpfWith(prg_mod.Sha256Prg, 4, 4, 2);
 
     const alphas: [2]M.Index = .{ @intCast(v0.alpha), @intCast(v3.alpha) };
     const betas: [2]M.Elem = .{ @intCast(v0.beta), @intCast(v3.beta) };

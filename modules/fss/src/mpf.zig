@@ -127,13 +127,21 @@ pub const GenError = error{
 /// protocol geometry — both parties compile the same instantiation — and the
 /// serialized length reveals it. What it does not reveal is the points.
 pub fn Mpf(comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize) type {
+    return MpfWith(prg_mod.default, n_bits, out_bytes, k);
+}
+
+/// `Mpf` with an explicitly chosen PRG — see `dpf.DpfWith`. The PRG is part of
+/// the key format here too, inherited from the sub-keys.
+pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize) type {
     // The `2k`-seed distinctness check is O(k²) and `Gen` holds `k` sub-keys;
     // both are fine at the scale this construction is the right one for. A `k`
     // this large is itself the signal to revisit the construction (module doc).
     if (k > 1024) @compileError("Mpf: k must be <= 1024");
     return struct {
         /// the single-point DPF this is `k` independent instances of
-        pub const Dpf = dpf_mod.Dpf(n_bits, out_bytes);
+        pub const Dpf = dpf_mod.DpfWith(P, n_bits, out_bytes);
+        /// the PRG both this and `Dpf` are built on (`prg.zig`)
+        pub const Prg = P;
         pub const G = Dpf.G;
         /// output-group element type (`Z_{2^{8*out_bytes}}`)
         pub const Elem = Dpf.Elem;
@@ -303,7 +311,7 @@ pub fn Mpf(comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize)
                 s[j] = key.keys[j].seed;
                 t[j] = b;
             }
-            walkPrefixEach(@TypeOf(context), emit, &key, b, &s, &t, 0, 0, count, context);
+            walkPrefixEach(@TypeOf(context), emit, P.init(), &key, b, &s, &t, 0, 0, count, context);
         }
 
         /// The interleaved walk under `evalEachFullWith`. Per level it applies
@@ -317,6 +325,7 @@ pub fn Mpf(comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize)
         fn walkPrefixEach(
             comptime Context: type,
             comptime emit: fn (Context, usize, *const [k]Elem) void,
+            p: P,
             key: *const Key,
             b: u1,
             s: *const [k]Seed,
@@ -333,10 +342,10 @@ pub fn Mpf(comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize)
             if (level == n_bits) {
                 var v: [k]Elem = undefined;
                 for (0..k) |j| {
-                    var e: Elem = prg_mod.convert(out_bytes, s[j]);
-                    if (t[j] == 1) e = G.add(e, key.keys[j].cw_final);
-                    if (b == 1) e = G.neg(e);
-                    v[j] = e;
+                    const leaf: Elem = p.convert(out_bytes, s[j]);
+                    const e0 = G.add(leaf, key.keys[j].cw_final & (0 -% @as(Elem, t[j])));
+                    const b_mask: Elem = 0 -% @as(Elem, b);
+                    v[j] = (G.neg(e0) & b_mask) | (e0 & ~b_mask);
                 }
                 emit(context, base, &v);
                 return;
@@ -347,7 +356,7 @@ pub fn Mpf(comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize)
             var s_r: [k]Seed = undefined;
             var t_r: [k]u1 = undefined;
             for (0..k) |j| {
-                const e = prg_mod.prg(s[j]);
+                const e = p.expand(s[j]);
                 const c = key.keys[j].cw[level];
                 s_l[j] = e.s_l;
                 t_l[j] = e.t_l ^ (t[j] & c.t_cw_l);
@@ -355,16 +364,16 @@ pub fn Mpf(comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize)
                 t_r[j] = e.t_r ^ (t[j] & c.t_cw_r);
                 // the seed CW is gated by the PARENT's control bit, per
                 // instance — applied after both children's bits are derived
-                // from that same parent bit.
-                if (t[j] == 1) {
-                    for (&s_l[j], c.s_cw) |*d, q| d.* ^= q;
-                    for (&s_r[j], c.s_cw) |*d, q| d.* ^= q;
-                }
+                // from that same parent bit. Masked, not branched: `t` is key
+                // material (see dpf.zig §"Constant time").
+                const m: u8 = 0 -% @as(u8, t[j]);
+                for (&s_l[j], c.s_cw) |*d, q| d.* ^= q & m;
+                for (&s_r[j], c.s_cw) |*d, q| d.* ^= q & m;
             }
 
             const half = @as(usize, 1) << @intCast(n_bits - 1 - level);
-            walkPrefixEach(Context, emit, key, b, &s_l, &t_l, level + 1, base, count, context);
-            walkPrefixEach(Context, emit, key, b, &s_r, &t_r, level + 1, base + half, count, context);
+            walkPrefixEach(Context, emit, p, key, b, &s_l, &t_l, level + 1, base, count, context);
+            walkPrefixEach(Context, emit, p, key, b, &s_r, &t_r, level + 1, base + half, count, context);
         }
 
         fn SumSink(

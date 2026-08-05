@@ -107,14 +107,33 @@ A self-consistent Gen/Eval pair can reconstruct correctly yet implement a
 **nonstandard** construction (e.g. different CW derivation), so full-domain
 self-consistency is **not** accepted as the sole correctness signal.
 
-- **No byte-exact PUBLIC test vector was adopted.** Published DPF vectors
-  (Google `distributed_point_functions`) are tied to that library's specific
-  **fixed-key-AES** PRG / hash construction; matching them byte-exact would
-  require reproducing that exact PRG (a non-goal for a pure-Zig, stdlib-only
-  Phase 1). Like `bulletproofs`' implementation-defined transcript, this
-  module's PRG is **module-defined** (documented in `prg.zig`), so its keys
-  are interoperable only with this module's own `Eval`.
-- **Anchor actually used: an INDEPENDENT re-derivation.** The construction was
+- **No byte-exact PUBLIC test vector was adopted, and adopting fixed-key AES
+  did not change that.** The obvious candidate is Google
+  `distributed_point_functions`. Moving to fixed-key AES removes the *primitive*
+  as an obstacle but not the rest: byte-exactness would additionally require
+  that library's fixed AES keys, its tweak/counter convention, its byte order,
+  its control-bit extraction, its value-correction scheme for packed outputs,
+  and its protobuf key layout — none of which are pinned by a published vector
+  file; its tests compute expectations inline. So the honest statement is
+  unchanged: this module's PRG and key layout are **module-defined**
+  (documented in `prg.zig`), and its keys are interoperable only with its own
+  `Eval`. What the PRG swap bought was speed (see §"PRG choice" below), not
+  interop.
+- **What IS externally anchored after the swap.** The AES step itself:
+  `prg.zig` pins `MMO_k(x) = AES_k(x) ⊕ x` against FIPS-197 Appendix B's
+  worked AES-128 example (the expected value is the XOR of two published
+  constants). That anchors "our AES call is AES, fed in the standard byte
+  order" — a real external number, and deliberately labelled for what it is
+  NOT: it says nothing about the DPF construction, the σ pre-mix, the tweaks
+  or the control-bit convention, which are this module's own.
+- **Anchor actually used: an INDEPENDENT re-derivation** — and it survived the
+  PRG swap intact, which is why `Sha256Prg` was kept rather than deleted. The
+  vectors are stated over the **SHA-256** instantiation
+  (`DpfWith(prg.Sha256Prg, …)`, exercised by `kat_test.zig`'s `KatDpf`), and
+  `DpfWith` is one body of correction-word code shared by every instantiation,
+  so reproducing the recorded `cw` bytes still pins that code byte-exact after
+  the default moved to AES. No vector was regenerated, and none was
+  self-generated to replace it. The construction was
   re-implemented from the BGI16 spec in a separate language (Python, stdlib
   `hashlib`) using the **same** SHA-256 PRG + `convert` + serialization this
   module pins. That reference (a) self-checks full-domain reconstruction over
@@ -402,9 +421,71 @@ case does.
 - **Sublinear multi-point FSS** — the cuckoo/batch-code construction, with the
   revisit trigger stated above.
 - **2-server PIR** built on `EvalAll` — now its own module, `pir`.
-- **Fixed-key-AES PRG** — the performance-standard, ~10× faster than SHA-256;
-  would additionally enable byte-exact interop with Google's DPF vectors.
-  (Tree-reuse `evalFull` was on this list and is now built —
-  §"Tree-reuse prefix evaluation" above.)
-- **Constant-time review** of `Eval`'s control-bit-gated branches (side-channel
-  hardening) — the branch on the running control bit is data-dependent.
+  (Fixed-key AES and the constant-time review were on this list; both are now
+  built — §"PRG choice" below.)
+
+## PRG choice (`prg.zig`) — why the default is fixed-key AES
+
+`Dpf`/`Mpf` are generic over the PRG. Two ship:
+
+| | `Aes128Mmo` (default, tag `0x02`) | `Sha256Prg` (tag `0x01`) |
+|---|---|---|
+| primitive | AES-128 under a public fixed key, MMO with the GKRRR σ pre-mix | SHA-256 |
+| per tree node | 2 AES blocks, issued as one `encryptWide` | 2 compressions |
+| control bit | low bit of the child block (BGI16 §3.2's own remark) | byte 16 of the hash |
+| constant time | only where AES is in hardware | always |
+| re-derivable from a stdlib-only script | no | yes (`hashlib`) |
+
+**σ, and why it is not plain `AES_k(x) ⊕ x`.** `H_j(x) = AES_k(σ(x ⊕ j)) ⊕
+σ(x ⊕ j)` with `σ(x) = (x_H ⊕ x_L) ‖ x_H`. The DPF feeds the PRG inputs that
+are XOR-correlated by construction — off the α-path both parties hold the same
+seed; on it the seeds are related through a correction word the other party
+also holds. That is precisely the setting Guo–Kolesnikov–Rosulek–Roy (S&P 2020)
+introduced σ for; plain MMO is correlation-robust but not *circular*
+correlation-robust under XOR offsets.
+
+**Measured** (`FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast`, i7-7920HQ,
+AES-NI present, same binary, same run — the SHA-256 row IS the pre-change
+module, since the construction code is identical):
+
+| | SHA-256 | fixed-key AES | |
+|---|---|---|---|
+| raw `expand` | 2.00 M/s | 71.8 M/s | **36×** |
+| `Gen`, n=12 | 75.4 k keys/s | 1.86 M keys/s | **25×** |
+| `evalFull`, n=12 full domain | 1.21 M evals/s | 30.3 M evals/s | **25×** |
+
+Larger than the "~10×" this was scoped out with, because the AES PRG also
+halves the number of primitive calls per node (one 128-bit block per child
+instead of a 256-bit hash for 17 bytes) and the two children pipeline through
+one `encryptWide`.
+
+**Key-format consequence, stated rather than discovered later.** Same `(n, L)`
+under two PRGs gives keys of the **same length** and different contents, so an
+old key decodes silently and evaluates to garbage. `Key.key_format`
+(`"fss.dpf/<prg-id>/v1"`) names the format and `Key.toBytesTagged` /
+`fromBytesTagged` carry a one-byte tag that rejects the wrong one
+(`error.UnsupportedKeyFormat`), asserted in `dpf.zig`. That tag is in the
+STORAGE codec only: the wire codec `toBytes`/`fromBytes` stays header-free
+because `pir/privacy_test.zig` asserts a serialized query share has no
+structurally-constant bytes, and a constant tag byte would both break that test
+and hand an observer a constant. On the wire the PRG is protocol geometry,
+exactly like `n`, `L` and `k`, none of which are in the bytes either.
+
+## Constant time
+
+`genWithSeeds`, `eval`, `evalFull`/`evalFullWith` and `Mpf`'s interleaved walk
+no longer branch on a secret bit. The α path bit in Gen and the running control
+bit `t` in every evaluator drive XOR-masked selects (`selectSeed`, `selectBit`,
+`xorMasked` in `dpf.zig`), so the instruction and branch trace is identical for
+every key, every α and every control-bit pattern. `x` in `eval` is a public
+query index but is masked the same way, so no reader has to reason about which
+of the two is secret.
+
+What remains, and it is in the PRG rather than the tree: on a target where
+`std.crypto.core.aes.has_hardware_support` is false, std falls back to a T-table
+AES whose table indices depend on the data. std applies cache-line-granular
+mitigations (`std.options.side_channels_mitigations`, default `.medium`) but
+does not claim constant time. `prg.Aes128Mmo.constant_time` exposes this, and
+`DpfWith(prg.Sha256Prg, …)` is the constant-time-everywhere choice for such a
+target. This is a real cost of the swap and is the second reason the SHA-256
+PRG was kept.

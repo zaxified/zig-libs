@@ -32,6 +32,17 @@ const gate = fss.gate;
 const Dpf = fss.Dpf;
 const kat_vectors = fss.kat_vectors;
 
+/// The KAT vectors were re-derived over the **SHA-256** PRG, so they are
+/// stated over that instantiation and not over the (now default) fixed-key-AES
+/// one. This is deliberate and is what let the default PRG change without
+/// costing the module its anchor: `DpfWith` shares ONE body of
+/// correction-word code across instantiations, so reproducing the recorded
+/// `cw` bytes still pins that code. What it no longer pins is the PRG itself —
+/// for the AES PRG that job belongs to `prg.zig`'s FIPS-197 MMO test.
+fn KatDpf(comptime n: usize, comptime L: usize) type {
+    return fss.DpfWith(fss.prg.Sha256Prg, n, L);
+}
+
 // ── Positive controls that run TODAY (no core) ────────────────────────────
 
 test "positive control: firstMismatch rejects an all-β (constant) sharing" {
@@ -88,7 +99,7 @@ test "full-domain correctness: Gen+EvalAll reconstruct f_{α,β} exhaustively" {
 test "byte-exact KAT vs independent reference vectors (anti-self-consistency)" {
     if (!gate.core_implemented) return error.SkipZigTest;
     inline for (kat_vectors.all) |v| {
-        const D = Dpf(v.n, v.out_bytes);
+        const D = KatDpf(v.n, v.out_bytes);
         const alpha: D.Index = @intCast(v.alpha);
         const beta: D.Elem = @intCast(v.beta);
         const keys = D.genWithSeeds(alpha, beta, v.seed0, v.seed1);

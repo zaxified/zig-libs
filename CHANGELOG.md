@@ -270,6 +270,49 @@ Per-module API changes since v0.1.0 worth calling out:
   and that error's meaning narrows to "key material was named but none of it
   could be reduced to a comparable key". Same-form matching, and every
   non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`fss`: BREAKING — the default PRG is now fixed-key AES-128, which changes
+  the key bytes.** `Dpf`/`Mpf` were SHA-256; they are now `prg.Aes128Mmo`,
+  fixed-key AES in the Matyas–Meyer–Oseas shape with the Guo–Kolesnikov–
+  Rosulek–Roy σ pre-mix (`H_j(x) = AES_k(σ(x ⊕ j)) ⊕ σ(x ⊕ j)`, public fixed
+  key, control bit = the child block's low bit). Measured on the same host, in
+  the same binary: raw expansion **2.00 M/s → 71.8 M/s (36×)**, `Gen` **75.4 k
+  → 1.86 M keys/s (25×)**, full-domain `evalFull` **1.21 M → 30.3 M evals/s
+  (25×)** — more than the "~10×" it was scoped out with, because AES also
+  halves the primitive calls per node (one 128-bit block per child rather than
+  a 256-bit hash for 17 bytes) and the two children pipeline through one
+  `encryptWide`. σ rather than plain MMO because the construction feeds the PRG
+  XOR-correlated inputs by design, which is the setting GKRRR introduced σ for.
+  **What it did NOT buy: interop.** Fixed-key AES removes the primitive as an
+  obstacle to matching Google's DPF vectors, but not that library's own fixed
+  keys, tweak convention, value-correction scheme or protobuf key layout, and
+  there is no published vector file to match — so the module stays
+  self-defined, and the claim that this swap yields byte-exact external
+  agreement is **wrong** and is corrected in `SPEC.md`.
+  **The anchor survived, deliberately.** `Sha256Prg` was kept, not deleted:
+  `DpfWith` is one body of correction-word code shared by both instantiations,
+  so the recorded independent-re-derivation KAT vectors — stated over SHA-256 —
+  still pin that code byte-exact. No vector was regenerated or self-generated.
+  New, and genuinely external as far as it goes: the MMO step is pinned against
+  FIPS-197 Appendix B's AES-128 example, which anchors the AES call and
+  explicitly nothing above it.
+  **Key format.** Both PRGs give keys of the *same length* and different
+  contents, so an old key decodes silently and evaluates to garbage. `Dpf`/
+  `Mpf` gained `DpfWith`/`MpfWith` (PRG chosen explicitly), `Key.key_format`
+  (`"fss.dpf/aes128-mmo/v1"`), and a tagged STORAGE codec
+  `Key.toBytesTagged`/`fromBytesTagged` that rejects the other PRG's key with
+  `error.UnsupportedKeyFormat`. The wire codec `toBytes`/`fromBytes` is
+  unchanged and stays header-free — `pir` asserts a query share carries no
+  structurally-constant bytes, so a tag byte belongs in storage, not on the
+  wire, and on the wire the PRG is out-of-band geometry like `n`, `L`, `k`.
+  Removed: the free `prg.prg`/`prg.convert` functions (now
+  `prg.Aes128Mmo`/`prg.Sha256Prg` methods) — a compile error rather than a
+  silent change of function.
+  **Constant time**, closing the other scoped-out item: `Gen` and every
+  evaluator now drive the α path bit and the running control bit through
+  XOR-masked selects instead of branches. Remaining caveat, in the PRG and not
+  the tree — on targets without hardware AES std falls back to a mitigated but
+  not constant-time T-table; `prg.Aes128Mmo.constant_time` reports it and
+  `DpfWith(prg.Sha256Prg, …)` is the constant-time-everywhere choice.
 - **`fss`:** `Dpf.evalFull` / `evalFullWith` — one tree traversal that emits
   every leaf, instead of re-walking the tree from the root per point. Cost
   drops from `O(N log N)` PRG calls to `O(N)`: measured **570 ms → 52 ms**

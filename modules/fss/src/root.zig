@@ -36,12 +36,17 @@
 //!     `.evalEachFullWith` / `.evalFullWith` / `.evalFull`: ONE interleaved
 //!     walk descending all `k` trees together, so a consumer's data is
 //!     traversed once and each index costs ~`k` PRG calls instead of `k·n`.
+//!   - `DpfWith(P, n, L)` / `MpfWith(P, n, L, k)` — the same with the PRG
+//!     chosen explicitly. The PRG is part of the key format (`Key.key_format`);
+//!     `Dpf`/`Mpf` mean `prg.default`, which is **fixed-key AES**
+//!     (`prg.Aes128Mmo`). `prg.Sha256Prg` stays available and is what the
+//!     recorded KAT vectors are stated over — see SPEC.md §"PRG choice".
 //!   - `prg` / `group` — the mechanical building blocks (both usable alone).
 //!
-//! Room to grow (all OUT of Phase 1, see SPEC.md): a `dcf.zig` Distributed
-//! Comparison Function and a fixed-key-AES PRG. The 2-server PIR layer landed
-//! as its own module (`pir`), and multi-point FSS — listed there as
-//! "General FSS" — is `mpf.zig`.
+//! Room to grow (OUT of Phase 1, see SPEC.md): a `dcf.zig` Distributed
+//! Comparison Function. The 2-server PIR layer landed as its own module
+//! (`pir`), multi-point FSS — listed there as "General FSS" — is `mpf.zig`,
+//! and the fixed-key-AES PRG + the constant-time review are both done.
 
 const std = @import("std");
 
@@ -50,7 +55,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant, // no shared state; caller supplies all inputs
     .model_after = "Boyle-Gilboa-Ishai DPF (Function Secret Sharing: Improvements and Extensions, CCS 2016)",
-    .deps = .{}, // std-only (std.crypto SHA-256)
+    .deps = .{}, // std-only (std.crypto: fixed-key AES-128, and SHA-256)
 };
 
 pub const gate = @import("gate.zig");
@@ -59,13 +64,21 @@ pub const group = @import("group.zig");
 
 const dpf = @import("dpf.zig");
 /// `Dpf(n, L)` — a 2-party single-point DPF over `{0,1}^n` with output group
-/// `Z_{2^{8L}}`. See `dpf.zig`.
+/// `Z_{2^{8L}}`, on the default PRG (`prg.default` = fixed-key AES).
+/// See `dpf.zig`.
 pub const Dpf = dpf.Dpf;
+/// `DpfWith(P, n, L)` — the same, with the PRG chosen explicitly. The PRG is
+/// part of the key format; see `Key.key_format`.
+pub const DpfWith = dpf.DpfWith;
+/// The one way `Key.fromBytesTagged` can fail (`error.UnsupportedKeyFormat`).
+pub const KeyFormatError = dpf.KeyFormatError;
 
 const mpf = @import("mpf.zig");
 /// `Mpf(n, L, k)` — a 2-party `k`-point FSS scheme over `{0,1}^n`, built as
 /// `k` independent `Dpf` instances summed in the output group. See `mpf.zig`.
 pub const Mpf = mpf.Mpf;
+/// `MpfWith(P, n, L, k)` — the same, with the PRG chosen explicitly.
+pub const MpfWith = mpf.MpfWith;
 /// The one way `Mpf.genWithSeeds` can fail (`error.SeedReuse`). See `mpf.zig`.
 pub const GenError = mpf.GenError;
 
