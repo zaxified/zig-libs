@@ -64,6 +64,25 @@ is simply not expressible against a concrete `ResponseWriter`):
   well-formed key whose *scoped* form would exceed 1 KiB degrades to running
   normally (no dedup) rather than erroring.
 
+### Request-fingerprint mismatch: 422
+
+A key reused across a different method or path is already safe under the
+default `scope = .target`: those are different cache entries, so a
+`POST /orders` answer can never replay for `POST /refunds` (only
+`scope = .key_only` opts out of that). The same target with a **different
+body** is the dangerous case — a client library reusing one key for two
+genuinely different payloads must NOT get the first payload's answer back.
+The middleware buffers the request body (bounded by `Options.max_body_bytes`,
+default 16 KiB) and SHA-256-fingerprints it; the digest is recorded alongside
+the response and compared (constant-time, `std.crypto.timing_safe.eql`) on
+every same-key request. A mismatch answers **422** without running the
+handler (the IETF Idempotency-Key draft's SHOULD). A body over the cap cannot
+be safely fingerprinted, so it fails closed with **413** instead of silently
+falling back to no check — the whole point is that a check that can be
+dodged is not a check. The buffered bytes are re-exposed to the handler
+transparently (via the same `req.decoded` seam inbound gzip decoding uses),
+so a handler that reads the body still sees it.
+
 ### Bounds & retention
 
 `ramcache` supplies the store's spine: a TTL (default 24 h via `Store.ttl_ns`),
@@ -80,18 +99,6 @@ request arriving in that window is answered **409** (already in flight)
 instead of re-running it. This is in-process state, not shared through
 `ramcache` — it closes the race within one process but not across multiple
 processes/machines sharing one store.
-
-### Not handled
-
-- **Request-fingerprint mismatch**, partially. A key reused across a different
-  method or path is already safe under the default `scope = .target`: those are
-  different cache entries, so a `POST /orders` answer can never replay for
-  `POST /refunds` (only `scope = .key_only` opts out of that). What is NOT
-  detected is the same target with a **different body** — the first response is
-  replayed, so a client library reusing one key for two payloads gets the wrong
-  answer. The IETF Idempotency-Key draft says 422 here; that needs the body
-  hashed, which needs it buffered before the handler reads it, a per-request
-  memory cost not imposed today. Pinned by the `GAP:` test in `root.zig`.
 
 ## Attributes
 
@@ -114,11 +121,17 @@ modules.
 
 ## Verification
 
-`zig build test-idempotency` — 9 offline tests through `http.Server.serveStream`
+`zig build test-idempotency` — 13 offline tests through `http.Server.serveStream`
 with a real `router` + `ramcache`: first key runs the handler once and a replay
 returns the cached response without re-running (hit-counter asserted), a
 concurrent same-key duplicate fired from inside the first handler is rejected
 409 in-flight rather than double-running it, a different key runs again, a
 non-idempotent method (GET) bypasses, a POST with no key bypasses, an invalid
 key → 400, target-scope isolation across paths, TTL expiry re-runs the handler
-(injected clock), and encode/decode round-trip. `zig fmt --check` clean.
+(injected clock), encode/decode round-trip (now including the digest), a
+different body under the same key answers 422 without running the handler
+(and the original entry still replays afterward, untouched), a same body
+retry with a real request body still replays, `.key_only` scope still
+cross-replays across endpoints when the body genuinely matches, and the body
+cap boundary (exactly at the cap fingerprints normally, one byte over answers
+413). `zig fmt --check` clean.

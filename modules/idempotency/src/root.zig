@@ -57,21 +57,25 @@
 //! client retries once the original finishes and then gets the replay.
 //!
 //! **Request-fingerprint mismatch** (a client reusing one key for two
-//! different requests) is covered only as far as the cache key goes, and it is
-//! worth being precise about where that line falls:
+//! different requests) is covered two ways:
 //!
 //! - Different method or path, under the default `scope = .target`: these are
 //!   *different cache entries*, so no cross-replay can happen. The dangerous
 //!   confusion — a key from `POST /orders` replaying as the answer to
 //!   `POST /refunds` — cannot occur unless you opt into `scope = .key_only`.
-//! - Same method and path, different **body**: NOT detected. The recorded
-//!   response is replayed, so a client library that reuses a key across two
-//!   genuinely different payloads gets the first one's answer. The IETF
-//!   Idempotency-Key draft says a server SHOULD answer 422 here; doing so
-//!   requires hashing the request body, which means buffering it before the
-//!   handler reads it — a memory cost per in-flight request this module does
-//!   not currently impose. `idempotency: same key, different body` below pins
-//!   the current behavior so the choice stays visible.
+//! - Same method and path (or same key under `.key_only`), different
+//!   **body**: detected via a SHA-256 fingerprint of the request body,
+//!   recorded alongside the response and compared (constant-time) on every
+//!   same-key request. A mismatch means this is not a retry — it is either a
+//!   client bug or a replay of the key against different content — and the
+//!   module answers **422** (the IETF Idempotency-Key draft's SHOULD) without
+//!   running the handler. Detecting this needs the body buffered before the
+//!   handler reads it, bounded by `Options.max_body_bytes` (default 16 KiB):
+//!   a body over the cap cannot be safely fingerprinted, and letting it
+//!   through unverified would just reopen this same hole by another name, so
+//!   it fails closed — **413** — rather than silently skipping the check.
+//!   The buffered bytes are re-exposed to the handler via `req.decoded`, so a
+//!   handler that reads the body still sees it.
 //!
 //! ## Usage
 //!
@@ -140,6 +144,18 @@ pub const default_max_key_len = 255;
 /// whose scoped key would exceed this bypasses deduplication (runs normally,
 /// nothing recorded) rather than being rejected.
 pub const max_scoped_key = 1024;
+
+/// Length of the body fingerprint (SHA-256).
+pub const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+
+/// Default cap on the request body buffered and fingerprinted for the
+/// same-key mismatch check. Generous for a JSON payment/order payload — the
+/// Idempotency-Key pattern's motivating use case — without letting an
+/// unbounded body sit in memory per in-flight request. A body over the cap
+/// (`Options.max_body_bytes`) cannot be safely fingerprinted, so it fails
+/// closed with **413** rather than silently skipping the check (see the
+/// module doc's "Request-fingerprint mismatch" note).
+pub const default_max_body_bytes: usize = 16 * 1024;
 
 /// How the client's key maps to a cache key.
 pub const Scope = enum {
@@ -229,9 +245,14 @@ pub const Store = struct {
 
     /// The outcome of `beginOrReplay`.
     pub const Begin = union(enum) {
-        /// A completed response is already recorded — an owned copy of its
-        /// encoded blob (caller frees with the same allocator it passed).
+        /// A completed response is already recorded, and its fingerprint
+        /// matches this request's body — an owned copy of the encoded blob
+        /// (caller frees with the same allocator it passed).
         replay: []u8,
+        /// A completed response is already recorded under this key, but its
+        /// fingerprint does NOT match this request's body: not a retry — the
+        /// caller must answer 422 without running the handler.
+        mismatch,
         /// Another request holds the reservation for this key: the caller
         /// must answer 409 (in flight) without running the handler.
         in_flight,
@@ -241,14 +262,37 @@ pub const Store = struct {
     };
 
     /// Atomically (under a single lock) either return a recorded response to
-    /// replay, reject a concurrent in-flight duplicate, or reserve `key` for
-    /// this request. Doing the cache-check and the reservation together is
-    /// what makes the second concurrent first-flight lose the race cleanly.
-    fn beginOrReplay(store: *Store, key: []const u8, gpa: std.mem.Allocator) std.mem.Allocator.Error!Begin {
+    /// replay, flag a body-fingerprint mismatch, reject a concurrent
+    /// in-flight duplicate, or reserve `key` for this request. Doing the
+    /// cache-check and the reservation together is what makes the second
+    /// concurrent first-flight lose the race cleanly. `digest` is this
+    /// request's SHA-256 body fingerprint, computed by the caller before the
+    /// lock is taken (hashing never happens under the lock).
+    fn beginOrReplay(store: *Store, key: []const u8, digest: [digest_len]u8, gpa: std.mem.Allocator) std.mem.Allocator.Error!Begin {
         const now = store.clock.now();
         lockSpin(&store.lock);
         defer store.lock.unlock();
-        if (store.cache.get(key, now, 0)) |v| return .{ .replay = try gpa.dupe(u8, v) };
+        if (store.cache.get(key, now, 0)) |v| {
+            // Check the fingerprint before ever handing back the recorded
+            // response: a same-key request whose body differs from what was
+            // recorded is not a retry (a client bug, or a replay of the key
+            // against different content — the IETF Idempotency-Key draft's
+            // 422 case). Constant-time because both operands are influenced
+            // by the client (its own request's digest against the stored
+            // one) — a variable-time compare would let a client binary-
+            // search the stored digest byte by byte across retries, which
+            // defeats fingerprinting as a check at all.
+            //
+            // An undecodable stored blob (corrupt/short — should not happen
+            // in practice) skips the compare and falls through to the
+            // existing replay path, which itself re-runs the handler on a
+            // decode failure (see `middlewareRun`) — unchanged from before
+            // fingerprinting landed.
+            if (decode(v)) |rec| {
+                if (!std.crypto.timing_safe.eql([digest_len]u8, rec.digest, digest)) return .mismatch;
+            }
+            return .{ .replay = try gpa.dupe(u8, v) };
+        }
         if (store.in_flight.contains(key)) return .in_flight;
         const owned = try store.cache.alloc.dupe(u8, key);
         errdefer store.cache.alloc.free(owned);
@@ -280,15 +324,21 @@ pub const Store = struct {
         ctx.res.setStatus(status);
         if (content_type) |ct| try ctx.res.setHeader("Content-Type", ct);
         try ctx.res.writeAll(body);
-        if (currentKey()) |key| store.record(key, status, content_type orelse "", body);
+        // `current_key` and `current_digest` are set and cleared together by
+        // the middleware (see `middlewareRun`), so a non-null key always has
+        // a digest alongside it.
+        if (currentKey()) |key| store.record(key, current_digest.?, status, content_type orelse "", body);
     }
 
-    /// Record a completed response under `key`. Best-effort: a failed encode or
-    /// a full cache silently skips caching (a missed dedup is never fatal — the
-    /// next replay just re-runs the handler). Callable directly when a handler
-    /// does not use `respond`.
-    pub fn record(store: *Store, key: []const u8, status: u16, content_type: []const u8, body: []const u8) void {
-        const blob = encode(store.cache.alloc, status, content_type, body) catch return;
+    /// Record a completed response under `key`, alongside `digest` — the
+    /// SHA-256 fingerprint of the request body that produced it, checked
+    /// against a later same-key request (see `beginOrReplay`). Best-effort: a
+    /// failed encode or a full cache silently skips caching (a missed dedup
+    /// is never fatal — the next replay just re-runs the handler). Callable
+    /// directly when a handler does not use `respond` — pair with
+    /// `currentDigest()` for the matching fingerprint.
+    pub fn record(store: *Store, key: []const u8, digest: [digest_len]u8, status: u16, content_type: []const u8, body: []const u8) void {
+        const blob = encode(store.cache.alloc, digest, status, content_type, body) catch return;
         defer store.cache.alloc.free(blob);
         const now = store.clock.now();
         lockSpin(&store.lock);
@@ -297,32 +347,38 @@ pub const Store = struct {
     }
 };
 
-// Stored blob layout: [status:u16 BE][ct_len:u16 BE][ct bytes][body bytes].
+// Stored blob layout:
+// [digest:32][status:u16 BE][ct_len:u16 BE][ct bytes][body bytes].
 const RecordedResponse = struct {
+    digest: [digest_len]u8,
     status: u16,
     content_type: []const u8,
     body: []const u8,
 };
 
-fn encode(gpa: std.mem.Allocator, status: u16, content_type: []const u8, body: []const u8) ![]u8 {
+fn encode(gpa: std.mem.Allocator, digest: [digest_len]u8, status: u16, content_type: []const u8, body: []const u8) ![]u8 {
     const ct_len = std.math.cast(u16, content_type.len) orelse return error.InvalidRecord;
-    const blob = try gpa.alloc(u8, 4 + content_type.len + body.len);
-    std.mem.writeInt(u16, blob[0..2], status, .big);
-    std.mem.writeInt(u16, blob[2..4], ct_len, .big);
-    @memcpy(blob[4..][0..content_type.len], content_type);
-    @memcpy(blob[4 + content_type.len ..], body);
+    const blob = try gpa.alloc(u8, digest_len + 4 + content_type.len + body.len);
+    @memcpy(blob[0..digest_len], &digest);
+    std.mem.writeInt(u16, blob[digest_len..][0..2], status, .big);
+    std.mem.writeInt(u16, blob[digest_len + 2 ..][0..2], ct_len, .big);
+    @memcpy(blob[digest_len + 4 ..][0..content_type.len], content_type);
+    @memcpy(blob[digest_len + 4 + content_type.len ..], body);
     return blob;
 }
 
 fn decode(blob: []const u8) ?RecordedResponse {
-    if (blob.len < 4) return null;
-    const status = std.mem.readInt(u16, blob[0..2], .big);
-    const ct_len = std.mem.readInt(u16, blob[2..4], .big);
-    if (4 + @as(usize, ct_len) > blob.len) return null;
+    if (blob.len < digest_len + 4) return null;
+    var digest: [digest_len]u8 = undefined;
+    @memcpy(&digest, blob[0..digest_len]);
+    const status = std.mem.readInt(u16, blob[digest_len..][0..2], .big);
+    const ct_len = std.mem.readInt(u16, blob[digest_len + 2 ..][0..2], .big);
+    if (digest_len + 4 + @as(usize, ct_len) > blob.len) return null;
     return .{
+        .digest = digest,
         .status = status,
-        .content_type = blob[4..][0..ct_len],
-        .body = blob[4 + ct_len ..],
+        .content_type = blob[digest_len + 4 ..][0..ct_len],
+        .body = blob[digest_len + 4 + ct_len ..],
     };
 }
 
@@ -340,6 +396,15 @@ pub const Options = struct {
     max_key_len: usize = default_max_key_len,
     /// How the client key maps to a cache key. Default `.target`.
     scope: Scope = .target,
+    /// Cap on the request body buffered and SHA-256 fingerprinted to detect
+    /// a same-key request with a different body. A body at or under this is
+    /// hashed and compared (constant-time) against the fingerprint recorded
+    /// for the first request under the key; a mismatch answers 422. A body
+    /// over this cap cannot be safely fingerprinted and answers 413 instead
+    /// of silently letting the mismatch check be skipped — see the module
+    /// doc's "Request-fingerprint mismatch" note. Default
+    /// `default_max_body_bytes` (16 KiB).
+    max_body_bytes: usize = default_max_body_bytes,
 };
 
 /// Config + the middleware over a `Store`. Immutable once built; share one
@@ -360,6 +425,11 @@ pub const Idempotency = struct {
 threadlocal var key_buf: [max_scoped_key]u8 = undefined;
 threadlocal var current_key: []const u8 = &.{};
 
+// The SHA-256 fingerprint of the current request's (buffered) body, set
+// alongside `current_key` by the middleware and cleared with it — so a
+// non-null `current_key` always has a matching digest. See `currentDigest`.
+threadlocal var current_digest: ?[digest_len]u8 = null;
+
 // A replayed `Content-Type` value must outlive the middleware call (the
 // ResponseWriter stores header value slices verbatim — no copy — and the head
 // is not flushed until after the handler chain returns), so the decoded value
@@ -375,11 +445,20 @@ pub fn currentKey() ?[]const u8 {
     return if (current_key.len == 0) null else current_key;
 }
 
+/// The SHA-256 fingerprint of the current request's body, or null exactly
+/// when `currentKey()` is null (the two are set and cleared together). A
+/// handler that records a response via `Store.record` directly instead of
+/// `Store.respond` needs this to pass the matching digest.
+pub fn currentDigest() ?[digest_len]u8 {
+    return current_digest;
+}
+
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const idem: *const Idempotency = @ptrCast(@alignCast(state.?));
-    // Clear any key left over from a prior request on this thread, so a
-    // bypassed request never inherits a stale one.
+    // Clear any key/digest left over from a prior request on this thread, so
+    // a bypassed request never inherits a stale one.
     current_key = &.{};
+    current_digest = null;
 
     if (!methodGuarded(idem.options.methods, ctx.req.method)) return next.run(ctx);
     const client_key = ctx.req.header(idem.options.header_name) orelse return next.run(ctx);
@@ -389,9 +468,43 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         // Too long to scope — degrade to running normally without dedup.
         return next.run(ctx);
 
-    // One atomic step: replay a completed response, reject a concurrent
-    // in-flight duplicate (409), or reserve this key and run the handler.
-    switch (try idem.store.beginOrReplay(scoped, idem.store.cache.alloc)) {
+    // Buffer and fingerprint the body before the cache decision: whether
+    // this is a replay or a 422 mismatch depends on it. Bounded — a body
+    // over `max_body_bytes` cannot be safely fingerprinted, so it fails
+    // closed (413) instead of silently skipping the check (see the module
+    // doc's "Request-fingerprint mismatch" note).
+    //
+    // `allocRemaining` treats reaching its limit exactly as `StreamTooLong`
+    // (bytes up to the limit are read either way); probing at
+    // `max_body_bytes + 1` is what makes a body of exactly the configured
+    // cap succeed while one byte more is rejected — the documented boundary.
+    const probe_cap = if (idem.options.max_body_bytes == std.math.maxInt(usize))
+        idem.options.max_body_bytes
+    else
+        idem.options.max_body_bytes + 1;
+    const body_bytes = ctx.req.reader().allocRemaining(idem.store.cache.alloc, .limited(probe_cap)) catch |err| switch (err) {
+        error.StreamTooLong => return payloadTooLarge(ctx),
+        else => |e| return e,
+    };
+    defer idem.store.cache.alloc.free(body_bytes);
+    var digest: [digest_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body_bytes, &digest, .{});
+
+    // We just drained the body ourselves — re-expose the buffered bytes to
+    // the handler transparently via the `decoded` override seam (the same
+    // one inbound gzip decoding uses), so a handler that reads the body
+    // still sees it. Restored (not just nulled) on return, in case an outer
+    // caller relies on whatever was there before us (e.g. a decompressed
+    // stream from server-level gzip handling).
+    var body_reader: std.Io.Reader = .fixed(body_bytes);
+    const prev_decoded = ctx.req.decoded;
+    ctx.req.decoded = &body_reader;
+    defer ctx.req.decoded = prev_decoded;
+
+    // One atomic step: replay a completed response, flag a body-fingerprint
+    // mismatch, reject a concurrent in-flight duplicate (409), or reserve
+    // this key and run the handler.
+    switch (try idem.store.beginOrReplay(scoped, digest, idem.store.cache.alloc)) {
         .replay => |blob| {
             // A hit writes the recorded response and short-circuits the chain,
             // so the handler never runs.
@@ -409,15 +522,19 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
             try ctx.res.writeAll(rec.body); // writeAll copies, so freeing blob after is safe
             return;
         },
+        .mismatch => return unprocessable(ctx),
         .in_flight => return conflict(ctx),
         .reserved => {},
     }
 
-    // Miss (reserved): expose the scoped key for the handler's `respond`, run
-    // the chain, then release the reservation so a later retry can proceed.
+    // Miss (reserved): expose the scoped key + digest for the handler's
+    // `respond`, run the chain, then release the reservation so a later
+    // retry can proceed.
     current_key = scoped;
+    current_digest = digest;
     defer {
         current_key = &.{};
+        current_digest = null;
         idem.store.finish(scoped);
     }
     return next.run(ctx);
@@ -465,6 +582,26 @@ fn conflict(ctx: *router.Ctx) anyerror!void {
     ctx.res.setStatus(409);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Idempotency-Key request already in flight\n");
+}
+
+/// A same-key, same-target request whose body fingerprint does not match the
+/// one recorded for the first request under this key: not a retry — either a
+/// client bug or a replay of the key against different content. The IETF
+/// Idempotency-Key draft's SHOULD-422 case. The handler never runs.
+fn unprocessable(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(422);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Idempotency-Key reused with a different request body\n");
+}
+
+/// A same-key request whose body exceeds `Options.max_body_bytes`: it cannot
+/// be safely fingerprinted, and letting it through unverified would just
+/// reopen the same-key/different-body hole this feature exists to close —
+/// so it fails closed rather than silently falling back to no dedup.
+fn payloadTooLarge(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(413);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Idempotency-Key request body exceeds the fingerprint cap\n");
 }
 
 fn lockSpin(m: *std.atomic.Mutex) void {
@@ -549,6 +686,14 @@ fn reqKey(comptime method: []const u8, comptime path: []const u8, comptime key: 
 
 fn reqNoKey(comptime method: []const u8, comptime path: []const u8) []const u8 {
     return method ++ " " ++ path ++ " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+}
+
+/// Like `reqKey`, carrying a request body under `Content-Length` framing —
+/// for the fingerprint tests, which need actual body bytes on the wire.
+fn reqKeyBody(comptime method: []const u8, comptime path: []const u8, comptime key: []const u8, comptime body: []const u8) []const u8 {
+    return method ++ " " ++ path ++ " HTTP/1.1\r\nHost: t\r\nIdempotency-Key: " ++ key ++
+        "\r\nContent-Length: " ++ std.fmt.comptimePrint("{d}", .{body.len}) ++
+        "\r\nConnection: close\r\n\r\n" ++ body;
 }
 
 fn newCache() ramcache.Cache {
@@ -794,32 +939,37 @@ test "TTL expiry: after the recorded response expires, the handler re-runs" {
     try testing.expectEqual(@as(u32, 2), app.calls);
 }
 
-test "encode/decode round-trips status, content-type and body" {
-    const blob = try encode(testing.allocator, 201, "application/json", "{\"ok\":true}");
+test "encode/decode round-trips digest, status, content-type and body" {
+    const d1: [digest_len]u8 = [_]u8{0xAB} ** digest_len;
+    const blob = try encode(testing.allocator, d1, 201, "application/json", "{\"ok\":true}");
     defer testing.allocator.free(blob);
     const rec = decode(blob).?;
+    try testing.expectEqualSlices(u8, &d1, &rec.digest);
     try testing.expectEqual(@as(u16, 201), rec.status);
     try testing.expectEqualStrings("application/json", rec.content_type);
     try testing.expectEqualStrings("{\"ok\":true}", rec.body);
 
-    // Empty content-type is valid.
-    const blob2 = try encode(testing.allocator, 204, "", "");
+    // Empty content-type is valid; an all-zero digest is a valid bit pattern
+    // too (just not one SHA-256 is expected to ever actually produce).
+    const d2: [digest_len]u8 = [_]u8{0} ** digest_len;
+    const blob2 = try encode(testing.allocator, d2, 204, "", "");
     defer testing.allocator.free(blob2);
     const rec2 = decode(blob2).?;
+    try testing.expectEqualSlices(u8, &d2, &rec2.digest);
     try testing.expectEqual(@as(u16, 204), rec2.status);
     try testing.expectEqualStrings("", rec2.content_type);
     try testing.expectEqualStrings("", rec2.body);
 
-    // A truncated blob decodes to null rather than reading out of bounds.
+    // A truncated blob (shorter than the digest + header) decodes to null
+    // rather than reading out of bounds.
     try testing.expectEqual(@as(?RecordedResponse, null), decode("x"));
 }
 
-// Same target, different body: the replay wins. See the module doc comment —
-// detecting this needs a body fingerprint, which needs the body buffered
-// before the handler reads it. This test exists so the limitation is visible
-// in the suite and not only in prose, and so it fails loudly the day a
-// fingerprint lands and the answer becomes 422.
-test "GAP: same key and target with a different body replays instead of answering 422" {
+// Graduated from the `GAP:` test pinning the documented limitation (commit
+// 71540f3): same target, different body used to replay the first response
+// unchecked. Now the body is fingerprinted and a mismatch answers 422
+// without running the handler — this is the conformance test for that.
+test "same key and target with a different body answers 422, not a replay" {
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache };
@@ -834,21 +984,116 @@ test "GAP: same key and target with a different body replays instead of answerin
     try r.post("/orders", hOrder);
 
     const with_body = "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: dup\r\n" ++
-        "Content-Type: application/json\r\nContent-Length: 12\r\n" ++
-        "Connection: close\r\n\r\n{\"amt\":10}\r\n";
+        "Content-Type: application/json\r\nContent-Length: 10\r\n" ++
+        "Connection: close\r\n\r\n{\"amt\":10}";
     const other_body = "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: dup\r\n" ++
-        "Content-Type: application/json\r\nContent-Length: 14\r\n" ++
-        "Connection: close\r\n\r\n{\"amt\":1000}\r\n";
+        "Content-Type: application/json\r\nContent-Length: 12\r\n" ++
+        "Connection: close\r\n\r\n{\"amt\":1000}";
 
     var b1: [2048]u8 = undefined;
     try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, with_body, &b1)));
+    try testing.expectEqual(@as(u32, 1), app.calls);
 
-    // A DIFFERENT payload under the same key: today this replays the first
-    // answer. Note the amount differs in length too, so even a Content-Length
-    // fingerprint would have caught this one.
+    // A DIFFERENT payload under the same key: not a replay — 422, and the
+    // handler never sees it.
     var b2: [2048]u8 = undefined;
     const second = runWire(&r, other_body, &b2);
-    try testing.expectEqualStrings("order-1", bodyOf(second));
-    try testing.expectEqualStrings("true", headerValue(second, "Idempotent-Replayed").?);
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 422"));
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(second, "Idempotent-Replayed"));
     try testing.expectEqual(@as(u32, 1), app.calls); // the handler never saw the second request
+
+    // The original is still intact and still replays on its own — the
+    // mismatch didn't clobber or evict the recorded entry.
+    var b3: [2048]u8 = undefined;
+    const replay = runWire(&r, with_body, &b3);
+    try testing.expectEqualStrings("order-1", bodyOf(replay));
+    try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+test "same key, same body: replays across a retry even with a real request body" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+
+    var b1: [2048]u8 = undefined;
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, reqKeyBody("POST", "/orders", "dup", "{\"amt\":10}"), &b1)));
+
+    var b2: [2048]u8 = undefined;
+    const replay = runWire(&r, reqKeyBody("POST", "/orders", "dup", "{\"amt\":10}"), &b2);
+    try testing.expectEqualStrings("order-1", bodyOf(replay));
+    try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+test "key_only scope: same key and same body still cross-replays across endpoints (unaffected by fingerprinting)" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .scope = .key_only } };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+    try r.post("/refunds", hOrder);
+
+    var b1: [2048]u8 = undefined;
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, reqKeyBody("POST", "/orders", "dup", "same"), &b1)));
+
+    // Different endpoint, SAME key and SAME body under `.key_only`: this is
+    // the documented "global across endpoints" behavior — the fingerprint
+    // check does not get in its way because the body genuinely matches.
+    var b2: [2048]u8 = undefined;
+    const cross = runWire(&r, reqKeyBody("POST", "/refunds", "dup", "same"), &b2);
+    try testing.expectEqualStrings("order-1", bodyOf(cross));
+    try testing.expectEqualStrings("true", headerValue(cross, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+test "body fingerprint cap: exactly at the cap fingerprints normally; one byte over answers 413" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .max_body_bytes = 8 } };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+
+    // Exactly at the cap (8 bytes): fingerprinted normally, runs, and then
+    // replays on retry like any other guarded request.
+    var b1: [2048]u8 = undefined;
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, reqKeyBody("POST", "/orders", "at-cap", "AAAAAAAA"), &b1)));
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    var b2: [2048]u8 = undefined;
+    const replay = runWire(&r, reqKeyBody("POST", "/orders", "at-cap", "AAAAAAAA"), &b2);
+    try testing.expectEqualStrings("order-1", bodyOf(replay));
+    try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+
+    // One byte over the cap (9 bytes), a fresh key: cannot be safely
+    // fingerprinted, so the request fails closed (413) rather than either
+    // silently skipping the check or being allowed through unchecked. The
+    // handler never runs.
+    var b3: [2048]u8 = undefined;
+    const over = runWire(&r, reqKeyBody("POST", "/orders", "over-cap", "AAAAAAAAA"), &b3);
+    try testing.expect(std.mem.startsWith(u8, over, "HTTP/1.1 413"));
+    try testing.expectEqual(@as(u32, 1), app.calls); // still 1 — the over-cap request never ran
 }

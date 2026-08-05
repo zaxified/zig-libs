@@ -16,8 +16,17 @@ cross-replay; `.key_only` keys on the client value alone. Method gating: only PO
 (configurable) are deduplicated by default; any other method, or a gated method with no key header,
 bypasses and runs normally. Key validation: non-empty, ≤ `max_key_len` (255) bytes, printable
 non-space ASCII, else 400; a scoped key exceeding 1 KiB degrades to running normally (no dedup)
-rather than erroring. Bounds via `ramcache`: TTL (default 24h via `Store.ttl_ns`), byte cap, entry
-cap, W-TinyLFU admission/eviction. Concurrency: the `ramcache` store sits behind an internal
+rather than erroring. Body-fingerprint verification: a same-key, same-target request is only a
+valid retry if its body also matches — the middleware buffers the body (bounded by
+`Options.max_body_bytes`, default 16 KiB) and SHA-256-fingerprints it, recording the digest
+alongside the response and comparing it (constant-time, `std.crypto.timing_safe.eql` — both
+operands are client-influenced, so a variable-time compare would let an attacker binary-search the
+stored digest across retries) on every subsequent same-key request. A mismatch answers 422 without
+running the handler; a body over the cap cannot be safely fingerprinted and fails closed with 413
+rather than silently letting the check be skipped. The buffered body is re-exposed to the handler
+via the `req.decoded` override seam (the same one inbound gzip decoding uses), so a cooperating
+handler that reads the body still sees it. Bounds via `ramcache`: TTL (default 24h via
+`Store.ttl_ns`), byte cap, entry cap, W-TinyLFU admission/eviction. Concurrency: the `ramcache` store sits behind an internal
 spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std `SmpAllocator` pattern); cached bytes are
 copied out under the lock and written to the socket lock-free. The scoped key travels
 middleware→handler via thread-local storage (task-per-connection, same model as `requestid`).
@@ -35,26 +44,32 @@ handler a second time — proven by a reentrant test that fires the duplicate *f
 handler while it is still executing (`"concurrent first-flight of the same key does not double-run
 (in-flight 409)"`). This closes the true concurrent-retry race for requests routed through the same
 process; it does not span multiple processes/machines (the reservation set is in-process state, not
-shared via `ramcache`). **Request-fingerprint mismatch is not detected**: a client reusing a key with
-a different request body gets the originally recorded response regardless — treated as the client's
-bug, not verified against. Not a general response cache (only ever serves the byte-for-byte original
-response back to the *same key*), and not a security boundary — a key is whatever the client sends,
-with no authentication tying it to a caller identity.
+shared via `ramcache`). **Request-fingerprint mismatch IS detected**: a client reusing a key with a
+different request body gets **422**, not the originally recorded response — the body is
+SHA-256-fingerprinted (bounded by `Options.max_body_bytes`, fail-closed 413 over the cap) and the
+digest checked against the one recorded for the key, constant-time. Not a general response cache
+(only ever serves the byte-for-byte original response back to the *same key*, and only when its body
+fingerprint matches), and not a security boundary — a key is whatever the client sends, with no
+authentication tying it to a caller identity.
 
 ## Verification
-9 offline tests through `http.Server.serveStream` with a real `router` + `ramcache`: first key runs
+13 offline tests through `http.Server.serveStream` with a real `router` + `ramcache`: first key runs
 the handler once and a replay returns the cached response without re-running (hit-counter
 asserted), a concurrent same-key duplicate fired from inside the first handler is rejected 409
 in-flight without a second handler run, a different key runs again, a non-idempotent method (GET)
 bypasses, a POST with no key bypasses, an invalid key → 400, target-scope isolation across paths,
-TTL expiry re-runs the handler (injected clock), encode/decode round-trip. `zig fmt --check` clean.
-Run: `zig build test-idempotency`.
+TTL expiry re-runs the handler (injected clock), encode/decode round-trip (digest included), a
+different body under the same key answers 422 and leaves the original entry replayable (graduated
+from the `GAP:` test pinned in commit 71540f3), a same-key/same-body retry with a real request body
+still replays, `.key_only` scope still cross-replays across endpoints when the body matches, and the
+body-cap boundary (exactly at the cap fingerprints normally, one byte over answers 413).
+`zig fmt --check` clean. Run: `zig build test-idempotency`.
 
 ## Backlog / deferred
-None beyond the one explicit non-goal in Threat model (request-fingerprint verification) —
-`idempotency` sits in the prod-API hardening cluster with no further per-module gap noted.
-In-flight reservation is single-process only; a multi-process/multi-machine deployment sharing one
-`ramcache`-backed store would still need a distributed lock to close the same race across processes.
+None. The one explicit non-goal previously noted here (request-fingerprint verification) is closed —
+see "Request-fingerprint mismatch" above. In-flight reservation is still single-process only; a
+multi-process/multi-machine deployment sharing one `ramcache`-backed store would still need a
+distributed lock to close the same race across processes.
 
 ## Status
 `gap · any · server · threadsafe` · deps: `router`, `http`, `ramcache` — canonical source is `pub
