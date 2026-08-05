@@ -24,15 +24,24 @@
 //! TLS/Noise bulk). It is **byte-exact** to std and to RFC 8439: the SIMD ChaCha
 //! is anchored against the RFC 8439 KATs *and* differentially against
 //! `std.crypto.aead.chacha_poly.ChaCha20Poly1305` (the oracle) over every
-//! block-boundary edge length. The Poly1305 MAC is **scalar** — it reuses
-//! `std.crypto.onetimeauth.Poly1305` verbatim (a SIMD Poly1305 is a further,
-//! trickier win left as a backlog item; the ChaCha keystream dominates the AEAD
-//! cost, so the scalar MAC already captures most of the win).
+//! block-boundary edge length.
+//!
+//! The Poly1305 MAC is **lane-parallel** — see `poly1305.zig`, which holds the
+//! full design note. Short version: `L` blocks per multiply in a 5×26-bit limb
+//! layout, `L` comptime-selected from the target (AVX2 → 4), hybridised with
+//! `std.crypto.onetimeauth.Poly1305` as the serial core so that inputs below the
+//! break-even size run std's code and cannot regress.
+//!
+//! **Where the AEAD's time now goes.** With the MAC at ~3.6 GB/s the limiter is
+//! `ChaCha20.xor` below: it stages the keystream through a stack buffer and XORs
+//! it a byte at a time, running at ~1.06 GB/s against `stream`'s ~2.17 GB/s.
+//! Fusing generation with the XOR is the next throughput item here.
 //!
 //! **Constant-time.** ChaCha and Poly1305 are inherently constant-time — only
-//! add / xor / rotate / (Poly1305) multiply, no secret-indexed memory and no
-//! data-dependent branches. The `@Vector` ops preserve this. Tag comparison uses
-//! `std.crypto.timing_safe.eql`.
+//! add / xor / rotate / (Poly1305) multiply / mask, no secret-indexed memory and
+//! no data-dependent branches. The `@Vector` ops preserve this, and the MAC's
+//! lane count is a comptime constant rather than a runtime CPU dispatch. Tag
+//! comparison uses `std.crypto.timing_safe.eql`.
 //!
 //! API mirrors `std.crypto.stream.chacha.ChaCha20IETF` and
 //! `std.crypto.aead.chacha_poly.ChaCha20Poly1305` so consumers can swap it in.
@@ -40,14 +49,18 @@
 const std = @import("std");
 const mem = std.mem;
 const math = std.math;
-const Poly1305 = std.crypto.onetimeauth.Poly1305;
+const poly1305 = @import("poly1305.zig");
+/// Lane-parallel Poly1305 (see `poly1305.zig`); falls back to
+/// `std.crypto.onetimeauth.Poly1305` at comptime on targets without a usable
+/// wide SIMD integer multiply.
+pub const Poly1305 = poly1305.Poly1305;
 const AuthenticationError = std.crypto.errors.AuthenticationError;
 
 pub const meta = .{
     .platform = .any,
     .role = .codec, // pure computation, no I/O
     .concurrency = .reentrant, // no shared state
-    .model_after = "RFC 8439 (ChaCha20-Poly1305); block-parallel @Vector transpose layout after the vectorised std.crypto.stream.chacha; Poly1305 reuses std.crypto.onetimeauth.Poly1305",
+    .model_after = "RFC 8439 (ChaCha20-Poly1305); block-parallel @Vector transpose layout after the vectorised std.crypto.stream.chacha; lane-parallel 5x26-bit-limb Poly1305 (r^L powers) hybridised with std.crypto.onetimeauth.Poly1305 as the serial core",
     .deps = .{}, // std only
 };
 
@@ -264,6 +277,11 @@ fn pad16(mac: *Poly1305, len: usize) void {
 // ── tests: RFC 8439 known-answer vectors ─────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    _ = @import("poly1305.zig");
+    _ = @import("bench.zig");
+}
 
 // RFC 8439 §2.3.2 — ChaCha20 block function (counter = 1).
 test "RFC 8439 §2.3.2 ChaCha20 block/keystream" {

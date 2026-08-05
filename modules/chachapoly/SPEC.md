@@ -55,22 +55,49 @@ increments it with wrapping (`+%`). `std` *asserts* the stream stays within
 inside that domain (wrap past 2^32 blocks is out of `std`'s and RFC's defined
 range and is not diffed).
 
-## Poly1305 — scalar, reused from std
+## Poly1305 — lane-parallel above a threshold, std's scalar core below it
 
-The MAC is **not** reimplemented: it is `std.crypto.onetimeauth.Poly1305`,
-called exactly as the RFC 8439 §2.8 construction requires (one-time key =
-ChaCha20 keystream block at counter 0; MAC over `ad ‖ pad16 ‖ ciphertext ‖
-pad16 ‖ le64(ad.len) ‖ le64(ct.len)`; ciphertext at counter 1). The ChaCha
-keystream dominates AEAD cost, so a correct scalar Poly1305 already banks most of
-the AEAD win; a SIMD Poly1305 (parallel `r^N`-power polynomial evaluation) is a
-further, trickier win left as a **backlog item**. Measured full-AEAD speedup is
-~1.3× (vs ~1.6× for raw keystream) — the gap is the scalar MAC, as expected.
+Lives in `src/poly1305.zig`; that file's doc comment is the primary reference
+and is not restated here. The construction around it is unchanged and is exactly
+what RFC 8439 §2.8 requires (one-time key = ChaCha20 keystream block at counter
+0; MAC over `ad ‖ pad16 ‖ ciphertext ‖ pad16 ‖ le64(ad.len) ‖ le64(ct.len)`;
+ciphertext at counter 1).
+
+The shape, in one paragraph: Poly1305 is `H = Σ mᵢ·r^(n−i+1)` in GF(2^130−5), so
+`L` blocks can be absorbed per multiply by running one Horner recurrence per lane
+with the shared multiplier `r^L` and folding the lanes at the end against
+`(r^L, …, r^1)`. That needs a limb layout SIMD can multiply — five 26-bit limbs,
+because the widest integer multiply x86 vectors have is `PMULUDQ`'s 32×32→64.
+`lanes` is picked at comptime (AVX-512F → 8, AVX2 → 4, otherwise 1).
+
+**It is a hybrid, and that is the load-bearing design decision.** The power table
+`r^1..r^L` costs `L−1` field multiplies up front, and the 26-bit layout is
+*worse* than std's 2×64 when run one block at a time. A pure-vector version
+measured **0.47× std at 64 bytes** — a real regression on the short-packet
+traffic (WireGuard keepalives, handshakes) this module exists to serve. So
+`Generic(L)` embeds `std.crypto.onetimeauth.Poly1305`, delegates the key, the
+leftover buffer, the tail, the final reduction and the tag to it, and intercepts
+only runs of ≥ `wide_min_groups` whole lane groups. Below the threshold the
+executed code is std's.
+
+The seam reads and writes three of std's public fields — `h` (the
+partially-reduced accumulator), `r` (the clamped key half) and `leftover`. That
+coupling is deliberate and is pinned by the every-length differential below: if
+any of those meanings drifted, the sweep would fail rather than silently forge.
+
+Measured on an i7-7920HQ (AVX2), ReleaseFast: MAC 1.0× at 32 B, 0.98× at 128 B,
+1.06× at 256 B, 1.5× at 512 B, 2.0× at 1420 B, 2.5× at 8 KiB; full AEAD 1.8× at
+8 KiB. With the MAC at 3.6 GB/s the AEAD's limiter is now `ChaCha20.xor`'s
+stack-buffer-plus-bytewise-XOR loop (1.06 GB/s vs 2.17 GB/s for `stream`), not
+the MAC.
 
 ## Constant-time
 
 ChaCha and Poly1305 are inherently constant-time: only add / xor / rotate /
-(Poly1305) multiply, no secret-indexed memory access and no data-dependent
-branches. The `@Vector` ops preserve this (SIMD lanes are data-oblivious). The
+(Poly1305) multiply / mask, no secret-indexed memory access and no data-dependent
+branches. The lane-parallel MAC adds only arithmetic of that same shape; every
+branch it introduces is on message length or buffer occupancy, both public, and
+the lane count is a comptime constant rather than a runtime dispatch. The `@Vector` ops preserve this (SIMD lanes are data-oblivious). The
 byte-serialization transpose indexes vectors by **comptime** lane/word indices
 only. Tag verification uses `std.crypto.timing_safe.eql`, and a failed `decrypt`
 `secureZero`s the computed tag and `@memset`s the plaintext buffer before
@@ -83,7 +110,17 @@ the source), not a machine-checked-disassembly audit like `montint`/`k256`.
 
 - **RFC 8439 KATs**, byte-exact, Debug + ReleaseFast: §2.3.2 (ChaCha20 block /
   keystream at counter 1), §2.4.2 (the "sunscreen" encryption), §2.5.2 (Poly1305
-  tag — documents the scalar std MAC), §2.8.2 (AEAD encrypt: ciphertext + tag).
+  tag), §2.8.2 (AEAD encrypt: ciphertext + tag).
+- **RFC 8439 §A.3 Poly1305 vectors** — all eleven, at every lane width
+  L ∈ {1,2,4,8}. These are the ones written to break a wrong implementation:
+  r = 0, s = 0, r = 2^130−6, the two "imperfect carry propagation" pairs, and a
+  127-byte message that lands mid-lane at every width.
+- **Poly1305 differential vs `std` for EVERY length 0..2048**, at every lane
+  width, plus a random-key stress, an all-0xff key/message worst case for the
+  deferred-carry bound, and every `update` split point (the streaming path the
+  AEAD actually drives). The partial-final-block and lane-boundary-straddle
+  cases are where parallel Poly1305 implementations break, so they are swept
+  exhaustively rather than sampled.
 - **Differential vs the `std` oracle** across block-boundary edge lengths
   `{0,1,15,16,17,31,63,64,65,127,128,129,255,256,257,511,512,513,1000,4096}`:
   our `ChaCha20.stream`/`.xor` equal `std`'s byte-for-byte at several counters;
@@ -100,7 +137,14 @@ implementation at every awkward length, so a wrong keystream cannot ship.
 
 ## Non-goals / backlog
 
-- **SIMD Poly1305** (parallel polynomial evaluation) — the remaining AEAD win.
+- **Fusing `ChaCha20.xor`'s keystream generation with the XOR** — now the AEAD's
+  actual bottleneck (see the throughput note above), worth more than further MAC
+  work.
+- **AVX-512 (L = 8) is correctness-tested but perf-unmeasured** — no AVX-512
+  hardware here. The selection is comptime, so a host that has it takes the
+  8-lane path untested for *speed*; it is not untested for *correctness*.
+- **2-lane SSE2 / NEON Poly1305** — deliberately not taken: two 26-bit lanes do
+  not beat one 64×64→128 scalar multiply, so those targets stay on std.
 - **XChaCha20 / XChaCha20-Poly1305** (24-byte extended nonce, HChaCha20) — not
   needed by current consumers; add if a consumer wants it.
 - Machine-checked CT disassembly audit (as done for the asm field modules).

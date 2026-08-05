@@ -48,17 +48,32 @@ cp.ChaCha20.xor(out, in, 1, key, nonce);
 
 ## Performance (this host, ReleaseFast)
 
-ChaCha20 keystream + full AEAD-encrypt throughput vs `std.crypto`:
+Reproduce with:
 
-| target | size | keystream (ours / std) | AEAD (ours / std) |
+```
+CHACHAPOLY_BENCH=1 scripts/capped zig build test-chachapoly -Doptimize=ReleaseFast
+```
+
+Measured on an i7-7920HQ (AVX2, no AVX-512), 8 KiB working set, ReleaseFast,
+median of three runs:
+
+| what | ours | std | |
 |---|---:|---:|---:|
-| AVX2 (`-mcpu=native`) | 8 KiB | 2374 / 1486 MB/s — **1.6×** | 662 / 507 MB/s — **1.3×** |
-| baseline (SSE2) | 8 KiB | 1113 / 673 MB/s — **1.65×** | 489 / 364 MB/s — **1.34×** |
+| ChaCha20 keystream | 2165 MB/s | 1402 MB/s | **1.5×** |
+| Poly1305 MAC | 3653 MB/s | 1440 MB/s | **2.6×** |
+| full AEAD encrypt | 808 MB/s | 460 MB/s | **1.8×** |
 
-The keystream (**2374 MB/s** on AVX2) exceeds the cited OpenSSL AVX2 ChaCha
-number (1852 MB/s). The full-AEAD speedup is smaller (**~1.3×**) because Poly1305
-is scalar (`std.crypto.onetimeauth.Poly1305`, reused verbatim) and dominates once
-the ChaCha keystream is fast — a SIMD Poly1305 is a documented backlog item.
+Poly1305 is lane-parallel above a size threshold and std's scalar core below it,
+so the MAC speedup is size-dependent — and deliberately never a *loss*:
+
+| message | 32 B | 128 B | 256 B | 512 B | 1420 B | 4 KiB | 8 KiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ours vs std | 1.0× | 0.98× | 1.06× | 1.53× | 2.0× | 2.4× | 2.5× |
+
+**The AEAD's own bottleneck has moved.** With the MAC at 3.6 GB/s the limiter is
+now `ChaCha20.xor`, which stages the keystream through a stack buffer and XORs it
+byte-wise (1056 MB/s, against 2165 for `stream` writing straight to the output).
+Fusing that is the next AEAD-throughput item, not more MAC work.
 
 ## Verify
 
@@ -67,14 +82,18 @@ zig build test-chachapoly                          # Debug
 zig build test-chachapoly -Doptimize=ReleaseFast   # ReleaseFast (UB checks)
 ```
 
-Tests cover the RFC 8439 §2.3.2 / §2.4.2 / §2.5.2 / §2.8.2 KATs and a differential
-against the `std` AEAD across block-boundary edge lengths (seal/open/cross-decrypt
-/ tamper-reject), plus a `>8`-block counter-increment boundary case.
+Tests cover the RFC 8439 §2.3.2 / §2.4.2 / §2.5.2 / §2.8.2 KATs, the eleven
+RFC 8439 §A.3 Poly1305 vectors at every lane width, a differential against the
+`std` AEAD across block-boundary edge lengths (seal/open/cross-decrypt /
+tamper-reject), a `>8`-block counter-increment boundary case, and a
+length-by-length Poly1305 differential against `std` for **every** length
+0..2048 at L ∈ {1,2,4,8}.
 
 ## Provenance
 
 Clean-room from RFC 8439 (a public spec — no NOTICE entry required for the
-construction itself). The block-parallel `@Vector` layout and the reuse of
-`std.crypto.onetimeauth.Poly1305` as the MAC are recorded in the repo `NOTICE`;
+construction itself). The block-parallel `@Vector` layout and the use of
+`std.crypto.onetimeauth.Poly1305` as the Poly1305 serial core are recorded in the
+repo `NOTICE`;
 `std.crypto.aead.chacha_poly.ChaCha20Poly1305` is used as a black-box correctness
 oracle (a test relationship, not a design reference).
