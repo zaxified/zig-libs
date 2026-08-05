@@ -67,13 +67,18 @@ pub const KemId = enum(u16) {
     _,
 };
 
-/// RFC 9180 §7.2 Table 3 — KDF identifiers. Only HKDF-SHA256 is
-/// instantiated (the only KDF this module's `LabeledExtract`/
-/// `LabeledExpand` have been wired for so far; the functions are generic
-/// over any `std.crypto.kdf.hkdf.Hkdf(Hmac)` instantiation, so HKDF-SHA384/
-/// SHA512 need only a new `Hkdf` type argument, not new code).
+/// RFC 9180 §7.2 Table 3 — KDF identifiers. All three are instantiated:
+/// `labeledExtract`/`labeledExpand` below were always generic over any
+/// `std.crypto.kdf.hkdf.Hkdf(Hmac)` instantiation (this file never
+/// hardcoded a hash), and `schedule.zig`'s key schedule now dispatches on
+/// `Nh` (`schedule.KdfOf`) to pick HKDF-SHA256/384/512 — see that file for
+/// the outer-KDF-vs-KEM's-own-KDF distinction (RFC 9180 §4.1 vs §7.2:
+/// a DHKEM's internal KDF is fixed by its `kem_id`, independent of the
+/// ciphersuite's `kdf_id` this enum names).
 pub const KdfId = enum(u16) {
     hkdf_sha256 = 0x0001,
+    hkdf_sha384 = 0x0002,
+    hkdf_sha512 = 0x0003,
     _,
 };
 

@@ -10,15 +10,73 @@
 //! KAT-validated against RFC 9180 Appendix A.1's published
 //! key/base_nonce/exporter_secret, all 6 encryption tuples, and all 3
 //! exported values, in every mode (A.1.1/A.1.2/A.1.3/A.1.4, plus the
-//! P-256 suite's A.3.x; see `kat_rfc9180.zig`). The KDF is hard-wired to
-//! HKDF-SHA256 (the only `KdfId` this module instantiates — `Nh` is kept
-//! as an explicit parameter so widening to HKDF-SHA384/512 later is a
-//! type-parameter change, not a resignature).
+//! P-256 suite's A.3.x; see `kat_rfc9180.zig`).
+//!
+//! **The key-schedule KDF is `Nh`-dispatched, not hard-wired.** `KdfOf(Nh)`
+//! below maps `Nh` (the KDF's PRK/hash-output width, RFC 9180 §7.2 Table 3)
+//! to a concrete `std.crypto.kdf.hkdf.Hkdf(Hmac)` instantiation — 32 ->
+//! HKDF-SHA256, 48 -> HKDF-SHA384, 64 -> HKDF-SHA512 — so every function
+//! already parameterized on `Nh` (`Context`, `keySchedule`, the `setup*`/
+//! `seal*`/`open*` families) gets a different key-schedule KDF for free by
+//! passing a different `Nh`, with NO signature change: `Nh` was already
+//! threaded through every call site (originally just for buffer sizing),
+//! and the three valid widths happen to name three disjoint KDFs, so
+//! reusing it as the dispatch key needs no new parameter. `kdfIdOf(Nh)`
+//! (next to `aeadIdOf`) is the matching `suite_id` byte, so the three
+//! widths also produce three DIFFERENT `suite_id`s (correct — RFC 9180
+//! §7.2.1's `suite_id` folds in `kdf_id`, so HKDF-SHA256 vs -SHA512 over the
+//! same KEM+AEAD are cryptographically distinct ciphersuites, not the same
+//! suite with a wider hash bolted on).
+//!
+//! **This is the OUTER (key-schedule) KDF only — a SEPARATE choice from a
+//! DHKEM's own internal KDF** (RFC 9180 §4.1's `ExtractAndExpand`,
+//! `dhkem.zig`), which stays fixed per `kem_id` (both KEMs this module
+//! instantiates, X25519 and P-256, are registered with HKDF-SHA256 as their
+//! internal KDF, RFC 9180 §7.1 Table 2) regardless of what `Nh` (outer
+//! `kdf_id`) a caller picks for the key schedule — e.g. `DHKEM(P-256,
+//! HKDF-SHA256)` paired with an outer HKDF-SHA512 key schedule is a real,
+//! RFC-registered combination (Appendix A.4) whose `shared_secret` stays 32
+//! bytes (the KEM's own `Nsecret`) even though `key_schedule_context`/
+//! `secret`/`exporter_secret` are 64 (`Nh`). KAT: `kat_rfc9180.zig`'s `a4`
+//! (A.4, `DHKEM(P-256, HKDF-SHA256), HKDF-SHA512, AES-128-GCM`), the first
+//! vector this module drives with `Nh` != 32.
 
 const std = @import("std");
 const suite = @import("suite.zig");
 
-const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+/// The registered `KdfId`/`Hkdf` instantiation for a key-schedule `Nh`
+/// (RFC 9180 §7.2 Table 3) — the dispatch `keySchedule`/`Context.exportSecret`
+/// use to pick the actual HMAC hash underneath `suite.labeledExtract`/
+/// `.labeledExpand`. A compile error (not a runtime fallback) for any `Nh`
+/// this module doesn't register — the same shape as `aeadIdOf`'s
+/// unregistered-type rejection below. `std` names `HkdfSha256`/`HkdfSha512`
+/// directly; HKDF-SHA384 has no such alias, so it's built from
+/// `std.crypto.kdf.hkdf.Hkdf` (the same generic constructor `HkdfSha256`/
+/// `HkdfSha512` are themselves built from) over `std.crypto.auth.hmac.sha2.
+/// HmacSha384` — not a new primitive, the identical composition std uses
+/// for its own two named aliases.
+pub fn KdfOf(comptime Nh: usize) type {
+    return switch (Nh) {
+        32 => std.crypto.kdf.hkdf.HkdfSha256,
+        48 => std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384),
+        64 => std.crypto.kdf.hkdf.HkdfSha512,
+        else => @compileError("hpke: no RFC 9180 KDF registered for Nh=" ++ std.fmt.comptimePrint("{d}", .{Nh}) ++ " (valid: 32 HKDF-SHA256, 48 HKDF-SHA384, 64 HKDF-SHA512)"),
+    };
+}
+
+/// The registered `KdfId` (RFC 9180 §7.2 Table 3) for a key-schedule `Nh` —
+/// the `suite_id` byte pair `suiteIdOf` needs alongside `aeadIdOf`'s
+/// `aead_id`. Kept as a separate function (rather than reading
+/// `KdfOf(Nh).prk_length`-keyed data) so the `Nh`<->`kdf_id` mapping is
+/// named once, in one place, matching `KdfOf` switch-arm for switch-arm.
+fn kdfIdOf(comptime Nh: usize) u16 {
+    return switch (Nh) {
+        32 => @intFromEnum(suite.KdfId.hkdf_sha256),
+        48 => @intFromEnum(suite.KdfId.hkdf_sha384),
+        64 => @intFromEnum(suite.KdfId.hkdf_sha512),
+        else => @compileError("hpke: no RFC 9180 kdf_id registered for Nh=" ++ std.fmt.comptimePrint("{d}", .{Nh}) ++ " (valid: 32, 48, 64)"),
+    };
+}
 
 /// RFC 9180 §5.2: the AEAD hit its sequence-number ceiling
 /// (`2^(8*Nn) - 1`, though this implementation conservatively caps at
@@ -187,8 +245,9 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// pulled from many times, unlike `seal`/`open`'s single-use-per-
         /// seq nonces).
         pub fn exportSecret(self: *const Self, suite_id: []const u8, exporter_context: []const u8, out: []u8) suite.LabeledExpandError!void {
-            comptime std.debug.assert(Nh == HkdfSha256.prk_length); // KDF hard-wired to HKDF-SHA256 module-wide
-            return suite.labeledExpand(HkdfSha256, suite_id, self.exporter_secret, "sec", exporter_context, out);
+            const Kdf = KdfOf(Nh);
+            comptime std.debug.assert(Nh == Kdf.prk_length); // KdfOf(Nh) must be the Nh-width KDF, not a mismatched one
+            return suite.labeledExpand(Kdf, suite_id, self.exporter_secret, "sec", exporter_context, out);
         }
     };
 }
@@ -230,7 +289,14 @@ pub fn keySchedule(
     psk: []const u8,
     psk_id: []const u8,
 ) (KeyScheduleError || suite.LabeledExpandError)!Context(Aead, Nh) {
-    comptime std.debug.assert(Nh == HkdfSha256.prk_length); // KDF hard-wired to HKDF-SHA256 module-wide
+    // The key-schedule KDF, dispatched from Nh (see KdfOf's doc comment) —
+    // NOT the DHKEM's own internal KDF (dhkem.zig's ExtractAndExpand, fixed
+    // per kem_id, always HKDF-SHA256 for both KEMs this module
+    // instantiates), which is why `shared_secret` above stays a plain
+    // `[]const u8` here rather than `[Nh]u8` — its width is the KEM's
+    // Nsecret, independent of this function's Nh.
+    const Kdf = KdfOf(Nh);
+    comptime std.debug.assert(Nh == Kdf.prk_length); // KdfOf(Nh) must be the Nh-width KDF, not a mismatched one
 
     // VerifyPSKInputs (RFC 9180 §5.1): psk and psk_id must be present or
     // absent TOGETHER, and present iff the mode calls for a PSK.
@@ -244,8 +310,8 @@ pub fn keySchedule(
     // complaint about a PSK that shouldn't have been supplied at all.
     if (got_psk and psk.len < Nh) return error.PskTooShort;
 
-    const psk_id_hash = suite.labeledExtract(HkdfSha256, suite_id, "", "psk_id_hash", psk_id);
-    const info_hash = suite.labeledExtract(HkdfSha256, suite_id, "", "info_hash", info);
+    const psk_id_hash = suite.labeledExtract(Kdf, suite_id, "", "psk_id_hash", psk_id);
+    const info_hash = suite.labeledExtract(Kdf, suite_id, "", "info_hash", info);
 
     // key_schedule_context = I2OSP(mode, 1) || psk_id_hash || info_hash
     var ksc: [1 + 2 * Nh]u8 = undefined;
@@ -253,7 +319,7 @@ pub fn keySchedule(
     ksc[1 .. 1 + Nh].* = psk_id_hash;
     ksc[1 + Nh ..].* = info_hash;
 
-    const secret = suite.labeledExtract(HkdfSha256, suite_id, shared_secret, "secret", psk);
+    const secret = suite.labeledExtract(Kdf, suite_id, shared_secret, "secret", psk);
 
     var ctx = Context(Aead, Nh){
         .key = undefined,
@@ -261,9 +327,9 @@ pub fn keySchedule(
         .seq = 0,
         .exporter_secret = undefined,
     };
-    try suite.labeledExpand(HkdfSha256, suite_id, secret, "key", &ksc, &ctx.key);
-    try suite.labeledExpand(HkdfSha256, suite_id, secret, "base_nonce", &ksc, &ctx.base_nonce);
-    try suite.labeledExpand(HkdfSha256, suite_id, secret, "exp", &ksc, &ctx.exporter_secret);
+    try suite.labeledExpand(Kdf, suite_id, secret, "key", &ksc, &ctx.key);
+    try suite.labeledExpand(Kdf, suite_id, secret, "base_nonce", &ksc, &ctx.base_nonce);
+    try suite.labeledExpand(Kdf, suite_id, secret, "exp", &ksc, &ctx.exporter_secret);
     return ctx;
 }
 
@@ -280,10 +346,13 @@ fn aeadIdOf(comptime Aead: type) u16 {
     @compileError("hpke: no RFC 9180 aead_id registered for " ++ @typeName(Aead));
 }
 
-/// The outer HPKE `suite_id` (§7.2.1) for a `(Kem, Aead)` pair — kdf_id is
-/// hard-wired to HKDF-SHA256, the only KDF this module instantiates.
-fn suiteIdOf(comptime Kem: type, comptime Aead: type) [10]u8 {
-    return suite.suiteId(Kem.kem_id, @intFromEnum(suite.KdfId.hkdf_sha256), aeadIdOf(Aead));
+/// The outer HPKE `suite_id` (§7.2.1) for a `(Kem, Aead, Nh)` triple —
+/// `kdf_id` comes from `kdfIdOf(Nh)`, the same `Nh`-dispatch `keySchedule`
+/// uses to pick the actual `Hkdf` type, so a caller cannot pick a `Nh` that
+/// runs one KDF but names another in `suite_id` (RFC 9180 §7.2.1's
+/// domain-separation byte would then lie about which KDF was used).
+fn suiteIdOf(comptime Kem: type, comptime Aead: type, comptime Nh: usize) [10]u8 {
+    return suite.suiteId(Kem.kem_id, kdfIdOf(Nh), aeadIdOf(Aead));
 }
 
 /// `sealBase`/`sealBaseDeterministic`'s result: the `enc` the sender must
@@ -338,7 +407,7 @@ fn setupEncapped(
     psk: []const u8,
     psk_id: []const u8,
 ) !Setup(Kem, Aead, Nh) {
-    const suite_id = comptime suiteIdOf(Kem, Aead);
+    const suite_id = comptime suiteIdOf(Kem, Aead, Nh);
     const context = try keySchedule(Aead, Nh, mode, &suite_id, &encapped.shared_secret, info, psk, psk_id);
     return .{ .enc = encapped.enc, .context = context };
 }
@@ -356,7 +425,7 @@ fn setupDecapped(
     psk: []const u8,
     psk_id: []const u8,
 ) !Context(Aead, Nh) {
-    const suite_id = comptime suiteIdOf(Kem, Aead);
+    const suite_id = comptime suiteIdOf(Kem, Aead, Nh);
     return keySchedule(Aead, Nh, mode, &suite_id, &shared_secret, info, psk, psk_id);
 }
 

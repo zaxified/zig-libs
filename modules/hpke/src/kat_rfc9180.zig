@@ -197,6 +197,109 @@ pub const a3 = struct {
     pub const seq0_ct = hexTo(45, "5ad590bb8baa577f8619db35a36311226a896e7342a6d836d8b7bcd2f20b6c7f9076ac232e3ab2523f39513434");
 };
 
+// ── A.4: DHKEM(P-256, HKDF-SHA256), HKDF-SHA512, AES-128-GCM (base) ─────
+//
+// The FIRST vector this module drives with an outer key-schedule KDF other
+// than HKDF-SHA256 — HKDF-SHA512 (kdf_id 0x0003), Nh=64, paired with the
+// SAME DHKEM(P-256, HKDF-SHA256) already anchored by A.3 (whose internal
+// KDF stays HKDF-SHA256 regardless — RFC 9180 §7.1 Table 2 fixes a DHKEM's
+// own KDF per kem_id, independent of the outer ciphersuite's kdf_id; see
+// schedule.zig's module doc comment). `shared_secret` below is still 32
+// bytes (the KEM's Nsecret) while `key_schedule_context`/`secret`/
+// `exporter_secret` are 64 (Nh) — the clearest possible proof the two KDFs
+// are genuinely independent choices, not one hash reused at two widths.
+//
+// Extracted from RFC 9180 Appendix A.4, cross-checked against a LOCAL
+// (offline, no network fetch) copy of the same RFC's own published
+// test-vectors.json bundled as Go's standard-library HPKE test fixture —
+// `crypto/internal/hpke/testdata/rfc9180-vectors.json` in the Go
+// toolchain's module cache on this machine (entry 3 of 6, "DHKEM(P-256,
+// HKDF-SHA256), HKDF-SHA512, AES-128-GCM") — not authored by this repo,
+// not derived from this module's own output.
+pub const a4 = struct {
+    pub const kem_id: u16 = 0x0010;
+    pub const kdf_id: u16 = 0x0003;
+    pub const aead_id: u16 = 0x0001;
+    pub const mode: u8 = 0x00;
+
+    pub const info = hexTo(20, "4f6465206f6e2061204772656369616e2055726e");
+    pub const ikmE = hexTo(32, "4ab11a9dd78c39668f7038f921ffc0993b368171d3ddde8031501ee1e08c4c9a");
+    pub const pkEm = hexTo(65, "0493ed86735bdfb978cc055c98b45695ad7ce61ce748f4dd63c525a3b8d53a15565c6897888070070c1579db1f86aaa56deb8297e64db7e8924e72866f9a472580");
+    pub const skEm = hexTo(32, "2292bf14bb6e15b8c81a0f45b7a6e93e32d830e48cca702e0affcfb4d07e1b5c");
+    pub const ikmR = hexTo(32, "ea9ff7cc5b2705b188841c7ace169290ff312a9cb31467784ca92d7a2e6e1be8");
+    pub const pkRm = hexTo(65, "04085aa5b665dc3826f9650ccbcc471be268c8ada866422f739e2d531d4a8818a9466bc6b449357096232919ec4fe9070ccbac4aac30f4a1a53efcf7af90610edd");
+    pub const skRm = hexTo(32, "3ac8530ad1b01885960fab38cf3cdc4f7aef121eaa239f222623614b4079fb38");
+
+    pub const enc = hexTo(65, "0493ed86735bdfb978cc055c98b45695ad7ce61ce748f4dd63c525a3b8d53a15565c6897888070070c1579db1f86aaa56deb8297e64db7e8924e72866f9a472580");
+    // KEM's OWN Nsecret (32 bytes, HKDF-SHA256) — NOT Nh (64, the outer
+    // HKDF-SHA512). See this section's header comment.
+    pub const shared_secret = hexTo(32, "02f584736390fc93f5b4ad039826a3fa08e9911bd1215a3db8e8791ba533cafd");
+    // key_schedule_context = mode(1) || psk_id_hash(Nh=64) || info_hash(Nh=64) = 129 bytes.
+    pub const key_schedule_context = hexTo(129, "005b8a3617af7789ee716e7911c7e77f84cdc4cc46e60fb7e19e4059f9aeadc00585e26874d1ddde76e551a7679cd47168c466f6e1f705cc9374c192778a34fcd5ca221d77e229a9d11b654de7942d685069c633b2362ce3b3d8ea4891c9a2a87a4eb7cdb289ba5e2ecbf8cd2c8498bb4a383dc021454d70d46fcbbad1252ef4f9");
+    pub const secret = hexTo(64, "0c7acdab61693f936c4c1256c78e7be30eebfe466812f9cc49f0b58dc970328dfc03ea359be0250a471b1635a193d2dfa8cb23c90aa2e25025b892a725353eeb");
+    pub const key = hexTo(16, "090ca96e5f8aa02b69fac360da50ddf9");
+    pub const base_nonce = hexTo(12, "9c995e621bf9a20c5ca45546");
+    pub const exporter_secret = hexTo(64, "4a7abb2ac43e6553f129b2c5750a7e82d149a76ed56dc342d7bca61e26d494f4855dff0d0165f27ce57756f7f16baca006539bb8e4518987ba610480ac03efa8");
+
+    /// All 6 published `(sequence number, pt, aad, nonce, ct)` tuples
+    /// (including the seq 4/255/256 jumps, same convention as A.1.1.1).
+    pub const encryptions = [_]Encryption{
+        .{
+            .seq = 0,
+            .pt = &hexTo(29, "4265617574792069732074727574682c20747275746820626561757479"),
+            .aad = &hexTo(7, "436f756e742d30"),
+            .nonce = hexTo(12, "9c995e621bf9a20c5ca45546"),
+            .ct = &hexTo(45, "d3cf4984931484a080f74c1bb2a6782700dc1fef9abe8442e44a6f09044c88907200b332003543754eb51917ba"),
+        },
+        .{
+            .seq = 1,
+            .pt = &hexTo(29, "4265617574792069732074727574682c20747275746820626561757479"),
+            .aad = &hexTo(7, "436f756e742d31"),
+            .nonce = hexTo(12, "9c995e621bf9a20c5ca45547"),
+            .ct = &hexTo(45, "d14414555a47269dfead9fbf26abb303365e40709a4ed16eaefe1f2070f1ddeb1bdd94d9e41186f124e0acc62d"),
+        },
+        .{
+            .seq = 2,
+            .pt = &hexTo(29, "4265617574792069732074727574682c20747275746820626561757479"),
+            .aad = &hexTo(7, "436f756e742d32"),
+            .nonce = hexTo(12, "9c995e621bf9a20c5ca45544"),
+            .ct = &hexTo(45, "9bba136cade5c4069707ba91a61932e2cbedda2d9c7bdc33515aa01dd0e0f7e9d3579bf4016dec37da4aafa800"),
+        },
+        .{
+            .seq = 4,
+            .pt = &hexTo(29, "4265617574792069732074727574682c20747275746820626561757479"),
+            .aad = &hexTo(7, "436f756e742d34"),
+            .nonce = hexTo(12, "9c995e621bf9a20c5ca45542"),
+            .ct = &hexTo(45, "a531c0655342be013bf32112951f8df1da643602f1866749519f5dcb09cc68432579de305a77e6864e862a7600"),
+        },
+        .{
+            .seq = 255,
+            .pt = &hexTo(29, "4265617574792069732074727574682c20747275746820626561757479"),
+            .aad = &hexTo(9, "436f756e742d323535"),
+            .nonce = hexTo(12, "9c995e621bf9a20c5ca455b9"),
+            .ct = &hexTo(45, "be5da649469efbad0fb950366a82a73fefeda5f652ec7d3731fac6c4ffa21a7004d2ab8a04e13621bd3629547d"),
+        },
+        .{
+            .seq = 256,
+            .pt = &hexTo(29, "4265617574792069732074727574682c20747275746820626561757479"),
+            .aad = &hexTo(9, "436f756e742d323536"),
+            .nonce = hexTo(12, "9c995e621bf9a20c5ca45446"),
+            .ct = &hexTo(45, "62092672f5328a0dde095e57435edf7457ace60b26ee44c9291110ec135cb0e14b85594e4fea11247d937deb62"),
+        },
+    };
+
+    // No "Exports" (exported-value) tuples: unlike a1/a1_psk/a1_auth/
+    // a1_auth_psk/a3_psk/a3_auth/a3_auth_psk, the offline source this
+    // section was extracted from (see header comment) does not carry
+    // A.4's §A.4.1.2 exported-value tuples — Go's own HPKE test only
+    // exercises Setup+Encryptions, not Export. Rather than fabricate
+    // exported-value bytes (this repo's own convention: no self-generated
+    // vector dressed up as an anchor), `Context.exportSecret`'s HKDF-SHA512
+    // path is exercised only by round trip below, not a byte-exact RFC
+    // anchor — an honest, narrower claim than the other vectors in this
+    // file make.
+};
+
 // ── A.1.2/A.1.3/A.1.4 + A.3.2/A.3.3/A.3.4: the three NON-base modes ─────
 //
 // The base-mode sections above anchor mode_base (0x00) only. Everything a
@@ -812,6 +915,112 @@ test "A.3: P-256 + AES-128-GCM — Encap/Decap + KeySchedule + seq-0 Seal, byte-
     var ct: [45]u8 = undefined;
     try ctx.seal(a1.encryptions[0].aad, a1.encryptions[0].pt, &ct);
     try testing.expectEqualSlices(u8, &a3.seq0_ct, &ct);
+}
+
+// ── A.4: the first HKDF-SHA384/512-widened vector ───────────────────────
+//
+// Everything above this point drives HKDF-SHA256 (Nh=32) exclusively — A.4
+// is the ONE vector in this file that exercises schedule.zig's Nh-dispatch
+// (KdfOf/kdfIdOf) with Nh=64 (HKDF-SHA512), proving the widening in
+// schedule.zig actually changes the derived bytes rather than silently
+// falling back to HKDF-SHA256. See a4's own doc comment for provenance.
+
+test "A.4 header ids match suite.KemId/KdfId/AeadId (kdf_id is hkdf_sha512, NOT hkdf_sha256)" {
+    try testing.expectEqual(@as(u16, @intFromEnum(suite.KemId.dhkem_p256_hkdf_sha256)), a4.kem_id);
+    try testing.expectEqual(@as(u16, @intFromEnum(suite.KdfId.hkdf_sha512)), a4.kdf_id);
+    try testing.expectEqual(@as(u16, @intFromEnum(suite.AeadId.aes128gcm)), a4.aead_id);
+}
+
+test "A.4: DHKEM(P-256).encapDeterministic/.decap reproduce enc/shared_secret — UNCHANGED by the outer kdf_id" {
+    // The KEM's own internal KDF (dhkem.zig's ExtractAndExpand) is fixed
+    // HKDF-SHA256 by kem_id alone (RFC 9180 §7.1 Table 2) — this must
+    // reproduce shared_secret the exact same way A.3's test does, even
+    // though A.4's OUTER key schedule below runs HKDF-SHA512. If this KAT
+    // passed with a WRONG shared_secret, no later stage could recover.
+    const eph = dhkem.P256Kem.KeyPair{ .secret_key = a4.skEm, .public_key = a4.pkEm };
+    const got = try dhkem.P256Kem.encapDeterministic(a4.pkRm, eph);
+    try testing.expectEqualSlices(u8, &a4.enc, &got.enc);
+    try testing.expectEqualSlices(u8, &a4.shared_secret, &got.shared_secret);
+    const skR = dhkem.P256Kem.KeyPair{ .secret_key = a4.skRm, .public_key = a4.pkRm };
+    try testing.expectEqualSlices(u8, &a4.shared_secret, &(try dhkem.P256Kem.decap(a4.enc, skR)));
+}
+
+test "A.4: key_schedule_context/secret, byte-exact via real LabeledExtract with the HKDF-SHA512 Kdf type (Nh=64)" {
+    // Same recipe as the A.1.1 KSC test, but with schedule.KdfOf(64) (HKDF-
+    // SHA512) instead of HkdfSha256 — checked SEPARATELY from
+    // schedule.keySchedule (next test) so a wrong mode byte / suite_id /
+    // labeling would name ITS OWN stage instead of surfacing as an opaque
+    // wrong `key`.
+    const Kdf = schedule.KdfOf(64);
+    const suite_id = suite.suiteId(a4.kem_id, a4.kdf_id, a4.aead_id);
+    const psk_id_hash = suite.labeledExtract(Kdf, &suite_id, "", "psk_id_hash", "");
+    const info_hash = suite.labeledExtract(Kdf, &suite_id, "", "info_hash", &a4.info);
+
+    var ksc: [129]u8 = undefined;
+    ksc[0] = a4.mode;
+    ksc[1..65].* = psk_id_hash;
+    ksc[65..129].* = info_hash;
+    try testing.expectEqualSlices(u8, &a4.key_schedule_context, &ksc);
+
+    const secret = suite.labeledExtract(Kdf, &suite_id, &a4.shared_secret, "secret", "");
+    try testing.expectEqualSlices(u8, &a4.secret, &secret);
+}
+
+test "A.4: schedule.keySchedule(.base, shared_secret, info, Nh=64) matches key/base_nonce/exporter_secret" {
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const suite_id = suite.suiteId(a4.kem_id, a4.kdf_id, a4.aead_id);
+    // Nh=64 is the whole point of this test: schedule.keySchedule must
+    // dispatch to HKDF-SHA512 (schedule.KdfOf(64)) here, not silently keep
+    // using HKDF-SHA256 — a mutation that hardcoded HkdfSha256 back in
+    // would still COMPILE (Nh=64 only changes buffer widths, not which
+    // Hkdf runs) but every assertion below would go red.
+    const ctx = try schedule.keySchedule(Aes128Gcm, 64, .base, &suite_id, &a4.shared_secret, &a4.info, "", "");
+    try testing.expectEqualSlices(u8, &a4.key, &ctx.key);
+    try testing.expectEqualSlices(u8, &a4.base_nonce, &ctx.base_nonce);
+    try testing.expectEqualSlices(u8, &a4.exporter_secret, &ctx.exporter_secret);
+    try testing.expectEqual(@as(u64, 0), ctx.seq);
+}
+
+test "A.4: Context(Aead,64).seal/.open reproduce all 6 published tuples (seq 0/1/2/4/255/256)" {
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const suite_id = suite.suiteId(a4.kem_id, a4.kdf_id, a4.aead_id);
+    var sender = try schedule.keySchedule(Aes128Gcm, 64, .base, &suite_id, &a4.shared_secret, &a4.info, "", "");
+    var receiver = sender;
+
+    for (a4.encryptions) |enc_case| {
+        sender.seq = enc_case.seq;
+        var ct: [45]u8 = undefined;
+        std.debug.assert(enc_case.ct.len == ct.len);
+        try sender.seal(enc_case.aad, enc_case.pt, &ct);
+        try testing.expectEqualSlices(u8, enc_case.ct, &ct);
+        try testing.expectEqual(enc_case.seq + 1, sender.seq);
+
+        receiver.seq = enc_case.seq;
+        var pt: [29]u8 = undefined;
+        try receiver.open(enc_case.aad, enc_case.ct, &pt);
+        try testing.expectEqualSlices(u8, enc_case.pt, &pt);
+        try testing.expectEqual(enc_case.seq + 1, receiver.seq);
+    }
+}
+
+test "A.4: sealBaseDeterministic/openBase (Nh=64) reproduce enc + the first ciphertext end-to-end in one call" {
+    // The single-shot §6.1 wrapper path, not just keySchedule/Context
+    // directly — proves suiteIdOf(Kem, Aead, Nh=64) (the sealBase/openBase
+    // internal suite_id assembly) picks kdf_id=hkdf_sha512, matching the
+    // suite_id used above, not the hkdf_sha256 default.
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const eph = dhkem.P256Kem.KeyPair{ .secret_key = a4.skEm, .public_key = a4.pkEm };
+    const first = a4.encryptions[0];
+
+    var ct: [45]u8 = undefined;
+    const sealed = try schedule.sealBaseDeterministic(dhkem.P256Kem, Aes128Gcm, 64, a4.pkRm, eph, &a4.info, first.aad, first.pt, &ct);
+    try testing.expectEqualSlices(u8, &a4.enc, &sealed.enc);
+    try testing.expectEqualSlices(u8, first.ct, &ct);
+
+    const skR = dhkem.P256Kem.KeyPair{ .secret_key = a4.skRm, .public_key = a4.pkRm };
+    var pt: [29]u8 = undefined;
+    try schedule.openBase(dhkem.P256Kem, Aes128Gcm, 64, sealed.enc, skR, &a4.info, first.aad, &ct, &pt);
+    try testing.expectEqualSlices(u8, first.pt, &pt);
 }
 
 // ── non-base-mode vectors, driven end-to-end ────────────────────────────

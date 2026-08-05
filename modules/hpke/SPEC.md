@@ -11,9 +11,15 @@ multi-message `Context` for streaming use and a secret-export function
 (§5.3) higher-level protocols can pull their own derived keys from (e.g.
 MLS). This module targets the two DHKEM instantiations `std.crypto` can
 drive without a C dependency — `dhkem_x25519_hkdf_sha256` (kem_id
-0x0020) and `dhkem_p256_hkdf_sha256` (kem_id 0x0010) — both paired with
-HKDF-SHA256, and all three spec-named AEADs (AES-128-GCM, AES-256-GCM,
-ChaCha20Poly1305).
+0x0020) and `dhkem_p256_hkdf_sha256` (kem_id 0x0010) — each still fixed to
+ITS OWN internal KDF (HKDF-SHA256, RFC 9180 §7.1 Table 2), all three
+spec-named AEADs (AES-128-GCM, AES-256-GCM, ChaCha20Poly1305), and now all
+three spec-named OUTER key-schedule KDFs (HKDF-SHA256/384/512, `Nh` =
+32/48/64 — `schedule.KdfOf`/`kdfIdOf` dispatch on `Nh`, see `schedule.zig`'s
+module doc comment) — a DHKEM's own internal KDF and the ciphersuite's key-
+schedule KDF are RFC 9180's own SEPARATE choices (§4.1 vs §7.2), so e.g.
+`DHKEM(P-256, HKDF-SHA256)` + an HKDF-SHA512 key schedule (Appendix A.4) is
+a real, already-KATed combination, not a hypothetical one.
 
 ## Modes covered (RFC 9180 §5.1 Table 1)
 
@@ -357,6 +363,71 @@ implemented and KAT-verified (order preserved):
     consumption of this module, `sealBase`/`openBase` in `crypto.zig`, is
     untouched).
 
+## Done-record — HKDF-SHA384/SHA512 key-schedule KDF (2026-08-05)
+
+15. ✅ **The outer key-schedule KDF is `Nh`-dispatched, not hard-wired to
+    HKDF-SHA256.** Before this pass, `schedule.keySchedule`/
+    `Context.exportSecret` called `std.crypto.kdf.hkdf.HkdfSha256` directly
+    (a `comptime std.debug.assert(Nh == HkdfSha256.prk_length)` enforced
+    the only value `Nh` could legally be), even though `suite.zig`'s
+    `labeledExtract`/`labeledExpand` were ALREADY generic over any
+    `Hkdf(Hmac)` instantiation — the hardcoding was one layer up, in
+    `schedule.zig`. `schedule.KdfOf(Nh)` (public) now maps `Nh` — already
+    threaded through every `Context`/`keySchedule`/`setup*`/`seal*`/`open*`
+    signature, originally just for buffer sizing — to HKDF-SHA256 (32),
+    HKDF-SHA384 (48, built from `std.crypto.kdf.hkdf.Hkdf` over
+    `std.crypto.auth.hmac.sha2.HmacSha384`, since `std` names no
+    `HkdfSha384` alias the way it does the other two), or HKDF-SHA512 (64);
+    `kdfIdOf(Nh)` (private, next to `aeadIdOf`) supplies the matching
+    `suite_id` byte so `suiteIdOf` embeds the RIGHT `kdf_id` per `Nh`
+    instead of always `hkdf_sha256`. **No public signature changed** — an
+    existing caller passing `Nh=32` (every caller before this pass,
+    including `modules/mls`'s `sealBase`/`openBase` calls) gets the
+    byte-identical HKDF-SHA256 path; the existing A.1/A.1.2/A.1.3/A.1.4/
+    A.2/A.3/A.3.2/A.3.3/A.3.4 vectors all still pass unchanged (the
+    regression net for this refactor).
+    A DHKEM's OWN internal KDF (`dhkem.zig`'s `ExtractAndExpand`) is
+    UNTOUCHED and deliberately so — RFC 9180 §7.1 Table 2 fixes it per
+    `kem_id`, a separate choice from the ciphersuite's `kdf_id` this item
+    widens (§4.1 vs §7.2/§7.2.1). KAT: RFC 9180 Appendix A.4 (`DHKEM(P-256,
+    HKDF-SHA256), HKDF-SHA512, AES-128-GCM`) — `kat_rfc9180.zig`'s `a4` —
+    is the first vector this module drives with `Nh` != 32: DHKEM
+    Encap/Decap reproduce the published `enc`/`shared_secret` (still 32
+    bytes, the KEM's `Nsecret`, UNCHANGED by the outer `kdf_id`),
+    `key_schedule_context`/`secret` reproduced via
+    `suite.labeledExtract(schedule.KdfOf(64), ...)` directly (checked
+    separately from `keySchedule`, the same "own stage" discipline item 11
+    used), `schedule.keySchedule(Aead, 64, ...)` reproduces
+    `key`/`base_nonce`/`exporter_secret` (all 64-byte `Nh`-width, except
+    `key`/`base_nonce` which are AEAD/nonce-width as always), all 6
+    published `(seq, pt, aad, ct)` tuples sealed AND opened through the
+    real `Context(Aead, 64)`, and `sealBaseDeterministic`/`openBase`
+    (the §6.1 single-shot pair, exercising `suiteIdOf`'s `Nh`-dispatch too)
+    reproduce `enc` + the first ciphertext end-to-end. A.4's vector was
+    extracted from a local (no network fetch) copy of the RFC's own
+    published `test-vectors.json`, bundled as Go's standard-library HPKE
+    test fixture (`crypto/internal/hpke/testdata/rfc9180-vectors.json`) —
+    present in this machine's Go module cache — not authored by this repo
+    and not derived from this module's own output; A.4 does not carry an
+    exported-value (§A.4.1.2) vector in that source, so `Context.
+    exportSecret`'s HKDF-SHA512 path (`Context.exportSecret` itself is
+    UNCHANGED code, already covered mechanically by `KdfOf`) has no
+    byte-exact anchor for `Nh`=64 specifically — an honest narrower claim
+    than every other vector in this file. Mutation-checked: temporarily
+    mapping `kdfIdOf(64)` to `hkdf_sha384`'s id instead of `hkdf_sha512`'s
+    compiles fine (the bug is a wrong CONSTANT, not a type/width error) and
+    turns the A.4 `sealBaseDeterministic`/`openBase` KAT red — confirming
+    `suiteIdOf`'s `Nh`-dispatch is load-bearing, not vacuous.
+    HKDF-SHA384 (`Nh`=48) has no dedicated RFC 9180 Appendix A vector to
+    anchor against (no Appendix A section pairs an HKDF-SHA384 key
+    schedule with a KEM this module instantiates) — its correctness rests
+    on `KdfOf(48)` being the identical `Hkdf(Hmac)` composition `KdfOf(32)`/
+    `KdfOf(64)` already use, over `std.crypto.auth.hmac.sha2.HmacSha384`
+    (std's own HMAC-SHA384, itself not this module's code), not a
+    hand-rolled HKDF variant; there is no independent-of-this-module
+    anchor for it, a real (if narrow) coverage gap flagged here rather
+    than silently left implicit.
+
 ## Verification status
 
 1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — all tests
@@ -370,7 +441,11 @@ implemented and KAT-verified (order preserved):
    `setup*S`/`setup*R` entry points directly (`driveSetupVector` in
    `kat_rfc9180.zig`) — `enc`, every `Context` field, one Seal/Open round
    trip, and every published exported value via `Context.exportSecret`
-   called on the `Context` the new API hands back.
+   called on the `Context` the new API hands back. A.4 (`DHKEM(P-256,
+   HKDF-SHA256), HKDF-SHA512, AES-128-GCM`) drives the same DHKEM
+   Encap/Decap + KeySchedule + all 6 Seal/Open tuples + single-shot
+   sealBase/openBase chain with `Nh`=64 (HKDF-SHA512) instead of 32 — see
+   done-record item 15.
 2. **Negative-path:** low-order X25519 pkR (`error.DhFailed`), malformed
    P-256 SEC1 (`error.DeserializeError`), AEAD tamper/wrong-aad/
    truncated-ct (`error.DecryptionFailed`, `seq` not advanced),
@@ -384,10 +459,17 @@ implemented and KAT-verified (order preserved):
    exactly 32), and per-mode single-shot rejection (wrong `pkS`, wrong
    `psk`, wrong `psk_id`, and opening an `auth_psk` ciphertext with
    `openAuth` or an `auth` ciphertext with `openBase`).
-3. **Open:** nothing. Every RFC 9180 surface this module implements now
-   has an embedded official vector. The Appendix A sections deliberately
-   NOT embedded are the ones for suites this module does not instantiate
-   (A.4/A.6's HKDF-SHA512 and P-521, A.7+'s export-only AEAD) plus the
-   `ChaCha20Poly1305` mode vectors of A.2/A.5, which differ from the
-   embedded A.1/A.3 mode vectors only in the `aead_id` byte of `suite_id`
-   — already covered by the A.2 base header.
+3. **Open:** two narrow, explicitly-flagged gaps (see done-record item 15).
+   HKDF-SHA384 (`Nh`=48) has no RFC 9180 Appendix A vector at all (no
+   section pairs it with a KEM this module instantiates), so it rests on
+   being the same `Hkdf(Hmac)` composition as the other two widths, not an
+   independent anchor. A.4's `Context.exportSecret` output has no
+   byte-exact anchor either (the offline `test-vectors.json` copy this
+   module's A.4 was extracted from carries Setup+Encryptions but not
+   Export). Otherwise, every RFC 9180 surface this module implements has
+   an embedded official vector. The Appendix A sections still NOT
+   embedded are A.6 (P-521 — a KEM this module does not instantiate),
+   A.7+ (export-only AEAD) and the `ChaCha20Poly1305` mode vectors of
+   A.2/A.5, which differ from the embedded A.1/A.3/A.4 mode vectors only
+   in the `aead_id`/`kdf_id` bytes of `suite_id` — already covered by
+   their respective base headers.

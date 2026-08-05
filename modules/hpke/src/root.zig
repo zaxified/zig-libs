@@ -41,9 +41,10 @@
 //! alone; this module names no third-party implementation as a design
 //! reference, so `NOTICE` carries only the RFC 9180 citation). Built
 //! entirely on `std.crypto` (`std.crypto.dh.X25519`, `std.crypto.ecc.P256`,
-//! `std.crypto.kdf.hkdf.HkdfSha256`, `std.crypto.aead.aes_gcm.{Aes128Gcm,
-//! Aes256Gcm}`, `std.crypto.aead.chacha_poly.ChaCha20Poly1305`) — no
-//! sibling-module dependency, `deps = .{}`.
+//! `std.crypto.kdf.hkdf.HkdfSha256`/`.HkdfSha512`/`.Hkdf` — the key-schedule
+//! KDF is `Nh`-dispatched across all three RFC 9180 widths, `schedule.
+//! KdfOf` — `std.crypto.aead.aes_gcm.{Aes128Gcm, Aes256Gcm}`,
+//! `std.crypto.aead.chacha_poly.ChaCha20Poly1305`).
 
 const std = @import("std");
 

@@ -19,12 +19,22 @@ See `SPEC.md` for the threat model, the done-records, and the one place
 this module is deliberately stricter than the RFC (§5.1.2's PSK-length
 floor, `error.PskTooShort`).
 
+**The key-schedule KDF is HKDF-SHA256/384/512, dispatched on `Nh`** (not
+hard-wired) — `schedule.KdfOf(Nh)` picks the `Hkdf(Hmac)` instantiation for
+`Nh` = 32/48/64, so passing `Nh=64` to any existing `Context`/`keySchedule`/
+`setup*`/`seal*`/`open*` call runs HKDF-SHA512 instead, no signature
+change. This is a SEPARATE choice from a DHKEM's own internal KDF (fixed
+per `kem_id`, RFC 9180 §7.1 Table 2 — both KEMs this module instantiates
+stay HKDF-SHA256 internally regardless of the outer `Nh`). KAT: RFC 9180
+Appendix A.4 (`DHKEM(P-256, HKDF-SHA256), HKDF-SHA512, AES-128-GCM`), see
+SPEC.md's done-record.
+
 | File | Provides |
 |---|---|
 | `suite.zig` | `KemId`/`KdfId`/`AeadId`/`Mode`, `i2osp`/`os2ip`, `suiteId`/`kemSuiteId`, `labeledExtract`/`labeledExpand` (§4) |
 | `dhkem.zig` | `X25519Kem`/`P256Kem`: `encap`/`encapDeterministic`/`decap`/`authEncapDeterministic`/`authDecap`/`deriveKeyPair`/`generateKeyPair` (§4.1/§7.1.1–§7.1.3) |
-| `schedule.zig` | `keySchedule` (§5.1), `Context(Aead, Nh).seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, §5.1's `setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` (+ `*Deterministic` KAT seams) with their `setup*R` mirrors — return the `Context` itself, for multi-message/export-only use — and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` with their `open*` mirrors, now thin compositions over `setup*` |
-| `kat_rfc9180.zig` | RFC 9180 Appendix A vectors: A.1 in all four modes (full), A.2/A.3 headers, A.3's three non-base modes — driven end-to-end through the real implementation |
+| `schedule.zig` | `keySchedule` (§5.1), `Context(Aead, Nh).seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, `KdfOf(Nh)`/`kdfIdOf(Nh)` (the HKDF-SHA256/384/512 dispatch), §5.1's `setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` (+ `*Deterministic` KAT seams) with their `setup*R` mirrors — return the `Context` itself, for multi-message/export-only use — and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` with their `open*` mirrors, now thin compositions over `setup*` |
+| `kat_rfc9180.zig` | RFC 9180 Appendix A vectors: A.1 in all four modes (full), A.2/A.3/A.4 headers, A.3's three non-base modes — driven end-to-end through the real implementation |
 
 - **Model after:** RFC 9180 (Hybrid Public Key Encryption).
 - **Platform:** any. **Role:** util (no owned transport/socket — an
@@ -33,8 +43,10 @@ floor, `error.PskTooShort`).
   touches only its parameters.
 - **Deps:** `p256` (DHKEM(P-256)'s group — byte-exact to
   `std.crypto.ecc.P256`; the X25519 KEM path stays on `std`). Also `std`
-  directly: `std.crypto.dh.X25519`, `std.crypto.kdf.hkdf.HkdfSha256`,
-  `std.crypto.aead.aes_gcm`, `std.crypto.aead.chacha_poly`.
+  directly: `std.crypto.dh.X25519`, `std.crypto.kdf.hkdf.HkdfSha256`/
+  `.HkdfSha512`/`.Hkdf` (HKDF-SHA384's `Hkdf(std.crypto.auth.hmac.sha2.
+  HmacSha384)`, no named alias in `std`), `std.crypto.aead.aes_gcm`,
+  `std.crypto.aead.chacha_poly`.
 
 ## Import
 
