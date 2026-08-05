@@ -10,6 +10,15 @@
 //! without ever sealing a message through it (e.g. MLS/RFC 9420's
 //! external-init and external-commit, §8.3/§12.4).
 //!
+//! Three DHKEMs: `X25519Kem`, `P256Kem` (curve group from the local
+//! asm-accelerated `p256` module) and `P384Kem` (curve group from
+//! `std.crypto.ecc.P384` directly — no local perf-specialized sibling
+//! exists for P-384, see `dhkem.zig`'s module doc comment). RFC 9180
+//! Appendix A publishes no worked test-vector section for DHKEM(P-384,
+//! HKDF-SHA384) — `P384Kem` is anchored by type widths, self-consistency
+//! round trips and malformed-input rejection instead; see `dhkem.zig` and
+//! SPEC.md.
+//!
 //! **Status: crypto-implementation pass DONE — every core is real and
 //! KAT-validated** against RFC 9180 Appendix A, byte-exact, in ALL FOUR
 //! modes:
@@ -41,7 +50,8 @@
 //! alone; this module names no third-party implementation as a design
 //! reference, so `NOTICE` carries only the RFC 9180 citation). Built
 //! entirely on `std.crypto` (`std.crypto.dh.X25519`, `std.crypto.ecc.P256`,
-//! `std.crypto.kdf.hkdf.HkdfSha256`/`.HkdfSha512`/`.Hkdf` — the key-schedule
+//! `std.crypto.ecc.P384` (`P384Kem`'s group — no local perf module for
+//! P-384, see `dhkem.zig`), `std.crypto.kdf.hkdf.HkdfSha256`/`.HkdfSha512`/`.Hkdf` — the key-schedule
 //! KDF is `Nh`-dispatched across all three RFC 9180 widths, `schedule.
 //! KdfOf` — `std.crypto.aead.aes_gcm.{Aes128Gcm, Aes256Gcm}`,
 //! `std.crypto.aead.chacha_poly.ChaCha20Poly1305`).
@@ -59,6 +69,7 @@ pub const Mode = suite.Mode;
 
 pub const X25519Kem = dhkem.X25519Kem;
 pub const P256Kem = dhkem.P256Kem;
+pub const P384Kem = dhkem.P384Kem;
 
 pub const Context = schedule.Context;
 pub const keySchedule = schedule.keySchedule;
@@ -137,6 +148,7 @@ test "meta.role is .util (no owned transport/socket, unlike a .client/.server mo
 test "KemId/KdfId/AeadId ordinals match RFC 9180 Tables 2/3/5" {
     try std.testing.expectEqual(@as(u16, 0x0020), @intFromEnum(KemId.dhkem_x25519_hkdf_sha256));
     try std.testing.expectEqual(@as(u16, 0x0010), @intFromEnum(KemId.dhkem_p256_hkdf_sha256));
+    try std.testing.expectEqual(@as(u16, 0x0011), @intFromEnum(KemId.dhkem_p384_hkdf_sha384));
     try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(KdfId.hkdf_sha256));
     try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(AeadId.aes128gcm));
     try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(AeadId.aes256gcm));

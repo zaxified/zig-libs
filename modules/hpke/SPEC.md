@@ -9,17 +9,22 @@ composed with an HKDF-based key schedule and an AEAD into a "seal to a
 public key" / "open with the matching private key" primitive, plus a
 multi-message `Context` for streaming use and a secret-export function
 (§5.3) higher-level protocols can pull their own derived keys from (e.g.
-MLS). This module targets the two DHKEM instantiations `std.crypto` can
+MLS). This module targets the three DHKEM instantiations `std.crypto` can
 drive without a C dependency — `dhkem_x25519_hkdf_sha256` (kem_id
-0x0020) and `dhkem_p256_hkdf_sha256` (kem_id 0x0010) — each still fixed to
-ITS OWN internal KDF (HKDF-SHA256, RFC 9180 §7.1 Table 2), all three
-spec-named AEADs (AES-128-GCM, AES-256-GCM, ChaCha20Poly1305), and now all
-three spec-named OUTER key-schedule KDFs (HKDF-SHA256/384/512, `Nh` =
-32/48/64 — `schedule.KdfOf`/`kdfIdOf` dispatch on `Nh`, see `schedule.zig`'s
-module doc comment) — a DHKEM's own internal KDF and the ciphersuite's key-
-schedule KDF are RFC 9180's own SEPARATE choices (§4.1 vs §7.2), so e.g.
-`DHKEM(P-256, HKDF-SHA256)` + an HKDF-SHA512 key schedule (Appendix A.4) is
-a real, already-KATed combination, not a hypothetical one.
+0x0020), `dhkem_p256_hkdf_sha256` (kem_id 0x0010) and, since 2026-08-06,
+`dhkem_p384_hkdf_sha384` (kem_id 0x0011) — each fixed to ITS OWN internal
+KDF (HKDF-SHA256 for X25519/P-256, HKDF-SHA384 for P-384, RFC 9180 §7.1
+Table 2), all three spec-named AEADs (AES-128-GCM, AES-256-GCM,
+ChaCha20Poly1305), and all three spec-named OUTER key-schedule KDFs
+(HKDF-SHA256/384/512, `Nh` = 32/48/64 — `schedule.KdfOf`/`kdfIdOf` dispatch
+on `Nh`, see `schedule.zig`'s module doc comment) — a DHKEM's own internal
+KDF and the ciphersuite's key-schedule KDF are RFC 9180's own SEPARATE
+choices (§4.1 vs §7.2), so e.g. `DHKEM(P-256, HKDF-SHA256)` + an
+HKDF-SHA512 key schedule (Appendix A.4) is a real, already-KATed
+combination, not a hypothetical one — and `DHKEM(P-384, HKDF-SHA384)`
+paired with an HKDF-SHA384 key schedule (the natural pairing, `Nh`=48 both
+places) works the same way, just without an Appendix A vector to KAT it
+against (see the P-384 done-record item below).
 
 ## Modes covered (RFC 9180 §5.1 Table 1)
 
@@ -428,6 +433,92 @@ implemented and KAT-verified (order preserved):
     anchor for it, a real (if narrow) coverage gap flagged here rather
     than silently left implicit.
 
+## Done-record — DHKEM(P-384, HKDF-SHA384) (2026-08-06)
+
+16. ✅ **`dhkem.P384Kem`** — a third DHKEM, `kem_id` 0x0011 (RFC 9180 §7.1
+    Table 2), structurally identical to `P256Kem`: `Npk`=97 (SEC1
+    uncompressed `0x04 || X(48) || Y(48)`), `Nsk`=48, `Nsecret`=48, the same
+    x-coordinate-only ECDH (`fromSec1(pk).mul(sk,.big).affineCoordinates().
+    x.toBytes(.big)`), the same §7.1.3 rejection-sampling `deriveKeyPair`
+    loop (`bitmask`=0xFF — P-384's 384-bit order needs no narrowing, same
+    reasoning as P-256, unlike P-521's 0x01), and the same `AuthEncap`/
+    `AuthDecap` `dh || dh2` fold. The one real difference: DHKEM(P-384, …)'s
+    OWN internal KDF (RFC 9180 §7.1 Table 2) is HKDF-SHA384, not
+    HKDF-SHA256 — the first KEM this module instantiates where that's true
+    — so `dhkem.zig`'s shared `extractAndExpand` helper (previously
+    hardcoded to `HkdfSha256`, correct for both prior KEMs) is now
+    parameterized on the `Hkdf` type, with `X25519Kem`/`P256Kem` passing
+    `HkdfSha256` explicitly at every call site and `P384Kem` passing a
+    locally-built `Hkdf(HmacSha384)` (the same composition
+    `schedule.KdfOf(48)` already uses for the OUTER key schedule — a
+    coincidence of both landing on `Nh`=48, not a code-sharing shortcut:
+    `dhkem.zig` does not import `schedule.zig`, since a DHKEM's own KDF and
+    the outer key-schedule KDF are RFC 9180's own separate choices, the
+    same discipline `schedule.zig`'s module doc comment already states for
+    the reverse direction). `P384Kem`'s curve group is
+    `std.crypto.ecc.P384` directly, not a new local perf-specialized
+    module the way `p256` is for P-256 — `p256`'s README states its
+    reason for existing is a measured perf gap on named hot paths (P2
+    HTTPS-API JWT/TLS, 2FA/WebAuthn, `spake2plus`); nothing currently
+    calls `hpke`'s P-384 path on such a path, so building on std directly
+    (this repo's default posture) is the correct call here, not a
+    corner cut.
+    **No RFC 9180 Appendix A vector exists for DHKEM(P-384, HKDF-SHA384)
+    at all.** This was checked, not assumed: (a) this module's own record
+    of Appendix A's contents (done-record item 15 and "Verification
+    status" §3 below, both written from an earlier faithful pass over the
+    RFC) already enumerates every section — A.1/A.2 (X25519), A.3/A.4/A.5
+    (P-256), A.6 (P-521), A.7 (export-only) — and none is P-384; (b) the
+    offline `rfc9180-vectors.json` fixture bundled with the Go standard
+    library's `crypto/internal/hpke` package (the same local, no-network
+    source A.4 was extracted from, present in this machine's Go module
+    cache under multiple toolchain versions) contains exactly 6 entries —
+    X25519+AES128GCM, X25519+ChaCha, P256+AES128GCM, P256+SHA512+AES128GCM,
+    P256+ChaCha, P521+SHA512+AES256GCM — and P-384 is not among them
+    either. Go's own HPKE implementation supports P-384 curve arithmetic
+    elsewhere (`crypto/ecdh`) yet chose not to include an HPKE P-384 test
+    case, consistent with there being no RFC vector to draw one from. A
+    wider local search (this machine's Go module cache across many
+    toolchain versions, a bundled BoringSSL reference inside the Flutter
+    engine checkout — build files only, no source present locally — this
+    repo's own `audit/` notes, and the installed wolfSSL headers) turned
+    up no P-384 HPKE vector anywhere on this machine, and no network
+    fetch was available or used to look further. Per this repo's own
+    convention (do not self-generate a vector and present it as an
+    anchor — see done-record item 15's A.4-export-value gap and the
+    module's history of a previously-reverted self-generated "anchor"),
+    `P384Kem` is instead anchored the same way `P256Kem`'s own
+    non-KAT-covered surfaces already are: RFC 9180 §7.1 Table 2's
+    definitional `Npk`/`Nsk`/`Nsecret` widths and `kem_id` (type-width
+    test), a pure-math `basePoint.mul`+`toUncompressedSec1` smoke test
+    (scalar=1 → the curve's own basePoint), self-consistency round trips
+    for `Encap`/`Decap`, `AuthEncap`/`AuthDecap` (including the
+    wrong-`pkS`-diverges property) and `deriveKeyPair` (determinism,
+    distinctness, on-curve, Encap/Decap round trip through a derived key),
+    malformed-SEC1 rejection (`error.DeserializeError`), and fuzz coverage
+    of `decap`/`authDecap` against arbitrary attacker-controlled bytes
+    (`fuzzedSec1Bytes` generalized from `P256Kem`'s fuzz harness to a
+    comptime-`N` helper so both KEMs' fuzzers share one biasing recipe).
+    This is an honest, narrower claim than every A.1/A.2/A.3/A.4-anchored
+    surface in this file: round-trip and structural tests cannot catch a
+    misreading the sender and recipient share (see "Modes covered" above
+    on why that matters), so `P384Kem`'s `AuthEncap`/`AuthDecap` fold in
+    particular rests on being byte-for-byte the same recipe as the
+    RFC-anchored `X25519Kem`/`P256Kem` folds, not an independent external
+    check. Regression: the pre-existing A.1/A.1.2/A.1.3/A.1.4/A.2/A.3/
+    A.3.2/A.3.3/A.3.4/A.4 vectors were re-run unchanged after this work —
+    all still pass byte-exact — and `modules/mls`'s `test-mls` (the only
+    downstream consumer) stays green.
+    Teeth (replayed independently): temporarily changing `P384Kem`'s
+    `kem_id` inside `extractAndExpand`'s `suite_id` construction (i.e. the
+    KEM-context domain separator, analogous to done-record item 15's
+    `kdfIdOf` mutation) breaks the `Encap`/`Decap` round trip test — a
+    sender and receiver computing `kemSuiteId` from two different `kem_id`
+    constants derive two different `eae_prk`s and disagree on
+    `shared_secret`, so the mismatch is caught even without an external
+    vector. Exit 1 mutated, exit 0 restored — see this repo's task record
+    for the exact line and both exit codes.
+
 ## Verification status
 
 1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — all tests
@@ -445,9 +536,12 @@ implemented and KAT-verified (order preserved):
    HKDF-SHA256), HKDF-SHA512, AES-128-GCM`) drives the same DHKEM
    Encap/Decap + KeySchedule + all 6 Seal/Open tuples + single-shot
    sealBase/openBase chain with `Nh`=64 (HKDF-SHA512) instead of 32 — see
-   done-record item 15.
+   done-record item 15. `P384Kem` (done-record item 16) is exercised by
+   self-consistency round trips (Encap/Decap, AuthEncap/AuthDecap,
+   DeriveKeyPair) and fuzz coverage, NOT an Appendix A vector — see that
+   item for why none exists.
 2. **Negative-path:** low-order X25519 pkR (`error.DhFailed`), malformed
-   P-256 SEC1 (`error.DeserializeError`), AEAD tamper/wrong-aad/
+   P-256/P-384 SEC1 (`error.DeserializeError`), AEAD tamper/wrong-aad/
    truncated-ct (`error.DecryptionFailed`, `seq` not advanced),
    wrong-length `out` buffer on `seal`/`open` (`error.InvalidLength`,
    a real runtime check in every build mode, not a `std.debug.assert`
@@ -459,17 +553,23 @@ implemented and KAT-verified (order preserved):
    exactly 32), and per-mode single-shot rejection (wrong `pkS`, wrong
    `psk`, wrong `psk_id`, and opening an `auth_psk` ciphertext with
    `openAuth` or an `auth` ciphertext with `openBase`).
-3. **Open:** two narrow, explicitly-flagged gaps (see done-record item 15).
-   HKDF-SHA384 (`Nh`=48) has no RFC 9180 Appendix A vector at all (no
-   section pairs it with a KEM this module instantiates), so it rests on
-   being the same `Hkdf(Hmac)` composition as the other two widths, not an
-   independent anchor. A.4's `Context.exportSecret` output has no
-   byte-exact anchor either (the offline `test-vectors.json` copy this
-   module's A.4 was extracted from carries Setup+Encryptions but not
-   Export). Otherwise, every RFC 9180 surface this module implements has
-   an embedded official vector. The Appendix A sections still NOT
-   embedded are A.6 (P-521 — a KEM this module does not instantiate),
-   A.7+ (export-only AEAD) and the `ChaCha20Poly1305` mode vectors of
-   A.2/A.5, which differ from the embedded A.1/A.3/A.4 mode vectors only
-   in the `aead_id`/`kdf_id` bytes of `suite_id` — already covered by
-   their respective base headers.
+3. **Open:** three narrow, explicitly-flagged gaps (see done-record items
+   15/16). HKDF-SHA384 (`Nh`=48, the OUTER key-schedule KDF) has no RFC
+   9180 Appendix A vector at all (no section pairs it with a KEM this
+   module instantiates), so it rests on being the same `Hkdf(Hmac)`
+   composition as the other two widths, not an independent anchor. A.4's
+   `Context.exportSecret` output has no byte-exact anchor either (the
+   offline `test-vectors.json` copy this module's A.4 was extracted from
+   carries Setup+Encryptions but not Export). `P384Kem` (DHKEM(P-384,
+   HKDF-SHA384) — the KEM's OWN internal KDF, a separate gap from the
+   outer-KDF one above) has NO RFC 9180 Appendix A vector at all, checked
+   against both this module's own record of the appendix's contents and
+   the offline Go-stdlib `rfc9180-vectors.json` fixture (see done-record
+   item 16); it is anchored by type widths, self-consistency round trips
+   and malformed-input rejection instead. Otherwise, every RFC 9180
+   surface this module implements has an embedded official vector. The
+   Appendix A sections still NOT embedded are A.6 (P-521 — a KEM this
+   module does not instantiate), A.7+ (export-only AEAD) and the
+   `ChaCha20Poly1305` mode vectors of A.2/A.5, which differ from the
+   embedded A.1/A.3/A.4 mode vectors only in the `aead_id`/`kdf_id` bytes
+   of `suite_id` — already covered by their respective base headers.

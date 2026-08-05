@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: MIT
 //! DHKEM (RFC 9180 §4 / §7.1) — the KEM half of HPKE: `Encap`/`Decap` (base
 //! mode) and `AuthEncap`/`AuthDecap` (auth mode, §4.1 "Authentication using
-//! Asymmetric Keys"), instantiated over the two DH groups this repo's std
+//! Asymmetric Keys"), instantiated over the three DH groups this repo's std
 //! toolchain can drive without a C dependency: X25519
-//! (`dhkem_x25519_hkdf_sha256`) and P-256 (`dhkem_p256_hkdf_sha256`), both
-//! paired with HKDF-SHA256 (RFC 9180 §7.1 Table 2 only lists KEMs with
-//! their own fixed internal KDF — the KEM's KDF is independent of the
-//! outer ciphersuite's `kdf_id`).
+//! (`dhkem_x25519_hkdf_sha256`), P-256 (`dhkem_p256_hkdf_sha256`) and P-384
+//! (`dhkem_p384_hkdf_sha384`). Each DHKEM's internal KDF is FIXED per
+//! `kem_id` (RFC 9180 §7.1 Table 2): HKDF-SHA256 for X25519/P-256,
+//! HKDF-SHA384 for P-384 — independent of the outer ciphersuite's `kdf_id`
+//! (`schedule.zig`'s `KdfOf`/`kdfIdOf`), which is why `extractAndExpand`
+//! below takes the `Hkdf` type as a parameter rather than hardcoding one.
 //!
 //! **Everything here is REAL** (crypto-implementation pass done —
 //! KAT-validated against RFC 9180 Appendix A.1/A.3, see `kat_rfc9180.zig`;
 //! `AuthEncap`/`AuthDecap` and `P256Kem.deriveKeyPair` included, against
 //! A.1.3/A.1.4 and A.3.3/A.3.4's published `enc`/`shared_secret` and
-//! `ikmS`/`skSm`/`pkSm`).
+//! `ikmS`/`skSm`/`pkSm`). `P384Kem` is real and structurally identical to
+//! `P256Kem` (same std composition, one curve group swapped for another),
+//! but RFC 9180 Appendix A publishes NO worked test-vector section for
+//! DHKEM(P-384, HKDF-SHA384) at all (unlike P-256/P-521/X25519, each of
+//! which gets at least one) — see `P384Kem`'s doc comment and SPEC.md for
+//! what anchors it instead.
 //! `encapDeterministic`/`authEncapDeterministic` take the ephemeral keypair
 //! as a parameter (rather than drawing one from `std.Io`'s randomness
 //! internally) so the RFC 9180 Appendix A known-answer vectors — which fix
@@ -23,10 +30,23 @@ const std = @import("std");
 const suite = @import("suite.zig");
 // P-256 curve group for the DHKEM(P-256, …) suite from the asm-accelerated
 // `p256` module (byte-exact to `std.crypto.ecc.P256`). The X25519 KEM path
-// stays on std (p256 covers only the P-256 curve).
+// stays on std (p256 covers only the P-256 curve). P-384 has no local
+// perf-specialized sibling (no stated hot path the way P-256's JWT/TLS/
+// WebAuthn callers are, `modules/p256/README.md`'s "P2 HTTPS-API hot path"
+// rationale), so `P384Kem` below is built directly on
+// `std.crypto.ecc.P384` — same API shape as `p256`'s
+// (`fromSec1`/`toUncompressedSec1`/`mul`/`affineCoordinates`/`scalar.
+// random`/`scalar.rejectNonCanonical`), just not asm-accelerated.
 const P256 = @import("p256").P256;
+const P384 = std.crypto.ecc.P384;
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+// std names no `HkdfSha384` alias (unlike `HkdfSha256`/`HkdfSha512`) — same
+// composition `schedule.zig`'s `KdfOf(48)` builds for the OUTER key-schedule
+// KDF, reused here for `P384Kem`'s OWN internal KEM KDF (a separate choice,
+// see this file's module doc comment) rather than importing `schedule.zig`
+// (the higher layer) from here.
+const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
 
 /// Errors an `Encap`/`AuthEncap` can return (RFC 9180 §4/§7.1 doesn't
 /// itself name failure modes beyond "SerializeError"/"DeserializeError"
@@ -53,25 +73,28 @@ pub const DecapError = error{
 };
 
 /// RFC 9180 §4.1 `ExtractAndExpand(dh, kem_context)` — the one derivation
-/// both KEMs share (their internal KDF is HKDF-SHA256 for every KEM this
-/// module instantiates, RFC 9180 §7.1 Table 2): `eae_prk =
+/// every KEM shares, PARAMETERIZED on that KEM's own internal `Hkdf`
+/// (HKDF-SHA256 for X25519/P-256, HKDF-SHA384 for P-384 — RFC 9180 §7.1
+/// Table 2, fixed per `kem_id`, independent of the outer ciphersuite's
+/// `kdf_id`; see this file's module doc comment): `eae_prk =
 /// LabeledExtract("", "eae_prk", dh)`; `shared_secret =
 /// LabeledExpand(eae_prk, "shared_secret", kem_context, Nsecret)` — both
 /// under `kemSuiteId(kem_id)` ("KEM" || kem_id), NOT the outer HPKE
 /// `suiteId` (which also folds in kdf_id/aead_id; §7.2.1 vs §4.1).
 fn extractAndExpand(
+    comptime Hkdf: type,
     comptime kem_id: u16,
     comptime Nsecret: usize,
     dh: []const u8,
     kem_context: []const u8,
 ) [Nsecret]u8 {
     const kem_suite_id = comptime suite.kemSuiteId(kem_id);
-    const eae_prk = suite.labeledExtract(HkdfSha256, &kem_suite_id, "", "eae_prk", dh);
+    const eae_prk = suite.labeledExtract(Hkdf, &kem_suite_id, "", "eae_prk", dh);
     var shared_secret: [Nsecret]u8 = undefined;
-    // kem_context tops out at 195 bytes (P-256 auth mode: 3 × 65-byte SEC1
+    // kem_context tops out at 291 bytes (P-384 auth mode: 3 × 97-byte SEC1
     // points) — far inside labeledExpand's 512-byte scratch, so
     // error.LabelTooLong is structurally unreachable here.
-    suite.labeledExpand(HkdfSha256, &kem_suite_id, eae_prk, "shared_secret", kem_context, &shared_secret) catch unreachable;
+    suite.labeledExpand(Hkdf, &kem_suite_id, eae_prk, "shared_secret", kem_context, &shared_secret) catch unreachable;
     return shared_secret;
 }
 
@@ -173,7 +196,7 @@ pub const X25519Kem = struct {
         kem_context[0..Npk].* = eph.public_key;
         kem_context[Npk..].* = pkR;
         return .{
-            .shared_secret = extractAndExpand(kem_id, Nsecret, &dh, &kem_context),
+            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
             .enc = eph.public_key,
         };
     }
@@ -194,7 +217,7 @@ pub const X25519Kem = struct {
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = enc;
         kem_context[Npk..].* = skR.public_key;
-        return extractAndExpand(kem_id, Nsecret, &dh, &kem_context);
+        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
     }
 
     /// RFC 9180 §4.1 `AuthEncap(pkR, skS)` (auth / auth_psk modes): adds a
@@ -220,7 +243,7 @@ pub const X25519Kem = struct {
         kem_context[Npk .. 2 * Npk].* = pkR;
         kem_context[2 * Npk ..].* = skS.public_key;
         return .{
-            .shared_secret = extractAndExpand(kem_id, Nsecret, &dh, &kem_context),
+            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
             .enc = eph.public_key,
         };
     }
@@ -241,7 +264,7 @@ pub const X25519Kem = struct {
         kem_context[0..Npk].* = enc;
         kem_context[Npk .. 2 * Npk].* = skR.public_key;
         kem_context[2 * Npk ..].* = pkS;
-        return extractAndExpand(kem_id, Nsecret, &dh, &kem_context);
+        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
     }
 };
 
@@ -343,7 +366,7 @@ pub const P256Kem = struct {
         kem_context[0..Npk].* = eph.public_key;
         kem_context[Npk..].* = pkR;
         return .{
-            .shared_secret = extractAndExpand(kem_id, Nsecret, &dh, &kem_context),
+            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
             .enc = eph.public_key,
         };
     }
@@ -362,7 +385,7 @@ pub const P256Kem = struct {
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = enc;
         kem_context[Npk..].* = skR.public_key;
-        return extractAndExpand(kem_id, Nsecret, &dh, &kem_context);
+        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
     }
 
     /// RFC 9180 §4.1 `AuthEncap(pkR, skS)` for P-256 — same `dh || dh2`
@@ -380,7 +403,7 @@ pub const P256Kem = struct {
         kem_context[Npk .. 2 * Npk].* = pkR;
         kem_context[2 * Npk ..].* = skS.public_key;
         return .{
-            .shared_secret = extractAndExpand(kem_id, Nsecret, &dh, &kem_context),
+            .shared_secret = extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context),
             .enc = eph.public_key,
         };
     }
@@ -397,7 +420,152 @@ pub const P256Kem = struct {
         kem_context[0..Npk].* = enc;
         kem_context[Npk .. 2 * Npk].* = skR.public_key;
         kem_context[2 * Npk ..].* = pkS;
-        return extractAndExpand(kem_id, Nsecret, &dh, &kem_context);
+        return extractAndExpand(HkdfSha256, kem_id, Nsecret, &dh, &kem_context);
+    }
+};
+
+// ── DHKEM(P-384, HKDF-SHA384) — RFC 9180 §7.1, kem_id 0x0011 ────────────
+
+/// `dhkem_p384_hkdf_sha384` (RFC 9180 §7.1 Table 2): Nsecret = 48
+/// (HKDF-SHA384's `Nh`), Nsk = 48 (a P-384 scalar), Npk = 97 (SEC1
+/// UNCOMPRESSED point encoding — `0x04 || X(48) || Y(48)`, same convention
+/// as `P256Kem`). Structurally this is `P256Kem` with the curve group and
+/// internal KDF both swapped: `std.crypto.ecc.P384` in place of
+/// `p256`'s `P256` (`fromSec1`/`toUncompressedSec1`/`mul`/
+/// `affineCoordinates`/`scalar.random`/`scalar.rejectNonCanonical` — the
+/// identical API shape, see this file's module doc comment for why P-384
+/// stays on std rather than getting its own asm-accelerated sibling
+/// module), and `HkdfSha384` in place of `HkdfSha256` for
+/// `extractAndExpand`/`deriveKeyPair`'s internal KDF (RFC 9180 §7.1 Table 2
+/// fixes DHKEM(P-384, …)'s own KDF to HKDF-SHA384 — NOT the HKDF-SHA256
+/// every other KEM this module instantiates uses internally; this is
+/// exactly the "DHKEM's own KDF is a separate choice from the outer
+/// ciphersuite's kdf_id" distinction `schedule.zig`'s module doc comment
+/// describes, now demonstrated by a KEM whose OWN choice differs from
+/// HKDF-SHA256 for the first time, not just the outer key schedule's).
+///
+/// **No RFC 9180 Appendix A byte-exact anchor exists for this KEM** — see
+/// this struct's tests and SPEC.md's done-record for what anchors it
+/// instead (type widths against §7.1 Table 2's own definitional text,
+/// self-consistency round trips, and low-order/malformed-SEC1 rejection —
+/// the same class of test `P256Kem`'s own non-KAT-covered surfaces, e.g.
+/// its `basePoint.mul + toUncompressedSec1` smoke test, already rely on).
+pub const P384Kem = struct {
+    pub const kem_id: u16 = @intFromEnum(suite.KemId.dhkem_p384_hkdf_sha384);
+    pub const Nsecret: usize = 48;
+    pub const Npk: usize = 97; // SEC1 uncompressed: 0x04 || X(48) || Y(48)
+    pub const Nsk: usize = 48;
+
+    pub const PublicKey = [Npk]u8;
+    pub const EncappedKey = [Npk]u8;
+
+    pub const KeyPair = struct {
+        secret_key: [Nsk]u8,
+        public_key: PublicKey,
+    };
+
+    pub const Encapped = struct {
+        shared_secret: [Nsecret]u8,
+        enc: EncappedKey,
+    };
+
+    /// Same composition as `P256Kem.generateKeyPair`: `sk = random scalar
+    /// in [1, n-1]` via `P384.scalar.random(io, .big)`, `pk = (P384.
+    /// basePoint.mul(sk, .big)).toUncompressedSec1()`.
+    pub fn generateKeyPair(io: std.Io) KeyPair {
+        const sk = P384.scalar.random(io, .big);
+        const pk_point = P384.basePoint.mul(sk, .big) catch unreachable; // basePoint * nonzero scalar never hits the identity
+        return .{ .secret_key = sk, .public_key = pk_point.toUncompressedSec1() };
+    }
+
+    /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for P-384 — the same
+    /// rejection-sampling loop as `P256Kem.deriveKeyPair`, over
+    /// `HkdfSha384` (this KEM's own internal KDF, not `HkdfSha256`) and
+    /// `Nsk=48`. `bitmask = 0xFF` (RFC 9180 §7.1.3: 0xFF for every curve
+    /// except P-521, which needs 0x01 to narrow a 528-bit encoding down to
+    /// P-521's 521-bit order — P-384's Nsk=48 bytes = 384 bits already
+    /// matches its order's bit length, same reasoning as P-256).
+    pub fn deriveKeyPair(ikm: []const u8) KeyPair {
+        const kem_suite_id = comptime suite.kemSuiteId(kem_id);
+        const dkp_prk = suite.labeledExtract(HkdfSha384, &kem_suite_id, "", "dkp_prk", ikm);
+        var counter: u16 = 0;
+        while (counter <= 255) : (counter += 1) {
+            const ctr = suite.i2osp(1, counter);
+            var candidate: [Nsk]u8 = undefined;
+            suite.labeledExpand(HkdfSha384, &kem_suite_id, dkp_prk, "candidate", &ctr, &candidate) catch unreachable;
+            candidate[0] &= 0xff; // RFC 9180 §7.1.3 bitmask (0xFF for P-384)
+            P384.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
+            if (std.mem.allEqual(u8, &candidate, 0)) continue; // sk == 0
+            // basePoint * nonzero canonical scalar never hits the identity.
+            const pk_point = P384.basePoint.mul(candidate, .big) catch unreachable;
+            return .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
+        }
+        @panic("hpke: P-384 DeriveKeyPair exhausted 256 candidates (probability ~2^-8192; RFC 9180 7.1.3 DeriveKeyPairError)");
+    }
+
+    /// RFC 9180 §4.1/§7.1.2 `Encap(pkR)` for P-384 — same shape as
+    /// `P256Kem.encapDeterministic`: x-coordinate-only ECDH, `Nsecret=48`
+    /// via `HkdfSha384`.
+    pub fn encapDeterministic(pkR: PublicKey, eph: KeyPair) EncapError!Encapped {
+        const pkR_point = P384.fromSec1(&pkR) catch return error.DeserializeError;
+        const shared_point = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
+        const dh = shared_point.affineCoordinates().x.toBytes(.big);
+        var kem_context: [2 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = eph.public_key;
+        kem_context[Npk..].* = pkR;
+        return .{
+            .shared_secret = extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context),
+            .enc = eph.public_key,
+        };
+    }
+
+    pub fn encap(pkR: PublicKey, io: std.Io) EncapError!Encapped {
+        return encapDeterministic(pkR, generateKeyPair(io));
+    }
+
+    /// Mirror of `encapDeterministic`.
+    pub fn decap(enc: EncappedKey, skR: KeyPair) DecapError![Nsecret]u8 {
+        const enc_point = P384.fromSec1(&enc) catch return error.DeserializeError;
+        const shared_point = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
+        const dh = shared_point.affineCoordinates().x.toBytes(.big);
+        var kem_context: [2 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = enc;
+        kem_context[Npk..].* = skR.public_key;
+        return extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context);
+    }
+
+    /// RFC 9180 §4.1 `AuthEncap(pkR, skS)` for P-384 — same `dh || dh2`
+    /// fold as `P256Kem.authEncapDeterministic`.
+    pub fn authEncapDeterministic(pkR: PublicKey, skS: KeyPair, eph: KeyPair) EncapError!Encapped {
+        const pkR_point = P384.fromSec1(&pkR) catch return error.DeserializeError;
+        var dh: [2 * Nsk]u8 = undefined;
+        const p1 = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
+        dh[0..Nsk].* = p1.affineCoordinates().x.toBytes(.big);
+        const p2 = pkR_point.mul(skS.secret_key, .big) catch return error.DhFailed;
+        dh[Nsk..].* = p2.affineCoordinates().x.toBytes(.big);
+        var kem_context: [3 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = eph.public_key;
+        kem_context[Npk .. 2 * Npk].* = pkR;
+        kem_context[2 * Npk ..].* = skS.public_key;
+        return .{
+            .shared_secret = extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context),
+            .enc = eph.public_key,
+        };
+    }
+
+    pub fn authDecap(enc: EncappedKey, skR: KeyPair, pkS: PublicKey) DecapError![Nsecret]u8 {
+        const enc_point = P384.fromSec1(&enc) catch return error.DeserializeError;
+        const pkS_point = P384.fromSec1(&pkS) catch return error.DeserializeError;
+        var dh: [2 * Nsk]u8 = undefined;
+        const p1 = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
+        dh[0..Nsk].* = p1.affineCoordinates().x.toBytes(.big);
+        const p2 = pkS_point.mul(skR.secret_key, .big) catch return error.DhFailed;
+        dh[Nsk..].* = p2.affineCoordinates().x.toBytes(.big);
+        var kem_context: [3 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = enc;
+        kem_context[Npk .. 2 * Npk].* = skR.public_key;
+        kem_context[2 * Npk ..].* = pkS;
+        return extractAndExpand(HkdfSha384, kem_id, Nsecret, &dh, &kem_context);
     }
 };
 
@@ -539,6 +707,76 @@ test "DHKEM P-256 AuthEncap/AuthDecap: self-consistency round trip" {
     try testing.expect(!std.mem.eql(u8, &got.shared_secret, &dec_wrong));
 }
 
+// ── DHKEM P-384 — no RFC 9180 Appendix A vector exists for this KEM (see
+// `P384Kem`'s doc comment); the tests below are the same class of anchor
+// `P256Kem`'s own non-KAT surfaces already rely on: type widths against
+// §7.1 Table 2's definitional text, a pure-math basePoint smoke test,
+// self-consistency round trips (Encap/Decap, AuthEncap/AuthDecap,
+// DeriveKeyPair determinism), and low-order/malformed-SEC1 rejection.
+
+test "P384Kem: type widths match RFC 9180 Table 2 (SEC1 uncompressed Npk=97)" {
+    try testing.expectEqual(@as(usize, 48), P384Kem.Nsecret);
+    try testing.expectEqual(@as(usize, 97), P384Kem.Npk);
+    try testing.expectEqual(@as(usize, 48), P384Kem.Nsk);
+    try testing.expectEqual(@as(u16, 0x0011), P384Kem.kem_id);
+}
+
+test "P384Kem: basePoint.mul + toUncompressedSec1 wiring produces a well-formed SEC1 point" {
+    // Mirrors P256Kem's analogous smoke test: scalar = 1 -> pk == the
+    // curve's own basePoint, uncompressed-encoded.
+    const one = [_]u8{0} ** 47 ++ [_]u8{1};
+    const pk_point = P384.basePoint.mul(one, .big) catch unreachable;
+    const pk = pk_point.toUncompressedSec1();
+    try testing.expectEqual(@as(u8, 0x04), pk[0]); // SEC1 uncompressed tag
+    try testing.expectEqual(@as(usize, 97), pk.len);
+    try testing.expect(pk_point.equivalent(P384.basePoint));
+}
+
+test "DHKEM P-384 Encap/Decap: self-consistency round trip" {
+    const skR = P384Kem.deriveKeyPair("hpke p384 test receiver");
+    const eph = P384Kem.deriveKeyPair("hpke p384 test ephemeral");
+    const got = try P384Kem.encapDeterministic(skR.public_key, eph);
+    try testing.expectEqualSlices(u8, &eph.public_key, &got.enc);
+    const dec = try P384Kem.decap(got.enc, skR);
+    try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
+}
+
+test "DHKEM P-384 Encap/Decap: malformed SEC1 pkR fails closed with error.DeserializeError" {
+    const skR = P384Kem.deriveKeyPair("hpke p384 test receiver 3");
+    const eph = P384Kem.deriveKeyPair("hpke p384 test ephemeral 3");
+    var bad: P384Kem.PublicKey = undefined;
+    bad[0] = 0x05; // not a valid SEC1 tag
+    try testing.expectError(error.DeserializeError, P384Kem.encapDeterministic(bad, eph));
+    try testing.expectError(error.DeserializeError, P384Kem.decap(bad, skR));
+}
+
+test "DHKEM P-384 deriveKeyPair: deterministic, on-curve, distinct per ikm" {
+    const kp1 = P384Kem.deriveKeyPair("hpke p384 derive test ikm 1");
+    const kp1_again = P384Kem.deriveKeyPair("hpke p384 derive test ikm 1");
+    try testing.expectEqualSlices(u8, &kp1.secret_key, &kp1_again.secret_key);
+    try testing.expectEqualSlices(u8, &kp1.public_key, &kp1_again.public_key);
+    const kp2 = P384Kem.deriveKeyPair("hpke p384 derive test ikm 2");
+    try testing.expect(!std.mem.eql(u8, &kp1.secret_key, &kp2.secret_key));
+    try testing.expectEqual(@as(u8, 0x04), kp1.public_key[0]);
+    // public_key is actually sk*G: Encap/Decap round trip through it works.
+    const eph = P384Kem.deriveKeyPair("hpke p384 derive test ephemeral");
+    const got = try P384Kem.encapDeterministic(kp1.public_key, eph);
+    const dec = try P384Kem.decap(got.enc, kp1);
+    try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
+}
+
+test "DHKEM P-384 AuthEncap/AuthDecap: self-consistency round trip + wrong-pkS divergence" {
+    const skR = P384Kem.deriveKeyPair("hpke p384 auth test receiver");
+    const skS = P384Kem.deriveKeyPair("hpke p384 auth test sender");
+    const eph = P384Kem.deriveKeyPair("hpke p384 auth test ephemeral");
+    const got = try P384Kem.authEncapDeterministic(skR.public_key, skS, eph);
+    const dec = try P384Kem.authDecap(got.enc, skR, skS.public_key);
+    try testing.expectEqualSlices(u8, &got.shared_secret, &dec);
+    const wrong = P384Kem.deriveKeyPair("hpke p384 auth test WRONG sender");
+    const dec_wrong = try P384Kem.authDecap(got.enc, skR, wrong.public_key);
+    try testing.expect(!std.mem.eql(u8, &got.shared_secret, &dec_wrong));
+}
+
 // ── fuzz: P256Kem.decap/authDecap never panic on arbitrary enc/pkS bytes ──
 //
 // `enc` (the sender's ephemeral public key) and, for auth mode, `pkS` are
@@ -556,7 +794,10 @@ test "fuzz: P256Kem.decap never panics on arbitrary enc bytes" {
     try testing.fuzz({}, fuzzP256Decap, .{});
 }
 
-fn fuzzedSec1Bytes(smith: *std.testing.Smith, buf: *[P256Kem.Npk]u8) void {
+// Generic over the SEC1-encoded width (comptime N) so P384Kem's fuzz
+// harness below can reuse it verbatim at Npk=97 rather than duplicating
+// the byte-biasing recipe.
+fn fuzzedSec1Bytes(comptime N: usize, smith: *std.testing.Smith, buf: *[N]u8) void {
     smith.bytes(buf);
     buf[0] = switch (smith.valueRangeAtMost(u8, 0, 4)) {
         0 => 0,
@@ -570,7 +811,7 @@ fn fuzzedSec1Bytes(smith: *std.testing.Smith, buf: *[P256Kem.Npk]u8) void {
 fn fuzzP256Decap(_: void, smith: *std.testing.Smith) !void {
     const skR = P256Kem.deriveKeyPair("hpke fuzz decap receiver");
     var enc: P256Kem.EncappedKey = undefined;
-    fuzzedSec1Bytes(smith, &enc);
+    fuzzedSec1Bytes(P256Kem.Npk, smith, &enc);
     _ = P256Kem.decap(enc, skR) catch {};
 }
 
@@ -581,8 +822,59 @@ test "fuzz: P256Kem.authDecap never panics on arbitrary enc/pkS bytes" {
 fn fuzzP256AuthDecap(_: void, smith: *std.testing.Smith) !void {
     const skR = P256Kem.deriveKeyPair("hpke fuzz auth-decap receiver");
     var enc: P256Kem.EncappedKey = undefined;
-    fuzzedSec1Bytes(smith, &enc);
+    fuzzedSec1Bytes(P256Kem.Npk, smith, &enc);
     var pkS: P256Kem.PublicKey = undefined;
-    fuzzedSec1Bytes(smith, &pkS);
+    fuzzedSec1Bytes(P256Kem.Npk, smith, &pkS);
     _ = P256Kem.authDecap(enc, skR, pkS) catch {};
+}
+
+// ── fuzz: P384Kem.decap/authDecap never panic on arbitrary enc/pkS bytes ──
+// Same rationale as the P256Kem fuzz harness above — `enc`/`pkS` are
+// attacker-controlled wire bytes decap must never panic on, and P384Kem's
+// `fromSec1` is the analogous rejecting-decode step X25519Kem lacks.
+
+test "fuzz: P384Kem.decap never panics on arbitrary enc bytes" {
+    try testing.fuzz({}, fuzzP384Decap, .{});
+}
+
+fn fuzzP384Decap(_: void, smith: *std.testing.Smith) !void {
+    const skR = P384Kem.deriveKeyPair("hpke fuzz p384 decap receiver");
+    var enc: P384Kem.EncappedKey = undefined;
+    fuzzedSec1Bytes(P384Kem.Npk, smith, &enc);
+    _ = P384Kem.decap(enc, skR) catch {};
+}
+
+test "fuzz: P384Kem.authDecap never panics on arbitrary enc/pkS bytes" {
+    try testing.fuzz({}, fuzzP384AuthDecap, .{});
+}
+
+fn fuzzP384AuthDecap(_: void, smith: *std.testing.Smith) !void {
+    const skR = P384Kem.deriveKeyPair("hpke fuzz p384 auth-decap receiver");
+    var enc: P384Kem.EncappedKey = undefined;
+    fuzzedSec1Bytes(P384Kem.Npk, smith, &enc);
+    var pkS: P384Kem.PublicKey = undefined;
+    fuzzedSec1Bytes(P384Kem.Npk, smith, &pkS);
+    _ = P384Kem.authDecap(enc, skR, pkS) catch {};
+}
+
+// `P384Kem` has no RFC 9180 Appendix A vector (see SPEC.md item 16), so every
+// other test it has is self-consistent: encap and decap run the same code, and
+// a mutation applied to BOTH of them stays invisible. That is not theoretical
+// — swapping `HkdfSha384` for `HkdfSha512` here leaves the entire suite green
+// while making the module wire-incompatible with every other HPKE
+// implementation on earth.
+//
+// This test is the narrowest thing that is NOT self-referential: RFC 9180
+// §7.1 Table 2 fixes DHKEM(P-384, HKDF-SHA384)'s internal KDF, and HKDF's PRK
+// length is its hash's output length — 48 bytes for SHA-384, 64 for SHA-512,
+// 32 for SHA-256. The number comes from the spec, not from us, so a
+// consistently-wrong hash cannot satisfy it. It does not prove the KEM is
+// byte-correct; it proves the one parameter a self-consistency test structurally
+// cannot see.
+test "P384Kem's internal KDF is HKDF-SHA384, pinned by the spec's own output length" {
+    try std.testing.expectEqual(@as(usize, 48), HkdfSha384.prk_length);
+    try std.testing.expectEqual(@as(usize, 48), P384Kem.Nsecret);
+    // The sibling KEMs' internal KDF is HKDF-SHA256 (same table), so the same
+    // check pins them against a P-384-shaped copy-paste in either direction.
+    try std.testing.expectEqual(@as(usize, 32), HkdfSha256.prk_length);
 }

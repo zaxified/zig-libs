@@ -30,9 +30,9 @@
 //!
 //! **This is the OUTER (key-schedule) KDF only — a SEPARATE choice from a
 //! DHKEM's own internal KDF** (RFC 9180 §4.1's `ExtractAndExpand`,
-//! `dhkem.zig`), which stays fixed per `kem_id` (both KEMs this module
-//! instantiates, X25519 and P-256, are registered with HKDF-SHA256 as their
-//! internal KDF, RFC 9180 §7.1 Table 2) regardless of what `Nh` (outer
+//! `dhkem.zig`), which stays fixed per `kem_id` (X25519 and P-256 are
+//! registered with HKDF-SHA256 as their internal KDF, P-384 with
+//! HKDF-SHA384 — RFC 9180 §7.1 Table 2) regardless of what `Nh` (outer
 //! `kdf_id`) a caller picks for the key schedule — e.g. `DHKEM(P-256,
 //! HKDF-SHA256)` paired with an outer HKDF-SHA512 key schedule is a real,
 //! RFC-registered combination (Appendix A.4) whose `shared_secret` stays 32
@@ -291,10 +291,10 @@ pub fn keySchedule(
 ) (KeyScheduleError || suite.LabeledExpandError)!Context(Aead, Nh) {
     // The key-schedule KDF, dispatched from Nh (see KdfOf's doc comment) —
     // NOT the DHKEM's own internal KDF (dhkem.zig's ExtractAndExpand, fixed
-    // per kem_id, always HKDF-SHA256 for both KEMs this module
-    // instantiates), which is why `shared_secret` above stays a plain
-    // `[]const u8` here rather than `[Nh]u8` — its width is the KEM's
-    // Nsecret, independent of this function's Nh.
+    // per kem_id — HKDF-SHA256 for X25519/P-256, HKDF-SHA384 for P-384),
+    // which is why `shared_secret` above stays a plain `[]const u8` here
+    // rather than `[Nh]u8` — its width is the KEM's Nsecret, independent of
+    // this function's Nh.
     const Kdf = KdfOf(Nh);
     comptime std.debug.assert(Nh == Kdf.prk_length); // KdfOf(Nh) must be the Nh-width KDF, not a mismatched one
 

@@ -24,15 +24,28 @@ hard-wired) — `schedule.KdfOf(Nh)` picks the `Hkdf(Hmac)` instantiation for
 `Nh` = 32/48/64, so passing `Nh=64` to any existing `Context`/`keySchedule`/
 `setup*`/`seal*`/`open*` call runs HKDF-SHA512 instead, no signature
 change. This is a SEPARATE choice from a DHKEM's own internal KDF (fixed
-per `kem_id`, RFC 9180 §7.1 Table 2 — both KEMs this module instantiates
-stay HKDF-SHA256 internally regardless of the outer `Nh`). KAT: RFC 9180
+per `kem_id`, RFC 9180 §7.1 Table 2 — X25519/P-256 stay HKDF-SHA256
+internally, P-384 HKDF-SHA384, regardless of the outer `Nh`). KAT: RFC 9180
 Appendix A.4 (`DHKEM(P-256, HKDF-SHA256), HKDF-SHA512, AES-128-GCM`), see
 SPEC.md's done-record.
+
+**Three DHKEMs: X25519, P-256 and (since 2026-08-06) P-384**
+(`dhkem_p384_hkdf_sha384`, kem_id 0x0011) — structurally identical to
+`P256Kem`, built directly on `std.crypto.ecc.P384` (no local
+perf-specialized sibling the way `p256` is for P-256). **RFC 9180 Appendix
+A has no worked test-vector section for DHKEM(P-384, HKDF-SHA384) at
+all** — checked against this module's own record of the appendix's
+contents and an offline Go-stdlib vector fixture, neither of which
+contains a P-384 entry — so `P384Kem` is anchored by RFC 9180 §7.1 Table
+2's definitional type widths, self-consistency round trips (Encap/Decap,
+AuthEncap/AuthDecap, DeriveKeyPair) and malformed-SEC1/fuzz rejection
+instead of a byte-exact KAT. See SPEC.md's done-record for the full
+search trail and reasoning.
 
 | File | Provides |
 |---|---|
 | `suite.zig` | `KemId`/`KdfId`/`AeadId`/`Mode`, `i2osp`/`os2ip`, `suiteId`/`kemSuiteId`, `labeledExtract`/`labeledExpand` (§4) |
-| `dhkem.zig` | `X25519Kem`/`P256Kem`: `encap`/`encapDeterministic`/`decap`/`authEncapDeterministic`/`authDecap`/`deriveKeyPair`/`generateKeyPair` (§4.1/§7.1.1–§7.1.3) |
+| `dhkem.zig` | `X25519Kem`/`P256Kem`/`P384Kem`: `encap`/`encapDeterministic`/`decap`/`authEncapDeterministic`/`authDecap`/`deriveKeyPair`/`generateKeyPair` (§4.1/§7.1.1–§7.1.3) |
 | `schedule.zig` | `keySchedule` (§5.1), `Context(Aead, Nh).seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, `KdfOf(Nh)`/`kdfIdOf(Nh)` (the HKDF-SHA256/384/512 dispatch), §5.1's `setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` (+ `*Deterministic` KAT seams) with their `setup*R` mirrors — return the `Context` itself, for multi-message/export-only use — and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` with their `open*` mirrors, now thin compositions over `setup*` |
 | `kat_rfc9180.zig` | RFC 9180 Appendix A vectors: A.1 in all four modes (full), A.2/A.3/A.4 headers, A.3's three non-base modes — driven end-to-end through the real implementation |
 
@@ -43,7 +56,8 @@ SPEC.md's done-record.
   touches only its parameters.
 - **Deps:** `p256` (DHKEM(P-256)'s group — byte-exact to
   `std.crypto.ecc.P256`; the X25519 KEM path stays on `std`). Also `std`
-  directly: `std.crypto.dh.X25519`, `std.crypto.kdf.hkdf.HkdfSha256`/
+  directly: `std.crypto.dh.X25519`, `std.crypto.ecc.P384` (`P384Kem`'s
+  group), `std.crypto.kdf.hkdf.HkdfSha256`/
   `.HkdfSha512`/`.Hkdf` (HKDF-SHA384's `Hkdf(std.crypto.auth.hmac.sha2.
   HmacSha384)`, no named alias in `std`), `std.crypto.aead.aes_gcm`,
   `std.crypto.aead.chacha_poly`.
@@ -69,7 +83,8 @@ var shared_secret: [32]u8 = undefined;
 try hpke.suite.labeledExpand(HkdfSha256, &kem_suite_id, prk, "shared_secret", kem_context, &shared_secret);
 ```
 
-**KEM** (`dhkem.zig`, re-exported as `hpke.X25519Kem`/`hpke.P256Kem`):
+**KEM** (`dhkem.zig`, re-exported as `hpke.X25519Kem`/`hpke.P256Kem`/
+`hpke.P384Kem`):
 
 ```zig
 const kp = hpke.X25519Kem.generateKeyPair(io); // fresh random keypair
@@ -77,6 +92,12 @@ const kp2 = hpke.X25519Kem.deriveKeyPair(ikm); // RFC 9180 §7.1.3, ikm-seeded
 const encapped = try hpke.X25519Kem.encap(kp.public_key, io); // {shared_secret, enc}
 const ss = try hpke.X25519Kem.decap(encapped.enc, kp); // == encapped.shared_secret
 ```
+
+`hpke.P384Kem` is the same shape (`kp = hpke.P384Kem.generateKeyPair(io)`,
+`Npk`=97/`Nsk`=48/`Nsecret`=48 instead of P-256's 65/32/32) — pass it to
+`sealBase`/`setupBaseS`/etc. in place of `X25519Kem`/`P256Kem` below; the
+outer `Nh` (key-schedule KDF width) is unrelated and picked the same way
+regardless of KEM.
 
 The single-shot flow (§6.1):
 
