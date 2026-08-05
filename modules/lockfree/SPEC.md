@@ -172,16 +172,46 @@ limbo (crossbeam-style) so `unregister` returns immediately — is the documente
 next increment (§6); the self-draining version is accepted for the fixed, trusted
 DL4 roster where a brief bounded wait at teardown is a non-issue.
 
-**`dequeue`'s OOM `@panic` (API corner).** `dequeue` returns `?u64`, so it cannot
-surface the `Allocator.Error` that `retire` may raise when a limbo bag has to
-grow. Steady state never allocates — drained bags keep their capacity, so retire
-reuses it — but a *true* OOM at that point leaves only two options, both wrong
-(lose the node, or free it under live readers), so `dequeue` refuses both and
-`@panic`s. Accepted as documented rather than forced into a signature change:
-threading `error{OutOfMemory}` through `?u64` (→ `!?u64`) would push the corner
-onto every caller for a path that cannot occur in the bounded-pool consumer this
-module targets. A future consumer that must survive allocator failure at dequeue
-time would take the `!?u64` signature as a small, mechanical follow-up.
+**Allocation on the retire path — the bounded reserve (was: `dequeue`'s OOM
+`@panic`).** `retire` is called pinned and *after* the unlink, so by then the node
+is out of the structure and its payload is already in the caller's hands: there is
+nothing to roll back, and `dequeue`'s `?u64` cannot surface an error anyway. The
+first version therefore `@panic`ed on `error.OutOfMemory` from the limbo-bag
+append, on the argument that both alternatives (lose the node, or free it under
+live readers) were wrong. That argument was half right — freeing under readers is
+a use-after-free and is never acceptable — but aborting the process is not the
+lesser evil it looks like: it loses *all* the memory rather than one node, and it
+turns a recoverable allocator failure into a crash for every consumer of the
+module. `retire` is now **infallible**, via two mechanisms, neither of which
+touches an ordering or the reclaim predicate:
+
+1. **A bounded reserve.** `Config.bag_reserve` (default 16) limbo entries per bag
+   per participant are pre-allocated in `Domain.init` — where a failure is just an
+   `error.OutOfMemory` out of a constructor. Bags keep capacity across drains
+   (`clearRetainingCapacity`), so once warm, retire never calls the allocator at
+   all; the reserve exists to cover the cold start and to bound the window in
+   which the remaining path can be reached.
+2. **Abandon, never free.** If the reserve is exceeded *and* the grow fails, the
+   node is dropped on the floor: not staged, not reclaimed. An abandoned node is
+   never returned to the `NodePool`, hence never re-acquired, hence can never
+   alias a live node — the same conservative direction the whole module takes, and
+   the only one of the three responses that is safe in the reclamation sense. Nor
+   is it a heap leak: the node is a pool slot, destroyed by `NodePool.deinit` at
+   teardown regardless, so the loss is bounded pool capacity. It is counted
+   (`Domain.droppedRetires`, quiescent-read) so a consumer that cares can assert
+   zero.
+
+`dequeue` keeps its `?u64` signature and contains no failure handling at all. Note
+what did **not** change: the retire tag is still the fresh `.seq_cst`
+`global_epoch` read, the drain predicate is still `observed − tag ≥ 2`, and the
+abandon path leaves `bag_epoch` untouched (the bag is unchanged, and an empty
+bag's tag is meaningless). The §7/§7.1 certifications cover the atomics and are
+unaffected — the reserve and the abandon path are plain single-owner memory on a
+path where the allocator has already failed. Tested with
+`std.testing.FailingAllocator` (alloc *and* remap refused): the reserve carries
+`bag_reserve` retires with zero allocations, and past it a `dequeue` still returns
+its value, drops nothing else, frees nothing early (`verifyQuiescent` clean), and
+does not panic.
 
 ## 5. Verification strategy — the teeth
 

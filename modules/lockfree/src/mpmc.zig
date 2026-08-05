@@ -221,7 +221,14 @@ pub const MpmcQueue = struct {
     ///  • `retire(h)` runs program-order AFTER the successful unlink CAS and
     ///    inside the same pin — the two preconditions of `Domain.retire`'s
     ///    tag argument. Never freed inline: another consumer that read the
-    ///    same `h` may be dereferencing `h.next` right now.
+    ///    same `h` may be dereferencing `h.next` right now. `retire` is
+    ///    infallible, which is what lets `dequeue` keep its `?u64` signature:
+    ///    limbo space is pre-allocated at `Domain.init`
+    ///    (`Config.bag_reserve`) and, if that reserve is exhausted under a
+    ///    failing allocator, `retire` abandons the node rather than freeing
+    ///    it under readers or aborting — see `ebr.Domain.retire`. Either way
+    ///    `h` is never handed back to the pool early, so nothing here (and
+    ///    nothing in the theorem) changes.
     ///  • `tryAdvance` runs on every call, but strictly AFTER the unpin
     ///    (defers run LIFO: release first, then tryAdvance). This placement
     ///    is load-bearing for liveness: the scan takes ~max_participants
@@ -266,14 +273,7 @@ pub const MpmcQueue = struct {
                     .ptr = h,
                     .ctx = self.node_pool,
                     .reclaim = reclaimNode,
-                }) catch {
-                    // `dequeue`'s `?u64` signature cannot surface allocator
-                    // failure (scaffold limitation, reported). Steady state
-                    // never allocates (drained bags keep capacity); an OOM
-                    // here would mean losing the node or freeing it under
-                    // readers — refuse both, loudly.
-                    @panic("lockfree: allocator failure while retiring a node; dequeue cannot surface errors");
-                };
+                });
                 guard.release();
                 return value;
             }

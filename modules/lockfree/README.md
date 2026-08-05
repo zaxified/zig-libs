@@ -42,7 +42,11 @@ const v = q.dequeue(me);         // ?u64 (null when empty)
   participants (each with a pinned local epoch and three epoch-indexed limbo
   bags). `register`/`unregister` are mechanical slot bookkeeping;
   `enterCritical`/`exitCritical`/`retire`/`tryAdvance` are the Fable core (the
-  safe-reclaim predicate).
+  safe-reclaim predicate). `retire` is **infallible**: `Config.bag_reserve` limbo
+  entries per bag are pre-allocated at `init` (the one place an allocator failure
+  is surfaceable), and if that reserve is exhausted under a failing allocator the
+  node is *abandoned* — never freed under live readers, never a panic — and
+  counted in `Domain.droppedRetires`. See `SPEC.md` §4.
 - `MpmcQueue` / `Node` — the **Michael-Scott** unbounded MPMC queue over EBR.
   `init`/`deinit`/`reclaimNode` are mechanical; `enqueue`/`dequeue` (the CAS
   loops) are the Fable core. Because EBR keeps a retired node physically alive

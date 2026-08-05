@@ -51,6 +51,18 @@ pub const Config = struct {
     /// knows its width at construction, so a fixed registry (no growth, no
     /// lock) is the right storage. Mechanical.
     max_participants: usize = 128,
+    /// Limbo entries pre-allocated per bag, per participant, at `init` — the
+    /// "bounded reserve" that makes `retire` allocation-free. `retire` runs
+    /// pinned and *after* the unlink, so it is the one place in this module
+    /// where an allocator failure cannot be handed back to the caller (see
+    /// `retire`); the reserve moves that allocation to `init`, where the
+    /// failure IS surfaceable. Bags keep their capacity across drains
+    /// (`clearRetainingCapacity`), so the reserve is permanent and steady
+    /// state never touches the allocator at all. Beyond the reserve `retire`
+    /// still tries to grow the bag, and degrades safely (never fatally) if it
+    /// cannot. Costs `max_participants * num_epochs * bag_reserve *
+    /// @sizeOf(Retired)` bytes at `init`; set to 0 to opt out.
+    bag_reserve: usize = 16,
 };
 
 /// Number of epoch-indexed limbo bags. Three is the minimum that lets the
@@ -90,6 +102,13 @@ pub const Participant = struct {
     /// becomes ambiguous once the epoch wraps the 3-bag ring (bag `E % 3` may
     /// hold garbage tagged `E` or `E-3`; only the tag disambiguates).
     bag_epoch: [num_epochs]u64,
+    /// How many retired nodes this participant had to abandon because its
+    /// limbo bag could not grow (reserve exhausted *and* the allocator
+    /// failed). Single-owner plain counter, like the bags themselves — read it
+    /// through `Domain.droppedRetires` when the domain is quiescent. Nonzero
+    /// means pool slots were permanently withheld from reuse (never freed, so
+    /// never a use-after-free); see `retire`.
+    dropped_retires: usize,
 
     /// Sentinel `local_epoch` value meaning "not inside a critical section".
     pub const unpinned: u64 = std.math.maxInt(u64);
@@ -99,6 +118,7 @@ pub const Participant = struct {
         self.in_use = .init(false);
         for (&self.bags) |*b| b.* = .empty;
         self.bag_epoch = @splat(0);
+        self.dropped_retires = 0;
     }
 
     fn deinitBags(self: *Participant, allocator: std.mem.Allocator) void {
@@ -136,7 +156,18 @@ pub const Domain = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) std.mem.Allocator.Error!Domain {
         const parts = try allocator.alloc(Participant, cfg.max_participants);
+        errdefer allocator.free(parts);
         for (parts) |*p| p.initInPlace();
+        // Pre-allocate the limbo reserve HERE, where a failure is just an
+        // `error.OutOfMemory` out of `init`, so that `retire` — which runs
+        // pinned, after the unlink, with no way to hand an error back — has
+        // somewhere to stage a node without calling the allocator. Bags are
+        // `.empty` at this point, so deinitting a partially-reserved set is
+        // safe. See `Config.bag_reserve` and `retire`.
+        errdefer for (parts) |*p| p.deinitBags(allocator);
+        for (parts) |*p| {
+            for (&p.bags) |*b| try b.ensureTotalCapacity(allocator, cfg.bag_reserve);
+        }
         return .{
             .global_epoch = .init(0),
             .participants = parts,
@@ -294,7 +325,35 @@ pub const Domain = struct {
     /// free one epoch too early relative to a reference-holder pinned at the
     /// current epoch — a use-after-free. Reading fresh can only yield a tag ≥
     /// the pin, i.e. only defer reclamation. Conservative direction = safe.
-    pub fn retire(self: *Domain, p: *Participant, r: Retired) std.mem.Allocator.Error!void {
+    ///
+    /// **Infallible, by construction and by necessity.** `retire`'s contract
+    /// puts it after the unlink and inside the pin: by then the node is gone
+    /// from the structure and its payload has been handed to the caller, so
+    /// there is nothing left to roll back and no error the caller could act
+    /// on — which is why the sole caller (`mpmc.dequeue`, a `?u64`) used to
+    /// `@panic` on `error.OutOfMemory`. Two mechanisms remove that panic
+    /// without touching a single ordering on the success path:
+    ///  1. `Config.bag_reserve` limbo entries per bag are pre-allocated at
+    ///     `init`, so staging a node needs no allocator at all until one
+    ///     epoch's garbage from one thread exceeds the reserve; and bags keep
+    ///     capacity across drains, so steady state stays allocation-free.
+    ///  2. If the reserve *is* exceeded and the grow also fails, the node is
+    ///     **abandoned**: not staged, and — critically — not freed. Of the
+    ///     three possible responses, freeing it inline is a use-after-free
+    ///     (readers may still hold it) and aborting the process loses all
+    ///     memory rather than one node; abandoning is the only one that is
+    ///     safe in the reclamation sense. An abandoned node is never returned
+    ///     to the pool, hence never re-acquired, hence can never alias a live
+    ///     node — the same "conservative direction" the rest of this file
+    ///     takes. It is not a heap leak either: the node is a `NodePool`
+    ///     slot, which `NodePool.deinit` destroys at teardown regardless; the
+    ///     loss is bounded pool capacity, counted in `dropped_retires` and
+    ///     readable via `droppedRetires` so a caller can assert on it.
+    ///
+    /// The epoch tag is left untouched on the abandon path: the bag is
+    /// unchanged, and an empty bag's tag is meaningless (`reclaimExpired`
+    /// only looks at non-empty bags).
+    pub fn retire(self: *Domain, p: *Participant, r: Retired) void {
         std.debug.assert(p.local_epoch.load(.monotonic) != Participant.unpinned);
         const e = self.global_epoch.load(.seq_cst);
         const idx: usize = @intCast(e % num_epochs);
@@ -306,8 +365,23 @@ pub const Domain = struct {
             std.debug.assert(e - p.bag_epoch[idx] >= num_epochs);
             drainBag(p, idx);
         }
-        try p.bags[idx].append(self.allocator, r);
+        p.bags[idx].append(self.allocator, r) catch {
+            p.dropped_retires += 1;
+            return;
+        };
         p.bag_epoch[idx] = e;
+    }
+
+    /// Total nodes abandoned by `retire` across all participant slots (see
+    /// `retire`). Nonzero means the limbo reserve was exhausted under a
+    /// failing allocator and that many pool slots were withheld from reuse —
+    /// safe, but worth alerting on. Reads plain single-owner counters, so
+    /// call it when the domain is quiescent (same contract as
+    /// `NodePool.verifyQuiescent`), not from a racing thread.
+    pub fn droppedRetires(self: *const Domain) usize {
+        var n: usize = 0;
+        for (self.participants) |*p| n += p.dropped_retires;
+        return n;
     }
 
     /// The safe-reclaim predicate: reclaim this participant's expired limbo
@@ -446,6 +520,115 @@ test "register hands out distinct slots and unregister frees them for reuse" {
     try testing.expectEqual(a, c);
     d.unregister(b);
     d.unregister(c);
+}
+
+// ── the bounded limbo reserve + the no-panic retire failure path ────────────
+
+/// A reclaim callback that only counts, so these tests need no node pool.
+fn countingReclaim(ctx: *anyopaque, ptr: *anyopaque) void {
+    _ = ptr;
+    const n: *usize = @ptrCast(@alignCast(ctx));
+    n.* += 1;
+}
+
+test "init pre-allocates the limbo reserve, so retire never touches the allocator" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2, .bag_reserve = 8 });
+    defer d.deinit();
+    for (d.participants) |*q| {
+        for (&q.bags) |*b| try testing.expect(b.capacity >= 8);
+    }
+
+    // Swap in an allocator that fails EVERY request: the reserve alone must
+    // carry `bag_reserve` retires per bag. (Frees pass through, so `deinit`
+    // still works; restored below for tidiness.)
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    d.allocator = failing.allocator();
+
+    const p = try d.register();
+    var freed: usize = 0;
+    var victims: [8]u64 = @splat(0);
+    for (&victims) |*v| {
+        const g = d.enterCritical(p);
+        d.retire(p, .{ .ptr = v, .ctx = &freed, .reclaim = countingReclaim });
+        g.release();
+    }
+    // All eight fit in the reserve: nothing allocated, nothing abandoned.
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    try testing.expectEqual(@as(usize, 0), d.droppedRetires());
+    try testing.expectEqual(@as(usize, 8), Domain.remainingGarbage(p));
+
+    d.allocator = testing.allocator;
+    d.unregister(p); // self-drains; every victim is reclaimed
+    try testing.expectEqual(@as(usize, 8), freed);
+}
+
+test "retire abandons (never panics, never frees early) when the bag cannot grow" {
+    // No reserve + an allocator that fails every request ⇒ the very first
+    // retire hits the exhausted path.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 1, .bag_reserve = 0 });
+    defer d.deinit();
+    d.allocator = failing.allocator();
+
+    const p = try d.register();
+    var freed: usize = 0;
+    var a: u64 = 1;
+    var b: u64 = 2;
+
+    for ([_]*u64{ &a, &b }) |v| {
+        const g = d.enterCritical(p);
+        d.retire(p, .{ .ptr = v, .ctx = &freed, .reclaim = countingReclaim });
+        g.release();
+    }
+
+    // Abandoned, not staged — and above all NOT reclaimed: freeing under a
+    // possible reader is the one outcome that would be a use-after-free.
+    try testing.expectEqual(@as(usize, 2), d.droppedRetires());
+    try testing.expectEqual(@as(usize, 0), freed);
+    try testing.expectEqual(@as(usize, 0), Domain.remainingGarbage(p));
+
+    // The domain stays usable: once the allocator recovers, retire resumes
+    // staging and draining normally.
+    d.allocator = testing.allocator;
+    var c: u64 = 3;
+    const g = d.enterCritical(p);
+    d.retire(p, .{ .ptr = &c, .ctx = &freed, .reclaim = countingReclaim });
+    g.release();
+    try testing.expectEqual(@as(usize, 2), d.droppedRetires()); // unchanged
+    d.unregister(p); // self-drains: only `c` was ever staged
+    try testing.expectEqual(@as(usize, 1), freed);
+}
+
+test "a queue dequeue survives a failing allocator: value returned, node not freed" {
+    const mpmc = @import("mpmc.zig");
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 1, .bag_reserve = 0 });
+    defer d.deinit();
+    var np = mpmc.Pool.init(testing.allocator);
+    defer np.deinit();
+    var q = try mpmc.MpmcQueue.init(&np, &d);
+
+    const p = try d.register();
+    try q.enqueue(p, 0xC0FFEE);
+    try q.enqueue(p, 0xBEEF);
+
+    // Now starve the limbo bags. This is the path that used to `@panic`.
+    d.allocator = failing.allocator();
+    try testing.expectEqual(@as(?u64, 0xC0FFEE), q.dequeue(p));
+    try testing.expectEqual(@as(?u64, 0xBEEF), q.dequeue(p));
+    try testing.expectEqual(@as(?u64, null), q.dequeue(p));
+    try testing.expectEqual(@as(usize, 2), d.droppedRetires());
+
+    // The abandoned nodes were never released back to the pool, so no live
+    // node can alias them and the free list is still intact-poisoned.
+    try np.verifyQuiescent();
+
+    d.allocator = testing.allocator;
+    d.unregister(p);
+    q.deinit();
+    // `np.deinit` destroys the abandoned slots too — a bounded loss of pool
+    // capacity, not a heap leak (testing.allocator would flag one).
 }
 
 test "fresh participant is unpinned with empty limbo bags" {
