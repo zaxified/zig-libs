@@ -587,7 +587,7 @@ test "live: native batch round-trip — create, list, delete" {
     sock.commit(&b) catch |err| switch (err) {
         error.KernelRejected, error.AccessDenied, error.NotSupported, error.WouldBlock => {
             skipUnprivileged(&sock, "round-trip", err);
-            return;
+            return error.SkipZigTest;
         },
         else => return err,
     };
@@ -696,7 +696,7 @@ test "live: a bad batch is rolled back atomically and names the failing command"
         sock.commit(&probe) catch |err| switch (err) {
             error.KernelRejected, error.AccessDenied, error.NotSupported, error.WouldBlock => {
                 skipUnprivileged(&sock, "atomicity", err);
-                return;
+                return error.SkipZigTest;
             },
             else => return err,
         };

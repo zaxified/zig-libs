@@ -220,7 +220,7 @@ const Link = struct {
 test "live BACnet/SC: our node connects to a hub and exchanges NPDUs" {
     const spec = envVar("BACNET_SC_TEST_HUB") orelse {
         skip("live BACnet/SC node", "BACNET_SC_TEST_HUB");
-        return;
+        return error.SkipZigTest;
     };
     const addr = address(spec) orelse return error.BadHubAddress;
 
@@ -338,7 +338,7 @@ fn pump(link: *Link, node: *sc_node.Node, rand: std.Random) !void {
 test "live BACnet/SC: our hub admits a third-party node" {
     const spec = envVar("BACNET_SC_TEST_LISTEN") orelse {
         skip("live BACnet/SC hub", "BACNET_SC_TEST_LISTEN");
-        return;
+        return error.SkipZigTest;
     };
     const addr = address(spec) orelse return error.BadListenAddress;
 
