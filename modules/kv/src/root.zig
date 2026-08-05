@@ -36,8 +36,16 @@
 //! same lock. Honest caveat: a writer holds the lock across `fsync`, so a
 //! concurrent thread spin-waits for the duration of a disk flush; this is
 //! fine for the intended embedded/low-contention use, and lockless MVCC
-//! readers are an explicitly noted future phase. Cross-*process* exclusion
-//! is NOT provided (no lock file) — one `Db` instance per store.
+//! readers are an explicitly noted future phase.
+//!
+//! **Cross-process exclusion (on by default):** `open` takes an exclusive
+//! ADVISORY lock (`flock(2)`, non-blocking) on a sidecar `<path>.lock` and
+//! holds it until `close`. A second opener — another process, or a second
+//! `Db` in this one — gets `error.Locked` instead of silently becoming a
+//! second writer over the same append-only log. Opt out with
+//! `Options.lock = .none`. See `Storage.tryLockExclusive` for the full
+//! contract (why `flock` and not `fcntl`, what `fork` does, and why NFS is
+//! explicitly not promised).
 //!
 //! **The Storage seam:** every storage side effect (write / fsync / truncate
 //! / rename / delete / dir-fsync) goes through the injectable `Storage`
@@ -50,7 +58,8 @@
 //! immutable/MVCC on-disk structure (HAMT/B-tree) with lockless readers,
 //! ordered/ranged scans, transactions/batches, secondary indexes, automatic
 //! compaction thresholds, in-memory value cache (compose with `ramcache`),
-//! cross-process lock files. The v0 keydir is an unordered hash map.
+//! shared/reader locks (the store is single-writer, so the cross-process
+//! lock is exclusive-only). The v0 keydir is an unordered hash map.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -121,6 +130,8 @@ fn encodeRecord(buf: []u8, op: u8, key: []const u8, value: []const u8) void {
 ///     namespace change is durable only after `syncDir`.
 ///   * `delete` errors with `error.FileNotFound` if the name is absent.
 ///   * `syncDir` = fsync of the directory containing the store's files.
+///   * `tryLockExclusive` = a non-blocking, advisory, cross-process lock
+///     whose lifetime is the HANDLE's lifetime (see its doc comment).
 pub const Storage = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -140,6 +151,12 @@ pub const Storage = struct {
         IsDir,
         OutOfMemory,
         Unexpected,
+        /// This backend / filesystem cannot take advisory locks at all (e.g.
+        /// WASI, or a filesystem whose `flock` returns EOPNOTSUPP). Reported,
+        /// never swallowed: a store that silently skips locking is worse than
+        /// one that refuses to open. Pass `Options.lock = .none` to proceed
+        /// without cross-process exclusion.
+        LockUnsupported,
     };
 
     pub const VTable = struct {
@@ -153,6 +170,7 @@ pub const Storage = struct {
         rename: *const fn (ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Error!void,
         delete: *const fn (ctx: *anyopaque, path: []const u8) Error!void,
         syncDir: *const fn (ctx: *anyopaque) Error!void,
+        tryLockExclusive: *const fn (ctx: *anyopaque, h: Handle) Error!bool,
     };
 
     pub fn open(s: Storage, path: []const u8, mode: OpenMode) Error!Handle {
@@ -195,6 +213,63 @@ pub const Storage = struct {
     pub fn syncDir(s: Storage) Error!void {
         return s.vtable.syncDir(s.ctx);
     }
+
+    /// Try to take an exclusive ADVISORY lock on the open file description
+    /// `h`. Returns `true` when the lock is now held, `false` when an
+    /// incompatible lock is already held by someone else. **Never blocks.**
+    ///
+    /// There is deliberately NO `unlock` operation: the lock's lifetime is
+    /// exactly the handle's lifetime — `close` releases it, and so does the
+    /// holder dying. That is not an accident of the API, it is the reason
+    /// the semantics below were chosen.
+    ///
+    /// ### Why `flock(2)` and not `fcntl(F_SETLK)`
+    ///
+    /// `flock` locks belong to the **open file description**; `fcntl` locks
+    /// belong to the **process**. Three consequences decide it:
+    ///
+    ///  1. **The `fcntl` close footgun.** A POSIX record lock is dropped as
+    ///     soon as the process closes *any* descriptor for that file — even a
+    ///     descriptor it never locked, opened by unrelated code elsewhere in
+    ///     the program. A library cannot defend against that: some other
+    ///     module stat-ing/opening the same path would silently unlock our
+    ///     store. `flock` is immune (only closing the last copy of *this*
+    ///     description releases it).
+    ///  2. **`fork`.** `flock`: the child inherits the descriptor and thus a
+    ///     *share* of the same lock — it does NOT get a second, independent
+    ///     lock, and the lock is released only once parent and child have
+    ///     both closed (or died). So forking a process holding an open `Db`
+    ///     leaves exactly one logical writer; two forked halves must not both
+    ///     write, and the lock will not tell them apart (it is one holder).
+    ///     A child that wants its own store must `Db.open` afresh, which
+    ///     creates a new description and is correctly refused with
+    ///     `error.Locked` while the parent holds the store. `fcntl` instead
+    ///     gives the child *no* lock at all, which looks safe until the child
+    ///     re-locks and both halves believe they own the store.
+    ///  3. **Death cleanup.** Both flavors are released by the kernel when
+    ///     the holder dies, so a crashed writer never leaves a stale lock
+    ///     behind and there is no PID file to garbage-collect. `flock`'s
+    ///     description scope makes this exact under `fork`/`dup` too.
+    ///
+    /// ### What is NOT promised
+    ///
+    ///  * **Advisory only.** A process that never calls `Db.open` (`cat >`,
+    ///     an editor, another library) is not stopped by anything here.
+    ///  * **Network filesystems.** On NFS, Linux emulates `flock` on top of
+    ///     POSIX record locks — which re-introduces footgun (1) — and some
+    ///     configurations (`local_lock=`, `-o nolock`, several SMB/9p/FUSE
+    ///     setups) make the lock **node-local**, i.e. it silently fails to
+    ///     exclude a writer on another host. This module promises
+    ///     cross-process exclusion on **local POSIX filesystems** only. Do
+    ///     not put a `kv` store on a network share and expect this to save
+    ///     you; nothing at this layer can detect the degradation.
+    ///  * **Not a substitute for the durability contract.** The lock is held
+    ///     across every write *and* its `fsync`, from `open` to `close` — a
+    ///     lock dropped before the data is durable would protect nothing —
+    ///     but it says nothing about media integrity.
+    pub fn tryLockExclusive(s: Storage, h: Handle) Error!bool {
+        return s.vtable.tryLockExclusive(s.ctx, h);
+    }
 };
 
 // ── FsStorage: the real-filesystem backend ───────────────────────────────────
@@ -212,8 +287,8 @@ pub const FsStorage = struct {
     dir: std.Io.Dir,
     files: [max_handles]?std.Io.File = @splat(null),
 
-    /// The store needs at most 2 concurrently open files (data + compaction
-    /// temp); a little headroom is left.
+    /// The store needs at most 3 concurrently open files (data + lock
+    /// sidecar + compaction temp); a little headroom is left.
     const max_handles = 4;
 
     pub fn init(io: std.Io, dir: std.Io.Dir) FsStorage {
@@ -235,6 +310,7 @@ pub const FsStorage = struct {
         .rename = vRename,
         .delete = vDelete,
         .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLockExclusive,
     };
 
     fn cast(ctx: *anyopaque) *FsStorage {
@@ -243,6 +319,7 @@ pub const FsStorage = struct {
 
     fn mapErr(e: anyerror) Storage.Error {
         return switch (e) {
+            error.FileLocksUnsupported => error.LockUnsupported,
             error.FileNotFound => error.FileNotFound,
             error.AccessDenied, error.PermissionDenied => error.AccessDenied,
             error.NoSpaceLeft, error.DiskQuota => error.NoSpaceLeft,
@@ -321,6 +398,15 @@ pub const FsStorage = struct {
         const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
         as_file.sync(self.io) catch |e| return mapErr(e);
     }
+
+    /// `flock(fd, LOCK_EX | LOCK_NB)` (POSIX) / `NtLockFile` with fail-
+    /// immediately (Windows), via `std.Io.File.tryLock` — the non-blocking
+    /// form, so a contended store reports `error.Locked` to the caller
+    /// instead of parking the thread inside a library call forever.
+    fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        const self = cast(ctx);
+        return self.fileOf(h).tryLock(self.io, .exclusive) catch |e| mapErr(e);
+    }
 };
 
 // ── Db ───────────────────────────────────────────────────────────────────────
@@ -331,6 +417,24 @@ pub const Options = struct {
     /// the record header + key per get; disable only if the value copy alone
     /// is acceptable verification (replay already CRC-checked every record).
     read_verify: bool = true,
+
+    /// Cross-process exclusion policy (default: on). See `LockPolicy`.
+    lock: LockPolicy = .exclusive,
+};
+
+pub const LockPolicy = enum {
+    /// Take and hold an exclusive advisory lock on `<path>.lock` for the
+    /// whole lifetime of the `Db`. A second opener gets `error.Locked`.
+    /// This is the default: two writers over one append-only log corrupt it,
+    /// and "one instance per store is the caller's responsibility" is not a
+    /// guarantee, it is a hope.
+    exclusive,
+    /// No locking at all. For backends where it is meaningless (a pure
+    /// in-memory `Storage`), for a caller that already has its own
+    /// exclusion, or for the network-filesystem case where the lock would be
+    /// a lie anyway (see `Storage.tryLockExclusive`). Choosing this is
+    /// choosing to be the sole writer by construction.
+    none,
 };
 
 pub const OpenError = Storage.Error || error{
@@ -339,6 +443,12 @@ pub const OpenError = Storage.Error || error{
     /// The file is a kv store from an incompatible (newer) format version.
     UnsupportedVersion,
     Corrupt,
+    /// Another `Db` — in another process, or in this one — currently holds
+    /// the store's exclusive lock. Nothing was opened, read or written; the
+    /// data file was not even touched. Retrying is the caller's decision
+    /// (this is the non-blocking path, by design: a library that blocks
+    /// forever inside `open` is a library that hangs your program).
+    Locked,
 };
 
 pub const MutateError = Storage.Error || error{
@@ -362,9 +472,14 @@ pub const Db = struct {
     gpa: Allocator,
     store: Storage,
     file: Storage.Handle,
-    /// Owned copies of the data-file path and the compaction temp path.
+    /// Owned copies of the data-file path, the compaction temp path and the
+    /// cross-process lock sidecar path.
     path: []u8,
     tmp_path: []u8,
+    lock_path: []u8,
+    /// Handle of the held `<path>.lock` sidecar, or null with
+    /// `LockPolicy.none`. Closing it releases the advisory lock.
+    lock_file: ?Storage.Handle,
     keydir: std.StringHashMapUnmanaged(Entry),
     /// Append offset == length of the valid prefix of the data file.
     end: u64,
@@ -392,6 +507,13 @@ pub const Db = struct {
     /// `path` is resolved by the given `Storage` (for `FsStorage`: relative
     /// to its directory; must not contain a separator, so the dir fsync
     /// covers it).
+    ///
+    /// Unless `options.lock == .none`, the store's exclusive advisory lock is
+    /// taken FIRST — before the stale temp is removed, before the log is
+    /// replayed, and before recovery truncates a torn tail. That ordering is
+    /// the point: those are precisely the steps two concurrent openers would
+    /// corrupt. A contended store returns `error.Locked` with the data file
+    /// untouched.
     pub fn open(gpa: Allocator, store: Storage, path: []const u8, options: Options) OpenError!Db {
         var self = Db{
             .gpa = gpa,
@@ -399,6 +521,8 @@ pub const Db = struct {
             .file = undefined,
             .path = try gpa.dupe(u8, path),
             .tmp_path = undefined,
+            .lock_path = undefined,
+            .lock_file = null,
             .keydir = .empty,
             .end = header_len,
             .dead_bytes = 0,
@@ -409,6 +533,28 @@ pub const Db = struct {
         errdefer gpa.free(self.path);
         self.tmp_path = try std.fmt.allocPrint(gpa, "{s}.compact", .{path});
         errdefer gpa.free(self.tmp_path);
+        self.lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+        errdefer gpa.free(self.lock_path);
+
+        // Cross-process exclusion, before anything else touches the store.
+        //
+        // The lock lives on a SIDECAR file, not on the data file, because
+        // `compact()` replaces the data file by `rename(2)`: a lock held on
+        // the data file's open description would survive as a lock on an
+        // unlinked inode while the store's NAME resolves to a fresh, unlocked
+        // one — mutual exclusion silently lost at exactly the moment the
+        // store is being rewritten. The sidecar's inode is never renamed and
+        // never deleted (unlink+recreate would hand two processes locks on
+        // two different inodes of the same name), so it is a stable identity
+        // for "this store" across compactions and restarts. It stays behind
+        // as an empty file; that is the cost.
+        if (options.lock == .exclusive) self.lock_file = try store.open(self.lock_path, .open_or_create);
+        // Closing the handle is what releases the lock, so this one errdefer
+        // covers every later failure path, acquired or not.
+        errdefer if (self.lock_file) |lh| store.close(lh);
+        if (self.lock_file) |lh| {
+            if (!try store.tryLockExclusive(lh)) return error.Locked;
+        }
 
         // A crash mid-compaction may leave a temp file behind; it is dead
         // weight (the swap either fully happened or the old file stands).
@@ -449,12 +595,16 @@ pub const Db = struct {
     }
 
     /// Close the store and free all memory. Does not sync (every committed
-    /// mutation already was).
+    /// mutation already was). Releases the cross-process lock — by closing
+    /// the handle that holds it, the same mechanism the kernel applies when
+    /// the process dies, so there is no path where a lock outlives its `Db`.
     pub fn close(self: *Db) void {
         self.store.close(self.file);
+        if (self.lock_file) |lh| self.store.close(lh);
         self.freeKeydir();
         self.gpa.free(self.path);
         self.gpa.free(self.tmp_path);
+        self.gpa.free(self.lock_path);
         self.* = undefined;
     }
 
@@ -778,6 +928,8 @@ pub const Db = struct {
 // ── tests (deterministic on SimStorage; one real-fs round-trip at the end) ──
 
 const testing = std.testing;
+const builtin = @import("builtin");
+const linux = std.os.linux;
 
 test {
     _ = @import("prng.zig");
@@ -1279,4 +1431,290 @@ test "getBuf: allocation-free reads, exact sizing, and no silent truncation" {
     // A corrupt record must fail the same way through both entry points, not
     // just through `get` — the CRC check is shared, and this proves it.
     try testing.expect(db.options.read_verify);
+}
+
+// ── cross-process locking ────────────────────────────────────────────────────
+
+test "lock: a second Db on the same store is refused, and released on close" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("k", "v");
+        // A second opener — in a real deployment, another process — is turned
+        // away instead of quietly becoming a second writer over one log.
+        try testing.expectError(
+            error.Locked,
+            Db.open(testing.allocator, sim.storage(), "db", .{}),
+        );
+        // The refusal costs the holder nothing.
+        try expectGet(&db, "k", "v");
+    }
+    // Once the holder closes, the store is takeable again.
+    var db2 = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db2.close();
+    try expectGet(&db2, "k", "v");
+}
+
+test "lock: the sidecar survives compaction (the rename must not orphan the lock)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try db.put("a", "1");
+    try db.put("a", "2"); // dead weight for compaction to drop
+    // Compaction replaces the DATA file via rename. A lock taken on the data
+    // file itself would now be stranded on the unlinked inode and the store
+    // would be silently takeable; the sidecar's inode is untouched.
+    try db.compact();
+    try testing.expectError(
+        error.Locked,
+        Db.open(testing.allocator, sim.storage(), "db", .{}),
+    );
+    try expectGet(&db, "a", "2");
+}
+
+test "lock: a crashed holder leaves no stale lock" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    try db.put("k", "v");
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, db.put("k2", "v2"));
+    sim.reboot();
+
+    // `db` is deliberately still "open" here: a killed process runs no
+    // cleanup, and recovery must not depend on it having run any.
+    var db2 = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db2.close();
+    try expectGet(&db2, "k", "v");
+    db.close();
+}
+
+test "lock: a foreign holder blocks open BEFORE the store is touched" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var good_len: usize = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("committed", "safe");
+        good_len = sim.fileContent("db").?.len;
+    }
+    // A torn tail that `open` would normally truncate away — a *write*, and
+    // the exact write two concurrent openers must never race on.
+    try sim.appendDurable("db", &[_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02 });
+    const dirty_len = sim.fileContent("db").?.len;
+
+    try sim.holdForeignLock("db.lock");
+    try testing.expectError(
+        error.Locked,
+        Db.open(testing.allocator, sim.storage(), "db", .{}),
+    );
+    // Nothing was replayed and nothing was truncated: the lock is taken
+    // first, so a refused open is a total no-op on the data file.
+    try testing.expectEqual(dirty_len, sim.fileContent("db").?.len);
+
+    // The other process exits; now recovery may proceed.
+    sim.releaseForeignLock("db.lock");
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "committed", "safe");
+    try testing.expectEqual(good_len, sim.fileContent("db").?.len);
+}
+
+test "lock: .none opts out; a backend without locks is refused, never downgraded" {
+    { // opt-out: two live Dbs on one store, by the caller's explicit choice
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var a = try Db.open(testing.allocator, sim.storage(), "db", .{ .lock = .none });
+        defer a.close();
+        var b = try Db.open(testing.allocator, sim.storage(), "db", .{ .lock = .none });
+        defer b.close();
+        try testing.expect(sim.fileContent("db.lock") == null); // no sidecar at all
+    }
+    { // a filesystem with no advisory locks: loud failure, not silent risk
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.lock_unsupported = true;
+        try testing.expectError(
+            error.LockUnsupported,
+            Db.open(testing.allocator, sim.storage(), "db", .{}),
+        );
+        // ...and the caller can still proceed, having been told.
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .lock = .none });
+        defer db.close();
+        try db.put("k", "v");
+    }
+}
+
+test "lock: real filesystem, two open descriptions on one store contend" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_a = FsStorage.init(testing.io, tmp.dir);
+    var fs_b = FsStorage.init(testing.io, tmp.dir);
+    {
+        var db = Db.open(testing.allocator, fs_a.storage(), "real.kv", .{}) catch |e| switch (e) {
+            // A filesystem that cannot flock (some CI overlays) — say so
+            // rather than silently passing a locking test that locked nothing.
+            error.LockUnsupported => return error.SkipZigTest,
+            else => return e,
+        };
+        defer db.close();
+        try db.put("k", "v");
+        try testing.expectError(
+            error.Locked,
+            Db.open(testing.allocator, fs_b.storage(), "real.kv", .{}),
+        );
+    }
+    var db2 = try Db.open(testing.allocator, fs_b.storage(), "real.kv", .{});
+    defer db2.close();
+    try expectGet(&db2, "k", "v");
+}
+
+// ── cross-process locking: REAL second processes ─────────────────────────────
+//
+// Everything above runs in one process. Even though `flock` is scoped to the
+// open file description (so a second `Db.open` here really does contend), only
+// a genuine second process proves the guarantee callers actually buy. These
+// two tests fork.
+//
+// Neither test can wedge the runner: every child arms `alarm(2)` as a
+// self-destruct before it does anything, the parent reaps with a WNOHANG poll
+// under a deadline and `SIGKILL`s a child that overstays, and the parent's one
+// blocking read is on a pipe whose only write end lives in that child — so a
+// dead or killed child yields EOF rather than a hang.
+
+/// Seconds after which a child self-terminates with `SIGALRM` no matter what
+/// it is doing. The upper bound on how long any of this can take.
+const child_watchdog_s: usize = 10;
+
+/// Child exit codes (0 = the expected outcome).
+const child_no_lock: i32 = 71; // opened a store it should have been refused
+const child_wrong_error: i32 = 72; // refused, but not with error.Locked
+const child_open_failed: i32 = 73; // could not open a store it should have got
+
+/// Reap `pid`, polling for at most `deadline_ms`, then `SIGKILL` and block.
+/// Bounded by construction: this returns even for a child that ignores
+/// everything.
+fn reapBounded(pid: i32, deadline_ms: usize) !u32 {
+    var status: u32 = 0;
+    var waited: usize = 0;
+    while (waited < deadline_ms) : (waited += 5) {
+        const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
+        if (@as(isize, @bitCast(rc)) < 0) {
+            if (linux.errno(rc) == .INTR) continue;
+            return error.WaitFailed;
+        }
+        if (rc != 0) return status;
+        var ts = linux.timespec{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+    _ = linux.kill(pid, .KILL);
+    while (true) {
+        const rc = linux.waitpid(pid, &status, 0);
+        if (@as(isize, @bitCast(rc)) < 0 and linux.errno(rc) == .INTR) continue;
+        break;
+    }
+    return status;
+}
+
+test "lock: a REAL second process is refused by the holder's flock" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    var db = Db.open(testing.allocator, fs_store.storage(), "shared.kv", .{}) catch |e| switch (e) {
+        error.LockUnsupported => return error.SkipZigTest,
+        else => return e,
+    };
+    defer db.close();
+    try db.put("owner", "parent");
+
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(@as(isize, @bitCast(forked)));
+    if (pid == 0) {
+        // CHILD: a separate process with its own fd table. It never returns
+        // into the test runner — `exit_group` only — so the parent's
+        // allocator, io and test state are never touched.
+        _ = linux.syscall1(.alarm, child_watchdog_s);
+        var child_fs = FsStorage.init(testing.io, tmp.dir);
+        if (Db.open(std.heap.page_allocator, child_fs.storage(), "shared.kv", .{})) |_| {
+            linux.exit_group(child_no_lock);
+        } else |e| switch (e) {
+            error.Locked => linux.exit_group(0),
+            else => linux.exit_group(child_wrong_error),
+        }
+    }
+
+    const status = try reapBounded(pid, 5000);
+    try testing.expect(linux.W.IFEXITED(status));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    // The rejected process left the holder's store exactly as it was.
+    try expectGet(&db, "owner", "parent");
+}
+
+test "lock: the lock dies with the holding process (SIGKILL, zero cleanup)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+
+    // The child announces "I hold the lock" on this pipe. The parent closes
+    // its own write end, so if the child dies early the read returns EOF
+    // instead of blocking forever.
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.PipeFailed;
+
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(@as(isize, @bitCast(forked)));
+    if (pid == 0) {
+        _ = linux.close(fds[0]);
+        _ = linux.syscall1(.alarm, child_watchdog_s);
+        var child_fs = FsStorage.init(testing.io, tmp.dir);
+        var cdb = Db.open(std.heap.page_allocator, child_fs.storage(), "shared.kv", .{}) catch
+            linux.exit_group(child_open_failed);
+        cdb.put("owner", "child") catch linux.exit_group(child_open_failed);
+        _ = linux.write(fds[1], "L", 1);
+        // Hold the store open until killed. No unlock, no close, no defer
+        // will ever run — the point is that none of that is needed.
+        while (true) {
+            var ts = linux.timespec{ .sec = 1, .nsec = 0 };
+            _ = linux.nanosleep(&ts, null);
+        }
+    }
+    _ = linux.close(fds[1]);
+    var byte: [1]u8 = undefined;
+    const n = linux.read(fds[0], &byte, 1);
+    _ = linux.close(fds[0]);
+    if (n != 1) {
+        _ = try reapBounded(pid, 5000);
+        // The child could not open/lock at all (e.g. no flock on this fs).
+        return error.SkipZigTest;
+    }
+
+    // While that process lives, this one cannot have the store.
+    try testing.expectError(
+        error.Locked,
+        Db.open(testing.allocator, fs_store.storage(), "shared.kv", .{}),
+    );
+
+    // SIGKILL: no destructor, no unlock call, no `Db.close` — the kernel
+    // closes the descriptors and the advisory lock goes with them. This is
+    // the reason `flock` was chosen over a PID/lock-file protocol that would
+    // now need stale-lock heuristics.
+    _ = linux.kill(pid, .KILL);
+    const status = try reapBounded(pid, 5000);
+    try testing.expect(linux.W.IFSIGNALED(status));
+
+    var db = try Db.open(testing.allocator, fs_store.storage(), "shared.kv", .{});
+    defer db.close();
+    // ...and the dead process's durable write is there, which also proves it
+    // really was operating on THIS store and not a private copy.
+    try expectGet(&db, "owner", "child");
 }

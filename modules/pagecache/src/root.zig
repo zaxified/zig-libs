@@ -172,6 +172,7 @@ pub const PageCache = struct {
         .rename = vRename,
         .delete = vDelete,
         .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLockExclusive,
     };
 
     fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
@@ -263,6 +264,13 @@ pub const PageCache = struct {
 
     fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
         return cast(ctx).inner.syncDir();
+    }
+
+    /// Forwarded verbatim: the cross-process lock belongs to the real backing
+    /// file, and a cache that answered it locally would hand out an exclusion
+    /// guarantee it cannot enforce.
+    fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        return cast(ctx).inner.tryLockExclusive(h);
     }
 };
 

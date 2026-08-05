@@ -33,6 +33,7 @@ const CrashMode = kv.CrashMode;
 const testing = std.testing;
 
 const db_name = "sweep.kv";
+const lock_name = db_name ++ ".lock";
 
 // ── the scripted workload ────────────────────────────────────────────────────
 
@@ -167,6 +168,11 @@ test "fault-injection sweep: crash at EVERY storage side effect, all modes" {
         try testing.expect(!out.crashed);
         try testing.expectEqual(script.len, out.completed);
         total = sim.ops_seen;
+        // Teeth: the swept workload must actually exercise the cross-process
+        // lock path (`Db.open` takes it by default). If this sidecar is
+        // missing, the store opened unlocked and every crash point below
+        // stopped covering the lock acquisition.
+        try testing.expect(sim.fileContent(lock_name) != null);
         // The run must also be verifiable as-is (no crash at all).
         try verifyRecovery(&sim, out);
     }
@@ -243,6 +249,63 @@ test "fault-injection sweep: non-contiguous (reordered) unsynced persistence" {
     // Teeth: the reorder collapse must have punched genuine non-contiguous
     // holes in the compact windows (else this mode tested nothing new).
     try testing.expect(holes > 0);
+}
+
+test "fault sweep: a contended lock blocks recovery without touching the crashed store" {
+    // The dangerous moment for a store is the one right after a crash: the
+    // log has a torn tail, and `open` wants to replay and TRUNCATE it. If a
+    // second process is already recovering the same file, both truncating is
+    // how a crash-consistent store becomes an inconsistent one.
+    //
+    // So: crash at every point, then (with another process modeled as holding
+    // the lock) assert that recovery is refused and the crashed file is left
+    // byte-for-byte alone — and that once the other process is gone, the very
+    // same recovery still satisfies the sweep's full invariant set.
+    var total: usize = 0;
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        _ = runScript(&sim);
+        total = sim.ops_seen;
+    }
+
+    var contended: usize = 0;
+    var point: usize = 0;
+    while (point < total) : (point += 1) {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.ops_until_crash = point;
+        const out = runScript(&sim);
+        try testing.expect(out.crashed);
+        sim.reboot();
+
+        // Another process holds the store. (The crash released OUR lock but
+        // has no power over theirs — that asymmetry is the model's job.)
+        try sim.holdForeignLock(lock_name);
+        const before = try testing.allocator.dupe(u8, sim.fileContent(db_name) orelse "");
+        defer testing.allocator.free(before);
+
+        try testing.expectError(
+            error.Locked,
+            Db.open(testing.allocator, sim.storage(), db_name, .{}),
+        );
+        // A refused open must be a *total* no-op: no replay, no truncation of
+        // the torn tail, no stale-temp deletion.
+        try testing.expectEqualSlices(u8, before, sim.fileContent(db_name) orelse "");
+        contended += 1;
+
+        sim.releaseForeignLock(lock_name);
+        verifyRecovery(&sim, out) catch |e| {
+            std.debug.print(
+                "contended-lock sweep FAILED: crash_point={d}/{d} completed_steps={d}\n",
+                .{ point, total, out.completed },
+            );
+            return e;
+        };
+    }
+    // Teeth: the contention actually happened at every crash point (a sweep
+    // where `open` never hit `error.Locked` proves nothing about locking).
+    try testing.expectEqual(total, contended);
 }
 
 test "fault sweep is deterministic across repeats" {

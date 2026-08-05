@@ -133,6 +133,7 @@ const FaultStorage = struct {
         .rename = vRename,
         .delete = vDelete,
         .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLockExclusive,
     };
 
     fn cast(ctx: *anyopaque) *FaultStorage {
@@ -205,6 +206,15 @@ const FaultStorage = struct {
         const self = cast(ctx);
         if (self.fires()) return self.error_kind;
         return self.inner.syncDir();
+    }
+
+    /// Taking the store's cross-process lock is a side effect like any other
+    /// here: the scheduled error may fire on it, so `Db.open`'s lock-acquire
+    /// path gets the same failure coverage as its write path.
+    fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        const self = cast(ctx);
+        if (self.fires()) return self.error_kind;
+        return self.inner.tryLockExclusive(h);
     }
 };
 

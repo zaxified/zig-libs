@@ -45,10 +45,27 @@
 //! sweep in `fault_test.zig` replays a scripted workload once per (crash
 //! point × crash mode) pair and asserts recovery invariants after each.
 //!
+//! **Cross-process locking is modeled too** (`tryLockExclusive`), because a
+//! lock operation the simulator does not know about is a lock operation the
+//! fault sweep silently stops covering. The model mirrors `flock(2)`:
+//!
+//!   * a lock is held by an open file DESCRIPTION — here, by the `Handle`
+//!     that took it. Two handles on the same name contend, even though this
+//!     is one simulated process; that is exactly what makes a second
+//!     `Db.open` behave like a second *process*;
+//!   * `close` releases (no unlock op exists — see `Storage`);
+//!   * a **crash releases our locks** (the kernel closes a dead process's
+//!     descriptors), so a crashed store never wedges its own restart. A
+//!     `holdForeignLock` holder models a *different* process and therefore
+//!     survives our crash — the "reboot, still locked out" case;
+//!   * `lock_unsupported` models a filesystem with no working `flock`
+//!     (WASI, some FUSE/network mounts) → `error.LockUnsupported`.
+//!
 //! Injection points (side effects that count toward `ops_until_crash`):
-//! `open`, `writeAll`, `sync`, `truncate`, `rename`, `delete`, `syncDir`.
-//! Pure reads (`pread`, `size`) and `close` are not side effects — crashing
-//! "at" them is indistinguishable from crashing before the next side effect.
+//! `open`, `writeAll`, `sync`, `truncate`, `rename`, `delete`, `syncDir`,
+//! `tryLockExclusive`. Pure reads (`pread`, `size`) and `close` are not side
+//! effects — crashing "at" them is indistinguishable from crashing before
+//! the next side effect.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -109,9 +126,19 @@ pub const SimStorage = struct {
     /// must also write any byte range at most once per sync window (the
     /// `unsynced_writes` ranges are assumed disjoint by `crashReorder`).
     allow_overwrite: bool = false,
+    /// Model a filesystem that cannot take advisory locks at all: every
+    /// `tryLockExclusive` fails with `error.LockUnsupported` (WASI, some
+    /// FUSE/network mounts). The store must refuse to open rather than run
+    /// unprotected.
+    lock_unsupported: bool = false,
 
     /// A byte-range written to a file since its last durability barrier.
     const Range = struct { off: usize, len: usize };
+
+    /// Sentinel lock holder standing for "a different process holds it" —
+    /// installed by `holdForeignLock`. Unlike a holder of ours, it is NOT
+    /// released by `close` or by a crash of this simulated machine.
+    pub const foreign_holder: Storage.Handle = std.math.maxInt(Storage.Handle);
 
     const SimFile = struct {
         content: std.ArrayListUnmanaged(u8) = .empty,
@@ -120,6 +147,10 @@ pub const SimStorage = struct {
         /// `truncate` / `create_truncate` on this file. Consumed by
         /// `.reorder_unsynced` to drop a subset; cleared by every barrier.
         unsynced_writes: std.ArrayListUnmanaged(Range) = .empty,
+        /// Handle holding this file's exclusive advisory lock (or
+        /// `foreign_holder`), null when unlocked. Mirrors `flock`: the lock
+        /// belongs to an open file description, not to "the process".
+        lock_holder: ?Storage.Handle = null,
     };
 
     /// splitmix64 step (public-domain, S. Vigna) — the harness's only PRNG.
@@ -184,6 +215,28 @@ pub const SimStorage = struct {
         f.unsynced_writes.clearRetainingCapacity(); // all content is now durable
     }
 
+    /// Test helper: pretend ANOTHER process holds `path`'s exclusive advisory
+    /// lock (creating the file if it does not exist). Our `close` and our
+    /// crashes do not release it — only `releaseForeignLock` does. This is
+    /// the contention case a single simulated machine cannot otherwise
+    /// express, and the one a store must survive: refuse to open, touch
+    /// nothing.
+    pub fn holdForeignLock(self: *SimStorage, path: []const u8) !void {
+        const f = self.names.get(path) orelse blk: {
+            const nf = try self.newFile();
+            try putName(self.gpa, &self.names, path, nf);
+            try putName(self.gpa, &self.durable_names, path, nf);
+            break :blk nf;
+        };
+        f.lock_holder = foreign_holder;
+    }
+
+    /// Test helper: the foreign holder went away (its process exited).
+    pub fn releaseForeignLock(self: *SimStorage, path: []const u8) void {
+        const f = self.names.get(path) orelse return;
+        if (f.lock_holder == foreign_holder) f.lock_holder = null;
+    }
+
     /// Test helper: create `path` with `bytes` as durable content and a
     /// durable name (as if it had been fully written and synced long ago).
     pub fn installFile(self: *SimStorage, path: []const u8, bytes: []const u8) !void {
@@ -228,6 +281,13 @@ pub const SimStorage = struct {
             // `reboot`, after which a fresh `open` reads only `content`.)
             f.durable_len = f.content.items.len;
             f.unsynced_writes.clearRetainingCapacity();
+            // Our descriptors die with the process, so the kernel drops every
+            // advisory lock we held — the reason a crashed writer can never
+            // leave a stale lock that wedges the next `open`. A FOREIGN
+            // holder is another process and is untouched by our death.
+            if (f.lock_holder) |owner| {
+                if (owner != foreign_holder) f.lock_holder = null;
+            }
         }
         switch (self.crash_mode) {
             // The dying OS flushed the directory too.
@@ -324,6 +384,7 @@ pub const SimStorage = struct {
         .rename = vRename,
         .delete = vDelete,
         .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLockExclusive,
     };
 
     fn cast(ctx: *anyopaque) *SimStorage {
@@ -459,9 +520,32 @@ pub const SimStorage = struct {
         f.unsynced_writes.shrinkRetainingCapacity(w);
     }
 
+    /// `flock(fd, LOCK_EX | LOCK_NB)`: the lock belongs to this HANDLE (the
+    /// open file description). A different handle on the same file contends
+    /// even within one simulated process — which is precisely how a second
+    /// `Db.open` stands in for a second process here. Re-locking through the
+    /// handle that already holds it succeeds (as `flock` does).
+    fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        const self = cast(ctx);
+        if (self.crashed) return error.Crashed;
+        if (self.inject()) return error.Crashed;
+        if (self.lock_unsupported) return error.LockUnsupported;
+        const f = self.fileOf(h);
+        if (f.lock_holder) |owner| return owner == h;
+        f.lock_holder = h;
+        return true;
+    }
+
     fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
         const self = cast(ctx);
-        if (h < self.handles.items.len) self.handles.items[h] = null;
+        if (h >= self.handles.items.len) return;
+        // Closing the description releases the lock it held — the only
+        // release path there is (there is no unlock op), so a `Db` that
+        // forgets to close its lock handle is a `Db` that wedges the store.
+        if (self.handles.items[h]) |f| {
+            if (f.lock_holder == h) f.lock_holder = null;
+        }
+        self.handles.items[h] = null;
     }
 
     fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
@@ -679,6 +763,82 @@ test "sim: created file name vanishes on crash without syncDir" {
     try testing.expectError(error.Crashed, st.sync(h));
     sim.reboot();
     try testing.expect(sim.fileContent("new") == null);
+}
+
+test "sim: the exclusive lock contends between handles and is released by close" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+
+    const a = try st.open("f", .open_or_create);
+    const b = try st.open("f", .open_or_create); // a second open DESCRIPTION
+    try testing.expect(try st.tryLockExclusive(a));
+    // The second description is refused — this is the whole point of the op.
+    try testing.expect(!try st.tryLockExclusive(b));
+    // Re-locking through the holder itself is a no-op success (flock does).
+    try testing.expect(try st.tryLockExclusive(a));
+
+    st.close(a); // closing releases; there is no unlock op
+    try testing.expect(try st.tryLockExclusive(b));
+    st.close(b);
+
+    const c = try st.open("f", .open_or_create);
+    try testing.expect(try st.tryLockExclusive(c));
+    st.close(c);
+}
+
+test "sim: a crash releases OUR lock, but not a foreign holder's" {
+    { // our own lock: the machine dies, the kernel drops our descriptors
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const st = sim.storage();
+        const a = try st.open("f", .open_or_create);
+        try testing.expect(try st.tryLockExclusive(a));
+        sim.ops_until_crash = 0;
+        try testing.expectError(error.Crashed, st.sync(a));
+        sim.reboot();
+        // Note: `a` is deliberately NOT closed — a real crashed process does
+        // not get to run its cleanup, and the lock must still be gone.
+        const b = try st.open("f", .open_or_create);
+        try testing.expect(try st.tryLockExclusive(b));
+    }
+    { // a different process's lock survives our crash
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const st = sim.storage();
+        try sim.holdForeignLock("f");
+        const a = try st.open("f", .open_or_create);
+        try testing.expect(!try st.tryLockExclusive(a));
+        sim.ops_until_crash = 0;
+        try testing.expectError(error.Crashed, st.sync(a));
+        sim.reboot();
+        const b = try st.open("f", .open_or_create);
+        try testing.expect(!try st.tryLockExclusive(b)); // still theirs
+        sim.releaseForeignLock("f");
+        try testing.expect(try st.tryLockExclusive(b));
+    }
+}
+
+test "sim: a filesystem without advisory locks reports it instead of pretending" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.lock_unsupported = true;
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    try testing.expectError(error.LockUnsupported, st.tryLockExclusive(h));
+}
+
+test "sim: a crash can land ON the lock acquisition" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    sim.ops_until_crash = 0; // the lock op is itself an injection point
+    try testing.expectError(error.Crashed, st.tryLockExclusive(h));
+    sim.reboot();
+    // The crashed acquisition left no holder behind.
+    const h2 = try st.open("f", .open_or_create);
+    try testing.expect(try st.tryLockExclusive(h2));
 }
 
 test "sim: injection counting is deterministic" {

@@ -14,6 +14,16 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **Storage seam:** all disk I/O goes through an injectable `Storage` interface, so the whole engine
   runs against an in-memory fault-injecting fake — no real filesystem needed to test recovery.
 - Threadsafe for the operations it exposes; single log owner.
+- **Single writer, enforced across processes:** `open` takes an exclusive advisory `flock(2)` on a
+  sidecar `<path>.lock` (non-blocking → `error.Locked`) and holds it until `close`, so the lock
+  spans every write *and* its fsync, and the whole of recovery (replay + tail truncation happen
+  after acquisition — a refused open does not touch the data file). `flock` over
+  `fcntl(F_SETLK)`: description-scoped rather than process-scoped, so an unrelated `close` of the
+  same path elsewhere in the program cannot silently release it, and `fork` yields one shared
+  holder rather than a child with no lock that can then re-lock. Kernel release on process death
+  means no stale locks and no PID-file heuristics. The lock is a sidecar, not the data file,
+  because `compact()`'s `rename(2)` would otherwise strand it on an unlinked inode. Opt out:
+  `Options.lock = .none`. See README for what is *not* promised (advisory only; NFS/SMB/9p/FUSE).
 
 ## Threat model / out of scope
 
@@ -24,8 +34,10 @@ Reliability, not adversarial security:
   loses committed data MUST be caught → `error.InvariantViolation`). Reproducible from a fixed
   PRNG value (splitmix64, no clock/OS-rng).
 - **Out of scope (deferred):** MVCC / multi-version reads, HAMT on-disk index, ordered scans /
-  range queries, transactions, secondary indexes, and a cross-process lock — the randomized VOPR is
-  done; these on-disk/txn features are future work. Not a networked/served DB (embedded,
+  range queries, transactions, secondary indexes, and shared/reader locks — the randomized VOPR is
+  done; these on-disk/txn features are future work. (The **cross-process lock** was on this list
+  until 2026-08-06 and is now built — see Design & invariants; only the *shared* mode remains
+  deferred, the store being single-writer.) Not a networked/served DB (embedded,
   in-process). No encryption-at-rest, no untrusted-input hardening on the log file (assumes the
   file is the engine's own, not attacker-supplied).
 
@@ -35,6 +47,19 @@ Unit tests + the randomized deterministic **VOPR** (`vopr.zig`): PRNG-driven fuz
 torn/partial writes, short reads, garbage tails, and crash points ×4 modes (incl. non-contiguous /
 out-of-order durability, see below) over chained epochs; min-fault-count asserts + the sabotage
 self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`.
+
+- **Cross-process lock — modeled, not just implemented** (2026-08-06): `tryLockExclusive` is a
+  `Storage` vtable op and an injection point, so the fixed sweep crashes on the acquisition like
+  any other side effect (57 points × 3 modes). `SimStorage` models a lock as belonging to an open
+  file *description* (a second `Handle` on the same name contends), released by `close` and by our
+  own crash but **not** by a `holdForeignLock` holder — which is what lets a sweep assert that a
+  post-crash recovery contended by another process is refused with `error.Locked` and leaves the
+  torn file byte-identical, then succeeds with full invariants once that process is gone.
+  `lock_unsupported` models a filesystem with no `flock` (`error.LockUnsupported`, never a silent
+  downgrade). The guarantee callers actually buy is proved by two **forked child processes**
+  (bounded: `alarm(2)` self-destruct + a deadline-and-`SIGKILL` reaper): a real second process is
+  refused, and a `SIGKILL`ed holder — no destructor, no unlock, nothing — leaves the store
+  immediately openable with its durable write intact.
 
 - **Fault-scheduling policy is a seam** (`scheduler.zig`, 2026-07-15): the epoch-planning
   decision (which fault, how soon) that used to be inline in `Vopr.runSeed` is a pluggable

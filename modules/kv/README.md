@@ -51,7 +51,8 @@ if (db.deadBytes() > 1 << 20)      // caller-driven compaction (v0)
 
 Options: `read_verify` (default true) re-checks the whole record CRC on every
 `get`, so even post-`open` file rot is caught — corrupt data is **never**
-served.
+served. `lock` (default `.exclusive`) takes the cross-process lock described
+below; `.none` opts out.
 
 ## On-disk format (v1, little-endian)
 
@@ -92,22 +93,65 @@ see a consistent keydir because they take the same lock. Caveats, honestly:
 a writer holds the lock **across fsync**, so a concurrent thread spin-waits
 (burning CPU) for the duration of a disk flush — fine for embedded,
 low-contention use; wrong for a hot multi-threaded server. Lockless MVCC
-readers are a noted phase. **No cross-process locking** (no lock file): one
-`Db` instance per store is the caller's responsibility.
+readers are a noted phase.
+
+## Cross-process exclusion — what it does and does not buy
+
+`open` takes an exclusive **advisory** lock (`flock(2)`, non-blocking) on a
+sidecar `<path>.lock` and holds it until `close`. A second opener — another
+process, or a second `Db` in this one — gets `error.Locked`. Opt out with
+`Options.lock = .none`.
+
+- **`flock`, not `fcntl(F_SETLK)`.** A POSIX record lock is released as soon
+  as the process closes *any* fd for that file, including one opened by
+  unrelated code elsewhere in the program — a library cannot defend against
+  that. `flock` is scoped to the open file *description*, so only closing
+  that handle (or dying) releases it.
+- **`fork`.** The child inherits a *share* of the same lock, not a second
+  one; both halves are one holder, so do not write from both. A child that
+  calls `Db.open` itself is correctly refused while the parent holds the
+  store.
+- **Crash cleanup is free.** The kernel drops the lock when the holder dies,
+  so there are no stale locks, no PID files and no timeout heuristics. A
+  `SIGKILL`ed writer's store is immediately openable — there is a test that
+  kills a real forked child to prove it.
+- **Non-blocking on purpose.** `open` returns `error.Locked` rather than
+  parking your thread inside a library call for an unbounded time; waiting
+  or retrying is the caller's policy.
+- **A sidecar, not the data file.** `compact()` swaps the data file by
+  `rename(2)`; a lock on that file would end up stranded on an unlinked
+  inode while the store's *name* pointed at a fresh, unlocked one. The
+  sidecar's inode is stable, and it is never deleted (unlink+recreate would
+  hand two processes locks on two different inodes of one name).
+- **Not promised:** anything on NFS/SMB/9p/FUSE. Linux emulates `flock` over
+  POSIX locks on NFS (re-introducing the close footgun), and several mount
+  configurations make it node-local, i.e. silently no protection against a
+  writer on another host. This module promises cross-process exclusion on
+  **local POSIX filesystems**; nothing at this layer can detect the
+  degradation. Advisory also means a process that never calls `Db.open` is
+  not stopped by any of it. A backend that cannot lock at all reports
+  `error.LockUnsupported` — it is never downgraded to "no lock" silently.
 
 ## The Storage seam + mini-VOPR (the differentiator)
 
 Every storage side effect — `open`, `writeAll`, `sync`, `truncate`,
-`rename`, `delete`, `syncDir` — goes through the injectable `Storage`
-vtable. Production uses `FsStorage`; tests use `SimStorage` (`sim.zig`), a
-deterministic in-memory model of what an OS actually guarantees: file
-content is volatile until `sync`, the *namespace* (create/rename/delete) is
-volatile until `syncDir`, and a crash collapses the world under one of three
-models (`lose_unsynced` / `keep_unsynced` / `torn_tail`).
+`rename`, `delete`, `syncDir`, `tryLockExclusive` — goes through the
+injectable `Storage` vtable. Production uses `FsStorage`; tests use
+`SimStorage` (`sim.zig`), a deterministic in-memory model of what an OS
+actually guarantees: file content is volatile until `sync`, the *namespace*
+(create/rename/delete) is volatile until `syncDir`, a lock belongs to an
+open file description and dies with it, and a crash collapses the world
+under one of three models (`lose_unsynced` / `keep_unsynced` / `torn_tail`).
+
+Locking is modeled, not just implemented: `SimStorage` reproduces the three
+states that matter — acquired, contended (`holdForeignLock` stands in for
+another *process*, so it survives our crash while our own locks do not) and
+unavailable (`lock_unsupported`) — and the acquisition is itself an
+injection point, so the sweep crashes on it like any other side effect.
 
 The sweep (`fault_test.zig`) drives a scripted workload (puts, overwrites,
 deletes, two compactions, edge keys) once per **(injection point × crash
-mode)** — 55 injection points × 3 modes = 165 deterministic crash scenarios
+mode)** — 57 injection points × 3 modes = 171 deterministic crash scenarios
 — and asserts after each reboot+reopen: no acknowledged write lost, the
 recovered state exactly equals the model with the in-flight op either
 atomically applied or absent (never a mix, never torn data), compaction
@@ -144,8 +188,9 @@ extras sit on top of it:
 Full randomized VOPR at scale; immutable/MVCC on-disk structure
 (HAMT/B-tree) with lockless readers; ordered/ranged scans; transactions and
 batches; secondary indexes; automatic compaction thresholds; in-memory value
-cache (compose with `ramcache`); cross-process lock file. The v0 keydir is
-an unordered hash map.
+cache (compose with `ramcache`); shared/reader locks (the store is
+single-writer, so the cross-process lock is exclusive-only). The v0 keydir
+is an unordered hash map.
 
 Tests: `zig build test-kv` (unit + sim-semantics + the fixed
 sweep + the randomized VOPR + the scheduler/shrink extras above;
