@@ -91,8 +91,10 @@ so the security properties below are in effect, not aspirational.
    advertised window *and* by the caller's `max_output`/`max_input`. The Binary Packet Protocol
    caps `packet_length` at `messages.max_wire_string_len` (1 MiB).
 5. **Not covered / caller's job.** Constant-time password comparison and rate limiting belong in
-   the `PasswordCheck` callback. The `password` method sends the secret inside an encrypted packet
-   and this module scrubs its own request buffer, but it cannot scrub `writePacket`'s internal
+   the `PasswordCheck` callback. The `password` method sends the secret inside an encrypted packet;
+   both roles scrub the heap buffer that holds the plaintext (the client its request buffer, the
+   server `serveUserauth`'s packet scratch — see "Known limits" below for why that scrub is load-
+   bearing only in unsafe optimize modes), but neither can scrub `writePacket`'s internal
    stack buffer — a stack-secret-residue concern shared with every other message. OAEP/
    Bleichenbacher-style timing leaks are the `rsa` module's concern. Rekeying (RFC 4253 §9) is not
    implemented, so a very long-lived or very high-volume connection is out of policy.
@@ -100,6 +102,32 @@ so the security properties below are in effect, not aspirational.
    never spawns a process, so all sandboxing/privilege questions are the caller's.
 6. **Permanently out of scope:** TLS-anything (SSH doesn't use TLS), compression (`none` only), and
    any transport concern below the `std.Io.Reader`/`Writer` seam.
+
+### Known limits of the userauth path (audited, deliberately not "fixed" here)
+
+- **`AuthConfig.max_attempts` is a credential budget, not a time or packet budget.** Only a
+  *rejected credential* consumes it. SSH_MSG_IGNORE, SSH_MSG_DEBUG and the RFC 4252 §7
+  signature-less `publickey` *query* (answered SSH_MSG_USERAUTH_PK_OK — by definition not an
+  attempt) all loop `serveUserauth` without spending budget, so an unauthenticated peer can hold
+  the pre-auth state machine open for as long as it keeps sending bytes. There is deliberately no
+  OpenSSH-style `LoginGraceTime`: this module never owns the socket (see the transport-agnostic
+  invariant above), so a read deadline can only be imposed by the caller that created the
+  `std.Io.Reader`/`Writer`. **A server exposed to the internet must set one.**
+- **The §7 query phase is a public-key-authorization oracle, by RFC design.** PK_OK-versus-FAILURE
+  tells an unauthenticated peer whether a given public key blob is authorized for a given user
+  name; OpenSSH answers the same question the same way. Relatedly, a *signed* request naming an
+  unauthorized key is rejected by `AuthorizedKeyCheck` **before** any signature verification runs,
+  so the two cases are also distinguishable by timing. Both leak strictly less than the protocol
+  already grants, and closing either would mean diverging from RFC 4252 — so neither is treated as
+  a defect. What is *not* leaked: every rejection is the same SSH_MSG_USERAUTH_FAILURE, with the
+  same continuation name-list and `partial success = false`, whatever the reason (unknown user,
+  unknown method, unusable algorithm, blob-type mismatch, unauthorized key, bad signature).
+- **The plaintext-password scrub is only observable in unsafe optimize modes.**
+  `serveUserauth` `secureZero`s its packet scratch before freeing it, because the §8 password
+  arrives in that buffer. In Debug/ReleaseSafe `std.mem.Allocator.free` already poisons the block
+  with `undefined` (0xaa) and hides any omission; in ReleaseFast/ReleaseSmall that memset is
+  elided and the scrub is the only thing standing between a successful login and the password
+  persisting verbatim in freed heap. The regression test says so in its own comment.
 
 ## Verification
 
@@ -115,8 +143,9 @@ environment with OpenSSH installed.
   `ssh-keygen`'s `.pub`), ecdsa signature wire shape, error paths.
 - **Userauth units:** `signedBlob` field-order/framing assertion, session-id-changes-the-message,
   the algorithm↔key-blob-type pairing table, an ed25519 signature that verifies under its own
-  session id and fails under another, the borrow-not-copy `sessionId` regression, and two crafted-
-  wire server tests (oversize peer string, oversize packet length → typed errors).
+  session id and fails under another, the borrow-not-copy `sessionId` regression, two crafted-
+  wire server tests (oversize peer string, oversize packet length → typed errors), and the
+  freed-scratch password-scrub regression (see Known limits for the mode caveat).
 - **Loopback self-interop (headline, `connection.zig`)** — our client ↔ our server over a real
   loopback TCP socket, full stack each time: transport KEX → `publickey` userauth → session-channel
   open → `exec` → stdout/stderr/`exit-status` → close. Cases: two-phase publickey, direct-signature

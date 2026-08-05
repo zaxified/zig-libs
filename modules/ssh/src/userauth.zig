@@ -349,10 +349,20 @@ fn awaitAuthReply(t: *transport.Transport, scratch: []u8) UserauthError!AuthRepl
 
 // ── server side ────────────────────────────────────────────────────────────
 
-/// Server policy hook: is `key_blob` (wire format, `algorithm`-typed) an
-/// authorized key for `user`? The equivalent of one line of an
-/// `authorized_keys` file. Storage/parsing of that file is deliberately the
-/// caller's concern — this module never touches the filesystem.
+/// Server policy hook: is `key_blob` an authorized key for `user`? The
+/// equivalent of one line of an `authorized_keys` file. Storage/parsing of
+/// that file is deliberately the caller's concern — this module never touches
+/// the filesystem.
+///
+/// `algorithm` is the *signature* algorithm name from the request, which is
+/// NOT always the key blob's own type name: RFC 8332 §3 pairs both
+/// `rsa-sha2-256` and `rsa-sha2-512` with an `ssh-rsa`-typed blob (that
+/// pairing is enforced by `keyBlobTypeFor` before this hook is called). A
+/// callback that compares an `authorized_keys` line should compare
+/// `key_blob` — the full wire blob, type prefix included, exactly what
+/// `AuthKey.publicBlob` produces and what the base64 field of an
+/// `authorized_keys` line decodes to — and treat `algorithm` as policy input
+/// only (e.g. to refuse a weaker hash).
 ///
 /// Called for BOTH phases of the §7 flow: once for the signature-less query
 /// (deciding whether to answer SSH_MSG_USERAUTH_PK_OK) and again before
@@ -374,8 +384,18 @@ pub const AuthConfig = struct {
     /// Optional SSH_MSG_USERAUTH_BANNER (§5.4) sent once, before the first
     /// verdict.
     banner: ?[]const u8 = null,
-    /// Failed attempts tolerated before giving up with
-    /// `error.AuthenticationFailed` (a peer-controlled loop otherwise).
+    /// Rejected *credentials* tolerated before giving up with
+    /// `error.AuthenticationFailed`.
+    ///
+    /// This is a credential budget, not a time or packet budget: messages
+    /// that produce no verdict — SSH_MSG_IGNORE, SSH_MSG_DEBUG, and the
+    /// RFC 4252 §7 signature-less `publickey` *query* (which is answered
+    /// SSH_MSG_USERAUTH_PK_OK and is by definition not an attempt) — do not
+    /// consume it, so an unauthenticated peer can keep `serveUserauth`
+    /// looping for as long as it keeps sending. There is no OpenSSH-style
+    /// `LoginGraceTime` here and there cannot be: this module never owns the
+    /// socket (see SPEC.md → Threat model), so the read deadline belongs to
+    /// the caller that does.
     max_attempts: u32 = 20,
 };
 
@@ -414,7 +434,16 @@ pub fn serveUserauth(
 ) UserauthError!AuthResult {
     const sid = try sessionId(t);
     const scratch = try gpa.alloc(u8, scratch_len);
-    defer gpa.free(scratch);
+    // The §8 `password` method delivers the peer's plaintext secret straight
+    // into this buffer, so the server half owes the same scrub the client
+    // half (`authenticatePassword`) already does for its request buffer —
+    // otherwise a successful login leaves the password sitting in freed heap
+    // for whatever allocates next. Unconditional: the failure and error
+    // paths carry the same plaintext.
+    defer {
+        std.crypto.secureZero(u8, scratch);
+        gpa.free(scratch);
+    }
 
     var banner_sent = false;
     var attempts: u32 = 0;
@@ -723,6 +752,65 @@ test "serveUserauth: an oversize packet length is rejected by the framing layer"
             }
         }.f,
     }));
+}
+
+test "serveUserauth: a received plaintext password does not survive in the freed packet scratch" {
+    const t = std.testing;
+
+    // A well-formed RFC 4252 §8 `password` request the callback accepts.
+    const secret = "s3cr3t-correct-horse-battery";
+    var pbuf: [256]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try messages.writeString(&pw, "alice");
+    try messages.writeString(&pw, connection_service);
+    try messages.writeString(&pw, "password");
+    try pw.writeByte(0); // FALSE: not a password *change* request
+    try messages.writeString(&pw, secret);
+
+    var wire: [512]u8 = undefined;
+    const framed = try framePackets(&wire, &.{pw.buffered()});
+
+    // Back `serveUserauth`'s allocations with a buffer this test still owns
+    // after they are freed, so the freed bytes can be inspected directly.
+    // `recvPacket` decodes the request INTO that scratch, so without the
+    // scrub the plaintext password is still lying there, verbatim, for
+    // whatever allocates the block next.
+    //
+    // WHERE THIS TEST HAS TEETH: `std.mem.Allocator.free` does
+    // `@memset(bytes, undefined)` before calling the vtable, which in
+    // Debug/ReleaseSafe writes 0xaa over the block and hides the leak from
+    // any in-process observer. That memset is a no-op in ReleaseFast/
+    // ReleaseSmall — exactly the modes a server actually ships in — and
+    // there this test fails without the `secureZero` in `serveUserauth`
+    // (verified: the password was found at offset 46 of the freed block).
+    // The assertion is unconditional because the property must hold in every
+    // mode; only its discriminating power is mode-dependent.
+    const backing = try t.allocator.alloc(u8, 256 * 1024);
+    defer t.allocator.free(backing);
+    @memset(backing, 0);
+    var fba = std.heap.FixedBufferAllocator.init(backing);
+
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [512]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+    tr.session_id = transport.SessionId.from("session");
+
+    const res = try serveUserauth(&tr, fba.allocator(), .{
+        .password = struct {
+            fn f(u: []const u8, p: []const u8) bool {
+                return std.mem.eql(u8, u, "alice") and
+                    std.mem.eql(u8, p, "s3cr3t-correct-horse-battery");
+            }
+        }.f,
+    });
+    // Positive control: the exchange really happened (an authentication that
+    // never ran would trivially leave no password behind).
+    try t.expectEqualStrings("alice", res.user());
+    try t.expectEqual(AuthMethod.password, res.method);
+
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, backing, secret));
 }
 
 test "an ed25519 userauth signature verifies only against its own session id" {
