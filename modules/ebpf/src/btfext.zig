@@ -1355,7 +1355,7 @@ test "CO-RE: relocate a real clang object against /sys/kernel/btf/vmlinux" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelAvailable()) {
         if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf CO-RE kernel test — no /sys/kernel/btf/vmlinux.\n", .{});
-        return;
+        return error.SkipZigTest;
     }
     const gpa = testing.allocator;
 
@@ -1377,7 +1377,7 @@ test "CO-RE: relocate a real clang object against /sys/kernel/btf/vmlinux" {
     //  NUMBER is not asserted; it changes with every kernel build.)
     const task_k = kernel.findByNameKind("task_struct", .@"struct") orelse {
         if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf CO-RE — this kernel's BTF has no task_struct.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     const task_size = try kernel.sizeOf(task_k);
     {
@@ -1482,7 +1482,7 @@ test "fieldByName resolves against the running kernel" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelAvailable()) {
         if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf fieldByName kernel test — no kernel BTF.\n", .{});
-        return;
+        return error.SkipZigTest;
     }
     const gpa = testing.allocator;
     var k = try btf.loadKernel(gpa);

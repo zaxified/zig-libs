@@ -94,3 +94,40 @@ test "load: an unsafe program (no r0 set before exit) is rejected by the verifie
         else => return e,
     }
 }
+
+test "loadWithLog: a rejected program's verifier log is actually captured, not just EINVAL" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!hasBpfCapability()) return error.SkipZigTest;
+
+    // Same rejection shape as the test above (`load`), but through the log-
+    // capturing path: a bare `error.UnsafeProgram` says the verifier said no,
+    // not WHY. `loadWithLog` exists specifically so a caller iterating on a
+    // `programs.zig` builder can read the verifier's own explanation (see
+    // ../SPEC.md's "golden vectors" section) -- this test is the only thing
+    // in the module that confirms the kernel actually WRITES into `log_buf`
+    // on rejection, rather than the buffer sitting there always empty and
+    // `loadWithLog` silently degrading to plain `load`'s worth of signal.
+    const insns = [_]Insn{
+        Insn.exit(), // r0 never initialized
+    };
+    const prog: Program = .{ .prog_type = .socket_filter, .insns = &insns };
+
+    var log_buf: [4096]u8 = undefined;
+    if (loadWithLog(prog, "MIT", &log_buf, 0)) |fd| {
+        _ = linux.close(fd);
+        return error.TestUnexpectedResult; // the verifier must NOT accept this
+    } else |e| switch (e) {
+        error.UnsafeProgram => {
+            const msg = std.mem.sliceTo(&log_buf, 0);
+            if (msg.len == 0) {
+                std.debug.print(
+                    "\nLIVE ebpf load test: verifier rejected the program but log_buf stayed empty -- loadWithLog is not actually capturing anything.\n",
+                    .{},
+                );
+                return error.TestUnexpectedResult;
+            }
+        },
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    }
+}

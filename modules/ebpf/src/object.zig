@@ -2127,7 +2127,7 @@ test "CO-RE: relocate a real object against /sys/kernel/btf/vmlinux" {
     // 0444 — so this one really runs on an unprivileged box.
     var vmlinux = btf_mod.loadKernel(gpa) catch {
         if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.object CO-RE-vs-vmlinux — no /sys/kernel/btf/vmlinux.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     defer vmlinux.deinit();
 
@@ -2138,7 +2138,7 @@ test "CO-RE: relocate a real object against /sys/kernel/btf/vmlinux" {
 
     const n = applyCoreRelos(p, local, &vmlinux) catch |e| {
         if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.object CO-RE-vs-vmlinux — {s}.\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     try testing.expectEqual(p.core_relos.len, n);
 
@@ -2415,7 +2415,7 @@ test "LIVE: create maps and load an XDP object end to end" {
             "\nSKIPPED: LIVE ebpf.object XDP load — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
     var obj = try open(gpa, fx_xdp_pass, .{});
     defer obj.deinit();
@@ -2425,7 +2425,7 @@ test "LIVE: create maps and load an XDP object end to end" {
             "\nSKIPPED: LIVE ebpf.object XDP load refused ({s}): {s}\n",
             .{ @errorName(e), obj.verifier_log },
         );
-        return;
+        return error.SkipZigTest;
     };
     try testing.expect(obj.programFd("xdp_accept") != null);
     try testing.expect(obj.programFd("xdp_reject") != null);
@@ -2440,7 +2440,7 @@ test "LIVE: a BTF-defined hash map is created and its fd relocated in" {
             "\nSKIPPED: LIVE ebpf.object map+kprobe load — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
     var obj = try open(gpa, fx_kprobe_hash, .{});
     defer obj.deinit();
@@ -2450,7 +2450,7 @@ test "LIVE: a BTF-defined hash map is created and its fd relocated in" {
             "\nSKIPPED: LIVE ebpf.object map+kprobe load refused ({s}): {s}\n",
             .{ @errorName(e), obj.verifier_log },
         );
-        return;
+        return error.SkipZigTest;
     };
     const map_fd = obj.mapFd("counts").?;
     try testing.expect(map_fd >= 0);
@@ -2468,7 +2468,7 @@ test "LIVE: .rodata is created, seeded and frozen" {
             "\nSKIPPED: LIVE ebpf.object .rodata load — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
     var obj = try open(gpa, fx_rodata_const, .{});
     defer obj.deinit();
@@ -2478,7 +2478,7 @@ test "LIVE: .rodata is created, seeded and frozen" {
             "\nSKIPPED: LIVE ebpf.object .rodata load refused ({s}): {s}\n",
             .{ @errorName(e), obj.verifier_log },
         );
-        return;
+        return error.SkipZigTest;
     };
     const fd = obj.mapFd(".rodata").?;
     var value: [16]u8 = undefined;

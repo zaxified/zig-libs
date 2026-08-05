@@ -754,7 +754,7 @@ test "resolveAttachId against real kernel BTF" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelBtfAvailable()) {
         if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.tracing resolve test — no /sys/kernel/btf/vmlinux.\n", .{});
-        return;
+        return error.SkipZigTest;
     }
     const gpa = testing.allocator;
     var k = try btf.loadKernel(gpa);
@@ -825,19 +825,19 @@ test "LIVE: load and attach an fentry program by name" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelBtfAvailable()) {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.tracing fentry — no kernel BTF.\n", .{});
-        return;
+        return error.SkipZigTest;
     }
     if (!hasBpfCapability()) {
         if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.tracing fentry attach — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
     const gpa = testing.allocator;
     var k = btf.loadKernel(gpa) catch {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.tracing fentry — kernel BTF unparseable.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     defer k.deinit();
 
@@ -847,7 +847,7 @@ test "LIVE: load and attach an fentry program by name" {
         if (resolveAttachId(&k, .fentry, n)) |_| break n else |_| {}
     } else {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.tracing fentry — no candidate function in this kernel's BTF.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
 
     const insns = [_]Insn{ Insn.mov(.r0, 0), Insn.exit() };
@@ -860,7 +860,7 @@ test "LIVE: load and attach an fentry program by name" {
             "\nSKIPPED: LIVE ebpf.tracing fentry BPF_PROG_LOAD refused ({s}): {s}\n",
             .{ @errorName(e), std.mem.sliceTo(&log, 0) },
         );
-        return;
+        return error.SkipZigTest;
     };
     defer loaded.close();
     try testing.expect(loaded.fd >= 0);
@@ -868,7 +868,7 @@ test "LIVE: load and attach an fentry program by name" {
 
     var out = attachFentryOpts(gpa, loaded.fd, target, .{ .btf = &k }) catch |e| {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.tracing fentry BPF_LINK_CREATE refused ({s}).\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     defer out.detach();
     try testing.expect(out.link.fd >= 0);
@@ -889,7 +889,7 @@ test "LIVE: a tp_btf program attaches through the same path" {
             "\nSKIPPED: LIVE ebpf.tracing tp_btf — needs CAP_BPF and kernel BTF (uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
     const gpa = testing.allocator;
     var k = try btf.loadKernel(gpa);
@@ -899,7 +899,7 @@ test "LIVE: a tp_btf program attaches through the same path" {
         if (resolveAttachId(&k, .tp_btf, n)) |_| break n else |_| {}
     } else {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.tracing tp_btf — no btf_trace_* typedef found.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
 
     const insns = [_]Insn{ Insn.mov(.r0, 0), Insn.exit() };
@@ -912,13 +912,13 @@ test "LIVE: a tp_btf program attaches through the same path" {
             "\nSKIPPED: LIVE ebpf.tracing tp_btf BPF_PROG_LOAD refused ({s}): {s}\n",
             .{ @errorName(e), std.mem.sliceTo(&log, 0) },
         );
-        return;
+        return error.SkipZigTest;
     };
     defer loaded.close();
 
     var out = attachTpBtfOpts(gpa, loaded.fd, tp, .{ .btf = &k }) catch |e| {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.tracing tp_btf BPF_LINK_CREATE refused ({s}).\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     defer out.detach();
     try testing.expect(out.link.fd >= 0);

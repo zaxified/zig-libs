@@ -1998,7 +1998,7 @@ test "real kernel BTF: /sys/kernel/btf/vmlinux parses and resolves" {
             "\nSKIPPED: ebpf.btf kernel test — {s} not readable (CONFIG_DEBUG_INFO_BTF=n?).\n",
             .{sysfs_vmlinux},
         );
-        return;
+        return error.SkipZigTest;
     }
     const gpa = testing.allocator;
     var k = try loadKernel(gpa);
@@ -2020,7 +2020,7 @@ test "real kernel BTF: /sys/kernel/btf/vmlinux parses and resolves" {
     // `struct task_struct` and a few members every kernel since ~2.6 has.
     const task = k.findByNameKind("task_struct", .@"struct") orelse {
         if (verboseSkip()) std.debug.print("\nSKIPPED: no `struct task_struct` in this kernel's BTF.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     {
         const t = try k.byId(task);
@@ -2135,7 +2135,7 @@ test "real kernel BTF: a module's split BTF resolves only with vmlinux as its ba
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelBtfAvailable()) {
         if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.btf module-BTF test — no kernel BTF.\n", .{});
-        return;
+        return error.SkipZigTest;
     }
     const gpa = testing.allocator;
     var k = try loadKernel(gpa);
@@ -2184,7 +2184,7 @@ test "real kernel BTF: a module's split BTF resolves only with vmlinux as its ba
 
         // Informational, not a failure — same stderr rule as the skip reasons.
         if (verboseSkip()) std.debug.print("\nebpf.btf: verified split BTF against module `{s}` ({d} types, ids from {d}).\n", .{ name, m.typeCount(), m.start_id });
-        return;
+        return error.SkipZigTest;
     }
     if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.btf module-BTF test — none of the candidate modules has BTF here.\n", .{});
 }
@@ -2227,13 +2227,13 @@ test "LIVE: BPF_BTF_LOAD accepts a blob this module built" {
             "\nSKIPPED: LIVE ebpf.btf BPF_BTF_LOAD — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
 
     var log: [4096]u8 = undefined;
     const fd = loadIntoKernel(blob, &log) catch |e| {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.btf BPF_BTF_LOAD refused ({s}): {s}\n", .{ @errorName(e), std.mem.sliceTo(&log, 0) });
-        return;
+        return error.SkipZigTest;
     };
     defer _ = linux.close(fd);
     try testing.expect(fd >= 0);

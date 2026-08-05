@@ -1266,19 +1266,19 @@ test "real library: resolved offsets agree with an independent derivation" {
         }
     } else {
         if (verboseSkip()) std.debug.print("\nebpf elfsym real-library test SKIPPED: no libc.so.6 found.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
 
     const sym = resolveFunc(gpa, path, "malloc") catch |e| {
         if (verboseSkip()) std.debug.print("\nebpf elfsym real-library test SKIPPED: malloc unresolvable ({s}).\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     try testing.expect(sym.vaddr != 0);
     try testing.expect(sym.kind == .func or sym.kind == .ifunc);
 
     const oracle = (try fileOffsetViaSections(gpa, path, sym.vaddr)) orelse {
         if (verboseSkip()) std.debug.print("\nebpf elfsym cross-check SKIPPED: no section covers malloc's vaddr.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     try testing.expectEqual(oracle, sym.file_offset);
 

@@ -798,15 +798,52 @@ something real:
    program loaded with a resolved `attach_btf_id` and attached by name**
    (asserting the link reports `LinkType.tracing` and that the id the attach
    resolved equals the one the load used), and the same for a **`tp_btf`**
-   program. Each prints a
-   `SKIPPED:` line and **passes** when the capability is missing, mirroring
-   the `opcua` module's podman-gated live tests — a sandboxed run can never
-   be mistaken for "verified", but it also never fails for lack of
-   privilege. Note that `unshare -r` is NOT sufficient: `geteuid() == 0`
+   program. Each prints a `SKIPPED:` line (when `ZIG_LIBS_VERBOSE_SKIP` is
+   set — see `testkit`) and returns `error.SkipZigTest` when the capability
+   is missing, mirroring the `opcua` module's podman-gated live tests — a
+   sandboxed run can never be mistaken for "verified", but it also never
+   fails for lack of privilege. **This is load-bearing, not cosmetic**: an
+   audit of this module (2026-08-05) found every one of these guards
+   written as `catch { print SKIPPED; return; }` — a bare `return`, which
+   reports as a PASS in `zig build test`'s summary, not a skip. On a normal
+   host that meant the entire privileged surface (kprobe/uprobe/tracepoint/
+   raw-tracepoint/cgroup attach, BTF load, fentry/tp_btf) could silently
+   never execute a single kernel syscall while `zig build test-ebpf`
+   reported all-green — exactly the "skip that looks like coverage"
+   failure mode this repo has been burned by before. Fixed to
+   `catch { return testkit.skip(...); }` (or the equivalent explicit
+   `return error.SkipZigTest;`) throughout: **on this dev host (no
+   CAP_BPF), `scripts/capped zig build test-ebpf` now reports "N skipped"
+   in the summary line** — currently 21 of 149 — instead of hiding them
+   inside the pass count. See "How to tell whether the privileged lane
+   actually ran" below for the authoritative way to confirm real kernel
+   execution. Note that `unshare -r` is NOT sufficient: `geteuid() == 0`
    inside a user namespace is not `CAP_BPF` in the init user namespace, so
-   `bpf()` still fails; the live tests fall through their inner
-   `catch { print SKIPPED; return; }` guards in that case rather than
-   failing.
+   `bpf()` still fails and these tests skip the same way they do
+   unprivileged.
+
+### How to tell whether the privileged lane actually ran
+
+`zig build test-ebpf` (or `scripts/vm/run.sh ebpf debian`) prints a summary
+line ending in `N passed; M skipped; K failed` (the VM lane) or
+`X/Y tests passed (M skipped)` (the plain build summary). **M is the
+number that matters** — every CAP_BPF/CAP_PERFMON-gated test in this
+module now returns `error.SkipZigTest` rather than a silent pass when it
+cannot reach the kernel, so M > 0 on an ordinary dev host is expected and
+correct, not a problem to chase away. Set `ZIG_LIBS_VERBOSE_SKIP=1` to get
+a `SKIPPED: ...` line naming exactly which precondition was missing for
+each one (`testkit.verboseSkip`/`testkit.skip`).
+
+The only environment that runs this module's privileged surface for real
+is `scripts/vm/run.sh ebpf` (`scripts/vm/README.md`'s routing table routes
+`ebpf` to the Debian guest, which boots as real root with a real kernel —
+verified end-to-end 2026-08-05: 147/149 passed, 2 skipped for genuine
+environmental reasons unrelated to privilege — no BTF kernel module
+loadable for the split-BTF test, and the perfbuf CPU-array test's own
+gate — 0 failed). A bare `zig build test-ebpf` on a normal workstation
+will never exercise `BPF_PROG_LOAD`'s real verifier accept/reject path;
+only the VM lane does, and only its own run's `M skipped` count (not the
+workstation's) is evidence the verifier ran.
 
 Privileges required, per operation: `CAP_BPF` (or root) for map creation,
 program load, `BPF_BTF_LOAD` and cgroup attach; additionally

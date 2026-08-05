@@ -23,12 +23,18 @@ the XDP attach path. Two ways in: hand-built programs for a fixed, named set
   root) at minimum; the kprobe/uprobe/tracepoint attaches additionally need
   `CAP_PERFMON`/`CAP_SYS_ADMIN`, and `attachXdp` needs `CAP_NET_ADMIN`.
   Nothing that touches the kernel works unprivileged — every gated test
-  either skips (`error.SkipZigTest`) or prints a `SKIPPED:` line and passes,
-  never fails, without it. (`unshare -r` does **not** help: `geteuid() == 0`
-  in a user namespace is not `CAP_BPF` in the init user namespace.) The pure
+  returns `error.SkipZigTest` (visible as `M skipped` in `zig build`'s
+  summary; set `ZIG_LIBS_VERBOSE_SKIP=1` for a `SKIPPED: ...` line naming
+  what was missing) rather than passing without doing anything, so a green
+  `zig build test-ebpf` on an unprivileged box never masquerades as kernel
+  coverage. (`unshare -r` does **not** help: `geteuid() == 0` in a user
+  namespace is not `CAP_BPF` in the init user namespace.) The pure
   encoding/parsing layers — program builders, the netlink message builder,
   the ELF symbol reader, and both consumers' record walks — are fully tested
-  with no privilege at all.
+  with no privilege at all. The privileged surface, including the real
+  in-kernel verifier's accept/reject decision on `BPF_PROG_LOAD`, only runs
+  for real under `scripts/vm/run.sh ebpf` — see `SPEC.md`'s "How to tell
+  whether the privileged lane actually ran".
 
 Provenance: clean-room from the kernel UAPI headers (`linux/bpf.h`,
 `linux/btf.h`, `linux/perf_event.h`, `linux/if_link.h`) — only the
@@ -508,8 +514,9 @@ if this module ever needs to generate large or many programs.
   the table.
 - **Attach/consume validation is layered by privilege** — struct/byte-layout
   tests and a hand-built fake ring run everywhere; real attach and real
-  `mmap`+consume tests print `SKIPPED:` and pass when `CAP_BPF` is absent,
-  so a sandbox run is never mistaken for a verified one.
+  `mmap`+consume tests return `error.SkipZigTest` (counted as skipped, not
+  passed) when `CAP_BPF` is absent, so a sandbox run is never mistaken for
+  a verified one.
 - **A fallback is never silent.** Where both a `BPF_LINK_CREATE` and a
   legacy path exist, the entry point returns which one it used
   (`AttachPath`) and accepts a `LinkPreference` that can force either — a

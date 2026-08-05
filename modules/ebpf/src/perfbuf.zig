@@ -1196,7 +1196,7 @@ test "onlineCpus reports at least one CPU on this machine" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const cpus = onlineCpus(testing.allocator) catch |e| {
         if (verboseSkip()) std.debug.print("\nebpf perfbuf onlineCpus SKIPPED: {s}\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     defer testing.allocator.free(cpus);
     try testing.expect(cpus.len >= 1);
@@ -1221,27 +1221,27 @@ test "LIVE: a real PERF_EVENT_ARRAY consumed end-to-end through a tracepoint" {
             "\nLIVE ebpf perfbuf test SKIPPED: needs CAP_BPF+CAP_PERFMON (running as uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
 
     const load = @import("load.zig").load;
 
     const cpus = onlineCpus(testing.allocator) catch {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: cannot enumerate CPUs.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     defer testing.allocator.free(cpus);
 
     // key = u32 cpu, value = u32 perf fd, one slot per CPU.
     const map_fd = BPF.map_create(.perf_event_array, 4, 4, @intCast(cpus.len)) catch {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: BPF_MAP_CREATE(.perf_event_array) refused.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     defer _ = linux.close(map_fd);
 
     var pb = PerfBuffer.open(testing.allocator, map_fd, .{ .pages = 8 }) catch |e| {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: PerfBuffer.open failed ({s}).\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     defer pb.close();
 
@@ -1282,13 +1282,13 @@ test "LIVE: a real PERF_EVENT_ARRAY consumed end-to-end through a tracepoint" {
     };
     const prog_fd = load(.{ .prog_type = .tracepoint, .insns = &insns }, "MIT") catch |e| {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: BPF_PROG_LOAD refused ({s}).\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     defer _ = linux.close(prog_fd);
 
     var tp = attach.attachTracepoint(testing.allocator, "syscalls", "sys_enter_write", prog_fd) catch |e| {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: tracepoint attach failed ({s}).\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     defer tp.deinit();
 

@@ -657,7 +657,7 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
             "\nLIVE ebpf bpflink test SKIPPED: needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
-        return;
+        return error.SkipZigTest;
     }
 
     var path_buf: [64]u8 = undefined;
@@ -666,7 +666,7 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
         .SUCCESS => {},
         else => {
             if (verboseSkip()) std.debug.print("\nLIVE ebpf bpflink test SKIPPED: cannot create {s} (cgroup v2 not mounted?).\n", .{dir});
-            return;
+            return error.SkipZigTest;
         },
     }
     defer _ = linux.rmdir(dir.ptr);
@@ -674,7 +674,7 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
     const dir_rc = linux.open(dir.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     if (linux.errno(dir_rc) != .SUCCESS) {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf bpflink test SKIPPED: cannot open the cgroup directory.\n", .{});
-        return;
+        return error.SkipZigTest;
     }
     const cgroup_fd: linux.fd_t = @intCast(dir_rc);
     defer _ = linux.close(cgroup_fd);
@@ -682,18 +682,18 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
     const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 1), BPF.Insn.exit() };
     const prog_a = BPF.prog_load(.cgroup_skb, &insns, null, "MIT", 0, 0) catch {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf bpflink test SKIPPED: cgroup_skb BPF_PROG_LOAD refused.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     defer _ = linux.close(prog_a);
     const prog_b = BPF.prog_load(.cgroup_skb, &insns, null, "MIT", 0, 0) catch {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf bpflink test SKIPPED: second BPF_PROG_LOAD refused.\n", .{});
-        return;
+        return error.SkipZigTest;
     };
     defer _ = linux.close(prog_b);
 
     var link = linkCreateCgroup(prog_a, cgroup_fd, .cgroup_inet_egress, 0) catch |e| {
         if (verboseSkip()) std.debug.print("\nLIVE ebpf bpflink test SKIPPED: BPF_LINK_CREATE failed ({s}).\n", .{@errorName(e)});
-        return;
+        return error.SkipZigTest;
     };
     defer link.detach();
     try testing.expect(link.fd >= 0);
