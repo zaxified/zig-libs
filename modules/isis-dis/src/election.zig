@@ -241,3 +241,141 @@ test "positive control: lowest-SNPA election disagrees with the correct one" {
     try testing.expectEqual(local.system_id, wrong.dis_system_id); // …:01
     try testing.expect(!std.mem.eql(u8, &correct.dis_system_id, &wrong.dis_system_id));
 }
+
+// ── FRR anchor: capture-and-freeze against a real IS-IS speaker ─────────────
+//
+// Every expectation above (like every isis-dis expectation before this section)
+// rests on our own reading of ISO/IEC 10589 §8.4.5 — hand-built candidate sets,
+// winners we believed the spec requires, tests and implementation sharing one
+// author's interpretation of one document. Unlike the wire-visible fields the
+// sibling `goldens.zig` already checked against Wireshark's dissector (lan_id,
+// priority, the pseudonode LSP-ID split), the election RESULT — which router
+// wins — has no bytes of its own on the wire for a dissector to grade. But it
+// is not unobservable: a real IS-IS speaker computes it internally and reports
+// it back, both in its own state (`show isis interface detail`, "is/is not
+// DIS") and, in a real deployment, on the wire (who starts emitting the
+// periodic CSNP). This section closes that gap the same way `isis-spf` closed
+// its SPF-result gap: `frr`'s own `isisd` (10.3), run inside this repo's
+// throwaway Debian VM lane (`scripts/vm/`, `frr` already in
+// `VM_DEBIAN_PACKAGES` since isis-spf's anchor), computing a real LAN DIS
+// election over inputs this task chose, read back and frozen.
+//
+// Licence note (same reasoning as `isis-spf`'s anchor, read before touching
+// this block): FRR is GPL-2.0-or-later; this repo is MIT. Nothing here is
+// copied from FRR's source, and nothing here is FRR's own test data. What is
+// frozen below is FRR's *election outcome* for a topology and priority/SNPA
+// assignment this task authored from scratch — GPLv2 §0 restricts the covered
+// *Program*, not a state value it reports about our own configuration. The run
+// was ONE-SHOT (twice, to get two independent input assignments): nothing
+// below boots a VM, invokes FRR, or touches the network — the values are
+// literals from here on.
+//
+// ── the topology (one LAN, 3 routers, one broadcast circuit, level-1) ──────
+//
+//   r1(0000.0000.0001) ─┐
+//   r2(0000.0000.0002) ─┼─ br0 (Linux bridge, one shared LAN segment)
+//   r3(0000.0000.0003) ─┘
+//
+// All three `isisd` instances ran as real LAN adjacencies (`isis network
+// broadcast`, the default for an Ethernet-type interface; `is-type level-1`;
+// `metric-style wide`) in their own network namespace (`ip netns`), each
+// with one veth leg plugged into a single Linux bridge (`br0`) in the host
+// namespace — a real, single, shared broadcast domain, not three separate
+// point-to-point links. Each namespace ran its own `zebra`/`isisd` pair,
+// isolated from the others via FRR's `-N <name>` pathspace flag (separate vty
+// sockets) *and* the network namespace (separate interfaces/L2 domain) —
+// `ip netns exec r1 /usr/lib/frr/isisd -N r1 -f /etc/frr/r1/isisd.conf -d`,
+// one per router. A `/24` IPv4 address per interface (not load-bearing for
+// LAN election itself, but kept for parity with the isis-spf lab and because
+// P2P adjacencies in that lab needed IPv4 to leave Down at all).
+//
+// `dpkg -l frr` / `isisd -v` (once, before configuring anything):
+//   frr  10.3-3+deb13u1  amd64
+//   isisd version 10.3
+//
+// ── run A: priorities {10, 64, 64} — decided by priority, confirms the tie ──
+//
+// Interface config (`isis priority <N>`), SNPA = the interface's own MAC
+// (`ip link set eth0 address <mac>`, set once before bringing the link up):
+//   r1: priority 10, SNPA 02:00:00:00:00:01
+//   r2: priority 64, SNPA 02:00:00:00:00:02
+//   r3: priority 64, SNPA 02:00:00:00:00:03
+//
+// `vtysh -N <r> -c "show isis interface detail"` on each, after convergence
+// (~20s; the LAN Hello interval here is 3s, holddown 10 — several Hellos
+// exchanged), the exact "LAN Priority" / DIS lines:
+//   r1: "LAN Priority: 10, is not DIS"
+//   r2: "LAN Priority: 64, is not DIS"
+//   r3: "LAN Priority: 64, is DIS"
+// (`show isis neighbor` on r1 independently confirms both r2 and r3 reached
+// State Up with SNPA 0200.0000.0002 / 0200.0000.0003 — the adjacencies this
+// election ran over were real, not assumed.)
+//
+// r2 and r3 (priority 64) both outrank r1 (priority 10) — the priority rule.
+// Between r2 and r3, tied at 64, r3's SNPA (…03) is numerically higher than
+// r2's (…02) and r3 wins — the tie-break rule, exactly as SPEC.md §3 states
+// it and exactly what `elect` computes below.
+//
+// ── run B: same priorities, SNPAs swapped between r2 and r3 ────────────────
+//
+// A second, independent capture — not just a restatement of run A — chosen to
+// rule out the result tracking something incidental (hostname, hand-config
+// order, numerically-higher system-id) rather than the SNPA itself: keep every
+// system-id and priority as in run A, but reassign the physical MACs so the
+// PREVIOUS loser of the tie-break now holds the higher SNPA.
+//   r1: priority 10, SNPA 02:00:00:00:00:01 (unchanged)
+//   r2: priority 64, SNPA 02:00:00:00:00:09 (was …02 in run A)
+//   r3: priority 64, SNPA 02:00:00:00:00:05 (was …03 in run A)
+//
+// `vtysh -N <r> -c "show isis interface detail"` after convergence:
+//   r1: "LAN Priority: 10, is not DIS"
+//   r2: "LAN Priority: 64, is DIS"      -- flipped from run A
+//   r3: "LAN Priority: 64, is not DIS"  -- flipped from run A
+//
+// The winner tracked the SNPA reassignment exactly (r2 now has the higher
+// SNPA and is now DIS) with priority and system-ids held fixed — first try,
+// both runs, no adjustment made to `elect` to match.
+test "FRR anchor: LAN DIS election, priority + SNPA tie-break, two independent runs" {
+    // Run A: r2/r3 tied at priority 64, decided by SNPA (…03 > …02).
+    {
+        const r1: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 10, .snpa = snpa(0x01) };
+        const r2: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = snpa(0x02) };
+        const r3: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 3 }, .priority = 64, .snpa = snpa(0x03) };
+
+        // From r1's vantage point (its own Up-neighbour view: r2, r3): the
+        // elected DIS is r3 — matches FRR's r1 AND r3's own "is/is not DIS".
+        const from_r1 = elect(r1, &.{ r2, r3 });
+        try testing.expectEqual(r3.system_id, from_r1.dis_system_id);
+        try testing.expectEqual(r3.snpa, from_r1.dis_snpa);
+        try testing.expect(!from_r1.is_local_dis);
+
+        // From r3's own vantage point: it correctly sees itself as DIS.
+        const from_r3 = elect(r3, &.{ r1, r2 });
+        try testing.expect(from_r3.is_local_dis);
+        try testing.expectEqual(r3.system_id, from_r3.dis_system_id);
+
+        // From r2's own vantage point: it correctly sees itself as NOT DIS.
+        const from_r2 = elect(r2, &.{ r1, r3 });
+        try testing.expect(!from_r2.is_local_dis);
+        try testing.expectEqual(r3.system_id, from_r2.dis_system_id);
+    }
+
+    // Run B: same priorities/system-ids, SNPAs swapped between r2 and r3 —
+    // the winner must flip to r2.
+    {
+        const r1: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 10, .snpa = snpa(0x01) };
+        const r2: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = snpa(0x09) };
+        const r3: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 3 }, .priority = 64, .snpa = snpa(0x05) };
+
+        const from_r1 = elect(r1, &.{ r2, r3 });
+        try testing.expectEqual(r2.system_id, from_r1.dis_system_id);
+        try testing.expectEqual(r2.snpa, from_r1.dis_snpa);
+
+        const from_r2 = elect(r2, &.{ r1, r3 });
+        try testing.expect(from_r2.is_local_dis);
+
+        const from_r3 = elect(r3, &.{ r1, r2 });
+        try testing.expect(!from_r3.is_local_dis);
+        try testing.expectEqual(r2.system_id, from_r3.dis_system_id);
+    }
+}

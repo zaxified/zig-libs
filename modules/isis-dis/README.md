@@ -143,3 +143,39 @@ RED. Green in Debug and ReleaseFast; `zig fmt` clean.
 Provenance: clean-room from ISO/IEC 10589 §8.4.5; no third-party IS-IS
 implementation (frrouting, IOS, Junos) was ported or studied. See `/NOTICE`
 (no entry required — public spec). License: MIT.
+
+## Anchored (2026-08-05) — FRR, capture-and-freeze
+
+The wire-visible fields (`lan_id`, priority, the pseudonode LSP-ID split) were
+already checked against Wireshark's dissector (`goldens.zig`), but the
+election *result* — which router wins — has no bytes of its own on the wire
+for a dissector to grade. It is not unobservable, though: a real IS-IS speaker
+computes it and reports it back in its own state. This anchors that result the
+same way `isis-spf` anchored its SPF result: a real `isisd` (FRR 10.3) ran
+three LAN adjacencies over one shared broadcast segment (three network
+namespaces joined by veth to one Linux bridge, inside this repo's Debian VM
+lane, `frr` already in `VM_DEBIAN_PACKAGES`) with a chosen priority/SNPA
+assignment, and its own `show isis interface detail` "is/is not DIS" verdict
+was read back and frozen.
+
+Two independent runs, both first-try matches with our `elect()`: run A
+(priorities `{10, 64, 64}`) confirmed the priority rule (both 64s beat the 10)
+*and* the SNPA tie-break (the higher-SNPA 64 won); run B kept every priority
+and system-id fixed and swapped the SNPAs between the two priority-64 routers
+— the winner flipped to match, ruling out the result tracking something
+incidental (hostname, config order) rather than the SNPA itself. See
+`src/election.zig`, test `"FRR anchor: LAN DIS election, priority + SNPA
+tie-break, two independent runs"`, whose own comment quotes the exact
+topology, FRR's version, and the printed `vtysh` lines for both runs.
+
+This is a one-shot capture: the test asserts against literals and does not
+boot a VM, run FRR, or touch the network. Licence note: FRR is
+GPL-2.0-or-later and this repo is MIT; nothing here is FRR source or FRR's
+own test fixtures, and GPLv2 §0 restricts the covered Program, not a state
+value it reports about our own configuration — the same reasoning already
+applied to the `isis-spf` FRR anchor and the goaccess/Wireshark captures
+elsewhere in this repo. See the test's own comment for the full citation.
+
+What is still not FRR-anchored: the `SPEC.md` §6-deferred surface (pseudonode
+LSP *content*, LAN adjacency formation, multi-level DIS) is out of scope by
+design, not by gap.

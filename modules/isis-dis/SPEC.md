@@ -139,9 +139,13 @@ returns `change == null`.
 
 ## 7. Verification
 
-Per CONVENTIONS §7 this is **pure logic** → unit + property tests, no external
-oracle needed (the derived `lan_id` / LSP-ID are validated end-to-end against the
-sibling `isis` codec, which is itself golden-tested).
+Per CONVENTIONS §7 this is **pure logic** → unit + property tests; the derived
+`lan_id` / LSP-ID are validated end-to-end against the sibling `isis` codec
+(golden-tested), and — since 2026-08-05 — the election *result itself* is
+anchored against a real IS-IS speaker: see "FRR anchor" below. Wire-visible
+content (`lan_id`, priority, the Hello type codes) was separately checked
+against Wireshark's dissector (`goldens.zig`); that anchor cannot grade the
+election outcome, which has no wire form of its own.
 
 - **Priority election**: {10, 64, 64} → the higher-SNPA 64 wins (asserted exactly),
   and the highest-SNPA-but-lower-priority local still loses.
@@ -161,6 +165,10 @@ sibling `isis` codec, which is itself golden-tested).
   and `pseudonodeLspId()` through a real `isis` LSP (`lsp_id[6]` nonzero, `[7]`==0).
 - **Positive control** (permanent): a deliberately-wrong lowest-SNPA election
   disagrees with the correct one — a regression to lowest-wins is caught.
+- **FRR anchor** (permanent, `election.zig`): a real `isisd` 10.3 LAN election
+  (3 routers, one shared broadcast segment, in-VM), two independent
+  priority/SNPA assignments, `elect()`'s winner matches FRR's own "is/is not
+  DIS" verdict both times — first try, no adjustment made to match.
 
 Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
 green; the sibling `isis` test suite unaffected.
