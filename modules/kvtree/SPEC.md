@@ -71,7 +71,10 @@ Single 4 KiB page unit (`format.zig`):
 - **page 0, page 1** — the two META pages, double-buffered. A commit writes the
   meta slot it is *not* currently rooted at, then fsyncs, so a torn meta write
   never destroys the last good one.
-- **page 2…** — tree nodes and freelist pages, handed out by the `Pager`.
+- **page 2…** — tree nodes and freelist pages, handed out by the `Pager`. The
+  freelist is a page CHAIN — each freelist page carries a `next` pointer
+  (0 = end) alongside its entries, so a commit that frees more pages than one
+  page holds simply chains another instead of losing ids.
 
 A **node** is a slotted page: an 8-byte header (kind, count, and — for a branch
 — the leftmost child), a `count`-entry directory of 2-byte cell offsets kept in
@@ -190,8 +193,6 @@ library). Cross-*process* exclusion is not provided (one `Db` per store).
 
 - **Overflow pages** for keys/values larger than a page fits (today: rejected
   with `error.EntryTooLarge`), mirroring `kv`'s large-value handling.
-- **Freelist page chaining** when one freelist page fills (today: a single
-  bounded freelist page; the reuse-safety invariant is unchanged by chaining).
 - **Node merge / rebalance-by-borrow** on underflow (today: deletes remove the
   key in place — underflowed and empty leaves persist until overwritten, which
   wastes space but never corrupts; merging and borrowing from a fuller sibling

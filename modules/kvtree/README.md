@@ -24,9 +24,11 @@ that see a consistent snapshot without blocking the writer.
 > and a crash-point sweep over every storage side effect of a commit, across
 > all four `kv.SimStorage` crash modes. Remaining scaffold simplifications
 > (documented in `SPEC.md`'s backlog): no overflow pages for entries larger
-> than a page, a single bounded freelist page (overflow leaks ids — space,
-> never correctness), merge-less deletes (empty leaves persist until
-> overwritten). See `SPEC.md` for the A-vs-B design decision and the
+> than a page, merge-less deletes (empty leaves persist until overwritten).
+> The on-disk freelist is a page CHAIN (not a single bounded page) — freeing
+> more pages than one page holds chains another, so nothing is silently
+> leaked; chain-storage pages are drawn only from fresh growth, never the
+> reuse pool. See `SPEC.md` for the A-vs-B design decision and the
 > verification argument.
 
 Provenance: clean-room. Design references only — LMDB/BoltDB (COW B-tree +

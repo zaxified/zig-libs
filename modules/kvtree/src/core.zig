@@ -138,16 +138,14 @@ pub fn commit(
     const saved_high_water = pager.high_water;
     errdefer pager.high_water = saved_high_water;
 
-    // Load the base freelist (the old freelist page itself dies this commit).
-    var fl = Freelist{};
-    if (base.free_root != 0) {
-        var page: [page_size]u8 = undefined;
-        try readForCommit(pager, base.free_root, &page);
-        fl = Freelist.decode(arena, &page) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Corrupt => error.Storage,
-        };
-    }
+    // Load the base freelist chain (every page in it dies this commit — see
+    // below). May span more than one page; that is exactly what "chaining"
+    // means and is why there is no cap on how many pages may be parked.
+    const base_chain = pager_mod.readFreelistChain(arena, pager, base.free_root) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Storage,
+    };
+    var fl = base_chain.fl;
 
     var ctx = Ctx{
         .arena = arena,
@@ -171,25 +169,24 @@ pub fn commit(
     const new_root = pieces[0].id;
     const new_txn = base.txn_id + 1;
 
-    // The old freelist page is dead too (it was rebuilt above into `fl`).
-    if (base.free_root != 0)
-        ctx.freed.append(arena, base.free_root) catch return error.OutOfMemory;
+    // Every page in the old freelist chain is dead too (it was rebuilt above
+    // into `fl`) — chaining means this can be more than one page.
+    for (base_chain.pages.items) |pid|
+        ctx.freed.append(arena, pid) catch return error.OutOfMemory;
 
-    // Allocate the new freelist page BEFORE parking this commit's freed pages
-    // (see the doc comment: an in-flight commit must never recycle a page the
-    // still-durable base tree references).
-    const new_free_root = ctx.allocPage();
-    for (ctx.freed.items) |pid| {
-        // Scaffold bound: a single freelist page (chaining is a documented
-        // backlog item). Overflow LEAKS the excess ids — the file merely
-        // stays larger; never a correctness issue.
-        if (fl.len() >= Freelist.capacity) break;
+    // Record every page this commit made dead. No capacity cap: unlike a
+    // plain tree-node/freelist-storage allocation, `Freelist.writeChain`
+    // below draws its own storage pages from `pager.growOne` only — never
+    // `popReusable` — so it can never recycle a page the still-durable
+    // `base` meta still references before this commit's final fsync, and it
+    // is therefore always safe to do this push before writing the chain (see
+    // `Freelist`'s container doc comment). A batch of frees larger than one
+    // page's worth chains a second (third, ...) page instead of losing ids.
+    for (ctx.freed.items) |pid|
         fl.push(arena, pid, new_txn) catch return error.OutOfMemory;
-    }
 
     var buf: [page_size]u8 = undefined;
-    fl.encode(&buf);
-    pager.writePage(new_free_root, &buf) catch return error.CommitFailed;
+    const new_free_root = fl.writeChain(pager) catch return error.CommitFailed;
 
     // fsync #1: all referenced pages durable before any meta write.
     pager.sync() catch return error.CommitFailed;
@@ -465,22 +462,36 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
     }
 
     if (m.free_root == 0) return m.free_count == 0;
-    if (!pageIdOk(m.free_root, m.high_water)) return false;
-    pager.readPage(m.free_root, &buf) catch |e| switch (e) {
-        error.Corrupt => return false,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Storage,
-    };
-    const n = std.mem.readInt(u16, buf[0..2], .little);
-    if (n > Freelist.capacity) return false;
-    if (@as(u64, n) != m.free_count) return false;
-    var k: usize = 0;
-    while (k < n) : (k += 1) {
-        const off = 2 + k * Freelist.entry_bytes;
-        const id = std.mem.readInt(u32, buf[off .. off + 4][0..4], .little);
-        if (!pageIdOk(id, m.high_water)) return false;
+    // Walk the freelist CHAIN, trusting nothing: each hop's page id must be
+    // in-bounds, its declared count must fit one page, and a cycle (a hostile
+    // or torn `next` pointer looping back) must be rejected rather than hang
+    // — the exact dual of the tree walk above, over the freelist's own
+    // linked structure.
+    var fid = m.free_root;
+    var total: u64 = 0;
+    var fl_visited: u64 = 0;
+    while (fid != 0) {
+        fl_visited += 1;
+        if (fl_visited > m.high_water) return false; // cycle guard
+        if (!pageIdOk(fid, m.high_water)) return false;
+        pager.readPage(fid, &buf) catch |e| switch (e) {
+            error.Corrupt => return false,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Storage,
+        };
+        const n = std.mem.readInt(u16, buf[0..2], .little);
+        if (n > Freelist.capacity) return false;
+        const next = std.mem.readInt(u32, buf[2..6], .little);
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const off = Freelist.hdr_bytes + k * Freelist.entry_bytes;
+            const id = std.mem.readInt(u32, buf[off .. off + 4][0..4], .little);
+            if (!pageIdOk(id, m.high_water)) return false;
+        }
+        total += n;
+        fid = next;
     }
-    return true;
+    return total == m.free_count;
 }
 
 fn pageIdOk(id: PageId, high_water: u64) bool {

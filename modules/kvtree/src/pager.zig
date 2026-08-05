@@ -84,9 +84,16 @@ pub const Pager = struct {
 // its freeing txn — the `reclaimGate` predicate. The container itself (push +
 // on-disk encode/decode) is mechanical; the reuse gate is the Fable core.
 //
-// Scaffold simplification: a single freelist page (bounded capacity). A
-// production build chains freelist pages when one fills; that chaining is a
-// documented backlog item (SPEC.md), orthogonal to the reuse-safety invariant.
+// On-disk, the freelist is a CHAIN of pages (not a single bounded page): each
+// page header is `count(u16) + next(PageId u32)`, followed by up to
+// `capacity` fixed 12-byte entries. A commit that frees more pages than one
+// page holds simply chains another — there is no cap on how many pages may be
+// parked, only on how many fit per chain page. Chain-storage pages themselves
+// are allocated via `Pager.growOne` only (never `popReusable`): that sidesteps
+// the classic chicken-and-egg problem of a freelist write needing to itself
+// describe the very page it is about to be written to, at the cost of never
+// reusing a freed page for freelist storage (a documented simplification,
+// orthogonal to the reuse-safety invariant `reclaimGate` enforces).
 
 pub const Freelist = struct {
     ids: std.ArrayList(PageId) = .empty,
@@ -94,7 +101,9 @@ pub const Freelist = struct {
     free_txns: std.ArrayList(u64) = .empty,
 
     pub const entry_bytes = 12; // PageId(4) + free_txn(8)
-    pub const capacity = (page_size - 2) / entry_bytes;
+    pub const hdr_bytes = 6; // count(2) + next PageId(4)
+    /// Entries that fit on ONE chain page (not the whole list — see above).
+    pub const capacity = (page_size - hdr_bytes) / entry_bytes;
 
     pub fn deinit(self: *Freelist, gpa: Allocator) void {
         self.ids.deinit(gpa);
@@ -129,35 +138,100 @@ pub const Freelist = struct {
         return null;
     }
 
-    /// Serialize into a single freelist page. Asserts it fits (see `capacity`).
-    pub fn encode(self: *const Freelist, page: *[page_size]u8) void {
-        std.debug.assert(self.ids.items.len <= capacity);
+    /// Chain pages needed to persist the current entry count (0 if empty).
+    pub fn pagesNeeded(self: *const Freelist) usize {
+        const n = self.ids.items.len;
+        if (n == 0) return 0;
+        return (n + capacity - 1) / capacity;
+    }
+
+    fn encodeChunk(ids: []const PageId, txns: []const u64, next: PageId, page: *[page_size]u8) void {
+        std.debug.assert(ids.len <= capacity);
         @memset(page, 0);
-        std.mem.writeInt(u16, page[0..2], @intCast(self.ids.items.len), .little);
-        for (self.ids.items, self.free_txns.items, 0..) |id, txn, k| {
-            const base = 2 + k * entry_bytes;
+        std.mem.writeInt(u16, page[0..2], @intCast(ids.len), .little);
+        std.mem.writeInt(u32, page[2..6], next, .little);
+        for (ids, txns, 0..) |id, txn, k| {
+            const base = hdr_bytes + k * entry_bytes;
             std.mem.writeInt(u32, page[base .. base + 4][0..4], id, .little);
             std.mem.writeInt(u64, page[base + 4 .. base + 12][0..8], txn, .little);
         }
     }
 
-    pub fn decode(gpa: Allocator, page: *const [page_size]u8) !Freelist {
-        var fl = Freelist{};
-        errdefer fl.deinit(gpa);
-        const n = std.mem.readInt(u16, page[0..2], .little);
-        if (n > capacity) return error.Corrupt;
-        var k: usize = 0;
-        while (k < n) : (k += 1) {
-            const base = 2 + k * entry_bytes;
-            try fl.push(
-                gpa,
-                std.mem.readInt(u32, page[base .. base + 4][0..4], .little),
-                std.mem.readInt(u64, page[base + 4 .. base + 12][0..8], .little),
-            );
+    /// Write the whole list as a chain of fresh pages and return the chain
+    /// head (0 if empty). Storage pages come only from `pager.growOne` (see
+    /// the container doc comment) — this never touches `popReusable`, so it
+    /// can safely be called after this commit's own freed pages have already
+    /// been pushed into `self`.
+    pub fn writeChain(self: *const Freelist, pager: *Pager) StorageError!PageId {
+        const n = self.ids.items.len;
+        if (n == 0) return 0;
+        const npages = self.pagesNeeded();
+        const first_id: PageId = @intCast(pager.high_water);
+        pager.high_water += npages; // reserve npages consecutive fresh ids
+
+        var buf: [page_size]u8 = undefined;
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < npages) : (i += 1) {
+            const take = @min(capacity, n - start);
+            const next: PageId = if (i + 1 < npages) first_id + @as(PageId, @intCast(i + 1)) else 0;
+            encodeChunk(self.ids.items[start .. start + take], self.free_txns.items[start .. start + take], next, &buf);
+            try pager.writePage(first_id + @as(PageId, @intCast(i)), &buf);
+            start += take;
         }
-        return fl;
+        return first_id;
     }
 };
+
+pub const ChainReadError = StorageError || error{Corrupt} || Allocator.Error;
+
+/// Result of reading the on-disk freelist chain: the merged entry list plus
+/// the page ids that make up the chain itself (the caller must mark these
+/// dead on the next COW rewrite — the chain's own pages die every commit just
+/// like tree nodes do).
+pub const FreelistChain = struct {
+    fl: Freelist = .{},
+    pages: std.ArrayList(PageId) = .empty,
+
+    pub fn deinit(self: *FreelistChain, gpa: Allocator) void {
+        self.fl.deinit(gpa);
+        self.pages.deinit(gpa);
+    }
+};
+
+/// Read the whole on-disk freelist chain starting at `head` (0 = empty).
+/// This is the COMMIT-PATH reader over pages this module itself wrote last
+/// commit — not the crash-recovery validation path (that is
+/// `core.recover`'s `candidateValid`, which trusts nothing). Still guards
+/// against a runaway/cyclic chain defensively: a legitimate chain can never
+/// visit more pages than the file has ever grown to.
+pub fn readFreelistChain(gpa: Allocator, pager: *Pager, head: PageId) ChainReadError!FreelistChain {
+    var out = FreelistChain{};
+    errdefer out.deinit(gpa);
+    var id = head;
+    var buf: [page_size]u8 = undefined;
+    var visited: u64 = 0;
+    while (id != 0) {
+        visited += 1;
+        if (visited > pager.high_water) return error.Corrupt; // cycle guard
+        try out.pages.append(gpa, id);
+        try pager.readPage(id, &buf);
+        const n = std.mem.readInt(u16, buf[0..2], .little);
+        if (n > Freelist.capacity) return error.Corrupt;
+        const next = std.mem.readInt(u32, buf[2..6], .little);
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const base = Freelist.hdr_bytes + k * Freelist.entry_bytes;
+            try out.fl.push(
+                gpa,
+                std.mem.readInt(u32, buf[base .. base + 4][0..4], .little),
+                std.mem.readInt(u64, buf[base + 4 .. base + 12][0..8], .little),
+            );
+        }
+        id = next;
+    }
+    return out;
+}
 
 // ── tests: the mechanical bookkeeping (no core reached) ──────────────────────
 
@@ -188,24 +262,137 @@ test "pager write/read a page round-trips through kv.Storage" {
     try testing.expectEqualSlices(u8, &out, &in);
 }
 
-test "freelist push + encode/decode round-trip" {
+/// Fresh Pager + backing SimStorage handle, ready for freelist chain tests.
+fn testPager(sim: *kv.SimStorage) !Pager {
+    const h = try sim.storage().open("t.kvt", .create_truncate);
+    return Pager.init(sim.storage(), h, format.first_data_page);
+}
+
+test "freelist writeChain/readFreelistChain round-trip (well below capacity)" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
     var fl = Freelist{};
     defer fl.deinit(testing.allocator);
     try fl.push(testing.allocator, 7, 3);
     try fl.push(testing.allocator, 9, 3);
     try fl.push(testing.allocator, 4, 5);
-    try testing.expectEqual(@as(usize, 3), fl.len());
+    try testing.expectEqual(@as(usize, 1), fl.pagesNeeded());
 
-    var page: [page_size]u8 = undefined;
-    fl.encode(&page);
-    var back = try Freelist.decode(testing.allocator, &page);
+    const head = try fl.writeChain(&p);
+    try testing.expect(head != 0);
+
+    var back = try readFreelistChain(testing.allocator, &p, head);
     defer back.deinit(testing.allocator);
-    try testing.expectEqualSlices(PageId, fl.ids.items, back.ids.items);
-    try testing.expectEqualSlices(u64, fl.free_txns.items, back.free_txns.items);
+    try testing.expectEqual(@as(usize, 1), back.pages.items.len);
+    try testing.expectEqualSlices(PageId, fl.ids.items, back.fl.ids.items);
+    try testing.expectEqualSlices(u64, fl.free_txns.items, back.fl.free_txns.items);
 }
 
-test "freelist decode rejects an over-capacity count" {
+test "freelist chain: empty list writes/reads as head 0, no pages" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    try testing.expectEqual(@as(PageId, 0), try fl.writeChain(&p));
+
+    var back = try readFreelistChain(testing.allocator, &p, 0);
+    defer back.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), back.pages.items.len);
+    try testing.expectEqual(@as(usize, 0), back.fl.len());
+}
+
+test "freelist chain: exactly at one page's capacity stays a single page" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    var i: PageId = 0;
+    while (i < Freelist.capacity) : (i += 1)
+        try fl.push(testing.allocator, i + 100, 1);
+    try testing.expectEqual(@as(usize, 1), fl.pagesNeeded());
+
+    const head = try fl.writeChain(&p);
+    var back = try readFreelistChain(testing.allocator, &p, head);
+    defer back.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), back.pages.items.len);
+    try testing.expectEqual(@as(usize, Freelist.capacity), back.fl.len());
+    try testing.expectEqualSlices(PageId, fl.ids.items, back.fl.ids.items);
+}
+
+test "freelist chain: ONE OVER capacity forces a second chain page (the overflow boundary)" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    var i: PageId = 0;
+    while (i < Freelist.capacity + 1) : (i += 1)
+        try fl.push(testing.allocator, i + 100, 1);
+    try testing.expectEqual(@as(usize, 2), fl.pagesNeeded());
+
+    const head = try fl.writeChain(&p);
+    var back = try readFreelistChain(testing.allocator, &p, head);
+    defer back.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), back.pages.items.len);
+    // The overflow entry (the (capacity+1)-th) must NOT be silently lost —
+    // this is exactly the boundary where a single bounded page used to leak.
+    try testing.expectEqual(@as(usize, Freelist.capacity + 1), back.fl.len());
+    try testing.expectEqualSlices(PageId, fl.ids.items, back.fl.ids.items);
+    try testing.expectEqualSlices(u64, fl.free_txns.items, back.fl.free_txns.items);
+}
+
+test "readFreelistChain rejects an over-capacity per-page count" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
     var page: [page_size]u8 = @splat(0);
     std.mem.writeInt(u16, page[0..2], @intCast(Freelist.capacity + 1), .little);
-    try testing.expectError(error.Corrupt, Freelist.decode(testing.allocator, &page));
+    std.mem.writeInt(u32, page[2..6], 0, .little); // next = end of chain
+    const id = p.growOne();
+    try p.writePage(id, &page);
+
+    try testing.expectError(error.Corrupt, readFreelistChain(testing.allocator, &p, id));
+}
+
+test "freelist chain: freeing MORE pages than one page holds survives a simulated reopen, all still known-free and reusable" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
+    // Free enough pages to force a 3-page chain (2 full pages + a remainder).
+    const total = Freelist.capacity * 2 + 17;
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    var i: PageId = 0;
+    while (i < total) : (i += 1)
+        try fl.push(testing.allocator, i + 1000, 42); // all freed by txn 42
+    try testing.expectEqual(@as(usize, 3), fl.pagesNeeded());
+
+    const head = try fl.writeChain(&p);
+    const high_water_after_write = p.high_water;
+
+    // Simulate reopen: a fresh Pager over the SAME store/handle, as `recover`
+    // would build after re-deriving high_water from the durable meta.
+    var reopened = Pager.init(sim.storage(), p.handle, high_water_after_write);
+
+    var back = try readFreelistChain(testing.allocator, &reopened, head);
+    defer back.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), back.pages.items.len);
+    try testing.expectEqual(@as(usize, total), back.fl.len());
+    try testing.expectEqualSlices(PageId, fl.ids.items, back.fl.ids.items);
+
+    // Every single one of them is still known-free and reusable (passes the
+    // real reclaimGate against a reader pinned at-or-after the freeing txn).
+    var reused: usize = 0;
+    while (back.fl.popReusable(42)) |_| reused += 1;
+    try testing.expectEqual(total, reused);
+    try testing.expectEqual(@as(usize, 0), back.fl.len());
 }

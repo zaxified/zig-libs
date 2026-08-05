@@ -41,7 +41,14 @@ pub const first_data_page: PageId = 2;
 pub const NodeKind = enum(u8) { leaf = 0, branch = 1 };
 
 const meta_magic = "ZKVT";
-const format_version: u32 = 1;
+/// Bumped 1 -> 2 when the freelist gained page chaining: its page header grew
+/// from `count(2)` to `count(2) + next(4)`, so a v1 freelist page read with the
+/// v2 layout yields a garbage `next` pointer (v1 held the first entry in those
+/// bytes) and every entry after it shifted by 4. Freelist pages carry no magic
+/// or CRC of their own -- this version, checked in `Meta.decode`, is the ONLY
+/// thing standing between an old file and a chain walk into arbitrary pages, so
+/// opening a v1 file must fail closed rather than misread it.
+const format_version: u32 = 2;
 
 /// A single leaf entry (borrowed slices into a page buffer, or into a builder's
 /// arena — never owns).
