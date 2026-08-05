@@ -1,11 +1,14 @@
-# Anchor classification — one line per module, generated 2026-08-01
+# Anchor classification — one line per module, generated 2026-08-01, kept in
+# sync since.
 #
-# ⚠ THIS IS A DATED SNAPSHOT OF THE CLASSIFICATION, NOT LIVE STATUS. The CLASS
-#   column stays true (a module's relationship to the outside world does not
-#   change), but the ANCHOR column is only accurate as of the generation date.
-#   ANCHOR-TASKS.tsv is the single ownership place for current anchor state and
-#   wins wherever the two disagree — e.g. isis reads SELF here and MIXED there,
-#   because it was anchored against Wireshark after this file was generated.
+# ANCHOR-TASKS.tsv is the single ownership place for current anchor state: it
+# is where a task gets closed, and this file's ANCHOR column must be updated to
+# match whenever that happens. `zig build check-catalog` enforces this (see
+# `checkAnchors` in build.zig) — for any module listed in both files, CLASS and
+# ANCHOR must agree, or the build fails naming the module and which column
+# drifted. This file used to be allowed to silently lag ANCHOR-TASKS.tsv as a
+# "dated snapshot"; that is what let the bookkeeping go stale three times
+# (backlog 1B), so the allowance was removed rather than documented further.
 #
 # CLASS: does this module have an external truth at all?
 #   A  wire / interop format — other implementations must byte-agree with it
@@ -34,7 +37,7 @@
 # module	CLASS	ANCHOR	EVIDENCE
 aaa-gate	C	n/a	bearer-gate middleware; RFC 6750 header parse trivial, no interop surface, internal goldens
 abuseguard	C	n/a	internal rate-limit/gate store; nginx/fail2ban are design refs only, no wire format
-accesslog	A	SELF	Combined/logfmt/JSON logs consumed by real tools; goldens hand-authored, not captured
+accesslog	A	MIXED	Combined anchored by real goaccess 1.10.2 (verdicts frozen as byte literals); JSON/logfmt unanchored, no foreign parser
 acme	A	MIXED	RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed
 adaptor	B	REDERIVED	no official spec/vectors; kat_vectors.zig computed independently in Python (NOTICE)
 aeadframe	D	n/a	own composed record framing inspired by RFC4303/9147, wire format defined in SPEC.md
@@ -115,13 +118,13 @@ iec61850	A	EXTERNAL	82+15 goldens captured from libiec61850, live peer both dire
 iec62351	A	MIXED	RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested
 imap	A	EXTERNAL	RFC 3501 worked example, byte-exact, plus a live IMAP server peer (README)
 ipcbus	C	n/a	internal unix-socket dispatch loop, framing delegated, no protocol of its own
-isis	A	SELF	hand-authored goldens from spec reading; no dissector/router used (README/SPEC)
-isis-adj	A	SELF	SPEC.md: no external oracle needed, checked only via golden-tested sibling isis
-isis-dis	A	SELF	SPEC.md: no external oracle needed, lan_id/LSP-ID checked via sibling isis only
-isis-flood	A	SELF	SPEC.md: no external oracle needed, wire exercised via sibling isis codec only
+isis	A	MIXED	Wireshark sharkd validated 5 PDU bodies + TLVs incl. L2 CSNP/PSNP (goldens.zig); long-tail raw-TLV escape hatch stays self-tested
+isis-adj	A	MIXED	Wireshark sharkd validated TLV 240 three-way adjacency, all wire states; found+fixed 11-octet BadLength bug
+isis-dis	A	MIXED	Wireshark sharkd validated lan_id/priority/Hello codes; DIS election result closed vs 3 real isisd 10.3 instances
+isis-flood	A	MIXED	Wireshark sharkd validated CSNP/PSNP content via Scheduler.poll; SRM/SSN flag state + retransmit pace are not wire-observable, stay open
 isis-lsdb	A	MIXED	checksum tie-break (§7.3.16.1) cross-checked vs FRR isis_lsp.c; rest of KAT table hand-authored only
 isis-sim	C	n/a	composes siblings over netsim; convergence/determinism invariants, no wire format of its own
-isis-spf	A	SELF	golden line-topology fixtures hand-built; no external SPF vectors or peer cross-check
+isis-spf	A	MIXED	5-router topology run once through real isisd 10.3 in-VM, matches vertex-by-vertex modulo documented undirected-engine gap; rest stays SELF
 jinja	A	EXTERNAL	golden.json captured from real Python Jinja2 3.1.6 output + live subprocess oracle
 jobqueue	C	n/a	internal partition-FIFO dispatch queue; original design, no wire format
 json5	A	SELF	hand-authored fixtures; deliberately partial subset, no json5.org test corpus used
@@ -138,8 +141,8 @@ latency-stats	C	n/a	in-process stats/histogram; hand-computed KAT + sorted-oracl
 linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked examples cited
 liveness-hyst	C	n/a	local estimator "modeled after" BFD/Babel; scored via trace corpus + invariants, not wire-compat
 llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs
-lninvoice	A	MIXED	BOLT11/12 mostly externally anchored (bolts vectors); BOLT12 offer ENCODE round-trip self-constructed
-lnwire	A	MIXED	BigSize/TLV base wire externally anchored (BOLT#1 App A/B); BOLT#2/#7 messages round-trip only
+lninvoice	A	EXTERNAL	BOLT11 + BOLT12 offer/invoice_request/invoice decode+ENCODE all vs lightning/bolts vectors, byte-exact (NOTICE)
+lnwire	A	EXTERNAL	BigSize/TLV base wire + BOLT#7 announcements/queries + all BOLT#2 messages vs bolts + rust-lightning msgs.rs, byte-exact
 lockfree	C	n/a	canonical class-C case (MPMC queue + EBR); litmus/ = internal weak-memory verification
 loopfree-reconv	C	n/a	ordered-FIB scheduling algorithm proven via own loop-freedom invariant, no wire messages
 loopix	C	n/a	netsim anonymity simulation of Loopix paper; modeled header, not byte-compat with real Loopix/Nym
@@ -171,7 +174,7 @@ otp	B	EXTERNAL	RFC 4226/6238 appendix vectors embedded byte-exact
 p256	B	EXTERNAL	RFC 6979 Appendix A.2.5 ECDSA-P256 vectors; field ops also cross-checked vs std.crypto
 pagecache	C	n/a	internal buffer-pool page cache, no wire, LMDB/Postgres named as concept analogues only
 paillier	B	EXTERNAL	cross-checked against phe (python-paillier) 1.5.0 real library output
-pbb	A	SELF	hand-assembled golden frames per IEEE 802.1ah spec, no capture available (README explicit)
+pbb	A	MIXED	Wireshark sharkd validated encode() B-Tag/I-TAG/B-TCI/relocation/ethertype/recursion; no wire bug, UCA/NCA naming dispute open
 pir	B	SELF	SPEC.md: no external test vector exists for this DPF construction
 pollworker	C	n/a	internal job/event-loop scheduler (single-owner controller), no wire
 poseidon	B	EXTERNAL	circomlibjs JSON consts byte-identical (constants_test.zig)
@@ -180,7 +183,7 @@ probe	C	n/a	TCP connect timing via std connect(); no wire codec of its own
 procnet	A	EXTERNAL	testdata/*.txt captured from real kernel /proc snapshots (README)
 procrun	C	n/a	process reap/spawn robustness util, no wire format
 protobuf	A	MIXED	codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing
-psbt	A	MIXED	kat_vectors.zig = official BIP174 vectors; finalize P2WPKH/P2SH/P2WSH self-authored
+psbt	A	EXTERNAL	BIP174 vectors + Core rpc_psbt.json + live bitcoind v28 regtest (native P2WPKH/P2WSH captured); every spend shape now anchored
 quic-crypto	A	EXTERNAL	RFC 9001 Appendix A vectors verbatim in initial/headerprot/protection.zig
 raft	C	n/a	netsim model-checking vs Raft safety properties, no wire byte format
 ramcache	C	n/a	pure in-process W-TinyLFU cache, no wire
@@ -253,5 +256,5 @@ xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used
 xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip
 xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only
 xmss	B	MIXED	core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only
-yaml	A	MIXED	yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution self-tested only
+yaml	A	EXTERNAL	yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution also test-suite covered (VERIFIED 2026-08-01)
 zipstream	A	MIXED	writer bytes cross-checked live via std.zip.Iterator; real unzip/zipinfo check was ad hoc, not standing

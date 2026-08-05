@@ -539,6 +539,7 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
 
     checkNonGoals(readme, b, &failed);
     try checkProvenance(b, io, &failed);
+    try checkAnchors(b, io, &failed);
 
     if (failed) return step.fail("catalog drift — see errors above", .{});
 }
@@ -747,6 +748,193 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
             failed.* = true;
         }
     }
+}
+
+/// Oracle-provenance gate: `ANCHORS.tsv`'s CLASS/ANCHOR columns record where each
+/// module's TEST ORACLE gets its authority from -- see the file's own header for
+/// the A/B/C/D and EXTERNAL/REDERIVED/MIXED/SELF vocabulary. This is deliberately
+/// a separate function from `checkProvenance` above, which guards where
+/// implementation CODE came from (licensing / clean-room). Same word, opposite
+/// question -- conflating them would mean one of the two silently stops being
+/// enforced.
+///
+/// This bookkeeping went stale three times by hand before this gate existed
+/// (backlog 1B), always the same way: closing an anchor task updates
+/// `ANCHOR-TASKS.tsv` -- the one place actually owned while doing the work -- and
+/// `ANCHORS.tsv`, a dated snapshot regenerated separately, is never told. Running
+/// this gate against the repo as it stood found exactly that: 11 modules (`pbb`,
+/// `isis`, `isis-adj`, `isis-dis`, `isis-flood`, `isis-spf`, `lnwire`, `psbt`,
+/// `accesslog`, `lninvoice`, `yaml`) where `ANCHOR-TASKS.tsv` had already moved
+/// past what `ANCHORS.tsv` still said, closed 2026-08-02..2026-08-05 while
+/// `ANCHORS.tsv` was last regenerated 2026-08-01. Fixed by syncing those 11 rows;
+/// this gate is what stops it from happening an eleventh time.
+///
+/// What CAN be checked mechanically, and is:
+///   - every module in `module_list` has exactly one `ANCHORS.tsv` row, and every
+///     `ANCHORS.tsv` row names a real module -- no ghost row for a deleted
+///     module, the same one-directional blind spot `checkProvenance`'s claim 4
+///     documents for NOTICE §1 (driving the check FROM `module_list` alone can
+///     only ever see a module whose row disagrees, never a row with no module)
+///   - CLASS is one of A/B/C/D and ANCHOR is one of
+///     EXTERNAL/REDERIVED/MIXED/SELF/n/a, in both TSVs
+///   - the pairing rule from `ANCHORS.tsv`'s own header: a class A/B module
+///     (faces the outside world) must carry a real ANCHOR value; a class C/D
+///     module (no outside exists) must be `n/a`
+///   - `ANCHOR-TASKS.tsv` only ever lists class A/B modules -- a C/D module
+///     cannot carry anchor debt by construction, so its presence there is a
+///     misclassification somewhere
+///   - `ANCHOR-TASKS.tsv`'s CLASS matches `ANCHORS.tsv`'s CLASS for the same
+///     module -- CLASS records a module's relationship to the outside world,
+///     which the header states does not change, so any disagreement is a bug
+///   - `ANCHORS.tsv`'s ANCHOR matches `ANCHOR-TASKS.tsv`'s ANCHOR for every
+///     module in both -- this is the actual fix for the staleness above: what
+///     used to be a silently tolerated snapshot lag is now a build error
+///
+/// What CANNOT be checked, and this does not pretend to:
+///   - that a module claiming EXTERNAL/REDERIVED genuinely has one. The KAT
+///     file, live peer or foreign oracle a row points at could be deleted,
+///     fabricated, or never have existed, and every check above stays green --
+///     "the TSV cell says EXTERNAL" is not the same fact as "bytes in this repo
+///     were produced by a foreign implementation", and nothing short of a human
+///     re-running the foreign oracle (i.e. the anchor-task work itself) can close
+///     that gap. Claiming otherwise here would manufacture false confidence.
+///   - that EVIDENCE prose is accurate -- only the CLASS/ANCHOR/SOURCE columns
+///     are validated; EVIDENCE is free text for a human to judge, same as the
+///     README `Provenance:` note is left to a human elsewhere in this file.
+///
+/// Deliberately NOT built: a "module claims EXTERNAL therefore its tree must
+/// contain a file named like a golden/vector" filename heuristic. It was tried
+/// while designing this gate -- `sandbox` (EXTERNAL: seccomp/landlock tested
+/// against the real running kernel) and `traceroute` (MIXED: real ICMP over a
+/// veth pair) are both single-file modules with no `*golden*`/`*vector*`/`*kat*`
+/// filename anywhere in their tree, so the heuristic would already need a
+/// per-module exemption list on a clean repo, on day one. A check that starts
+/// pre-broken teaches everyone to ignore it, which is worse than not having it --
+/// see `checkNonGoals`'s own exemption mechanism for what that costs when it IS
+/// worth paying for.
+fn checkAnchors(b: *std.Build, io: std.Io, failed: *bool) !void {
+    const anchors_src = try b.build_root.handle.readFileAlloc(io, "ANCHORS.tsv", b.allocator, .limited(1 * 1024 * 1024));
+    const tasks_src = try b.build_root.handle.readFileAlloc(io, "ANCHOR-TASKS.tsv", b.allocator, .limited(1 * 1024 * 1024));
+
+    const anchor_rows = parseAnchorRows(anchors_src, b);
+    const task_rows = parseAnchorRows(tasks_src, b);
+
+    // module_list <-> ANCHORS.tsv, both directions -- the same shape as the
+    // module_list <-> modules/ check earlier in checkCatalog.
+    for (module_list) |m| {
+        if (findAnchorRow(anchor_rows, m.name) == null) {
+            std.log.err("module '{s}' has no ANCHORS.tsv row (CLASS/ANCHOR oracle bookkeeping)", .{m.name});
+            failed.* = true;
+        }
+    }
+    for (anchor_rows) |row| {
+        const known = for (module_list) |m| {
+            if (std.mem.eql(u8, m.name, row.name)) break true;
+        } else false;
+        if (!known) {
+            std.log.err("ANCHORS.tsv has a row for '{s}' but no such module exists in module_list", .{row.name});
+            failed.* = true;
+        }
+    }
+
+    // Schema + the A/B <-> non-n/a pairing rule, on ANCHORS.tsv.
+    for (anchor_rows) |row| {
+        if (!containsName(&.{ "A", "B", "C", "D" }, row.class)) {
+            std.log.err("ANCHORS.tsv: module '{s}' has CLASS '{s}', not one of A/B/C/D", .{ row.name, row.class });
+            failed.* = true;
+        }
+        if (!containsName(&.{ "EXTERNAL", "REDERIVED", "MIXED", "SELF", "n/a" }, row.anchor)) {
+            std.log.err("ANCHORS.tsv: module '{s}' has ANCHOR '{s}', not one of EXTERNAL/REDERIVED/MIXED/SELF/n/a", .{ row.name, row.anchor });
+            failed.* = true;
+        }
+        const faces_outside = std.mem.eql(u8, row.class, "A") or std.mem.eql(u8, row.class, "B");
+        const has_anchor = !std.mem.eql(u8, row.anchor, "n/a");
+        if (faces_outside and !has_anchor) {
+            std.log.err(
+                "ANCHORS.tsv: module '{s}' is CLASS {s} (faces the outside world) but ANCHOR is 'n/a' -- " ++
+                    "an A/B module must record EXTERNAL/REDERIVED/MIXED/SELF",
+                .{ row.name, row.class },
+            );
+            failed.* = true;
+        } else if (!faces_outside and has_anchor) {
+            std.log.err(
+                "ANCHORS.tsv: module '{s}' is CLASS {s} (no outside truth exists for it) but ANCHOR is '{s}', not 'n/a'",
+                .{ row.name, row.class, row.anchor },
+            );
+            failed.* = true;
+        }
+    }
+
+    // ANCHOR-TASKS.tsv: schema, ghost rows, and agreement with ANCHORS.tsv.
+    for (task_rows) |trow| {
+        if (!containsName(&.{ "EXTERNAL", "REDERIVED", "MIXED", "SELF", "n/a" }, trow.anchor)) {
+            std.log.err("ANCHOR-TASKS.tsv: module '{s}' has ANCHOR '{s}', not one of EXTERNAL/REDERIVED/MIXED/SELF/n/a", .{ trow.name, trow.anchor });
+            failed.* = true;
+        }
+        const arow = findAnchorRow(anchor_rows, trow.name) orelse {
+            std.log.err("ANCHOR-TASKS.tsv has a row for '{s}' but ANCHORS.tsv has no such module", .{trow.name});
+            failed.* = true;
+            continue;
+        };
+        if (!std.mem.eql(u8, arow.class, "A") and !std.mem.eql(u8, arow.class, "B")) {
+            std.log.err(
+                "ANCHOR-TASKS.tsv lists '{s}', but ANCHORS.tsv classifies it CLASS {s} -- only class A/B modules can carry anchor debt",
+                .{ trow.name, arow.class },
+            );
+            failed.* = true;
+        }
+        if (!std.mem.eql(u8, arow.class, trow.class)) {
+            std.log.err(
+                "CLASS disagreement for '{s}': ANCHORS.tsv says {s}, ANCHOR-TASKS.tsv says {s} -- CLASS records a " ++
+                    "module's relationship to the outside world and must never change between the two files",
+                .{ trow.name, arow.class, trow.class },
+            );
+            failed.* = true;
+        }
+        if (!std.mem.eql(u8, arow.anchor, trow.anchor)) {
+            std.log.err(
+                "ANCHOR drift for '{s}': ANCHORS.tsv says {s}, ANCHOR-TASKS.tsv (the file owned while closing anchor " ++
+                    "tasks) says {s} -- ANCHORS.tsv was not updated when the task closed",
+                .{ trow.name, arow.anchor, trow.anchor },
+            );
+            failed.* = true;
+        }
+    }
+}
+
+const AnchorRow = struct {
+    name: []const u8,
+    class: []const u8,
+    anchor: []const u8,
+};
+
+/// Parse the `module<TAB>CLASS<TAB>ANCHOR<TAB>...` rows both `ANCHORS.tsv` and
+/// `ANCHOR-TASKS.tsv` share as their first three columns, skipping `#` comment
+/// lines, blank lines, and any malformed line with fewer than three tab-separated
+/// fields (a row that short is not a data row this gate can make sense of, and
+/// reporting a parse error on it would obscure the real drift this gate exists to
+/// find -- CONVENTIONS.md documents the fuller column set each file adds after
+/// ANCHOR).
+fn parseAnchorRows(content: []const u8, b: *std.Build) []const AnchorRow {
+    var out: std.ArrayList(AnchorRow) = .empty;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var cols = std.mem.splitScalar(u8, line, '\t');
+        const name = cols.next() orelse continue;
+        const class = cols.next() orelse continue;
+        const anchor = cols.next() orelse continue;
+        out.append(b.allocator, .{ .name = name, .class = class, .anchor = anchor }) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+fn findAnchorRow(rows: []const AnchorRow, name: []const u8) ?AnchorRow {
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.name, name)) return r;
+    }
+    return null;
 }
 
 /// The module README's provenance statement: from the first `Provenance:` or
