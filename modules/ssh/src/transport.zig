@@ -716,6 +716,50 @@ fn msgType(p: Packet) u8 {
     return if (p.payload.len == 0) 0 else p.payload[0];
 }
 
+/// The key-blob type a `publickey`/host-key *algorithm* name implies (RFC
+/// 8332 §3: an `rsa-sha2-*` *signature* algorithm still uses an `ssh-rsa`-
+/// typed *key* blob; every other supported name's blob type is itself).
+///
+/// Single source of truth for that mapping — `userauth.zig`'s `publickey`
+/// path calls this directly (`transport.keyBlobTypeFor`) rather than keeping
+/// a second copy that could silently diverge from this one.
+pub fn keyBlobTypeFor(algorithm: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, algorithm, "ssh-ed25519")) return "ssh-ed25519";
+    if (std.mem.eql(u8, algorithm, "rsa-sha2-256")) return "ssh-rsa";
+    if (std.mem.eql(u8, algorithm, "rsa-sha2-512")) return "ssh-rsa";
+    if (std.mem.eql(u8, algorithm, "ecdsa-sha2-nistp256")) return "ecdsa-sha2-nistp256";
+    return null;
+}
+
+/// Cross-check the negotiated `server_host_key_algorithms` entry against what
+/// the KEX reply actually delivered — mirroring the three-way check
+/// `userauth.zig`'s `publickey` path already does for the *userauth*
+/// signature (blob-type-vs-algorithm at its top, algorithm-vs-signature-blob
+/// just before it calls `verifySignature`), which nothing on the KEX/host-key
+/// side previously did (RFC 4253 §7.1 "the server MUST use the negotiated
+/// algorithm"; RFC 8332 §3 for the `rsa-sha2-*` split):
+///
+///   1. `K_S`'s own key-type string must match the blob type the negotiated
+///      name implies (`keyBlobTypeFor`) — e.g. negotiating `rsa-sha2-512`
+///      still means `K_S` is typed `ssh-rsa`, never `rsa-sha2-512` itself.
+///   2. The signature blob's own algorithm string must equal the negotiated
+///      name exactly — this is what actually pins the hash: without it, a
+///      server could negotiate `rsa-sha2-512` and reply with a valid
+///      `rsa-sha2-256` signature (weaker hash) and `verifySignature` would
+///      accept it, because it dispatches purely on `key_type` + the
+///      signature blob's own algorithm field, never on what was negotiated.
+fn checkHostKeyAlgorithmAgreement(
+    negotiated_algorithm: []const u8,
+    key_type: []const u8,
+    sig_blob: []const u8,
+) TransportError!void {
+    const expected_blob_type = keyBlobTypeFor(negotiated_algorithm) orelse return error.UnsupportedAlgorithm;
+    if (!std.mem.eql(u8, key_type, expected_blob_type)) return error.HostKeyVerificationFailed;
+    var sr = SliceReader{ .b = sig_blob };
+    const sig_algo = try sr.string();
+    if (!std.mem.eql(u8, sig_algo, negotiated_algorithm)) return error.HostKeyVerificationFailed;
+}
+
 /// Verify an SSH public-key signature blob `sig_blob` (`string algorithm ||
 /// string raw-signature`) over `h`, dispatched by the key type in the key
 /// blob `k_s` and the algorithm string inside `sig_blob`.
@@ -726,6 +770,13 @@ fn msgType(p: Packet) u8 {
 /// `publickey` userauth signature over the session-id-bound request blob
 /// (server side, `userauth.zig`) — hence `pub`, so the userauth layer does
 /// not mirror this dispatch.
+///
+/// This function alone never checks `key_type`/`sig_blob`'s algorithm
+/// against what was *negotiated* in KEXINIT — it only checks that they agree
+/// with EACH OTHER enough to pick a verification routine. The KEX callers
+/// below call `checkHostKeyAlgorithmAgreement` first for that reason; the
+/// userauth caller does its own equivalent check (blob-type-vs-`algorithm`,
+/// then `algorithm`-vs-signature-blob) before ever reaching this function.
 pub fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const u8, h: []const u8) TransportError!void {
     var sr = SliceReader{ .b = sig_blob };
     const sig_algo = try sr.string();
@@ -775,7 +826,8 @@ pub fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const 
 /// Run the client side of curve25519-sha256 key exchange (RFC 8731):
 /// SSH_MSG_KEX_ECDH_INIT (`Q_C`) → SSH_MSG_KEX_ECDH_REPLY (`K_S`, `Q_S`,
 /// signature), compute `K` and `H`, verify the host key via
-/// `verify_host_key`, then verify its signature over `H`.
+/// `verify_host_key`, cross-check `negotiated_host_key_algorithm` against
+/// `K_S`/the signature blob, then verify the signature over `H`.
 pub fn curve25519Kex(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
@@ -785,6 +837,7 @@ pub fn curve25519Kex(
     client_id: []const u8,
     server_id: []const u8,
     verify_host_key: HostKeyVerifier,
+    negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
     var seed: [32]u8 = undefined;
     fillRandom(&seed);
@@ -837,6 +890,7 @@ pub fn curve25519Kex(
     var ksr = SliceReader{ .b = k_s };
     const key_type = try ksr.string();
     if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
+    try checkHostKeyAlgorithmAgreement(negotiated_host_key_algorithm, key_type, sig);
     try verifySignature(key_type, k_s, sig, &h);
 
     // Legacy path: `k_enc_len == 0` makes `buildCipher` mpint-encode
@@ -998,7 +1052,8 @@ pub fn dhPowModPrime(prime_be: []const u8, base_be: []const u8, exp_be: []const 
 /// SSH_MSG_KEXDH_REPLY (`K_S`, `f = g^y mod p`, signature), compute
 /// `K = f^x mod p`, and `H = HASH(V_C‖V_S‖I_C‖I_S‖K_S‖e‖f‖K)` where `e`, `f`,
 /// `K` are mpints and HASH is SHA-256 (group14) or SHA-512 (group16). Then
-/// verify the host key and its signature over `H`.
+/// verify the host key, cross-check `negotiated_host_key_algorithm` against
+/// `K_S`/the signature blob, and verify the signature over `H`.
 pub fn dhGroupKex(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
@@ -1009,6 +1064,7 @@ pub fn dhGroupKex(
     server_id: []const u8,
     verify_host_key: HostKeyVerifier,
     kex_name: []const u8,
+    negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
     const group = DhGroup.forName(kex_name) orelse return error.UnsupportedAlgorithm;
     const m = DhModulus.fromBytes(group.prime, .big) catch return error.KexFailed;
@@ -1088,6 +1144,7 @@ pub fn dhGroupKex(
     var ksr = SliceReader{ .b = k_s };
     const key_type = try ksr.string();
     if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
+    try checkHostKeyAlgorithmAgreement(negotiated_host_key_algorithm, key_type, sig);
     try verifySignature(key_type, k_s, sig, res.hash());
 
     return res;
@@ -1134,7 +1191,8 @@ pub fn mlkemSharedK(res: *KexResult, kem_shared: [32]u8, x25519_shared: [32]u8) 
 /// blob `S = ML-KEM_ciphertext(1088) ‖ X25519_server_pub(32)`, decapsulate +
 /// X25519-scalarmult to the two component secrets, then
 /// `K = SHA256(K_MLKEM ‖ K_X25519)` (encoded as a `string`) and
-/// `H = SHA256(V_C‖V_S‖I_C‖I_S‖K_S‖C‖S‖string(K))`. Verify the host key + sig.
+/// `H = SHA256(V_C‖V_S‖I_C‖I_S‖K_S‖C‖S‖string(K))`. Verify the host key,
+/// cross-check `negotiated_host_key_algorithm`, then verify the signature.
 pub fn mlkem768x25519Kex(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
@@ -1144,6 +1202,7 @@ pub fn mlkem768x25519Kex(
     client_id: []const u8,
     server_id: []const u8,
     verify_host_key: HostKeyVerifier,
+    negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
     // X25519 ephemeral.
     var x_seed: [32]u8 = undefined;
@@ -1210,6 +1269,7 @@ pub fn mlkem768x25519Kex(
     var ksr = SliceReader{ .b = k_s };
     const key_type = try ksr.string();
     if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
+    try checkHostKeyAlgorithmAgreement(negotiated_host_key_algorithm, key_type, sig);
     try verifySignature(key_type, k_s, sig, res.hash());
 
     return res;
@@ -1485,11 +1545,11 @@ pub const Transport = struct {
         // only ever returns a name from `kex_algorithms`; every one of those
         // dispatches to a working implementation here.
         var kex_result = if (isMlkemKex(neg.kex))
-            try mlkem768x25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key)
+            try mlkem768x25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.host_key)
         else if (isCurve25519Kex(neg.kex))
-            try curve25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key)
+            try curve25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.host_key)
         else
-            try dhGroupKex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.kex);
+            try dhGroupKex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.kex, neg.host_key);
         defer kex_result.zeroize();
 
         if (t.session_id == null) t.session_id = SessionId.from(kex_result.hash());
@@ -1946,7 +2006,7 @@ test "curve25519Kex (client): rejects a KEX_ECDH_REPLY carrying the identity poi
 
     try std.testing.expectError(
         error.KexFailed,
-        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier),
+        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier, "ssh-ed25519"),
     );
 }
 
@@ -2001,7 +2061,7 @@ test "curve25519Kex (client): a caller `HostKeyVerifier` that returns false actu
 
     try std.testing.expectError(
         error.HostKeyVerificationFailed,
-        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", alwaysRejectHostKey),
+        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", alwaysRejectHostKey, "ssh-ed25519"),
     );
 }
 
@@ -2020,7 +2080,7 @@ test "dhGroupKex (client): rejects a KEXDH_REPLY carrying f == p or f == p-1" {
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier, kex_name),
+            dhGroupKex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier, kex_name, "ssh-ed25519"),
         );
     }
 }
@@ -2150,6 +2210,85 @@ test "host-key parse + signature verify: ed25519 (generated key)" {
     // A different message must fail.
     const h2 = [_]u8{0xCD} ** 32;
     try t.expectError(error.HostKeyVerificationFailed, verifySignature("ssh-ed25519", k_s, sig_blob, &h2));
+}
+
+test "keyBlobTypeFor: rsa-sha2-* signature algorithms use an ssh-rsa key blob" {
+    const t = std.testing;
+    try t.expectEqualStrings("ssh-rsa", keyBlobTypeFor("rsa-sha2-256").?);
+    try t.expectEqualStrings("ssh-rsa", keyBlobTypeFor("rsa-sha2-512").?);
+    try t.expectEqualStrings("ssh-ed25519", keyBlobTypeFor("ssh-ed25519").?);
+    try t.expectEqualStrings("ecdsa-sha2-nistp256", keyBlobTypeFor("ecdsa-sha2-nistp256").?);
+    try t.expectEqual(@as(?[]const u8, null), keyBlobTypeFor("ssh-dss"));
+    try t.expectEqual(@as(?[]const u8, null), keyBlobTypeFor("ssh-rsa")); // SHA-1, refused
+}
+
+/// Encode a bare `string algorithm || string <placeholder bytes>` signature
+/// blob — enough for `checkHostKeyAlgorithmAgreement`, which only reads the
+/// blob's own algorithm-name field and never touches the signature bytes.
+fn fakeSigBlob(algorithm: []const u8, out: []u8) []const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    messages.writeString(&w, algorithm) catch unreachable;
+    messages.writeString(&w, "placeholder-signature-bytes") catch unreachable;
+    return w.buffered();
+}
+
+test "checkHostKeyAlgorithmAgreement: positive control for every supported host-key algorithm" {
+    // Not just "rejects everything": each of the four names this module
+    // negotiates must pass when K_S's type and the signature blob's own
+    // algorithm both actually agree with it.
+    const cases = [_]struct { negotiated: []const u8, key_type: []const u8 }{
+        .{ .negotiated = "ssh-ed25519", .key_type = "ssh-ed25519" },
+        .{ .negotiated = "rsa-sha2-256", .key_type = "ssh-rsa" },
+        .{ .negotiated = "rsa-sha2-512", .key_type = "ssh-rsa" },
+        .{ .negotiated = "ecdsa-sha2-nistp256", .key_type = "ecdsa-sha2-nistp256" },
+    };
+    for (cases) |c| {
+        var buf: [64]u8 = undefined;
+        const sig_blob = fakeSigBlob(c.negotiated, &buf);
+        try checkHostKeyAlgorithmAgreement(c.negotiated, c.key_type, sig_blob);
+    }
+}
+
+test "checkHostKeyAlgorithmAgreement: rejects an rsa-sha2-256 signature blob when rsa-sha2-512 was negotiated" {
+    // The exact scenario from the audit finding this task fixes: K_S is
+    // correctly typed "ssh-rsa" either way (RFC 8332 §3 — the key blob type
+    // never encodes the hash choice), so only the algorithm-name cross-check
+    // added here catches the downgrade.
+    var buf: [64]u8 = undefined;
+    const sig_blob = fakeSigBlob("rsa-sha2-256", &buf);
+    try std.testing.expectError(
+        error.HostKeyVerificationFailed,
+        checkHostKeyAlgorithmAgreement("rsa-sha2-512", "ssh-rsa", sig_blob),
+    );
+    // And the reverse direction (claims the stronger hash, signs the weaker
+    // one) must be caught too — this is not a one-directional inequality.
+    var buf2: [64]u8 = undefined;
+    const sig_blob2 = fakeSigBlob("rsa-sha2-512", &buf2);
+    try std.testing.expectError(
+        error.HostKeyVerificationFailed,
+        checkHostKeyAlgorithmAgreement("rsa-sha2-256", "ssh-rsa", sig_blob2),
+    );
+}
+
+test "checkHostKeyAlgorithmAgreement: rejects K_S typed differently than the negotiated algorithm implies" {
+    var buf: [64]u8 = undefined;
+    // Signature blob's own algorithm name agrees with what was negotiated —
+    // only K_S's type is wrong. Must still be rejected (RFC 8332 §3: the
+    // blob type is a function of the negotiated name, not free-standing).
+    const sig_blob = fakeSigBlob("ssh-ed25519", &buf);
+    try std.testing.expectError(
+        error.HostKeyVerificationFailed,
+        checkHostKeyAlgorithmAgreement("ssh-ed25519", "ssh-rsa", sig_blob),
+    );
+}
+
+test "checkHostKeyAlgorithmAgreement: an unknown negotiated algorithm name is UnsupportedAlgorithm" {
+    var buf: [64]u8 = undefined;
+    const sig_blob = fakeSigBlob("ssh-dss", &buf);
+    try std.testing.expectError(
+        error.UnsupportedAlgorithm,
+        checkHostKeyAlgorithmAgreement("ssh-dss", "ssh-dss", sig_blob),
+    );
 }
 
 // ── live interop test against a real OpenSSH sshd (gated) ───────────────────

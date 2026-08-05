@@ -1375,6 +1375,12 @@ const dkx_i_s = "I_S direct-kex server kexinit payload (opaque here)";
 const DirectKexClient = struct {
     port: u16,
     kex_name: []const u8,
+    /// What the client claims it negotiated for the host-key algorithm.
+    /// Defaults to the algorithm `directDhConsistency`'s server side
+    /// actually signs with (`fixture_ed25519_key`); a test that wants to
+    /// exercise a MISMATCH (server signs one algorithm, client claims it
+    /// negotiated another) overrides this.
+    negotiated_host_key_algorithm: []const u8 = "ssh-ed25519",
     err: ?anyerror = null,
     hash: [64]u8 = undefined,
     hash_len: u8 = 0,
@@ -1410,7 +1416,7 @@ const DirectKexClient = struct {
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
         var none: transport.CipherState = .none;
-        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, acceptAnyHostKey, self.kex_name);
+        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, acceptAnyHostKey, self.kex_name, self.negotiated_host_key_algorithm);
         defer res.zeroize();
         self.hash_len = res.hash_len;
         @memcpy(self.hash[0..res.hash_len], res.hash());
@@ -1462,6 +1468,54 @@ test "self-consistency (direct KEX): diffie-hellman-group14-sha256" {
 
 test "self-consistency (direct KEX): diffie-hellman-group16-sha512" {
     try directDhConsistency("diffie-hellman-group16-sha512");
+}
+
+test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature when rsa-sha2-512 was negotiated (RFC 8332 three-way check)" {
+    // End-to-end proof, not just a unit test of the helper: the server here
+    // signs with its real, correctly-typed `rsa-sha2-256` key — nothing on
+    // the wire is forged. The only thing "wrong" is what the CLIENT claims
+    // it negotiated. Before `checkHostKeyAlgorithmAgreement` existed,
+    // `dhGroupKex` never looked at the negotiated name at all, so this
+    // handshake would have completed "successfully" while silently
+    // accepting a weaker hash than the one supposedly agreed in KEXINIT.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try listenLoopback(io, &port);
+    defer listener.deinit(io);
+
+    const kex_name = "diffie-hellman-group14-sha256";
+    var client = DirectKexClient{
+        .port = port,
+        .kex_name = kex_name,
+        .negotiated_host_key_algorithm = "rsa-sha2-512",
+    };
+    const th = try std.Thread.spawn(.{}, DirectKexClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) th.join();
+
+    var stream = try listener.accept(io);
+    defer stream.close(io);
+    var rbuf: [32 * 1024]u8 = undefined;
+    var wbuf: [32 * 1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    // Freshly loaded, `.hash` is pinned to `.sha2_256` (see `HostKey.
+    // fromOpenSSH`'s doc comment) — this key signs "rsa-sha2-256", never
+    // "rsa-sha2-512".
+    const hk = try HostKey.fromOpenSSH(fixture_rsa_key, null);
+    try std.testing.expectEqualStrings("rsa-sha2-256", hk.algorithmName());
+    var none: transport.CipherState = .none;
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
+    defer res.zeroize();
+
+    th.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, error.HostKeyVerificationFailed), client.err);
 }
 
 /// Builds a raw (unencrypted, `.none` cipher) `SSH_MSG_KEXDH_INIT` packet

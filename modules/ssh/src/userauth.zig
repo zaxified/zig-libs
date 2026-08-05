@@ -133,17 +133,6 @@ pub fn signedBlob(
     try messages.writeString(w, key_blob);
 }
 
-/// The set of `publickey` algorithm names this module accepts, and the key
-/// blob type each one implies (RFC 8332 §3: an `rsa-sha2-*` *signature*
-/// algorithm still uses an `ssh-rsa`-typed *key* blob).
-fn keyBlobTypeFor(algorithm: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, algorithm, "ssh-ed25519")) return "ssh-ed25519";
-    if (std.mem.eql(u8, algorithm, "rsa-sha2-256")) return "ssh-rsa";
-    if (std.mem.eql(u8, algorithm, "rsa-sha2-512")) return "ssh-rsa";
-    if (std.mem.eql(u8, algorithm, "ecdsa-sha2-nistp256")) return "ecdsa-sha2-nistp256";
-    return null;
-}
-
 // ── client side ────────────────────────────────────────────────────────────
 
 /// Client-side `publickey` options.
@@ -357,7 +346,8 @@ fn awaitAuthReply(t: *transport.Transport, scratch: []u8) UserauthError!AuthRepl
 /// `algorithm` is the *signature* algorithm name from the request, which is
 /// NOT always the key blob's own type name: RFC 8332 §3 pairs both
 /// `rsa-sha2-256` and `rsa-sha2-512` with an `ssh-rsa`-typed blob (that
-/// pairing is enforced by `keyBlobTypeFor` before this hook is called). A
+/// pairing is enforced by `transport.keyBlobTypeFor` before this hook is
+/// called). A
 /// callback that compares an `authorized_keys` line should compare
 /// `key_blob` — the full wire blob, type prefix included, exactly what
 /// `AuthKey.publicBlob` produces and what the base64 field of an
@@ -548,7 +538,7 @@ fn servePublickey(
     // of the type that algorithm implies (RFC 8332 §3 for the rsa-sha2-*
     // name/`ssh-rsa` blob-type split). Rejecting a mismatch here stops an
     // "announce ed25519, present an RSA blob" style confusion at the door.
-    const want_blob_type = keyBlobTypeFor(algorithm) orelse return .failure;
+    const want_blob_type = transport.keyBlobTypeFor(algorithm) orelse return .failure;
     var kc = Cursor{ .b = key_blob };
     const blob_type = kc.string() catch return .failure;
     if (!std.mem.eql(u8, blob_type, want_blob_type)) return .failure;
@@ -684,16 +674,6 @@ test "sessionId borrows from the transport (regression: not a dead stack copy)" 
     // whatever the stack happened to hold — which is how the signature ends
     // up bound to nothing at all.
     try t.expectEqual(@intFromPtr(&tr.session_id.?.bytes[0]), @intFromPtr(s.ptr));
-}
-
-test "keyBlobTypeFor: rsa-sha2-* signature algorithms use an ssh-rsa key blob" {
-    const t = std.testing;
-    try t.expectEqualStrings("ssh-rsa", keyBlobTypeFor("rsa-sha2-256").?);
-    try t.expectEqualStrings("ssh-rsa", keyBlobTypeFor("rsa-sha2-512").?);
-    try t.expectEqualStrings("ssh-ed25519", keyBlobTypeFor("ssh-ed25519").?);
-    try t.expectEqualStrings("ecdsa-sha2-nistp256", keyBlobTypeFor("ecdsa-sha2-nistp256").?);
-    try t.expectEqual(@as(?[]const u8, null), keyBlobTypeFor("ssh-dss"));
-    try t.expectEqual(@as(?[]const u8, null), keyBlobTypeFor("ssh-rsa")); // SHA-1, refused
 }
 
 /// Frame `payloads` as plaintext binary packets (the `.none` cipher state) so
@@ -864,7 +844,7 @@ test "servePublickey: an ed25519 key blob, its OWN valid signature, wrapped in a
 
     const session_id = "session-mismatch";
     const user = "alice";
-    const lying_algorithm = "rsa-sha2-256"; // keyBlobTypeFor => "ssh-rsa", but `blob` is "ssh-ed25519"
+    const lying_algorithm = "rsa-sha2-256"; // transport.keyBlobTypeFor => "ssh-rsa", but `blob` is "ssh-ed25519"
 
     var mbuf: [512]u8 = undefined;
     var mw: std.Io.Writer = .fixed(&mbuf);
