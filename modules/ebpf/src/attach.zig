@@ -2465,3 +2465,41 @@ test "LIVE: cgroup attach + detach in a throwaway cgroup" {
     // Idempotent.
     try cg.detach();
 }
+
+// ── fuzz: the one text parser in this file ──────────────────────────────────
+//
+// Everything else in this file is a syscall wrapper (perf_event_open,
+// ioctl, netlink, bpf()) — there is no "parse untrusted bytes" surface to
+// fuzz there; the errno-to-error-set mappings are pure switches over a
+// small enumerable domain, already exhaustively covered by the deterministic
+// tests above. The netlink ACK reply IS parsed (`waitAck`, via the sibling
+// `netlink` module's `codec.MessageIterator`), but that parser is already a
+// fuzz target in `netlink`'s own test suite (`codec.zig`'s "fuzz: walkers
+// never panic...", `root.zig`'s "fuzz: typed parsers...") — refuzzing the
+// same code here through this module's thin wrapper would add no new
+// coverage.
+//
+// `parseConfigShift` is the one exception: a small hand-rolled text parser
+// (`"config:N"` / `"config:N-M"`) reading a kernel sysfs file. The file is
+// trusted in practice (root-owned, mode 0444), but it is still BYTES READ
+// FROM DISK rather than a value this process constructed, and the function
+// is explicitly `pub` and split out "so the ... grammar is testable without
+// sysfs" per its own doc comment — so it is fuzzed here for the same reason
+// its existing edge-case tests exist.
+
+test "fuzz: parseConfigShift never panics on arbitrary sysfs-file bytes" {
+    try testing.fuzz({}, fuzzParseConfigShift, .{});
+}
+
+fn fuzzParseConfigShift(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const default: u6 = smith.value(u6);
+    // The u6 return type already makes "out of range" unrepresentable; the
+    // property under test is that arbitrary bytes (short reads, embedded
+    // NULs, non-ASCII, digit strings far longer than any real shift value,
+    // a bare "config:" with nothing after it, multiple '-' separators, …)
+    // never trip an unreachable/overflow/index-out-of-bounds path.
+    _ = parseConfigShift(buf[0..len], default);
+}

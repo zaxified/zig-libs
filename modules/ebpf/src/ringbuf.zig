@@ -518,14 +518,31 @@ pub fn mapInfo(map_fd: linux.fd_t) OpenError!MapInfo {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 //
-// Two layers, per this module's SPEC.md:
+// Three layers, per this module's SPEC.md:
 //  1. UNPRIVILEGED, always run: a hand-built in-memory FAKE RING driving the
 //     real `Reader` consumer — multi-record walks, wrap-around, discard,
 //     busy-skip, truncated/hostile headers, and the barrier-ordered position
 //     updates, all without a kernel. This is the backbone of this file's
 //     coverage: everything except the mmap/epoll syscalls themselves is
 //     exercised here.
-//  2. PRIVILEGED, gracefully skipped: a real `BPF_MAP_TYPE_RINGBUF` map,
+//  1b. A DETERMINISTIC BOUNDARY SWEEP over the exact edges a fuzzer rarely
+//      hits by chance (below, "boundary:" prefixed tests): the stride ==
+//      ring_size cutoff (accepted) vs. one 8-byte granule past it (rejected),
+//      BUSY-takes-priority-over-DISCARD, why a record header can never
+//      straddle the ring's physical end, absolute positions far from zero
+//      (a long-lived ring's counters are not restarted at 0), and
+//      `recordStride` at the record length's maximum representable value
+//      (no usize overflow). Each asserts a SPECIFIC outcome, not merely "did
+//      not crash" — see feedback_external_anchor_limits in project memory for
+//      why a fuzz-only pass is close to worthless on its own.
+//  2. A COVERAGE-GUIDED FUZZ TARGET (`testing.fuzz`, below) drives the real
+//     record walk over an arbitrary byte buffer standing in for the mapped
+//     region, with positions kept within a bounded backlog of the ring size
+//     — mirroring the kernel's own invariant that a well-behaved producer
+//     never lets the backlog exceed the ring's capacity, which is also what
+//     keeps a hostile RECORD CONTENT from turning into an unbounded loop
+//     (each `next()` call is bounded by that backlog / the 8-byte granule).
+//  3. PRIVILEGED, gracefully skipped: a real `BPF_MAP_TYPE_RINGBUF` map,
 //     mmap'd and consumed end-to-end. Prints a SKIPPED line and PASSES when
 //     CAP_BPF is missing.
 
@@ -869,6 +886,129 @@ test "fake ring: hostile record headers are typed errors, never panics" {
     }
 }
 
+test "boundary: stride exactly at ring_size is accepted, one granule past is not" {
+    // ring_size = 64: a record's stride (header + payload, 8-byte rounded)
+    // may consume the WHOLE ring but not exceed it. `next()`'s check is
+    // `stride > self.ring_size`, so equality is deliberately the accept
+    // side of the line — assert both edges explicitly, not just "big value
+    // rejected" as the pre-existing hostile-header tests do.
+    {
+        var ring = try FakeRing.init(testing.allocator, 64);
+        defer ring.deinit();
+        // len = 56 -> stride = alignForward(56+8, 8) = 64 == ring_size.
+        ring.pokeU32(0, 56);
+        ring.pokeU32(4, 0);
+        ring.producer_pos = 64;
+        ring.publish();
+        var rb = ring.reader();
+        const rec = (try rb.next()).?;
+        try testing.expectEqual(@as(usize, 56), rec.data.len);
+        rb.advance();
+        try testing.expectEqual(@as(u64, 64), ring.kernelVisibleConsumerPos());
+    }
+    {
+        var ring = try FakeRing.init(testing.allocator, 64);
+        defer ring.deinit();
+        // len = 57 -> stride = alignForward(57+8, 8) = 72 > 64 == ring_size.
+        ring.pokeU32(0, 57);
+        ring.pokeU32(4, 0);
+        ring.producer_pos = 72;
+        ring.publish();
+        var rb = ring.reader();
+        try testing.expectError(error.CorruptRecord, rb.next());
+    }
+}
+
+test "boundary: BUSY takes priority over DISCARD when both bits are set" {
+    // A well-behaved kernel never sets both, but the header is untrusted
+    // bytes as far as this consumer is concerned — the code checks BUSY
+    // first, so a record claiming both must stop the walk (return null),
+    // never be silently skipped as a discard.
+    var ring = try FakeRing.init(testing.allocator, 4096);
+    defer ring.deinit();
+    ring.pokeU32(0, BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT);
+    ring.pokeU32(4, 0);
+    ring.producer_pos = 4096;
+    ring.publish();
+    var rb = ring.reader();
+    try testing.expectEqual(@as(?Record, null), try rb.next());
+    // Nothing was released: a BUSY stop must not advance consumer_pos.
+    try testing.expectEqual(@as(u64, 0), ring.kernelVisibleConsumerPos());
+}
+
+test "boundary: a zero-length BUSY record still stops the walk, not just non-zero ones" {
+    var ring = try FakeRing.init(testing.allocator, 4096);
+    defer ring.deinit();
+    ring.pokeU32(0, BPF_RINGBUF_BUSY_BIT); // len = 0, busy
+    ring.pokeU32(4, 0);
+    ring.producer_pos = 4096;
+    ring.publish();
+    var rb = ring.reader();
+    try testing.expectEqual(@as(?Record, null), try rb.next());
+}
+
+test "boundary: a record header can never straddle the ring's physical end" {
+    // Structural argument, made concrete: `next()` only ever reads a header
+    // at `off = consumer_pos & mask`, and consumer_pos is rejected unless
+    // it is a multiple of 8 (the granule check). Since `ring_size` is
+    // itself always a multiple of 8 (a real ring is a multiple of the page
+    // size; `openWithRingSize` enforces that), `off` can only take values
+    // in `{0, 8, 16, ..., ring_size - 8}` — the 4-byte header read at `off`
+    // therefore always lands fully inside `[0, ring_size)`, never crossing
+    // into the second (aliased) copy. This test exercises the LARGEST
+    // reachable offset (`ring_size - 8`, the tightest the invariant gets)
+    // and confirms it decodes correctly using only the first copy.
+    var ring = try FakeRing.init(testing.allocator, 64);
+    defer ring.deinit();
+    // Place a record's header directly at offset 56 = ring_size - 8, the
+    // largest legal offset (a fresh ring, not a walk from 0, so the
+    // producer never gets more than one ring's worth ahead of the
+    // consumer — going further would mean the "producer" overwrote data
+    // the consumer had not read yet, which is a self-inflicted corruption
+    // of the TEST, not a property of the real Reader).
+    ring.pokeU32(56, 1); // len = 1, no flags
+    ring.pokeU32(60, 0); // pg_off, unused
+    ring.pokeByte(64, 'z'); // the 1-byte payload — physically wraps to offset 0
+    ring.producer_pos = 72; // 56 + recordStride(1) = 56 + 16
+    ring.publish();
+
+    var rb = ring.reader();
+    rb.consumer_pos = 56; // start exactly at the record under test
+    const rec = (try rb.next()).?;
+    try testing.expectEqualStrings("z", rec.data);
+    rb.advance();
+    try testing.expectEqual(@as(u64, 72), ring.kernelVisibleConsumerPos());
+}
+
+test "boundary: absolute positions far from zero decode identically to fresh ones" {
+    // A long-lived ring's counters are cumulative byte totals, never reset
+    // — a reader attaching to one that has been running a while starts from
+    // some large, non-zero, 8-aligned position. The mask arithmetic must
+    // not have a hidden dependency on positions starting near zero.
+    var ring = try FakeRing.init(testing.allocator, 4096);
+    defer ring.deinit();
+    const far: u64 = 1_000_000_000 * 8; // large, still a multiple of 8
+    ring.producer_pos = far;
+
+    ring.append("after-a-long-life", 0);
+    var rb = ring.reader();
+    rb.consumer_pos = far;
+    const rec = (try rb.next()).?;
+    try testing.expectEqualStrings("after-a-long-life", rec.data);
+    rb.advance();
+    try testing.expectEqual(ring.producer_pos, ring.kernelVisibleConsumerPos());
+}
+
+test "boundary: recordStride at the record length's maximum does not overflow" {
+    // BPF_RINGBUF_LEN_MASK is the largest `len` a header can carry once the
+    // two flag bits are masked off (~1 GiB). On a 64-bit usize, len + 8
+    // rounded up to 8 must not wrap — assert the exact value, not just
+    // "did not crash".
+    const max_len = BPF_RINGBUF_LEN_MASK;
+    try testing.expectEqual(@as(usize, 1_073_741_832), recordStride(max_len));
+    try testing.expect(recordStride(max_len) > max_len);
+}
+
 test "fake ring: a zero-length record is legal and yields an empty payload" {
     var ring = try FakeRing.init(testing.allocator, 4096);
     defer ring.deinit();
@@ -956,6 +1096,107 @@ test "MapInfo mirrors the kernel's bpf_map_info prefix layout" {
     try testing.expectEqual(@as(usize, 48), @offsetOf(MapInfo, "netns_dev"));
     try testing.expectEqual(@as(usize, 80), @offsetOf(MapInfo, "map_extra"));
     try testing.expectEqual(@as(usize, 88), @sizeOf(MapInfo));
+}
+
+test "fuzz: record walk over hostile mmap-region bytes never panics or reads out of bounds" {
+    try testing.fuzz({}, fuzzRingbufWalk, .{});
+}
+
+/// Drives the real `Reader.next()`/`advance()` over a hand-built region whose
+/// DATA bytes are entirely fuzzer-controlled — standing in for the mmap'd
+/// ring a hostile or corrupted kernel-side record header would produce (see
+/// this file's header comment: every record header field is treated as
+/// untrusted). No real map or syscall is involved; `owns_mappings = false`
+/// mirrors `FakeRing.reader()` so `close()` is never called on it.
+///
+/// The backlog (`producer_pos - consumer_pos`) is deliberately capped to a
+/// few ring lengths, matching the invariant a well-behaved kernel always
+/// upholds (it never lets the unread backlog exceed the ring's capacity) —
+/// this is what keeps a single `next()` call's internal discard-skipping
+/// loop bounded, rather than fuzzing toward an unrelated "huge backlog"
+/// hang that a real mmap'd ring could never actually present.
+fn fuzzRingbufWalk(_: void, smith: *std.testing.Smith) !void {
+    const ring_size: usize = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => 64,
+        1 => 128,
+        2 => 256,
+        else => 512,
+    };
+    const page = std.heap.page_size_min;
+    const alignment: std.mem.Alignment = comptime .fromByteUnits(std.heap.page_size_min);
+    const gpa = testing.allocator;
+
+    const cons = try gpa.alignedAlloc(u8, alignment, page);
+    defer gpa.free(cons);
+    const data = try gpa.alignedAlloc(u8, alignment, page + 2 * ring_size);
+    defer gpa.free(data);
+    @memset(cons, 0);
+    @memset(data, 0);
+
+    // Fill the ring's data bytes with arbitrary content. Most of the time
+    // mirror it into both copies (what a consistent kernel aliasing
+    // produces); occasionally let them disagree, covering the case of a
+    // genuinely corrupted second copy too.
+    var buf: [512]u8 = undefined;
+    smith.bytes(buf[0..ring_size]);
+    @memcpy(data[page..][0..ring_size], buf[0..ring_size]);
+    if (smith.boolWeighted(9, 10)) {
+        @memcpy(data[page + ring_size ..][0..ring_size], buf[0..ring_size]);
+    } else {
+        var buf2: [512]u8 = undefined;
+        smith.bytes(buf2[0..ring_size]);
+        @memcpy(data[page + ring_size ..][0..ring_size], buf2[0..ring_size]);
+    }
+
+    // consumer_pos: an arbitrary 8-aligned absolute position, far from zero
+    // most of the time (a long-lived ring), occasionally perturbed off the
+    // 8-byte granule to also exercise the InconsistentPositions rejection.
+    var consumer_start: u64 = @as(u64, smith.value(u32)) * 8;
+    if (smith.boolWeighted(1, 8)) consumer_start +|= @as(u64, smith.valueRangeAtMost(u8, 1, 7));
+
+    // producer_pos: consumer_start plus/minus a bounded delta (bounded so a
+    // hostile CONTENT pattern cannot turn into an effectively-unbounded
+    // internal loop — see the doc comment above), using saturating
+    // arithmetic so a subtraction near zero cannot wrap around into a huge
+    // value instead of the intended "producer behind consumer" case.
+    const delta: u64 = @as(u64, smith.valueRangeAtMost(u32, 0, @intCast(ring_size * 4)));
+    const producer_pos = if (smith.boolWeighted(9, 10))
+        consumer_start +| delta
+    else
+        consumer_start -| delta;
+
+    @atomicStore(u64, @as(*u64, @ptrCast(@alignCast(data.ptr))), producer_pos, .release);
+
+    var rb: Reader = .{
+        .map_fd = -1,
+        .cons_page = cons,
+        .data_pages = data,
+        .data_off = page,
+        .ring_size = ring_size,
+        .mask = ring_size - 1,
+        .consumer_pos = consumer_start,
+        .pending = 0,
+        .epoll_fd = -1,
+        .owns_mappings = false,
+    };
+
+    // Bounded independently of the position math above: even if every
+    // assumption elsewhere in this function were wrong, this loop itself
+    // cannot run away.
+    var iterations: usize = 0;
+    while (iterations < 4096) : (iterations += 1) {
+        // Every decode failure is one of the module's own typed
+        // `ConsumeError` variants — never a panic, never a bare
+        // `unreachable`. `catch break` is exhaustive over both.
+        const rec = rb.next() catch break;
+        const r = rec orelse break;
+        // The returned slice must lie fully inside the mapped double
+        // region — the one property that would matter for memory safety
+        // if the bounds checks above this were ever wrong.
+        try testing.expect(@intFromPtr(r.data.ptr) >= @intFromPtr(data.ptr));
+        try testing.expect(@intFromPtr(r.data.ptr) + r.data.len <= @intFromPtr(data.ptr) + data.len);
+        rb.advance();
+    }
 }
 
 test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {
