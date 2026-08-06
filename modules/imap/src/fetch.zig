@@ -200,6 +200,13 @@ pub fn encode(
     by_uid: bool,
     req: Request,
 ) command.Error!void {
+    // Everything the caller supplied is checked *before* the first byte goes
+    // out. The encoder writes straight into the session's buffer, so failing
+    // half way would leave `T1 FETCH ` sitting in front of the next command.
+    try command.checkArg(tag);
+    try command.checkSequenceSet(seq_set);
+    for (req.sections) |sec| try command.checkSection(sec);
+
     try e.atom(tag);
     try e.sp();
     if (by_uid) {
@@ -864,4 +871,83 @@ test "encode: an empty request still asks for something valid" {
     try encode(&e, "A1", "1", false, .{});
     // "()" is not a valid item list.
     try testing.expectEqualStrings("A1 FETCH 1 (UID)\r\n", w.buffered());
+}
+
+test "encode: a seq_set cannot smuggle a second command onto the wire" {
+    // The audit's reproducer, verbatim. Before the fix this emitted
+    // `T1 FETCH 1:*\r\nT9 DELETE "Important" (UID)\r\n` — a fully-formed
+    // DELETE on an authenticated connection, from a caller who thought they
+    // were naming messages.
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var e = command.Encoder.init(testing.allocator, &w, .{});
+    try testing.expectError(
+        error.InvalidSequenceSet,
+        encode(&e, "T1", "1:*\r\nT9 DELETE \"Important\"", false, .{ .uid = true }),
+    );
+    // Not one byte, either: a half-written command would sit in the session's
+    // buffer and prefix whatever the caller sends next.
+    try testing.expectEqualStrings("", w.buffered());
+
+    // The section variant: `BODY.PEEK[HEADER]\r\nT9 LOGOUT]`.
+    try testing.expectError(
+        error.InvalidSection,
+        encode(&e, "T2", "1", false, .{ .sections = &.{"HEADER]\r\nT9 LOGOUT"} }),
+    );
+    try testing.expectEqualStrings("", w.buffered());
+
+    // A bad section in the *second* slot must not leave the first one written.
+    try testing.expectError(
+        error.InvalidSection,
+        encode(&e, "T3", "1", false, .{ .sections = &.{ "HEADER", "TEXT]\r\nT9 LOGOUT" } }),
+    );
+    try testing.expectEqualStrings("", w.buffered());
+
+    // And a tag is an unframed argument too.
+    try testing.expectError(
+        error.ControlCharacterInArgument,
+        encode(&e, "T4\r\nT9 LOGOUT", "1", false, .{}),
+    );
+    try testing.expectEqualStrings("", w.buffered());
+}
+
+test "fuzz: no FETCH argument can put a second command line on the wire" {
+    try testing.fuzz({}, fuzzEncode, .{});
+}
+
+/// `fetch.encode` never calls `string`, so it never emits a literal: every byte
+/// it writes is either a constant or a caller argument written unframed. That
+/// makes the invariant exact — one CRLF, at the very end, and no stray CR or LF
+/// anywhere before it. The shape is `smtp/src/command.zig`'s `fuzzCommands`.
+fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
+    var raw: [96]u8 = undefined;
+    smith.bytes(&raw);
+    // From 0: the empty seq_set and the empty section are both interesting, and
+    // a harness that cannot draw them cannot reach half of this grammar.
+    const seq = raw[0..smith.valueRangeAtMost(u8, 0, 48)];
+    const sec = raw[48..][0..smith.valueRangeAtMost(u8, 0, 48)];
+    const tag = if (smith.value(bool)) "T1" else seq;
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var e = command.Encoder.init(std.testing.allocator, &w, .{});
+
+    const req: Request = .{
+        .uid = smith.value(bool),
+        .flags = smith.value(bool),
+        .body_structure = smith.value(bool),
+        .sections = &.{sec},
+        .peek = smith.value(bool),
+    };
+    if (encode(&e, tag, seq, smith.value(bool), req)) |_| {
+        const line = w.buffered();
+        std.debug.assert(std.mem.endsWith(u8, line, "\r\n"));
+        const body = line[0 .. line.len - 2];
+        std.debug.assert(std.mem.indexOfScalar(u8, body, '\r') == null);
+        std.debug.assert(std.mem.indexOfScalar(u8, body, '\n') == null);
+        std.debug.assert(std.mem.indexOfScalar(u8, body, 0) == null);
+    } else |_| {
+        // A refusal must also be a clean refusal: nothing half-written.
+        std.debug.assert(w.buffered().len == 0);
+    }
 }

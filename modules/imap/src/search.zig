@@ -80,6 +80,13 @@ pub fn encode(
     ret: Return,
     crit: *const Criteria,
 ) command.Error!void {
+    // Before any output: the criteria tree is walked for the values that go out
+    // unframed. A nested `NOT (…)` is written after its parent's `NOT (`, so
+    // discovering a bad key down there mid-write would strand an unbalanced
+    // paren in the session's buffer.
+    try command.checkArg(tag);
+    try checkKeys(crit);
+
     try e.atom(tag);
     try e.sp();
     if (by_uid) {
@@ -112,6 +119,41 @@ pub fn encode(
     try e.sp();
     try writeKeys(e, crit);
     try e.crlf();
+}
+
+/// The five flags whose search keys the grammar spells out; see `writeFlagKey`.
+const system_flags = [_]struct { flag: []const u8, yes: []const u8, no: []const u8 }{
+    .{ .flag = "\\Seen", .yes = "SEEN", .no = "UNSEEN" },
+    .{ .flag = "\\Answered", .yes = "ANSWERED", .no = "UNANSWERED" },
+    .{ .flag = "\\Flagged", .yes = "FLAGGED", .no = "UNFLAGGED" },
+    .{ .flag = "\\Deleted", .yes = "DELETED", .no = "UNDELETED" },
+    .{ .flag = "\\Draft", .yes = "DRAFT", .no = "UNDRAFT" },
+};
+
+/// The pre-flight for `writeKeys`, in the same order and over the same fields:
+/// every value that `writeKeys` sends unframed (`atom`, `flag`) is validated
+/// here, and every value it sends through `string` is skipped, because a
+/// literal frames its own payload and cannot escape the command.
+fn checkKeys(c: *const Criteria) command.Error!void {
+    if (c.seq_set) |s| try command.checkSequenceSet(s);
+    if (c.uid_set) |s| try command.checkSequenceSet(s);
+    for (c.flag) |f| if (!validFlag(f)) return error.InvalidFlag;
+    for (c.not_flag) |f| if (!validFlag(f)) return error.InvalidFlag;
+    for (c.not) |sub| try checkKeys(sub);
+    for (c.either) |pair| {
+        try checkKeys(pair[0]);
+        try checkKeys(pair[1]);
+    }
+}
+
+/// A system flag is spelled as its own search key and never reaches `flag()`,
+/// so the pre-flight accepts exactly what `writeFlagKey` would emit: the five
+/// system names, or whatever `Encoder.flag` itself would accept.
+fn validFlag(f: []const u8) bool {
+    for (system_flags) |s| {
+        if (std.ascii.eqlIgnoreCase(f, s.flag)) return true;
+    }
+    return command.validFlag(f);
 }
 
 fn writeKeys(e: *command.Encoder, c: *const Criteria) command.Error!void {
@@ -232,14 +274,7 @@ fn writeKeys(e: *command.Encoder, c: *const Criteria) command.Error!void {
 /// negation is `UNSEEN` rather than `NOT SEEN`); a keyword goes through
 /// `KEYWORD` / `UNKEYWORD`.
 fn writeFlagKey(e: *command.Encoder, f: []const u8, negate: bool) command.Error!void {
-    const system = [_]struct { flag: []const u8, yes: []const u8, no: []const u8 }{
-        .{ .flag = "\\Seen", .yes = "SEEN", .no = "UNSEEN" },
-        .{ .flag = "\\Answered", .yes = "ANSWERED", .no = "UNANSWERED" },
-        .{ .flag = "\\Flagged", .yes = "FLAGGED", .no = "UNFLAGGED" },
-        .{ .flag = "\\Deleted", .yes = "DELETED", .no = "UNDELETED" },
-        .{ .flag = "\\Draft", .yes = "DRAFT", .no = "UNDRAFT" },
-    };
-    for (system) |s| {
+    for (system_flags) |s| {
         if (!std.ascii.eqlIgnoreCase(f, s.flag)) continue;
         return e.atom(if (negate) s.no else s.yes);
     }
@@ -498,4 +533,98 @@ test "an empty rev1 reply means no matches, not a parse failure" {
     defer f.deinit();
     const r = try parseSearch(&f.d);
     try testing.expectEqual(@as(usize, 0), r.numbers.len);
+}
+
+test "a criteria set cannot smuggle a second command onto the wire" {
+    const inject = "1:*\r\nT9 DELETE \"Important\"";
+
+    var s: Sink = undefined;
+    s.init();
+    var e = s.enc();
+    try testing.expectError(
+        error.InvalidSequenceSet,
+        encode(&e, "T1", false, .{}, &.{ .seq_set = inject }),
+    );
+    try testing.expectEqualStrings("", s.out());
+
+    try testing.expectError(
+        error.InvalidSequenceSet,
+        encode(&e, "T2", false, .{}, &.{ .uid_set = inject }),
+    );
+    try testing.expectEqualStrings("", s.out());
+
+    // Nested: `writeKeys` recurses, and the parent had already written `NOT (`
+    // before the child's key was reached. The pre-flight is what makes this a
+    // clean refusal rather than an unbalanced paren left in the buffer.
+    const inner = Criteria{ .seq_set = inject };
+    const mid = Criteria{ .not = &.{&inner} };
+    try testing.expectError(
+        error.InvalidSequenceSet,
+        encode(&e, "T3", false, .{}, &.{ .not = &.{&mid} }),
+    );
+    try testing.expectEqualStrings("", s.out());
+
+    const a = Criteria{ .body = &.{"hello"} };
+    try testing.expectError(
+        error.InvalidSequenceSet,
+        encode(&e, "T4", false, .{}, &.{ .either = &.{.{ &a, &inner }} }),
+    );
+    try testing.expectEqualStrings("", s.out());
+
+    // A keyword flag reaches the wire through `flag()`, which already refused
+    // control characters — but it did so mid-write.
+    try testing.expectError(
+        error.InvalidFlag,
+        encode(&e, "T5", false, .{}, &.{ .flag = &.{"Junk\r\nT9 LOGOUT"} }),
+    );
+    try testing.expectEqualStrings("", s.out());
+
+    // A CRLF in a BODY/TEXT/HEADER value is *not* an injection: those go out as
+    // counted literals. Refusing them would be a regression.
+    var s2: Sink = undefined;
+    s2.init();
+    var e2 = command.Encoder.init(testing.allocator, &s2.w, .{ .literal_plus = true });
+    try encode(&e2, "T6", false, .{}, &.{ .body = &.{"a\r\nb"} });
+    try testing.expectEqualStrings("T6 SEARCH BODY {4+}\r\na\r\nb\r\n", s2.out());
+}
+
+test "fuzz: no SEARCH set or flag can put a second command line on the wire" {
+    try testing.fuzz({}, fuzzEncode, .{});
+}
+
+/// Only the unframed criteria are driven here — `seq_set`, `uid_set` and the
+/// flag keys. `body`/`text`/`header` values are deliberately left out: those go
+/// through `string`, which may emit a literal whose payload legitimately holds
+/// a CR, and mixing them in would make the invariant untestable rather than
+/// stronger.
+fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
+    var raw: [96]u8 = undefined;
+    smith.bytes(&raw);
+    const seq = raw[0..smith.valueRangeAtMost(u8, 0, 32)];
+    const uid = raw[32..][0..smith.valueRangeAtMost(u8, 0, 32)];
+    const flag_key = raw[64..][0..smith.valueRangeAtMost(u8, 0, 32)];
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var e = command.Encoder.init(std.testing.allocator, &w, .{});
+
+    const inner = Criteria{
+        .seq_set = if (smith.value(bool)) seq else null,
+        .flag = &.{flag_key},
+    };
+    const crit = Criteria{
+        .uid_set = if (smith.value(bool)) uid else null,
+        .larger = smith.value(u32),
+        .not = &.{&inner},
+    };
+    if (encode(&e, "T1", smith.value(bool), .{ .count = smith.value(bool) }, &crit)) |_| {
+        const line = w.buffered();
+        std.debug.assert(std.mem.endsWith(u8, line, "\r\n"));
+        const body = line[0 .. line.len - 2];
+        std.debug.assert(std.mem.indexOfScalar(u8, body, '\r') == null);
+        std.debug.assert(std.mem.indexOfScalar(u8, body, '\n') == null);
+        std.debug.assert(std.mem.indexOfScalar(u8, body, 0) == null);
+    } else |_| {
+        std.debug.assert(w.buffered().len == 0);
+    }
 }

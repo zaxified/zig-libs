@@ -27,6 +27,20 @@
 //! into `LOGIN` alone, so a `SEARCH BODY "a\r\nb"` — perfectly legal, and
 //! literal-only — failed against a real server. One callback covers every
 //! command instead of one command.
+//!
+//! ## Why arguments are checked rather than escaped
+//!
+//! `string`/`literal` frame their value, so a CR in a password is harmless: it
+//! travels inside a counted literal. `atom` does not frame anything — it is the
+//! grammar productions that have no quoted form at all (a tag, a `sequence-set`,
+//! the text between `BODY[` and `]`). A CR there ends the command line and the
+//! rest of the caller's value becomes **a second, fully-formed command** on an
+//! authenticated connection; `1:*\r\nT9 DELETE "Important"` as a `seq_set` is
+//! the whole exploit. There is nothing to escape it *into*, so those arguments
+//! are refused — `error.ControlCharacterInArgument`, the same posture and the
+//! same spelling as the sibling `smtp` module's `checkArg`. Quoting instead
+//! would be worse than refusing: a value that reaches the server altered is a
+//! mail client acting on a mailbox the user did not name.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -48,9 +62,74 @@ pub const Error = error{
     SyncLiteralRequired,
     /// A flag with a backslash anywhere but the front, or a non-atom byte.
     InvalidFlag,
+    /// CR, LF or NUL inside an unframed argument — the command-injection
+    /// vector. Same name as `smtp`'s, deliberately.
+    ControlCharacterInArgument,
+    /// Not a `sequence-set` (RFC 9051 §9): digits, `*`, `:`, `,`, or the
+    /// RFC 5182 `$`.
+    InvalidSequenceSet,
+    /// A `BODY[...]` section specifier carrying a byte that would leave the
+    /// brackets.
+    InvalidSection,
     InvalidUtf8,
     OutOfMemory,
 };
+
+/// CR, LF and NUL can never appear in an unframed argument: the first two end
+/// the command line, and the third truncates it for a C-based server. Mirrors
+/// `smtp/src/command.zig`'s `checkArg`.
+pub fn checkArg(s: []const u8) Error!void {
+    for (s) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return error.ControlCharacterInArgument;
+    }
+}
+
+/// RFC 9051 §9 `sequence-set`: `seq-number` is a non-zero 32-bit number or
+/// `*`, joined by `:` into a range and by `,` into a set. RFC 5182 adds `$`,
+/// the last saved result, which stands alone.
+///
+/// This is stricter than `checkArg` on purpose. A sequence-set has no quoted
+/// form, so anything that is not one has to be refused rather than encoded
+/// differently, and refusing only CR/LF would still let a space through —
+/// `FETCH 1 2 (UID)` is a different command from the one the caller asked for.
+pub fn checkSequenceSet(s: []const u8) Error!void {
+    if (std.mem.eql(u8, s, "$")) return;
+    var rest = s;
+    while (true) {
+        rest = try seqNumber(rest);
+        if (rest.len != 0 and rest[0] == ':') rest = try seqNumber(rest[1..]);
+        if (rest.len == 0) return;
+        if (rest[0] != ',') return error.InvalidSequenceSet;
+        rest = rest[1..];
+    }
+}
+
+fn seqNumber(s: []const u8) Error![]const u8 {
+    if (s.len == 0) return error.InvalidSequenceSet;
+    if (s[0] == '*') return s[1..];
+    // `nz-number = digit-nz *DIGIT` — no leading zero, and it must fit.
+    if (s[0] < '1' or s[0] > '9') return error.InvalidSequenceSet;
+    var i: usize = 0;
+    while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    _ = std.fmt.parseInt(u32, s[0..i], 10) catch return error.InvalidSequenceSet;
+    return s[i..];
+}
+
+/// The text between `BODY[` and `]` — RFC 9051 §9 `section-spec`: part
+/// numbers, `HEADER`, `HEADER.FIELDS (…)`, `TEXT`, `MIME`, or empty.
+///
+/// Checked by character class rather than by the full grammar, because a
+/// client asking for a section this module has not heard of should get the
+/// *server's* answer and not ours. What is refused is exactly the two ways out
+/// of the brackets: `]` closes them early (the auditor's second reproducer
+/// emitted `BODY.PEEK[HEADER]\r\nT9 LOGOUT]`), and any control byte ends the
+/// line. Non-ASCII goes too — a section specifier is ASCII in every form the
+/// grammar has.
+pub fn checkSection(s: []const u8) Error!void {
+    for (s) |c| {
+        if (c == ']' or c < 0x20 or c >= 0x7f) return error.InvalidSection;
+    }
+}
 
 pub const Options = struct {
     /// Raw UTF-8 inside quoted strings. Requires IMAP4rev2 or `UTF8=ACCEPT`;
@@ -94,7 +173,10 @@ pub const Encoder = struct {
         e.w.writeAll(s) catch return error.WriteFailed;
     }
 
+    /// An unframed argument. Nothing here can be escaped, so a byte that would
+    /// end the line is refused; see the module note.
     pub fn atom(e: *Encoder, s: []const u8) Error!void {
+        try checkArg(s);
         return e.raw(s);
     }
 
@@ -102,8 +184,12 @@ pub const Encoder = struct {
         return e.raw(" ");
     }
 
+    /// A grammar delimiter. Public, therefore checked: a caller reaching for
+    /// `special('\r')` is writing a command boundary, not a delimiter.
     pub fn special(e: *Encoder, ch: u8) Error!void {
-        return e.raw(&[_]u8{ch});
+        const one = [_]u8{ch};
+        try checkArg(&one);
+        return e.raw(&one);
     }
 
     pub fn crlf(e: *Encoder) Error!void {
@@ -116,9 +202,12 @@ pub const Encoder = struct {
         return e.raw(s);
     }
 
-    /// A quoted string, escaping `"` and `\`. Assumes the value is quotable;
-    /// use `string` to choose the form.
+    /// A quoted string, escaping `"` and `\`. Assumes the value is otherwise
+    /// quotable; use `string` to choose the form. The three bytes a quoted
+    /// string can never hold are checked rather than assumed, because this is
+    /// public and a direct caller would otherwise inject through it.
     pub fn quoted(e: *Encoder, s: []const u8) Error!void {
+        try checkArg(s);
         try e.raw("\"");
         var start: usize = 0;
         for (s, 0..) |ch, i| {
@@ -270,7 +359,9 @@ pub const Encoder = struct {
     }
 };
 
-fn validFlag(s: []const u8) bool {
+/// What `Encoder.flag` accepts. Public so `search`'s pre-flight can ask the
+/// question without a second copy of the rule.
+pub fn validFlag(s: []const u8) bool {
     if (s.len == 0) return false;
     if (std.mem.eql(u8, s, "\\*")) return true;
     for (s, 0..) |ch, i| {
@@ -445,6 +536,71 @@ test "tags never repeat" {
     defer gpa.free(b);
     try testing.expectEqualStrings("T1", a);
     try testing.expectEqualStrings("T2", b);
+}
+
+test "an unframed argument cannot carry a byte that ends the command line" {
+    var s: Sink = undefined;
+    s.init();
+    var e = s.enc(testing.allocator, .{});
+
+    // The exploit, at the primitive: `atom` had no validation at all, so this
+    // put `T1 FETCH 1:*` and then a whole second command on the wire.
+    try testing.expectError(
+        error.ControlCharacterInArgument,
+        e.atom("1:*\r\nT9 DELETE \"Important\""),
+    );
+    try testing.expectError(error.ControlCharacterInArgument, e.atom("a\nb"));
+    try testing.expectError(error.ControlCharacterInArgument, e.atom("a\x00b"));
+    // `quoted` is public and escapes only `"` and `\`, so it was the second way
+    // through; `special` is public and takes a byte, so it was the third.
+    try testing.expectError(error.ControlCharacterInArgument, e.quoted("a\r\nT9 NOOP"));
+    try testing.expectError(error.ControlCharacterInArgument, e.special('\r'));
+    try testing.expectError(error.ControlCharacterInArgument, e.special(0));
+
+    // Nothing was emitted by any of them.
+    try testing.expectEqualStrings("", s.written());
+
+    // What is framed stays legal: a literal counts its own bytes, so a CR in a
+    // password is not an injection and must not start being refused.
+    var s2: Sink = undefined;
+    s2.init();
+    var e2 = s2.enc(testing.allocator, .{ .literal_plus = true });
+    try e2.login("a1", "u", "pa\r\nss");
+    try testing.expectEqualStrings("a1 LOGIN \"u\" {6+}\r\npa\r\nss\r\n", s2.written());
+}
+
+test "sequence-set: the grammar, not just the absence of CRLF" {
+    for ([_][]const u8{ "1", "1:*", "*", "2:4", "12:13", "1:5,7,9:*", "$", "4294967295" }) |ok| {
+        checkSequenceSet(ok) catch |err| {
+            std.debug.print("rejected a valid sequence-set {s}: {}\n", .{ ok, err });
+            return error.TestUnexpectedResult;
+        };
+    }
+    for ([_][]const u8{
+        "1:*\r\nT9 DELETE \"Important\"", // the audit's reproducer
+        "", // FETCH with no set at all
+        "1 2", // a space is a second argument, not a set
+        "0", // nz-number
+        "01", // leading zero
+        "1:", "1,", ",1", ":2", "1::2", "4294967296", "1;2", "$1", "1 ",
+    }) |bad| {
+        testing.expectError(error.InvalidSequenceSet, checkSequenceSet(bad)) catch {
+            std.debug.print("accepted a bad sequence-set: {s}\n", .{bad});
+            return error.TestUnexpectedResult;
+        };
+    }
+}
+
+test "section specifier: the two ways out of the brackets are shut" {
+    for ([_][]const u8{ "", "HEADER", "TEXT", "1.2", "HEADER.FIELDS (FROM TO)", "2.MIME" }) |ok| {
+        try checkSection(ok);
+    }
+    // `]` closes the brackets early; the auditor's second reproducer used both.
+    try testing.expectError(error.InvalidSection, checkSection("HEADER]\r\nT9 LOGOUT"));
+    try testing.expectError(error.InvalidSection, checkSection("HEADER] (FLAGS"));
+    try testing.expectError(error.InvalidSection, checkSection("A\rB"));
+    try testing.expectError(error.InvalidSection, checkSection("A\x00B"));
+    try testing.expectError(error.InvalidSection, checkSection("caf\u{e9}"));
 }
 
 test "round trip: what the encoder writes, the response reader's grammar reads" {

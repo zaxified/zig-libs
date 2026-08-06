@@ -185,6 +185,38 @@ test "LIVE pymap interop: greet -> login -> select -> fetch -> search -> idle ->
     try testing.expect(saw_envelope);
     try testing.expect(saw_structure);
 
+    // ── command injection, against a server that would obey it ──────────────
+    //
+    // The audit's reproducer, pointed at a real IMAP server on an
+    // authenticated, selected connection. `1:*\r\nT9 STORE ...` as a seq-set
+    // used to put a second, fully-formed command on this socket, and pymap
+    // would have run it — a mailbox mutation from a caller who thought they
+    // were naming messages.
+    //
+    // Two things are checked that no offline Sink can check. The client
+    // refuses; and the *connection is still in sync afterwards*, which is the
+    // property that a half-written `T7 FETCH ` left in the write buffer would
+    // break — it would prefix the next command and the server would answer BAD.
+    try testing.expectError(error.InvalidSequenceSet, c.fetchMessages(
+        out.allocator(),
+        "1:*\r\nT9 STORE 1 +FLAGS (\\Deleted)",
+        false,
+        .{ .uid = true },
+    ));
+    try testing.expectError(error.InvalidSection, c.fetchMessages(
+        out.allocator(),
+        "1",
+        false,
+        .{ .sections = &.{"HEADER]\r\nT9 STORE 1 +FLAGS (\\Deleted)"} },
+    ));
+
+    const after = try c.fetchMessages(out.allocator(), "1", false, .{ .flags = true });
+    try testing.expectEqual(@as(usize, 1), after.len);
+    for (after[0].items) |it| {
+        if (it != .flags) continue;
+        for (it.flags) |f| try testing.expect(!std.ascii.eqlIgnoreCase(f, "\\Deleted"));
+    }
+
     // ── a synchronising literal against a real server ───────────────────────
     //
     // pymap advertises LITERAL+, so the encoder would take the non-sync path
