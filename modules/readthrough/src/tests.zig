@@ -254,3 +254,69 @@ test "concurrent mixed keys: no lock-up, no leak, every key resolves" {
     for (&threads) |t| t.join();
     for (&soaks) |*sk| try testing.expect(sk.ok);
 }
+
+test "a leader that OOMs on the result copy hands EVERY follower the error, not an empty value" {
+    // The follower half of the fail-open defect: the leader used to substitute
+    // `&[_]u8{}` for a failed result copy and publish it, so all N coalesced
+    // callers got `.value` with `len == 0` — indistinguishable from a backend
+    // that really returned "" — while the cache held the correct bytes and the
+    // whole thing self-healed on the next get. Every participant must instead
+    // see `error.OutOfMemory`.
+    const value_len = 4093;
+    const big = "y" ** value_len;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var dummy = std.atomic.Value(u32).init(0);
+
+    var fa: rt.SizeFailAllocator = .{ .child = testing.allocator, .fail_len = value_len };
+    var gl = GatedLoader{ .io = io, .value = big };
+    var c = rt.Cache.init(fa.allocator(), .{
+        .io = io,
+        .loader = gl.loader(),
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+    defer c.deinit();
+
+    const Probe = struct {
+        cache: *rt.Cache,
+        /// null = `get` returned a value/missing rather than an error.
+        err: ?anyerror = null,
+        empty_value: bool = false,
+        fn run(self: *@This()) void {
+            const res = self.cache.get("k") catch |e| {
+                self.err = e;
+                return;
+            };
+            defer self.cache.free(res);
+            self.empty_value = (res == .value and res.value.len == 0);
+        }
+    };
+
+    var probes: [n_threads]Probe = undefined;
+    var threads: [n_threads]std.Thread = undefined;
+    for (&probes) |*p| p.* = .{ .cache = &c };
+    for (&threads, &probes) |*t, *p| t.* = try std.Thread.spawn(.{}, Probe.run, .{p});
+
+    const Pred = struct {
+        c: *rt.Cache,
+        fn check(self: @This()) bool {
+            return self.c.getStats().coalesced >= n_threads - 1;
+        }
+    };
+    waitUntil(io, &dummy, Pred{ .c = &c });
+    gl.open();
+    for (&threads) |t| t.join();
+
+    // The rig really did coalesce (otherwise this proves nothing about
+    // followers) and really did refuse the copy.
+    try testing.expectEqual(@as(u64, n_threads - 1), c.getStats().coalesced);
+    try testing.expect(fa.denied.load(.monotonic) > 0);
+
+    for (&probes) |*p| {
+        try testing.expect(!p.empty_value);
+        try testing.expectEqual(@as(?anyerror, error.OutOfMemory), p.err);
+    }
+}

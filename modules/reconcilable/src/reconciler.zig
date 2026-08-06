@@ -394,6 +394,47 @@ test "requeue_after is honoured exactly and does not accumulate backoff" {
     try testing.expectEqual(@as(?u32, 0), r.failuresOf(1));
 }
 
+test "a huge requeue_after keeps the key, it does not silently converge" {
+    // The caller-visible half of the `nil_due` sentinel collision: a large
+    // `requeue_after` (the documented shape for a lease TTL / long poll
+    // interval) saturates `now +| ns`, which used to equal the "nothing
+    // deferred" sentinel and drop the key. `.done` and a far-future
+    // `.requeue_after` must be distinguishable from outside the module.
+    const Big = struct {
+        n: u32 = 0,
+        fn go(ctx: *@This(), _: u32, _: Instant) types.Outcome {
+            ctx.n += 1;
+            return .{ .requeue_after = std.math.maxInt(u64) };
+        }
+    };
+    var f: Big = .{};
+    const BR = Reconciler(u32, *Big);
+    var r = try BR.init(testing.allocator, &f, Big.go, .{ .capacity = 4 });
+    defer r.deinit();
+
+    _ = try r.enqueue(1);
+    _ = r.tick(0);
+    try testing.expectEqual(@as(u32, 1), f.n);
+    try testing.expectEqual(@as(u32, 1), r.pending());
+    try testing.expect(r.nextDue(0) != null);
+    try testing.expectEqual(@as(u64, 0), r.stats().converged);
+
+    // Contrast: `.done` really does drop the key, so the caller can tell the
+    // two outcomes apart by `pending()`.
+    const Doner = struct {
+        fn go(_: *void, _: u32, _: Instant) types.Outcome {
+            return .done;
+        }
+    };
+    var unit: void = {};
+    const DR = Reconciler(u32, *void);
+    var d = try DR.init(testing.allocator, &unit, Doner.go, .{ .capacity = 4 });
+    defer d.deinit();
+    _ = try d.enqueue(1);
+    _ = d.tick(0);
+    try testing.expectEqual(@as(u32, 0), d.pending());
+}
+
 test "max_failures abandons a hopeless key instead of retrying forever" {
     var rec = newRecorder();
     defer rec.deinit();

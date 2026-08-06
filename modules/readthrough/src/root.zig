@@ -348,11 +348,18 @@ pub const Cache = struct {
 
         if (outcome) |oc| switch (oc) {
             .value => |bytes| {
-                call.result = .{
-                    .value = self.gpa.dupe(u8, bytes) catch blk: {
-                        break :blk &[_]u8{}; // OOM: deliver empty, still coalesced
-                    },
-                };
+                // Never substitute a value for a failure: an empty slice here
+                // would be byte-identical, at every participant, to a backend
+                // that legitimately returned "". Deliver the error instead —
+                // SPEC §6 ("a failed return copy surfaces as error.OutOfMemory").
+                if (self.gpa.dupe(u8, bytes)) |copy| {
+                    call.result = .{ .value = copy };
+                } else |e| {
+                    call.result = .{ .err = e };
+                }
+                // The store is independent of the copy and still worth doing:
+                // it is fail-soft, and a populated cache makes the next get
+                // succeed. It does not paper over the error above.
                 if (!poisoned) self.storeLocked(key, tag_value, bytes, self.ttl_ns);
             },
             .missing => {
@@ -508,7 +515,9 @@ pub const Cache = struct {
         call.refs -= 1;
         if (call.refs != 0) return;
         switch (call.result) {
-            .value => |v| if (v.len != 0) self.gpa.free(v),
+            // Unconditional: a zero-length value is a real, owned allocation
+            // like any other now that OOM no longer masquerades as one.
+            .value => |v| self.gpa.free(v),
             else => {},
         }
         self.gpa.destroy(call);
@@ -856,6 +865,103 @@ test "value is copied out of the cache (caller owns it across an invalidation)" 
     defer c.free(a);
     c.invalidateAll(); // would shadow the stored entry
     try testing.expectEqualStrings("durable", a.value); // the returned copy is unaffected
+}
+
+/// An allocator that refuses every allocation of exactly `fail_len` bytes and
+/// forwards everything else. Targeting a *size* rather than an ordinal makes
+/// the OOM land on a specific `dupe` without depending on how many allocations
+/// ramcache happens to make first (which `std.testing.FailingAllocator` would).
+pub const SizeFailAllocator = struct {
+    child: Allocator,
+    fail_len: usize,
+    /// How many allocations were actually refused — asserted by the tests, so
+    /// a rig that stops reaching the target path cannot silently pass.
+    /// Atomic: the threaded follower test shares one of these across threads.
+    denied: std.atomic.Value(usize) = .init(0),
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *SizeFailAllocator = @ptrCast(@alignCast(ctx));
+        if (len == self.fail_len) {
+            _ = self.denied.fetchAdd(1, .monotonic);
+            return null;
+        }
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *SizeFailAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len == self.fail_len) return false;
+        return self.child.rawResize(m, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *SizeFailAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len == self.fail_len) return null;
+        return self.child.rawRemap(m, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *SizeFailAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, alignment, ra);
+    }
+
+    pub fn allocator(self: *SizeFailAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+};
+
+test "OOM on the leader's result copy surfaces as an error, not as an empty value" {
+    // The two outcomes the caller must be able to tell apart:
+    //   (a) the backend legitimately returned a zero-length value  ⇒ `.value`
+    //       with `len == 0`;
+    //   (b) the return copy could not be allocated                 ⇒ an error.
+    // The leader used to substitute `&[_]u8{}` for (b), making it byte-identical
+    // to (a) at the caller while the cache still held the correct bytes — so the
+    // failure self-healed on the next get and was never reportable.
+    // `SPEC.md` §6 promises `error.OutOfMemory`.
+    const value_len = 4093; // a size ramcache/the key path never asks for
+    const big = "x" ** value_len;
+
+    // (a) a genuinely empty backend value is a value, and stays one.
+    {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.ldr.put(testing.allocator, "empty", "");
+        var c = rig.open(.{});
+        defer c.deinit();
+
+        const got = try c.get("empty");
+        defer c.free(got);
+        try testing.expect(got == .value);
+        try testing.expectEqual(@as(usize, 0), got.value.len);
+    }
+
+    // (b) the same shape at the caller must NOT be reachable by failing the copy.
+    {
+        var fa: SizeFailAllocator = .{ .child = testing.allocator, .fail_len = value_len };
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.ldr.put(testing.allocator, "k", big);
+        var c = Cache.init(fa.allocator(), .{
+            .io = rig.threaded.io(),
+            .loader = rig.ldr.loader(),
+            .clock = rig.clock.clock(),
+            .max_bytes = 1 << 20,
+            .max_entries = 64,
+        });
+        defer c.deinit();
+
+        try testing.expectError(error.OutOfMemory, c.get("k"));
+        // The rig really did exercise the intended path, not some other one.
+        try testing.expect(fa.denied.load(.monotonic) > 0);
+        // And no Call / in-flight key was leaked by the error path: the
+        // leak-checking child allocator would report it at test teardown.
+        try testing.expectEqual(@as(usize, 1), c.getStats().loads);
+    }
 }
 
 test "meta is well-formed" {

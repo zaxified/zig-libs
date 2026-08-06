@@ -60,16 +60,27 @@ pub fn WorkQueue(comptime Key: type) type {
             /// `enqueue` arrived while `.running` — re-queue immediately when
             /// the pass returns.
             dirty: bool,
-            /// `enqueueAfter` arrived while `.running`; `nil_due` = none. The
+            /// `enqueueAfter` arrived while `.running`; `null` = none. The
             /// earliest such request wins, and `dirty` beats all of them.
-            dirty_due: Instant,
+            ///
+            /// This is an `?Instant` and not an in-band sentinel on purpose:
+            /// `now +| delay_ns` saturates at `maxInt(Instant)`, which is a
+            /// legal (if very distant) deadline, so any in-band "none" value
+            /// would be forgeable by a caller asking for a long delay — and
+            /// the key would then be dropped instead of parked.
+            dirty_due: ?Instant,
             /// `forget` arrived while `.running` — drop when the pass returns,
             /// whatever the pass asks for.
             force_drop: bool,
         };
 
-        /// Sentinel for "no deferred re-enqueue requested".
-        pub const nil_due: Instant = std.math.maxInt(Instant);
+        /// The earlier of two optional deadlines; `null` means "not requested"
+        /// and therefore never wins over a real deadline.
+        fn earlierDue(a: ?Instant, b: ?Instant) ?Instant {
+            const x = a orelse return b;
+            const y = b orelse return x;
+            return @min(x, y);
+        }
 
         gpa: std.mem.Allocator,
         slots: []Slot,
@@ -108,7 +119,7 @@ pub fn WorkQueue(comptime Key: type) type {
                     .seq = 0,
                     .failures = 0,
                     .dirty = false,
-                    .dirty_due = nil_due,
+                    .dirty_due = null,
                     .force_drop = false,
                 };
             }
@@ -180,7 +191,7 @@ pub fn WorkQueue(comptime Key: type) type {
                         return .deduped;
                     },
                     .running => {
-                        s.dirty_due = @min(s.dirty_due, due);
+                        s.dirty_due = earlierDue(s.dirty_due, due);
                         return .marked_dirty;
                     },
                     .free => unreachable,
@@ -203,7 +214,7 @@ pub fn WorkQueue(comptime Key: type) type {
                 .waiting => self.heapRemove(idx),
                 .running => {
                     s.dirty = false;
-                    s.dirty_due = nil_due;
+                    s.dirty_due = null;
                     s.failures = 0;
                     s.force_drop = true;
                     return true;
@@ -239,7 +250,7 @@ pub fn WorkQueue(comptime Key: type) type {
             const s = &self.slots[idx];
             s.state = .running;
             s.dirty = false;
-            s.dirty_due = nil_due;
+            s.dirty_due = null;
             s.force_drop = false;
             self.running_len += 1;
             return idx;
@@ -270,20 +281,21 @@ pub fn WorkQueue(comptime Key: type) type {
             }
             if (s.dirty) {
                 s.dirty = false;
-                s.dirty_due = nil_due;
+                s.dirty_due = null;
                 self.readyPush(idx);
                 return;
             }
-            const asked: Instant = switch (disposition) {
-                .drop => nil_due,
+            const asked: ?Instant = switch (disposition) {
+                .drop => null,
                 .after => |d| now +| d,
             };
-            const due = @min(asked, s.dirty_due);
-            s.dirty_due = nil_due;
-            if (due == nil_due) {
+            const due = earlierDue(asked, s.dirty_due) orelse {
+                // Neither the pass nor a mid-pass request wants this key back.
+                s.dirty_due = null;
                 self.freeSlot(idx);
                 return;
-            }
+            };
+            s.dirty_due = null;
             if (due <= now) {
                 self.readyPush(idx);
             } else {
@@ -342,7 +354,7 @@ pub fn WorkQueue(comptime Key: type) type {
                 .seq = 0,
                 .failures = 0,
                 .dirty = false,
-                .dirty_due = nil_due,
+                .dirty_due = null,
                 .force_drop = false,
             };
             // Capacity was reserved in `init`, so this cannot allocate.
@@ -600,7 +612,7 @@ test "a mid-pass enqueueAfter survives a drop disposition" {
     // `.after` dispositions racing a mid-pass enqueueAfter. A `.drop`
     // disposition (the pass converged) must NOT discard a re-check that
     // arrived while it was running — `finish` takes @min(asked, dirty_due)
-    // where `asked` is nil_due for `.drop`, so dirty_due alone must win.
+    // where `asked` is null for `.drop`, so dirty_due alone must win.
     var q = try Q.init(testing.allocator, 8);
     defer q.deinit();
 
@@ -614,6 +626,55 @@ test "a mid-pass enqueueAfter survives a drop disposition" {
     try testing.expect(q.contains(7));
     try testing.expectEqual(@as(?Instant, 110), q.nextTimer());
     try testing.expectEqual(Q.State.waiting, q.stateOf(7).?);
+    q.assertInvariants();
+}
+
+test "a saturating disposition parks the key instead of dropping it" {
+    // `nil_due` used to be `maxInt(Instant)`, which is also what `now +| d`
+    // saturates to for a large `after` delay — so "re-run in a very long time"
+    // was indistinguishable from "converged, drop it". A caller asking for a
+    // far-future deadline must still be able to tell the two apart: the key
+    // stays tracked and parked on a timer.
+    var q = try Q.init(testing.allocator, 8);
+    defer q.deinit();
+
+    _ = try q.enqueue(7);
+    const idx = q.takeReady().?;
+    q.finish(idx, 100, .{ .after = std.math.maxInt(u64) });
+
+    try testing.expect(q.contains(7));
+    try testing.expectEqual(Q.State.waiting, q.stateOf(7).?);
+    try testing.expectEqual(@as(u32, 1), q.tracked);
+    // And it is genuinely distinguishable from `.drop`, which does free it.
+    try testing.expect(q.nextTimer() != null);
+    q.assertInvariants();
+
+    const idx2 = blk: {
+        _ = q.promoteDue(std.math.maxInt(Instant));
+        break :blk q.takeReady().?;
+    };
+    q.finish(idx2, std.math.maxInt(Instant), .drop);
+    try testing.expect(!q.contains(7));
+    try testing.expectEqual(@as(u32, 0), q.tracked);
+    q.assertInvariants();
+}
+
+test "a saturating mid-pass enqueueAfter survives a drop disposition" {
+    // Second site of the same sentinel collision: `enqueueAfter` on a
+    // `.running` key folded the request into `dirty_due` with a plain `@min`,
+    // so a saturating deadline left `dirty_due` at the "none" sentinel and the
+    // request vanished when the pass then said `.drop`.
+    var q = try Q.init(testing.allocator, 8);
+    defer q.deinit();
+
+    _ = try q.enqueue(7);
+    const idx = q.takeReady().?;
+    _ = try q.enqueueAfter(7, 100, std.math.maxInt(u64)); // saturates
+    q.finish(idx, 100, .drop);
+
+    try testing.expect(q.contains(7));
+    try testing.expectEqual(Q.State.waiting, q.stateOf(7).?);
+    try testing.expect(q.nextTimer() != null);
     q.assertInvariants();
 }
 
