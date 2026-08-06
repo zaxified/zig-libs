@@ -327,3 +327,60 @@ test "a Template stays immutable across renders that load other templates" {
         try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "<{d}><{d}>", .{ n, n }), out);
     }
 }
+
+test "autoescape: context data cannot reach the output unescaped without |safe" {
+    // The property the whole autoescape design rests on, asserted directly
+    // rather than as a byte comparison: `|safe` is the ONLY way a template
+    // spells "emit these bytes raw". It was false. `markupAware` re-marked a
+    // filter result as markup whenever the INPUT was markup, and `replace`
+    // spliced its `new` argument in without escaping it — so any template that
+    // produced markup by construction leaked. `{% filter %}` and `{% set %}`
+    // block bodies are markup by construction under autoescape
+    // (`render.zig:310`, `:324`), which makes the first two templates below a
+    // bypass in a template that never writes `|safe` at all.
+    //
+    // Not one of these templates has a literal `<` in its text, so any `<` in
+    // the output came from the context. The reference (Jinja2 3.1.6) renders
+    // every one of them escaped; `corpus.zig`'s `escape_replace_*` cases pin
+    // the exact bytes against it.
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const ctx = try jinja.valueFrom(arena.allocator(), .{
+        .s = "q x q",
+        .evil = "<script>alert(1)</script>",
+    });
+
+    const Case = struct { src: []const u8, escaped: []const u8 };
+    for ([_]Case{
+        .{ .src = "{% filter replace('x', evil) %}q x q{% endfilter %}", .escaped = "&lt;script&gt;" },
+        .{ .src = "{% set b %}q x q{% endset %}{{ b|replace('x', evil) }}", .escaped = "&lt;script&gt;" },
+        // `|upper` runs on the markup, so the entities are uppercased too —
+        // which is what the reference does (`Markup.upper()`).
+        .{ .src = "{% filter replace('x', evil)|upper %}q x q{% endfilter %}", .escaped = "&LT;SCRIPT&GT;" },
+        .{ .src = "{{ (s|safe)|replace('x', evil) }}", .escaped = "&lt;script&gt;" },
+        .{ .src = "{{ (s|safe)|replace('x', evil)|replace('q', 'r') }}", .escaped = "&lt;script&gt;" },
+        .{ .src = "{{ (s|safe).replace('x', evil) }}", .escaped = "&lt;script&gt;" },
+        .{ .src = "{{ s|replace('x', evil) }}", .escaped = "&lt;script&gt;" },
+        .{ .src = "{{ [s|safe]|map('replace', 'x', evil)|list|join('') }}", .escaped = "&lt;script&gt;" },
+        .{ .src = "{% set b %}q x q{% endset %}{{ b|replace('x', evil, 1) }}", .escaped = "&lt;script&gt;" },
+        .{ .src = "{% filter replace('x', evil)|trim %}q x q{% endfilter %}", .escaped = "&lt;script&gt;" },
+    }) |c| {
+        const out = try renderWith(gpa, .{ .autoescape = true }, c.src, ctx);
+        defer gpa.free(out);
+        if (std.mem.indexOfScalar(u8, out, '<') != null) {
+            std.debug.print("\nautoescape bypass: '{s}' rendered '{s}'\n", .{ c.src, out });
+            return error.AutoescapeBypass;
+        }
+        if (std.mem.indexOf(u8, out, c.escaped) == null) {
+            std.debug.print("\n'{s}' rendered '{s}', which does not carry '{s}'\n", .{ c.src, out, c.escaped });
+            return error.EscapedFormMissing;
+        }
+    }
+
+    // The control: an argument the template explicitly marked safe still goes
+    // through raw, so the check above is not just "we escape everything".
+    const raw = try renderWith(gpa, .{ .autoescape = true }, "{{ (s|safe)|replace('x', evil|safe) }}", ctx);
+    defer gpa.free(raw);
+    try testing.expectEqualStrings("q <script>alert(1)</script> q", raw);
+}

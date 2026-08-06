@@ -168,6 +168,97 @@ fn fuzzNumericArgs(_: void, smith: *std.testing.Smith) !void {
     gpa.free(out);
 }
 
+/// Template shapes that put **context data** through a filter, a method or an
+/// operator that can produce markup. Not one of them spells `|safe` on `e`, and
+/// not one of them has a `<` or a `>` in its literal text: `s` is the fixed
+/// benign string `q x q`, and the only `|safe` marks *it*, which is precisely
+/// the "the body is markup by construction" situation that `{% filter %}` and
+/// `{% set %}` create on their own.
+const escape_sites = [_][]const u8{
+    "{% filter replace('x', e) %}q x q{% endfilter %}",
+    "{% filter replace('x', e)|upper %}q x q{% endfilter %}",
+    "{% set b %}q x q{% endset %}{{ b|replace('x', e) }}",
+    "{{ (s|safe)|replace('x', e) }}",
+    "{{ (s|safe)|replace('x', e, 1) }}",
+    "{{ (s|safe).replace('x', e) }}",
+    "{{ s|replace('x', e) }}",
+    "{{ s.replace('x', e) }}",
+    "{{ (s|safe)|replace(e, 'Y') }}",
+    "{{ [s|safe]|map('replace', 'x', e)|list|join('') }}",
+    "{{ (s|safe)|trim(e) }}",
+    "{{ (s|safe).lstrip(e) }}",
+    "{{ (s|safe).rstrip(e) }}",
+    "{{ (s|safe).removeprefix(e) }}",
+    "{{ (s|safe).removesuffix(e) }}",
+    "{{ (s|safe) ~ e }}",
+    "{{ (s|safe) + e }}",
+    "{{ ['a','b']|join(e) }}",
+    "{{ [e]|join('-') }}",
+    "{{ e }}",
+    "{{ e|upper }}|{{ e|lower }}|{{ e|capitalize }}|{{ e|title }}",
+    "{{ e|trim }}|{{ e|reverse }}|{{ e|first }}|{{ e|last }}",
+    "{{ e|truncate(6, true, '..') }}",
+    "{{ e|center(9) }}",
+    "{{ e|indent(2, true) }}",
+    "{{ e|list|join('') }}",
+    "{{ [e]|batch(1)|first|join('') }}",
+    "{{ e.split('q')|list|join('') }}",
+    "{{ e|tojson }}",
+    "{{ e|urlencode }}",
+    "{{ e|xmlattr if false else e|string }}",
+    "{% for c in e %}{{ c }}{% endfor %}",
+    "{% filter upper %}{{ e }}{% endfilter %}",
+};
+
+/// The autoescape invariant, as an oracle a fuzzer can actually judge.
+///
+/// An escaping defect is not crash-shaped, so the three harnesses above cannot
+/// see one however long they run — and the audit's headline finding (a filter
+/// argument spliced raw into a markup result) is exactly that shape. The
+/// property asserted here is the one the whole design rests on: with autoescape
+/// on and `|safe` written nowhere over the data, **no byte of context data
+/// reaches the output as a live `<` or `>`**. The template text contributes
+/// none, so any that appear came from `e`.
+///
+/// Quotes are deliberately not asserted: `|tojson` emits `"` raw by design and
+/// the reference does the same, so a quote in the output is not evidence of
+/// anything. `<` and `>` have no such exemption in an HTML *text* context,
+/// which is the only context `autoescape` claims to cover (SPEC §8).
+fn fuzzAutoescapeInvariant(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    const src = escape_sites[smith.index(escape_sites.len)];
+
+    var buf: [256]u8 = undefined;
+    const n = smith.indexWithHash(buf.len, 0);
+    smith.bytes(buf[0..n]);
+    const evil = buf[0..n];
+
+    var env = try jinja.Environment.init(gpa, .{ .autoescape = true, .undefined_policy = .lenient });
+    defer env.deinit();
+
+    // NOT `catch return`, unlike the harnesses above: the template text here is
+    // fixed and only the data is drawn, so a site that fails to compile is a
+    // typo in the table that would otherwise silently remove itself from the
+    // sweep — the exact shape of a harness that certifies nothing.
+    var tmpl = try env.compile(src, null);
+    defer tmpl.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const ctx = try jinja.valueFrom(arena.allocator(), .{ .s = "q x q", .e = evil });
+
+    const out = tmpl.render(gpa, ctx, null) catch return;
+    defer gpa.free(out);
+
+    if (std.mem.indexOfAny(u8, out, "<>")) |at| {
+        std.debug.print(
+            "\nautoescape bypass: '{s}' with e={f} rendered '{f}' (live markup at byte {d})\n",
+            .{ src, std.ascii.hexEscape(evil, .lower), std.ascii.hexEscape(out, .lower), at },
+        );
+        return error.AutoescapeBypass;
+    }
+}
+
 test "fuzz: arbitrary bytes as a template never panic" {
     try std.testing.fuzz({}, fuzzCompileAndRender, .{});
 }
@@ -178,4 +269,21 @@ test "fuzz: arbitrary bytes with whitespace options never panic" {
 
 test "fuzz: arbitrary numeric arguments to filters, globals and slices never panic" {
     try std.testing.fuzz({}, fuzzNumericArgs, .{});
+}
+
+test "fuzz: arbitrary context data never reaches the output as live markup" {
+    try std.testing.fuzz({}, fuzzAutoescapeInvariant, .{});
+}
+
+test "every autoescape fuzz site is a template that compiles" {
+    // Asserted in the ordinary suite, not left to the fuzzer: a mistyped site
+    // would compile-error on a random subset of draws and take that shape out
+    // of the sweep without anyone noticing.
+    const gpa = std.testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{ .autoescape = true, .undefined_policy = .lenient });
+    defer env.deinit();
+    for (escape_sites) |src| {
+        var tmpl = try env.compile(src, null);
+        tmpl.deinit();
+    }
 }

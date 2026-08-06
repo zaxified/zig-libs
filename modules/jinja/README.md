@@ -166,7 +166,11 @@ working under both policies.
 Autoescaping is off unless you ask for it, and there is no guessing from a file
 extension (this module has no loader). With it on, `|safe` marks a string as
 markup, `|escape` produces markup, and markup propagates through `~`, `+`,
-`|join` and the case-changing filters exactly as markupsafe's `Markup` does.
+`|join` and the case-changing filters exactly as markupsafe's `Markup` does. A
+filter *argument* spliced into a markup result is escaped first, so `|safe` is
+the only thing that puts context data in the output raw — with one inherited
+exception, `|indent` with a string width, which the reference splices raw too
+(SPEC §5).
 
 ## Composition
 

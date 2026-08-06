@@ -196,6 +196,24 @@ case-changing filters preserve markup, `|escape` on markup is a no-op while
 Every one of those is a corpus case, because each is a plausible place to get
 double-escaping or, worse, no escaping.
 
+**A filter's arguments are operands too.** A markup result may only be assembled
+from operands that are themselves markup or have been escaped — a filter that
+splices a caller-supplied argument into a result it then marks as markup makes
+`autoescape` bypassable *without `|safe`*, because a `{% set %}` / `{% filter %}`
+body is markup by construction: `{% filter replace('x', data) %}…{% endfilter %}`
+would emit `data` raw in a template that never marks anything safe. `|replace`
+and the `.replace()` method therefore follow the reference exactly — Jinja2's
+`do_replace` escapes the subject when either argument is markup, markupsafe's
+`Markup.replace` escapes `new` and leaves `old` unescaped (so `old` is matched
+against the raw markup bytes) — and the corpus crosses `autoescape=true` with
+every argument-taking filter, each argument carrying `<`, `>`, `&`, `"` and `'`.
+
+The one exception is **`|indent` with a *string* width**, which Jinja2 splices
+raw into a markup result (`do_indent` does `indention = Markup(indention)`, and
+`Markup(x)` does not escape `x`). We match the reference there, which makes it
+the only route from context data to unescaped output that does not spell
+`|safe` — `escape_indent_string_width_splices_raw` pins it.
+
 ## 6. Divergences from Python Jinja2 3.1.6
 
 Everything not covered by a corpus case is here. Nothing in this table is a

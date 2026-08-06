@@ -175,6 +175,10 @@
    "out": "[c]",
    "status": "ok"
   },
+  "escape_argument_bearing_filters_on_plain_input": {
+   "out": "abcdefghijabcde&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]",
+   "status": "ok"
+  },
   "escape_filter_when_off": {
    "out": "&lt;b&gt;",
    "status": "ok"
@@ -183,8 +187,16 @@
    "out": "&lt;b&gt;",
    "status": "ok"
   },
+  "escape_indent_string_width_splices_raw": {
+   "out": "<i>&'\"</i>q|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a\n&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b",
+   "status": "ok"
+  },
   "escape_join_escapes_items": {
    "out": "&lt;a&gt;&lt;&gt;&lt;b&gt;",
+   "status": "ok"
+  },
+  "escape_join_markup_separator_and_items": {
+   "out": "a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b|<b>&lt;-&gt;&lt;i&gt;",
    "status": "ok"
   },
   "escape_markup_add": {
@@ -203,12 +215,48 @@
    "out": "<b>&'\"",
    "status": "ok"
   },
+  "escape_off_replace_method_markup_receiver": {
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q",
+   "status": "ok"
+  },
   "escape_on_escapes": {
    "out": "&lt;b&gt;&amp;&#39;&#34;",
    "status": "ok"
   },
   "escape_on_safe": {
    "out": "<b>",
+   "status": "ok"
+  },
+  "escape_replace_filter_block": {
+   "out": "q &lt;script&gt;a&amp;b&#39;&#34;&lt;/script&gt; q",
+   "status": "ok"
+  },
+  "escape_replace_filter_block_count": {
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; x q",
+   "status": "ok"
+  },
+  "escape_replace_markup_matrix": {
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q|q <i>&'\"</i> q",
+   "status": "ok"
+  },
+  "escape_replace_markup_old_is_not_escaped": {
+   "out": "Yx</b>|&lt;b&gt;x&lt;/b&gt;|&lt;b&gt;x&lt;/b&gt;",
+   "status": "ok"
+  },
+  "escape_replace_method_matrix": {
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q",
+   "status": "ok"
+  },
+  "escape_replace_non_string_argument": {
+   "out": "q 5 q|q [&#39;&lt;a&gt;&#39;] q|q None q",
+   "status": "ok"
+  },
+  "escape_replace_set_block": {
+   "out": "q &lt;script&gt;a&amp;b&#39;&#34;&lt;/script&gt; q",
+   "status": "ok"
+  },
+  "escape_replace_through_map": {
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q",
    "status": "ok"
   },
   "escape_safe_then_escape_is_noop": {
@@ -221,6 +269,10 @@
   },
   "escape_tojson_is_safe": {
    "out": "{\"k\": \"\\u003cv\\u003e\"}",
+   "status": "ok"
+  },
+  "escape_trim_chars_argument_is_not_spliced": {
+   "out": "b>x</b|b&gt;x&lt;/b|b>x</b>|b>x</b>",
    "status": "ok"
   },
   "escape_upper_preserves_markup": {

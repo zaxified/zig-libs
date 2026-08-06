@@ -95,9 +95,27 @@ fn strArg(ctx: *Ctx, args: Args, i: usize, name: []const u8, dflt: []const u8) E
     return ctx.toStr(v);
 }
 
+/// The markup bit of a filter whose result is built **only out of the input's
+/// own bytes** — a case fold, a trim, a reversal, a prefix removal. markupsafe
+/// does exactly this (`Markup.upper()`, `Markup.strip()`, `Markup.removeprefix()`
+/// all return `Markup` without escaping anything).
+///
+/// **Never use this for a result that splices a caller-supplied ARGUMENT in.**
+/// The argument is ordinary data — attacker-reachable in every documented use —
+/// and re-marking the result as markup emits it unescaped, which is an
+/// autoescape bypass reachable without any `|safe` in the template, because a
+/// `{% filter %}`/`{% set %}` block body is markup by construction
+/// (`render.zig:310`, `:324`). The rule markupsafe actually holds to is: a
+/// markup result may only be assembled from operands that are *themselves*
+/// markup or have been escaped. `fReplace`, `fJoin` and `binary(.add)` do that;
+/// this helper cannot, because it never sees the argument.
 fn markupAware(ctx: *Ctx, input: Value, bytes: []const u8) Value {
     const safe = ctx.autoescape and input == .string and input.string.safe;
     return .{ .string = .{ .bytes = bytes, .safe = safe } };
+}
+
+fn isMarkup(v: Value) bool {
+    return v == .string and v.string.safe;
 }
 
 /// The elements a sequence filter works on.
@@ -184,11 +202,46 @@ fn fTrim(ctx: *Ctx, input: Value, args: Args) Error!Value {
     return markupAware(ctx, input, std.mem.trim(u8, s, cut));
 }
 
+/// `|replace` — Jinja2's `do_replace`, escaping included.
+///
+/// MATCH THE REFERENCE, and here the reference is also where the security
+/// property lives. `do_replace` (jinja2/filters.py, 3.1.6) under autoescape is
+///
+///     if hasattr(old, "__html__") or hasattr(new, "__html__") and not hasattr(s, "__html__"):
+///         s = escape(s)
+///     else:
+///         s = soft_str(s)
+///     return s.replace(soft_str(old), soft_str(new), count)
+///
+/// and `Markup.replace` (markupsafe 3.0.3) is
+/// `self.__class__(super().replace(old, self.escape(new), count))` — **`new` is
+/// escaped, `old` is not**: `old` is matched against the raw markup bytes.
+/// Composing the two gives one rule, which is the rule for every markup-valued
+/// operation: *the result is markup iff some operand is markup, and every
+/// operand that is not already markup is escaped on the way in.*
+///
+/// Splicing `new` in raw while re-marking the result as markup — what
+/// `markupAware` did here — is an autoescape bypass that needs no `|safe`
+/// anywhere in the template, because `{% filter replace('x', data) %}` and
+/// `{% set b %}…{% endset %}{{ b|replace('x', data) }}` both have a markup
+/// body by construction. Verified case for case against Jinja2 3.1.6 +
+/// markupsafe 3.0.3 on this host, both autoescape settings; the corpus pins
+/// the whole matrix (`escape_replace_*`).
 fn fReplace(ctx: *Ctx, input: Value, args: Args) Error!Value {
-    const s = try ctx.toStr(input);
-    const old = try strArg(ctx, args, 0, "old", "");
-    const new = try strArg(ctx, args, 1, "new", "");
-    const count_v = args.get(2, "count");
+    const old_v = args.get(0, "old") orelse Value.empty_string;
+    const new_v = args.get(1, "new") orelse Value.empty_string;
+    // `escape(s)` when either argument is markup, `soft_str(s)` otherwise —
+    // which is markup exactly when one of the three operands already was.
+    const markup = ctx.autoescape and (isMarkup(input) or isMarkup(old_v) or isMarkup(new_v));
+    const s = if (markup) try escapedBytes(ctx, input) else try ctx.toStr(input);
+    const old = try ctx.toStr(old_v);
+    const new = if (markup) try escapedBytes(ctx, new_v) else try ctx.toStr(new_v);
+    return replaceCore(ctx, s, old, new, args.get(2, "count"), markup);
+}
+
+/// The splice itself, shared by the filter and the `.replace()` method, which
+/// differ only in how they decide what to escape.
+fn replaceCore(ctx: *Ctx, s: []const u8, old: []const u8, new: []const u8, count_v: ?Value, markup: bool) Error!Value {
     // MATCH THE REFERENCE. `str.replace(old, new, count)` treats *any* negative
     // count as "every occurrence", and `{{ x|replace('a','b',-1) }}` is an
     // ordinary Jinja2 spelling: 3.1.6 renders `'aaa'|replace('a','b',-1)` and
@@ -199,7 +252,7 @@ fn fReplace(ctx: *Ctx, input: Value, args: Args) Error!Value {
         const c = try intArg(count_v.?, 0);
         break :blk if (c < 0) std.math.maxInt(usize) else @intCast(c);
     };
-    if (old.len == 0) return markupAware(ctx, input, s);
+    if (old.len == 0) return .{ .string = .{ .bytes = s, .safe = markup } };
 
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -214,13 +267,37 @@ fn fReplace(ctx: *Ctx, input: Value, args: Args) Error!Value {
             i += 1;
         }
     }
-    return markupAware(ctx, input, out.items);
+    return .{ .string = .{ .bytes = out.items, .safe = markup } };
+}
+
+/// `.replace()` as a **method**, which is not the same function as the filter:
+/// the method is markupsafe's `Markup.replace` when the receiver is markup and
+/// plain `str.replace` when it is not. `do_replace`'s "escape `s` when an
+/// argument is markup" rule belongs to the filter alone, and the method's
+/// escaping of `new` is driven by the receiver, not by `autoescape` — with
+/// autoescape off, Jinja2 3.1.6 renders `{{ (s|safe).replace('x', evil) }}`
+/// with the entities visible, and `{{ s.replace('x', evil) }}` raw.
+fn replaceMethod(ctx: *Ctx, s: value.Str, args: Args) Error!Value {
+    const new_v = args.get(1, "new") orelse Value.empty_string;
+    const old = try strArg(ctx, args, 0, "old", "");
+    const new = if (s.safe) try escapedBytes(ctx, new_v) else try ctx.toStr(new_v);
+    return replaceCore(ctx, s.bytes, old, new, args.get(2, "count"), s.safe);
 }
 
 fn fIndent(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const s = try ctx.toStr(input);
     const width_v = args.get(0, "width") orelse Value{ .integer = 4 };
     const indention: []const u8 = switch (width_v) {
+        // MATCH THE REFERENCE, INCLUDING ITS SHARP EDGE. `do_indent` does
+        // `indention = Markup(indention)` when the input is markup, and
+        // `Markup(x)` marks x safe *without* escaping it — so a string `width`
+        // is spliced raw into a markup result. Jinja2 3.1.6 renders
+        // `{% filter indent(data, true) %}q{% endfilter %}` under autoescape
+        // with `data` unescaped, and so do we (corpus:
+        // `escape_indent_string_width_splices_raw`). This is the one remaining
+        // route from context data to unescaped output that does not spell
+        // `|safe`, and it is the reference's, not ours; diverging here would
+        // cost byte-exactness against the only oracle this module has.
         .string => |x| x.bytes,
         else => blk: {
             // MATCH THE REFERENCE. `do_indent` builds `" " * width`, and in
@@ -1505,7 +1582,7 @@ fn stringMethod(ctx: *Ctx, s: value.Str, name: []const u8, args: Args) Error!Val
     if (std.mem.eql(u8, name, "title")) return fTitle(ctx, input, args);
     if (std.mem.eql(u8, name, "capitalize")) return fCapitalize(ctx, input, args);
     if (std.mem.eql(u8, name, "strip")) return fTrim(ctx, input, args);
-    if (std.mem.eql(u8, name, "replace")) return fReplace(ctx, input, args);
+    if (std.mem.eql(u8, name, "replace")) return replaceMethod(ctx, s, args);
     if (std.mem.eql(u8, name, "lstrip")) {
         const cut = try strArg(ctx, args, 0, "chars", " \t\r\n\x0b\x0c");
         return markupAware(ctx, input, std.mem.trimStart(u8, s.bytes, cut));

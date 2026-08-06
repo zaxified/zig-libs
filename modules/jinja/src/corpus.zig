@@ -257,6 +257,94 @@ pub const cases = [_]Case{
     .{ .name = "escape_tojson_is_safe", .template = "{{ d|tojson }}", .context = "{\"d\": {\"k\": \"<v>\"}}", .autoescape = true },
     .{ .name = "escape_xmlattr", .template = "<a{{ d|xmlattr }}>", .context = "{\"d\": {\"href\": \"a&b\", \"n\": null}}", .autoescape = true },
 
+    // ── autoescape × argument-taking filters (audit F1/F8, W2-18) ───────────
+    //
+    // The hole the audit named: the autoescape section above crossed `safe`
+    // with argument-*less* filters only, and every argument-taking filter case
+    // used plain alphanumeric input with autoescape off. Both halves of that
+    // product have to be covered, because the markup bit is an input to the
+    // escaping decision and the argument is the thing that gets escaped — a
+    // filter that re-marks its result as markup while splicing its argument in
+    // raw is an autoescape bypass, and `{% filter %}` / `{% set %}` bodies are
+    // markup by construction, so it needs no `|safe` anywhere.
+    //
+    // Every argument here carries `<`, `>`, `&`, `"` and `'`. The reference's
+    // rule (`do_replace` + markupsafe's `Markup.replace`) is: the result is
+    // markup iff some operand is markup, and every operand that is not markup
+    // is escaped on the way in — `new` is escaped, `old` never is.
+    .{ .name = "escape_replace_filter_block", .template = "{% filter replace('x', evil) %}q x q{% endfilter %}", .context = "{\"evil\": \"<script>a&b'\\\"</script>\"}", .autoescape = true },
+    .{ .name = "escape_replace_set_block", .template = "{% set b %}q x q{% endset %}{{ b|replace('x', evil) }}", .context = "{\"evil\": \"<script>a&b'\\\"</script>\"}", .autoescape = true },
+    .{ .name = "escape_replace_filter_block_count", .template = "{% filter replace('x', evil, 1) %}q x x q{% endfilter %}", .context = "{\"evil\": \"<i>&'\\\"</i>\"}", .autoescape = true },
+    .{
+        .name = "escape_replace_markup_matrix",
+        .template = "{{ (s|safe)|replace('x', evil) }}|{{ s|replace('x', evil) }}|{{ s|replace('x', evil|safe) }}|{{ (s|safe)|replace('x', evil|safe) }}",
+        .context = "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+        .autoescape = true,
+    },
+    .{
+        .name = "escape_replace_markup_old_is_not_escaped",
+        .template = "{{ (h|safe)|replace('<b>','Y') }}|{{ h|replace(t|safe,'Y') }}|{{ h|replace('<b>', evil|safe) }}",
+        .context = "{\"h\": \"<b>x</b>\", \"t\": \"<b>\", \"evil\": \"<i>\"}",
+        .autoescape = true,
+    },
+    .{
+        .name = "escape_replace_method_matrix",
+        .template = "{{ (s|safe).replace('x', evil) }}|{{ s.replace('x', evil) }}|{{ s.replace('x', evil|safe) }}|{{ (s|safe).replace('x', evil|safe) }}",
+        .context = "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+        .autoescape = true,
+    },
+    // The method is markupsafe's `Markup.replace`, not `do_replace`: it escapes
+    // `new` because the RECEIVER is markup, whatever `autoescape` says.
+    .{
+        .name = "escape_off_replace_method_markup_receiver",
+        .template = "{{ (s|safe).replace('x', evil) }}|{{ s.replace('x', evil) }}",
+        .context = "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+    },
+    .{
+        .name = "escape_replace_non_string_argument",
+        .template = "{{ (s|safe)|replace('x', n) }}|{{ (s|safe)|replace('x', l) }}|{{ (s|safe)|replace('x', none) }}",
+        .context = "{\"s\": \"q x q\", \"n\": 5, \"l\": [\"<a>\"]}",
+        .autoescape = true,
+    },
+    .{
+        .name = "escape_replace_through_map",
+        .template = "{{ [s|safe]|map('replace','x',evil)|list|join('') }}",
+        .context = "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+        .autoescape = true,
+    },
+    // `indent`'s string `width` IS spliced raw into a markup result — see the
+    // comment on `fIndent`. That is the reference's behaviour, pinned here so a
+    // future "fix" that diverges from it shows up as a corpus failure rather
+    // than as a silent difference from the only oracle this module has.
+    .{
+        .name = "escape_indent_string_width_splices_raw",
+        .template = "{% filter indent(evil, true) %}q{% endfilter %}|{{ h|indent(evil, true) }}",
+        .context = "{\"h\": \"a\\nb\", \"evil\": \"<i>&'\\\"</i>\"}",
+        .autoescape = true,
+    },
+    // Arguments that are *not* spliced: `trim`/`strip` use theirs as a cut set,
+    // `removeprefix` only ever returns a substring of its input.
+    .{
+        .name = "escape_trim_chars_argument_is_not_spliced",
+        .template = "{{ (h|safe)|trim(evil) }}|{{ h|trim(evil) }}|{{ (h|safe).lstrip(evil) }}|{{ (h|safe).removeprefix('<') }}",
+        .context = "{\"h\": \"<b>x</b>\", \"evil\": \"<script>&'\\\"\"}",
+        .autoescape = true,
+    },
+    .{
+        .name = "escape_join_markup_separator_and_items",
+        .template = "{{ l|join(evil) }}|{{ [h|safe, t]|join('<->') }}",
+        .context = "{\"l\": [\"a\", \"b\"], \"h\": \"<b>\", \"t\": \"<i>\", \"evil\": \"<i>&'\\\"</i>\"}",
+        .autoescape = true,
+    },
+    // Argument-taking filters whose result is not markup: the argument still
+    // has to survive the round trip byte-exactly through the escaper.
+    .{
+        .name = "escape_argument_bearing_filters_on_plain_input",
+        .template = "{{ long|truncate(25, true, evil) }}|{{ missing|default(evil) }}|{{ l|batch(2, evil)|list }}|{{ l|slice(2, evil)|list }}",
+        .context = "{\"long\": \"abcdefghijabcdefghijabcdefghijabcdefghij\", \"l\": [\"<a>\", \"b\", \"c\"], \"evil\": \"<i>&'\\\"</i>\"}",
+        .autoescape = true,
+    },
+
     // ── methods on values ───────────────────────────────────────────────────
     .{ .name = "string_methods", .template = "{{ s.upper() }}|{{ s.startswith('he') }}|{{ s.split('l')|list }}|{{ s.replace('l','L') }}|{{ s.find('ll') }}", .context = "{\"s\": \"hello\"}" },
     .{ .name = "dict_methods", .template = "{{ d.keys()|list }}|{{ d.values()|list }}|{{ d.get('a') }}|{{ d.get('z', 'dflt') }}", .context = "{\"d\": {\"a\": 1, \"b\": 2}}" },
