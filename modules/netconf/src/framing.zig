@@ -110,6 +110,15 @@ pub const Framer = struct {
     /// `msg` so that assembling message N+1 cannot invalidate message N until
     /// the caller asks for it.
     msg_out: std.ArrayList(u8) = .empty,
+    /// Diagnostic: total bytes moved by `compact` over this framer's life.
+    ///
+    /// This is not a tuning knob and nothing in the decoder reads it. It exists
+    /// because the *amortised* cost of compaction is a correctness property
+    /// here — the peer chooses the chunk sizes, so a compaction per chunk is
+    /// O(n²) in the chunk count — and an amortisation bound cannot be asserted
+    /// with a stopwatch. The test named "compaction cost is linear in the wire
+    /// size, not in the chunk count" is its only reader.
+    compacted_bytes: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, dialect: Dialect, limits: Limits) Framer {
         return .{ .gpa = gpa, .dialect = dialect, .limits = limits };
@@ -156,13 +165,34 @@ pub const Framer = struct {
     }
 
     /// Drop the consumed prefix of `pending` so a long-lived session does not
-    /// grow without bound.
+    /// grow without bound. O(bytes still unconsumed) — see `maybeCompact` for
+    /// why that makes the call site matter.
     fn compact(self: *Framer) void {
         if (self.cursor == 0) return;
         const rest = self.pending.items.len - self.cursor;
+        self.compacted_bytes += rest;
         std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[self.cursor..]);
         self.pending.shrinkRetainingCapacity(rest);
         self.cursor = 0;
+    }
+
+    /// Compact only once the consumed prefix is at least half of `pending` —
+    /// the standard amortisation rule.
+    ///
+    /// The decode loops MUST use this and not `compact`. A chunked message is
+    /// `1*chunk`, the peer picks every chunk-size, and a compaction per chunk
+    /// header plus one per chunk body moves the whole remaining buffer O(n)
+    /// times: 655 KB of one-byte chunks cost 159 CPU-seconds before this rule
+    /// existed. Under the rule each compaction copies at most half the buffer
+    /// and discards at least the other half, so the copying is charged to bytes
+    /// that are then gone for good and the total stays O(bytes fed).
+    ///
+    /// `feed` still compacts unconditionally: it is called once per read, and
+    /// the `max_pending` ceiling must be measured against live bytes only.
+    fn maybeCompact(self: *Framer) void {
+        if (self.cursor == 0) return;
+        if (self.cursor * 2 < self.pending.items.len) return;
+        self.compact();
     }
 
     fn finish(self: *Framer) FramerError!?[]const u8 {
@@ -184,7 +214,7 @@ pub const Framer = struct {
             if (self.msg.items.len + idx > self.limits.max_message) return error.MessageTooLarge;
             try self.msg.appendSlice(self.gpa, buf[0..idx]);
             self.cursor += idx + eom_delimiter.len;
-            self.compact();
+            self.maybeCompact();
             return self.finish();
         }
         // No delimiter yet. Absorb everything except a possible partial
@@ -196,7 +226,7 @@ pub const Framer = struct {
             if (self.msg.items.len + take > self.limits.max_message) return error.MessageTooLarge;
             try self.msg.appendSlice(self.gpa, buf[0..take]);
             self.cursor += take;
-            self.compact();
+            self.maybeCompact();
         }
         return null;
     }
@@ -214,7 +244,7 @@ pub const Framer = struct {
                 try self.msg.appendSlice(self.gpa, buf[0..n]);
                 self.cursor += n;
                 self.chunk_left -= take;
-                self.compact();
+                self.maybeCompact();
                 continue;
             }
 
@@ -230,7 +260,7 @@ pub const Framer = struct {
                 buf.len >= 2 and buf[0] == '\n' and buf[1] == '\n')
             {
                 self.cursor += 1;
-                self.compact();
+                self.maybeCompact();
                 buf = self.pending.items[self.cursor..];
             }
             if (buf.len < 2) return null; // need at least "\n#"
@@ -243,7 +273,7 @@ pub const Framer = struct {
                 if (buf[3] != '\n') return error.MalformedChunkHeader;
                 if (!self.got_chunk) return error.EmptyChunkedMessage;
                 self.cursor += 4;
-                self.compact();
+                self.maybeCompact();
                 return self.finish();
             }
 
@@ -268,7 +298,7 @@ pub const Framer = struct {
             if (size > max_chunk_size_rfc or size > self.limits.max_chunk) return error.ChunkTooLarge;
 
             self.cursor += i + 1; // past the LF that ends the header
-            self.compact();
+            self.maybeCompact();
             self.chunk_left = size;
             self.got_chunk = true;
         }
@@ -501,6 +531,50 @@ test "chunked: multi-chunk and multi-message streams" {
     try testing.expectEqual(@as(usize, 2), msgs.items.len);
     try testing.expectEqualStrings("<a>0123456789</a>", msgs.items[0]);
     try testing.expectEqualStrings("<b/>", msgs.items[1]);
+}
+
+test "chunked: compaction cost is linear in the wire size, not in the chunk count" {
+    const gpa = testing.allocator;
+    const n = 4096;
+
+    // The peer picks the chunk sizes, and one byte per chunk is legal
+    // (`chunk-size = 1*DIGIT1 0*DIGIT`, minimum 1). Compacting `pending` per
+    // chunk made this quadratic: 655 KB of such wire cost 159 CPU-seconds.
+    //
+    // The oracle is `compacted_bytes`, not a stopwatch: the amortisation rule
+    // says every byte copied out of `pending` is paid for by a byte discarded
+    // from it, so the lifetime total cannot exceed the bytes fed in. A
+    // per-chunk compaction blows through this by ~n/10.
+    {
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        for (0..n) |_| try wire.appendSlice(gpa, "\n#1\nX");
+        try wire.appendSlice(gpa, "\n##\n");
+
+        var f: Framer = .init(gpa, .chunked, .{});
+        defer f.deinit();
+        try f.feed(wire.items);
+        const msg = (try f.next()).?;
+        try testing.expectEqual(@as(usize, n), msg.len);
+        try testing.expect(f.compacted_bytes <= 2 * wire.items.len);
+    }
+
+    // The same bound across many *messages* drained from a single feed. This
+    // is the case a "compact once per next() instead of per chunk" fix would
+    // still get wrong, because next() is called once per message.
+    {
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        for (0..n) |_| try wire.appendSlice(gpa, "\n#1\nX\n##\n");
+
+        var f: Framer = .init(gpa, .chunked, .{});
+        defer f.deinit();
+        try f.feed(wire.items);
+        var count: usize = 0;
+        while (try f.next()) |m| : (count += 1) try testing.expectEqualStrings("X", m);
+        try testing.expectEqual(@as(usize, n), count);
+        try testing.expect(f.compacted_bytes <= 2 * wire.items.len);
+    }
 }
 
 test "chunked hostile: malformed headers are typed errors, never accepted" {
