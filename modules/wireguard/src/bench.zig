@@ -207,33 +207,42 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
     //    ChaCha group and the lane-parallel Poly1305 both have a warm-up),
     //    and a tunnel carries plenty of 64-byte ACKs, not only full MTUs.
     //
-    //    MEASURED (i7-7920HQ, AVX2, ReleaseFast, -Dcpu=native): the crossover
-    //    is around 256 bytes. Below it the swap is a small LOSS —
-    //    ~0.85-0.92x at 64 and 128 bytes — because a wide ChaCha group and
-    //    the Poly1305 r^L power table both cost a fixed setup that a short
-    //    packet cannot amortise. `chachapoly`'s own bench sweeps the MAC by
-    //    size but not the full AEAD, so this line is where that shows up.
-    //    It matters for WireGuard specifically: keepalives are a 0-byte
-    //    payload and tunnelled TCP ACKs are ~40-60 bytes, so a flow that is
-    //    mostly ACKs sees no gain at all. It is not a regression worth
-    //    reverting (the loss is a few percent of a cheap operation, the win
-    //    is >2x on the bytes that dominate a tunnel's byte count), but it
-    //    must not be reported as "2.4x everywhere". ──
+    //    HISTORY, because this line is the regression guard and the guard is
+    //    worth nothing if the number it guards is forgotten. This sweep once
+    //    read ~0.85-0.92x at 64 and 128 bytes: a LOSS on exactly the traffic
+    //    a tunnel is full of. The cause was NOT the Poly1305 power table
+    //    (that engine already keeps std's serial core below 176 bytes and
+    //    contributed nothing) — it was the cipher: a block-parallel ChaCha
+    //    has no shape smaller than a whole block, so a 40-byte ACK paid for a
+    //    full one, twice, once for the payload and once for the Poly1305-key
+    //    derivation every AEAD call makes regardless of length. `chachapoly`
+    //    now delegates short runs to std at two measured thresholds
+    //    (`delegate_max_bytes` / `aead_delegate_max` in `chachapoly/root.zig`)
+    //    and no payload size loses: 1.00x up to 128 bytes because the code
+    //    that runs there IS std's, then 1.06x at 144 rising to 2.4x at a full
+    //    MTU. A row MATERIALLY below 1.00x here means a threshold moved —
+    //    material, because unlike `chachapoly`'s own sweep this one is a
+    //    single timed run, so +/-2% on the delegated rows is timer noise on
+    //    what is literally the same machine code both times. ──
     {
         std.debug.print("by payload size (chachapoly / std / ratio):\n", .{});
-        inline for (.{ 64, 128, 256, 512, 1024, 1420 }) |n| {
-            const n_iters = @max(iters, iters * 1420 / n);
+        inline for (.{ 0, 64, 128, 144, 256, 512, 1024, 1420 }) |n| {
+            // n = 0 is the keepalive: a real packet on the wire, and the one
+            // the old loss hurt most. Its "throughput" is meaningless, so bill
+            // it as one byte — the RATIO is still exactly the ratio of the two
+            // per-call costs, which is the only thing this row claims.
+            const n_iters = @max(iters, iters * 1420 / @max(n, 64));
             var t0 = nowNs();
             for (0..n_iters) |i| noise.Aead.encrypt(out[0..n], &tag, packet[0..n], "", counterNonce(i), key);
             var dt = nowNs() - t0;
             std.mem.doNotOptimizeAway(&out);
-            const ours = mbps(n, n_iters, dt);
+            const ours = mbps(@max(n, 1), n_iters, dt);
 
             t0 = nowNs();
             for (0..n_iters) |i| noise.StdAead.encrypt(out[0..n], &tag, packet[0..n], "", counterNonce(i), key);
             dt = nowNs() - t0;
             std.mem.doNotOptimizeAway(&out);
-            const theirs = mbps(n, n_iters, dt);
+            const theirs = mbps(@max(n, 1), n_iters, dt);
             std.debug.print("  {d:>5} B : {d:>8.0} / {d:>8.0} MB/s  ({d:.2}x)\n", .{ n, ours, theirs, ours / theirs });
         }
         std.debug.print("\n", .{});

@@ -15,8 +15,19 @@
 //! consecutive counter blocks, so a quarter-round is `N`-way data-parallel with
 //! no in-block shuffles. With `N = 8` a `@Vector(8, u32)` lowers to 256-bit AVX2
 //! when the target enables it (`-Dcpu=native` / any AVX2 target), recovering most
-//! of the gap; on `baseline` it lowers to paired SSE2 and is still correct, and
-//! at `N = 1` the same engine is a plain scalar fallback for the short tail.
+//! of the gap; on `baseline` it lowers to paired SSE2 and is still correct.
+//!
+//! **Hybrid at both levels — short inputs are std's code.** A block-parallel
+//! engine has no shape smaller than a whole group, and a group's cost is flat:
+//! ~220 ns whether it emits 65 bytes or 512. Below that it loses to std, which
+//! vectorises *within* a block and so has a cheap single-block shape. Two
+//! measured thresholds keep this module off the ground it does not own:
+//! `delegate_max_bytes` (64 B — one ChaCha block) hands short cipher runs to
+//! `std.crypto.stream.chacha`, and `aead_delegate_max` (128 B of message + AD)
+//! hands the whole short AEAD to `std.crypto.aead.chacha_poly`. This mirrors
+//! what `poly1305.zig` already did internally, and it is why the module now
+//! wins or ties at EVERY length instead of losing 0.80-0.95x below 144 bytes.
+//! Both branches are on public lengths only — never on key or plaintext.
 //!
 //! **Dedup note.** `std` *has* ChaCha20-Poly1305 (`std.crypto.aead.chacha_poly`).
 //! This is a deliberate performance-specialised duplicate, justified by the
@@ -46,15 +57,20 @@
 //! interleaving the two, not another local fix.
 //!
 //! The sub-group tail generates one *whole* wide group and discards the unused
-//! blocks: a wide group costs about what a single `N = 1` block costs, so this
+//! blocks: a wide group costs about what a single scalar block costs, so this
 //! is a win for any tail longer than one block (it is most of the 1420-byte
-//! gain). Only that tail still stages through a stack buffer.
+//! gain), and a tail of one block or less goes to std instead. Only that tail
+//! still stages through a stack buffer.
 //!
 //! **Constant-time.** ChaCha and Poly1305 are inherently constant-time — only
 //! add / xor / rotate / (Poly1305) multiply / mask, no secret-indexed memory and
 //! no data-dependent branches. The `@Vector` ops preserve this, and the MAC's
 //! lane count is a comptime constant rather than a runtime CPU dispatch. Tag
-//! comparison uses `std.crypto.timing_safe.eql`.
+//! comparison uses `std.crypto.timing_safe.eql`. The delegation thresholds add
+//! *runtime* branches, but only on message and AD **lengths**, which are
+//! public — a packet's size is on the wire before any of it is authenticated.
+//! A branch on anything secret would be a timing oracle; a branch on a length
+//! is not, and none may be added.
 //!
 //! API mirrors `std.crypto.stream.chacha.ChaCha20IETF` and
 //! `std.crypto.aead.chacha_poly.ChaCha20Poly1305` so consumers can swap it in.
@@ -69,6 +85,14 @@ const poly1305 = @import("poly1305.zig");
 pub const Poly1305 = poly1305.Poly1305;
 const AuthenticationError = std.crypto.errors.AuthenticationError;
 
+/// std's ChaCha20 and ChaCha20-Poly1305. These are **both** the oracle the
+/// tests below differentiate against **and** the implementation this module
+/// runs on short inputs — see `delegate_max_bytes` and `aead_delegate_max`.
+/// One name for both roles on purpose: "byte-identical to std" is the module's
+/// contract, and on the short path it holds because the code *is* std's.
+const StdChaCha = std.crypto.stream.chacha.ChaCha20IETF;
+const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+
 pub const meta = .{
     .platform = .any,
     .role = .codec, // pure computation, no I/O
@@ -82,6 +106,85 @@ pub const meta = .{
 /// Number of blocks processed in parallel in the wide path. `@Vector(8, u32)`
 /// lowers to 256-bit AVX2 on targets that enable it; to paired SSE2 otherwise.
 const wide = 8;
+
+/// Runs of at most this many bytes are handed to `StdChaCha` instead of being
+/// generated here. 64 = one ChaCha block: below a whole block this engine has
+/// no cheaper shape than a whole block, and std's does.
+///
+/// **MEASURED, not guessed** — i7-7920HQ, AVX2, ReleaseFast, `-Dcpu=native`,
+/// from the `chacha20 xor by size` table in `bench.zig` (ns per call, minimum
+/// of 5 runs; re-derive by rerunning it):
+///
+/// ```
+///  BEFORE   16 B   32 B   48 B   64 B    80 B    96 B   144 B   512 B
+///    ours  138.8  131.0  139.3  131.6   230.5   221.1   230.9   217.4
+///     std  102.9  108.8  115.6  135.9   232.0   239.3   283.6   726.6
+///   ratio   0.74x  0.83x  0.83x  1.03x   1.01x   1.08x   1.23x   3.34x
+///
+///  AFTER (this constant in place)
+///   ratio   1.00x  1.01x  1.00x  1.01x   1.05x   1.14x   1.25x   3.22x
+/// ```
+///
+/// The *shape* is the point, not the individual numbers. Our cost is flat in
+/// the length — a partial block costs a whole block, and a sub-group tail
+/// costs a whole 8-block group — while std's rises with it. So there is
+/// exactly one crossover and it sits at one block: under 64 bytes we computed
+/// a full block-parallel block that std's in-block-vectorised core does in
+/// ~25% less time, and from 64 bytes up the wide group is ahead and pulls away
+/// (3.2x by 512 B). Anything shorter than a block was pure loss for us.
+///
+/// This is the same hybrid the Poly1305 sibling already uses (`poly1305.zig`,
+/// `wide_min_groups`): keep std for the region where std is faster, rather
+/// than ship a documented regression.
+///
+/// **One length still loses: exactly 128 bytes (0.84x).** It is not a trend
+/// and not ours — with AVX2, std runs exactly two blocks as a single degree-2
+/// pass with no partial-block tail, the cheapest shape std has; at 129 bytes
+/// std is back to 1.25x behind us, and at 65-120 we are already 1.03-1.14x
+/// ahead. Raising this constant to cover 128 would hand back every one of
+/// those wins to buy one size, so it stays at 64 and the loss is recorded here
+/// rather than rounded away. It does not reach the AEAD: a 128-byte AEAD call
+/// is inside `aead_delegate_max` and runs std end to end.
+const delegate_max_bytes = 64;
+
+// ── path witness (test builds only) ──────────────────────────────────────────
+//
+// A threshold bug is **byte-invisible**. Both engines are correct and produce
+// identical output, so a reversed comparison — short packets taking the wide
+// path, long ones taking std — passes every KAT, every differential against
+// std, every in-place and unaligned sweep and every fuzz case in this file. It
+// is a pure performance property, and the only thing that would notice is a
+// benchmark nobody runs in CI.
+//
+// So record which engine each call took, and let a test assert it. This is the
+// ONLY guard the thresholds have; without it they are unguarded, not
+// under-guarded.
+//
+// `is_test` is a comptime constant, so outside a test build `Path` is `void`,
+// every `note` below is a store to a zero-sized value, and none of it reaches
+// the object file. It is not a runtime dispatch flag and non-test code must
+// never read it. It also means the module's `.concurrency = .reentrant` claim
+// still holds for everything that ships — the mutable state exists only in a
+// test binary, where these tests are single-threaded.
+
+const builtin = @import("builtin");
+
+/// Which engine a call used: std's (short input) or this module's wide one.
+pub const Path = enum { std_delegated, wide };
+
+const Witness = if (builtin.is_test) Path else void;
+const witness_init: Witness = if (builtin.is_test) .wide else {};
+
+/// Engine taken by the last `ChaCha20.xor` / `ChaCha20.stream` call. For a call
+/// long enough to run whole wide groups, this is the engine that handled the
+/// TAIL, so it also pins the tail branch's direction.
+pub var chacha_path: Witness = witness_init;
+/// Engine taken by the last `ChaCha20Poly1305.encrypt` / `.decrypt` call.
+pub var aead_path: Witness = witness_init;
+
+inline fn note(w: *Witness, p: Path) void {
+    if (builtin.is_test) w.* = p;
+}
 
 const native_endian = @import("builtin").cpu.arch.endian();
 
@@ -231,6 +334,23 @@ pub const ChaCha20 = struct {
         // std.crypto.stream.chacha; a caller streaming past the counter space
         // must re-key or advance the nonce.
         std.debug.assert(@as(u64, (in.len + 63) / 64) + counter <= (@as(u64, 1) << 32));
+        // Short whole call -> std, before anything else happens. See
+        // `delegate_max_bytes`. This is a strict SUBSET of the tail branch at
+        // the bottom (if it fires, the group loop cannot run and `rem` would
+        // equal `in.len`), so the two comparisons cannot disagree about which
+        // engine a given length gets; it exists only to return before the
+        // function builds the wide path's 512-byte stack frame and splits the
+        // key/nonce into words. Measured worth ~6 ns of a ~108 ns call — the
+        // difference between 0.95x and 1.01x against std at 16 bytes.
+        //
+        // Branch on the message LENGTH, which is public (it is on the wire
+        // before a byte is decrypted). Never on key or plaintext.
+        if (in.len <= delegate_max_bytes) {
+            note(&chacha_path, .std_delegated);
+            return StdChaCha.xor(out, in, counter, key, nonce);
+        }
+        note(&chacha_path, .wide);
+
         const k = keyToWords(key);
         const n = nonceToWords(nonce);
         var ctr = counter;
@@ -246,22 +366,34 @@ pub const ChaCha20 = struct {
         // Tail: fewer than `wide` whole blocks left, so the group cannot be
         // XORed in place and the keystream is staged (at most 512 bytes, once
         // per call). Both branches below are on the *message length*, which is
-        // public; neither depends on key or plaintext.
+        // public — a ChaCha20 message length is visible on the wire before a
+        // byte of it is decrypted. NOTHING here may become a branch on key or
+        // plaintext; that would be a timing oracle, whereas this is not.
+        //
+        // When `in.len` is itself below the threshold the loop above never
+        // ran, so `rem == in.len` and this same branch is the whole call —
+        // which is the point. One comparison covers both "short message" and
+        // "short tail after the wide groups".
         const rem = in.len - i;
-        if (rem > 64) {
+        if (rem > delegate_max_bytes) {
             // A wide group costs about the same as ONE scalar block — same
             // instruction count, `wide` times the width — so generating all
-            // `wide` blocks and discarding the unused suffix beats looping the
-            // N=1 engine as soon as more than one block is left. The discarded
+            // `wide` blocks and discarding the unused suffix beats any
+            // narrower loop as soon as more than one block is left (measured:
+            // flat ~220 ns for every tail from 65 to 512 bytes). The discarded
             // lanes may carry counters past 2^32-1 (`+% iota`); those bytes are
             // never emitted, so the anti-wrap guarantee above is unaffected.
             var ks: [64 * wide]u8 = undefined;
             keystream(wide, &ks, k, ctr, n);
             xorTail(out[i..], in[i..], ks[0..rem]);
         } else if (rem > 0) {
-            var ks: [64]u8 = undefined;
-            keystream(1, &ks, k, ctr, n);
-            xorTail(out[i..], in[i..], ks[0..rem]);
+            // Under one block: std wins, so std runs it. See
+            // `delegate_max_bytes` for the measurement. This is what makes a
+            // WireGuard keepalive, a 40-byte tunnelled ACK, and the AEAD's
+            // 32-byte Poly1305-key derivation (paid by EVERY AEAD call, at
+            // every length) cost what std costs instead of ~25% more.
+            note(&chacha_path, .std_delegated);
+            StdChaCha.xor(out[i..], in[i..], ctr, key, nonce);
         }
     }
 
@@ -269,6 +401,13 @@ pub const ChaCha20 = struct {
     pub fn stream(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         // See `xor`: the 32-bit block counter must not wrap (keystream reuse).
         std.debug.assert(@as(u64, (out.len + 63) / 64) + counter <= (@as(u64, 1) << 32));
+        // Short whole call -> std; see the matching note in `xor`.
+        if (out.len <= delegate_max_bytes) {
+            note(&chacha_path, .std_delegated);
+            return StdChaCha.stream(out, counter, key, nonce);
+        }
+        note(&chacha_path, .wide);
+
         const k = keyToWords(key);
         const n = nonceToWords(nonce);
         var ctr = counter;
@@ -278,22 +417,64 @@ pub const ChaCha20 = struct {
             keystream(wide, out[i..][0 .. 64 * wide], k, ctr, n);
             ctr +%= wide;
         }
-        // Tail — see the matching note in `xor`: one wide group with the unused
-        // blocks discarded beats a loop over the N=1 engine. Length-only branch.
+        // Tail — see the matching note in `xor`, which this mirrors exactly:
+        // one wide group with the unused blocks discarded above the threshold,
+        // std below it. Branch on the output length only, which is public.
         const rem = out.len - i;
-        if (rem > 64) {
+        if (rem > delegate_max_bytes) {
             var ks: [64 * wide]u8 = undefined;
             keystream(wide, &ks, k, ctr, n);
             @memcpy(out[i..], ks[0..rem]);
         } else if (rem > 0) {
-            var ks: [64]u8 = undefined;
-            keystream(1, &ks, k, ctr, n);
-            @memcpy(out[i..], ks[0..rem]);
+            note(&chacha_path, .std_delegated);
+            StdChaCha.stream(out[i..], ctr, key, nonce);
         }
     }
 };
 
 // ── ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) ───────────────────────────────────
+
+/// Total input — message **plus** associated data — at or below which the
+/// whole AEAD is handed to `StdAead`. Message + AD, not just the message,
+/// because the MAC covers both while only the message goes through the cipher:
+/// a 0-byte message with 1 KiB of AD is a long MAC and belongs on the wide
+/// path, and a threshold on `m.len` alone would send it to std.
+///
+/// **MEASURED, not guessed** — i7-7920HQ, AVX2, ReleaseFast, `-Dcpu=native`,
+/// from the `aead seal by size` / `aead open by size` tables in `bench.zig`
+/// (ns per call, minimum of 5 runs), taken *after* `delegate_max_bytes` above
+/// had already removed the cipher's short-run cost:
+///
+/// ```
+///           64 B   80 B   96 B  112 B  128 B  144 B  160 B  192 B
+///    ours  327.5  442.9  430.5  454.5  455.6  479.4  473.3  504.0
+///     std  329.8  435.6  447.4  458.6  413.0  521.7  534.7  587.2
+///   ratio   1.01x  0.98x  1.04x  1.01x  0.91x  1.09x  1.13x  1.16x
+///
+///  AFTER (this constant in place; <=128 is std's code, so 1.00x is exact and
+///  the +/-1% is timer noise, not a difference)
+///   ratio   0.99x  1.00x  1.00x  1.00x  1.01x  1.12x  1.15x  1.15x
+/// ```
+///
+/// 128 is the last size at which std wins and 144 the first at which this
+/// module wins by a margin worth having, so the threshold is 128 *inclusive*.
+/// The dip at exactly 128 is not noise and not ours: with AVX2 std's ChaCha
+/// runs 128 bytes as one 2-block pass with NO partial-block tail, which is the
+/// cheapest shape it has. Below 144 the residual gap is only 2-5% and is not
+/// the cipher any more (that was fixed by `delegate_max_bytes`) — it is this
+/// module's own per-call overhead, chiefly a `Poly1305` state ~3x the size of
+/// std's. Rather than shave that, delegate: below the threshold the code that
+/// runs IS std's, so the parity is exact by construction instead of by tuning.
+///
+/// Note what is NOT here: the Poly1305 power table, which the original
+/// diagnosis blamed. `poly1305.zig` already guards itself (`wide_min_groups`)
+/// and stays on std's serial core below 176 bytes, so it contributes exactly
+/// zero to the short-packet gap — confirmed by the `poly1305 by size` bench
+/// rows reading 0.97-1.01x at 32/64/128 bytes.
+///
+/// Re-derive by rerunning the bench: the threshold is the last size whose
+/// ratio is below 1.00x.
+const aead_delegate_max = 128;
 
 /// ChaCha20-Poly1305 AEAD, as designed for TLS/RFC 8439. Byte-for-byte
 /// compatible with `std.crypto.aead.chacha_poly.ChaCha20Poly1305`.
@@ -305,6 +486,18 @@ pub const ChaCha20Poly1305 = struct {
     /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
     pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
         std.debug.assert(c.len == m.len);
+
+        // Short total -> run std's AEAD unchanged. See `aead_delegate_max`.
+        // The branch is on the two LENGTHS, both of which are public: a
+        // packet's size and its AD's size are visible to anyone on the path
+        // before any of it is authenticated. Nothing secret may ever be added
+        // to this condition — a branch on key or plaintext would be a timing
+        // oracle, a branch on a length is not.
+        if (m.len + ad.len <= aead_delegate_max) {
+            note(&aead_path, .std_delegated);
+            return StdAead.encrypt(c, tag, m, ad, npub, k);
+        }
+        note(&aead_path, .wide);
 
         var poly_key = [_]u8{0} ** 32;
         ChaCha20.xor(poly_key[0..], poly_key[0..], 0, k, npub);
@@ -327,6 +520,27 @@ pub const ChaCha20Poly1305 = struct {
     /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
     pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
         std.debug.assert(c.len == m.len);
+
+        // Short total -> std's AEAD. Same public-length branch as `encrypt`;
+        // see `aead_delegate_max`.
+        if (c.len + ad.len <= aead_delegate_max) {
+            note(&aead_path, .std_delegated);
+            StdAead.decrypt(m, c, tag, ad, npub, k) catch |e| {
+                // The one place the delegation is NOT a straight hand-off.
+                // std documents `m` as *undefined* after a rejection and
+                // implements that as `@memset(m, undefined)`, which is a hint
+                // ReleaseFast elides — so a caller's pre-loaded bytes survive.
+                // This module documents `m` as ZEROED and a test asserts it
+                // (see "decrypt zeroes the output buffer ... (audit F3)",
+                // whose 25-byte message runs exactly this path). Carry the
+                // stronger promise across the seam rather than quietly
+                // weakening it for short messages.
+                std.crypto.secureZero(u8, m);
+                return e;
+            };
+            return;
+        }
+        note(&aead_path, .wide);
 
         var poly_key = [_]u8{0} ** 32;
         ChaCha20.xor(poly_key[0..], poly_key[0..], 0, k, npub);
@@ -473,9 +687,6 @@ test "RFC 8439 §2.8.2 AEAD encrypt + tag" {
 
 // ── tests: differential vs std (the oracle), across block-boundary edges ──────
 
-const StdChaCha = std.crypto.stream.chacha.ChaCha20IETF;
-const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-
 const edge_lens = [_]usize{ 0, 1, 15, 16, 17, 31, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1000, 4096 };
 
 test "differential ChaCha20 stream vs std across edge lengths" {
@@ -565,6 +776,234 @@ test "differential AEAD vs std: seal/open/tamper across edge lengths" {
             bad_c[len - 1] +%= 1;
             try testing.expectError(error.AuthenticationFailed, ChaCha20Poly1305.decrypt(dec[0..len], bad_c[0..len], ours_tag, ad[0..ad_len], nonce, key));
         }
+    }
+}
+
+// ── tests: the delegation seams ──────────────────────────────────────────────
+//
+// `delegate_max_bytes` and `aead_delegate_max` each introduce a seam where two
+// engines must agree byte for byte. The sweeps elsewhere in this file cross
+// both incidentally; these two tests cross them ON PURPOSE, one length at a
+// time, so a future edit to either constant lands on a test that is obviously
+// about it.
+
+test "differential vs std across the AEAD delegation threshold" {
+    // Every total length from `aead_delegate_max - 8` to `+ 8`, seal and open.
+    // The threshold is on `m.len + ad.len`, not on `m.len`, so each total is
+    // split several ways: an implementation that compared only the message
+    // length would pass a message-only sweep and fail here.
+    var prng = std.Random.DefaultPrng.init(0x7B5E_5401);
+    const rand = prng.random();
+    var key: [32]u8 = undefined;
+    var nonce: [12]u8 = undefined;
+    rand.bytes(&key);
+    rand.bytes(&nonce);
+
+    var msg: [256]u8 = undefined;
+    var ad: [64]u8 = undefined;
+    rand.bytes(&msg);
+    rand.bytes(&ad);
+
+    var ours_c: [256]u8 = undefined;
+    var std_c: [256]u8 = undefined;
+    var dec: [256]u8 = undefined;
+
+    var total: usize = aead_delegate_max - 8;
+    while (total <= aead_delegate_max + 8) : (total += 1) {
+        for ([_]usize{ 0, 1, 15, 16, 17, 32 }) |ad_len| {
+            if (ad_len > total) continue;
+            const m_len = total - ad_len;
+
+            var ours_tag: [16]u8 = undefined;
+            var std_tag: [16]u8 = undefined;
+            ChaCha20Poly1305.encrypt(ours_c[0..m_len], &ours_tag, msg[0..m_len], ad[0..ad_len], nonce, key);
+            StdAead.encrypt(std_c[0..m_len], &std_tag, msg[0..m_len], ad[0..ad_len], nonce, key);
+
+            testing.expectEqualSlices(u8, std_c[0..m_len], ours_c[0..m_len]) catch |e| {
+                std.debug.print("seal mismatch: total={d} m={d} ad={d}\n", .{ total, m_len, ad_len });
+                return e;
+            };
+            testing.expectEqualSlices(u8, &std_tag, &ours_tag) catch |e| {
+                std.debug.print("tag mismatch: total={d} m={d} ad={d}\n", .{ total, m_len, ad_len });
+                return e;
+            };
+
+            // open, both directions across the seam
+            try ChaCha20Poly1305.decrypt(dec[0..m_len], std_c[0..m_len], std_tag, ad[0..ad_len], nonce, key);
+            try testing.expectEqualSlices(u8, msg[0..m_len], dec[0..m_len]);
+            try StdAead.decrypt(dec[0..m_len], ours_c[0..m_len], ours_tag, ad[0..ad_len], nonce, key);
+            try testing.expectEqualSlices(u8, msg[0..m_len], dec[0..m_len]);
+
+            // and a rejection still zeroes `m` on BOTH sides of the seam —
+            // the delegated path has to re-add that promise by hand, because
+            // std only leaves `m` undefined.
+            var bad_tag = ours_tag;
+            bad_tag[0] +%= 1;
+            @memset(dec[0..m_len], 0xAA);
+            try testing.expectError(error.AuthenticationFailed, ChaCha20Poly1305.decrypt(dec[0..m_len], ours_c[0..m_len], bad_tag, ad[0..ad_len], nonce, key));
+            for (dec[0..m_len]) |b| try testing.expectEqual(@as(u8, 0), b);
+        }
+    }
+}
+
+test "differential vs std across the ChaCha20 delegation threshold" {
+    // `delegate_max_bytes` is crossed twice by every long call: once as the
+    // whole message length, once as the tail left after the wide groups. Both
+    // are swept here — the second by adding a whole 512-byte group to each
+    // length, which the plain 0..1024 sweep also covers but not by name.
+    var prng = std.Random.DefaultPrng.init(0xC0DEC0DE);
+    const rand = prng.random();
+    var key: [32]u8 = undefined;
+    var nonce: [12]u8 = undefined;
+    rand.bytes(&key);
+    rand.bytes(&nonce);
+
+    var msg: [1024]u8 = undefined;
+    rand.bytes(&msg);
+    var ours: [1024]u8 = undefined;
+    var theirs: [1024]u8 = undefined;
+
+    var n: usize = delegate_max_bytes - 8;
+    while (n <= delegate_max_bytes + 8) : (n += 1) {
+        for ([_]usize{ 0, 64 * wide }) |base| {
+            const len = base + n;
+            for ([_]u32{ 0, 1, 7, 0xFFFF }) |ctr| {
+                ChaCha20.xor(ours[0..len], msg[0..len], ctr, key, nonce);
+                StdChaCha.xor(theirs[0..len], msg[0..len], ctr, key, nonce);
+                testing.expectEqualSlices(u8, theirs[0..len], ours[0..len]) catch |e| {
+                    std.debug.print("xor mismatch at len={d} ctr={d}\n", .{ len, ctr });
+                    return e;
+                };
+                ChaCha20.stream(ours[0..len], ctr, key, nonce);
+                StdChaCha.stream(theirs[0..len], ctr, key, nonce);
+                try testing.expectEqualSlices(u8, theirs[0..len], ours[0..len]);
+            }
+        }
+    }
+}
+
+// THE ONLY TEST THAT CAN FAIL ON A WRONG THRESHOLD.
+//
+// Everything else in this file compares bytes, and both engines produce the
+// same bytes — so reversing either comparison, or moving either constant,
+// leaves every KAT, every differential, every sweep and every fuzz case GREEN
+// while destroying the property the thresholds exist for. That is the whole
+// reason `chacha_path` / `aead_path` exist (see their note above).
+//
+// What this still cannot check, stated plainly because both holes were found
+// by mutation and the second one is still open:
+//
+//   1. That the constants are the RIGHT numbers. They came from a measurement
+//      on one host; only rerunning `bench.zig` can re-derive them. This test
+//      pins the routing, not the tuning.
+//      Operationally, though: the case tables below are written in terms of
+//      the CURRENT values, so CHANGING a constant turns the suite red (the
+//      across-threshold differential aborts). That is intended -- retuning on
+//      another host is a deliberate act, not a silent one -- but it means the
+//      cases must be updated together with the constant. A red suite after
+//      re-deriving the threshold is the tables being stale, not a broken port.
+//   2. The ENTRY fast path in `xor`/`stream`. Disabling it (`in.len <= 0`)
+//      leaves every test green — correctly so, because it is not a routing
+//      change: the tail branch still hands the run to std, so the witness
+//      records the same engine and the bytes are unchanged. All that is lost
+//      is the ~6 ns of wide-path frame setup the early return exists to skip
+//      (measured: 0.95x vs 1.01x against std at 16 bytes). A redundant fast
+//      path is invisible to a witness by construction — the only thing that
+//      can see it is `bench.zig`'s `chacha20 xor by size` table.
+//
+// Everything that is a genuine mis-ROUTING is covered, verified by mutating
+// each of the six comparison sites in turn and judging by exit code.
+test "delegation thresholds route each length to the engine it was measured for" {
+    // ── HOW THIS TEST IS BUILT, AND WHY ─────────────────────────────────────
+    //
+    // Both entry points below have TWO implementations of the same comparison
+    // (`xor` and `stream`; `encrypt` and `decrypt`), and each comparison has
+    // more than one way to be wrong. The first version of this test wrote the
+    // assertions out by hand per entry point, and that is exactly how it grew
+    // a hole: `decrypt` got a message-length pair and no AD-dominant one, so
+    // `c.len + ad.len <= T` could be mutated to `c.len <= T` — dropping the AD
+    // term on the side an attacker feeds — and the whole suite stayed green.
+    // `stream` had the same hole for its tail branch: only `xor`'s tail was
+    // ever asserted, so `stream`'s could be made to never delegate at all and
+    // nothing noticed. Both were confirmed by mutation, both exited 0.
+    //
+    // So the cases live in TABLES that are replayed against every
+    // implementation of the comparison. A case cannot be covered on one side
+    // and forgotten on the other, because there is only one side.
+    const key = [_]u8{0x21} ** 32;
+    const nonce = [_]u8{0x43} ** 12;
+    const grp = 64 * wide;
+    var buf: [2 * grp]u8 = undefined;
+    var out: [2 * grp]u8 = undefined;
+    var dec: [2 * grp]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    @memset(&buf, 0x5A);
+
+    // ── ChaCha20. Replayed against `xor` AND `stream`. ──
+    const CipherCase = struct { len: usize, want: Path, why: []const u8 };
+    for ([_]CipherCase{
+        .{ .len = 0, .want = .std_delegated, .why = "empty" },
+        .{ .len = 1, .want = .std_delegated, .why = "one byte" },
+        .{ .len = delegate_max_bytes, .want = .std_delegated, .why = "at the threshold" },
+        .{ .len = delegate_max_bytes + 1, .want = .wide, .why = "one past it" },
+        // The TAIL branch, which no short call can reach: a whole wide group
+        // plus a tail on each side of the threshold. `chacha_path` records the
+        // TAIL's engine, so these pin that branch independently of the entry
+        // check — and they are what a "tail never delegates" mutation trips.
+        .{ .len = grp, .want = .wide, .why = "exact group, no tail" },
+        .{ .len = grp + 1, .want = .std_delegated, .why = "1-byte tail" },
+        .{ .len = grp + delegate_max_bytes, .want = .std_delegated, .why = "tail at the threshold" },
+        .{ .len = grp + delegate_max_bytes + 1, .want = .wide, .why = "tail one past it" },
+    }) |c| {
+        ChaCha20.xor(out[0..c.len], buf[0..c.len], 1, key, nonce);
+        testing.expectEqual(c.want, chacha_path) catch |e| {
+            std.debug.print("xor routed {d} B ({s}) to {s}\n", .{ c.len, c.why, @tagName(chacha_path) });
+            return e;
+        };
+        ChaCha20.stream(out[0..c.len], 1, key, nonce);
+        testing.expectEqual(c.want, chacha_path) catch |e| {
+            std.debug.print("stream routed {d} B ({s}) to {s}\n", .{ c.len, c.why, @tagName(chacha_path) });
+            return e;
+        };
+    }
+
+    // ── AEAD. Replayed against `encrypt` AND `decrypt`. ──
+    //
+    // The threshold is on message + AD, so the table has to move the total
+    // across it from BOTH terms. The `ad`-dominant rows are the load-bearing
+    // ones: in every one of them the ciphertext alone stays at or below the
+    // threshold, so an implementation that compared only `c.len`/`m.len` would
+    // route them all to std and fail on the `.wide` rows. An AEAD open with a
+    // tiny ciphertext and a large AD is an ordinary shape, not a corner case.
+    const AeadCase = struct { m: usize, ad: usize, want: Path, why: []const u8 };
+    for ([_]AeadCase{
+        // the message moves the total
+        .{ .m = aead_delegate_max, .ad = 0, .want = .std_delegated, .why = "msg at threshold" },
+        .{ .m = aead_delegate_max + 1, .ad = 0, .want = .wide, .why = "msg one past" },
+        // the AD moves the total, message pinned below the threshold
+        .{ .m = aead_delegate_max - 8, .ad = 8, .want = .std_delegated, .why = "ad tops up to threshold" },
+        .{ .m = aead_delegate_max - 8, .ad = 9, .want = .wide, .why = "ad tops one past" },
+        .{ .m = 16, .ad = aead_delegate_max - 16, .want = .std_delegated, .why = "ad-dominant, at threshold" },
+        .{ .m = 16, .ad = aead_delegate_max - 15, .want = .wide, .why = "ad-dominant, one past" },
+        // the extreme: no message at all, AD does all the crossing
+        .{ .m = 0, .ad = aead_delegate_max, .want = .std_delegated, .why = "ad only, at threshold" },
+        .{ .m = 0, .ad = aead_delegate_max + 1, .want = .wide, .why = "ad only, one past" },
+    }) |c| {
+        ChaCha20Poly1305.encrypt(out[0..c.m], &tag, buf[0..c.m], buf[0..c.ad], nonce, key);
+        testing.expectEqual(c.want, aead_path) catch |e| {
+            std.debug.print("seal routed m={d} ad={d} ({s}) to {s}\n", .{ c.m, c.ad, c.why, @tagName(aead_path) });
+            return e;
+        };
+        // Same case through `open`, which carries its own copy of the
+        // comparison and is the side that sees attacker-chosen input.
+        try ChaCha20Poly1305.decrypt(dec[0..c.m], out[0..c.m], tag, buf[0..c.ad], nonce, key);
+        testing.expectEqual(c.want, aead_path) catch |e| {
+            std.debug.print("open routed c={d} ad={d} ({s}) to {s}\n", .{ c.m, c.ad, c.why, @tagName(aead_path) });
+            return e;
+        };
+        // The routing assertions above would also pass on a call that did
+        // nothing at all, so pin the bytes too.
+        try testing.expectEqualSlices(u8, buf[0..c.m], dec[0..c.m]);
     }
 }
 

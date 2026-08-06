@@ -188,4 +188,141 @@ test "bench (opt-in via CHACHAPOLY_BENCH)" {
         }
         std.debug.print("\n", .{});
     }
+
+    // ── SHORT-PACKET SWEEPS ─────────────────────────────────────────────────
+    //
+    // Everything below exists to answer one question the sweeps above cannot:
+    // *where* a short AEAD call spends its time, and at what length the wide
+    // machinery starts paying for itself. Three properties make these
+    // different from the bulk lines above:
+    //
+    //   * They report **ns per call**, not MB/s. A short call is dominated by
+    //     a FIXED cost; MB/s hides a fixed cost behind a division by the
+    //     length, and a 30 ns difference at 64 bytes is invisible as MB/s but
+    //     is 10% of the call.
+    //   * They take the **minimum** of `reps` runs, not one run. Microbench
+    //     noise on a mobile CPU is one-sided — preemption, migration, thermal
+    //     throttle only ever make a run slower — so the fastest observed run
+    //     is the best estimate of the true cost. Single-shot runs of these
+    //     sizes were non-monotonic in length (a 96-byte call "faster" than a
+    //     64-byte one), which is noise, and a threshold tuned on noise is a
+    //     guess wearing a number's clothes.
+    //   * They step in 16-byte increments through the crossover region rather
+    //     than doubling, because the threshold has to be read off them.
+    //
+    // ── ChaCha20 `xor` by size — the AEAD's cipher half, in isolation. Note
+    //    that EVERY AEAD call, whatever its length, also pays one `xor` of 32
+    //    bytes to derive the Poly1305 key; the 32-byte row below is that cost.
+    {
+        std.debug.print("chacha20 xor by size (ns/call, min of {d}; ours / std / ratio):\n", .{reps});
+        inline for (short_sizes) |n| {
+            const n_iters = shortIters(iters, n);
+
+            var ours: u64 = std.math.maxInt(u64);
+            for (0..reps) |_| {
+                const t0 = nowNs();
+                for (0..n_iters) |_| root.ChaCha20.xor(out[0..n], buf[0..n], 1, key, nonce);
+                ours = @min(ours, nowNs() - t0);
+                std.mem.doNotOptimizeAway(&out);
+            }
+
+            var theirs: u64 = std.math.maxInt(u64);
+            for (0..reps) |_| {
+                const t0 = nowNs();
+                for (0..n_iters) |_| StdChaCha.xor(out[0..n], buf[0..n], 1, key, nonce);
+                theirs = @min(theirs, nowNs() - t0);
+                std.mem.doNotOptimizeAway(&out);
+            }
+            printRow(n, n_iters, ours, theirs);
+        }
+        std.debug.print("\n", .{});
+    }
+
+    // ── FULL AEAD by size — the number a consumer actually feels, and the one
+    //    this file was missing: it swept the MAC by size, but the AEAD only at
+    //    8 KiB and 1420 B. A WireGuard tunnel carries keepalives (0-byte
+    //    payload) and tunnelled TCP ACKs (40-60 B), so the left end of this
+    //    sweep is real traffic, not a microbenchmark curiosity.
+    //
+    //    `seal` and `open` are swept separately: `open` runs the MAC *before*
+    //    the keystream XOR, so a fix that only covered one direction would
+    //    show up as a split between the two tables.
+    {
+        std.debug.print("aead seal by size (ns/call, min of {d}; ours / std / ratio):\n", .{reps});
+        inline for (short_sizes) |n| {
+            const n_iters = shortIters(iters, n);
+            var tag: [16]u8 = undefined;
+
+            var ours: u64 = std.math.maxInt(u64);
+            for (0..reps) |_| {
+                const t0 = nowNs();
+                for (0..n_iters) |_| root.ChaCha20Poly1305.encrypt(out[0..n], &tag, buf[0..n], "", nonce, key);
+                ours = @min(ours, nowNs() - t0);
+                std.mem.doNotOptimizeAway(&out);
+            }
+
+            var theirs: u64 = std.math.maxInt(u64);
+            for (0..reps) |_| {
+                const t0 = nowNs();
+                for (0..n_iters) |_| StdAead.encrypt(out[0..n], &tag, buf[0..n], "", nonce, key);
+                theirs = @min(theirs, nowNs() - t0);
+                std.mem.doNotOptimizeAway(&out);
+            }
+            printRow(n, n_iters, ours, theirs);
+        }
+        std.debug.print("\n", .{});
+    }
+
+    {
+        std.debug.print("aead open by size (ns/call, min of {d}; ours / std / ratio):\n", .{reps});
+        var ct: [len]u8 = undefined;
+        inline for (short_sizes) |n| {
+            const n_iters = shortIters(iters, n);
+            var tag: [16]u8 = undefined;
+            root.ChaCha20Poly1305.encrypt(ct[0..n], &tag, buf[0..n], "", nonce, key);
+
+            var ours: u64 = std.math.maxInt(u64);
+            for (0..reps) |_| {
+                const t0 = nowNs();
+                for (0..n_iters) |_| root.ChaCha20Poly1305.decrypt(out[0..n], ct[0..n], tag, "", nonce, key) catch unreachable;
+                ours = @min(ours, nowNs() - t0);
+                std.mem.doNotOptimizeAway(&out);
+            }
+
+            var theirs: u64 = std.math.maxInt(u64);
+            for (0..reps) |_| {
+                const t0 = nowNs();
+                for (0..n_iters) |_| StdAead.decrypt(out[0..n], ct[0..n], tag, "", nonce, key) catch unreachable;
+                theirs = @min(theirs, nowNs() - t0);
+                std.mem.doNotOptimizeAway(&out);
+            }
+            printRow(n, n_iters, ours, theirs);
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+/// Sizes for the short-packet sweeps: 16-byte steps through the crossover
+/// region (a WireGuard keepalive is 0 bytes and a tunnelled TCP ACK is 40-60),
+/// then doubling out to a full MTU and beyond so the same table also shows
+/// that no large size was traded away for the short ones.
+const short_sizes = .{ 0, 16, 32, 48, 64, 65, 80, 96, 112, 120, 128, 129, 136, 144, 160, 176, 192, 224, 256, 320, 384, 448, 512, 1024, 1420, 8192 };
+
+/// Runs taken per measurement; the minimum is kept. See the block comment.
+const reps = 5;
+
+/// Iterations for a `n`-byte measurement — a fixed byte budget so a 16-byte
+/// row does not run for a minute, floored so the fixed-cost rows still get
+/// enough calls to time. Deliberately modest: benchmarks in this repo stay
+/// small (an oversized one once OOM-killed the host's editor).
+fn shortIters(iters: usize, comptime n: usize) usize {
+    return @max(iters, iters * 2048 / @max(n, 16));
+}
+
+fn printRow(comptime n: usize, n_iters: usize, ours_ns: u64, theirs_ns: u64) void {
+    const o = @as(f64, @floatFromInt(ours_ns)) / @as(f64, @floatFromInt(n_iters));
+    const t = @as(f64, @floatFromInt(theirs_ns)) / @as(f64, @floatFromInt(n_iters));
+    // Ratio is reported speed-wise (>1 = ours faster), i.e. theirs/ours in
+    // time, so it reads the same direction as the MB/s tables above.
+    std.debug.print("  {d:>5} B : {d:>8.1} / {d:>8.1} ns  ({d:.2}x)\n", .{ n, o, t, t / o });
 }
