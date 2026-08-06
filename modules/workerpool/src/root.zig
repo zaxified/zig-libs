@@ -40,6 +40,7 @@
 //! backpressure policy, and the interaction with `lockfree`'s EBR reclamation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lockfree = @import("lockfree");
 
 const QNode = lockfree.Node;
@@ -179,6 +180,18 @@ pub const WorkerPool = struct {
     // observability (also lets tests assert exact run counts)
     submitted: std.atomic.Value(u64) = .init(0),
     completed: std.atomic.Value(u64) = .init(0),
+
+    /// `JobBox`es handed out by `boxes` and not yet returned to it.
+    ///
+    /// This exists because a leaked box is **invisible to the allocator**:
+    /// `lockfree.NodePool.deinit` `destroy`s every slot it ever allocated
+    /// regardless of whether that slot was `release`d, so a `DebugAllocator`
+    /// reports a clean teardown even when `freeQueuedBoxes` never ran and tens
+    /// of thousands of boxes were abandoned. Both of this module's "no leak"
+    /// tests were anchored on nothing until this counter existed. It is the
+    /// pool's own accounting, so it holds without any change to `lockfree`
+    /// (whose `NodePool` exposes no live-slot count).
+    boxes_live: std.atomic.Value(i64) = .init(0),
 
     /// Build and start the pool. Returns a heap-owned `*WorkerPool` so worker
     /// threads can hold a stable back-pointer (a by-value pool would move on
@@ -340,6 +353,12 @@ pub const WorkerPool = struct {
     pub fn workerCount(self: *const WorkerPool) usize {
         return self.workers.len;
     }
+    /// `JobBox`es currently checked out of the box pool. Must be 0 once the
+    /// workers have joined and the queue has been drained (`drain`) or flushed
+    /// (`shutdownNow`); a non-zero value is a leak the allocator cannot see.
+    pub fn outstandingBoxes(self: *const WorkerPool) i64 {
+        return self.boxes_live.load(.seq_cst);
+    }
 
     // ── internal machinery ───────────────────────────────────────────────────
 
@@ -349,13 +368,13 @@ pub const WorkerPool = struct {
     fn enqueueJob(self: *WorkerPool, p: *Participant, job: Job) SubmitError!void {
         if (self.state.load(.seq_cst) != .running) return error.Shutdown;
 
-        const box = self.boxes.acquire() catch return error.SubmitFailed;
+        const box = self.acquireBox() catch return error.SubmitFailed;
         box.* = .{ .func = job.func, .ctx = job.ctx };
 
         _ = self.submitted.fetchAdd(1, .monotonic);
         self.queue.enqueue(p, @intFromPtr(box)) catch {
             _ = self.submitted.fetchSub(1, .monotonic);
-            self.boxes.release(box);
+            self.releaseBox(box);
             return error.SubmitFailed;
         };
 
@@ -365,6 +384,20 @@ pub const WorkerPool = struct {
         // and skip parking (or, if already parked, be woken here).
         _ = self.notify.fetchAdd(1, .seq_cst);
         self.io.futexWake(u32, &self.notify.raw, 1);
+    }
+
+    /// Check a box out of the pool, counting it. Every `boxes.acquire` in the
+    /// module goes through here, and every `boxes.release` through
+    /// `releaseBox`, so `boxes_live` cannot drift.
+    fn acquireBox(self: *WorkerPool) !*JobBox {
+        const box = try self.boxes.acquire();
+        _ = self.boxes_live.fetchAdd(1, .monotonic);
+        return box;
+    }
+
+    fn releaseBox(self: *WorkerPool, box: *JobBox) void {
+        self.boxes.release(box);
+        _ = self.boxes_live.fetchSub(1, .monotonic);
     }
 
     /// Bump the generation and wake every parked worker. Called after a state
@@ -381,7 +414,7 @@ pub const WorkerPool = struct {
         const box: *JobBox = @ptrFromInt(@as(usize, @intCast(value)));
         const func = box.func;
         const ctx = box.ctx;
-        self.boxes.release(box);
+        self.releaseBox(box);
         func(ctx);
         _ = self.completed.fetchAdd(1, .monotonic);
     }
@@ -392,7 +425,7 @@ pub const WorkerPool = struct {
     fn freeQueuedBoxes(self: *WorkerPool) void {
         while (self.queue.dequeue(self.shared_producer)) |value| {
             const box: *JobBox = @ptrFromInt(@as(usize, @intCast(value)));
-            self.boxes.release(box);
+            self.releaseBox(box);
         }
     }
 };
@@ -414,6 +447,23 @@ pub const Submitter = struct {
         self.* = undefined;
     }
 };
+
+/// **Test-only seam inside the lost-wakeup window.** `null` in every build;
+/// only the teeth test at the bottom of this file ever installs anything, and
+/// the call site is `comptime`-gated on `builtin.is_test`, so a release build
+/// does not even load it.
+///
+/// It sits between a worker's FINAL queue re-check and its park. That is the
+/// only instant at which a test can deterministically place a producer inside
+/// the window SPEC §4 argues about, so:
+///
+///   **INVARIANT: `workerRun` must snapshot `notify` ABOVE the final
+///   `queue.dequeue` re-check.** Any edit that moves the snapshot below this
+///   seam reintroduces the classic lost wakeup (worker sees empty → producer
+///   publishes, bumps the generation and wakes nobody → worker snapshots the
+///   *new* generation and parks on it forever) and hangs that test into its
+///   watchdog.
+var park_seam: std.atomic.Value(?*const fn () void) = .init(null);
 
 // The worker thread body. A free function (not a method) so `std.Thread.spawn`
 // can name it; takes the stable `*Worker`.
@@ -440,6 +490,12 @@ fn workerRun(w: *Worker) void {
         if (self.queue.dequeue(p)) |value| {
             self.runBox(value);
             continue;
+        }
+        // Test seam — see `park_seam`. Deliberately placed at the TOP of the
+        // pre-park window (immediately after the last look at the queue), so a
+        // snapshot moved anywhere below it is caught.
+        if (builtin.is_test) {
+            if (park_seam.load(.seq_cst)) |f| f();
         }
         if (self.state.load(.seq_cst) != .running) continue; // re-handle stop/drain
         self.io.futexWaitUncancelable(u32, &self.notify.raw, gen);
@@ -552,6 +608,11 @@ test "graceful drain runs every queued job; no leak (DebugAllocator clean)" {
 
     // Submitting after drain is refused, not a panic.
     try testing.expectError(error.Shutdown, pool.submit(.{ .func = incr, .ctx = &c }));
+
+    // The allocator alone cannot see an unreturned `JobBox` (see `boxes_live`),
+    // so assert the pool's own accounting too — otherwise "no leak" in this
+    // test's name is a claim nothing checks.
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
 
     pool.deinit(); // frees everything; DebugAllocator verifies no leak
 }
@@ -684,6 +745,8 @@ test "shutdownNow: in-flight completes, queued dropped, no leak" {
     // freed (the deferred deinit + DebugAllocator prove no leak/double-free).
     try testing.expect(ran <= n);
     try testing.expectEqual(ran, pool.completedCount());
+    // Same point as above: the DebugAllocator cannot see an abandoned box.
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
 }
 
 test "STRESS: many concurrent producers via Submitter + pool consuming (MP)" {
@@ -813,6 +876,155 @@ test "STRESS: submitter register/deinit churn (dynamic EBR slot reuse)" {
     pool.drain();
     try testing.expectEqual(cycles * per_cycle, c.n.load(.seq_cst));
     try testing.expectEqual(cycles * per_cycle, pool.completedCount());
+}
+
+// ── TEETH: the lost-wakeup ordering (SPEC §4) ───────────────────────────────
+//
+// The STRESS test above hammers the park/wake edge 5 000 times and still could
+// not see an inverted `notify` snapshot: with 2 workers the *sibling* absorbs
+// the stranded job, and even with one worker the window between the queue
+// re-check and the park is a few instructions wide, so a random race never
+// lands in it. More iterations do not help — the window has to be held open.
+//
+// So it is held open: `park_seam` blocks the (single) worker exactly inside the
+// window while the test publishes a job, bumps the generation and issues the
+// wake. The wake reaches nobody, because the worker is not parked yet. The job
+// can therefore only ever run if the generation the worker parks on is the one
+// it snapshotted BEFORE its last look at the queue — which is precisely the
+// property SPEC §4's argument rests on.
+
+const LostWakeup = struct {
+    io: std.Io,
+    /// Worker → test: "I am inside the pre-park window."
+    in_window: std.atomic.Value(u32) = .init(0),
+    /// Test → worker: "the job is published and the wake has been issued."
+    released: std.atomic.Value(u32) = .init(0),
+    /// One-shot: only the first park of the run is intercepted.
+    used: std.atomic.Value(u32) = .init(0),
+};
+
+var lost_wakeup_ctx: std.atomic.Value(?*LostWakeup) = .init(null);
+
+fn lostWakeupSeam() void {
+    const ctx = lost_wakeup_ctx.load(.seq_cst) orelse return;
+    if (ctx.used.cmpxchgStrong(0, 1, .seq_cst, .seq_cst) != null) return;
+    ctx.in_window.store(1, .seq_cst);
+    ctx.io.futexWake(u32, &ctx.in_window.raw, std.math.maxInt(u32));
+    while (ctx.released.load(.seq_cst) == 0) {
+        ctx.io.futexWaitTimeout(u32, &ctx.released.raw, 0, .{ .duration = .{
+            .raw = .fromMilliseconds(5),
+            .clock = .awake,
+        } }) catch {};
+    }
+}
+
+test "TEETH: the notify snapshot must precede the final queue re-check" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ctx = LostWakeup{ .io = io };
+    lost_wakeup_ctx.store(&ctx, .seq_cst);
+    defer lost_wakeup_ctx.store(null, .seq_cst);
+    park_seam.store(lostWakeupSeam, .seq_cst);
+    defer park_seam.store(null, .seq_cst);
+
+    // Exactly ONE worker: with two, the sibling picks the stranded job up and
+    // the defect is masked — the reason the 5 000-iteration stress test is
+    // structurally incapable of catching this.
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    // The worker starts with an empty queue, so it walks straight into the
+    // window and blocks in the seam.
+    while (ctx.in_window.load(.seq_cst) == 0) {
+        io.futexWaitTimeout(u32, &ctx.in_window.raw, 0, .{ .duration = .{
+            .raw = .fromMilliseconds(1),
+            .clock = .awake,
+        } }) catch {};
+    }
+
+    // Publish + bump + wake while the worker is inside the window: the wake
+    // lands on an empty futex queue and is lost, by construction.
+    var c = Counter{};
+    try pool.submit(.{ .func = incr, .ctx = &c });
+
+    ctx.released.store(1, .seq_cst);
+    io.futexWake(u32, &ctx.released.raw, std.math.maxInt(u32));
+
+    // Correct code: the worker holds the pre-submit generation, the futex value
+    // no longer matches, the wait returns at once and the job runs.
+    // Inverted snapshot: the worker parks on the post-submit generation with
+    // the job sitting in the queue and nothing left to wake it — this poll
+    // never finishes and the watchdog panics.
+    var poll = std.atomic.Value(u32).init(0);
+    while (c.n.load(.seq_cst) == 0) {
+        io.futexWaitTimeout(u32, &poll.raw, 0, .{ .duration = .{
+            .raw = .fromMilliseconds(1),
+            .clock = .awake,
+        } }) catch {};
+    }
+    try testing.expectEqual(@as(u64, 1), c.n.load(.seq_cst));
+
+    pool.drain();
+    try testing.expectEqual(@as(u64, 1), pool.completedCount());
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+}
+
+// ── TEETH: box reclamation the allocator cannot see ─────────────────────────
+
+test "TEETH: shutdownNow returns every queued JobBox to the pool" {
+    // `testing.allocator` is blind here: `lockfree.NodePool.deinit` frees every
+    // slot whether or not it was released, so deleting `freeQueuedBoxes`
+    // outright leaves 50 000 abandoned boxes and still reports a clean run.
+    // `outstandingBoxes` is the anchor the allocator cannot provide.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 30_000 };
+    try wd.start();
+    defer wd.finish();
+
+    // Slow jobs, so the abrupt stop is guaranteed to leave a real backlog in
+    // the queue — otherwise there would be nothing for `freeQueuedBoxes` to do
+    // and the test would assert a vacuous truth.
+    var c = SpinCounter{ .spins = 2_000 };
+    const n: u64 = 50_000;
+    for (0..n) |_| try pool.submit(.{ .func = spinIncr, .ctx = &c });
+
+    pool.shutdownNow();
+    const ran = c.n.load(.seq_cst);
+    try testing.expect(ran < n); // the backlog was real
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+}
+
+test "TEETH: graceful drain returns every JobBox to the pool" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 3 });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 30_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    const n: u64 = 5_000;
+    for (0..n) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+
+    pool.drain();
+    try testing.expectEqual(n, pool.completedCount());
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
 }
 
 test "default n_workers derives from cpu count and is ≥ 1" {

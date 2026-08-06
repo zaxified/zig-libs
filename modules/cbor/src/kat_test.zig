@@ -281,6 +281,93 @@ test "hostile: empty input is Truncated, not a panic" {
     try testing.expectError(error.Truncated, cbor.decode(a, &.{}, .{}));
 }
 
+// ── boundary teeth for `Decoder.readBytes` ─────────────────────────────────
+//
+// Every string read in the decoder passes through one bounds check:
+//   `if (len > remaining) return error.Truncated;`  (`root.zig`)
+// The hostile tests above only ever declare `len = 2^64-1`, i.e. astronomically
+// past the bound. That is the "tested far past the limit, never at it" shape:
+// widening the check to `len > remaining + 1` keeps every one of those tests
+// green while the decoder walks one byte off the end of the input for real.
+// These tests pin BOTH sides of the boundary — `len == remaining` must be
+// accepted and `len == remaining + 1` must be `Truncated` — on every path that
+// reaches `readBytes`: definite byte string, definite text string, a multi-byte
+// length argument, and both flavours of indefinite-length chunk.
+//
+// Under the off-by-one the `remaining + 1` cases stop returning `Truncated`
+// and slice past `bytes.len`, so they fail either as a wrong error or as a
+// bounds-check panic; either way the suite exits non-zero.
+
+test "boundary: definite byte string with len == remaining is accepted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = [_]u8{ 0x41, 0xaa }; // bstr, len 1, exactly 1 content byte
+    const v = try cbor.decode(a, &bytes, .{});
+    try testing.expectEqualSlices(u8, &[_]u8{0xaa}, v.bytes);
+}
+
+test "boundary: definite byte string with len == remaining + 1 is Truncated" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = [_]u8{0x41}; // bstr, len 1, zero content bytes follow
+    try testing.expectError(error.Truncated, cbor.decode(a, &bytes, .{}));
+}
+
+test "boundary: definite text string with len == remaining / remaining + 1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const exact = [_]u8{ 0x61, 'a' }; // tstr, len 1, one content byte
+    const v = try cbor.decode(a, &exact, .{});
+    try testing.expectEqualStrings("a", v.text);
+
+    const over = [_]u8{0x61}; // tstr, len 1, nothing follows
+    try testing.expectError(error.Truncated, cbor.decode(a, &over, .{}));
+}
+
+test "boundary: multi-byte length argument, len == remaining / remaining + 1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 0x59 = bstr with a 2-byte length argument. Exercises the boundary through
+    // `readUintN(2)` rather than the inline 0..23 form.
+    const exact = [_]u8{ 0x59, 0x00, 0x03, 1, 2, 3 };
+    const v = try cbor.decode(a, &exact, .{});
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, v.bytes);
+
+    const over = [_]u8{ 0x59, 0x00, 0x03, 1, 2 }; // declares 3, supplies 2
+    try testing.expectError(error.Truncated, cbor.decode(a, &over, .{}));
+}
+
+test "boundary: indefinite byte-string chunk, len == remaining / remaining + 1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 0x5f … 0xff — the chunk length is bounds-checked by the same `readBytes`.
+    const exact = [_]u8{ 0x5f, 0x42, 0xaa, 0xbb, 0xff };
+    const v = try cbor.decode(a, &exact, .{});
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb }, v.bytes);
+
+    // Chunk declares 1 byte with 0 bytes left in the whole input (`0xff` was
+    // already consumed as the chunk head's neighbour): len == remaining + 1.
+    const over = [_]u8{ 0x5f, 0x41 };
+    try testing.expectError(error.Truncated, cbor.decode(a, &over, .{}));
+}
+
+test "boundary: indefinite text-string chunk, len == remaining / remaining + 1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const exact = [_]u8{ 0x7f, 0x62, 'h', 'i', 0xff };
+    const v = try cbor.decode(a, &exact, .{});
+    try testing.expectEqualStrings("hi", v.text);
+
+    const over = [_]u8{ 0x7f, 0x61 }; // chunk declares 1, nothing remains
+    try testing.expectError(error.Truncated, cbor.decode(a, &over, .{}));
+}
+
 // ── fuzz: decode on arbitrary bytes never panics/OOB ────────────────────────
 
 fn fuzzDecodeNeverPanics(_: void, smith: *std.testing.Smith) !void {

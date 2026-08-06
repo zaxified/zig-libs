@@ -23,9 +23,15 @@
 //!     "a link you are an endpoint of just failed": mark that circuit down, then
 //!     re-originate this node's LSP without the lost neighbour at a bumped
 //!     sequence number, and flood.
-//!   - **check** — a safety invariant checked after every event: no node's LSDB
-//!     ever holds more than `node_count` distinct LSP-IDs (a runaway/corruption
-//!     tripwire; correct flooding stores exactly one LSP per originator).
+//!   - **check** — the safety invariants checked after every event: (1) no
+//!     node's LSDB ever holds more than `node_count` distinct LSP-IDs (a
+//!     runaway/corruption tripwire; correct flooding stores exactly one LSP per
+//!     originator), and (2) no node's stored sequence number for an originator
+//!     ever decreases, and no LSP it already holds ever disappears (nothing ages
+//!     or is purged here). Both have a permanent positive control in the tests,
+//!     so each is known to be capable of firing — see `extra_fragments` and
+//!     `broken_wipe_node`. A violation is recorded in `Fabric.violation` as well
+//!     as stopping the run.
 //!
 //! ## Why link-state changes are driven by a timer, not observed
 //! netsim delivers no fault notification to the protocol (its `neighbors` view
@@ -173,6 +179,34 @@ pub const Fabric = struct {
     /// — deliberately breaks convergence (a permanent test flips it on).
     broken_no_drain: bool = false,
 
+    /// Per-(node, originator) high-water mark of the stored sequence number,
+    /// `nodes.len * nodes.len` entries indexed `node * n + origin`. Zero means
+    /// "never seen". Maintained by `check` after every event so a *transient*
+    /// regression — one that self-heals before the run ends and is therefore
+    /// invisible to every end-of-run assertion — is still caught.
+    seen_seq: []u32,
+
+    /// The first safety-invariant `check` raised during the last run, or null.
+    /// Recorded here as well as inside netsim because `runToConvergence`
+    /// collapses "invariant violated", "event cap hit" and "did not quiesce"
+    /// into the single `.step_cap_exceeded` value, so the outcome alone cannot
+    /// say *which* happened.
+    violation: ?anyerror = null,
+
+    /// Positive control for the LSDB-count tripwire: originate this many extra
+    /// LSP fragments (LSP-numbers 1..n) alongside the real LSP-number 0. Every
+    /// fragment is a distinct LSP-ID, so each node's database grows past the
+    /// "exactly one LSP per originator" bound that `check` asserts. Zero (the
+    /// default) is the normal, correct fabric.
+    extra_fragments: u8 = 0,
+
+    /// Positive control for the sequence-monotonicity invariant: the first time
+    /// this node receives a message while already holding ≥ 2 LSPs, its whole
+    /// LSDB is dropped and re-initialised — the shape of a store that loses
+    /// entries. `null` (the default) is the normal fabric.
+    broken_wipe_node: ?NodeId = null,
+    wipe_done: bool = false,
+
     pub fn init(gpa: Allocator, topo: Topology, seed: u64) Allocator.Error!Fabric {
         const nodes = try gpa.alloc(NodeState, topo.node_count);
         errdefer gpa.free(nodes);
@@ -223,7 +257,12 @@ pub const Fabric = struct {
             initialized += 1;
         }
 
-        return .{ .gpa = gpa, .nodes = nodes, .seed = seed };
+        // Sized n×n; the `initialized`/`nodes` errdefers above still cover a
+        // failure here, so no extra unwind is needed.
+        const seen_seq = try gpa.alloc(u32, topo.node_count * topo.node_count);
+        @memset(seen_seq, 0);
+
+        return .{ .gpa = gpa, .nodes = nodes, .seed = seed, .seen_seq = seen_seq };
     }
 
     pub fn deinit(self: *Fabric) void {
@@ -233,6 +272,7 @@ pub const Fabric = struct {
             self.gpa.free(ns.neighbours);
             self.gpa.free(ns.link_failed);
         }
+        self.gpa.free(self.seen_seq);
         self.gpa.free(self.nodes);
         self.failures.deinit(self.gpa);
         self.* = undefined;
@@ -301,6 +341,11 @@ pub const Fabric = struct {
             @memset(ns.link_failed, false);
             _ = i;
         }
+        // Per-run invariant state (netsim calls `reset` at the top of every
+        // drive, so this is the run's baseline).
+        @memset(self.seen_seq, 0);
+        self.violation = null;
+        self.wipe_done = false;
     }
 
     fn onStart(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId) anyerror!void {
@@ -330,6 +375,21 @@ pub const Fabric = struct {
             else => return,
         }
 
+        // Positive control for `check`'s monotonicity invariant: drop this
+        // node's whole database once it has learned something. Nothing in the
+        // end-of-run assertions would notice (the fabric re-floods and
+        // re-converges); only a per-event hook can.
+        if (self.broken_wipe_node) |wn| {
+            if (!self.wipe_done and node == wn and ns.lsdb.count() >= 2) {
+                self.wipe_done = true;
+                ns.lsdb.deinit();
+                ns.lsdb = isis_lsdb.Lsdb.init(
+                    self.gpa,
+                    lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(self.nodes.len)),
+                );
+            }
+        }
+
         // Positive control: skipping this arm leaves SRM/SSN undrained forever.
         if (self.broken_no_drain) return;
         try sim.setTimer(node, poll_delay, timer_poll);
@@ -350,13 +410,44 @@ pub const Fabric = struct {
         try self.pollAndSend(sim, node, now);
     }
 
+    /// Record and raise a safety-invariant violation. `check` never overwrites
+    /// an earlier one (netsim stops the run on the first).
+    fn violate(self: *Fabric, e: anyerror) anyerror!void {
+        if (self.violation == null) self.violation = e;
+        return e;
+    }
+
+    /// The per-event safety hook — netsim calls this after EVERY event, so it is
+    /// the harness's only continuous oracle. Everything else (`lsdbsAgree`,
+    /// routes, quiescence) is asserted once, at the end, and therefore cannot
+    /// see a violation that repairs itself before the run finishes.
+    ///
+    /// Both invariants below have a permanent positive control in the tests
+    /// (`extra_fragments` for the first, `broken_wipe_node` for the second), so
+    /// each is known to be *capable* of firing and its bound is known to be
+    /// tight. An invariant that has never been watched fire is decoration.
     fn check(ctx: *anyopaque, sim: *const netsim.Sim) anyerror!void {
         _ = sim;
         const self = cast(ctx);
-        for (self.nodes) |*ns| {
-            // Correct flooding stores exactly one LSP per originator; anything
-            // beyond the node count is a runaway/corruption bug.
-            if (ns.lsdb.count() > self.nodes.len) return error.LsdbOverflow;
+        const n = self.nodes.len;
+        for (self.nodes, 0..) |*ns, node| {
+            // (1) Correct flooding stores exactly one LSP per originator;
+            // anything beyond the node count is a runaway/corruption bug.
+            if (ns.lsdb.count() > n) return self.violate(error.LsdbOverflow);
+
+            // (2) A stored sequence number never goes backwards, and an LSP a
+            // node already holds never disappears (this harness never ticks
+            // lifetimes, so nothing ages out and nothing is purged). Absence is
+            // modelled as sequence 0, so "held, then gone" is caught by the
+            // same comparison as "held, then rolled back".
+            var origin: usize = 0;
+            while (origin < n) : (origin += 1) {
+                const id = lspIdOf(systemIdForNode(@intCast(origin)), 0);
+                const cur: u32 = if (ns.lsdb.get(id, 0)) |v| v.sequence_number else 0;
+                const slot = &self.seen_seq[node * n + origin];
+                if (cur < slot.*) return self.violate(error.SequenceRegression);
+                slot.* = cur;
+            }
         }
     }
 
@@ -383,6 +474,24 @@ pub const Fabric = struct {
             try isis.tlvs.addExtendedIsReach(&b.tlvs, neighbourId7(nbr_sys), nb.metric, &.{});
         }
         _ = try ns.lsdb.insert(b.finish(), null, now);
+
+        // Positive control for `check`'s LSDB-count tripwire: emit additional
+        // LSP fragments for this system. Each is a distinct LSP-ID, so the
+        // "exactly one LSP per originator" bound is exceeded within a couple of
+        // flooding hops — at a count just above `node_count`, not orders of
+        // magnitude above it.
+        var frag: u8 = 1;
+        while (frag <= self.extra_fragments) : (frag += 1) {
+            var fbuf: [1024]u8 = undefined;
+            var fb = try isis.pdu.LspBuilder.init(&fbuf, .{
+                .remaining_lifetime = lsp_lifetime,
+                .lsp_id = lspIdOf(ns.system_id, frag),
+                .sequence_number = ns.seq,
+                .checksum = 0,
+                .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+            });
+            _ = try ns.lsdb.insert(fb.finish(), null, now);
+        }
     }
 
     /// Run one flooding poll for `node` and physically send every effect to the
@@ -756,6 +865,77 @@ test "determinism: identical fabric + fault schedule yields identical final LSDB
             try testing.expectEqual(f1.storedSequence(node, origin), f2.storedSequence(node, origin));
         }
         try testing.expectEqual(f1.selfSequence(node), f2.selfSequence(node));
+    }
+}
+
+// ── TEETH for the per-event safety hook (`check`) ───────────────────────────
+//
+// `check` is the only oracle that runs *during* a simulation; everything else
+// is asserted once, at the end. It used to assert a single bound
+// (`lsdb.count() > node_count`) that no test came anywhere near, so the bound
+// could be loosened a thousandfold and the whole suite stayed green: the
+// tripwire had never fired and was not known to be able to. These two tests
+// make each invariant fire on demand, and pin the bound tight enough that
+// loosening it is caught.
+
+test "TEETH: the LSDB-count tripwire fires, and its bound is tight" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.init(testing.allocator, topo, 0x1CE);
+    defer fab.deinit();
+
+    // Each node now originates three distinct LSP-IDs instead of one, so the
+    // "exactly one LSP per originator" bound is breached during flooding.
+    fab.extra_fragments = 2;
+
+    // The run must STOP on the invariant — not merely fail to converge.
+    try testing.expectEqual(Outcome.step_cap_exceeded, try fab.runToConvergence(step_cap));
+    try testing.expectEqual(@as(?anyerror, error.LsdbOverflow), fab.violation);
+
+    // Tightness: the hook must catch this while the database is barely over the
+    // bound. Any loosening of `count() > nodes.len` — the exact mutation that
+    // previously left 9/9 green — pushes the trip point past this window and
+    // the assertions above stop holding.
+    var max_count: usize = 0;
+    for (fab.nodes) |*ns| max_count = @max(max_count, ns.lsdb.count());
+    try testing.expect(max_count > topo.node_count);
+    try testing.expect(max_count <= topo.node_count * 2);
+}
+
+test "TEETH: a stored sequence that goes backwards is caught during the run" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.init(testing.allocator, topo, 0x5E9);
+    defer fab.deinit();
+
+    // C (node 2) loses its whole database once it has learned two LSPs. The
+    // fabric would re-flood and re-converge, so no end-of-run assertion would
+    // ever see it; only the per-event hook can.
+    fab.broken_wipe_node = 2;
+
+    try testing.expectEqual(Outcome.step_cap_exceeded, try fab.runToConvergence(step_cap));
+    try testing.expectEqual(@as(?anyerror, error.SequenceRegression), fab.violation);
+}
+
+test "control: a correct run trips neither invariant" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.init(testing.allocator, topo, 0xA11CE);
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    try testing.expectEqual(@as(?anyerror, null), fab.violation);
+
+    // And the monotonicity high-water marks match the final state, i.e. the
+    // hook really did observe every node's database, not an empty one.
+    var node: usize = 0;
+    while (node < topo.node_count) : (node += 1) {
+        var origin: usize = 0;
+        while (origin < topo.node_count) : (origin += 1) {
+            try testing.expectEqual(
+                @as(u32, 1),
+                fab.seen_seq[node * topo.node_count + origin],
+            );
+        }
     }
 }
 

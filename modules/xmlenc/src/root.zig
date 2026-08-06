@@ -569,11 +569,129 @@ test "RFC 3394 §4.1 AES key unwrap (byte-exact)" {
     try testing.expectEqualSlices(u8, &key_data, rec);
 }
 
-test "PKCS#1 v1.5 unpad rejects short PS / wrong prefix" {
-    // Directly exercise the unpadding logic through a crafted EM by feeding a
-    // fake modexp is out of scope; instead validate the flag logic on the
-    // helper indirectly via the classify + gating tests and the round-trip
-    // suite. Here we only assert the gate: rsa-1_5 without opt-in is refused —
-    // covered in test_roundtrip.zig. This placeholder keeps intent documented.
-    try testing.expect(true);
+// ── RFC 8017 §7.2.2 unpadding teeth ─────────────────────────────────────────
+//
+// This replaces a placeholder that asserted `testing.expect(true)` and said so
+// in its own comment ("feeding a fake modexp is out of scope"). It is not out
+// of scope: RSA is a bijection, so a chosen EM block can be handed to the
+// *production* `rsaPkcs1v15Unwrap` by raw-encrypting it with the matching
+// public key (`rsa.rsaep`) — RSADP then hands the unpadding exactly the block
+// we built. No refactor, no fake key, no test-only entry point.
+//
+// This matters because the module's own threat model names Bleichenbacher and
+// Jager–Somorovsky as the reason `rsa-1_5` is gated behind `allow_weak_rsa15`:
+// the unpadding IS the check that stands between a deployment that flips that
+// opt-in and those attacks. Before this table, deleting the block-type check
+// (`em[1] == 0x02`) or the PS ≥ 8 minimum left the whole suite green.
+//
+// Key size: a 512-bit modulus (k = 64) is used deliberately. The PS-length
+// boundary is only reachable at all when `k - sep_idx - 1` still fits the
+// 64-byte CEK buffer; with k = 128 a 7-octet PS implies a 118-byte "message"
+// and would be rejected by the length arm instead, so the PS test would pass
+// for the wrong reason. The over-long-message arm gets its own 1024-bit case.
+
+/// Deterministic test keys (test-only use of a seeded PRNG, as elsewhere here).
+fn v15TestKey(comptime bits: usize) !rsa.KeyPair {
+    var prng = std.Random.DefaultPrng.init(0x15_C0_DE_15);
+    return rsa.generate(prng.random(), bits, 65537);
+}
+
+/// Build an EM block of exactly `k` bytes: `b0 || b1 || PS || sep || M`, where
+/// PS is `ps_len` nonzero octets and `sep` is 0x00 unless `terminate` is false
+/// (in which case the whole tail after the prefix is nonzero — no terminator).
+fn buildEm(comptime k: usize, b0: u8, b1: u8, ps_len: usize, msg_len: usize, terminate: bool) [k]u8 {
+    var em: [k]u8 = undefined;
+    @memset(&em, 0xBB); // nonzero filler
+    em[0] = b0;
+    em[1] = b1;
+    if (terminate) {
+        std.debug.assert(2 + ps_len + 1 + msg_len == k);
+        em[2 + ps_len] = 0x00;
+        // A recognisable message body so the recovered bytes can be compared.
+        for (em[2 + ps_len + 1 ..], 0..) |*p, i| p.* = @intCast((i % 251) + 1);
+    }
+    return em;
+}
+
+/// Hand `em` to the production unpadding by raw-encrypting it under `pk`.
+fn unpadEm(comptime k: usize, em: [k]u8, kp: rsa.KeyPair, out: *[64]u8) Error![]const u8 {
+    const ct = rsa.rsaep(k, em, kp.public_key) catch return error.DecryptionError;
+    return rsaPkcs1v15Unwrap(kp.secret_key, &ct, out);
+}
+
+test "TEETH: PKCS#1 v1.5 unpadding accepts a valid EM and the PS=8 boundary" {
+    const k = 64;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    var out: [64]u8 = undefined;
+
+    // Ordinary CEK-sized message: EM = 00 02 PS(29) 00 M(32).
+    const good = buildEm(k, 0x00, 0x02, 29, 32, true);
+    const rec = try unpadEm(k, good, kp, &out);
+    try testing.expectEqualSlices(u8, good[k - 32 ..], rec);
+
+    // PS of exactly 8 octets is the RFC 8017 §7.2.2 minimum — must be ACCEPTED.
+    // (This is the positive half of the boundary; the negative half is PS = 7
+    // in the rejection table below. Without both, `sep_idx >= 10` can be moved
+    // in either direction unnoticed.)
+    const ps8 = buildEm(k, 0x00, 0x02, 8, 53, true);
+    const rec8 = try unpadEm(k, ps8, kp, &out);
+    try testing.expectEqualSlices(u8, ps8[k - 53 ..], rec8);
+}
+
+test "TEETH: PKCS#1 v1.5 unpadding rejects every malformed EM (RFC 8017 §7.2.2)" {
+    const k = 64;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    var out: [64]u8 = undefined;
+
+    const Case = struct {
+        name: []const u8,
+        em: [k]u8,
+    };
+    const cases = [_]Case{
+        // EM[0] must be 0x00.
+        .{ .name = "leading octet 0x01", .em = buildEm(k, 0x01, 0x02, 29, 32, true) },
+        // EM[1] must be 0x02. 0x01 is block type 1 (the *signature* padding
+        // type) — accepting it is the classic v1.5 confusion, and dropping this
+        // single check is what previously survived the whole suite.
+        .{ .name = "block type 1 (signature padding)", .em = buildEm(k, 0x00, 0x01, 29, 32, true) },
+        .{ .name = "block type 0", .em = buildEm(k, 0x00, 0x00, 29, 32, true) },
+        .{ .name = "block type 3", .em = buildEm(k, 0x00, 0x03, 29, 32, true) },
+        // PS must be at least 8 octets. 7 is one below the bound; everything
+        // else about this block is valid, so the PS minimum is the only check
+        // that can reject it.
+        .{ .name = "PS of 7 octets (one below the minimum)", .em = buildEm(k, 0x00, 0x02, 7, 54, true) },
+        .{ .name = "PS of 1 octet", .em = buildEm(k, 0x00, 0x02, 1, 60, true) },
+        .{ .name = "PS of 0 octets (0x00 immediately after the prefix)", .em = buildEm(k, 0x00, 0x02, 0, 61, true) },
+        // A 0x00 terminator must exist.
+        .{ .name = "no 0x00 terminator anywhere", .em = buildEm(k, 0x00, 0x02, 0, 0, false) },
+        // A zero-length message (terminator is the final octet) is not a CEK.
+        .{ .name = "zero-length message", .em = buildEm(k, 0x00, 0x02, k - 3, 0, true) },
+    };
+
+    for (cases) |c| {
+        const r = unpadEm(k, c.em, kp, &out);
+        testing.expectError(error.DecryptionError, r) catch |e| {
+            std.debug.print("v1.5 unpadding ACCEPTED a malformed EM: {s}\n", .{c.name});
+            return e;
+        };
+    }
+}
+
+test "TEETH: PKCS#1 v1.5 unpadding rejects a message longer than the CEK buffer" {
+    // The `msg_len > out.len` arm needs a modulus large enough that a valid
+    // PS still leaves more than 64 message octets: k = 128, PS = 8 ⇒ 117.
+    const k = 128;
+    var kp = try v15TestKey(1024);
+    defer kp.secret_key.deinit();
+    var out: [64]u8 = undefined;
+
+    const long = buildEm(k, 0x00, 0x02, 8, 117, true);
+    try testing.expectError(error.DecryptionError, unpadEm(k, long, kp, &out));
+
+    // Control on the same key: a 32-byte CEK with a full-length PS decodes.
+    const ok = buildEm(k, 0x00, 0x02, 93, 32, true);
+    const rec = try unpadEm(k, ok, kp, &out);
+    try testing.expectEqualSlices(u8, ok[k - 32 ..], rec);
 }
