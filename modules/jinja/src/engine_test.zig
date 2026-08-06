@@ -384,3 +384,162 @@ test "autoescape: context data cannot reach the output unescaped without |safe" 
     defer gpa.free(raw);
     try testing.expectEqualStrings("q <script>alert(1)</script> q", raw);
 }
+
+// ── unbounded work on attacker-chosen input ────────────────────────────────
+//
+// Templates in this module are untrusted input (see `fuzz_test.zig`'s
+// docstring: a config repository, a UI field, a fleet-management API), and so
+// is the context data. Both of the shapes below used to be a crash or a spin
+// rather than an error.
+
+const Parts = struct {
+    pre: []const u8 = "",
+    open: []const u8 = "",
+    mid: []const u8 = "",
+    close: []const u8 = "",
+    post: []const u8 = "",
+};
+
+/// `pre ++ open*n ++ mid ++ close*n ++ post`.
+fn nestedSrc(gpa: std.mem.Allocator, parts: Parts, n: usize) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    errdefer b.deinit(gpa);
+    try b.appendSlice(gpa, parts.pre);
+    for (0..n) |_| try b.appendSlice(gpa, parts.open);
+    try b.appendSlice(gpa, parts.mid);
+    for (0..n) |_| try b.appendSlice(gpa, parts.close);
+    try b.appendSlice(gpa, parts.post);
+    return b.toOwnedSlice(gpa);
+}
+
+const Nesting = struct {
+    what: []const u8,
+    parts: Parts,
+    /// Deepest `n` that still compiles at `max_nesting_depth = 32`.
+    fits_at_32: usize,
+};
+
+/// Every shape that recursed without a bound. The first three grow the
+/// *parser's* stack; the rest are parsed by iterative loops and grow only the
+/// **tree**, which `Renderer.eval` / `renderNodes` / `exprMentions` then
+/// descend just as recursively — so a bound on the parser alone would have left
+/// them crashing.
+const nestings = [_]Nesting{
+    .{ .what = "parentheses", .parts = .{ .pre = "{{ ", .open = "(", .mid = "1", .close = ")", .post = " }}" }, .fits_at_32 = 31 },
+    .{ .what = "list literals", .parts = .{ .pre = "{{ ", .open = "[", .mid = "1", .close = "]", .post = " }}" }, .fits_at_32 = 31 },
+    .{ .what = "unary minus", .parts = .{ .pre = "{{ ", .open = "-", .mid = "1", .post = " }}" }, .fits_at_32 = 31 },
+    .{ .what = "filter chain", .parts = .{ .pre = "{{ 1", .mid = "", .close = "|string", .post = " }}" }, .fits_at_32 = 31 },
+    .{ .what = "arithmetic chain", .parts = .{ .pre = "{{ 1", .mid = "", .close = "+1", .post = " }}" }, .fits_at_32 = 31 },
+    .{ .what = "attribute chain", .parts = .{ .pre = "{{ x", .mid = "", .close = ".a", .post = " }}" }, .fits_at_32 = 31 },
+    .{ .what = "chain inside a macro body", .parts = .{ .pre = "{% macro m() %}{{ 1", .mid = "", .close = "+1", .post = " }}{% endmacro %}" }, .fits_at_32 = 30 },
+    .{ .what = "block nesting", .parts = .{ .open = "{% if 1 %}", .mid = "x", .close = "{% endif %}" }, .fits_at_32 = 15 },
+    .{ .what = "elif chain", .parts = .{ .pre = "{% if 0 %}a", .mid = "", .close = "{% elif 0 %}b", .post = "{% endif %}" }, .fits_at_32 = 29 },
+};
+
+test "nesting deeper than the bound is a named error, not a stack overflow" {
+    const gpa = testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{ .undefined_policy = .lenient });
+    defer env.deinit();
+    for (nestings) |c| {
+        // 20 000 levels: every one of these was a SIGSEGV at this depth, in
+        // templates of 20–420 KB. The default bound is 256, so the answer must
+        // arrive as an error long before any stack is touched.
+        const src = try nestedSrc(gpa, c.parts, 20_000);
+        defer gpa.free(src);
+        var diag: jinja.Diagnostic = .{};
+        if (env.compile(src, &diag)) |tmpl| {
+            var m = tmpl;
+            m.deinit();
+            std.debug.print("\n{s} nested 20000 deep compiled instead of being refused\n", .{c.what});
+            return error.NestingNotBounded;
+        } else |e| try testing.expectEqual(error.TooDeep, e);
+        // Reported like every other template error: a typed error plus a
+        // diagnostic, not a panic and not a silent truncation.
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "nested deeper than") != null);
+    }
+}
+
+test "the nesting bound bites AT the bound, not somewhere past it" {
+    const gpa = testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{ .max_nesting_depth = 32, .undefined_policy = .lenient });
+    defer env.deinit();
+    for (nestings) |c| {
+        // Exactly at the limit: compiles.
+        const ok_src = try nestedSrc(gpa, c.parts, c.fits_at_32);
+        defer gpa.free(ok_src);
+        var ok = env.compile(ok_src, null) catch |e| {
+            std.debug.print("\n{s} at n={d} was refused ({s}); the bound is off by one\n", .{ c.what, c.fits_at_32, @errorName(e) });
+            return error.BoundTooTight;
+        };
+        ok.deinit();
+
+        // One level past it: refused. This is the interesting case — a test at
+        // ten times the cap proves only that something eventually stops.
+        const bad_src = try nestedSrc(gpa, c.parts, c.fits_at_32 + 1);
+        defer gpa.free(bad_src);
+        if (env.compile(bad_src, null)) |tmpl| {
+            var m = tmpl;
+            m.deinit();
+            std.debug.print("\n{s} at n={d} compiled; the bound is off by one\n", .{ c.what, c.fits_at_32 + 1 });
+            return error.BoundTooLoose;
+        } else |e| try testing.expectEqual(error.TooDeep, e);
+    }
+}
+
+fn monotonicNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "`**` with a base of 0, 1 or -1 answers in closed form" {
+    const gpa = testing.allocator;
+    // Pinned against CPython/Jinja2 3.1.6 on this host, which answers each of
+    // these instantly: `1 ** 500000000` = 1, `0 ** 500000000` = 0, `0 ** 0` = 1,
+    // `(-1) ** 500000000` = 1, `(-1) ** 500000001` = -1.
+    for ([_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "{{ 1 ** 500000000 }}", .want = "1" },
+        .{ .src = "{{ 1 ** 9223372036854775807 }}", .want = "1" },
+        .{ .src = "{{ 0 ** 500000000 }}", .want = "0" },
+        .{ .src = "{{ 0 ** 0 }}", .want = "1" },
+        .{ .src = "{{ (-1) ** 500000000 }}", .want = "1" },
+        .{ .src = "{{ (-1) ** 500000001 }}", .want = "-1" },
+        .{ .src = "{{ (-1) ** 9223372036854775807 }}", .want = "-1" },
+        // The bases that do overflow still terminate — within 63 doublings —
+        // and still say so.
+        .{ .src = "{{ 2 ** 62 }}", .want = "4611686018427387904" },
+    }) |c| {
+        const out = try renderWith(gpa, .{}, c.src, .{ .map = .{ .pairs = &.{} } });
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+    try testing.expectError(
+        error.OutOfRange,
+        renderWith(gpa, .{}, "{{ 2 ** 64 }}", .{ .map = .{ .pairs = &.{} } }),
+    );
+}
+
+test "`**` from context data cannot spin the renderer" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    // The reachable shape: neither operand is in the template. Before the fix
+    // this loop ran `b` times producing nothing, so `max_output_bytes` — the
+    // only exhaustion bound SPEC §8 offers — never fired; measured at ~7 s for
+    // an exponent of 500 000 000, and ~10^6 years for i64's maximum.
+    const ctx = try jinja.valueFrom(arena.allocator(), .{
+        .a = @as(i64, 1),
+        .b = @as(i64, 1_000_000_000),
+    });
+    const start = monotonicNs();
+    const out = try renderWith(gpa, .{}, "{{ a ** b }}", ctx);
+    defer gpa.free(out);
+    const elapsed = monotonicNs() - start;
+    try testing.expectEqualStrings("1", out);
+    // Two orders of magnitude of headroom over the fixed path (microseconds)
+    // and an order of magnitude under the unfixed one (~14 s at this exponent).
+    if (elapsed > 2 * std.time.ns_per_s) {
+        std.debug.print("\n`{{{{ a ** b }}}}` with b=1e9 took {d} ms\n", .{elapsed / std.time.ns_per_ms});
+        return error.PowUnbounded;
+    }
+}

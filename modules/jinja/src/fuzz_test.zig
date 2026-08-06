@@ -76,8 +76,13 @@ fn fuzzWhitespaceOptions(_: void, smith: *std.testing.Smith) !void {
 const NumSite = struct { pre: []const u8, post: []const u8 };
 
 /// Every filter, global and operator that narrows a caller-supplied number.
-/// `**` is deliberately absent: its loop is unbounded for `|base| <= 1`, which
-/// is a separate finding and would hang this harness rather than crash it.
+///
+/// `**` was excluded when this harness was written, because `intPow` looped
+/// `exponent` times for `|base| <= 1` and would have hung the sweep instead of
+/// crashing it. That is fixed — those three bases are answered in closed form
+/// and every other base overflows within 63 steps — so the operator is fuzzed
+/// here now, at all four bases whose behaviour differs (`0`, `1`, `-1`, and a
+/// base that can overflow), on both the literal and the context path.
 const num_sites = [_]NumSite{
     .{ .pre = "{{ s|replace('a','b',", .post = ") }}" },
     .{ .pre = "{{ s|indent(", .post = ", true) }}" },
@@ -107,6 +112,10 @@ const num_sites = [_]NumSite{
     .{ .pre = "{{ l[", .post = "] }}" },
     .{ .pre = "{{ s[", .post = ":] }}" },
     .{ .pre = "{{ l|first|default(", .post = ") }}" },
+    .{ .pre = "{{ 1 ** ", .post = " }}" },
+    .{ .pre = "{{ 0 ** ", .post = " }}" },
+    .{ .pre = "{{ (-1) ** ", .post = " }}" },
+    .{ .pre = "{{ a ** ", .post = " }}" },
 };
 
 /// The numeric-argument surface, which the two harnesses above cannot reach.

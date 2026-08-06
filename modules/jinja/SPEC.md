@@ -234,7 +234,7 @@ or a documented, tested behaviour.
 | D10 | `{% do %}` and `{% with %}` need no extension to be enabled | superset |
 | D11 | String methods are a documented subset (README); an unknown one is a render error naming the type and method | runtime error |
 | D12 | `round(x, p)` falls back to scaled arithmetic when the exact integer form would exceed `u128` (roughly `|p| > 22`) | silent, beyond f64 precision |
-| D13 | `max_output_bytes` (64 MiB) and a 4 Mi-element cap on `range()`/`'x' * n` have no reference equivalent | extra refusal |
+| D13 | `max_output_bytes` (64 MiB), a 4 Mi-element cap on `range()`/`'x' * n`, and `max_nesting_depth` (256) have no reference equivalent. The reference has no explicit nesting bound either, but CPython's recursion limit gives it an implicit one that is *tighter* for nested source: Jinja2 3.1.6 raises `RecursionError` for `{{ ((…1…)) }}` between 50 and 100 parentheses | extra refusal |
 | D14 | A loader is explicit: without one, a composition tag is `error.NoLoader`. There is no implicit filesystem access and no default search path | API |
 | D15 | Calling a name that is not a macro and not one of the three built-in globals is `error.NotCallable`; the reference would call any callable in the context | **runtime error** |
 | D16 | `super.super()` (reaching two levels up in one expression) is not implemented; `{{ super() }}` inside a block that itself overrides is the supported form | **runtime error** |
@@ -340,9 +340,21 @@ given and can loop; it cannot open files (no loader), reach the environment, or
 call arbitrary functions. Against resource exhaustion, `max_output_bytes` bounds
 output, `value.max_items` bounds `range()` and list repetition, and
 `value.max_alloc` bounds string repetition — so `{{ 'x' * 10**9 }}` and
-`{% for i in range(10**9) %}` fail rather than being attempted. Recursion in the
-evaluator follows template nesting depth, which is bounded by the source's
-bracket nesting; the fuzz harnesses exercise that path.
+`{% for i in range(10**9) %}` fail rather than being attempted, and `**` is
+answered in closed form for the bases (`0`, `1`, `-1`) whose loop would
+otherwise run `exponent` times producing no output for `max_output_bytes` to
+see.
+
+Recursion in the parser and in the evaluator follows the source's nesting depth,
+and that is bounded explicitly by `max_nesting_depth` (256), not implicitly by
+anything about the source. An earlier revision of this section claimed the
+recursion was "bounded by the source's bracket nesting", which restated the
+problem rather than solving it: 8 000 nested parentheses (a 16 KB template),
+8 000 `|string` links and 16 000 nested `{% if %}` each overflowed the stack.
+One `Options` field now bounds all three, at compile time, as `error.TooDeep`
+with a diagnostic — and because it bounds the *tree*, it bounds `Renderer.eval`,
+`renderNodes` and the macro-body walker too. Siblings do not accumulate, so
+template size is not limited; only depth is.
 
 Escaping is a policy the caller sets, not a guess: with `autoescape = false` the
 module never escapes anything, and with it on the safe bit is the only way to
@@ -441,8 +453,9 @@ Two mechanisms, because they answer different questions:
 - **Everything else is caught by a depth cap.** `max_template_depth` (32) bounds
   `{% extends %}` + `{% include %}` + `{% import %}` nesting combined;
   `max_call_depth` (64) bounds macro calls, `{% call %}` bodies and `loop()`;
-  `max_templates` (256) bounds distinct loads per render; `max_output_bytes`
-  bounds the output. All are `Options` fields.
+  `max_templates` (256) bounds distinct loads per render; `max_nesting_depth`
+  (256) bounds expression, chain and block nesting within one template; and
+  `max_output_bytes` bounds the output. All are `Options` fields.
 
 The proof is a set of bombs, not a comment. `loader_test.zig` renders a
 self-including template, a mutually-including pair, an **exponential** include

@@ -155,6 +155,7 @@ fn fromYaml(arena: std.mem.Allocator, v: yaml.Value) !jinja.Value {
 | `max_template_depth` | 32 | Combined `{% extends %}`/`{% include %}`/`{% import %}` nesting bound. |
 | `max_call_depth` | 64 | Macro, `{% call %}` and `loop()` recursion bound. |
 | `max_templates` | 256 | Distinct templates one render may load. |
+| `max_nesting_depth` | 256 | How deep one template's syntax may nest — brackets, `not`/unary chains, `else` arms, each link of a `1+1+1`/`x\|f\|g`/`a.b.c` chain, each nested block body, each `{% elif %}`. Refused at compile time as `error.TooDeep`, which also bounds the recursive evaluator. |
 
 **The `.strict` default inverts the reference implementation's.** That is
 deliberate and is the module's one behavioural divergence in the default path:

@@ -23,8 +23,50 @@ const Expr = ast.Expr;
 const Node = ast.Node;
 const Value = value.Value;
 
-pub const Error = error{ OutOfMemory, TemplateSyntaxError };
+pub const Error = error{ OutOfMemory, TemplateSyntaxError, TooDeep };
 pub const Diagnostic = lex.Diagnostic;
+
+/// Bounds the parser enforces on the *shape* of one template's source.
+///
+/// Three unbounded recursions live behind the one number here, and every one of
+/// them is decided entirely by bytes the module does not control:
+///
+///   * the parser's own stack on **expressions** — the grammar is recursive
+///     descent, so every `(`, `[`, `{`, subscript, argument list, `not`/unary
+///     link and `else` arm pushes about a dozen frames;
+///   * the parser's own stack on **block bodies** — `{% if %}` inside `{% if %}`
+///     recurses through `parseBody`, and an `{% elif %}` chain recurses through
+///     `parseIfTail`;
+///   * the **depth of the tree it builds**, which `Renderer.eval`,
+///     `renderNodes` and `exprMentions` all walk recursively later. A
+///     left-nested chain (`1+1+1+…`, `x|f|g|h`, `a.b.c.d`) costs the parser no
+///     stack at all, because those loops are iterative — but it is one tree
+///     level per link, and the evaluator descends every one of them.
+///
+/// Nothing else bounded any of it: `max_template_depth` bounds composition,
+/// `max_call_depth` bounds macros, and neither is consulted while an expression
+/// or a block body is parsed or evaluated. Measured on this host, in Debug:
+/// 8 000 `(` overflow the parser's stack, 8 000 `|string` links overflow the
+/// *evaluator's*, and 16 000 nested `{% if %}` overflow the parser's again —
+/// each a segfault, not a diagnostic, in a module whose own fuzz harness says
+/// templates arrive from config repos, UI fields and fleet APIs.
+pub const Limits = struct {
+    /// Bound on the depth of any single path through one template's syntax:
+    /// nested expression constructs, chain links, nested block bodies and
+    /// `{% elif %}` links all count one level each. Siblings do not accumulate,
+    /// so template *size* is not bounded here — only nesting.
+    ///
+    /// Default 256. Above it sits the measured cliff: the shallowest overflow
+    /// found was around 4 000–8 000 levels in Debug, so 256 keeps a factor of
+    /// ~16 in hand, and more in release where frames are smaller. Below it sits
+    /// everything a template plausibly writes, and the reference itself: Jinja2
+    /// 3.1.6 raises `RecursionError` for `{{ ((…1…)) }}` somewhere between 50
+    /// and 100 parentheses, so nested *source* is refused here later than the
+    /// reference refuses it. Only the chain forms are refused earlier than the
+    /// reference would, and nothing that emits a 256-term arithmetic chain into
+    /// a configuration template is doing so on purpose.
+    max_nesting_depth: usize = 256,
+};
 
 /// How the parser asks the environment whether a filter/test name exists.
 pub const Registry = struct {
@@ -44,9 +86,16 @@ pub fn parse(
     arena: std.mem.Allocator,
     pieces: []const lex.Piece,
     registry: Registry,
+    limits: Limits,
     diag: *Diagnostic,
 ) Error!ast.Parsed {
-    var p: Parser = .{ .arena = arena, .pieces = pieces, .registry = registry, .diag = diag };
+    var p: Parser = .{
+        .arena = arena,
+        .pieces = pieces,
+        .registry = registry,
+        .limits = limits,
+        .diag = diag,
+    };
     const body = try p.parseBody(&.{});
     if (p.idx < pieces.len) return p.failAt(pieces[p.idx].line, "unexpected end tag");
     return .{ .nodes = body.nodes, .blocks = p.blocks.items, .extends = p.extends };
@@ -65,7 +114,10 @@ const Parser = struct {
     pieces: []const lex.Piece,
     idx: usize = 0,
     registry: Registry,
+    limits: Limits = .{},
     diag: *Diagnostic,
+    /// How many syntactic levels are open right now — see `Limits`.
+    depth: usize = 0,
     /// Every `{% block %}` seen, at any nesting depth.
     blocks: std.ArrayList(ast.BlockDef) = .empty,
     /// The first top-level `{% extends %}`.
@@ -82,7 +134,32 @@ const Parser = struct {
         return p;
     }
 
+    /// Called immediately before descending one more syntactic level, paired
+    /// with `defer unnest()`. Refusing *before* the frame is pushed is the
+    /// point: once the stack is gone there is no error left to return.
+    fn nest(self: *Parser, line: usize) Error!void {
+        if (self.depth >= self.limits.max_nesting_depth) {
+            self.diag.set(line, "template nested deeper than {d}", .{self.limits.max_nesting_depth});
+            return error.TooDeep;
+        }
+        self.depth += 1;
+    }
+
+    fn unnest(self: *Parser) void {
+        self.depth -= 1;
+    }
+
+    fn release(self: *Parser, held: usize) void {
+        self.depth -= held;
+    }
+
     fn parseBody(self: *Parser, stop: []const []const u8) Error!Body {
+        // Block bodies nest by recursion too — `{% if %}` inside `{% if %}` —
+        // and `renderNodes` walks the result the same way, so the same bound
+        // has to cover them. 16 000 nested `{% if %}` (a 336 KB template)
+        // overflowed the parser's stack before this guard existed.
+        try self.nest(if (self.idx < self.pieces.len) self.pieces[self.idx].line else 0);
+        defer self.unnest();
         var nodes: std.ArrayList(Node) = .empty;
         while (self.idx < self.pieces.len) {
             const piece = self.pieces[self.idx];
@@ -166,6 +243,12 @@ const Parser = struct {
 
     /// `{% elif %}` is the same node type as `{% if %}`, nested in `orelse_`.
     fn parseIfTail(self: *Parser, cond: *const Expr) Error!Node {
+        // An `{% elif %}` chain is a chain, not a nesting: each link recurses
+        // into `parseIfTail` and produces one more `.if_` node in `orelse_`,
+        // which the renderer then descends. Charged per link, released when the
+        // whole chain returns.
+        try self.nest(0);
+        defer self.unnest();
         const body = try self.parseBody(&.{ "elif", "else", "endif" });
         if (std.mem.eql(u8, body.ended_with, "endif")) {
             return .{ .if_ = .{ .cond = cond, .body = body.nodes, .orelse_ = &.{} } };
@@ -591,6 +674,30 @@ const Stream = struct {
         return self.p.dupe(e);
     }
 
+    fn nest(self: *Stream, line: usize) Error!void {
+        return self.p.nest(line);
+    }
+
+    fn unnest(self: *Stream) void {
+        self.p.unnest();
+    }
+
+    /// A left-nested *chain* — `a|f|g|h`, `1+1+1+1`, `a.b.c.d` — costs the
+    /// parser no stack at all, because the loops that build it are iterative.
+    /// It still costs one level of **tree** per link, and the tree is what
+    /// `Renderer.eval` and `exprMentions` descend recursively. So each link is
+    /// charged a level here and every level a chain took is released together
+    /// when the function that built it returns: siblings do not accumulate,
+    /// but a path from the root does.
+    fn nestLink(self: *Stream, held: *usize, line: usize) Error!void {
+        try self.nest(line);
+        held.* += 1;
+    }
+
+    fn release(self: *Stream, held: usize) void {
+        self.p.release(held);
+    }
+
     // ── targets ─────────────────────────────────────────────────────────────
 
     fn parseTarget(self: *Stream, line: usize, allow_attr: bool) Error!ast.Target {
@@ -637,8 +744,11 @@ const Stream = struct {
     }
 
     fn parseCondExpr(self: *Stream, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var e = try self.parseOr(line);
         while (self.eatName("if")) {
+            try self.nestLink(&held, line);
             const cond = try self.parseOr(line);
             var otherwise: ?*const Expr = null;
             if (self.eatName("else")) otherwise = try self.parseCondExpr(line);
@@ -648,8 +758,11 @@ const Stream = struct {
     }
 
     fn parseOr(self: *Stream, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var lhs = try self.parseAnd(line);
         while (self.eatName("or")) {
+            try self.nestLink(&held, line);
             const rhs = try self.parseAnd(line);
             lhs = try self.dupe(.{ .logical = .{ .op = .@"or", .lhs = lhs, .rhs = rhs } });
         }
@@ -657,8 +770,11 @@ const Stream = struct {
     }
 
     fn parseAnd(self: *Stream, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var lhs = try self.parseNot(line);
         while (self.eatName("and")) {
+            try self.nestLink(&held, line);
             const rhs = try self.parseNot(line);
             lhs = try self.dupe(.{ .logical = .{ .op = .@"and", .lhs = lhs, .rhs = rhs } });
         }
@@ -667,6 +783,8 @@ const Stream = struct {
 
     fn parseNot(self: *Stream, line: usize) Error!*const Expr {
         if (self.eatName("not")) {
+            try self.nest(line);
+            defer self.unnest();
             const inner = try self.parseNot(line);
             return self.dupe(.{ .not = inner });
         }
@@ -706,6 +824,8 @@ const Stream = struct {
     }
 
     fn parseMath1(self: *Stream, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var lhs = try self.parseConcat(line);
         while (self.peek()) |t| {
             const op: value.BinOp = switch (t.kind) {
@@ -714,6 +834,7 @@ const Stream = struct {
                 else => break,
             };
             self.i += 1;
+            try self.nestLink(&held, line);
             const rhs = try self.parseConcat(line);
             lhs = try self.dupe(.{ .binop = .{ .op = op, .lhs = lhs, .rhs = rhs } });
         }
@@ -721,8 +842,11 @@ const Stream = struct {
     }
 
     fn parseConcat(self: *Stream, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var lhs = try self.parseMath2(line);
         while (self.eat(.tilde)) {
+            try self.nestLink(&held, line);
             const rhs = try self.parseMath2(line);
             lhs = try self.dupe(.{ .binop = .{ .op = .concat, .lhs = lhs, .rhs = rhs } });
         }
@@ -730,6 +854,8 @@ const Stream = struct {
     }
 
     fn parseMath2(self: *Stream, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var lhs = try self.parsePow(line);
         while (self.peek()) |t| {
             const op: value.BinOp = switch (t.kind) {
@@ -740,6 +866,7 @@ const Stream = struct {
                 else => break,
             };
             self.i += 1;
+            try self.nestLink(&held, line);
             const rhs = try self.parsePow(line);
             lhs = try self.dupe(.{ .binop = .{ .op = op, .lhs = lhs, .rhs = rhs } });
         }
@@ -747,8 +874,11 @@ const Stream = struct {
     }
 
     fn parsePow(self: *Stream, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var lhs = try self.parseUnary(line, true);
         while (self.eat(.pow)) {
+            try self.nestLink(&held, line);
             const rhs = try self.parseUnary(line, true);
             lhs = try self.dupe(.{ .binop = .{ .op = .pow, .lhs = lhs, .rhs = rhs } });
         }
@@ -758,8 +888,12 @@ const Stream = struct {
     fn parseUnary(self: *Stream, line: usize, with_filter: bool) Error!*const Expr {
         var node: *const Expr = undefined;
         if (self.eat(.sub)) {
+            try self.nest(line);
+            defer self.unnest();
             node = try self.dupe(.{ .neg = try self.parseUnary(line, false) });
         } else if (self.eat(.add)) {
+            try self.nest(line);
+            defer self.unnest();
             node = try self.dupe(.{ .pos = try self.parseUnary(line, false) });
         } else {
             node = try self.parsePrimary(line);
@@ -805,12 +939,16 @@ const Stream = struct {
             .lparen => {
                 self.i += 1;
                 if (self.eat(.rparen)) return self.dupe(.{ .tuple = &.{} });
+                try self.nest(line);
+                defer self.unnest();
                 const inner = try self.parseParenTuple(line);
                 _ = try self.expect(.rparen, line, "expected `)`");
                 return inner;
             },
             .lbracket => {
                 self.i += 1;
+                try self.nest(line);
+                defer self.unnest();
                 var items: std.ArrayList(*const Expr) = .empty;
                 while (!self.eat(.rbracket)) {
                     if (items.items.len != 0) _ = try self.expect(.comma, line, "expected `,` in list literal");
@@ -821,6 +959,8 @@ const Stream = struct {
             },
             .lbrace => {
                 self.i += 1;
+                try self.nest(line);
+                defer self.unnest();
                 var entries: std.ArrayList(ast.DictEntry) = .empty;
                 while (!self.eat(.rbrace)) {
                     if (entries.items.len != 0) _ = try self.expect(.comma, line, "expected `,` in dict literal");
@@ -850,11 +990,14 @@ const Stream = struct {
     }
 
     fn parsePostfix(self: *Stream, start: *const Expr, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var node = start;
         while (self.peek()) |t| {
             switch (t.kind) {
                 .dot => {
                     self.i += 1;
+                    try self.nestLink(&held, line);
                     const n = self.next() orelse return self.p.failAt(line, "expected a name after `.`");
                     const attr: []const u8 = switch (n.kind) {
                         .name => n.text,
@@ -876,9 +1019,11 @@ const Stream = struct {
                 },
                 .lbracket => {
                     self.i += 1;
+                    try self.nestLink(&held, line);
                     node = try self.parseSubscript(node, line);
                 },
                 .lparen => {
+                    try self.nestLink(&held, line);
                     const args = try self.parseCallArgs(line);
                     node = try self.dupe(.{ .call = .{ .callee = node, .args = args, .line = line } });
                 },
@@ -889,6 +1034,8 @@ const Stream = struct {
     }
 
     fn parseSubscript(self: *Stream, obj: *const Expr, line: usize) Error!*const Expr {
+        try self.nest(line);
+        defer self.unnest();
         var start: ?*const Expr = null;
         if (self.peek() != null and self.peek().?.kind != .colon)
             start = try self.parseExpression(line, true);
@@ -911,6 +1058,8 @@ const Stream = struct {
 
     fn parseCallArgs(self: *Stream, line: usize) Error!ast.Args {
         _ = try self.expect(.lparen, line, "expected `(`");
+        try self.nest(line);
+        defer self.unnest();
         var positional: std.ArrayList(*const Expr) = .empty;
         var keyword: std.ArrayList(ast.Kwarg) = .empty;
         while (!self.eat(.rparen)) {
@@ -935,14 +1084,19 @@ const Stream = struct {
 
     /// `| filter` and `is test`, the tightest-binding postfix layer.
     fn parseFilterExpr(self: *Stream, start: *const Expr, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var node = start;
         while (self.peek()) |t| {
             if (t.kind == .pipe) {
+                try self.nestLink(&held, line);
                 node = try self.parseOneFilter(node, line);
             } else if (t.isName("is")) {
                 self.i += 1;
+                try self.nestLink(&held, line);
                 node = try self.parseTest(node, line);
             } else if (t.kind == .lparen) {
+                try self.nestLink(&held, line);
                 const args = try self.parseCallArgs(line);
                 node = try self.dupe(.{ .call = .{ .callee = node, .args = args, .line = line } });
             } else break;
@@ -951,16 +1105,27 @@ const Stream = struct {
     }
 
     fn parseFilterChain(self: *Stream, start: *const Expr, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         var node = start;
-        while (self.peek() != null and self.peek().?.kind == .pipe) node = try self.parseOneFilter(node, line);
+        while (self.peek() != null and self.peek().?.kind == .pipe) {
+            try self.nestLink(&held, line);
+            node = try self.parseOneFilter(node, line);
+        }
         return node;
     }
 
     /// `{% filter name(…) | other %}` — the leading `|` is implicit.
     fn parseFilterChainBare(self: *Stream, start: *const Expr, line: usize) Error!*const Expr {
+        var held: usize = 0;
+        defer self.release(held);
         const name = try self.expect(.name, line, "expected a filter name");
+        try self.nestLink(&held, line);
         var node = try self.finishFilter(start, name, line);
-        while (self.peek() != null and self.peek().?.kind == .pipe) node = try self.parseOneFilter(node, line);
+        while (self.peek() != null and self.peek().?.kind == .pipe) {
+            try self.nestLink(&held, line);
+            node = try self.parseOneFilter(node, line);
+        }
         return node;
     }
 

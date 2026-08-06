@@ -577,6 +577,26 @@ fn intPow(x: i64, y: i64) Error!Value {
         const fy: f64 = @floatFromInt(y);
         return .{ .float = std.math.pow(f64, fx, fy) };
     }
+    // The three bases that never overflow, answered in closed form.
+    //
+    // This is not a resource cap bolted on top — it is what the reference
+    // computes, and it is the only thing that makes the loop below terminate at
+    // all. `acc` escapes that loop *only* by overflowing, and |x| <= 1 cannot
+    // overflow, so `{{ 1 ** 500000000 }}` used to spin for ~7 s of pure CPU and
+    // `{{ 1 ** 9223372036854775807 }}` for geological time — producing no
+    // output, which is exactly why `max_output_bytes` never saw it. The
+    // exponent is reachable from context data (`{{ a ** b }}`), not only from
+    // template text. Python: `1 ** 500000000` = 1, `0 ** 500000000` = 0,
+    // `0 ** 0` = 1, `(-1) ** 500000000` = 1, `(-1) ** 500000001` = -1, each
+    // instant.
+    switch (x) {
+        0 => return .{ .integer = if (y == 0) 1 else 0 },
+        1 => return .{ .integer = 1 },
+        -1 => return .{ .integer = if (@rem(y, 2) == 0) 1 else -1 },
+        else => {},
+    }
+    // With |x| >= 2 the loop is bounded by construction: |acc| at least doubles
+    // every step, so it overflows `i64` within 63 of them whatever `y` is.
     var acc: i64 = 1;
     var i: i64 = 0;
     while (i < y) : (i += 1) {

@@ -127,6 +127,15 @@ pub const Options = struct {
     max_call_depth: usize = 64,
     /// How many distinct templates one render may load.
     max_templates: usize = 256,
+    /// Bound on how deep one template's syntax may nest: brackets, `not`/unary
+    /// chains, `else` arms, each link of a `1+1+1`/`x|f|g`/`a.b.c` chain, each
+    /// nested block body and each `{% elif %}`. Enforced at compile time, and
+    /// therefore bounding the recursive evaluator too, since it bounds the tree
+    /// the evaluator walks. Without it a template of 8 000 `(` overflows the
+    /// parser's stack, one of 8 000 `|string` overflows the evaluator's, and
+    /// 16 000 nested `{% if %}` overflow the parser's again — a segfault rather
+    /// than an error. See `parser.Limits` for why the default is 256.
+    max_nesting_depth: usize = 256,
 };
 
 pub const CompileError = parser.Error;
@@ -209,7 +218,7 @@ pub const Environment = struct {
             .ctx = self,
             .hasFilter = hasFilterThunk,
             .hasTest = hasTestThunk,
-        }, d);
+        }, .{ .max_nesting_depth = self.options.max_nesting_depth }, d);
 
         return .{ .arena = arena, .parsed = parsed, .env = self };
     }
@@ -267,7 +276,7 @@ pub const Environment = struct {
             .ctx = self,
             .hasFilter = hasFilterThunk,
             .hasTest = hasTestThunk,
-        }, diag);
+        }, .{ .max_nesting_depth = self.options.max_nesting_depth }, diag);
     }
 };
 
