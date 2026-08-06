@@ -59,15 +59,34 @@ fully controls up to the cryptographic binding). Every check below is proven loa
 dedicated adversarial test (`assertion_test.zig` / `attestation_test.zig` "reject:" tests) that
 tampers exactly one input and asserts the *specific* typed error, not merely "some error":
 
+- **Both ceremonies are bound, and the binding lives in one place each.** `verifyAssertion` (§7.2)
+  and `verifyRegistration` (§7.1) each run the full clientData + `rpIdHash` + User-Present check
+  set described below. `verifyAttestation` is the **statement-only** entry point underneath
+  `verifyRegistration`: it takes an opaque `client_data_hash`, so it structurally cannot check
+  `type`, `challenge` or `origin`, and its doc comment says so. An RP that calls it directly owns
+  those checks itself — the returned `rp_id_hash`/`flags` are there for exactly that.
 - **Origin/RP binding (confused-deputy defense):** `clientDataJSON.origin` must equal the RP's
   configured origin, and `authenticatorData`'s `rpIdHash` must equal `SHA-256(rpId)` — an
-  assertion minted for a different site cannot be replayed against this RP.
+  assertion or a registration minted for a different site cannot be replayed against this RP.
 - **Challenge binding (replay defense):** `clientDataJSON.challenge` (base64url-decoded to raw
   bytes, never compared as encoded text) must equal the exact challenge the RP issued for this
   ceremony — the RP is responsible for challenge freshness/single-use bookkeeping; this module
-  only proves the *presented* challenge matches the *expected* one byte-for-byte.
+  only proves the *presented* challenge matches the *expected* one byte-for-byte. This is the
+  **only** thing tying a registration to a ceremony: an attestation statement signs
+  `authData ‖ clientDataHash`, which binds the authenticator to some clientData but never binds
+  that clientData to a challenge this RP issued — and with `fmt == "none"` there is no statement
+  signature at all.
 - **Type confusion defense:** an assertion (`webauthn.get`) response cannot be replayed as a
-  registration (`webauthn.create`) response or vice versa — `type` is checked exactly.
+  registration (`webauthn.create`) response or vice versa — `type` is checked exactly, in both
+  directions (`verifyAssertion` and `verifyRegistration` respectively).
+- **`fmt == "none"` is accepted, and says so.** A registration with no attestation statement is a
+  conforming §7.1 outcome and is what most platform authenticators send, so refusing it by default
+  would be wrong. It is accepted **only** through the ceremony checks above — with no statement
+  signature they are the whole of the verification — and the caller is told: `attestation_type ==
+  .none`. `RegistrationOptions.require_attestation` refuses it outright for an RP whose policy
+  depends on the authenticator's identity; such an RP must also chain the leaf certificate,
+  because `.basic` here means "the statement is internally consistent", not "vouched for" (see
+  "Deferred").
 - **Algorithm confusion defense:** see "Design & invariants" above — `verifySignature` refuses to
   verify under a mismatched key/alg pairing.
 - **User Present / User Verified:** `verifyAssertion` always requires the UP flag; UV is required
@@ -148,10 +167,18 @@ section numbers). Covers:
   vectors fed to `verifyAttestation`, proving `error.UnsupportedFormat` fires on real (not
   synthetic) inputs.
 
+The registration ceremony is anchored on the same corpus: all six implemented §16 registration
+vectors verify through `verifyRegistration` against their own separately-stated
+`registration_challenge`, `rp_id` and `origin`.
+
 Adversarial reject-teeth (`assertion_test.zig`/`attestation_test.zig`, each tampering exactly one
-input off a real-vector baseline): tampered `authenticatorData` byte, tampered signature byte,
-tampered `clientDataHash`, wrong `rpId`, User Present flag cleared, User Verified required-but-clear,
-wrong challenge, wrong origin, wrong `type` (registration clientData replayed as an assertion),
+input off a real-vector baseline — or, for the ceremony-binding tests, tampering *nothing* and
+supplying a genuine §16 artefact from the wrong ceremony): tampered `authenticatorData` byte,
+tampered signature byte, tampered `clientDataHash`, wrong `rpId`, User Present flag cleared, User
+Verified required-but-clear, wrong challenge, wrong origin, wrong `type` (registration clientData
+replayed as an assertion, and §16.2's real assertion clientData replayed as a registration),
+a valid §16.2/§16.7 registration response replayed into a ceremony whose issued challenge was a
+different vector's, `require_attestation` against `fmt == "none"`,
 cross-algorithm key swap (EdDSA key against an ES256 assertion), cross-credential key swap (right
 algorithm, wrong actual key), non-empty `attStmt` on `fmt=="none"`, and an unrecognized `fmt`
 string. Run: `zig build test-webauthn`.

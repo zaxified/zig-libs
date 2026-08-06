@@ -14,11 +14,11 @@ for the full threat model and deferred-work rationale.
 
 | File | Contents |
 |---|---|
-| `root.zig` | `parseClientData`, `parseAuthenticatorData`, `parseCredentialKey` (extends `cbor.cose` with RFC 8230 RSA keys), `verifySignature`, `verifyAssertion`, `verifyAttestation` |
+| `root.zig` | `parseClientData`, `parseAuthenticatorData`, `parseCredentialKey` (extends `cbor.cose` with RFC 8230 RSA keys), `verifySignature`, `verifyAssertion`, `verifyRegistration`, `verifyAttestation` |
 | `vectors.zig` | W3C WebAuthn Level 3 §16 official test vectors, mechanically extracted from the spec text (not hand-transcribed) |
 | `clientdata_test.zig` | `clientDataJSON` parsing — real-vector + adversarial |
 | `assertion_test.zig` | `verifyAssertion` — real-vector anchors (ES256/EdDSA/RS256) + reject-teeth |
-| `attestation_test.zig` | `verifyAttestation` — real-vector anchors (`none`/`packed`/`fido-u2f`) + deferred-format + reject-teeth |
+| `attestation_test.zig` | `verifyAttestation`/`verifyRegistration` — real-vector anchors (`none`/`packed`/`fido-u2f`) + deferred-format + ceremony-binding and statement reject-teeth |
 
 Provenance: clean-room from the W3C WebAuthn Level 3 recommendation, a public
 specification; the §16 test vectors were fetched from w3.org and mechanically
@@ -57,26 +57,42 @@ const result = try webauthn.verifyAssertion(
 // result.user_present / result.user_verified
 ```
 
-### Attestation (registration ceremony, §7.1/§8)
+### Registration ceremony (§7.1/§8)
 
 ```zig
-var client_data_hash: [32]u8 = undefined;
-std.crypto.hash.sha2.Sha256.hash(client_data_json, &client_data_hash, .{});
-
-// Also run parseClientData + check type=="webauthn.create"/challenge/origin
-// yourself (verifyAttestation only covers the attestation STATEMENT --
-// "none" has no signature to anchor a clientData check to).
-const cd = try webauthn.parseClientData(allocator, client_data_json);
-if (!std.mem.eql(u8, cd.type, "webauthn.create")) return error.TypeMismatch;
-// ... challenge / origin checks ...
-
-const result = try webauthn.verifyAttestation(allocator, attestation_object, client_data_hash);
+const result = try webauthn.verifyRegistration(
+    allocator,           // an arena is the natural fit
+    attestation_object,  // raw bytes, from the client
+    client_data_json,    // raw bytes, from the client
+    .{
+        .rp_id = "example.org",
+        .expected_challenge = issued_challenge_bytes, // raw bytes you generated/stored
+        .expected_origin = "https://example.org",
+        .require_user_verification = false, // set true to enforce UV
+        .require_attestation = false,       // set true to refuse fmt=="none"
+    },
+);
 // result.attestation_type      -> .none / .basic / .self_attestation
 // result.credential_id         -> store this
 // result.credential_public_key -> store this (webauthn.CoseKey) -- feed back
 //                                  into verifyAssertion for future logins
-// result.aaguid, result.sign_count
+// result.aaguid, result.sign_count, result.rp_id_hash, result.flags
 ```
+
+`type == "webauthn.create"`, the challenge, the origin, `rpIdHash` and the
+User Present flag are all checked here — an authentication response, a
+response minted for another site, or a replay of an earlier registration is
+rejected with a specific typed error. `attestation_type == .none` means the
+response carried **no** attestation statement: legitimate (§7.1 step 20, and
+what most platform authenticators send), and accepted by default, but nothing
+about the authenticator was proven — set `require_attestation` to refuse it.
+Even `.basic` only means the statement is internally consistent; no chain is
+built (see `SPEC.md` "Deferred").
+
+If you are splitting the ceremony and have already done those checks
+yourself, `verifyAttestation(allocator, attestation_object, client_data_hash)`
+verifies the attestation **statement** alone. It cannot check the ceremony —
+it never sees the clientDataJSON.
 
 `tpm`/`android-key` attestation objects return `error.UnsupportedFormat` —
 see `SPEC.md` "Deferred" for why, and what it would take to add them.

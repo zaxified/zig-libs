@@ -101,6 +101,19 @@ Zig's bitfield-packing rules.
   a live id makes responses ambiguous. A retry is a **resend of the stored datagram**, not a
   re-encode, so a retransmission is guaranteed byte-identical to the original.
 
+  **A transaction is keyed on (invoke id, peer address), never on the invoke id alone.** That is
+  what clause 5.4's TSM entry is indexed by, and what `bacnet-stack`'s `tsm.c` compares before it
+  touches an entry. It has to be: base BACnet/IP is unauthenticated, and the invoke id is an
+  8-bit sequentially-allocated number, so a response matched on the id alone is a response any
+  host that can reach the socket can forge — cancelling a transaction it knows nothing about, or
+  having its own ComplexACK delivered to the application as the answer the client was waiting
+  for. A SimpleACK/ComplexACK/Error/Reject/Abort whose origin does not match the address the
+  request went to (and a late one for a transaction that has already completed or timed out) is
+  reported as `.unhandled` and retires nothing; the genuine answer, or the timeout, still
+  happens. This does mean a device that answers from a *different* source address than the one
+  addressed is not understood — that device is non-conforming, and the alternative is accepting
+  anybody's answer.
+
   **A unicast question gets a unicast answer.** A device that receives a Who-Is or Who-Has as an
   `Original-Unicast-NPDU` answers with a unicast I-Am/I-Have; a broadcast question gets a
   broadcast answer with the global-broadcast destination and hop count 255. This was found by

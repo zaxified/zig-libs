@@ -18,6 +18,16 @@
 //!   skips ids that are still outstanding; a client that reuses a live id
 //!   cannot tell which response belongs to which request, and BACnet gives it
 //!   no other correlator.
+//! * **A transaction is keyed on (invoke id, peer address), not on the invoke
+//!   id alone.** Clause 5.4's TSM state machine is indexed by the pair, and it
+//!   has to be: base BACnet/IP has no authentication whatsoever, invoke ids are
+//!   8-bit and handed out sequentially, so a host that can put a datagram on
+//!   the segment could otherwise cancel someone else's outstanding transaction
+//!   by guessing an id — or, worse, have a forged ComplexACK delivered to the
+//!   application as that transaction's answer. A response whose origin does not
+//!   match the address the request went to is reported as `.unhandled` and the
+//!   transaction stays outstanding, so the genuine answer (or the timeout) still
+//!   happens.
 //! * **A segmented response is refused explicitly.** This client advertises
 //!   `max_segments = .unspecified` and does not set the
 //!   segmented-response-accepted bit, so a conforming device will never send
@@ -119,8 +129,11 @@ pub const Event = union(enum) {
     segmented_response: struct { from: BipAddress, invoke_id: u8 },
     /// A network-layer message (routing). Reported, not acted on.
     network_message: struct { from: BipAddress, kind: npdu.MessageType },
-    /// Something arrived that this client does not model. Reported rather than
-    /// dropped, so a caller can log it.
+    /// Something arrived that this client does not model — **or** a response
+    /// PDU that no outstanding transaction claims: an unknown invoke id, or a
+    /// known invoke id from an address the matching request never went to.
+    /// Reported rather than dropped, so a caller can log it; the transaction,
+    /// if there was one, is left outstanding.
     unhandled: struct { from: BipAddress, pdu_type: apdu.PduType },
 };
 
@@ -442,7 +455,7 @@ pub fn Client(comptime max_pending: usize) type {
             switch (a) {
                 .unconfirmed_request => |u| return self.handleUnconfirmed(origin, u),
                 .simple_ack => |s| {
-                    self.retire(s.invoke_id);
+                    if (!self.retire(s.invoke_id, origin)) return unclaimed(origin, .simple_ack);
                     return .{ .simple_ack = .{
                         .from = origin,
                         .invoke_id = s.invoke_id,
@@ -450,17 +463,16 @@ pub fn Client(comptime max_pending: usize) type {
                     } };
                 },
                 .complex_ack => |c| {
+                    if (!self.retire(c.invoke_id, origin)) return unclaimed(origin, .complex_ack);
                     if (c.segment != null) {
                         // Refuse explicitly. Answering nothing would leave the
                         // device retransmitting the whole transfer.
                         try self.sendApdu(origin, apdu.segmentationNotSupported(c.invoke_id, false));
-                        self.retire(c.invoke_id);
                         return .{ .segmented_response = .{
                             .from = origin,
                             .invoke_id = c.invoke_id,
                         } };
                     }
-                    self.retire(c.invoke_id);
                     return .{ .complex_ack = .{
                         .from = origin,
                         .invoke_id = c.invoke_id,
@@ -469,7 +481,7 @@ pub fn Client(comptime max_pending: usize) type {
                     } };
                 },
                 .err => |e| {
-                    self.retire(e.invoke_id);
+                    if (!self.retire(e.invoke_id, origin)) return unclaimed(origin, .err);
                     return .{ .err = .{
                         .from = origin,
                         .invoke_id = e.invoke_id,
@@ -479,7 +491,7 @@ pub fn Client(comptime max_pending: usize) type {
                     } };
                 },
                 .reject => |r| {
-                    self.retire(r.invoke_id);
+                    if (!self.retire(r.invoke_id, origin)) return unclaimed(origin, .reject);
                     return .{ .reject = .{
                         .from = origin,
                         .invoke_id = r.invoke_id,
@@ -487,7 +499,7 @@ pub fn Client(comptime max_pending: usize) type {
                     } };
                 },
                 .abort => |ab| {
-                    self.retire(ab.invoke_id);
+                    if (!self.retire(ab.invoke_id, origin)) return unclaimed(origin, .abort);
                     return .{ .abort = .{
                         .from = origin,
                         .invoke_id = ab.invoke_id,
@@ -556,10 +568,35 @@ pub fn Client(comptime max_pending: usize) type {
             }
         }
 
-        fn retire(self: *Self, invoke_id: u8) void {
+        /// A response PDU no outstanding transaction claims. Surfaced so a
+        /// caller can log it — on a real segment this is what a spoofing
+        /// attempt looks like from the client's side — and deliberately NOT
+        /// turned into a completion event.
+        fn unclaimed(origin: BipAddress, pdu_type: apdu.PduType) Event {
+            return .{ .unhandled = .{ .from = origin, .pdu_type = pdu_type } };
+        }
+
+        /// Retires the transaction matching **both** `invoke_id` and the
+        /// address the response came from. Clause 5.4 keys a TSM entry on the
+        /// (invoke id, peer address) pair — `bacnet-stack`'s `tsm.c` does the
+        /// same address match — because the invoke id alone is an 8-bit,
+        /// sequentially-allocated, unauthenticated correlator: matching on it
+        /// alone lets any host that can reach this socket cancel a transaction
+        /// it knows nothing about.
+        ///
+        /// Returns whether a transaction was actually retired. `false` means
+        /// the response is unclaimed: an id nobody asked about, a late answer
+        /// to an already-timed-out request, or the right id from the wrong
+        /// host.
+        fn retire(self: *Self, invoke_id: u8, origin: BipAddress) bool {
+            var retired = false;
             for (&self.pending) |*p| {
-                if (p.active and p.invoke_id == invoke_id) p.active = false;
+                if (p.active and p.invoke_id == invoke_id and p.peer.eql(origin)) {
+                    p.active = false;
+                    retired = true;
+                }
             }
+            return retired;
         }
 
         fn slot(self: *Self) ?*Pending {
@@ -1233,4 +1270,189 @@ test "ReadRange asks for a slice of a trend log" {
     try testing.expectEqual(types.ConfirmedService.read_range, req.a.confirmed_request.service);
     const rr = try service.ReadRange.decode(req.a.confirmed_request.data);
     try testing.expectEqual(@as(i32, 10), rr.range.?.by_position.count);
+}
+
+// ── the TSM is keyed on (invoke id, peer address), not the id alone ─────────
+//
+// Base BACnet/IP is unauthenticated: any host that can put a UDP datagram on
+// the client's port is a peer. Invoke ids are 8 bits wide and handed out
+// sequentially, so a response that correlates on the id alone is a response an
+// off-path guess can forge. Clause 5.4 keys a TSM entry on the pair, and
+// `bacnet-stack`'s `tsm.c` compares the address before it touches the entry.
+//
+// Everything the impostor below sends is *well formed* — right BVLC framing,
+// right PDU type, right service, right invoke id. The only thing wrong with it
+// is who it came from.
+
+/// A third host on the segment, and the fake device that speaks from it.
+const Impostor = struct {
+    ep: transport.LoopTransport = transport.LoopTransport.init(.{ .ip = .{ 192, 0, 2, 66 } }),
+
+    fn join(self: *Impostor, rig: *Rig) Peer {
+        rig.net.attach(&self.ep);
+        return .{ .tp = &self.ep };
+    }
+};
+
+/// A perfectly valid ReadPropertyAck body carrying `value`.
+fn readPropertyAckBody(buf: []u8, value_buf: []u8, value: f32) ![]const u8 {
+    var vw = tag.Writer.init(value_buf);
+    try vw.appReal(value);
+    var w = tag.Writer.init(buf);
+    try (service.ReadPropertyAck{
+        .object = .{ .type = .analog_input, .instance = 5 },
+        .property = .present_value,
+        .value = vw.written(),
+    }).encode(&w);
+    return w.written();
+}
+
+test "a forged ComplexACK from another host is not this transaction's answer" {
+    var rig: Rig = .{};
+    rig.wire();
+    var imp: Impostor = .{};
+    var impostor = imp.join(&rig);
+    var c = DefaultClient.init(rig.client_ep.transport(), .{});
+    var device: Peer = .{ .tp = &rig.device_ep };
+
+    const id = try c.readProperty(
+        rig.device_ep.address,
+        .{ .type = .analog_input, .instance = 5 },
+        .present_value,
+        null,
+        0,
+    );
+    const req = (try device.recvApdu()).?;
+    try testing.expectEqual(id, req.a.confirmed_request.invoke_id);
+
+    // The impostor answers first, with the id it guessed and a value of its
+    // choosing.
+    var ack_buf: [64]u8 = undefined;
+    var val_buf: [8]u8 = undefined;
+    try impostor.reply(rig.client_ep.address, .{ .complex_ack = .{
+        .invoke_id = id,
+        .service = .read_property,
+        .data = try readPropertyAckBody(&ack_buf, &val_buf, -999.0),
+    } });
+
+    const ev = try c.poll(1);
+    try testing.expectEqual(std.meta.Tag(Event).unhandled, std.meta.activeTag(ev));
+    try testing.expectEqual(apdu.PduType.complex_ack, ev.unhandled.pdu_type);
+    try testing.expect(ev.unhandled.from.eql(imp.ep.address));
+    // The transaction the client actually opened is untouched.
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    try testing.expectEqual(@as(?u64, 2999), c.nextDeadline(1));
+
+    // ... and the real device's answer still completes it, with the real value.
+    var real_buf: [64]u8 = undefined;
+    var real_val: [8]u8 = undefined;
+    try device.reply(req.from, .{ .complex_ack = .{
+        .invoke_id = id,
+        .service = .read_property,
+        .data = try readPropertyAckBody(&real_buf, &real_val, 72.5),
+    } });
+    const good = try c.poll(2);
+    try testing.expectEqual(std.meta.Tag(Event).complex_ack, std.meta.activeTag(good));
+    try testing.expectEqual(id, good.complex_ack.invoke_id);
+    const ack = try service.ReadPropertyAck.decode(good.complex_ack.data);
+    try testing.expectEqual(@as(f32, 72.5), (try ack.scalar()).real);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "no response PDU from a stranger can cancel an outstanding transaction" {
+    // The other four completion PDUs: each one, sent from the wrong address
+    // with the right invoke id, is a free transaction-cancel if the TSM
+    // matches on the id alone.
+    var rig: Rig = .{};
+    rig.wire();
+    var imp: Impostor = .{};
+    var impostor = imp.join(&rig);
+    // No retries, so the deadline below is the timeout rather than a resend.
+    var c = DefaultClient.init(rig.client_ep.transport(), .{ .retries = 0 });
+    var device: Peer = .{ .tp = &rig.device_ep };
+
+    const id = try c.readProperty(
+        rig.device_ep.address,
+        .{ .type = .analog_input, .instance = 5 },
+        .present_value,
+        null,
+        0,
+    );
+    _ = (try device.recvApdu()).?;
+
+    const forgeries = [_]apdu.Apdu{
+        .{ .simple_ack = .{ .invoke_id = id, .service = .read_property } },
+        .{ .err = .{
+            .invoke_id = id,
+            .service = .read_property,
+            .class = .object,
+            .code = .unknown_object,
+        } },
+        .{ .reject = .{ .invoke_id = id, .reason = .undefined_enumeration } },
+        .{ .abort = .{ .invoke_id = id, .reason = .other } },
+    };
+    const expected = [_]apdu.PduType{ .simple_ack, .err, .reject, .abort };
+    for (forgeries, expected) |f, pdu_type| {
+        try impostor.reply(rig.client_ep.address, f);
+        const ev = try c.poll(1);
+        try testing.expectEqual(std.meta.Tag(Event).unhandled, std.meta.activeTag(ev));
+        try testing.expectEqual(pdu_type, ev.unhandled.pdu_type);
+        try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    }
+
+    // A forged *segmented* ComplexACK is likewise not this transaction's, so
+    // the client does not tear the transaction down — nor send an Abort to a
+    // host it has no transaction with.
+    try impostor.reply(rig.client_ep.address, .{ .complex_ack = .{
+        .invoke_id = id,
+        .service = .read_property,
+        .segment = .{ .sequence_number = 0, .window_size = 4, .more_follows = true },
+        .data = &.{ 0x0C, 0x02, 0x00, 0x02, 0x57 },
+    } });
+    const ev = try c.poll(1);
+    try testing.expectEqual(std.meta.Tag(Event).unhandled, std.meta.activeTag(ev));
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    try testing.expectEqual(@as(?transport.Received, null), try imp.ep.transport().recv(&impostor.rx));
+
+    // The genuine device still owns the transaction, and still times it out.
+    const ev_timeout = try c.poll(3000);
+    try testing.expectEqual(std.meta.Tag(Event).timeout, std.meta.activeTag(ev_timeout));
+    try testing.expectEqual(id, ev_timeout.timeout.invoke_id);
+}
+
+test "a stale response to an already-retired transaction is not a second answer" {
+    // The same guard, arrived at from the other side: the peer address matches
+    // but nothing is outstanding, because the answer already came.
+    var rig: Rig = .{};
+    rig.wire();
+    var c = DefaultClient.init(rig.client_ep.transport(), .{});
+    var device: Peer = .{ .tp = &rig.device_ep };
+
+    const id = try c.readProperty(
+        rig.device_ep.address,
+        .{ .type = .analog_input, .instance = 5 },
+        .present_value,
+        null,
+        0,
+    );
+    const req = (try device.recvApdu()).?;
+    var buf: [64]u8 = undefined;
+    var vbuf: [8]u8 = undefined;
+    const body = try readPropertyAckBody(&buf, &vbuf, 72.5);
+    try device.reply(req.from, .{ .complex_ack = .{
+        .invoke_id = id,
+        .service = .read_property,
+        .data = body,
+    } });
+    try testing.expectEqual(std.meta.Tag(Event).complex_ack, std.meta.activeTag(try c.poll(1)));
+
+    // A duplicate of the very same datagram — a retransmission, or a replay.
+    try device.reply(req.from, .{ .complex_ack = .{
+        .invoke_id = id,
+        .service = .read_property,
+        .data = body,
+    } });
+    const ev = try c.poll(2);
+    try testing.expectEqual(std.meta.Tag(Event).unhandled, std.meta.activeTag(ev));
+    try testing.expectEqual(apdu.PduType.complex_ack, ev.unhandled.pdu_type);
 }

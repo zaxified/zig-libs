@@ -28,11 +28,22 @@
 //! against and the adversarial test suite (`assertion_test.zig`) that proves
 //! each one is load-bearing (tamper any one input, verification fails).
 //!
-//! **Attestation (registration) verify — `verifyAttestation`**: parses the
+//! **Registration ceremony verify — `verifyRegistration`**: the §7.1
+//! counterpart of `verifyAssertion`, and the entry point a relying party
+//! wants. Checks `type == "webauthn.create"`, the challenge, the origin,
+//! `rpIdHash == SHA-256(rpId)` and the User Present/User Verified flags,
+//! *then* the attestation statement. Without those first four a registration
+//! response from a different ceremony or a different site verifies happily —
+//! the attestation statement binds the authenticator to a clientDataHash, it
+//! never binds that clientDataHash to a challenge this RP issued (and with
+//! `fmt == "none"` there is no statement signature at all).
+//!
+//! **Attestation-statement verify — `verifyAttestation`**: parses the
 //! CBOR `attestationObject` (`{fmt, attStmt, authData}`), extracts the
 //! attested credential's COSE public key from `authData`, and verifies the
 //! attestation statement for `fmt` in {`none`, `packed`, `fido-u2f`}
-//! (WebAuthn §8.2/§8.3/§8.6). `tpm` and `android-key` are DEFERRED —
+//! (WebAuthn §8.2/§8.3/§8.6) — the statement half only, for a caller that
+//! does the ceremony binding itself. `tpm` and `android-key` are DEFERRED —
 //! structurally recognized and rejected with `error.UnsupportedFormat`
 //! rather than half-implemented (see SPEC.md "Deferred" for the rationale:
 //! both require parsing/validating a manufacturer certificate-chain format
@@ -399,6 +410,14 @@ pub const AttestationResult = struct {
     credential_public_key: CoseKey,
     aaguid: [16]u8,
     sign_count: u32,
+    /// `authenticatorData`'s leading 32 bytes. `verifyRegistration` has
+    /// already compared this against `SHA-256(rp_id)`; a caller using the
+    /// lower-level `verifyAttestation` must do that comparison itself.
+    rp_id_hash: [32]u8,
+    /// §6.1 flags as they arrived. `verifyRegistration` enforces UP (and UV
+    /// on request); `backup_eligible`/`backup_state` are reported for a
+    /// caller with a passkey-portability policy, never acted on here.
+    flags: AuthenticatorData.Flags,
 };
 
 const AttestationObject = struct {
@@ -560,34 +579,33 @@ fn verifyFidoU2f(
     return .basic;
 }
 
-/// Verify a WebAuthn attestation (registration ceremony, §7.1): parses
-/// `attestation_object_raw` and dispatches on `fmt` to `none`/`packed`/
-/// `fido-u2f`. `tpm`/`android-key` (and any other fmt) return
-/// `error.UnsupportedFormat` — structurally recognized, not silently
-/// accepted, not half-verified. `client_data_hash` is
-/// `SHA-256(clientDataJSON)` (compute it via `parseClientData` +
-/// `std.crypto.hash.sha2.Sha256.hash` on the raw bytes, same as for
-/// assertions — the caller is expected to also run the clientData
-/// type/challenge/origin checks via `parseClientData`, since `fmt=="none"`
-/// has no attStmt-level signature to anchor a full ceremony check).
-pub fn verifyAttestation(
+/// The attestation-statement half of §7.1 (steps 19-21): dispatch on `fmt`
+/// and verify the statement over `authData || clientDataHash`. Says nothing
+/// about which ceremony the `clientDataHash` came from — that binding is the
+/// caller's, and `verifyRegistration` is where it lives.
+fn verifyStatement(
     allocator: Allocator,
-    attestation_object_raw: []const u8,
+    obj: AttestationObject,
+    att: AttestedCredentialData,
     client_data_hash: [32]u8,
-) AttestationError!AttestationResult {
-    const obj = try parseAttestationObject(allocator, attestation_object_raw);
-    const att = obj.auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
-
-    const attestation_type: AttestationType = if (std.mem.eql(u8, obj.fmt, "none")) blk: {
+) AttestationError!AttestationType {
+    if (std.mem.eql(u8, obj.fmt, "none")) {
         if (obj.att_stmt.len != 0) return error.InvalidAttestationStatement;
-        break :blk .none;
-    } else if (std.mem.eql(u8, obj.fmt, "packed")) blk: {
+        return .none;
+    } else if (std.mem.eql(u8, obj.fmt, "packed")) {
         const msg = try std.mem.concat(allocator, u8, &.{ obj.auth_data_raw, &client_data_hash });
-        break :blk try verifyPacked(obj.att_stmt, msg, att.credential_public_key);
-    } else if (std.mem.eql(u8, obj.fmt, "fido-u2f")) blk: {
-        break :blk try verifyFidoU2f(allocator, obj.att_stmt, obj.auth_data, client_data_hash);
-    } else return error.UnsupportedFormat; // covers "tpm", "android-key", and anything unrecognized
+        return verifyPacked(obj.att_stmt, msg, att.credential_public_key);
+    } else if (std.mem.eql(u8, obj.fmt, "fido-u2f")) {
+        return verifyFidoU2f(allocator, obj.att_stmt, obj.auth_data, client_data_hash);
+    }
+    return error.UnsupportedFormat; // covers "tpm", "android-key", and anything unrecognized
+}
 
+fn attestationResult(
+    obj: AttestationObject,
+    att: AttestedCredentialData,
+    attestation_type: AttestationType,
+) AttestationResult {
     return .{
         .attestation_type = attestation_type,
         .format = obj.fmt,
@@ -595,7 +613,122 @@ pub fn verifyAttestation(
         .credential_public_key = att.credential_public_key,
         .aaguid = att.aaguid,
         .sign_count = obj.auth_data.sign_count,
+        .rp_id_hash = obj.auth_data.rp_id_hash,
+        .flags = obj.auth_data.flags,
     };
+}
+
+/// Verify only the **attestation statement** of a registration response:
+/// parses `attestation_object_raw` and dispatches on `fmt` to `none`/
+/// `packed`/`fido-u2f`. `tpm`/`android-key` (and any other fmt) return
+/// `error.UnsupportedFormat` — structurally recognized, not silently
+/// accepted, not half-verified.
+///
+/// **This is not the registration ceremony.** It takes an opaque
+/// `client_data_hash` and therefore cannot check `type`, `challenge`,
+/// `origin` or `rpIdHash`: it proves the attestation statement is internally
+/// consistent with *some* clientData, not that the response answers the
+/// ceremony this relying party started. With `fmt == "none"` there is no
+/// signature in the statement at all, so nothing whatsoever is bound. Use
+/// `verifyRegistration` unless you are deliberately splitting the ceremony
+/// (a two-stage pipeline that has already done the §7.1 clientData and
+/// `rpIdHash` checks itself) — the returned `rp_id_hash` and `flags` are
+/// there so such a caller can.
+pub fn verifyAttestation(
+    allocator: Allocator,
+    attestation_object_raw: []const u8,
+    client_data_hash: [32]u8,
+) AttestationError!AttestationResult {
+    const obj = try parseAttestationObject(allocator, attestation_object_raw);
+    const att = obj.auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
+    const attestation_type = try verifyStatement(allocator, obj, att, client_data_hash);
+    return attestationResult(obj, att, attestation_type);
+}
+
+// ── registration ceremony — WebAuthn §7.1 ──────────────────────────────────
+
+pub const RegistrationError = AttestationError || ClientDataError || error{
+    TypeMismatch,
+    ChallengeMismatch,
+    OriginMismatch,
+    RpIdMismatch,
+    UserNotPresent,
+    UserNotVerified,
+    AttestationNotProvided,
+};
+
+pub const RegistrationOptions = struct {
+    /// The Relying Party ID (WebAuthn §4) — `authenticatorData`'s
+    /// `rpIdHash` must equal `SHA-256(rp_id)`.
+    rp_id: []const u8,
+    /// The exact raw challenge bytes the RP issued **for this registration**
+    /// (not base64url text). The RP owns freshness and single-use; this only
+    /// proves the presented challenge is the expected one byte-for-byte.
+    expected_challenge: []const u8,
+    /// The exact origin the RP expects (e.g. `"https://example.org"`).
+    expected_origin: []const u8,
+    require_user_verification: bool = false,
+    /// Refuse `fmt == "none"` (`error.AttestationNotProvided`).
+    ///
+    /// Left **off** by default deliberately. `none` is a legitimate and, in
+    /// practice, dominant choice — §7.1 step 20 lists "no attestation
+    /// statement" as a conforming outcome, platform authenticators
+    /// (Windows Hello, iCloud Keychain, Android) commonly send it, and an RP
+    /// that is not running an MDS-backed authenticator allow-list gains
+    /// nothing by demanding a statement it will not check against a trust
+    /// store. What is *not* optional is that the caller knows: with `none`
+    /// nothing about the authenticator is proven, and `attestation_type ==
+    /// .none` in the result says so. Turn this on when a policy actually
+    /// depends on the authenticator's identity — and then also chain the
+    /// leaf certificate, because `basic` here still only means "the
+    /// statement is internally consistent" (see SPEC.md "Deferred").
+    require_attestation: bool = false,
+};
+
+/// Verify a WebAuthn **registration ceremony** (§7.1) end to end: the
+/// clientData half (`type == "webauthn.create"`, challenge, origin), the
+/// authenticator-data half (`rpIdHash == SHA-256(rp_id)`, User Present, User
+/// Verified when required), and then the attestation statement over
+/// `authData || SHA-256(clientDataJSON)`.
+///
+/// The clientData and `rpIdHash` checks are what make the response answer
+/// *this* ceremony. Without them a registration response is accepted from a
+/// different ceremony, a different site, or (for `fmt == "none"`, which
+/// carries no signature) simply replayed — the attestation statement binds
+/// the authenticator to a clientDataHash, never the clientDataHash to a
+/// challenge this RP issued. `type` is checked exactly in both directions:
+/// §7.2's `"webauthn.get"` in `verifyAssertion`, §7.1's `"webauthn.create"`
+/// here, so neither ceremony's response is the other's.
+///
+/// `allocator` is used for JSON/CBOR parsing and the signed-message concat
+/// (an arena is the natural fit).
+pub fn verifyRegistration(
+    allocator: Allocator,
+    attestation_object_raw: []const u8,
+    client_data_json: []const u8,
+    options: RegistrationOptions,
+) RegistrationError!AttestationResult {
+    const client_data = try parseClientData(allocator, client_data_json);
+    if (!std.mem.eql(u8, client_data.type, "webauthn.create")) return error.TypeMismatch;
+    if (!std.mem.eql(u8, client_data.challenge, options.expected_challenge)) return error.ChallengeMismatch;
+    if (!std.mem.eql(u8, client_data.origin, options.expected_origin)) return error.OriginMismatch;
+
+    const obj = try parseAttestationObject(allocator, attestation_object_raw);
+    const att = obj.auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
+
+    var expected_rp_id_hash: [32]u8 = undefined;
+    Sha256.hash(options.rp_id, &expected_rp_id_hash, .{});
+    if (!std.mem.eql(u8, &obj.auth_data.rp_id_hash, &expected_rp_id_hash)) return error.RpIdMismatch;
+
+    if (!obj.auth_data.flags.user_present) return error.UserNotPresent;
+    if (options.require_user_verification and !obj.auth_data.flags.user_verified) return error.UserNotVerified;
+
+    var client_data_hash: [32]u8 = undefined;
+    Sha256.hash(client_data_json, &client_data_hash, .{});
+    const attestation_type = try verifyStatement(allocator, obj, att, client_data_hash);
+    if (options.require_attestation and attestation_type == .none) return error.AttestationNotProvided;
+
+    return attestationResult(obj, att, attestation_type);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

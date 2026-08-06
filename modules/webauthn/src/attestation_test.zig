@@ -536,3 +536,392 @@ test "the attestation fuzz harness reaches the certificate parser (reachability)
     var smith: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 64 ++ [_]u8{0x00} ** 1024) };
     try fuzzVerifyAttestation({}, &smith);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// The registration ceremony itself (§7.1): type, challenge, origin, rpIdHash
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `verifyAttestation` proves the attestation statement is internally
+// consistent with *some* clientDataHash. It cannot prove the response answers
+// the ceremony this relying party started, because it never sees the
+// clientDataJSON — and with `fmt == "none"` there is no statement signature to
+// prove anything at all. Every input below is a genuine, unmodified W3C §16
+// artefact; what is wrong with it is only which ceremony it belongs to. That
+// is the shape a malformed-input test cannot reach.
+
+const RegOpts = webauthn.RegistrationOptions;
+
+test "verifyRegistration: every real W3C §16 registration verifies against its own ceremony" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    inline for (.{
+        .{ vectors.none_es256, webauthn.AttestationType.none },
+        .{ vectors.packed_self_es256, webauthn.AttestationType.self_attestation },
+        .{ vectors.packed_es256_full, webauthn.AttestationType.basic },
+        .{ vectors.packed_rs256, webauthn.AttestationType.basic },
+        .{ vectors.packed_eddsa, webauthn.AttestationType.basic },
+        .{ vectors.fido_u2f_es256, webauthn.AttestationType.basic },
+    }) |case| {
+        const v = case[0];
+        const result = try webauthn.verifyRegistration(
+            a,
+            &v.attestation_object,
+            &v.registration_client_data_json,
+            .{
+                .rp_id = vectors.rp_id,
+                .expected_challenge = &v.registration_challenge,
+                .expected_origin = vectors.origin,
+            },
+        );
+        try testing.expectEqual(case[1], result.attestation_type);
+        try testing.expectEqualSlices(u8, &v.credential_id, result.credential_id);
+        // The rpIdHash the ceremony check compared against is the vector's own.
+        var expected_rp_id_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(vectors.rp_id, &expected_rp_id_hash, .{});
+        try testing.expectEqualSlices(u8, &expected_rp_id_hash, &result.rp_id_hash);
+        try testing.expect(result.flags.user_present);
+    }
+}
+
+test "reject: an assertion's clientDataJSON replayed as a registration -> TypeMismatch" {
+    // §16.2's own assertion clientDataJSON: a real, valid, correctly-signed
+    // artefact of the *authentication* ceremony, same authenticator, same
+    // origin. Paired with §16.2's `fmt == "none"` attestationObject — which
+    // carries no signature over the clientDataHash — nothing but the `type`
+    // string distinguishes it from the registration response.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+
+    try testing.expectError(error.TypeMismatch, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.assertion_client_data_json,
+        .{
+            .rp_id = vectors.rp_id,
+            .expected_challenge = &v.assertion_challenge,
+            .expected_origin = vectors.origin,
+        },
+    ));
+
+    // And this is exactly what the statement-only entry point cannot see: the
+    // same swap through `verifyAttestation` succeeds, because there is no
+    // signature and no clientData in its argument list. Documented behaviour,
+    // pinned here so it stays a deliberate split and not an accident.
+    const hash = clientDataHash(&v.assertion_client_data_json);
+    const anyway = try webauthn.verifyAttestation(a, &v.attestation_object, hash);
+    try testing.expectEqual(webauthn.AttestationType.none, anyway.attestation_type);
+}
+
+test "reject: a valid registration response replayed into another ceremony -> ChallengeMismatch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `fmt == "none"`: the whole response is unauthenticated, so the challenge
+    // is the only thing tying it to a ceremony.
+    const none = vectors.none_es256;
+    try testing.expectError(error.ChallengeMismatch, webauthn.verifyRegistration(
+        a,
+        &none.attestation_object,
+        &none.registration_client_data_json,
+        .{
+            .rp_id = vectors.rp_id,
+            // The challenge the RP issued for a *different* registration.
+            .expected_challenge = &vectors.packed_self_es256.registration_challenge,
+            .expected_origin = vectors.origin,
+        },
+    ));
+
+    // `fmt == "packed"` with a real x5c chain: the attestation signature
+    // verifies — it is a genuine statement over this exact authData and this
+    // exact clientDataHash — and it still says nothing about which challenge
+    // the relying party issued. A signature check alone never catches this.
+    const full = vectors.packed_es256_full;
+    const opts: RegOpts = .{
+        .rp_id = vectors.rp_id,
+        .expected_challenge = &vectors.packed_eddsa.registration_challenge,
+        .expected_origin = vectors.origin,
+    };
+    try testing.expectError(error.ChallengeMismatch, webauthn.verifyRegistration(
+        a,
+        &full.attestation_object,
+        &full.registration_client_data_json,
+        opts,
+    ));
+    // Not vacuous: with the right challenge the very same bytes verify.
+    var right = opts;
+    right.expected_challenge = &full.registration_challenge;
+    _ = try webauthn.verifyRegistration(a, &full.attestation_object, &full.registration_client_data_json, right);
+}
+
+test "reject: registration from another site or another RP ID" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_es256_full;
+    const base: RegOpts = .{
+        .rp_id = vectors.rp_id,
+        .expected_challenge = &v.registration_challenge,
+        .expected_origin = vectors.origin,
+    };
+
+    // The origin the browser asserted is not this relying party's.
+    var wrong_origin = base;
+    wrong_origin.expected_origin = "https://evil.example";
+    try testing.expectError(error.OriginMismatch, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.registration_client_data_json,
+        wrong_origin,
+    ));
+
+    // The authenticator scoped the credential to a different RP ID, so its
+    // rpIdHash cannot be ours.
+    var wrong_rp = base;
+    wrong_rp.rp_id = "example.com";
+    try testing.expectError(error.RpIdMismatch, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.registration_client_data_json,
+        wrong_rp,
+    ));
+}
+
+test "verifyRegistration: user verification is opt-in and load-bearing when opted in" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // §16.2's authData has UP set and UV clear (flags 0x59).
+    const v = vectors.none_es256;
+    const base: RegOpts = .{
+        .rp_id = vectors.rp_id,
+        .expected_challenge = &v.registration_challenge,
+        .expected_origin = vectors.origin,
+    };
+    const ok = try webauthn.verifyRegistration(a, &v.attestation_object, &v.registration_client_data_json, base);
+    try testing.expect(!ok.flags.user_verified);
+
+    var uv = base;
+    uv.require_user_verification = true;
+    try testing.expectError(error.UserNotVerified, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.registration_client_data_json,
+        uv,
+    ));
+
+    // §16.3's has UV set (flags 0x5D), so the same requirement passes there.
+    const w = vectors.packed_self_es256;
+    _ = try webauthn.verifyRegistration(a, &w.attestation_object, &w.registration_client_data_json, .{
+        .rp_id = vectors.rp_id,
+        .expected_challenge = &w.registration_challenge,
+        .expected_origin = vectors.origin,
+        .require_user_verification = true,
+    });
+}
+
+test "verifyRegistration: fmt=none is accepted by default and refusable on request" {
+    // The deliberate decision, pinned: `none` stays acceptable (§7.1 step 20
+    // lists it as a conforming outcome and it is what most platform
+    // authenticators send), but the caller is told — `attestation_type ==
+    // .none` — and can refuse it outright.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+    const base: RegOpts = .{
+        .rp_id = vectors.rp_id,
+        .expected_challenge = &v.registration_challenge,
+        .expected_origin = vectors.origin,
+    };
+
+    const permissive = try webauthn.verifyRegistration(a, &v.attestation_object, &v.registration_client_data_json, base);
+    try testing.expectEqual(webauthn.AttestationType.none, permissive.attestation_type);
+
+    var strict = base;
+    strict.require_attestation = true;
+    try testing.expectError(error.AttestationNotProvided, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.registration_client_data_json,
+        strict,
+    ));
+
+    // A real attestation statement satisfies the same setting.
+    const w = vectors.packed_es256_full;
+    const attested = try webauthn.verifyRegistration(a, &w.attestation_object, &w.registration_client_data_json, .{
+        .rp_id = vectors.rp_id,
+        .expected_challenge = &w.registration_challenge,
+        .expected_origin = vectors.origin,
+        .require_attestation = true,
+    });
+    try testing.expectEqual(webauthn.AttestationType.basic, attested.attestation_type);
+}
+
+// ── fuzz: a registration that VERIFIES must be bound to this ceremony ───────
+//
+// The defect this section guards is not crash-shaped: a mis-bound registration
+// response verifies, it does not abort, so a "never panics" harness cannot see
+// it however long it runs. What makes a harness bite here is an **oracle on
+// success** rather than on survival — every accepted registration is re-read
+// and its clientData compared against the options it was verified under. A
+// binding that is dropped, weakened or made conditional turns some accepted
+// input into a violation of that invariant.
+
+const AllVectors = struct {
+    fn attestationObject(i: usize) []const u8 {
+        return switch (i) {
+            0 => &vectors.none_es256.attestation_object,
+            1 => &vectors.packed_self_es256.attestation_object,
+            2 => &vectors.packed_es256_full.attestation_object,
+            3 => &vectors.packed_rs256.attestation_object,
+            4 => &vectors.packed_eddsa.attestation_object,
+            else => &vectors.fido_u2f_es256.attestation_object,
+        };
+    }
+    fn registrationClientData(i: usize) []const u8 {
+        return switch (i) {
+            0 => &vectors.none_es256.registration_client_data_json,
+            1 => &vectors.packed_self_es256.registration_client_data_json,
+            2 => &vectors.packed_es256_full.registration_client_data_json,
+            3 => &vectors.packed_rs256.registration_client_data_json,
+            4 => &vectors.packed_eddsa.registration_client_data_json,
+            else => &vectors.fido_u2f_es256.registration_client_data_json,
+        };
+    }
+    fn assertionClientData(i: usize) []const u8 {
+        return switch (i) {
+            0 => &vectors.none_es256.assertion_client_data_json,
+            1 => &vectors.packed_self_es256.assertion_client_data_json,
+            2 => &vectors.packed_es256_full.assertion_client_data_json,
+            3 => &vectors.packed_rs256.assertion_client_data_json,
+            4 => &vectors.packed_eddsa.assertion_client_data_json,
+            else => &vectors.fido_u2f_es256.assertion_client_data_json,
+        };
+    }
+    fn challenge(i: usize) []const u8 {
+        return switch (i) {
+            0 => &vectors.none_es256.registration_challenge,
+            1 => &vectors.packed_self_es256.registration_challenge,
+            2 => &vectors.packed_es256_full.registration_challenge,
+            3 => &vectors.packed_rs256.registration_challenge,
+            4 => &vectors.packed_eddsa.registration_challenge,
+            else => &vectors.fido_u2f_es256.registration_challenge,
+        };
+    }
+    const count: usize = 6;
+};
+
+const fuzz_types = [_][]const u8{ "webauthn.create", "webauthn.get", "webauthn.CREATE", "" };
+const fuzz_origins = [_][]const u8{ "https://example.org", "https://example.org.evil.test", "http://example.org", "" };
+
+/// Every accepted registration must satisfy §7.1's binding, whatever the
+/// fuzzer built. Any run that returns a result and fails one of these
+/// comparisons is a mis-binding — the class of defect that verifies rather
+/// than crashes.
+fn fuzzRegistrationBinding(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const vi = smith.index(AllVectors.count);
+
+    // clientDataJSON: the ceremony's own, another ceremony's, the *assertion*
+    // ceremony's, or one assembled field by field from the fuzzer's choices.
+    const client_data_json: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => AllVectors.registrationClientData(vi),
+        1 => AllVectors.registrationClientData(smith.index(AllVectors.count)),
+        2 => AllVectors.assertionClientData(vi),
+        else => blk: {
+            var chal_raw: [32]u8 = undefined;
+            smith.bytes(&chal_raw);
+            const chal_len: usize = smith.valueRangeAtMost(u8, 0, chal_raw.len);
+            const enc = std.base64.url_safe_no_pad.Encoder;
+            const chal_b64 = try a.alloc(u8, enc.calcSize(chal_len));
+            _ = enc.encode(chal_b64, chal_raw[0..chal_len]);
+            break :blk try std.fmt.allocPrint(
+                a,
+                "{{\"type\":\"{s}\",\"challenge\":\"{s}\",\"origin\":\"{s}\",\"crossOrigin\":false}}",
+                .{
+                    fuzz_types[smith.index(fuzz_types.len)],
+                    chal_b64,
+                    fuzz_origins[smith.index(fuzz_origins.len)],
+                },
+            );
+        },
+    };
+
+    var expected_challenge_raw: [32]u8 = undefined;
+    smith.bytes(&expected_challenge_raw);
+    const options: webauthn.RegistrationOptions = .{
+        .rp_id = if (smith.value(bool)) vectors.rp_id else "example.com",
+        .expected_challenge = if (smith.value(bool))
+            AllVectors.challenge(smith.index(AllVectors.count))
+        else
+            expected_challenge_raw[0..smith.valueRangeAtMost(u8, 0, 32)],
+        .expected_origin = fuzz_origins[smith.index(fuzz_origins.len)],
+        .require_user_verification = smith.value(bool),
+        .require_attestation = smith.value(bool),
+    };
+
+    const result = webauthn.verifyRegistration(
+        a,
+        AllVectors.attestationObject(vi),
+        client_data_json,
+        options,
+    ) catch return;
+
+    // It verified. Then all of this must hold.
+    const cd = try webauthn.parseClientData(a, client_data_json);
+    try testing.expectEqualStrings("webauthn.create", cd.type);
+    try testing.expectEqualSlices(u8, options.expected_challenge, cd.challenge);
+    try testing.expectEqualStrings(options.expected_origin, cd.origin);
+
+    var expected_rp_id_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(options.rp_id, &expected_rp_id_hash, .{});
+    try testing.expectEqualSlices(u8, &expected_rp_id_hash, &result.rp_id_hash);
+    try testing.expect(result.flags.user_present);
+    if (options.require_user_verification) try testing.expect(result.flags.user_verified);
+    if (options.require_attestation) try testing.expect(result.attestation_type != .none);
+}
+
+test "fuzz: an accepted registration is bound to the ceremony it was verified against" {
+    try std.testing.fuzz({}, fuzzRegistrationBinding, .{});
+}
+
+test "the registration fuzz harness reaches an accepted registration (reachability)" {
+    // An oracle-on-success harness proves nothing if it never succeeds. Drive
+    // the same code path deterministically over every vector and assert the
+    // accept branch is exercised — otherwise the harness above would stay
+    // green while checking nothing at all.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var accepted: usize = 0;
+    for (0..AllVectors.count) |i| {
+        _ = webauthn.verifyRegistration(
+            a,
+            AllVectors.attestationObject(i),
+            AllVectors.registrationClientData(i),
+            .{
+                .rp_id = vectors.rp_id,
+                .expected_challenge = AllVectors.challenge(i),
+                .expected_origin = vectors.origin,
+            },
+        ) catch continue;
+        accepted += 1;
+    }
+    try testing.expectEqual(AllVectors.count, accepted);
+
+    // And the harness body itself runs to completion on fixed input.
+    inline for (.{ 0x00, 0x01, 0x02, 0x55, 0x7f, 0xff }) |filler| {
+        var smith: std.testing.Smith = .{ .in = &([_]u8{filler} ** 64 ++ [_]u8{0} ** 512) };
+        try fuzzRegistrationBinding({}, &smith);
+    }
+}
