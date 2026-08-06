@@ -28,7 +28,12 @@ there is deliberately no root `/NOTICE` entry to point at.
 - **Certificate PARSING, not chain validation, for `packed`/`fido-u2f` x5c.** `verifyLeafCertSignature`
   uses `std.crypto.Certificate.parse` (the same primitive the sibling `x509` module's chain
   validator builds on) to pull the leaf certificate's own public key and verify `attStmt.sig`
-  against it. It does **not** build or validate a trust chain to a root, check `basicConstraints`/
+  against it — but **only through `x509.safe.safeCertificate`**, never on the raw `x5c[0]` bytes.
+  std's DER reader is not total on attacker-controlled input (a 4-byte `30 02 30 00` walks it off
+  the end of the buffer: a Debug panic that aborts the relying-party server, a silent
+  out-of-bounds read under ReleaseFast), and `x509/src/safe.zig` is this collection's single
+  reconciled guard for exactly that hazard. It does
+  **not** build or validate a trust chain to a root, check `basicConstraints`/
   `keyUsage`, or check certificate validity dates — WebAuthn attestation trust decisions (is this
   authenticator model acceptable?) are a metadata-service (FIDO MDS) / RP-policy concern layered
   above signature verification, and are explicitly out of scope here (see "Threat model" below).
@@ -153,6 +158,6 @@ string. Run: `zig build test-webauthn`.
 
 ## Status
 
-`extract · any · util · reentrant` + deps `cbor`, `rsa`, `p256` — canonical source is
+`extract · any · util · reentrant` + deps `cbor`, `rsa`, `p256`, `x509` — canonical source is
 `pub const meta` in `src/root.zig`. Assertion verify: ES256/EdDSA/RS256, complete. Attestation
 verify: `none`/`packed`/`fido-u2f`, complete; `tpm`/`android-key` deferred (see above).

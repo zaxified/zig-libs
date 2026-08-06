@@ -175,7 +175,7 @@ const module_list = [_]Module{
     .{ .name = "cbor" },
     .{ .name = "protobuf", .test_deps = &.{"testkit"} },
     .{ .name = "grpc", .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"} },
-    .{ .name = "webauthn", .deps = &.{ "cbor", "rsa", "p256" } },
+    .{ .name = "webauthn", .deps = &.{ "cbor", "rsa", "p256", "x509" } },
     .{ .name = "zipstream" },
     .{ .name = "tz", .deps = &.{"datefmt"} },
     .{ .name = "pollworker" },

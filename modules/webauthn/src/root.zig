@@ -58,6 +58,7 @@ const Allocator = std.mem.Allocator;
 const cbor = @import("cbor");
 const rsa = @import("rsa");
 const p256 = @import("p256");
+const x509 = @import("x509");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -66,7 +67,7 @@ pub const meta = .{
     .role = .util, // pure verification logic — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function takes its inputs as parameters
     .model_after = "W3C WebAuthn Level 3 (https://www.w3.org/TR/webauthn-3/) — clean-room from the spec",
-    .deps = .{ "cbor", "rsa", "p256" },
+    .deps = .{ "cbor", "rsa", "p256", "x509" },
 };
 
 // RFC 8812 §2 COSE algorithm identifier for RS256 (RSASSA-PKCS1-v1_5 w/
@@ -440,8 +441,19 @@ fn parseAttestationObject(allocator: Allocator, raw: []const u8) (AttestationObj
 /// (not chain validation — no trust-store lookup, no expiry/policy check;
 /// see SPEC.md "Deferred") is `std.crypto.Certificate.parse`, the same
 /// primitive the sibling `x509` module builds its chain validator on.
+///
+/// `leaf_der` is `attStmt.x5c[0]` — fully attacker-controlled bytes off the
+/// registration ceremony's wire. `std.crypto.Certificate.parse` is NOT total
+/// on such input: it indexes past the end of the buffer for a truncated or
+/// minimally-shaped DER (`30 02 30 00` panics `index out of bounds: index 4,
+/// len 4` in Debug and reads out of bounds silently under ReleaseFast), so it
+/// is only ever reached here through `x509.safe.safeCertificate`, the
+/// collection's single reconciled guard for exactly this std hazard — see
+/// `modules/x509/src/safe.zig`. Never call `cert.parse()` on `leaf_der`
+/// directly.
 fn verifyLeafCertSignature(leaf_der: []const u8, alg: i64, msg: []const u8, sig: []const u8) AttestationError!void {
-    const cert: std.crypto.Certificate = .{ .buffer = leaf_der, .index = 0 };
+    var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const cert = x509.safe.safeCertificate(leaf_der, &scratch) catch return error.InvalidCertificate;
     const parsed = cert.parse() catch return error.InvalidCertificate;
     switch (parsed.pub_key_algo) {
         .X9_62_id_ecPublicKey => |named_curve| {

@@ -253,3 +253,286 @@ test "reject: unknown fmt string -> UnsupportedFormat" {
     const hash = clientDataHash(&v.registration_client_data_json);
     try testing.expectError(error.UnsupportedFormat, webauthn.verifyAttestation(a, built, hash));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// The `x5c` / attestation-object surface: hostile-input regression + fuzz
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `verifyAttestation` is the registration-ceremony entry point, and every byte
+// it sees comes off the wire from an arbitrary client: the CBOR framing, the
+// `fmt` string, the `attStmt` map, the declared COSE `alg`, the signature, and
+// — the sharpest edge — `attStmt.x5c[0]`, a raw DER certificate that ends up in
+// `std.crypto.Certificate.parse`. std's DER reader is not total on such input
+// (see `x509/src/safe.zig`), which is why `verifyLeafCertSignature` only
+// reaches it through `x509.safe.safeCertificate`.
+//
+// The two tests below are one pair: the first pins the exact reproducer, the
+// second is the harness whose absence let that reproducer live undetected
+// through a repo-wide fuzz sweep (the pre-existing harnesses sit on
+// `parseClientData`/`parseAuthenticatorData`, which the x5c path never reaches).
+
+/// The pieces of an `attestationObject` a hostile client fully controls.
+const AttShape = struct {
+    fmt: []const u8,
+    /// The COSE algorithm `attStmt.alg` declares.
+    alg: i64,
+    /// `attStmt.x5c[0]`. `null` omits the `x5c` key entirely (the
+    /// self-attestation shape); a present-but-empty slice still produces a
+    /// one-element array holding an empty byte string.
+    x5c: ?[]const u8,
+    sig: []const u8,
+    auth_data: []const u8,
+};
+
+/// CBOR-encode `{fmt, attStmt:{alg, sig[, x5c]}, authData}` — the real
+/// attestationObject shape, so the bytes under test are the structured
+/// fields rather than entropy a CBOR decoder rejects at byte one.
+fn buildAttestationObject(a: std.mem.Allocator, s: AttShape) ![]u8 {
+    var att: std.ArrayList(cbor.MapEntry) = .empty;
+    const alg_value: cbor.Value = if (s.alg < 0)
+        .{ .negint = @intCast(-1 - s.alg) }
+    else
+        .{ .uint = @intCast(s.alg) };
+    try att.append(a, .{ .key = .{ .text = "alg" }, .value = alg_value });
+    try att.append(a, .{ .key = .{ .text = "sig" }, .value = .{ .bytes = s.sig } });
+    if (s.x5c) |leaf| {
+        const arr = try a.alloc(cbor.Value, 1);
+        arr[0] = .{ .bytes = leaf };
+        try att.append(a, .{ .key = .{ .text = "x5c" }, .value = .{ .array = arr } });
+    }
+    const entries = [_]cbor.MapEntry{
+        .{ .key = .{ .text = "fmt" }, .value = .{ .text = s.fmt } },
+        .{ .key = .{ .text = "attStmt" }, .value = .{ .map = att.items } },
+        .{ .key = .{ .text = "authData" }, .value = .{ .bytes = s.auth_data } },
+    };
+    return cbor.encode(a, .{ .map = &entries }, .{});
+}
+
+/// The `x5c[0]` bytes out of a real W3C §16 packed-x5c vector — a genuine
+/// attestation certificate, so a mutation of it walks deep into the DER
+/// parser instead of dying at the outer tag.
+fn realX5c(a: std.mem.Allocator, attestation_object: []const u8) ![]const u8 {
+    const decoded = try cbor.decode(a, attestation_object, .{});
+    for (decoded.map) |e| switch (e.key) {
+        .text => |t| if (std.mem.eql(u8, t, "attStmt")) {
+            for (e.value.map) |ae| switch (ae.key) {
+                .text => |at| if (std.mem.eql(u8, at, "x5c")) return ae.value.array[0].bytes,
+                else => {},
+            };
+        },
+        else => {},
+    };
+    return error.MissingField;
+}
+
+test "regression: a 4-byte x5c[0] is a typed error, not a panic (std DER hazard)" {
+    // `30 02 30 00` is `SEQUENCE { SEQUENCE {} }`: well-formed DER, and a
+    // certificate with an empty tbsCertificate. Handed to
+    // `std.crypto.Certificate.parse` RAW it walks off the end of the buffer —
+    // `index out of bounds: index 4, len 4` in Debug (the relying-party
+    // process aborts), a silent out-of-bounds read under ReleaseFast. It is
+    // the exact reproducer `modules/x509/src/safe.zig` was written for, and
+    // an attacker puts it in `attStmt.x5c[0]` for free.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const v = vectors.none_es256;
+    const auth_data_bytes = try extractAuthDataRaw(a, &v.attestation_object);
+    const hostile: []const u8 = &.{ 0x30, 0x02, 0x30, 0x00 };
+
+    // Both formats that consume x5c must reject it as a typed error.
+    inline for (.{ "packed", "fido-u2f" }) |fmt| {
+        const built = try buildAttestationObject(a, .{
+            .fmt = fmt,
+            .alg = -7, // ES256
+            .x5c = hostile,
+            .sig = &.{0x00},
+            .auth_data = auth_data_bytes,
+        });
+        try testing.expectError(
+            error.InvalidCertificate,
+            webauthn.verifyAttestation(a, built, @splat(0)),
+        );
+    }
+
+    // Every prefix of a real attestation certificate, likewise: truncation is
+    // the general shape the 4-byte case is one instance of.
+    const real = try realX5c(a, &vectors.packed_es256_full.attestation_object);
+    var cut: usize = 0;
+    while (cut < real.len) : (cut += 1) {
+        const built = try buildAttestationObject(a, .{
+            .fmt = "packed",
+            .alg = -7,
+            .x5c = real[0..cut],
+            .sig = &.{0x00},
+            .auth_data = auth_data_bytes,
+        });
+        // A strict prefix can never verify; the load-bearing property is that
+        // the verdict is a typed error and not an abort.
+        if (webauthn.verifyAttestation(a, built, @splat(0))) |_| {
+            try testing.expect(false);
+        } else |_| {}
+    }
+    // Not vacuous: the untruncated certificate really does reach the signature
+    // check (and fails it, since the clientDataHash here is all zeroes).
+    const whole = try buildAttestationObject(a, .{
+        .fmt = "packed",
+        .alg = -7,
+        .x5c = real,
+        .sig = &.{0x00},
+        .auth_data = auth_data_bytes,
+    });
+    try testing.expectError(
+        error.InvalidSignature,
+        webauthn.verifyAttestation(a, whole, @splat(0)),
+    );
+}
+
+// ── fuzz: the attestation / x5c / CBOR surface ─────────────────────────────
+
+/// How the harness derives `x5c[0]` from the fuzzer's bytes. Raw entropy is
+/// rejected by the DER reader almost immediately, so most of the modes wrap
+/// the fuzzed bytes in structure the parser will actually descend into.
+const X5cMode = enum {
+    /// No `x5c` key at all — the `packed` self-attestation shape.
+    absent,
+    /// Raw fuzzer bytes.
+    raw,
+    /// Fuzzer bytes inside a `SEQUENCE` header, i.e. certificate-shaped.
+    der_framed,
+    /// A real attestation certificate, truncated at a fuzzer-chosen offset.
+    real_truncated,
+    /// A real attestation certificate with a fuzzer-chosen byte overwritten.
+    real_mutated,
+};
+
+const fuzz_formats = [_][]const u8{ "packed", "fido-u2f", "none", "tpm", "android-key", "" };
+const fuzz_algs = [_]i64{ -7, -8, -257, -65535, 0, 1 };
+
+/// One hostile attestationObject, assembled from the fuzzer's bytes and run
+/// through `verifyAttestation`. The contract is "never panics": any typed
+/// error is a fine outcome, an abort is not.
+fn fuzzVerifyAttestation(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const real_cert = try realX5c(a, &vectors.packed_es256_full.attestation_object);
+    const real_auth_data = try extractAuthDataRaw(a, &vectors.none_es256.attestation_object);
+
+    const fmt = fuzz_formats[smith.index(fuzz_formats.len)];
+    const alg = fuzz_algs[smith.index(fuzz_algs.len)];
+    const mode: X5cMode = @enumFromInt(smith.valueRangeAtMost(u8, 0, @typeInfo(X5cMode).@"enum".fields.len - 1));
+
+    var raw: [512]u8 = undefined;
+    smith.bytes(&raw);
+    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+
+    const x5c: ?[]const u8 = switch (mode) {
+        .absent => null,
+        .raw => raw[0..raw_len],
+        .der_framed => blk: {
+            // `30 82 <len:be16> <fuzzed bytes>` — a SEQUENCE whose declared
+            // length is the fuzzed content's, so the DER reader descends.
+            const body = raw[0..raw_len];
+            const framed = try a.alloc(u8, body.len + 4);
+            framed[0] = 0x30;
+            framed[1] = 0x82;
+            std.mem.writeInt(u16, framed[2..4], @intCast(body.len), .big);
+            @memcpy(framed[4..], body);
+            break :blk framed;
+        },
+        .real_truncated => real_cert[0..smith.valueRangeAtMost(u16, 0, @intCast(real_cert.len))],
+        .real_mutated => blk: {
+            const mutant = try a.dupe(u8, real_cert);
+            mutant[smith.index(mutant.len)] = raw[0];
+            break :blk mutant;
+        },
+    };
+
+    var sig_buf: [128]u8 = undefined;
+    smith.bytes(&sig_buf);
+    const sig_len: usize = smith.valueRangeAtMost(u8, 0, sig_buf.len);
+
+    // authData: the real §16 blob (so the attested-credential-data parse
+    // succeeds and the run gets as far as the attestation statement), or the
+    // real blob with one fuzzed byte, or pure entropy.
+    const auth_data: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => real_auth_data,
+        1 => blk: {
+            const mutant = try a.dupe(u8, real_auth_data);
+            mutant[smith.index(mutant.len)] = raw[raw.len - 1];
+            break :blk mutant;
+        },
+        else => raw[0..raw_len],
+    };
+
+    const built = try buildAttestationObject(a, .{
+        .fmt = fmt,
+        .alg = alg,
+        .x5c = x5c,
+        .sig = sig_buf[0..sig_len],
+        .auth_data = auth_data,
+    });
+
+    var hash: [32]u8 = undefined;
+    smith.bytes(&hash);
+
+    // Two entry points: the assembled object, and — so the CBOR framing itself
+    // is fuzzed and not only its fields — the fuzzer's raw bytes.
+    _ = webauthn.verifyAttestation(a, built, hash) catch {};
+    _ = webauthn.verifyAttestation(a, raw[0..raw_len], hash) catch {};
+}
+
+test "fuzz: verifyAttestation never panics on a hostile attestationObject" {
+    try std.testing.fuzz({}, fuzzVerifyAttestation, .{});
+}
+
+test "the attestation fuzz harness reaches the certificate parser (reachability)" {
+    // A harness that cannot reach the code it claims to cover is the defect
+    // class this test exists to rule out: drive `fuzzVerifyAttestation`'s own
+    // body deterministically (a `Smith` with `in` set consumes fixed bytes
+    // instead of the fuzzer's) and, separately, assert that each x5c mode the
+    // harness can pick really does land inside `verifyLeafCertSignature`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const real_cert = try realX5c(a, &vectors.packed_es256_full.attestation_object);
+    const real_auth_data = try extractAuthDataRaw(a, &vectors.none_es256.attestation_object);
+
+    // `InvalidCertificate` / `InvalidSignature` / `BadSignature` /
+    // `UnsupportedAlgorithm` are only reachable *inside*
+    // `verifyLeafCertSignature`; any of them proves the x5c path ran.
+    var reached: usize = 0;
+    for ([_][]const u8{
+        &.{ 0x30, 0x02, 0x30, 0x00 }, // the std hazard shape
+        real_cert, // the genuine article
+        real_cert[0 .. real_cert.len / 2], // truncated
+        &.{ 0x30, 0x82, 0x00, 0x02, 0xff, 0xff }, // der_framed shape over junk
+    }) |leaf| {
+        const built = try buildAttestationObject(a, .{
+            .fmt = "packed",
+            .alg = -7,
+            .x5c = leaf,
+            .sig = &.{ 0x30, 0x00 },
+            .auth_data = real_auth_data,
+        });
+        const err = webauthn.verifyAttestation(a, built, @splat(0));
+        if (err) |_| {} else |e| switch (e) {
+            error.InvalidCertificate,
+            error.InvalidSignature,
+            error.BadSignature,
+            error.UnsupportedAlgorithm,
+            => reached += 1,
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), reached);
+
+    // And the harness body itself runs to completion on fixed input — it does
+    // not, for instance, bail out before it has built anything.
+    var smith: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 64 ++ [_]u8{0x00} ** 1024) };
+    try fuzzVerifyAttestation({}, &smith);
+}
