@@ -295,6 +295,20 @@ pub fn build(b: *std.Build) void {
     const heavy_optimize: std.builtin.OptimizeMode =
         if (optimize == .Debug and !strict_debug) .ReleaseSafe else optimize;
 
+    // `-Dtest-filter=<substring>` — compile only the tests whose name contains
+    // one of these. Added for `scripts/fuzz-sweep.sh`: `--fuzz` puts every fuzz
+    // test of a module in ONE process, so the first harness to crash takes the
+    // rest of that module's harnesses down with it and they are reported as
+    // though they had run. The sweep re-runs a crashed module one harness at a
+    // time through this option, which is the only way to give the survivors a
+    // process (and a budget) of their own. Useful by hand too:
+    // `zig build test-http -Dtest-filter="fuzz: ChunkedReader"`.
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Only build tests whose name contains this substring (repeatable)",
+    ) orelse &.{};
+
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (module_list) |m| {
@@ -327,7 +341,7 @@ pub fn build(b: *std.Build) void {
             break :blk t;
         };
 
-        const unit_tests = b.addTest(.{ .root_module = test_root });
+        const unit_tests = b.addTest(.{ .root_module = test_root, .filters = test_filters });
         const run = b.addRunArtifact(unit_tests);
         test_step.dependOn(&run.step);
 
@@ -430,6 +444,19 @@ pub fn build(b: *std.Build) void {
         .makeFn = checkCatalog,
     });
     check.dependOn(check_inner);
+
+    // Fuzz-coverage gate: `zig build check-fuzz`. Deliberately a SEPARATE step
+    // from `check-catalog` rather than a section of it -- see `checkFuzz` for
+    // why, and for the one-line change that folds it in once the tree is green.
+    const check_fuzz = b.step("check-fuzz", "Verify every module with an untrusted byte surface has a fuzz harness");
+    const check_fuzz_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_fuzz_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-fuzz",
+        .owner = b,
+        .makeFn = checkFuzz,
+    });
+    check_fuzz.dependOn(check_fuzz_inner);
 }
 
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
@@ -935,6 +962,365 @@ fn findAnchorRow(rows: []const AnchorRow, name: []const u8) ?AnchorRow {
         if (std.mem.eql(u8, r.name, name)) return r;
     }
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// `zig build check-fuzz` — the fuzz-coverage gate.
+// ---------------------------------------------------------------------------
+
+/// A row of `FUZZ-EXEMPT.tsv`: `module<TAB>REASON<TAB>EVIDENCE`.
+const FuzzExemptRow = struct {
+    name: []const u8,
+    reason: []const u8,
+    evidence: []const u8,
+};
+
+fn parseFuzzExemptRows(content: []const u8, b: *std.Build) []const FuzzExemptRow {
+    var out: std.ArrayList(FuzzExemptRow) = .empty;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var cols = std.mem.splitScalar(u8, line, '\t');
+        const name = cols.next() orelse continue;
+        const reason = cols.next() orelse continue;
+        const evidence = std.mem.trim(u8, cols.next() orelse "", " ");
+        out.append(b.allocator, .{ .name = name, .reason = reason, .evidence = evidence }) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+/// What `checkFuzz` learns about one module by reading its sources.
+const FuzzScan = struct {
+    /// Files under `modules/<m>/src/` that expose a `pub fn` whose PARAMETER
+    /// LIST accepts caller-supplied bytes (`[]const u8`, `[]u8`, or a Reader).
+    surface_files: usize,
+    /// Files under `modules/<m>/src/` containing a `testing.fuzz(` call.
+    harness_files: usize,
+    /// `testing.fuzz(` call sites, i.e. individual harnesses.
+    harnesses: usize,
+};
+
+/// THE GATE'S DEFINITION OF "SHOULD BE FUZZED", AND WHY IT IS NOT A FIG LEAF.
+///
+/// A module is obligated to carry a fuzz harness when BOTH of these hold:
+///
+///   1. `ANCHORS.tsv` classifies it CLASS **A** (wire / interop format — other
+///      implementations must byte-agree with it) or **B** (published crypto or
+///      algorithmic construction). That column is the repo's own, already
+///      CI-enforced statement that *foreign bytes are the truth for this
+///      module*.
+///   2. Its sources expose a `pub fn` that ACCEPTS BYTES — a parameter list
+///      mentioning `[]const u8`, `[]u8`, or a `Reader`. That is a property of
+///      the code, derived here, not declared anywhere.
+///
+/// Neither half alone works, and this was measured rather than assumed:
+///
+///   - CLASS A/B alone obligates 46 harness-less modules, 20 of which have no
+///     byte-accepting public function at all: `spbfib`, `bumtree`, `l2forward`,
+///     `isis-spf`/`-dis`/`-flood`, `cors`, `security-headers`, `openapi`,
+///     `accesslog`, … Those are FSMs and emitters over already-decoded structs.
+///     Four of them (`spbfib`, `tcplan`, `workerpool`, `reconcilable`) were
+///     independently *justified* as unfuzzable by wave-2 auditors, in prose,
+///     before this gate existed — and the structural half reproduces that
+///     judgement without being told.
+///   - Condition 2 alone obligates the whole repo: `kv`, `ramcache`,
+///     `hashdigest` all take `[]const u8` from callers who are us.
+///
+/// The conjunction is hard to escape cheaply. To make an obligated module stop
+/// being obligated you must either take the byte-accepting function out of the
+/// public API (a real code change that also removes the surface), or downgrade
+/// its CLASS — and CLASS is load-bearing for something else: `checkAnchors`
+/// forces a non-A/B module's ANCHOR to `n/a`, which deletes its recorded
+/// external anchor and drops it out of `ANCHOR-TASKS.tsv`. You cannot buy fuzz
+/// exemption without paying in anchor provenance, in a file whose whole purpose
+/// is to be read. That is the difference between this and the earlier
+/// "external anchor ⇒ vector file" proxy, which was measured and rejected: this
+/// gate does not infer coverage from bookkeeping, it infers OBLIGATION from
+/// bookkeeping that is already independently policed, and then checks coverage
+/// against the code.
+///
+/// `FUZZ-EXEMPT.tsv` exists for the residue — cases where condition 2 is true
+/// but the bytes are ours (`metrics` takes `[]const u8` metric NAMES, authored
+/// by our own callers, and never parses the exposition format it emits). It has
+/// ONE row, and five rules keep it that way; see `checkFuzzExempt`. It is not
+/// the mechanism, it is the mechanism's error term.
+///
+/// WHAT THIS GATE DOES NOT DO. It is per MODULE, not per FILE. `lninvoice`
+/// passes it today while `bolt12.zig` has no harness of its own. A file-level
+/// version was implemented and measured before this one: 455 files in class A/B
+/// modules contain a byte-accepting `pub fn` and 234 of them have no harness in
+/// the same file. A gate that fires on half the files it looks at is a wishlist,
+/// not a gate, and no sharper file predicate separated cleanly (requiring an
+/// error-union return only moved it to 162 files across 75 modules). So the
+/// file-granularity half of the problem is answered in `scripts/fuzz-sweep.sh`
+/// instead, which now budgets and reports per HARNESS with its file path, so a
+/// module whose second decoder is unfuzzed is visible in every sweep — and, more
+/// importantly, adding that harness no longer steals budget from the first.
+///
+/// WHY A SEPARATE STEP FROM `check-catalog`. It is red on 26 modules right now
+/// (`zig build check-fuzz` prints them). Folding it into the gate that every
+/// commit runs would make the tree red for pre-existing debt none of which this
+/// slot owns. The one-line change is `check.dependOn(check_fuzz_inner)` in
+/// `build()`; it belongs to whoever burns those 26 down, not here. Weakening the
+/// gate to make the tree green was the alternative and was rejected.
+fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+
+    const anchors_src = try b.build_root.handle.readFileAlloc(io, "ANCHORS.tsv", b.allocator, .limited(1 * 1024 * 1024));
+    const anchor_rows = parseAnchorRows(anchors_src, b);
+    const exempt_src = try b.build_root.handle.readFileAlloc(io, "FUZZ-EXEMPT.tsv", b.allocator, .limited(1 * 1024 * 1024));
+    const exempt_rows = parseFuzzExemptRows(exempt_src, b);
+
+    var failed = false;
+    var n_obligated: usize = 0;
+    var n_covered: usize = 0;
+    var n_exempt: usize = 0;
+    var n_failing: usize = 0;
+    var n_harnesses: usize = 0;
+
+    for (module_list) |m| {
+        const scan = try scanModuleForFuzz(b, io, m.name);
+        n_harnesses += scan.harnesses;
+
+        const row = findAnchorRow(anchor_rows, m.name) orelse {
+            // checkAnchors reports the missing row itself; repeat it here so a
+            // module cannot dodge THIS gate by simply having no CLASS.
+            std.log.err(
+                "module '{s}' has no ANCHORS.tsv row, so check-fuzz cannot tell whether foreign bytes are its truth",
+                .{m.name},
+            );
+            failed = true;
+            continue;
+        };
+        const faces_outside = std.mem.eql(u8, row.class, "A") or std.mem.eql(u8, row.class, "B");
+        if (!faces_outside or scan.surface_files == 0) continue;
+
+        n_obligated += 1;
+        if (scan.harnesses > 0) {
+            n_covered += 1;
+            continue;
+        }
+        if (findFuzzExemptRow(exempt_rows, m.name) != null) {
+            n_exempt += 1;
+            continue;
+        }
+        n_failing += 1;
+        std.log.err(
+            "module '{s}' is CLASS {s} and exposes a byte-accepting public API in {d} source file(s), " ++
+                "but modules/{s}/src/ contains no `testing.fuzz(` harness — so every repo-wide sweep " ++
+                "skips it and it looks covered from outside. Add a harness on the decode entry point, " ++
+                "or add a justified row to FUZZ-EXEMPT.tsv",
+            .{ m.name, row.class, scan.surface_files, m.name },
+        );
+        failed = true;
+    }
+
+    try checkFuzzExempt(b, io, exempt_rows, anchor_rows, &failed);
+
+    std.log.info(
+        "check-fuzz: {d} modules obligated, {d} covered, {d} exempt, {d} FAILING ({d} harnesses total)",
+        .{ n_obligated, n_covered, n_exempt, n_failing, n_harnesses },
+    );
+
+    if (failed) return step.fail("fuzz-coverage gap — see errors above", .{});
+}
+
+/// The five rules that keep `FUZZ-EXEMPT.tsv` from becoming the thing that
+/// makes this gate meaningless. Every one of them is a claim the gate can
+/// refute from the tree, which is the whole point: a row survives only while
+/// the code still agrees with it.
+///
+///  1. REASON comes from a closed vocabulary — `EMIT-ONLY` or `PRE-PARSED`.
+///     Free prose in the reason column is how an exemption list stops being
+///     readable, and how "we'll fuzz it later" gets in.
+///  2. The module exists in `module_list`. (Ghost rows outlive their module —
+///     the same blindness `checkProvenance` claim 4 was added for.)
+///  3. The row must be DOING WORK: the module must be one this gate would
+///     otherwise flag (CLASS A/B *and* a byte-accepting public API). You cannot
+///     pre-emptively exempt a module, and an exemption written for a module that
+///     later stops facing the wire becomes an error rather than dead weight.
+///  4. The module must NOT have a harness. The moment someone fuzzes it anyway,
+///     the row is a lie and the gate says so, so stale rows cannot accumulate.
+///  5. `PRE-PARSED` must name, in EVIDENCE, a sibling that is a declared `deps`
+///     entry of the exempt module AND is itself fuzzed. "Somebody else validates
+///     it first" is only an argument if that somebody exists, is actually wired
+///     in, and is itself covered. `EMIT-ONLY` must still write down why in
+///     EVIDENCE — it is the one claim only a human can make, so it is the one
+///     that has to be stated in full.
+fn checkFuzzExempt(
+    b: *std.Build,
+    io: std.Io,
+    exempt_rows: []const FuzzExemptRow,
+    anchor_rows: []const AnchorRow,
+    failed: *bool,
+) !void {
+    for (exempt_rows) |row| {
+        if (!containsName(&.{ "EMIT-ONLY", "PRE-PARSED" }, row.reason)) {
+            std.log.err(
+                "FUZZ-EXEMPT.tsv: '{s}' has REASON '{s}', not one of EMIT-ONLY/PRE-PARSED",
+                .{ row.name, row.reason },
+            );
+            failed.* = true;
+            continue;
+        }
+        if (row.evidence.len == 0) {
+            std.log.err("FUZZ-EXEMPT.tsv: '{s}' has an empty EVIDENCE column", .{row.name});
+            failed.* = true;
+        }
+
+        const mod = for (module_list) |m| {
+            if (std.mem.eql(u8, m.name, row.name)) break m;
+        } else {
+            std.log.err("FUZZ-EXEMPT.tsv has a row for '{s}' but no such module exists in module_list", .{row.name});
+            failed.* = true;
+            continue;
+        };
+
+        const scan = try scanModuleForFuzz(b, io, row.name);
+        const class = if (findAnchorRow(anchor_rows, row.name)) |r| r.class else "?";
+        const faces_outside = std.mem.eql(u8, class, "A") or std.mem.eql(u8, class, "B");
+        if (!faces_outside or scan.surface_files == 0) {
+            std.log.err(
+                "FUZZ-EXEMPT.tsv exempts '{s}', but check-fuzz would not have flagged it (CLASS {s}, " ++
+                    "{d} byte-accepting source file(s)) — an exemption that excuses nothing is dead weight; delete the row",
+                .{ row.name, class, scan.surface_files },
+            );
+            failed.* = true;
+        }
+        if (scan.harnesses > 0) {
+            std.log.err(
+                "FUZZ-EXEMPT.tsv exempts '{s}' as {s}, but modules/{s}/src/ now contains {d} fuzz harness(es) — " ++
+                    "the code contradicts the exemption; delete the row",
+                .{ row.name, row.reason, row.name, scan.harnesses },
+            );
+            failed.* = true;
+        }
+
+        if (std.mem.eql(u8, row.reason, "PRE-PARSED")) {
+            if (!containsName(mod.deps, row.evidence)) {
+                std.log.err(
+                    "FUZZ-EXEMPT.tsv: '{s}' claims PRE-PARSED by '{s}', but '{s}' is not one of its declared deps " ++
+                        "in build.zig's module_list — the bytes cannot be arriving pre-decoded from a module it does not import",
+                    .{ row.name, row.evidence, row.evidence },
+                );
+                failed.* = true;
+            } else {
+                const upstream = try scanModuleForFuzz(b, io, row.evidence);
+                if (upstream.harnesses == 0) {
+                    std.log.err(
+                        "FUZZ-EXEMPT.tsv: '{s}' claims PRE-PARSED by '{s}', but '{s}' has no fuzz harness of its own — " ++
+                            "the exemption hands the untrusted surface to a module nobody fuzzes",
+                        .{ row.name, row.evidence, row.evidence },
+                    );
+                    failed.* = true;
+                }
+            }
+        }
+    }
+}
+
+fn findFuzzExemptRow(rows: []const FuzzExemptRow, name: []const u8) ?FuzzExemptRow {
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.name, name)) return r;
+    }
+    return null;
+}
+
+/// Read `modules/<name>/src/*.zig` and count the two things the gate compares:
+/// files exposing a byte-accepting public function, and fuzz harnesses.
+///
+/// Only the flat `src/*.zig` layer is scanned, which is exactly the set
+/// `scripts/fuzz-sweep.sh` derives its targets from; the only nested `.zig`
+/// files in the repo live under `src/testdata/`.
+fn scanModuleForFuzz(b: *std.Build, io: std.Io, name: []const u8) !FuzzScan {
+    var out: FuzzScan = .{ .surface_files = 0, .harness_files = 0, .harnesses = 0 };
+    const dir_path = b.fmt("modules/{s}/src", .{name});
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch return out;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".zig")) continue;
+        const path = b.fmt("{s}/{s}", .{ dir_path, e.name });
+        const src = try b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(8 * 1024 * 1024));
+
+        const n = countFuzzCalls(src);
+        out.harnesses += n;
+        if (n > 0) out.harness_files += 1;
+        if (fileHasByteAcceptingPubFn(src)) out.surface_files += 1;
+    }
+    return out;
+}
+
+fn countFuzzCalls(src: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "testing.fuzz(")) |at| {
+        n += 1;
+        i = at + 1;
+    }
+    return n;
+}
+
+/// Does this file expose a `pub fn` whose PARAMETER LIST accepts bytes the
+/// caller supplies — `[]const u8` or a `Reader`?
+///
+/// Three deliberate narrowings, each of which removed a measured false positive:
+///
+///  - PARAMETER LIST, not the whole signature. A function RETURNING `[]const u8`
+///    hands bytes out; it does not take them in.
+///  - `[]const u8` but NOT `[]u8`. A mutable byte slice parameter is a buffer
+///    the callee WRITES — `isis-flood`'s `buildPsnp(scratch: []u8, …)` and
+///    `accesslog`'s `addr_buf: []u8` are output space, and counting them
+///    obligated two modules that consume only already-decoded structs.
+///  - Parentheses are MATCHED from the one after the function name, so the ~378
+///    multi-line signatures in the repo are read correctly. A line-oriented
+///    regex missed `adaptor` and `musig2`, which wrap their parameters, and
+///    would have let both crypto modules out of the gate.
+///
+/// Line comments are skipped so a `pub fn` inside a doc-comment example does not
+/// obligate a module.
+fn fileHasByteAcceptingPubFn(src: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "pub fn ")) |at| {
+        i = at + 7;
+        if (isInsideLineComment(src, at)) continue;
+        const open = std.mem.indexOfScalarPos(u8, src, i, '(') orelse break;
+        // Anything but an identifier between `pub fn ` and `(` means this is
+        // not a plain function header.
+        var depth: usize = 1;
+        var j = open + 1;
+        while (j < src.len and depth > 0) : (j += 1) {
+            switch (src[j]) {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                else => {},
+            }
+        }
+        const params = src[open + 1 .. if (j > 0) j - 1 else 0];
+        if (std.mem.indexOf(u8, params, "[]const u8") != null or
+            std.mem.indexOf(u8, params, "Reader") != null) return true;
+        i = j;
+    }
+    return false;
+}
+
+/// Is byte `at` preceded on its own line by a `//` that is not inside a string
+/// literal? Cheap, and only ever consulted for a `pub fn ` occurrence.
+fn isInsideLineComment(src: []const u8, at: usize) bool {
+    const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..at], '\n')) |nl| nl + 1 else 0;
+    var in_str = false;
+    var k = line_start;
+    while (k + 1 < at) : (k += 1) {
+        switch (src[k]) {
+            '"' => in_str = !in_str,
+            '/' => if (!in_str and src[k + 1] == '/') return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// The module README's provenance statement: from the first `Provenance:` or

@@ -659,6 +659,13 @@ Usage: scripts/test.sh [subcommand] [args]
                         reverse-dependency closure.
   all                   test every module: fmt check + check-catalog + the
                         full suite. The pre-commit/CI gate.
+                        NOT included: `zig build check-fuzz`, which fails a
+                        module that faces the wire and has no fuzz harness.
+                        It is red on pre-existing debt (27 modules as of
+                        writing) and is deliberately kept out of the gate
+                        every commit runs until that is burned down — see
+                        `checkFuzz` in build.zig for the one-line change
+                        that folds it in. Run it by hand meanwhile.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.

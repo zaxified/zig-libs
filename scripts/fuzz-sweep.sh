@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# First-ever coverage-guided fuzz sweep over zig-libs.
+# Coverage-guided fuzz sweep over zig-libs.
 #
-# `--fuzz` needs `--release=safe` (NOT `-Doptimize=ReleaseSafe`) — in Debug the
-# test runner itself crashes. It then runs forever, so each module gets a fixed
-# window and is killed.
+# ⭐ THE BUDGET IS ITERATIONS PER HARNESS, NOT SECONDS PER MODULE. The first
+# argument used to be a per-module wall-clock window; it is now a per-fuzz-test
+# iteration count handed to `zig build --fuzz=<N>`. Read the two blocks marked
+# WHY ITERATIONS below before changing it back — the old shape had three
+# defects that this one does not, and all three were measured, not theorised.
 #
-#   exit 124  -> the window expired with no crash        = clean for that budget
-#   exit 0    -> the module finished, i.e. it never entered the fuzz loop
-#   exit 15   -> the cgroup OOM-killed it (see oomKilled below — NOT 137)
-#   anything  -> a real finding: the log is kept
+#   ./scripts/fuzz-sweep.sh                 # every module with a harness
+#   ./scripts/fuzz-sweep.sh 200000          # a bigger per-harness budget
+#   ./scripts/fuzz-sweep.sh 50000 http dns  # only these
+#
+# Verdicts written to $OUT/summary.tsv:
+#
+#   clean          every harness completed its full iteration budget, no crash
+#   FINDING        a crash; the log and the crashing input are kept, and the
+#                  module is then re-run ONE HARNESS AT A TIME (see RE-RUN)
+#   HANG           the bounded run did not finish within 6x its own measured
+#                  rate — the thing that used to be indistinguishable from clean
+#   NEVER-FUZZED   the process exited without the fuzzer performing a single run
+#   OOM-KILLED     the cgroup killed it: an allocation sized from unbounded input
 #
 # Everything runs through scripts/capped, so a runaway allocation is killed by
 # its own cgroup instead of the machine. NEVER run the fuzz command without it:
@@ -19,7 +30,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BUDGET="${1:-40}"
+ITERS="${1:-50000}"
+CAL_ITERS="${CAL_ITERS:-1000}"   # calibration budget, per harness
+CAL_WALL="${CAL_WALL:-300}"      # hard ceiling on the calibration run, seconds
+HANG_FACTOR="${HANG_FACTOR:-6}"  # main run may take this x its calibrated rate
 OUT="${FUZZ_OUT:-${TMPDIR:-/tmp}/zig-libs-fuzz}"
 mkdir -p "$OUT"
 : > "$OUT/summary.tsv"
@@ -28,10 +42,10 @@ mkdir -p "$OUT"
 # Modules that actually have a fuzz harness. Derived, never hardcoded, so
 # the sweep cannot silently stop covering a module that grows one.
 #
-# Naming modules after the budget restricts the run to those — the whole sweep
-# is 2+ hours, which is too slow a loop to check a change to this script
-# against. Every verdict path below was confirmed that way (see the OOM and
-# NEVER-FUZZED notes), so keep the filter working.
+# ⚠ Derivation only answers "which modules HAVE a harness". It cannot answer
+# "which modules SHOULD" — a module with no harness is simply absent here and
+# looks covered from outside. That is what `zig build check-fuzz` is for; it is
+# a separate gate precisely because this script cannot be one.
 mapfile -t ALL_MODS < <(grep -rl 'testing\.fuzz(' modules/*/src/*.zig 2>/dev/null |
     sed 's|modules/||; s|/src/.*||' | sort -u)
 shift || true
@@ -66,71 +80,160 @@ oomKilled() { # $1 = epoch seconds the run started
         grep -qE 'oom-kill:.*CONSTRAINT_MEMCG.*run-p[0-9]+'
 }
 
-# ⭐ WARM THE BUILD CACHE FIRST, or the budget is a lie. Each module's window
-# is spent on `zig build`, COMPILE INCLUDED — so a module with a slow
-# ReleaseSafe build gets a fraction of its nominal seconds actually fuzzing,
-# and reports "clean" for a sweep that barely ran. Measured on `imap`: a
-# planted 1-byte trigger was NOT found in 45s cold and WAS found within 60s
-# once the build was cached.
+# ⭐ A TIMED-OUT FUZZ RUN LEAVES AN ORPHAN THAT WEDGES THE NEXT ONE. `timeout`
+# signals the `zig` it spawned, but the build RUNNER it forked lives on inside
+# the systemd scope `scripts/capped` created — still spinning on the input that
+# caused the timeout, still holding `.zig-cache/f/`. The next invocation for
+# that module then blocks forever with no output. Cost me three dead sweeps
+# while testing the HANG branch: the sweep printed "warming ..." and never
+# returned, and the culprit was a build runner from two attempts earlier.
 #
-# This is a different failure from NEVER-FUZZED below. That one catches a run
-# that never reached the loop at all; it cannot see one that reached it with
-# five seconds left, which looks identical to a clean result.
-echo "warming $total ReleaseSafe builds so the budget is spent fuzzing, not compiling..."
+# So reap after any timeout, matched narrowly on this module's own command line.
+reapOrphans() { # $1 = module
+    pkill -9 -f "test-$1 --release=safe" 2>/dev/null
+    sleep 1
+    return 0
+}
+
+# The fuzzer's own end-of-run report carries `Runs: <before> -> <after>`, where
+# both numbers are cumulative across runs that share the cache. The DELTA is the
+# only trustworthy answer to "did this actually fuzz?" — far better than the old
+# `grep -q 'Build Summary'` heuristic, which could only tell that the build had
+# got as far as printing a summary.
+runsDelta() { # $1 = log path
+    awk -F'[ >-]+' '/^Runs: /{ d += $3 - $2 } END { print d+0 }' "$1"
+}
+
+# Every `testing.fuzz(` call site, as `<file>\t<test name>`. The name is the one
+# the compiler will match `-Dtest-filter` against, taken from the nearest
+# preceding `test "..."` header. Used for the per-harness re-run and to report
+# WHICH FILES a module's harnesses actually live in — a module can be listed in
+# every sweep on the strength of one file's harness while a second decoder in
+# the same module has none (`lninvoice`: bech32_raw + bolt11 fuzzed, bolt12.zig
+# not). The sweep cannot refuse to run in that state, but it can stop hiding it.
+harnessesOf() { # $1 = module
+    awk -v mod="$1" '
+        FNR == 1 { name = "" }
+        /^[[:space:]]*test "/ {
+            line = $0
+            sub(/^[^"]*"/, "", line)
+            sub(/".*$/, "", line)
+            name = line
+        }
+        /testing\.fuzz\(/ && name != "" { print FILENAME "\t" name }
+    ' modules/"$1"/src/*.zig 2>/dev/null
+}
+
+# ⭐ WHY ITERATIONS (1/2) — WARMING IS STILL NEEDED, BUT NO LONGER LOAD-BEARING.
+# Under the old seconds-per-module budget a cold ReleaseSafe compile ate the
+# window and the module reported "clean" for a sweep that barely ran (measured
+# on `imap`: a planted 1-byte trigger was NOT found in 45s cold and WAS found
+# within 60s warm). A budget counted in ITERATIONS cannot be eaten by a compile
+# — the run performs its N iterations per harness whether the build took 1s or
+# 90s. Warming now only keeps the calibration timing honest, so a slow compile
+# is not mistaken for a slow target.
+#
+# ⚠ Warm with `--fuzz=1`, not a plain build. `--fuzz` rebuilds the module in
+# FUZZ MODE — a different, instrumented binary with its own cache entry — so
+# warming without it warms the wrong artifact. Caught here: `linkheader`
+# calibrated at 17s instead of ~0s after a "warm" plain build, and its hang
+# ceiling came out ten times too generous as a result.
+#
+# ⚠ The warm run is TIMED OUT like every other fuzz invocation. `--fuzz=1` still
+# replays the persisted corpus first, so a module with a nonterminating path
+# already reachable from its corpus hangs HERE, before calibration — observed
+# while testing the HANG branch, where the warm pass sat forever and the sweep
+# never reached the module. An unbounded command in a sweep whose whole point is
+# bounding things is a bug.
+# ⭐ REFUSE TO START ON TOP OF ANOTHER FUZZ RUN. Two fuzzers sharing a module's
+# corpus collide, and the collision surfaces as a Zig panic reading
+# `corpus … in use by another fuzzer` — an artifact that has been mistaken for a
+# finding. It also just wedges: a leftover build runner (see reapOrphans) holds
+# the corpus and the new run blocks in the warm pass with no output at all,
+# which is how three sweeps died during this script's own testing. So look
+# first, name what is running, and stop rather than produce a bad answer.
+mapfile -t RUNNING < <(pgrep -af -- '--fuzz' 2>/dev/null | grep -v fuzz-sweep || true)
+if (( ${#RUNNING[@]} )); then
+    echo "REFUSING TO START — a fuzz run is already in flight:"
+    printf '  %s\n' "${RUNNING[@]}"
+    echo "Wait for it, or reap it (a timed-out run leaves the build runner alive)."
+    exit 3
+fi
+
+echo "warming $total instrumented builds so calibration times the target, not the compiler..."
 warm_start=$(date +%s)
 for m in "${MODS[@]}"; do
-    ./scripts/capped zig build "test-$m" --release=safe > /dev/null 2>&1 ||
-        echo "  warm FAILED: $m (its window will include a compile)"
+    timeout "$CAL_WALL" ./scripts/capped zig build "test-$m" --release=safe --fuzz=1 > /dev/null 2>&1 || {
+        echo "  warm FAILED or timed out: $m (calibration will re-time it and can report HANG)"
+        reapOrphans "$m"
+    }
 done
 echo "warmed in $(( $(date +%s) - warm_start ))s"
-
-# ⭐ THE BUDGET IS PER MODULE, because the fuzz loop does not start until the
-# module's own unit tests have finished. `http` and `threshold_ecdsa` both came
-# back NEVER-FUZZED at 45s: their suites alone outlast the whole window, so a
-# single global number cannot give every module the same amount of FUZZING.
-#
-# Rather than hardcode exceptions that rot as suites grow, measure it. The warm
-# pass above has already cached each build, so a second run times the unit
-# tests alone — the exact quantity being subtracted from the budget — and each
-# module's window becomes BUDGET + that. A module whose suite grows past its
-# window fixes itself on the next sweep.
-declare -A PRETIME
-echo "measuring each suite's own runtime (the part that is not fuzzing)..."
-for m in "${MODS[@]}"; do
-    t0=$(date +%s)
-    ./scripts/capped zig build "test-$m" --release=safe > /dev/null 2>&1
-    PRETIME[$m]=$(( $(date +%s) - t0 ))
-done
-slow=$(for m in "${MODS[@]}"; do printf '%s\t%s\n' "${PRETIME[$m]}" "$m"; done |
-    sort -rn | awk -v b="$BUDGET" '$1 * 2 >= b {printf "%s(%ss) ", $2, $1}')
-[[ -n "$slow" ]] && echo "  suites eating a big share of a ${BUDGET}s budget: $slow"
 echo
 
+# ⭐ WHY ITERATIONS (2/2) — A MODULE'S BUDGET USED TO BE SHARED BY EVERY HARNESS
+# IN IT, so adding one starved the others and coverage regressed silently while
+# the sweep still said `clean`. Measured during the class-B burn-down: with all
+# three `webauthn` harnesses live, 120s did NOT reach a live CRIT; with only the
+# attestation harness live, 180s did.
+#
+# `--fuzz=<N>` gives EACH fuzz test its own limit of N (lib/fuzzer.zig keeps a
+# per-`Test` `limit` and `select()` returns null only once every test has used
+# its own up). Verified here: `btcp2p`, 11 harnesses, `--fuzz=5000` performed
+# 55,208 runs = 11 x 5000. So a module that grows a twelfth harness gets a
+# twelfth full budget instead of eleven thinner ones.
+#
+# It also makes the run TERMINATE, which is what lets `clean` and `hang` finally
+# be different answers — see the HANG branch.
 i=0
 for m in "${MODS[@]}"; do
     i=$((i + 1))
     log="$OUT/$m.log"
-    window=$(( BUDGET + ${PRETIME[$m]:-0} ))
+    mapfile -t HARNESS < <(harnessesOf "$m")
+    nh=${#HARNESS[@]}
+
+    # Calibrate on a small budget to learn this module's own throughput, so the
+    # hang ceiling below is derived from the target rather than guessed. A
+    # target that cannot even finish CAL_ITERS inside CAL_WALL is already the
+    # answer.
+    cal_start=$(date +%s)
+    timeout "$CAL_WALL" ./scripts/capped zig build "test-$m" --release=safe \
+        --fuzz="$CAL_ITERS" > "$log.cal" 2>&1
+    cal_rc=$?
+    cal_dur=$(( $(date +%s) - cal_start ))
+
+    if [[ $cal_rc -eq 124 ]]; then
+        reapOrphans "$m"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$m" 124 "$cal_dur" "HANG" \
+            "did not finish ${CAL_ITERS} iters/harness in ${CAL_WALL}s (calibration)" >> "$OUT/summary.tsv"
+        { echo "=== $m (HANG at calibration, ${cal_dur}s) ==="; tail -40 "$log.cal"; echo; } >> "$OUT/findings.txt"
+        echo "[$i/$total] $m -> HANG (calibration, ${cal_dur}s)"
+        continue
+    fi
+
+    # Scale the calibrated time to the real budget, then allow HANG_FACTOR x
+    # that. A slow-but-terminating target stays clean; one that stops making
+    # progress blows through its own measured rate and is named.
+    wall=$(( (cal_dur * ITERS / CAL_ITERS + 15) * HANG_FACTOR ))
+    (( wall < 60 )) && wall=60
+
     start=$(date +%s)
-    timeout "$window" ./scripts/capped zig build "test-$m" --fuzz --release=safe > "$log" 2>&1
+    timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
+        --fuzz="$ITERS" > "$log" 2>&1
     rc=$?
     dur=$(( $(date +%s) - start ))
+    [[ $rc -eq 124 ]] && reapOrphans "$m"
+    delta=$(runsDelta "$log")
 
-    # ⭐ The EXIT CODE CANNOT BE THE SIGNAL. A fuzz crash is reported and the
-    # build keeps running (the web server stays up), so `timeout` still kills it
-    # with 124 — exactly as if nothing had been found. Verified by planting an
-    # unconditional panic: full trace in the log, exit still 124. Detection has
-    # to read the log.
+    # ⭐ A CRASH IS STILL FOUND BY READING THE LOG, not by the exit code alone:
+    # the crash is reported by the fuzzer and the exit status has been seen to
+    # be anything. Keep both signals.
     if grep -qE ' [0-9]+ crash|terminated with signal|thread [0-9]+ panic' "$log"; then
         verdict="FINDING"
     else
-        # Did the module even REACH the fuzz loop? With a warm cache the only
-        # thing before it is the module's own unit tests, and for a heavy module
-        # those alone can outlast a short budget — which would otherwise be
-        # recorded as "clean" while nothing was ever fuzzed.
         case $rc in
-            124) if grep -q 'Build Summary' "$log"; then verdict="clean"; else verdict="NEVER-FUZZED"; fi ;;
-            0)   verdict="NO-FUZZ-LOOP" ;;
+            0)   if [[ "$delta" -gt 0 ]]; then verdict="clean"; else verdict="NEVER-FUZZED"; fi ;;
+            124) verdict="HANG" ;;
             137) verdict="OOM-KILLED" ;;
             15)  if oomKilled "$start"; then verdict="OOM-KILLED"; else verdict="EXIT-15-SIGTERM"; fi ;;
             *)   verdict="EXIT-$rc" ;;
@@ -142,6 +245,11 @@ for m in "${MODS[@]}"; do
     # be read, next to the trace, instead of leaving a bare exit code.
     if [[ "$verdict" == "OOM-KILLED" ]]; then
         echo "  OOM: killed by its cgroup after ${dur}s — an allocation was sized from unbounded input" >> "$log"
+    fi
+    if [[ "$verdict" == "HANG" ]]; then
+        echo "  HANG: killed after ${dur}s, having asked for ${ITERS} iterations per harness and been" >> "$log"
+        echo "  given ${wall}s = ${HANG_FACTOR}x its own calibrated rate. A bounded fuzz run that does" >> "$log"
+        echo "  not terminate means some input reached a path that does not." >> "$log"
     fi
 
     # ⭐ PRESERVE THE CRASHING INPUT, not just the trace. The Zig fuzzer writes
@@ -156,17 +264,47 @@ for m in "${MODS[@]}"; do
         echo "  saved crashing input -> $OUT/$m.crash-input"
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\n' "$m" "$rc" "$dur" "$verdict" "window=${window}s(suite ${PRETIME[$m]:-?}s)" >> "$OUT/summary.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$m" "$rc" "$dur" "$verdict" \
+        "harnesses=$nh runs=$delta budget=${ITERS}/harness wall=${wall}s" >> "$OUT/summary.tsv"
     if [[ "$verdict" != "clean" ]]; then
-        {
-            echo "=== $m (exit $rc, ${dur}s, $verdict) ==="
-            tail -40 "$log"
-            echo
-        } >> "$OUT/findings.txt"
+        { echo "=== $m (exit $rc, ${dur}s, $verdict) ==="; tail -40 "$log"; echo; } >> "$OUT/findings.txt"
     fi
-    echo "[$i/$total] $m -> $verdict (${dur}s of ${window}s)"
+    echo "[$i/$total] $m -> $verdict (${dur}s, $nh harness(es), $delta runs)"
+
+    # ⭐ RE-RUN: ONE CRASH USED TO SILENCE EVERY LATER HARNESS IN THE MODULE.
+    # All of a module's fuzz tests share one process, so the first to crash
+    # takes the rest down with it and they were reported as if they had run
+    # their budget. There is no way to keep them alive in that process, so give
+    # each survivor a process of its own via `-Dtest-filter` and report it
+    # separately. This costs one compile per harness, which is why it happens
+    # only for a module that actually crashed.
+    if [[ "$verdict" == "FINDING" && $nh -gt 1 ]]; then
+        echo "  crash in a shared process starved the other $((nh - 1)) harness(es) — re-running each alone"
+        for h in "${HARNESS[@]}"; do
+            hfile="${h%%$'\t'*}"; hname="${h#*$'\t'}"
+            hlog="$OUT/$m.$(echo "$hname" | tr -c 'A-Za-z0-9' '_').log"
+            hstart=$(date +%s)
+            timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
+                -Dtest-filter="$hname" --fuzz="$ITERS" > "$hlog" 2>&1
+            hrc=$?
+            [[ $hrc -eq 124 ]] && reapOrphans "$m"
+            hdelta=$(runsDelta "$hlog")
+            if grep -qE ' [0-9]+ crash|terminated with signal|thread [0-9]+ panic' "$hlog"; then
+                hv="FINDING"
+            elif [[ $hrc -eq 124 ]]; then hv="HANG"
+            elif [[ $hrc -eq 0 && "$hdelta" -gt 0 ]]; then hv="clean"
+            elif [[ $hrc -eq 0 ]]; then hv="NEVER-FUZZED"
+            else hv="EXIT-$hrc"; fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$m/$hname" "$hrc" "$(( $(date +%s) - hstart ))" "$hv" \
+                "isolated re-run, $hfile, runs=$hdelta" >> "$OUT/summary.tsv"
+            echo "    $hfile :: $hname -> $hv ($hdelta runs)"
+        done
+    fi
 done
 
 echo
 echo "=== SWEEP DONE ==="
-awk -F'\t' '{c[$4]++} END {for (v in c) printf "%-14s %d\n", v, c[v]}' "$OUT/summary.tsv"
+awk -F'\t' '{c[$4]++} END {for (v in c) printf "%-16s %d\n", v, c[v]}' "$OUT/summary.tsv"
+echo
+echo "Modules that SHOULD have a harness and do not are invisible here by"
+echo "construction — run \`zig build check-fuzz\` for that half of the picture."
