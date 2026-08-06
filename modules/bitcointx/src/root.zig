@@ -20,6 +20,12 @@
 //! - `hashtype.zig` — the shared `ALL`/`NONE`/`SINGLE`/`ANYONECANPAY` bit
 //!   layout `sighash_legacy`/`sighash_bip143` both use (BIP341 has its own
 //!   stricter single-byte encoding, defined in `sighash_bip341.zig`).
+//! - `precomputed.zig` — `PrecomputedTransactionData`: the per-transaction
+//!   BIP143/BIP341 commitment hashes, computed once per transaction so a
+//!   validator's cost is linear in transaction size rather than quadratic
+//!   (that seam is what BIP143 exists for — see the file's doc comment).
+//! - `instrument.zig` — test-only counter backing the regression test for
+//!   the above; compiles to nothing outside a test build.
 //! - `hash256.zig` — `sha256d` (Bitcoin's double-SHA256) and plain
 //!   `sha256` (what BIP341's commitment hashes use instead).
 //! - `*_kat_vectors.zig` / `*_kat_test.zig` — official test vectors
@@ -42,6 +48,14 @@ pub const hashtype = @import("hashtype.zig");
 pub const legacy = @import("sighash_legacy.zig");
 pub const bip143 = @import("sighash_bip143.zig");
 pub const bip341 = @import("sighash_bip341.zig");
+pub const precomputed = @import("precomputed.zig");
+
+/// Bitcoin Core's `PrecomputedTransactionData` equivalent: the BIP143 and
+/// BIP341 per-transaction commitment hashes, computed once per transaction
+/// and reused for every input and every `CHECKSIG`. See `precomputed.zig`
+/// for why an implementation without this seam is BIP143-shaped but still
+/// `O(n²)` on attacker-chosen input.
+pub const PrecomputedTransactionData = precomputed.PrecomputedTransactionData;
 
 // Re-export the tx/CompactSize surface at the package root for convenience
 // (`@import("bitcointx").deserialize(...)` alongside `@import("bitcointx").tx.deserialize(...)`).
@@ -71,6 +85,8 @@ test {
     _ = legacy;
     _ = bip143;
     _ = bip341;
+    _ = precomputed;
+    _ = @import("instrument.zig");
     _ = @import("testutil.zig");
     _ = @import("tx_kat_vectors.zig");
     _ = @import("tx_kat_test.zig");

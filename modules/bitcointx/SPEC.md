@@ -26,9 +26,19 @@ provides. Five files:
 - `sighash_bip341.zig` — BIP341 taproot key-path sighash: `SigMsg` over prevout/amount/
   scriptPubKey/sequence commitments (single SHA-256, not `sha256d` — see `hash256.zig`'s doc
   comment) plus `bip340.taggedHash("TapSighash", …)`.
+- `precomputed.zig` — `PrecomputedTransactionData` (Bitcoin Core's struct of the same name): the
+  BIP143 and BIP341 per-transaction commitment hashes computed once per transaction, plus the
+  `*With` sighash entry points that consume it. Byte-identical to the uncached entry points by
+  construction — the `hash_type`-dependent selection over the commitment hashes lives in one place
+  per algorithm and both routes share it — and pinned as such by a test over every hash type and
+  every input. Complexity is guarded by a deterministic counter of commitment-hash computations
+  (`instrument.zig`), not a stopwatch.
+- `instrument.zig` — that counter. `builtin.is_test`-gated, so it is `void` and compiles away
+  entirely outside a test build.
 
 Concurrency: `.reentrant` — every function is a pure transform over caller-owned values, no
-shared/global state.
+shared/global state. (`instrument.zig`'s counter is the sole mutable global and exists only in a
+test binary, where these tests are single-threaded.)
 
 ## Threat model / out of scope
 

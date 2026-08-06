@@ -21,6 +21,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const hash256 = @import("hash256.zig");
 const hashtype = @import("hashtype.zig");
+const instrument = @import("instrument.zig");
 const tx = @import("tx.zig");
 
 pub const ALL = hashtype.ALL;
@@ -60,15 +61,100 @@ fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.
     try buf.appendSlice(allocator, &tmp);
 }
 
-/// The three reusable per-transaction midstates (BIP143 "Specification").
-/// Each is `sha256d` of zero or more fixed-width fields; a field set is
-/// replaced by 32 zero bytes exactly when BIP143 says to omit it (see
-/// inline comments) rather than hashing an empty input.
-pub fn midstates(
+// ── the three per-transaction commitment hashes ──────────────────────────────
+//
+// Each of these depends on the TRANSACTION only — never on `input_index`,
+// never on `hash_type`. That is precisely why BIP143 defines them: the
+// legacy algorithm's per-input reserialization made validation `O(n²)` in
+// transaction size on attacker-chosen input, and hoisting these three out of
+// the per-input loop is what makes segwit-v0 validation linear. Bitcoin Core
+// hoists exactly these into `PrecomputedTransactionData`; `Precomputed`
+// below is that seam. Computing them per input has the letter of BIP143 and
+// none of its point.
+//
+// Each is the sole implementation of its byte layout — the cached and the
+// uncached selection paths below both route through these, so there is no
+// second copy of a consensus-critical serialization to drift.
+
+fn hashPrevouts(allocator: Allocator, transaction: tx.Transaction) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.ensureTotalCapacity(allocator, transaction.vin.len * 36);
+    for (transaction.vin) |vin| {
+        try buf.appendSlice(allocator, &vin.prevout.txid);
+        try appendU32LE(&buf, allocator, vin.prevout.vout);
+    }
+    return hash256.sha256d(buf.items);
+}
+
+fn hashSequence(allocator: Allocator, transaction: tx.Transaction) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.ensureTotalCapacity(allocator, transaction.vin.len * 4);
+    for (transaction.vin) |vin| try appendU32LE(&buf, allocator, vin.sequence);
+    return hash256.sha256d(buf.items);
+}
+
+fn hashOutputs(allocator: Allocator, transaction: tx.Transaction) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (transaction.vout) |vout| {
+        try appendI64LE(&buf, allocator, vout.value);
+        try appendCompactSize(&buf, allocator, vout.script_pubkey.len);
+        try buf.appendSlice(allocator, vout.script_pubkey);
+    }
+    return hash256.sha256d(buf.items);
+}
+
+/// SIGHASH_SINGLE's `hashOutputs`: the ONE output matching this input.
+/// Per-input by construction (Core computes it per input too), hence not
+/// part of `Precomputed` and not counted by `instrument`.
+fn hashSingleOutput(allocator: Allocator, vout: tx.TxOut) Allocator.Error![32]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendI64LE(&buf, allocator, vout.value);
+    try appendCompactSize(&buf, allocator, vout.script_pubkey.len);
+    try buf.appendSlice(allocator, vout.script_pubkey);
+    return hash256.sha256d(buf.items);
+}
+
+/// The per-transaction half of Bitcoin Core's `PrecomputedTransactionData`
+/// (`hashPrevouts`/`hashSequence`/`hashOutputs`): compute once per
+/// transaction, reuse for every input and every `CHECKSIG`.
+///
+/// These are the UNCONDITIONAL hashes. Which of them a given signature
+/// actually commits to depends on `hash_type` — that selection (including
+/// BIP143's zero-substitutions) stays in `midstatesFrom`, so a cached
+/// caller and an uncached one make the same choice from one piece of code.
+pub const Precomputed = struct {
+    hash_prevouts: [32]u8,
+    hash_sequence: [32]u8,
+    hash_outputs: [32]u8,
+};
+
+/// Compute the per-transaction commitment hashes once. Cost is `O(n)` in
+/// transaction size, paid once rather than once per input.
+pub fn precompute(allocator: Allocator, transaction: tx.Transaction) Allocator.Error!Precomputed {
+    return .{
+        .hash_prevouts = try hashPrevouts(allocator, transaction),
+        .hash_sequence = try hashSequence(allocator, transaction),
+        .hash_outputs = try hashOutputs(allocator, transaction),
+    };
+}
+
+/// BIP143's `hash_type`-dependent selection over the three commitment
+/// hashes. `pre != null` takes them from the cache; `pre == null` computes
+/// exactly the ones this `hash_type` needs, lazily. Both routes share this
+/// one body, so the gates below exist once.
+fn selectMidstates(
     allocator: Allocator,
     transaction: tx.Transaction,
     input_index: usize,
     hash_type: u32,
+    pre: ?Precomputed,
 ) Bip143Error!Midstates {
     if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
     const base = hashtype.baseType(hash_type);
@@ -77,62 +163,72 @@ pub fn midstates(
     var hash_prevouts: [32]u8 = [_]u8{0} ** 32;
     var hash_sequence: [32]u8 = [_]u8{0} ** 32;
     if (!anyone_can_pay) {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(allocator);
-        for (transaction.vin) |vin| {
-            try buf.appendSlice(allocator, &vin.prevout.txid);
-            try appendU32LE(&buf, allocator, vin.prevout.vout);
-        }
-        hash_prevouts = hash256.sha256d(buf.items);
+        hash_prevouts = if (pre) |p| p.hash_prevouts else try hashPrevouts(allocator, transaction);
 
         // hashSequence is only meaningful for ALL-like (not NONE/SINGLE).
         if (base != NONE and base != SINGLE) {
-            buf.clearRetainingCapacity();
-            for (transaction.vin) |vin| try appendU32LE(&buf, allocator, vin.sequence);
-            hash_sequence = hash256.sha256d(buf.items);
+            hash_sequence = if (pre) |p| p.hash_sequence else try hashSequence(allocator, transaction);
         }
     }
 
     var hash_outputs: [32]u8 = [_]u8{0} ** 32;
     if (base != NONE and base != SINGLE) {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(allocator);
-        for (transaction.vout) |vout| {
-            try appendI64LE(&buf, allocator, vout.value);
-            try appendCompactSize(&buf, allocator, vout.script_pubkey.len);
-            try buf.appendSlice(allocator, vout.script_pubkey);
-        }
-        hash_outputs = hash256.sha256d(buf.items);
+        hash_outputs = if (pre) |p| p.hash_outputs else try hashOutputs(allocator, transaction);
     } else if (base == SINGLE and input_index < transaction.vout.len) {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(allocator);
-        const vout = transaction.vout[input_index];
-        try appendI64LE(&buf, allocator, vout.value);
-        try appendCompactSize(&buf, allocator, vout.script_pubkey.len);
-        try buf.appendSlice(allocator, vout.script_pubkey);
-        hash_outputs = hash256.sha256d(buf.items);
+        hash_outputs = try hashSingleOutput(allocator, transaction.vout[input_index]);
     }
     // else (SINGLE with input_index >= vout.len): stays all-zero, per BIP143.
 
     return .{ .hash_prevouts = hash_prevouts, .hash_sequence = hash_sequence, .hash_outputs = hash_outputs };
 }
 
-/// The full BIP143 preimage (caller owns the returned slice). `amount_sats`
-/// is the value of the output this input spends (the amount BIP143
-/// commits to that legacy sighash never did).
-pub fn preimage(
+/// The three reusable per-transaction midstates (BIP143 "Specification").
+/// Each is `sha256d` of zero or more fixed-width fields; a field set is
+/// replaced by 32 zero bytes exactly when BIP143 says to omit it (see
+/// inline comments) rather than hashing an empty input.
+///
+/// Recomputes the commitment hashes on every call. Validating a whole
+/// transaction should use `precompute` + `midstatesFrom` instead — see
+/// `Precomputed`.
+pub fn midstates(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u32,
+) Bip143Error!Midstates {
+    return selectMidstates(allocator, transaction, input_index, hash_type, null);
+}
+
+/// `midstates` against an already-computed `Precomputed`. Byte-identical
+/// output; the only difference is that the per-transaction hashes are not
+/// recomputed.
+pub fn midstatesFrom(
+    allocator: Allocator,
+    pre: Precomputed,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u32,
+) Bip143Error!Midstates {
+    return selectMidstates(allocator, transaction, input_index, hash_type, pre);
+}
+
+fn buildPreimage(
     allocator: Allocator,
     transaction: tx.Transaction,
     input_index: usize,
     script_code: []const u8,
     amount_sats: i64,
     hash_type: u32,
+    pre: ?Precomputed,
 ) Bip143Error![]u8 {
-    const mid = try midstates(allocator, transaction, input_index, hash_type);
+    const mid = try selectMidstates(allocator, transaction, input_index, hash_type, pre);
     const vin = transaction.vin[input_index];
 
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
+    // The preimage's size is known exactly: 156 fixed bytes plus the
+    // length-prefixed scriptCode. One allocation, no growth reallocs.
+    try buf.ensureTotalCapacityPrecise(allocator, 156 + tx.compactSizeLen(script_code.len) + script_code.len);
     try appendI32LE(&buf, allocator, transaction.version);
     try buf.appendSlice(allocator, &mid.hash_prevouts);
     try buf.appendSlice(allocator, &mid.hash_sequence);
@@ -148,6 +244,39 @@ pub fn preimage(
     return buf.toOwnedSlice(allocator);
 }
 
+/// The full BIP143 preimage (caller owns the returned slice). `amount_sats`
+/// is the value of the output this input spends (the amount BIP143
+/// commits to that legacy sighash never did).
+///
+/// Recomputes the per-transaction commitment hashes; see `preimageWith`.
+pub fn preimage(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    input_index: usize,
+    script_code: []const u8,
+    amount_sats: i64,
+    hash_type: u32,
+) Bip143Error![]u8 {
+    return buildPreimage(allocator, transaction, input_index, script_code, amount_sats, hash_type, null);
+}
+
+/// `preimage` against an already-computed `Precomputed`. Byte-identical.
+pub fn preimageWith(
+    allocator: Allocator,
+    pre: Precomputed,
+    transaction: tx.Transaction,
+    input_index: usize,
+    script_code: []const u8,
+    amount_sats: i64,
+    hash_type: u32,
+) Bip143Error![]u8 {
+    return buildPreimage(allocator, transaction, input_index, script_code, amount_sats, hash_type, pre);
+}
+
+/// Recomputes the per-transaction commitment hashes on every call, so a
+/// caller looping over inputs (or over the `CHECKSIG`s of one input) pays
+/// `O(n)` per call and `O(n²)` overall. Use `sighashWith` for that; this
+/// entry point remains for one-off signing of a single input.
 pub fn sighash(
     allocator: Allocator,
     transaction: tx.Transaction,
@@ -156,9 +285,27 @@ pub fn sighash(
     amount_sats: i64,
     hash_type: u32,
 ) Bip143Error![32]u8 {
-    const pre = try preimage(allocator, transaction, input_index, script_code, amount_sats, hash_type);
-    defer allocator.free(pre);
-    return hash256.sha256d(pre);
+    const img = try preimage(allocator, transaction, input_index, script_code, amount_sats, hash_type);
+    defer allocator.free(img);
+    return hash256.sha256d(img);
+}
+
+/// `sighash` against an already-computed `Precomputed` — byte-identical
+/// output, `O(1)` commitment hashes per call. This is the entry point a
+/// transaction validator wants: `precompute` once, then call this for every
+/// input and every `CHECKSIG`.
+pub fn sighashWith(
+    allocator: Allocator,
+    pre: Precomputed,
+    transaction: tx.Transaction,
+    input_index: usize,
+    script_code: []const u8,
+    amount_sats: i64,
+    hash_type: u32,
+) Bip143Error![32]u8 {
+    const img = try preimageWith(allocator, pre, transaction, input_index, script_code, amount_sats, hash_type);
+    defer allocator.free(img);
+    return hash256.sha256d(img);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

@@ -43,6 +43,13 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup:
   exposes the same layout with a caller-chosen `spend_type` and optional annex commitment, so
   `bitcoinscript`'s BIP342 script-path message appends its extension to this one rather than
   reproducing a consensus-critical byte order a second time.
+- **`PrecomputedTransactionData`** (`precomputed.zig`) — the per-transaction commitment hashes
+  (BIP143's three midstates, BIP341's five) computed **once per transaction** and reused for every
+  input and every `CHECKSIG`, matching Bitcoin Core's struct of the same name. "Reusable" above is
+  only true if the caller actually holds them: the plain `sighash` entry points recompute on every
+  call, which is `O(n²)` in transaction size on input an attacker chooses — the exact cost BIP143
+  was written to eliminate. A validator wants `precompute` + `bip143.sighashWith` /
+  `bip341.sighashWith`, which are byte-identical to the uncached forms.
 
 Deliberately deferred (structurally noted, not half-built — SPEC.md has the full rationale): BIP342
 tapscript signature hashing itself (the message layout is shared, the tapscript semantics live in

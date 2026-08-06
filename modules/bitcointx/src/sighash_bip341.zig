@@ -47,6 +47,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const hash256 = @import("hash256.zig");
 const bip340 = @import("bip340");
+const instrument = @import("instrument.zig");
 const tx = @import("tx.zig");
 
 pub const SIGHASH_DEFAULT: u8 = 0x00;
@@ -101,6 +102,10 @@ fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.
     try buf.appendSlice(allocator, &tmp);
 }
 
+/// `sha_single_output` — SIGHASH_SINGLE's commitment to the ONE output
+/// matching this input. Per-input by construction (Core computes it per
+/// input too), hence not part of `Precomputed` and not counted by
+/// `instrument`.
 fn shaOutput(allocator: Allocator, vout: tx.TxOut) Allocator.Error![32]u8 {
     var tmp: std.ArrayList(u8) = .empty;
     defer tmp.deinit(allocator);
@@ -108,6 +113,107 @@ fn shaOutput(allocator: Allocator, vout: tx.TxOut) Allocator.Error![32]u8 {
     try appendCompactSize(&tmp, allocator, vout.script_pubkey.len);
     try tmp.appendSlice(allocator, vout.script_pubkey);
     return hash256.sha256(tmp.items);
+}
+
+// ── the five per-transaction commitment hashes ───────────────────────────────
+//
+// Each depends on the TRANSACTION (plus, for two of them, the spent-output
+// set) only — never on `input_index`, never on `hash_type`. Bitcoin Core
+// hoists all five into `PrecomputedTransactionData`
+// (`m_prevouts_single_hash`, `m_spent_amounts_single_hash`,
+// `m_spent_scripts_single_hash`, `m_sequences_single_hash`,
+// `m_outputs_single_hash`); `Precomputed` below is that seam. Rebuilding
+// them per input makes taproot validation `O(n²)` in transaction size on
+// input an attacker chooses.
+//
+// Each is the sole implementation of its byte layout: the cached and the
+// uncached routes through `buildCommonSigMsg` both call these.
+
+fn shaPrevouts(allocator: Allocator, transaction: tx.Transaction) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
+    try tmp.ensureTotalCapacity(allocator, transaction.vin.len * 36);
+    for (transaction.vin) |vin| {
+        try tmp.appendSlice(allocator, &vin.prevout.txid);
+        try appendU32LE(&tmp, allocator, vin.prevout.vout);
+    }
+    return hash256.sha256(tmp.items);
+}
+
+fn shaAmounts(allocator: Allocator, spent_outputs: []const tx.TxOut) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
+    try tmp.ensureTotalCapacity(allocator, spent_outputs.len * 8);
+    for (spent_outputs) |o| try appendI64LE(&tmp, allocator, o.value);
+    return hash256.sha256(tmp.items);
+}
+
+fn shaScriptPubkeys(allocator: Allocator, spent_outputs: []const tx.TxOut) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
+    for (spent_outputs) |o| {
+        try appendCompactSize(&tmp, allocator, o.script_pubkey.len);
+        try tmp.appendSlice(allocator, o.script_pubkey);
+    }
+    return hash256.sha256(tmp.items);
+}
+
+fn shaSequences(allocator: Allocator, transaction: tx.Transaction) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
+    try tmp.ensureTotalCapacity(allocator, transaction.vin.len * 4);
+    for (transaction.vin) |vin| try appendU32LE(&tmp, allocator, vin.sequence);
+    return hash256.sha256(tmp.items);
+}
+
+fn shaOutputs(allocator: Allocator, transaction: tx.Transaction) Allocator.Error![32]u8 {
+    instrument.noteCommitmentHash();
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
+    for (transaction.vout) |vout| {
+        try appendI64LE(&tmp, allocator, vout.value);
+        try appendCompactSize(&tmp, allocator, vout.script_pubkey.len);
+        try tmp.appendSlice(allocator, vout.script_pubkey);
+    }
+    return hash256.sha256(tmp.items);
+}
+
+/// The taproot half of Bitcoin Core's `PrecomputedTransactionData`: the five
+/// per-transaction BIP341 commitment hashes, computed once and reused for
+/// every input and every tapscript `CHECKSIG`.
+///
+/// All five are computed unconditionally (as Core does in
+/// `PrecomputedTransactionData::Init`); which of them a given `hash_type`
+/// actually commits to is decided in `buildCommonSigMsg`, so a cached
+/// caller and an uncached one make the same choice from one piece of code.
+pub const Precomputed = struct {
+    sha_prevouts: [32]u8,
+    sha_amounts: [32]u8,
+    sha_scriptpubkeys: [32]u8,
+    sha_sequences: [32]u8,
+    sha_outputs: [32]u8,
+};
+
+/// Compute the five per-transaction commitment hashes once. `spent_outputs`
+/// is the previous output every `vin[i]` spends, in `vin` order (BIP341
+/// commits to all of them, not just the input being signed).
+pub fn precompute(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    spent_outputs: []const tx.TxOut,
+) Bip341Error!Precomputed {
+    if (spent_outputs.len != transaction.vin.len) return error.PrevoutsCountMismatch;
+    return .{
+        .sha_prevouts = try shaPrevouts(allocator, transaction),
+        .sha_amounts = try shaAmounts(allocator, spent_outputs),
+        .sha_scriptpubkeys = try shaScriptPubkeys(allocator, spent_outputs),
+        .sha_sequences = try shaSequences(allocator, transaction),
+        .sha_outputs = try shaOutputs(allocator, transaction),
+    };
 }
 
 /// `0x00 || SigMsg(hash_type, ext_flag=0)` (key-path spending; the leading
@@ -135,13 +241,14 @@ pub const CommonOptions = struct {
 /// script-path message shares with a key-path one. A tapscript caller appends
 /// its own `ext_flag = 1` fields (tapleaf_hash || key_version || codesep_pos)
 /// to the result.
-pub fn commonSigMsg(
+fn buildCommonSigMsg(
     allocator: Allocator,
     transaction: tx.Transaction,
     input_index: usize,
     hash_type: u8,
     spent_outputs: []const tx.TxOut,
     opts: CommonOptions,
+    pre: ?Precomputed,
 ) Bip341Error![]u8 {
     try validateHashType(hash_type);
     if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
@@ -159,47 +266,14 @@ pub fn commonSigMsg(
     try appendU32LE(&buf, allocator, transaction.locktime);
 
     if (!anyone_can_pay) {
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (transaction.vin) |vin| {
-                try tmp.appendSlice(allocator, &vin.prevout.txid);
-                try appendU32LE(&tmp, allocator, vin.prevout.vout);
-            }
-            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
-        }
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (spent_outputs) |o| try appendI64LE(&tmp, allocator, o.value);
-            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
-        }
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (spent_outputs) |o| {
-                try appendCompactSize(&tmp, allocator, o.script_pubkey.len);
-                try tmp.appendSlice(allocator, o.script_pubkey);
-            }
-            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
-        }
-        {
-            var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            for (transaction.vin) |vin| try appendU32LE(&tmp, allocator, vin.sequence);
-            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
-        }
+        try buf.appendSlice(allocator, &(if (pre) |p| p.sha_prevouts else try shaPrevouts(allocator, transaction)));
+        try buf.appendSlice(allocator, &(if (pre) |p| p.sha_amounts else try shaAmounts(allocator, spent_outputs)));
+        try buf.appendSlice(allocator, &(if (pre) |p| p.sha_scriptpubkeys else try shaScriptPubkeys(allocator, spent_outputs)));
+        try buf.appendSlice(allocator, &(if (pre) |p| p.sha_sequences else try shaSequences(allocator, transaction)));
     }
 
     if (base == SIGHASH_DEFAULT or base == SIGHASH_ALL) {
-        var tmp: std.ArrayList(u8) = .empty;
-        defer tmp.deinit(allocator);
-        for (transaction.vout) |vout| {
-            try appendI64LE(&tmp, allocator, vout.value);
-            try appendCompactSize(&tmp, allocator, vout.script_pubkey.len);
-            try tmp.appendSlice(allocator, vout.script_pubkey);
-        }
-        try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
+        try buf.appendSlice(allocator, &(if (pre) |p| p.sha_outputs else try shaOutputs(allocator, transaction)));
     }
 
     try buf.append(allocator, opts.spend_type);
@@ -229,6 +303,33 @@ pub fn commonSigMsg(
     return buf.toOwnedSlice(allocator);
 }
 
+/// Rebuilds the five per-transaction commitment hashes on every call. A
+/// caller validating a whole transaction should use `commonSigMsgWith`.
+pub fn commonSigMsg(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+    opts: CommonOptions,
+) Bip341Error![]u8 {
+    return buildCommonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, opts, null);
+}
+
+/// `commonSigMsg` against an already-computed `Precomputed`. Byte-identical
+/// output; `O(1)` commitment hashes per call instead of `O(n)`.
+pub fn commonSigMsgWith(
+    allocator: Allocator,
+    pre: Precomputed,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+    opts: CommonOptions,
+) Bip341Error![]u8 {
+    return buildCommonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, opts, pre);
+}
+
 /// The key-path SigMsg: `commonSigMsg` with `spend_type = 0` and no annex.
 pub fn sigMsg(
     allocator: Allocator,
@@ -240,8 +341,22 @@ pub fn sigMsg(
     return commonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, .{});
 }
 
+/// `sigMsg` against an already-computed `Precomputed`. Byte-identical.
+pub fn sigMsgWith(
+    allocator: Allocator,
+    pre: Precomputed,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+) Bip341Error![]u8 {
+    return commonSigMsgWith(allocator, pre, transaction, input_index, hash_type, spent_outputs, .{});
+}
+
 /// `bip340.taggedHash("TapSighash", sigMsg(...))` — `sigMsg` already
 /// includes the leading epoch byte (see its doc comment).
+///
+/// Rebuilds the per-transaction commitment hashes; see `sighashWith`.
 pub fn sighash(
     allocator: Allocator,
     transaction: tx.Transaction,
@@ -250,6 +365,22 @@ pub fn sighash(
     spent_outputs: []const tx.TxOut,
 ) Bip341Error![32]u8 {
     const msg = try sigMsg(allocator, transaction, input_index, hash_type, spent_outputs);
+    defer allocator.free(msg);
+    return bip340.taggedHash("TapSighash", msg);
+}
+
+/// `sighash` against an already-computed `Precomputed` — byte-identical
+/// output, `O(1)` commitment hashes per call. The entry point a transaction
+/// validator wants.
+pub fn sighashWith(
+    allocator: Allocator,
+    pre: Precomputed,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+) Bip341Error![32]u8 {
+    const msg = try sigMsgWith(allocator, pre, transaction, input_index, hash_type, spent_outputs);
     defer allocator.free(msg);
     return bip340.taggedHash("TapSighash", msg);
 }
