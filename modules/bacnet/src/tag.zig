@@ -780,17 +780,31 @@ pub const Reader = struct {
         if (!t.isOpening(n)) return error.UnexpectedTag;
         const start = self.pos;
         var depth: usize = 1;
+        var end = start;
         while (depth > 0) {
+            // Remember where this header began: the body of the block ends
+            // where its *own* closing bracket starts. Backing off from the end
+            // by the width the OPENING number would have been spelled at
+            // assumes the peer spelled both brackets alike, which nothing on
+            // the wire guarantees — `[3 ... ]99` then leaks an octet of the
+            // closing header into the body, and `[99 ... ]3` underflows
+            // `self.pos` into a slice of length ~2^64.
+            const header_at = self.pos;
             const inner = try self.next();
             switch (inner.form) {
                 .opening => depth += 1,
-                .closing => depth -= 1,
+                .closing => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        // The bracket that closes *this* block must carry this
+                        // block's number, exactly as `skip` requires at depth 1.
+                        if (inner.number != n) return error.UnexpectedTag;
+                        end = header_at;
+                    }
+                },
                 .primitive => _ = try self.take(inner.len),
             }
         }
-        // `self.pos` is now just past the closing bracket; the block body ends
-        // one closing-tag header earlier.
-        const end = self.pos - closingHeaderLen(n);
         return self.buf[start..end];
     }
 
@@ -944,11 +958,6 @@ pub const Reader = struct {
         }
     }
 };
-
-/// Octets a closing tag for `n` occupies (1, or 2 for the extended form).
-fn closingHeaderLen(n: u32) usize {
-    return if (n < 15) 1 else 2;
-}
 
 /// Big-endian unsigned of 1..8 octets. Zero octets is *not* zero — BACnet
 /// always writes at least one octet — so it is an error.
@@ -1277,6 +1286,51 @@ test "reader: openedBlock hands back the body without the brackets" {
     try testing.expect(r2.atEnd());
 }
 
+test "reader: openedBlock refuses a closing bracket that is not its own" {
+    // W2-05. A block's body ends where the block's OWN closing bracket starts.
+    // Deriving that end from the *opening* number's width instead lets a peer
+    // spell the closing bracket at a different width and move the end of the
+    // body: one octet late in one direction, and below `start` in the other,
+    // where the `usize` subtraction wraps.
+    const cases = [_]struct { n: u32, bytes: []const u8, what: []const u8 }{
+        // `[3 21 05 ]99` — the closing header is two octets where one was
+        // assumed, so `FF`, half of that header, was handed back as value.
+        .{ .n = 3, .bytes = &.{ 0x3E, 0x21, 0x05, 0xFF, 0x63 }, .what = "[3 ... ]99 (leaks a closing-header octet)" },
+        // `[99 ]3` — one octet where two were assumed. `pos - 2` underflows
+        // below `start`: a Debug panic, and under ReleaseFast a returned slice
+        // of length 2^64-1 that the caller can read from.
+        .{ .n = 99, .bytes = &.{ 0xFE, 0x63, 0x3F }, .what = "[99 ]3 (underflows, empty body)" },
+        // The same inversion with a body, so the identity check is what is
+        // under test and not merely the underflow.
+        .{ .n = 99, .bytes = &.{ 0xFE, 0x63, 0x21, 0x05, 0x3F }, .what = "[99 ... ]3 (underflows, non-empty body)" },
+        // A mismatch at the *same* width. No arithmetic on the opening
+        // number could ever have caught this one: both brackets are one octet.
+        .{ .n = 3, .bytes = &.{ 0x3E, 0x21, 0x05, 0x4F }, .what = "[3 ... ]4 (same width, wrong number)" },
+    };
+
+    // Counted rather than short-circuited: under ReleaseFast one run says how
+    // many of the four shapes are accepted, not just that the first one is.
+    var accepted: usize = 0;
+    for (cases) |c| {
+        var r = Reader.init(c.bytes);
+        if (r.openedBlock(c.n)) |body| {
+            accepted += 1;
+            std.debug.print("accepted {s}: body len {d}\n", .{ c.what, body.len });
+        } else |e| if (e != error.UnexpectedTag) {
+            std.debug.print("{s}: got {s}, want UnexpectedTag\n", .{ c.what, @errorName(e) });
+            return e;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), accepted);
+
+    // A *nested* block still closes normally: only the outermost bracket has
+    // to carry this block's number, exactly as `skip` requires at depth 1.
+    const nested = [_]u8{ 0x3E, 0x4E, 0x21, 0x05, 0x4F, 0x3F };
+    var rn = Reader.init(&nested);
+    try testing.expectEqualSlices(u8, &.{ 0x4E, 0x21, 0x05, 0x4F }, try rn.openedBlock(3));
+    try testing.expect(rn.atEnd());
+}
+
 test "reader: wrong tag is UnexpectedTag" {
     const bytes = [_]u8{ 0x21, 0x05 };
     var r = Reader.init(&bytes);
@@ -1593,6 +1647,39 @@ fn fuzzAppValue(_: void, smith: *std.testing.Smith) !void {
         const before = r.pos;
         _ = r.appValue() catch break;
         if (r.pos <= before) break;
+    }
+}
+
+test "fuzz: openedBlock returns a sub-slice of its input or nothing" {
+    try std.testing.fuzz({}, fuzzOpenedBlock, .{});
+}
+
+/// W2-05 lived through a clean coverage-guided sweep because `openedBlock` was
+/// not fuzzed at all: `fuzzSkip`, `fuzzAppValue` and `fuzzHeaderRoundTrip`
+/// between them cover `skip`, `appValue` and `decodeHeader` and nothing else.
+/// The property that would have caught it is the one `sc.zig`'s harness
+/// already asserts for its own decode — a borrowed slice must lie inside the
+/// buffer it was borrowed from.
+fn fuzzOpenedBlock(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const input = buf[0..len];
+    // Every bracket number a service decoder in this module actually opens,
+    // plus one extended-form number, so a closing bracket of a *different*
+    // width than the opening one is reachable in both directions.
+    for ([_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 99 }) |n| {
+        var r = Reader.init(input);
+        const body = r.openedBlock(n) catch continue;
+        // Checked as a length and an offset, never as a pointer comparison: a
+        // wrapped length is exactly the failure mode here, and `ptr + len`
+        // would wrap with it.
+        if (body.len > input.len) return error.BodyLongerThanInput;
+        const offset = @intFromPtr(body.ptr) - @intFromPtr(input.ptr);
+        if (offset > input.len or offset + body.len > input.len) return error.BodyOutsideInput;
+        if (r.pos > input.len) return error.CursorPastEnd;
+        // The body must end before the closing bracket the cursor just passed.
+        if (offset + body.len > r.pos) return error.BodyOverrunsCursor;
     }
 }
 

@@ -67,6 +67,21 @@ Zig's bitfield-packing rules.
   `MaxApdu` reserved codes (6..15) return `error.InvalidValue` from `octets()`. Guessing a buffer
   size from a reserved code is how a peer gets to choose your allocation.
 
+- **A wire integer that does not fit its field is refused, never narrowed.** BACnet spells an
+  unsigned in 1..8 octets, so a peer chooses the width of every integer it sends, and the fields
+  they land in are `u32`, `u8` and `i32`. Every such conversion in `service.zig` goes through
+  `narrow`, which answers `error.InvalidParameter`. A bare `@intCast` there is wrong in both
+  build modes and differently in each: a *panic* under ReleaseSafe, so one 14-octet datagram from
+  unauthenticated UDP 47808 stops the device; a silent *wrap* under ReleaseFast, where an array
+  index of 2^32 becomes index 0 — which in BACnet is not the first element but the array's
+  **length**, so the device answers a question it was not asked and says nothing about it.
+
+- **A constructed block ends at its own closing bracket.** `Reader.openedBlock(n)` requires the
+  bracket that closes the block to carry number `n`, and takes the end of the body from where that
+  bracket actually starts. The number and the *width* are separate traps: `[3 … ]99` closes two
+  octets wide where one was expected and leaks a header octet into the value, `[99 … ]3` closes
+  one octet wide where two were expected and underflows the body length.
+
 - **Non-exhaustive enums everywhere.** BACnet reserves whole ranges for vendors — object types
   ≥ 128, property identifiers ≥ 512, error codes ≥ 256, network message types ≥ 0x80. A decoder
   that refuses an unnamed value is wrong; every enum here is `_`-terminated and an unknown value

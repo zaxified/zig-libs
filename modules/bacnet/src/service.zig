@@ -28,7 +28,8 @@ pub const Error = tag.Error || error{
     /// not define.
     MissingParameter,
     /// A parameter is present but impossible: a device instance above 2^22-1,
-    /// a priority outside 1..16.
+    /// a priority outside 1..16, or a wire integer too wide for the field it
+    /// would land in (see `narrow`).
     InvalidParameter,
 };
 
@@ -39,6 +40,28 @@ const PropertyIdentifier = types.PropertyIdentifier;
 /// `4194303` is reserved for an unconfigured device and is also what a
 /// `Who-Is` uses as its "no upper bound" sentinel.
 pub const max_instance: u32 = 0x3FFFFF;
+
+/// Narrows a **wire-supplied** integer to the width of the field it lands in,
+/// refusing a value that does not fit instead of truncating it.
+///
+/// Every conversion in this file of a decoded 64-bit wire integer to a
+/// narrower field goes through here. A bare `@intCast` is wrong twice over:
+/// in Debug/ReleaseSafe it *panics*, so an unauthenticated 14-octet datagram
+/// kills the device; in ReleaseFast it *silently wraps*, so a peer asking for
+/// array index 2^32 is served index 0 — which in BACnet is not the first
+/// element but the array's **length**, an entirely different read.
+///
+/// `error.InvalidParameter` is the same answer the hand-guarded sites already
+/// give (`WhoIs.decode`, `IAm.decode`, `WriteProperty`'s priority), so the
+/// reject path a peer sees does not depend on which parameter was oversized.
+fn narrow(comptime T: type, v: anytype) Error!T {
+    const V = @TypeOf(v);
+    if (@typeInfo(V).int.signedness == .signed and v < std.math.minInt(T)) {
+        return error.InvalidParameter;
+    }
+    if (v > std.math.maxInt(T)) return error.InvalidParameter;
+    return @intCast(v);
+}
 
 // ── Who-Is / I-Am (clause 16.10, 16.11) ────────────────────────────────────
 
@@ -141,8 +164,8 @@ pub const WhoHas = struct {
         var out: WhoHas = .{ .target = .{ .object_id = .{ .type = .device, .instance = 0 } } };
         var t = try r.peek();
         if (t.isContext(0)) {
-            out.low = @intCast(try r.ctxUnsigned(0));
-            out.high = @intCast(try r.ctxUnsigned(1));
+            out.low = try narrow(u32, try r.ctxUnsigned(0));
+            out.high = try narrow(u32, try r.ctxUnsigned(1));
             t = try r.peek();
         }
         if (t.isContext(2)) {
@@ -199,7 +222,7 @@ pub const ReadProperty = struct {
         var idx: ?u32 = null;
         if (!r.atEnd()) {
             const t = try r.peek();
-            if (t.isContext(2)) idx = @intCast(try r.ctxUnsigned(2));
+            if (t.isContext(2)) idx = try narrow(u32, try r.ctxUnsigned(2));
         }
         return .{ .object = obj, .property = prop, .array_index = idx };
     }
@@ -229,7 +252,7 @@ pub const ReadPropertyAck = struct {
         var idx: ?u32 = null;
         var t = try r.peek();
         if (t.isContext(2)) {
-            idx = @intCast(try r.ctxUnsigned(2));
+            idx = try narrow(u32, try r.ctxUnsigned(2));
             t = try r.peek();
         }
         return .{
@@ -305,7 +328,7 @@ pub const WriteProperty = struct {
         var idx: ?u32 = null;
         var t = try r.peek();
         if (t.isContext(2)) {
-            idx = @intCast(try r.ctxUnsigned(2));
+            idx = try narrow(u32, try r.ctxUnsigned(2));
         }
         const value = try r.openedBlock(3);
         var prio: ?u8 = null;
@@ -420,7 +443,7 @@ pub const PropertyReferenceIterator = struct {
         var idx: ?u32 = null;
         if (!self.r.atEnd()) {
             const t = try self.r.peek();
-            if (t.isContext(1)) idx = @intCast(try self.r.ctxUnsigned(1));
+            if (t.isContext(1)) idx = try narrow(u32, try self.r.ctxUnsigned(1));
         }
         return .{ .property = prop, .array_index = idx };
     }
@@ -532,7 +555,7 @@ pub const ResultElementIterator = struct {
         var idx: ?u32 = null;
         var t = try self.r.peek();
         if (t.isContext(3)) {
-            idx = @intCast(try self.r.ctxUnsigned(3));
+            idx = try narrow(u32, try self.r.ctxUnsigned(3));
             t = try self.r.peek();
         }
         if (t.isOpening(4)) {
@@ -602,15 +625,15 @@ pub const SubscribeCov = struct {
         const pid = try r.ctxUnsigned(0);
         const obj = try r.ctxObjectId(1);
         if (r.atEnd()) {
-            return .{ .process_id = @intCast(pid), .object = obj };
+            return .{ .process_id = try narrow(u32, pid), .object = obj };
         }
         const c = try r.ctxBool(2);
         const lt = try r.ctxUnsigned(3);
         return .{
-            .process_id = @intCast(pid),
+            .process_id = try narrow(u32, pid),
             .object = obj,
             .confirmed = c,
-            .lifetime = @intCast(lt),
+            .lifetime = try narrow(u32, lt),
         };
     }
 };
@@ -643,10 +666,10 @@ pub const CovNotification = struct {
     pub fn decode(data: []const u8) Error!CovNotification {
         var r = tag.Reader.init(data);
         return .{
-            .process_id = @intCast(try r.ctxUnsigned(0)),
+            .process_id = try narrow(u32, try r.ctxUnsigned(0)),
             .initiating_device = try r.ctxObjectId(1),
             .monitored_object = try r.ctxObjectId(2),
-            .time_remaining = @intCast(try r.ctxUnsigned(3)),
+            .time_remaining = try narrow(u32, try r.ctxUnsigned(3)),
             .values_block = try r.openedBlock(4),
         };
     }
@@ -671,14 +694,14 @@ pub const CovValueIterator = struct {
         var idx: ?u32 = null;
         var t = try self.r.peek();
         if (t.isContext(1)) {
-            idx = @intCast(try self.r.ctxUnsigned(1));
+            idx = try narrow(u32, try self.r.ctxUnsigned(1));
             t = try self.r.peek();
         }
         const value = try self.r.openedBlock(2);
         var prio: ?u8 = null;
         if (!self.r.atEnd()) {
             t = try self.r.peek();
-            if (t.isContext(3)) prio = @intCast(try self.r.ctxUnsigned(3));
+            if (t.isContext(3)) prio = try narrow(u8, try self.r.ctxUnsigned(3));
         }
         return .{ .property = prop, .array_index = idx, .value = value, .priority = prio };
     }
@@ -751,7 +774,7 @@ pub const ReadRange = struct {
         if (r.atEnd()) return out;
         var t = try r.peek();
         if (t.isContext(2)) {
-            idx = @intCast(try r.ctxUnsigned(2));
+            idx = try narrow(u32, try r.ctxUnsigned(2));
             out.array_index = idx;
             if (r.atEnd()) return out;
             t = try r.peek();
@@ -762,8 +785,8 @@ pub const ReadRange = struct {
             const ref = (try br.expectApp(.unsigned)).unsigned;
             const count = (try br.expectApp(.signed)).signed;
             out.range = .{ .by_position = .{
-                .reference_index = @intCast(ref),
-                .count = @intCast(count),
+                .reference_index = try narrow(u32, ref),
+                .count = try narrow(i32, count),
             } };
         } else if (t.isOpening(7)) {
             const body = try r.openedBlock(7);
@@ -771,15 +794,15 @@ pub const ReadRange = struct {
             const seq = (try br.expectApp(.unsigned)).unsigned;
             const count = (try br.expectApp(.signed)).signed;
             out.range = .{ .by_sequence = .{
-                .sequence_number = @intCast(seq),
-                .count = @intCast(count),
+                .sequence_number = try narrow(u32, seq),
+                .count = try narrow(i32, count),
             } };
         } else if (t.isOpening(6)) {
             const body = try r.openedBlock(6);
             var br = tag.Reader.init(body);
             const dt = try DateTime.decodeFrom(&br);
             const count = (try br.expectApp(.signed)).signed;
-            out.range = .{ .by_time = .{ .time = dt, .count = @intCast(count) } };
+            out.range = .{ .by_time = .{ .time = dt, .count = try narrow(i32, count) } };
         }
         return out;
     }
@@ -1273,6 +1296,108 @@ test "hostile service bodies are typed errors" {
     try testing.expectError(error.UnexpectedTag, els.next());
 }
 
+test "ReadProperty-ACK: a value block closed by the wrong bracket is refused" {
+    // W2-05 on a real wire path, not just on `tag.Reader` directly. The peer
+    // opens `[3`, writes an application Real, and closes with `]99`. The old
+    // `openedBlock` measured the body from the *opening* number's width, so
+    // `FF` — the first octet of the two-octet closing header — was handed back
+    // as part of the property value: `ack.value` came out `4442910000ff`
+    // instead of `4442910000`, i.e. the caller's Real gained a trailing octet.
+    const bytes = hex("0c000000051955" ++ "3e" ++ "4442910000" ++ "ff63");
+    try testing.expectError(error.UnexpectedTag, ReadPropertyAck.decode(&bytes));
+
+    // The well-formed neighbour still decodes, so the guard rejects the framing
+    // error and nothing else.
+    const ok = hex("0c000000051955" ++ "3e" ++ "4442910000" ++ "3f");
+    const ack = try ReadPropertyAck.decode(&ok);
+    try testing.expectEqualSlices(u8, &hex("4442910000"), ack.value);
+}
+
+// Entry points that reach a narrowing site which is not at the top level of a
+// service body, so the whole table below can be one shape.
+fn firstCovValue(data: []const u8) Error!CovValue {
+    var vals = (try CovNotification.decode(data)).values();
+    return (try vals.next()) orelse error.MissingParameter;
+}
+fn firstRpmPropertyRef(data: []const u8) Error!PropertyReference {
+    var it = RpmRequestIterator.init(data);
+    var props = ((try it.next()) orelse return error.MissingParameter).properties();
+    return (try props.next()) orelse error.MissingParameter;
+}
+fn firstRpmResultElement(data: []const u8) Error!ResultElement {
+    var it = RpmAckIterator.init(data);
+    var els = ((try it.next()) orelse return error.MissingParameter).results();
+    return (try els.next()) orelse error.MissingParameter;
+}
+
+test "wire integers wider than the field they land in are refused, not truncated" {
+    // W2-01. Every vector below carries a five-octet context or application
+    // integer worth 2^32 where the field it lands in is a u32, u8 or i32.
+    // Before the fix each of these was a bare `@intCast`: in Debug/ReleaseSafe
+    // a *panic*, so a 14-octet datagram from unauthenticated UDP 47808 kills
+    // the device; under ReleaseFast a silent wrap, so an array index of 2^32
+    // becomes index 0 — which in BACnet is not the first element but the
+    // array's **length**. The device then answers a different question than
+    // the one it was asked and nothing on either side notices.
+    //
+    // The table is the *whole* narrowing surface of this file, not a sample.
+    // Its last three rows were already guarded by hand before W2-01 and are
+    // included so the set is closed by enumeration rather than by choice: the
+    // invariant is "every conversion of a decoded wire integer to a narrower
+    // field appears here", and `@intCast` may appear in this file only inside
+    // `narrow` or on a value one of these rows has already range-checked.
+    //
+    // Asserting `error.InvalidParameter` specifically — rather than "some
+    // error" — is what makes a row evidence: a mistake in the vector's framing
+    // would surface as `Truncated`/`UnexpectedTag` and the row would go red.
+    const oversized = .{
+        // decoder, vector, the parameter that is out of range
+        .{ WhoHas.decode, "0d05010000000019012c00000005", "Who-Has low" },
+        .{ WhoHas.decode, "09011d0501000000002c00000005", "Who-Has high" },
+        .{ ReadProperty.decode, "0c0000000519552d050100000000", "ReadProperty arrayIndex" },
+        .{ ReadPropertyAck.decode, "0c0000000519552d0501000000003e21053f", "ReadProperty-ACK arrayIndex" },
+        .{ WriteProperty.decode, "0c0000000519552d0501000000003e21053f", "WriteProperty arrayIndex" },
+        .{ SubscribeCov.decode, "0d0501000000001c00000005", "SubscribeCOV processId (cancellation)" },
+        .{ SubscribeCov.decode, "0d0501000000001c0000000529013901", "SubscribeCOV processId (subscription)" },
+        .{ SubscribeCov.decode, "09011c0000000529013d050100000000", "SubscribeCOV lifetime" },
+        .{ CovNotification.decode, "0d0501000000001c000000052c0000000539014e4f", "COV processId" },
+        .{ CovNotification.decode, "09011c000000052c000000053d0501000000004e4f", "COV timeRemaining" },
+        .{ firstCovValue, "09011c000000052c0000000539014e09551d0501000000002e21052f4f", "COV value arrayIndex" },
+        .{ firstCovValue, "09011c000000052c0000000539014e09552e21052f3d0501000000004f", "COV value priority (u8)" },
+        .{ firstRpmPropertyRef, "0c000000051e09551d0501000000001f", "RPM property-ref arrayIndex" },
+        .{ firstRpmResultElement, "0c000000051e29553d0501000000004e21054f1f", "RPM result arrayIndex" },
+        .{ ReadRange.decode, "0c0000000519552d050100000000", "ReadRange arrayIndex" },
+        .{ ReadRange.decode, "0c0000000519553e2505010000000031053f", "ReadRange by-position referenceIndex" },
+        .{ ReadRange.decode, "0c0000000519553e2105350501000000003f", "ReadRange by-position count (i32)" },
+        .{ ReadRange.decode, "0c0000000519557e2505010000000031057f", "ReadRange by-sequence sequenceNumber" },
+        .{ ReadRange.decode, "0c0000000519557e2105350501000000007f", "ReadRange by-sequence count (i32)" },
+        .{ ReadRange.decode, "0c0000000519556ea4ffffffffb4ffffffff350501000000006f", "ReadRange by-time count (i32)" },
+        .{ WriteProperty.decode, "0c0000000519553e21053f4d050100000000", "WriteProperty priority (guarded before W2-01)" },
+        .{ WhoIs.decode, "0d0501000000001901", "Who-Is low (guarded before W2-01)" },
+        .{ IAm.decode, "c4000000052505010000000091002103", "I-Am maxAPDU (guarded before W2-01)" },
+    };
+
+    // Counted rather than short-circuited, so one run reports how many of the
+    // sites are open, not merely that the first one is.
+    var accepted: usize = 0;
+    inline for (oversized) |case| {
+        const bytes = hex(case[1]);
+        if (case[0](&bytes)) |_| {
+            accepted += 1;
+            std.debug.print("truncated instead of refused: {s}\n", .{case[2]});
+        } else |e| if (e != error.InvalidParameter) {
+            std.debug.print("{s}: got {s}, want InvalidParameter\n", .{ case[2], @errorName(e) });
+            return e;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), accepted);
+
+    // The in-range neighbour of the first vector still decodes, so the guard
+    // refuses the value and not the shape.
+    const ok = try ReadProperty.decode(&hex("0c0000000519552905"));
+    try testing.expectEqual(@as(?u32, 5), ok.array_index);
+}
+
 test "fuzz: service decoders never crash on arbitrary bodies" {
     try std.testing.fuzz({}, fuzzServices, .{});
 }
@@ -1314,5 +1439,201 @@ fn fuzzServices(_: void, smith: *std.testing.Smith) !void {
         while (g2 < 256) : (g2 += 1) {
             _ = (els.next() catch break) orelse break;
         }
+    }
+}
+
+// ── a structure-aware harness for the wire-integer sites ───────────────────
+//
+// W2-01 survived 180 s of clean coverage-guided fuzzing even though
+// `fuzzServices` above *calls* every decoder it lives in. The harness's reach
+// was never the problem: before a decoder gets as far as an array index or a
+// process id it must first accept a structured prefix (`0c <objid> 19 <prop>`),
+// and a corpus of arbitrary bytes never invented one. So the oversized-integer
+// paths were not merely under-explored — they were never entered at all.
+//
+// This harness supplies the structure and lets the fuzzer choose only what a
+// peer chooses: which service, and how many octets each integer field is
+// spelled in. One octet is ordinary traffic; five is `2^32` landing in a `u32`.
+
+/// Emits a context tag `number` carrying `data`, in the short or the extended
+/// length form, exactly as a peer would spell it.
+fn wireCtx(out: []u8, number: u8, data: []const u8) usize {
+    var i: usize = 0;
+    if (data.len < 5) {
+        out[0] = (number << 4) | 0x08 | @as(u8, @intCast(data.len));
+        i = 1;
+    } else {
+        out[0] = (number << 4) | 0x0D;
+        out[1] = @intCast(data.len);
+        i = 2;
+    }
+    @memcpy(out[i..][0..data.len], data);
+    return i + data.len;
+}
+
+/// The same for an application tag.
+fn wireApp(out: []u8, number: u8, data: []const u8) usize {
+    var i: usize = 0;
+    if (data.len < 5) {
+        out[0] = (number << 4) | @as(u8, @intCast(data.len));
+        i = 1;
+    } else {
+        out[0] = (number << 4) | 0x05;
+        out[1] = @intCast(data.len);
+        i = 2;
+    }
+    @memcpy(out[i..][0..data.len], data);
+    return i + data.len;
+}
+
+fn wireRaw(out: []u8, data: []const u8) usize {
+    @memcpy(out[0..data.len], data);
+    return data.len;
+}
+
+test "fuzz: a wire integer of any width never truncates into a service field" {
+    try std.testing.fuzz({}, fuzzServiceIntegers, .{});
+}
+
+fn fuzzServiceIntegers(_: void, smith: *std.testing.Smith) !void {
+    var digits: [8]u8 = undefined;
+    smith.bytes(&digits);
+    const width: usize = smith.valueRangeAtMost(u8, 1, 8);
+    const int = digits[0..width];
+    const which = smith.valueRangeAtMost(u8, 0, 18);
+
+    const oid = [_]u8{ 0x00, 0x00, 0x00, 0x05 };
+    const present_value = [_]u8{0x55};
+    const one = [_]u8{0x01};
+
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    switch (which) {
+        // ReadProperty / -ACK / WriteProperty arrayIndex.
+        0, 1, 2 => {
+            n += wireCtx(buf[n..], 0, &oid);
+            n += wireCtx(buf[n..], 1, &present_value);
+            n += wireCtx(buf[n..], 2, int);
+            if (which == 0) {
+                _ = ReadProperty.decode(buf[0..n]) catch {};
+                return;
+            }
+            n += wireRaw(buf[n..], &.{ 0x3E, 0x21, 0x05, 0x3F });
+            if (which == 1) {
+                _ = ReadPropertyAck.decode(buf[0..n]) catch {};
+            } else {
+                _ = WriteProperty.decode(buf[0..n]) catch {};
+            }
+        },
+        // WriteProperty priority.
+        3 => {
+            n += wireCtx(buf[n..], 0, &oid);
+            n += wireCtx(buf[n..], 1, &present_value);
+            n += wireRaw(buf[n..], &.{ 0x3E, 0x21, 0x05, 0x3F });
+            n += wireCtx(buf[n..], 4, int);
+            _ = WriteProperty.decode(buf[0..n]) catch {};
+        },
+        // SubscribeCOV processId, cancellation form.
+        4 => {
+            n += wireCtx(buf[n..], 0, int);
+            n += wireCtx(buf[n..], 1, &oid);
+            _ = SubscribeCov.decode(buf[0..n]) catch {};
+        },
+        // SubscribeCOV processId and lifetime, subscription form.
+        5, 6 => {
+            n += wireCtx(buf[n..], 0, if (which == 5) int else &one);
+            n += wireCtx(buf[n..], 1, &oid);
+            n += wireCtx(buf[n..], 2, &one);
+            n += wireCtx(buf[n..], 3, if (which == 6) int else &one);
+            _ = SubscribeCov.decode(buf[0..n]) catch {};
+        },
+        // COV notification processId / timeRemaining, and its value list's
+        // arrayIndex / priority.
+        7, 8, 9, 10 => {
+            n += wireCtx(buf[n..], 0, if (which == 7) int else &one);
+            n += wireCtx(buf[n..], 1, &oid);
+            n += wireCtx(buf[n..], 2, &oid);
+            n += wireCtx(buf[n..], 3, if (which == 8) int else &one);
+            n += wireRaw(buf[n..], &.{0x4E});
+            if (which == 9 or which == 10) {
+                n += wireCtx(buf[n..], 0, &present_value);
+                if (which == 9) n += wireCtx(buf[n..], 1, int);
+                n += wireRaw(buf[n..], &.{ 0x2E, 0x21, 0x05, 0x2F });
+                if (which == 10) n += wireCtx(buf[n..], 3, int);
+            }
+            n += wireRaw(buf[n..], &.{0x4F});
+            const notif = CovNotification.decode(buf[0..n]) catch return;
+            var vals = notif.values();
+            var guard: usize = 0;
+            while (guard < 8) : (guard += 1) {
+                _ = (vals.next() catch break) orelse break;
+            }
+        },
+        // ReadRange arrayIndex, and the index/count of all three range forms.
+        11, 12, 13, 14, 15, 16, 17 => {
+            n += wireCtx(buf[n..], 0, &oid);
+            n += wireCtx(buf[n..], 1, &present_value);
+            if (which == 11) n += wireCtx(buf[n..], 2, int);
+            switch (which) {
+                12, 13 => { // by position: [3] Unsigned, Signed
+                    n += wireRaw(buf[n..], &.{0x3E});
+                    n += wireApp(buf[n..], 2, if (which == 12) int else &one);
+                    n += wireApp(buf[n..], 3, if (which == 13) int else &one);
+                    n += wireRaw(buf[n..], &.{0x3F});
+                },
+                14, 15 => { // by sequence: [7] Unsigned, Signed
+                    n += wireRaw(buf[n..], &.{0x7E});
+                    n += wireApp(buf[n..], 2, if (which == 14) int else &one);
+                    n += wireApp(buf[n..], 3, if (which == 15) int else &one);
+                    n += wireRaw(buf[n..], &.{0x7F});
+                },
+                16, 17 => { // by time: [6] Date, Time, Signed
+                    n += wireRaw(buf[n..], &.{0x6E});
+                    n += wireApp(buf[n..], 10, &.{ 0xFF, 0xFF, 0xFF, 0xFF });
+                    n += wireApp(buf[n..], 11, &.{ 0xFF, 0xFF, 0xFF, 0xFF });
+                    n += wireApp(buf[n..], 3, if (which == 17) int else &one);
+                    n += wireRaw(buf[n..], &.{0x6F});
+                },
+                else => {},
+            }
+            _ = ReadRange.decode(buf[0..n]) catch {};
+        },
+        // Who-Has low/high, then the two RPM iterators' arrayIndex.
+        else => {
+            n += wireCtx(buf[n..], 0, int);
+            n += wireCtx(buf[n..], 1, int);
+            n += wireCtx(buf[n..], 2, &oid);
+            _ = WhoHas.decode(buf[0..n]) catch {};
+
+            n = 0;
+            n += wireCtx(buf[n..], 0, &oid);
+            n += wireRaw(buf[n..], &.{0x1E});
+            n += wireCtx(buf[n..], 0, &present_value);
+            n += wireCtx(buf[n..], 1, int);
+            n += wireRaw(buf[n..], &.{0x1F});
+            var req = RpmRequestIterator.init(buf[0..n]);
+            if (req.next() catch null) |spec| {
+                var props = spec.properties();
+                var guard: usize = 0;
+                while (guard < 8) : (guard += 1) {
+                    _ = (props.next() catch break) orelse break;
+                }
+            }
+
+            n = 0;
+            n += wireCtx(buf[n..], 0, &oid);
+            n += wireRaw(buf[n..], &.{0x1E});
+            n += wireCtx(buf[n..], 2, &present_value);
+            n += wireCtx(buf[n..], 3, int);
+            n += wireRaw(buf[n..], &.{ 0x4E, 0x21, 0x05, 0x4F, 0x1F });
+            var ack = RpmAckIterator.init(buf[0..n]);
+            if (ack.next() catch null) |res| {
+                var els = res.results();
+                var guard: usize = 0;
+                while (guard < 8) : (guard += 1) {
+                    _ = (els.next() catch break) orelse break;
+                }
+            }
+        },
     }
 }
