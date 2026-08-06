@@ -773,4 +773,3 @@ test "indexing the anchor table did not change what anchors mean" {
     }
     try testing.expectError(error.UnknownAlias, compose(testing.allocator, "&x 1\n---\n*x\n", .{}));
 }
-

@@ -98,9 +98,23 @@ accounting.
   planned arc; adding it back is a one-line change if a future
   compressed-encoding consumer ever appears, but it would currently be
   dead, untested code.
-- **Montgomery-storage / canonical-storage convention: identical to
-  `bls12_381`** (`Fp`/`Fr` store canonically at rest; see `fp.zig`'s
-  module doc comment).
+- **Montgomery-storage / canonical-storage convention: `Fp` matches
+  `bls12_381` (canonical at rest, see `fp.zig`'s module doc comment);
+  `Fr` does NOT — it stores in Montgomery form.** `std.crypto.ff`'s
+  `Modulus.mul` preserves its first operand's form, so two canonical
+  operands cost **four** Montgomery multiplications per field multiply
+  (and `sq` costs three, the 3:4 `square`:`mul` ratio that exposed
+  this), while two Montgomery operands cost one. `Fr` is the field
+  Poseidon hashing, Groth16 witnesses and scalar multiplication live
+  in, so it converts in `fromBytes`/`reduceWide` and back in `toBytes`
+  and holds Montgomery form in between — measured 4.0× on `Fr.mul`,
+  3.0× on `Fr.square` and 4.4× on a `poseidon` `t = 3` permutation,
+  with every byte-exact KAT in this module and in `groth16`/`poseidon`
+  unchanged. The invariant (every `Fr` a constructor or operation
+  yields is in Montgomery form) is load-bearing, because `ff.Fe.eql`
+  ignores the form flag; `scalar.zig` asserts it directly in a test.
+  `Fp` is deliberately left alone here — it is a separate change with
+  the pairing KATs as its own acceptance surface.
 - **`G1`'s cofactor is 1 — a load-bearing fact, not a simplification.**
   BN254's defining polynomial family gives `#E(Fp) = p + 1 - t = r`
   EXACTLY (`t = 6x^2+1`, confirmed `p + 1 - t == r` symbolically — see

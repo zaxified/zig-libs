@@ -6,9 +6,10 @@
 //! future Groth16-verifier part — see `README.md`'s multi-part arc).
 //!
 //! **Status: implemented** — all arithmetic delegates to
-//! `std.crypto.ff` with the same canonical-storage convention as
-//! `fp.zig` (see that file's convention note above `Fp.add`). Same
-//! construction as `bls12_381/src/scalar.zig`, adapted to BN254's
+//! `std.crypto.ff`, but — unlike `fp.zig` — this type stores its
+//! elements in **Montgomery form** rather than canonical form; see the
+//! storage-convention note on `Fr` for what that buys and what it
+//! obliges. Same construction as `bls12_381/src/scalar.zig`, adapted to BN254's
 //! `r` — which, unlike BLS12-381 (`Fp`: 381 bits / `Fr`: 255 bits, two
 //! different container widths), happens to be the SAME 254-bit
 //! magnitude class as `Fp` (`p` and `r` are both 254 bits), so `Fr`
@@ -57,27 +58,61 @@ pub const modulus: FfModulus = blk: {
 
 pub const FrError = std.crypto.ff.OverflowError || std.crypto.ff.FieldElementError;
 
+/// Convert a canonical `Fe` into Montgomery form — the storage convention
+/// of every `Fr` value. See the `Fr` doc comment.
+fn intoMontgomery(fe: FfFe) FfFe {
+    var x = fe;
+    modulus.toMontgomery(&x) catch unreachable; // only errors if already Montgomery
+    return x;
+}
+
 /// An element of the BN254 scalar field `GF(r)`.
+///
+/// ## Storage convention: Montgomery form, always
+///
+/// `fe` is held in **Montgomery form** (`fe.montgomery == true` for every
+/// value this type ever produces), converted in `fromBytes`/`reduceWide` on
+/// the way in and in `toBytes` on the way out. It is NOT the canonical-storage
+/// convention `fp.zig` uses.
+///
+/// This is a performance property with a correctness edge, so both halves
+/// matter. `std.crypto.ff`'s `Modulus.mul` "preserves the first operand's
+/// form": given two canonical operands it runs `toMontgomery(x)`,
+/// `toMontgomery(y)`, `montgomeryMul`, `fromMontgomery` — **four** Montgomery
+/// multiplications to do one field multiply, and `sq` runs three. Given two
+/// Montgomery operands it runs exactly one. Since `Fr` is the field Poseidon,
+/// Groth16 witnesses and every scalar multiplication live in, that factor is
+/// the difference between a usable and an unusable field: the measured
+/// `square`:`mul` ratio of exactly 3:4 was the fingerprint of the defect.
+///
+/// The correctness edge: `ff.Fe.eql` compares the raw value and ignores the
+/// form, so a canonical `Fe` and a Montgomery `Fe` of the same field element
+/// compare **unequal**. That is safe only because the invariant holds for
+/// every constructor here — `zero`, `one`, `fromBytes`, `reduceWide`, and the
+/// arithmetic, all of which either produce Montgomery output or (in `pow`/
+/// `inv`) restore the input's form. Anything added to this type must keep it;
+/// the regression test at the bottom of this file asserts it directly.
 pub const Fr = struct {
     fe: FfFe,
 
     /// Fixed-size big-endian wire encoding: 32 bytes.
     pub const encoded_bytes = 32;
 
-    pub const zero: Fr = .{ .fe = modulus.zero };
-    pub const one: Fr = .{ .fe = modulus.one() };
+    pub const zero: Fr = .{ .fe = intoMontgomery(modulus.zero) };
+    pub const one: Fr = .{ .fe = intoMontgomery(modulus.one()) };
 
     /// Parses a big-endian 32-byte value, REJECTING anything `>= r`. REAL.
     pub fn fromBytes(bytes: [encoded_bytes]u8) FrError!Fr {
-        return .{ .fe = try FfFe.fromBytes(modulus, &bytes, .big) };
+        return .{ .fe = intoMontgomery(try FfFe.fromBytes(modulus, &bytes, .big)) };
     }
 
-    /// Serializes to big-endian 32 bytes. REAL, provided canonical
-    /// (non-Montgomery) storage at the struct boundary — see `fp.zig`'s
-    /// module doc comment for the same caveat, applied here to `Fr`.
+    /// Serializes to big-endian 32 bytes. REAL — the Montgomery factor is
+    /// removed here, which is the only place the wire encoding is produced.
     pub fn toBytes(self: Fr) [encoded_bytes]u8 {
+        var canonical = self.fe;
+        modulus.fromMontgomery(&canonical) catch unreachable; // invariant: always Montgomery
         var out: [encoded_bytes]u8 = undefined;
-        self.fe.toBytes(&out, .big) catch unreachable;
+        canonical.toBytes(&out, .big) catch unreachable;
         return out;
     }
 
@@ -143,7 +178,7 @@ pub const Fr = struct {
     pub fn reduceWide(bytes: []const u8) Fr {
         std.debug.assert(bytes.len <= 64);
         const wide = std.crypto.ff.Uint(512).fromBytes(bytes, .big) catch unreachable;
-        return .{ .fe = modulus.reduce(wide) };
+        return .{ .fe = intoMontgomery(modulus.reduce(wide)) };
     }
 
     /// A uniformly random scalar. Same rejection-sampling shape as
@@ -250,6 +285,52 @@ test "Fr.reduceWide: r reduces to 0, r+1 to 1, canonical values unchanged, 64-by
     var expected_bytes: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected_bytes, "0216d0b17f4e44a58c49833d53bb808553fe3ab1e35c59e31bb8e645ae216da6");
     try std.testing.expectEqualSlices(u8, &expected_bytes, &Fr.reduceWide(&wide).toBytes());
+}
+
+test "Fr stores Montgomery form: every constructor and every operation" {
+    // The performance defect this pins: with canonical storage,
+    // `std.crypto.ff`'s `Modulus.mul` does FOUR Montgomery multiplications per
+    // field multiply (toMontgomery(x), toMontgomery(y), montgomeryMul,
+    // fromMontgomery) and `sq` does three — the measured 3:4 `square`:`mul`
+    // ratio. With Montgomery storage each is exactly one. There is no counter
+    // to read, so the representation itself is the assertion: it is a property
+    // of the stored value, checked without a clock.
+    var a_bytes = [_]u8{0} ** 32;
+    a_bytes[31] = 0xef;
+    a_bytes[0] = 0x11;
+    const a = try Fr.fromBytes(a_bytes);
+    const b = try Fr.fromBytes([_]u8{0} ** 31 ++ [_]u8{3});
+
+    // Every constructor.
+    try std.testing.expect(Fr.zero.fe.montgomery);
+    try std.testing.expect(Fr.one.fe.montgomery);
+    try std.testing.expect(a.fe.montgomery);
+    try std.testing.expect(Fr.reduceWide(&([_]u8{0xff} ** 64)).fe.montgomery);
+
+    // Every operation — `mul`/`sq` only take the one-Montgomery-op fast path
+    // when BOTH operands are already in Montgomery form.
+    try std.testing.expect(a.add(b).fe.montgomery);
+    try std.testing.expect(a.sub(b).fe.montgomery);
+    try std.testing.expect(a.neg().fe.montgomery);
+    try std.testing.expect(a.mul(b).fe.montgomery);
+    try std.testing.expect(a.square().fe.montgomery);
+    try std.testing.expect((try a.inv()).fe.montgomery);
+    try std.testing.expect(a.pow([_]u8{0} ** 31 ++ [_]u8{5}).fe.montgomery);
+
+    // ...and the flag is not merely set on an unconverted value: `one` is
+    // stored as `R mod r`, which is not 1. (A `.montgomery = true` slapped
+    // onto canonical limbs would pass every check above and produce garbage.)
+    var one_limbs: [32]u8 = undefined;
+    // `Fe.toBytes` refuses a Montgomery value outright, which is itself part of
+    // the proof; read the raw `Uint` underneath instead.
+    try std.testing.expectError(error.UnexpectedRepresentation, Fr.one.fe.toBytes(&one_limbs, .big));
+    Fr.one.fe.v.toBytes(&one_limbs, .big) catch unreachable;
+    var canonical_one = [_]u8{0} ** 32;
+    canonical_one[31] = 1;
+    try std.testing.expect(!std.mem.eql(u8, &one_limbs, &canonical_one));
+    // The round trip still yields exactly 1, i.e. the factor is removed on the
+    // way out — this is what keeps every byte-exact KAT in this repo passing.
+    try std.testing.expectEqualSlices(u8, &canonical_one, &Fr.one.toBytes());
 }
 
 test "Fr.random produces canonical, distinct draws" {

@@ -93,8 +93,17 @@ not hardened against adversarial hash-collision flooding; intended for trusted i
 strings, URLs), not attacker-chosen keys. No persistence — `on_evict`/dirty-set (see above) is a
 *seam* for a caller-built write-behind layer, not persistence itself; the cache does no I/O and
 `on_evict` must not call back into the `Cache` (reentrancy mid-removal, e.g. during `clear`'s
-iteration, is unsupported). An item larger than `max_bytes` is never stored. Region scans are
-linear — fine for a hot query/fetch cache's modest entry counts, not a million-entry store.
+iteration, is unsupported). An item larger than `max_bytes` is never stored. Victim
+selection is **O(1)**: a binary min-heap per region ordered by the logical access tick, plus one
+over TTL deadlines, so `regionLruKey` and `findExpiredKey` read a heap root instead of walking the
+map. Each entry carries a small stable index node (a separate allocation, because a hash map moves
+its values on rehash) and heap maintenance is O(log n) with no hashing. Until 2026-08-07 those two
+functions were full-map scans and `maintain` ran up to three of them on **every** insert, making one
+insert O(`max_entries`) — measured on `pagecache` at 1.98 → 93.5 us per 4 KiB page fill from 64 to
+4096 pages, against 1.33 → 0.80 us now, with the per-insert entry-visit count flat at ~2 instead of
+rising to ~10 200. The heaps are ordered by the same global tick the scans compared, and ticks are
+unique per live entry, so the entry chosen is *identical* to the one the scan chose: this is a
+complexity change, not a policy change.
 
 ## Verification
 
@@ -105,6 +114,9 @@ stats. Sketch tests: exact estimate for a lone key, CMS never underestimates und
 saturation at 15(+1 doorkeeper), aging halves + clears the doorkeeper. W-TinyLFU behavior: admission
 gate, scan resistance (a 150-key one-hit burst doesn't evict a 20-key hot set), and a 60k-op
 Zipf-skewed hit-ratio benchmark asserting W-TinyLFU beats an inline plain-LRU baseline by ≥10%.
+Complexity: a counter-based (not clock-based) regression test asserts the per-insert entry-visit
+count of the eviction path does not grow when capacity goes from 64 to 4096, plus an expired-first
+test with one TTL entry buried among seven that never expire.
 Write-behind seam: `on_evict` fires on W-TinyLFU eviction / replacement / clear with the correct
 key+value+dirty+reason and does *not* fire on a plain hit or miss (positive control); dirty set on
 `put`, cleared by `markClean`, `markClean` on an absent key is a no-op; `drainDirty` visits exactly

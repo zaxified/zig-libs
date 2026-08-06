@@ -1780,4 +1780,3 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 test {
     _ = @import("xmlconf_test.zig");
 }
-

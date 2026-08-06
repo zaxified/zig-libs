@@ -421,4 +421,3 @@ test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.generator));
     try std.testing.expect(!verifyRoundPoints(g2.Affine.generator, 1, g1.Affine.identity));
 }
-
