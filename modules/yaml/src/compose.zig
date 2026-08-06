@@ -188,6 +188,21 @@ const Composer = struct {
     p: *parser.Parser,
     options: Options,
     anchors: std.ArrayList(Anchor) = .empty,
+    /// Anchor name → index into `anchors`. Without it, both defining an anchor
+    /// and resolving an alias scan the whole table, so a document is O(a²) in
+    /// the number of anchors it declares — and nothing caps that number:
+    /// `max_nodes` bounds nodes, and the cost here is comparisons. Measured
+    /// before this index (ReleaseFast, best of 5): 8.7 / 35.5 / 142.5 ms at
+    /// 2000 / 4000 / 8000 anchors = 4.0× per doubling, against 1.11 / 2.16 /
+    /// 4.74 ms = 1.95× for the same document with the anchors removed. With
+    /// it: 1.26 / 2.47 / 5.28 ms = 2.0×, i.e. 1.2× the anchor-free control
+    /// instead of 30×. The array stays as the storage so slot indices (and
+    /// `finishAnchor`) are unaffected.
+    anchor_index: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Anchor-table entries examined: one per lookup for the hash index, one
+    /// per entry walked for a linear scan. Lets a regression test pin the
+    /// complexity class with a deterministic number rather than a stopwatch.
+    anchor_probes: usize = 0,
     nodes: usize = 0,
     /// One-event pushback, so a collection can test for its end marker.
     peeked: ?Event = null,
@@ -218,6 +233,7 @@ const Composer = struct {
                 .document_start => {
                     // Anchors do not cross document boundaries (YAML 1.2 §3.2.2).
                     self.anchors.clearRetainingCapacity();
+                    self.anchor_index.clearRetainingCapacity();
                     const root = try self.composeNode(0);
                     const end = (try self.next()) orelse return error.InvalidYaml;
                     if (end != .document_end) return error.InvalidYaml;
@@ -240,14 +256,18 @@ const Composer = struct {
     fn beginAnchor(self: *Composer, name: ?[]const u8) Error!?usize {
         const n = name orelse return null;
         // A repeated anchor name rebinds it; later aliases see the newer node
-        // (YAML 1.2 §3.2.2 — anchors are not required to be unique).
-        for (self.anchors.items, 0..) |*a, i| {
-            if (std.mem.eql(u8, a.name, n)) {
-                a.* = .{ .name = a.name, .value = .null, .in_progress = true };
-                return i;
-            }
+        // (YAML 1.2 §3.2.2 — anchors are not required to be unique). A name
+        // therefore occupies exactly one slot, which is what lets the index be
+        // a plain name → slot map with no chaining.
+        self.anchor_probes += 1;
+        const gop = try self.anchor_index.getOrPut(self.alloc, n);
+        if (gop.found_existing) {
+            const i = gop.value_ptr.*;
+            self.anchors.items[i] = .{ .name = self.anchors.items[i].name, .value = .null, .in_progress = true };
+            return i;
         }
         try self.anchors.append(self.alloc, .{ .name = n, .value = .null, .in_progress = true });
+        gop.value_ptr.* = self.anchors.items.len - 1;
         return self.anchors.items.len - 1;
     }
 
@@ -262,12 +282,11 @@ const Composer = struct {
         const ev = (try self.next()) orelse return error.InvalidYaml;
         switch (ev) {
             .alias => |a| {
-                for (self.anchors.items) |anc| {
-                    if (!std.mem.eql(u8, anc.name, a.anchor)) continue;
-                    if (anc.in_progress) return error.AliasCycle;
-                    return anc.value;
-                }
-                return error.UnknownAlias;
+                self.anchor_probes += 1;
+                const slot = self.anchor_index.get(a.anchor) orelse return error.UnknownAlias;
+                const anc = self.anchors.items[slot];
+                if (anc.in_progress) return error.AliasCycle;
+                return anc.value;
             },
             .scalar => |s| {
                 const slot = try self.beginAnchor(s.anchor);
@@ -703,3 +722,55 @@ test "'---' as a mapping value, not at column 0, is plain content — not a docu
     try testing.expectEqualStrings("---", r.root.get("a").?.string);
     try testing.expectEqual(@as(i64, 1), r.root.get("b").?.int);
 }
+
+test "the anchor table is indexed, so a document full of anchors is linear, not quadratic" {
+    // Nothing caps how many anchors a document may declare — `max_nodes`
+    // bounds nodes, and a linear anchor table's cost is *comparisons*, one
+    // scan per definition and one per alias. Measured before the index:
+    // 8.7/35.5/142.5 ms at 2000/4000/8000 anchors = 4.0× per doubling,
+    // against 1.95× for the identical anchor-free document — a 128 KB input
+    // costing 30× the linear control, and the ratio grows with n.
+    //
+    // Assert the complexity, not the clock: `anchor_probes` counts table
+    // entries examined, so this is deterministic on any machine.
+    const gpa = testing.allocator;
+    const n = 2000;
+
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    for (0..n) |i| try src.print(gpa, "- &a{d} x\n", .{i});
+    for (0..n) |i| try src.print(gpa, "- *a{d}\n", .{i});
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var p = parser.Parser.init(arena.allocator(), src.items);
+    defer p.deinit();
+    var c: Composer = .{ .alloc = arena.allocator(), .p = &p, .options = .{} };
+    const docs = try c.run();
+
+    try testing.expectEqual(@as(usize, 1), docs.len);
+    try testing.expectEqual(@as(usize, 2 * n), docs[0].sequence.len);
+    try testing.expectEqualStrings("x", docs[0].sequence[2 * n - 1].string);
+    // 2n lookups; a scan-based table would spend ~n²/2 = 2 000 000 here.
+    try testing.expect(c.anchor_probes <= 4 * n);
+}
+
+test "indexing the anchor table did not change what anchors mean" {
+    // The index must answer exactly as the scan did: last definition wins,
+    // a dangling alias is `UnknownAlias`, an ancestor reference is
+    // `AliasCycle`, a sibling alias is fine, and nothing survives `---`.
+    {
+        const r = try single("a: &x 1\nb: &x 2\nc: *x\n");
+        defer r.deinit();
+        try testing.expectEqual(@as(i64, 2), r.root.get("c").?.int);
+    }
+    try testing.expectError(error.UnknownAlias, compose(testing.allocator, "[*nope]\n", .{}));
+    try testing.expectError(error.AliasCycle, compose(testing.allocator, "&r [*r]\n", .{}));
+    {
+        const r = try single("[&s x, *s]\n");
+        defer r.deinit();
+        try testing.expectEqualStrings("x", r.root.sequence[1].string);
+    }
+    try testing.expectError(error.UnknownAlias, compose(testing.allocator, "&x 1\n---\n*x\n", .{}));
+}
+

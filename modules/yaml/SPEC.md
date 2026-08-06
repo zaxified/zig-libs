@@ -263,6 +263,19 @@ that would expand to 2^n nodes composes into n. A consumer that walks the DAG
 *as if* it were a tree still sees 2^n paths — inherent to the format, and why
 `Options.max_nodes` exists as a second bound.
 
+The anchor **table** is a third, easily missed cost. Nothing in the format caps
+how many anchors a document may declare — an anchor is one `&name` token, and
+`max_nodes` bounds nodes rather than comparisons — so a table that is scanned
+linearly on definition *and* on alias resolution makes composing O(anchors²).
+Measured on the array-scan version (ReleaseFast, best of 5): 8.7 / 35.5 /
+142.5 ms at 2000 / 4000 / 8000 anchors = 4.0× per doubling, against 1.11 / 2.16 /
+4.74 ms = 1.95× for the same document with the anchors removed — a 128 KB input
+already 30× the anchor-free cost, and the ratio grows with n. With the index:
+1.26 / 2.47 / 5.28 ms = 2.0× per doubling, 1.2× the anchor-free control.
+`Composer` therefore keeps a name → slot index beside the array; the array
+remains the storage so slot identity and `finishAnchor` are unchanged. Pinned by
+`compose.zig`'s `anchor_probes` counter rather than by a wall-clock assertion.
+
 ## 8. Integer range — the one place resolution is lossy
 
 `Value.int` is an `i64`. An int-shaped scalar that does not fit stays a

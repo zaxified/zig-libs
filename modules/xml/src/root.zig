@@ -332,6 +332,13 @@ pub const ParseError = error{
 /// memory (backed by an arena whose child allocator is `gpa`); call
 /// `Document.deinit`. On error nothing is leaked.
 pub fn parse(gpa: std.mem.Allocator, source: []const u8, options: Options) ParseError!Document {
+    return parseCounted(gpa, source, options, null);
+}
+
+/// `parse`, with an optional work counter. Test-only seam: it lets a regression
+/// test pin the *complexity* of duplicate detection with a deterministic number
+/// instead of a stopwatch. `stats == null` is the production path.
+fn parseCounted(gpa: std.mem.Allocator, source: []const u8, options: Options, stats: ?*Stats) ParseError!Document {
     if (!std.unicode.utf8ValidateSlice(source)) return error.InvalidCharacter;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -344,6 +351,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, options: Options) Parse
         .a = a,
         .opts = options,
         .ids = .empty,
+        .stats = stats,
     };
 
     // Optional UTF-8 BOM.
@@ -387,6 +395,44 @@ const Name = struct {
     local: []const u8,
 };
 
+/// Deterministic work counters. `dup_compares` counts the units of work spent
+/// on per-element duplicate detection: one per name comparison on the direct
+/// scan, one per hash-set probe on the hashed path. A regression test asserts a
+/// linear bound on it, which pins the complexity class without a stopwatch.
+const Stats = struct {
+    dup_compares: usize = 0,
+};
+
+/// Duplicate detection rescans the list it is building, which is O(k²) in the
+/// number of attributes (or namespace declarations) on one element — and
+/// `Options.max_attributes` caps that count, not the CPU it costs. Above this
+/// many entries the scan runs through a hash set instead, which is O(k); below
+/// it the direct scan wins, because a hash set costs an allocation and the
+/// overwhelming majority of real elements carry a handful of attributes.
+const dup_scan_threshold = 16;
+
+/// An attribute's expanded name (namespace URI + local name), hashed as a unit
+/// so the duplicate check needs no concatenated key and so no allocation.
+const ExpandedName = struct {
+    uri: []const u8,
+    local: []const u8,
+
+    const Context = struct {
+        pub fn hash(_: Context, k: ExpandedName) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(k.uri);
+            h.update(&[_]u8{0}); // separator: ("a","bc") must not hash as ("ab","c")
+            h.update(k.local);
+            return h.final();
+        }
+        pub fn eql(_: Context, a: ExpandedName, b: ExpandedName) bool {
+            return std.mem.eql(u8, a.uri, b.uri) and std.mem.eql(u8, a.local, b.local);
+        }
+    };
+
+    const Set = std.HashMapUnmanaged(ExpandedName, void, Context, std.hash_map.default_max_load_percentage);
+};
+
 const Parser = struct {
     src: []const u8,
     i: usize,
@@ -394,6 +440,33 @@ const Parser = struct {
     opts: Options,
     ids: std.StringHashMapUnmanaged(*Element),
     stack: std.ArrayList(Open) = .empty,
+    stats: ?*Stats = null,
+
+    fn countCompares(self: *Parser, n: usize) void {
+        if (self.stats) |s| s.dup_compares += n;
+    }
+
+    fn countCompare(self: *Parser) void {
+        self.countCompares(1);
+    }
+
+    /// Has `pfx` already been declared on this element? `use_hash` selects the
+    /// O(1) set over the O(d) rescan; both answer identically.
+    fn nsAlreadyDeclared(
+        self: *Parser,
+        seen: *std.StringHashMapUnmanaged(void),
+        use_hash: bool,
+        decls: []const NsDecl,
+        pfx: []const u8,
+    ) ParseError!bool {
+        self.countCompare();
+        if (use_hash) return (try seen.getOrPut(self.a, pfx)).found_existing;
+        for (decls) |d| {
+            self.countCompare();
+            if (std.mem.eql(u8, d.prefix, pfx)) return true;
+        }
+        return false;
+    }
 
     fn eof(self: *Parser) bool {
         return self.i >= self.src.len;
@@ -798,10 +871,13 @@ const Parser = struct {
         // Split raw attributes into namespace declarations and real attributes.
         var ns_decls: std.ArrayList(NsDecl) = .empty;
         var attrs: std.ArrayList(Attribute) = .empty;
+        var seen_ns: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen_ns.deinit(self.a);
+        const hash_ns = raw.items.len > dup_scan_threshold;
         for (raw.items) |ra| {
             if (ra.name.prefix.len == 0 and std.mem.eql(u8, ra.name.local, "xmlns")) {
                 // default namespace declaration
-                for (ns_decls.items) |d| if (d.prefix.len == 0) return error.NamespaceError;
+                if (try self.nsAlreadyDeclared(&seen_ns, hash_ns, ns_decls.items, "")) return error.NamespaceError;
                 // xmlns="..." — value may be "" (undeclare). May not be the
                 // reserved xmlns URI.
                 if (std.mem.eql(u8, ra.value, xmlns_ns)) return error.NamespaceError;
@@ -817,7 +893,7 @@ const Parser = struct {
                     if (std.mem.eql(u8, ra.value, xml_ns)) return error.NamespaceError; // xml URI reserved
                     if (std.mem.eql(u8, ra.value, xmlns_ns)) return error.NamespaceError;
                 }
-                for (ns_decls.items) |d| if (std.mem.eql(u8, d.prefix, pfx)) return error.NamespaceError;
+                if (try self.nsAlreadyDeclared(&seen_ns, hash_ns, ns_decls.items, pfx)) return error.NamespaceError;
                 try ns_decls.append(self.a, .{ .prefix = pfx, .uri = ra.value });
             } else {
                 try attrs.append(self.a, .{
@@ -846,20 +922,60 @@ const Parser = struct {
         el.uri = el.resolveNs(name.prefix) orelse return error.UndeclaredNamespacePrefix;
 
         // Resolve attribute namespaces; unprefixed attr → no namespace.
+        // `resolveNs` scans this element's declarations linearly, so with many
+        // attributes *and* many declarations on one element the loop is
+        // O(attrs × decls) — the same quadratic shape as the duplicate checks,
+        // and just as reachable before authentication. Above the threshold,
+        // index this element's own declarations once.
+        var own_ns: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer own_ns.deinit(self.a);
+        const hash_ns_lookup = attrs.items.len > dup_scan_threshold and el.ns_decls.len > dup_scan_threshold;
+        if (hash_ns_lookup) {
+            try own_ns.ensureTotalCapacity(self.a, @intCast(el.ns_decls.len));
+            // A prefix declared twice on one element was rejected above, so
+            // first-wins and only-entry are the same thing here.
+            for (el.ns_decls) |d| own_ns.putAssumeCapacity(d.prefix, d.uri);
+        }
         for (attrs.items) |*at| {
             if (at.prefix.len == 0) {
                 at.uri = "";
             } else if (std.mem.eql(u8, at.prefix, "xmlns")) {
                 return error.NamespaceError;
+            } else if (hash_ns_lookup) {
+                self.countCompare();
+                // Same answer as `el.resolveNs`, in the same precedence order:
+                // a prefix this element declares wins; `xml` is reserved and
+                // may only ever be bound to `xml_ns` (checked above), so the
+                // shortcut and a declaration agree; otherwise the parent axis.
+                at.uri = own_ns.get(at.prefix) orelse blk: {
+                    if (std.mem.eql(u8, at.prefix, "xml")) break :blk xml_ns;
+                    const p = el.parent orelse return error.UndeclaredNamespacePrefix;
+                    break :blk p.resolveNs(at.prefix) orelse return error.UndeclaredNamespacePrefix;
+                };
             } else {
+                // `resolveNs` scans at least this element's own declarations.
+                self.countCompares(el.ns_decls.len + 1);
                 at.uri = el.resolveNs(at.prefix) orelse return error.UndeclaredNamespacePrefix;
             }
         }
-        // Duplicate check by expanded name (uri, local).
-        for (attrs.items, 0..) |a1, idx| {
-            for (attrs.items[idx + 1 ..]) |a2| {
-                if (std.mem.eql(u8, a1.uri, a2.uri) and std.mem.eql(u8, a1.local, a2.local)) {
-                    return error.DuplicateAttribute;
+        // Duplicate check by expanded name (uri, local). O(k) above
+        // `dup_scan_threshold`, direct scan below it — see that constant.
+        if (attrs.items.len > dup_scan_threshold) {
+            var seen: ExpandedName.Set = .empty;
+            defer seen.deinit(self.a);
+            try seen.ensureTotalCapacity(self.a, @intCast(attrs.items.len));
+            for (attrs.items) |at| {
+                self.countCompare();
+                const gop = seen.getOrPutAssumeCapacity(.{ .uri = at.uri, .local = at.local });
+                if (gop.found_existing) return error.DuplicateAttribute;
+            }
+        } else {
+            for (attrs.items, 0..) |a1, idx| {
+                for (attrs.items[idx + 1 ..]) |a2| {
+                    self.countCompare();
+                    if (std.mem.eql(u8, a1.uri, a2.uri) and std.mem.eql(u8, a1.local, a2.local)) {
+                        return error.DuplicateAttribute;
+                    }
                 }
             }
         }
@@ -1524,6 +1640,99 @@ test "security bounds: exact boundary — max_attributes accepted, max_attribute
     try testing.expectError(error.TooManyAttributes, parse(gpa, over_cap.items, .{ .max_attributes = cap }));
 }
 
+test "security bounds: per-element duplicate detection is linear in k, not quadratic" {
+    // `max_attributes` caps how many attributes an element may carry; it does
+    // not cap what they cost. Every duplicate check here used to rescan the
+    // list it was building, so one element at the default cap of 4096 spent
+    // k(k-1)/2 ≈ 8.4 M name comparisons — measured at 89 ms of CPU for a
+    // single 127 KB element, on a parser that runs *before* authentication and
+    // that xmldsig/xmlenc/saml all sit on top of.
+    //
+    // Assert the complexity, not the wall clock: `Stats.dup_compares` counts
+    // the comparisons/probes the three duplicate-detection sites perform, so
+    // this pins O(k) deterministically instead of flaking on a loaded CI box.
+    const gpa = testing.allocator;
+    const k = 2048;
+
+    // (a) plain attributes — the expanded-name duplicate check.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<r");
+        for (0..k) |i| try buf.print(gpa, " a{d}=\"v\"", .{i});
+        try buf.appendSlice(gpa, "/>");
+
+        var st: Stats = .{};
+        var doc = try parseCounted(gpa, buf.items, .{}, &st);
+        defer doc.deinit();
+        try testing.expectEqual(@as(usize, k), doc.root.attributes.len);
+        try testing.expect(st.dup_compares <= 6 * k);
+    }
+
+    // (b) namespace declarations, plus the per-attribute prefix resolution
+    //     that scans them — same quadratic shape, reached by a document that
+    //     declares k prefixes and then uses each of them once.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<r");
+        for (0..k) |i| try buf.print(gpa, " xmlns:p{d}=\"urn:x{d}\"", .{ i, i });
+        for (0..k) |i| try buf.print(gpa, " p{d}:a=\"v\"", .{i});
+        try buf.appendSlice(gpa, "/>");
+
+        var st: Stats = .{};
+        var doc = try parseCounted(gpa, buf.items, .{}, &st);
+        defer doc.deinit();
+        try testing.expectEqual(@as(usize, k), doc.root.ns_decls.len);
+        try testing.expectEqualStrings("urn:x7", doc.root.attributes[7].uri);
+        try testing.expect(st.dup_compares <= 6 * k);
+    }
+
+    // The behaviour these fast paths replace must be unchanged: duplicates are
+    // still rejected, on both sides of `dup_scan_threshold`, and both by
+    // expanded name rather than by spelling.
+    try testing.expectError(error.DuplicateAttribute, parse(gpa, "<r a=\"1\" a=\"2\"/>", .{}));
+    try testing.expectError(error.NamespaceError, parse(gpa, "<r xmlns:p=\"urn:a\" xmlns:p=\"urn:b\"/>", .{}));
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<r xmlns:p=\"urn:x\" xmlns:q=\"urn:x\"");
+        for (0..k) |i| try buf.print(gpa, " a{d}=\"v\"", .{i});
+        // Distinct spellings, one expanded name — must still be a duplicate.
+        try buf.appendSlice(gpa, " p:dup=\"1\" q:dup=\"2\"/>");
+        try testing.expectError(error.DuplicateAttribute, parse(gpa, buf.items, .{}));
+    }
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<r");
+        for (0..k) |i| try buf.print(gpa, " xmlns:p{d}=\"urn:x{d}\"", .{ i, i });
+        try buf.appendSlice(gpa, " xmlns:p0=\"urn:again\"/>");
+        try testing.expectError(error.NamespaceError, parse(gpa, buf.items, .{}));
+    }
+    {
+        // Above the threshold, a prefix declared on an *ancestor* must still
+        // resolve, and an undeclared one must still be refused.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<r xmlns:up=\"urn:up\"><c");
+        for (0..k) |i| try buf.print(gpa, " xmlns:p{d}=\"urn:x{d}\"", .{ i, i });
+        try buf.appendSlice(gpa, " up:a=\"1\" xml:lang=\"en\"/></r>");
+        var doc = try parse(gpa, buf.items, .{});
+        defer doc.deinit();
+        const c = doc.root.children[0].content.element;
+        try testing.expectEqualStrings("urn:up", c.attributes[0].uri);
+        try testing.expectEqualStrings(xml_ns, c.attributes[1].uri);
+
+        var bad: std.ArrayList(u8) = .empty;
+        defer bad.deinit(gpa);
+        try bad.appendSlice(gpa, "<r><c");
+        for (0..k) |i| try bad.print(gpa, " xmlns:p{d}=\"urn:x{d}\"", .{ i, i });
+        try bad.appendSlice(gpa, " nope:a=\"1\"/></r>");
+        try testing.expectError(error.UndeclaredNamespacePrefix, parse(gpa, bad.items, .{}));
+    }
+}
+
 test "security: duplicate ID rejected (signature-wrapping guard)" {
     try testing.expectError(error.DuplicateId, parse(testing.allocator, "<r><a ID=\"x\"/><b ID=\"x\"/></r>", .{}));
 }
@@ -1571,3 +1780,4 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 test {
     _ = @import("xmlconf_test.zig");
 }
+
