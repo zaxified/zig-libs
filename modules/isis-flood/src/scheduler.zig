@@ -27,6 +27,16 @@
 //! send, the DIS's CSNP doing the sync — is deliberately out of scope; see
 //! `../SPEC.md`.)
 //!
+//! ## The CSNP series (ISO/IEC 10589 §7.3.15.2) — a range is a *claim*
+//! A CSNP asserts that it lists **every** LSP the sender holds in the inclusive
+//! `[Start, End]` range it carries; a receiver that holds an in-range LSP the
+//! CSNP omitted concludes the sender lacks it and floods it back. So a summary
+//! that does not fit one buffer may never round its last range up to
+//! `FF…FF` — it advertises only the sub-range it actually enumerated, sets
+//! `truncated`, and resumes from `End + 1` on the next `poll` (per circuit).
+//! The cadence timer is re-armed only when a series reaches the top of the
+//! space. See `emitCsnp`.
+//!
 //! The last-sent map is bounded by the number of currently-SRM-flagged
 //! `(lsp, iface)` pairs — itself bounded by the LSDB's own capacity — because each
 //! `poll` first prunes entries whose SRM is no longer set (acked, cleared, or the
@@ -63,8 +73,10 @@ pub const default_lsp_entries_per_pdu: usize = snp.max_entries_per_pdu;
 
 /// The comptime ceiling on entries collected for one interface's PSNP/CSNP
 /// summary in a single `poll` (a stack buffer, no allocation). A DB larger than
-/// this is summarised only up to this many entries per poll for that circuit — a
-/// documented cap, sized generously for the intended fabric (see `../SPEC.md`).
+/// this is summarised in **several** polls for that circuit: each poll advertises
+/// a narrower `[start, end]` window that it can enumerate completely, and the
+/// next poll resumes at the following LSP-ID (see `emitCsnp` and `../SPEC.md`).
+/// A CSNP never claims a range whose contents it did not list.
 pub const max_summary_entries: usize = 256;
 
 /// The kind of PDU an `Effect` tells the caller to transmit.
@@ -90,8 +102,10 @@ pub const PollResult = struct {
     /// this is `now` (poll again immediately to make progress).
     next_wakeup: ?Time,
     /// The `out` slice, the `scratch` buffer, or a per-interface burst budget
-    /// filled before all pending work was emitted. The caller should send what it
-    /// got and `poll` again immediately (`next_wakeup == now`).
+    /// filled before all pending work was emitted — or a CSNP series that has
+    /// not yet advertised the top of the LSP-ID space (§7.3.15.2, see the file
+    /// header). The caller should send what it got and `poll` again immediately
+    /// (`next_wakeup == now`).
     truncated: bool,
 };
 
@@ -138,6 +152,12 @@ pub const Scheduler = struct {
     /// Absolute next-CSNP time per circuit, and whether it has been primed.
     csnp_next: [max_interfaces]Time = @splat(0),
     csnp_primed: [max_interfaces]bool = @splat(false),
+    /// Resume point of an in-progress CSNP series per circuit: the LSP-ID the
+    /// next CSNP's advertised range must start at. `min_lsp_id` means no series
+    /// is in progress (the next cadence tick starts a fresh one). A database
+    /// larger than one summary buffer is advertised across several polls; until
+    /// the series reaches `max_lsp_id` the cadence timer is not re-armed.
+    csnp_cursor: [max_interfaces]LspId = @splat(snp.min_lsp_id),
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Scheduler {
         std.debug.assert(cfg.lsp_entries_per_pdu >= 1 and cfg.lsp_entries_per_pdu <= snp.max_entries_per_pdu);
@@ -226,24 +246,30 @@ pub const Scheduler = struct {
             }
 
             // ── 2. PSNP acks / requests (SSN) — chunked ─────────────────────────
-            if (self.emitSnp(.psnp, now, iface, db, out, &n_eff, scratch, &scratch_used)) |t| {
-                if (t) {
-                    truncated = true;
-                    wake = minOpt(wake, now);
-                    break :outer;
-                }
+            if (self.emitPsnp(now, iface, db, out, &n_eff, scratch, &scratch_used)) {
+                truncated = true;
+                wake = minOpt(wake, now);
+                break :outer;
             }
 
             // ── 3. Periodic CSNP (§7.3.15.2) ────────────────────────────────────
             if (now >= self.csnp_next[iface]) {
-                if (self.emitSnp(.csnp, now, iface, db, out, &n_eff, scratch, &scratch_used)) |t| {
-                    if (t) {
-                        truncated = true;
-                        wake = minOpt(wake, now);
-                        break :outer;
-                    }
+                const r = self.emitCsnp(now, iface, db, out, &n_eff, scratch, &scratch_used);
+                if (r.more) {
+                    // The series has not yet reached max_lsp_id: the caller must
+                    // poll again immediately so the rest of the database is
+                    // advertised. The cadence timer stays un-armed (it is still
+                    // in the past) until the series completes.
+                    truncated = true;
+                    wake = minOpt(wake, now);
+                } else {
+                    self.csnp_next[iface] = now +| self.cfg.complete_snp_interval;
                 }
-                self.csnp_next[iface] = now +| self.cfg.complete_snp_interval;
+                if (r.out_of_room) {
+                    truncated = true;
+                    wake = minOpt(wake, now);
+                    break :outer;
+                }
             }
             wake = minOpt(wake, self.csnp_next[iface]);
         }
@@ -255,14 +281,11 @@ pub const Scheduler = struct {
         };
     }
 
-    /// Emit the SNP PDUs for one circuit. For `.psnp` it drains the SSN-flagged
-    /// LSPs (clearing SSN as each PDU is produced); for `.csnp` it summarises the
-    /// whole DB into contiguously-tiled ranges. Returns `true` iff it ran out of
-    /// `out` room or `scratch` space (truncated) — otherwise `false`; `null` is
-    /// never returned (the optional keeps the call sites uniform).
-    fn emitSnp(
+    /// Emit the PSNP PDUs for one circuit: drain the SSN-flagged LSPs, chunked,
+    /// clearing SSN as each PDU is produced. Returns `true` iff it ran out of
+    /// `out` room or `scratch` space (truncated).
+    fn emitPsnp(
         self: *Scheduler,
-        comptime kind: PduKind,
         now: Time,
         iface: u8,
         db: *Lsdb,
@@ -270,31 +293,108 @@ pub const Scheduler = struct {
         n_eff: *usize,
         scratch: []u8,
         scratch_used: *usize,
-    ) ?bool {
+    ) bool {
         var entries: [max_summary_entries]LspEntry = undefined;
         var m: usize = 0;
 
-        switch (kind) {
-            .psnp => {
-                var qit = db.ssnIterator(iface);
-                while (qit.next()) |item| {
-                    if (m >= entries.len) break;
-                    const v = db.get(item.lsp_id, now) orelse continue;
-                    entries[m] = .{
-                        .remaining_lifetime = v.remaining_lifetime,
-                        .lsp_id = item.lsp_id,
-                        .sequence_number = v.sequence_number,
-                        .checksum = v.checksum,
-                    };
-                    m += 1;
-                }
-                if (m == 0) return false; // nothing to ack
-            },
-            .csnp => {
-                m = db.summarise(&entries, snp.min_lsp_id, snp.max_lsp_id, now);
-                // m == 0 is legal: one empty CSNP over the whole range still emits.
-            },
-            .lsp => unreachable,
+        var qit = db.ssnIterator(iface);
+        while (qit.next()) |item| {
+            if (m >= entries.len) break;
+            const v = db.get(item.lsp_id, now) orelse continue;
+            entries[m] = .{
+                .remaining_lifetime = v.remaining_lifetime,
+                .lsp_id = item.lsp_id,
+                .sequence_number = v.sequence_number,
+                .checksum = v.checksum,
+            };
+            m += 1;
+        }
+        if (m == 0) return false; // nothing to ack
+
+        snp.sortEntries(entries[0..m]);
+
+        const per = self.cfg.lsp_entries_per_pdu;
+        const src = self.sourceId();
+        var i: usize = 0;
+        while (i < m) {
+            const j = @min(i + per, m);
+            if (n_eff.* >= out.len) return true;
+            const built = snp.buildPsnp(scratch[scratch_used.*..], src, self.cfg.is_l2, entries[i..j]) catch return true;
+
+            out[n_eff.*] = .{ .iface = iface, .kind = .psnp, .bytes = built };
+            n_eff.* += 1;
+            scratch_used.* += built.len;
+
+            // A PSNP has now acknowledged/requested these LSPs → clear SSN.
+            for (entries[i..j]) |e| db.clearSsn(e.lsp_id, iface);
+            i = j;
+        }
+        return false;
+    }
+
+    /// The outcome of one circuit's CSNP burst.
+    const CsnpProgress = struct {
+        /// `out`/`scratch` filled before the window's PDUs were all emitted.
+        out_of_room: bool,
+        /// The series has not yet advertised up to `max_lsp_id`; the caller must
+        /// poll again (the cursor holds the resume point).
+        more: bool,
+    };
+
+    /// Emit the CSNP PDUs for one circuit.
+    ///
+    /// **ISO/IEC 10589 §7.3.15.2**: a CSNP is a *complete* summary of the
+    /// inclusive `[Start LSP ID, End LSP ID]` range it advertises. A receiver
+    /// that holds an LSP inside that range which the CSNP did **not** list
+    /// concludes the sender lacks it and floods it back (sets SRM); the sibling
+    /// `isis-lsdb.reconcileCsnp` implements exactly that receive rule. So the
+    /// advertised range is a *claim* about coverage, and this function may only
+    /// claim what it actually enumerated.
+    ///
+    /// The summary buffer is finite (`max_summary_entries`) and `isis-lsdb`'s
+    /// `summarise` fills it in hash order, so "the first N of the range" is not
+    /// even a well-defined prefix. Therefore: ask for one more entry than we can
+    /// advertise, and if the window is over-full **narrow the window** (halve it
+    /// by LSP-ID) and re-count until what came back is provably the *whole*
+    /// content of `[start, end]`. That window is then advertised honestly, the
+    /// cursor moves to `end + 1`, and the rest of the database follows on the
+    /// next poll(s). The previous behaviour — emit the first 256 entries and
+    /// still stamp `max_lsp_id` on the last chunk — made every omitted LSP look
+    /// absent to the peer, which re-flooded them on every cadence tick forever.
+    fn emitCsnp(
+        self: *Scheduler,
+        now: Time,
+        iface: u8,
+        db: *Lsdb,
+        out: []Effect,
+        n_eff: *usize,
+        scratch: []u8,
+        scratch_used: *usize,
+    ) CsnpProgress {
+        // One slot more than we will ever advertise: a return of
+        // `max_summary_entries + 1` proves the window holds more than we can
+        // enumerate; anything less proves the window is complete.
+        var entries: [max_summary_entries + 1]LspEntry = undefined;
+
+        const start = self.csnp_cursor[iface];
+        var end = snp.max_lsp_id;
+        var m = db.summarise(&entries, start, end, now);
+        if (m > max_summary_entries) {
+            // Over-full: we cannot enumerate this window, so we must not claim
+            // it. Binary-search the LARGEST end whose window we can enumerate
+            // (largest, not merely any, so a sparse ID space does not cost one
+            // poll per halving). `good` is complete by construction — a single
+            // LSP-ID holds at most one entry — and `bad` is over-full; each step
+            // strictly shrinks the gap, so this ends after at most 64 rounds.
+            var good = start;
+            var bad = end;
+            while (true) {
+                const mid = snp.midpoint(good, bad);
+                if (std.mem.eql(u8, &mid, &good)) break; // bad == good + 1
+                if (db.summarise(&entries, start, mid, now) > max_summary_entries) bad = mid else good = mid;
+            }
+            end = good;
+            m = db.summarise(&entries, start, end, now); // refill for the chosen window
         }
 
         snp.sortEntries(entries[0..m]);
@@ -302,34 +402,44 @@ pub const Scheduler = struct {
         const per = self.cfg.lsp_entries_per_pdu;
         const src = self.sourceId();
         var i: usize = 0;
-        // A CSNP with no entries still emits exactly one covering PDU.
+        var advertised_to: ?LspId = null;
+        // A CSNP with no entries still emits exactly one PDU covering its window.
         var first = true;
-        while (i < m or (kind == .csnp and first)) {
+        while (i < m or first) {
             first = false;
             const j = @min(i + per, m);
-            if (n_eff.* >= out.len) return true;
+            if (n_eff.* >= out.len) return self.csnpDone(iface, advertised_to, true);
 
-            const built = switch (kind) {
-                .psnp => snp.buildPsnp(scratch[scratch_used.*..], src, self.cfg.is_l2, entries[i..j]) catch return true,
-                .csnp => blk: {
-                    const start = if (i == 0) snp.min_lsp_id else snp.successor(entries[i - 1].lsp_id);
-                    const end = if (j >= m) snp.max_lsp_id else entries[j - 1].lsp_id;
-                    break :blk snp.buildCsnp(scratch[scratch_used.*..], src, self.cfg.is_l2, start, end, entries[i..j]) catch return true;
-                },
-                .lsp => unreachable,
-            };
+            // The first chunk starts at the cursor; each later chunk starts one
+            // past the previous chunk's last entry, so the chunks tile the
+            // window with no gap and no overlap. The final chunk ends at the
+            // window's proven end — never at a value we did not enumerate.
+            const chunk_start = if (i == 0) start else snp.successor(entries[i - 1].lsp_id);
+            const chunk_end = if (j >= m) end else entries[j - 1].lsp_id;
+            const built = snp.buildCsnp(scratch[scratch_used.*..], src, self.cfg.is_l2, chunk_start, chunk_end, entries[i..j]) catch
+                return self.csnpDone(iface, advertised_to, true);
 
-            out[n_eff.*] = .{ .iface = iface, .kind = kind, .bytes = built };
+            out[n_eff.*] = .{ .iface = iface, .kind = .csnp, .bytes = built };
             n_eff.* += 1;
             scratch_used.* += built.len;
-
-            // A PSNP has now acknowledged/requested these LSPs → clear SSN.
-            if (kind == .psnp) {
-                for (entries[i..j]) |e| db.clearSsn(e.lsp_id, iface);
-            }
+            advertised_to = chunk_end;
             i = j;
         }
-        return false;
+        return self.csnpDone(iface, advertised_to, false);
+    }
+
+    /// Park the CSNP series cursor after a burst: `advertised_to` is the highest
+    /// LSP-ID actually covered by an emitted PDU (null if none was emitted). The
+    /// series is complete only once it has covered `max_lsp_id`.
+    fn csnpDone(self: *Scheduler, iface: u8, advertised_to: ?LspId, out_of_room: bool) CsnpProgress {
+        const to = advertised_to orelse
+            return .{ .out_of_room = out_of_room, .more = true }; // cursor unchanged: retry
+        if (std.mem.eql(u8, &to, &snp.max_lsp_id)) {
+            self.csnp_cursor[iface] = snp.min_lsp_id; // series complete
+            return .{ .out_of_room = out_of_room, .more = false };
+        }
+        self.csnp_cursor[iface] = snp.successor(to);
+        return .{ .out_of_room = out_of_room, .more = true };
     }
 };
 
@@ -357,6 +467,25 @@ fn buildLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16, csum: u16) 
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     }) catch unreachable;
     return b.finish();
+}
+
+/// Build an LSP with an explicit 8-octet LSP-ID (the `sys ++ pseudonode ++
+/// fragment` split matters when a test needs more than 256 distinct ids).
+fn buildLspId(buf: []u8, id: LspId, seq: u32, life: u16, csum: u16) []const u8 {
+    var b = isis.pdu.LspBuilder.init(buf, .{
+        .remaining_lifetime = life,
+        .lsp_id = id,
+        .sequence_number = seq,
+        .checksum = csum,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    }) catch unreachable;
+    return b.finish();
+}
+
+/// The `n`-th distinct LSP-ID of `sys`: pseudonode byte + fragment byte together
+/// give 65536 ids, so a test can exceed `max_summary_entries`.
+fn idNth(sys: [6]u8, n: u16) LspId {
+    return .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], @intCast(n >> 8), @truncate(n) };
 }
 
 fn oneUp(iface: u8) InterfaceSet {
@@ -680,6 +809,145 @@ test "truncation: a full out slice reports truncated and next_wakeup == now" {
     try testing.expect(r.truncated);
     try testing.expectEqual(@as(usize, 2), r.effects.len);
     try testing.expectEqual(@as(?Time, 7), r.next_wakeup); // == now: poll again immediately
+}
+
+// ── ISO/IEC 10589 §7.3.15.2: an advertised CSNP range is a COVERAGE CLAIM ────
+//
+// The hostile input needs no malformed packet: a neighbour merely floods more
+// LSPs into the area than one summary buffer holds. The stock `isis-lsdb`
+// capacity is 4096 and `max_summary_entries` is 256, so a 257-LSP area — an
+// ordinary IS-IS deployment — reaches this. §7.3.15.2 makes a receiver treat an
+// LSP it holds inside a CSNP's `[Start, End]` range that the CSNP did not list
+// as one the sender lacks, and flood it back (`isis-lsdb.reconcileCsnp`
+// implements that rule). The defect these two tests pin: the last chunk's End
+// was unconditionally FF…FF, so the series claimed the entire LSP-ID space
+// while listing only the first 256 entries `summarise` happened to return in
+// hash order — and reported `truncated = false`, so the caller never polled for
+// the rest. The result was a permanent re-flood of (DB − 256) LSPs per cadence
+// tick, per circuit, forever.
+
+const hostile_lsp_count: u16 = 300; // the audit's reproducer size (> 256)
+
+fn fillHostileDb(db: *Lsdb, arrival_iface: ?u8) !void {
+    var buf: [128]u8 = undefined;
+    var n: u16 = 0;
+    while (n < hostile_lsp_count) : (n += 1) {
+        _ = try db.insert(buildLspId(&buf, idNth(sys_other, n), 1 + @as(u32, n), 900, 0x1000 +% n), arrival_iface, 0);
+    }
+}
+
+test "hostile peer: a >256-LSP CSNP series never claims a range it did not enumerate" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 512 });
+    defer db.deinit();
+    try fillHostileDb(&db, 0); // arrived on iface 0 → no SRM there; SSN cleared below
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var k: u16 = 0;
+    while (k < hostile_lsp_count) : (k += 1) db.clearSsn(idNth(sys_other, k), 0);
+
+    var out: [64]Effect = undefined;
+    var scratch: [16 * 1024]u8 = undefined;
+
+    var covered: std.AutoHashMapUnmanaged(LspId, void) = .empty;
+    defer covered.deinit(testing.allocator);
+
+    var prev_end: ?LspId = null;
+    var first_truncated = false;
+    var completed = false;
+    var polls: usize = 0;
+    while (polls < 64) : (polls += 1) {
+        const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
+        if (polls == 0) first_truncated = r.truncated;
+        for (r.effects) |e| {
+            if (e.kind != .csnp) continue;
+            const cs = try isis.Csnp.decode(e.bytes);
+
+            // The whole (multi-poll) series still tiles the space contiguously.
+            if (prev_end) |p| {
+                try testing.expectEqual(snp.successor(p), cs.start_lsp_id);
+            } else {
+                try testing.expectEqual(snp.min_lsp_id, cs.start_lsp_id);
+            }
+            prev_end = cs.end_lsp_id;
+
+            var listed: std.AutoHashMapUnmanaged(LspId, void) = .empty;
+            defer listed.deinit(testing.allocator);
+            if (try isis.tlv.findFirst(cs.tlv_bytes, isis.tlvs.code.lsp_entries)) |tlv| {
+                var it = isis.tlvs.LspEntryIterator.init(tlv);
+                while (try it.next()) |entry| {
+                    try listed.put(testing.allocator, entry.lsp_id, {});
+                    try covered.put(testing.allocator, entry.lsp_id, {});
+                }
+            }
+
+            // THE RULE (§7.3.15.2): every LSP we hold inside the advertised
+            // range must appear in this CSNP. One omission = one re-flood.
+            var j: u16 = 0;
+            while (j < hostile_lsp_count) : (j += 1) {
+                const id = idNth(sys_other, j);
+                const in_range = std.mem.order(u8, &id, &cs.start_lsp_id) != .lt and
+                    std.mem.order(u8, &id, &cs.end_lsp_id) != .gt;
+                if (in_range and !listed.contains(id)) return error.CsnpClaimedAnLspItDidNotList;
+            }
+        }
+        if (!r.truncated) {
+            completed = true;
+            break;
+        }
+    }
+
+    try testing.expect(first_truncated); // the caller is TOLD there is more
+    try testing.expect(completed); // the series terminates …
+    try testing.expectEqual(snp.max_lsp_id, prev_end.?); // … having reached the top
+    try testing.expectEqual(@as(usize, hostile_lsp_count), covered.count()); // all of it
+}
+
+test "hostile peer: a >256-LSP CSNP series makes a peer holding the same DB re-flood nothing" {
+    // The receive-side oracle: `isis-lsdb.reconcileCsnp` is an independent
+    // implementation of the §7.3.15.2 completeness rule, written for the
+    // opposite direction — exactly what a real IS-IS neighbour (e.g. FRR
+    // isisd) does with our PDUs. Feed our series to a peer that already holds
+    // every LSP we hold: it must ask for nothing and re-flood nothing.
+    var mine = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 512 });
+    defer mine.deinit();
+    // A third router: the LSPs are sys_other's, so neither DB owns them.
+    const sys_peer: [6]u8 = .{ 0, 0, 0, 0, 0, 0xC };
+    var peer = Lsdb.init(testing.allocator, .{ .local_system_id = sys_peer, .interface_count = 2, .capacity = 512 });
+    defer peer.deinit();
+    try fillHostileDb(&mine, 0);
+    try fillHostileDb(&peer, 0); // identical contents, arrived on iface 0 → no SRM there
+
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var k: u16 = 0;
+    while (k < hostile_lsp_count) : (k += 1) {
+        mine.clearSsn(idNth(sys_other, k), 0);
+        peer.clearSsn(idNth(sys_other, k), 0);
+    }
+
+    var out: [64]Effect = undefined;
+    var scratch: [16 * 1024]u8 = undefined;
+    var polls: usize = 0;
+    while (polls < 64) : (polls += 1) {
+        const r = sched.poll(0, oneUp(0), &mine, &out, &scratch);
+        for (r.effects) |e| {
+            if (e.kind != .csnp) continue;
+            peer.reconcileCsnp(try isis.Csnp.decode(e.bytes), 0, 0);
+        }
+        if (!r.truncated) break;
+    }
+
+    // Not one LSP is marked for re-flood back at us, and none is requested.
+    var reflooded: usize = 0;
+    var requested: usize = 0;
+    k = 0;
+    while (k < hostile_lsp_count) : (k += 1) {
+        const id = idNth(sys_other, k);
+        if (peer.srmSet(id).?.isSet(0)) reflooded += 1;
+        if (peer.ssnSet(id).?.isSet(0)) requested += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), reflooded);
+    try testing.expectEqual(@as(usize, 0), requested);
 }
 
 test "last-sent map is pruned when SRM clears (bounded by the SRM-flagged set)" {

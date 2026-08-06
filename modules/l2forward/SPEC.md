@@ -28,8 +28,12 @@ Concurrency is `.single_owner`: one thread/loop owns the table, no internal lock
 
 ## Forward decision & BUM classification
 
-`forward(isid, dst, src_pe, now, out)`:
+`forward(isid, dst, ingress, now, out)`, where `ingress` is `.access` (a local
+customer circuit) or `.core = pe` (out of the fabric, ingress-replicated by
+remote PE `pe`):
 
+0. If `ingress` is `.core` → `Decision.local_only`, before any table lookup.
+   Nothing received from the core re-enters the fabric (see Split-horizon).
 1. If `dst` is a **broadcast or multicast** address (`isBumAddress` — the I/G
    bit, LSB of the first octet; broadcast all-ones is its special case) → BUM.
 2. Else look `dst` up in `isid`'s FDB. A **fresh hit** → `Decision.unicast(pe)`.
@@ -43,34 +47,60 @@ decision lives inside `forward`.
 
 ## Split-horizon
 
-`replicationSet(isid, src_pe, out)` returns every member of `isid` **except**
-`src_pe`, written into the caller's buffer and **sorted ascending by PE id**. The
-sort is load-bearing: `AutoHashMap` iteration order tracks internal
+`replicationSet(isid, ingress, out)`:
+
+- `.core` → the **empty** set, unconditionally. RFC 4762 §4.4 (VPLS: a PE must
+  not forward a frame received on one mesh PW onto another mesh PW) and RFC 7432
+  §8.3.1 (EVPN ingress replication) both make the PE-to-PE mesh full, so every
+  member already received its own copy directly from the ingress PE. The claimed
+  ingress PE id is an attacker-controlled header field (`l2encap`'s
+  `ingress_pe`); the rule deliberately does not consult its value.
+- `.access` → every member of `isid`, written into the caller's buffer and
+  **sorted ascending by PE id**. Members are by definition the *remote* PEs, so
+  the local PE is never in its own member set and there is nothing to subtract.
+
+The sort is load-bearing: `AutoHashMap` iteration order tracks internal
 insert/remove history and is not stable, so an unsorted set would make the flood
 decision non-deterministic across equivalent tables. Sorting a set bounded by
-`max_pes_per_isid` is cheap and gives a total, reproducible order.
+`max_pes_per_isid` is cheap and gives a total, reproducible order. `out` too
+small for the set is `error.BufferTooSmall`; sizing `out` to `max_pes_per_isid`
+makes that unreachable.
 
-A `src_pe` that is not a member excludes nothing (all members are returned) — the
-documented rule for a frame whose ingress PE the local table does not (yet) list
-as a member. `out` too small for the filtered set is `error.BufferTooSmall`;
-sizing `out` to `max_pes_per_isid` makes that unreachable.
+**Superseded rule (kept so the change is legible).** This module previously
+returned *members − `src_pe`* for every BUM frame, and `forward` had no way to
+say a frame came from the core. That is not a weaker split horizon, it is a
+relay: with N members, hop k carries `(N−1)(N−2)^(k−1)` copies of one broadcast
+— at N=4, `3·2^63` frames, stopped only when `l2encap`'s TTL (default 64) runs
+out. `l2encap.droppedBySplitHorizon` cannot catch the relayed copies either,
+because `ingress_pe` is stamped once at ingress and preserved across
+`decrementTtl`, so a third PE never recognises a copy as relayed. Pinned by the
+4-PE composition test in `src/root.zig`.
 
 ### Honest scope of the loop claim (do not overclaim)
 
-Split-horizon-as-source-PE-exclusion prevents exactly the **reflection** case: a
-BUM frame delivered back toward the PE that ingress-replicated it. It does **not**
-by itself prevent a transient forwarding loop among *other* PEs during
-control-plane reconvergence — that needs a loop-free BUM distribution tree and a
-reverse-path-forwarding check, which are **control-plane** computations (the S1b
-`loopfree-reconv` / SPB-tree work), not something a per-frame forwarding table
-can assert. The always-correct data-plane backstop is `l2encap`'s **TTL**: even a
+The failure mode this rule *does* close is the **steady-state core relay** in a
+fully converged fabric — the exponential duplication described above. It needs no
+reconvergence, no misconfiguration and no malformed frame: it is what a faithful
+`l2forward` + `l2encap` integration did on every broadcast. That is now
+prevented by construction, because a core-received frame yields `local_only`.
+(An earlier revision of this paragraph named only the *transient reconvergence*
+loop as the residual risk. That was the wrong failure mode: the dominant one was
+in the steady state, and it was ours.)
+
+What is still **not** closed here: a transient forwarding loop among PEs during
+control-plane reconvergence, when the member sets of different PEs disagree.
+That needs a loop-free BUM distribution tree and a reverse-path-forwarding
+check, which are **control-plane** computations (the S1b `loopfree-reconv` /
+SPB-tree work), not something a per-frame forwarding table can assert. The
+always-correct data-plane backstop for that residue is `l2encap`'s **TTL**: a
 loop the control plane briefly allows dies after at most `initial_ttl` PE hops.
-This module supplies the *necessary inputs* (the member set + the split-horizon
-filter); the finite-loop guarantee is TTL's, and true loop-freedom is the control
-plane's. This division is intentional and matches `l2encap`'s SPEC exactly — see
-its "Honest scope of the loop claim" section. `l2forward` therefore performs
-**ingress replication to the full member set**, not tree-pruned replication; a
-loop-free tree is out of scope by design (deferred list).
+This module supplies the *necessary inputs* (the member set + the ingress
+classification); the finite-loop guarantee is TTL's, and true loop-freedom is
+the control plane's. `l2forward` therefore performs **ingress replication to the
+full member set**, not tree-pruned replication; a loop-free tree is out of scope
+by design (deferred list). `l2encap`'s SPEC carries the same "honest scope"
+paragraph and still names only the transient case — it needs the same correction
+in its own module.
 
 ## MAC-move policy
 
@@ -155,15 +185,19 @@ control plane's concern (deferred list).
 
 Offline only — pure logic, no live-interop surface. `zig build test-l2forward`
 (Debug + `-Doptimize=ReleaseFast`): BUM classification; known-unicast
-learn→forward + unknown-unicast fallback; split-horizon (`{2,3,4}` src 3 →
-`{2,4}` ascending; non-member source excludes nothing; `BufferTooSmall`); tenant
+learn→forward + unknown-unicast fallback; full-mesh split horizon (access BUM →
+all of `{2,3,4}` ascending; core BUM → nobody; `BufferTooSmall`); a hostile-peer
+test that no claimed `ingress_pe` — member, non-member or edge value — buys a
+relay; a 4-PE fabric composition test that one access broadcast produces exactly
+3 copies and stops at hop 1; tenant
 isolation; MAC move (last-writer-wins, one entry); ageing (boundary fresh/expired,
 lazy miss + `tick` reclaim, re-learn refresh) and static-entry immunity; the
 per-tenant MAC-flood bound (`FdbFull` after reclaim, existing entries + moves
 still served) and I-SID/member caps; determinism (identical `(ops, now)` →
 identical decisions, insertion-order-independent sorted flood set); a permanent
-positive-control test proving a flood set that *keeps* the source PE contradicts
-split-horizon (so a regression there goes red); and a `testing.allocator` leak
+positive-control test proving that the superseded "members − src_pe" set is a
+non-empty relay where the rule demands nothing (so a regression there goes red);
+and a `testing.allocator` leak
 check that `deinit` frees every nested membership + FDB map. `zig fmt --check`
 clean; `zig build check-catalog` green.
 
@@ -198,7 +232,8 @@ Findings, with the exact commands/output:
   decision, matching `learn`'s contract.
 - **Flood on unknown/broadcast destination.** The same broadcast frame was
   observed (via raw sockets) arriving at *both* other ports (`veth2b` and
-  `veth3b`) — matching `forward`'s BUM → flood-to-all-members-minus-source path.
+  `veth3b`) — matching `forward`'s BUM → flood-to-all-members path for an
+  access-ingress frame.
 - **Learned unicast is not flooded.** After also learning
   `02:00:00:00:00:02` behind the second port, a frame from the first port
   addressed to that MAC arrived *only* at the port it was learned behind

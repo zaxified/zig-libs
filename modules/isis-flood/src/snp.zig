@@ -60,6 +60,22 @@ pub fn successor(id: LspId) LspId {
     return max_lsp_id; // successor(FF…FF) saturates
 }
 
+/// The big-endian midpoint `a + (b - a) / 2` of two LSP-IDs, for narrowing a
+/// CSNP window that holds more entries than one summary buffer can enumerate
+/// (see `scheduler.emitCsnp`). The result is always in `[min, max)` when the two
+/// differ, and equal to them when they are equal, so repeated halving strictly
+/// shrinks the window and terminates. Total: the operands are ordered here, so a
+/// swapped call is well-defined rather than an underflow.
+pub fn midpoint(a: LspId, b: LspId) LspId {
+    const x = std.mem.readInt(u64, &a, .big);
+    const y = std.mem.readInt(u64, &b, .big);
+    const lo = @min(x, y);
+    const hi = @max(x, y);
+    var out: LspId = undefined;
+    std.mem.writeInt(u64, &out, lo + (hi - lo) / 2, .big);
+    return out;
+}
+
 fn lessThanEntry(_: void, a: LspEntry, b: LspEntry) bool {
     return std.mem.order(u8, &a.lsp_id, &b.lsp_id) == .lt;
 }
@@ -109,6 +125,27 @@ test "successor increments big-endian with carry and saturates" {
     try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 0, 1, 0 }, successor(.{ 0, 0, 0, 0, 0, 0, 0, 0xFF }));
     try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 1, 0, 0 }, successor(.{ 0, 0, 0, 0, 0, 0, 0xFF, 0xFF }));
     try testing.expectEqual(max_lsp_id, successor(max_lsp_id)); // saturates
+}
+
+test "midpoint halves a window and always terminates" {
+    // Exact halving of the whole space.
+    try testing.expectEqual(LspId{ 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, midpoint(min_lsp_id, max_lsp_id));
+    // Adjacent IDs: the midpoint is the lower one, so the window shrinks.
+    const a: LspId = .{ 0, 0, 0, 0, 0, 0, 0, 4 };
+    const b: LspId = .{ 0, 0, 0, 0, 0, 0, 0, 5 };
+    try testing.expectEqual(a, midpoint(a, b));
+    // Equal endpoints are a fixed point.
+    try testing.expectEqual(a, midpoint(a, a));
+
+    // Repeated halving from the top of the space reaches `start` in <= 64 steps
+    // — the termination argument `emitCsnp`'s narrowing loop relies on.
+    var end = max_lsp_id;
+    var steps: usize = 0;
+    while (!std.mem.eql(u8, &end, &min_lsp_id)) : (steps += 1) {
+        end = midpoint(min_lsp_id, end);
+        try testing.expect(steps < 64);
+    }
+    try testing.expectEqual(@as(usize, 64), steps);
 }
 
 test "sortEntries orders by LSP-ID" {

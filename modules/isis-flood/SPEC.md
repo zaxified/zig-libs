@@ -75,11 +75,15 @@ the up-interface gate), `poll` emits, in order:
    `lsp_entries_per_pdu`, build one PSNP per chunk into `scratch`, emit
    `{ i, .psnp, bytes }`, and **`clearSsn`** for each entry in the chunk (the ack
    has been produced).
-3. **CSNP (periodic, §7.3.15.2).** When `now >= csnp_next[i]`: summarise the whole
-   DB, chunk into range-tiled CSNPs (§5), emit `{ i, .csnp, bytes }`, and set
-   `csnp_next[i] = now + complete_snp_interval`. The first `poll` that sees `i` Up
-   primes `csnp_next[i] = now`, so an initial CSNP fires immediately, then only on
-   cadence.
+3. **CSNP (periodic, §7.3.15.2).** When `now >= csnp_next[i]`: summarise the
+   largest LSP-ID window starting at `csnp_cursor[i]` that one summary buffer can
+   enumerate **completely**, chunk it into range-tiled CSNPs (§5), emit
+   `{ i, .csnp, bytes }`. If the window reached `FF…FF` the series is complete and
+   `csnp_next[i] = now + complete_snp_interval`; otherwise `csnp_cursor[i]` is
+   parked at `end + 1`, `truncated` is set, and the next `poll` continues the
+   series (the cadence is **not** re-armed mid-series). The first `poll` that sees
+   `i` Up primes `csnp_next[i] = now`, so an initial CSNP fires immediately, then
+   only on cadence.
 
 `Effect.bytes` for `.lsp` alias the LSDB; for `.psnp`/`.csnp` they alias the
 caller's `scratch`. Both are valid until the next `poll` or the next LSDB
@@ -87,21 +91,35 @@ mutation — the caller sends them synchronously.
 
 ## 5. CSNP range-chunking scheme
 
-`summarise` fills up to `max_summary_entries` (256) LSP-Entries for the full range
-`[00…00, FF…FF]`, in map order. The scheduler **sorts** them ascending by LSP-ID
-and splits into groups of `lsp_entries_per_pdu`. For group `k` (entries
-`[i, j)`):
+**An advertised range is a coverage claim, not a hint.** ISO 10589 §7.3.15.2
+makes a CSNP a *complete* summary of the `[Start, End]` range it carries: a
+receiver holding an in-range LSP the CSNP omitted concludes the sender lacks it
+and floods it back (`isis-lsdb.reconcileCsnp` implements that receive rule). So
+the scheduler may only advertise a range it has fully enumerated.
 
-- `start = (k == 0) ? 00…00 : successor(last_id_of_group_{k-1})`
-- `end   = (k == last) ? FF…FF : last_id_of_group_k`
+Each poll therefore picks a **window** `[cursor, end]`:
 
-where `successor` is the byte-wise big-endian +1. This **tiles** `[00…00, FF…FF]`
-with no gap and no overlap: consecutive ranges abut exactly (`start_k =
-end_{k-1} + 1`), the first starts at the bottom, the last ends at the top, and
-every summarised LSP-ID lies within exactly one range. A neighbour that runs the
-CSNP completeness check per range therefore sees a coherent, gap-free picture. An
-empty DB emits one CSNP covering the whole range with no entries (a valid "I hold
-nothing" assertion that makes the neighbour flood everything to us).
+- `summarise` is asked for one entry more than can be advertised
+  (`max_summary_entries + 1`). A short answer proves the window is complete.
+- If the window is over-full, `end` is **binary-searched** down (by LSP-ID,
+  `snp.midpoint`) to the largest value whose window fits. Narrowing rather than
+  truncating is what keeps the claim honest — `summarise` walks the LSDB in hash
+  order, so "the first 256" is not even a well-defined prefix of the range.
+- The window's entries are **sorted** ascending by LSP-ID and split into groups
+  of `lsp_entries_per_pdu`. For group `k` (entries `[i, j)`):
+  - `start = (k == 0) ? cursor : successor(last_id_of_group_{k-1})`
+  - `end   = (k == last) ? window_end : last_id_of_group_k`
+- When `window_end < FF…FF` the series continues: the cursor is parked at
+  `window_end + 1`, `truncated` is set (so `next_wakeup == now`), and the cadence
+  timer is not re-armed until a window reaches the top of the space.
+
+`successor` is the byte-wise big-endian +1. The series **tiles** `[00…00, FF…FF]`
+with no gap and no overlap across however many polls it takes: consecutive ranges
+abut exactly (`start_k = end_{k-1} + 1`), the first starts at the bottom, the last
+ends at the top, and every LSP-ID held lies within exactly one range **and is
+listed in that range's PDU**. An empty DB emits one CSNP covering the whole range
+with no entries (a valid "I hold nothing" assertion that makes the neighbour flood
+everything to us).
 
 **Per-PDU cap.** Each emitted PDU carries exactly one #9 TLV, so an 8-bit TLV
 length caps it at 255 / 16 = 15 entries; `lsp_entries_per_pdu ∈ [1, 15]`
@@ -133,9 +151,12 @@ Saturating arithmetic (`+|`) guards the interval additions.
   `scratch` bounds the serialised bytes; overrunning either sets `truncated` and
   stops cleanly (SSN is cleared only for PSNPs actually emitted, so an unsent ack
   simply retries next poll). The per-interface burst cap bounds LSP effects.
-- **Summary** — a DB larger than `max_summary_entries` is summarised only up to
-  that many entries per poll per circuit (a documented cap, sized to the fabric;
-  the periodic cadence re-summarises). No per-hostile-input allocation anywhere.
+- **Summary** — a DB larger than `max_summary_entries` is advertised over several
+  polls per circuit: each poll enumerates one complete LSP-ID window and the next
+  resumes at `end + 1` (§5). The bound is on the *window*, never on the truth of
+  the advertised range — a hostile neighbour that grows the area past the buffer
+  cannot make us claim coverage we do not have. No per-hostile-input allocation
+  anywhere; the window search costs at most 64 `summarise` passes.
 
 ## 8. Deferred (with hooks)
 

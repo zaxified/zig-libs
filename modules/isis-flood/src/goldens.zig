@@ -350,3 +350,87 @@ test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP ty
     }
     try testing.expect(found);
 }
+
+// ── Golden 5: the first CSNP of a TRUNCATED series — the range this module ──
+// ── may claim when the database does not fit one summary buffer ─────────────
+//
+// Added with the ISO 10589 §7.3.15.2 coverage fix. The other four goldens all
+// come from databases small enough to summarise in one window, so none of them
+// exercises the case the fix is about: a database larger than
+// `max_summary_entries`, where the last chunk's End LSP-ID must be the last
+// entry actually enumerated and NOT the `FF…FF` sentinel. This vector is the
+// first CSNP of a 300-LSP series at `lsp_entries_per_pdu = 2`; its End is a
+// real LSP-ID, and a third-party dissector agrees that is what the field says.
+//
+// Command:
+//   scripts/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 43 00
+//   00 00 00 00 0a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0b 00 01 09 20 03
+//   84 00 00 00 00 00 0b 00 00 00 00 00 01 10 00 03 84 00 00 00 00 00 0b 00 01
+//   00 00 00 02 10 01'
+//
+// Wireshark 4.6.4 printed (verbatim, trimmed to the load-bearing lines):
+//   frame.protocols == "eth:llc:osi:isis:isis.csnp"
+//   isis.type == 24 = ...1 1000 = PDU Type: L1 CSNP (24)
+//   isis.csnp.pdu_length == 67 = PDU length: 67
+//   isis.csnp.source_id == 0000.0000.000a = Source-ID: 0000.0000.000a
+//   isis.csnp.start_lsp_id == 0000.0000.0000.00-00 = Start LSP-ID: 0000.0000.0000.00-00
+//   isis.csnp.end_lsp_id == 0000.0000.000b.00-01 = End LSP-ID: 0000.0000.000b.00-01
+//   isis.csnp.clv.type == 9 = Type: 9
+//   isis.csnp.clv.length == 32 = Length: 32
+//   isis.csnp.lsp_id == 0000.0000.000b.00-00 = LSP-ID: 0000.0000.000b.00-00
+//   isis.csnp.lsp_id == 0000.0000.000b.00-01 = LSP-ID: 0000.0000.000b.00-01
+// No `data` fallback (the frame reached the real IS-IS CSNP dissector) and no
+// expert-info item. Both listed LSP-IDs lie inside the advertised range, and
+// the range stops at the second of them: the 298 LSPs this PDU does not list
+// are all OUTSIDE what it claims, which is the whole point — a peer running
+// the §7.3.15.2 completeness check on this range concludes nothing about them.
+const golden5_csnp_truncated_series = [_]u8{
+    0x83, 0x21, 0x01, 0x06, 0x18, 0x01, 0x00, 0x03,
+    0x00, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00,
+    0x01, 0x09, 0x20, 0x03, 0x84, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x10, 0x00, 0x03, 0x84, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0b, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x10, 0x01,
+};
+
+test "golden truncated CSNP series (Wireshark-anchored): the End LSP-ID is enumerated, not FF…FF" {
+    var db = lsdb_mod.Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 512 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+    defer sched.deinit();
+
+    // 300 LSPs — more than `max_summary_entries` (256), so the series cannot be
+    // advertised in one window.
+    var buf: [256]u8 = undefined;
+    var n: u16 = 0;
+    while (n < 300) : (n += 1) {
+        const id: LspId = .{ 0, 0, 0, 0, 0, 0x0B, @intCast(n >> 8), @truncate(n) };
+        var lb = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 900,
+            .lsp_id = id,
+            .sequence_number = 1 + @as(u32, n),
+            .checksum = 0x1000 +% n,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        _ = try db.insert(lb.finish(), 0, 0);
+        db.clearSsn(id, 0); // only the periodic CSNP is under test
+    }
+
+    var out: [4]Effect = undefined;
+    var scratch: [4096]u8 = undefined;
+    const r = sched.poll(0, up0(), &db, &out, &scratch);
+
+    var found = false;
+    for (r.effects) |e| {
+        if (e.kind != .csnp) continue;
+        try testing.expectEqualSlices(u8, &golden5_csnp_truncated_series, e.bytes);
+        found = true;
+        break;
+    }
+    try testing.expect(found);
+    // The series is not finished, and the caller is told so.
+    try testing.expect(r.truncated);
+}

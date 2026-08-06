@@ -2,10 +2,10 @@
 
 A pure-Zig **E-LAN edge forwarding table** for a multi-tenant, encrypted L2VPN
 fabric. It is the forwarding *brain* a provider edge (PE) runs: given a customer
-Ethernet frame's `{ I-SID, destination MAC, source PE }` it decides **where to
-send it** — to one remote PE (a learned unicast), or replicated to the I-SID's
-member PEs minus the source (a BUM/unknown flood). It owns the per-tenant state
-(MAC learning + membership); the sibling [`l2encap`](../l2encap/README.md) codec
+Ethernet frame's `{ I-SID, destination MAC, ingress }` it decides **where to
+send it** — to one remote PE (a learned unicast), replicated to the I-SID's
+member PEs (a BUM/unknown flood), or nowhere at all when the frame came out of
+the core. It owns the per-tenant state (MAC learning + membership); the sibling [`l2encap`](../l2encap/README.md) codec
 builds the actual on-wire frame. Pure, deterministic, time-injected, bounded: no
 socket, no clock, no thread — the caller drives `now` and all I/O.
 
@@ -24,10 +24,11 @@ below; full design/threat notes in [SPEC.md](SPEC.md).
 - **IEEE 802.1ah PBB I-SID service scoping** — every FDB and member set is keyed
   by the 24-bit **I-SID**, so each tenant is an isolated learning domain (the
   same MAC in two I-SIDs is two unrelated entries).
-- **EVPN (RFC 7432) / SPB (IEEE 802.1aq) ingress replication + split-horizon** —
-  a BUM frame is replicated to the I-SID's member PEs *minus the source PE* (the
-  split-horizon rule that stops a PE echoing a BUM frame back toward its
-  originator), matching `l2encap`'s `droppedBySplitHorizon` predicate.
+- **EVPN (RFC 7432) / SPB (IEEE 802.1aq) ingress replication + full-mesh
+  split-horizon** — a BUM frame received on a local **access** circuit is
+  replicated to the I-SID's member PEs; a frame received from the **core** is
+  never put back into the fabric at all (RFC 4762 §4.4, RFC 7432 §8.3.1),
+  matching `l2encap`'s `droppedBySplitHorizon` predicate.
 
 ## Pairing with `l2encap`
 
@@ -36,9 +37,9 @@ I-SID, same 16-bit PE id, same split-horizon rule:
 
 ```
                     ┌── membership + FDB (this module) ──┐
-received frame ──▶  l2forward.forward(isid, dst, src_pe) ──▶ Decision
+received frame ──▶  l2forward.forward(isid, dst, ingress) ──▶ Decision
                                                               │
-              unicast(pe) / flood({pe…})  ──────────────────▶ l2encap.encode(fields…)
+       unicast(pe) / flood({pe…}) / local_only  ───────────▶ l2encap.encode(fields…)
                                                               (builds the frame per remote PE)
 ```
 
@@ -49,14 +50,20 @@ chains them.
 
 ## The forward decision
 
-`forward(isid, dst_mac, src_pe, now, out) → Decision`:
+`forward(isid, dst_mac, ingress, now, out) → Decision`, where `ingress` is
+`.access` (a local customer port) or `.core = pe` (out of the fabric, replicated
+by remote PE `pe` — `l2encap.decode` supplies that id):
 
-- **known unicast** — `dst_mac` is a fresh FDB hit in `isid` →
+- **from the core** → `Decision.local_only`, always, whatever the destination:
+  deliver to local access circuits and put nothing back into the fabric. The
+  full mesh means every other member already got its own copy from the ingress
+  PE (RFC 4762 §4.4, RFC 7432 §8.3.1).
+- **from access, known unicast** — `dst_mac` is a fresh FDB hit in `isid` →
   `Decision.unicast(pe)`: send to that one remote PE.
-- **BUM** → `Decision.flood(set)`: the I-SID's member PEs **minus `src_pe`**
-  (split-horizon), written into the caller-supplied `out` buffer, ascending by
-  PE id (deterministic). The set may be empty (no other members, or an unknown
-  I-SID).
+- **from access, BUM** → `Decision.flood(set)`: the I-SID's member PEs, written
+  into the caller-supplied `out` buffer, ascending by PE id (deterministic).
+  Members are the *remote* PEs, so there is nothing to exclude. The set may be
+  empty (no members, or an unknown I-SID).
 
 **BUM classification** (Broadcast / Unknown-unicast / Multicast):
 
@@ -71,9 +78,12 @@ unknown-unicast case is decided inside `forward` against the FDB.
 
 ## Split-horizon, tenant isolation, ageing
 
-- **Split-horizon** — a flood set never contains `src_pe`: a BUM frame is never
-  replicated back toward the PE it arrived from (the E-LAN duplicate/loop guard,
-  matching `l2encap`). A `src_pe` that is not a member excludes nothing.
+- **Split-horizon** — the replication set for a core-received frame is
+  **empty**, never "members minus the source". Excluding only the source would
+  relay the frame to the other N−2 members, each of which would relay again —
+  `(N−1)(N−2)^(k−1)` copies at hop k, stopped only by `l2encap`'s TTL. The
+  claimed ingress PE is an attacker-controlled header field, and the rule does
+  not depend on its value.
 - **Tenant isolation** — the I-SID is the top-level key; a MAC learned in one
   I-SID is invisible to every other. A flood or MAC-move in tenant A can never
   affect tenant B.
@@ -115,8 +125,8 @@ order — both pinned by permanent tests.
   `learnStatic(isid, mac, pe) !void` — pinned, never-aged; `forget(isid, mac)
   bool` — delete.
 - `lookup(isid, mac, now) ?PeId` — the PE a known unicast would take, or null.
-- `forward(isid, dst, src_pe, now, out) !Decision` — the forward decision;
-  `replicationSet(isid, src_pe, out) ![]const PeId` — the split-horizon set
+- `forward(isid, dst, ingress, now, out) !Decision` — the forward decision;
+  `replicationSet(isid, ingress, out) ![]const PeId` — the replication set
   directly, for a pre-classified BUM frame.
 - `tick(now)` — reclaim aged entries. `fdbCount(isid)` / `isidCount()` — sizes.
 - `isBroadcast(mac)` / `isMulticast(mac)` / `isBumAddress(dst)` — pure BUM
@@ -129,15 +139,19 @@ zig build test-l2forward
 ```
 
 Unit tests cover BUM classification (broadcast/multicast/unicast); known-unicast
-learn→forward and its unknown-unicast fallback; split-horizon flood
-(`{2,3,4}` src 3 → `{2,4}`, and a non-member source excluding nothing); tenant
+learn→forward and its unknown-unicast fallback; full-mesh split horizon
+(access BUM floods all of `{2,3,4}`, core BUM floods nobody); a **hostile-peer**
+test that a lying/absent `ingress_pe` buys no relay; a 4-PE fabric composition
+test that one access broadcast yields exactly 3 copies and dies at hop 1
+(pre-fix: `(N−1)(N−2)^(k−1)`, bounded only by TTL); tenant
 isolation (a MAC in I-SID A is unknown in B); MAC move (last-writer-wins);
 ageing (fresh at the boundary, gone past it, `tick` reclaims, re-learn
 refreshes) and static entries; the per-tenant MAC-flood bound (`FdbFull` after a
 reclaim attempt, existing entries unaffected) plus I-SID/member caps;
 determinism (identical `(ops, now)` → identical decisions, insertion-order-
-independent sorted flood set); a permanent positive-control test proving a flood
-set that *keeps* the source PE contradicts split-horizon; and a leak check
+independent sorted flood set); a permanent positive-control test proving that
+the old "members − src_pe" set is a non-empty *relay* where the rule demands
+nothing; and a leak check
 (`testing.allocator`) that `deinit` frees every nested map. Green in Debug and
 `-Doptimize=ReleaseFast`.
 

@@ -2,15 +2,27 @@
 //! l2forward — the E-LAN edge forwarding table for a multi-tenant L2VPN fabric.
 //!
 //! This is the forwarding *brain* a provider edge (PE) runs: given a customer
-//! Ethernet frame's `{ I-SID, destination MAC, source PE }` it decides **where
-//! to send it** — to one remote PE (a learned unicast), or replicated to the
-//! I-SID's member PEs minus the source (a BUM/unknown flood). It pairs with the
-//! sibling `l2encap` codec, which builds the actual on-wire frame: `l2encap`
-//! carries the tenant tag / TTL / split-horizon *fields*; `l2forward` owns the
-//! *state* (per-tenant MAC learning + membership) those fields are computed
-//! from. The two agree by construction — same 24-bit **I-SID**, same 16-bit
-//! **PE id**, same split-horizon rule (never replicate a BUM frame back toward
-//! the PE it arrived from).
+//! Ethernet frame's `{ I-SID, destination MAC, ingress }` it decides **where to
+//! send it into the fabric** — to one remote PE (a learned unicast), replicated
+//! to the I-SID's member PEs (a BUM/unknown flood), or **nowhere at all** when
+//! the frame came out of the core. It pairs with the sibling `l2encap` codec,
+//! which builds the actual on-wire frame: `l2encap` carries the tenant tag / TTL
+//! / split-horizon *fields*; `l2forward` owns the *state* (per-tenant MAC
+//! learning + membership) those fields are computed from. The two agree by
+//! construction — same 24-bit **I-SID**, same 16-bit **PE id**, same full-mesh
+//! split-horizon rule.
+//!
+//! ## Full-mesh split horizon (RFC 4762 §4.4, RFC 7432 §8.3.1)
+//! Members are the **remote** PEs, and the PE-to-PE mesh is full: every PE is
+//! reachable from every other in one hop. So a frame that arrived **from the
+//! core** must never be sent back into the core — not to the PE it came from,
+//! and not to any other PE either, because that PE received its own copy
+//! directly from the ingress PE. Sending "members − source" is therefore not a
+//! weaker version of the rule, it is the replication storm the rule exists to
+//! prevent: with N members each relay produces N−2 further copies, i.e.
+//! `(N−1)(N−2)^(k−1)` frames at hop k, bounded only by `l2encap`'s TTL.
+//! `forward` takes the missing input — `Ingress` — so that this decision is
+//! expressible at all; excluding a source PE from a member set never was.
 //!
 //! Pure, deterministic, **time-injected** and **bounded**:
 //!   * no clock — every entry point that ages state takes a caller-supplied
@@ -36,15 +48,19 @@
 //!      overwritten by dynamic learning.
 //!
 //! ## Forward decision
-//! `forward(isid, dst_mac, src_pe, now, out)` classifies `dst_mac` and returns:
-//!   * **known unicast** — `dst_mac` is a fresh FDB hit in `isid` →
-//!     `Decision.unicast(pe)`: send to that one remote PE.
-//!   * **BUM** (Broadcast, Unknown-unicast, or Multicast) →
-//!     `Decision.flood(set)`: the I-SID's member PEs **minus `src_pe`**
-//!     (split-horizon), written into the caller-supplied `out` buffer in
-//!     ascending PE-id order (deterministic). `dst_mac` is BUM when it is the
-//!     broadcast address (all-ones), a multicast/group address (the I/G bit —
-//!     the LSB of the first octet — is set), or a unicast that misses the FDB.
+//! `forward(isid, dst_mac, ingress, now, out)` classifies `dst_mac` and returns:
+//!   * `.core` ingress → **`Decision.local_only`**, always: a frame received
+//!     from the core is delivered to local access circuits and never re-enters
+//!     the fabric (the split-horizon rule above). No FDB lookup is made.
+//!   * `.access` ingress, **known unicast** — `dst_mac` is a fresh FDB hit in
+//!     `isid` → `Decision.unicast(pe)`: send to that one remote PE.
+//!   * `.access` ingress, **BUM** (Broadcast, Unknown-unicast, or Multicast) →
+//!     `Decision.flood(set)`: the I-SID's member PEs — all of them, since the
+//!     local PE is by definition not in its own member set — written into the
+//!     caller-supplied `out` buffer in ascending PE-id order (deterministic).
+//!     `dst_mac` is BUM when it is the broadcast address (all-ones), a
+//!     multicast/group address (the I/G bit — the LSB of the first octet — is
+//!     set), or a unicast that misses the FDB.
 //!
 //! ## Ageing
 //! `tick(now)` reclaims dynamic FDB entries older than `Options.aging_ticks`;
@@ -149,15 +165,34 @@ pub const Options = struct {
 
 // ── decisions & errors ───────────────────────────────────────────────────────
 
+/// Where a frame entered this PE. This is the input the full-mesh split-horizon
+/// rule is decided from; without it the rule is not expressible (see the module
+/// header). The caller knows it from the port the frame arrived on: a customer
+/// access circuit, or the fabric-facing core (in which case `l2encap.decode`
+/// already yielded the `ingress_pe` that replicated it).
+pub const Ingress = union(enum) {
+    /// A local access circuit (customer-facing port). The frame may be
+    /// replicated into the fabric.
+    access,
+    /// The core, ingress-replicated by remote PE `pe`. RFC 4762 §4.4 /
+    /// RFC 7432 §8.3.1: it must not be forwarded back into the fabric at all.
+    core: PeId,
+};
+
 /// The forward decision for one frame.
 pub const Decision = union(enum) {
     /// Known unicast: send to exactly this one remote PE.
     unicast: PeId,
-    /// BUM / unknown-unicast: replicate to these member PEs. The slice is a
-    /// prefix of the caller's `out` buffer, ascending by PE id (deterministic),
-    /// already split-horizon-filtered (never contains the source PE). May be
-    /// empty (the I-SID has no other members, or is unknown).
+    /// BUM / unknown-unicast from an access circuit: replicate to these member
+    /// PEs. The slice is a prefix of the caller's `out` buffer, ascending by PE
+    /// id (deterministic). May be empty (the I-SID has no members, or is
+    /// unknown).
     flood: []const PeId,
+    /// The frame arrived from the core: deliver it to local access circuits
+    /// only and put **nothing** back into the fabric — full-mesh split horizon
+    /// (RFC 4762 §4.4, RFC 7432 §8.3.1). Local delivery is the caller's job;
+    /// this module models the fabric side, and the fabric side is empty.
+    local_only,
 };
 
 pub const AddMemberError = error{
@@ -309,33 +344,45 @@ pub const Table = struct {
         return e.pe;
     }
 
-    /// Decide where a frame `{ isid, dst_mac, src_pe }` goes as of `now`. A
-    /// known unicast → `unicast(pe)`; broadcast, multicast, or unknown-unicast →
-    /// `flood(set)` where `set` is `isid`'s members minus `src_pe`, written into
-    /// `out` (ascending, deterministic). Size `out` to `max_pes_per_isid`.
+    /// Decide where a frame `{ isid, dst_mac, ingress }` goes as of `now`.
+    /// `.core` ingress → `local_only` (never back into the fabric — RFC 4762
+    /// §4.4 / RFC 7432 §8.3.1); `.access` ingress: a known unicast →
+    /// `unicast(pe)`, and broadcast / multicast / unknown-unicast →
+    /// `flood(set)` where `set` is `isid`'s members, written into `out`
+    /// (ascending, deterministic). Size `out` to `max_pes_per_isid`.
     /// Read-only (no mutation, no reclamation).
-    pub fn forward(self: *const Table, isid: Isid, dst_mac: Mac, src_pe: PeId, now: Time, out: []PeId) ForwardError!Decision {
+    pub fn forward(self: *const Table, isid: Isid, dst_mac: Mac, ingress: Ingress, now: Time, out: []PeId) ForwardError!Decision {
+        // Full-mesh split horizon, decided BEFORE any table lookup: every other
+        // PE already received its own copy from the ingress PE, so relaying —
+        // unicast or BUM — would multiply the frame, not deliver it.
+        if (ingress == .core) return .local_only;
         if (!isBumAddress(dst_mac)) {
             if (self.lookup(isid, dst_mac, now)) |pe| return .{ .unicast = pe };
             // fall through: unknown unicast is BUM relative to this FDB
         }
-        return .{ .flood = try self.replicationSet(isid, src_pe, out) };
+        return .{ .flood = try self.replicationSet(isid, ingress, out) };
     }
 
-    /// The split-horizon replication set for a BUM frame that arrived from
-    /// `src_pe`: every member of `isid` except `src_pe`, ascending by PE id,
-    /// into `out`. Exposed directly for callers that have already classified the
-    /// frame as BUM. A `src_pe` that is not a member excludes nothing (all
-    /// members are returned).
-    pub fn replicationSet(self: *const Table, isid: Isid, src_pe: PeId, out: []PeId) ForwardError![]const PeId {
+    /// The replication set for a BUM frame with the given `ingress`, ascending
+    /// by PE id, into `out`. Exposed directly for callers that have already
+    /// classified the frame as BUM.
+    ///
+    /// * `.core` → **empty**, always. Full-mesh split horizon (RFC 4762 §4.4:
+    ///   a PE must not forward a frame received on one mesh PW onto another;
+    ///   RFC 7432 §8.3.1 for EVPN ingress replication). Members are the remote
+    ///   PEs and the mesh is full, so every one of them already got its own copy
+    ///   from the ingress PE — "members − src_pe" would be a relay, and relays
+    ///   compound: `(N−1)(N−2)^(k−1)` copies at hop k.
+    /// * `.access` → every member of `isid` (the local PE is never in its own
+    ///   member set, so there is nothing to exclude).
+    pub fn replicationSet(self: *const Table, isid: Isid, ingress: Ingress, out: []PeId) ForwardError![]const PeId {
+        if (ingress == .core) return out[0..0];
         const ie = self.isids.getPtr(isid) orelse return out[0..0];
         var n: usize = 0;
         var it = ie.members.keyIterator();
         while (it.next()) |pe_ptr| {
-            const pe = pe_ptr.*;
-            if (pe == src_pe) continue; // split-horizon: never back to the source PE
             if (n >= out.len) return error.BufferTooSmall;
-            out[n] = pe;
+            out[n] = pe_ptr.*;
             n += 1;
         }
         std.mem.sort(PeId, out[0..n], {}, std.sort.asc(PeId));
@@ -452,15 +499,15 @@ test "known unicast: learn then forward returns the single PE; a different MAC f
     try t.learn(10, macOf(0xAA), 2, 0); // M behind PE 2
 
     var buf: [16]PeId = undefined;
-    const d = try t.forward(10, macOf(0xAA), 5, 0, &buf);
+    const d = try t.forward(10, macOf(0xAA), .access, 0, &buf);
     try testing.expectEqual(Decision{ .unicast = 2 }, d);
 
-    // An unlearned unicast in the same I-SID is unknown → flood (members − src 5)
-    const d2 = try t.forward(10, macOf(0xBB), 5, 0, &buf);
-    try testing.expectEqualSlices(PeId, &.{2}, d2.flood);
+    // An unlearned unicast in the same I-SID is unknown → flood to every member.
+    const d2 = try t.forward(10, macOf(0xBB), .access, 0, &buf);
+    try testing.expectEqualSlices(PeId, &.{ 2, 5 }, d2.flood);
 }
 
-test "split-horizon flood: members {2,3,4}, src 3 → exactly {2,4}, ascending" {
+test "full-mesh split horizon: access BUM floods every member; core BUM floods nobody" {
     var t = testTable();
     defer t.deinit();
     // Insert members out of order to prove the output ordering is sorted, not
@@ -470,12 +517,103 @@ test "split-horizon flood: members {2,3,4}, src 3 → exactly {2,4}, ascending" 
     try t.addMember(7, 3);
 
     var buf: [16]PeId = undefined;
-    const d = try t.forward(7, broadcast, 3, 0, &buf);
-    try testing.expectEqualSlices(PeId, &.{ 2, 4 }, d.flood); // 3 excluded, ascending
+    // From a local access circuit: ingress-replicate to all members, ascending.
+    // Members are the REMOTE PEs, so there is nothing here to exclude.
+    const d = try t.forward(7, broadcast, .access, 0, &buf);
+    try testing.expectEqualSlices(PeId, &.{ 2, 3, 4 }, d.flood);
 
-    // src PE that is not a member excludes nothing → all three members.
-    const d2 = try t.forward(7, broadcast, 99, 0, &buf);
-    try testing.expectEqualSlices(PeId, &.{ 2, 3, 4 }, d2.flood);
+    // RFC 4762 §4.4 / RFC 7432 §8.3.1: a BUM frame that arrived from the core
+    // is never put back into the fabric — not to the PE it came from, and not
+    // to the other members either (they got their own copy from the ingress
+    // PE). "Members − src_pe" here is precisely the relay that storms.
+    try testing.expectEqual(Decision.local_only, try t.forward(7, broadcast, .{ .core = 3 }, 0, &buf));
+    try testing.expectEqual(@as(usize, 0), (try t.replicationSet(7, .{ .core = 3 }, &buf)).len);
+}
+
+test "hostile peer: a lying ingress_pe cannot buy a relay — every core BUM replicates to nobody" {
+    // The frame's claimed ingress PE is attacker-controlled: it rides in
+    // `l2encap`'s header and nothing authenticates it. Under the old
+    // "members − src_pe" rule a peer that stamped a NON-member id (or another
+    // member's id) got its frame relayed to 3 or 2 further PEs, each of which
+    // relayed again. The rule must not depend on that field's value at all.
+    var t = testTable();
+    defer t.deinit();
+    try t.addMember(7, 2);
+    try t.addMember(7, 3);
+    try t.addMember(7, 4);
+
+    var buf: [16]PeId = undefined;
+    const claims = [_]PeId{ 2, 3, 4, 99, 0, std.math.maxInt(PeId) }; // members, non-members, edges
+    for (claims) |claimed| {
+        const ingress: Ingress = .{ .core = claimed };
+        try testing.expectEqual(@as(usize, 0), (try t.replicationSet(7, ingress, &buf)).len);
+        try testing.expectEqual(Decision.local_only, try t.forward(7, broadcast, ingress, 0, &buf));
+        // A known unicast from the core is not relayed either: the destination
+        // PE already had its own copy delivered directly (full mesh).
+        try t.learn(7, macOf(0xC1), 2, 0);
+        try testing.expectEqual(Decision.local_only, try t.forward(7, macOf(0xC1), ingress, 0, &buf));
+    }
+}
+
+test "no BUM storm: a relayed copy in a converged 4-PE fabric dies at hop 1" {
+    // Faithful composition of the module's own decisions across a full mesh:
+    // PE 1 receives one broadcast on an access port; every PE that receives a
+    // core copy asks this table what to do with it. Before the fix each of the
+    // 3 first-hop copies produced 2 more, and those 2 each produced 2 more —
+    // `(N-1)(N-2)^(k-1)` copies at hop k, stopped only by l2encap's TTL 64.
+    const pes = [_]PeId{ 1, 2, 3, 4 };
+    var tables: [4]Table = undefined;
+    for (&tables) |*tbl| tbl.* = testTable();
+    defer for (&tables) |*tbl| tbl.deinit();
+    for (&tables, 0..) |*tbl, i| {
+        for (pes) |pe| if (pe != pes[i]) try tbl.addMember(11, pe); // members = the OTHER PEs
+    }
+
+    var buf: [16]PeId = undefined;
+    var copies: usize = 0;
+    // Hop 0: the access-ingress replication at PE 1.
+    var queue: [64]PeId = undefined;
+    var q_len: usize = 0;
+    const first = try tables[0].forward(11, broadcast, .access, 0, &buf);
+    for (first.flood) |pe| {
+        copies += 1;
+        queue[q_len] = pe;
+        q_len += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), copies); // 2, 3, 4 — one copy each
+
+    // Hops 1..8: every PE holding a core-received copy consults its own table.
+    var hop: usize = 0;
+    while (hop < 8 and q_len > 0) : (hop += 1) {
+        var next: [64]PeId = undefined;
+        var n_len: usize = 0;
+        for (queue[0..q_len]) |pe| {
+            const d = try tables[pe - 1].forward(11, broadcast, .{ .core = 1 }, 0, &buf);
+            switch (d) {
+                .local_only => {}, // delivered to local ACs; nothing re-enters the fabric
+                // The queue is capped so a regression storms the COUNT rather
+                // than overrunning this test's own buffer.
+                .flood => |set| for (set) |to| {
+                    copies += 1;
+                    if (n_len < next.len) {
+                        next[n_len] = to;
+                        n_len += 1;
+                    }
+                },
+                .unicast => |to| {
+                    copies += 1;
+                    if (n_len < next.len) {
+                        next[n_len] = to;
+                        n_len += 1;
+                    }
+                },
+            }
+        }
+        @memcpy(queue[0..n_len], next[0..n_len]);
+        q_len = n_len;
+    }
+    try testing.expectEqual(@as(usize, 0), q_len); // the frame stops after hop 0
+    try testing.expectEqual(@as(usize, 3), copies); // exactly one copy per remote PE
 }
 
 test "tenant isolation: a MAC learned in I-SID A does not affect I-SID B" {
@@ -487,9 +625,9 @@ test "tenant isolation: a MAC learned in I-SID A does not affect I-SID B" {
 
     var buf: [16]PeId = undefined;
     // In A: known unicast to PE 2.
-    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(100, macOf(0x11), 9, 0, &buf));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(100, macOf(0x11), .access, 0, &buf));
     // In B: the very same MAC is unknown → floods B's members, never unicast(2).
-    const d = try t.forward(200, macOf(0x11), 9, 0, &buf);
+    const d = try t.forward(200, macOf(0x11), .access, 0, &buf);
     try testing.expectEqualSlices(PeId, &.{8}, d.flood);
     try testing.expect(t.lookup(200, macOf(0x11), 0) == null);
     try testing.expect(t.lookup(100, macOf(0x11), 0) != null);
@@ -504,14 +642,14 @@ test "BUM classification drives flood: broadcast, multicast, unknown-unicast flo
 
     var buf: [16]PeId = undefined;
     // known unicast → unicast, NOT flood
-    try testing.expect((try t.forward(1, macOf(0x55), 9, 0, &buf)) == .unicast);
+    try testing.expect((try t.forward(1, macOf(0x55), .access, 0, &buf)) == .unicast);
     // broadcast → flood
-    try testing.expect((try t.forward(1, broadcast, 9, 0, &buf)) == .flood);
+    try testing.expect((try t.forward(1, broadcast, .access, 0, &buf)) == .flood);
     // multicast → flood
     const group: Mac = .{ 0x33, 0x33, 0, 0, 0, 1 }; // IPv6 multicast, I/G set
-    try testing.expect((try t.forward(1, group, 9, 0, &buf)) == .flood);
+    try testing.expect((try t.forward(1, group, .access, 0, &buf)) == .flood);
     // unknown unicast → flood
-    try testing.expect((try t.forward(1, macOf(0x66), 9, 0, &buf)) == .flood);
+    try testing.expect((try t.forward(1, macOf(0x66), .access, 0, &buf)) == .flood);
 }
 
 test "MAC move: relearn behind a new PE updates the decision (last-writer-wins)" {
@@ -519,9 +657,9 @@ test "MAC move: relearn behind a new PE updates the decision (last-writer-wins)"
     defer t.deinit();
     var buf: [16]PeId = undefined;
     try t.learn(3, macOf(0x77), 2, 0);
-    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(3, macOf(0x77), 9, 5, &buf));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(3, macOf(0x77), .access, 5, &buf));
     try t.learn(3, macOf(0x77), 7, 10); // same MAC, now seen from PE 7
-    try testing.expectEqual(Decision{ .unicast = 7 }, try t.forward(3, macOf(0x77), 9, 20, &buf));
+    try testing.expectEqual(Decision{ .unicast = 7 }, try t.forward(3, macOf(0x77), .access, 20, &buf));
     try testing.expectEqual(@as(usize, 1), t.fdbCount(3)); // a move, not a second entry
 }
 
@@ -533,16 +671,16 @@ test "ageing: fresh → unicast; past aging_ticks the entry is gone → flood; r
 
     var buf: [16]PeId = undefined;
     // t=1100: age exactly 100 == aging_ticks → still fresh (boundary).
-    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(4, macOf(0x88), 9, 1100, &buf));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(4, macOf(0x88), .access, 1100, &buf));
     // t=1101: age 101 > 100 → expired, treated as unknown → flood (lazy).
-    try testing.expect((try t.forward(4, macOf(0x88), 9, 1101, &buf)) == .flood);
+    try testing.expect((try t.forward(4, macOf(0x88), .access, 1101, &buf)) == .flood);
     // The stale entry lingers until a tick reclaims it.
     try testing.expectEqual(@as(usize, 1), t.fdbCount(4));
     t.tick(1101);
     try testing.expectEqual(@as(usize, 0), t.fdbCount(4));
     // Relearn refreshes the age: fresh again well past the original expiry.
     try t.learn(4, macOf(0x88), 2, 1101);
-    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(4, macOf(0x88), 9, 1200, &buf));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(4, macOf(0x88), .access, 1200, &buf));
 }
 
 test "static entry is never aged and not overwritten by dynamic learn" {
@@ -551,12 +689,12 @@ test "static entry is never aged and not overwritten by dynamic learn" {
     try t.learnStatic(5, macOf(0x99), 2);
     var buf: [16]PeId = undefined;
     // Never expires, even far past any aging window.
-    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x99), 9, std.math.maxInt(Time), &buf));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x99), .access, std.math.maxInt(Time), &buf));
     t.tick(std.math.maxInt(Time));
     try testing.expectEqual(@as(usize, 1), t.fdbCount(5));
     // Dynamic learn does not move a static entry.
     try t.learn(5, macOf(0x99), 7, 10);
-    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x99), 9, 10, &buf));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x99), .access, 10, &buf));
     // forget removes it.
     try testing.expect(t.forget(5, macOf(0x99)));
     try testing.expect(t.lookup(5, macOf(0x99), 10) == null);
@@ -586,7 +724,7 @@ test "isExpired clock-skew clamp: now before learned_at is treated as age 0 (fre
     // (e.g. a clock adjustment). age must clamp to 0, never underflow.
     try t.learn(7, macOf(0xBB), 2, 1_000);
     var buf: [16]PeId = undefined;
-    const d = try t.forward(7, macOf(0xBB), 9, 10, &buf); // now(10) < learned_at(1000)
+    const d = try t.forward(7, macOf(0xBB), .access, 10, &buf); // now(10) < learned_at(1000)
     try testing.expectEqual(Decision{ .unicast = 2 }, d);
     try testing.expectEqual(@as(?PeId, 2), t.lookup(7, macOf(0xBB), 0));
 }
@@ -642,7 +780,7 @@ test "membership: add/remove/isMember; removeMember leaves the FDB intact" {
 
 test "determinism: identical (ops, now) streams produce identical decisions" {
     const Run = struct {
-        fn drive() [3]PeId {
+        fn drive() [4]PeId {
             var t = Table.init(testing.allocator, .{});
             defer t.deinit();
             // Add members in a scrambled order; the sorted flood set must be
@@ -652,49 +790,54 @@ test "determinism: identical (ops, now) streams produce identical decisions" {
             t.addMember(1, 30) catch unreachable;
             t.addMember(1, 20) catch unreachable;
             var buf: [8]PeId = undefined;
-            const d = t.forward(1, broadcast, 20, 0, &buf) catch unreachable; // exclude 20
-            var out: [3]PeId = undefined;
-            @memcpy(&out, d.flood[0..3]);
+            const d = t.forward(1, broadcast, .access, 0, &buf) catch unreachable;
+            var out: [4]PeId = undefined;
+            @memcpy(&out, d.flood[0..4]);
             return out;
         }
     };
-    try testing.expectEqual([3]PeId{ 10, 30, 40 }, Run.drive());
+    try testing.expectEqual([4]PeId{ 10, 20, 30, 40 }, Run.drive());
     try testing.expectEqual(Run.drive(), Run.drive());
 }
 
 // Permanent positive control (CONVENTIONS/brief): prove the split-horizon
-// assertion has teeth. A deliberately-broken replication that INCLUDES the
-// source PE must produce a different (wrong) set — one that contains `src_pe` —
-// so that if `replicationSet` ever stopped excluding the source, the
-// split-horizon test above would go RED.
-test "positive control: a flood set that keeps the source PE contradicts split-horizon" {
+// assertion has teeth. This control was rewritten with the fix for the
+// full-mesh rule (RFC 4762 §4.4 / RFC 7432 §8.3.1): it used to pin
+// "members − src_pe" as *correct* and the full member set as *broken*, when in
+// fact BOTH relay a core-received frame back into the fabric and both storm.
+// The genuinely broken variant is now the one this module used to compute.
+test "positive control: 'members − src_pe' is a relay, and it is what storms the fabric" {
     var t = testTable();
     defer t.deinit();
     try t.addMember(1, 2);
     try t.addMember(1, 3);
     try t.addMember(1, 4);
     const src: PeId = 3;
+    const ingress: Ingress = .{ .core = src };
 
     var buf: [16]PeId = undefined;
-    const correct = try t.replicationSet(1, src, &buf);
-    // The correct, split-horizoned set never contains the source PE.
-    try testing.expect(std.mem.indexOfScalar(PeId, correct, src) == null);
-    try testing.expectEqualSlices(PeId, &.{ 2, 4 }, correct);
+    // The correct set for a core-received BUM frame is EMPTY — nothing at all
+    // goes back into the fabric.
+    const correct = try t.replicationSet(1, ingress, &buf);
+    try testing.expectEqual(@as(usize, 0), correct.len);
 
-    // The broken variant: every member including the source. It DOES contain the
-    // source PE and differs from the correct set — exactly the regression the
-    // split-horizon test would catch.
+    // The broken variant: the old rule, every member except the source. It is
+    // non-empty, so each of the N−1 PEs that received the ingress replication
+    // would relay to N−2 more, and so on — the storm. If `replicationSet` ever
+    // regressed to this, the split-horizon and no-storm tests above go RED.
     var broken: [16]PeId = undefined;
     var n: usize = 0;
     var it = t.isids.getPtr(1).?.members.keyIterator();
     while (it.next()) |pe_ptr| {
+        if (pe_ptr.* == src) continue;
         broken[n] = pe_ptr.*;
         n += 1;
     }
     std.mem.sort(PeId, broken[0..n], {}, std.sort.asc(PeId));
-    try testing.expect(std.mem.indexOfScalar(PeId, broken[0..n], src) != null);
+    try testing.expectEqualSlices(PeId, &.{ 2, 4 }, broken[0..n]);
     try testing.expect(!std.mem.eql(PeId, correct, broken[0..n]));
-    try testing.expectEqualSlices(PeId, &.{ 2, 3, 4 }, broken[0..n]);
+    // Each relayed copy is itself relayable → unbounded but for l2encap's TTL.
+    try testing.expect(broken[0..n].len > 0);
 }
 
 test "forward: BufferTooSmall when out cannot hold the replication set" {
@@ -704,14 +847,14 @@ test "forward: BufferTooSmall when out cannot hold the replication set" {
     try t.addMember(1, 3);
     try t.addMember(1, 4);
     var tiny: [1]PeId = undefined; // room for 1, need 2 after excluding src
-    try testing.expectError(error.BufferTooSmall, t.forward(1, broadcast, 9, 0, &tiny));
+    try testing.expectError(error.BufferTooSmall, t.forward(1, broadcast, .access, 0, &tiny));
 }
 
 test "forward on an unknown I-SID floods to an empty set" {
     var t = testTable();
     defer t.deinit();
     var buf: [16]PeId = undefined;
-    const d = try t.forward(12345, broadcast, 1, 0, &buf);
+    const d = try t.forward(12345, broadcast, .access, 0, &buf);
     try testing.expectEqual(@as(usize, 0), d.flood.len);
 }
 

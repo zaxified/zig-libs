@@ -55,13 +55,18 @@ it (or filling `out`/`scratch`) sets `truncated` and `next_wakeup == now`.
   one PSNP per chunk, and **SSN is cleared** for the entries once the PSNP is
   produced.
 - **CSNP (periodic, §7.3.15.2):** on a `complete_snp_interval` cadence per
-  interface (default **10**), the whole DB is summarised (`lsdb.summarise` over
-  `[00…00, FF…FF]`), sorted, and chunked into CSNPs whose `[start, end]` ranges
-  **tile the LSP-ID space contiguously** — each chunk's start is one past the
-  previous chunk's last LSP-ID, the first starts at `00…00`, the last ends at
-  `FF…FF` — so a neighbour's completeness check sees no gap or overlap. An empty
-  DB still emits one covering CSNP. The initial CSNP fires on the first `poll`
-  that sees an interface Up; thereafter only on cadence.
+  interface (default **10**), the DB is summarised (`lsdb.summarise`), sorted,
+  and chunked into CSNPs whose `[start, end]` ranges **tile the LSP-ID space
+  contiguously** — each chunk's start is one past the previous chunk's last
+  LSP-ID, the first starts at `00…00`, the last ends at `FF…FF` — so a
+  neighbour's completeness check sees no gap or overlap. Because §7.3.15.2 makes
+  an advertised range a **claim** that every in-range LSP is listed (an omitted
+  one gets flooded back at us), a database too large for one summary buffer is
+  advertised across **several polls**: each poll covers the largest window it can
+  enumerate completely, sets `truncated`, and the next poll resumes at
+  `end + 1` — the last range says `FF…FF` only when the series really got there.
+  An empty DB still emits one covering CSNP. The initial CSNP fires on the first
+  `poll` that sees an interface Up; thereafter only on cadence.
 
 ## Up-interface gating
 
@@ -115,6 +120,10 @@ SRM, and the re-send stops); **SSN → PSNP** (exactly the flagged LSPs, decoded
 and checked, SSN cleared afterward); **periodic CSNP** (emitted on cadence, not
 every poll, summarising the DB — decoded and checked); **CSNP chunking**
 (contiguous gap-free `[start, end]` ranges tiling the DB, full entry coverage);
+two **hostile-peer** tests over a 300-LSP database (> the 256-entry summary
+buffer): no CSNP ever claims a range holding an LSP it did not list, and a peer
+LSDB fed the whole series re-floods and requests **nothing** (ISO 10589
+§7.3.15.2);
 **up-interface gating**; **next-wakeup** = min(next retransmit, next CSNP);
 **determinism** (identical inputs → identical effects); **truncation** (full
 `out` → `truncated`, `next_wakeup == now`); the **last-sent prune bound**; a
