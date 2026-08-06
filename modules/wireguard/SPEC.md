@@ -106,6 +106,79 @@ wrong PSK fail closed). A netns-gated **live in-kernel WireGuard interop** test 
 `unshare -rn` + `ip`/wireguard module) runs a real handshake against the kernel and AEAD-decrypts a
 kernel-sent transport packet under the derived key, including a non-zero PSK.
 
+## Transport data plane (`transport.zig`)
+
+The type-4 seal/open path the handshake exists to key: `SendSession.seal` turns one plaintext packet
+into `header ‖ AEAD(T_send, nonce(counter), pad16(packet), ε)`, `RecvSession.open` reverses it.
+Four protocol details carry the interop risk, and each is pinned by its own test rather than by a
+round trip: the nonce is **4 zero bytes ‖ counter little-endian** (byte-exact expectations for 0, 1,
+2, 255, 256, 2^32−1, 2^32, an asymmetric value and 2^64−1); the **AAD is empty** (the header is not
+associated data — the counter is bound through the nonce); the plaintext is **zero-padded to a
+multiple of 16** with `paddedLen(0) == 0`, so a keepalive is 32 bytes on the wire and not 48; and
+`open` returns the **padded** length, because WireGuard deliberately does not encode the true one —
+the receiver takes it from the inner IP header, so this codec must not try to strip padding.
+`seal` refuses at `REJECT_AFTER_MESSAGES` (2^64−2^13−1) instead of wrapping — a wrapped counter
+repeats a nonce, which is fatal for ChaCha20-Poly1305 — mirroring the same refuse-don't-wrap stance
+`aeadframe`'s sealer takes at its own ceiling. `REKEY_AFTER_MESSAGES` (2^60) is a *policy* limit
+with 2^60 of margin left, so it is surfaced as a typed `RekeyState.due` on every seal and open
+rather than enforced: continuing silently would be wrong, but dropping a packet the peer will still
+accept would be worse. Anti-replay is an RFC-6479 circular bitmap `default_window_bits` (8192)
+counters wide — the same width `REJECT_AFTER_MESSAGES` reserves below the u64 ceiling and the width
+the Linux implementation uses. Counters are tracked internally as `counter + 1` so the all-zero
+state means "nothing received" and counter 0 stays an ordinary first packet. `accepts` is a
+read-only pre-check and `commit` runs only after the tag verifies, so a forged packet can never burn
+a legitimate counter's window slot. Nothing branches on secret data: the counter, the receiver index
+and the length are all cleartext header fields. Zero allocation — every entry point writes into a
+caller buffer, and `seal` pads and encrypts in place inside it (`chachapoly` documents and tests the
+`c == m` case).
+
+**Why not built on the `aeadframe` sibling.** `aeadframe` is the right shape in the abstract — per-key
+AEAD records, monotonic counter nonce, sliding-window anti-replay, refuse-don't-wrap — and its
+`Channel` was evaluated first. It cannot be used here because WireGuard's wire format is fixed by
+the protocol and differs from `aeadframe`'s in every field that matters: a 16-byte
+`type ‖ reserved ‖ receiver_index ‖ counter` header (all little-endian) vs `aeadframe`'s 13-byte
+`version ‖ epoch ‖ seq` (all **big**-endian); a nonce of `4 zero bytes ‖ counter LE` vs
+`epoch BE ‖ seq BE`; an **empty** AAD vs a mandatory context/tenant binding; a **pad-to-16** rule
+`aeadframe` has no concept of (its `sealedLen` is `overhead + pt_len`); and protocol counter limits
+(`2^64−2^13−1` / `2^60`) instead of a plain u64 ceiling. Sealing through `aeadframe` and rewriting
+the framing afterwards would mean re-encrypting under a different nonce — i.e. not using it at all.
+The one genuinely reusable piece was `aeadframe.ReplayWindow`, whose semantics (advisory `accepts`,
+post-authentication `commit`) are exactly right; it is capped at **64** counters by its `u64` bitmap,
+and WireGuard's own constants reserve 8192, so a 64-wide window would drop legitimate reordered
+packets on any fast link. Widening it belongs to `aeadframe`'s owner, not to a caller, so this
+module implements the wider circular bitmap locally — the same relationship `aeadframe`'s own
+`replay.zig` documents towards the windows in `oscore`/`snmp`/`iec62351`. No new module dependency
+was added (`noise.zig` → `chachapoly`, already declared).
+
+**Verification.** WireGuard publishes no fixed-input transport-data vector, and none was
+self-generated in place of one. What anchors this: (1) the nonce layout against **literal expected
+bytes** transcribed from whitepaper §5.4.6, at the counters where a byte-swap or a 32-bit truncation
+shows up (a consistent nonce error is invisible to any round trip, which is why this test exists at
+all) — plus a permanent positive control showing counter 0 is exactly where a big-endian nonce
+*would* agree, i.e. why the handshake KATs cannot catch it; (2) a **differential over the whole
+message** — the same packet rebuilt with `std.crypto.aead.chacha_poly` (an independent AEAD) over a
+nonce taken from that literal table and an independently written header/padding, byte-identical at
+14 payload lengths × 5 counters, then cross-opened; (3) the netns-gated **live kernel interop** test,
+which now decrypts the kernel's keepalive *through `RecvSession.open`* rather than through a
+hand-rolled AEAD call, making the kernel an oracle for the framing too — real, but it SKIPS without
+root, so it is not counted as the offline anchor; (4) the replay window against a brute-force
+reference oracle over a 20 000-step randomised trace at three widths. Behavioural tests: round trip
+both directions, keepalive, send/recv keys not interchangeable, replay rejected, out-of-order-inside-
+the-window accepted, the exact trailing-edge boundary (`capacity` in, `capacity + 1` out), a forged
+packet not burning a window slot, `REJECT_AFTER_MESSAGES` refused on both seal and open,
+`REKEY_AFTER_MESSAGES` signalled, padding at 0/1/15/16/17/31/32/1419/1420, truncated / wrong-type /
+dirty-reserved-byte / wrong-receiver / tampered inputs, buffer sizing on both sides, and a
+`std.testing.fuzz` harness over `open`.
+
+**Measured** (i7-7920HQ, AVX2, ReleaseFast, `-Dcpu=native`, 1420-byte payload, `WIREGUARD_BENCH=1`):
+the full `seal` path — header write, copy-and-pad, AEAD, counter limits — runs **~1.3–1.5 µs/packet
+(~0.7 Mpps, ~1.0 GB/s)**, and `open` (which additionally updates the replay window) the same within
+noise. The bare AEAD alone is ~1.3–1.4 µs, so the module's framing costs approximately nothing next
+to the crypto; the 2.3–2.4× `chachapoly`-over-std ratio therefore survives to the API a consumer
+actually calls. Still no socket, no routing table and no queue in the timed region — a real tunnel
+adds a syscall (~1–2 µs) per packet on top, which will dominate.
+
 ## Status
-`gap · linux · client · reentrant` + deps: `netlink`, `genetlink` — canonical source is
-`pub const meta` in src/root.zig. (The handshake scaffold above has no dependency on either.)
+`gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly` — canonical source is
+`pub const meta` in src/root.zig. (The handshake + transport half above depends only on
+`chachapoly`/std.crypto, not on either netlink module.)

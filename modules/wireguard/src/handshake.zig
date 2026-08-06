@@ -38,6 +38,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const noise = @import("noise.zig");
+/// The transport-data (type 4) seal/open data plane the completed handshake
+/// keys. Imported one way only — `transport.zig` knows nothing about the
+/// handshake, so it stays usable with keys from any source.
+const transport = @import("transport.zig");
 
 comptime {
     // The mac1/mac2 computations and the KAT/interop tests view the extern
@@ -310,12 +314,11 @@ pub const Handshake = struct {
 
     /// The 12-byte AEAD nonce for a 64-bit counter: 4 zero bytes followed by
     /// the counter, little-endian (whitepaper 5.4.6). Handshake messages
-    /// always use counter 0.
-    fn counterNonce(counter: u64) [noise.Aead.nonce_length]u8 {
-        var n: [noise.Aead.nonce_length]u8 = @splat(0);
-        std.mem.writeInt(u64, n[4..12], counter, .little);
-        return n;
-    }
+    /// always use counter 0 — which is why the handshake KATs below cannot
+    /// detect an endianness error here and `transport.zig` pins the layout
+    /// against fixed bytes. ONE definition, shared with the data plane, so
+    /// that pinning covers this call site too.
+    const counterNonce = transport.counterNonce;
 
     /// Initiator step 1: derive `Ci`/`Hi` from `noise.CONSTRUCTION` +
     /// `noise.IDENTIFIER` + `remote_static_public`, generate an ephemeral
@@ -586,7 +589,7 @@ pub const Handshake = struct {
     /// played to call this correctly.
     /// Consumes the handshake: the chaining key, transcript hash and the
     /// ephemeral private key are wiped — only the returned keys survive.
-    pub fn deriveTransportKeys(self: *Handshake, is_initiator: bool) struct { send: [32]u8, recv: [32]u8 } {
+    pub fn deriveTransportKeys(self: *Handshake, is_initiator: bool) transport.TransportKeys {
         std.debug.assert(self.state == .complete);
         // Kdf2(ck, ε) = (T1, T2): kdf2 leaves T1 in the chaining key and
         // returns T2.
@@ -599,6 +602,19 @@ pub const Handshake = struct {
             .{ .send = t1, .recv = t2 }
         else
             .{ .send = t2, .recv = t1 };
+    }
+
+    /// The one-call bridge from a completed handshake to the data plane:
+    /// derive the transport keys and wire them, with both session indices,
+    /// into a `transport.Session`. Prefer this over calling
+    /// `deriveTransportKeys` by hand — it is what makes the send/receive key
+    /// and the local/remote index assignment impossible to swap (a swap
+    /// round-trips against yourself and fails against every real peer).
+    /// Consumes the handshake exactly as `deriveTransportKeys` does.
+    pub fn transportSession(self: *Handshake, is_initiator: bool) transport.Session {
+        const local = self.local_index;
+        const remote = self.remote_index;
+        return transport.Session.init(self.deriveTransportKeys(is_initiator), local, remote);
     }
 
     /// `MAC(mac1_key(remote_static_public), msg_bytes_before_mac1)` — the
@@ -632,6 +648,12 @@ test "message type wire values" {
     try testing.expectEqual(@as(u32, 2), @intFromEnum(MessageType.handshake_response));
     try testing.expectEqual(@as(u32, 3), @intFromEnum(MessageType.cookie_reply));
     try testing.expectEqual(@as(u32, 4), @intFromEnum(MessageType.transport_data));
+    // `transport.zig` carries its own copy of the type tag (it deliberately
+    // does not import this file, so the dependency runs one way only). Pin
+    // the two together here rather than trusting they stay equal.
+    try testing.expectEqual(@intFromEnum(MessageType.transport_data), transport.message_type);
+    try testing.expectEqual(@sizeOf(MessageTransportHeader), transport.header_len);
+    try testing.expectEqual(noise.tag_len, transport.tag_len);
 }
 
 test "wire message sizes match the WireGuard protocol exactly" {
@@ -756,13 +778,12 @@ test "KAT: full handshake, byte-exact messages and transport keys" {
 // `noise.Aead` is the SIMD `chachapoly` sibling; `noise.StdAead` is
 // `std.crypto.aead.chacha_poly.ChaCha20Poly1305`. The KAT above already pins
 // the HANDSHAKE messages byte-exact against an independent reference under
-// the swapped-in AEAD. This pins the TRANSPORT-DATA direction, which has no
-// published vector and (today) no seal/open API in this module — the packet
-// shape is reproduced here exactly as the protocol and the kernel-interop
-// test below define it: `AEAD(T_send, counterNonce(counter), packet, ε)`,
-// empty associated data, the 12-byte nonce being 4 zero bytes || LE64
-// counter. Every length across the ChaCha block boundaries up to a full
-// 1500-byte MTU, plus the counter values that exercise the nonce encoding.
+// the swapped-in AEAD. This pins the raw AEAD call underneath the
+// TRANSPORT-DATA direction: `AEAD(T_send, counterNonce(counter), packet, ε)`,
+// empty associated data, over every length across the ChaCha block boundaries
+// up to a full 1500-byte MTU and the counter values that exercise the nonce
+// encoding. The FRAMING on top of it (header, padding, limits, replay) is
+// `transport.zig`'s, and is differentially anchored there.
 test "differential: transport-data seal is byte-identical under chachapoly and std" {
     const key = kat.t_initiator_send;
     var packet: [1500]u8 = undefined;
@@ -839,6 +860,57 @@ test "differential: the handshake KAT messages are identical under std's AEAD to
         k,
     );
     try testing.expectEqualSlices(u8, &msg1.encrypted_timestamp, &enc_ts);
+}
+
+test "handshake → data plane: the KAT session carries packets both ways" {
+    // The seam this covers: `transportSession` must hand each half the key and
+    // index it needs. The KAT above pins the two transport keys against an
+    // independent reference, so this asserts the WIRING against those pinned
+    // values — a swapped pair would still round-trip, so the equality checks
+    // below (not the round trip) are the test.
+    const io = std.testing.io;
+    var ini = kat.initiator();
+    var rsp = kat.responder();
+    const msg1 = try ini.createInitiation(io, kat.timestamp);
+    try rsp.consumeInitiation(msg1);
+    const msg2 = try rsp.createResponse(io);
+    try ini.consumeResponse(msg2);
+
+    var i_sess = ini.transportSession(true);
+    var r_sess = rsp.transportSession(false);
+
+    // Keys land on the half that uses them, against the KAT's fixed values.
+    try testing.expectEqual(kat.t_initiator_send, i_sess.send.key);
+    try testing.expectEqual(kat.t_initiator_recv, i_sess.recv.key);
+    try testing.expectEqual(kat.t_initiator_send, r_sess.recv.key);
+    try testing.expectEqual(kat.t_initiator_recv, r_sess.send.key);
+    // Indices: we stamp the PEER's index on what we send, and expect our own
+    // on what we receive.
+    try testing.expectEqual(kat.idx_r, i_sess.send.receiver_index);
+    try testing.expectEqual(kat.idx_i, i_sess.recv.local_index);
+    try testing.expectEqual(kat.idx_i, r_sess.send.receiver_index);
+    try testing.expectEqual(kat.idx_r, r_sess.recv.local_index);
+
+    var wire: [1500]u8 = undefined;
+    var out: [1500]u8 = undefined;
+    const packet = "an inner IP packet";
+    const sr = try i_sess.send.seal(&wire, packet);
+    // The header carries the responder's index, as any real peer would expect.
+    try testing.expectEqual(kat.idx_r, (try transport.parseHeader(wire[0..sr.len])).receiver_index);
+    // Cross-wiring fails: the initiator's own receiver cannot open what the
+    // initiator sent — it is addressed to the responder's index.
+    try testing.expectError(error.WrongReceiver, i_sess.recv.open(&out, wire[0..sr.len]));
+
+    const orr = try r_sess.recv.open(&out, wire[0..sr.len]);
+    try testing.expectEqualSlices(u8, packet, out[0..packet.len]);
+    try testing.expectEqual(transport.paddedLen(packet.len), orr.len);
+
+    // …and the reverse direction, under the other key.
+    var wire2: [1500]u8 = undefined;
+    const sr2 = try r_sess.send.seal(&wire2, "and one back");
+    const orr2 = try i_sess.recv.open(&out, wire2[0..sr2.len]);
+    try testing.expectEqualSlices(u8, "and one back", out[0..12]);
+    try testing.expectEqual(@as(usize, 16), orr2.len);
 }
 
 test "self-consistency: full handshake with fresh random keys" {
@@ -1091,7 +1163,7 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
         .preshared_key = psk,
         .local_index = 0x5a5a5a5a,
     };
-    var keys: ?struct { send: [32]u8, recv: [32]u8 } = null;
+    var session: ?transport.Session = null;
 
     // Drive the exchange: initiation in → response out → keepalive in.
     var buf: [2048]u8 = undefined;
@@ -1117,8 +1189,10 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                 @memcpy(std.mem.asBytes(&msg1), buf[0..@sizeOf(MessageInitiation)]);
                 try hs.consumeInitiation(msg1);
                 var msg2 = try hs.createResponse(io);
-                const k = hs.deriveTransportKeys(false);
-                keys = .{ .send = k.send, .recv = k.recv };
+                // Through the real data-plane API, not a hand-rolled AEAD
+                // call: this is what makes the kernel an oracle for
+                // `transport.zig`'s framing, not only for the handshake.
+                session = hs.transportSession(false);
                 const src_len_const: linux.socklen_t = src_len;
                 const wrc = linux.sendto(
                     fd,
@@ -1132,22 +1206,22 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                 try testing.expectEqual(@sizeOf(MessageResponse), wrc);
             },
             @intFromEnum(MessageType.transport_data) => {
-                // Keepalive: 16-byte header + empty plaintext + 16-byte tag.
-                if (n != @sizeOf(MessageTransportHeader) + noise.tag_len) continue;
-                const k = keys orelse continue; // transport before our response? ignore
+                // Keepalive: 16-byte header + empty plaintext + 16-byte tag —
+                // i.e. `transport.sealedLen(0)`, which is what the protocol's
+                // "pad to a multiple of 16" rule yields for an EMPTY payload
+                // (a rule that padded 0 up to 16 would make this 48).
+                if (n != transport.sealedLen(0)) continue;
+                if (session == null) continue; // transport before our response? ignore
+                const sess = &session.?;
                 try testing.expectEqual(hs.local_index, std.mem.readInt(u32, buf[4..8], .little));
-                const counter = std.mem.readInt(u64, buf[8..16], .little);
                 var empty: [0]u8 = .{};
-                // THE oracle assertion: a kernel-encrypted packet decrypts
-                // under our derived receive key.
-                try noise.Aead.decrypt(
-                    &empty,
-                    buf[16..16],
-                    buf[16..32].*,
-                    "",
-                    Handshake.counterNonce(counter),
-                    k.recv,
-                );
+                // THE oracle assertion: a kernel-encrypted packet opens
+                // through our data-plane API under our derived receive key.
+                // Everything the kernel had to agree with us about is in this
+                // one call — nonce layout and endianness, empty AAD, header
+                // layout, receiver index, and the padding rule.
+                const r = try sess.recv.open(&empty, buf[0..n]);
+                try testing.expectEqual(@as(usize, 0), r.len);
                 return; // interop proven
             },
             else => continue,

@@ -45,11 +45,12 @@
 //! usage — behavior/attribute-shape reference only, no source consulted or
 //! copied.
 //!
-//! `noise.zig`/`handshake.zig` implement the OTHER half of the protocol — the
-//! Noise_IKpsk2 cryptographic data-plane handshake (initiation/response,
-//! transport-key derivation, mac1/mac2). It shares this module because both
-//! halves implement the one WireGuard protocol, but has no dependency on the
-//! netlink control-plane code above (std.crypto only).
+//! `noise.zig`/`handshake.zig`/`transport.zig` implement the OTHER half of the
+//! protocol — the Noise_IKpsk2 cryptographic handshake (initiation/response,
+//! transport-key derivation, mac1/mac2) and the transport-data (type 4) seal/
+//! open data plane those keys exist for. That half shares this module because
+//! both halves implement the one WireGuard protocol, but has no dependency on
+//! the netlink control-plane code above (std.crypto / `chachapoly` only).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -70,6 +71,10 @@ pub const genl = @import("genetlink");
 // std.crypto only). See the module-level doc-comments in noise.zig/handshake.zig.
 pub const noise = @import("noise.zig");
 pub const handshake = @import("handshake.zig");
+/// The transport-data (type 4) data plane: seal/open a packet under the keys
+/// `handshake.Handshake.deriveTransportKeys` produced, with the protocol's
+/// padding rule, counter limits and anti-replay window.
+pub const transport = @import("transport.zig");
 
 pub const meta = .{
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
@@ -1528,6 +1533,7 @@ test "integration (root): set + get round-trip on a real wg interface" {
 test {
     _ = noise;
     _ = handshake;
+    _ = transport;
     // Opt-in throughput bench (WIREGUARD_BENCH); a plain `error.SkipZigTest`
     // otherwise. See its module doc comment for what it does NOT measure.
     _ = @import("bench.zig");

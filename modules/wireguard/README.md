@@ -111,3 +111,46 @@ ChaCha20-Poly1305, keyed BLAKE2s-128 for mac1, HKDF-over-HMAC-BLAKE2s); no
 `netlink` dependency. Verified with a full-handshake known-answer vector,
 initiator↔responder self-consistency, and a netns-gated live interop
 against the in-kernel WireGuard implementation. Provenance: see `/NOTICE`.
+
+## Transport data — the data plane (`transport.zig`)
+
+What the handshake keys are *for*: type-4 transport-data messages. One
+outbound packet in, one wire message out; one wire message in, one packet
+out — with WireGuard's own header, padding rule, counter limits and
+anti-replay window. Zero allocation on both paths (caller buffers only).
+
+```zig
+const transport = wireguard.transport;
+
+// From a completed handshake, in one call — this is what makes the
+// send/recv key and the local/remote index impossible to swap:
+var sess = hs.transportSession(is_initiator);
+
+// Outbound: `out` must be >= transport.sealedLen(packet.len) and must not
+// overlap `packet`.
+var out: [transport.sealedLen(1420)]u8 = undefined;
+const s = try sess.send.seal(&out, ip_packet);
+if (s.rekey == .due) startNewHandshake(); // typed signal, never silent
+try udp.send(out[0..s.len]);
+
+// Inbound: demultiplex on the header first, then open under that session.
+const hdr = try transport.parseHeader(datagram);   // -> receiver_index
+var plain: [1440]u8 = undefined;
+const o = try sess.recv.open(&plain, datagram);    // Replayed / auth errors
+// o.len is the PADDED length — the true packet length comes from the inner
+// IP header, exactly as the protocol intends.
+```
+
+- **Nonce** = 4 zero bytes ‖ counter as 8 bytes **little-endian**; **AAD is
+  empty**; the plaintext is **zero-padded to a multiple of 16**
+  (`paddedLen(0) == 0`, so a keepalive is a 32-byte message).
+- **Counter limits are enforced, not decorative:** `seal` refuses at
+  `reject_after_messages` (2^64−2^13−1) rather than wrapping a nonce, and
+  every seal/open reports `RekeyState.due` once past `rekey_after_messages`
+  (2^60).
+- **Anti-replay:** an RFC-6479-style circular bitmap 8192 counters wide (the
+  same width `reject_after_messages` reserves below the u64 ceiling).
+  Out-of-order inside the window is accepted once; a duplicate or a
+  too-old counter is `error.Replayed`. The window is committed only *after*
+  the tag verifies, so a forged packet cannot burn a legitimate slot.
+- Not built on the `aeadframe` sibling — see SPEC.md for exactly why.

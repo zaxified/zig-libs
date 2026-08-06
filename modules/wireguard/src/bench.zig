@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const noise = @import("noise.zig");
+const transport = @import("transport.zig");
 
 fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
@@ -51,22 +52,28 @@ fn mbps(len: usize, iters: usize, dt_ns: u64) f64 {
 }
 
 /// The transport-data nonce: 4 zero bytes then the 64-bit counter,
-/// little-endian (whitepaper 5.4.6). Mirrors `Handshake.counterNonce`, which
-/// is file-private to `handshake.zig`.
-fn counterNonce(counter: u64) [noise.Aead.nonce_length]u8 {
-    var n: [noise.Aead.nonce_length]u8 = @splat(0);
-    std.mem.writeInt(u64, n[4..12], counter, .little);
-    return n;
-}
+/// little-endian (whitepaper 5.4.6). THE definition, shared with the data
+/// plane and the handshake — a bench with its own copy could not have caught a
+/// layout regression.
+const counterNonce = transport.counterNonce;
+
+/// 1500-byte MTU - 20 (IPv4) - 8 (UDP) - 16 (WG transport header) - 16
+/// (Poly1305 tag) = 1440; 1420 is the conventional WireGuard tunnel MTU and
+/// the size `chachapoly`'s own bench quotes, so the two are comparable.
+const bench_mtu = 1420;
+
+// Buffers for the full-path (`transport.zig`) bench. At file scope so the
+// 64-slot ring lives in .bss rather than on the test thread's stack — still
+// ~93 KB total, i.e. one MTU per slot. Benchmarks in this repo stay small on
+// purpose: an oversized one once OOM-killed the host's editor.
+var sealed_scratch: [transport.sealedLen(bench_mtu)]u8 = undefined;
+var out_padded: [transport.paddedLen(bench_mtu)]u8 = undefined;
+var open_ring: [64][transport.sealedLen(bench_mtu)]u8 = undefined;
 
 test "bench (opt-in via WIREGUARD_BENCH)" {
     if (std.testing.environ.getPosix("WIREGUARD_BENCH") == null) return error.SkipZigTest;
 
-    // 1500-byte MTU - 20 (IPv4) - 8 (UDP) - 16 (WG transport header)
-    //              - 16 (Poly1305 tag) = 1440; 1420 is the conventional
-    // WireGuard tunnel MTU and the size `chachapoly`'s own bench quotes, so
-    // the two are directly comparable.
-    const mtu = 1420;
+    const mtu = bench_mtu;
     const iters: usize = 80_000; // 1420 B * 80k = 114 MB moved per measurement
 
     var packet: [mtu]u8 = undefined;
@@ -148,6 +155,52 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
             "per packet     : chachapoly {d:>8.0} ns ({d:.2} Mpps)   std {d:>8.0} ns ({d:.2} Mpps)\n",
             .{ ours_ns, 1000.0 / ours_ns, theirs_ns, 1000.0 / theirs_ns },
         );
+    }
+
+    // ── the REAL data-plane path: `transport.SendSession.seal` /
+    //    `RecvSession.open`, i.e. the AEAD plus everything the module wraps
+    //    around it — the 16-byte header write, the copy-and-pad into the
+    //    output buffer, the counter limit checks and (on receive) the
+    //    anti-replay window. This is the number a tunnel budget is written
+    //    in; the AEAD-only lines above are its lower bound. Still no socket
+    //    and no routing table. ──
+    {
+        var s = transport.SendSession.init(key, 0xDEADBEEF);
+        var t0 = nowNs();
+        for (0..iters) |_| {
+            const r = s.seal(&sealed_scratch, &packet) catch unreachable;
+            std.mem.doNotOptimizeAway(r.len);
+        }
+        var dt = nowNs() - t0;
+        const seal_ns = @as(f64, @floatFromInt(dt)) / @as(f64, @floatFromInt(iters));
+
+        // Open needs distinct counters (a replay is rejected by design), so
+        // pre-seal a small ring and reset the receiver once per lap. The
+        // reset is a `.{}` assignment amortised over `ring_len` opens.
+        var ring_sender = transport.SendSession.init(key, 0xDEADBEEF);
+        for (&open_ring) |*slot| _ = ring_sender.seal(slot, &packet) catch unreachable;
+        const msg_len = transport.sealedLen(mtu);
+
+        var r = transport.RecvSession.init(key, 0xDEADBEEF);
+        t0 = nowNs();
+        var done: usize = 0;
+        while (done < iters) : (done += open_ring.len) {
+            r.window.reset();
+            for (&open_ring) |*slot| {
+                const o = r.open(&out_padded, slot[0..msg_len]) catch unreachable;
+                std.mem.doNotOptimizeAway(o.len);
+            }
+        }
+        dt = nowNs() - t0;
+        const open_ns = @as(f64, @floatFromInt(dt)) / @as(f64, @floatFromInt(done));
+        std.debug.print(
+            \\full path      : seal {d:>8.0} ns ({d:.2} Mpps, {d:.0} MB/s)   open {d:>8.0} ns ({d:.2} Mpps, {d:.0} MB/s)
+            \\    (header + pad-to-16 + AEAD + counter limits [+ replay window on open])
+            \\
+        , .{
+            seal_ns,      1000.0 / seal_ns, @as(f64, mtu) / seal_ns * 1000.0,
+            open_ns,      1000.0 / open_ns, @as(f64, mtu) / open_ns * 1000.0,
+        });
     }
 
     // ── size sweep: the AEAD's advantage is length-dependent (the wide
