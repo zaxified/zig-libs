@@ -36,6 +36,11 @@
 //!   (key-path + script-path) orchestration built on `interpreter.eval`.
 //! - `script_tests_vectors.zig` / `script_tests_test.zig` — a pinned
 //!   subset of Bitcoin Core's official `script_tests.json` corpus.
+//! - `tx_findanddelete_vectors.zig` / `tx_findanddelete_test.zig` — the
+//!   `FindAndDelete`/`OP_CODESEPARATOR`/`CONST_SCRIPTCODE` rows of Core's
+//!   `tx_valid.json` + `tx_invalid.json` (real transactions).
+//! - `findanddelete_test.zig` — Core's own `script_FindAndDelete` unit test,
+//!   byte-for-byte.
 //! - `e2e_test.zig` — real P2PKH/P2WPKH/P2TR spends verified end-to-end
 //!   through `bitcointx` sighash + `k256`/`bip340` signatures.
 //! - `dos_test.zig` — additional consensus-limit DoS teeth at the
@@ -91,6 +96,9 @@ test {
     _ = @import("e2e_test.zig");
     _ = @import("dos_test.zig");
     _ = @import("tapscript_test.zig");
+    _ = @import("findanddelete_test.zig");
+    _ = @import("tx_findanddelete_vectors.zig");
+    _ = @import("tx_findanddelete_test.zig");
     _ = @import("consensus_kat_vectors.zig");
     _ = @import("consensus_kat_test.zig");
 }

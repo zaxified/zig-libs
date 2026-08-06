@@ -50,7 +50,7 @@ bech32	A	EXTERNAL	BIP173/BIP350 test vectors fetched directly from bitcoin/bips 
 bfv	B	REDERIVED	NTT/RNS/BFV KAT vectors from independent Python re-derivation (SPEC.md)
 bip32	B	EXTERNAL	official BIP-32 Test Vectors 1/2/3/5 in bip32_vectors.zig
 bip340	B	EXTERNAL	official BIP340 19 test vectors embedded verbatim in kat_vectors.zig
-bitcoinscript	A	EXTERNAL	machine-transcribed bitcoin/bitcoin src/test/data/script_tests.json
+bitcoinscript	A	EXTERNAL	machine-transcribed bitcoin/bitcoin src/test/data/script_tests.json + tx_valid/tx_invalid.json FindAndDelete/CONST_SCRIPTCODE rows + script_tests.cpp script_FindAndDelete
 bitcointx	A	MIXED	BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector
 blindrsa	B	EXTERNAL	RFC 9474 Appendix A.1/A.4 byte-exact KATs
 blobmsg	A	MIXED	hand-derived libubox-spec goldens (SELF); live ubusd peer test when reachable (EXTERNAL)

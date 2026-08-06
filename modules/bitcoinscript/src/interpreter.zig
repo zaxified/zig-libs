@@ -85,6 +85,14 @@ pub const EvalError = error{
     /// BIP342 policy (`discourage_op_success`): the tapscript leaf contains
     /// an `OP_SUCCESSx` opcode.
     DiscourageOpSuccess,
+    /// Bitcoin Core `SCRIPT_ERR_SIG_FINDANDDELETE` (`const_scriptcode`
+    /// policy): the signature being checked was found in the scriptCode it
+    /// signs, so `FindAndDelete` removed it — the legacy quirk this flag
+    /// exists to make visible.
+    SigFindanddelete,
+    /// Bitcoin Core `SCRIPT_ERR_OP_CODESEPARATOR` (`const_scriptcode`
+    /// policy): `OP_CODESEPARATOR` appeared in a non-witness script.
+    OpCodeseparator,
     /// Catch-all for conditions Bitcoin Core itself folds into
     /// `SCRIPT_ERR_UNKNOWN_ERROR` (a `CScriptNum` construction that
     /// overflows or is non-minimal — distinct from the dedicated
@@ -141,18 +149,120 @@ fn checkMinimalPush(opcode: u8, data: []const u8) bool {
     return opcode == 0x4e;
 }
 
+/// Bitcoin Core `CScript() << data` (`CScript::AppendDataSize` +
+/// `AppendData`): the CANONICAL push of `data`, which is what
+/// `FindAndDelete` searches for — deliberately independent of however the
+/// signature happened to be pushed on the stack. A signature pushed with a
+/// non-minimal `OP_PUSHDATA1` prefix in the scriptCode therefore does NOT
+/// match, and Core's `tx_invalid.json` pins exactly that ("FindAndDelete …
+/// will only remove if it uses the same pushdata prefix as is standard").
+fn canonicalPush(allocator: Allocator, data: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (data.len < 0x4c) {
+        try out.append(allocator, @intCast(data.len));
+    } else if (data.len <= 0xff) {
+        try out.append(allocator, 0x4c);
+        try out.append(allocator, @intCast(data.len));
+    } else if (data.len <= 0xffff) {
+        try out.append(allocator, 0x4d);
+        var lb: [2]u8 = undefined;
+        std.mem.writeInt(u16, &lb, @intCast(data.len), .little);
+        try out.appendSlice(allocator, &lb);
+    } else {
+        try out.append(allocator, 0x4e);
+        var lb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lb, @intCast(data.len), .little);
+        try out.appendSlice(allocator, &lb);
+    }
+    try out.appendSlice(allocator, data);
+    return out.toOwnedSlice(allocator);
+}
+
+pub const FindAndDeleteResult = struct {
+    /// `script` itself when nothing was found (Core leaves the script
+    /// untouched unless `nFound > 0`); otherwise a freshly allocated copy.
+    script: []const u8,
+    found: usize,
+};
+
+/// Bitcoin Core `FindAndDelete(CScript& script, const CScript& b)`
+/// (`script/interpreter.cpp`) — transcribed including the parts that look
+/// like bugs and are consensus:
+///
+/// - matches are only attempted at positions its `GetOp` walk reaches, so a
+///   byte sequence *inside* a push's payload never matches ("doesn't match
+///   'inside' opcodes"), but after a deletion the walk simply resumes at the
+///   new offset — which can re-anchor the instruction boundaries and expose
+///   bytes that were payload before (Core's own test: deleting `03` from
+///   `0302ff030302ff03` leaves `02ff03 02ff03`, two *different* pushes);
+/// - deletion is greedy at one position (`while … std::equal`) but the outer
+///   walk is single-pass, so `OP_0 OP_0 OP_1 OP_1` minus `OP_0 OP_1` yields
+///   `OP_0 OP_1`, not the empty script;
+/// - when the walk hits an undecodable push it stops and the remainder is
+///   copied RAW, so an invalid trailing push can still be deleted;
+/// - an empty pattern deletes nothing.
+pub fn findAndDelete(allocator: Allocator, script: []const u8, pattern: []const u8) Allocator.Error!FindAndDeleteResult {
+    if (pattern.len == 0) return .{ .script = script, .found = 0 };
+
+    var out: std.ArrayList(u8) = .empty;
+    var pc: usize = 0;
+    var pc2: usize = 0;
+    var found: usize = 0;
+    // Core's `do { … } while (script.GetOp(pc, opcode));` — the body runs
+    // once before the walk is advanced, and the walk failing (end of script
+    // OR an undecodable push) exits without re-running it.
+    while (true) {
+        try out.appendSlice(allocator, script[pc2..pc]);
+        while (script.len - pc >= pattern.len and std.mem.eql(u8, script[pc..][0..pattern.len], pattern)) {
+            pc += pattern.len;
+            found += 1;
+        }
+        pc2 = pc;
+        if (pc >= script.len) break;
+        const instr = readInstruction(script, pc) catch break;
+        pc = instr.next;
+    }
+
+    if (found == 0) return .{ .script = script, .found = 0 };
+    try out.appendSlice(allocator, script[pc2..]);
+    return .{ .script = try out.toOwnedSlice(allocator), .found = found };
+}
+
 /// The scriptCode a `CHECKSIG`-family opcode signs over: `script[from..]`
 /// (everything from the last executed `OP_CODESEPARATOR` onward — `from`
-/// is 0 if none executed yet). For `sig_version == .base` (legacy), Bitcoin
-/// Core additionally runs `FindAndDelete(OP_CODESEPARATOR)` over that
-/// sub-script — literal `0xab` opcode bytes are dropped (parsed
-/// opcode-by-opcode via `readInstruction`, so a `0xab` *byte inside a
-/// push's data payload* is correctly left alone). BIP143 §"No
-/// FindAndDelete" makes `witness_v0` skip this step entirely: the
+/// is 0 if none executed yet), with two legacy-only transformations applied
+/// in Bitcoin Core's order:
+///
+///  1. `FindAndDelete(scriptCode, CScript() << vchSig)` for EVERY signature
+///     the opcode was given (`EvalChecksigPreTapscript` for CHECKSIG; the
+///     `for (int k = 0; k < nSigsCount; k++)` loop, top-of-block first, for
+///     CHECKMULTISIG). Under `const_scriptcode` a non-zero find count is a
+///     hard `SCRIPT_ERR_SIG_FINDANDDELETE`.
+///  2. `FindAndDelete(OP_CODESEPARATOR)` — literal `0xab` opcode bytes are
+///     dropped (parsed opcode-by-opcode via `readInstruction`, so a `0xab`
+///     *byte inside a push's data payload* is correctly left alone). Core
+///     does this inside `CTransactionSignatureSerializer`, i.e. strictly
+///     AFTER step 1, which is why the order here matters.
+///
+/// BIP143 §"No FindAndDelete" makes `witness_v0` skip BOTH steps: the
 /// sub-script from `from` onward is used exactly as-is.
-fn scriptCodeFor(allocator: Allocator, script: []const u8, from: usize, sig_version: SigVersion) EvalError![]const u8 {
-    const sub = script[from..];
+fn scriptCodeFor(
+    allocator: Allocator,
+    script: []const u8,
+    from: usize,
+    sig_version: SigVersion,
+    flags: ScriptFlags,
+    sigs: []const []const u8,
+) EvalError![]const u8 {
+    var sub = script[from..];
     if (sig_version == .witness_v0) return sub;
+
+    for (sigs) |sig| {
+        const pattern = try canonicalPush(allocator, sig);
+        const r = try findAndDelete(allocator, sub, pattern);
+        if (r.found > 0 and flags.const_scriptcode) return error.SigFindanddelete;
+        sub = r.script;
+    }
 
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -218,7 +328,10 @@ const State = struct {
 };
 
 fn checkSigForState(state: *State, sig: []const u8, pubkey: []const u8) EvalError!bool {
-    const script_code = try scriptCodeFor(state.allocator, state.script, state.last_codesep, state.sig_version);
+    // Core's `EvalChecksigPreTapscript` builds the scriptCode (dropping this
+    // one signature) BEFORE `CheckSignatureEncoding`/`CheckPubKeyEncoding`,
+    // so `SIG_FINDANDDELETE` takes precedence over any encoding error.
+    const script_code = try scriptCodeFor(state.allocator, state.script, state.last_codesep, state.sig_version, state.flags, &.{sig});
     return sigcheck.checkEcdsaSig(state.allocator, sig, pubkey, script_code, state.ctx, state.sig_version, state.flags);
 }
 
@@ -597,11 +710,19 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             stack.shrinkRetainingCapacity(stack.items.len - n_sigs);
             const sigs = sig_buf[0..n_sigs];
 
+            // Bitcoin Core builds the scriptCode — and runs FindAndDelete for
+            // every supplied signature, top-of-block first (`stacktop(-isig-k)`
+            // for `k = 0..nSigsCount`, which is exactly `sigs`' order here) —
+            // BEFORE it ever looks at the dummy element, which it pops in the
+            // post-matching-loop stack cleanup. So `SIG_FINDANDDELETE` takes
+            // precedence over both the missing-dummy `INVALID_STACK_OPERATION`
+            // and `SIG_NULLDUMMY`.
+            const script_code = try scriptCodeFor(allocator, state.script, state.last_codesep, state.sig_version, state.flags, sigs);
+
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const dummy = stack.pop().?;
             if (state.flags.nulldummy and dummy.len != 0) return error.SigNulldummy;
 
-            const script_code = try scriptCodeFor(allocator, state.script, state.last_codesep, state.sig_version);
             // Direct translation of Bitcoin Core's matching loop
             // (`interpreter.cpp` `OP_CHECKMULTISIG`): `key_i`/`sig_i` index
             // into `pubkeys`/`sigs` (both top-to-bottom, see above);
@@ -796,6 +917,14 @@ fn evalCore(
             state.op_count += 1;
             if (state.op_count > limits.max_ops_per_script) return error.OpCount;
         }
+
+        // `const_scriptcode` policy: OP_CODESEPARATOR is rejected in a
+        // non-witness script EVEN IN AN UNEXECUTED BRANCH — Bitcoin Core
+        // checks this above its opcode `switch`, i.e. before `fExec` is
+        // consulted, so an unexecuted `IF OP_CODESEPARATOR ENDIF` is just as
+        // fatal as an executed one (`tx_invalid.json` pins both).
+        if (sig_version == .base and flags.const_scriptcode and
+            instr.opcode == @intFromEnum(Opcode.OP_CODESEPARATOR)) return error.OpCodeseparator;
 
         const exec = allExecuting(cond_stack.items);
 

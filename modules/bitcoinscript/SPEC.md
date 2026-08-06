@@ -137,30 +137,78 @@ control-block length-validation failure, and the unknown-leaf-version anyone-can
 is a representative slice, not exhaustive coverage of the corpus (2244 entries total) — widening it
 is left for the interop backlog.
 
-`FindAndDelete(vchSig)` (the historical per-signature literal-byte-removal quirk in `SignatureHash`,
-distinct from `FindAndDelete(OP_CODESEPARATOR)`, which IS implemented) is also out of scope — see
-`bitcointx`'s own `sighash_legacy.zig` module doc comment for the same cut and its rationale; no
-standard script template ever needs it, and the `script_tests.json` subset pinned below excludes
-every vector that would.
+### `FindAndDelete(vchSig)` — implemented (was out of scope until 2026-08-06)
+
+`FindAndDelete(scriptCode, CScript() << vchSig)` — the historical per-signature literal-byte-removal
+quirk Bitcoin Core applies to the scriptCode before hashing it, distinct from
+`FindAndDelete(OP_CODESEPARATOR)` — **is implemented** (`interpreter.findAndDelete`,
+`interpreter.scriptCodeFor`), for `SigVersion.base` only, in both `OP_CHECKSIG`(`VERIFY`) and
+`OP_CHECKMULTISIG`(`VERIFY`). It was previously declared out of scope; that was wrong. A legacy
+script whose scriptCode contains a supplied signature's canonical push gets a *different sighash*
+without it, hence the opposite validity verdict from every other node — a chain-split primitive, not
+a cosmetic gap. Core's own `tx_valid.json`/`tx_invalid.json` pin it with real transactions and say so
+outright: *"the tests are 'correctly wrong', they should pass by modifying OP_CHECKSIG under
+interpreter.cpp by replacing (sigversion == SigVersion::BASE) with (sigversion != SigVersion::BASE)"*.
+
+Transcribed faithfully from `script/interpreter.cpp`, including the parts that look like bugs:
+
+- the pattern searched for is the CANONICAL push of the signature (`CScript() << vchSig`), never
+  however the signature happened to be pushed — a non-standard `OP_PUSHDATA1` prefix in the
+  scriptCode does not match, and neither does a signature differing only in its hashtype byte;
+- matches are attempted only at positions the `GetOp` walk reaches, so a byte sequence inside a
+  push's payload never matches — but after a deletion the walk resumes at the new offset, which
+  re-anchors instruction boundaries;
+- deletion is greedy at one position but the outer walk is single-pass;
+- an undecodable trailing push stops the walk and the remainder is copied raw, so an invalid push
+  can still be deleted;
+- for `witness_v0` the step is skipped entirely (BIP143 §"No FindAndDelete"), and it runs BEFORE the
+  `OP_CODESEPARATOR` strip, matching Core's `CTransactionSignatureSerializer` ordering.
+
+`const_scriptcode` (`SCRIPT_VERIFY_CONST_SCRIPTCODE`, mempool-relay policy, part of
+`ScriptFlags.standard`) models both halves of Core's flag: a non-zero find count is
+`error.SigFindanddelete`, and `OP_CODESEPARATOR` in a `SigVersion.base` script is
+`error.OpCodeseparator` **even in an unexecuted branch** (Core checks it above the opcode `switch`).
+
+Note that `bitcointx`'s `sighash_legacy.zig` still documents the same cut on the transaction side;
+that module's own `FindAndDelete` gap is tracked separately — this module supplies the scriptCode
+already transformed, so no legacy verdict here depends on it.
 
 ## Verification
 
 ### script_tests.json coverage
 
-`script_tests_vectors.zig` pins 296 rows machine-filtered (not hand-picked) from Bitcoin Core's
+`script_tests_vectors.zig` pins 297 rows machine-filtered (not hand-picked) from Bitcoin Core's
 official `src/test/data/script_tests.json` (fetched 2026-07 from the `bitcoin/bitcoin` `master`
 branch), then machine-transcribed verbatim via a one-off Python script — never hand-typed. The
 filter: keep only rows (a) with no witness field (this module's segwit/taproot coverage is
 verified separately, by `e2e_test.zig`'s real spends, rather than transcribing the witness-bearing
 subset of the JSON, which is small and largely tapscript-flavored); (b) whose `scriptSig`/
 `scriptPubKey` asm text uses only mnemonics this module's opcode table implements (a plain
-substring/token check — this mechanically excludes every BIP342 tapscript-only vector); (c)
-without `OP_CODESEPARATOR` (sidesteps `FindAndDelete(vchSig)`, out of scope — see above); (d)
-without the `CONST_SCRIPTCODE` flag (not modeled, same reason). From the ~1108 rows surviving
-that filter, every row is kept for buckets with ≤20 members (every distinct error class Bitcoin
-Core's test suite exercises that this module can reach), and a fixed-seed random sample of 70 `OK`
-rows / 20 rows for buckets larger than 20 (`EVAL_FALSE`/`BAD_OPCODE`/`INVALID_STACK_OPERATION`/
-`DISABLED_OPCODE`/`SCRIPTNUM`/`MINIMALDATA`/`SIG_DER`).
+substring/token check — this mechanically excludes every BIP342 tapscript-only vector). From the
+~1108 rows surviving that filter, every row is kept for buckets with ≤20 members (every distinct
+error class Bitcoin Core's test suite exercises that this module can reach), and a fixed-seed
+random sample of 70 `OK` rows / 20 rows for buckets larger than 20 (`EVAL_FALSE`/`BAD_OPCODE`/
+`INVALID_STACK_OPERATION`/`DISABLED_OPCODE`/`SCRIPTNUM`/`MINIMALDATA`/`SIG_DER`).
+
+Two further exclusions — (c) `OP_CODESEPARATOR` rows and (d) `CONST_SCRIPTCODE` rows — were
+**removed on 2026-08-06** along with the `FindAndDelete(vchSig)` scope cut they existed to justify.
+Re-running the filter without them admits exactly **one** additional row (the 297th, appended at
+the end of the vectors file): `script_tests.json` contains a single `CODESEPARATOR` row in total
+and **zero** rows carrying the `CONST_SCRIPTCODE` flag. So this corpus was never able to exercise
+`FindAndDelete(vchSig)`, with or without the filter — Core tests that behaviour elsewhere, and both
+places are now pinned here:
+
+- **`tx_findanddelete_vectors.zig` / `tx_findanddelete_test.zig`** — 38 rows machine-transcribed
+  from Core's `src/test/data/tx_valid.json` (18) and `tx_invalid.json` (20): every row that names
+  `CONST_SCRIPTCODE` in its flags field, or contains `CODESEPARATOR` in a prevout script, or sits
+  under a `FindAndDelete` comment block. These are REAL transactions (several mainnet/testnet3),
+  run through `verifyScript` with full deserialization, prevouts matched by outpoint, and Core's
+  per-file flag semantics (`tx_valid`'s field is the flags to EXCLUDE, `tx_invalid`'s the flags to
+  APPLY). They include the entire `SCRIPT_VERIFY_CONST_SCRIPTCODE tests` section of
+  `tx_invalid.json` (12 rows), which is the external oracle for the flag itself.
+- **`findanddelete_test.zig`** — Bitcoin Core's own `script_FindAndDelete` unit test
+  (`src/test/script_tests.cpp`), all 16 cases byte-for-byte, as the oracle for the primitive's
+  greedy-but-single-pass, boundary-re-anchoring, invalid-trailing-push semantics.
 
 `script_tests_test.zig` assembles each row's asm text (`asmparser.zig`, a transcription of
 Bitcoin Core's own `ParseScript`) into script bytes, reproduces Bitcoin Core's EXACT synthetic
@@ -244,3 +292,9 @@ standardness/policy flags — `discourage_op_success`, `discourage_upgradable_pu
 `discourage_upgradable_taproot_version` — which reject (as non-standard) the consensus-valid BIP342
 upgrade hooks (`OP_SUCCESSx`, unknown CHECKSIG pubkey types, unknown leaf versions). All three are
 `false` in `.none` and `true` in `.standard`.
+
+It also includes `const_scriptcode` (`SCRIPT_VERIFY_CONST_SCRIPTCODE`, added 2026-08-06), which
+rejects the two legacy scriptCode mutations — `FindAndDelete(vchSig)` removing something, and
+`OP_CODESEPARATOR` appearing in a `SigVersion.base` script at all, executed branch or not. Both
+remain fully implemented at consensus level (flag off); the flag only makes them observable. It is
+`false` in `.none` and `true` in `.standard`, matching Core's `STANDARD_SCRIPT_VERIFY_FLAGS`.

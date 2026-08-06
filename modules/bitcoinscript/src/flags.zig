@@ -69,6 +69,16 @@ pub const ScriptFlags = struct {
     /// key is of an unknown (not 32-byte, not empty) type — which consensus
     /// (this flag off) treats as an always-successful upgrade hook.
     discourage_upgradable_pubkeytype: bool = false,
+    /// Makes the legacy scriptCode constant: in a `SigVersion.base` script,
+    /// reject `OP_CODESEPARATOR` outright (even in an unexecuted branch), and
+    /// reject any CHECKSIG-family check whose `FindAndDelete(scriptCode,
+    /// <push of the signature>)` actually removed something. Both are
+    /// mempool-relay policy, not consensus — consensus (this flag off) still
+    /// applies `FindAndDelete` and still honours `OP_CODESEPARATOR`, and
+    /// `interpreter.zig` implements both. The flag exists so that the two
+    /// historical quirks become *observable* rather than silently changing
+    /// the message a legacy signature commits to.
+    const_scriptcode: bool = false,
     /// BIP341 policy: reject a taproot script-path spend whose leaf version
     /// is not `0xc0` (the only assigned tapscript version) — which consensus
     /// (this flag off) treats as anyone-can-spend for future upgradeability.
@@ -98,6 +108,7 @@ pub const ScriptFlags = struct {
         .minimaldata = true,
         .taproot = true,
         .sigpushonly = true,
+        .const_scriptcode = true,
         .discourage_op_success = true,
         .discourage_upgradable_pubkeytype = true,
         .discourage_upgradable_taproot_version = true,

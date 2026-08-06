@@ -7,9 +7,20 @@
 //! expected result) via a Python script, never hand-typed. See SPEC.md
 //! "script_tests.json coverage" for the exact filter (excludes: any mnemonic
 //! outside this module's opcode table -- which mechanically excludes every
-//! BIP342 tapscript-only vector; `OP_CODESEPARATOR` vectors, most of which
-//! exercise `FindAndDelete(vchSig)`, an explicitly out-of-scope legacy quirk;
-//! and the `CONST_SCRIPTCODE` flag). `script_tests_test.zig` assembles each
+//! BIP342 tapscript-only vector -- and any row with a witness field).
+//!
+//! The former `OP_CODESEPARATOR` and `CONST_SCRIPTCODE` exclusions were
+//! REMOVED on 2026-08-06 together with the `FindAndDelete(vchSig)` fix they
+//! were hiding. Re-running the filter without them admits exactly ONE extra
+//! row (appended at the end): `script_tests.json` holds a single
+//! `CODESEPARATOR` row in total and ZERO rows carrying the `CONST_SCRIPTCODE`
+//! flag, so this corpus never could have exercised `FindAndDelete(vchSig)`.
+//! The external oracle for that lives in Core's `tx_valid.json`/
+//! `tx_invalid.json` instead -- see `tx_findanddelete_vectors.zig` -- and for
+//! the primitive itself in `script_tests.cpp`'s `script_FindAndDelete` unit
+//! test -- see `findanddelete_test.zig`.
+//!
+//! `script_tests_test.zig` assembles each
 //! `script_sig`/`script_pubkey` asm string (Bitcoin Core's own human-readable
 //! test format) into real script bytes and runs it through `verifyScript`
 //! against Bitcoin Core's exact synthetic crediting/spending transaction pair
@@ -2099,5 +2110,17 @@ pub const vectors = [_]Vector{
         .flags = .{ .checksequenceverify = true },
         .expect = "UnsatisfiedLocktime",
         .comment = "CSV fails if stack top bit 1 << 31 is not set, and tx version < 2",
+    },
+    // Admitted 2026-08-06 by re-running the vendoring filter with the former
+    // exclusions (c) `OP_CODESEPARATOR` and (d) `CONST_SCRIPTCODE` removed.
+    // That re-run yields exactly ONE additional row -- this one -- because
+    // `script_tests.json` contains a single `CODESEPARATOR` row in total and
+    // ZERO rows carrying the `CONST_SCRIPTCODE` flag. See SPEC.md.
+    .{
+        .script_sig = "NOP",
+        .script_pubkey = "CODESEPARATOR 1",
+        .flags = .{ .p2sh = true, .strictenc = true },
+        .expect = null,
+        .comment = "",
     },
 };

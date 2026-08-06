@@ -33,7 +33,7 @@ Implemented:
   `strictenc`, `nulldummy`, `discourage_upgradable_nops`, `cleanstack`, `checklocktimeverify`,
   `checksequenceverify`, `witness`, `discourage_upgradable_witness_program`, `minimalif`,
   `witness_pubkeytype`, `nullfail`, `minimaldata`, `taproot`, `sigpushonly`,
-  `discourage_op_success`, `discourage_upgradable_pubkeytype`,
+  `const_scriptcode`, `discourage_op_success`, `discourage_upgradable_pubkeytype`,
   `discourage_upgradable_taproot_version`.
 
 ## Use
