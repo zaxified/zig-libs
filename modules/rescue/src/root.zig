@@ -56,8 +56,8 @@
 //! const nd = rescue.Rpo256.merge(left, right);        // Merkle node
 //!
 //! // The specification's own sponge
-//! const s  = rescue.spec128.hash(&.{ 1, 2, 3 });      // 4 elements
-//! const s5 = rescue.spec160.hash(&.{ 1, 2, 3 });      // 5 elements
+//! const s  = try rescue.spec128.hash(&.{ 1, 2, 3 });  // 4 elements (empty input is refused)
+//! const s5 = try rescue.spec160.hash(&.{ 1, 2, 3 });  // 5 elements
 //!
 //! // The bare permutation
 //! var st: rescue.Rpo256.State = .{0} ** 12;

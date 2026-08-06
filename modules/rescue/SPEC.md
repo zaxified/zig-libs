@@ -87,7 +87,7 @@ The RPO report and miden-crypto disagree about how to wrap the permutation:
 | padding | `input ++ [1] ++ 0*`, only when `len % r != 0` | zeros |
 | domain separation | `state[0] = 1` when padded | `state[8] = len mod r`, always |
 | byte hashing | not defined | 7-byte chunks, flag `= r + (n mod r)` |
-| empty input | rejected (`assert len > 0`) | zero digest, no permutation |
+| empty input | rejected (`error.EmptyInput`) | zero digest, no permutation |
 | widths | `m = 12` and `m = 16` | `m = 12` |
 
 miden-crypto's padding rule is deliberate and cited — it follows

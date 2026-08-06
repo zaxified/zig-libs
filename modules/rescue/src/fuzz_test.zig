@@ -86,17 +86,26 @@ test "fuzz: Goldilocks arithmetic agrees with a u128 modulo oracle" {
 
 fn fuzzFramings(_: void, smith: *std.testing.Smith) !void {
     var buf: [24]gl.Fe = undefined;
-    const n = 1 + smith.value(u8) % buf.len;
+    // Length 0 is deliberately **in** range. It used to start at 1, which is why
+    // no fuzz run ever reached `spec.hash`'s empty-input path — the one that was
+    // guarded by an assert and therefore undefined behaviour in a release build.
+    const n = smith.value(u8) % (buf.len + 1);
     for (buf[0..n]) |*x| x.* = arbitraryFe(smith);
     const input = buf[0..n];
 
-    const a = rpo.spec128.hash(input);
+    const a = rpo.spec128.hash(input) catch |err| {
+        // The empty sequence is the single input this framing refuses; the
+        // miden framing defines it. Anything else refused is a finding.
+        try std.testing.expectEqual(rpo.spec128.Error.EmptyInput, err);
+        try std.testing.expectEqual(@as(usize, 0), input.len);
+        return;
+    };
     const b = rpo.Rpo256.hashElements(input);
     try std.testing.expect(!std.mem.eql(gl.Fe, &a, &b));
 
     // The same elements through the same framing must agree with themselves —
     // trivial, but it is what catches a stateful `state` slipping into scope.
-    try std.testing.expectEqualSlices(gl.Fe, &a, &rpo.spec128.hash(input));
+    try std.testing.expectEqualSlices(gl.Fe, &a, &try rpo.spec128.hash(input));
 }
 
 test "fuzz: the two RPO sponge framings never collide" {

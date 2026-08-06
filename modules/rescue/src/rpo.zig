@@ -15,7 +15,7 @@
 //! | digest | `state[c .. c + r/2]` | `state[0 .. 4]` |
 //! | padding | append `1`, then zeros; set `state[0] = 1` | zeros only |
 //! | domain separation | the `state[0] = 1` padding flag | `state[8] = len mod 8` |
-//! | empty input | rejected | zero digest, no permutation |
+//! | empty input | rejected (`error.EmptyInput`) | zero digest, no permutation |
 //! | widths | `m = 12` (128-bit) and `m = 16` (160-bit) | `m = 12` only |
 //!
 //! Both are anchored on published vectors — see `vectors_test.zig`. Neither is
@@ -44,17 +44,29 @@ pub fn Spec(comptime inst: params.Instance) type {
             Perm.permute(state);
         }
 
+        /// Rejecting the empty input is part of the construction, not a
+        /// defensive check — see `hash`.
+        pub const Error = error{EmptyInput};
+
         /// Hash a non-empty sequence of field elements.
         ///
-        /// Empty input is **rejected**, exactly as the reference implementation
-        /// does (`assert(len(input_sequence) > 0)`). Hashing nothing is not
-        /// defined by this construction: with `len % rate == 0` the padding
-        /// branch is skipped, so the sponge would never permute and the digest
-        /// would be a constant zero that no domain separator distinguishes from
-        /// anything. Callers who need a value for "no input" must pick their own
-        /// convention (`Rpo256` picked the zero digest; see there).
-        pub fn hash(input: []const gl.Fe) Digest {
-            std.debug.assert(input.len > 0);
+        /// Empty input is **rejected** with `error.EmptyInput`, exactly as the
+        /// reference implementation does (`assert(len(input_sequence) > 0)`).
+        /// Hashing nothing is not defined by this construction: with
+        /// `len % rate == 0` the padding branch is skipped, so the sponge would
+        /// never permute and the digest would be a constant zero that no domain
+        /// separator distinguishes from anything — and that constant zero is
+        /// *also* `Rpo256.hashElements(&.{})`, so defining it here would make the
+        /// two framings, which disagree on every other input, agree on this one.
+        /// Callers who need a value for "no input" must pick their own convention
+        /// (`Rpo256` picked the zero digest; see there).
+        ///
+        /// This is a **runtime** rejection. It used to be `std.debug.assert`,
+        /// which lowers to `unreachable` — undefined behaviour, i.e. a segfault
+        /// in ReleaseFast — on the ordinary case of a caller passing a
+        /// runtime-length element list that happened to be empty.
+        pub fn hash(input: []const gl.Fe) Error!Digest {
+            if (input.len == 0) return error.EmptyInput;
             var state: State = @splat(0);
             var i: usize = 0;
 
@@ -353,15 +365,36 @@ test "spec: the padding flag separates a padded absorb from an exact one" {
     // rate = 8; 8 elements take the no-padding branch, 7 take the padded one.
     const eight = [_]gl.Fe{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const seven = eight[0..7];
-    const d8 = spec128.hash(&eight);
-    const d7 = spec128.hash(seven);
+    const d8 = try spec128.hash(&eight);
+    const d7 = try spec128.hash(seven);
     try std.testing.expect(!std.meta.eql(d8, d7));
     // ...and a hand-built "padded" input must not collide with the real one.
     const manual = [_]gl.Fe{ 1, 2, 3, 4, 5, 6, 7, 1 };
-    try std.testing.expect(!std.meta.eql(d7, spec128.hash(&manual)));
+    try std.testing.expect(!std.meta.eql(d7, try spec128.hash(&manual)));
+}
+
+test "spec: an empty input is rejected at runtime, not asserted away" {
+    // The documented rejection used to be `std.debug.assert(input.len > 0)`,
+    // which lowers to `unreachable`: undefined behaviour in ReleaseFast (an
+    // observed SEGV), a panic in a safe build — never the promised rejection.
+    // The length must be a *runtime* value; `&.{}` is a comptime-known empty
+    // slice and would let a future assert be checked at compile time instead.
+    var buf: [4]gl.Fe = .{ 1, 2, 3, 4 };
+    var len: usize = 0;
+    _ = &len;
+    try std.testing.expectError(error.EmptyInput, spec128.hash(buf[0..len]));
+    try std.testing.expectError(error.EmptyInput, spec160.hash(buf[0..len]));
+
+    // Why a rejection rather than a defined empty digest: the only value this
+    // framing could give it is the all-zero state read back without a single
+    // permutation — and that is bit-for-bit `Rpo256.hashElements(&.{})`. Two
+    // framings that disagree on every other input would agree on this one, which
+    // is precisely the guard `vectors_test.zig` and `fuzz_test.zig` maintain.
+    const zero: [4]gl.Fe = @splat(0);
+    try std.testing.expectEqualSlices(gl.Fe, &zero, &Rpo256.hashElements(&.{}));
 }
 
 test "spec: digest lengths follow rate/2" {
-    try std.testing.expectEqual(@as(usize, 4), spec128.hash(&.{1}).len);
-    try std.testing.expectEqual(@as(usize, 5), spec160.hash(&.{1}).len);
+    try std.testing.expectEqual(@as(usize, 4), (try spec128.hash(&.{1})).len);
+    try std.testing.expectEqual(@as(usize, 5), (try spec160.hash(&.{1})).len);
 }

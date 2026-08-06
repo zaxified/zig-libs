@@ -73,8 +73,8 @@ const bd = rescue.Rpo256.hash("arbitrary bytes");       // separate domain
 const dd = rescue.Rpo256.mergeInDomain(left, right, 7);
 
 // The specification's own sponge.
-const s4 = rescue.spec128.hash(&.{ 1, 2, 3 });          // [4]u64
-const s5 = rescue.spec160.hash(&.{ 1, 2, 3 });          // [5]u64
+const s4 = try rescue.spec128.hash(&.{ 1, 2, 3 });      // [4]u64, error.EmptyInput on &.{}
+const s5 = try rescue.spec160.hash(&.{ 1, 2, 3 });      // [5]u64
 
 // The bare permutation, for building your own construction.
 var st: rescue.Rpo256.State = @splat(0);

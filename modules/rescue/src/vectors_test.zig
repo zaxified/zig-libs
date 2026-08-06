@@ -37,7 +37,7 @@ fn counting(comptime n: usize) [n]gl.Fe {
 test "RPO report, 128-bit instance: all 19 published digests" {
     inline for (up.spec_128, 1..) |expected, n| {
         const input = comptime counting(n);
-        const got = rpo.spec128.hash(&input);
+        const got = try rpo.spec128.hash(&input);
         try std.testing.expectEqualSlices(gl.Fe, &expected, &got);
     }
 }
@@ -45,7 +45,7 @@ test "RPO report, 128-bit instance: all 19 published digests" {
 test "RPO report, 160-bit instance: all 19 published digests" {
     inline for (up.spec_160, 1..) |expected, n| {
         const input = comptime counting(n);
-        const got = rpo.spec160.hash(&input);
+        const got = try rpo.spec160.hash(&input);
         try std.testing.expectEqualSlices(gl.Fe, &expected, &got);
     }
 }
@@ -71,7 +71,7 @@ test "the two sponges disagree on every input, as they must" {
     // this would not.
     inline for (1..20) |n| {
         const input = comptime counting(n);
-        const a = rpo.spec128.hash(&input);
+        const a = try rpo.spec128.hash(&input);
         const b = rpo.Rpo256.hashElements(&input);
         try std.testing.expect(!std.mem.eql(gl.Fe, &a, &b));
     }
