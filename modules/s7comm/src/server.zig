@@ -160,6 +160,18 @@ pub const Responder = struct {
                 try w.addError(.data_type_unsupported, error_item_length);
                 continue;
             };
+            // A zero element count makes the bounds guard below vacuous: `want`
+            // is 0, so `start + want > store.len` is false even at
+            // `start == store.len`, and the `.bit` arm then indexes
+            // `store[item.byteOffset()]` one octet past the area. Refuse it up
+            // front -- there is nothing to transfer either way, and with
+            // `count >= 1` the guard implies `byteOffset() < store.len` for
+            // every area kind (for a bit-addressed area `start == byteOffset()`;
+            // for an element-addressed one `byteOffset() <= start`).
+            if (item.count == 0) {
+                try w.addError(.invalid_address, error_item_length);
+                continue;
+            }
             const store = self.find(item.area, item.db_number) orelse {
                 try w.addError(.object_does_not_exist, error_item_length);
                 continue;
@@ -507,8 +519,280 @@ test "read SZL 0x0424 reflects the configured and the stopped state" {
     try testing.expectEqual(userdata.CpuStatus.stop, userdata.cpuStatusFrom(resp2).?);
 }
 
-test "fuzz: the responder never panics on arbitrary packets" {
+test "a Read Var item with count 0 on the bit path does not index past the area" {
+    // Regression, wave-2 W2-02. `payloadBytes()` returns `(count + 7) / 8`, so a
+    // `.bit` item with `count == 0` wants ZERO octets and the guard
+    // `start + want > store.len` is satisfied at `start == store.len` -- after
+    // which the `.bit` arm unconditionally read `store[item.byteOffset()]`, one
+    // past the end. Wire-controlled and unauthenticated: S7 has no
+    // authentication at all, and `doRead` does not require `Setup
+    // communication` to have run first, so this frame is the whole attack.
+    //
+    // The item is `12 0a 10 01 0000 0001 84 000200`: S7ANY, transport size
+    // `bit` (0x01), count 0, DB 1, area DB, bit address 0x200 = byte 64 -- one
+    // past a 64-octet DB.
+    //
+    // (The audit's evidence line quotes this frame with a TPKT length octet of
+    // `0x2b` and calls it "43 octets". That is wrong on both counts and the
+    // frame as printed would have been refused by `tpkt.decode`, whose
+    // `total > buf.len` check bites: the frame is 31 octets and its length
+    // field is `0x1f`. The item bytes -- the part that carries the defect --
+    // are exactly as the audit recorded them.)
+    var db: [64]u8 = @splat(0);
+    var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};
+    var r = Responder.init(.{}, &areas);
+    var in: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const req = hex("0300001f" ++ "02f080" ++ "320100000001000e0000" ++ "0401" ++
+        "120a1001" ++ "0000" ++ "0001" ++ "84" ++ "000200", &in);
+    const rep = (try r.handle(req, &out)).?;
+    // A refusal, not a payload: the item must come back as a four-octet error
+    // entry (`rc, null_size, 00 04`) rather than a success item carrying a byte
+    // that was never inside the area.
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{ @intFromEnum(items.ReturnCode.invalid_address), 0x00, 0x00, 0x04 },
+        rep[21..],
+    );
+}
+
+test "fuzz: the responder never panics on hostile requests inside a well-formed envelope" {
     try std.testing.fuzz({}, fuzzHandle, .{});
+}
+
+// ── the structure-aware responder harness ───────────────────────────────────
+//
+// The previous version of this harness fed `smith.bytes()` straight into
+// `handle`. That looked like coverage of the responder and was coverage of the
+// framing layer only: before control can reach `doRead`, an input has to
+// satisfy TPKT (`03 00`, a self-consistent length), COTP (LI, code, class 0),
+// the S7 header (`0x32`, a known ROSCTR, and `parameter_length + data_length`
+// matching the frame **exactly**), a Read/Write Var function octet and a
+// `12 0a 10` S7ANY descriptor whose item count matches the octets present.
+// Uniform random bytes clear that with probability ~0 — a 400 s
+// coverage-guided run never got past `cotp` — so `doRead`, `doWrite`,
+// `applyWrite` and `handleUserdata` had no fuzz coverage at all, and the
+// out-of-bounds read in `doRead` (regression test above) sat one well-formed
+// packet away from a harness that could never build one.
+//
+// So the envelope is **built** here rather than guessed, and the fuzzer's
+// entropy is spent where the responder makes decisions: the item descriptors
+// (transport size, element count, DB number, area, address) and the write
+// data block (declared length vs. payload actually present). The framing
+// layer keeps its own raw-byte harnesses in `tpkt.zig`, `cotp.zig`, `s7.zig`,
+// `vars.zig` and `items.zig`, so nothing is given up by specialising this one.
+
+/// Areas the responder can be asked about: two of them are registered below,
+/// the rest must come back as a return code rather than a crash. `counter` and
+/// `timer` are in the list because they are the two areas whose address counts
+/// elements rather than bits, which is a second address-arithmetic path.
+const fuzz_areas = [_]u8{ 0x1C, 0x1D, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87 };
+
+/// The two areas the harness actually registers. Drawn from more often than
+/// the full list: an item naming an unregistered area is answered from
+/// `find`'s `orelse` arm and never reaches the address arithmetic at all, so
+/// spreading the draw uniformly over ten areas spends 80% of the budget on one
+/// early return.
+const fuzz_bound_areas = [_]u8{ 0x83, 0x84 };
+
+/// Every named request transport size, `bit` (0x01) included — it is the one
+/// whose payload length is counted in bits and therefore rounds, which is what
+/// made a zero element count degenerate.
+const fuzz_sizes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0F, 0x1C, 0x1D, 0x1E, 0x1F, 0x20 };
+
+/// The sizes a real client actually asks for, weighted up for the same reason.
+const fuzz_common_sizes = [_]u8{ 0x01, 0x02, 0x04, 0x05, 0x06, 0x07, 0x08 };
+
+/// Data-block transport sizes, including `null_size` and unknown-to-us values.
+const fuzz_data_sizes = [_]u8{ 0x00, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09 };
+
+/// Writes one 12-octet S7ANY item descriptor. The three-octet prefix is fixed
+/// because a wrong one is rejected by `items.Item.decode` before the responder
+/// ever sees the item — that refusal is `items.zig`'s harness's job, not this
+/// one's.
+fn fuzzItemBytes(smith: *std.testing.Smith, out: *[12]u8) void {
+    out[0] = 0x12;
+    out[1] = 0x0A;
+    out[2] = 0x10;
+    out[3] = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+        0...5 => fuzz_common_sizes[smith.index(fuzz_common_sizes.len)],
+        6...8 => fuzz_sizes[smith.index(fuzz_sizes.len)],
+        else => smith.value(u8),
+    };
+    // Biased small: that is the region where an item is *accepted* and the
+    // bounds arithmetic is what decides the outcome. Zero is deliberately in
+    // range — a zero count makes `payloadBytes()` zero for every size.
+    const count: u16 = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+        0...5 => smith.valueRangeAtMost(u16, 0, 8),
+        6...8 => smith.valueRangeAtMost(u16, 0, 64),
+        else => smith.value(u16),
+    };
+    out[4] = @intCast(count >> 8);
+    out[5] = @truncate(count);
+    // DB 1 is registered; 0 and 2 are not.
+    const db: u16 = smith.valueRangeAtMost(u16, 0, 2);
+    out[6] = @intCast(db >> 8);
+    out[7] = @truncate(db);
+    out[8] = if (smith.boolWeighted(2, 3))
+        fuzz_bound_areas[smith.index(fuzz_bound_areas.len)]
+    else
+        fuzz_areas[smith.index(fuzz_areas.len)];
+    // The address is generated the way a client writes one -- a byte offset
+    // plus a bit index -- rather than as a raw 24-bit number, and the byte
+    // offset is drawn from a range that straddles the end of both 64-octet
+    // areas. Uniform over 2^24 the boundary is never hit; uniform over the
+    // wire encoding it is hit only by accident.
+    const addr: u24 = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+        0...6 => @as(u24, smith.valueRangeAtMost(u8, 0, 80)) * 8 + smith.valueRangeAtMost(u8, 0, 7),
+        7...8 => smith.valueRangeAtMost(u24, 0, 4096),
+        else => smith.value(u24),
+    };
+    out[9] = @intCast((addr >> 16) & 0xFF);
+    out[10] = @intCast((addr >> 8) & 0xFF);
+    out[11] = @truncate(addr);
+}
+
+/// Appends one Write Var request data item at `pos`, returning the new
+/// position. The declared length is usually the honest one — otherwise the
+/// data-block iterator rejects the frame before `applyWrite` runs and the
+/// whole request is wasted — but sometimes a lie, which is the case
+/// `applyWrite`'s own `value.payload.len < want` guard exists for.
+fn fuzzWriteValue(smith: *std.testing.Smith, data: []u8, pos: usize, last: bool) ?usize {
+    const ts: items.DataTransportSize = @enumFromInt(fuzz_data_sizes[smith.index(fuzz_data_sizes.len)]);
+    const n: usize = smith.valueRangeAtMost(u8, 0, 32);
+    const honest = items.encodeLength(ts, n) catch return null;
+    const raw: u16 = if (smith.boolWeighted(7, 1)) honest else smith.value(u16);
+    if (pos + 4 + n > data.len) return null;
+    data[pos] = 0x00; // a request item's return-code octet is `reserved`
+    data[pos + 1] = @intFromEnum(ts);
+    data[pos + 2] = @intCast(raw >> 8);
+    data[pos + 3] = @truncate(raw);
+    smith.bytes(data[pos + 4 ..][0..n]);
+    var p = pos + 4 + n;
+    if (n % 2 == 1 and !last) {
+        if (p >= data.len) return null;
+        data[p] = 0x00;
+        p += 1;
+    }
+    return p;
+}
+
+/// Wraps `params` / `data` in a correct COTP-DT + TPKT envelope and an S7
+/// header whose two length fields agree with what follows, which is what
+/// `s7.decode` insists on.
+fn fuzzEnvelope(rosctr: u8, params: []const u8, data: []const u8, out: []u8) ?[]const u8 {
+    const total = tpkt.header_len + 3 + 10 + params.len + data.len;
+    if (total > out.len or total > 0xFFFF) return null;
+    out[0] = 0x03;
+    out[1] = 0x00;
+    out[2] = @intCast(total >> 8);
+    out[3] = @truncate(total);
+    out[4] = 0x02; // COTP LI
+    out[5] = 0xF0; // DT
+    out[6] = 0x80; // TPDU number 0, EOT
+    out[7] = 0x32; // S7 protocol id
+    out[8] = rosctr;
+    out[9] = 0x00; // redundancy identification
+    out[10] = 0x00;
+    out[11] = 0x00; // PDU reference
+    out[12] = 0x01;
+    out[13] = @intCast(params.len >> 8);
+    out[14] = @truncate(params.len);
+    out[15] = @intCast(data.len >> 8);
+    out[16] = @truncate(data.len);
+    @memcpy(out[17..][0..params.len], params);
+    @memcpy(out[17 + params.len ..][0..data.len], data);
+    return out[0..total];
+}
+
+/// Builds one request. Returns null when this draw could not be assembled, in
+/// which case the caller simply moves on.
+fn fuzzRequest(smith: *std.testing.Smith, out: []u8) ?[]const u8 {
+    var params: [320]u8 = undefined;
+    var data: [640]u8 = undefined;
+    var plen: usize = 0;
+    var dlen: usize = 0;
+    var rosctr: u8 = 0x01; // job
+
+    // Read Var is drawn most often: it is the request with the most
+    // wire-controlled arithmetic behind it, and the only one that can be sent
+    // with no prior exchange at all.
+    switch (smith.valueRangeAtMost(u8, 0, 9)) {
+        // Setup communication: the negotiated PDU length gates every reply.
+        0 => {
+            const asked = if (smith.boolWeighted(3, 1))
+                smith.valueRangeAtMost(u16, 0, 960)
+            else
+                smith.value(u16);
+            params[0] = 0xF0;
+            params[1] = 0x00;
+            params[2] = 0x00;
+            params[3] = 0x01;
+            params[4] = 0x00;
+            params[5] = 0x01;
+            params[6] = @intCast(asked >> 8);
+            params[7] = @truncate(asked);
+            plen = 8;
+        },
+        // Read Var / Write Var.
+        1...6 => |k| {
+            const func: u8 = if (k >= 5) 0x05 else 0x04;
+            const n: u8 = smith.valueRangeAtMost(u8, 1, 12);
+            params[0] = func;
+            params[1] = n;
+            plen = 2;
+            var i: u8 = 0;
+            while (i < n) : (i += 1) {
+                fuzzItemBytes(smith, params[plen..][0..12]);
+                plen += 12;
+            }
+            if (func == 0x05) {
+                i = 0;
+                while (i < n) : (i += 1) {
+                    dlen = fuzzWriteValue(smith, &data, dlen, i + 1 == n) orelse break;
+                }
+            }
+        },
+        // PLC control, and — via an arbitrary function octet — `handleJob`'s
+        // unrecognised-function arm.
+        7 => {
+            params[0] = if (smith.boolWeighted(2, 1))
+                (if (smith.value(bool)) @as(u8, 0x29) else 0x28)
+            else
+                smith.value(u8);
+            const tail: usize = smith.valueRangeAtMost(u8, 0, 24);
+            smith.bytes(params[1..][0..tail]);
+            plen = 1 + tail;
+        },
+        // Userdata / Read SZL.
+        else => {
+            rosctr = 0x07;
+            const p = (userdata.Param{
+                .message_type = @enumFromInt(@as(u4, @truncate(if (smith.boolWeighted(7, 1)) @as(u8, 0) else smith.value(u8)))),
+                .function_group = @enumFromInt(@as(u4, @truncate(if (smith.boolWeighted(7, 1)) @as(u8, 4) else smith.value(u8)))),
+                .subfunction = if (smith.boolWeighted(7, 1)) 0x01 else smith.value(u8),
+            }).encodeRequest(&params) catch return null;
+            plen = p.len;
+            var payload: [32]u8 = undefined;
+            const n: usize = smith.valueRangeAtMost(u8, 0, 8);
+            smith.bytes(payload[0..n]);
+            if (n >= 2 and smith.boolWeighted(3, 1)) {
+                // Steer the list id onto one the responder implements.
+                const known = [_]u16{ 0x0011, 0x0424 };
+                const id = known[smith.index(known.len)];
+                payload[0] = @intCast(id >> 8);
+                payload[1] = @truncate(id);
+            }
+            const db = userdata.DataBlock.encode(
+                @enumFromInt(0xFF),
+                @enumFromInt(0x09),
+                payload[0..n],
+                &data,
+            ) catch return null;
+            dlen = db.len;
+        },
+    }
+    return fuzzEnvelope(rosctr, params[0..plen], data[0..dlen], out);
 }
 
 fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
@@ -517,11 +801,18 @@ fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
         .{ .area = .db, .db_number = 1, .bytes = storage[0..64] },
         .{ .area = .flags, .bytes = storage[64..] },
     };
-    var r = Responder.init(.{ .allow_plc_control = true }, &areas);
-    r.pdu_length = 480;
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var szl: [56]u8 = @splat(0x5A);
+    var r = Responder.init(
+        .{ .allow_plc_control = true, .szl_0011 = &szl },
+        &areas,
+    );
+    var frame_buf: [1024]u8 = undefined;
     var out: [2048]u8 = undefined;
-    _ = r.handle(buf[0..len], &out) catch return;
+    // Several requests down one connection: `pdu_length` and `stopped` carry
+    // across, so a state a single packet cannot reach is still reachable.
+    var n: usize = 0;
+    while (n < 4) : (n += 1) {
+        const frame = fuzzRequest(smith, &frame_buf) orelse continue;
+        _ = r.handle(frame, &out) catch continue;
+    }
 }

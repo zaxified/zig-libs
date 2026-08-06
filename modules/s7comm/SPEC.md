@@ -216,7 +216,14 @@ hang":
   arbitrary bytes, with the record accessor walked to exhaustion.
 - `address.parse` over arbitrary bytes, with anything that parses required to build an encodable
   item.
-- `Responder.handle` over arbitrary packets against real backing areas.
+- `Responder.handle` against real backing areas, driven by a **structure-aware** generator: the
+  TPKT/COTP/S7 envelope is built rather than guessed, and the fuzzed fields are the ones the
+  responder acts on — the S7ANY item descriptors (transport size, element count, DB number, area,
+  address) and a Write Var data block whose declared length and actual payload are drawn
+  independently. Arbitrary *packets* are covered by the raw-byte harnesses one layer down
+  (`tpkt`, `cotp`, `s7`, `vars`, `items`); a harness that has to guess a four-layer envelope
+  before it reaches `doRead` reaches it with probability ~0, which is how the zero-element-count
+  read past the end of an area stayed invisible.
 
 Explicit hostile-input tests (not fuzz) cover every case named in the task and more: a TPKT shorter
 than its header, a bad version octet, a non-zero reserved octet, a length below the header size, a
