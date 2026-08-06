@@ -151,7 +151,7 @@ const module_list = [_]Module{
     .{ .name = "rbac" },
     .{ .name = "xml" },
     .{ .name = "xmldsig", .deps = &.{ "xml", "rsa", "p256" } },
-    .{ .name = "saml", .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509" }, .heavy = true },
+    .{ .name = "saml", .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true },
     .{ .name = "xmlenc", .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true },
     .{ .name = "aescbc" },
     .{ .name = "aeskw" },

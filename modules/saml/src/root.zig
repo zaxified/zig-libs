@@ -121,6 +121,7 @@ const xmldsig = @import("xmldsig");
 const xmlenc = @import("xmlenc");
 const rsa = @import("rsa");
 const x509 = @import("x509");
+const datefmt = @import("datefmt");
 
 /// P-256 public keys, the one EC form `xmldsig.VerifyKey` (and therefore this
 /// module's Holder-of-Key matching) supports.
@@ -131,7 +132,7 @@ pub const meta = .{
     .role = .codec, // consumes an untrusted wire document into a trusted result
     .concurrency = .reentrant,
     .model_after = "OASIS SAML 2.0 (SAMLCore / SAMLProf) Web Browser SSO, SP side; XSW-hardened per 'On Breaking SAML'",
-    .deps = .{ "xmldsig", "xml", "xmlenc", "rsa", "x509" }, // x509: the panic-safe SubjectPublicKeyInfo extractor behind HoK cross-form matching
+    .deps = .{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, // x509: the panic-safe SubjectPublicKeyInfo extractor behind HoK cross-form matching; datefmt: shared xsd:dateTime parsing
 };
 
 // ── namespaces ───────────────────────────────────────────────────────────────
@@ -837,11 +838,11 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
     var audience_ok = false;
     if (childEl(asrt, saml_ns, "Conditions")) |cond| {
         if (cond.attr("", "NotBefore")) |nb| {
-            const t = try parseDateTime(nb);
+            const t = try datefmt.parseXsdDateTime(nb);
             if (now + skew < t) return error.AssertionNotYetValid;
         }
         if (cond.attr("", "NotOnOrAfter")) |noa| {
-            const t = try parseDateTime(noa);
+            const t = try datefmt.parseXsdDateTime(noa);
             if (now - skew >= t) return error.AssertionExpired;
             session_noa = t;
         }
@@ -1006,7 +1007,7 @@ fn validateBearerData(sc: *const xml.Element, config: Config, now: i64, skew: i6
     if (!std.mem.eql(u8, recip, config.acs_url)) return error.RecipientMismatch;
     // NotOnOrAfter is required for a Bearer confirmation.
     const noa = scd.attr("", "NotOnOrAfter") orelse return error.SubjectConfirmationFailed;
-    const t = try parseDateTime(noa);
+    const t = try datefmt.parseXsdDateTime(noa);
     if (now - skew >= t) return error.AssertionExpired;
     // InResponseTo correlation.
     if (scd.attr("", "InResponseTo")) |irt| {
@@ -1050,11 +1051,11 @@ fn validateHolderOfKeyData(alloc: std.mem.Allocator, sc: *const xml.Element, con
     const scd = childEl(sc, saml_ns, "SubjectConfirmationData") orelse return error.SubjectConfirmationFailed;
     // NotBefore / NotOnOrAfter are optional for HoK; enforce them if present.
     if (scd.attr("", "NotBefore")) |nb| {
-        const t = try parseDateTime(nb);
+        const t = try datefmt.parseXsdDateTime(nb);
         if (now + skew < t) return error.AssertionNotYetValid;
     }
     if (scd.attr("", "NotOnOrAfter")) |noa| {
-        const t = try parseDateTime(noa);
+        const t = try datefmt.parseXsdDateTime(noa);
         if (now - skew >= t) return error.AssertionExpired;
     }
     // Recipient is optional for HoK; when present it must still match the ACS.
@@ -2331,11 +2332,11 @@ pub fn consumeLogoutRequestXml(
 
     const id_val = root.attr("", config.id_attr) orelse return error.MalformedRequest;
     const issue_instant_raw = root.attr("", "IssueInstant") orelse return error.MalformedRequest;
-    const issue_instant = try parseDateTime(issue_instant_raw);
+    const issue_instant = try datefmt.parseXsdDateTime(issue_instant_raw);
 
     var not_on_or_after: ?i64 = null;
     if (root.attr("", "NotOnOrAfter")) |noa| {
-        const t = try parseDateTime(noa);
+        const t = try datefmt.parseXsdDateTime(noa);
         if (config.now_unix - config.clock_skew_secs >= t) return error.RequestExpired;
         not_on_or_after = t;
     }
@@ -2512,7 +2513,7 @@ pub fn consumeLogoutResponseXml(
 
     const id_val = root.attr("", config.id_attr) orelse return error.MalformedResponse;
     const issue_instant_raw = root.attr("", "IssueInstant") orelse return error.MalformedResponse;
-    const issue_instant = try parseDateTime(issue_instant_raw);
+    const issue_instant = try datefmt.parseXsdDateTime(issue_instant_raw);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
@@ -2875,107 +2876,14 @@ fn appendTextEscaped(alloc: std.mem.Allocator, w: *std.ArrayList(u8), s: []const
 
 // ── xsd:dateTime → Unix seconds ──────────────────────────────────────────────
 //
-// Parses the SAML/xsd forms: `YYYY-MM-DDThh:mm:ss(.frac)?(Z|±hh:mm)?`. Fractional
-// seconds are truncated (second granularity is sufficient for validity windows).
-// A missing timezone is treated as UTC (SAML timestamps are UTC in practice).
-//
-// DRY note: `datefmt.partsToUnix`/`daysInMonth` do this arithmetic, but `saml`
-// depends only on `xmldsig`+`xml`; the calendar math is reproduced here rather
-// than pulling in `datefmt`. A future `datetime`/`iso8601` helper would let all
-// three (saml, xmldsig-conditions, jwt exp/nbf) share one parser — and the case
-// for it got stronger: this copy had drifted, accepting days that do not exist
-// in their month (`2024-02-31` parsed as `2024-03-02`) where `datefmt.validate`
-// rejects them. Duplicated calendar rules diverge silently.
-//
-// The return type is the minimal `error{InvalidDateTime}` (never allocates),
-// not the wider `ConsumeError` — Zig's error-set coercion widens it back to
-// `ConsumeError` at the existing call sites automatically, and it lets the
-// Single-Logout / Artifact code (their own, narrower error sets) `try` this
-// directly instead of duplicating the calendar arithmetic a second time.
-fn parseDateTime(s: []const u8) error{InvalidDateTime}!i64 {
-    // Minimum: "YYYY-MM-DDThh:mm:ss" = 19 chars.
-    if (s.len < 19) return error.InvalidDateTime;
-    if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':') {
-        return error.InvalidDateTime;
-    }
-    const year = try parseIntField(i64, s[0..4]);
-    const month = try parseIntField(i64, s[5..7]);
-    const day = try parseIntField(i64, s[8..10]);
-    const hour = try parseIntField(i64, s[11..13]);
-    const min = try parseIntField(i64, s[14..16]);
-    const sec = try parseIntField(i64, s[17..19]);
-    if (month < 1 or month > 12 or day < 1) return error.InvalidDateTime;
-    // The day must exist in THAT month: `daysFromCivil` is happy to roll an
-    // impossible date over (Feb 31 became Mar 2), which for a `NotOnOrAfter`
-    // silently extends the assertion's validity window instead of rejecting a
-    // malformed timestamp.
-    if (day > daysInMonth(year, @intCast(month))) return error.InvalidDateTime;
-    if (hour > 23 or min > 59 or sec > 60) return error.InvalidDateTime;
-
-    var i: usize = 19;
-    // Optional fractional seconds (ignored).
-    if (i < s.len and s[i] == '.') {
-        i += 1;
-        const frac_start = i;
-        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
-        if (i == frac_start) return error.InvalidDateTime;
-    }
-    // Optional timezone.
-    var tz_offset: i64 = 0;
-    if (i < s.len) {
-        const c = s[i];
-        if (c == 'Z' or c == 'z') {
-            i += 1;
-        } else if (c == '+' or c == '-') {
-            if (i + 6 > s.len or s[i + 3] != ':') return error.InvalidDateTime;
-            const oh = try parseIntField(i64, s[i + 1 .. i + 3]);
-            const om = try parseIntField(i64, s[i + 4 .. i + 6]);
-            if (oh > 23 or om > 59) return error.InvalidDateTime;
-            tz_offset = (oh * 60 + om) * 60;
-            if (c == '-') tz_offset = -tz_offset;
-            i += 6;
-        } else return error.InvalidDateTime;
-    }
-    if (i != s.len) return error.InvalidDateTime;
-
-    const days = daysFromCivil(year, @intCast(month), @intCast(day));
-    const secs = days * 86400 + hour * 3600 + min * 60 + sec;
-    return secs - tz_offset;
-}
-
-/// Days in `month` (1-12) of `year`, proleptic Gregorian — the same rule as
-/// `datefmt.daysInMonth`, reproduced here for the reason given above.
-fn daysInMonth(year: i64, month: u4) u5 {
-    return switch (month) {
-        1, 3, 5, 7, 8, 10, 12 => 31,
-        4, 6, 9, 11 => 30,
-        2 => if (@rem(year, 4) == 0 and (@rem(year, 100) != 0 or @rem(year, 400) == 0)) 29 else 28,
-        else => unreachable,
-    };
-}
-
-fn parseIntField(comptime T: type, s: []const u8) error{InvalidDateTime}!T {
-    var v: T = 0;
-    if (s.len == 0) return error.InvalidDateTime;
-    for (s) |c| {
-        if (c < '0' or c > '9') return error.InvalidDateTime;
-        v = v * 10 + @as(T, c - '0');
-    }
-    return v;
-}
-
-/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
-/// algorithm). Valid for the full range SAML timestamps use.
-fn daysFromCivil(y_in: i64, m: u32, d: u32) i64 {
-    var y = y_in;
-    if (m <= 2) y -= 1;
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe: i64 = y - era * 400;
-    const mp: i64 = @intCast((m + 9) % 12);
-    const doy: i64 = @divTrunc(153 * mp + 2, 5) + @as(i64, @intCast(d)) - 1;
-    const doe: i64 = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
-}
+// `datefmt.parseXsdDateTime` parses the SAML/xsd forms:
+// `YYYY-MM-DDThh:mm:ss(.frac)?(Z|±hh:mm)?`. This used to be a hand-duplicated
+// copy living in this file; it had already drifted once, accepting days that
+// do not exist in their month (`2024-02-31` parsed as `2024-03-02`), silently
+// extending a `NotOnOrAfter` validity window by up to three days (fixed
+// `eb3edc6`). Sharing the civil-calendar core with `datefmt` (which every
+// call site below still gets via `error{InvalidDateTime}` widening into its
+// own `ConsumeError`/etc.) is what keeps that class of bug from recurring.
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
@@ -2996,43 +2904,6 @@ test {
 }
 
 const testing = std.testing;
-
-test "parseDateTime: UTC Z form" {
-    // 2024-06-01T12:00:00Z == 1717243200.
-    try testing.expectEqual(@as(i64, 1717243200), try parseDateTime("2024-06-01T12:00:00Z"));
-}
-
-test "parseDateTime: fractional seconds truncated, lowercase t/z tolerated" {
-    try testing.expectEqual(@as(i64, 1717243200), try parseDateTime("2024-06-01t12:00:00.123456z"));
-}
-
-test "parseDateTime: numeric timezone offset applied" {
-    // 12:00:00+02:00 is 10:00:00Z == 1717236000.
-    try testing.expectEqual(@as(i64, 1717236000), try parseDateTime("2024-06-01T12:00:00+02:00"));
-    // 12:00:00-02:00 is 14:00:00Z == 1717250400.
-    try testing.expectEqual(@as(i64, 1717250400), try parseDateTime("2024-06-01T12:00:00-02:00"));
-}
-
-test "parseDateTime: epoch and a pre-epoch date" {
-    try testing.expectEqual(@as(i64, 0), try parseDateTime("1970-01-01T00:00:00Z"));
-    // 1969-12-31T00:00:00Z == -86400.
-    try testing.expectEqual(@as(i64, -86400), try parseDateTime("1969-12-31T00:00:00Z"));
-}
-
-test "parseDateTime: malformed inputs are typed errors, never panics" {
-    try testing.expectError(error.InvalidDateTime, parseDateTime("2024-06-01"));
-    try testing.expectError(error.InvalidDateTime, parseDateTime("2024/06/01T12:00:00Z"));
-    try testing.expectError(error.InvalidDateTime, parseDateTime("2024-13-01T12:00:00Z"));
-    try testing.expectError(error.InvalidDateTime, parseDateTime("2024-06-01T25:00:00Z"));
-    try testing.expectError(error.InvalidDateTime, parseDateTime("2024-06-01T12:00:00Q"));
-    try testing.expectError(error.InvalidDateTime, parseDateTime("2024-06-01T12:00:00+0200"));
-    try testing.expectError(error.InvalidDateTime, parseDateTime(""));
-}
-
-test "daysFromCivil matches known epochs" {
-    try testing.expectEqual(@as(i64, 0), daysFromCivil(1970, 1, 1));
-    try testing.expectEqual(@as(i64, 19875), daysFromCivil(2024, 6, 1));
-}
 
 test "buildAuthnRequest: well-formed, parses back, carries the fields" {
     const req = try buildAuthnRequest(testing.allocator, .{
@@ -3185,32 +3056,58 @@ test "decodePostField: base64 wrapped in whitespace decodes (browsers and IdPs b
     try std.testing.expectError(error.InvalidEncoding, decodePostField(a, bad.items));
 }
 
-test "parseDateTime: a day that does not exist in its month is rejected, not rolled over" {
-    // Before this check `daysFromCivil` normalised the overflow, so
-    // "2024-02-31T…" parsed as 2024-03-02 — a `NotOnOrAfter` two days later
-    // than the document actually said, i.e. a validity window an attacker
-    // could stretch with a typo-shaped timestamp rather than a signature.
+test "regression (eb3edc6): a day that does not exist in its month is rejected, not rolled over" {
+    // The exhaustive grammar/leap-year matrix for this now lives in
+    // `datefmt`'s own suite (`parseXsdDateTime`, the function `saml`'s
+    // Conditions/SubjectConfirmationData/IssueInstant checks call below).
+    // This copy is kept here deliberately, calling the very same import
+    // `saml`'s real call sites use, so that `test-saml` — not just
+    // `test-datefmt` — fails if the shared civil-calendar core regresses:
+    // before this check was added (here, pre-merge), a hand-duplicated copy
+    // of this parser normalised the overflow, so "2024-02-31T…" parsed as
+    // 2024-03-02 — a `NotOnOrAfter` two days later than the document actually
+    // said, i.e. a validity window an attacker could stretch with a
+    // typo-shaped timestamp rather than a signature.
     for ([_][]const u8{
         "2024-02-30T00:00:00Z",
         "2024-02-31T00:00:00Z",
         "2023-02-29T00:00:00Z", // 2023 is not a leap year
         "2024-04-31T00:00:00Z",
-        "2024-06-31T00:00:00Z",
-        "2024-09-31T00:00:00Z",
-        "2024-11-31T00:00:00Z",
-        "2024-01-32T00:00:00Z",
-        "2024-01-00T00:00:00Z",
     }) |bad| {
-        std.testing.expectError(error.InvalidDateTime, parseDateTime(bad)) catch |e| {
+        std.testing.expectError(error.InvalidDateTime, datefmt.parseXsdDateTime(bad)) catch |e| {
             std.debug.print("accepted impossible date: {s}\n", .{bad});
             return e;
         };
     }
+    // The real boundary still parses.
+    try std.testing.expectEqual(@as(i64, 1709164800), try datefmt.parseXsdDateTime("2024-02-29T00:00:00Z"));
+}
 
-    // The real boundaries still parse, including both leap-year rules.
-    try std.testing.expectEqual(@as(i64, 1709164800), try parseDateTime("2024-02-29T00:00:00Z"));
-    try std.testing.expectEqual(@as(i64, 951782400), try parseDateTime("2000-02-29T00:00:00Z")); // /400
-    try std.testing.expectError(error.InvalidDateTime, parseDateTime("1900-02-29T00:00:00Z")); // /100
-    try std.testing.expectEqual(@as(i64, 1709251200), try parseDateTime("2024-03-01T00:00:00Z"));
-    try std.testing.expectEqual(@as(i64, 1735603200), try parseDateTime("2024-12-31T00:00:00Z"));
+// The two tests below are NOT redundant with `datefmt`'s own suite, even
+// though they exercise the exact same assertions `datefmt`'s tests do.
+// `parseXsdDateTime` now lives in a module `saml` merely depends on, and
+// `datefmt` has no reason to know it is used for SAML `NotBefore` /
+// `NotOnOrAfter` / `IssueInstant` — a `datefmt` maintainer with no SAML
+// context could loosen either property (they are plausible-looking
+// simplifications: "why reject trailing bytes after a complete parse?",
+// "why insist on the colon, ISO-8601 doesn't care") and `datefmt`'s own tests
+// would simply be updated to match, green the whole way. Without a saml-side
+// assertion, `test-saml` would not notice: these two properties would have
+// silently reverted to being untested from the caller that actually depends
+// on them for security (a shifted `NotOnOrAfter` — the exact consequence
+// class as `eb3edc6`). Do not delete these as "duplicate coverage" — the
+// duplication IS the point: it is `saml` re-asserting its own requirement on
+// a function it does not own.
+
+test "saml requirement: parseXsdDateTime must consume the whole string (no trailing bytes after a complete timestamp)" {
+    // `<Conditions NotOnOrAfter="...Zjunk">` must be rejected outright, not
+    // parsed as if the trailing bytes were not there.
+    try std.testing.expectError(error.InvalidDateTime, datefmt.parseXsdDateTime("2024-01-01T00:00:00Zjunk"));
+}
+
+test "saml requirement: parseXsdDateTime must require the colon in a numeric timezone offset" {
+    // xsd:dateTime's timezone frag is `('+'|'-') hh ':' mm` — the colon is
+    // mandatory. `+0200` (no colon) must be rejected, not silently accepted
+    // as if it meant `+02:00`.
+    try std.testing.expectError(error.InvalidDateTime, datefmt.parseXsdDateTime("2024-01-01T00:00:00+0200"));
 }

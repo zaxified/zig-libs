@@ -823,6 +823,104 @@ pub fn formatIsoDate(alloc: std.mem.Allocator, parts: DateParts) ![]const u8 {
     return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y_u, parts.month, parts.day });
 }
 
+/// Parse an `xsd:dateTime` (SAML/XML-Schema) timestamp to Unix seconds:
+/// `YYYY-MM-DDThh:mm:ss(.frac)?(Z|±hh:mm)?`. Fractional seconds are accepted
+/// and truncated (second granularity only); a missing timezone is treated as
+/// UTC.
+///
+/// This is deliberately a SEPARATE entry point from `parse`, not a `fmt`
+/// string fed through it — `xsd:dateTime` and generic ISO-8601 are not the
+/// same grammar and a single token-based function cannot honestly serve both:
+///   - the timezone offset here REQUIRES the `:` (`+02:00`, never `+0200`),
+///     which `parse`'s `ZZ` token deliberately accepts either way;
+///   - fractional seconds have no token in `parse`'s vocabulary at all (a
+///     format string has no way to say "optionally `.ddd`, then optionally a
+///     zone");
+///   - `parse` has no end-of-input check — trailing garbage after the last
+///     token is silently ignored. This parser requires the whole string to be
+///     consumed;
+///   - a leap second (`:60`) is accepted here (`xsd:dateTime` allows it);
+///     `parse`'s range validation caps seconds at 59.
+/// Loosening any of the above to reuse `parse` directly would make this
+/// function wrong for its one caller (SAML assertion validity windows).
+///
+/// The day-in-month / leap-year rules ARE shared with `parse` (`daysInMonth`,
+/// `ymdToEpochDay`) — this used to be a hand-duplicated copy in `saml` that
+/// had drifted: it normalised `2024-02-31` to `2024-03-02` instead of
+/// rejecting it, silently extending a `NotOnOrAfter` validity window by up to
+/// three days. Sharing the civil core here is what keeps that class of bug
+/// from recurring.
+///
+/// The narrow `error{InvalidDateTime}` return (rather than the wider
+/// `ParseError`) is intentional: Zig's error-set coercion widens it into any
+/// caller's own error set automatically, so `saml` (and any future xsd:dateTime
+/// consumer) can `try` this directly into its own typed errors without an
+/// explicit conversion at every call site.
+pub fn parseXsdDateTime(s: []const u8) error{InvalidDateTime}!i64 {
+    // Minimum: "YYYY-MM-DDThh:mm:ss" = 19 chars.
+    if (s.len < 19) return error.InvalidDateTime;
+    if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':') {
+        return error.InvalidDateTime;
+    }
+    const year = try parseDigitField(i32, s[0..4]);
+    const month = try parseDigitField(u32, s[5..7]);
+    const day = try parseDigitField(u32, s[8..10]);
+    const hour = try parseDigitField(i64, s[11..13]);
+    const min = try parseDigitField(i64, s[14..16]);
+    const sec = try parseDigitField(i64, s[17..19]);
+    if (month < 1 or month > 12 or day < 1) return error.InvalidDateTime;
+    // The day must exist in THAT month — see the doc comment above for why
+    // this check exists (`ymdToEpochDay` happily rolls Feb 31 into Mar 2).
+    if (day > daysInMonth(year, month)) return error.InvalidDateTime;
+    if (hour > 23 or min > 59 or sec > 60) return error.InvalidDateTime; // :60 = leap second
+
+    var i: usize = 19;
+    // Optional fractional seconds (ignored).
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        const frac_start = i;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+        if (i == frac_start) return error.InvalidDateTime;
+    }
+    // Optional timezone: `Z`/`z`, or a signed `±hh:mm` (colon required).
+    var tz_offset_secs: i64 = 0;
+    if (i < s.len) {
+        const c = s[i];
+        if (c == 'Z' or c == 'z') {
+            i += 1;
+        } else if (c == '+' or c == '-') {
+            if (i + 6 > s.len or s[i + 3] != ':') return error.InvalidDateTime;
+            const oh = try parseDigitField(i64, s[i + 1 .. i + 3]);
+            const om = try parseDigitField(i64, s[i + 4 .. i + 6]);
+            if (oh > 23 or om > 59) return error.InvalidDateTime;
+            tz_offset_secs = (oh * 60 + om) * 60;
+            if (c == '-') tz_offset_secs = -tz_offset_secs;
+            i += 6;
+        } else return error.InvalidDateTime;
+    }
+    if (i != s.len) return error.InvalidDateTime;
+
+    const days = ymdToEpochDay(year, month, day);
+    const secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    return secs - tz_offset_secs;
+}
+
+/// Digit-only fixed-field parse: every byte must be `0`-`9` (no sign, no
+/// whitespace) — unlike `std.fmt.parseInt`, which would happily read a `-`
+/// inside a slice meant to be an unsigned calendar field. Used by
+/// `parseXsdDateTime`, where a slice like `s[11..13]` (the hour field) must
+/// never silently become negative just because the byte at that offset was
+/// `-` rather than a digit.
+fn parseDigitField(comptime T: type, s: []const u8) error{InvalidDateTime}!T {
+    var v: T = 0;
+    if (s.len == 0) return error.InvalidDateTime;
+    for (s) |c| {
+        if (c < '0' or c > '9') return error.InvalidDateTime;
+        v = v * 10 + @as(T, c - '0');
+    }
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // Format-string validation
 // ---------------------------------------------------------------------------
@@ -1057,6 +1155,74 @@ test "strict ISO helpers" {
     const s = try formatIsoDate(a, .{ .year = 1924, .month = 10, .day = 10 });
     defer a.free(s);
     try testing.expectEqualStrings("1924-10-10", s);
+}
+
+test "parseXsdDateTime: UTC Z form" {
+    try testing.expectEqual(@as(i64, 1717243200), try parseXsdDateTime("2024-06-01T12:00:00Z"));
+}
+
+test "parseXsdDateTime: fractional seconds truncated, lowercase t/z tolerated" {
+    try testing.expectEqual(@as(i64, 1717243200), try parseXsdDateTime("2024-06-01t12:00:00.123456z"));
+}
+
+test "parseXsdDateTime: numeric timezone offset applied" {
+    try testing.expectEqual(@as(i64, 1717236000), try parseXsdDateTime("2024-06-01T12:00:00+02:00"));
+    try testing.expectEqual(@as(i64, 1717250400), try parseXsdDateTime("2024-06-01T12:00:00-02:00"));
+}
+
+test "parseXsdDateTime: epoch and a pre-epoch date" {
+    try testing.expectEqual(@as(i64, 0), try parseXsdDateTime("1970-01-01T00:00:00Z"));
+    try testing.expectEqual(@as(i64, -86400), try parseXsdDateTime("1969-12-31T00:00:00Z"));
+}
+
+test "parseXsdDateTime: malformed inputs are typed errors, never panics" {
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-06-01"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024/06/01T12:00:00Z"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-13-01T12:00:00Z"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-06-01T25:00:00Z"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-06-01T12:00:00Q"));
+    // xsd:dateTime requires the ':' in the offset — unlike `parse`'s `ZZ`
+    // token, which tolerates its absence. This is the divergence documented
+    // on `parseXsdDateTime` itself.
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-06-01T12:00:00+0200"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime(""));
+}
+
+test "parseXsdDateTime: leap second (:60) accepted — xsd:dateTime allows it, parse()'s range check does not" {
+    try testing.expectEqual(@as(i64, 1719792000), try parseXsdDateTime("2024-06-30T23:59:60Z"));
+}
+
+test "parseXsdDateTime: trailing garbage after a complete timestamp is rejected" {
+    // `parse()` has no end-of-input check; this parser does — see doc comment.
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-06-01T12:00:00Zgarbage"));
+}
+
+test "parseXsdDateTime: a day that does not exist in its month is rejected, not rolled over (regression, eb3edc6)" {
+    // Before this check, the previous saml-local copy of this parser
+    // normalised the overflow, so "2024-02-31T…" parsed as 2024-03-02 — a
+    // `NotOnOrAfter` two days later than the document actually said, i.e. an
+    // assertion validity window an attacker could stretch with a typo-shaped
+    // timestamp rather than a signature.
+    for ([_][]const u8{
+        "2024-02-30T00:00:00Z",
+        "2024-02-31T00:00:00Z",
+        "2023-02-29T00:00:00Z", // 2023 is not a leap year
+        "2024-04-31T00:00:00Z",
+        "2024-06-31T00:00:00Z",
+        "2024-09-31T00:00:00Z",
+        "2024-11-31T00:00:00Z",
+        "2024-01-32T00:00:00Z",
+        "2024-01-00T00:00:00Z",
+    }) |bad| {
+        try testing.expectError(error.InvalidDateTime, parseXsdDateTime(bad));
+    }
+
+    // The real boundaries still parse, including both leap-year rules.
+    try testing.expectEqual(@as(i64, 1709164800), try parseXsdDateTime("2024-02-29T00:00:00Z"));
+    try testing.expectEqual(@as(i64, 951782400), try parseXsdDateTime("2000-02-29T00:00:00Z")); // /400
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("1900-02-29T00:00:00Z")); // /100
+    try testing.expectEqual(@as(i64, 1709251200), try parseXsdDateTime("2024-03-01T00:00:00Z"));
+    try testing.expectEqual(@as(i64, 1735603200), try parseXsdDateTime("2024-12-31T00:00:00Z"));
 }
 
 test "firstInvalidFormatChar: flags stray letters, accepts tokens + literals" {
