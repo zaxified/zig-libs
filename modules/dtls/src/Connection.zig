@@ -3188,8 +3188,14 @@ pub const Connection = struct {
 
 // ── suite dispatch (runtime CipherSuite -> comptime AEAD/sn primitives) ──
 
+const chachapoly = @import("chachapoly");
+
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+// The `chacha20_poly1305_sha256` suite is RFC 8439's plain ChaCha20-Poly1305
+// (NOT XChaCha), so the SIMD `chachapoly` sibling applies here — see
+// `aead.zig`'s differential test for the byte-identity proof against std,
+// which stays reachable there as the OpenSSL-anchored oracle.
+const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
 const SuiteParams = struct { key_len: u8, sn_len: u8, tag_len: u8, is_chacha: bool };
 
@@ -3273,6 +3279,47 @@ fn snMaskDispatch(suite: CipherSuite, keys: DirKeys, sample: []const u8, seq_byt
         .chacha20_poly1305_sha256 => aead.encryptSequenceNumberChaCha20(keys.sn_key[0..32], sample, seq_bytes),
         else => error.UnsupportedSuite,
     };
+}
+
+// ── suite dispatch chained to the byte-exact AEAD layer ──────────────────
+//
+// `roundtripSuite`/`loopbackHandshake`/`connectedPair` below drive the
+// `chacha20_poly1305_sha256` suite end to end, but ONLY as a client<->server
+// self-consistency check: both sides resolve `ChaCha20Poly1305` to whatever
+// this file's alias currently names, so a suite bound to the WRONG AEAD
+// (e.g. AES-256-GCM, which happens to share the 32/12/16 key/nonce/tag
+// shape) still round-trips against itself and none of those tests would
+// notice. This test closes that gap by calling `protectDispatch` directly
+// with fixed keys/epoch/seq/plaintext/aad (no handshake needed — `DirKeys`
+// is plain bytes) and asserting the record is byte-identical to
+// `aead.Protection(chachapoly.ChaCha20Poly1305)` driven with the SAME
+// inputs — the same `Protection` instantiation `aead.zig`'s KAT pins
+// byte-exact against the independent OpenSSL vector. The chain is therefore
+// OpenSSL vector -> `Protection` -> this dispatch, with no new external
+// vector and nothing self-generated.
+test "protectDispatch(chacha20_poly1305_sha256): byte-identical to Protection(chachapoly.ChaCha20Poly1305) for the same inputs" {
+    var keys: DirKeys = .{};
+    for (&keys.key, 0..) |*b, i| b.* = @intCast(0xA0 +% i);
+    keys.key_len = 32;
+    for (&keys.iv, 0..) |*b, i| b.* = @intCast(0x50 +% i);
+    const epoch: u16 = 7;
+    const seq: u48 = 99;
+    const inner = "dtls dispatch chain KAT";
+    const aad = "record header bytes";
+
+    var via_dispatch: [inner.len + 16]u8 = undefined;
+    const n1 = try protectDispatch(.chacha20_poly1305_sha256, keys, epoch, seq, inner, aad, &via_dispatch);
+
+    var via_protection: [inner.len + 16]u8 = undefined;
+    const n2 = try aead.Protection(chachapoly.ChaCha20Poly1305).protect(keys.key, keys.iv, epoch, seq, inner, aad, &via_protection);
+
+    try std.testing.expectEqual(n1, n2);
+    try std.testing.expectEqualSlices(u8, via_protection[0..n2], via_dispatch[0..n1]);
+
+    // And it opens back through the same two paths.
+    var open_dispatch: [inner.len]u8 = undefined;
+    const m1 = try unprotectDispatch(.chacha20_poly1305_sha256, keys, epoch, seq, via_dispatch[0..n1], aad, &open_dispatch);
+    try std.testing.expectEqualSlices(u8, inner, open_dispatch[0..m1]);
 }
 
 /// RFC 9147 §4.5.1 sliding anti-replay window check-and-update, shared by

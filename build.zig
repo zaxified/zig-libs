@@ -203,7 +203,7 @@ const module_list = [_]Module{
     .{ .name = "slhdsa", .heavy = true },
     .{ .name = "falcon" },
     .{ .name = "hqc", .heavy = true },
-    .{ .name = "dtls", .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"} },
+    .{ .name = "dtls", .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsresume" },
     .{ .name = "quic-crypto", .deps = &.{"chachapoly"} },
     .{ .name = "sandbox" },

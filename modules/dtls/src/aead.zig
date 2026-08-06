@@ -184,6 +184,7 @@ pub fn decryptSequenceNumberChaCha20(
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const chachapoly = @import("chachapoly");
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
@@ -229,6 +230,25 @@ test "AES-GCM record protection: byte-exact vs OpenSSL, then round-trips" {
 
 test "ChaCha20-Poly1305 record protection: byte-exact vs OpenSSL" {
     const P = Protection(ChaCha20Poly1305);
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(0x10 + i);
+    const iv = hexTo(12, "5d313eb2671276ee13000b30");
+    const inner = hexTo(10, "48692074686572652117");
+    const aad = hexTo(5, "2e002a0018");
+    var out: [64]u8 = undefined;
+    const n = try P.protect(key, iv, 0, 0x2A, &inner, &aad, &out);
+    try testing.expectEqualSlices(u8, &hexTo(26, "fe100fc8a3e503734e8cafbddc40f5e847fcd8be3eb895158ab7"), out[0..n]);
+    var back: [64]u8 = undefined;
+    const m = try P.unprotect(key, iv, 0, 0x2A, out[0..n], &aad, &back);
+    try testing.expectEqualSlices(u8, &inner, back[0..m]);
+}
+
+test "ChaCha20-Poly1305 record protection: chachapoly sibling is byte-identical to std/OpenSSL" {
+    // `Connection.zig`'s suite dispatch drives `Protection(chachapoly.
+    // ChaCha20Poly1305)` in production for `chacha20_poly1305_sha256`; std's
+    // ChaCha20-Poly1305 stays the OpenSSL-anchored oracle in the test above.
+    // Same vector, same expected bytes -> proves the swap is inert.
+    const P = Protection(chachapoly.ChaCha20Poly1305);
     var key: [32]u8 = undefined;
     for (&key, 0..) |*b, i| b.* = @intCast(0x10 + i);
     const iv = hexTo(12, "5d313eb2671276ee13000b30");

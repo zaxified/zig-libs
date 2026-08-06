@@ -216,11 +216,16 @@
 //!   scaffold's original "thin pass-through to std" plan would have produced
 //!   TLS-prefixed keys that no DTLS peer accepts.
 //! - Cipher-suite→AEAD binding: `aead.zig`'s `Protection(comptime Aead)`
-//!   mirrors std TLS's generic per-suite shape, instantiated here for
-//!   `Aes128Gcm` and `ChaCha20Poly1305`. `AES_128_CCM_8_SHA256` (the CoAP
-//!   profile default) is NOT wired: std's CCM presets are all 13-byte-nonce
-//!   and the parametric `AesCcm` is private, so a TLS/DTLS-correct 12-byte
-//!   nonce is unavailable from std (see the AEAD/CCM correction above).
+//!   mirrors std TLS's generic per-suite shape, instantiated in
+//!   `Connection.zig`'s suite dispatch for `Aes128Gcm` (std) and
+//!   `ChaCha20Poly1305` (the `chachapoly` sibling, RFC 8439's plain
+//!   ChaCha20-Poly1305 — the `chacha20_poly1305_sha256` suite is not
+//!   XChaCha, so the sibling applies; std's ChaCha20-Poly1305 stays
+//!   reachable in `aead.zig`'s own tests as the OpenSSL differential
+//!   oracle). `AES_128_CCM_8_SHA256` (the CoAP profile default) is NOT
+//!   wired: std's CCM presets are all 13-byte-nonce and the parametric
+//!   `AesCcm` is private, so a TLS/DTLS-correct 12-byte nonce is
+//!   unavailable from std (see the AEAD/CCM correction above).
 //! - `std.crypto.core.aes.Aes128`/`Aes256` `.initEnc(key).encrypt(...)` is a
 //!   real single-block AES-ECB primitive, used directly for the RFC 9147
 //!   §4.2.3 sequence-number mask; `std.crypto.stream.chacha.ChaCha20IETF`
@@ -297,9 +302,14 @@ pub const meta = .{
     // `x509`: `certauth.zig`'s certificate-DER parsing, routed through
     // `x509.spkiOf`/`x509.safe.safeCertificate` instead of
     // `std.crypto.Certificate.parse` (see certauth.zig's doc comment).
+    // `chachapoly`: `Connection.zig`'s suite dispatch uses the SIMD sibling
+    // for the negotiated `chacha20_poly1305_sha256` suite (RFC 8439's plain
+    // ChaCha20-Poly1305 — NOT XChaCha, so the sibling applies); std's
+    // ChaCha20-Poly1305 stays reachable in `aead.zig`'s tests as the
+    // OpenSSL-anchored differential oracle.
     // The PSK-only flight engine itself still needs no sibling modules,
     // see the "meta.deps" test below.
-    .deps = .{ "rsa", "x509" },
+    .deps = .{ "rsa", "x509", "chachapoly" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -324,10 +334,11 @@ test {
     _ = @import("wolfssl_interop.zig");
 }
 
-test "meta.deps is {\"rsa\", \"x509\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing; the PSK flight engine itself needs no sibling modules)" {
-    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
+test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 suite; the PSK flight engine itself needs no sibling modules)" {
+    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
     try std.testing.expectEqualStrings("rsa", meta.deps[0]);
     try std.testing.expectEqualStrings("x509", meta.deps[1]);
+    try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
 }
 
 test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5.9)" {
