@@ -86,7 +86,41 @@ there — the only ISO LAN-vs-P2P distinction the flag matrix needs. A newer LSP
 that **replaces** an existing entry resets both flag sets before applying the
 matrix (the old version's flags are superseded).
 
-### 4.2 Purge for an unknown LSP
+### 4.2 The own-LSP rule (ISO §7.3.16.1) — received copies of our own LSPs
+
+IS-IS as built here is **unauthenticated** (§8), so the update process must
+defend itself against an on-link peer. An LSP **received on a circuit**
+(`arrival_iface != null`) whose LSP-ID's first six octets equal
+`Config.local_system_id` is *never* stored, however "newer" it compares. Only
+this system may originate its own LSPs. The standard's remedy — mirrored by
+FRRouting's `own_lsp` branch in `isis_pdu.c:process_lsp`, which calls
+`lsp_inc_seqno` and re-floods — is to **re-originate at the challenger's
+sequence + 1**. LSP generation is deferred (§8), so this module reports it:
+
+| Case | Effect |
+|------|--------|
+| we hold that LSP-ID, comparison says `newer` | copy untouched; `refresh_pending` set; `challenge_sequence` raised to theirs; SRM set on **every** circuit (arrival included — the sender's copy is wrong); SSN cleared; `InsertResult{ stored = false, self_challenge = their_seq }` |
+| we hold it, comparison says `same`/`older` | the ordinary matrix (§4.1) — neither touches the stored copy |
+| we hold no copy of that LSP-ID | refused outright (FRR purges rather than adopts); `InsertResult{ stored = false, self_challenge = their_seq }` |
+| an **SNP** lists one of our LSP-IDs | never SSN, never a placeholder — we do not request our own LSP from a neighbour. `newer` ⇒ `refresh_pending` + `challenge_sequence` + SRM; `older` ⇒ SRM; `same` ⇒ SRM cleared |
+
+Without this rule a peer could purge our own LSP outright (stored, re-flooded,
+deleted after `ZeroAgeLifetime`) with `refresh_pending` never set.
+
+### 4.3 Sequence exhaustion (ISO §7.3.16.1)
+
+The sequence space is the **linear** range `[1, 2^32-1]`; a system that would
+need to exceed it must purge the LSP and wait `MaxAge` before restarting at 1.
+A **local** origination (`arrival_iface == null`) of a self LSP-ID at
+`max_sequence_number` is therefore refused with `error.SequenceExhausted`: a copy
+at the top of the space could never be superseded. Refusing *at* the top rather
+than beyond it is deliberate — there is no "beyond" to detect. A neighbour's LSP
+at `2^32-1` is unaffected; the rule is about our own origination. Combined with
+§4.2 this closes the lockout: a peer injecting `0xFFFF_FFFF` for one of our
+LSP-IDs is refused before it can be stored, so our later re-originations still
+compare `.newer`.
+
+### 4.4 Purge for an unknown LSP
 
 An LSP received with zero Remaining Lifetime whose LSP-ID is **not** in the
 database is **ignored** — nothing to purge, and it is deliberately not stored, so
@@ -146,20 +180,40 @@ sweep is **skipped** — a corrupt CSNP must not trigger a mass re-flood.
 
 Request placeholders carry no PDU bytes, are skipped by aging and by `summarise`,
 count toward `capacity`, and are replaced when the real LSP arrives (any real LSP
-is newer than a sequence-0 placeholder).
+is newer than a sequence-0 placeholder). They are **not** created for our own
+LSP-IDs (§4.2), they are budgeted separately (§7), and they are **timed out**
+(§7) — an SNP is unauthenticated, so a placeholder that nothing ever answers must
+not be permanent.
 
 ## 7. Capacity / DoS bound
 
 The store is bounded by `Config.capacity`. A new distinct LSP-ID is admitted only
 while `count() < capacity`; otherwise `insert` returns `error.DatabaseFull` with
-the store unchanged. Request placeholders from SNPs are bounded the same way
-(silently dropped when full — a later CSNP retries). Purges for unknown LSPs are
-never stored. Together these mean neither an LSP flood, an SNP flood, nor a
-zero-lifetime flood can grow the database without limit — the adversarial memory
-ceiling is `capacity` entries plus one in-flight decode. Updates to existing
-LSP-IDs never change membership, so they always succeed at capacity. (ISO's
-LSPDBOverload — set the overload bit and shed — is a hook for the
-LSP-generation layer, §8.)
+the store unchanged. Purges for unknown LSPs are never stored. So no flood grows
+the database without limit — the adversarial memory ceiling is `capacity` entries
+plus one in-flight decode. Updates to existing LSP-IDs never change membership,
+so they always succeed at capacity. (ISO's LSPDBOverload — set the overload bit
+and shed — is a hook for the LSP-generation layer, §8.)
+
+**Bounding *size* is not bounding *availability*.** A request placeholder is
+minted from an SNP entry, i.e. from bytes any on-link party can send, and it is
+indistinguishable from a genuine request. Two further bounds therefore apply to
+placeholders specifically:
+
+- **A separate budget.** `Config.request_capacity` (default `max(1, capacity/4)`,
+  never above `capacity`) caps how many placeholders may exist at once. Over the
+  budget the request is dropped and the next CSNP retries. However many LSP-IDs a
+  hostile SNP fabricates, at least `capacity − budget` slots stay available to
+  genuine LSPs. The count is maintained incrementally (`Lsdb.request_count`), so
+  an SNP with `n` entries costs `O(n)`, not `O(n²)`.
+- **A timeout.** `Config.request_timeout` (default 60 `Time` units; ISO's
+  `completeSNPInterval` default is 10 s, so this covers several CSNP retries)
+  bounds how long a placeholder lives. `tick`'s pass 2 drops expired ones and
+  reports them as `AgeReport.requests_expired`. Without it a placeholder for an
+  LSP that never arrives is immortal — skipped by pass 1 (`is_request`) and
+  invisible to pass 2 (no `purge_deadline`) — so one CSNP listing `capacity`
+  fabricated LSP-IDs would wedge the database permanently, returning
+  `DatabaseFull` for every genuine LSP thereafter.
 
 ## 8. Deferred (with hooks)
 
@@ -177,9 +231,31 @@ LSP-generation layer, §8.)
 - **Multi-topology (MT) and multi-level** — this is a single-level database; an
   L1 and an L2 database are two `Lsdb` instances. MT would key/scope entries by
   topology.
-- **The ISO Fletcher checksum** — neither computed nor verified here (the raw
-  field feeds the comparison as-is); it belongs with LSP generation + receive
-  validation.
+- **The ISO Fletcher checksum — a KNOWN, OPEN exposure, not merely "deferred".**
+  Neither computed nor verified anywhere in this repo: the `isis` codec carries
+  the checksum as a raw field and exports no Fletcher primitive
+  (`isis/src/pdu.zig:248-249`), so no consumer *can* verify it. §7.3.16.1(d)
+  (§3, row "c) checksum") is safe in ISO only because §7.3.14.2 has already
+  **discarded** an LSP whose checksum is invalid — by the time (d) runs, a
+  differing checksum can only mean two well-formed copies disagree. Without that
+  precondition **clause (d) is an unauthenticated content-replacement
+  primitive**: an on-link party needs *no* higher sequence number to overwrite a
+  stored LSP, only an arbitrary checksum byte-pair at the *same* sequence; the
+  store then replaces the bytes and sets SRM, re-flooding the attacker's content
+  onward. Closing it is a two-module change and the halves belong in different
+  places:
+  - **the primitive → `isis`.** The Fletcher-over-the-PDU computation is a
+    property of the PDU encoding, and `isis` is a *dependency* of this module, so
+    only a primitive living there is reachable by both the receive path here and
+    the (deferred) LSP-generation path that must *stamp* the checksum.
+    Re-implementing it here would put it out of reach of its other user and
+    duplicate it.
+  - **the policy → here.** "Discard an LSP with an invalid checksum before the
+    §7.3.16.1 comparison" is receive-process behaviour and belongs in
+    `Lsdb.insert`, immediately after `isis.Lsp.decode`.
+
+  Tracked as `isis-lsdb` F4 / `isis` F3 in the wave-2 audit; the `isis` half must
+  land first.
 
 ## 9. Verification
 
@@ -208,6 +284,18 @@ cross-checked against FRRouting `isis_lsp.c:lsp_compare`.
   purge-for-unknown ignored; a `std.testing.fuzz` target over `insert` (hostile
   bytes never panic, an errored insert leaves membership unchanged); no leak
   (`std.testing.allocator`, `deinit` frees all owned bytes).
+- **Hostile on-link peer** (each drives the exact input an unauthenticated
+  neighbour can send): a CSNP of `capacity` fabricated LSP-IDs leaves the
+  request budget bounded and genuine LSPs still admissible; placeholders expire
+  at `request_timeout` and return their budget; a peer's zero-lifetime purge of
+  our own LSP is refused, our copy survives past `ZeroAgeLifetime`,
+  `refresh_pending` + `challenge_sequence` are set and SRM is asserted on every
+  circuit; a peer's `2^32-1` for one of our LSP-IDs is refused and we can still
+  re-originate; the two combined still leave both fragments re-originable;
+  originating at `2^32-1` is `error.SequenceExhausted`; an SNP listing our own
+  LSP-IDs never yields SSN or a placeholder. The Wireshark-anchored golden LSP
+  additionally pins that the *same anchored bytes* replayed from a circuit at a
+  higher sequence are refused with `self_challenge`.
 - **Determinism**: identical `(ops, now)` streams yield identical flag state and
   count.
 - **Integration**: two `Lsdb` instances reconcile a CSNP and flood the delta into

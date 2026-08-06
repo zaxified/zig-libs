@@ -76,15 +76,44 @@ configured system id) is never purged by aging; nearing/reaching expiry it is
 flagged for refresh (`refreshPending`), the signal for the owner to re-originate
 it with a higher sequence number.
 
+## Receive-side self-defence (ISO §7.3.16.1)
+
+IS-IS as built here is unauthenticated (auth is deferred, `SPEC.md` §8), so the
+update process defends itself against an on-link peer:
+
+- **Own LSPs are never accepted from the wire.** A copy of an LSP whose LSP-ID
+  begins with our system id, arriving on a circuit, is refused however "newer" it
+  compares — including a zero-lifetime *purge* of our own LSP. `insert` reports
+  `InsertResult.self_challenge = <their sequence>`, sets `refreshPending`, records
+  `EntryView.challenge_sequence`, and asserts our copy with SRM on every circuit.
+  The owner must re-originate at `self_challenge + 1` (FRR's `own_lsp` /
+  `lsp_inc_seqno` behaviour). An SNP listing one of our LSP-IDs likewise never
+  produces an SSN request or a placeholder.
+- **The sequence space cannot be locked.** Originating one of our own LSPs at
+  `max_sequence_number` (`2^32-1`) is `error.SequenceExhausted` — a copy at the
+  top of ISO's linear `[1, 2^32-1]` space could never be superseded; ISO's remedy
+  is purge-and-wait-`MaxAge`, restarting at 1.
+
+Still open, and **not** fixable in this module: ISO §7.3.14.2's Fletcher-checksum
+discard. Nothing in the repo verifies the checksum, which leaves the §7.3.16.1(d)
+tie-break usable as an unauthenticated content-replacement primitive. See
+`SPEC.md` §8.
+
 ## Capacity / DoS bound
 
 The store never grows without limit. A new distinct LSP-ID is admitted only while
 `count() < Config.capacity`; past that, `insert` returns `error.DatabaseFull`
-(store unchanged) rather than evicting a valid link-state record. Request
-placeholders created from SNPs for LSPs we lack are bounded the same way (dropped
-when full). A flood of distinct LSP-IDs or SNP entries is therefore bounded by
-`capacity`. (ISO's LSPDBOverload response — the overload bit — is a hook, deferred
-to the LSP-generation layer.)
+(store unchanged) rather than evicting a valid link-state record.
+
+Bounding size is not bounding availability, so **request placeholders** — the
+zero-sequence stubs minted from unauthenticated SNP entries for LSPs we lack —
+are bounded twice more: by their own sub-budget `Config.request_capacity`
+(default `capacity/4`, so fabricated LSP-IDs can never deny admission to genuine
+LSPs) and by `Config.request_timeout` (default 60), after which `tick` drops them
+and reports `AgeReport.requests_expired`. Without the timeout one CSNP listing
+`capacity` fabricated LSP-IDs wedges the database permanently. (ISO's
+LSPDBOverload response — the overload bit — is a hook, deferred to the
+LSP-generation layer.)
 
 ## Time-injection contract
 

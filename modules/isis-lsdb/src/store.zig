@@ -67,6 +67,18 @@ pub const default_capacity: usize = 4096;
 /// ~900 s) well before `MaxAge` (~1200 s); 300 is the corresponding headroom.
 pub const default_refresh_threshold: u16 = 300;
 
+/// How long a request placeholder (see `Config.request_timeout`) is retained
+/// before `tick` drops it. ISO 10589's `completeSNPInterval` default is 10 s, so
+/// 60 covers several CSNP retries of a genuinely-slow neighbour while still
+/// bounding how long a fabricated SNP entry can occupy the request budget.
+pub const default_request_timeout: u16 = 60;
+
+/// The top of ISO/IEC 10589's LSP sequence space. The space is the **linear**
+/// range `[1, 2^32-1]` (§7.3.16.1 — there is no wrap-around); a system that
+/// would need to exceed it must purge the LSP and wait `MaxAge` before
+/// restarting at 1. See `Lsdb.insert`'s `error.SequenceExhausted`.
+pub const max_sequence_number: u32 = 0xFFFF_FFFF;
+
 /// Static per-database configuration. Immutable for the life of the `Lsdb`.
 pub const Config = struct {
     /// Our own 6-octet system id. An LSP whose LSP-ID begins with these six
@@ -86,11 +98,28 @@ pub const Config = struct {
     zero_age_lifetime: u16 = default_zero_age_lifetime,
     /// Self-originated refresh threshold, in `Time` units.
     refresh_threshold: u16 = default_refresh_threshold,
+    /// The sub-budget, inside `capacity`, for **request placeholders** — the
+    /// zero-sequence stubs `reconcileCsnp`/`reconcilePsnp` create for LSPs a
+    /// neighbour advertised that we lack. `null` ⇒ `max(1, capacity / 4)`.
+    /// Placeholders are created from unauthenticated SNP bytes, so they are
+    /// budgeted *separately* from real LSPs: an SNP listing fabricated LSP-IDs
+    /// can consume at most this many entries and can therefore never deny
+    /// admission to a genuine LSP. See `requestBudget`.
+    request_capacity: ?usize = null,
+    /// How long, in `Time` units, a request placeholder is retained before
+    /// `tick` drops it (the next CSNP re-creates it if the LSP is still wanted).
+    /// Without this a placeholder for an LSP that never arrives is immortal.
+    request_timeout: u16 = default_request_timeout,
 };
 
 pub const InsertError = error{
     /// The store is at `capacity` and this is a new distinct LSP-ID.
     DatabaseFull,
+    /// ISO/IEC 10589 §7.3.16.1 sequence exhaustion: a **locally originated**
+    /// LSP was offered at `max_sequence_number`. Originating there would leave
+    /// the LSP impossible to supersede, so the store refuses it; the owner must
+    /// purge the LSP and wait `MaxAge` before restarting at sequence 1.
+    SequenceExhausted,
 } || std.mem.Allocator.Error || isis.pdu.DecodeError;
 
 /// The outcome of an `insert`.
@@ -102,6 +131,13 @@ pub const InsertResult = struct {
     /// Whether the incoming LSP was stored (a strictly newer copy, or new).
     stored: bool,
     lsp_id: LspId,
+    /// Non-`null` when a **received** LSP carried our own system-id and would
+    /// otherwise have been accepted (ISO/IEC 10589 §7.3.16.1 own-LSP rule): the
+    /// challenger's sequence number. Nothing was stored. The owner must
+    /// re-originate that LSP at `self_challenge + 1` (or purge it, if it is no
+    /// longer relevant) — this is the receive-side counterpart of
+    /// `refresh_pending`, which only fires on natural aging.
+    self_challenge: ?u32 = null,
 };
 
 /// What one `tick` changed, in counts (the per-LSP effects are recorded on the
@@ -114,6 +150,9 @@ pub const AgeReport = struct {
     removed: usize = 0,
     /// Self-originated entries newly flagged for refresh this tick.
     refresh_flagged: usize = 0,
+    /// Request placeholders whose `Config.request_timeout` elapsed without the
+    /// requested LSP ever arriving, and which were dropped this tick.
+    requests_expired: usize = 0,
 };
 
 /// A read-only view of a stored entry, aged to the `now` passed to the query.
@@ -132,6 +171,10 @@ pub const EntryView = struct {
     /// A zero-sequence placeholder created to *request* an LSP a neighbour's SNP
     /// advertised that we lack; carries no PDU bytes yet.
     is_request: bool,
+    /// The highest sequence number a **peer** has claimed for this
+    /// self-originated LSP-ID (ISO/IEC 10589 §7.3.16.1 own-LSP rule). `0` when
+    /// unchallenged. The owner must re-originate above this value.
+    challenge_sequence: u32,
     /// The owned raw PDU bytes (empty for a request placeholder). Valid until
     /// this LSP is replaced, removed, or the store is deinit'd.
     bytes: []const u8,
@@ -155,8 +198,14 @@ const Entry = struct {
     /// owner re-inserts a fresher copy.
     refresh_pending: bool,
     /// A zero-sequence request placeholder (no PDU bytes) created from an SNP for
-    /// an LSP we lack. Skipped by aging; replaced when the real LSP arrives.
+    /// an LSP we lack. Skipped by aging; dropped by `tick` once
+    /// `Config.request_timeout` elapses (`set_now` is the creation instant);
+    /// replaced when the real LSP arrives.
     is_request: bool,
+    /// The highest sequence number a peer has claimed for this self-originated
+    /// LSP-ID; `0` when unchallenged. Set by `insert`'s §7.3.16.1 own-LSP rule,
+    /// cleared when the owner re-originates.
+    challenge_seq: u32,
     /// Transient mark used by the CSNP completeness sweep — do not read outside a
     /// single `reconcileCsnp` call.
     snp_seen: bool,
@@ -194,6 +243,10 @@ pub const Lsdb = struct {
     alloc: std.mem.Allocator,
     cfg: Config,
     map: EntryMap = .empty,
+    /// How many entries in `map` are request placeholders — the quantity the
+    /// separate request budget is enforced against (kept incrementally so
+    /// `requestMissing` stays O(1); an SNP with `n` entries must not cost O(n²)).
+    request_count: usize = 0,
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Lsdb {
         std.debug.assert(cfg.interface_count <= max_interfaces);
@@ -234,14 +287,73 @@ pub const Lsdb = struct {
     /// A purge (zero Remaining Lifetime) for an LSP **not** in the database is
     /// ignored — there is nothing to purge, and it is deliberately not stored so
     /// a zero-lifetime flood cannot grow the database.
+    ///
+    /// ## The own-LSP rule (ISO/IEC 10589 §7.3.16.1)
+    /// An LSP **received from a circuit** (`arrival_iface != null`) whose LSP-ID
+    /// carries our own system-id is *never* accepted, however "newer" it
+    /// compares. Only this system may originate its own LSPs; a neighbour's copy
+    /// is at best stale and at worst hostile (a zero-lifetime purge of our own
+    /// LSP, or a `max_sequence_number` injection that would lock us out of the
+    /// sequence space forever). The standard's remedy — mirrored by FRRouting's
+    /// `own_lsp` branch in `isis_pdu.c:process_lsp`, which calls `lsp_inc_seqno`
+    /// and re-floods — is to **re-originate at the challenger's sequence + 1**.
+    /// Since LSP generation is deferred (SPEC §8), this store instead:
+    ///   - keeps its own copy untouched,
+    ///   - sets `refresh_pending` and records `challenge_sequence` on it,
+    ///   - sets SRM on **every** circuit (FRR floods the corrected LSP on all,
+    ///     including the arrival one — the sender's copy is wrong), and
+    ///   - reports `self_challenge = <their sequence>` in the `InsertResult`.
+    /// If we hold no copy of that LSP-ID at all, it is likewise refused (FRR
+    /// purges such an LSP rather than adopting it) and reported the same way.
+    ///
+    /// ## Sequence exhaustion (ISO/IEC 10589 §7.3.16.1)
+    /// The sequence space is linear `[1, 2^32-1]`. A **local** origination
+    /// (`arrival_iface == null`) at `max_sequence_number` is refused with
+    /// `error.SequenceExhausted` rather than stored: a copy at the top of the
+    /// space can never be superseded, so the owner must purge it and wait
+    /// `MaxAge` before restarting at 1. (Refusing *at* the top rather than
+    /// beyond it is deliberate — there is no "beyond" to detect.)
     pub fn insert(self: *Lsdb, bytes: []const u8, arrival_iface: ?u8, now: Time) InsertError!InsertResult {
         const lsp = try isis.Lsp.decode(bytes);
         const id = lsp.lsp_id;
+        const is_self = std.mem.eql(u8, id[0..6], &self.cfg.local_system_id);
+
+        // §7.3.16.1 sequence exhaustion — checked before any mutation.
+        if (is_self and arrival_iface == null and lsp.sequence_number == max_sequence_number)
+            return error.SequenceExhausted;
+
         const incoming: LspVersion = .{
             .sequence_number = lsp.sequence_number,
             .remaining_lifetime = lsp.remaining_lifetime,
             .checksum = lsp.checksum,
         };
+
+        // §7.3.16.1 own-LSP rule: a received copy of OUR LSP is never accepted.
+        const from_peer = arrival_iface != null;
+        if (is_self and from_peer) {
+            if (self.map.getPtr(id)) |e| {
+                const ord = if (e.is_request) Ordering.newer else compare(incoming, e.versionAt(now));
+                if (ord != .newer) {
+                    // Stale or identical: the ordinary matrix is right (and does
+                    // not touch the stored copy).
+                    if (ord == .same) self.applySame(e, arrival_iface) else self.applyOlder(e, arrival_iface);
+                    return .{ .ordering = ord, .stored = false, .lsp_id = id };
+                }
+                e.refresh_pending = true;
+                e.challenge_seq = @max(e.challenge_seq, lsp.sequence_number);
+                // Only a real copy can be re-asserted; a placeholder has no
+                // bytes to flood (see `reconcileOne`, which never creates one
+                // for a self LSP-ID).
+                if (!e.is_request) {
+                    self.setSrmAll(e);
+                    e.ssn = InterfaceSet.initEmpty();
+                }
+                return .{ .ordering = ord, .stored = false, .lsp_id = id, .self_challenge = lsp.sequence_number };
+            }
+            // We hold no copy of an LSP-ID that is ours to originate. Refuse it
+            // (FRR purges rather than adopts) and tell the owner.
+            return .{ .ordering = .newer, .stored = false, .lsp_id = id, .self_challenge = lsp.sequence_number };
+        }
 
         if (self.map.getPtr(id)) |e| {
             // A placeholder is a request (sequence 0) — any real LSP is newer.
@@ -282,6 +394,7 @@ pub const Lsdb = struct {
             .self_originated = std.mem.eql(u8, lsp.lsp_id[0..6], &self.cfg.local_system_id),
             .refresh_pending = false,
             .is_request = false,
+            .challenge_seq = 0,
             .snp_seen = false,
             .bytes = owned,
             .srm = InterfaceSet.initEmpty(),
@@ -295,6 +408,8 @@ pub const Lsdb = struct {
     fn fillEntry(self: *Lsdb, e: *Entry, lsp: isis.Lsp, bytes: []const u8, now: Time) !void {
         const owned = try self.alloc.dupe(u8, bytes[0..lsp.pdu_length]);
         if (e.bytes.len > 0) self.alloc.free(e.bytes);
+        // The placeholder is being satisfied — give its slot back to the budget.
+        if (e.is_request) self.request_count -= 1;
         e.bytes = owned;
         e.sequence_number = lsp.sequence_number;
         e.initial_lifetime = lsp.remaining_lifetime;
@@ -305,6 +420,7 @@ pub const Lsdb = struct {
         e.self_originated = std.mem.eql(u8, lsp.lsp_id[0..6], &self.cfg.local_system_id);
         e.refresh_pending = false;
         e.is_request = false;
+        e.challenge_seq = 0;
     }
 
     fn setSsnIfP2p(self: *Lsdb, e: *Entry, iface: u8) void {
@@ -368,26 +484,45 @@ pub const Lsdb = struct {
             }
         }
 
-        // Pass 2: remove purge-hold entries whose ZeroAgeLifetime elapsed.
-        // Removal invalidates the iterator, so re-scan after each removal.
-        // Purge removals are rare (only at ZeroAgeLifetime expiry), so the
-        // re-scan cost is negligible and the pass allocates nothing.
+        // Pass 2: remove purge-hold entries whose ZeroAgeLifetime elapsed, and
+        // request placeholders whose `request_timeout` elapsed. Removal
+        // invalidates the iterator, so re-scan after each removal. Purge
+        // removals are rare (only at ZeroAgeLifetime expiry), so the re-scan
+        // cost is negligible and the pass allocates nothing.
         while (true) {
             var rit = self.map.iterator();
             const victim: ?LspId = blk: {
                 while (rit.next()) |kv| {
-                    if (kv.value_ptr.purge_deadline) |dl| {
+                    const e = kv.value_ptr;
+                    // ISO/IEC 10589 §7.3.15.2: an SNP entry for an LSP we lack
+                    // makes us *request* it; the request is re-established by
+                    // the neighbour's next periodic CSNP. Holding the
+                    // placeholder past that window serves nothing and lets one
+                    // SNP full of fabricated LSP-IDs occupy the database
+                    // forever, so it is timed out.
+                    if (e.is_request) {
+                        if (now >= e.set_now + self.cfg.request_timeout) break :blk kv.key_ptr.*;
+                        continue;
+                    }
+                    if (e.purge_deadline) |dl| {
                         if (now >= dl) break :blk kv.key_ptr.*;
                     }
                 }
                 break :blk null;
             };
             const key = victim orelse break;
+            var was_request = false;
             if (self.map.getPtr(key)) |e| {
                 if (e.bytes.len > 0) self.alloc.free(e.bytes);
+                was_request = e.is_request;
             }
             _ = self.map.remove(key);
-            rep.removed += 1;
+            if (was_request) {
+                self.request_count -= 1;
+                rep.requests_expired += 1;
+            } else {
+                rep.removed += 1;
+            }
         }
 
         return rep;
@@ -488,6 +623,7 @@ pub const Lsdb = struct {
             .self_originated = e.self_originated,
             .is_purge = e.purge_deadline != null,
             .is_request = e.is_request,
+            .challenge_sequence = e.challenge_seq,
             .bytes = e.bytes,
         };
     }
@@ -607,6 +743,30 @@ pub const Lsdb = struct {
             .remaining_lifetime = entry.remaining_lifetime,
             .checksum = entry.checksum,
         };
+        // ISO/IEC 10589 §7.3.16.1 own-LSP rule, SNP side: we never *request* an
+        // LSP that is ours to originate, so a summary entry for our own
+        // system-id can only ever mean "flood ours" or "the owner must
+        // re-originate" — never SSN, and never a placeholder.
+        const is_self = std.mem.eql(u8, entry.lsp_id[0..6], &self.cfg.local_system_id);
+        if (is_self) {
+            const e = self.map.getPtr(entry.lsp_id) orelse return;
+            e.snp_seen = true;
+            if (e.is_request) return;
+            switch (compare(their, e.versionAt(now))) {
+                // They claim a newer copy of our own LSP → assert ownership
+                // (flood ours) and tell the owner to re-originate above it.
+                .newer => {
+                    e.refresh_pending = true;
+                    e.challenge_seq = @max(e.challenge_seq, entry.sequence_number);
+                    e.srm.set(iface);
+                },
+                // Ours is newer → flood it to them.
+                .older => e.srm.set(iface),
+                // In sync → stop flooding it to them.
+                .same => e.srm.unset(iface),
+            }
+            return;
+        }
         if (self.map.getPtr(entry.lsp_id)) |e| {
             e.snp_seen = true;
             if (e.is_request) {
@@ -626,17 +786,32 @@ pub const Lsdb = struct {
             // We lack it. A summary entry that is itself an all-zero purge for an
             // unknown LSP carries nothing to request → ignore.
             if (entry.sequence_number == 0 and entry.remaining_lifetime == 0 and entry.checksum == 0) return;
-            self.requestMissing(entry.lsp_id, iface);
+            self.requestMissing(entry.lsp_id, iface, now);
         }
     }
 
+    /// The ceiling on concurrently-held request placeholders — `capacity / 4` by
+    /// default, never above `capacity`. Placeholders are minted from
+    /// *unauthenticated* SNP bytes, so they get a budget of their own: however
+    /// many LSP-IDs a hostile SNP fabricates, at least `capacity - budget` slots
+    /// stay available to genuine LSPs.
+    fn requestBudget(self: *const Lsdb) usize {
+        return @min(self.cfg.capacity, self.cfg.request_capacity orelse @max(1, self.cfg.capacity / 4));
+    }
+
     /// Create a zero-sequence request placeholder for an LSP a neighbour listed
-    /// that we lack, and set SSN so a PSNP request is emitted. Bounded by
-    /// `capacity`: if the store is full the request is dropped (a later CSNP
-    /// retries) rather than growing the database — an SNP-flood cannot exhaust
-    /// memory. An allocation failure likewise drops the request.
-    fn requestMissing(self: *Lsdb, id: LspId, iface: u8) void {
-        if (self.map.getPtr(id) == null and self.map.count() >= self.cfg.capacity) return;
+    /// that we lack, and set SSN so a PSNP request is emitted. Bounded twice:
+    /// by `capacity` (the store never grows without limit) and by
+    /// `requestBudget` (placeholders never crowd out real LSPs). Over either
+    /// bound the request is dropped — a later CSNP retries — rather than
+    /// admitted. An allocation failure likewise drops the request. The
+    /// placeholder's `set_now` is the creation instant, from which `tick` times
+    /// it out after `Config.request_timeout`.
+    fn requestMissing(self: *Lsdb, id: LspId, iface: u8, now: Time) void {
+        if (self.map.getPtr(id) == null) {
+            if (self.map.count() >= self.cfg.capacity) return;
+            if (self.request_count >= self.requestBudget()) return;
+        }
         const gop = self.map.getOrPut(self.alloc, id) catch return;
         if (!gop.found_existing) {
             gop.value_ptr.* = .{
@@ -644,16 +819,18 @@ pub const Lsdb = struct {
                 .initial_lifetime = 0,
                 .checksum = 0,
                 .flags = isis.pdu.LspFlags.fromByte(0),
-                .set_now = 0,
+                .set_now = now,
                 .purge_deadline = null,
                 .self_originated = false,
                 .refresh_pending = false,
                 .is_request = true,
+                .challenge_seq = 0,
                 .snp_seen = true,
                 .bytes = &.{},
                 .srm = InterfaceSet.initEmpty(),
                 .ssn = InterfaceSet.initEmpty(),
             };
+            self.request_count += 1;
         }
         self.setSsnIfP2p(gop.value_ptr, iface);
     }
@@ -971,6 +1148,222 @@ test "broadcast interface: newer LSP received on it is not SSN-acked" {
     try testing.expectEqual(@as(usize, 0), db.ssnSet(id).?.count());
     // SRM still set on the other circuits.
     try testing.expect(db.srmSet(id).?.isSet(0));
+}
+
+// ── regression: ISO 10589 receive-side self-defences (hostile on-link peer) ───
+//
+// IS-IS in this deployment model is unauthenticated (SPEC §8 defers RFC
+// 5304/5310), so every input below is one an on-link party can simply send.
+
+/// Build a CSNP over the whole LSP-ID range listing `entries`.
+fn buildCsnp(buf: []u8, entries: []const isis.tlvs.LspEntry) []const u8 {
+    var cb = isis.pdu.CsnpBuilder.init(buf, .{
+        .source_id = .{ 0xDE, 0xAD, 0, 0, 0, 0, 0 },
+        .start_lsp_id = @splat(0),
+        .end_lsp_id = @splat(0xFF),
+    }) catch unreachable;
+    isis.tlvs.addLspEntries(&cb.tlvs, entries) catch unreachable;
+    return cb.finish();
+}
+
+/// `n` LSP-Entries for LSP-IDs that do not exist anywhere and never will.
+fn fabricatedEntries(comptime n: u8) [n]isis.tlvs.LspEntry {
+    var out: [n]isis.tlvs.LspEntry = undefined;
+    for (&out, 0..) |*e, i| e.* = .{
+        .remaining_lifetime = 1000,
+        .lsp_id = idOf(.{ 0xDE, 0xAD, 0, 0, 0, @intCast(i) }, 0),
+        .sequence_number = 1,
+        .checksum = 0x4242,
+    };
+    return out;
+}
+
+test "hostile CSNP: fabricated LSP-IDs cannot starve genuine LSPs (request budget)" {
+    // capacity 8 ⇒ default request budget max(1, 8/4) = 2.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+
+    var cbuf: [512]u8 = undefined;
+    const entries = fabricatedEntries(8);
+    const csnp = try isis.Csnp.decode(buildCsnp(&cbuf, &entries));
+    db.reconcileCsnp(csnp, 1, 0);
+
+    // Placeholders are budgeted separately, not admitted wholesale.
+    try testing.expectEqual(@as(usize, 2), db.count());
+
+    // ...so genuine LSPs still get in — the availability property the module's
+    // capacity note claims (root.zig:29-33) and which F1 showed was false.
+    var buf: [128]u8 = undefined;
+    var n: u8 = 0;
+    while (n < 6) : (n += 1) {
+        const r = try db.insert(buildLsp(&buf, sys_other, n, 1, 1000, 0x1111), 0, 0);
+        try testing.expect(r.stored);
+    }
+    try testing.expectEqual(@as(usize, 8), db.count());
+}
+
+test "request placeholders are not immortal: they time out and return their slot" {
+    var db = Lsdb.init(testing.allocator, .{
+        .local_system_id = sys_local,
+        .interface_count = 2,
+        .capacity = 8,
+        .request_capacity = 4,
+        .request_timeout = 60,
+    });
+    defer db.deinit();
+
+    var cbuf: [512]u8 = undefined;
+    const entries = fabricatedEntries(4);
+    const csnp = try isis.Csnp.decode(buildCsnp(&cbuf, &entries));
+    db.reconcileCsnp(csnp, 1, 0);
+    try testing.expectEqual(@as(usize, 4), db.count());
+
+    // Just inside the request window: still requested.
+    const r1 = db.tick(59);
+    try testing.expectEqual(@as(usize, 0), r1.requests_expired);
+    try testing.expectEqual(@as(usize, 4), db.count());
+
+    // At the window: dropped (a later CSNP re-requests, as the code anticipates).
+    const r2 = db.tick(60);
+    try testing.expectEqual(@as(usize, 4), r2.requests_expired);
+    try testing.expectEqual(@as(usize, 0), r2.removed);
+    try testing.expectEqual(@as(usize, 0), db.count());
+
+    // The budget came back with them.
+    db.reconcileCsnp(csnp, 1, 60);
+    try testing.expectEqual(@as(usize, 4), db.count());
+}
+
+test "own LSP (§7.3.16.1): a peer's purge of our self-originated LSP is refused" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8, .zero_age_lifetime = 60 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    var pbuf: [128]u8 = undefined;
+
+    _ = try db.insert(buildLsp(&buf, sys_local, 0, 5, 1200, 0x1111), null, 0);
+    const id = idOf(sys_local, 0);
+    for ([_]u8{ 0, 1, 2, 3 }) |i| db.clearSrm(id, i);
+
+    // The attack: a lifetime-0, seq-6 header for OUR LSP-ID arrives on iface 1.
+    const r = try db.insert(buildLsp(&pbuf, sys_local, 0, 6, 0, 0), 1, 1);
+    try testing.expect(!r.stored);
+    try testing.expectEqual(@as(?u32, 6), r.self_challenge);
+
+    // Our copy is untouched and is NOT in the purge hold.
+    const v = db.get(id, 1).?;
+    try testing.expectEqual(@as(u32, 5), v.sequence_number);
+    try testing.expect(!v.is_purge);
+    try testing.expectEqual(@as(u32, 6), v.challenge_sequence);
+    // The owner is signalled, and we re-assert on every circuit (FRR's own_lsp
+    // branch floods the corrected LSP on all circuits, arrival included).
+    try testing.expect(db.refreshPending(id));
+    try testing.expectEqual(@as(usize, 4), db.srmSet(id).?.count());
+    try testing.expectEqual(@as(usize, 0), db.ssnSet(id).?.count());
+
+    // Far past ZeroAgeLifetime our own LSP is still there (F2: it was deleted).
+    _ = db.tick(500);
+    try testing.expect(db.get(id, 500) != null);
+}
+
+test "own LSP (§7.3.16.1): a peer cannot claim the top of our sequence space" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    const id = idOf(sys_local, 1);
+
+    // An LSP-ID of ours that we are not currently originating.
+    const r = try db.insert(buildLsp(&buf, sys_local, 1, max_sequence_number, 1000, 0xBEEF), 2, 0);
+    try testing.expect(!r.stored);
+    try testing.expectEqual(@as(?u32, max_sequence_number), r.self_challenge);
+    try testing.expect(db.get(id, 0) == null);
+
+    // We can still originate it — the lockout (F3) is gone.
+    const own = try db.insert(buildLsp(&buf, sys_local, 1, 7, 1000, 0x1111), null, 1);
+    try testing.expect(own.stored);
+    try testing.expectEqual(@as(u32, 7), db.get(id, 1).?.sequence_number);
+}
+
+test "sequence exhaustion (§7.3.16.1): originating at the top of the space is a typed error" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+
+    // A copy at 2^32-1 could never be superseded → refuse to originate it; ISO
+    // requires purge-and-wait-MaxAge instead.
+    try testing.expectError(
+        error.SequenceExhausted,
+        db.insert(buildLsp(&buf, sys_local, 0, max_sequence_number, 1000, 0x1111), null, 0),
+    );
+    try testing.expectEqual(@as(usize, 0), db.count());
+
+    // A *neighbour's* LSP at the top of the space is unaffected — the rule is
+    // about our own origination, not about what we may store for others.
+    const r = try db.insert(buildLsp(&buf, sys_other, 0, max_sequence_number, 1000, 0x1111), 0, 0);
+    try testing.expect(r.stored);
+}
+
+test "own LSP: purge AND sequence-lockout together still leave us able to re-originate" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .zero_age_lifetime = 60 });
+    defer db.deinit();
+    var b0: [128]u8 = undefined;
+    var b1: [128]u8 = undefined;
+    const id0 = idOf(sys_local, 0);
+    const id1 = idOf(sys_local, 1);
+
+    _ = try db.insert(buildLsp(&b0, sys_local, 0, 5, 1200, 0x1111), null, 0);
+
+    // The whole attack in one pass on one circuit: purge the live fragment,
+    // and claim 2^32-1 for a fragment we hold none of.
+    _ = try db.insert(buildLsp(&b0, sys_local, 0, 6, 0, 0), 1, 1);
+    _ = try db.insert(buildLsp(&b1, sys_local, 1, max_sequence_number, 1000, 0xBEEF), 1, 1);
+
+    _ = db.tick(500); // far past ZeroAgeLifetime
+
+    try testing.expectEqual(@as(u32, 5), db.get(id0, 500).?.sequence_number);
+    try testing.expect(db.get(id1, 500) == null);
+
+    // The owner re-originates above the recorded challenge; both land.
+    const challenge = db.get(id0, 500).?.challenge_sequence;
+    try testing.expectEqual(@as(u32, 6), challenge);
+    try testing.expect((try db.insert(buildLsp(&b0, sys_local, 0, challenge + 1, 1200, 0x2222), null, 501)).stored);
+    try testing.expect((try db.insert(buildLsp(&b1, sys_local, 1, 7, 1200, 0x3333), null, 501)).stored);
+    try testing.expectEqual(@as(u32, 7), db.get(id0, 501).?.sequence_number);
+    try testing.expectEqual(@as(u32, 7), db.get(id1, 501).?.sequence_number);
+    // Re-origination clears the challenge record.
+    try testing.expectEqual(@as(u32, 0), db.get(id0, 501).?.challenge_sequence);
+    try testing.expect(!db.refreshPending(id0));
+}
+
+test "own LSP: an SNP never makes us request our own LSP-ID" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    var cbuf: [512]u8 = undefined;
+
+    _ = try db.insert(buildLsp(&buf, sys_local, 0, 5, 1200, 0x1111), null, 0);
+    const id0 = idOf(sys_local, 0);
+    const id1 = idOf(sys_local, 1);
+    db.clearSrm(id0, 0);
+    db.clearSrm(id0, 1);
+
+    // A neighbour summarises OUR LSP-IDs: fragment 0 at a higher sequence than
+    // ours, fragment 1 which we do not originate at all.
+    const entries = [_]isis.tlvs.LspEntry{
+        .{ .remaining_lifetime = 1000, .lsp_id = id0, .sequence_number = 99, .checksum = 0x9999 },
+        .{ .remaining_lifetime = 1000, .lsp_id = id1, .sequence_number = 99, .checksum = 0x9999 },
+    };
+    const csnp = try isis.Csnp.decode(buildCsnp(&cbuf, &entries));
+    db.reconcileCsnp(csnp, 1, 0);
+
+    // No placeholder for an LSP-ID that is ours to originate, and no SSN: we
+    // never ask a neighbour for our own LSP.
+    try testing.expect(db.get(id1, 0) == null);
+    try testing.expectEqual(@as(usize, 1), db.count());
+    try testing.expectEqual(@as(usize, 0), db.ssnSet(id0).?.count());
+    // Instead: assert ownership (SRM) and tell the owner to re-originate.
+    try testing.expect(db.srmSet(id0).?.isSet(1));
+    try testing.expect(db.refreshPending(id0));
+    try testing.expectEqual(@as(u32, 99), db.get(id0, 0).?.challenge_sequence);
 }
 
 test "srmIterator walks the LSPs queued for one circuit" {

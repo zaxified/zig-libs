@@ -111,7 +111,12 @@ test "golden LSP (Wireshark-anchored): Lsdb.insert stores exactly the fields Wir
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = golden_lsp_system_id, .interface_count = 2 });
     defer db.deinit();
 
-    const r = try db.insert(&golden_lsp_bytes, 0, 100);
+    // Originated locally (`arrival_iface = null`): this LSP-ID carries
+    // `local_system_id`, and ISO/IEC 10589 §7.3.16.1's own-LSP rule means only
+    // this system may originate it — a copy arriving on a circuit is refused
+    // (asserted at the end of this test), so the *storing* path for a self LSP
+    // is the local one.
+    const r = try db.insert(&golden_lsp_bytes, null, 100);
     try testing.expect(r.stored);
     try testing.expectEqual(golden_lsp_id, r.lsp_id);
 
@@ -131,6 +136,18 @@ test "golden LSP (Wireshark-anchored): Lsdb.insert stores exactly the fields Wir
     try testing.expectEqual(@as(u4, 0xA), view.flags.attached);
     try testing.expect(view.flags.overload);
     try testing.expectEqual(@as(u2, 3), view.flags.is_type);
+
+    // ISO/IEC 10589 §7.3.16.1 own-LSP rule, on the Wireshark-anchored bytes:
+    // the *same* LSP-ID arriving from a neighbour at a higher sequence number
+    // (0x80000008 > the golden's 0x80000007) is refused, not adopted, and the
+    // owner is told to re-originate above the challenger.
+    var hostile = golden_lsp_bytes;
+    hostile[23] = 0x08; // sequence number low octet: 0x8000_0007 → 0x8000_0008
+    const c = try db.insert(&hostile, 1, 101);
+    try testing.expect(!c.stored);
+    try testing.expectEqual(@as(?u32, 0x8000_0008), c.self_challenge);
+    try testing.expectEqual(@as(u32, 0x8000_0007), db.get(golden_lsp_id, 101).?.sequence_number);
+    try testing.expect(db.refreshPending(golden_lsp_id));
 }
 
 // ── Not a bug: a placeholder checksum used by this module's existing KAT ────
@@ -399,4 +416,3 @@ test "golden L2 PSNP LSP-Entry (Wireshark-anchored): Lsdb.reconcilePsnp recogniz
     try testing.expect(view.is_request);
     try testing.expect(db.ssnSet(golden_psnp_entry_id).?.isSet(1));
 }
-

@@ -30,7 +30,20 @@
 //! The store is bounded by `Config.capacity`: a new distinct LSP-ID is admitted
 //! only while `count() < capacity`, else `insert` returns `error.DatabaseFull`
 //! (unchanged). A flood of distinct LSP-IDs — or of SNP entries requesting LSPs
-//! we lack — cannot grow the database without limit. See `SPEC.md`.
+//! we lack — cannot grow the database without limit. Request placeholders (born
+//! from *unauthenticated* SNP bytes) additionally get their own sub-budget
+//! (`Config.request_capacity`) and their own timeout (`Config.request_timeout`),
+//! so a hostile SNP can neither wedge nor starve the database. See `SPEC.md`.
+//!
+//! ## Receive-side self-defence (ISO/IEC 10589 §7.3.16.1)
+//! IS-IS here is unauthenticated (auth is deferred, `SPEC.md` §8), so the update
+//! process must defend itself against an on-link peer: a copy of **our own** LSP
+//! received from a circuit is never accepted (the owner is told to re-originate
+//! at `InsertResult.self_challenge + 1`), and a local origination at
+//! `max_sequence_number` is `error.SequenceExhausted` rather than a permanent
+//! self-lockout. One defence is still missing and is **not** fixable here: the
+//! §7.3.14.2 Fletcher-checksum discard — see `compare.zig`'s note on §7.3.16.1(d)
+//! and `SPEC.md` §8.
 //!
 //! Provenance: clean-room from ISO/IEC 10589 §7.3; the §7.3.16.1 comparison was
 //! cross-checked against FRRouting `isis_lsp.c:lsp_compare` for the (oriented)
@@ -65,6 +78,7 @@ pub const Ordering = compare.Ordering;
 pub const LspVersion = compare.LspVersion;
 pub const compareVersions = compare.compare;
 pub const max_interfaces = store.max_interfaces;
+pub const max_sequence_number = store.max_sequence_number;
 
 // ── integration test: two databases synchronise via CSNP + flooding ──────────
 
