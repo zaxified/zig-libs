@@ -599,8 +599,13 @@ fn joinStrings(arena: std.mem.Allocator, a: Str, b: Str) Error!Value {
 fn repeatStr(arena: std.mem.Allocator, s: Str, times: i64) Error!Value {
     if (times <= 0) return .{ .string = .{ .bytes = "", .safe = s.safe } };
     const n: usize = @intCast(times);
-    if (s.bytes.len * n > max_alloc) return error.OutOfRange;
-    const out = try arena.alloc(u8, s.bytes.len * n);
+    // The product is checked *before* it is formed. `s.bytes.len * n` wraps in
+    // ReleaseFast, so a guard written over the product itself passes for a
+    // request that overflows `usize` and `arena.alloc` then hands the `@memcpy`
+    // loop below an undersized buffer — an out-of-bounds write, not a panic.
+    const total = std.math.mul(usize, s.bytes.len, n) catch return error.OutOfRange;
+    if (total > max_alloc) return error.OutOfRange;
+    const out = try arena.alloc(u8, total);
     var i: usize = 0;
     while (i < n) : (i += 1) @memcpy(out[i * s.bytes.len ..][0..s.bytes.len], s.bytes);
     return .{ .string = .{ .bytes = out, .safe = s.safe } };
@@ -609,8 +614,10 @@ fn repeatStr(arena: std.mem.Allocator, s: Str, times: i64) Error!Value {
 fn repeatList(arena: std.mem.Allocator, l: []const Value, times: i64) Error!Value {
     if (times <= 0) return .{ .list = &.{} };
     const n: usize = @intCast(times);
-    if (l.len * n > max_items) return error.OutOfRange;
-    const out = try arena.alloc(Value, l.len * n);
+    // Same shape as `repeatStr`: form the product only after it is known to fit.
+    const total = std.math.mul(usize, l.len, n) catch return error.OutOfRange;
+    if (total > max_items) return error.OutOfRange;
+    const out = try arena.alloc(Value, total);
     var i: usize = 0;
     while (i < n) : (i += 1) @memcpy(out[i * l.len ..][0..l.len], l);
     return .{ .list = out };

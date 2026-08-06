@@ -1118,16 +1118,30 @@ const Renderer = struct {
             if (nums.len == 3) step = try intOf(nums[2]);
         }
         if (step == 0) return error.BadArgument;
-        var count: usize = 0;
-        if (step > 0 and stop > start) count = @intCast(@divTrunc(stop - start + step - 1, step));
-        if (step < 0 and stop < start) count = @intCast(@divTrunc(start - stop - step - 1, -step));
-        if (count > value.max_items)
-            return self.fail(line, "range() of {d} items exceeds the {d}-item cap", .{ count, value.max_items }, error.OutOfRange);
+        // `stop - start` is a subtraction of two numbers the template or the
+        // context supplied, so it is done in `i128`: `range(-2^63, 2^63-1)`
+        // overflows `i64` here and the count never reaches the cap below.
+        // (The reference raises `OverflowError` on the same input.)
+        const span: i128 = @as(i128, stop) - @as(i128, start);
+        const st: i128 = step;
+        const wanted: i128 = if (step > 0 and span > 0)
+            @divTrunc(span + st - 1, st)
+        else if (step < 0 and span < 0)
+            @divTrunc(-span - st - 1, -st)
+        else
+            0;
+        if (wanted > value.max_items)
+            return self.fail(line, "range() of {d} items exceeds the {d}-item cap", .{ wanted, value.max_items }, error.OutOfRange);
+        const count: usize = @intCast(wanted);
         const out = try self.arena.alloc(Value, count);
         var v = start;
         for (out) |*slot| {
             slot.* = .{ .integer = v };
-            v += step;
+            // Saturating for the same reason as `pySlice`: the *last* increment
+            // walks one step past the final element, and with `start` near an
+            // `i64` end and a large `step` that step leaves the range. No
+            // earlier increment can, because `count` proves they land inside.
+            v +|= step;
         }
         return .{ .list = out };
     }
@@ -1289,7 +1303,11 @@ fn intOf(v: Value) Error!i64 {
     return switch (v) {
         .integer => |i| i,
         .boolean => |b| @intFromBool(b),
-        .float => |f| @intFromFloat(f),
+        // `range(1e300)` and `[1,2,3][1.0e300:]` reach here. The reference
+        // refuses a float in either position (`TypeError`, which `getitem`
+        // turns into Undefined for the slice); this module truncates integral
+        // floats but names the out-of-range case instead of trapping.
+        .float => |f| filters.intFromFloatChecked(f),
         else => error.BadArgument,
     };
 }
@@ -1329,7 +1347,12 @@ fn pySlice(
         const start = if (start_v == .none) 0 else clampIndex(try intOf(start_v), len);
         const stop = if (stop_v == .none) len else clampIndex(try intOf(stop_v), len);
         var i = start;
-        while (i < stop) : (i += step) try out.append(arena, items[@intCast(i)]);
+        // Saturating, not wrapping: `step` comes from the template or the
+        // context, and `i += 9223372036854775807` overflows `i64` after the
+        // first element. Saturating reproduces the reference exactly, because
+        // an index past the end ends the walk either way — Jinja2 3.1.6 renders
+        // `[1,2,3][::9223372036854775807]` as `[1]` and `[1,2,3][1::…]` as `[2]`.
+        while (i < stop) : (i +|= step) try out.append(arena, items[@intCast(i)]);
     } else {
         const start = if (start_v == .none) len - 1 else blk: {
             const raw = try intOf(start_v);
@@ -1342,6 +1365,9 @@ fn pySlice(
             break :blk @max(eff, -1);
         };
         var i = start;
+        // Plain `+=` is safe here, unlike the forward branch: `i` enters at
+        // `<= len - 1` and the body breaks as soon as it goes negative, so
+        // `i + step` never leaves `i64` for any `step`.
         while (i > stop) : (i += step) {
             if (i < 0 or i >= len) break;
             try out.append(arena, items[@intCast(i)]);

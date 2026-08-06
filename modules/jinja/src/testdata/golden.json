@@ -281,6 +281,10 @@
    "out": "[[1, 2], [3, 4], [5]]|[[1, 2], [3, 0]]",
    "status": "ok"
   },
+  "filter_batch_negative_linecount": {
+   "out": "[['a/b', 'c', 3]]|[['a/b', 'c', 3]]|[]",
+   "status": "ok"
+  },
   "filter_block": {
    "out": "QUIET",
    "status": "ok"
@@ -291,6 +295,10 @@
   },
   "filter_center": {
    "out": "[   ab  ]",
+   "status": "ok"
+  },
+  "filter_center_negative_width": {
+   "out": "[a/b]|[a/b]",
    "status": "ok"
   },
   "filter_chain": {
@@ -325,8 +333,16 @@
    "out": "[  a\n  b]",
    "status": "ok"
   },
+  "filter_indent_negative_width": {
+   "out": "[a\n<b>\nc]",
+   "status": "ok"
+  },
   "filter_int_float": {
    "out": "42|0|9|1|3|2.5|1.5",
+   "status": "ok"
+  },
+  "filter_int_out_of_range_base": {
+   "out": "10|10",
    "status": "ok"
   },
   "filter_items": {
@@ -369,8 +385,20 @@
    "out": "bbb|bba",
    "status": "ok"
   },
+  "filter_replace_count_from_data": {
+   "out": "b<b>b",
+   "status": "ok"
+  },
+  "filter_replace_negative_count": {
+   "out": "b<b>b|b<b>b|a<a>a",
+   "status": "ok"
+  },
   "filter_reverse": {
    "out": "[3, 2, 1]|cba",
+   "status": "ok"
+  },
+  "filter_round_saturating_precision": {
+   "out": "1.5|0.0|0",
    "status": "ok"
   },
   "filter_round_ties_and_precision": {
@@ -395,6 +423,10 @@
   },
   "filter_slice": {
    "out": "[[1, 2], [3, 4], [5]]",
+   "status": "ok"
+  },
+  "filter_slice_negative_slices": {
+   "out": "[]|[]",
    "status": "ok"
   },
   "filter_sort_case_sensitive": {
@@ -429,6 +461,10 @@
    "out": "{\n  \"a\": [\n    1,\n    2\n  ]\n}",
    "status": "ok"
   },
+  "filter_tojson_negative_indent": {
+   "out": "{\n\"a\": \"\\u003cx\\u003e\",\n\"b\": 1\n}",
+   "status": "ok"
+  },
   "filter_tojson_scalars": {
    "out": "{\"a\": \"x\", \"b\": 1, \"c\": [true, null, 1.5]}",
    "status": "ok"
@@ -440,6 +476,16 @@
   "filter_truncate": {
    "out": "the...|the quick...",
    "status": "ok"
+  },
+  "filter_truncate_negative_leeway": {
+   "kind": "AssertionError",
+   "msg": "expected leeway >= 0, got -1",
+   "status": "error"
+  },
+  "filter_truncate_negative_length": {
+   "kind": "AssertionError",
+   "msg": "expected length >= 3, got -1",
+   "status": "error"
   },
   "filter_unique": {
    "out": "a,b|a,A,b",
@@ -561,6 +607,11 @@
   "global_dict": {
    "out": "{'a': 1, 'b': 2}",
    "status": "ok"
+  },
+  "global_range_float_out_of_range": {
+   "kind": "TypeError",
+   "msg": "'float' object cannot be interpreted as an integer",
+   "status": "error"
   },
   "global_range_repr": {
    "out": "[0, 1, 2]",
@@ -894,6 +945,15 @@
    "out": "5.0",
    "status": "ok"
   },
+  "range_fill_steps_past_i64_end": {
+   "out": "[9223372036854775806]|[-9223372036854775807]",
+   "status": "ok"
+  },
+  "range_span_overflows_i64": {
+   "kind": "OverflowError",
+   "msg": "Python int too large to convert to C ssize_t",
+   "status": "error"
+  },
   "raw_block": {
    "out": "{{ not_a_var }} {% if %}",
    "status": "ok"
@@ -901,6 +961,16 @@
   "raw_with_whitespace_control": {
    "out": "a{{x}}b",
    "status": "ok"
+  },
+  "repeat_list_product_overflows": {
+   "kind": "MemoryError",
+   "msg": "",
+   "status": "error"
+  },
+  "repeat_str_product_overflows": {
+   "kind": "OverflowError",
+   "msg": "repeated string is too long",
+   "status": "error"
   },
   "required_block_not_overridden_errors": {
    "kind": "TemplateRuntimeError",
@@ -949,6 +1019,10 @@
   },
   "slice_negative_and_step": {
    "out": "[3, 4]|[0, 2, 4]|[4, 3, 2, 1, 0]",
+   "status": "ok"
+  },
+  "slice_step_saturates_at_i64_bounds": {
+   "out": "[1]|[3]|[2]",
    "status": "ok"
   },
   "slice_step_zero_errors": {

@@ -62,11 +62,24 @@ pub const TestEntry = struct { name: []const u8, func: TestFn };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+/// A float in a position that needs an integer. The reference refuses one
+/// outright here (`range(1e300)` → `TypeError`); this module is deliberately
+/// more permissive and truncates, but a magnitude `i64` cannot hold is a named
+/// error rather than a `@intFromFloat` that traps in ReleaseSafe and produces a
+/// junk integer in ReleaseFast.
+pub fn intFromFloatChecked(f: f64) Error!i64 {
+    if (!std.math.isFinite(f)) return error.BadArgument;
+    const t = @trunc(f);
+    // Both bounds are exactly representable: -2^63 and +2^63.
+    if (t < -9223372036854775808.0 or t >= 9223372036854775808.0) return error.OutOfRange;
+    return @intFromFloat(t);
+}
+
 fn intArg(v: Value, dflt: i64) Error!i64 {
     return switch (v) {
         .integer => |i| i,
         .boolean => |b| @intFromBool(b),
-        .float => |f| @intFromFloat(f),
+        .float => |f| intFromFloatChecked(f),
         .none, .undef => dflt,
         else => error.BadArgument,
     };
@@ -176,10 +189,16 @@ fn fReplace(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const old = try strArg(ctx, args, 0, "old", "");
     const new = try strArg(ctx, args, 1, "new", "");
     const count_v = args.get(2, "count");
+    // MATCH THE REFERENCE. `str.replace(old, new, count)` treats *any* negative
+    // count as "every occurrence", and `{{ x|replace('a','b',-1) }}` is an
+    // ordinary Jinja2 spelling: 3.1.6 renders `'aaa'|replace('a','b',-1)` and
+    // `…,-5)` both as `bbb`, and `…,0)` as `aaa`.
     const limit: usize = if (count_v == null or count_v.? == .none)
         std.math.maxInt(usize)
-    else
-        @intCast(try intArg(count_v.?, 0));
+    else blk: {
+        const c = try intArg(count_v.?, 0);
+        break :blk if (c < 0) std.math.maxInt(usize) else @intCast(c);
+    };
     if (old.len == 0) return markupAware(ctx, input, s);
 
     var out: std.ArrayList(u8) = .empty;
@@ -204,7 +223,12 @@ fn fIndent(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const indention: []const u8 = switch (width_v) {
         .string => |x| x.bytes,
         else => blk: {
-            const n: usize = @intCast(try intArg(width_v, 4));
+            // MATCH THE REFERENCE. `do_indent` builds `" " * width`, and in
+            // Python that is `""` for any negative width: Jinja2 3.1.6 renders
+            // `'a\nb'|indent(-1, true)` as `a\nb`, unchanged.
+            const w = try intArg(width_v, 4);
+            const n: usize = if (w < 0) 0 else @intCast(w);
+            if (n > value.max_alloc) return error.OutOfRange;
             const buf = try ctx.arena.alloc(u8, n);
             @memset(buf, ' ');
             break :blk buf;
@@ -229,10 +253,17 @@ fn fIndent(ctx: *Ctx, input: Value, args: Args) Error!Value {
 
 fn fCenter(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const s = try ctx.toStr(input);
-    const width: usize = @intCast(try intArg(args.get(0, "width") orelse Value{ .integer = 80 }, 80));
+    // MATCH THE REFERENCE. `str.center(w)` returns the string unchanged for
+    // every `w <= len`, negatives included: Jinja2 3.1.6 renders
+    // `'ab'|center(-1)` and `'ab'|center(0)` both as `ab`. Folding a negative
+    // width to 0 reproduces that exactly, because the `len >= width` branch
+    // below is the same early return.
+    const width_i = try intArg(args.get(0, "width") orelse Value{ .integer = 80 }, 80);
+    const width: usize = if (width_i < 0) 0 else @intCast(width_i);
     const len = std.unicode.utf8CountCodepoints(s) catch s.len;
     if (len >= width) return Value.str(s);
     const total = width - len;
+    if (total > value.max_alloc) return error.OutOfRange;
     // CPython's exact rule (`Objects/stringlib/transmute.h`): the odd space
     // goes LEFT when both the margin and the width are odd.
     const left = total / 2 + (total & width & 1);
@@ -246,11 +277,19 @@ fn fCenter(ctx: *Ctx, input: Value, args: Args) Error!Value {
 
 fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const s = try ctx.toStr(input);
-    const length: usize = @intCast(try intArg(args.get(0, "length") orelse Value{ .integer = 255 }, 255));
+    const length_i = try intArg(args.get(0, "length") orelse Value{ .integer = 255 }, 255);
     const killwords = boolArg(args, 1, "killwords", false);
     const end = try strArg(ctx, args, 2, "end", "...");
-    const leeway: usize = @intCast(try intArg(args.get(3, "leeway") orelse Value{ .integer = 5 }, 5));
-    if (s.len <= length + leeway) return Value.str(s);
+    const leeway_i = try intArg(args.get(3, "leeway") orelse Value{ .integer = 5 }, 5);
+    // TYPED ERROR. `do_truncate` opens with `assert length >= len(end)` and
+    // `assert leeway >= 0`, so a negative either way raises in the reference
+    // (Jinja2 3.1.6: `'abcdefghijklmnop'|truncate(-1)` → AssertionError,
+    // `…|truncate(5, true, '...', -1)` → AssertionError). There is no defined
+    // output to match, so it is a named error here.
+    if (length_i < 0 or leeway_i < 0) return error.BadArgument;
+    const length: usize = @intCast(length_i);
+    const leeway: usize = @intCast(leeway_i);
+    if (s.len <= length +| leeway) return Value.str(s);
     if (length < end.len) return error.BadArgument;
     const keep = length - end.len;
     var cut = s[0..keep];
@@ -437,18 +476,30 @@ fn fAbs(ctx: *Ctx, input: Value, args: Args) Error!Value {
 
 fn fInt(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const dflt = args.get(0, "default") orelse Value{ .integer = 0 };
-    const base: u8 = @intCast(try intArg(args.get(1, "base") orelse Value{ .integer = 10 }, 10));
+    // MATCH THE REFERENCE. `int(s, base)` accepts only 0 and 2..36; any other
+    // base raises there, and `do_int` catches it and falls through to its
+    // `int(float(value))` branch — Jinja2 3.1.6 renders `'10'|int(0,-1)` and
+    // `'10'|int(0,99999999999)` both as `10`. So an out-of-range base is not an
+    // error, it is a base no integer parse will accept.
+    const base_i = try intArg(args.get(1, "base") orelse Value{ .integer = 10 }, 10);
+    const base: ?u8 = if (base_i == 0 or (base_i >= 2 and base_i <= 36)) @intCast(base_i) else null;
     _ = ctx;
     return switch (input) {
         .integer => input,
         .boolean => |b| .{ .integer = @intFromBool(b) },
-        .float => |f| if (std.math.isNan(f) or std.math.isInf(f)) dflt else .{ .integer = @intFromFloat(@trunc(f)) },
+        // TYPED ERROR on magnitude: the reference answers `1e300|int` with an
+        // arbitrary-precision integer this module has no type for, and
+        // returning `default` instead would be a wrong answer rather than a
+        // refusal.
+        .float => |f| if (std.math.isNan(f) or std.math.isInf(f)) dflt else .{ .integer = try intFromFloatChecked(f) },
         .string => |s| blk: {
             const t = std.mem.trim(u8, s.bytes, " \t\r\n");
-            const stripped = if (base != 10 and t.len > 2 and t[0] == '0' and !std.ascii.isDigit(t[1])) t[2..] else t;
-            if (std.fmt.parseInt(i64, stripped, base)) |v| break :blk .{ .integer = v } else |_| {}
-            if (base == 10) {
-                if (std.fmt.parseFloat(f64, t)) |f| break :blk .{ .integer = @intFromFloat(@trunc(f)) } else |_| {}
+            if (base) |b| {
+                const stripped = if (b != 10 and t.len > 2 and t[0] == '0' and !std.ascii.isDigit(t[1])) t[2..] else t;
+                if (std.fmt.parseInt(i64, stripped, b)) |v| break :blk .{ .integer = v } else |_| {}
+            }
+            if (base == null or base.? == 10) {
+                if (std.fmt.parseFloat(f64, t)) |f| break :blk .{ .integer = try intFromFloatChecked(f) } else |_| {}
             }
             break :blk dflt;
         },
@@ -474,7 +525,13 @@ fn fFloat(ctx: *Ctx, input: Value, args: Args) Error!Value {
 
 fn fRound(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = ctx;
-    const precision: i32 = @intCast(try intArg(args.get(0, "precision") orelse Value{ .integer = 0 }, 0));
+    // MATCH THE REFERENCE, by a clamp that is value-preserving rather than a
+    // guess: for `f64` every precision past ±400 decimal places gives the same
+    // answer as ±400 (17 significant digits, magnitudes 5e-324 … 1.8e308), and
+    // that answer is the reference's — Jinja2 3.1.6 renders
+    // `1.5|round(10000000000)` as `1.5` and `1.5|round(-10000000000)` as `0.0`.
+    // `roundHalfEven`/`roundIntHalfEven` handle the two saturated ends exactly.
+    const precision: i32 = @intCast(std.math.clamp(try intArg(args.get(0, "precision") orelse Value{ .integer = 0 }, 0), -400, 400));
     const method_v = args.get(1, "method");
     const method: []const u8 = if (method_v) |m| switch (m) {
         .string => |s| s.bytes,
@@ -500,6 +557,11 @@ fn fRound(ctx: *Ctx, input: Value, args: Args) Error!Value {
     // `ceil`/`floor` are what the reference does verbatim: scale, apply the
     // math function, scale back.
     const scale = powTen(precision);
+    // `math.ceil(value * 10**precision)` is what the reference computes, and it
+    // raises (`OverflowError`) once `10**precision` leaves `f64` — there is no
+    // defined output to match, and an unguarded `inf`/`0` scale here would
+    // silently produce NaN.
+    if (!std.math.isFinite(scale) or scale == 0) return error.OutOfRange;
     const scaled = x * scale;
     const r: f64 = if (std.mem.eql(u8, method, "ceil"))
         @ceil(scaled)
@@ -514,6 +576,9 @@ fn fRound(ctx: *Ctx, input: Value, args: Args) Error!Value {
 /// negative one rounds to a multiple of `10^-p`, ties to even.
 fn roundIntHalfEven(x: i64, p: i32) Error!i64 {
     if (p >= 0) return x;
+    // `|i64| < 5e19`, so rounding to a multiple of `10^20` or coarser is 0 for
+    // every input — which is what the reference gives (`round(15, -400)` → 0).
+    if (p <= -20) return 0;
     const d: i128 = @intCast(mulPow10(1, @intCast(-p)) orelse return error.OutOfRange);
     const neg = x < 0;
     const a: i128 = if (neg) -@as(i128, x) else @as(i128, x);
@@ -557,6 +622,13 @@ fn powTen(p: i32) f64 {
 fn roundHalfEven(x: f64, p: i32) f64 {
     if (x == 0 or std.math.isNan(x) or std.math.isInf(x)) return x;
     const neg = x < 0;
+    // Saturated precision. At 400 decimal places the correction is below half
+    // an ulp for every finite `f64`, so the value is unchanged; at -400 every
+    // finite `f64` is below half of `10^400`, so the answer is zero. Both agree
+    // with the reference, and both keep the exact path below out of the
+    // `mulPow10` overflow fallback, which degenerates to NaN at this scale.
+    if (p >= 400) return x;
+    if (p <= -400) return if (neg) -0.0 else 0.0;
     const mag = @abs(x);
 
     const bits: u64 = @bitCast(mag);
@@ -712,8 +784,21 @@ fn escapedBytes(ctx: *Ctx, v: Value) Error![]const u8 {
 
 fn fBatch(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const items = try seq(ctx, input);
-    const n: usize = @intCast(try intArg(args.get(0, "linecount") orelse return error.BadArgument, 1));
-    if (n == 0) return error.BadArgument;
+    const n_i = try intArg(args.get(0, "linecount") orelse return error.BadArgument, 1);
+    if (n_i == 0) return error.BadArgument;
+    // MATCH THE REFERENCE. `do_batch`'s `if len(tmp) == linecount` can never
+    // fire for a negative count, so every item lands in a single batch and
+    // `fill_with` never applies: Jinja2 3.1.6 renders `[1,2,3]|batch(-1)` and
+    // `[1,2,3]|batch(-1,'x')` both as `[[1, 2, 3]]`, and `[]|batch(-1)` as `[]`.
+    if (n_i < 0) {
+        if (items.len == 0) return .{ .list = &.{} };
+        const rows = try ctx.arena.alloc(Value, 1);
+        rows[0] = .{ .list = try ctx.arena.dupe(Value, items) };
+        return .{ .list = rows };
+    }
+    const n: usize = @intCast(n_i);
+    // A `fill_with` row is padded up to `n`, so `n` is an allocation size.
+    if (n > value.max_items) return error.OutOfRange;
     const fill = args.get(1, "fill_with");
     var rows: std.ArrayList(Value) = .empty;
     var i: usize = 0;
@@ -731,8 +816,15 @@ fn fBatch(ctx: *Ctx, input: Value, args: Args) Error!Value {
 
 fn fSlice(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const items = try seq(ctx, input);
-    const n: usize = @intCast(try intArg(args.get(0, "slices") orelse return error.BadArgument, 1));
-    if (n == 0) return error.BadArgument;
+    const n_i = try intArg(args.get(0, "slices") orelse return error.BadArgument, 1);
+    if (n_i == 0) return error.BadArgument;
+    // MATCH THE REFERENCE. `do_slice` iterates `range(slices)`, which is empty
+    // for a negative count: Jinja2 3.1.6 renders `[1,2,3]|slice(-1)` and
+    // `[1,2,3]|slice(-2,'x')` both as `[]`.
+    if (n_i < 0) return .{ .list = &.{} };
+    const n: usize = @intCast(n_i);
+    // `n` is the row count, so it is an allocation size.
+    if (n > value.max_items) return error.OutOfRange;
     const fill = args.get(1, "fill_with");
     const per = items.len / n;
     const extra = items.len % n;
@@ -982,10 +1074,17 @@ fn fRejectattr(ctx: *Ctx, input: Value, args: Args) Error!Value {
 
 fn fTojson(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const indent_v = args.get(0, "indent");
+    // MATCH THE REFERENCE. `json.dumps(indent=n)` spells the pad as `' ' * n`,
+    // so a negative indent still switches on the newlines but emits no spaces:
+    // Jinja2 3.1.6 renders `{'a':1,'b':2}|tojson(-1)` identically to
+    // `…|tojson(0)`, as `{\n"a": 1,\n"b": 2\n}`.
     const indent: ?usize = if (indent_v == null or indent_v.? == .none)
         null
-    else
-        @intCast(try intArg(indent_v.?, 0));
+    else blk: {
+        const n = try intArg(indent_v.?, 0);
+        if (n > value.max_alloc) return error.OutOfRange;
+        break :blk if (n < 0) 0 else @as(usize, @intCast(n));
+    };
     var aw: std.Io.Writer.Allocating = .init(ctx.arena);
     try jsonWrite(ctx, &aw.writer, input, indent, 0);
     // Jinja escapes the four characters that could break out of a <script> or

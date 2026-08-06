@@ -285,6 +285,43 @@ pub const cases = [_]Case{
     .{ .name = "whitespace_only_template", .template = "   \n   " },
     .{ .name = "tag_at_very_start_and_end", .template = "{{ 1 }}mid{{ 2 }}" },
 
+    // ── out-of-range numeric arguments to argument-taking filters ───────────
+    //
+    // The shape this corpus was missing (audit F8/F3): every filter case above
+    // feeds an argument-taking filter a small in-range literal and plain
+    // alphanumeric input, so the whole "what does the reference do with a
+    // negative or out-of-range argument" question went unasked — and eleven
+    // unchecked narrowing casts sat behind it, each an abort on a spelling the
+    // reference renders. The inputs here deliberately carry `<`, `>` and `/`
+    // as well, and one case takes its argument from the *context* rather than
+    // from the template, which is the data path no fuzz harness reached.
+    .{ .name = "filter_replace_negative_count", .template = "{{ s|replace('a','b',-1) }}|{{ s|replace('a','b',-5) }}|{{ s|replace('a','b',0) }}", .context = "{\"s\": \"a<a>a\"}" },
+    .{ .name = "filter_replace_count_from_data", .template = "{{ s|replace('a','b',n) }}", .context = "{\"s\": \"a<a>a\", \"n\": -5}" },
+    .{ .name = "filter_indent_negative_width", .template = "[{{ s|indent(-1, true) }}]", .context = "{\"s\": \"a\\n<b>\\nc\"}" },
+    .{ .name = "filter_center_negative_width", .template = "[{{ s|center(-1) }}]|[{{ s|center(0) }}]", .context = "{\"s\": \"a/b\"}" },
+    .{ .name = "filter_int_out_of_range_base", .template = "{{ s|int(0, -1) }}|{{ s|int(0, 99) }}", .context = "{\"s\": \"10\"}" },
+    .{ .name = "filter_round_saturating_precision", .template = "{{ x|round(10000000000) }}|{{ x|round(-10000000000) }}|{{ n|round(-400) }}", .context = "{\"x\": 1.5, \"n\": 15}" },
+    .{ .name = "filter_batch_negative_linecount", .template = "{{ l|batch(-1)|list }}|{{ l|batch(-1,'x')|list }}|{{ e|batch(-1)|list }}", .context = "{\"l\": [\"a/b\", \"c\", 3], \"e\": []}" },
+    .{ .name = "filter_slice_negative_slices", .template = "{{ l|slice(-1)|list }}|{{ l|slice(-2,'x')|list }}", .context = "{\"l\": [1,2,3]}" },
+    .{ .name = "filter_tojson_negative_indent", .template = "{{ d|tojson(-1) }}", .context = "{\"d\": {\"b\": 1, \"a\": \"<x>\"}}" },
+    // The reference *refuses* these three, so all this pins is that we refuse
+    // too — which is the point: before the fix they aborted the process.
+    .{ .name = "filter_truncate_negative_length", .template = "{{ s|truncate(-1) }}", .context = "{\"s\": \"abcdefghijklmnop\"}", .expect_error = true },
+    .{ .name = "filter_truncate_negative_leeway", .template = "{{ s|truncate(5, true, '...', -1) }}", .context = "{\"s\": \"abcdefghijklmnop\"}", .expect_error = true },
+    .{ .name = "global_range_float_out_of_range", .template = "{{ range(1e300)|length }}", .expect_error = true },
+    // W2-03: the repetition guard multiplied before it checked, and `4` times
+    // `2^62` is exactly `0` once `usize` wraps — so in ReleaseFast the guard
+    // passed and `@memcpy` wrote past a zero-length buffer.
+    .{ .name = "repeat_str_product_overflows", .template = "{{ (s * 4611686018427387904)|length }}", .context = "{\"s\": \"abcd\"}", .expect_error = true },
+    .{ .name = "repeat_list_product_overflows", .template = "{{ (l * 4611686018427387904)|length }}", .context = "{\"l\": [1,2,3,4]}", .expect_error = true },
+    // Not in the audit's site list — found by building the numeric-argument
+    // fuzz harness the audit said was missing. `i += step` in `pySlice` and
+    // `stop - start` in `range()` are the same class: `i64` arithmetic on a
+    // number that crossed the trust boundary, here through the *context*.
+    .{ .name = "slice_step_saturates_at_i64_bounds", .template = "{{ l[::big] }}|{{ l[::small] }}|{{ l[1::big] }}", .context = "{\"l\": [1,2,3], \"big\": 9223372036854775807, \"small\": -9223372036854775808}" },
+    .{ .name = "range_span_overflows_i64", .template = "{{ range(small, big)|length }}", .context = "{\"big\": 9223372036854775807, \"small\": -9223372036854775808}", .expect_error = true },
+    .{ .name = "range_fill_steps_past_i64_end", .template = "{{ range(bigm1, big, big)|list }}|{{ range(smallp1, small, small)|list }}", .context = "{\"big\": 9223372036854775807, \"bigm1\": 9223372036854775806, \"small\": -9223372036854775808, \"smallp1\": -9223372036854775807}" },
+
     // ── inheritance ─────────────────────────────────────────────────────────
     .{
         .name = "extends_basic",
