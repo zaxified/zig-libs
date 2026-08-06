@@ -238,45 +238,19 @@ pub const Socket = struct {
     /// Needs `CAP_NET_ADMIN` in the network namespace. `Flow` is pointer-free,
     /// so the result is released with a single `gpa.free(flows)`.
     pub fn dump(self: *Socket, family: Family) DumpError![]Flow {
-        var attempt: usize = 0;
-        retry: while (true) {
-            attempt += 1;
-            const seq = self.nextSeq();
-            const req = wire.buildDumpRequest(seq, family);
-            try self.send(&req);
+        return dumpOver(self.nl.gpa, self, family);
+    }
 
-            var out: std.ArrayList(Flow) = .empty;
-            errdefer out.deinit(self.nl.gpa);
-            while (true) {
-                const dgram = try self.recvDatagram();
-                var it: codec.MessageIterator = .{ .buf = dgram };
-                while (it.next() catch return error.MalformedReply) |m| {
-                    switch (netlink.classifyDumpMessage(m, self.nl.portid, seq)) {
-                        .skip => {},
-                        .restart => {
-                            // The table changed under the dump: what we have
-                            // may be inconsistent, so start over with a fresh
-                            // sequence.
-                            out.deinit(self.nl.gpa);
-                            if (attempt < max_dump_attempts) continue :retry;
-                            return error.InconsistentDump;
-                        },
-                        .done => return out.toOwnedSlice(self.nl.gpa),
-                        .failed => |code| {
-                            self.nl.captureExtAck(m);
-                            return netlink.errorFromCode(code);
-                        },
-                        .overrun => return error.Overrun,
-                        .malformed => return error.MalformedReply,
-                        .record => |rec| {
-                            if (rec.type != wire.msg_ct_new) continue;
-                            const f = wire.decodeFlow(rec.payload) catch return error.MalformedReply;
-                            try out.append(self.nl.gpa, f);
-                        },
-                    }
-                }
-            }
-        }
+    // ── transport hooks the dump engine needs (see `dumpOver`) ─────────────
+
+    /// The kernel-assigned port id replies are matched against.
+    fn portId(self: *const Socket) u32 {
+        return self.nl.portid;
+    }
+
+    /// Copy the extended-ACK reason string out of a failed reply.
+    fn captureExtAck(self: *Socket, m: codec.Message) void {
+        self.nl.captureExtAck(m);
     }
 
     /// Look one flow up by tuple (`IPCTNL_MSG_CT_GET`, no dump flag). Null
@@ -413,6 +387,67 @@ pub const Socket = struct {
     }
 };
 
+/// The multi-part dump engine, factored out of `Socket.dump` so it is a **seam**
+/// like `EventIterator`: everything here is ctnetlink policy (which request,
+/// which reply type, which decoder, the `NLM_F_DUMP_INTR` retry budget), while
+/// `transport` owns the blocking I/O. In production that is a `*Socket`; in the
+/// tests it is a scripted fixture, which is the only way to reach the restart
+/// path deterministically — a live dump on a quiet host never sets
+/// `NLM_F_DUMP_INTR`.
+///
+/// `transport` must offer `nextSeq()`, `send(bytes)`, `recvDatagram()`,
+/// `portId()` and `captureExtAck(msg)`.
+///
+/// **Ownership**: `out` is declared once, *outside* the retry loop, and the
+/// single `errdefer` is its only destructor. A restart calls
+/// `clearRetainingCapacity` rather than `deinit`, because `continue :retry` does
+/// not run an errdefer but `return error.InconsistentDump` on the next line
+/// does — deinit-ing on restart and then letting the errdefer fire freed the
+/// same buffer twice (`std.ArrayList.deinit` leaves `self.* = undefined`, so the
+/// second free is on a garbage pointer).
+fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpError![]Flow {
+    var out: std.ArrayList(Flow) = .empty;
+    errdefer out.deinit(gpa);
+
+    var attempt: usize = 0;
+    retry: while (true) {
+        attempt += 1;
+        const seq = transport.nextSeq();
+        const req = wire.buildDumpRequest(seq, family);
+        try transport.send(&req);
+
+        while (true) {
+            const dgram = try transport.recvDatagram();
+            var it: codec.MessageIterator = .{ .buf = dgram };
+            while (it.next() catch return error.MalformedReply) |m| {
+                switch (netlink.classifyDumpMessage(m, transport.portId(), seq)) {
+                    .skip => {},
+                    .restart => {
+                        // The table changed under the dump: what we have may be
+                        // inconsistent, so start over with a fresh sequence.
+                        // Only the *contents* are stale — keep the capacity.
+                        out.clearRetainingCapacity();
+                        if (attempt < max_dump_attempts) continue :retry;
+                        return error.InconsistentDump;
+                    },
+                    .done => return out.toOwnedSlice(gpa),
+                    .failed => |code| {
+                        transport.captureExtAck(m);
+                        return netlink.errorFromCode(code);
+                    },
+                    .overrun => return error.Overrun,
+                    .malformed => return error.MalformedReply,
+                    .record => |rec| {
+                        if (rec.type != wire.msg_ct_new) continue;
+                        const f = wire.decodeFlow(rec.payload) catch return error.MalformedReply;
+                        try out.append(gpa, f);
+                    },
+                }
+            }
+        }
+    }
+}
+
 /// Walks one received datagram, yielding every conntrack event in it. Pure: it
 /// never blocks and never touches a socket, so a caller with its own event loop
 /// can feed it bytes from anywhere (a test fixture, a replayed capture).
@@ -514,6 +549,185 @@ test "group masks match the kernel's 1-based nfnetlink_groups enum" {
     try testing.expectEqual(@as(u32, 0b010), Group.CONNTRACK_UPDATE);
     try testing.expectEqual(@as(u32, 0b100), Group.CONNTRACK_DESTROY);
     try testing.expectEqual(@as(u32, 0b111), Group.all_conntrack);
+}
+
+// ── dump-engine tests (scripted transport, no kernel involved) ─────────────
+
+/// A scripted stand-in for `Socket` in `dumpOver`: hands out canned datagrams in
+/// order and counts requests. It exists because the `NLM_F_DUMP_INTR` restart
+/// path — and with it the retry budget — is unreachable from a live test: it
+/// needs the kernel's conntrack table to churn under the dump, four times
+/// running. Everything the engine does *around* the collected flows (ownership,
+/// how many requests it sends, what it returns when the budget runs out) is
+/// otherwise untested.
+const ScriptedTransport = struct {
+    /// The datagrams the engine will "receive", in order.
+    script: []const []const u8,
+    pos: usize = 0,
+    /// How many dump requests the engine sent — i.e. attempts made.
+    requests: usize = 0,
+    /// The identity the canned datagrams carry, so `classifyDumpMessage` matches
+    /// them instead of skipping them as stale.
+    pid: u32,
+    seq: u32,
+
+    fn nextSeq(self: *ScriptedTransport) u32 {
+        return self.seq;
+    }
+    fn portId(self: *const ScriptedTransport) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(_: *ScriptedTransport, _: codec.Message) void {}
+    fn send(self: *ScriptedTransport, _: []const u8) SendError!void {
+        self.requests += 1;
+    }
+    fn recvDatagram(self: *ScriptedTransport) RecvError![]const u8 {
+        // Running off the end means the engine asked for more than the scenario
+        // scripted — a test bug, surfaced as an error rather than a hang.
+        if (self.pos == self.script.len) return error.RecvFailed;
+        defer self.pos += 1;
+        return self.script[self.pos];
+    }
+};
+
+/// The `(pid, seq)` the captured `conntrack -L` reply was addressed to; read out
+/// of the golden rather than retyped.
+fn goldenDumpIdentity() struct { pid: u32, seq: u32 } {
+    var it: codec.MessageIterator = .{ .buf = &goldens.dump_reply_three_flows };
+    const m = (it.next() catch unreachable).?;
+    return .{ .pid = m.pid, .seq = m.seq };
+}
+
+/// A bare control datagram carrying `flags` — `NLM_F_DUMP_INTR` for the
+/// "table changed under the dump" signal the kernel stamps on `netlink_dump`
+/// output, or plain `NLM_F_MULTI` for the terminating `NLMSG_DONE`.
+fn controlDatagram(pid: u32, seq: u32, flags: u16) [codec.header_len]u8 {
+    var b: [codec.header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, b[0..4], codec.header_len, native_endian);
+    std.mem.writeInt(u16, b[4..6], codec.NLMSG_DONE, native_endian);
+    std.mem.writeInt(u16, b[6..8], flags, native_endian);
+    std.mem.writeInt(u32, b[8..12], seq, native_endian);
+    std.mem.writeInt(u32, b[12..16], pid, native_endian);
+    return b;
+}
+
+test "dump engine: a clean multi-part reply is collected and handed over" {
+    const id = goldenDumpIdentity();
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    var t: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, &done },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    const flows = try dumpOver(testing.allocator, &t, .unspec);
+    defer testing.allocator.free(flows);
+    try testing.expectEqual(@as(usize, 3), flows.len);
+    try testing.expectEqual(@as(usize, 1), t.requests);
+}
+
+test "dump engine: NLM_F_DUMP_INTR restarts and the retry replaces the stale flows" {
+    const id = goldenDumpIdentity();
+    const intr = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    var t: ScriptedTransport = .{
+        .script = &.{
+            &goldens.dump_reply_three_flows, &intr, // first pass: interrupted
+            &goldens.dump_reply_three_flows, &done, // second pass: completes
+        },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    const flows = try dumpOver(testing.allocator, &t, .unspec);
+    defer testing.allocator.free(flows);
+    // 3, not 6: the interrupted pass's flows are discarded, not appended to.
+    try testing.expectEqual(@as(usize, 3), flows.len);
+    try testing.expectEqual(@as(usize, 2), t.requests);
+}
+
+test "dump engine: an exhausted DUMP_INTR budget errors without freeing twice" {
+    // The W2-07 regression. Four interrupted attempts take the *error* return,
+    // which is the one path where an errdefer fires — so a `deinit` in the
+    // restart branch would free the already-freed buffer a second time. The
+    // flows collected before each restart matter: they make the ArrayList own a
+    // real allocation, without which the double free is a no-op.
+    const id = goldenDumpIdentity();
+    const intr = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR);
+    var t: ScriptedTransport = .{
+        .script = &.{
+            &goldens.dump_reply_three_flows, &intr,
+            &goldens.dump_reply_three_flows, &intr,
+            &goldens.dump_reply_three_flows, &intr,
+            &goldens.dump_reply_three_flows, &intr,
+        },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    try testing.expectError(error.InconsistentDump, dumpOver(testing.allocator, &t, .unspec));
+    try testing.expectEqual(@as(usize, max_dump_attempts), t.requests);
+    // The whole script was consumed: the budget is 4 attempts, not 3 or 5.
+    try testing.expectEqual(t.script.len, t.pos);
+}
+
+test "dump engine: a kernel error reply is mapped and stops the dump" {
+    const id = goldenDumpIdentity();
+    var err_dgram: [codec.header_len + 4]u8 = @splat(0);
+    std.mem.writeInt(u32, err_dgram[0..4], err_dgram.len, native_endian);
+    std.mem.writeInt(u16, err_dgram[4..6], codec.NLMSG_ERROR, native_endian);
+    std.mem.writeInt(u32, err_dgram[8..12], id.seq, native_endian);
+    std.mem.writeInt(u32, err_dgram[12..16], id.pid, native_endian);
+    std.mem.writeInt(i32, err_dgram[16..20], -1, native_endian); // -EPERM
+    var t: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, &err_dgram },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    // The flows collected before the error are released by the engine's
+    // errdefer; std.testing.allocator fails the test if they are not.
+    try testing.expectError(error.AccessDenied, dumpOver(testing.allocator, &t, .unspec));
+}
+
+test "fuzz: the dump engine survives any interleaving of dump replies" {
+    try testing.fuzz({}, fuzzDumpEngine, .{});
+}
+
+/// The dump *engine* had no fuzz reach at all — `wire.zig`'s harness stops at
+/// `decodeFlow`, so nothing exercised the retry budget, the errdefer or the
+/// ownership of the collected flows. This drives `dumpOver` with an arbitrary
+/// interleaving of the datagram kinds a kernel can send, on `std.testing`'s
+/// allocator, so a leak, a double free or a use-after-free on any exit path is a
+/// finding rather than a silent survivor. (The W2-07 double free needed four
+/// consecutive `NLM_F_DUMP_INTR`, which is exactly the kind of sequence a
+/// scripted unit test only reaches if somebody already suspects it.)
+fn fuzzDumpEngine(_: void, smith: *std.testing.Smith) !void {
+    const id = goldenDumpIdentity();
+    const intr = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+
+    var failed: [codec.header_len + 4]u8 = @splat(0);
+    std.mem.writeInt(u32, failed[0..4], failed.len, native_endian);
+    std.mem.writeInt(u16, failed[4..6], codec.NLMSG_ERROR, native_endian);
+    std.mem.writeInt(u32, failed[8..12], id.seq, native_endian);
+    std.mem.writeInt(u32, failed[12..16], id.pid, native_endian);
+    std.mem.writeInt(i32, failed[16..20], -@as(i32, smith.value(u8)), native_endian);
+
+    var junk: [128]u8 = undefined;
+    smith.bytes(&junk);
+
+    var script: [16][]const u8 = undefined;
+    const n = smith.valueRangeAtMost(u8, 1, script.len);
+    for (script[0..n]) |*d| {
+        d.* = switch (smith.value(u8) % 5) {
+            0 => &goldens.dump_reply_three_flows,
+            1 => &intr,
+            2 => &done,
+            3 => &failed,
+            else => junk[0..smith.valueRangeAtMost(u8, 0, junk.len)],
+        };
+    }
+
+    var t: ScriptedTransport = .{ .script = script[0..n], .pid = id.pid, .seq = id.seq };
+    const flows = dumpOver(testing.allocator, &t, .unspec) catch return;
+    testing.allocator.free(flows);
 }
 
 // ── live tests (real kernel; skip cleanly when they cannot run) ─────────────
