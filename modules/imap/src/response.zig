@@ -123,6 +123,9 @@ pub const Reader = struct {
     /// Read exactly one response line.
     pub fn next(self: *Reader) Error!Response {
         const d = &self.d;
+        // A line is what this function reads, so this is the only place that
+        // can start the `wire.Options.max_line` budget.
+        d.startLine();
 
         if (try d.accept('+')) {
             // Continuation. The text is optional -- servers commonly send a
@@ -288,6 +291,11 @@ pub const Reader = struct {
                     else => return error.ReadFailed,
                 };
                 if (ch == ']') break;
+                // The only byte consumption in this module that does not go
+                // through a `Decoder` primitive, so it charges the line budget
+                // itself — otherwise `[UNKNOWN aaaa…` with no `]` is an
+                // unbounded spin.
+                try d.charge(1);
                 d.r.toss(1);
             }
         }
@@ -375,6 +383,23 @@ const Fixture = struct {
         return Reader.init(f.arena.allocator(), &f.r, .{});
     }
 };
+
+test "the max_line budget is per line, and it is this Reader that starts one" {
+    // Two lines, each within the cap, together well over it. If the budget is
+    // never reset the second line fails; if it is never charged the third
+    // (unterminated) line is accepted. Both halves matter.
+    var f = Fixture.init(
+        "* 172 EXISTS\r\n" ++
+            "* 173 EXISTS\r\n" ++
+            "* AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    );
+    defer f.deinit();
+    var rd = Reader.init(f.arena.allocator(), &f.r, .{ .max_line = 24 });
+
+    try testing.expectEqual(@as(u32, 172), (try rd.next()).data.exists);
+    try testing.expectEqual(@as(u32, 173), (try rd.next()).data.exists);
+    try testing.expectError(error.LineTooLong, rd.next());
+}
 
 test "RFC 9051 §6.3.2: the whole SELECT transcript" {
     var f = Fixture.init(

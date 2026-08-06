@@ -39,6 +39,10 @@ pub const Error = error{
     LiteralTooLarge,
     /// More nested lists than `Options.max_depth`.
     DepthExceeded,
+    /// One response line consumed more than `Options.max_line` bytes outside
+    /// its literals — a line the server never terminated, or one atom the size
+    /// of a mailbox.
+    LineTooLong,
     /// A server sent `{123+}`, which only a client may send.
     NonSyncLiteral,
     InvalidUtf7,
@@ -57,6 +61,21 @@ pub const Options = struct {
     /// nested multipart is the legitimate reason this is not 8; the point is
     /// that recursion is bounded. Matches go-imap's `maxListDepth`.
     max_depth: usize = 1000,
+    /// Largest response line, in bytes, **excluding literal payloads**. This
+    /// is go-imap's `Decoder.MaxSize`, which the port dropped (divergence D4
+    /// below) and nothing replaced: without it one never-terminated line from
+    /// a hostile or MITM'd server allocates until the process dies, and a
+    /// single 8 MiB atom was accepted under the defaults.
+    ///
+    /// Literals are excluded because they are the one construct a legitimate
+    /// server uses to send megabytes (a `FETCH` of a whole message), and they
+    /// have their own ceiling in `max_literal`, checked before the allocation.
+    /// Everything else — atoms, quoted strings, capability lists, flag lists,
+    /// `BODYSTRUCTURE` parameters, status text — is grammar, and 64 KiB of
+    /// grammar on one line is already two orders of magnitude past what a real
+    /// server sends. Refusal is `error.LineTooLong`; nothing is truncated,
+    /// because a silently shortened mailbox name or flag is a wrong answer.
+    max_line: usize = 64 * 1024,
 };
 
 /// True for RFC 9051 `ATOM-CHAR`: anything but the specials and CTLs.
@@ -80,9 +99,28 @@ pub const Decoder = struct {
     gpa: Allocator,
     opts: Options = .{},
     depth: usize = 0,
+    /// Bytes consumed on the current line, literal payloads excluded. See
+    /// `Options.max_line`; `startLine` resets it.
+    line_bytes: usize = 0,
 
     pub fn init(gpa: Allocator, r: *std.Io.Reader, opts: Options) Decoder {
         return .{ .r = r, .gpa = gpa, .opts = opts };
+    }
+
+    // ── the line budget ─────────────────────────────────────────────────────
+
+    /// Begin a new response line. What counts as a line is `response.Reader`'s
+    /// business, not the grammar's, so the budget cannot reset itself.
+    pub fn startLine(d: *Decoder) void {
+        d.line_bytes = 0;
+    }
+
+    /// Account for `n` bytes taken off the wire on this line. Every byte the
+    /// decoder consumes goes through here except a literal's payload, which
+    /// `max_literal` bounds instead.
+    pub fn charge(d: *Decoder, n: usize) Error!void {
+        d.line_bytes += n;
+        if (d.line_bytes > d.opts.max_line) return error.LineTooLong;
     }
 
     // ── bytes ───────────────────────────────────────────────────────────────
@@ -91,6 +129,7 @@ pub const Decoder = struct {
     pub fn accept(d: *Decoder, ch: u8) Error!bool {
         const got = d.r.peekByte() catch |e| return mapRead(e);
         if (got != ch) return false;
+        try d.charge(1);
         d.r.toss(1);
         return true;
     }
@@ -144,6 +183,10 @@ pub const Decoder = struct {
                 else => return mapRead(e),
             };
             if (!valid(ch)) break;
+            // Before the append, not after: this loop is the module's one
+            // unbounded accumulator, and it is what a server that never
+            // terminates a line drives.
+            try d.charge(1);
             d.r.toss(1);
             try out.append(d.gpa, ch);
         }
@@ -174,9 +217,13 @@ pub const Decoder = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(d.gpa);
         while (true) {
+            try d.charge(1);
             var ch = d.r.takeByte() catch |e| return mapRead(e);
             if (ch == '"') break;
-            if (ch == '\\') ch = d.r.takeByte() catch |e| return mapRead(e);
+            if (ch == '\\') {
+                try d.charge(1);
+                ch = d.r.takeByte() catch |e| return mapRead(e);
+            }
             try out.append(d.gpa, ch);
         }
         return try out.toOwnedSlice(d.gpa);
@@ -194,6 +241,10 @@ pub const Decoder = struct {
         try d.expectCrlf();
 
         // Checked BEFORE the allocation: the size came off the wire.
+        // This is also why the payload below is not charged to the line
+        // budget — `max_literal` is the bound that applies to it, and a line
+        // budget large enough to hold a fetched message would be no bound at
+        // all on the grammar. The `{n}` header itself was charged, above.
         if (size > d.opts.max_literal) return error.LiteralTooLarge;
 
         const buf = try d.gpa.alloc(u8, size);
@@ -408,6 +459,80 @@ test "literal: a server may not send a non-synchronising literal" {
     var r = std.Io.Reader.fixed("{12+}\r\nHello there\n");
     var d = decoderOver(gpa, &r);
     try testing.expectError(error.NonSyncLiteral, d.literal());
+}
+
+test "literal: the payload is bounded by max_literal, not by the line budget" {
+    // The two ceilings must not collide: a FETCH of a whole message is a
+    // legitimate multi-megabyte literal on a line whose grammar is tiny.
+    const gpa = testing.allocator;
+    var r = std.Io.Reader.fixed("{20}\r\nAAAAAAAAAAAAAAAAAAAA\r\n");
+    var d = Decoder.init(gpa, &r, .{ .max_line = 16, .max_literal = 1024 });
+    const s = (try d.literal()).?;
+    defer gpa.free(s);
+    try testing.expectEqual(@as(usize, 20), s.len);
+    try testing.expectEqual(@as(usize, 6), d.line_bytes); // only `{20}\r\n`
+}
+
+test "run: an unterminated line is refused, not accumulated, under the DEFAULT options" {
+    // The reproducer from the audit: a server that starts an atom and never
+    // ends the line. It was accepted at 8 MiB with `Options{}` — there was no
+    // error path at any size. `max_line` is what a hostile or MITM'd server
+    // now runs into; 64 KiB + 1 is the smallest input that reaches it, so the
+    // test costs nothing to run.
+    const gpa = testing.allocator;
+    const opts: Options = .{};
+    const buf = try gpa.alloc(u8, opts.max_line + 1);
+    defer gpa.free(buf);
+    @memset(buf, 'A');
+
+    var r = std.Io.Reader.fixed(buf);
+    var d = decoderOver(gpa, &r);
+    // Not EndOfStream and not a truncated atom: a typed refusal. Truncating
+    // would hand the caller a mailbox name that is not the server's.
+    try testing.expectError(error.LineTooLong, d.expectAtom());
+}
+
+test "run: the line budget is enforced AT max_line, not somewhere past it" {
+    const gpa = testing.allocator;
+    const opts: Options = .{ .max_line = 16 };
+
+    // Exactly at the cap: accepted, whole.
+    {
+        var r = std.Io.Reader.fixed("AAAAAAAAAAAAAAAA\r\n"); // 16 atom chars
+        var d = Decoder.init(gpa, &r, opts);
+        const a = try d.expectAtom();
+        defer gpa.free(a);
+        try testing.expectEqual(@as(usize, 16), a.len);
+        try testing.expectEqual(@as(usize, 16), d.line_bytes);
+        // The CRLF is part of the line too, so it is over budget from here.
+        try testing.expectError(error.LineTooLong, d.crlf());
+    }
+
+    // One byte past it: refused.
+    {
+        var r = std.Io.Reader.fixed("AAAAAAAAAAAAAAAAA\r\n"); // 17
+        var d = Decoder.init(gpa, &r, opts);
+        try testing.expectError(error.LineTooLong, d.expectAtom());
+    }
+
+    // The budget spans the whole line, not one token: two atoms that are each
+    // under the cap but together over it.
+    {
+        var r = std.Io.Reader.fixed("AAAAAAAAA BBBBBBBBB\r\n"); // 9 + 1 + 9
+        var d = Decoder.init(gpa, &r, opts);
+        const a = try d.expectAtom();
+        defer gpa.free(a);
+        try d.expectSp();
+        try testing.expectError(error.LineTooLong, d.expectAstring());
+    }
+
+    // A quoted string is the other unbounded accumulator, and a server can
+    // simply never close the quote.
+    {
+        var r = std.Io.Reader.fixed("\"AAAAAAAAAAAAAAAAAAAAAAAA");
+        var d = Decoder.init(gpa, &r, opts);
+        try testing.expectError(error.LineTooLong, d.quoted());
+    }
 }
 
 test "literal: the announced size is capped before it is allocated" {
@@ -627,6 +752,10 @@ test "a full untagged line, field by field" {
 //     parsing into undefined state.
 //
 // D4. Go's `Decoder.MaxSize` bounds the total bytes read (literals excluded).
-//     That belongs to the response reader rather than to the grammar, so it
-//     is not here; `Options.max_literal` and `Options.max_depth` are, and both
-//     are enforced before the allocation or recursion they bound.
+//     This file once argued that the bound "belongs to the response reader
+//     rather than to the grammar" and left it out — and nothing in the response
+//     reader ever put it back, so an unterminated server line had no ceiling of
+//     any kind. `Options.max_line` is that bound, restored with go-imap's
+//     semantics (literals excluded, `max_literal` covers those); the *reset* is
+//     the response reader's business and lives in `response.Reader.next` via
+//     `startLine`, which is as much of the original argument as survives.
