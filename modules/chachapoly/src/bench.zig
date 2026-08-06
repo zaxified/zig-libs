@@ -87,8 +87,9 @@ test "bench (opt-in via CHACHAPOLY_BENCH)" {
         std.debug.print("chacha20 keystream : ours {d:>8.0} MB/s   std {d:>8.0} MB/s   ({d:.2}x)\n", .{ ours, theirs, ours / theirs });
     }
 
-    // ── ChaCha20 xor (what the AEAD actually calls; `stream` above writes the
-    //    keystream straight to `out`, `xor` stages it through a stack buffer) ──
+    // ── ChaCha20 xor (what the AEAD actually calls). Since the XOR was fused
+    //    into the block emit this should track `stream` above within noise; a
+    //    result far below it means the staging buffer is back. ──
     {
         var t0 = nowNs();
         for (0..iters) |_| root.ChaCha20.xor(&out, &buf, 1, key, nonce);

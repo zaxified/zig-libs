@@ -15,8 +15,8 @@
 //! consecutive counter blocks, so a quarter-round is `N`-way data-parallel with
 //! no in-block shuffles. With `N = 8` a `@Vector(8, u32)` lowers to 256-bit AVX2
 //! when the target enables it (`-Dcpu=native` / any AVX2 target), recovering most
-//! of the gap; on `baseline` it lowers to paired SSE2 and is still correct. The
-//! `<N`-block tail is handled by a scalar (`N = 1`) pass over the same engine.
+//! of the gap; on `baseline` it lowers to paired SSE2 and is still correct, and
+//! at `N = 1` the same engine is a plain scalar fallback for the short tail.
 //!
 //! **Dedup note.** `std` *has* ChaCha20-Poly1305 (`std.crypto.aead.chacha_poly`).
 //! This is a deliberate performance-specialised duplicate, justified by the
@@ -32,10 +32,23 @@
 //! `std.crypto.onetimeauth.Poly1305` as the serial core so that inputs below the
 //! break-even size run std's code and cannot regress.
 //!
-//! **Where the AEAD's time now goes.** With the MAC at ~3.6 GB/s the limiter is
-//! `ChaCha20.xor` below: it stages the keystream through a stack buffer and XORs
-//! it a byte at a time, running at ~1.06 GB/s against `stream`'s ~2.17 GB/s.
-//! Fusing generation with the XOR is the next throughput item here.
+//! **The XOR is fused.** `ChaCha20.xor` does not materialise the keystream: a
+//! block group is transposed straight out of the `@Vector` state into 64-byte
+//! vectors, XORed against unaligned loads of the input, and stored. The previous
+//! shape — stage into a `[64 * N]u8`, then `out[j] = in[j] ^ ks[j]` — cost more
+//! than the extra copy suggests: LLVM would not vectorise that loop at all
+//! (`out` may alias `in`) and emitted one `movzbl`/`xor`/`mov` **per byte**.
+//! Fusing took `xor` from 1102 to 2356 MB/s and the AEAD from 845 to 1394 MB/s
+//! at 8 KiB, and 542 -> 1088 MB/s for a 1420-byte WireGuard-sized packet
+//! (i7-7920HQ, AVX2, ReleaseFast). The MAC at ~3.9 GB/s and the cipher at
+//! ~2.4 GB/s now compose to almost exactly the measured AEAD rate, so neither
+//! side has slack left; going further means a wider group (AVX-512) or
+//! interleaving the two, not another local fix.
+//!
+//! The sub-group tail generates one *whole* wide group and discards the unused
+//! blocks: a wide group costs about what a single `N = 1` block costs, so this
+//! is a win for any tail longer than one block (it is most of the 1420-byte
+//! gain). Only that tail still stages through a stack buffer.
 //!
 //! **Constant-time.** ChaCha and Poly1305 are inherently constant-time — only
 //! add / xor / rotate / (Poly1305) multiply / mask, no secret-indexed memory and
@@ -70,6 +83,8 @@ pub const meta = .{
 /// lowers to 256-bit AVX2 on targets that enable it; to paired SSE2 otherwise.
 const wide = 8;
 
+const native_endian = @import("builtin").cpu.arch.endian();
+
 const sigma = [4]u32{ 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 }; // "expand 32-byte k"
 
 fn keyToWords(key: [32]u8) [8]u32 {
@@ -86,10 +101,12 @@ fn nonceToWords(nonce: [12]u8) [3]u32 {
     };
 }
 
-/// Fill `ks` with the ChaCha20 keystream for `N` consecutive blocks starting at
-/// `counter` (block j uses counter `counter +% j`). This is the block-parallel
-/// transpose core: 16 state words, each a `@Vector(N, u32)` across the N blocks.
-fn keystream(comptime N: usize, ks: *[64 * N]u8, k: [8]u32, counter: u32, n: [3]u32) void {
+/// Compute the ChaCha20 state for `N` consecutive blocks starting at `counter`
+/// (block j uses counter `counter +% j`), returning the 16 post-`+= s` state
+/// words in the block-parallel **transpose layout**: word i of every one of the
+/// N blocks lives in lane i..N of `x[i]`. The words are NOT yet in memory order
+/// — `blockWords` does that transpose, and it is the only place that may.
+fn chachaCore(comptime N: usize, k: [8]u32, counter: u32, n: [3]u32) [16]@Vector(N, u32) {
     const V = @Vector(N, u32);
     const iota: V = comptime blk: {
         var a: [N]u32 = undefined;
@@ -122,13 +139,63 @@ fn keystream(comptime N: usize, ks: *[64 * N]u8, k: [8]u32, counter: u32, n: [3]
         quarterRound(V, &x, 3, 4, 9, 14);
     }
     inline for (0..16) |i| x[i] +%= s[i];
+    return x;
+}
 
-    // Transpose word-major vectors back to block-major little-endian bytes.
+/// The transpose. Gather block `j`'s 16 words out of the word-major state into
+/// one `@Vector(16, u32)` in memory order, byte-swapped so that a `@bitCast` to
+/// `[64]u8` is the little-endian keystream block RFC 8439 specifies.
+///
+/// Every consumer of the core goes through here, so there is exactly one place
+/// that knows the lane layout. LLVM recognises the lane-extract pattern and
+/// lowers it to a shuffle network (verified in the disassembly), not to 16
+/// scalar extracts.
+inline fn blockWords(comptime N: usize, x: [16]@Vector(N, u32), comptime j: usize) @Vector(16, u32) {
+    var w: @Vector(16, u32) = undefined;
+    inline for (0..16) |i| w[i] = x[i][j];
+    // comptime branch on target endianness — no runtime cost, no secret input.
+    return if (native_endian == .little) w else @byteSwap(w);
+}
+
+/// Fill `ks` with the keystream for `N` blocks starting at `counter`.
+fn keystream(comptime N: usize, ks: *[64 * N]u8, k: [8]u32, counter: u32, n: [3]u32) void {
+    const x = chachaCore(N, k, counter, n);
     inline for (0..N) |j| {
-        inline for (0..16) |i| {
-            mem.writeInt(u32, ks[64 * j + 4 * i ..][0..4], x[i][j], .little);
-        }
+        ks[64 * j ..][0..64].* = @bitCast(blockWords(N, x, j));
     }
+}
+
+/// **Fused** keystream-and-XOR for a whole group of `N` blocks: the keystream
+/// never becomes bytes in memory. Each block is transposed straight into a
+/// 64-byte vector, XORed against an unaligned load of `in`, and stored to `out`
+/// — no `[64 * N]u8` staging buffer and no bytewise loop (the bytewise loop is
+/// what LLVM refused to vectorise, because `out` may alias `in`).
+///
+/// `out` and `in` may be the same pointer (in-place): every byte of a block is
+/// read before any byte of that block is written.
+inline fn xorBlocks(comptime N: usize, out: *[64 * N]u8, in: *const [64 * N]u8, x: [16]@Vector(N, u32)) void {
+    const Block = @Vector(64, u8);
+    inline for (0..N) |j| {
+        const ks: Block = @bitCast(blockWords(N, x, j));
+        // Unaligned load/store: callers hand us arbitrary `[]u8` slices, so
+        // nothing may be assumed about alignment. `[64]u8` has alignment 1.
+        const src: Block = in[64 * j ..][0..64].*;
+        out[64 * j ..][0..64].* = @as([64]u8, src ^ ks);
+    }
+}
+
+/// XOR `ks` into `in` -> `out` for a partial (sub-group) run, in vector-width
+/// chunks with a bytewise remainder. Both loop bounds are functions of the
+/// message length, which is public; nothing here depends on key or plaintext.
+inline fn xorTail(out: []u8, in: []const u8, ks: []const u8) void {
+    const Chunk = @Vector(32, u8);
+    var j: usize = 0;
+    while (j + 32 <= ks.len) : (j += 32) {
+        const a: Chunk = in[j..][0..32].*;
+        const b: Chunk = ks[j..][0..32].*;
+        out[j..][0..32].* = @as([32]u8, a ^ b);
+    }
+    while (j < ks.len) : (j += 1) out[j] = in[j] ^ ks[j];
 }
 
 inline fn quarterRound(comptime V: type, x: *[16]V, a: usize, b: usize, c: usize, d: usize) void {
@@ -151,6 +218,11 @@ pub const ChaCha20 = struct {
 
     /// XOR the ChaCha20 keystream (starting at block `counter`) into `in`,
     /// writing to `out`. `out.len == in.len`. NOT authenticated on its own.
+    ///
+    /// `out` and `in` must be either the **same** slice (in-place, which is what
+    /// the AEAD and every network consumer does) or **disjoint**. Partially
+    /// overlapping slices are not supported — the fused path reads a whole
+    /// 64-byte block before writing it, as std's block-buffered `xor` does.
     pub fn xor(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         std.debug.assert(out.len == in.len);
         // RFC 8439 §2.3: the 32-bit block counter must not wrap. A wrap restarts
@@ -164,18 +236,32 @@ pub const ChaCha20 = struct {
         var ctr = counter;
         var i: usize = 0;
 
+        // Whole groups: fused, no staging buffer.
         while (i + 64 * wide <= in.len) : (i += 64 * wide) {
-            var ks: [64 * wide]u8 = undefined;
-            keystream(wide, &ks, k, ctr, n);
-            for (0..64 * wide) |j| out[i + j] = in[i + j] ^ ks[j];
+            const x = chachaCore(wide, k, ctr, n);
+            xorBlocks(wide, out[i..][0 .. 64 * wide], in[i..][0 .. 64 * wide], x);
             ctr +%= wide;
         }
-        while (i < in.len) : (i += 64) {
+
+        // Tail: fewer than `wide` whole blocks left, so the group cannot be
+        // XORed in place and the keystream is staged (at most 512 bytes, once
+        // per call). Both branches below are on the *message length*, which is
+        // public; neither depends on key or plaintext.
+        const rem = in.len - i;
+        if (rem > 64) {
+            // A wide group costs about the same as ONE scalar block — same
+            // instruction count, `wide` times the width — so generating all
+            // `wide` blocks and discarding the unused suffix beats looping the
+            // N=1 engine as soon as more than one block is left. The discarded
+            // lanes may carry counters past 2^32-1 (`+% iota`); those bytes are
+            // never emitted, so the anti-wrap guarantee above is unaffected.
+            var ks: [64 * wide]u8 = undefined;
+            keystream(wide, &ks, k, ctr, n);
+            xorTail(out[i..], in[i..], ks[0..rem]);
+        } else if (rem > 0) {
             var ks: [64]u8 = undefined;
             keystream(1, &ks, k, ctr, n);
-            const m = @min(@as(usize, 64), in.len - i);
-            for (0..m) |j| out[i + j] = in[i + j] ^ ks[j];
-            ctr +%= 1;
+            xorTail(out[i..], in[i..], ks[0..rem]);
         }
     }
 
@@ -192,12 +278,17 @@ pub const ChaCha20 = struct {
             keystream(wide, out[i..][0 .. 64 * wide], k, ctr, n);
             ctr +%= wide;
         }
-        while (i < out.len) : (i += 64) {
+        // Tail — see the matching note in `xor`: one wide group with the unused
+        // blocks discarded beats a loop over the N=1 engine. Length-only branch.
+        const rem = out.len - i;
+        if (rem > 64) {
+            var ks: [64 * wide]u8 = undefined;
+            keystream(wide, &ks, k, ctr, n);
+            @memcpy(out[i..], ks[0..rem]);
+        } else if (rem > 0) {
             var ks: [64]u8 = undefined;
             keystream(1, &ks, k, ctr, n);
-            const m = @min(@as(usize, 64), out.len - i);
-            @memcpy(out[i..][0..m], ks[0..m]);
-            ctr +%= 1;
+            @memcpy(out[i..], ks[0..rem]);
         }
     }
 };
@@ -473,6 +564,118 @@ test "differential AEAD vs std: seal/open/tamper across edge lengths" {
             var bad_c = ours_c;
             bad_c[len - 1] +%= 1;
             try testing.expectError(error.AuthenticationFailed, ChaCha20Poly1305.decrypt(dec[0..len], bad_c[0..len], ours_tag, ad[0..ad_len], nonce, key));
+        }
+    }
+}
+
+// The fused `xor` writes whole 64-byte blocks from vector registers and reaches
+// the staging path only for the final partial group, so its failure modes are
+// (a) a mis-transposed lane, (b) a wrong block in the discarded tail suffix, and
+// (c) an off-by-one at the group/tail seam. A handful of edge lengths does not
+// cover that: the tail can be any of 0..511 bytes and the tail engine switches
+// between the wide and the N=1 core at 64. Sweep EVERY length up to 1024 — two
+// whole wide groups plus every possible tail — byte-exact against std.
+test "exhaustive length sweep 0..1024: xor byte-exact vs std" {
+    var prng = std.Random.DefaultPrng.init(0xFACE_B00C);
+    const rand = prng.random();
+    var key: [32]u8 = undefined;
+    var nonce: [12]u8 = undefined;
+    rand.bytes(&key);
+    rand.bytes(&nonce);
+
+    var msg: [1024]u8 = undefined;
+    rand.bytes(&msg);
+    var ours: [1024]u8 = undefined;
+    var theirs: [1024]u8 = undefined;
+
+    for (0..1025) |len| {
+        for ([_]u32{ 0, 1, 7, 8, 9, 0xFFFF }) |ctr| {
+            @memset(ours[0..len], 0xA5);
+            @memset(theirs[0..len], 0x5A);
+            ChaCha20.xor(ours[0..len], msg[0..len], ctr, key, nonce);
+            StdChaCha.xor(theirs[0..len], msg[0..len], ctr, key, nonce);
+            try testing.expectEqualSlices(u8, theirs[0..len], ours[0..len]);
+        }
+        // `stream` shares the same core and tail split; hold it to the same bar.
+        ChaCha20.stream(ours[0..len], 3, key, nonce);
+        StdChaCha.stream(theirs[0..len], 3, key, nonce);
+        try testing.expectEqualSlices(u8, theirs[0..len], ours[0..len]);
+    }
+}
+
+// `out == in` is the documented in-place contract and what the AEAD's poly-key
+// derivation and every network consumer use. The fused path reads a whole block
+// into registers before storing it, which is what makes that safe; a version
+// that stored a partial block before finishing its loads would corrupt the
+// input it had not read yet. Every length up to two wide groups, in place.
+test "in-place xor (out == in) matches the out-of-place result, 0..1024" {
+    var prng = std.Random.DefaultPrng.init(0x1_9_1ACE);
+    const rand = prng.random();
+    var key: [32]u8 = undefined;
+    var nonce: [12]u8 = undefined;
+    rand.bytes(&key);
+    rand.bytes(&nonce);
+
+    var msg: [1024]u8 = undefined;
+    rand.bytes(&msg);
+    var inplace: [1024]u8 = undefined;
+    var theirs: [1024]u8 = undefined;
+
+    for (0..1025) |len| {
+        @memcpy(inplace[0..len], msg[0..len]);
+        ChaCha20.xor(inplace[0..len], inplace[0..len], 1, key, nonce);
+        StdChaCha.xor(theirs[0..len], msg[0..len], 1, key, nonce);
+        try testing.expectEqualSlices(u8, theirs[0..len], inplace[0..len]);
+
+        // and it round-trips back to the plaintext in place
+        ChaCha20.xor(inplace[0..len], inplace[0..len], 1, key, nonce);
+        try testing.expectEqualSlices(u8, msg[0..len], inplace[0..len]);
+    }
+}
+
+test "in-place AEAD (c == m buffer) seal/open" {
+    const key = [_]u8{0x11} ** 32;
+    const nonce = [_]u8{0x22} ** 12;
+    var prng = std.Random.DefaultPrng.init(0xA11A5);
+    var msg: [777]u8 = undefined;
+    prng.random().bytes(&msg);
+
+    inline for (.{ 0, 1, 63, 64, 65, 511, 512, 513, 777 }) |len| {
+        var buf: [len]u8 = undefined;
+        @memcpy(&buf, msg[0..len]);
+        var tag: [16]u8 = undefined;
+        ChaCha20Poly1305.encrypt(&buf, &tag, &buf, "ad", nonce, key);
+
+        var std_c: [len]u8 = undefined;
+        var std_tag: [16]u8 = undefined;
+        StdAead.encrypt(&std_c, &std_tag, msg[0..len], "ad", nonce, key);
+        try testing.expectEqualSlices(u8, &std_c, &buf);
+        try testing.expectEqualSlices(u8, &std_tag, &tag);
+
+        try ChaCha20Poly1305.decrypt(&buf, &buf, tag, "ad", nonce, key);
+        try testing.expectEqualSlices(u8, msg[0..len], &buf);
+    }
+}
+
+// Unaligned slices: callers hand us arbitrary `[]u8`, and the fused path uses
+// unaligned vector loads/stores. Slide both `in` and `out` across every offset
+// in a 64-byte window, independently, so no combination is accidentally aligned.
+test "unaligned in/out offsets produce identical bytes" {
+    const key = [_]u8{0x5C} ** 32;
+    const nonce = [_]u8{0x3E} ** 12;
+    var prng = std.Random.DefaultPrng.init(0x0DDA_1160);
+    var backing_in: [64 + 600]u8 = undefined;
+    var backing_out: [64 + 600]u8 = undefined;
+    prng.random().bytes(&backing_in);
+
+    const len = 600;
+    var reference: [len]u8 = undefined;
+    for (0..64) |in_off| {
+        StdChaCha.xor(&reference, backing_in[in_off..][0..len], 1, key, nonce);
+        for (0..64) |out_off| {
+            @memset(&backing_out, 0);
+            ChaCha20.xor(backing_out[out_off..][0..len], backing_in[in_off..][0..len], 1, key, nonce);
+            try testing.expectEqualSlices(u8, &reference, backing_out[out_off..][0..len]);
         }
     }
 }

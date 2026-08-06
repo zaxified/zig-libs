@@ -86,10 +86,27 @@ coupling is deliberate and is pinned by the every-length differential below: if
 any of those meanings drifted, the sweep would fail rather than silently forge.
 
 Measured on an i7-7920HQ (AVX2), ReleaseFast: MAC 1.0× at 32 B, 0.98× at 128 B,
-1.06× at 256 B, 1.5× at 512 B, 2.0× at 1420 B, 2.5× at 8 KiB; full AEAD 1.8× at
-8 KiB. With the MAC at 3.6 GB/s the AEAD's limiter is now `ChaCha20.xor`'s
-stack-buffer-plus-bytewise-XOR loop (1.06 GB/s vs 2.17 GB/s for `stream`), not
-the MAC.
+1.06× at 256 B, 1.5× at 512 B, 2.0× at 1420 B, 2.5× at 8 KiB; full AEAD 2.8× at
+8 KiB and 2.6× for a 1420-byte packet.
+
+`ChaCha20.xor` is **fused**: whole `wide`-block groups are transposed straight
+out of the `@Vector` state into 64-byte vectors, XORed against unaligned loads of
+the input and stored, with no `[64 * wide]u8` staging buffer. The staged shape it
+replaced was worse than an extra copy — its `out[j] = in[j] ^ ks[j]` loop was not
+vectorised at all, because `out` may alias `in`, so it emitted one
+`movzbl`/`xor`/`mov` per byte and held `xor` to 1102 MB/s against `stream`'s
+2219. Fused it reaches 2383 MB/s, and the AEAD 845 → 1406 MB/s at 8 KiB.
+
+Only the sub-group tail still stages, and it generates one *whole* `wide` group
+and discards the unused blocks: a wide group costs roughly what a single `N = 1`
+block costs, so this wins for any tail longer than one block. The discarded lanes
+may carry block counters past 2^32-1 through the `+% iota`; those bytes are never
+emitted, so the anti-wrap guarantee is unaffected. This is most of the 1420-byte
+gain (542 → 1127 MB/s), which is the size that matters for the per-packet case.
+
+`xor` requires `out` and `in` to be either the same slice (in-place) or disjoint;
+partially overlapping slices are not supported, matching std's block-buffered
+`xor`. In-place is covered by tests at every length 0..1024.
 
 ## Constant-time
 

@@ -59,9 +59,11 @@ median of three runs:
 
 | what | ours | std | |
 |---|---:|---:|---:|
-| ChaCha20 keystream | 2165 MB/s | 1402 MB/s | **1.5×** |
-| Poly1305 MAC | 3653 MB/s | 1440 MB/s | **2.6×** |
-| full AEAD encrypt | 808 MB/s | 460 MB/s | **1.8×** |
+| ChaCha20 keystream | 2355 MB/s | 1450 MB/s | **1.6×** |
+| ChaCha20 xor (fused) | 2383 MB/s | 718 MB/s | **3.3×** |
+| Poly1305 MAC | 3892 MB/s | 1443 MB/s | **2.7×** |
+| full AEAD encrypt | 1406 MB/s | 502 MB/s | **2.8×** |
+| AEAD, 1420 B packet | 1127 MB/s | 441 MB/s | **2.6×** |
 
 Poly1305 is lane-parallel above a size threshold and std's scalar core below it,
 so the MAC speedup is size-dependent — and deliberately never a *loss*:
@@ -70,10 +72,17 @@ so the MAC speedup is size-dependent — and deliberately never a *loss*:
 |---|---:|---:|---:|---:|---:|---:|---:|
 | ours vs std | 1.0× | 0.98× | 1.06× | 1.53× | 2.0× | 2.4× | 2.5× |
 
-**The AEAD's own bottleneck has moved.** With the MAC at 3.6 GB/s the limiter is
-now `ChaCha20.xor`, which stages the keystream through a stack buffer and XORs it
-byte-wise (1056 MB/s, against 2165 for `stream` writing straight to the output).
-Fusing that is the next AEAD-throughput item, not more MAC work.
+**The XOR is fused.** `ChaCha20.xor` used to stage the keystream into a stack
+buffer and then XOR it byte-wise; that loop was not vectorised at all (LLVM could
+not prove `out` does not alias `in`, and emitted one `movzbl`/`xor`/`mov` per
+byte), so `xor` ran at 1102 MB/s against 2219 for `stream`. Each block group is
+now transposed straight out of the `@Vector` state into 64-byte vectors, XORed
+against unaligned loads and stored — no intermediate keystream bytes. `xor` went
+1102 → 2383 MB/s, the 8 KiB AEAD 845 → 1406, and a 1420-byte packet 542 → 1127.
+
+Cipher (~2.4 GB/s) and MAC (~3.9 GB/s) in series predict ~1.47 GB/s, which is
+what the AEAD measures — neither side has slack left. Further gains need a wider
+block group (AVX-512) or interleaving the two passes, not another local fix.
 
 ## Verify
 
@@ -85,7 +94,11 @@ zig build test-chachapoly -Doptimize=ReleaseFast   # ReleaseFast (UB checks)
 Tests cover the RFC 8439 §2.3.2 / §2.4.2 / §2.5.2 / §2.8.2 KATs, the eleven
 RFC 8439 §A.3 Poly1305 vectors at every lane width, a differential against the
 `std` AEAD across block-boundary edge lengths (seal/open/cross-decrypt /
-tamper-reject), a `>8`-block counter-increment boundary case, and a
+tamper-reject), a `>8`-block counter-increment boundary case, a byte-exact
+ChaCha20 `xor`/`stream` differential against `std` for **every** length 0..1024
+(the fused path's tail can be any of 0..511 bytes), the in-place case
+(`out == in`) at every one of those lengths plus in-place AEAD, an
+unaligned-offset sweep over all 64×64 input/output offset pairs, and a
 length-by-length Poly1305 differential against `std` for **every** length
 0..2048 at L ∈ {1,2,4,8}.
 
