@@ -65,6 +65,10 @@ pub const tlsprofile = @import("tlsprofile.zig");
 pub const buildAuthenticatedFrame = goose.build;
 /// IEC 62351-6: parse and authenticate a GOOSE/SV frame.
 pub const verifyFrame = goose.verify;
+/// The per-publisher GMAC IV counter every `.aes_gmac_*` sealer needs
+/// (NIST SP 800-38D §8.2.1). Re-exported because a caller who does not find it
+/// invents a constant, which voids the authentication entirely.
+pub const GmacIvCounter = goose.IvCounter;
 /// IEC 62351-6 §6.2 replay guards.
 pub const GooseReplayGuard = replay.GooseGuard;
 pub const SvReplayGuard = replay.SvGuard;

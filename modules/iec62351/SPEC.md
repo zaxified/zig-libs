@@ -257,6 +257,30 @@ comparison isolated in one function.
   so the *policy* ("we only accept authenticated frames") is the caller's to
   enforce and is easy to enforce correctly — but it is a policy, not a
   cryptographic guarantee.
+- **A publisher that repeats a GMAC IV across a restart.** This is the module's
+  sharpest edge and it is stated here because the rest of this list used to look
+  exhaustive without it. GMAC is GCM with an empty plaintext, so a repeated
+  (key, IV) pair is not a degradation: two tags under one pair give a polynomial
+  in the GHASH subkey `H`, and an attacker who solves it forges a valid tag for
+  **any** frame — everything this module provides, gone. Under IEC 62351-9 the
+  key is a *group* key held by every IED on the segment, so an IV scheme that is
+  not explicitly partitioned per publisher repeats by default rather than by
+  accident.
+  What the module now does: `build` will not accept a bare IV at all. It takes an
+  `IvSource`, either `IvCounter` — NIST SP 800-38D §8.2.1's deterministic
+  construction, `fixed` (per-publisher, 32 bits) ‖ `invocation` (a counter that
+  refuses at §8.3's 2^32-per-key cap rather than wrapping) — or the explicitly
+  named `asserted_unique` escape for a counter the module does not own (an HSM,
+  a gateway, a frozen test vector).
+  What it still cannot do: make the counter survive a reboot. A publisher that
+  restarts `invocation` at 0 under an unchanged group key reissues every IV it
+  has already spent, and no receiver-side check here would notice. **Persist the
+  counter, or treat every restart as a rekey.** Note the IV construction is SP
+  800-38D's — the cipher specification's own requirement — not text quoted from
+  IEC 62351-6, which this module was not built from; it is interoperable
+  regardless, because the IV travels in the extension and no receiver has to
+  reproduce it. Tests: `GMAC IV: no (key, IV) pair is ever emitted twice, across
+  publishers of one group key` and its fixed-IV positive control.
 - **Key management.** No key derivation, distribution, rollover or revocation.
   `time_of_current_key`/`time_to_next_key`/`key_id` are carried and returned to
   the caller; acting on them is IEC 62351-9 / RFC 8052 GDOI territory and is not

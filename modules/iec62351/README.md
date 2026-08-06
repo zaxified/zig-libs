@@ -89,8 +89,36 @@ const r = goose.verify(received, .ed2020, .{
 | `.hmac_sha256_80` | 10 octets | |
 | `.hmac_sha256_128` | 16 octets | |
 | `.hmac_sha256_256` | 32 octets | |
-| `.aes_gmac_64` | 8 octets | needs a 12-octet IV in the extension |
-| `.aes_gmac_128` | 16 octets | needs a 12-octet IV |
+| `.aes_gmac_64` | 8 octets | needs an `IvSource` (see below) |
+| `.aes_gmac_128` | 16 octets | needs an `IvSource` (see below) |
+
+#### The GMAC IV is not a free parameter
+
+A repeated (key, IV) pair under GMAC leaks the GHASH subkey and lets an attacker
+forge a tag for **any** frame — and 62351-9 hands the *same* group key to every
+IED on the segment, so an IV that is not partitioned per publisher repeats by
+default. `build` therefore refuses a bare IV and takes an `IvSource`:
+
+```zig
+// Once per publisher, per key. `fixed` must be unique among the devices
+// holding this key (APPID, or an index the SCL/KDC assigns).
+var iv_counter = goose.IvCounter.init(0x3001);
+
+const frame = try goose.build(&frame_buf, .{
+    .appid      = 0x3001,
+    .apdu       = encoded_goose_pdu,
+    .auth       = .{ .key_id = 7, .tag = &.{} },   // no `.iv` here
+    .iv_source  = .{ .counter = &iv_counter },     // <- the safe path
+}, .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &key } });
+```
+
+`IvCounter` is NIST SP 800-38D §8.2.1's deterministic construction (`fixed` ‖
+`invocation`) and refuses at §8.3's 2^32-invocations-per-key cap instead of
+wrapping. **It cannot survive a reboot for you**: persist `iv_counter.invocation`,
+or take a fresh key on restart — otherwise a restart reissues every IV already
+used. `.{ .asserted_unique = iv }` is the escape for a counter this module does
+not own (HSM, gateway, frozen vector); the name is the whole contract, nothing
+checks it.
 
 Signature profiles are separate `Sealer`/`Verifier` variants, not MAC
 algorithms: `.rsa_pss_sha256` (the 2007 edition's profile, using the sibling

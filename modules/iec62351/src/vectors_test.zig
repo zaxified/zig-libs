@@ -245,9 +245,14 @@ const kat = struct {
                 .time_of_current_key = time_of_current_key,
                 .time_to_next_key = time_to_next_key,
                 .key_id = key_id,
-                .iv = if (alg.needsIv()) iv else null,
                 .tag = &.{},
             },
+            // A frozen vector is the one legitimate use of a frozen IV: the
+            // point is that these exact octets reproduce these exact tags. The
+            // `asserted_unique` name is what a *deployment* copying this must
+            // not leave in place — the frozen bytes below are unchanged by the
+            // move, which is the evidence that only the API changed.
+            .iv_source = if (alg.needsIv()) goose.IvSource{ .asserted_unique = iv } else null,
         }, .{ .mac = .{ .algorithm = alg, .key = key } });
     }
 };

@@ -38,6 +38,18 @@ pub const EpochError = error{
     EpochExhausted,
 };
 
+/// Error from `Sealer.rekey`.
+pub const RekeyError = error{
+    /// The requested `(key, epoch)` pair is one this sealer is already using:
+    /// `new_key` equals the current key and `new_epoch` does not advance past
+    /// the current epoch. Accepting it would restart `seq` at 0 inside a nonce
+    /// subspace that is already spent — keystream reuse (plaintext recovery by
+    /// XOR of two records) plus a repeated Poly1305/GHASH one-time key, which
+    /// also costs authentication. Supply a genuinely fresh key, or an epoch
+    /// strictly greater than the current one.
+    NonceSpaceReuse,
+};
+
 /// Errors from `Opener.open`.
 pub const OpenError = error{
     /// The record is shorter than the minimum (`record.overhead`).
@@ -117,7 +129,26 @@ pub fn Channel(comptime Aead: type) type {
             /// Rekey with a caller-supplied fresh key and epoch, resetting the
             /// sequence counter. The fresh key gives an independent keystream
             /// (and forward secrecy if the old key is destroyed).
-            pub fn rekey(self: *Sealer, new_key: [32]u8, new_epoch: u32) void {
+            ///
+            /// Refuses (`error.NonceSpaceReuse`, state unchanged) the one case
+            /// it can detect locally: `new_key` equal to the current key with
+            /// an epoch that does not strictly advance. That combination would
+            /// restart `seq` at 0 in a spent nonce subspace — the same hazard
+            /// `bumpEpoch`'s monotonicity rules out. A *different* key needs no
+            /// epoch ordering: an independent keystream cannot collide with the
+            /// old one whatever the epoch.
+            ///
+            /// The residual obligation the sealer cannot discharge is stated in
+            /// SPEC.md §8: it remembers only its current key, so re-installing a
+            /// key it used *earlier* (A → B → A) at a non-advancing epoch is
+            /// undetectable here, exactly as reconstructing a `Sealer` on a spent
+            /// `(key, epoch)` is.
+            pub fn rekey(self: *Sealer, new_key: [32]u8, new_epoch: u32) RekeyError!void {
+                // Constant-time in the key bytes: both operands are the caller's
+                // own secrets, and the branch outcome (not the content) is what
+                // the caller is told.
+                const same_key = std.crypto.timing_safe.eql([32]u8, new_key, self.key);
+                if (same_key and new_epoch <= self.epoch) return error.NonceSpaceReuse;
                 self.key = new_key;
                 self.epoch = new_epoch;
                 self.seq = 0;
@@ -177,7 +208,9 @@ pub fn Channel(comptime Aead: type) type {
             }
 
             /// Rekey to a caller-supplied fresh key + epoch and reset the
-            /// replay window.
+            /// replay window. Infallible, unlike `Sealer.rekey`: the receiver
+            /// emits no nonce, so there is no nonce space to spend. It only
+            /// changes which records it will accept.
             pub fn rekey(self: *Opener, new_key: [32]u8, new_epoch: u32) void {
                 self.key = new_key;
                 self.epoch = new_epoch;
@@ -431,7 +464,7 @@ test "rekey with a fresh key: old key's record no longer opens" {
     var rec_old: [record.overhead + 2]u8 = undefined;
     _ = try s.seal(&rec_old, "hi", "c");
 
-    s.rekey(testKey(20), 0);
+    try s.rekey(testKey(20), 0); // fresh key: legal at any epoch, incl. the same one
     o.rekey(testKey(20), 0);
     var pt: [2]u8 = undefined;
     // Old record (old key, epoch 0) presented to the rekeyed opener (new key,
@@ -442,6 +475,58 @@ test "rekey with a fresh key: old key's record no longer opens" {
     _ = try s.seal(&rec_new, "yo", "c");
     const m = try o.open(&pt, &rec_new, "c");
     try testing.expectEqualSlices(u8, "yo", pt[0..m]);
+}
+
+test "rekey to the SAME (key, epoch) is refused: no keystream reuse" {
+    // Regression for the wave-2 audit's F1 probe. Before the fix, `rekey` reset
+    // `seq` to 0 unconditionally, so rekey(current_key, current_epoch) re-emitted
+    // nonce (epoch 0, seq 0) and the two ciphertexts XORed to the two plaintexts
+    // XORed: full plaintext recovery from ciphertext alone, plus a repeated
+    // one-time authentication key.
+    inline for (channels) |Ch| {
+        const key = testKey(21);
+        var s = Ch.Sealer.init(key, 0);
+        const a = "AAAAAAAA";
+        const b = "BBBBBBBB";
+        var rec_a: [record.overhead + a.len]u8 = undefined;
+        _ = try s.seal(&rec_a, a, "c"); // epoch 0, seq 0
+
+        // The unsafe operation must be refused, with the sealer untouched.
+        const before_epoch = s.epoch;
+        const before_seq = s.seq;
+        if (s.rekey(key, 0)) |_| {
+            // Only reachable if the guard is gone. Then the oracle below is the
+            // real one: seal again and show the keystream repeated.
+            var rec_b: [record.overhead + b.len]u8 = undefined;
+            _ = try s.seal(&rec_b, b, "c");
+            const ct_a = rec_a[record.header_len..][0..a.len];
+            const ct_b = rec_b[record.header_len..][0..b.len];
+            var reused = true;
+            for (ct_a, ct_b) |x, y| {
+                if (x ^ y != 'A' ^ 'B') reused = false;
+            }
+            try testing.expect(!reused); // keystream reuse — must never happen
+            return error.RekeyAcceptedASpentNonceSpace;
+        } else |e| {
+            try testing.expectEqual(RekeyError.NonceSpaceReuse, e);
+        }
+        try testing.expectEqual(before_epoch, s.epoch); // state unchanged
+        try testing.expectEqual(before_seq, s.seq);
+
+        // A lower epoch under the same key is the same hazard.
+        var s2 = Ch.Sealer.init(key, 7);
+        try testing.expectError(error.NonceSpaceReuse, s2.rekey(key, 6));
+        try testing.expectError(error.NonceSpaceReuse, s2.rekey(key, 7));
+        try testing.expectEqual(@as(u32, 7), s2.epoch);
+
+        // The two safe shapes still work: same key with a strictly greater
+        // epoch (bumpEpoch's rule), and a different key at any epoch.
+        try s2.rekey(key, 8);
+        try testing.expectEqual(@as(u32, 8), s2.epoch);
+        try testing.expectEqual(@as(u64, 0), s2.seq);
+        try s2.rekey(testKey(22), 0);
+        try testing.expectEqual(@as(u32, 0), s2.epoch);
+    }
 }
 
 // ── KAT: the framing is byte-anchored, not merely self-consistent ─────────────

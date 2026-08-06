@@ -292,6 +292,13 @@ pub const AuthenticationValue = struct {
     time_to_next_key: u16 = 0,
     /// GMAC/GCM initialisation vector; `null` for the HMAC and signature
     /// profiles.
+    ///
+    /// **A repeat of this value under one key destroys the module's entire
+    /// guarantee**, so it is *not* a free parameter: on the sending side it is
+    /// produced by `IvSource` (`build` refuses a frame whose caller filled this
+    /// field in), and on the receiving side it is a parse output only. See
+    /// `IvCounter` for the construction and why a 62351-9 *group* key makes
+    /// this the module's sharpest edge.
     iv: ?[12]u8 = null,
     /// Key identifier assigned by the key-distribution centre.
     key_id: u32 = 0,
@@ -416,6 +423,118 @@ pub const MacAlgorithm = enum(u8) {
         return switch (a) {
             .aes_gmac_64, .aes_gmac_128 => true,
             else => false,
+        };
+    }
+};
+
+// ── the GMAC IV, and why it is not a free parameter ─────────────────────────
+
+/// Errors from `IvCounter` / `IvSource`.
+pub const IvError = error{
+    /// This key's GMAC invocation budget is spent. NIST SP 800-38D §8.3 caps
+    /// the number of invocations of the authenticated-encryption function
+    /// under one key at 2^32; past that the construction's own security
+    /// argument no longer holds, so the counter refuses rather than continuing
+    /// (and *far* rather than wrapping, which would repeat an IV). Take a new
+    /// group key from the 62351-9 key-distribution centre.
+    IvSpaceExhausted,
+};
+
+/// SP 800-38D §8.3's per-key invocation cap.
+pub const gmac_max_invocations: u64 = 1 << 32;
+
+/// The 96-bit AES-GMAC IV, built the way GCM's own specification requires.
+///
+/// **Why this type exists.** GMAC is GCM with an empty plaintext, so it
+/// inherits GCM's one absolute rule: an (key, IV) pair must never be used
+/// twice. A repeat is not a degradation — two tags under the same pair give a
+/// polynomial in the GHASH subkey `H`, an attacker solves it, and from then on
+/// forges a valid tag for **any** frame. That is the whole of what this module
+/// provides, gone. The exposure is structural in IEC 62351-6 rather than
+/// theoretical: 62351-9 distributes a *group* key, so every IED on the segment
+/// holds the same key and "two publishers happened to pick the same IV" is not
+/// unlikely, it is the default outcome of any construction that is not
+/// explicitly partitioned per device.
+///
+/// **The construction** is NIST SP 800-38D §8.2.1, the *deterministic*
+/// construction, which is what a device with no reliable randomness (an IED)
+/// must use:
+///
+/// ```
+///   IV = fixed field (32 bits, big-endian)  ‖  invocation field (64 bits, BE)
+/// ```
+///
+/// - `fixed` identifies the *publisher*, and **must be distinct for every
+///   device that holds this key**. Under a group key nothing else keeps two
+///   publishers apart. The APPID, or an index the SCL/KDC assigns, is the
+///   natural source; the module cannot derive it, so it is an argument.
+/// - `invocation` is a strictly increasing counter, never reset while the key
+///   is unchanged. `next` refuses at the SP 800-38D cap instead of wrapping.
+///
+/// **The obligation this type cannot discharge** is persistence across a
+/// restart: a publisher that reboots and restarts `invocation` at 0 under the
+/// same group key repeats every IV it has already used. Either persist the
+/// counter, or treat a restart as a rekey. This is stated here, in SPEC.md's
+/// threat model, and in the README, because it is the one part of the rule an
+/// integrator can get wrong while using the safe API.
+///
+/// **Provenance.** IEC 62351-6:2020 names the GMAC algorithms; the IV
+/// construction here is SP 800-38D's, i.e. the one the cipher's own
+/// specification mandates, not text quoted from the IEC standard (which this
+/// module was not built from — see SPEC.md's provenance section). It is
+/// interoperable by construction: the IV travels in the extension, so a
+/// receiver never has to reproduce it.
+pub const IvCounter = struct {
+    /// SP 800-38D's fixed field — the per-publisher partition (see above).
+    fixed: u32,
+    /// SP 800-38D's invocation field. Public for persistence: a publisher that
+    /// stores this across a restart keeps its guarantee; one that does not,
+    /// must rekey on restart.
+    invocation: u64 = 0,
+
+    /// `publisher` must be unique among every device holding this key.
+    pub fn init(publisher: u32) IvCounter {
+        return .{ .fixed = publisher };
+    }
+
+    /// The next never-before-used IV under the current key.
+    pub fn next(self: *IvCounter) IvError![12]u8 {
+        if (self.invocation >= gmac_max_invocations) return error.IvSpaceExhausted;
+        var iv: [12]u8 = undefined;
+        std.mem.writeInt(u32, iv[0..4], self.fixed, .big);
+        std.mem.writeInt(u64, iv[4..12], self.invocation, .big);
+        self.invocation += 1;
+        return iv;
+    }
+
+    /// Restart the invocation field. Legitimate **only** when the key itself
+    /// has changed — the counter's uniqueness claim is per key, so calling
+    /// this without a new key reissues every IV already spent.
+    pub fn rekeyed(self: *IvCounter) void {
+        self.invocation = 0;
+    }
+};
+
+/// Where `build` gets the GMAC IV. Required for the `.aes_gmac_*` algorithms
+/// (and any `RawSealer` declaring `needs_iv`), refused for every other
+/// profile. There is deliberately no default: before this type existed the IV
+/// was a plain `[12]u8` on `BuildParams.auth` with no contract attached, and
+/// the obvious thing to write there — a constant — silently voids the module.
+pub const IvSource = union(enum) {
+    /// The safe path: SP 800-38D §8.2.1 deterministic construction, owned by
+    /// this module.
+    counter: *IvCounter,
+    /// Escape hatch for a counter this module does not own — an HSM, a
+    /// gateway that already allocates IVs, a frozen test vector. The name is
+    /// the contract: the caller asserts, on its own authority, that this exact
+    /// value has never been used under this key and never will be again.
+    /// Nothing here checks it.
+    asserted_unique: [12]u8,
+
+    pub fn take(source: IvSource) IvError![12]u8 {
+        return switch (source) {
+            .counter => |c| try c.next(),
+            .asserted_unique => |iv| iv,
         };
     }
 };
@@ -602,11 +721,15 @@ pub const EncodeError = error{
     BufferTooSmall,
     /// A GMAC algorithm was selected without an IV in the authentication value.
     IvRequired,
-    /// An IV was supplied for an algorithm that takes none (or vice versa).
+    /// The IV supplied to `build` does not match what the sealer needs: an
+    /// `iv_source` for a profile that takes no IV, no `iv_source` for one that
+    /// does, or an IV written straight into `auth.iv` (which is a *parse*
+    /// output — on the build side the IV comes from `IvSource`, so that its
+    /// uniqueness contract cannot be bypassed by filling in a struct field).
     IvMismatch,
 };
 
-pub const SealError = EncodeError || MacError || ber.Error ||
+pub const SealError = EncodeError || MacError || ber.Error || IvError ||
     error{ SignatureFailed, UnsupportedAlgorithm };
 
 pub const BuildParams = struct {
@@ -618,8 +741,13 @@ pub const BuildParams = struct {
     /// (e.g. IEC 61850-8-1's simulation bit under a profile that keeps it).
     reserved1_extra: u16 = 0,
     header: HeaderProfile = .ed2020,
-    /// Everything but `tag`, which this function fills in.
+    /// Everything but `tag` and `iv`, which this function fills in.
     auth: AuthenticationValue = .{ .tag = &.{} },
+    /// Where the GMAC IV comes from. Mandatory for the `.aes_gmac_*`
+    /// algorithms and for a `RawSealer` that declares `needs_iv`; must be
+    /// `null` otherwise. See `IvCounter` — under a 62351-9 group key this is
+    /// the single parameter that can void the whole guarantee.
+    iv_source: ?IvSource = null,
 };
 
 /// Build an authenticated frame into `out` and return the written slice.
@@ -632,9 +760,14 @@ pub const BuildParams = struct {
 pub fn build(out: []u8, params: BuildParams, sealer: Sealer) SealError![]u8 {
     const tag_len = sealer.tagLen();
     if (tag_len == 0) return error.UnsupportedAlgorithm;
-    if (sealer.needsIv() != (params.auth.iv != null)) return error.IvMismatch;
+    // The IV is a sealer-side decision with a uniqueness contract (`IvSource`),
+    // not a field a caller fills in: refuse both a hand-written `auth.iv` and a
+    // presence disagreement between the profile and the source.
+    if (params.auth.iv != null) return error.IvMismatch;
+    if (sealer.needsIv() != (params.iv_source != null)) return error.IvMismatch;
 
     var auth = params.auth;
+    auth.iv = if (params.iv_source) |source| try source.take() else null;
     var tag_buf: [rsa.max_modulus_len]u8 = undefined;
     if (tag_len > tag_buf.len) return error.BufferTooSmall;
     auth.tag = tag_buf[0..tag_len];
@@ -739,6 +872,11 @@ const sample_key = [_]u8{
 };
 
 fn buildSample(out: []u8, algorithm: MacAlgorithm, key: []const u8) ![]u8 {
+    // The sample is the thing an integrator copies, so it takes the safe path:
+    // a per-publisher counter, seeded with this publisher's APPID as SP
+    // 800-38D's fixed field. (It used to hand `build` the constant IV
+    // `0x11 ** 12`, which is exactly the mistake `IvCounter` exists to stop.)
+    var iv_counter = IvCounter.init(0x3001);
     return build(out, .{
         .appid = 0x3001,
         .apdu = &sample_apdu,
@@ -746,9 +884,9 @@ fn buildSample(out: []u8, algorithm: MacAlgorithm, key: []const u8) ![]u8 {
             .time_of_current_key = 0x5f00_0000,
             .time_to_next_key = 60,
             .key_id = 0x0000_0007,
-            .iv = if (algorithm.needsIv()) [_]u8{0x11} ** 12 else null,
             .tag = &.{},
         },
+        .iv_source = if (algorithm.needsIv()) .{ .counter = &iv_counter } else null,
     }, .{ .mac = .{ .algorithm = algorithm, .key = key } });
 }
 
@@ -1016,6 +1154,106 @@ test "IV presence must match the algorithm in both directions" {
         .apdu = &sample_apdu,
         .auth = .{ .key_id = 1, .iv = [_]u8{0} ** 12, .tag = &.{} },
     }, .{ .mac = .{ .algorithm = .hmac_sha256_128, .key = &sample_key } }));
+}
+
+test "GMAC IV: no (key, IV) pair is ever emitted twice, across publishers of one group key" {
+    // Regression for the wave-2 audit's F1. The IV used to be a plain
+    // caller-supplied `[12]u8` with no contract, and the module's own sample
+    // handed it the constant `0x11 ** 12`. Under a 62351-9 *group* key, two
+    // publishers doing that repeat the pair immediately, which leaks GHASH's
+    // subkey H and yields universal forgery.
+    //
+    // The oracle is deliberately the wire, not the counter: the IV is read back
+    // out of each built frame via `verify`, because that is the value an
+    // attacker sees.
+    var out: [512]u8 = undefined;
+    const group_key = [_]u8{0x2a} ** 16; // ONE key, shared by the segment
+    var seen = std.AutoHashMap([12]u8, void).init(testing.allocator);
+    defer seen.deinit();
+
+    for ([_]u32{ 0x3001, 0x3002 }) |publisher| {
+        var counter = IvCounter.init(publisher);
+        for (0..256) |_| {
+            const frame = try build(&out, .{
+                .appid = @intCast(publisher & 0xffff),
+                .apdu = &sample_apdu,
+                .auth = .{ .key_id = 7, .tag = &.{} },
+                .iv_source = .{ .counter = &counter },
+            }, .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &group_key } });
+            const r = try verify(frame, .ed2020, .{
+                .mac = .{ .algorithm = .aes_gmac_128, .key = &group_key },
+            });
+            const iv = r.auth.iv.?;
+            try testing.expect(!seen.contains(iv)); // the whole guarantee
+            try seen.put(iv, {});
+        }
+        try testing.expectEqual(@as(u64, 256), counter.invocation);
+    }
+    // 512 frames, 512 distinct IVs: the fixed field kept the two publishers
+    // apart and the invocation field kept each publisher's frames apart.
+    try testing.expectEqual(@as(usize, 512), seen.count());
+}
+
+test "positive control: a fixed IV repeats, which is what the counter prevents" {
+    // Sentinel proving the test above has teeth: the same loop with a constant
+    // IV — the module's own pre-fix sample value — emits the same (key, IV)
+    // pair twice. `asserted_unique` carries its promise in its name because
+    // nothing here can check it.
+    var out: [512]u8 = undefined;
+    var ivs: [2][12]u8 = undefined;
+    for (&ivs) |*slot| {
+        const frame = try build(&out, .{
+            .appid = 0x3001,
+            .apdu = &sample_apdu,
+            .auth = .{ .key_id = 7, .tag = &.{} },
+            .iv_source = .{ .asserted_unique = [_]u8{0x11} ** 12 },
+        }, .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 } });
+        const r = try verify(frame, .ed2020, .{
+            .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 },
+        });
+        slot.* = r.auth.iv.?;
+    }
+    try testing.expect(std.mem.eql(u8, &ivs[0], &ivs[1]));
+}
+
+test "GMAC IV: build refuses every way of not having a unique-IV source" {
+    var out: [512]u8 = undefined;
+    const gmac: Sealer = .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 } };
+    // (a) No source at all.
+    try testing.expectError(error.IvMismatch, build(&out, .{
+        .appid = 1,
+        .apdu = &sample_apdu,
+        .auth = .{ .key_id = 1, .tag = &.{} },
+    }, gmac));
+    // (b) The pre-fix path: an IV written straight into the value struct,
+    // bypassing the contract. Refused even though the octets are well-formed.
+    try testing.expectError(error.IvMismatch, build(&out, .{
+        .appid = 1,
+        .apdu = &sample_apdu,
+        .auth = .{ .key_id = 1, .iv = [_]u8{0x11} ** 12, .tag = &.{} },
+    }, gmac));
+    // (c) A source for a profile that takes none — and the counter must not be
+    // drawn down by a call that fails.
+    var c = IvCounter.init(1);
+    try testing.expectError(error.IvMismatch, build(&out, .{
+        .appid = 1,
+        .apdu = &sample_apdu,
+        .auth = .{ .key_id = 1, .tag = &.{} },
+        .iv_source = .{ .counter = &c },
+    }, .{ .mac = .{ .algorithm = .hmac_sha256_128, .key = &sample_key } }));
+    try testing.expectEqual(@as(u64, 0), c.invocation);
+}
+
+test "GMAC IV: the counter refuses at SP 800-38D's per-key invocation cap" {
+    var c = IvCounter.init(0xdead_beef);
+    c.invocation = gmac_max_invocations - 1;
+    const last = try c.next();
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    }, &last);
+    // Refused, not wrapped: a wrapped invocation field repeats every IV.
+    try testing.expectError(error.IvSpaceExhausted, c.next());
+    try testing.expectEqual(gmac_max_invocations, c.invocation);
 }
 
 test "AuthenticationValue: encode/parse round-trip with and without an IV" {

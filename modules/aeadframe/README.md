@@ -68,7 +68,10 @@ Contracts (full detail in [SPEC.md](SPEC.md)):
 - **Rekey / epoch.** `bumpEpoch` keeps the key and advances the epoch (reset
   `seq`, fresh window) — nonce-safe because the epoch is *in* the nonce and
   strictly increases. `rekey(new_key, epoch)` installs a caller-supplied fresh
-  key (adds forward secrecy). An old-epoch record is rejected
+  key (adds forward secrecy) and refuses with `error.NonceSpaceReuse` if asked
+  to re-install the *current* key at an epoch that does not advance — that
+  would reset `seq` inside a spent nonce space (see SPEC.md §4 for the one
+  residual case it cannot see). An old-epoch record is rejected
   (`error.EpochMismatch`); a new-epoch record may reuse an old `seq` because it
   maps to a fresh nonce.
 - **AAD binding.** The `aad` is authenticated into the tag; a record sealed

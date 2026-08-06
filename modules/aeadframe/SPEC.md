@@ -88,7 +88,9 @@ Two rekey paths, both nonce-safe, chosen by policy:
 - **`rekey(new_key, new_epoch)` — new key.** A fresh key gives an independent
   keystream, so nonce reuse across the boundary is impossible regardless of
   epoch numbering, and (if the old key is destroyed) it provides forward
-  secrecy. This is the recommended production path.
+  secrecy. This is the recommended production path. Because `rekey` also resets
+  `seq` to 0, it is safe **only** when the `(key, epoch)` pair it installs is
+  unspent; the sealer enforces the part of that it can see (below).
 - **`bumpEpoch()` — same key, epoch += 1, `seq` reset to 0.** Nonce-safe
   because the epoch is embedded in the nonce and strictly increases: epoch 0
   uses nonces `00000000·{0,1,…}`, epoch 1 uses `00000001·{0,1,…}`, and the two
@@ -101,8 +103,24 @@ The coordinator's brief flagged "reset the sequence counter to 0 on rekey" as a
 potential nonce-reuse trap. It is **safe here specifically because the epoch is
 part of the nonce and is monotone** — resetting `seq` to 0 under a *new* epoch
 (or a new key) lands in a fresh nonce subspace. Resetting `seq` while keeping
-both key *and* epoch unchanged would be the unsafe version; the API offers no
-such operation.
+both key *and* epoch unchanged is the unsafe version, and `Sealer.rekey` — the
+one entry point that could express it — **refuses it**: if `new_key` equals the
+current key and `new_epoch` does not strictly advance past the current epoch,
+it returns `error.NonceSpaceReuse` with the sealer's state untouched. `seal`
+and `bumpEpoch` cannot express it at all (both are strictly increasing and
+refuse at their ceilings), so no sequence of calls on a live `Sealer` emits a
+nonce twice, with the single exception recorded in §8 (re-installing a key this
+sealer used *earlier*).
+
+Note the asymmetry with a *different* key: `rekey` imposes no epoch ordering
+there, because an independent key gives an independent keystream and the epoch
+field is then irrelevant to collision. `Opener.rekey` stays infallible — a
+receiver emits no nonce, so it has no nonce space to spend.
+
+> History: until this guard existed, `SPEC.md` asserted at this point that "the
+> API offers no such operation", while `Sealer.rekey` accepted exactly it and
+> silently reset `seq`. The sentence is corrected rather than deleted so the
+> claim and the check are visibly the same statement.
 
 On the receive side, an epoch change (`bumpEpoch`/`rekey`) **resets the replay
 window** — the old sequence numbers describe a spent nonce space and carry no
@@ -194,7 +212,13 @@ arbitrary bytes:
 - **Cross-`Sealer` nonce uniqueness.** Guaranteed within one live `Sealer`. A
   caller that reconstructs a `Sealer` on the same `(key, epoch)` — e.g. after a
   crash without persisting `seq` — must supply a fresh key or a never-before-used
-  epoch. Durable sequence-number/epoch persistence is a caller concern.
+  epoch. Durable sequence-number/epoch persistence is a caller concern. The same
+  limit applies *within* a sealer to re-installing an earlier key: `rekey` holds
+  only the current key, so `rekey(A,0) → rekey(B,9) → rekey(A,0)` is accepted
+  even though key A's epoch 0 is spent. Detecting it would require the sealer to
+  retain every key it has held, which is the opposite of the forward secrecy
+  `rekey` exists to provide — so it is a caller obligation, stated rather than
+  enforced.
 - **Out-of-order delivery across an epoch boundary.** Records straddling a
   rekey are dropped as `EpochMismatch`; a multi-epoch opener (keeping the
   previous epoch's key+window alive during a transition window) is not built.
