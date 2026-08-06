@@ -52,6 +52,19 @@ pub const Error = response.Error || command.Error || error{
     ServerClosed,
     /// A continuation request was expected and something else came back.
     NoContinuation,
+    /// The server advertised `LOGINDISABLED`, so RFC 9051 §6.2.3 forbids
+    /// issuing `LOGIN` at all. Run `startTls` first (the capability is
+    /// normally withdrawn once the link is encrypted).
+    LoginDisabled,
+    /// `login` was called on a link this client has not seen encrypted and
+    /// `Options.allow_plaintext_auth` is false. See that option.
+    PlaintextAuth,
+    /// Bytes were already buffered from the server when the STARTTLS
+    /// handshake was about to start — they arrived in the clear, before any
+    /// peer was authenticated, so they are treated as injected and the
+    /// upgrade is refused. Same posture and same spelling as the sibling
+    /// `smtp` module's guard.
+    PlaintextInjection,
 };
 
 /// RFC 9051 §3.
@@ -91,6 +104,17 @@ pub const Options = struct {
     /// unsolicited EXISTS, anything unparsed).
     on_unilateral: ?UnilateralFn = null,
     unilateral_ctx: ?*anyopaque = null,
+    /// Permit `login` on a link this client has not seen encrypted.
+    ///
+    /// `LOGIN` transmits the password as a plain astring, so on a cleartext
+    /// link it is handed to anyone on the path. Default **false**: `login`
+    /// refuses with `error.PlaintextAuth` unless `startTls`/`tlsEstablished`
+    /// has run or the caller opts in here. The opt-in is for the cases where
+    /// the transport is already trusted and this client cannot know it — a
+    /// unix socket, a loopback test server, a tunnel the caller established.
+    /// Mirrors `smtp`'s `Session.Options.allow_plaintext_auth`, including the
+    /// default.
+    allow_plaintext_auth: bool = false,
 };
 
 pub const Client = struct {
@@ -111,6 +135,12 @@ pub const Client = struct {
     /// The real error behind `command.Error.SyncFailed`, which cannot travel
     /// through the encoder's callback signature.
     sync_err: ?Error = null,
+    /// The server answered `STARTTLS` with OK and nothing was buffered
+    /// across the boundary — `tlsEstablished` may be called.
+    tls_negotiated: bool = false,
+    /// `tlsEstablished` has run: the streams this client writes to and reads
+    /// from are the caller's encrypted ones. Gates `login`.
+    tls_active: bool = false,
 
     pub fn init(
         gpa: Allocator,
@@ -346,12 +376,85 @@ pub const Client = struct {
         return c.expectOk(tag);
     }
 
+    /// `STARTTLS` (RFC 9051 §6.2.1), step 1 of 2: send the command and read
+    /// its completion. On success the caller performs the TLS handshake on
+    /// its own transport and then calls `tlsEstablished` with the upgraded
+    /// streams — this client owns no socket, so it cannot do the handshake
+    /// itself (divergence D6).
+    ///
+    /// Two things this does that a bare `enc.startTls` would not:
+    ///
+    /// **It refuses buffered plaintext.** Once the server has said OK it must
+    /// send nothing further until the TLS handshake; anything already in the
+    /// reader arrived in the clear from an unauthenticated peer and would be
+    /// replayed as if it had come from inside the tunnel. That is the 2011
+    /// STARTTLS command/response-injection class (CVE-2011-0411 and
+    /// relatives), and it is refused with `error.PlaintextInjection` —
+    /// the same guard, and the same spelling, as `smtp/src/client.zig`.
+    /// The check is exactly as strong as the reader's buffer: bytes still in
+    /// the kernel socket queue are not visible here, so a caller reading
+    /// through an unbuffered stream gets no protection from it. That is the
+    /// same ceiling `smtp`'s `parser.atBoundary()` has.
+    ///
+    /// **It does not upgrade anything by itself.** `tls_active` stays false
+    /// until `tlsEstablished` runs, so `login` keeps refusing in between.
+    pub fn startTls(c: *Client) Error!Completion {
+        c.arm();
+        if (c.tls_active or c.tls_negotiated) return error.BadState;
+        // §6.2.1: only valid in the not-authenticated state.
+        if (c.state != .not_authenticated) return error.BadState;
+
+        const tag = try c.tagger.next(c.gpa);
+        defer c.gpa.free(tag);
+        try c.enc.startTls(tag);
+        c.enc.w.flush() catch return error.WriteFailed;
+        const done = try c.expectOk(tag);
+
+        if (c.rd.d.r.bufferedLen() != 0) return error.PlaintextInjection;
+        c.tls_negotiated = true;
+        return done;
+    }
+
+    /// `STARTTLS` step 2 of 2: adopt the caller's upgraded streams and redo
+    /// capability discovery.
+    ///
+    /// RFC 9051 §6.2.1 requires the client to **discard** the capability list
+    /// it learned before the handshake — it came from an unauthenticated peer
+    /// and a downgrade attacker could have written it. This drops the whole
+    /// set *and* the encoder policy derived from it (`literal_plus`,
+    /// `literal_minus`, `quoted_utf8` — `setCaps` derives all three), then
+    /// re-issues `CAPABILITY` over the encrypted link and takes the answer
+    /// from there. Returns that command's completion.
+    pub fn tlsEstablished(c: *Client, r: *std.Io.Reader, w: *std.Io.Writer) Error!Completion {
+        if (!c.tls_negotiated) return error.BadState;
+        c.rd.d.r = r;
+        c.enc.w = w;
+        // §6.2.1 discard: the pre-TLS list and everything derived from it.
+        c.freeCaps();
+        c.enc.opts.literal_plus = false;
+        c.enc.opts.literal_minus = false;
+        c.enc.opts.quoted_utf8 = false;
+        c.tls_active = true;
+        c.tls_negotiated = false;
+        return c.capability();
+    }
+
     /// `LOGIN`. Only legal before authentication — after it, the server is
     /// required to reject it, so this refuses locally rather than sending a
     /// command that leaks a password into a session that cannot use it.
+    ///
+    /// Two more refusals, both about not handing the password to the wrong
+    /// party. `LOGINDISABLED` (RFC 9051 §6.2.3) is the server stating that
+    /// `LOGIN` is not permitted on this link — a client MUST NOT issue it,
+    /// and the module already parsed the capability, it simply never
+    /// consulted it. And an unencrypted link needs
+    /// `Options.allow_plaintext_auth`, because `LOGIN` puts the password on
+    /// the wire in the clear.
     pub fn login(c: *Client, user: []const u8, pass: []const u8) Error!Completion {
         c.arm();
         if (c.state != .not_authenticated) return error.BadState;
+        if (c.hasCap("LOGINDISABLED")) return error.LoginDisabled;
+        if (!c.tls_active and !c.opts.allow_plaintext_auth) return error.PlaintextAuth;
 
         const tag = try c.tagger.next(c.gpa);
         defer c.gpa.free(tag);
@@ -603,7 +706,7 @@ const Peer = struct {
 test "RFC 9051 §6.1.1 + §6.2.3 + §6.3.2: greet, capability, login, select" {
     var p: Peer = undefined;
     p.init("* OK [CAPABILITY IMAP4rev2 STARTTLS] Service Ready\r\n" ++
-        "* CAPABILITY IMAP4rev2 STARTTLS LOGINDISABLED\r\n" ++
+        "* CAPABILITY IMAP4rev2 STARTTLS AUTH=PLAIN\r\n" ++
         "T1 OK CAPABILITY completed\r\n" ++
         "T2 OK LOGIN completed\r\n" ++
         "* 172 EXISTS\r\n" ++
@@ -613,7 +716,13 @@ test "RFC 9051 §6.1.1 + §6.2.3 + §6.3.2: greet, capability, login, select" {
         "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\n" ++
         "T3 OK [READ-WRITE] SELECT completed\r\n");
 
-    var c = p.client(.{});
+    // The link is a scripted in-memory pipe, not a socket, so the plaintext
+    // gate is opted out of explicitly -- exactly as the sibling `smtp`'s tests
+    // do. FIXTURE CORRECTION: this script used to advertise LOGINDISABLED on
+    // the CAPABILITY line and then log in successfully, i.e. it encoded the
+    // very defect W2-57 names, in the test whose own title cites §6.2.3. The
+    // capability moved to the dedicated refusal test below.
+    var c = p.client(.{ .allow_plaintext_auth = true });
     defer c.deinit();
 
     _ = try c.greet();
@@ -624,7 +733,8 @@ test "RFC 9051 §6.1.1 + §6.2.3 + §6.3.2: greet, capability, login, select" {
     try testing.expect(c.hasCap("IMAP4rev2"));
 
     _ = try c.capability();
-    try testing.expect(c.hasCap("LOGINDISABLED"));
+    try testing.expect(c.hasCap("AUTH=PLAIN"));
+    try testing.expect(!c.hasCap("LOGINDISABLED"));
 
     _ = try c.login("SMITH", "SESAME");
     try testing.expectEqual(State.authenticated, c.state);
@@ -646,6 +756,133 @@ test "RFC 9051 §6.1.1 + §6.2.3 + §6.3.2: greet, capability, login, select" {
     );
 }
 
+test "RFC 9051 §6.2.3: LOGINDISABLED refuses LOGIN instead of sending the password" {
+    // The capability the module has always parsed and never consulted. This
+    // assertion used to live in the test above, one line before a successful
+    // `login` on the very same connection.
+    var p: Peer = undefined;
+    p.init("* OK [CAPABILITY IMAP4rev2 STARTTLS LOGINDISABLED] Service Ready\r\n");
+
+    // Note: even with the plaintext gate opted out, LOGINDISABLED still wins —
+    // it is the server's own statement that LOGIN is not permitted here.
+    var c = p.client(.{ .allow_plaintext_auth = true });
+    defer c.deinit();
+    _ = try c.greet();
+    try testing.expect(c.hasCap("LOGINDISABLED"));
+
+    try testing.expectError(error.LoginDisabled, c.login("SMITH", "SESAME"));
+    // Nothing at all went onto the wire -- in particular not the password.
+    try testing.expectEqualStrings("", p.sent());
+    try testing.expectEqual(State.not_authenticated, c.state);
+}
+
+test "LOGIN on an unencrypted link is refused without an explicit opt-in" {
+    var p: Peer = undefined;
+    p.init("* OK [CAPABILITY IMAP4rev2 STARTTLS] Service Ready\r\n");
+
+    var c = p.client(.{}); // default: allow_plaintext_auth = false
+    defer c.deinit();
+    _ = try c.greet();
+
+    try testing.expectError(error.PlaintextAuth, c.login("SMITH", "SESAME"));
+    try testing.expectEqualStrings("", p.sent());
+    try testing.expectEqual(State.not_authenticated, c.state);
+}
+
+test "STARTTLS: §6.2.1 capability discard, and LOGIN opens up once TLS is active" {
+    // Step 1 runs over the cleartext peer and must consume it exactly: the
+    // server may not send a byte after the OK until the handshake.
+    var p1: Peer = undefined;
+    p1.init("* OK [CAPABILITY IMAP4rev2 STARTTLS LOGINDISABLED LITERAL+] Ready\r\n" ++
+        "T1 OK Begin TLS negotiation now\r\n");
+
+    var c = p1.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    try testing.expect(c.hasCap("LOGINDISABLED"));
+    try testing.expect(c.enc.opts.literal_plus); // derived from the PRE-TLS list
+
+    _ = try c.startTls();
+    try testing.expect(c.tls_negotiated);
+    try testing.expect(!c.tls_active); // not until the caller has handshaked
+    try testing.expectEqualStrings("T1 STARTTLS\r\n", p1.sent());
+
+    // Step 2: the caller hands over the upgraded streams. Everything the
+    // cleartext peer claimed must be gone -- including the encoder policy
+    // `setCaps` derived from it, which is the half that is easy to forget.
+    //
+    // The scripted server deliberately answers CAPABILITY with NO untagged
+    // list. That is what makes this test bite: `setCaps` starts with a
+    // `freeCaps`, so when the server does re-announce, the discard is
+    // invisible -- the re-announcement overwrites the stale set either way.
+    // A server that stays silent (broken, or an attacker who suppressed the
+    // line) is the case where the pre-TLS list would otherwise survive the
+    // handshake intact. Fail-closed means it must not.
+    var p2: Peer = undefined;
+    p2.init("T2 OK CAPABILITY completed\r\n" ++
+        "T3 OK LOGIN completed\r\n");
+
+    _ = try c.tlsEstablished(&p2.r, &p2.w);
+    try testing.expect(c.tls_active);
+    try testing.expect(!c.hasCap("LOGINDISABLED")); // discarded, not carried over
+    try testing.expect(!c.hasCap("STARTTLS"));
+    try testing.expect(!c.hasCap("IMAP4rev2"));
+    try testing.expectEqual(@as(usize, 0), c.caps.count());
+    try testing.expect(!c.enc.opts.literal_plus); // and so is what it implied
+    try testing.expect(!c.enc.opts.literal_minus);
+    try testing.expect(!c.enc.opts.quoted_utf8);
+
+    // ...and now LOGIN is allowed with no `allow_plaintext_auth` anywhere.
+    _ = try c.login("SMITH", "SESAME");
+    try testing.expectEqual(State.authenticated, c.state);
+    try testing.expectEqualStrings(
+        "T2 CAPABILITY\r\n" ++ "T3 LOGIN \"SMITH\" \"SESAME\"\r\n",
+        p2.sent(),
+    );
+}
+
+test "STARTTLS: the post-handshake CAPABILITY answer is what the session keeps" {
+    var p1: Peer = undefined;
+    p1.init("* OK [CAPABILITY IMAP4rev2 STARTTLS LOGINDISABLED] Ready\r\n" ++
+        "T1 OK Begin TLS negotiation now\r\n");
+
+    var c = p1.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    _ = try c.startTls();
+
+    var p2: Peer = undefined;
+    p2.init("* CAPABILITY IMAP4rev2 LITERAL+ AUTH=PLAIN\r\n" ++
+        "T2 OK CAPABILITY completed\r\n");
+    _ = try c.tlsEstablished(&p2.r, &p2.w);
+
+    try testing.expect(c.hasCap("AUTH=PLAIN"));
+    try testing.expect(!c.hasCap("LOGINDISABLED"));
+    try testing.expect(c.enc.opts.literal_plus); // re-derived from the NEW list
+}
+
+test "STARTTLS: data buffered across the handshake boundary is refused" {
+    // The 2011 STARTTLS injection class: the attacker appends a command (or a
+    // response) to the OK, in the clear, and it is replayed as if it had come
+    // from inside the tunnel. `smtp` refuses this; `imap` had no such path.
+    var p: Peer = undefined;
+    p.init("* OK [CAPABILITY IMAP4rev2 STARTTLS] Ready\r\n" ++
+        "T1 OK Begin TLS negotiation now\r\n" ++
+        "* 1 EXISTS\r\n"); // <- injected before the handshake
+
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+
+    try testing.expectError(error.PlaintextInjection, c.startTls());
+    try testing.expect(!c.tls_negotiated);
+    // And the upgrade cannot be forced through afterwards.
+    var p2: Peer = undefined;
+    p2.init("T2 OK CAPABILITY completed\r\n");
+    try testing.expectError(error.BadState, c.tlsEstablished(&p2.r, &p2.w));
+    try testing.expect(!c.tls_active);
+}
+
 test "a synchronising literal: write {n}, wait for '+', then the payload" {
     // No LITERAL+ or LITERAL- advertised, and the password holds a CRLF, so it
     // cannot be quoted. This is the handshake the encoder refuses to fake.
@@ -654,7 +891,7 @@ test "a synchronising literal: write {n}, wait for '+', then the payload" {
         "+ Ready for additional command text\r\n" ++
         "T1 OK LOGIN completed\r\n");
 
-    var c = p.client(.{});
+    var c = p.client(.{ .allow_plaintext_auth = true });
     defer c.deinit();
     _ = try c.greet();
     _ = try c.login("u", "pa\r\nss");
@@ -671,7 +908,7 @@ test "untagged data arriving before the continuation is handled, not dropped" {
         "+ go ahead\r\n" ++
         "T1 OK LOGIN completed\r\n");
 
-    var c = p.client(.{});
+    var c = p.client(.{ .allow_plaintext_auth = true });
     defer c.deinit();
     _ = try c.greet();
     _ = try c.login("u", "pa\r\nss");
@@ -685,7 +922,7 @@ test "LITERAL+ removes the handshake entirely" {
     p.init("* OK [CAPABILITY IMAP4rev2 LITERAL+] ready\r\n" ++
         "T1 OK LOGIN completed\r\n");
 
-    var c = p.client(.{});
+    var c = p.client(.{ .allow_plaintext_auth = true });
     defer c.deinit();
     _ = try c.greet();
     _ = try c.login("u", "pa\r\nss");
@@ -970,5 +1207,20 @@ test "IDLE: polling outside an IDLE, and nesting one, are both refused" {
 //     this without changing the layers below.
 //
 // D6. go-imap reconnects and upgrades in place for STARTTLS. Here the
-//     transport is the caller's, so `startTls` writes the command and the
-//     caller swaps the streams — consistent with owning no socket.
+//     transport is the caller's, so the upgrade is split in two:
+//     `Client.startTls` writes the command, reads its completion and refuses
+//     the upgrade if anything was buffered across the boundary
+//     (`error.PlaintextInjection`); the caller then performs the handshake on
+//     its own transport and hands the upgraded streams to
+//     `Client.tlsEstablished`, which discards the pre-TLS capability list per
+//     §6.2.1 and re-runs CAPABILITY. Consistent with owning no socket.
+//
+//     Until 2026-08-07 this note claimed "`startTls` writes the command and
+//     the caller swaps the streams" for a `Client` method that did not exist:
+//     only the unused `command.Encoder.startTls` did, nothing called it, and
+//     there was no capability discard, no buffered-plaintext refusal and no
+//     gate on `LOGINDISABLED`. An integrator reading the note was told a
+//     safety property the code did not have. Recorded here rather than
+//     deleted, because the shape of that mistake — a divergence note
+//     describing the design intent instead of the code — is the thing to
+//     watch for.

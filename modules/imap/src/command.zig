@@ -582,7 +582,15 @@ test "sequence-set: the grammar, not just the absence of CRLF" {
         "1 2", // a space is a second argument, not a set
         "0", // nz-number
         "01", // leading zero
-        "1:", "1,", ",1", ":2", "1::2", "4294967296", "1;2", "$1", "1 ",
+        "1:",
+        "1,",
+        ",1",
+        ":2",
+        "1::2",
+        "4294967296",
+        "1;2",
+        "$1",
+        "1 ",
     }) |bad| {
         testing.expectError(error.InvalidSequenceSet, checkSequenceSet(bad)) catch {
             std.debug.print("accepted a bad sequence-set: {s}\n", .{bad});

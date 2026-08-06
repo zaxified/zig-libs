@@ -119,6 +119,14 @@ pub const Connection = struct {
             .text, .binary => {
                 if (self.fragment_opcode != null) return error.InvalidFragmentation;
                 if (parsed.fin) {
+                    // The cap is the caller's memory budget, so it has to apply
+                    // to a one-frame message too — the doc comment on
+                    // `message_buf` says so, and before this check the only
+                    // bound on an unfragmented message was `max_frame_size`.
+                    // The payload is still returned borrowed from `buf` (no
+                    // copy into `message_buf`); the buffer's *length* is what
+                    // is being honoured here, not its storage.
+                    if (parsed.payload.len > self.message_buf.len) return error.MessageTooLarge;
                     if (parsed.opcode == .text and !std.unicode.utf8ValidateSlice(parsed.payload))
                         return error.InvalidUtf8;
                     return .{ .event = .{ .message = .{ .opcode = parsed.opcode, .payload = parsed.payload } }, .consumed = parsed.consumed };
@@ -242,6 +250,37 @@ test "aggregate message over message_buf cap is rejected (close 1009)" {
     var wire2 = [_]u8{ 0x80, 0x02, 'l', 'o' }; // +2 bytes = 5 > 4-byte cap
     try testing.expectError(error.MessageTooLarge, conn.receive(&wire2));
     try testing.expectEqual(@as(u16, 1009), frame.closeCode(error.MessageTooLarge));
+}
+
+test "an UNFRAGMENTED message over message_buf cap is rejected too (close 1009)" {
+    // The cap the doc comment on `message_buf` promises used to apply only to
+    // the reassembly path: a single FIN frame was returned borrowed from the
+    // read buffer with no size check at all, so the only bound on a one-frame
+    // message was `max_frame_size` and a caller who sized `message_buf` as its
+    // memory budget did not have one. A 4-byte `message_buf` accepted a 10-byte
+    // one-shot text frame.
+    var scratch: [4]u8 = undefined; // the caller's stated memory budget
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+
+    var wire = [_]u8{ 0x81, 0x0a } ++ "abcdefghij".*; // text, FIN, 10 bytes
+    try testing.expectError(error.MessageTooLarge, conn.receive(&wire));
+    try testing.expectEqual(@as(u16, 1009), frame.closeCode(error.MessageTooLarge));
+
+    // ...and the same for binary, which has no UTF-8 check to hide behind.
+    var bin = [_]u8{ 0x82, 0x05, 1, 2, 3, 4, 5 };
+    try testing.expectError(error.MessageTooLarge, conn.receive(&bin));
+
+    // POSITIVE CONTROL: exactly the cap still goes through, and still borrows
+    // the caller's read buffer rather than being copied into `message_buf`.
+    var fits = [_]u8{ 0x81, 0x04 } ++ "abcd".*;
+    const r = try conn.receive(&fits);
+    switch (r.event) {
+        .message => |m| {
+            try testing.expectEqualStrings("abcd", m.payload);
+            try testing.expect(m.payload.ptr == fits[2..].ptr);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "invalid UTF-8 single-frame text message is rejected (close 1007)" {

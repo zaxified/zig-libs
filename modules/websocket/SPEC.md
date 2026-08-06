@@ -38,7 +38,10 @@ tests (the masking key in those vectors is fixed, not random).
 text/binary with `FIN=0`, zero or more `continuation` frames, a final `continuation` with `FIN=1`)
 into a caller-owned `message_buf`; that buffer's length **is** the aggregate max-message-size cap
 (a fragmented message can exceed any single frame's `max_frame_size` even with every individual
-frame compliant, so this is a separate bound from the per-frame one). Control frames (ping/pong/
+frame compliant, so this is a separate bound from the per-frame one). The cap applies to an
+**unfragmented** message as well, even though such a message is never copied into `message_buf`:
+the buffer's *length* is the caller's stated memory budget for one message, and a bound that a
+one-frame message could walk past would not be a budget at all. Control frames (ping/pong/
 close) are dispatched before fragmentation state is even consulted, which is what makes
 interleaving them mid-fragmentation "just work" — no special-casing needed. UTF-8 validation
 (§5.6, required for `text`/`.continuation`-reassembled-as-text) runs against the **complete**
@@ -116,7 +119,9 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   payload, invalid-UTF-8 reason), handshake rejections (non-GET, missing Upgrade/Connection/
   version, missing/malformed key, unoffered-subprotocol echo, accept mismatch, non-101 status),
   `Connection` fragmentation-sequencing errors (orphan continuation, new frame before finishing
-  the previous one), aggregate message-size cap, single-frame and reassembled invalid-UTF-8
+  the previous one), aggregate message-size cap on **both** the reassembled and the unfragmented
+  path (the latter with an at-exactly-the-cap positive control that also asserts the payload is
+  still borrowed from the read buffer), single-frame and reassembled invalid-UTF-8
   rejection, the split-codepoint-across-fragments positive control, and control-frame interleaving
   mid-fragmentation.
 

@@ -122,7 +122,11 @@ test "LIVE pymap interop: greet -> login -> select -> fetch -> search -> idle ->
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);
 
-    var c = client.Client.init(gpa, &sr.interface, &sw.interface, .{});
+    // pymap is spawned by this test on 127.0.0.1 with no TLS at all, so the
+    // plaintext-auth gate (`login` refuses an unencrypted link by default) has
+    // to be opted out of explicitly. This is the "the caller knows the
+    // transport is trusted" case the option exists for.
+    var c = client.Client.init(gpa, &sr.interface, &sw.interface, .{ .allow_plaintext_auth = true });
     defer c.deinit();
 
     // ── greeting ────────────────────────────────────────────────────────────

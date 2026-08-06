@@ -156,6 +156,8 @@ var c = imap.Client.init(gpa, &reader, &writer, .{});
 defer c.deinit();
 
 _ = try c.greet();                     // capabilities often arrive here
+_ = try c.startTls();                  // then handshake on your own transport
+_ = try c.tlsEstablished(&tls_reader, &tls_writer);
 _ = try c.login("user", "pass");
 _ = try c.select("INBOX", false);
 // c.mailbox.exists / .flags / .permanent_flags / .uid_validity / .uid_next
@@ -173,6 +175,21 @@ Three things live here because nothing below can own them:
   that treats the next line as the continuation gets wrong. Advertising
   `LITERAL+` removes the round trip; the session sets the encoder's policy from
   the capabilities the server actually sent.
+- **STARTTLS is a state transition, not a command.** This module speaks no TLS,
+  so the upgrade is split: `startTls` writes the command, reads its completion,
+  and **refuses** the upgrade if anything is already buffered from the server
+  (`error.PlaintextInjection` — the 2011 STARTTLS response-injection class, the
+  same guard `smtp` has). The caller then performs the handshake on its own
+  transport and hands the upgraded streams to `tlsEstablished`, which discards
+  the pre-TLS capability list per RFC 9051 §6.2.1 — **and** the encoder policy
+  (`LITERAL+`/`LITERAL-`/`UTF8=ACCEPT`) that was derived from it — before
+  re-running `CAPABILITY` over the encrypted link.
+- **The password is not handed to just anyone.** `login` refuses with
+  `error.LoginDisabled` when the server advertised `LOGINDISABLED` (RFC 9051
+  §6.2.3 says a client MUST NOT issue `LOGIN` then), and with
+  `error.PlaintextAuth` on a link this client has not seen encrypted unless
+  `Options.allow_plaintext_auth` is set — same default, and the same reasoning,
+  as `smtp`.
 - **State gates commands.** `LOGIN` after authentication is a local error, not
   a password sent into a session that cannot use it.
 
