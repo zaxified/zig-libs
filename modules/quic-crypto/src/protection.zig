@@ -24,6 +24,7 @@
 //! QUIC-shaped; see SPEC.md/NOTICE.
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 
 pub const ProtectionError = error{
     /// AEAD tag verification failed on `open` — return this, never panic.
@@ -139,7 +140,17 @@ pub fn Protection(comptime Aead: type) type {
 
 const testing = std.testing;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+// The `Protection(...)` API tests below instantiate the SIMD `chachapoly`
+// sibling — the AEAD this module recommends for the QUIC ChaCha suite, and
+// the one a data-plane consumer will actually bind.
+const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
+// …while the `sanity` tests keep driving std's AEAD directly. That split is
+// deliberate and is the differential: the sanity test reproduces the RFC 9001
+// App. A.5 ciphertext with std, the API tests reproduce the SAME RFC bytes
+// through `Protection(chachapoly.…)`. If the two implementations ever
+// diverged, one half of this file would go red against constants neither of
+// them authored.
+const StdChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 fn hexTo(comptime n: usize, s: []const u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -217,12 +228,51 @@ test "sanity: App. A.2 client Initial AES-128-GCM protected-payload head matches
     try testing.expectEqualSlices(u8, &rfc_client_ct_head, out[0..16]);
 }
 
-test "sanity: App. A.5 ChaCha20-Poly1305 seal matches RFC ciphertext" {
+test "sanity: App. A.5 ChaCha20-Poly1305 seal matches RFC ciphertext (std, the independent oracle)" {
     var out: [rfc_a5_plain.len + 16]u8 = undefined;
     var tag: [16]u8 = undefined;
-    ChaCha20Poly1305.encrypt(out[0..rfc_a5_plain.len], &tag, &rfc_a5_plain, &rfc_a5_header, rfc_a5_nonce, rfc_a5_key);
+    StdChaCha20Poly1305.encrypt(out[0..rfc_a5_plain.len], &tag, &rfc_a5_plain, &rfc_a5_header, rfc_a5_nonce, rfc_a5_key);
     @memcpy(out[rfc_a5_plain.len..][0..16], &tag);
     try testing.expectEqualSlices(u8, &rfc_a5_ct, &out);
+}
+
+test "differential: Protection is byte-identical under chachapoly and std, over QUIC packet sizes" {
+    // `Protection` is generic over the AEAD, so this is the cheap version of
+    // the differential: run the same key/iv/pn/header through BOTH
+    // instantiations at every size a real QUIC datagram takes, including the
+    // sub-block and block-boundary lengths where a vectorised ChaCha tail
+    // would be wrong if it were wrong at all.
+    const Ours = Protection(ChaCha20Poly1305);
+    const Theirs = Protection(StdChaCha20Poly1305);
+    try testing.expectEqual(Theirs.key_length, Ours.key_length);
+    try testing.expectEqual(Theirs.nonce_length, Ours.nonce_length);
+    try testing.expectEqual(Theirs.tag_length, Ours.tag_length);
+
+    var payload: [1452]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x9001_9001);
+    prng.random().bytes(&payload);
+    var ours: [1452 + 16]u8 = undefined;
+    var theirs: [1452 + 16]u8 = undefined;
+    var back: [1452]u8 = undefined;
+
+    const lens = [_]usize{ 0, 1, 63, 64, 65, 127, 512, 1200, 1452 };
+    // 0, the 1-byte and 2-byte PN spaces, and the 62-bit maximum.
+    const pns = [_]u64{ 0, 1, 255, 256, 0xFFFF_FFFF, (@as(u64, 1) << 62) - 1 };
+
+    for (lens) |len| {
+        for (pns) |pn| {
+            const n1 = try Ours.seal(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, payload[0..len], &ours);
+            const n2 = try Theirs.seal(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, payload[0..len], &theirs);
+            try testing.expectEqual(n2, n1);
+            try testing.expectEqualSlices(u8, theirs[0..n2], ours[0..n1]);
+
+            // Cross-open: each implementation must accept the other's packet.
+            const m = try Ours.open(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, theirs[0..n2], &back);
+            try testing.expectEqualSlices(u8, payload[0..len], back[0..m]);
+            const m2 = try Theirs.open(rfc_a5_key, rfc_a5_iv, pn, &rfc_a5_header, ours[0..n1], &back);
+            try testing.expectEqualSlices(u8, payload[0..len], back[0..m2]);
+        }
+    }
 }
 
 fn rfc_server_iv_xor_pn() [12]u8 {

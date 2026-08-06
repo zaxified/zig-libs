@@ -35,7 +35,8 @@
 //!   `info = kdf_rk_info`, 64-byte output split `RK' ‖ CK` (spec §5.2).
 //! - `KDF_CK(CK)` = HMAC-SHA256 keyed by `CK`; `HMAC(CK, 0x01) -> MK`,
 //!   `HMAC(CK, 0x02) -> CK'` (spec §5.2, the exact recommended constants).
-//! - **AEAD = ChaCha20-Poly1305** (`std.crypto.aead.chacha_poly`). The
+//! - **AEAD = ChaCha20-Poly1305** (the `chachapoly` sibling; byte-exact to
+//!   `std.crypto.aead.chacha_poly.ChaCha20Poly1305`). The
 //!   spec's OWN example is AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC),
 //!   but it explicitly permits "an AEAD encryption scheme"; a real AEAD is
 //!   simpler and less error-prone than hand-rolled EtM, and ChaCha20-
@@ -62,12 +63,22 @@
 //! (Signal Foundation / Trevor Perrin, Moxie Marlinspike). See `../NOTICE`.
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 const x3dh = @import("x3dh.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+/// The ratchet AEAD — the SIMD `chachapoly` sibling, byte-exact to
+/// `StdChaCha20Poly1305` below. A Double Ratchet message is one AEAD call over
+/// a chat-sized payload, so this is uniformity with the rest of the repo far
+/// more than it is a throughput win here (see README); the reason to do it
+/// anyway is that there is then exactly ONE ChaCha20-Poly1305 implementation
+/// that consumers audit, fuzz and keep constant-time.
+const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
+/// `std`'s AEAD. Not used on any production path — kept reachable so the
+/// tests can assert the swap moved no ciphertext byte.
+const StdChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 pub const key_length: usize = x3dh.key_length; // 32
 pub const chain_key_length: usize = 32;
@@ -650,6 +661,52 @@ fn sendRecv(sender: *State, receiver: *State, plaintext: []const u8, io: std.Io)
     const pt = try receiver.decrypt(alloc, msg.header, msg.ciphertext, io);
     defer alloc.free(pt);
     try testing.expectEqualSlices(u8, plaintext, pt);
+}
+
+// ── differential: swapping std's AEAD for `chachapoly` moved nothing ─────
+//
+// The ratchet's ciphertext format is `AEAD(k, n, plaintext, AD ‖ header)`
+// with the key/nonce HKDF-expanded from the message key. There is no
+// published vector for it (the Double Ratchet spec leaves the AEAD to the
+// application), so the anchor for the swap has to be the OTHER implementation
+// of the same function: recompute `aeadSeal`'s exact output with std's AEAD
+// and require byte-identity, over every length that crosses a ChaCha block
+// boundary and over the associated data the header actually contributes.
+test "differential: aeadSeal/aeadOpen are byte-identical under chachapoly and std" {
+    try testing.expectEqual(StdChaCha20Poly1305.key_length, ChaCha20Poly1305.key_length);
+    try testing.expectEqual(StdChaCha20Poly1305.nonce_length, ChaCha20Poly1305.nonce_length);
+    try testing.expectEqual(StdChaCha20Poly1305.tag_length, ChaCha20Poly1305.tag_length);
+
+    const mk: [message_key_length]u8 = @splat(0x5A);
+    const ad: [associated_data_length]u8 = @splat(0x3C);
+    const header: Header = .{ .dh = @splat(0x77), .pn = 4321, .n = 1234 };
+
+    var plaintext: [600]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x516E_A100);
+    prng.random().bytes(&plaintext);
+
+    var theirs: [600 + tag_length]u8 = undefined;
+
+    for ([_]usize{ 0, 1, 15, 63, 64, 65, 127, 128, 511, 512, 513, 600 }) |len| {
+        const ours = try aeadSeal(testing.allocator, mk, header, plaintext[0..len], ad);
+        defer testing.allocator.free(ours);
+
+        // The std-side recomputation mirrors `aeadSeal` exactly: same derived
+        // key/nonce, same AAD assembly, tag appended after the ciphertext.
+        var kn = aeadKeyNonce(mk);
+        defer std.crypto.secureZero(u8, &kn.key);
+        const aad = aeadAad(header, ad);
+        var tag: [tag_length]u8 = undefined;
+        StdChaCha20Poly1305.encrypt(theirs[0..len], &tag, plaintext[0..len], &aad, kn.nonce, kn.key);
+        theirs[len..][0..tag_length].* = tag;
+
+        try testing.expectEqualSlices(u8, theirs[0 .. len + tag_length], ours);
+
+        // …and `aeadOpen` (chachapoly) accepts the ciphertext std produced.
+        const back = try aeadOpen(testing.allocator, mk, header, theirs[0 .. len + tag_length], ad);
+        defer testing.allocator.free(back);
+        try testing.expectEqualSlices(u8, plaintext[0..len], back);
+    }
 }
 
 test "header codec round-trips; fromBytes rejects wrong length" {

@@ -138,6 +138,68 @@ test "wiring sanity: Transport built from the published sk/rk/ck reproduces the 
     try testing.expectEqualSlices(u8, kv.msg_outputs[0].bytes, &out);
 }
 
+// ── differential: the AEAD swap must not move a single wire byte ───────
+//
+// `handshake.Suite` binds `noise.ChaCha20Poly1305` (the SIMD `chachapoly`
+// sibling); `handshake.StdAeadSuite` binds `std.crypto.aead.chacha_poly.
+// ChaCha20Poly1305`. Both are supposed to be the same function. Replay the
+// published BOLT#8 "Message Encryption Tests" send sequence — same key, same
+// chaining key, same nonce ladder, same rotation points — through a
+// `CipherState` from EACH suite and require the produced frames to be equal
+// to each other AND to the vectors BOLT#8 publishes.
+//
+// This drives the AEAD directly rather than through `Transport`, because
+// `Transport` is bound to the one suite; the operations replicated here are
+// exactly `Transport.sendMessage`'s two `encryptWithAd` calls plus the
+// every-1000 `mixKey` rotation, so a divergence anywhere in the AEAD shows up
+// as a mismatched frame.
+fn bolt8SendSequence(comptime S: type, comptime n_msgs: usize, out_frames: *[n_msgs][18 + 5 + 16]u8) !void {
+    var cipher: S.CipherState = .{};
+    cipher.initializeKey(kv.msg_test_sk.*);
+    var chain: [32]u8 = kv.msg_test_ck.*;
+
+    for (0..n_msgs) |i| {
+        var l_be: [2]u8 = undefined;
+        std.mem.writeInt(u16, &l_be, 5, .big);
+        try cipher.encryptWithAd("", &l_be, out_frames[i][0..18]);
+        if (cipher.n == 1000) {
+            var shell: S.SymmetricState = .{ .ck = chain };
+            shell.mixKey(&cipher.k);
+            chain = shell.ck;
+            cipher = shell.cipher_state;
+        }
+        try cipher.encryptWithAd("", "hello", out_frames[i][18..]);
+        if (cipher.n == 1000) {
+            var shell: S.SymmetricState = .{ .ck = chain };
+            shell.mixKey(&cipher.k);
+            chain = shell.ck;
+            cipher = shell.cipher_state;
+        }
+    }
+}
+
+test "differential: BOLT#8 message-test frames are byte-identical under chachapoly and std, and match the published vectors" {
+    // 1002 messages covers both published rotation boundaries (indices 500 and
+    // 1001 in the vector table), so the differential spans a re-key too.
+    const n = 1002;
+    const Frames = [n][18 + 5 + 16]u8;
+    const ours = try testing.allocator.create(Frames);
+    defer testing.allocator.destroy(ours);
+    const theirs = try testing.allocator.create(Frames);
+    defer testing.allocator.destroy(theirs);
+
+    try bolt8SendSequence(handshake.Suite, n, ours);
+    try bolt8SendSequence(handshake.StdAeadSuite, n, theirs);
+
+    for (0..n) |i| try testing.expectEqualSlices(u8, &theirs[i], &ours[i]);
+
+    // …and both agree with the bytes BOLT#8 publishes.
+    for (kv.msg_outputs) |o| {
+        try testing.expectEqualSlices(u8, o.bytes, &ours[o.idx]);
+        try testing.expectEqualSlices(u8, o.bytes, &theirs[o.idx]);
+    }
+}
+
 test "wiring sanity: Initiator.init/Responder.init from the published identities agree (delegates to handshake.zig's own KAT)" {
     const init_ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
     const resp_ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);

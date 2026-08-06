@@ -57,6 +57,7 @@
 //! `std.crypto.aead.chacha_poly.ChaCha20Poly1305`).
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 
 pub const suite = @import("suite.zig");
 pub const dhkem = @import("dhkem.zig");
@@ -73,6 +74,18 @@ pub const P384Kem = dhkem.P384Kem;
 
 pub const Context = schedule.Context;
 pub const keySchedule = schedule.keySchedule;
+
+/// RFC 9180 Table 5 `aead_id = 0x0003` (ChaCha20Poly1305) — the SIMD
+/// `chachapoly` sibling, byte-exact to `std.crypto.aead.chacha_poly.
+/// ChaCha20Poly1305`. Re-exported as this module's RECOMMENDED binding for
+/// the ChaCha suite; nothing here hard-wires an AEAD (every entry point takes
+/// it as a comptime parameter), so std's type stays equally bindable and both
+/// map to the same registered `aead_id` — the choice cannot reach the wire.
+/// The RFC 9180 A.2 vectors are run under both (`kat_rfc9180.zig`).
+///
+/// The AES-GCM suites have no sibling implementation and come from std;
+/// reach them as `std.crypto.aead.aes_gcm.Aes128Gcm` / `.Aes256Gcm`.
+pub const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
 // RFC 9180 §5.1's `Setup*S`/`Setup*R` pairs, one per mode — the
 // multi-message counterpart to §6.1's single-shot `Seal*`/`Open*` pairs
@@ -121,7 +134,12 @@ pub const meta = .{
     // only its parameters.
     .concurrency = .reentrant,
     .model_after = "RFC 9180 (Hybrid Public Key Encryption)",
-    .deps = .{"p256"}, // DHKEM(P-256) group from the asm-accelerated p256 (byte-exact to std.crypto.ecc.P256); X25519 KEM path stays on std
+    // p256: the DHKEM(P-256) group from the asm-accelerated p256 (byte-exact
+    // to std.crypto.ecc.P256); the X25519 KEM path stays on std.
+    // chachapoly: the RFC 9180 Table 5 `aead_id = 0x0003` AEAD (byte-exact to
+    // std). Both are implementation choices behind comptime parameters — no
+    // wire byte depends on either.
+    .deps = .{ "p256", "chachapoly" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -136,9 +154,17 @@ test {
     _ = @import("kat_rfc9180.zig");
 }
 
-test "meta.deps is exactly {p256} (the DHKEM(P-256) curve group; else std only)" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {p256, chachapoly} (the P-256 group + the ChaCha AEAD; else std only)" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("p256", meta.deps[0]);
+    try std.testing.expectEqualStrings("chachapoly", meta.deps[1]);
+}
+
+test "the ChaCha AEAD swap is inert: chachapoly and std agree on every RFC 9180 Nk/Nn/Nt" {
+    const Std = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+    try std.testing.expectEqual(Std.key_length, ChaCha20Poly1305.key_length); // Nk = 32
+    try std.testing.expectEqual(Std.nonce_length, ChaCha20Poly1305.nonce_length); // Nn = 12
+    try std.testing.expectEqual(Std.tag_length, ChaCha20Poly1305.tag_length); // Nt = 16
 }
 
 test "meta.role is .util (no owned transport/socket, unlike a .client/.server module)" {

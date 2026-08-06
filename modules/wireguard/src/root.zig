@@ -76,7 +76,12 @@ pub const meta = .{
     .role = .client,
     .concurrency = .reentrant, // no globals; one Wireguard per thread/loop
     .model_after = "WireGuard genetlink UAPI / wgctrl-go",
-    .deps = .{ "netlink", "genetlink" }, // wire codec + genl transport are reused
+    // netlink/genetlink: the control-plane wire codec + genl transport.
+    // chachapoly: the Noise_IKpsk2 data-plane AEAD (noise.zig's `Aead`) — a
+    // WireGuard transport-data packet is one AEAD seal/open per MTU, so this
+    // is the module's only throughput-sensitive primitive. Byte-exact to
+    // std; the cookie-reply XChaCha20 variant stays on std (see noise.zig).
+    .deps = .{ "netlink", "genetlink", "chachapoly" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────
@@ -1523,6 +1528,9 @@ test "integration (root): set + get round-trip on a real wg interface" {
 test {
     _ = noise;
     _ = handshake;
+    // Opt-in throughput bench (WIREGUARD_BENCH); a plain `error.SkipZigTest`
+    // otherwise. See its module doc comment for what it does NOT measure.
+    _ = @import("bench.zig");
     // External anchor: real kernel + real `wg`-tool netlink bytes, captured
     // once and frozen (see kernel_goldens.zig's module doc-comment).
     _ = @import("kernel_goldens.zig");

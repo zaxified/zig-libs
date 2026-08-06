@@ -9,6 +9,7 @@
 //! tests at the bottom of this file.
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 const patterns = @import("patterns.zig");
 const Token = @import("token.zig").Token;
 
@@ -19,7 +20,16 @@ fn dhName(comptime T: type) []const u8 {
     @compileError("noise: no spec §8 protocol name for DH type " ++ @typeName(T));
 }
 
+/// Spec §8's `ChaChaPoly`/`AESGCM` cipher-name fragment. BOTH
+/// ChaCha20-Poly1305 implementations map to the SAME name: the `chachapoly`
+/// sibling is byte-exact to `std.crypto.aead.chacha_poly.ChaCha20Poly1305`
+/// (differentially anchored in that module over every block-boundary edge
+/// length), so which one a suite is bound with is an implementation choice
+/// that must NOT reach the wire. The protocol name is hashed into the
+/// initial chaining key, so returning two different strings here would fork
+/// the handshake transcript and silently break interop.
 fn cipherName(comptime T: type) []const u8 {
+    if (T == chachapoly.ChaCha20Poly1305) return "ChaChaPoly";
     if (T == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return "ChaChaPoly";
     if (T == std.crypto.aead.aes_gcm.Aes256Gcm) return "AESGCM";
     @compileError("noise: no spec §8 protocol name for AEAD type " ++ @typeName(T));
@@ -640,11 +650,25 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
 
 const testing = std.testing;
 
+/// The default binding: the `chachapoly` sibling's AEAD. Several tests below
+/// recompute their expectation with `std.crypto.aead.chacha_poly.
+/// ChaCha20Poly1305` directly, which makes them differential — the suite runs
+/// `chachapoly`, the oracle is std, and the bytes must match.
 const TestSuite = Suite(
     std.crypto.dh.X25519,
-    std.crypto.aead.chacha_poly.ChaCha20Poly1305,
+    chachapoly.ChaCha20Poly1305,
     std.crypto.hash.sha2.Sha256,
 );
+
+/// Both byte-exact ChaCha20-Poly1305 implementations. Every official-vector
+/// KAT below is run under BOTH: the vectors are the wire format, so a suite
+/// bound with `chachapoly` and one bound with std must produce identical
+/// bytes at every step. Ordered `chachapoly` first so the default is the one
+/// a failure names first.
+const chacha_aeads = [_]type{
+    chachapoly.ChaCha20Poly1305,
+    std.crypto.aead.chacha_poly.ChaCha20Poly1305,
+};
 
 test "Suite(X25519, ChaCha20Poly1305, SHA256): DHLEN/HASHLEN + zero-value defaults" {
     const S = TestSuite;
@@ -921,6 +945,17 @@ fn katPub(comptime S: type, pubkey: ?[]const u8) ?[S.DHLEN]u8 {
     return p[0..S.DHLEN].*;
 }
 
+/// Run one official ChaChaPoly vector under BOTH byte-exact ChaCha20-Poly1305
+/// implementations (`chachapoly` sibling and std). The vectors ARE the wire
+/// format, so this is the differential that keeps the AEAD swap inert: if the
+/// two disagree anywhere — ciphertext, tag, or the final handshake hash — one
+/// of the two runs goes red against the SAME published bytes.
+fn runKatBothChaChaAeads(comptime Hash: type, comptime v: Kat) !void {
+    inline for (chacha_aeads) |Aead| {
+        try runKat(Suite(std.crypto.dh.X25519, Aead, Hash), v);
+    }
+}
+
 fn runKat(comptime S: type, comptime v: Kat) !void {
     var ini: S.HandshakeState = .{};
     var rsp: S.HandshakeState = .{};
@@ -1013,7 +1048,7 @@ const kat_p4 = hx("4a65616e2d426170746973746520536179"); // "Jean-Baptiste Say"
 const kat_p5 = hx("457567656e2042f6686d20766f6e2042617765726b"); // "Eugen Böhm von Bawerk"
 
 test "KAT: Noise_NN_25519_ChaChaPoly_SHA256 (official noise-c vector)" {
-    try runKat(TestSuite, .{
+    try runKatBothChaChaAeads(std.crypto.hash.sha2.Sha256, .{
         .pattern = patterns.NN,
         .prologue = kat_prologue,
         .init_ephemeral = kat_init_ephemeral,
@@ -1031,7 +1066,7 @@ test "KAT: Noise_NN_25519_ChaChaPoly_SHA256 (official noise-c vector)" {
 }
 
 test "KAT: Noise_NK_25519_ChaChaPoly_SHA256 (official noise-c vector)" {
-    try runKat(TestSuite, .{
+    try runKatBothChaChaAeads(std.crypto.hash.sha2.Sha256, .{
         .pattern = patterns.NK,
         .prologue = kat_prologue,
         .init_ephemeral = kat_init_ephemeral,
@@ -1051,7 +1086,7 @@ test "KAT: Noise_NK_25519_ChaChaPoly_SHA256 (official noise-c vector)" {
 }
 
 test "KAT: Noise_XX_25519_ChaChaPoly_SHA256 (official noise-c vector; covers es+se both roles)" {
-    try runKat(TestSuite, .{
+    try runKatBothChaChaAeads(std.crypto.hash.sha2.Sha256, .{
         .pattern = patterns.XX,
         .prologue = kat_prologue,
         .init_static = kat_init_static,
@@ -1071,7 +1106,7 @@ test "KAT: Noise_XX_25519_ChaChaPoly_SHA256 (official noise-c vector; covers es+
 }
 
 test "KAT: Noise_IK_25519_ChaChaPoly_SHA256 (official noise-c vector; covers es+ss+se)" {
-    try runKat(TestSuite, .{
+    try runKatBothChaChaAeads(std.crypto.hash.sha2.Sha256, .{
         .pattern = patterns.IK,
         .prologue = kat_prologue,
         .init_static = kat_init_static,
@@ -1092,12 +1127,7 @@ test "KAT: Noise_IK_25519_ChaChaPoly_SHA256 (official noise-c vector; covers es+
 }
 
 test "KAT: Noise_XX_25519_ChaChaPoly_BLAKE2s (official noise-c vector; second hash)" {
-    const S = Suite(
-        std.crypto.dh.X25519,
-        std.crypto.aead.chacha_poly.ChaCha20Poly1305,
-        std.crypto.hash.blake2.Blake2s256,
-    );
-    try runKat(S, .{
+    try runKatBothChaChaAeads(std.crypto.hash.blake2.Blake2s256, .{
         .pattern = patterns.XX,
         .prologue = kat_prologue,
         .init_static = kat_init_static,
@@ -1117,12 +1147,7 @@ test "KAT: Noise_XX_25519_ChaChaPoly_BLAKE2s (official noise-c vector; second ha
 }
 
 test "KAT: Noise_IK_25519_ChaChaPoly_SHA512 (official noise-c vector; HASHLEN=64 truncation)" {
-    const S = Suite(
-        std.crypto.dh.X25519,
-        std.crypto.aead.chacha_poly.ChaCha20Poly1305,
-        std.crypto.hash.sha2.Sha512,
-    );
-    try runKat(S, .{
+    try runKatBothChaChaAeads(std.crypto.hash.sha2.Sha512, .{
         .pattern = patterns.IK,
         .prologue = kat_prologue,
         .init_static = kat_init_static,

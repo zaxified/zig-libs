@@ -38,6 +38,7 @@
 //! vectors, byte-exact, no skip guards left.
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 const suite = @import("suite.zig");
 const dhkem = @import("dhkem.zig");
 const schedule = @import("schedule.zig");
@@ -871,9 +872,21 @@ test "A.1: sealBaseDeterministic/openBase reproduce enc + the first ciphertext e
     try testing.expectEqualSlices(u8, first.pt, &pt);
 }
 
-test "A.2: X25519 + ChaCha20Poly1305 — Encap/Decap + KeySchedule + seq-0 Seal, byte-exact" {
-    const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+// Run the A.2 vector under BOTH byte-exact ChaCha20-Poly1305 implementations
+// — the `chachapoly` sibling this module recommends (`hpke.ChaCha20Poly1305`)
+// and std's. The RFC's published bytes are the shared oracle, so the pair is
+// a differential AND a KAT at once: if the two AEADs ever disagreed, exactly
+// one iteration would go red against the SAME RFC constants.
+const chacha_aeads = [_]type{
+    chachapoly.ChaCha20Poly1305,
+    std.crypto.aead.chacha_poly.ChaCha20Poly1305,
+};
 
+test "A.2: X25519 + ChaCha20Poly1305 — Encap/Decap + KeySchedule + seq-0 Seal, byte-exact (both AEAD impls)" {
+    inline for (chacha_aeads) |ChaCha20Poly1305| try a2Vector(ChaCha20Poly1305);
+}
+
+fn a2Vector(comptime ChaCha20Poly1305: type) !void {
     const eph = dhkem.X25519Kem.KeyPair{ .secret_key = a2.skEm, .public_key = a2.pkEm };
     const got = try dhkem.X25519Kem.encapDeterministic(a2.pkRm, eph);
     try testing.expectEqualSlices(u8, &a2.enc, &got.enc);

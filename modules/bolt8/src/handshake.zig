@@ -46,7 +46,22 @@ const act = @import("act.zig");
 /// itself supplies the `public_length`/`KeyPair`/`scalarmult` decls
 /// `Suite(DH,...)` expects off its `DH` type parameter — see that file's
 /// "noise.Suite(DH, ...) adapter surface" section.
+/// The AEAD is `noise.ChaCha20Poly1305` — the `chachapoly` sibling, reached
+/// through `noise`'s re-export so this module needs no `chachapoly` dep of
+/// its own. It is byte-exact to `std.crypto.aead.chacha_poly.
+/// ChaCha20Poly1305`, and `kat_test.zig` runs the BOLT#8 Appendix A vectors
+/// under both to keep that claim honest here rather than by reference.
 pub const Suite = noise.Suite(
+    dh,
+    noise.ChaCha20Poly1305,
+    std.crypto.hash.sha2.Sha256,
+);
+
+/// The same suite bound to `std`'s ChaCha20-Poly1305 instead. Not used on any
+/// production path — it exists so `kat_test.zig` can drive the published
+/// BOLT#8 vectors through the OTHER AEAD implementation and assert the two
+/// produce identical wire bytes (the differential that proves the swap inert).
+pub const StdAeadSuite = noise.Suite(
     dh,
     std.crypto.aead.chacha_poly.ChaCha20Poly1305,
     std.crypto.hash.sha2.Sha256,

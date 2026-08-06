@@ -42,6 +42,7 @@
 //! vector this module drives with `Nh` != 32.
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 const suite = @import("suite.zig");
 
 /// The registered `KdfId`/`Hkdf` instantiation for a key-schedule `Nh`
@@ -342,6 +343,14 @@ pub fn keySchedule(
 fn aeadIdOf(comptime Aead: type) u16 {
     if (Aead == std.crypto.aead.aes_gcm.Aes128Gcm) return @intFromEnum(suite.AeadId.aes128gcm);
     if (Aead == std.crypto.aead.aes_gcm.Aes256Gcm) return @intFromEnum(suite.AeadId.aes256gcm);
+    // BOTH ChaCha20-Poly1305 implementations map to the SAME registered id
+    // 0x0003. The `chachapoly` sibling is byte-exact to std's (differentially
+    // anchored there over every block-boundary edge length), so which one a
+    // caller binds is an implementation choice — while `aead_id` is wire data:
+    // it is baked into the §7.2.1 `suite_id` that domain-separates every
+    // labeled extract/expand in the key schedule. Two ids here would fork the
+    // derived keys, i.e. silently break interop with any other HPKE peer.
+    if (Aead == chachapoly.ChaCha20Poly1305) return @intFromEnum(suite.AeadId.chacha20poly1305);
     if (Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return @intFromEnum(suite.AeadId.chacha20poly1305);
     @compileError("hpke: no RFC 9180 aead_id registered for " ++ @typeName(Aead));
 }

@@ -63,6 +63,7 @@
 //! seam with no transport engine — it belongs to the eventual consumer.
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 
 pub const initial = @import("initial.zig");
 pub const keyschedule = @import("keyschedule.zig");
@@ -79,6 +80,18 @@ pub const advanceKeys = keyschedule.advanceKeys;
 pub const Protection = protection.Protection;
 pub const HeaderForm = headerprot.HeaderForm;
 
+/// The RFC 9001 §5.3 ChaCha20-Poly1305 AEAD to instantiate `Protection` with
+/// — the SIMD `chachapoly` sibling, byte-exact to `std.crypto.aead.
+/// chacha_poly.ChaCha20Poly1305`. Re-exported because 1-RTT packet protection
+/// is a per-packet, per-datagram cost on the QUIC data plane, so which
+/// implementation a consumer binds is a throughput decision, not a taste one.
+///
+/// `Protection` is and stays generic over the AEAD (that is how the two
+/// AES-GCM suites are reached, `std.crypto.aead.aes_gcm.Aes128Gcm` /
+/// `.Aes256Gcm`), so std's ChaCha type remains bindable and is used as the
+/// differential oracle in `protection.zig`'s tests.
+pub const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
+
 pub const meta = .{
     .platform = .any,
     // Pure crypto/codec over caller-supplied bytes — both directions (seal
@@ -91,7 +104,10 @@ pub const meta = .{
     // doesn't alias its own buffers.
     .concurrency = .reentrant,
     .model_after = "RFC 9001 (Using TLS to Secure QUIC) §5.1/§5.2/§5.3/§5.4/§6; shares the AEAD-nonce (iv XOR left-pad(pn)) + AES-ECB/ChaCha20 header-mask constructions with this repo's dtls module (RFC 9147), re-expressed QUIC-shaped (no code shared)",
-    .deps = .{}, // std only — deliberately does NOT import dtls (see SPEC.md)
+    // chachapoly only: the §5.3 ChaCha20-Poly1305 AEAD (byte-exact to std,
+    // SIMD). Deliberately does NOT import dtls (see SPEC.md) — the shared
+    // nonce construction is re-expressed, not shared.
+    .deps = .{"chachapoly"},
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -106,8 +122,17 @@ test {
     _ = headerprot;
 }
 
-test "meta.deps is empty (std only — quic-crypto does not import dtls)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is exactly {chachapoly} — quic-crypto still does not import dtls" {
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("chachapoly", meta.deps[0]);
+}
+
+test "the AEAD swap is inert: chachapoly matches std on every RFC 9001 §5.3 width" {
+    const Std = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+    try std.testing.expectEqual(Std.key_length, ChaCha20Poly1305.key_length);
+    try std.testing.expectEqual(@as(usize, 12), ChaCha20Poly1305.nonce_length); // §5.3: nonce-12
+    try std.testing.expectEqual(Std.nonce_length, ChaCha20Poly1305.nonce_length);
+    try std.testing.expectEqual(Std.tag_length, ChaCha20Poly1305.tag_length);
 }
 
 test "meta.role is .codec (symmetric packet protection, either endpoint)" {

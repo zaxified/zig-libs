@@ -751,6 +751,96 @@ test "KAT: full handshake, byte-exact messages and transport keys" {
     try testing.expectEqual(@as(PrivateKey, @splat(0)), ini.local_ephemeral.?.private);
 }
 
+// ── differential: the std -> chachapoly AEAD swap is inert ────────────────
+//
+// `noise.Aead` is the SIMD `chachapoly` sibling; `noise.StdAead` is
+// `std.crypto.aead.chacha_poly.ChaCha20Poly1305`. The KAT above already pins
+// the HANDSHAKE messages byte-exact against an independent reference under
+// the swapped-in AEAD. This pins the TRANSPORT-DATA direction, which has no
+// published vector and (today) no seal/open API in this module — the packet
+// shape is reproduced here exactly as the protocol and the kernel-interop
+// test below define it: `AEAD(T_send, counterNonce(counter), packet, ε)`,
+// empty associated data, the 12-byte nonce being 4 zero bytes || LE64
+// counter. Every length across the ChaCha block boundaries up to a full
+// 1500-byte MTU, plus the counter values that exercise the nonce encoding.
+test "differential: transport-data seal is byte-identical under chachapoly and std" {
+    const key = kat.t_initiator_send;
+    var packet: [1500]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x5A17_C0DE);
+    prng.random().bytes(&packet);
+
+    var ours: [1500]u8 = undefined;
+    var theirs: [1500]u8 = undefined;
+    var ours_tag: [16]u8 = undefined;
+    var theirs_tag: [16]u8 = undefined;
+    var back: [1500]u8 = undefined;
+
+    const lens = [_]usize{ 0, 1, 63, 64, 65, 127, 128, 512, 513, 1280, 1420, 1500 };
+    const counters = [_]u64{ 0, 1, 1023, 0xFFFF_FFFF, 0x1_0000_0000, std.math.maxInt(u64) };
+
+    for (lens) |len| {
+        for (counters) |ctr| {
+            const npub = Handshake.counterNonce(ctr);
+            noise.Aead.encrypt(ours[0..len], &ours_tag, packet[0..len], "", npub, key);
+            noise.StdAead.encrypt(theirs[0..len], &theirs_tag, packet[0..len], "", npub, key);
+
+            // Ciphertext AND tag byte-identical — this is the whole claim.
+            try testing.expectEqualSlices(u8, theirs[0..len], ours[0..len]);
+            try testing.expectEqualSlices(u8, &theirs_tag, &ours_tag);
+
+            // …and each implementation opens the other's packet, so a peer
+            // running either one interoperates with a peer running the other.
+            try noise.Aead.decrypt(back[0..len], theirs[0..len], theirs_tag, "", npub, key);
+            try testing.expectEqualSlices(u8, packet[0..len], back[0..len]);
+            try noise.StdAead.decrypt(back[0..len], ours[0..len], ours_tag, "", npub, key);
+            try testing.expectEqualSlices(u8, packet[0..len], back[0..len]);
+        }
+    }
+}
+
+test "differential: the handshake KAT messages are identical under std's AEAD too" {
+    // The KAT above proves `chachapoly` reproduces the independent reference's
+    // bytes. Recompute the SAME two messages' AEAD fields with std's AEAD from
+    // the same transcript inputs: if the two AEADs ever diverged, exactly one
+    // of these two tests would go red, and the pair says which side moved.
+    const io = std.testing.io;
+    var ini = kat.initiator();
+    const msg1 = try ini.createInitiation(io, kat.timestamp);
+
+    // Replay message 1's transcript with std's AEAD (mirrors createInitiation).
+    var st = Handshake.initialState(ini.remote_static_public);
+    noise.kdf1(&st.ck, &msg1.unencrypted_ephemeral);
+    noise.mixHash(&st.h, &msg1.unencrypted_ephemeral);
+    var es = try noise.X25519.scalarmult(ini.local_ephemeral.?.private, ini.remote_static_public);
+    var k = noise.mixKey(&st.ck, &es);
+    std.crypto.secureZero(u8, &es);
+    var enc_static: [48]u8 = undefined;
+    noise.StdAead.encrypt(
+        enc_static[0..32],
+        enc_static[32..48],
+        &ini.static_keypair.public,
+        &st.h,
+        Handshake.counterNonce(0),
+        k,
+    );
+    try testing.expectEqualSlices(u8, &msg1.encrypted_static, &enc_static);
+    noise.mixHash(&st.h, &enc_static);
+
+    var ss = try noise.X25519.scalarmult(ini.static_keypair.private, ini.remote_static_public);
+    k = noise.mixKey(&st.ck, &ss);
+    std.crypto.secureZero(u8, &ss);
+    var enc_ts: [28]u8 = undefined;
+    noise.StdAead.encrypt(
+        enc_ts[0..12],
+        enc_ts[12..28],
+        &kat.timestamp,
+        &st.h,
+        Handshake.counterNonce(0),
+        k,
+    );
+    try testing.expectEqualSlices(u8, &msg1.encrypted_timestamp, &enc_ts);
+}
+
 test "self-consistency: full handshake with fresh random keys" {
     const io = std.testing.io;
     const si = Keypair.generate(io);

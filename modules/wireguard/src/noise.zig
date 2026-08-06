@@ -28,6 +28,7 @@
 //! copyrightable expression); no source consulted or copied. See ../NOTICE.
 
 const std = @import("std");
+const chachapoly = @import("chachapoly");
 
 // Note: `pub const meta` is declared once, canonically, in `root.zig` (per
 // CONVENTIONS.md §4) — submodule files like this one do not repeat it.
@@ -64,10 +65,34 @@ pub const X25519 = std.crypto.dh.X25519;
 /// the two produce different bytes. Matches the whitepaper's
 /// `Mac(key, input) := Keyed-Blake2s(key, input, 16)`.
 pub const Blake2s128 = std.crypto.hash.blake2.Blake2s128;
-/// ChaCha20-Poly1305 AEAD (`AEAD` in the Noise spec).
-pub const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+/// ChaCha20-Poly1305 AEAD (`AEAD` in the Noise spec) — the SIMD `chachapoly`
+/// sibling, not std. WireGuard is a data-plane protocol: every transport-data
+/// packet is one AEAD seal/open at MTU size, so this is the one primitive in
+/// the whole module whose throughput is on the packet path.
+///
+/// Byte-exact to `StdAead` below: `chachapoly` carries a differential against
+/// std over every block-boundary edge length, and `handshake.zig`'s
+/// independent-reference KAT plus `kernel_goldens.zig` re-prove it here on
+/// real WireGuard wire bytes. The AEAD choice is an implementation detail; the
+/// wire format is unchanged.
+pub const Aead = chachapoly.ChaCha20Poly1305;
+
+/// `std`'s ChaCha20-Poly1305. NOT used on any production path — it is kept
+/// reachable purely so the module's own tests can run a vector through both
+/// implementations and assert byte-identity (see `handshake.zig`'s
+/// differential test).
+pub const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+
 /// XChaCha20-Poly1305 AEAD — used for the (non-Noise) cookie-reply message,
 /// which needs a 24-byte random nonce rather than a Noise-ratcheted counter.
+///
+/// **Stays on std deliberately.** `chachapoly` implements RFC 8439
+/// ChaCha20-Poly1305 only; the X-variant is a DIFFERENT construction (an
+/// HChaCha20 subkey derivation from the first 16 nonce bytes, then RFC 8439
+/// under the remaining 8), which that module does not provide. Substituting
+/// the non-X AEAD here would be a silent security break, not a speed-up. This
+/// costs nothing: the cookie-reply path is a per-DoS-event control message,
+/// not a data-plane one.
 pub const XAead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
 /// BLAKE2s digest length: chaining-key / transcript-hash / symmetric-key
@@ -322,4 +347,12 @@ test "primitive sizes agree with the WireGuard wire format" {
     try testing.expectEqual(@as(usize, 16), Aead.tag_length);
     try testing.expectEqual(@as(usize, 16), mac_len);
     try testing.expectEqual(@as(usize, 24), XAead.nonce_length);
+
+    // The AEAD swap (std -> chachapoly) must not move any of the three
+    // constants the wire format is built out of. Verified, not assumed.
+    try testing.expectEqual(StdAead.key_length, Aead.key_length);
+    try testing.expectEqual(StdAead.nonce_length, Aead.nonce_length);
+    try testing.expectEqual(StdAead.tag_length, Aead.tag_length);
+    // XAead is a different construction and keeps its own, wider nonce.
+    try testing.expect(XAead.nonce_length != Aead.nonce_length);
 }
