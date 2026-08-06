@@ -23,6 +23,41 @@
 //! signature themselves is `session.zig`'s job (it is the only place that
 //! holds keys) — see that file's `OutboundSession.encrypt`/
 //! `InboundGroupSession.decrypt`.
+//!
+//! ## ⚠ The MAC/signature cover the RECEIVED bytes, not a re-encoding
+//!
+//! `decode` retains the received `version || payload || mac` span
+//! (`received_signed`) and `macBytes`/`signatureBytes` return slices of
+//! **that**, so verification authenticates the exact bytes that arrived.
+//!
+//! They used to re-encode the payload from the decoded fields via
+//! `encodePayload`, i.e. they authenticated a CANONICALISED form. Since
+//! this decoder — like libolm's and like vodozemac's prost-based one —
+//! accepts non-minimal LEB128 varints, reordered fields and duplicates
+//! (last wins), that made the wire format malleable: the wave-2 audit
+//! (W2-33) rewrote the index varint `0x00` of a real libolm message as
+//! `0x80 0x00`, and the resulting 94-byte message — one libolm never
+//! emitted — still decrypted to `"Message"` under the UNCHANGED
+//! signature. Any dedup / replay / audit cache keyed on the wire bytes
+//! (which is how a Matrix client would key one) is defeated by that.
+//!
+//! libolm is the reference and it authenticates its input buffer
+//! directly. In `src/inbound_group_session.c`'s `_decrypt`, after
+//! base64-decoding, the SAME `message, message_length` pointer pair is
+//! handed to both `_olm_crypto_ed25519_verify(&session->signing_key,
+//! message, message_length, message + message_length)` and
+//! `megolm_cipher->ops->decrypt(..., message, message_length, ...)` —
+//! the received range, never a re-encoding (checked against
+//! gitlab.matrix.org master while making this fix). So this is the
+//! reference's own behaviour, not an added strictness. Note the
+//! deliberate *non*-choice: the decoder is NOT made canonical-only.
+//! Rejecting non-minimal varints or reordered fields would make us
+//! stricter than libolm/vodozemac accept, and once the authenticated
+//! range is the received range it buys nothing — a non-canonical frame
+//! can then only come from the holder of the signing key, who could have
+//! sent anything anyway. `encode` on a decoded `Message` is byte-
+//! identical to its input, which is the property a wire-keyed cache
+//! needs; the fuzz harness asserts exactly that.
 
 const std = @import("std");
 
@@ -64,23 +99,36 @@ pub const Message = struct {
     ciphertext: []u8,
     mac: [wire_mac_len]u8,
     signature: [signature_len]u8,
+    /// For a DECODED message: an owned copy of the received
+    /// `version || payload || mac` bytes — everything the Ed25519
+    /// signature covers. `macBytes`/`signatureBytes` return slices of this
+    /// so verification authenticates what actually arrived rather than a
+    /// canonical re-encoding of the decoded fields (see the module doc
+    /// comment; W2-33). `null` for a `Message` built for ENCODING (the
+    /// sender defines the canonical bytes), in which case those two
+    /// functions fall back to `encodePayload`.
+    received_signed: ?[]u8 = null,
 
     pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
         allocator.free(self.ciphertext);
+        if (self.received_signed) |s| allocator.free(s);
         self.* = undefined;
     }
 
     /// `version || payload` — the bytes the wire MAC is computed over.
-    /// Caller frees.
+    /// For a decoded message this is the RECEIVED range verbatim, never a
+    /// re-encoding. Caller frees.
     pub fn macBytes(self: *const Message, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        if (self.received_signed) |s| return allocator.dupe(u8, s[0 .. s.len - wire_mac_len]);
         return encodePayload(allocator, self.message_index, self.ciphertext);
     }
 
     /// `macBytes() || mac` — the bytes the Ed25519 signature is computed
     /// over (spec: "the entire message ... are passed through HMAC-
-    /// SHA-256 ... Finally, the authenticated message is signed"). Caller
-    /// frees.
+    /// SHA-256 ... Finally, the authenticated message is signed"). For a
+    /// decoded message this is the RECEIVED range verbatim. Caller frees.
     pub fn signatureBytes(self: *const Message, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        if (self.received_signed) |s| return allocator.dupe(u8, s);
         const payload = try self.macBytes(allocator);
         defer allocator.free(payload);
         const out = try allocator.alloc(u8, payload.len + wire_mac_len);
@@ -148,11 +196,18 @@ pub const Message = struct {
         const ciphertext = try allocator.dupe(u8, ct_src);
         errdefer allocator.free(ciphertext);
 
+        // The signed range EXACTLY as received: version || payload || mac.
+        // This is what the MAC and the Ed25519 signature must be checked
+        // against — see the module doc comment (W2-33).
+        const received_signed = try allocator.dupe(u8, bytes[0 .. bytes.len - signature_len]);
+        errdefer allocator.free(received_signed);
+
         return .{
             .message_index = index,
             .ciphertext = ciphertext,
             .mac = mac_bytes.*,
             .signature = sig_bytes.*,
+            .received_signed = received_signed,
         };
     }
 
@@ -350,6 +405,94 @@ test "decode rejects: too short, wrong version, unknown field tag" {
     try testing.expectError(error.UnknownField, Message.decode(testing.allocator, &unknown_tag));
 }
 
+// ── W2-33: the authenticated range is the RECEIVED range ────────────────
+
+test "W2-33: signatureBytes/macBytes on a decoded message are the received bytes verbatim" {
+    var msg = try dummyMessage(testing.allocator);
+    defer msg.deinit(testing.allocator);
+
+    // Re-encode the SAME logical message with a deliberately non-minimal
+    // index varint (0 written as `0x80 0x00`) — a shape this decoder, like
+    // libolm's and vodozemac's, accepts. Its decoded FIELDS are identical
+    // to the minimal encoding's, so a canonical-re-encoding verifier
+    // cannot tell the two apart. Its BYTES must be what gets authenticated.
+    const noncanon = try nonMinimalIndexEncoding(testing.allocator, 0, msg.ciphertext, msg.mac, msg.signature);
+    defer testing.allocator.free(noncanon);
+
+    var decoded = try Message.decode(testing.allocator, noncanon);
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), decoded.message_index);
+
+    const sig_range = try decoded.signatureBytes(testing.allocator);
+    defer testing.allocator.free(sig_range);
+    try testing.expectEqualSlices(u8, noncanon[0 .. noncanon.len - signature_len], sig_range);
+
+    const mac_range = try decoded.macBytes(testing.allocator);
+    defer testing.allocator.free(mac_range);
+    try testing.expectEqualSlices(u8, noncanon[0 .. noncanon.len - suffix_len], mac_range);
+
+    // The canonical re-encoding of the same fields is a DIFFERENT byte
+    // string — which is exactly why authenticating it was a hole.
+    const reencoded = try encodePayload(testing.allocator, decoded.message_index, decoded.ciphertext);
+    defer testing.allocator.free(reencoded);
+    try testing.expect(!std.mem.eql(u8, reencoded, mac_range));
+}
+
+test "W2-33: decode -> encode is byte-identical, including for a non-canonical frame" {
+    var msg = try dummyMessage(testing.allocator);
+    defer msg.deinit(testing.allocator);
+    const raw = try msg.encode(testing.allocator);
+    defer testing.allocator.free(raw);
+
+    const noncanon = try nonMinimalIndexEncoding(testing.allocator, 42, msg.ciphertext, msg.mac, msg.signature);
+    defer testing.allocator.free(noncanon);
+    try testing.expect(!std.mem.eql(u8, raw, noncanon));
+
+    for ([_][]const u8{ raw, noncanon }) |input| {
+        var decoded = try Message.decode(testing.allocator, input);
+        defer decoded.deinit(testing.allocator);
+        const round_tripped = try decoded.encode(testing.allocator);
+        defer testing.allocator.free(round_tripped);
+        // A wire-keyed dedup/replay cache is only sound if this holds.
+        try testing.expectEqualSlices(u8, input, round_tripped);
+    }
+}
+
+/// `version || 0x08 || varint(index) padded to 2 bytes || 0x12 ||
+/// varint(len) || ciphertext || mac || signature`. Structurally legal,
+/// accepted by this decoder and by libolm's, but NOT the canonical form
+/// `encodePayload` produces. Caller frees.
+fn nonMinimalIndexEncoding(
+    allocator: std.mem.Allocator,
+    index: u32,
+    ciphertext: []const u8,
+    mac: [wire_mac_len]u8,
+    signature: [signature_len]u8,
+) std.mem.Allocator.Error![]u8 {
+    var hdr: [1 + 11 + 1 + 10]u8 = undefined;
+    var pos: usize = 0;
+    hdr[pos] = version;
+    pos += 1;
+    hdr[pos] = 0x08;
+    pos += 1;
+    // index with one extra continuation group (the audit's `0x80 0x00`
+    // shape when index == 0).
+    const n = writeVarint(hdr[pos..], index);
+    hdr[pos + n - 1] |= 0x80;
+    hdr[pos + n] = 0x00;
+    pos += n + 1;
+    hdr[pos] = 0x12;
+    pos += 1;
+    pos += writeVarint(hdr[pos..], @as(u64, ciphertext.len));
+
+    const out = try allocator.alloc(u8, pos + ciphertext.len + suffix_len);
+    @memcpy(out[0..pos], hdr[0..pos]);
+    @memcpy(out[pos..][0..ciphertext.len], ciphertext);
+    @memcpy(out[pos + ciphertext.len ..][0..wire_mac_len], &mac);
+    @memcpy(out[pos + ciphertext.len + wire_mac_len ..][0..signature_len], &signature);
+    return out;
+}
+
 test "decode rejects a ciphertext length claiming more bytes than remain (truncation-safe)" {
     // version, tag 0x08, index=0 (1-byte varint), tag 0x12, length=200 (a
     // 2-byte varint claiming way more than actually remains), then the
@@ -469,7 +612,18 @@ fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
 
     if (Message.decode(allocator, buf[0..n])) |msg| {
         var m = msg;
-        m.deinit(allocator);
+        defer m.deinit(allocator);
+        // ORACLE (W2-33), not just "does not crash": whatever `decode`
+        // accepts, `encode` must reproduce BYTE-IDENTICALLY. That is the
+        // property a dedup/replay cache keyed on the wire bytes depends
+        // on, and it is exactly what the canonical-re-encoding
+        // `macBytes`/`signatureBytes` broke — this assertion fires on any
+        // input whose accepted encoding is not the canonical one
+        // (non-minimal varints, reordering, duplicates), which the payload
+        // generator above deliberately produces.
+        const re = try m.encode(allocator);
+        defer allocator.free(re);
+        try testing.expectEqualSlices(u8, buf[0..n], re);
     } else |_| {}
 
     // Same bytes through the base64 wrapper, plus (sometimes) a corrupted

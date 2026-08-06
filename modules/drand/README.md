@@ -32,7 +32,7 @@ direct pairing check, not `bls_sig.verify` (see [SPEC.md](SPEC.md)).
 |---|---|
 | `root.zig` | Module doc, `meta`, flattened re-exports, dark-tests aggregator, end-to-end KAT |
 | `chaininfo.zig` | `parseInfo` → `ChainInfo` (typed plain value; decodes + `KeyValidate`s the `G2` chain key for quicknet), `Scheme` enum |
-| `round.zig` | `parseRound` → `Round` (decodes the `G1` signature; retains `randomness`/`previous_signature`); `roundPath`/`latestPath` request-path helpers |
+| `round.zig` | `parseRound` → `Round` (decodes **and `KeyValidate`s** the `G1` signature — the pairing equation cannot see a cofactor-torsion addend, so a non-subgroup signature is rejected here; retains `randomness`/`previous_signature`); `roundPath`/`latestPath` request-path helpers |
 | `verify.zig` | `verifyRound(info, round)` — the drand `VerifyBeacon` pairing equation on `bls12_381.pairing` + the `randomness == SHA-256(signature)` check; the fuzz harness |
 
 ## Schemes covered

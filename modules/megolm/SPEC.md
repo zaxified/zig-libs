@@ -93,7 +93,25 @@ The payload is a minimal two-field encoding in the shape Protocol Buffers
 uses (LEB128 varints, tag-then-value) — not general Protocol Buffers.
 The Ed25519 signature covers `version ‖ payload ‖ mac` (everything except
 itself); the MAC covers `version ‖ payload` (everything except itself and
-the signature). This ordering is why the reject-teeth in
+the signature). **On the receiving side those are the RECEIVED bytes, not
+a re-encoding of the decoded fields** — `Message.decode` retains the
+signed span and `macBytes`/`signatureBytes` return it verbatim, the way
+libolm's `_decrypt` (`src/inbound_group_session.c`) hands the same
+`message, message_length` received range to both
+`_olm_crypto_ed25519_verify` and `megolm_cipher->ops->decrypt`.
+Until the wave-2 audit (W2-33) they re-encoded canonically
+instead, which made the wire format malleable: this decoder accepts
+non-minimal LEB128 varints, reordered fields and duplicate fields (as do
+libolm's and vodozemac's), so byte-different frames decoded to identical
+fields and all verified under one unchanged signature — the audit turned
+a real 93-byte libolm message into a 94-byte one that still decrypted.
+That defeats any dedup / replay / audit cache keyed on the wire bytes.
+The decoder is deliberately still permissive (rejecting non-canonical
+encodings would make this module stricter than the network); the property
+callers get instead is that `decode` followed by `encode` is
+byte-identical to the input, which the fuzz harness asserts.
+
+This ordering is why the reject-teeth in
 "Verification"/`session.zig`'s module doc comment work out the way they
 do: tampering the ciphertext OR the mac invalidates the signature too
 (the signature covers both), so an outside attacker cannot produce a

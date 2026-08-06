@@ -207,6 +207,67 @@ test "libolm vector: real session-key + message decrypts to plaintext 'Message' 
     try testing.expectEqualStrings("Message", decrypted.plaintext);
 }
 
+// ── W2-33: the wave-2 audit's own malleability reproducer ───────────────
+//
+// The audit took the real libolm message below (93 raw bytes,
+// `raw[0..6] = 03 08 00 12 10 1c`), rewrote the message-index varint
+// `0x00` as the non-minimal `0x80 0x00` (94 bytes -- a message libolm
+// never emitted) and got `MALLEATED MESSAGE ACCEPTED, plaintext='Message'`
+// under the UNCHANGED Ed25519 signature, because `signatureBytes()`
+// re-encoded the payload canonically instead of returning the received
+// range. It must now be `InvalidSignature`.
+test "W2-33: a non-minimal-varint remake of the real libolm message is REJECTED" {
+    const session_key_b64 =
+        "AgAAAAAwMTIzNDU2Nzg5QUJERUYwMTIzNDU2Nzg5QUJDREVGMDEyMzQ1Njc4OUFCREVGM" ++
+        "DEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlBQkRFRjAxMjM0NTY3ODlBQkNERUYwMTIzND" ++
+        "U2Nzg5QUJERUYwMTIzNDU2Nzg5QUJDREVGMDEyMw0bdg1BDq4Px/slBow06q8n/B9WBfw" ++
+        "WYyNOB8DlUmXGGwrFmaSb9bR/eY8xgERrxmP07hFmD9uqA2p8PMHdnV5ysmgufE6oLZ5+" ++
+        "8/mWQOW3VVTnDIlnwd8oHUYRuk8TCQ";
+    const message_b64 =
+        "AwgAEhAcbh6UpbByoyZxufQ+h2B+8XHMjhR69G8F4+qjMaFlnIXusJZX3r8LnRORG9T3D" ++
+        "XFdbVuvIWrLyRfm4i8QRbe8VPwGRFG57B1CtmxanuP8bHtnnYqlwPsD";
+
+    const codec = std.base64.standard_no_pad;
+    const raw = try testing.allocator.alloc(u8, try codec.Decoder.calcSizeForSlice(message_b64));
+    defer testing.allocator.free(raw);
+    try codec.Decoder.decode(raw, message_b64);
+    // Pin the audit's own byte prefix so this test breaks loudly if the
+    // vector is ever swapped for one with a different index encoding.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x08, 0x00, 0x12, 0x10, 0x1c }, raw[0..6]);
+    try testing.expectEqual(@as(usize, 93), raw.len);
+
+    // 03 08 [00] 12 ...  ->  03 08 [80 00] 12 ...
+    const mal = try testing.allocator.alloc(u8, raw.len + 1);
+    defer testing.allocator.free(mal);
+    @memcpy(mal[0..2], raw[0..2]);
+    mal[2] = 0x80;
+    mal[3] = 0x00;
+    @memcpy(mal[4..], raw[3..]);
+    try testing.expectEqual(@as(usize, 94), mal.len);
+
+    const key = try SessionKey.fromBase64(testing.allocator, session_key_b64);
+    var session = try InboundGroupSession.fromSessionKey(key);
+    defer session.deinit();
+
+    // Control: the genuine bytes still decrypt (the fix is not a blanket
+    // reject, and the decoder is deliberately NOT made canonical-only --
+    // the malleated frame still DECODES, it just no longer authenticates).
+    var msg_ok = try Message.fromBase64(testing.allocator, message_b64);
+    defer msg_ok.deinit(testing.allocator);
+    var ok = try session.decrypt(testing.allocator, &msg_ok);
+    defer ok.deinit(testing.allocator);
+    try testing.expectEqualStrings("Message", ok.plaintext);
+
+    var msg_mal = try Message.decode(testing.allocator, mal);
+    defer msg_mal.deinit(testing.allocator);
+    try testing.expectEqual(msg_ok.message_index, msg_mal.message_index);
+    try testing.expectEqualSlices(u8, msg_ok.ciphertext, msg_mal.ciphertext);
+    try testing.expectEqualSlices(u8, &msg_ok.signature, &msg_mal.signature);
+    // Same decoded fields, same signature, different wire bytes -- and now
+    // it must NOT verify.
+    try testing.expectError(error.InvalidSignature, session.decrypt(testing.allocator, &msg_mal));
+}
+
 test "libolm vector: tampered final byte (part of the signature) is rejected as InvalidSignature" {
     const session_key_b64 =
         "AgAAAAAwMTIzNDU2Nzg5QUJERUYwMTIzNDU2Nzg5QUJDREVGMDEyMzQ1Njc4OUFCREVGM" ++

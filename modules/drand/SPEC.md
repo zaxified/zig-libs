@@ -122,6 +122,15 @@ stop) feeding crafted bytes:
   `bls12_381`'s `fromBytesCompressed` deliberately does NOT subgroup-
   check (that module's documented pitfall — callers at trust boundaries
   must, and this module is that boundary).
+- **Non-subgroup beacon signature** → `SignatureNotInSubgroup` at
+  `parseRound`, and `false` from `verifyRoundPoints`. The same
+  `KeyValidate` obligation applies to the `G1` signature, and the pairing
+  equation does **not** discharge it: for a cofactor-torsion `T`
+  (`ord(T) | h1`, `gcd(h1, r) = 1`) we have `e(T, Q) = 1`, so
+  `sig' = sig + T` is different wire bytes satisfying the same equation —
+  a malleated beacon whose `randomness = SHA-256(sig')` the attacker
+  simply recomputes. drand's own Go client subgroup-checks on
+  deserialization. Found by the wave-2 audit (W2-32).
 - **Wrong signature / wrong round / wrong chain key** → the pairing
   equation fails → `InvalidSignature`. Never a silent false-accept.
 - **Number overflow** (`period`/`genesis_time` past `u64`) →

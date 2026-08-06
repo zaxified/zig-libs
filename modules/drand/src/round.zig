@@ -19,11 +19,28 @@
 //!
 //! For the sig-on-`G1` scheme (quicknet), the 48-byte compressed
 //! `signature` is decoded into a `bls12_381` `G1` point (the group
-//! element `verify` pairs against). The signature is NOT subgroup-checked
-//! at parse time — `verify.verifyRound`'s pairing equation is a full BLS
-//! verify that rejects an off-subgroup or wrong point; a caller wanting a
-//! standalone `KeyValidate` can call `Round.signatureG1` and subgroup-
-//! check the result. `randomness`, when present, is retained for the
+//! element `verify` pairs against) and that point IS subgroup-checked
+//! here, mirroring what `chaininfo.parseInfo` does for the `G2` public
+//! key and what drand's own Go client does on deserialization: its
+//! `kyber-bls12381` `KyberG1.UnmarshalBinary` calls
+//! `bls12381.NewG1().FromCompressed`, and kilic/bls12-381's
+//! `G1.FromCompressed` ends with
+//! `if !g.InCorrectSubgroup(p) { return nil, errors.New("point is not
+//! on correct subgroup") }` (both read from upstream master while
+//! making this fix).
+//!
+//! ⚠ The pairing equation in `verify.verifyRoundPoints` does NOT stand in
+//! for this check. For a cofactor-torsion point `T` (`ord(T) | h1`,
+//! `gcd(h1, r) = 1`) the pairing `e(T, Q)` lands in `μ_r` with order
+//! dividing `ord(T)`, hence `e(T, Q) = 1`; so by bilinearity
+//! `e(sig + T, Q) = e(sig, Q)` and `sig' = sig + T` is a DIFFERENT 48-byte
+//! encoding that satisfies the same equation. Without this check two
+//! honest verifiers could be handed different "verified" signatures — and
+//! different `randomness`, since the attacker recomputes
+//! `SHA-256(sig')` — for the same round. Found by the wave-2 audit
+//! (W2-32), which demonstrated the acceptance live.
+//!
+//! `randomness`, when present, is retained for the
 //! `randomness == SHA-256(signature)` check `verify` performs.
 //!
 //! The parser is pure and bounds-checked: malformed / truncated /
@@ -53,6 +70,11 @@ pub const RoundParseError = error{
     InvalidLength,
     /// The signature bytes are not a valid compressed `G1` point.
     InvalidPoint,
+    /// The signature decoded to a point that is on the curve `E(Fp)` but
+    /// NOT in the order-`r` subgroup `G1`. See the module doc comment:
+    /// the pairing equation cannot see a cofactor-torsion addend, so this
+    /// is the only place a malleated `sig + T` is caught.
+    SignatureNotInSubgroup,
     OutOfMemory,
 };
 
@@ -134,7 +156,12 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
 
     var sig_g1: ?g1.Affine = null;
     if (sig_len == sig_g1_bytes) {
-        sig_g1 = g1.fromBytesCompressed(sig_bytes[0..sig_g1_bytes].*) catch return error.InvalidPoint;
+        const pt = g1.fromBytesCompressed(sig_bytes[0..sig_g1_bytes].*) catch return error.InvalidPoint;
+        // The subgroup check the pairing equation cannot do for us — see
+        // the module doc comment. Same guard `chaininfo.parseInfo` applies
+        // to the G2 public key (`PublicKeyNotInSubgroup`).
+        if (!g1.Jacobian.fromAffine(pt).subgroupCheck()) return error.SignatureNotInSubgroup;
+        sig_g1 = pt;
     }
 
     var randomness: ?[32]u8 = null;
@@ -210,17 +237,45 @@ test "parseRound: decoded G1 signature is in the subgroup" {
     try testing.expect(g1.Jacobian.fromAffine(sig).subgroupCheck());
 }
 
-test "parseRound: flipped-byte signature still decodes (a valid but different point) or fails at decode" {
-    // Flip the last hex nibble of the signature: the result is either a
-    // different valid G1 point or an invalid encoding — never a panic.
+test "parseRound: an on-curve signature OUTSIDE G1 → SignatureNotInSubgroup (W2-32)" {
+    // The on-curve, non-subgroup point at x = 4 (the same construction
+    // `bls12_381`'s own subgroupCheck test uses), presented as a round
+    // signature. Decompression succeeds — `fromBytesCompressed` only
+    // checks the curve equation — so `InvalidPoint` never fires and this
+    // is the ONLY guard between such a point and the pairing equation,
+    // which cannot see it.
+    var comp = [_]u8{0} ** sig_g1_bytes;
+    comp[0] = 0x80;
+    comp[sig_g1_bytes - 1] = 4;
+    const pt = try g1.fromBytesCompressed(comp);
+    try testing.expect(g1.Jacobian.fromAffine(pt).isOnCurve());
+    try testing.expect(!g1.Jacobian.fromAffine(pt).subgroupCheck());
+
+    const doc = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"round\":1000,\"signature\":\"{s}\"}}",
+        .{std.fmt.bytesToHex(comp, .lower)},
+    );
+    defer testing.allocator.free(doc);
+    try testing.expectError(error.SignatureNotInSubgroup, parseRound(testing.allocator, doc));
+}
+
+test "parseRound: flipped-byte signature is REJECTED, not silently decoded" {
+    // Flip the last hex nibble of the signature. Before W2-32's fix this
+    // test allowed the parse to SUCCEED ("decoded to some point"), which
+    // is precisely the hole: a tampered x-coordinate that still satisfies
+    // the curve equation lands in the order-`r` subgroup with probability
+    // `1/h1` (h1 ≈ 2^126), so what it actually produces is an off-subgroup
+    // point — and it used to be handed straight to the pairing. The
+    // expectation was widened, not the check: both outcomes below are
+    // typed REJECTIONS, and success is no longer among them.
     const flipped =
         \\{"round":1000,"signature":"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e38"}
     ;
     const res = parseRound(testing.allocator, flipped);
-    if (res) |r| {
-        try testing.expect(r.sig_g1 != null); // decoded to some point
-    } else |err| {
-        try testing.expect(err == error.InvalidPoint);
+    try testing.expect(std.meta.isError(res));
+    if (res) |_| unreachable else |err| {
+        try testing.expect(err == error.InvalidPoint or err == error.SignatureNotInSubgroup);
     }
 }
 

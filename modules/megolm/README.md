@@ -82,7 +82,7 @@ original private key).
 | `src/root.zig` | `meta`, flat re-exports, dark-tests aggregator |
 | `src/ratchet.zig` | The 128-byte four-part hash ratchet: `advanceStep` (one message), `advanceToUnchecked` (unconditional fast-forward incl. 32-bit wraparound), guarded `advanceTo` (`error.CannotRatchetBackward`) |
 | `src/cipher.zig` | HKDF-SHA-256 key derivation (`AES_KEY‖HMAC_KEY‖AES_IV`, info `"MEGOLM_KEYS"`) + AES-256-CBC/PKCS#7 (over the sibling `aescbc` module) + truncated HMAC-SHA-256 |
-| `src/message.zig` | The wire message codec (version + LEB128-tagged payload + MAC + signature byte ranges) — no keys, no crypto |
+| `src/message.zig` | The wire message codec (version + LEB128-tagged payload + MAC + signature byte ranges) — no keys, no crypto. A decoded `Message` retains the **received** signed span, so verification authenticates the bytes that arrived rather than a canonical re-encoding (`decode` → `encode` is byte-identical) |
 | `src/session_key.zig` | The signed session-sharing format (`SessionKey`, self-verifying) and unsigned session-export format (`ExportedSessionKey`) |
 | `src/session.zig` | `OutboundSession` (encrypt+sign+advance) and `InboundGroupSession` (verify signature → locate ratchet → verify MAC → decrypt) |
 | `src/kat_test.zig` | External anchors (libolm ratchet vectors + a real libolm session-key+message pair) and the reject-teeth battery |

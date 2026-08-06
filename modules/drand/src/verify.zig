@@ -92,6 +92,22 @@ pub fn verifyRoundPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
     // Found by the 1A mutation audit.
     if (pubkey.infinity or sig.infinity) return false;
 
+    // ⚠ Reject a signature that is on the curve but OUTSIDE the order-`r`
+    // subgroup. The pairing equation below is blind to a cofactor-torsion
+    // addend `T`: `e(T, Q)` has order dividing `gcd(ord(T), r) = 1`, so
+    // `e(sig + T, Q) = e(sig, Q)` and the malleated `sig' = sig + T`
+    // satisfies the same equation with different wire bytes. `parseRound`
+    // rejects such a point at the parse boundary; this is the same guard
+    // for the callers this function's doc comment invites to skip the
+    // parser (a guard living in a caller is not a guard this function
+    // has). The public key's subgroup membership is guaranteed by
+    // `chaininfo.parseInfo`; a caller supplying a `g2.Affine` from
+    // elsewhere must run `g2.Jacobian.fromAffine(pk).subgroupCheck()`
+    // itself — the G2 check is ~2x the cost of this one and would be paid
+    // on every beacon for a point this module's own parser has already
+    // validated. Found by the wave-2 audit (W2-32).
+    if (!g1.Jacobian.fromAffine(sig).subgroupCheck()) return false;
+
     const qid = ciphersuite.h1(ciphersuite.beaconId(round));
     const neg_qid = g1.Jacobian.fromAffine(qid).negate().toAffine();
     return pairing.pairingCheck(&.{
@@ -178,19 +194,21 @@ test "verifyRound: the round-1000 randomness equals SHA-256(signature)" {
 
 // ── negative tests: never a false accept ───────────────────────────────
 
-test "verifyRound: a flipped signature byte → InvalidSignature" {
+test "verifyRound: a flipped signature byte is rejected (parse or verify), never accepted" {
     const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
-    // Same round, last signature nibble flipped 9→8 (still a valid G1
-    // point, just not the right one).
+    // Same round, last signature nibble flipped 9→8.
     const bad_round =
         \\{"round":1000,"signature":"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e38"}
     ;
-    const rnd = round_mod.parseRound(testing.allocator, bad_round) catch {
-        // If the flipped bytes fail to decode as a point, that is also a
-        // correct rejection (never a false accept) — the test's contract.
-        return;
-    };
-    try testing.expectError(error.InvalidSignature, verifyRound(&info, &rnd));
+    // ⚠ This used to be `… catch { return; }` — a bare `return` from a Zig
+    // test body is a PASS, so once W2-32's subgroup check started
+    // rejecting this input at parse time the test would have silently
+    // stopped asserting anything. Assert the rejection instead.
+    if (round_mod.parseRound(testing.allocator, bad_round)) |rnd| {
+        try testing.expectError(error.InvalidSignature, verifyRound(&info, &rnd));
+    } else |err| {
+        try testing.expect(err == error.InvalidPoint or err == error.SignatureNotInSubgroup);
+    }
 }
 
 test "verifyRound: correct signature but WRONG round number → InvalidSignature" {
@@ -243,6 +261,94 @@ test "verifyRound: an unsupported (chained) scheme → UnsupportedScheme" {
     const info = try chaininfo.parseInfo(testing.allocator, chained);
     const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
     try testing.expectError(error.UnsupportedScheme, verifyRound(&info, &rnd));
+}
+
+// ── W2-32: cofactor-torsion malleation of a GENUINE signature ──────────
+//
+// The wave-2 audit demonstrated live that `verifyRound` ACCEPTED a forged
+// round-1000 document whose signature was `sig + T` for a cofactor-torsion
+// `T`, with `randomness` recomputed by the attacker so the
+// `randomness == SHA-256(signature)` check passed too. This reconstructs
+// that exact forgery from the torsion point (NOT from a random blob), so
+// the test pins the property rather than an accident of some byte string.
+
+/// `T = [r]·P` where `P` is the on-curve, NOT-in-`G1` point at `x = 4`.
+/// Multiplying by the group order `r` annihilates the order-`r` component,
+/// leaving a pure cofactor-torsion point: `ord(T) | h1` and
+/// `gcd(h1, r) = 1`, hence `e(T, Q) ∈ μ_r` has order 1, i.e. `e(T, Q) = 1`.
+/// By bilinearity `e(sig + T, Q) = e(sig, Q)` — the pairing equation
+/// literally cannot distinguish the two.
+fn cofactorTorsionPoint() !g1.Jacobian {
+    var comp = [_]u8{0} ** g1.compressed_bytes;
+    comp[0] = 0x80; // compression flag set, sort = 0
+    comp[g1.compressed_bytes - 1] = 4;
+    const p = try g1.fromBytesCompressed(comp);
+    return g1.Jacobian.fromAffine(p).scalarMulBytes(&bls12_381.scalar.r_bytes);
+}
+
+test "W2-32: sig + cofactor-torsion is a different encoding the pairing alone cannot see" {
+    const t = try cofactorTorsionPoint();
+    // T is a real, non-trivial torsion point: on the curve, not O, not in G1.
+    try testing.expect(!t.isIdentity());
+    try testing.expect(t.isOnCurve());
+    try testing.expect(!t.subgroupCheck());
+
+    const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
+    const mal = g1.Jacobian.fromAffine(rnd.sig_g1.?).add(t).toAffine();
+    const mal_bytes = g1.toBytesCompressed(mal);
+
+    // It really is a DIFFERENT 48-byte encoding for the SAME round…
+    try testing.expect(!std.mem.eql(u8, &mal_bytes, rnd.signatureBytes()));
+    // …and the raw pairing equation, on its own, still holds for it. This
+    // is the assertion that makes the guards below load-bearing rather
+    // than decorative: there is nothing in the equation to fail.
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    const qid = ciphersuite.h1(ciphersuite.beaconId(rnd.round));
+    const neg_qid = g1.Jacobian.fromAffine(qid).negate().toAffine();
+    try testing.expect(pairing.pairingCheck(&.{
+        .{ .p = mal, .q = g2.Affine.generator },
+        .{ .p = neg_qid, .q = info.pubkey_g2.? },
+    }));
+}
+
+test "W2-32: verifyRoundPoints REFUSES the malleated signature" {
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
+    const t = try cofactorTorsionPoint();
+    const mal = g1.Jacobian.fromAffine(rnd.sig_g1.?).add(t).toAffine();
+
+    // Control: the genuine point still verifies (the guard is not a blanket reject).
+    try testing.expect(verifyRoundPoints(info.pubkey_g2.?, rnd.round, rnd.sig_g1.?));
+    try testing.expect(!verifyRoundPoints(info.pubkey_g2.?, rnd.round, mal));
+}
+
+test "W2-32: the full public path refuses the forged round-1000 document" {
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
+    const t = try cofactorTorsionPoint();
+    const mal_bytes = g1.toBytesCompressed(g1.Jacobian.fromAffine(rnd.sig_g1.?).add(t).toAffine());
+
+    // The attacker recomputes randomness = SHA-256(sig') so that check
+    // passes as well — exactly the document the audit got accepted.
+    var digest: [32]u8 = undefined;
+    Sha256.hash(&mal_bytes, &digest, .{});
+    const forged = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"round\":1000,\"randomness\":\"{s}\",\"signature\":\"{s}\"}}",
+        .{ std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(mal_bytes, .lower) },
+    );
+    defer testing.allocator.free(forged);
+
+    // Rejected at the parse boundary…
+    try testing.expectError(error.SignatureNotInSubgroup, round_mod.parseRound(testing.allocator, forged));
+
+    // …and again by `verifyRound` for a `Round` a caller built by hand
+    // (`Round` is a plain value type; nothing forces it through `parseRound`).
+    var handmade = rnd;
+    handmade.sig_bytes[0..mal_bytes.len].* = mal_bytes;
+    handmade.sig_g1 = g1.Jacobian.fromAffine(rnd.sig_g1.?).add(t).toAffine();
+    handmade.randomness = digest;
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &handmade));
 }
 
 // ── POSITIVE CONTROL: prove the test actually pins the scheme ──────────
@@ -315,3 +421,4 @@ test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.generator));
     try std.testing.expect(!verifyRoundPoints(g2.Affine.generator, 1, g1.Affine.identity));
 }
+
