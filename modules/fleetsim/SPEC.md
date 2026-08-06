@@ -187,6 +187,22 @@ Proved, not asserted, by three tests:
 
 ## What was verified live, against real third-party masters
 
+> **How to tell whether any of this ran.** The transcripts below are a record of
+> runs that happened once, on a host where those masters were installed; they
+> are prose, not a check. Two things make that record falsifiable:
+>
+> 1. **`FLEETSIM_EXPECT_LIVE=1`** — the live lane. With it set, every live test
+>    whose `FLEETSIM_*_LISTEN` variable is missing (or whose binding gets no
+>    peer) **fails** instead of skipping, so "0 of 8 live tests ran" can no
+>    longer look identical to "all 8 passed" at the exit code. Without it, the
+>    default run still skips, and its summary line still says so.
+> 2. **`src/goldens.zig`** (plus the OPC UA vector in `src/root.zig`) — a
+>    third-party *reading* of the bytes the adapters emit, frozen from
+>    Wireshark 4.6.4's dissectors for all seven protocols. It runs offline on
+>    every build with no new dependency. It grades frames, so it does not
+>    replace a real master's state machine; it does mean a green
+>    `test-fleetsim` is no longer entirely self-anchored.
+
 **All seven protocols now have third-party-master evidence through the adapter
 and the module's own binding**, on Linux, Debug build. Each run schedules a
 `trouble` fault at simulated t=15 s and the master polls across it, so the

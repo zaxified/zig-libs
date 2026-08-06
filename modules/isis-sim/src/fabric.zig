@@ -162,6 +162,29 @@ const NodeState = struct {
 
 const Failure = struct { time: Time, a: NodeId, b: NodeId };
 
+/// How the run is configured beyond the topology. The defaults reproduce the
+/// original harness exactly — a **perfect** medium with retransmission switched
+/// off — so every pre-existing test is unaffected. The wave-2 audit's HIGH
+/// finding was that this was the *only* configuration ever exercised, i.e. the
+/// one condition under which IS-IS flooding is trivially correct.
+pub const Options = struct {
+    /// The per-link medium handed to `netsim`. `netsim` models loss,
+    /// duplication, reordering and jitter on every link; turning them on is
+    /// what makes the flooding result mean something.
+    link: netsim.LinkConfig = .{ .latency = link_latency },
+    /// `isis-flood`'s minimum LSP transmission interval — the **retransmit**
+    /// timer. The default is larger than any run horizon, so retransmission is
+    /// inert; that is only sound on a lossless medium. Any run with
+    /// `link.loss_permille > 0` (or a `drop_once` fault) MUST lower this, or a
+    /// dropped LSP is never resent and the fabric provably cannot converge.
+    retransmit_interval: Time = min_lsp_interval,
+    /// `isis-flood`'s periodic CSNP interval. Lowering it turns the
+    /// database-summary resync path from a single startup event into a live
+    /// repair mechanism — which is what actually recovers a database after
+    /// loss.
+    csnp_interval: Time = csnp_interval,
+};
+
 // ── the Fabric (the Protocol context) ────────────────────────────────────────
 
 /// A small IS-IS/SPB fabric and the state to run it through netsim. Single-owner;
@@ -170,7 +193,12 @@ pub const Fabric = struct {
     gpa: Allocator,
     nodes: []NodeState,
     seed: u64,
+    opts: Options = .{},
     failures: std.ArrayListUnmanaged(Failure) = .empty,
+    /// Extra one-shot / partition fault events merged into the trace built by
+    /// `runToConvergence`, on top of the `link_down` pairs `failures` produces.
+    /// `netsim` has always supported these; nothing used to add any.
+    extra_faults: std.ArrayListUnmanaged(netsim.FaultEvent) = .empty,
     /// The current run's time horizon (`until`), so a hook never arms a timer
     /// past the end of the run. Set by `runToConvergence`.
     horizon: Time = 0,
@@ -208,6 +236,15 @@ pub const Fabric = struct {
     wipe_done: bool = false,
 
     pub fn init(gpa: Allocator, topo: Topology, seed: u64) Allocator.Error!Fabric {
+        return initWithOptions(gpa, topo, seed, .{});
+    }
+
+    pub fn initWithOptions(
+        gpa: Allocator,
+        topo: Topology,
+        seed: u64,
+        opts: Options,
+    ) Allocator.Error!Fabric {
         const nodes = try gpa.alloc(NodeState, topo.node_count);
         errdefer gpa.free(nodes);
 
@@ -251,7 +288,7 @@ pub const Fabric = struct {
                 .neighbours = neighbours,
                 .link_failed = link_failed,
                 .lsdb = isis_lsdb.Lsdb.init(gpa, lsdbConfig(sys, degree, topo.node_count)),
-                .sched = isis_flood.Scheduler.init(gpa, schedConfig(sys)),
+                .sched = isis_flood.Scheduler.init(gpa, schedConfig(sys, opts)),
                 .seq = 0,
             };
             initialized += 1;
@@ -262,7 +299,7 @@ pub const Fabric = struct {
         const seen_seq = try gpa.alloc(u32, topo.node_count * topo.node_count);
         @memset(seen_seq, 0);
 
-        return .{ .gpa = gpa, .nodes = nodes, .seed = seed, .seen_seq = seen_seq };
+        return .{ .gpa = gpa, .nodes = nodes, .seed = seed, .opts = opts, .seen_seq = seen_seq };
     }
 
     pub fn deinit(self: *Fabric) void {
@@ -275,6 +312,7 @@ pub const Fabric = struct {
         self.gpa.free(self.seen_seq);
         self.gpa.free(self.nodes);
         self.failures.deinit(self.gpa);
+        self.extra_faults.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -287,11 +325,11 @@ pub const Fabric = struct {
         };
     }
 
-    fn schedConfig(sys: SystemId) isis_flood.Config {
+    fn schedConfig(sys: SystemId, opts: Options) isis_flood.Config {
         return .{
             .local_system_id = sys,
-            .min_lsp_transmission_interval = min_lsp_interval,
-            .complete_snp_interval = csnp_interval,
+            .min_lsp_transmission_interval = opts.retransmit_interval,
+            .complete_snp_interval = opts.csnp_interval,
         };
     }
 
@@ -336,7 +374,7 @@ pub const Fabric = struct {
             ns.lsdb.deinit();
             ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, node_count));
             ns.sched.deinit();
-            ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id));
+            ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
             ns.seq = 0;
             @memset(ns.link_failed, false);
             _ = i;
@@ -509,15 +547,21 @@ pub const Fabric = struct {
             try sim.send(node, nbr, e.bytes);
         }
 
-        // Self-terminating: only re-arm when we actually sent something (a
-        // zero-effect poll means SRM/SSN drained → quiesce). Never arm past the
-        // run horizon.
+        // Self-terminating: re-arm only while flooding work remains, and never
+        // past the run horizon.
+        //
+        // The `effects.len > 0` clause used to guard this, which quietly made
+        // **retransmission unreachable**: a poll whose LSP was dropped by the
+        // medium emits nothing (the pacing gate holds it) yet reports a
+        // `next_wakeup` at the retransmit deadline — and with no timer armed
+        // for it, the node parked forever with SRM still set. Honouring
+        // `next_wakeup` regardless of the effect count is what lets the
+        // retransmit path run at all, and it is still self-terminating because
+        // `poll` returns `next_wakeup == null` once SRM/SSN have drained.
         if (r.truncated) {
             if (now + 1 <= self.horizon) try sim.setTimer(node, 1, timer_poll);
-        } else if (r.effects.len > 0) {
-            if (r.next_wakeup) |w| {
-                if (w > now and w <= self.horizon) try sim.setTimer(node, w - now, timer_poll);
-            }
+        } else if (r.next_wakeup) |w| {
+            if (w > now and w <= self.horizon) try sim.setTimer(node, w - now, timer_poll);
         }
     }
 
@@ -553,6 +597,10 @@ pub const Fabric = struct {
             try trace.append(self.gpa, .{ .time = f.time, .kind = .{ .link_down = .{ .a = f.a, .b = f.b } } });
             try trace.append(self.gpa, .{ .time = f.time, .kind = .{ .link_down = .{ .a = f.b, .b = f.a } } });
         }
+        // One-shot drops / duplications / delays and partition+heal pairs the
+        // caller registered. `netsim.replay` sorts by time, so append order
+        // does not matter.
+        try trace.appendSlice(self.gpa, self.extra_faults.items);
 
         const case = netsim.Case{
             .seed = self.seed,
@@ -678,7 +726,7 @@ fn buildScenario(sim: *netsim.Sim) anyerror!void {
     for (fab.nodes, 0..) |ns, a| {
         for (ns.neighbours) |nb| {
             if (@as(usize, nb.node) > a) {
-                try sim.addBiLink(@intCast(a), nb.node, .{ .latency = link_latency });
+                try sim.addBiLink(@intCast(a), nb.node, fab.opts.link);
             }
         }
     }
@@ -954,4 +1002,192 @@ test "positive control: breaking the flood-drain leaves far nodes ignorant (RED)
     // away. This is the sentinel that the flood-propagation wiring is required.
     try testing.expect(!fab.lsdbsAgree());
     try testing.expect(fab.storedSequence(3, 0) == null); // D lacks A's LSP
+}
+
+// ── the imperfect medium (wave-2 W2-54) ──────────────────────────────────────
+//
+// Everything above this line runs over a perfect network: no loss, no
+// duplication, no reordering, and `min_lsp_transmission_interval` set past the
+// horizon so the retransmit path is dead code. That is the one condition under
+// which IS-IS flooding is trivially correct. The tests below turn on the
+// medium `netsim` has always modelled.
+
+/// Retransmit + CSNP intervals for the lossy runs. Both must be well inside the
+/// run horizon or a dropped LSP is never resent and a diverged database is
+/// never resynchronised — the two mechanisms that make flooding robust.
+/// Only the retransmit timer is restored; the periodic CSNP is left inert (its
+/// module default), so **retransmission** is the sole repair path in every test
+/// below. Measured, not assumed — 16 seeds, 200%o loss, 20 000 ticks:
+///
+///   * `retransmit_interval = 40`, CSNP inert  → converged **16/16**
+///   * CSNP at 400, `retransmit_interval` inert → converged **0/16**
+///
+/// The second row is not evidence that CSNP resync is broken: this knob is
+/// `isis-flood`'s `min_lsp_transmission_interval`, which paces *every* LSP
+/// transmission on a circuit, so while it sits past the run horizon no
+/// mechanism can re-send a dropped LSP — a CSNP-driven PSNP request included.
+/// Whether the CSNP path repairs a loss on its own is therefore still
+/// unmeasured here; see the audit's separate CSNP-fixture finding.
+const lossy_opts_base = Options{
+    .retransmit_interval = 40,
+};
+
+/// A shorter horizon than `step_cap`, because a retransmit timer that keeps
+/// re-arming spends `netsim`'s 200 000-event ceiling on steady-state churn long
+/// after the fabric has converged — and `runToConvergence` reports the event cap
+/// as `.step_cap_exceeded` even when the fabric is quiesced and agreeing (the
+/// outcome collapsing the audit records separately). 20 000 ticks is ~500
+/// retransmit periods, far more than convergence needs.
+const lossy_step_cap: Time = 20_000;
+
+test "lossy medium: a 4-node line still converges when 20% of messages are dropped" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var opts = lossy_opts_base;
+    opts.link = .{ .latency = link_latency, .loss_permille = 200 };
+
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xA11CE, opts);
+    defer fab.deinit();
+
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(lossy_step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    var node: NodeId = 0;
+    while (node < 4) : (node += 1) {
+        var origin: NodeId = 0;
+        while (origin < 4) : (origin += 1) {
+            try testing.expectEqual(@as(?u32, 1), fab.storedSequence(node, origin));
+        }
+    }
+    try testing.expectEqual(@as(?anyerror, null), fab.violation);
+}
+
+test "lossy medium: duplication, reordering and jitter do not corrupt any LSDB" {
+    const edges = [_]Edge{
+        .{ .a = 0, .b = 1, .metric = 10 },
+        .{ .a = 1, .b = 2, .metric = 10 },
+        .{ .a = 2, .b = 3, .metric = 10 },
+        .{ .a = 3, .b = 0, .metric = 10 },
+        .{ .a = 2, .b = 4, .metric = 10 },
+    };
+    var opts = lossy_opts_base;
+    opts.link = .{
+        .latency = link_latency,
+        .jitter = 3,
+        .loss_permille = 100,
+        .dup_permille = 250,
+        .reorder_permille = 250,
+        .reorder_extra = 7,
+    };
+    var fab = try Fabric.initWithOptions(
+        testing.allocator,
+        .{ .node_count = 5, .edges = &edges },
+        0xC0FFEE,
+        opts,
+    );
+    defer fab.deinit();
+
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(lossy_step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    // The per-event invariants (no sequence regression, no LSDB overflow) held
+    // throughout, not just at the end.
+    try testing.expectEqual(@as(?anyerror, null), fab.violation);
+    var origin: NodeId = 0;
+    while (origin < 5) : (origin += 1) {
+        try testing.expectEqual(@as(?u32, 1), fab.storedSequence(0, origin));
+    }
+}
+
+test "lossy medium: a seed sweep, not one hard-coded draw" {
+    // The audit's F1: every result above rested on a single fixed seed. Sweep
+    // instead — each seed is a different loss/duplication/reorder schedule, and
+    // convergence must hold on all of them.
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var opts = lossy_opts_base;
+    opts.link = .{
+        .latency = link_latency,
+        .loss_permille = 150,
+        .dup_permille = 150,
+        .reorder_permille = 150,
+        .reorder_extra = 5,
+    };
+
+    var seed: u64 = 1;
+    while (seed <= 32) : (seed += 1) {
+        var fab = try Fabric.initWithOptions(testing.allocator, topo, seed *% 0x9E3779B97F4A7C15, opts);
+        defer fab.deinit();
+        const outcome = try fab.runToConvergence(lossy_step_cap);
+        if (outcome != .converged or !fab.lsdbsAgree()) {
+            std.debug.print(
+                "seed {d} did not converge: outcome={t} agree={} violation={?}\n",
+                .{ seed, outcome, fab.lsdbsAgree(), fab.violation },
+            );
+            return error.LossySeedDidNotConverge;
+        }
+    }
+}
+
+test "one-shot faults: a dropped first LSP is repaired by retransmission" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    // No probabilistic loss at all — the single scheduled `drop_once` is the
+    // whole fault, so if this converges it is retransmission (or CSNP resync)
+    // that did it, not luck.
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 4242, lossy_opts_base);
+    defer fab.deinit();
+    try fab.extra_faults.append(testing.allocator, .{
+        .time = 0,
+        .kind = .{ .drop_once = .{ .a = 0, .b = 1 } },
+    });
+    try fab.extra_faults.append(testing.allocator, .{
+        .time = 0,
+        .kind = .{ .dup_once = .{ .a = 1, .b = 2 } },
+    });
+    try fab.extra_faults.append(testing.allocator, .{
+        .time = 0,
+        .kind = .{ .delay_once = .{ .a = 2, .b = 3, .extra = 37 } },
+    });
+
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(lossy_step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expectEqual(@as(?u32, 1), fab.storedSequence(3, 0)); // A's LSP reached D
+    try testing.expectEqual(@as(?anyerror, null), fab.violation);
+}
+
+test "one-shot faults: a partition that heals re-synchronises both sides" {
+    const edges = [_]Edge{
+        .{ .a = 0, .b = 1, .metric = 10 },
+        .{ .a = 1, .b = 2, .metric = 10 },
+        .{ .a = 2, .b = 3, .metric = 10 },
+    };
+    const topo = Topology{ .node_count = 4, .edges = &edges };
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0x5EED, lossy_opts_base);
+    defer fab.deinit();
+
+    // Cut {0,1} from {2,3} before anything has flooded, then heal well before
+    // the horizon. A partition is not a `link_down`: it is applied by netsim as
+    // a cut across the whole graph and reversed by id, and nothing in this
+    // module used it.
+    const cut = [_]NodeId{ 0, 1 };
+    try fab.extra_faults.append(testing.allocator, .{
+        .time = 0,
+        .kind = .{ .partition = .{ .id = 1, .cut = &cut } },
+    });
+    try fab.extra_faults.append(testing.allocator, .{
+        .time = 300,
+        .kind = .{ .heal = .{ .id = 1 } },
+    });
+
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(lossy_step_cap));
+    // After the heal every node must hold every originator again — the state a
+    // partition-only run (which the harness used to stop at) cannot reach.
+    try testing.expect(fab.lsdbsAgree());
+    var node: NodeId = 0;
+    while (node < 4) : (node += 1) {
+        var origin: NodeId = 0;
+        while (origin < 4) : (origin += 1) {
+            try testing.expect(fab.storedSequence(node, origin) != null);
+        }
+    }
+    try testing.expectEqual(@as(?anyerror, null), fab.violation);
 }

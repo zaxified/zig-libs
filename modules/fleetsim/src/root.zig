@@ -883,9 +883,43 @@ fn liveBindings(node_id: NodeId, ep: Endpoint, out: *[1]Binding) ![]const Bindin
     return out;
 }
 
+/// Is the caller running the **live lane**? `FLEETSIM_EXPECT_LIVE=1` says "a
+/// real third-party master is standing by; a live test that does not run is a
+/// failure, not a skip".
+///
+/// This exists because the default run's summary line — "59 pass, 8 skip" —
+/// is byte-identical whether the live lane is correctly wired or has silently
+/// regressed to zero third-party interop. `error.SkipZigTest` at least shows
+/// on the summary line (unlike a bare `return`), but nothing *fails*, so the
+/// module's only external anchor can rot indefinitely. Under this flag every
+/// gate below turns loud.
+fn expectLive() bool {
+    const v = envVar("FLEETSIM_EXPECT_LIVE") orelse return false;
+    return v.len > 0 and !std.mem.eql(u8, v, "0");
+}
+
+/// The endpoint gate every live test opens with. Returns `error.SkipZigTest`
+/// normally, `error.LiveTestDidNotRun` in the live lane.
+fn liveGate(label: []const u8, var_name: []const u8) anyerror!void {
+    if (expectLive()) {
+        std.debug.print(
+            "FLEETSIM_EXPECT_LIVE is set but {s} is unset: {s} did NOT run\n",
+            .{ var_name, label },
+        );
+        return error.LiveTestDidNotRun;
+    }
+    if (verboseSkip())
+        std.debug.print("SKIPPED: {s} (set {s}=host:port)\n", .{ label, var_name });
+    return error.SkipZigTest;
+}
+
 fn liveSkip(name: []const u8, e: anyerror) anyerror {
     switch (e) {
         error.BindFailed, error.NoPeer => {
+            if (expectLive()) {
+                std.debug.print("FLEETSIM_EXPECT_LIVE is set but {s} got no peer\n", .{name});
+                return error.LiveTestDidNotRun;
+            }
             if (verboseSkip()) std.debug.print("SKIPPED: {s} (no listener/peer)\n", .{name});
             return error.SkipZigTest;
         },
@@ -895,10 +929,8 @@ fn liveSkip(name: []const u8, e: anyerror) anyerror {
 
 test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_DNP3_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim DNP3 (set FLEETSIM_DNP3_LISTEN=host:port)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_DNP3_LISTEN") orelse
+        return liveGate("live fleetsim DNP3", "FLEETSIM_DNP3_LISTEN");
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -974,10 +1006,8 @@ test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
 
 test "live: a real IEC 104 master drives a simulated outstation, and sees iv quality" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_IEC104_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim IEC 104 (set FLEETSIM_IEC104_LISTEN=host:port)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_IEC104_LISTEN") orelse
+        return liveGate("live fleetsim IEC 104", "FLEETSIM_IEC104_LISTEN");
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1027,10 +1057,8 @@ test "live: a real IEC 104 master drives a simulated outstation, and sees iv qua
 
 test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_S7_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim S7comm (set FLEETSIM_S7_LISTEN=host:port)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_S7_LISTEN") orelse
+        return liveGate("live fleetsim S7comm", "FLEETSIM_S7_LISTEN");
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1090,10 +1118,8 @@ test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
 
 test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFailure" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_OPCUA_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim OPC UA (set FLEETSIM_OPCUA_LISTEN=host:port)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_OPCUA_LISTEN") orelse
+        return liveGate("live fleetsim OPC UA", "FLEETSIM_OPCUA_LISTEN");
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1152,10 +1178,8 @@ test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFa
 
 test "live: two real masters, two nodes, one binding thread" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_MULTI_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim multi-peer (set FLEETSIM_MULTI_LISTEN=host:portA,portB)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_MULTI_LISTEN") orelse
+        return liveGate("live fleetsim multi-peer", "FLEETSIM_MULTI_LISTEN");
     const comma = std.mem.indexOfScalar(u8, endpoint, ',') orelse return error.SkipZigTest;
     const ep_a = splitEndpoint(endpoint[0..comma]) orelse return error.SkipZigTest;
     const port_b = std.fmt.parseInt(u16, endpoint[comma + 1 ..], 10) catch return error.SkipZigTest;
@@ -1215,10 +1239,8 @@ test "live: two real masters, two nodes, one binding thread" {
 
 test "live: a real Modbus master drives a simulated slave over the TCP binding" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_TEST_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim Modbus (set FLEETSIM_TEST_LISTEN=host:port)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_TEST_LISTEN") orelse
+        return liveGate("live fleetsim Modbus", "FLEETSIM_TEST_LISTEN");
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1261,10 +1283,12 @@ test "live: a real Modbus master drives a simulated slave over the TCP binding" 
         .max_sessions = 8,
     }) catch |e| switch (e) {
         error.BindFailed => {
+            if (expectLive()) return e;
             if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim Modbus (cannot bind {s})\n", .{endpoint});
             return error.SkipZigTest;
         },
         error.NoPeer => {
+            if (expectLive()) return e;
             if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim Modbus (no peer connected)\n", .{});
             return error.SkipZigTest;
         },
@@ -1283,10 +1307,8 @@ test "live: a real Modbus master drives a simulated slave over the TCP binding" 
 
 test "live: a real EtherNet/IP master drives a simulated adapter" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_ENIP_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim EtherNet/IP (set FLEETSIM_ENIP_LISTEN=host:port)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_ENIP_LISTEN") orelse
+        return liveGate("live fleetsim EtherNet/IP", "FLEETSIM_ENIP_LISTEN");
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1348,10 +1370,8 @@ test "live: a real EtherNet/IP master drives a simulated adapter" {
 
 test "live: a real BACnet client discovers a simulated device over UDP" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const endpoint = envVar("FLEETSIM_BACNET_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim BACnet (set FLEETSIM_BACNET_LISTEN=host:port)\n", .{});
-        return error.SkipZigTest;
-    };
+    const endpoint = envVar("FLEETSIM_BACNET_LISTEN") orelse
+        return liveGate("live fleetsim BACnet", "FLEETSIM_BACNET_LISTEN");
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1398,6 +1418,7 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
         .run_ms = live_run_ms,
     }) catch |e| switch (e) {
         error.BindFailed => {
+            if (expectLive()) return e;
             if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim BACnet (cannot bind {s})\n", .{endpoint});
             return error.SkipZigTest;
         },
@@ -1507,6 +1528,60 @@ const OpcuaFixture = struct {
     }
 };
 
+test "anchor: Wireshark reads the OPC UA adapter's ACKF handshake reply" {
+    // External anchor (Wireshark 4.6.4 / sharkd, tcp 4840 -> 40000). See
+    // `goldens.zig` for the method and for why this module needs one at all;
+    // this vector lives here rather than there because it needs `OpcuaFixture`.
+    //
+    //   OpcUa Binary Protocol
+    //     Message Type: ACK          [opcua.transport.type == "ACK"]
+    //     Chunk Type: F              [opcua.transport.chunk == "F"]
+    //     Message Size: 28           [opcua.transport.size == 28]
+    //     Version: 0                 [opcua.transport.ver == 0]
+    //     ReceiveBufferSize: 65536   [opcua.transport.rbs == 65536]
+    //     SendBufferSize: 65536      [opcua.transport.sbs == 65536]
+    //     MaxMessageSize: 1048576    [opcua.transport.mms == 1048576]
+    //     MaxChunkCount: 256         [opcua.transport.mcc == 256]
+    //
+    // The negotiated limits are what a real client uses to size its own
+    // buffers, so a third party reading them back in the right order and
+    // endianness is the part of the UA-TCP handshake worth anchoring.
+    const gpa = testing.allocator;
+    var fx: OpcuaFixture = undefined;
+    try fx.init(gpa, "opc.tcp://127.0.0.1:4840");
+    defer fx.deinit();
+
+    var f = try Fleet.init(gpa, .{
+        .seed = 8,
+        .max_frame_len = 64 * 1024,
+        .inflight_capacity = 32,
+        .outbox_bytes = 256 * 1024,
+    });
+    defer f.deinit();
+    const id = try f.addNode(.{ .node = fx.node.node(), .tag = 9 });
+
+    const url = "opc.tcp://127.0.0.1:4840";
+    var hel: [32 + url.len]u8 = undefined;
+    @memcpy(hel[0..4], "HELF");
+    std.mem.writeInt(u32, hel[4..8], hel.len, .little);
+    std.mem.writeInt(u32, hel[8..12], 0, .little);
+    std.mem.writeInt(u32, hel[12..16], 65536, .little);
+    std.mem.writeInt(u32, hel[16..20], 65536, .little);
+    std.mem.writeInt(u32, hel[20..24], 1 << 20, .little);
+    std.mem.writeInt(u32, hel[24..28], 0, .little);
+    std.mem.writeInt(u32, hel[28..32], url.len, .little);
+    @memcpy(hel[32..], url);
+
+    try f.submit(id, &hel, 0);
+    _ = try f.advance(10);
+    try testing.expectEqual(@as(usize, 1), f.outbound().len);
+    try testing.expectEqualSlices(u8, &.{
+        0x41, 0x43, 0x4B, 0x46, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x00, 0x01, 0x00, 0x00,
+    }, f.frameBytes(f.outbound()[0]));
+}
+
 test "opcua adapter: a HEL/OPN/CreateSession sequence round-trips through the node" {
     const gpa = testing.allocator;
     var fx: OpcuaFixture = undefined;
@@ -1600,4 +1675,5 @@ test {
     _ = @import("adapters.zig");
     _ = @import("tcp.zig");
     _ = @import("shim.zig");
+    _ = @import("goldens.zig");
 }
