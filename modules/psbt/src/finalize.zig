@@ -28,6 +28,15 @@
 //! was deferred until `bitcoinscript` existed (see `root.zig`'s prior module
 //! doc comment, still visible in history).
 //!
+//! "the input's actual scriptPubKey" is only true because the spent output
+//! is **bound to the input** first, in `spentOutputFor`: a
+//! `PSBT_IN_NON_WITNESS_UTXO` must hash (`txid`) to
+//! `unsigned_tx.vin[i].prevout.txid`, and a `PSBT_IN_WITNESS_UTXO` — which
+//! carries no such link — is only trusted when there is no non-witness UTXO
+//! to check it against, and must agree with it when there is. Skipping that
+//! step would leave `verifyScript` running against a scriptPubKey and amount
+//! the PSBT's (untrusted) author simply asserted, which verifies nothing.
+//!
 //! ## BIP174 §"Input Finalizer": what gets cleared
 //!
 //! Per spec, all input fields except the UTXO and unknown/proprietary
@@ -296,22 +305,57 @@ fn finalizeWitnessProgram(
 
 // ── UTXO resolution ──────────────────────────────────────────────────────
 
+pub const UtxoBindingError = error{
+    /// `PSBT_IN_NON_WITNESS_UTXO` is present but `sha256d` of its
+    /// non-witness serialization is NOT the txid this input spends
+    /// (`unsigned_tx.vin[i].prevout.txid`). Without this check the claimed
+    /// previous transaction — and therefore the scriptPubKey and amount
+    /// `verifyScript` runs against — is whatever a hostile co-signer chose,
+    /// not what the input actually spends. Bitcoin Core raises the same
+    /// refusal ("Non-witness UTXO does not match outpoint hash").
+    UtxoOutpointMismatch,
+    /// Both UTXO fields are present and they disagree about the spent
+    /// output. `PSBT_IN_NON_WITNESS_UTXO` is the authoritative one (it is
+    /// the only one bound to the outpoint at all), so a `WITNESS_UTXO`
+    /// contradicting it is a lie, not a shortcut.
+    UtxoFieldsDisagree,
+};
+
+/// Resolve the output this input spends, **bound to the input**.
+///
+/// The binding is the whole point: a PSBT arrives from a party who may be
+/// hostile, so the UTXO fields are claims, not facts. `NON_WITNESS_UTXO`
+/// carries the full previous transaction, so it can be checked against
+/// `prevout.txid` and is treated as authoritative. `WITNESS_UTXO` carries a
+/// bare `TxOut` with nothing tying it to this input, so it is only trusted
+/// when there is no `NON_WITNESS_UTXO` to check it against — and when there
+/// is, the two must agree.
 fn spentOutputFor(
     allocator: Allocator,
     m: psbt.Map,
     utx: bitcointx.Transaction,
     index: usize,
-) (psbt.WitnessUtxoError || bitcointx.tx.DeserializeError)!?bitcointx.TxOut {
-    if (try psbt.inputWitnessUtxo(m)) |wu| return wu;
+) (psbt.WitnessUtxoError || bitcointx.tx.DeserializeError || UtxoBindingError)!?bitcointx.TxOut {
+    if (index >= utx.vin.len) return null;
+    const prevout = utx.vin[index].prevout;
+
+    var from_non_witness: ?bitcointx.TxOut = null;
     if (try psbt.inputNonWitnessUtxo(m, allocator)) |prevtx| {
         var pt = prevtx;
         defer pt.deinit(allocator); // frees only the vout ARRAY -- the TxOut copied out below still borrows its content bytes from `m`'s original buffer (module doc comment)
-        if (index >= utx.vin.len) return null;
-        const vout_idx = utx.vin[index].prevout.vout;
-        if (vout_idx >= pt.vout.len) return null;
-        return pt.vout[vout_idx];
+        const computed = try pt.txid(allocator);
+        if (!std.mem.eql(u8, &computed, &prevout.txid)) return error.UtxoOutpointMismatch;
+        if (prevout.vout >= pt.vout.len) return null;
+        from_non_witness = pt.vout[prevout.vout];
     }
-    return null;
+
+    if (try psbt.inputWitnessUtxo(m)) |wu| {
+        const nw = from_non_witness orelse return wu;
+        if (nw.value != wu.value or !std.mem.eql(u8, nw.script_pubkey, wu.script_pubkey))
+            return error.UtxoFieldsDisagree;
+        return nw;
+    }
+    return from_non_witness;
 }
 
 // ── input-map rebuild (the BIP174 "clear consumed fields" step) ────────
@@ -421,7 +465,7 @@ pub const InputFinalizeError = error{
     MissingTaprootSignature,
     /// A multisig script needs more matching signatures than are present.
     InsufficientSignatures,
-} || psbt.WitnessUtxoError || bitcointx.tx.DeserializeError || bitcoinscript.VerifyError || Allocator.Error;
+} || psbt.WitnessUtxoError || bitcointx.tx.DeserializeError || bitcoinscript.VerifyError || UtxoBindingError || Allocator.Error;
 
 fn finalizeOneInput(
     allocator: Allocator,
@@ -429,6 +473,7 @@ fn finalizeOneInput(
     utx: bitcointx.Transaction,
     spent: []const bitcointx.TxOut,
     resolved: []const bool,
+    binding_err: []const ?UtxoBindingError,
     all_resolved: bool,
     index: usize,
 ) InputFinalizeError!void {
@@ -436,6 +481,7 @@ fn finalizeOneInput(
     if (m.find(psbt.input_key.FINAL_SCRIPTSIG) != null or m.find(psbt.input_key.FINAL_SCRIPTWITNESS) != null) {
         return; // already finalized -- idempotent success, BIP174 doc comment
     }
+    if (binding_err[index]) |e| return e; // mis-bound UTXO: a named refusal, not "missing"
     if (!resolved[index]) return error.MissingUtxo;
 
     const script_pubkey = spent[index].script_pubkey;
@@ -500,9 +546,23 @@ pub fn finalize(allocator: Allocator, ps: psbt.Psbt) FinalizeSetupError![]?Input
     defer allocator.free(spent);
     const resolved = try allocator.alloc(bool, n);
     defer allocator.free(resolved);
+    // A UTXO that fails to BIND to its input is a different thing from one
+    // that is absent or unparseable: it is an active claim that was refuted,
+    // so it is reported under its own name instead of collapsing to
+    // `MissingUtxo`.
+    const binding_err = try allocator.alloc(?UtxoBindingError, n);
+    defer allocator.free(binding_err);
 
     for (ps.inputs, 0..) |m, i| {
-        const so = spentOutputFor(allocator, m, utx, i) catch null;
+        binding_err[i] = null;
+        const so = spentOutputFor(allocator, m, utx, i) catch |e| blk: {
+            switch (e) {
+                error.UtxoOutpointMismatch => binding_err[i] = error.UtxoOutpointMismatch,
+                error.UtxoFieldsDisagree => binding_err[i] = error.UtxoFieldsDisagree,
+                else => {},
+            }
+            break :blk null;
+        };
         if (so) |v| {
             spent[i] = v;
             resolved[i] = true;
@@ -521,7 +581,7 @@ pub fn finalize(allocator: Allocator, ps: psbt.Psbt) FinalizeSetupError![]?Input
 
     const results = try allocator.alloc(?InputFinalizeError, n);
     for (0..n) |i| {
-        results[i] = if (finalizeOneInput(allocator, ps, utx, spent, resolved, all_resolved, i)) |_| null else |e| e;
+        results[i] = if (finalizeOneInput(allocator, ps, utx, spent, resolved, binding_err, all_resolved, i)) |_| null else |e| e;
     }
     return results;
 }

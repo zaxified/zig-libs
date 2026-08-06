@@ -172,6 +172,41 @@ test "Core invalid_with_msg: 4 of 23 rejected (3 defensibly, 1 coincidentally); 
     }
 }
 
+// ── B2: UTXO binding -- parse accepts (pure wire codec), finalize REJECTS ──
+
+test "Core invalid[39]/invalid[40]: a UTXO that does not bind to its input is rejected by finalize (reclassified from invalid_out_of_scope)" {
+    for (vectors.invalid_utxo_binding) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
+        const raw = try hexToBytesAlloc(allocator, case.hex);
+        // `parse` is a pure BIP174-v0 wire codec and still accepts these --
+        // asserted here so the reclassification is about WHERE the refusal
+        // lives, not a silent change of the parse contract.
+        const p = try psbt.parse(allocator, raw);
+        try testing.expect(p.inputs.len >= 1);
+
+        const results = try psbt.finalize(allocator, p);
+        const got = results[0];
+        const want: anyerror = switch (case.expect) {
+            .outpoint_mismatch => error.UtxoOutpointMismatch,
+            .missing_utxo => error.MissingUtxo,
+        };
+        if (got == null) {
+            std.debug.print(
+                "FAIL: core_index={d} finalize ACCEPTED a UTXO that does not bind to its input\n",
+                .{case.core_index},
+            );
+            return error.TestUnexpectedResult;
+        }
+        testing.expectEqual(want, @as(anyerror, got.?)) catch |err| {
+            std.debug.print("FAIL: core_index={d} got={any}\n", .{ case.core_index, got.? });
+            return err;
+        };
+    }
+}
+
 // ── D: valid[] within scope -- parse -> serialize byte-exact ────────────
 
 test "Core valid[]: parse -> serialize is byte-exact" {

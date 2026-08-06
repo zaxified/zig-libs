@@ -83,9 +83,16 @@ rather than just pattern-matching Core's message. That surfaced one genuine BIP1
 `PSBT_GLOBAL_VERSION` was checked for shape but never for value, though BIP174 §"Version 0" requires
 it be 0 if present — now fixed (`error.UnsupportedPsbtVersion`; `core_kat_vectors.invalid_v0_scope`'s
 `core_index = 19`/`42` are the external oracle for it). Every other vector this module still accepts
-is BIP370(PSBTv2)/BIP371(Taproot)/MuSig2 content, or a BIP174 §"Signer" TXID-cross-check (Signer role
-is deferred, see "Threat model" below) — explicitly out of scope, not a bug; asserted as an accept,
-not silently skipped (`core_kat_vectors.invalid_out_of_scope`). Of Core's 42 new `valid` vectors, 27
+is BIP370(PSBTv2)/BIP371(Taproot)/MuSig2 content — explicitly out of scope, not a bug; asserted as an
+accept, not silently skipped (`core_kat_vectors.invalid_out_of_scope`). **Correction:** two of those
+vectors (`core_index = 39`/`40`) were previously bucketed here as "a BIP174 §Signer TXID-cross-check,
+and the Signer is deferred", and therefore asserted as accepts. That was wrong. The justification was
+written while all three non-Script roles were deferred; the **Finalizer** landed afterwards and does
+consume the UTXO — so the cross-check stopped being someone else's job the moment `finalize.zig`
+existed. They are now `core_kat_vectors.invalid_utxo_binding` and are asserted as **rejects** by
+`finalize` (`error.UtxoOutpointMismatch` / `error.MissingUtxo`); `parse`, a pure v0 wire codec that
+never interprets one record against another, still accepts them, which is where this module's layering
+differs from Core's (Core refuses them at deserialize). Of Core's 42 new `valid` vectors, 27
 round-trip byte-exact, 14 are pure-PSBTv2 PSBTs this module correctly refuses (out of scope), and one
 (`valid[5]`) hits the SAME 0-vin/BIP144-marker ambiguity as the two BIP174 valid vectors above, just
 surfacing as `error.TooManyItems` instead of `error.InvalidWitnessFlag` — same root cause, new facet,
@@ -132,7 +139,12 @@ blocker is gone for these two. `finalize` assembles `FINAL_SCRIPTSIG`/`FINAL_SCR
 standard spend types (P2PKH, P2WPKH, P2SH-P2WPKH, bare/P2SH/P2WSH/P2SH-P2WSH multisig, P2TR
 key-path), verifying every candidate through `bitcoinscript.verifyScript` before accepting it and
 clearing the now-consumed input fields per BIP174 §"Input Finalizer"; `extract` splices finalized
-inputs into a network-ready `bitcointx.Transaction`. See `finalize.zig`'s own module doc comment for
+inputs into a network-ready `bitcointx.Transaction`. Because `finalize` consumes the UTXO fields, it
+also **binds** them to the input first: a `PSBT_IN_NON_WITNESS_UTXO` must hash to
+`unsigned_tx.vin[i].prevout.txid` (`error.UtxoOutpointMismatch`), and a `PSBT_IN_WITNESS_UTXO` — which
+carries no such link — is only trusted alone, and must agree with the non-witness UTXO when both are
+present (`error.UtxoFieldsDisagree`). Without that, `verifyScript` would run against a scriptPubKey
+and amount the PSBT's (untrusted) author simply asserted. See `finalize.zig`'s own module doc comment for
 the full scope cut (non-standard/timelocked/tapscript spends are `error.NonStandardScript`, never
 silently mis-assembled) and "Verification" below for the anchor.
 

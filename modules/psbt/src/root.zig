@@ -616,6 +616,7 @@ pub fn combine(allocator: Allocator, a: Psbt, b: Psbt) CombineError!Psbt {
 
 const finalize_mod = @import("finalize.zig");
 pub const InputFinalizeError = finalize_mod.InputFinalizeError;
+pub const UtxoBindingError = finalize_mod.UtxoBindingError;
 pub const FinalizeSetupError = finalize_mod.FinalizeSetupError;
 pub const ExtractError = finalize_mod.ExtractError;
 pub const WitnessStackError = finalize_mod.WitnessStackError;

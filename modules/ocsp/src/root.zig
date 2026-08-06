@@ -50,9 +50,11 @@
 //! ## Reuse
 //!
 //! DER *decoding* primitives (`parseElement`, the `der.Element`/`Tag` types)
-//! and the id-kp-OCSPSigning EKU check (`extensions.hasPurpose` +
-//! `extensions.Purpose.ocsp_signing`) are reused from the sibling `x509`
-//! module — no second ASN.1 reader is written here. Responder-signature
+//! and the EKU walk (`extensions.findExtensions`/`iterate`/`parseExtKeyUsage`
+//! + `extensions.Purpose`) are reused from the sibling `x509` module — but the
+//! id-kp-OCSPSigning DECISION is local and stricter than `extensions.hasPurpose`
+//! (which also honours `anyExtendedKeyUsage`); see `hasOcspSigningEku`. No
+//! second ASN.1 reader is written here. Responder-signature
 //! verification reuses `rsa.verifyPkcs1v15` and `p256.sign.ecdsaVerify`. Only the
 //! narrow cert-structure walk (locating subject DN / SPKI / serial / validity /
 //! tbs / signature) is local, because x509's equivalent (`chain.parseShape`) is
@@ -800,7 +802,8 @@ fn resolveDelegate(basic: Basic, issuer: CertView, now_unix: i64) VerifyError!Ce
             else => return e,
         };
 
-        // id-kp-OCSPSigning EKU (reuse x509's extension machinery).
+        // id-kp-OCSPSigning EKU specifically -- anyEKU does NOT authorize an
+        // OCSP responder (RFC 6960 §4.2.2.2); see `hasOcspSigningEku`.
         if (!try hasOcspSigningEku(cert_der)) return error.ResponderMissingOcspSigning;
 
         // Validity window.
@@ -823,15 +826,34 @@ fn candidateMatchesResponder(cand: CertView, responder: Responder) bool {
     }
 }
 
-/// Does `cert_der` carry extKeyUsage with id-kp-OCSPSigning (or anyEKU)?
-/// Uses x509's bounds-safe extension walk + `Purpose` map — no local EKU parser.
+/// Does `cert_der` carry extKeyUsage listing id-kp-OCSPSigning **specifically**?
+///
+/// Deliberately NOT `ext.hasPurpose(…, .ocsp_signing)`: that shared helper also
+/// answers true for `anyExtendedKeyUsage` (2.5.29.37.0), which is the right
+/// permissive reading for the purposes `x509`'s chain validator asks about but
+/// is forbidden here. RFC 6960 §4.2.2.2 requires the delegated responder's
+/// certificate to contain the `id-kp-OCSPSigning` value, and the CA/Browser
+/// Forum Baseline Requirements forbid anyEKU in this role for a concrete
+/// reason: a CA that has ever issued an anyEKU leaf would otherwise have handed
+/// that leaf's holder a revocation oracle for its ENTIRE hierarchy — it could
+/// sign "good" for any certificate that CA issued. So the strictness is local
+/// to `ocsp`; `hasPurpose`'s own semantics are correct for its other callers
+/// and are left alone (see `x509/src/chain.zig`, which documents relying on
+/// exactly that behaviour).
+///
+/// Still uses `x509`'s bounds-safe extension/EKU walk — the only thing that
+/// differs is which purposes count.
 fn hasOcspSigningEku(cert_der: []const u8) VerifyError!bool {
     const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
     const slice = (ext.findExtensions(cert) catch return error.Malformed) orelse return false;
     var it = ext.iterate(slice, cert);
     while (it.next() catch return error.Malformed) |entry| {
         if (entry.id == .ext_key_usage) {
-            return ext.hasPurpose(entry.value, .ocsp_signing) catch return error.Malformed;
+            var eku = ext.parseExtKeyUsage(entry.value) catch return error.Malformed;
+            while (eku.next() catch return error.Malformed) |purpose| {
+                if (purpose.known == .ocsp_signing) return true;
+            }
+            return false;
         }
     }
     return false;

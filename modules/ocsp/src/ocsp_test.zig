@@ -37,6 +37,7 @@ const oid_ocsp_basic = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x
 const oid_ocsp_nonce = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02 };
 const oid_ext_key_usage = [_]u8{ 0x55, 0x1d, 0x25 }; // 2.5.29.37
 const oid_ocsp_signing = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09 };
+const oid_any_extended_key_usage = [_]u8{ 0x55, 0x1d, 0x25, 0x00 }; // 2.5.29.37.0
 
 // ── independent cert-field extraction (test oracle, mirrors parseCert) ──────
 
@@ -257,13 +258,19 @@ fn derIntMagnitude(b: der_writer.Builder, raw: []const u8) ![]const u8 {
 
 // ── delegate responder cert (signed by the issuer RSA key) ──────────────────
 
+/// Which extKeyUsage the built delegate cert carries. `.any` is the
+/// interesting one: a cert that is well-formed, correctly signed by the
+/// issuer, valid at `now`, and names the responder — everything a responder
+/// needs EXCEPT the one purpose RFC 6960 §4.2.2.2 asks for.
+const DelegateEku = enum { none, ocsp_signing, any };
+
 fn buildDelegateCert(
     gpa: std.mem.Allocator,
     issuer_sk: rsa.SecretKey,
     issuer_name: []const u8,
     delegate_spki: []const u8,
     delegate_name: []const u8,
-    with_eku: bool,
+    eku: DelegateEku,
 ) ![]u8 {
     return buildDelegateCertValidity(
         gpa,
@@ -271,7 +278,7 @@ fn buildDelegateCert(
         issuer_name,
         delegate_spki,
         delegate_name,
-        with_eku,
+        eku,
         "200101000000Z",
         "400101000000Z",
     );
@@ -283,7 +290,7 @@ fn buildDelegateCertValidity(
     issuer_name: []const u8,
     delegate_spki: []const u8,
     delegate_name: []const u8,
-    with_eku: bool,
+    eku: DelegateEku,
     not_before: []const u8,
     not_after: []const u8,
 ) ![]u8 {
@@ -303,12 +310,17 @@ fn buildDelegateCertValidity(
     try tbs_parts.appendSlice(b.a, &[_][]const u8{
         version, serial, sig_alg, issuer_name, validity, delegate_name, delegate_spki,
     });
-    if (with_eku) {
-        const eku = try b.seq(&.{
+    if (eku != .none) {
+        const purpose_oid = switch (eku) {
+            .ocsp_signing => &oid_ocsp_signing,
+            .any => &oid_any_extended_key_usage,
+            .none => unreachable,
+        };
+        const eku_ext = try b.seq(&.{
             try b.oid(&oid_ext_key_usage),
-            try b.octet(try b.seqOf(&.{try b.oid(&oid_ocsp_signing)})),
+            try b.octet(try b.seqOf(&.{try b.oid(purpose_oid)})),
         });
-        try tbs_parts.append(b.a, try b.explicit(3, try b.seqOf(&.{eku})));
+        try tbs_parts.append(b.a, try b.explicit(3, try b.seqOf(&.{eku_ext})));
     }
     const tbs = try b.seq(tbs_parts.items);
 
@@ -648,7 +660,7 @@ test "verify: delegated responder with OCSPSigning EKU accepted" {
     // Extract the delegate's SPKI TLV from its self-signed cert.
     const dspki = try spkiOf(delegate_self);
 
-    const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, dspki, dbits.subject_name, true);
+    const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, dspki, dbits.subject_name, .ocsp_signing);
     defer gpa.free(delegate_cert);
 
     const resp_der = try buildResponse(gpa, .{
@@ -686,7 +698,7 @@ test "verify: delegated responder WITHOUT OCSPSigning EKU rejected" {
     const dbits = try extractBits(delegate_self);
     const dspki = try spkiOf(delegate_self);
 
-    const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, dspki, dbits.subject_name, false);
+    const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, dspki, dbits.subject_name, .none);
     defer gpa.free(delegate_cert);
 
     const resp_der = try buildResponse(gpa, .{
@@ -700,6 +712,77 @@ test "verify: delegated responder WITHOUT OCSPSigning EKU rejected" {
 
     const parsed = try ocsp.parseResponse(resp_der);
     try testing.expectError(error.ResponderMissingOcspSigning, ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()));
+}
+
+test "verify: delegated responder carrying anyExtendedKeyUsage instead of id-kp-OCSPSigning is rejected (RFC 6960 §4.2.2.2 / CA-B BR)" {
+    // The certificate below is not defective in any way a general-purpose
+    // validator would notice: it is well-formed, correctly signed by the
+    // issuing CA, inside its validity window, and its subject Name is exactly
+    // the response's ResponderID. It carries an extKeyUsage extension listing
+    // `anyExtendedKeyUsage` (2.5.29.37.0) — a purpose `x509`'s shared
+    // `extensions.hasPurpose` treats as satisfying every request, correctly,
+    // for the callers that ask it about server/client auth. It is NOT
+    // sufficient here: RFC 6960 §4.2.2.2 requires `id-kp-OCSPSigning`
+    // specifically, because otherwise ANY anyEKU leaf this CA has ever issued
+    // could sign revocation answers for the CA's whole hierarchy.
+    //
+    // The response itself is signed with the delegate's own key and would
+    // verify. The ONLY thing wrong with it is that this certificate is not
+    // bound to the OCSP-responder role.
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    var prng = std.Random.DefaultPrng.init(0xa11e6ce7);
+    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
+        .common_name = "any-eku responder",
+        .serial = 11,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = false,
+    });
+    defer gpa.free(delegate_self);
+    const dbits = try extractBits(delegate_self);
+    const dspki = try spkiOf(delegate_self);
+
+    const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, dspki, dbits.subject_name, .any);
+    defer gpa.free(delegate_cert);
+
+    // Control on the fixture itself: the shared x509 helper DOES accept this
+    // cert's EKU for `.ocsp_signing`. That is what makes the assertion below a
+    // check of `ocsp`'s own strictness rather than of `x509`'s — and it pins
+    // the shared helper's behaviour so a future change there is not silently
+    // absorbed by this test.
+    {
+        const cert: std.crypto.Certificate = .{ .buffer = delegate_cert, .index = 0 };
+        const slice = (try ext.findExtensions(cert)).?;
+        var it = ext.iterate(slice, cert);
+        var saw_eku = false;
+        while (try it.next()) |entry| {
+            if (entry.id != .ext_key_usage) continue;
+            saw_eku = true;
+            try testing.expect(try ext.hasPurpose(entry.value, .ocsp_signing));
+        }
+        try testing.expect(saw_eku);
+    }
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = dbits.subject_name,
+        .certs = delegate_cert,
+        .sign_rsa = dkp.secret_key, // a genuine signature by the delegate key
+    });
+    defer gpa.free(resp_der);
+
+    const parsed = try ocsp.parseResponse(resp_der);
+    try testing.expectError(
+        error.ResponderMissingOcspSigning,
+        ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()),
+    );
 }
 
 test "verify: responder identified byKey (KeyHash) accepted; wrong key hash rejected" {
@@ -770,7 +853,7 @@ test "verify: delegated responder cert outside its validity window → Responder
         issuer.subject_name,
         dspki,
         dbits.subject_name,
-        true,
+        .ocsp_signing,
         "200101000000Z",
         "260101000000Z", // notAfter 2026-01-01, well before now_2027 (2027-01-15)
     );

@@ -612,3 +612,152 @@ test "BIP174 official Finalizer/Extractor worked example: extract (from the BIP'
     const want = try hexToBytesAlloc(a, vectors.finalize_extracted_tx_hex);
     try testing.expectEqualSlices(u8, want, got);
 }
+
+// ── G: UTXO<->input binding (the spent output must belong to THIS input) ──
+//
+// A PSBT arrives from a co-signer who may be hostile, so its UTXO fields are
+// CLAIMS. `finalize` runs `verifyScript` against the scriptPubKey and amount
+// it resolves from them, so if the resolution is unbound, every signature is
+// checked against whatever the sender chose to assert — the "verify-on-
+// finalize" guarantee in `finalize.zig`'s doc comment reduces to "the sender's
+// story is internally consistent". Both tests below therefore supply a
+// well-formed, otherwise-verifying object that is bound to the WRONG thing;
+// neither uses malformed input, which would prove nothing about this class.
+
+/// A minimal, well-formed funding transaction paying `outs`.
+fn buildPrevTx(a: Allocator, version: i32, outs: []const bitcointx.TxOut) !bitcointx.Transaction {
+    const vin = try a.alloc(bitcointx.TxIn, 1);
+    vin[0] = .{ .prevout = .{ .txid = [_]u8{0xa1} ** 32, .vout = 7 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    const vout = try a.dupe(bitcointx.TxOut, outs);
+    return .{ .version = version, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
+}
+
+fn buildUnsignedTxSpending(a: Allocator, prev_txid: [32]u8, vout_idx: u32, out_value: i64) !bitcointx.Transaction {
+    const vin = try a.alloc(bitcointx.TxIn, 1);
+    vin[0] = .{ .prevout = .{ .txid = prev_txid, .vout = vout_idx }, .script_sig = &.{}, .sequence = 0xffffffff };
+    const vout = try a.alloc(bitcointx.TxOut, 1);
+    vout[0] = .{ .value = out_value, .script_pubkey = &.{} };
+    return .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
+}
+
+test "finalize: a NON_WITNESS_UTXO whose txid is not the input's prevout is refused, even when its output is byte-identical to the real one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seed: [32]u8 = [_]u8{0x71} ** 32;
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+
+    var script_pubkey: [22]u8 = undefined; // P2WPKH
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &pkh);
+
+    var script_code: [25]u8 = undefined; // BIP143 implicit scriptCode
+    script_code[0] = 0x76;
+    script_code[1] = 0xa9;
+    script_code[2] = 0x14;
+    @memcpy(script_code[3..23], &pkh);
+    script_code[23] = 0x88;
+    script_code[24] = 0xac;
+
+    const credit_value: i64 = 5000;
+    const spent: bitcointx.TxOut = .{ .value = credit_value, .script_pubkey = &script_pubkey };
+
+    // The genuine funding tx, and the input that actually spends its vout[0].
+    const real_prev = try buildPrevTx(a, 2, &.{spent});
+    const real_txid = try real_prev.txid(a);
+    const unsigned = try buildUnsignedTxSpending(a, real_txid, 0, 900);
+
+    const sighash = try bitcointx.bip143.sighash(a, unsigned, 0, &script_code, credit_value, SIGHASH_ALL);
+    const sig_ht = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(sighash, null)), 0x01);
+
+    // Control: the truthful NON_WITNESS_UTXO finalizes. This is what makes
+    // the negative below meaningful -- it is the SAME PSBT with only the
+    // funding transaction swapped.
+    {
+        const real_bytes = try bitcointx.serializeLegacy(a, real_prev);
+        var recs = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.NON_WITNESS_UTXO, .keydata = &.{}, .value = real_bytes },
+            .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+        };
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const ps = try wrapPsbt(a, unsigned, &maps);
+        const results = try psbt.finalize(a, ps);
+        try testing.expect(results[0] == null);
+    }
+
+    // Attack: a DIFFERENT, perfectly well-formed transaction whose vout[0] is
+    // byte-identical to the real one (same scriptPubKey, same amount) -- it
+    // differs only in its version, so its txid differs. Because the output is
+    // identical, `verifyScript` still passes and the signature still checks
+    // out: nothing about this PSBT is internally inconsistent. The only thing
+    // wrong with it is that it does not answer for THIS input, which is
+    // exactly what an unbound resolution cannot see.
+    const decoy = try buildPrevTx(a, 1, &.{spent});
+    const decoy_txid = try decoy.txid(a);
+    try testing.expect(!std.mem.eql(u8, &decoy_txid, &real_txid));
+
+    const decoy_bytes = try bitcointx.serializeLegacy(a, decoy);
+    var bad_recs = [_]psbt.Record{
+        .{ .keytype = psbt.input_key.NON_WITNESS_UTXO, .keydata = &.{}, .value = decoy_bytes },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+    };
+    var bad_maps = [_]psbt.Map{.{ .records = &bad_recs }};
+    const bad_ps = try wrapPsbt(a, unsigned, &bad_maps);
+    const bad_results = try psbt.finalize(a, bad_ps);
+    try expectInputError(bad_results, 0, error.UtxoOutpointMismatch);
+    try testing.expect(bad_ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
+}
+
+test "finalize: a WITNESS_UTXO contradicting the input's real NON_WITNESS_UTXO cannot override it (the lie must not win)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seed: [32]u8 = [_]u8{0x72} ** 32;
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &pkh);
+
+    var script_code: [25]u8 = undefined;
+    script_code[0] = 0x76;
+    script_code[1] = 0xa9;
+    script_code[2] = 0x14;
+    @memcpy(script_code[3..23], &pkh);
+    script_code[23] = 0x88;
+    script_code[24] = 0xac;
+
+    const real_value: i64 = 5000;
+    const claimed_value: i64 = 500_000; // the co-signer's lie
+    const real_prev = try buildPrevTx(a, 2, &.{.{ .value = real_value, .script_pubkey = &script_pubkey }});
+    const real_txid = try real_prev.txid(a);
+    const unsigned = try buildUnsignedTxSpending(a, real_txid, 0, 900);
+
+    // The signature commits to the LIE's amount (BIP143 covers the value), so
+    // if the finalizer resolves the spent output from `WITNESS_UTXO` the whole
+    // package verifies cleanly and the fabricated amount is what got checked.
+    const sighash = try bitcointx.bip143.sighash(a, unsigned, 0, &script_code, claimed_value, SIGHASH_ALL);
+    const sig_ht = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(sighash, null)), 0x01);
+
+    const real_bytes = try bitcointx.serializeLegacy(a, real_prev);
+    const lying_witness_utxo = try buildWitnessUtxoValue(a, claimed_value, &script_pubkey);
+
+    var recs = [_]psbt.Record{
+        .{ .keytype = psbt.input_key.NON_WITNESS_UTXO, .keydata = &.{}, .value = real_bytes },
+        .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = lying_witness_utxo },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+    };
+    var maps = [_]psbt.Map{.{ .records = &recs }};
+    const ps = try wrapPsbt(a, unsigned, &maps);
+    const results = try psbt.finalize(a, ps);
+    try expectInputError(results, 0, error.UtxoFieldsDisagree);
+    try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
+}

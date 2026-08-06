@@ -94,8 +94,16 @@ Consequences:
 - **DER reader**: `x509.extensions.parseElement` (the bounded element parser)
   and the `std.crypto.Certificate.der.Element`/`Tag` types are reused directly —
   no second ASN.1 parser is written.
-- **EKU**: the `id-kp-OCSPSigning` check reuses `x509.extensions.findExtensions`
-  / `iterate` / `hasPurpose` + `Purpose.ocsp_signing`.
+- **EKU**: the extension/EKU *walk* reuses `x509.extensions.findExtensions` /
+  `iterate` / `parseExtKeyUsage` + `Purpose`, but the id-kp-OCSPSigning
+  *decision* is local (`hasOcspSigningEku`) and deliberately stricter than
+  `x509.extensions.hasPurpose`: that helper also accepts `anyExtendedKeyUsage`
+  (2.5.29.37.0), which is the correct permissive reading for a chain
+  validator's server/client-auth questions but is forbidden for a delegated
+  OCSP responder by RFC 6960 §4.2.2.2 and the CA/Browser Forum Baseline
+  Requirements — otherwise any anyEKU leaf a CA has issued becomes a
+  revocation oracle for that CA's whole hierarchy. `hasPurpose`'s semantics
+  are left untouched for its other callers.
 - **Friction noted**: x509's own certificate-field extractor (`chain.parseShape`
   → `Shape`) is **private**, so the narrow cert-structure walk that locates the
   subject DN / SPKI / serial / validity / tbs / signature is re-implemented here
