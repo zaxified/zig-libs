@@ -153,10 +153,27 @@ pub const Fields = struct {
     i_pcp: u3,
     /// I-TAG drop-eligible indicator.
     i_dei: bool,
-    /// Use Customer Addresses bit (I-TCI bit 27). Wireshark's own IEEE 802.1ah
-    /// dissector calls the identical bit `NCA` ("No Customer Addresses") — see
-    /// the naming note on the Wireshark-anchored golden below for why this
-    /// module keeps `uca` rather than picking a side.
+    /// Use Customer Addresses bit (I-TCI bit 27, mask `0x08` in the flag
+    /// octet). This field records the **raw bit only** — the codec attaches no
+    /// forwarding semantics to it, so its value round-trips unchanged
+    /// regardless of which of the two conflicting readings below is correct.
+    ///
+    /// Naming: kept as `uca` (matches the rest of this struct's 802.1Q/802.1ah
+    /// vocabulary — I-PCP/I-DEI/I-SID/B-TCI are all standard terms — and
+    /// matches independent vendor usage: Nokia SR OS's PBB docs also say
+    /// "UCA"). Wireshark's own IEEE 802.1ah dissector calls the *identical
+    /// bit* `ieee8021ah.nca`, and — verified by forcing this bit to 1 through
+    /// `scripts/dissect.py`/sharkd (see the second Wireshark-anchored golden
+    /// below) — its `nca` output tracks the **same raw polarity**, not the
+    /// logical inverse: bit=1 reads as both `uca=true` here and
+    /// `ieee8021ah.nca == 1` in Wireshark, whose dissector's own embedded
+    /// string table names that state "No Customer Addresses". So this is a
+    /// genuine opposite-meaning naming conflict on one shared bit, not a
+    /// cosmetic spelling difference — and it is left unresolved on purpose:
+    /// the IEEE 802.1Q-2014 primary text that would adjudicate it is
+    /// paywalled and was not available to this repo. `uca` was kept, not
+    /// renamed, because renaming on the strength of one of two conflicting
+    /// secondary sources would trade one unverified guess for another.
     uca: bool,
     /// 24-bit backbone service instance identifier (the tenant/VPN key). Agrees
     /// with `l2encap`'s I-SID width so the two encapsulations map 1:1.
@@ -849,6 +866,56 @@ test "golden (Wireshark-anchored): decode recovers every field, including the re
     try testing.expectEqual(@as(u16, 0x8100), std.mem.readInt(u16, dec.customer_data[0..2], .big));
     try testing.expectEqual(@as(u16, 0x000a), std.mem.readInt(u16, dec.customer_data[2..4], .big));
     try testing.expectEqualSlices(u8, golden_wireshark_customer_vlan[headerLen(true)..], dec.customer_data);
+}
+
+// ── UCA/NCA naming resolution: pin that the two names conflict, not just spell
+// differently ──────────────────────────────────────────────────────────────
+//
+// The golden above has `uca = false`, which cannot distinguish "Wireshark's
+// `nca` is a same-polarity relabelling of our bit" from "Wireshark's `nca` is
+// the logical inverse of our bit" — both hypotheses agree when the raw bit is
+// 0. This golden is the same frame with only that one bit forced to 1, run
+// through the identical `scripts/dissect.py`/sharkd pipeline, to settle it.
+//
+// Command:
+//   scripts/dissect.py --frame raw --fields '00 1b 21 00 00 01 00 1b 21 00 00
+//   02 88 a8 50 c8 88 e7 98 00 10 00 00 50 56 00 00 01 00 50 56 00 00 02 81 00
+//   00 0a 08 00 45 00 00 1c 00 01 00 00 40 fd 65 e2 0a 00 00 01 0a 00 00 02 41
+//   42 43 44 45 46 47 48'
+//
+// Wireshark printed (trimmed to the load-bearing line; every other field is
+// unchanged from the bit=0 golden above and was re-checked to still hold, no
+// `_ws.expert`/`_ws.malformed` anywhere):
+//   ieee8021ah.nca == 1 = .... 1... .... .... .... .... .... .... = NCA: 1
+//
+// Result: raw bit 1 -> Wireshark's `nca` reads 1, the *same* value our `uca`
+// reads for that bit — not `nca = !uca`. So "UCA" and "NCA" are not two
+// spellings of one fact; they are opposite claims about the identical wire
+// state (this module: bit=1 means "use customer addresses"; Wireshark's own
+// embedded field-name string for that state, extracted from
+// `libwireshark.so`'s string table, is literally "No Customer Addresses").
+// See the naming resolution on `Fields.uca`'s doc comment for the decision
+// this pins.
+const golden_wireshark_uca_bit_set = blk: {
+    var frame = golden_wireshark_customer_vlan;
+    frame[b_mac_len + b_tag_len + 2] |= 0x08; // I-TCI flag octet: set bit 27 (UCA/NCA)
+    break :blk frame;
+};
+
+test "golden (Wireshark-anchored): UCA bit forced to 1 decodes uca=true — Wireshark's nca==1 for the same raw bit, not its inverse" {
+    const dec = try decode(&golden_wireshark_uca_bit_set);
+    try testing.expect(dec.fields.uca); // this module: "customer addresses are used"
+    // Everything else is untouched by the single flipped bit.
+    try testing.expectEqual(@as(u3, 4), dec.fields.i_pcp);
+    try testing.expect(dec.fields.i_dei);
+    try testing.expectEqual(@as(u24, 0x00_1000), dec.fields.i_sid);
+
+    // Round-trip: encoding fields with uca=true reproduces this exact frame.
+    var fields = dec.fields;
+    fields.uca = true;
+    var buf: [golden_wireshark_uca_bit_set.len]u8 = undefined;
+    const out = try encode(fields, dec.customer_data, &buf);
+    try testing.expectEqualSlices(u8, &golden_wireshark_uca_bit_set, out);
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {

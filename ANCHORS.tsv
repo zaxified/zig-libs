@@ -174,7 +174,7 @@ otp	B	EXTERNAL	RFC 4226/6238 appendix vectors embedded byte-exact
 p256	B	EXTERNAL	RFC 6979 Appendix A.2.5 ECDSA-P256 vectors; field ops also cross-checked vs std.crypto
 pagecache	C	n/a	internal buffer-pool page cache, no wire, LMDB/Postgres named as concept analogues only
 paillier	B	EXTERNAL	cross-checked against phe (python-paillier) 1.5.0 real library output
-pbb	A	MIXED	Wireshark sharkd validated encode() B-Tag/I-TAG/B-TCI/relocation/ethertype/recursion; no wire bug, UCA/NCA naming dispute open
+pbb	A	MIXED	Wireshark sharkd validated encode() B-Tag/I-TAG/B-TCI/relocation/ethertype/recursion; no wire bug; UCA/NCA naming resolved 2026-08-06 (kept uca, documented — see ANCHOR-TASKS.tsv)
 pir	B	SELF	SPEC.md: no external test vector exists for this DPF construction
 pollworker	C	n/a	internal job/event-loop scheduler (single-owner controller), no wire
 poseidon	B	EXTERNAL	circomlibjs JSON consts byte-identical (constants_test.zig)

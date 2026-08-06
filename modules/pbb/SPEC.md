@@ -157,11 +157,19 @@ order (including bit 27), the 24-bit I-SID window, C-DA/C-SA placement, the
 that its own dissector recurses cleanly through B-Tag → I-Tag → the
 encapsulated frame's own tag → IPv4 → data, which only works if
 `customer_data` starts exactly where this codec says it does. The one
-disagreement that turned up was cosmetic: Wireshark's dissector names the same
-bit `NCA` ("No Customer Addresses") where this module calls it `uca` ("Use
-Customer Addresses") — see the naming note beside the golden in `src/root.zig`
-for why that was left as an open, cited ambiguity rather than "fixed" on the
-strength of one of two conflicting secondary sources.
+disagreement that turned up is **not merely cosmetic**: Wireshark's dissector
+names the same bit `NCA` ("No Customer Addresses") where this module calls it
+`uca` ("Use Customer Addresses"), and a second golden — the identical frame
+with only that bit forced to 1 — proves Wireshark's `nca` tracks the *same*
+raw polarity as this module's `uca`, not its logical inverse (`ieee8021ah.nca
+== 1` for the same bit value this module reads as `uca == true`). So the two
+names make opposite claims about the identical wire state, not just different
+spellings of one claim. This module keeps `uca`: it matches the rest of the
+struct's 802.1Q/802.1ah vocabulary and an independent vendor (Nokia SR OS's
+PBB docs also say "UCA"), and the primary text that would adjudicate which
+side is right — IEEE 802.1Q-2014 clause 9.7 itself — is paywalled and was not
+available here. See the naming note on `Fields.uca` in `src/root.zig` for the
+full resolution and the pinned bit=1 golden that proves the conflict is real.
 
 `zig build test-pbb`: the three goldens above; an isolated I-TCI-octet
 bit-field test; two permanent positive-control tests (UCA↔DEI swap,

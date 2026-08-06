@@ -128,6 +128,11 @@ cross-checked against Wireshark 4.6.4's real IEEE 802.1ah dissector offline
 (`scripts/dissect.py`, sharkd — no capture, no network needed). Wireshark
 confirmed the I-TCI/B-TCI bit layout, the C-DA/C-SA relocation, and that its own
 dissector recurses correctly into the encapsulated customer frame at exactly the
-offset this codec treats as the boundary. See SPEC.md for the design, threat
-model, and the one naming ambiguity ("UCA" vs Wireshark's "NCA") that check
-turned up.
+offset this codec treats as the boundary. A fourth golden, the same frame with
+only I-TCI bit 27 forced to 1, proves that Wireshark's dissector calls this bit
+`NCA` ("No Customer Addresses") with the *same* raw polarity this module reads
+as `uca` ("Use Customer Addresses") — an opposite semantic claim about one
+shared bit, not a cosmetic spelling difference. `uca` was kept (it matches the
+struct's 802.1Q vocabulary and independent Nokia SR OS usage; the primary
+802.1Q-2014 text that would adjudicate it is paywalled). See SPEC.md and the
+`Fields.uca` doc comment in `src/root.zig` for the full resolution.
