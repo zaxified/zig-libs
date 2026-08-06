@@ -363,3 +363,122 @@ test "decode rejects a ciphertext length claiming more bytes than remain (trunca
     buf[5] = 0x01; // ...= 200, but far fewer bytes actually remain
     try testing.expectError(error.Truncated, Message.decode(testing.allocator, &buf));
 }
+
+// ── fuzz: the wire-message decoder ───────────────────────────────────────
+//
+// `Message.decode`/`fromBase64` take a byte string straight off the wire —
+// a Matrix `m.room.encrypted` event body is attacker-supplied in full —
+// and walk it with hand-rolled LEB128 varints and offset arithmetic
+// (`payload = bytes[1 .. len - 72]`, then a tag/value loop that advances
+// `pos` by amounts the input chooses). Until this harness existed the
+// module carried NO `testing.fuzz(` call at all, so `scripts/fuzz-sweep.sh`
+// — whose target list is `grep -rl 'testing.fuzz(' modules/*/src/*.zig` —
+// never listed `megolm` and it received zero fuzz budget in the repo's own
+// sweeps.
+//
+// Raw entropy would spend almost every iteration on `MessageTooShort` /
+// `UnsupportedVersion`, so this builds the FRAME (version byte + the fixed
+// 72-byte MAC+signature suffix) around fuzzer-chosen payload bytes, and
+// generates the payload as a tag/varint stream — including deliberately
+// NON-MINIMAL varints (`0x80 0x00` for zero), over-claimed
+// length-delimited fields, duplicate and out-of-order fields, and 10-byte
+// maximal varints — because those are exactly the shapes the offset
+// arithmetic has to survive.
+//
+// Reachability was verified rather than assumed: with a temporary
+// `@panic` on `decode`'s SUCCESS return, a 60 s `scripts/fuzz-sweep.sh`
+// run found it — so the harness really does drive the tag loop to
+// completion, not just its early rejects. Probe then removed.
+test "fuzz: Message.decode / fromBase64 never panic on arbitrary bytes" {
+    try testing.fuzz({}, fuzzMessageDecode, .{});
+}
+
+/// Writes `v` as LEB128 using exactly `pad` extra continuation bytes — a
+/// non-minimal but structurally legal encoding. `pad == 0` is the minimal
+/// form. Returns the number of bytes written.
+fn fuzzWriteVarintPadded(buf: []u8, v: u64, pad: usize) usize {
+    var x = v;
+    var i: usize = 0;
+    while (true) {
+        var b: u8 = @intCast(x & 0x7f);
+        x >>= 7;
+        if (x != 0) b |= 0x80;
+        if (i >= buf.len) return i;
+        buf[i] = b;
+        i += 1;
+        if (x == 0) break;
+    }
+    var p: usize = 0;
+    while (p < pad and i < buf.len and i < max_varint_bytes) : (p += 1) {
+        buf[i - 1] |= 0x80; // re-open the previous byte
+        buf[i] = 0x00; // ...and continue with a zero group
+        i += 1;
+    }
+    return i;
+}
+
+fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+
+    if (smith.boolWeighted(1, 7)) {
+        // Minority: unstructured bytes, so the length/version gates and the
+        // "not even a frame" shapes get their own coverage.
+        n = smith.slice(&buf);
+    } else {
+        buf[0] = if (smith.boolWeighted(1, 9)) smith.value(u8) else version;
+        n = 1;
+        // Payload: a tag/value stream the decoder has to walk.
+        while (n + 16 < buf.len - suffix_len and !smith.eosWeightedSimple(4, 1)) {
+            const tag: u64 = switch (smith.value(enum { index, ciphertext, unknown, wide })) {
+                .index => 0x08,
+                .ciphertext => 0x12,
+                .unknown => smith.value(u8),
+                .wide => smith.value(u64),
+            };
+            n += fuzzWriteVarintPadded(buf[n..], tag, smith.valueRangeAtMost(u8, 0, 3));
+            switch (tag) {
+                0x08 => {
+                    // A u32-overflowing index must be `VarintTooLong`, and a
+                    // non-minimal one is the malleability shape.
+                    const v: u64 = if (smith.boolWeighted(2, 1)) smith.value(u32) else smith.value(u64);
+                    n += fuzzWriteVarintPadded(buf[n..], v, smith.valueRangeAtMost(u8, 0, 9));
+                },
+                0x12 => {
+                    const claimed: u64 = if (smith.boolWeighted(4, 1))
+                        smith.valueRangeAtMost(u8, 0, 32)
+                    else
+                        smith.value(u64);
+                    n += fuzzWriteVarintPadded(buf[n..], claimed, smith.valueRangeAtMost(u8, 0, 3));
+                    const room = buf.len - suffix_len - n;
+                    const want: usize = @min(@as(usize, @intCast(@min(claimed, 32))), room);
+                    n += smith.slice(buf[n..][0..want]);
+                },
+                else => {},
+            }
+        }
+        // The fixed suffix: 8-byte MAC + 64-byte Ed25519 signature. Its
+        // CONTENT is irrelevant to `decode` (verification lives in
+        // session.zig), but its 72-byte presence is what separates a
+        // walkable payload from `MessageTooShort`.
+        const suffix_room = @min(suffix_len, buf.len - n);
+        n += smith.slice(buf[n..][0..suffix_room]);
+    }
+
+    if (Message.decode(allocator, buf[0..n])) |msg| {
+        var m = msg;
+        m.deinit(allocator);
+    } else |_| {}
+
+    // Same bytes through the base64 wrapper, plus (sometimes) a corrupted
+    // alphabet so `base64Decode`'s own reject paths are reached.
+    const b64 = try base64Encode(allocator, buf[0..n]);
+    defer allocator.free(b64);
+    if (b64.len > 0 and smith.boolWeighted(3, 1)) b64[smith.index(b64.len)] = smith.value(u8);
+    if (Message.fromBase64(allocator, b64)) |msg| {
+        var m = msg;
+        m.deinit(allocator);
+    } else |_| {}
+}

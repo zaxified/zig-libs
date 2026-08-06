@@ -262,3 +262,65 @@ test "SessionKey rejects a signature that doesn't match the embedded ratchet (ta
 fn testIo() std.Io.Threaded {
     return std.Io.Threaded.init(testing.allocator, .{});
 }
+
+// ── fuzz: the session-key decoders ───────────────────────────────────────
+//
+// `SessionKey.decode`/`fromBase64` and `ExportedSessionKey.decode`/
+// `fromBase64` are the other half of `megolm`'s attacker-facing surface
+// (the first half is `message.zig`): a session key arrives from whoever
+// claims to be sharing the session, and an *exported* one arrives from a
+// key backup, i.e. from storage this module does not control. Both were
+// unfuzzed — the module had no `testing.fuzz(` call at all, so the
+// module-granularity `grep` in `scripts/fuzz-sweep.sh` never listed it.
+//
+// These decoders are fixed-width, so unlike `message.zig` the shape that
+// matters is the LENGTH GATE and what happens just past it: this harness
+// biases lengths hard toward `export_len` (165) and `share_len` (229) and
+// their off-by-ones, so the `bytes.len != …` check, the version byte, the
+// big-endian index read, the Ed25519 `PublicKey.fromBytes` rejection of a
+// non-canonical point and the signature verify all get real budget rather
+// than being sheltered behind a length that never matches.
+//
+// Reachability: with a temporary `@panic` where `SessionKey.decode`
+// rejects a bad Ed25519 signature — i.e. past the length gate, the
+// version byte, the big-endian index read and the public-key parse — a
+// 60 s `scripts/fuzz-sweep.sh` run found it. Probe then removed.
+test "fuzz: session-key decoders never panic on arbitrary bytes" {
+    try testing.fuzz({}, fuzzSessionKeyDecode, .{});
+}
+
+fn fuzzSessionKeyDecode(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    var buf: [320]u8 = undefined;
+    const len: usize = switch (smith.value(enum { exact_export, exact_share, near, any })) {
+        .exact_export => export_len,
+        .exact_share => share_len,
+        .near => blk: {
+            const base: usize = if (smith.value(bool)) export_len else share_len;
+            const delta = smith.valueRangeAtMost(u8, 0, 4);
+            break :blk if (smith.value(bool)) base + delta else base -| delta;
+        },
+        .any => smith.valueRangeAtMost(u16, 0, buf.len),
+    };
+    _ = smith.slice(buf[0..len]);
+    // The version byte gates everything after the length check, so make it
+    // the right one most of the time.
+    if (len > 0) {
+        buf[0] = switch (smith.value(enum { share, exp, any })) {
+            .share => share_version,
+            .exp => export_version,
+            .any => smith.value(u8),
+        };
+    }
+    const bytes = buf[0..len];
+
+    _ = ExportedSessionKey.decode(bytes) catch {};
+    _ = SessionKey.decode(bytes) catch {};
+
+    const b64 = try base64Encode(allocator, bytes);
+    defer allocator.free(b64);
+    if (b64.len > 0 and smith.boolWeighted(3, 1)) b64[smith.index(b64.len)] = smith.value(u8);
+    _ = ExportedSessionKey.fromBase64(allocator, b64) catch {};
+    _ = SessionKey.fromBase64(allocator, b64) catch {};
+}

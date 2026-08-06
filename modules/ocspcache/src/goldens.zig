@@ -65,11 +65,11 @@ const testing = std.testing;
 const ocspcache = @import("root.zig");
 const ocsp = @import("ocsp");
 
-const this_update_unix: i64 = 1785514845;
-const next_update_unix: i64 = 1785860385;
+pub const this_update_unix: i64 = 1785514845;
+pub const next_update_unix: i64 = 1785860385;
 /// thisUpdate + 1h — inside the response's real validity window and the
 /// delegate certificate's real validity window (2026-02-26 .. 2027-02-26).
-const now_unix: i64 = this_update_unix + 3600;
+pub const now_unix: i64 = this_update_unix + 3600;
 
 pub const godaddy_leaf_der = [_]u8{
     0x30, 0x82, 0x06, 0xd2, 0x30, 0x82, 0x05, 0xba, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x09, 0x00,

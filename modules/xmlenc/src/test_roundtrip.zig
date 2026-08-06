@@ -543,3 +543,276 @@ fn kwWrap(kek: []const u8, plaintext: []const u8, out: []u8) void {
     }
     @memcpy(out[0..8], &a);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// fuzz: the `<xenc:EncryptedData>` surface
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `decryptData` parses an attacker-supplied `EncryptedData` element and
+// base64-decodes both CipherValues BEFORE the private key is ever applied, and
+// on the SAML path (`saml`'s `EncryptedAssertion`) it is reached
+// pre-authentication — an unauthenticated peer chooses every byte. Until this
+// harness existed the module had no `testing.fuzz` target at all, so
+// `scripts/fuzz-sweep.sh`, whose module list is derived from exactly that
+// grep, had never covered it once.
+//
+// The bytes are wrapped in real structure rather than fed raw: an XML-Enc
+// document, algorithm URIs off the module's own allow-lists, and base64 text
+// of the right length to reach the RSA private operation. Raw entropy dies at
+// `xml.parse` and never reaches `readCipherValue`, `unwrapCek`,
+// `rsaPkcs1v15Unwrap`, `aesGcmDecrypt` or `aesCbcDecrypt` — the functions the
+// finding names. `fuzzKeyPairReaches` (below) is the standing proof that a
+// document from this builder really does traverse the whole path.
+
+/// One deterministic 1024-bit test key, generated once and reused: key
+/// generation costs far more than the decrypt under test, and `makeKey` is
+/// seeded, so caching changes nothing but the budget.
+var fuzz_kp_cache: ?rsa.KeyPair = null;
+
+fn fuzzKeyPair() !rsa.KeyPair {
+    if (fuzz_kp_cache) |kp| return kp;
+    const kp = try makeKey();
+    fuzz_kp_cache = kp;
+    return kp;
+}
+
+const fuzz_content_algs = [_][]const u8{
+    xenc_ns ++ "aes128-cbc",
+    xenc_ns ++ "aes256-cbc",
+    xenc11_ns ++ "aes128-gcm",
+    xenc11_ns ++ "aes256-gcm",
+    xenc_ns ++ "aes192-cbc", // real xmlenc algorithm this module refuses
+    "urn:not-an-algorithm",
+};
+
+const fuzz_key_algs = [_][]const u8{
+    xenc_ns ++ "rsa-oaep-mgf1p",
+    xenc11_ns ++ "rsa-oaep",
+    xenc_ns ++ "rsa-1_5",
+    xenc_ns ++ "kw-aes128",
+    xenc_ns ++ "kw-aes256",
+    "urn:not-an-algorithm",
+};
+
+const fuzz_digest_algs = [_][]const u8{
+    ds_ns ++ "sha1",
+    xenc_ns ++ "sha256",
+    "urn:not-a-digest",
+};
+
+const fuzz_mgf_algs = [_][]const u8{
+    xenc11_ns ++ "mgf1sha1",
+    xenc11_ns ++ "mgf1sha256",
+    "urn:not-an-mgf",
+};
+
+/// The parts of an `EncryptedData` document a hostile IdP controls.
+const EncShape = struct {
+    content_alg: []const u8,
+    key_alg: []const u8,
+    /// `<ds:DigestMethod>` / `<x11:MGF>` inside the EncryptedKey's
+    /// EncryptionMethod (xenc11 rsa-oaep parameters), when present.
+    digest_alg: ?[]const u8 = null,
+    mgf_alg: ?[]const u8 = null,
+    /// `<xenc:OAEPparams>` text (the OAEP label), when present.
+    oaep_params: ?[]const u8 = null,
+    /// Text placed inside the EncryptedKey's `<xenc:CipherValue>`.
+    key_cipher_text: []const u8,
+    /// Text placed inside the EncryptedData's `<xenc:CipherValue>`.
+    content_cipher_text: []const u8,
+    /// Emit a `<xenc:CipherReference>` instead of a `<xenc:CipherValue>` for
+    /// the content (must be refused before any key use).
+    cipher_reference: bool = false,
+    /// Drop the `<ds:KeyInfo>` subtree entirely.
+    omit_key_info: bool = false,
+};
+
+fn buildFuzzDoc(alloc: std.mem.Allocator, s: EncShape) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.print(
+        alloc,
+        "<xenc:EncryptedData xmlns:xenc=\"{s}\" xmlns:ds=\"{s}\" xmlns:x11=\"{s}\" " ++
+            "Type=\"http://www.w3.org/2001/04/xmlenc#Element\">",
+        .{ xenc_ns, ds_ns, xenc11_ns },
+    );
+    try out.print(alloc, "<xenc:EncryptionMethod Algorithm=\"{s}\"/>", .{s.content_alg});
+    if (!s.omit_key_info) {
+        try out.appendSlice(alloc, "<ds:KeyInfo><xenc:EncryptedKey>");
+        try out.print(alloc, "<xenc:EncryptionMethod Algorithm=\"{s}\">", .{s.key_alg});
+        if (s.digest_alg) |d| try out.print(alloc, "<ds:DigestMethod Algorithm=\"{s}\"/>", .{d});
+        if (s.mgf_alg) |m| try out.print(alloc, "<x11:MGF Algorithm=\"{s}\"/>", .{m});
+        if (s.oaep_params) |p| try out.print(alloc, "<xenc:OAEPparams>{s}</xenc:OAEPparams>", .{p});
+        try out.appendSlice(alloc, "</xenc:EncryptionMethod>");
+        try out.print(
+            alloc,
+            "<xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>",
+            .{s.key_cipher_text},
+        );
+        try out.appendSlice(alloc, "</xenc:EncryptedKey></ds:KeyInfo>");
+    }
+    if (s.cipher_reference) {
+        try out.appendSlice(alloc, "<xenc:CipherData><xenc:CipherReference URI=\"http://evil.example/x\"/></xenc:CipherData>");
+    } else {
+        try out.print(
+            alloc,
+            "<xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>",
+            .{s.content_cipher_text},
+        );
+    }
+    try out.appendSlice(alloc, "</xenc:EncryptedData>");
+    return out.toOwnedSlice(alloc);
+}
+
+/// Parse + decrypt one built document. Split out so the reachability test
+/// drives exactly what the fuzzer drives.
+fn fuzzDecryptDoc(alloc: std.mem.Allocator, doc_src: []const u8, sk: rsa.SecretKey, options: xmlenc.Options) !void {
+    var doc = xml.parse(alloc, doc_src, .{ .id_attr_names = &.{"ID"} }) catch return;
+    defer doc.deinit();
+    const plain = xmlenc.decryptData(alloc, doc.root, sk, options) catch return;
+    alloc.free(plain);
+}
+
+/// XML-text-safe alphabet: base64's own characters plus whitespace and a few
+/// non-base64 bytes, so the decoder's reject path is exercised too, without
+/// `<`/`&` turning every iteration into an `xml.parse` failure.
+const b64ish = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/= \n\t!*.";
+
+fn toB64ish(buf: []u8) void {
+    for (buf) |*c| c.* = b64ish[c.* % b64ish.len];
+}
+
+fn fuzzDecryptData(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const kp = try fuzzKeyPair();
+    const k = (kp.public_key.n.bits() + 7) / 8; // exact RSA block length
+
+    var raw: [512]u8 = undefined;
+    smith.bytes(&raw);
+    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+
+    // The wrapped-CEK text. Length `k` is the only one `rsaRawPrivate`
+    // accepts, so give the fuzzer that shape explicitly as well as free rein.
+    const key_text: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => try b64(a, raw[0..k]), // exact RSA block: reaches the private op
+        1 => try b64(a, raw[0..@min(raw_len, 40)]), // AES-KW-ish blob
+        2 => blk: {
+            const t = try a.dupe(u8, raw[0..raw_len]);
+            toB64ish(t);
+            break :blk t;
+        },
+        else => "",
+    };
+
+    const content_text: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => try b64(a, raw[0..raw_len]),
+        1 => blk: {
+            const t = try a.dupe(u8, raw[0..raw_len]);
+            toB64ish(t);
+            break :blk t;
+        },
+        else => "",
+    };
+
+    const shape: EncShape = .{
+        .content_alg = fuzz_content_algs[smith.index(fuzz_content_algs.len)],
+        .key_alg = fuzz_key_algs[smith.index(fuzz_key_algs.len)],
+        .digest_alg = if (smith.value(bool)) fuzz_digest_algs[smith.index(fuzz_digest_algs.len)] else null,
+        .mgf_alg = if (smith.value(bool)) fuzz_mgf_algs[smith.index(fuzz_mgf_algs.len)] else null,
+        .oaep_params = if (smith.value(bool)) content_text else null,
+        .key_cipher_text = key_text,
+        .content_cipher_text = content_text,
+        .cipher_reference = smith.value(bool),
+        .omit_key_info = smith.value(bool),
+    };
+
+    var kek: [32]u8 = undefined;
+    smith.bytes(&kek);
+    const kek_len: usize = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => 16,
+        1 => 32,
+        else => 0,
+    };
+    const options: xmlenc.Options = .{
+        .allow_weak_rsa15 = smith.value(bool),
+        .kek = if (kek_len == 0) null else kek[0..kek_len],
+        .max_ciphertext_len = 4 << 20,
+    };
+
+    const doc_src = try buildFuzzDoc(a, shape);
+    try fuzzDecryptDoc(a, doc_src, kp.secret_key, options);
+
+    // Also the unstructured direction, so the XML framing itself is fuzzed and
+    // not only the fields inside a fixed template.
+    try fuzzDecryptDoc(a, raw[0..raw_len], kp.secret_key, options);
+}
+
+test "fuzz: decryptData never panics on a hostile EncryptedData" {
+    try std.testing.fuzz({}, fuzzDecryptData, .{});
+}
+
+test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" {
+    // The class-B defect this guards against is a harness that cannot reach
+    // the code it appears to cover. Two directions, both through the *same*
+    // `buildFuzzDoc` the fuzzer uses:
+    const a = std.testing.allocator;
+    const kp = try fuzzKeyPair();
+    const k = (kp.public_key.n.bits() + 7) / 8;
+
+    // 1. A document from the builder decrypts end to end — so the framing is
+    //    right all the way through `unwrapCek` and `aesGcmDecrypt`.
+    {
+        const cek = [_]u8{0x5A} ** 32;
+        const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+        defer a.free(wrapped);
+        const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+        defer a.free(content);
+        const wrapped_b64 = try b64(a, wrapped);
+        defer a.free(wrapped_b64);
+        const content_b64 = try b64(a, content);
+        defer a.free(content_b64);
+
+        const doc_src = try buildFuzzDoc(a, .{
+            .content_alg = xenc11_ns ++ "aes256-gcm",
+            .key_alg = xenc_ns ++ "rsa-oaep-mgf1p",
+            .key_cipher_text = wrapped_b64,
+            .content_cipher_text = content_b64,
+        });
+        defer a.free(doc_src);
+        var doc = try xml.parse(a, doc_src, .{ .id_attr_names = &.{"ID"} });
+        defer doc.deinit();
+        const plain = try xmlenc.decryptData(a, doc.root, kp.secret_key, .{});
+        defer a.free(plain);
+        try std.testing.expectEqualStrings(plaintext_assertion, plain);
+    }
+
+    // 2. Junk of exactly the RSA block length reaches the private operation
+    //    and the v1.5 unpadding: `DecryptionError` is only produced downstream
+    //    of `rsaRawPrivate`, never by the structural checks above it.
+    {
+        var junk: [512]u8 = undefined;
+        for (&junk, 0..) |*c, i| c.* = @truncate(i *% 7 +% 3);
+        const junk_b64 = try b64(a, junk[0..k]);
+        defer a.free(junk_b64);
+        const doc_src = try buildFuzzDoc(a, .{
+            .content_alg = xenc11_ns ++ "aes256-gcm",
+            .key_alg = xenc_ns ++ "rsa-1_5",
+            .key_cipher_text = junk_b64,
+            .content_cipher_text = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        });
+        defer a.free(doc_src);
+        var doc = try xml.parse(a, doc_src, .{ .id_attr_names = &.{"ID"} });
+        defer doc.deinit();
+        try std.testing.expectError(
+            error.DecryptionError,
+            xmlenc.decryptData(a, doc.root, kp.secret_key, .{ .allow_weak_rsa15 = true }),
+        );
+    }
+
+    // 3. And the harness body itself runs to completion on fixed input.
+    var smith: std.testing.Smith = .{ .in = &([_]u8{0x02} ** 32 ++ [_]u8{0x00} ** 2048) };
+    try fuzzDecryptData({}, &smith);
+}

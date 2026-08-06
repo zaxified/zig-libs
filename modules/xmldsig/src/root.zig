@@ -960,3 +960,269 @@ test "verify: not a Signature element is a typed error, never a panic" {
     const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
     try testing.expectError(error.MalformedSignature, verify(a, &doc, doc.root, .{ .key = .{ .rsa = pk } }));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// fuzz: the `ds:Signature` surface
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `verify()` IS this module's attack surface: it runs on a fully
+// attacker-controlled `ds:Signature` element before any trust decision has
+// been made (`saml` calls it on an unauthenticated Response). Until this
+// harness existed the module had no `testing.fuzz` target at all, so
+// `scripts/fuzz-sweep.sh` — whose module list is derived from that grep — had
+// never covered it, and `xml`'s own harness stops at the parse layer: it never
+// builds a `ds:Signature`, so `validateReference`, `c14n.canonicalize`,
+// `decodeBase64` and `verifySignature` were unreached by any fuzzer.
+//
+// Raw entropy cannot get past `xml.parse`, let alone assemble a SignedInfo, so
+// the fuzzed bytes are placed INSIDE real signature structure: algorithm URIs
+// drawn from the module's own allow-lists (plus off-list ones), base64 fields
+// of signature length, and — the deepest mode — byte mutations of a genuinely
+// valid signed document, which reach the digest and RSA comparisons with
+// everything else intact.
+
+/// One valid signed document, built once (two RSA signatures) and reused as
+/// the mutation base; `buildSignedRsaDoc` is deterministic, so caching changes
+/// nothing but the budget. Held in the page allocator on purpose: it outlives
+/// individual tests, and `std.testing.allocator` is torn down between them.
+var fuzz_signed_doc: ?[]u8 = null;
+
+fn fuzzSignedDoc() ![]const u8 {
+    if (fuzz_signed_doc) |d| return d;
+    const sd = try buildSignedRsaDoc(std.heap.page_allocator, false, false);
+    fuzz_signed_doc = sd.xml;
+    return sd.xml;
+}
+
+const fuzz_c14n_algs = [_][]const u8{
+    alg_exc_c14n, alg_exc_c14n_wc, alg_c14n, alg_c14n_wc, "urn:not-a-c14n",
+};
+const fuzz_sig_algs = [_][]const u8{
+    sig_rsa_sha256, sig_rsa_sha384, sig_rsa_sha512, sig_rsa_sha1, sig_ecdsa_sha256, "urn:not-a-sig",
+};
+const fuzz_digest_algs = [_][]const u8{
+    dig_sha256, dig_sha384, dig_sha512, dig_sha1, "urn:not-a-digest",
+};
+const fuzz_transform_algs = [_][]const u8{
+    alg_enveloped, alg_exc_c14n, alg_c14n, "http://www.w3.org/TR/1999/REC-xpath-19991116", "urn:not-a-transform",
+};
+const fuzz_ref_uris = [_][]const u8{ "", "#obj-1", "#nope", "#", "http://evil.example/x" };
+
+/// The parts of a `ds:Signature` document a hostile peer controls.
+const SigShape = struct {
+    c14n_alg: []const u8,
+    sig_alg: []const u8,
+    digest_alg: []const u8,
+    transform1: ?[]const u8,
+    transform2: ?[]const u8,
+    ref_uri: []const u8,
+    digest_value: []const u8,
+    signature_value: []const u8,
+    content: []const u8,
+    key_info_cert: ?[]const u8,
+    /// Emit a second `ds:Reference` (the multi-reference shape).
+    second_reference: bool,
+};
+
+fn buildFuzzSignature(alloc: std.mem.Allocator, s: SigShape) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.print(alloc, "<Envelope ID=\"obj-1\" xmlns=\"urn:demo\"><Data>{s}</Data>", .{s.content});
+    try out.print(alloc, "<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>", .{ds_ns});
+    try out.print(alloc, "<ds:CanonicalizationMethod Algorithm=\"{s}\"/>", .{s.c14n_alg});
+    try out.print(alloc, "<ds:SignatureMethod Algorithm=\"{s}\"/>", .{s.sig_alg});
+    for (0..(if (s.second_reference) @as(usize, 2) else 1)) |_| {
+        try out.print(alloc, "<ds:Reference URI=\"{s}\">", .{s.ref_uri});
+        if (s.transform1 != null or s.transform2 != null) {
+            try out.appendSlice(alloc, "<ds:Transforms>");
+            if (s.transform1) |t| try out.print(alloc, "<ds:Transform Algorithm=\"{s}\"/>", .{t});
+            if (s.transform2) |t| try out.print(alloc, "<ds:Transform Algorithm=\"{s}\"/>", .{t});
+            try out.appendSlice(alloc, "</ds:Transforms>");
+        }
+        try out.print(alloc, "<ds:DigestMethod Algorithm=\"{s}\"/>", .{s.digest_alg});
+        try out.print(alloc, "<ds:DigestValue>{s}</ds:DigestValue></ds:Reference>", .{s.digest_value});
+    }
+    try out.appendSlice(alloc, "</ds:SignedInfo>");
+    try out.print(alloc, "<ds:SignatureValue>{s}</ds:SignatureValue>", .{s.signature_value});
+    if (s.key_info_cert) |c| {
+        try out.print(
+            alloc,
+            "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{s}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+            .{c},
+        );
+    }
+    try out.appendSlice(alloc, "</ds:Signature></Envelope>");
+    return out.toOwnedSlice(alloc);
+}
+
+/// Parse a candidate document and run `verify()` on the `ds:Signature` it
+/// contains (the element itself when it is the root — the enveloping shape).
+/// Split out so the reachability test drives exactly what the fuzzer drives.
+fn fuzzVerifyDoc(alloc: std.mem.Allocator, src: []const u8, options: Options) !void {
+    var doc = xml.parse(alloc, src, .{ .id_attr_names = &.{"ID"} }) catch return;
+    defer doc.deinit();
+    const sig = if (isDs(doc.root, "Signature")) doc.root else childByName(doc.root, "Signature") orelse return;
+    var res = verify(alloc, &doc, sig, options) catch return;
+    res.deinit(alloc);
+}
+
+/// XML-text-safe alphabet (no `<`/`&`), biased to base64 so a fuzzed
+/// DigestValue/SignatureValue frequently decodes instead of dying at the
+/// first character.
+const ds_b64ish = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/= \n\t!*";
+
+fn toDsB64ish(buf: []u8) void {
+    for (buf) |*c| c.* = ds_b64ish[c.* % ds_b64ish.len];
+}
+
+fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    const options: Options = .{
+        .key = .{ .rsa = pk },
+        .allow_weak_sha1 = smith.value(bool),
+        .id_attr = if (smith.value(bool)) "ID" else null,
+    };
+
+    var raw: [512]u8 = undefined;
+    smith.bytes(&raw);
+    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+
+    // Mode 1 — a signature assembled around the fuzzed bytes.
+    {
+        var digest_buf: [64]u8 = undefined;
+        smith.bytes(&digest_buf);
+        var sig_buf: [256]u8 = undefined; // exactly one RSA-2048 signature
+        smith.bytes(&sig_buf);
+        var text_buf: [64]u8 = undefined;
+        smith.bytes(&text_buf);
+        toDsB64ish(&text_buf);
+
+        const digest_value: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+            0 => try b64Encode(a, digest_buf[0..32]),
+            1 => blk: {
+                const t = try a.dupe(u8, digest_buf[0..]);
+                toDsB64ish(t);
+                break :blk t;
+            },
+            else => "",
+        };
+        const signature_value: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+            0 => try b64Encode(a, sig_buf[0..]), // right length: reaches the RSA op
+            1 => blk: {
+                const t = try a.dupe(u8, sig_buf[0..64]);
+                toDsB64ish(t);
+                break :blk t;
+            },
+            else => "",
+        };
+
+        const src = try buildFuzzSignature(a, .{
+            .c14n_alg = fuzz_c14n_algs[smith.index(fuzz_c14n_algs.len)],
+            .sig_alg = fuzz_sig_algs[smith.index(fuzz_sig_algs.len)],
+            .digest_alg = fuzz_digest_algs[smith.index(fuzz_digest_algs.len)],
+            .transform1 = if (smith.value(bool)) fuzz_transform_algs[smith.index(fuzz_transform_algs.len)] else null,
+            .transform2 = if (smith.value(bool)) fuzz_transform_algs[smith.index(fuzz_transform_algs.len)] else null,
+            .ref_uri = fuzz_ref_uris[smith.index(fuzz_ref_uris.len)],
+            .digest_value = digest_value,
+            .signature_value = signature_value,
+            .content = &text_buf,
+            .key_info_cert = if (smith.value(bool)) digest_value else null,
+            .second_reference = smith.value(bool),
+        });
+        try fuzzVerifyDoc(a, src, options);
+    }
+
+    // Mode 2 — a genuinely VALID signed document with a fuzzer-chosen byte
+    // range overwritten. Everything the mutation does not touch stays
+    // consistent, so these inputs reach the digest and signature comparisons
+    // that a from-scratch document rarely survives to.
+    {
+        const base = try fuzzSignedDoc();
+        const mutant = try a.dupe(u8, base);
+        const off = smith.index(mutant.len);
+        const n = @min(smith.valueRangeAtMost(u8, 0, 32), mutant.len - off);
+        var patch: [32]u8 = undefined;
+        smith.bytes(&patch);
+        toDsB64ish(patch[0..n]);
+        @memcpy(mutant[off..][0..n], patch[0..n]);
+        try fuzzVerifyDoc(a, mutant, options);
+    }
+
+    // Mode 3 — unstructured, so the XML framing itself is fuzzed.
+    try fuzzVerifyDoc(a, raw[0..raw_len], options);
+}
+
+fn b64Encode(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try alloc.alloc(u8, enc.calcSize(data.len));
+    _ = enc.encode(out, data);
+    return out;
+}
+
+test "fuzz: verify never panics on a hostile ds:Signature" {
+    try std.testing.fuzz({}, fuzzVerifySignature, .{});
+}
+
+test "the xmldsig fuzz harness reaches verify's digest and signature checks (reachability)" {
+    // Guards the class-B defect: a harness that never reaches what it covers.
+    const a = testing.allocator;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    const options: Options = .{ .key = .{ .rsa = pk } };
+
+    // 1. The mutation base is a document that verifies — so mode 2 starts from
+    //    an input that traverses `verify()` in full, digest comparison and RSA
+    //    verification included.
+    {
+        const base = try fuzzSignedDoc();
+        var doc = try xml.parse(a, base, .{ .id_attr_names = &.{"ID"} });
+        defer doc.deinit();
+        const sig = childByName(doc.root, "Signature").?;
+        var res = try verify(a, &doc, sig, options);
+        defer res.deinit(a);
+        try testing.expect(res.valid);
+        try testing.expect(res.references[0].digest_valid);
+    }
+
+    // 2. A document from the harness's own builder, with on-allow-list
+    //    algorithms and a signature-length base64 SignatureValue, runs all the
+    //    way to a verdict: `verify` RETURNING a Result (rather than a
+    //    structural error) means C14N, the reference digest and
+    //    `verifySignature` all executed.
+    {
+        const digest_b64 = try b64Encode(a, &[_]u8{0xAB} ** 32);
+        defer a.free(digest_b64);
+        const sig_b64 = try b64Encode(a, &[_]u8{0xCD} ** 256);
+        defer a.free(sig_b64);
+        const src = try buildFuzzSignature(a, .{
+            .c14n_alg = alg_exc_c14n,
+            .sig_alg = sig_rsa_sha256,
+            .digest_alg = dig_sha256,
+            .transform1 = alg_enveloped,
+            .transform2 = alg_exc_c14n,
+            .ref_uri = "",
+            .digest_value = digest_b64,
+            .signature_value = sig_b64,
+            .content = "Hello World",
+            .key_info_cert = null,
+            .second_reference = false,
+        });
+        defer a.free(src);
+        var doc = try xml.parse(a, src, .{ .id_attr_names = &.{"ID"} });
+        defer doc.deinit();
+        const sig = childByName(doc.root, "Signature").?;
+        var res = try verify(a, &doc, sig, options);
+        defer res.deinit(a);
+        // Both comparisons ran and both said no — which is the point: they ran.
+        try testing.expect(!res.valid);
+        try testing.expectEqual(@as(usize, 1), res.references.len);
+        try testing.expect(!res.references[0].digest_valid);
+    }
+
+    // 3. And the harness body itself runs to completion on fixed input.
+    var smith: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 64 ++ [_]u8{0x00} ** 2048) };
+    try fuzzVerifySignature({}, &smith);
+}

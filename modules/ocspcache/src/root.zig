@@ -518,6 +518,204 @@ test "buildGetUrl: percent-encodes reserved base64 characters" {
         std.mem.indexOf(u8, b64_segment, "%3D") != null);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// fuzz: the two untrusted surfaces
+// ════════════════════════════════════════════════════════════════════════════
+//
+// This module had NO `testing.fuzz` target at all, and `scripts/fuzz-sweep.sh`
+// derives its module list from exactly that grep — so `ocspcache` was absent
+// from every repo-wide sweep ever run. It looked covered from outside and was
+// not. Both of its untrusted inputs are real:
+//
+//   * `discoverResponderUrl`/`parseAiaOcspUrl` walk the Authority Information
+//     Access extension of a certificate the module did not issue;
+//   * `Cache.refresh` consumes an HTTP body chosen by whoever answers the
+//     responder URL — an unauthenticated network peer — and hands it to
+//     `ocsp.parseResponse`/`ocsp.verify`.
+//
+// Raw entropy is rejected by the first DER header, so both harnesses build the
+// bytes into real structure: an `AccessDescription` around a fuzzed OID and
+// URI, byte mutations of a real production certificate, and mutations of the
+// real captured GoDaddy OCSP response. The reachability test below is the
+// standing proof that these inputs traverse the whole path.
+
+/// A `Transport` that returns caller-chosen bytes, so `refresh`'s response
+/// handling can be fuzzed without a network.
+const FuzzTransport = struct {
+    status: u16 = 200,
+    body: []const u8 = &.{},
+
+    fn fetch(context: *anyopaque, gpa: std.mem.Allocator, req: FetchRequest) FetchError!FetchResponse {
+        _ = req;
+        const self: *FuzzTransport = @ptrCast(@alignCast(context));
+        return .{ .status = self.status, .body = gpa.dupe(u8, self.body) catch return error.OutOfMemory };
+    }
+
+    fn transport(self: *FuzzTransport) Transport {
+        return .{ .context = self, .fetchFn = fetch };
+    }
+};
+
+/// Emit one DER TLV (`tag`, length, `content`) into `out`.
+fn derTlv(alloc: std.mem.Allocator, tag: u8, content: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, tag);
+    if (content.len < 0x80) {
+        try out.append(alloc, @intCast(content.len));
+    } else {
+        try out.append(alloc, 0x82);
+        var be: [2]u8 = undefined;
+        std.mem.writeInt(u16, &be, @intCast(content.len), .big);
+        try out.appendSlice(alloc, &be);
+    }
+    try out.appendSlice(alloc, content);
+    return out.toOwnedSlice(alloc);
+}
+
+/// `SEQUENCE { SEQUENCE { OID <oid>, [tag] <loc> } }` — the AIA extnValue
+/// shape `parseAiaOcspUrl` walks, with the fuzzed bytes as the OID content and
+/// the accessLocation content.
+fn buildAia(alloc: std.mem.Allocator, oid: []const u8, loc_tag: u8, loc: []const u8) ![]u8 {
+    const method = try derTlv(alloc, 0x06, oid);
+    const location = try derTlv(alloc, loc_tag, loc);
+    const inner = try std.mem.concat(alloc, u8, &.{ method, location });
+    const ad = try derTlv(alloc, 0x30, inner);
+    return derTlv(alloc, 0x30, ad);
+}
+
+const fuzz_loc_tags = [_]u8{ 0x86, 0xa4, 0x82, 0x30, 0x04 };
+
+fn fuzzAia(_: void, smith: *std.testing.Smith) !void {
+    const goldens = @import("goldens.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var raw: [256]u8 = undefined;
+    smith.bytes(&raw);
+    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+
+    // 1. Structured: a real AccessDescription around fuzzed bytes. The OID is
+    //    either the genuine id-ad-ocsp (so the URI branch is taken) or fuzzed.
+    const oid: []const u8 = if (smith.value(bool)) &oid_ad_ocsp else raw[0..@min(raw_len, 16)];
+    const loc_tag = fuzz_loc_tags[smith.index(fuzz_loc_tags.len)];
+    const value = try buildAia(a, oid, loc_tag, raw[0..raw_len]);
+    _ = parseAiaOcspUrl(value) catch {};
+
+    // 2. Unstructured, straight at the extension parser.
+    _ = parseAiaOcspUrl(raw[0..raw_len]) catch {};
+
+    // 3. A real production certificate with a fuzzer-chosen byte overwritten,
+    //    through the full `findExtensions` -> `iterate` -> AIA walk.
+    const mutant = try a.dupe(u8, &goldens.godaddy_leaf_der);
+    const n = @min(smith.valueRangeAtMost(u8, 0, 8), raw_len);
+    for (0..n) |i| mutant[smith.index(mutant.len)] = raw[i];
+    _ = discoverResponderUrl(mutant) catch {};
+
+    // 4. And every truncation is a typed error, never a walk off the end.
+    const cut = smith.valueRangeAtMost(u16, 0, @intCast(goldens.godaddy_leaf_der.len));
+    _ = discoverResponderUrl(goldens.godaddy_leaf_der[0..cut]) catch {};
+}
+
+test "fuzz: the AIA responder-URL walk never panics" {
+    try std.testing.fuzz({}, fuzzAia, .{});
+}
+
+fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
+    const goldens = @import("goldens.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var raw: [512]u8 = undefined;
+    smith.bytes(&raw);
+    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+
+    // The responder's answer: the real captured response, mutated or truncated
+    // (so `ocsp.parseResponse` and `ocsp.verify` are actually reached), or
+    // arbitrary bytes.
+    const body: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => &goldens.godaddy_response_der,
+        1 => blk: {
+            const mutant = try a.dupe(u8, &goldens.godaddy_response_der);
+            const n = @min(smith.valueRangeAtMost(u8, 0, 8), raw_len);
+            for (0..n) |i| mutant[smith.index(mutant.len)] = raw[i];
+            break :blk mutant;
+        },
+        2 => goldens.godaddy_response_der[0..smith.valueRangeAtMost(u16, 0, @intCast(goldens.godaddy_response_der.len))],
+        else => raw[0..raw_len],
+    };
+
+    var mock: FuzzTransport = .{
+        .status = if (smith.value(bool)) 200 else smith.valueRangeAtMost(u16, 0, 599),
+        .body = body,
+    };
+    var cache = Cache.init(std.testing.allocator, mock.transport(), .{
+        .fetch_method = if (smith.value(bool)) .post else .get,
+        .max_response_bytes = 64 * 1024,
+    });
+    defer cache.deinit();
+
+    const now: i64 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => goldens.now_unix,
+        1 => goldens.next_update_unix + 1,
+        else => @as(i64, smith.value(i32)),
+    };
+
+    cache.refresh(&goldens.godaddy_leaf_der, &goldens.godaddy_issuer_der, now) catch {};
+    _ = cache.getStapled(&goldens.godaddy_leaf_der, now);
+    _ = cache.needsRefresh(&goldens.godaddy_leaf_der, now);
+
+    // A fuzzed subject/issuer pair too — the request-building side.
+    cache.refresh(raw[0..raw_len], &goldens.godaddy_issuer_der, now) catch {};
+}
+
+test "fuzz: Cache.refresh never panics on a hostile responder body" {
+    try std.testing.fuzz({}, fuzzRefresh, .{});
+}
+
+test "the ocspcache fuzz harnesses reach the AIA walk and ocsp.verify (reachability)" {
+    // Guards the class-B defect: a harness that cannot reach what it covers.
+    const goldens = @import("goldens.zig");
+    const a = testing.allocator;
+
+    // 1. The AIA builder produces a document the parser resolves to a URL, so
+    //    the fuzzed variants really are exercising the matching branch.
+    {
+        // `buildAia` composes intermediate TLVs; the fuzz harness runs it in an
+        // arena, so do the same here rather than free four pieces by hand.
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try buildAia(arena.allocator(), &oid_ad_ocsp, 0x86, "http://ocsp.example.org/");
+        try testing.expectEqualStrings("http://ocsp.example.org/", (try parseAiaOcspUrl(value)).?);
+    }
+
+    // 2. The unmutated real certificate resolves through `discoverResponderUrl`
+    //    — the path modes 3 and 4 mutate.
+    try testing.expectEqualStrings(
+        "http://ocsp.godaddy.com/",
+        (try discoverResponderUrl(&goldens.godaddy_leaf_der)).?,
+    );
+
+    // 3. The refresh harness's own transport + cache reach `ocsp.verify` and a
+    //    cached staple: with the unmutated captured response the whole
+    //    fetch -> parse -> verify -> cache path completes.
+    {
+        var mock: FuzzTransport = .{ .status = 200, .body = &goldens.godaddy_response_der };
+        var cache = Cache.init(a, mock.transport(), .{});
+        defer cache.deinit();
+        try cache.refresh(&goldens.godaddy_leaf_der, &goldens.godaddy_issuer_der, goldens.now_unix);
+        try testing.expect(cache.getStapled(&goldens.godaddy_leaf_der, goldens.now_unix) != null);
+    }
+
+    // 4. And both harness bodies run to completion on fixed input.
+    var s1: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 32 ++ [_]u8{0x00} ** 1024) };
+    try fuzzAia({}, &s1);
+    var s2: std.testing.Smith = .{ .in = &([_]u8{0x00} ** 1024) };
+    try fuzzRefresh({}, &s2);
+}
+
 test {
     _ = @import("ocspcache_test.zig");
     _ = @import("goldens.zig");

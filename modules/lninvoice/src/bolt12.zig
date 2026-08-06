@@ -1598,3 +1598,169 @@ test "BOLT#12: wrong prefix rejected for lnr / lni decoders" {
     try testing.expectError(error.UnknownPrefix, decodeInvoiceRequest(allocator, "lno1qqqq"));
     try testing.expectError(error.UnknownPrefix, decodeInvoice(allocator, "lnr1qqqq"));
 }
+
+// ── fuzz: the checksum-LESS BOLT#12 parsers ──────────────────────────────
+//
+// This file needs a harness of its OWN even though the module already
+// appears in `scripts/fuzz-sweep.sh`: that script derives its target list
+// with `grep -rl 'testing.fuzz(' modules/*/src/*.zig`, i.e. at MODULE
+// granularity, so `bech32_raw.zig`'s and `bolt11.zig`'s harnesses were
+// making `lninvoice` look covered while every entry point in this file
+// contributed nothing to the sweep.
+//
+// The exposure is strictly larger here than in `bolt11.zig`. A BOLT#11
+// invoice is bech32-checksummed, so an arbitrary string dies at
+// `InvalidChecksum` with probability 1 - 2^-30 and never reaches the
+// parser (which is why that file's harness routes through `encode`).
+// BOLT#12 has **no checksum at all** ("There is no checksum, unlike
+// bech32m"), so *every* byte string a user scans off a QR code or pastes
+// from a web page walks straight into `stripContinuation`, the bit
+// unpacker, `lnwire.parseTlvStream`, the per-record semantic checks and
+// `merkleRoot`'s recursive tree builder.
+//
+// Structure, not entropy: the interesting machinery is behind a TLV
+// stream, and uniform bytes rarely produce a walkable one. So the harness
+// generates the TLV records itself (BigSize type + BigSize length + value,
+// with the type biased toward the real offer/invoice_request/invoice
+// numbers and toward the 240..1000 signature range that `merkleRoot`
+// excludes), then feeds those bytes BOTH raw to `merkleRoot` and, wrapped
+// by the module's own `encodeNoChecksum`, to all three string decoders.
+// A minority of iterations skip the generator and use raw entropy, and a
+// minority mutate the finished string (case, `+` continuations, stray
+// bytes) so the envelope's own reject paths are exercised too.
+//
+// Reachability was checked, not assumed: with a temporary `@panic` fired
+// when `decodeOffer`'s `parseTlvStream` returned TWO OR MORE records —
+// i.e. the envelope, the bit unpacker and the whole BOLT#1 TLV walk
+// (ascending types, no unknown-even) all cleared — a 90 s
+// `scripts/fuzz-sweep.sh` run found it. Probe then removed. `merkleRoot`
+// needs no such check: the harness hands it raw bytes directly.
+test "fuzz: BOLT#12 decoders and merkleRoot never panic on arbitrary input" {
+    try testing.fuzz({}, fuzzBolt12, .{});
+}
+
+/// Minimal BigSize (BOLT#1) writer — the harness's own, so a bug in the
+/// module's encoder cannot quietly stop the harness reaching the parser.
+fn fuzzPutBigSize(buf: []u8, v: u64) usize {
+    if (v < 0xfd) {
+        buf[0] = @intCast(v);
+        return 1;
+    } else if (v <= 0xffff) {
+        buf[0] = 0xfd;
+        std.mem.writeInt(u16, buf[1..3], @intCast(v), .big);
+        return 3;
+    } else if (v <= 0xffff_ffff) {
+        buf[0] = 0xfe;
+        std.mem.writeInt(u32, buf[1..5], @intCast(v), .big);
+        return 5;
+    } else {
+        buf[0] = 0xff;
+        std.mem.writeInt(u64, buf[1..9], v, .big);
+        return 9;
+    }
+}
+
+fn fuzzBolt12(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    // ── 1. the raw TLV stream ────────────────────────────────────────────
+    var tlv: [512]u8 = undefined;
+    var n: usize = 0;
+    if (smith.boolWeighted(1, 7)) {
+        n = smith.slice(&tlv); // pure entropy, the minority case
+    } else {
+        // BOLT#1 requires STRICTLY ASCENDING types, and rejects an unknown
+        // EVEN one — so a stream of independently-drawn types is thrown out
+        // by `parseTlvStream` before any of this file's own logic runs.
+        // Two thirds of records therefore walk the real offer type list
+        // upward, which is what actually gets the harness past the TLV
+        // walk and into the per-record semantics.
+        var offer_idx: usize = 0;
+        var first_offer = true;
+        while (n + 32 < tlv.len and !smith.eosWeightedSimple(3, 1)) {
+            const t: u64 = if (smith.boolWeighted(1, 2)) blk: {
+                const step: usize = if (first_offer)
+                    smith.valueRangeAtMost(u8, 0, 3)
+                else
+                    smith.valueRangeAtMost(u8, 1, 3);
+                first_offer = false;
+                offer_idx = @min(offer_idx + step, known_offer_types.len - 1);
+                break :blk known_offer_types[offer_idx];
+            } else switch (smith.value(enum { ireq, invoice, sig_range, tiny, huge })) {
+                // The invoice_request / invoice number spaces, spanning the
+                // 240..1000 signature exclusion on both sides.
+                .ireq => smith.valueRangeAtMost(u16, 0, 250),
+                .invoice => smith.valueRangeAtMost(u16, 160, 260),
+                .sig_range => smith.valueRangeAtMost(u16, 235, 1005),
+                .tiny => smith.value(u8),
+                .huge => smith.value(u64),
+            };
+            var hdr: [9]u8 = undefined;
+            const tl = fuzzPutBigSize(&hdr, t);
+            if (n + tl >= tlv.len) break;
+            @memcpy(tlv[n..][0..tl], hdr[0..tl]);
+            n += tl;
+
+            // The declared length is deliberately allowed to disagree with
+            // what follows: `parseTlvStream`/`merkleRoot` must fail closed
+            // on an over-claim rather than slice past the buffer.
+            const claimed: u64 = if (smith.boolWeighted(6, 1))
+                smith.valueRangeAtMost(u8, 0, 40)
+            else
+                smith.value(u64);
+            const ll = fuzzPutBigSize(&hdr, claimed);
+            if (n + ll >= tlv.len) break;
+            @memcpy(tlv[n..][0..ll], hdr[0..ll]);
+            n += ll;
+
+            const want: usize = @min(@as(usize, @intCast(@min(claimed, 64))), tlv.len - n);
+            n += smith.slice(tlv[n..][0..want]);
+        }
+    }
+    const stream = tlv[0..n];
+
+    // ── 2. merkleRoot, straight over the raw bytes ───────────────────────
+    _ = merkleRoot(allocator, stream) catch {};
+
+    // ── 3. the same bytes inside each string envelope ────────────────────
+    const quintets = try bitpack.bytesToQuintets(allocator, stream);
+    defer allocator.free(quintets);
+
+    const hrps = [_][]const u8{ "lno", "lnr", "lni", "ln", "lnbc" };
+    const hrp = hrps[smith.index(hrps.len)];
+    const encoded = bech32raw.encodeNoChecksum(allocator, hrp, quintets) catch return;
+    defer allocator.free(encoded);
+
+    // Optional string-level damage: uppercase runs, `+` continuations and
+    // out-of-charset bytes all have their own paths in `stripContinuation`
+    // / `decodeNoChecksum`.
+    var str_buf: [1024]u8 = undefined;
+    var s: []const u8 = encoded;
+    if (encoded.len <= str_buf.len and encoded.len > 0 and smith.boolWeighted(2, 1)) {
+        @memcpy(str_buf[0..encoded.len], encoded);
+        var muts: usize = 0;
+        while (muts < 8 and !smith.eosWeightedSimple(3, 1)) : (muts += 1) {
+            const i = smith.index(encoded.len);
+            str_buf[i] = switch (smith.value(enum { plus, space, upper, byte })) {
+                .plus => '+',
+                .space => ' ',
+                .upper => std.ascii.toUpper(str_buf[i]),
+                .byte => smith.value(u8),
+            };
+        }
+        s = str_buf[0..encoded.len];
+    }
+
+    if (decodeOffer(allocator, s)) |off| {
+        var o = off;
+        o.deinit(allocator);
+    } else |_| {}
+    if (decodeInvoiceRequest(allocator, s)) |ireq| {
+        var r = ireq;
+        r.deinit(allocator);
+    } else |_| {}
+    if (decodeInvoice(allocator, s)) |inv| {
+        var v = inv;
+        v.deinit(allocator);
+    } else |_| {}
+}
