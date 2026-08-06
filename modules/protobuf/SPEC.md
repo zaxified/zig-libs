@@ -118,6 +118,45 @@ M7), which is the evidence that the cap is doing work rather than decorating the
 The encoder is bounded by the same option for the same reason: a boxed self-recursive value built
 at run time can be arbitrarily deep.
 
+### 3. A duplicate field is a merge, not a replacement
+
+The encoding spec has two rules for a field that appears more than once, and only one of them is
+"last occurrence wins". Scalars, `string` and `bytes` are last-wins; an **embedded message** is
+*merged* into the earlier occurrence (`MergeFrom`), recursively, with the submessage's own repeated
+fields concatenating and its own scalars again last-wins.
+
+Getting this wrong in the replacing direction is not a cosmetic divergence, it is a **field-hiding
+primitive**: a sender appends a second, near-empty copy of a submessage and every field the first
+copy set reverts to its type default in front of whatever authorisation or validation decision
+reads the value — while a reference peer, and therefore any filter in front of us, still sees the
+original field. No round trip can see this, because a canonical encoding never emits the shape;
+only a foreign parser can settle it, which is why the case is in `reference_interop.zig` as well as
+in the offline `adversarial.zig`.
+
+It is implemented through the equivalence the spec itself states — parsing the concatenation of two
+encodings equals parsing each and merging — so the *payload bytes* are gathered and decoded once
+(`decode.zig`, `MergeBuf`). That matters for more than tidiness: decoding each occurrence and then
+merging the values would have to re-copy every element of every already-decoded repeated field on
+every further occurrence, and the sender picks the number of occurrences, so it is quadratic in the
+input. Concatenation is linear, and the single-occurrence case — essentially all real traffic —
+copies nothing, the payload staying a borrowed slice.
+
+### 4. `string` means UTF-8, and the reference enforces it
+
+proto3 requires a `string` field to carry valid UTF-8, and the reference implementation enforces it
+**at parse time**: the Python runtime raises `UnicodeDecodeError` out of `ParseFromString`, naming
+the field, so the whole message is refused (verified on both proto3 and proto2 descriptors). We
+return `error.InvalidUtf8` for the same inputs — invalid start byte, overlong encoding, a UTF-16
+surrogate half, a truncated sequence — all of which `std.unicode.utf8ValidateSlice` rejects and all
+of which the reference rejects.
+
+Accepting them would make this decoder the hole in a mixed fleet: a filter built on it passes a
+message every reference peer refuses, and a consumer receives a `[]const u8` whose declared type
+promises text. `bytes` is deliberately untouched — that is the kind for arbitrary octets, and the
+reference accepts `0xff` there. **Asymmetry to know about:** the *encoder* does not validate, so a
+caller who puts invalid UTF-8 into a `.string` field of a value it encodes will emit bytes the
+reference rejects. The check is on the untrusted side, which is the side the threat model is about.
+
 ### Smaller hardening
 
 - **Varints are capped at 10 bytes**, and the 10th byte may only contribute the one bit that fits

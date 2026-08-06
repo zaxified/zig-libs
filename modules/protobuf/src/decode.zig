@@ -39,7 +39,11 @@ pub const Options = struct {
     /// Copy `string`/`bytes` payloads into the arena so the decoded value
     /// outlives the input buffer. Set false for a zero-copy decode whose
     /// slices alias `input` — faster, but the caller must keep `input`
-    /// alive and unmodified for as long as the value is used.
+    /// alive and unmodified for as long as the value is used. (The one
+    /// exception is a submessage that arrived in more than one piece: its
+    /// payloads are concatenated into the arena to be merged, so strings
+    /// inside it alias the arena rather than `input` — strictly the safer
+    /// of the two, and the arena is what `Decoded.deinit` frees anyway.)
     copy_strings: bool = true,
     /// Fail on a field the schema does not describe, instead of preserving
     /// it (or dropping it, if the message declares no `Unknown` sink).
@@ -50,6 +54,11 @@ pub const Options = struct {
 pub const Error = wire.Error || error{
     /// Nesting exceeded `Options.max_depth`.
     DepthExceeded,
+    /// A `string` field carried bytes that are not valid UTF-8. `bytes` is
+    /// the field kind for arbitrary octets; `string` promises text, and the
+    /// reference implementation refuses the stream rather than hand a
+    /// consumer a value its type lies about.
+    InvalidUtf8,
     /// An enum value outside an exhaustive Zig enum. Declare proto enums
     /// non-exhaustive (`enum(i32) { …, _ }`) to accept a newer peer's value.
     InvalidEnumValue,
@@ -89,9 +98,60 @@ pub fn decode(
 
 // ── the per-message loop ────────────────────────────────────────────────────
 
-/// The set of ArrayLists a message needs while decoding: one per repeated
-/// field, plus one for captured unknown bytes. Generated so a repeated field
-/// grows amortised instead of reallocating per element.
+/// Accumulator for the payloads of a **singular/optional message** field.
+///
+/// The encoding spec's merge rule applies to embedded messages: when the
+/// same singular message field appears more than once, the later copies are
+/// *merged* into the earlier one (`MergeFrom`), not substituted for it, so a
+/// field set only in the first copy survives. Replacing instead of merging
+/// is a field-hiding primitive — a sender appends a second, near-empty copy
+/// and every field the first copy set reverts to its default in front of
+/// whatever authorisation decision reads the value.
+///
+/// The spec also states the equivalence exploited here: parsing the
+/// concatenation of two encodings of a message is the same as parsing each
+/// and merging. Concatenating the *payload bytes* and decoding once is why
+/// this is linear: decode-then-merge would have to re-copy every element of
+/// every already-decoded repeated field on each further occurrence, and the
+/// number of occurrences is the sender's to choose — quadratic in the input.
+/// The single-occurrence case, which is essentially all real traffic, copies
+/// nothing at all: the payload stays a borrowed slice.
+const MergeBuf = struct {
+    /// The sole payload, borrowed from the input, while `count == 1`.
+    one: []const u8 = &.{},
+    /// `one` followed by every later payload, once `count > 1`.
+    joined: std.ArrayList(u8) = .empty,
+    count: usize = 0,
+
+    fn add(self: *MergeBuf, arena: std.mem.Allocator, payload: []const u8) !void {
+        switch (self.count) {
+            0 => self.one = payload,
+            1 => {
+                try self.joined.ensureTotalCapacity(arena, self.one.len + payload.len);
+                self.joined.appendSliceAssumeCapacity(self.one);
+                self.joined.appendSliceAssumeCapacity(payload);
+            },
+            else => try self.joined.appendSlice(arena, payload),
+        }
+        self.count += 1;
+    }
+
+    /// The bytes to decode, or null if the field never appeared. An absent
+    /// field and a present-but-empty one stay distinguishable: a zero-length
+    /// submessage still yields an empty slice, not null.
+    fn bytes(self: MergeBuf) ?[]const u8 {
+        return switch (self.count) {
+            0 => null,
+            1 => self.one,
+            else => self.joined.items,
+        };
+    }
+};
+
+/// The per-message scratch state: one ArrayList per repeated field, one
+/// `MergeBuf` per singular/optional message field, plus one list for
+/// captured unknown bytes. Generated so a repeated field grows amortised
+/// instead of reallocating per element.
 fn Lists(comptime T: type) type {
     comptime {
         const inf = schema.infos(T);
@@ -101,7 +161,15 @@ fn Lists(comptime T: type) type {
         var attrs: [inf.len + 1]Attrs = undefined;
         var n: usize = 0;
         for (inf) |i| {
-            if (i.card != .repeated) continue;
+            if (i.card != .repeated) {
+                if (i.kind == .message) {
+                    names[n] = i.name;
+                    types[n] = MergeBuf;
+                    attrs[n] = .{ .default_value_ptr = emptyMergeBufPtr() };
+                    n += 1;
+                }
+                continue;
+            }
             const L = std.ArrayList(i.Elem);
             names[n] = i.name;
             types[n] = L;
@@ -124,6 +192,11 @@ fn Lists(comptime T: type) type {
 
 fn emptyListPtr(comptime L: type) *const anyopaque {
     const d: L = .empty;
+    return @ptrCast(&d);
+}
+
+fn emptyMergeBufPtr() *const anyopaque {
+    const d: MergeBuf = .{};
     return @ptrCast(&d);
 }
 
@@ -170,8 +243,23 @@ fn decodeMessage(
     }
 
     inline for (comptime schema.infos(T)) |info| {
-        if (info.card == .repeated)
+        if (info.card == .repeated) {
             @field(out, info.name) = try @field(lists, info.name).toOwnedSlice(arena);
+        } else if (info.kind == .message) {
+            // Every occurrence of this field, concatenated, decoded once —
+            // which is exactly `MergeFrom` over the occurrences. See MergeBuf.
+            if (@field(lists, info.name).bytes()) |payload| {
+                var sub = Cursor.init(payload);
+                const v = try decodeMessage(info.Elem, arena, &sub, options, depth + 1);
+                if (comptime info.boxed) {
+                    const boxed = try arena.create(info.Elem);
+                    boxed.* = v;
+                    @field(out, info.name) = boxed;
+                } else {
+                    @field(out, info.name) = v;
+                }
+            }
+        }
     }
     if (comptime unknownFieldName(T)) |name|
         @field(out, name) = .{ .raw = try @field(lists, name).toOwnedSlice(arena) };
@@ -221,9 +309,20 @@ fn readField(
         return;
     }
 
+    if (comptime info.kind == .message) {
+        // A singular/optional submessage is *not* decoded here: the merge
+        // rule needs every occurrence in hand before any of them can be
+        // read, so the payload is only bounds-checked and set aside. The
+        // decode happens once, over the concatenation, in `decodeMessage`.
+        const n = try cur.varint();
+        try @field(lists, info.name).add(arena, try cur.take(n));
+        return;
+    }
+
     const v = try readValue(info.kind, E, arena, cur, options, depth);
     switch (info.card) {
-        // Last occurrence wins, per the encoding spec's merge rule.
+        // Scalars, strings and bytes are last-occurrence-wins; only embedded
+        // messages merge (handled above).
         .singular => @field(out, info.name) = v,
         .optional => if (info.boxed) {
             const boxed = try arena.create(E);
@@ -265,9 +364,24 @@ fn readValue(
         .fixed64 => try cur.fixed64(),
         .sfixed64 => @bitCast(try cur.fixed64()),
         .double => @bitCast(try cur.fixed64()),
-        .string, .bytes => blk: {
+        .bytes => blk: {
             const n = try cur.varint();
             const raw = try cur.take(n); // bounds check before anything else
+            break :blk if (options.copy_strings) try arena.dupe(u8, raw) else raw;
+        },
+        .string => blk: {
+            const n = try cur.varint();
+            const raw = try cur.take(n); // bounds check before anything else
+            // proto3 requires a `string` field to hold valid UTF-8 and the
+            // reference implementation enforces it *at parse time* — the
+            // Python runtime raises `UnicodeDecodeError` out of
+            // `ParseFromString`, so the whole message is refused. Accepting
+            // it here would make this decoder the hole in a mixed fleet
+            // (a filter built on it passes a message every reference peer
+            // rejects) and would hand a consumer a `[]const u8` whose type
+            // promises text. `.bytes` is deliberately untouched: that is the
+            // kind for arbitrary octets, and the reference accepts 0xff there.
+            if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
             break :blk if (options.copy_strings) try arena.dupe(u8, raw) else raw;
         },
         .message => blk: {

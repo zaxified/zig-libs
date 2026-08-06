@@ -58,8 +58,8 @@ pub const Route = struct {
     metric: u64,
 };
 
-/// Tuning for `computeWith`. The default is the correct ISO §7.2.5 behaviour;
-/// the non-default exists only for the permanent positive control.
+/// Tuning for `computeWith`. The defaults are the correct/safe behaviour;
+/// `require_two_way = false` exists only for the permanent positive control.
 pub const Options = struct {
     /// The ISO §7.2.5 two-way reachability check. When `true` (default,
     /// correct) an undirected edge A–B is admitted to SPF only if BOTH A
@@ -68,6 +68,36 @@ pub const Options = struct {
     /// advertisement poisons the tree); kept solely to prove, in a permanent
     /// test, that the two-way check is load-bearing.
     require_two_way: bool = true,
+
+    /// Refuse to emit a table this module knows is wrong.
+    ///
+    /// IS-IS metrics are **per-interface and therefore directional**: ISO
+    /// 10589 §7.2 relaxes the arc A→B with A's own advertised metric to B.
+    /// `spf-ect` is an *undirected* engine with one weight per edge, so when
+    /// the two endpoints advertise different metrics for the same link there
+    /// is no single weight that reproduces a directed SPF — the next hop and
+    /// the total metric can both come out wrong, and the FRR anchor at the
+    /// bottom of this file is a measured instance of exactly that (FRR 10.3
+    /// reaches r3 at cost 15 via r5; the approximation here says 30 via the
+    /// r4 branch). With this set (the default) such a database is a typed
+    /// `error.AsymmetricMetric` instead of a plausible-looking wrong answer.
+    ///
+    /// Note the entry points differ, deliberately: `compute` **cannot** fail
+    /// closed — its `Allocator.Error` signature is compiled against by other
+    /// modules — so it approximates and reports through
+    /// `RouteTable.asymmetric_links`. `computeWith` is the one that can
+    /// refuse, and does so unless told otherwise. An 802.1aq/SPB fabric
+    /// requires symmetric metrics for congruent forward/reverse paths, so in
+    /// this stack's own topologies the flag never fires.
+    reject_asymmetric: bool = true,
+};
+
+/// `computeWith` fails for two reasons only.
+pub const Error = Allocator.Error || error{
+    /// A link was advertised in both directions with **different** metrics,
+    /// and `Options.reject_asymmetric` was set. The undirected engine cannot
+    /// represent it; see that option.
+    AsymmetricMetric,
 };
 
 /// The computed forwarding table — routes sorted ascending by destination
@@ -75,6 +105,16 @@ pub const Options = struct {
 pub const RouteTable = struct {
     gpa: Allocator,
     routes: []Route,
+    /// How many admitted links were advertised in both directions with
+    /// **different** metrics — i.e. how many edges this table's weights are
+    /// only an approximation of (see `Options.reject_asymmetric`).
+    ///
+    /// **Zero is the only value that means the routes are exact.** Non-zero
+    /// says at least one destination may carry a next hop and a metric a
+    /// directed SPF — a real IS-IS router — would not agree with, so a
+    /// caller outside a symmetric-metric fabric must treat the table as
+    /// advisory rather than authoritative.
+    asymmetric_links: u32 = 0,
 
     pub fn deinit(self: *RouteTable) void {
         self.gpa.free(self.routes);
@@ -106,8 +146,17 @@ pub const RouteTable = struct {
 /// Compute the forwarding table from `db` as seen at `now`, rooted at the
 /// `local` system-id, with the correct ISO §7.2.5 two-way check. See
 /// `computeWith` for the details and the degenerate cases.
+///
+/// This entry point **approximates** an asymmetric link rather than refusing
+/// it (its error set is part of a signature other modules compile against);
+/// check `RouteTable.asymmetric_links != 0` to find out whether it had to, or
+/// call `computeWith` and let `Options.reject_asymmetric` fail closed.
 pub fn compute(gpa: Allocator, db: *const lsdb.Lsdb, local: SystemId, now: Time) Allocator.Error!RouteTable {
-    return computeWith(gpa, db, local, now, .{});
+    return computeWith(gpa, db, local, now, .{ .reject_asymmetric = false }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        // Unreachable by construction: only `reject_asymmetric` raises it.
+        error.AsymmetricMetric => unreachable,
+    };
 }
 
 /// `compute` with explicit `Options`.
@@ -129,7 +178,7 @@ pub fn computeWith(
     local: SystemId,
     now: Time,
     opts: Options,
-) Allocator.Error!RouteTable {
+) Error!RouteTable {
     // ── 1. extract directed advertisements + the set of LSP origins ──────────
     // directed: (from ++ to) → best (minimum) advertised metric, from ⟶ to.
     var directed: std.AutoHashMapUnmanaged([12]u8, spf.Weight) = .empty;
@@ -179,6 +228,11 @@ pub fn computeWith(
     var pairs: std.AutoHashMapUnmanaged([12]u8, spf.Weight) = .empty;
     defer pairs.deinit(gpa);
 
+    // Links whose two endpoints advertised different metrics — the edges whose
+    // weight is an approximation, counted so the caller is never left guessing
+    // whether this table is exact. See `Options.reject_asymmetric`.
+    var asymmetric_links: u32 = 0;
+
     var dit = directed.iterator();
     while (dit.next()) |kv| {
         const a: SystemId = kv.key_ptr[0..6].*;
@@ -199,6 +253,20 @@ pub fn computeWith(
         const hi_lo = directed.get(rev); // hi ⟶ lo advertisement, if any
 
         if (opts.require_two_way and !(lo_hi != null and hi_lo != null)) continue;
+
+        // ISO 10589's metric is per-interface, so the two endpoints can — and
+        // in the real world do — advertise different costs for the same link.
+        // An undirected single-weight engine has no way to hold both, and no
+        // choice of the one weight reproduces a directed SPF in general: which
+        // direction of the edge a path traverses is decided by the tree, which
+        // is what is being computed. So this is detected rather than papered
+        // over: refused outright by default, and counted otherwise, because
+        // the alternative — the behaviour this replaces — was to return a
+        // confident wrong next hop with no signal of any kind to the caller.
+        if (lo_hi != null and hi_lo != null and lo_hi.? != hi_lo.?) {
+            if (opts.reject_asymmetric) return error.AsymmetricMetric;
+            asymmetric_links += 1;
+        }
 
         // Undirected engine: one weight per edge. Use the lo⟶hi advertisement
         // (the endpoint with the lexicographically-smaller system-id) as the
@@ -229,7 +297,7 @@ pub fn computeWith(
 
     // Local not in the graph → degenerate empty table (documented).
     if (!id_set.contains(local)) {
-        return .{ .gpa = gpa, .routes = try gpa.alloc(Route, 0) };
+        return .{ .gpa = gpa, .routes = try gpa.alloc(Route, 0), .asymmetric_links = asymmetric_links };
     }
 
     const node_count: u32 = @intCast(id_set.count());
@@ -280,7 +348,7 @@ pub fn computeWith(
         });
     }
 
-    return .{ .gpa = gpa, .routes = try routes.toOwnedSlice(gpa) };
+    return .{ .gpa = gpa, .routes = try routes.toOwnedSlice(gpa), .asymmetric_links = asymmetric_links };
 }
 
 /// Record a directed advertisement `from ⟶ to`, keeping the minimum metric if
@@ -1024,7 +1092,7 @@ test "two-way check with require_two_way=false: only the hi->lo advertisement ex
 //    r4      TE-IS   20     r4        eth-r4     r1(4)
 //                            r2        eth-r2     r2(4)
 //
-// ── reading the result: two matches, one designed, documented divergence ──
+// ── reading the result: three matches and one MEASURED WRONG ANSWER ──
 //
 // r2, r5 (direct neighbours) and r4 (the ECMP tie) match FRR exactly: this
 // module's undirected-engine approximation (SPEC.md §3.3, the canonical
@@ -1033,23 +1101,87 @@ test "two-way check with require_two_way=false: only the hi->lo advertisement ex
 // three, because the root (r1) is the lower-id endpoint of every edge it
 // uses directly, and {r2,r4} / {r1,r4} are symmetric.
 //
-// r3 is the case SPEC.md §3.3 predicts by name. FRR's real, directed SPF
-// reaches r3 via the r5→r3 arc, whose cost is r5's OWN advertised metric:
-// 5, total 15. This module's edge weight for the *undirected* pair {r3,r5}
-// is canonicalised to the LOWER system-id's advertisement -- r3 (id 3) is
-// lower than r5 (id 5), so the weight used is r3's advertisement (50), not
-// r5's (5), regardless of which direction a path actually needs. That makes
-// the r4 path (20 + 10 = 30) look cheaper than the r5 path (10 + 50 = 60)
-// to this module, even though the real network's cheapest path is 15 via
-// r5. This is not a bug: it is the documented, deliberate limitation of
-// modelling a directed protocol on an undirected single-weight graph (ISO
-// 10589 has no notion of a single link cost -- §7.2's SPF relaxes the arc
-// A→B using A's own advertised metric, which this module cannot represent
-// exactly without a directed engine, SPEC.md §6 "Directed (asymmetric)
-// metrics"). The assertion below pins CURRENT behaviour (30, via r4) so a
-// regression is still caught; the FRR-true answer (15, via r5) is recorded
-// above for anyone who later builds the directed engine to compare against.
-test "FRR anchor: 5-router topology, asymmetric r3<->r5 metric, r4 ECMP tie" {
+// r3 does not. FRR's real, directed SPF reaches r3 via the r5→r3 arc, whose
+// cost is r5's OWN advertised metric: 5, total 15. This module's edge weight
+// for the *undirected* pair {r3,r5} is canonicalised to the LOWER system-id's
+// advertisement -- r3 (id 3) is lower than r5 (id 5), so the weight used is
+// r3's advertisement (50), not r5's (5), regardless of which direction a path
+// actually needs. That makes the r4 path (20 + 10 = 30) look cheaper than the
+// r5 path (10 + 50 = 60), even though the real network's cheapest path is 15
+// via r5. A router loading that table sends r3's traffic the wrong way and
+// bills it at twice the true cost.
+//
+// **This transcript is an oracle, and it says we are wrong.** It used to sit
+// here above an assertion of *our* 30, which turned a live external
+// disagreement into a certificate that the disagreement was intended -- the
+// one thing an anchor must never be made to do. What is asserted now is the
+// disagreement itself: the FRR-true numbers are literals, the test states
+// that we do not produce them, and the default entry point that a router
+// would call (`computeWith`) REFUSES this database outright rather than
+// answering 30 (see `Options.reject_asymmetric`).
+//
+// The underlying limitation is real and unchanged: ISO 10589 has no notion of
+// a single link cost -- §7.2's SPF relaxes the arc A→B using A's own
+// advertised metric, and an undirected single-weight engine cannot represent
+// that. No choice of the one weight fixes it either, because which direction
+// of an edge a path traverses is decided by the tree being computed. Closing
+// it means a **directed** SPF, which lives in `spf-ect`, not here (SPEC.md §6
+// "Directed (asymmetric) metrics"). Until that exists, refusing is the honest
+// answer and the numbers below are what to compare a directed engine against.
+
+/// FRR 10.3's answer for this topology, read off the `show isis topology`
+/// transcript above. These are the oracle's values, not ours.
+const frr_r3_metric: u64 = 15;
+
+fn frrTopology(db: *lsdb.Lsdb) !void {
+    const r1 = sysId(1);
+    const r2 = sysId(2);
+    const r3 = sysId(3);
+    const r4 = sysId(4);
+    const r5 = sysId(5);
+    try insertReachLsp(db, r1, 1, &.{
+        .{ .nbr = r2, .metric = 10 },
+        .{ .nbr = r3, .metric = 100 },
+        .{ .nbr = r4, .metric = 20 },
+        .{ .nbr = r5, .metric = 10 },
+    });
+    try insertReachLsp(db, r2, 1, &.{
+        .{ .nbr = r1, .metric = 10 },
+        .{ .nbr = r4, .metric = 10 },
+    });
+    try insertReachLsp(db, r3, 1, &.{
+        .{ .nbr = r1, .metric = 100 },
+        .{ .nbr = r4, .metric = 10 },
+        .{ .nbr = r5, .metric = 50 }, // r3's own outgoing metric (asymmetric)
+    });
+    try insertReachLsp(db, r4, 1, &.{
+        .{ .nbr = r1, .metric = 20 },
+        .{ .nbr = r2, .metric = 10 },
+        .{ .nbr = r3, .metric = 10 },
+    });
+    try insertReachLsp(db, r5, 1, &.{
+        .{ .nbr = r1, .metric = 10 },
+        .{ .nbr = r3, .metric = 5 }, // r5's own outgoing metric (asymmetric)
+    });
+}
+
+test "FRR anchor: the asymmetric database FRR routes at 15 is REFUSED, not answered wrongly" {
+    // The whole point of the row. On the exact input where a real IS-IS
+    // router reaches r3 at cost 15 via r5, the default decision process here
+    // must not hand back a confident 30 via r4 -- it must say it cannot
+    // represent this database. `require_two_way` is left at its correct
+    // default so nothing else is in play.
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(sysId(1)));
+    defer db.deinit();
+    try frrTopology(&db);
+
+    try testing.expectError(
+        error.AsymmetricMetric,
+        computeWith(testing.allocator, &db, sysId(1), 0, .{}),
+    );
+}
+
+test "FRR anchor: the approximating entry point flags the link and still contradicts FRR" {
     const r1 = sysId(1);
     const r2 = sysId(2);
     const r3 = sysId(3);
@@ -1057,36 +1189,17 @@ test "FRR anchor: 5-router topology, asymmetric r3<->r5 metric, r4 ECMP tie" {
     const r5 = sysId(5);
     var db = lsdb.Lsdb.init(testing.allocator, cfgFor(r1));
     defer db.deinit();
-
-    try insertReachLsp(&db, r1, 1, &.{
-        .{ .nbr = r2, .metric = 10 },
-        .{ .nbr = r3, .metric = 100 },
-        .{ .nbr = r4, .metric = 20 },
-        .{ .nbr = r5, .metric = 10 },
-    });
-    try insertReachLsp(&db, r2, 1, &.{
-        .{ .nbr = r1, .metric = 10 },
-        .{ .nbr = r4, .metric = 10 },
-    });
-    try insertReachLsp(&db, r3, 1, &.{
-        .{ .nbr = r1, .metric = 100 },
-        .{ .nbr = r4, .metric = 10 },
-        .{ .nbr = r5, .metric = 50 }, // r3's own outgoing metric (asymmetric)
-    });
-    try insertReachLsp(&db, r4, 1, &.{
-        .{ .nbr = r1, .metric = 20 },
-        .{ .nbr = r2, .metric = 10 },
-        .{ .nbr = r3, .metric = 10 },
-    });
-    try insertReachLsp(&db, r5, 1, &.{
-        .{ .nbr = r1, .metric = 10 },
-        .{ .nbr = r3, .metric = 5 }, // r5's own outgoing metric (asymmetric)
-    });
+    try frrTopology(&db);
 
     var table = try compute(testing.allocator, &db, r1, 0);
     defer table.deinit();
 
     try testing.expectEqual(@as(usize, 5), table.routes.len);
+
+    // The signal the caller used to not get at all: exactly one link ({r3,r5},
+    // 50 one way and 5 the other) is only approximated. Without this the
+    // table below is indistinguishable from a correct one.
+    try testing.expectEqual(@as(u32, 1), table.asymmetric_links);
 
     // Direct neighbours: exact match with FRR ("show isis topology": r2/r5,
     // metric 10, next-hop themselves).
@@ -1100,15 +1213,61 @@ test "FRR anchor: 5-router topology, asymmetric r3<->r5 metric, r4 ECMP tie" {
     try testing.expectEqual(@as(u64, 20), r4_route.metric);
     try testing.expect(std.mem.eql(u8, &r4_route.next_hop, &r4) or std.mem.eql(u8, &r4_route.next_hop, &r2));
 
-    // r3: DIVERGES from FRR's real answer (15, via r5) -- see the comment
-    // above. Pinned to this module's actual, documented-limitation output:
-    // cost 30 via the r4 branch of the tie (r1->r2->r4->r3, first hop r2 --
-    // which branch of the r4 tie carries the r3 sub-path is itself the
-    // ECT tie-break's choice, so only the metric is asserted exactly; the
-    // next-hop is checked against the same two-way set as r4's).
+    // r3: the divergence, asserted AS a divergence. FRR says 15 via r5; this
+    // approximation says neither. Both halves are pinned -- that we contradict
+    // the oracle (so nobody can later read this file as agreement), and the
+    // exact shape we contradict it with (so a silent change is still caught).
     const r3_route = table.lookup(r3).?;
+    try testing.expect(r3_route.metric != frr_r3_metric);
+    try testing.expect(!std.mem.eql(u8, &r3_route.next_hop, &r5));
     try testing.expectEqual(@as(u64, 30), r3_route.metric);
     try testing.expect(std.mem.eql(u8, &r3_route.next_hop, &r4) or std.mem.eql(u8, &r3_route.next_hop, &r2));
+}
+
+test "asymmetry detection does not fire on a symmetric database" {
+    // The refusal above is only worth anything if it is specific: a symmetric
+    // fabric -- which is what 802.1aq requires and what this stack actually
+    // runs -- must go through untouched, with the count at zero. Same topology
+    // as the FRR one with the single asymmetric pair made symmetric (both
+    // endpoints 50), so the difference between the two tests is exactly the
+    // one advertisement.
+    const r1 = sysId(1);
+    const r3 = sysId(3);
+    const r5 = sysId(5);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(r1));
+    defer db.deinit();
+    try insertReachLsp(&db, r1, 1, &.{
+        .{ .nbr = sysId(2), .metric = 10 },
+        .{ .nbr = r3, .metric = 100 },
+        .{ .nbr = sysId(4), .metric = 20 },
+        .{ .nbr = r5, .metric = 10 },
+    });
+    try insertReachLsp(&db, sysId(2), 1, &.{
+        .{ .nbr = r1, .metric = 10 },
+        .{ .nbr = sysId(4), .metric = 10 },
+    });
+    try insertReachLsp(&db, r3, 1, &.{
+        .{ .nbr = r1, .metric = 100 },
+        .{ .nbr = sysId(4), .metric = 10 },
+        .{ .nbr = r5, .metric = 50 },
+    });
+    try insertReachLsp(&db, sysId(4), 1, &.{
+        .{ .nbr = r1, .metric = 20 },
+        .{ .nbr = sysId(2), .metric = 10 },
+        .{ .nbr = r3, .metric = 10 },
+    });
+    try insertReachLsp(&db, r5, 1, &.{
+        .{ .nbr = r1, .metric = 10 },
+        .{ .nbr = r3, .metric = 50 }, // symmetric now
+    });
+
+    var table = try computeWith(testing.allocator, &db, r1, 0, .{});
+    defer table.deinit();
+    try testing.expectEqual(@as(u32, 0), table.asymmetric_links);
+    try testing.expectEqual(@as(usize, 5), table.routes.len);
+    // With the {r3,r5} link genuinely costing 50 both ways, 30 via r4 IS the
+    // right answer, and now it is asserted about a database where it is right.
+    try testing.expectEqual(@as(u64, 30), table.lookup(r3).?.metric);
 }
 
 test "meta is well-formed" {

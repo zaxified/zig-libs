@@ -123,14 +123,23 @@ and capturing its own output for a topology this task built from scratch.
 Debian VM lane (`scripts/vm/`) re-provisioned, and a real `isisd` 10.3 —
 five instances, one per network namespace, joined by veth, real p2p
 adjacencies, asymmetric per-interface metrics on one link, one deliberate
-equal-cost tie — computed SPF once. That output is now frozen into a
-permanent test: see `src/root.zig`, test `"FRR anchor: 5-router topology,
-asymmetric r3<->r5 metric, r4 ECMP tie"`, which quotes the exact `vtysh`
-commands, FRR's version, and the relevant printed lines in its own comment
-block, and explains — with the ISO 10589 §7.2 reasoning — the one place this
-module's output legitimately diverges from FRR's (the undirected-engine
-approximation this README's "Metric handling" section and `SPEC.md` §3.3
-already documented, not a bug).
+equal-cost tie — computed SPF once. That output is now frozen into two
+permanent tests in `src/root.zig` (`"FRR anchor: …"`), whose shared comment
+block quotes the exact `vtysh` commands, FRR's version, and the relevant
+printed lines.
+
+**Read the outcome carefully: on one vertex the oracle says we are wrong.**
+FRR reaches r3 at cost 15 via r5; the undirected-engine approximation
+(this README's "Metric handling", `SPEC.md` §3.3) says 30 via the r4 branch —
+wrong next hop, double the cost. The transcript originally sat above an
+assertion of *our* 30, which turned a live external disagreement into a
+certificate that the disagreement was intended. It no longer does: the
+disagreement itself is what is asserted, and the default decision-process
+entry point (`computeWith`) now **refuses** that database with
+`error.AsymmetricMetric` rather than answering it. `compute`, whose signature
+other modules compile against, still approximates but reports the fact through
+`RouteTable.asymmetric_links`. The real fix is a directed SPF, which belongs
+to `spf-ect`, not here.
 
 This is a one-shot capture: the test above asserts against literals and does
 not boot a VM, run FRR, or touch the network. Licence note: FRR is

@@ -84,9 +84,31 @@ deterministic rule chosen:
 - old-style #2 default metric: the **low 6 bits** of the octet are the value;
   the high bits are I/E / supported flags.
 
-A directed IS-IS SPF (per-arc metric) is a candidate for a later increment; it
+**Asymmetric metrics are detected and, by default, refused.** The rule above is
+an approximation, and where it is only an approximation it is now said out loud
+rather than left to a comment:
+
+- `RouteTable.asymmetric_links` counts the admitted links whose two endpoints
+  advertised **different** metrics. Zero is the only value that means the routes
+  are exact; non-zero means at least one destination may carry a next hop and a
+  metric a real IS-IS router would not agree with.
+- `Options.reject_asymmetric` (**default true**) turns such a database into
+  `error.AsymmetricMetric` instead of a plausible-looking wrong answer.
+  `compute` cannot use it — its `Allocator.Error` signature is compiled against
+  by `isis-sim` and `spbfib` — so `compute` approximates and reports through the
+  count; `computeWith` is the entry point that refuses.
+
+This matters because the failure is not a rounding error. The FRR 10.3 anchor at
+the bottom of `src/root.zig` is a measured case: FRR reaches r3 at cost **15 via
+r5**, the approximation here says **30 via the r4 branch** — wrong next hop and
+double the cost. Note also that *no* choice of the single weight fixes this in
+general: which direction of an edge a path traverses is decided by the tree being
+computed, so the needed weight is not knowable when the graph is built.
+
+A directed IS-IS SPF (per-arc metric) is therefore the only real fix, and it
 would require either extending `spf-ect` to a directed graph or a different
-engine. Documented, deferred.
+engine — **it does not live in this module**. Documented, deferred; until it
+exists, refusing is the honest answer.
 
 ### 3.4 Intern mapping (system-id ↔ NodeId)
 
@@ -157,4 +179,7 @@ across runs (a permanent test pins this).
 - **Incremental SPF.** Each call is a full recomputation. Incremental / partial
   SPF on an LSDB delta is a performance optimisation, not needed for correctness.
 - **Directed (asymmetric) metrics.** See §3.3 — the undirected engine uses the
-  lower-system-id endpoint's metric; exact only for symmetric metrics.
+  lower-system-id endpoint's metric; exact only for symmetric metrics. Deferred,
+  **not** silently: an asymmetric link is counted on the `RouteTable` and, by
+  default in `computeWith`, refused outright (`error.AsymmetricMetric`). The
+  engine change belongs to `spf-ect`.

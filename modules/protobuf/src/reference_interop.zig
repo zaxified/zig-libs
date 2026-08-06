@@ -329,6 +329,92 @@ test "reference: accepts our packing flipped in both directions" {
     try testing.expect(std.mem.indexOf(u8, dump_flipped, "unpacked=[1,2,150]") != null);
 }
 
+// ── the merge rule, judged by the reference ─────────────────────────────────
+
+test "reference: a repeated singular submessage merges rather than replaces" {
+    // The encoding spec's `MergeFrom` rule for embedded messages. Neither our
+    // encoder nor the reference's ever *emits* this shape — a canonical
+    // encoding writes each singular field once — so only the reference's
+    // parser can settle it, which is precisely why a round trip is blind to
+    // it. Replacing instead of merging lets a sender hide a field: append a
+    // second, near-empty copy and everything the first copy set reverts to
+    // its default in front of whatever reads the value.
+    var ref = try Ref.init(testing.allocator, testing.io);
+    defer ref.deinit();
+    const gpa = testing.allocator;
+
+    // Wide.inner is field 17 (tag 8a 01): inner{v:1} then inner{note:"x"}.
+    const two_copies = [_]u8{ 0x8a, 0x01, 0x02, 0x08, 0x01, 0x8a, 0x01, 0x03, 0x12, 0x01, 0x78 };
+
+    // What the reference reads out of it…
+    const theirs = try ref.refDump("submessage", &two_copies);
+    defer gpa.free(theirs);
+
+    // …must be what it reads out of the single merged message, and what we
+    // decode must equal that same value.
+    const merged = ct.Wide{ .inner = .{ .v = 1, .note = "x" } };
+    const canonical = try pb.encodeAlloc(gpa, merged, .{});
+    defer gpa.free(canonical);
+    try testing.expect(!std.mem.eql(u8, &two_copies, canonical));
+    const want = try ref.refDump("submessage", canonical);
+    defer gpa.free(want);
+    try testing.expectEqualStrings(want, theirs);
+
+    var decoded = try pb.decode(ct.Wide, gpa, &two_copies, .{});
+    defer decoded.deinit();
+    try expectMessageEqual(ct.Wide, merged, decoded.value);
+
+    // A *repeated* message field is not merged: one element per occurrence.
+    // Repeated.inners is field 8 (tag 0x42).
+    const rep_two = [_]u8{ 0x42, 0x02, 0x08, 0x01, 0x42, 0x03, 0x12, 0x01, 0x78 };
+    const rep_theirs = try ref.refDump("rep_message", &rep_two);
+    defer gpa.free(rep_theirs);
+    var rep_decoded = try pb.decode(ct.Repeated, gpa, &rep_two, .{});
+    defer rep_decoded.deinit();
+    const rep_ours = try pb.encodeAlloc(gpa, rep_decoded.value, .{});
+    defer gpa.free(rep_ours);
+    const rep_want = try ref.refDump("rep_message", rep_ours);
+    defer gpa.free(rep_want);
+    try testing.expectEqualStrings(rep_want, rep_theirs);
+    try testing.expectEqual(@as(usize, 2), rep_decoded.value.inners.len);
+}
+
+// ── `string` is UTF-8, judged by the reference ──────────────────────────────
+
+test "reference: invalid UTF-8 in a string field is rejected by both, in bytes by neither" {
+    var ref = try Ref.init(testing.allocator, testing.io);
+    defer ref.deinit();
+    const gpa = testing.allocator;
+
+    // Wide.s is field 15 (tag 0x7a), kind `string`. The reference's
+    // ParseFromString raises UnicodeDecodeError naming pb.Wide.s, so the
+    // driver exits non-zero -> error.ReferenceRejected.
+    const bad = [_][]const u8{
+        &.{ 0x7a, 0x01, 0xff },
+        &.{ 0x7a, 0x02, 0xc0, 0x80 },
+        &.{ 0x7a, 0x03, 0xed, 0xa0, 0x80 },
+        &.{ 0x7a, 0x01, 0xc3 },
+    };
+    for (bad) |b| {
+        if (ref.refDump("strings", b)) |dump| {
+            gpa.free(dump);
+            std.debug.print("reference ACCEPTED invalid UTF-8 {x} — re-derive this test\n", .{b});
+            return error.ReferenceChangedItsMind;
+        } else |e| try testing.expectEqual(error.ReferenceRejected, e);
+        try testing.expectError(error.InvalidUtf8, pb.decode(ct.Wide, gpa, b, .{}));
+    }
+
+    // Wide.raw is field 16 (tag 82 01), kind `bytes`: the same octet is fine
+    // for both, so this is a check on `string`, not a blanket byte filter.
+    const raw_ff = [_]u8{ 0x82, 0x01, 0x01, 0xff };
+    const dump = try ref.refDump("strings", &raw_ff);
+    defer gpa.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "raw=ff") != null);
+    var ours = try pb.decode(ct.Wide, gpa, &raw_ff, .{});
+    defer ours.deinit();
+    try testing.expectEqualSlices(u8, &.{0xff}, ours.value.raw);
+}
+
 // ── unknown-field preservation, judged by the reference ─────────────────────
 
 /// The same message as `ct.Wide` with almost every field removed — an old
