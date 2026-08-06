@@ -312,9 +312,11 @@ pub fn sighashWith(
 
 const testing = std.testing;
 
-// The two published BIP143 examples (`bip143_kat_vectors.zig`) both use
-// hash_type 0x01 (ALL) — neither SIGHASH_SINGLE nor ANYONECANPAY is
-// byte-exact-KAT-covered. In particular, BIP143 deliberately PRESERVES the
+// `bip143_kat_vectors.zig` covers SIGHASH_SINGLE/NONE/ANYONECANPAY
+// byte-exactly (BIP143's "Native P2WSH" and "P2SH-P2WSH" examples), so the
+// hash_type-dependent gates above are externally anchored. The tests below
+// remain as the structural statement of the same rules on hand-built
+// transactions. In particular, BIP143 deliberately PRESERVES the
 // historical "SIGHASH_SINGLE bug" (a SINGLE hash_type with no corresponding
 // output leaves `hashOutputs` all-zero rather than erroring, unlike
 // BIP341's `MissingCorrespondingOutput`) — see this file's `midstates` doc

@@ -2,10 +2,10 @@ lninvoice — third-party attribution
 ====================================================================
 
 This module's own code is MIT (see the repository LICENSE). It additionally
-reproduces third-party TEST-CASE DATA published under Creative Commons
-Attribution 4.0 International (CC-BY 4.0), whose attribution must be
-preserved in any copy. Redistributing this module — alone or as part of
-zig-libs — must keep this file with it.
+reproduces third-party TEST-CASE DATA from two sources — one published under
+Creative Commons Attribution 4.0 International (CC-BY 4.0), one under the MIT
+License — whose attribution must be preserved in any copy. Redistributing
+this module — alone or as part of zig-libs — must keep this file with it.
 
 CC-BY 4.0 permits redistribution and MODIFICATION (unlike a stricter case
 elsewhere in this repository — the `xml` module excludes the James Clark
@@ -95,6 +95,33 @@ A fifth file, `bolt12/format-string-test.json`'s sibling
 hostname is NXDOMAIN and was the reason `ANCHOR-TASKS.tsv` previously marked
 this module BLOCKED. It was never needed — the official vectors live in
 `lightning/bolts` (this file's own source), reachable without it.
+
+## `bitcoinjs/bolt11` — an independent BOLT#11 implementation's own
+## amount-encoding fixtures
+
+  https://github.com/bitcoinjs/bolt11
+  Copyright (c) 2017 bitcoinjs contributors
+  Licensed under the MIT License (see the repository's `LICENSE`; the terms
+  are the same MIT text as this repository's own root LICENSE, and the
+  copyright line above is the attribution MIT requires be preserved).
+  Fetched 2026-08-06 from `test/fixtures.json` at commit
+  `200c232d5b27f34fa948b35de4d39774ad4b063f` (2021-11-18).
+
+  Vendored as `src/bolt11_amount_kat_vectors.zig`: the `hrpToSat`,
+  `hrpToMillisat`, `satToHrp` and `millisatToHrp` fixture tables (amount
+  strings paired with the amount they denote, in both directions), plus one
+  complete published `lnbcrt120n1…` invoice from the `decode` section with
+  upstream's stated `millisatoshis`. Reproduced because BOLT#11's OWN
+  example invoices never use the `n` (nano) multiplier, so the
+  specification authors' vectors — the source above — cannot anchor it;
+  bitcoinjs/bolt11 is an unrelated implementation, which is exactly what
+  makes it usable as a second opinion. Satoshi-denominated rows are
+  multiplied by 1000 into millisatoshis; three upstream `invalid` rows are
+  deliberately not imported (they encode that library's whole-satoshi API
+  constraint rather than a BOLT#11 rule) — the vendored file names them.
+
+  No bitcoinjs/bolt11 SOURCE CODE is reproduced or was consulted;
+  `bolt11.zig` remains clean-room from the specification text.
 
 Implementation vs. test-data distinction: the BOLT#11/BOLT#12 wire-format
 CODEC and Merkle/BIP-340 signature machinery in `bolt11.zig`/`bolt12.zig` are

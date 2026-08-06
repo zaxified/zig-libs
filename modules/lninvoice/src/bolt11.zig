@@ -23,6 +23,7 @@ const k256 = @import("k256");
 const bech32raw = @import("bech32_raw.zig");
 const bitpack = @import("bitpack.zig");
 const ecdsa = @import("ecdsa_recover.zig");
+const amount_vectors = @import("bolt11_amount_kat_vectors.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -993,4 +994,67 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
 
     var inv = decode(allocator, invoice) catch return;
     defer inv.deinit(allocator);
+}
+
+// ── external anchor for the HRP amount multipliers ───────────────────────
+//
+// BOLT#11's own example invoices use `m`, `u`, `p` and no multiplier —
+// never `n`. That left the nano multiplier pinned by nothing but this
+// file's encoder agreeing with this file's decoder, which a *consistent*
+// error in both survives: every `lnbc…n…` amount would be off by 10× and
+// still round trip, and since the amount sits in the HRP (inside the
+// signed preimage, `signedPreimage` below) the signature would still
+// verify. The rows below come from bitcoinjs/bolt11, an independent
+// implementation, in both directions — see
+// `bolt11_amount_kat_vectors.zig` for provenance and for which upstream
+// rows were deliberately not imported.
+
+test "BOLT#11 amount anchor (bitcoinjs/bolt11): every HRP amount string decodes to the msat upstream says" {
+    for (amount_vectors.hrp_to_msat) |v| {
+        const got = parseAmountMsat(v.hrp_amount) catch |err| {
+            std.debug.print("row '{s}' ({s}) failed: {}\n", .{ v.hrp_amount, v.upstream, err });
+            return err;
+        };
+        testing.expectEqual(@as(?u64, v.msat), got) catch |err| {
+            std.debug.print("row '{s}' ({s})\n", .{ v.hrp_amount, v.upstream });
+            return err;
+        };
+    }
+}
+
+test "BOLT#11 amount anchor (bitcoinjs/bolt11): every msat encodes to the shortest HRP amount upstream emits" {
+    var buf: [32]u8 = undefined;
+    for (amount_vectors.msat_to_hrp) |v| {
+        const got = formatAmount(v.msat, &buf);
+        testing.expectEqualStrings(v.hrp_amount, got) catch |err| {
+            std.debug.print("row {d} msat ({s})\n", .{ v.msat, v.upstream });
+            return err;
+        };
+    }
+}
+
+test "BOLT#11 amount anchor: a published 120n invoice's own HRP parses to the amount its publisher states" {
+    const allocator = testing.allocator;
+    const inv = amount_vectors.nano_invoice;
+
+    // Straight off the wire: bech32-checksummed bytes an outside
+    // implementation signed and published, not a string assembled here.
+    var raw = try bech32raw.decode(allocator, inv.payment_request);
+    defer raw.deinit(allocator);
+    try testing.expectEqualStrings(inv.hrp, raw.hrp);
+    try testing.expectEqualStrings(inv.hrp_amount, raw.hrp["lnbcrt".len..]);
+    try testing.expectEqual(@as(?u64, inv.msat), try parseAmountMsat(raw.hrp["lnbcrt".len..]));
+
+    // …and the same amount is what this module would put back into the HRP.
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings(inv.hrp_amount, formatAmount(inv.msat, &buf));
+}
+
+test "BOLT#11 amount anchor (bitcoinjs/bolt11): the amount strings upstream rejects are rejected here too" {
+    for (amount_vectors.invalid_hrp_amounts) |s| {
+        if (parseAmountMsat(s)) |ok| {
+            std.debug.print("expected '{s}' to be rejected, got {?d} msat\n", .{ s, ok });
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }
