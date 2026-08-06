@@ -20,6 +20,48 @@
 #                  rate — the thing that used to be indistinguishable from clean
 #   NEVER-FUZZED   the process exited without the fuzzer performing a single run
 #   OOM-KILLED     the cgroup killed it: an allocation sized from unbounded input
+#   INCOMPLETE     no crash was recognised, but the run performed far fewer
+#                  iterations than the budget it asked for, so it stopped early
+#                  for a reason this script could not name. NOT clean — see
+#                  WHY THE EXIT CODE CANNOT BE TRUSTED.
+#
+# ⭐⭐ WHY THE EXIT CODE CANNOT BE TRUSTED UNDER `--fuzz`. `zig build --fuzz=N`
+# EXITS 0 EVEN WHEN A FUZZ TEST CRASHES. This is not a guess; it is visible in
+# the 0.16.0 build runner. `compiler/build_runner.zig` totals `failure_count`
+# from the step states in a loop that runs BEFORE `if (fuzz) |mode|` starts the
+# fuzzer, and the process exit code is computed from that already-frozen total:
+#
+#     for (step_stack.keys()) |s| { ... .failure => failure_count += 1 ... }
+#     if (fuzz) |mode| { ... f.start(); try f.waitAndPrintReport(); }
+#     const code: u8 = code: { if (failure_count == 0) break :code 0; ... };
+#
+# A crash found by the fuzzer marks its step `.failure` only afterwards, and
+# `std/Build/Fuzz.zig:fuzzWorkerRun` swallows the `error.MakeFailed` it gets
+# back — it prints the message and `return`s. So the failure is REPORTED and
+# never COUNTED. Reproduced at fd39a3e:
+#
+#     zig build test-bacnet --release=safe \
+#         -Dtest-filter="every canonically decoded header re-encodes" --fuzz=20000
+#     -> "error: test '...' exited with code 1; input saved to '.zig-cache/f/crash'"
+#     -> $? == 0
+#
+# The consequence for this script is that `rc` says nothing about crashes, and
+# the old log grep only matched the SIGNAL/panic spellings — so a harness that
+# fails by RETURNING AN ERROR (the ordinary shape of a round-trip oracle:
+# `try expectEqualSlices` -> `error.TestExpectedEqual`) printed `exited with
+# code 1` and was filed as `clean`, with an empty findings.txt. That happened to
+# `bacnet` on 2026-08-06. Under-reporting is worse than no gate at all, so the
+# verdict now rests on THREE independent observations, any one of which is
+# enough to deny `clean`:
+#
+#   1. the log (see CRASH_RE) — the authoritative line is Run.zig's
+#      `error: test '<name>' <term>; input saved to '<path>'`, which is emitted
+#      for every terminating shape: exit code, signal, stop;
+#   2. the `.zig-cache/f/crash` artifact — stamped before and after each run, so
+#      a crash the text patterns miss still shows up as a new artifact;
+#   3. the iteration budget — a completed run performs at least one full
+#      budget per harness (see BUDGET FLOOR); a run that stopped early is
+#      INCOMPLETE, which is the fail-closed answer to "I cannot tell".
 #
 # Everything runs through scripts/capped, so a runaway allocation is killed by
 # its own cgroup instead of the machine. NEVER run the fuzz command without it:
@@ -102,6 +144,31 @@ reapOrphans() { # $1 = module
 # got as far as printing a summary.
 runsDelta() { # $1 = log path
     awk -F'[ >-]+' '/^Runs: /{ d += $3 - $2 } END { print d+0 }' "$1"
+}
+
+# ⭐ EVERY SPELLING OF "A FUZZ TEST DIED", not just the ones with a signal in
+# them. The load-bearing member is `input saved to`/`error: test '`, which is
+# `std/Build/Step/Run.zig`'s single `step.fail("test '{s}' {f}; input saved to
+# '{f}{s}'")` — one call site, reached for `exited with code N`, `terminated
+# with signal N` and `stopped` alike. `run test failure` is the build runner's
+# own tree line for the same event and survives if that message is ever
+# reworded. The old ` [0-9]+ crash` was aimed at the Build Summary's
+# `N crashed`, which under `--fuzz` is BOTH counted before the fuzzer runs and
+# suppressed by the default `--summary failures` when failure_count is 0 — it
+# could never fire. Kept anyway; it costs nothing and covers non-fuzz callers.
+CRASH_RE="error: test '| [0-9]+ crash|terminated with signal|thread [0-9]+ panic|input saved to|run test failure"
+
+crashSeen() { # $1 = log path
+    [[ -f "$1" ]] && grep -qE "$CRASH_RE" "$1"
+}
+
+# ⭐ THE CRASHING INPUT IS EVIDENCE THAT DOES NOT DEPEND ON WORDING. The fuzzer
+# writes `.zig-cache/f/crash` when, and only when, a fuzz test terminated
+# abnormally. Stamping it either side of a run detects a crash even if every
+# text pattern above misses, and mtime+size beats an `-newermt` window because
+# it has no one-second granularity hole.
+crashStamp() {
+    stat -c '%Y:%s' .zig-cache/f/crash 2>/dev/null || echo none
 }
 
 # Every `testing.fuzz(` call site, as `<file>\t<test name>`. The name is the one
@@ -197,10 +264,23 @@ for m in "${MODS[@]}"; do
     # target that cannot even finish CAL_ITERS inside CAL_WALL is already the
     # answer.
     cal_start=$(date +%s)
+    stamp_before=$(crashStamp)
     timeout "$CAL_WALL" ./scripts/capped zig build "test-$m" --release=safe \
         --fuzz="$CAL_ITERS" > "$log.cal" 2>&1
     cal_rc=$?
     cal_dur=$(( $(date +%s) - cal_start ))
+    cal_delta=$(runsDelta "$log.cal")
+
+    # ⭐ THE CALIBRATION RUN IS A FUZZ RUN AND CAN CRASH TOO. It was previously
+    # judged by `cal_rc` alone, which under `--fuzz` is 0 whatever happens, so a
+    # module that crashed in the first CAL_ITERS iterations went on to a main
+    # run timed by a truncated `cal_dur` and could come back `clean`. Remember
+    # it; the verdict below refuses `clean` for a module that crashed here even
+    # if the main run happened not to reach the same input again.
+    cal_crashed=0
+    if crashSeen "$log.cal" || [[ "$(crashStamp)" != "$stamp_before" ]]; then
+        cal_crashed=1
+    fi
 
     if [[ $cal_rc -eq 124 ]]; then
         reapOrphans "$m"
@@ -218,24 +298,67 @@ for m in "${MODS[@]}"; do
     (( wall < 60 )) && wall=60
 
     start=$(date +%s)
+    stamp_before=$(crashStamp)
     timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
         --fuzz="$ITERS" > "$log" 2>&1
     rc=$?
     dur=$(( $(date +%s) - start ))
     [[ $rc -eq 124 ]] && reapOrphans "$m"
     delta=$(runsDelta "$log")
+    new_crash_artifact=0
+    [[ "$(crashStamp)" != "$stamp_before" ]] && new_crash_artifact=1
 
-    # ⭐ A CRASH IS STILL FOUND BY READING THE LOG, not by the exit code alone:
-    # the crash is reported by the fuzzer and the exit status has been seen to
-    # be anything. Keep both signals.
-    if grep -qE ' [0-9]+ crash|terminated with signal|thread [0-9]+ panic' "$log"; then
+    # ⭐ BUDGET FLOOR — the observation that does not read a single word of the
+    # log. A run that ran to completion performs at least ITERS iterations per
+    # fuzz test, so `delta` has a floor, and a run that stopped early falls
+    # under it no matter WHY it stopped or how the reason was spelled.
+    #
+    # Two independent estimators of that floor, because each can be wrong on its
+    # own and they are wrong in opposite directions:
+    #
+    #   nh * ITERS          — exact when `harnessesOf` counted right, but it
+    #                         counts `testing.fuzz(` call sites, so two calls in
+    #                         one test (or one in a helper) OVER-counts.
+    #   cal_delta * ITERS/CAL_ITERS
+    #                       — measured from this module's own completed
+    #                         calibration, immune to miscounting, but noisy:
+    #                         the fuzzer overshoots its limit in batches, and at
+    #                         CAL_ITERS the relative overshoot is largest, so it
+    #                         OVER-estimates.
+    #
+    # Take the smaller, then keep 10% back for the batching overshoot. Measured
+    # at fd39a3e, --fuzz=3000: netaddr 3 harnesses -> 9080 (floor 9000),
+    # json5 2 -> 6722 (6000), cbor 1 -> 3149 (3000). Never once undershot.
+    # bacnet's misreported crash: floor 14x20000 = 280000, delta 80712 = 29%.
+    floor=$(( nh * ITERS ))
+    if (( cal_crashed == 0 && cal_delta > 0 )); then
+        cal_floor=$(( cal_delta * ITERS / CAL_ITERS ))
+        (( cal_floor < floor )) && floor=$cal_floor
+    fi
+
+    # ⭐ THE LADDER IS ORDERED BY WHAT IT CAN PROVE, and `clean` is the only rung
+    # that requires proof rather than the absence of evidence. `rc` is checked
+    # LAST among the failure shapes for exactly the reason in the header: under
+    # `--fuzz` it is 0 even for a crash, so it can only ever add verdicts, never
+    # withhold one.
+    if crashSeen "$log" || (( new_crash_artifact )) || (( cal_crashed )); then
         verdict="FINDING"
     else
         case $rc in
-            0)   if [[ "$delta" -gt 0 ]]; then verdict="clean"; else verdict="NEVER-FUZZED"; fi ;;
             124) verdict="HANG" ;;
             137) verdict="OOM-KILLED" ;;
             15)  if oomKilled "$start"; then verdict="OOM-KILLED"; else verdict="EXIT-15-SIGTERM"; fi ;;
+            0)   if [[ "$delta" -le 0 ]]; then
+                     verdict="NEVER-FUZZED"
+                 elif ! grep -q '^Runs: ' "$log"; then
+                     # No FUZZING REPORT at all: nothing to measure against, so
+                     # say so instead of guessing.
+                     verdict="INCOMPLETE"
+                 elif (( floor > 0 && delta * 100 < floor * 90 )); then
+                     verdict="INCOMPLETE"
+                 else
+                     verdict="clean"
+                 fi ;;
             *)   verdict="EXIT-$rc" ;;
         esac
     fi
@@ -250,6 +373,11 @@ for m in "${MODS[@]}"; do
         echo "  HANG: killed after ${dur}s, having asked for ${ITERS} iterations per harness and been" >> "$log"
         echo "  given ${wall}s = ${HANG_FACTOR}x its own calibrated rate. A bounded fuzz run that does" >> "$log"
         echo "  not terminate means some input reached a path that does not." >> "$log"
+    fi
+    if [[ "$verdict" == "INCOMPLETE" ]]; then
+        echo "  INCOMPLETE: performed $delta runs where a completed run of ${nh} harness(es) at" >> "$log"
+        echo "  ${ITERS} iterations each has a floor of ${floor}. Something stopped this run early and" >> "$log"
+        echo "  none of the crash signals named it. Re-run it alone before believing anything." >> "$log"
     fi
 
     # ⭐ PRESERVE THE CRASHING INPUT, not just the trace. The Zig fuzzer writes
@@ -284,17 +412,30 @@ for m in "${MODS[@]}"; do
             hfile="${h%%$'\t'*}"; hname="${h#*$'\t'}"
             hlog="$OUT/$m.$(echo "$hname" | tr -c 'A-Za-z0-9' '_').log"
             hstart=$(date +%s)
+            hstamp=$(crashStamp)
             timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
                 -Dtest-filter="$hname" --fuzz="$ITERS" > "$hlog" 2>&1
             hrc=$?
             [[ $hrc -eq 124 ]] && reapOrphans "$m"
             hdelta=$(runsDelta "$hlog")
-            if grep -qE ' [0-9]+ crash|terminated with signal|thread [0-9]+ panic' "$hlog"; then
+            # Same three signals as the main ladder. This loop exists to say
+            # which harnesses are innocent, so it is the LAST place that may
+            # answer `clean` from the absence of a message.
+            if crashSeen "$hlog" || [[ "$(crashStamp)" != "$hstamp" ]]; then
                 hv="FINDING"
             elif [[ $hrc -eq 124 ]]; then hv="HANG"
-            elif [[ $hrc -eq 0 && "$hdelta" -gt 0 ]]; then hv="clean"
-            elif [[ $hrc -eq 0 ]]; then hv="NEVER-FUZZED"
-            else hv="EXIT-$hrc"; fi
+            elif [[ $hrc -ne 0 ]]; then hv="EXIT-$hrc"
+            elif [[ "$hdelta" -le 0 ]]; then hv="NEVER-FUZZED"
+            elif (( hdelta * 100 < ITERS * 90 )); then hv="INCOMPLETE"
+            else hv="clean"; fi
+            # Each isolated re-run overwrites .zig-cache/f/crash in turn, so a
+            # second crashing harness used to lose its input to the third one's.
+            # Found the moment the verdict fix let the re-run happen at all:
+            # bacnet's re-run turned up a SECOND crash (sc.zig option walking,
+            # integer overflow) that the mislabelled `clean` had hidden.
+            if [[ "$hv" == "FINDING" && -f .zig-cache/f/crash ]]; then
+                cp .zig-cache/f/crash "${hlog%.log}.crash-input"
+            fi
             printf '%s\t%s\t%s\t%s\t%s\n' "$m/$hname" "$hrc" "$(( $(date +%s) - hstart ))" "$hv" \
                 "isolated re-run, $hfile, runs=$hdelta" >> "$OUT/summary.tsv"
             echo "    $hfile :: $hname -> $hv ($hdelta runs)"
