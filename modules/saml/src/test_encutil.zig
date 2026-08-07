@@ -80,3 +80,54 @@ pub fn encryptedWrapper(
         "<xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>" ++
         "</xenc:EncryptedData></saml:{s}>", .{ wrapper_local, xenc_ns, ds_ns, xenc_ns, cek_b64, content_b64, wrapper_local });
 }
+
+// ── CONVENTIONS §2.1 Z1 probe ────────────────────────────────────────────────
+
+/// An allocator wrapper that inspects every block handed to `free` and records
+/// whether `needle` was still present in it — the only way to observe a Z1 heap
+/// wipe, since after `free` the bytes belong to the allocator again.
+///
+/// Useful ONLY under `-Doptimize=ReleaseFast`: `std.mem.Allocator.free` runs
+/// `@memset(bytes, undefined)` before it reaches the vtable, so in Debug and
+/// ReleaseSafe every freed block is already scrubbed to `0xaa` and this scanner
+/// reports a clean result whatever the module under test does. Gate the test on
+/// `builtin.mode` with `error.SkipZigTest` so the skip is visible.
+pub const FreeScanner = struct {
+    child: std.mem.Allocator,
+    needle: []const u8,
+    /// A block containing `needle` was released without being wiped.
+    leaked_plaintext: bool = false,
+    /// Blocks large enough to hold `needle` that were released at all — the
+    /// positive control that the scanner is looking at something.
+    frees_seen: usize = 0,
+
+    pub fn allocator(self: *FreeScanner) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        } };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resizeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remapFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn freeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        if (m.len >= self.needle.len) {
+            self.frees_seen += 1;
+            if (std.mem.indexOf(u8, m, self.needle) != null) self.leaked_plaintext = true;
+        }
+        self.child.rawFree(m, a, ra);
+    }
+};

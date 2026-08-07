@@ -3,6 +3,20 @@
 //! rescue — **the other arithmetization-oriented hash**: same goal as
 //! `poseidon` (be cheap inside an arithmetic circuit), opposite trade.
 //!
+//!
+//! **Zeroization: none, deliberately (CONVENTIONS §2.1 Z3).** The chaining
+//! state and the message-block buffer are the internal working state of a
+//! transform, not a secret this module owns — they are Z3, the class the repo
+//! settled once so it stops being re-raised module by module. `std` takes the
+//! same position: `sha2`, `sha3`, `blake2`, `blake3`, `hmac` and `hkdf` contain
+//! no `secureZero` at all (`hmac` holds a real MAC key in `o_key_pad` and still
+//! does not wipe it), while `keccak_p`/`ascon` expose an opt-in `secureZero()`
+//! their own hash paths never call. The technical reason is in §2.1: the
+//! compression function keeps these words in registers and spill slots for its
+//! whole run, and no `secureZero` reaches those, so wiping the struct clears
+//! the copy least likely to be the one that leaks. A caller with a concrete
+//! reason to want the state cleared should say so and get an opt-in
+//! `secureZero()` here — that is a feature request, not a defect report.
 //! Poseidon uses one S-box, `x^5`, in every round. Rescue alternates `x^alpha`
 //! with its **inverse** `x^(1/alpha)`: one half-round raises to the 7th power,
 //! the next takes a 7th root. The root is an exponentiation by a full 64-bit

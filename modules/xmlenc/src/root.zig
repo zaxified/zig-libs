@@ -139,6 +139,13 @@ pub const Error = error{
 /// For a SAML `Type="...#Element"` EncryptedData the returned bytes are the
 /// serialized decrypted element (e.g. `<saml:Assertion ...>...</saml:Assertion>`),
 /// ready to feed back into `xml.parse` + signature verification.
+///
+/// **The returned plaintext is the caller's to destroy** (CONVENTIONS §2.1 Z2).
+/// It is recovered sensitive content — for the SAML path, a subject identity
+/// and every attribute asserted about it — and this module cannot know when the
+/// caller is finished with it. `std.crypto.secureZero` it before `alloc.free`.
+/// Every buffer *this* module frees on the way there (the CEK, the CBC
+/// plaintext-plus-padding scratch) is wiped here.
 pub fn decryptData(
     alloc: std.mem.Allocator,
     encrypted_data: *const xml.Element,
@@ -163,8 +170,13 @@ pub fn decryptData(
     const enc_key = childEl(key_info, xenc_ns, "EncryptedKey") orelse return error.MalformedStructure;
 
     var cek_buf: [64]u8 = undefined; // >= any AES key length
-    const cek = try unwrapCek(alloc, enc_key, sk, options, &cek_buf);
+    // CONVENTIONS §2.1 Z1: the `defer` is registered BEFORE the fallible
+    // `unwrapCek`, not after it. Registered after, an early return from
+    // `unwrapCek` skipped the wipe entirely and left whatever the unwrap had
+    // already written into the buffer — no current unwrap path copies before
+    // it succeeds, but that is an accident of two callees, not a guarantee.
     defer std.crypto.secureZero(u8, cek_buf[0..]);
+    const cek = try unwrapCek(alloc, enc_key, sk, options, &cek_buf);
     if (cek.len != content.key_len) return error.DecryptionError;
 
     // 4. Decrypt the content with the CEK.
@@ -466,7 +478,15 @@ fn aesCbcDecrypt(alloc: std.mem.Allocator, key: []const u8, data: []const u8) Er
     const ct = data[bs..];
 
     const buf = try alloc.alloc(u8, ct.len);
-    errdefer alloc.free(buf);
+    // CONVENTIONS §2.1 Z1: `buf` is the recovered plaintext (plus padding) in
+    // heap storage this function owns and frees, so it goes back to the
+    // allocator — and on to unrelated code — unless it is wiped first. One
+    // `defer` covers the success path and the padding-failure path alike; the
+    // old `errdefer` + explicit `free` pair wiped neither.
+    defer {
+        std.crypto.secureZero(u8, buf);
+        alloc.free(buf);
+    }
 
     const n = switch (key.len) {
         16 => aescbc.decrypt(Aes128, key[0..16].*, iv, ct, buf),
@@ -479,7 +499,6 @@ fn aesCbcDecrypt(alloc: std.mem.Allocator, key: []const u8, data: []const u8) Er
     // backing capacity leaks the pad); free the scratch buffer on success.
     const out = try alloc.alloc(u8, plain_len);
     @memcpy(out, buf[0..plain_len]);
-    alloc.free(buf);
     return out;
 }
 

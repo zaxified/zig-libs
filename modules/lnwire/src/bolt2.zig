@@ -339,6 +339,11 @@ const update_fulfill_htlc_known_tlv = [_]u64{1}; // attribution_data
 pub const UpdateFulfillHtlc = struct {
     channel_id: ChannelId,
     id: u64,
+    /// SECRET — the preimage that redeems the HTLC; whoever holds it can claim
+    /// the funds. **Caller-owned** (CONVENTIONS §2.1 Z2): this struct is decoded
+    /// into storage the caller supplies and keeps, and `deinit` frees only the
+    /// TLV extension, so the module has no point at which it may destroy this
+    /// field. `std.crypto.secureZero` it once the HTLC is settled.
     payment_preimage: [32]u8,
     extension: Extension = .{},
 
@@ -454,6 +459,12 @@ pub const REVOKE_AND_ACK_TYPE: u16 = 133;
 
 pub const RevokeAndAck = struct {
     channel_id: ChannelId,
+    /// SECRET — the revocation secret for the now-superseded commitment; it is
+    /// what lets the peer punish a revoked broadcast. **Caller-owned**
+    /// (CONVENTIONS §2.1 Z2), on the same terms as
+    /// `UpdateFulfillHtlc.payment_preimage`: `deinit` is deliberately a no-op
+    /// here, so the caller must `std.crypto.secureZero` this field itself once
+    /// the secret has been folded into its revocation store.
     per_commitment_secret: [32]u8,
     next_per_commitment_point: Point,
 

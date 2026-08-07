@@ -816,3 +816,90 @@ test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" 
     var smith: std.testing.Smith = .{ .in = &([_]u8{0x02} ** 32 ++ [_]u8{0x00} ** 2048) };
     try fuzzDecryptData({}, &smith);
 }
+
+// ── CONVENTIONS §2.1 Z1: nothing this module frees may still hold plaintext ──
+
+/// An allocator wrapper that inspects every block handed to `free` and records
+/// whether `needle` was still present in it. This is the only way to observe a
+/// Z1 heap wipe: after `free` the bytes belong to the allocator again, so the
+/// check has to happen at the moment of release.
+const FreeScanner = struct {
+    child: std.mem.Allocator,
+    needle: []const u8,
+    /// Set when a block containing `needle` was released without being wiped.
+    leaked_plaintext: bool = false,
+    /// How many blocks large enough to hold `needle` were released at all —
+    /// the positive control that the scanner is looking at something.
+    frees_seen: usize = 0,
+
+    fn allocator(self: *FreeScanner) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        if (m.len >= self.needle.len) {
+            self.frees_seen += 1;
+            if (std.mem.indexOf(u8, m, self.needle) != null) self.leaked_plaintext = true;
+        }
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+test "Z1: the CBC plaintext scratch is wiped before it goes back to the allocator" {
+    // ReleaseFast ONLY, and the reason is the whole point of the test.
+    // `std.mem.Allocator.free` runs `@memset(bytes, undefined)` before it calls
+    // the vtable, so in Debug/ReleaseSafe every freed block is already scrubbed
+    // to 0xaa and a scanner sees nothing whatever the module does. In
+    // ReleaseFast that memset is a no-op — which is precisely the mode where
+    // our own `secureZero` is load-bearing, and the mode this repo builds as a
+    // CI lane (CONVENTIONS §7.1). A skip here is honest coverage reporting, not
+    // a silent pass.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = [_]u8{0x3B} ** 32;
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const content = try cbcEncrypt(a, aes.Aes256, cek, plaintext_assertion);
+    defer a.free(content);
+
+    // The needle is a distinctive slice of the recovered assertion body. The
+    // CBC path allocates a plaintext-plus-padding scratch buffer, copies the
+    // unpadded plaintext into a right-sized block, and frees the scratch — that
+    // free is what this scanner watches.
+    const needle = "the recovered assertion body";
+    var scan = FreeScanner{ .child = a, .needle = needle };
+    const sa = scan.allocator();
+
+    const out = try roundTrip(sa, xenc_ns ++ "aes256-cbc", xenc_ns ++ "rsa-oaep-mgf1p", wrapped, content, kp.secret_key, .{});
+    try std.testing.expectEqualStrings(plaintext_assertion, out);
+
+    // Positive control first: if the scanner never saw a qualifying free, the
+    // assertion below would pass without proving anything.
+    try std.testing.expect(scan.frees_seen > 0);
+    try std.testing.expect(!scan.leaked_plaintext);
+
+    // The caller's own copy is the caller's to destroy (§2.1 Z2) — do it here
+    // so this test does not itself hand the plaintext back unwiped.
+    std.crypto.secureZero(u8, out);
+    sa.free(out);
+}

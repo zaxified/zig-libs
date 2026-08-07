@@ -547,6 +547,17 @@ pub const KeyPair = struct {
             .checksum = std.mem.zeroes([checksum_length]u8),
         };
     }
+
+    /// Destroy the long-term Ed25519 secret key held by this struct
+    /// (CONVENTIONS §2.1 Z1). Call it once signing is finished — a `KeyPair`
+    /// recovered by `openSecretKey` is the decrypted form of the on-disk key,
+    /// and it lives exactly as long as the caller keeps this value.
+    ///
+    /// The public key and key number are left intact: neither is secret, and
+    /// both stay useful for logging which key was retired.
+    pub fn wipe(self: *KeyPair) void {
+        std.crypto.secureZero(u8, &self.ed25519.secret_key.bytes);
+    }
 };
 
 /// scrypt-keystream length: `key_number || secret_key || checksum`.
@@ -565,12 +576,18 @@ pub fn sealSecretKey(
     mem_limit: usize,
 ) !RawSecretKey {
     const plain_key_number = key_pair.key_number;
-    const plain_sk = key_pair.ed25519.secret_key.toBytes();
+    // CONVENTIONS §2.1 Z1: our own copies of the plaintext secret key, its
+    // checksum, and the scrypt keystream that encrypts them. Every `defer` is
+    // registered before the fallible `kdf` call so no error path skips one.
+    var plain_sk = key_pair.ed25519.secret_key.toBytes();
+    defer std.crypto.secureZero(u8, &plain_sk);
     var plain_chk: [checksum_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plain_chk);
     computeChecksum(&plain_chk, sig_alg_legacy, plain_key_number, plain_sk);
 
     const params = std.crypto.pwhash.scrypt.Params.fromLimits(ops_limit, mem_limit);
     var stream: [encrypted_block_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &stream);
     try std.crypto.pwhash.scrypt.kdf(allocator, &stream, password, &salt, params);
 
     var raw: RawSecretKey = .{
@@ -611,7 +628,11 @@ pub fn openSecretKey(
     if (!std.mem.eql(u8, &raw.chk_alg, &chk_alg_blake2b)) return error.UnsupportedChecksumAlgorithm;
 
     var key_number = raw.key_number;
+    // CONVENTIONS §2.1 Z1 — the recovered plaintext secret key. The `defer`
+    // runs after the return operand is built, so the returned `KeyPair` still
+    // carries the key while this frame's copy does not.
     var sk_bytes = raw.secret_key;
+    defer std.crypto.secureZero(u8, &sk_bytes);
 
     if (std.mem.eql(u8, &raw.kdf_alg, &kdf_alg_none)) {
         // Plaintext; chk intentionally unchecked (see module doc comment).
@@ -619,11 +640,14 @@ pub fn openSecretKey(
         const pw = password orelse return error.PasswordRequired;
         const params = std.crypto.pwhash.scrypt.Params.fromLimits(raw.ops_limit, raw.mem_limit);
         var stream: [encrypted_block_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &stream);
         try std.crypto.pwhash.scrypt.kdf(allocator, &stream, pw, &raw.salt, params);
 
         var plain_key_number: [key_number_length]u8 = undefined;
         var plain_sk: [secret_key_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain_sk);
         var plain_chk: [checksum_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain_chk);
         for (&plain_key_number, 0..) |*b, i| b.* = raw.key_number[i] ^ stream[i];
         for (&plain_sk, 0..) |*b, i| b.* = raw.secret_key[i] ^ stream[key_number_length + i];
         for (&plain_chk, 0..) |*b, i| b.* = raw.checksum[i] ^ stream[key_number_length + secret_key_length + i];
@@ -995,4 +1019,32 @@ fn fuzzIsPrintableComment(_: void, smith: *std.testing.Smith) !void {
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+}
+
+test "KeyPair.wipe destroys the long-term secret key, leaving the public half usable" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const kp = KeyPair.generate(io);
+    var salt: [salt_length]u8 = undefined;
+    io.random(&salt);
+
+    const raw = try sealSecretKey(gpa, kp, "pw", salt, 32768, 1 << 16);
+    var opened = try openSecretKey(gpa, raw, "pw");
+
+    // Precondition: the recovered key really is the on-disk key, so the
+    // assertion below is about the wipe and not about a key that was never
+    // there in the first place.
+    const zero = std.mem.zeroes([std.crypto.sign.Ed25519.SecretKey.encoded_length]u8);
+    try std.testing.expectEqual(kp.ed25519.secret_key.toBytes(), opened.ed25519.secret_key.toBytes());
+    try std.testing.expect(!std.mem.eql(u8, &zero, &opened.ed25519.secret_key.bytes));
+
+    opened.wipe();
+
+    try std.testing.expectEqualSlices(u8, &zero, &opened.ed25519.secret_key.bytes);
+    // Not secret — the wipe must leave the identity of the retired key legible.
+    try std.testing.expectEqual(kp.key_number, opened.key_number);
+    try std.testing.expectEqual(
+        kp.ed25519.public_key.toBytes(),
+        opened.ed25519.public_key.toBytes(),
+    );
 }

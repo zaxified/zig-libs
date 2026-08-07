@@ -67,7 +67,13 @@ pub const Storage = kv.Storage;
 pub const FsStorage = kv.FsStorage;
 pub const SimStorage = kv.SimStorage;
 
-pub const OpenError = kv.Storage.Error || core.RecoverError || error{ Corrupt, NotAKvtreeFile };
+pub const OpenError = kv.Storage.Error || core.RecoverError || error{
+    Corrupt,
+    NotAKvtreeFile,
+    /// Another `Db` — in another process, or in this one — currently holds
+    /// the store's exclusive lock. Nothing was opened, read or written.
+    Locked,
+};
 pub const GetError = kv.Storage.Error || error{ Corrupt, OutOfMemory };
 pub const CommitError = core.CommitError;
 
@@ -84,6 +90,11 @@ pub const Db = struct {
     /// The current committed meta (root of the newest durable tree version).
     meta_rec: format.Meta,
     path: []u8,
+    /// Owned copy of the cross-process lock sidecar's path (freed on close).
+    lock_path: []u8,
+    /// Handle of the held `<path>.lock` sidecar, or null with
+    /// `Options.lock == .none`. Closing it releases the advisory lock.
+    lock_file: ?kv.Storage.Handle,
     /// txn_id to stamp the next commit with (monotonic).
     next_txn: u64,
     /// Open read snapshots' pinned txn_ids — their minimum is the oldest reader
@@ -94,8 +105,27 @@ pub const Db = struct {
     /// Open (or create) the store. A fresh/empty file is initialized
     /// mechanically (two meta pages + an empty-leaf root); an existing file is
     /// recovered via `core.recover` (the Fable crash-recovery core).
+    ///
+    /// Unless `options.lock == .none`, an exclusive advisory lock on a
+    /// `<path>.lock` sidecar is taken FIRST, before the data file is even
+    /// opened — mirroring `kv.Db.open`'s ordering (see its doc comment for
+    /// why the lock lives on a sidecar rather than the data file). A second
+    /// concurrent opener over the same store gets `error.Locked` with
+    /// nothing touched, instead of silently racing this one's COW commits.
     pub fn open(gpa: Allocator, store: kv.Storage, path: []const u8, options: Options) OpenError!Db {
-        _ = options;
+        const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+        errdefer gpa.free(lock_path);
+
+        var lock_file: ?kv.Storage.Handle = null;
+        if (options.lock == .exclusive) {
+            const lh = try store.open(lock_path, .open_or_create);
+            lock_file = lh;
+        }
+        errdefer if (lock_file) |lh| store.close(lh);
+        if (lock_file) |lh| {
+            if (!try store.tryLockExclusive(lh)) return error.Locked;
+        }
+
         const handle = try store.open(path, .open_or_create);
         errdefer store.close(handle);
         const size = try store.size(handle);
@@ -122,6 +152,8 @@ pub const Db = struct {
             .pager = pager,
             .meta_rec = meta_rec,
             .path = try gpa.dupe(u8, path),
+            .lock_path = lock_path,
+            .lock_file = lock_file,
             .next_txn = meta_rec.txn_id + 1,
             .open_snapshots = .empty,
         };
@@ -129,6 +161,8 @@ pub const Db = struct {
 
     pub fn close(self: *Db) void {
         self.pager.store.close(self.pager.handle);
+        if (self.lock_file) |lh| self.pager.store.close(lh);
+        self.gpa.free(self.lock_path);
         self.open_snapshots.deinit(self.gpa);
         self.gpa.free(self.path);
         self.* = undefined;
@@ -234,7 +268,25 @@ pub const Db = struct {
     }
 };
 
-pub const Options = struct {};
+pub const Options = struct {
+    /// Cross-process exclusion policy (default: on). See `LockPolicy`.
+    lock: LockPolicy = .exclusive,
+};
+
+pub const LockPolicy = enum {
+    /// Take and hold an exclusive advisory lock on `<path>.lock` for the
+    /// whole lifetime of the `Db`. A second opener over the same store gets
+    /// `error.Locked`. This is the default: kvtree's whole correctness case
+    /// rests on being the sole writer of its COW meta pages, and two
+    /// independent `Db`s over one file is not something the format survives.
+    exclusive,
+    /// No locking at all. For a pure in-memory `Storage`, for a caller that
+    /// already has its own exclusion (e.g. a single `Store` that itself
+    /// serializes access to a shard), or where the backend cannot support
+    /// locking at all. Choosing this is choosing to be the sole writer by
+    /// construction.
+    none,
+};
 
 // ── Txn ──────────────────────────────────────────────────────────────────────
 
@@ -467,6 +519,34 @@ test "smoke: fresh store opens, is empty, and closes cleanly (mechanical init)" 
     defer cur.deinit();
     try cur.first();
     try testing.expect((try cur.next()) == null);
+}
+
+test "open takes an exclusive lock by default: a second concurrent opener over the same store is refused" {
+    // WAVE-2 K3: `Db.open` used to discard `Options` entirely (`_ = options;`)
+    // and never call `store.tryLockExclusive`, so two independent `Db`s could
+    // race each other's COW commits over one file with no complaint at all —
+    // three consumers (`tsdb` F6, `shardstore` F2, `pagecache` F4) filed the
+    // same finding independently. Fixed once, here.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+
+    var db1 = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+
+    // A second opener over the SAME store, while the first is still live,
+    // must be refused — not silently allowed to race the first one's commits.
+    try testing.expectError(error.Locked, Db.open(testing.allocator, sim.storage(), "t.kvt", .{}));
+
+    // Closing the first releases the lock; a subsequent opener succeeds.
+    db1.close();
+    var db2 = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+    db2.close();
+
+    // `.lock = .none` opts back out, for a caller that already provides its
+    // own exclusion (e.g. `shardstore`'s single store-wide lock).
+    var db3 = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{ .lock = .none });
+    defer db3.close();
+    var db4 = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{ .lock = .none });
+    db4.close();
 }
 
 test "read path over a hand-built two-level tree: get + ordered scan + seek" {

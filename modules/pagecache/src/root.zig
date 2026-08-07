@@ -423,7 +423,12 @@ test "bounding: working set >> budget stays within the budget, evicts, and still
     try testing.expect(st.hits > 0);
 
     // Despite heavy eviction, every read is correct — cold pages refetched.
-    const file_pages = (try sim.storage().size(0)) / pc.page_size;
+    //
+    // Named lookup, not handle 0: `kvtree.Db.open` now opens the `.lock`
+    // sidecar before the data file (the F2/K3 cross-process-exclusion fix),
+    // so handle 0 is the lock file's tiny handle, not "t.kvt"'s — a
+    // hardcoded `size(0)` silently measured the wrong file.
+    const file_pages = sim.fileContent("t.kvt").?.len / pc.page_size;
     try testing.expect(file_pages > budget); // sanity: working set exceeds budget
 
     var kbuf: [32]u8 = undefined;

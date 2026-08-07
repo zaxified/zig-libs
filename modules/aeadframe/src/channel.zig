@@ -153,6 +153,16 @@ pub fn Channel(comptime Aead: type) type {
                 self.epoch = new_epoch;
                 self.seq = 0;
             }
+
+            /// Destroy the AEAD key held by this sealer (CONVENTIONS §2.1 Z1 —
+            /// the key is a secret in storage this struct owns). Call it once
+            /// the channel is finished; the sealer is unusable afterwards, since
+            /// an all-zero key is not a key. `epoch`/`seq` are left alone: they
+            /// are not secret, and leaving them lets a caller log how much of
+            /// the nonce space was spent.
+            pub fn wipe(self: *Sealer) void {
+                std.crypto.secureZero(u8, &self.key);
+            }
         };
 
         /// Receiver half: opens records under a fixed key + epoch, enforcing an
@@ -215,6 +225,13 @@ pub fn Channel(comptime Aead: type) type {
                 self.key = new_key;
                 self.epoch = new_epoch;
                 self.window.reset();
+            }
+
+            /// Destroy the AEAD key held by this opener — see `Sealer.wipe`.
+            /// The replay window is left intact: it is not secret, and it is the
+            /// record of what this peer already accepted.
+            pub fn wipe(self: *Opener) void {
+                std.crypto.secureZero(u8, &self.key);
             }
         };
     };
@@ -618,4 +635,35 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: Opener.open never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzOpen, .{});
+}
+
+// ── key destruction (CONVENTIONS §2.1 Z1) ─────────────────────────────────────
+
+test "wipe destroys the key in both halves and leaves the non-secret state alone" {
+    const key = testKey(7);
+    var s = ChaChaChannel.Sealer.init(key, 3);
+    var o = ChaChaChannel.Opener.init(key, 3);
+
+    var rec: [record.overhead + 5]u8 = undefined;
+    _ = try s.seal(&rec, "hello", "aad");
+    var pt: [5]u8 = undefined;
+    _ = try o.open(&pt, &rec, "aad");
+
+    // Preconditions: the key really is in the structs, and the non-secret
+    // bookkeeping really is non-zero, so neither assertion below is vacuous.
+    try testing.expectEqualSlices(u8, &key, &s.key);
+    try testing.expectEqualSlices(u8, &key, &o.key);
+    try testing.expectEqual(@as(u64, 1), s.seq);
+    try testing.expectEqual(@as(u32, 3), o.epoch);
+
+    s.wipe();
+    o.wipe();
+
+    const zero = [_]u8{0} ** 32;
+    try testing.expectEqualSlices(u8, &zero, &s.key);
+    try testing.expectEqualSlices(u8, &zero, &o.key);
+    // Not secret — wipe must not touch these.
+    try testing.expectEqual(@as(u64, 1), s.seq);
+    try testing.expectEqual(@as(u32, 3), s.epoch);
+    try testing.expectEqual(@as(u32, 3), o.epoch);
 }

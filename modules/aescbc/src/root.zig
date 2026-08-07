@@ -56,6 +56,14 @@ pub const PaddingError = error{InvalidPadding};
 /// `std.crypto.core.aes.Aes128` or `Aes256`; `key` is
 /// `[Aes.key_bits / 8]u8`. `out` must be at least `plaintext.len` bytes.
 /// No allocation. Returns the written length (== `plaintext.len`).
+/// Zeroization posture (CONVENTIONS §2.1): nothing here is wiped, deliberately.
+/// The AES round-key schedule (`Aes.initEnc`/`initDec`'s context) and the
+/// per-block staging buffers are Z3 — the internal working state of a
+/// transform, which `std`'s own `core.aes` does not wipe either. `key` and `iv`
+/// arrive by value from caller-owned storage (Z2): the caller wipes those, and
+/// the plaintext/ciphertext live in the caller's `out`/input slices, which the
+/// caller likewise owns. This module allocates nothing and holds nothing across
+/// calls, so it has no Z1 storage at all.
 pub fn encrypt(
     comptime Aes: type,
     key: [Aes.key_bits / 8]u8,

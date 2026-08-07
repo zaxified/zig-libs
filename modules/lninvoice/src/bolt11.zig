@@ -460,6 +460,16 @@ pub const EncodeParams = struct {
     fields: []const TaggedFieldOut,
 };
 
+/// How `encode` gets its signature: either a ready-made one (the node signed
+/// out of process) or the node's secp256k1 private key to sign with here.
+///
+/// **`private_key` is caller-owned storage** (CONVENTIONS §2.1 Z2). `encode`
+/// takes this union by value, which for a payload this size Zig is free to pass
+/// by reference — so a `secureZero` here could clobber the caller's own
+/// variable, and on the copies it could legally reach it would only clear a
+/// value already dying with the frame. The caller must `std.crypto.secureZero`
+/// its own key storage once the invoice is encoded. Prefer the `signature`
+/// variant where the key never has to cross this boundary at all.
 pub const SignInput = union(enum) {
     signature: ecdsa.Signature,
     private_key: [32]u8,

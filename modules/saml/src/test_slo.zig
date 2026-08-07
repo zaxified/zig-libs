@@ -443,3 +443,34 @@ test "LogoutResponse: nested (second-level) StatusCode extracted, e.g. PartialLo
     try testing.expectEqualStrings("urn:oasis:names:tc:SAML:2.0:status:PartialLogout", res.second_level_status_code.?);
     try testing.expectEqualStrings("one participant failed", res.status_message.?);
 }
+
+test "Z1: Decrypted.deinit wipes the recovered NameID before its buffer is freed" {
+    // ReleaseFast only — see `test_encutil.FreeScanner` for why the safe lanes
+    // cannot observe this.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const sp = try enc.makeSpKey(0x510_ED01);
+    const enc_id = try enc.encryptedWrapper(alloc, sp.public_key, "EncryptedID", nameid_plaintext);
+    defer alloc.free(enc_id);
+    const req = try buildRequestWithEncryptedId(alloc, enc_id);
+    defer alloc.free(req);
+
+    // Markup that exists only in the decrypted `<saml:NameID>` octets: it is
+    // never in the ciphertext, and the extracted `res.name_id` copies the text
+    // content only, so a hit can come from nothing but the plaintext buffer.
+    const needle = "nameid-format:emailAddress\">alice@example.org</saml:NameID>";
+    var scan = enc.FreeScanner{ .child = alloc, .needle = needle };
+    const sa = scan.allocator();
+
+    const kp = try makeIdpKey(0x510_0008);
+    var cfg = baseRequestConfig(.{ .rsa = kp.public_key });
+    cfg.sp_decrypt_key = sp.secret_key;
+    var res = try saml.consumeLogoutRequestXml(sa, req, .redirect_verified, cfg);
+    defer res.deinit();
+
+    // The decryption really happened, and the scanner really saw frees.
+    try testing.expectEqualStrings("alice@example.org", res.name_id);
+    try testing.expect(scan.frees_seen > 0);
+    try testing.expect(!scan.leaked_plaintext);
+}

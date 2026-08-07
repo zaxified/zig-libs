@@ -41,6 +41,73 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
   server (gated on `std.Io`, ~0.18/post-1.0) or via an opportunistic spike; until then,
   this is the permanent shape, not a stopgap.
 
+### 2.1 Zeroization of secret material
+
+`std.crypto.secureZero` clears **the storage you name it on, and nothing else**. The compiler is
+free to keep the same bytes in registers and stack spill slots, and no `secureZero` call can reach
+those. A wipe therefore earns its line only where it removes a copy that would otherwise **outlive
+the call**; where every copy dies with the call frame regardless, it removes one of an unknown
+number of equally short-lived copies and buys nothing an attacker model can name. That asymmetry —
+not "these bytes are secret" — decides each case below.
+
+Classify the *storage*, then apply the rule. This is settled repo-wide; it is not re-decided per
+module.
+
+**Z1 — storage this module owns and knows the death of → MUST wipe.**
+A copy of the *secret itself* in storage we control: a struct field, a heap buffer we allocate and
+free, or a local holding a private key, a decrypted plaintext, or derived key material. Anything
+that is a secret in module-controlled storage and is not on Z3's list below is Z1. Here we know
+exactly when the secret dies, and the copy the wipe
+removes is genuinely the long-lived one — a freed heap block goes straight back to the allocator
+and on to unrelated code. Wipe in `deinit`/`wipe()`, or via `defer`; **register the `defer` before
+the fallible call that fills the buffer**, never after it, or the error path skips the wipe. This
+matches `std` (`Poly1305.final`, `Ghash.final`, and the plaintext-plus-tag wipe on AEAD
+authentication failure) and the 46 modules here that already do it.
+
+**Z2 — caller-owned storage → MUST NOT wipe; MUST document.**
+A secret the caller passed in by value, or one we hand back inside a decoded struct
+(`lnwire.UpdateFulfillHtlc.payment_preimage`, the static keypair `s` in `noise`). The module cannot
+know when the caller is finished with it, so wiping is either a use-after-wipe for them or a no-op
+on our own dying copy. The deliverable is a `///` sentence naming the field and stating that the
+caller must `std.crypto.secureZero` it when done. `noise/src/state.zig:511-516` is the reference:
+it wipes `e`, `ck` and `k`, deliberately leaves `s`, and says why. **A doc sentence is a complete
+fix for a Z2 site** — do not "upgrade" it to a wipe.
+
+**Z3 — the internal working state of a transform → NOT wiped, by convention.**
+Hash chaining variables and message blocks, sponge/permutation state, AES round-key schedules:
+storage that secret-derived bytes merely *passed through*. `std` takes exactly this position —
+`sha2`, `sha3`, `blake2`, `blake3`, `hmac` and `hkdf` contain no `secureZero` at all (`hmac` keeps
+a real MAC key in `o_key_pad` and still does not wipe it), while `keccak_p` and `ascon` expose an
+**opt-in** `secureZero()` method that their own hash paths never call. We do not diverge: no wipe
+inside the transform, and where a caller has a concrete reason to want one, expose an opt-in
+`secureZero()`/`wipe()` on the state instead of charging every call for it. This is also where the
+register/spill argument bites hardest — a compression function holds the chaining variables in
+registers for its entire run, so wiping the struct afterwards clears the copy least likely to be
+the one that leaks.
+
+**A zeroization finding against a Z3 site is not a finding.** Cite this section and close it.
+
+**Which build mode a heap wipe is actually for.** `std.mem.Allocator.free` runs
+`@memset(bytes, undefined)` *before* it calls the vtable, so in Debug and ReleaseSafe every freed
+block is already scrubbed to `0xaa` and a `secureZero` before `free` changes nothing. In
+ReleaseFast that memset compiles to nothing — so the wipe is load-bearing in exactly one mode, and
+it is the mode an integrator ships. Write the wipe; just do not claim the safe lanes prove it.
+
+**What a Z1 wipe can and cannot be tested for.** A wipe of a *struct field* is testable in any
+mode, and must ship with a test asserting the field is zero after `wipe()` — with a precondition
+assert that the field was non-zero first, or the test passes vacuously
+(`tenantkex/src/root.zig`'s `SessionKeys.wipe` test is the model). A wipe of a *heap buffer before
+`free`* is testable only under `-Doptimize=ReleaseFast`, for the reason above: route the
+allocation through a test-local allocator wrapper that inspects the bytes handed to `rawFree`, and
+gate the test on `builtin.mode == .ReleaseFast` with `error.SkipZigTest` so the skip is visible
+rather than a silent pass (`xmlenc/src/test_roundtrip.zig`'s `FreeScanner` is the model). A wipe
+of a **stack local is not testable at all**, and no reviewer should ask for a red test on one: the
+dead frame lies below the stack pointer, so any function that reads it must first build a frame
+there — and in Debug/ReleaseSafe Zig initializes that frame's `undefined` locals to `0xaa`,
+scrubbing the very residue the probe wants to see (measured: 2048/2048 bytes overwritten; in
+ReleaseFast the residue is gone for a different reason, register and slot reuse). Z1 stack wipes
+are justified by this rule and by review, not by a regression test.
+
 ## 3. Naming & structure
 
 - **`snake_case`, capability-based, no `zig-` prefix, no platform/role in the name** —

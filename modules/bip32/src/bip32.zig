@@ -8,12 +8,22 @@
 //! xprv/xpub Base58Check wire format, mainnet version bytes), and
 //! `parsePath`/`derivePath` (`m/44'/0'/0'/0/0`-style path strings).
 //!
-//! Handles SECRET key material: every buffer this module allocates on the
-//! stack that can hold a private-key-derived value (`HMAC-SHA512` output,
-//! the intermediate hardened-derivation input) is zeroized before the
-//! owning function returns. A `deinit` on `ExtendedPrivKey` is provided for
-//! callers to zero the struct itself once done with it — the module cannot
-//! do that automatically since the struct outlives the call that built it.
+//! Handles SECRET key material, under CONVENTIONS §2.1. Every stack buffer
+//! this module owns that can hold a private-key-derived value is zeroized
+//! before the owning function returns (Z1): the `HMAC-SHA512` output *and* the
+//! `IL`/`IR`/child-scalar copies taken out of it, the hardened-derivation input,
+//! the xprv serialization payload, and `parseExtended`'s Base58Check decode
+//! scratch — the last on every exit path, not only the two xprv ones. The
+//! `defer`s are registered before the fallible calls that fill the buffers, so
+//! an error return cannot skip one.
+//!
+//! `ExtendedPrivKey` itself outlives the call that built it, so it is the
+//! caller's to destroy (Z2) — `ExtendedPrivKey.deinit` does it.
+//!
+//! Note what such a wipe is and is not worth: it clears the storage it names,
+//! never the register and spill-slot copies the compiler may also hold, and it
+//! is not observable from a test (see §2.1). It is defence in depth against a
+//! later read of this frame's memory, not a proof of absence.
 
 const std = @import("std");
 const k256 = @import("k256");
@@ -83,8 +93,13 @@ pub fn masterFromSeed(seed: []const u8) MasterError!ExtendedPrivKey {
     defer std.crypto.secureZero(u8, &i);
     std.crypto.auth.hmac.sha2.HmacSha512.create(&i, seed, "Bitcoin seed");
 
-    const il = i[0..32].*;
-    const ir = i[32..64].*;
+    // CONVENTIONS §2.1 Z1: `il`/`ir` are our own copies of the master scalar
+    // and chain code, so we wipe them. The `defer` runs after the return
+    // operand has been built, so the returned struct still carries the values.
+    var il = i[0..32].*;
+    defer std.crypto.secureZero(u8, &il);
+    var ir = i[32..64].*;
+    defer std.crypto.secureZero(u8, &ir);
 
     Secp256k1.scalar.rejectNonCanonical(il, .big) catch return error.InvalidMasterKey;
     if (std.mem.allEqual(u8, &il, 0)) return error.InvalidMasterKey;
@@ -140,10 +155,15 @@ pub fn ckdPriv(parent: ExtendedPrivKey, index: u32) CkdError!ExtendedPrivKey {
     defer std.crypto.secureZero(u8, &i);
     std.crypto.auth.hmac.sha2.HmacSha512.create(&i, &data, &parent.chain_code);
 
-    const il = i[0..32].*;
-    const ir = i[32..64].*;
+    // CONVENTIONS §2.1 Z1 — see `masterFromSeed`. `child_priv` is the derived
+    // child scalar; `il` the offset scalar; `ir` the child chain code.
+    var il = i[0..32].*;
+    defer std.crypto.secureZero(u8, &il);
+    var ir = i[32..64].*;
+    defer std.crypto.secureZero(u8, &ir);
 
-    const child_priv = Secp256k1.scalar.add(parent.privkey, il, .big) catch return error.InvalidChildKey;
+    var child_priv = Secp256k1.scalar.add(parent.privkey, il, .big) catch return error.InvalidChildKey;
+    defer std.crypto.secureZero(u8, &child_priv);
     if (std.mem.allEqual(u8, &child_priv, 0)) return error.InvalidChildKey;
 
     const parent_pub = pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey;
@@ -255,6 +275,13 @@ pub const ParsedKey = union(enum) {
 /// a best-effort partial parse.
 pub fn parseExtended(s: []const u8) ParseError!ParsedKey {
     var buf: [bech32.base58.max_payload_len]u8 = undefined;
+    // CONVENTIONS §2.1 Z1: for an xprv, `buf` holds the decoded private
+    // scalar. The `defer` is registered *before* the fallible decode and
+    // before every validation `return`, so no exit path can skip it — the
+    // previous per-path calls covered only the two xprv outcomes and left the
+    // scalar of a malformed xprv (bad length, unknown version, xpub version
+    // byte over private payload) sitting in the frame.
+    defer std.crypto.secureZero(u8, &buf);
     const payload = try bech32.base58.checkDecode(s, &buf);
     if (payload.len != serialized_payload_len) return error.InvalidLength;
 
@@ -275,17 +302,15 @@ pub fn parseExtended(s: []const u8) ParseError!ParsedKey {
         version_mainnet_priv => {
             if (payload[45] != 0x00) return error.InvalidPrivateKeyMarker;
             var priv: [32]u8 = undefined;
+            defer std.crypto.secureZero(u8, &priv);
             @memcpy(&priv, payload[46..78]);
             const canonical = blk: {
                 Secp256k1.scalar.rejectNonCanonical(priv, .big) catch break :blk false;
                 break :blk true;
             };
             if (!canonical or std.mem.allEqual(u8, &priv, 0)) {
-                std.crypto.secureZero(u8, &priv);
-                std.crypto.secureZero(u8, &buf);
                 return error.PrivateKeyOutOfRange;
             }
-            std.crypto.secureZero(u8, &buf); // raw decode buffer no longer needed
             return .{ .private = .{
                 .depth = depth,
                 .parent_fingerprint = parent_fp,

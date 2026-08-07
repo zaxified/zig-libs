@@ -552,6 +552,17 @@ pub const MacError = error{
 
 /// Compute the MAC of `domain` (which must be `Frame.macDomain`) into `out`,
 /// returning the truncated tag.
+///
+/// Zeroization posture (CONVENTIONS §2.1): nothing here is wiped, and that is
+/// the decision rather than an omission. `key` is a borrowed caller slice (Z2 —
+/// the caller owns the session key and wipes it). The untruncated `full`/`tag`
+/// buffers hold a MAC *output* over a frame that is about to go on the wire in
+/// cleartext: recovering the untruncated tag for a message an attacker already
+/// has confers no forgery power over any other message, so these are not secret
+/// storage at all, and the HMAC/GHASH state behind them is Z3 (`std` does not
+/// wipe `Hmac`'s `o_key_pad` either). The `[768]u8` signing-input buffers in
+/// `acse.zig` hold public protocol bytes on the same reasoning. This module
+/// owns no long-lived secret, so it has no Z1 site.
 pub fn computeMac(
     algorithm: MacAlgorithm,
     key: []const u8,

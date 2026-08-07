@@ -450,6 +450,21 @@ pub const Client = struct {
     /// consulted it. And an unencrypted link needs
     /// `Options.allow_plaintext_auth`, because `LOGIN` puts the password on
     /// the wire in the clear.
+    ///
+    /// **Credential residue is the caller's to clear** (CONVENTIONS §2.1 Z2).
+    /// `user` and `pass` are encoded straight into the `std.Io.Writer` handed
+    /// to `init`; this module keeps no copy of either. That writer's buffer is
+    /// caller-owned storage and the module cannot know when its bytes have
+    /// reached the wire — with a `Writer.fixed` the buffer *is* the transport,
+    /// so wiping it here would destroy an unsent command. Once the session is
+    /// finished the caller should `std.crypto.secureZero` the writer's buffer,
+    /// and its own `user`/`pass` storage.
+    ///
+    /// This is where `imap` differs from the sibling `smtp`, whose `wipeOut`
+    /// looks like a missing counterpart here: `smtp.Session` owns its output
+    /// `ArrayList` and drains it itself, so that residue is Z1 storage it can
+    /// legitimately destroy. `imap.Client` owns no equivalent buffer, so the
+    /// obligation is documented rather than discharged.
     pub fn login(c: *Client, user: []const u8, pass: []const u8) Error!Completion {
         c.arm();
         if (c.state != .not_authenticated) return error.BadState;

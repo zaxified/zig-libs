@@ -6,6 +6,20 @@
 //! primitive `RIPEMD160(SHA256(msg))` used to derive P2PKH/P2WPKH pubkey hashes,
 //! composed from this module's compressor and `std.crypto.hash.sha2.Sha256`.
 //!
+//!
+//! **Zeroization: none, deliberately (CONVENTIONS §2.1 Z3).** The chaining
+//! state and the message-block buffer are the internal working state of a
+//! transform, not a secret this module owns — they are Z3, the class the repo
+//! settled once so it stops being re-raised module by module. `std` takes the
+//! same position: `sha2`, `sha3`, `blake2`, `blake3`, `hmac` and `hkdf` contain
+//! no `secureZero` at all (`hmac` holds a real MAC key in `o_key_pad` and still
+//! does not wipe it), while `keccak_p`/`ascon` expose an opt-in `secureZero()`
+//! their own hash paths never call. The technical reason is in §2.1: the
+//! compression function keeps these words in registers and spill slots for its
+//! whole run, and no `secureZero` reaches those, so wiping the struct clears
+//! the copy least likely to be the one that leaks. A caller with a concrete
+//! reason to want the state cleared should say so and get an opt-in
+//! `secureZero()` here — that is a feature request, not a defect report.
 //! RIPEMD-160 processes 512-bit blocks through two independent, parallel
 //! 80-round lines (five 16-round groups each, distinct nonlinear functions,
 //! word-selection permutations, and rotate amounts per line) whose final

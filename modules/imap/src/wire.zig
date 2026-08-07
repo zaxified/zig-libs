@@ -174,21 +174,48 @@ pub const Decoder = struct {
     // ── atoms, strings, numbers ─────────────────────────────────────────────
 
     /// A run of bytes satisfying `valid`, or null if the first byte does not.
+    ///
+    /// WAVE-2 imap F7 / CAMPAIGN K1: scans the reader's already-buffered
+    /// window (`std.Io.Reader.buffered` — pure memory, no read call) for the
+    /// longest valid prefix and takes it with one `appendSlice`/`toss`,
+    /// instead of one `peekByte`/`toss`/`append` per byte (go-imap slices its
+    /// buffered window the same way). Same accounting, same result: `charge`
+    /// still runs before the bytes are kept, so a run that would blow the
+    /// line budget is still refused, not truncated and kept. Falls back to
+    /// the byte-at-a-time path only when nothing is buffered yet (forces a
+    /// fill) — a run spanning a refill boundary just loops.
     pub fn run(d: *Decoder, valid: *const fn (u8) bool) Error!?[]const u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(d.gpa);
         while (true) {
-            const ch = d.r.peekByte() catch |e| switch (e) {
-                error.EndOfStream => break, // a run may end the stream
-                else => return mapRead(e),
-            };
-            if (!valid(ch)) break;
-            // Before the append, not after: this loop is the module's one
-            // unbounded accumulator, and it is what a server that never
-            // terminates a line drives.
-            try d.charge(1);
-            d.r.toss(1);
-            try out.append(d.gpa, ch);
+            const buf = d.r.buffered();
+            if (buf.len == 0) {
+                // Nothing buffered right now; peekByte forces a fill (or
+                // reports EndOfStream) and hands back one byte to keep this
+                // loop's per-byte fallback correct without duplicating the
+                // reader's fill logic.
+                const ch = d.r.peekByte() catch |e| switch (e) {
+                    error.EndOfStream => break, // a run may end the stream
+                    else => return mapRead(e),
+                };
+                if (!valid(ch)) break;
+                // Before the append, not after: this loop is the module's
+                // one unbounded accumulator, and it is what a server that
+                // never terminates a line drives.
+                try d.charge(1);
+                d.r.toss(1);
+                try out.append(d.gpa, ch);
+                continue;
+            }
+            var n: usize = 0;
+            while (n < buf.len and valid(buf[n])) n += 1;
+            if (n == 0) break; // first buffered byte is already invalid
+            try d.charge(n);
+            try out.appendSlice(d.gpa, buf[0..n]);
+            d.r.toss(n);
+            if (n < buf.len) break; // hit an invalid byte inside the buffer
+            // Consumed the whole buffered window without finding the run's
+            // end: loop around to refill and keep scanning.
         }
         if (out.items.len == 0) return null;
         return try out.toOwnedSlice(d.gpa);

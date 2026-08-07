@@ -679,7 +679,13 @@ fn processEncryptedAssertion(
         // no oracle signal, mirroring xmlenc's own posture.
         else => return error.AssertionDecryptionFailed,
     };
-    defer alloc.free(plaintext);
+    // CONVENTIONS §2.1 Z1: the recovered `<saml:Assertion>` — the subject's
+    // NameID and every attribute asserted about them — in heap storage this
+    // function owns and frees. Wipe before the block goes back to the allocator.
+    defer {
+        std.crypto.secureZero(u8, plaintext);
+        alloc.free(plaintext);
+    }
 
     // Parse the recovered octets with the SAME id-attribute options `saml` uses
     // for the Response, so the XSW pointer-pin (which resolves the signature's
@@ -777,6 +783,10 @@ const Decrypted = struct {
     src: []u8,
     fn deinit(self: *Decrypted, alloc: std.mem.Allocator) void {
         self.doc.deinit();
+        // CONVENTIONS §2.1 Z1: `src` is the decrypted NameID / Attribute
+        // octets. The document is torn down first because its element and
+        // attribute slices borrow from `src`.
+        std.crypto.secureZero(u8, self.src);
         alloc.free(self.src);
         self.* = undefined;
     }
@@ -816,7 +826,13 @@ fn decryptWrappedElement(
         error.OutOfMemory => return error.OutOfMemory,
         else => return fail_err,
     };
-    errdefer alloc.free(plaintext);
+    // CONVENTIONS §2.1 Z1 — the recovered NameID / Attribute value. On the
+    // parse-failure path the plaintext is freed here; on success `Decrypted`
+    // takes ownership and `Decrypted.deinit` does the same wipe.
+    errdefer {
+        std.crypto.secureZero(u8, plaintext);
+        alloc.free(plaintext);
+    }
     const doc = xml.parse(alloc, plaintext, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return fail_err,

@@ -139,11 +139,27 @@ pub fn Verified(
         /// assumption that hides the index.
         pub const Secret = struct {
             m: TagWord,
+
+            /// Destroy `m` (CONVENTIONS §2.1 Z1 — a per-query client secret in
+            /// storage this struct owns). Call it once `reconstruct` has
+            /// returned: `m` is what the soundness bound rests on, and holding
+            /// it past the query buys nothing. A wiped `Secret` rejects every
+            /// answer, so it cannot be reused by accident.
+            pub fn wipe(self: *Secret) void {
+                std.crypto.secureZero(TagWord, @as(*[1]TagWord, &self.m));
+            }
         };
 
         pub const Query = struct {
             shares: [2]Ver.Share,
             secret: Secret,
+
+            /// Destroy the client secret carried by this query — see
+            /// `Secret.wipe`. `shares` are the outbound wire values (they went
+            /// to the servers) and are left alone.
+            pub fn wipe(self: *Query) void {
+                self.secret.wipe();
+            }
         };
 
         // ── client: query construction ────────────────────────────────────
@@ -159,6 +175,13 @@ pub fn Verified(
         /// one `m`). Byte-identical seeds are rejected (`error.SeedReuse`),
         /// the same plumbing-bug guard `Multi` uses; independence remains the
         /// caller's obligation, as everywhere in this repo.
+        ///
+        /// `mac_rand` and the four seeds are **caller-owned** storage
+        /// (CONVENTIONS §2.1 Z2): this module copies what it needs and cannot
+        /// know when the caller is done, so the caller must
+        /// `std.crypto.secureZero` its own buffers. The copy that ends up in
+        /// the returned `Query` is ours — destroy it with `Query.wipe` once
+        /// `reconstruct` has returned.
         ///
         /// `m` is `mac_rand` forced odd (low bit set). Odd means invertible,
         /// which removes the all-even weak class and makes the presence check
@@ -1181,4 +1204,21 @@ fn fuzzVerReconstruct(_: void, smith: *std.testing.Smith) !void {
 }
 test "fuzz verified reconstruct never panics" {
     try std.testing.fuzz({}, fuzzVerReconstruct, .{});
+}
+
+test "Query.wipe destroys the client MAC secret, and a wiped Secret rejects" {
+    var run = try Run.init(9, 4711);
+    var got: [t_record_len]u8 = undefined;
+
+    // Precondition: an honest run reconstructs, and `m` is really non-zero —
+    // without this the assertion below could hold vacuously.
+    try run.reconstruct(&got);
+    try testing.expect(run.q.secret.m != 0);
+
+    run.q.wipe();
+
+    try testing.expectEqual(@as(V.TagWord, 0), run.q.secret.m);
+    // A wiped secret cannot be reused by accident: m = 0 fails the presence
+    // word, so every answer rejects.
+    try testing.expectError(error.AnswerRejected, run.reconstruct(&got));
 }

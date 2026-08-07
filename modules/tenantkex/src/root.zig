@@ -155,6 +155,17 @@ fn keysFor(comptime is_initiator: bool, pair: [2]Suite.CipherState, h: [32]u8) S
     };
 }
 
+/// Wipe every secret this module copied into a `noise` handshake state:
+/// the static and ephemeral secret keys plus the symmetric chaining/cipher
+/// keys. See `Initiator.wipe` for why this layer owns the static-key wipe.
+fn wipeHandshake(hs: *HS) void {
+    if (hs.s != null) std.crypto.secureZero(u8, &hs.s.?.secret_key);
+    if (hs.e != null) std.crypto.secureZero(u8, &hs.e.?.secret_key);
+    std.crypto.secureZero(u8, &hs.symmetric_state.ck);
+    std.crypto.secureZero(u8, &hs.symmetric_state.cipher_state.k);
+    hs.symmetric_state.cipher_state.has_key = false;
+}
+
 /// The initiating provider edge. Owns one session's handshake state; drive it
 /// exactly once through `writeMessage1` then `readMessage2`.
 pub const Initiator = struct {
@@ -193,6 +204,20 @@ pub const Initiator = struct {
             &.{},
         );
         return self;
+    }
+
+    /// Destroy the private key material this initiator holds — the copy of the
+    /// PE's **long-term static** secret key that `initEphemeral` handed to
+    /// `noise`, plus the ephemeral secret and the chaining/cipher keys.
+    ///
+    /// `noise` wipes its own derived material when the handshake splits, but
+    /// deliberately leaves `s` alone: from `noise`'s side that is the caller's
+    /// key and it cannot know the caller's lifetime. `tenantkex` is the caller
+    /// — the copy inside `hs` is ours, so under CONVENTIONS §2.1 Z1 the wipe is
+    /// ours to do. Call it once the handshake is done with (the `SessionKeys`
+    /// are a separate copy and survive; wipe those with `SessionKeys.wipe`).
+    pub fn wipe(self: *Initiator) void {
+        wipeHandshake(&self.hs);
     }
 
     /// Emit msg1 into `out` (needs `message1Len(payload.len)` bytes),
@@ -255,6 +280,12 @@ pub const Responder = struct {
             &.{},
         );
         return self;
+    }
+
+    /// Destroy the private key material this responder holds — see
+    /// `Initiator.wipe` (same rule, same ownership argument).
+    pub fn wipe(self: *Responder) void {
+        wipeHandshake(&self.hs);
     }
 
     /// Consume msg1, decrypting any initiator payload into `payload_out` and
@@ -568,4 +599,39 @@ test "SessionKeys.wipe zeroizes both secret keys but leaves the transcript hash 
 test "meta.deps is exactly {noise}" {
     try testing.expectEqual(@as(usize, 1), meta.deps.len);
     try testing.expectEqualStrings("noise", meta.deps[0]);
+}
+
+test "Initiator/Responder.wipe destroys the copied long-term static secret key" {
+    const i_kp = kp(init_static_priv);
+    const r_kp = kp(resp_static_priv);
+
+    var ini = Initiator.init(i_kp, r_kp.public_key, demo_ctx);
+    var res = Responder.init(r_kp, demo_ctx);
+
+    // Drive a full handshake, so both sides hold live material when wiped —
+    // this is the state a real caller finishes in.
+    var prng_i = testRandom(0x3333);
+    var prng_r = testRandom(0x4444);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(prng_i.random(), "hi", m1[0..message1Len(2)]);
+    _ = try res.readMessage1(m1[0..n1], &pl);
+    const fin_r = try res.writeMessage2(prng_r.random(), "hi", m2[0..message2Len(2)]);
+    _ = try ini.readMessage2(m2[0..fin_r.len], &pl);
+
+    // Preconditions: `noise`'s own split-time wipe leaves `s` alone, so the
+    // caller's long-term secret is still sitting in both structs right now.
+    // Without these the assertions below could pass vacuously.
+    try testing.expectEqualSlices(u8, &i_kp.secret_key, &ini.hs.s.?.secret_key);
+    try testing.expectEqualSlices(u8, &r_kp.secret_key, &res.hs.s.?.secret_key);
+
+    ini.wipe();
+    res.wipe();
+
+    const zero = [_]u8{0} ** 32;
+    try testing.expectEqualSlices(u8, &zero, &ini.hs.s.?.secret_key);
+    try testing.expectEqualSlices(u8, &zero, &res.hs.s.?.secret_key);
+    // The caller's own copy is untouched — we only own the copy inside `hs`.
+    try testing.expectEqualSlices(u8, &init_static_priv, &i_kp.secret_key);
 }

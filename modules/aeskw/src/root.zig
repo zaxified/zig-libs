@@ -98,6 +98,14 @@ pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
 /// recovered plaintext bytes, or `error.Unauthentic` if the constant-time
 /// integrity check fails (in which case `out` is zeroed — no partial-key
 /// leak).
+///
+/// Zeroization posture (CONVENTIONS §2.1): the failure-path wipe of `out` above
+/// is the module's only one, and that is the complete set. The `a` register and
+/// the 16-byte `block` staging buffer are the KW construction's own working
+/// state — Z3, the class `std` leaves unwiped in its own ciphers — and so is
+/// the AES round-key schedule inside `encBlock`/`decBlock`. `kek` and `out` are
+/// caller-owned slices (Z2). There is no Z1 storage here: this module allocates
+/// nothing and keeps nothing between calls.
 pub fn unwrap(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
     if (ciphertext.len < 24 or ciphertext.len % 8 != 0) return error.InvalidLength;
     const n = ciphertext.len / 8 - 1;

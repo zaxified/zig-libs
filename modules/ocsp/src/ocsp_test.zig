@@ -499,6 +499,35 @@ test "verify: revoked status parsed with time + reason" {
     try testing.expectEqual(@as(?u8, 1), verdict.status.revoked.reason);
 }
 
+test "verify: unknown status parsed end-to-end (not silently accepted as good)" {
+    // WAVE-2 ocsp F4 / CAMPAIGN K5: the `CertStatus` builder (`buildResponse`'s
+    // `.unknown` arm, above) could ALWAYS construct an `unknown [2]` DER
+    // response, but nothing ever ran it through `verify()` and checked the
+    // resulting `verdict.status` — fault injection at audit time confirmed a
+    // mutant mapping `unknown` to `.good` left the whole suite green. This
+    // closes that gap directly (the `revoked` case already had its own test
+    // above; `unknown` did not).
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = issuer.subject_name,
+        .status = .unknown,
+        .sign_rsa = fx.kp.secret_key,
+    });
+    defer gpa.free(resp_der);
+
+    const parsed = try ocsp.parseResponse(resp_der);
+    const verdict = try ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts());
+    try testing.expect(verdict.status == .unknown);
+    try testing.expect(verdict.status != .good);
+}
+
 test "verify: tampered tbsResponseData → SignatureInvalid" {
     const gpa = testing.allocator;
     var fx = try makeRsaFixture(gpa);

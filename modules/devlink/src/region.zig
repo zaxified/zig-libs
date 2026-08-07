@@ -225,10 +225,21 @@ pub const Assembler = struct {
         const end = @addWithOverflow(off, @as(u64, bytes.len));
         if (end[1] != 0 or end[0] > a.buf.len) return error.BadLength;
         const start: usize = @intCast(off);
-        for (bytes, start..) |b, i| {
+        const stop: usize = @intCast(end[0]);
+        // Range-check the WHOLE span against the overlap bitmap first, then
+        // `@memcpy` the payload in one bulk op instead of a per-byte
+        // read-modify-write (WAVE-2 devlink F3 / CAMPAIGN K1) — the bitmap
+        // bit-tests stay a cheap byte-wise loop (not the expensive part; the
+        // per-byte *data* copy against a vectorised `memcpy` was), and
+        // checking before copying means an overlap is now rejected with the
+        // buffer untouched by this call, rather than partially written up to
+        // the overlap point as the old single fused loop left it.
+        for (start..stop) |i| {
             if (a.seen[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0) return error.BadLength;
+        }
+        @memcpy(a.buf[start..stop], bytes);
+        for (start..stop) |i| {
             a.seen[i / 8] |= @as(u8, 1) << @intCast(i % 8);
-            a.buf[i] = b;
         }
         a.covered += bytes.len;
     }

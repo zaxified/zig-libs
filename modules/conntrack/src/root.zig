@@ -791,22 +791,26 @@ fn fuzzDumpEngine(_: void, smith: *std.testing.Smith) !void {
 // in both cases the tests below print a SKIPPED line and pass. The repo's
 // plain `zig build test` must stay green for an unprivileged user.
 
-fn liveSocket(what: []const u8) ?Socket {
-    if (builtin.os.tag != .linux) return null;
-    var sock = Socket.open(testing.allocator) catch |err| {
-        if (verboseSkip()) std.debug.print(
-            "\nLIVE conntrack {s} test SKIPPED: cannot open a NETLINK_NETFILTER socket ({s}).\n",
+// `liveSocket` reports "no live kernel access here" via `error.SkipZigTest`
+// (`testkit.skip`), never via a bare `return;`. A bare `return;` inside a Zig
+// test body PASSES the test — the summary line still reads `N/N pass,
+// 0 skipped` — so an unprivileged CI run that can never reach the kernel
+// path would certify these tests every time without ever exercising them.
+// `error.SkipZigTest` is the only outcome the test runner counts as a skip.
+fn liveSocket(what: []const u8) !Socket {
+    if (builtin.os.tag != .linux) return testkit.skip("conntrack {s} test: needs Linux", .{what});
+    var sock = Socket.open(testing.allocator) catch |err|
+        return testkit.skip(
+            "LIVE conntrack {s} test: cannot open a NETLINK_NETFILTER socket ({s}).",
             .{ what, @errorName(err) },
         );
-        return null;
-    };
     // Never let a live test hang a CI run: no ctnetlink reply takes seconds.
     sock.setRecvTimeout(5000) catch {};
     return sock;
 }
 
 test "live: dump the conntrack table over a real ctnetlink socket" {
-    var sock = liveSocket("dump") orelse return;
+    var sock = try liveSocket("dump");
     defer sock.close();
 
     const flows = sock.dump(.unspec) catch |err| switch (err) {
@@ -815,14 +819,11 @@ test "live: dump the conntrack table over a real ctnetlink socket" {
         error.InvalidRequest,
         error.WouldBlock,
         error.Unexpected,
-        => {
-            if (verboseSkip()) std.debug.print(
-                "\nLIVE conntrack dump test SKIPPED: the kernel refused the dump ({s}) — " ++
-                    "needs CAP_NET_ADMIN and a loaded nf_conntrack.\n",
-                .{@errorName(err)},
-            );
-            return;
-        },
+        => return testkit.skip(
+            "LIVE conntrack dump test: the kernel refused the dump ({s}) — " ++
+                "needs CAP_NET_ADMIN and a loaded nf_conntrack.",
+            .{@errorName(err)},
+        ),
         else => return err,
     };
     defer testing.allocator.free(flows);
@@ -846,7 +847,7 @@ test "live: dump the conntrack table over a real ctnetlink socket" {
 }
 
 test "live: insert -> get -> dump -> delete round-trip (needs a netns)" {
-    var sock = liveSocket("round-trip") orelse return;
+    var sock = try liveSocket("round-trip");
     defer sock.close();
 
     // Documentation-range addresses (RFC 5737) on high ports: nothing real can
@@ -875,25 +876,19 @@ test "live: insert -> get -> dump -> delete round-trip (needs a netns)" {
         error.InvalidRequest,
         error.WouldBlock,
         error.Unexpected,
-        => {
-            if (verboseSkip()) std.debug.print(
-                "\nLIVE conntrack round-trip test SKIPPED: insert refused ({s}{s}{s}) — " ++
-                    "run it as `unshare -rn zig build test-conntrack`.\n",
-                .{
-                    @errorName(err),
-                    if (sock.lastErrorMessage().len > 0) ": " else "",
-                    sock.lastErrorMessage(),
-                },
-            );
-            return;
-        },
-        error.Exists => {
-            if (verboseSkip()) std.debug.print(
-                "\nLIVE conntrack round-trip test SKIPPED: the test tuple is already tracked.\n",
-                .{},
-            );
-            return;
-        },
+        => return testkit.skip(
+            "LIVE conntrack round-trip test: insert refused ({s}{s}{s}) — " ++
+                "run it as `unshare -rn zig build test-conntrack`.",
+            .{
+                @errorName(err),
+                if (sock.lastErrorMessage().len > 0) ": " else "",
+                sock.lastErrorMessage(),
+            },
+        ),
+        error.Exists => return testkit.skip(
+            "LIVE conntrack round-trip test: the test tuple is already tracked.",
+            .{},
+        ),
         else => return err,
     };
     // From here on the entry exists and must be cleaned up on any failure.
@@ -945,21 +940,19 @@ test "live: insert -> get -> dump -> delete round-trip (needs a netns)" {
 }
 
 test "live: an event socket sees the flow another socket creates" {
-    if (builtin.os.tag != .linux) return;
-    var events = Socket.openEvents(testing.allocator, Group.all_conntrack) catch |err| {
-        if (verboseSkip()) std.debug.print(
-            "\nLIVE conntrack event test SKIPPED: cannot bind the conntrack event groups ({s}) — " ++
-                "needs CAP_NET_ADMIN.\n",
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var events = Socket.openEvents(testing.allocator, Group.all_conntrack) catch |err|
+        return testkit.skip(
+            "LIVE conntrack event test: cannot bind the conntrack event groups ({s}) — " ++
+                "needs CAP_NET_ADMIN.",
             .{@errorName(err)},
         );
-        return;
-    };
     defer events.close();
     // The kernel may deliver nothing at all (events compiled out); a bounded
     // wait keeps the test from hanging and turns that into a SKIP.
     events.setRecvTimeout(2000) catch {};
 
-    var ctl = liveSocket("event") orelse return;
+    var ctl = try liveSocket("event");
     defer ctl.close();
 
     const orig: Tuple = .{
@@ -969,13 +962,8 @@ test "live: an event socket sees the flow another socket creates" {
         .src_port = 59421,
         .dst_port = 59422,
     };
-    ctl.insert(.ipv4, .{ .orig = orig, .reply = orig.invert(), .timeout = 60 }) catch |err| {
-        if (verboseSkip()) std.debug.print(
-            "\nLIVE conntrack event test SKIPPED: insert refused ({s}).\n",
-            .{@errorName(err)},
-        );
-        return;
-    };
+    ctl.insert(.ipv4, .{ .orig = orig, .reply = orig.invert(), .timeout = 60 }) catch |err|
+        return testkit.skip("LIVE conntrack event test: insert refused ({s}).", .{@errorName(err)});
     defer ctl.delete(.ipv4, .orig, orig, null) catch {};
 
     // The insert queued a NEW event before its ACK came back, so the first
@@ -983,13 +971,8 @@ test "live: an event socket sees the flow another socket creates" {
     var found = false;
     var datagrams: usize = 0;
     while (datagrams < 8 and !found) : (datagrams += 1) {
-        var it = events.nextEvents() catch |err| {
-            if (verboseSkip()) std.debug.print(
-                "\nLIVE conntrack event test SKIPPED: no event datagram ({s}).\n",
-                .{@errorName(err)},
-            );
-            return;
-        };
+        var it = events.nextEvents() catch |err|
+            return testkit.skip("LIVE conntrack event test: no event datagram ({s}).", .{@errorName(err)});
         while (try it.next()) |ev| {
             if (ev.flow.orig.src_port == 59421 and ev.kind == .new) found = true;
         }

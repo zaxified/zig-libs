@@ -185,6 +185,11 @@ pub const Store = struct {
     storage_concurrency: StorageConcurrency,
     /// Owning-thread token, meaningful only for `.single_thread` stores.
     owner: usize,
+    /// Kept only to close `lock_file` in `deinit` — the `Storage` value
+    /// itself is just a `{ctx, vtable}` pair, cheap to hold onto.
+    store: Storage,
+    /// Handle of the held `"<name_prefix>.lock"` sidecar — see `acquireLock`.
+    lock_file: Storage.Handle,
 
     /// Open (or create) `options.n_shards` independent `kvtree` shards over the
     /// injected `Storage`. On any per-shard open failure, already-opened shards
@@ -197,6 +202,11 @@ pub const Store = struct {
         if (options.n_shards == 0) return error.InvalidShardCount;
 
         try checkManifest(store, options);
+
+        // ONE exclusive lock for the whole store (not one per shard — see
+        // `acquireLock`'s doc comment for why).
+        const lock_file = try acquireLock(store, options);
+        errdefer store.close(lock_file);
 
         const shards = try gpa.alloc(Db, options.n_shards);
         errdefer gpa.free(shards);
@@ -212,7 +222,9 @@ pub const Store = struct {
                 "{s}-{d:0>5}{s}",
                 .{ options.name_prefix, opened, options.name_suffix },
             ) catch return error.ShardNameTooLong;
-            shards[opened] = try Db.open(gpa, store, path, .{});
+            // `.lock = .none`: exclusion is already held once, above, for the
+            // whole store — see `acquireLock`.
+            shards[opened] = try Db.open(gpa, store, path, .{ .lock = .none });
         }
 
         return .{
@@ -225,7 +237,32 @@ pub const Store = struct {
                 null,
             .storage_concurrency = options.storage_concurrency,
             .owner = currentThreadToken(),
+            .store = store,
+            .lock_file = lock_file,
         };
+    }
+
+    /// Cross-process/cross-instance exclusion for the WHOLE store — one lock
+    /// covering every shard, rather than each shard taking its own via
+    /// `kvtree.Db.open`'s default `Options.lock == .exclusive`. Per-shard
+    /// locking would work too (it is `kvtree`'s default), but it doubles the
+    /// handle count per shard (data file + lock sidecar), and `FsStorage`'s
+    /// handle table is small and fixed (`max_handles == 4`, sized for one
+    /// `kv`/`kvtree` store's own data+lock+compaction-temp needs) — four
+    /// shards alone would then need 8 concurrently open handles over one
+    /// `FsStorage` and fail with `error.Unexpected`. One lock at the `Store`
+    /// level gives the identical guarantee this module's F2 finding asked
+    /// for — a second `Store` over the same paths gets `error.Locked` with
+    /// nothing touched — at the cost of one handle instead of N.
+    fn acquireLock(store: Storage, options: Options) InitError!Storage.Handle {
+        var buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}.lock", .{options.name_prefix}) catch
+            return error.ShardNameTooLong;
+
+        const h = try store.open(path, .open_or_create);
+        errdefer store.close(h);
+        if (!try store.tryLockExclusive(h)) return error.Locked;
+        return h;
     }
 
     /// Create-or-verify the shard-count manifest. Runs **before** any shard is
@@ -283,9 +320,11 @@ pub const Store = struct {
             return error.NotOwningThread;
     }
 
-    /// Close every shard and free the shard array. No leaks.
+    /// Close every shard, release the store-wide lock, and free the shard
+    /// array. No leaks.
     pub fn deinit(self: *Store) void {
         for (self.shards) |*d| d.close();
+        self.store.close(self.lock_file);
         self.gpa.free(self.shards);
         self.* = undefined;
     }
@@ -372,21 +411,34 @@ test "routing is deterministic and stable across store instances" {
     sim.allow_overwrite = true; // kvtree is a COW page store: meta slots overwrite in place
 
     var s1 = try Store.init(testing.allocator, sim.storage(), .{ .n_shards = 8 });
-    defer s1.deinit();
 
     // Same key → same shard, repeatedly.
     const idx = s1.shardFor("stable-key");
     try testing.expectEqual(idx, s1.shardFor("stable-key"));
     try testing.expectEqual(idx, s1.shardFor("stable-key"));
 
+    // shardFor is a pure function of the key (no I/O), so capture s1's
+    // answers before closing it — a second Store now holds an exclusive
+    // store-wide lock (see `Store.acquireLock`), so a second live Store over
+    // the SAME paths while the first is still open is refused, not merely
+    // untested; that used to be the F2 finding (kvtree.Db.open discarded its
+    // locking Options entirely). Close s1 first, exactly like any real
+    // sequential reopen would.
+    var buf: [32]u8 = undefined;
+    var want: [200]usize = undefined;
+    for (&want, 0..) |*w, n| {
+        const k = try std.fmt.bufPrint(&buf, "k-{d}", .{n});
+        w.* = s1.shardFor(k);
+    }
+    s1.deinit();
+
     // A second store with the same n_shards routes identically (pure hash).
     var s2 = try Store.init(testing.allocator, sim.storage(), .{ .n_shards = 8 });
     defer s2.deinit();
-    var buf: [32]u8 = undefined;
-    for (0..200) |n| {
+    for (want, 0..) |w, n| {
         const k = try std.fmt.bufPrint(&buf, "k-{d}", .{n});
-        try testing.expectEqual(s1.shardFor(k), s2.shardFor(k));
-        try testing.expect(s1.shardFor(k) < 8);
+        try testing.expectEqual(w, s2.shardFor(k));
+        try testing.expect(s2.shardFor(k) < 8);
     }
 }
 
@@ -478,14 +530,18 @@ test "round-trip: put→get across shards, delete, values survive reads on other
 //     assertion alone cannot tell parallelism from its absence — which is how
 //     the original claim survived unexamined. A `Storage` shim instead
 //     rendezvouses the first backend write of each thread: the barrier opens
-//     only when all four threads are inside the backend AT THE SAME TIME, on
-//     four distinct shards, and every arriving thread blocks until then. Put a
-//     latch back in the routed path, or any shared mutable state that forces
-//     ordering, and the barrier is never met: the shim gives up, sets
-//     `timed_out`, and the test fails. That is a deterministic consequence of
-//     serialization, not a race we hope to catch in the act.
+//     only when all `n_shards` threads are inside the backend AT THE SAME
+//     TIME, on `n_shards` distinct shards, and every arriving thread blocks
+//     until then. Put a latch back in the routed path, or any shared mutable
+//     state that forces ordering, and the barrier is never met: the shim
+//     gives up, sets `timed_out`, and the test fails. That is a deterministic
+//     consequence of serialization, not a race we hope to catch in the act.
+//     `n_shards` is 3, not 4 — `FsStorage.max_handles == 4` (kv module) plus
+//     the one store-wide lock handle `Store.init` now holds for cross-process
+//     exclusion (the F2 fix) leaves room for exactly 3 concurrently open
+//     shards; see the test itself.
 //  3. Three rounds, each re-arming the barrier and rewriting every key, with a
-//     full exact-value read-back of all 4000 keys as the correctness oracle —
+//     full exact-value read-back of all the keys as the correctness oracle —
 //     one lost or torn write is one wrong value — under the leak-checking
 //     `testing.allocator`. The suite also runs in ReleaseFast, so the same
 //     assertions are made against optimized code.
@@ -596,11 +652,16 @@ const Rendezvous = struct {
     }
 };
 
-test "multi-core write parallelism: four writers provably inside the backend at once (FsStorage)" {
+test "multi-core write parallelism: three writers provably inside the backend at once (FsStorage)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const n_shards = 4;
+    // 3, not 4: `FsStorage.max_handles == 4` (kv module) has zero headroom
+    // beyond exactly `n_shards` data-file handles, and `Store.init` now also
+    // holds one store-wide lock handle for the whole store's lifetime (the
+    // F2 fix) — 3 shard handles + 1 lock handle == 4 fits exactly; 4 shards
+    // would need 5 and fail with `error.Unexpected` from `FsStorage.vOpen`.
+    const n_shards = 3;
     var fs = FsStorage.init(testing.io, tmp.dir);
     var rv = Rendezvous{ .inner = fs.storage(), .want = n_shards };
 
@@ -663,9 +724,9 @@ test "multi-core write parallelism: four writers provably inside the backend at 
 
         // No worker hit an error.
         for (workers) |w| try testing.expect(w.err == null);
-        // THE CLAIM ITSELF: all four writers were inside the backend together,
-        // on four distinct shards. This is what goes red if the routed path
-        // ever serializes again.
+        // THE CLAIM ITSELF: all `n_shards` writers were inside the backend
+        // together, on `n_shards` distinct shards. This is what goes red if
+        // the routed path ever serializes again.
         try testing.expect(!rv.timed_out.load(.acquire));
         try testing.expect(rv.met.load(.acquire));
     }
@@ -765,9 +826,13 @@ test "persistence: data survives reopening the shards (FsStorage over a tmp dir)
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // 3, not 4: see the multi-core-parallelism test above — `Store.init` now
+    // holds one store-wide lock handle for the whole store's lifetime (the
+    // F2 fix), and `FsStorage.max_handles == 4` (kv module) has no headroom
+    // beyond exactly `n_shards` data-file handles + that one lock handle.
     {
         var fs = FsStorage.init(testing.io, tmp.dir);
-        var store = try Store.init(testing.allocator, fs.storage(), .{ .n_shards = 4 });
+        var store = try Store.init(testing.allocator, fs.storage(), .{ .n_shards = 3 });
         defer store.deinit();
         var kbuf: [32]u8 = undefined;
         var vbuf: [32]u8 = undefined;
@@ -781,7 +846,7 @@ test "persistence: data survives reopening the shards (FsStorage over a tmp dir)
     // Reopen a fresh Store over the SAME dir/paths — durability delegates to
     // kvtree; the same key routes to the same shard file it was written to.
     var fs2 = FsStorage.init(testing.io, tmp.dir);
-    var store2 = try Store.init(testing.allocator, fs2.storage(), .{ .n_shards = 4 });
+    var store2 = try Store.init(testing.allocator, fs2.storage(), .{ .n_shards = 3 });
     defer store2.deinit();
     var kbuf: [32]u8 = undefined;
     var vbuf: [32]u8 = undefined;
