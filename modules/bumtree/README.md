@@ -30,16 +30,19 @@ below.
 
 ## Why (the gap this closes)
 
-The data-plane siblings `l2encap` and `l2forward` both stop at split-horizon and
-say, in their SPECs' "Honest scope of the loop claim" sections, that split-horizon
-prevents only **reflection** (a BUM frame handed back to the PE that
-ingress-replicated it) — it does **not** prevent a **transient forwarding loop**
-among other nodes during reconvergence, which needs "a loop-free BUM distribution
-tree and a reverse-path-forwarding check, which are **control-plane**
-computations". This module is that control-plane piece: the pruned per-source tree
-supplies the replication set, and RPF is the per-node ingress gate. The
-data-plane's TTL remains the always-correct last-resort backstop; this module is
-what makes the loop not happen in the first place.
+The data-plane siblings `l2encap` and `l2forward` say, in their SPECs' "Honest
+scope of the loop claim" sections, exactly how far they get. `l2encap`'s
+ingress-PE-id predicate prevents only **reflection** (a BUM frame handed back to
+the PE that ingress-replicated it) — it cannot even see a relayed copy, because
+`ingress_pe` names the originator and survives `decrementTtl`. `l2forward` closes
+the **steady-state core relay** on top of that, by classifying the frame's
+arrival. What neither can do is prevent a **transient forwarding loop** among
+other nodes during reconvergence, which needs "a loop-free BUM distribution tree
+and a reverse-path-forwarding check, which are **control-plane** computations".
+This module is that control-plane piece: the pruned per-source tree supplies the
+replication set, and RPF is the per-node ingress gate. The data-plane's TTL
+remains the always-correct last-resort backstop; this module is what makes the
+loop not happen in the first place.
 
 ## Loop-freedom & congruency
 

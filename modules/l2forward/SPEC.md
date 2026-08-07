@@ -98,9 +98,8 @@ This module supplies the *necessary inputs* (the member set + the ingress
 classification); the finite-loop guarantee is TTL's, and true loop-freedom is
 the control plane's. `l2forward` therefore performs **ingress replication to the
 full member set**, not tree-pruned replication; a loop-free tree is out of scope
-by design (deferred list). `l2encap`'s SPEC carries the same "honest scope"
-paragraph and still names only the transient case — it needs the same correction
-in its own module.
+by design (deferred list). `l2encap`'s SPEC carried the same "honest scope"
+paragraph and was corrected alongside this one.
 
 ## MAC-move policy
 

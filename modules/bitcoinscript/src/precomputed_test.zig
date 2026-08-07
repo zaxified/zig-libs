@@ -14,15 +14,26 @@
 //! Two oracles, because each is blind to what the other catches:
 //!
 //!  1. **Cost.** A deterministic counter, never a stopwatch (a complexity
-//!     assertion made with a clock is a flaky test on a loaded box). The
-//!     natural counter — `bitcointx`'s own `instrument.count()` — is not
-//!     reachable from here (`instrument.zig` is private to that module), so
-//!     this counts BYTES ALLOCATED while verifying one input instead. Every
-//!     commitment hash serializes the whole transaction into a buffer first,
-//!     so recomputing them is visible as allocation that scales with `vin`/
-//!     `vout`, and hoisting them is visible as allocation that does not.
-//!     `std.testing.FailingAllocator` with the default (never-fail) config is
-//!     exactly that counter.
+//!     assertion made with a clock is a flaky test on a loaded box). Two of
+//!     them, because the direct one only became reachable in audit BD-18:
+//!
+//!     * `bitcointx.instrument.count()` — the number of PER-TRANSACTION
+//!       commitment hashes actually computed. This is the property itself,
+//!       not a proxy for it. It used to be unreachable (`instrument.zig` was
+//!       not re-exported from `bitcointx`'s root), which is why this file was
+//!       first written around the proxy below.
+//!     * BYTES ALLOCATED while verifying one input. Every commitment hash
+//!       serializes the whole transaction into a buffer first, so recomputing
+//!       them is visible as allocation that scales with `vin`/`vout`, and
+//!       hoisting them is visible as allocation that does not.
+//!       `std.testing.FailingAllocator` with the default (never-fail) config
+//!       is exactly that counter.
+//!
+//!     The proxy is KEPT rather than replaced: it is blind to a hash that is
+//!     recomputed without allocating, and the direct counter is blind to a
+//!     call site that allocates a transaction-sized buffer for some other
+//!     reason. Neither subsumes the other, and the second is the one that
+//!     would survive `instrument` being compiled out.
 //!
 //!  2. **Bytes.** Consensus code: faster is worthless if it is different. Real
 //!     signatures over the UNCACHED sighashes, verified through the cached
@@ -69,10 +80,13 @@ fn buildWideTx(a: std.mem.Allocator, n: usize, spk: []const u8) !struct { tx: bi
     };
 }
 
-/// Bytes `verifyScript` allocates while verifying ONE input of an `n`-input,
-/// `n`-output transaction. Building the transaction and (when asked) the cache
-/// happens outside the measured region — the question is what ONE input costs.
-fn verifyOneInputBytes(gpa: std.mem.Allocator, n: usize, kind: Kind, use_pre: bool) !usize {
+/// What verifying ONE input of an `n`-input, `n`-output transaction costs:
+/// bytes allocated, and per-transaction commitment hashes computed. Building
+/// the transaction and (when asked) the cache happens outside the measured
+/// region — the question is what ONE input costs.
+const Cost = struct { bytes: usize, hashes: usize };
+
+fn verifyOneInputCost(gpa: std.mem.Allocator, n: usize, kind: Kind, use_pre: bool) !Cost {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -142,8 +156,9 @@ fn verifyOneInputBytes(gpa: std.mem.Allocator, n: usize, kind: Kind, use_pre: bo
 
     // The spend is expected to FAIL (bogus signature) — the sighash is
     // computed first, which is the cost under test.
+    bitcointx.instrument.reset();
     verify.verifyScript(fa.allocator(), &.{}, spk, witness, flags, ctx) catch {};
-    return fa.allocated_bytes;
+    return .{ .bytes = fa.allocated_bytes, .hashes = bitcointx.instrument.count() };
 }
 
 test "cost: with the cache, verifying an input allocates the same regardless of transaction size" {
@@ -156,21 +171,35 @@ test "cost: with the cache, verifying an input allocates the same regardless of 
         // verification of one input allocates depends on `vin`/`vout` at all.
         // Not "grows slowly" — EQUAL, the same shape as `bitcointx`'s own
         // `count() == 8` assertion.
-        const cached_small = try verifyOneInputBytes(gpa, small, kind, true);
-        const cached_big = try verifyOneInputBytes(gpa, big, kind, true);
-        try testing.expect(cached_small > 0);
-        try testing.expectEqual(cached_small, cached_big);
+        const cached_small = try verifyOneInputCost(gpa, small, kind, true);
+        const cached_big = try verifyOneInputCost(gpa, big, kind, true);
+        try testing.expect(cached_small.bytes > 0);
+        try testing.expectEqual(cached_small.bytes, cached_big.bytes);
 
-        // Control — this is what guards the oracle from being inert. The SAME
-        // counter must see the uncached path grow with the transaction: each
-        // commitment hash serializes every input/output again, so 8x the
-        // transaction is ~8x the allocation for the same ONE input.
-        const raw_small = try verifyOneInputBytes(gpa, small, kind, false);
-        const raw_big = try verifyOneInputBytes(gpa, big, kind, false);
-        try testing.expect(raw_big >= 4 * raw_small);
+        // The direct oracle (audit BD-18): with the cache in hand, verifying an
+        // input must compute NO per-transaction commitment hash at all — the
+        // call site consumed the hoisted ones. Zero, at any transaction size.
+        try testing.expectEqual(@as(usize, 0), cached_small.hashes);
+        try testing.expectEqual(@as(usize, 0), cached_big.hashes);
+
+        // Control — this is what guards both oracles from being inert. The SAME
+        // counters must see the uncached path do the work: each commitment hash
+        // serializes every input/output again, so 8x the transaction is ~8x the
+        // allocation for the same ONE input...
+        const raw_small = try verifyOneInputCost(gpa, small, kind, false);
+        const raw_big = try verifyOneInputCost(gpa, big, kind, false);
+        try testing.expect(raw_big.bytes >= 4 * raw_small.bytes);
+
+        // ...and the uncached path computes commitment hashes per input, which
+        // is precisely what the cache removes. (The count itself does not vary
+        // with `n` — recomputing the SAME hashes over a bigger transaction is
+        // what makes it quadratic — so this is the hashes-vs-none contrast, and
+        // the allocation counter above is what sees the size dependence.)
+        try testing.expect(raw_small.hashes > 0);
+        try testing.expectEqual(raw_small.hashes, raw_big.hashes);
 
         // And the cache is what removes the growth, not some unrelated bound.
-        try testing.expect(cached_big * 4 < raw_big);
+        try testing.expect(cached_big.bytes * 4 < raw_big.bytes);
     }
 }
 

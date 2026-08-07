@@ -13,8 +13,11 @@ per-node plan `{ rpf_ingress, replicate_to, is_member }` that a forwarder uses t
 deliver BUM (broadcast/unknown-unicast/multicast) traffic for an I-SID on `S`'s
 pruned shortest-path tree. This is the control-plane half deferred to by the
 data-plane `l2encap`/`l2forward` (their "Honest scope of the loop claim"
-sections): split-horizon stops reflection; the pruned SPT + RPF stop transient
-loops and duplicates.
+sections): `l2encap`'s ingress-PE-id predicate stops reflection only (it cannot
+see a relayed copy — `ingress_pe` names the originator and survives
+`decrementTtl`), `l2forward` stops the steady-state core relay by classifying the
+frame's arrival, and the pruned SPT + RPF here stop transient loops and
+duplicates.
 
 ## Algorithm
 

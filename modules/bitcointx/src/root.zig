@@ -25,7 +25,9 @@
 //!   validator's cost is linear in transaction size rather than quadratic
 //!   (that seam is what BIP143 exists for — see the file's doc comment).
 //! - `instrument.zig` — test-only counter backing the regression test for
-//!   the above; compiles to nothing outside a test build.
+//!   the above; compiles to nothing outside a test build. Re-exported as
+//!   `instrument` so a *consumer*'s tests can assert the same property at
+//!   their own call sites (audit BD-18).
 //! - `hash256.zig` — `sha256d` (Bitcoin's double-SHA256) and plain
 //!   `sha256` (what BIP341's commitment hashes use instead).
 //! - `*_kat_vectors.zig` / `*_kat_test.zig` — official test vectors
@@ -49,6 +51,13 @@ pub const legacy = @import("sighash_legacy.zig");
 pub const bip143 = @import("sighash_bip143.zig");
 pub const bip341 = @import("sighash_bip341.zig");
 pub const precomputed = @import("precomputed.zig");
+/// Test-only commitment-hash counter. Public because the property it measures
+/// — "compute once per transaction" — is a property of the CALL PATTERN, so it
+/// has to be assertable from the consumers that make the calls
+/// (`bitcoinscript` is one) and not only from this module's own tests. Outside
+/// a test build every symbol in here is `void`/zero and reaches no object file;
+/// see `instrument.zig`. Non-test code must never read it.
+pub const instrument = @import("instrument.zig");
 
 /// Bitcoin Core's `PrecomputedTransactionData` equivalent: the BIP143 and
 /// BIP341 per-transaction commitment hashes, computed once per transaction
@@ -86,7 +95,7 @@ test {
     _ = bip143;
     _ = bip341;
     _ = precomputed;
-    _ = @import("instrument.zig");
+    _ = instrument;
     _ = @import("testutil.zig");
     _ = @import("tx_kat_vectors.zig");
     _ = @import("tx_kat_test.zig");

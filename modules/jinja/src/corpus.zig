@@ -83,6 +83,18 @@ pub const cases = [_]Case{
     .{ .name = "list_concat_repeat", .template = "{{ [1] + [2, 3] }}|{{ [0] * 3 }}" },
     .{ .name = "div_by_zero_errors", .template = "{{ 1 / 0 }}", .expect_error = true },
     .{ .name = "mod_by_zero_errors", .template = "{{ 1 % 0 }}", .expect_error = true },
+    // `**` is the third division-by-zero, and the one that does not look like
+    // one: Python raises `ZeroDivisionError("zero to a negative power")` rather
+    // than producing `inf`, for an integer base, a float base, and `-0.0` alike.
+    // We used to render `inf` (audit BD-07).
+    .{ .name = "pow_zero_to_negative_errors", .template = "{{ 0 ** -1 }}", .expect_error = true },
+    .{ .name = "pow_zero_to_negative_float_base_errors", .template = "{{ 0.0 ** -1 }}", .expect_error = true },
+    .{ .name = "pow_zero_to_negative_float_exponent_errors", .template = "{{ 0 ** -0.5 }}", .expect_error = true },
+    .{ .name = "pow_negative_zero_to_negative_errors", .template = "{{ -0.0 ** -1 }}", .expect_error = true },
+    // The neighbours that must keep working, so the guard cannot be a blanket
+    // refusal of a zero base: exponent zero (including `-0.0`) is 1, and a
+    // non-zero base to a negative power is still the float path.
+    .{ .name = "pow_zero_base_non_negative", .template = "{{ 0 ** 0 }}|{{ 0.0 ** 0 }}|{{ 0 ** 3 }}|{{ 0.0 ** -0.0 }}|{{ 2 ** -2 }}|{{ 0.5 ** -2 }}" },
 
     // ── comparison and logic ────────────────────────────────────────────────
     .{ .name = "compare_ops", .template = "{{ 1 < 2 }}|{{ 2 <= 2 }}|{{ 3 > 4 }}|{{ 3 >= 3 }}|{{ 1 == 1.0 }}|{{ 'a' != 'b' }}" },
@@ -123,6 +135,12 @@ pub const cases = [_]Case{
     .{ .name = "filter_join_attribute", .template = "{{ rows|join(', ', attribute='n') }}", .context = "{\"rows\": [{\"n\": 1}, {\"n\": 2}]}" },
     .{ .name = "filter_join_plain", .template = "{{ ['a','b']|join }}|{{ [1,2]|join('+') }}" },
     .{ .name = "filter_replace", .template = "{{ 'aaa'|replace('a','b') }}|{{ 'aaa'|replace('a','b',2) }}" },
+    // An empty `old` matches at every gap — `count` clips from the left, and an
+    // empty input still gets the one insertion. We returned the input unchanged
+    // (audit BD-06).
+    .{ .name = "filter_replace_empty_old", .template = "{{ 'abc'|replace('','X') }}|{{ ''|replace('','X') }}|{{ 'abc'|replace('','X',2) }}|{{ 'abc'|replace('','X',0) }}|{{ 'abc'|replace('','X',-1) }}" },
+    // The gaps are between CODEPOINTS, not bytes — two characters, three gaps.
+    .{ .name = "filter_replace_empty_old_unicode", .template = "{{ 'áb'|replace('','X') }}|{{ 'ěš'.replace('','-') }}" },
     .{ .name = "filter_default", .template = "[{{ missing|default('D') }}]|[{{ ''|default('D') }}]|[{{ ''|default('D', true) }}]" },
     .{ .name = "filter_default_short", .template = "{{ nope|d(5) }}" },
     .{ .name = "filter_int_float", .template = "{{ '42'|int }}|{{ 'x'|int }}|{{ 'x'|int(9) }}|{{ '1.9'|int }}|{{ 3.9|int }}|{{ '2.5'|float }}|{{ 'x'|float(1.5) }}" },
@@ -299,6 +317,16 @@ pub const cases = [_]Case{
         .name = "escape_off_replace_method_markup_receiver",
         .template = "{{ (s|safe).replace('x', evil) }}|{{ s.replace('x', evil) }}",
         .context = "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+    },
+    // The empty-`old` splice crossed with the markup matrix (audit BD-06). The
+    // third column is the load-bearing one: `old` being markup makes `do_replace`
+    // ESCAPE the input first, so the gaps are counted over `a&lt;b` — five
+    // characters, six insertions — not over the three characters of `a<b`.
+    .{
+        .name = "escape_replace_empty_old_markup_matrix",
+        .template = "{{ s|replace('', evil) }}|{{ (s|safe)|replace('', evil) }}|{{ s|replace(''|safe, evil) }}|{{ (s|safe).replace('', evil) }}",
+        .context = "{\"s\": \"a<b\", \"evil\": \"<i>&'\\\"</i>\"}",
+        .autoescape = true,
     },
     .{
         .name = "escape_replace_non_string_argument",

@@ -174,10 +174,20 @@ pub const Npci = struct {
     }
 
     /// Octets this NPCI occupies on the wire.
+    ///
+    /// Each `mac_len` is widened to `usize` **before** any arithmetic. Zig types
+    /// `3 + d.mac_len` by its operands, not by where the result lands: written
+    /// without the widening it is computed in `u8` and overflows at
+    /// `mac_len >= 253`, even though `n` is a `usize`. That is the same shape as
+    /// the `u16` length arithmetic in `sc.zig`'s `OptionIter` (audit BD-02).
+    /// `decodeHeader` caps DLEN/SLEN at 7 and `NetAddress.fromMac` refuses
+    /// longer, so no wire input reaches it today — but `NetAddress.mac_len` is a
+    /// public field, so a caller-built NPCI does, and a bounds computation must
+    /// not depend on an invariant enforced somewhere else.
     pub fn wireLen(self: Npci) usize {
         var n: usize = 2;
-        if (self.destination) |d| n += 3 + d.mac_len;
-        if (self.source) |s| n += 3 + s.mac_len;
+        if (self.destination) |d| n += 3 + @as(usize, d.mac_len);
+        if (self.source) |s| n += 3 + @as(usize, s.mac_len);
         if (self.destination != null) n += 1; // hop count
         return n;
     }
@@ -734,6 +744,34 @@ test "encode refuses to overflow the output buffer at any field" {
     var ok: [19]u8 = undefined;
     const wire = try encode(npci, &.{ 0x10, 0x08 }, &ok);
     try testing.expectEqual(@as(usize, 19), wire.len);
+}
+
+// ── regression: `wireLen` must not do its arithmetic in `u8` (audit BD-19) ───
+//
+// `NetAddress.mac_len` is a public field, so an NPCI can be built with any
+// length at all without going through `fromMac`. `3 + d.mac_len` written
+// unwidened is typed by its operands — `u8` — and panics with "integer
+// overflow" from `mac_len == 253` upward, in a function whose whole job is to
+// tell the caller how big a buffer to hand `encode`. Same shape as BD-02 in
+// `sc.zig`; there it silently wrapped a bounds check, here it traps.
+test "wireLen is computed in usize, not in the u8 the operands imply" {
+    // 253 is where `3 + mac_len` first leaves the u8 range.
+    for ([_]u8{ 252, 253, 254, 255 }) |len| {
+        const d: Npci = .{ .destination = .{ .net = 1, .mac_len = len } };
+        try testing.expectEqual(@as(usize, 2 + 3 + @as(usize, len) + 1), d.wireLen());
+        const s: Npci = .{ .source = .{ .net = 1, .mac_len = len } };
+        try testing.expectEqual(@as(usize, 2 + 3 + @as(usize, len)), s.wireLen());
+        const both: Npci = .{
+            .destination = .{ .net = 1, .mac_len = len },
+            .source = .{ .net = 2, .mac_len = len },
+        };
+        try testing.expectEqual(@as(usize, 2 + 2 * (3 + @as(usize, len)) + 1), both.wireLen());
+    }
+    // The legal lengths are unchanged.
+    try testing.expectEqual(@as(usize, 17), (Npci{
+        .destination = try NetAddress.fromMac(1, &.{ 1, 2, 3, 4, 5, 6 }),
+        .source = try NetAddress.fromMac(2, &.{ 7, 8 }),
+    }).wireLen());
 }
 
 test "fuzz: NPDU decode never panics and canonical headers re-encode" {

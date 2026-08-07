@@ -74,7 +74,13 @@
 //!
 //! What this does and does not guarantee: the ingress-PE-id + TTL fields are the
 //! **necessary inputs** to loop mitigation, and TTL alone bounds any loop to a
-//! finite hop count. Full loop-freedom of the BUM distribution tree (SPB/TRILL
+//! finite hop count. Step 1 stops **reflection only**. It does not stop a
+//! *relayed* copy: `ingress_pe` names the originator and is preserved across
+//! `decrementTtl` (deliberately — that is what makes step 1 work), so a third PE
+//! compares its id against the originator's, never against the relayer's. The
+//! steady-state core relay that follows from that is closed in `l2forward`, by
+//! classifying where the frame arrived from; see SPEC.md, "Honest scope of the
+//! loop claim". Full loop-freedom of the BUM distribution tree (SPB/TRILL
 //! reverse-path-forwarding-check, tree computation) is a **control-plane**
 //! property built on top of these fields, not something a stateless codec can
 //! assert on its own — see SPEC.md's deferred list.
@@ -430,6 +436,44 @@ test "semantics: split-horizon drops a BUM frame reflected to its own ingress PE
     // A unicast frame is never dropped by split-horizon, even from this PE.
     const own_unicast: Fields = .{ .isid = 9, .ttl = 10, .bum = false, .ingress_pe = this_pe };
     try testing.expect(!droppedBySplitHorizon(own_unicast, this_pe));
+}
+
+// The negative space of the rule above, made executable. `SPEC.md`'s "Honest
+// scope of the loop claim" used to name only the transient reconvergence loop as
+// the residue; the dominant failure was the steady-state core relay, and the
+// reason this predicate cannot see it is a property of THIS header — see the
+// corrected paragraph (audit BD-12).
+test "semantics: split-horizon cannot see a RELAYED copy — ingress_pe names the originator, not the last hop" {
+    const pe_a: u16 = 1; // originator: ingress-replicates the BUM frame
+    const pe_b: u16 = 2; // first core hop: relays it onward
+    const pe_c: u16 = 3; // third PE: receives B's relayed copy
+
+    const at_b: Fields = .{ .isid = 9, .ttl = 64, .bum = true, .ingress_pe = pe_a };
+    // B accepts it (not its own id) and forwards. `decrementTtl` touches the TTL
+    // and nothing else — deliberately, because rewriting `ingress_pe` per hop is
+    // what would break the reflection rule the field exists for.
+    try testing.expect(!droppedBySplitHorizon(at_b, pe_b));
+    const at_c = try decrementTtl(at_b);
+    try testing.expectEqual(pe_a, at_c.ingress_pe);
+    try testing.expectEqual(@as(u8, 63), at_c.ttl);
+
+    // The consequence: at C the predicate compares C against the ORIGINATOR, so
+    // a copy that reached C only because B relayed it is indistinguishable from
+    // a legitimate first delivery. This must stay FALSE — a "fix" that made it
+    // true would drop every legitimate BUM delivery from the fabric.
+    try testing.expect(!droppedBySplitHorizon(at_c, pe_c));
+    // And the same copy handed back to A IS caught — the one case the rule owns,
+    // however many hops it took to get there.
+    try testing.expect(droppedBySplitHorizon(at_c, pe_a));
+
+    // Only the TTL bounds the relay: 64 hops, not the split-horizon predicate.
+    var f = at_c;
+    var hops: usize = 1;
+    while (decrementTtl(f)) |next| : (hops += 1) {
+        try testing.expect(!droppedBySplitHorizon(next, pe_c));
+        f = next;
+    } else |err| try testing.expectEqual(ForwardError.TtlExpired, err);
+    try testing.expectEqual(@as(usize, 64), hops);
 }
 
 test "semantics: looksLikeEthernet is a pure length check at the eth_hdr_len boundary" {

@@ -1772,6 +1772,69 @@ test "§7.3.16.4 b): an LSP that AGES into the purge hold is flooded as a header
     try testing.expect(hostnameOf(&peer, id, 1) == null);
 }
 
+// ── regression: §7.3.16.4 b) retains the header's CHECKSUM verbatim ──────────
+//
+// `stampPurgeHeader` rewrites exactly two fields (PDU Length, Remaining
+// Lifetime). Leaving the Checksum field alone is a decision, not an oversight:
+// note 36 has the check "succeed even though the data portion is not present",
+// i.e. the field survives a purge and is simply not re-verified. Nothing pinned
+// it — the audit zeroed the checksum in `dupeRetainedBytes` and all three
+// dependent suites stayed green (BD-25). The consequence a zeroing would have is
+// not local: the retained octets are what `srmIterator` re-floods, and a peer
+// holding the same purge compares the incoming checksum against its own under
+// §7.3.16.1 — with the stored copy a purge, clause (d) does not apply, so an
+// altered checksum makes an identical purge compare `.older` and the peer
+// re-sends its copy back at us. A purge ping-pong, from one zeroed field.
+
+test "§7.3.16.4 b): the retained purge header keeps its Checksum verbatim, on both paths" {
+    const id = idOf(sys_other, 0);
+
+    // (1) Receive path (`dupeRetainedBytes`): a purge arriving with a body is
+    // truncated to its header, and that header carries the checksum it arrived
+    // with — the same value the entry reports to `summarise`.
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    var good: [128]u8 = undefined;
+    _ = try db.insert(buildNamedLsp(&good, sys_other, 0, 4, 1000, "legit", false), 1, 0);
+    var evil: [128]u8 = undefined;
+    _ = try db.insert(buildFatPurge(&evil, sys_other, 0, 5, "EVIL!", 0xBEEF), 1, 1);
+    const v = db.get(id, 1).?;
+    try testing.expect(v.is_purge);
+    try testing.expectEqual(@as(u16, 0xBEEF), (try isis.Lsp.decode(v.bytes)).checksum);
+    // The flooded octets and the CSNP summary must agree, or a neighbour's SNP
+    // reconciliation sees a difference that does not exist.
+    try testing.expectEqual(v.checksum, (try isis.Lsp.decode(v.bytes)).checksum);
+
+    // (2) Aging path (`retainHeaderOnly`): an LSP that ages into the purge hold
+    // keeps the checksum of the copy that expired.
+    var aged = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .zero_age_lifetime = 60 });
+    defer aged.deinit();
+    var abuf: [128]u8 = undefined;
+    const live = buildNamedLsp(&abuf, sys_other, 0, 4, 100, "peer", false);
+    const live_csum = (try isis.Lsp.decode(live)).checksum;
+    try testing.expect(live_csum != 0); // §7.3.11 never yields zero (RFC 3719 §7)
+    _ = try aged.insert(live, 1, 0);
+    try testing.expectEqual(@as(usize, 1), aged.tick(100).entered_purge);
+    try testing.expectEqual(live_csum, (try isis.Lsp.decode(aged.get(id, 100).?.bytes)).checksum);
+
+    // (3) The consequence, end to end: a peer that already holds this purge must
+    // recognise our re-flooded header as IDENTICAL (§7.3.16.1(a)) and stay
+    // quiet. If the retained header's checksum were rewritten, clause (a) would
+    // miss, clause (d) would not fire (the stored copy is a purge), and the peer
+    // would grade it `.older` and re-send its copy back out the arrival circuit.
+    var peer = Lsdb.init(testing.allocator, testCfg());
+    defer peer.deinit();
+    var pgood: [128]u8 = undefined;
+    _ = try peer.insert(buildNamedLsp(&pgood, sys_other, 0, 4, 1000, "legit", false), 1, 0);
+    var pevil: [128]u8 = undefined;
+    _ = try peer.insert(buildFatPurge(&pevil, sys_other, 0, 5, "EVIL!", 0xBEEF), 1, 1);
+    var i: u8 = 0;
+    while (i < 4) : (i += 1) peer.clearSrm(id, i); // that flood already happened
+    const r = try peer.insert(v.bytes, 0, 2);
+    try testing.expectEqual(Ordering.same, r.ordering);
+    try testing.expect(!peer.srmSet(id).?.isSet(0));
+}
+
 test "srmIterator walks the LSPs queued for one circuit" {
     var db = Lsdb.init(testing.allocator, testCfg());
     defer db.deinit();

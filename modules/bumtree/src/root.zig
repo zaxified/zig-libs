@@ -20,11 +20,24 @@
 //!      loop/duplicate backstop.
 //!
 //! This is the control-plane loop-free BUM tree that the data-plane
-//! `l2encap`/`l2forward` explicitly defer to: source-PE split-horizon only stops
-//! *reflection* (a frame handed back to the PE that ingress-replicated it); RPF +
-//! the pruned SPT are what stop a *transient forwarding loop* among other nodes
-//! during reconvergence and prevent duplicate delivery. See both those modules'
-//! SPECs ("Honest scope of the loop claim").
+//! `l2encap`/`l2forward` explicitly defer to. Two data-plane rules sit below it,
+//! and neither is a substitute:
+//!
+//!   * `l2encap.droppedBySplitHorizon` stops **reflection only** — a frame handed
+//!     back to the PE that ingress-replicated it. It cannot see a *relayed* copy,
+//!     because `ingress_pe` names the originator and is preserved across
+//!     `decrementTtl`, so a third PE never matches on it. (This module's doc
+//!     comment used to call that rule "source-PE split-horizon", which reads as
+//!     the broader guarantee it is not.)
+//!   * `l2forward` closes the **steady-state core relay** — the exponential
+//!     duplication a converged fabric produced when a core-received BUM frame was
+//!     re-replicated to every other member — by classifying the frame's arrival,
+//!     not by inspecting `ingress_pe`.
+//!
+//! What is left after both, and what this module is for: a **transient forwarding
+//! loop** among other nodes during reconvergence, and duplicate delivery. RPF +
+//! the pruned SPT are what stop those. See both those modules' SPECs ("Honest
+//! scope of the loop claim").
 //!
 //! Loop-freedom is by construction: an SPT is a tree (acyclic), so tree-flooding
 //! terminates and reaches each node once; RPF enforces a single valid ingress, so

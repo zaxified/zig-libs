@@ -378,7 +378,7 @@ ZIG_LIBS_VERBOSE_SKIP=1 zig build test-jinja # say why a live test skipped
 zig build test-jinja --fuzz --release=safe   # fuzz the compiler
 ```
 
-The conformance suite renders a 292-case corpus with **Python Jinja2 3.1.6** in
+The conformance suite renders a 330-case corpus with **Python Jinja2 3.1.6** in
 a subprocess and compares byte for byte, and separately against a committed
 golden file produced by that same reference so an offline host still asserts
 conformance. Python is a test oracle only — nothing links against it. If

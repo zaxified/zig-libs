@@ -543,7 +543,11 @@ pub fn binary(arena: std.mem.Allocator, op: BinOp, a: Value, b: Value) Error!Val
         .mul => .{ .float = x * y },
         .floordiv => if (y == 0.0) error.DivisionByZero else .{ .float = @floor(x / y) },
         .mod => if (y == 0.0) error.DivisionByZero else .{ .float = pyFmod(x, y) },
-        .pow => .{ .float = std.math.pow(f64, x, y) },
+        // Zero to a negative power is `ZeroDivisionError` in Python, not `inf`
+        // — see `intPow`. `x == 0.0` is also true for `-0.0` (Python agrees:
+        // `(-0.0) ** -1` raises), and `y < 0` is false for `-0.0` (Python
+        // agrees: `0.0 ** -0.0` is `1.0`).
+        .pow => if (x == 0.0 and y < 0) error.DivisionByZero else .{ .float = std.math.pow(f64, x, y) },
         .div, .concat => unreachable,
     };
 }
@@ -573,6 +577,14 @@ fn pyFmod(x: f64, y: f64) f64 {
 
 fn intPow(x: i64, y: i64) Error!Value {
     if (y < 0) {
+        // MATCH THE REFERENCE. `0 ** -1` is `ZeroDivisionError("zero to a
+        // negative power")` in Python, and Jinja2 3.1.6 propagates it — checked
+        // on this host. Taking the float path here produced `inf` instead, which
+        // is worse than a wrong number: `{{ 1 / 0 }}` and `{{ 1 % 0 }}` already
+        // abort the render, so a template that Jinja2 refuses would quietly emit
+        // `inf` into whatever this engine is generating (audit BD-07). The float
+        // branch of `binary` has the same guard for `0.0 ** -1`.
+        if (x == 0) return error.DivisionByZero;
         const fx: f64 = @floatFromInt(x);
         const fy: f64 = @floatFromInt(y);
         return .{ .float = std.math.pow(f64, fx, fy) };

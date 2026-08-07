@@ -227,6 +227,10 @@
    "out": "<b>",
    "status": "ok"
   },
+  "escape_replace_empty_old_markup_matrix": {
+   "out": "&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;&lt;&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;<&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;&&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;l&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;t&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;;&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;<&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;",
+   "status": "ok"
+  },
   "escape_replace_filter_block": {
    "out": "q &lt;script&gt;a&amp;b&#39;&#34;&lt;/script&gt; q",
    "status": "ok"
@@ -439,6 +443,14 @@
   },
   "filter_replace_count_from_data": {
    "out": "b<b>b",
+   "status": "ok"
+  },
+  "filter_replace_empty_old": {
+   "out": "XaXbXcX|X|XaXbc|abc|XaXbXcX",
+   "status": "ok"
+  },
+  "filter_replace_empty_old_unicode": {
+   "out": "X\u00e1XbX|-\u011b-\u0161-",
    "status": "ok"
   },
   "filter_replace_negative_count": {
@@ -988,6 +1000,30 @@
   "plain_text": {
    "out": "hello world",
    "status": "ok"
+  },
+  "pow_negative_zero_to_negative_errors": {
+   "kind": "ZeroDivisionError",
+   "msg": "zero to a negative power",
+   "status": "error"
+  },
+  "pow_zero_base_non_negative": {
+   "out": "1|1.0|0|1.0|0.25|4.0",
+   "status": "ok"
+  },
+  "pow_zero_to_negative_errors": {
+   "kind": "ZeroDivisionError",
+   "msg": "zero to a negative power",
+   "status": "error"
+  },
+  "pow_zero_to_negative_float_base_errors": {
+   "kind": "ZeroDivisionError",
+   "msg": "zero to a negative power",
+   "status": "error"
+  },
+  "pow_zero_to_negative_float_exponent_errors": {
+   "kind": "ZeroDivisionError",
+   "msg": "zero to a negative power",
+   "status": "error"
   },
   "power": {
    "out": "1024|1|0.5",

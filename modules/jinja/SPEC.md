@@ -251,7 +251,7 @@ the reference too.
 ## 7. Verification
 
 The anchor is **Python Jinja2 3.1.6**, the reference implementation, and the
-comparison is byte-for-byte: `src/corpus.zig` holds 292 cases (template + the
+comparison is byte-for-byte: `src/corpus.zig` holds 330 cases (template + the
 other templates its loader serves + JSON context + syntax options), and both
 oracles render exactly that table — Zig against a `MapLoader`, Python against a
 `DictLoader` built from the same table.

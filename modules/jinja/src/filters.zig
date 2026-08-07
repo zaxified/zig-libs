@@ -252,9 +252,37 @@ fn replaceCore(ctx: *Ctx, s: []const u8, old: []const u8, new: []const u8, count
         const c = try intArg(count_v.?, 0);
         break :blk if (c < 0) std.math.maxInt(usize) else @intCast(c);
     };
-    if (old.len == 0) return .{ .string = .{ .bytes = s, .safe = markup } };
-
+    // MATCH THE REFERENCE. An empty `old` is not "nothing to do": Python's
+    // `str.replace` treats it as a match at every gap, so `'abc'.replace('','X')`
+    // is `'XaXbXcX'`, `''.replace('','X')` is `'X'`, and `count` clips from the
+    // left (`'abc'.replace('','X',2)` is `'XaXbc'`). Jinja2 3.1.6 inherits all of
+    // it verbatim, in both autoescape settings — checked on this host. Returning
+    // the input unchanged (what this did) is a silent no-op in a filter whose
+    // arguments routinely come from context data, so the divergence is not
+    // reachable only from template text (audit BD-06).
+    //
+    // The gaps are between CODEPOINTS, not bytes: Python replaces over
+    // characters, so `'áb'.replace('','X')` is `'XáXbX'` — three insertions, not
+    // four — and splicing between the bytes of a multi-byte sequence would also
+    // emit invalid UTF-8.
     var out: std.ArrayList(u8) = .empty;
+    if (old.len == 0) {
+        var i: usize = 0;
+        var done: usize = 0;
+        while (i < s.len) {
+            if (done < limit) {
+                try out.appendSlice(ctx.arena, new);
+                done += 1;
+            }
+            const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+            const end = @min(i + n, s.len);
+            try out.appendSlice(ctx.arena, s[i..end]);
+            i = end;
+        }
+        if (done < limit) try out.appendSlice(ctx.arena, new);
+        return .{ .string = .{ .bytes = out.items, .safe = markup } };
+    }
+
     var i: usize = 0;
     var done: usize = 0;
     while (i < s.len) {

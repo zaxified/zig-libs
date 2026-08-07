@@ -69,10 +69,36 @@ per-frame test* for; it never forwards, replicates, or learns.
 
 ### Honest scope of the loop claim (do not overclaim)
 
-The ingress-PE-id split-horizon rule prevents the **reflection** case (a BUM
-frame delivered back to its own originator). It does **not**, by itself, prevent
-a transient forwarding loop among *other* PEs during control-plane reconvergence
-— that requires a loop-free BUM distribution tree and a reverse-path-forwarding
+The ingress-PE-id split-horizon rule prevents exactly one case: **reflection**,
+a BUM frame delivered back to its own originator. That is a narrower guarantee
+than "split horizon", and the gap is not hypothetical.
+
+**The failure mode it does not close, and which was ours.** The dominant loop
+in a fully converged fabric was the **steady-state core relay**: a PE that
+received a BUM frame *from the core* re-replicated it to every other member,
+because `l2forward` returned *members − src_pe* for every BUM frame regardless
+of where it came from. With N members, hop k carries `(N−1)(N−2)^(k−1)` copies
+of one broadcast. `droppedBySplitHorizon` cannot recognise a single one of those
+copies, and the reason is a property of this header: **`ingress_pe` is stamped
+once at ingress and is preserved across `decrementTtl`**, deliberately, so that
+the field keeps naming the *originator* rather than the previous hop. A third PE
+therefore compares its own id against the originator's, never against the
+relayer's, and the predicate is false for every relayed copy. Nothing about that
+is a defect in this module — the alternative (rewriting `ingress_pe` per hop)
+would destroy the reflection rule the field exists for — but it does mean the
+split-horizon predicate is **not** a relay guard, and must not be described as
+one. The relay is closed in `l2forward`, by classifying the frame's arrival
+(core-received ⇒ `local_only`); see its SPEC, and the 4-PE composition test that
+pins it.
+
+(An earlier revision of this paragraph named only the *transient reconvergence*
+loop as the residual risk, and that misdirected the reader: the dominant failure
+mode was in the steady state, needed no reconvergence, no misconfiguration and
+no malformed frame, and it was ours.)
+
+**What is still not closed anywhere in the data plane:** a transient forwarding
+loop among PEs during control-plane reconvergence, when member sets disagree.
+That requires a loop-free BUM distribution tree and a reverse-path-forwarding
 check, which are **control-plane** computations (the S1b `loopfree-reconv` /
 SPB-tree work), not something a stateless codec can assert. The header's job is
 to carry the *necessary inputs* (source id + hop count + BUM bit) to those
