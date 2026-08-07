@@ -117,3 +117,122 @@ test "root re-exports resolve to the same types/values as tx.zig" {
     comptime std.debug.assert(tx.Transaction == Transaction);
     try std.testing.expectEqual(tx.compactSizeLen(300), compactSizeLen(300));
 }
+
+// ── fuzz: a decoded transaction through all three sighash algorithms ────────
+//
+// W2 A3 (F5) recorded that `deserializePartial` was the only fuzzed entry
+// point in this module, and that the three sighash functions — the only ones
+// that consume attacker-derived data on a validating node, since every field
+// they read comes off the wire — had never been fuzzed at all. The obstacle
+// is that the harness for `deserializePartial` lives in `tx.zig`, and `tx.zig`
+// is what the sighash files import: it cannot reach them without a cycle. So
+// the decode→sighash harness lives here, where all four are already in scope.
+//
+// The oracle is not just "no panic". `sighashWith` (the precomputed-midstate
+// seam) must be byte-identical to the one-off `sighash` for the same inputs;
+// that is the invariant a validator's whole O(n) vs O(n²) choice rests on, and
+// it is checked on every input that decodes.
+test "fuzz: every decoded transaction through legacy/BIP143/BIP341 sighash" {
+    try std.testing.fuzz({}, fuzzSighash, .{ .corpus = sighash_seeds });
+}
+
+fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    // The same three-way bias `tx.zig`'s harness uses on the octet after the
+    // version field, so transactions actually decode instead of the fuzzer
+    // spending its budget on the CompactSize bail-out.
+    buf[4] = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => smith.valueRangeAtMost(u8, 0, 4),
+        1 => 0x00,
+        else => smith.value(u8),
+    };
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var r = deserializePartial(a, buf[0..len]) catch return;
+    defer r.tx.deinit(a);
+    const t = r.tx;
+
+    var script_buf: [96]u8 = undefined;
+    smith.bytes(&script_buf);
+    const script = script_buf[0..smith.valueRangeAtMost(u8, 0, script_buf.len)];
+    // Deliberately drawn past `vin.len`: `InputIndexOutOfRange` is a gate all
+    // three implement separately, and an out-of-range index is exactly what a
+    // hostile witness stack supplies.
+    const idx: usize = smith.valueRangeAtMost(u8, 0, 5);
+    const amount = smith.value(i64);
+
+    // Half the draws are a well-formed hash type (base 0..3, optional
+    // ANYONECANPAY), half are arbitrary — the SIGHASH_SINGLE bug and the
+    // unknown-base fallthrough are both only reachable from the first half.
+    const ht32: u32 = if (smith.value(bool))
+        @as(u32, smith.valueRangeAtMost(u8, 0, 3)) | (if (smith.value(bool)) @as(u32, 0x80) else 0)
+    else
+        smith.value(u32);
+
+    _ = legacy.sighash(a, t, idx, script, ht32) catch {};
+
+    if (bip143.sighash(a, t, idx, script, amount, ht32)) |h| {
+        const pre = try bip143.precompute(a, t);
+        const h2 = bip143.sighashWith(a, pre, t, idx, script, amount, ht32) catch
+            return error.PrecomputedSeamRefusedAnAcceptedInput;
+        if (!std.mem.eql(u8, &h, &h2)) return error.Bip143PrecomputedDiverged;
+    } else |_| {}
+
+    // BIP341 commits to every spent output, so it needs one per input.
+    var spent: [8]TxOut = undefined;
+    if (t.vin.len <= spent.len) {
+        for (spent[0..t.vin.len]) |*o| o.* = .{
+            .value = smith.value(i64),
+            .script_pubkey = script,
+        };
+        const outs = spent[0..t.vin.len];
+        const valid_ht = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 };
+        const ht8: u8 = if (smith.value(bool))
+            valid_ht[smith.valueRangeAtMost(u8, 0, valid_ht.len - 1)]
+        else
+            smith.value(u8);
+        if (bip341.sighash(a, t, idx, ht8, outs)) |h| {
+            const pre = bip341.precompute(a, t, outs) catch
+                return error.PrecomputeRefusedAnAcceptedTransaction;
+            const h2 = bip341.sighashWith(a, pre, t, idx, ht8, outs) catch
+                return error.PrecomputedSeamRefusedAnAcceptedInput;
+            if (!std.mem.eql(u8, &h, &h2)) return error.Bip341PrecomputedDiverged;
+        } else |_| {}
+    }
+}
+
+/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
+/// `options.corpus` plus one empty input, and an empty input makes every draw
+/// return its range minimum — a zero-length buffer that decodes to nothing.
+/// The first `smith.bytes` draw takes raw octets, so the seed's head is a
+/// transaction prefix; the words after it are kept small because `Smith`
+/// discards any word outside a draw's declared range.
+fn sighashSeed(comptime head: []const u8, comptime bits: u64, comptime n: usize) [n]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [n]u8 = undefined;
+    for (out[0..256], 0..) |*b, i| b.* = head[i % head.len];
+    var i: usize = 256;
+    var w: u6 = 0;
+    while (i + 8 <= n) : (i += 8) {
+        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x03, .little);
+        w +%= 1;
+    }
+    return out;
+}
+
+const sighash_seeds: []const []const u8 = &.{
+    // version 2, one input, one output, small scripts — a shape that decodes.
+    &sighashSeed(&[_]u8{
+        0x02, 0x00, 0x00, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33,
+        0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+        0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x00,
+        0x00, 0x00, 0x00, 0x02, 0x51, 0x52, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x10,
+        0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x51, 0x51, 0x00, 0x00,
+        0x00, 0x00,
+    }, 0x9E37_79B9_7F4A_7C15, 512),
+    &sighashSeed(&[_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 }, 0x0123_4567_89AB_CDEF, 512),
+    &sighashSeed(&[_]u8{ 0x01, 0x00, 0x00, 0x00, 0x02 }, 0xF0E1_D2C3_B4A5_9687, 512),
+    &sighashSeed(&[_]u8{0xFF}, 0xFFFF_FFFF_FFFF_FFFF, 512),
+};

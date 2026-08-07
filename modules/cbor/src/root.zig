@@ -654,6 +654,88 @@ test "decode does not leak on error paths with a non-arena allocator" {
     );
 }
 
+// ── the fuzz harness that can see a leak, and can see depth ────────────────
+//
+// W2 A3 (F5) recorded that the module's only harness lived in `kat_test.zig`,
+// capped its input at 512 octets and ran `decode` against an `ArenaAllocator`.
+// Both halves of that hid something. The arena hid the whole class the test
+// above was written for — with an arena, an `errdefer` that stops freeing is
+// invisible, because the arena frees it anyway. And a corpus of arbitrary
+// octets essentially never spells a container nesting more than a handful of
+// levels deep, so the depth guard, and the unwinding of a *deep* partially
+// built tree, were unreachable however long the harness ran.
+//
+// This harness fixes both: `std.testing.allocator` (the fuzz runner checks it
+// for leaks after every single input, and `freeValue` is in scope here, which
+// is why the harness lives in this file rather than beside the other one), and
+// a generator that emits nesting on purpose.
+test "fuzz: decode releases every allocation it made, whatever the input" {
+    try std.testing.fuzz({}, fuzzDecodeNoLeak, .{ .corpus = cbor_seeds });
+}
+
+fn fuzzDecodeNoLeak(_: void, smith: *std.testing.Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const input = buildNested(smith, &buf);
+    const a = std.testing.allocator;
+    // The depth cap is drawn too, so the boundary is approached from both
+    // sides rather than only from far below a fixed 64.
+    const opts = DecodeOptions{ .max_depth = smith.valueRangeAtMost(u32, 1, 96) };
+    const v = decode(a, input, opts) catch return;
+    freeValue(a, v);
+}
+
+/// Either arbitrary octets, or a run of container headers with an arbitrary
+/// tail — `81` (array(1)), `9f` (indefinite array), `a1` (map(1)) and `c1`
+/// (tag), the four openers whose bodies allocate and therefore have something
+/// to leak when the item inside them turns out to be malformed.
+fn buildNested(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    const opener: u8 = switch (smith.valueRangeAtMost(u8, 0, 4)) {
+        0 => {
+            smith.bytes(buf);
+            return buf[0..smith.valueRangeAtMost(u16, 0, @intCast(buf.len))];
+        },
+        1 => 0x81,
+        2 => 0x9f,
+        3 => 0xa1,
+        else => 0xc1,
+    };
+    const depth: usize = smith.valueRangeAtMost(u16, 0, 200);
+    var n: usize = @min(depth, buf.len);
+    @memset(buf[0..n], opener);
+    var tail: [96]u8 = undefined;
+    smith.bytes(&tail);
+    const tail_len = @min(@as(usize, smith.valueRangeAtMost(u8, 0, tail.len)), buf.len - n);
+    @memcpy(buf[n..][0..tail_len], tail[0..tail_len]);
+    n += tail_len;
+    return buf[0..n];
+}
+
+/// See `iec61850/src/goose.zig` for the reasoning: without `--fuzz` the runner
+/// feeds only `options.corpus` plus one empty input, and an empty input makes
+/// every draw return its range minimum — mode 0, length 0, nothing decoded.
+/// `Smith` reads one little-endian `u64` per scalar draw and discards any word
+/// that falls outside that draw's range, so the words are kept small.
+fn cborSeed(comptime first_word: u64, comptime bits: u64, comptime n: usize) [n]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [n]u8 = undefined;
+    std.mem.writeInt(u64, out[0..8], first_word, .little);
+    var i: usize = 8;
+    var w: u6 = 0;
+    while (i + 8 <= n) : (i += 8) {
+        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x7F, .little);
+        w +%= 1;
+    }
+    return out;
+}
+
+const cbor_seeds: []const []const u8 = &.{
+    &cborSeed(1, 0x9E37_79B9_7F4A_7C15, 256), // array(1) nesting
+    &cborSeed(2, 0x0123_4567_89AB_CDEF, 256), // indefinite arrays
+    &cborSeed(3, 0xF0E1_D2C3_B4A5_9687, 256), // map(1) nesting
+    &cborSeed(4, 0x6C62_1F4D_3A98_5E27, 256), // tag nesting
+    &cborSeed(0, 0xD5B8_0E93_C741_A26F, 256), // arbitrary octets
+};
+
 test "smoke: encode/decode round-trip a small map" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);

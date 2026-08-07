@@ -201,6 +201,168 @@ fn fuzzInsert(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+// ── fuzz: the SNP surface — the half `fuzzInsert` structurally cannot reach ───
+//
+// W2 A3 (F8) recorded that `insert` was the only fuzzed entry point, and that
+// `reconcileCsnp` / `reconcilePsnp` / `summarise` — the whole SNP attack
+// surface, and where this module's own CRIT lived — had never been fuzzed.
+// The obstacle is a type, not a budget: `reconcileCsnp` takes an `isis.Csnp`,
+// i.e. a PDU that has already decoded, and arbitrary octets do not decode into
+// one (an 0x83 discriminator, the right PDU type, a length field that agrees,
+// and a TLV region that walks). So the harness builds real CSNP/PSNP PDUs with
+// the fuzzer choosing the parts a hostile neighbour chooses — the summary
+// range, the LSP-Entry records, and a tail of arbitrary octets in the TLV
+// region — and puts them through the wire codec before the store sees them.
+test "fuzz: hostile CSNP/PSNP bytes never panic, and never grow the store past capacity" {
+    try std.testing.fuzz({}, fuzzSnp, .{ .corpus = snp_seeds });
+}
+
+const fuzz_capacity: usize = 16;
+
+/// Flips up to three octets inside the TLV region of an already-built SNP,
+/// leaving the fixed header intact so the PDU still decodes and the damage
+/// lands where the TLV walk has to cope with it.
+fn damageTlvRegion(smith: *std.testing.Smith, pdu_bytes: []u8, fixed_len: usize) void {
+    if (pdu_bytes.len <= fixed_len) return;
+    const n = smith.valueRangeAtMost(u8, 0, 3);
+    var i: u8 = 0;
+    while (i < n) : (i += 1) {
+        const at = fixed_len + smith.index(pdu_bytes.len - fixed_len);
+        pdu_bytes[at] ^= smith.valueRangeAtMost(u8, 1, 255);
+    }
+}
+
+fn fuzzSnp(_: void, smith: *std.testing.Smith) !void {
+    var db = Lsdb.init(testing.allocator, .{
+        .local_system_id = sys_a,
+        .interface_count = 2,
+        .capacity = fuzz_capacity,
+    });
+    defer db.deinit();
+
+    // A few real LSPs, so the reconcile has something to compare against and
+    // the completeness sweep has in-range entries to mark. An empty database
+    // makes every SNP path a no-op — which is how this surface stays "covered"
+    // while testing nothing.
+    var lbuf: [128]u8 = undefined;
+    const n_lsps = smith.valueRangeAtMost(u8, 0, 4);
+    var k: u8 = 0;
+    while (k < n_lsps) : (k += 1) {
+        const sys: [6]u8 = .{ 0x00, 0x00, 0x00, 0x00, 0x00, smith.value(u8) };
+        _ = db.insert(
+            buildLsp(&lbuf, sys, smith.value(u8), smith.valueRangeAtMost(u32, 1, 8), smith.value(u16)),
+            null,
+            0,
+        ) catch {};
+    }
+    const seeded = db.count();
+
+    // The SNP's own TLV region: LSP-Entry records the fuzzer chooses, then an
+    // arbitrary tail, so both the well-formed and the malformed walk are
+    // driven. `reconcileCsnp` skips its completeness sweep when the walk hits
+    // malformed bytes, and that branch is only reachable with the tail.
+    var entries: [8]isis.tlvs.LspEntry = undefined;
+    const n_entries = smith.valueRangeAtMost(u8, 0, entries.len);
+    for (entries[0..n_entries]) |*e| {
+        e.* = .{
+            .remaining_lifetime = smith.value(u16),
+            .lsp_id = .{
+                0,               0,               0,               0, 0,
+                smith.value(u8), smith.value(u8), smith.value(u8),
+            },
+            .sequence_number = smith.valueRangeAtMost(u32, 0, 8),
+            .checksum = smith.value(u16),
+        };
+    }
+    // An extra, unmodelled TLV, then a few byte flips confined to the TLV
+    // region: `reconcileCsnp` skips its completeness sweep when the walk hits
+    // malformed bytes, and that branch is only reachable if the walk can
+    // actually break. The fixed header is left alone so the PDU still decodes.
+    var extra: [48]u8 = undefined;
+    smith.bytes(&extra);
+    const extra_len = smith.valueRangeAtMost(u8, 0, extra.len);
+    const extra_code = smith.value(u8);
+
+    const start_lsp_id: LspId = .{
+        0, 0, 0, 0, 0, smith.value(u8), smith.value(u8), smith.value(u8),
+    };
+    const end_lsp_id: LspId = .{
+        0, 0, 0, 0, 0, smith.value(u8), smith.value(u8), smith.value(u8),
+    };
+    const iface = smith.valueRangeAtMost(u8, 0, 1);
+    const now: Time = smith.value(u16);
+
+    var wire: [512]u8 = undefined;
+    if (smith.value(bool)) {
+        var cb = isis.pdu.CsnpBuilder.init(&wire, .{
+            .source_id = .{ 0, 0, 0, 0, 0, smith.value(u8), 0 },
+            .start_lsp_id = start_lsp_id,
+            .end_lsp_id = end_lsp_id,
+        }) catch return;
+        isis.tlvs.addLspEntries(&cb.tlvs, entries[0..n_entries]) catch {};
+        cb.tlvs.addTlv(extra_code, extra[0..extra_len]) catch {};
+        const len = cb.finish().len;
+        damageTlvRegion(smith, wire[0..len], isis.pdu.csnp_fixed_len);
+        const csnp = isis.Csnp.decode(wire[0..len]) catch return;
+        db.reconcileCsnp(csnp, iface, now);
+    } else {
+        var pb = isis.pdu.PsnpBuilder.init(&wire, .{
+            .source_id = .{ 0, 0, 0, 0, 0, smith.value(u8), 0 },
+        }) catch return;
+        isis.tlvs.addLspEntries(&pb.tlvs, entries[0..n_entries]) catch {};
+        pb.tlvs.addTlv(extra_code, extra[0..extra_len]) catch {};
+        const len = pb.finish().len;
+        damageTlvRegion(smith, wire[0..len], isis.pdu.psnp_fixed_len);
+        const psnp = isis.Psnp.decode(wire[0..len]) catch return;
+        db.reconcilePsnp(psnp, iface, now);
+    }
+
+    // The DoS bound is the property an unauthenticated SNP threatens: entries
+    // requesting LSPs we lack become request placeholders, and those must stay
+    // inside the configured capacity no matter what the neighbour sends.
+    if (db.count() > fuzz_capacity) return error.CapacityExceeded;
+    if (db.count() < seeded) return error.ReconcileDroppedRealLsps;
+
+    // `summarise` on the same store: the caller's buffer bounds it, every
+    // entry it returns lies in the requested range, and the result is sorted.
+    var out: [6]isis.tlvs.LspEntry = undefined;
+    const want = smith.valueRangeAtMost(u8, 0, out.len);
+    const n = db.summarise(out[0..want], start_lsp_id, end_lsp_id, now);
+    if (n > want) return error.SummariseOverranBuffer;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (std.mem.order(u8, &out[i].lsp_id, &start_lsp_id) == .lt) return error.SummariseBelowRange;
+        if (std.mem.order(u8, &out[i].lsp_id, &end_lsp_id) == .gt) return error.SummariseAboveRange;
+        if (i > 0 and std.mem.order(u8, &out[i - 1].lsp_id, &out[i].lsp_id) != .lt)
+            return error.SummariseNotSorted;
+    }
+}
+
+/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
+/// `options.corpus` plus one empty input, and an empty input makes every draw
+/// return its range minimum — an empty database and an empty SNP. `Smith`
+/// reads one little-endian `u64` per scalar draw and discards a word outside
+/// that draw's range, so the words are kept small.
+fn snpSeed(comptime bits: u64, comptime n: usize) [n]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [n]u8 = undefined;
+    var i: usize = 0;
+    var w: u6 = 0;
+    while (i + 8 <= n) : (i += 8) {
+        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x03, .little);
+        w +%= 1;
+    }
+    @memset(out[i..], 0);
+    return out;
+}
+
+const snp_seeds: []const []const u8 = &.{
+    &snpSeed(0x9E37_79B9_7F4A_7C15, 512),
+    &snpSeed(0x0123_4567_89AB_CDEF, 512),
+    &snpSeed(0xF0E1_D2C3_B4A5_9687, 512),
+    &snpSeed(0xFFFF_FFFF_FFFF_FFFF, 512),
+};
+
 test {
     std.testing.refAllDecls(@This());
     _ = @import("compare.zig");

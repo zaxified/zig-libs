@@ -1047,6 +1047,189 @@ fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
     _ = ocsp.parseResponse(buf[0..len]) catch return;
 }
 
+// ── fuzz: the parsers behind `verify`, which the harness above cannot reach ──
+//
+// W2 A3 (F5) recorded that `fuzzParseResponse` was the module's only harness,
+// and that a 90-second coverage-guided window over it never entered `verify`
+// at all. The obstacle is structural, not statistical: `verify` takes an
+// already-parsed `Response`, and reaching one means a corpus of arbitrary
+// octets first has to spell a complete DER `OCSPResponse` — nested SEQUENCEs,
+// an ENUMERATED status, the `id-pkix-ocsp-basic` OID, an OCTET STRING wrapper
+// — which it never does. So `resolveDelegate`'s walk over `certs [0]`, the
+// `parseCert` structure walk it runs on each embedded responder certificate,
+// `findMatchingSingle`/`parseSingleTail`/`parseRevoked`, and
+// `hasOcspSigningEku` had never been handed a hostile byte, even though every
+// one of them consumes bytes a MITM chose.
+//
+// The fixture below is a *delegated* response, so `certs [0]` is populated and
+// the delegate path is on by default rather than by luck. The fuzzer then
+// chooses where to damage it: the response (which the signature covers end to
+// end), the caller's issuer or subject certificate, or — the direct route into
+// `parseCert` — arbitrary octets where a certificate is expected.
+//
+// Two of the assertions are there to keep the harness honest rather than to
+// find a bug: on the iterations that damage nothing, the fixture MUST still
+// verify `.good` and `.delegated`. A harness that stops reaching `verify` (a
+// fixture that rots, an option that drifts) then fails loudly instead of
+// quietly reporting "no crashes" forever.
+
+const VerifyFuzzCtx = struct {
+    response: []const u8,
+    issuer: []const u8,
+    subject: []const u8,
+};
+
+test "fuzz: verify's certificate and delegate parsers on damaged input" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    var prng = std.Random.DefaultPrng.init(0xf0e1d2c3);
+    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
+        .common_name = "fuzz delegated responder",
+        .serial = 9,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = false,
+    });
+    defer gpa.free(delegate_self);
+    const dbits = try extractBits(delegate_self);
+    const delegate_cert = try buildDelegateCert(
+        gpa,
+        fx.kp.secret_key,
+        issuer.subject_name,
+        try spkiOf(delegate_self),
+        dbits.subject_name,
+        .ocsp_signing,
+    );
+    defer gpa.free(delegate_cert);
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = dbits.subject_name,
+        .certs = delegate_cert,
+        .sign_rsa = dkp.secret_key,
+    });
+    defer gpa.free(resp_der);
+
+    // Positive control, before a single fuzz input runs: without this, every
+    // "no crash" below could be reporting on a fixture that stopped verifying.
+    const control = try ocsp.verify(
+        try ocsp.parseResponse(resp_der),
+        fx.issuer_der,
+        fx.subject_der,
+        defaultOpts(),
+    );
+    try testing.expect(control.status == .good);
+    try testing.expect(control.delegated);
+
+    const ctx = VerifyFuzzCtx{
+        .response = resp_der,
+        .issuer = fx.issuer_der,
+        .subject = fx.subject_der,
+    };
+    try testing.fuzz(&ctx, fuzzVerify, .{ .corpus = verify_seeds });
+}
+
+/// Flips between one and four octets, then reports whether the buffer actually
+/// differs from the original — two flips of the same octet can cancel, and an
+/// "it was mutated" flag that is not measured is how a false positive gets
+/// into a security assertion.
+fn damage(smith: *std.testing.Smith, buf: []u8, original: []const u8) bool {
+    if (buf.len == 0) return false;
+    const n = smith.valueRangeAtMost(u8, 1, 4);
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        const at = smith.index(buf.len);
+        buf[at] ^= smith.valueRangeAtMost(u8, 1, 255);
+    }
+    return !std.mem.eql(u8, buf, original);
+}
+
+fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
+    var rbuf: [4096]u8 = undefined;
+    var ibuf: [2048]u8 = undefined;
+    var sbuf: [2048]u8 = undefined;
+    if (ctx.response.len > rbuf.len or ctx.issuer.len > ibuf.len or ctx.subject.len > sbuf.len)
+        return error.FixtureLargerThanHarnessBuffers;
+    @memcpy(rbuf[0..ctx.response.len], ctx.response);
+    @memcpy(ibuf[0..ctx.issuer.len], ctx.issuer);
+    @memcpy(sbuf[0..ctx.subject.len], ctx.subject);
+    const resp = rbuf[0..ctx.response.len];
+    var iss: []const u8 = ibuf[0..ctx.issuer.len];
+    var subj: []const u8 = sbuf[0..ctx.subject.len];
+
+    const mode = smith.valueRangeAtMost(u8, 0, 4);
+    var response_damaged = false;
+    switch (mode) {
+        0 => {}, // untouched — the positive control
+        1 => response_damaged = damage(smith, resp, ctx.response),
+        2 => _ = damage(smith, ibuf[0..ctx.issuer.len], ctx.issuer),
+        3 => _ = damage(smith, sbuf[0..ctx.subject.len], ctx.subject),
+        else => {
+            // Arbitrary octets where a certificate is expected: the direct
+            // route into `parseCert`'s structure walk.
+            smith.bytes(&ibuf);
+            smith.bytes(&sbuf);
+            iss = ibuf[0..smith.valueRangeAtMost(u16, 0, 1024)];
+            subj = sbuf[0..smith.valueRangeAtMost(u16, 0, 1024)];
+        },
+    }
+
+    const opts: ocsp.VerifyOptions = if (mode == 0) defaultOpts() else .{
+        .now_unix = smith.value(i32),
+        .max_age_seconds = smith.value(u16),
+        .expected_nonce = null,
+    };
+
+    const parsed = ocsp.parseResponse(resp) catch {
+        if (mode != 1) return error.UndamagedFixtureNoLongerParses;
+        return;
+    };
+    const verdict = ocsp.verify(parsed, iss, subj, opts) catch {
+        if (mode == 0) return error.UndamagedFixtureRejected;
+        return;
+    };
+    if (mode == 0) {
+        if (verdict.status != .good) return error.UndamagedFixtureNotGood;
+        if (!verdict.delegated) return error.UndamagedFixtureNotDelegated;
+    }
+    // Every octet of this response is either inside the signed
+    // `tbsResponseData`, inside the signature over it, or in the wrapper that
+    // names the two — so a response altered anywhere must not verify.
+    if (response_damaged) return error.DamagedResponseAccepted;
+}
+
+/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
+/// `options.corpus` plus one empty input, and an empty input makes every draw
+/// return its range minimum — mode 0 forever. `Smith` reads one little-endian
+/// `u64` per scalar draw and discards a word outside that draw's range, so the
+/// words are kept small; the leading word selects the mode.
+fn verifySeed(comptime mode: u64, comptime bits: u64, comptime n: usize) [n]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [n]u8 = undefined;
+    std.mem.writeInt(u64, out[0..8], mode, .little);
+    var i: usize = 8;
+    var w: u6 = 0;
+    while (i + 8 <= n) : (i += 8) {
+        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0xFF, .little);
+        w +%= 1;
+    }
+    return out;
+}
+
+const verify_seeds: []const []const u8 = &.{
+    &verifySeed(0, 0x9E37_79B9_7F4A_7C15, 128), // the positive control
+    &verifySeed(1, 0x0123_4567_89AB_CDEF, 128), // damage the response
+    &verifySeed(2, 0xF0E1_D2C3_B4A5_9687, 128), // damage the issuer cert
+    &verifySeed(3, 0x6C62_1F4D_3A98_5E27, 128), // damage the subject cert
+    &verifySeed(4, 0xD5B8_0E93_C741_A26F, 128), // arbitrary octets as certs
+};
+
 /// Extract the SubjectPublicKeyInfo TLV bytes from a certificate.
 fn spkiOf(cert: []const u8) ![]const u8 {
     const c = try elem(cert, 0);

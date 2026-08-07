@@ -287,3 +287,105 @@ test "e2e tapscript: exceeding the sigops/validation-weight budget fails closed"
     // rejected outright.
     try testing.expectError(error.TapscriptValidationWeight, verify.verifyScript(a, &.{}, &s.script_pubkey, &witness, consensus_taproot, s.ctx));
 }
+
+// ── fuzz: the tapscript interpreter, behind a VALID taproot commitment ──────
+//
+// W2 A3 (F6) recorded that `evalTapscript` was unreachable from
+// `verify.zig`'s harness by arbitrary bytes at all, and the reason is a
+// cryptographic gate rather than a shallow one: reaching it needs a witness
+// whose control block and leaf script hash, through `tapleafHash` and
+// `hash_TapTweak`, to exactly the 32-octet witness program in the
+// scriptPubKey. A fuzzer does not invent a taproot commitment, so
+// `verifyTaprootScriptPath` returned `TaprootCommitmentMismatch` on every
+// input and the BIP342 interpreter — `OP_CHECKSIGADD`, the validation-weight
+// budget, the extended stack limits, the `OP_SUCCESSx` pre-scan — was never
+// executed by the fuzzer even once.
+//
+// This harness builds the commitment for whatever leaf script the fuzzer
+// chose, using the same `buildSingleLeaf` the tests above use, so the script
+// under evaluation is attacker-chosen while the framing around it is real.
+test "fuzz: tapscript leaf evaluation, with the commitment built for the leaf" {
+    try std.testing.fuzz({}, fuzzTapscriptLeaf, .{ .corpus = tapscript_seeds });
+}
+
+fn fuzzTapscriptLeaf(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A leaf script the fuzzer chooses, biased toward real opcodes so the
+    // dispatch table is exercised instead of dying on the first undefined one.
+    var script_buf: [256]u8 = undefined;
+    const script_len: usize = smith.valueRangeAtMost(u8, 0, script_buf.len - 1);
+    for (script_buf[0..script_len]) |*b| {
+        b.* = if (smith.valueRangeAtMost(u8, 0, 5) != 0)
+            smith.valueRangeAtMost(u8, 0, 0xba)
+        else
+            smith.value(u8);
+    }
+    const script = script_buf[0..script_len];
+
+    const internal = keypair(smith.value(u8)) catch return;
+    const s = buildSingleLeaf(a, internal.x, script) catch return;
+
+    // The initial stack: what a spender puts under the script, plus the two
+    // trailing items BIP341 requires (script, control block).
+    var stack_bufs: [3][72]u8 = undefined;
+    var witness: [5][]const u8 = undefined;
+    const n_stack = smith.valueRangeAtMost(u8, 0, 3);
+    var i: u8 = 0;
+    while (i < n_stack) : (i += 1) {
+        smith.bytes(&stack_bufs[i]);
+        witness[i] = stack_bufs[i][0..smith.valueRangeAtMost(u8, 0, stack_bufs[i].len)];
+    }
+    witness[n_stack] = script;
+    // A control block the fuzzer may damage: an intact one commits (so the
+    // leaf runs), a damaged one must be refused rather than mis-evaluated.
+    var cb: [33]u8 = s.control_block;
+    const cb_damaged = smith.value(bool);
+    if (cb_damaged) cb[smith.index(cb.len)] ^= smith.valueRangeAtMost(u8, 1, 255);
+    witness[n_stack + 1] = &cb;
+
+    var f = consensus_taproot;
+    inline for (@typeInfo(ScriptFlags).@"struct".fields) |fld| {
+        if (fld.type == bool and comptime std.mem.startsWith(u8, fld.name, "discourage_"))
+            @field(f, fld.name) = smith.value(bool);
+    }
+
+    const r = verify.verifyScript(a, &.{}, &s.script_pubkey, witness[0 .. n_stack + 2], f, s.ctx);
+    if (!cb_damaged) {
+        // The commitment was built for this exact leaf, so the one verdict
+        // that must never come back is "the commitment does not match" — that
+        // is the wall this harness exists to get past, and if it ever returns
+        // the harness has silently stopped reaching the interpreter.
+        if (r) |_| {} else |e| switch (e) {
+            error.TaprootCommitmentMismatch, error.TaprootWrongControlSize => return e,
+            else => {},
+        }
+    } else {
+        _ = r catch {};
+    }
+}
+
+/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
+/// `options.corpus` plus one empty input, and an empty input makes every draw
+/// return its range minimum — an empty leaf script and an empty stack.
+fn tapscriptSeed(comptime bits: u64, comptime n: usize) [n]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [n]u8 = undefined;
+    var i: usize = 0;
+    var w: u6 = 0;
+    while (i + 8 <= n) : (i += 8) {
+        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x0F, .little);
+        w +%= 1;
+    }
+    @memset(out[i..], 0);
+    return out;
+}
+
+const tapscript_seeds: []const []const u8 = &.{
+    &tapscriptSeed(0x9E37_79B9_7F4A_7C15, 512),
+    &tapscriptSeed(0x0123_4567_89AB_CDEF, 512),
+    &tapscriptSeed(0xF0E1_D2C3_B4A5_9687, 512),
+    &tapscriptSeed(0x6C62_1F4D_3A98_5E27, 512),
+};

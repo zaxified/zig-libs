@@ -80,6 +80,13 @@ pub const RequestError = error{
     NotConnected,
     SystemResources,
     Unexpected,
+    /// **W2 audit finding, campaign C-06 (`nl80211` F5)**: `Dump.next`/
+    /// `awaitAck` looped on `recvDatagram` with no upper bound. A peer that
+    /// never sends `NLMSG_DONE`/a matching ACK — a kernel bug, or (this
+    /// module was worst-of-four here: it neither forwarded
+    /// `setRecvTimeout` nor exposed the command socket's fd) anything else
+    /// able to answer on this socket — hung the caller forever.
+    TooManyMessages,
 };
 
 pub const OpenError = genl.OpenError || genl.ResolveError;
@@ -495,19 +502,55 @@ pub const Nl80211 = struct {
     }
 
     fn awaitAck(cl: *Nl80211, seq: u32) RequestError!void {
-        while (true) {
-            const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != cl.sock.portid or m.seq != seq) continue;
-                if (m.type != codec.NLMSG_ERROR) continue;
-                const code = m.errorCode() catch return error.MalformedReply;
-                if (code == 0) return; // ACK
-                return errnoToError(code);
-            }
-        }
+        return awaitAckStep(cl, seq);
+    }
+
+    /// Bound how long a `recvDatagram` on the command socket may block
+    /// (`SO_RCVTIMEO`); 0 restores the default of blocking forever. Belt and
+    /// braces alongside `max_dump_messages`: the message budget bounds a
+    /// peer that keeps talking without ever sending `NLMSG_DONE`/an ACK, this
+    /// bounds a peer that stops talking entirely. **W2 audit finding,
+    /// campaign C-06 (`nl80211` F5)**: this wrapper did not exist before —
+    /// the underlying `genetlink.Socket.setRecvTimeout` was reachable only
+    /// by reaching into the `sock` field directly, which is exactly the gap
+    /// the sibling `ethtool`/`conntrack` clients do not have (they wrap it).
+    pub fn setRecvTimeout(cl: *Nl80211, millis: u32) error{Unexpected}!void {
+        return cl.sock.setRecvTimeout(millis);
+    }
+
+    /// The raw command-socket file descriptor, for poll/epoll integration —
+    /// same reason `EventSocket.fd` exists. Do not close it; `close` is.
+    pub fn fd(cl: *const Nl80211) i32 {
+        return cl.sock.fd;
     }
 };
+
+/// Ceiling on how many netlink messages one `Dump`/`awaitAck` scan may
+/// consume before giving up. See the sibling `ethtool`/`devlink` clients'
+/// identical constant for the full rationale: the kernel is the only
+/// verified sender on this socket, so this is a robustness ceiling against a
+/// malfunctioning driver, not an attacker-facing bound.
+const max_dump_messages: u32 = 65536;
+
+/// The body of `Nl80211.awaitAck`, factored out the same way `dumpStep` is —
+/// `cl` need only look like `*Nl80211` for `cl.sock.recvDatagram()` /
+/// `cl.sock.portid`.
+fn awaitAckStep(cl: anytype, seq: u32) RequestError!void {
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_dump_messages) return error.TooManyMessages;
+        const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            if (m.pid != cl.sock.portid or m.seq != seq) continue;
+            if (m.type != codec.NLMSG_ERROR) continue;
+            const code = m.errorCode() catch return error.MalformedReply;
+            if (code == 0) return; // ACK
+            return errnoToError(code);
+        }
+    }
+}
 
 fn recvErr(e: genl.RecvError) RequestError {
     return switch (e) {
@@ -526,47 +569,66 @@ pub const DumpMessage = struct {
 };
 
 /// Walks a multi-part reply, hiding datagram boundaries. Terminates on
-/// `NLMSG_DONE` (a dump) or on the ACK (a single-shot request).
+/// `NLMSG_DONE` (a dump), on the ACK (a single-shot request), or on
+/// `error.TooManyMessages` once `max_dump_messages` is exceeded.
 const Dump = struct {
     cl: *Nl80211,
     seq: u32,
     it: codec.MessageIterator = .{ .buf = &.{} },
     finished: bool = false,
+    msgs: u32 = 0,
 
     fn next(w: *Dump) RequestError!?DumpMessage {
-        while (true) {
-            if (w.finished) return null;
-            const maybe = w.it.next() catch return error.MalformedReply;
-            const m = maybe orelse {
-                const dgram = w.cl.sock.recvDatagram() catch |e| return recvErr(e);
-                w.it = .{ .buf = dgram };
-                continue;
-            };
-            if (m.pid != w.cl.sock.portid or m.seq != w.seq) continue;
-            switch (m.type) {
-                codec.NLMSG_DONE => {
-                    w.finished = true;
-                    return null;
-                },
-                codec.NLMSG_ERROR => {
-                    const code = m.errorCode() catch return error.MalformedReply;
-                    if (code != 0) return errnoToError(code);
-                    // A zero-error message is the ACK of a non-dump request:
-                    // everything that was going to arrive has arrived.
-                    w.finished = true;
-                    return null;
-                },
-                codec.NLMSG_NOOP => continue,
-                codec.NLMSG_OVERRUN => return error.SystemResources,
-                else => {
-                    if (m.type != w.cl.family_id) continue;
-                    const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
-                    return .{ .cmd = p.cmd, .attrs = p.attrs };
-                },
-            }
-        }
+        return dumpStep(w.cl, w.seq, &w.it, &w.finished, &w.msgs);
     }
 };
+
+/// The body of `Dump.next`, factored out so a mock transport can drive it in
+/// tests without a real socket (same technique as the sibling `conntrack`
+/// module's `dumpOver` and `ethtool`'s `walkStep`). `cl` need only look like
+/// `*Nl80211` for the fields this loop touches: `cl.sock.recvDatagram()`,
+/// `cl.sock.portid`, `cl.family_id`.
+fn dumpStep(
+    cl: anytype,
+    seq: u32,
+    it: *codec.MessageIterator,
+    finished: *bool,
+    msgs: *u32,
+) RequestError!?DumpMessage {
+    while (true) {
+        if (finished.*) return null;
+        const maybe = it.next() catch return error.MalformedReply;
+        const m = maybe orelse {
+            if (msgs.* >= max_dump_messages) return error.TooManyMessages;
+            const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
+            msgs.* += 1;
+            it.* = .{ .buf = dgram };
+            continue;
+        };
+        if (m.pid != cl.sock.portid or m.seq != seq) continue;
+        switch (m.type) {
+            codec.NLMSG_DONE => {
+                finished.* = true;
+                return null;
+            },
+            codec.NLMSG_ERROR => {
+                const code = m.errorCode() catch return error.MalformedReply;
+                if (code != 0) return errnoToError(code);
+                // A zero-error message is the ACK of a non-dump request:
+                // everything that was going to arrive has arrived.
+                finished.* = true;
+                return null;
+            },
+            codec.NLMSG_NOOP => continue,
+            codec.NLMSG_OVERRUN => return error.SystemResources,
+            else => {
+                if (m.type != cl.family_id) continue;
+                const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
+                return .{ .cmd = p.cmd, .attrs = p.attrs };
+            },
+        }
+    }
+}
 
 // ── the event socket ───────────────────────────────────────────────────────
 
@@ -825,6 +887,68 @@ test "parseEvent: malformed attributes are typed errors" {
 
 test "fuzz: event parsing never crashes" {
     try testing.fuzz({}, fuzzEvent, .{});
+}
+
+// ── C-06 regression: the dump/ACK loops must not spin forever ──────────────
+// W2-nn (`nl80211` F5, campaign C-06): `Dump.next` and `awaitAck` looped on
+// `recvDatagram` with no upper bound, so a peer that never sends
+// `NLMSG_DONE`/a matching ACK hangs the caller forever. `dumpStep` was
+// factored out of `Dump.next` precisely so a scripted stand-in can drive it
+// here, the same technique the sibling `conntrack` module's
+// `ScriptedTransport` uses for `dumpOver`.
+
+/// Hands back the same never-matching datagram forever.
+const MockSock = struct {
+    portid: u32,
+    datagram: []const u8,
+
+    fn recvDatagram(self: *MockSock) genl.RecvError![]const u8 {
+        return self.datagram;
+    }
+};
+
+const MockNl80211 = struct {
+    sock: MockSock,
+    family_id: u16,
+};
+
+/// One message with `NLM_F_MULTI` set and a type that never matches
+/// `family_id`, so `Dump`'s `else` arm skips it and asks for another
+/// datagram — forever, absent a budget.
+fn nonTerminatingDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, family_id: u16) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, family_id +% 1, codec.NLM_F_MULTI, seq, pid);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+test "Dump.next errors out instead of looping forever on a never-DONE reply" {
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    const dgram = try nonTerminatingDatagram(testing.allocator, pid, seq, family_id);
+    defer testing.allocator.free(dgram);
+
+    var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    var msgs: u32 = 0;
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &it, &finished, &msgs));
+    try testing.expectEqual(max_dump_messages, msgs);
+}
+
+test "awaitAck errors out instead of looping forever on a never-matching reply" {
+    // pid/seq deliberately do NOT match, so awaitAckStep's `continue`
+    // (not a type mismatch) is what keeps asking for another datagram.
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    const dgram = try nonTerminatingDatagram(testing.allocator, pid + 1, seq + 1, family_id);
+    defer testing.allocator.free(dgram);
+
+    var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
+    try testing.expectError(error.TooManyMessages, awaitAckStep(&cl, seq));
 }
 
 fn fuzzEvent(_: void, smith: *std.testing.Smith) !void {

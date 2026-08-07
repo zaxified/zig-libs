@@ -676,11 +676,68 @@ fn fuzzDispatch(_: void, input: []const u8) anyerror!void {
     try iec_node.init(.{ .common_address = 47 }, &points, &iec_frames, &iec_queue, .{});
     const iec_id = try f.addNode(.{ .node = iec_node.node(), .tick_period_ms = 500 });
 
+    // W2 A3 (F3) recorded that only these three of the module's eight adapters
+    // were fuzzed, so `dnp3`, `enip` and `bacnet` — all three of which a
+    // `serveTcp`/`serveUdp` run exposes to a real socket, i.e. to whatever a
+    // peer sends — had no fuzz coverage at all despite being reachable the
+    // same way. Nothing structural was in the way; the adapter list simply
+    // stopped at three. The three below are stack-allocated, so adding them
+    // costs the harness nothing per iteration.
+    //
+    // `opcua` is the one deliberate omission: an `OpcuaNode` needs a
+    // `NodeStore` with the standard node set plus a 64 KiB receive buffer and
+    // a 256 KiB message buffer, built per node. Constructing that on every
+    // fuzz input would dominate the harness's own cost, and sharing one across
+    // inputs would let a session table grow without bound over a long sweep.
+    // It needs its own harness with a shared fixture and a per-input reset —
+    // recorded here rather than bolted on badly.
+    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = true, .class = .class1 }} ** 4;
+    var events: [16]dnp3.outstation.Event = undefined;
+    var dnp_rx: [512]u8 = undefined;
+    var dnp_scratch: [512]u8 = undefined;
+    var dnp_tx: [2048]u8 = undefined;
+    var dnp_node: Dnp3Node = undefined;
+    dnp_node.init(
+        .{ .address = 1024, .master_address = 1 },
+        .{ .binary_inputs = &binaries },
+        dnp3.outstation.EventBuffer.init(&events),
+        &dnp_rx,
+        &dnp_scratch,
+        &dnp_tx,
+    );
+    const dnp_id = try f.addNode(.{ .node = dnp_node.node() });
+
+    var tag_bytes = [_]u8{0} ** 16;
+    const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
+    var enip_node = EnipNode.init(.{}, &tags);
+    const enip_id = try f.addNode(.{ .node = enip_node.node() });
+
+    var ai_props = [_]bacnet.Property{
+        .{ .id = .object_name, .value = .{ .string = "AI 1" } },
+        .{ .id = .present_value, .value = .{ .real = 1.0 } },
+    };
+    var dev_props = [_]bacnet.Property{
+        .{ .id = .object_name, .value = .{ .string = "zig-fleetsim device" } },
+        .{ .id = .vendor_name, .value = .{ .string = "zig-libs" } },
+    };
+    var objects = [_]bacnet.Object{
+        .{ .id = .{ .type = .analog_input, .instance = 1 }, .properties = &ai_props },
+        .{ .id = .{ .type = .device, .instance = 260_001 }, .properties = &dev_props },
+    };
+    var bac_node: BacnetNode = undefined;
+    bac_node.init(
+        .{ .instance = 260_001, .vendor_id = 999 },
+        &objects,
+        .{ .ip = .{ 0, 0, 0, 0 }, .port = 47808 },
+        .{ .ip = .{ 0, 0, 0, 0 }, .port = 47808 },
+    );
+    const bac_id = try f.addNode(.{ .node = bac_node.node(), .tick_period_ms = 500 });
+
     // Every byte of the corpus becomes a frame boundary decision, a node choice
     // and a clock step, so the fuzzer explores dispatch, not just one parser.
     var pos: usize = 0;
     var t: Time = 0;
-    const ids = [_]NodeId{ mb_id, s7_id, iec_id };
+    const ids = [_]NodeId{ mb_id, s7_id, iec_id, dnp_id, enip_id, bac_id };
     while (pos < input.len) {
         const chunk_len = @min(@as(usize, input[pos]) + 1, input.len - pos);
         const chunk = input[pos..][0..chunk_len];
@@ -699,7 +756,7 @@ fn fuzzDispatch(_: void, input: []const u8) anyerror!void {
     try testing.expectEqual(f.opts.inflight_capacity, f.free_count);
 }
 
-test "fuzz: frame dispatch across three adapters survives arbitrary bytes" {
+test "fuzz: frame dispatch across six adapters survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzSmith, .{});
 }
 

@@ -474,36 +474,80 @@ fn fuzzScriptBytes(smith: *std.testing.Smith, buf: []u8) []u8 {
     return buf[0..len];
 }
 
+/// W2 A3 (F6) recorded two structural caps on this harness. The first was the
+/// flags: eight of `ScriptFlags`' twenty fields were drawn and the other twelve
+/// were always `false`, so `sigpushonly`, `minimalif`, `nullfail`,
+/// `const_scriptcode`, the four `discourage_*` policies and the two
+/// locktime-verify gates were never on. `inline for` over the struct closes
+/// that permanently — a flag added later is drawn without anyone remembering
+/// to come back here.
+fn fuzzFlags(smith: *std.testing.Smith) ScriptFlags {
+    var sf: ScriptFlags = .{};
+    inline for (@typeInfo(ScriptFlags).@"struct".fields) |f| {
+        if (f.type == bool) @field(sf, f.name) = smith.value(bool);
+    }
+    return sf;
+}
+
+/// The second cap was size: 64- and 96-octet buffers, against consensus limits
+/// of a 10 000-octet script, 201 executed opcodes and a 1000-element stack.
+/// None of those three could be approached, let alone crossed. Drawing ten
+/// kilobytes an iteration would cost the fuzzer most of its throughput for
+/// bytes the interpreter mostly just counts, so a long script is built as a
+/// fuzzer-chosen head followed by a run of one repeated opcode: that is what
+/// actually walks the opcode counter and the stack-depth counter up to their
+/// limits, and `OP_1`-style pushes cross the 1000-element bound.
+fn fuzzLongScript(smith: *std.testing.Smith, buf: []u8) []u8 {
+    const head_len: usize = @min(buf.len, smith.valueRangeAtMost(u8, 0, 64));
+    _ = fuzzScriptBytes(smith, buf[0..head_len]);
+    const filler: u8 = if (smith.value(bool))
+        smith.valueRangeAtMost(u8, 0x51, 0x60) // OP_1..OP_16: one stack element each
+    else
+        smith.valueRangeAtMost(u8, 0, 0xba);
+    // Both sides of every limit: just under, just over, and far over.
+    const total: usize = @min(buf.len, switch (smith.valueRangeAtMost(u8, 0, 5)) {
+        0 => head_len,
+        1 => 200,
+        2 => 202,
+        3 => 1001,
+        4 => 10_000,
+        else => smith.valueRangeAtMost(u16, 0, 10_001),
+    });
+    if (total > head_len) @memset(buf[head_len..total], filler);
+    return buf[0..@max(total, head_len)];
+}
+
 fn fuzzVerifyScript(_: void, smith: *std.testing.Smith) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var sig_buf: [64]u8 = undefined;
-    const script_sig = fuzzScriptBytes(smith, &sig_buf);
-    var pubkey_buf: [96]u8 = undefined;
-    const script_pubkey = fuzzScriptBytes(smith, &pubkey_buf);
+    var sig_buf: [10_001]u8 = undefined;
+    const script_sig = fuzzLongScript(smith, &sig_buf);
+    var pubkey_buf: [10_001]u8 = undefined;
+    const script_pubkey = fuzzLongScript(smith, &pubkey_buf);
 
     const n_witness = smith.valueRangeAtMost(u8, 0, 4);
-    var witness_bufs: [4][80]u8 = undefined;
+    var witness_bufs: [4][600]u8 = undefined;
     var witness_items: [4][]const u8 = undefined;
     var i: u8 = 0;
     while (i < n_witness) : (i += 1) {
-        smith.bytes(&witness_bufs[i]);
-        const wlen: usize = smith.valueRangeAtMost(u8, 0, witness_bufs[i].len);
+        // Up to 600 so the 520-octet per-element limit is reachable from both
+        // sides; the drawn prefix stays short and the rest is one repeated
+        // octet, for the same throughput reason as the scripts above.
+        const drawn: usize = smith.valueRangeAtMost(u8, 0, 64);
+        smith.bytes(witness_bufs[i][0..drawn]);
+        const wlen: usize = @max(drawn, switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            0 => drawn,
+            1 => 519,
+            2 => 521,
+            else => smith.valueRangeAtMost(u16, 0, 600),
+        });
+        if (wlen > drawn) @memset(witness_bufs[i][drawn..wlen], smith.value(u8));
         witness_items[i] = witness_bufs[i][0..wlen];
     }
 
-    const sf: ScriptFlags = .{
-        .p2sh = smith.value(bool),
-        .dersig = smith.value(bool),
-        .low_s = smith.value(bool),
-        .strictenc = smith.value(bool),
-        .cleanstack = smith.value(bool),
-        .witness = smith.value(bool),
-        .minimaldata = smith.value(bool),
-        .taproot = smith.value(bool),
-    };
+    const sf = fuzzFlags(smith);
 
     verifyScript(a, script_sig, script_pubkey, witness_items[0..n_witness], sf, dummyCtx()) catch return;
 }

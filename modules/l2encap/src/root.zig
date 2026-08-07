@@ -535,10 +535,36 @@ test "fuzz: decode never panics/OOBs on hostile bytes and stays within input bou
     try testing.fuzz({}, fuzzDecode, .{});
 }
 
+/// The largest frame this decoder can be handed on a real tunnel: a 9000-octet
+/// jumbo payload behind the 8-octet header. W2 A3 recorded that the harness
+/// used to cap the driven buffer at `header_len + 64` = 72 octets, because the
+/// length was drawn as a `u8` — so `decode` was never fuzzed at an ordinary
+/// 1500-octet Ethernet size, let alone a jumbo one. The bound is safe by
+/// construction (there is no length field; the payload is a subslice), but a
+/// harness that cannot reach the size cannot show it.
+const fuzz_max_frame: usize = header_len + 9000;
+
+/// Only the header region is drawn from the fuzzer. Filling nine kilobytes per
+/// iteration would cost far more than it buys: past the header every octet is
+/// opaque payload the decoder only ever *slices*, so what matters at size is
+/// the length, not the content.
+const fuzz_drawn: usize = header_len + 64;
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [header_len + 64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+    var buf: [fuzz_max_frame]u8 = undefined;
+    smith.bytes(buf[0..fuzz_drawn]);
+    // A size class rather than a uniform draw: a uniform length over the whole
+    // range would almost never land on the header boundary, which is where the
+    // interesting truncations are, and a `u8` draw never leaves it.
+    const len: usize = switch (smith.valueRangeAtMost(u8, 0, 5)) {
+        0 => smith.valueRangeAtMost(u8, 0, @intCast(fuzz_drawn)),
+        1 => 1500, // ordinary Ethernet MTU behind the header
+        2 => header_len + 1500,
+        3 => fuzz_max_frame, // jumbo
+        4 => smith.valueRangeAtMost(u16, 0, @intCast(fuzz_max_frame)),
+        else => smith.valueRangeAtMost(u16, header_len, @intCast(fuzz_max_frame)),
+    };
+    @memset(buf[fuzz_drawn..], smith.value(u8));
 
     // Half the time, force a valid version byte so the deeper flag/field paths
     // are reached instead of always bailing at the version check.

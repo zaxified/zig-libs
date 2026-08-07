@@ -82,6 +82,18 @@ pub const RequestError = error{
     Busy,
     SystemResources,
     Unexpected,
+    /// **W2 audit finding, campaign C-06 (`devlink` F5)**: `Walk.next`
+    /// exceeded `max_walk_messages` without reaching `NLMSG_DONE`/an ACK/a
+    /// family message — a kernel bug or a socket fed by something other
+    /// than the kernel would otherwise spin the caller (and every dump
+    /// collector built on `Walk`: `devices`/`ports`/`params`/`regions`/
+    /// `healthReporters`) forever.
+    TooManyMessages,
+    /// **W2 audit finding, campaign C-10 (`devlink` F4)**: a single-object
+    /// (`doit`) reply's echoed handle does not name the object that was
+    /// asked about. Correlation used to rest solely on `Walk`'s `(portid,
+    /// seq)` match.
+    UnexpectedHandle,
 };
 
 pub const OpenError = genl.OpenError || genl.ResolveError;
@@ -184,7 +196,10 @@ pub const Devlink = struct {
         const gpa = cl.allocator();
         var reply = try cl.simpleGet(uapi.CMD.INFO_GET, h);
         defer reply.deinit(gpa);
-        return dev_mod.parseInfo(gpa, reply.attrs) catch |e| return mapParse(e);
+        var out = dev_mod.parseInfo(gpa, reply.attrs) catch |e| return mapParse(e);
+        errdefer out.deinit(gpa);
+        try checkHandleEcho(h, out.handle);
+        return out;
     }
 
     // ── ports ──────────────────────────────────────────────────────────────
@@ -224,7 +239,9 @@ pub const Devlink = struct {
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
-        return port_mod.parse(reply.attrs) catch error.MalformedReply;
+        const out = port_mod.parse(reply.attrs) catch return error.MalformedReply;
+        try checkPortHandleEcho(p, out.handle, out.index);
+        return out;
     }
 
     /// `DEVLINK_CMD_PORT_SET` — change a port's type. Needs **CAP_NET_ADMIN**.
@@ -321,7 +338,11 @@ pub const Devlink = struct {
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
-        return param_mod.parse(gpa, reply.attrs) catch |e| return mapParse(e);
+        var out = param_mod.parse(gpa, reply.attrs) catch |e| return mapParse(e);
+        errdefer out.deinit(gpa);
+        try checkHandleEcho(h, out.handle);
+        if (!std.mem.eql(u8, out.name(), name)) return error.UnexpectedHandle;
+        return out;
     }
 
     /// `DEVLINK_CMD_PARAM_SET`. Needs **CAP_NET_ADMIN**.
@@ -360,7 +381,10 @@ pub const Devlink = struct {
         const gpa = cl.allocator();
         var reply = try cl.simpleGet(uapi.CMD.RESOURCE_DUMP, h);
         defer reply.deinit(gpa);
-        return resource_mod.parse(gpa, reply.attrs) catch |e| return mapParse(e);
+        var out = resource_mod.parse(gpa, reply.attrs) catch |e| return mapParse(e);
+        errdefer out.deinit(gpa);
+        try checkHandleEcho(h, out.handle);
+        return out;
     }
 
     /// `DEVLINK_CMD_RESOURCE_SET` — request a new size for one resource.
@@ -423,7 +447,10 @@ pub const Devlink = struct {
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
-        return region_mod.parseRegion(reply.attrs) catch error.MalformedReply;
+        const out = region_mod.parseRegion(reply.attrs) catch return error.MalformedReply;
+        try checkHandleEcho(h, out.handle);
+        if (!std.mem.eql(u8, out.name(), name)) return error.UnexpectedHandle;
+        return out;
     }
 
     /// `DEVLINK_CMD_REGION_NEW` — take a snapshot. Needs **CAP_NET_ADMIN**.
@@ -551,7 +578,10 @@ pub const Devlink = struct {
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
-        return health_mod.parse(reply.attrs) catch error.MalformedReply;
+        const out = health_mod.parse(reply.attrs) catch return error.MalformedReply;
+        try checkHandleEcho(h, out.handle);
+        if (!std.mem.eql(u8, out.name(), name)) return error.UnexpectedHandle;
+        return out;
     }
 
     /// `DEVLINK_CMD_HEALTH_REPORTER_RECOVER` — run the driver's recovery
@@ -583,7 +613,9 @@ pub const Devlink = struct {
         const gpa = cl.allocator();
         var reply = try cl.simpleGet(uapi.CMD.ESWITCH_GET, h);
         defer reply.deinit(gpa);
-        return eswitch_mod.parse(reply.attrs) catch error.MalformedReply;
+        const out = eswitch_mod.parse(reply.attrs) catch return error.MalformedReply;
+        try checkHandleEcho(h, out.handle);
+        return out;
     }
 
     /// `DEVLINK_CMD_ESWITCH_SET`. Needs **CAP_NET_ADMIN**, and changing the
@@ -754,6 +786,25 @@ fn validate(h: handle_mod.Handle) RequestError!void {
     h.validate() catch return error.InvalidRequest;
 }
 
+/// C-10 binding check for the single-object (`doit`) device-scoped
+/// commands: the reply's echoed handle must name the exact device the
+/// request asked about. The dump variants (`ports`/`params`/`regions`/
+/// `healthReporters`) already filter client-side on `p.handle.eql(h)`; this
+/// is that same invariant enforced on the `doit` path, which is the one
+/// that writes hardware.
+fn checkHandleEcho(want: handle_mod.Handle, got: handle_mod.Owned) RequestError!void {
+    if (!got.isComplete()) return error.UnexpectedHandle;
+    if (!got.eql(want)) return error.UnexpectedHandle;
+}
+
+/// Same check for `port`, whose identity is a device handle *plus* a port
+/// index — `PortHandle` has no `.eql` of its own, so both halves are
+/// compared here.
+fn checkPortHandleEcho(want: handle_mod.PortHandle, got: handle_mod.Owned, got_index: ?u32) RequestError!void {
+    try checkHandleEcho(want.handle, got);
+    if (got_index != want.index) return error.UnexpectedHandle;
+}
+
 fn recvErr(e: genl.RecvError) RequestError {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -804,51 +855,79 @@ const WalkMessage = struct {
     attrs: []const u8,
 };
 
+/// Ceiling on how many netlink messages one `Walk` scan may consume before
+/// giving up. **W2 audit finding, campaign C-06**: the kernel is the only
+/// verified sender on this socket, so this is a robustness ceiling against a
+/// malfunctioning driver, not an attacker-facing bound — but without it, a
+/// kernel that never sends `NLMSG_DONE` hangs the caller (and every dump
+/// collector built on `Walk`) forever. Generous relative to any real dump.
+const max_walk_messages: u32 = 65536;
+
 /// Walks a request's replies, hiding datagram boundaries. Terminates on the
-/// ACK (a `doit`) or on `NLMSG_DONE` (a dump).
+/// ACK (a `doit`), on `NLMSG_DONE` (a dump), or on `error.TooManyMessages`
+/// once `max_walk_messages` is exceeded.
 const Walk = struct {
     cl: *Devlink,
     seq: u32,
     it: codec.MessageIterator = .{ .buf = &.{} },
     finished: bool = false,
+    msgs: u32 = 0,
 
     fn next(w: *Walk) RequestError!?WalkMessage {
-        while (true) {
-            if (w.finished) return null;
-            const maybe = w.it.next() catch return error.MalformedReply;
-            const m = maybe orelse {
-                const dgram = w.cl.sock.recvDatagram() catch |e| return recvErr(e);
-                w.it = .{ .buf = dgram };
-                continue;
-            };
-            if (m.pid != w.cl.sock.portid or m.seq != w.seq) continue;
-            switch (m.type) {
-                codec.NLMSG_DONE => {
-                    w.finished = true;
-                    return null;
-                },
-                codec.NLMSG_ERROR => {
-                    const code = m.errorCode() catch return error.MalformedReply;
-                    if (code != 0) {
-                        // Keep the kernel's sentence before mapping the errno:
-                        // "no such region" says far more than ENODEV.
-                        w.cl.noteErrorMessage(m);
-                        return errnoToError(code);
-                    }
-                    w.finished = true;
-                    return null;
-                },
-                codec.NLMSG_NOOP => continue,
-                codec.NLMSG_OVERRUN => return error.SystemResources,
-                else => {
-                    if (m.type != w.cl.family_id) continue;
-                    const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
-                    return .{ .cmd = p.cmd, .attrs = p.attrs };
-                },
-            }
-        }
+        return walkStep(w.cl, w.seq, &w.it, &w.finished, &w.msgs);
     }
 };
+
+/// The body of `Walk.next`, factored out so a mock transport can drive it in
+/// tests without a real socket (same technique as the sibling `conntrack`
+/// module's `dumpOver` and `ethtool`'s `walkStep`). `cl` need only look like
+/// `*Devlink` for the fields/methods this loop touches:
+/// `cl.sock.recvDatagram()`, `cl.sock.portid`, `cl.family_id`,
+/// `cl.noteErrorMessage(msg)`.
+fn walkStep(
+    cl: anytype,
+    seq: u32,
+    it: *codec.MessageIterator,
+    finished: *bool,
+    msgs: *u32,
+) RequestError!?WalkMessage {
+    while (true) {
+        if (finished.*) return null;
+        const maybe = it.next() catch return error.MalformedReply;
+        const m = maybe orelse {
+            if (msgs.* >= max_walk_messages) return error.TooManyMessages;
+            const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
+            msgs.* += 1;
+            it.* = .{ .buf = dgram };
+            continue;
+        };
+        if (m.pid != cl.sock.portid or m.seq != seq) continue;
+        switch (m.type) {
+            codec.NLMSG_DONE => {
+                finished.* = true;
+                return null;
+            },
+            codec.NLMSG_ERROR => {
+                const code = m.errorCode() catch return error.MalformedReply;
+                if (code != 0) {
+                    // Keep the kernel's sentence before mapping the errno:
+                    // "no such region" says far more than ENODEV.
+                    cl.noteErrorMessage(m);
+                    return errnoToError(code);
+                }
+                finished.* = true;
+                return null;
+            },
+            codec.NLMSG_NOOP => continue,
+            codec.NLMSG_OVERRUN => return error.SystemResources,
+            else => {
+                if (m.type != cl.family_id) continue;
+                const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
+                return .{ .cmd = p.cmd, .attrs = p.attrs };
+            },
+        }
+    }
+}
 
 // ── the event socket ───────────────────────────────────────────────────────
 
@@ -1071,4 +1150,115 @@ fn fuzzNotification(_: void, smith: *std.testing.Smith) !void {
         _ = v.isNotification();
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+// ── C-10 regression: single-object requests must bind the reply's handle ───
+// W2-nn (`devlink` F4, campaign C-10): `port`/`param`/`region`/
+// `healthReporter`/`info`/`eswitch`/`resources` handed the reply straight to
+// the typed parser with no check that the echoed handle named the device
+// (and, for `port`, the port index) that was asked about. `checkHandleEcho`/
+// `checkPortHandleEcho` are the fix, and both are pure (no socket needed).
+
+fn ownedHandle(bus: []const u8, dev: []const u8) handle_mod.Owned {
+    var o: handle_mod.Owned = .{};
+    @memcpy(o.bus_buf[0..bus.len], bus);
+    o.bus_len = @intCast(bus.len);
+    @memcpy(o.dev_buf[0..dev.len], dev);
+    o.dev_len = @intCast(dev.len);
+    return o;
+}
+
+test "checkHandleEcho accepts a reply that echoes the requested handle" {
+    try checkHandleEcho(.pci("0000:65:00.0"), ownedHandle("pci", "0000:65:00.0"));
+}
+
+test "checkHandleEcho rejects a reply for a different device" {
+    try testing.expectError(
+        error.UnexpectedHandle,
+        checkHandleEcho(.pci("0000:65:00.0"), ownedHandle("pci", "0000:03:00.0")),
+    );
+}
+
+test "checkHandleEcho rejects a reply with only half a handle" {
+    try testing.expectError(
+        error.UnexpectedHandle,
+        checkHandleEcho(.pci("0000:65:00.0"), ownedHandle("pci", "")),
+    );
+}
+
+test "checkPortHandleEcho accepts a reply that echoes handle and index" {
+    try checkPortHandleEcho(
+        .{ .handle = .pci("0000:65:00.0"), .index = 3 },
+        ownedHandle("pci", "0000:65:00.0"),
+        3,
+    );
+}
+
+test "checkPortHandleEcho rejects a reply for the right device but wrong port index" {
+    try testing.expectError(
+        error.UnexpectedHandle,
+        checkPortHandleEcho(
+            .{ .handle = .pci("0000:65:00.0"), .index = 3 },
+            ownedHandle("pci", "0000:65:00.0"),
+            4,
+        ),
+    );
+}
+
+test "checkPortHandleEcho rejects a reply that carries no index at all" {
+    try testing.expectError(
+        error.UnexpectedHandle,
+        checkPortHandleEcho(
+            .{ .handle = .pci("0000:65:00.0"), .index = 3 },
+            ownedHandle("pci", "0000:65:00.0"),
+            null,
+        ),
+    );
+}
+
+// ── C-06 regression: the dump loop must not spin forever ───────────────────
+// W2-nn (`devlink` F5, campaign C-06): `Walk.next` looped on `recvDatagram`
+// with no upper bound, so a peer that never sends `NLMSG_DONE`/an ACK hangs
+// the caller (and every dump collector built on `Walk`) forever. `walkStep`
+// was factored out of `Walk.next` precisely so a scripted stand-in can drive
+// it here, the same technique the sibling `conntrack` module's
+// `ScriptedTransport` uses for `dumpOver`.
+
+const MockSock = struct {
+    portid: u32,
+    datagram: []const u8,
+
+    fn recvDatagram(self: *MockSock) genl.RecvError![]const u8 {
+        return self.datagram;
+    }
+};
+
+const MockDevlink = struct {
+    sock: MockSock,
+    family_id: u16,
+
+    fn noteErrorMessage(_: *MockDevlink, _: codec.Message) void {}
+};
+
+fn nonTerminatingDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, family_id: u16) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, family_id +% 1, codec.NLM_F_MULTI, seq, pid);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+test "Walk.next errors out instead of looping forever on a never-DONE reply" {
+    const family_id: u16 = 0x19;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    const dgram = try nonTerminatingDatagram(testing.allocator, pid, seq, family_id);
+    defer testing.allocator.free(dgram);
+
+    var cl: MockDevlink = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    var msgs: u32 = 0;
+    try testing.expectError(error.TooManyMessages, walkStep(&cl, seq, &it, &finished, &msgs));
+    try testing.expectEqual(max_walk_messages, msgs);
 }

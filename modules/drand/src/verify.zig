@@ -402,12 +402,159 @@ fn fuzzParseVerify(_: void, smith: *std.testing.Smith) !void {
 
     // If BOTH parsed, the verify path must also never crash (it will
     // almost always reject; the contract is "no panic", not "accepts").
+    // ⚠ This never happened: see `fuzzVerifyRound` below for why.
     if (maybe_info) |info| {
         if (maybe_round) |rnd| {
             verifyRound(&info, &rnd) catch {};
         }
     }
 }
+
+// ── fuzz: the verify path itself, which the harness above cannot reach ────
+//
+// W2 A3 (F2) recorded that `verifyRound` — where this module's own CRIT
+// (signature malleability / total forgery) lived — was never reached by the
+// harness above, and the reason is structural rather than statistical. That
+// harness draws ONE buffer of arbitrary octets and feeds the SAME buffer to
+// both parsers, so reaching `verifyRound` would need a single document that is
+// simultaneously a valid `/info` (six mandatory fields, a 64-hex `hash`, a
+// 64-hex `groupHash`, and a 192-hex `public_key` that decodes to a G2 point
+// passing KeyValidate) and a valid `/public/<round>` (a `round` number and a
+// 96-hex `signature` that decodes to a G1 point in the subgroup). No such
+// document exists — the two shapes disagree — so the `if (maybe_info) if
+// (maybe_round)` body was dead code, and none of `verifyRoundPoints`, the
+// subgroup guards, or the randomness check was ever fuzzed.
+//
+// This harness builds the two documents separately, from the genuine quicknet
+// fixtures, and lets the fuzzer damage them the way a hostile responder would:
+// nibbles of the key, of the signature, of the claimed randomness, the round
+// number, the scheme label. Two assertions keep it honest in both directions:
+// an undamaged pair MUST verify (so the harness cannot quietly stop reaching
+// the verifier), and a pair whose crypto-relevant fields were damaged MUST NOT
+// (which is the forgery property the CRIT was about).
+
+const genuine_pubkey_hex = "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a";
+const genuine_sig_hex = "b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39";
+const genuine_randomness_hex = "fe290beca10872ef2fb164d2aa4442de4566183ec51c56ff3cd603d930e54fdd";
+const genuine_hash_hex = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971";
+const genuine_group_hash_hex = "f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e";
+const genuine_scheme = "bls-unchained-g1-rfc9380";
+const genuine_round: u64 = 1000;
+
+/// Replaces up to three nibbles with fuzzer-chosen hex digits. Reports whether
+/// the text actually changed — a flip that happens to write the digit already
+/// there is not damage, and an unmeasured "it was damaged" flag is how a false
+/// positive gets into a security assertion.
+fn damageHex(smith: *std.testing.Smith, hex: []u8, original: []const u8) bool {
+    if (hex.len == 0) return false;
+    const n = smith.valueRangeAtMost(u8, 0, 3);
+    var i: u8 = 0;
+    while (i < n) : (i += 1) {
+        hex[smith.index(hex.len)] = "0123456789abcdef"[smith.valueRangeAtMost(u8, 0, 15)];
+    }
+    return !std.mem.eql(u8, hex, original);
+}
+
+test "fuzz: verifyRound on genuine and damaged quicknet documents" {
+    try std.testing.fuzz({}, fuzzVerifyRound, .{ .corpus = drand_seeds });
+}
+
+fn fuzzVerifyRound(_: void, smith: *std.testing.Smith) !void {
+    var pk: [genuine_pubkey_hex.len]u8 = genuine_pubkey_hex.*;
+    var sig: [genuine_sig_hex.len]u8 = genuine_sig_hex.*;
+    var rand_hex: [genuine_randomness_hex.len]u8 = genuine_randomness_hex.*;
+    var hash: [genuine_hash_hex.len]u8 = genuine_hash_hex.*;
+    var ghash: [genuine_group_hash_hex.len]u8 = genuine_group_hash_hex.*;
+
+    const pk_damaged = damageHex(smith, &pk, genuine_pubkey_hex);
+    const sig_damaged = damageHex(smith, &sig, genuine_sig_hex);
+    const rand_damaged = damageHex(smith, &rand_hex, genuine_randomness_hex);
+    _ = damageHex(smith, &hash, genuine_hash_hex);
+    _ = damageHex(smith, &ghash, genuine_group_hash_hex);
+
+    const scheme = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => genuine_scheme,
+        1 => "pedersen-bls-chained",
+        2 => "bls-unchained-on-g1",
+        else => "",
+    };
+    const round_no: u64 = if (smith.value(bool)) genuine_round else smith.value(u64);
+    const with_randomness = smith.value(bool);
+    // `period`, `genesis_time`, `hash`, `groupHash` and the beacon id are not
+    // inputs to the verification equation, so damaging them must NOT change
+    // the verdict — which is exactly why they are damaged here.
+    var info_buf: [768]u8 = undefined;
+    const info_json = std.fmt.bufPrint(
+        &info_buf,
+        "{{\"public_key\":\"{s}\",\"period\":{d},\"genesis_time\":{d}," ++
+            "\"hash\":\"{s}\",\"groupHash\":\"{s}\",\"schemeID\":\"{s}\"," ++
+            "\"metadata\":{{\"beaconID\":\"quicknet\"}}}}",
+        .{ &pk, smith.value(u16), smith.value(u32), &hash, &ghash, scheme },
+    ) catch return;
+
+    var round_buf: [512]u8 = undefined;
+    const round_json = if (with_randomness)
+        std.fmt.bufPrint(
+            &round_buf,
+            "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\"}}",
+            .{ round_no, &rand_hex, &sig },
+        ) catch return
+    else
+        std.fmt.bufPrint(
+            &round_buf,
+            "{{\"round\":{d},\"signature\":\"{s}\"}}",
+            .{ round_no, &sig },
+        ) catch return;
+
+    const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
+        // An undamaged key on the genuine scheme must always parse; anything
+        // else means the fixture or the parser drifted, and every "no crash"
+        // verdict from here on would have been vacuous.
+        if (!pk_damaged and std.mem.eql(u8, scheme, genuine_scheme)) return e;
+        return;
+    };
+    const rnd = round_mod.parseRound(testing.allocator, round_json) catch |e| {
+        if (!sig_damaged) return e;
+        return;
+    };
+
+    const crypto_intact = !pk_damaged and !sig_damaged and
+        (!with_randomness or !rand_damaged) and
+        round_no == genuine_round and std.mem.eql(u8, scheme, genuine_scheme);
+
+    if (verifyRound(&info, &rnd)) |_| {
+        // A verdict of "genuine" for anything the equation actually covers
+        // that was altered is a forgery accepted.
+        if (!crypto_intact) return error.DamagedRoundVerified;
+    } else |_| {
+        if (crypto_intact) return error.GenuineRoundRejected;
+    }
+}
+
+/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
+/// `options.corpus` plus one empty input, and an empty input makes every draw
+/// return its range minimum — no damage at all, i.e. only the positive
+/// control. `Smith` reads one little-endian `u64` per scalar draw and discards
+/// a word outside that draw's range, so the words are kept small.
+fn drandSeed(comptime bits: u64, comptime n: usize) [n]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [n]u8 = undefined;
+    var i: usize = 0;
+    var w: u6 = 0;
+    while (i + 8 <= n) : (i += 8) {
+        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x0F, .little);
+        w +%= 1;
+    }
+    @memset(out[i..], 0);
+    return out;
+}
+
+const drand_seeds: []const []const u8 = &.{
+    &drandSeed(0x0000_0000_0000_0000, 256), // undamaged: the positive control
+    &drandSeed(0x9E37_79B9_7F4A_7C15, 256),
+    &drandSeed(0x0123_4567_89AB_CDEF, 256),
+    &drandSeed(0xF0E1_D2C3_B4A5_9687, 256),
+};
 
 test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     // Both operands identity => every pairing is the target-group identity,

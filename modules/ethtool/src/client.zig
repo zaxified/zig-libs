@@ -81,6 +81,18 @@ pub const RequestError = error{
     Busy,
     SystemResources,
     Unexpected,
+    /// A multi-part reply (or an event stream skipping foreign messages)
+    /// exceeded `max_walk_messages` without reaching `NLMSG_DONE`/an ACK/a
+    /// family message — a kernel bug or a socket fed by something other than
+    /// the kernel would otherwise spin the caller forever. See `Walk.next`.
+    TooManyMessages,
+    /// **W2 audit finding, campaign C-10 (`ethtool` F3)**: a `simpleGet`
+    /// reply's echoed header names a different device than the one that was
+    /// asked about. Correlation used to rest solely on `Walk`'s `(portid,
+    /// seq)` match; this catches a kernel (or anything else that can answer
+    /// on this socket) sending back the wrong device's data under the right
+    /// sequence number.
+    UnexpectedDevice,
 };
 
 pub const OpenError = genl.OpenError || genl.ResolveError;
@@ -638,7 +650,10 @@ pub const Ethtool = struct {
     }
 
     /// Build + send a device GET with no extra attributes and return its one
-    /// reply message.
+    /// reply message, after checking the reply's own echoed header names the
+    /// device that was asked about (see `checkDeviceEcho` / `UnexpectedDevice`
+    /// — campaign C-10, `ethtool` F3). Reply/request correlation used to rest
+    /// solely on `Walk`'s `(portid, seq)` match.
     fn simpleGet(
         cl: *Ethtool,
         cmd: u8,
@@ -653,7 +668,12 @@ pub const Ethtool = struct {
         try cl.appendHeaderNest(&msg, hdr_attr, opts);
         codec.finishHeader(&msg, h);
         try cl.send(msg.items);
-        return (try cl.collect(seq)) orelse error.MalformedReply;
+        var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
+        errdefer reply.deinit(gpa);
+        const got = (header.find(reply.attrs, hdr_attr) catch return error.MalformedReply) orelse
+            return error.MalformedReply;
+        try checkDeviceEcho(opts.target, got);
+        return reply;
     }
 
     /// Read to the end of a request's replies, keeping the first family
@@ -715,6 +735,24 @@ fn mapHeader(e: header.Error) RequestError {
     };
 }
 
+/// `simpleGet`'s C-10 binding check: the reply's echoed header must name the
+/// exact device the request asked about, by whichever identifier the request
+/// used. The header doc (`header.zig`) says a reply always carries both
+/// `DEV_INDEX` and `DEV_NAME`; a reply missing the one the caller asked with
+/// is treated the same as a mismatch rather than silently accepted.
+fn checkDeviceEcho(target: header.Target, got: header.Device) RequestError!void {
+    switch (target) {
+        .index => |i| {
+            const gi = got.index orelse return error.UnexpectedDevice;
+            if (gi != i) return error.UnexpectedDevice;
+        },
+        .name => |n| {
+            if (got.name_len == 0) return error.UnexpectedDevice;
+            if (!std.mem.eql(u8, got.name(), n)) return error.UnexpectedDevice;
+        },
+    }
+}
+
 /// One family reply message. `attrs` borrows the socket's receive buffer and is
 /// valid only until the next `Walk.next` call.
 const WalkMessage = struct {
@@ -722,51 +760,84 @@ const WalkMessage = struct {
     attrs: []const u8,
 };
 
+/// Ceiling on how many netlink messages one `Walk`/`waitForNotification` scan
+/// may consume before giving up. **W2 audit finding, campaign C-06**: the
+/// kernel is the only verified sender on this socket (`netlink.Socket`'s
+/// `MSG_PEEK|MSG_TRUNC` receive path drops any datagram whose sender pid is
+/// not 0), so this is a robustness ceiling against a malfunctioning driver or
+/// a stuck NLMSG_DONE, not an attacker-facing bound — but without it, a
+/// kernel that answers with an endless multi-part stream (or never answers
+/// the sequence at all while flooding the socket with unrelated traffic)
+/// hangs the caller forever with no escape but closing the fd from another
+/// thread. Generous relative to any real dump (hundreds of devices, not
+/// tens of thousands) while still finite.
+const max_walk_messages: u32 = 65536;
+
 /// Walks a request's replies, hiding datagram boundaries. Terminates on the
-/// ACK (the normal case) or on `NLMSG_DONE` (a dump).
+/// ACK (the normal case), on `NLMSG_DONE` (a dump), or on
+/// `error.TooManyMessages` once `max_walk_messages` is exceeded.
 const Walk = struct {
     cl: *Ethtool,
     seq: u32,
     it: codec.MessageIterator = .{ .buf = &.{} },
     finished: bool = false,
+    msgs: u32 = 0,
 
     fn next(w: *Walk) RequestError!?WalkMessage {
-        while (true) {
-            if (w.finished) return null;
-            const maybe = w.it.next() catch return error.MalformedReply;
-            const m = maybe orelse {
-                const dgram = w.cl.sock.recvDatagram() catch |e| return recvErr(e);
-                w.it = .{ .buf = dgram };
-                continue;
-            };
-            if (m.pid != w.cl.sock.portid or m.seq != w.seq) continue;
-            switch (m.type) {
-                codec.NLMSG_DONE => {
-                    w.finished = true;
-                    return null;
-                },
-                codec.NLMSG_ERROR => {
-                    const code = m.errorCode() catch return error.MalformedReply;
-                    if (code != 0) {
-                        // Keep the kernel's own sentence before mapping the
-                        // errno — "EOPNOTSUPP" alone loses the interesting half.
-                        w.cl.noteErrorMessage(m);
-                        return errnoToError(code);
-                    }
-                    w.finished = true;
-                    return null;
-                },
-                codec.NLMSG_NOOP => continue,
-                codec.NLMSG_OVERRUN => return error.SystemResources,
-                else => {
-                    if (m.type != w.cl.family_id) continue;
-                    const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
-                    return .{ .cmd = p.cmd, .attrs = p.attrs };
-                },
-            }
-        }
+        return walkStep(w.cl, w.seq, &w.it, &w.finished, &w.msgs);
     }
 };
+
+/// The body of `Walk.next`, factored out so a mock transport can drive it in
+/// tests without a real socket (the technique the sibling `conntrack` module
+/// established for its `dumpOver` dump engine). `cl` need only look like
+/// `*Ethtool` for the fields/methods this loop actually touches:
+/// `cl.sock.recvDatagram()`, `cl.sock.portid`, `cl.family_id`,
+/// `cl.noteErrorMessage(msg)`.
+fn walkStep(
+    cl: anytype,
+    seq: u32,
+    it: *codec.MessageIterator,
+    finished: *bool,
+    msgs: *u32,
+) RequestError!?WalkMessage {
+    while (true) {
+        if (finished.*) return null;
+        const maybe = it.next() catch return error.MalformedReply;
+        const m = maybe orelse {
+            if (msgs.* >= max_walk_messages) return error.TooManyMessages;
+            const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
+            msgs.* += 1;
+            it.* = .{ .buf = dgram };
+            continue;
+        };
+        if (m.pid != cl.sock.portid or m.seq != seq) continue;
+        switch (m.type) {
+            codec.NLMSG_DONE => {
+                finished.* = true;
+                return null;
+            },
+            codec.NLMSG_ERROR => {
+                const code = m.errorCode() catch return error.MalformedReply;
+                if (code != 0) {
+                    // Keep the kernel's own sentence before mapping the
+                    // errno — "EOPNOTSUPP" alone loses the interesting half.
+                    cl.noteErrorMessage(m);
+                    return errnoToError(code);
+                }
+                finished.* = true;
+                return null;
+            },
+            codec.NLMSG_NOOP => continue,
+            codec.NLMSG_OVERRUN => return error.SystemResources,
+            else => {
+                if (m.type != cl.family_id) continue;
+                const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
+                return .{ .cmd = p.cmd, .attrs = p.attrs };
+            },
+        }
+    }
+}
 
 // ── the event socket ───────────────────────────────────────────────────────
 
@@ -882,21 +953,39 @@ pub const EventSocket = struct {
     /// **The one blocking call.** Returns the next ethtool notification,
     /// performing a single `recvmsg` only when the previously received datagram
     /// has been drained. Messages that are not ethtool-family messages are
-    /// skipped. Free the result with `deinit`.
+    /// skipped, up to `max_walk_messages` of them — see that constant's doc
+    /// comment: a multicast group flooded with foreign traffic must not spin
+    /// this call forever (`error.TooManyMessages`). Free the result with
+    /// `deinit`.
     pub fn waitForNotification(ev: *EventSocket, gpa: std.mem.Allocator) RequestError!Notification {
-        while (true) {
-            const maybe = ev.it.next() catch return error.MalformedReply;
-            const m = maybe orelse {
-                const dgram = ev.sock.recvDatagram() catch |e| return recvErr(e);
-                ev.it = .{ .buf = dgram };
-                continue;
-            };
-            if (m.type != ev.family_id) continue;
-            const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
-            return parseNotification(gpa, p.cmd, p.attrs) catch |e| return mapParse(e);
-        }
+        return waitForNotificationStep(&ev.sock, ev.family_id, &ev.it, gpa);
     }
 };
+
+/// The body of `EventSocket.waitForNotification`, factored out the same way
+/// `walkStep` is — `sock` need only look like `*genl.Socket`
+/// (`recvDatagram`/`portid` are unused here, only `recvDatagram`).
+fn waitForNotificationStep(
+    sock: anytype,
+    family_id: u16,
+    it: *codec.MessageIterator,
+    gpa: std.mem.Allocator,
+) RequestError!Notification {
+    var msgs: u32 = 0;
+    while (true) {
+        const maybe = it.next() catch return error.MalformedReply;
+        const m = maybe orelse {
+            if (msgs >= max_walk_messages) return error.TooManyMessages;
+            const dgram = sock.recvDatagram() catch |e| return recvErr(e);
+            msgs += 1;
+            it.* = .{ .buf = dgram };
+            continue;
+        };
+        if (m.type != family_id) continue;
+        const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
+        return parseNotification(gpa, p.cmd, p.attrs) catch |e| return mapParse(e);
+    }
+}
 
 /// Decode one notification's command + attribute bytes into an owned
 /// `Notification`. Pure apart from the copy.
@@ -993,6 +1082,123 @@ test "parseNotification: malformed attributes are typed errors" {
 test "BitsetForm maps onto the header flag" {
     try testing.expect(BitsetForm.compact.compactFlag());
     try testing.expect(!BitsetForm.verbose.compactFlag());
+}
+
+// ── C-10 regression: simpleGet must bind the reply to the request's device ─
+// W2-nn (`ethtool` F3): `simpleGet` handed `reply.attrs` straight to the typed
+// parser with no check that the echoed header named the device that was
+// asked about — correlation rested solely on `Walk`'s `(portid, seq)` match.
+// `checkDeviceEcho` is the fix, and it is pure (no socket needed), so it is
+// tested directly rather than through a mocked `simpleGet` round trip.
+
+fn deviceNamed(index: ?u32, name: []const u8) header.Device {
+    var d: header.Device = .{ .index = index };
+    @memcpy(d.name_buf[0..name.len], name);
+    d.name_len = @intCast(name.len);
+    return d;
+}
+
+test "checkDeviceEcho accepts a reply that echoes the requested index" {
+    try checkDeviceEcho(header.Target.byIndex(3), deviceNamed(3, "eth0"));
+}
+
+test "checkDeviceEcho rejects a reply for a different index" {
+    try testing.expectError(
+        error.UnexpectedDevice,
+        checkDeviceEcho(header.Target.byIndex(3), deviceNamed(4, "eth1")),
+    );
+}
+
+test "checkDeviceEcho rejects a reply with no index when one was requested" {
+    try testing.expectError(
+        error.UnexpectedDevice,
+        checkDeviceEcho(header.Target.byIndex(3), header.Device{}),
+    );
+}
+
+test "checkDeviceEcho accepts a reply that echoes the requested name" {
+    try checkDeviceEcho(header.Target.byName("enp0s31f6"), deviceNamed(2, "enp0s31f6"));
+}
+
+test "checkDeviceEcho rejects a reply for a different name" {
+    try testing.expectError(
+        error.UnexpectedDevice,
+        checkDeviceEcho(header.Target.byName("enp0s31f6"), deviceNamed(2, "eth0")),
+    );
+}
+
+test "checkDeviceEcho rejects a reply with no name when one was requested" {
+    try testing.expectError(
+        error.UnexpectedDevice,
+        checkDeviceEcho(header.Target.byName("enp0s31f6"), header.Device{ .index = 2 }),
+    );
+}
+
+// ── C-06 regression: the dump/notification loops must not spin forever ─────
+// W2-nn (devlink/ethtool/nl80211 F5/F4/F5, campaign C-06): `Walk.next` and
+// `EventSocket.waitForNotification` looped on `recvDatagram` with no upper
+// bound, so a peer that never sends `NLMSG_DONE` (or never sends a matching
+// family message) hangs the caller forever. `walkStep`/`waitForNotificationStep`
+// were factored out of the concrete `Ethtool`/`EventSocket` methods precisely so
+// a scripted stand-in can drive them here, the same technique the sibling
+// `conntrack` module's `ScriptedTransport` uses for `dumpOver`.
+
+/// Hands back the same never-matching datagram forever — the scenario is a
+/// peer that keeps talking but never terminates the walk, not one that runs
+/// out of things to say.
+const MockSock = struct {
+    portid: u32,
+    datagram: []const u8,
+
+    fn recvDatagram(self: *MockSock) genl.RecvError![]const u8 {
+        return self.datagram;
+    }
+};
+
+const MockEthtool = struct {
+    sock: MockSock,
+    family_id: u16,
+
+    fn noteErrorMessage(_: *MockEthtool, _: codec.Message) void {}
+};
+
+/// One message with `NLM_F_MULTI` set and a type that never matches
+/// `family_id`, so `Walk`'s `else` arm (or `waitForNotification`'s family
+/// check) skips it and asks for another datagram — forever, absent a budget.
+fn nonTerminatingDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, family_id: u16) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, family_id +% 1, codec.NLM_F_MULTI, seq, pid);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+test "Walk.next errors out instead of looping forever on a never-DONE reply" {
+    const family_id: u16 = 23;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    const dgram = try nonTerminatingDatagram(testing.allocator, pid, seq, family_id);
+    defer testing.allocator.free(dgram);
+
+    var cl: MockEthtool = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    var msgs: u32 = 0;
+    try testing.expectError(error.TooManyMessages, walkStep(&cl, seq, &it, &finished, &msgs));
+    try testing.expectEqual(max_walk_messages, msgs);
+}
+
+test "waitForNotification errors out instead of looping forever on foreign traffic" {
+    const family_id: u16 = 23;
+    const dgram = try nonTerminatingDatagram(testing.allocator, 0, 0, family_id);
+    defer testing.allocator.free(dgram);
+
+    var sock: MockSock = .{ .portid = 0, .datagram = dgram };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    try testing.expectError(
+        error.TooManyMessages,
+        waitForNotificationStep(&sock, family_id, &it, testing.allocator),
+    );
 }
 
 test "fuzz: notification parsing never crashes" {

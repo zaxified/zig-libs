@@ -370,8 +370,13 @@ test "boundary: indefinite text-string chunk, len == remaining / remaining + 1" 
 
 // ── fuzz: decode on arbitrary bytes never panics/OOB ────────────────────────
 
+/// W2 A3 (F5): this used to cap the driven input at 512 octets, which is
+/// shorter than plenty of real COSE structures and far too short to build a
+/// deeply nested one. The companion harness in `root.zig` covers the other
+/// half of that finding — the arena here cannot see a leak, so the leak oracle
+/// had to live where `freeValue` is in scope.
 fn fuzzDecodeNeverPanics(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     smith.bytes(&buf);
     const len = smith.valueRangeAtMost(u16, 0, buf.len);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

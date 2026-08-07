@@ -457,6 +457,33 @@ pub fn build(b: *std.Build) void {
         .makeFn = checkFuzz,
     });
     check_fuzz.dependOn(check_fuzz_inner);
+
+    // Kernel-UAPI constant-drift gate: `zig build check-uapi` (campaign
+    // C-09, wave-2 audit K3). `conntrack`/`devlink`/`ethtool`/`nl80211` each
+    // transcribe hundreds of kernel netlink constants by hand; the audit
+    // diffed every one of them against this host's `/usr/include/linux`
+    // headers ONCE and proved with a fault injection that nothing else in
+    // the repo would notice a wrong value (a mutated constant compiled and
+    // `zig build test-<module>` stayed green, because each module's own
+    // goldens read the same mutated symbol on both the encode and the
+    // decode side). `scripts/check-uapi-consts.py` is the standing version
+    // of that diff. It is a SEPARATE step, not folded into `check-catalog`
+    // or `test`, because unlike those it depends on host state this build
+    // does not control: a machine without `python3` or without the kernel
+    // headers installed can still build and test every module normally, so
+    // this step SKIPS (does not fail the build) whenever either is missing
+    // -- see `checkUapi` below and the script's own header-missing handling.
+    // Run it explicitly (or from whatever wires `scripts/check-citations.py`
+    // into CI, which has the same host-dependency shape).
+    const check_uapi = b.step("check-uapi", "Diff conntrack/devlink/ethtool/nl80211 constants against installed kernel headers");
+    const check_uapi_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_uapi_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-uapi",
+        .owner = b,
+        .makeFn = checkUapi,
+    });
+    check_uapi.dependOn(check_uapi_inner);
 }
 
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
@@ -1064,6 +1091,44 @@ const FuzzScan = struct {
 /// slot owns. The one-line change is `check.dependOn(check_fuzz_inner)` in
 /// `build()`; it belongs to whoever burns those 26 down, not here. Weakening the
 /// gate to make the tree green was the alternative and was rejected.
+/// `zig build check-uapi` (campaign C-09). Shells out to
+/// `scripts/check-uapi-consts.py` rather than re-implementing its C-header
+/// parsing in Zig -- the script is itself the tested, documented artifact
+/// (see its own module docstring), and this step is just what makes running
+/// it "standing" instead of "something you have to remember to type".
+///
+/// Absence of `python3` on `PATH` is a SKIP, not a failure, for the same
+/// reason the script itself skips a module whose kernel header is not
+/// installed: a check that only builds on hosts with specific packages
+/// present cannot be a hard gate every clone of this repo goes through.
+fn checkUapi(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+
+    const script_path = b.pathFromRoot("scripts/check-uapi-consts.py");
+    const result = std.process.run(b.allocator, io, .{
+        .argv = &.{ "python3", script_path },
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.log.warn("check-uapi: SKIP -- python3 not found on PATH", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer b.allocator.free(result.stdout);
+    defer b.allocator.free(result.stderr);
+
+    if (result.stdout.len > 0) std.log.info("{s}", .{result.stdout});
+    if (result.stderr.len > 0) std.log.err("{s}", .{result.stderr});
+
+    switch (result.term) {
+        .exited => |code| if (code != 0)
+            return step.fail("kernel-UAPI constant drift found by {s} -- see output above", .{script_path}),
+        else => |t| return step.fail("check-uapi-consts.py terminated abnormally: {any}", .{t}),
+    }
+}
+
 fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
     _ = options;
     const b = step.owner;

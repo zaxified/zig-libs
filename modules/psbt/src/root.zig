@@ -733,6 +733,18 @@ fn appendFuzzedRecords(
     smith: *std.testing.Smith,
     known_keytypes: []const u64,
 ) !void {
+    try appendFuzzedRecordsOpen(list, allocator, smith, known_keytypes);
+    try list.append(allocator, 0x00); // map terminator
+}
+
+/// The same, without the terminating `0x00`, so a caller can append further
+/// records of its own to the same map before closing it.
+fn appendFuzzedRecordsOpen(
+    list: *std.ArrayList(u8),
+    allocator: Allocator,
+    smith: *std.testing.Smith,
+    known_keytypes: []const u64,
+) !void {
     const n = smith.valueRangeAtMost(u8, 0, 5);
     var i: u8 = 0;
     while (i < n) : (i += 1) {
@@ -757,7 +769,44 @@ fn appendFuzzedRecords(
 
         try appendFuzzRecord(list, allocator, keytype, keydata_buf[0..keydata_len], value_buf[0..value_len]);
     }
-    try list.append(allocator, 0x00); // map terminator
+}
+
+/// Appends a `FINAL_SCRIPTSIG` and/or a `FINAL_SCRIPTWITNESS` to the input map
+/// currently being written.
+///
+/// W2 A3 (F4) recorded that `decodeWitnessStack` is documented as taking
+/// untrusted input ("one `extract` is asked to process directly after
+/// `parse`") yet was not reachable from this harness at all, and that
+/// `finalize`/`extract` -- the two roles that run a Script interpreter over
+/// attacker-chosen bytes -- had zero fuzz coverage. The obstacle was in the
+/// generator, not in the budget: the input keytypes it drew from were
+/// `NON_WITNESS_UTXO`/`WITNESS_UTXO`/`PARTIAL_SIG`/`SIGHASH_TYPE`/
+/// `BIP32_DERIVATION` and nothing else, so no input ever carried a final
+/// field, `extract` returned `InputNotFinalized` at the first input every
+/// time, and the witness decoder behind it could not be entered however long
+/// the fuzzer ran.
+fn appendFinalRecords(list: *std.ArrayList(u8), allocator: Allocator, smith: *std.testing.Smith) !void {
+    var script_buf: [64]u8 = undefined;
+    smith.bytes(&script_buf);
+    const script = script_buf[0..smith.valueRangeAtMost(u8, 0, script_buf.len)];
+
+    const with_sig = smith.value(bool);
+    if (with_sig) {
+        try appendFuzzRecord(list, allocator, input_key.FINAL_SCRIPTSIG, &.{}, script);
+    }
+    if (!with_sig or smith.value(bool)) {
+        // Half the time a well-formed witness-stack encoding, half the time
+        // arbitrary octets: `decodeWitnessStack` has to survive both, and only
+        // the first form gets past it into `extract`.
+        if (smith.value(bool)) {
+            const items = [_][]const u8{ script, script[0..@min(script.len, 8)] };
+            const enc = try encodeWitnessStack(allocator, items[0..smith.valueRangeAtMost(u8, 0, 2)]);
+            defer allocator.free(enc);
+            try appendFuzzRecord(list, allocator, input_key.FINAL_SCRIPTWITNESS, &.{}, enc);
+        } else {
+            try appendFuzzRecord(list, allocator, input_key.FINAL_SCRIPTWITNESS, &.{}, script);
+        }
+    }
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
@@ -793,12 +842,18 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     try appendFuzzRecord(&buf, allocator, global_key.UNSIGNED_TX, &.{}, utx_bytes);
     try appendFuzzedRecords(&buf, allocator, smith, &.{ global_key.XPUB, global_key.VERSION, global_key.PROPRIETARY });
 
+    // See the note below `parse`: without a `FINAL_SCRIPTSIG`/
+    // `FINAL_SCRIPTWITNESS` on *every* input, `extract` refuses at the first
+    // one and everything behind it stays unreachable.
+    const finalize_them = smith.value(bool);
     var i: usize = 0;
     while (i < n_in) : (i += 1) {
-        try appendFuzzedRecords(&buf, allocator, smith, &.{
+        try appendFuzzedRecordsOpen(&buf, allocator, smith, &.{
             input_key.NON_WITNESS_UTXO, input_key.WITNESS_UTXO,     input_key.PARTIAL_SIG,
             input_key.SIGHASH_TYPE,     input_key.BIP32_DERIVATION,
         });
+        if (finalize_them) try appendFinalRecords(&buf, allocator, smith);
+        try buf.append(allocator, 0x00); // map terminator
     }
     i = 0;
     while (i < n_out) : (i += 1) {
@@ -807,4 +862,41 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 
     var psbt = parse(allocator, buf.items) catch return;
     defer psbt.deinit(allocator);
+
+    // `decodeWitnessStack` driven directly as well: it is public, it is
+    // documented as untrusted-input, and reaching it only through a PSBT that
+    // parses would leave most of its own error paths behind a second gate.
+    {
+        var wbuf: [96]u8 = undefined;
+        smith.bytes(&wbuf);
+        const wlen = smith.valueRangeAtMost(u8, 0, wbuf.len);
+        if (decodeWitnessStack(allocator, wbuf[0..wlen])) |stack| {
+            defer allocator.free(stack);
+            // Every item is a subslice of the value it was decoded from, and
+            // the stack cannot claim more items than there were octets.
+            if (stack.len > wlen) return error.MoreItemsThanOctets;
+            for (stack) |item| {
+                const off = @intFromPtr(item.ptr) - @intFromPtr(&wbuf);
+                if (off > wlen or item.len > wlen - off) return error.ItemOutsideValue;
+            }
+        } else |_| {}
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ps = parse(a, buf.items) catch return;
+    defer ps.deinit(a);
+
+    if (finalize(a, ps)) |results| {
+        if (results.len != n_in) return error.FinalizeResultCountMismatch;
+    } else |_| {}
+
+    if (extract(a, ps)) |tx| {
+        // The extractor splices signatures into the unsigned transaction; it
+        // must not invent or drop inputs or outputs while doing it.
+        if (tx.vin.len != n_in) return error.ExtractChangedInputCount;
+        if (tx.vout.len != n_out) return error.ExtractChangedOutputCount;
+        if (tx.has_witness and tx.witness.len != n_in) return error.WitnessCountMismatch;
+    } else |_| {}
 }

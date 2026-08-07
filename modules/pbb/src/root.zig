@@ -918,10 +918,34 @@ test "golden (Wireshark-anchored): UCA bit forced to 1 decodes uca=true — Wire
     try testing.expectEqualSlices(u8, &golden_wireshark_uca_bit_set, out);
 }
 
+/// The largest frame a PBB backbone port can be handed: a 9000-octet jumbo
+/// customer frame behind the B-MACs, the optional B-TAG and the I-TAG. W2 A3
+/// recorded that the harness used to cap the driven buffer at
+/// `min_frame_len + b_tag_len + 64` = 92 octets, so a multi-kilobyte hostile
+/// frame — the ordinary case on a provider backbone — was never decoded here at
+/// all. The bound is safe by construction (the customer data is a subslice and
+/// there is no length field), but the harness could not demonstrate it.
+const fuzz_max_frame: usize = min_frame_len + b_tag_len + 9000;
+
+/// Only the tag region is drawn from the fuzzer: past the I-TAG every octet is
+/// opaque customer data that `decode` merely slices, so drawing nine kilobytes
+/// an iteration would buy nothing and cost the fuzzer most of its throughput.
+const fuzz_drawn: usize = min_frame_len + b_tag_len + 64;
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [min_frame_len + b_tag_len + 64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+    var buf: [fuzz_max_frame]u8 = undefined;
+    smith.bytes(buf[0..fuzz_drawn]);
+    // A size class rather than one uniform draw: uniform over the whole range
+    // would almost never land near `min_frame_len`, where the truncations are.
+    const len: usize = switch (smith.valueRangeAtMost(u8, 0, 5)) {
+        0 => smith.valueRangeAtMost(u16, 0, @intCast(fuzz_drawn)),
+        1 => min_frame_len + 1500,
+        2 => min_frame_len + b_tag_len + 1500,
+        3 => fuzz_max_frame, // jumbo
+        4 => smith.valueRangeAtMost(u16, 0, @intCast(fuzz_max_frame)),
+        else => smith.valueRangeAtMost(u16, @intCast(min_frame_len), @intCast(fuzz_max_frame)),
+    };
+    @memset(buf[fuzz_drawn..], smith.value(u8));
 
     // Bias toward the deeper paths: sometimes plant a valid tag region so the
     // fuzzer reaches the I-TCI/C-DA/C-SA parsing instead of bailing early.

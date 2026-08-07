@@ -636,3 +636,202 @@ test "round trip: what the encoder writes, the response reader's grammar reads" 
     try testing.expectEqualStrings("Sent \"Items\"", name);
     try d.expectCrlf();
 }
+
+// ── the encode side, fuzzed ─────────────────────────────────────────────────
+//
+// W2 A3 recorded that this module's *decode* side was fuzzed and its encode
+// side was not: `grep -c 'testing.fuzz(' src/*.zig` found harnesses in
+// `utf7.zig` and `response.zig` only, so the whole builder surface — the one a
+// caller feeds a mailbox name, a tag or a password from a config file or a UI
+// — had none. `search.zig` and `fetch.zig` have since grown one each; the
+// builders in *this* file still had none, which is where the command-injection
+// finding lived.
+//
+// The invariant is not "no CR anywhere": `string` may legitimately put a CR
+// inside a counted literal, and a password containing one has to be sendable.
+// It is the framing property that injection actually breaks — **every octet
+// that is not inside a declared literal payload is free of CR, LF and NUL, and
+// the declared lengths land exactly on the closing CRLF.** A `{n}` that lies
+// about its length and a CR written outside a literal both fail it.
+
+/// Walks a finished command line the way a server's parser does: literal
+/// headers are honoured and their payloads skipped, everything else must be
+/// free of the three octets that end or truncate a line.
+fn framedAsOneCommand(line: []const u8) bool {
+    if (!std.mem.endsWith(u8, line, "\r\n")) return false;
+    const end = line.len - 2;
+    var i: usize = 0;
+    while (i < end) {
+        if (line[i] == '{') lit: {
+            var j = i + 1;
+            var n: usize = 0;
+            var digits: usize = 0;
+            while (j < line.len and std.ascii.isDigit(line[j])) : (j += 1) {
+                n = n *| 10 +| (line[j] - '0');
+                digits += 1;
+            }
+            if (digits == 0) break :lit;
+            if (j < line.len and line[j] == '+') j += 1;
+            if (j + 2 >= line.len) break :lit;
+            if (line[j] != '}' or line[j + 1] != '\r' or line[j + 2] != '\n') break :lit;
+            const payload = j + 3;
+            // A length that runs past the buffer is the failure, not a reason
+            // to keep scanning as if it were text.
+            if (payload > line.len or n > line.len - payload) return false;
+            i = payload + n;
+            continue;
+        }
+        const c = line[i];
+        if (c == '\r' or c == '\n' or c == 0) return false;
+        i += 1;
+    }
+    // A literal payload that swallowed the terminating CRLF leaves `i > end`:
+    // the line the server sees does not end where this one thinks it does.
+    return i == end;
+}
+
+fn noWait(_: ?*anyopaque) anyerror!void {}
+
+/// See `goose.zig` in `iec61850` for the same reasoning: without `--fuzz` the
+/// runner feeds `options.corpus` and one empty input, and an empty input makes
+/// every draw return its range minimum — every string empty, every flag false.
+/// A seed therefore has to be shaped: `arg_bytes` octets for the single
+/// `smith.bytes` draw, drawn from an alphabet that contains the octets this
+/// invariant is about, then one little-endian `u64` per scalar draw carrying 0
+/// or 1 (any other value falls outside a `bool`'s range and is discarded).
+const arg_bytes = 96;
+
+fn cmdSeed(comptime alphabet: []const u8, comptime bits: u64, comptime n: usize) [n]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [n]u8 = undefined;
+    for (out[0..arg_bytes], 0..) |*b, i| b.* = alphabet[(i * 7 + (bits & 0xF)) % alphabet.len];
+    var i: usize = arg_bytes;
+    var w: u6 = 0;
+    while (i + 8 <= n) : (i += 8) {
+        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 1, .little);
+        w +%= 1;
+    }
+    return out;
+}
+
+const cmd_seeds: []const []const u8 = &.{
+    &cmdSeed("\r\n\x00A1 LOGOUT", 0x9E37_79B9_7F4A_7C15, 512),
+    &cmdSeed("\"\\&{}[]12 \r\n", 0x0123_4567_89AB_CDEF, 512),
+    &cmdSeed("\x00\xC3\xA9&-INBOX\r\n", 0xF0E1_D2C3_B4A5_9687, 512),
+    &cmdSeed("abc\rdef\nghi", 0xFFFF_FFFF_FFFF_FFFF, 512),
+    &cmdSeed("\\Seen \\*\r\n\x00", 0x6C62_1F4D_3A98_5E27, 512),
+};
+
+test "fuzz: no command builder can put a second command line on the wire" {
+    try testing.fuzz({}, fuzzBuilders, .{ .corpus = cmd_seeds });
+}
+
+fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
+    var raw: [arg_bytes]u8 = undefined;
+    smith.bytes(&raw);
+    const tag = raw[0..smith.valueRangeAtMost(u8, 0, 16)];
+    const user = raw[16..][0..smith.valueRangeAtMost(u8, 0, 24)];
+    const pass = raw[40..][0..smith.valueRangeAtMost(u8, 0, 24)];
+    const name = raw[64..][0..smith.valueRangeAtMost(u8, 0, 16)];
+    const fl = raw[80..][0..smith.valueRangeAtMost(u8, 0, 16)];
+
+    const opts = Options{
+        .quoted_utf8 = smith.value(bool),
+        .literal_minus = smith.value(bool),
+        .literal_plus = smith.value(bool),
+        // Without a callback a synchronising literal is refused outright, which
+        // is a legal outcome but reaches none of the literal-writing code.
+        .on_sync = if (smith.value(bool)) null else noWait,
+    };
+
+    const gpa = testing.allocator;
+
+    // The commands whose only unframed argument is the tag.
+    inline for (.{ "capability", "noop", "logout", "startTls" }) |which| {
+        var s: Sink = undefined;
+        s.init();
+        var e = s.enc(gpa, opts);
+        if (@field(Encoder, which)(&e, tag)) |_| {
+            if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
+            // No literal is possible here, so the stronger form must hold too.
+            const body = s.written()[0 .. s.written().len - 2];
+            if (std.mem.indexOfScalar(u8, body, '\r') != null) return error.CarriageReturnInCommand;
+            if (std.mem.indexOfScalar(u8, body, '\n') != null) return error.LineFeedInCommand;
+            if (std.mem.indexOfScalar(u8, body, 0) != null) return error.NulInCommand;
+        } else |_| {}
+    }
+
+    {
+        var s: Sink = undefined;
+        s.init();
+        var e = s.enc(gpa, opts);
+        if (e.login(tag, user, pass)) |_| {
+            if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
+        } else |_| {}
+    }
+    {
+        var s: Sink = undefined;
+        s.init();
+        var e = s.enc(gpa, opts);
+        if (e.select(tag, name, smith.value(bool))) |_| {
+            if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
+        } else |_| {}
+    }
+
+    // The primitives, each on its own writer so one refusal does not mask the
+    // next. `flag` and `atom` frame nothing at all, so anything they write must
+    // be free of the three octets outright.
+    inline for (.{ "atom", "flag" }) |which| {
+        var s: Sink = undefined;
+        s.init();
+        var e = s.enc(gpa, opts);
+        if (@field(Encoder, which)(&e, fl)) |_| {
+            const out = s.written();
+            if (std.mem.indexOfScalar(u8, out, '\r') != null) return error.CarriageReturnInArgument;
+            if (std.mem.indexOfScalar(u8, out, '\n') != null) return error.LineFeedInArgument;
+            if (std.mem.indexOfScalar(u8, out, 0) != null) return error.NulInArgument;
+        } else |_| {}
+    }
+    {
+        // `quoted` frames with `"`, so what it writes must stay inside them:
+        // one leading quote, one trailing quote, and every interior `"` or `\`
+        // escaped. A CR would end the line regardless of the quotes.
+        var s: Sink = undefined;
+        s.init();
+        var e = s.enc(gpa, opts);
+        if (e.quoted(user)) |_| {
+            const out = s.written();
+            if (out.len < 2 or out[0] != '"' or out[out.len - 1] != '"') return error.NotQuoted;
+            if (std.mem.indexOfScalar(u8, out, '\r') != null) return error.CarriageReturnInQuoted;
+            if (std.mem.indexOfScalar(u8, out, '\n') != null) return error.LineFeedInQuoted;
+            if (std.mem.indexOfScalar(u8, out, 0) != null) return error.NulInQuoted;
+            var k: usize = 1;
+            while (k < out.len - 1) : (k += 1) {
+                if (out[k] == '\\') {
+                    k += 1;
+                    if (k >= out.len - 1) return error.DanglingEscape;
+                } else if (out[k] == '"') return error.UnescapedQuote;
+            }
+        } else |_| {}
+    }
+    {
+        // A mailbox name must survive the encoding it was given: `mailbox`
+        // writes an astring, so the framing property is the one that holds.
+        var s: Sink = undefined;
+        s.init();
+        var e = s.enc(gpa, opts);
+        if (e.mailbox(name)) |_| {
+            try e.crlf();
+            if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
+        } else |_| {}
+    }
+    {
+        var s: Sink = undefined;
+        s.init();
+        var e = s.enc(gpa, opts);
+        if (e.string(pass)) |_| {
+            try e.crlf();
+            if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
+        } else |_| {}
+    }
+}

@@ -130,16 +130,137 @@ test "fuzz: PDU/TLV decode never panics/OOBs/over-allocates on hostile bytes" {
     try std.testing.fuzz({}, fuzzDecode, .{});
 }
 
+/// `sub` must lie entirely inside `input`. Checked as an offset and a length,
+/// never as a raw pointer comparison — a wrapped length is the failure mode
+/// being looked for, and `ptr + len` would wrap along with it.
+fn within(sub: []const u8, input: []const u8) void {
+    std.debug.assert(@intFromPtr(sub.ptr) >= @intFromPtr(input.ptr));
+    const off = @intFromPtr(sub.ptr) - @intFromPtr(input.ptr);
+    std.debug.assert(off <= input.len);
+    std.debug.assert(sub.len <= input.len - off);
+}
+
+/// W2 A3 recorded that this harness reached `tlv.TlvIterator` and nothing else:
+/// `walkTlvs` built one raw walker and stopped, so `spb.{MtCapability,
+/// SpbInstance, SpbmServiceId}.decode` and the five `tlvs.*Iterator`s — every
+/// **fixed-offset** reader in the module, which is the shape that over-reads —
+/// were never handed a hostile byte. Dispatching on the TLV code would not have
+/// been enough on its own: a 128-octet random buffer almost never spells `144`
+/// in a length-consistent position, so the typed decoders would still have been
+/// entered on a vanishing fraction of iterations. Every typed decoder is
+/// therefore run on **every** value, code or no code — each one is a total
+/// function on bytes, and the only question is whether it stays in bounds.
+fn driveTyped(value: []const u8, input: []const u8) void {
+    var guard: usize = 0;
+
+    var areas = tlvs.AreaAddressIterator.init(value);
+    while (true) {
+        const a = (areas.next() catch break) orelse break;
+        within(a, input);
+        guard += 1;
+        std.debug.assert(guard <= input.len + 1);
+    }
+
+    var snpas = tlvs.SnpaIterator.init(value);
+    guard = 0;
+    while (true) {
+        _ = (snpas.next() catch break) orelse break;
+        guard += 1;
+        std.debug.assert(guard <= input.len + 1);
+    }
+
+    if (tlvs.IsReachIterator.init(value)) |init_ok| {
+        var reach = init_ok;
+        _ = reach.virtualFlag();
+        guard = 0;
+        while (true) {
+            _ = (reach.next() catch break) orelse break;
+            guard += 1;
+            std.debug.assert(guard <= input.len + 1);
+        }
+    } else |_| {}
+
+    var ext = tlvs.ExtIsReachIterator.init(value);
+    guard = 0;
+    while (true) {
+        const e = (ext.next() catch break) orelse break;
+        within(e.sub_tlvs, input);
+        var esub = e.subTlvIterator();
+        while (true) {
+            const s = (esub.next() catch break) orelse break;
+            within(s.value, input);
+        }
+        guard += 1;
+        std.debug.assert(guard <= input.len + 1);
+    }
+
+    var entries = tlvs.LspEntryIterator.init(value);
+    guard = 0;
+    while (true) {
+        _ = (entries.next() catch break) orelse break;
+        guard += 1;
+        std.debug.assert(guard <= input.len + 1);
+    }
+
+    // The SPB container and its two fixed-layout sub-TLVs.
+    if (spb.MtCapability.decode(value)) |mt| {
+        within(mt.sub_tlvs, input);
+        var msub = mt.subTlvIterator();
+        guard = 0;
+        while (true) {
+            const s = (msub.next() catch break) orelse break;
+            within(s.value, input);
+            driveSpb(s.value, input);
+            guard += 1;
+            std.debug.assert(guard <= input.len + 1);
+        }
+    } else |_| {}
+    // Also unconditionally, so the sub-TLV readers do not depend on the
+    // container preamble having been synthesised first.
+    driveSpb(value, input);
+}
+
+fn driveSpb(value: []const u8, input: []const u8) void {
+    var guard: usize = 0;
+    if (spb.SpbInstance.decode(value)) |inst| {
+        within(inst.tuple_bytes, input);
+        std.debug.assert(inst.tuple_bytes.len == @as(usize, inst.num_trees) * 8);
+        var tuples = inst.tupleIterator();
+        while (true) {
+            _ = (tuples.next() catch break) orelse break;
+            guard += 1;
+            std.debug.assert(guard <= input.len + 1);
+        }
+    } else |_| {}
+    if (spb.SpbmServiceId.decode(value)) |si| {
+        within(si.isid_bytes, input);
+        std.debug.assert(si.isid_bytes.len % 4 == 0);
+        var isids = si.isidIterator();
+        guard = 0;
+        while (true) {
+            _ = (isids.next() catch break) orelse break;
+            guard += 1;
+            std.debug.assert(guard <= input.len + 1);
+        }
+    } else |_| {}
+}
+
 fn walkTlvs(bytes: []const u8, input: []const u8) void {
     var it = tlv.TlvIterator.init(bytes);
     var guard: usize = 0;
     while (it.next() catch return) |t| {
         // Every yielded value must be a subslice of the original input.
-        std.debug.assert(@intFromPtr(t.value.ptr) >= @intFromPtr(input.ptr));
-        std.debug.assert(@intFromPtr(t.value.ptr) + t.value.len <= @intFromPtr(input.ptr) + input.len);
+        within(t.value, input);
         // One level of sub-TLV walking (extended-reach / SPB shape).
         var sub = tlv.TlvIterator.init(t.value);
-        while (sub.next() catch break) |_| {}
+        while (true) {
+            const s = (sub.next() catch break) orelse break;
+            within(s.value, input);
+            driveTyped(s.value, input);
+        }
+        // …and the typed views of this value, which is where the fixed-offset
+        // reads live.
+        driveTyped(t.value, input);
         guard += 1;
         std.debug.assert(guard <= input.len); // the walk must terminate
     }

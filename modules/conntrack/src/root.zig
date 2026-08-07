@@ -154,13 +154,27 @@ pub const DumpError = netlink.DumpError || RecvError || SendError;
 /// superset of `netlink.RequestError`, so `netlink.writeErrorFromCode` is
 /// reused verbatim: `NotFound` is what an untracked tuple yields, `Exists` an
 /// `NLM_F_EXCL` insert of a flow the kernel already knows.
-pub const RequestError = netlink.RequestError || RecvError || SendError;
+///
+/// `TooManyMessages` is this module's own addition (**W2 audit finding,
+/// campaign C-06, `conntrack` F6**): `awaitFlow` used to loop on
+/// `recvDatagram` until a message matching `(portid, seq)` arrived, with no
+/// upper bound — a kernel that answers neither `NLMSG_ERROR` nor
+/// `IPCTNL_MSG_CT_NEW` on that sequence spun the caller forever.
+pub const RequestError = netlink.RequestError || RecvError || SendError || error{TooManyMessages};
 
 /// Everything a write op can fail with: request construction + transport +
 /// the kernel's mapped errno.
 pub const WriteError = RequestError || BuildError;
 
 const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
+
+/// Ceiling on how many netlink messages `awaitFlow` may consume before
+/// giving up. See the sibling `ethtool`/`devlink`/`nl80211` clients'
+/// identical constant for the full rationale: the kernel is the only
+/// verified sender on this socket (`netlink.Socket.recvDatagramStrict`
+/// drops any datagram whose sender pid is not 0), so this is a robustness
+/// ceiling against a malfunctioning driver, not an attacker-facing bound.
+const max_await_messages: u32 = 65536;
 
 // ── socket ──────────────────────────────────────────────────────────────────
 
@@ -362,30 +376,48 @@ pub const Socket = struct {
     }
 
     /// Wait for the single `IPCTNL_MSG_CT_NEW` answer to a GET on `seq`.
+    /// **W2 audit finding, campaign C-06 (`conntrack` F6)**: this used to
+    /// loop on `recvDatagram` with no upper bound — a kernel that answers
+    /// neither `NLMSG_ERROR` nor `IPCTNL_MSG_CT_NEW` on this sequence spun
+    /// the caller forever. `awaitFlowOver` is the bounded engine, factored
+    /// out (same reason `dumpOver` is) so the existing `ScriptedTransport`
+    /// test fixture can drive it without a real socket.
     fn awaitFlow(self: *Socket, seq: u32) RequestError!Flow {
         self.nl.ext_ack_len = 0;
-        while (true) {
-            const dgram = try self.recvDatagram();
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.nl.portid or m.seq != seq) continue;
-                switch (m.type) {
-                    codec.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        self.nl.captureExtAck(m);
-                        // A bare ACK carries no entry — treat it like ENOENT.
-                        if (code == 0) return error.NotFound;
-                        return netlink.writeErrorFromCode(code);
-                    },
-                    codec.NLMSG_OVERRUN => return error.Overrun,
-                    wire.msg_ct_new => return wire.decodeFlow(m.payload) catch
-                        error.MalformedReply,
-                    else => {},
-                }
+        return awaitFlowOver(self, seq);
+    }
+};
+
+/// The body of `Socket.awaitFlow`, taking `transport: anytype` for the same
+/// reason `dumpOver` does: `Socket` already defines `recvDatagram()`,
+/// `portId()` and `captureExtAck(msg)` (see below `dump`, above) precisely so
+/// it satisfies this shape, and the `ScriptedTransport` test fixture near
+/// `dumpOver`'s tests satisfies the same shape without a real socket.
+fn awaitFlowOver(transport: anytype, seq: u32) RequestError!Flow {
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_await_messages) return error.TooManyMessages;
+        const dgram = try transport.recvDatagram();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            if (m.pid != transport.portId() or m.seq != seq) continue;
+            switch (m.type) {
+                codec.NLMSG_ERROR => {
+                    const code = m.errorCode() catch return error.MalformedReply;
+                    transport.captureExtAck(m);
+                    // A bare ACK carries no entry — treat it like ENOENT.
+                    if (code == 0) return error.NotFound;
+                    return netlink.writeErrorFromCode(code);
+                },
+                codec.NLMSG_OVERRUN => return error.Overrun,
+                wire.msg_ct_new => return wire.decodeFlow(m.payload) catch
+                    error.MalformedReply,
+                else => {},
             }
         }
     }
-};
+}
 
 /// The multi-part dump engine, factored out of `Socket.dump` so it is a **seam**
 /// like `EventIterator`: everything here is ctnetlink policy (which request,
@@ -684,6 +716,24 @@ test "dump engine: a kernel error reply is mapped and stops the dump" {
     // The flows collected before the error are released by the engine's
     // errdefer; std.testing.allocator fails the test if they are not.
     try testing.expectError(error.AccessDenied, dumpOver(testing.allocator, &t, .unspec));
+}
+
+// ── C-06 regression: awaitFlow must not spin forever ───────────────────────
+// W2-nn (`conntrack` F6, campaign C-06): `awaitFlow` looped on `recvDatagram`
+// until a message matching `(portid, seq)` arrived, with no upper bound — a
+// kernel that answers neither `NLMSG_ERROR` nor `IPCTNL_MSG_CT_NEW` on that
+// sequence spun the caller forever. Reuses `ScriptedTransport`, the same
+// fixture `dumpOver`'s tests above already use.
+
+test "awaitFlow errors out instead of looping forever on a never-matching reply" {
+    // A datagram addressed to a different (pid, seq) than the one awaitFlow
+    // is waiting for, so it is skipped forever instead of ever matching.
+    const bogus = controlDatagram(999, 999, 0);
+    var script_buf: [max_await_messages][]const u8 = undefined;
+    for (&script_buf) |*s| s.* = &bogus;
+    var t: ScriptedTransport = .{ .script = &script_buf, .pid = 1, .seq = 42 };
+    try testing.expectError(error.TooManyMessages, awaitFlowOver(&t, 42));
+    try testing.expectEqual(t.script.len, t.pos);
 }
 
 test "fuzz: the dump engine survives any interleaving of dump replies" {
