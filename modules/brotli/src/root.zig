@@ -149,6 +149,70 @@ test "decode: empty input is truncated error" {
     try testing.expectError(error.TruncatedInput, decompress(testing.allocator, "", .{}));
 }
 
+// --- W2-P07 (brotli F2): transform buffer sizing ---------------------------
+// `transforms.transformWord` writes prefix + word + suffix into the caller's
+// buffer with no internal bounds error path. It is safe in the decoder only
+// because the buffer is large enough for the worst-case transform. That worst
+// case is a property of the RFC 7932 pool + transform tables, so this test
+// asserts, by brute force over every transform and every legal word length,
+// that `transforms.maxOutputLen` really bounds the output — and that the
+// decoder's buffer is sized from it. Undersize the buffer (revert the fix) and
+// the writes run past the `dst` slice: a Debug/ReleaseSafe bounds panic here,
+// a silent stack smash under ReleaseFast.
+test "transform: maxOutputLen bounds every transform's output" {
+    const transforms = @import("transforms.zig");
+    const dict = @import("dictionary.zig");
+
+    const cap = transforms.maxOutputLen(dict.max_word_length);
+    // A guard region after the slice we hand to transformWord; if the bound is
+    // wrong the writes spill into it (and, because we pass an exact-size slice,
+    // trip the bounds check first).
+    var backing: [512]u8 = undefined;
+    const guard = 0xAA;
+
+    var ti: usize = 0;
+    while (ti < transforms.num_transforms) : (ti += 1) {
+        var wlen: usize = dict.min_word_length;
+        while (wlen <= dict.max_word_length) : (wlen += 1) {
+            // A word made of letters so UPPERCASE_* transforms do real work.
+            var word: [dict.max_word_length]u8 = undefined;
+            for (word[0..wlen], 0..) |*b, i| b.* = @intCast('a' + (i % 26));
+
+            @memset(&backing, guard);
+            const out = transforms.transformWord(backing[0..cap], word[0..wlen], wlen, ti);
+            try testing.expect(out <= cap);
+            for (backing[cap..]) |b| try testing.expectEqual(@as(u8, guard), b);
+        }
+    }
+}
+
+// --- W2-P07 continued: end-to-end max-length transform ---------------------
+// The `quickfox`/`ukkonooa` fixtures already exercise the dictionary path; this
+// pins that the maximum-output transform decodes correctly through the resized
+// buffer. (See the transform unit test above for the biting invariant.)
+test "decode: dictionary transforms decode correctly (regression corpus)" {
+    try expectDecodes("quickfox");
+    try expectDecodes("zerosukkanooa");
+}
+
+// --- W2-P07: F4 was NOT a defect — parity with google/brotli ---------------
+// F4 suspected a non-terminating / zero-progress loop from a dictionary
+// reference whose transform yields zero output (`transformWord` returns 0),
+// which the guard at decoder.zig only rejects for `distance <= 120`. A zeroing
+// transform (OMIT_* >= word length) has transform index >= 34, so its address
+// is >= 34*2^shift and the distance is always >> 120 — the guard can never fire
+// for a genuine zero-output word, so such a reference is accepted. The stream
+// below is hand-crafted to hit exactly that path (transform 34, a 4-byte word
+// omitted whole, distance 34818). Both this decoder AND the google/brotli
+// reference decode it to "AA": accepting it is conformant, not a bug. This test
+// is a characterisation lock so the guard is not "hardened" into divergence.
+test "decode: zero-output dictionary transform matches reference (parity)" {
+    const comp = &[_]u8{ 0x22, 0x00, 0x00, 0x00, 0x44, 0x50, 0x28, 0x12, 0x6a, 0x01, 0x02 };
+    const got = try decompress(testing.allocator, comp, .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, "AA", got);
+}
+
 fn roundTrip(data: []const u8) !void {
     const comp = try compress(testing.allocator, data);
     defer testing.allocator.free(comp);

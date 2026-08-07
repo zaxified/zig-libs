@@ -323,41 +323,79 @@ fn rsaOaepUnwrap(
 }
 
 /// RSAES-PKCS#1 v1.5 decryption (RFC 8017 §7.2.2). Gated behind
-/// `allow_weak_rsa15`. The unpadding accumulates every check into one validity
-/// flag and returns a single generic `error.DecryptionError`, so it does not
-/// branch on padding validity (a Bleichenbacher oracle-hardening measure; note
-/// std does not let us fully hide the RSADP range check, which is on the
-/// public ciphertext anyway).
+/// `allow_weak_rsa15`.
+///
+/// Bleichenbacher hardening, stated precisely (see `SPEC.md` §"Constant-time
+/// posture" for what is and is not verified):
+///
+///   * Every validity check accumulates into one all-ones/all-zeros mask built
+///     from `ctEqByteMask` / `ctGeMaskUsize`, which are pure integer arithmetic.
+///     No `if`, no `while` condition and no array index anywhere in this
+///     function depends on the *contents* of `em`.
+///   * The separator search always walks the whole block; the message copy
+///     always performs the same fixed number of byte operations, over indices
+///     derived only from the (public) modulus length.
+///   * `out` is written with a fixed-length masked copy, so a rejected block
+///     leaves it all-zero rather than skipping the write.
+///   * Exactly one branch on secret-derived data remains — the final
+///     accept/reject — and it is the outcome itself, with nothing but the
+///     return after it. Both outcomes collapse to one `error.DecryptionError`
+///     at every caller.
+///
+/// `em.len`, the loop bounds and `wrapped.len` are all functions of the public
+/// modulus length. (std does not let us hide the RSADP range check, which is on
+/// the public ciphertext anyway.)
 fn rsaPkcs1v15Unwrap(sk: rsa.SecretKey, wrapped: []const u8, out: *[64]u8) Error![]const u8 {
     var em_buf: [rsa.max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &em_buf);
     const em = try rsaRawPrivate(sk, wrapped, &em_buf);
     // EM = 0x00 || 0x02 || PS || 0x00 || M, PS >= 8 nonzero octets (RFC 8017
-    // §7.2.2). Scan branch-light; collapse to one flag.
+    // §7.2.2). `em.len` is the modulus byte length: public.
     if (em.len < 11) return error.DecryptionError;
-    var good: u8 = 1;
-    good &= ctEq(em[0], 0x00);
-    good &= ctEq(em[1], 0x02);
+    const all_ones = ~@as(usize, 0);
+    var good: usize = all_ones;
+    good &= ctEqByteMask(em[0], 0x00);
+    good &= ctEqByteMask(em[1], 0x02);
     // Locate the first 0x00 at index >= 2; PS is everything before it and must
     // be all-nonzero and >= 8 bytes.
-    var seen_sep: u8 = 0;
+    var seen_sep: usize = 0;
     var sep_idx: usize = 0;
     var i: usize = 2;
     while (i < em.len) : (i += 1) {
-        const is_zero = ctEq(em[i], 0x00);
-        // record first separator position
-        const first = (seen_sep ^ 1) & is_zero;
+        const is_zero = ctEqByteMask(em[i], 0x00);
+        // Record the first separator position without branching on it.
+        const first = ~seen_sep & is_zero;
         sep_idx = ctSelectUsize(first, i, sep_idx);
         seen_sep |= is_zero;
     }
     good &= seen_sep; // a 0x00 terminator must exist
-    // PS length = sep_idx - 2 must be >= 8.
-    const ps_ok: u8 = if (sep_idx >= 10) 1 else 0;
-    good &= ps_ok;
-    const msg_len = if (sep_idx + 1 <= em.len) em.len - sep_idx - 1 else 0;
-    if (msg_len == 0 or msg_len > out.len) good = 0;
-    if (good != 1) return error.DecryptionError;
-    @memcpy(out[0..msg_len], em[sep_idx + 1 ..]);
+    // PS length = sep_idx - 2 must be >= 8, i.e. sep_idx >= 10.
+    good &= ctGeMaskUsize(sep_idx, 10);
+    // `sep_idx <= em.len - 1` always holds (it is either an in-range index or
+    // the 0 initialiser), so this cannot underflow and needs no guard.
+    const msg_len = em.len - sep_idx - 1;
+    good &= ~ctEqMaskUsize(msg_len, 0); // a zero-length message is not a CEK
+    good &= ctGeMaskUsize(out.len, msg_len); // and it must fit the CEK buffer
+
+    // Fixed-shape message extraction. Rather than reading `em` at the
+    // secret-derived offset `sep_idx + 1` (a data-dependent memory access), try
+    // every *public* separator position and keep the one that matches. The work
+    // done is a function of `em.len` alone.
+    var msg_buf: [64]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &msg_buf);
+    var s: usize = 2;
+    while (s + 1 < em.len) : (s += 1) {
+        const m: u8 = @truncate(ctEqMaskUsize(s, sep_idx));
+        const take = @min(em.len - s - 1, msg_buf.len);
+        for (msg_buf[0..take], em[s + 1 ..][0..take]) |*o, v| o.* |= v & m;
+    }
+    // Publish under the validity mask: on rejection `out` becomes all-zero
+    // rather than being left untouched, so the write is unconditional and no
+    // recovered plaintext survives in the caller's buffer.
+    const pub_mask: u8 = @truncate(good);
+    for (out, &msg_buf) |*o, v| o.* = v & pub_mask;
+
+    if (good == 0) return error.DecryptionError;
     return out[0..msg_len];
 }
 
@@ -524,12 +562,45 @@ fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn ctEq(a: u8, b: u8) u8 {
-    return @intFromBool(a == b);
+// These return an all-ones / all-zeros *mask*, not a 0/1 flag, and are written
+// as pure integer arithmetic so that no comparison operator (which lowers to a
+// branch or a conditional move at the compiler's discretion) sits on a secret.
+// `std.crypto.timing_safe` offers no scalar select or equality mask — only
+// `eql`/`compare` over slices and the valgrind `classify`/`declassify`
+// annotations — so these are the minimum that has to be hand-rolled.
+//
+// The mask width is `usize` throughout so that masks can be combined with
+// index arithmetic without a widening step.
+
+const usize_bits = @bitSizeOf(usize);
+
+/// All-ones iff `a == b`, all-zeros otherwise. Branch-free.
+fn ctEqByteMask(a: u8, b: u8) usize {
+    // `d | -d` has its top bit set for every d != 0, and is 0 for d == 0.
+    const d: usize = a ^ b;
+    const nonzero = (d | (0 -% d)) >> (usize_bits - 1);
+    return nonzero -% 1;
 }
 
-fn ctSelectUsize(cond: u8, a: usize, b: usize) usize {
-    return if (cond == 1) a else b;
+/// All-ones iff `a == b`, all-zeros otherwise. Branch-free.
+fn ctEqMaskUsize(a: usize, b: usize) usize {
+    const d = a ^ b;
+    const nonzero = (d | (0 -% d)) >> (usize_bits - 1);
+    return nonzero -% 1;
+}
+
+/// All-ones iff `a >= b` (unsigned), all-zeros otherwise. Branch-free.
+fn ctGeMaskUsize(a: usize, b: usize) usize {
+    // Hacker's Delight §2-12: the borrow out of `a - b` — which is exactly the
+    // predicate `a < b` for unsigned operands — is the top bit of
+    // `(~a & b) | (~(a ^ b) & (a - b))`.
+    const lt = ((~a & b) | (~(a ^ b) & (a -% b))) >> (usize_bits - 1);
+    return lt -% 1;
+}
+
+/// `a` when `mask` is all-ones, `b` when it is all-zeros. Branch-free.
+fn ctSelectUsize(mask: usize, a: usize, b: usize) usize {
+    return (a & mask) | (b & ~mask);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -694,4 +765,97 @@ test "TEETH: PKCS#1 v1.5 unpadding rejects a message longer than the CEK buffer"
     const ok = buildEm(k, 0x00, 0x02, 93, 32, true);
     const rec = try unpadEm(k, ok, kp, &out);
     try testing.expectEqualSlices(u8, ok[k - 32 ..], rec);
+}
+
+// ── constant-time shape of the v1.5 unpadding (F3) ──────────────────────────
+//
+// WHAT THESE TESTS PROVE, AND WHAT THEY DO NOT.
+//
+// They prove the *structural* half of the constant-time claim: that the write
+// into the caller's CEK buffer has a fixed length and happens on every path,
+// accept and reject alike, rather than being a `@memcpy` of `msg_len` bytes
+// read from the secret-derived offset `sep_idx + 1` and skipped entirely by an
+// early `return error`. That is observable from Zig, and it is what the two
+// tests below assert.
+//
+// They do NOT prove that the compiled code is branch-free, and they cannot:
+// a unit test cannot measure timing, cannot see a conditional move, and cannot
+// stop a future compiler from lowering the mask arithmetic into a branch. The
+// tools that could — valgrind/ctgrind via `std.crypto.timing_safe.classify`,
+// or a dudect-style statistical harness — are not wired into this repo, and a
+// green test that measures none of that would be worse than saying so. The
+// remaining assurance for the arithmetic itself is that the mask helpers are
+// exhaustively tested below and are load-bearing: get a mask wrong and the
+// RFC 8017 §7.2.2 teeth tests above go red.
+//
+// See `SPEC.md` §"Constant-time posture" for the same statement in prose.
+
+test "TEETH (F3): the v1.5 message copy has a fixed length, not msg_len" {
+    const k = 64;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+
+    // A short (16-byte) CEK. A `@memcpy(out[0..msg_len], …)` touches 16 bytes
+    // and leaves the other 48 as the caller left them; the constant-time copy
+    // writes all 64.
+    var out: [64]u8 = @splat(0xAA);
+    const em = buildEm(k, 0x00, 0x02, 45, 16, true);
+    const rec = try unpadEm(k, em, kp, &out);
+    try testing.expectEqualSlices(u8, em[k - 16 ..], rec);
+    for (out[16..], 16..) |b, idx| {
+        if (b != 0) {
+            std.debug.print(
+                "v1.5 copy is msg_len-sized: out[{d}] still holds the caller's 0x{X:0>2}\n",
+                .{ idx, b },
+            );
+            return error.MessageCopyLengthLeaksMsgLen;
+        }
+    }
+}
+
+test "TEETH (F3): a rejected v1.5 block still writes the CEK buffer, and writes zero" {
+    const k = 64;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+
+    // PS = 7 is one octet below the RFC 8017 minimum: rejected, but every
+    // other part of the block is well formed, so a `msg_len`-sized copy placed
+    // before the validity branch would deposit 54 bytes of recovered plaintext
+    // here and an early `return error` would deposit none. Both are visible.
+    var out: [64]u8 = @splat(0xAA);
+    const bad = buildEm(k, 0x00, 0x02, 7, 54, true);
+    try testing.expectError(error.DecryptionError, unpadEm(k, bad, kp, &out));
+    for (out, 0..) |b, idx| {
+        if (b != 0) {
+            std.debug.print(
+                "rejected v1.5 block left out[{d}] = 0x{X:0>2} (0xAA = write skipped, else = plaintext residue)\n",
+                .{ idx, b },
+            );
+            return error.RejectPathSkipsTheCopy;
+        }
+    }
+}
+
+test "constant-time mask helpers (exhaustive over u8, table over usize)" {
+    const ones = ~@as(usize, 0);
+
+    // ctEqByteMask: all 65536 byte pairs.
+    var a: usize = 0;
+    while (a < 256) : (a += 1) {
+        var b: usize = 0;
+        while (b < 256) : (b += 1) {
+            const want: usize = if (a == b) ones else 0;
+            try testing.expectEqual(want, ctEqByteMask(@intCast(a), @intCast(b)));
+        }
+    }
+
+    const vals = [_]usize{ 0, 1, 2, 8, 9, 10, 11, 63, 64, 65, 255, 512, ones >> 1, ones - 1, ones };
+    for (vals) |x| {
+        for (vals) |y| {
+            try testing.expectEqual(@as(usize, if (x == y) ones else 0), ctEqMaskUsize(x, y));
+            try testing.expectEqual(@as(usize, if (x >= y) ones else 0), ctGeMaskUsize(x, y));
+            try testing.expectEqual(x, ctSelectUsize(ones, x, y));
+            try testing.expectEqual(y, ctSelectUsize(0, x, y));
+        }
+    }
 }

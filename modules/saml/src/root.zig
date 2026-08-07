@@ -381,6 +381,10 @@ pub const ConsumeError = error{
     StatusNotSuccess,
     /// `<Issuer>` did not equal `Config.idp_entity_id`.
     IssuerMismatch,
+    /// The `<Assertion>` carried no `<saml:Issuer>` at all. SAMLCore §2.3.3
+    /// makes the element REQUIRED on an assertion, so its absence is a hard
+    /// error — never a skipped `idp_entity_id` check.
+    IssuerMissing,
     /// `<Response Destination>` was present and did not equal `Config.acs_url`.
     DestinationMismatch,
     /// No `<Assertion>` (and no EncryptedAssertion) — nothing to consume.
@@ -533,12 +537,21 @@ fn processResponse(alloc: std.mem.Allocator, doc: *const xml.Document, config: C
     const code = status_code.attr("", "Value") orelse return error.MalformedResponse;
     if (!std.mem.eql(u8, code, status_success)) return error.StatusNotSuccess;
 
-    // Response Issuer (optional element; when present it MUST match).
-    if (childEl(root, saml_ns, "Issuer")) |iss| {
-        const t = try textAlloc(alloc, iss);
-        defer alloc.free(t);
-        if (!std.mem.eql(u8, trim(t), config.idp_entity_id)) return error.IssuerMismatch;
-    }
+    // Response-level Issuer. This is the ONE consumer where omission is legal,
+    // and it is legal because the profile says so, verbatim —
+    // SAMLProf §4.1.4.2 <Response> Usage, first bullet: "The <Issuer> element
+    // MAY be omitted, but if present it MUST contain the unique identifier of
+    // the issuing identity provider". Making it mandatory here would refuse
+    // conformant IdPs.
+    //
+    // That permission used to be the whole of `idp_entity_id` enforcement,
+    // which made deleting one element an authentication bypass. It is not any
+    // more: the *assertion's* own Issuer is now checked and required in
+    // `buildResult`, and SAMLProf §4.1.4.2 fourth bullet guarantees there is
+    // always an assertion to check ("It MUST contain at least one
+    // <Assertion>. Each assertion's <Issuer> element MUST contain the unique
+    // identifier of the issuing identity provider").
+    try checkIssuer(ConsumeError, alloc, root, config.idp_entity_id, false);
 
     // Response Destination (optional attribute; when present it MUST match ACS).
     if (root.attr("", "Destination")) |dest| {
@@ -830,6 +843,28 @@ fn signedTargetMatches(doc: *const xml.Document, res: *const xmldsig.Result, tar
 fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Config, cert_in: *?[]u8) ConsumeError!AuthnResult {
     const now = config.now_unix;
     const skew = config.clock_skew_secs;
+
+    // ── Assertion Issuer ─────────────────────────────────────────────────────
+    // REQUIRED, and this is the check that closes the bypass. SAMLCore §2.3.3
+    // "Element <Assertion>" lists, verbatim:
+    //
+    //     <Issuer> [Required]
+    //         The SAML authority that is making the claim(s) in the assertion.
+    //         The issuer SHOULD be unambiguous to the intended relying parties.
+    //
+    // and its schema fragment declares `<element ref="saml:Issuer"/>` with no
+    // `minOccurs`, i.e. minOccurs=1. SAMLProf §4.1.4.2 <Response> Usage adds
+    // the value requirement: "Each assertion's <Issuer> element MUST contain
+    // the unique identifier of the issuing identity provider".
+    //
+    // (The audit's to-do cited SAMLProf §4.1.4.3 for this. It does not say it:
+    // §4.1.4.3 <Response> Message Processing Rules lists signature, Recipient,
+    // NotOnOrAfter, InResponseTo and Address, and never mentions <Issuer>.
+    // §4.1.4.2 is the section that does.)
+    //
+    // This runs on the signature-verified assertion, and it runs for BOTH the
+    // cleartext and the EncryptedAssertion path, because both reach here.
+    try checkIssuer(ConsumeError, alloc, asrt, config.idp_entity_id, true);
 
     var one_time_use = false;
     var session_noa: ?i64 = null;
@@ -2241,6 +2276,10 @@ pub const LogoutRequestError = error{
     MalformedRequest,
     NotLogoutRequest,
     IssuerMismatch,
+    /// No `<saml:Issuer>` on the `<LogoutRequest>`. SAMLProf §4.4.4.1: "The
+    /// `<Issuer>` element MUST be present and MUST contain the unique
+    /// identifier of the requesting entity."
+    IssuerMissing,
     DestinationMismatch,
     /// No `<ds:Signature>` found under `.embedded` — never downgraded to
     /// trusting an unsigned request.
@@ -2308,11 +2347,12 @@ pub fn consumeLogoutRequestXml(
     const root = doc.root;
     if (!isEl(root, samlp_ns, "LogoutRequest")) return error.NotLogoutRequest;
 
-    if (childEl(root, saml_ns, "Issuer")) |iss| {
-        const t = try textAlloc(alloc, iss);
-        defer alloc.free(t);
-        if (!std.mem.eql(u8, trim(t), config.idp_entity_id)) return error.IssuerMismatch;
-    }
+    // REQUIRED. SAMLProf §4.4.4.1 <LogoutRequest> Usage, verbatim: "The
+    // <Issuer> element MUST be present and MUST contain the unique identifier
+    // of the requesting entity". (SAMLCore's RequestAbstractType schema has it
+    // `minOccurs="0"`, so schema validation alone would not catch omission —
+    // the profile is what makes this fail-closed.)
+    try checkIssuer(LogoutRequestError, alloc, root, config.idp_entity_id, true);
     if (root.attr("", "Destination")) |dest| {
         if (config.expected_destination) |exp| {
             if (!std.mem.eql(u8, dest, exp)) return error.DestinationMismatch;
@@ -2420,6 +2460,10 @@ pub const LogoutResponseError = error{
     MalformedResponse,
     NotLogoutResponse,
     IssuerMismatch,
+    /// No `<saml:Issuer>` on the `<LogoutResponse>`. SAMLProf §4.4.4.2: "The
+    /// `<Issuer>` element MUST be present and MUST contain the unique
+    /// identifier of the responding entity."
+    IssuerMissing,
     DestinationMismatch,
     SignatureMissing,
     SignatureInvalid,
@@ -2482,11 +2526,10 @@ pub fn consumeLogoutResponseXml(
     const root = doc.root;
     if (!isEl(root, samlp_ns, "LogoutResponse")) return error.NotLogoutResponse;
 
-    if (childEl(root, saml_ns, "Issuer")) |iss| {
-        const t = try textAlloc(alloc, iss);
-        defer alloc.free(t);
-        if (!std.mem.eql(u8, trim(t), config.idp_entity_id)) return error.IssuerMismatch;
-    }
+    // REQUIRED. SAMLProf §4.4.4.2 <LogoutResponse> Usage, verbatim: "The
+    // <Issuer> element MUST be present and MUST contain the unique identifier
+    // of the responding entity".
+    try checkIssuer(LogoutResponseError, alloc, root, config.idp_entity_id, true);
     if (root.attr("", "Destination")) |dest| {
         if (config.expected_destination) |exp| {
             if (!std.mem.eql(u8, dest, exp)) return error.DestinationMismatch;
@@ -2706,6 +2749,10 @@ pub const ArtifactResponseError = error{
     MalformedSoap,
     NotArtifactResponse,
     IssuerMismatch,
+    /// No `<saml:Issuer>` on the `<ArtifactResponse>`. SAMLProf §5.4.2: "The
+    /// `<Issuer>` element MUST be present and MUST contain the unique
+    /// identifier of the artifact issuer."
+    IssuerMissing,
     DestinationMismatch,
     SignatureMissing,
     SignatureInvalid,
@@ -2753,11 +2800,10 @@ pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u
     const root = firstChildElement(body) orelse return error.MalformedSoap;
     if (!isEl(root, samlp_ns, "ArtifactResponse")) return error.NotArtifactResponse;
 
-    if (childEl(root, saml_ns, "Issuer")) |iss| {
-        const t = try textAlloc(alloc, iss);
-        defer alloc.free(t);
-        if (!std.mem.eql(u8, trim(t), config.idp_entity_id)) return error.IssuerMismatch;
-    }
+    // REQUIRED. SAMLProf §5.4.2 <ArtifactResponse> Usage, verbatim: "The
+    // <Issuer> element MUST be present and MUST contain the unique identifier
+    // of the artifact issuer".
+    try checkIssuer(ArtifactResponseError, alloc, root, config.idp_entity_id, true);
     if (root.attr("", "Destination")) |dest| {
         if (config.expected_destination) |exp| {
             if (!std.mem.eql(u8, dest, exp)) return error.DestinationMismatch;
@@ -2833,6 +2879,33 @@ fn textAlloc(alloc: std.mem.Allocator, el: *const xml.Element) std.mem.Allocator
     return el.textContent(alloc);
 }
 
+/// Check `<saml:Issuer>` on `el` against the configured IdP entityID.
+///
+/// **`required = true` is the whole point of this helper.** Every one of these
+/// checks used to be spelled `if (childEl(root, saml_ns, "Issuer")) |iss| { … }`,
+/// i.e. *opt-out by omission*: deleting the element skipped the
+/// `idp_entity_id` comparison entirely instead of failing. Where the profile
+/// mandates the element, absence must be `IssuerMissing`, never a pass.
+///
+/// The `E` parameter carries the caller's error set so each consumer keeps its
+/// own typed errors; every one of them contains `IssuerMissing`,
+/// `IssuerMismatch` and `OutOfMemory`.
+fn checkIssuer(
+    comptime E: type,
+    alloc: std.mem.Allocator,
+    el: *const xml.Element,
+    expected: []const u8,
+    comptime required: bool,
+) E!void {
+    const iss = childEl(el, saml_ns, "Issuer") orelse {
+        if (required) return error.IssuerMissing;
+        return;
+    };
+    const t = try textAlloc(alloc, iss);
+    defer alloc.free(t);
+    if (!std.mem.eql(u8, trim(t), expected)) return error.IssuerMismatch;
+}
+
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
@@ -2901,6 +2974,7 @@ test {
     _ = @import("test_slo.zig");
     _ = @import("test_redirect_binding.zig");
     _ = @import("test_artifact.zig");
+    _ = @import("test_issuer.zig");
 }
 
 const testing = std.testing;

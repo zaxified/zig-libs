@@ -4,6 +4,8 @@
 //! google/brotli `c/common/transform.c`, MIT-licensed). The standard RFC 7932
 //! transform set contains 121 transforms and uses no SHIFT parameters.
 
+const std = @import("std");
+
 /// prefix/suffix pool: each id addresses a length-prefixed byte string
 /// (first byte = length, then that many bytes). Trailing NUL is the empty id.
 pub const prefix_suffix =
@@ -187,6 +189,29 @@ comptime {
 
 pub const num_transforms = transforms_data.len / 3;
 
+/// Longest prefix/suffix string addressable through `prefix_suffix_map` (the
+/// leading length byte of each pool entry). Derived from the actual pool so a
+/// table edit cannot silently invalidate the decoder's transform buffer size.
+/// The doc comment on `transformWord` historically claimed a 5-byte prefix
+/// bound, but the RFC 7932 pool contains an 8-byte prefix (`" of the "`); this
+/// constant is computed, not asserted, so it stays correct.
+pub const max_affix_len: usize = blk: {
+    var m: usize = 0;
+    for (prefix_suffix_map) |off| {
+        const l = prefix_suffix[off];
+        if (l > m) m = l;
+    }
+    break :blk m;
+};
+
+/// Upper bound on `transformWord`'s output for a dictionary word of at most
+/// `max_word_len` bytes: prefix + word + suffix. The word contribution never
+/// exceeds the input length (OMIT_* only shrink it; UPPERCASE_* never grow the
+/// byte count), and the prefix and suffix are each at most `max_affix_len`.
+pub fn maxOutputLen(comptime max_word_len: usize) usize {
+    return 2 * max_affix_len + max_word_len;
+}
+
 fn prefixId(idx: usize) u8 {
     return transforms_data[idx * 3 + 0];
 }
@@ -214,7 +239,9 @@ fn toUpperCase(p: []u8) usize {
 
 /// Apply transform `transform_idx` to a dictionary `word` of length `len`,
 /// writing the transformed bytes to `dst`. Returns the number of bytes written.
-/// `dst` must have room for prefix(<=5) + word + suffix(<=8) bytes.
+/// `dst` must have room for `maxOutputLen(word.len)` bytes; the safe way to size
+/// a caller's buffer is `[maxOutputLen(dict.max_word_length)]u8` — never a magic
+/// constant, since the prefix/suffix pool can be up to `max_affix_len` bytes.
 pub fn transformWord(dst: []u8, word: []const u8, len_in: usize, transform_idx: usize) usize {
     var idx: usize = 0;
     const prefix = prefix_suffix[prefix_suffix_map[prefixId(transform_idx)]..];
@@ -275,5 +302,9 @@ pub fn transformWord(dst: []u8, word: []const u8, len_in: usize, transform_idx: 
             idx += 1;
         }
     }
+    // Defence in depth for safe builds: the caller must size `dst` from
+    // `maxOutputLen`. In ReleaseFast this is a no-op, so correctness rests on
+    // the caller's buffer being derived from the same table (see decoder.zig).
+    std.debug.assert(idx <= dst.len);
     return idx;
 }

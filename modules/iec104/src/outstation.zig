@@ -92,6 +92,18 @@ pub const Options = struct {
 
 pub const Error = SinkError || asdu_mod.Error;
 
+/// §7.2.4: which type ids the global (broadcast) common address is valid for.
+/// Only station/counter interrogation, clock synchronisation and reset process.
+/// Everything else — every control-direction command in particular — must be
+/// ignored when addressed to the broadcast address. Matches lib60870's CS101/
+/// CS104 slave, whose broadcast handling covers exactly these four type ids.
+fn broadcastable(type_id: asdu_mod.TypeId) bool {
+    return switch (type_id) {
+        .c_ic_na_1, .c_ci_na_1, .c_cs_na_1, .c_rp_na_1 => true,
+        else => false,
+    };
+}
+
 pub const Outstation = struct {
     opts: Options,
     points: []Point,
@@ -129,13 +141,25 @@ pub const Outstation = struct {
         }
 
         // Wrong station. Broadcast is accepted by every station.
-        if (header.common_address != self.opts.common_address and
-            header.common_address != self.opts.params.broadcastCa())
-        {
+        const is_broadcast = header.common_address == self.opts.params.broadcastCa();
+        if (header.common_address != self.opts.common_address and !is_broadcast) {
             // Matches what a real RTU does: a negative activation
             // confirmation first, then a separate ASDU carrying cause 46.
             try self.echoRaw(request, header, .activation_con, true, sink);
             try self.echoRaw(request, header, .unknown_common_address, false, sink);
+            return;
+        }
+
+        // §7.2.4: the global (broadcast) common address is defined only for the
+        // interrogation / clock-sync / reset-process system commands. Any other
+        // type id addressed to it — above all a control-direction command — must
+        // never be acted on: a broadcast C_SC_NA_1 that operated the point would
+        // fire that output on *every* station on the link, unauthenticated. Such
+        // a frame is dropped silently (no actuation, and no reply storm from the
+        // whole link answering one broadcast).
+        if (is_broadcast and header.common_address != self.opts.common_address and
+            !broadcastable(header.type_id))
+        {
             return;
         }
 
@@ -923,6 +947,28 @@ test "outstation: the broadcast common address is accepted" {
     const a = try asdu_mod.decode(s.get(0), asdu_mod.default_params);
     try testing.expectEqual(asdu_mod.Cot.activation_con, a.header.cause.cot);
     try testing.expect(!a.header.cause.negative);
+}
+
+test "outstation: a broadcast control command never operates the point (§7.2.4)" {
+    // A direct-mode single command so one execute would, unguarded, fire the
+    // output immediately.
+    var points = [_]Point{
+        .{ .ioa = 301, .type_id = .c_sc_na_1, .element = .{ .sco = .{} }, .command_mode = .direct },
+    };
+    var o = try Outstation.init(.{ .common_address = 47 }, &points);
+    var s = CollectSink{};
+
+    // C_SC_NA_1 (0x2d), activation, CA 0xffff (global), IOA 301, SCO on/execute.
+    // Effect first, status second: the actuation is the assertion that must trip.
+    try o.handle(&hex("2d010600ffff2d010001"), s.sink());
+    try testing.expect(!points[0].element.sco.on); // point must NOT have operated
+    try testing.expectEqual(@as(usize, 0), s.count); // dropped: no reply storm
+
+    // The same command to this station's own CA still operates it — proof the
+    // guard rejects only the broadcast case, not the type outright.
+    s.reset();
+    try o.handle(&hex("2d0106002f002d010001"), s.sink());
+    try testing.expect(points[0].element.sco.on);
 }
 
 test "outstation: the originator address and test bit are echoed back" {

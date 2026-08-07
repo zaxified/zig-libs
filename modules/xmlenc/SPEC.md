@@ -90,7 +90,8 @@ for A192*). The CEK length must match the content algorithm's key size, else
   returns one generic `error.DecryptionError`, so it does not branch on padding
   validity. std's RSADP range check on the (public) ciphertext is the one early
   path that is not hidden — and it is on public data. Only enable v1.5 for an IdP
-  that offers nothing else; prefer migrating the IdP.
+  that offers nothing else; prefer migrating the IdP. See **Constant-time
+  posture** below for exactly how far that claim has been verified.
 - **CBC is the padding-oracle surface.** Unpadding validates only the length
   bound and returns the same generic `error.DecryptionError` on any failure. The
   robust composition remains **decrypt → signature-verify**: because the
@@ -108,6 +109,52 @@ for A192*). The CEK length must match the content algorithm's key size, else
   (default 4 MiB). The recovered CEK is `secureZero`'d after use; RSA EM /
   OAEP scratch buffers are zeroized. Never panics — all failures are typed
   errors.
+
+## Constant-time posture
+
+Scoped to `rsaPkcs1v15Unwrap`, the one place in this module that makes a
+secret-dependent decision of its own. (GCM tag comparison is std's; AES-KW
+integrity uses `std.crypto.timing_safe.eql`; OAEP is delegated to
+`rsa.decryptOaepH`; algorithm-URI comparisons are over public strings.)
+
+**What the code does.**
+
+- Every validity check — leading `00`, block type `02`, the `00` separator's
+  existence, PS ≥ 8, the message-length bounds — is an all-ones/all-zeros mask
+  produced by `ctEqByteMask` / `ctEqMaskUsize` / `ctGeMaskUsize`, which are pure
+  integer arithmetic (`|`, `&`, `~`, `-%`, shift). No comparison operator is
+  applied to a secret-derived value.
+- The separator scan always walks the whole block. The message extraction tries
+  every *public* separator position under a mask instead of reading `em` at the
+  secret offset `sep_idx + 1`, so the memory-access pattern is a function of the
+  modulus length only.
+- The write into the caller's CEK buffer is a fixed 64-byte masked copy on every
+  path. A rejected block leaves the buffer all-zero; it is neither skipped nor
+  sized by `msg_len`, and no recovered plaintext survives there.
+- **One** branch on secret-derived data remains: the final accept/reject. It is
+  the outcome itself and nothing follows it but the return. Both outcomes
+  collapse to the same `error.DecryptionError` at every caller, and `saml`
+  collapses them again into `AssertionDecryptionFailed`.
+
+**What is verified, and what is not.**
+
+- *Verified by the suite:* the fixed-length, unconditional, zero-on-reject shape
+  of the message copy (two `TEETH (F3)` tests in `src/root.zig`, both of which go
+  red against the previous `@memcpy(out[0..msg_len], em[sep_idx + 1 ..])` behind
+  an early `return error`); and the mask helpers, exhaustively over all 65 536
+  byte pairs plus a boundary table for the `usize` forms. The helpers are
+  load-bearing — a wrong mask turns the RFC 8017 §7.2.2 teeth tests red.
+- *NOT verified:* that the emitted machine code is branch-free. **No test in this
+  repo measures timing**, and none can: a unit test cannot see a conditional
+  move, cannot time a cache miss, and cannot prevent a future compiler from
+  lowering the mask arithmetic into a branch. `std.crypto.timing_safe.classify`
+  (valgrind/ctgrind) and a dudect-style statistical harness are the tools that
+  would close this; neither is wired into this repo, and `classify` is a silent
+  no-op without valgrind. Treat the constant-time property as *argued from the
+  source, not measured*.
+- The residual risk is therefore compiler-dependent, which is one more reason
+  `allow_weak_rsa15` stays off by default. Migrating the IdP off `rsa-1_5`
+  remains the only complete answer.
 
 ## Validation
 

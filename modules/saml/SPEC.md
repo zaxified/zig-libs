@@ -271,10 +271,36 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
   requires the presented-key match instead of `Recipient`. The subject is confirmed
   if at least one permitted-method confirmation fully validates; otherwise the most
   specific reason is returned.
+- **Assertion `<Issuer>`: REQUIRED, and it must equal `idp_entity_id`** →
+  `IssuerMissing` / `IssuerMismatch`. See the next section for why absence is an
+  error rather than a skipped check.
 - **Response level**: `<Status><StatusCode>` must be `…:status:Success`
   (`StatusNotSuccess`); `<Issuer>`, when present, must equal `idp_entity_id`
   (`IssuerMismatch`); `Destination`, when present, must equal `acs_url`
   (`DestinationMismatch`).
+
+## `<Issuer>` enforcement fails closed
+
+`Config.idp_entity_id` used to be enforced only by `if (element present) then
+compare`, and the assertion's own `<Issuer>` was not read at all. Deleting one
+element therefore skipped the check entirely on every message type — an
+authentication bypass in the SP, not a hygiene gap. Enforcement is now presence
++ value wherever the profile mandates the element, with the one documented
+exception below. Regression tests: `src/test_issuer.zig`.
+
+| Consumer | `<Issuer>` | Authority (verbatim) |
+|---|---|---|
+| `<Assertion>` | **required** | SAMLCore §2.3.3: "`<Issuer> [Required]` — The SAML authority that is making the claim(s) in the assertion." Schema: `<element ref="saml:Issuer"/>`, no `minOccurs`. Value per SAMLProf §4.1.4.2: "Each assertion's `<Issuer>` element MUST contain the unique identifier of the issuing identity provider". |
+| `<Response>` | **optional** | SAMLProf §4.1.4.2: "The `<Issuer>` element MAY be omitted, but if present it MUST contain the unique identifier of the issuing identity provider". Requiring it here would refuse conformant IdPs. Safe to leave optional because §4.1.4.2 also requires at least one `<Assertion>`, and that assertion's `<Issuer>` is mandatory. |
+| `<LogoutRequest>` | **required** | SAMLProf §4.4.4.1: "The `<Issuer>` element MUST be present and MUST contain the unique identifier of the requesting entity". (SAMLCore's `RequestAbstractType` schema has it `minOccurs="0"`, so the profile — not the schema — is what makes this fail closed.) |
+| `<LogoutResponse>` | **required** | SAMLProf §4.4.4.2: "The `<Issuer>` element MUST be present and MUST contain the unique identifier of the responding entity". |
+| `<ArtifactResponse>` | **required** | SAMLProf §5.4.2: "The `<Issuer>` element MUST be present and MUST contain the unique identifier of the artifact issuer". |
+
+Documents read: `saml-core-2.0-os` and `saml-profiles-2.0-os` (OASIS Standard,
+15 March 2005). Note that SAMLProf **§4.1.4.3** — sometimes cited for this rule
+— does not state it: it lists signatures, `Recipient`, `NotOnOrAfter`,
+`InResponseTo`, `Address` and "valid in other respects", and never mentions
+`<Issuer>`. §4.1.4.2 is the correct citation.
 
 ## Extraction (`AuthnResult`, arena-owned — nothing borrows the input)
 

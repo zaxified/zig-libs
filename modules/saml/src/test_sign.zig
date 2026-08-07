@@ -53,6 +53,36 @@ pub fn signAssertion(
     issue_instant: []const u8,
     after_issuer: []const u8,
 ) !Signed {
+    return signAssertionMaybeIssuer(alloc, seed, issuer, id, issue_instant, after_issuer);
+}
+
+/// Mint a **validly signed** assertion that carries NO `<saml:Issuer>` at all —
+/// the shape SAMLCore §2.3.3 forbids (`<Issuer> [Required]`).
+///
+/// This has to be minted rather than produced by deleting the element from an
+/// already-signed fixture: deletion changes the reference digest, so the
+/// consumer would reject it as `SignatureInvalid` and a regression test built
+/// that way would go red for the wrong reason. Here the signature is genuine
+/// and covers the issuer-less assertion, so the ONLY thing that can reject it
+/// is the presence check itself.
+pub fn signAssertionWithoutIssuer(
+    alloc: std.mem.Allocator,
+    seed: u64,
+    id: []const u8,
+    issue_instant: []const u8,
+    after_issuer: []const u8,
+) !Signed {
+    return signAssertionMaybeIssuer(alloc, seed, null, id, issue_instant, after_issuer);
+}
+
+fn signAssertionMaybeIssuer(
+    alloc: std.mem.Allocator,
+    seed: u64,
+    issuer: ?[]const u8,
+    id: []const u8,
+    issue_instant: []const u8,
+    after_issuer: []const u8,
+) !Signed {
     var prng = std.Random.DefaultPrng.init(seed);
     // 1024-bit is ample for RSA-SHA256 enveloped signing (min modulus ~62 bytes)
     // and keeps deterministic keygen fast across the many minted-fixture tests.
@@ -70,11 +100,17 @@ pub fn signAssertion(
     // Assemble the assertion with a placeholder digest + empty SignatureValue.
     // The whole `<ds:Signature>` is omitted when the reference digest is taken,
     // so the placeholder never affects it.
+    const issuer_xml = if (issuer) |iss|
+        try std.fmt.allocPrint(alloc, "<saml:Issuer>{s}</saml:Issuer>", .{iss})
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(issuer_xml);
+
     const assembled = try std.fmt.allocPrint(alloc, "<saml:Assertion xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" IssueInstant=\"{s}\">" ++
-        "<saml:Issuer>{s}</saml:Issuer>" ++
+        "{s}" ++
         "<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++ signed_info_inner ++ "</ds:SignedInfo>" ++
         "<ds:SignatureValue></ds:SignatureValue></ds:Signature>" ++
-        "{s}</saml:Assertion>", .{ saml_ns, id, issue_instant, issuer, ds_ns, id, digest_placeholder, after_issuer });
+        "{s}</saml:Assertion>", .{ saml_ns, id, issue_instant, issuer_xml, ds_ns, id, digest_placeholder, after_issuer });
     defer alloc.free(assembled);
 
     // Pass 1 — reference digest over the assertion with the Signature omitted.

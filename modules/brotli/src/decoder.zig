@@ -530,7 +530,10 @@ const Decoder = struct {
                 const woff = dict.offsets_by_length[copy] + word_idx * copy;
                 if (woff + copy > dict.data.len) return error.InvalidDictionary;
                 const word = dict.data[woff..][0..copy];
-                var buf: [64]u8 = undefined;
+                // `copy` is bounded to `dict.max_word_length` above, so this
+                // buffer, sized from the same tables, provably holds any
+                // transform output even under ReleaseFast (no magic constant).
+                var buf: [transforms.maxOutputLen(dict.max_word_length)]u8 = undefined;
                 var wlen: usize = undefined;
                 if (transform_idx == 0) {
                     @memcpy(buf[0..copy], word);
