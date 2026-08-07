@@ -219,9 +219,33 @@ pub const ConnectionParameters = struct {
     connection_type: ConnectionType = .point_to_point,
     /// True = several originators may own this connection.
     redundant_owner: bool = false,
+    /// The bits neither encoding assigns a meaning to, kept **in their wire
+    /// positions** so a captured frame re-encodes byte-exactly.
+    ///
+    /// The 16-bit word leaves bit 12 unassigned; the 32-bit word leaves bits
+    /// 16-24 and bit 28. A sender is required to zero them, and every frame in
+    /// `goldens.zig` does — but "the sender must zero it" is not the same as
+    /// "we may zero it for him". Dropping them made `fromU16`/`fromU32` lossy
+    /// and `toU16`/`toU32` unable to reproduce what had just been accepted, so
+    /// a `Forward_Open` relayed through this module came out as different
+    /// octets than went in. Reserved bits are ignored on receipt rather than
+    /// rejected — refusing them would be a new denial path on an
+    /// unauthenticated listening surface for a field that changes nothing
+    /// about the connection — so they are carried, exactly as `ForwardOpen`'s
+    /// own `reserved: [3]u8` is.
+    reserved: u32 = 0,
 
     /// The maximum a 16-bit `Forward_Open` can express (9 bits).
     pub const max_small_size: u16 = 511;
+
+    /// Bit 12 of the 16-bit word. Cross-checked against Wireshark's CIP
+    /// dissector, which maps 0x01FF/0x0200/0x0C00/0x6000/0x8000 and nothing
+    /// else (`epan/dissectors/packet-cip.c`, `hf_cip_cm_fwo_*`).
+    pub const reserved_mask_16: u16 = 0x1000;
+    /// Bits 16-24 and bit 28 of the 32-bit word. Same cross-check:
+    /// `hf_cip_cm_lfwo_*` maps 0xFFFF/0x02000000/0x0C000000/0x60000000/
+    /// 0x80000000, leaving exactly these.
+    pub const reserved_mask_32: u32 = 0x11FF_0000;
 
     pub fn toU16(self: ConnectionParameters) ?u16 {
         if (self.size > max_small_size) return null;
@@ -230,6 +254,7 @@ pub const ConnectionParameters = struct {
         v |= @as(u16, @intFromEnum(self.priority)) << 10;
         v |= @as(u16, @intFromEnum(self.connection_type)) << 13;
         if (self.redundant_owner) v |= 1 << 15;
+        v |= @as(u16, @truncate(self.reserved)) & reserved_mask_16;
         return v;
     }
 
@@ -240,6 +265,7 @@ pub const ConnectionParameters = struct {
             .priority = @enumFromInt(@as(u2, @truncate(v >> 10))),
             .connection_type = @enumFromInt(@as(u2, @truncate(v >> 13))),
             .redundant_owner = v & (1 << 15) != 0,
+            .reserved = v & reserved_mask_16,
         };
     }
 
@@ -249,6 +275,7 @@ pub const ConnectionParameters = struct {
         v |= @as(u32, @intFromEnum(self.priority)) << 26;
         v |= @as(u32, @intFromEnum(self.connection_type)) << 29;
         if (self.redundant_owner) v |= @as(u32, 1) << 31;
+        v |= self.reserved & reserved_mask_32;
         return v;
     }
 
@@ -259,6 +286,7 @@ pub const ConnectionParameters = struct {
             .priority = @enumFromInt(@as(u2, @truncate(v >> 26))),
             .connection_type = @enumFromInt(@as(u2, @truncate(v >> 29))),
             .redundant_owner = v & (@as(u32, 1) << 31) != 0,
+            .reserved = v & reserved_mask_32,
         };
     }
 };
@@ -702,6 +730,69 @@ test "connection parameters round trip in both widths" {
     try testing.expectEqual(@as(u16, 4000), back2.size);
     try testing.expectEqual(ConnectionType.point_to_point, back2.connection_type);
     try testing.expect(back2.variable);
+}
+
+test "the reserved bits of a network-parameters word survive a decode" {
+    // BD-24. The sweep reduced to a 46-octet `Forward_Open` whose parameter
+    // word differed from its re-encode at exactly one bit — bit 12 of the
+    // 16-bit form, which `fromU16` read past and `toU16` wrote back as zero.
+    // The audit recorded this gap for the 32-bit form only and said the
+    // 16-bit form "has no such gap"; it has one, and the fuzzer found that
+    // one first.
+    //
+    // Wireshark's CIP dissector maps 0x01FF|0x0200|0x0C00|0x6000|0x8000 of
+    // the small word and 0xFFFF|0x02000000|0x0C000000|0x60000000|0x80000000
+    // of the large one, so the unassigned bits are exactly the two masks
+    // asserted here.
+    try testing.expectEqual(@as(u16, 0xEFFF), ~ConnectionParameters.reserved_mask_16);
+    try testing.expectEqual(@as(u32, 0xEE00_FFFF), ~ConnectionParameters.reserved_mask_32);
+
+    // Every reserved bit, one at a time, must come back out where it went in.
+    for (0..16) |bit| {
+        const m: u16 = @as(u16, 1) << @intCast(bit);
+        if (m & ConnectionParameters.reserved_mask_16 == 0) continue;
+        const v: u16 = 0x43F4 | m;
+        try testing.expectEqual(v, ConnectionParameters.fromU16(v).toU16().?);
+    }
+    for (0..32) |bit| {
+        const m: u32 = @as(u32, 1) << @intCast(bit);
+        if (m & ConnectionParameters.reserved_mask_32 == 0) continue;
+        const v: u32 = 0x4200_0FA0 | m;
+        try testing.expectEqual(v, ConnectionParameters.fromU32(v).toU32());
+    }
+
+    // End to end, on the two captured `Forward_Open` bodies with a reserved
+    // bit set in the o→t word: a decode/encode round trip must be byte-exact.
+    const bodies = [_]struct { large: bool, off: usize, hex: []const u8 }{
+        // cpppo's small Forward_Open; o→t parameters at octets 26-27.
+        .{ .large = false, .off = 26, .hex = "059dfecc0000fffffffffecc3412010000000000000080841e00fe4380841e00fe43a303010020022401" },
+        // pycomm3's Large_Forward_Open; o→t parameters at octets 26-29.
+        .{ .large = true, .off = 26, .hex = "0a05000000005bbca9dc27040910ab4289180700000001402000a00f004201402000a00f0042a30220022401" },
+    };
+    for (bodies) |b| {
+        var wire: [128]u8 = undefined;
+        const n = (std.fmt.hexToBytes(&wire, b.hex) catch unreachable).len;
+        // A clean capture must round-trip first, or the rest proves nothing.
+        var round: [128]u8 = undefined;
+        const fo0 = try ForwardOpen.decode(wire[0..n], b.large);
+        try testing.expectEqualSlices(u8, wire[0..n], try fo0.encode(&round));
+        // Now set a reserved bit the way a peer that ignores the "shall be
+        // zero" rule would, and require the same octets back.
+        if (b.large) {
+            const v = std.mem.readInt(u32, wire[b.off..][0..4], .little);
+            std.mem.writeInt(u32, wire[b.off..][0..4], v | 0x1000_0000, .little);
+        } else {
+            const v = std.mem.readInt(u16, wire[b.off..][0..2], .little);
+            std.mem.writeInt(u16, wire[b.off..][0..2], v | 0x1000, .little);
+        }
+        const fo = try ForwardOpen.decode(wire[0..n], b.large);
+        try testing.expectEqualSlices(u8, wire[0..n], try fo.encode(&round));
+        // …and the fields a caller acts on are unchanged by that bit.
+        try testing.expectEqual(fo0.o_to_t_params.size, fo.o_to_t_params.size);
+        try testing.expectEqual(fo0.o_to_t_params.connection_type, fo.o_to_t_params.connection_type);
+        try testing.expectEqual(fo0.o_to_t_params.priority, fo.o_to_t_params.priority);
+        try testing.expectEqual(fo0.o_to_t_params.variable, fo.o_to_t_params.variable);
+    }
 }
 
 test "transport class octet round trips" {

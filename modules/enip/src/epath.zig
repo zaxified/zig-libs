@@ -39,8 +39,11 @@ pub const DecodeError = error{
     ReservedFormat,
     /// A symbolic segment with a zero length, which names nothing.
     EmptySymbol,
-    /// A padded 16/32-bit logical segment whose pad octet is not zero. The
-    /// spec fixes it at zero; a non-zero value means the path is misaligned.
+    /// A segment whose alignment pad octet is not zero — a padded 16/32-bit
+    /// logical segment, an odd symbolic or ANSI-symbol name, or an odd port
+    /// segment. The spec fixes every one of them at zero; a non-zero value
+    /// means the path is misaligned, or that someone is spelling the same
+    /// path a second way.
     BadPad,
 };
 
@@ -104,6 +107,18 @@ pub const Port = struct {
     /// One octet for the common case; several for a link address that is an
     /// IP address or similar.
     link: []const u8,
+    /// The segment was written in the **extended-size** form: bit 4 of the
+    /// segment octet set and an explicit link-length octet following. CIP
+    /// permits it for a one-octet link too (`11 01 <link> 00` is a legal
+    /// spelling of `01 <link>`), so the form has to be carried rather than
+    /// re-derived from `link.len` — otherwise a captured route path shrinks
+    /// by two octets on re-encode and every path-size word count downstream
+    /// of it is wrong.
+    extended_size: bool = false,
+    /// The segment was written with the **extended-port** escape: port id 15
+    /// and a 16-bit port number following. Also legal for a port that would
+    /// fit in the nibble, and preserved for the same reason.
+    extended_port: bool = false,
 };
 
 /// A network segment. Only the single-octet forms and the "extended network"
@@ -204,6 +219,22 @@ pub const Iterator = struct {
         return s;
     }
 
+    /// Consumes one pad octet and requires it to be zero.
+    ///
+    /// Every pad in an EPATH — the alignment octet after an odd symbolic or
+    /// ANSI-symbol name, the one after an odd port segment, and the one
+    /// between a 16/32-bit logical segment's type octet and its value — is
+    /// fixed at zero by CIP Vol 1 App. C. Only the logical one used to be
+    /// checked; the other three were consumed and thrown away, and
+    /// `Builder` then re-emitted a zero. The result was a decoder that
+    /// accepted 256 spellings of the same path and an encoder that could
+    /// only produce one of them — an information-losing accept, and the
+    /// same divergence primitive as any other silent normalisation: our
+    /// stack and the peer disagree about which octets the frame was.
+    fn checkPad(self: *Iterator) DecodeError!void {
+        if ((try self.take(1))[0] != 0) return error.BadPad;
+    }
+
     fn decodeAt(self: *Iterator, b: u8) DecodeError!Segment {
         switch (b & 0xE0) {
             seg_type_port => return .{ .port = try self.decodePort(b) },
@@ -216,7 +247,10 @@ pub const Iterator = struct {
                 // which no device seen emits; refuse rather than guess.
                 if (n == 0) return error.EmptySymbol;
                 const name = try self.take(n);
-                if (n % 2 == 1) _ = try self.take(1); // pad to a word boundary
+                // Pad to a word boundary. The pad is fixed at zero, so a
+                // non-zero one is `BadPad` exactly as it is on a 16/32-bit
+                // logical segment — see `checkPad`.
+                if (n % 2 == 1) try self.checkPad();
                 return .{ .symbolic = name };
             },
             seg_type_data => {
@@ -225,7 +259,7 @@ pub const Iterator = struct {
                     const n: usize = (try self.take(1))[0];
                     if (n == 0) return error.EmptySymbol;
                     const name = try self.take(n);
-                    if (n % 2 == 1) _ = try self.take(1);
+                    if (n % 2 == 1) try self.checkPad();
                     return .{ .ansi_symbol = name };
                 }
                 if (b == simple_data_segment) {
@@ -253,8 +287,13 @@ pub const Iterator = struct {
         const link = try self.take(link_len);
         // The pad makes **this segment** an even octet count, which is not the
         // same as making the running offset even once a packed path is in play.
-        if ((self.off - start) % 2 == 1) _ = try self.take(1);
-        return .{ .port = port, .link = link };
+        if ((self.off - start) % 2 == 1) try self.checkPad();
+        return .{
+            .port = port,
+            .link = link,
+            .extended_size = extended_size,
+            .extended_port = port_id == 0x0F,
+        };
     }
 
     fn decodeLogical(self: *Iterator, b: u8) DecodeError!Segment {
@@ -276,9 +315,7 @@ pub const Iterator = struct {
                 .format = format,
             } },
             .bits_16 => {
-                if (self.padded) {
-                    if ((try self.take(1))[0] != 0) return error.BadPad;
-                }
+                if (self.padded) try self.checkPad();
                 const v = try self.take(2);
                 return .{ .logical = .{
                     .what = what,
@@ -287,9 +324,7 @@ pub const Iterator = struct {
                 } };
             },
             .bits_32 => {
-                if (self.padded) {
-                    if ((try self.take(1))[0] != 0) return error.BadPad;
-                }
+                if (self.padded) try self.checkPad();
                 const v = try self.take(4);
                 return .{ .logical = .{
                     .what = what,
@@ -459,18 +494,37 @@ pub const Builder = struct {
     /// A port segment. `link` is one octet for a chassis slot and more for a
     /// link address that is an IP address or similar.
     pub fn port(self: *Builder, port_id: u16, link: []const u8) EncodeError!void {
+        try self.portVerbatim(.{
+            .port = port_id,
+            .link = link,
+            .extended_size = link.len > 1,
+            .extended_port = port_id > 14,
+        });
+    }
+
+    /// A port segment in **the form it was decoded in**, escapes included.
+    /// `Builder.port` picks the narrowest spelling; this one reproduces the
+    /// one on the wire, which is what makes a captured route path re-encode
+    /// byte for byte.
+    pub fn portVerbatim(self: *Builder, p: Port) EncodeError!void {
+        const link = p.link;
+        const port_id = p.port;
         if (link.len == 0 or link.len > 255) return error.TooLong;
+        // A form that cannot express this segment is an encode error, not a
+        // silently narrower path.
+        const extended_size = p.extended_size or link.len > 1;
+        const extended_port = p.extended_port or port_id > 14;
+        if (!extended_size and link.len != 1) return error.TooLong;
+        if (!extended_port and port_id > 14) return error.TooLong;
         const start = self.len;
-        const extended_size = link.len > 1;
-        const extended_port = port_id > 14;
         var head: u8 = if (extended_port) 0x0F else @intCast(port_id);
         if (extended_size) head |= 0x10;
         try self.put(&[_]u8{head});
         if (extended_size) try self.put(&[_]u8{@intCast(link.len)});
         if (extended_port) {
-            var p: [2]u8 = undefined;
-            std.mem.writeInt(u16, &p, port_id, .little);
-            try self.put(&p);
+            var ext: [2]u8 = undefined;
+            std.mem.writeInt(u16, &ext, port_id, .little);
+            try self.put(&ext);
         }
         try self.put(link);
         if ((self.len - start) % 2 == 1) try self.put(&[_]u8{0});
@@ -503,7 +557,7 @@ pub const Builder = struct {
             .symbolic => |s| try self.shortSymbol(s),
             .ansi_symbol => |s| try self.symbol(s),
             .simple_data => |d| try self.simpleData(d),
-            .port => |p| try self.port(p.port, p.link),
+            .port => |p| try self.portVerbatim(p),
             .network => |n| {
                 switch (n.subtype) {
                     Network.schedule,
@@ -621,6 +675,77 @@ test "a padded 16-bit logical segment with a dirty pad octet is refused" {
     try testing.expectEqual(@as(u32, 0x34FF), seg.logical.value);
 }
 
+test "every alignment pad in a path is refused when it is not zero" {
+    // BD-24. The coverage-guided sweep reduced to a single 186-octet port
+    // segment whose trailing pad was 0xFF: `reencode` returned 186 octets
+    // that differed from its input in exactly that byte, because the pad was
+    // consumed unexamined and `Builder.port` re-emitted a zero. Three of the
+    // four pads in this file had that shape; only the logical one was checked.
+    const cases = [_]struct { what: []const u8, wire: []const u8 }{
+        // Port segment, odd link address (`0x10 | port`, size, address, pad).
+        .{ .what = "port", .wire = &[_]u8{ 0x12, 0x03, 0x0A, 0x00, 0x05, 0xFF } },
+        // The reduced shape itself: extended size, one-octet link, pad.
+        .{ .what = "short port", .wire = &[_]u8{ 0x16, 0x01, 0xAA, 0xFF } },
+        // ANSI Extended Symbol with an odd name.
+        .{ .what = "ansi symbol", .wire = &[_]u8{ 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0xFF } },
+        // Short symbolic segment with an odd name.
+        .{ .what = "symbolic", .wire = &[_]u8{ 0x63, 'a', 'b', 'c', 0xFF } },
+        // The pad that was already checked, kept here so the four stay together.
+        .{ .what = "logical 16", .wire = &[_]u8{ 0x25, 0xFF, 0x34, 0x12 } },
+        .{ .what = "logical 32", .wire = &[_]u8{ 0x26, 0xFF, 0x34, 0x12, 0x00, 0x00 } },
+    };
+    var round: [64]u8 = undefined;
+    for (cases) |c| {
+        errdefer std.debug.print("pad case: {s}\n", .{c.what});
+        var it = Iterator.init(c.wire);
+        try testing.expectError(error.BadPad, it.next());
+        try testing.expectError(error.BadPad, reencode(c.wire, &round));
+        // Zero the pad and the same path decodes and re-encodes byte-exactly,
+        // so the check refuses the dirty spelling and nothing else.
+        var clean: [8]u8 = undefined;
+        @memcpy(clean[0..c.wire.len], c.wire);
+        clean[c.wire.len - 1] = 0;
+        // The logical cases carry their pad in the middle, not at the end.
+        if (c.wire[0] & 0xE0 == seg_type_logical) clean[1] = 0;
+        const again = try reencode(clean[0..c.wire.len], &round);
+        try testing.expectEqualSlices(u8, clean[0..c.wire.len], again);
+    }
+}
+
+test "a port segment re-encodes in the form it arrived in, not the narrowest one" {
+    // The other half of BD-24, and audit finding F1. Both escapes are legal
+    // for values that would fit without them, so both have to be carried:
+    // deriving the form from `link.len`/`port` shrinks a captured route path
+    // and shifts every path-size word count downstream of it.
+    const cases = [_][]const u8{
+        // Extended size with a one-octet link: `11 01 AA 00` is `01 AA`.
+        &[_]u8{ 0x11, 0x01, 0xAA, 0x00 },
+        // Extended port escape for port 3: `0F 03 00 AA` is `03 AA`.
+        &[_]u8{ 0x0F, 0x03, 0x00, 0xAA },
+        // Both escapes at once, for a port and a link that need neither.
+        &[_]u8{ 0x1F, 0x01, 0x03, 0x00, 0xAA, 0x00 },
+        // The narrow spellings still round-trip unchanged.
+        &[_]u8{ 0x01, 0x00 },
+        &[_]u8{ 0x12, 0x08, '1', '0', '.', '0', '.', '0', '.', '5' },
+    };
+    var round: [32]u8 = undefined;
+    for (cases) |wire| {
+        errdefer std.debug.print("port case: {x}\n", .{wire});
+        try testing.expectEqualSlices(u8, wire, try reencode(wire, &round));
+    }
+    // And the decoded values are still the narrow ones, so a caller reading
+    // `port`/`link` is unaffected by which spelling arrived.
+    var it = Iterator.init(&[_]u8{ 0x1F, 0x01, 0x03, 0x00, 0xAA, 0x00 });
+    const seg = (try it.next()).?;
+    try testing.expectEqual(@as(u16, 3), seg.port.port);
+    try testing.expectEqualSlices(u8, &[_]u8{0xAA}, seg.port.link);
+    // `Builder.port` keeps choosing the narrowest form for new paths.
+    var buf: [16]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.port(3, &[_]u8{0xAA});
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0xAA }, b.bytes());
+}
+
 test "the backplane route path Logix clients send" {
     var buf: [16]u8 = undefined;
     var b = Builder.init(&buf);
@@ -680,15 +805,25 @@ test "a symbolic segment with a zero length names nothing" {
     try testing.expectError(error.EmptySymbol, b.symbol(""));
 }
 
-test "an odd symbolic segment missing its pad runs into the next segment" {
+test "an odd symbolic segment missing its pad is refused, not run into the next segment" {
     // `91 05 SCADA` with no pad, then what should be an element segment.
-    // The walk consumes the 0x28 as the pad and then finds a bare 0x00.
+    // This test used to *record* the mis-framing: the walk consumed the 0x28
+    // as the pad, handed back "SCADA", and then tripped over a bare 0x00 one
+    // segment later. That was the pad check missing (BD-24) — the octet is
+    // fixed at zero, so 0x28 in that position means the path is misaligned
+    // and the misalignment is detectable right here, before any consumer has
+    // been handed a tag name that a peer would have read differently.
     const wire = [_]u8{ 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x28, 0x00 };
     var it = Iterator.init(&wire);
-    const first = (try it.next()).?;
-    try testing.expectEqualStrings("SCADA", first.ansi_symbol);
-    // 0x00 is a port segment whose link octet is missing.
-    try testing.expectError(error.SegmentOverruns, it.next());
+    try testing.expectError(error.BadPad, it.next());
+    // With the pad written correctly the same two segments are both there.
+    const good = [_]u8{ 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x00, 0x28, 0x03 };
+    var ok = Iterator.init(&good);
+    try testing.expectEqualStrings("SCADA", (try ok.next()).?.ansi_symbol);
+    const member = (try ok.next()).?;
+    try testing.expectEqual(LogicalType.member, member.logical.what);
+    try testing.expectEqual(@as(u32, 3), member.logical.value);
+    try testing.expect((try ok.next()) == null);
 }
 
 test "reserved logical types and formats are refused" {

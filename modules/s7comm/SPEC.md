@@ -18,7 +18,27 @@ rules.
 - **`cotp` (ISO 8073 class 0).** `LI` counts the octets after itself **excluding user data**,
   which is what puts the S7 PDU at `1 + LI`. A `DT` with `LI != 2` is refused rather than
   guessed at, because in class 0 that value is fixed and a different one means the framing is
-  already wrong. Transport classes other than 0 are refused at the CR/CC. Unknown variable-part
+  already wrong. Transport classes other than 0 are refused at the CR/CC.
+
+  **The TPDU code is a full octet except on `CR` and `CC`.** RFC 905 §13.2.2.2 names exactly four
+  codes whose bits 4-1 carry a CDT — `1110 xxxx` CR, `1101 xxxx` CC, `0101 xxxx` RJ, `0110 xxxx`
+  AK — and closes with "only those codes defined in 13.1 are valid"; Table 8 spells the rest as
+  full octets (`DR 1000 0000`, `DC 1100 0000`, `DT 1111 0000`, `ER 0111 0000`), which 13.7.3 a)
+  repeats for `DT`. A non-zero low nibble on those four is therefore `UnknownTpduCode`, not a
+  `DT` with a nibble to be dropped. Dispatching on the high nibble alone made sixteen distinct
+  octets decode as one and re-encode as `0xF0` — an information-losing accept, and on an OT
+  segment a DPI/IDS evasion primitive, because a monitor keyed on the literal `02 F0 80` sees
+  nothing while the stack behind it processes `02 F7 80` as data.
+
+  **The same applies to bits 4 and 3 of a CR/CC's class-and-option octet.**
+  §13.3.3 e) tabulates that nibble as bit 4 "0 always", bit 3 "0 always",
+  bit 2 extended formats, bit 1 no explicit flow control — and NOTE 2 adds
+  that in class 0 all four "are always zero and have no meaning". Bits 2 and
+  1 are modelled and round-trip; bits 4 and 3 had nowhere to go, so four
+  octets decoded as one and `encodeConnectVerbatim` emitted the one. They are
+  now `UnsupportedClass`, which makes the decode of that octet a bijection.
+
+  Unknown variable-part
   parameters survive a decode (the raw `variable_part` is kept), which is what makes
   `encodeConnectVerbatim` byte-exact for peers that order parameters differently — one of the
   two captured stacks emits `src, dst, size` and the other `size, src, dst`, and both must
@@ -207,7 +227,10 @@ hang":
   and its `total_len` must not exceed the input.
 - `tpkt.Framer` fed arbitrary stream bytes in chunks, with a guard counter that fails the test if
   `next` ever returns a packet without consuming input (an infinite-loop bug).
-- `cotp.decode` over arbitrary bytes — a CR/CC must re-encode verbatim, a DT must re-encode exactly.
+- `cotp.decode` over arbitrary bytes — a CR/CC must re-encode verbatim, a DT must re-encode exactly,
+  and anything that decodes as a `DT`/`DR`/`DC`/`ER` must have come from a code octet whose low
+  nibble was zero. `DR`/`DC`/`ER` have no re-encoder, so that last assertion is the only octet-level
+  check they get; it is what would have caught the `0xF7`-decodes-as-`DT` accept on the first sweep.
 - `s7.decode` over arbitrary bytes — anything that decodes must re-encode to the identical octets.
 - `items.Item.decode` and `items.DataItemIterator` over arbitrary bytes **and an arbitrary item
   count**, with a guard on both the iteration count and the consumed length.
@@ -229,7 +252,9 @@ Explicit hostile-input tests (not fuzz) cover every case named in the task and m
 than its header, a bad version octet, a non-zero reserved octet, a length below the header size, a
 **TPKT length that disagrees with the payload in both directions**, a packet larger than the
 framer's storage; a **COTP length indicator pointing past the buffer**, an `LI` of zero, an unknown
-TPDU code, transport class 4, a CR whose `LI` does not cover its fixed part, a `DT` with `LI != 2`,
+TPDU code, **all sixteen low nibbles of each of `DT`/`DR`/`DC`/`ER`** (exactly one of which may
+decode) and all sixteen credits of a `CR` (all of which must), all sixteen option
+nibbles of a `CR`'s class octet (four of which must), transport class 4, a CR whose `LI` does not cover its fixed part, a `DT` with `LI != 2`,
 a TSAP parameter of the wrong length, a TPDU-size parameter of the wrong length, a parameter whose
 length runs off the end of the variable part and a dangling parameter code; an **S7 header whose
 parameter and data lengths overflow the frame** (both singly and summed), trailing junk past the

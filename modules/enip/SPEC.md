@@ -59,13 +59,33 @@ layout never depends on Zig's bitfield-packing rules.
   indices are **Member ID** segments (`0x28`/`0x29`/`0x2A`), not attribute or
   instance segments.
 
-  The decoded `Logical.format` is preserved so a re-encode is byte-exact: a
-  peer may write instance 1 as a 16-bit segment even though 8 bits would do,
-  and normalising it would break the goldens' re-encode assertion. A padded
-  segment whose pad octet is not zero is a typed error, because the spec fixes
-  it at zero and a non-zero value means the path is already misaligned. Port
-  segments pad relative to the **segment start**, not to the running offset,
-  which only differs inside a packed path but differs silently there.
+  **Every legal spelling of the same path is preserved, and every illegal one
+  is a typed error.** CIP leaves a decoder several ways to be silently wrong
+  here, and all of them end in the same place: our stack and the peer disagree
+  about which octets the frame was.
+
+  - The decoded `Logical.format` is kept, because a peer may write instance 1
+    as a 16-bit segment even though 8 bits would do.
+  - A port segment's two escapes are kept as `Port.extended_size` /
+    `Port.extended_port`, because both are legal for values that would fit
+    without them (`11 01 <link> 00` is a legal spelling of `01 <link>`, and
+    `0F 03 00 <link>` of `03 <link>`). Deriving the form from `link.len` and
+    `port` instead **shrank a captured route path by two octets**, which shifts
+    the path-size word count of everything downstream that rebuilds a route it
+    received. `Builder.port` still picks the narrowest form for paths we
+    originate; `Builder.portVerbatim` reproduces the one that arrived, and
+    `Builder.segment` uses that.
+  - **Every** alignment pad is required to be zero — the one after an odd
+    symbolic or ANSI-symbol name, the one after an odd port segment, and the
+    one between a 16/32-bit logical segment's type octet and its value. The
+    spec fixes all four at zero, so a non-zero one means the path is
+    misaligned. Only the logical pad used to be checked; the other three were
+    consumed unexamined and re-emitted as zero, so the decoder accepted 256
+    spellings of a path the encoder could write only one of. `checkPad` is now
+    the single site, so a fifth pad cannot be added without one.
+
+  Port segments pad relative to the **segment start**, not to the running
+  offset, which only differs inside a packed path but differs silently there.
 - **`cip`.** A reply sets bit 7 of the service code; `Reply` stores the service
   **stripped** and re-encodes it set, and `Request.decode` refuses a message
   with the bit set (and `Reply.decode` one without) rather than reading a
@@ -104,6 +124,19 @@ layout never depends on Zig's bitfield-packing rules.
   `ConnectionParameters` owns both and `toU16` returns null for a size the
   small form cannot express, which is what makes the choice of
   `Large_Forward_Open` mechanical rather than a guess.
+
+  **The bits neither layout assigns are carried, not cleared.** The 16-bit word
+  leaves bit 12 unassigned and the 32-bit word leaves bits 16-24 and bit 28
+  (`ConnectionParameters.reserved_mask_16` / `_32`; cross-checked against
+  Wireshark's CIP dissector, which maps exactly the complement of each). A
+  sender is required to zero them and every captured frame does — but "the
+  sender must zero it" is not "we may zero it for him": dropping them made the
+  decode lossy and the encode unable to reproduce what had just been accepted,
+  so a `Forward_Open` relayed through this module came out as different octets
+  than went in. They are ignored on receipt rather than rejected, because
+  refusing them would add a denial path on an unauthenticated listening surface
+  for a field that changes nothing about the connection — the same treatment
+  `ForwardOpen.reserved` already gives its three reserved octets.
 
   A `Forward_Close` matches on the `{connection serial, originator vendor,
   originator serial}` **triple**, not on a connection id — it does not carry
@@ -387,8 +420,9 @@ connected address of the wrong width, a connected data item too short for its
 own sequence count, a single-item data CPF; an **EPATH segment whose size runs
 past the path** (symbol, 16-bit logical, simple data, extended port), a
 **symbolic segment with a zero length**, an **odd symbolic segment with its pad
-missing** (which runs into the next segment and is shown doing so), a padded
-segment with a dirty pad octet, reserved logical types and formats, and
+missing** (which used to run into the next segment and is now refused at the
+pad), a dirty pad octet on **all four** padded shapes, both non-canonical port
+spellings re-encoded verbatim, reserved logical types and formats, and
 unmodelled segment types; a **request path size that overruns**, a reply with
 the request bit, a request with the reply bit, a dirty reserved octet, an
 **additional-status count that overruns** (both by 255 words and by one octet);
@@ -396,7 +430,9 @@ a **Multiple Service Packet offset table pointing outside the payload**, one
 pointing into the table itself, a table whose own width overruns, and
 descending offsets; an `Unconnected_Send` **embedded size that overruns**, a
 route-path size that overruns, a dirty reserved octet, a `Forward_Open`
-connection-path size that overruns and a truncated `Forward_Open`; a
+connection-path size that overruns, a truncated `Forward_Open`, and both
+captured `Forward_Open` bodies re-encoded with a reserved network-parameter bit
+set; a
 **SHORT_STRING/STRING length prefix that runs past the data**, a **type code
 that contradicts the data length**, a structure reply missing its handle, and
 an out-of-range element index on both fixed- and variable-width arrays; roughly

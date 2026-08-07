@@ -246,12 +246,40 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
     const raw_code = bytes[1];
     const header = bytes[1 .. 1 + li];
 
+    // RFC 905 §13.2.2.2: the TPDU code "is a full octet except in the following
+    // cases: 1110 xxxx Connection Request / 1101 xxxx Connection Confirm /
+    // 0101 xxxx Reject / 0110 xxxx Data Acknowledgement, where xxxx (bits 4-1)
+    // is used to signal the CDT", followed by "Only those codes defined in 13.1
+    // are valid". Table 8 in 13.1 spells the four codes this class-0 stack also
+    // handles as full octets — DR `1000 0000`, DC `1100 0000`, DT `1111 0000`,
+    // ER `0111 0000` — and 13.7.3 a) repeats "DT: Data Transfer Code: 1111
+    // 0000". Dispatching on `raw_code & 0xF0` alone therefore accepted sixteen
+    // distinct octets as each of those four and normalised them to one on the
+    // way out: an information-losing accept, and in an OT network a DPI/IDS
+    // evasion primitive — a monitor keyed on the literal `02 F0 80` sees
+    // nothing while this stack processes `02 F7 80` as a data TPDU. The credit
+    // nibble is read below for CR/CC, and only there.
+    switch (raw_code & 0xF0) {
+        @intFromEnum(Code.cr), @intFromEnum(Code.cc) => {},
+        else => if (raw_code & 0x0F != 0) return error.UnknownTpduCode,
+    }
+
     switch (raw_code & 0xF0) {
         @intFromEnum(Code.cr), @intFromEnum(Code.cc) => {
             if (header.len < 6) return error.ShortTpdu;
             const class_octet = header[5];
             const class: u4 = @intCast(class_octet >> 4);
             if (class != 0) return error.UnsupportedClass;
+            // RFC 905 §13.3.3 e) tabulates bits 4-1 of octet 7: bit 4 "0
+            // always", bit 3 "0 always", bit 2 extended formats, bit 1 no
+            // explicit flow control (and NOTE 2: "bits 4 to 1 are always zero
+            // in Class 0 and have no meaning"). Bits 4 and 3 are the two the
+            // struct has nowhere to put, so accepting them was the same
+            // information-losing accept as the TPDU-code nibble above: four
+            // octets decoded as one and `encodeConnectVerbatim` emitted the
+            // one. Bits 2 and 1 are modelled and round-trip, so they are
+            // still accepted — the decoder is now a bijection on this octet.
+            if (class_octet & 0x0C != 0) return error.UnsupportedClass;
             var t: ConnectTpdu = .{
                 .code = @enumFromInt(raw_code & 0xF0),
                 .credit = @intCast(raw_code & 0x0F),
@@ -516,6 +544,78 @@ test "decode rejects hostile TPDUs" {
     try testing.expectError(error.BadParameter, decode(&[_]u8{ 0x07, 0xE0, 0, 0, 0, 1, 0, 0xC1 }));
 }
 
+test "only CR and CC carry a credit nibble; the other four codes are full octets" {
+    // The reproducer the coverage-guided sweep found (BD-23): `02 F7 80 …`
+    // used to decode as a DT and re-encode as `02 F0 80 …`, so sixteen
+    // distinct octets collapsed onto one. RFC 905 Table 8 spells DT as
+    // `1111 0000` and 13.2.2.2 says the code is a full octet outside
+    // CR/CC/RJ/AK, so `0xF7` names no TPDU at all.
+    try testing.expectError(error.UnknownTpduCode, decode(&[_]u8{ 0x02, 0xF7, 0x80, 0xAA, 0xBB }));
+
+    // All sixteen low nibbles, for each of the four codes that have none.
+    // 1 (the canonical `0x?0`) must decode; the other 15 must be refused.
+    const cases = [_]struct { code: u8, frame: []const u8 }{
+        // DT `1111 0000`: LI 2, TPDU-NR/EOT, then user data.
+        .{ .code = 0xF0, .frame = &[_]u8{ 0x02, 0xF0, 0x80, 0x32, 0x01 } },
+        // DR `1000 0000`: LI 6.
+        .{ .code = 0x80, .frame = &[_]u8{ 0x06, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00 } },
+        // DC `1100 0000`: LI 5.
+        .{ .code = 0xC0, .frame = &[_]u8{ 0x05, 0xC0, 0x00, 0x01, 0x00, 0x02 } },
+        // ER `0111 0000`: LI 4.
+        .{ .code = 0x70, .frame = &[_]u8{ 0x04, 0x70, 0x00, 0x01, 0x01 } },
+    };
+    for (cases) |c| {
+        var frame: [8]u8 = undefined;
+        @memcpy(frame[0..c.frame.len], c.frame);
+        var accepted: usize = 0;
+        for (0..16) |nibble| {
+            frame[1] = c.code | @as(u8, @intCast(nibble));
+            if (decode(frame[0..c.frame.len])) |_| {
+                accepted += 1;
+                try testing.expectEqual(@as(usize, 0), nibble);
+            } else |err| {
+                try testing.expect(nibble != 0);
+                try testing.expectEqual(error.UnknownTpduCode, err);
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), accepted);
+    }
+
+    // CR and CC keep theirs: the nibble is the CDT and must survive the trip.
+    for (0..16) |nibble| {
+        const cr = [_]u8{ 0x06, 0xE0 | @as(u8, @intCast(nibble)), 0, 0, 0, 1, 0x00 };
+        const dec = (try decode(&cr)).cr;
+        try testing.expectEqual(@as(u4, @intCast(nibble)), dec.credit);
+        var buf: [16]u8 = undefined;
+        try testing.expectEqualSlices(u8, &cr, try encodeConnectVerbatim(dec, &buf));
+    }
+}
+
+test "the class/option octet of a CR is a bijection, not a four-to-one map" {
+    // The second crash the same harness produced once the first was cleared:
+    // `EC DD 01 DC E9 42 0C …` re-encoded with octet 7 as `00`, because bits
+    // 4 and 3 of the class/option octet were read by nothing and written as
+    // zero. RFC 905 §13.3.3 e) fixes both at "0 always"; bits 2 and 1 are the
+    // extended-formats and flow-control options and are modelled.
+    for (0..16) |low| {
+        const opt: u8 = @intCast(low);
+        const cr = [_]u8{ 0x06, 0xE0, 0, 0, 0, 1, opt };
+        if (opt & 0x0C != 0) {
+            try testing.expectError(error.UnsupportedClass, decode(&cr));
+            continue;
+        }
+        const dec = (try decode(&cr)).cr;
+        try testing.expectEqual(opt & 0x02 != 0, dec.extended_formats);
+        try testing.expectEqual(opt & 0x01 != 0, dec.no_explicit_flow_control);
+        var buf: [16]u8 = undefined;
+        try testing.expectEqualSlices(u8, &cr, try encodeConnectVerbatim(dec, &buf));
+    }
+    // A class other than 0 is still refused for its own reason, and the two
+    // rejections do not shadow each other.
+    try testing.expectError(error.UnsupportedClass, decode(&[_]u8{ 0x06, 0xE0, 0, 0, 0, 1, 0x40 }));
+    try testing.expectError(error.UnsupportedClass, decode(&[_]u8{ 0x06, 0xE0, 0, 0, 0, 1, 0x04 }));
+}
+
 test "verbatim re-encode preserves an unusual parameter order" {
     // Parameter order src, dst, size — a different stack's choice.
     const wire = [_]u8{
@@ -547,6 +647,14 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     const t = decode(buf[0..len]) catch return;
+    // Anything that decoded as one of the four codes with no CDT field must
+    // have come from a full-octet code (RFC 905 Table 8). DR/DC/ER have no
+    // re-encoder here, so without this the only octet those three would ever
+    // be checked against is the one the decoder chose to remember.
+    switch (t) {
+        .dt, .dr, .dc, .er => try testing.expectEqual(@as(u8, 0), buf[1] & 0x0F),
+        .cr, .cc => {},
+    }
     var round: [512]u8 = undefined;
     switch (t) {
         .cr, .cc => |c| {
