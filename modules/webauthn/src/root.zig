@@ -12,7 +12,7 @@
 //! **Assertion (authentication) verify — `verifyAssertion`**: given the
 //! authenticator's raw `authenticatorData`, the raw `clientDataJSON`, the
 //! signature, and the stored credential's COSE public key, checks (WebAuthn
-//! §7.2, "Verifying an authentication assertion"):
+//! §7.2, "Verifying an Authentication Assertion"):
 //!   - `clientDataJSON` parses as JSON, `type == "webauthn.get"`, the
 //!     decoded `challenge` matches the expected challenge bytes, `origin`
 //!     matches;

@@ -144,3 +144,17 @@ module inside a disposable VM, where tests gated on real root actually
 execute instead of skipping. That is not a formality — the `tc` action-table
 bug in `modules/tc` was invisible for as long as its test skipped. See
 [vm/README.md](vm/README.md).
+
+## Standards citations
+
+`scripts/check-citations.py [module ...]` fetches the RFC/BIP/BOLT/W3C text
+behind a quoted standards citation in `modules/**` and reports each one
+VERIFIED, MISMATCH or UNFETCHABLE — a fabricated citation is worse than a
+missing one, since nothing prompts a reader to doubt it. Needs network on
+first run; caches into `${XDG_CACHE_HOME:-~/.cache}/zig-libs-citations`, never
+into the repo.
+
+It is a triage aid, not a gate. Extraction is regex-based, so a full-repo run
+reports roughly half its claims as MISMATCH — mostly ordinary prose sitting
+near a standards token, not wrong citations. Read the `file:line` before
+believing one. UNFETCHABLE is never a pass: those claims are simply unchecked.

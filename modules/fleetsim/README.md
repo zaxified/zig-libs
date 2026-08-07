@@ -166,6 +166,34 @@ FLEETSIM_MULTI_LISTEN=127.0.0.1:15026,15027 zig build test-fleetsim  # two maste
 The DNP3 test matches opendnp3's `master-demo` defaults (outstation address 10,
 master 1, port 20000) so the oracle needs no patching.
 
+### Installing the masters
+
+The versions below are the ones the transcripts in [SPEC.md](./SPEC.md) were
+recorded against; pin them, because a master's own defaults are part of the
+oracle. Six of the seven are pip-only — no Debian package exists for them, and
+`python3-pymodbus` ships 3.8.6, far behind the 3.14.0 that was used here.
+
+```
+pip install --user --break-system-packages \
+    pymodbus==3.14.0 pycomm3==1.2.16 bacpypes3==0.0.106 \
+    python-snap7==3.1.0 asyncua==2.0.1 c104==2.2.1
+```
+
+`c104` is the only one carrying a compiled extension (it wraps lib60870-C).
+Its published wheels stop at CPython 3.13, so on a newer interpreter pip falls
+back to a source build and needs `build-essential` and `cmake`.
+
+DNP3 has no usable Python master: `pydnp3` on PyPI is a 2018 work-in-progress
+and is *not* what the transcript was taken against. Build the real thing:
+
+```
+git clone --branch release https://github.com/dnp3/opendnp3.git
+cmake -S opendnp3 -B opendnp3/build -DDNP3_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build opendnp3/build -j"$(nproc)"
+```
+
+then run its `master-demo` example unpatched.
+
 What was actually run against real third-party masters (all seven protocols,
 with the transcript of what each master did), the determinism proof, the
 measured scale numbers and the deferred list are in [SPEC.md](./SPEC.md).
