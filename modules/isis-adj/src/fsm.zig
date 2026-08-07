@@ -78,6 +78,19 @@ pub const RejectReason = enum {
     level_mismatch,
     /// The circuit has not been `start`ed.
     not_started,
+    /// A **third** system sent an IIH while this circuit already has a
+    /// neighbour. A point-to-point circuit carries exactly ONE adjacency
+    /// (ISO/IEC 10589 §8.2.4 — the P2P adjacency is the circuit's, and there is
+    /// one neighbour per circuit), so an IIH whose source-id differs from the
+    /// neighbour we are already tracking is not "the neighbour" and must not be
+    /// acted on. Accepting it would let any unauthenticated station on the wire
+    /// (an IIH carries no authentication unless TLV 10 is configured) refresh
+    /// *our* hold timer with *its* chosen holding-time, overwrite the recorded
+    /// neighbour, and — because it cannot echo our system-id in TLV 240 — drag
+    /// the adjacency Up→Initializing on every frame. The incumbent is kept and
+    /// nothing is mutated; the stranger can only be adopted once the incumbent's
+    /// hold genuinely expires (`tick` → Down clears the neighbour).
+    other_neighbor,
 };
 
 pub const Transition = struct { from: State, to: State };
@@ -310,6 +323,18 @@ pub const Adjacency = struct {
         if ((@intFromEnum(rx.circuit_type) & @intFromEnum(self.cfg.circuit_type)) == 0) {
             return .{ .rejected = .level_mismatch };
         }
+        // One circuit, one neighbour (ISO/IEC 10589 §8.2.4). Once we have heard
+        // a neighbour, only *that* system-id drives this adjacency. Checked
+        // BEFORE any mutation, so a stranger's IIH refreshes no hold, overwrites
+        // no neighbour and forces no transition — see `RejectReason.other_neighbor`.
+        // The lock releases exactly when the incumbent's hold expires: `tick`
+        // clears `neighbor_system_id` on the way to Down, and `start`/`stop` do
+        // the same, so a genuine neighbour change still converges in one hold.
+        if (self.neighbor_system_id) |incumbent| {
+            if (!std.mem.eql(u8, &incumbent, &rx.source_id)) {
+                return .{ .rejected = .other_neighbor };
+            }
+        }
 
         // ── accepted: refresh hold + record the neighbour ───────────────────
         self.hold_deadline = now + @as(Time, rx.holding_time);
@@ -435,6 +460,80 @@ test "rxHello before start is rejected as not_started" {
     var adj = Adjacency.init(cfgA());
     const e = adj.rxHello(.{ .source_id = sys_b, .holding_time = 30, .circuit_type = .level1_2, .local_circuit_id = 1 }, 1);
     try testing.expectEqual(RejectReason.not_started, e.rejected.?);
+}
+
+// Regression (audit W2 `isis-adj` F1): a third system-id must not be able to
+// touch an established adjacency. Before the fix `rxHello` never compared
+// `rx.source_id` against the neighbour already on this circuit, so ONE hello
+// from an unauthenticated stranger refreshed `hold_deadline` to the stranger's
+// chosen holding-time, overwrote `neighbor_system_id`, and (the stranger cannot
+// echo us) dropped the adjacency Up→Initializing with `.neighbor_restarted`.
+// Repeated at any rate that is a permanent flap; worse, once the real neighbour
+// goes silent the stranger's refreshes keep `hold_deadline` in the future, so
+// the hold never expires and the FSM never returns to a clean Down.
+test "a third system-id cannot hijack an established adjacency, nor wedge its hold timer" {
+    const sys_c: SystemId = .{ 0, 0, 0, 0, 0, 0xC };
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+
+    // A and B reach Up at t=1 with B's holding_time = 30 → hold expires at 31.
+    const up = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 },
+        },
+    }, 1);
+    try testing.expect(up.adjacency_up);
+    try testing.expectEqual(State.up, adj.currentState());
+    try testing.expectEqual(@as(Time, 31), adj.hold_deadline);
+
+    // C sprays hellos with the maximum holding-time and no TLV 240 at all.
+    var t: Time = 2;
+    while (t < 30) : (t += 1) {
+        const e = adj.rxHello(.{
+            .source_id = sys_c,
+            .holding_time = 65535,
+            .circuit_type = .level1_2,
+            .local_circuit_id = 1,
+        }, t);
+        // Rejected outright: no transition, no down report, no hello scheduled.
+        try testing.expectEqual(@as(?RejectReason, .other_neighbor), e.rejected);
+        try testing.expect(e.transition == null);
+        try testing.expect(e.adjacency_down == null);
+        // Nothing was mutated: still Up, still B, hold untouched (NOT 65535+t).
+        try testing.expectEqual(State.up, adj.currentState());
+        try testing.expectEqual(sys_b, adj.neighbor_system_id.?);
+        try testing.expectEqual(@as(Time, 31), adj.hold_deadline);
+    }
+
+    // The real neighbour has gone silent, so the hold must still expire on time
+    // — C's refreshes cannot hold it open. (Before the fix `hold_deadline` was
+    // 65535 + 29 here and this adjacency stayed nominally alive forever.)
+    const dead = adj.tick(31);
+    try testing.expectEqual(State.down, adj.currentState());
+    try testing.expectEqual(DownReason.hold_expired, dead.adjacency_down.?);
+    try testing.expect(adj.neighbor_system_id == null);
+
+    // Down releases the circuit: C is now an ordinary candidate neighbour.
+    const after = adj.rxHello(.{
+        .source_id = sys_c,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xC1,
+            .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 },
+        },
+    }, 32);
+    try testing.expect(after.rejected == null);
+    try testing.expect(after.adjacency_up);
+    try testing.expectEqual(sys_c, adj.neighbor_system_id.?);
 }
 
 test "a neighbour not echoing us holds us at Initializing (three-way guard)" {

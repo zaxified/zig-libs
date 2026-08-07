@@ -192,6 +192,18 @@ inference. If the SNP's TLV walk hits malformed bytes the walk terminates safely
 (the `isis` iterators are bounds-checked, never over-read) and the completeness
 sweep is **skipped** — a corrupt CSNP must not trigger a mass re-flood.
 
+**CSNP generation is the same rule read backwards**, so `summarise` fills `out`
+with the numerically **smallest** in-range LSP-IDs in **ascending** LSP-ID order:
+truncation drops the **tail** of the range, never an arbitrary subset. It used to
+truncate in the hash map's arbitrary iteration order while the doc told callers to
+"paginate", which is not definable without an order — an undersized buffer then
+produced a CSNP that *claimed* completeness over `[start, end]` while omitting a
+run-dependent subset, and the receiver's completeness sweep above flooded every
+omitted LSP straight back, on every cadence tick. With the ordered prefix a
+returned count `n` provably enumerates the whole of `[start, out[n-1].lsp_id]`, so
+the caller advertises exactly that window and resumes at its successor; `n <
+out.len` proves the requested range was enumerated in full.
+
 Request placeholders carry no PDU bytes, are skipped by aging and by `summarise`,
 count toward `capacity`, and are replaced when the real LSP arrives (any real LSP
 is newer than a sequence-0 placeholder). They are **not** created for our own

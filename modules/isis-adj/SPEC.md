@@ -103,6 +103,16 @@ Implemented (cheap, and they gate adjacency formation):
   bit1 L2); `(rx & ours) == 0` → `rejected = .level_mismatch`. Catches an
   L1-only vs L2-only P2P pairing.
 - **Not started** — `rxHello` before `start` → `rejected = .not_started`.
+- **Third neighbour** — a P2P circuit carries exactly one adjacency (ISO/IEC
+  10589 §8.2.4). Once `neighbor_system_id` is populated, an IIH from a *different*
+  source system-id → `rejected = .other_neighbor`, checked **before** any
+  mutation. An IIH is unauthenticated unless TLV 10 is configured, so without
+  this check any station on the wire could refresh our hold timer with its own
+  `holding_time`, overwrite the recorded neighbour, and — being unable to echo
+  our system-id in TLV 240 — flap the adjacency Up→Initializing on every frame,
+  while the inflated hold kept the FSM from ever reaching a clean Down. The
+  circuit is released only when the incumbent's hold genuinely expires (`tick`
+  → Down clears the neighbour), so a real neighbour change converges in one hold.
 
 Malformed input is a typed **error** (not a soft reject) from `rxHelloBytes`:
 a bad common header / P2P body surfaces `isis`'s `pdu.DecodeError`

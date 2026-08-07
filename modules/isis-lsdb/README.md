@@ -158,7 +158,11 @@ while (it.next()) |lsp| { sendOnWire(lsp.bytes); db.clearSrm(lsp.lsp_id, c); }
 // DB sync: process a received CSNP on circuit c:
 db.reconcileCsnp(try isis.Csnp.decode(csnp_bytes), c, now);
 
-// build our own CSNP:
+// build our own CSNP: `summarise` returns the SMALLEST in-range LSP-IDs in
+// ASCENDING order, so truncation drops the tail of the range, never an
+// arbitrary subset. Advertise only what you enumerated: a full buffer means
+// the honest window is [start_id, out[count-1].lsp_id], and the next page
+// resumes at its successor.
 var out: [64]isis.tlvs.LspEntry = undefined;
 const count = db.summarise(&out, start_id, end_id, now);
 ```

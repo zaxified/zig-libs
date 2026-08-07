@@ -784,26 +784,53 @@ pub const Lsdb = struct {
     // ── CSNP / PSNP database sync (ISO 10589 §7.3.15.2) ─────────────────────
 
     /// Summarise the database into LSP-Entries for a CSNP covering the inclusive
-    /// LSP-ID range `[start_id, end_id]`. Fills `out` (in the map's iteration
-    /// order) and returns the count written — bounded by `out.len` (the caller
-    /// sizes it / paginates). Request placeholders are skipped (we do not
-    /// advertise LSPs we do not actually hold). Lifetimes are aged to `now`.
+    /// LSP-ID range `[start_id, end_id]`. Request placeholders are skipped (we do
+    /// not advertise LSPs we do not actually hold). Lifetimes are aged to `now`.
+    ///
+    /// **Ordered, prefix truncation.** `out` is filled with the numerically
+    /// **smallest** in-range LSP-IDs, in **ascending LSP-ID order**, and the
+    /// count written is returned. When the range holds more entries than `out`
+    /// can carry, what is dropped is the **tail** of the ID range — never an
+    /// arbitrary subset.
+    ///
+    /// That distinction is the whole contract, because ISO/IEC 10589 §7.3.15.2
+    /// makes a CSNP a *complete* summary of the range it advertises, and
+    /// `reconcileCsnp` (below) implements exactly that receive rule: every
+    /// in-range LSP the CSNP omitted gets SRM set and is flooded back. Under the
+    /// previous hash-order truncation an undersized `out` therefore turned into a
+    /// self-inflicted flood of an arbitrary, run-dependent subset of the database,
+    /// repeated on every cadence tick — and "paginate it" was not even expressible,
+    /// since "the first N of the range" had no definition. With ascending order it
+    /// is: a return of `n` entries provably enumerates the whole of
+    /// `[start_id, out[n-1].lsp_id]`, so a caller advertises **that** range and
+    /// resumes the next page at its successor. A return of `n < out.len` proves
+    /// `[start_id, end_id]` was enumerated completely.
     pub fn summarise(self: *const Lsdb, out: []isis.tlvs.LspEntry, start_id: LspId, end_id: LspId, now: Time) usize {
+        if (out.len == 0) return 0;
         var n: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |kv| {
-            if (n >= out.len) break;
             const e = kv.value_ptr;
             if (e.is_request) continue;
             const id = kv.key_ptr.*;
             if (!inRange(id, start_id, end_id)) continue;
-            out[n] = .{
+            // Full and this id sorts at/after the current largest kept entry →
+            // it belongs to the dropped tail. O(1), so a huge database costs one
+            // compare per out-of-window entry.
+            if (n == out.len and std.mem.order(u8, &id, &out[n - 1].lsp_id) != .lt) continue;
+            // Insertion sort into the kept prefix; when full the largest kept
+            // entry falls off the end.
+            var i: usize = n;
+            while (i > 0 and std.mem.order(u8, &out[i - 1].lsp_id, &id) == .gt) : (i -= 1) {}
+            var j: usize = if (n < out.len) n else out.len - 1;
+            while (j > i) : (j -= 1) out[j] = out[j - 1];
+            out[i] = .{
                 .remaining_lifetime = e.remainingLifetime(now),
                 .lsp_id = id,
                 .sequence_number = e.sequence_number,
                 .checksum = e.checksum,
             };
-            n += 1;
+            if (n < out.len) n += 1;
         }
         return n;
     }
@@ -1264,14 +1291,67 @@ test "summarise fills LSP-Entries for the range, skipping request placeholders" 
     var out: [8]isis.tlvs.LspEntry = undefined;
     const n = db.summarise(&out, @splat(0), @splat(0xFF), 0);
     try testing.expectEqual(@as(usize, 2), n);
-    // Both entries present with their sequence numbers (order is map-defined).
-    var seen0 = false;
-    var seen1 = false;
-    for (out[0..n]) |e| {
-        if (e.sequence_number == 4) seen0 = true;
-        if (e.sequence_number == 6) seen1 = true;
+    // Both entries present with their sequence numbers, in ascending LSP-ID
+    // order (fragment 0 before fragment 1).
+    try testing.expectEqual(idOf(sys_other, 0), out[0].lsp_id);
+    try testing.expectEqual(@as(u32, 4), out[0].sequence_number);
+    try testing.expectEqual(idOf(sys_other, 1), out[1].lsp_id);
+    try testing.expectEqual(@as(u32, 6), out[1].sequence_number);
+}
+
+// Regression (audit W2 `isis-lsdb` F5; the mechanism behind `isis-flood` F1).
+// `summarise` used to truncate at `out.len` in the hash map's ARBITRARY
+// iteration order, while its doc told callers to "paginate" — which is not
+// definable without an order. A caller with an undersized `out` therefore
+// emitted a CSNP claiming completeness over `[start, end]` while omitting a
+// run-dependent subset, and the peer's `reconcileCsnp` (ISO/IEC 10589 §7.3.15.2:
+// a CSNP is authoritative-complete for its range) flooded every omitted LSP back
+// at us — an undersized buffer converted into a self-inflicted flood rather than
+// a truncation error. The contract is now: ascending LSP-ID order, and
+// truncation drops the TAIL of the range.
+test "summarise truncates as an ordered prefix, not an arbitrary hash-order subset" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 64 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+
+    // 32 fragments, inserted in a scrambled order so hash-order != ID order and
+    // != insertion order. Fragment number IS the low octet of the LSP-ID, so the
+    // expected ordered prefix is exactly fragments 0..k-1.
+    const scramble = [_]u8{ 17, 3, 28, 9, 0, 31, 12, 5, 22, 1, 30, 8, 19, 2, 26, 14, 6, 23, 11, 29, 4, 16, 25, 7, 20, 13, 27, 10, 24, 15, 21, 18 };
+    for (scramble) |frag| _ = try db.insert(buildLsp(&buf, sys_other, frag, 1, 900), 0, 0);
+    try testing.expectEqual(@as(usize, 32), db.count());
+
+    // Undersized buffer: 8 slots for 32 in-range entries.
+    var out: [8]isis.tlvs.LspEntry = undefined;
+    const n = db.summarise(&out, @splat(0), @splat(0xFF), 0);
+    try testing.expectEqual(@as(usize, 8), n);
+    // The kept set is the 8 SMALLEST LSP-IDs, ascending — the range's prefix.
+    for (out[0..n], 0..) |e, k| {
+        try testing.expectEqual(idOf(sys_other, @intCast(k)), e.lsp_id);
+        if (k > 0) try testing.expect(std.mem.order(u8, &out[k - 1].lsp_id, &e.lsp_id) == .lt);
     }
-    try testing.expect(seen0 and seen1);
+
+    // Because the prefix is ordered, the range the caller may honestly advertise
+    // is computable — `[start, out[n-1].lsp_id]` — and re-summarising exactly
+    // that window returns the same n entries and nothing more. That is what
+    // makes a CSNP's completeness claim truthful under truncation.
+    var out2: [8]isis.tlvs.LspEntry = undefined;
+    const n2 = db.summarise(&out2, @splat(0), out[n - 1].lsp_id, 0);
+    try testing.expectEqual(n, n2);
+    try testing.expectEqualSlices(isis.tlvs.LspEntry, out[0..n], out2[0..n2]);
+
+    // The next page resumes at the successor and is likewise a prefix.
+    var next_start = out[n - 1].lsp_id;
+    next_start[7] += 1;
+    const n3 = db.summarise(&out2, next_start, @splat(0xFF), 0);
+    try testing.expectEqual(@as(usize, 8), n3);
+    for (out2[0..n3], 0..) |e, k| try testing.expectEqual(idOf(sys_other, @intCast(8 + k)), e.lsp_id);
+
+    // A buffer that is big enough returns the whole range, still ascending.
+    var big: [64]isis.tlvs.LspEntry = undefined;
+    const nb = db.summarise(&big, @splat(0), @splat(0xFF), 0);
+    try testing.expectEqual(@as(usize, 32), nb);
+    for (big[0..nb], 0..) |e, k| try testing.expectEqual(idOf(sys_other, @intCast(k)), e.lsp_id);
 }
 
 test "determinism: identical (ops, now) streams yield identical flag state" {
