@@ -163,9 +163,15 @@ earlier (fewer messages before mandatory rekey), never later.
 shape.** `std.crypto.ecc.P256` exposes point arithmetic
 (`fromSec1`/`toUncompressedSec1`/`mul`/`affineCoordinates`), not a
 packaged "DH function" the way `std.crypto.dh.X25519` does — RFC 9180
-§7.1.2's `DH(skX, pkY)` for NIST curves is "the shared point's X
-coordinate only" (§7.1.2: "This function can raise a DeserializeError
-error... and a DHError error"), which `dhkem.P256Kem`'s
+**§4.1**'s `DH(skX, pkY)` for NIST curves yields the X coordinate only,
+verbatim: "For P-256, P-384, and P-521, the size Ndh of the Diffie-Hellman
+shared secret is equal to 32, 48, and 66, respectively, corresponding to the
+x-coordinate of the resulting elliptic curve point [IEEE1363]." (§4.1 also
+fixes the failure mode: `DH` "can raise a ValidationError as described in
+Section 7.1.4", not a deserialization error.) Earlier revisions of this file
+cited §7.1.2 — which is "SerializePrivateKey and DeserializePrivateKey", not
+`DH` — and quoted "a DHError error", a name that appears nowhere in RFC 9180
+(audit BD-26). `dhkem.P256Kem`'s
 `encapDeterministic`/`decap` implement as
 `P256.fromSec1(pk).mul(sk, .big).affineCoordinates().x.toBytes(.big)`
 (NOT `.toUncompressedSec1()`, NOT the Y coordinate) — KAT-confirmed by
@@ -204,9 +210,13 @@ thin `generateKeyPair(io)` + `*Deterministic` wrappers for real callers.
   reuse by sheer message volume — the caller MUST re-key (a fresh
   `Encap`/`KeySchedule`) rather than continue, and the type never wraps
   silently.
-- **KEM low-order/identity-element DH results.** RFC 9180 §7.1.1/§7.1.2
-  both require rejecting a DH computation that lands on the identity
-  element (X25519's documented all-zero output for a maliciously chosen
+- **KEM low-order/identity-element DH results.** RFC 9180 **§7.1.4**
+  requires rejecting a DH computation that lands on the identity
+  element — verbatim: "senders and recipients MUST ensure the Diffie-Hellman
+  shared secret is not the point at infinity" and "recipients MUST check
+  whether the Diffie-Hellman shared secret is the all-zero value and abort if
+  so". (§7.1.1/§7.1.2, cited here before audit BD-26, only cover key
+  *serialization* and defer validation to §7.1.4.) That is (X25519's documented all-zero output for a maliciously chosen
   public key, RFC 7748 §6.1; P-256's point-at-infinity) — silently
   proceeding would let a peer force a known, attacker-predictable
   `shared_secret`. Every `Encap`/`Decap`/`AuthEncap`/`AuthDecap` maps
@@ -295,7 +305,8 @@ implemented and KAT-verified (order preserved):
    plaintext; fresh-random-key round trips (X25519+AES-128-GCM and
    P-256+ChaCha20Poly1305) including a mismatched-`info` rejection.
 7. ✅ **`dhkem.P256Kem.encapDeterministic`/`.decap`/`.deriveKeyPair`**
-   (§7.1.2/§7.1.3) — x-coordinate-only ECDH
+   (§4.1's x-coordinate rule, §7.1.1's SEC1 deserialization, §7.1.3's
+   `DeriveKeyPair`) — x-coordinate-only ECDH
    (`P256.fromSec1(pk).mul(sk,.big).affineCoordinates().x.toBytes(.big)`,
    `error.DeserializeError` on malformed SEC1, `error.DhFailed` on
    identity) and the §7.1.3 rejection-sampling `deriveKeyPair` loop

@@ -617,8 +617,10 @@ fn findSki(cert_der: CertDer) VerifyChainError!?[]const u8 {
 /// `extensions.subtreeIterator`) collected from every CA certificate above
 /// this one in the path; `subject_dn` is the raw RDNSequence content of the
 /// certificate being checked (always checked against `directoryName`
-/// constraints, RFC 5280 §4.2.1.10: "restricts... the certificate subject
-/// field") and `subject_san` is its raw `subjectAltName` extnValue (or an
+/// constraints — RFC 5280 §4.2.1.10, verbatim: "Restrictions apply to the
+/// subject distinguished name and apply to subject alternative names."; the
+/// shorter string quoted here before audit BD-26 was not the RFC's wording)
+/// and `subject_san` is its raw `subjectAltName` extnValue (or an
 /// empty slice when absent — every entry in it is checked against the
 /// constraint of its own `GeneralName` type).
 ///

@@ -388,13 +388,13 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     ///     in the first place; answering it with a byte-identical
     ///     ClientHello would be a retry loop.
     HelloRetryRequestUnsupported,
-    /// RFC 8446 §4.1.4: a HelloRetryRequest named a `selected_group` this
-    /// client never put in its own `supported_groups`. Accepting it would
+    /// RFC 8446 §4.2.8 check (1): a HelloRetryRequest named a
+    /// `selected_group` this client never put in its own `supported_groups`. Accepting it would
     /// let the server choose a group off-menu — including one this side
     /// cannot compute a share for.
     UnsupportedGroup,
-    /// RFC 8446 §4.1.4: a HelloRetryRequest named a group the client had
-    /// ALREADY offered a `key_share` for, or (in a ServerHello) selected a
+    /// RFC 8446 §4.2.8 check (2): a HelloRetryRequest named a group the
+    /// client had ALREADY offered a `key_share` for, or (in a ServerHello) selected a
     /// cipher suite other than the one the preceding HelloRetryRequest
     /// committed to. Both are protocol violations that a client which
     /// obliged could be driven around indefinitely by.
@@ -756,8 +756,8 @@ const advertised_groups = [_]u16{ x25519_group, secp256r1_group };
 const max_key_share_len = 65;
 
 /// Is `group` one this side advertised in `supported_groups`? RFC 8446
-/// §4.1.4: a client MUST abort on a HelloRetryRequest whose `selected_group`
-/// was not in its own `supported_groups` — otherwise a server picks the
+/// §4.2.8 check (1): a client MUST abort on a HelloRetryRequest whose
+/// `selected_group` was not in its own `supported_groups` — otherwise a server picks the
 /// group, which is precisely backwards.
 fn groupAdvertised(group: u16) bool {
     for (advertised_groups) |g| {
@@ -2595,9 +2595,13 @@ pub const Connection = struct {
                     return err;
                 };
                 std.crypto.secureZero(u8, &kp.secret); // forward secrecy: drop the ephemeral private key
-                // Goes into the ServerHello key_share, in the client's group
-                // (RFC 8446 §4.2.8: "the server's share MUST be in the same
-                // group as the client's").
+                // Goes into the ServerHello key_share, in the client's group.
+                // RFC 8446 §4.2.8, verbatim: "This value MUST be in the same
+                // group as the KeyShareEntry value offered by the client that
+                // the server has selected for the negotiated key exchange."
+                // (Before audit BD-26 this quoted "the server's share MUST be
+                // in the same group as the client's", which is §2's overview
+                // sentence with "one of the client's shares" edited away.)
                 self.ecdhe_group = kp.group;
                 self.ecdhe_public = kp.public;
                 self.ecdhe_public_len = kp.public_len;
@@ -6067,9 +6071,13 @@ test "cert-DHE HRR reject: a retry naming a group the client ALREADY offered a s
     var buf2: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
 
-    // RFC 8446 §4.1.4: "Clients MUST abort ... if the selected_group field
-    // ... corresponds to a group which was provided in the key_share
-    // extension in the original ClientHello". A client that obliged would
+    // RFC 8446 §4.2.8, verbatim: the client "MUST verify that ... (2) the
+    // selected_group field does not correspond to a group which was provided
+    // in the "key_share" extension in the original ClientHello. If either of
+    // these checks fails, then the client MUST abort the handshake with an
+    // "illegal_parameter" alert." (Cited as §4.1.4 before audit BD-26; §4.1.4
+    // is where the related "would not result in any change in the
+    // ClientHello" abort lives, not this rule.) A client that obliged would
     // regenerate the same offer on demand, forever — an unbounded loop the
     // peer controls. Note this survives even WITH a cookie present: the
     // cookie makes the retry "not pointless", but the group is still
@@ -6179,8 +6187,10 @@ test "HRR: the ServerHello must select the cipher suite the retry committed to (
 }
 
 test "cert-DHE: a ServerHello answering in a DIFFERENT group than the client offered is rejected" {
-    // RFC 8446 §4.2.8: "the server's share MUST be in the same group as the
-    // client's". Without the check, this client would run X25519 over bytes
+    // RFC 8446 §4.2.8, verbatim: "This value MUST be in the same group as the
+    // KeyShareEntry value offered by the client that the server has selected
+    // for the negotiated key exchange."
+    // Without the check, this client would run X25519 over bytes
     // the server labelled secp256r1 and carry on into the flight with a
     // shared secret neither side agrees on.
     //

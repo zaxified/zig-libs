@@ -80,7 +80,7 @@ server said.
 
 PLAIN and LOGIN both send the password in a base64 that is not encryption, so
 `Session.afterTlsDecision` returns `error.PlaintextAuthRefused` unless `tls_active` or the
-caller set `allow_plaintext_auth` (RFC 4954 §14). The refusal happens **before** any AUTH
+caller set `allow_plaintext_auth` (RFC 4954 §9). The refusal happens **before** any AUTH
 command is written; the test asserts the wire carries no `AUTH` at all in that case.
 
 Credentials are validated before encoding: a NUL would forge RFC 4616's field separator, a

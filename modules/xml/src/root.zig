@@ -764,9 +764,13 @@ const Parser = struct {
         self.i += 1;
         const target = try self.parseNameRaw();
         if (asciiEqualIgnoreCase(target, "xml")) return error.MalformedPI; // reserved
-        // Namespaces in XML 1.0 Section 8 (Namespace Constraints): "in XML
-        // documents conforming to this specification, no ... PI targets ...
-        // contain any colons." This module always applies namespace
+        // Namespaces in XML 1.0 §7 "Conformance of Documents", verbatim:
+        // "It follows that in a namespace-well-formed document: ... No entity
+        // names, processing instruction targets, or notation names contain any
+        // colons." (Audit BD-26: cited as "Section 8 (Namespace Constraints)"
+        // before — §8 is "Conformance of Processors", and the rule is a
+        // consequence stated in §7, not a named Namespace Constraint.)
+        // This module always applies namespace
         // processing, so this NSC is enforced unconditionally (xmlconf
         // rmt-ns10-042, errata NE08).
         if (std.mem.indexOfScalar(u8, target, ':') != null) return error.NamespaceError;

@@ -58,10 +58,17 @@ pub const version: u8 = 1;
 /// `DLEN = 0` means "every network".
 pub const global_broadcast_net: u16 = 0xFFFF;
 
-/// Maximum octets a MAC address inside DADR/SADR may take. The standard caps
-/// the field at a single length octet; MS/TP uses 1, BACnet/IP uses 6, and
-/// nothing real exceeds 7 (ARCNET/Ethernet).
-pub const max_mac_len: usize = 255;
+/// Maximum octets a MAC address inside DADR/SADR may take **here**.
+///
+/// DLEN/SLEN are single octets on the wire, so the encoding can name up to 255
+/// — but no BACnet data link defines a MAC that long: MS/TP and ARCNET use 1,
+/// BACnet/IP uses 6, and 7 is the ceiling every implementation allocates for
+/// (it is `bacnet-stack`'s `MAX_MAC_LEN` too). This module refuses anything
+/// longer at the decoder and cannot represent it in `NetAddress`, so this
+/// constant is the storage size, the decoder's cap and `fromMac`'s cap, all at
+/// once. It was `255` until audit BD-27: a constant that contradicted both the
+/// `[7]u8` it described and the code that enforced the real limit.
+pub const max_mac_len: usize = 7;
 
 /// Network priority (clause 6.2.2, the low two control bits).
 pub const Priority = enum(u2) {
@@ -78,10 +85,18 @@ pub const NetAddress = struct {
     net: u16,
     /// Storage for the MAC. Fixed-size so an NPCI is a value, never a
     /// borrow — an NPDU header outlives the datagram in a client's state.
-    mac: [7]u8 = @splat(0),
-    mac_len: u8 = 0,
+    mac: [max_mac_len]u8 = @splat(0),
+    /// Octets of `mac` that are meaningful. Deliberately a `u3`, not a `u8`:
+    /// `max_mac_len` is 7, so a `u3` can name every valid length and no invalid
+    /// one. `mac` and `mac_len` are both public — the same reachability that
+    /// made audit BD-19 real — and with a `u8` a caller could write `mac_len =
+    /// 200` and `address()` would slice out of bounds. Refusing that at each
+    /// use site is a list of checks somebody eventually forgets; refusing it in
+    /// the type is the check that cannot be forgotten (audit BD-27).
+    mac_len: u3 = 0,
 
     pub fn address(self: *const NetAddress) []const u8 {
+        // In bounds by construction: `mac_len` cannot exceed `mac.len`.
         return self.mac[0..self.mac_len];
     }
 
@@ -94,7 +109,7 @@ pub const NetAddress = struct {
     pub const global: NetAddress = .{ .net = global_broadcast_net };
 
     pub fn fromMac(net: u16, mac: []const u8) Error!NetAddress {
-        if (mac.len > 7) return error.InvalidControl;
+        if (mac.len > max_mac_len) return error.InvalidControl;
         var a: NetAddress = .{ .net = net, .mac_len = @intCast(mac.len) };
         @memcpy(a.mac[0..mac.len], mac);
         return a;
@@ -177,13 +192,12 @@ pub const Npci = struct {
     ///
     /// Each `mac_len` is widened to `usize` **before** any arithmetic. Zig types
     /// `3 + d.mac_len` by its operands, not by where the result lands: written
-    /// without the widening it is computed in `u8` and overflows at
-    /// `mac_len >= 253`, even though `n` is a `usize`. That is the same shape as
-    /// the `u16` length arithmetic in `sc.zig`'s `OptionIter` (audit BD-02).
-    /// `decodeHeader` caps DLEN/SLEN at 7 and `NetAddress.fromMac` refuses
-    /// longer, so no wire input reaches it today — but `NetAddress.mac_len` is a
-    /// public field, so a caller-built NPCI does, and a bounds computation must
-    /// not depend on an invariant enforced somewhere else.
+    /// without the widening it is computed in the field's own type and traps on
+    /// overflow, even though `n` is a `usize`. That was `u8` and `mac_len >= 253`
+    /// when audit BD-19 found it; since BD-27 narrowed the field to `u3` it is
+    /// `mac_len >= 5`, i.e. *reachable from a legal address* — the widening got
+    /// more load-bearing, not less. Same shape as the `u16` length arithmetic in
+    /// `sc.zig`'s `OptionIter` (audit BD-02).
     pub fn wireLen(self: Npci) usize {
         var n: usize = 2;
         if (self.destination) |d| n += 3 + @as(usize, d.mac_len);
@@ -271,7 +285,7 @@ pub fn decode(buf: []const u8) Error!Npdu {
         const net = std.mem.readInt(u16, buf[pos..][0..2], .big);
         const dlen = buf[pos + 2];
         pos += 3;
-        if (dlen > 7) return error.InvalidControl;
+        if (dlen > max_mac_len) return error.InvalidControl;
         if (pos + dlen > buf.len) return error.Truncated;
         // DLEN == 0 is legal: "broadcast on DNET".
         npci.destination = try NetAddress.fromMac(net, buf[pos..][0..dlen]);
@@ -284,7 +298,7 @@ pub fn decode(buf: []const u8) Error!Npdu {
         pos += 3;
         // A source specifier with no address cannot be replied to; the
         // standard forbids it and so does this decoder.
-        if (slen == 0 or slen > 7) return error.InvalidControl;
+        if (slen == 0 or slen > max_mac_len) return error.InvalidControl;
         if (pos + slen > buf.len) return error.Truncated;
         npci.source = try NetAddress.fromMac(net, buf[pos..][0..slen]);
         pos += slen;
@@ -746,17 +760,21 @@ test "encode refuses to overflow the output buffer at any field" {
     try testing.expectEqual(@as(usize, 19), wire.len);
 }
 
-// ── regression: `wireLen` must not do its arithmetic in `u8` (audit BD-19) ───
+// ── regression: `wireLen` must not do its arithmetic in the field's own type
+// (audit BD-19, boundary moved by BD-27) ─────────────────────────────────────
 //
-// `NetAddress.mac_len` is a public field, so an NPCI can be built with any
-// length at all without going through `fromMac`. `3 + d.mac_len` written
-// unwidened is typed by its operands — `u8` — and panics with "integer
-// overflow" from `mac_len == 253` upward, in a function whose whole job is to
-// tell the caller how big a buffer to hand `encode`. Same shape as BD-02 in
+// `NetAddress.mac_len` is a public field, so an NPCI can be built without going
+// through `fromMac`. `3 + d.mac_len` written unwidened is typed by its operands
+// and panics with "integer overflow", in a function whose whole job is to tell
+// the caller how big a buffer to hand `encode`. BD-19 found this when the field
+// was a `u8` and the trap started at 253; BD-27 narrowed the field to a `u3`,
+// which fixes the out-of-bounds slice but drags the overflow boundary down to
+// 5 — a MAC length a real BACnet/IP peer sends. Same shape as BD-02 in
 // `sc.zig`; there it silently wrapped a bounds check, here it traps.
-test "wireLen is computed in usize, not in the u8 the operands imply" {
-    // 253 is where `3 + mac_len` first leaves the u8 range.
-    for ([_]u8{ 252, 253, 254, 255 }) |len| {
+test "wireLen is computed in usize, not in the type the operands imply" {
+    // 5 is where `3 + mac_len` first leaves the u3 range; 7 is the maximum the
+    // field can hold at all.
+    for ([_]u3{ 4, 5, 6, 7 }) |len| {
         const d: Npci = .{ .destination = .{ .net = 1, .mac_len = len } };
         try testing.expectEqual(@as(usize, 2 + 3 + @as(usize, len) + 1), d.wireLen());
         const s: Npci = .{ .source = .{ .net = 1, .mac_len = len } };
@@ -772,6 +790,42 @@ test "wireLen is computed in usize, not in the u8 the operands imply" {
         .destination = try NetAddress.fromMac(1, &.{ 1, 2, 3, 4, 5, 6 }),
         .source = try NetAddress.fromMac(2, &.{ 7, 8 }),
     }).wireLen());
+}
+
+// ── regression: an over-long `mac_len` must be unrepresentable (audit BD-27) ─
+//
+// `address()` returns `mac[0..mac_len]` with both fields public. While
+// `mac_len` was a `u8` and `mac` a `[7]u8`, `NetAddress{ .net = 1, .mac_len =
+// 200 }` — no `fromMac`, no wire input, just a struct literal — sliced 193
+// octets past the storage, and `max_mac_len` said `255` as if that were fine.
+// The fix is the type, so the defect is now a compile error rather than a
+// runtime one; what this test pins is the property that makes it so.
+test "mac_len cannot name an octet outside the MAC storage" {
+    const cap = @typeInfo(@FieldType(NetAddress, "mac")).array.len;
+    // The invariant, stated where a future widening of the field would trip
+    // over it: the length type cannot express an out-of-bounds index.
+    try testing.expectEqual(cap, max_mac_len);
+    try testing.expect(std.math.maxInt(@FieldType(NetAddress, "mac_len")) <= cap);
+
+    // ...and it holds for every value the field can take, built by hand rather
+    // than through `fromMac`, which is the path that had no guard.
+    var v: NetAddress = .{ .net = 1, .mac = .{ 1, 2, 3, 4, 5, 6, 7 } };
+    for (0..cap + 1) |n| {
+        v.mac_len = @intCast(n);
+        try testing.expectEqual(n, v.address().len);
+        try testing.expectEqualSlices(u8, v.mac[0..n], v.address());
+        // `wireLen` must survive the same values (BD-19's arithmetic).
+        try testing.expectEqual(2 + 3 + n + 1, (Npci{ .destination = v }).wireLen());
+    }
+
+    // The boundary the decoder enforces is the same number, not a second one.
+    try testing.expectError(error.InvalidControl, NetAddress.fromMac(1, &[_]u8{0} ** (cap + 1)));
+    // DLEN one past the cap, with the octets actually present, is still refused.
+    var wire: [2 + 3 + cap + 1 + 1]u8 = @splat(0);
+    wire[0] = version;
+    wire[1] = 0x20;
+    wire[4] = cap + 1;
+    try testing.expectError(error.InvalidControl, decode(&wire));
 }
 
 test "fuzz: NPDU decode never panics and canonical headers re-encode" {

@@ -28,7 +28,7 @@
 //! re-issues EHLO; and once TLS is up, `error.PlaintextAfterTls` is returned
 //! rather than continuing if anything tries to fall back.
 //!
-//! **AUTH is refused on an unprotected link.** RFC 4954 §14. PLAIN and LOGIN
+//! **AUTH is refused on an unprotected link.** RFC 4954 §9. PLAIN and LOGIN
 //! hand the password to anyone on the path. `Options.allow_plaintext_auth` is
 //! the explicit opt-in and defaults to false, so the insecure case cannot be
 //! reached by forgetting a flag.
@@ -78,7 +78,7 @@ pub const Options = struct {
     ehlo_domain: []const u8 = "localhost",
     tls: TlsPolicy = .opportunistic,
     credentials: ?Credentials = null,
-    /// AUTH over a link with no TLS. See the file comment; RFC 4954 §14.
+    /// AUTH over a link with no TLS. See the file comment; RFC 4954 §9.
     allow_plaintext_auth: bool = false,
     /// Group MAIL/RCPT/DATA when the server advertises PIPELINING.
     pipelining: bool = true,

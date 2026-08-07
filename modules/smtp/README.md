@@ -22,7 +22,7 @@ builds `multipart/mixed` and `multipart/alternative` trees with attachments.
   downgrade vulnerability), and any byte buffered across the handshake is
   `error.PlaintextInjection`, not leftover data.
 - **AUTH** PLAIN (RFC 4616) and LOGIN, refused on an unencrypted link unless the caller
-  sets `allow_plaintext_auth` (RFC 4954 §14).
+  sets `allow_plaintext_auth` (RFC 4954 §9).
 - **DATA transparency.** Dot-stuffing on send, un-stuffing on receive, and the `CRLF.CRLF`
   terminator. A body line that is exactly `.` is the canonical case and is tested
   everywhere, including end-to-end against a real server. The terminator is *only*

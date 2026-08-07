@@ -34,8 +34,12 @@ pub const MessageType = enum(u8) {
     SSH_MSG_USERAUTH_FAILURE = 51,
     SSH_MSG_USERAUTH_SUCCESS = 52,
     SSH_MSG_USERAUTH_BANNER = 53,
-    /// 60 is method-specific (RFC 4252 §6: "in the range 60..79 ... only
-    /// valid during the authentication method they belong to"). For the
+    /// 60 is method-specific. RFC 4252 §6, verbatim: "there is a range of
+    /// message numbers (60 to 79) reserved for method-specific messages ...
+    /// Different authentication methods reuse the same message numbers."
+    /// (Audit BD-26: the second half of the sentence quoted here before —
+    /// "only valid during the authentication method they belong to" — is this
+    /// module's own gloss, not the RFC's words.) For the
     /// `publickey` method it is SSH_MSG_USERAUTH_PK_OK (RFC 4252 §7); for
     /// `password` the same number is SSH_MSG_USERAUTH_PASSWD_CHANGEREQ
     /// (§8), which this module never sends and rejects on receipt.

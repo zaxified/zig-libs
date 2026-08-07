@@ -40,7 +40,7 @@ not copied from any other implementation's test suite.
 (MIT, part of Zig itself) — see `suite.zig`/`dhkem.zig`/`schedule.zig`'s
 module docs for the specific API recon (e.g. P-256's raw ECDH is
 `P256.fromSec1(pk).mul(sk, .big).affineCoordinates().x.toBytes(.big)` —
-the shared X coordinate only, per RFC 9180 §7.1.2 — since std ships no
+the shared X coordinate only, per RFC 9180 §4.1 — since std ships no
 packaged "P-256 DH keypair" type the way it does `X25519.KeyPair`).
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

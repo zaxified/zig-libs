@@ -3,12 +3,23 @@
 //! RFC 4954 — the SMTP AUTH extension, PLAIN (RFC 4616) and LOGIN.
 //!
 //! Both mechanisms transmit the password in the clear after a base64 encode
-//! that is not encryption. RFC 4954 §14 is blunt about it: "the AUTH command
-//! ... MUST NOT be used over an unencrypted connection unless the client has
-//! explicitly requested it". `session.zig` enforces exactly that — AUTH is
-//! refused on a plaintext link unless the caller sets
+//! that is not encryption. RFC 4954 §9 (Security Considerations), last
+//! paragraph, verbatim: "If an implementation supports SASL mechanisms that
+//! are vulnerable to passive eavesdropping attacks (such as [PLAIN]), then the
+//! implementation MUST support at least one configuration where these SASL
+//! mechanisms are not advertised or used without the presence of an external
+//! security layer such as [TLS]." `session.zig` is that configuration, and it
+//! is the default — AUTH is refused on a plaintext link unless the caller sets
 //! `Options.allow_plaintext_auth`, and the refusal is a typed error, not a
 //! warning.
+//!
+//! Earlier revisions of this file, `session.zig`, `README.md` and `SPEC.md`
+//! cited "RFC 4954 §14" for that rule and quoted a sentence — "the AUTH
+//! command ... MUST NOT be used over an unencrypted connection unless the
+//! client has explicitly requested it" — which appears nowhere in RFC 4954.
+//! §14 is "Additional Requirements When Using SASL PLAIN over TLS" and is
+//! about certificate and hostname verification once TLS is already up. The
+//! error is recorded here rather than silently overwritten (audit BD-26).
 //!
 //! LOGIN was never standardised (it has no RFC; the challenges are the literal
 //! base64 of "Username:" and "Password:"). It is implemented because a large

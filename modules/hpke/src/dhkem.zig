@@ -51,12 +51,15 @@ const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384
 /// Errors an `Encap`/`AuthEncap` can return (RFC 9180 §4/§7.1 doesn't
 /// itself name failure modes beyond "SerializeError"/"DeserializeError"
 /// for malformed keys — X25519/P-256 DH can also reject a low-order/
-/// identity result, RFC 9180 §7.1.1/§7.1.2).
+/// identity result, RFC 9180 §7.1.4).
 pub const EncapError = error{
     /// The DH computation hit the identity element / a low-order point
     /// (X25519 all-zero output, RFC 7748 §6.1; P-256 point-at-infinity) —
-    /// RFC 9180 §7.1.1/§7.1.2 both call this out as a required check, not
-    /// an edge case to silently ignore.
+    /// RFC 9180 §7.1.4 calls this out as a required check, not an edge case
+    /// to silently ignore: "senders and recipients MUST ensure the
+    /// Diffie-Hellman shared secret is not the point at infinity". (§7.1.1 and
+    /// §7.1.2, cited here before audit BD-26, are the serialization clauses
+    /// and defer validation to §7.1.4.)
     DhFailed,
     /// `pkR`/`pkS` failed to deserialize (P-256 SEC1 decoding: not on the
     /// curve, non-canonical coordinates, or a malformed encoding — RFC
