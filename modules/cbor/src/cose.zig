@@ -74,6 +74,14 @@ pub const KeyError = error{
     /// `kty` is present and well-typed but not EC2 (2) or OKP (1) — the only
     /// two key types this module models.
     UnsupportedKty,
+    /// Two entries in the map share the same integer label. RFC 9052 §3:
+    /// "Labels in each of the maps MUST be unique. When processing messages,
+    /// if a label appears multiple times, the message MUST be rejected as
+    /// malformed." (fetched and read 2026-08-07, https://www.rfc-editor.org/rfc/rfc9052.html
+    /// §3). A first-wins or last-wins reader disagrees with any
+    /// spec-conformant peer about which copy is authoritative — a
+    /// parser-differential in front of the key material itself.
+    DuplicateLabel,
 };
 
 /// An EC2 (double-coordinate elliptic curve) public key (RFC 9053 §7.1) —
@@ -122,6 +130,33 @@ fn mapGet(entries: []const MapEntry, label: i64) ?Value {
     return null;
 }
 
+/// True if two entries' int-valued keys are the same label. Non-int keys
+/// (this module never emits or expects a `tstr` label) never collide.
+fn labelKeyEql(a: Value, b: Value) bool {
+    const ai = switch (a) {
+        .uint, .negint => a.toI64() orelse return false,
+        else => return false,
+    };
+    const bi = switch (b) {
+        .uint, .negint => b.toI64() orelse return false,
+        else => return false,
+    };
+    return ai == bi;
+}
+
+/// RFC 9052 §3 forbids a repeated label in a header-bucket map. Detect it
+/// generically over every entry — not just the labels this module happens
+/// to read — because a producer and a lenient first/last-wins consumer can
+/// disagree about which of two copies is authoritative.
+fn hasDuplicateLabel(entries: []const MapEntry) bool {
+    for (entries, 0..) |e, i| {
+        for (entries[i + 1 ..]) |o| {
+            if (labelKeyEql(e.key, o.key)) return true;
+        }
+    }
+    return false;
+}
+
 fn intField(entries: []const MapEntry, label: i64) KeyError!?i64 {
     const v = mapGet(entries, label) orelse return null;
     return v.toI64() orelse return error.WrongType;
@@ -149,6 +184,7 @@ pub fn parseKey(value: Value) KeyError!Key {
         .map => |m| m,
         else => return error.NotAMap,
     };
+    if (hasDuplicateLabel(entries)) return error.DuplicateLabel;
     const kty = try requiredIntField(entries, label_kty);
     const alg = try intField(entries, label_alg);
     const crv = try requiredIntField(entries, label_crv);
@@ -192,6 +228,8 @@ pub const Sign1Error = error{
     /// Not a 4-element array (after optionally unwrapping a tag-18 wrapper).
     NotSign1,
     WrongType,
+    /// The unprotected header map has a repeated label — see `KeyError.DuplicateLabel`.
+    DuplicateLabel,
 };
 
 /// A parsed/to-be-built `COSE_Sign1` structure (RFC 9052 §4.2): the 4-tuple
@@ -234,6 +272,7 @@ pub fn parseSign1(value: Value) Sign1Error!Sign1 {
         .map => |m| m,
         else => return error.WrongType,
     };
+    if (hasDuplicateLabel(unprotected)) return error.DuplicateLabel;
     const payload: ?[]const u8 = switch (arr[2]) {
         .bytes => |b| b,
         .null_value => null,
@@ -323,6 +362,35 @@ test "COSE_Key: OKP Ed25519 round-trip" {
     try testing.expect(parsed == .okp);
     try testing.expectEqual(@as(i64, crv_ed25519), parsed.okp.crv);
     try testing.expectEqualSlices(u8, &x, parsed.okp.x);
+}
+
+test "COSE_Key: a duplicated label is rejected, not resolved first-wins (RFC 9052 §3)" {
+    // Two `alg` (label 3) entries: -7 (ES256) then -65535 (RS1). A
+    // first-wins reader picks -7; a last-wins reader picks -65535 — the
+    // parser-differential RFC 9052 §3 exists specifically to forbid.
+    const entries = [_]MapEntry{
+        .{ .key = Value.fromI64(label_kty), .value = .{ .uint = kty_ec2 } },
+        .{ .key = Value.fromI64(label_alg), .value = Value.fromI64(-7) },
+        .{ .key = Value.fromI64(label_alg), .value = Value.fromI64(-65535) },
+        .{ .key = Value.fromI64(label_crv), .value = .{ .uint = 1 } },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = "x" } },
+        .{ .key = Value.fromI64(label_y), .value = .{ .bytes = "y" } },
+    };
+    try testing.expectError(error.DuplicateLabel, parseKey(.{ .map = &entries }));
+}
+
+test "COSE_Sign1: a duplicated label in the unprotected header is rejected" {
+    const unprotected = [_]MapEntry{
+        .{ .key = Value.fromI64(1), .value = .{ .uint = 1 } },
+        .{ .key = Value.fromI64(1), .value = .{ .uint = 2 } },
+    };
+    const arr = [_]Value{
+        .{ .bytes = &.{} },
+        .{ .map = &unprotected },
+        .{ .bytes = "payload" },
+        .{ .bytes = "sig" },
+    };
+    try testing.expectError(error.DuplicateLabel, parseSign1(.{ .array = &arr }));
 }
 
 test "COSE_Key: missing required field -> MissingField" {

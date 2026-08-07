@@ -100,9 +100,17 @@ pub const Options = struct {
     /// signature algorithms. Off by default; enable only for legacy interop.
     allow_weak_sha1: bool = false,
     /// If set, `URI="#value"` references are resolved by matching this
-    /// unqualified attribute's local name (via `Document.findByAttr`) instead of
-    /// the parser's ID heuristic (`getElementById`). SAML profiles that use a
-    /// non-standard ID attribute name pass it here.
+    /// unqualified attribute's local name instead of the parser's ID heuristic
+    /// (`getElementById`). SAML profiles that use a non-standard ID attribute
+    /// name pass it here.
+    ///
+    /// Uniqueness on this branch is enforced by `resolveReference` itself, NOT
+    /// by the parser: `Document.findByAttr` is first-match-in-document-order,
+    /// and the name given here need not be one of the `xml.Options.id_attr_names`
+    /// the document was parsed with, so `error.DuplicateId` may never have looked
+    /// at it. A document carrying this attribute with the same value on two
+    /// elements is rejected (`error.UriNotResolved`) rather than silently
+    /// resolved to the first — see that error's documentation.
     id_attr: ?[]const u8 = null,
 };
 
@@ -148,8 +156,12 @@ pub const VerifyError = error{
     /// A transform other than enveloped-signature / exclusive / inclusive C14N
     /// was requested (XPath, XSLT, base64, …). Rejected by policy.
     UnsupportedTransform,
-    /// A `Reference URI` did not resolve to exactly one in-document element
-    /// (missing, external, or — defensively — not found).
+    /// A `Reference URI` did not resolve to exactly one in-document element:
+    /// missing, external, not found — or **ambiguous**, i.e. two or more
+    /// elements carry `Options.id_attr` with that value. Ambiguity is a refusal
+    /// and not a first-match, because the caller resolves the same id
+    /// independently when deciding what the signature covers, and a resolution
+    /// the two sides can disagree about is signature wrapping.
     UriNotResolved,
     /// A recomputed reference digest did not match `<DigestValue>`.
     DigestMismatch,
@@ -190,6 +202,53 @@ fn mapSig(uri: []const u8) ?SigAlg {
     return null;
 }
 
+// ── secret-scrubbing allocator (CONVENTIONS §2.1 Z1) ────────────────────────
+
+/// An allocator wrapper that `secureZero`s every block before handing it back to
+/// `child`. `verify()` backs its scratch arena with this, because the arena's
+/// blocks hold the canonical form of the very octets under verification — which,
+/// on `saml`'s encrypted-assertion path, is a decrypted SAML assertion.
+///
+/// `resize`/`remap` are deliberately refused rather than forwarded: both can end
+/// up releasing storage inside `child` (a shrink's tail, a moving remap's old
+/// block) without ever reaching `free`, so there is no hook left to scrub it.
+/// Refusing makes `Allocator.realloc` fall back to alloc + copy + free, and that
+/// `free` is ours. The arena only ever calls `alloc` and `free` on its child
+/// anyway, so this costs nothing today and stays correct if the arena goes away.
+///
+/// Note which build mode this is for: `Allocator.free` memsets the block to
+/// `undefined` before reaching the vtable, so in Debug/ReleaseSafe the block is
+/// already scrubbed to `0xaa`. In ReleaseFast that memset compiles away and this
+/// wipe is the only thing standing between a freed block and unrelated code.
+const WipingAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *WipingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        } };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resizeFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remapFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn freeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
+        std.crypto.secureZero(u8, m);
+        self.child.rawFree(m, a, ra);
+    }
+};
+
 // ── entry point ─────────────────────────────────────────────────────────────
 
 /// Verify the `ds:Signature` element `signature` within `doc`.
@@ -209,7 +268,16 @@ pub fn verify(
     signature: *const xml.Element,
     options: Options,
 ) VerifyError!Result {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    // CONVENTIONS §2.1 Z1 — everything this arena holds is a copy of the bytes
+    // under verification, and for `saml`'s encrypted-assertion path those bytes
+    // are a DECRYPTED `<saml:Assertion>`: the subject NameID and every attribute
+    // asserted about them. `saml` wipes its own plaintext buffer, but we
+    // canonicalize that plaintext into arena storage we own and free, so the
+    // long-lived copy is ours. Wiping only the final canonical slices would miss
+    // the intermediate `ArrayList` growth copies the arena keeps, so the wipe
+    // goes on the arena's own release path — every block, once.
+    var wiping: WipingAllocator = .{ .child = alloc };
+    var arena_state = std.heap.ArenaAllocator.init(wiping.allocator());
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
@@ -339,11 +407,41 @@ fn resolveReference(doc: *const xml.Document, uri: []const u8, options: Options)
     const id = uri[1..];
     if (id.len == 0) return error.UriNotResolved;
     if (options.id_attr) |name| {
-        return doc.findByAttr("", name, id) orelse error.UriNotResolved;
+        // `Document.findByAttr` is first-match-in-document-order and guarantees
+        // nothing about uniqueness — and `name` need not be one of the names the
+        // parser's `DuplicateId` guard was configured with, so on this branch the
+        // parse-time ID index proves nothing at all. That gap is the whole of
+        // XML Signature Wrapping in one step: a caller reads
+        // `Result.references[i].uri` and resolves it their own way, and if two
+        // elements may carry the same id, "the element we digested" and "the
+        // element they read" are free to be different elements. Enforce here what
+        // `UriNotResolved` already promises — *exactly one*.
+        const hit = doc.findByAttr("", name, id) orelse return error.UriNotResolved;
+        if (countByAttr(doc.root, name, id) != 1) return error.UriNotResolved;
+        return hit;
     }
-    // The parser guarantees ID uniqueness (DuplicateId is a parse error), so a
+    // Fall-through ONLY: this branch reads the parse-time ID index, which is
+    // deduplicated (a repeated value is `error.DuplicateId` at parse time), so a
     // hit here is unambiguous — the DSig-layer half of the wrapping defense.
     return doc.getElementById(id) orelse error.UriNotResolved;
+}
+
+/// How many elements in `el`'s subtree carry the unprefixed attribute `name`
+/// with value `value`, saturating at 2 — the only question asked is
+/// "exactly one?", and stopping early keeps a wide document cheap.
+fn countByAttr(el: *const xml.Element, name: []const u8, value: []const u8) usize {
+    var n: usize = 0;
+    if (el.attr("", name)) |v| {
+        if (std.mem.eql(u8, v, value)) n += 1;
+    }
+    for (el.children) |c| switch (c.content) {
+        .element => |child| {
+            n += countByAttr(child, name, value);
+            if (n >= 2) return 2;
+        },
+        else => {},
+    };
+    return n;
 }
 
 /// Parse an `<ec:InclusiveNamespaces PrefixList="...">` child of an exc-c14n
@@ -636,6 +734,188 @@ test "verify: valid RSA-SHA256 enveloped signature round-trips" {
     try testing.expect(res.valid);
     try testing.expectEqual(@as(usize, 1), res.references.len);
     try testing.expect(res.references[0].digest_valid);
+}
+
+/// Build a document whose signature references `#dup-1` through a CUSTOM id
+/// attribute (`AID`, deliberately not one of `xml.Options.id_attr_names`, so the
+/// parser's `DuplicateId` guard never looks at it). The reference covers the
+/// `<Target>` subtree with plain exclusive C14N — no enveloped transform — so
+/// appending `<Decoy AID="dup-1">` as a later sibling leaves both the reference
+/// digest and the `SignedInfo` signature bit-for-bit valid while making the id
+/// ambiguous. That is the attack shape: an untouched, genuinely valid signature
+/// over a reference that no longer names one element.
+fn buildDupIdDoc(a: std.mem.Allocator, with_decoy: bool) ![]u8 {
+    var sk = try rsa.SecretKey.fromPem(test_rsa_priv_pem);
+    defer sk.deinit();
+
+    const tmpl =
+        "<Root xmlns=\"urn:demo\">" ++
+        "<Target AID=\"dup-1\">genuine</Target>" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" ++
+        "<ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+        "<ds:Reference URI=\"#dup-1\">" ++
+        "<ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms>" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>{s}</ds:DigestValue>" ++
+        "</ds:Reference></ds:SignedInfo>" ++
+        "<ds:SignatureValue>{s}</ds:SignatureValue>" ++
+        "</ds:Signature>{s}</Root>";
+
+    // Pass 1: digest the `<Target>` subtree.
+    const p1 = try std.fmt.allocPrint(a, tmpl, .{ "", "", "" });
+    defer a.free(p1);
+    var d1 = try xml.parse(a, p1, .{});
+    defer d1.deinit();
+    const target = firstLocal(d1.root, "Target").?;
+    const ref_canon = try c14n.canonicalize(a, target, .{ .mode = .exclusive });
+    defer a.free(ref_canon);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ref_canon, &digest, .{});
+    var digest_b64_buf: [64]u8 = undefined;
+    const digest_b64 = std.base64.standard.Encoder.encode(&digest_b64_buf, &digest);
+
+    // Pass 2: sign the real `<SignedInfo>`.
+    const p2 = try std.fmt.allocPrint(a, tmpl, .{ digest_b64, "", "" });
+    defer a.free(p2);
+    var d2 = try xml.parse(a, p2, .{});
+    defer d2.deinit();
+    const si = firstLocal(d2.root, "SignedInfo").?;
+    const si_canon = try c14n.canonicalize(a, si, .{ .mode = .exclusive });
+    defer a.free(si_canon);
+    var sig_buf: [256]u8 = undefined;
+    const sig_slice = try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
+    var sig_b64_buf: [512]u8 = undefined;
+    const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, sig_slice);
+
+    const decoy = if (with_decoy) "<Decoy AID=\"dup-1\">forged</Decoy>" else "";
+    return std.fmt.allocPrint(a, tmpl, .{ digest_b64, sig_b64, decoy });
+}
+
+/// First element with this local name anywhere in the subtree (namespace-blind).
+fn firstLocal(el: *xml.Element, local: []const u8) ?*xml.Element {
+    if (std.mem.eql(u8, el.local, local)) return el;
+    for (el.children) |c| switch (c.content) {
+        .element => |child| {
+            if (firstLocal(child, local)) |f| return f;
+        },
+        else => {},
+    };
+    return null;
+}
+
+test "verify: an id_attr reference matching two elements is refused, not resolved to the first" {
+    const a = testing.allocator;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    const opts: Options = .{ .key = .{ .rsa = pk }, .id_attr = "AID" };
+
+    // Control: exactly one carrier of AID="dup-1" — a genuine, valid signature.
+    const one = try buildDupIdDoc(a, false);
+    defer a.free(one);
+    var doc1 = try xml.parse(a, one, .{});
+    defer doc1.deinit();
+    var res = try verify(a, &doc1, firstLocal(doc1.root, "Signature").?, opts);
+    defer res.deinit(a);
+    try testing.expect(res.valid);
+
+    // The attack shape: the SAME signature, plus a second element carrying the
+    // same AID. Nothing the signature covers has changed, so the digest and the
+    // SignatureValue both still check out — the only thing that changed is that
+    // `#dup-1` no longer names one element. `AID` is not one of `xml`'s default
+    // `id_attr_names`, so the parser's `DuplicateId` guard never sees it: this
+    // document parses without complaint (asserted below).
+    const two = try buildDupIdDoc(a, true);
+    defer a.free(two);
+    var doc2 = try xml.parse(a, two, .{});
+    defer doc2.deinit();
+    try testing.expect(firstLocal(doc2.root, "Decoy") != null);
+
+    // Resolution must fail closed. Reporting "#dup-1 is validly signed" when a
+    // caller resolving #dup-1 their own way could land on <Decoy> is exactly the
+    // signature-wrapping split this module exists to prevent.
+    try testing.expectError(error.UriNotResolved, verify(a, &doc2, firstLocal(doc2.root, "Signature").?, opts));
+}
+
+/// Test-only allocator that inspects every block on its way back to `child` and
+/// records whether `needle` survived in it — the only way to observe a Z1 heap
+/// wipe, since after `free` the bytes belong to the allocator again.
+const FreeScanner = struct {
+    child: std.mem.Allocator,
+    needle: []const u8,
+    /// A block still containing `needle` was released.
+    leaked: bool = false,
+    /// Blocks big enough to hold `needle` that were released at all — the
+    /// positive control that the scanner is watching something.
+    frees_seen: usize = 0,
+
+    fn allocator(self: *FreeScanner) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        } };
+    }
+    fn allocFn(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resizeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remapFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn freeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *FreeScanner = @ptrCast(@alignCast(ctx));
+        if (m.len >= self.needle.len) {
+            self.frees_seen += 1;
+            if (std.mem.indexOf(u8, m, self.needle) != null) self.leaked = true;
+        }
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+test "Z1: verify() scrubs the canonicalized plaintext before its arena goes back to the caller's allocator" {
+    // ReleaseFast ONLY, and the reason is the point of the test:
+    // `std.mem.Allocator.free` memsets the block to `undefined` before it
+    // reaches the vtable, so in Debug/ReleaseSafe every freed block is already
+    // 0xaa and a scanner sees nothing whatever this module does. ReleaseFast is
+    // the mode where our own `secureZero` is load-bearing — and the mode an
+    // integrator ships (CONVENTIONS §2.1). A visible skip beats a silent pass.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    var sd = try buildSignedRsaDoc(a, false, false);
+    defer sd.deinit(a);
+
+    var doc = try xml.parse(a, sd.xml, .{});
+    defer doc.deinit();
+    const sig = childByName(doc.root, "Signature").?;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+
+    // This byte sequence exists ONLY in the canonical form: in the source
+    // document the `<ds:Signature>` sits between `</Data>` and `</Envelope>`,
+    // and the enveloped-signature transform is what splices them together. A hit
+    // therefore cannot come from the source buffer or from the parsed tree
+    // (whose slices borrow from that buffer) — only from a C14N buffer inside
+    // verify()'s own arena.
+    const needle = "<Data>Hello World</Data></Envelope>";
+    try testing.expect(std.mem.indexOf(u8, sd.xml, needle) == null);
+
+    var scan = FreeScanner{ .child = a, .needle = needle };
+    const sa = scan.allocator();
+
+    var res = try verify(sa, &doc, sig, .{ .key = .{ .rsa = pk } });
+    defer res.deinit(sa);
+    // The canonicalization really happened (and agreed with the signature).
+    try testing.expect(res.valid);
+    // The scanner really watched something.
+    try testing.expect(scan.frees_seen > 0);
+    try testing.expect(!scan.leaked);
 }
 
 test "EXTERNAL anchor: our own signer's output is byte-identical to openssl's over the same canonical bytes" {

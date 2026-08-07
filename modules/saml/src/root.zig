@@ -281,8 +281,28 @@ pub const Config = struct {
     required_loa: ?[]const u8 = null,
 
     /// The unqualified attribute name that carries assertion / response IDs.
-    /// SAML uses `ID`; both this module and `xmldsig` resolve references through
-    /// it, which is what makes the XSW pointer-pin sound.
+    /// SAML uses `ID`.
+    ///
+    /// What actually makes the XSW pointer-pin sound is worth stating exactly,
+    /// because the obvious answer is the wrong one. It is NOT "the parser
+    /// guarantees this attribute is unique": the entry points here parse with
+    /// `xml.Options.id_attr_names = &.{"ID"}`, so the parser's `DuplicateId`
+    /// guard covers this field only while it holds its default. Soundness rests
+    /// on two things that hold for ANY value of it:
+    ///
+    ///  1. **Consistency.** `signedTargetMatches` (below) is the module's ONLY
+    ///     id resolution, and it calls `xml.Document.findByAttr("", id_attr, id)`
+    ///     — the same function, on the same document, with the same arguments as
+    ///     `xmldsig`'s own `resolveReference`. The element the signature was
+    ///     checked over and the element pinned here are therefore the same
+    ///     pointer, never merely the same id.
+    ///  2. **Uniqueness, enforced one layer down.** `xmldsig.resolveReference`
+    ///     refuses a reference whose id is carried by more than one element
+    ///     (`error.UriNotResolved`), so an ambiguous id fails closed before it
+    ///     can reach either side of (1).
+    ///
+    /// Changing this away from `"ID"` is therefore safe, but do not add a second
+    /// way of resolving an id in this module without re-reading (1).
     id_attr: []const u8 = "ID",
 
     // ── EncryptedAssertion (eIDAS encrypt profile) ───────────────────────────
@@ -2991,6 +3011,7 @@ test {
     _ = @import("test_redirect_binding.zig");
     _ = @import("test_artifact.zig");
     _ = @import("test_issuer.zig");
+    _ = @import("test_multins.zig");
 }
 
 const testing = std.testing;

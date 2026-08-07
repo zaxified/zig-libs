@@ -15,7 +15,17 @@ const Writer = message.Writer;
 const net_addr = @import("net_addr.zig");
 const NetAddr = net_addr.NetAddr;
 
-pub const DecodeError = message.ReadError || message.CompactSizeError;
+pub const DecodeError = message.ReadError || message.CompactSizeError || error{SubversionTooLong};
+
+/// Cap on `Version.user_agent`. Bitcoin Core: "Maximum length of the user
+/// agent string in `version` message" — `MAX_SUBVERSION_LENGTH = 256` in
+/// `src/net.h` (fetched and read 2026-08-07,
+/// https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/net.h).
+/// Unlike `varBytes`'s only other generic cap (the 4 MB envelope ceiling in
+/// `envelope.zig`), this is field-specific: `varBytes` itself stays
+/// uncapped because `housekeeping.zig`'s `reject` message/reason fields
+/// reuse it too, and neither is bounded to 256.
+pub const max_subversion_length: usize = 256;
 
 /// Bits of `Version.services` / `NetAddr.services` -- "The following
 /// services are currently assigned" per the wiki's version-message
@@ -61,6 +71,7 @@ pub fn decodeVersion(bytes: []const u8) DecodeError!Version {
     const addr_from = try NetAddr.decode(&r);
     const nonce = try r.u64le();
     const user_agent = try r.varBytes();
+    if (user_agent.len > max_subversion_length) return error.SubversionTooLong;
     const start_height = try r.i32le();
     const relay: ?bool = if (r.remaining() > 0) try r.boolByte() else null;
     return .{
@@ -153,6 +164,33 @@ test "Version: round-trip with a relay byte present (protocol >= 70001)" {
     try testing.expectEqual(@as(?bool, true), decoded.relay);
 }
 
+test "decodeVersion: user_agent exactly at max_subversion_length is accepted, one byte more is SubversionTooLong" {
+    const allocator = testing.allocator;
+    var at_cap: [max_subversion_length]u8 = @splat('a');
+    const v: Version = .{
+        .version = 70015,
+        .services = 0,
+        .timestamp = 0,
+        .addr_recv = .{ .services = 0, .ip = @splat(0), .port = 0 },
+        .addr_from = .{ .services = 0, .ip = @splat(0), .port = 0 },
+        .nonce = 0,
+        .user_agent = &at_cap,
+        .start_height = 0,
+    };
+    const bytes = try serializeVersion(allocator, v);
+    defer allocator.free(bytes);
+    var decoded = try decodeVersion(bytes);
+    defer decoded.deinit(allocator);
+    try testing.expectEqual(@as(usize, max_subversion_length), decoded.user_agent.len);
+
+    var over: [max_subversion_length + 1]u8 = @splat('a');
+    var v2 = v;
+    v2.user_agent = &over;
+    const bytes2 = try serializeVersion(allocator, v2);
+    defer allocator.free(bytes2);
+    try testing.expectError(error.SubversionTooLong, decodeVersion(bytes2));
+}
+
 test "decodeEmpty: accepts a zero-length payload, rejects any other" {
     try decodeEmpty(&.{});
     try testing.expectError(error.UnexpectedPayload, decodeEmpty(&.{0x00}));
@@ -188,4 +226,15 @@ fn fuzzDecodeVersion(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     var v = decodeVersion(buf[0..len]) catch return;
     v.deinit(testing.allocator);
+}
+
+test "external anchor: max_subversion_length is Bitcoin Core's MAX_SUBVERSION_LENGTH" {
+    // The boundary test above is written in terms of `max_subversion_length`,
+    // so it passes for any value of it — raising the constant to 65535 leaves
+    // the whole suite green while silently accepting a `version` message no
+    // Core node would. The number itself is the interop claim: Core's
+    // `src/net.h` declares `static const unsigned int MAX_SUBVERSION_LENGTH =
+    // 256;` and `CNode::SetSubVersion` truncates to it, so a peer that sends
+    // more is talking to something that is not Bitcoin Core.
+    try testing.expectEqual(@as(usize, 256), max_subversion_length);
 }

@@ -101,9 +101,18 @@ pub const Asdu = struct {
         var a = Asdu{ .sv_id = &.{}, .smp_cnt = 0, .conf_rev = 0, .seq_data = &.{} };
         var seen_id = false;
         var seen_data = false;
+        // Tracks which of [0]..[8] have already been seen — see goose.zig's
+        // `Pdu.decode` for why a repeated context tag is rejected rather than
+        // silently resolved last-wins.
+        var seen_mask: u16 = 0;
         var it = ber.Iterator.init(e.content);
         while (try it.next()) |f| {
             if (f.tag.class != .context) return error.UnexpectedTag;
+            if (f.tag.number <= 8) {
+                const bit = @as(u16, 1) << @as(u4, @intCast(f.tag.number));
+                if (seen_mask & bit != 0) return error.DuplicateField;
+                seen_mask |= bit;
+            }
             switch (f.tag.number) {
                 0 => {
                     a.sv_id = f.content;
@@ -394,6 +403,18 @@ test "fixed-width fields of the wrong width are refused" {
     );
     // An ASDU with no svID.
     try testing.expectError(error.MissingField, Asdu.decode(&[_]u8{ 0x30, 0x02, 0x87, 0x00 }));
+}
+
+// F5 (shared shape with goose.zig's `Pdu.decode`): a duplicated `[2] smpCnt`
+// used to be accepted last-wins.
+test "an ASDU with a duplicated [2] smpCnt is refused, not last-wins" {
+    try testing.expectError(error.DuplicateField, Asdu.decode(&[_]u8{
+        0x30, 0x0D,
+        0x80, 0x01, 'a', // [0] svID
+        0x82, 0x02, 0, 1, // [2] smpCnt #1 = 1
+        0x82, 0x02, 0, 2, // [2] smpCnt #2 = 2 (duplicate)
+        0x87, 0x00, // [7] seqData (empty)
+    }));
 }
 
 test "an SV frame with a GOOSE EtherType is refused" {

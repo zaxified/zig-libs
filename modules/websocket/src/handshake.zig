@@ -38,6 +38,21 @@ pub const HandshakeError = error{
     /// base64-encoded nonce (§4.2.1 point 5) — always exactly 24 base64
     /// characters for 16 bytes.
     InvalidKey,
+    /// `Upgrade`, `Connection`, `Sec-WebSocket-Version` or
+    /// `Sec-WebSocket-Key` appeared more than once. RFC 6455 §4.1/§4.2.1 say
+    /// nothing about a duplicated instance of any of these header fields —
+    /// fetched and read 2026-08-07 (https://www.rfc-editor.org/rfc/rfc6455.html):
+    /// the opening-handshake sections defer silently to general HTTP header
+    /// processing (RFC 2616) for anything they do not spell out themselves,
+    /// and that generic fallback does not resolve a duplicate either.
+    /// `h1.RequestHead.header` returns only the first occurrence, so a
+    /// duplicate used to be silently first-wins here — an intermediary in
+    /// front of this server that combines the values or picks the last
+    /// would derive a different accept key, or a different upgrade
+    /// decision, from the same bytes. Undefined + silently resolved is the
+    /// dangerous combination, so this is rejected rather than left to
+    /// chance.
+    DuplicateHeader,
     /// (Client side) the response status was not 101.
     UnexpectedStatus,
     /// (Client side) the response advertised a `Sec-WebSocket-Protocol`
@@ -109,6 +124,10 @@ pub fn acceptHandshake(head: h1.RequestHead, options: ServerAcceptOptions) Hands
     if (!std.ascii.eqlIgnoreCase(head.method, "GET")) return error.NotGet;
     if (head.http1_0) return error.UnsupportedHttpVersion;
 
+    inline for (.{ "upgrade", "connection", "sec-websocket-version", "sec-websocket-key" }) |name| {
+        if (countHeader(head, name) > 1) return error.DuplicateHeader;
+    }
+
     const upgrade = head.header("upgrade") orelse return error.MissingUpgrade;
     if (!h1.tokenListContains(upgrade, "websocket")) return error.MissingUpgrade;
 
@@ -129,6 +148,18 @@ pub fn acceptHandshake(head: h1.RequestHead, options: ServerAcceptOptions) Hands
     }
 
     return .{ .accept_key = computeAcceptKey(key), .protocol = protocol };
+}
+
+/// How many header fields named `name` (case-insensitive) appear in `head`.
+/// `head.header(name)` only ever returns the first, so this is the only way
+/// to notice a duplicate at all.
+fn countHeader(head: h1.RequestHead, name: []const u8) usize {
+    var n: usize = 0;
+    var it = head.iterate();
+    while (it.next()) |e| {
+        if (std.ascii.eqlIgnoreCase(e.name, name)) n += 1;
+    }
+    return n;
 }
 
 /// First token in the comma-separated `offered` list (client preference
@@ -286,6 +317,19 @@ test "acceptHandshake: RFC 1.3 example request" {
     try testing.expect(std.mem.indexOf(u8, resp, "101 Switching Protocols") != null);
     try testing.expect(std.mem.indexOf(u8, resp, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
     try testing.expect(std.mem.indexOf(u8, resp, "Sec-WebSocket-Protocol: chat") != null);
+}
+
+test "acceptHandshake: rejects a duplicated Sec-WebSocket-Key" {
+    // Two different keys under the same header name. `head.header()` only
+    // ever returns the first, so this used to silently accept and hash the
+    // first key — a proxy that combined or preferred the last key would
+    // compute a different Sec-WebSocket-Accept from the same request.
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.DuplicateHeader, acceptHandshake(head, .{}));
 }
 
 test "acceptHandshake: rejects non-GET" {

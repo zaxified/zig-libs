@@ -89,6 +89,32 @@ pub const Pair = struct {
     value: Value,
 };
 
+/// Structural equality between two composed `Value`s — used only to detect
+/// a repeated mapping key under `Options.reject_duplicate_keys`. Aliases of
+/// the same anchor compare equal trivially (shared slices); two distinct
+/// nodes that merely look the same compare equal by content, recursively.
+fn valueEql(a: Value, b: Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .bool => |av| b == .bool and av == b.bool,
+        .int => |av| b == .int and av == b.int,
+        .float => |av| b == .float and av == b.float,
+        .string => |av| b == .string and std.mem.eql(u8, av, b.string),
+        .sequence => |av| blk: {
+            if (b != .sequence or av.len != b.sequence.len) break :blk false;
+            for (av, b.sequence) |x, y| if (!valueEql(x, y)) break :blk false;
+            break :blk true;
+        },
+        .mapping => |av| blk: {
+            if (b != .mapping or av.len != b.mapping.len) break :blk false;
+            for (av, b.mapping) |x, y| {
+                if (!valueEql(x.key, y.key) or !valueEql(x.value, y.value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
 pub const Error = parser.Error || error{
     /// An alias named an anchor that is still being composed — i.e. one of its
     /// own ancestors. See the module doc-comment and SPEC.md §7.
@@ -101,6 +127,8 @@ pub const Error = parser.Error || error{
     /// `Options.max_nodes` or `Options.max_depth` exceeded.
     TooManyNodes,
     TooDeep,
+    /// `Options.reject_duplicate_keys` is set and a mapping repeated a key.
+    DuplicateKey,
 };
 
 pub const Options = struct {
@@ -111,6 +139,23 @@ pub const Options = struct {
     /// `scanner.max_depth`, so this is a second, independent bound that also
     /// keeps `composeNode`'s recursion off the end of the stack.
     max_depth: usize = 1024,
+    /// Reject a mapping that repeats a key instead of composing it.
+    ///
+    /// YAML 1.2.2 §3.2.1.1 restricts a mapping node's keys to be unique
+    /// (fetched and read 2026-08-07, https://yaml.org/spec/1.2.2/#3211-nodes:
+    /// "the content of a mapping node is an unordered set of key/value node
+    /// pairs, with the restriction that each of the keys is unique"), but
+    /// real-world parsers routinely accept the duplicate anyway and resolve
+    /// it however they see fit — this composer among them: the default
+    /// (`false`) preserves every pair in wire order (see the `duplicate
+    /// keys are preserved, not collapsed` test and `Value.mapping`'s doc
+    /// comment), which is what lets `Value.get`'s first-wins convention be
+    /// documented rather than silently disagreeing with, say, PyYAML's
+    /// last-wins with no way for a caller to even notice. Set this `true`
+    /// to opt into strict spec-conformant rejection instead, for a caller
+    /// that would rather fail closed than resolve an ambiguity a producer
+    /// and some other consumer could disagree about.
+    reject_duplicate_keys: bool = false,
 };
 
 /// A composed stream that owns its own arena. Mirrors `std.json.Parsed`: the
@@ -320,6 +365,11 @@ const Composer = struct {
                     }
                     const k = try self.composeNode(depth + 1);
                     const val = try self.composeNode(depth + 1);
+                    if (self.options.reject_duplicate_keys) {
+                        for (pairs.items) |p| {
+                            if (valueEql(p.key, k)) return error.DuplicateKey;
+                        }
+                    }
                     try pairs.append(self.alloc, .{ .key = k, .value = val });
                 }
                 const v: Value = .{ .mapping = pairs.items };
@@ -678,6 +728,19 @@ test "mapping keys may be non-strings and are kept in order" {
 
 test "duplicate keys are preserved, not collapsed" {
     const r = try single("a: 1\na: 2\n");
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.root.mapping.len);
+}
+
+test "reject_duplicate_keys: off by default, opt-in rejects a repeated scalar key" {
+    // Default behaviour is unchanged (the test above pins it); this only
+    // exercises the opt-in strict mode.
+    try testing.expectError(
+        error.DuplicateKey,
+        compose(testing.allocator, "admin: false\nother: 1\nadmin: true\n", .{ .reject_duplicate_keys = true }),
+    );
+    // A document with no repeated key still composes under strict mode.
+    const r = try compose(testing.allocator, "admin: false\nother: 1\n", .{ .reject_duplicate_keys = true });
     defer r.deinit();
     try testing.expectEqual(@as(usize, 2), r.root.mapping.len);
 }

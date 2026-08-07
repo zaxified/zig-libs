@@ -105,6 +105,18 @@ pub const itag_len: usize = 2 + 4 + 2 * mac_len;
 /// Smallest valid backbone frame (no B-Tag, empty customer data): B-MACs + I-TAG.
 pub const min_frame_len: usize = b_mac_len + itag_len;
 
+/// Largest backbone frame this codec will encode or accept on decode.
+///
+/// No single external standard fixes one number here — 802.1ah leaves the
+/// carried frame size to the backbone port's own MTU — so this mirrors the
+/// sibling `ethfrag`'s `max_frame_len` (`std.math.maxInt(u16)` = 65535)
+/// rather than inventing a third convention: this module's own doc comment
+/// already says "no real 802.1ah backbone port will carry" a 9 KiB+ frame,
+/// and `ethfrag`/`l2encap` already treat 65535 as the shared backbone
+/// ceiling. `UNVERIFIED:` against an external standard for the exact value;
+/// the *shape* of the bound (some ceiling must exist) is not in question.
+pub const max_frame_len: usize = std.math.maxInt(u16);
+
 /// Largest representable I-SID (24-bit). Enforced by the `u24` type on `Fields`.
 pub const max_isid: u24 = std.math.maxInt(u24);
 
@@ -208,6 +220,8 @@ fn encodeITci(f: Fields) u32 {
 pub const EncodeError = error{
     /// `out` is smaller than `encodedLen(fields, customer_data.len)`.
     BufferTooSmall,
+    /// `encodedLen(fields, customer_data.len)` exceeds `max_frame_len`.
+    FrameTooLarge,
 };
 
 /// Header size for a frame with/without a B-Tag (everything before the customer
@@ -232,6 +246,7 @@ fn writeMac(out: []u8, mac: Mac) void {
 /// writes on error.
 pub fn encode(fields: Fields, customer_data: []const u8, out: []u8) EncodeError![]u8 {
     const total = encodedLen(fields, customer_data.len);
+    if (total > max_frame_len) return error.FrameTooLarge;
     if (out.len < total) return error.BufferTooSmall;
 
     var off: usize = 0;
@@ -261,9 +276,12 @@ pub fn encode(fields: Fields, customer_data: []const u8, out: []u8) EncodeError!
 
 /// Allocating convenience wrapper over `encode`: returns freshly-owned bytes the
 /// caller frees with the same allocator. Mirrors `l2encap.encodeAlloc`.
-pub fn encodeAlloc(allocator: Allocator, fields: Fields, customer_data: []const u8) Allocator.Error![]u8 {
-    const buf = try allocator.alloc(u8, encodedLen(fields, customer_data.len));
-    // Cannot fail: `buf` is exactly `encodedLen` bytes.
+pub fn encodeAlloc(allocator: Allocator, fields: Fields, customer_data: []const u8) (Allocator.Error || error{FrameTooLarge})![]u8 {
+    const total = encodedLen(fields, customer_data.len);
+    if (total > max_frame_len) return error.FrameTooLarge;
+    const buf = try allocator.alloc(u8, total);
+    // Cannot fail: `buf` is exactly `encodedLen` bytes, and the size was
+    // already checked against `max_frame_len` above.
     return encode(fields, customer_data, buf) catch unreachable;
 }
 
@@ -288,6 +306,8 @@ pub const DecodeError = error{
     UnexpectedEtherType,
     /// A B-Tag was present but was not followed by the I-TAG EtherType (0x88E7).
     MissingITag,
+    /// `bytes.len` exceeds `max_frame_len`.
+    FrameTooLarge,
 };
 
 /// Parse one PBB frame from untrusted link bytes. Every field is bounds-checked
@@ -295,6 +315,7 @@ pub const DecodeError = error{
 /// not followed by the I-TAG returns a typed error and never panics, reads out of
 /// bounds, loops, or allocates. Reserved I-TCI bits are ignored (per spec).
 pub fn decode(bytes: []const u8) DecodeError!Decoded {
+    if (bytes.len > max_frame_len) return error.FrameTooLarge;
     // B-DA + B-SA + at least the 2-octet tag-region EtherType.
     if (bytes.len < b_mac_len + 2) return error.Truncated;
 
@@ -551,6 +572,45 @@ test "encode: buffer too small is rejected, never partially writes" {
     var too_small: [min_frame_len - 1]u8 = @splat(0x5A);
     try testing.expectError(error.BufferTooSmall, encode(fields, "", &too_small));
     for (too_small) |b| try testing.expectEqual(@as(u8, 0x5A), b); // untouched
+}
+
+test "encode: exactly max_frame_len is accepted, one byte more is FrameTooLarge" {
+    const fields: Fields = .{
+        .b_da = @splat(0x11),
+        .b_sa = @splat(0x22),
+        .b_tag = null,
+        .i_pcp = 0,
+        .i_dei = false,
+        .uca = false,
+        .i_sid = 1,
+        .c_da = @splat(0x33),
+        .c_sa = @splat(0x44),
+    };
+    const at_cap_len = max_frame_len - headerLen(false);
+    const data = try testing.allocator.alloc(u8, at_cap_len);
+    defer testing.allocator.free(data);
+    const wire = try encodeAlloc(testing.allocator, fields, data);
+    defer testing.allocator.free(wire);
+    try testing.expectEqual(@as(usize, max_frame_len), wire.len);
+
+    const over = try testing.allocator.alloc(u8, at_cap_len + 1);
+    defer testing.allocator.free(over);
+    try testing.expectError(error.FrameTooLarge, encodeAlloc(testing.allocator, fields, over));
+}
+
+test "decode: exactly max_frame_len is accepted, one byte more is FrameTooLarge" {
+    const buf = try testing.allocator.alloc(u8, max_frame_len + 1);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    // A minimal valid untagged header at the front: B-DA/B-SA (zero, arbitrary)
+    // followed directly by the I-TAG EtherType.
+    std.mem.writeInt(u16, buf[b_mac_len..][0..2], itag_ethertype, .big);
+
+    try testing.expectError(error.FrameTooLarge, decode(buf));
+
+    const at_cap = buf[0..max_frame_len];
+    const dec = try decode(at_cap);
+    try testing.expectEqual(max_frame_len - min_frame_len, dec.customer_data.len);
 }
 
 test "encodeAlloc equals caller-buffer encode" {

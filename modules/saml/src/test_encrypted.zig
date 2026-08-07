@@ -25,6 +25,7 @@ const rsa = @import("rsa");
 const xmlenc = @import("xmlenc");
 const saml = @import("root.zig");
 const fx = @import("fixtures.zig");
+const encutil = @import("test_encutil.zig");
 
 const Sha1 = std.crypto.hash.Sha1;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
@@ -170,6 +171,43 @@ test "encrypted flow: decrypt -> verify -> extract yields the SAME AuthnResult a
     try testing.expectEqualStrings(cg[0], eg[0]);
     try testing.expectEqualStrings(cg[1], eg[1]);
     try testing.expectEqualStrings(clear.attribute("email").?[0], enc.attribute("email").?[0]);
+}
+
+test "Z1: the decrypted assertion body does not survive in any block consumeResponseXml releases" {
+    // ReleaseFast ONLY — see `test_encutil.FreeScanner` for why the safe lanes
+    // cannot observe a heap wipe at all.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const kp = try makeSpKey(0x5A11_2E20);
+    const enc_resp = try encryptedResponse(alloc, kp.public_key);
+    defer alloc.free(enc_resp);
+
+    // Markup that exists only in the DECRYPTED `<saml:Assertion>` octets: the
+    // Response on the wire carries the ciphertext instead of the assertion, and
+    // the extracted `AuthnResult` copies the NameID's text content without the
+    // surrounding tags. So a hit can come from nothing but a module-owned copy
+    // of the plaintext — `saml`'s own decrypt buffer, or the canonical form
+    // `xmldsig.verify` builds from it while checking the IdP signature.
+    const needle = ">alice@example.org</saml:NameID>";
+    try testing.expect(std.mem.indexOf(u8, enc_resp, needle) == null);
+
+    var scan = encutil.FreeScanner{ .child = alloc, .needle = needle };
+    const sa = scan.allocator();
+
+    var cfg = baseConfig(fx.t_valid);
+    cfg.sp_decrypt_key = kp.secret_key;
+    var res = try saml.consumeResponseXml(sa, enc_resp, cfg);
+
+    // The decryption + signature verification really happened, and the scanner
+    // really watched frees go by.
+    try testing.expectEqualStrings("alice@example.org", res.name_id);
+    try testing.expect(scan.frees_seen > 0);
+    try testing.expect(!scan.leaked_plaintext);
+
+    // The result arena is the CALLER's copy (§2.1 Z2) — tear it down only after
+    // the assertion above, so its release cannot colour the verdict.
+    res.deinit();
 }
 
 test "encrypted flow: POST binding (base64) decodes then decrypts + verifies" {

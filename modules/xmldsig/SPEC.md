@@ -129,12 +129,24 @@ left to the caller / a future helper.
 
 - **Algorithm allow-list** — closed set above; unknown/dangerous algorithms and
   all XPath/XSLT/filter/base64 transforms are rejected, not executed.
-- **Unambiguous reference resolution** — relies on the `xml` layer's
-  duplicate-ID rejection (`error.DuplicateId` at parse). A `URI="#x"` resolving
-  to zero elements fails (`UriNotResolved`); uniqueness guarantees it never
-  resolves to more than one. This is the DSig-layer half of the
-  XML-Signature-Wrapping defense (the SAML layer adds "the signature must cover
-  the element I actually consume").
+- **Unambiguous reference resolution** — a `URI="#x"` must resolve to *exactly
+  one* element; zero and two-or-more both fail with `UriNotResolved`. Which
+  mechanism supplies the "at most one" half depends on the branch, and the
+  difference matters:
+  - **Default (`Options.id_attr == null`)** — the lookup goes through the `xml`
+    parser's ID index, which is deduplicated at parse (`error.DuplicateId`), so
+    a hit is unique by construction.
+  - **`Options.id_attr` set** — the lookup is `Document.findByAttr`, which is
+    first-match-in-document-order and asserts nothing, and the caller's chosen
+    attribute name need not be one of the `xml.Options.id_attr_names` the
+    document was parsed with, so `DuplicateId` may never have examined it.
+    `resolveReference` therefore counts the carriers itself and refuses when
+    there is more than one. Resolving first-match here would let "the element we
+    digested" and "the element the caller reads" diverge — signature wrapping in
+    one step.
+
+  This is the DSig-layer half of the XML-Signature-Wrapping defense (the SAML
+  layer adds "the signature must cover the element I actually consume").
 - **No panics** — every malformed-signature path is a typed error.
 
 ### Dependency note (fixed during this work)

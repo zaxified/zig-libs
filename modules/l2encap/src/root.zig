@@ -122,6 +122,17 @@ pub const default_ttl: u8 = 64;
 /// rather than a runtime check.
 pub const max_isid: u24 = std.math.maxInt(u24);
 
+/// Largest total encoded frame (`header_len` + payload) this codec will
+/// produce or accept. The module doc comment already names the number:
+/// "hand this output to a fragmenter (the sibling `ethfrag`, whose
+/// `max_frame_len` is 65535)" — that contract used to live only in prose and
+/// in a test comment ("composition sanity: encode output is a plain []u8
+/// ready to fragment"), never enforced in code. Using the same constant here
+/// (rather than importing `ethfrag`, which this module deliberately does
+/// not) keeps the separation-of-concerns the module doc comment describes
+/// while finally checking the number it already asserts.
+pub const max_frame_len: usize = 65535;
+
 /// `flags` byte bit 0: set = BUM (broadcast / unknown-unicast / multicast),
 /// clear = unicast.
 const flag_bum: u8 = 1 << 0;
@@ -160,6 +171,8 @@ fn writeHeader(f: Fields, out: *[header_len]u8) void {
 pub const EncodeError = error{
     /// `out` is smaller than `encodedLen(customer_frame.len)`.
     BufferTooSmall,
+    /// `encodedLen(customer_frame.len)` exceeds `max_frame_len`.
+    FrameTooLarge,
 };
 
 /// Number of bytes `encode` will write for a customer frame of `payload_len`
@@ -174,6 +187,7 @@ pub fn encodedLen(payload_len: usize) usize {
 /// bytes). Errors if `out` is too small; never partially writes on error.
 pub fn encode(fields: Fields, customer_frame: []const u8, out: []u8) EncodeError![]u8 {
     const total = header_len + customer_frame.len;
+    if (total > max_frame_len) return error.FrameTooLarge;
     if (out.len < total) return error.BufferTooSmall;
     writeHeader(fields, out[0..header_len]);
     @memcpy(out[header_len..total], customer_frame);
@@ -183,9 +197,12 @@ pub fn encode(fields: Fields, customer_frame: []const u8, out: []u8) EncodeError
 /// Allocating convenience wrapper over `encode`: returns a freshly-owned
 /// `[]u8` the caller must free with the same allocator. Mirrors `ethfrag`'s
 /// owned-bytes convention for callers that don't manage their own buffer.
-pub fn encodeAlloc(allocator: Allocator, fields: Fields, customer_frame: []const u8) Allocator.Error![]u8 {
-    const buf = try allocator.alloc(u8, header_len + customer_frame.len);
-    // Cannot fail: `buf` is exactly `encodedLen` bytes.
+pub fn encodeAlloc(allocator: Allocator, fields: Fields, customer_frame: []const u8) (Allocator.Error || error{FrameTooLarge})![]u8 {
+    const total = header_len + customer_frame.len;
+    if (total > max_frame_len) return error.FrameTooLarge;
+    const buf = try allocator.alloc(u8, total);
+    // Cannot fail: `buf` is exactly `encodedLen` bytes, and the size was
+    // already checked against `max_frame_len` above.
     return encode(fields, customer_frame, buf) catch unreachable;
 }
 
@@ -207,6 +224,8 @@ pub const DecodeError = error{
     UnsupportedVersion,
     /// A reserved `flags` bit was set.
     InvalidHeader,
+    /// `bytes.len` exceeds `max_frame_len`.
+    FrameTooLarge,
 };
 
 /// Parses one encapsulated frame from untrusted tunnel bytes. Every field is
@@ -214,6 +233,7 @@ pub const DecodeError = error{
 /// reserved-bit-dirty buffer returns a typed error and never panics, reads out
 /// of bounds, loops, or allocates.
 pub fn decode(bytes: []const u8) DecodeError!Decoded {
+    if (bytes.len > max_frame_len) return error.FrameTooLarge;
     if (bytes.len < header_len) return error.Truncated;
     if (bytes[0] != version_current) return error.UnsupportedVersion;
     const flags = bytes[1];
@@ -314,6 +334,33 @@ test "encode: buffer too small is rejected, never partially writes" {
     try testing.expectError(error.BufferTooSmall, encode(fields, "abc", &too_small));
     // Nothing was written: still all sentinel.
     for (too_small) |b| try testing.expectEqual(@as(u8, 0xAA), b);
+}
+
+test "encode: exactly max_frame_len is accepted, one byte more is FrameTooLarge" {
+    const fields: Fields = .{ .isid = 5, .ttl = 10, .bum = false, .ingress_pe = 1 };
+    const at_cap_len = max_frame_len - header_len;
+    const data = try testing.allocator.alloc(u8, at_cap_len);
+    defer testing.allocator.free(data);
+    const wire = try encodeAlloc(testing.allocator, fields, data);
+    defer testing.allocator.free(wire);
+    try testing.expectEqual(@as(usize, max_frame_len), wire.len);
+
+    const over = try testing.allocator.alloc(u8, at_cap_len + 1);
+    defer testing.allocator.free(over);
+    try testing.expectError(error.FrameTooLarge, encodeAlloc(testing.allocator, fields, over));
+}
+
+test "decode: exactly max_frame_len is accepted, one byte more is FrameTooLarge" {
+    const buf = try testing.allocator.alloc(u8, max_frame_len + 1);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    buf[0] = version_current; // otherwise-empty valid header
+
+    try testing.expectError(error.FrameTooLarge, decode(buf));
+
+    const at_cap = buf[0..max_frame_len];
+    const dec = try decode(at_cap);
+    try testing.expectEqual(max_frame_len - header_len, dec.payload.len);
 }
 
 test "encodeAlloc equals caller-buffer encode" {

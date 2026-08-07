@@ -43,6 +43,15 @@ pub const Error = mmsdata.Error || error{
     MissingField,
     /// More data-set entries than the fixed decode table holds.
     TooManyEntries,
+    /// A `[0]`..`[11]` context tag appeared more than once in the same PDU.
+    /// IEC 61850-8-1 defines `GOOSEPdu` as an ASN.1 `SEQUENCE` with each of
+    /// these as a single OPTIONAL/mandatory component — `UNVERIFIED:` the
+    /// exact clause text (IEC 61850-8-1 is paywalled; no fetchable public
+    /// mirror found), but the type shape means a second occurrence of the
+    /// same tag is not a valid encoding of it either way. Left silently
+    /// last-wins, a subscriber and any first-wins peer/IDS disagree on
+    /// `stNum`/`sqNum` — the replay-detection fields — from the same bytes.
+    DuplicateField,
 };
 
 pub const ether_type: u16 = 0x88B8;
@@ -224,9 +233,18 @@ pub const Pdu = struct {
         var seen_sq_num = false;
         var seen_conf_rev = false;
         var seen_all_data = false;
+        // Tracks which of [0]..[11] have already been seen, so a repeated
+        // context tag is rejected instead of silently overwriting the first
+        // occurrence (last-wins).
+        var seen_mask: u16 = 0;
         var it = ber.Iterator.init(outer.content);
         while (try it.next()) |e| {
             if (e.tag.class != .context) return error.UnexpectedTag;
+            if (e.tag.number <= 11) {
+                const bit = @as(u16, 1) << @as(u4, @intCast(e.tag.number));
+                if (seen_mask & bit != 0) return error.DuplicateField;
+                seen_mask |= bit;
+            }
             switch (e.tag.number) {
                 0 => p.gocb_ref = e.content,
                 1 => p.time_allowed_to_live_ms = try ber.decodeUint(u32, e.content),
@@ -528,6 +546,26 @@ test "a GOOSE PDU omitting stNum, sqNum or confRev is refused" {
         0x08,
     } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A} ++ [_]u8{ 0x85, 0x01, 0x00, 0xAB, 0x00 };
     try testing.expectError(error.MissingField, Pdu.decode(&missing_sq_and_conf));
+}
+
+// F5: two `[5] stNum` elements in one PDU used to be accepted last-wins
+// (`stNum == 9`, discarding the first-sent `1`). `stNum`/`sqNum` are the
+// replay-detection fields (see the P-16 comment above), so a subscriber and
+// any last-wins-disagreeing peer/IDS reading the same bytes would disagree
+// about which frame this is.
+test "a GOOSE PDU with a duplicated [5] stNum is refused, not last-wins" {
+    const dup_st_num = [_]u8{
+        0x61, 0x1B,
+        0x80, 0x01, 'a', // [0] gocbRef
+        0x84, 0x08,
+    } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A} ++ [_]u8{ // [4] t
+        0x85, 0x01, 0x01, // [5] stNum #1 = 1
+        0x85, 0x01, 0x09, // [5] stNum #2 = 9 (duplicate)
+        0x86, 0x01, 0x00, // [6] sqNum
+        0x88, 0x01, 0x01, // [8] confRev
+        0xAB, 0x00, // [11] allData (empty)
+    };
+    try testing.expectError(error.DuplicateField, Pdu.decode(&dup_st_num));
 }
 
 test "a UtcTime with an impossible accuracy is refused inside a GOOSE PDU" {

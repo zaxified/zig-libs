@@ -275,7 +275,111 @@ const signxml_enveloped_rsa_sha256 =
     "<ds:Modulus>2pnU5gYsnLbNQOVlNNV4yw5L2PiPalyE7u0/qs2dP3xTTDQO6nGGDcnLpHI4gv0EiXxsB4a7Rdg7bSY/cHTdEteAnxvs9aZszpgiWQidlAJseXsYwfoBm0FN3GFMCz2tnZ/EvkijcR/cHNCcunITewxtab21LAD5lh+RjSo7EUEmg7J54QUzPqk0Bp1+Jsgxmw3JjFVCGjoTMIiFe/w6cEVoDiBW992nyuYYfyDbUhaRy/7Tx5bArYaBhHB/HMT0N6Uxb4cJMb5fXh+DJ3G7SNbZJZ9N14N+j61K23rOhBnyShlA7AmUKb/ch+uw4YaMJoVfHP3/knYWH07p1rk+/w==</ds:Modulus>" ++
     "<ds:Exponent>AQAB</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo></ds:Signature></Envelope>";
 
-test "EXTERNAL anchor: fixture count canary — 5 genuinely external xmlsec1/signxml-signed documents" {
+// ── fixture 6: xmlsec1-signed, attributes spanning TWO namespaces plus
+// unprefixed ones — the external anchor for the C14N attribute SORT KEY ──────
+//
+// Every fixture above carries attributes from a single namespace (or none), so
+// the `sortAttrs` key is under-determined by them: swapping it from
+// (namespace-URI, local-name) to (local-name, namespace-URI) leaves all five
+// green. This document is built so the two keys disagree. On the apex
+// `<Envelope>`:
+//
+//   attribute      namespace URI   local
+//   ID=…           ""              ID
+//   zz=…           ""              zz
+//   a:mm=…         urn:x:aa        mm
+//   b:aa=…         urn:x:bb        aa
+//
+// (URI, local) → `ID zz a:mm b:aa`   ·   (local, URI) → `ID b:aa a:mm zz`
+//
+// libxml2, via `xmllint --exc-c14n`, emits the first of those, and xmlsec1's
+// `DigestValue` below is over exactly those bytes — so this fixture pins the
+// sort key to an implementation that shares no code with ours. Provenance
+// (offline, never run by the suite):
+//
+// ```sh
+// openssl genrsa -out priv.pem 2048 && openssl rsa -in priv.pem -pubout -out pub.pem
+// xmlsec1 --sign --privkey-pem:mykey priv.pem --output out.xml tmpl.xml
+// xmlsec1 --verify --lax-key-search --pubkey-pem pub.pem out.xml   # => OK
+// ```
+//
+// The 2048-bit key is throwaway TEST MATERIAL; the private half was discarded.
+
+const multi_ns_rsa_pub_pem =
+    \\-----BEGIN PUBLIC KEY-----
+    \\MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkwb0+ctwnT/MJXoywmsz
+    \\c3M+68AjtFOU0KiVsWYHhqZJtAyW3usL2B911+JM09Ao8QCvu9egpMcghF+iRLO/
+    \\l/3Zw6LIVMzIWga3toAWE+/viMhxdWp+kzkOWfP8uWGijC3mHnqXwQ6qJWGRgThK
+    \\ykvtUxSa+dsNeB39+Lvdvjh4jdHOA3I20EYEtyxFFFJb8V5Z6oMeL+74khgrXI0c
+    \\76pg9Im/uzS1Se+Na85T8W9ifk9sF+s3Ob/w635R8SaPq5CQqQiG7k/YLWwT8Xis
+    \\hjHfIgHOBbAfbqwHlG3mq5tOmiTl0l3j19xrqbLY2ewrAsueHy9gXqeLWDJhRqwr
+    \\wQIDAQAB
+    \\-----END PUBLIC KEY-----
+;
+
+const multi_ns_signed_rsa_sha256 =
+    \\<?xml version="1.0"?>
+    \\<Envelope xmlns="urn:demo" xmlns:a="urn:x:aa" xmlns:b="urn:x:bb" ID="obj-multi-ns" zz="unprefixed-z" a:mm="in-a" b:aa="in-b">
+    \\<Data b:zz="d-in-b" a:nn="d-in-a" k="d-plain">multi-namespace attribute ordering</Data>
+    \\<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    \\<ds:SignedInfo>
+    \\<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    \\<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    \\<ds:Reference URI="">
+    \\<ds:Transforms>
+    \\<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+    \\<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    \\</ds:Transforms>
+    \\<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+    \\<ds:DigestValue>jnLutRldkyYXfU8gG41k1h2mI3jrtu8vkl5dTxMiiD8=</ds:DigestValue>
+    \\</ds:Reference>
+    \\</ds:SignedInfo>
+    \\<ds:SignatureValue>MHNLZ1nxFhnRdlWJ9EmMYuJc5UrCgojgDunjKlsXcXgl5WZydALKfnJCHREIARA+
+    \\PwmMmUjR1Efrc+FOUJsT1OMwUiGEfJDVF7IVT6AeRVTJVGeGldH1IJw2FI9zlBcT
+    \\nhKVlmMVuAOhEZ350jw4lYH+dNzfnz2ed4p6eHegZchgxwltA6X+Qt0+3+qtVeI+
+    \\3rqyXbG/cElDNBt1/RvLVIeNaFZKh55qoOl0mg+xwWMvixxnKUNkbqCgEh3CJ1lR
+    \\aEzcjcuG4sTqBKw+nApd1nbCxLMSov2WK9BCQ0syLXCfuN91BKIbVfovFZu7BGTX
+    \\dQJ+xYNvGrY8S5xvmz+GJQ==</ds:SignatureValue>
+    \\<ds:KeyInfo><ds:KeyName>mykey</ds:KeyName></ds:KeyInfo>
+    \\</ds:Signature>
+    \\</Envelope>
+;
+
+test "EXTERNAL anchor: xmlsec1-signed document whose attributes span two namespaces pins the C14N sort key" {
+    const a = testing.allocator;
+    var doc = try xml.parse(a, multi_ns_signed_rsa_sha256, .{});
+    defer doc.deinit();
+    const sig = firstChild(doc.root, "Signature").?;
+    const pk = try rsa.PublicKey.fromPem(multi_ns_rsa_pub_pem);
+    var res = try verify(a, &doc, sig, .{ .key = .{ .rsa = pk } });
+    defer res.deinit(a);
+    try testing.expect(res.valid);
+    try testing.expect(res.references[0].digest_valid);
+}
+
+test "EXTERNAL anchor: the multi-namespace fixture really does discriminate the two candidate sort keys" {
+    // Guards the fixture itself: if someone edits the attribute set into
+    // something the (local, URI) key would order identically, the anchor above
+    // silently stops anchoring anything. Assert here, on the canonical bytes,
+    // that the two keys disagree — so a future edit that neuters the fixture
+    // fails loudly instead of passing.
+    const a = testing.allocator;
+    var doc = try xml.parse(a, multi_ns_signed_rsa_sha256, .{});
+    defer doc.deinit();
+    const sig = firstChild(doc.root, "Signature").?;
+    const canon = try xmldsig.c14n.canonicalize(a, doc.root, .{ .mode = .exclusive, .omit = sig });
+    defer a.free(canon);
+
+    // The byte order libxml2 produced (see the provenance block above).
+    const by_uri_then_local = "ID=\"obj-multi-ns\" zz=\"unprefixed-z\" a:mm=\"in-a\" b:aa=\"in-b\"";
+    // What the (local, URI) key would have produced instead.
+    const by_local_then_uri = "ID=\"obj-multi-ns\" b:aa=\"in-b\" a:mm=\"in-a\" zz=\"unprefixed-z\"";
+    try testing.expect(!std.mem.eql(u8, by_uri_then_local, by_local_then_uri));
+    try testing.expect(std.mem.indexOf(u8, canon, by_uri_then_local) != null);
+    try testing.expect(std.mem.indexOf(u8, canon, by_local_then_uri) == null);
+}
+
+test "EXTERNAL anchor: fixture count canary — 6 genuinely external xmlsec1/signxml-signed documents" {
     // If this drops, a fixture was deleted/disabled rather than fixed — the
     // count itself is the guard against silent coverage loss.
     const fixtures = [_][]const u8{
@@ -284,8 +388,9 @@ test "EXTERNAL anchor: fixture count canary — 5 genuinely external xmlsec1/sig
         enveloping_signed_rsa_sha256,
         ecdsa_signed_p256_sha256,
         signxml_enveloped_rsa_sha256,
+        multi_ns_signed_rsa_sha256,
     };
-    try testing.expectEqual(@as(usize, 5), fixtures.len);
+    try testing.expectEqual(@as(usize, 6), fixtures.len);
     for (fixtures) |f| try testing.expect(f.len > 100);
 }
 

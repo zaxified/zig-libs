@@ -251,6 +251,18 @@ pub const ParseError = ber.Error || AcseRequirements.BitStringError || error{
     UnknownAuthenticationAlternative,
     /// A `[3] other` value did not contain an OID followed by a value.
     MalformedOtherMechanism,
+    /// `[10]`/`[11]`/`[12]` appeared more than once in the same AARQ/AARE.
+    /// The AARQ/AARE `SEQUENCE` type (ISO/IEC 8650-1 / ITU-T X.227 ACSE-1
+    /// module) defines each of these as an OPTIONAL component with a fixed
+    /// tag, i.e. present at most once; a BER encoding with the same
+    /// context tag twice in one SEQUENCE does not conform to that type.
+    /// `UNVERIFIED:` the exact X.690 clause text — the standard's PDF was
+    /// not machine-readable to this auditor and the ACSE-1 module itself is
+    /// paywalled — but a last-wins reader disagreeing with a first-wins
+    /// reader about which authentication assertion a peer just sent is the
+    /// dangerous outcome regardless of whether the encoding is formally
+    /// malformed or merely unspecified, so this is rejected either way.
+    DuplicateField,
 };
 
 /// The three authentication fields, located inside a caller-owned PDU.
@@ -290,14 +302,17 @@ pub fn findAuthFields(bytes: []const u8, kind: PduKind) ParseError!AuthFields {
         offset = it.pos;
         switch (e.tag) {
             tag.acse_requirements => {
+                if (fields.requirements != null) return error.DuplicateField;
                 fields.requirements = try AcseRequirements.parse(e.content);
                 fields.requirements_slice = whole;
             },
             tag.mechanism_name => {
+                if (fields.mechanism_name != null) return error.DuplicateField;
                 fields.mechanism_name = e.content;
                 fields.mechanism_name_slice = whole;
             },
             tag.authentication_value => {
+                if (fields.value != null) return error.DuplicateField;
                 fields.value = try parseAuthValue(e);
                 fields.value_slice = whole;
             },
@@ -668,6 +683,24 @@ test "sample AARQ is well-formed for the reader" {
     var n: usize = 0;
     while (try it.next()) |_| n += 1;
     try testing.expectEqual(@as(usize, 3), n);
+}
+
+test "findAuthFields: a duplicated [10] acse-requirements is rejected, not last-wins" {
+    // sample_aarq's [0]/[1]/[30] children, plus two [10] elements disagreeing
+    // on `authentication`: the first sets it true, the second false. A
+    // last-wins reader (the one this codebase used to be) would report
+    // `assertsAuthentication() == false` even though the peer's first
+    // assertion — the one a first-wins gateway sitting in front of this
+    // parser would see — was `true`.
+    const dup = [_]u8{
+        0x60, 0x24,
+        0x80, 0x02, 0x07, 0x80, // [0] protocol-version
+        0xa1, 0x07, 0x06, 0x05, 0x28, 0xca, 0x22, 0x02, 0x03, // [1] application-context-name
+        0x8a, 0x02, 0x00, 0x80, // [10] acse-requirements #1: authentication=true
+        0x8a, 0x02, 0x00, 0x00, // [10] acse-requirements #2: authentication=false
+        0xbe, 0x0d, 0x28, 0x0b, 0x06, 0x02, 0x51, 0x01, 0xa0, 0x05, 0xa8, 0x03, 0x80, 0x01, 0x05, // [30]
+    };
+    try testing.expectError(error.DuplicateField, findAuthFields(&dup, .aarq));
 }
 
 test "findAuthFields: absent fields are reported as absent, not defaulted" {

@@ -409,7 +409,16 @@ pub fn summarize(ies: []const u8) Summary {
         };
         const e = maybe orelse return s;
         switch (e.id) {
-            EID.SSID => if (s.ssid.len == 0 and !s.hidden_ssid) {
+            // SPEC.md §3: "SSIDs are raw bytes. 0–32 bytes". An element body
+            // can be up to 255 bytes (the IE length octet's range), so
+            // without this check a caller sizing a buffer on `max_ssid_len`
+            // (as `iface.Interface.ssid_buf` does) would overflow on a
+            // hostile or malformed beacon — `iface.parse` already enforces
+            // this same ceiling on `NL80211_ATTR_SSID`; this path did not.
+            // An oversized element is skipped, not treated as a decode
+            // failure, matching every other guard in this loop (e.g.
+            // DS_PARAMS below) and this function's own "never fails" oracle.
+            EID.SSID => if (s.ssid.len == 0 and !s.hidden_ssid and e.body.len <= uapi.max_ssid_len) {
                 s.ssid = e.body;
                 s.hidden_ssid = e.body.len == 0 or std.mem.allEqual(u8, e.body, 0);
             },
@@ -690,6 +699,23 @@ test "summarize on a hidden-SSID beacon" {
     try testing.expectEqual(Security.open, s.security(0));
     try testing.expectEqual(Security.wep, s.security(1 << 4));
     try testing.expect(!s.truncated);
+}
+
+test "summarize: an SSID element exactly at max_ssid_len is accepted, one byte more is skipped" {
+    // At the cap: 32-byte SSID, accepted verbatim.
+    const at_cap = [_]u8{ 0, uapi.max_ssid_len } ++ [_]u8{'a'} ** uapi.max_ssid_len;
+    const s_at_cap = summarize(&at_cap);
+    try testing.expectEqual(@as(usize, uapi.max_ssid_len), s_at_cap.ssid.len);
+    try testing.expect(!s_at_cap.hidden_ssid);
+
+    // One past the cap: 33-byte SSID element. SPEC.md §3 claims 0-32
+    // bytes; unenforced, this used to be copied into `Summary.ssid`
+    // unconditionally and would overflow a caller's `max_ssid_len`-sized
+    // buffer (e.g. `iface.Interface.ssid_buf`). The oversized element is
+    // now skipped: `s.ssid` stays empty rather than 33 bytes long.
+    const over_cap = [_]u8{ 0, uapi.max_ssid_len + 1 } ++ [_]u8{'a'} ** (uapi.max_ssid_len + 1);
+    const s_over_cap = summarize(&over_cap);
+    try testing.expectEqual(@as(usize, 0), s_over_cap.ssid.len);
 }
 
 test "summarize stops at a malformed element and reports what it had" {

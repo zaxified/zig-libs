@@ -63,10 +63,23 @@ The mechanism (`signedTargetMatches` in `root.zig`):
      *identical* (pointer equality, shared Document arena) to the assertion we
      are about to consume (or, for a Response-level signature, to the Response
      element that directly contains that assertion).
-3. Because `xml` rejects duplicate IDs at parse time (`error.DuplicateId`), the
-   id lookup is unambiguous, so pointer identity is a sound proof that the signed
-   octets *are* the consumed assertion. We do **not** rely on the duplicate-ID
-   guard alone — the pointer pin is the primary defense.
+3. Pointer identity is a sound proof that the signed octets *are* the consumed
+   assertion, and it is worth being precise about why — the obvious reason is
+   the wrong one. It is **not** "`xml` rejects duplicate IDs at parse time":
+   the entry points parse with `id_attr_names = &.{"ID"}`, so that guard covers
+   `Config.id_attr` only while it holds its default. The proof rests on:
+   - **Consistency** — `signedTargetMatches` is this module's *only* id
+     resolution, and it calls `Document.findByAttr("", id_attr, id)`: the same
+     function, same document, same arguments as `xmldsig`'s own
+     `resolveReference`. Both sides therefore land on the same *pointer*, not
+     merely on the same id, whatever `id_attr` is set to.
+   - **Uniqueness, enforced one layer down** — `xmldsig.resolveReference`
+     refuses a reference whose id is carried by more than one element
+     (`UriNotResolved`), so an ambiguous id fails closed before it reaches
+     either side of the consistency argument.
+
+   The parse-time duplicate-ID guard is a third, independent layer under the
+   default configuration — and the pointer pin remains the primary defense.
 4. A signature that is valid but resolves elsewhere is
    `error.SignatureWrappingDetected` (never silently ignored). A response with no
    signature covering the consumed assertion is `error.SignatureMissing` — there
