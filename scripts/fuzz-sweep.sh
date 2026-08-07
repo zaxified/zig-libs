@@ -7,9 +7,17 @@
 # WHY ITERATIONS below before changing it back — the old shape had three
 # defects that this one does not, and all three were measured, not theorised.
 #
-#   ./scripts/fuzz-sweep.sh                 # every module with a harness
-#   ./scripts/fuzz-sweep.sh 200000          # a bigger per-harness budget
-#   ./scripts/fuzz-sweep.sh 50000 http dns  # only these
+#   ./scripts/fuzz-sweep.sh http dns        # only these
+#   ./scripts/fuzz-sweep.sh 50000 http dns  # ... with an explicit budget
+#   ./scripts/fuzz-sweep.sh all             # every module with a harness
+#   ./scripts/fuzz-sweep.sh 200000 all      # ... with a bigger per-harness budget
+#
+# ⭐ THE TARGET IS MANDATORY. A bare `./scripts/fuzz-sweep.sh` used to start a
+# sweep of the WHOLE REPO — hours of ReleaseSafe fuzzing — which is not a thing
+# anyone types on purpose, and it was triggered by accident on 2026-08-07 while
+# someone was listing harnesses. Whole-repo now costs the word `all`. The first
+# argument is the budget only when it is all digits, so a bare module name works
+# too (`fuzz-sweep.sh cbor` used to be read as `--fuzz=cbor`).
 #
 # Verdicts written to $OUT/summary.tsv:
 #
@@ -24,6 +32,9 @@
 #                  iterations than the budget it asked for, so it stopped early
 #                  for a reason this script could not name. NOT clean — see
 #                  WHY THE EXIT CODE CANNOT BE TRUSTED.
+#   TOO-SLOW       the module's measured rate is so low that not even MIN_ITERS
+#                  iterations per harness fit in MODULE_WALL. Named rather than
+#                  swept badly — see THE SLOW LANE.
 #
 # ⭐⭐ WHY THE EXIT CODE CANNOT BE TRUSTED UNDER `--fuzz`. `zig build --fuzz=N`
 # EXITS 0 EVEN WHEN A FUZZ TEST CRASHES. This is not a guess; it is visible in
@@ -72,14 +83,39 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ITERS="${1:-50000}"
-CAL_ITERS="${CAL_ITERS:-1000}"   # calibration budget, per harness
-CAL_WALL="${CAL_WALL:-300}"      # hard ceiling on the calibration run, seconds
+CAL_ITERS="${CAL_ITERS:-1000}"   # calibration budget, per harness (starting point)
+CAL_WALL="${CAL_WALL:-300}"      # hard ceiling on ONE calibration attempt, seconds
 HANG_FACTOR="${HANG_FACTOR:-6}"  # main run may take this x its calibrated rate
-OUT="${FUZZ_OUT:-${TMPDIR:-/tmp}/zig-libs-fuzz}"
-mkdir -p "$OUT"
-: > "$OUT/summary.tsv"
-: > "$OUT/findings.txt"
+MODULE_WALL="${MODULE_WALL:-600}" # target wall-clock for one module's main run
+MIN_ITERS="${MIN_ITERS:-200}"    # below this a reduced budget is not worth calling clean
+
+usage() {
+    cat >&2 <<'EOF'
+usage: fuzz-sweep.sh [ITERS] <module>...
+       fuzz-sweep.sh [ITERS] all
+
+  ITERS      per-harness iteration budget handed to `zig build --fuzz=N`
+             (default 50000). Recognised only if it is all digits.
+  <module>   one or more module names, e.g. `cbor http dns`
+  all        every module in the repo that has a `testing.fuzz(` harness.
+             Required spelling: a whole-repo sweep is hours of work and is
+             never what a bare invocation meant to ask for.
+EOF
+    exit 2
+}
+
+ITERS=50000
+if [[ ${1:-} =~ ^[0-9]+$ ]]; then
+    ITERS="$1"
+    shift
+fi
+(( $# )) || usage
+(( ITERS > 0 )) || usage
+for a in "$@"; do
+    [[ "$a" == "all" && $# -ne 1 ]] && { echo "'all' must be the only target" >&2; usage; }
+    [[ "$a" == -* ]] && { echo "unknown option: $a" >&2; usage; }
+done
+
 
 # Modules that actually have a fuzz harness. Derived, never hardcoded, so
 # the sweep cannot silently stop covering a module that grows one.
@@ -90,8 +126,9 @@ mkdir -p "$OUT"
 # a separate gate precisely because this script cannot be one.
 mapfile -t ALL_MODS < <(grep -rl 'testing\.fuzz(' modules/*/src/*.zig 2>/dev/null |
     sed 's|modules/||; s|/src/.*||' | sort -u)
-shift || true
-if [[ $# -gt 0 ]]; then
+if [[ "$1" == "all" ]]; then
+    MODS=("${ALL_MODS[@]}")
+else
     MODS=()
     for want in "$@"; do
         found=0
@@ -101,10 +138,27 @@ if [[ $# -gt 0 ]]; then
         (( found )) || echo "  skipping '$want': no testing.fuzz( harness in modules/$want/src/"
     done
     (( ${#MODS[@]} )) || { echo "no named module has a fuzz harness"; exit 2; }
-else
-    MODS=("${ALL_MODS[@]}")
 fi
 total=${#MODS[@]}
+
+# ⭐ ONE RUN MUST NOT ERASE ANOTHER'S EVIDENCE. Every sweep used to write
+# summary.tsv and findings.txt into one shared directory AND TRUNCATE BOTH ON
+# START, so the second of two sequential sweeps destroyed the first's verdicts —
+# with two agents working the same tree that is the permanent condition, and it
+# already cost this campaign a verdict that had to be re-run. Each run now owns
+# a directory keyed by start time and pid; nothing is ever truncated except this
+# run's own files, which are new. $BASE/latest is a convenience pointer for the
+# common case ("where did my sweep go"), and $BASE/runs.tsv is an append-only
+# index so a run whose pointer was overtaken is still findable.
+BASE="${FUZZ_OUT:-${TMPDIR:-/tmp}/zig-libs-fuzz}"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+OUT="$BASE/run-$RUN_ID"
+mkdir -p "$OUT"
+: > "$OUT/summary.tsv"
+: > "$OUT/findings.txt"
+ln -sfn "$OUT" "$BASE/latest"
+printf '%s\t%s\t%s\t%s\n' "$RUN_ID" "started" "iters=$ITERS" "targets=$*" >> "$BASE/runs.tsv"
+echo "run $RUN_ID -> $OUT   (also reachable as $BASE/latest)"
 
 # ⭐ A CGROUP OOM-KILL REPORTS 15, NOT 137. `scripts/capped` runs the command
 # under `systemd-run --user --scope`, and when the scope hits MemoryMax systemd
@@ -178,16 +232,32 @@ crashStamp() {
 # every sweep on the strength of one file's harness while a second decoder in
 # the same module has none (`lninvoice`: bech32_raw + bolt11 fuzzed, bolt12.zig
 # not). The sweep cannot refuse to run in that state, but it can stop hiding it.
+#
+# ⭐ A `testing.fuzz(` INSIDE A COMMENT IS NOT A HARNESS. This file was matching
+# the literal text anywhere on a line, and this repo writes long provenance
+# comments that quote it — `brotli/src/root.zig:298` and
+# `lninvoice/src/bolt12.zig:1606` both say the words `testing.fuzz(` in prose
+# about the sweep itself. The count feeds the BUDGET FLOOR below, so brotli came
+# back as 3 harnesses when it has 1, its floor was set three times too high, and
+# the module was filed INCOMPLETE twice in a row on a run that had in fact done
+# its full budget. lninvoice the same, 4 counted against 3 real. Strip anything
+# from `//` onwards before matching, on the test header too, so a commented-out
+# test cannot supply a name either.
+#
+# The module-level `grep -rl` above has the same shape and is left alone: it
+# only answers yes/no per module, and it was checked to select the same 132
+# modules with and without comment stripping.
 harnessesOf() { # $1 = module
-    awk -v mod="$1" '
+    awk '
         FNR == 1 { name = "" }
-        /^[[:space:]]*test "/ {
-            line = $0
+        { code = $0; sub(/\/\/.*/, "", code) }
+        code ~ /^[[:space:]]*test "/ {
+            line = code
             sub(/^[^"]*"/, "", line)
             sub(/".*$/, "", line)
             name = line
         }
-        /testing\.fuzz\(/ && name != "" { print FILENAME "\t" name }
+        code ~ /testing\.fuzz\(/ && name != "" { print FILENAME "\t" name }
     ' modules/"$1"/src/*.zig 2>/dev/null
 }
 
@@ -260,47 +330,122 @@ for m in "${MODS[@]}"; do
     nh=${#HARNESS[@]}
 
     # Calibrate on a small budget to learn this module's own throughput, so the
-    # hang ceiling below is derived from the target rather than guessed. A
-    # target that cannot even finish CAL_ITERS inside CAL_WALL is already the
-    # answer.
-    cal_start=$(date +%s)
-    stamp_before=$(crashStamp)
-    timeout "$CAL_WALL" ./scripts/capped zig build "test-$m" --release=safe \
-        --fuzz="$CAL_ITERS" > "$log.cal" 2>&1
-    cal_rc=$?
-    cal_dur=$(( $(date +%s) - cal_start ))
-    cal_delta=$(runsDelta "$log.cal")
-
-    # ⭐ THE CALIBRATION RUN IS A FUZZ RUN AND CAN CRASH TOO. It was previously
-    # judged by `cal_rc` alone, which under `--fuzz` is 0 whatever happens, so a
-    # module that crashed in the first CAL_ITERS iterations went on to a main
-    # run timed by a truncated `cal_dur` and could come back `clean`. Remember
-    # it; the verdict below refuses `clean` for a module that crashed here even
-    # if the main run happened not to reach the same input again.
+    # hang ceiling below is derived from the target rather than guessed.
+    #
+    # ⭐⭐ A FIXED CALIBRATION BUDGET CALLS A SLOW MODULE A HANG. The budget used
+    # to be exactly CAL_ITERS and the ceiling exactly CAL_WALL, so a module whose
+    # harnesses are individually expensive could not calibrate at all and was
+    # filed `HANG (calibration)` — a verdict about the instrument, not the code.
+    # `iec62351` is the case that found this: its `tlsprofile` harness builds a
+    # fresh RSA-2048 certificate per iteration, measured at 0.33 s/run, so 1000
+    # iterations of that ONE harness need ~330 s and the module could never
+    # finish 1000 x 8 inside 300 s. Twice reproduced on an idle machine.
+    #
+    # Raising the constant is not a fix — it just moves the cliff, and there is
+    # always a module past it. The rule instead:
+    #
+    #   BACK THE CALIBRATION BUDGET OFF UNTIL IT COMPLETES, and only call it a
+    #   hang when even `--fuzz=1` cannot finish inside CAL_WALL.
+    #
+    # That threshold is meaningful rather than arbitrary: at `--fuzz=1` the work
+    # left is one iteration per harness plus a replay of the persisted corpus,
+    # i.e. a FIXED amount of work. A target that does not get through a fixed
+    # amount of work in five minutes is not slow, it is not terminating — which
+    # is exactly what HANG is supposed to mean. Everything above that threshold
+    # gets a measured rate, and a measured rate is all the ceiling below needs.
+    #
+    # Note the backoff costs nothing for a module that calibrates today: the
+    # first attempt is still CAL_ITERS and still the only one.
+    cal_budget=$CAL_ITERS
     cal_crashed=0
-    if crashSeen "$log.cal" || [[ "$(crashStamp)" != "$stamp_before" ]]; then
-        cal_crashed=1
+    cal_timedout=0
+    while :; do
+        cal_start=$(date +%s)
+        stamp_before=$(crashStamp)
+        timeout "$CAL_WALL" ./scripts/capped zig build "test-$m" --release=safe \
+            --fuzz="$cal_budget" > "$log.cal" 2>&1
+        cal_rc=$?
+        cal_dur=$(( $(date +%s) - cal_start ))
+        cal_delta=$(runsDelta "$log.cal")
+
+        # ⭐ THE CALIBRATION RUN IS A FUZZ RUN AND CAN CRASH TOO. It was
+        # previously judged by `cal_rc` alone, which under `--fuzz` is 0 whatever
+        # happens, so a module that crashed in the first iterations went on to a
+        # main run timed by a truncated `cal_dur` and could come back `clean`.
+        # Remember it; the verdict below refuses `clean` for a module that
+        # crashed here even if the main run happened not to reach the same input
+        # again. A crash also ends the backoff — the answer is already known.
+        if crashSeen "$log.cal" || [[ "$(crashStamp)" != "$stamp_before" ]]; then
+            cal_crashed=1
+            break
+        fi
+        [[ $cal_rc -ne 124 ]] && break
+        reapOrphans "$m"
+        if (( cal_budget <= 1 )); then cal_timedout=1; break; fi
+        cal_budget=$(( cal_budget / 10 ))
+        (( cal_budget < 1 )) && cal_budget=1
+        cp "$log.cal" "$log.cal.timedout-above-$cal_budget"
+        echo "  $m: calibration did not finish in ${CAL_WALL}s — retrying at ${cal_budget} iters/harness"
+    done
+
+    if (( cal_timedout )); then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$m" 124 "$cal_dur" "HANG" \
+            "did not finish 1 iter/harness + corpus replay in ${CAL_WALL}s (calibration floor)" >> "$OUT/summary.tsv"
+        { echo "=== $m (HANG at calibration floor, ${cal_dur}s) ==="; tail -40 "$log.cal"; echo; } >> "$OUT/findings.txt"
+        echo "[$i/$total] $m -> HANG (calibration floor, ${cal_dur}s)"
+        continue
     fi
 
-    if [[ $cal_rc -eq 124 ]]; then
-        reapOrphans "$m"
-        printf '%s\t%s\t%s\t%s\t%s\n' "$m" 124 "$cal_dur" "HANG" \
-            "did not finish ${CAL_ITERS} iters/harness in ${CAL_WALL}s (calibration)" >> "$OUT/summary.tsv"
-        { echo "=== $m (HANG at calibration, ${cal_dur}s) ==="; tail -40 "$log.cal"; echo; } >> "$OUT/findings.txt"
-        echo "[$i/$total] $m -> HANG (calibration, ${cal_dur}s)"
-        continue
+    # ⭐ THE SLOW LANE. The budget is per harness and in iterations, so a module
+    # whose iterations cost 1000x the median asks for 1000x the wall clock. With
+    # the calibration fixed, `iec62351` at the default 50000/harness projects to
+    # ~6 hours — technically a verdict, practically a sweep nobody runs, which is
+    # the same blindness as the false HANG it replaced.
+    #
+    # So the ITERATION budget is the request and MODULE_WALL is the allowance: a
+    # module too slow for the request is run at the largest budget that fits its
+    # own measured rate, and the reduction is REPORTED next to the verdict. This
+    # keeps `clean` meaning exactly what it meant — "every harness completed the
+    # budget it was given" — while making the budget it was given visible, so a
+    # thin clean can never be mistaken for a full one.
+    #
+    # Below MIN_ITERS there is no honest verdict left to give, and the module is
+    # named TOO-SLOW rather than swept badly. That is a finding about the module
+    # (a harness doing keygen per iteration is a harness design problem), not a
+    # verdict about its code.
+    budget=$ITERS
+    reduced=""
+    if (( cal_dur > 0 && cal_budget > 0 )); then
+        proj=$(( cal_dur * ITERS / cal_budget ))
+        if (( proj > MODULE_WALL )); then
+            budget=$(( MODULE_WALL * cal_budget / cal_dur ))
+            (( budget > ITERS )) && budget=$ITERS
+            if (( budget < MIN_ITERS )); then
+                printf '%s\t%s\t%s\t%s\t%s\n' "$m" 0 "$cal_dur" "TOO-SLOW" \
+                    "measured ${cal_delta} runs in ${cal_dur}s at ${cal_budget}/harness; ${ITERS}/harness projects to ${proj}s and even ${MIN_ITERS}/harness does not fit MODULE_WALL=${MODULE_WALL}s" >> "$OUT/summary.tsv"
+                { echo "=== $m (TOO-SLOW: ${cal_delta} runs in ${cal_dur}s) ==="
+                  echo "A harness in this module is too expensive per iteration to fuzz at any"
+                  echo "budget worth calling clean. Fix the harness (per-iteration keygen or"
+                  echo "signature work belongs outside the loop), or raise MODULE_WALL knowingly."
+                  echo; } >> "$OUT/findings.txt"
+                echo "[$i/$total] $m -> TOO-SLOW (${cal_delta} runs in ${cal_dur}s)"
+                continue
+            fi
+            reduced=" REDUCED-BUDGET from ${ITERS} (full budget projects to ${proj}s > MODULE_WALL=${MODULE_WALL}s)"
+            echo "  $m: slow lane — budget reduced ${ITERS} -> ${budget} iters/harness"
+        fi
     fi
 
     # Scale the calibrated time to the real budget, then allow HANG_FACTOR x
     # that. A slow-but-terminating target stays clean; one that stops making
     # progress blows through its own measured rate and is named.
-    wall=$(( (cal_dur * ITERS / CAL_ITERS + 15) * HANG_FACTOR ))
+    wall=$(( (cal_dur * budget / cal_budget + 15) * HANG_FACTOR ))
     (( wall < 60 )) && wall=60
 
     start=$(date +%s)
     stamp_before=$(crashStamp)
     timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
-        --fuzz="$ITERS" > "$log" 2>&1
+        --fuzz="$budget" > "$log" 2>&1
     rc=$?
     dur=$(( $(date +%s) - start ))
     [[ $rc -eq 124 ]] && reapOrphans "$m"
@@ -309,30 +454,30 @@ for m in "${MODS[@]}"; do
     [[ "$(crashStamp)" != "$stamp_before" ]] && new_crash_artifact=1
 
     # ⭐ BUDGET FLOOR — the observation that does not read a single word of the
-    # log. A run that ran to completion performs at least ITERS iterations per
+    # log. A run that ran to completion performs at least `budget` iterations per
     # fuzz test, so `delta` has a floor, and a run that stopped early falls
     # under it no matter WHY it stopped or how the reason was spelled.
     #
     # Two independent estimators of that floor, because each can be wrong on its
     # own and they are wrong in opposite directions:
     #
-    #   nh * ITERS          — exact when `harnessesOf` counted right, but it
+    #   nh * budget         — exact when `harnessesOf` counted right, but it
     #                         counts `testing.fuzz(` call sites, so two calls in
     #                         one test (or one in a helper) OVER-counts.
-    #   cal_delta * ITERS/CAL_ITERS
+    #   cal_delta * budget/cal_budget
     #                       — measured from this module's own completed
     #                         calibration, immune to miscounting, but noisy:
     #                         the fuzzer overshoots its limit in batches, and at
-    #                         CAL_ITERS the relative overshoot is largest, so it
+    #                         cal_budget the relative overshoot is largest, so it
     #                         OVER-estimates.
     #
     # Take the smaller, then keep 10% back for the batching overshoot. Measured
     # at fd39a3e, --fuzz=3000: netaddr 3 harnesses -> 9080 (floor 9000),
     # json5 2 -> 6722 (6000), cbor 1 -> 3149 (3000). Never once undershot.
     # bacnet's misreported crash: floor 14x20000 = 280000, delta 80712 = 29%.
-    floor=$(( nh * ITERS ))
+    floor=$(( nh * budget ))
     if (( cal_crashed == 0 && cal_delta > 0 )); then
-        cal_floor=$(( cal_delta * ITERS / CAL_ITERS ))
+        cal_floor=$(( cal_delta * budget / cal_budget ))
         (( cal_floor < floor )) && floor=$cal_floor
     fi
 
@@ -370,13 +515,13 @@ for m in "${MODS[@]}"; do
         echo "  OOM: killed by its cgroup after ${dur}s — an allocation was sized from unbounded input" >> "$log"
     fi
     if [[ "$verdict" == "HANG" ]]; then
-        echo "  HANG: killed after ${dur}s, having asked for ${ITERS} iterations per harness and been" >> "$log"
+        echo "  HANG: killed after ${dur}s, having asked for ${budget} iterations per harness and been" >> "$log"
         echo "  given ${wall}s = ${HANG_FACTOR}x its own calibrated rate. A bounded fuzz run that does" >> "$log"
         echo "  not terminate means some input reached a path that does not." >> "$log"
     fi
     if [[ "$verdict" == "INCOMPLETE" ]]; then
         echo "  INCOMPLETE: performed $delta runs where a completed run of ${nh} harness(es) at" >> "$log"
-        echo "  ${ITERS} iterations each has a floor of ${floor}. Something stopped this run early and" >> "$log"
+        echo "  ${budget} iterations each has a floor of ${floor}. Something stopped this run early and" >> "$log"
         echo "  none of the crash signals named it. Re-run it alone before believing anything." >> "$log"
     fi
 
@@ -393,11 +538,11 @@ for m in "${MODS[@]}"; do
     fi
 
     printf '%s\t%s\t%s\t%s\t%s\n' "$m" "$rc" "$dur" "$verdict" \
-        "harnesses=$nh runs=$delta budget=${ITERS}/harness wall=${wall}s" >> "$OUT/summary.tsv"
+        "harnesses=$nh runs=$delta budget=${budget}/harness wall=${wall}s${reduced}" >> "$OUT/summary.tsv"
     if [[ "$verdict" != "clean" ]]; then
         { echo "=== $m (exit $rc, ${dur}s, $verdict) ==="; tail -40 "$log"; echo; } >> "$OUT/findings.txt"
     fi
-    echo "[$i/$total] $m -> $verdict (${dur}s, $nh harness(es), $delta runs)"
+    echo "[$i/$total] $m -> $verdict (${dur}s, $nh harness(es), $delta runs, ${budget}/harness)"
 
     # ⭐ RE-RUN: ONE CRASH USED TO SILENCE EVERY LATER HARNESS IN THE MODULE.
     # All of a module's fuzz tests share one process, so the first to crash
@@ -414,7 +559,7 @@ for m in "${MODS[@]}"; do
             hstart=$(date +%s)
             hstamp=$(crashStamp)
             timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
-                -Dtest-filter="$hname" --fuzz="$ITERS" > "$hlog" 2>&1
+                -Dtest-filter="$hname" --fuzz="$budget" > "$hlog" 2>&1
             hrc=$?
             [[ $hrc -eq 124 ]] && reapOrphans "$m"
             hdelta=$(runsDelta "$hlog")
@@ -426,7 +571,7 @@ for m in "${MODS[@]}"; do
             elif [[ $hrc -eq 124 ]]; then hv="HANG"
             elif [[ $hrc -ne 0 ]]; then hv="EXIT-$hrc"
             elif [[ "$hdelta" -le 0 ]]; then hv="NEVER-FUZZED"
-            elif (( hdelta * 100 < ITERS * 90 )); then hv="INCOMPLETE"
+            elif (( hdelta * 100 < budget * 90 )); then hv="INCOMPLETE"
             else hv="clean"; fi
             # Each isolated re-run overwrites .zig-cache/f/crash in turn, so a
             # second crashing harness used to lose its input to the third one's.
@@ -446,6 +591,19 @@ done
 echo
 echo "=== SWEEP DONE ==="
 awk -F'\t' '{c[$4]++} END {for (v in c) printf "%-16s %d\n", v, c[v]}' "$OUT/summary.tsv"
+
+# A `clean` won at a reduced budget is not the same evidence as a `clean` at the
+# budget that was asked for. Say so at the end, where the counts are read.
+if grep -q 'REDUCED-BUDGET' "$OUT/summary.tsv"; then
+    echo
+    echo "SLOW LANE — these ran at less than the ${ITERS}/harness you asked for:"
+    awk -F'\t' '/REDUCED-BUDGET/ { print "  " $1 "\t" $4 "\t" $5 }' "$OUT/summary.tsv"
+fi
+echo
+echo "evidence: $OUT   (latest -> $BASE/latest, index: $BASE/runs.tsv)"
+printf '%s\t%s\t%s\t%s\n' "$RUN_ID" "finished" \
+    "$(awk -F'\t' '{c[$4]++} END {for (v in c) printf "%s=%d ", v, c[v]}' "$OUT/summary.tsv")" \
+    "$OUT" >> "$BASE/runs.tsv"
 echo
 echo "Modules that SHOULD have a harness and do not are invisible here by"
 echo "construction — run \`zig build check-fuzz\` for that half of the picture."
