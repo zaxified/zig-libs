@@ -29,7 +29,23 @@ RFC 6960 OCSP request building + response parsing/verification; see
 The check order is security-significant: the responder is authorized and the
 `tbsResponseData` signature is verified **before** any per-certificate status is
 trusted; the CertID binding then confirms the response applies to the subject
-certificate; freshness and nonce are checked last. Every step fails **closed**.
+certificate; freshness and nonce are checked last. Before any of that, the
+supplied subject/issuer pair must actually be a chain. Every step fails **closed**.
+
+0. **Subject↔issuer link.** `subject_cert_der`'s `issuer` Name must equal
+   `issuer_cert_der`'s `subject` Name (byte-exact over the DER Name TLVs; no
+   RFC 5280 §7.1 canonicalization, which can only make this stricter, and a
+   conforming CA re-encodes the issuer Name verbatim anyway — the CertID's
+   `issuerNameHash` already depends on that). Else ⇒ `IssuerMismatch`.
+
+   This step exists because a `CertID` (§4.1.1) names a certificate as
+   (issuerNameHash, issuerKeyHash, serialNumber) and carries **no field that
+   identifies the subject certificate itself**. Step 3 below therefore binds
+   the two hashes to the issuer the *caller* supplied and the serial to the
+   subject the *caller* supplied. If that pair is not actually a chain, the
+   certificate the response answers for is a different one than
+   `subject_cert_der`, and every later step would be a confident statement
+   about that other certificate.
 
 1. **Responder authorization.**
    - *Direct* — the `ResponderID` names the issuing CA itself: `byName` equals

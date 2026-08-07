@@ -40,7 +40,11 @@
 //!      the caller populates from the control plane (SPB I-SID TLVs / EVPN
 //!      route imports). `addMember` / `removeMember` / `isMember`. This module
 //!      never learns membership from data-plane frames; it is control-plane
-//!      state the caller owns.
+//!      state the caller owns. **So is the tenant slot itself**: only the
+//!      control-plane entry points (`addIsid`, `addMember`, `learnStatic`)
+//!      create an I-SID. `learn` — the data-plane one — refuses an I-SID the
+//!      caller never configured (`error.UnknownIsid`) and allocates nothing, so
+//!      received traffic can never spend the `max_isids` budget.
 //!   2. **FDB** (802.1D-style forwarding database) — customer MAC → remote PE,
 //!      learned from received frames (`learn`), each entry carrying the `now`
 //!      it was last (re)learned at so ageing is a comparison, not an owned
@@ -62,6 +66,22 @@
 //!     multicast/group address (the I/G bit — the LSB of the first octet — is
 //!     set), or a unicast that misses the FDB.
 //!
+//! ## MAC mobility / hijack (EVPN RFC 7432 §15)
+//! A source MAC arriving from a different PE is a **move**, and the frame that
+//! causes one is unauthenticated: a spoofed source MAC redirects a station's
+//! entire unicast flow to whoever sent it. Two properties keep that bounded:
+//!   * **it is never silent** — `learn` returns a `LearnOutcome`, so `.moved`
+//!     is a signal the caller can alarm on, rate-limit or answer with a
+//!     `learnStatic` pin. A table that accepts moves without telling anyone is
+//!     a traffic-redirection primitive;
+//!   * **it is counted** — `Options.max_mac_moves` moves inside
+//!     `Options.mac_move_window` trip duplicate-MAC detection: that move is
+//!     refused and the MAC is **quarantined**, meaning no binding is trusted
+//!     and the MAC floods to every member PE (which still reaches the real
+//!     station) until the window lapses. Flooding, not freezing on whichever
+//!     party won the last race — a freeze would let the attacker lock in the
+//!     binding it stole. `forget` / `learnStatic` clear a quarantine early.
+//!
 //! ## Ageing
 //! `tick(now)` reclaims dynamic FDB entries older than `Options.aging_ticks`;
 //! an expired entry's MAC reverts to unknown-unicast (floods again until
@@ -79,7 +99,10 @@
 //! to flooding when its CAM is full. The per-tenant cap means a flood in one
 //! I-SID can never evict another tenant's entries. Total worst-case memory is
 //! `max_isids × max_macs_per_isid` FDB entries plus `max_isids ×
-//! max_pes_per_isid` membership entries.
+//! max_pes_per_isid` membership entries — and that ceiling is reachable only by
+//! the **control plane**, because `learn` cannot create a tenant (see the data
+//! model above): an attacker with no control-plane access is confined to the
+//! I-SIDs the operator actually provisioned.
 //!
 //! Provenance: clean-room from public specifications (IEEE 802.1D MAC learning /
 //! ageing FDB, IEEE 802.1ah PBB I-SID service scoping, IEEE 802.1aq SPB / EVPN
@@ -161,6 +184,27 @@ pub const Options = struct {
     /// as a miss by `forward`/`lookup` and reclaimed by `tick`. Static entries
     /// ignore it. `0` means every dynamic entry is immediately stale.
     aging_ticks: Time = 300,
+    /// MAC-mobility limit (EVPN RFC 7432 §15.1 duplicate-MAC detection): the
+    /// number of moves of the *same* MAC inside `mac_move_window` that trips
+    /// duplicate detection. The move that reaches this count is **refused** and
+    /// the MAC is quarantined (see `LearnOutcome.duplicate_detected`). `0`
+    /// disables move acceptance entirely — the first move quarantines.
+    max_mac_moves: u8 = 5,
+    /// The sliding window (in `Time` units) `max_mac_moves` is counted over, and
+    /// also how long a quarantine holds. RFC 7432 §15.1 (verified against the
+    /// RFC text, 2026-08-07): "a PE that detects a MAC mobility event via local
+    /// learning starts an M-second timer (with a default value of M = 180), and
+    /// if it detects N MAC moves before the timer expires (with a default value
+    /// of N = 5), it concludes that a duplicate-MAC situation has occurred."
+    ///
+    /// **Deliberate deviation:** the same clause says the PE "MUST alert the
+    /// operator and stop … until a corrective action is taken by the operator".
+    /// That is a BGP-EVPN control-plane rule about withdrawing MAC/IP
+    /// Advertisement routes; this module is a local FDB with no control plane to
+    /// alert, so a quarantine instead lapses with the window. A deployment that
+    /// wants the RFC's operator-clears-it behaviour sets `mac_move_window` to
+    /// something long and calls `forget` as the corrective action.
+    mac_move_window: Time = 180,
 };
 
 // ── decisions & errors ───────────────────────────────────────────────────────
@@ -203,14 +247,73 @@ pub const AddMemberError = error{
     OutOfMemory,
 };
 
-pub const LearnError = error{
+pub const AddIsidError = error{
     /// A new I-SID would exceed `Options.max_isids`.
     TooManyIsids,
+    OutOfMemory,
+};
+
+/// Errors of the **data-plane** entry point `learn`. Note what is *not* here:
+/// `TooManyIsids`. A received frame can never create a tenant, so it can never
+/// consume the I-SID budget either — it is refused with `UnknownIsid` first.
+pub const LearnError = error{
+    /// No such tenant. `learn` is the data-plane entry point and the tenant slot
+    /// is control-plane state (`addIsid` / `addMember` / `learnStatic` create
+    /// it), so a frame carrying an I-SID the control plane never configured is
+    /// refused outright — it does not allocate anything. Fail closed: the caller
+    /// should drop the frame.
+    UnknownIsid,
     /// This I-SID's FDB is full (`Options.max_macs_per_isid`) and no expired
     /// entry could be reclaimed to make room — the new MAC is not learned and
     /// forwards as unknown-unicast (floods). Existing entries are untouched.
     FdbFull,
     OutOfMemory,
+};
+
+/// Errors of the **control-plane** pinning entry point `learnStatic`, which
+/// (like `addMember`) may create the tenant slot and therefore can hit the
+/// I-SID cap.
+pub const LearnStaticError = error{
+    /// A new I-SID would exceed `Options.max_isids`.
+    TooManyIsids,
+    /// See `LearnError.FdbFull`.
+    FdbFull,
+    OutOfMemory,
+};
+
+/// What a `learn` call actually did. `learn` returns this instead of `void`
+/// because a **move is a security event**: the frame that causes one is
+/// unauthenticated data-plane input (see the module header), and a move
+/// silently redirects a station's entire unicast flow to whoever sent it. The
+/// caller — not this table — owns the policy response (alarm, ACL, pin the MAC
+/// with `learnStatic`), and it cannot exercise any policy over an event it is
+/// never told about.
+pub const LearnOutcome = enum {
+    /// The MAC was not in the FDB (or its quarantine had lapsed): a fresh
+    /// binding was installed.
+    learned,
+    /// The MAC was already bound to this same PE: only its age was refreshed.
+    /// Nothing about the forwarding decision changed.
+    refreshed,
+    /// **The MAC moved**: it was bound to a different PE and is now bound to
+    /// `src_pe`. Legitimate station mobility looks exactly like a hijack here;
+    /// the move counter (`moveCount`) is how the caller tells them apart.
+    moved,
+    /// This move reached `Options.max_mac_moves` inside
+    /// `Options.mac_move_window` — RFC 7432 §15 duplicate-MAC detection. The
+    /// move is **refused**, and the MAC is quarantined: `lookup`/`forward` now
+    /// report it as unknown so it floods to every member PE (which still
+    /// reaches the real station) instead of being unicast to whichever party
+    /// won the last race. The quarantine lapses `mac_move_window` after it
+    /// started, or immediately on `forget` / `learnStatic`.
+    duplicate_detected,
+    /// Refused: this MAC is quarantined and the window has not lapsed. Nothing
+    /// changed — in particular a quarantine cannot be *extended* by continuing
+    /// to send, so an attacker cannot hold a MAC in quarantine indefinitely.
+    denied_duplicate,
+    /// The MAC is administratively pinned by `learnStatic`; dynamic learning
+    /// leaves it alone (no error, no change).
+    static_pinned,
 };
 
 pub const ForwardError = error{
@@ -226,9 +329,19 @@ const FdbEntry = struct {
     /// The `now` this entry was last learned/refreshed at; ageing is
     /// `now - learned_at > aging_ticks`. Ignored when `static`.
     learned_at: Time,
+    /// Start of the current MAC-mobility window: the `now` of the first move
+    /// counted in `moves`, or — once `duplicate` is set — the instant the
+    /// quarantine began. Never advanced while quarantined.
+    move_window_start: Time = 0,
+    /// Moves of this MAC counted inside the current window (saturating).
+    moves: u8 = 0,
     /// Administratively pinned: never aged, never overwritten by dynamic
     /// `learn`. Installed by `learnStatic`, removed only by `forget`/`deinit`.
     static: bool = false,
+    /// Quarantined by duplicate-MAC detection: the binding is not trusted by
+    /// anybody, so `lookup`/`forward` report a miss (the MAC floods) until the
+    /// window lapses and a fresh `learn` re-establishes it.
+    duplicate: bool = false,
 };
 
 const PeSet = std.AutoHashMapUnmanaged(PeId, void);
@@ -263,6 +376,26 @@ pub const Table = struct {
 
     // ── membership (control-plane populated) ─────────────────────────────────
 
+    /// **Provision a tenant** (idempotent): create `isid`'s (empty) state so
+    /// that the data plane may learn in it. This is the control-plane act that
+    /// `learn` deliberately cannot perform — see `LearnError.UnknownIsid`. It
+    /// exists as its own entry point because a tenant is legitimately
+    /// member-less (a single-PE I-SID with only local access circuits), so
+    /// `addMember` is not a sufficient provisioning path.
+    pub fn addIsid(self: *Table, isid: Isid) AddIsidError!void {
+        _ = try self.getOrCreateIsid(isid);
+    }
+
+    /// Deprovision a tenant: drop its membership *and* its FDB. Returns true if
+    /// the I-SID existed. After this, `learn` on `isid` fails with
+    /// `UnknownIsid` again.
+    pub fn removeIsid(self: *Table, isid: Isid) bool {
+        const kv = self.isids.fetchRemove(isid) orelse return false;
+        var ie = kv.value;
+        ie.deinit(self.alloc);
+        return true;
+    }
+
     /// Add `pe` to `isid`'s member set (idempotent). Creating the I-SID counts
     /// against `max_isids`; a brand-new I-SID starts with zero members, so
     /// `TooManyMembers` can only arise on an already-populated I-SID.
@@ -296,27 +429,70 @@ pub const Table = struct {
     // ── learning (data-plane) ────────────────────────────────────────────────
 
     /// Learn (or refresh) that customer MAC `src_mac` in tenant `isid` is
-    /// reachable behind remote PE `src_pe`, as of `now`. Re-learning an existing
-    /// dynamic MAC refreshes its age and — if it now arrives from a different PE
-    /// — accepts the move (last-writer-wins). A MAC pinned by `learnStatic` is
-    /// **not** overwritten by dynamic learning (the static entry wins, no
-    /// error). New MACs beyond the per-tenant cap are rejected (`FdbFull`) after
-    /// a reclaim attempt — see the module DoS note.
-    pub fn learn(self: *Table, isid: Isid, src_mac: Mac, src_pe: PeId, now: Time) LearnError!void {
-        const ie = try self.getOrCreateIsid(isid);
+    /// reachable behind remote PE `src_pe`, as of `now`. **Data plane**: the
+    /// argument values come from a received frame and are not authenticated, so
+    /// this entry point is the module's whole attack surface and is deliberately
+    /// the most constrained one.
+    ///
+    ///   * `isid` must already exist (`addIsid` / `addMember` / `learnStatic`).
+    ///     A frame carrying an unconfigured I-SID is refused with `UnknownIsid`
+    ///     and allocates nothing — a received frame never creates tenant state.
+    ///   * A *move* (the MAC was bound to another PE) is accepted but **counted
+    ///     and reported**: `LearnOutcome.moved`. `max_mac_moves` moves inside
+    ///     `mac_move_window` trip RFC 7432 §15 duplicate-MAC detection — that
+    ///     move is refused and the MAC is quarantined (floods) until the window
+    ///     lapses.
+    ///   * A MAC pinned by `learnStatic` is not overwritten (`static_pinned`).
+    ///   * New MACs beyond the per-tenant cap are rejected (`FdbFull`) after a
+    ///     reclaim attempt — see the module DoS note.
+    ///
+    /// The returned `LearnOutcome` is the caller's only notification of a MAC
+    /// hijack; ignoring it (`_ = try …`) is choosing to run without one.
+    pub fn learn(self: *Table, isid: Isid, src_mac: Mac, src_pe: PeId, now: Time) LearnError!LearnOutcome {
+        // Data-plane frames do not provision tenants: no getOrCreateIsid here.
+        const ie = self.isids.getPtr(isid) orelse return error.UnknownIsid;
         if (ie.fdb.getPtr(src_mac)) |e| {
-            if (e.static) return; // static entries are administratively pinned
-            e.pe = src_pe; // accept move (last-writer-wins)
+            if (e.static) return .static_pinned; // administratively pinned
+            if (e.duplicate) {
+                // Quarantined. A lapsed window lets the MAC be re-established
+                // from scratch; an unlapsed one refuses without touching a
+                // thing, so the quarantine cannot be extended by sending more.
+                if (!self.quarantineLapsed(e.*, now)) return .denied_duplicate;
+                e.* = .{ .pe = src_pe, .learned_at = now };
+                return .learned;
+            }
+            if (e.pe == src_pe) {
+                e.learned_at = now;
+                return .refreshed;
+            }
+            // A move. Count it inside the mobility window.
+            if (!self.inMoveWindow(e.*, now)) {
+                e.move_window_start = now;
+                e.moves = 0;
+            }
+            e.moves +|= 1;
+            if (e.moves >= self.options.max_mac_moves) {
+                // RFC 7432 §15: too many moves in the window. Refuse THIS move
+                // and trust neither binding — the MAC floods until the
+                // quarantine lapses, which still reaches the real station.
+                e.duplicate = true;
+                e.move_window_start = now;
+                return .duplicate_detected;
+            }
+            e.pe = src_pe;
             e.learned_at = now;
-            return;
+            return .moved;
         }
         try self.insertNewMac(ie, src_mac, .{ .pe = src_pe, .learned_at = now }, now);
+        return .learned;
     }
 
     /// Install a **static** entry: MAC `mac` in `isid` is pinned behind `pe`,
-    /// never aged and never overwritten by dynamic `learn`. Overwrites whatever
-    /// (static or dynamic) was there. Still counts against the per-tenant cap.
-    pub fn learnStatic(self: *Table, isid: Isid, mac: Mac, pe: PeId) LearnError!void {
+    /// never aged, never overwritten by dynamic `learn`, and never quarantined.
+    /// Overwrites whatever (static, dynamic or quarantined) was there. Still
+    /// counts against the per-tenant cap. Control plane: unlike `learn` it may
+    /// create the I-SID, and so can fail with `TooManyIsids`.
+    pub fn learnStatic(self: *Table, isid: Isid, mac: Mac, pe: PeId) LearnStaticError!void {
         const ie = try self.getOrCreateIsid(isid);
         if (ie.fdb.getPtr(mac)) |e| {
             e.* = .{ .pe = pe, .learned_at = 0, .static = true };
@@ -335,13 +511,35 @@ pub const Table = struct {
     // ── lookup & the forward decision ────────────────────────────────────────
 
     /// The remote PE a fresh, known unicast to `dst_mac` in `isid` would go to,
-    /// or null (unknown or expired). Read-only: does not mutate or reclaim (an
-    /// expired entry is simply reported as a miss; `tick` reclaims it later).
+    /// or null (unknown, expired, or quarantined by duplicate-MAC detection).
+    /// Read-only: does not mutate or reclaim (an expired entry is simply
+    /// reported as a miss; `tick` reclaims it later).
     pub fn lookup(self: *const Table, isid: Isid, dst_mac: Mac, now: Time) ?PeId {
         const ie = self.isids.getPtr(isid) orelse return null;
         const e = ie.fdb.getPtr(dst_mac) orelse return null;
+        // A quarantined MAC has no trusted binding: report a miss so the frame
+        // floods to every member (which still reaches the real station) rather
+        // than being unicast to whoever won the last move race.
+        if (e.duplicate) return null;
         if (self.isExpired(e.*, now)) return null;
         return e.pe;
+    }
+
+    /// Moves of `mac` counted in the current mobility window (0 if unknown).
+    /// The caller's hijack signal alongside `LearnOutcome.moved`.
+    pub fn moveCount(self: *const Table, isid: Isid, mac: Mac) u8 {
+        const ie = self.isids.getPtr(isid) orelse return 0;
+        const e = ie.fdb.getPtr(mac) orelse return 0;
+        return e.moves;
+    }
+
+    /// True iff `mac` is currently quarantined by duplicate-MAC detection (it
+    /// floods instead of being unicast). Cleared by `forget` / `learnStatic`,
+    /// or by a `learn` after `Options.mac_move_window` has lapsed.
+    pub fn isQuarantined(self: *const Table, isid: Isid, mac: Mac) bool {
+        const ie = self.isids.getPtr(isid) orelse return false;
+        const e = ie.fdb.getPtr(mac) orelse return false;
+        return e.duplicate;
     }
 
     /// Decide where a frame `{ isid, dst_mac, ingress }` goes as of `now`.
@@ -418,8 +616,27 @@ pub const Table = struct {
 
     fn isExpired(self: *const Table, e: FdbEntry, now: Time) bool {
         if (e.static) return false;
+        // A live quarantine outlives ageing: reclaiming the entry would erase
+        // the duplicate flag and hand the MAC straight back to the attacker.
+        if (e.duplicate and !self.quarantineLapsed(e, now)) return false;
         const age = if (now >= e.learned_at) now - e.learned_at else 0;
         return age > self.options.aging_ticks;
+    }
+
+    /// Ticks elapsed since `e.move_window_start`, clamped to 0 for a
+    /// non-monotonic `now` exactly as `isExpired` clamps ageing.
+    fn sinceWindowStart(e: FdbEntry, now: Time) Time {
+        return if (now >= e.move_window_start) now - e.move_window_start else 0;
+    }
+
+    /// True iff a move at `now` still falls inside `e`'s current move window.
+    fn inMoveWindow(self: *const Table, e: FdbEntry, now: Time) bool {
+        return e.moves > 0 and sinceWindowStart(e, now) <= self.options.mac_move_window;
+    }
+
+    /// True iff a quarantine started at `e.move_window_start` has expired.
+    fn quarantineLapsed(self: *const Table, e: FdbEntry, now: Time) bool {
+        return sinceWindowStart(e, now) > self.options.mac_move_window;
     }
 
     fn getOrCreateIsid(self: *Table, isid: Isid) error{ TooManyIsids, OutOfMemory }!*IsidEntry {
@@ -434,7 +651,7 @@ pub const Table = struct {
     /// Insert a MAC not currently present, enforcing the per-tenant cap: when
     /// full, reclaim this I-SID's expired dynamic entries first; if still full,
     /// reject with `FdbFull`.
-    fn insertNewMac(self: *Table, ie: *IsidEntry, mac: Mac, entry: FdbEntry, now: Time) LearnError!void {
+    fn insertNewMac(self: *Table, ie: *IsidEntry, mac: Mac, entry: FdbEntry, now: Time) error{ FdbFull, OutOfMemory }!void {
         if (ie.fdb.count() >= self.options.max_macs_per_isid) {
             self.pruneIsid(ie, now);
             if (ie.fdb.count() >= self.options.max_macs_per_isid) return error.FdbFull;
@@ -496,7 +713,7 @@ test "known unicast: learn then forward returns the single PE; a different MAC f
     defer t.deinit();
     try t.addMember(10, 2);
     try t.addMember(10, 5);
-    try t.learn(10, macOf(0xAA), 2, 0); // M behind PE 2
+    _ = try t.learn(10, macOf(0xAA), 2, 0); // M behind PE 2
 
     var buf: [16]PeId = undefined;
     const d = try t.forward(10, macOf(0xAA), .access, 0, &buf);
@@ -550,7 +767,7 @@ test "hostile peer: a lying ingress_pe cannot buy a relay — every core BUM rep
         try testing.expectEqual(Decision.local_only, try t.forward(7, broadcast, ingress, 0, &buf));
         // A known unicast from the core is not relayed either: the destination
         // PE already had its own copy delivered directly (full mesh).
-        try t.learn(7, macOf(0xC1), 2, 0);
+        _ = try t.learn(7, macOf(0xC1), 2, 0);
         try testing.expectEqual(Decision.local_only, try t.forward(7, macOf(0xC1), ingress, 0, &buf));
     }
 }
@@ -621,7 +838,7 @@ test "tenant isolation: a MAC learned in I-SID A does not affect I-SID B" {
     defer t.deinit();
     try t.addMember(100, 2);
     try t.addMember(200, 8);
-    try t.learn(100, macOf(0x11), 2, 0); // M behind PE 2, only in A
+    _ = try t.learn(100, macOf(0x11), 2, 0); // M behind PE 2, only in A
 
     var buf: [16]PeId = undefined;
     // In A: known unicast to PE 2.
@@ -638,7 +855,7 @@ test "BUM classification drives flood: broadcast, multicast, unknown-unicast flo
     defer t.deinit();
     try t.addMember(1, 2);
     try t.addMember(1, 3);
-    try t.learn(1, macOf(0x55), 2, 0);
+    _ = try t.learn(1, macOf(0x55), 2, 0);
 
     var buf: [16]PeId = undefined;
     // known unicast → unicast, NOT flood
@@ -656,18 +873,134 @@ test "MAC move: relearn behind a new PE updates the decision (last-writer-wins)"
     var t = testTable();
     defer t.deinit();
     var buf: [16]PeId = undefined;
-    try t.learn(3, macOf(0x77), 2, 0);
+    try t.addIsid(3); // the tenant is control-plane state; the data plane fills it
+    _ = try t.learn(3, macOf(0x77), 2, 0);
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(3, macOf(0x77), .access, 5, &buf));
-    try t.learn(3, macOf(0x77), 7, 10); // same MAC, now seen from PE 7
+    _ = try t.learn(3, macOf(0x77), 7, 10); // same MAC, now seen from PE 7
     try testing.expectEqual(Decision{ .unicast = 7 }, try t.forward(3, macOf(0x77), .access, 20, &buf));
     try testing.expectEqual(@as(usize, 1), t.fdbCount(3)); // a move, not a second entry
+}
+
+// Regression (audit F5 / P-09): a MAC move is unauthenticated data-plane
+// traffic redirection. Before the fix `learn` was plain last-writer-wins with
+// no counter, no limit and no return value, so one hostile frame with a spoofed
+// source MAC silently pointed a station's entire unicast flow at the attacker's
+// PE and kept it there for as long as the attacker refreshed it. The contract
+// now is: every move is REPORTED to the caller and COUNTED, and a MAC that
+// flaps `max_mac_moves` times inside `mac_move_window` is quarantined — no
+// binding is trusted, the MAC floods (which still reaches the real station),
+// and the refused move is not installed (EVPN RFC 7432 §15).
+test "MAC hijack: a move is reported and counted, and a flapping MAC is quarantined, not stolen" {
+    var t = Table.init(testing.allocator, .{
+        .max_isids = 64,
+        .max_pes_per_isid = 16,
+        .max_macs_per_isid = 8,
+        .aging_ticks = 10,
+        .max_mac_moves = 3,
+        .mac_move_window = 50,
+    });
+    defer t.deinit();
+    try t.addMember(1, 2); // the victim station's real PE
+    try t.addMember(1, 9); // the attacker's PE
+    var buf: [16]PeId = undefined;
+    const victim = macOf(0x42);
+
+    // Normal learning: no move, nothing to report.
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, victim, 2, 0));
+    try testing.expectEqual(LearnOutcome.refreshed, try t.learn(1, victim, 2, 1));
+    try testing.expectEqual(@as(u8, 0), t.moveCount(1, victim));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(1, victim, .access, 1, &buf));
+
+    // ONE hostile frame steals the entry. The steal is still accepted — real
+    // mobility is indistinguishable from it — but it is no longer SILENT: the
+    // caller is told it happened and the move is counted.
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 9, 2));
+    try testing.expectEqual(@as(u8, 1), t.moveCount(1, victim));
+    try testing.expectEqual(@as(?PeId, 9), t.lookup(1, victim, 2));
+
+    // The victim answers, the attacker steals again: the flap is now bounded.
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 2, 3));
+    try testing.expectEqual(@as(u8, 2), t.moveCount(1, victim));
+    try testing.expectEqual(LearnOutcome.duplicate_detected, try t.learn(1, victim, 9, 4));
+    try testing.expect(t.isQuarantined(1, victim));
+
+    // The refused move did not install the attacker, and the frame floods to
+    // every member instead of being unicast to whoever won the last race.
+    try testing.expect(t.lookup(1, victim, 4) == null);
+    try testing.expectEqualSlices(PeId, &.{ 2, 9 }, (try t.forward(1, victim, .access, 4, &buf)).flood);
+
+    // Nothing the attacker sends re-opens the entry, and sending does not
+    // EXTEND the quarantine either (its window start is pinned at detection).
+    var k: Time = 5;
+    while (k < 50) : (k += 5) {
+        try testing.expectEqual(LearnOutcome.denied_duplicate, try t.learn(1, victim, 9, k));
+        try testing.expect(t.lookup(1, victim, k) == null);
+    }
+    // Nor does ageing quietly reclaim the entry and hand the MAC straight back:
+    // at t=54 the entry is 51 ticks old against aging_ticks=10, yet the live
+    // quarantine outlives it.
+    t.tick(54);
+    try testing.expectEqual(@as(usize, 1), t.fdbCount(1));
+    try testing.expect(t.isQuarantined(1, victim));
+
+    // Past the window the MAC is learnable again, from scratch (self-healing —
+    // a quarantine is not a permanent black hole for a legitimate station).
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, victim, 2, 56));
+    try testing.expect(!t.isQuarantined(1, victim));
+    try testing.expectEqual(@as(u8, 0), t.moveCount(1, victim));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(1, victim, .access, 56, &buf));
+
+    // A static pin is above all of this: it is neither moved nor quarantined.
+    try t.learnStatic(1, victim, 2);
+    try testing.expectEqual(LearnOutcome.static_pinned, try t.learn(1, victim, 9, 60));
+    try testing.expectEqual(@as(?PeId, 2), t.lookup(1, victim, 60));
+}
+
+// Regression (audit F3 / P-10): the module documents tenant state as
+// "control-plane state the caller owns", but `learn` called `getOrCreateIsid`
+// unconditionally, so a data-plane frame carrying an I-SID nobody configured
+// allocated a fresh tenant slot (two hash maps). An attacker with no
+// control-plane access could therefore walk `max_isids` — the documented
+// worst-case footprint — entirely from received frames. The pre-fix test suite
+// only ever pinned the *cap*, never that an unconfigured I-SID is refused.
+test "data plane cannot create tenants: learn on an unconfigured I-SID is refused, not allocated" {
+    var t = Table.init(testing.allocator, .{ .max_isids = 4, .max_pes_per_isid = 4, .max_macs_per_isid = 4 });
+    defer t.deinit();
+
+    // The walk an attacker performs: novel I-SIDs, one frame each. Every one is
+    // refused, and — the part that matters — nothing is allocated for any of
+    // them. Before the fix the first 4 silently provisioned tenants and the
+    // rest failed with TooManyIsids, i.e. the budget was spent by traffic.
+    var isid: Isid = 1;
+    while (isid <= 100) : (isid += 1) {
+        try testing.expectError(error.UnknownIsid, t.learn(isid, macOf(@truncate(isid)), 7, 0));
+        try testing.expectEqual(@as(usize, 0), t.isidCount());
+    }
+    try testing.expectEqual(@as(usize, 0), t.fdbCount(1));
+    try testing.expectEqual(@as(usize, 0), t.memberCount(1));
+
+    // The control plane provisions; only then does the data plane learn. All
+    // three control-plane entry points create the slot.
+    try t.addIsid(1);
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, macOf(1), 7, 0));
+    try t.addMember(2, 5);
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(2, macOf(2), 5, 0));
+    try t.learnStatic(3, macOf(3), 6);
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(3, macOf(4), 6, 0));
+    try testing.expectEqual(@as(usize, 3), t.isidCount());
+
+    // Deprovisioning closes the door again (and frees the tenant's FDB).
+    try testing.expect(t.removeIsid(1));
+    try testing.expect(!t.removeIsid(1)); // idempotent
+    try testing.expectEqual(@as(usize, 2), t.isidCount());
+    try testing.expectError(error.UnknownIsid, t.learn(1, macOf(1), 7, 0));
 }
 
 test "ageing: fresh → unicast; past aging_ticks the entry is gone → flood; relearn refreshes" {
     var t = testTable();
     defer t.deinit();
     try t.addMember(4, 8);
-    try t.learn(4, macOf(0x88), 2, 1000); // learned at t=1000, aging=100
+    _ = try t.learn(4, macOf(0x88), 2, 1000); // learned at t=1000, aging=100
 
     var buf: [16]PeId = undefined;
     // t=1100: age exactly 100 == aging_ticks → still fresh (boundary).
@@ -679,7 +1012,7 @@ test "ageing: fresh → unicast; past aging_ticks the entry is gone → flood; r
     t.tick(1101);
     try testing.expectEqual(@as(usize, 0), t.fdbCount(4));
     // Relearn refreshes the age: fresh again well past the original expiry.
-    try t.learn(4, macOf(0x88), 2, 1101);
+    _ = try t.learn(4, macOf(0x88), 2, 1101);
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(4, macOf(0x88), .access, 1200, &buf));
 }
 
@@ -693,7 +1026,7 @@ test "static entry is never aged and not overwritten by dynamic learn" {
     t.tick(std.math.maxInt(Time));
     try testing.expectEqual(@as(usize, 1), t.fdbCount(5));
     // Dynamic learn does not move a static entry.
-    try t.learn(5, macOf(0x99), 7, 10);
+    _ = try t.learn(5, macOf(0x99), 7, 10);
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x99), .access, 10, &buf));
     // forget removes it.
     try testing.expect(t.forget(5, macOf(0x99)));
@@ -703,7 +1036,8 @@ test "static entry is never aged and not overwritten by dynamic learn" {
 test "learnStatic pins an already-dynamic entry: it stops ageing after the upgrade" {
     var t = testTable(); // aging_ticks = 100
     defer t.deinit();
-    try t.learn(6, macOf(0xAA), 2, 0); // dynamic, learned at t=0
+    try t.addIsid(6);
+    _ = try t.learn(6, macOf(0xAA), 2, 0); // dynamic, learned at t=0
     // Still dynamic: it would expire past the aging window.
     try testing.expect(t.lookup(6, macOf(0xAA), 1000) == null);
 
@@ -722,7 +1056,8 @@ test "isExpired clock-skew clamp: now before learned_at is treated as age 0 (fre
     defer t.deinit();
     // Learn "in the future" relative to a later query with a smaller `now`
     // (e.g. a clock adjustment). age must clamp to 0, never underflow.
-    try t.learn(7, macOf(0xBB), 2, 1_000);
+    try t.addIsid(7);
+    _ = try t.learn(7, macOf(0xBB), 2, 1_000);
     var buf: [16]PeId = undefined;
     const d = try t.forward(7, macOf(0xBB), .access, 10, &buf); // now(10) < learned_at(1000)
     try testing.expectEqual(Decision{ .unicast = 2 }, d);
@@ -733,20 +1068,21 @@ test "capacity: per-tenant MAC-flood is bounded; existing entries unaffected; re
     var t = testTable(); // max_macs_per_isid = 8, aging = 100
     defer t.deinit();
     // Fill the FDB to its cap with fresh entries at t=0.
+    try t.addIsid(6);
     var i: u8 = 0;
-    while (i < 8) : (i += 1) try t.learn(6, macOf(i), 2, 0);
+    while (i < 8) : (i += 1) _ = try t.learn(6, macOf(i), 2, 0);
     try testing.expectEqual(@as(usize, 8), t.fdbCount(6));
 
     // A 9th novel MAC while full and nothing expired → rejected, not grown.
     try testing.expectError(error.FdbFull, t.learn(6, macOf(200), 2, 0));
     try testing.expectEqual(@as(usize, 8), t.fdbCount(6));
     // An existing MAC is still refreshable while full (a move/refresh, no growth).
-    try t.learn(6, macOf(0), 3, 0);
+    _ = try t.learn(6, macOf(0), 3, 0);
     try testing.expectEqual(@as(usize, 8), t.fdbCount(6));
     try testing.expectEqual(@as(?PeId, 3), t.lookup(6, macOf(0), 0));
 
     // Once the table has aged out, learning reclaims and admits the new MAC.
-    try t.learn(6, macOf(201), 2, 1000); // at full + all others expired (age 1000>100)
+    _ = try t.learn(6, macOf(201), 2, 1000); // at full + all others expired (age 1000>100)
     // insertNewMac pruned the 8 expired entries, then inserted 201.
     try testing.expectEqual(@as(usize, 1), t.fdbCount(6));
     try testing.expectEqual(@as(?PeId, 2), t.lookup(6, macOf(201), 1000));
@@ -758,7 +1094,12 @@ test "capacity: I-SID and member caps are enforced" {
     try t.addMember(1, 10);
     try t.addMember(2, 10);
     try testing.expectError(error.TooManyIsids, t.addMember(3, 10)); // 3rd I-SID
-    try testing.expectError(error.TooManyIsids, t.learn(3, macOf(1), 10, 0));
+    try testing.expectError(error.TooManyIsids, t.addIsid(3)); // ditto, explicit
+    try testing.expectError(error.TooManyIsids, t.learnStatic(3, macOf(1), 10)); // ditto, control plane
+    // The data plane never gets as far as the I-SID cap: an unconfigured I-SID
+    // is refused before anything is allocated (it cannot create a tenant at all,
+    // so it cannot consume the budget either).
+    try testing.expectError(error.UnknownIsid, t.learn(3, macOf(1), 10, 0));
     // Member cap within an existing I-SID.
     try t.addMember(1, 11); // 2nd member of I-SID 1 (at cap now)
     try testing.expectError(error.TooManyMembers, t.addMember(1, 12));
@@ -770,7 +1111,7 @@ test "membership: add/remove/isMember; removeMember leaves the FDB intact" {
     var t = testTable();
     defer t.deinit();
     try t.addMember(9, 4);
-    try t.learn(9, macOf(0x01), 4, 0);
+    _ = try t.learn(9, macOf(0x01), 4, 0);
     try testing.expect(t.isMember(9, 4));
     t.removeMember(9, 4);
     try testing.expect(!t.isMember(9, 4));
@@ -866,7 +1207,7 @@ test "deinit frees all nested membership + FDB maps (leak check via testing.allo
         try t.addMember(isid, 1);
         try t.addMember(isid, 2);
         var m: u8 = 0;
-        while (m < 4) : (m += 1) try t.learn(isid, macOf(m), 1, 0);
+        while (m < 4) : (m += 1) _ = try t.learn(isid, macOf(m), 1, 0);
         try t.learnStatic(isid, macOf(0xFE), 2);
     }
     try testing.expectEqual(@as(usize, 5), t.isidCount());
@@ -910,4 +1251,16 @@ test "external anchor: our default aging_ticks matches a live kernel bridge's de
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "external anchor: our MAC-move defaults are RFC 7432 §15.1's stated N and M" {
+    // Not a style assertion. Every duplicate-MAC test below configures its own
+    // small N so it can trip the limit in a few calls, which leaves the shipped
+    // defaults pinned by nothing: raising `max_mac_moves` to 255 keeps the whole
+    // suite green while making the hijack refusal practically unreachable.
+    // RFC 7432 §15.1 states M = 180 and N = 5; those are the numbers a reader of
+    // the doc comment above is entitled to get.
+    const d: Options = .{};
+    try testing.expectEqual(@as(u8, 5), d.max_mac_moves);
+    try testing.expectEqual(@as(Time, 180), d.mac_move_window);
 }

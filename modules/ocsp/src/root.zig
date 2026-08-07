@@ -651,6 +651,10 @@ pub const VerifyError = error{
     UnsupportedResponseType,
     /// The response, issuer cert, or a responder cert failed bounds-safe decode.
     Malformed,
+    /// `subject_cert_der`'s `issuer` Name is not `issuer_cert_der`'s `subject`
+    /// Name — the two certificates are not a chain, so no CertID computed from
+    /// this issuer can be an answer *about this subject*.
+    IssuerMismatch,
     /// No authorized responder: neither the issuer (by name/key) nor a
     /// delegated cert that is issuer-signed.
     UntrustedResponder,
@@ -676,7 +680,9 @@ pub const VerifyError = error{
 
 /// Verify a parsed OCSP response and return the subject certificate's status.
 ///
-/// `issuer_cert_der` is the trusted issuer of `subject_cert_der` (both DER).
+/// `issuer_cert_der` is the trusted issuer of `subject_cert_der` (both DER);
+/// that claim is *checked*, not assumed — a pair that is not a chain is
+/// `error.IssuerMismatch`.
 /// The order of checks is security-significant: the responder is authorized and
 /// the `tbsResponseData` signature is verified BEFORE any SingleResponse
 /// content is trusted; the CertID binding then confirms the response applies to
@@ -692,6 +698,24 @@ pub fn verify(
 
     const issuer = parseCert(issuer_cert_der) catch return error.Malformed;
     const subject = parseCert(subject_cert_der) catch return error.Malformed;
+
+    // ── 0. The subject↔issuer link ──
+    // A `CertID` (RFC 6960 §4.1.1) names a certificate by
+    // (issuerNameHash, issuerKeyHash, serialNumber) — it carries no field that
+    // identifies the subject certificate on its own. `certIdBinds` therefore
+    // binds those hashes to the issuer the CALLER supplied and the serial to
+    // the subject the CALLER supplied. If that pair is not actually a chain,
+    // the (issuer, serial) the response answers for is a *different*
+    // certificate than `subject_cert_der`, and the verdict below would be a
+    // confident statement about that other certificate. Reject up front.
+    //
+    // The comparison is byte-exact over the DER-encoded Name TLVs, i.e. no
+    // RFC 5280 §7.1 name canonicalization: two Names that are semantically
+    // equal but not byte-identical are refused. That direction is fail-closed
+    // (a real chain built by a conforming CA re-encodes the issuer Name
+    // verbatim, which is also what the CertID's issuerNameHash requires), so
+    // strictness here can only reject, never accept.
+    if (!std.mem.eql(u8, subject.issuer_name, issuer.subject_name)) return error.IssuerMismatch;
 
     // ── 1. Resolve the authorized responder key ──
     var responder_algo: PubKeyAlgo = undefined;

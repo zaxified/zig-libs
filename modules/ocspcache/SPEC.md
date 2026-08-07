@@ -82,10 +82,12 @@ a step:
    core (responder authorization, signature verification, CertID binding,
    freshness, nonce if used): any rejection is `VerifyFailed`. **No response
    is cached or ever handed to `getStapled` without passing this.**
-6. Only a verified `Verdict.status == .good` is cached
-   (`CertNotGood` otherwise) — a verified-but-`revoked`/`unknown` response is
-   never stapled; the caller (not this module) decides what a revoked
-   server certificate means for its own operation.
+6. Only a verified `Verdict.status == .good` is cached. A verified `revoked`
+   returns `CertRevoked` **and evicts any cached entry** (see "Soft-fail"); a
+   verified `unknown` returns `CertStatusUnknown` and leaves the cache alone.
+   Neither is ever stapled; the caller (not this module) decides what a
+   revoked server certificate means for its own operation, but it can tell
+   the two apart — and apart from a mere outage — from the error alone.
 7. `Config.max_entries` bounds the number of distinct certificates cached
    (`CacheFull`) — a production TLS server serves a handful of its own
    certificates, not an open-ended set.
@@ -105,8 +107,9 @@ by construction, no older than `max_age_seconds`).
   `now_unix > nextUpdate - Config.refresh_margin_seconds` — the signal a
   scheduler uses to call `refresh` proactively, well before the cached
   response actually expires, so a replacement is normally ready in time.
-- `getStapled(subject, now_unix)` returns the cached DER only while
-  `now_unix <= nextUpdate` — past that point it returns `null` even if
+- `getStapled(gpa, subject, now_unix)` returns a **caller-owned copy** of the
+  cached DER (never a borrow of cache storage — see "Staple ownership") only
+  while `now_unix <= nextUpdate` — past that point it returns `null` even if
   `refresh` has never been retried, rather than staple a response known to
   be outside its validity window. This is a deliberate reading of the task's
   "or null if none-fresh": staleness is checked against the *actual*
@@ -115,8 +118,8 @@ by construction, no older than `max_age_seconds`).
 
 ## Soft-fail posture
 
-A responder outage, a `tryLater`, a malformed reply, or a single
-unverifiable fetch must never evict a still-valid cached response — that
+A responder outage, a `tryLater`, a malformed reply, an `unknown` status, or
+a single unverifiable fetch must never evict a still-valid cached response — that
 would turn a transient responder problem into an unnecessary stapling
 outage. `Cache.refresh` enforces this structurally, not by exception
 handling: the cache map (`entries`) is mutated in exactly one place, at the
@@ -128,6 +131,33 @@ outcome — they only ever look at what's actually in the cache and
 a response valid until 6pm, `getStapled` keeps returning it, unaffected,
 right up until 6pm; only past actual expiry does it start returning `null`,
 regardless of how many failed refresh attempts came before.
+
+**The one exception — a verified `revoked`.** Soft-fail exists so that a
+failure to *learn* anything does not become a stapling outage. A verified
+`revoked` is not that: it is the CA's authenticated statement that the
+certificate is dead, and it arrives through the same `ocsp.verify` that every
+accepted response passes. Treating it like an outage would mean the cached
+`good` response keeps being stapled for the remainder of its own `nextUpdate`
+window — days, given the shipped 12-hour refresh margin against a typical
+week-long OCSP validity — after revocation was positively proven. So
+`refresh` evicts the entry and returns `CertRevoked`, which is a distinct
+error from every "could not get an answer" outcome. `Cache.invalidate` exposes
+the same eviction for a revocation learned out of band (a CRL, a CA notice).
+
+## Staple ownership
+
+`getStapled` returns bytes the caller owns and frees, allocated from an
+allocator the caller passes. It is deliberately not a view into the cache's
+own storage: the next successful `refresh` for that certificate frees exactly
+the buffer it replaces (and a `CertRevoked` refresh frees it outright), and
+the caller holding a staple is a TLS server whose refresh scheduler runs
+independently of its handshakes by design — `needsRefresh` exists precisely to
+make it do so. A borrow would therefore dangle with no ordering rule the
+caller could have followed, and the bytes in question are written into a live
+`status_request` extension, so the failure mode is freed heap on the wire, not
+just a crash. The copy costs a couple of kilobytes of memcpy against a
+handshake that already does asymmetric crypto; callers with a per-connection
+arena pay nothing to free it.
 
 ## Cache keying and bounds
 

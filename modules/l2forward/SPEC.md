@@ -16,8 +16,18 @@ tenant's isolated forwarding state:
 - **members** — `AutoHashMapUnmanaged(PeId, void)`, a set of remote PEs the
   caller populates from the control plane (SPB I-SID TLVs / EVPN imports). This
   module never learns membership from data-plane frames.
+- **the tenant slot itself** is control-plane state on exactly the same footing.
+  Only `addIsid` (explicit provisioning, for a legitimately member-less
+  single-PE I-SID), `addMember` and `learnStatic` create an `IsidEntry`;
+  `removeIsid` drops one. The data-plane entry point `learn` **cannot**: an
+  I-SID the caller never configured is refused with `error.UnknownIsid` and
+  allocates nothing. Before 2026-08-07 `learn` called `getOrCreateIsid`
+  unconditionally, which contradicted the sentence above it and let an attacker
+  with no control-plane access walk the `max_isids` budget from received frames
+  alone (audit finding F3).
 - **fdb** — `AutoHashMapUnmanaged(Mac, FdbEntry)`, the 802.1D-style learning
-  table. `FdbEntry = { pe: PeId, learned_at: Time, static: bool }`. Ageing is
+  table. `FdbEntry = { pe: PeId, learned_at: Time, move_window_start: Time,
+  moves: u8, static: bool, duplicate: bool }`. Ageing is
   *derived* from `learned_at` versus the caller-supplied `now` (a comparison,
   never an owned countdown), exactly the pattern the sibling `isis-lsdb` /
   `ramcache` use for time-injected freshness.
@@ -101,14 +111,44 @@ full member set**, not tree-pruned replication; a loop-free tree is out of scope
 by design (deferred list). `l2encap`'s SPEC carried the same "honest scope"
 paragraph and was corrected alongside this one.
 
-## MAC-move policy
+## MAC-move policy (EVPN RFC 7432 §15)
 
-Re-learning a MAC already present and **dynamic** overwrites its `pe` and
-refreshes `learned_at` — last-writer-wins / accept-move. It is one entry, not a
-second; no flap dampening or move-rate limiting is applied here (that is a
-deferred anti-flap concern). A MAC pinned **static** is not moved by dynamic
-learning (the static entry wins, silently); `learnStatic` itself overwrites
-whatever was there, and `forget` deletes either kind.
+Re-learning a MAC already present and **dynamic** behind a *different* PE is a
+**move**. It is one entry, not a second. A move is not an anti-flap/stability
+concern here, it is a **security** one: the frame that causes it is
+unauthenticated data-plane input, so a spoofed source MAC redirects a station's
+entire unicast flow to the attacker's PE. Until 2026-08-07 `learn` was plain
+last-writer-wins returning `void` — no counter, no limit, no notification — so
+one hostile frame stole a binding permanently and silently (audit finding F5).
+The policy now:
+
+- **`learn` returns a `LearnOutcome`**, never `void`: `.learned`, `.refreshed`,
+  `.moved`, `.duplicate_detected`, `.denied_duplicate`, `.static_pinned`. A move
+  is therefore always reported to the caller, which owns the policy response
+  (alarm, ACL, pin with `learnStatic`). `moveCount` / `isQuarantined` expose the
+  same state for inspection.
+- **Moves are counted** per entry over a sliding window. The move that reaches
+  `Options.max_mac_moves` (default 5) within `Options.mac_move_window` (default
+  180 — RFC 7432 §15's stated N/M defaults) is **refused**, and the MAC is
+  **quarantined**.
+- **A quarantine means "nobody's binding is trusted"**, not "freeze the current
+  one": `lookup`/`forward` report a miss, so the MAC floods to every member PE —
+  which still reaches the real station — until the window lapses. Freezing
+  instead would hand the attacker a permanent lock on whatever it had just
+  stolen. The quarantine's window start is pinned at detection, so continuing to
+  send cannot extend it, and a live quarantine also survives ageing/`tick` (else
+  reclamation would erase the flag and return the MAC to the attacker). `forget`
+  and `learnStatic` clear it immediately; after the window a fresh `learn`
+  re-establishes the MAC from scratch, so a legitimate station is never
+  permanently black-holed.
+- A MAC pinned **static** is not moved and never quarantined (`.static_pinned`,
+  silent, no error); `learnStatic` itself overwrites whatever was there
+  (including a quarantined entry), and `forget` deletes either kind.
+
+Residual: within `max_mac_moves - 1` moves per window an attacker still wins the
+binding it stole, exactly as a real bridge does — that race is not decidable
+without per-frame authentication (see the boundary note below). What the module
+guarantees is that it is *bounded* and *reported*, never silent or permanent.
 
 ## Ageing model
 
@@ -148,6 +188,15 @@ spraying novel source MACs to exhaust memory. Bounds, all hard:
   **`max_pes_per_isid`** bounds membership per tenant (and thus the maximum flood
   fan-out / replication-buffer size). A new I-SID beyond the cap →
   `error.TooManyIsids`; a new member beyond the cap → `error.TooManyMembers`.
+- **Only the control plane can spend the `max_isids` budget.** `learn` refuses an
+  unconfigured I-SID (`error.UnknownIsid`) instead of creating one, so the
+  worst-case footprint below is a function of what the *operator* provisioned,
+  never of received traffic. This matters because that footprint is large by
+  construction — at the defaults `max_isids × max_macs_per_isid` is 4096 × 8192
+  FDB entries — and reaching it must require control-plane access.
+- **`max_mac_moves` / `mac_move_window`** bound MAC *churn* rather than memory:
+  a flapping MAC costs no extra entry, and duplicate detection stops an endless
+  hijack loop (see the MAC-move policy).
 
 Total worst-case footprint is therefore `max_isids × max_macs_per_isid` FDB
 entries + `max_isids × max_pes_per_isid` membership entries — a fixed ceiling the
@@ -157,8 +206,12 @@ operator sets, never a function of received traffic.
 trusts the frames the fabric hands it; an attacker who can inject authenticated
 in-tunnel frames can poison learning (a spoofed source MAC learned behind the
 wrong PE) within the same fabric trust as any other in-tunnel byte. Per-frame
-authentication and MAC-pinning policy beyond the `static` flag are the caller's /
-control plane's concern (deferred list).
+authentication is the caller's / control plane's concern (deferred list). What
+this table does owe such an attacker is that the damage is **bounded and
+visible** rather than unlimited and silent — hence: no tenant creation from the
+data plane, per-tenant FDB caps, counted moves reported through `LearnOutcome`,
+and duplicate-MAC quarantine. MAC-pinning *policy* on top of those signals
+(which MACs to `learnStatic`, when to alarm) stays the caller's.
 
 ## Deliberately deferred (out of scope by design, not oversight)
 
@@ -168,9 +221,12 @@ control plane's concern (deferred list).
 - **Loop-free BUM distribution trees / reverse-path-forwarding check** — this
   module does simple ingress replication to the full member set; a pruned
   loop-free tree is a control-plane computation (`loopfree-reconv` / SPB tree).
-- **MAC mobility / anti-flap dampening** — move-rate limiting, flap suppression,
-  sequence-number arbitration (EVPN MAC mobility extended community). `learn` is
-  plain last-writer-wins.
+- **MAC-mobility *arbitration* across PEs** — the EVPN MAC-mobility extended
+  community's sequence number, i.e. deciding which PE's advertisement wins in the
+  *control plane*. Local duplicate-MAC detection (RFC 7432 §15's N-moves-in-M
+  rule) is **not** deferred any more — it is implemented, see the MAC-move policy
+  above. What remains out of scope is the inter-PE signalling that carries the
+  verdict, plus flap dampening of the control-plane churn itself.
 - **ARP/ND suppression & proxy-ARP** — answering ARP/ND from the FDB to cut BUM
   flooding is a higher-layer optimization, not modelled.
 - **The frame itself** — encap/decap, TTL, fragmentation, encryption are
@@ -189,7 +245,14 @@ all of `{2,3,4}` ascending; core BUM → nobody; `BufferTooSmall`); a hostile-pe
 test that no claimed `ingress_pe` — member, non-member or edge value — buys a
 relay; a 4-PE fabric composition test that one access broadcast produces exactly
 3 copies and stops at hop 1; tenant
-isolation; MAC move (last-writer-wins, one entry); ageing (boundary fresh/expired,
+isolation; MAC move (accepted, one entry); a MAC-hijack regression test — a move
+is reported as `.moved` and counted, a flapping MAC is quarantined at
+`max_mac_moves` (the refused move is *not* installed, the MAC floods to every
+member instead, sending more neither extends the quarantine nor lets ageing
+reclaim it, and the window's expiry re-opens learning); a tenant-provisioning
+regression test — 100 unconfigured I-SIDs presented from the data plane are each
+refused with `UnknownIsid` while `isidCount()` stays 0, and `addIsid` /
+`addMember` / `learnStatic` / `removeIsid` open and close the door; ageing (boundary fresh/expired,
 lazy miss + `tick` reclaim, re-learn refresh) and static-entry immunity; the
 per-tenant MAC-flood bound (`FdbFull` after reclaim, existing entries + moves
 still served) and I-SID/member caps; determinism (identical `(ops, now)` →

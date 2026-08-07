@@ -27,12 +27,15 @@
 //!     `Config.fetch_method`), and — **only if** `ocsp.verify` accepts the
 //!     response AND its status is `good` — caches the raw response bytes.
 //!     Every other outcome (unreachable responder, `tryLater`, a tampered or
-//!     unverifiable response, a `revoked`/`unknown` status) returns a typed
-//!     error and leaves any existing cache entry **untouched** — the
-//!     soft-fail stapling posture (see SPEC.md).
-//!   - `getStapled(subject, now_unix)` returns the cached raw OCSP-response
-//!     DER to staple, or `null` if there is no entry or it has genuinely
-//!     expired (`now_unix > nextUpdate`).
+//!     unverifiable response, an `unknown` status) returns a typed error and
+//!     leaves any existing cache entry **untouched** — the soft-fail stapling
+//!     posture (see SPEC.md). The single exception is a verified `revoked`
+//!     (`error.CertRevoked`), which **evicts** the entry: that is an
+//!     authenticated answer, not a failure to get one.
+//!   - `getStapled(gpa, subject, now_unix)` returns a caller-owned copy of the
+//!     cached raw OCSP-response DER to staple, or `null` if there is no entry
+//!     or it has genuinely expired (`now_unix > nextUpdate`).
+//!   - `invalidate(subject)` drops a cached response on demand.
 //!   - `needsRefresh(subject, now_unix)` — whether a scheduler should call
 //!     `refresh` now: absent, or within `Config.refresh_margin_seconds` of
 //!     `nextUpdate`, so a fresh response is ready before the cached one
@@ -312,18 +315,38 @@ pub const RefreshError = error{
     /// `ocsp.verify` rejected the response (bad signature, untrusted
     /// responder, CertID mismatch, stale, nonce mismatch, ...).
     VerifyFailed,
-    /// The response verified but the certificate's status is not `good`
-    /// (revoked or unknown) — not cached/stapled; the caller decides policy.
-    CertNotGood,
+    /// The response verified and says the certificate is **revoked**. This is
+    /// positive, cryptographically authenticated evidence about the
+    /// certificate — categorically unlike every other error in this set, all
+    /// of which mean "could not obtain an answer". Any cached response for
+    /// this certificate has therefore been **evicted** (the soft-fail rule
+    /// below does not apply), and `getStapled` will return `null` until a
+    /// later `refresh` produces a fresh `good` answer.
+    CertRevoked,
+    /// The response verified and says the responder does not know this
+    /// certificate (RFC 6960 `unknown`). Unlike `CertRevoked` this is *not*
+    /// evidence of revocation — it is the responder disclaiming knowledge —
+    /// so it is treated as a failure to obtain an answer: nothing is cached,
+    /// and an existing entry is left alone (soft-fail, see below).
+    CertStatusUnknown,
     /// `Config.max_entries` reached and this cert isn't already cached.
     CacheFull,
     OutOfMemory,
 };
 
-/// Every path above that returns an error leaves any existing cache entry
-/// for this certificate **completely untouched** — this is the soft-fail
-/// stapling posture (see SPEC.md "Soft-fail"): a responder outage or a
-/// single bad fetch never evicts a still-valid cached response.
+/// Every path above that returns an error leaves any existing cache entry for
+/// this certificate **completely untouched** — this is the soft-fail stapling
+/// posture (see SPEC.md "Soft-fail"): a responder outage or a single bad fetch
+/// never evicts a still-valid cached response.
+///
+/// `error.CertRevoked` is the one deliberate exception, and it is not a hole
+/// in the rule but the point of it: soft-fail exists so that a *failure to
+/// learn anything* does not cause a stapling outage. A verified `revoked` is
+/// not a failure to learn anything — it is the CA's signed statement that the
+/// certificate is dead. Conflating the two would mean a previously cached
+/// `good` response keeps being stapled for the rest of its `nextUpdate` window
+/// (up to days, with typical CA validity periods) after revocation was
+/// positively proven. So that single case evicts.
 pub const Cache = struct {
     gpa: std.mem.Allocator,
     transport: Transport,
@@ -345,10 +368,47 @@ pub const Cache = struct {
     /// `null` if there is no entry, or the entry has genuinely expired
     /// (`now_unix > nextUpdate`) — never staple a response known to be past
     /// its validity window, even as a soft-fail fallback.
-    pub fn getStapled(self: *Cache, subject_cert_der: []const u8, now_unix: i64) ?[]const u8 {
+    ///
+    /// ## Ownership: the caller owns the returned bytes
+    ///
+    /// The result is a fresh `gpa`-owned copy, **not** a view into the cache's
+    /// own storage, and the caller frees it. That is a deliberate contract,
+    /// not a convenience:
+    ///
+    /// A borrow would be invalidated by the very next `refresh` for the same
+    /// certificate, which frees exactly the buffer it replaces — and the
+    /// caller that holds a staple is a TLS server whose refresh scheduler runs
+    /// concurrently with its handshakes by design. The resulting dangling
+    /// slice is not merely a crash risk: those bytes are copied into the
+    /// `status_request` extension of a live handshake, so freed heap would be
+    /// transmitted to an unauthenticated peer. There is no lifetime rule a
+    /// caller could follow to make a borrow safe here short of "never refresh
+    /// while a handshake is in flight", which defeats the module's purpose.
+    ///
+    /// The copy is cheap where it is spent: a staple is a couple of kilobytes
+    /// and is memcpy'd into the handshake buffer regardless, next to a
+    /// handshake's own asymmetric-crypto cost. Callers with a per-connection
+    /// arena can pass it here and never free at all.
+    pub fn getStapled(
+        self: *Cache,
+        gpa: std.mem.Allocator,
+        subject_cert_der: []const u8,
+        now_unix: i64,
+    ) error{OutOfMemory}!?[]u8 {
         const entry = self.entries.get(keyOf(subject_cert_der)) orelse return null;
         if (now_unix > entry.next_update_unix) return null;
-        return entry.response_der;
+        return try gpa.dupe(u8, entry.response_der);
+    }
+
+    /// Drop any cached response for `subject_cert_der`, returning whether
+    /// there was one. `refresh` calls this itself on a verified `revoked`;
+    /// it is public so an operator that learns of a revocation out of band
+    /// (a CRL, a CA notification) can stop stapling immediately instead of
+    /// waiting out the cached response's `nextUpdate`.
+    pub fn invalidate(self: *Cache, subject_cert_der: []const u8) bool {
+        const entry = self.entries.fetchRemove(keyOf(subject_cert_der)) orelse return false;
+        self.gpa.free(entry.value.response_der);
+        return true;
     }
 
     /// Whether a scheduler should call `refresh` now: no cached entry, or
@@ -408,7 +468,22 @@ pub const Cache = struct {
             .max_age_seconds = self.config.max_age_seconds,
         }) catch return error.VerifyFailed;
 
-        if (verdict.status != .good) return error.CertNotGood;
+        switch (verdict.status) {
+            .good => {},
+            // Authenticated proof the certificate is dead. Everything else in
+            // `RefreshError` means "no answer"; this one is an answer, so the
+            // soft-fail rule must not cover it — otherwise the stale `good`
+            // entry keeps being stapled until its own `nextUpdate`, which for
+            // a typical 7-day OCSP validity is days of stapling a response the
+            // CA has already contradicted.
+            .revoked => {
+                _ = self.invalidate(subject_cert_der);
+                return error.CertRevoked;
+            },
+            // "I don't know this certificate" is not proof of anything about
+            // it, so this stays on the soft-fail side: cache untouched.
+            .unknown => return error.CertStatusUnknown,
+        }
 
         const next_update = verdict.next_update_unix orelse (verdict.this_update_unix + self.config.max_age_seconds);
         const key = keyOf(subject_cert_der);
@@ -664,7 +739,7 @@ fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
     };
 
     cache.refresh(&goldens.godaddy_leaf_der, &goldens.godaddy_issuer_der, now) catch {};
-    _ = cache.getStapled(&goldens.godaddy_leaf_der, now);
+    if (cache.getStapled(a, &goldens.godaddy_leaf_der, now) catch null) |s| a.free(s);
     _ = cache.needsRefresh(&goldens.godaddy_leaf_der, now);
 
     // A fuzzed subject/issuer pair too — the request-building side.
@@ -706,7 +781,8 @@ test "the ocspcache fuzz harnesses reach the AIA walk and ocsp.verify (reachabil
         var cache = Cache.init(a, mock.transport(), .{});
         defer cache.deinit();
         try cache.refresh(&goldens.godaddy_leaf_der, &goldens.godaddy_issuer_der, goldens.now_unix);
-        try testing.expect(cache.getStapled(&goldens.godaddy_leaf_der, goldens.now_unix) != null);
+        const staple = (try cache.getStapled(a, &goldens.godaddy_leaf_der, goldens.now_unix)).?;
+        a.free(staple);
     }
 
     // 4. And both harness bodies run to completion on fixed input.

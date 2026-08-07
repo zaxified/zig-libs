@@ -62,10 +62,15 @@ switch (verdict.status) {
   `sig_alg_oid`, `signature`, `certs`, `nonce`).
 - `verify(response, issuer_cert_der, subject_cert_der, VerifyOptions) VerifyError!Verdict`
   — `Verdict{ status: CertStatus, responder: Responder, delegated: bool,
-  this_update_unix, next_update_unix, produced_at_unix }`.
+  this_update_unix, next_update_unix, produced_at_unix }`. That
+  `issuer_cert_der` really issued `subject_cert_der` is **checked**, not
+  assumed (`IssuerMismatch`): a `CertID` names a certificate only as
+  (issuer, serial), so a mismatched pair would yield a confident verdict about
+  a different certificate.
 - Error sets `BuildRequestError`, `ParseError`, `VerifyError` — every failure
-  mode is typed (bad signature, CertID mismatch, stale/not-yet-valid, untrusted
-  responder, missing OCSPSigning EKU, nonce mismatch, malformed, …).
+  mode is typed (subject/issuer not a chain, bad signature, CertID mismatch,
+  stale/not-yet-valid, untrusted responder, missing OCSPSigning EKU, nonce
+  mismatch, malformed, …).
 
 - **Model after:** RFC 6960 (OCSP). Built on this repo's `x509` (DER reader +
   `id-kp-OCSPSigning` EKU check), `rsa` (RFC 8017 PKCS#1 v1.5 verify) and

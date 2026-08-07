@@ -434,13 +434,15 @@ test "golden: Cache.refresh fetches, verifies (real delegated responder) and cac
     try cache.refresh(&godaddy_leaf_der, &godaddy_issuer_der, now_unix);
     try testing.expectEqual(@as(usize, 1), mock.calls);
 
-    const staple = cache.getStapled(&godaddy_leaf_der, now_unix).?;
+    const staple = (try cache.getStapled(gpa, &godaddy_leaf_der, now_unix)).?;
+    defer gpa.free(staple);
     try testing.expectEqualSlices(u8, &godaddy_response_der, staple);
 
     // Past the real nextUpdate, the cached response is no longer servable.
-    try testing.expect(cache.getStapled(&godaddy_leaf_der, next_update_unix + 1) == null);
+    try testing.expect((try cache.getStapled(gpa, &godaddy_leaf_der, next_update_unix + 1)) == null);
     // At/just before it, still servable — the exact captured validity window.
-    try testing.expect(cache.getStapled(&godaddy_leaf_der, next_update_unix) != null);
+    const at_boundary = (try cache.getStapled(gpa, &godaddy_leaf_der, next_update_unix)).?;
+    gpa.free(at_boundary);
 }
 
 test "golden: buildRequest against the real leaf/issuer pair is a well-formed OCSPRequest" {

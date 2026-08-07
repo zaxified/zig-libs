@@ -95,8 +95,20 @@ unknown-unicast case is decided inside `forward` against the FDB.
 
 ## MAC-move & capacity (the DoS bound)
 
-- **MAC move** — re-learning a MAC now seen from a different PE updates the entry
-  in place (last-writer-wins / accept-move); it is one entry, not two.
+- **MAC move — reported and counted** (EVPN RFC 7432 §15). Re-learning a MAC now
+  seen from a different PE updates the entry in place; it is one entry, not two.
+  But the frame that causes a move is unauthenticated, so a move is a possible
+  **hijack**, not just mobility: `learn` therefore returns a `LearnOutcome`
+  (`.moved` and friends) so the caller is always told, and counts moves. The move
+  that reaches `Options.max_mac_moves` (default 5) inside
+  `Options.mac_move_window` (default 180) is **refused** and the MAC is
+  **quarantined** — no binding is trusted, so it floods to every member PE (which
+  still reaches the real station) until the window lapses. `moveCount` /
+  `isQuarantined` expose the state; `forget` / `learnStatic` clear it.
+- **The data plane cannot create tenants** — `learn` refuses an I-SID the control
+  plane never configured (`error.UnknownIsid`) and allocates nothing for it. Only
+  `addIsid` / `addMember` / `learnStatic` provision a tenant slot, so received
+  traffic can never spend the `max_isids` budget.
 - **MAC-flood bound** — the learning table is capped **per tenant** by
   `Options.max_macs_per_isid`. When a tenant's FDB is full, `learn` first
   reclaims that tenant's expired entries; if still full a *new* MAC is rejected
@@ -118,12 +130,19 @@ order — both pinned by permanent tests.
 ## API
 
 - `Table.init(alloc, options) Table` / `deinit()` — `Options` carries the caps
-  (`max_isids`, `max_pes_per_isid`, `max_macs_per_isid`) and `aging_ticks`.
+  (`max_isids`, `max_pes_per_isid`, `max_macs_per_isid`), `aging_ticks` and the
+  MAC-mobility limits (`max_mac_moves`, `mac_move_window`).
+- `addIsid(isid) !void` / `removeIsid(isid) bool` — control-plane tenant
+  provisioning (a tenant may legitimately have no members).
 - `addMember(isid, pe) !void` / `removeMember(isid, pe)` / `isMember(...) bool` /
   `memberCount(isid) usize` — control-plane-populated membership.
-- `learn(isid, mac, pe, now) !void` — dynamic learning (refresh + accept-move);
-  `learnStatic(isid, mac, pe) !void` — pinned, never-aged; `forget(isid, mac)
-  bool` — delete.
+- `learn(isid, mac, pe, now) !LearnOutcome` — dynamic learning; the outcome
+  (`.learned` / `.refreshed` / `.moved` / `.duplicate_detected` /
+  `.denied_duplicate` / `.static_pinned`) is the caller's hijack notification and
+  is not optional to think about. `learnStatic(isid, mac, pe) !void` — pinned,
+  never-aged, never quarantined; `forget(isid, mac) bool` — delete.
+- `moveCount(isid, mac) u8` / `isQuarantined(isid, mac) bool` — MAC-mobility
+  state.
 - `lookup(isid, mac, now) ?PeId` — the PE a known unicast would take, or null.
 - `forward(isid, dst, ingress, now, out) !Decision` — the forward decision;
   `replicationSet(isid, ingress, out) ![]const PeId` — the replication set
@@ -144,7 +163,13 @@ learn→forward and its unknown-unicast fallback; full-mesh split horizon
 test that a lying/absent `ingress_pe` buys no relay; a 4-PE fabric composition
 test that one access broadcast yields exactly 3 copies and dies at hop 1
 (pre-fix: `(N−1)(N−2)^(k−1)`, bounded only by TTL); tenant
-isolation (a MAC in I-SID A is unknown in B); MAC move (last-writer-wins);
+isolation (a MAC in I-SID A is unknown in B); MAC move (one entry, reported);
+a **MAC-hijack** test (a move is reported and counted; a flapping MAC is
+quarantined, the refused move is not installed, it floods instead of being
+unicast to the thief, sending more neither extends the quarantine nor lets
+ageing reclaim it, and the window's expiry re-opens learning); a
+**tenant-provisioning** test (100 unconfigured I-SIDs from the data plane are
+each refused with `UnknownIsid` and `isidCount()` stays 0);
 ageing (fresh at the boundary, gone past it, `tick` reclaims, re-learn
 refreshes) and static entries; the per-tenant MAC-flood bound (`FdbFull` after a
 reclaim attempt, existing entries unaffected) plus I-SID/member caps;

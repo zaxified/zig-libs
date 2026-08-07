@@ -45,15 +45,24 @@ defer cache.deinit();
 
 // Periodically (your own scheduler — this module has no timer/clock):
 if (cache.needsRefresh(my_leaf_cert_der, now_unix)) {
-    cache.refresh(my_leaf_cert_der, my_issuer_cert_der, now_unix) catch |err| {
-        // Soft-fail: log `err` and move on — any still-valid cached
-        // response keeps being served by getStapled below regardless.
+    cache.refresh(my_leaf_cert_der, my_issuer_cert_der, now_unix) catch |err| switch (err) {
+        // A verified `revoked` is the CA's signed statement that this
+        // certificate is dead; the cache entry has already been evicted, so
+        // getStapled below returns null from here on. Soft-fail does NOT
+        // apply — this is an answer, not a failure to get one.
+        error.CertRevoked => stopServingThisCertificate(),
+        // Everything else: log and move on — any still-valid cached response
+        // keeps being served by getStapled below regardless.
+        else => {},
     };
 }
 
 // In the TLS handshake path (wiring the bytes into status_request is the
 // TLS server's job — out of scope here):
-if (cache.getStapled(my_leaf_cert_der, now_unix)) |ocsp_response_der| {
+// The staple is a copy the caller owns (a borrow would dangle the moment the
+// scheduler above ran a refresh). A per-connection arena works well here.
+if (try cache.getStapled(handshake_gpa, my_leaf_cert_der, now_unix)) |ocsp_response_der| {
+    defer handshake_gpa.free(ocsp_response_der);
     // staple `ocsp_response_der`
 }
 ```
@@ -69,7 +78,8 @@ if (cache.getStapled(my_leaf_cert_der, now_unix)) |ocsp_response_der| {
   - `buildGetUrl(gpa, responder_url, req_der) ![]u8` — RFC 6960 Appendix
     A.1.1 GET-form URL, reserved base64 characters percent-encoded.
 - `Cache` — `init(gpa, transport, Config) Cache`, `deinit()`.
-  - `getStapled(subject_cert_der, now_unix) ?[]const u8`
+  - `getStapled(gpa, subject_cert_der, now_unix) !?[]u8` — caller owns the result
+  - `invalidate(subject_cert_der) bool`
   - `needsRefresh(subject_cert_der, now_unix) bool`
   - `refresh(subject_cert_der, issuer_cert_der, now_unix) RefreshError!void`
 - `Config` — `hash` (CertID hash algo), `fetch_method` (`.post`/`.get`),

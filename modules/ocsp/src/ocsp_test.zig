@@ -87,6 +87,50 @@ const RsaFixture = struct {
     }
 };
 
+/// Build a leaf certificate genuinely ISSUED BY `issuer_name` (i.e. its
+/// `issuer` field is the CA's `subject` Name), signed with the CA key.
+/// `rsa.selfSignedCert` cannot express this — it writes one Name into both
+/// slots — so the leaf is assembled here from the module's own DER writer.
+/// This is what makes the fixture a real chain, which `ocsp.verify`'s
+/// subject↔issuer check requires.
+fn buildLeafCert(
+    gpa: std.mem.Allocator,
+    issuer_sk: rsa.SecretKey,
+    issuer_name: []const u8,
+    leaf_spki: []const u8,
+    leaf_cn: []const u8,
+    serial_raw: []const u8,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+
+    const version = try b.explicit(0, try b.integerU8(2)); // v3
+    const serial = try b.integerRaw(serial_raw);
+    const sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
+    const validity = try b.seq(&.{
+        try b.tlv(0x17, "200101000000Z"),
+        try b.tlv(0x17, "400101000000Z"),
+    });
+    const tbs = try b.seq(&.{
+        version,
+        serial,
+        sig_alg,
+        issuer_name,
+        validity,
+        try buildName(b, leaf_cn),
+        leaf_spki,
+    });
+    var out: [512]u8 = undefined;
+    const sig = try rsa.signPkcs1v15(issuer_sk, Sha256, tbs, &out);
+    const cert = try b.seq(&.{
+        tbs,
+        try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() }),
+        try b.bitString(sig),
+    });
+    return gpa.dupe(u8, cert);
+}
+
 fn makeRsaFixture(gpa: std.mem.Allocator) !RsaFixture {
     var prng = std.Random.DefaultPrng.init(0x0c005eed);
     const kp = try rsa.generate(prng.random(), 1024, 65537);
@@ -98,13 +142,15 @@ fn makeRsaFixture(gpa: std.mem.Allocator) !RsaFixture {
         .is_ca = true,
     });
     errdefer gpa.free(issuer);
-    const subject = try rsa.selfSignedCert(gpa, kp.secret_key, kp.public_key, Sha256, .{
-        .common_name = "leaf.example.com",
-        .serial = 0x4242,
-        .not_before = "200101000000Z",
-        .not_after = "400101000000Z",
-        .is_ca = false,
-    });
+    const issuer_bits = try extractBits(issuer);
+    const subject = try buildLeafCert(
+        gpa,
+        kp.secret_key,
+        issuer_bits.subject_name,
+        try spkiOf(issuer), // same keypair; only the Names matter to `ocsp`
+        "leaf.example.com",
+        &.{ 0x42, 0x42 }, // serial 0x4242
+    );
     return .{ .issuer_der = issuer, .subject_der = subject, .kp = kp };
 }
 
@@ -892,6 +938,13 @@ test "verify: ECDSA-P256 direct-issuer signature accepted" {
     defer gpa.free(ec_issuer);
     const ec_bits = try extractBits(ec_issuer);
 
+    // The leaf must chain to THIS issuer: `verify` refuses a subject/issuer
+    // pair that is not a chain (the fixture's RSA leaf is issued by the RSA
+    // CA). Its own signature is never checked by `ocsp`, so signing it with
+    // the RSA key is fine — only the Names are load-bearing here.
+    const ec_leaf = try buildLeafCert(gpa, fx.kp.secret_key, ec_bits.subject_name, try spkiOf(fx.subject_der), "leaf.example.com", subject.serial);
+    defer gpa.free(ec_leaf);
+
     const resp_der = try buildResponse(gpa, .{
         .issuer = ec_bits,
         .subject_serial = subject.serial,
@@ -901,8 +954,62 @@ test "verify: ECDSA-P256 direct-issuer signature accepted" {
     defer gpa.free(resp_der);
 
     const parsed = try ocsp.parseResponse(resp_der);
-    const verdict = try ocsp.verify(parsed, ec_issuer, fx.subject_der, defaultOpts());
+    const verdict = try ocsp.verify(parsed, ec_issuer, ec_leaf, defaultOpts());
     try testing.expect(verdict.status == .good);
+}
+
+// ── the subject↔issuer link (F2 / P-01) ────────────────────────────────────
+//
+// `certIdBinds` binds the CertID's two hashes to the issuer the CALLER passed
+// and the serial to the subject the CALLER passed; nothing in a `CertID`
+// identifies the subject certificate itself. So without an explicit check, a
+// caller that pairs a subject with the wrong issuer gets a confident verdict
+// about a DIFFERENT certificate — the (issuer, serial) pair the response
+// actually answers for. The response below is entirely genuine: correctly
+// signed by CA-B, with a CertID that binds perfectly to CA-B and to a serial
+// CA-B really did issue. The only thing wrong is that the leaf handed to
+// `verify` was issued by CA-A, not CA-B.
+test "verify: subject not issued by the supplied issuer → IssuerMismatch" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa); // CA-A + leaf issued by CA-A
+    defer fx.deinit(gpa);
+    const subject = try extractBits(fx.subject_der);
+
+    // CA-B: a different CA, with its own key and its own name.
+    var prng = std.Random.DefaultPrng.init(0xca0fbeef);
+    const kp_b = try rsa.generate(prng.random(), 1024, 65537);
+    const ca_b = try rsa.selfSignedCert(gpa, kp_b.secret_key, kp_b.public_key, Sha256, .{
+        .common_name = "zig-libs OCSP test CA B",
+        .serial = 2,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = true,
+    });
+    defer gpa.free(ca_b);
+    const bits_b = try extractBits(ca_b);
+
+    // A completely valid response FROM CA-B about serial 0x4242 under CA-B.
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = bits_b,
+        .subject_serial = subject.serial,
+        .responder_by_name = bits_b.subject_name,
+        .sign_rsa = kp_b.secret_key,
+    });
+    defer gpa.free(resp_der);
+    const parsed = try ocsp.parseResponse(resp_der);
+
+    // Control: against CA-B's own leaf the very same response verifies `good`,
+    // so the rejection below is the subject↔issuer link and nothing else.
+    const leaf_b = try buildLeafCert(gpa, kp_b.secret_key, bits_b.subject_name, try spkiOf(ca_b), "leaf.example.com", subject.serial);
+    defer gpa.free(leaf_b);
+    const ok = try ocsp.verify(parsed, ca_b, leaf_b, defaultOpts());
+    try testing.expect(ok.status == .good);
+
+    // CA-A's leaf against CA-B's response and CA-B's cert: not a chain.
+    try testing.expectError(
+        error.IssuerMismatch,
+        ocsp.verify(parsed, ca_b, fx.subject_der, defaultOpts()),
+    );
 }
 
 test "parseResponse: malformed / truncated input never panics" {
