@@ -148,7 +148,9 @@ pub fn decodeHeader(buf: []const u8) Error!Tag {
         pos = 2;
         // An extended header that encodes a number below 15 is a
         // non-canonical encoding of something that fits in the nibble. Accept
-        // it on decode (a peer may emit it) but never produce it.
+        // it on decode (a peer may emit it) but never produce it. The *length*
+        // escape below has exactly the same property and the same answer; see
+        // `headerIsCanonical`, which is the one place both are written down.
     }
 
     switch (lvt) {
@@ -272,6 +274,44 @@ pub fn encodeHeader(tag: Tag, out: []u8) Error!usize {
         }
     }
     return pos;
+}
+
+/// True when `buf` spells its tag header the way `encodeHeader` would.
+///
+/// Clause 20.2 gives **both** the tag number and the length an escape, and a
+/// peer may take an escape where the short form would have fitted: `f0 01` is
+/// tag number 1 spelled the long way, and `7d 00` is length 0 spelled through
+/// the extended-length escape (as are `7d fe 00 00` and `7d ff 00 00 00 00`).
+/// All of them decode to the same tag as the short spelling.
+///
+/// **They are accepted, not refused.** `bacpypes3` 0.0.106 — the implementation
+/// this module's goldens come from — decodes every one of those four and
+/// re-emits the *short* form, which is exactly what `encodeHeader` does. So a
+/// non-canonical spelling is legal input that cannot survive a byte-identical
+/// round trip, and refusing it would drop traffic the reference stack accepts.
+/// This predicate names that set once, so a caller (or a round-trip check) does
+/// not have to re-derive half of it from the shape of the first octet.
+///
+/// Returns false for a header that does not decode at all.
+pub fn headerIsCanonical(buf: []const u8) bool {
+    const t = decodeHeader(buf) catch return false;
+    var pos: usize = 1;
+    if (buf[0] >> 4 == 0x0F) {
+        // The number escape, used for a number the nibble could have held.
+        if (t.number < 15) return false;
+        pos = 2;
+    }
+    // Opening/closing brackets carry no length, and an application Boolean's
+    // LVT is its value: in both cases there is only one spelling.
+    if (t.form != .primitive) return true;
+    if (buf[0] & 0x07 != 5) return true;
+    // Extended length: the shortest escape that fits is the canonical one.
+    return switch (buf[pos]) {
+        0...4 => false, // would have fitted in the LVT nibble
+        254 => t.len > 253,
+        255 => t.len > 65535,
+        else => true, // 5..253, spelled in the single octet, as it must be
+    };
 }
 
 // ── primitive value types ───────────────────────────────────────────────────
@@ -1136,6 +1176,74 @@ test "header: encode is canonical and round-trips every form" {
     }
 }
 
+test "header: a length spelled through an escape it did not need is legal, and not canonical" {
+    // Anchored on `bacpypes3` 0.0.106 (the stack that produced this module's
+    // goldens): each `spelling` below decodes there to the very same tag as its
+    // `canonical` neighbour, and re-encodes to `canonical`. So this module must
+    // accept them too — and must report them as non-canonical, because they can
+    // never come back out byte-identically.
+    const cases = [_]struct { spelling: []const u8, canonical: []const u8 }{
+        // The two reproducers, at a context tag and at an application tag.
+        .{ .spelling = &.{ 0x7d, 0x00 }, .canonical = &.{0x78} },
+        .{ .spelling = &.{ 0xc5, 0x00 }, .canonical = &.{0xc0} },
+        // The same length 0, reached through the two wider escapes.
+        .{ .spelling = &.{ 0x7d, 0xfe, 0x00, 0x00 }, .canonical = &.{0x78} },
+        .{ .spelling = &.{ 0x7d, 0xff, 0x00, 0x00, 0x00, 0x00 }, .canonical = &.{0x78} },
+        // A length of 4 still fits in the LVT nibble; 253 still fits in one octet.
+        .{ .spelling = &.{ 0x7d, 0x04 }, .canonical = &.{0x7c} },
+        .{ .spelling = &.{ 0x7d, 0xfe, 0x00, 0xfd }, .canonical = &.{ 0x7d, 0xfd } },
+        // 65535 fits in the u16 escape, so the u32 escape is one octet too many.
+        .{ .spelling = &.{ 0x7d, 0xff, 0x00, 0x00, 0xff, 0xff }, .canonical = &.{ 0x7d, 0xfe, 0xff, 0xff } },
+        // The sibling escape, on the tag *number*, which was already excused.
+        .{ .spelling = &.{ 0xf0, 0x01 }, .canonical = &.{0x10} },
+    };
+    var buf: [max_header_len]u8 = undefined;
+    for (cases) |c| {
+        const a = try decodeHeader(c.spelling);
+        const b = try decodeHeader(c.canonical);
+        try testing.expectEqual(b.class, a.class);
+        try testing.expectEqual(b.number, a.number);
+        try testing.expectEqual(b.form, a.form);
+        try testing.expectEqual(b.len, a.len);
+        try testing.expectEqual(@as(u8, @intCast(c.spelling.len)), a.header_len);
+
+        // The escape is what makes it non-canonical; the short form is not.
+        try testing.expect(!headerIsCanonical(c.spelling));
+        try testing.expect(headerIsCanonical(c.canonical));
+
+        // And re-encoding really does shorten it — which is precisely why the
+        // round-trip fuzzer has to skip this input rather than assert on it.
+        const n = try encodeHeader(a, &buf);
+        try testing.expectEqualSlices(u8, c.canonical, buf[0..n]);
+        try testing.expect(n < a.header_len);
+    }
+}
+
+test "header: every canonical spelling is reported as canonical" {
+    // The negative control. If `headerIsCanonical` ever answers false here, the
+    // round-trip fuzzer stops asserting on real traffic and quietly goes green.
+    const canonical = [_][]const u8{
+        &.{0x78}, // context 7, length 0 in the LVT
+        &.{0x7c}, // context 7, length 4 in the LVT
+        &.{ 0x7d, 0x05 }, // length 5: the escape is now obligatory
+        &.{ 0x7d, 0xfd }, // 253, still one octet
+        &.{ 0x7d, 0xfe, 0x00, 0xfe }, // 254: the u16 escape becomes obligatory
+        &.{ 0x7d, 0xff, 0x00, 0x01, 0x00, 0x00 }, // 65536: and then the u32 one
+        &.{ 0xf9, 0x20 }, // extended number 32, inline length
+        &.{ 0xf5, 0x20, 0x05 }, // extended number 32, extended length
+        &.{0x3e}, // opening bracket 3
+        &.{0x3f}, // closing bracket 3
+        &.{0x11}, // application Boolean: LVT is the value, not a length
+        &.{0x10},
+    };
+    for (canonical) |c| try testing.expect(headerIsCanonical(c));
+
+    // A header that does not decode is not canonical either.
+    try testing.expect(!headerIsCanonical(&.{}));
+    try testing.expect(!headerIsCanonical(&.{0xf0}));
+    try testing.expect(!headerIsCanonical(&.{0x06})); // LVT 6 on an application tag
+}
+
 test "header: opening/closing on the application class is rejected on encode" {
     var buf: [16]u8 = undefined;
     try testing.expectError(error.InvalidTag, encodeHeader(
@@ -1693,9 +1801,12 @@ fn fuzzHeaderRoundTrip(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
     const input = buf[0..len];
     const t = decodeHeader(input) catch return;
-    // A peer may spell a small tag number in the extended form; that decodes
-    // but is deliberately never re-emitted, so skip those.
-    if (input[0] >> 4 == 0x0F and input.len >= 2 and input[1] < 15) return;
+    // A peer may take an escape where the short form would have fitted — for
+    // the tag *number* (`f0 01`) or for the *length* (`7d 00`). Both decode,
+    // both are legal (`bacpypes3` accepts them), and neither is ever re-emitted
+    // here, so neither can round-trip byte-identically. Skip exactly that set —
+    // which `headerIsCanonical` defines and its own tests pin — and no more.
+    if (!headerIsCanonical(input)) return;
     var out: [max_header_len]u8 = undefined;
     const n = encodeHeader(t, &out) catch return;
     if (n != t.header_len) return error.HeaderLenMismatch;

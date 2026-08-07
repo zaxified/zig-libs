@@ -26,6 +26,12 @@ Zig's bitfield-packing rules.
   `encodeHeader` always emits the **canonical** form (nibble when the number fits, shortest length
   escape). A peer's non-canonical spelling still decodes; it is simply never re-emitted, and the
   round-trip fuzzer skips exactly that case rather than pretending the two are equal.
+  **Both** escapes have that property, not just the number one: `f0 01` is tag number 1 spelled
+  the long way and `7d 00` is length 0 spelled through the extended-length escape (as are
+  `7d fe 0000` and `7d ff 00000000`). `bacpypes3` 0.0.106 accepts all of them and re-emits the
+  short form, so refusing them here would drop traffic the reference stack takes — they are
+  accepted, and `headerIsCanonical` is the single place that names the set, so the round-trip
+  fuzzer skips it instead of re-deriving half of it from the first octet.
 
   Decoded strings and octet strings are **slices of the caller's input**. Nothing in this module
   allocates, anywhere, including the client and the device.

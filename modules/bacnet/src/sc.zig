@@ -339,7 +339,15 @@ pub const OptionIter = struct {
         var data: ?[]const u8 = null;
         if (has_data) {
             if (self.rest.len < 3) return error.Truncated;
-            const len = std.mem.readInt(u16, self.rest[1..3], .big);
+            // Widened to `usize` **before** any arithmetic. `readInt(u16, ..)`
+            // yields a `u16`, and Zig types `3 + len` by the operands, not by
+            // where the result lands: it would be computed in `u16` and wrap at
+            // 65536 even inside `if (self.rest.len < 3 + len)`. A declared
+            // length of 65533..65535 then compares as 0..2, the bounds check it
+            // was meant to fail passes, and the slice below is taken with
+            // `start > end`. The comparison must be made in the type the
+            // arithmetic cannot overflow.
+            const len: usize = std.mem.readInt(u16, self.rest[1..3], .big);
             if (self.rest.len < 3 + len) return error.Truncated;
             data = self.rest[3 .. 3 + len];
             consumed = 3 + len;
@@ -917,6 +925,28 @@ test "an option's header length may not overrun the frame" {
     try testing.expectError(error.Truncated, decode(hex("0102000a3f00ff0102", &buf)));
     // ... and the two length octets themselves must be present.
     try testing.expectError(error.Truncated, decode(hex("0102000a3f00", &buf)));
+}
+
+test "a declared option length near 2^16 is refused, not wrapped into range" {
+    // The three lengths whose `3 + len` does not fit in a `u16`. Computed in
+    // `u16` they compare as 0, 1 and 2 — every one of them small enough that
+    // the bounds check passes on a three-octet remainder, after which the data
+    // slice is taken with `start > end`. Computed in `usize` they are refused.
+    for ([_]u16{ 0xfffd, 0xfffe, 0xffff }) |declared| {
+        var frame: [3]u8 = .{ option_flags.header_data | option_flags.must_understand, 0, 0 };
+        std.mem.writeInt(u16, frame[1..3], declared, .big);
+        var it: OptionIter = .{ .rest = &frame };
+        try testing.expectError(error.Truncated, it.next());
+        try testing.expectError(error.Truncated, scanOptions(&frame));
+    }
+
+    // The octets the `option walking` fuzzer crashed on, kept verbatim: an
+    // option list whose first option declares 0xffff octets of header data.
+    var buf: [16]u8 = undefined;
+    const crash = hex("60ffffffdfb10036", &buf);
+    var it: OptionIter = .{ .rest = crash };
+    try testing.expectError(error.Truncated, it.next());
+    try testing.expectError(error.Truncated, scanOptions(crash));
 }
 
 test "a must-understand option we do not know is reported, not skipped" {
