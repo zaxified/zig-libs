@@ -51,6 +51,14 @@ const ctx: bitcoinscript.TxContext = .{
     .spent_outputs = spent_outputs, // []const bitcointx.TxOut, one per spending_tx.vin entry
 };
 
+// Verifying MORE THAN ONE input of the same transaction? Build the BIP143/
+// BIP341 per-transaction sighash cache once and vary only `input_index`.
+// Without it every sighash rebuilds the commitment hashes over the whole
+// transaction, which is byte-identical and O(n^2) -- the very blowup BIP143
+// was written to retire.
+//   var ctx = try base_ctx.withPrecomputed(allocator);
+//   for (spending_tx.vin, 0..) |_, i| { ctx.input_index = i; ... }
+
 // witness: the input's witness stack (&.{} if the spend has none).
 bitcoinscript.verifyScript(
     allocator, // arena recommended -- see SPEC.md "Allocator contract"

@@ -96,6 +96,7 @@ test {
     _ = @import("e2e_test.zig");
     _ = @import("dos_test.zig");
     _ = @import("tapscript_test.zig");
+    _ = @import("precomputed_test.zig");
     _ = @import("findanddelete_test.zig");
     _ = @import("tx_findanddelete_vectors.zig");
     _ = @import("tx_findanddelete_test.zig");

@@ -277,8 +277,18 @@ pub fn checkEcdsaSig(
 
     const hash_type: u32 = hash_type_byte;
     const sighash: [32]u8 = switch (sig_version) {
+        // The legacy algorithm has no per-transaction factor to hoist — its
+        // digest depends on the input index and the scriptCode. That is the
+        // defect BIP143 was written to retire, not an omission here.
         .base => try bitcointx.legacy.sighash(allocator, ctx.tx, ctx.input_index, script_code, hash_type),
-        .witness_v0 => try bitcointx.bip143.sighash(allocator, ctx.tx, ctx.input_index, script_code, ctx.amountSats(), hash_type),
+        // BIP143: reuse the caller's per-transaction midstates when it has
+        // them. Byte-identical to the uncached call (`bitcointx` routes both
+        // through one selection body); the difference is O(1) commitment
+        // hashes per CHECKSIG instead of O(vin.len + vout.len).
+        .witness_v0 => if (ctx.segwitV0Precomputed()) |pre|
+            try bitcointx.bip143.sighashWith(allocator, pre, ctx.tx, ctx.input_index, script_code, ctx.amountSats(), hash_type)
+        else
+            try bitcointx.bip143.sighash(allocator, ctx.tx, ctx.input_index, script_code, ctx.amountSats(), hash_type),
         // Tapscript CHECKSIG uses BIP340 Schnorr over the BIP341/342 sighash
         // (`tapscript.zig`), never this ECDSA path — `interpreter.zig`
         // dispatches `.tapscript` away from `checkEcdsaSig` entirely.

@@ -77,9 +77,16 @@ Document's lifetime — exactly what a C14N pass over a subtree requires.
   (`DuplicateId`) — a deliberate guard against XML-Signature-wrapping tricks.
 - `Document.findByAttr(uri, local, value) ?*Element` — exact-attribute search,
   giving the dsig layer full control over which attribute is the ID.
-- `Element.resolveNs(prefix) ?[]const u8` — in-scope prefix→URI resolution up
-  the parent axis (`""` = default namespace; result `""` for `""` means "no
-  namespace"; reserved `xml`/`xmlns` handled).
+- `Element.resolveNs(prefix) ?[]const u8` — in-scope prefix→URI resolution
+  (`""` = default namespace; result `""` for `""` means "no namespace";
+  reserved `xml`/`xmlns` handled). Cost is O(declaring ancestors), not
+  O(declarations × depth): the parser links each element to a `NsScope` that
+  skips every ancestor declaring nothing and indexes any element carrying more
+  than `dup_scan_threshold` declarations. That matters because this is a
+  per-attribute call for `c14n`/`xmldsig` — a linear walk here reintroduces, in
+  every consumer, the exact quadratic the parser's own paths were hardened
+  against. A hand-assembled tree (no `ns_scope`) falls back to the plain
+  parent-axis walk and answers identically.
 - `Element.inScopeNamespaces(alloc) ![]NsDecl` — full inherited namespace axis,
   nearest-wins, undeclared default omitted (for inclusive C14N).
 - `Element.attr(uri, local) ?[]const u8`, `Element.elementIterator()`,
@@ -110,7 +117,7 @@ these are canonicalization policy, not infoset data.
 | **XXE / external entities / external DTD** | `<!DOCTYPE>` is **rejected by default** (`error.DoctypeForbidden`) — an external subset is never even inspected. With `doctype = .ignore` the DTD is *skipped without parsing any entity declaration*; the parser has **no filesystem/network code path at all**, so `SYSTEM "file:///…"` can never be dereferenced, and the later `&xxe;` fails as `UndefinedEntity`. | `security XXE: *` (incl. a positive control) |
 | **Entity-expansion DoS** (billion laughs / quadratic blowup) | User-defined general entities are **never supported**. Only the 5 predefined + numeric refs expand. A custom `&lol3;` is simply undefined ⇒ `UndefinedEntity` (or `DoctypeForbidden` under the default policy) — no recursive expansion, no memory growth. | `security billion-laughs: *` |
 | **Adversarial nesting / stack exhaustion** | Element depth capped at `Options.max_depth` (default 256); the parser uses an explicit heap stack (no native recursion on nesting). | `security depth: *` (reject + positive control) |
-| **Pathological attribute counts** | Two separate bounds, because a count cap alone is **not** a CPU bound. (a) `Options.max_attributes` (default 4096) ⇒ `TooManyAttributes`. (b) Per-element duplicate detection — duplicate attributes, duplicate namespace declarations, and prefix resolution — is O(k), not O(k²): above `dup_scan_threshold` entries each runs through a hash set instead of rescanning the list. Before (b), one element at the default cap cost 8.4 M name comparisons ≈ 50 ms of CPU for 127 KB of input, pre-authentication. | `security bounds: too many attributes`, `security bounds: per-element duplicate detection is linear in k` |
+| **Pathological attribute counts** | Two separate bounds, because a count cap alone is **not** a CPU bound. (a) `Options.max_attributes` (default 4096) ⇒ `TooManyAttributes`. (b) Per-element duplicate detection — duplicate attributes, duplicate namespace declarations, and prefix resolution — is O(k), not O(k²): above `dup_scan_threshold` entries each runs through a hash set instead of rescanning the list. Before (b), one element at the default cap cost 8.4 M name comparisons ≈ 50 ms of CPU for 127 KB of input, pre-authentication. (c) `Element.resolveNs` — the same resolution reached as a *public* call rather than through the parser — is bounded by the same index plus a scope chain that skips non-declaring ancestors, so a consumer resolving one prefix per attribute does not reintroduce the quadratic. Measured: a 4000-deep document costs 51.4 ms of consumer-side resolution before that change, 0.13 ms after; exclusive C14N over it, 31.6 ms → 1.1 ms. | `security bounds: too many attributes`, `security bounds: per-element duplicate detection is linear in k`, `complexity: Element.resolveNs is O(1) in depth and in declaration count` |
 | **Oversized names** | `Options.max_name_len` (default 1 MiB) ⇒ `NameTooLong`. | (bound enforced in `parseNameRaw`) |
 | **Signature-wrapping via duplicate IDs** | Duplicate ID values ⇒ `DuplicateId`. | `security: duplicate ID rejected` |
 | **Invalid input** | Whole input must be valid UTF-8; numeric char refs bounded to valid XML scalar values; malformed markup ⇒ typed errors, **never a panic**. | `security: invalid UTF-8`, `char ref out of range`, the not-wf suite |

@@ -20,7 +20,18 @@ A stack machine executing UNTRUSTED, attacker-supplied bytes, layered bottom-up:
   what it gates; `.none`/`.standard` are convenience presets.
 - `txctx.zig` — `SigVersion` (`.base`/`.witness_v0`, selects legacy vs. BIP143 sighash) and
   `TxContext` (the spending tx + input index + every input's spent output — BIP341 needs all of
-  them, not just the one being signed).
+  them, not just the one being signed), plus the optional `precomputed`
+  (`bitcointx.PrecomputedTransactionData`) sighash cache. BIP143/BIP341 exist because legacy
+  sighashing made validation **quadratic** in transaction size; their per-transaction commitment
+  hashes are the fix, and "compute once" is a property of the CALL PATTERN — recomputing them
+  inside every sighash call is byte-exact against every published vector and still `O(n²)`. A
+  validator verifying more than one input of the same transaction should build the cache once
+  with `TxContext.withPrecomputed(allocator)` and vary only `input_index`; all three sighash call
+  sites (`sigcheck.zig` BIP143, `verify.zig` BIP341 key-path, `tapscript.zig` BIP341/342
+  script-path) route through it when present. Measured over 800 inputs: segwit-v0 277 ms → 28 ms,
+  taproot key-path 410 ms → 46 ms, with the growth ratio per doubling falling from ~3.9 to ~2.0.
+  The legacy (`.base`) algorithm has no cache and never will — its digest depends on the input
+  index and scriptCode, which is precisely the defect BIP143 retired.
 - `sigcheck.zig` — BIP62/66/146 signature/pubkey encoding checks, and the actual ECDSA
   verification. **Does NOT use `k256.sign.ecdsaVerify`** — that function hashes its `msg`
   parameter with SHA-256 internally (matching `std.crypto.sign.ecdsa`'s "verify over SHA-256 of

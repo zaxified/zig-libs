@@ -352,15 +352,7 @@ fn evalChecksigTapscript(state: *State, sig: []const u8, pubkey: []const u8) Eva
     if (pubkey.len == 0) return error.Pubkeytype;
     if (pubkey.len == 32) {
         if (success) {
-            try tapscript.checkSchnorrSig(
-                state.allocator,
-                sig,
-                pubkey,
-                state.ctx.tx,
-                state.ctx.input_index,
-                state.ctx.spent_outputs,
-                exec,
-            );
+            try tapscript.checkSchnorrSig(state.allocator, sig, pubkey, state.ctx, exec);
         }
     } else {
         // Unknown public key type: signature validation is considered

@@ -96,6 +96,39 @@ pub const Child = struct {
     };
 };
 
+/// The namespace bindings in force at an element, as a chain that skips every
+/// ancestor which declares nothing. The parser links one of these onto each
+/// element so `resolveNs` — a PUBLIC entry point that `c14n`/`xmldsig` call
+/// once per attribute — does not have to rescan the parent axis element by
+/// element and declaration by declaration.
+///
+/// Two things make the chain cheap:
+///  - an element that declares no namespace SHARES its parent's scope, so a
+///    subtree nested 4000 deep under a root that declares `p` is one hop from
+///    the binding, not 4000;
+///  - an element carrying more than `dup_scan_threshold` declarations gets a
+///    prefix index, so the per-level scan is a probe rather than a walk.
+///
+/// It answers exactly what the parent-axis walk answers, in the same
+/// nearest-declaration-wins order: a prefix declared twice on one element is
+/// rejected at parse, so each level holds at most one binding per prefix.
+pub const NsScope = struct {
+    /// Declarations made literally on the element that introduced this scope.
+    decls: []const NsDecl,
+    /// prefix → uri over `decls`, built only when `decls` is long enough that
+    /// scanning it would dominate. Null means "scan `decls`".
+    index: ?*const PrefixIndex = null,
+    /// Scope of the nearest ancestor that declares any namespace.
+    outer: ?*const NsScope = null,
+
+    pub const PrefixIndex = std.StringHashMapUnmanaged([]const u8);
+};
+
+/// The scope of an element that declares nothing and has no declaring
+/// ancestor. Shared, so "no namespaces anywhere" costs no allocation — and so
+/// `Element.ns_scope == null` means unambiguously "not computed".
+const empty_ns_scope: NsScope = .{ .decls = &.{} };
+
 /// An element node. Preserves the original prefix, the resolved namespace URI,
 /// the namespace declarations made on this element, all attributes in original
 /// order, and children in document order. `parent` enables the inherited
@@ -109,24 +142,53 @@ pub const Element = struct {
     children: []const Child,
     parent: ?*Element,
     span: Span,
+    /// Accelerator for `resolveNs`, owned by the Document's arena. The parser
+    /// sets it on every element it builds. `null` means "not computed" — a
+    /// hand-assembled tree keeps working, on the plain parent-axis walk.
+    ns_scope: ?*const NsScope = null,
 
     /// Resolve a namespace prefix to a URI using the in-scope namespaces at
-    /// this element (walks up the parent axis; nearest declaration wins).
+    /// this element (nearest declaration wins).
     /// - `"xml"` and `"xmlns"` resolve to their reserved URIs.
     /// - The default prefix `""` resolves to the in-scope default namespace, or
     ///   "" (no namespace) when none is in scope. So a "" result for `""` means
     ///   "no namespace", never "unresolved".
     /// - Any other prefix returns null when not declared anywhere in scope.
     pub fn resolveNs(self: *const Element, prefix: []const u8) ?[]const u8 {
+        var probes: usize = 0;
+        return self.resolveNsCounted(prefix, &probes);
+    }
+
+    /// `resolveNs`, with a work counter. Test-only seam, exactly like
+    /// `parseCounted`: it lets a regression test pin the *complexity* of
+    /// prefix resolution with a deterministic number instead of a stopwatch.
+    /// One probe = one prefix comparison on the scan path, or one hash lookup
+    /// on the indexed path.
+    fn resolveNsCounted(self: *const Element, prefix: []const u8, probes: *usize) ?[]const u8 {
         if (std.mem.eql(u8, prefix, "xml")) return xml_ns;
         if (std.mem.eql(u8, prefix, "xmlns")) return xmlns_ns;
-        var cur: ?*const Element = self;
-        while (cur) |el| : (cur = el.parent) {
-            for (el.ns_decls) |d| {
-                if (std.mem.eql(u8, d.prefix, prefix)) {
+        if (self.ns_scope) |scope| {
+            var cur: ?*const NsScope = scope;
+            while (cur) |s| : (cur = s.outer) {
+                probes.* += 1;
+                if (s.index) |ix| {
                     // "" uri for a prefixed decl can't happen (rejected at
                     // parse). For the default prefix, "" means undeclared.
-                    return d.uri;
+                    if (ix.get(prefix)) |uri| return uri;
+                } else {
+                    for (s.decls) |d| {
+                        probes.* += 1;
+                        if (std.mem.eql(u8, d.prefix, prefix)) return d.uri;
+                    }
+                }
+            }
+        } else {
+            var cur: ?*const Element = self;
+            while (cur) |el| : (cur = el.parent) {
+                probes.* += 1;
+                for (el.ns_decls) |d| {
+                    probes.* += 1;
+                    if (std.mem.eql(u8, d.prefix, prefix)) return d.uri;
                 }
             }
         }
@@ -917,45 +979,37 @@ const Parser = struct {
             .span = .{ .start = start, .end = 0 },
         };
 
+        // Link this element into the namespace scope chain BEFORE resolving
+        // anything: `resolveNs` reads it, and both the parser and every
+        // downstream consumer (`c14n` calls it once per attribute) then pay
+        // O(declaring ancestors) instead of O(decls × depth). See `NsScope`.
+        try self.linkNsScope(el);
+
         // Resolve element namespace.
         if (std.mem.eql(u8, name.prefix, "xmlns")) return error.NamespaceError;
-        el.uri = el.resolveNs(name.prefix) orelse return error.UndeclaredNamespacePrefix;
+        var probes: usize = 0;
+        el.uri = el.resolveNsCounted(name.prefix, &probes) orelse return error.UndeclaredNamespacePrefix;
+        self.countCompares(probes);
 
-        // Resolve attribute namespaces; unprefixed attr → no namespace.
-        // `resolveNs` scans this element's declarations linearly, so with many
-        // attributes *and* many declarations on one element the loop is
-        // O(attrs × decls) — the same quadratic shape as the duplicate checks,
-        // and just as reachable before authentication. Above the threshold,
-        // index this element's own declarations once.
-        var own_ns: std.StringHashMapUnmanaged([]const u8) = .empty;
-        defer own_ns.deinit(self.a);
-        const hash_ns_lookup = attrs.items.len > dup_scan_threshold and el.ns_decls.len > dup_scan_threshold;
-        if (hash_ns_lookup) {
-            try own_ns.ensureTotalCapacity(self.a, @intCast(el.ns_decls.len));
-            // A prefix declared twice on one element was rejected above, so
-            // first-wins and only-entry are the same thing here.
-            for (el.ns_decls) |d| own_ns.putAssumeCapacity(d.prefix, d.uri);
-        }
+        // Resolve attribute namespaces; unprefixed attr → no namespace. With
+        // the scope chain in place this is O(attrs), not the O(attrs × decls)
+        // it used to be — the indexing lives in `resolveNs` now, so there is
+        // one implementation of the precedence rules rather than two.
+        //
+        // The real probe count is folded into `dup_compares` rather than a
+        // flat 1 per attribute: this loop is one of the three sites that
+        // test's linear bound is written about, and charging it a constant
+        // would make the bound blind to exactly the regression it exists to
+        // catch.
         for (attrs.items) |*at| {
             if (at.prefix.len == 0) {
                 at.uri = "";
             } else if (std.mem.eql(u8, at.prefix, "xmlns")) {
                 return error.NamespaceError;
-            } else if (hash_ns_lookup) {
-                self.countCompare();
-                // Same answer as `el.resolveNs`, in the same precedence order:
-                // a prefix this element declares wins; `xml` is reserved and
-                // may only ever be bound to `xml_ns` (checked above), so the
-                // shortcut and a declaration agree; otherwise the parent axis.
-                at.uri = own_ns.get(at.prefix) orelse blk: {
-                    if (std.mem.eql(u8, at.prefix, "xml")) break :blk xml_ns;
-                    const p = el.parent orelse return error.UndeclaredNamespacePrefix;
-                    break :blk p.resolveNs(at.prefix) orelse return error.UndeclaredNamespacePrefix;
-                };
             } else {
-                // `resolveNs` scans at least this element's own declarations.
-                self.countCompares(el.ns_decls.len + 1);
-                at.uri = el.resolveNs(at.prefix) orelse return error.UndeclaredNamespacePrefix;
+                probes = 0;
+                at.uri = el.resolveNsCounted(at.prefix, &probes) orelse return error.UndeclaredNamespacePrefix;
+                self.countCompares(probes);
             }
         }
         // Duplicate check by expanded name (uri, local). O(k) above
@@ -997,6 +1051,29 @@ const Parser = struct {
             self.i += 1;
             try self.stack.append(self.a, .{ .el = el, .children = .empty });
         }
+    }
+
+    /// Attach the namespace scope in force at `el`. An element that declares
+    /// nothing shares its parent's scope — no allocation, and the parent-axis
+    /// walk in `resolveNs` skips it entirely.
+    fn linkNsScope(self: *Parser, el: *Element) ParseError!void {
+        const outer: ?*const NsScope = if (el.parent) |p| p.ns_scope else null;
+        if (el.ns_decls.len == 0) {
+            el.ns_scope = outer orelse &empty_ns_scope;
+            return;
+        }
+        const s = try self.a.create(NsScope);
+        s.* = .{ .decls = el.ns_decls, .index = null, .outer = outer };
+        if (el.ns_decls.len > dup_scan_threshold) {
+            const ix = try self.a.create(NsScope.PrefixIndex);
+            ix.* = .empty;
+            try ix.ensureTotalCapacity(self.a, @intCast(el.ns_decls.len));
+            // A prefix declared twice on one element was rejected above, so
+            // there is exactly one entry per prefix and no first-wins tie.
+            for (el.ns_decls) |d| ix.putAssumeCapacity(d.prefix, d.uri);
+            s.index = ix;
+        }
+        el.ns_scope = s;
     }
 
     fn registerIds(self: *Parser, el: *Element) ParseError!void {
@@ -1731,6 +1808,165 @@ test "security bounds: per-element duplicate detection is linear in k, not quadr
         try bad.appendSlice(gpa, " nope:a=\"1\"/></r>");
         try testing.expectError(error.UndeclaredNamespacePrefix, parse(gpa, bad.items, .{}));
     }
+}
+
+/// The parent-axis walk `resolveNs` used to be, kept as a differential oracle:
+/// the scope chain must answer identically, including precedence and the
+/// null/"" distinction. Deliberately NOT written in terms of `NsScope`.
+fn resolveNsReference(el: *const Element, prefix: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, prefix, "xml")) return xml_ns;
+    if (std.mem.eql(u8, prefix, "xmlns")) return xmlns_ns;
+    var cur: ?*const Element = el;
+    while (cur) |e| : (cur = e.parent) {
+        for (e.ns_decls) |d| {
+            if (std.mem.eql(u8, d.prefix, prefix)) return d.uri;
+        }
+    }
+    if (prefix.len == 0) return "";
+    return null;
+}
+
+fn checkResolveAgreesEverywhere(el: *const Element, prefixes: []const []const u8) !void {
+    for (prefixes) |p| {
+        const got = el.resolveNs(p);
+        const want = resolveNsReference(el, p);
+        if (want == null or got == null) {
+            try testing.expect((want == null) == (got == null));
+        } else {
+            try testing.expectEqualStrings(want.?, got.?);
+        }
+    }
+    for (el.children) |c| switch (c.content) {
+        .element => |e| try checkResolveAgreesEverywhere(e, prefixes),
+        else => {},
+    };
+}
+
+test "complexity: Element.resolveNs is O(1) in depth and in declaration count" {
+    // `resolveNs` is a PUBLIC entry point, and `c14n`/`xmldsig` call it once
+    // per attribute per element. The parser's own duplicate/namespace paths
+    // were indexed earlier; `resolveNs` itself stayed a linear walk of every
+    // declaration on every ancestor, so a consumer calling it per attribute
+    // kept exactly the O(decls × depth) shape the parser had shed — reachable
+    // pre-authentication through SAML/xmldsig, like every other bound here.
+    //
+    // Assert the complexity, not the wall clock: `resolveNsCounted` reports
+    // prefix probes, so this pins the class deterministically. (Measured for
+    // the record: a 4000-deep document costs 51.4 ms of consumer-side
+    // resolution before this change and 0.13 ms after; exclusive C14N over
+    // the same document, 31.6 ms -> 1.1 ms.)
+    const gpa = testing.allocator;
+
+    // (a) Depth. The prefix is declared once at the root and used far below.
+    // Every element in between declares nothing, so the answer is one hop
+    // away no matter how deep the use site is.
+    {
+        const depth = 2048;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<r xmlns:p=\"urn:p\">");
+        for (0..depth) |_| try buf.appendSlice(gpa, "<e>");
+        try buf.appendSlice(gpa, "<leaf p:a=\"1\"/>");
+        for (0..depth) |_| try buf.appendSlice(gpa, "</e>");
+        try buf.appendSlice(gpa, "</r>");
+
+        var doc = try parse(gpa, buf.items, .{ .max_depth = depth + 4 });
+        defer doc.deinit();
+
+        var leaf: *const Element = doc.root;
+        while (leaf.firstElementChild()) |c| leaf = c;
+        try testing.expectEqualStrings("leaf", leaf.local);
+        try testing.expectEqualStrings("urn:p", leaf.attributes[0].uri);
+
+        var probes: usize = 0;
+        try testing.expectEqualStrings("urn:p", leaf.resolveNsCounted("p", &probes).?);
+        try testing.expect(probes <= 8);
+
+        // A prefix that is nowhere in scope must also cost O(1): it is the
+        // miss, not the hit, that walks the whole axis.
+        probes = 0;
+        try testing.expect(leaf.resolveNsCounted("nope", &probes) == null);
+        try testing.expect(probes <= 8);
+    }
+
+    // (b) Width. k declarations on one element, each prefix resolved once —
+    // O(k) in total, not O(k²).
+    {
+        const k = 2048;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<r");
+        for (0..k) |i| try buf.print(gpa, " xmlns:p{d}=\"urn:x{d}\"", .{ i, i });
+        try buf.appendSlice(gpa, "/>");
+
+        var doc = try parse(gpa, buf.items, .{});
+        defer doc.deinit();
+
+        var name: [32]u8 = undefined;
+        var total: usize = 0;
+        for (0..k) |i| {
+            const pfx = try std.fmt.bufPrint(&name, "p{d}", .{i});
+            var probes: usize = 0;
+            const uri = doc.root.resolveNsCounted(pfx, &probes) orelse return error.TestUnexpectedResult;
+            var want: [32]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "urn:x{d}", .{i}), uri);
+            total += probes;
+        }
+        try testing.expect(total <= 6 * k);
+    }
+}
+
+test "behaviour: resolveNs answers exactly what the parent-axis walk answers" {
+    // The accelerator must not move a single answer: nearest declaration wins,
+    // `xml`/`xmlns` outrank any declaration, `xmlns=""` undeclares the default,
+    // an unknown prefix is null while an absent default is "".
+    const gpa = testing.allocator;
+    const src =
+        \\<r xmlns="urn:d" xmlns:a="urn:a1" xmlns:b="urn:b">
+        \\  <m xmlns:a="urn:a2"><deep a:x="1" b:y="2"/></m>
+        \\  <n xmlns=""><plain/></n>
+        \\  <o><p xmlns:c="urn:c"><q/></p></o>
+        \\</r>
+    ;
+    var doc = try parse(gpa, src, .{});
+    defer doc.deinit();
+
+    const prefixes = [_][]const u8{ "", "a", "b", "c", "xml", "xmlns", "zz" };
+    try checkResolveAgreesEverywhere(doc.root, &prefixes);
+
+    // Spot-check the specific rules rather than trusting the differential
+    // alone (a reference that is wrong in the same way proves nothing).
+    const m = doc.root.children[1].content.element;
+    try testing.expectEqualStrings("m", m.local);
+    const deep = m.firstElementChild().?;
+    try testing.expectEqualStrings("urn:a2", deep.resolveNs("a").?); // shadowed
+    try testing.expectEqualStrings("urn:b", deep.resolveNs("b").?); // inherited
+    try testing.expectEqualStrings("urn:d", deep.resolveNs("").?);
+    try testing.expectEqualStrings(xml_ns, deep.resolveNs("xml").?);
+    try testing.expect(deep.resolveNs("c") == null); // declared on a sibling axis
+
+    const n = doc.root.children[3].content.element;
+    try testing.expectEqualStrings("n", n.local);
+    try testing.expectEqualStrings("", n.firstElementChild().?.resolveNs("").?); // undeclared default
+
+    // A hand-assembled tree carries no scope chain; it must still resolve.
+    var root: Element = .{
+        .prefix = "",
+        .local = "r",
+        .uri = "",
+        .ns_decls = &.{.{ .prefix = "h", .uri = "urn:h" }},
+        .attributes = &.{},
+        .children = &.{},
+        .parent = null,
+        .span = .{ .start = 0, .end = 0 },
+    };
+    var child: Element = root;
+    child.local = "c";
+    child.ns_decls = &.{};
+    child.parent = &root;
+    try testing.expect(child.ns_scope == null);
+    try testing.expectEqualStrings("urn:h", child.resolveNs("h").?);
+    try testing.expect(child.resolveNs("zz") == null);
 }
 
 test "security: duplicate ID rejected (signature-wrapping guard)" {

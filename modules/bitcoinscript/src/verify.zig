@@ -142,7 +142,12 @@ fn verifyTaprootKeyPath(allocator: Allocator, program_x: []const u8, sig_bytes: 
     var sig64: [64]u8 = undefined;
     @memcpy(&sig64, sig_bytes[0..64]);
 
-    const msg = try bitcointx.bip341.sighash(allocator, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs);
+    // BIP341: reuse the caller's per-transaction commitment hashes when it
+    // has them — byte-identical either way (see `TxContext.precomputed`).
+    const msg = if (ctx.taprootPrecomputed()) |pre|
+        try bitcointx.bip341.sighashWith(allocator, pre, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs)
+    else
+        try bitcointx.bip341.sighash(allocator, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs);
 
     var xonly: [32]u8 = undefined;
     @memcpy(&xonly, program_x);

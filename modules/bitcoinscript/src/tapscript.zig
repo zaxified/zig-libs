@@ -41,6 +41,7 @@ const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
 const bip340 = @import("bip340");
 const k256 = @import("k256");
+const txctx = @import("txctx.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Secp256k1 = k256.Secp256k1;
@@ -230,6 +231,35 @@ pub fn sigMsg(
     spent_outputs: []const bitcointx.TxOut,
     exec: *const ExecData,
 ) SchnorrError![]u8 {
+    return buildSigMsg(allocator, null, transaction, input_index, hash_type, spent_outputs, exec);
+}
+
+/// `sigMsg` against an already-computed `bitcointx.bip341.Precomputed`.
+/// Byte-identical output; `O(1)` per-transaction commitment hashes per call
+/// instead of `O(vin.len + vout.len)`. Mirrors `bitcointx`'s own `*With`
+/// convention, and routes through the same body as `sigMsg` so the cached and
+/// uncached routes cannot drift on consensus bytes.
+pub fn sigMsgWith(
+    allocator: Allocator,
+    pre: bitcointx.bip341.Precomputed,
+    transaction: bitcointx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const bitcointx.TxOut,
+    exec: *const ExecData,
+) SchnorrError![]u8 {
+    return buildSigMsg(allocator, pre, transaction, input_index, hash_type, spent_outputs, exec);
+}
+
+fn buildSigMsg(
+    allocator: Allocator,
+    pre: ?bitcointx.bip341.Precomputed,
+    transaction: bitcointx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const bitcointx.TxOut,
+    exec: *const ExecData,
+) SchnorrError![]u8 {
     // The common BIP341 layout comes from `bitcointx` — one implementation of
     // a consensus-critical byte order, not two that can drift. Only the
     // BIP342 extension below is this module's own.
@@ -242,11 +272,15 @@ pub fn sigMsg(
         break :blk sha256(tmp.items);
     } else null;
 
-    const common = try bitcointx.bip341.commonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, .{
+    const common_opts: bitcointx.bip341.CommonOptions = .{
         // spend_type = 2*ext_flag + annex_present; ext_flag = 1 for tapscript.
         .spend_type = 2 + @as(u8, if (annex_hash != null) 1 else 0),
         .annex_hash = annex_hash,
-    });
+    };
+    const common = if (pre) |p|
+        try bitcointx.bip341.commonSigMsgWith(allocator, p, transaction, input_index, hash_type, spent_outputs, common_opts)
+    else
+        try bitcointx.bip341.commonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, common_opts);
 
     var buf: std.ArrayList(u8) = .fromOwnedSlice(common);
     errdefer buf.deinit(allocator);
@@ -273,6 +307,22 @@ pub fn sighash(
     return bip340.taggedHash("TapSighash", msg);
 }
 
+/// `sighash` against an already-computed `bitcointx.bip341.Precomputed` —
+/// byte-identical output, `O(1)` commitment hashes per call.
+pub fn sighashWith(
+    allocator: Allocator,
+    pre: bitcointx.bip341.Precomputed,
+    transaction: bitcointx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const bitcointx.TxOut,
+    exec: *const ExecData,
+) SchnorrError![32]u8 {
+    const msg = try sigMsgWith(allocator, pre, transaction, input_index, hash_type, spent_outputs, exec);
+    defer allocator.free(msg);
+    return bip340.taggedHash("TapSighash", msg);
+}
+
 /// Verifies a non-empty tapscript signature `sig` against the 32-byte x-only
 /// `pubkey`, over the BIP341/342 sighash of `ctx`'s input. `sig` is 64 bytes
 /// (implicit `SIGHASH_DEFAULT`) or 65 bytes (trailing sighash-type byte,
@@ -286,9 +336,7 @@ pub fn checkSchnorrSig(
     allocator: Allocator,
     sig: []const u8,
     pubkey: []const u8,
-    transaction: bitcointx.Transaction,
-    input_index: usize,
-    spent_outputs: []const bitcointx.TxOut,
+    ctx: txctx.TxContext,
     exec: *const ExecData,
 ) SchnorrError!void {
     std.debug.assert(pubkey.len == 32);
@@ -304,7 +352,14 @@ pub fn checkSchnorrSig(
         bitcointx.bip341.validateHashType(hash_type) catch return error.SchnorrSigHashtype;
     }
 
-    const msg = try sighash(allocator, transaction, input_index, hash_type, spent_outputs, exec);
+    // Takes the whole `TxContext` rather than the three fields it needs so the
+    // per-transaction sighash cache travels with them: a tapscript leaf may
+    // run many CHECKSIGs, and every one of them used to rebuild all five
+    // BIP341 commitment hashes over the entire transaction.
+    const msg = if (ctx.taprootPrecomputed()) |pre|
+        try sighashWith(allocator, pre, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs, exec)
+    else
+        try sighash(allocator, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs, exec);
 
     const xpk = bip340.XOnlyPublicKey.fromBytes(pubkey[0..32].*) catch return error.SchnorrSig;
     const parsed = bip340.Signature.fromBytes(sig[0..64].*) catch return error.SchnorrSig;
