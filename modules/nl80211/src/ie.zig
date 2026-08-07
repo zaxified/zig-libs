@@ -27,7 +27,11 @@
 //!   transmitter claimed so a caller can see that it was clipped.
 //! * **`summarize` never fails.** The convenience path stops at the first
 //!   malformed element and returns what it decoded, because a single bad IE in
-//!   a beacon must not make the surrounding BSS undecodable.
+//!   a beacon must not make the surrounding BSS undecodable. It is therefore
+//!   the caller's answer that has to carry the doubt: `Summary.truncated` says
+//!   the walk stopped early, and `Summary.security` turns that into
+//!   `Security.unknown` rather than letting a transmitter truncate its way to
+//!   an `.open` verdict.
 
 const std = @import("std");
 const uapi = @import("uapi.zig");
@@ -357,22 +361,42 @@ pub const Summary = struct {
     /// The walk stopped early on a malformed element.
     truncated: bool = false,
 
-    /// Best-effort privacy verdict from the elements alone. `capability`
-    /// comes from `NL80211_BSS_CAPABILITY` bit 4 (Privacy) and is what tells
-    /// WEP apart from open when no RSN/WPA element is present.
+    /// Privacy verdict from the elements alone. `capability` comes from
+    /// `NL80211_BSS_CAPABILITY` bit 4 (Privacy) and is what tells WEP apart
+    /// from open when no RSN/WPA element is present.
+    ///
+    /// **A truncated walk yields `.unknown`, never `.open`.** IEs are
+    /// unauthenticated bytes off the air, so any transmitter in range can put
+    /// one malformed element in front of the RSN element and end the walk
+    /// early (see `summarize`). If that verdict fell through to the Privacy
+    /// bit, the attacker would get to pick it: `.open` for any BSS whose
+    /// Privacy bit is clear, `.wep` for one where it is set. What we actually
+    /// know in that case is nothing, and this returns exactly that.
+    ///
+    /// A truncation *after* a decoded RSN element is not a downgrade: RSN
+    /// outranks both the WPA1 vendor element and the Privacy bit, so no
+    /// element still hidden in the unseen tail can change the answer. Once
+    /// `rsn` is set the verdict is therefore reported as usual.
     pub fn security(s: Summary, capability: ?u16) Security {
         if (s.rsn) |r| {
             if (r.offersSae()) return .wpa3_sae;
             if (r.offersPsk()) return .wpa2_psk;
             return .wpa2_enterprise;
         }
+        // No RSN — but the walk stopped early, so we never reached the bytes
+        // that would have carried one. Anything below this line would be a
+        // guess dressed up as a verdict.
+        if (s.truncated) return .unknown;
         if (s.wpa1 != null) return .wpa1;
         const privacy = (capability orelse 0) & (1 << 4) != 0;
         return if (privacy) .wep else .open;
     }
 };
 
-pub const Security = enum { open, wep, wpa1, wpa2_psk, wpa2_enterprise, wpa3_sae };
+/// A privacy classification, or `.unknown` when the elements did not permit
+/// one. `.unknown` is deliberately not last: a caller that treats this as a
+/// strength ladder must not read "could not tell" as "strongest".
+pub const Security = enum { unknown, open, wep, wpa1, wpa2_psk, wpa2_enterprise, wpa3_sae };
 
 /// Decode the elements listed in `Summary` in one pass. See `Summary`.
 pub fn summarize(ies: []const u8) Summary {
@@ -682,6 +706,60 @@ test "summarize stops at a malformed element and reports what it had" {
     try testing.expect(s.truncated);
 }
 
+/// A complete WPA2-PSK beacon: SSID, rates, then an RSN element declaring
+/// CCMP group + pairwise and the PSK AKM.
+const wpa2_psk_beacon = [_]u8{
+    0, 3, 'a',  'b',  'c',
+    1, 2, 0x82, 0x84,
+    48, 18, 0x01, 0x00, // RSN version 1
+    0x00, 0x0f, 0xac, 0x04, // group cipher CCMP
+    0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, // 1 pairwise cipher: CCMP
+    0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, // 1 AKM: PSK
+};
+
+/// A vendor element claiming a 250-byte body it does not have: the cheapest
+/// way for a transmitter to end the walk wherever it likes.
+const truncating_element = [_]u8{ 221, 250, 0x00 };
+
+test "security: a truncating element cannot force .open on a WPA2 BSS" {
+    // Baseline — the honest beacon classifies as WPA2-PSK either way.
+    const honest = summarize(&wpa2_psk_beacon);
+    try testing.expect(!honest.truncated);
+    try testing.expectEqual(Security.wpa2_psk, honest.security(0));
+    try testing.expectEqual(Security.wpa2_psk, honest.security(1 << 4));
+
+    // Now a transmitter in range appends nothing but three bytes in front of
+    // the RSN element. The walk stops there and never sees the RSN.
+    const attacked = wpa2_psk_beacon[0..9] ++ truncating_element ++ wpa2_psk_beacon[9..];
+    const s = summarize(attacked);
+    try testing.expect(s.truncated);
+    try testing.expectEqual(@as(?Rsn, null), s.rsn);
+
+    // The verdict must not be one the attacker chose. Both of these were
+    // `.open` / `.wep` before the fix — a downgrade of the exact field a
+    // caller uses to decide whether it is safe to connect.
+    try testing.expectEqual(Security.unknown, s.security(0));
+    try testing.expectEqual(Security.unknown, s.security(1 << 4));
+    try testing.expectEqual(Security.unknown, s.security(null));
+}
+
+test "security: truncation after a decoded RSN still reports the RSN verdict" {
+    // The other side of the contract: once RSN is decoded, nothing hidden in
+    // the unseen tail can outrank it, so this must NOT degrade to .unknown.
+    const s = summarize(&wpa2_psk_beacon ++ truncating_element);
+    try testing.expect(s.truncated);
+    try testing.expectEqual(Security.wpa2_psk, s.security(0));
+}
+
+test "security: a truncating element cannot force .open on an open BSS either" {
+    // Same shape without any RSN to hide: the answer is still "I could not
+    // tell", because the missing tail is exactly where an RSN would live.
+    const ies = [_]u8{ 0, 3, 'a', 'b', 'c' } ++ truncating_element;
+    const s = summarize(&ies);
+    try testing.expect(s.truncated);
+    try testing.expectEqual(Security.unknown, s.security(0));
+}
+
 test "summarize: a malformed RSN does not sink the rest of the beacon" {
     const ies = [_]u8{
         0, 3, 'x', 'y', 'z',
@@ -711,6 +789,11 @@ fn fuzzIes(_: void, smith: *std.testing.Smith) !void {
     }
     const s = summarize(buf);
     std.mem.doNotOptimizeAway(&s);
+    // The accessor, not just the parse — F1's fuzz gap was exactly a harness
+    // that reached the struct and walked past the method that reads it.
+    std.mem.doNotOptimizeAway(&s.security(smith.value(u16)));
+    // A truncated walk must never be classified as "no protection".
+    if (s.truncated and s.rsn == null) std.debug.assert(s.security(0) == .unknown);
     if (parseRsn(buf)) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
     if (parseWpa1(buf)) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
     _ = find(buf, EID.SSID);

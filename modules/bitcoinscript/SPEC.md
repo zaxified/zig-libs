@@ -175,6 +175,20 @@ Transcribed faithfully from `script/interpreter.cpp`, including the parts that l
 - for `witness_v0` the step is skipped entirely (BIP143 §"No FindAndDelete"), and it runs BEFORE the
   `OP_CODESEPARATOR` strip, matching Core's `CTransactionSignatureSerializer` ordering.
 
+Because of that raw-tail copy, **the scriptCode handed to the `OP_CODESEPARATOR` strip need not
+decode**, and an undecodable scriptCode is not an error: Core's
+`CTransactionSignatureSerializer::SerializeScriptCode` walks it with
+`while (scriptCode.GetOp(it, opcode))`, so a failing `GetOp` merely ends the walk and the bytes that
+call already consumed (`GetScriptOp` advances `pc` past the opcode byte and any readable length
+prefix *before* the check that fails) are still written. `scriptCodeFor` reproduces that stop
+position exactly (`interpreter.undecodableStop`) instead of returning `error.BadOpcode`, which would
+abort a CHECKSIG that Core keeps evaluating and answer a different error class for the same bytes.
+One residual is recorded in that function's doc comment: when the walk stops with `k > 0` bytes
+unconsumed, Core's length prefix for the scriptCode is `k` larger than the payload it writes, and a
+`[]const u8` cannot carry that split (the serialization is `bitcointx`'s). No verdict can turn on
+it — `evalCore` decodes the whole script with the same reader, so any script with an undecodable
+scriptCode is itself undecodable and fails on reaching those bytes regardless.
+
 `const_scriptcode` (`SCRIPT_VERIFY_CONST_SCRIPTCODE`, mempool-relay policy, part of
 `ScriptFlags.standard`) models both halves of Core's flag: a non-zero find count is
 `error.SigFindanddelete`, and `OP_CODESEPARATOR` in a `SigVersion.base` script is

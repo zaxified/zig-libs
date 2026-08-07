@@ -98,6 +98,7 @@ test {
     _ = @import("tapscript_test.zig");
     _ = @import("precomputed_test.zig");
     _ = @import("findanddelete_test.zig");
+    _ = @import("scriptcode_test.zig");
     _ = @import("tx_findanddelete_vectors.zig");
     _ = @import("tx_findanddelete_test.zig");
     _ = @import("consensus_kat_vectors.zig");

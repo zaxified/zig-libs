@@ -246,6 +246,32 @@ pub fn findAndDelete(allocator: Allocator, script: []const u8, pattern: []const 
 ///
 /// BIP143 §"No FindAndDelete" makes `witness_v0` skip BOTH steps: the
 /// sub-script from `from` onward is used exactly as-is.
+///
+/// ## An undecodable scriptCode is NOT an error
+///
+/// Step 2's walk can run off the end of an instruction — `FindAndDelete`
+/// copies the tail RAW once it has deleted something, so the scriptCode it
+/// hands over need not be decodable, and `script[from..]` can end mid-push
+/// while the CHECKSIG that asked for it sits earlier in the script. Core
+/// does not reject that: `SerializeScriptCode`'s loop is
+/// `while (scriptCode.GetOp(it, opcode))`, so a failing `GetOp` merely ENDS
+/// the walk and the bytes it consumed are still written. Returning
+/// `error.BadOpcode` here instead would abort a script at the CHECKSIG that
+/// Core keeps evaluating — a different verdict class than Core's for the
+/// same bytes, which is the one thing a consensus engine may never do.
+///
+/// **Known residual, and why no verdict can turn on it.** Core writes the
+/// scriptCode into the sighash preimage as
+/// `WriteCompactSize(scriptCode.size() - nCodeSeparators)` followed by only
+/// the bytes the walk consumed. When the walk stops early with `k > 0` bytes
+/// left over, that declared length is `k` larger than the payload — a length
+/// prefix a plain `[]const u8` cannot express, and the serialization lives in
+/// `bitcointx`, not here. The bytes returned below are Core's payload exactly;
+/// only the prefix can differ, and only for `k > 0`. That cannot change a
+/// verdict: `evalCore` decodes the whole script with the same
+/// `readInstruction`, so a script whose scriptCode fails to decode fails to
+/// decode itself, and the eval loop returns `error.BadOpcode` on reaching
+/// those same bytes no matter what any CHECKSIG before them computed.
 fn scriptCodeFor(
     allocator: Allocator,
     script: []const u8,
@@ -267,13 +293,41 @@ fn scriptCodeFor(
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < sub.len) {
-        const instr = try readInstruction(sub, i);
+        const instr = readInstruction(sub, i) catch {
+            // Core's walk is `while (scriptCode.GetOp(it, opcode))` — a
+            // FAILING `GetOp` ends the loop, it is NOT an error. See
+            // `undecodableStop` for what the failed `GetOp` still consumed
+            // and why those bytes are part of the output.
+            try out.appendSlice(allocator, sub[i..undecodableStop(sub, i)]);
+            break;
+        };
         if (instr.opcode != @intFromEnum(Opcode.OP_CODESEPARATOR)) {
             try out.appendSlice(allocator, sub[i..instr.next]);
         }
         i = instr.next;
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Where Bitcoin Core's `GetScriptOp` (`script/script.cpp`) leaves `pc` when
+/// it FAILS to decode the instruction at `script[i..]`. `pc` is taken by
+/// reference and is advanced past the opcode byte (`unsigned int opcode =
+/// *pc++;`) and past any length prefix it managed to read BEFORE the check
+/// that fails, so a failed `GetOp` is not a no-op on the iterator — and
+/// `SerializeScriptCode`'s trailing `s.write(Span{&itBegin[0], it - itBegin})`
+/// writes exactly up to that position. Only ever called for an `i` at which
+/// `readInstruction` returned `error.BadOpcode`, i.e. `script[i] <= 0x4e`.
+fn undecodableStop(script: []const u8, i: usize) usize {
+    const op = script[i];
+    var pos = i + 1; // `*pc++` happens before any operand check
+    if (op == 0x4c) {
+        if (script.len - pos >= 1) pos += 1;
+    } else if (op == 0x4d) {
+        if (script.len - pos >= 2) pos += 2;
+    } else if (op == 0x4e) {
+        if (script.len - pos >= 4) pos += 4;
+    }
+    return pos;
 }
 
 fn allExecuting(cond_stack: []const bool) bool {
@@ -991,6 +1045,81 @@ test "OP_1 OP_2 OP_ADD OP_3 OP_EQUAL leaves true" {
     try eval(arena.allocator(), &stack, &.{ 0x51, 0x52, 0x93, 0x53, 0x87 }, dummyCtx(), .base, ScriptFlags.none);
     try testing.expectEqual(@as(usize, 1), stack.items.len);
     try testing.expect(number.castToBool(stack.items[0]));
+}
+
+// ── scriptCode over an undecodable tail ──────────────────────────────────
+//
+// Bitcoin Core `CTransactionSignatureSerializer::SerializeScriptCode`
+// (`script/interpreter.cpp`, v29.0 lines 1268-1287) walks the scriptCode with
+// `while (scriptCode.GetOp(it, opcode))` and writes the final chunk as
+// `Span{&itBegin[0], size_t(it - itBegin)}`. `GetScriptOp`
+// (`script/script.cpp`:306) takes `pc` BY REFERENCE and does `*pc++` plus any
+// readable length prefix before the check that fails, so the failing
+// instruction's header is inside `it` and therefore inside the output. A
+// failing `GetOp` ends the walk; it is never an error.
+//
+// The three tails below are Bitcoin Core's own bytes: `script_tests.json`
+// carries them as the rows "PUSHDATA1/2/4 with not enough bytes"
+// (`0x4c01`, `0x4d0200ff`, `0x4e03000000ffff`) -- the only 3 scripts in that
+// 1207-row corpus whose `GetOp` walk fails, and none of them reaches a
+// CHECKSIG, which is why the corpus never builds a scriptCode from one.
+const UndecodableCase = struct { script: []const u8, expect: []const u8, note: []const u8 };
+
+const undecodable_cases = [_]UndecodableCase{
+    .{
+        .script = &.{ 0xac, 0x4c, 0x01 },
+        .expect = &.{ 0xac, 0x4c, 0x01 },
+        .note = "PUSHDATA1 with not enough bytes: the size byte IS read (pc++), so it lands in the output",
+    },
+    .{
+        .script = &.{ 0xac, 0x4d, 0x02, 0x00, 0xff },
+        .expect = &.{ 0xac, 0x4d, 0x02, 0x00 },
+        .note = "PUSHDATA2 with not enough bytes: 2-byte prefix read, the 1 payload byte is NOT",
+    },
+    .{
+        .script = &.{ 0xac, 0x4e, 0x03, 0x00, 0x00, 0x00, 0xff, 0xff },
+        .expect = &.{ 0xac, 0x4e, 0x03, 0x00, 0x00, 0x00 },
+        .note = "PUSHDATA4 with not enough bytes: 4-byte prefix read, the 2 payload bytes are NOT",
+    },
+    .{
+        .script = &.{ 0xac, 0x4d, 0x02 },
+        .expect = &.{ 0xac, 0x4d },
+        .note = "the OTHER GetScriptOp failure branch: `if (end - pc < 2) return false;` leaves pc right after the opcode byte",
+    },
+    .{
+        .script = &.{ 0xab, 0xac, 0x4c },
+        .expect = &.{ 0xac, 0x4c },
+        .note = "OP_CODESEPARATOR is still dropped from the chunk that precedes the undecodable tail",
+    },
+    .{
+        .script = &.{ 0x4b, 0x00, 0x00, 0x00 },
+        .expect = &.{0x4b},
+        .note = "audit reproducer shape: a bare 0x4b push with fewer than 75 bytes behind it",
+    },
+};
+
+test "scriptCode: an undecodable tail ends Core's walk, it does not abort the CHECKSIG" {
+    for (undecodable_cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const got = scriptCodeFor(arena.allocator(), c.script, 0, .base, ScriptFlags.none, &.{}) catch |e| {
+            std.debug.print("\nscriptCodeFor returned error.{s} for {x} ({s})\n", .{ @errorName(e), c.script, c.note });
+            return error.ScriptCodeAborted;
+        };
+        testing.expectEqualSlices(u8, c.expect, got) catch |e| {
+            std.debug.print("\ncase: {s}\n", .{c.note});
+            return e;
+        };
+    }
+}
+
+test "scriptCode: a decodable script is unaffected by the undecodable-tail path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // OP_CODESEPARATOR stripped, everything else verbatim -- the ordinary case
+    // must not start swallowing bytes.
+    const got = try scriptCodeFor(arena.allocator(), &.{ 0x51, 0xab, 0x02, 0xab, 0xff, 0xac }, 0, .base, ScriptFlags.none, &.{});
+    try testing.expectEqualSlices(u8, &.{ 0x51, 0x02, 0xab, 0xff, 0xac }, got);
 }
 
 test "unbalanced OP_IF (no ENDIF) is rejected" {

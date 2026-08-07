@@ -227,7 +227,12 @@ Mitigations, in `src/ie.zig`:
   legitimately short element — the RSN element is specified so a transmitter
   may stop after any field);
 - `summarize` never fails: it stops at the first malformed element and returns
-  what it decoded, so one bad IE cannot make a whole BSS undecodable.
+  what it decoded, so one bad IE cannot make a whole BSS undecodable. Because
+  that stop is attacker-triggerable, the doubt is carried in the result:
+  `Summary.truncated` is set, and `Summary.security` reports
+  `Security.unknown` instead of falling through to the Privacy bit — otherwise
+  a transmitter in range could force `.open` for any BSS by putting one
+  malformed element in front of its RSN element.
 
 **SSIDs are raw bytes.** 0–32 bytes, any content, frequently invalid UTF-8, and
 an attacker can pick them. A consumer that renders one must escape it; this

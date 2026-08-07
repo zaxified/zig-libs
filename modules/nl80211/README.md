@@ -166,7 +166,11 @@ try wifi.disconnect(wlan, nl80211.connect.reason_deauth_leaving);
   this wire comes from the local kernel; IEs are verbatim bytes off the air.
   `ie.zig` bounds-checks every step, always advances ≥ 2 bytes (so a walk over
   N bytes terminates in ≤ N/2 steps), never allocates, and `summarize` stops at
-  the first malformed element instead of losing the whole BSS.
+  the first malformed element instead of losing the whole BSS. That stop is
+  attacker-triggerable, so it is visible in the answer: `Summary.truncated` is
+  set and `security()` returns `.unknown` rather than guessing. Without that,
+  one malformed element in front of an RSN element would let any transmitter
+  in range downgrade a WPA2 BSS to `.open`.
 - **SSIDs are raw bytes, not strings** — any 0–32 bytes, possibly invalid
   UTF-8, possibly all zeroes (a hidden network). Never print one unescaped.
   Note the wire asymmetry the goldens pin: an SSID attribute is *not*
