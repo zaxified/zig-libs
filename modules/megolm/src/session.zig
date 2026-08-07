@@ -401,6 +401,54 @@ test "exportAt then import: imported session can't decrypt what was forgotten" {
     try testing.expectEqualStrings("second secret", d2.plaintext);
 }
 
+test "forgetBefore: an index below the new floor is MessageIndexTooOld after the call" {
+    // F3: forgetBefore is the module's entire "Partial Forward Secrecy"
+    // mitigation and had zero call sites and zero tests — replacing its
+    // body with `return true;` left the suite fully green, so a caller
+    // winding a session forward could believe past keys were destroyed
+    // when nothing happened. Directly exercise the contract: decrypt an
+    // early message successfully, forget everything before a later index,
+    // then confirm the SAME early message (and only that one) is no longer
+    // decryptable, while indices at/after the new floor still are.
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = OutboundSession.init(io);
+    defer out.deinit();
+    var in = try InboundGroupSession.fromSessionKey(try out.sessionKey());
+    defer in.deinit();
+
+    var m0 = try out.encrypt(testing.allocator, "zero");
+    defer m0.deinit(testing.allocator);
+    var m1 = try out.encrypt(testing.allocator, "one");
+    defer m1.deinit(testing.allocator);
+    var m2 = try out.encrypt(testing.allocator, "two");
+    defer m2.deinit(testing.allocator);
+
+    // Provably decryptable BEFORE forgetting.
+    var d0 = try in.decrypt(testing.allocator, &m0);
+    d0.deinit(testing.allocator);
+
+    try testing.expect(in.forgetBefore(2));
+    try testing.expectEqual(@as(u32, 2), in.firstKnownIndex());
+
+    // Below the new floor: no longer decryptable, even though it worked
+    // moments ago.
+    try testing.expectError(error.MessageIndexTooOld, in.decrypt(testing.allocator, &m0));
+    try testing.expectError(error.MessageIndexTooOld, in.decrypt(testing.allocator, &m1));
+
+    // At/after the new floor: still decryptable.
+    var d2 = try in.decrypt(testing.allocator, &m2);
+    defer d2.deinit(testing.allocator);
+    try testing.expectEqualStrings("two", d2.plaintext);
+
+    // A no-op call (index not past the current floor) reports false and
+    // changes nothing.
+    try testing.expect(!in.forgetBefore(1));
+    try testing.expectEqual(@as(u32, 2), in.firstKnownIndex());
+}
+
 test "tampered ciphertext byte is rejected as an invalid signature" {
     var threaded = testIo();
     defer threaded.deinit();

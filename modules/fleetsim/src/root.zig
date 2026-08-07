@@ -260,6 +260,11 @@ const TraceDigest = struct {
     /// Trace entries that record a fault actually biting (loss, duplication,
     /// a silenced node, a restart).
     faulted: usize,
+    /// `applyNetsimTrace`'s unmapped-event count (currently only
+    /// `clock_jump`, which has no fleet meaning — see `Fleet.applyNetsimTrace`).
+    /// Threaded through so a test can assert on it instead of the caller
+    /// discarding it with `_ = try …`.
+    unmapped: usize,
 };
 
 /// One canned run: a Modbus slave and a DNP3 outstation behind a lossy,
@@ -327,7 +332,7 @@ fn cannedRun(seed: u64, collect: ?*std.ArrayList(u8)) !TraceDigest {
         .{ .horizon = 4000, .max_events = 8 },
     );
     defer trace.deinit();
-    _ = try f.applyNetsimTrace(trace.events);
+    const unmapped = try f.applyNetsimTrace(trace.events);
 
     var mb_buf: [modbus.tcp.max_adu_len]u8 = undefined;
     var link_buf: [64]u8 = undefined;
@@ -374,6 +379,7 @@ fn cannedRun(seed: u64, collect: ?*std.ArrayList(u8)) !TraceDigest {
         .events = f.events_processed,
         .out_hash = out_hash,
         .faulted = faulted,
+        .unmapped = unmapped,
     };
 }
 
@@ -396,6 +402,28 @@ test "determinism: the same seed reproduces a byte-identical emitted stream" {
     try testing.expect(d1.events > 200);
     try testing.expect(d1.faulted > 20);
     try testing.expectEqual(d1.faulted, d2.faulted);
+
+    // Absolute golden (F4): every prior assertion above is purely
+    // self-consistency (same seed -> equal, different seed -> unequal), so a
+    // change that alters every emitted byte identically on both sides of a
+    // same-seed comparison would pass silently. Pin canonical seed 0xC0FFEE's
+    // fingerprint/out_hash to a captured constant so such a change is caught.
+    try testing.expectEqual(@as(u64, 0xdfd7130c1cf5bb4d), d1.fingerprint);
+    try testing.expectEqual(@as(u64, 0x78c0521f7775613b), d1.out_hash);
+}
+
+test "determinism: cannedRun surfaces applyNetsimTrace's unmapped (clock_jump) count, not discards it" {
+    // F5: the only production caller of `applyNetsimTrace` was
+    // `_ = try f.applyNetsimTrace(trace.events);` — the unmapped-event
+    // count (currently only `netsim`'s clock_jump, which has no fleet
+    // meaning) was computed and thrown away, so a canned run could not tell
+    // whether a seed's fault schedule was applied in full or partially
+    // dropped. Seed 2 is a concrete draw whose schedule contains a
+    // clock_jump (found by scanning small seeds against this horizon/
+    // max_events config); pin the exact unmapped count `cannedRun` now
+    // surfaces for it.
+    const d = try cannedRun(2, null);
+    try testing.expectEqual(@as(usize, 1), d.unmapped);
 }
 
 test "determinism: a different seed diverges" {

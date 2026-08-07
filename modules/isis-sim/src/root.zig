@@ -19,7 +19,8 @@
 //!   - `failLink(a, b)` / `failLinkAt(a, b, time)` — register a mid-run link
 //!     failure (both endpoints re-originate; the netsim link is severed).
 //!   - `runToConvergence(max_steps)` — drive the fabric through `netsim.replay`
-//!     to a quiesced steady state, or `.step_cap_exceeded` at the hard cap.
+//!     to a quiesced steady state, or `.safety_violated` / `.event_cap_exceeded`
+//!     / `.not_quiescent` (see `Outcome`) short of it.
 //!   - `lsdbsAgree`, `routes`, `reaches`, `selfSequence`, `systemIdOf` — inspect
 //!     the converged state.
 

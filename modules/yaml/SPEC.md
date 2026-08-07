@@ -276,7 +276,38 @@ already 30× the anchor-free cost, and the ratio grows with n. With the index:
 remains the storage so slot identity and `finishAnchor` are unchanged. Pinned by
 `compose.zig`'s `anchor_probes` counter rather than by a wall-clock assertion.
 
-## 8. Integer range — the one place resolution is lossy
+## 8. Duplicate mapping keys — rejected by default
+
+YAML 1.2.2 §3.2.1.1 restricts a mapping node's keys to be unique (fetched and
+read 2026-08-07, https://yaml.org/spec/1.2.2/#3211-nodes: "The content of a
+mapping node is an unordered set of key/value node pairs, with the
+restriction that each of the keys is unique"), but plenty of real-world
+parsers accept the duplicate anyway and resolve it however they see fit.
+`Options.reject_duplicate_keys` decides which posture this composer takes,
+and it **defaults to `true`** — reject.
+
+The default was chosen to match the de-facto reference implementation for Go,
+because "real-world parsers disagree" is not itself a reason to pick
+leniency: `go-yaml/yaml` branch `v3`'s `decode.go` declares a `uniqueKeys
+bool` field that `newDecoder()` sets to `true`, and a repeated key makes the
+decoder append the type error `"line %d: mapping key %#v already defined at
+line %d"`. Rejected by default, with permissiveness as an opt-in. (`yaml.v2`
+had it the other way — lenient unless the caller called `UnmarshalStrict` —
+so v2 is not the precedent; v3, the maintained branch, is.) Silent first- or
+last-wins resolution of a duplicate key is also a well-known shape for a
+security defect: two consumers of the same document (e.g. a validator and the
+program that acts on it) can each resolve the duplicate differently and
+disagree about which value is authoritative without either one erroring.
+
+`false` opts back into the permissive path this composer has always had:
+every pair is preserved in `Value.mapping`, in wire order, duplicates
+included (`compose.zig`'s `"duplicate keys are preserved, not collapsed,
+under the explicit opt-out"` test). That path exists for a caller that
+already owns the ambiguity — interop with a producer that emits duplicate
+keys on purpose, or a consumer implementing its own resolution policy — not
+as a hidden default a caller could be surprised by.
+
+## 9. Integer range — the one place resolution is lossy
 
 `Value.int` is an `i64`. An int-shaped scalar that does not fit stays a
 **string** holding its exact original text, tagged or not.
@@ -291,7 +322,7 @@ No suite case exercises this (the corpus has no oversized integers), so the unit
 test in `compose.zig` is the only thing keeping the behaviour deliberate. A
 consumer needing bignums has the exact text and can parse it itself.
 
-## 9. Backlog
+## 10. Backlog
 
 - **Emitter, `parseInto(T, …)`, schemas beyond core** — see README, Deferred.
 - **Fuzz harness.** The module ships an adversarial-input test but not yet a

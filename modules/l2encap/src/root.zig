@@ -311,6 +311,38 @@ test "golden: exact byte layout is pinned field-by-field" {
     try testing.expectEqualSlices(u8, &golden, out);
 }
 
+test "golden: second independent per-field byte literal (distinct asymmetric fields)" {
+    // F3: a CONSISTENT encode+decode mutation (e.g. flipping ingress_pe to
+    // little-endian on both sides) is caught by exactly one test in this
+    // module — the golden above — because it is the sole hand-written byte
+    // literal; the module has no external anchor (invented wire format,
+    // see F1) so this is the only defense that exists. The other existing
+    // golden ("unicast, I-SID 0, empty payload") uses ingress_pe = 0, which
+    // reads identically in either endianness and would NOT catch that
+    // mutation either. This uses a second, independently-chosen set of
+    // asymmetric byte values (every multi-byte field has distinct high/low
+    // octets) so an endianness or field-order regression has two
+    // independent literals to survive, not one.
+    // version=1, unicast, I-SID=0x445566, TTL=200, ingress_pe=0xABCD, payload="Zg".
+    const fields: Fields = .{ .isid = 0x44_55_66, .ttl = 200, .bum = false, .ingress_pe = 0xABCD };
+    var buf: [64]u8 = undefined;
+    const out = try encode(fields, "Zg", &buf);
+
+    const golden = [_]u8{
+        0x01, // version
+        0x00, // flags: unicast (bum=0)
+        0x44, 0x55, 0x66, // I-SID (big-endian)
+        0xC8, // TTL = 200
+        0xAB, 0xCD, // ingress PE id (big-endian)
+        'Z', 'g', // opaque payload
+    };
+    try testing.expectEqualSlices(u8, &golden, out);
+
+    const dec = try decode(out);
+    try testing.expectEqual(fields, dec.fields);
+    try testing.expectEqualSlices(u8, "Zg", dec.payload);
+}
+
 test "golden: unicast, I-SID 0, empty payload" {
     const fields: Fields = .{ .isid = 0, .ttl = 1, .bum = false, .ingress_pe = 0 };
     var buf: [header_len]u8 = undefined;

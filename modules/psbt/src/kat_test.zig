@@ -83,6 +83,37 @@ test "BIP174 official invalid vectors: specific expected error per named case" {
     }
 }
 
+test "F2: a garbage byte appended after a valid PSBT is rejected with TrailingBytes" {
+    // `parse`'s `if (offset != bytes.len) return error.TrailingBytes;` had
+    // no test teeth: deleting it left all 44 tests green (including every
+    // BIP174 invalid vector, Core's invalid/invalid_with_msg vectors, and
+    // the regtest KATs), because none of them is "a structurally valid PSBT
+    // with one byte appended" -- they are all malformed from the start. A
+    // PSBT accepted despite trailing garbage silently drops the tail on
+    // re-serialize (PSBT malleability). Take a genuine BIP174 valid vector,
+    // append one byte, and confirm it is now rejected -- and specifically
+    // with TrailingBytes, not some other error.
+    const allocator = testing.allocator;
+    // Skip the last two vectors here too -- they hit bitcointx's documented
+    // BIP144 marker/0-vin wire ambiguity on a plain `parse`, unrelated to
+    // this test's own trailing-bytes concern (see the dedicated test below).
+    for (vectors.valid[0 .. vectors.valid.len - 2]) |case| {
+        const raw = try hexToBytesAlloc(allocator, case.hex);
+        defer allocator.free(raw);
+
+        // Sanity: the vector parses cleanly on its own first.
+        var ok = try psbt.parse(allocator, raw);
+        ok.deinit(allocator);
+
+        var padded = try allocator.alloc(u8, raw.len + 1);
+        defer allocator.free(padded);
+        @memcpy(padded[0..raw.len], raw);
+        padded[raw.len] = 0xAA; // one garbage byte appended
+
+        try testing.expectError(error.TrailingBytes, psbt.parse(allocator, padded));
+    }
+}
+
 test "BIP174 official valid vectors: parse -> serialize is byte-exact" {
     const allocator = testing.allocator;
     // The last two vectors (0-input legacy tx) hit bitcointx's documented

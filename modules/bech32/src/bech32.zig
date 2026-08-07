@@ -15,6 +15,12 @@ const std = @import("std");
 /// `1`, or BIP350's `0x2bc830a3` (segwit v1+/Taproot).
 pub const Encoding = enum { bech32, bech32m };
 
+// NOTE (load-bearing, do not trim `kat_vectors.zig`): a consistent mutation
+// of `0x2bc830a3` here is invisible to every round-trip test in this file —
+// `createChecksum` and `detectEncoding` both read the constant from this one
+// function, so encode/decode still agree with each other under a wrong
+// value. Only the imported BIP-350 vectors in `kat_test.zig` catch it
+// (verified by fault injection: 37 pass / 3 fail, all three BIP350 cases).
 fn encodingConst(e: Encoding) u32 {
     return switch (e) {
         .bech32 => 1,

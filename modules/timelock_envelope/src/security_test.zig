@@ -202,6 +202,25 @@ test "tamper: flipping a byte in any region makes open fail with a typed error, 
     }
 }
 
+test "F1: tampering the flags byte (offset 6) is rejected — the only AAD-EXCLUSIVE byte" {
+    // Every other tamper-test offset is shadowed by a second binding: the
+    // round field also feeds the KDF info, the tlock/HQC ciphertexts are
+    // checked by their own consistency checks, and tag/content are covered
+    // by the AEAD itself. `flags` at offset 6 is deliberately left
+    // unconstrained by `parse` (reserved for future use) and is authenticated
+    // ONLY because it is inside the AAD region — so this is the one test
+    // that actually exercises "the AAD binding matters", as opposed to being
+    // shadowed by some other check that would catch the same offset anyway.
+    const kp = recipientKeypair(0x0D);
+    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    defer testing.allocator.free(base);
+
+    const dup = try testing.allocator.dupe(u8, base);
+    defer testing.allocator.free(dup);
+    dup[6] ^= 0xFF; // the flags byte
+    try expectOpenIsError(dup, kp.dk, round1000Signature());
+}
+
 test "tamper: corrupting the magic / version / suite bytes is rejected at parse" {
     const kp = recipientKeypair(0x09);
     const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());

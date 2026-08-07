@@ -191,6 +191,16 @@ pub fn ckdPub(parent: ExtendedPubKey, index: u32) CkdError!ExtendedPubKey {
     const il = i[0..32].*;
     const ir = i[32..64].*;
 
+    return ckdPubFromIL(parent, index, il, ir);
+}
+
+/// The `CKDpub` math from `IL`/`IR` onward, split out of `ckdPub` as a
+/// test-only seam: `IL >= n` (BIP-32's `CKDpub` step 3) fires with
+/// probability ~2^-128 under an honest HMAC output, so no vector built from
+/// a real seed can exercise the `rejectNonCanonical` guard below. This lets
+/// a test hand in a synthetic non-canonical `il` directly. Not `pub` outside
+/// the module — call `ckdPub` for real derivation.
+fn ckdPubFromIL(parent: ExtendedPubKey, index: u32, il: [32]u8, ir: [32]u8) CkdError!ExtendedPubKey {
     Secp256k1.scalar.rejectNonCanonical(il, .big) catch return error.InvalidChildKey;
     const il_point = Secp256k1.combMulBase(il, .big) catch return error.InvalidChildKey;
     const parent_point = Secp256k1.fromSec1(&parent.pubkey) catch return error.InvalidChildKey;
@@ -438,6 +448,22 @@ test "ckdPriv hardened vs normal both derive, and neuter(ckdPriv) == ckdPub(neut
     try testing.expectEqualSlices(u8, &via_priv.chain_code, &via_pub.chain_code);
 
     try testing.expectError(error.HardenedRequiresPrivateKey, ckdPub(master_pub, hardened_offset + 0));
+}
+
+test "ckdPub rejects a non-canonical IL (IL >= n, BIP-32 CKDpub step 3)" {
+    // No honest HMAC output can hit this (probability ~2^-128), so this
+    // drives the math directly through the test-only `ckdPubFromIL` seam
+    // with a synthetic IL of all-0xFF bytes, which as a big-endian 256-bit
+    // integer is far above the secp256k1 order n
+    // (0xFFFF...FFFE BAAEDCE6 AF48A03B BFD25E8C D0364141).
+    const seed = [_]u8{0xcd} ** 32;
+    var master = try masterFromSeed(&seed);
+    defer master.deinit();
+    const master_pub = try neuter(master);
+
+    const non_canonical_il = [_]u8{0xff} ** 32;
+    const ir = [_]u8{0x11} ** 32;
+    try testing.expectError(error.InvalidChildKey, ckdPubFromIL(master_pub, 0, non_canonical_il, ir));
 }
 
 test "parsePath: m/44'/0'/0'/0/0 and bare relative paths" {

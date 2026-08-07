@@ -27,8 +27,12 @@ const dbg  = doc.root.get("debug").?.string;     // "no" — 1.2 has no yes/no b
 `Value` is a small by-value union: `.null`, `.bool`, `.int`, `.float`,
 `.string`, `.sequence`, `.mapping`. A mapping is an **ordered slice of pairs**,
 not a hash map, because YAML mapping keys may be any node (a sequence, a
-mapping, an empty scalar) and are not required to be unique — flattening either
-fact away would lose documents the format allows.
+mapping, an empty scalar) — flattening that away would lose documents the
+format allows.
+
+**A repeated mapping key is rejected by default** (`error.DuplicateKey`), per
+`Options.reject_duplicate_keys` (default `true`). See "Duplicate mapping
+keys" below.
 
 For a multi-document stream use `composeAll`, which returns one `Value` per
 document; `compose` is the single-document convenience and errors otherwise.
@@ -79,6 +83,23 @@ the rest.
 unwalkable by any consumer that does not carry its own visited-set, and no JSON
 oracle can express one anyway.
 
+## Duplicate mapping keys
+
+YAML 1.2.2 §3.2.1.1 says a mapping node's keys are unique ("the content of a
+mapping node is an unordered set of key/value node pairs, with the
+restriction that each of the keys is unique"), and the de-facto reference
+implementation for Go enforces it: `go-yaml/yaml` branch `v3`'s `newDecoder()`
+sets `uniqueKeys: true`, so a repeated key is a decode error there unless the
+caller opts out (`yaml.v2` is the other way round — lenient unless you call
+`UnmarshalStrict` — so it is not the precedent to follow).
+
+This composer matches v3: **`Options.reject_duplicate_keys` defaults to
+`true`**, and a repeated key composes to `error.DuplicateKey`. Set it `false`
+to opt into the permissive behaviour instead — every pair is preserved, in
+wire order, including the duplicates — for a caller that already owns the
+ambiguity itself (interop with a producer that duplicates keys on purpose, or
+a consumer implementing its own first-/last-wins policy).
+
 ## Lifetime
 
 Everything is arena-backed. `Parser` owns an arena; so do `Composed` and
@@ -106,10 +127,8 @@ spec citation lives in `SPEC.md`.
 - **Schemas other than core.** The failsafe and JSON schemas, and the `!!binary`
   / `!!timestamp` / `!!set` / `!!omap` types, are not resolved; those tags leave
   their scalars as text.
-- **Duplicate-key policy.** Duplicates are preserved rather than rejected or
-  merged; a consumer that wants "last wins" or an error must apply it.
 - **Integers outside `i64`** stay strings holding their exact text — see
-  SPEC.md §8.
+  SPEC.md §9.
 - **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; only the UTF-8 BOM
   is handled.
 

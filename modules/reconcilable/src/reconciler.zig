@@ -338,6 +338,48 @@ test "a self-enqueue during a pass runs in the NEXT tick, not this one" {
     try testing.expectEqual(@as(u32, 0), r.tick(3).reconciled);
 }
 
+test "F3: exactly-once-per-tick holds even with a nonzero budget_per_tick, not just the unlimited (0) case" {
+    // `tick` computes `budget = @min(opts.budget_per_tick, ready_at_start)`;
+    // the `ready_at_start` term is what stops a self-re-enqueueing key from
+    // being reconciled twice in one tick. The only prior self-enqueue test
+    // left `budget_per_tick` at its default 0, which takes the OTHER
+    // branch (`budget = ready_at_start`) and never reaches the clamp at
+    // all — so a regression that dropped `ready_at_start` from the min
+    // entirely (using the raw configured budget) went undetected. Same
+    // scenario as that test, but with a real nonzero budget bigger than
+    // what is ready.
+    const Selfish = struct {
+        r: ?*anyopaque = null,
+        calls: u32 = 0,
+        fn go(ctx: *@This(), key: u32, _: Instant) types.Outcome {
+            ctx.calls += 1;
+            if (ctx.calls < 3) {
+                const self_r: *Reconciler(u32, *@This()) = @ptrCast(@alignCast(ctx.r.?));
+                _ = self_r.enqueue(key) catch unreachable;
+            }
+            return .done;
+        }
+    };
+    var s: Selfish = .{};
+    const SR = Reconciler(u32, *Selfish);
+    // budget_per_tick = 5: far more than the single key that is ever ready
+    // at once, so a broken clamp (ignoring ready_at_start) would let the
+    // self-enqueue be immediately re-picked-up and reconciled again within
+    // the SAME tick, instead of parking it for the next one.
+    var r = try SR.init(testing.allocator, &s, Selfish.go, .{ .capacity = 4, .budget_per_tick = 5 });
+    defer r.deinit();
+    s.r = &r;
+
+    _ = try r.enqueue(1);
+    try testing.expectEqual(@as(u32, 1), r.tick(0).reconciled);
+    try testing.expectEqual(@as(u32, 1), s.calls);
+    try testing.expectEqual(@as(u32, 1), r.tick(1).reconciled);
+    try testing.expectEqual(@as(u32, 2), s.calls);
+    try testing.expectEqual(@as(u32, 1), r.tick(2).reconciled);
+    try testing.expectEqual(@as(u32, 3), s.calls);
+    try testing.expectEqual(@as(u32, 0), r.tick(3).reconciled);
+}
+
 test "failure backoff is exponential, capped, and reset by a success" {
     var rec = newRecorder();
     defer rec.deinit();
@@ -367,6 +409,35 @@ test "failure backoff is exponential, capped, and reset by a success" {
     _ = try r.enqueue(1);
     _ = r.tick(now);
     try testing.expectEqual(@as(u64, 1), (r.nextDue(now).? - now) / std.time.ns_per_ms);
+}
+
+test "F5: Stats.retried counts every backoff (requeue AND failed), like every other counter" {
+    // `retried` is a documented public counter, incremented in `backoff`
+    // (called on both `.requeue` and `.failed` outcomes), but was asserted
+    // by no test — every sibling counter (admitted/deduped/rejected/
+    // reconciled/converged/failed/abandoned/overflowed) is.
+    var rec = newRecorder();
+    defer rec.deinit();
+    rec.fail_first = 3; // fails the first 3 reconciles, then succeeds
+    var r = try R.init(testing.allocator, &rec, recorderFn, .{
+        .capacity = 4,
+        .backoff = .{ .base_delay_ms = 1, .factor = 2.0, .max_delay_ms = 8, .jitter = .none },
+    });
+    defer r.deinit();
+
+    _ = try r.enqueue(1);
+    var now: Instant = 0;
+    for (0..3) |_| {
+        _ = r.tick(now);
+        now = r.nextDue(now).?;
+    }
+    try testing.expectEqual(@as(u64, 3), r.stats().retried);
+    try testing.expectEqual(@as(u64, 3), r.stats().failed);
+
+    // The 4th tick succeeds — no further backoff, retried stays at 3.
+    _ = r.tick(now);
+    try testing.expectEqual(@as(u64, 3), r.stats().retried);
+    try testing.expectEqual(@as(u64, 1), r.stats().converged);
 }
 
 test "requeue_after is honoured exactly and does not accumulate backoff" {

@@ -56,7 +56,8 @@
 //! inspects the ctx: the fabric is **quiescent** iff no node has any SRM (flood)
 //! or SSN (ack) flag set — i.e. flooding has drained and a further poll would
 //! send nothing. Quiescence within the cap ⇒ `.converged`; otherwise
-//! `.step_cap_exceeded`. Database *agreement* (`lsdbsAgree`) and route
+//! `.safety_violated` / `.event_cap_exceeded` / `.not_quiescent` (see
+//! `Outcome`). Database *agreement* (`lsdbsAgree`) and route
 //! consistency (`routes`/`reaches`) are separate assertions the caller makes on
 //! the converged state — a partition quiesces too, and is then detected as an
 //! unreachable destination in SPF rather than as a hang.
@@ -108,14 +109,27 @@ pub const Topology = struct {
     edges: []const Edge,
 };
 
-/// The result of `runToConvergence`.
+/// The result of `runToConvergence`. F5: this used to collapse three distinct
+/// causes into one `.step_cap_exceeded` value ("invariant violated", "event
+/// cap hit", "did not quiesce") — reported to the caller under a name that
+/// says only "needed more steps", even for a genuine safety violation. Split
+/// so a caller (and a test) can tell them apart without also having to check
+/// `violation`.
 pub const Outcome = enum {
     /// The fabric reached a quiesced steady state within the step cap (no SRM/SSN
     /// flag set anywhere). Inspect `lsdbsAgree`/`routes` for the resulting state.
     converged,
-    /// The step cap (event/time bound) was hit, or the safety invariant tripped,
-    /// before the fabric quiesced.
-    step_cap_exceeded,
+    /// `check`'s per-event safety invariant tripped during the run. See
+    /// `violation` for the specific error.
+    safety_violated,
+    /// The hard event-count ceiling (`Case.max_events_cap`) was hit before the
+    /// fabric quiesced — a runaway/non-terminating condition, not a mere
+    /// under-convergence within the simulated-time horizon.
+    event_cap_exceeded,
+    /// The simulated-time horizon (`max_steps`) elapsed with SRM/SSN still set
+    /// somewhere — simple non-quiescence, no safety invariant tripped and the
+    /// event-count ceiling was not reached.
+    not_quiescent,
 };
 
 // ── timing knobs (abstract netsim ticks) ─────────────────────────────────────
@@ -221,10 +235,9 @@ pub const Fabric = struct {
     seen_seq: []u32,
 
     /// The first safety-invariant `check` raised during the last run, or null.
-    /// Recorded here as well as inside netsim because `runToConvergence`
-    /// collapses "invariant violated", "event cap hit" and "did not quiesce"
-    /// into the single `.step_cap_exceeded` value, so the outcome alone cannot
-    /// say *which* happened.
+    /// Recorded here as well as inside netsim as the specific error behind a
+    /// `.safety_violated` outcome (`Outcome` distinguishes it from an event-cap
+    /// hit or simple non-quiescence — see there).
     violation: ?anyerror = null,
 
     /// Positive control for the LSDB-count tripwire: originate this many extra
@@ -685,9 +698,9 @@ pub const Fabric = struct {
         defer g_active_fabric = null;
 
         const result = try netsim.replay(self.gpa, case, trace.items, null);
-        if (result.outcome == .violated) return .step_cap_exceeded;
-        if (result.events_processed >= case.max_events_cap) return .step_cap_exceeded;
-        if (!self.allQuiescent()) return .step_cap_exceeded;
+        if (result.outcome == .violated) return .safety_violated;
+        if (result.events_processed >= case.max_events_cap) return .event_cap_exceeded;
+        if (!self.allQuiescent()) return .not_quiescent;
         return .converged;
     }
 
@@ -737,6 +750,14 @@ pub const Fabric = struct {
                 if ((ref == null) != (got == null)) return false;
                 if (ref) |rv| {
                     if (rv.sequence_number != got.?.sequence_number) return false;
+                    // F4: sequence-number parity alone lets two nodes "agree"
+                    // while holding different LSP bodies for the same
+                    // originator/sequence — exactly what a mis-ordered or
+                    // partially-applied update looks like. `originate` now
+                    // stamps a real ISO 10589 §7.3.11 checksum (no longer
+                    // `checksum = 0`), so the stored bytes are a real,
+                    // content-sensitive oracle: compare them in full.
+                    if (!std.mem.eql(u8, rv.bytes, got.?.bytes)) return false;
                 }
             }
         }
@@ -1006,7 +1027,7 @@ test "TEETH: the LSDB-count tripwire fires, and its bound is tight" {
     fab.extra_fragments = 2;
 
     // The run must STOP on the invariant — not merely fail to converge.
-    try testing.expectEqual(Outcome.step_cap_exceeded, try fab.runToConvergence(step_cap));
+    try testing.expectEqual(Outcome.safety_violated, try fab.runToConvergence(step_cap));
     try testing.expectEqual(@as(?anyerror, error.LsdbOverflow), fab.violation);
 
     // Tightness: the hook must catch this while the database is barely over the
@@ -1030,8 +1051,58 @@ test "TEETH: a stored sequence that goes backwards is caught during the run" {
     // ever see it; only the per-event hook can.
     fab.broken_wipe_node = 2;
 
-    try testing.expectEqual(Outcome.step_cap_exceeded, try fab.runToConvergence(step_cap));
+    try testing.expectEqual(Outcome.safety_violated, try fab.runToConvergence(step_cap));
     try testing.expectEqual(@as(?anyerror, error.SequenceRegression), fab.violation);
+}
+
+test "TEETH: lsdbsAgree catches a byte-level body divergence at matching sequence numbers" {
+    // F4: sequence-number parity alone lets two nodes "agree" while holding
+    // different LSP bodies for the same originator at the same sequence
+    // number — exactly the shape a mis-ordered or partially-applied update
+    // produces. Insert directly into two nodes' LSDBs (bypassing
+    // `originate`) two LSPs for the same origin/sequence but different
+    // reachability TLVs, so their checksums (real, per ISO 10589 §7.3.11 —
+    // `originate` no longer stamps `checksum = 0`) and bytes differ too.
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.init(testing.allocator, topo, 0x7EE7);
+    defer fab.deinit();
+
+    const origin_sys = systemIdForNode(0);
+    const id = lspIdOf(origin_sys, 0);
+
+    var buf_a: [256]u8 = undefined;
+    var b_a = try isis.pdu.LspBuilder.init(&buf_a, .{
+        .remaining_lifetime = 900,
+        .lsp_id = id,
+        .sequence_number = 1,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    try isis.tlvs.addExtendedIsReach(&b_a.tlvs, neighbourId7(systemIdForNode(1)), 10, &.{});
+    const lsp_a_bytes = b_a.finishStamped();
+    _ = try fab.nodes[0].lsdb.insert(lsp_a_bytes, null, 0);
+
+    var buf_b: [256]u8 = undefined;
+    var b_b = try isis.pdu.LspBuilder.init(&buf_b, .{
+        .remaining_lifetime = 900,
+        .lsp_id = id,
+        .sequence_number = 1, // same sequence number as node 0's copy
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    // Different reachability TLV -> different bytes and a different real
+    // checksum, but the same (id, sequence_number).
+    try isis.tlvs.addExtendedIsReach(&b_b.tlvs, neighbourId7(systemIdForNode(2)), 99, &.{});
+    _ = try fab.nodes[1].lsdb.insert(b_b.finishStamped(), null, 0);
+
+    // Nodes 2 and 3 hold node 0's ORIGINAL bytes (not the divergent copy),
+    // so the only discrepancy in the whole fabric is node 1's body — this
+    // isolates the byte-comparison check from the (already-covered)
+    // presence-parity check just above it.
+    _ = try fab.nodes[2].lsdb.insert(lsp_a_bytes, null, 0);
+    _ = try fab.nodes[3].lsdb.insert(lsp_a_bytes, null, 0);
+
+    // Sequence numbers alone would call this "agreement"; node 1's body differs.
+    try testing.expect(!fab.lsdbsAgree());
 }
 
 test "control: a correct run trips neither invariant" {
@@ -1065,7 +1136,15 @@ test "positive control: breaking the flood-drain leaves far nodes ignorant (RED)
     defer fab.deinit();
     fab.broken_no_drain = true;
 
-    _ = try fab.runToConvergence(step_cap);
+    // F5: the outcome used to be discarded (`_ = try …`), so if breaking the
+    // flood-drain had ALSO tripped the per-event safety invariant — a
+    // different, unintended defect from the one this positive control means
+    // to demonstrate — nothing here would have said so. Assert the specific
+    // outcome: this break causes simple non-quiescence (some SRM never
+    // drains because the far side never acks), not a safety violation.
+    const outcome = try fab.runToConvergence(step_cap);
+    try testing.expectEqual(Outcome.not_quiescent, outcome);
+    try testing.expectEqual(@as(?anyerror, null), fab.violation);
 
     // The databases do NOT agree: D (node 3) never learns A (node 0), two hops
     // away. This is the sentinel that the flood-propagation wiring is required.
@@ -1121,8 +1200,8 @@ const lossy_opts_base = Options{
 /// A shorter horizon than `step_cap`, because a retransmit timer that keeps
 /// re-arming spends `netsim`'s 200 000-event ceiling on steady-state churn long
 /// after the fabric has converged — and `runToConvergence` reports the event cap
-/// as `.step_cap_exceeded` even when the fabric is quiesced and agreeing (the
-/// outcome collapsing the audit records separately). 20 000 ticks is ~500
+/// as `.event_cap_exceeded` even when the fabric is quiesced and agreeing (the
+/// event-cap check runs before the quiescence check). 20 000 ticks is ~500
 /// retransmit periods, far more than convergence needs.
 const lossy_step_cap: Time = 20_000;
 

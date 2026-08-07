@@ -562,3 +562,168 @@ test "non-page-aligned and short reads pass straight through, uncached" {
     try testing.expectEqual(@as(u64, 1), pc.misses);
     st.close(h);
 }
+
+test "F2: each of the six clear() invalidation guards actually empties the cache" {
+    // SPEC's whole stale-hit-impossibility argument rests on these six
+    // sites (vOpen/.create_truncate, sub-page vWriteAll, vTruncate, vClose,
+    // vRename, vDelete) — none had a test. Fill the cache, trigger the
+    // guarded operation, and confirm `resident_pages` actually drops to 0
+    // (not just that the module happens to still return correct bytes for
+    // some other reason).
+    const gpa = testing.allocator;
+    const page = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page);
+    @memset(page, 0xAB);
+
+    // 1) vOpen(.create_truncate): a truncating open on a path with a page
+    //    still cached under a DIFFERENT, still-open handle on that same
+    //    path must invalidate — otherwise the still-open handle's next
+    //    full-page read returns pre-truncation bytes the file no longer has.
+    {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+        defer pc.deinit();
+        const st = pc.storage();
+
+        const h0 = try st.open("a", .create_truncate);
+        try st.writeAll(h0, page, 0);
+        try testing.expect(pc.stats().resident_pages > 0);
+
+        _ = try st.open("a", .create_truncate); // truncates "a" via a second handle
+        try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+        // The now-empty file has nothing to read at offset 0: a stale hit
+        // would instead return a full page of 0xAB.
+        var buf: [default_page_size]u8 = undefined;
+        const n = try st.pread(h0, &buf, 0);
+        try testing.expectEqual(@as(usize, 0), n);
+    }
+
+    // 2) sub-page vWriteAll: an unaligned/partial write over a resident
+    //    page must drop it — otherwise a later full-page read returns the
+    //    pre-write bytes instead of the just-written change.
+    {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+        defer pc.deinit();
+        const st = pc.storage();
+
+        const h = try st.open("b", .create_truncate);
+        try st.writeAll(h, page, 0); // a full-page write caches too (write-through)
+        try testing.expect(pc.stats().resident_pages > 0);
+
+        try st.writeAll(h, "Z", 5); // sub-page, unaligned
+        try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+        var buf: [default_page_size]u8 = undefined;
+        _ = try st.pread(h, &buf, 0);
+        try testing.expectEqual(@as(u8, 'Z'), buf[5]);
+    }
+
+    // 3) vTruncate: truncating away a resident page must drop it.
+    {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+        defer pc.deinit();
+        const st = pc.storage();
+
+        const h = try st.open("c", .create_truncate);
+        try st.writeAll(h, page, 0);
+        try testing.expect(pc.stats().resident_pages > 0);
+
+        try st.truncate(h, 0);
+        try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+        var buf: [default_page_size]u8 = undefined;
+        const n = try st.pread(h, &buf, 0);
+        try testing.expectEqual(@as(usize, 0), n); // nothing left to read; a stale hit would return 0xAB * page_size
+    }
+
+    // 4) vClose: closing must drop resident pages, because the handle
+    //    number can be recycled by an unrelated later open.
+    {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+        defer pc.deinit();
+        const st = pc.storage();
+
+        const h = try st.open("d", .create_truncate);
+        try st.writeAll(h, page, 0);
+        try testing.expect(pc.stats().resident_pages > 0);
+
+        st.close(h);
+        try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+
+        // A fresh, unrelated file reuses the just-freed handle number.
+        const h2 = try st.open("e", .create_truncate);
+        try testing.expectEqual(h, h2); // sanity: the slot really was reused
+        var buf: [default_page_size]u8 = undefined;
+        const n = try st.pread(h2, &buf, 0);
+        try testing.expectEqual(@as(usize, 0), n); // "e" is empty; a stale hit would return "d"'s 0xAB page
+    }
+
+    // 5) vRename: must drop resident pages.
+    {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+        defer pc.deinit();
+        const st = pc.storage();
+
+        const h = try st.open("f", .create_truncate);
+        try st.writeAll(h, page, 0);
+        try testing.expect(pc.stats().resident_pages > 0);
+
+        try st.rename("f", "g");
+        try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+    }
+
+    // 6) vDelete: must drop resident pages.
+    {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+        defer pc.deinit();
+        const st = pc.storage();
+
+        const h = try st.open("h", .create_truncate);
+        try st.writeAll(h, page, 0);
+        try testing.expect(pc.stats().resident_pages > 0);
+
+        try st.delete("h");
+        try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+    }
+}
+
+test "F4: vTryLockExclusive forwards to the inner Storage verbatim (dead in kvtree's own call path today)" {
+    // `kvtree.Db.open` discards its options and never calls
+    // `store.tryLockExclusive` at all, so this forwarding method has zero
+    // exercise through the intended path. It is still `pub` on the
+    // `Storage` vtable PageCache implements, so a direct caller must get
+    // the real cross-process-lock semantics from the inner Storage, not a
+    // locally-fabricated answer (the doc comment above `vTryLockExclusive`
+    // explicitly warns against the cache ever answering this itself).
+    // Mirrors `kv`'s own "the exclusive lock contends between handles"
+    // test, one layer up through the cache.
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const a = try st.open("lock-me", .open_or_create);
+    const b = try st.open("lock-me", .open_or_create); // second description, same file
+
+    try testing.expect(try st.tryLockExclusive(a));
+    // The contending handle is refused — proves this reached the REAL
+    // inner lock state, not a cache-local stub returning `true` for anyone.
+    try testing.expect(!try st.tryLockExclusive(b));
+    // Re-locking through the holder itself is still a no-op success.
+    try testing.expect(try st.tryLockExclusive(a));
+
+    st.close(a); // releases; there is no unlock op
+    try testing.expect(try st.tryLockExclusive(b));
+    st.close(b);
+}

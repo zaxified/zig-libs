@@ -1044,3 +1044,62 @@ test "persistence: samples survive a real filesystem round trip" {
     try testing.expectEqual(@as(usize, 44), got.len); // 64 points, ts 0..630, cutoff 200
     try testing.expectEqual(@as(Timestamp, 200), got[0].ts);
 }
+
+test "F1: CorruptIndex/CorruptPoint reject paths actually fire on a malformed value written directly through the tree" {
+    // Every corruption reject path (CorruptIndex, CorruptPoint) is
+    // declared and documented in SPEC.md as the module's fail-closed
+    // story, but nothing ever constructed the malformed bytes that would
+    // exercise them — the reject branches were dead code as far as the
+    // suite could tell. Write directly through the underlying kvtree at
+    // the module's own known key shapes (bypassing tsdb's own API, which
+    // never itself produces malformed values) and confirm each guard
+    // actually returns its documented typed error.
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const gpa = testing.allocator;
+
+    // ── CorruptIndex via lookupSeries: index value must be exactly 8 bytes ──
+    {
+        var idx_key: std.ArrayList(u8) = .empty;
+        defer idx_key.deinit(gpa);
+        try fx.db.indexKey(&idx_key, "bad-index", &.{});
+        try fx.tree.put(idx_key.items, "\x01\x02\x03"); // 3 bytes, not 8
+        try testing.expectError(error.CorruptIndex, fx.db.lookupSeries("bad-index", &.{}));
+    }
+
+    // ── CorruptIndex via retentionState: header too short ──────────────────
+    {
+        try fx.tree.put(&codec.meta_key_retention, "\x01\x00\x00\x00"); // < 1+8 bytes
+        try testing.expectError(error.CorruptIndex, fx.db.retentionState());
+    }
+
+    // ── CorruptIndex via retentionState: wrong version byte ────────────────
+    {
+        var v: [1 + 8 + 3]u8 = undefined;
+        v[0] = 0x99; // not version 1
+        @memset(v[1..9], 0);
+        @memset(v[9..12], 0xAA); // any nonempty resume-key filler
+        try fx.tree.put(&codec.meta_key_retention, &v);
+        try testing.expectError(error.CorruptIndex, fx.db.retentionState());
+    }
+
+    // ── CorruptIndex via retentionState: empty resume key ──────────────────
+    {
+        var v: [1 + 8]u8 = undefined;
+        v[0] = 1;
+        @memset(v[1..9], 0);
+        try fx.tree.put(&codec.meta_key_retention, &v);
+        try testing.expectError(error.CorruptIndex, fx.db.retentionState());
+    }
+    try fx.tree.del(&codec.meta_key_retention); // clean up for the next section
+
+    // ── CorruptPoint via Range.next: point value must be exactly 8 bytes ───
+    {
+        const s = try fx.db.seriesId("bad-point", &.{});
+        const key = codec.pointKey(s, 42);
+        try fx.tree.put(&key, "\x01\x02\x03\x04"); // 4 bytes, not 8
+        var r = try fx.db.range(s, 0, 1000);
+        defer r.deinit();
+        try testing.expectError(error.CorruptPoint, r.next());
+    }
+}

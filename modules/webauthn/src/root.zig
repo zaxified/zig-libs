@@ -781,3 +781,59 @@ fn fuzzParseAuthenticatorData(_: void, smith: *std.testing.Smith) !void {
     defer arena.deinit();
     _ = parseAuthenticatorData(arena.allocator(), buf[0..len]) catch return;
 }
+
+test "F4: parseAuthenticatorData reads signCount big-endian, pinned byte-exact" {
+    // SPEC.md hands signCount to the caller as the clone-detection signal,
+    // but every real W3C §16 vector's signCount is 0 (a fresh authenticator
+    // counter) -- 0 reads identically regardless of byte order, so no
+    // amount of asserting against the real corpus alone can catch a
+    // `.big` -> `.little` regression. Drive `parseAuthenticatorData`
+    // directly with a hand-built, asymmetric 4-byte value: a
+    // little-endian read of 01 02 03 04 would yield 0x04030201, not
+    // 0x01020304.
+    var raw: [37]u8 = undefined;
+    @memset(raw[0..32], 0xCC); // rp_id_hash, irrelevant to this check
+    raw[32] = 0x01; // flags: user_present only, no attested credential data
+    raw[33..37].* = .{ 0x01, 0x02, 0x03, 0x04 }; // signCount, big-endian
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseAuthenticatorData(arena.allocator(), &raw);
+    try std.testing.expectEqual(@as(u32, 0x01020304), parsed.sign_count);
+}
+
+test "F5: parseAuthenticatorData decodes aaguid + user_present/user_verified byte-exact" {
+    // aaguid and the user_present/user_verified flag bits were likewise
+    // never asserted anywhere in the suite. Build a synthetic
+    // authenticatorData with attested credential data present (a real,
+    // valid COSE EC2 key so the CBOR decode succeeds -- the same
+    // credential_public_key bytes as vectors.none_es256, inlined here so
+    // this "production" file does not import the test-only vectors
+    // module) and an asymmetric aaguid, and pin all three against the
+    // exact bytes/bits that went in.
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+
+    try raw.appendSlice(a, &([_]u8{0xCC} ** 32)); // rp_id_hash
+    // flags: user_present=1, user_verified=1, attested_credential_data=1.
+    // (bit0 | bit2 | bit6)
+    try raw.append(a, 0b0100_0101);
+    try raw.appendSlice(a, &[_]u8{ 0, 0, 0, 0 }); // signCount, irrelevant here
+    const aaguid = [16]u8{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F };
+    try raw.appendSlice(a, &aaguid);
+    try raw.appendSlice(a, &[_]u8{ 0, 0 }); // credentialIdLength = 0
+    const cose_key_hex = "a5010203262001215820afefa16f97ca9b2d23eb86ccb64098d20db90856062eb249c33a9b672f26df61225820930a56b87a2fca66334b03458abf879717c12cc68ed73290af2e2664796b9220";
+    var cose_key: [cose_key_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&cose_key, cose_key_hex);
+    try raw.appendSlice(a, &cose_key);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseAuthenticatorData(arena.allocator(), raw.items);
+
+    try std.testing.expect(parsed.flags.user_present);
+    try std.testing.expect(parsed.flags.user_verified);
+    try std.testing.expect(parsed.attested_credential_data != null);
+    try std.testing.expectEqualSlices(u8, &aaguid, &parsed.attested_credential_data.?.aaguid);
+}

@@ -805,28 +805,83 @@ test "next-wakeup is the min of the next paced retransmit and the next CSNP" {
     try testing.expectEqual(@as(?Time, null), s2.poll(0, InterfaceSet.initEmpty(), &db, &out, &scratch).next_wakeup);
 }
 
-test "determinism: identical (lsdb ops, now, up) yield identical effects" {
+/// A full ordered snapshot of one `poll`'s effects — (iface, kind, bytes) per
+/// entry, in the order emitted — so two runs can be compared for byte-exact
+/// determinism, not just per-kind counts. Owns its `bytes` copies; call
+/// `deinit`.
+const EffectItem = struct { iface: u8, kind: PduKind, bytes: []u8 };
+
+const EffectSnapshot = struct {
+    items: std.ArrayList(EffectItem),
+
+    fn capture(alloc: std.mem.Allocator, effects: []const Effect) !EffectSnapshot {
+        var items: std.ArrayList(EffectItem) = .empty;
+        errdefer {
+            for (items.items) |it| alloc.free(it.bytes);
+            items.deinit(alloc);
+        }
+        for (effects) |e| {
+            const owned = try alloc.dupe(u8, e.bytes);
+            try items.append(alloc, .{ .iface = e.iface, .kind = e.kind, .bytes = owned });
+        }
+        return .{ .items = items };
+    }
+
+    fn deinit(self: *EffectSnapshot, alloc: std.mem.Allocator) void {
+        for (self.items.items) |it| alloc.free(it.bytes);
+        self.items.deinit(alloc);
+    }
+
+    fn expectEqual(a: EffectSnapshot, b: EffectSnapshot) !void {
+        try testing.expectEqual(a.items.items.len, b.items.items.len);
+        for (a.items.items, b.items.items) |x, y| {
+            try testing.expectEqual(x.iface, y.iface);
+            try testing.expectEqual(x.kind, y.kind);
+            try testing.expectEqualSlices(u8, x.bytes, y.bytes);
+        }
+    }
+};
+
+test "determinism: identical (lsdb ops, now, up) yield identical effects, order and bytes included" {
+    // F2: the previous version of this test compared only three per-kind
+    // COUNTS (lsp/psnp/csnp) and next_wakeup between two runs, never the
+    // Effect order or bytes. But LSP transmit order comes from
+    // `db.srmIterator`, a bare AutoHashMap iterator whose iteration order is
+    // a function of insertion history (probed separately: the same 12 LSP
+    // IDs inserted forward vs. reverse DO come out of `srmIterator` in a
+    // different order — see the module finding). The file's own
+    // determinism contract ("the same (lsdb state, now sequence, up set)
+    // yields the same effects") is about *content*-determinism, which is
+    // stronger than three counts can pin. This drives the same script
+    // twice (identical insertion order both times, so this specific
+    // scenario IS expected to be byte-identical) and asserts the full
+    // ordered (iface, kind, bytes) sequence, not just counts.
     const Run = struct {
-        fn drive(alloc: std.mem.Allocator) !struct { lsp: usize, psnp: usize, csnp: usize, wake: ?Time } {
+        fn drive(alloc: std.mem.Allocator) !struct { snap: EffectSnapshot, wake: ?Time } {
             var db = Lsdb.init(alloc, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
             defer db.deinit();
             var sched = Scheduler.init(alloc, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
             defer sched.deinit();
             var buf: [128]u8 = undefined;
+            // Arrive on iface 0; flood out iface 1 (up) so split horizon
+            // doesn't suppress every .lsp send, leaving a non-trivial
+            // sequence to compare.
             _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 900), 0, 0);
             _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 900), 0, 0);
             _ = try db.insert(buildLsp(&buf, sys_other, 2, 1, 900), 0, 0);
             var out: [32]Effect = undefined;
             var scratch: [1024]u8 = undefined;
-            const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
-            return .{ .lsp = countKind(r.effects, .lsp), .psnp = countKind(r.effects, .psnp), .csnp = countKind(r.effects, .csnp), .wake = r.next_wakeup };
+            const r = sched.poll(0, oneUp(1), &db, &out, &scratch);
+            return .{ .snap = try EffectSnapshot.capture(alloc, r.effects), .wake = r.next_wakeup };
         }
     };
-    const a = try Run.drive(testing.allocator);
-    const b = try Run.drive(testing.allocator);
-    try testing.expectEqual(a.lsp, b.lsp);
-    try testing.expectEqual(a.psnp, b.psnp);
-    try testing.expectEqual(a.csnp, b.csnp);
+    var a = try Run.drive(testing.allocator);
+    defer a.snap.deinit(testing.allocator);
+    var b = try Run.drive(testing.allocator);
+    defer b.snap.deinit(testing.allocator);
+
+    try testing.expect(a.snap.items.items.len > 0); // teeth: something was actually emitted
+    try a.snap.expectEqual(b.snap);
     try testing.expectEqual(a.wake, b.wake);
 }
 

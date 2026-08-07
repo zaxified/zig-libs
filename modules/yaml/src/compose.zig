@@ -143,19 +143,32 @@ pub const Options = struct {
     ///
     /// YAML 1.2.2 §3.2.1.1 restricts a mapping node's keys to be unique
     /// (fetched and read 2026-08-07, https://yaml.org/spec/1.2.2/#3211-nodes:
-    /// "the content of a mapping node is an unordered set of key/value node
-    /// pairs, with the restriction that each of the keys is unique"), but
-    /// real-world parsers routinely accept the duplicate anyway and resolve
-    /// it however they see fit — this composer among them: the default
-    /// (`false`) preserves every pair in wire order (see the `duplicate
-    /// keys are preserved, not collapsed` test and `Value.mapping`'s doc
-    /// comment), which is what lets `Value.get`'s first-wins convention be
-    /// documented rather than silently disagreeing with, say, PyYAML's
-    /// last-wins with no way for a caller to even notice. Set this `true`
-    /// to opt into strict spec-conformant rejection instead, for a caller
-    /// that would rather fail closed than resolve an ambiguity a producer
-    /// and some other consumer could disagree about.
-    reject_duplicate_keys: bool = false,
+    /// "The content of a mapping node is an unordered set of key/value node
+    /// pairs, with the restriction that each of the keys is unique"), and the
+    /// de-facto reference implementation for Go agrees in practice, not just
+    /// on paper: `go-yaml/yaml` branch `v3`'s `decode.go` declares a
+    /// `uniqueKeys bool` field that `newDecoder()` sets to `true`, and a
+    /// repeated key makes the decoder append the type error `"line %d:
+    /// mapping key %#v already defined at line %d"` — rejected by default,
+    /// with permissiveness as the opt-out. (`yaml.v2` had it backwards —
+    /// lenient unless the caller opted into `UnmarshalStrict` — so v2 is
+    /// not the precedent; v3 is.) This composer follows v3's default:
+    /// **`true`**, reject-by-default. Silent first/last-wins over a
+    /// duplicate key is a classic shape for a bug or a smuggled-in
+    /// disagreement between two consumers of the same document about which
+    /// value won, so failing closed is the safer default.
+    ///
+    /// Set this `false` to opt into the permissive behaviour instead: every
+    /// pair is preserved in wire order (see the `duplicate keys are
+    /// preserved, not collapsed` test and `Value.mapping`'s doc comment),
+    /// which is what lets `Value.get`'s first-wins convention be documented
+    /// rather than silently disagreeing with, say, PyYAML's last-wins with
+    /// no way for a caller to even notice. This exists for a caller that
+    /// already owns the ambiguity itself — one that would rather see every
+    /// duplicate pair (to resolve them its own way, or just to interoperate
+    /// with a producer that emits them on purpose) than have the parse fail
+    /// out from under it.
+    reject_duplicate_keys: bool = true,
 };
 
 /// A composed stream that owns its own arena. Mirrors `std.json.Parsed`: the
@@ -462,7 +475,7 @@ fn parseBool(t: []const u8) ?Value {
 /// `[-+]? [0-9]+` | `0o [0-7]+` | `0x [0-9a-fA-F]+`
 ///
 /// A value that matches but does not fit an `i64` stays a **string** holding
-/// the original text — see SPEC.md §8. No suite case exercises it; the unit
+/// the original text — see SPEC.md §9. No suite case exercises it; the unit
 /// test below pins the behaviour so it cannot change by accident.
 fn isIntShape(t: []const u8) bool {
     if (t.len == 0) return false;
@@ -658,7 +671,7 @@ test "near-miss numbers stay strings" {
 }
 
 test "an integer too large for i64 stays a string holding its text" {
-    // Documented limitation (SPEC.md §8): no suite case exercises it, so this
+    // Documented limitation (SPEC.md §9): no suite case exercises it, so this
     // test is the only thing keeping the behaviour deliberate.
     const r = try single("x: 123456789012345678901234567890\n");
     defer r.deinit();
@@ -726,21 +739,28 @@ test "mapping keys may be non-strings and are kept in order" {
     try testing.expectEqualStrings("one", m[1].value.string);
 }
 
-test "duplicate keys are preserved, not collapsed" {
-    const r = try single("a: 1\na: 2\n");
+test "a repeated mapping key is rejected by default" {
+    // `single()` passes `.{}` — the *default* Options, no opt-out named.
+    // This is the reject-by-default contract itself: see the citation on
+    // `Options.reject_duplicate_keys` (go-yaml/yaml v3's `uniqueKeys: true`).
+    try testing.expectError(error.DuplicateKey, single("admin: false\nother: 1\nadmin: true\n"));
+    // A document with no repeated key still composes under the default.
+    const r = try single("admin: false\nother: 1\n");
     defer r.deinit();
     try testing.expectEqual(@as(usize, 2), r.root.mapping.len);
 }
 
-test "reject_duplicate_keys: off by default, opt-in rejects a repeated scalar key" {
-    // Default behaviour is unchanged (the test above pins it); this only
-    // exercises the opt-in strict mode.
-    try testing.expectError(
-        error.DuplicateKey,
-        compose(testing.allocator, "admin: false\nother: 1\nadmin: true\n", .{ .reject_duplicate_keys = true }),
-    );
-    // A document with no repeated key still composes under strict mode.
-    const r = try compose(testing.allocator, "admin: false\nother: 1\n", .{ .reject_duplicate_keys = true });
+test "duplicate keys are preserved, not collapsed, under the explicit opt-out" {
+    // `reject_duplicate_keys` defaults to `true` (see its doc comment), so
+    // this needs the explicit `false` to reach the permissive path at all.
+    // The option exists for a caller that already owns the ambiguity — one
+    // that would rather see every duplicate pair, in wire order, than have
+    // the parse fail out from under it (e.g. interop with a producer that
+    // emits duplicates on purpose, or a consumer implementing its own
+    // last-wins/first-wins policy). This test is what keeps that path
+    // covered instead of silently rotting now that it is no longer the
+    // default.
+    const r = try compose(testing.allocator, "a: 1\na: 2\n", .{ .reject_duplicate_keys = false });
     defer r.deinit();
     try testing.expectEqual(@as(usize, 2), r.root.mapping.len);
 }

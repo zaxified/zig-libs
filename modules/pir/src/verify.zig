@@ -1039,6 +1039,69 @@ test "EXACT: for a fixed tampering, the reject verdict is identical for EVERY qu
     }
 }
 
+test "EXACT: the tag channel's server access order is a function of the record count alone" {
+    // F2: the exact emission-order Trace oracle (`privacy_test.zig`'s
+    // "EXACT: the multi-index server's record access order…") is applied
+    // only to `Mpf.evalEachFullWith`, never to `TagDpf.evalFullWith` — the
+    // DPF that drives `Verified.answer`'s tag pass (`:322`). A
+    // data-dependent skip conditioned on the evaluated tag share would be
+    // arithmetically invisible to every value-comparing test in this file
+    // (a skipped term contributes zero to the sum either way) but would
+    // leak the query index through which records the server actually
+    // touched. Prove the walk itself is unconditional: the sequence of
+    // `x` values `TagDpf.evalFullWith` emits is exactly `0, 1, …,
+    // count-1`, for both parties, for real tag keys AND for arbitrary
+    // hostile bytes reinterpreted as a tag key.
+    const Trace = struct {
+        xs: []usize,
+        n: *usize,
+        fn emit(self: @This(), x: usize, _: V.TagWord) void {
+            self.xs[self.n.*] = x;
+            self.n.* += 1;
+        }
+    };
+
+    for ([_]usize{ 1, 2, 8, V.domain_size }) |count| {
+        var reference: [V.domain_size]usize = undefined;
+        var have_reference = false;
+
+        for ([_]usize{ 0, 3, 15 }) |index| {
+            const q = try V.query(
+                index,
+                detMac(V.tag_word_len, index + 900),
+                detSeed(index * 4 + 100),
+                detSeed(index * 4 + 101),
+                detSeed(index * 4 + 102),
+                detSeed(index * 4 + 103),
+            );
+            inline for (.{ 0, 1 }) |party| {
+                var xs: [V.domain_size]usize = undefined;
+                var n: usize = 0;
+                V.TagDpf.evalFullWith(party, q.shares[party].tag, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+                try testing.expectEqual(count, n);
+                for (0..count) |x| try testing.expectEqual(x, xs[x]);
+                if (have_reference) {
+                    try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
+                } else {
+                    @memcpy(reference[0..count], xs[0..count]);
+                    have_reference = true;
+                }
+            }
+        }
+
+        // Arbitrary bytes from a hostile client, reinterpreted as a tag key,
+        // must not be able to steer the access pattern either.
+        var buf: [V.TagDpf.Key.serialized_len]u8 = undefined;
+        for (&buf, 0..) |*b, i| b.* = @truncate(i *% 197 +% 31);
+        const junk = V.TagDpf.Key.fromBytes(&buf);
+        var xs: [V.domain_size]usize = undefined;
+        var n: usize = 0;
+        V.TagDpf.evalFullWith(1, junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+        try testing.expectEqual(count, n);
+        try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
+    }
+}
+
 // ── SELF: geometry errors and boundary sweeps ─────────────────────────────
 
 test "SELF: geometry errors are returned, never asserted" {

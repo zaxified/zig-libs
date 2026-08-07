@@ -1549,6 +1549,52 @@ test "a second record for a poisoned key is not stranded behind it" {
     try testing.expectEqual(@as(usize, 4), rig.sink.seen); // 2 records x 2 attempts
 }
 
+test "F4: recover() stops at the first sink failure, keeps prior progress, and resumes cleanly on retry" {
+    // FailingSink existed but was only ever driven through flushAll -- no
+    // test put a failing sink through recover() at all. recover() aborts
+    // on the FIRST failure after nacking that one lease, with no count of
+    // how much it did replay. Decide (and pin) the contract: earlier
+    // records already acked to the sink before the failure stay acked
+    // (never replayed twice, never lost), the failing record and
+    // everything still queued behind it stay pending/durable, and a later
+    // recover() call (once the obstacle is gone) finishes the job.
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .reject_key = "k1" });
+    defer rig.deinit();
+
+    {
+        const c = try rig.open(0);
+        try c.put("k0", "v0");
+        try c.put("k1", "v1");
+        try c.put("k2", "v2");
+        c.deinitNoFlush(); // crash: nothing reached the sink yet
+    }
+    try testing.expect(rig.sink.get("k0") == null);
+
+    const c2 = try rig.open(0);
+    defer c2.deinit();
+    try testing.expectEqual(@as(usize, 3), c2.pendingCount());
+
+    try testing.expectError(error.SinkWriteFailed, c2.recover());
+
+    // k0 (enqueued before the failing key) made it through and is durably
+    // acked -- recover() does not lose or replay-skip prior progress.
+    try testing.expectEqualStrings("v0", rig.sink.get("k0").?);
+    // k1 (the failure) and k2 (never reached) are still outstanding.
+    try testing.expect(rig.sink.get("k1") == null);
+    try testing.expect(rig.sink.get("k2") == null);
+    try testing.expectEqual(@as(usize, 2), c2.pendingCount());
+
+    // Clear the obstacle and resume: a later recover() call finishes
+    // replaying what the first call left behind.
+    rig.sink.reject_key = null;
+    try c2.recover();
+    try testing.expectEqualStrings("v0", rig.sink.get("k0").?);
+    try testing.expectEqualStrings("v1", rig.sink.get("k1").?);
+    try testing.expectEqualStrings("v2", rig.sink.get("k2").?);
+    try testing.expectEqual(@as(usize, 0), c2.pendingCount());
+}
+
 test "meta is well-formed" {
     try testing.expect(meta.platform == .posix);
     try testing.expect(meta.concurrency == .single_owner);

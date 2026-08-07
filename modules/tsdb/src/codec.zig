@@ -486,3 +486,36 @@ test "value codec round trip incl. non-finite samples" {
     try testing.expect(std.math.isNan(decodeValue(&nan).?));
     try testing.expect(decodeValue(&[_]u8{ 1, 2, 3 }) == null);
 }
+
+// ── fuzz: parseCanonical / decodePointKey over arbitrary bytes ───────────
+//
+// F2: tsdb had no fuzz harness at all and was absent from every repo-wide
+// sweep. `SPEC.md` explicitly admits untrusted key bytes ("the tree can be
+// shared, so decodePointKey validates…"), and `parseCanonical` is a real
+// length-prefixed decoder with a caller-influenced `count` driving
+// `gpa.alloc(Label, count)` — exactly the shape a fuzzer exists to check,
+// CLASS C ("no wire interop") notwithstanding.
+
+fn fuzzParseCanonical(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var d = parseCanonical(gpa, buf[0..len]) catch return;
+    d.deinit(gpa);
+}
+
+test "fuzz: parseCanonical never panics or leaks on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseCanonical, .{});
+}
+
+fn fuzzDecodePointKey(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = decodePointKey(buf[0..len]);
+}
+
+test "fuzz: decodePointKey never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodePointKey, .{});
+}

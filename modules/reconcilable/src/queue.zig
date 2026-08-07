@@ -805,3 +805,61 @@ test "heap ordering matches a sorted reference over random deadlines" {
     try testing.expectEqual(@as(usize, 64), n);
     try testing.expectEqualSlices(u64, &expected, &out);
 }
+
+test "F2: heapRemove's interior-removal fixup needs BOTH siftDown and siftUp, not just siftDown" {
+    // `heapRemove` moves the last element into the hole and does
+    // `siftDown(pos)` then `siftUp(pos)`. The `siftUp` half is untested by
+    // every random-seed property test in this file, because a RANDOM
+    // deadline sequence only rarely produces a hole whose replacement is
+    // smaller than the hole's own parent (the shape that needs siftUp, not
+    // siftDown). This is a hand-constructed witness for exactly that shape:
+    // inserting due-values 1,2,50,3,4,60,70,5 in this order never triggers
+    // sift-up-on-insert (each stays no-earlier than its parent as it is
+    // added), so the resulting heap array is literally
+    // [1,2,50,3,4,60,70,5]. Removing the key at position 5 (due=60) moves
+    // the last element (due=5) into position 5; 5 has no children to sift
+    // down past (position 5 is past the leaves once heap_len drops to 7),
+    // but 5 IS less than its new parent at position 2 (due=50) — a
+    // real min-heap violation unless siftUp runs.
+    var q = try Q.init(testing.allocator, 8);
+    defer q.deinit();
+
+    const dues = [_]u64{ 1, 2, 50, 3, 4, 60, 70, 5 };
+    for (dues, 0..) |due, i| _ = try q.enqueueAfter(@intCast(100 + i), 0, due);
+    q.assertInvariants(); // sanity: still a valid heap before the removal
+
+    // Key 105 (index i=5 above) is the one enqueued with due=60, at heap
+    // position 5. `enqueue` on an already-`.waiting` key removes it from
+    // the heap (promoting it to ready) — the public entry point to
+    // `heapRemove`.
+    try testing.expectEqual(Q.State.waiting, q.stateOf(105).?);
+    _ = try q.enqueue(105);
+    try testing.expectEqual(Q.State.ready, q.stateOf(105).?);
+
+    // A broken fixup leaves position 5 (due=5) smaller than its parent at
+    // position 2 (due=50) — assertInvariants' explicit heap-order check
+    // catches it; a correct fixup does not.
+    q.assertInvariants();
+
+    // Drain the already-ready key (105) out of the way first, so it does
+    // not get mixed into the heap-draining loop below.
+    const idx105 = q.takeReady().?;
+    q.finish(idx105, 0, .drop);
+
+    // And the remaining heap must still drain in true sorted order.
+    var remaining: [7]u64 = undefined;
+    for (0.., [_]u64{ 1, 2, 3, 4, 5, 50, 70 }) |i, v| remaining[i] = v;
+    var out: [7]u64 = undefined;
+    var n: usize = 0;
+    while (q.heap_len > 0) {
+        const due = q.nextTimer().?;
+        _ = q.promoteDue(due);
+        while (q.takeReady()) |idx| {
+            out[n] = due;
+            n += 1;
+            q.finish(idx, due, .drop);
+        }
+    }
+    try testing.expectEqual(@as(usize, 7), n);
+    try testing.expectEqualSlices(u64, &remaining, &out);
+}

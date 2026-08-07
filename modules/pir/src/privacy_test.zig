@@ -560,6 +560,64 @@ test "EXACT: the multi-index server's record access order is a function of the r
     }
 }
 
+test "EXACT: the single-index server's record access order is a function of the record count alone" {
+    // F2: the same emission-order Trace oracle used above for the
+    // multi-index walk (`Mpf.evalEachFullWith`) is applied only there —
+    // never to `Dpf.evalFullWith`, the single-index server path
+    // `Pir.answer` is built on. A data-dependent skip conditioned on the
+    // evaluated share is arithmetically invisible to any test that only
+    // compares the reconstructed VALUE (a skipped term contributes zero
+    // either way), but it would leak the query index through which
+    // records the server actually touches. Prove the walk itself is
+    // unconditional: the sequence of `x` values `Dpf.evalFullWith` emits
+    // is exactly `0, 1, …, count-1`, for both parties, for real shares AND
+    // for arbitrary hostile bytes reinterpreted as a share.
+    const P = pir.Pir(8, 4);
+
+    const Trace = struct {
+        xs: []usize,
+        n: *usize,
+        fn emit(self: @This(), x: usize, _: P.Word) void {
+            self.xs[self.n.*] = x;
+            self.n.* += 1;
+        }
+    };
+
+    for ([_]usize{ 1, 2, 100, 255, 256 }) |count| {
+        var reference: [256]usize = undefined;
+        var have_reference = false;
+
+        for ([_]usize{ 0, 128, 255 }) |index| {
+            const seeds = detSeeds(5900 + index);
+            const shares = try P.query(index, seeds[0], seeds[1]);
+            inline for (.{ 0, 1 }) |party| {
+                var xs: [256]usize = undefined;
+                var n: usize = 0;
+                P.Dpf.evalFullWith(party, shares[party], count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+                try testing.expectEqual(count, n);
+                for (0..count) |x| try testing.expectEqual(x, xs[x]);
+                if (have_reference) {
+                    try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
+                } else {
+                    @memcpy(reference[0..count], xs[0..count]);
+                    have_reference = true;
+                }
+            }
+        }
+
+        // Arbitrary bytes from a hostile client, reinterpreted as a share,
+        // must not be able to steer the access pattern either.
+        var buf: [P.share_len]u8 = undefined;
+        for (&buf, 0..) |*b, i| b.* = @truncate(i *% 173 +% 41);
+        const junk = try P.shareFromBytes(&buf);
+        var xs: [256]usize = undefined;
+        var n: usize = 0;
+        P.Dpf.evalFullWith(1, junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+        try testing.expectEqual(count, n);
+        try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
+    }
+}
+
 // ── STAT (multi): does the relationship between the indices separate? ─────
 
 const PM = pir.Pir(8, 4).Multi(2);

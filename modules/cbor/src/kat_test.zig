@@ -210,6 +210,34 @@ test "hostile: depth bomb - deeply nested single-element arrays exceed max_depth
     _ = try cbor.decode(a, shallow_bytes, .{});
 }
 
+test "hostile: depth bomb - exact boundary at max_depth and max_depth+1" {
+    // Only depths 200 (fails) and 10 (succeeds) were exercised elsewhere,
+    // leaving root.zig's `if (depth > self.max_depth) …` off-by-one
+    // (`>` vs `>=`) untested at the boundary itself. Default max_depth is
+    // 64; the decode call chain for N nested single-element arrays reaches
+    // depth == N at the innermost item, so N == max_depth must succeed and
+    // N == max_depth + 1 must fail.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const max_depth = 64; // DecodeOptions.max_depth default
+
+    {
+        const depth = max_depth;
+        var bytes = try a.alloc(u8, depth + 1);
+        for (bytes[0..depth]) |*b| b.* = 0x81;
+        bytes[depth] = 0x00;
+        _ = try cbor.decode(a, bytes, .{});
+    }
+    {
+        const depth = max_depth + 1;
+        var bytes = try a.alloc(u8, depth + 1);
+        for (bytes[0..depth]) |*b| b.* = 0x81;
+        bytes[depth] = 0x00;
+        try testing.expectError(error.DepthLimitExceeded, cbor.decode(a, bytes, .{}));
+    }
+}
+
 test "hostile: trailing garbage after a complete item is rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

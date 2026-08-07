@@ -481,6 +481,39 @@ test "I-TCI bit-field correctness: distinct I-PCP/I-DEI/UCA/I-SID land in the ri
     try testing.expectEqual(@as(u24, 0xAB_CDEF), dec.fields.i_sid);
 }
 
+test "F4: B-TCI top-of-range byte golden (PCP=7, DEI=1, VID=4095), not just round-trip" {
+    // decodeBTci is documented "every 16-bit value maps to a valid BTag",
+    // but the only dei=true B-Tag in the suite was a pure round trip or the
+    // Wireshark golden's PCP=2/DEI=1/VID=200 — never the top-of-range
+    // corner. PCP=7 (111), DEI=1, VID=0xFFF (all 12 bits set) packs to
+    // 0b111_1_111111111111 = 0xFFFF, i.e. every bit of the 16-bit TCI set —
+    // the case most likely to expose a mispositioned field.
+    const fields: Fields = .{
+        .b_da = @splat(0),
+        .b_sa = @splat(0),
+        .b_tag = .{ .pcp = 7, .dei = true, .vid = 4095 },
+        .i_pcp = 0,
+        .i_dei = false,
+        .uca = false,
+        .i_sid = 0,
+        .c_da = @splat(0),
+        .c_sa = @splat(0),
+    };
+    var buf: [min_frame_len + b_tag_len]u8 = undefined;
+    const out = try encode(fields, "", &buf);
+
+    // B-TCI sits right after the B-TPID, which itself follows B-DA/B-SA.
+    const btci_off = b_mac_len + 2;
+    try testing.expectEqual(@as(u8, 0xFF), out[btci_off]);
+    try testing.expectEqual(@as(u8, 0xFF), out[btci_off + 1]);
+
+    const dec = try decode(out);
+    const bt = dec.fields.b_tag orelse return error.TestExpectedBTag;
+    try testing.expectEqual(@as(u3, 7), bt.pcp);
+    try testing.expect(bt.dei);
+    try testing.expectEqual(@as(u12, 4095), bt.vid);
+}
+
 test "positive control: swapping UCA and I-DEI bits would flip the golden octet" {
     // Permanent guard that the I-TCI test pins the exact bit positions. UCA is
     // bit 27 (mask 0x08 in octet 0), I-DEI is bit 28 (mask 0x10). A swapped-impl

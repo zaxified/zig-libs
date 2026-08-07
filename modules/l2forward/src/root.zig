@@ -492,13 +492,22 @@ pub const Table = struct {
     /// Overwrites whatever (static, dynamic or quarantined) was there. Still
     /// counts against the per-tenant cap. Control plane: unlike `learn` it may
     /// create the I-SID, and so can fail with `TooManyIsids`.
-    pub fn learnStatic(self: *Table, isid: Isid, mac: Mac, pe: PeId) LearnStaticError!void {
+    ///
+    /// `now` is the caller's current time. A static entry's own
+    /// `learned_at` is irrelevant (it is never aged), but `now` still has to
+    /// be the REAL current time because a full FDB is pruned of expired
+    /// *dynamic* entries before this insert is rejected — hard-coding `now =
+    /// 0` here made every dynamic entry look age-0 to that prune, so it
+    /// reclaimed nothing and a full-of-stale-junk FDB rejected an
+    /// administrative pin with `FdbFull` even when a `learn` at the same
+    /// instant would have reclaimed the space and succeeded.
+    pub fn learnStatic(self: *Table, isid: Isid, mac: Mac, pe: PeId, now: Time) LearnStaticError!void {
         const ie = try self.getOrCreateIsid(isid);
         if (ie.fdb.getPtr(mac)) |e| {
             e.* = .{ .pe = pe, .learned_at = 0, .static = true };
             return;
         }
-        try self.insertNewMac(ie, mac, .{ .pe = pe, .learned_at = 0, .static = true }, 0);
+        try self.insertNewMac(ie, mac, .{ .pe = pe, .learned_at = 0, .static = true }, now);
     }
 
     /// Delete a learned MAC (static or dynamic) from `isid`. Returns true if an
@@ -951,7 +960,7 @@ test "MAC hijack: a move is reported and counted, and a flapping MAC is quaranti
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(1, victim, .access, 56, &buf));
 
     // A static pin is above all of this: it is neither moved nor quarantined.
-    try t.learnStatic(1, victim, 2);
+    try t.learnStatic(1, victim, 2, 60);
     try testing.expectEqual(LearnOutcome.static_pinned, try t.learn(1, victim, 9, 60));
     try testing.expectEqual(@as(?PeId, 2), t.lookup(1, victim, 60));
 }
@@ -985,7 +994,7 @@ test "data plane cannot create tenants: learn on an unconfigured I-SID is refuse
     try testing.expectEqual(LearnOutcome.learned, try t.learn(1, macOf(1), 7, 0));
     try t.addMember(2, 5);
     try testing.expectEqual(LearnOutcome.learned, try t.learn(2, macOf(2), 5, 0));
-    try t.learnStatic(3, macOf(3), 6);
+    try t.learnStatic(3, macOf(3), 6, 0);
     try testing.expectEqual(LearnOutcome.learned, try t.learn(3, macOf(4), 6, 0));
     try testing.expectEqual(@as(usize, 3), t.isidCount());
 
@@ -1019,7 +1028,7 @@ test "ageing: fresh → unicast; past aging_ticks the entry is gone → flood; r
 test "static entry is never aged and not overwritten by dynamic learn" {
     var t = testTable();
     defer t.deinit();
-    try t.learnStatic(5, macOf(0x99), 2);
+    try t.learnStatic(5, macOf(0x99), 2, 0);
     var buf: [16]PeId = undefined;
     // Never expires, even far past any aging window.
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x99), .access, std.math.maxInt(Time), &buf));
@@ -1042,7 +1051,7 @@ test "learnStatic pins an already-dynamic entry: it stops ageing after the upgra
     try testing.expect(t.lookup(6, macOf(0xAA), 1000) == null);
 
     // Re-learn at t=0 doesn't matter here; pin it via learnStatic instead.
-    try t.learnStatic(6, macOf(0xAA), 3);
+    try t.learnStatic(6, macOf(0xAA), 3, 0);
     // Now pinned behind PE 3, and never expires — even far past the window
     // that would have aged out the original dynamic entry.
     try testing.expectEqual(@as(?PeId, 3), t.lookup(6, macOf(0xAA), 1000));
@@ -1088,6 +1097,29 @@ test "capacity: per-tenant MAC-flood is bounded; existing entries unaffected; re
     try testing.expectEqual(@as(?PeId, 2), t.lookup(6, macOf(201), 1000));
 }
 
+test "F4: learnStatic reclaims expired dynamic entries too, not just dynamic learn" {
+    // learnStatic hard-coded now=0 into insertNewMac's prune call, so
+    // pruneIsid(ie, 0) computed age 0 for every entry (the clock-skew clamp
+    // turns `now < learned_at` into age 0) and reclaimed nothing — an
+    // operator's administrative MAC pin was rejected with FdbFull even
+    // though a dynamic `learn` at the very same instant would have reclaimed
+    // the space and succeeded. Same scenario as the dynamic-path capacity
+    // test above, but through learnStatic.
+    var t = testTable(); // max_macs_per_isid = 8, aging = 100
+    defer t.deinit();
+    try t.addIsid(6);
+    var i: u8 = 0;
+    while (i < 8) : (i += 1) _ = try t.learn(6, macOf(i), 2, 0);
+    try testing.expectEqual(@as(usize, 8), t.fdbCount(6));
+
+    // Well past the aging window: every dynamic entry above is expired
+    // (age 1000 > 100). A static pin passing the real current time must
+    // reclaim them, exactly as the dynamic path does.
+    try t.learnStatic(6, macOf(201), 2, 1000);
+    try testing.expectEqual(@as(usize, 1), t.fdbCount(6));
+    try testing.expectEqual(@as(?PeId, 2), t.lookup(6, macOf(201), 1000));
+}
+
 test "capacity: I-SID and member caps are enforced" {
     var t = Table.init(testing.allocator, .{ .max_isids = 2, .max_pes_per_isid = 2, .max_macs_per_isid = 4 });
     defer t.deinit();
@@ -1095,7 +1127,7 @@ test "capacity: I-SID and member caps are enforced" {
     try t.addMember(2, 10);
     try testing.expectError(error.TooManyIsids, t.addMember(3, 10)); // 3rd I-SID
     try testing.expectError(error.TooManyIsids, t.addIsid(3)); // ditto, explicit
-    try testing.expectError(error.TooManyIsids, t.learnStatic(3, macOf(1), 10)); // ditto, control plane
+    try testing.expectError(error.TooManyIsids, t.learnStatic(3, macOf(1), 10, 0)); // ditto, control plane
     // The data plane never gets as far as the I-SID cap: an unconfigured I-SID
     // is refused before anything is allocated (it cannot create a tenant at all,
     // so it cannot consume the budget either).
@@ -1208,7 +1240,7 @@ test "deinit frees all nested membership + FDB maps (leak check via testing.allo
         try t.addMember(isid, 2);
         var m: u8 = 0;
         while (m < 4) : (m += 1) _ = try t.learn(isid, macOf(m), 1, 0);
-        try t.learnStatic(isid, macOf(0xFE), 2);
+        try t.learnStatic(isid, macOf(0xFE), 2, 0);
     }
     try testing.expectEqual(@as(usize, 5), t.isidCount());
     // No explicit frees here: testing.allocator asserts no leak at deinit.

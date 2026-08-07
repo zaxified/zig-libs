@@ -1581,6 +1581,51 @@ test "BOLT#12 Merkle: signature TLVs (240-1000) are excluded from the tree" {
     try testing.expectEqualSlices(u8, &r_data, &r_with);
 }
 
+test "BOLT#12 Merkle: signature-type exclusion range [240,1000] is a range, not just its lower bound" {
+    // F3: the only existing boundary case above uses type=240; that alone
+    // cannot distinguish `isSignatureType`'s real range check
+    // (`t >= 240 and t <= 1000`) from a degenerate `t == 240`. Types 241-999
+    // are all odd-numbered in BOLT#12's own fixtures except 240 itself, and
+    // no vendored vector carries a signature-range TLV other than exactly
+    // type 240 — so both the fact that the exclusion is a RANGE (not one
+    // value) and its upper edge (1000 excluded, 1001 included) are unpinned
+    // without this. Type 999 (odd, top of the excluded range) must still be
+    // dropped exactly like 240; type 1001 (odd, just past the range) must
+    // be walked as an ordinary leaf.
+    const allocator = testing.allocator;
+    const data = "010203e802080000010000020003";
+    const data_bytes = try hexAlloc(allocator, data);
+    defer allocator.free(data_bytes);
+    const r_data = try merkleRoot(allocator, data_bytes);
+
+    // type=999 (BigSize 0xfd03e7), len=2, value=0xdead — top of the excluded
+    // range; must still be ignored, same as type=240.
+    var with_999: std.ArrayList(u8) = .empty;
+    defer with_999.deinit(allocator);
+    try with_999.appendSlice(allocator, data_bytes);
+    try with_999.appendSlice(allocator, &.{ 0xfd, 0x03, 0xe7, 0x02, 0xde, 0xad });
+    const r_999 = try merkleRoot(allocator, with_999.items);
+    try testing.expectEqualSlices(u8, &r_data, &r_999);
+
+    // type=1000 (BigSize 0xfd03e8) — the exact upper edge, still inclusive
+    // per BOLT#12; must also be ignored.
+    var with_1000: std.ArrayList(u8) = .empty;
+    defer with_1000.deinit(allocator);
+    try with_1000.appendSlice(allocator, data_bytes);
+    try with_1000.appendSlice(allocator, &.{ 0xfd, 0x03, 0xe8, 0x02, 0xde, 0xad });
+    const r_1000 = try merkleRoot(allocator, with_1000.items);
+    try testing.expectEqualSlices(u8, &r_data, &r_1000);
+
+    // type=1001 (BigSize 0xfd03e9), len=2, value=0xbeef — just past the
+    // range; MUST be walked as an ordinary leaf, changing the root.
+    var with_1001: std.ArrayList(u8) = .empty;
+    defer with_1001.deinit(allocator);
+    try with_1001.appendSlice(allocator, data_bytes);
+    try with_1001.appendSlice(allocator, &.{ 0xfd, 0x03, 0xe9, 0x02, 0xbe, 0xef });
+    const r_1001 = try merkleRoot(allocator, with_1001.items);
+    try testing.expect(!std.mem.eql(u8, &r_data, &r_1001));
+}
+
 test "BOLT#12 Merkle: hostile inputs fail closed" {
     const allocator = testing.allocator;
     // Declared length overruns the buffer.

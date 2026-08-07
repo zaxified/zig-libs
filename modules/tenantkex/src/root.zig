@@ -542,6 +542,48 @@ test "KAT (noise as oracle): tenantkex == raw Noise_IK over the bound prologue, 
     try testing.expectEqualSlices(u8, &ref_pair[1].k, &fin_i.keys.recv_key);
     try testing.expectEqualSlices(u8, &ref_pair[1].k, &fin_r.keys.send_key);
     try testing.expectEqualSlices(u8, &ref_pair[0].k, &fin_r.keys.recv_key);
+
+    // F1: transcript_hash pinned against raw noise's own handshake hash --
+    // this KAT compared the wire bytes and both transport keys but never
+    // the hash `keysFor` also derives from `self.hs.symmetric_state`.
+    const ref_hash = rrsp.symmetric_state.getHandshakeHash();
+    try testing.expectEqualSlices(u8, &ref_hash, &fin_i.keys.transcript_hash);
+    try testing.expectEqualSlices(u8, &ref_hash, &fin_r.keys.transcript_hash);
+}
+
+test "F1: transcript_hash differs between two tenants that otherwise complete identically" {
+    // The only prior assertions on transcript_hash were "initiator's equals
+    // responder's" and "wipe leaves it intact" -- both trivially true even
+    // for a fixed constant. Complete two full, otherwise-identical
+    // handshakes that differ ONLY in FabricContext.isid (so both succeed --
+    // this is not the "different I-SIDs fail" isolation test, it is two
+    // SEPARATE tenants each with their own consistent context) and confirm
+    // their resulting transcript hashes are distinct: a constant would
+    // silently collapse this channel-binding value across every tenant.
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    const ctx_a = FabricContext{ .isid = 0x0A0A0A, .initiator_pe = 1, .responder_pe = 2 };
+    const ctx_b = FabricContext{ .isid = 0x0B0B0B, .initiator_pe = 1, .responder_pe = 2 };
+
+    const Run = struct {
+        fn go(is_: KeyPair, rs_: KeyPair, ctx: FabricContext, seed: u64) !SessionKeys {
+            var ini = Initiator.init(is_, rs_.public_key, ctx);
+            var rsp = Responder.init(rs_, ctx);
+            var prng = testRandom(seed);
+            var m1: [256]u8 = undefined;
+            var m2: [256]u8 = undefined;
+            var pl: [64]u8 = undefined;
+            const n1 = try ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
+            _ = try rsp.readMessage1(m1[0..n1], &pl);
+            const fin_r = try rsp.writeMessage2(prng.random(), "", m2[0..message2Len(0)]);
+            const fin_i = try ini.readMessage2(m2[0..fin_r.len], &pl);
+            try testing.expectEqualSlices(u8, &fin_i.keys.transcript_hash, &fin_r.keys.transcript_hash);
+            return fin_i.keys;
+        }
+    };
+    const keys_a = try Run.go(is, rs, ctx_a, 0x1010);
+    const keys_b = try Run.go(is, rs, ctx_b, 0x1010); // same seed: only isid differs
+    try testing.expect(!std.mem.eql(u8, &keys_a.transcript_hash, &keys_b.transcript_hash));
 }
 
 test "state machine: out-of-order calls are rejected with WrongState" {
@@ -634,4 +676,50 @@ test "Initiator/Responder.wipe destroys the copied long-term static secret key" 
     try testing.expectEqualSlices(u8, &zero, &res.hs.s.?.secret_key);
     // The caller's own copy is untouched — we only own the copy inside `hs`.
     try testing.expectEqualSlices(u8, &init_static_priv, &i_kp.secret_key);
+}
+
+// ── fuzz: readMessage1 / readMessage2 over arbitrary wire bytes ──────────
+//
+// F3: the module had no fuzz harness and was absent from every repo-wide
+// sweep, despite these two entry points taking raw attacker-supplied wire
+// bytes. `noise` itself is fuzzed and covers the actual parsing; what
+// tenantkex adds on top is a state-enum check and the split->key mapping,
+// neither of which parses — so this is a thin harness by design, not an
+// attempt to duplicate `noise`'s own coverage.
+
+fn fuzzReadMessage1(_: void, smith: *std.testing.Smith) !void {
+    var msg: [256]u8 = undefined;
+    smith.bytes(&msg);
+    const len: usize = smith.valueRangeAtMost(u16, 0, msg.len);
+
+    var rsp = Responder.init(kp(resp_static_priv), demo_ctx);
+    var payload_out: [256]u8 = undefined;
+    // Arbitrary bytes must only ever yield a typed error (short message /
+    // bad auth tag) or a successful decode, never a panic or OOB write.
+    _ = rsp.readMessage1(msg[0..len], &payload_out) catch return;
+}
+
+test "fuzz: Responder.readMessage1 never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzReadMessage1, .{});
+}
+
+fn fuzzReadMessage2(_: void, smith: *std.testing.Smith) !void {
+    var msg: [256]u8 = undefined;
+    smith.bytes(&msg);
+    const len: usize = smith.valueRangeAtMost(u16, 0, msg.len);
+
+    // A real Initiator that has genuinely sent msg1, so readMessage2 is
+    // reached in the state where it actually does work (WrongState from
+    // `.start` would make this a no-op fuzz target).
+    var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+    var prng = testRandom(0x9999);
+    var m1: [256]u8 = undefined;
+    _ = ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]) catch return;
+
+    var payload_out: [256]u8 = undefined;
+    _ = ini.readMessage2(msg[0..len], &payload_out) catch return;
+}
+
+test "fuzz: Initiator.readMessage2 never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzReadMessage2, .{});
 }

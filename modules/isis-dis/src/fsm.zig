@@ -97,8 +97,17 @@ pub const Election = struct {
         const r = elect(self.local, neighbours);
         var eff: Effect = .{ .result = r };
 
+        // Keyed on `lan_id` (system id ‖ pseudonode id), not `dis_system_id`
+        // alone: `lan_id` is what a Hello advertises and what
+        // `pseudonodeLspId()` is derived from, so it is what a caller must
+        // track to know when to stop chasing the OLD pseudonode LSP. The
+        // same system id can keep winning while its pseudonode byte changes
+        // (a DIS restart picking a different circuit id, or a neighbour's
+        // `lan_id` going from 0 to nonzero the moment it becomes DIS) — a
+        // system-id-only key would miss that and leave the caller tracking
+        // a stale pseudonode LSP-ID.
         const flipped = if (self.current) |old|
-            !std.mem.eql(u8, &old.dis_system_id, &r.dis_system_id)
+            !std.mem.eql(u8, &old.lan_id, &r.lan_id)
         else
             true; // the first election always establishes a DIS
 
@@ -199,6 +208,32 @@ test "a DIS flip between two remote routers is a change with neither became nor 
     try testing.expect(!c.resigned_dis);
     // lan_id tracks the winning neighbour's advertised pseudonode id.
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 3, 6 }, &eff.result.lan_id);
+}
+
+test "DisChange keys on lan_id, not just dis_system_id: a stale pseudonode byte still fires a change" {
+    // A remote router keeps the SAME system id but its advertised
+    // pseudonode id changes between recomputes — e.g. it restarts and picks
+    // a different circuit id, or its Hello's lan_id was 0 until it declared
+    // itself DIS. `dis_system_id` alone would see no change here (F1); the
+    // caller needs a DisChange so it stops tracking the old pseudonode
+    // LSP-ID and starts tracking the new one.
+    const low_local: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 1, .snpa = snpa(0x01), .pseudonode_id = 1 };
+    const remote_old_pn: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 90, .snpa = snpa(0x20), .pseudonode_id = 5 };
+    const remote_new_pn: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 90, .snpa = snpa(0x20), .pseudonode_id = 7 };
+
+    var e = Election.init(low_local);
+    const e1 = e.recompute(&.{remote_old_pn}, 1);
+    try testing.expect(e1.change != null);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 2, 5 }, &e1.result.lan_id);
+
+    // Same winning system id, only the pseudonode byte changed.
+    const e2 = e.recompute(&.{remote_new_pn}, 2);
+    try testing.expectEqual(remote_old_pn.system_id, e2.result.dis_system_id);
+    try testing.expectEqual(remote_new_pn.system_id, e2.result.dis_system_id); // same system id either side
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 2, 7 }, &e2.result.lan_id);
+    const c2 = e2.change orelse return error.TestExpectedChangeOnPseudonodeFlip;
+    try testing.expectEqual(remote_old_pn.system_id, c2.old_dis.?);
+    try testing.expectEqual(remote_new_pn.system_id, c2.new_dis);
 }
 
 test "determinism: identical (candidate-set, now) streams yield identical effects" {

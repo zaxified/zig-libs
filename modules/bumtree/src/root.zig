@@ -99,6 +99,13 @@ pub const Options = struct {
     /// fabric and delivering toward non-members); kept solely to prove, in a
     /// permanent test, that pruning is load-bearing.
     prune: bool = true,
+
+    /// Test-only instrumentation: when non-null, incremented once per visit
+    /// of the member-pruning walk's `while (true)` body (i.e. once per
+    /// `has_member[cur]` check in `buildWith`). Lets a test assert the walk
+    /// stays `O(nodes)` regardless of member count, per the doc comment on
+    /// `buildWith`'s algorithm step 2. Never read by production code.
+    mark_steps: ?*usize = null,
 };
 
 /// One source's pruned per-source BUM distribution tree + RPF plan. Caller-owned;
@@ -243,6 +250,7 @@ pub fn buildWith(
         if (m >= n or !tree.reachable(m)) continue;
         var cur = m;
         while (true) {
+            if (opts.mark_steps) |s| s.* += 1;
             if (has_member[cur]) break; // this node (and its ancestors) already marked
             has_member[cur] = true;
             if (cur == source) break;
@@ -734,6 +742,33 @@ test "unreachable member: flagged but never a replication target" {
     try testing.expectEqualSlices(NodeId, &.{1}, bt.replicateTo(0)); // only reachable member's branch
     try testing.expect(bt.isMember(3)); // flagged…
     try testing.expectEqual(@as(?NodeId, null), bt.rpfIngress(3)); // …but unreachable
+}
+
+test "member-pruning walk is O(nodes), not O(members x depth): the has_member short-circuit is load-bearing" {
+    // A depth-9 chain 0->1->...->9, source = 0, with the far leaf (9) listed
+    // as a member 40 times over. The has_member[cur] short-circuit means the
+    // first walk marks all 10 nodes and every subsequent duplicate walk
+    // breaks after a single step, so total steps stay bounded in the number
+    // of NODES, not (members x depth). Without the short-circuit each of
+    // the 40 duplicate members would re-walk the full depth-9 chain.
+    const gpa = testing.allocator;
+    var g = spf.Graph.init(gpa);
+    defer g.deinit();
+    const chain_len = 10;
+    var i: NodeId = 0;
+    while (i + 1 < chain_len) : (i += 1) try g.addEdge(i, i + 1, 1);
+
+    var members: [40]NodeId = undefined;
+    for (&members) |*m| m.* = chain_len - 1; // same far leaf, duplicated
+
+    var steps: usize = 0;
+    var bt = try buildWith(gpa, &g, 0, &members, .{ .mark_steps = &steps });
+    defer bt.deinit();
+
+    // O(nodes): bounded by node_count plus one cheap short-circuit check per
+    // duplicate member. A broken (non-short-circuiting) walk would instead
+    // cost members.len * chain_len == 400 steps, which this bound rejects.
+    try testing.expect(steps <= chain_len + members.len);
 }
 
 test "meta is well-formed" {

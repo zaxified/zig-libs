@@ -320,7 +320,7 @@ fn elementText(el: *const xml.Element, source: []const u8) []const u8 {
         },
         else => {},
     };
-    if (count != 1) return std.mem.trim(u8, out, " \t\r\n");
+    if (count != 1) return ""; // split across multiple text/CDATA nodes (or none) — see doc comment
     return std.mem.trim(u8, out, " \t\r\n");
 }
 
@@ -613,6 +613,26 @@ test "parseReply: an unmodelled error-tag keeps its text" {
     defer r.deinit();
     try testing.expectEqual(ErrorTag.unknown, r.errors[0].tag);
     try testing.expectEqualStrings("vendor-specific-boom", r.errors[0].tag_text);
+}
+
+test "F2: elementText falls back to \"\" when the text is split across multiple nodes, per its own doc comment" {
+    // The `count != 1` branch and its fallthrough used to be byte-identical
+    // (`return trim(out)` both times), so an element whose text was split by
+    // a comment/CDATA silently returned only the LAST text node instead of
+    // the documented "" fallback. `error-tag` isn't a realistic place for a
+    // comment to appear, but `elementText` has no notion of which caller it
+    // serves — it must behave per its own contract for any leaf element.
+    const gpa = testing.allocator;
+    const src =
+        \\<rpc-reply message-id="1" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <rpc-error><error-tag>a<!--x-->b</error-tag></rpc-error>
+        \\</rpc-reply>
+    ;
+    var r = try parseReply(gpa, src);
+    defer r.deinit();
+    // Two text nodes ("a" and "b") either side of the comment: count != 1,
+    // so this must be "", never "b" (the last node) or "a" (the first).
+    try testing.expectEqualStrings("", r.errors[0].tag_text);
 }
 
 test "parseReply: an RPC-specific body is exposed verbatim, not dropped" {

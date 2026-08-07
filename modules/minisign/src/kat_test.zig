@@ -20,6 +20,24 @@ test "prehashed KAT: parse + verify a real minisign signature" {
     try m.verifyFile(std.testing.allocator, pub_key.key, kat.message, parsed);
 }
 
+test "F1: verifyFile rejects a tampered trusted comment, not just verifyTrustedComment directly" {
+    // verifyFile is the only API that verifies BOTH layers (message +
+    // trusted comment). Every existing trusted-comment negative test calls
+    // verifyTrustedComment directly, so a regression that dropped that call
+    // from verifyFile's body (e.g. `_ = allocator;` and nothing else) was
+    // invisible to the suite. Go through the composed entry point with a
+    // genuine minisign-signed KAT fixture whose trusted comment has been
+    // tampered with after parsing.
+    const pub_key = try m.parsePublicKeyFile(kat.unencrypted_public_key_file);
+    var parsed = try m.parseSignatureFile(kat.prehashed_signature_file);
+
+    // The message/key-id layer alone still verifies (untouched).
+    try std.testing.expectError(error.SignatureVerificationFailed, blk: {
+        parsed.trusted_comment = "tampered trusted comment";
+        break :blk m.verifyFile(std.testing.allocator, pub_key.key, kat.message, parsed);
+    });
+}
+
 test "legacy KAT: parse + verify a real minisign signature" {
     const pub_key = try m.parsePublicKeyFile(kat.unencrypted_public_key_file);
     const parsed = try m.parseSignatureFile(kat.legacy_signature_file);

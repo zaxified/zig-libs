@@ -647,6 +647,37 @@ test "old-style #2 IS reachability is extracted too" {
     try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 7 }, table.lookup(b).?);
 }
 
+test "old-style #2 default metric: the I/E bit is masked off, not folded into the value (ISO 10589 §9.8)" {
+    // The octet's high bit is the I/E (internal/external) flag; only the low
+    // 6 bits are the metric value. An LSP advertising an EXTERNAL default
+    // metric of 7 (I/E=1) is encoded as 0x87 = 0b1000_0111. Reading the whole
+    // byte instead of masking would extract 135, a 19x error.
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+
+    inline for (.{ .{ a, b }, .{ b, a } }) |pair| {
+        var buf: [128]u8 = undefined;
+        var lb = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 1000,
+            .lsp_id = .{ pair[0][0], pair[0][1], pair[0][2], pair[0][3], pair[0][4], pair[0][5], 0, 0 },
+            .sequence_number = 1,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        const nbr = pair[1];
+        const val = [_]u8{0} // virtual flag
+            ++ [_]u8{ 0x87, 0x80, 0x80, 0x80 } // I/E=1, value=7 (others "not supported")
+            ++ [_]u8{ nbr[0], nbr[1], nbr[2], nbr[3], nbr[4], nbr[5], 0 };
+        try lb.tlvs.addTlv(isis.tlvs.code.is_neighbours_lsp, &val);
+        _ = try db.insert(lb.finish(), null, 0);
+    }
+
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 7 }, table.lookup(b).?);
+}
+
 // ── LAN pseudonode neighbour filter ──────────────────────────────────────────
 //
 // A LAN's designated IS (DIS) originates a pseudonode LSP whose LSP-ID has a
