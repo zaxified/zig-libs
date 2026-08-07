@@ -23,8 +23,9 @@ caller's `now`). Point-to-point topology only this increment. Out of scope: §6.
   over-read.
 - **`isis-lsdb`** (store) — `iterator(now) → ViewIterator` yielding `EntryView`
   with `lsp_id`, owned PDU `bytes`, and `is_request`. This module only reads it.
-- **`spf-ect`** (graph) — the `Graph` builder (`ensureNode`, `addEdge`,
-  **undirected**, `Weight = u32 ≥ 1`, `Distance = u64`), `shortestPathTree(gpa,
+- **`spf-ect`** (graph) — the `Graph` builder (`ensureNode`, `addArc`
+  (**directed**, one weight per direction) / `addEdge` (both directions at one
+  weight), `Weight = u32 ≥ 1`, `Distance = u64`), `shortestPathTree(gpa,
   graph, root) → Tree` (Dijkstra + the ECT tie-break already applied), and
   `Tree.pred` / `distanceTo` / `reachable`.
 
@@ -47,68 +48,79 @@ Directed advertisements are deduped per ordered `(from, to)` pair, keeping the
 **minimum** metric (a link advertised via both #2 and #22, or across LSP
 fragments, resolves to its best cost).
 
-### 3.2 Two-way reachability (ISO/IEC 10589 §7.2.5)
+### 3.2 Two-way connectivity check (ISO/IEC 10589 §7.2.8.2)
 
-> "…a designated intermediate system shall only consider an adjacency to a
-> neighbour in the SPF computation if that neighbour also reports an adjacency
-> back."  (ISO/IEC 10589 §7.2.5, the two-way connectivity check.)
+Verbatim, from the clause (§7.2.8.2 "Two-way connectivity check"; earlier
+revisions of this file paraphrased it and mis-cited it as §7.2.5, which is
+"Multiple LSPs for the same system"):
 
-An undirected edge for the unordered pair {A, B} is admitted **only if both A⟶B
-and B⟶A were advertised**. This is the reason the model needs *directed*
-advertisements collected first and *undirected* edges derived second. It is what
+> "The Decision Process shall not utilise a link between two Intermediate
+> Systems unless both ISs report the link.
+> NOTE – the check is not applicable to links to an End System.
+> Reporting the link indicates that it has a defined value for at least the
+> default routeing metric. **It is permissible for two endpoints to report
+> different defined values of the same metric for the same link. In this case,
+> routes may be asymmetric.**"
+
+The link {A, B} is admitted **only if both A⟶B and B⟶A were advertised**, and
+each direction then enters SPF as its own arc at its own metric — the clause
+decides whether a link is *used*, never what it *costs* (§3.3). The check
 prevents a stale one-directional LSP — a neighbour that has gone away but whose
 LSP has not yet aged out, or a half-formed adjacency — from creating a
 forwarding path that does not exist.
 
 The **positive control** (`Options.require_two_way = false`) admits a single
-directed advertisement as an edge. It is deliberately wrong and exists only so a
-permanent test can show that flipping the flag makes the one-way edge appear —
-i.e. that the two-way check is the load-bearing part, not an accident of the
-topology.
+directed advertisement, mirroring it onto the direction nobody reported. It is
+deliberately wrong and exists only so a permanent test can show that flipping
+the flag makes the one-way link appear — i.e. that the two-way check is the
+load-bearing part, not an accident of the topology.
 
-### 3.3 Metric handling and the undirected-engine limitation
+### 3.3 Metric handling: one arc per direction
 
-`spf-ect` is an **undirected** graph with **one** `u32` weight per edge; real
-IS-IS SPF is directed (the arc A→B uses A's advertised metric to B). With a
-single weight per edge we cannot represent asymmetric metrics exactly. The
-deterministic rule chosen:
+IS-IS metrics are per-interface, so the two ends of a link may advertise
+different costs, and the SPF is directed. ISO/IEC 10589 Annex C.2.4 ("The
+Algorithm"), Step 1, verbatim:
 
-- the edge weight for {lo, hi} (lo < hi by system-id) is **lo's advertised
-  metric to hi** — the endpoint with the lexicographically-smaller system-id.
-  This is iteration-order-independent and, when metrics are **symmetric** (which
-  IEEE 802.1aq *requires* for congruent forward/reverse paths — the SPB fabric
-  this stack targets), exactly correct.
+> "compute
+>   dist(P,N) = d(P) + metric_k(P,N).
+> for each neighbour N (both Intermediate System and End system) of the system
+> P. … d(P) is the second element of the triple ⟨P,d(P),{Adj(P)}⟩ and
+> **metric_k(P,N) is the cost of the link from P to N as reported in P's Link
+> State PDU**"
+
+So the weight used to relax P→N is P's *own* advertisement for N, for the
+direction actually being traversed. Each admitted direction therefore becomes
+its own `spf-ect` arc (`Graph.addArc`) at its own metric; nothing is merged.
+This closes the wrong-answer case documented in earlier revisions of this file:
+FRR 10.3 reaches r3 at cost **15 via r5**, and so does this module — the FRR
+anchor at the bottom of `src/root.zig` now asserts the agreement it used to
+assert as a divergence.
+
+There is no single-weight rule that could have done this: which direction of a
+link a path traverses is decided by the tree being computed, so the needed
+weight is not knowable when the graph is built. The old rule (weight of {lo,hi}
+= lo's advertisement) answered 30 via r4 on the anchor topology.
+
+Also:
+
 - a metric of 0 is clamped to **1**: `spf-ect` rejects a zero weight because a
-  0-cost edge can produce a predecessor 2-cycle that makes tree walks loop. A
+  0-cost arc can produce a predecessor 2-cycle that makes tree walks loop. A
   genuinely 0-cost IS-IS link is treated as cost 1.
 - old-style #2 default metric: the **low 6 bits** of the octet are the value;
   the high bits are I/E / supported flags.
 
-**Asymmetric metrics are detected and, by default, refused.** The rule above is
-an approximation, and where it is only an approximation it is now said out loud
-rather than left to a comment:
+**Asymmetry is reported, not refused.** §7.2.8.2 permits it outright, so:
 
 - `RouteTable.asymmetric_links` counts the admitted links whose two endpoints
-  advertised **different** metrics. Zero is the only value that means the routes
-  are exact; non-zero means at least one destination may carry a next hop and a
-  metric a real IS-IS router would not agree with.
-- `Options.reject_asymmetric` (**default true**) turns such a database into
-  `error.AsymmetricMetric` instead of a plausible-looking wrong answer.
-  `compute` cannot use it — its `Allocator.Error` signature is compiled against
-  by `isis-sim` and `spbfib` — so `compute` approximates and reports through the
-  count; `computeWith` is the entry point that refuses.
-
-This matters because the failure is not a rounding error. The FRR 10.3 anchor at
-the bottom of `src/root.zig` is a measured case: FRR reaches r3 at cost **15 via
-r5**, the approximation here says **30 via the r4 branch** — wrong next hop and
-double the cost. Note also that *no* choice of the single weight fixes this in
-general: which direction of an edge a path traverses is decided by the tree being
-computed, so the needed weight is not knowable when the graph is built.
-
-A directed IS-IS SPF (per-arc metric) is therefore the only real fix, and it
-would require either extending `spf-ect` to a directed graph or a different
-engine — **it does not live in this module**. Documented, deferred; until it
-exists, refusing is the honest answer.
+  advertised **different** metrics. It no longer means "approximate" — the
+  routes are exact either way. It matters because IEEE 802.1aq *requires*
+  symmetric metrics for congruent forward/reverse paths, so an SPB fabric with
+  a non-zero count is misconfigured.
+- `Options.reject_asymmetric` (**default `false`**, was `true`) is the opt-in
+  form of that check: `error.AsymmetricMetric` instead of a
+  correct-but-asymmetric table. `compute` never uses it (its `Allocator.Error`
+  signature is compiled against by `isis-sim` and `spbfib`) and no longer needs
+  to.
 
 ### 3.4 Intern mapping (system-id ↔ NodeId)
 
@@ -178,8 +190,6 @@ across runs (a permanent test pins this).
   decoded LSP for a future increment.
 - **Incremental SPF.** Each call is a full recomputation. Incremental / partial
   SPF on an LSDB delta is a performance optimisation, not needed for correctness.
-- **Directed (asymmetric) metrics.** See §3.3 — the undirected engine uses the
-  lower-system-id endpoint's metric; exact only for symmetric metrics. Deferred,
-  **not** silently: an asymmetric link is counted on the `RouteTable` and, by
-  default in `computeWith`, refused outright (`error.AsymmetricMetric`). The
-  engine change belongs to `spf-ect`.
+- ~~**Directed (asymmetric) metrics.**~~ **No longer deferred** — `spf-ect`
+  gained `Graph.addArc` and this module now adds one arc per advertised
+  direction at that direction's own metric (§3.3). The FRR anchor agrees.

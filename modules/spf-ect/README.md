@@ -1,9 +1,11 @@
 # spf-ect
 
-Deterministic **symmetric shortest paths**: Dijkstra plus a totally-ordered,
-direction-independent tie-break, so that `path(A→B)` is always exactly the
-reverse of `path(B→A)` no matter which end computes it. That property is what
-lets independent nodes agree on a forwarding tree without exchanging the result.
+Deterministic shortest paths over a **directed** weighted graph, with an
+undirected-link convenience constructor: Dijkstra plus a totally-ordered,
+direction-independent tie-break, so that on a symmetric graph `path(A→B)` is
+always exactly the reverse of `path(B→A)` no matter which end computes it. That
+property is what lets independent nodes agree on a forwarding tree without
+exchanging the result.
 Also provides a disjointness-*minimizing* second tree (PRP mode) — a greedy
 equal-cost tie-break that steers onto unused links wherever the graph offers
 one; **not** a max-flow disjoint-path guarantee.
@@ -24,8 +26,9 @@ const spf = @import("spf-ect");
 
 var g = spf.Graph.init(gpa);
 defer g.deinit();
-try g.addEdge(0, 1, 4);
+try g.addEdge(0, 1, 4);   // both directions at weight 4
 try g.addEdge(1, 2, 3);
+try g.addArc(2, 0, 9);    // one direction only — 0→2 stays absent
 
 const path = try spf.shortestPath(gpa, &g, 0, 2); // [0, 1, 2]
 defer gpa.free(path);
@@ -52,11 +55,31 @@ primary-tree overlap key for the second tree.
 Adjacency is kept sorted by neighbor id, so relaxation order is deterministic
 and a run does not depend on insertion order.
 
+## Directed arcs
+
+`Graph.addArc(from, to, w)` adds one direction; `addEdge(a, b, w)` is exactly
+`addArc(a, b, w)` + `addArc(b, a, w)`. Storage is unchanged either way — the
+adjacency was always a per-node list of outgoing arcs, and Dijkstra always
+relaxed the list of the node it expanded, so the *engine* was already directed;
+only the constructor was not.
+
+This is what a link-state decision process needs: ISO/IEC 10589 Annex C.2.4
+Step 1 relaxes `dist(P,N) = d(P) + metric_k(P,N)` where "metric_k(P,N) is the
+cost of the link from P to N as reported in P's Link State PDU", and §7.2.8.2
+permits the two endpoints of one link to advertise different values ("routes
+may be asymmetric"). No per-link weight can stand in for both directions,
+because which direction a path uses is decided by the tree being computed —
+see `isis-spf`'s FRR anchor for the measured case.
+
+On a graph with an asymmetric arc pair the reversal property above does not
+hold, and cannot: the two directions have different costs. That is a property
+of the topology, not of the comparator.
+
 ## Verify
 
 ```
-zig build test-spf-ect                          # Debug       — 10 pass
-zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast — 10 pass
+zig build test-spf-ect                          # Debug       — 13 pass
+zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast — 13 pass
 ```
 
 The property harness is the real check: reversal symmetry, strict-total-order

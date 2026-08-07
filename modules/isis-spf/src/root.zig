@@ -8,16 +8,26 @@
 //!      IS-reachability TLVs (#22 Extended IS Reachability, RFC 5305; and the
 //!      old-style #2 IS Neighbours, ISO 10589 §9.8) into `(neighbour, metric)`
 //!      directed advertisements.
-//!   2. **Two-way reachability (ISO §7.2.5).** An edge A–B is used only when A
-//!      advertises B *and* B advertises A. A one-way advertisement (a
-//!      half-formed adjacency, or a neighbour that just left) is dropped — this
-//!      is the classic SPF stability rule, and it is what keeps a stale
-//!      one-directional LSP from poisoning the tree.
-//!   3. **SPF.** Intern each system-id to a dense `spf-ect` `NodeId`, build the
-//!      `spf-ect.Graph`, and run `shortestPathTree` from the local system.
+//!   2. **Two-way connectivity check (ISO §7.2.8.2: "The Decision Process shall
+//!      not utilise a link between two Intermediate Systems unless both ISs
+//!      report the link").** A link A–B is used only when A advertises B *and*
+//!      B advertises A. A one-way advertisement (a half-formed adjacency, or a
+//!      neighbour that just left) is dropped — this is the classic SPF
+//!      stability rule, and it is what keeps a stale one-directional LSP from
+//!      poisoning the tree. The check admits the link; it does **not** merge
+//!      the two metrics — the same clause says "It is permissible for two
+//!      endpoints to report different defined values of the same metric for the
+//!      same link. In this case, routes may be asymmetric."
+//!   3. **SPF.** Intern each system-id to a dense `spf-ect` `NodeId`, add one
+//!      *directed arc* per admitted direction at that direction's own
+//!      advertised metric (ISO Annex C.2.4 Step 1: `dist(P,N) = d(P) +
+//!      metric_k(P,N)`, where "metric_k(P,N) is the cost of the link from P to
+//!      N as reported in P's Link State PDU"), and run `shortestPathTree` from
+//!      the local system.
 //!      `spf-ect` owns Dijkstra *and* the ECT (802.1aq / RFC 6329) tie-break, so
-//!      equal-cost path selection is symmetric and loop-free by construction;
-//!      this module only consumes the resolved tree.
+//!      equal-cost path selection is loop-free by construction — and, on a
+//!      symmetric-metric fabric (which 802.1aq requires), congruent in both
+//!      directions; this module only consumes the resolved tree.
 //!   4. **Route table.** For every reachable destination system-id, resolve the
 //!      first hop after the root (walking the tree's predecessor chain) and the
 //!      total metric, emitting `dest → { next_hop, metric }`, sorted by dest.
@@ -61,42 +71,43 @@ pub const Route = struct {
 /// Tuning for `computeWith`. The defaults are the correct/safe behaviour;
 /// `require_two_way = false` exists only for the permanent positive control.
 pub const Options = struct {
-    /// The ISO §7.2.5 two-way reachability check. When `true` (default,
-    /// correct) an undirected edge A–B is admitted to SPF only if BOTH A
-    /// advertises B and B advertises A. When `false` a *single* directed
-    /// advertisement is enough — deliberately WRONG (a one-way/stale
-    /// advertisement poisons the tree); kept solely to prove, in a permanent
-    /// test, that the two-way check is load-bearing.
+    /// The ISO §7.2.8.2 two-way connectivity check. When `true` (default,
+    /// correct) the link A–B is admitted to SPF only if BOTH A advertises B
+    /// and B advertises A; each direction then relaxes at its own advertised
+    /// metric. When `false` a *single* directed advertisement is enough, and
+    /// the missing direction is mirrored from the one that exists —
+    /// deliberately WRONG (a one-way/stale advertisement poisons the tree);
+    /// kept solely to prove, in a permanent test, that the two-way check is
+    /// load-bearing.
     require_two_way: bool = true,
 
-    /// Refuse to emit a table this module knows is wrong.
+    /// Refuse a database that carries an asymmetric link at all — an
+    /// **opt-in fabric-hygiene check, not a correctness guard**.
     ///
-    /// IS-IS metrics are **per-interface and therefore directional**: ISO
-    /// 10589 §7.2 relaxes the arc A→B with A's own advertised metric to B.
-    /// `spf-ect` is an *undirected* engine with one weight per edge, so when
-    /// the two endpoints advertise different metrics for the same link there
-    /// is no single weight that reproduces a directed SPF — the next hop and
-    /// the total metric can both come out wrong, and the FRR anchor at the
-    /// bottom of this file is a measured instance of exactly that (FRR 10.3
-    /// reaches r3 at cost 15 via r5; the approximation here says 30 via the
-    /// r4 branch). With this set (the default) such a database is a typed
-    /// `error.AsymmetricMetric` instead of a plausible-looking wrong answer.
+    /// IS-IS metrics are per-interface and therefore directional, and ISO
+    /// 10589 §7.2.8.2 explicitly permits the two endpoints to report
+    /// different values for the same link ("routes may be asymmetric"). Since
+    /// `55752d4`'s successor this module honours that: each direction becomes
+    /// its own `spf-ect` arc at its own advertised metric, so an asymmetric
+    /// database now produces the *right* table (the FRR anchor at the bottom
+    /// of this file is the measured proof: FRR 10.3 reaches r3 at cost 15 via
+    /// r5, and so do we). This flag therefore no longer defends against a
+    /// wrong answer, and its default is `false`.
     ///
-    /// Note the entry points differ, deliberately: `compute` **cannot** fail
-    /// closed — its `Allocator.Error` signature is compiled against by other
-    /// modules — so it approximates and reports through
-    /// `RouteTable.asymmetric_links`. `computeWith` is the one that can
-    /// refuse, and does so unless told otherwise. An 802.1aq/SPB fabric
-    /// requires symmetric metrics for congruent forward/reverse paths, so in
-    /// this stack's own topologies the flag never fires.
-    reject_asymmetric: bool = true,
+    /// What it is still good for: an 802.1aq/SPB fabric REQUIRES symmetric
+    /// metrics, because congruent forward/reverse paths are what make its
+    /// reverse-path check and its ECT tie-break meaningful. Such a caller can
+    /// set this and get `error.AsymmetricMetric` on a misconfigured fabric
+    /// rather than a correct-but-asymmetric table it cannot use. Either way
+    /// `RouteTable.asymmetric_links` reports the count.
+    reject_asymmetric: bool = false,
 };
 
 /// `computeWith` fails for two reasons only.
 pub const Error = Allocator.Error || error{
     /// A link was advertised in both directions with **different** metrics,
-    /// and `Options.reject_asymmetric` was set. The undirected engine cannot
-    /// represent it; see that option.
+    /// and `Options.reject_asymmetric` was set. The engine represents this
+    /// fine; the caller asked to be told instead. See that option.
     AsymmetricMetric,
 };
 
@@ -106,14 +117,15 @@ pub const RouteTable = struct {
     gpa: Allocator,
     routes: []Route,
     /// How many admitted links were advertised in both directions with
-    /// **different** metrics — i.e. how many edges this table's weights are
-    /// only an approximation of (see `Options.reject_asymmetric`).
+    /// **different** metrics. Informational: the routes are computed with
+    /// each direction's own metric (ISO Annex C.2.4 Step 1), so a non-zero
+    /// count does **not** make the table approximate — it used to, when the
+    /// engine was undirected and had to pick one of the two metrics.
     ///
-    /// **Zero is the only value that means the routes are exact.** Non-zero
-    /// says at least one destination may carry a next hop and a metric a
-    /// directed SPF — a real IS-IS router — would not agree with, so a
-    /// caller outside a symmetric-metric fabric must treat the table as
-    /// advisory rather than authoritative.
+    /// It is still worth reporting, because a fabric that requires symmetric
+    /// metrics (802.1aq/SPB, whose forward/reverse congruency this stack
+    /// relies on) is misconfigured if this is non-zero — see
+    /// `Options.reject_asymmetric`.
     asymmetric_links: u32 = 0,
 
     pub fn deinit(self: *RouteTable) void {
@@ -144,13 +156,15 @@ pub const RouteTable = struct {
 };
 
 /// Compute the forwarding table from `db` as seen at `now`, rooted at the
-/// `local` system-id, with the correct ISO §7.2.5 two-way check. See
-/// `computeWith` for the details and the degenerate cases.
+/// `local` system-id, with the correct ISO §7.2.8.2 two-way connectivity
+/// check. See `computeWith` for the details and the degenerate cases.
 ///
-/// This entry point **approximates** an asymmetric link rather than refusing
-/// it (its error set is part of a signature other modules compile against);
-/// check `RouteTable.asymmetric_links != 0` to find out whether it had to, or
-/// call `computeWith` and let `Options.reject_asymmetric` fail closed.
+/// This entry point cannot fail on anything but OOM (its error set is part of
+/// a signature other modules compile against) and does not need to: an
+/// asymmetric link is *computed*, not approximated — each direction relaxes at
+/// its own advertised metric. `RouteTable.asymmetric_links` still reports how
+/// many such links there were, for callers (802.1aq fabrics) that require
+/// symmetry for reasons of their own.
 pub fn compute(gpa: Allocator, db: *const lsdb.Lsdb, local: SystemId, now: Time) Allocator.Error!RouteTable {
     return computeWith(gpa, db, local, now, .{ .reject_asymmetric = false }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -223,63 +237,60 @@ pub fn computeWith(
         };
     }
 
-    // ── 2. two-way reachability → unordered edges ────────────────────────────
-    // pairs: canonical (lo ++ hi), lo < hi → the undirected edge weight.
-    var pairs: std.AutoHashMapUnmanaged([12]u8, spf.Weight) = .empty;
-    defer pairs.deinit(gpa);
+    // ── 2. two-way connectivity check → admitted directed arcs ───────────────
+    // arcs: (from ++ to) → the weight to relax that arc with. Per ISO Annex
+    // C.2.4 Step 1 that weight is `metric_k(P,N)`, "the cost of the link from
+    // P to N as reported in P's Link State PDU" — i.e. the *originator's own*
+    // advertisement, for the direction actually being traversed. The two
+    // directions of one link are two arcs and may differ (§7.2.8.2 permits it
+    // in as many words), which is why nothing here merges them into a single
+    // per-link number: no such number exists, because which direction of a
+    // link a path uses is decided by the tree being computed.
+    var arcs: std.AutoHashMapUnmanaged([12]u8, spf.Weight) = .empty;
+    defer arcs.deinit(gpa);
 
-    // Links whose two endpoints advertised different metrics — the edges whose
-    // weight is an approximation, counted so the caller is never left guessing
-    // whether this table is exact. See `Options.reject_asymmetric`.
+    // Links whose two endpoints advertised different metrics. Counted per
+    // unordered pair (at the lo⟶hi entry, so exactly once). Informational —
+    // the routes are exact either way; see `Options.reject_asymmetric`.
     var asymmetric_links: u32 = 0;
 
     var dit = directed.iterator();
     while (dit.next()) |kv| {
         const a: SystemId = kv.key_ptr[0..6].*;
         const b: SystemId = kv.key_ptr[6..12].*;
-        // Canonicalise so each unordered pair is considered once.
-        const lo_first = std.mem.order(u8, &a, &b) == .lt;
-        const lo = if (lo_first) a else b;
-        const hi = if (lo_first) b else a;
-        var canon: [12]u8 = undefined;
-        canon[0..6].* = lo;
-        canon[6..12].* = hi;
-        if (pairs.contains(canon)) continue;
+        const fwd = kv.value_ptr.*; // a ⟶ b, a's own advertised metric
+        var rev_key: [12]u8 = undefined;
+        rev_key[0..6].* = b;
+        rev_key[6..12].* = a;
+        const rev = directed.get(rev_key); // b ⟶ a advertisement, if any
 
-        const lo_hi = directed.get(canon); // lo ⟶ hi advertisement, if any
-        var rev: [12]u8 = undefined;
-        rev[0..6].* = hi;
-        rev[6..12].* = lo;
-        const hi_lo = directed.get(rev); // hi ⟶ lo advertisement, if any
+        // §7.2.8.2: both ISs must report the link, or it is not used at all.
+        if (opts.require_two_way and rev == null) continue;
 
-        if (opts.require_two_way and !(lo_hi != null and hi_lo != null)) continue;
-
-        // ISO 10589's metric is per-interface, so the two endpoints can — and
-        // in the real world do — advertise different costs for the same link.
-        // An undirected single-weight engine has no way to hold both, and no
-        // choice of the one weight reproduces a directed SPF in general: which
-        // direction of the edge a path traverses is decided by the tree, which
-        // is what is being computed. So this is detected rather than papered
-        // over: refused outright by default, and counted otherwise, because
-        // the alternative — the behaviour this replaces — was to return a
-        // confident wrong next hop with no signal of any kind to the caller.
-        if (lo_hi != null and hi_lo != null and lo_hi.? != hi_lo.?) {
+        // Report the asymmetry once per unordered pair (at the lower id's
+        // entry). The metrics themselves are NOT reconciled — each arc keeps
+        // its own.
+        if (rev != null and rev.? != fwd and std.mem.order(u8, &a, &b) == .lt) {
             if (opts.reject_asymmetric) return error.AsymmetricMetric;
             asymmetric_links += 1;
         }
 
-        // Undirected engine: one weight per edge. Use the lo⟶hi advertisement
-        // (the endpoint with the lexicographically-smaller system-id) as the
-        // canonical weight so the choice is deterministic and independent of
-        // LSDB iteration order; SPB requires symmetric metrics, in which case
-        // this is exact. When only hi⟶lo exists (positive-control mode) fall
-        // back to it.
-        const weight = lo_hi orelse hi_lo.?;
-        try pairs.put(gpa, canon, weight);
+        var key: [12]u8 = undefined;
+        key[0..6].* = a;
+        key[6..12].* = b;
+        try arcs.put(gpa, key, fwd);
+
+        // Positive-control path only (`require_two_way = false`): a link
+        // reported by just one endpoint has no metric for the other
+        // direction, so mirror the one advertisement onto the reverse arc.
+        // That reproduces exactly what the old undirected admission did with
+        // a one-way advertisement, which is what the deliberately-broken
+        // control tests below pin.
+        if (rev == null) try arcs.put(gpa, rev_key, fwd);
     }
 
     // ── 3. intern system-ids → dense NodeIds (sorted, deterministic) ─────────
-    // Node set = every edge endpoint, plus `local` if it originated an LSP (so
+    // Node set = every arc endpoint, plus `local` if it originated an LSP (so
     // an isolated local system still yields a self route). Sorting the ids and
     // assigning NodeIds in ascending order makes the mapping independent of
     // hash-map iteration order AND aligns the ECT "low path id" tie-break with
@@ -287,8 +298,8 @@ pub fn computeWith(
     var id_set: std.AutoArrayHashMapUnmanaged(SystemId, void) = .empty;
     defer id_set.deinit(gpa);
     {
-        var pit = pairs.iterator();
-        while (pit.next()) |kv| {
+        var ait = arcs.iterator();
+        while (ait.next()) |kv| {
             try id_set.put(gpa, kv.key_ptr[0..6].*, {});
             try id_set.put(gpa, kv.key_ptr[6..12].*, {});
         }
@@ -315,14 +326,16 @@ pub fn computeWith(
     defer graph.deinit();
     try graph.ensureNode(node_count - 1);
 
-    var pit = pairs.iterator();
+    var pit = arcs.iterator();
     while (pit.next()) |kv| {
         const na = id_to_node.get(kv.key_ptr[0..6].*).?;
         const nb = id_to_node.get(kv.key_ptr[6..12].*).?;
-        graph.addEdge(na, nb, kv.value_ptr.*) catch |err| switch (err) {
-            // Pairs are deduped and lo != hi, so these never fire; a positive
-            // weight is guaranteed by `addDirected`'s clamp. Swallow the
-            // structural ones, propagate OOM.
+        // One directed arc per admitted direction, at that direction's own
+        // advertised metric — ISO Annex C.2.4 Step 1's `metric_k(P,N)`.
+        graph.addArc(na, nb, kv.value_ptr.*) catch |err| switch (err) {
+            // Arcs are keyed by ordered pair (so no duplicates) and from != to,
+            // so these never fire; a positive weight is guaranteed by
+            // `addDirected`'s clamp. Swallow the structural ones, propagate OOM.
             error.DuplicateEdge, error.SelfLoop, error.ZeroWeight => {},
             error.OutOfMemory => return error.OutOfMemory,
         };
@@ -962,20 +975,32 @@ test "determinism: identical databases yield byte-identical tables" {
     }
 }
 
-test "asymmetric metrics: the lower-system-id endpoint's advertisement wins" {
+test "asymmetric metrics: each direction relaxes at its own advertised metric" {
     const a = sysId(0xA);
     const b = sysId(0xB);
     var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
     defer db.deinit();
 
-    // A (lower id) advertises B with 7; B advertises A with 99. The canonical
-    // undirected weight is A's (7).
+    // A advertises B with 7; B advertises A with 99. ISO Annex C.2.4 Step 1:
+    // the arc A→B relaxes at A's own 7, the arc B→A at B's own 99.
     try insertReachLsp(&db, a, 1, &.{.{ .nbr = b, .metric = 7 }});
     try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 99 }});
 
-    var table = try compute(testing.allocator, &db, a, 0);
-    defer table.deinit();
-    try testing.expectEqual(@as(u64, 7), table.lookup(b).?.metric);
+    // From A: 7. (This value was also what the old rule -- "the
+    // lexicographically-lower system-id's advertisement wins" -- produced,
+    // because here A *is* the lower id. That coincidence is why this fixture
+    // alone could never see the defect, and why the second half exists.)
+    var from_a = try compute(testing.allocator, &db, a, 0);
+    defer from_a.deinit();
+    try testing.expectEqual(@as(u64, 7), from_a.lookup(b).?.metric);
+    try testing.expectEqual(@as(u32, 1), from_a.asymmetric_links);
+
+    // From B, over the very same link: 99, not 7. The old rule answered 7
+    // here — the same wrong number for both directions.
+    var from_b = try compute(testing.allocator, &db, b, 0);
+    defer from_b.deinit();
+    try testing.expectEqual(@as(u64, 99), from_b.lookup(a).?.metric);
+    try testing.expectEqual(a, from_b.nextHop(a).?);
 }
 
 test "addDirected: the same ordered pair advertised twice keeps the minimum metric" {
@@ -1092,46 +1117,49 @@ test "two-way check with require_two_way=false: only the hi->lo advertisement ex
 //    r4      TE-IS   20     r4        eth-r4     r1(4)
 //                            r2        eth-r2     r2(4)
 //
-// ── reading the result: three matches and one MEASURED WRONG ANSWER ──
+// ── reading the result: all five rows now match ──
 //
-// r2, r5 (direct neighbours) and r4 (the ECMP tie) match FRR exactly: this
-// module's undirected-engine approximation (SPEC.md §3.3, the canonical
-// edge weight is the LOWER-system-id endpoint's advertised metric) happens
-// to equal the true directed cost on every edge that matters for THOSE
-// three, because the root (r1) is the lower-id endpoint of every edge it
-// uses directly, and {r2,r4} / {r1,r4} are symmetric.
+// r2, r5 (direct neighbours) and r4 (the ECMP tie) always matched FRR: the
+// old undirected approximation (one weight per link, taken from the
+// LOWER-system-id endpoint's advertisement) happened to equal the true
+// directed cost on every link those three use, because the root (r1) is the
+// lower-id endpoint of every link it uses directly, and {r2,r4} / {r1,r4}
+// are symmetric.
 //
-// r3 does not. FRR's real, directed SPF reaches r3 via the r5→r3 arc, whose
-// cost is r5's OWN advertised metric: 5, total 15. This module's edge weight
-// for the *undirected* pair {r3,r5} is canonicalised to the LOWER system-id's
-// advertisement -- r3 (id 3) is lower than r5 (id 5), so the weight used is
-// r3's advertisement (50), not r5's (5), regardless of which direction a path
-// actually needs. That makes the r4 path (20 + 10 = 30) look cheaper than the
-// r5 path (10 + 50 = 60), even though the real network's cheapest path is 15
-// via r5. A router loading that table sends r3's traffic the wrong way and
-// bills it at twice the true cost.
+// r3 did not, and that was the whole finding. FRR's directed SPF reaches r3
+// over the r5→r3 arc at r5's OWN advertised metric -- 5, total 15. The
+// undirected engine had to pick ONE weight for the {r3,r5} pair and picked
+// the lower id's (r3's 50), regardless of which direction a path needs, which
+// made the r4 branch (20 + 10 = 30) look cheaper than the r5 branch
+// (10 + 50 = 60). A router loading that table sent r3's traffic the wrong way
+// and billed it at twice the true cost. `55752d4` made the module detect and
+// refuse such a database instead -- honest, still not an answer.
 //
-// **This transcript is an oracle, and it says we are wrong.** It used to sit
-// here above an assertion of *our* 30, which turned a live external
-// disagreement into a certificate that the disagreement was intended -- the
-// one thing an anchor must never be made to do. What is asserted now is the
-// disagreement itself: the FRR-true numbers are literals, the test states
-// that we do not produce them, and the default entry point that a router
-// would call (`computeWith`) REFUSES this database outright rather than
-// answering 30 (see `Options.reject_asymmetric`).
+// It is an answer now. `spf-ect` grew `Graph.addArc` (one directed arc, one
+// weight, per direction) and step 2 above admits one arc per advertised
+// direction at that direction's own metric, which is precisely ISO/IEC 10589
+// Annex C.2.4 Step 1: `dist(P,N) = d(P) + metric_k(P,N)`, where
+// "metric_k(P,N) is the cost of the link from P to N as reported in P's Link
+// State PDU". Nothing merges the two advertisements, because §7.2.8.2 says
+// they are allowed to differ ("routes may be asymmetric") -- the two-way
+// check decides whether a link is USED, never what it COSTS.
 //
-// The underlying limitation is real and unchanged: ISO 10589 has no notion of
-// a single link cost -- §7.2's SPF relaxes the arc A→B using A's own
-// advertised metric, and an undirected single-weight engine cannot represent
-// that. No choice of the one weight fixes it either, because which direction
-// of an edge a path traverses is decided by the tree being computed. Closing
-// it means a **directed** SPF, which lives in `spf-ect`, not here (SPEC.md §6
-// "Directed (asymmetric) metrics"). Until that exists, refusing is the honest
-// answer and the numbers below are what to compare a directed engine against.
+// So the assertions below changed direction: they used to pin our
+// disagreement with the oracle (asserting our 30, and that `computeWith`
+// refuses); they now pin agreement with it (15 via r5). Every other claim the
+// old tests made is still made -- five routes, the asymmetric-link count of
+// 1, r2/r5 exact, r4's ECMP tie -- plus the explicit statement that the old
+// wrong answer (30 via r4/r2) is NOT what comes back, so the regression
+// cannot return unnoticed.
 
 /// FRR 10.3's answer for this topology, read off the `show isis topology`
 /// transcript above. These are the oracle's values, not ours.
 const frr_r3_metric: u64 = 15;
+/// FRR's next hop for r3, same transcript row ("r3 TE-IS 15 r5 eth-r5 r5(4)").
+const frr_r3_next_hop: SystemId = .{ 0, 0, 0, 0, 0, 5 };
+/// What the undirected engine used to answer instead. Asserted against, so
+/// the closed defect cannot creep back in silently.
+const undirected_wrong_r3_metric: u64 = 30;
 
 fn frrTopology(db: *lsdb.Lsdb) !void {
     const r1 = sysId(1);
@@ -1165,23 +1193,79 @@ fn frrTopology(db: *lsdb.Lsdb) !void {
     });
 }
 
-test "FRR anchor: the asymmetric database FRR routes at 15 is REFUSED, not answered wrongly" {
+test "FRR anchor: the asymmetric database FRR routes at 15 is ANSWERED at 15 via r5" {
     // The whole point of the row. On the exact input where a real IS-IS
     // router reaches r3 at cost 15 via r5, the default decision process here
-    // must not hand back a confident 30 via r4 -- it must say it cannot
-    // represent this database. `require_two_way` is left at its correct
+    // must produce 15 via r5 -- not the old undirected 30 via r4, and no
+    // longer a refusal either. `require_two_way` is left at its correct
     // default so nothing else is in play.
     var db = lsdb.Lsdb.init(testing.allocator, cfgFor(sysId(1)));
     defer db.deinit();
     try frrTopology(&db);
 
+    var table = try computeWith(testing.allocator, &db, sysId(1), 0, .{});
+    defer table.deinit();
+
+    const r3 = table.lookup(sysId(3)).?;
+    try testing.expectEqual(frr_r3_metric, r3.metric);
+    try testing.expectEqual(frr_r3_next_hop, r3.next_hop);
+    // The claim the superseded version of this test made, kept verbatim in
+    // substance: the old confident wrong answer must not come back.
+    try testing.expect(r3.metric != undirected_wrong_r3_metric);
+
+    // The refusal is now opt-in, and still works: a caller that needs a
+    // symmetric fabric (802.1aq) can still be told this database is not one.
     try testing.expectError(
         error.AsymmetricMetric,
-        computeWith(testing.allocator, &db, sysId(1), 0, .{}),
+        computeWith(testing.allocator, &db, sysId(1), 0, .{ .reject_asymmetric = true }),
     );
 }
 
-test "FRR anchor: the approximating entry point flags the link and still contradicts FRR" {
+test "FRR anchor: the r5 arc is what carries it — flipping r5's advertisement moves the route" {
+    // Teeth for the direction rule specifically. ISO Annex C.2.4 Step 1 uses
+    // "the cost of the link from P to N as reported in P's Link State PDU",
+    // so the r5→r3 arc's weight is r5's 5 and the r3→r5 arc's is r3's 50.
+    // Reading the wrong endpoint's advertisement (what the undirected engine
+    // did) is invisible on a symmetric fixture, so this one asserts BOTH
+    // trees over the same database: from r1 the cheap arc is available (15
+    // via r5) and from r3 it is not (r3→r5 costs 50, so r3 reaches r1 at 30
+    // via r4, not at 60 via r5 and not at 15).
+    const r1 = sysId(1);
+    const r3 = sysId(3);
+    const r4 = sysId(4);
+    const r5 = sysId(5);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(r1));
+    defer db.deinit();
+    try frrTopology(&db);
+
+    var from_r1 = try compute(testing.allocator, &db, r1, 0);
+    defer from_r1.deinit();
+    try testing.expectEqual(@as(u64, 15), from_r1.lookup(r3).?.metric);
+    try testing.expectEqual(r5, from_r1.nextHop(r3).?);
+    // r5 itself is still a direct neighbour at 10 (r1's own advertisement).
+    try testing.expectEqual(@as(u64, 10), from_r1.lookup(r5).?.metric);
+
+    var from_r3 = try compute(testing.allocator, &db, r3, 0);
+    defer from_r3.deinit();
+    // r3 → r1: 30 via r4 (10 + 20) beats 60 via r5 (50 + 10) and 100 direct.
+    try testing.expectEqual(@as(u64, 30), from_r3.lookup(r1).?.metric);
+    try testing.expectEqual(r4, from_r3.nextHop(r1).?);
+    // The {r3,r5} link traversed the OTHER way costs r3 its own 50, which is
+    // no longer competitive: r3 reaches r5 at 40, the long way round via
+    // r4—r1. An undirected engine cannot produce this at all — it has one
+    // number for the link and therefore one distance for both directions.
+    try testing.expectEqual(@as(u64, 40), from_r3.lookup(r5).?.metric);
+    try testing.expectEqual(r4, from_r3.nextHop(r5).?);
+
+    var from_r5 = try compute(testing.allocator, &db, r5, 0);
+    defer from_r5.deinit();
+    // …while r5 reaches r3 at 5, over that same link. 5 one way, 40 the
+    // other: the asymmetry is the point.
+    try testing.expectEqual(@as(u64, 5), from_r5.lookup(r3).?.metric);
+    try testing.expectEqual(r3, from_r5.nextHop(r3).?);
+}
+
+test "FRR anchor: `compute` reproduces every row of FRR's table, and still flags the link" {
     const r1 = sysId(1);
     const r2 = sysId(2);
     const r3 = sysId(3);
@@ -1196,9 +1280,10 @@ test "FRR anchor: the approximating entry point flags the link and still contrad
 
     try testing.expectEqual(@as(usize, 5), table.routes.len);
 
-    // The signal the caller used to not get at all: exactly one link ({r3,r5},
-    // 50 one way and 5 the other) is only approximated. Without this the
-    // table below is indistinguishable from a correct one.
+    // Exactly one link ({r3,r5}, 50 one way and 5 the other) is asymmetric.
+    // The count no longer means "approximated" -- the routes below are exact
+    // -- but it is still the signal an 802.1aq fabric needs, and counting it
+    // exactly once per unordered pair is still a claim worth pinning.
     try testing.expectEqual(@as(u32, 1), table.asymmetric_links);
 
     // Direct neighbours: exact match with FRR ("show isis topology": r2/r5,
@@ -1213,15 +1298,18 @@ test "FRR anchor: the approximating entry point flags the link and still contrad
     try testing.expectEqual(@as(u64, 20), r4_route.metric);
     try testing.expect(std.mem.eql(u8, &r4_route.next_hop, &r4) or std.mem.eql(u8, &r4_route.next_hop, &r2));
 
-    // r3: the divergence, asserted AS a divergence. FRR says 15 via r5; this
-    // approximation says neither. Both halves are pinned -- that we contradict
-    // the oracle (so nobody can later read this file as agreement), and the
-    // exact shape we contradict it with (so a silent change is still caught).
+    // r3: the row that used to diverge, asserted AS agreement. FRR's
+    // transcript says "r3 TE-IS 15 r5 eth-r5 r5(4)"; so do we, both fields.
     const r3_route = table.lookup(r3).?;
-    try testing.expect(r3_route.metric != frr_r3_metric);
-    try testing.expect(!std.mem.eql(u8, &r3_route.next_hop, &r5));
-    try testing.expectEqual(@as(u64, 30), r3_route.metric);
-    try testing.expect(std.mem.eql(u8, &r3_route.next_hop, &r4) or std.mem.eql(u8, &r3_route.next_hop, &r2));
+    try testing.expectEqual(frr_r3_metric, r3_route.metric);
+    try testing.expectEqual(frr_r3_next_hop, r3_route.next_hop);
+    try testing.expect(std.mem.eql(u8, &r3_route.next_hop, &r5));
+    // …and the specific wrong shape the undirected engine produced (30, via
+    // r4 or r2) is named and excluded, so its return is a test failure and
+    // not a quiet regression.
+    try testing.expect(r3_route.metric != undirected_wrong_r3_metric);
+    try testing.expect(!std.mem.eql(u8, &r3_route.next_hop, &r4));
+    try testing.expect(!std.mem.eql(u8, &r3_route.next_hop, &r2));
 }
 
 test "asymmetry detection does not fire on a symmetric database" {

@@ -36,11 +36,12 @@ equal-cost paths itself.
    neighbour, metric)` advertisements. Malformed TLV records are skipped by the
    bounds-checked `isis` parse; a decode failure skips only that LSP.
 
-2. **Two-way reachability (ISO §7.2.5).** An undirected edge A–B is admitted to
+2. **Two-way connectivity check (ISO §7.2.8.2).** The link A–B is admitted to
    SPF **only if A advertises B and B advertises A**. A one-way advertisement —
    a half-formed adjacency, or a neighbour that just left whose LSP is still in
    the database — is dropped. This is the classic SPF-stability rule that keeps a
-   stale one-directional link from poisoning the tree.
+   stale one-directional link from poisoning the tree. The clause admits the
+   link; it does not merge the two metrics (see "Metric handling").
 
 3. **Interning.** Each participating system-id is mapped to a dense `spf-ect`
    `NodeId`. The ids are **sorted ascending** and assigned NodeIds in that order,
@@ -56,14 +57,19 @@ equal-cost paths itself.
 
 ## Metric handling
 
-`spf-ect` is an **undirected** graph with a single `u32` weight per edge, so an
-edge carries one metric in both directions. For a two-way pair the weight is the
-advertisement from the endpoint with the **lexicographically-smaller system-id**
-— deterministic and iteration-order-independent. SPB requires symmetric metrics,
-in which case this is exact; when the two directions differ, the lower-id
-endpoint's value is used (documented limitation, see `SPEC.md`). A zero metric is
-clamped to 1 (`spf-ect` rejects a zero weight, which could form a predecessor
-cycle). Old-style #2 metrics use the low 6 bits of the default-metric octet.
+IS-IS metrics are per-interface and **directional**: ISO/IEC 10589 Annex C.2.4
+Step 1 relaxes `dist(P,N) = d(P) + metric_k(P,N)` where "metric_k(P,N) is the
+cost of the link from P to N as reported in P's Link State PDU". So each
+admitted direction becomes its own `spf-ect` arc (`Graph.addArc`) carrying that
+endpoint's own advertised metric — the two directions of one link may differ,
+which §7.2.8.2 permits in as many words ("routes may be asymmetric"). Nothing
+is merged into a single per-link weight; no such weight exists, because which
+direction of a link a path traverses is decided by the tree being computed.
+`RouteTable.asymmetric_links` reports how many links differ (relevant to SPB,
+which *requires* symmetry), and `Options.reject_asymmetric` (default `false`)
+turns that into an error for callers who need it. A zero metric is clamped to 1
+(`spf-ect` rejects a zero weight, which could form a predecessor cycle).
+Old-style #2 metrics use the low 6 bits of the default-metric octet.
 
 ## API sketch
 
@@ -128,18 +134,17 @@ permanent tests in `src/root.zig` (`"FRR anchor: …"`), whose shared comment
 block quotes the exact `vtysh` commands, FRR's version, and the relevant
 printed lines.
 
-**Read the outcome carefully: on one vertex the oracle says we are wrong.**
-FRR reaches r3 at cost 15 via r5; the undirected-engine approximation
-(this README's "Metric handling", `SPEC.md` §3.3) says 30 via the r4 branch —
-wrong next hop, double the cost. The transcript originally sat above an
-assertion of *our* 30, which turned a live external disagreement into a
-certificate that the disagreement was intended. It no longer does: the
-disagreement itself is what is asserted, and the default decision-process
-entry point (`computeWith`) now **refuses** that database with
-`error.AsymmetricMetric` rather than answering it. `compute`, whose signature
-other modules compile against, still approximates but reports the fact through
-`RouteTable.asymmetric_links`. The real fix is a directed SPF, which belongs
-to `spf-ect`, not here.
+**History of the r3 row, because it is the point of the anchor.** FRR reaches
+r3 at cost 15 via r5. The original undirected engine answered 30 via the r4
+branch — wrong next hop, double the cost — and the transcript first sat above
+an assertion of *our* 30, which turned a live external disagreement into a
+certificate that the disagreement was intended. `55752d4` stopped that: the
+divergence itself became the assertion, and `computeWith` refused such a
+database outright. Both are now superseded by the actual fix — `spf-ect` grew
+directed arcs, this module adds one per advertised direction, and **all five
+rows match FRR**, r3 included (15, next hop r5). The tests assert the
+agreement, and additionally assert that the old wrong shape (30 via r4/r2) is
+not what comes back.
 
 This is a one-shot capture: the test above asserts against literals and does
 not boot a VM, run FRR, or touch the network. Licence note: FRR is

@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! spf-ect — deterministic symmetric shortest-path core with ECT-style tie-breaking.
+//! spf-ect — deterministic shortest-path core with ECT-style tie-breaking.
+//!
+//! The graph is **directed** (`Graph.addArc`), with `Graph.addEdge` as the
+//! symmetric-link convenience that adds both arcs at one weight; everything
+//! below about symmetry/ECT describes graphs built the latter way, which is
+//! what an 802.1aq fabric is. Directed arcs exist because a link-state
+//! protocol's metric is per-interface and may differ per direction (ISO/IEC
+//! 10589 §7.2.8.2), and no single per-link weight can represent that.
 //!
 //! Dijkstra shortest-path plus a totally-ordered, direction-independent tie-break
 //! (the SPB/802.1aq ECT idea, portable to IP/ECMP) so that path(A→B) is always the
@@ -74,7 +81,11 @@ pub const Distance = u64;
 /// Sentinel for "no path found" in `Tree.dist`.
 pub const unreachable_dist: Distance = std.math.maxInt(Distance);
 
-/// One directed half of an undirected edge, as stored in `Graph`'s adjacency.
+/// One directed arc `(owner of this adjacency list) → to`, as stored in
+/// `Graph`'s adjacency. An undirected edge added via `addEdge` is two of
+/// these, one in each endpoint's list, carrying the same weight; `addArc`
+/// adds a single one, so the two directions of a link may carry different
+/// weights (see `Graph`).
 pub const Edge = struct {
     to: NodeId,
     weight: Weight,
@@ -83,9 +94,28 @@ pub const Edge = struct {
 /// A candidate (or resolved) path, source-first, destination-last.
 pub const Path = []const NodeId;
 
-/// Weighted undirected graph. Nodes are the dense range `[0, nodeCount())`;
-/// `ensureNode`/`addEdge` grow that range as needed (isolated nodes are
-/// allowed — e.g. to reserve an id before its first edge exists).
+/// Weighted **directed** graph with an undirected convenience constructor.
+/// Nodes are the dense range `[0, nodeCount())`; `ensureNode`/`addEdge`/
+/// `addArc` grow that range as needed (isolated nodes are allowed — e.g. to
+/// reserve an id before its first edge exists).
+///
+/// The storage was always a per-node list of outgoing arcs and Dijkstra
+/// always relaxed `u`'s list when expanding `u`, i.e. the *engine* has always
+/// been directed; what was undirected was the only constructor, `addEdge`,
+/// which writes the same weight into both endpoints' lists. `addArc` writes
+/// one direction only, so a link may cost differently each way — required by
+/// any link-state protocol whose metric is per-interface (ISO/IEC 10589
+/// §7.2.8.2: "It is permissible for two endpoints to report different defined
+/// values of the same metric for the same link. In this case, routes may be
+/// asymmetric."). No extra storage: an asymmetric link occupies the same two
+/// arc slots a symmetric one always did.
+///
+/// **Symmetry caveat.** `shortestPath(g, a, b) == reverse(shortestPath(g, b,
+/// a))` (the ECT property `comparePaths` exists to provide) holds for graphs
+/// built with `addEdge` only. On a graph with a genuinely asymmetric arc pair
+/// the two directions have different *costs*, so no tie-break could make the
+/// paths mirror each other — that is a property of the topology, not of the
+/// comparator.
 ///
 /// Adjacency lists are kept sorted by neighbor `NodeId` at all times, so
 /// `neighbors(n)` — and therefore Dijkstra's relaxation order — never
@@ -123,10 +153,11 @@ pub const Graph = struct {
     }
 
     pub const AddEdgeError = error{
-        /// `a == b` — undirected simple graphs only, no self-loops.
+        /// `a == b` — simple graphs only, no self-loops.
         SelfLoop,
-        /// This unordered pair already has an edge; call `addEdge` once per
-        /// pair (there's no update-in-place — remove-then-readd if needed).
+        /// This arc (or, for `addEdge`, one of the two arcs) already exists;
+        /// call `addEdge`/`addArc` once per direction (there's no
+        /// update-in-place — remove-then-readd if needed).
         DuplicateEdge,
         /// `weight == 0` — shortest paths require strictly positive weights
         /// (see `Weight`): a 0-weight edge can yield a predecessor 2-cycle
@@ -134,21 +165,38 @@ pub const Graph = struct {
         ZeroWeight,
     } || Allocator.Error;
 
-    /// Add undirected edge `a <-> b` with `weight` (must be `>= 1`). Both
-    /// endpoints are auto-created via `ensureNode`. Fails atomically: on
+    /// Add undirected edge `a <-> b` with `weight` (must be `>= 1`) — i.e.
+    /// the two arcs `a → b` and `b → a`, both at `weight`. Both endpoints
+    /// are auto-created via `ensureNode`. Fails atomically: on
     /// `DuplicateEdge` or OOM partway through, the graph is left exactly as
     /// it was before the call (no half-added edge).
     pub fn addEdge(self: *Graph, a: NodeId, b: NodeId, weight: Weight) AddEdgeError!void {
-        if (a == b) return error.SelfLoop;
-        if (weight == 0) return error.ZeroWeight;
-        try self.ensureNode(@max(a, b));
-        try insertSorted(self.gpa, &self.adj.items[a], .{ .to = b, .weight = weight });
+        try self.addArc(a, b, weight);
         errdefer removeSorted(&self.adj.items[a], b);
-        try insertSorted(self.gpa, &self.adj.items[b], .{ .to = a, .weight = weight });
+        try self.addArc(b, a, weight);
     }
 
-    /// `node`'s edges, sorted by neighbor id. Valid until the next mutating
-    /// call on this graph.
+    /// Add the single directed arc `from → to` with `weight` (must be
+    /// `>= 1`); the reverse direction is untouched, so calling this twice
+    /// with different weights models a link that costs differently each way.
+    /// Both endpoints are auto-created. Fails atomically.
+    ///
+    /// This is the constructor a link-state decision process needs: ISO/IEC
+    /// 10589 Annex C.2.4 Step 1 relaxes `dist(P,N) = d(P) + metric_k(P,N)`
+    /// where "metric_k(P,N) is the cost of the link from P to N **as
+    /// reported in P's Link State PDU**" — the arc's weight belongs to the
+    /// direction being traversed, and no single per-link weight can stand in
+    /// for both, because which direction of a link a path uses is decided by
+    /// the tree being computed.
+    pub fn addArc(self: *Graph, from: NodeId, to: NodeId, weight: Weight) AddEdgeError!void {
+        if (from == to) return error.SelfLoop;
+        if (weight == 0) return error.ZeroWeight;
+        try self.ensureNode(@max(from, to));
+        try insertSorted(self.gpa, &self.adj.items[from], .{ .to = to, .weight = weight });
+    }
+
+    /// `node`'s outgoing arcs, sorted by neighbor id. Valid until the next
+    /// mutating call on this graph.
     pub fn neighbors(self: *const Graph, node: NodeId) []const Edge {
         return self.adj.items[node].items;
     }
@@ -574,7 +622,8 @@ pub fn shortestPathTree(gpa: Allocator, graph: *const Graph, root: NodeId) Alloc
 /// `root..target` inclusive shortest path, deterministic per `comparePaths`.
 /// Once `comparePaths` satisfies its documented contract,
 /// `shortestPath(gpa, g, a, b)` is guaranteed equal to
-/// `reverse(shortestPath(gpa, g, b, a))`.
+/// `reverse(shortestPath(gpa, g, b, a))` — **on a symmetric graph** (one
+/// built with `addEdge` only; see `Graph`'s symmetry caveat).
 pub fn shortestPath(gpa: Allocator, graph: *const Graph, a: NodeId, b: NodeId) (Allocator.Error || Tree.PathError)![]NodeId {
     var tree = try shortestPathTree(gpa, graph, a);
     defer tree.deinit();
@@ -635,6 +684,84 @@ test "graph builder: addEdge rejects a 0-weight edge (predecessor-cycle DoS guar
     // A positive weight on the same pair still works.
     try g.addEdge(0, 1, 1);
     try testing.expectEqual(@as(u32, 2), g.nodeCount());
+}
+
+// ── tests: directed arcs ────────────────────────────────────────────────
+
+test "addArc: one direction only; the reverse is absent, not mirrored" {
+    var g = Graph.init(testing.allocator);
+    defer g.deinit();
+
+    try g.addArc(0, 1, 7);
+    try testing.expectEqualSlices(Edge, &.{.{ .to = 1, .weight = 7 }}, g.neighbors(0));
+    try testing.expectEqual(@as(usize, 0), g.neighbors(1).len);
+
+    // The reverse arc is a separate object and may carry a different weight.
+    try g.addArc(1, 0, 99);
+    try testing.expectEqualSlices(Edge, &.{.{ .to = 0, .weight = 99 }}, g.neighbors(1));
+    // …and re-adding an existing arc is still a duplicate.
+    try testing.expectError(error.DuplicateEdge, g.addArc(0, 1, 3));
+    try testing.expectError(error.SelfLoop, g.addArc(2, 2, 1));
+    try testing.expectError(error.ZeroWeight, g.addArc(3, 4, 0));
+
+    // addEdge remains exactly "both arcs at one weight".
+    var h = Graph.init(testing.allocator);
+    defer h.deinit();
+    try h.addEdge(0, 1, 4);
+    try testing.expectEqualSlices(Edge, &.{.{ .to = 1, .weight = 4 }}, h.neighbors(0));
+    try testing.expectEqualSlices(Edge, &.{.{ .to = 0, .weight = 4 }}, h.neighbors(1));
+}
+
+// The BD-14 defect, in graph terms: with a link that costs 50 one way and 5
+// the other, the cheapest route depends on which way you traverse it, and NO
+// single per-link weight reproduces both trees. This is the `spf-ect` half of
+// the `isis-spf` FRR divergence (FRR 10.3 reaches r3 at 15 via r5 where the
+// undirected approximation said 30 via r4) reduced to the four nodes that
+// carry it: 0=r1, 1=r4, 2=r3, 3=r5.
+test "directed SPF: the asymmetric arc pair is traversed at the traversed direction's cost" {
+    const gpa = testing.allocator;
+    var g = Graph.init(gpa);
+    defer g.deinit();
+    try g.addEdge(0, 1, 20); // r1—r4, symmetric 20
+    try g.addEdge(1, 2, 10); // r4—r3, symmetric 10
+    try g.addEdge(0, 3, 10); // r1—r5, symmetric 10
+    try g.addArc(2, 3, 50); // r3 → r5 costs 50 (r3's own advertisement)
+    try g.addArc(3, 2, 5); //  r5 → r3 costs 5  (r5's own advertisement)
+
+    // From 0: 0→3→2 = 10+5 = 15 beats 0→1→2 = 20+10 = 30.
+    var t = try shortestPathTree(gpa, &g, 0);
+    defer t.deinit();
+    try testing.expectEqual(@as(Distance, 15), t.distanceTo(2));
+    const p = try t.pathTo(gpa, 2);
+    defer gpa.free(p);
+    try testing.expectEqualSlices(NodeId, &.{ 0, 3, 2 }, p);
+
+    // From 2 the SAME link costs 50, so the cheap way home is the other
+    // branch: 2→1→0 = 30 beats 2→3→0 = 55. Not the reverse of the path
+    // above — which is exactly what no per-edge weight can express.
+    var back = try shortestPathTree(gpa, &g, 2);
+    defer back.deinit();
+    try testing.expectEqual(@as(Distance, 30), back.distanceTo(0));
+    const q = try back.pathTo(gpa, 0);
+    defer gpa.free(q);
+    try testing.expectEqualSlices(NodeId, &.{ 2, 1, 0 }, q);
+}
+
+test "directed SPF: a one-way arc gives no route back (no implicit reverse)" {
+    const gpa = testing.allocator;
+    var g = Graph.init(gpa);
+    defer g.deinit();
+    try g.addArc(0, 1, 5); // only 0 → 1 exists
+    try g.ensureNode(1);
+
+    var t = try shortestPathTree(gpa, &g, 0);
+    defer t.deinit();
+    try testing.expectEqual(@as(Distance, 5), t.distanceTo(1));
+
+    var back = try shortestPathTree(gpa, &g, 1);
+    defer back.deinit();
+    try testing.expect(!back.reachable(0));
+    try testing.expectError(error.Unreachable, back.pathTo(gpa, 0));
 }
 
 // ── tests: Dijkstra without ties (never touches the Fable stubs) ────────
