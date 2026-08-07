@@ -39,11 +39,15 @@
 //! IS-IS here is unauthenticated (auth is deferred, `SPEC.md` §8), so the update
 //! process must defend itself against an on-link peer: a copy of **our own** LSP
 //! received from a circuit is never accepted (the owner is told to re-originate
-//! at `InsertResult.self_challenge + 1`), and a local origination at
+//! at `InsertResult.self_challenge + 1`), a local origination at
 //! `max_sequence_number` is `error.SequenceExhausted` rather than a permanent
-//! self-lockout. One defence is still missing and is **not** fixable here: the
-//! §7.3.14.2 Fletcher-checksum discard — see `compare.zig`'s note on §7.3.16.1(d)
-//! and `SPEC.md` §8.
+//! self-lockout, and a **received** LSP whose ISO Fletcher checksum does not
+//! check out is discarded with `error.CorruptedLsp` before any comparison
+//! (§7.3.14.2 e), the precondition §7.3.16.1(d)'s checksum tie-break assumes —
+//! see `compare.zig`). Purges and locally originated LSPs are exempt, for the
+//! reasons spelled out at `Lsdb.insert`. What remains missing is
+//! **authentication** (RFC 5304/5310, `SPEC.md` §8): the checksum is unkeyed, so
+//! it stops corruption and accidents, not a determined on-link forger.
 //!
 //! Provenance: clean-room from ISO/IEC 10589 §7.3; the §7.3.16.1 comparison was
 //! cross-checked against FRRouting `isis_lsp.c:lsp_compare` for the (oriented)
@@ -87,15 +91,18 @@ const testing = std.testing;
 const sys_a: [6]u8 = .{ 0, 0, 0, 0, 0, 0xA };
 const sys_b: [6]u8 = .{ 0, 0, 0, 0, 0, 0xB };
 
-fn buildLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16, csum: u16) []const u8 {
+/// Stamps the ISO 10589 §7.3.11 checksum: the LSP A floods is *received* by B in
+/// this test, and `insert`'s §7.3.14.2 gate discards an LSP that does not carry
+/// one (the fixture previously used a `0xAAAA` placeholder, which is not a valid
+/// checksum for these bytes and would now be refused — correctly).
+fn buildLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16) []const u8 {
     var b = isis.pdu.LspBuilder.init(buf, .{
         .remaining_lifetime = life,
         .lsp_id = .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, lsp_num },
         .sequence_number = seq,
-        .checksum = csum,
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     }) catch unreachable;
-    return b.finish();
+    return b.finishStamped();
 }
 
 // The end-to-end proof: B holds an LSP that A lacks. A learns of it from B's
@@ -111,9 +118,9 @@ test "two databases reconcile a CSNP and flood the delta into each other" {
     var buf: [128]u8 = undefined;
 
     // A originates its own LSP (floods out every circuit).
-    _ = try a.insert(buildLsp(&buf, sys_a, 0, 1, 1000, 0xAAAA), null, 0);
+    _ = try a.insert(buildLsp(&buf, sys_a, 0, 1, 1000), null, 0);
     // B originates its own LSP.
-    _ = try b.insert(buildLsp(&buf, sys_b, 0, 1, 1000, 0xBBBB), null, 0);
+    _ = try b.insert(buildLsp(&buf, sys_b, 0, 1, 1000), null, 0);
 
     // B sends A a CSNP summarising B's whole DB (just B's own LSP). A holds A's
     // LSP but not B's.
@@ -172,10 +179,21 @@ fn fuzzInsert(_: void, smith: *std.testing.Smith) !void {
         buf[3] = 0; // id length 0 => 6
         buf[4] = 18; // l1_lsp
         buf[5] = 1; // version
+        // ISO 10589 §7.3.14.2: a received LSP with a wrong Fletcher checksum is
+        // discarded before the store is touched, so random bytes would now
+        // almost never get past `insert`'s front door. Stamp a correct checksum
+        // on some of them to keep the deep store path (compare → fill → flags)
+        // as reachable as it was before that gate existed, while the unstamped
+        // half keeps fuzzing the discard path itself.
+        if (smith.value(bool)) _ = isis.pdu.stampLspChecksum(input) catch {};
     }
 
+    // Both sides of the gate: `null` is a local origination (checksum exempt),
+    // an interface index is a receive (checksum enforced).
+    const arrival: ?u8 = if (smith.value(bool)) null else smith.valueRangeAtMost(u8, 0, 1);
+
     const before = db.count();
-    if (db.insert(input, 0, 1)) |_| {
+    if (db.insert(input, arrival, 1)) |_| {
         // Accepted, ignored, or refused — all leave a coherent store.
     } else |_| {
         // A decode error (or DatabaseFull) must be inert w.r.t. membership.

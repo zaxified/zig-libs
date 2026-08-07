@@ -120,6 +120,12 @@ pub const InsertError = error{
     /// the LSP impossible to supersede, so the store refuses it; the owner must
     /// purge the LSP and wait `MaxAge` before restarting at sequence 1.
     SequenceExhausted,
+    /// ISO/IEC 10589 §7.3.14.2 e): an LSP **received from a circuit** whose ISO
+    /// Fletcher checksum does not check out. The standard's `corruptedLSPReceived`
+    /// circuit event; the PDU is discarded and the store is left unchanged. Also
+    /// returned for a live LSP carrying a zero checksum (RFC 3719 §7). See
+    /// `insert`'s "§7.3.14.2 receive validation" note.
+    CorruptedLsp,
 } || std.mem.Allocator.Error || isis.pdu.DecodeError;
 
 /// The outcome of an `insert`.
@@ -313,10 +319,58 @@ pub const Lsdb = struct {
     /// space can never be superseded, so the owner must purge it and wait
     /// `MaxAge` before restarting at 1. (Refusing *at* the top rather than
     /// beyond it is deliberate — there is no "beyond" to detect.)
+    ///
+    /// ## §7.3.14.2 receive validation (the ISO Fletcher checksum)
+    /// ISO/IEC 10589 §7.3.14.2 e): "An IS receiving a LSP with an incorrect LSP
+    /// Checksum or with an invalid PDU syntax shall 1) generate a
+    /// corruptedLSPReceived circuit event, 2) discard the PDU." That discard is
+    /// what makes the §7.3.16.1(d) checksum tie-break safe, so it runs **first**,
+    /// before any comparison — see `compare.zig`. A failure is
+    /// `error.CorruptedLsp` and the store is untouched.
+    ///
+    /// Three cases are deliberately *not* validated, each because validating
+    /// them would break a conformant network:
+    /// 1. **A locally originated LSP** (`arrival_iface == null`). §7.3.14.2 is a
+    ///    receive rule; §7.3.11 makes stamping the generator's job
+    ///    (`isis.pdu.LspBuilder.finishStamped`), and this store is the generator's
+    ///    sink, not its auditor.
+    /// 2. **A purge** (zero Remaining Lifetime). §7.3.16.4 b) keeps only the LSP
+    ///    header, so the body the checksum covered is gone; §7.3.16.4's note 36
+    ///    states that a check of a zero-Remaining-Lifetime LSP "succeeds even
+    ///    though the data portion is not present", and
+    ///    `draft-li-isis-error-lsp-processing` §4 Figure 1 makes it explicit —
+    ///    test Remaining Lifetime **first**, and never checksum a purge. This
+    ///    exemption does not re-open the content-replacement hole: an attacker
+    ///    who sends a purge replaces content with *no* content, and a purge that
+    ///    a peer can send at all is the unauthenticated-IS-IS exposure RFC
+    ///    5304/5310 addresses, not one a checksum ever defended.
+    /// 3. Nothing else. In particular a **zero checksum** on a live LSP is
+    ///    *rejected*, not waved through: a correctly computed ISO 8473 checksum
+    ///    can never be zero (RFC 3719 §7), so zero means "not computed", and
+    ///    RFC 3719 §7 directs that such an LSP be treated as a checksum error and
+    ///    discarded (revising §7.3.14.2(i)'s purge-instead behaviour, which "has
+    ///    proved to be disruptive in practice"). Accepting it would leave clause
+    ///    (d) reachable with `checksum = 0`, i.e. the whole hole still open.
+    ///
+    /// **What this does and does not buy.** Fletcher is unkeyed, so it stops
+    /// corruption, not an adversary: an on-link attacker can compute a valid
+    /// checksum for forged content as easily as we can. What it removes is the
+    /// specific primitive where *arbitrary* checksum bytes at an *equal*
+    /// sequence number sufficed. Authentication (RFC 5304/5310, `SPEC.md` §8)
+    /// remains the only defence against a deliberate on-link forger.
     pub fn insert(self: *Lsdb, bytes: []const u8, arrival_iface: ?u8, now: Time) InsertError!InsertResult {
         const lsp = try isis.Lsp.decode(bytes);
         const id = lsp.lsp_id;
         const is_self = std.mem.eql(u8, id[0..6], &self.cfg.local_system_id);
+
+        // §7.3.14.2 e) — before the §7.3.16.1 comparison, before the own-LSP
+        // rule, before any mutation.
+        if (arrival_iface != null and lsp.remaining_lifetime != 0) {
+            switch (try isis.pdu.checkLspChecksum(bytes)) {
+                .good => {},
+                .bad, .not_present => return error.CorruptedLsp,
+            }
+        }
 
         // §7.3.16.1 sequence exhaustion — checked before any mutation.
         if (is_self and arrival_iface == null and lsp.sequence_number == max_sequence_number)
@@ -853,8 +907,29 @@ fn testCfg() Config {
     return .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8 };
 }
 
-/// Build an LSP PDU for `sys` into `buf` and return the wire slice.
-fn buildLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16, csum: u16) []const u8 {
+/// Build an LSP PDU for `sys` into `buf` and return the wire slice, carrying the
+/// ISO 10589 §7.3.11 checksum a conformant originator stamps. Fixtures used to
+/// pass a hand-picked placeholder here (`0x1111`, `0x9999`, …); those PDUs were
+/// simply invalid — Wireshark grades them "Bad" (see `goldens.zig`) — and only
+/// went unnoticed because no layer checked. They are corrected, not exempted:
+/// `insert` now enforces §7.3.14.2 on the receive path.
+fn buildLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16) []const u8 {
+    var b = lspBuilder(buf, sys, lsp_num, seq, life);
+    return b.finishStamped();
+}
+
+fn lspBuilder(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16) isis.pdu.LspBuilder {
+    return isis.pdu.LspBuilder.init(buf, .{
+        .remaining_lifetime = life,
+        .lsp_id = .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, lsp_num },
+        .sequence_number = seq,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    }) catch unreachable;
+}
+
+/// Build an LSP carrying `csum` verbatim — a wire image only a corrupt or
+/// hostile sender produces. Used by the §7.3.14.2 regression tests below.
+fn buildLspRawCsum(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16, csum: u16) []const u8 {
     var b = isis.pdu.LspBuilder.init(buf, .{
         .remaining_lifetime = life,
         .lsp_id = .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, lsp_num },
@@ -874,7 +949,7 @@ test "insert of a new LSP stores it and sets the newer SRM/SSN matrix" {
     defer db.deinit();
 
     var buf: [128]u8 = undefined;
-    const wire = buildLsp(&buf, sys_other, 0, 1, 1000, 0x1111);
+    const wire = buildLsp(&buf, sys_other, 0, 1, 1000);
     const r = try db.insert(wire, 2, 0);
     try testing.expect(r.stored);
     try testing.expectEqual(Ordering.newer, r.ordering);
@@ -894,7 +969,7 @@ test "duplicate (same) insert: SSN on arrival, no SRM" {
     var db = Lsdb.init(testing.allocator, testCfg());
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    const wire = buildLsp(&buf, sys_other, 0, 5, 1000, 0x1111);
+    const wire = buildLsp(&buf, sys_other, 0, 5, 1000);
     _ = try db.insert(wire, 1, 0); // first time (newer)
     const id = idOf(sys_other, 0);
     db.clearSrm(id, 0);
@@ -915,7 +990,7 @@ test "older insert: SRM on arrival only" {
     defer db.deinit();
     var buf1: [128]u8 = undefined;
     var buf2: [128]u8 = undefined;
-    const newer = buildLsp(&buf1, sys_other, 0, 10, 1000, 0x1111);
+    const newer = buildLsp(&buf1, sys_other, 0, 10, 1000);
     _ = try db.insert(newer, 1, 0);
     const id = idOf(sys_other, 0);
     db.clearSrm(id, 0);
@@ -923,7 +998,7 @@ test "older insert: SRM on arrival only" {
     db.clearSrm(id, 3);
 
     // An older sequence arrives on iface 3.
-    const older = buildLsp(&buf2, sys_other, 0, 4, 1000, 0x1111);
+    const older = buildLsp(&buf2, sys_other, 0, 4, 1000);
     const r = try db.insert(older, 3, 1);
     try testing.expectEqual(Ordering.older, r.ordering);
     try testing.expect(!r.stored);
@@ -939,10 +1014,10 @@ test "newer sequence replaces and re-floods" {
     defer db.deinit();
     var buf1: [128]u8 = undefined;
     var buf2: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&buf1, sys_other, 0, 1, 1000, 0x1111), 0, 0);
+    _ = try db.insert(buildLsp(&buf1, sys_other, 0, 1, 1000), 0, 0);
     const id = idOf(sys_other, 0);
     // A newer sequence on iface 1.
-    const r = try db.insert(buildLsp(&buf2, sys_other, 0, 2, 1000, 0x2222), 1, 5);
+    const r = try db.insert(buildLsp(&buf2, sys_other, 0, 2, 1000), 1, 5);
     try testing.expect(r.stored);
     try testing.expectEqual(@as(u32, 2), db.get(id, 5).?.sequence_number);
     const srm = db.srmSet(id).?;
@@ -953,7 +1028,7 @@ test "locally-originated LSP (null arrival) floods every interface, no SSN" {
     var db = Lsdb.init(testing.allocator, testCfg());
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    const wire = buildLsp(&buf, sys_local, 0, 1, 1200, 0x3333);
+    const wire = buildLsp(&buf, sys_local, 0, 1, 1200);
     _ = try db.insert(wire, null, 0);
     const id = idOf(sys_local, 0);
     const srm = db.srmSet(id).?;
@@ -975,14 +1050,14 @@ test "capacity bound: a flood of distinct LSP-IDs is refused, not grown" {
     var buf: [128]u8 = undefined;
     var i: u8 = 0;
     while (i < 3) : (i += 1) {
-        _ = try db.insert(buildLsp(&buf, sys_other, i, 1, 1000, 0x1111), 0, 0);
+        _ = try db.insert(buildLsp(&buf, sys_other, i, 1, 1000), 0, 0);
     }
     try testing.expectEqual(@as(usize, 3), db.count());
     // The 4th distinct LSP-ID is refused.
-    try testing.expectError(error.DatabaseFull, db.insert(buildLsp(&buf, sys_other, 9, 1, 1000, 0x1111), 0, 0));
+    try testing.expectError(error.DatabaseFull, db.insert(buildLsp(&buf, sys_other, 9, 1, 1000), 0, 0));
     try testing.expectEqual(@as(usize, 3), db.count());
     // But updating an existing LSP-ID still works at capacity.
-    const r = try db.insert(buildLsp(&buf, sys_other, 0, 2, 1000, 0x2222), 0, 1);
+    const r = try db.insert(buildLsp(&buf, sys_other, 0, 2, 1000), 0, 1);
     try testing.expect(r.stored);
     try testing.expectEqual(@as(usize, 3), db.count());
 }
@@ -991,7 +1066,7 @@ test "purge for an unknown LSP is ignored (not stored)" {
     var db = Lsdb.init(testing.allocator, testCfg());
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    const purge = buildLsp(&buf, sys_other, 0, 3, 0, 0); // zero lifetime
+    const purge = buildLsp(&buf, sys_other, 0, 3, 0); // zero lifetime
     const r = try db.insert(purge, 1, 0);
     try testing.expect(!r.stored);
     try testing.expectEqual(@as(usize, 0), db.count());
@@ -1001,7 +1076,7 @@ test "aging: keeps before expiry, purges at expiry, removes after ZeroAge" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .zero_age_lifetime = 60 });
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 100, 0x1111), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 100), 0, 0);
     const id = idOf(sys_other, 0);
 
     // Just before expiry (t=99): still present, lifetime 1.
@@ -1029,7 +1104,7 @@ test "self-originated near expiry is flagged for refresh, never purged" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .refresh_threshold = 50 });
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&buf, sys_local, 0, 1, 100, 0x1111), null, 0);
+    _ = try db.insert(buildLsp(&buf, sys_local, 0, 1, 100), null, 0);
     const id = idOf(sys_local, 0);
 
     // t=49: lifetime 51 > threshold 50 → not yet flagged.
@@ -1054,9 +1129,9 @@ test "CSNP reconcile: lack→SSN, we-newer→SRM, they-newer→SSN, complete-mis
     // We hold LSP #0 seq 10 (we are newer than the CSNP's seq 5) and LSP #1
     // seq 1 (the CSNP is newer, seq 9). We LACK #2 (the CSNP lists it). We hold
     // #3 which the CSNP does NOT list at all (completeness → flood).
-    _ = try db.insert(buildLsp(&buf, sys_other, 0, 10, 1000, 0x1111), 0, 0);
-    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000, 0x2222), 0, 0);
-    _ = try db.insert(buildLsp(&buf, sys_other, 3, 7, 1000, 0x4444), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 10, 1000), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 3, 7, 1000), 0, 0);
     // Clear the SRM the inserts set so the CSNP effect is what we assert.
     for ([_]u8{ 0, 1, 3 }) |n| {
         db.clearSrm(idOf(sys_other, n), 0);
@@ -1096,8 +1171,8 @@ test "summarise fills LSP-Entries for the range, skipping request placeholders" 
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&buf, sys_other, 0, 4, 900, 0x1111), 0, 0);
-    _ = try db.insert(buildLsp(&buf, sys_other, 1, 6, 900, 0x2222), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 4, 900), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 6, 900), 0, 0);
 
     var out: [8]isis.tlvs.LspEntry = undefined;
     const n = db.summarise(&out, @splat(0), @splat(0xFF), 0);
@@ -1118,9 +1193,9 @@ test "determinism: identical (ops, now) streams yield identical flag state" {
             var db = Lsdb.init(alloc, testCfg());
             defer db.deinit();
             var buf: [128]u8 = undefined;
-            _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000, 0x1111), 2, 0);
-            _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000, 0x2222), 1, 0);
-            _ = try db.insert(buildLsp(&buf, sys_other, 0, 2, 1000, 0x3333), 0, 5);
+            _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000), 2, 0);
+            _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000), 1, 0);
+            _ = try db.insert(buildLsp(&buf, sys_other, 0, 2, 1000), 0, 5);
             _ = db.tick(10);
             return .{
                 .srm0 = db.srmSet(idOf(sys_other, 0)).?.count(),
@@ -1142,7 +1217,7 @@ test "broadcast interface: newer LSP received on it is not SSN-acked" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8, .broadcast_interfaces = bcast });
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000, 0x1111), 2, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000), 2, 0);
     const id = idOf(sys_other, 0);
     // Arrived on broadcast iface 2 → no SSN anywhere.
     try testing.expectEqual(@as(usize, 0), db.ssnSet(id).?.count());
@@ -1196,7 +1271,7 @@ test "hostile CSNP: fabricated LSP-IDs cannot starve genuine LSPs (request budge
     var buf: [128]u8 = undefined;
     var n: u8 = 0;
     while (n < 6) : (n += 1) {
-        const r = try db.insert(buildLsp(&buf, sys_other, n, 1, 1000, 0x1111), 0, 0);
+        const r = try db.insert(buildLsp(&buf, sys_other, n, 1, 1000), 0, 0);
         try testing.expect(r.stored);
     }
     try testing.expectEqual(@as(usize, 8), db.count());
@@ -1240,12 +1315,12 @@ test "own LSP (§7.3.16.1): a peer's purge of our self-originated LSP is refused
     var buf: [128]u8 = undefined;
     var pbuf: [128]u8 = undefined;
 
-    _ = try db.insert(buildLsp(&buf, sys_local, 0, 5, 1200, 0x1111), null, 0);
+    _ = try db.insert(buildLsp(&buf, sys_local, 0, 5, 1200), null, 0);
     const id = idOf(sys_local, 0);
     for ([_]u8{ 0, 1, 2, 3 }) |i| db.clearSrm(id, i);
 
     // The attack: a lifetime-0, seq-6 header for OUR LSP-ID arrives on iface 1.
-    const r = try db.insert(buildLsp(&pbuf, sys_local, 0, 6, 0, 0), 1, 1);
+    const r = try db.insert(buildLsp(&pbuf, sys_local, 0, 6, 0), 1, 1);
     try testing.expect(!r.stored);
     try testing.expectEqual(@as(?u32, 6), r.self_challenge);
 
@@ -1272,13 +1347,13 @@ test "own LSP (§7.3.16.1): a peer cannot claim the top of our sequence space" {
     const id = idOf(sys_local, 1);
 
     // An LSP-ID of ours that we are not currently originating.
-    const r = try db.insert(buildLsp(&buf, sys_local, 1, max_sequence_number, 1000, 0xBEEF), 2, 0);
+    const r = try db.insert(buildLsp(&buf, sys_local, 1, max_sequence_number, 1000), 2, 0);
     try testing.expect(!r.stored);
     try testing.expectEqual(@as(?u32, max_sequence_number), r.self_challenge);
     try testing.expect(db.get(id, 0) == null);
 
     // We can still originate it — the lockout (F3) is gone.
-    const own = try db.insert(buildLsp(&buf, sys_local, 1, 7, 1000, 0x1111), null, 1);
+    const own = try db.insert(buildLsp(&buf, sys_local, 1, 7, 1000), null, 1);
     try testing.expect(own.stored);
     try testing.expectEqual(@as(u32, 7), db.get(id, 1).?.sequence_number);
 }
@@ -1292,13 +1367,13 @@ test "sequence exhaustion (§7.3.16.1): originating at the top of the space is a
     // requires purge-and-wait-MaxAge instead.
     try testing.expectError(
         error.SequenceExhausted,
-        db.insert(buildLsp(&buf, sys_local, 0, max_sequence_number, 1000, 0x1111), null, 0),
+        db.insert(buildLsp(&buf, sys_local, 0, max_sequence_number, 1000), null, 0),
     );
     try testing.expectEqual(@as(usize, 0), db.count());
 
     // A *neighbour's* LSP at the top of the space is unaffected — the rule is
     // about our own origination, not about what we may store for others.
-    const r = try db.insert(buildLsp(&buf, sys_other, 0, max_sequence_number, 1000, 0x1111), 0, 0);
+    const r = try db.insert(buildLsp(&buf, sys_other, 0, max_sequence_number, 1000), 0, 0);
     try testing.expect(r.stored);
 }
 
@@ -1310,12 +1385,12 @@ test "own LSP: purge AND sequence-lockout together still leave us able to re-ori
     const id0 = idOf(sys_local, 0);
     const id1 = idOf(sys_local, 1);
 
-    _ = try db.insert(buildLsp(&b0, sys_local, 0, 5, 1200, 0x1111), null, 0);
+    _ = try db.insert(buildLsp(&b0, sys_local, 0, 5, 1200), null, 0);
 
     // The whole attack in one pass on one circuit: purge the live fragment,
     // and claim 2^32-1 for a fragment we hold none of.
-    _ = try db.insert(buildLsp(&b0, sys_local, 0, 6, 0, 0), 1, 1);
-    _ = try db.insert(buildLsp(&b1, sys_local, 1, max_sequence_number, 1000, 0xBEEF), 1, 1);
+    _ = try db.insert(buildLsp(&b0, sys_local, 0, 6, 0), 1, 1);
+    _ = try db.insert(buildLsp(&b1, sys_local, 1, max_sequence_number, 1000), 1, 1);
 
     _ = db.tick(500); // far past ZeroAgeLifetime
 
@@ -1325,8 +1400,8 @@ test "own LSP: purge AND sequence-lockout together still leave us able to re-ori
     // The owner re-originates above the recorded challenge; both land.
     const challenge = db.get(id0, 500).?.challenge_sequence;
     try testing.expectEqual(@as(u32, 6), challenge);
-    try testing.expect((try db.insert(buildLsp(&b0, sys_local, 0, challenge + 1, 1200, 0x2222), null, 501)).stored);
-    try testing.expect((try db.insert(buildLsp(&b1, sys_local, 1, 7, 1200, 0x3333), null, 501)).stored);
+    try testing.expect((try db.insert(buildLsp(&b0, sys_local, 0, challenge + 1, 1200), null, 501)).stored);
+    try testing.expect((try db.insert(buildLsp(&b1, sys_local, 1, 7, 1200), null, 501)).stored);
     try testing.expectEqual(@as(u32, 7), db.get(id0, 501).?.sequence_number);
     try testing.expectEqual(@as(u32, 7), db.get(id1, 501).?.sequence_number);
     // Re-origination clears the challenge record.
@@ -1340,7 +1415,7 @@ test "own LSP: an SNP never makes us request our own LSP-ID" {
     var buf: [128]u8 = undefined;
     var cbuf: [512]u8 = undefined;
 
-    _ = try db.insert(buildLsp(&buf, sys_local, 0, 5, 1200, 0x1111), null, 0);
+    _ = try db.insert(buildLsp(&buf, sys_local, 0, 5, 1200), null, 0);
     const id0 = idOf(sys_local, 0);
     const id1 = idOf(sys_local, 1);
     db.clearSrm(id0, 0);
@@ -1366,12 +1441,155 @@ test "own LSP: an SNP never makes us request our own LSP-ID" {
     try testing.expectEqual(@as(u32, 99), db.get(id0, 0).?.challenge_sequence);
 }
 
+// ── regression: ISO 10589 §7.3.14.2 e) — discard a bad-checksum LSP on receipt ─
+//
+// The clause the §7.3.16.1(d) tie-break presupposes. Without it, an equal
+// sequence number plus an arbitrary checksum byte-pair is enough to replace a
+// stored LSP's content and have us re-flood it (audit W2-28 / `isis` F3).
+
+/// Build an LSP carrying a Dynamic Hostname (#137) TLV, so a replacement is
+/// observable as *content*, not just as header fields.
+fn buildNamedLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16, name: []const u8, overload: bool) []const u8 {
+    var b = isis.pdu.LspBuilder.init(buf, .{
+        .remaining_lifetime = life,
+        .lsp_id = .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, lsp_num },
+        .sequence_number = seq,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = overload, .is_type = 1 },
+    }) catch unreachable;
+    isis.tlvs.addHostname(&b.tlvs, name) catch unreachable;
+    return b.finishStamped();
+}
+
+fn hostnameOf(db: *Lsdb, id: LspId, now: Time) ?[]const u8 {
+    const view = db.get(id, now) orelse return null;
+    const lsp = isis.Lsp.decode(view.bytes) catch return null;
+    return isis.tlv.findFirst(lsp.tlv_bytes, isis.tlvs.code.dynamic_hostname) catch null;
+}
+
+test "§7.3.14.2: equal sequence + forged checksum can no longer replace an LSP's content" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    const id = idOf(sys_other, 0);
+
+    // The legitimate LSP, as a conformant neighbour originates it.
+    var good: [128]u8 = undefined;
+    const legit = buildNamedLsp(&good, sys_other, 0, 9, 1000, "legit", false);
+    try testing.expect((try db.insert(legit, 2, 0)).stored);
+    for ([_]u8{ 0, 1, 3 }) |i| db.clearSrm(id, i);
+
+    // The attack (audit PROBE-B): the SAME LSP-ID at the SAME sequence number,
+    // different content, and an arbitrary checksum. §7.3.16.1(d) would have
+    // called it `.newer`; §7.3.14.2 discards it before the comparison runs.
+    var evil: [128]u8 = undefined;
+    var eb = isis.pdu.LspBuilder.init(&evil, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = id,
+        .sequence_number = 9,
+        .checksum = 0xDEAD,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = true, .is_type = 1 },
+    }) catch unreachable;
+    try isis.tlvs.addHostname(&eb.tlvs, "EVIL!");
+    try testing.expectError(error.CorruptedLsp, db.insert(eb.finish(), 1, 1));
+
+    // Nothing moved: content, flags, sequence, and the flooding flags.
+    try testing.expectEqualStrings("legit", hostnameOf(&db, id, 1).?);
+    try testing.expect(!db.get(id, 1).?.flags.overload);
+    try testing.expectEqual(@as(u32, 9), db.get(id, 1).?.sequence_number);
+    try testing.expectEqual(@as(usize, 0), db.srmSet(id).?.count());
+    try testing.expectEqual(@as(usize, 1), db.count());
+}
+
+test "§7.3.14.2: a zero checksum on a live LSP is a checksum error (RFC 3719 §7)" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    const id = idOf(sys_other, 0);
+
+    var good: [128]u8 = undefined;
+    _ = try db.insert(buildNamedLsp(&good, sys_other, 0, 9, 1000, "legit", false), 2, 0);
+
+    // Zero is the "not computed" marker, not a value — waving it through would
+    // leave clause (d) reachable with `checksum = 0`, i.e. the hole still open.
+    var evil: [128]u8 = undefined;
+    var eb = isis.pdu.LspBuilder.init(&evil, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = id,
+        .sequence_number = 9,
+        .checksum = 0,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = true, .is_type = 1 },
+    }) catch unreachable;
+    try isis.tlvs.addHostname(&eb.tlvs, "EVIL!");
+    try testing.expectError(error.CorruptedLsp, db.insert(eb.finish(), 1, 1));
+    try testing.expectEqualStrings("legit", hostnameOf(&db, id, 1).?);
+
+    // Same for a brand-new LSP-ID: a live LSP with no checksum never enters.
+    var fresh: [128]u8 = undefined;
+    try testing.expectError(
+        error.CorruptedLsp,
+        db.insert(buildLspRawCsum(&fresh, sys_other, 5, 1, 1000, 0), 1, 1),
+    );
+    try testing.expectEqual(@as(usize, 1), db.count());
+}
+
+test "§7.3.14.2: one flipped body octet is discarded, the stored copy survives" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    const id = idOf(sys_other, 0);
+
+    var good: [128]u8 = undefined;
+    const legit = buildNamedLsp(&good, sys_other, 0, 9, 1000, "legit", false);
+    _ = try db.insert(legit, 2, 0);
+
+    // Corrupt exactly one octet of the covered region, keeping the checksum —
+    // the memory-corruption case §7.3.11 exists to detect.
+    var corrupt: [128]u8 = undefined;
+    @memcpy(corrupt[0..legit.len], legit);
+    corrupt[legit.len - 1] ^= 0x01;
+    try testing.expectError(error.CorruptedLsp, db.insert(corrupt[0..legit.len], 1, 1));
+    try testing.expectEqualStrings("legit", hostnameOf(&db, id, 1).?);
+}
+
+test "§7.3.14.2 exemptions: purge, local origination, and in-transit aging still pass" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8 });
+    defer db.deinit();
+
+    // (1) Local origination is not a receive path: the generation layer stamps
+    // (`LspBuilder.finishStamped`), so an unstamped local insert is accepted.
+    var lbuf: [128]u8 = undefined;
+    try testing.expect((try db.insert(buildLspRawCsum(&lbuf, sys_local, 0, 1, 1200, 0), null, 0)).stored);
+
+    // (2) A purge keeps only the header (§7.3.16.4 b), so its checksum cannot
+    // match the body it was computed over. `draft-li-isis-error-lsp-processing`
+    // §4 Fig 1: test Remaining Lifetime first, never checksum a purge.
+    var obuf: [128]u8 = undefined;
+    const other_id = idOf(sys_other, 0);
+    _ = try db.insert(buildNamedLsp(&obuf, sys_other, 0, 4, 1000, "peer", false), 1, 0);
+    var pbuf: [128]u8 = undefined;
+    const purge = buildLspRawCsum(&pbuf, sys_other, 0, 5, 0, 0xBEEF); // stale checksum
+    const pr = try db.insert(purge, 1, 1);
+    try testing.expect(pr.stored);
+    try testing.expect(db.get(other_id, 1).?.is_purge);
+    // ...and the zero-checksum form some implementations send is equally fine.
+    var p2: [128]u8 = undefined;
+    _ = try db.insert(buildLspRawCsum(&p2, sys_other, 1, 5, 0, 0), 1, 1);
+
+    // (3) §7.3.16.3 requires a transit IS to DECREMENT Remaining Lifetime
+    // without recomputing the checksum — §7.3.11 excludes that field precisely
+    // so it can. An LSP aged in flight must still be accepted.
+    var abuf: [128]u8 = undefined;
+    const fresh = buildNamedLsp(&abuf, sys_other, 2, 2, 1200, "aged", false);
+    var aged: [128]u8 = undefined;
+    @memcpy(aged[0..fresh.len], fresh);
+    std.mem.writeInt(u16, aged[10..12], 137, .big); // as a neighbour would
+    try testing.expect((try db.insert(aged[0..fresh.len], 1, 2)).stored);
+    try testing.expectEqual(@as(u16, 137), db.get(idOf(sys_other, 2), 2).?.remaining_lifetime);
+}
+
 test "srmIterator walks the LSPs queued for one circuit" {
     var db = Lsdb.init(testing.allocator, testCfg());
     defer db.deinit();
     var buf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000, 0x1111), null, 0);
-    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000, 0x2222), null, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000), null, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000), null, 0);
     var it = db.srmIterator(0);
     var n: usize = 0;
     while (it.next()) |item| {

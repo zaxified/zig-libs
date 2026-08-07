@@ -84,19 +84,22 @@ pub fn compare(incoming: LspVersion, stored: LspVersion) Ordering {
     // §7.3.16.1(d): a differing checksum against an active stored copy is
     // treated as more recent (forces a purge of the corrupt copy).
     //
-    // ⚠ UNVERIFIED PRECONDITION — read `SPEC.md` §8 before relying on this.
-    // In ISO/IEC 10589 this clause is safe only because §7.3.14.2 has *already*
-    // discarded any LSP whose Fletcher checksum is invalid: by the time (d) runs,
-    // a differing checksum can only mean "two well-formed copies of the same
-    // sequence number disagree", i.e. corruption to be purged. No layer in this
-    // repo verifies that checksum today — the `isis` codec carries it as a raw
-    // field and exports no Fletcher primitive (`isis/src/pdu.zig:248-249`), so no
-    // consumer *can* verify it. Until it does, clause (d) is an
-    // **unauthenticated content-replacement primitive**: an on-link party needs
-    // no higher sequence number to overwrite an LSP, only an arbitrary checksum
-    // byte-pair at the same sequence. The rule below is a faithful transcription
-    // of the standard and must NOT be weakened to compensate; the missing piece
-    // is receive-side §7.3.14.2 validation, whose primitive belongs in `isis`.
+    // PRECONDITION (now enforced): in ISO/IEC 10589 this clause is safe only
+    // because §7.3.14.2 e) has *already* discarded any received LSP whose ISO
+    // Fletcher checksum is invalid, so by the time (d) runs a differing checksum
+    // can only mean "two well-formed copies of the same sequence number
+    // disagree" — §7.3.16.2's LSP-confusion case, corruption to be purged.
+    // `Lsdb.insert` performs that discard before calling here (`store.zig`,
+    // "§7.3.14.2 receive validation"), using `isis.pdu.checkLspChecksum`. This
+    // rule is a faithful transcription of the standard and must NOT be weakened;
+    // if the discard is ever removed, (d) degrades back into a primitive that
+    // replaces an LSP's content at an *equal* sequence number using arbitrary
+    // checksum bytes (audit W2-28).
+    //
+    // What the discard does NOT buy: Fletcher is unkeyed, so an on-link forger
+    // can compute a valid checksum for forged content. Against a deliberate
+    // attacker the defence is authentication (RFC 5304/5310, `SPEC.md` §8), not
+    // this clause.
     if (incoming.checksum != stored.checksum and stored.remaining_lifetime != 0) return .newer;
 
     // None of the "more recent" conditions hold and it is not identical → older.

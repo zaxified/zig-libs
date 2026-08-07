@@ -44,6 +44,28 @@
 //! what makes the anchor re-checkable without re-running the tool — the test
 //! suite itself never invokes `dissect.py`/`sharkd`/`text2pcap` (no new build
 //! dependency).
+//!
+//! ## Re-anchored: the fixture LSPs now carry a real §7.3.11 checksum
+//!
+//! Every vector here was first captured from fixture LSPs built with a
+//! hand-picked Checksum field (0xaee7, 0x2222, 0x3000+n, 0x4444, 0x1000+n).
+//! Those values are **wrong** — Wireshark grades that class of LSP
+//! `isis.lsp.checksum.status == "Bad"` — and they were then handed to
+//! `Lsdb.insert` on an arrival interface, i.e. as a *receive*. ISO 10589
+//! §7.3.14.2 e) says a receiver discards such an LSP, so the fixtures were
+//! modelling a PDU no conformant IS-IS would have accepted; they only survived
+//! because nothing verified the field. The fixtures now build through
+//! `LspBuilder.finishStamped` (§7.3.11: the source IS computes the checksum
+//! when the LSP is generated), which changes the 2 checksum octets inside each
+//! LSP-Entry — so every vector below was re-dissected, and each golden records
+//! the command and the `frame.protocols` line proving the frame reached the
+//! real `isis.csnp`/`isis.psnp` dissector rather than a `data` fallback.
+//!
+//! Wireshark does **not** grade the checksum octets inside an LSP-Entry (there
+//! they are opaque payload), so each golden additionally records a dissection
+//! of the *LSP itself*, where Wireshark computes ISO 8473 independently and
+//! reports `isis.lsp.checksum.status`. That, not our own arithmetic, is what
+//! says the new entry checksums are the right values.
 
 const std = @import("std");
 const isis = @import("isis");
@@ -70,10 +92,11 @@ fn up0() scheduler.InterfaceSet {
 // Command:
 //   scripts/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 43 00
 //   00 00 00 00 0a 00 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 09 20 01
-//   f4 11 22 33 44 55 66 00 01 00 00 00 02 22 22 03 84 11 22 33 44 55 66 09 0a
-//   80 00 00 07 ae e7'
+//   f4 11 22 33 44 55 66 00 01 00 00 00 02 6e 27 03 84 11 22 33 44 55 66 09 0a
+//   80 00 00 07 6c 91'
 //
 // Wireshark printed (verbatim, trimmed to the load-bearing lines):
+//   frame.protocols == "eth:llc:osi:isis:isis.csnp"
 //   isis.type == 24 = ...1 1000 = PDU Type: L1 CSNP (24)
 //   isis.csnp.pdu_length == 67 = PDU length: 67
 //   isis.csnp.source_id == 0000.0000.000a = Source-ID: 0000.0000.000a
@@ -84,14 +107,27 @@ fn up0() scheduler.InterfaceSet {
 //   isis.csnp.clv.length == 32 = Length: 32
 //   isis.csnp.lsp_seq_num == 0x00000002 = LSP Sequence Number: 0x00000002
 //   isis.csnp.lsp_remain_life == 500 = Remaining Lifetime: 500
-//   isis.csnp.lsp_checksum == 0x2222 = LSP checksum: 0x2222
+//   isis.csnp.lsp_checksum == 0x6e27 = LSP checksum: 0x6e27
 //   isis.csnp.lsp_id == 1122.3344.5566.00-01 = LSP-ID: 1122.3344.5566.00-01
 //   isis.csnp.lsp_seq_num == 0x80000007 = LSP Sequence Number: 0x80000007
 //   isis.csnp.lsp_remain_life == 900 = Remaining Lifetime: 900
-//   isis.csnp.lsp_checksum == 0xaee7 = LSP checksum: 0xaee7
+//   isis.csnp.lsp_checksum == 0x6c91 = LSP checksum: 0x6c91
 //   isis.csnp.lsp_id == 1122.3344.5566.09-0a = LSP-ID: 1122.3344.5566.09-0a
 // (No expert info of any kind on this or any other vector in this file —
 // checked via --json.)
+//
+// The two summarised LSPs, dissected on their own so Wireshark grades the
+// checksum it cannot grade inside an LSP-Entry:
+//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 01
+//   f4 11 22 33 44 55 66 00 01 00 00 00 02 6e 27 01'
+//     frame.protocols == "eth:llc:osi:isis:isis.lsp"
+//     isis.lsp.checksum == 0x6e27 = Checksum: 0x6e27 [correct]
+//     isis.lsp.checksum.status == "Good" = Checksum Status: Good
+//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   84 11 22 33 44 55 66 09 0a 80 00 00 07 6c 91 01'
+//     frame.protocols == "eth:llc:osi:isis:isis.lsp"
+//     isis.lsp.checksum == 0x6c91 = Checksum: 0x6c91 [correct]
+//     isis.lsp.checksum.status == "Good" = Checksum Status: Good
 //
 // Confirms: the Source-ID splits as system-id(6)+circuit(1) exactly where
 // `Scheduler.sourceId()` places it; the full-database summary's range is
@@ -108,9 +144,9 @@ const golden1_csnp_l1_full = [_]u8{
     0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0x09, 0x20, 0x01, 0xf4, 0x11, 0x22, 0x33,
     0x44, 0x55, 0x66, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x02, 0x22, 0x22, 0x03, 0x84, 0x11, 0x22, 0x33,
+    0x02, 0x6e, 0x27, 0x03, 0x84, 0x11, 0x22, 0x33,
     0x44, 0x55, 0x66, 0x09, 0x0a, 0x80, 0x00, 0x00,
-    0x07, 0xae, 0xe7,
+    0x07, 0x6c, 0x91,
 };
 
 test "golden L1 CSNP full range (Wireshark-anchored): Scheduler.poll reproduces the exact bytes" {
@@ -127,18 +163,18 @@ test "golden L1 CSNP full range (Wireshark-anchored): Scheduler.poll reproduces 
         .remaining_lifetime = 900,
         .lsp_id = id_a,
         .sequence_number = 0x8000_0007,
-        .checksum = 0xaee7,
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     });
-    _ = try db.insert(la.finish(), 0, 0);
+    // §7.3.11 stamping, not a placeholder: these arrive on iface 0, so
+    // §7.3.14.2 e) would discard a "Bad" LSP before it ever reached the LSDB.
+    _ = try db.insert(la.finishStamped(), 0, 0);
     var lb = try isis.pdu.LspBuilder.init(&buf_b, .{
         .remaining_lifetime = 500,
         .lsp_id = id_b,
         .sequence_number = 2,
-        .checksum = 0x2222,
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     });
-    _ = try db.insert(lb.finish(), 0, 0);
+    _ = try db.insert(lb.finishStamped(), 0, 0);
 
     // Only the periodic CSNP is under test: clear the SRM/SSN this arrival set.
     db.clearSrm(id_a, 0);
@@ -165,9 +201,10 @@ test "golden L1 CSNP full range (Wireshark-anchored): Scheduler.poll reproduces 
 // Command:
 //   scripts/dissect.py --frame llc --fields '83 21 01 06 19 01 00 03 00 33 00
 //   00 00 00 00 0a 00 22 33 44 55 66 77 00 02 22 33 44 55 66 77 00 02 09 10 02
-//   58 22 33 44 55 66 77 00 02 00 00 00 03 30 01'
+//   58 22 33 44 55 66 77 00 02 00 00 00 03 33 f9'
 //
 // Wireshark printed:
+//   frame.protocols == "eth:llc:osi:isis:isis.csnp"
 //   isis.type == 25 = ...1 1001 = PDU Type: L2 CSNP (25)
 //   isis.csnp.pdu_length == 51 = PDU length: 51
 //   isis.csnp.source_id == 0000.0000.000a = Source-ID: 0000.0000.000a
@@ -177,8 +214,15 @@ test "golden L1 CSNP full range (Wireshark-anchored): Scheduler.poll reproduces 
 //   isis.csnp.clv.length == 16 = Length: 16
 //   isis.csnp.lsp_seq_num == 0x00000003 = LSP Sequence Number: 0x00000003
 //   isis.csnp.lsp_remain_life == 600 = Remaining Lifetime: 600
-//   isis.csnp.lsp_checksum == 0x3001 = LSP checksum: 0x3001
+//   isis.csnp.lsp_checksum == 0x33f9 = LSP checksum: 0x33f9
 //   isis.csnp.lsp_id == 2233.4455.6677.00-02 = LSP-ID: 2233.4455.6677.00-02
+//
+// The summarised LSP on its own, so Wireshark grades the checksum:
+//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 02
+//   58 22 33 44 55 66 77 00 02 00 00 00 03 33 f9 01'
+//     frame.protocols == "eth:llc:osi:isis:isis.lsp"
+//     isis.lsp.checksum == 0x33f9 = Checksum: 0x33f9 [correct]
+//     isis.lsp.checksum.status == "Good" = Checksum Status: Good
 //
 // This is the middle of 3 CSNPs generated from 5 5-per-poll... actually 3
 // LSPs at `lsp_entries_per_pdu = 1`: chunk 0 covers [00...00, ...00-01] (the
@@ -197,7 +241,7 @@ const golden2_csnp_l2_partial = [_]u8{
     0x02, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00,
     0x02, 0x09, 0x10, 0x02, 0x58, 0x22, 0x33, 0x44,
     0x55, 0x66, 0x77, 0x00, 0x02, 0x00, 0x00, 0x00,
-    0x03, 0x30, 0x01,
+    0x03, 0x33, 0xf9,
 };
 
 test "golden L2 CSNP partial range (Wireshark-anchored): Scheduler.poll's own chunking reproduces the exact bytes" {
@@ -214,10 +258,9 @@ test "golden L2 CSNP partial range (Wireshark-anchored): Scheduler.poll's own ch
             .remaining_lifetime = 600,
             .lsp_id = id,
             .sequence_number = 3,
-            .checksum = @as(u16, 0x3000) + n,
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
         });
-        _ = try db.insert(b.finish(), 0, 0);
+        _ = try db.insert(b.finishStamped(), 0, 0);
         db.clearSrm(id, 0);
         db.clearSsn(id, 0);
     }
@@ -248,9 +291,10 @@ test "golden L2 CSNP partial range (Wireshark-anchored): Scheduler.poll's own ch
 //
 // Command:
 //   scripts/dissect.py --frame llc --fields '83 11 01 06 1a 01 00 03 00 23 00
-//   00 00 00 00 0a 00 09 10 03 84 11 22 33 44 55 66 09 0a 80 00 00 07 ae e7'
+//   00 00 00 00 0a 00 09 10 03 84 11 22 33 44 55 66 09 0a 80 00 00 07 6c 91'
 //
 // Wireshark printed:
+//   frame.protocols == "eth:llc:osi:isis:isis.psnp"
 //   isis.type == 26 = ...1 1010 = PDU Type: L1 PSNP (26)
 //   isis.psnp.pdu_length == 35 = PDU length: 35
 //   isis.psnp.source_id == 0000.0000.000a = Source-ID: 0000.0000.000a
@@ -259,14 +303,20 @@ test "golden L2 CSNP partial range (Wireshark-anchored): Scheduler.poll's own ch
 //   isis.psnp.clv.length == 16 = Length: 16
 //   isis.csnp.lsp_seq_num == 0x80000007 = LSP Sequence Number: 0x80000007
 //   isis.csnp.lsp_remain_life == 900 = Remaining Lifetime: 900
-//   isis.csnp.lsp_checksum == 0xaee7 = LSP checksum: 0xaee7
+//   isis.csnp.lsp_checksum == 0x6c91 = LSP checksum: 0x6c91
 //   isis.csnp.lsp_id == 1122.3344.5566.09-0a = LSP-ID: 1122.3344.5566.09-0a
+//
+// The acknowledged LSP on its own (same bytes as Golden 1's second entry):
+//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   84 11 22 33 44 55 66 09 0a 80 00 00 07 6c 91 01'
+//     frame.protocols == "eth:llc:osi:isis:isis.lsp"
+//     isis.lsp.checksum.status == "Good" = Checksum Status: Good
 const golden3_psnp_l1 = [_]u8{
     0x83, 0x11, 0x01, 0x06, 0x1a, 0x01, 0x00, 0x03,
     0x00, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
     0x00, 0x09, 0x10, 0x03, 0x84, 0x11, 0x22, 0x33,
     0x44, 0x55, 0x66, 0x09, 0x0a, 0x80, 0x00, 0x00,
-    0x07, 0xae, 0xe7,
+    0x07, 0x6c, 0x91,
 };
 
 test "golden L1 PSNP (Wireshark-anchored): Scheduler.poll's SSN-drain reproduces the exact bytes" {
@@ -281,10 +331,9 @@ test "golden L1 PSNP (Wireshark-anchored): Scheduler.poll's SSN-drain reproduces
         .remaining_lifetime = 900,
         .lsp_id = id_a,
         .sequence_number = 0x8000_0007,
-        .checksum = 0xaee7,
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     });
-    _ = try db.insert(la.finish(), 0, 0); // arrives on iface 0 -> SSN set there
+    _ = try db.insert(la.finishStamped(), 0, 0); // arrives on iface 0 -> SSN set there
 
     var out: [16]Effect = undefined;
     var scratch: [1024]u8 = undefined;
@@ -303,22 +352,30 @@ test "golden L1 PSNP (Wireshark-anchored): Scheduler.poll's SSN-drain reproduces
 //
 // Command:
 //   scripts/dissect.py --frame llc --fields '83 11 01 06 1b 01 00 03 00 23 00
-//   00 00 00 00 0a 00 09 10 02 bc 22 33 44 55 66 77 00 01 00 00 00 09 44 44'
+//   00 00 00 00 0a 00 09 10 02 bc 22 33 44 55 66 77 00 01 00 00 00 09 2d fa'
 //
 // Wireshark printed:
+//   frame.protocols == "eth:llc:osi:isis:isis.psnp"
 //   isis.type == 27 = ...1 1011 = PDU Type: L2 PSNP (27)
 //   isis.psnp.pdu_length == 35 = PDU length: 35
 //   isis.psnp.source_id == 0000.0000.000a = Source-ID: 0000.0000.000a
 //   isis.csnp.lsp_seq_num == 0x00000009 = LSP Sequence Number: 0x00000009
 //   isis.csnp.lsp_remain_life == 700 = Remaining Lifetime: 700
-//   isis.csnp.lsp_checksum == 0x4444 = LSP checksum: 0x4444
+//   isis.csnp.lsp_checksum == 0x2dfa = LSP checksum: 0x2dfa
 //   isis.csnp.lsp_id == 2233.4455.6677.00-01 = LSP-ID: 2233.4455.6677.00-01
+//
+// The acknowledged LSP on its own, so Wireshark grades the checksum:
+//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 02
+//   bc 22 33 44 55 66 77 00 01 00 00 00 09 2d fa 01'
+//     frame.protocols == "eth:llc:osi:isis:isis.lsp"
+//     isis.lsp.checksum == 0x2dfa = Checksum: 0x2dfa [correct]
+//     isis.lsp.checksum.status == "Good" = Checksum Status: Good
 const golden4_psnp_l2 = [_]u8{
     0x83, 0x11, 0x01, 0x06, 0x1b, 0x01, 0x00, 0x03,
     0x00, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
     0x00, 0x09, 0x10, 0x02, 0xbc, 0x22, 0x33, 0x44,
     0x55, 0x66, 0x77, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x09, 0x44, 0x44,
+    0x09, 0x2d, 0xfa,
 };
 
 test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP type code" {
@@ -333,10 +390,9 @@ test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP ty
         .remaining_lifetime = 700,
         .lsp_id = id_a,
         .sequence_number = 9,
-        .checksum = 0x4444,
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     });
-    _ = try db.insert(la.finish(), 0, 0);
+    _ = try db.insert(la.finishStamped(), 0, 0);
 
     var out: [16]Effect = undefined;
     var scratch: [1024]u8 = undefined;
@@ -365,8 +421,8 @@ test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP ty
 // Command:
 //   scripts/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 43 00
 //   00 00 00 00 0a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0b 00 01 09 20 03
-//   84 00 00 00 00 00 0b 00 00 00 00 00 01 10 00 03 84 00 00 00 00 00 0b 00 01
-//   00 00 00 02 10 01'
+//   84 00 00 00 00 00 0b 00 00 00 00 00 01 a6 4c 03 84 00 00 00 00 00 0b 00 01
+//   00 00 00 02 9e 52'
 //
 // Wireshark 4.6.4 printed (verbatim, trimmed to the load-bearing lines):
 //   frame.protocols == "eth:llc:osi:isis:isis.csnp"
@@ -377,8 +433,23 @@ test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP ty
 //   isis.csnp.end_lsp_id == 0000.0000.000b.00-01 = End LSP-ID: 0000.0000.000b.00-01
 //   isis.csnp.clv.type == 9 = Type: 9
 //   isis.csnp.clv.length == 32 = Length: 32
+//   isis.csnp.lsp_checksum == 0xa64c = LSP checksum: 0xa64c
 //   isis.csnp.lsp_id == 0000.0000.000b.00-00 = LSP-ID: 0000.0000.000b.00-00
+//   isis.csnp.lsp_checksum == 0x9e52 = LSP checksum: 0x9e52
 //   isis.csnp.lsp_id == 0000.0000.000b.00-01 = LSP-ID: 0000.0000.000b.00-01
+//
+// The two listed LSPs on their own, so Wireshark grades their checksums:
+//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   84 00 00 00 00 00 0b 00 00 00 00 00 01 a6 4c 01'
+//     frame.protocols == "eth:llc:osi:isis:isis.lsp"
+//     isis.lsp.checksum == 0xa64c = Checksum: 0xa64c [correct]
+//     isis.lsp.checksum.status == "Good" = Checksum Status: Good
+//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   84 00 00 00 00 00 0b 00 01 00 00 00 02 9e 52 01'
+//     frame.protocols == "eth:llc:osi:isis:isis.lsp"
+//     isis.lsp.checksum == 0x9e52 = Checksum: 0x9e52 [correct]
+//     isis.lsp.checksum.status == "Good" = Checksum Status: Good
+//
 // No `data` fallback (the frame reached the real IS-IS CSNP dissector) and no
 // expert-info item. Both listed LSP-IDs lie inside the advertised range, and
 // the range stops at the second of them: the 298 LSPs this PDU does not list
@@ -391,9 +462,9 @@ const golden5_csnp_truncated_series = [_]u8{
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00,
     0x01, 0x09, 0x20, 0x03, 0x84, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x01, 0x10, 0x00, 0x03, 0x84, 0x00, 0x00, 0x00,
+    0x01, 0xa6, 0x4c, 0x03, 0x84, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x0b, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x02, 0x10, 0x01,
+    0x02, 0x9e, 0x52,
 };
 
 test "golden truncated CSNP series (Wireshark-anchored): the End LSP-ID is enumerated, not FF…FF" {
@@ -412,10 +483,9 @@ test "golden truncated CSNP series (Wireshark-anchored): the End LSP-ID is enume
             .remaining_lifetime = 900,
             .lsp_id = id,
             .sequence_number = 1 + @as(u32, n),
-            .checksum = 0x1000 +% n,
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
         });
-        _ = try db.insert(lb.finish(), 0, 0);
+        _ = try db.insert(lb.finishStamped(), 0, 0);
         db.clearSsn(id, 0); // only the periodic CSNP is under test
     }
 

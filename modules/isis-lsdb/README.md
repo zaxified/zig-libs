@@ -94,10 +94,17 @@ update process defends itself against an on-link peer:
   top of ISO's linear `[1, 2^32-1]` space could never be superseded; ISO's remedy
   is purge-and-wait-`MaxAge`, restarting at 1.
 
-Still open, and **not** fixable in this module: ISO §7.3.14.2's Fletcher-checksum
-discard. Nothing in the repo verifies the checksum, which leaves the §7.3.16.1(d)
-tie-break usable as an unauthenticated content-replacement primitive. See
-`SPEC.md` §8.
+- **A corrupt LSP is discarded before it can be compared.** ISO §7.3.14.2 e): a
+  **received** LSP whose ISO Fletcher checksum does not check out (including a
+  live LSP carrying a zero checksum, RFC 3719 §7) is `error.CorruptedLsp`, store
+  unchanged — so §7.3.16.1(d)'s checksum tie-break can no longer be reached with
+  arbitrary bytes at an equal sequence number. Purges (§7.3.16.4 note 36) and
+  locally originated LSPs are exempt; see `SPEC.md` §8 for why each has to be.
+
+Still open: **authentication** (RFC 5304/5310). The Fletcher checksum is unkeyed,
+so it catches corruption, not a deliberate on-link forger — one who computes a
+valid checksum for forged content is still only bounded by the sequence-number
+and own-LSP rules above. See `SPEC.md` §8.
 
 ## Capacity / DoS bound
 

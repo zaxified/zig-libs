@@ -84,10 +84,17 @@ notice" design, and it is deliberate.
 Extended IS Reachability (#22) TLV per **currently-up** neighbour (metric = the
 edge metric; `isis-spf` clamps to ≥ 1), and `lsdb.insert`s it self-originated
 (`arrival_iface = null`), which sets SRM on every circuit. The **checksum is
-stamped 0** ("checksumming not in use", ISO 10589): this is load-bearing — it
-keeps every copy of an originator's LSP at a given sequence number comparing
-`.same` under `isis-lsdb`'s §7.3.16.1 rule (which would otherwise treat a differing
-checksum against an active copy as *newer* and re-flood forever). Remaining
+computed** (`LspBuilder.finishStamped`, ISO 10589 §7.3.11: "the source IS shall
+compute the LSP Checksum when the LSP is generated"). This is load-bearing in
+two directions. It must be *right*, because the very next hop `insert`s the same
+bytes with `arrival_iface` set — a receive, and so subject to §7.3.14.2 e)'s
+discard of a checksum failure; the harness previously stamped 0 ("checksumming
+not in use"), which that rule rejects as "not computed" (RFC 3719 §7), so nothing
+would flood at all. And it must be *deterministic*, because every copy of an
+originator's LSP at a given sequence number must compare `.same` under
+`isis-lsdb`'s §7.3.16.1 rule (a differing checksum against an active copy reads
+as *newer* and re-floods forever) — which holds, because every node holds the
+identical bytes the originator emitted. Remaining
 Lifetime is stamped high and the harness never `tick`s the LSDBs, so nothing ages
 during a run (aging races are deferred, §7).
 

@@ -10,8 +10,12 @@ this module.
 Status: **gap** — first increment. Models the common header, the TLV framework,
 the IIH (Hello) / LSP / CSNP / PSNP PDUs, the common TLVs, and the SPB sub-TLVs.
 Caveats: typed PDU bodies decode only the **6-octet system-id** (the SPB/default
-case); the ISO Fletcher checksum is carried as a raw field, not computed; the
-long tail of the IANA TLV registry stays reachable through the raw escape hatch.
+case); `Lsp.decode` carries the ISO Fletcher checksum as a raw field and
+validates nothing, though the checksum itself is now available — `checksum.
+{compute,verify}` (ISO 8473 / RFC 905 Annex B) with the ISO 10589 §7.3.11 LSP
+framing in `pdu.{computeLspChecksum, checkLspChecksum, stampLspChecksum}` and
+`LspBuilder.finishStamped`; the long tail of the IANA TLV registry stays
+reachable through the raw escape hatch.
 See `SPEC.md` for the deliberately-deferred list.
 
 Model after: ISO/IEC 10589 (IS-IS), RFC 1195 / 5301 / 5305 (IP/hostname/TE

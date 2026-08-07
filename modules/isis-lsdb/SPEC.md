@@ -21,8 +21,10 @@ this increment: everything in §6.
 `flags` (`LspFlags`), `pdu_length`, and a bounds-checked `tlv_bytes` region; and
 the CSNP/PSNP (`isis.Csnp`/`isis.Psnp`) with their LSP-Entries (#9) TLVs, walked
 by `isis.tlvs.LspEntryIterator` (16-octet records: lifetime, LSP-ID, sequence,
-checksum). It computes/verifies **no** state and **no** ISO Fletcher checksum —
-the checksum is a raw field.
+checksum). It computes/verifies **no** state; the LSP checksum is decoded as a
+raw field, and `isis.pdu.checkLspChecksum` / `stampLspChecksum` (over
+`isis.checksum`, the ISO 8473 Fletcher primitive) are the codec-side grading and
+stamping this module's §7.3.14.2 receive check calls.
 
 This module owns the **database** and the **update-process logic**: the store,
 the §7.3.16.1 comparison (`compare.zig`), aging, the SRM/SSN flag sets, and the
@@ -231,31 +233,30 @@ placeholders specifically:
 - **Multi-topology (MT) and multi-level** — this is a single-level database; an
   L1 and an L2 database are two `Lsdb` instances. MT would key/scope entries by
   topology.
-- **The ISO Fletcher checksum — a KNOWN, OPEN exposure, not merely "deferred".**
-  Neither computed nor verified anywhere in this repo: the `isis` codec carries
-  the checksum as a raw field and exports no Fletcher primitive
-  (`isis/src/pdu.zig:248-249`), so no consumer *can* verify it. §7.3.16.1(d)
-  (§3, row "c) checksum") is safe in ISO only because §7.3.14.2 has already
-  **discarded** an LSP whose checksum is invalid — by the time (d) runs, a
-  differing checksum can only mean two well-formed copies disagree. Without that
-  precondition **clause (d) is an unauthenticated content-replacement
-  primitive**: an on-link party needs *no* higher sequence number to overwrite a
-  stored LSP, only an arbitrary checksum byte-pair at the *same* sequence; the
-  store then replaces the bytes and sets SRM, re-flooding the attacker's content
-  onward. Closing it is a two-module change and the halves belong in different
-  places:
-  - **the primitive → `isis`.** The Fletcher-over-the-PDU computation is a
-    property of the PDU encoding, and `isis` is a *dependency* of this module, so
-    only a primitive living there is reachable by both the receive path here and
-    the (deferred) LSP-generation path that must *stamp* the checksum.
-    Re-implementing it here would put it out of reach of its other user and
-    duplicate it.
-  - **the policy → here.** "Discard an LSP with an invalid checksum before the
-    §7.3.16.1 comparison" is receive-process behaviour and belongs in
-    `Lsdb.insert`, immediately after `isis.Lsp.decode`.
+- **~~The ISO Fletcher checksum~~ — CLOSED.** Both halves now exist, split as
+  planned: the **primitive** in `isis` (`isis.checksum` + `pdu.{compute,check,
+  stamp}LspChecksum`, ISO 10589 §7.3.11 over the region after Remaining Lifetime,
+  ISO 8473 / RFC 905 Annex B construction, KAT-anchored on the Wireshark-graded
+  `0xaee7` in `src/goldens.zig`), and the **policy** here, in `Lsdb.insert`
+  immediately after `isis.Lsp.decode`: a **received** LSP whose checksum does not
+  check out is `error.CorruptedLsp` and is discarded before any §7.3.16.1
+  comparison (§7.3.14.2 e). That restores the precondition §7.3.16.1(d) (§3, row
+  "c) checksum") assumes, so a differing checksum at an equal sequence number can
+  again only mean "two well-formed copies disagree" (§7.3.16.2) rather than
+  "somebody sent arbitrary bytes". Exemptions, each load-bearing: a **purge**
+  (zero Remaining Lifetime — §7.3.16.4 b) keeps only the header, so its checksum
+  cannot match; §7.3.16.4 note 36 and `draft-li-isis-error-lsp-processing` §4
+  Fig 1 say check lifetime first and never checksum a purge) and a **locally
+  originated** LSP (§7.3.14.2 is a receive rule; stamping is the generator's job
+  per §7.3.11). A **zero checksum on a live LSP is rejected**, not exempted — a
+  correct ISO 8473 checksum can never be zero (RFC 3719 §7), and exempting it
+  would leave clause (d) reachable with `checksum = 0`.
 
-  Tracked as `isis-lsdb` F4 / `isis` F3 in the wave-2 audit; the `isis` half must
-  land first.
+  **This is not authentication.** Fletcher is unkeyed: an on-link forger computes
+  a valid checksum as easily as we do. What the discard removes is the specific
+  primitive where *arbitrary* checksum bytes at an *equal* sequence number
+  sufficed. RFC 5304/5310 remains the only defence against a deliberate forger.
+  (Wave-2 audit `isis-lsdb` F4 / `isis` F3.)
 
 ## 9. Verification
 

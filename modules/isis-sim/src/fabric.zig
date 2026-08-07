@@ -503,7 +503,6 @@ pub const Fabric = struct {
             .remaining_lifetime = lsp_lifetime,
             .lsp_id = lspIdOf(ns.system_id, 0),
             .sequence_number = ns.seq,
-            .checksum = 0, // "checksumming not in use": equal-seq copies compare .same
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
         });
         for (ns.neighbours, 0..) |nb, iface| {
@@ -511,7 +510,13 @@ pub const Fabric = struct {
             const nbr_sys = self.nodes[nb.node].system_id;
             try isis.tlvs.addExtendedIsReach(&b.tlvs, neighbourId7(nbr_sys), nb.metric, &.{});
         }
-        _ = try ns.lsdb.insert(b.finish(), null, now);
+        // ISO 10589 §7.3.11: the *source* IS computes the LSP Checksum when the
+        // LSP is generated. This is that source, so it stamps — and it must, or
+        // the very first hop's `insert` (which arrives on a circuit, and so runs
+        // the §7.3.14.2 e) receive check) discards the LSP as corrupt and the
+        // fabric never floods anything. Two nodes holding the same LSP hold the
+        // same bytes, so equal-sequence copies still compare `.same`.
+        _ = try ns.lsdb.insert(b.finishStamped(), null, now);
 
         // Positive control for `check`'s LSDB-count tripwire: emit additional
         // LSP fragments for this system. Each is a distinct LSP-ID, so the
@@ -525,10 +530,9 @@ pub const Fabric = struct {
                 .remaining_lifetime = lsp_lifetime,
                 .lsp_id = lspIdOf(ns.system_id, frag),
                 .sequence_number = ns.seq,
-                .checksum = 0,
                 .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
             });
-            _ = try ns.lsdb.insert(fb.finish(), null, now);
+            _ = try ns.lsdb.insert(fb.finishStamped(), null, now);
         }
     }
 

@@ -458,28 +458,29 @@ fn idOf(sys: [6]u8, lsp_num: u8) LspId {
     return .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, lsp_num };
 }
 
-fn buildLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16, csum: u16) []const u8 {
-    var b = isis.pdu.LspBuilder.init(buf, .{
-        .remaining_lifetime = life,
-        .lsp_id = idOf(sys, lsp_num),
-        .sequence_number = seq,
-        .checksum = csum,
-        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
-    }) catch unreachable;
-    return b.finish();
+/// Build an LSP the way a conformant originator does: ISO 10589 §7.3.11 makes
+/// computing the Checksum the generating IS's job, so these fixtures stamp it.
+/// They used to pass a `csum` argument of hand-picked filler (0x1111, 0x2222,
+/// 0x1000+n) — values Wireshark grades "Bad" — which every test below then fed
+/// to `Lsdb.insert` on an *arrival* interface. That is a receive, so ISO 10589
+/// §7.3.14.2 e) discards it; the fixtures were modelling a PDU no IS-IS
+/// implementation would accept. No test here asserts a particular checksum
+/// *value*, so nothing is lost by computing it — the one place that needed the
+/// value to match (the PSNP ack below) now derives it from the LSP itself.
+fn buildLsp(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, life: u16) []const u8 {
+    return buildLspId(buf, idOf(sys, lsp_num), seq, life);
 }
 
 /// Build an LSP with an explicit 8-octet LSP-ID (the `sys ++ pseudonode ++
 /// fragment` split matters when a test needs more than 256 distinct ids).
-fn buildLspId(buf: []u8, id: LspId, seq: u32, life: u16, csum: u16) []const u8 {
+fn buildLspId(buf: []u8, id: LspId, seq: u32, life: u16) []const u8 {
     var b = isis.pdu.LspBuilder.init(buf, .{
         .remaining_lifetime = life,
         .lsp_id = id,
         .sequence_number = seq,
-        .checksum = csum,
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     }) catch unreachable;
-    return b.finish();
+    return b.finishStamped();
 }
 
 /// The `n`-th distinct LSP-ID of `sys`: pseudonode byte + fragment byte together
@@ -513,7 +514,7 @@ test "SRM drain + pace: one send, no re-send within the interval, re-send after"
     defer sched.deinit();
 
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000, 0x1111), null, 0); // SRM on all
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0); // SRM on all
     const up = oneUp(0);
 
     var out: [16]Effect = undefined;
@@ -539,7 +540,7 @@ test "positive control: unpaced re-sends every poll; the pace-boundary test need
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000, 0x1111), null, 0);
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0);
     const up = oneUp(0);
     var out: [16]Effect = undefined;
     var scratch: [512]u8 = undefined;
@@ -566,7 +567,8 @@ test "ack clears retransmit: a PSNP that reconciles SRM stops the re-send" {
     defer sched.deinit();
 
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000, 0x1111), null, 0);
+    const lsp = buildLsp(&lbuf, sys_other, 0, 1, 1000);
+    _ = try db.insert(lsp, null, 0);
     const id = idOf(sys_other, 0);
     const up = oneUp(0);
     var out: [16]Effect = undefined;
@@ -578,7 +580,15 @@ test "ack clears retransmit: a PSNP that reconciles SRM stops the re-send" {
     // The neighbour ACKs with a PSNP echoing the same (seq, life, csum) → isis-lsdb
     // clears SRM on the ack path (per-entry `same` ⇒ unset SRM).
     var pbuf: [128]u8 = undefined;
-    const ack = [_]LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = id, .sequence_number = 1, .checksum = 0x1111 }};
+    // The checksum is the one the LSP actually carries (§7.3.11), not a literal:
+    // `same` requires all three of (seq, life, csum) to match, so a stale literal
+    // here would make the ack a no-op and quietly disarm this test.
+    const ack = [_]LspEntry{.{
+        .remaining_lifetime = 1000,
+        .lsp_id = id,
+        .sequence_number = 1,
+        .checksum = try isis.pdu.computeLspChecksum(lsp),
+    }};
     const pw = try snp.buildPsnp(&pbuf, .{ 0, 0, 0, 0, 0, 0xB, 0 }, false, &ack);
     db.reconcilePsnp(try isis.Psnp.decode(pw), 0, 1);
     try testing.expect(!db.srmSet(id).?.isSet(0)); // acked
@@ -596,8 +606,8 @@ test "SSN -> PSNP: exactly the flagged LSPs, decoded, and SSN cleared" {
     // Two LSPs arrive on P2P iface 0 → SSN set on iface 0 for both (ack pending).
     var b0: [128]u8 = undefined;
     var b1: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&b0, sys_other, 0, 3, 900, 0x1111), 0, 0);
-    _ = try db.insert(buildLsp(&b1, sys_other, 1, 7, 800, 0x2222), 0, 0);
+    _ = try db.insert(buildLsp(&b0, sys_other, 0, 3, 900), 0, 0);
+    _ = try db.insert(buildLsp(&b1, sys_other, 1, 7, 800), 0, 0);
     const id0 = idOf(sys_other, 0);
     const id1 = idOf(sys_other, 1);
     try testing.expect(db.ssnSet(id0).?.isSet(0) and db.ssnSet(id1).?.isSet(0));
@@ -639,8 +649,8 @@ test "periodic CSNP: emitted on cadence, not every poll, summarising the DB" {
     defer sched.deinit();
 
     var buf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&buf, sys_other, 0, 4, 900, 0x1111), 0, 0);
-    _ = try db.insert(buildLsp(&buf, sys_other, 1, 6, 900, 0x2222), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 4, 900), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 6, 900), 0, 0);
     // Clear SRM so only the CSNP is under test on iface 0.
     for ([_]u8{ 0, 1 }) |n| db.clearSrm(idOf(sys_other, n), 0);
     // These arrived on iface 0 → SSN on iface 0; clear it too.
@@ -684,7 +694,7 @@ test "CSNP chunking: contiguous [start,end] ranges tile the DB with no gap/overl
     var buf: [128]u8 = undefined;
     var n: u8 = 0;
     while (n < 5) : (n += 1) {
-        _ = try db.insert(buildLsp(&buf, sys_other, n, 1, 900, 0x1000 + @as(u16, n)), 0, 0);
+        _ = try db.insert(buildLsp(&buf, sys_other, n, 1, 900), 0, 0);
         db.clearSrm(idOf(sys_other, n), 0);
         db.clearSsn(idOf(sys_other, n), 0);
     }
@@ -731,7 +741,7 @@ test "up-interface gating: SRM on a down iface is not sent; sent once it is Up" 
 
     var lbuf: [128]u8 = undefined;
     // Arrives on iface 2 → SRM on {0,1,3}, none on 2.
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000, 0x1111), 2, 0);
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), 2, 0);
 
     var out: [16]Effect = undefined;
     var scratch: [512]u8 = undefined;
@@ -746,7 +756,7 @@ test "next-wakeup is the min of the next paced retransmit and the next CSNP" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000, 0x1111), null, 0); // SRM on all
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0); // SRM on all
     const up = oneUp(0);
     var out: [16]Effect = undefined;
     var scratch: [512]u8 = undefined;
@@ -775,9 +785,9 @@ test "determinism: identical (lsdb ops, now, up) yield identical effects" {
             var sched = Scheduler.init(alloc, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
             defer sched.deinit();
             var buf: [128]u8 = undefined;
-            _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 900, 0x1111), 0, 0);
-            _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 900, 0x2222), 0, 0);
-            _ = try db.insert(buildLsp(&buf, sys_other, 2, 1, 900, 0x3333), 0, 0);
+            _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 900), 0, 0);
+            _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 900), 0, 0);
+            _ = try db.insert(buildLsp(&buf, sys_other, 2, 1, 900), 0, 0);
             var out: [32]Effect = undefined;
             var scratch: [1024]u8 = undefined;
             const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
@@ -800,7 +810,7 @@ test "truncation: a full out slice reports truncated and next_wakeup == now" {
     var buf: [128]u8 = undefined;
     var n: u8 = 0;
     while (n < 4) : (n += 1) {
-        _ = try db.insert(buildLsp(&buf, sys_other, n, 1, 900, 0x1000 + @as(u16, n)), null, 0); // SRM on all
+        _ = try db.insert(buildLsp(&buf, sys_other, n, 1, 900), null, 0); // SRM on all
     }
     // out holds only 2 effects but 4 LSPs want flooding on iface 0.
     var out: [2]Effect = undefined;
@@ -832,7 +842,7 @@ fn fillHostileDb(db: *Lsdb, arrival_iface: ?u8) !void {
     var buf: [128]u8 = undefined;
     var n: u16 = 0;
     while (n < hostile_lsp_count) : (n += 1) {
-        _ = try db.insert(buildLspId(&buf, idNth(sys_other, n), 1 + @as(u32, n), 900, 0x1000 +% n), arrival_iface, 0);
+        _ = try db.insert(buildLspId(&buf, idNth(sys_other, n), 1 + @as(u32, n), 900), arrival_iface, 0);
     }
 }
 
@@ -956,7 +966,7 @@ test "last-sent map is pruned when SRM clears (bounded by the SRM-flagged set)" 
     var sched = Scheduler.init(testing.allocator, testCfg());
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000, 0x1111), null, 0);
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0);
     const id = idOf(sys_other, 0);
     var out: [8]Effect = undefined;
     var scratch: [256]u8 = undefined;

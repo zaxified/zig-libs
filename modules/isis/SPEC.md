@@ -157,9 +157,17 @@ Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
   are modeled, the exchange algorithm is not), SPF/route computation, and the
   SPB shortest-path-tree / ECT computation. This module supplies the bytes those
   consumers exchange.
-- **ISO Fletcher checksum** compute/verify — the LSP checksum is carried as a
-  raw 16-bit field (`0` = "not in use", per ISO 10589). Adding a
-  `fletcher16`-based compute/verify is additive and does not change the wire.
+- ~~**ISO Fletcher checksum** compute/verify~~ — **now implemented**, additively:
+  `checksum.{compute,verify}` (ISO 8473 Annex C / RFC 905 Annex B) plus the LSP
+  framing in `pdu.{lspChecksumRegion, computeLspChecksum, checkLspChecksum,
+  stampLspChecksum}` and `LspBuilder.finishStamped`, per ISO 10589 §7.3.11 ("The
+  checksum shall be computed over all fields in the LSP which appear after the
+  Remaining Lifetime field"). `Lsp.decode` is unchanged — it still carries the
+  raw 16-bit field and validates nothing, so the wire behaviour and the
+  zero-allocation decode contract are untouched. A zero field means "not
+  computed" (`ChecksumStatus.not_present`); the receive **policy** built on that
+  — ISO §7.3.14.2's discard — belongs to the update process (`isis-lsdb`), not
+  here.
 - **Non-default ID lengths** in the typed bodies (only 6 is wired; the raw TLV
   walk is id-length-independent).
 - **Authentication TLV (#10)** and IS-IS crypto-auth (RFC 5304/5310); SPB digest

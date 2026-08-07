@@ -87,10 +87,13 @@ fn buildLsp(buf: []u8, sys: [6]u8, seq: u32) []const u8 {
         .remaining_lifetime = 1000,
         .lsp_id = .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, 0 },
         .sequence_number = seq,
-        .checksum = 0xABCD,
         .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
     }) catch unreachable;
-    return b.finish();
+    // ISO 10589 §7.3.11 — the originator stamps the checksum. The placeholder
+    // 0xABCD this used to carry is one Wireshark grades "Bad", and B's `insert`
+    // below is a *receive* (`arrival_iface = 0`), so §7.3.14.2 e) discards it:
+    // the flood→ack loop this test claims to exercise never started.
+    return b.finishStamped();
 }
 
 fn up0() InterfaceSet {

@@ -137,12 +137,22 @@ test "golden LSP (Wireshark-anchored): Lsdb.insert stores exactly the fields Wir
     try testing.expect(view.flags.overload);
     try testing.expectEqual(@as(u2, 3), view.flags.is_type);
 
-    // ISO/IEC 10589 §7.3.16.1 own-LSP rule, on the Wireshark-anchored bytes:
-    // the *same* LSP-ID arriving from a neighbour at a higher sequence number
-    // (0x80000008 > the golden's 0x80000007) is refused, not adopted, and the
-    // owner is told to re-originate above the challenger.
+    // ISO/IEC 10589 §7.3.14.2 e), on the Wireshark-anchored bytes: bumping the
+    // sequence number without recomputing the Fletcher checksum leaves 0xaee7
+    // stale — exactly the state Wireshark grades "Bad" — so the LSP is
+    // discarded on receipt, before the §7.3.16.1 machinery is reached at all.
     var hostile = golden_lsp_bytes;
     hostile[23] = 0x08; // sequence number low octet: 0x8000_0007 → 0x8000_0008
+    try testing.expectError(error.CorruptedLsp, db.insert(&hostile, 1, 101));
+    try testing.expectEqual(@as(u32, 0x8000_0007), db.get(golden_lsp_id, 101).?.sequence_number);
+    try testing.expect(!db.refreshPending(golden_lsp_id));
+
+    // ISO/IEC 10589 §7.3.16.1 own-LSP rule, on the same bytes with the checksum
+    // recomputed as a conformant (or merely competent) sender would: the *same*
+    // LSP-ID arriving from a neighbour at a higher sequence number
+    // (0x80000008 > the golden's 0x80000007) is refused, not adopted, and the
+    // owner is told to re-originate above the challenger.
+    _ = try isis.pdu.stampLspChecksum(&hostile);
     const c = try db.insert(&hostile, 1, 101);
     try testing.expect(!c.stored);
     try testing.expectEqual(@as(?u32, 0x8000_0008), c.self_challenge);

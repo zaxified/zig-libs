@@ -17,6 +17,10 @@
 //! - `pdu` — the IIH (LAN + P2P), LSP, CSNP, and PSNP bodies + builders.
 //! - `spb` — the SPB MT-Capability (#144) / MT-Port-Capability (#143) container
 //!   and the SPB Instance (sub-TLV 1) + SPBM-SI (sub-TLV 3) sub-TLVs.
+//! - `checksum` — the ISO 8473 Fletcher checksum (RFC 905 Annex B), and with it
+//!   `pdu.{computeLspChecksum, checkLspChecksum, stampLspChecksum}` for ISO
+//!   10589 §7.3.11. The codec still *carries* the field verbatim on decode; the
+//!   §7.3.14.2 receive policy is the update process's (`isis-lsdb`).
 //!
 //! ## Conventions (see SPEC.md for the rationale)
 //! - System ids are 6 octets (the default, MAC-sized id SPB uses); the typed
@@ -45,6 +49,7 @@ pub const tlv = @import("tlv.zig");
 pub const tlvs = @import("tlvs.zig");
 pub const pdu = @import("pdu.zig");
 pub const spb = @import("spb.zig");
+pub const checksum = @import("checksum.zig");
 
 // Convenience re-exports of the most-used surface.
 pub const PduType = header.PduType;
@@ -93,6 +98,7 @@ test {
     _ = @import("tlvs.zig");
     _ = @import("pdu.zig");
     _ = @import("spb.zig");
+    _ = @import("checksum.zig");
     _ = @import("goldens.zig");
 }
 

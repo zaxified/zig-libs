@@ -23,6 +23,7 @@
 const std = @import("std");
 const header = @import("header.zig");
 const tlv = @import("tlv.zig");
+const checksum = @import("checksum.zig");
 
 const PduType = header.PduType;
 const CommonHeader = header.CommonHeader;
@@ -218,6 +219,18 @@ pub const P2pHelloBuilder = struct {
 
 pub const lsp_fixed_len: usize = 27;
 
+/// First octet the LSP Checksum covers. ISO/IEC 10589 §7.3.11: "The checksum
+/// shall be computed over all fields in the LSP which appear after the Remaining
+/// Lifetime field. This field (and those appearing before it) are excluded so
+/// that the LSP may be aged by systems without requiring re-computation." The
+/// field after Remaining Lifetime is the LSP ID (a.k.a. Source ID) at offset 12,
+/// which §7.3.11's NOTE confirms: "All Checksum calculations on the LSP are
+/// performed treating the Source ID field as the first octet."
+pub const lsp_checksum_base: usize = 12;
+
+/// Offset of the first of the two Checksum octets in an LSP.
+pub const lsp_checksum_off: usize = 24;
+
 /// The LSP flags octet (ISO 10589 §9.8): partition-repair, attached-metric
 /// bits, LSP-DB overload, and IS Type.
 pub const LspFlags = struct {
@@ -245,8 +258,11 @@ pub const LspFlags = struct {
     }
 };
 
-/// A decoded LSP body (ISO 10589 §9.8). The checksum is carried as a raw field;
-/// this codec does not compute or verify the ISO Fletcher checksum (see SPEC).
+/// A decoded LSP body (ISO 10589 §9.8). `checksum` is the raw field exactly as
+/// it appeared on the wire — decoding never validates it. Use
+/// `checkLspChecksum` (ISO 10589 §7.3.11 / ISO 8473) to grade it and
+/// `stampLspChecksum` to compute it on generation; the receive **policy** built
+/// on top (§7.3.14.2's discard) belongs to the update process, not the codec.
 pub const Lsp = struct {
     header: CommonHeader,
     pdu_length: u16,
@@ -316,7 +332,66 @@ pub const LspBuilder = struct {
         std.mem.writeInt(u16, b.buf[8..10], total, .big);
         return b.buf[0..total];
     }
+
+    /// `finish`, then overwrite the Checksum field with the value ISO/IEC 10589
+    /// §7.3.11 requires ("The source IS shall compute the LSP Checksum when the
+    /// LSP is generated"), discarding whatever `LspFields.checksum` carried.
+    /// This is what an LSP-generation layer calls; `finish` stays available for
+    /// callers that must emit a specific (or deliberately wrong) checksum.
+    pub fn finishStamped(b: *LspBuilder) []const u8 {
+        const wire = b.finish();
+        // `finish` produced a well-formed LSP of at least `lsp_fixed_len`, so
+        // the region and the field are in range by construction.
+        _ = stampLspChecksum(b.buf[0..wire.len]) catch unreachable;
+        return b.buf[0..wire.len];
+    }
 };
+
+/// How an LSP's Checksum field grades (ISO/IEC 10589 §7.3.11 + ISO 8473).
+pub const ChecksumStatus = enum {
+    /// The carried checksum satisfies the ISO 8473 congruences.
+    good,
+    /// The carried checksum is non-zero and does not satisfy them.
+    bad,
+    /// The field is all-zero. A correctly computed checksum can never be zero
+    /// (RFC 3719 §7), so this means the sender did not compute one. It is NOT
+    /// "good" — what to do about it is a receive-policy decision (ISO 10589
+    /// §7.3.14.2(i), and RFC 3719 §7's revision of it), not a codec one.
+    not_present,
+};
+
+/// The byte range the LSP Checksum covers, per §7.3.11: `[lsp_checksum_base,
+/// pdu_length)` of a decoded LSP. Errors exactly as `Lsp.decode` does.
+pub fn lspChecksumRegion(bytes: []const u8) DecodeError![]const u8 {
+    const lsp = try Lsp.decode(bytes);
+    // `tlvRegion` already bounded pdu_length into [lsp_fixed_len, bytes.len],
+    // and lsp_fixed_len > lsp_checksum_off + 1, so the field is inside.
+    return bytes[lsp_checksum_base..lsp.pdu_length];
+}
+
+/// The Checksum value this LSP *should* carry (ISO 10589 §7.3.11 over the
+/// §7.3.11 region, ISO 8473 / RFC 905 Annex B construction).
+pub fn computeLspChecksum(bytes: []const u8) DecodeError!u16 {
+    const region = try lspChecksumRegion(bytes);
+    return checksum.compute(region, lsp_checksum_off - lsp_checksum_base);
+}
+
+/// Grade the Checksum field an LSP carries. `not_present` is reported for an
+/// all-zero field ahead of the arithmetic, because zero is the "not computed"
+/// marker rather than a candidate value (RFC 3719 §7).
+pub fn checkLspChecksum(bytes: []const u8) DecodeError!ChecksumStatus {
+    const region = try lspChecksumRegion(bytes);
+    const carried = std.mem.readInt(u16, bytes[lsp_checksum_off..][0..2], .big);
+    if (carried == 0) return .not_present;
+    return if (checksum.verify(region)) .good else .bad;
+}
+
+/// Write the §7.3.11 checksum into an already-built LSP in place, and return it.
+pub fn stampLspChecksum(bytes: []u8) DecodeError!u16 {
+    const value = try computeLspChecksum(bytes);
+    std.mem.writeInt(u16, bytes[lsp_checksum_off..][0..2], value, .big);
+    return value;
+}
 
 // ── CSNP / PSNP (types 24/25, 26/27) ─────────────────────────────────────────
 
@@ -574,4 +649,95 @@ test "TruncatedBody when the buffer is shorter than the fixed header" {
     // 20-octet fixed header — only 10 bytes here, so the body decode trips.
     const short = [_]u8{ 0x83, 0x08, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03, 0x03, 0x00 };
     try testing.expectError(error.TruncatedBody, P2pHello.decode(&short));
+}
+
+// ── ISO 10589 §7.3.11 LSP checksum ───────────────────────────────────────────
+
+/// The Wireshark-graded LSP from `modules/isis-lsdb/src/goldens.zig` (Golden 1):
+/// `sharkd` reached the real IS-IS dissector and reported
+/// `isis.lsp.checksum == 0xaee7 … [correct]` / `checksum.status == "Good"`.
+/// Repeated here (rather than imported) because `isis` must not depend on its
+/// consumer; `src/checksum.zig` carries the full provenance note.
+const graded_lsp = [_]u8{
+    0x83, 0x1b, 0x01, 0x06, 0x14, 0x01, 0x00, 0x03,
+    0x00, 0x1b, 0x03, 0x84, 0xaa, 0xbb, 0xcc, 0xdd,
+    0xee, 0xff, 0x07, 0x03, 0x80, 0x00, 0x00, 0x07,
+    0xae, 0xe7, 0xd7,
+};
+
+test "§7.3.11: the checksum region starts after Remaining Lifetime, at the LSP ID" {
+    const region = try lspChecksumRegion(&graded_lsp);
+    try testing.expectEqual(@as(usize, graded_lsp.len - lsp_checksum_base), region.len);
+    // First covered octet is the LSP ID's first octet, not PDU Length/lifetime.
+    try testing.expectEqual(@as(u8, 0xaa), region[0]);
+    try testing.expectEqual(graded_lsp[graded_lsp.len - 1], region[region.len - 1]);
+}
+
+test "§7.3.11 KAT: computeLspChecksum reproduces Wireshark's 0xaee7" {
+    try testing.expectEqual(@as(u16, 0xaee7), try computeLspChecksum(&graded_lsp));
+    try testing.expectEqual(ChecksumStatus.good, try checkLspChecksum(&graded_lsp));
+}
+
+test "§7.3.11: aging an LSP does not invalidate its checksum" {
+    // The whole point of excluding Remaining Lifetime: a transit IS decrements
+    // it (§7.3.16.3) without recomputing. Every lifetime value must still grade
+    // `good` over the same body.
+    var aged = graded_lsp;
+    for ([_]u16{ 0, 1, 42, 899, 1199, 65535 }) |life| {
+        std.mem.writeInt(u16, aged[10..12], life, .big);
+        try testing.expectEqual(ChecksumStatus.good, try checkLspChecksum(&aged));
+    }
+}
+
+test "§7.3.11: a wrong checksum grades bad, an absent one grades not_present" {
+    var m = graded_lsp;
+    // Wireshark on these exact bytes: "0x1111 incorrect, should be 0xaee7" / Bad.
+    std.mem.writeInt(u16, m[24..26], 0x1111, .big);
+    try testing.expectEqual(ChecksumStatus.bad, try checkLspChecksum(&m));
+
+    // Zero is the "not computed" marker, not a value (RFC 3719 §7).
+    std.mem.writeInt(u16, m[24..26], 0, .big);
+    try testing.expectEqual(ChecksumStatus.not_present, try checkLspChecksum(&m));
+
+    // Body corruption with the original (correct-for-the-old-body) checksum.
+    m = graded_lsp;
+    m[26] ^= 0x01; // flags octet
+    try testing.expectEqual(ChecksumStatus.bad, try checkLspChecksum(&m));
+}
+
+test "§7.3.11: finishStamped emits the checksum the standard requires" {
+    var buf: [128]u8 = undefined;
+    var b = try LspBuilder.init(&buf, .{
+        .is_l2 = true,
+        .remaining_lifetime = 900,
+        .lsp_id = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x07, 0x03 },
+        .sequence_number = 0x8000_0007,
+        .checksum = 0xDEAD, // deliberately wrong — finishStamped overwrites it
+        .flags = .{ .partition_repair = true, .attached = 0xA, .overload = true, .is_type = 3 },
+    });
+    const wire = b.finishStamped();
+    // Byte-identical to the Wireshark-graded golden, checksum included.
+    try testing.expectEqualSlices(u8, &graded_lsp, wire);
+    try testing.expectEqual(ChecksumStatus.good, try checkLspChecksum(wire));
+
+    // With TLVs the stamp covers them too.
+    var buf2: [128]u8 = undefined;
+    var b2 = try LspBuilder.init(&buf2, .{
+        .remaining_lifetime = 1200,
+        .lsp_id = .{ 0, 0, 0, 0, 0, 1, 0, 0 },
+        .sequence_number = 1,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    try tlvs.addHostname(&b2.tlvs, "node-a");
+    const wire2 = b2.finishStamped();
+    try testing.expectEqual(ChecksumStatus.good, try checkLspChecksum(wire2));
+    var corrupt: [128]u8 = undefined;
+    @memcpy(corrupt[0..wire2.len], wire2);
+    corrupt[wire2.len - 1] ^= 0x01; // last TLV octet — inside the covered region
+    try testing.expectEqual(ChecksumStatus.bad, try checkLspChecksum(corrupt[0..wire2.len]));
+}
+
+test "§7.3.11 helpers reject a malformed LSP the same way decode does" {
+    try testing.expectError(error.BadDiscriminator, checkLspChecksum(&([_]u8{0xFF} ** 30)));
+    try testing.expectError(error.TruncatedBody, computeLspChecksum(graded_lsp[0..20]));
 }
