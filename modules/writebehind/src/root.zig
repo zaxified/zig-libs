@@ -526,6 +526,18 @@ pub const Coordinator = struct {
         // Stage in the cache (marks the entry dirty). OOM here is non-fatal to
         // durability: the WAL record still drives the flush/recovery.
         self.cache.put(key, value, 0, 0, 0);
+        // NON-ADMISSION, not eviction: `ramcache.put` silently refuses any value
+        // larger than the whole cache budget (`value.len > max_bytes`) and fires
+        // NO `on_evict`, so the key would end up neither cache-dirty nor an
+        // orphan — and `kick()`'s only two sources are `drainDirty` and
+        // `orphans`. The acked, durable record would then never be selected by
+        // the documented periodic `drain()` tick, leaving it pending forever
+        // while the WAL grows. Registering the key as an orphan puts it back
+        // under the flush loop's ownership; `startKey` reads the value from the
+        // WAL lease, not from the cache, so an over-budget value still flushes.
+        // (Cheap: `isDirty` is one hash lookup, and the branch is taken only in
+        // the non-admission / immediately-evicted cases.)
+        if (!self.cache.isDirty(key)) try self.addKeySet(&self.orphans, key);
         // A prior tombstone (delete) for this key is now superseded.
         self.dropTombstone(key);
     }
@@ -1190,6 +1202,58 @@ test "on_evict safety net: the evicted entry reaches the sink via drain() ALONE 
     try testing.expectEqualStrings("1", rig.sink.peek("a").?);
     try testing.expectEqualStrings("2", rig.sink.peek("b").?);
     try testing.expectEqualStrings("3", rig.sink.peek("cc").?);
+}
+
+// Regression: wave-2 F1. A value larger than the WHOLE cache budget is refused
+// admission by `ramcache.put` (`value.len > max_bytes`) WITHOUT firing
+// `on_evict`, so before the fix the key was neither cache-dirty nor an orphan
+// and `kick()` — whose only sources are `drainDirty` and `orphans` — could never
+// select it. The write was acked and durable, yet the documented periodic
+// `drain()` tick left it pending forever. `flushAll` is deliberately NOT used:
+// its `flushOneSync` backstop drains any leftover WAL record and would mask the
+// hole (that is exactly why the audit's own reproducer needed 2000 drain passes).
+test "over-budget value: acked write is reachable by drain() ALONE (non-admission, not eviction)" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+
+    var c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1024, // deliberately smaller than the value below
+        .max_cache_entries = 64,
+        .n_workers = 2,
+    });
+    defer c.deinit();
+
+    const big: [4096]u8 = @splat('z');
+    try c.put("small", "s"); // a normally-admitted neighbour, must be unaffected
+    try c.put("big", &big); // 4096 > max_bytes=1024 → refused admission
+    try testing.expectEqual(@as(usize, 2), c.pendingCount());
+
+    // CONTROL 1: the value really was refused admission — this test is only
+    // meaningful while `ramcache` keeps rejecting over-budget values. If a future
+    // `ramcache` change admits it, this assertion fails loudly rather than
+    // letting the test silently stop covering the defect.
+    try testing.expect(!c.cache.isDirty("big"));
+    try testing.expect(c.cache.get("big", 0, 0) == null);
+    // CONTROL 2: and `on_evict` did NOT fire for it (non-admission is not
+    // eviction), so the orphan entry can only have come from `put`'s own
+    // non-admission check.
+    try testing.expect(c.orphans.contains("big"));
+
+    // drain() ALONE — no flushAll backstop.
+    var spins: usize = 0;
+    while (c.pendingCount() > 0 and spins < 100_000) : (spins += 1) c.drain();
+
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 2), rig.sink.count());
+    try testing.expectEqualStrings("s", rig.sink.peek("small").?);
+    try testing.expectEqualStrings(&big, rig.sink.peek("big").?);
+    // Bookkeeping is reconciled once the record is acked — no permanent orphan.
+    try testing.expect(!c.orphans.contains("big"));
 }
 
 test "concurrency: many keys flush via the pool; drain-loop reaches a clean state, no leak" {

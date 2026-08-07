@@ -112,6 +112,23 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   coordinator records the key as an **orphan** so the flusher revisits it even though the cache no
   longer lists it dirty. Its WAL record was already durable, so the write is never lost — the orphan
   set only closes a *liveness* gap (which key to flush), not a durability one.
+- **Non-admission safety net (the same gap, a different door).** Eviction is not the only way a key
+  can leave the cache's dirty list: `ramcache.put` **refuses admission outright** to any value
+  larger than the whole cache budget (`value.len > max_bytes`) and fires **no** `on_evict`. Such a
+  key was therefore neither cache-dirty nor an orphan, and `kick()`'s only two sources are
+  `drainDirty` and `orphans` — so a server whose flush loop is the documented periodic `drain()`
+  tick left an **acked, durable** record pending forever while the WAL grew without bound.
+  `put` now checks `cache.isDirty(key)` after staging and registers a non-admitted key as an
+  orphan. `startKey` takes the value from the WAL lease rather than from the cache, so an
+  over-budget value flushes normally once selected.
+
+  **Why the fix lives here and not in `ramcache`.** Refusing an item bigger than the entire cache is
+  correct, deliberate cache policy — admitting it would evict everything else to hold one entry, and
+  every other `ramcache` consumer relies on the bound. Nor is a synthetic `on_evict` for a value
+  that was never resident honest. The defect was this module's: it treated "handed to the cache" as
+  "registered for flush", when the cache is only a *hint* about which keys are pending and the WAL
+  is the authority. Regression test: *"over-budget value: acked write is reachable by drain() ALONE"*,
+  which deliberately avoids `flushAll` because its `flushOneSync` backstop masks the hole.
 - **`flushAll` backstop.** If records remain but none are cache-dirty/orphan (e.g. a reopened WAL
   the operator never `recover()`ed), `flushOneSync` drains them synchronously so `flushAll` always
   terminates in a clean state. `deinit` calls `flushAll`, so even a forgotten `recover()` loses

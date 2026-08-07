@@ -66,7 +66,11 @@ pub const RegRule = struct {
     }
     /// Does this rule cover `mhz`?
     pub fn covers(r: RegRule, mhz: u32) bool {
-        return mhz * 1000 >= r.start_khz and mhz * 1000 <= r.end_khz;
+        // `mhz * 1000` overflows `u32` for `mhz > 4_294_967`; widen to `u64`
+        // rather than wrap or panic on an out-of-range caller-supplied
+        // frequency.
+        const khz: u64 = @as(u64, mhz) * 1000;
+        return khz >= r.start_khz and khz <= r.end_khz;
     }
 };
 
@@ -262,6 +266,16 @@ test "parse: rules decode with kHz→MHz conversion and DFS flags" {
     try testing.expect(!r.covers(2412));
     try testing.expectEqual(@as(?RegRule, null), d.ruleFor(2412));
     try testing.expectEqual(@as(u32, 5250), d.ruleFor(5280).?.startMhz());
+}
+
+// P-18 (same finding as station.zig's kilobitsPerSecond): `mhz * 1000`
+// overflowed `u32` for `mhz > 4_294_967`, reachable through the public
+// `RegDomain.ruleFor` with a caller-supplied frequency.
+test "RegRule.covers does not overflow on an out-of-range frequency" {
+    const r = RegRule{ .start_khz = 2_400_000, .end_khz = 2_500_000 };
+    try testing.expect(!r.covers(std.math.maxInt(u32)));
+    try testing.expect(!r.covers(4_294_968));
+    try testing.expect(r.covers(2450));
 }
 
 test "parse: the world domain" {

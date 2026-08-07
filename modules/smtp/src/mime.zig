@@ -177,8 +177,16 @@ pub fn writeEncodedWords(f: *Folder, text: []const u8, opts: Options) HeaderErro
         var avail = if (f.opts.fold_at > f.len + 1) f.opts.fold_at - f.len - 1 else 0;
         if (avail < overhead + 8) {
             try f.forceFold();
-            avail = f.opts.fold_at - 2;
+            // `Options.fold_at` is a public, caller-set field with no lower
+            // bound: a `fold_at` below 2 would underflow here, and a
+            // `fold_at` that leaves less room than `overhead` would
+            // underflow `budget` below. Neither is a usable fold width for
+            // an encoded word, so treat it the same as the "absurd charset
+            // name" check above rather than let the subtraction wrap.
+            avail = if (f.opts.fold_at > 2) f.opts.fold_at - 2 else 0;
         }
+        if (avail < overhead + 1) return error.LineTooLong;
+
         const budget = @min(@as(usize, 75), avail) - overhead;
         const use_q = preferQ(rest);
         var taken: usize = 0;
@@ -615,6 +623,34 @@ test "a token that cannot be folded below the hard limit is an error" {
     const big = try renderHeader(gpa, writeUnstructured, .{ "Subject", "A" ** 900, Options{} });
     defer gpa.free(big);
     try checkLineLengths(big, 998);
+}
+
+// P-19: a `fold_at` too small to fit `writeEncodedWords`'s fixed overhead
+// (`"=?" + charset + "?B?" + payload + "?="`) underflowed `usize` arithmetic
+// instead of erroring out. `Options.fold_at` is a public, caller-set field
+// reachable from `Client.sendMessage` through `message.RenderOptions.mime`,
+// with nothing validating it anywhere in the module.
+test "a fold_at too small for the encoded-word overhead is a clean error, not an underflow" {
+    const gpa = testing.allocator;
+    // The audit's reproducer: non-ASCII text forces an encoded word; fold_at
+    // = 10 leaves less room than the "=?utf-8?B??=" overhead (12 octets).
+    try testing.expectError(
+        error.LineTooLong,
+        renderHeader(gpa, writeUnstructured, .{ "Subject", "žluťoučký kůň", Options{ .fold_at = 10 } }),
+    );
+    // fold_at below 2 hits the `fold_at - 2` subtraction directly.
+    try testing.expectError(
+        error.LineTooLong,
+        renderHeader(gpa, writeUnstructured, .{ "Subject", "žluťoučký kůň", Options{ .fold_at = 1 } }),
+    );
+    try testing.expectError(
+        error.LineTooLong,
+        renderHeader(gpa, writeUnstructured, .{ "Subject", "žluťoučký kůň", Options{ .fold_at = 0 } }),
+    );
+    // A fold_at with just enough room still works.
+    const out = try renderHeader(gpa, writeUnstructured, .{ "Subject", "žluťoučký kůň", Options{ .fold_at = 20 } });
+    defer gpa.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "=?utf-8?") != null);
 }
 
 test "RFC 2047: non-ASCII subjects become encoded words under 76 octets" {

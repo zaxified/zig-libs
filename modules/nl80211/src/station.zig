@@ -98,8 +98,13 @@ pub const RateInfo = struct {
 
     /// The link rate in kbit/s, preferring the non-saturating 32-bit field.
     pub fn kilobitsPerSecond(r: RateInfo) ?u32 {
-        if (r.bitrate32_100kbps) |b| return b * 100;
-        if (r.bitrate_100kbps) |b| return @as(u32, b) * 100;
+        // `b * 100` overflows `u32` for `b >= 42_949_673`; the kernel does not
+        // bound `BITRATE32`, so hostile or corrupted wire data can hit it.
+        // Saturate rather than wrap or panic: a link rate over ~4.3 Tbit/s is
+        // never real, so clamping to `maxInt(u32)` kbit/s preserves "absurdly
+        // fast" without aborting the process on decoded wire data.
+        if (r.bitrate32_100kbps) |b| return b *| 100;
+        if (r.bitrate_100kbps) |b| return @as(u32, b) *| 100;
         return null;
     }
 };
@@ -354,6 +359,33 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
     smith.bytes(&raw);
     const len = smith.valueRangeAtMost(u16, 0, raw.len);
-    if (parse(raw[0..len])) |s| std.mem.doNotOptimizeAway(&s) else |_| {}
-    if (parseRateInfo(raw[0..len])) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
+    // Also exercise the accessors, not just the parse — `kilobitsPerSecond`
+    // (P-18) is where the previous integer-overflow panic lived, and a
+    // fuzz harness that only calls `parse`/`parseRateInfo` walks right past
+    // it, per the finding.
+    if (parse(raw[0..len])) |s| {
+        std.mem.doNotOptimizeAway(&s);
+        if (s.tx_bitrate) |r| std.mem.doNotOptimizeAway(r.kilobitsPerSecond());
+        if (s.rx_bitrate) |r| std.mem.doNotOptimizeAway(r.kilobitsPerSecond());
+    } else |_| {}
+    if (parseRateInfo(raw[0..len])) |r| {
+        std.mem.doNotOptimizeAway(&r);
+        std.mem.doNotOptimizeAway(r.kilobitsPerSecond());
+    } else |_| {}
+}
+
+// P-18: `BITRATE32 >= 42_949_673` made `b * 100` overflow a `u32` and abort
+// the process (Debug/ReleaseSafe) or wrap silently (ReleaseFast). This is
+// decoded wire data with no kernel-side range check, so it is attacker/
+// corruption-reachable. Same defect class as W2-01 (CRIT), differing only
+// in exposure.
+test "kilobitsPerSecond saturates instead of overflowing on a hostile BITRATE32" {
+    const r: RateInfo = .{ .bitrate32_100kbps = 42_949_673 };
+    try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), r.kilobitsPerSecond());
+
+    // One below the threshold still overflows the naive `* 100`, so pin it
+    // too: `42_949_672 * 100 == 4_294_967_200`, which fits `u32`
+    // (`maxInt(u32) == 4_294_967_295`) — the true boundary.
+    const r2: RateInfo = .{ .bitrate32_100kbps = 42_949_672 };
+    try testing.expectEqual(@as(?u32, 4_294_967_200), r2.kilobitsPerSecond());
 }

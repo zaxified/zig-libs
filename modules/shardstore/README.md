@@ -24,8 +24,13 @@ them.
 const shardstore = @import("shardstore");
 
 // Open (or create) 8 independent kvtree shards over a filesystem dir.
+// `FsStorage` is per-handle concurrent, so declare it and get real cross-shard
+// parallelism; the default is the conservative `.single_thread`.
 var fs = shardstore.FsStorage.init(io, dir);
-var store = try shardstore.Store.init(gpa, fs.storage(), .{ .n_shards = 8 });
+var store = try shardstore.Store.init(gpa, fs.storage(), .{
+    .n_shards = 8,
+    .storage_concurrency = .parallel_per_handle,
+});
 defer store.deinit();
 
 try store.put("user:42", "alice");           // routed to shardFor("user:42")
@@ -48,7 +53,17 @@ var db = store.shardAt(0);
   cheap mask routing, but any `n_shards >= 1` works.
 - `name_prefix` = `"shard"`, `name_suffix` = `".kvt"` — shard `i`'s file is
   `"<prefix>-<i:0>5><suffix>"` (e.g. `shard-00000.kvt`), resolved by the injected
-  `Storage`.
+  `Storage`. A sixteen-byte `"<prefix>.manifest"` sits beside them.
+- `storage_concurrency` = `.single_thread` — what the injected `Storage`
+  guarantees about concurrent use. See the threading contract below; this is a
+  precondition, not a tuning knob.
+
+**`n_shards` is immutable for the life of the data.** Routing is
+`hash % n_shards`, so a different count re-routes every key. The manifest records
+the count at creation and a mismatched reopen fails with
+`error.ShardCountMismatch` — previously it succeeded and silently read *absent*
+for most keys (measured: a 200-key 4-shard store reopened with 8 found 98/200).
+Changing the count means migrating the data; there is no incremental resharding.
 
 ## Routing
 
@@ -70,6 +85,16 @@ more:
 - Operations on the **same** shard are bounded by `kvtree`'s single-writer rule:
   **the caller must serialize concurrent same-shard writers.** This router adds
   no latch; `shardFor` is exposed so callers can partition up front.
+- **All of which depends on the backend.** Every operation ends in the injected
+  `Storage`, and that is where two shards meet. Cross-shard parallelism is real
+  only over a backend safe for concurrent ops on distinct handles — `FsStorage`
+  is (positional per-handle I/O), `SimStorage` is not (unmanaged containers, a
+  non-atomic `ops_seen`). Declare it with `storage_concurrency`:
+  - `.single_thread` (default) — the `Store` belongs to the thread that called
+    `init`; any other thread gets `error.NotOwningThread` from `put`/`get`/
+    `delete` instead of corrupting the backend. `adoptOwner()` hands it over.
+  - `.parallel_per_handle` — no latch, no owner check, genuine cross-shard
+    parallelism. You are asserting the backend can take it.
 
 Not provided: cross-shard atomicity (a write group spanning shards is not one
 transaction — transactions/snapshots/cursors stay per-shard), a global ordered

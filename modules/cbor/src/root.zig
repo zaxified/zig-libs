@@ -169,6 +169,36 @@ pub const DecodeOptions = struct {
     max_depth: u32 = 64,
 };
 
+/// Recursively releases everything a decoded `Value` owns (`bytes`/`text`
+/// slices, `array`/`map` backing storage and every element inside, `tag`'s
+/// heap-allocated inner value) via `allocator` — the same allocator `decode`
+/// was called with. Used internally to unwind a partially built tree when a
+/// later part of the input turns out to be malformed; a caller using an
+/// arena never needs this (the whole arena is freed at once), which is why
+/// it stays private — decode()'s only documented cleanup contract today is
+/// "free the arena".
+fn freeValue(allocator: Allocator, v: Value) void {
+    switch (v) {
+        .bytes, .text => |s| allocator.free(s),
+        .array => |a| {
+            for (a) |item| freeValue(allocator, item);
+            allocator.free(a);
+        },
+        .map => |m| {
+            for (m) |entry| {
+                freeValue(allocator, entry.key);
+                freeValue(allocator, entry.value);
+            }
+            allocator.free(m);
+        },
+        .tag => |t| {
+            freeValue(allocator, t.value.*);
+            allocator.destroy(t.value);
+        },
+        .uint, .negint, .simple, .bool, .null_value, .undefined_value, .f16, .f32, .f64 => {},
+    }
+}
+
 /// Decode exactly one CBOR item from `bytes`. Fails `error.TrailingGarbage`
 /// if bytes remain after the item (use a length-prefixing framing, e.g.
 /// `framing`, if you need to pack multiple CBOR items back to back).
@@ -177,7 +207,13 @@ pub const DecodeOptions = struct {
 pub fn decode(allocator: Allocator, bytes: []const u8, options: DecodeOptions) DecodeError!Value {
     var d: Decoder = .{ .bytes = bytes, .pos = 0, .allocator = allocator, .max_depth = options.max_depth };
     const v = try d.decodeValue(0);
-    if (d.pos != bytes.len) return error.TrailingGarbage;
+    if (d.pos != bytes.len) {
+        // A fully-decoded tree that turns out to have trailing garbage is
+        // still an error return — free it rather than hand the caller
+        // nothing while the allocator keeps it alive.
+        freeValue(allocator, v);
+        return error.TrailingGarbage;
+    }
     return v;
 }
 
@@ -259,6 +295,7 @@ const Decoder = struct {
             6 => blk: {
                 const tag_num = try self.readArg(info);
                 const inner = try self.allocator.create(Value);
+                errdefer self.allocator.destroy(inner);
                 inner.* = try self.decodeValue(depth + 1);
                 break :blk .{ .tag = .{ .number = tag_num, .value = inner } };
             },
@@ -271,6 +308,7 @@ const Decoder = struct {
             .value => |len| return try self.readBytes(len),
             .indefinite => {
                 var list: std.ArrayList(u8) = .empty;
+                errdefer list.deinit(self.allocator);
                 while (true) {
                     if (try self.peekByte() == 0xff) {
                         _ = try self.readByte();
@@ -285,6 +323,11 @@ const Decoder = struct {
                         .indefinite => return error.Malformed, // chunks may not nest
                     };
                     const chunk = try self.readBytes(chunk_len);
+                    // `chunk` is a standalone dupe; appendSlice copies its
+                    // bytes into `list`'s own buffer and does not take
+                    // ownership, so `chunk` must be freed here regardless of
+                    // whether the append (or a later iteration) succeeds.
+                    defer self.allocator.free(chunk);
                     try list.appendSlice(self.allocator, chunk);
                 }
                 return try list.toOwnedSlice(self.allocator);
@@ -296,11 +339,15 @@ const Decoder = struct {
         switch (try self.readArgFull(info)) {
             .value => |len| {
                 const s = try self.readBytes(len);
-                if (!std.unicode.utf8ValidateSlice(s)) return error.Malformed;
+                if (!std.unicode.utf8ValidateSlice(s)) {
+                    self.allocator.free(s);
+                    return error.Malformed;
+                }
                 return s;
             },
             .indefinite => {
                 var list: std.ArrayList(u8) = .empty;
+                errdefer list.deinit(self.allocator);
                 while (true) {
                     if (try self.peekByte() == 0xff) {
                         _ = try self.readByte();
@@ -315,6 +362,7 @@ const Decoder = struct {
                         .indefinite => return error.Malformed,
                     };
                     const chunk = try self.readBytes(chunk_len);
+                    defer self.allocator.free(chunk);
                     if (!std.unicode.utf8ValidateSlice(chunk)) return error.Malformed;
                     try list.appendSlice(self.allocator, chunk);
                 }
@@ -325,6 +373,14 @@ const Decoder = struct {
 
     fn readArray(self: *Decoder, info: u5, depth: u32) DecodeError![]const Value {
         var list: std.ArrayList(Value) = .empty;
+        // Any error from here on must not leak the elements already
+        // decoded and appended (each may own further allocations of its
+        // own — nested arrays/maps/tags/strings) nor the list's own
+        // backing buffer.
+        errdefer {
+            for (list.items) |v| freeValue(self.allocator, v);
+            list.deinit(self.allocator);
+        }
         switch (try self.readArgFull(info)) {
             .value => |n| {
                 var i: u64 = 0;
@@ -332,12 +388,16 @@ const Decoder = struct {
                 // consume >=1 real byte via decodeValue, so a bogus huge `n`
                 // fails Truncated long before the allocator is stressed.
                 while (i < n) : (i += 1) {
-                    try list.append(self.allocator, try self.decodeValue(depth + 1));
+                    const item = try self.decodeValue(depth + 1);
+                    errdefer freeValue(self.allocator, item);
+                    try list.append(self.allocator, item);
                 }
             },
             .indefinite => {
                 while (try self.peekByte() != 0xff) {
-                    try list.append(self.allocator, try self.decodeValue(depth + 1));
+                    const item = try self.decodeValue(depth + 1);
+                    errdefer freeValue(self.allocator, item);
+                    try list.append(self.allocator, item);
                 }
                 _ = try self.readByte();
             },
@@ -347,19 +407,30 @@ const Decoder = struct {
 
     fn readMap(self: *Decoder, info: u5, depth: u32) DecodeError![]const MapEntry {
         var list: std.ArrayList(MapEntry) = .empty;
+        errdefer {
+            for (list.items) |e| {
+                freeValue(self.allocator, e.key);
+                freeValue(self.allocator, e.value);
+            }
+            list.deinit(self.allocator);
+        }
         switch (try self.readArgFull(info)) {
             .value => |n| {
                 var i: u64 = 0;
                 while (i < n) : (i += 1) {
                     const k = try self.decodeValue(depth + 1);
+                    errdefer freeValue(self.allocator, k);
                     const v = try self.decodeValue(depth + 1);
+                    errdefer freeValue(self.allocator, v);
                     try list.append(self.allocator, .{ .key = k, .value = v });
                 }
             },
             .indefinite => {
                 while (try self.peekByte() != 0xff) {
                     const k = try self.decodeValue(depth + 1);
+                    errdefer freeValue(self.allocator, k);
                     const v = try self.decodeValue(depth + 1);
+                    errdefer freeValue(self.allocator, v);
                     try list.append(self.allocator, .{ .key = k, .value = v });
                 }
                 _ = try self.readByte();
@@ -525,6 +596,62 @@ test {
     _ = cose;
     _ = @import("kat_test.zig");
     _ = @import("cose_kat_test.zig");
+}
+
+// P-20: `decode` leaked the partially built tree on every error path with a
+// non-arena allocator (no `errdefer` anywhere in `readArray`/`readMap`/
+// `readByteString`/`readTextString`, nor around the tag `create`, nor at
+// `decode`'s own `TrailingGarbage` check). All 12 hostile-input tests in
+// `kat_test.zig` use an `ArenaAllocator`, so this class was invisible to the
+// suite — `std.testing.allocator` fails the test on any leak, which is
+// exactly what makes it the right oracle here.
+test "decode does not leak on error paths with a non-arena allocator" {
+    const a = std.testing.allocator;
+
+    // The audit's reproducer: array(2) whose 2nd element is truncated.
+    try std.testing.expectError(error.Truncated, decode(a, &[_]u8{ 0x82, 0x01 }, .{}));
+
+    // A map whose value is truncated after the key decoded successfully.
+    try std.testing.expectError(error.Truncated, decode(a, &[_]u8{ 0xa1, 0x01 }, .{}));
+
+    // A tagged value whose inner item is truncated (exercises the
+    // `allocator.create(Value)` for the tag's heap-allocated inner pointer).
+    try std.testing.expectError(error.Truncated, decode(a, &[_]u8{ 0xc1, 0x18 }, .{}));
+
+    // An indefinite byte string whose second chunk is truncated, after a
+    // valid first chunk was already decoded, duped and appended.
+    try std.testing.expectError(
+        error.Truncated,
+        decode(a, &[_]u8{ 0x5f, 0x41, 0xaa, 0x41 }, .{}),
+    );
+
+    // An indefinite text string whose second chunk is invalid UTF-8, after a
+    // valid first chunk was already decoded, duped and appended.
+    try std.testing.expectError(
+        error.Malformed,
+        decode(a, &[_]u8{ 0x7f, 0x61, 0x61, 0x61, 0xff }, .{}),
+    );
+
+    // A definite text string that is not valid UTF-8.
+    try std.testing.expectError(error.Malformed, decode(a, &[_]u8{ 0x61, 0xff }, .{}));
+
+    // array(2): a byte string that decodes fully, then a nested array whose
+    // one declared element is missing entirely. The outer `list` already
+    // holds the completed byte string when the second element fails, so its
+    // errdefer must free that byte string's allocation too, not just the
+    // outer list's own buffer.
+    try std.testing.expectError(
+        error.Truncated,
+        decode(a, &[_]u8{ 0x82, 0x41, 0x61, 0x81 }, .{}),
+    );
+
+    // A fully-decoded byte string (an owned allocation) with trailing
+    // garbage after it — exercises `decode()`'s own `TrailingGarbage` free;
+    // an all-`uint` item here would own nothing to leak in the first place.
+    try std.testing.expectError(
+        error.TrailingGarbage,
+        decode(a, &[_]u8{ 0x41, 0x61, 0x02 }, .{}),
+    );
 }
 
 test "smoke: encode/decode round-trip a small map" {

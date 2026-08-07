@@ -220,6 +220,9 @@ pub const Pdu = struct {
             .all_data = &.{},
         };
         var seen_t = false;
+        var seen_st_num = false;
+        var seen_sq_num = false;
+        var seen_conf_rev = false;
         var seen_all_data = false;
         var it = ber.Iterator.init(outer.content);
         while (try it.next()) |e| {
@@ -233,10 +236,19 @@ pub const Pdu = struct {
                     p.t = try mmsdata.UtcTime.parse(e.content);
                     seen_t = true;
                 },
-                5 => p.st_num = try ber.decodeUint(u32, e.content),
-                6 => p.sq_num = try ber.decodeUint(u32, e.content),
+                5 => {
+                    p.st_num = try ber.decodeUint(u32, e.content);
+                    seen_st_num = true;
+                },
+                6 => {
+                    p.sq_num = try ber.decodeUint(u32, e.content);
+                    seen_sq_num = true;
+                },
                 7 => p.test_mode = try ber.decodeBool(e.content),
-                8 => p.conf_rev = try ber.decodeUint(u32, e.content),
+                8 => {
+                    p.conf_rev = try ber.decodeUint(u32, e.content);
+                    seen_conf_rev = true;
+                },
                 9 => p.nds_com = try ber.decodeBool(e.content),
                 10 => p.num_dat_set_entries = try ber.decodeUint(u32, e.content),
                 11 => {
@@ -246,7 +258,14 @@ pub const Pdu = struct {
                 else => {}, // security [12] and future fields are ignored
             }
         }
-        if (p.gocb_ref.len == 0 or !seen_t or !seen_all_data) return error.MissingField;
+        // `stNum`, `sqNum` and `confRev` are the replay-detection fields (see
+        // SPEC.md "The subscriber distinguishes four conditions"): a silently
+        // defaulted 0 is indistinguishable from a legitimately quiet
+        // publisher's first frame, so a subscriber that accepts an absent
+        // field here has its replay/staleness detection defeated by
+        // omission, not just by a forged value.
+        if (p.gocb_ref.len == 0 or !seen_t or !seen_all_data or
+            !seen_st_num or !seen_sq_num or !seen_conf_rev) return error.MissingField;
         if (p.go_id.len == 0) p.go_id = p.gocb_ref;
         // The redundant count must agree with the entries actually present.
         const actual = try p.valueCount();
@@ -479,6 +498,36 @@ test "a PDU missing a mandatory field is refused" {
     // gocbRef present, t present, but no allData.
     const no_all_data = [_]u8{ 0x61, 0x0D, 0x80, 0x01, 'a', 0x84, 0x08 } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A};
     try testing.expectError(error.MissingField, Pdu.decode(&no_all_data));
+}
+
+// P-16: `stNum`, `sqNum` and `confRev` are the replay/staleness-detection
+// fields (SPEC.md "The subscriber distinguishes four conditions"). A PDU
+// that omits them must be refused, not silently decoded with each at 0 —
+// a defaulted 0 is indistinguishable from a legitimate first frame and
+// defeats replay detection by omission alone. UNVERIFIED: this test relies
+// on the module's own SPEC.md and the ASN.1 field roles it documents, not
+// on a direct read of the paywalled IEC 61850-8-1 text.
+test "a GOOSE PDU omitting stNum, sqNum or confRev is refused" {
+    // gocbRef + t + allData present; stNum, sqNum, confRev all absent.
+    // 80 01 'a' (gocbRef) | 84 08 <8 bytes> (t) | AB 00 (empty allData)
+    const missing_all_three = [_]u8{
+        0x61, 0x0F,
+        0x80, 0x01,
+        'a',  0x84,
+        0x08,
+    } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A} ++ [_]u8{ 0xAB, 0x00 };
+    try testing.expectError(error.MissingField, Pdu.decode(&missing_all_three));
+
+    // Same PDU but with stNum = 0 added explicitly: sqNum and confRev are
+    // still absent, so it must still be refused.
+    // ... 85 01 00 (stNum) added before allData.
+    const missing_sq_and_conf = [_]u8{
+        0x61, 0x12,
+        0x80, 0x01,
+        'a',  0x84,
+        0x08,
+    } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A} ++ [_]u8{ 0x85, 0x01, 0x00, 0xAB, 0x00 };
+    try testing.expectError(error.MissingField, Pdu.decode(&missing_sq_and_conf));
 }
 
 test "a UtcTime with an impossible accuracy is refused inside a GOOSE PDU" {
