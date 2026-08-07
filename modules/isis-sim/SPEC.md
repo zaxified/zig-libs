@@ -51,13 +51,24 @@ the harness owns all per-node isis state in `ctx`.
   duration of the replay. The scenario adds `node_count` nodes and one
   `addBiLink` per undirected edge (added once, for `a < b`).
 - **onStart** originates the node's LSP (§4), arms the first flooding poll
-  (`timer_poll = 0`, delay 1), and pre-arms a failure timer
+  (`timer_poll = 0`, delay 1), pre-arms a failure timer
   (`fail_timer_base + k`, delay = the failure's scheduled time) for each scheduled
-  failure it terminates.
+  failure it terminates, and pre-arms the cold-restart timer
+  (`timer_restart = 1`) if `Fabric.restart` names this node.
 - **onMessage** decodes the PDU and applies it to the LSDB (insert / reconcile),
   then arms a flooding poll so the freshly-set SRM/SSN drain on the next `poll`.
-- **onTimer** either polls-and-sends (`timer_poll`) or, for a failure timer,
-  marks the circuit down + re-originates (§5) and then polls-and-sends.
+  With `Fabric.ignore_snp` set, CSNP/PSNP PDUs are dropped instead of reconciled
+  — the SNP path's positive control (§6).
+- **onTimer** polls-and-sends (`timer_poll`); for a failure timer it first marks
+  the circuit down + re-originates (§5); for `timer_restart` it first performs a
+  **cold restart** — the node's LSDB and its whole flooding state (SRM/SSN, the
+  last-sent pacing map, the CSNP cadence) are dropped and it re-originates its
+  own LSP at a bumped sequence number. Its neighbours hold no SRM toward it (they
+  were acked before the restart), so this is the one divergence retransmission
+  cannot repair, and therefore the configuration in which the CSNP resync path is
+  measurable at all. Measured result in `fabric.zig` (`MEASURED:` tests): SNPs
+  dropped → 1 of 4 originators recovered; SNPs reconciled → 4 of 4, with the
+  retransmit interval inert in both.
 - **checkFn** enforces `lsdb.count() ≤ node_count` on every node after every
   event (a runaway/corruption tripwire).
 - **resetFn** deinits+re-inits every LSDB/scheduler and clears seq/link_failed to
@@ -160,8 +171,10 @@ always working regardless, this test would stop failing.
 
 - **Adjacency FSM (`isis-adj`).** A netsim link is the adjacency; no hello /
   three-way handshake / hold-timer. This is the one stack layer the capstone omits.
-- **Node crash / restart.** netsim supports it (`crash_node` / `restart_node`),
-  but LSP purge/refresh-on-restart races are out of scope.
+- **Node crash / restart.** A control-plane cold restart *is* modelled
+  (`Fabric.restart`, above) because it is the only way to exercise CSNP resync.
+  netsim's own transport-level `crash_node` / `restart_node`, and LSP
+  purge/refresh-on-restart races, remain out of scope.
 - **LSP purge & aging races.** The harness never `tick`s the LSDBs, so
   MaxAge/ZeroAgeLifetime purge and self-refresh do not interleave with flooding
   here.

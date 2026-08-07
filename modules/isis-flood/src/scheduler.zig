@@ -495,6 +495,34 @@ fn oneUp(iface: u8) InterfaceSet {
     return s;
 }
 
+/// The circuit the tests below receive another system's LSPs on.
+///
+/// Six fixtures used to insert `sys_other`'s LSP with `arrival_iface = null` —
+/// the **local-origination** path — purely because that arms SRM on every
+/// circuit in one call. No such state exists on a real box: an LSP whose LSP-ID
+/// does not carry our system-id always arrived on some circuit, and arriving is
+/// what the flooding matrix is defined over. The shortcut also hid the ISO
+/// §7.3.15 split-horizon rule (SRM on every circuit *except* the arrival one)
+/// behind a state where there is no arrival circuit to except.
+///
+/// Receiving on circuit 1 while every test polls `oneUp(0)` keeps every expected
+/// count identical and makes the SRM set the real one: `{0}` rather than
+/// `{0, 1}`. `arrivalDb` asserts exactly that, so the difference cannot go
+/// unnoticed if the matrix changes.
+const arrival: u8 = 1;
+
+/// A 2-circuit store holding `sys_other`'s LSP as **received on `arrival`**,
+/// with the resulting flag set asserted: SRM on circuit 0 only (split horizon),
+/// SSN on the arrival circuit only (the P2P ack, which no test below polls for
+/// since none brings circuit 1 Up).
+fn arrivalDb(db: *Lsdb, wire: []const u8, id: LspId) !void {
+    _ = try db.insert(wire, arrival, 0);
+    const srm = db.srmSet(id).?;
+    try testing.expect(srm.isSet(0) and !srm.isSet(arrival));
+    try testing.expectEqual(@as(usize, 1), srm.count());
+    try testing.expect(db.ssnSet(id).?.isSet(arrival));
+}
+
 fn countKind(effects: []const Effect, kind: PduKind) usize {
     var n: usize = 0;
     for (effects) |e| if (e.kind == kind) {
@@ -514,7 +542,7 @@ test "SRM drain + pace: one send, no re-send within the interval, re-send after"
     defer sched.deinit();
 
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0); // SRM on all
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
     const up = oneUp(0);
 
     var out: [16]Effect = undefined;
@@ -540,7 +568,7 @@ test "positive control: unpaced re-sends every poll; the pace-boundary test need
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0);
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
     const up = oneUp(0);
     var out: [16]Effect = undefined;
     var scratch: [512]u8 = undefined;
@@ -568,8 +596,8 @@ test "ack clears retransmit: a PSNP that reconciles SRM stops the re-send" {
 
     var lbuf: [128]u8 = undefined;
     const lsp = buildLsp(&lbuf, sys_other, 0, 1, 1000);
-    _ = try db.insert(lsp, null, 0);
     const id = idOf(sys_other, 0);
+    try arrivalDb(&db, lsp, id);
     const up = oneUp(0);
     var out: [16]Effect = undefined;
     var scratch: [512]u8 = undefined;
@@ -756,7 +784,7 @@ test "next-wakeup is the min of the next paced retransmit and the next CSNP" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0); // SRM on all
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
     const up = oneUp(0);
     var out: [16]Effect = undefined;
     var scratch: [512]u8 = undefined;
@@ -810,7 +838,7 @@ test "truncation: a full out slice reports truncated and next_wakeup == now" {
     var buf: [128]u8 = undefined;
     var n: u8 = 0;
     while (n < 4) : (n += 1) {
-        _ = try db.insert(buildLsp(&buf, sys_other, n, 1, 900), null, 0); // SRM on all
+        try arrivalDb(&db, buildLsp(&buf, sys_other, n, 1, 900), idOf(sys_other, n));
     }
     // out holds only 2 effects but 4 LSPs want flooding on iface 0.
     var out: [2]Effect = undefined;
@@ -960,14 +988,44 @@ test "hostile peer: a >256-LSP CSNP series makes a peer holding the same DB re-f
     try testing.expectEqual(@as(usize, 0), requested);
 }
 
+test "split horizon: a received LSP is never scheduled back out its arrival circuit" {
+    // What the six `arrival_iface = null` fixtures could not state. With no
+    // arrival circuit there is no circuit to except, so SRM was set on all of
+    // them and "does the scheduler respect the exception" was untestable here.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5 });
+    defer sched.deinit();
+
+    var lbuf: [128]u8 = undefined;
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
+
+    // Both circuits Up, polled across several retransmit periods: the LSP is
+    // transmitted repeatedly on circuit 0 and not once on the arrival circuit.
+    var both = oneUp(0);
+    both.set(arrival);
+    var out: [16]Effect = undefined;
+    var scratch: [512]u8 = undefined;
+    var on_zero: usize = 0;
+    var on_arrival: usize = 0;
+    for ([_]Time{ 0, 5, 10, 15 }) |t| {
+        for (sched.poll(t, both, &db, &out, &scratch).effects) |e| {
+            if (e.kind != .lsp) continue;
+            if (e.iface == arrival) on_arrival += 1 else on_zero += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), on_zero);
+    try testing.expectEqual(@as(usize, 0), on_arrival);
+}
+
 test "last-sent map is pruned when SRM clears (bounded by the SRM-flagged set)" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
     var sched = Scheduler.init(testing.allocator, testCfg());
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
-    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), null, 0);
     const id = idOf(sys_other, 0);
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), id);
     var out: [8]Effect = undefined;
     var scratch: [256]u8 = undefined;
 

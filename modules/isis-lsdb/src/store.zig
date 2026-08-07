@@ -183,6 +183,12 @@ pub const EntryView = struct {
     challenge_sequence: u32,
     /// The owned raw PDU bytes (empty for a request placeholder). Valid until
     /// this LSP is replaced, removed, or the store is deinit'd.
+    ///
+    /// **For a purge (`is_purge`) these are the LSP header alone** — ISO/IEC
+    /// 10589 §7.3.16.4 b). Whatever TLV body the zero-lifetime PDU arrived with
+    /// is not retained and is therefore not observable by any reader, and not
+    /// re-flooded: `isis.Lsp.decode(bytes).tlv_bytes` is empty and
+    /// `pdu_length == isis.pdu.lsp_fixed_len`. See `Lsdb.retainHeaderOnly`.
     bytes: []const u8,
 };
 
@@ -340,9 +346,13 @@ pub const Lsdb = struct {
     ///    though the data portion is not present", and
     ///    `draft-li-isis-error-lsp-processing` §4 Figure 1 makes it explicit —
     ///    test Remaining Lifetime **first**, and never checksum a purge. This
-    ///    exemption does not re-open the content-replacement hole: an attacker
-    ///    who sends a purge replaces content with *no* content, and a purge that
-    ///    a peer can send at all is the unauthenticated-IS-IS exposure RFC
+    ///    exemption does not re-open the content-replacement hole *because*
+    ///    §7.3.16.4 b) is enforced on the store side: a purge is retained as its
+    ///    header alone (`dupeRetainedBytes`), so an attacker who sends one
+    ///    replaces content with **no** content however many TLVs the PDU
+    ///    carried. Without that retention rule the exemption would be exactly a
+    ///    content-injection path no checksum defends (audit BD-20). A purge a
+    ///    peer can send at all is then the unauthenticated-IS-IS exposure RFC
     ///    5304/5310 addresses, not one a checksum ever defended.
     /// 3. Nothing else. In particular a **zero checksum** on a live LSP is
     ///    *rejected*, not waved through: a correctly computed ISO 8473 checksum
@@ -435,9 +445,45 @@ pub const Lsdb = struct {
         return .{ .ordering = .newer, .stored = true, .lsp_id = id };
     }
 
+    /// ISO/IEC 10589 §7.3.16.4 b): **"retain only the LSP header"**. The octets
+    /// this store keeps for a copy of `lsp` — the whole PDU while it is active,
+    /// the 27-octet LSP header alone once it is a purge (zero Remaining
+    /// Lifetime).
+    ///
+    /// ## Why a purge is stored header-only, and why not simply rejected
+    /// A purge is deliberately exempt from the §7.3.14.2 e) checksum discard
+    /// (`insert`, exemption 2): its body is gone by definition, so the carried
+    /// checksum cannot cover it. That exemption is only sound while the body
+    /// really is discarded. Storing a zero-lifetime PDU's TLVs would make the
+    /// purge a **content-injection path that no checksum defends** — an on-link
+    /// party could replace a stored LSP's body with arbitrary TLVs simply by
+    /// stamping Remaining Lifetime 0 (bounded, but only by `ZeroAgeLifetime`).
+    /// Retaining the header closes it: `EntryView.bytes` for a purge decodes to
+    /// an empty TLV region, so no reader — SPF, hostname lookup, the flooding
+    /// layer that re-transmits these very bytes — can observe the injected body.
+    ///
+    /// A full-bodied purge is **accepted and truncated**, not discarded. ISO's
+    /// purger transmits header-only, so a body means a non-conformant (or
+    /// hostile) sender; but discarding it would let anyone *block* a legitimate
+    /// purge from propagating by appending one octet to it. Liberal in what we
+    /// accept, strict in what we retain.
+    ///
+    /// The header is kept **verbatim** apart from the two fields that describe
+    /// the truncation itself (PDU Length, and Remaining Lifetime for the aging
+    /// path — see `retainHeaderOnly`). In particular the Checksum field is left
+    /// as it arrived: §7.3.16.4's note 36 has the check "succeed even though the
+    /// data portion is not present", i.e. the field survives the purge and is
+    /// simply not re-verified.
+    fn dupeRetainedBytes(self: *Lsdb, lsp: isis.Lsp, bytes: []const u8) ![]u8 {
+        if (lsp.remaining_lifetime != 0) return self.alloc.dupe(u8, bytes[0..lsp.pdu_length]);
+        const hdr = try self.alloc.dupe(u8, bytes[0..isis.pdu.lsp_fixed_len]);
+        stampPurgeHeader(hdr);
+        return hdr;
+    }
+
     /// Build a fresh owned entry from a decoded LSP (dupes the PDU bytes).
     fn newEntry(self: *Lsdb, lsp: isis.Lsp, bytes: []const u8, now: Time) !Entry {
-        const owned = try self.alloc.dupe(u8, bytes[0..lsp.pdu_length]);
+        const owned = try self.dupeRetainedBytes(lsp, bytes);
         return .{
             .sequence_number = lsp.sequence_number,
             .initial_lifetime = lsp.remaining_lifetime,
@@ -460,7 +506,7 @@ pub const Lsdb = struct {
     /// old bytes, dupes the new). Resets purge/refresh/request state; the caller
     /// then re-applies the flooding flags.
     fn fillEntry(self: *Lsdb, e: *Entry, lsp: isis.Lsp, bytes: []const u8, now: Time) !void {
-        const owned = try self.alloc.dupe(u8, bytes[0..lsp.pdu_length]);
+        const owned = try self.dupeRetainedBytes(lsp, bytes);
         if (e.bytes.len > 0) self.alloc.free(e.bytes);
         // The placeholder is being satisfied — give its slot back to the budget.
         if (e.is_request) self.request_count -= 1;
@@ -533,6 +579,7 @@ pub const Lsdb = struct {
             }
             if (rem == 0) {
                 e.purge_deadline = now + self.cfg.zero_age_lifetime;
+                self.retainHeaderOnly(e);
                 self.setSrmAll(e);
                 rep.entered_purge += 1;
             }
@@ -585,6 +632,34 @@ pub const Lsdb = struct {
     fn setSrmAll(self: *Lsdb, e: *Entry) void {
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) e.srm.set(i);
+    }
+
+    /// ISO/IEC 10589 §7.3.16.4 b) for the **aging** path: an entry whose
+    /// Remaining Lifetime has just reached zero becomes a purge, so the body it
+    /// was holding must go the same way a received purge's does
+    /// (`dupeRetainedBytes`) — these are the very octets `srmIterator` hands the
+    /// flooding layer to re-transmit, and a purge is flooded as a header.
+    ///
+    /// It also stamps Remaining Lifetime 0 into the retained header. Without
+    /// that the "purge" this store floods would carry the lifetime the LSP was
+    /// *originated* with, i.e. it would not be a purge at all and the removal
+    /// would never propagate.
+    ///
+    /// Unlike the receive path this cannot report an error (`tick` has no error
+    /// union), so the shrink is best-effort: if reallocation fails the body is
+    /// still erased in place and PDU Length still says "header only", so no
+    /// reader and no re-flood can observe it — only the allocation stays larger
+    /// than it needs to be.
+    fn retainHeaderOnly(self: *Lsdb, e: *Entry) void {
+        if (e.bytes.len < isis.pdu.lsp_fixed_len) return; // request placeholder
+        if (e.bytes.len > isis.pdu.lsp_fixed_len) {
+            if (self.alloc.realloc(e.bytes, isis.pdu.lsp_fixed_len)) |shrunk| {
+                e.bytes = shrunk;
+            } else |_| {
+                @memset(e.bytes[isis.pdu.lsp_fixed_len..], 0);
+            }
+        }
+        stampPurgeHeader(e.bytes);
     }
 
     // ── flooding-flag queries (the flooding layer's read/clear surface) ─────
@@ -889,6 +964,18 @@ pub const Lsdb = struct {
         self.setSsnIfP2p(gop.value_ptr, iface);
     }
 };
+
+/// Rewrite the two header fields that describe a §7.3.16.4 b) truncation: PDU
+/// Length becomes the header length (so the TLV region a decoder derives is
+/// empty), and Remaining Lifetime becomes 0 (so the retained header *is* a
+/// purge on the wire). Offsets per ISO 10589 §9.8 / `isis.Lsp.decode`. Every
+/// other header octet — LSP-ID, Sequence Number, Checksum, flags — is left as it
+/// stood; those are what §7.3.16.1 and the CSNP summary still reason over.
+fn stampPurgeHeader(hdr: []u8) void {
+    std.debug.assert(hdr.len >= isis.pdu.lsp_fixed_len);
+    std.mem.writeInt(u16, hdr[8..10], @intCast(isis.pdu.lsp_fixed_len), .big);
+    std.mem.writeInt(u16, hdr[10..12], 0, .big);
+}
 
 /// Inclusive byte-wise (lexicographic) LSP-ID range test — the ordering a CSNP's
 /// `[start, end]` uses.
@@ -1582,6 +1669,107 @@ test "§7.3.14.2 exemptions: purge, local origination, and in-transit aging stil
     std.mem.writeInt(u16, aged[10..12], 137, .big); // as a neighbour would
     try testing.expect((try db.insert(aged[0..fresh.len], 1, 2)).stored);
     try testing.expectEqual(@as(u16, 137), db.get(idOf(sys_other, 2), 2).?.remaining_lifetime);
+}
+
+// ── regression: ISO 10589 §7.3.16.4 b) — a purge is retained as a HEADER ─────
+//
+// The purge is exempt from the §7.3.14.2 e) checksum discard above (its body is
+// gone by definition, so the carried checksum cannot cover it). That exemption
+// is sound only while the body really is discarded — otherwise "zero Remaining
+// Lifetime" is a content-injection primitive that no checksum defends, which is
+// exactly what the checksum work was meant to close. Audit BD-20.
+
+/// Build a zero-lifetime LSP that nevertheless carries a full TLV body, with a
+/// checksum of the sender's choosing: the wire image of a hostile purge. No
+/// conformant IS emits this — §7.3.16.4 b) makes the purger send the header —
+/// and an on-link party needs nothing but a socket to send it.
+fn buildFatPurge(buf: []u8, sys: [6]u8, lsp_num: u8, seq: u32, name: []const u8, csum: u16) []const u8 {
+    var b = isis.pdu.LspBuilder.init(buf, .{
+        .remaining_lifetime = 0,
+        .lsp_id = .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], 0, lsp_num },
+        .sequence_number = seq,
+        .checksum = csum,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = true, .is_type = 1 },
+    }) catch unreachable;
+    isis.tlvs.addHostname(&b.tlvs, name) catch unreachable;
+    return b.finish();
+}
+
+test "§7.3.16.4 b): a hostile purge's TLV body is not retained and not re-flooded" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    const id = idOf(sys_other, 0);
+
+    // A conformant neighbour's LSP, whose content a reader can observe.
+    var good: [128]u8 = undefined;
+    _ = try db.insert(buildNamedLsp(&good, sys_other, 0, 4, 1000, "legit", false), 1, 0);
+    try testing.expectEqualStrings("legit", hostnameOf(&db, id, 0).?);
+
+    // The attack: a zero-lifetime PDU for the same LSP-ID at a higher sequence,
+    // carrying a body and any checksum at all. It IS a valid purge (§7.3.16.1 —
+    // a higher sequence wins) and is stored as one; what must not survive is the
+    // body it smuggled.
+    var evil: [128]u8 = undefined;
+    const r = try db.insert(buildFatPurge(&evil, sys_other, 0, 5, "EVIL!", 0xBEEF), 1, 1);
+    try testing.expect(r.stored);
+    const v = db.get(id, 1).?;
+    try testing.expect(v.is_purge);
+
+    // §7.3.16.4 b): only the header is retained.
+    try testing.expectEqual(@as(usize, isis.pdu.lsp_fixed_len), v.bytes.len);
+    const stored = try isis.Lsp.decode(v.bytes);
+    try testing.expectEqual(@as(u16, isis.pdu.lsp_fixed_len), stored.pdu_length);
+    try testing.expectEqual(@as(usize, 0), stored.tlv_bytes.len);
+    // Nothing a reader can observe — not the injected name, not the old one.
+    try testing.expect(hostnameOf(&db, id, 1) == null);
+    // The header fields the comparison and the CSNP summary still need survive.
+    try testing.expectEqual(@as(u32, 5), stored.sequence_number);
+    try testing.expectEqual(@as(u16, 0), stored.remaining_lifetime);
+
+    // And the flooding layer re-transmits exactly those header octets: the
+    // purge is SRM-flagged on every circuit, and what it hands out is a header.
+    var it = db.srmIterator(0);
+    const queued = it.next().?;
+    try testing.expectEqual(@as(usize, isis.pdu.lsp_fixed_len), queued.bytes.len);
+    try testing.expectEqual(@as(usize, 0), (try isis.Lsp.decode(queued.bytes)).tlv_bytes.len);
+
+    // Truncation is per-copy, not sticky: the next legitimate LSP for this
+    // LSP-ID is stored with its body intact and is observable again.
+    var back: [128]u8 = undefined;
+    try testing.expect((try db.insert(buildNamedLsp(&back, sys_other, 0, 6, 1000, "back", false), 1, 2)).stored);
+    try testing.expect(!db.get(id, 2).?.is_purge);
+    try testing.expectEqualStrings("back", hostnameOf(&db, id, 2).?);
+}
+
+test "§7.3.16.4 b): an LSP that AGES into the purge hold is flooded as a header, lifetime 0" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .zero_age_lifetime = 60 });
+    defer db.deinit();
+    const id = idOf(sys_other, 0);
+
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildNamedLsp(&buf, sys_other, 0, 4, 100, "peer", false), 1, 0);
+    try testing.expectEqualStrings("peer", hostnameOf(&db, id, 0).?);
+
+    // At expiry the entry enters the purge hold with SRM set on every circuit
+    // "to flood the purge" — so the bytes it hands out must BE a purge.
+    try testing.expectEqual(@as(usize, 1), db.tick(100).entered_purge);
+    const v = db.get(id, 100).?;
+    try testing.expect(v.is_purge);
+    const stored = try isis.Lsp.decode(v.bytes);
+    try testing.expectEqual(@as(usize, 0), stored.tlv_bytes.len);
+    // Remaining Lifetime 0 on the wire, not the 100 it was originated with —
+    // otherwise the "purge" we flood is an ordinary LSP and the removal never
+    // propagates.
+    try testing.expectEqual(@as(u16, 0), stored.remaining_lifetime);
+    try testing.expectEqual(@as(u16, isis.pdu.lsp_fixed_len), stored.pdu_length);
+
+    // A neighbour receiving those exact octets records a purge, not a live LSP.
+    var peer = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer peer.deinit();
+    _ = try peer.insert(buildNamedLsp(&buf, sys_other, 0, 4, 100, "peer", false), 1, 0);
+    _ = try peer.insert(v.bytes, 0, 1);
+    try testing.expect(peer.get(id, 1).?.is_purge);
+    try testing.expect(hostnameOf(&peer, id, 1) == null);
 }
 
 test "srmIterator walks the LSPs queued for one circuit" {

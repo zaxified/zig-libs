@@ -19,10 +19,13 @@
 //!     poll is then armed so the next `poll` drains the freshly-set flags.
 //!   - **onTimer(node, id)** — id 0 = "poll the flooding scheduler now": call
 //!     `isis-flood.poll`, `sim.send` each effect (LSP/PSNP/CSNP) to the neighbour
-//!     on its interface, and re-arm while work remains. id ≥ `fail_timer_base` =
-//!     "a link you are an endpoint of just failed": mark that circuit down, then
-//!     re-originate this node's LSP without the lost neighbour at a bumped
-//!     sequence number, and flood.
+//!     on its interface, and re-arm while work remains. id 1 = "you cold-
+//!     restarted": drop this node's LSDB and flooding state and re-originate
+//!     (`coldRestart` — the only divergence a P2P fabric cannot repair by
+//!     retransmission, and hence the one that measures the CSNP resync path).
+//!     id ≥ `fail_timer_base` = "a link you are an endpoint of just failed":
+//!     mark that circuit down, then re-originate this node's LSP without the
+//!     lost neighbour at a bumped sequence number, and flood.
 //!   - **check** — the safety invariants checked after every event: (1) no
 //!     node's LSDB ever holds more than `node_count` distinct LSP-IDs (a
 //!     runaway/corruption tripwire; correct flooding stores exactly one LSP per
@@ -134,6 +137,9 @@ const csnp_interval: Time = 1_000_000_000;
 const lsp_lifetime: u16 = 65_535;
 
 const timer_poll: u64 = 0;
+/// "This node cold-restarted": drop its LSDB and its flooding state and
+/// re-originate (see `Fabric.restart`).
+const timer_restart: u64 = 1;
 /// Failure-reaction timer ids start here (distinct from `timer_poll`); the
 /// failure index is added on.
 const fail_timer_base: u64 = 1 << 32;
@@ -234,6 +240,27 @@ pub const Fabric = struct {
     /// entries. `null` (the default) is the normal fabric.
     broken_wipe_node: ?NodeId = null,
     wipe_done: bool = false,
+
+    /// A scheduled **cold restart**: at `time`, `node` loses its whole LSDB and
+    /// its flooding state and re-originates its own LSP (see `coldRestart`).
+    ///
+    /// This is the one divergence a point-to-point fabric cannot repair by
+    /// retransmission, and therefore the only way to measure the CSNP resync
+    /// path at all. On P2P, `isis-lsdb` clears SRM only when the neighbour has
+    /// demonstrably got the LSP (a PSNP ack, or a summary that compares
+    /// `.same`), so *every* undelivered LSP leaves SRM set at the sender and the
+    /// retransmit timer alone repairs it — a CSNP can only ever re-set an SRM
+    /// that is already set. After a restart the opposite holds: the neighbours
+    /// were acked long ago, hold no SRM toward the restarted node, and nothing
+    /// but a database summary can discover that it is missing anything.
+    restart: ?struct { node: NodeId, time: Time } = null,
+
+    /// Positive control for the SNP path: when true, `onMessage` drops every
+    /// CSNP and PSNP, so `reconcileCsnp`/`reconcilePsnp` never run. Flooding
+    /// (LSP + SRM + retransmit) is untouched. Every lossy test in this module
+    /// repaired itself by retransmission, so the SNP path had no control of its
+    /// own and no test would have noticed it doing nothing.
+    ignore_snp: bool = false,
 
     pub fn init(gpa: Allocator, topo: Topology, seed: u64) Allocator.Error!Fabric {
         return initWithOptions(gpa, topo, seed, .{});
@@ -397,6 +424,34 @@ pub const Fabric = struct {
                 try sim.setTimer(node, f.time, fail_timer_base + k);
             }
         }
+        // Pre-arm the cold restart, if this is the node that suffers one.
+        if (self.restart) |r| {
+            if (r.node == node and r.time <= self.horizon) try sim.setTimer(node, r.time, timer_restart);
+        }
+    }
+
+    /// A cold restart of `node`: its link-state database and its whole flooding
+    /// state (SRM/SSN, the last-sent pacing map, the CSNP cadence) are gone, and
+    /// it re-originates its own LSP at a bumped sequence number — ISO/IEC 10589
+    /// §7.3.16.1 forbids it from adopting the copy its neighbours still hold.
+    ///
+    /// Its neighbours are unaffected and, crucially, hold **no SRM** toward it:
+    /// they were acked before the restart. So nothing they do on their own will
+    /// re-send it anything, and the LSPs it lost come back only if a database
+    /// summary discovers the divergence.
+    fn coldRestart(self: *Fabric, node: NodeId, now: Time) anyerror!void {
+        const ns = &self.nodes[node];
+        const n = self.nodes.len;
+        ns.lsdb.deinit();
+        ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(n)));
+        ns.sched.deinit();
+        ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
+        // `check`'s monotonicity invariant is "no stored sequence goes backwards
+        // *absent a restart*". This is the restart, and it clears the high-water
+        // marks of the restarting node only — every other node's row, and this
+        // node's own future, stay under the invariant.
+        @memset(self.seen_seq[node * n ..][0..n], 0);
+        try self.originate(node, now);
     }
 
     fn onMessage(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
@@ -408,8 +463,16 @@ pub const Fabric = struct {
         const pdu = isis.decode(payload) catch return; // hostile/short bytes: ignore
         switch (pdu) {
             .lsp => _ = try ns.lsdb.insert(payload, iface, now),
-            .csnp => |c| ns.lsdb.reconcileCsnp(c, iface, now),
-            .psnp => |p| ns.lsdb.reconcilePsnp(p, iface, now),
+            // The SNP positive control: drop the summary rather than reconcile
+            // it, leaving flooding as the only mechanism in the fabric.
+            .csnp => |c| {
+                if (self.ignore_snp) return;
+                ns.lsdb.reconcileCsnp(c, iface, now);
+            },
+            .psnp => |p| {
+                if (self.ignore_snp) return;
+                ns.lsdb.reconcilePsnp(p, iface, now);
+            },
             else => return,
         }
 
@@ -437,7 +500,9 @@ pub const Fabric = struct {
         const self = cast(ctx);
         const now = sim.timeNow();
 
-        if (timer_id >= fail_timer_base) {
+        if (timer_id == timer_restart) {
+            try self.coldRestart(node, now);
+        } else if (timer_id >= fail_timer_base) {
             const ns = &self.nodes[node];
             const f = self.failures.items[timer_id - fail_timer_base];
             const other = if (f.a == node) f.b else f.a;
@@ -1030,8 +1095,25 @@ test "positive control: breaking the flood-drain leaves far nodes ignorant (RED)
 /// `isis-flood`'s `min_lsp_transmission_interval`, which paces *every* LSP
 /// transmission on a circuit, so while it sits past the run horizon no
 /// mechanism can re-send a dropped LSP — a CSNP-driven PSNP request included.
-/// Whether the CSNP path repairs a loss on its own is therefore still
-/// unmeasured here; see the audit's separate CSNP-fixture finding.
+///
+/// The CSNP path is no longer unmeasured (audit BD-16). It is measured by the
+/// `MEASURED:` tests at the bottom of this file, on the divergence a P2P fabric
+/// cannot retransmit its way out of — a **restart**, where the sender holds no
+/// SRM at all — with the retransmit interval left inert in every run:
+///
+///   * restart, SNPs dropped      → the restarted node recovers **1 of 4**
+///     originators (only the one it re-originates itself)
+///   * restart, SNPs reconciled   → **4 of 4**, databases agree
+///   * restart, SNPs reconciled, periodic CSNP *also* inert → **4 of 4**
+///     (the single adjacency-up CSNP the restarted node emits is enough)
+///
+/// So the answer to "does CSNP resync repair a loss on its own" is yes, by two
+/// independent sub-paths: the restarted node's own CSNP claims the whole LSP-ID
+/// space while listing almost nothing, and each neighbour's §7.3.15.2
+/// completeness sweep floods the difference back; and, when a cadence is
+/// running, the neighbours' CSNPs make the restarted node *request* what it
+/// lacks by PSNP. Disabling the completeness sweep alone kills the first but not
+/// the second — verified by mutation.
 const lossy_opts_base = Options{
     .retransmit_interval = 40,
 };
@@ -1156,6 +1238,79 @@ test "one-shot faults: a dropped first LSP is repaired by retransmission" {
     try testing.expect(fab.lsdbsAgree());
     try testing.expectEqual(@as(?u32, 1), fab.storedSequence(3, 0)); // A's LSP reached D
     try testing.expectEqual(@as(?anyerror, null), fab.violation);
+}
+
+// ── the CSNP resync path, MEASURED (audit BD-16) ────────────────────────────
+//
+// Every lossy test above repairs itself by **retransmission**: on a P2P circuit
+// `isis-lsdb` clears SRM only once the neighbour demonstrably holds the LSP (a
+// PSNP ack, or a summary comparing `.same`), so an undelivered LSP always leaves
+// SRM set at the sender and the retransmit timer alone brings it back. A CSNP in
+// that situation can only re-set an SRM that is already set — which is why the
+// audit's sweep with the retransmit interval left inert converged 0/16 and the
+// CSNP path's own repair ability stayed unmeasured. (`min_lsp_transmission_
+// interval` paces *every* transmission on a circuit, so parking it past the run
+// horizon stops the send whatever set the flag.)
+//
+// The divergence a P2P fabric cannot retransmit its way out of is one where the
+// sender holds no SRM at all: a **restart**. `Fabric.restart` builds it, and the
+// two runs below differ in exactly one thing — whether CSNP/PSNP PDUs are
+// reconciled — with the retransmit interval left at its inert default in BOTH,
+// so retransmission cannot be what repaired anything.
+
+const restart_node: NodeId = 2;
+const restart_time: Time = 5_000;
+
+/// Run the line topology with node 2 cold-restarting mid-run, and report how
+/// many of the four originators it holds at the end.
+fn runRestart(ignore_snp: bool, csnp_interval_ticks: Time) !struct { held: usize, agree: bool, violation: ?anyerror } {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    // Retransmission is INERT (the module default): whatever repairs the
+    // restarted database, it is not the retransmit timer.
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xB16, .{
+        .csnp_interval = csnp_interval_ticks,
+    });
+    defer fab.deinit();
+    fab.restart = .{ .node = restart_node, .time = restart_time };
+    fab.ignore_snp = ignore_snp;
+
+    _ = try fab.runToConvergence(lossy_step_cap);
+
+    var held: usize = 0;
+    var origin: NodeId = 0;
+    while (origin < 4) : (origin += 1) {
+        if (fab.storedSequence(restart_node, origin) != null) held += 1;
+    }
+    return .{ .held = held, .agree = fab.lsdbsAgree(), .violation = fab.violation };
+}
+
+test "MEASURED: the CSNP path repairs a restarted database that retransmission cannot" {
+    // Control: SNPs dropped. The restarted node re-originates its own LSP and
+    // that is all it ever holds again — its neighbours have no SRM toward it, so
+    // nothing re-floods them and no timer can help.
+    const without = try runRestart(true, 400);
+    try testing.expectEqual(@as(usize, 1), without.held); // its own LSP only
+    try testing.expect(!without.agree);
+    try testing.expectEqual(@as(?anyerror, null), without.violation);
+
+    // The measurement: with SNPs reconciled — same topology, same seed, same
+    // inert retransmit interval — the database comes back in full.
+    const with = try runRestart(false, 400);
+    try testing.expectEqual(@as(usize, 4), with.held);
+    try testing.expect(with.agree);
+    try testing.expectEqual(@as(?anyerror, null), with.violation);
+}
+
+test "MEASURED: the repair survives an inert CSNP cadence (the adjacency-up CSNP does it)" {
+    // ISO §7.3.15.2 has a P2P circuit send a CSNP when the adjacency comes up,
+    // not only on a cadence. The restarted node's fresh scheduler emits exactly
+    // that one CSNP; it claims the whole LSP-ID space while listing only its own
+    // LSP, so each neighbour's completeness sweep flags everything else for
+    // flooding back. Measured with the periodic cadence parked past the horizon.
+    const with = try runRestart(false, csnp_interval);
+    try testing.expectEqual(@as(usize, 4), with.held);
+    try testing.expect(with.agree);
 }
 
 test "one-shot faults: a partition that heals re-synchronises both sides" {

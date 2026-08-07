@@ -141,6 +141,18 @@ a zero-lifetime flood cannot grow the DB. Reported as `{ ordering = .same, store
   - **other**: if `rem == 0`, enter the purge hold — set `purge_deadline = now +
     zero_age_lifetime`, set SRM on **every** circuit (flood the purge). Reported
     in `AgeReport.entered_purge`.
+- **Retention (§7.3.16.4 b: "retain only the LSP header")** — the moment an entry
+  becomes a purge, by aging *or* by a received zero-lifetime LSP, the stored PDU
+  bytes are truncated to the 27-octet LSP header: PDU Length is rewritten to the
+  header length and Remaining Lifetime to 0; LSP-ID, Sequence Number, Checksum
+  and flags are kept verbatim (§7.3.16.1 and the CSNP summary still reason over
+  them). Two consequences, both load-bearing:
+  - a **received** purge cannot smuggle a TLV body into the database. The purge
+    is deliberately exempt from the §7.3.14.2 e) checksum discard (§4.5), so
+    without this rule "Remaining Lifetime = 0" would be a content-replacement
+    primitive that no checksum defends;
+  - an **aged-out** LSP is flooded as a purge rather than as a copy of itself at
+    its original lifetime, so the removal actually propagates.
 - **Pass 2 (remove)** — any purge-hold entry with `now ≥ purge_deadline` is
   removed and its bytes freed (`AgeReport.removed`). Removal invalidates the map
   iterator, so the pass re-scans after each removal; purge removals are rare (only
