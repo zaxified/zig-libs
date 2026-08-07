@@ -28,20 +28,28 @@
 //! except the one being signed. Serialize the result plus a trailing
 //! 4-byte little-endian `hash_type`, and `sha256d` it.
 //!
-//! ## Scope: no `FindAndDelete(OP_CODESEPARATOR)`
+//! ## `OP_CODESEPARATOR` removal is part of the serialization
 //!
-//! Bitcoin Core additionally strips every literal `OP_CODESEPARATOR`
-//! (`0xab`) opcode from `script_code` before signing (`CScript::
-//! FindAndDelete`), which requires walking `script_code` opcode-by-opcode
-//! (respecting push-data lengths, so a `0xab` *byte* inside a push's data
-//! payload must NOT be treated as an opcode) — i.e. a Script parser. This
-//! module does not run a script interpreter (module doc comment, tx.zig)
-//! and OP_CODESEPARATOR is essentially unused in deployed Bitcoin (no
-//! standard script template ever emits it): callers whose `script_code`
-//! could contain it must strip it themselves before calling `sighash`.
-//! `legacy_kat_vectors.zig`'s vectors are filtered to exclude any case that
-//! would need this step, so this simplification never masks a wrong
-//! answer against the pinned KATs.
+//! Core does NOT write `script_code` verbatim. `CTransactionSignatureSerializer
+//! ::SerializeScriptCode` (`script/interpreter.cpp`) walks it opcode by opcode
+//! and omits every literal `OP_CODESEPARATOR` (`0xab`) *opcode* — a `0xab`
+//! byte inside a push's data payload is left alone, which is why the walk has
+//! to be a real Script parse and not a `memchr`. `appendScriptCode` below
+//! reproduces it, including the two details that make it not just "delete the
+//! 0xab bytes":
+//!
+//!  - the CompactSize prefix Core writes is `scriptCode.size() -
+//!    nCodeSeparators`, computed from the FIRST walk, not from the number of
+//!    bytes the second walk actually emits;
+//!  - both walks end at the first `GetOp` that fails, and the trailing write
+//!    is bounded by where that failed `GetOp` left the cursor — so an
+//!    undecodable tail is truncated, not copied whole.
+//!
+//! For a `script_code` that decodes cleanly and holds no `OP_CODESEPARATOR`
+//! — every standard template — this is byte-for-byte the old verbatim write.
+//!
+//! This module still runs no interpreter: the walk below only needs push-length
+//! rules, no opcode semantics, no stack.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -90,6 +98,71 @@ fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.
     try buf.appendSlice(allocator, &tmp);
 }
 
+/// Bitcoin Core's `GetScriptOp` (`script/script.cpp`), reduced to what
+/// `SerializeScriptCode` uses: the opcode, and the cursor position afterwards.
+/// Returns null when the decode fails — and, like Core's, leaves `pc` where the
+/// failed attempt left it, having already consumed the opcode byte and any
+/// length prefix it managed to read before the check that failed. That
+/// end position is load-bearing: it bounds the trailing write below.
+fn getOp(script: []const u8, pc: *usize) ?u8 {
+    if (pc.* >= script.len) return null;
+    const opcode = script[pc.*];
+    pc.* += 1;
+    if (opcode <= 0x4e) { // OP_PUSHDATA4
+        var size: u64 = 0;
+        if (opcode < 0x4c) {
+            size = opcode;
+        } else if (opcode == 0x4c) {
+            if (script.len - pc.* < 1) return null;
+            size = script[pc.*];
+            pc.* += 1;
+        } else if (opcode == 0x4d) {
+            if (script.len - pc.* < 2) return null;
+            size = std.mem.readInt(u16, script[pc.*..][0..2], .little);
+            pc.* += 2;
+        } else {
+            if (script.len - pc.* < 4) return null;
+            size = std.mem.readInt(u32, script[pc.*..][0..4], .little);
+            pc.* += 4;
+        }
+        if (script.len - pc.* < size) return null;
+        pc.* += @intCast(size);
+    }
+    return opcode;
+}
+
+const op_codeseparator: u8 = 0xab;
+
+/// Core's `CTransactionSignatureSerializer::SerializeScriptCode`: the
+/// CompactSize length, then `script_code` with every `OP_CODESEPARATOR`
+/// *opcode* omitted.
+///
+/// The declared length is `script_code.len - n_separators`, taken from the
+/// counting walk. When the emitting walk stops early on an undecodable tail
+/// that number can exceed the bytes actually written — Core does exactly this,
+/// so reproducing it is the point, not a bug to round off. It cannot change a
+/// verdict on its own: the script that produced such a scriptCode fails to
+/// decode in the interpreter too.
+fn appendScriptCode(buf: *std.ArrayList(u8), allocator: Allocator, script_code: []const u8) Allocator.Error!void {
+    var it: usize = 0;
+    var n_separators: usize = 0;
+    while (getOp(script_code, &it)) |op| {
+        if (op == op_codeseparator) n_separators += 1;
+    }
+    try appendCompactSize(buf, allocator, script_code.len - n_separators);
+
+    var begin: usize = 0;
+    it = 0;
+    while (getOp(script_code, &it)) |op| {
+        if (op == op_codeseparator) {
+            // `it` sits just past the 1-byte opcode, so `it - 1` is the 0xab.
+            try buf.appendSlice(allocator, script_code[begin .. it - 1]);
+            begin = it;
+        }
+    }
+    if (begin != script_code.len) try buf.appendSlice(allocator, script_code[begin..it]);
+}
+
 /// Bitcoin Core's `SignatureHash()`. `input_index` selects which input is
 /// being signed; `script_code` substitutes for that input's `scriptSig`
 /// (see module doc comment for what "scriptCode" means here and what's
@@ -118,8 +191,7 @@ pub fn sighash(
         const vin = transaction.vin[input_index];
         try buf.appendSlice(allocator, &vin.prevout.txid);
         try appendU32LE(&buf, allocator, vin.prevout.vout);
-        try appendCompactSize(&buf, allocator, script_code.len);
-        try buf.appendSlice(allocator, script_code);
+        try appendScriptCode(&buf, allocator, script_code);
         try appendU32LE(&buf, allocator, vin.sequence);
     } else {
         try appendCompactSize(&buf, allocator, transaction.vin.len);
@@ -127,8 +199,7 @@ pub fn sighash(
             try buf.appendSlice(allocator, &vin.prevout.txid);
             try appendU32LE(&buf, allocator, vin.prevout.vout);
             if (i == input_index) {
-                try appendCompactSize(&buf, allocator, script_code.len);
-                try buf.appendSlice(allocator, script_code);
+                try appendScriptCode(&buf, allocator, script_code);
             } else {
                 try appendCompactSize(&buf, allocator, 0);
             }
@@ -216,4 +287,69 @@ test "SIGHASH_SINGLE bug: input_index with no corresponding output returns the f
     const got = try sighash(fail_alloc.allocator(), t, 1, &.{}, SINGLE);
     try testing.expectEqualSlices(u8, &sighash_single_bug, &got);
     _ = &t;
+}
+
+// ── SerializeScriptCode branches the vendored corpus cannot reach ────────────
+//
+// Measured over all 500 `sighash.json` data rows: 210 carry a real
+// `OP_CODESEPARATOR` opcode, ZERO carry a `0xab` byte that is push *data*, and
+// ZERO have a script whose `GetOp` walk fails. So the corpus anchors the
+// ordinary removal path and nothing else. The three cases below are pinned
+// against Bitcoin Core's source rather than against a vector file, and say so:
+// they are read off `CTransactionSignatureSerializer::SerializeScriptCode` and
+// `GetScriptOp` (`script/interpreter.cpp`, `script/script.cpp`, v29.0), not
+// invented here.
+
+fn serializedScriptCode(allocator: Allocator, script_code: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendScriptCode(&buf, allocator, script_code);
+    return buf.toOwnedSlice(allocator);
+}
+
+test "SerializeScriptCode: a 0xab byte inside a push payload is DATA, not a separator" {
+    // `<push 1 byte: 0xab> OP_1`. A `memchr`-style strip would eat the 0xab and
+    // change the signed message; Core's walk keeps it, because `GetOp` consumed
+    // it as the push's payload and never reported it as an opcode.
+    const script = [_]u8{ 0x01, 0xab, 0x51 };
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x01, 0xab, 0x51 }, got);
+}
+
+test "SerializeScriptCode: a bare OP_CODESEPARATOR opcode is removed, length included" {
+    // `OP_1 OP_CODESEPARATOR OP_2` -> `OP_1 OP_2`, and the CompactSize prefix
+    // drops with it (`scriptCode.size() - nCodeSeparators` = 3 - 1).
+    const script = [_]u8{ 0x51, 0xab, 0x52 };
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x51, 0x52 }, got);
+
+    // Two separators, one of them trailing.
+    const script2 = [_]u8{ 0xab, 0x51, 0xab };
+    const got2 = try serializedScriptCode(testing.allocator, &script2);
+    defer testing.allocator.free(got2);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x51 }, got2);
+}
+
+test "SerializeScriptCode: an undecodable tail truncates, and the length prefix over-declares" {
+    // `OP_PUSHDATA2` with only one of its two length octets present. Core's
+    // `GetScriptOp` has already done `*pc++` before the `end - pc < 2` check
+    // that fails, so the cursor stops at 1 and `SerializeScriptCode`'s trailing
+    // `s.write(Span{&itBegin[0], it - itBegin})` writes exactly that one byte —
+    // while the prefix, computed as `scriptCode.size() - nCodeSeparators`,
+    // still says 2. This mismatch is Core's, and is reproduced deliberately.
+    const script = [_]u8{ 0x4d, 0x00 };
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x4d }, got);
+    // Declared 2, wrote 1: the residual, stated as a fact rather than smoothed.
+    try testing.expectEqual(@as(u8, 2), got[0]); // the declared length
+    try testing.expectEqual(@as(usize, 1), got.len - 1); // the bytes actually written
+}
+
+test "SerializeScriptCode: an empty scriptCode is a bare zero length" {
+    const got = try serializedScriptCode(testing.allocator, &.{});
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{0x00}, got);
 }

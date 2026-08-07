@@ -391,3 +391,115 @@ fn readValue(
         },
     };
 }
+
+// ── fuzz: decode on arbitrary bytes never panics or leaks ──────────────────
+//
+// W2 A3 (protobuf F3): CLASS A, zero `testing.fuzz(` harnesses anywhere in
+// this module before this — `adversarial.zig`'s existing coverage is real
+// but entirely deterministic, hand-seeded from exactly two hand-built
+// attack messages (a lying length, an over-deep chain). This module's own
+// doc comment names the two properties that have to hold for *arbitrary*
+// input, not just those two: declared lengths are bounds-checked against
+// the real buffer before anything is allocated or looped over, and nesting
+// depth is capped by `Options.max_depth` regardless of what the input asks
+// for. The harness below drives real random bytes at four schema shapes
+// (scalar-heavy `Wide`, `Repeated`, unknown-field-capturing `Keeps`, and
+// self-recursive `Chain`) so the unknown-field-capture path and the message
+// merge path both get adversarial input too, not just the scalar loop.
+const ct = @import("codec_test.zig");
+const encode_mod = @import("encode.zig");
+
+test "fuzz: decode never panics or leaks, across every message shape the schema exposes" {
+    try std.testing.fuzz({}, fuzzDecodeNeverPanics, .{});
+}
+
+fn fuzzDecodeNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    // Length drawn first so every mutated byte lands inside `input`, not
+    // scattered across a fixed 4096-byte draw a small `len` would discard.
+    var buf: [4096]u8 = undefined;
+    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    smith.bytes(buf[0..len]);
+    const input = buf[0..len];
+
+    const options: Options = .{
+        .max_depth = smith.valueRangeAtMost(u8, 1, 96),
+        .copy_strings = smith.value(bool),
+        .reject_unknown_fields = smith.value(bool),
+    };
+
+    switch (smith.valueRangeAtMost(u2, 0, 3)) {
+        0 => try fuzzOne(ct.Wide, input, options),
+        1 => try fuzzOne(ct.Repeated, input, options),
+        2 => try fuzzOne(ct.Keeps, input, options),
+        3 => try fuzzOne(ct.Chain, input, options),
+    }
+}
+
+fn fuzzOne(comptime T: type, input: []const u8, options: Options) !void {
+    var d = decode(T, std.testing.allocator, input, options) catch return;
+    defer d.deinit();
+}
+
+// ── fuzz: the depth cap holds at exactly the boundary the input picks ──────
+//
+// Pure random bytes essentially never spell a genuinely nested submessage
+// chain — every level needs a length prefix that correctly covers everything
+// inside it, which is astronomically unlikely by chance (this is the same
+// obstacle `43c99ad` documents for `cbor`/`isis`). So the harness above,
+// however long it runs, cannot be trusted to have ever exercised the depth
+// cap's actual boundary. This one builds a REAL nested `Chain` with the
+// module's own encoder — the one piece of machinery in this repo that is
+// guaranteed to produce a message nested to an exact, chosen depth — and
+// then decodes it under an independently fuzzed `max_depth`, asserting the
+// precise boundary: a chain of `n` linked nodes must decode whole when
+// `n <= max_depth` and must fail with exactly `error.DepthExceeded`
+// otherwise. (A round trip alone would not prove this: encode and decode
+// share the same depth-counting convention, so a consistent off-by-one in
+// both would be invisible to a bytes-match check. The boundary assertion
+// below does not compare encode's and decode's counters against each other,
+// it compares decode's outcome against the caller-known true nesting depth
+// `n`, which is independent of either implementation.)
+test "fuzz: the nesting-depth cap fires at exactly the boundary the input asks for" {
+    try std.testing.fuzz({}, fuzzDepthCapBoundary, .{});
+}
+
+fn fuzzDepthCapBoundary(_: void, smith: *std.testing.Smith) !void {
+    const true_len = smith.valueRangeAtMost(u8, 1, 200);
+    const max_depth = smith.valueRangeAtMost(u8, 1, 200);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var chain: ?*const ct.Chain = null;
+    var i: u8 = 0;
+    while (i < true_len) : (i += 1) {
+        const node = try a.create(ct.Chain);
+        node.* = .{ .depth = i, .next = chain };
+        chain = node;
+    }
+    const root = chain.?.*;
+
+    // Encoder's own depth cap is independent of the decoder's; keep it out
+    // of the way (255, the type's max) so only the decoder's cap is under
+    // test here.
+    const bytes = encode_mod.encodeAlloc(a, root, .{ .max_depth = 255 }) catch |err| switch (err) {
+        error.DepthExceeded => return, // true_len > 255: cannot happen (u8), kept for exhaustiveness
+        else => return err,
+    };
+
+    var d = decode(ct.Chain, std.testing.allocator, bytes, .{ .max_depth = max_depth }) catch |err| {
+        if (err == error.DepthExceeded) {
+            try std.testing.expect(true_len > max_depth);
+            return;
+        }
+        return err;
+    };
+    defer d.deinit();
+
+    try std.testing.expect(true_len <= max_depth);
+    var got: usize = 1;
+    var cur: ?*const ct.Chain = d.value.next;
+    while (cur) |c| : (got += 1) cur = c.next;
+    try std.testing.expectEqual(@as(usize, true_len), got);
+}

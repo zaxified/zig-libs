@@ -205,9 +205,9 @@ already transformed, so no legacy verdict here depends on it.
 `script_tests_vectors.zig` pins 297 rows machine-filtered (not hand-picked) from Bitcoin Core's
 official `src/test/data/script_tests.json` (fetched 2026-07 from the `bitcoin/bitcoin` `master`
 branch), then machine-transcribed verbatim via a one-off Python script — never hand-typed. The
-filter: keep only rows (a) with no witness field (this module's segwit/taproot coverage is
-verified separately, by `e2e_test.zig`'s real spends, rather than transcribing the witness-bearing
-subset of the JSON, which is small and largely tapscript-flavored); (b) whose `scriptSig`/
+filter: keep only rows (a) with no witness field — **those now live in
+`script_tests_witness_vectors.zig`, see below; this file still excludes them, but the corpus as a
+whole no longer does**; (b) whose `scriptSig`/
 `scriptPubKey` asm text uses only mnemonics this module's opcode table implements (a plain
 substring/token check — this mechanically excludes every BIP342 tapscript-only vector). From the
 ~1108 rows surviving that filter, every row is kept for buckets with ≤20 members (every distinct
@@ -235,6 +235,46 @@ places are now pinned here:
   (`src/test/script_tests.cpp`), all 16 cases byte-for-byte, as the oracle for the primitive's
   greedy-but-single-pass, boundary-re-anchoring, invalid-trailing-push semantics.
 
+### script_tests.json witness rows
+
+`script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` pin the rows the file above
+drops. Counted on upstream `v29.0`: `script_tests.json` holds **1258 array entries, 51 comment-only,
+so 1207 data rows, of which 107 carry a witness field** (a leading
+`[<stack item hex>..., <amount in BTC>]` array). All 107 are vendored — no sampling, no mnemonic
+filter needed (they use only `NOP`/`HASH160`/`EQUAL`/`CHECKSIG`). **Zero** of them set `TAPROOT`:
+Core keeps the BIP342 corpus in `script_assets_test.json`, so that is a property of upstream, not
+of a filter here.
+
+This is the module's first external oracle for segwit v0 — P2WPKH/P2WSH dispatch,
+`WITNESS_MALLEATED`, `WITNESS_MALLEATED_P2SH`, program length/version rules, witness-v0
+`MINIMALIF`, post-witness `CLEANSTACK`, and the compressed-pubkey rule were previously anchored
+only by round trips this repo wrote itself. Importing it immediately exposed a real divergence:
+`OP_IF`/`OP_NOTIF` on an empty stack returned `InvalidStackOperation`, where Core's
+`interpreter.cpp` (v29.0, `case OP_IF: case OP_NOTIF:`) returns
+`SCRIPT_ERR_UNBALANCED_CONDITIONAL` — the one place in `EvalScript` where a `stack.size() < n`
+check does NOT use `INVALID_STACK_OPERATION`. Two rows of `script_tests_vectors.zig` had been
+transcribed with the implementation's answer rather than Core's; both are corrected.
+
+One mapping is deliberately not injective and is recorded rather than hidden: Core's
+`WITNESS_PUBKEYTYPE` and `PUBKEYTYPE` both land on this module's single `Pubkeytype`
+(`sigcheck.zig`), so the corpus cannot distinguish them. Each row keeps Core's own `SCRIPT_ERR_*`
+name in a `core_expect` field.
+
+### BIP65/BIP112 boundary rows
+
+`tx_locktime_vectors.zig` / `tx_locktime_test.zig` pin the `CHECKLOCKTIMEVERIFY` /
+`CHECKSEQUENCEVERIFY` rows of Core's `tx_valid.json` (**38**) and `tx_invalid.json` (**30**).
+Counted on upstream `v29.0`: `tx_valid.json` has 247 array entries / 127 comment-only / 120 data
+rows (10 naming CLTV and 28 naming CSV in a prevout script); `tx_invalid.json` has 201 / 108 / 93
+(16 and 14).
+
+`script_tests.json` **cannot** anchor these opcodes at all, however many rows are imported:
+`script_tests.cpp`'s synthetic spend is fixed at `nLockTime = 0` and `nSequence = SEQUENCE_FINAL`
+for every row, and both opcodes compare against exactly those two fields. A consistent mutation of
+the comparison plus the module's own boundary unit test passes the entire 297-row corpus. The
+imported rows straddle 499999999/500000000/500000001 (the height↔time threshold),
+4194303/4194304 (BIP112's type flag), the `CScriptNum` sign edge, and negative operands.
+
 `script_tests_test.zig` assembles each row's asm text (`asmparser.zig`, a transcription of
 Bitcoin Core's own `ParseScript`) into script bytes, reproduces Bitcoin Core's EXACT synthetic
 crediting/spending transaction pair (`script_tests.cpp`'s `BuildCreditingTransaction`/
@@ -245,7 +285,7 @@ result's CLASS matches (`OK` vs. the JSON's named error, mapped 1:1 to this modu
 overflow/non-minimality into via its generic exception catch, distinct from the dedicated
 `MinimalData` class which is push-opcode minimality only).
 
-Three real bugs were caught and fixed by getting these 296 rows green (not merely by unit tests of
+Three real bugs were caught and fixed by getting these rows green (not merely by unit tests of
 each function in isolation) — each is exactly the kind of subtle cross-cutting mistake a
 "synthesize opcodes independently, believe the docs, never run the official corpus" approach would
 have missed:

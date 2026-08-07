@@ -400,3 +400,58 @@ test "block_length / digest_length" {
     try testing.expectEqual(@as(usize, 64), Ripemd160.block_length);
     try testing.expectEqual(@as(usize, 20), Ripemd160.digest_length);
 }
+
+// ── fuzz: streaming `update` agrees with one-shot `hash`, at any split ─────
+//
+// W2 A3 (F1): CLASS B, zero `testing.fuzz(` harnesses — this module was
+// absent from `scripts/fuzz-sweep.sh`'s target list entirely. Per the
+// campaign brief, a crypto primitive's byte-exactness is already pinned by
+// the KATs above (including the LE-length-padding stress vector); fuzzing
+// it again would duplicate that, not add to it. What the KATs do NOT cover
+// is `update`'s own buffer arithmetic — the partial-buffer fill, the
+// full-block loop, and the remainder copy that has to stay correct across
+// however many calls and however the caller chops the message up. The
+// existing "streaming: chunked update equals one-shot" test only tries a
+// handful of hand-picked split points; this harness tries however many the
+// input asks for, at byte-by-byte granularity, up to several block
+// boundaries.
+//
+// Oracle: streaming `update`/`final` must equal one-shot `hash` on the same
+// bytes. This is a differential between two genuinely different code paths
+// (the multi-call buffering logic vs. the straight-through compress loop in
+// `hash`), not a round trip of one function against itself — but per the
+// campaign brief's own caveat, a mutation that changes both paths
+// *consistently* (e.g. a shared bug in `compress`) would still be invisible
+// to this oracle; the KATs above are what pin `compress` itself against an
+// external reference.
+test "fuzz: streaming update matches one-shot hash, at every split the input picks" {
+    try testing.fuzz({}, fuzzStreamingMatchesOneShot, .{});
+}
+
+fn fuzzStreamingMatchesOneShot(_: void, smith: *testing.Smith) !void {
+    // Length drawn first so every mutated byte lands inside `data`, not
+    // scattered across a fixed 4096-byte draw a small `len` would discard.
+    var msg: [4096]u8 = undefined;
+    const len = smith.valueRangeAtMost(u16, 0, msg.len);
+    smith.bytes(msg[0..len]);
+    const data = msg[0..len];
+
+    var one_shot: [Ripemd160.digest_length]u8 = undefined;
+    Ripemd160.hash(data, &one_shot, .{});
+
+    // Feed `data` through `update` in fuzzer-chosen chunk sizes (1..97 bytes,
+    // deliberately not a divisor of the 64-byte block so both the
+    // straddling-a-boundary and the landing-exactly-on-one shapes occur).
+    var d = Ripemd160.init(.{});
+    var off: usize = 0;
+    while (off < data.len) {
+        const chunk = smith.valueRangeAtMost(u8, 1, 97);
+        const n = @min(chunk, data.len - off);
+        d.update(data[off..][0..n]);
+        off += n;
+    }
+    var streamed: [Ripemd160.digest_length]u8 = undefined;
+    d.final(&streamed);
+
+    try testing.expectEqualSlices(u8, &one_shot, &streamed);
+}

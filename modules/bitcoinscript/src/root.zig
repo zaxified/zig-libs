@@ -36,9 +36,16 @@
 //!   (key-path + script-path) orchestration built on `interpreter.eval`.
 //! - `script_tests_vectors.zig` / `script_tests_test.zig` — a pinned
 //!   subset of Bitcoin Core's official `script_tests.json` corpus.
+//! - `script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` —
+//!   the witness-bearing rows of that same corpus, which the file above
+//!   excludes; the external oracle for segwit v0.
 //! - `tx_findanddelete_vectors.zig` / `tx_findanddelete_test.zig` — the
 //!   `FindAndDelete`/`OP_CODESEPARATOR`/`CONST_SCRIPTCODE` rows of Core's
 //!   `tx_valid.json` + `tx_invalid.json` (real transactions).
+//! - `tx_locktime_vectors.zig` / `tx_locktime_test.zig` — the BIP65/BIP112
+//!   boundary rows of those same two files; the only external oracle for the
+//!   locktime comparisons, since `script_tests.json`'s synthetic spend fixes
+//!   `nLockTime = 0` and `nSequence = SEQUENCE_FINAL`.
 //! - `findanddelete_test.zig` — Core's own `script_FindAndDelete` unit test,
 //!   byte-for-byte.
 //! - `e2e_test.zig` — real P2PKH/P2WPKH/P2TR spends verified end-to-end
@@ -93,6 +100,7 @@ test {
     _ = @import("asmparser.zig");
     _ = @import("script_tests_vectors.zig");
     _ = @import("script_tests_test.zig");
+    _ = @import("script_tests_witness_test.zig");
     _ = @import("e2e_test.zig");
     _ = @import("dos_test.zig");
     _ = @import("tapscript_test.zig");
@@ -101,6 +109,7 @@ test {
     _ = @import("scriptcode_test.zig");
     _ = @import("tx_findanddelete_vectors.zig");
     _ = @import("tx_findanddelete_test.zig");
+    _ = @import("tx_locktime_test.zig");
     _ = @import("consensus_kat_vectors.zig");
     _ = @import("consensus_kat_test.zig");
 }

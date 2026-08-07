@@ -102,7 +102,9 @@ try bitcoinscript.interpreter.eval(allocator, &stack, script_bytes, ctx, .base, 
 zig build test-bitcoinscript --summary all
 ```
 
-296 pinned rows from Bitcoin Core's official `script_tests.json`, real end-to-end spends
+297 + 107 pinned rows from Bitcoin Core's official `script_tests.json` (the second batch being
+its witness-bearing rows), 68 BIP65/BIP112 boundary rows from `tx_valid.json`/`tx_invalid.json`,
+real end-to-end spends
 (P2PKH/P2WPKH/P2TR key-path plus BIP342 tapscript script-path: `OP_CHECKSIG`, `OP_CHECKSIGADD`
 threshold, `OP_SUCCESSx`, empty-sig, and validation-weight exhaustion — `tapscript_test.zig`),
 BIP341 wallet-test-vector KATs for the taproot commitment (`tapscript.zig`), and DoS-bound teeth —

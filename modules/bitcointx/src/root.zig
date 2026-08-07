@@ -99,6 +99,7 @@ test {
     _ = @import("testutil.zig");
     _ = @import("tx_kat_vectors.zig");
     _ = @import("tx_kat_test.zig");
+    _ = @import("tx_wire_test.zig");
     _ = @import("legacy_kat_vectors.zig");
     _ = @import("legacy_kat_test.zig");
     _ = @import("single_bug_kat_vectors.zig");

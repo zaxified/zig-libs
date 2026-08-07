@@ -218,10 +218,14 @@ pub const Outstation = struct {
 
         const qoi_value = @intFromEnum(qoi);
         const group: u8 = if (qoi_value >= 21 and qoi_value <= 36) qoi_value - 20 else 0;
+        // `group` is already constrained to 1..16 by the range test above, so
+        // the `orelse` never fires; it is spelled as a fallback rather than
+        // `.?` so a future edit to that range degrades to the station cause
+        // instead of trapping.
         const cause: asdu_mod.Cot = if (group == 0)
             .interrogated_by_station
         else
-            asdu_mod.Cot.interrogatedByGroup(group);
+            asdu_mod.Cot.interrogatedByGroup(group) orelse .interrogated_by_station;
 
         for (self.points) |*p| {
             if (!p.type_id.isMonitoring()) continue;

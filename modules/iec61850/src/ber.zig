@@ -46,7 +46,9 @@ pub const Error = error{
     /// An integer wider than the requested Zig type, or a negative value in an
     /// unsigned field.
     IntegerRange,
-    /// A BIT STRING whose unused-bit count is not 0..7, or which is empty.
+    /// A BIT STRING whose unused-bit count is not 0..7, or which is empty, or
+    /// (on the writing side) one asked for more bits than the `u64` value
+    /// carrying them can hold.
     BadBitString,
     /// A FloatingPoint whose width octet does not match its payload.
     BadFloat,
@@ -456,6 +458,12 @@ pub const BitString = struct {
 /// Builds a BIT STRING body from `count` bits held most-significant-first in
 /// `value`.
 pub fn bitStringContent(value: u64, count: u8, out: []u8) Error![]u8 {
+    // The bits live in a `u64`, so `count` above 64 has no source to read from
+    // and the shift amount below would not fit the `u6` it is cast to. Reject
+    // it here: the `out.len` guard alone admits counts up to 8 * out.len - 8
+    // (88 for the 12-byte scratch `Writer.bitString` passes), which used to
+    // reach `@intCast` on a 64..87 shift — a trap in Debug, UB in ReleaseFast.
+    if (count > 64) return error.BadBitString;
     const octets = (@as(usize, count) + 7) / 8;
     if (out.len < octets + 1) return error.BufferTooSmall;
     const unused: u8 = @intCast(octets * 8 - count);
@@ -875,6 +883,25 @@ test "bit string content round trips through the writer" {
     const back = try BitString.parse(of);
     try testing.expectEqual(@as(usize, 13), back.bitCount());
     try testing.expectEqual(@as(u64, 0b0111101000000), back.asInt());
+}
+
+test "a bit string wider than its u64 source is refused, not miscast" {
+    // `bitStringContent`/`Writer.bitString` are public API. The only bound was
+    // `out.len`, and `Writer.bitString`'s own 12-byte scratch admits counts up
+    // to 88 — so counts 65..88 reached `@intCast(count - 1 - i)` with a shift
+    // amount of 64..87 for the `u6` shift of a `u64`. Debug trapped; under
+    // ReleaseFast the shift is UB and the emitted BIT STRING is garbage.
+    var tmp: [12]u8 = undefined;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, try bitStringContent(std.math.maxInt(u64), 64, &tmp));
+    try testing.expectError(error.BadBitString, bitStringContent(1, 65, &tmp));
+    try testing.expectError(error.BadBitString, bitStringContent(1, 88, &tmp));
+    try testing.expectError(error.BadBitString, bitStringContent(1, 255, &tmp));
+
+    // Same guard reached through the writer, which is the surface a caller
+    // outside this module actually holds.
+    var buf: [64]u8 = undefined;
+    var w = Writer.init(&buf);
+    try testing.expectError(error.BadBitString, w.bitString(Tag.uni(Universal.bit_string), 1, 65));
 }
 
 test "MMS floats carry their exponent width" {

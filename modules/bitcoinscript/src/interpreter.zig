@@ -110,26 +110,39 @@ pub const Instruction = struct { opcode: u8, data: ?[]const u8, next: usize };
 /// `OP_CODESEPARATOR` removal pass, so both walk the exact same push-length
 /// rules (a correctness requirement — see that function's doc comment).
 pub fn readInstruction(script: []const u8, i: usize) EvalError!Instruction {
+    // Public API, and `i` is the caller's. Core's `GetOp` is `if (pc >=
+    // end()) return false;` — an out-of-range cursor is a failed decode, not
+    // an out-of-bounds read. Every in-repo caller happens to be inside the
+    // script already (`isExactPush` even pre-checks for the empty case), so
+    // this is not reachable from the wire today; unguarded it was an OOB
+    // index plus an `i + 1` that overflows at `maxInt(usize)`.
+    if (i >= script.len) return error.BadOpcode;
     const op = script[i];
     var pos = i + 1;
     if (op <= 0x4e) {
         var len: usize = undefined;
+        // Every remaining bound is written as a subtraction on `script.len`.
+        // `pos <= script.len` holds at each step, so the difference cannot
+        // wrap — whereas `pos + len > script.len` adds an attacker-supplied
+        // `u32` (`OP_PUSHDATA4`) to `pos`, which cannot wrap on the 64-bit
+        // targets this repo builds but would on any future 32-bit one, and a
+        // wrapped sum turns this guard into an out-of-bounds slice.
         if (op < 0x4c) {
             len = op;
         } else if (op == 0x4c) {
-            if (pos >= script.len) return error.BadOpcode;
+            if (script.len - pos < 1) return error.BadOpcode;
             len = script[pos];
             pos += 1;
         } else if (op == 0x4d) {
-            if (pos + 2 > script.len) return error.BadOpcode;
+            if (script.len - pos < 2) return error.BadOpcode;
             len = std.mem.readInt(u16, script[pos..][0..2], .little);
             pos += 2;
         } else {
-            if (pos + 4 > script.len) return error.BadOpcode;
+            if (script.len - pos < 4) return error.BadOpcode;
             len = std.mem.readInt(u32, script[pos..][0..4], .little);
             pos += 4;
         }
-        if (pos + len > script.len) return error.BadOpcode;
+        if (script.len - pos < len) return error.BadOpcode;
         const data = script[pos .. pos + len];
         pos += len;
         return .{ .opcode = op, .data = data, .next = pos };
@@ -315,8 +328,10 @@ fn scriptCodeFor(
 /// *pc++;`) and past any length prefix it managed to read BEFORE the check
 /// that fails, so a failed `GetOp` is not a no-op on the iterator — and
 /// `SerializeScriptCode`'s trailing `s.write(Span{&itBegin[0], it - itBegin})`
-/// writes exactly up to that position. Only ever called for an `i` at which
-/// `readInstruction` returned `error.BadOpcode`, i.e. `script[i] <= 0x4e`.
+/// writes exactly up to that position. Only ever called for an in-range `i` at
+/// which `readInstruction` returned `error.BadOpcode`, i.e. `script[i] <= 0x4e`
+/// (the sole caller's loop condition is `i < sub.len`, so the other
+/// `BadOpcode` source — `i` past the end — cannot arrive here).
 fn undecodableStop(script: []const u8, i: usize) usize {
     const op = script[i];
     var pos = i + 1; // `*pc++` happens before any operand check
@@ -983,7 +998,15 @@ fn evalCore(
         } else if (instr.opcode == @intFromEnum(Opcode.OP_IF) or instr.opcode == @intFromEnum(Opcode.OP_NOTIF)) {
             var value = false;
             if (exec) {
-                if (stack.items.len < 1) return error.InvalidStackOperation;
+                // Core spells this one UNBALANCED_CONDITIONAL, not
+                // INVALID_STACK_OPERATION — `interpreter.cpp` (v29.0)
+                // `case OP_IF: case OP_NOTIF:` is
+                // `if (stack.size() < 1) return set_error(serror,
+                // SCRIPT_ERR_UNBALANCED_CONDITIONAL);`. Every other
+                // `stack.size() < n` in `EvalScript` does use
+                // INVALID_STACK_OPERATION, which is why this one reads like a
+                // typo and was implemented as one.
+                if (stack.items.len < 1) return error.UnbalancedConditional;
                 const top = stack.items[stack.items.len - 1];
                 // Bitcoin Core gates MINIMALIF on `sigversion ==
                 // WITNESS_V0` + the flag for segwit-v0, and makes it
@@ -1122,6 +1145,37 @@ test "scriptCode: a decodable script is unaffected by the undecodable-tail path"
     try testing.expectEqualSlices(u8, &.{ 0x51, 0x02, 0xab, 0xff, 0xac }, got);
 }
 
+test "readInstruction refuses a cursor past the end instead of reading past it" {
+    // `readInstruction` is public API and `i` is the caller's index. Bitcoin
+    // Core's `GetScriptOp` opens with `if (pc >= end) return false;`, so an
+    // out-of-range cursor is a failed decode. Unguarded, `script[i]` read out
+    // of bounds and `i + 1` overflowed at `maxInt(usize)`. No in-repo caller
+    // reaches it (`isExactPush` pre-checks the empty case), so this is a
+    // public-API landmine, not a wire-reachable one.
+    try testing.expectError(error.BadOpcode, readInstruction(&.{}, 0));
+    try testing.expectError(error.BadOpcode, readInstruction(&.{0x51}, 1));
+    try testing.expectError(error.BadOpcode, readInstruction(&.{ 0x51, 0x52 }, 9));
+    try testing.expectError(error.BadOpcode, readInstruction(&.{0x51}, std.math.maxInt(usize)));
+    // The in-range case still decodes, so the guard is a bound and not a stub.
+    const ok = try readInstruction(&.{ 0x51, 0x52 }, 1);
+    try testing.expectEqual(@as(u8, 0x52), ok.opcode);
+    try testing.expectEqual(@as(usize, 2), ok.next);
+}
+
+test "readInstruction's push bounds are subtractions, not sums that can wrap" {
+    // OP_PUSHDATA4 with a length of 0xFFFFFFFF: `pos + len > script.len` adds
+    // an attacker-supplied u32 to `pos`. It cannot wrap on this repo's 64-bit
+    // targets, but the guard is now `script.len - pos < len`, which cannot
+    // wrap on any target width. Same for the length-prefix reads.
+    try testing.expectError(error.BadOpcode, readInstruction(&.{ 0x4e, 0xFF, 0xFF, 0xFF, 0xFF }, 0));
+    try testing.expectError(error.BadOpcode, readInstruction(&.{ 0x4e, 0xFF, 0xFF }, 0)); // prefix truncated
+    try testing.expectError(error.BadOpcode, readInstruction(&.{ 0x4d, 0x00 }, 0));
+    try testing.expectError(error.BadOpcode, readInstruction(&.{0x4c}, 0));
+    // A well-formed PUSHDATA4 of one byte still decodes.
+    const ok = try readInstruction(&.{ 0x4e, 0x01, 0x00, 0x00, 0x00, 0xAB }, 0);
+    try testing.expectEqualSlices(u8, &.{0xAB}, ok.data.?);
+}
+
 test "unbalanced OP_IF (no ENDIF) is rejected" {
     try testing.expectError(error.UnbalancedConditional, run(&.{ 0x51, 0x63 })); // OP_1 OP_IF
 }
@@ -1193,9 +1247,11 @@ test "OP_CHECKLOCKTIMEVERIFY without the flag is a plain NOP" {
 // transaction". None of `script_tests_vectors.zig`'s CHECKLOCKTIMEVERIFY
 // entries exercise the numeric comparison at all (both the crediting and
 // spending transactions in that harness always have `locktime == 0`), so
-// this is the only place the `locktime == tx.locktime` boundary — and the
-// ordinary less-than/greater-than cases either side of it — get checked
-// against a real, nonzero transaction locktime.
+// this test is the module's own statement of the boundary. It is no longer
+// the ONLY one: `tx_locktime_test.zig` runs the 38 + 30 BIP65/BIP112 rows of
+// Core's `tx_valid.json`/`tx_invalid.json`, real transactions with real
+// nonzero locktimes, which is the external oracle this test alone could not
+// be (a consistent mutation of both the comparison and this test passes).
 test "OP_CHECKLOCKTIMEVERIFY: locktime <= tx.locktime passes, > fails (BIP65 boundary)" {
     const flags: ScriptFlags = .{ .checklocktimeverify = true };
 

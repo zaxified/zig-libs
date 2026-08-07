@@ -455,9 +455,12 @@ pub const Qoi = enum(u8) {
     group_16 = 36,
     _,
 
-    pub fn group(n: u8) Qoi {
-        std.debug.assert(n >= 1 and n <= 16);
-        return @enumFromInt(20 + n);
+    /// The QOI for inventory group `n` (1..16), or null if `n` is not a group
+    /// number. Bounded by a returned `null`, not an `assert` — see
+    /// `asdu.Cot.interrogatedByGroup` for why.
+    pub fn group(n: u8) ?Qoi {
+        if (n < 1 or n > 16) return null;
+        return @enumFromInt(20 + @as(u8, n));
     }
 };
 
@@ -719,8 +722,18 @@ test "QCC packs the request in the low six bits and the freeze above" {
     try testing.expectEqual(CounterRequest.general, q.request);
     try testing.expectEqual(CounterFreeze.freeze_reset, q.freeze);
     try testing.expectEqual(Qoi.station, @as(Qoi, @enumFromInt(20)));
-    try testing.expectEqual(Qoi.group_1, Qoi.group(1));
-    try testing.expectEqual(Qoi.group_16, Qoi.group(16));
+    try testing.expectEqual(Qoi.group_1, Qoi.group(1).?);
+    try testing.expectEqual(Qoi.group_16, Qoi.group(16).?);
+}
+
+test "Qoi.group rejects a group number outside 1..16" {
+    // Same shape as `asdu.Cot.interrogatedByGroup`: assert-only bound on a
+    // public constructor over a non-exhaustive enum, so out-of-range input
+    // used to yield a wrong-but-representable QOI (or wrap `20 + n`).
+    try testing.expectEqual(@as(?Qoi, null), Qoi.group(0));
+    try testing.expectEqual(@as(?Qoi, null), Qoi.group(17));
+    try testing.expectEqual(@as(?Qoi, null), Qoi.group(236));
+    try testing.expectEqual(@as(?Qoi, null), Qoi.group(255));
 }
 
 test "COI splits the cause from the local-change flag" {

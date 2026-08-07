@@ -33,8 +33,8 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup:
   caller's buffer) and `serialize`/`serializeLegacy`/`serializeSegwit`. `Transaction.txid()`/
   `.wtxid()` per BIP141.
 - **Legacy sighash** (`sighash_legacy.zig`) — scriptCode substitution, ALL/NONE/SINGLE ×
-  ANYONECANPAY, the historical SIGHASH_SINGLE `uint256(1)` bug. No `FindAndDelete
-  (OP_CODESEPARATOR)` — see SPEC.md.
+  ANYONECANPAY, the historical SIGHASH_SINGLE `uint256(1)` bug, and Core's
+  `SerializeScriptCode` (`OP_CODESEPARATOR` opcodes omitted, push payloads left alone).
 - **BIP143 segwit-v0 sighash** (`sighash_bip143.zig`) — the three reusable midstates
   (`hashPrevouts`/`hashSequence`/`hashOutputs`) plus the amount-committing preimage.
 - **BIP341 taproot key-path sighash** (`sighash_bip341.zig`) — `SigMsg` over prevout/amount/
@@ -99,7 +99,9 @@ zig fmt --check modules/bitcointx
 
 Byte-exact against: a real mainnet block-170 legacy transaction (txid), BIP143's own published
 Native-P2WPKH signed example (round-trip + txid + wtxid), Bitcoin Core's `sighash.json` reference
-fixture (290 of its 500 rows — every row that does not need `FindAndDelete(OP_CODESEPARATOR)`),
+fixture (**all 500** of its rows, including the 210 that carry an `OP_CODESEPARATOR`), every
+transaction in Core's `tx_valid.json` + `tx_invalid.json` (213 real serializations, round-tripped
+and cross-checked against Core's own prevout table),
 python-bitcoinlib's `RawSignatureHash` for the **SIGHASH_SINGLE boundary** (a corner `sighash.json`
 does not reach: 17 of its rows use SINGLE, none with `input_index >= len(vout)`), BIP143's own two
 worked examples (intermediates + preimage + sighash), and the

@@ -238,6 +238,86 @@ test "unwrap fails closed: wrong KEK / corrupted ciphertext -> Unauthentic, outp
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &out);
 }
 
+// ── fuzz: `unwrap` on an attacker-controlled ciphertext ─────────────────────
+//
+// W2 A3 (F2): CLASS B, zero `testing.fuzz(` harnesses — this module was
+// absent from `scripts/fuzz-sweep.sh`'s target list entirely, despite
+// `unwrap`'s own SPEC.md naming it a wire-facing entry point: "the wrapped
+// blob may arrive over an untrusted channel". Per the campaign brief, the
+// AES core and the wrap/unwrap recurrence are already pinned byte-exact by
+// the RFC 3394 KATs above; fuzzing arbitrary bytes into `unwrap` would not
+// re-test those (a random ciphertext almost never survives the integrity
+// check to reach a specific arithmetic step) — what it DOES test is the two
+// length guards and the no-partial-key-leak invariant on failure, which is
+// the actual parsing/framing surface named in the finding.
+//
+// Two oracles, not one:
+//  1. On `error.Unauthentic` (the overwhelmingly likely outcome for random
+//     bytes), `out` must be all-zero — SPEC's stated no-partial-key-leak
+//     guarantee, and the one already covered by only a single hand-built
+//     case in the unit test above.
+//  2. A genuine wrap→unwrap round trip over fuzzed plaintext, at every
+//     legal semiblock count, closes with an exact-recovery check. A round
+//     trip alone cannot see a bug that shifts both `wrap` and `unwrap` the
+//     same way (the campaign brief's own caveat), which is exactly why (1)
+//     exists as an independent check that does not go through `wrap` at
+//     all.
+test "fuzz: unwrap never leaks partial key material on failure, on arbitrary ciphertext" {
+    try std.testing.fuzz({}, fuzzUnwrapNoLeak, .{});
+}
+
+fn fuzzUnwrapNoLeak(_: void, smith: *std.testing.Smith) !void {
+    const kek_len: usize = if (smith.value(bool)) 16 else 32;
+    var kek_buf: [32]u8 = undefined;
+    smith.bytes(kek_buf[0..kek_len]);
+    const kek = kek_buf[0..kek_len];
+
+    // Length drawn first so every mutated byte lands inside `ct`, not
+    // scattered across a fixed 256-byte draw a small `ct_len` would discard.
+    var ct_buf: [256]u8 = undefined;
+    const ct_len = smith.valueRangeAtMost(u16, 0, ct_buf.len);
+    smith.bytes(ct_buf[0..ct_len]);
+    const ct = ct_buf[0..ct_len];
+
+    var out: [256]u8 = undefined;
+    if (unwrap(kek, ct, &out)) |_| {
+        // Astronomically unlikely for random bytes (would require the
+        // integrity register to land on the default IV by chance), but not
+        // impossible in principle -- nothing to assert beyond "no crash".
+    } else |err| {
+        if (err != error.Unauthentic) return;
+        const n = ct.len / 8 - 1;
+        for (out[0..n]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    }
+}
+
+test "fuzz: wrap then unwrap recovers the exact plaintext, at every legal size" {
+    try std.testing.fuzz({}, fuzzWrapUnwrapRoundTrip, .{});
+}
+
+fn fuzzWrapUnwrapRoundTrip(_: void, smith: *std.testing.Smith) !void {
+    const kek_len: usize = if (smith.value(bool)) 16 else 32;
+    var kek_buf: [32]u8 = undefined;
+    smith.bytes(kek_buf[0..kek_len]);
+    const kek = kek_buf[0..kek_len];
+
+    // n semiblocks, n in [2, 31] -> plaintext length in [16, 248], a
+    // multiple of 8 as `wrap` requires. Drawn before the bytes it bounds,
+    // same reasoning as above.
+    const n = smith.valueRangeAtMost(u8, 2, 31);
+    var pt_buf: [248]u8 = undefined;
+    const pt_len = @as(usize, n) * 8;
+    smith.bytes(pt_buf[0..pt_len]);
+    const pt = pt_buf[0..pt_len];
+
+    var ct_buf: [256]u8 = undefined;
+    const ct = try wrap(kek, pt, &ct_buf);
+
+    var out: [248]u8 = undefined;
+    const recovered = try unwrap(kek, ct, &out);
+    try std.testing.expectEqualSlices(u8, pt, recovered);
+}
+
 test "length + KEK validation (incl. the 192-bit-KEK std gap), with positive controls" {
     const kek = [_]u8{0} ** 16;
     var buf: [64]u8 = undefined;

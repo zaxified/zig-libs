@@ -9,6 +9,10 @@
 //! outside this module's opcode table -- which mechanically excludes every
 //! BIP342 tapscript-only vector -- and any row with a witness field).
 //!
+//! The witness-bearing rows are NOT unpinned: all 107 of them live in
+//! `script_tests_witness_vectors.zig`, which needs a harness that carries the
+//! witness stack and the row's amount, hence the separate file.
+//!
 //! The former `OP_CODESEPARATOR` and `CONST_SCRIPTCODE` exclusions were
 //! REMOVED on 2026-08-06 together with the `FindAndDelete(vchSig)` fix they
 //! were hiding. Re-running the filter without them admits exactly ONE extra
@@ -1037,7 +1041,7 @@ pub const vectors = [_]Vector{
         .script_sig = "0x03 0x635168",
         .script_pubkey = "HASH160 0x14 0xe7309652a8e3f600f06f5d8d52d6df03d2176cc3 EQUAL",
         .flags = .{ .p2sh = true, .witness = true, .minimalif = true },
-        .expect = "InvalidStackOperation",
+        .expect = "UnbalancedConditional",
         .comment = "",
     },
     .{
@@ -1086,7 +1090,7 @@ pub const vectors = [_]Vector{
         .script_sig = "NOP",
         .script_pubkey = "IF 1 ENDIF",
         .flags = .{ .p2sh = true, .strictenc = true },
-        .expect = "InvalidStackOperation",
+        .expect = "UnbalancedConditional",
         .comment = "The following tests check the if(stack.size() < N) tests in each opcode",
     },
     .{

@@ -411,6 +411,49 @@ test "XML-Enc unpad round-trip through real CBC encrypt/decrypt" {
     try testing.expectEqualStrings(msg, pt[0..n]);
 }
 
+// ── fuzz: the unpad guards, on arbitrary decrypted-buffer content ──────────
+//
+// W2 A3 (F2): CLASS B, zero `testing.fuzz(` harnesses — this module was
+// absent from `scripts/fuzz-sweep.sh`'s target list entirely. Per the
+// campaign brief, `encrypt`/`decrypt`'s AES-CBC core is a crypto primitive
+// already pinned byte-exact against NIST SP800-38A above; fuzzing it again
+// would duplicate the KATs, not add to them. The genuinely untested-by-fuzz
+// surface is the framing/parsing logic in `unpadPkcs7`/`unpadXmlEnc`: both
+// consume a buffer that, on a chosen-ciphertext path, is attacker-shaped
+// (the audit's own framing — F2's evidence column).
+//
+// Oracle: not "never panics" alone. Success from either function is a
+// specific, checkable claim about the buffer's *last byte* and (for PKCS#7)
+// every byte in the claimed pad — so the harness asserts that claim holds,
+// which is strictly stronger than surviving without a crash.
+test "fuzz: unpad functions never panic, and a successful unpad's invariant actually holds" {
+    try testing.fuzz({}, fuzzUnpad, .{});
+}
+
+fn fuzzUnpad(_: void, smith: *testing.Smith) !void {
+    // Length drawn first so every mutated byte lands inside `data`, not
+    // scattered across a fixed 512-byte draw a small `len` would discard.
+    var buf: [512]u8 = undefined;
+    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    smith.bytes(buf[0..len]);
+    const data = buf[0..len];
+
+    if (unpadPkcs7(data)) |n| {
+        try testing.expect(data.len > 0 and data.len % block_len == 0);
+        const pad = data[data.len - 1];
+        try testing.expect(pad >= 1 and pad <= block_len);
+        try testing.expectEqual(data.len - @as(usize, pad), n);
+        for (data[n..]) |b| try testing.expectEqual(pad, b);
+    } else |_| {}
+
+    if (unpadXmlEnc(data)) |n| {
+        try testing.expect(data.len > 0 and data.len % block_len == 0);
+        const pad = data[data.len - 1];
+        try testing.expect(pad >= 1 and pad <= block_len);
+        try testing.expectEqual(data.len - @as(usize, pad), n);
+    } else |_| {}
+}
+
 test "raw CBC vs jwe's/xmlenc's hand-rolled shape: same output on the same input" {
     // Sanity oracle: reproduce the loop shape from jwe/src/enc.zig and
     // xmlenc/src/root.zig using ONLY std.crypto (not this module's own

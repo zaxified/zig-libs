@@ -305,8 +305,13 @@ pub const TagData = struct {
     /// not the same width.
     pub fn at(self: TagData, i: usize) DecodeError!Value {
         if (self.type.elementSize()) |n| {
-            const start = i * n;
-            if (start + n > self.data.len) return error.OutOfRange;
+            // `i` is caller-supplied and `n` is wire-derived, so `i * n` and
+            // `start + n` are both attacker-influenced products: compute the
+            // bound by subtraction on the (known-small) buffer length instead,
+            // so a huge `i` reports `OutOfRange` rather than wrapping into an
+            // in-bounds `start` under ReleaseFast.
+            const start = std.math.mul(usize, i, n) catch return error.OutOfRange;
+            if (n > self.data.len or start > self.data.len - n) return error.OutOfRange;
             return decodeValue(self.type, self.data[start..]);
         }
         if (self.type == .short_string or self.type == .string) {
@@ -531,6 +536,26 @@ test "a tag read payload splits type code from elements" {
     try testing.expectError(error.OutOfRange, td.at(4));
     var out: [16]u8 = undefined;
     try testing.expectEqualSlices(u8, &payload, try td.encode(&out));
+}
+
+test "TagData.at reports OutOfRange instead of wrapping on a huge index" {
+    // `at` is public API over a wire-decoded struct. Before the guard, `i * n`
+    // and `start + n` were unchecked: in Debug they trap, and in ReleaseFast a
+    // large `i` wraps into an in-bounds `start` and silently returns the WRONG
+    // element instead of `error.OutOfRange`.
+    const payload = [_]u8{ 0xC3, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00 };
+    const td = try TagData.decode(&payload);
+    try testing.expectEqual(@as(?usize, 2), td.type.elementSize());
+    // i * 2 wraps to 0 -> element 0 ("1") would come back as if in range.
+    const wrapping_index: usize = (1 << 63);
+    try testing.expectError(error.OutOfRange, td.at(wrapping_index));
+    // i * 2 wraps to `start = data.len - n`, i.e. the LAST element.
+    try testing.expectError(error.OutOfRange, td.at(wrapping_index + 3));
+    // start + n overflows while start itself does not.
+    try testing.expectError(error.OutOfRange, td.at(std.math.maxInt(usize) / 2));
+    // A one-byte element type: `start + n` is the only overflow route left.
+    const sint = TagData{ .type = .sint, .data = payload[2..], .structure_handle = null };
+    try testing.expectError(error.OutOfRange, sint.at(std.math.maxInt(usize)));
 }
 
 test "a structure read carries a handle the data does not include" {

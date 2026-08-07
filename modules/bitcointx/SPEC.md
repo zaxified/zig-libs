@@ -57,14 +57,14 @@ items are opaque byte slices throughout; `sighash_legacy`/`sighash_bip143`'s `sc
 parameter is caller-supplied (typically the spent output's `scriptPubKey`, or a P2SH
 `redeemScript`) rather than derived by walking a script. Two concrete consequences:
 
-- **No `FindAndDelete(OP_CODESEPARATOR)`** in the legacy algorithm (`sighash_legacy.zig`'s doc
-  comment has the full rationale): Bitcoin Core additionally strips every literal
-  `OP_CODESEPARATOR` (`0xab`) opcode from `script_code` before hashing, which requires an
-  opcode-aware walk (so a `0xab` *byte* inside a push's data payload is correctly NOT treated as
-  an opcode) — i.e. a script parser. `OP_CODESEPARATOR` is essentially unused in deployed Bitcoin
-  (no standard script template emits it); callers whose `script_code` could contain it must strip
-  it themselves first. `legacy_kat_vectors.zig`'s vectors are filtered to exclude any case that
-  would need this step, so the simplification never masks a wrong answer against the pinned KATs.
+- **`OP_CODESEPARATOR` removal IS implemented** (as of the wave-2 burn-down; this section used to
+  record it as a scope cut). `sighash_legacy.zig`'s `appendScriptCode` reproduces Core's
+  `CTransactionSignatureSerializer::SerializeScriptCode`: an opcode-aware walk that omits every
+  literal `OP_CODESEPARATOR` (`0xab`) *opcode* while leaving a `0xab` *byte* inside a push payload
+  alone, with Core's `scriptCode.size() - nCodeSeparators` length prefix and Core's truncation of
+  an undecodable tail. This needs push-length rules only — no opcode semantics, no stack — so the
+  "no Script interpretation" position above still holds. `legacy_kat_vectors.zig` is consequently
+  UNFILTERED: all 500 rows of `sighash.json`, including the 210 the old filter dropped.
 - BIP143 explicitly drops this step too (BIP143 "No FindAndDelete"), so `sighash_bip143.zig` has
   **no** scope cut relative to its spec — `script_code` is hashed exactly as given, matching
   BIP143 precisely.
@@ -100,9 +100,10 @@ transcription/byte-order pitfall before it ever reached this module's Zig tests 
 this caught" below).
 
 - **Legacy sighash** — `bitcoin/bitcoin`'s own `src/test/data/sighash.json` (the reference-oracle
-  fixture `SignatureHash()` is checked against upstream): 290 of the file's 500 rows, every one
-  that doesn't need the deferred `FindAndDelete` step (a mechanical, row-content-based filter —
-  any row whose `script` contains byte `0xab` is excluded, not a hand-picked subset), covering all
+  fixture `SignatureHash()` is checked against upstream): **all 500 data rows, no filter** (the
+  file has 501 array entries, one of which is the header comment). 210 of them carry a raw `0xab`
+  byte in the `script` column and were excluded until `SerializeScriptCode` was implemented;
+  measured, all 210 are real `OP_CODESEPARATOR` opcodes rather than push payload. Covering all
   3 named base types (`ALL`/`NONE`/`SINGLE`) × both `ANYONECANPAY` states plus many rows whose
   low-5-bit hashType isn't 1/2/3 at all (the "falls back to ALL-like" classification). See
   `modules/bitcointx/NOTICE` for the required Bitcoin Core attribution this data carries.

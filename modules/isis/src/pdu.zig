@@ -60,6 +60,24 @@ fn tlvRegion(bytes: []const u8, fixed_len: usize, pdu_len_off: usize) DecodeErro
     return bytes[fixed_len..pdu_length];
 }
 
+/// Every PDU body here carries its total length in a `u16` field (ISO/IEC
+/// 10589 §9.5-§9.9), so no builder can describe more than 65535 octets.
+pub const max_pdu_len: usize = std.math.maxInt(u16);
+
+/// The TLV region a builder may write into, capped at `max_pdu_len`.
+///
+/// The caller supplies the buffer, and nothing stopped it being larger than the
+/// length field can describe: each `finish` then did `@intCast(fixed_len +
+/// tlvs.pos)` into a `u16`, which traps in Debug and — the part that matters —
+/// silently WRAPS under ReleaseFast, putting a length on the wire that has
+/// nothing to do with the bytes returned. Capping the region here moves the
+/// refusal to the `addTlv` that would cross the line, where it is already
+/// spelled `error.BufferTooSmall`, and makes each `finish`'s narrowing
+/// unreachable by construction rather than by convention.
+fn buildableTlvRegion(buf: []u8, fixed_len: usize) []u8 {
+    return buf[fixed_len..@min(buf.len, max_pdu_len)];
+}
+
 /// The circuit-type field low 2 bits (ISO 10589): which levels this circuit runs.
 pub const CircuitType = enum(u2) {
     reserved0 = 0,
@@ -136,7 +154,7 @@ pub const LanHelloBuilder = struct {
         std.mem.writeInt(u16, buf[17..19], 0, .big); // PDU length, backfilled
         buf[19] = @as(u8, f.priority); // top bit reserved, zero
         @memcpy(buf[20..27], &f.lan_id);
-        return .{ .buf = buf, .tlvs = tlv.Builder.init(buf[lan_iih_fixed_len..]) };
+        return .{ .buf = buf, .tlvs = tlv.Builder.init(buildableTlvRegion(buf, lan_iih_fixed_len)) };
     }
 
     pub fn finish(b: *LanHelloBuilder) []const u8 {
@@ -205,7 +223,7 @@ pub const P2pHelloBuilder = struct {
         std.mem.writeInt(u16, buf[15..17], f.holding_time, .big);
         std.mem.writeInt(u16, buf[17..19], 0, .big);
         buf[19] = f.local_circuit_id;
-        return .{ .buf = buf, .tlvs = tlv.Builder.init(buf[p2p_iih_fixed_len..]) };
+        return .{ .buf = buf, .tlvs = tlv.Builder.init(buildableTlvRegion(buf, p2p_iih_fixed_len)) };
     }
 
     pub fn finish(b: *P2pHelloBuilder) []const u8 {
@@ -324,7 +342,7 @@ pub const LspBuilder = struct {
         std.mem.writeInt(u32, buf[20..24], f.sequence_number, .big);
         std.mem.writeInt(u16, buf[24..26], f.checksum, .big);
         buf[26] = f.flags.toByte();
-        return .{ .buf = buf, .tlvs = tlv.Builder.init(buf[lsp_fixed_len..]) };
+        return .{ .buf = buf, .tlvs = tlv.Builder.init(buildableTlvRegion(buf, lsp_fixed_len)) };
     }
 
     pub fn finish(b: *LspBuilder) []const u8 {
@@ -452,7 +470,7 @@ pub const CsnpBuilder = struct {
         @memcpy(buf[10..17], &f.source_id);
         @memcpy(buf[17..25], &f.start_lsp_id);
         @memcpy(buf[25..33], &f.end_lsp_id);
-        return .{ .buf = buf, .tlvs = tlv.Builder.init(buf[csnp_fixed_len..]) };
+        return .{ .buf = buf, .tlvs = tlv.Builder.init(buildableTlvRegion(buf, csnp_fixed_len)) };
     }
 
     pub fn finish(b: *CsnpBuilder) []const u8 {
@@ -507,7 +525,7 @@ pub const PsnpBuilder = struct {
         }, buf[0..header.common_header_len]) catch unreachable;
         std.mem.writeInt(u16, buf[8..10], 0, .big);
         @memcpy(buf[10..17], &f.source_id);
-        return .{ .buf = buf, .tlvs = tlv.Builder.init(buf[psnp_fixed_len..]) };
+        return .{ .buf = buf, .tlvs = tlv.Builder.init(buildableTlvRegion(buf, psnp_fixed_len)) };
     }
 
     pub fn finish(b: *PsnpBuilder) []const u8 {
@@ -740,4 +758,43 @@ test "§7.3.11: finishStamped emits the checksum the standard requires" {
 test "§7.3.11 helpers reject a malformed LSP the same way decode does" {
     try testing.expectError(error.BadDiscriminator, checkLspChecksum(&([_]u8{0xFF} ** 30)));
     try testing.expectError(error.TruncatedBody, computeLspChecksum(graded_lsp[0..20]));
+}
+
+test "an over-large builder buffer cannot wrap the u16 PDU Length field" {
+    // The builders take the caller's buffer as-is. Nothing bounded it by what
+    // the PDU Length field can describe, so `finish`'s
+    // `@intCast(fixed_len + tlvs.pos)` was reachable with a total above 65535:
+    // a trap in Debug, and under ReleaseFast a WRAPPED length written to the
+    // wire while `buf[0..total]` returns a differently-sized slice.
+    const oversized = 80 * 1024;
+    const buf = try testing.allocator.alloc(u8, oversized);
+    defer testing.allocator.free(buf);
+
+    var b = try LspBuilder.init(buf, .{
+        .remaining_lifetime = 1200,
+        .lsp_id = .{ 0, 0, 0, 0, 0, 1, 0, 0 },
+        .sequence_number = 1,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+
+    // Fill with the widest TLV there is (2 + 255 octets each) until refused.
+    const value = [_]u8{0xAA} ** 255;
+    var added: usize = 0;
+    while (b.tlvs.addTlv(0x0E, &value)) |_| {
+        added += 1;
+        try testing.expect(added < 1024); // must stop long before the buffer end
+    } else |err| {
+        try testing.expectEqual(error.BufferTooSmall, err);
+    }
+    // Unguarded, this is the trap: `@intCast(lsp_fixed_len + tlvs.pos)` with a
+    // total of ~81 KiB.
+    const wire = b.finish();
+    try testing.expect(wire.len <= max_pdu_len);
+    // The refusal has to come from the u16 ceiling, not from the buffer: the
+    // buffer still has tens of kilobytes free.
+    try testing.expect(buf.len - (lsp_fixed_len + b.tlvs.pos) > 8 * 1024);
+    try testing.expectEqual(wire.len, @as(usize, std.mem.readInt(u16, buf[8..10], .big)));
+    // And it is still a decodable LSP whose length field matches the bytes.
+    const p = try Lsp.decode(wire);
+    try testing.expectEqual(@as(u16, @intCast(wire.len)), p.pdu_length);
 }

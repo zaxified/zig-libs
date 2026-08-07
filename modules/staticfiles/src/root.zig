@@ -749,6 +749,56 @@ test "sanitizePath: absolute-looking input cannot escape" {
     try testing.expectEqualStrings("etc/passwd", try sanitizePath("///etc/passwd", &buf, .{}));
 }
 
+// ── fuzz: sanitizePath's own traversal-safety contract, on arbitrary bytes ─
+//
+// W2 A3 (F1): CLASS A, zero `testing.fuzz(` harnesses — this module was
+// absent from `scripts/fuzz-sweep.sh`'s target list entirely, despite
+// `sanitizePath`/`percentDecode` being the module's own doc comment's
+// "make-or-break requirement": the request path is attacker-controlled and
+// must never escape the root via percent-encoding, `..`, a NUL trick or a
+// backslash. The hand-picked vectors above pin known attack shapes; this
+// harness checks the CONTRACT itself holds for bytes nobody picked.
+//
+// Oracle: not "never panics". A successful `sanitizePath` result is a
+// specific claim — every segment is non-empty, is not `.`/`..`, contains no
+// NUL/backslash, and (unless opted in) does not start with `.`, and the
+// whole result has no leading/trailing slash. The harness re-derives that
+// claim from the output and checks it holds, which would catch e.g. a
+// `..` that survived because it arrived alongside an unrelated encoding
+// quirk the hand-picked vectors did not happen to combine.
+test "fuzz: sanitizePath's traversal-safety contract holds for arbitrary bytes" {
+    try testing.fuzz({}, fuzzSanitizePath, .{});
+}
+
+fn fuzzSanitizePath(_: void, smith: *testing.Smith) !void {
+    // Length drawn BEFORE the bytes it bounds: every mutated byte the
+    // fuzzer spends then lands inside the slice actually passed to
+    // `sanitizePath`, instead of diluting mutations across a fixed 4096-byte
+    // draw most of which gets discarded by a length picked afterward.
+    var raw_buf: [4096]u8 = undefined;
+    const raw_len = smith.valueRangeAtMost(u16, 0, raw_buf.len);
+    smith.bytes(raw_buf[0..raw_len]);
+    const raw = raw_buf[0..raw_len];
+    const allow_dotfiles = smith.value(bool);
+
+    var out: [max_path_bytes]u8 = undefined;
+    const clean = sanitizePath(raw, &out, .{ .allow_dotfiles = allow_dotfiles }) catch return;
+
+    // An empty result is a valid outcome (the doc comment: "means the
+    // request targets the root directory itself") -- not a segment to check.
+    if (clean.len == 0) return;
+    try testing.expect(clean[0] != '/');
+    try testing.expect(clean[clean.len - 1] != '/');
+    var it = mem.splitScalar(u8, clean, '/');
+    while (it.next()) |seg| {
+        try testing.expect(seg.len != 0);
+        try testing.expect(!mem.eql(u8, seg, "."));
+        try testing.expect(!mem.eql(u8, seg, ".."));
+        if (!allow_dotfiles) try testing.expect(seg[0] != '.');
+        for (seg) |c| try testing.expect(c != 0 and c != '\\');
+    }
+}
+
 // ── filesystem / serving tests ────────────────────────────────────────────────
 
 /// Build a root with real files + a real out-of-root secret + a symlink into

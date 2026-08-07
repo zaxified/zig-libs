@@ -58,3 +58,23 @@ test "teeth: corrupting one byte of a vector's expected sighash makes the byte-e
     want[31] ^= 0x01;
     try testing.expect(!std.mem.eql(u8, &want, &got));
 }
+
+test "the sighash corpus is the whole file, and reaches the OP_CODESEPARATOR path" {
+    // Corpus-shape sanity: a truncated or re-filtered vectors file must not
+    // pass with reduced coverage. Counted on upstream v29.0's `sighash.json`:
+    // 501 array entries, 1 header comment, 500 data rows, of which exactly 210
+    // carry a raw 0xab byte in the `script` column — and, measured, all 210 of
+    // those are real OP_CODESEPARATOR opcodes rather than push payload.
+    try testing.expectEqual(@as(usize, 500), vectors.vectors.len);
+    var with_separator: usize = 0;
+    for (vectors.vectors) |v| {
+        var i: usize = 0;
+        while (i + 1 < v.script_code_hex.len) : (i += 2) {
+            if (std.ascii.eqlIgnoreCase(v.script_code_hex[i .. i + 2], "ab")) {
+                with_separator += 1;
+                break;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 210), with_separator);
+}

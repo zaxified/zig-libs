@@ -206,10 +206,14 @@ pub const Cot = enum(u6) {
     unknown_ioa = 47,
     _,
 
-    /// Interrogation cause for inventory group `n` (1..16).
-    pub fn interrogatedByGroup(n: u8) Cot {
-        std.debug.assert(n >= 1 and n <= 16);
-        return @enumFromInt(20 + n);
+    /// Interrogation cause for inventory group `n` (1..16), or null if `n` is
+    /// not a group number. The bound is a returned `null`, not an `assert`:
+    /// asserts vanish under ReleaseFast, and this is public API — `20 + n`
+    /// overflows `u8` for `n > 235` and silently yields a *different, valid*
+    /// non-exhaustive tag for every other out-of-range `n`.
+    pub fn interrogatedByGroup(n: u8) ?Cot {
+        if (n < 1 or n > 16) return null;
+        return @enumFromInt(20 + @as(u8, n));
     }
 };
 
@@ -931,8 +935,22 @@ test "cause of transmission carries P/N and T alongside the six-bit cause" {
     try testing.expect(both.negative);
     try testing.expect(both.is_test);
     try testing.expectEqual(@as(u8, 3), both.originator);
-    try testing.expectEqual(Cot.interrogated_by_group_1, Cot.interrogatedByGroup(1));
-    try testing.expectEqual(Cot.interrogated_by_group_16, Cot.interrogatedByGroup(16));
+    try testing.expectEqual(Cot.interrogated_by_group_1, Cot.interrogatedByGroup(1).?);
+    try testing.expectEqual(Cot.interrogated_by_group_16, Cot.interrogatedByGroup(16).?);
+}
+
+test "interrogatedByGroup rejects a group number outside 1..16" {
+    // Public API bounded only by `std.debug.assert` before this: the assert is
+    // compiled out under ReleaseFast, and what is left is NOT a no-op. `Cot`
+    // is a NON-EXHAUSTIVE enum, so `@enumFromInt` accepts any `u8` — every
+    // n in 17..235 silently produced a real, wrong cause (n = 17 -> cause 37,
+    // `requested_by_general_counter`), and `20 + n` overflowed `u8` above 235.
+    try testing.expectEqual(@as(?Cot, null), Cot.interrogatedByGroup(0));
+    try testing.expectEqual(@as(?Cot, null), Cot.interrogatedByGroup(17));
+    try testing.expectEqual(@as(?Cot, null), Cot.interrogatedByGroup(255));
+    // The two values the unguarded code would have aliased onto real causes.
+    try testing.expect(Cot.interrogatedByGroup(17) == null);
+    try testing.expect(Cot.interrogatedByGroup(25) == null);
 }
 
 test "alternative address sizings put the fields where the caller asked" {

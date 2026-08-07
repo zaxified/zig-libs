@@ -836,3 +836,131 @@ test "indexing the anchor table did not change what anchors mean" {
     }
     try testing.expectError(error.UnknownAlias, compose(testing.allocator, "&x 1\n---\n*x\n", .{}));
 }
+
+// ── fuzz: the composer, not just the scanner/parser beneath it ─────────────
+//
+// W2 A3 (F3): CLASS A, zero `testing.fuzz(` harnesses in this module.
+// `root.zig`'s "arbitrary input never panics" test already drives ~4000
+// hand-rolled random strings at `dumpEvents` -- but `dumpEvents` calls
+// `Parser.next` directly and never reaches this file at all. Every anchor/
+// alias/tag-resolution/duplicate-key line in this file (`composeNode`,
+// `beginAnchor`, `resolveScalar`, the core-schema resolvers below) has
+// therefore never once seen a byte it did not choose itself. That matters
+// because this file is exactly where F1 (the quadratic anchor-table
+// finding, fixed elsewhere) and F2 (duplicate-key handling) both live.
+//
+// Two harnesses, because a bare byte-soup generator and a structural one
+// catch different things (the K1 campaign's own lesson: a generator that
+// never produces the interesting shape leaves the interesting code
+// unreached even while the harness runs clean).
+
+// (1) Byte-soup, same alphabet as `root.zig`'s scanner-level stand-in
+// (proven, by that test, to reach real parse success often enough to be
+// worth reusing) but driven through `composeAll` instead of `dumpEvents`,
+// so anchors/aliases/tags/duplicate keys in THIS file are what is under
+// test, with `Options` fuzzed too (small `max_nodes`/`max_depth` so the
+// budget errors get exercised, not just the happy path).
+//
+// Oracle: never panics, and `composeAll`'s arena is always freed on every
+// path (`testing.allocator` backs the arena, so a leaked page fails the
+// test on its own).
+test "fuzz: composeAll never panics or leaks, on the same adversarial alphabet as the scanner-level stand-in" {
+    try testing.fuzz({}, fuzzComposeNeverPanics, .{});
+}
+
+fn fuzzComposeNeverPanics(_: void, smith: *testing.Smith) !void {
+    const alphabet = "-?:,[]{}#&*!|>'\"%@` \tabc0129\n";
+    var buf: [512]u8 = undefined;
+    const n = smith.valueRangeAtMost(u16, 1, buf.len);
+    for (buf[0..n]) |*b| b.* = alphabet[smith.index(alphabet.len)];
+
+    const options: Options = .{
+        .max_nodes = smith.valueRangeAtMost(u16, 1, 500),
+        .max_depth = smith.valueRangeAtMost(u16, 1, 64),
+        .reject_duplicate_keys = smith.value(bool),
+    };
+    var result = composeAll(testing.allocator, buf[0..n], options) catch return;
+    defer result.deinit();
+}
+
+// (2) A structural generator that GUARANTEES anchors, aliases, and
+// sometimes a cycle, because random bytes essentially never spell
+// `&name value ... *name` by chance (the exact obstacle `43c99ad`
+// documents for other modules' generators). Builds a flow sequence of
+// `&aI <scalar>` definitions, each optionally followed by a `*aI` alias
+// reference or, sometimes, made to reference itself (a guaranteed cycle).
+//
+// Oracle: an alias must resolve to a value STRUCTURALLY EQUAL to its
+// anchor's — checked with this file's own `valueEql`, independent of the
+// composer's internal `Anchor` bookkeeping — and a self-referential entry
+// must be rejected with exactly `error.AliasCycle`, never silently
+// accepted or misreported as a different error. (A pure round trip would
+// not prove this: `valueEql` is not "the composer agrees with itself", it
+// is "the alias's resolved content is exactly the text that was written
+// under that anchor", generated independently of the composer's alias
+// lookup.)
+test "fuzz: an alias always resolves to exactly its anchor's value, and a self-reference is always AliasCycle" {
+    try testing.fuzz({}, fuzzAnchorAlias, .{});
+}
+
+fn fuzzAnchorAlias(_: void, smith: *testing.Smith) !void {
+    const scalars = [_][]const u8{ "42", "-7", "true", "false", "null", "hello", "0x1F", ".inf", "" };
+
+    var src: std.ArrayList(u8) = .empty;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    defer src.deinit(std.testing.allocator);
+
+    const count = smith.valueRangeAtMost(u8, 1, 12);
+    var aliased: [12]bool = undefined;
+    var cyclic: [12]bool = undefined;
+
+    try src.append(std.testing.allocator, '[');
+    var i: u8 = 0;
+    while (i < count) : (i += 1) {
+        if (i != 0) try src.append(std.testing.allocator, ',');
+        const text = scalars[smith.index(scalars.len)];
+        cyclic[i] = smith.boolWeighted(20, 1); // rare: self-reference
+        aliased[i] = !cyclic[i] and smith.value(bool);
+        if (cyclic[i]) {
+            try src.print(std.testing.allocator, "&a{d} [*a{d}]", .{ i, i });
+        } else {
+            try src.print(std.testing.allocator, "&a{d} {s}", .{ i, text });
+        }
+        if (aliased[i]) try src.print(std.testing.allocator, ", *a{d}", .{i});
+    }
+    try src.append(std.testing.allocator, ']');
+
+    const result = composeAllLeaky(scratch, src.items, .{}) catch |err| {
+        // A cyclic entry (if any were generated) MUST be the reason a
+        // document with otherwise-legal scalars was rejected.
+        var any_cyclic = false;
+        for (cyclic[0..count]) |c| {
+            if (c) any_cyclic = true;
+        }
+        try testing.expect(any_cyclic);
+        try testing.expectEqual(error.AliasCycle, err);
+        return;
+    };
+    // No cyclic entry may have been generated for compose to have succeeded.
+    for (cyclic[0..count]) |c| try testing.expect(!c);
+
+    try testing.expectEqual(@as(usize, 1), result.len);
+    const seq = result[0].sequence;
+    // Each definition contributes 1 element, plus 1 more for each alias.
+    var want_len: usize = 0;
+    for (aliased[0..count]) |a| want_len += if (a) @as(usize, 2) else 1;
+    try testing.expectEqual(want_len, seq.len);
+
+    var idx: usize = 0;
+    for (0..count) |k| {
+        const defined = seq[idx];
+        idx += 1;
+        if (aliased[k]) {
+            const via_alias = seq[idx];
+            idx += 1;
+            try testing.expect(valueEql(defined, via_alias));
+        }
+    }
+}
