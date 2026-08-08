@@ -895,21 +895,15 @@ test "F3: init's errdefer ladder never leaks under allocator exhaustion, at ever
     // out-of-scope leak below, instead of a leak-detecting backing allocator
     // panicking mid-sweep with no chance to attribute it.
     //
-    // NOT WORKERPOOL'S BUG (recorded here, not fixed — `workerpool`'s own
-    // ladder is what this test verifies): at exactly one allocation site,
-    // `lockfree.NodePool.acquire` (`modules/lockfree/src/pool.zig` around
-    // its `self.allocator.create(Slot)` / `self.all.append(...)` pair, hit
-    // here via `MpmcQueue.init`'s dummy-sentinel acquisition) allocates the
-    // `Slot` FIRST and only THEN appends it to its own tracking list; if
-    // that second allocation (the list's buffer growth) fails, the `Slot`
-    // just created is never recorded anywhere and `NodePool.deinit`'s
-    // `for (self.all.items) |slot| self.allocator.destroy(slot);` sweep
-    // cannot find it — a genuine leak on `lockfree`'s own allocator-failure
-    // path, independent of anything `workerpool` does with the result. This
-    // loop tolerates exactly that one signature (a single net-leaked
-    // allocation at a single index) and still fails on anything else —
-    // more leaked bytes, more than one leaking index, or a leak paired with
-    // a non-`OutOfMemory` error would all be a NEW, in-scope defect.
+    // This used to tolerate exactly one leaking index: `lockfree.NodePool.
+    // acquire` created a `Slot` and only then appended it to its own tracking
+    // list, so a failure of that second allocation left the `Slot` recorded
+    // nowhere and `NodePool.deinit`'s sweep could not find it. That was found
+    // here and fixed in `lockfree` (`acquire` now reserves the list capacity
+    // before creating the slot, so there is no fallible step between
+    // allocating and recording). The tolerance is therefore gone: ANY net
+    // leak at ANY fail index is now a defect, in this ladder or in a
+    // dependency, and this test says so.
     var idx: usize = 0;
     var leaking_indices_seen: usize = 0;
     const safety_bound = 64; // generous; init allocates far fewer times than this
@@ -920,15 +914,14 @@ test "F3: init's errdefer ladder never leaks under allocator exhaustion, at ever
             // swept above. Done.
             pool.deinit();
             try testing.expect(idx > 0); // sanity: init does allocate
-            try testing.expectEqual(@as(usize, 1), leaking_indices_seen); // exactly the one known lockfree site
+            try testing.expectEqual(@as(usize, 0), leaking_indices_seen); // no fail index may leak
             return;
         } else |err| {
             try testing.expect(err == error.OutOfMemory); // never SpawnFailed: spawning doesn't use this allocator
             const leaked = failing.allocations - failing.deallocations;
             if (leaked != 0) {
                 leaking_indices_seen += 1;
-                try testing.expectEqual(@as(usize, 1), leaked); // exactly the lockfree Slot, nothing more
-                try testing.expect(leaking_indices_seen <= 1); // exactly one such site, not several
+                try testing.expectEqual(@as(usize, 0), leaked); // fails, naming the index and the byte count
             }
         }
     }

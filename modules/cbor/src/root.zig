@@ -13,8 +13,11 @@
 //! shape as their definite counterparts (chunks concatenated, items
 //! collected) — decode does not distinguish "was this indefinite on the
 //! wire", by design (see README "Deferred"). `decode()` returns everything
-//! newly allocated via the caller's `allocator` (arena-friendly): the input
-//! `bytes` slice can be freed or reused the moment `decode()` returns.
+//! newly allocated via the caller's `allocator` (arena-friendly, **not**
+//! arena-required): the input `bytes` slice can be freed or reused the moment
+//! `decode()` returns, and the tree itself is released either by freeing the
+//! arena or — for a caller on a plain allocator — with the public
+//! `freeValue(allocator, value)`.
 //!
 //! **Encode ← `Value`.** `encode()` always emits definite-length,
 //! shortest-form integers/lengths (RFC 8949 §4.1 "preferred serialization").
@@ -171,13 +174,22 @@ pub const DecodeOptions = struct {
 
 /// Recursively releases everything a decoded `Value` owns (`bytes`/`text`
 /// slices, `array`/`map` backing storage and every element inside, `tag`'s
-/// heap-allocated inner value) via `allocator` — the same allocator `decode`
-/// was called with. Used internally to unwind a partially built tree when a
-/// later part of the input turns out to be malformed; a caller using an
-/// arena never needs this (the whole arena is freed at once), which is why
-/// it stays private — decode()'s only documented cleanup contract today is
-/// "free the arena".
-fn freeValue(allocator: Allocator, v: Value) void {
+/// heap-allocated inner value) via `allocator` — which **must** be the same
+/// allocator the `Value` was `decode`d with.
+///
+/// This is the counterpart to `decode`, and it is public because the module
+/// claims to be *arena-friendly, not arena-required*. It was private, and the
+/// only documented cleanup contract was "free the arena" — which meant that
+/// posture was not actually deliverable: a caller on a plain allocator had no
+/// supported way to release a decoded tree at all, and would have had to walk
+/// the `Value` union themselves (and get `tag`'s heap-allocated inner value
+/// and the `array`/`map` backing slices right) to avoid leaking.
+///
+/// Only call it on a `Value` that came out of `decode`. A `Value` a caller
+/// built by hand may point at string literals or stack buffers, and a
+/// `Value` returned by a *failed* `decode` does not exist — `decode` unwinds
+/// its own partial tree before returning an error.
+pub fn freeValue(allocator: Allocator, v: Value) void {
     switch (v) {
         .bytes, .text => |s| allocator.free(s),
         .array => |a| {
@@ -203,7 +215,10 @@ fn freeValue(allocator: Allocator, v: Value) void {
 /// if bytes remain after the item (use a length-prefixing framing, e.g.
 /// `framing`, if you need to pack multiple CBOR items back to back).
 /// Everything in the returned `Value` tree is allocated via `allocator`;
-/// `bytes` need not outlive the call.
+/// `bytes` need not outlive the call. Release it with `freeValue(allocator,
+/// value)`, or — if `allocator` is an arena — by freeing the arena. On an
+/// error return there is nothing to release: the partial tree is unwound
+/// before the error leaves this function.
 pub fn decode(allocator: Allocator, bytes: []const u8, options: DecodeOptions) DecodeError!Value {
     var d: Decoder = .{ .bytes = bytes, .pos = 0, .allocator = allocator, .max_depth = options.max_depth };
     const v = try d.decodeValue(0);

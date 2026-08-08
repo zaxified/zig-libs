@@ -103,9 +103,17 @@ pub fn NodePool(comptime T: type) type {
                 slot.live = true;
                 return &slot.node;
             }
+            // `all` is the *only* record of a slot's existence — `deinit`'s
+            // destroy sweep walks nothing else — so growing it must happen
+            // BEFORE the slot exists. The obvious `create` + `append` order
+            // leaks: `create` succeeds, the independent `append` fails, and the
+            // fresh slot is then unreachable from `all` for the rest of the
+            // pool's life. Reserving first leaves no fallible step between the
+            // allocation and the record of it.
+            try self.all.ensureUnusedCapacity(self.allocator, 1);
             const slot = try self.allocator.create(Slot);
             slot.* = .{ .node = undefined, .next_free = null, .live = true };
-            try self.all.append(self.allocator, slot);
+            self.all.appendAssumeCapacity(slot);
             return &slot.node;
         }
 
@@ -202,4 +210,35 @@ test "CANARY TEETH: a UAF is also caught at the next acquire, not just the sweep
     pool.release(a);
     a.next = a; // stale write corrupts the poisoned slot
     try testing.expectError(error.CanaryTripped, pool.acquire());
+}
+
+test "acquire leaks no slot when the allocator fails part-way through" {
+    // The defect: `acquire` used to `create(Slot)` and only then `append` the
+    // pointer to `self.all`. Those are two independent allocations; when the
+    // second failed, the freshly created slot was never recorded, and
+    // `deinit`'s destroy sweep — which walks `self.all` and nothing else —
+    // could never find it again. Exactly one leaked `Slot` per pool, on
+    // exactly the sweep index where the *append's* growth is the failing
+    // allocation.
+    //
+    // The sweep drives every fail index a growing pool can reach, so it does
+    // not depend on knowing which one that is; the whole point is that one of
+    // them used to end with `allocations - deallocations == 1`.
+    var idx: usize = 0;
+    while (idx < 24) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        const gpa = failing.allocator();
+        {
+            var pool = NodePool(TestNode).init(gpa);
+            defer pool.deinit();
+            // Acquire until the induced failure hits (or the budget is spent);
+            // `release` first so some rounds also exercise the free-list path.
+            var n: usize = 0;
+            while (n < 16) : (n += 1) {
+                const node = pool.acquire() catch break;
+                if (n % 3 == 2) pool.release(node);
+            }
+        }
+        try testing.expectEqual(failing.allocations, failing.deallocations);
+    }
 }

@@ -157,6 +157,15 @@ pub const Storage = struct {
         /// one that refuses to open. Pass `Options.lock = .none` to proceed
         /// without cross-process exclusion.
         LockUnsupported,
+        /// The backend's open-handle table is full — a backend-imposed limit,
+        /// **not** the OS's `EMFILE`/`ENFILE` (those still surface as
+        /// `Unexpected` from the underlying `openFile`). Distinct from
+        /// `Unexpected` on purpose: this one is diagnosable and actionable —
+        /// close handles, or size the backend's table for the workload
+        /// (`FsStorageCapacity`). `FsStorage` used to report exactly this
+        /// condition as `error.Unexpected`, which made a store that simply
+        /// wanted a fifth open file indistinguishable from a real bug.
+        HandleTableFull,
     };
 
     pub const VTable = struct {
@@ -282,132 +291,166 @@ pub const Storage = struct {
 /// that makes file creation and rename durable on POSIX filesystems. On
 /// platforms where fsync-of-a-directory is not supported the error is
 /// reported (not swallowed); this backend is verified on Linux.
-pub const FsStorage = struct {
-    io: std.Io,
-    dir: std.Io.Dir,
-    files: [max_handles]?std.Io.File = @splat(null),
+pub const FsStorage = FsStorageCapacity(default_max_handles);
 
-    /// The store needs at most 3 concurrently open files (data + lock
-    /// sidecar + compaction temp); a little headroom is left.
-    const max_handles = 4;
+/// How many files one `FsStorage` can hold open at once by default.
+///
+/// **This used to be 4**, sized for exactly one `Db` (data file + lock
+/// sidecar + compaction temp, plus one spare) — but an `FsStorage` is not
+/// per-`Db`: it is a backend that several stores share, and the handle table
+/// is the *shared* resource. That cap was reached twice in practice, both
+/// times by `shardstore`, which needs `n_shards × 2` handles when it locks
+/// per shard and so could not open more than two shards over the default
+/// backend. Neither site could see why: exhaustion was reported as
+/// `error.Unexpected`.
+///
+/// 64 is not a claim that 64 is enough for everyone — it is a default sized
+/// for "a handful of stores over one backend" instead of "one store", at a
+/// cost of well under a kilobyte of inline table. Callers with a known,
+/// larger fan-out ask for the size they need with `FsStorageCapacity`, and
+/// callers that exceed whatever they chose now get `error.HandleTableFull`,
+/// which says what happened and what to change.
+pub const default_max_handles = 64;
 
-    pub fn init(io: std.Io, dir: std.Io.Dir) FsStorage {
-        return .{ .io = io, .dir = dir };
-    }
+/// `FsStorage` with an explicitly sized handle table — for a caller whose
+/// fan-out over a single backend is known and larger than
+/// `default_max_handles` (e.g. `shardstore` with many shards, which needs
+/// two handles per shard). `FsStorageCapacity(default_max_handles)` *is*
+/// `FsStorage`; the types are identical, not merely compatible.
+pub fn FsStorageCapacity(comptime max_handles: usize) type {
+    return struct {
+        const Self = @This();
 
-    pub fn storage(self: *FsStorage) Storage {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
+        io: std.Io,
+        dir: std.Io.Dir,
+        files: [max_handles]?std.Io.File = @splat(null),
 
-    const vtable = Storage.VTable{
-        .open = vOpen,
-        .size = vSize,
-        .pread = vPread,
-        .writeAll = vWriteAll,
-        .sync = vSync,
-        .truncate = vTruncate,
-        .close = vClose,
-        .rename = vRename,
-        .delete = vDelete,
-        .syncDir = vSyncDir,
-        .tryLockExclusive = vTryLockExclusive,
-    };
+        /// How many files this backend can hold open at once. Exceeding it is
+        /// `error.HandleTableFull`, never `error.Unexpected`.
+        pub const capacity = max_handles;
 
-    fn cast(ctx: *anyopaque) *FsStorage {
-        return @ptrCast(@alignCast(ctx));
-    }
+        pub fn init(io: std.Io, dir: std.Io.Dir) Self {
+            return .{ .io = io, .dir = dir };
+        }
 
-    fn mapErr(e: anyerror) Storage.Error {
-        return switch (e) {
-            error.FileLocksUnsupported => error.LockUnsupported,
-            error.FileNotFound => error.FileNotFound,
-            error.AccessDenied, error.PermissionDenied => error.AccessDenied,
-            error.NoSpaceLeft, error.DiskQuota => error.NoSpaceLeft,
-            error.InputOutput => error.InputOutput,
-            error.IsDir => error.IsDir,
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.Unexpected,
+        pub fn storage(self: *Self) Storage {
+            return .{ .ctx = self, .vtable = &vtable };
+        }
+
+        const vtable = Storage.VTable{
+            .open = vOpen,
+            .size = vSize,
+            .pread = vPread,
+            .writeAll = vWriteAll,
+            .sync = vSync,
+            .truncate = vTruncate,
+            .close = vClose,
+            .rename = vRename,
+            .delete = vDelete,
+            .syncDir = vSyncDir,
+            .tryLockExclusive = vTryLockExclusive,
         };
-    }
 
-    fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
-        const self = cast(ctx);
-        const slot: usize = for (self.files, 0..) |f, i| {
-            if (f == null) break i;
-        } else return error.Unexpected;
-        const file = self.dir.createFile(self.io, path, .{
-            .read = true,
-            .truncate = mode == .create_truncate,
-        }) catch |e| return mapErr(e);
-        self.files[slot] = file;
-        return @intCast(slot);
-    }
+        fn cast(ctx: *anyopaque) *Self {
+            return @ptrCast(@alignCast(ctx));
+        }
 
-    fn fileOf(self: *FsStorage, h: Storage.Handle) std.Io.File {
-        return self.files[h].?;
-    }
+        fn mapErr(e: anyerror) Storage.Error {
+            return switch (e) {
+                error.FileLocksUnsupported => error.LockUnsupported,
+                error.FileNotFound => error.FileNotFound,
+                error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+                error.NoSpaceLeft, error.DiskQuota => error.NoSpaceLeft,
+                error.InputOutput => error.InputOutput,
+                error.IsDir => error.IsDir,
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Unexpected,
+            };
+        }
 
-    fn vSize(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
-        const self = cast(ctx);
-        return self.fileOf(h).length(self.io) catch |e| mapErr(e);
-    }
+        fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
+            const self = cast(ctx);
+            // The handle table is this backend's only fixed resource. It
+            // used to report exhaustion as `error.Unexpected`, so a caller
+            // that simply needed one more open file could not tell a sizing
+            // problem from a bug — see `default_max_handles`.
+            const slot: usize = for (self.files, 0..) |f, i| {
+                if (f == null) break i;
+            } else return error.HandleTableFull;
+            const file = self.dir.createFile(self.io, path, .{
+                .read = true,
+                .truncate = mode == .create_truncate,
+            }) catch |e| return mapErr(e);
+            self.files[slot] = file;
+            return @intCast(slot);
+        }
 
-    fn vPread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
-        const self = cast(ctx);
-        return self.fileOf(h).readPositionalAll(self.io, buf, off) catch |e| mapErr(e);
-    }
+        fn fileOf(self: *Self, h: Storage.Handle) std.Io.File {
+            return self.files[h].?;
+        }
 
-    fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
-        const self = cast(ctx);
-        self.fileOf(h).writePositionalAll(self.io, bytes, off) catch |e| return mapErr(e);
-    }
+        fn vSize(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
+            const self = cast(ctx);
+            return self.fileOf(h).length(self.io) catch |e| mapErr(e);
+        }
 
-    fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
-        const self = cast(ctx);
-        self.fileOf(h).sync(self.io) catch |e| return mapErr(e);
-    }
+        fn vPread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
+            const self = cast(ctx);
+            return self.fileOf(h).readPositionalAll(self.io, buf, off) catch |e| mapErr(e);
+        }
 
-    fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
-        const self = cast(ctx);
-        self.fileOf(h).setLength(self.io, len) catch |e| return mapErr(e);
-    }
+        fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
+            const self = cast(ctx);
+            self.fileOf(h).writePositionalAll(self.io, bytes, off) catch |e| return mapErr(e);
+        }
 
-    fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
-        const self = cast(ctx);
-        if (self.files[h]) |f| f.close(self.io);
-        self.files[h] = null;
-    }
+        fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+            const self = cast(ctx);
+            self.fileOf(h).sync(self.io) catch |e| return mapErr(e);
+        }
 
-    fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
-        const self = cast(ctx);
-        std.Io.Dir.rename(self.dir, old_path, self.dir, new_path, self.io) catch |e| return mapErr(e);
-    }
+        fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
+            const self = cast(ctx);
+            self.fileOf(h).setLength(self.io, len) catch |e| return mapErr(e);
+        }
 
-    fn vDelete(ctx: *anyopaque, path: []const u8) Storage.Error!void {
-        const self = cast(ctx);
-        self.dir.deleteFile(self.io, path) catch |e| return mapErr(e);
-    }
+        fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
+            const self = cast(ctx);
+            if (self.files[h]) |f| f.close(self.io);
+            self.files[h] = null;
+        }
 
-    fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
-        const self = cast(ctx);
-        // `dir` may have been opened O_PATH (std's default for non-iterable
-        // dir handles), which cannot be fsync'd — re-open "." as a real
-        // handle (`iterate = true` forces a non-O_PATH fd) just for the sync.
-        const d = self.dir.openDir(self.io, ".", .{ .iterate = true }) catch |e| return mapErr(e);
-        defer d.close(self.io);
-        const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
-        as_file.sync(self.io) catch |e| return mapErr(e);
-    }
+        fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
+            const self = cast(ctx);
+            std.Io.Dir.rename(self.dir, old_path, self.dir, new_path, self.io) catch |e| return mapErr(e);
+        }
 
-    /// `flock(fd, LOCK_EX | LOCK_NB)` (POSIX) / `NtLockFile` with fail-
-    /// immediately (Windows), via `std.Io.File.tryLock` — the non-blocking
-    /// form, so a contended store reports `error.Locked` to the caller
-    /// instead of parking the thread inside a library call forever.
-    fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
-        const self = cast(ctx);
-        return self.fileOf(h).tryLock(self.io, .exclusive) catch |e| mapErr(e);
-    }
-};
+        fn vDelete(ctx: *anyopaque, path: []const u8) Storage.Error!void {
+            const self = cast(ctx);
+            self.dir.deleteFile(self.io, path) catch |e| return mapErr(e);
+        }
+
+        fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
+            const self = cast(ctx);
+            // `dir` may have been opened O_PATH (std's default for non-iterable
+            // dir handles), which cannot be fsync'd — re-open "." as a real
+            // handle (`iterate = true` forces a non-O_PATH fd) just for the sync.
+            const d = self.dir.openDir(self.io, ".", .{ .iterate = true }) catch |e| return mapErr(e);
+            defer d.close(self.io);
+            const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
+            as_file.sync(self.io) catch |e| return mapErr(e);
+        }
+
+        /// `flock(fd, LOCK_EX | LOCK_NB)` (POSIX) / `NtLockFile` with fail-
+        /// immediately (Windows), via `std.Io.File.tryLock` — the non-blocking
+        /// form, so a contended store reports `error.Locked` to the caller
+        /// instead of parking the thread inside a library call forever.
+        fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+            const self = cast(ctx);
+            return self.fileOf(h).tryLock(self.io, .exclusive) catch |e| mapErr(e);
+        }
+    };
+}
 
 // ── Db ───────────────────────────────────────────────────────────────────────
 
@@ -1376,6 +1419,51 @@ test "real filesystem (FsStorage): persistence + compaction round-trip" {
     try expectGet(&db, "gamma", "three");
     try db.put("delta", "four");
     try expectGet(&db, "delta", "four");
+}
+
+test "FsStorage: a full handle table is diagnosable, not error.Unexpected" {
+    // The defect: exhausting the fixed handle table fell out of the `for`
+    // loop's `else` as `error.Unexpected` — the same error a genuine bug
+    // produces. A caller could not tell "size me differently" from "something
+    // is broken", and the cap that produced it (4) was undocumented.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorageCapacity(2).init(testing.io, tmp.dir);
+    const st = fs_store.storage();
+
+    const a = try st.open("a.bin", .open_or_create);
+    _ = try st.open("b.bin", .open_or_create);
+    try testing.expectError(error.HandleTableFull, st.open("c.bin", .open_or_create));
+    // Closing one frees exactly one slot: the table is a reusable resource,
+    // not a one-way budget.
+    st.close(a);
+    const d = try st.open("d.bin", .open_or_create);
+    try testing.expectError(error.HandleTableFull, st.open("e.bin", .open_or_create));
+    st.close(d);
+    st.close(1);
+}
+
+test "FsStorage: the default handle table holds more than one store's worth of files" {
+    // The sharp part of the old cap: `max_handles == 4` was sized for a single
+    // `Db` (data + lock sidecar + compaction temp), but an `FsStorage` is a
+    // *shared* backend. `shardstore` needs two handles per shard, so over the
+    // default backend it could not open a fourth shard at all, and two of its
+    // tests had to be written with 3 shards instead of 4 to stay green.
+    //
+    // This pins the property those callers actually need: eight handles —
+    // four two-handle stores — open at once on the default `FsStorage`.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    const st = fs_store.storage();
+
+    var handles: [8]Storage.Handle = undefined;
+    for (&handles, 0..) |*h, i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "shard{d}.bin", .{i});
+        h.* = try st.open(name, .open_or_create);
+    }
+    for (handles) |h| st.close(h);
 }
 
 test "real filesystem: torn tail on disk is recovered" {

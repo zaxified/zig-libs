@@ -414,3 +414,32 @@ fn fuzzDecodeNeverPanics(_: void, smith: *std.testing.Smith) !void {
 test "fuzz: decode never panics on arbitrary bytes" {
     try std.testing.fuzz({}, fuzzDecodeNeverPanics, .{});
 }
+
+// ── the free path is part of the public API ────────────────────────────────
+//
+// The module's stated posture is "arena-friendly, not arena-required", but
+// `freeValue` was private and the only documented cleanup contract was "free
+// the arena" — so for a caller on a plain allocator the posture was not
+// deliverable: there was no supported way to release a decoded tree at all.
+// This test lives in a *separate file* on purpose. Zig only exposes `pub`
+// declarations across a file boundary, so it exercises exactly the property
+// the finding is about, and it is the leak-detecting `testing.allocator`
+// rather than an arena, so the free path also has to be correct, not just
+// reachable.
+
+test "a decoded tree can be freed through the public API, with no arena" {
+    // map{ "a": [1, h'0102'], 2: 24("txt") } — one value of every owning
+    // shape: text, array + its backing slice, byte string, and a tag with a
+    // heap-allocated inner value.
+    const bytes = [_]u8{
+        0xa2, // map, 2 pairs
+        0x61, 'a', // key: text "a"
+        0x82, 0x01, 0x42, 0x01, 0x02, // value: [1, h'0102']
+        0x02, // key: 2
+        0xd8, 0x18, 0x63, 't', 'x', 't', // value: tag(24, "txt")
+    };
+    const v = try cbor.decode(testing.allocator, &bytes, .{});
+    try testing.expectEqual(@as(usize, 2), v.map.len);
+    try testing.expectEqualStrings("txt", v.map[1].value.tag.value.text);
+    cbor.freeValue(testing.allocator, v);
+}

@@ -1160,6 +1160,10 @@ pub const RequestError = error{
     /// The kernel lacks this feature: unknown link kind, unsupported family
     /// (EOPNOTSUPP/EAFNOSUPPORT/EPROTONOSUPPORT).
     NotSupported,
+    /// The reply loop consumed `max_await_messages` netlink messages without
+    /// ever seeing the `NLMSG_ERROR` that terminates it. See that constant:
+    /// `awaitAckStrict` used to loop forever in this case.
+    TooManyMessages,
     Unexpected,
 };
 
@@ -1215,12 +1219,36 @@ pub const DumpError = error{
     InconsistentDump,
     AccessDenied,
     InvalidRequest,
+    /// One dump attempt consumed `max_dump_messages` netlink messages without
+    /// ever reaching `NLMSG_DONE`. See that constant: the dump loops used to
+    /// run forever in this case.
+    TooManyMessages,
     Unexpected,
 };
 
 const initial_recv_buf_len = 8192; // libmnl's MNL_SOCKET_BUFFER_SIZE ceiling
 const max_recv_buf_len = 1 << 24; // hard cap on receive-buffer growth
 const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
+
+/// Ceiling on how many netlink messages one dump attempt may consume before
+/// giving up with `error.TooManyMessages`, and the same for the ACK wait
+/// (`max_await_messages`). Same rationale as the identical constants in the
+/// `conntrack`/`ethtool`/`devlink`/`nl80211` clients that sit on this
+/// transport: `recvDatagramStrict` drops every datagram whose sender pid is
+/// not 0, so the kernel is the only verified sender on this socket and these
+/// are robustness ceilings against a malfunctioning kernel/driver, not
+/// attacker-facing bounds. Without them a peer that never sends `NLMSG_DONE`
+/// (or, on the write path, never sends the `NLMSG_ERROR` ACK) spins the
+/// caller forever with no timeout and no budget — and this is the rtnetlink
+/// engine behind links, addresses, routes, neighbours and the bridge ops, so
+/// the exposure is wider than all four of those clients combined.
+///
+/// 65536 is generous for every real dump: the largest rtnetlink dumps on a
+/// busy host (a full neighbour or route table) arrive in far fewer messages,
+/// and a dump that genuinely needs more is better served by a filtered
+/// request than by an unbounded loop.
+const max_dump_messages: u32 = 65536;
+const max_await_messages: u32 = 65536;
 /// Cap on the kernel's extended-ACK reason string kept per socket; real ones
 /// are short sentences ("Unknown device type"), and a longer one is truncated
 /// rather than allocated for.
@@ -1721,25 +1749,21 @@ pub const Socket = struct {
     /// other ports/sequences (a stale dump, a multicast event, another process
     /// addressing our port id) are skipped; non-error messages carrying our
     /// seq (an `NLM_F_ECHO` copy) are ignored until the ACK itself arrives.
+    /// Bounded by `max_await_messages`: a kernel that never answers this `seq`
+    /// with an `NLMSG_ERROR` used to spin this loop forever (no budget, no
+    /// timeout). `awaitAckOver` is the bounded engine, factored out so a
+    /// scripted transport can drive it without a real socket.
     pub fn awaitAckStrict(self: *Socket, seq: u32) StrictRequestError!void {
         self.ext_ack_len = 0;
-        while (true) {
-            const dgram = try self.recvDatagramStrict();
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.portid or m.seq != seq) continue;
-                switch (m.type) {
-                    codec.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        self.captureExtAck(m);
-                        if (code == 0) return; // ACK
-                        return writeErrorFromCode(code);
-                    },
-                    codec.NLMSG_OVERRUN => return error.Overrun,
-                    else => {}, // NOOP / echo — keep waiting for the ACK
-                }
-            }
-        }
+        return awaitAckOver(self, seq);
+    }
+
+    /// This socket's kernel-assigned netlink port id. Present so `Socket`
+    /// satisfies the `transport` shape the reply engines below are written
+    /// against (`recvDatagram`/`recvDatagramStrict`, `portId`, `captureExtAck`,
+    /// `send`, `nextSeq`, `sendDumpRequest`).
+    pub fn portId(self: *const Socket) u32 {
+        return self.portid;
     }
 
     /// Copy the extended-ACK reason string (if any) out of the reply buffer,
@@ -1763,6 +1787,12 @@ pub const Socket = struct {
     /// foreign is skipped, which also self-heals the queue after an aborted
     /// earlier dump. NLM_F_DUMP_INTR restarts the dump with a fresh sequence
     /// number, mirroring libnl's NLE_DUMP_INTR handling.
+    ///
+    /// The engine itself is `dumpOver`, a free function over `transport:
+    /// anytype`, so the reply discipline can be driven by a scripted transport
+    /// in the tests — which is the only way to reach the restart and the
+    /// message-budget paths deterministically (a live kernel neither sets
+    /// `NLM_F_DUMP_INTR` on a quiet host nor withholds `NLMSG_DONE`).
     fn dump(
         self: *Socket,
         comptime T: type,
@@ -1773,37 +1803,7 @@ pub const Socket = struct {
         fixed_len: usize,
         filter: Filter,
     ) DumpError![]T {
-        var attempt: usize = 0;
-        retry: while (true) {
-            attempt += 1;
-            const seq = try self.sendDumpRequest(msg_type, fixed_len, filter.family orelse AF.UNSPEC);
-            var out: std.ArrayList(T) = .empty;
-            errdefer out.deinit(self.gpa);
-            while (true) {
-                const dgram = try self.recvDatagram();
-                var it: codec.MessageIterator = .{ .buf = dgram };
-                while (it.next() catch return error.MalformedReply) |m| {
-                    switch (codec.classifyDumpMessage(m, self.portid, seq)) {
-                        .skip => {},
-                        .restart => {
-                            out.deinit(self.gpa);
-                            if (attempt < max_dump_attempts) continue :retry;
-                            return error.InconsistentDump;
-                        },
-                        .done => return out.toOwnedSlice(self.gpa),
-                        .failed => |code| return errorFromCode(code),
-                        .overrun => return error.SystemResources,
-                        .malformed => return error.MalformedReply,
-                        .record => |rec| {
-                            if (rec.type != reply_type) continue;
-                            const parsed = parseFn(rec.payload) catch return error.MalformedReply;
-                            if (parsed) |item| if (matchFn(item, filter))
-                                try out.append(self.gpa, item);
-                        },
-                    }
-                }
-            }
-        }
+        return dumpOver(T, parseFn, matchFn, self.gpa, self, msg_type, reply_type, fixed_len, filter);
     }
 
     /// The dump engine for pre-built requests, used by the AF_BRIDGE dumps
@@ -1823,39 +1823,7 @@ pub const Socket = struct {
         request: []u8,
         reply_type: u16,
     ) DumpError![]T {
-        if (request.len < codec.header_len) return error.InvalidRequest;
-        var seq = std.mem.readInt(u32, request[8..12], native_endian);
-        var attempt: usize = 0;
-        retry: while (true) {
-            attempt += 1;
-            try self.send(request);
-            var out: std.ArrayList(T) = .empty;
-            errdefer out.deinit(self.gpa);
-            while (true) {
-                const dgram = try self.recvDatagram();
-                var it: codec.MessageIterator = .{ .buf = dgram };
-                while (it.next() catch return error.MalformedReply) |m| {
-                    switch (codec.classifyDumpMessage(m, self.portid, seq)) {
-                        .skip => {},
-                        .restart => {
-                            out.deinit(self.gpa);
-                            if (attempt >= max_dump_attempts) return error.InconsistentDump;
-                            seq = self.nextSeq();
-                            std.mem.writeInt(u32, request[8..12], seq, native_endian);
-                            continue :retry;
-                        },
-                        .done => return out.toOwnedSlice(self.gpa),
-                        .failed => |code| return errorFromCode(code),
-                        .overrun => return error.SystemResources,
-                        .malformed => return error.MalformedReply,
-                        .record => |rec| {
-                            if (rec.type != reply_type) continue;
-                            try collectFn(self.gpa, &out, rec.payload);
-                        },
-                    }
-                }
-            }
-        }
+        return dumpCollectOver(T, collectFn, self.gpa, self, request, reply_type);
     }
 
     /// Emit one dump request: nlmsghdr + a zeroed fixed family header with
@@ -1972,6 +1940,160 @@ pub const Socket = struct {
         }
     }
 };
+
+// ── reply engines (free functions over a `transport`) ───────────────────────
+//
+// `Socket` defines `recvDatagram()`, `recvDatagramStrict()`, `portId()`,
+// `captureExtAck(msg)`, `send(bytes)`, `nextSeq()` and `sendDumpRequest(…)`
+// precisely so it satisfies the shapes below; the `ScriptedTransport` fixture
+// in the tests satisfies the same shapes without a real socket, which is the
+// only way to drive the restart and message-budget paths deterministically.
+
+/// The body of `Socket.awaitAckStrict`, bounded by `max_await_messages`.
+/// `transport` must offer `recvDatagramStrict()`, `portId()` and
+/// `captureExtAck(msg)`.
+fn awaitAckOver(transport: anytype, seq: u32) StrictRequestError!void {
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_await_messages) return error.TooManyMessages;
+        const dgram = try transport.recvDatagramStrict();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            if (m.pid != transport.portId() or m.seq != seq) continue;
+            switch (m.type) {
+                codec.NLMSG_ERROR => {
+                    const code = m.errorCode() catch return error.MalformedReply;
+                    transport.captureExtAck(m);
+                    if (code == 0) return; // ACK
+                    return writeErrorFromCode(code);
+                },
+                codec.NLMSG_OVERRUN => return error.Overrun,
+                else => {}, // NOOP / echo — keep waiting for the ACK
+            }
+        }
+    }
+}
+
+/// How one pass of the multi-part reply loop ended, when it did not fail.
+const DumpPass = enum { done, restart };
+
+/// The receive half shared by `dumpOver` and `dumpCollectOver`: consume
+/// multi-part replies for `seq` until `NLMSG_DONE` (`.done`), `NLM_F_DUMP_INTR`
+/// (`.restart`), an error, or `max_dump_messages` messages
+/// (`error.TooManyMessages`). `transport` must offer `recvDatagram()` and
+/// `portId()`.
+fn collectDumpPass(
+    comptime T: type,
+    comptime Ctx: type,
+    comptime recordFn: fn (std.mem.Allocator, *std.ArrayList(T), []const u8, Ctx) DumpError!void,
+    gpa: std.mem.Allocator,
+    transport: anytype,
+    out: *std.ArrayList(T),
+    seq: u32,
+    reply_type: u16,
+    ctx: Ctx,
+) DumpError!DumpPass {
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_dump_messages) return error.TooManyMessages;
+        const dgram = try transport.recvDatagram();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            switch (codec.classifyDumpMessage(m, transport.portId(), seq)) {
+                .skip => {},
+                .restart => return .restart,
+                .done => return .done,
+                .failed => |code| return errorFromCode(code),
+                .overrun => return error.SystemResources,
+                .malformed => return error.MalformedReply,
+                .record => |rec| {
+                    if (rec.type != reply_type) continue;
+                    try recordFn(gpa, out, rec.payload, ctx);
+                },
+            }
+        }
+    }
+}
+
+/// The engine behind `Socket.dump`. `transport` must additionally offer
+/// `sendDumpRequest(msg_type, fixed_len, family)`.
+///
+/// **Ownership**: `out` is declared once, *outside* the retry loop, and the
+/// single `errdefer` is its only destructor; a restart calls
+/// `clearRetainingCapacity` rather than `deinit`. Deinit-ing on restart and
+/// then returning `error.InconsistentDump` on the next line freed the same
+/// buffer twice, because `continue :retry` does not run an errdefer but the
+/// `return` does (`std.ArrayList.deinit` leaves `self.* = undefined`, so the
+/// second free is on a garbage pointer).
+fn dumpOver(
+    comptime T: type,
+    comptime parseFn: fn ([]const u8) codec.Error!?T,
+    comptime matchFn: fn (T, Filter) bool,
+    gpa: std.mem.Allocator,
+    transport: anytype,
+    msg_type: u16,
+    reply_type: u16,
+    fixed_len: usize,
+    filter: Filter,
+) DumpError![]T {
+    const rec = struct {
+        fn record(a: std.mem.Allocator, out: *std.ArrayList(T), payload: []const u8, f: Filter) DumpError!void {
+            const parsed = parseFn(payload) catch return error.MalformedReply;
+            if (parsed) |item| if (matchFn(item, f)) try out.append(a, item);
+        }
+    }.record;
+
+    var out: std.ArrayList(T) = .empty;
+    errdefer out.deinit(gpa);
+    var attempt: usize = 0;
+    while (true) {
+        attempt += 1;
+        const seq = try transport.sendDumpRequest(msg_type, fixed_len, filter.family orelse AF.UNSPEC);
+        out.clearRetainingCapacity();
+        switch (try collectDumpPass(T, Filter, rec, gpa, transport, &out, seq, reply_type, filter)) {
+            .done => return out.toOwnedSlice(gpa),
+            .restart => if (attempt >= max_dump_attempts) return error.InconsistentDump,
+        }
+    }
+}
+
+/// The engine behind `Socket.dumpCollect`. `transport` must additionally offer
+/// `send(bytes)` and `nextSeq()`. Same ownership discipline as `dumpOver`.
+fn dumpCollectOver(
+    comptime T: type,
+    comptime collectFn: fn (std.mem.Allocator, *std.ArrayList(T), []const u8) DumpError!void,
+    gpa: std.mem.Allocator,
+    transport: anytype,
+    request: []u8,
+    reply_type: u16,
+) DumpError![]T {
+    if (request.len < codec.header_len) return error.InvalidRequest;
+    const rec = struct {
+        fn record(a: std.mem.Allocator, out: *std.ArrayList(T), payload: []const u8, _: void) DumpError!void {
+            return collectFn(a, out, payload);
+        }
+    }.record;
+
+    var seq = std.mem.readInt(u32, request[8..12], native_endian);
+    var out: std.ArrayList(T) = .empty;
+    errdefer out.deinit(gpa);
+    var attempt: usize = 0;
+    while (true) {
+        attempt += 1;
+        try transport.send(request);
+        out.clearRetainingCapacity();
+        switch (try collectDumpPass(T, void, rec, gpa, transport, &out, seq, reply_type, {})) {
+            .done => return out.toOwnedSlice(gpa),
+            .restart => {
+                if (attempt >= max_dump_attempts) return error.InconsistentDump;
+                seq = transport.nextSeq();
+                std.mem.writeInt(u32, request[8..12], seq, native_endian);
+            },
+        }
+    }
+}
 
 // ── AF_BRIDGE dump collectors (glue between `dumpCollect` and `bridge`) ─────
 
@@ -2704,6 +2826,153 @@ fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
     if (parseAddress(payload)) |_| {} else |_| {}
     if (parseRoute(payload)) |_| {} else |_| {}
     if (parseNeighbor(payload)) |_| {} else |_| {}
+}
+
+// ── reply-engine regression tests (scripted transport, no kernel) ──────────
+//
+// The defect these pin: `awaitAckStrict`, `dump` and `dumpCollect` all ran a
+// `while (true)` receive loop with **no message budget and no timeout**, so a
+// peer that answers but never sends the terminating message (`NLMSG_ERROR` on
+// the write path, `NLMSG_DONE` on the dump path) spun the caller forever. This
+// is the same defect that was bounded in the `conntrack`/`devlink`/`ethtool`/
+// `nl80211` clients, but here it is the rtnetlink engine behind links,
+// addresses, routes, neighbours and the bridge ops.
+//
+// `filler` below is what makes these tests bite: the transport returns the
+// same non-terminating datagram *forever*, so the unbounded loop is a genuine
+// hang (proven by running the suite under `timeout`), not a finite script that
+// would end in `RecvFailed` and let an unbounded loop pass.
+
+/// One 16-byte netlink message with no payload.
+fn cannedMessage(msg_type: u16, flags: u16, seq: u32, pid: u32) [codec.header_len]u8 {
+    var m: [codec.header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, m[0..4], codec.header_len, native_endian);
+    std.mem.writeInt(u16, m[4..6], msg_type, native_endian);
+    std.mem.writeInt(u16, m[6..8], flags, native_endian);
+    std.mem.writeInt(u32, m[8..12], seq, native_endian);
+    std.mem.writeInt(u32, m[12..16], pid, native_endian);
+    return m;
+}
+
+/// A transport that satisfies the shapes `awaitAckOver`, `dumpOver` and
+/// `dumpCollectOver` are written against, without a socket. Scripted
+/// datagrams are delivered in order; once they run out, `filler` is returned
+/// forever (and `null` means "the engine asked for more than the scenario
+/// scripted", surfaced as an error rather than as a hang).
+const ScriptedTransport = struct {
+    script: []const []const u8 = &.{},
+    filler: ?[]const u8 = null,
+    pos: usize = 0,
+    /// How many datagrams the engine consumed, and how many requests it sent.
+    recvs: usize = 0,
+    requests: usize = 0,
+    /// The identity the canned datagrams carry, so they match instead of
+    /// being skipped as stale.
+    pid: u32,
+    seq: u32,
+
+    fn nextSeq(self: *ScriptedTransport) u32 {
+        return self.seq;
+    }
+    fn portId(self: *const ScriptedTransport) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(_: *ScriptedTransport, _: codec.Message) void {}
+    fn send(self: *ScriptedTransport, _: []const u8) SendError!void {
+        self.requests += 1;
+    }
+    fn sendDumpRequest(self: *ScriptedTransport, _: u16, _: usize, _: u8) DumpError!u32 {
+        self.requests += 1;
+        return self.seq;
+    }
+    fn recvDatagram(self: *ScriptedTransport) RecvError![]const u8 {
+        self.recvs += 1;
+        if (self.pos < self.script.len) {
+            defer self.pos += 1;
+            return self.script[self.pos];
+        }
+        return self.filler orelse error.RecvFailed;
+    }
+    fn recvDatagramStrict(self: *ScriptedTransport) StrictRecvError![]const u8 {
+        return self.recvDatagram();
+    }
+};
+
+test "awaitAckStrict gives up instead of spinning when the ACK never arrives" {
+    // A NOOP addressed to us on our own sequence: matched, then ignored by the
+    // `else` arm, forever. Without a budget this loop never returns.
+    const noop = cannedMessage(codec.NLMSG_NOOP, 0, 42, 7);
+    var t: ScriptedTransport = .{ .filler = &noop, .pid = 7, .seq = 42 };
+    try testing.expectError(error.TooManyMessages, awaitAckOver(&t, 42));
+    try testing.expectEqual(@as(usize, max_await_messages), t.recvs);
+}
+
+test "the dump engine gives up instead of spinning when NLMSG_DONE never arrives" {
+    const noop = cannedMessage(codec.NLMSG_NOOP, codec.NLM_F_MULTI, 42, 7);
+    var t: ScriptedTransport = .{ .filler = &noop, .pid = 7, .seq = 42 };
+    try testing.expectError(error.TooManyMessages, dumpOver(
+        Link,
+        parseLink,
+        matchLink,
+        testing.allocator,
+        &t,
+        RTM_GETLINK,
+        RTM_NEWLINK,
+        ifinfomsg_len,
+        .{},
+    ));
+    try testing.expectEqual(@as(usize, max_dump_messages), t.recvs);
+    // One request, not a retry storm: the budget ends the attempt outright.
+    try testing.expectEqual(@as(usize, 1), t.requests);
+}
+
+test "the pre-built-request dump engine gives up on an endless reply stream too" {
+    const noop = cannedMessage(codec.NLMSG_NOOP, codec.NLM_F_MULTI, 42, 7);
+    var t: ScriptedTransport = .{ .filler = &noop, .pid = 7, .seq = 42 };
+    var request = cannedMessage(RTM_GETNEIGH, codec.NLM_F_REQUEST | codec.NLM_F_DUMP, 42, 0);
+    try testing.expectError(error.TooManyMessages, dumpCollectOver(
+        FdbEntry,
+        collectFdb,
+        testing.allocator,
+        &t,
+        &request,
+        RTM_NEWNEIGH,
+    ));
+    try testing.expectEqual(@as(usize, max_dump_messages), t.recvs);
+}
+
+test "an exhausted NLM_F_DUMP_INTR retry budget frees the accumulator exactly once" {
+    // One datagram carrying a usable RTM_NEWLINK record *and then* a
+    // DUMP_INTR-flagged NLMSG_DONE: the engine appends an item (so the
+    // accumulator owns a heap buffer) and is then told to restart, every
+    // attempt, until `max_dump_attempts` is spent. The old shape deinit-ed
+    // `out` in the restart arm and then returned `error.InconsistentDump` on
+    // the next line, which ran the errdefer over an already-freed,
+    // `undefined`-stamped ArrayList — a double free the testing allocator
+    // cannot survive.
+    var dgram: std.ArrayList(u8) = .empty;
+    defer dgram.deinit(testing.allocator);
+    const rec = try codec.appendHeader(testing.allocator, &dgram, RTM_NEWLINK, codec.NLM_F_MULTI, 42, 7);
+    var fixed: [ifinfomsg_len]u8 = @splat(0);
+    std.mem.writeInt(i32, fixed[4..8], 1, native_endian); // index 1, so parseLink yields a Link
+    try codec.appendPadded(testing.allocator, &dgram, &fixed);
+    codec.finishHeader(&dgram, rec);
+    const fin = try codec.appendHeader(testing.allocator, &dgram, codec.NLMSG_DONE, codec.NLM_F_DUMP_INTR, 42, 7);
+    codec.finishHeader(&dgram, fin);
+
+    var t: ScriptedTransport = .{ .filler = dgram.items, .pid = 7, .seq = 42 };
+    try testing.expectError(error.InconsistentDump, dumpOver(
+        Link,
+        parseLink,
+        matchLink,
+        testing.allocator,
+        &t,
+        RTM_GETLINK,
+        RTM_NEWLINK,
+        ifinfomsg_len,
+        .{},
+    ));
+    try testing.expectEqual(@as(usize, max_dump_attempts), t.requests);
 }
 
 // ── integration tests (real kernel; RTM_GET* dumps need no root) ────────────

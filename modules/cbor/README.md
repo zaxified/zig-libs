@@ -68,6 +68,7 @@ const EncodeError = cbor.EncodeError; // Allocator.Error
 
 fn decode(a: Allocator, bytes: []const u8, opts: cbor.DecodeOptions) DecodeError!Value;
 fn encode(a: Allocator, value: Value, opts: cbor.EncodeOptions) EncodeError![]u8;
+fn freeValue(a: Allocator, value: Value) void; // release a decoded tree without an arena
 
 // value.toI64() -> ?i64   (uint/negint as a signed int, if it fits)
 // Value.fromI64(i: i64) -> Value
@@ -83,8 +84,10 @@ fn cose.encodeSign1(a: Allocator, s: cose.Sign1) Allocator.Error![]u8;
 fn cose.sigStructure(a: Allocator, protected: []const u8, external_aad: []const u8, payload: []const u8) Allocator.Error![]u8;
 ```
 
-Everything `decode` returns is allocated via the `allocator` you pass (arena-friendly) — the input
-`bytes` need not outlive the call. `cose.parseKey`/`parseSign1` don't allocate at all; their
+Everything `decode` returns is allocated via the `allocator` you pass (arena-friendly, not
+arena-required) — the input `bytes` need not outlive the call. Release the tree with
+`freeValue(allocator, value)`, or by freeing the arena if that is what you passed; on an error
+return there is nothing to release, `decode` unwinds its own partial tree. `cose.parseKey`/`parseSign1` don't allocate at all; their
 returned slices borrow the `Value` tree you already decoded.
 
 ## Verify
