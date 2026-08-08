@@ -143,7 +143,14 @@ editions):
   signature field.
 - The authentication value's field order: version, TimeOfCurrentKey (4 octets),
   TimeToNextKey (2 octets), initialisation vector, Key ID (4 octets), MAC value
-  (8–32 octets).
+  (8–32 octets). ⚠ **This order is NOT inherited from 61850-90-5 and must not be
+  read as if it were** (checked 2026-08-08 against Wireshark 4.6.4's `rgoose`
+  dissector source, which is the closest independently-implemented relative):
+  90-5's session PDU runs TimeOfCurrentKey, TimeToNextKey, **Key ID, then an
+  explicit IV-length octet and the IV**, and carries a two-octet version in the
+  outer session header rather than one octet inside the security block. So the
+  bullet above shares only the `0x85` tag with 90-5; the order itself rests on
+  this module's own reading and is exactly what finding F4 says is unanchored.
 - IEC TS 62351-6:2007 used SHA-256 + RSASSA-PSS (RFC 3447), and the 2020 IS
   replaced it with symmetric MACs because signatures cannot meet IEC 61850-5's
   3 ms transfer-time class.
