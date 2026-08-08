@@ -255,6 +255,19 @@ pub const Socket = struct {
         return dumpOver(self.nl.gpa, self, family);
     }
 
+    /// Streaming counterpart to `dump` (F4): calls `visit(ctx, &flow)` once
+    /// per flow instead of materializing the whole table. See `dumpEachOver`
+    /// for the full contract, in particular how an `NLM_F_DUMP_INTR` restart
+    /// is handled differently from `dump`'s transparent retry.
+    pub fn dumpEach(
+        self: *Socket,
+        family: Family,
+        ctx: ?*anyopaque,
+        visit: *const fn (ctx: ?*anyopaque, flow: *const Flow) anyerror!void,
+    ) anyerror!void {
+        return dumpEachOver(self, family, ctx, visit);
+    }
+
     // ── transport hooks the dump engine needs (see `dumpOver`) ─────────────
 
     /// The kernel-assigned port id replies are matched against.
@@ -480,6 +493,59 @@ fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpErro
     }
 }
 
+/// A streaming counterpart to `dumpOver`/`dump` (F4): calls `visit` once per
+/// decoded flow, in kernel wire order, instead of collecting into a growing
+/// `ArrayList`. Constant memory regardless of table size — the whole point,
+/// since a busy firewall's table is `@sizeOf(Flow)` (256 B) times 10⁵-10⁶
+/// entries, 25-250 MB before the caller sees a single one via `dump`. `flow`
+/// is a stack value valid only for the duration of one `visit` call; copy out
+/// whatever the caller needs to keep.
+///
+/// **Does not retry `NLM_F_DUMP_INTR` the way `dumpOver` does.** `dumpOver`
+/// can silently restart because nothing has left the function yet — the
+/// collected `ArrayList` is simply cleared. Here `visit` has already been
+/// called for however many flows arrived before the restart, and there is no
+/// way to un-call it, so a restart is surfaced immediately as
+/// `error.InconsistentDump` rather than replayed underneath the caller. This
+/// is not a workaround: it is what `libnetfilter_conntrack`'s own
+/// callback-based `nfct_query(NFCT_Q_DUMP)` does under the identical
+/// constraint — once a callback has fired, retry-after-interrupt is the
+/// caller's decision (re-call `dumpEach`), not something the dump engine can
+/// paper over.
+fn dumpEachOver(
+    transport: anytype,
+    family: Family,
+    ctx: ?*anyopaque,
+    visit: *const fn (ctx: ?*anyopaque, flow: *const Flow) anyerror!void,
+) anyerror!void {
+    const seq = transport.nextSeq();
+    const req = wire.buildDumpRequest(seq, family);
+    try transport.send(&req);
+
+    while (true) {
+        const dgram = try transport.recvDatagram();
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            switch (netlink.classifyDumpMessage(m, transport.portId(), seq)) {
+                .skip => {},
+                .restart => return error.InconsistentDump,
+                .done => return,
+                .failed => |code| {
+                    transport.captureExtAck(m);
+                    return netlink.errorFromCode(code);
+                },
+                .overrun => return error.Overrun,
+                .malformed => return error.MalformedReply,
+                .record => |rec| {
+                    if (rec.type != wire.msg_ct_new) continue;
+                    const f = wire.decodeFlow(rec.payload) catch return error.MalformedReply;
+                    try visit(ctx, &f);
+                },
+            }
+        }
+    }
+}
+
 /// Walks one received datagram, yielding every conntrack event in it. Pure: it
 /// never blocks and never touches a socket, so a caller with its own event loop
 /// can feed it bytes from anywhere (a test fixture, a replayed capture).
@@ -698,6 +764,76 @@ test "dump engine: an exhausted DUMP_INTR budget errors without freeing twice" {
     try testing.expectEqual(@as(usize, max_dump_attempts), t.requests);
     // The whole script was consumed: the budget is 4 attempts, not 3 or 5.
     try testing.expectEqual(t.script.len, t.pos);
+}
+
+/// A `dumpEach` visitor that counts calls and records the delivered flows.
+const CollectingVisitor = struct {
+    flows: std.ArrayList(Flow) = .empty,
+    calls: usize = 0,
+
+    fn visit(ctx: ?*anyopaque, flow: *const Flow) anyerror!void {
+        const self: *CollectingVisitor = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        try self.flows.append(testing.allocator, flow.*);
+    }
+
+    fn deinit(self: *CollectingVisitor) void {
+        self.flows.deinit(testing.allocator);
+    }
+};
+
+test "F4: dumpEach (streaming) delivers the same flows as dump (collecting), one call per flow" {
+    const id = goldenDumpIdentity();
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    var t: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, &done },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    var v: CollectingVisitor = .{};
+    defer v.deinit();
+    try dumpEachOver(&t, .unspec, &v, CollectingVisitor.visit);
+
+    try testing.expectEqual(@as(usize, 3), v.calls);
+    try testing.expectEqual(@as(usize, 3), v.flows.items.len);
+    try testing.expectEqual(@as(usize, 1), t.requests);
+
+    // Cross-check against the materializing `dump` engine over an identical
+    // script: same flows, same order.
+    var t2: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, &done },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    const flows = try dumpOver(testing.allocator, &t2, .unspec);
+    defer testing.allocator.free(flows);
+    try testing.expectEqual(flows.len, v.flows.items.len);
+    for (flows, v.flows.items) |a, b| {
+        try testing.expect(std.meta.eql(a.orig, b.orig));
+    }
+}
+
+test "F4: dumpEach surfaces NLM_F_DUMP_INTR as an error instead of silently retrying" {
+    // Unlike `dumpOver`, `dumpEach` cannot discard what it already delivered
+    // to the visitor, so a restart must be reported, not swallowed.
+    const id = goldenDumpIdentity();
+    const intr = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR);
+    var t: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, &intr },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    var v: CollectingVisitor = .{};
+    defer v.deinit();
+    try testing.expectError(
+        error.InconsistentDump,
+        dumpEachOver(&t, .unspec, &v, CollectingVisitor.visit),
+    );
+    // The three flows before the restart WERE delivered (that's exactly why
+    // this can't be silently retried like `dumpOver`) — and only one request
+    // was sent, confirming there was no transparent retry attempt.
+    try testing.expectEqual(@as(usize, 3), v.calls);
+    try testing.expectEqual(@as(usize, 1), t.requests);
 }
 
 test "dump engine: a kernel error reply is mapped and stops the dump" {

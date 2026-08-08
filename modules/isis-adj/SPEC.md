@@ -174,9 +174,14 @@ printed output are pinned in `root.zig`'s golden tests and `three_way.zig`'s
 11-octet golden. This covers the state byte (Up/Initializing/Down) and the
 5-/11-/15-octet TLV 240 shapes, all three exercised through this module's own
 code paths, not hand-derived. NOT externally covered: the 1-octet (state-only)
-form, since `helloFields()` never emits it (this module always advertises at
-least its own extended-local-circuit-id) — its behavior rests on Wireshark's
-own `case 1` in `packet-isis-hello.c`, read but not independently re-run here.
+form via this module's own encoder — `helloFields()` never emits it (this
+module always advertises at least its own extended-local-circuit-id), so
+there is nothing of our own construction to hand to Wireshark for that shape.
+Stale as of the wave-2 audit (F5): the 1-octet form HAS since been
+independently re-run, the other direction — a bare length-1 TLV 240 was fed
+to both Wireshark's dissector and this module's own `decode`, and the two
+independent readings agree (`three_way.zig`'s golden for the shape, with the
+`scripts/dissect.py` command and Wireshark's printed output quoted inline).
 The P2P Hello *header* framing (length-indicator, PDU length, circuit-type
 bits, holding-time, local-circuit-id) is the sibling `isis` codec's own
 already-anchored surface (see `modules/isis/ANCHOR-TASKS.tsv` row) — that part

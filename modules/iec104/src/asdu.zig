@@ -677,8 +677,8 @@ pub fn decodeElement(kind: ElementKind, bytes: []const u8) Error!Element {
         .normalized_no_quality => .{ .normalized_no_quality = .{ .raw = info.readI16(bytes[0..2]) } },
         .counter => .{ .counter = info.Bcr.decode(bytes[0..5]) },
         .packed_single => .{ .packed_single = .{
-            .status = @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8),
-            .changed = @as(u16, bytes[2]) | (@as(u16, bytes[3]) << 8),
+            .status = info.readU16(bytes[0..2]),
+            .changed = info.readU16(bytes[2..4]),
             .quality = info.Quality.fromByte(bytes[4]),
         } },
         .sco => .{ .sco = info.Sco.fromByte(bytes[0]) },
@@ -692,7 +692,7 @@ pub fn decodeElement(kind: ElementKind, bytes: []const u8) Error!Element {
         .qcc => .{ .qcc = info.Qcc.fromByte(bytes[0]) },
         .qrp => .{ .qrp = @enumFromInt(bytes[0]) },
         .coi => .{ .coi = info.Coi.fromByte(bytes[0]) },
-        .fbp => .{ .fbp = @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8) },
+        .fbp => .{ .fbp = info.readU16(bytes[0..2]) },
         .parameter => .{ .parameter = .{ .raw = .{ bytes[0], bytes[1] }, .qpm = bytes[2] } },
     };
 }
@@ -728,10 +728,8 @@ pub fn encodeElement(element: Element, out: []u8) Error!usize {
         .normalized_no_quality => |v| info.writeI16(out[0..2], v.raw),
         .counter => |v| _ = v.encode(out[0..5]),
         .packed_single => |v| {
-            out[0] = @truncate(v.status);
-            out[1] = @truncate(v.status >> 8);
-            out[2] = @truncate(v.changed);
-            out[3] = @truncate(v.changed >> 8);
+            info.writeU16(out[0..2], v.status);
+            info.writeU16(out[2..4], v.changed);
             out[4] = v.quality.toByte();
         },
         .sco => |v| out[0] = v.toByte(),
@@ -754,10 +752,7 @@ pub fn encodeElement(element: Element, out: []u8) Error!usize {
         .qcc => |v| out[0] = v.toByte(),
         .qrp => |v| out[0] = @intFromEnum(v),
         .coi => |v| out[0] = v.toByte(),
-        .fbp => |v| {
-            out[0] = @truncate(v);
-            out[1] = @truncate(v >> 8);
-        },
+        .fbp => |v| info.writeU16(out[0..2], v),
         .parameter => |v| {
             out[0] = v.raw[0];
             out[1] = v.raw[1];
@@ -1163,6 +1158,40 @@ test "every modelled type round-trips element bytes" {
         try testing.expectEqual(s.e, o.element);
         try testing.expectEqual(t56, o.time.cp56Time().?);
     }
+}
+
+// W2-A2/iec104-F2: every case in "every modelled type round-trips element
+// bytes" above only ever calls `decode(encode(x))` and compares against `x`
+// — which cannot distinguish a *correct* implementation from one where
+// `encodeElement` and `decodeElement` apply the same consistent, wrong
+// transformation to a multi-byte field (the audit's demonstrated PoC: an
+// endianness swap of `.packed_single.changed` applied identically on both
+// sides survives the whole suite, exit 0, byte-identical). `status` and
+// `changed` are asymmetric here specifically so a byte swap changes the
+// literal wire bytes. Also covers `.fbp` (C_TS_NA_1/C_TS_TA_1), the other
+// element that hand-rolled this exact 16-bit LE pack before this fix routed
+// both through the independently-tested `info.readU16`/`writeU16`
+// (see "scalar helpers are little-endian" in info.zig).
+test "packed_single and fbp encode/decode against literal wire bytes, not just each other" {
+    var buf: [8]u8 = undefined;
+    const e: Element = .{ .packed_single = .{ .status = 0x1234, .changed = 0x5678, .quality = .{ .iv = true } } };
+    const n = try encodeElement(e, &buf);
+    try testing.expectEqual(@as(usize, 5), n);
+    // status 0x1234 LE -> 34 12; changed 0x5678 LE -> 78 56; quality IV -> 0x80.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x34, 0x12, 0x78, 0x56, 0x80 }, buf[0..n]);
+    const dec = try decodeElement(.packed_single, buf[0..n]);
+    try testing.expectEqual(e, dec);
+
+    // Independently: decoding the literal bytes directly (not the ones just
+    // produced by our own encoder) must give the same fields.
+    const dec2 = try decodeElement(.packed_single, &[_]u8{ 0x34, 0x12, 0x78, 0x56, 0x80 });
+    try testing.expectEqual(e, dec2);
+
+    const f: Element = .{ .fbp = 0x1234 };
+    const nf = try encodeElement(f, &buf);
+    try testing.expectEqual(@as(usize, 2), nf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x34, 0x12 }, buf[0..nf]);
+    try testing.expectEqual(f, try decodeElement(.fbp, &[_]u8{ 0x34, 0x12 }));
 }
 
 test "the parameter-loading types (P_ME/P_AC) round-trip too" {

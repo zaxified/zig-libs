@@ -81,6 +81,12 @@ pub const Connection = struct {
         /// The complete text message (or the close reason) is not valid
         /// UTF-8 (§5.6/§5.5.1). Close 1007.
         InvalidUtf8,
+        /// W2-A8/websocket-F3: a data frame (text/binary/continuation)
+        /// arrived after a close frame was already received. RFC 6455 §1.4:
+        /// "after receiving a control frame indicating the connection
+        /// should be closed, a peer discards any further data received."
+        /// Close 1002.
+        DataAfterClose,
     };
 
     /// Feed the next available bytes. Consumes at most one frame per call
@@ -104,6 +110,15 @@ pub const Connection = struct {
                 else => unreachable,
             };
         }
+
+        // W2-A8/websocket-F3: `close_received` existed but `receive` never
+        // consulted it — a data frame arriving after the peer's close frame
+        // was silently delivered as an ordinary message. RFC 6455 §1.4
+        // requires discarding it instead. Checked once, after control-frame
+        // dispatch (a peer's own close/ping/pong in response is unaffected)
+        // and before the fragmentation-state machine runs, so a stray data
+        // frame post-close can never start or continue a reassembly.
+        if (self.close_received) return error.DataAfterClose;
 
         switch (parsed.opcode) {
             .continuation => {
@@ -328,6 +343,39 @@ test "close frame surfaces code + reason and updates close_received" {
     try testing.expect(!conn.bothClosed());
     conn.close_sent = true;
     try testing.expect(conn.bothClosed());
+}
+
+// W2-A8/websocket-F2: `decodeCloseBody` now validates the close code against
+// RFC 6455 §7.4.1 (see `frame.zig`'s `isValidCloseCode`) — check the error
+// actually surfaces through `Connection.receive`, not just `frame` directly,
+// and that it maps to close code 1002 like every other protocol error.
+test "a close frame carrying an RFC-illegal code fails through Connection.receive, close 1002" {
+    var scratch: [16]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+    var wire = [_]u8{ 0x88, 0x02, 0x03, 0xed }; // close, code 1005 — "MUST NOT be set"
+    try testing.expectError(error.InvalidCloseCode, conn.receive(&wire));
+    try testing.expectEqual(@as(u16, 1002), frame.closeCode(error.InvalidCloseCode));
+}
+
+// W2-A8/websocket-F3: `close_received` was tracked but never consulted by
+// `receive` — a text/binary/continuation frame arriving after the peer's
+// close frame was delivered as an ordinary message instead of being
+// discarded per RFC 6455 §1.4.
+test "a data frame after close_received is rejected, not delivered (close 1002)" {
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+
+    var close_wire = [_]u8{ 0x88, 0x00 }; // close, no code/reason
+    const r1 = try conn.receive(&close_wire);
+    try testing.expect(r1.event == .close);
+    try testing.expect(conn.close_received);
+
+    var text_wire = unmaskedFrame(0x81, "hi", 4);
+    try testing.expectError(error.DataAfterClose, conn.receive(&text_wire));
+    try testing.expectEqual(@as(u16, 1002), frame.closeCode(error.DataAfterClose));
+
+    var cont_wire = unmaskedFrame(0x80, "hi", 4);
+    try testing.expectError(error.DataAfterClose, conn.receive(&cont_wire));
 }
 
 test "unmasked client frame is rejected through the Connection too (close 1002)" {

@@ -142,6 +142,20 @@ pub const Server = struct {
     contexts: presentation.ContextTable = .{},
     associated: bool = false,
     transport_up: bool = false,
+    /// W2-A8/iec61850-F6: COTP class-0 reassembly for an inbound *segmented*
+    /// request — mirrors `client.zig`'s identical `reasm`/`reasm_len` pair.
+    /// Before this existed, `handle` discarded the `eot` bit and fed every
+    /// `DT` TPDU straight to `handleSpdu` regardless of segmentation, so a
+    /// peer that split a large request (e.g. a multi-member `Write`) across
+    /// several TPDUs — which `cotp.Reassembler` exists for and `client.zig`
+    /// already uses on the request-building side — got a decode error on
+    /// every non-terminal fragment instead of being served. Fail-closed
+    /// (each fragment used to fail as a typed decode error, never silently
+    /// misparsed as its own SPDU), but an undocumented interop gap: SPEC's
+    /// "Deferred" list only ever declared the *outbound* non-splitting limit.
+    reasm_buf: [max_report_len]u8 = undefined,
+    /// Octets held by a partially reassembled inbound COTP sequence.
+    reasm_len: usize = 0,
     /// The presentation context the association settled on, remembered so an
     /// **unsolicited** PDU can be wrapped without a request to copy it from.
     mms_context: u16 = presentation.context_mms,
@@ -222,7 +236,16 @@ pub const Server = struct {
                 self.transport_up = false;
                 return null;
             },
-            .dt => |dt| return self.handleSpdu(dt.payload, out),
+            .dt => |dt| {
+                var r = cotp.Reassembler.init(&self.reasm_buf);
+                r.len = self.reasm_len;
+                const spdu = (try r.push(dt)) orelse {
+                    self.reasm_len = r.len;
+                    return null;
+                };
+                self.reasm_len = r.len;
+                return self.handleSpdu(spdu, out);
+            },
             else => return error.Unsupported,
         }
     }
@@ -1341,6 +1364,13 @@ const Paired = struct {
     queue_len: usize = 0,
     queue_pos: usize = 0,
     failures: usize = 0,
+    /// A copy of the most recent full TPKT frame the client wrote — lets a
+    /// test capture a genuine, correctly-negotiated request frame and then
+    /// replay it (e.g. split across two segments) directly against `server`
+    /// without hand-building session/presentation/MMS bytes from scratch.
+    /// Purely an observation seam; does not change `writeFn`'s behaviour.
+    last_write: [4096]u8 = undefined,
+    last_write_len: usize = 0,
 
     fn seam(self: *Paired) transport.Transport {
         return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
@@ -1360,6 +1390,9 @@ const Paired = struct {
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) transport.TransportError!void {
         const self: *Paired = @ptrCast(@alignCast(ctx));
+        const cap = @min(bytes.len, self.last_write.len);
+        @memcpy(self.last_write[0..cap], bytes[0..cap]);
+        self.last_write_len = cap;
         const reply = self.server.handle(bytes, &self.out) catch {
             self.failures += 1;
             return;
@@ -1464,6 +1497,62 @@ test "round trip: our client against our server over an in-memory wire" {
     try testing.expect(!srv.associated);
     try testing.expectEqual(@as(usize, 0), paired.failures);
     try testing.expect(srv.reads > 0 and srv.writes > 0 and srv.name_lists > 0);
+}
+
+// W2-A8/iec61850-F6: before this fix, `handle` fed every inbound `DT` TPDU
+// straight to `handleSpdu` regardless of the `eot` bit, so a peer that
+// segments a request across several COTP TPDUs (which `cotp.Reassembler`
+// exists for, and `client.zig` already uses on its own receive side) got a
+// decode error on the first non-terminal fragment instead of being served.
+// `client.zig` never splits a request by design (SPEC "Deferred"), so this
+// captures one genuine client-built request, replays it split in two, and
+// checks the server serves it only once both fragments have arrived.
+test "handle reassembles a request segmented across two COTP DT TPDUs" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    try testing.expect(srv.associated);
+
+    // A genuine, correctly-negotiated read request, captured as the client
+    // built and sent it (one DT TPDU, eot = true).
+    try testing.expectEqual(true, try (try c.readObject("TESTLD/GGIO1.Ind2.stVal", .ST)).boolean());
+    const reads_before = srv.reads;
+    const captured = paired.last_write[0..paired.last_write_len];
+
+    const pkt = try tpkt.decode(captured);
+    const dt = switch (try cotp.decode(pkt.payload)) {
+        .dt => |d| d,
+        else => unreachable,
+    };
+    try testing.expect(dt.eot);
+    try testing.expect(dt.payload.len >= 2); // enough to split into two non-empty halves
+
+    const mid = dt.payload.len / 2;
+    var seg1_buf: [512]u8 = undefined;
+    var seg2_buf: [512]u8 = undefined;
+    var frame1_buf: [640]u8 = undefined;
+    var frame2_buf: [640]u8 = undefined;
+    const seg1 = try cotp.encodeData(dt.payload[0..mid], false, &seg1_buf);
+    const seg2 = try cotp.encodeData(dt.payload[mid..], true, &seg2_buf);
+    const frame1 = try tpkt.encode(seg1, &frame1_buf);
+    const frame2 = try tpkt.encode(seg2, &frame2_buf);
+
+    // The non-terminal fragment alone: buffered, no reply, not yet served.
+    var out1: [4096]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), try srv.handle(frame1, &out1));
+    try testing.expectEqual(reads_before, srv.reads);
+
+    // The terminal fragment completes reassembly: served exactly once, and a
+    // real reply comes back.
+    var out2: [4096]u8 = undefined;
+    const reply = try srv.handle(frame2, &out2);
+    try testing.expect(reply != null);
+    try testing.expectEqual(reads_before + 1, srv.reads);
+    try testing.expectEqual(@as(usize, 0), srv.reasm_len); // reassembly state reset
 }
 
 test "the server refuses an association with the wrong application context" {

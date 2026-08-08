@@ -3,11 +3,16 @@
 //! Golden IS-IS PDUs — byte-for-byte anchors for the wire format.
 //!
 //! Provenance: **hand-assembled field-by-field from ISO/IEC 10589 and RFC 6329**
-//! (no live capture was available in this environment). Each golden is annotated
-//! below against the spec field layout; every offset and every big-endian
-//! multi-byte field is pinned. The tests prove three directions: the builders
-//! reproduce the golden bytes exactly (encode is correct), the decoders recover
-//! every field from the golden (decode is correct), and the two agree
+//! — golden 1 and golden 2 below were originally written up as unanchored
+//! (no live capture was available in that environment). That is stale (F5,
+//! wave-2 audit): `sharkd` is on this host, and both dissect cleanly through
+//! Wireshark 4.6.4's real IS-IS dissector, exactly like goldens 3+ below —
+//! see each golden's own "External anchor" note for the command and the
+//! field-level agreement. Each golden is annotated below against the spec
+//! field layout too; every offset and every big-endian multi-byte field is
+//! pinned. The tests prove three directions: the builders reproduce the
+//! golden bytes exactly (encode is correct), the decoders recover every
+//! field from the golden (decode is correct), and the two agree
 //! (round-trip). The Length-Indicator and PDU-Length values are the canonical
 //! ISO 10589 constants (P2P IIH header = 20, LSP header = 27), an independent
 //! cross-check on the hand assembly.
@@ -33,6 +38,16 @@ const testing = std.testing;
 //   81 01 cc                  TLV #129 Protocols Supported: NLPID 0xCC (IPv4)
 //   01 04 03 49 00 01         TLV #1 Area Addresses: area 49.00.01
 //   06 06 00 1b 21 3c 9d f8   TLV #6 IS Neighbours (IIH): one SNPA
+//
+// External anchor (F5, wave-2 audit): re-dissected with `scripts/dissect.py
+// --frame llc --fields` against Wireshark 4.6.4's real IS-IS dissector, not
+// merely re-transcribed. `frame.protocols == "eth:llc:osi:isis:isis.hello"`
+// — the real Hello sub-dissector, never a generic `data` fallback — with
+// `isis.type == 17` (P2P HELLO), `isis.hello.circuit_type == 0x03`,
+// `isis.hello.source_id == 0000.0000.0001`, `isis.hello.holding_timer == 30`,
+// `isis.hello.pdu_length == 37`, `isis.hello.local_circuit_id == 1`, the
+// Protocols-Supported CLV (`t=129,l=1`, NLPID 0xcc) all agreeing field-for-
+// field with the spec-derived layout above.
 const golden_p2p_iih = [_]u8{
     0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03,
     0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
@@ -96,6 +111,17 @@ test "golden P2P IIH: decode recovers every field" {
 //       00 00 00 11 22 33         B-MAC
 //       00 10                     Res(4) | Base VID(12) = 16
 //       c0 00 00 64               I-SID entry: T=1,R=1, I-SID 100
+//
+// External anchor (F5, wave-2 audit): re-dissected with `scripts/dissect.py
+// --frame llc --fields` against Wireshark 4.6.4. `frame.protocols ==
+// "eth:llc:osi:isis:isis.lsp"` — the real LSP sub-dissector — with
+// `isis.type == 18` (L1 LSP), `isis.lsp.lsp_id == 0000.0000.0001.00-00`,
+// `isis.lsp.sequence_number == 0x00000001`, `isis.lsp.is_type == 1`, the
+// Area-Address/Protocols-Supported/Dynamic-Hostname CLVs, and — the sub-TLV
+// no other golden in this file covers — the full SPBM-SI decode:
+// `isis.lsp.mt_cap_spbm_service_identifier.{b_mac == 00:00:00:11:22:33,
+// base_vid == 0x0010, t == True, r == True, i_sid == 0x000064}`, all
+// agreeing with the layout above.
 const golden_l1_lsp = [_]u8{
     0x83, 0x1b, 0x01, 0x06, 0x12, 0x01, 0x00, 0x03,
     0x00, 0x3c, 0x04, 0xb0, 0x00, 0x00, 0x00, 0x00,
@@ -198,19 +224,22 @@ test "raw escape hatch: an unmodeled TLV type round-trips verbatim" {
 
 // ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) ────────
 //
-// The two goldens above were hand-assembled from the spec text — an anchor
-// whose authority comes from the same head that wrote the encoder is not an
-// external anchor (see BACKLOG task notes). The vectors below were instead
-// **produced by our own builders**, fed through `scripts/dissect.py`, which
-// runs Wireshark 4.6.4's real IS-IS dissector (sharkd, offline, no network),
-// and pinned to what Wireshark actually printed. This closes the remaining
-// PDU types / TLVs that golden 1/2 above did not cover: LAN Hello, CSNP, PSNP,
-// old-style IS Neighbours (#2), Extended IS Reachability (#22) with a
-// sub-TLV, the SPB Instance sub-TLV (1), and the MT-Port-Capability (143)
-// container. The `dissect.py` run happened once, interactively, while writing
-// these tests; the frozen byte arrays plus the quoted Wireshark output below
-// are what makes the anchor re-checkable without re-running the tool — the
-// test gate itself never invokes Wireshark/sharkd/text2pcap.
+// Goldens 1 and 2 above were originally hand-assembled from the spec text
+// only — an anchor whose authority comes from the same head that wrote the
+// encoder is not an external anchor — and have SINCE been independently
+// re-dissected too (see each golden's own "External anchor" note, F5 of the
+// wave-2 audit); that closed the gap for those two PDU types. The vectors
+// below were instead **produced by our own builders**, fed through
+// `scripts/dissect.py`, which runs Wireshark 4.6.4's real IS-IS dissector
+// (sharkd, offline, no network), and pinned to what Wireshark actually
+// printed from the start. This closes the remaining PDU types / TLVs that
+// golden 1/2 above did not cover: LAN Hello, CSNP, PSNP, old-style IS
+// Neighbours (#2), Extended IS Reachability (#22) with a sub-TLV, the SPB
+// Instance sub-TLV (1), and the MT-Port-Capability (143) container. The
+// `dissect.py` run happened once, interactively, while writing these tests;
+// the frozen byte arrays plus the quoted Wireshark output below are what
+// makes the anchor re-checkable without re-running the tool — the test gate
+// itself never invokes Wireshark/sharkd/text2pcap.
 
 // ── Golden 3: L1 LAN Hello (PDU type 15) with Area/Protocols/IS-Neighbours ───
 //
@@ -708,4 +737,3 @@ test "golden L2 PSNP (Wireshark-anchored): decode recovers the L2 type code and 
     const e = (try ei.next()).?;
     try testing.expectEqual(@as(u32, 5), e.sequence_number);
 }
-

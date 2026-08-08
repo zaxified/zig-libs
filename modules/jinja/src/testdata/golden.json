@@ -179,6 +179,18 @@
    "out": "abcdefghijabcde&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]",
    "status": "ok"
   },
+  "escape_capitalize_title_center_truncate_plain_input": {
+   "out": "&lt;b&gt;x&lt;/b&gt;|&lt;B&gt;x&lt;/b&gt;|  &lt;b&gt;x&lt;/b&gt;  |&lt;b&gt;x&lt;/b&gt;",
+   "status": "ok"
+  },
+  "escape_capitalize_title_center_truncate_preserve_markup": {
+   "out": "<b>x</b>|&lt;B&gt;x&lt;/b&gt;|  <b>x</b>  |<b>x</b>",
+   "status": "ok"
+  },
+  "escape_chars_iteration_loses_markup_per_character": {
+   "out": "&lt;|>|&lt;b|&lt;b&gt;x&lt;/b&gt;",
+   "status": "ok"
+  },
   "escape_filter_when_off": {
    "out": "&lt;b&gt;",
    "status": "ok"
@@ -263,6 +275,10 @@
    "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q",
    "status": "ok"
   },
+  "escape_reverse_preserves_markup_of_whole_result": {
+   "out": ">ba<",
+   "status": "ok"
+  },
   "escape_safe_then_escape_is_noop": {
    "out": "<b>",
    "status": "ok"
@@ -271,12 +287,20 @@
    "out": "&lt;b&gt;",
    "status": "ok"
   },
+  "escape_split_preserves_markup_per_part": {
+   "out": "<a>|<a>|</a>\n<b>|<a>x</a>|<b>",
+   "status": "ok"
+  },
   "escape_tojson_is_safe": {
    "out": "{\"k\": \"\\u003cv\\u003e\"}",
    "status": "ok"
   },
   "escape_trim_chars_argument_is_not_spliced": {
    "out": "b>x</b|b&gt;x&lt;/b|b>x</b>|b>x</b>",
+   "status": "ok"
+  },
+  "escape_truncate_end_argument_matrix": {
+   "out": "<&lt;i&gt;|&lt;&lt;i&gt;|<<i>",
    "status": "ok"
   },
   "escape_upper_preserves_markup": {
@@ -515,6 +539,10 @@
   },
   "filter_sum": {
    "out": "6|3|0",
+   "status": "ok"
+  },
+  "filter_title_word_boundary_set": {
+   "out": "A/b C-D(E|Eth0.100:tag|It's Ok",
    "status": "ok"
   },
   "filter_tojson_escapes": {

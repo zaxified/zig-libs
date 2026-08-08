@@ -87,6 +87,18 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   reason (same error) is rejected; binary messages are never validated.
 - **Fragmentation sequencing:** a continuation frame with no message in progress, or a new
   text/binary frame while one is already in progress, is `error.InvalidFragmentation` (close 1002).
+- **Close-code validation (RFC 6455 §7.4.1):** a close frame's status code is checked against the
+  ranges the RFC actually permits on the wire — `1000-1003`, `1007-1011`, `3000-4999` — before its
+  reason is even read. Codes `0-999` (unused), `1004`/`1005`/`1006`/`1015` (each specified "MUST NOT
+  be set as a status code in a Close frame by an endpoint" — they name conditions with no
+  corresponding close frame, not values a peer may legitimately send) and the unassigned
+  `1012-2999`/`5000+` ranges are `error.InvalidCloseCode` (close 1002). This is Autobahn|Testsuite's
+  7.9.x class.
+- **Data frames after `close_received`:** RFC 6455 §1.4 — "after receiving a control frame
+  indicating the connection should be closed, a peer discards any further data received." A
+  text/binary/continuation frame arriving once `Connection.close_received` is set is
+  `error.DataAfterClose` (close 1002) rather than being reassembled or delivered as a message; the
+  peer's own close/ping/pong frames are unaffected.
 - **Every error maps to an RFC close code** via `frame.closeCode(err: anyerror) u16` (1002/1007/
   1009 per the table above; everything else defaults to 1002) so the caller doesn't need its own
   mapping switch to build the failing close frame.

@@ -17,8 +17,8 @@ changing kvtree or its durability guarantees.
 
 `PageCache` **wraps one inner `Storage` and itself implements the exact same
 `Storage` vtable** kvtree drives (`open`, `size`, `pread`, `writeAll`, `sync`,
-`truncate`, `close`, `rename`, `delete`, `syncDir`). So it composes by
-substitution:
+`truncate`, `close`, `rename`, `delete`, `syncDir`, `tryLockExclusive`). So it
+composes by substitution:
 
 ```zig
 var fs = kvtree.FsStorage.init(io, dir);
@@ -135,6 +135,54 @@ place); an absent page is always refetched from the authoritative inner store.
    keys).
 5. **Pass-through** — sub-page / unaligned reads bypass the cache and return
    exact inner bytes without registering as page hits/misses.
+
+## Copy cost vs. a borrowing seam (design note, wave-2 audit F3)
+
+A hit today copies a whole page once (`@memcpy(buf, cached)` into the caller's
+buffer); a miss copies it **twice** (`inner.pread` into `buf`, then
+`ramcache.put` dupes `buf` into cache storage, which itself allocates and
+frees a `page_size` buffer per fill). LMDB's mmap'd pages are the zero-copy
+alternative: the caller gets a pointer straight into the resident page, 0
+copies, 0 allocations.
+
+That is inherent to the current `pread(buf)` shape of the `Storage` seam, not
+a local inefficiency — `Storage.pread(h, buf, off) !usize` hands the *caller*
+an already-allocated destination, so `PageCache` cannot answer with "here is
+my copy" instead. Removing the copy needs a **different seam**, not a local
+optimisation:
+
+- Add a borrowing pair to `Storage` — e.g. `preadRef(h, off) !PinnedPage` /
+  `unpin(PinnedPage)` — that a cache-aware backend can implement by handing
+  back a pointer into resident storage (mmap for a real file, the cache slot
+  itself for `PageCache`), falling back to `pread`-into-an-owned-buffer for
+  backends with nothing to borrow from (e.g. plain `FsStorage` without mmap).
+  The pin must have a bounded lifetime the caller signals explicitly
+  (`unpin`), since the byte range it points at is not caller-owned the way a
+  `pread` buffer is.
+  - Any pin held across a `writeAll`/`truncate`/`close` on the same page turns
+    write-through's in-place `ramcache.put` (`vWriteAll`) or the coarse
+    `clear()` guards (F2) into a use-after-free/UAF-into-stale-bytes hazard —
+    the pin holder would need to either block the mutation or be invalidated
+    itself, and "invalidated while pinned" has no answer in the current
+    write-through model.
+  - `kvtree`'s own pager would need a second, borrowing call path alongside
+    its current `pread`-into-scratch one — a page-cache B-tree normally reads
+    a page once per descent and holds it only for the duration of that visit,
+    so the pin lifetime maps naturally to "duration of one page visit", but
+    that is a `kvtree` change, not a `pagecache` one.
+  - Every other `Storage` implementor (`FsStorage`, `SimStorage`, and any
+    future backend) would need to grow the new vtable method (even if only as
+    a `pread`-and-copy fallback), which is the "changes the seam every
+    backend implements" cost the module's own to-do #3 flags as needing a
+    design decision before it is actionable.
+
+**Verdict of this note:** real, not urgent — no measured consumer is
+bottlenecked on the extra copy today (the O(1)-victim-selection fix, F1/
+`a1d7229`, was the one that mattered at the measured page counts). Scope a
+`preadRef`/`pin`/`unpin` addition to `Storage` as its own cross-module task
+(touches `kv`, `kvtree`, and every backend, not `pagecache` alone) if a real
+caller's profile ever shows the double copy as the bottleneck rather than a
+constant-factor cost against an O(1) fill.
 
 ## Backlog / non-goals
 

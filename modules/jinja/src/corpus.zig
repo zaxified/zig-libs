@@ -373,6 +373,77 @@ pub const cases = [_]Case{
         .autoescape = true,
     },
 
+    // ── autoescape × case-changing / splitting filters (audit F6/F7/F8) ─────
+    //
+    // The hole the F1/F8 section above didn't close: it covers `replace`,
+    // `indent`, `trim`, `join` and plain argument-bearing filters, but never
+    // crosses `autoescape=true` markup input with `capitalize`/`title`/
+    // `center`/`truncate`, and never exercises the two ways of breaking a
+    // markup string into pieces (`chars()`-based iteration vs `split()`) —
+    // which the reference treats *oppositely* (iteration loses the mark,
+    // split keeps it). Every case here was diffed live against Jinja2 3.1.6 +
+    // markupsafe 3.0.3 before being fixed.
+    .{
+        .name = "escape_capitalize_title_center_truncate_preserve_markup",
+        .template = "{{ (s|safe)|capitalize }}|{{ (s|safe)|title }}|{{ (s|safe)|center(12) }}|{{ (s|safe)|truncate(4,true) }}",
+        .context = "{\"s\": \"<b>x</b>\"}",
+        .autoescape = true,
+    },
+    // Same four filters, unsafe input: the whole result is still escaped as
+    // ordinary text, because nothing marked it markup.
+    .{
+        .name = "escape_capitalize_title_center_truncate_plain_input",
+        .template = "{{ s|capitalize }}|{{ s|title }}|{{ s|center(12) }}|{{ s|truncate(4,true) }}",
+        .context = "{\"s\": \"<b>x</b>\"}",
+        .autoescape = true,
+    },
+    // `truncate`'s own splice: a custom `end` argument is escaped when the
+    // receiver is markup (the same `fReplace`-style splice rule), and the
+    // whole thing is escaped as one block when the receiver is not.
+    .{
+        .name = "escape_truncate_end_argument_matrix",
+        .template = "{{ (s|safe)|truncate(4, true, evil) }}|{{ s|truncate(4, true, evil) }}|{{ (s|safe)|truncate(4, true, evil|safe) }}",
+        .context = "{\"s\": \"<b>xxxxxxxx</b>\", \"evil\": \"<i>\"}",
+        .autoescape = true,
+    },
+    // `chars()`-based iteration (`|first`, `|last`, `|list`, `|batch`,
+    // `|reverse`) loses the markup bit per character even when the whole
+    // string was marked safe — `Markup` does not override `__iter__`, so
+    // CPython's `str` iteration yields plain `str` characters.
+    .{
+        .name = "escape_chars_iteration_loses_markup_per_character",
+        .template = "{{ (s|safe)|first }}|{{ (s|safe)|last }}|{{ (s|safe)|batch(2)|first|join('') }}|{{ (s|safe)|list|join('') }}",
+        .context = "{\"s\": \"<b>x</b>\"}",
+        .autoescape = true,
+    },
+    // `split()`/`splitlines()` do the OPPOSITE: `Markup.split()` returns
+    // `Markup` parts, so the mark survives being broken apart this way.
+    .{
+        .name = "escape_split_preserves_markup_per_part",
+        .template = "{{ (s|safe).split('x')|first }}|{{ (s|safe).split('x')|join('|') }}|{{ (s|safe).splitlines()|join('|') }}",
+        .context = "{\"s\": \"<a>x</a>\\n<b>\"}",
+        .autoescape = true,
+    },
+    // `reverse` reassembles bytes through `chars()` but re-wraps the RESULT
+    // from the original input's markup bit (not per character) — pinned so a
+    // future change to either helper is caught by the corpus, not just by
+    // the fix that made this true.
+    .{
+        .name = "escape_reverse_preserves_markup_of_whole_result",
+        .template = "{{ (s|safe)|reverse }}",
+        .context = "{\"s\": \"<ab>\"}",
+        .autoescape = true,
+    },
+
+    // ── title's word-boundary set (audit F7) ─────────────────────────────────
+    //
+    // Jinja2's `do_title` splits on `[-\s({[<]+` (verified live against
+    // `jinja2.filters._word_beginning_split_re.pattern`), not on "any
+    // non-alphabetic byte" — so `/`, `.`, `:`, `>`, `)`, `}`, `]`, digits and
+    // `'` are ordinary mid-word bytes, which matters for the configuration
+    // data (paths, FQDNs, interface names) this module is meant to render.
+    .{ .name = "filter_title_word_boundary_set", .template = "{{ 'a/b c-d(e'|title }}|{{ 'eth0.100:tag'|title }}|{{ \"it's ok\"|title }}" },
+
     // ── methods on values ───────────────────────────────────────────────────
     .{ .name = "string_methods", .template = "{{ s.upper() }}|{{ s.startswith('he') }}|{{ s.split('l')|list }}|{{ s.replace('l','L') }}|{{ s.find('ll') }}", .context = "{\"s\": \"hello\"}" },
     .{ .name = "dict_methods", .template = "{{ d.keys()|list }}|{{ d.values()|list }}|{{ d.get('a') }}|{{ d.get('z', 'dflt') }}", .context = "{\"d\": {\"a\": 1, \"b\": 2}}" },

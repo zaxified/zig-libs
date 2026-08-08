@@ -805,13 +805,28 @@ pub fn contains(haystack: Value, needle: Value) Error!bool {
 /// not by byte, so `len('ěš') == 2`. Invalid UTF-8 degrades to one byte per
 /// character rather than failing; a template engine must not reject data it
 /// merely has to copy through.
+///
+/// W2-A1/A2-jinja-F6: each character is **never** marked safe, even when `s`
+/// is. This is not an oversight — it matches the reference exactly:
+/// `markupsafe.Markup` is a `str` subclass and does not override `__iter__`,
+/// so CPython's C-implemented `str` iteration yields plain `str` characters,
+/// not `Markup` ones (`list(Markup('<b>'))[0]` is `<class 'str'>`, verified
+/// live against markupsafe 3.0.3). A caller-marked-safe string therefore
+/// loses that mark the moment something iterates it one character at a time
+/// — `{{ (s|safe)|first }}` under autoescape renders the **escaped** first
+/// character (`&lt;` for `s = "<b>x</b>"`), even though slicing or a
+/// whole-string filter on the same `s` would have stayed unescaped. Contrast
+/// `split` (`filters.zig`'s string-method dispatcher), which *does* preserve
+/// `.safe` per part — `Markup.split()` returns `Markup` parts, verified the
+/// same way. Two different reference behaviours for two different ways of
+/// breaking a markup string apart; both are pinned in `corpus.zig`.
 pub fn chars(arena: std.mem.Allocator, s: Str) Error![]const Value {
     var out: std.ArrayList(Value) = .empty;
     var i: usize = 0;
     while (i < s.bytes.len) {
         const n = std.unicode.utf8ByteSequenceLength(s.bytes[i]) catch 1;
         const end = @min(i + n, s.bytes.len);
-        try out.append(arena, .{ .string = .{ .bytes = s.bytes[i..end], .safe = s.safe } });
+        try out.append(arena, Value.str(s.bytes[i..end]));
         i = end;
     }
     return out.items;

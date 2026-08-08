@@ -90,6 +90,22 @@ pub const TimeError = error{
 /// hour+SU, day-of-month+day-of-week, month and year (two digits, relative to
 /// 2000 by convention — this module does not add the century, it reports the
 /// two digits as transmitted).
+///
+/// W2-A8/iec104-F4: three octets carry reserved bits that this struct has no
+/// field for — hour bits 5-6, month bits 4-7, year bit 7. **Policy: `decode`
+/// masks them to zero rather than rejecting a nonzero value**, unlike
+/// `apci.decode`'s strict reserved-bit rejection elsewhere in this module.
+/// This is a deliberate divergence, not an oversight: field practice
+/// (`lib60870` included) masks these bits too, and this module's captured
+/// real-traffic goldens (`goldens.zig`) never set them, so a strict reject
+/// would only ever fire on *this* module's own synthetic test input, never
+/// on a live capture. Consequence: decode is not injective on these three
+/// bits — two APDUs differing only in a reserved bit decode to the same
+/// `CP56Time2a`, and `encode(decode(x))` is a **canonicalization**, not a
+/// byte-identical round trip, when `x` carries a nonzero reserved bit.
+/// `encode` itself never sets any of these bits (there is no field to source
+/// them from), so its output is always already in canonical form — the
+/// re-encode-stability the fuzz harness below checks.
 pub const CP56Time2a = struct {
     /// 0..999
     millisecond: u16 = 0,
@@ -558,6 +574,22 @@ pub fn writeU32(out: []u8, v: u32) void {
     std.mem.writeInt(u32, out[0..4], v, .little);
 }
 
+/// Reads an unsigned little-endian 16-bit field — the layout shared by SPE
+/// (status/status-change words of a packed-single-point element, §7.2.6.9)
+/// and FBP (§7.2.6.14). W2-A2/iec104-F2: before this helper existed,
+/// `packed_single`'s status/changed words and `fbp` each hand-rolled this
+/// shift-and-mask independently in both `decodeElement` and `encodeElement`
+/// with no test asserting the wire bytes directly (only a decode-of-its-own-
+/// encode round trip, which cannot see a *consistent* mutation of both
+/// sides) — see `readU16`/`writeU16`'s own literal test.
+pub fn readU16(bytes: []const u8) u16 {
+    return std.mem.readInt(u16, bytes[0..2], .little);
+}
+
+pub fn writeU16(out: []u8, v: u16) void {
+    std.mem.writeInt(u16, out[0..2], v, .little);
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -755,6 +787,9 @@ test "scalar helpers are little-endian" {
     writeU32(&buf, 0x12345678);
     try testing.expectEqualSlices(u8, &[_]u8{ 0x78, 0x56, 0x34, 0x12 }, &buf);
     try testing.expectEqual(@as(u32, 0x12345678), readU32(&buf));
+    writeU16(buf[0..2], 0xBEEF);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xEF, 0xBE }, buf[0..2]);
+    try testing.expectEqual(@as(u16, 0xBEEF), readU16(buf[0..2]));
 }
 
 test "fuzz: CP56Time2a decode never panics and always round-trips" {
@@ -768,4 +803,38 @@ fn fuzzTime(_: void, smith: *std.testing.Smith) !void {
     var again: [7]u8 = undefined;
     _ = try t.encode(&again);
     try testing.expectEqual(t, try CP56Time2a.decode(&again));
+    // W2-A8/iec104-F4: `again` is `encode`'s output, which never carries a
+    // reserved bit (see the struct doc comment) — so it must already be the
+    // canonical form: re-encoding what it decodes to must reproduce it
+    // byte-for-byte, matching apci.zig's byte-identical re-encode oracle.
+    // This is the strengthening the audit asked for; it is deliberately
+    // *not* `expectEqualSlices(u8, &buf, &again)` — `buf` itself may carry a
+    // reserved bit that `again` legitimately canonicalizes away.
+    var twice: [7]u8 = undefined;
+    _ = try (try CP56Time2a.decode(&again)).encode(&twice);
+    try testing.expectEqualSlices(u8, &again, &twice);
+}
+
+// W2-A8/iec104-F4: direct evidence for the policy documented on the struct —
+// a reserved bit is masked to zero on decode rather than rejected, and
+// `encode` never reproduces it. Fixed byte literals, not a round trip: this
+// is what "an implementation could stop masking (or start rejecting) and
+// still round-trip against itself" looks like closed.
+test "CP56Time2a masks reserved bits (hour 5-6, month 4-7, year 7) rather than rejecting them" {
+    // Base: 2026-07-23 03:18:38.135, no flags — same fixture as the
+    // "milliseconds and seconds share one field" test above, bytes verified
+    // there: F7 94 12 03 17 07 1A.
+    const base = [_]u8{ 0xF7, 0x94, 0x12, 0x03, 0x17, 0x07, 0x1A };
+    const want = try CP56Time2a.decode(&base);
+
+    // Set every reserved bit: hour 0x60 (bits 5-6), month 0xF0 (bits 4-7),
+    // year 0x80 (bit 7). None of these bits has a field to land in.
+    const dirty = [_]u8{ 0xF7, 0x94, 0x12, 0x03 | 0x60, 0x17, 0x07 | 0xF0, 0x1A | 0x80 };
+    const got = try CP56Time2a.decode(&dirty);
+    try testing.expectEqual(want, got);
+
+    // encode() never reproduces a reserved bit, from either source struct.
+    var enc: [7]u8 = undefined;
+    _ = try got.encode(&enc);
+    try testing.expectEqualSlices(u8, &base, &enc);
 }

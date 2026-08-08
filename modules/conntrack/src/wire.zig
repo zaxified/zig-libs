@@ -246,8 +246,11 @@ pub const Family = enum(u8) {
 // ── errors ──────────────────────────────────────────────────────────────────
 
 /// Everything the decoder can reject. `Truncated`/`BadLength` come straight
-/// from `netlink.codec`'s bounds-checked walkers.
-pub const DecodeError = codec.Error;
+/// from `netlink.codec`'s bounds-checked walkers. `AddressFamilyMismatch`
+/// (F5) is decode's own: `decodeTuple` used to accept a `{v4 src, v6 dst}`
+/// tuple silently, while `appendTuple` already refused exactly that on the
+/// build side — now both directions agree.
+pub const DecodeError = codec.Error || error{AddressFamilyMismatch};
 
 /// Everything a request builder can reject.
 pub const BuildError = std.mem.Allocator.Error || error{
@@ -460,6 +463,13 @@ pub fn decodeTuple(nest: []const u8) DecodeError!Tuple {
         CTA_TUPLE.ZONE => out.zone = try a.asBe16(),
         else => {},
     };
+    // Mirror `appendTuple`'s build-side refusal (F5): a `{v4, v6}` mix is
+    // never a real kernel answer, and letting it through as a `Tuple` with
+    // no cross-check meant `family()` silently reflected only `src` (or
+    // `dst` if `src` was absent) while the OTHER address quietly carried
+    // the wrong family.
+    if (out.src != null and out.dst != null and Family.of(out.src.?) != Family.of(out.dst.?))
+        return error.AddressFamilyMismatch;
     return out;
 }
 
@@ -1222,6 +1232,35 @@ test "decodeCounters: legacy 32-bit PACKETS32/BYTES32 forms decode to the right 
     const c = try decodeCounters(nest.items);
     try testing.expectEqual(@as(u64, 11), c.packets);
     try testing.expectEqual(@as(u64, 2222), c.bytes);
+}
+
+test "F5: decodeTuple rejects a mixed-family tuple that appendTuple already refuses to build" {
+    const gpa = testing.allocator;
+
+    // A {v4 src, v6 dst} CTA_TUPLE_IP nest — exactly what `appendTuple`
+    // refuses with `error.AddressFamilyMismatch` on the build side, but
+    // `decodeTuple` used to assign whichever of V4_SRC/V6_SRC/V4_DST/V6_DST
+    // arrived with no cross-check at all.
+    var nest: std.ArrayList(u8) = .empty;
+    defer nest.deinit(gpa);
+    const ip_off = try codec.nestBegin(gpa, &nest, codec.NLA_F_NESTED | CTA_TUPLE.IP);
+    try codec.appendAttr(gpa, &nest, CTA_IP.V4_SRC, &.{ 1, 2, 3, 4 });
+    try codec.appendAttr(gpa, &nest, CTA_IP.V6_DST, &(@as([16]u8, @splat(0))));
+    codec.nestEnd(&nest, ip_off);
+
+    try testing.expectError(error.AddressFamilyMismatch, decodeTuple(nest.items));
+
+    // Same shape reached through `decodeFlow`'s CTA_TUPLE_ORIG path.
+    var flow_list: std.ArrayList(u8) = .empty;
+    defer flow_list.deinit(gpa);
+    try appendNfgenmsg(gpa, &flow_list, .ipv4, 0);
+    const t_off = try codec.nestBegin(gpa, &flow_list, codec.NLA_F_NESTED | CTA.TUPLE_ORIG);
+    const ip_off2 = try codec.nestBegin(gpa, &flow_list, codec.NLA_F_NESTED | CTA_TUPLE.IP);
+    try codec.appendAttr(gpa, &flow_list, CTA_IP.V4_SRC, &.{ 1, 2, 3, 4 });
+    try codec.appendAttr(gpa, &flow_list, CTA_IP.V6_DST, &(@as([16]u8, @splat(0))));
+    codec.nestEnd(&flow_list, ip_off2);
+    codec.nestEnd(&flow_list, t_off);
+    try testing.expectError(error.AddressFamilyMismatch, decodeFlow(flow_list.items));
 }
 
 test "decoder rejects wrong-sized scalars, not unknown attributes" {

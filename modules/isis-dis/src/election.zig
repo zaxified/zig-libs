@@ -374,12 +374,26 @@ test "positive control: lowest-SNPA election disagrees with the correct one" {
 // The winner tracked the SNPA reassignment exactly (r2 now has the higher
 // SNPA and is now DIS) with priority and system-ids held fixed — first try,
 // both runs, no adjustment made to `elect` to match.
+/// The lab's literal captured SNPAs (`02:00:00:00:00:0N`, set via `ip link
+/// set eth0 address <mac>` before bringing each link up — see the run A/B
+/// comments above) — distinct from the generic `snpa()` helper (`00:...`)
+/// every OTHER test in this file uses for hand-built candidates. F4 (wave-2
+/// audit): the FRR-anchor test below used to route through `snpa()` too, so
+/// its fixture was an order-preserving stand-in rather than a literal
+/// transcription of what the lab actually captured — the ordering conclusion
+/// was unaffected (only the last octet ever varies in any comparison here),
+/// but a capture-and-freeze anchor should be re-checkable against the literal
+/// captured bytes without re-deriving them.
+fn capturedSnpa(last: u8) Snpa {
+    return .{ 0x02, 0x00, 0x00, 0x00, 0x00, last };
+}
+
 test "FRR anchor: LAN DIS election, priority + SNPA tie-break, two independent runs" {
     // Run A: r2/r3 tied at priority 64, decided by SNPA (…03 > …02).
     {
-        const r1: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 10, .snpa = snpa(0x01) };
-        const r2: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = snpa(0x02) };
-        const r3: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 3 }, .priority = 64, .snpa = snpa(0x03) };
+        const r1: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 10, .snpa = capturedSnpa(0x01) };
+        const r2: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = capturedSnpa(0x02) };
+        const r3: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 3 }, .priority = 64, .snpa = capturedSnpa(0x03) };
 
         // From r1's vantage point (its own Up-neighbour view: r2, r3): the
         // elected DIS is r3 — matches FRR's r1 AND r3's own "is/is not DIS".
@@ -402,9 +416,9 @@ test "FRR anchor: LAN DIS election, priority + SNPA tie-break, two independent r
     // Run B: same priorities/system-ids, SNPAs swapped between r2 and r3 —
     // the winner must flip to r2.
     {
-        const r1: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 10, .snpa = snpa(0x01) };
-        const r2: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = snpa(0x09) };
-        const r3: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 3 }, .priority = 64, .snpa = snpa(0x05) };
+        const r1: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 10, .snpa = capturedSnpa(0x01) };
+        const r2: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = capturedSnpa(0x09) };
+        const r3: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 3 }, .priority = 64, .snpa = capturedSnpa(0x05) };
 
         const from_r1 = elect(r1, &.{ r2, r3 });
         try testing.expectEqual(r2.system_id, from_r1.dis_system_id);

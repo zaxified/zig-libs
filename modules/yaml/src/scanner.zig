@@ -463,10 +463,25 @@ pub const Scanner = struct {
     /// A `#` only opens a comment at the start of a line or after a blank —
     /// `[a]#x`, `"v"# x` and `>#c` are errors, not comments (`9JBA`, `CVW2`,
     /// `SU5Z`, `X4QW`, `MUS6/00`).
+    ///
+    /// W2-A2/yaml-F4: there used to be a third disjunct here,
+    /// `isBreak(self.src[self.pos - 1])`, reachable only if a break character
+    /// could sit immediately before this call with `self.column != 0`. It
+    /// cannot: every break in this scanner is consumed exactly one way —
+    /// `skipLine` (called directly, or via `readLine`) — and `skipLine`
+    /// unconditionally sets `self.column = 0` before returning. The other
+    /// character-consuming primitive, `read`, is never called on a break (all
+    /// four call sites are guarded by `!self.breakzAt(0)`/`breakAt(0)`
+    /// checks first). So a break immediately before `self.pos` always means
+    /// `self.column == 0`, which the line above already returns `true` for —
+    /// confirmed by fault injection (deleting the disjunct left the entire
+    /// suite green, including the full 402-event/279-value yaml-test-suite
+    /// run) *and* by tracing every consumer of `skipLine`/`read` above. Not
+    /// "untested"; provably unreachable, so removed rather than covered.
     fn commentHere(self: *const Self) bool {
         if (self.at(0) != '#') return false;
         if (self.pos == 0 or self.column == 0) return true;
-        return isBlank(self.src[self.pos - 1]) or isBreak(self.src[self.pos - 1]);
+        return isBlank(self.src[self.pos - 1]);
     }
 
     fn scanToNextToken(self: *Self) Error!void {

@@ -117,6 +117,19 @@ pub const Error = error{
     UnexpectedFrame,
     /// A second U-format *act* while one is still awaiting confirmation.
     ConfirmationPending,
+    /// W2-A8/iec104-F3: the peer has more than `k` I-frames outstanding on
+    /// the receive side. §5.5 only bounds the *sender*'s outstanding count
+    /// at `k`; a compliant peer never has more than `k` I-frames unacked at
+    /// once, so this can only mean either a caller of the standalone
+    /// `state.Connection` entry point (README "for the flow control with
+    /// your own I/O") never called `tick` to drain the receive window, or
+    /// the peer is violating its own send-window bound. Either way this is
+    /// the fail-closed alternative to `unacked_rx: u16` silently overflowing
+    /// after 65536 untackled frames — a safety panic in Debug/ReleaseSafe,
+    /// silent wraparound in ReleaseFast, previously reachable from
+    /// `while (try f.next()) |a| _ = try conn.onFrame(a, now)` (65536 I-frames
+    /// with no intervening `tick`).
+    TooManyUnackedFrames,
 } || ConfigError;
 
 /// What `onFrame` observed.
@@ -318,6 +331,12 @@ pub const Connection = struct {
             .i => |f| {
                 if (self.state != .started) return error.NotStarted;
                 if (f.send_seq != self.recv_seq) return error.UnexpectedSequence;
+                // W2-A8/iec104-F3: a compliant peer never has more than `k`
+                // I-frames outstanding (its own send-window bound), so this
+                // can only be a caller that never drained the receive window
+                // with `tick`, or a peer over its own limit — refuse rather
+                // than let `unacked_rx: u16` grow without bound.
+                if (self.unacked_rx >= self.cfg.k) return error.TooManyUnackedFrames;
                 try self.applyAck(f.recv_seq, now);
                 self.recv_seq +%= 1;
                 self.unacked_rx += 1;
@@ -657,6 +676,33 @@ test "w reached forces an immediate supervisory acknowledgement" {
     try testing.expectEqual(@as(u16, 0), c.unacked_rx);
     try testing.expectEqual(@as(Seq, 2), c.last_sent_ack);
     try testing.expectEqual(Action.none, c.tick(0));
+}
+
+// W2-A8/iec104-F3: `state.Connection` is documented (README) as a standalone
+// entry point "for the flow control with your own I/O" — a caller may drive
+// `onFrame` from a read loop without ever calling `tick`. Before this fix
+// `unacked_rx: u16` had no ceiling on the receive side, so 65536 I-frames fed
+// without an intervening `tick` would overflow it (a safety panic in
+// Debug/ReleaseSafe, silent wraparound in ReleaseFast). `k` I-frames is the
+// most a compliant peer ever has outstanding at once (its own send-window
+// bound), so the `k + 1`th one with no `tick` in between must be refused.
+test "more than k unacked I-frames with no intervening tick is refused, not silently counted" {
+    var c = try started(.controlled, fast); // k = 3, w = 2
+    _ = try c.onFrame(iframe(0, 0, "a"), 0);
+    _ = try c.onFrame(iframe(1, 0, "b"), 0);
+    _ = try c.onFrame(iframe(2, 0, "c"), 0);
+    try testing.expectEqual(@as(u16, 3), c.unacked_rx);
+    // The 4th I-frame in a row, still with no `tick`, exceeds k.
+    try testing.expectError(error.TooManyUnackedFrames, c.onFrame(iframe(3, 0, "d"), 0));
+    // The rejected frame must not have been counted or have advanced recv_seq.
+    try testing.expectEqual(@as(u16, 3), c.unacked_rx);
+    try testing.expectEqual(@as(Seq, 3), c.recv_seq);
+    // A `tick` drains the window (w = 2 was already reached earlier), after
+    // which frames flow normally again.
+    _ = c.tick(0);
+    try testing.expectEqual(@as(u16, 0), c.unacked_rx);
+    const e = try c.onFrame(iframe(3, 0, "d"), 0);
+    try testing.expectEqualStrings("d", e.asdu);
 }
 
 test "t2 acknowledges when w is never reached" {

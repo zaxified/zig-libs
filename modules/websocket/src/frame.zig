@@ -113,6 +113,9 @@ pub const FrameError = error{
     /// `max_frame_size` bound. Reported as soon as the length is known —
     /// before buffering the (attacker-controlled) payload. Close 1009.
     FrameTooLarge,
+    /// W2-A8/websocket-F2: a close frame's status code is not one RFC 6455
+    /// §7.4.1 permits on the wire — see `isValidCloseCode`. Close 1002.
+    InvalidCloseCode,
 };
 
 /// Map a `FrameError` (or the higher-level errors `connection.zig` adds) to
@@ -122,6 +125,7 @@ pub fn closeCode(err: anyerror) u16 {
     return switch (err) {
         error.FrameTooLarge, error.MessageTooLarge => 1009, // Message Too Big
         error.InvalidUtf8 => 1007, // Invalid frame payload data
+        error.InvalidCloseCode => 1002, // Protocol error
         else => 1002, // Protocol error (the default / everything else here)
     };
 }
@@ -334,14 +338,36 @@ pub fn encodeCloseBody(out: []u8, code: ?u16, reason: []const u8) error{ ReasonT
 
 pub const CloseInfo = struct { code: ?u16, reason: []const u8 };
 
+/// RFC 6455 §7.4.1, quoted verbatim: "Codes in the range 0-999 are not used.
+/// ... Codes in the range 1000-2999 are reserved for definition by this
+/// protocol, its future revisions, and extensions specified in a permanent
+/// and readily available public specification. Codes in the range
+/// 3000-3999 are reserved for use by libraries, frameworks, and
+/// applications. ... Codes in the range 4000-4999 are reserved for private
+/// use". Within 1000-2999, §7.4.1 defines 1000-1003 and 1007-1011 as usable
+/// *on the wire*; 1004, 1005, 1006 and 1015 are each specified with "MUST
+/// NOT be set as a status code in a Close frame by an endpoint" (they name
+/// conditions with no corresponding close frame — 1005/1006 mean "no status
+/// code was actually present"/"the connection was closed abnormally", 1004
+/// and 1015 are reserved outright); 1012-2999 (minus 1015) are simply
+/// unassigned. This is Autobahn|Testsuite's 7.9.x class.
+fn isValidCloseCode(code: u16) bool {
+    return switch (code) {
+        1000...1003, 1007...1011, 3000...4999 => true,
+        else => false,
+    };
+}
+
 /// Decode a close-frame payload (§5.5.1). Empty payload → `.{ .code =
 /// null, .reason = "" }`. A 1-byte payload is malformed (a code, if
-/// present, is always 2 bytes) → `error.InvalidPayloadLength`. The reason
-/// must be valid UTF-8 → `error.InvalidUtf8`.
+/// present, is always 2 bytes) → `error.InvalidPayloadLength`. A present
+/// code outside `isValidCloseCode`'s range → `error.InvalidCloseCode`
+/// (W2-A8/websocket-F2). The reason must be valid UTF-8 → `error.InvalidUtf8`.
 pub fn decodeCloseBody(payload: []const u8) (FrameError || error{InvalidUtf8})!CloseInfo {
     if (payload.len == 0) return .{ .code = null, .reason = "" };
     if (payload.len == 1) return error.InvalidPayloadLength;
     const code = std.mem.readInt(u16, payload[0..2], .big);
+    if (!isValidCloseCode(code)) return error.InvalidCloseCode;
     const reason = payload[2..];
     if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
     return .{ .code = code, .reason = reason };
@@ -607,6 +633,34 @@ test "decodeCloseBody: 1-byte payload is InvalidPayloadLength" {
 test "decodeCloseBody: invalid UTF-8 reason is rejected" {
     const payload = [_]u8{ 0x03, 0xe8, 0xff, 0xfe }; // code=1000, invalid UTF-8 reason
     try testing.expectError(error.InvalidUtf8, decodeCloseBody(&payload));
+}
+
+// W2-A8/websocket-F2: Autobahn|Testsuite's 7.9.x class — RFC 6455 §7.4.1
+// close codes that MUST NOT appear on the wire. Before this fix, any `u16`
+// was accepted verbatim.
+test "decodeCloseBody: rejects every RFC 6455 §7.4.1 illegal close code" {
+    const illegal = [_]u16{
+        0, 1, 999, // 0-999: not used
+        1004, 1005, 1006, // explicitly "MUST NOT be set"
+        1012, 1013, 1014, 1015, // unassigned (1015 also "MUST NOT be set")
+        2999, // top of the unassigned 1012-2999 range
+        5000, 65535, // past the 4000-4999 private-use ceiling
+    };
+    for (illegal) |code| {
+        var payload: [2]u8 = undefined;
+        std.mem.writeInt(u16, &payload, code, .big);
+        try testing.expectError(error.InvalidCloseCode, decodeCloseBody(&payload));
+    }
+}
+
+test "decodeCloseBody: accepts every RFC 6455 §7.4.1 legal close code" {
+    const legal = [_]u16{ 1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 3000, 3999, 4000, 4999 };
+    for (legal) |code| {
+        var payload: [2]u8 = undefined;
+        std.mem.writeInt(u16, &payload, code, .big);
+        const info = try decodeCloseBody(&payload);
+        try testing.expectEqual(@as(?u16, code), info.code);
+    }
 }
 
 // ── fuzz: frame parsing off the wire, never panics ──────────────────────────

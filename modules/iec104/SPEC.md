@@ -41,6 +41,11 @@ depends on Zig's bitfield-packing rules.
   error rather than a struct a caller might act on. IV (invalid), SU (summer time) and GEN
   (substituted) are orthogonal flags and survive a round trip. The OV bit is reserved in SIQ/DIQ and
   is masked out on encode so a caller that reused a QDS cannot smuggle it onto the wire.
+  `CP56Time2a.decode`'s reserved bits (hour bits 5-6, month bits 4-7, year bit 7) are **masked to
+  zero, not rejected** — a deliberate divergence from `apci.decode`'s strict reserved-bit rejection,
+  matching field practice (`lib60870` masks them too) and this module's real-traffic goldens, which
+  never set them. `encode` never reproduces a reserved bit, so its output is always the canonical
+  form; the fuzz oracle checks that re-encoding it is a byte-exact fixed point.
 - **`asdu` (§7.2).** Decoding validates up front that the body length is *exactly* what `count`
   objects of this type's element size need, in the layout the SQ bit selects — so
   `ObjectIterator.next` can never run off the end and needs no bounds checks. Element layout is

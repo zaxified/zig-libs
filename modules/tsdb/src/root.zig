@@ -100,9 +100,43 @@ pub const Sample = struct { ts: Timestamp, value: f64 };
 pub const Db = struct {
     gpa: Allocator,
     tree: *kvtree.Db,
+    /// In-memory `(name, labels) -> SeriesId` cache, keyed by the same
+    /// canonical `idx_key` bytes `seriesId`/`lookupSeries` build anyway
+    /// (owned copies). A consumer that resolves per sample — the natural
+    /// naive usage, and the only one the API suggests for a metric name held
+    /// as a string — hits this before paying a tree descent, though the
+    /// canonicalization itself (needed to make label order irrelevant) still
+    /// runs on every call. Call `deinit` to free it.
+    series_cache: std.StringHashMapUnmanaged(SeriesId) = .empty,
+    /// Retained scratch buffer for `sweepChunk`'s per-chunk delete list —
+    /// `clearRetainingCapacity`'d and reused across chunks of one `sweep`
+    /// call (and across calls) instead of a fresh `alloc`/`free` every
+    /// chunk of a long retention sweep.
+    sweep_scratch: std.ArrayList([codec.point_key_len]u8) = .empty,
 
     pub fn init(gpa: Allocator, tree: *kvtree.Db) Db {
         return .{ .gpa = gpa, .tree = tree };
+    }
+
+    /// Frees the in-memory series-id cache and sweep scratch. Does not touch
+    /// `tree` (borrowed).
+    pub fn deinit(self: *Db) void {
+        var it = self.series_cache.keyIterator();
+        while (it.next()) |k| self.gpa.free(k.*);
+        self.series_cache.deinit(self.gpa);
+        self.sweep_scratch.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Cache `id` under `idx_key`'s canonical bytes. Best-effort: a failed
+    /// dupe/insert just means the next call re-resolves through the tree —
+    /// this is a performance cache, not a durability path, so OOM here is
+    /// silently absorbed by design (unlike a durable-write path, where the
+    /// campaign's writebehind F3 finding is why that distinction matters).
+    fn cacheSeriesId(self: *Db, idx_key: []const u8, id: SeriesId) void {
+        if (self.series_cache.contains(idx_key)) return;
+        const key_copy = self.gpa.dupe(u8, idx_key) catch return;
+        self.series_cache.put(self.gpa, key_copy, id) catch self.gpa.free(key_copy);
     }
 
     // ── series identity ──────────────────────────────────────────────────────
@@ -121,10 +155,14 @@ pub const Db = struct {
         defer idx_key.deinit(self.gpa);
         try self.indexKey(&idx_key, name, labels);
 
+        if (self.series_cache.get(idx_key.items)) |cached| return cached;
+
         if (try self.tree.get(self.gpa, idx_key.items)) |v| {
             defer self.gpa.free(v);
             if (v.len != 8) return error.CorruptIndex;
-            return std.mem.readInt(u64, v[0..8], .big);
+            const id = std.mem.readInt(u64, v[0..8], .big);
+            self.cacheSeriesId(idx_key.items, id);
+            return id;
         }
 
         const id = try self.nextSeriesId();
@@ -142,6 +180,7 @@ pub const Db = struct {
             try txn.put(&codec.meta_key_next_series, &counter);
         }
         try txn.commit(); // consumes the txn on both outcomes
+        self.cacheSeriesId(idx_key.items, id);
         return id;
     }
 
@@ -151,10 +190,14 @@ pub const Db = struct {
         defer idx_key.deinit(self.gpa);
         try self.indexKey(&idx_key, name, labels);
 
+        if (self.series_cache.get(idx_key.items)) |cached| return cached;
+
         const v = (try self.tree.get(self.gpa, idx_key.items)) orelse return null;
         defer self.gpa.free(v);
         if (v.len != 8) return error.CorruptIndex;
-        return std.mem.readInt(u64, v[0..8], .big);
+        const id = std.mem.readInt(u64, v[0..8], .big);
+        self.cacheSeriesId(idx_key.items, id);
+        return id;
     }
 
     /// The canonical bytes registered for `id` (caller frees), or null. Decode
@@ -312,8 +355,11 @@ pub const Db = struct {
     /// One bounded chunk: scan forward from `pos`, then commit the deletions
     /// together with the new `pos` in a single transaction.
     fn sweepChunk(self: *Db, cutoff: Timestamp, opts: SweepOptions, pos: *ScanPos) Error!ChunkResult {
-        var deletes: std.ArrayList([codec.point_key_len]u8) = .empty;
-        defer deletes.deinit(self.gpa);
+        // Retained across chunks/calls (F5) — was a fresh `alloc`/`free` of
+        // up to `chunk_deletes * point_key_len` bytes (68 KiB at the
+        // defaults) every single chunk of a long retention sweep.
+        self.sweep_scratch.clearRetainingCapacity();
+        const deletes = &self.sweep_scratch;
 
         var examined: usize = 0;
         var done = false;
@@ -510,12 +556,14 @@ const Fixture = struct {
     /// Close and reopen the tree from the same simulated media — the
     /// restart-survival check.
     fn reopen(self: *Fixture) !void {
+        self.db.deinit(); // free the old Db's series-id cache before replacing it
         self.tree.close();
         self.tree.* = try kvtree.Db.open(self.gpa, self.sim.storage(), "series.kvt", .{});
         self.db = Db.init(self.gpa, self.tree);
     }
 
     fn deinit(self: *Fixture) void {
+        self.db.deinit();
         self.tree.close();
         self.gpa.destroy(self.tree);
         self.sim.deinit();
@@ -1030,6 +1078,7 @@ test "persistence: samples survive a real filesystem round trip" {
         var tree = try kvtree.Db.open(gpa, fs.storage(), "ts.kvt", .{});
         defer tree.close();
         var db = Db.init(gpa, &tree);
+        defer db.deinit();
         const s = try db.seriesId("disk", &.{.{ .name = "dev", .value = "sda" }});
         for (0..64) |i| try db.append(s, @intCast(i * 10), @floatFromInt(i));
         _ = try db.sweep(200, .{ .chunk_deletes = 3 });
@@ -1038,11 +1087,152 @@ test "persistence: samples survive a real filesystem round trip" {
     var tree2 = try kvtree.Db.open(gpa, fs.storage(), "ts.kvt", .{});
     defer tree2.close();
     var db2 = Db.init(gpa, &tree2);
+    defer db2.deinit();
     const s2 = (try db2.lookupSeries("disk", &.{.{ .name = "dev", .value = "sda" }})).?;
     const got = try collect(gpa, &db2, s2, std.math.minInt(i64), std.math.maxInt(i64));
     defer gpa.free(got);
     try testing.expectEqual(@as(usize, 44), got.len); // 64 points, ts 0..630, cutoff 200
     try testing.expectEqual(@as(Timestamp, 200), got[0].ts);
+}
+
+/// A `Storage` wrapper that counts `pread` calls reaching the inner backend
+/// — used to prove F4's cache actually skips the tree descent, independent
+/// of any allocator-count subtlety.
+const CountingStorage = struct {
+    inner: kvtree.Storage,
+    pread_count: usize = 0,
+
+    fn cast(ctx: *anyopaque) *CountingStorage {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn vOpen(ctx: *anyopaque, path: []const u8, mode: kvtree.Storage.OpenMode) kvtree.Storage.Error!kvtree.Storage.Handle {
+        return cast(ctx).inner.open(path, mode);
+    }
+    fn vSize(ctx: *anyopaque, h: kvtree.Storage.Handle) kvtree.Storage.Error!u64 {
+        return cast(ctx).inner.size(h);
+    }
+    fn vPread(ctx: *anyopaque, h: kvtree.Storage.Handle, buf: []u8, off: u64) kvtree.Storage.Error!usize {
+        const self = cast(ctx);
+        self.pread_count += 1;
+        return self.inner.pread(h, buf, off);
+    }
+    fn vWriteAll(ctx: *anyopaque, h: kvtree.Storage.Handle, bytes: []const u8, off: u64) kvtree.Storage.Error!void {
+        return cast(ctx).inner.writeAll(h, bytes, off);
+    }
+    fn vSync(ctx: *anyopaque, h: kvtree.Storage.Handle) kvtree.Storage.Error!void {
+        return cast(ctx).inner.sync(h);
+    }
+    fn vTruncate(ctx: *anyopaque, h: kvtree.Storage.Handle, len: u64) kvtree.Storage.Error!void {
+        return cast(ctx).inner.truncate(h, len);
+    }
+    fn vClose(ctx: *anyopaque, h: kvtree.Storage.Handle) void {
+        cast(ctx).inner.close(h);
+    }
+    fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) kvtree.Storage.Error!void {
+        return cast(ctx).inner.rename(old_path, new_path);
+    }
+    fn vDelete(ctx: *anyopaque, path: []const u8) kvtree.Storage.Error!void {
+        return cast(ctx).inner.delete(path);
+    }
+    fn vSyncDir(ctx: *anyopaque) kvtree.Storage.Error!void {
+        return cast(ctx).inner.syncDir();
+    }
+    fn vTryLockExclusive(ctx: *anyopaque, h: kvtree.Storage.Handle) kvtree.Storage.Error!bool {
+        return cast(ctx).inner.tryLockExclusive(h);
+    }
+
+    const vtable = kvtree.Storage.VTable{
+        .open = vOpen,
+        .size = vSize,
+        .pread = vPread,
+        .writeAll = vWriteAll,
+        .sync = vSync,
+        .truncate = vTruncate,
+        .close = vClose,
+        .rename = vRename,
+        .delete = vDelete,
+        .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLockExclusive,
+    };
+
+    fn storage(self: *CountingStorage) kvtree.Storage {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+test "F4: a resolved series id is served from the in-memory cache, not a repeat tree descent" {
+    const gpa = testing.allocator;
+    var sim = kvtree.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var counting = CountingStorage{ .inner = sim.storage() };
+    var tree = try kvtree.Db.open(gpa, counting.storage(), "series.kvt", .{});
+    defer tree.close();
+    var db = Db.init(gpa, &tree);
+    defer db.deinit();
+
+    const labels = [_]Label{ .{ .name = "region", .value = "eu" }, .{ .name = "host", .value = "a1" } };
+    const id1 = try db.seriesId("cpu", &labels);
+
+    const before = counting.pread_count;
+    const id2 = (try db.lookupSeries("cpu", &labels)).?;
+    try testing.expectEqual(id1, id2);
+
+    // The cache answered without a single further `pread` reaching the
+    // backend — no tree descent happened at all for the repeat lookup.
+    try testing.expectEqual(before, counting.pread_count);
+}
+
+test "F5: sweepChunk's delete scratch is retained across chunks, not alloc/free per chunk" {
+    const gpa = testing.allocator;
+    var sim = kvtree.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var tree = try kvtree.Db.open(gpa, sim.storage(), "series.kvt", .{});
+    defer tree.close();
+
+    // A separate FailingAllocator (never fails; just counts) as the tsdb
+    // layer's OWN allocator, isolated from `tree`'s internal allocator
+    // (`kvtree.Db.cursor`/`begin` use the gpa `tree` was opened with, not
+    // `Db.gpa`) — so every counted allocation is attributable to this
+    // layer: `sweepChunk`'s scratch and the handful of fixed per-sweep
+    // calls (`resumePosition`'s one `tree.get`), not tree internals.
+    var fa = std.testing.FailingAllocator.init(gpa, .{});
+    var db = Db.init(fa.allocator(), &tree);
+    defer db.deinit();
+
+    // Seed enough points that a small `chunk_deletes` forces several
+    // chunks per series, all pure-delete chunks (well below any cutoff).
+    var name_buf: [16]u8 = undefined;
+    var batch: std.ArrayList(Sample) = .empty;
+    defer batch.deinit(gpa);
+    for (0..3) |i| {
+        const nm = try std.fmt.bufPrint(&name_buf, "s{d}", .{i});
+        const id = try db.seriesId(nm, &.{});
+        batch.clearRetainingCapacity();
+        for (0..30) |t| try batch.append(gpa, .{ .ts = @intCast(t), .value = @floatFromInt(t) });
+        try db.appendMany(id, batch.items);
+    }
+
+    var pos = try db.resumePosition(1000);
+    const opts = Db.SweepOptions{ .chunk_deletes = 10, .chunk_examines = 10 };
+
+    // First chunk: the scratch buffer grows from empty to `chunk_deletes`
+    // capacity — the one place an allocation is expected.
+    const before1 = fa.allocations;
+    const c1 = try db.sweepChunk(1000, opts, &pos);
+    const delta1 = fa.allocations - before1;
+    try testing.expectEqual(@as(usize, 10), c1.deleted);
+
+    // Second chunk: same shape of work (10 deletes), but the scratch
+    // buffer already has the capacity from chunk 1 — `clearRetainingCapacity`
+    // reuses it, so this chunk must allocate strictly less than chunk 1.
+    const before2 = fa.allocations;
+    const c2 = try db.sweepChunk(1000, opts, &pos);
+    const delta2 = fa.allocations - before2;
+    try testing.expectEqual(@as(usize, 10), c2.deleted);
+
+    try testing.expect(delta2 < delta1);
 }
 
 test "F1: CorruptIndex/CorruptPoint reject paths actually fire on a malformed value written directly through the tree" {

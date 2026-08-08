@@ -156,6 +156,14 @@ pub const VerifyError = error{
     /// A transform other than enveloped-signature / exclusive / inclusive C14N
     /// was requested (XPath, XSLT, base64, …). Rejected by policy.
     UnsupportedTransform,
+    /// W2-A8/xmldsig-F4: the enveloped-signature transform appeared after a
+    /// C14N transform in `<Transforms>` — semantically backwards (canonicalize
+    /// first, then try to strip an element from already-serialized octets) and
+    /// not what any real signer emits. Not independently exploitable (the
+    /// digest is still bound to whatever `omit`/`mode` the chain nets out to,
+    /// and a mismatch is still caught), but accepting it silently as if it
+    /// were the correct order is unnecessary laxness on an untrusted chain.
+    TransformOrderInvalid,
     /// A `Reference URI` did not resolve to exactly one in-document element:
     /// missing, external, not found — or **ambiguous**, i.e. two or more
     /// elements carry `Options.id_attr` with that value. Ambiguity is a refusal
@@ -357,6 +365,12 @@ fn validateReference(
     var mode: c14n.Mode = .inclusive; // XML-DSig default when a node-set needs serializing
     var omit: ?*const xml.Element = null;
     var inclusive_prefixes: []const []const u8 = &.{};
+    // W2-A8/xmldsig-F4: tracks whether a C14N transform has already been
+    // consumed, so an enveloped-signature transform arriving after one (the
+    // nonsense order — canonicalize, then try to strip an element from the
+    // resulting octets) is refused rather than silently accepted and treated
+    // as if it were the correct order.
+    var seen_c14n = false;
 
     if (childByName(ref_el, "Transforms")) |transforms| {
         for (transforms.children) |tc| switch (tc.content) {
@@ -364,10 +378,12 @@ fn validateReference(
                 if (!isDs(t, "Transform")) continue;
                 const talg = t.attr("", "Algorithm") orelse return error.MalformedSignature;
                 if (std.mem.eql(u8, talg, alg_enveloped)) {
+                    if (seen_c14n) return error.TransformOrderInvalid;
                     omit = signature;
                 } else if (mapC14n(talg)) |m| {
                     mode = m;
                     inclusive_prefixes = try parseInclusiveNamespaces(arena, t);
+                    seen_c14n = true;
                 } else {
                     // XPath, XSLT, XPath-filter, base64, … — rejected by policy.
                     return error.UnsupportedTransform;
@@ -502,7 +518,18 @@ fn verifySignature(alg: SigAlg, key: VerifyKey, signed_info_canon: []const u8, s
                 else => return error.KeyAlgorithmMismatch,
             };
             // XML-DSig ECDSA signatures are raw r‖s (IEEE P1363), NOT DER.
-            if (sig.len != 64) return error.MalformedSignature;
+            // W2-A8/xmldsig-F5: a wrong-length `SignatureValue` is "did not
+            // verify" (`false`), not a structural error — matching the RSA
+            // arm above, where `rsa.verifyPkcs1v15` rejecting a malformed
+            // (including wrong-length) signature is caught and folded into
+            // `false` rather than propagated. Before this fix the two arms
+            // disagreed: RSA's `Result.valid = false` vs. ECDSA's hard
+            // `error.MalformedSignature`, for the same underlying shape of
+            // input defect. Callers that only inspect `Result.valid` still
+            // fail closed either way (`saml` maps any `verify` error to
+            // `SignatureInvalid`), so this is API-consistency, not a
+            // fail-open risk either direction.
+            if (sig.len != 64) return false;
             var rs: [64]u8 = undefined;
             @memcpy(&rs, sig[0..64]);
             return p256.sign.ecdsaVerify(sec1, signed_info_canon, rs);
@@ -1092,6 +1119,26 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     defer flipped_res.deinit(a);
     try testing.expect(!flipped_res.valid);
     try testing.expect(flipped_res.references[0].digest_valid);
+
+    // (c) W2-A8/xmldsig-F5: a wrong-LENGTH raw r‖s `SignatureValue` — before
+    // this fix the ECDSA arm raised `error.MalformedSignature` here (a hard
+    // structural error, no `Result` at all) where the RSA arm folds the same
+    // shape of defect into `Result.valid = false`. `verify` itself must
+    // still succeed and report a normal (unverified) `Result`, exactly like
+    // (a) and (b) above — not propagate an error.
+    var short_rs: [63]u8 = undefined;
+    @memcpy(&short_rs, rs[0..63]);
+    var short_b64: [128]u8 = undefined;
+    const short_sig_b64 = std.base64.standard.Encoder.encode(&short_b64, &short_rs);
+    const shortened = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, short_sig_b64 });
+    defer a.free(shortened);
+    var doc_s = try xml.parse(a, shortened, .{});
+    defer doc_s.deinit();
+    const sig_s = childByName(doc_s.root, "Signature").?;
+    var short_res = try verify(a, &doc_s, sig_s, .{ .key = .{ .ecdsa_p256_sec1 = &pub_sec1 } });
+    defer short_res.deinit(a);
+    try testing.expect(!short_res.valid);
+    try testing.expect(short_res.references[0].digest_valid); // structurally fine up to the signature
 }
 
 test "verify: unsupported transform (XPath) is rejected" {
@@ -1118,6 +1165,56 @@ test "verify: unsupported transform (XPath) is rejected" {
     const sig = childByName(doc.root, "Signature").?;
     const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
     try testing.expectError(error.UnsupportedTransform, verify(a, &doc, sig, .{ .key = .{ .rsa = pk } }));
+}
+
+// W2-A8/xmldsig-F4: the transform-order check must fire before any digest or
+// signature bytes matter — both `DigestValue` and `SignatureValue` below are
+// garbage, and the reference-loop's order check runs before `DigestMethod`
+// is even parsed, so this is not exploitable through those fields.
+test "verify: enveloped-signature transform after C14N is rejected (wrong order)" {
+    const a = testing.allocator;
+    const src =
+        "<Envelope xmlns=\"urn:demo\">" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" ++
+        "<ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+        "<ds:Reference URI=\"\">" ++
+        "<ds:Transforms>" ++
+        // WRONG ORDER: canonicalize first, then (nonsensically) try to strip
+        // the Signature element from the resulting octets. The correct order
+        // (exercised by every other test in this file) is the reverse.
+        "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>" ++
+        "</ds:Transforms>" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>AAAA</ds:DigestValue>" ++
+        "</ds:Reference>" ++
+        "</ds:SignedInfo>" ++
+        "<ds:SignatureValue>AAAA</ds:SignatureValue>" ++
+        "</ds:Signature>" ++
+        "</Envelope>";
+    var doc = try xml.parse(a, src, .{});
+    defer doc.deinit();
+    const sig = childByName(doc.root, "Signature").?;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    try testing.expectError(error.TransformOrderInvalid, verify(a, &doc, sig, .{ .key = .{ .rsa = pk } }));
+}
+
+// The correct order (enveloped-signature, THEN C14N) must keep working — a
+// real signed document exercises this already (`buildSignedRsaDoc`), but
+// this pins the *acceptance* boundary right next to the rejection above.
+test "verify: enveloped-signature transform before C14N is still accepted (right order)" {
+    const a = testing.allocator;
+    var doc = try buildSignedRsaDoc(a, false, false);
+    defer doc.deinit(a);
+    var parsed = try xml.parse(a, doc.xml, .{});
+    defer parsed.deinit();
+    const sig = childByName(parsed.root, "Signature").?;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    var res = try verify(a, &parsed, sig, .{ .key = .{ .rsa = pk } });
+    defer res.deinit(a);
+    try testing.expect(res.valid);
 }
 
 test "verify: SHA-1 digest rejected unless explicitly allowed" {

@@ -175,25 +175,87 @@ fn fLower(ctx: *Ctx, input: Value, args: Args) Error!Value {
     return markupAware(ctx, input, out);
 }
 
+// W2-A1/A2-jinja-F6: `do_capitalize` is `soft_str(s).capitalize()`, and
+// `soft_str` returns a `Markup` argument unchanged (it only wraps non-`str`
+// values). `str.capitalize()` on a `Markup` receiver returns a `Markup`
+// result — verified live: `Markup('<b>x</b>').capitalize()` is
+// `<class 'markupsafe.Markup'>`, not `str`. So the reference PRESERVES
+// markup through `capitalize`, unlike `chars()`'s per-character loss above.
+// `SPEC.md`'s "case-changing filters preserve markup" claim was accurate for
+// this filter; only `fCapitalize`'s own code didn't act on it.
 fn fCapitalize(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const s = try ctx.toStr(input);
     const out = try ctx.arena.dupe(u8, s);
     for (out, 0..) |*c, i| c.* = if (i == 0) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
-    return Value.str(out);
+    return markupAware(ctx, input, out);
 }
 
+/// W2-A1-jinja-F7: the boundary set Jinja2's `do_title` actually splits on
+/// (`jinja2/filters.py`'s `_word_beginning_split_re`, verified live:
+/// `re.compile(r"([-\s({\[<]+)").pattern`) — a run of `-`, whitespace, `(`,
+/// `{`, `[` or `<`. Anything else (`/`, `.`, `:`, `>`, `)`, `}`, `]`, digits,
+/// `'`) is an ordinary mid-word byte and does not start a new titlecased
+/// word — unlike the "any non-alphabetic byte" rule this replaced, which
+/// diverged on ordinary configuration data (paths, FQDNs, interface names).
+fn isTitleBoundary(c: u8) bool {
+    return switch (c) {
+        '-', ' ', '\t', '\r', '\n', 0x0b, 0x0c, '(', '{', '[', '<' => true,
+        else => false,
+    };
+}
+
+// W2-A1/A2-jinja-F6/F7: `do_title` (the `|title` FILTER) runs
+// `_word_beginning_split_re.split(...)` (a capturing split, so the boundary
+// runs themselves are also items) and applies
+// `item[0].upper() + item[1:].lower()` to every non-empty item —
+// equivalently, "at every point where byte membership in the boundary set
+// changes (including position 0), uppercase; everywhere else, lowercase".
+// Boundary characters have no case, so applying that rule to a boundary
+// character or a text character is uniformly correct byte-for-byte.
+//
+// **Unlike `capitalize`, this does NOT preserve markup** — audit F6's claim
+// that "title" belongs on the markup-preserving list does not survive a live
+// check: `(s|safe)|title` renders fully escaped in Jinja2 3.1.6/markupsafe
+// 3.0.3 (`&lt;B&gt;x&lt;/b&gt;` for `s = "<b>x</b>"`). The reason is
+// `do_title` rebuilds the result with a **plain** `"".join(...)` (`str`'s
+// `join`, not `Markup`'s), which discards every item's markup bit regardless
+// of the receiver's — the opposite of `capitalize`/`center`, which call the
+// receiver's own `.capitalize()`/`.center()` method directly and inherit
+// whatever type `soft_str(s)` was. See `titleMethod` below for `.title()` as
+// a *method* call, which goes through the real method and does preserve it.
 fn fTitle(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const s = try ctx.toStr(input);
     const out = try ctx.arena.dupe(u8, s);
-    var at_start = true;
-    for (out) |*c| {
-        const alpha = std.ascii.isAlphabetic(c.*) or c.* == '\'';
-        if (at_start) c.* = std.ascii.toUpper(c.*) else c.* = std.ascii.toLower(c.*);
-        at_start = !alpha;
+    var prev_boundary = false;
+    for (out, 0..) |*c, i| {
+        const boundary = isTitleBoundary(c.*);
+        const transition = i == 0 or boundary != prev_boundary;
+        c.* = if (transition) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
+        prev_boundary = boundary;
     }
     return Value.str(out);
+}
+
+// `.title()` as a METHOD call is a different function from the filter above:
+// it goes through `str.title()`/`Markup.title()` directly, which (a) uses
+// the built-in Unicode title-casing boundary rule — ANY non-alphabetic byte,
+// not the filter's `[-\s({[<]+` set (verified live: `"it's ok".title()` is
+// `"It'S Ok"` — the apostrophe *is* a boundary here, unlike the filter's
+// set) — and (b) DOES preserve markup on a `Markup` receiver (verified live:
+// `(s|safe).title()` stays unescaped), because it is the real method, not a
+// plain-`str`-reconstructing filter.
+fn titleMethod(ctx: *Ctx, input: Value) Error!Value {
+    const s = try ctx.toStr(input);
+    const out = try ctx.arena.dupe(u8, s);
+    var at_start = true;
+    for (out) |*c| {
+        const alpha = std.ascii.isAlphabetic(c.*);
+        c.* = if (at_start) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
+        at_start = !alpha;
+    }
+    return markupAware(ctx, input, out);
 }
 
 fn fTrim(ctx: *Ctx, input: Value, args: Args) Error!Value {
@@ -366,7 +428,11 @@ fn fCenter(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const width_i = try intArg(args.get(0, "width") orelse Value{ .integer = 80 }, 80);
     const width: usize = if (width_i < 0) 0 else @intCast(width_i);
     const len = std.unicode.utf8CountCodepoints(s) catch s.len;
-    if (len >= width) return Value.str(s);
+    // W2-A1/A2-jinja-F6: `do_center` is `soft_str(value).center(width)`, and
+    // `str.center()` on a `Markup` receiver returns `Markup` (verified live:
+    // `Markup('<b>x</b>').center(12)` is `<class 'markupsafe.Markup'>`) —
+    // both the early return and the padded result must preserve it.
+    if (len >= width) return markupAware(ctx, input, s);
     const total = width - len;
     if (total > value.max_alloc) return error.OutOfRange;
     // CPython's exact rule (`Objects/stringlib/transmute.h`): the odd space
@@ -377,14 +443,15 @@ fn fCenter(ctx: *Ctx, input: Value, args: Args) Error!Value {
     try out.appendNTimes(ctx.arena, ' ', left);
     try out.appendSlice(ctx.arena, s);
     try out.appendNTimes(ctx.arena, ' ', right);
-    return Value.str(out.items);
+    return markupAware(ctx, input, out.items);
 }
 
 fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const s = try ctx.toStr(input);
     const length_i = try intArg(args.get(0, "length") orelse Value{ .integer = 255 }, 255);
     const killwords = boolArg(args, 1, "killwords", false);
-    const end = try strArg(ctx, args, 2, "end", "...");
+    const end_v = args.get(2, "end") orelse Value.str("...");
+    const end_raw = try ctx.toStr(end_v);
     const leeway_i = try intArg(args.get(3, "leeway") orelse Value{ .integer = 5 }, 5);
     // TYPED ERROR. `do_truncate` opens with `assert length >= len(end)` and
     // `assert leeway >= 0`, so a negative either way raises in the reference
@@ -394,9 +461,18 @@ fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
     if (length_i < 0 or leeway_i < 0) return error.BadArgument;
     const length: usize = @intCast(length_i);
     const leeway: usize = @intCast(leeway_i);
-    if (s.len <= length +| leeway) return Value.str(s);
-    if (length < end.len) return error.BadArgument;
-    const keep = length - end.len;
+    // W2-A1/A2-jinja-F6: `do_truncate` returns `s` itself untouched when it's
+    // short enough, and otherwise builds `s[:n] + end`. `str.__add__` on a
+    // `Markup` receiver (`str.center`'s sibling rule) escapes a non-markup
+    // right operand and returns `Markup` — the same splice rule `fReplace`
+    // already applies to its own argument. A non-markup receiver stays
+    // unmarked either way, so the whole result (including `end`) is escaped
+    // on render, matching the reference.
+    if (s.len <= length +| leeway) return markupAware(ctx, input, s);
+    if (length < end_raw.len) return error.BadArgument;
+    const markup = ctx.autoescape and isMarkup(input);
+    const end = if (markup) try escapedBytes(ctx, end_v) else end_raw;
+    const keep = length - end_raw.len;
     var cut = s[0..keep];
     if (!killwords) {
         if (std.mem.lastIndexOfScalar(u8, cut, ' ')) |sp| {
@@ -405,7 +481,7 @@ fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
             cut = cut[0..0];
         }
     }
-    return Value.str(try std.mem.concat(ctx.arena, u8, &.{ cut, end }));
+    return .{ .string = .{ .bytes = try std.mem.concat(ctx.arena, u8, &.{ cut, end }), .safe = markup } };
 }
 
 fn fWordcount(ctx: *Ctx, input: Value, args: Args) Error!Value {
@@ -831,7 +907,18 @@ fn fFirst(ctx: *Ctx, input: Value, args: Args) Error!Value {
 fn fLast(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const items = try seq(ctx, input);
-    return if (items.len == 0) .{ .undef = .{ .name = "last" } } else items[items.len - 1];
+    if (items.len == 0) return .{ .undef = .{ .name = "last" } };
+    const last = items[items.len - 1];
+    // W2-A1/A2-jinja-F6: `do_last` is `next(iter(reversed(seq)))`. `str`
+    // (and `Markup`) define no `__reversed__`, so `reversed()` falls back to
+    // the index-based sequence protocol (`seq[len-1]`, `seq[len-2]`, ...),
+    // which — unlike `__iter__` (see `value.chars()`'s doc comment) —
+    // *does* preserve `Markup` on a single-character result: verified live,
+    // `list(reversed(Markup('<b>x</b>')))[0]` is `Markup`, not `str`.
+    // `first` (`next(iter(seq))`) goes through `__iter__` and has no such
+    // fallback, so it stays plain — the two filters genuinely disagree.
+    if (input == .string and last == .string) return markupAware(ctx, input, last.string.bytes);
+    return last;
 }
 
 fn fReverse(ctx: *Ctx, input: Value, args: Args) Error!Value {
@@ -1607,7 +1694,7 @@ fn stringMethod(ctx: *Ctx, s: value.Str, name: []const u8, args: Args) Error!Val
     const input: Value = .{ .string = s };
     if (std.mem.eql(u8, name, "upper")) return fUpper(ctx, input, args);
     if (std.mem.eql(u8, name, "lower")) return fLower(ctx, input, args);
-    if (std.mem.eql(u8, name, "title")) return fTitle(ctx, input, args);
+    if (std.mem.eql(u8, name, "title")) return titleMethod(ctx, input);
     if (std.mem.eql(u8, name, "capitalize")) return fCapitalize(ctx, input, args);
     if (std.mem.eql(u8, name, "strip")) return fTrim(ctx, input, args);
     if (std.mem.eql(u8, name, "replace")) return replaceMethod(ctx, s, args);
@@ -1640,17 +1727,23 @@ fn stringMethod(ctx: *Ctx, s: value.Str, name: []const u8, args: Args) Error!Val
         const at = std.mem.indexOf(u8, s.bytes, p) orelse return .{ .integer = -1 };
         return .{ .integer = @intCast(at) };
     }
+    // W2-A1/A2-jinja-F6: `str.split()`/`str.splitlines()` on a `Markup`
+    // receiver return `Markup` parts (verified live: `Markup('<b>x</b>')
+    // .split('x')` is `[Markup('<b>'), Markup('</b>')]`) — the opposite of
+    // `value.chars()`'s per-character iteration, which loses the mark (see
+    // its doc comment). Two different reference behaviours for two
+    // different ways of breaking a markup string apart.
     if (std.mem.eql(u8, name, "split")) {
         const sep_v = args.get(0, "sep");
         var out: std.ArrayList(Value) = .empty;
         if (sep_v == null or sep_v.? == .none) {
             var it = std.mem.tokenizeAny(u8, s.bytes, " \t\r\n\x0b\x0c");
-            while (it.next()) |part| try out.append(ctx.arena, Value.str(part));
+            while (it.next()) |part| try out.append(ctx.arena, markupAware(ctx, input, part));
         } else {
             const sep = try ctx.toStr(sep_v.?);
             if (sep.len == 0) return error.BadArgument;
             var it = std.mem.splitSequence(u8, s.bytes, sep);
-            while (it.next()) |part| try out.append(ctx.arena, Value.str(part));
+            while (it.next()) |part| try out.append(ctx.arena, markupAware(ctx, input, part));
         }
         return .{ .list = out.items };
     }
@@ -1659,10 +1752,10 @@ fn stringMethod(ctx: *Ctx, s: value.Str, name: []const u8, args: Args) Error!Val
         var it = std.mem.splitScalar(u8, s.bytes, '\n');
         var pending: ?[]const u8 = null;
         while (it.next()) |part| {
-            if (pending) |pv| try out.append(ctx.arena, Value.str(pv));
+            if (pending) |pv| try out.append(ctx.arena, markupAware(ctx, input, pv));
             pending = std.mem.trimEnd(u8, part, "\r");
         }
-        if (pending) |pv| if (pv.len != 0) try out.append(ctx.arena, Value.str(pv));
+        if (pending) |pv| if (pv.len != 0) try out.append(ctx.arena, markupAware(ctx, input, pv));
         return .{ .list = out.items };
     }
     if (std.mem.eql(u8, name, "join")) {

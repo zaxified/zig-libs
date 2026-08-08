@@ -361,6 +361,20 @@ module never escapes anything, and with it on the safe bit is the only way to
 opt a value out. Because `|safe` is representable in a value, a caller can mark
 trusted fragments in the *context* rather than in the template.
 
+**`autoescape` is HTML-*text*-context escaping only, and covers exactly what
+markupsafe's escape set covers: `&` `<` `>` `"` `'`.** There is no backslash in
+that set and no URI-scheme validation, so a value interpolated into a
+`<script>` block or a `href`/`src` attribute is not made safe for *that*
+context by `autoescape` alone: `<script>var a = "{{ s }}";</script>` with
+`s = "\\"` still lets the value escape the JS string (no backslash-escaping),
+and `<a href="{{ u }}">` with `u = "javascript:…"` still emits the scheme
+intact. This is not a divergence from the reference — Jinja2 has exactly the
+same scope, verified live in all three contexts (script, attribute, URL body)
+byte-identical to this module — so it is not a bug to fix here, only a scope
+this section previously left unstated. A caller who interpolates into a
+`<script>` block wants `|tojson`; a caller who interpolates into a URI
+attribute needs its own scheme allow-list, same as with the reference.
+
 ## 9. The loader and Zig's ownership model
 
 The brief for this half sketched the loader as plumbing. One thing about it is

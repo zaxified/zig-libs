@@ -911,8 +911,12 @@ Partly implemented, with the boundary stated:
   period, general interrogation, the bounded buffered-report guarantee with `EntryID` resume and
   `BufOvfl`, the whole RCB attribute surface, **report segmentation**, **runtime `DatSet`
   re-binding** and **multi-client reservation** (`Resv`, `ResvTms`, `Owner`). What it does not do is
-  split one MMS PDU across several COTP TPDUs: a class-0 TPDU is at most 8192 octets, so a *read*
-  response larger than the negotiated TPDU size is a `BufferTooSmall` rather than a fragmented one.
+  split one MMS PDU across several COTP TPDUs on the *outbound* (response) side: a class-0 TPDU is
+  at most 8192 octets, so a *read* response larger than the negotiated TPDU size is a
+  `BufferTooSmall` rather than a fragmented one. **Inbound** requests are the other direction:
+  `Server.handle` reassembles a segmented request via `cotp.Reassembler` (`reasm_buf`/`reasm_len`,
+  mirroring `client.zig`'s identical receive-side reassembly) before decoding it — a peer that
+  splits a large `Write` across several `DT` TPDUs is served normally, not refused.
   That ceiling is also what makes the segmentation budget honest — `Server.reportSegmentBudget` is
   the smaller of the client's `localDetailCalling` and the negotiated TPDU size, less the
   session/presentation envelope. `Owner` is part of the RCB *structure* only when `include_owner`

@@ -177,6 +177,14 @@ const RespSpec = struct {
     sign_rsa: ?rsa.SecretKey = null,
     /// signer: p256 secret key (ECDSA SHA-256).
     sign_ecdsa: ?[32]u8 = null,
+    /// W2-A2/ocsp-F3: flip a byte of the CertID's issuerNameHash so it no
+    /// longer matches the real issuer, leaving issuerKeyHash and serial
+    /// correct — isolates the name-hash comparison from the other two.
+    corrupt_issuer_name_hash: bool = false,
+    /// W2-A2/ocsp-F3: flip a byte of the CertID's issuerKeyHash so it no
+    /// longer matches the real issuer, leaving issuerNameHash and serial
+    /// correct — isolates the key-hash comparison from the other two.
+    corrupt_issuer_key_hash: bool = false,
 };
 
 fn certIdDer(b: der_writer.Builder, spec: RespSpec) ![]const u8 {
@@ -184,6 +192,8 @@ fn certIdDer(b: der_writer.Builder, spec: RespSpec) ![]const u8 {
     var kb: [64]u8 = undefined;
     Sha256.hash(spec.issuer.subject_name, nb[0..32], .{});
     Sha256.hash(spec.issuer.key_bits, kb[0..32], .{});
+    if (spec.corrupt_issuer_name_hash) nb[0] ^= 0xff;
+    if (spec.corrupt_issuer_key_hash) kb[0] ^= 0xff;
     const alg = try b.seq(&.{ try b.oid(&oid_sha256), try b.null() });
     return b.seq(&.{
         alg,
@@ -610,6 +620,51 @@ test "verify: CertID for a different serial → CertIdMismatch" {
         .subject_serial = &[_]u8{ 0x00, 0x99 }, // not the subject's serial
         .responder_by_name = issuer.subject_name,
         .sign_rsa = fx.kp.secret_key,
+    });
+    defer gpa.free(resp_der);
+
+    const parsed = try ocsp.parseResponse(resp_der);
+    try testing.expectError(error.CertIdMismatch, ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()));
+}
+
+// W2-A2/ocsp-F3: `certIdBinds` ANDs three independent comparisons
+// (issuerNameHash, issuerKeyHash, serial). The only existing negative test
+// (above) is on the serial; deleting the issuerNameHash comparison entirely
+// left the whole suite green because nothing exercised a CertID whose name
+// hash alone is wrong. These two tests isolate the other two conjuncts.
+test "verify: CertID with wrong issuerNameHash alone → CertIdMismatch" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = issuer.subject_name,
+        .sign_rsa = fx.kp.secret_key,
+        .corrupt_issuer_name_hash = true,
+    });
+    defer gpa.free(resp_der);
+
+    const parsed = try ocsp.parseResponse(resp_der);
+    try testing.expectError(error.CertIdMismatch, ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()));
+}
+
+test "verify: CertID with wrong issuerKeyHash alone → CertIdMismatch" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = issuer.subject_name,
+        .sign_rsa = fx.kp.secret_key,
+        .corrupt_issuer_key_hash = true,
     });
     defer gpa.free(resp_der);
 

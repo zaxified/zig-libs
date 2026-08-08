@@ -221,6 +221,45 @@ data plane, per-tenant FDB caps, counted moves reported through `LearnOutcome`,
 and duplicate-MAC quarantine. MAC-pinning *policy* on top of those signals
 (which MACs to `learnStatic`, when to alarm) stays the caller's.
 
+## Concurrency ceiling (wave-2 audit F7)
+
+`meta.concurrency = .single_owner`: one thread/loop owns a `Table` and it
+holds no internal lock (`root.zig:119`) — a plain `AutoHashMapUnmanaged`, no
+atomics, no RCU. Correct and cheap in that shape, but it is a real ceiling
+against the named C reference, not a nicety: the Linux kernel bridge FDB
+(`net/bridge/br_fdb.c`) is RCU-protected with per-bucket locking, so lookups
+run lock-free in parallel across every core while learning proceeds
+concurrently on the same table. A `Table` cannot do that — a PE that wants to
+forward at line rate across N cores against ONE `Table` needs an external
+lock serialising the read path the kernel deliberately keeps parallel, which
+gives up exactly the throughput scaling `br_fdb_find_rcu` provides.
+
+**This module confirmed sits on the real S1b L2VPN data-plane path** (F1, the
+split-horizon fix, is what makes that concrete — this is not a hypothetical
+consumer), so the ceiling is worth stating rather than leaving implicit:
+
+- **What is NOT provided:** cross-thread scaling of `forward`/`learn` over
+  one shared `Table`. Two threads calling into the same `Table` concurrently
+  is undefined — the same single-owner contract every other `zig-libs`
+  in-memory table in this family (`kv`, `kvtree`'s pager, `shardstore`'s own
+  per-shard rule) already carries.
+- **The accepted production shape today: one forwarding thread (one owning
+  loop) per PE.** A PE's own `Table` is never shared across PE processes/
+  threads by construction (it is PE-local FDB state), so this is not a
+  scaling *bug* inside a single PE's own forwarding path — a single PE
+  forwarding on one core is exactly the case this module is built for. The
+  ceiling only bites if a *single* PE's data plane is itself sharded across
+  multiple threads/cores against one `Table` — a shape this module does not
+  support today.
+- **If that shape is ever needed:** either (a) shard the table itself (N
+  independent `Table`s keyed by a stable partition of I-SID or MAC, the same
+  design `shardstore` already uses for `kvtree`), or (b) adopt an RCU/seqlock
+  read path so lookups run lock-free while `learn`/`tick` mutate — both are
+  real engineering, not a one-line fix, and neither is scheduled without a
+  concrete multi-core-per-PE consumer to size it against (the standing
+  perf-gate rule this repo already applies: no speculative concurrency
+  investment without a measured, named consumer).
+
 ## Deliberately deferred (out of scope by design, not oversight)
 
 - **Designated-forwarder (DF) election** — which PE forwards BUM into a

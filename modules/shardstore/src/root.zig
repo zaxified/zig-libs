@@ -201,6 +201,15 @@ pub const Store = struct {
     pub fn init(gpa: Allocator, store: Storage, options: Options) InitError!Store {
         if (options.n_shards == 0) return error.InvalidShardCount;
 
+        // Validate the shard-name format fits *before* touching the backend at
+        // all — checkManifest/acquireLock below have real side effects (a
+        // manifest write, a lock file), and a `name_prefix` long enough to
+        // blow the per-shard `"<prefix>-NNNNN<suffix>"` format (but short
+        // enough to fit the shorter `.manifest`/`.lock` names) used to reach
+        // both of those before failing on shard 0 of the open loop, leaving
+        // an orphaned manifest/lock file for a store that will never exist.
+        try validateShardNameFits(options);
+
         try checkManifest(store, options);
 
         // ONE exclusive lock for the whole store (not one per shard — see
@@ -263,6 +272,20 @@ pub const Store = struct {
         errdefer store.close(h);
         if (!try store.tryLockExclusive(h)) return error.Locked;
         return h;
+    }
+
+    /// Dry-run the widest per-shard path (`"<prefix>-NNNNN<suffix>"`, at the
+    /// highest shard index this `init` will ever format) into a throwaway
+    /// buffer, so a `name_prefix`/`name_suffix` combination that cannot
+    /// possibly open any shard is rejected before `checkManifest`/
+    /// `acquireLock` write or lock anything.
+    fn validateShardNameFits(options: Options) InitError!void {
+        var buf: [512]u8 = undefined;
+        _ = std.fmt.bufPrint(
+            &buf,
+            "{s}-{d:0>5}{s}",
+            .{ options.name_prefix, options.n_shards - 1, options.name_suffix },
+        ) catch return error.ShardNameTooLong;
     }
 
     /// Create-or-verify the shard-count manifest. Runs **before** any shard is
@@ -381,6 +404,33 @@ pub const Store = struct {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "F5: a name_prefix too long for the per-shard format is refused before any backend I/O" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // kvtree is a COW page store: meta slots overwrite in place
+
+    // Chosen so `"<prefix>.manifest"` (9-byte suffix) and `"<prefix>.lock"`
+    // (5-byte suffix) both fit the 512-byte format buffer, but the per-shard
+    // `"<prefix>-00000<suffix>"` (10-byte suffix, default `.kvt`) does not —
+    // 503 + 9 = 512 (fits), 503 + 10 = 513 (does not). Before this fix,
+    // `checkManifest`/`acquireLock` ran to completion on exactly this input
+    // (writing a manifest and taking a lock) before the shard-open loop
+    // discovered `ShardNameTooLong` on shard 0, leaving those files behind
+    // for a store that was never actually created.
+    var prefix_buf: [503]u8 = undefined;
+    @memset(&prefix_buf, 'a');
+    const prefix = prefix_buf[0..503];
+
+    try testing.expectError(
+        error.ShardNameTooLong,
+        Store.init(testing.allocator, sim.storage(), .{ .n_shards = 1, .name_prefix = prefix }),
+    );
+
+    // Nothing was created — validation ran before any manifest write or lock
+    // acquisition touched the backend.
+    try testing.expectEqual(@as(usize, 0), sim.names.count());
 }
 
 const testing = std.testing;

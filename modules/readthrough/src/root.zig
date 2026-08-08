@@ -411,32 +411,55 @@ pub const Cache = struct {
     ) bool {
         self.lock.lock();
         defer self.lock.unlock();
-        const dec = self.decodeFreshLocked(key) orelse return false;
+        // Mirror `get`'s accounting exactly, so `hits + misses == requests`
+        // holds whether a caller uses `get` or `ifCached` (or both): no
+        // fresh entry at all is a miss; a fresh entry — positive or not —
+        // is a hit, matching `get`'s `self.stats.hits += 1` before its own
+        // dispatch on `dec`. Previously `ifCached` counted hits on the
+        // positive branch only and nothing on any other outcome.
+        const dec = self.decodeFreshLocked(key) orelse {
+            self.stats.misses += 1;
+            return false;
+        };
+        self.stats.hits += 1;
         switch (dec) {
             .value => |v| {
-                self.stats.hits += 1;
                 f(ctx, v);
                 return true;
             },
-            else => return false,
+            .missing, .err => {
+                self.stats.negative_hits += 1;
+                return false;
+            },
+            .corrupt => return false,
         }
     }
 
     // ── invalidation ──────────────────────────────────────────────────────────
 
-    /// Force the next `get(key)` to reload. Any cached entry is shadowed
-    /// immediately (dropped lazily by ramcache on the next touch); a load in
-    /// flight for `key` is poisoned so its result is delivered to current
-    /// waiters but NOT written to the cache.
+    /// Force the next `get(key)` to reload. Any cached entry is dropped
+    /// EAGERLY, right here, not left to be discovered by some later `get`
+    /// or eviction; a load in flight for `key` is poisoned so its result is
+    /// delivered to current waiters but NOT written to the cache.
     pub fn invalidate(self: *Cache, key: []const u8) void {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.in_flight.get(key)) |call| call.poisoned = true;
         // All our stored entries are dirty (we never markClean), so `isDirty`
         // is a side-effect-free presence test — avoid inserting junk for an
-        // absent key. Shadow a present entry with a poison generation.
-        if (self.store.isDirty(key))
+        // absent key. Shadow a present entry with a poison generation...
+        if (self.store.isDirty(key)) {
             self.store.put(key, "", self.now(), 1, poison_gen);
+            // ...then immediately reclaim the slot: `ramcache` has no
+            // `remove(key)`, but a `get` under the REAL current generation
+            // sees the poison entry's generation mismatch and drops it right
+            // there (the same lazy-drop path a future caller would have
+            // triggered) — so the slot and its allocation are freed now,
+            // not whenever something else next happens to touch this key. A
+            // burst of invalidations across hot keys no longer transiently
+            // displaces live entries or inflates `stats.entries`.
+            _ = self.store.get(key, self.now(), self.generation);
+        }
         self.stats.invalidations += 1;
     }
 
@@ -767,6 +790,23 @@ test "invalidate(key): next get reloads; other keys untouched" {
     try testing.expectEqual(@as(u64, 3), rig.ldr.calls.load(.monotonic));
 }
 
+test "F5: invalidate() drops the entry's slot immediately, not on a later touch" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "k", "v");
+    var c = rig.open(.{});
+    defer c.deinit();
+
+    c.free(try c.get("k")); // populate
+    try testing.expectEqual(@as(usize, 1), c.store.stats.entries);
+
+    c.invalidate("k");
+    // No further `get`/`ifCached`/eviction touched "k" — the slot must
+    // already be gone, not merely shadowed and waiting to be discovered.
+    try testing.expectEqual(@as(usize, 0), c.store.stats.entries);
+}
+
 test "invalidate on an absent key inserts no junk and just forces a load" {
     var rig: Rig = undefined;
     rig.init();
@@ -894,6 +934,36 @@ test "ifCached: zero-alloc hit hands the borrowed value to a callback; miss retu
     c.free(try c.get("k")); // populate
     try testing.expect(c.ifCached("k", &sink, Sink.cb)); // now a hit
     try testing.expectEqualStrings("hello", sink.buf[0..sink.len]);
+}
+
+test "F5: ifCached counts its own misses, so hits + misses == requests through ifCached alone" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "k", "v");
+    var c = rig.open(.{});
+    defer c.deinit();
+
+    const Sink = struct {
+        fn cb(ctx: ?*anyopaque, value: []const u8) void {
+            _ = ctx;
+            _ = value;
+        }
+    };
+
+    // Nothing cached yet: a bare ifCached miss must count, on its own,
+    // without ever going through `get`.
+    try testing.expect(!c.ifCached("k", null, Sink.cb));
+    try testing.expectEqual(@as(u64, 1), c.getStats().misses);
+    try testing.expectEqual(@as(u64, 0), c.getStats().hits);
+
+    c.free(try c.get("k")); // populate (get's own miss/hit accounting)
+    const after_get = c.getStats();
+
+    try testing.expect(c.ifCached("k", null, Sink.cb)); // now a hit
+    const after_hit = c.getStats();
+    try testing.expectEqual(after_get.hits + 1, after_hit.hits);
+    try testing.expectEqual(after_get.misses, after_hit.misses); // unchanged
 }
 
 test "ifCached: a negatively-cached (missing) entry is NOT surfaced as a hit" {

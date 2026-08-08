@@ -395,6 +395,16 @@ pub const Coordinator = struct {
     /// the sink.
     n_poisoned: usize = 0,
 
+    /// Orphan registrations `onEvict` could not record because `addKeySet`
+    /// hit OOM (F3). The record stays fully durable in the WAL either way —
+    /// `unflushed`/`flushAll`'s WAL-rescan backstop (`flushOneSync`, driven
+    /// off `self.unflushed`, not the orphan set) does not depend on this
+    /// bookkeeping — but the key drops out of the periodic `drain()`/`kick()`
+    /// polling path (the exact F1 non-admission shape) until something else
+    /// touches it. Non-zero means: call `flushAll`/`sync` to force the
+    /// WAL-rescan reconciliation rather than relying on periodic `drain()`.
+    n_dropped_orphans: usize = 0,
+
     /// Un-acked WAL records (== writes not yet known-durable in the sink).
     /// Coordinator-thread-only. `flushAll`/`deinit` block until this is 0.
     unflushed: usize = 0,
@@ -558,10 +568,15 @@ pub const Coordinator = struct {
             .max_attempts = self.wal_max_attempts,
         }) catch |e| return mapWalErr(e);
         self.unflushed += 1;
-        self.addTombstone(key) catch {};
+        // The durable WAL delete record is already written; an OOM below
+        // must not be swallowed (F3) — a dropped tombstone would silently
+        // un-shadow the deleted key's stale cached value on `get`, the same
+        // class of consequence `put`'s own orphan registration below already
+        // propagates rather than swallows.
+        try self.addTombstone(key);
         // The key's WAL delete record is not tied to a cached dirty entry, so
         // register it as an orphan for the flusher to pick up.
-        self.addKeySet(&self.orphans, key) catch {};
+        try self.addKeySet(&self.orphans, key);
     }
 
     /// Read `key`: cache hit (fast), else — if the sink supports read-through —
@@ -653,6 +668,13 @@ pub const Coordinator = struct {
     /// to callers and will never reach the sink. Inspect them with `poisoned`.
     pub fn poisonedCount(self: *const Coordinator) usize {
         return self.n_poisoned;
+    }
+    /// Count behind `n_dropped_orphans` (F3) — see its doc comment. Durability
+    /// is never at risk (the WAL still has the record), but non-zero means a
+    /// caller relying solely on periodic `drain()` should call `flushAll`
+    /// instead to guarantee those records are reached.
+    pub fn droppedOrphanCount(self: *const Coordinator) usize {
+        return self.n_dropped_orphans;
     }
     /// The dead-lettered WAL records behind `poisonedCount` — the cache key is
     /// `partition`, the written value `payload`. Every entry is deep-copied
@@ -859,7 +881,13 @@ pub const Coordinator = struct {
         _ = reason;
         if (!dirty) return;
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
-        self.addKeySet(&self.orphans, key) catch {};
+        // Can't return an error from a `ramcache` eviction hook — count it
+        // instead (F3) rather than swallowing it silently. See
+        // `n_dropped_orphans`'s doc comment for why this does not risk
+        // durability.
+        self.addKeySet(&self.orphans, key) catch {
+            self.n_dropped_orphans += 1;
+        };
     }
 
     fn freeTask(self: *Coordinator, t: *FlushTask) void {
@@ -1129,6 +1157,62 @@ test "crash recovery preserves last-writer-wins across overwrites" {
     try c2.recover();
     try testing.expectEqualStrings("new", rig.sink.peek("k").?);
     try testing.expectEqualStrings("back", rig.sink.peek("gone").?);
+}
+
+test "F3: del() propagates OOM in tombstone/orphan registration instead of swallowing it" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = try rig.open(4);
+    defer c.deinit();
+
+    try c.put("k", "v");
+
+    // The WAL delete write itself uses `wal`'s own allocator (captured at
+    // init), unaffected by swapping `c.gpa` — so `del`'s durable append still
+    // succeeds; only the tombstone/orphan bookkeeping after it can fail.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    c.gpa = fa.allocator();
+    const result = c.del("k");
+    c.gpa = testing.allocator; // restore before anything else touches gpa
+
+    try testing.expectError(error.OutOfMemory, result);
+}
+
+test "F3: onEvict's dropped orphan registration is counted, not silently lost" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+
+    // Tiny cache (2 entries), same shape as the on_evict safety-net test
+    // below, so a third dirty put evicts an earlier dirty one.
+    var c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 2,
+        .n_workers = 2,
+    });
+    defer c.deinit();
+
+    try c.put("a", "1");
+    try c.put("b", "2");
+    try testing.expectEqual(@as(usize, 0), c.droppedOrphanCount());
+
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    c.gpa = fa.allocator();
+    try c.put("cc", "3"); // over capacity → on_evict fires, its addKeySet OOMs
+    c.gpa = testing.allocator; // restore before anything else touches gpa
+
+    try testing.expectEqual(@as(usize, 1), c.droppedOrphanCount());
+
+    // Durability is unaffected: flushAll's WAL-rescan backstop (driven off
+    // `unflushed`, not the orphan set) still reaches every record.
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 3), rig.sink.count());
 }
 
 test "on_evict safety net: a dirty entry evicted before flush is still persisted" {

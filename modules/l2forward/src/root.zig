@@ -116,7 +116,12 @@ const Allocator = std.mem.Allocator;
 pub const meta = .{
     .platform = .any,
     .role = .util,
-    .concurrency = .single_owner, // one thread/loop owns it, lock-free by design
+    // One thread/loop owns it, lock-free by design — no cross-thread scaling
+    // over one shared `Table` (unlike the RCU'd Linux bridge FDB this module
+    // is modelled after). See SPEC.md "Concurrency ceiling" for the accepted
+    // production shape (one forwarding thread per PE) and what a multi-core-
+    // per-PE consumer would need instead.
+    .concurrency = .single_owner,
     .model_after = "802.1D MAC-learning/ageing FDB + EVPN/SPB ingress replication with split-horizon, per-I-SID",
     .deps = .{}, // std only
 };
@@ -406,12 +411,28 @@ pub const Table = struct {
         try ie.members.put(self.alloc, pe, {});
     }
 
-    /// Remove `pe` from `isid`'s member set. No-op if the I-SID or PE is absent.
-    /// Does not touch the FDB (a MAC may still be learned behind a former
-    /// member until it ages out).
+    /// Remove `pe` from `isid`'s member set. No-op if the I-SID or PE is
+    /// absent. Also purges every FDB entry (static or dynamic) still pointing
+    /// at `pe` (F8): left alone, known-unicast frames for those MACs would
+    /// keep being sent to a non-member for up to `aging_ticks` (default 300 s)
+    /// — a black-hole window the caller had no way to shorten. Purging here
+    /// instead makes those MACs immediately unknown, so the next frame for
+    /// them floods to the remaining members (the correct fallback) rather
+    /// than being silently dropped by forwarding to a PE that is no longer
+    /// there. Same victims-then-remove shape as `pruneIsid`, for the same
+    /// iterator-invalidation reason.
     pub fn removeMember(self: *Table, isid: Isid, pe: PeId) void {
         const ie = self.isids.getPtr(isid) orelse return;
         _ = ie.members.remove(pe);
+
+        var victims: std.ArrayList(Mac) = .empty;
+        defer victims.deinit(self.alloc);
+        var it = ie.fdb.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.pe == pe)
+                victims.append(self.alloc, kv.key_ptr.*) catch break;
+        }
+        for (victims.items) |mac| _ = ie.fdb.remove(mac);
     }
 
     /// True iff `pe` is a member of `isid`.
@@ -1139,16 +1160,24 @@ test "capacity: I-SID and member caps are enforced" {
     try testing.expectEqual(@as(usize, 2), t.memberCount(1));
 }
 
-test "membership: add/remove/isMember; removeMember leaves the FDB intact" {
+test "membership: add/remove/isMember; removeMember purges the FDB entries behind that PE (F8)" {
     var t = testTable();
     defer t.deinit();
     try t.addMember(9, 4);
-    _ = try t.learn(9, macOf(0x01), 4, 0);
+    try t.addMember(9, 5);
+    _ = try t.learn(9, macOf(0x01), 4, 0); // behind the PE about to be removed
+    _ = try t.learn(9, macOf(0x02), 5, 0); // behind a DIFFERENT, still-member PE
     try testing.expect(t.isMember(9, 4));
     t.removeMember(9, 4);
     try testing.expect(!t.isMember(9, 4));
-    // The MAC learned behind the former member is still in the FDB until it ages.
-    try testing.expectEqual(@as(?PeId, 4), t.lookup(9, macOf(0x01), 0));
+    // F8: previously "still in the FDB until it ages" (up to `aging_ticks`,
+    // 300s at production defaults) — a black-hole window with no API to
+    // shorten it. `removeMember` now purges FDB entries pointing at the
+    // removed PE immediately, so the MAC is unknown again and the next frame
+    // floods to the remaining members instead of being sent nowhere.
+    try testing.expectEqual(@as(?PeId, null), t.lookup(9, macOf(0x01), 0));
+    // A MAC behind a DIFFERENT, still-current member must be untouched.
+    try testing.expectEqual(@as(?PeId, 5), t.lookup(9, macOf(0x02), 0));
 }
 
 test "determinism: identical (ops, now) streams produce identical decisions" {

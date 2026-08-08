@@ -124,6 +124,18 @@ pub fn discoverResponderUrl(cert_der: []const u8) DiscoverError!?[]const u8 {
 /// publishes); a non-URI accessLocation on an `id-ad-ocsp` entry is treated
 /// as "no usable entry" rather than an error — the extension itself is still
 /// well-formed, just not something this module can fetch from.
+///
+/// W2-A8/ocspcache-F5: a `uniformResourceIdentifier` is an arbitrary IA5String
+/// — nothing in the ASN.1 shape constrains its scheme. The AIA extension is
+/// part of the certificate's *signed* content, so for the documented use
+/// (stapling for the server's own certificate) that is fine. But `refresh`
+/// hands whatever comes back straight to `Transport.fetch` (see below), so a
+/// caller that ever runs this over a peer-supplied certificate would let that
+/// peer redirect the fetch to `file:`, an internal host, or a cloud metadata
+/// endpoint (`http://169.254.169.254/...`) — a textbook SSRF primitive. Only
+/// `http://`/`https://` locations are therefore accepted; anything else is
+/// treated the same as "no usable entry" (the AIA extension can still be
+/// well-formed) rather than surfaced as `error.Malformed`.
 fn parseAiaOcspUrl(value: []const u8) Malformed!?[]const u8 {
     const seq = try el(value, 0);
     if (seq.identifier.tag != .sequence) return error.Malformed;
@@ -136,10 +148,22 @@ fn parseAiaOcspUrl(value: []const u8) Malformed!?[]const u8 {
         if (method.identifier.tag != .object_identifier) return error.Malformed;
         const loc = try el(value, method.slice.end); // accessLocation GeneralName
         if (rawTag(loc) == 0x86 and std.mem.eql(u8, contentOf(value, method), &oid_ad_ocsp)) {
-            return contentOf(value, loc); // uniformResourceIdentifier [6] IA5String content
+            const uri = contentOf(value, loc); // uniformResourceIdentifier [6] IA5String content
+            if (isHttpUrl(uri)) return uri;
+            // Wrong scheme: keep scanning for another id-ad-ocsp entry rather
+            // than trusting this one.
         }
     }
     return null;
+}
+
+/// `true` for a URI that starts with `http://` or `https://` (ASCII
+/// case-insensitive scheme, per RFC 3986 §3.1). Deliberately conservative —
+/// no attempt to be a general URI parser, just a scheme allow-list.
+fn isHttpUrl(uri: []const u8) bool {
+    if (std.ascii.startsWithIgnoreCase(uri, "http://")) return true;
+    if (std.ascii.startsWithIgnoreCase(uri, "https://")) return true;
+    return false;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -550,6 +574,40 @@ test "parseAiaOcspUrl: id-ad-ocsp with a non-URI accessLocation yields null (not
     const value = [_]u8{ 0x30, ad.len } ++ ad;
 
     try testing.expect((try parseAiaOcspUrl(&value)) == null);
+}
+
+// W2-A8/ocspcache-F5: `refresh` hands whatever `parseAiaOcspUrl` returns
+// straight to `Transport.fetch` (see `refresh` above). Before this fix,
+// *any* accessLocation scheme was accepted verbatim — an AIA extension
+// pointing at `file:///etc/passwd` or an internal `http://169.254.169.254/`
+// metadata endpoint would be handed to the transport unchanged, an SSRF
+// primitive for any caller that ever runs this over a peer-supplied
+// certificate. Only `http(s)://` may be returned.
+test "parseAiaOcspUrl: non-http(s) scheme (file://) is rejected, not returned as a URL" {
+    const url = "file:///etc/passwd";
+    const method = [_]u8{ 0x06, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+    const loc = [_]u8{ 0x86, url.len } ++ url.*;
+    const ad = [_]u8{ 0x30, method.len + loc.len } ++ method ++ loc;
+    const value = [_]u8{ 0x30, ad.len } ++ ad;
+
+    try testing.expect((try parseAiaOcspUrl(&value)) == null);
+}
+
+test "parseAiaOcspUrl: non-http(s) scheme entry is skipped in favor of a later valid http(s) entry" {
+    const bad_url = "gopher://internal.example.org/x";
+    const bad_method = [_]u8{ 0x06, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+    const bad_loc = [_]u8{ 0x86, bad_url.len } ++ bad_url.*;
+    const bad_ad = [_]u8{ 0x30, bad_method.len + bad_loc.len } ++ bad_method ++ bad_loc;
+
+    const good_url = "https://ocsp.example.org/";
+    const good_method = [_]u8{ 0x06, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+    const good_loc = [_]u8{ 0x86, good_url.len } ++ good_url.*;
+    const good_ad = [_]u8{ 0x30, good_method.len + good_loc.len } ++ good_method ++ good_loc;
+
+    const value = [_]u8{ 0x30, bad_ad.len + good_ad.len } ++ bad_ad ++ good_ad;
+
+    const got = (try parseAiaOcspUrl(&value)).?;
+    try testing.expectEqualStrings(good_url, got);
 }
 
 test "parseAiaOcspUrl: caIssuers-only (no id-ad-ocsp) yields null" {

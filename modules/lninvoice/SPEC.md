@@ -176,6 +176,29 @@ signing the donation vector's own hash with its own documented private key repro
 exact `(r, s, recid)` byte-for-byte, and recovering from that freshly-signed signature reproduces
 the spec's node ID — signer and verifier agree end-to-end.
 
+`UNVERIFIED:` **BOLT#11 ENCODE has no byte-exact external anchor** (wave-2 audit F4). Every check
+above pins DECODE against the spec's own worked examples, and pins the *signature* half of ENCODE
+(RFC 6979 hash-signing reproduces the spec's exact `(r, s, recid)`, byte-for-byte). What is NOT
+pinned is the *serializer*: the tagged-field bit-packing, `data_length` header and field ordering
+`encode()` emits are checked only against this module's OWN `decode()` — a round trip, not an
+anchor (the hazard the campaign's own methodology names explicitly: encoder and decoder sharing one
+author's convention proves agreement, not correctness). The one documented reason: the spec's own
+donation-invoice vector's `9` (features) field uses non-minimal bech32 padding this encoder does not
+bit-for-bit reproduce, so that specific vector cannot be asserted byte-exact through the full encode
+pipeline (`bolt11.zig`'s RFC 6979 test comment). A direct check was attempted for this audit finding
+using a DIFFERENT spec vector without a `9` field (the donation invoice itself, `payment_hash` +
+`payment_secret` + `description`, signed with the spec's own documented private key so the
+signature bytes are reproducible) — the encoded output did **not** match the spec's string
+byte-for-byte, and the divergence starts well before the signature, in the tagged-field region
+itself; a few minutes of investigation did not isolate the layout difference (padding vs field-order
+vs a `data_length`/multiplier interaction is unconfirmed from a quick pass), so pinning down the
+exact behavioral gap needs a real investigation, not a guess. Closing this needs either (a) a
+third-party-generated BOLT#11 invoice (CLN's or LDK's own test corpus, or a fresh vector from either
+implementation) whose exact string this encoder can reproduce field-for-field, or (b) diagnosing and
+fixing the layout divergence the quick attempt above surfaced and THEN re-attempting a spec-vector
+match. Until one of those lands, treat `encode()`'s serializer (as opposed to its signature) as
+unverified against any implementation but its own.
+
 **BOLT#12 offer**: a hand-built minimal offer round-tripped through `lnwire.tlv.appendStream` →
 `bitpack.bytesToQuintets` → `bech32_raw.encodeNoChecksum` → `decodeOffer` (independently
 constructed, not hand-typed hex), `+`-continuation stripping, wrong-prefix rejection, and the
