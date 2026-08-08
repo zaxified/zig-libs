@@ -134,10 +134,10 @@ test "oracle vectors: captured payloads are well-formed JSON and internally cons
     // introduced while freezing these -- a corrupted capture would fail here,
     // not silently pass a looser check).
     inline for (.{
-        init_request, init_response_json, notifications_initialized_request,
-        tools_list_request, tools_list_response_json, echo_call_request,
-        echo_call_response_json, work_call_request, progress_1_json,
-        progress_2_json, work_call_response_json,
+        init_request,            init_response_json,       notifications_initialized_request,
+        tools_list_request,      tools_list_response_json, echo_call_request,
+        echo_call_response_json, work_call_request,        progress_1_json,
+        progress_2_json,         work_call_response_json,
     }) |payload| {
         var parsed = try std.json.parseFromSlice(std.json.Value, gpa, payload, .{});
         parsed.deinit();

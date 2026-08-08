@@ -198,8 +198,8 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
             \\    (header + pad-to-16 + AEAD + counter limits [+ replay window on open])
             \\
         , .{
-            seal_ns,      1000.0 / seal_ns, @as(f64, mtu) / seal_ns * 1000.0,
-            open_ns,      1000.0 / open_ns, @as(f64, mtu) / open_ns * 1000.0,
+            seal_ns, 1000.0 / seal_ns, @as(f64, mtu) / seal_ns * 1000.0,
+            open_ns, 1000.0 / open_ns, @as(f64, mtu) / open_ns * 1000.0,
         });
     }
 

@@ -597,7 +597,7 @@ test "header: byte-exact layout, type 4 with zero reserved bytes" {
     var buf: [64]u8 = undefined;
     const r = try s.seal(&buf, "hi");
     try testing.expectEqualSlices(u8, &.{
-        4,    0,    0,    0, // type = 4, three RESERVED ZERO bytes
+        4, 0, 0, 0, // type = 4, three RESERVED ZERO bytes
         0x44, 0x33, 0x22, 0x11, // receiver_index, little-endian
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // counter, little-endian
     }, buf[0..header_len]);

@@ -417,10 +417,8 @@ fn buildNative(gpa: std.mem.Allocator, b: *wire.Batch, programs: *[rule_count]ex
     });
 
     const chains = [rule_count][]const u8{
-        "input", "input", "input", "input", "input", "input", "input", "input", "input",
-        helper_chain,
-        post_chain, post_chain,
-        pre_chain,
+        "input",      "input",    "input",    "input",   "input", "input", "input", "input", "input",
+        helper_chain, post_chain, post_chain, pre_chain,
     };
 
     programs[0] = expr.Program.init(gpa, .inet);

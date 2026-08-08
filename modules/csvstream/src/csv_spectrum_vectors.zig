@@ -57,8 +57,7 @@ pub const vectors = [_]Vector{
         .name = "location_coordinates",
         .csv = @embedFile("testdata/csv-spectrum/csvs/location_coordinates.csv"),
         .json = @embedFile("testdata/csv-spectrum/json/location_coordinates.json"),
-        .out_of_scope =
-        "the corpus fixture pair itself is internally inconsistent: " ++
+        .out_of_scope = "the corpus fixture pair itself is internally inconsistent: " ++
             "json/location_coordinates.json's phone number (\"1234567890\") " ++
             "does not match its own csvs/location_coordinates.csv row " ++
             "(\"2095257564\"), and its JSON is a bare object -- every other " ++
