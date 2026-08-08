@@ -68,19 +68,33 @@ pub const Route = struct {
     metric: u64,
 };
 
-/// Tuning for `computeWith`. The defaults are the correct/safe behaviour;
-/// `require_two_way = false` exists only for the permanent positive control.
-pub const Options = struct {
-    /// The ISO §7.2.8.2 two-way connectivity check. When `true` (default,
-    /// correct) the link A–B is admitted to SPF only if BOTH A advertises B
-    /// and B advertises A; each direction then relaxes at its own advertised
-    /// metric. When `false` a *single* directed advertisement is enough, and
-    /// the missing direction is mirrored from the one that exists —
-    /// deliberately WRONG (a one-way/stale advertisement poisons the tree);
-    /// kept solely to prove, in a permanent test, that the two-way check is
-    /// load-bearing.
-    require_two_way: bool = true,
+/// RFC 5305 §3: "A value of 'MaxLinkMetric' ... MUST NOT be advertised... A
+/// link with this metric MUST not be considered during the normal SPF
+/// computation." The mechanism a TE-only / MPLS-TE / LFA-staging link uses to
+/// stay advertised (so its existence is still visible to traffic engineering)
+/// while being excluded from ordinary shortest-path routing.
+///
+/// RFC 5305 §3 also defines `MaxPathMetric` (0xFE000000), a ceiling on the
+/// SUMMED cost along a path, which this module does NOT enforce: at u24-per-
+/// hop metrics (max 0xFFFFFE once the value above is excluded), reaching that
+/// ceiling needs on the order of 254 concatenated near-max-metric hops — not
+/// a fixture that can be driven RED at a defensible size, and no path this
+/// module's own callers construct can plausibly reach it. Left as a known,
+/// intentionally deferred gap rather than shipped unproven; see W2
+/// `isis-spf` F2 in `~/CML/audit`.
+pub const max_link_metric: u32 = 0xFFFFFF;
 
+/// Tuning for `computeWith`. The defaults are the correct/safe behaviour.
+///
+/// This struct deliberately does NOT expose a way to disable the ISO §7.2.8.2
+/// two-way connectivity check — see W2 `isis-spf` F6 in `~/CML/audit`: that
+/// knob used to be a public field here (`require_two_way: bool = true`),
+/// reachable by any production caller with nothing stopping it from being
+/// passed `false` by accident. The deliberately-WRONG two-way-disabled path
+/// still exists, as `computeWithBrokenTwoWayForTesting` below, but that
+/// function is NOT `pub` — it is unreachable from outside this file (and
+/// therefore from every other module) by construction, not by convention.
+pub const Options = struct {
     /// Refuse a database that carries an asymmetric link at all — an
     /// **opt-in fabric-hygiene check, not a correctness guard**.
     ///
@@ -173,7 +187,9 @@ pub fn compute(gpa: Allocator, db: *const lsdb.Lsdb, local: SystemId, now: Time)
     };
 }
 
-/// `compute` with explicit `Options`.
+/// `compute` with explicit `Options`. Always runs with the correct ISO
+/// §7.2.8.2 two-way connectivity check — see `Options` for why that is not a
+/// choice this function offers.
 ///
 /// Degenerate cases (all documented, none panic):
 ///   - **Empty LSDB / local has no LSP** — the local system is not in the graph,
@@ -192,6 +208,37 @@ pub fn computeWith(
     local: SystemId,
     now: Time,
     opts: Options,
+) Error!RouteTable {
+    return computeInternal(gpa, db, local, now, .{ .require_two_way = true, .reject_asymmetric = opts.reject_asymmetric });
+}
+
+/// The two-way-check-disabled path — deliberately WRONG (a one-way/stale
+/// advertisement poisons the tree) — kept solely so a permanent test can
+/// prove the two-way check in `computeInternal` is load-bearing (W2
+/// `isis-spf` F6). NOT `pub`: unreachable outside this file, so no production
+/// caller can pass `require_two_way = false` by accident the way the old
+/// public `Options` field allowed.
+fn computeWithBrokenTwoWayForTesting(
+    gpa: Allocator,
+    db: *const lsdb.Lsdb,
+    local: SystemId,
+    now: Time,
+    reject_asymmetric: bool,
+) Error!RouteTable {
+    return computeInternal(gpa, db, local, now, .{ .require_two_way = false, .reject_asymmetric = reject_asymmetric });
+}
+
+const InternalOptions = struct {
+    require_two_way: bool,
+    reject_asymmetric: bool,
+};
+
+fn computeInternal(
+    gpa: Allocator,
+    db: *const lsdb.Lsdb,
+    local: SystemId,
+    now: Time,
+    opts: InternalOptions,
 ) Error!RouteTable {
     // ── 1. extract directed advertisements + the set of LSP origins ──────────
     // directed: (from ++ to) → best (minimum) advertised metric, from ⟶ to.
@@ -221,6 +268,13 @@ pub fn computeWith(
                 var eit = isis.tlvs.ExtIsReachIterator.init(t.value);
                 while (eit.next() catch break) |e| {
                     if (e.neighbour_id[6] != 0) continue; // pseudonode neighbour
+                    // RFC 5305 §3 max-link-metric: this direction MUST NOT be
+                    // considered during normal SPF. Excluded outright — not
+                    // added as an edge at all — rather than admitted at its
+                    // (very expensive) face value, so it cannot become the
+                    // path of last resort when nothing else reaches the
+                    // destination.
+                    if (e.metric == max_link_metric) continue;
                     try addDirected(gpa, &directed, from, e.neighbour_id[0..6].*, e.metric);
                 }
             },
@@ -574,14 +628,14 @@ test "positive control: disabling the two-way check DOES use the one-way edge" {
 
     // Correct behaviour: B unreachable.
     {
-        var table = try computeWith(testing.allocator, &db, a, 0, .{ .require_two_way = true });
+        var table = try computeWith(testing.allocator, &db, a, 0, .{});
         defer table.deinit();
         try testing.expect(table.lookup(b) == null);
     }
     // Deliberately-broken control: the one-way edge is admitted, so B routes —
     // proving the two-way check is exactly what excludes it above.
     {
-        var table = try computeWith(testing.allocator, &db, a, 0, .{ .require_two_way = false });
+        var table = try computeWithBrokenTwoWayForTesting(testing.allocator, &db, a, 0, false);
         defer table.deinit();
         try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 10 }, table.lookup(b).?);
     }
@@ -941,6 +995,50 @@ test "dangling neighbour (advertised, no LSP of its own) is unreachable, not a c
     try testing.expect(table.lookup(ghost) == null);
 }
 
+// Regression (audit W2 `isis-spf` F2): RFC 5305 §3's max-link-metric
+// (0xFFFFFF) MUST NOT be considered during normal SPF — it is the mechanism a
+// TE-only / MPLS-TE / LFA-staging link uses to stay advertised while being
+// excluded from ordinary routing. Before the fix, `e.metric` went straight
+// into `addDirected` unfiltered, so a max-metric link became a usable (if
+// very expensive) edge and could still be selected as the path of last
+// resort when nothing else reached the destination — exactly the case here.
+test "RFC 5305 max-link-metric (0xFFFFFF): excluded from SPF, destination unreachable when it is the only path" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+
+    // A—B is the ONLY link, and it is advertised (both ways, so the two-way
+    // check would otherwise admit it) at the max-link-metric value.
+    try insertReachLsp(&db, a, 1, &.{.{ .nbr = b, .metric = max_link_metric }});
+    try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = max_link_metric }});
+
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    // Only the self route: B is excluded, not admitted at cost 16777215.
+    try testing.expectEqual(@as(usize, 1), table.routes.len);
+    try testing.expect(table.lookup(b) == null);
+}
+
+test "RFC 5305 max-link-metric: a normal alternate path is still used when one direction is max-metric" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+
+    // A—B direct is max-metric (excluded); A—C—B is a normal 20-cost detour.
+    try insertReachLsp(&db, a, 1, &.{ .{ .nbr = b, .metric = max_link_metric }, .{ .nbr = c, .metric = 10 } });
+    try insertReachLsp(&db, b, 1, &.{ .{ .nbr = a, .metric = max_link_metric }, .{ .nbr = c, .metric = 10 } });
+    try insertReachLsp(&db, c, 1, &.{ .{ .nbr = a, .metric = 10 }, .{ .nbr = b, .metric = 10 } });
+
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    const r = table.lookup(b).?;
+    try testing.expectEqual(c, r.next_hop); // via C, not the direct (excluded) link
+    try testing.expectEqual(@as(u64, 20), r.metric);
+}
+
 test "empty LSDB → empty table; local absent → empty table" {
     const a = sysId(0xA);
     const b = sysId(0xB);
@@ -1063,7 +1161,7 @@ test "two-way check with require_two_way=false: only the hi->lo advertisement ex
     try insertReachLsp(&db, a, 1, &.{});
     try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 15 }});
 
-    var table = try computeWith(testing.allocator, &db, a, 0, .{ .require_two_way = false });
+    var table = try computeWithBrokenTwoWayForTesting(testing.allocator, &db, a, 0, false);
     defer table.deinit();
     try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 15 }, table.lookup(b).?);
 }
@@ -1393,4 +1491,24 @@ test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.util, meta.role);
     try testing.expectEqual(.single_owner, meta.concurrency);
+}
+
+// Regression (audit W2 `isis-spf` F6): the ISO §7.2.8.2 two-way-check toggle
+// must not be reachable through the public API `Options` struct — that is
+// precisely what let production code disable it by accident before this fix
+// (`require_two_way: bool = true` was a plain field on `pub const Options`,
+// and `computeWith` took `Options` directly). The disabled-two-way path still
+// exists (`computeWithBrokenTwoWayForTesting`, used by the two tests above),
+// but it is a bare, non-`pub` function — invisible to every other module,
+// which can only see this file's `pub` declarations. `@hasField` pins the
+// compile-time fact that closes this gap: if `require_two_way` (or any field
+// spelled like it) is ever added back to `Options`, this test catches it
+// immediately, without needing a separate cross-module compile-fail harness.
+test "the two-way-check toggle is not a field of the public Options struct" {
+    try testing.expect(!@hasField(Options, "require_two_way"));
+    // Guard against the same gap under a different name.
+    const info = @typeInfo(Options).@"struct";
+    inline for (info.fields) |f| {
+        try testing.expect(std.mem.indexOf(u8, f.name, "two_way") == null);
+    }
 }

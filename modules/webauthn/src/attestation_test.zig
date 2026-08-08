@@ -48,6 +48,8 @@ test "verifyAttestation: real W3C §16.2 vector (fmt=none)" {
     try testing.expectEqual(webauthn.AttestationType.none, result.attestation_type);
     try testing.expectEqualStrings("none", result.format);
     try testing.expectEqualSlices(u8, &v.credential_id, result.credential_id);
+    // Regression (audit W2 `webauthn` F6): no certificate for `fmt == "none"`.
+    try testing.expect(result.leaf_cert_der == null);
 }
 
 test "verifyAttestation: real W3C §16.3 vector (fmt=packed, self attestation)" {
@@ -60,6 +62,8 @@ test "verifyAttestation: real W3C §16.3 vector (fmt=packed, self attestation)" 
     const result = try webauthn.verifyAttestation(a, &v.attestation_object, hash);
     try testing.expectEqual(webauthn.AttestationType.self_attestation, result.attestation_type);
     try testing.expectEqualSlices(u8, &v.credential_id, result.credential_id);
+    // Regression (audit W2 `webauthn` F6): self-attestation carries no x5c.
+    try testing.expect(result.leaf_cert_der == null);
 }
 
 test "verifyAttestation: real W3C §16.7 vector (fmt=packed, x5c/basic, ES256)" {
@@ -72,6 +76,13 @@ test "verifyAttestation: real W3C §16.7 vector (fmt=packed, x5c/basic, ES256)" 
     try testing.expectEqual(webauthn.AttestationType.basic, result.attestation_type);
     try testing.expectEqualSlices(u8, &v.credential_id, result.credential_id);
     try testing.expect(result.credential_public_key == .ec2);
+    // Regression (audit W2 `webauthn` F6): `.basic` exposes the leaf DER it
+    // actually verified against, so a caller can chain it (`x509.verifyChain`
+    // against an MDS-derived trust store) instead of trusting the enum name
+    // alone — byte-exact against the same x5c[0] independently re-extracted
+    // from the raw CBOR, not merely "non-null".
+    const expected_leaf = try realX5c(a, &v.attestation_object);
+    try testing.expectEqualSlices(u8, expected_leaf, result.leaf_cert_der.?);
 }
 
 test "verifyAttestation: real W3C §16.10 vector (fmt=packed, x5c/basic, RS256 credential)" {
@@ -113,6 +124,10 @@ test "verifyAttestation: real W3C §16.16 vector (fmt=fido-u2f)" {
     try testing.expectEqual(webauthn.AttestationType.basic, result.attestation_type);
     try testing.expectEqualSlices(u8, &v.credential_id, result.credential_id);
     try testing.expect(result.credential_public_key == .ec2);
+    // Regression (audit W2 `webauthn` F6): fido-u2f's `.basic` also exposes
+    // the leaf it verified against, same contract as `packed`/x5c.
+    const expected_leaf = try realX5c(a, &v.attestation_object);
+    try testing.expectEqualSlices(u8, expected_leaf, result.leaf_cert_der.?);
 }
 
 // ── deferred formats: structurally recognized and rejected ─────────────────

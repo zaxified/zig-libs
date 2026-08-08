@@ -134,8 +134,19 @@ pub const Framer = struct {
     /// Switch framing. Only legal at a message boundary: after the hello
     /// exchange the very next byte belongs to the new dialect, and a decoder
     /// that let the dialect move mid-frame would mis-split the stream.
+    ///
+    /// Delegates to `atBoundary` rather than re-deriving the condition: this
+    /// used to check only `!in_message and msg.items.len == 0`, missing
+    /// `atBoundary`'s third clause (`pending.items.len == cursor` — bytes
+    /// already fed via `feed` but not yet consumed by a `next` call). The two
+    /// boundary predicates disagreeing meant a caller who fed bytes for the
+    /// next message without draining them first could switch dialect mid-buffer
+    /// while `setDialect` still reported success. Not currently reachable via
+    /// `Client.hello`, which calls `setDialect` immediately after `receive`
+    /// with nothing left unconsumed — but `setDialect` is public API, so the
+    /// gap was real for any other caller.
     pub fn setDialect(self: *Framer, d: Dialect) error{MidMessage}!void {
-        if (self.in_message or self.msg.items.len != 0) return error.MidMessage;
+        if (!self.atBoundary()) return error.MidMessage;
         self.dialect = d;
         self.chunk_left = 0;
         self.got_chunk = false;
@@ -660,6 +671,27 @@ test "dialect switch is only legal at a message boundary" {
     try f.feed("\n#11\n<rpc>]]>]]>\n##\n");
     const m = (try f.next()).?;
     try testing.expectEqualStrings("<rpc>]]>]]>", m);
+}
+
+test "dialect switch rejects fed-but-undrained bytes, not just an in-progress message" {
+    // `setDialect` used to check `!in_message and msg.items.len == 0`, missing
+    // `atBoundary`'s third clause (`pending.items.len == cursor`). A complete
+    // message's bytes, `feed`-ed but never drained by a `next` call, satisfy
+    // the old (weaker) condition -- `in_message` is false and `msg` is empty,
+    // both true before `next` has even looked at the buffer -- so `setDialect`
+    // used to accept here even though `atBoundary()` was already false.
+    const gpa = testing.allocator;
+    var f: Framer = .init(gpa, .end_of_message, .{});
+    defer f.deinit();
+    try f.feed("<hello/>]]>]]>");
+    try testing.expect(!f.atBoundary()); // fed, not yet drained via `next`
+    try testing.expectError(error.MidMessage, f.setDialect(.chunked));
+
+    // Draining reaches a real boundary, and the switch is legal again.
+    const hello = (try f.next()).?;
+    try testing.expectEqualStrings("<hello/>", hello);
+    try testing.expect(f.atBoundary());
+    try f.setDialect(.chunked);
 }
 
 test "chunked: a stray LF from a `]]>]]>\\n`-terminated hello is tolerated, not a header error" {

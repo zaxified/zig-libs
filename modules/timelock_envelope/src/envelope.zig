@@ -135,10 +135,21 @@ pub const OpenError = std.mem.Allocator.Error || error{
 
 /// The two content keys derived from both locks' secrets. `key` seals
 /// the content; `nonce` is derived alongside it (never stored on the
-/// wire) so there is no nonce-reuse footgun: the pair is a
-/// deterministic function of `(s_time, s_pq, round)`, and `s_time` /
-/// the HQC encapsulation randomness are freshly drawn per envelope, so
-/// `(key, nonce)` is effectively unique per seal.
+/// wire) so there is no nonce-reuse footgun *as long as the caller draws
+/// fresh randomness per seal*: the pair is a deterministic function of
+/// `(s_time, s_pq, suite_id, round)`, and `s_time` / the HQC encapsulation
+/// randomness are freshly drawn per envelope by `SealRandomness.generate`,
+/// so `(key, nonce)` is effectively unique per seal *in that case*.
+///
+/// **This module cannot enforce that.** `SealRandomness` is caller-supplied
+/// (see its own doc comment) — nothing in the type stops a caller from
+/// reusing one `SealRandomness` value for two `seal` calls to the same
+/// `(suite_id, round)`, and doing so reuses BOTH the ChaCha20-Poly1305 key
+/// and the nonce, since neither is transmitted or otherwise varied per
+/// call. Key+nonce reuse under ChaCha20-Poly1305 is a full break: XOR the
+/// two ciphertexts to recover the XOR of the two plaintexts, and a forged
+/// tag becomes computable from the two (ciphertext, tag) pairs. Draw a new
+/// `SealRandomness` for every `seal` call.
 pub const DerivedKeys = struct {
     key: [32]u8,
     nonce: [nonce_bytes]u8,
@@ -224,6 +235,16 @@ pub fn Envelope(comptime Kem: type) type {
             /// HQC `encaps` coins (`m || salt`).
             kem_coins: [Kem.coins_bytes]u8,
 
+            /// ⚠ Reuse consequence: `(key, nonce)` (see `DerivedKeys`) is a
+            /// deterministic function of `(s_time, s_pq, suite_id, round)`
+            /// and neither is transmitted, so sealing two different
+            /// plaintexts to the same recipient/round with the SAME
+            /// `SealRandomness` value reuses both the AEAD key and the
+            /// nonce — a full ChaCha20-Poly1305 break (plaintext-XOR
+            /// recovery, forgeable tags). This type does not and cannot
+            /// enforce freshness; the caller must draw a new value (e.g.
+            /// via `generate`) for every `seal` call.
+            ///
             /// Draw all three from a portable entropy source.
             pub fn generate(io: std.Io) SealRandomness {
                 var r: SealRandomness = undefined;

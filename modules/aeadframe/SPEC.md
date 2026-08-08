@@ -182,6 +182,22 @@ arbitrary bytes:
 - A `std.testing.fuzz` harness (`fuzzOpen`) drives `open` over Smith-generated
   bytes and asserts only a typed error or a plaintext length `≤` input — never a
   panic, OOB, or hang.
+- **No stream-termination signal — a per-record guarantee, not a stream one.**
+  Every guarantee above is about ONE record: tamper detection, replay
+  rejection, fail-closed on failure. Nothing in `header_len`/the record
+  format carries a terminator, a total-message-count, or any other marker of
+  "this is the last record." An attacker who truncates the underlying
+  transport after any complete, validly-authenticated record removes every
+  record after that point with no evidence left for `Opener` to detect —
+  each delivered record still authenticates individually. This is not a
+  defect specific to this module (ESP and DTLS 1.3 leave the identical gap
+  to a higher layer, e.g. a length-prefixed application message or an
+  explicit close-notify), but this module's own docs previously did not say
+  so despite framing itself as a complete record layer. **The caller's
+  transport/application layer is responsible for detecting stream
+  truncation** — e.g. a length-prefixed outer message, a sequence-number
+  gap check against an expected total, or an explicit terminator record the
+  caller defines above this layer. `aeadframe` does not provide one.
 
 ## 7. Verification
 

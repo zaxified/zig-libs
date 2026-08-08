@@ -193,7 +193,15 @@ spraying novel source MACs to exhaust memory. Bounds, all hard:
   worst-case footprint below is a function of what the *operator* provisioned,
   never of received traffic. This matters because that footprint is large by
   construction — at the defaults `max_isids × max_macs_per_isid` is 4096 × 8192
-  FDB entries — and reaching it must require control-plane access.
+  = 33,554,432 FDB entries, at LEAST ~500 MiB of raw `(Mac, FdbEntry)` bytes
+  before `AutoHashMapUnmanaged`'s own bookkeeping overhead (control bytes,
+  load-factor headroom) adds more on top — **not a bound an edge PE with a
+  modest memory budget should treat as free**, only as "will not grow past
+  this." Lower the defaults (or `max_isids` specifically, the dominant
+  factor) for a memory-constrained deployment; the `SELF` test pinning this
+  estimate lives in `root.zig` so a future field added to `FdbEntry` cannot
+  silently make this paragraph stale — and reaching it must still require
+  control-plane access.
 - **`max_mac_moves` / `mac_move_window`** bound MAC *churn* rather than memory:
   a flapping MAC costs no extra entry, and duplicate detection stops an endless
   hijack loop (see the MAC-move policy).

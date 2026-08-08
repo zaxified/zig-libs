@@ -33,6 +33,43 @@ declares no maxima for its strings. A reply that overruns one is
 `error.BadLength`, **never** a truncation: a silently shortened device name is
 a different device.
 
+**`Handle.parse` vs `PortHandle.parse` — anchored against the real CLI, not
+just self-consistent.** `Handle.parse` scans forward for one `/` and rejects a
+second one (a port-suffixed string); `PortHandle.parse` scans backward for the
+LAST `/` and requires the tail to be a valid port index. Whether this actually
+matches what the `devlink` binary itself accepts and rejects for its own
+`bus_name/dev_name` vs `bus_name/dev_name/port_index` forms was previously
+`UNVERIFIED` — checked only against this module's own round trip. Verified
+live against **iproute2 6.19.0's `devlink`** (same tool/version §4.1's byte-
+exact goldens are captured from) on a hardware-less host — no real devlink
+instance needs to exist for these; the CLI's own argument parser rejects a
+malformed identification string BEFORE ever asking the kernel, distinguishably
+from "kernel answers: No such device" (a real device lookup that reached the
+kernel and failed):
+
+| command | input | real CLI result |
+|---|---|---|
+| `devlink dev show` | `pci/0000:65:00.0` | format accepted (`kernel answers: No such device`) |
+| `devlink dev show` | `pci/0000:65:00.0/3` | **format rejected**: `Wrong identification string format. Devlink identification ("bus_name/dev_name") expected` |
+| `devlink dev show` | `nothing-here` (no `/`) | **format rejected**, same message |
+| `devlink port show` | `pci/0000:65:00.0/3` | format accepted (`kernel answers: No such device`) |
+| `devlink port show` | `pci/0000:65:00.0/x` | **format rejected**: `Port index "x" is not a number or not within range` |
+| `devlink port show` | `pci/0000:65:00.0/3/4` | **format rejected**: `Wrong port identification string format. Expected "bus_name/dev_name/port_index" or "netdev_ifname"` |
+
+This confirms the core claim this module's tests already pin (`handle.zig`'s
+`"Handle.parse accepts bus/dev and refuses a port string"` and `"PortHandle.parse
+splits off the trailing index"`): a device-only command's grammar is exactly
+`bus/dev` (a port-suffixed string is rejected, matching `Handle.parse`'s inner-
+`/` check) and a port command's grammar accepts the `bus/dev/index` triple with
+a numeric tail (matching `PortHandle.parse`), with too many or non-numeric
+segments rejected either way. `Handle.parse`/`PortHandle.parse` locally reject
+some additional cases (e.g. an empty `bus`/`dev` component) that the real CLI's
+own parser lets through to the kernel round trip instead of catching in its
+argument parser — those are `validate()`'s own "reject locally what the kernel
+would reject anyway" optimization (see its doc comment), not part of the
+grammar boundary this anchor is about, and are not claimed to match the CLI's
+parser byte-for-byte.
+
 ### 2.2 Every decoder is a pure function over bytes
 
 `dev.parseDevice`, `dev.parseInfo`, `port.parse`, `param.parse`,

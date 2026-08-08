@@ -228,6 +228,19 @@ pub const InboundGroupSession = struct {
     /// Verify the signature, locate the ratchet, verify the MAC, then
     /// decrypt. See this file's module doc comment for why these are four
     /// distinct typed errors. Caller owns the returned plaintext.
+    ///
+    /// **`signing_key_verified` is advisory-only and NOT consulted here.**
+    /// The Ed25519 signature this function checks proves the message was
+    /// signed by whoever holds the private half of `self.signing_key` — it
+    /// says nothing about whether `signing_key` itself belongs to the
+    /// claimed sender. That is exactly what `signing_key_verified` tracks
+    /// (`true` after `fromSessionKey`, whose format self-authenticates the
+    /// embedded key; `false` after `fromExportedKey`, whose export carries
+    /// no such proof) — but `decrypt` returns a plaintext regardless of its
+    /// value, mirroring vodozemac's own advisory-flag design. A caller whose
+    /// threat model cares about sender attribution on a session imported via
+    /// `fromExportedKey` must check `signing_key_verified` itself before
+    /// trusting the result; this function will not do it for them.
     pub fn decrypt(self: *InboundGroupSession, allocator: std.mem.Allocator, msg: *const Message) DecryptError!DecryptedMessage {
         const sig_bytes = try msg.signatureBytes(allocator);
         defer allocator.free(sig_bytes);

@@ -891,6 +891,35 @@ test "openSecretKey rejects an unrecognized sig_alg/chk_alg/kdf_alg tag" {
     try std.testing.expectError(error.UnsupportedKdf, openSecretKey(gpa, bad_kdf_alg, "some password"));
 }
 
+// Regression (audit W2 `minisign` F3): only `openSecretKey`'s three tag
+// rejections had a test; the signature-file and public-key-file
+// `UnsupportedAlgorithm` reject paths (`parseSignatureFile`'s `sig_alg`
+// dispatch, `parsePublicKeyFile`'s `sig_alg` check) had none. Not exploitable
+// today — `verifyMessage` re-derives the algorithm from the tag independently
+// and fails closed on its own — but an untested reject path is a real gap:
+// deleting either check would have gone unnoticed.
+test "parseSignatureFile rejects an unrecognized sig_alg tag" {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const sig: RawSignature = .{ .sig_alg = .{ 'X', 'X' }, .key_number = @splat(0), .signature = @splat(0) };
+    try writeSignatureFile(&w, "comment", sig, "trusted comment", @splat(0));
+    try std.testing.expectError(error.UnsupportedAlgorithm, parseSignatureFile(w.buffered()));
+}
+
+test "parsePublicKeyFile rejects an unrecognized sig_alg tag" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const pk: RawPublicKey = .{ .sig_alg = .{ 'X', 'X' }, .key_number = @splat(0), .key = @splat(0) };
+    try writePublicKeyFile(&w, "comment", pk);
+    try std.testing.expectError(error.UnsupportedAlgorithm, parsePublicKeyFile(w.buffered()));
+}
+
+test "parsePublicKeyBase64 rejects an unrecognized sig_alg tag" {
+    const pk: RawPublicKey = .{ .sig_alg = .{ 'X', 'X' }, .key_number = @splat(0), .key = @splat(0) };
+    const b64 = PublicKeyCodec.encode(pk.toBytes());
+    try std.testing.expectError(error.UnsupportedAlgorithm, parsePublicKeyBase64(&b64));
+}
+
 test "parse: truncated / missing-line signature file, missing prefixes" {
     // Empty text still yields one (empty) "line" from the split iterator,
     // so this fails the prefix check, not a missing-line check.

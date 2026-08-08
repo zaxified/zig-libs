@@ -86,6 +86,17 @@ pub const meta = .{
 // EC2/OKP key types use); webauthn is the first consumer that needs RSA.
 const alg_rs256: i64 = -257;
 
+/// Minimum RS256 **credential** key modulus size this module accepts (W2
+/// `webauthn` F7). `rsa.PublicKey.fromBytes` alone only enforces its own
+/// generic `min_modulus_bits = 512` floor — a size chosen for RSA as a
+/// primitive in general, not for WebAuthn specifically. Every RS256 FIDO2/
+/// WebAuthn authenticator in practice generates 2048-bit keys (it is what
+/// the CTAP2/FIDO Alliance certification test suites require), so a
+/// credential key below that is not a smaller-but-legitimate authenticator —
+/// it is a signal something is wrong (a forged/downgraded credential, or a
+/// non-conforming authenticator this RP should not trust for RS256).
+const rs256_min_modulus_bits: usize = 2048;
+
 // ── COSE key extraction (extends cbor.cose with RFC 8230 RSA keys) ─────────
 
 /// An RSA `COSE_Key` (RFC 8230 §4, `kty=3`): the modulus `n` (label -1) and
@@ -314,6 +325,13 @@ pub fn verifySignature(key: CoseKey, alg: i64, msg: []const u8, sig: []const u8)
         .rsa => |rk| {
             if (alg != alg_rs256) return error.UnsupportedAlgorithm;
             const pk = rsa.PublicKey.fromBytes(rk.n, rk.e) catch return error.InvalidKey;
+            // W2 `webauthn` F7: WebAuthn RS256 credential keys are always
+            // 2048-bit in practice; `rsa`'s own floor (512) is a generic
+            // primitive-level bound, not a WebAuthn policy. Reject a
+            // credential key below the size every conforming authenticator
+            // actually generates, rather than accept whatever `rsa` alone
+            // considers merely "not too small to compute with".
+            if (pk.n.bits() < rs256_min_modulus_bits) return error.InvalidKey;
             rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig) catch return error.BadSignature;
         },
     }
@@ -418,6 +436,21 @@ pub const AttestationResult = struct {
     /// on request); `backup_eligible`/`backup_state` are reported for a
     /// caller with a passkey-portability policy, never acted on here.
     flags: AuthenticatorData.Flags,
+    /// The `x5c[0]` leaf certificate DER, when `attestation_type == .basic`
+    /// (i.e. `fmt` was `packed` with an `x5c` or `fido-u2f`) — `null` for
+    /// `.none`/`.self_attestation`, which have no certificate. This module
+    /// only parses and signature-checks the leaf (via `x509.safe`, W2
+    /// `webauthn` F1); it does NOT chain it, check validity dates, or check
+    /// `basicConstraints` (W2 `webauthn` F6 — that is why `.basic` means "the
+    /// statement is internally consistent", not "an authenticator vendor
+    /// vouched for this", see `AttestationResult.require_attestation`'s doc).
+    /// A caller that wants that stronger guarantee runs `x509.verifyChain`
+    /// (or an MDS-derived trust-store check of its own) against this DER
+    /// itself. Borrows from the `attestation_object_raw`/CBOR-arena bytes the
+    /// caller passed to `verifyAttestation`/`verifyRegistration` — valid only
+    /// as long as that input (and, for the allocating decode path, the arena)
+    /// is still alive.
+    leaf_cert_der: ?[]const u8 = null,
 };
 
 const AttestationObject = struct {
@@ -514,13 +547,21 @@ fn firstX5cDer(att_stmt: []const cbor.MapEntry) AttestationError!?[]const u8 {
     };
 }
 
+/// The attestation-statement dispatch result: the type, plus the leaf
+/// certificate DER when one was verified (`.basic` only — see
+/// `AttestationResult.leaf_cert_der`).
+const StatementResult = struct {
+    attestation_type: AttestationType,
+    leaf_cert_der: ?[]const u8 = null,
+};
+
 /// `packed` attestation statement (WebAuthn §8.2): x5c present -> basic
 /// attestation, verify `sig` over `authData || clientDataHash` with the
 /// leaf certificate's key; x5c absent -> self attestation, verify with the
 /// credential's own public key (the `alg` in `attStmt` and the algorithm
 /// bound to `credential_key` must agree — enforced inside `verifySignature`
 /// itself, which rejects any alg/key-family mismatch).
-fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key: CoseKey) AttestationError!AttestationType {
+fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key: CoseKey) AttestationError!StatementResult {
     const alg_v = cborMapGetStr(att_stmt, "alg") orelse return error.MissingField;
     const alg = alg_v.toI64() orelse return error.WrongType;
     const sig_v = cborMapGetStr(att_stmt, "sig") orelse return error.MissingField;
@@ -531,10 +572,10 @@ fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key
 
     if (try firstX5cDer(att_stmt)) |leaf_der| {
         try verifyLeafCertSignature(leaf_der, alg, msg, sig);
-        return .basic;
+        return .{ .attestation_type = .basic, .leaf_cert_der = leaf_der };
     }
     try verifySignature(credential_key, alg, msg, sig);
-    return .self_attestation;
+    return .{ .attestation_type = .self_attestation };
 }
 
 /// `fido-u2f` attestation statement (WebAuthn §8.6, U2F-era authenticators):
@@ -547,7 +588,7 @@ fn verifyFidoU2f(
     att_stmt: []const cbor.MapEntry,
     auth_data: AuthenticatorData,
     client_data_hash: [32]u8,
-) AttestationError!AttestationType {
+) AttestationError!StatementResult {
     const sig_v = cborMapGetStr(att_stmt, "sig") orelse return error.MissingField;
     const sig = switch (sig_v) {
         .bytes => |b| b,
@@ -576,7 +617,7 @@ fn verifyFidoU2f(
     });
 
     try verifyLeafCertSignature(leaf_der, cbor.cose.alg_es256, verification_data, sig);
-    return .basic;
+    return .{ .attestation_type = .basic, .leaf_cert_der = leaf_der };
 }
 
 /// The attestation-statement half of §7.1 (steps 19-21): dispatch on `fmt`
@@ -588,10 +629,10 @@ fn verifyStatement(
     obj: AttestationObject,
     att: AttestedCredentialData,
     client_data_hash: [32]u8,
-) AttestationError!AttestationType {
+) AttestationError!StatementResult {
     if (std.mem.eql(u8, obj.fmt, "none")) {
         if (obj.att_stmt.len != 0) return error.InvalidAttestationStatement;
-        return .none;
+        return .{ .attestation_type = .none };
     } else if (std.mem.eql(u8, obj.fmt, "packed")) {
         const msg = try std.mem.concat(allocator, u8, &.{ obj.auth_data_raw, &client_data_hash });
         return verifyPacked(obj.att_stmt, msg, att.credential_public_key);
@@ -604,10 +645,10 @@ fn verifyStatement(
 fn attestationResult(
     obj: AttestationObject,
     att: AttestedCredentialData,
-    attestation_type: AttestationType,
+    statement: StatementResult,
 ) AttestationResult {
     return .{
-        .attestation_type = attestation_type,
+        .attestation_type = statement.attestation_type,
         .format = obj.fmt,
         .credential_id = att.credential_id,
         .credential_public_key = att.credential_public_key,
@@ -615,6 +656,7 @@ fn attestationResult(
         .sign_count = obj.auth_data.sign_count,
         .rp_id_hash = obj.auth_data.rp_id_hash,
         .flags = obj.auth_data.flags,
+        .leaf_cert_der = statement.leaf_cert_der,
     };
 }
 
@@ -641,8 +683,8 @@ pub fn verifyAttestation(
 ) AttestationError!AttestationResult {
     const obj = try parseAttestationObject(allocator, attestation_object_raw);
     const att = obj.auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
-    const attestation_type = try verifyStatement(allocator, obj, att, client_data_hash);
-    return attestationResult(obj, att, attestation_type);
+    const statement = try verifyStatement(allocator, obj, att, client_data_hash);
+    return attestationResult(obj, att, statement);
 }
 
 // ── registration ceremony — WebAuthn §7.1 ──────────────────────────────────
@@ -725,10 +767,10 @@ pub fn verifyRegistration(
 
     var client_data_hash: [32]u8 = undefined;
     Sha256.hash(client_data_json, &client_data_hash, .{});
-    const attestation_type = try verifyStatement(allocator, obj, att, client_data_hash);
-    if (options.require_attestation and attestation_type == .none) return error.AttestationNotProvided;
+    const statement = try verifyStatement(allocator, obj, att, client_data_hash);
+    if (options.require_attestation and statement.attestation_type == .none) return error.AttestationNotProvided;
 
-    return attestationResult(obj, att, attestation_type);
+    return attestationResult(obj, att, statement);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -742,6 +784,41 @@ test {
 test "smoke: module compiles and CoseKey.alg dispatch works" {
     const key: CoseKey = .{ .ec2 = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &[_]u8{0} ** 32, .y = &[_]u8{0} ** 32 } };
     try std.testing.expectEqual(@as(?i64, cbor.cose.alg_es256), key.alg());
+}
+
+// Regression (audit W2 `webauthn` F7): an RS256 CREDENTIAL key below the
+// 2048-bit floor every conforming WebAuthn/FIDO2 authenticator actually
+// generates must be rejected — `rsa.PublicKey.fromBytes`'s own floor (512)
+// is a generic RSA-primitive bound, not a WebAuthn policy, so a genuinely
+// well-formed (real prime-product, real signature) 512-bit key must still be
+// refused HERE. Uses a real generated key + real signature — not a malformed
+// blob — so the rejection is specifically the modulus-size policy, not
+// `InvalidKey`/`BadSignature` for an unrelated reason.
+test "F7: an RS256 credential key below 2048 bits is rejected, not merely small-but-valid" {
+    var prng = std.Random.DefaultPrng.init(0x7732_5f66_375f_6b65); // "w2_f7_ke" tests only
+    const random = prng.random();
+
+    // 512 bits: passes rsa's own floor (512) and is a completely valid,
+    // freshly generated RSA key — the ONLY thing wrong with it is its size.
+    const kp = try rsa.generate(random, 512, 65537);
+    var n_buf: [rsa.max_modulus_len]u8 = undefined;
+    kp.public_key.n.toBytes(&n_buf, .big) catch unreachable;
+    var e_buf: [rsa.max_modulus_len]u8 = undefined;
+    kp.public_key.e.toBytes(&e_buf, .big) catch unreachable;
+
+    const msg = "webauthn F7 regression";
+    var sig_buf: [rsa.max_modulus_len]u8 = undefined;
+    const sig = try rsa.signPkcs1v15(kp.secret_key, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
+
+    // Sanity: `rsa` itself is happy with this key (it is a real, valid
+    // 512-bit RSA key and a real signature) — proves the rejection below
+    // comes from webauthn's OWN 2048-bit floor, not from `rsa` refusing a
+    // malformed key.
+    const pk = try rsa.PublicKey.fromBytes(&n_buf, &e_buf);
+    try rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig);
+
+    const key: CoseKey = .{ .rsa = .{ .alg = alg_rs256, .n = &n_buf, .e = &e_buf } };
+    try std.testing.expectError(error.InvalidKey, verifySignature(key, alg_rs256, msg, sig));
 }
 
 // ── fuzz: clientDataJSON + authenticatorData, never panic ──────────────────

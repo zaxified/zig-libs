@@ -17,11 +17,15 @@
 //! A permanent positive-control test pins the highest-SNPA direction.
 //!
 //! `elect` is a pure function: no allocation, no clock, no I/O. It scans the
-//! caller-supplied neighbour slice once and is independent of that slice's order
-//! (SNPAs are unique per LAN, so `(priority, snpa)` is a strict total order — no
-//! two distinct candidates compare equal). The caller derives the candidate set
-//! from received LAN Hellos + adjacency state; this file does not parse Hellos or
-//! track adjacency — it takes the neighbour view as input.
+//! caller-supplied neighbour slice once and is independent of that slice's
+//! order: `(priority, snpa, system_id)` is a strict total order, so no two
+//! distinct candidates compare equal — the system-id level only matters when
+//! two candidates share an SNPA (a duplicate/spoofed MAC), which ISO 10589
+//! itself leaves undefined; system-ids are always unique, so it still
+//! guarantees a deterministic winner rather than falling back to slice order.
+//! The caller derives the candidate set from received LAN Hellos + adjacency
+//! state; this file does not parse Hellos or track adjacency — it takes the
+//! neighbour view as input.
 
 const std = @import("std");
 
@@ -82,12 +86,24 @@ pub const Result = struct {
 
 /// Returns true iff candidate `a` outranks `b` for DIS: higher priority wins;
 /// on equal priority the numerically higher SNPA wins (unsigned big-endian
-/// compare). Strict — equal `(priority, snpa)` returns false — so the max-scan is
-/// deterministic. SNPAs are unique per LAN, so no two distinct candidates ever
-/// reach the `.eq` case in practice.
+/// compare); on equal priority AND equal SNPA the numerically higher system-id
+/// wins. Strict — equal `(priority, snpa, system_id)` returns false — so the
+/// max-scan is deterministic and total regardless of the caller's slice order.
+///
+/// SNPAs are supposed to be unique per LAN (ISO 10589 §8.4.5 implicitly assumes
+/// it, since it defines only the two-level tie-break), so the third level is a
+/// belt-and-braces total order for the one case ISO 10589 leaves undefined: a
+/// duplicate or spoofed SNPA on the LAN. System-ids ARE guaranteed unique (it is
+/// the router's own identity), so this makes the comparison a strict total order
+/// under every input, not just the well-formed one — without it, a duplicate
+/// SNPA made `(priority, snpa)` a non-total preorder, and the winner silently
+/// became whichever candidate the caller happened to list first, i.e.
+/// order-dependent and possibly disagreeing router-to-router on the same LAN.
 fn outranks(a: Candidate, b: Candidate) bool {
     if (a.priority != b.priority) return a.priority > b.priority;
-    return std.mem.order(u8, &a.snpa, &b.snpa) == .gt;
+    const snpa_order = std.mem.order(u8, &a.snpa, &b.snpa);
+    if (snpa_order != .eq) return snpa_order == .gt;
+    return std.mem.order(u8, &a.system_id, &b.system_id) == .gt;
 }
 
 /// Elect the DIS over `{local} ∪ neighbours`. Pure, allocation-free, and
@@ -209,6 +225,29 @@ test "determinism: the winner is independent of neighbour-slice order" {
         try testing.expectEqual(want.is_local_dis, got.is_local_dis);
         try testing.expectEqualSlices(u8, &want.lan_id, &got.lan_id);
     }
+    try testing.expectEqual(n2.system_id, want.dis_system_id);
+}
+
+// Regression (audit W2 `isis-dis` F3): a duplicate/spoofed SNPA must still
+// yield a deterministic, order-independent winner. Before the fix,
+// `(priority, snpa)` was not a total order when two candidates shared an
+// SNPA — `outranks` returned false both ways, so the max-scan's first-wins
+// fallback made the result depend on the caller's slice order (different
+// routers on the same LAN, fed the same candidate SET in different orders,
+// could elect different DISes). The system-id tie-break makes the order
+// total again.
+test "duplicate SNPA: the winner is still deterministic and order-independent" {
+    const local: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 10, .snpa = snpa(0x01) };
+    // n1 and n2 share an SNPA (spoofed/misconfigured) but differ in system-id.
+    const n1: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = snpa(0xAA) };
+    const n2: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 9 }, .priority = 64, .snpa = snpa(0xAA) }; // same SNPA, higher system-id
+    const orders = [_][2]Candidate{ .{ n1, n2 }, .{ n2, n1 } };
+    const want = elect(local, &orders[0]);
+    for (orders) |o| {
+        const got = elect(local, &o);
+        try testing.expectEqual(want.dis_system_id, got.dis_system_id);
+    }
+    // The higher system-id (n2) must win the tie, not whichever came first.
     try testing.expectEqual(n2.system_id, want.dis_system_id);
 }
 

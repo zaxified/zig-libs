@@ -91,6 +91,18 @@ pub const RejectReason = enum {
     /// nothing is mutated; the stranger can only be adopted once the incumbent's
     /// hold genuinely expires (`tick` → Down clears the neighbour).
     other_neighbor,
+    /// The IIH's Maximum Area Addresses (common-header field, ISO/IEC 10589
+    /// §9.6) differs from ours. ISO 10589 §8.2 requires such an IIH be
+    /// discarded outright — the two systems disagree on how many area
+    /// addresses an IS may carry, which is a numbering-plan mismatch, not a
+    /// routing decision either side can paper over.
+    max_area_mismatch,
+    /// A Level-1-only circuit's neighbour advertised no Area Addresses (#1)
+    /// TLV entry in common with `Config.local_areas`. ISO 10589 §8.2.2/§7.2.4:
+    /// a Level 1 adjacency requires a shared area; Level 2 does not (an
+    /// `.level1_2` circuit is left to still form its L2 component, so this
+    /// check applies only to pure `.level1` circuits — see `SPEC.md` §5).
+    area_mismatch,
 };
 
 pub const Transition = struct { from: State, to: State };
@@ -114,6 +126,18 @@ pub const Config = struct {
     /// Which IS levels this circuit runs. Used both to stamp our outgoing IIH and
     /// for the cheap level-compatibility reject on receive.
     circuit_type: isis.pdu.CircuitType = .level1_2,
+    /// Our Maximum Area Addresses (ISO/IEC 10589 §9.6), stamped on our outgoing
+    /// common header and compared against a received IIH's own value on receive
+    /// (§8.2: a mismatch is discarded, not merely logged).
+    max_area_addresses: u8 = isis.header.default_max_area_addresses,
+    /// Our area addresses (ISO 10589 §7.2.4), each a raw NSAP area prefix.
+    /// Empty (the default) means area-address matching is NOT enforced — this
+    /// module has no configuration source of its own, so an unconfigured area
+    /// list cannot be distinguished from "matching not wanted" and the check is
+    /// skipped rather than rejecting every neighbour. Only consulted for pure
+    /// `.level1` circuits (see `RejectReason.area_mismatch`). The slice is
+    /// borrowed, not copied: it must outlive the `Adjacency`.
+    local_areas: []const []const u8 = &.{},
     /// The holding-time we advertise (neighbour multiplies nothing — it uses this
     /// verbatim as *its* hold deadline for us). Same unit as `Time`.
     holding_time: u16 = @intCast(default_hold_multiplier * default_hello_interval),
@@ -136,6 +160,10 @@ pub const HelloFields = struct {
     holding_time: u16,
     local_circuit_id: u8,
     circuit_type: isis.pdu.CircuitType,
+    /// Our Maximum Area Addresses (ISO/IEC 10589 §9.6), stamped into the common
+    /// header so a peer checking it against its own `Config.max_area_addresses`
+    /// sees our real value rather than the wire default.
+    max_area_addresses: u8 = isis.header.default_max_area_addresses,
     /// Our TLV 240 payload: our current state, our extended circuit id, and —
     /// once we have heard the neighbour — the neighbour block echoing it.
     three_way: ThreeWayTlv,
@@ -149,6 +177,18 @@ pub const RxHello = struct {
     holding_time: u16,
     circuit_type: isis.pdu.CircuitType,
     local_circuit_id: u8,
+    /// The neighbour's Maximum Area Addresses (common-header field). Defaults to
+    /// the wire default (3) so existing callers that don't care about this check
+    /// (i.e. that model a neighbour running the default) keep compiling and
+    /// passing unchanged; a real `rxHelloBytes` caller always supplies the
+    /// decoded value.
+    max_area_addresses: u8 = isis.header.default_max_area_addresses,
+    /// The neighbour's Area Addresses (#1) TLV, raw (undecoded) value bytes, if
+    /// present. Only consulted when `Config.local_areas` is non-empty and the
+    /// circuit is pure `.level1`. Kept raw (not eagerly parsed into owned
+    /// storage) so `rxHello` stays allocation-free; a malformed inner record is
+    /// treated as "no shared area found" rather than corrupting the FSM.
+    neighbor_area_addresses: ?[]const u8 = null,
     /// The neighbour's TLV 240, if present. Absent means the neighbour is not
     /// speaking three-way (or omitted it): we can hear it but can never confirm
     /// the loop guard from it, so it can raise us at most to Initializing.
@@ -257,6 +297,7 @@ pub const Adjacency = struct {
             .holding_time = self.cfg.holding_time,
             .local_circuit_id = self.cfg.local_circuit_id,
             .circuit_type = self.cfg.circuit_type,
+            .max_area_addresses = self.cfg.max_area_addresses,
             .three_way = tw,
         };
     }
@@ -296,11 +337,14 @@ pub const Adjacency = struct {
         if (try isis.tlv.findFirst(p.tlv_bytes, three_way.tlv_code)) |val| {
             tw = try ThreeWayTlv.decode(val);
         }
+        const area_addresses = try isis.tlv.findFirst(p.tlv_bytes, isis.tlvs.code.area_addresses);
         return self.rxHello(.{
             .source_id = p.source_id,
             .holding_time = p.holding_time,
             .circuit_type = p.circuit_type,
             .local_circuit_id = p.local_circuit_id,
+            .max_area_addresses = p.header.max_area_addresses,
+            .neighbor_area_addresses = area_addresses,
             .three_way = tw,
         }, now);
     }
@@ -323,6 +367,24 @@ pub const Adjacency = struct {
         if ((@intFromEnum(rx.circuit_type) & @intFromEnum(self.cfg.circuit_type)) == 0) {
             return .{ .rejected = .level_mismatch };
         }
+        // Maximum Area Addresses (ISO 10589 §8.2): a neighbour disagreeing with
+        // us on how many area addresses an IS may carry is discarded outright,
+        // not merely noted — the two sides are running an incompatible
+        // numbering plan and nothing downstream can paper over that.
+        if (rx.max_area_addresses != self.cfg.max_area_addresses) {
+            return .{ .rejected = .max_area_mismatch };
+        }
+        // Area-address matching (ISO 10589 §8.2.2/§7.2.4): required only for a
+        // Level 1 adjacency. `.level1_2` is left unchecked here because this
+        // FSM tracks one combined state per circuit rather than split L1/L2
+        // sub-states — rejecting a `.level1_2` circuit on an area mismatch
+        // would also block the L2 component, which ISO 10589 says must still
+        // form. Skipped entirely when `local_areas` is unconfigured.
+        if (self.cfg.circuit_type == .level1 and self.cfg.local_areas.len != 0) {
+            if (!self.sharesArea(rx.neighbor_area_addresses)) {
+                return .{ .rejected = .area_mismatch };
+            }
+        }
         // One circuit, one neighbour (ISO/IEC 10589 §8.2.4). Once we have heard
         // a neighbour, only *that* system-id drives this adjacency. Checked
         // BEFORE any mutation, so a stranger's IIH refreshes no hold, overwrites
@@ -339,9 +401,13 @@ pub const Adjacency = struct {
         // ── accepted: refresh hold + record the neighbour ───────────────────
         self.hold_deadline = now + @as(Time, rx.holding_time);
         self.neighbor_system_id = rx.source_id;
-        if (rx.three_way) |tw| {
-            self.neighbor_ext_circuit_id = tw.extended_local_circuit_id;
-        }
+        // Unconditional, not just when a 240 is present: an accepted IIH that
+        // carries no TLV 240 at all means the neighbour has stopped (or never
+        // started) speaking RFC 5303, so any previously recorded extended
+        // circuit id is no longer current and must be cleared rather than left
+        // stale — otherwise `helloFields` keeps advertising a neighbour block
+        // for a handshake reference the peer withdrew.
+        self.neighbor_ext_circuit_id = if (rx.three_way) |tw| tw.extended_local_circuit_id else null;
 
         // ── three-way decision ──────────────────────────────────────────────
         // echoed == the neighbour's 240 names US (our system-id AND our extended
@@ -385,6 +451,25 @@ pub const Adjacency = struct {
         if (prev == .up and new_state != .up) eff.adjacency_down = .neighbor_restarted;
         return eff;
     }
+
+    /// True iff `neighbor_tlv` (a neighbour's raw Area Addresses #1 TLV value,
+    /// if any) names at least one area in common with `cfg.local_areas`. No
+    /// TLV at all, or a malformed inner record, is "no shared area" (false) —
+    /// fail closed rather than guess. `rxHello` cannot propagate an error, so
+    /// a bad record from `AreaAddressIterator` is swallowed here rather than
+    /// surfaced; a hostile PDU still cannot corrupt the FSM, it is just
+    /// treated as a mismatch.
+    fn sharesArea(self: *const Adjacency, neighbor_tlv: ?[]const u8) bool {
+        const raw = neighbor_tlv orelse return false;
+        var it = isis.tlvs.AreaAddressIterator.init(raw);
+        while (true) {
+            const area = it.next() catch return false;
+            const a = area orelse return false;
+            for (self.cfg.local_areas) |local| {
+                if (std.mem.eql(u8, local, a)) return true;
+            }
+        }
+    }
 };
 
 /// Convenience: build a complete P2P IIH into `buf` from `HelloFields`, using the
@@ -396,6 +481,7 @@ pub fn buildHello(buf: []u8, f: HelloFields) error{ BufferTooSmall, ValueTooLong
         .holding_time = f.holding_time,
         .local_circuit_id = f.local_circuit_id,
         .circuit_type = f.circuit_type,
+        .max_area_addresses = f.max_area_addresses,
     }) catch return error.BufferTooSmall;
     var val_buf: [15]u8 = undefined;
     const val = f.three_way.encode(&val_buf) catch |e| switch (e) {
@@ -460,6 +546,202 @@ test "rxHello before start is rejected as not_started" {
     var adj = Adjacency.init(cfgA());
     const e = adj.rxHello(.{ .source_id = sys_b, .holding_time = 30, .circuit_type = .level1_2, .local_circuit_id = 1 }, 1);
     try testing.expectEqual(RejectReason.not_started, e.rejected.?);
+}
+
+// Regression (audit W2 `isis-adj` F2): ISO/IEC 10589 §8.2 requires an IIH
+// whose Maximum Area Addresses differs from ours to be discarded. Before the
+// fix, `RxHello` had no place to carry the field at all — `rxHelloBytes`
+// decoded and then threw it away — so a neighbour advertising a different
+// value reached Up exactly as if it agreed with us.
+test "Maximum Area Addresses mismatch is rejected, no state change" {
+    var adj = Adjacency.init(cfgA()); // cfgA: max_area_addresses defaults to 3
+    _ = adj.start(0);
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .max_area_addresses = 5, // disagrees with our 3
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 },
+        },
+    }, 1);
+    try testing.expectEqual(RejectReason.max_area_mismatch, e.rejected.?);
+    try testing.expectEqual(State.down, adj.currentState());
+    try testing.expect(adj.neighbor_system_id == null);
+}
+
+// Same defect, driven end-to-end through the real `isis` wire codec (not just
+// the RxHello struct literal), so the fix is proven against actual decoded
+// bytes and not just against a test that happens to populate the new field.
+test "rxHelloBytes rejects a real wire IIH advertising a different Maximum Area Addresses" {
+    var pdu_buf: [128]u8 = undefined;
+    var pb = try isis.pdu.P2pHelloBuilder.init(&pdu_buf, .{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .max_area_addresses = 5, // != cfgA()'s default of 3
+    });
+    var val_buf: [15]u8 = undefined;
+    const tw: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 };
+    const val = try tw.encode(&val_buf);
+    try pb.tlvs.addTlv(three_way.tlv_code, val);
+    const wire = pb.finish();
+
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    const e = try adj.rxHelloBytes(wire, 1);
+    try testing.expectEqual(RejectReason.max_area_mismatch, e.rejected.?);
+    try testing.expectEqual(State.down, adj.currentState());
+}
+
+// Regression (audit W2 `isis-adj` F3): a pure Level-1 P2P adjacency must not
+// reach Up with a neighbour whose Area Addresses (#1) TLV shares no area with
+// ours. Before the fix there was no such check at all — `SPEC.md` documented
+// it as a deferred hook, but the audit's own probe showed a neighbour
+// advertising a disjoint area (`49.9999` against our configured area) still
+// reached Up.
+test "L1 adjacency with a disjoint area is rejected once local_areas is configured" {
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .circuit_type = .level1,
+        .local_areas = &.{&our_area},
+    });
+    _ = adj.start(0);
+
+    const disjoint_area = [_]u8{ 0x49, 0x99, 0x99 };
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1,
+        .local_circuit_id = 1,
+        .neighbor_area_addresses = &[_]u8{disjoint_area.len} ++ disjoint_area,
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 },
+        },
+    }, 1);
+    try testing.expectEqual(RejectReason.area_mismatch, e.rejected.?);
+    try testing.expectEqual(State.down, adj.currentState());
+}
+
+test "L1 adjacency with a shared area reaches Up" {
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .circuit_type = .level1,
+        .local_areas = &.{&our_area},
+    });
+    _ = adj.start(0);
+
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1,
+        .local_circuit_id = 1,
+        .neighbor_area_addresses = &[_]u8{our_area.len} ++ our_area, // same area
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 },
+        },
+    }, 1);
+    try testing.expect(e.adjacency_up);
+    try testing.expectEqual(State.up, adj.currentState());
+}
+
+// Driven end-to-end through the real `isis` codec's Area Addresses builder.
+test "rxHelloBytes rejects a real wire L1 IIH with a disjoint area" {
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    const their_area = [_]u8{ 0x49, 0x99, 0x99 };
+
+    var pdu_buf: [128]u8 = undefined;
+    var pb = try isis.pdu.P2pHelloBuilder.init(&pdu_buf, .{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1,
+    });
+    var val_buf: [15]u8 = undefined;
+    const tw: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 };
+    const val = try tw.encode(&val_buf);
+    try pb.tlvs.addTlv(three_way.tlv_code, val);
+    try isis.tlvs.addAreaAddresses(&pb.tlvs, &.{&their_area});
+    const wire = pb.finish();
+
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .circuit_type = .level1,
+        .local_areas = &.{&our_area},
+    });
+    _ = adj.start(0);
+    const e = try adj.rxHelloBytes(wire, 1);
+    try testing.expectEqual(RejectReason.area_mismatch, e.rejected.?);
+    try testing.expectEqual(State.down, adj.currentState());
+}
+
+test "area matching is not enforced when local_areas is unconfigured (opt-in, no regression)" {
+    // Even a pure .level1 circuit must reach Up on a disjoint area exactly as
+    // before this fix, as long as `Config.local_areas` is left at its default
+    // (empty) — the module has no local area list to compare against, so the
+    // check is skipped rather than treated as "reject everything".
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .circuit_type = .level1, // would gate the check ON if local_areas were set
+    });
+    _ = adj.start(0);
+    const disjoint_area = [_]u8{ 0x49, 0x99, 0x99 };
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1,
+        .local_circuit_id = 1,
+        .neighbor_area_addresses = &[_]u8{disjoint_area.len} ++ disjoint_area,
+        .three_way = .{
+            .state = .initializing,
+            .extended_local_circuit_id = 0xB1,
+            .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 },
+        },
+    }, 1);
+    try testing.expect(e.adjacency_up);
+}
+
+// Regression (audit W2 `isis-adj` F4): `neighbor_ext_circuit_id` must not
+// survive an accepted IIH that carries no TLV 240 at all. Before the fix the
+// assignment was guarded by `if (rx.three_way) |tw|`, so a no-240 IIH left the
+// PREVIOUS neighbour's extended circuit id in place, and `helloFields` kept
+// advertising a neighbour block referencing a handshake the peer withdrew.
+test "an accepted IIH with no TLV 240 clears a previously recorded neighbour_ext_circuit_id" {
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    // First hello carries a 240 with an extended circuit id — recorded.
+    _ = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 },
+    }, 1);
+    try testing.expectEqual(@as(?u32, 0xB1), adj.neighbor_ext_circuit_id);
+
+    // Second hello, still from B (so it is accepted), carries NO TLV 240 at
+    // all — the stale value must be cleared, not left in place.
+    _ = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = null,
+    }, 2);
+    try testing.expect(adj.neighbor_ext_circuit_id == null);
+    // And the outgoing 240 must not claim a neighbour block for it.
+    try testing.expect(adj.helloFields().three_way.neighbor == null);
 }
 
 // Regression (audit W2 `isis-adj` F1): a third system-id must not be able to

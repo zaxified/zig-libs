@@ -124,12 +124,30 @@ pub const InitiatorFinish = struct { payload_len: usize, keys: SessionKeys };
 pub const ResponderFinish = struct { len: usize, keys: SessionKeys };
 
 /// Errors emitting a handshake message: `noise`'s write errors plus a
-/// state-machine guard.
-pub const WriteError = HS.WriteError || error{WrongState};
+/// state-machine guard, plus `HandshakeNotComplete` (see `ReadError`) --
+/// `writeMessage2` needs `Split()`'s transport pair exactly as `readMessage2`
+/// does.
+pub const WriteError = HS.WriteError || error{ WrongState, HandshakeNotComplete, UnexpectedHandshakeCompletion };
 /// Errors consuming a handshake message: `noise`'s read errors (incl.
 /// `DecryptionFailed` for a tampered message, a wrong responder static key, or
 /// an I-SID/prologue mismatch) plus a state-machine guard.
-pub const ReadError = HS.ReadError || error{WrongState};
+///
+/// `HandshakeNotComplete` guards an invariant that is true for `IK` as
+/// currently written -- msg2 is IK's last pattern token, so `Split()` always
+/// fires on it -- but is a property of the *pattern table*, not something
+/// this module's own state machine enforces. A future `noise` pattern-table
+/// change (or this module switching patterns) could turn a
+/// currently-correct assumption into `unreachable` triggering in
+/// ReleaseFast, which is undefined behavior, not a panic. Typed instead: the
+/// `State` guard above already rules out calling `readMessage2`/
+/// `writeMessage2` out of order, so this can only fire if `noise` itself
+/// changes shape underneath this module.
+///
+/// `UnexpectedHandshakeCompletion` is `HandshakeNotComplete`'s mirror image,
+/// guarding msg1 instead of msg2: IK's msg1 must NOT complete the pattern
+/// (`Split()` must not have fired yet), also true only because of IK's
+/// current token layout, not enforced by this module's own state machine.
+pub const ReadError = HS.ReadError || error{ WrongState, HandshakeNotComplete, UnexpectedHandshakeCompletion };
 
 /// Wire length of msg1 for a cleartext payload of `payload_len` bytes:
 /// e(32) + encrypted-s(32+16) + payload(+16).
@@ -227,7 +245,7 @@ pub const Initiator = struct {
     pub fn writeMessage1(self: *Initiator, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
         if (self.state != .start) return error.WrongState;
         const step = try self.hs.writeMessage(random, payload, out);
-        std.debug.assert(step.transport == null); // msg1 never completes IK
+        if (step.transport != null) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
         self.state = .awaiting_msg2;
         return step.len;
     }
@@ -240,7 +258,7 @@ pub const Initiator = struct {
     pub fn readMessage2(self: *Initiator, message: []const u8, payload_out: []u8) ReadError!InitiatorFinish {
         if (self.state != .awaiting_msg2) return error.WrongState;
         const step = try self.hs.readMessage(message, payload_out);
-        const pair = step.transport orelse unreachable; // msg2 completes IK
+        const pair = step.transport orelse return error.HandshakeNotComplete; // msg2 completes IK
         self.state = .done;
         return .{
             .payload_len = step.len,
@@ -295,7 +313,7 @@ pub const Responder = struct {
     pub fn readMessage1(self: *Responder, message: []const u8, payload_out: []u8) ReadError!usize {
         if (self.state != .start) return error.WrongState;
         const step = try self.hs.readMessage(message, payload_out);
-        std.debug.assert(step.transport == null); // msg1 never completes IK
+        if (step.transport != null) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
         self.state = .awaiting_write2;
         return step.len;
     }
@@ -305,7 +323,7 @@ pub const Responder = struct {
     pub fn writeMessage2(self: *Responder, random: std.Random, payload: []const u8, out: []u8) WriteError!ResponderFinish {
         if (self.state != .awaiting_write2) return error.WrongState;
         const step = try self.hs.writeMessage(random, payload, out);
-        const pair = step.transport orelse unreachable; // msg2 completes IK
+        const pair = step.transport orelse return error.HandshakeNotComplete; // msg2 completes IK
         self.state = .done;
         return .{
             .len = step.len,

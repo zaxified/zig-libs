@@ -40,17 +40,28 @@ pub const DecodeError = header.DecodeError || error{
     TruncatedBody,
     /// The body's PDU Length field is < the fixed header or > the buffer.
     BadPduLength,
+    /// The common header's Length Indicator does not equal this PDU type's
+    /// canonical fixed-header length (ISO/IEC 10589 §9.1: the Length Indicator
+    /// is defined to be exactly the fixed-header length for that PDU type, not
+    /// merely a lower bound).
+    LengthIndicatorMismatch,
 };
 
 pub const BuildError = tlv.BuildError;
 
-fn checkCommon(bytes: []const u8, want: []const PduType) DecodeError!CommonHeader {
+fn checkCommon(bytes: []const u8, want: []const PduType, fixed_len: usize) DecodeError!CommonHeader {
     const h = try header.decode(bytes);
     if (h.id_length != modeled_id_length) return error.UnsupportedIdLength;
+    var matched = false;
     for (want) |w| {
-        if (h.pdu_type == w) return h;
+        if (h.pdu_type == w) matched = true;
     }
-    return error.WrongPduType;
+    if (!matched) return error.WrongPduType;
+    // ISO/IEC 10589 §9.1: the Length Indicator is the fixed-header length for
+    // this PDU type, not a floor. `header.decode` only enforces the floor (it
+    // cannot know the type-specific fixed length); this is the per-type check.
+    if (h.length_indicator != fixed_len) return error.LengthIndicatorMismatch;
+    return h;
 }
 
 /// Validates a body's PDU Length field and returns the delimited TLV slice.
@@ -104,7 +115,7 @@ pub const LanHello = struct {
     tlv_bytes: []const u8,
 
     pub fn decode(bytes: []const u8) DecodeError!LanHello {
-        const h = try checkCommon(bytes, &.{ .l1_lan_iih, .l2_lan_iih });
+        const h = try checkCommon(bytes, &.{ .l1_lan_iih, .l2_lan_iih }, lan_iih_fixed_len);
         if (bytes.len < lan_iih_fixed_len) return error.TruncatedBody;
         const region = try tlvRegion(bytes, lan_iih_fixed_len, 17);
         return .{
@@ -179,7 +190,7 @@ pub const P2pHello = struct {
     tlv_bytes: []const u8,
 
     pub fn decode(bytes: []const u8) DecodeError!P2pHello {
-        const h = try checkCommon(bytes, &.{.p2p_iih});
+        const h = try checkCommon(bytes, &.{.p2p_iih}, p2p_iih_fixed_len);
         if (bytes.len < p2p_iih_fixed_len) return error.TruncatedBody;
         const region = try tlvRegion(bytes, p2p_iih_fixed_len, 17);
         return .{
@@ -293,7 +304,7 @@ pub const Lsp = struct {
     tlv_bytes: []const u8,
 
     pub fn decode(bytes: []const u8) DecodeError!Lsp {
-        const h = try checkCommon(bytes, &.{ .l1_lsp, .l2_lsp });
+        const h = try checkCommon(bytes, &.{ .l1_lsp, .l2_lsp }, lsp_fixed_len);
         if (bytes.len < lsp_fixed_len) return error.TruncatedBody;
         const region = try tlvRegion(bytes, lsp_fixed_len, 8);
         return .{
@@ -428,7 +439,7 @@ pub const Csnp = struct {
     tlv_bytes: []const u8,
 
     pub fn decode(bytes: []const u8) DecodeError!Csnp {
-        const h = try checkCommon(bytes, &.{ .l1_csnp, .l2_csnp });
+        const h = try checkCommon(bytes, &.{ .l1_csnp, .l2_csnp }, csnp_fixed_len);
         if (bytes.len < csnp_fixed_len) return error.TruncatedBody;
         const region = try tlvRegion(bytes, csnp_fixed_len, 8);
         return .{
@@ -489,7 +500,7 @@ pub const Psnp = struct {
     tlv_bytes: []const u8,
 
     pub fn decode(bytes: []const u8) DecodeError!Psnp {
-        const h = try checkCommon(bytes, &.{ .l1_psnp, .l2_psnp });
+        const h = try checkCommon(bytes, &.{ .l1_psnp, .l2_psnp }, psnp_fixed_len);
         if (bytes.len < psnp_fixed_len) return error.TruncatedBody;
         const region = try tlvRegion(bytes, psnp_fixed_len, 8);
         return .{
@@ -663,10 +674,35 @@ test "a PDU with zero TLVs (pdu_length == fixed_len exactly) decodes fine" {
 }
 
 test "TruncatedBody when the buffer is shorter than the fixed header" {
-    // Length-indicator 8 passes the common-header check, but a P2P IIH needs a
-    // 20-octet fixed header — only 10 bytes here, so the body decode trips.
-    const short = [_]u8{ 0x83, 0x08, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03, 0x03, 0x00 };
+    // Length-indicator correctly names the P2P IIH's 20-octet fixed header (so
+    // the LengthIndicatorMismatch check passes), but only 10 bytes are actually
+    // present — the body decode trips on the short buffer, not the header.
+    const short = [_]u8{ 0x83, p2p_iih_fixed_len, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03, 0x03, 0x00 };
     try testing.expectError(error.TruncatedBody, P2pHello.decode(&short));
+}
+
+// Regression (audit W2 `isis` F2): ISO/IEC 10589 §9.1 defines the Length
+// Indicator as the fixed-header length for that PDU type, not merely a floor.
+// Before the fix, `checkCommon` never looked at it past the >= 8 common-header
+// check, so an LSP declaring an arbitrary Length Indicator (e.g. 99) decoded
+// successfully as long as the buffer itself was long enough.
+test "a Length Indicator that disagrees with the PDU type's fixed length is rejected" {
+    var buf: [64]u8 = undefined;
+    var b = try LspBuilder.init(&buf, .{
+        .lsp_id = .{ 1, 2, 3, 4, 5, 6, 0, 0 },
+        .sequence_number = 1,
+        .remaining_lifetime = 30,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    const wire_len = b.finish().len;
+    // Sanity: the well-formed LSP decodes.
+    _ = try Lsp.decode(buf[0..wire_len]);
+
+    // Corrupt only the Length Indicator (byte 1) to a value that does not
+    // match `lsp_fixed_len` — everything else (including PDU Length and the
+    // buffer itself) stays self-consistent and long enough.
+    buf[1] = 99;
+    try testing.expectError(error.LengthIndicatorMismatch, Lsp.decode(buf[0..wire_len]));
 }
 
 // ── ISO 10589 §7.3.11 LSP checksum ───────────────────────────────────────────

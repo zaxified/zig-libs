@@ -918,12 +918,20 @@ const Parser = struct {
         var raw: std.ArrayList(RawAttr) = .empty;
         defer raw.deinit(self.a);
         while (true) {
+            const before_ws = self.i;
             self.skipWs();
             const c = self.peek() orelse return error.UnexpectedEof;
             if (c == '>' or c == '/') break;
+            // XML 1.0 §3.1: `STag ::= '<' Name (S Attribute)* S? '>'` -- each
+            // Attribute (including the first) is preceded by *required*
+            // whitespace S, not the optional S? that only precedes the closing
+            // '>'. `skipWs` above is a no-op on zero bytes of whitespace, so
+            // without this check `<a b="1"c="2"/>` silently accepted "c" as a
+            // second attribute with none consumed between it and the previous
+            // value -- this is the check that actually enforces it, not just
+            // the presence of a `skipWs` call.
+            if (self.i == before_ws) return error.UnexpectedChar;
             if (raw.items.len >= self.opts.max_attributes) return error.TooManyAttributes;
-            // Require whitespace before each attribute (already consumed above;
-            // enforce that at least one ws separated us from the name/prev val).
             const attr_start = self.i;
             const an = try self.parseName();
             self.skipWs();
@@ -1458,6 +1466,20 @@ test "not-wf: bad nesting overlap" {
 
 test "not-wf: duplicate attribute" {
     try testing.expectError(error.DuplicateAttribute, parse(testing.allocator, "<a x=\"1\" x=\"2\"/>", .{}));
+}
+
+test "not-wf: missing whitespace between attributes (XML 1.0 sec3.1: STag ::= '<' Name (S Attribute)* S? '>')" {
+    // Every Attribute, including the first, is preceded by REQUIRED
+    // whitespace (S), not the optional S? that precedes only the closing
+    // '>'/'/'. libxml2, xmlsec1 and expat all reject this; the xmlconf
+    // xmltest sub-suite that would cover it is excluded from this repo's
+    // vendored W3C corpus on licensing grounds (see README/SPEC), so this is
+    // a hand-written regression instead.
+    try testing.expectError(error.UnexpectedChar, parse(testing.allocator, "<a b=\"1\"c=\"2\"/>", .{}));
+    // The well-formed sibling must still parse (this is not just "reject
+    // everything with two attributes").
+    var doc = try parse(testing.allocator, "<a b=\"1\" c=\"2\"/>", .{});
+    defer doc.deinit();
 }
 
 test "not-wf: undeclared entity" {

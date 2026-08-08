@@ -62,6 +62,15 @@ fn toLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
+/// True iff `c` is a member of the 32-symbol bech32 charset, case-folded (the
+/// format allows an all-upper OR all-lower string, never mixed, so a single
+/// stray uppercase neighbour must still count as "a bech32 character" here —
+/// `splitHrp`/`charValue` reject a genuinely mixed-case string downstream;
+/// this helper only asks "is this byte bech32-shaped at all").
+fn isBech32Char(c: u8) bool {
+    return charValue(toLower(c)) != null;
+}
+
 fn hrpExpand(allocator: Allocator, hrp: []const u8) Allocator.Error![]u5 {
     const out = try allocator.alloc(u5, 2 * hrp.len + 1);
     for (hrp, 0..) |c, i| out[i] = @intCast(c >> 5);
@@ -205,16 +214,24 @@ pub fn encode(allocator: Allocator, hrp: []const u8, data: []const u5) (EncodeEr
 /// Left un-stripped, a disqualified `+` simply flows through to
 /// `charValue`/`splitHrp` and is rejected there — no new error variant
 /// needed.
+///
+/// **Neighbour test (W2 `lninvoice` F6, tightened):** the spec's "bech32
+/// characters" means charset membership, not merely "anything that is not
+/// `+`/whitespace". The prior check (`s[i-1] != '+' and !isWhitespace(...)`)
+/// qualified any other byte at all, so a `+` preceded by e.g. a control
+/// character or punctuation the spec would NOT call a bech32 character was
+/// still treated as sitting "between two bech32 characters" and stripped.
+/// `isBech32Char` (charset membership, case-folded) is the literal reading.
 pub fn stripContinuation(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '+') {
-            const has_before = i > 0 and s[i - 1] != '+' and !std.ascii.isWhitespace(s[i - 1]);
+            const has_before = i > 0 and isBech32Char(s[i - 1]);
             var j = i + 1;
             while (j < s.len and std.ascii.isWhitespace(s[j])) : (j += 1) {}
-            const has_after = j < s.len and s[j] != '+';
+            const has_after = j < s.len and isBech32Char(s[j]);
             if (has_before and has_after) {
                 i = j;
                 continue;
@@ -337,6 +354,41 @@ test "stripContinuation: removes '+' and following whitespace (BOLT#12 QR-split)
     const stripped = try stripContinuation(allocator, "lno1xxxxxxxx+\n\nyyyyyyyyyyyy+ zzzzz");
     defer allocator.free(stripped);
     try testing.expectEqualStrings("lno1xxxxxxxxyyyyyyyyyyyyzzzzz", stripped);
+}
+
+// Regression (audit W2 `lninvoice` F6): the neighbour test is "a bech32
+// charset member", not "anything other than '+'/whitespace". Before the fix,
+// a `+` preceded by a non-bech32, non-whitespace byte (e.g. `.` or `_`,
+// neither of which the 32-symbol charset contains) was still stripped,
+// because the old test only excluded `+` and whitespace explicitly. The
+// disqualifying byte is itself rejected downstream by `charValue`/`splitHrp`
+// today (so this was latent looseness, not a live accept per the audit's own
+// note), but the neighbour test itself must match the spec's literal words.
+test "stripContinuation: a '+' next to a NON-bech32 byte is left in place, not stripped" {
+    const allocator = testing.allocator;
+    // '.' and '_' are not in the 32-symbol bech32 charset.
+    const cases = [_][]const u8{
+        "lno1xx.+ yyyy", // disqualifying byte BEFORE the '+'
+        "lno1xx+ .yyyy", // disqualifying byte AFTER the '+' (past the whitespace)
+        "lno1xx_+yyyy",
+        "lno1xx+_yyyy",
+    };
+    for (cases) |c| {
+        const stripped = try stripContinuation(allocator, c);
+        defer allocator.free(stripped);
+        // Unchanged: the '+' (and any whitespace after it) survives verbatim
+        // because at least one neighbour is not bech32-charset-shaped.
+        try testing.expectEqualStrings(c, stripped);
+    }
+}
+
+test "stripContinuation: a '+' between two genuine bech32 characters is still stripped" {
+    const allocator = testing.allocator;
+    // Sanity: the tightened check does not regress the ordinary case — every
+    // byte on both sides is a real bech32-charset member.
+    const stripped = try stripContinuation(allocator, "lno1xxq+yyyy");
+    defer allocator.free(stripped);
+    try testing.expectEqualStrings("lno1xxqyyyy", stripped);
 }
 
 // ── fuzz: decode never panics on an arbitrary raw string ─────────────────

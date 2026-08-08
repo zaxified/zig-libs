@@ -42,7 +42,9 @@ pub const Handle = struct {
     /// Parse the `bus/dev` form the `devlink` CLI takes. The returned slices
     /// **borrow `s`**. A trailing `/port` is rejected here — use
     /// `PortHandle.parse` for that — so a port string cannot silently be taken
-    /// for a device.
+    /// for a device. This split is anchored against real iproute2 6.19.0
+    /// `devlink` CLI behavior, not just self-consistency — see `SPEC.md`
+    /// §2.1's "anchored against the real CLI" table.
     pub fn parse(s: []const u8) error{InvalidHandle}!Handle {
         const slash = std.mem.indexOfScalar(u8, s, '/') orelse return error.InvalidHandle;
         const h: Handle = .{ .bus = s[0..slash], .dev = s[slash + 1 ..] };
@@ -71,7 +73,8 @@ pub const PortHandle = struct {
     index: u32,
 
     /// Parse the `bus/dev/index` form the `devlink` CLI takes. The strings
-    /// borrow `s`.
+    /// borrow `s`. Anchored against the real CLI — see `Handle.parse`'s doc
+    /// comment and `SPEC.md` §2.1.
     pub fn parse(s: []const u8) error{InvalidHandle}!PortHandle {
         const last = std.mem.lastIndexOfScalar(u8, s, '/') orelse return error.InvalidHandle;
         const h = try Handle.parse(s[0..last]);
@@ -229,6 +232,11 @@ test "PortHandle.parse splits off the trailing index" {
     try testing.expectError(error.InvalidHandle, PortHandle.parse("pci/0000:65:00.0"));
     try testing.expectError(error.InvalidHandle, PortHandle.parse("pci/0000:65:00.0/x"));
     try testing.expectError(error.InvalidHandle, PortHandle.parse("pci/0000:65:00.0/4294967296"));
+    // Anchored against the real CLI (SPEC.md §2.1): `devlink port show
+    // pci/0000:65:00.0/3/4` -> "Wrong port identification string format" --
+    // one segment too many is a format rejection there too, not "some other
+    // device's port 4".
+    try testing.expectError(error.InvalidHandle, PortHandle.parse("pci/0000:65:00.0/3/4"));
 }
 
 test "parse recovers the handle and reports a half one as incomplete" {

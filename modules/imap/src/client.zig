@@ -226,6 +226,15 @@ pub const Client = struct {
     fn readLine(c: *Client) Error!response.Response {
         _ = c.arena.reset(.retain_capacity);
         c.rd.d.gpa = c.arena.allocator();
+        // `wire.Decoder.depth` is incremented by `maybeList` and decremented
+        // only by a clean `List.next()` close; an error raised while parsing
+        // an element inside a list (a previous line's malformed response)
+        // could leave `depth` above zero on a `Decoder` that lives for the
+        // whole connection, not just one line. Each response line is
+        // logically independent, so start it with a clean slate — a second
+        // line of defense alongside `wire.Decoder.List.deinit`'s own
+        // defer-safe close at internal call sites.
+        c.rd.d.depth = 0;
         return c.rd.next();
     }
 
@@ -982,6 +991,27 @@ test "PREAUTH means the connection is already authenticated" {
     // ...and LOGIN is then a local error, not a password sent into a session
     // that cannot use it.
     try testing.expectError(error.BadState, c.login("u", "p"));
+}
+
+test "readLine resets a leaked list-nesting depth before parsing the next line" {
+    // Simulates the residue a previous line's abandoned list parse could
+    // leave (`wire.Decoder.depth` incremented by `maybeList`, never
+    // decremented because an error inside the list skipped the clean
+    // close) -- WITHOUT actually constructing such a line, since the
+    // internal-callsite leak this guards is separately covered by
+    // `wire.zig`'s own "discardValue: an error mid-list still releases the
+    // depth slot" test. This one is about `readLine` itself: a fresh line
+    // must start at depth 0 regardless of what the PREVIOUS line left
+    // behind, so a leak from a malformed line does not silently make every
+    // later, well-formed line on the same long-lived connection look
+    // artificially closer to `max_depth`.
+    var p: Peer = undefined;
+    p.init("* OK [CAPABILITY IMAP4rev2] Service Ready\r\n");
+    var c = p.client(.{});
+    defer c.deinit();
+    c.rd.d.depth = 7; // simulated leak from a hypothetical earlier line
+    _ = try c.greet();
+    try testing.expectEqual(@as(usize, 0), c.rd.d.depth);
 }
 
 test "a greeting of BYE is a refused connection" {

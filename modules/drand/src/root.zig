@@ -56,6 +56,7 @@ pub const latestPath = round.latestPath;
 pub const VerifyError = verify.VerifyError;
 pub const verifyRound = verify.verifyRound;
 pub const verifyRoundPoints = verify.verifyRoundPoints;
+pub const expectedRound = verify.expectedRound;
 
 /// Re-exported: the sibling crypto module every point/pairing comes from.
 pub const bls12_381 = @import("bls12_381");

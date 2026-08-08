@@ -389,6 +389,26 @@ pub const WorkerPool = struct {
         return self.boxes_live.load(.seq_cst);
     }
 
+    /// True iff every job `submit`/`Submitter.submit` ever accepted has run
+    /// (`submittedCount() == completedCount()`). Meant to be checked after
+    /// `drain()` returns (W2 `workerpool` F6): `drain`'s own precondition
+    /// — "no thread may call `submit` concurrently with `drain`" — is the
+    /// caller's to uphold, and a violation is otherwise silent: `enqueueJob`'s
+    /// shutdown check and its enqueue are two separate steps, not one atomic
+    /// operation, so a `submit` racing `drain` can return success for a job
+    /// whose box is then queued behind (or after) the point where the last
+    /// worker already observed `.draining` and stopped looking — the job is
+    /// accepted, never run, and `submittedCount` is left permanently ahead of
+    /// `completedCount` with nothing pointing at why. This does not fix the
+    /// race (the precondition is the caller's contract, not something this
+    /// module can enforce without a lock on every `submit`) — it makes a
+    /// violation of it observable instead of silent. Meaningless after
+    /// `shutdownNow`, which intentionally drops queued jobs — see
+    /// `submittedCount`/`completedCount` directly for that case.
+    pub fn drainedCleanly(self: *const WorkerPool) bool {
+        return self.submitted.load(.seq_cst) == self.completed.load(.seq_cst);
+    }
+
     // ── internal machinery ───────────────────────────────────────────────────
 
     /// The shared enqueue path. `p` must be a participant this call owns
@@ -646,6 +666,57 @@ test "graceful drain runs every queued job; no leak (DebugAllocator clean)" {
     pool.deinit(); // frees everything; DebugAllocator verifies no leak
 }
 
+// Regression (audit W2 `workerpool` F6): `drain`'s producer-quiescence
+// precondition, if violated, used to be silent — `submittedCount` could sit
+// permanently ahead of `completedCount` with no diagnostic pointing at it.
+// `drainedCleanly()` makes that observable.
+test "F6: drainedCleanly() is true after a normal, precondition-respecting drain" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    defer pool.deinit();
+
+    var c = Counter{};
+    for (0..500) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    pool.drain();
+
+    try testing.expectEqual(pool.submittedCount(), pool.completedCount());
+    try testing.expect(pool.drainedCleanly());
+}
+
+test "F6: drainedCleanly() reports false when submitted permanently exceeds completed" {
+    // Exercises `drainedCleanly()`'s own logic deterministically rather than
+    // racing a real `submit` against a real `drain` (inherently timing-
+    // dependent, and the precondition violation this guards is explicitly
+    // out-of-contract usage, not something this test should need to
+    // reproduce nondeterministically to prove the accessor is correct).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+
+    var c = Counter{};
+    for (0..10) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    pool.drain();
+    try testing.expect(pool.drainedCleanly());
+
+    // Simulate exactly the shape F6 describes: a job accepted (`submitted`
+    // incremented) that never ran (`completed` left behind) — the state
+    // `enqueueJob`'s non-atomic shutdown-check-then-enqueue can leave behind
+    // if a `submit` slips in around `drain`.
+    _ = pool.submitted.fetchAdd(1, .monotonic);
+    try testing.expect(!pool.drainedCleanly());
+    try testing.expectEqual(pool.submittedCount(), pool.completedCount() + 1);
+
+    // Restore, so `deinit`'s own bookkeeping (which does not itself depend
+    // on submitted == completed) tears down cleanly.
+    _ = pool.submitted.fetchSub(1, .monotonic);
+}
+
 test "idle → wake: a submit into an idle pool runs promptly" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -776,6 +847,164 @@ test "shutdownNow: in-flight completes, queued dropped, no leak" {
     try testing.expectEqual(ran, pool.completedCount());
     // Same point as above: the DebugAllocator cannot see an abandoned box.
     try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+}
+
+// ── F3: the error ladder (audit W2 `workerpool` F3) ─────────────────────────
+//
+// Every non-happy path below was previously unreached by any test: no
+// `FailingAllocator` anywhere in the suite (`rg 'FailingAllocator'
+// modules/workerpool/` returned nothing), so a double-decrement, a missing
+// `boxes.release`, or a broken `init` unwind could ship silently.
+
+test "F3: TooManySubmitters is refused once max_submitters is exhausted" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Zero extra submitter slots: even the FIRST registerSubmitter must fail.
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_submitters = 0 });
+    defer pool.deinit();
+
+    try testing.expectError(error.TooManySubmitters, pool.registerSubmitter());
+
+    // One slot: the first registration succeeds, the second is refused, and
+    // releasing the first frees the slot for reuse (not a permanent budget).
+    const pool2 = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_submitters = 1 });
+    defer pool2.deinit();
+
+    var s1 = try pool2.registerSubmitter();
+    try testing.expectError(error.TooManySubmitters, pool2.registerSubmitter());
+    s1.deinit();
+    var s2 = try pool2.registerSubmitter(); // the freed slot is reusable
+    s2.deinit();
+}
+
+test "F3: init's errdefer ladder never leaks under allocator exhaustion, at every allocation site" {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Sweep every possible allocation-failure point inside `init` (domain,
+    // qnodes, boxes, queue's dummy sentinel, shared_producer registration,
+    // the workers slice, each worker's participant registration — one
+    // `errdefer` per site, per the doc comment on `init`). Deliberately on
+    // `page_allocator` (not the leak-panicking `testing.allocator`): this
+    // loop asserts leak-freedom ITSELF, via each `FailingAllocator`'s own
+    // `allocations`/`deallocations` counters, precisely so it can also
+    // report — rather than crash the whole suite on — the one KNOWN,
+    // out-of-scope leak below, instead of a leak-detecting backing allocator
+    // panicking mid-sweep with no chance to attribute it.
+    //
+    // NOT WORKERPOOL'S BUG (recorded here, not fixed — `workerpool`'s own
+    // ladder is what this test verifies): at exactly one allocation site,
+    // `lockfree.NodePool.acquire` (`modules/lockfree/src/pool.zig` around
+    // its `self.allocator.create(Slot)` / `self.all.append(...)` pair, hit
+    // here via `MpmcQueue.init`'s dummy-sentinel acquisition) allocates the
+    // `Slot` FIRST and only THEN appends it to its own tracking list; if
+    // that second allocation (the list's buffer growth) fails, the `Slot`
+    // just created is never recorded anywhere and `NodePool.deinit`'s
+    // `for (self.all.items) |slot| self.allocator.destroy(slot);` sweep
+    // cannot find it — a genuine leak on `lockfree`'s own allocator-failure
+    // path, independent of anything `workerpool` does with the result. This
+    // loop tolerates exactly that one signature (a single net-leaked
+    // allocation at a single index) and still fails on anything else —
+    // more leaked bytes, more than one leaking index, or a leak paired with
+    // a non-`OutOfMemory` error would all be a NEW, in-scope defect.
+    var idx: usize = 0;
+    var leaking_indices_seen: usize = 0;
+    const safety_bound = 64; // generous; init allocates far fewer times than this
+    while (idx < safety_bound) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(std.heap.page_allocator, .{ .fail_index = idx });
+        if (WorkerPool.init(failing.allocator(), .{ .io = io, .n_workers = 1, .max_submitters = 0 })) |pool| {
+            // `init` succeeded at this fail_index: every earlier index was
+            // swept above. Done.
+            pool.deinit();
+            try testing.expect(idx > 0); // sanity: init does allocate
+            try testing.expectEqual(@as(usize, 1), leaking_indices_seen); // exactly the one known lockfree site
+            return;
+        } else |err| {
+            try testing.expect(err == error.OutOfMemory); // never SpawnFailed: spawning doesn't use this allocator
+            const leaked = failing.allocations - failing.deallocations;
+            if (leaked != 0) {
+                leaking_indices_seen += 1;
+                try testing.expectEqual(@as(usize, 1), leaked); // exactly the lockfree Slot, nothing more
+                try testing.expect(leaking_indices_seen <= 1); // exactly one such site, not several
+            }
+        }
+    }
+    // If we get here, `init` never succeeded within `safety_bound`
+    // allocations — the sweep bound itself needs raising, not a real defect,
+    // but fail loudly rather than silently passing having tested nothing.
+    try testing.expect(false);
+}
+
+test "F3: SubmitFailed on box-acquisition failure leaves accounting untouched" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Build a real, healthy pool first (real allocator) so `init`'s own
+    // allocations are not in the budget being tested below — only the
+    // allocation `submit` itself triggers (`boxes.acquire`'s fresh `JobBox`,
+    // the pool's free list starts empty) is exercised.
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+
+    // Swap in a FailingAllocator that fails on the very first allocation —
+    // `boxes.acquire` is the first thing `enqueueJob` allocates, so this
+    // fails there, before `submitted` is touched and before the queue is
+    // touched at all. Only `boxes`' own allocator needs swapping:
+    // `acquireBox` routes through `self.boxes.acquire()`, which reads
+    // `self.boxes.allocator`, not the pool's top-level `allocator` field.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    pool.boxes.allocator = failing.allocator();
+    defer pool.boxes.allocator = testing.allocator;
+
+    const before_submitted = pool.submittedCount();
+    const before_outstanding = pool.outstandingBoxes();
+    try testing.expectError(error.SubmitFailed, pool.submit(.{ .func = incr, .ctx = undefined }));
+    try testing.expectEqual(before_submitted, pool.submittedCount()); // never incremented
+    try testing.expectEqual(before_outstanding, pool.outstandingBoxes()); // box never counted
+
+    // The pool is otherwise still healthy: restore a real allocator and
+    // prove a normal submit still works (this was a transient allocator
+    // failure, not pool corruption).
+    pool.boxes.allocator = testing.allocator;
+    var c = Counter{};
+    try pool.submit(.{ .func = incr, .ctx = &c });
+}
+
+test "F3: SubmitFailed on enqueue failure rolls back submitted-count AND releases the box (no leak)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+
+    // Let `boxes.acquire` succeed (fail_index high) but make the QUEUE's own
+    // node allocation fail — `queue.enqueue` needs a fresh `QNode` from
+    // `qnodes`, a separate pool from `boxes`, so failing only `qnodes`'
+    // allocator isolates the rollback branch specifically (`enqueueJob`'s
+    // `queue.enqueue(...) catch { submitted.fetchSub; boxes.release; ...
+    // }`) from the box-acquisition failure the previous test already covers.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    pool.qnodes.allocator = failing.allocator();
+    defer pool.qnodes.allocator = testing.allocator;
+
+    const before_submitted = pool.submittedCount();
+    const before_outstanding = pool.outstandingBoxes();
+    try testing.expectError(error.SubmitFailed, pool.submit(.{ .func = incr, .ctx = undefined }));
+    // Rolled back exactly: `submitted` was incremented then decremented back
+    // (not left elevated), and the acquired box was released (not leaked —
+    // `outstandingBoxes` returns to what it was before this submit).
+    try testing.expectEqual(before_submitted, pool.submittedCount());
+    try testing.expectEqual(before_outstanding, pool.outstandingBoxes());
+
+    // Healthy afterward: restore and prove a normal submit still runs.
+    pool.qnodes.allocator = testing.allocator;
+    var c = Counter{};
+    try pool.submit(.{ .func = incr, .ctx = &c });
 }
 
 test "STRESS: many concurrent producers via Submitter + pool consuming (MP)" {

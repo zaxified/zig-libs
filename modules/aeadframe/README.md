@@ -16,6 +16,12 @@ to wrap; the receiver runs a sliding-window replay filter; and the
 caller-supplied `aad` cryptographically pins each record to its context (tenant
 / I-SID / channel), the isolation binding for the S1b per-tenant L2VPN case.
 
+**Every guarantee above is per-record, not per-stream.** There is no
+end-of-stream marker in the wire format — a truncated transport silently
+drops trailing records with no evidence for the receiver, same as ESP/DTLS
+1.3 leave to a higher layer. See `SPEC.md` §6 "No stream-termination
+signal" before treating this as a complete transport.
+
 **Key establishment is out of scope.** The 32-byte key is an input — a
 Noise/HPKE/X25519 handshake (a caller or future module) produces it. See
 [SPEC.md](SPEC.md).

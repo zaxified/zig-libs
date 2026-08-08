@@ -284,6 +284,48 @@ test "networkFromMagic round-trips every known network's magic" {
     try testing.expectEqual(@as(?Network, null), networkFromMagic(.{ 0, 0, 0, 0 }));
 }
 
+// ── externally anchored: Bitcoin Core's src/kernel/chainparams.cpp (fetched
+// directly, not hand-transcribed) ──────────────────────────────────────────
+// Prior to this, only `mainnet`'s magic had a byte-level external anchor
+// (the wiki hex dumps above); `testnet3`/`regtest`/`signet` were pinned only
+// by a self round-trip against this same file's own table, which cannot
+// notice a mistyped literal. `pchMessageStart` is a plain 4-byte literal for
+// testnet3/regtest; `signet`'s default network has no literal at all --
+// Core derives it at runtime as the first 4 bytes of
+// `sha256d(CompactSize-prefixed default signet challenge script)` (the
+// `HashWriter h{}; h << consensus.signet_challenge;` vector-serialization
+// convention), so that one is independently *derived* here, not pasted.
+
+test "external: testnet3 magic byte-exact against Core's CTestNetParams::pchMessageStart" {
+    try testing.expectEqualSlices(u8, &.{ 0x0b, 0x11, 0x09, 0x07 }, &magic(.testnet3));
+}
+
+test "external: regtest magic byte-exact against Core's CRegTestParams::pchMessageStart" {
+    try testing.expectEqualSlices(u8, &.{ 0xfa, 0xbf, 0xb5, 0xda }, &magic(.regtest));
+}
+
+test "external: signet default magic derives from Core's published default challenge script" {
+    // Core's default signet challenge (SigNetParams, `!options.challenge`
+    // branch): a 71-byte 2-of-2 P2MS challenge script, published as a hex
+    // literal in chainparams.cpp.
+    const challenge = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+    var challenge_bytes: [challenge.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&challenge_bytes, challenge) catch unreachable;
+
+    // Core serializes the challenge through its generic `Serialize(Stream&,
+    // const std::vector<uint8_t>&)` operator, which is CompactSize-length-
+    // prefixed, then double-SHA256s the result -- not a bare hash of the
+    // challenge bytes (a bare-hash derivation gives 0f1bf2e1, not the
+    // published magic; this was checked as part of writing this test).
+    var buf: [1 + challenge_bytes.len]u8 = undefined;
+    const prefix = bitcointx.encodeCompactSize(challenge_bytes.len, &buf) catch unreachable;
+    @memcpy(buf[prefix.len..], &challenge_bytes);
+
+    const digest = bitcointx.hash256.sha256d(&buf);
+    try testing.expectEqualSlices(u8, &.{ 0x0a, 0x03, 0xcf, 0x40 }, digest[0..4]);
+    try testing.expectEqualSlices(u8, digest[0..4], &magic(.signet));
+}
+
 test "self round-trip: encodeMessage -> decodeMessage recovers command + payload" {
     const allocator = testing.allocator;
     const payload = "hello, peer";

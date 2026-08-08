@@ -448,14 +448,52 @@ verified layer requires `index < db.count()`.
   MAC binds the answer to the database the two servers *jointly* used, not to
   any database the client expects. A test asserts the acceptance. Binding to
   a published database is authenticated PIR — see below.
-- **Privacy is not degraded.** The tag key is one more DPF key under the same
-  hiding assumption; lengths are geometry-only (asserted, including across `m`
-  values); and the only new observable, the abort bit, shifts by at most the
-  soundness error across indices — a fixed `m`-independent tampering rejects
-  for *every* index (asserted), so there is no selective-failure index test.
-  The carve-out, stated exactly: an adversary can make the *carry* `δ` of an
-  attacked word depend on `record[i]`, but acceptance still requires hitting
-  `m`, so the abort probability varies across indices by at most `2^{1−8S}`.
+- **Privacy holds AT THE RECOMMENDED `S = tag_slack_bytes = 8`, and the
+  single-word abort-bit argument below is what the module's own guard test
+  exercises there — but the "no selective-failure index test" conclusion does
+  NOT extend uniformly down to the permitted floor `S = 1`.** ⚠ **Corrected
+  from an earlier draft of this section**, which stated the no-selective-
+  failure claim without this scoping. `tag_slack_bytes` is therefore not
+  purely an *integrity* knob — it is also a *privacy* parameter, and the
+  accept/reject bit's independence from `i` degrades as `S` shrinks, not just
+  the soundness bound's magnitude.
+  - **Single-word tampering, any `S`.** The tag key is one more DPF key under
+    the same hiding assumption; lengths are geometry-only (asserted,
+    including across `m` values); and for a tampering confined to ONE value
+    word, the abort bit shifts by at most the soundness error across indices
+    — a fixed `m`-independent single-word tampering rejects for *every*
+    index (this is what the module's guard test at the recommended `S = 8`
+    demonstrates). The carve-out, stated exactly: an adversary can make the
+    *carry* `δ` of the attacked word depend on `record[i]`, but acceptance
+    still requires separately hitting `m` (probability ≤ `2^{1−8S}`), so the
+    abort probability varies across indices by at most that same soundness
+    bound. At `S = 8` this is `2^{-63}`-scale — privacy-irrelevant in
+    practice.
+  - **Two-word tampering at `S = 1` is a different, CONCLUSIVE oracle, not a
+    smaller-probability version of the same one.** Tamper two DIFFERENT
+    value words `j1 ≠ j2` in the SAME query with the same chosen error `e`,
+    and mirror it with the same tag-channel error at both tag words. Passing
+    the check at both words requires
+    `m·(e − δ1·2^{8L}) ≡ m·(e − δ2·2^{8L}) (mod 2^{8(L+S)})`, and since `m`
+    is forced odd (hence invertible mod a power of two) this collapses to
+    `δ1 ≡ δ2 (mod 2^{8S})`. At `S = 1`, `δ ∈ {0, 1}`, so the reduction is
+    exact: `δ1 = δ2`. Both carries are **deterministic functions of
+    `record[i]`** (whether `word_{j1}(record[i]) + e` and
+    `word_{j2}(record[i]) + e` each overflow `2^{8L}`) — so accept/reject
+    becomes a conclusive, adversary-chosen, amplifiable 1-bit oracle on
+    `record[i]`, with NO dependence on guessing `m` at all. This is not
+    covered by the `2^{1−8S}` soundness bound above, which is a per-word
+    statement; it is a distinct two-word interaction the bound does not
+    price in. `S = tag_slack_bytes` is a compile-time module parameter with
+    an enforced floor of 1 (`S = 0` is a compile error, see above) — `S = 1`
+    is therefore a *permitted*, documented configuration, not a
+    theoretical/unreachable corner.
+  - **Practical bar.** The recommended default is `S = 8`; at that setting
+    the two-word attack above requires `δ1 ≡ δ2 (mod 2^{64})` with
+    `δ ∈ {0, 1}`, i.e. it degenerates back into the same `2^{1-8S}`-scale
+    event the single-word argument already bounds. The conclusive oracle is
+    specific to the low-`S` floor, which is exactly why this module
+    documents it here rather than only at `S = 1`'s own instantiation site.
 
 ### Against the alternatives
 
@@ -503,6 +541,31 @@ mismatched or by how much. Wide-integer `*%` compiles to branch-free multiply
 chains on the supported targets. The DPF evaluation underneath keeps `fss`'s
 documented posture (control-bit-gated branches, hardening scoped out there);
 this layer adds no new branch on secret data.
+
+### Constant-time PRG selection
+
+`Pir`/`Verified` are generic over `fss`'s DPF, and `fss`'s DEFAULT PRG
+(`fss.prg.default` = `Aes128Mmo`) declares
+`constant_time = aes.has_hardware_support`: on a target with AES-NI or
+ARMv8-AES it is constant-time, but on one without either it falls back to
+`std`'s software (T-table) AES implementation, which is NOT constant-time.
+The secret this touches is real and named: the client's own DPF-key
+generation (`Gen`) walks the domain tree keyed by the query index `i`, so a
+co-resident cache-timing attacker observing that soft-AES fallback can
+recover bits of `i` — exactly the thing this whole protocol exists to hide.
+
+`fss` already exposes the escape hatch this needs — `Sha256Prg`, a
+constant-time PRG built on `std.crypto.hash.sha2.Sha256` — via
+`fss.DpfWith`/`fss.MpfWith`. Prior to `PirWith`/`VerifiedWith` existing,
+nothing threaded that choice through: `Pir`/`Verified` were hard-wired to
+`fss.Dpf`/`fss.Mpf`, i.e. to the default PRG, with no way for a caller on a
+soft-AES target to opt into `Sha256Prg` instead. `pir.PirWith(Prg, ...)` and
+`verify.VerifiedWith(Prg, ...)` now take the PRG as an explicit parameter,
+mirroring `fss.DpfWith`/`fss.MpfWith` exactly; `Pir`/`Verified` remain
+`PirWith`/`VerifiedWith` applied to `fss.prg.default`, unchanged for every
+existing caller. A caller on a target without AES-NI/ARMv8-AES that cares
+about this side channel should instantiate with `fss.prg.Sha256Prg`
+explicitly rather than relying on the default.
 
 ### Anchoring the verified layer
 
@@ -612,13 +675,22 @@ omission:
   A search of the PIR literature and of Google's `distributed_point_functions`
   library surfaced DPF vectors and PIR *parameters*, never a retrieval-level
   test vector.
-- **Even the DPF layer could not interoperate.** `fss` deliberately uses a
-  module-defined SHA-256 PRG rather than the fixed-key-AES construction of
-  Google's library, precisely so its correctness could be anchored against an
-  independent re-derivation in another language (`fss/SPEC.md`
-  §"External-reference anchoring"). Any external PIR vector would be built on
-  that library's PRG, so byte-exact agreement is impossible by `fss`'s own
-  design decision — not by an oversight here.
+- **Even the DPF layer could not interoperate — but not for the reason this
+  section used to give.** `fss`'s *default* PRG is now fixed-key AES
+  (`Aes128Mmo`), not a module-defined SHA-256 (that swap happened after this
+  paragraph was first written; `Sha256Prg` still exists as a
+  correctness-anchoring instantiation and, separately, a caller-selectable
+  constant-time-safe alternative — see §"Constant-time PRG selection"). The conclusion is
+  unchanged, but for `fss`'s actual reason (`fss/SPEC.md`
+  §"External-reference anchoring"): moving to fixed-key AES removes the
+  *primitive* as an obstacle to interop with Google's
+  `distributed_point_functions`, but not the rest — byte-exactness would also
+  need that library's exact fixed AES keys, tweak/counter convention, byte
+  order, control-bit extraction, value-correction scheme and protobuf key
+  layout, none of which is pinned by a published vector file. `fss`'s PRG and
+  key layout remain module-defined regardless of which primitive backs them,
+  so any external PIR vector — built on a different DPF library's key format
+  — cannot byte-exactly agree with this composition's output either way.
 - **The DPF underneath is already anchored**, byte-exact, against an
   independent Python re-derivation of BGI16 Fig. 1 (`fss/kat_vectors.zig`).
   This module leans on that rather than re-proving it: everything below

@@ -179,6 +179,13 @@ implements only the spec's version `0x03`.
   false`; authenticating the embedded `Kpub` (if the caller's threat
   model needs it) is entirely the caller's responsibility, exactly as
   vodozemac's own `InboundGroupSession::import` documents.
+  **`signing_key_verified` is advisory-only: `decrypt` never reads it.**
+  `decrypt`'s own Ed25519 check proves a message was signed by whoever
+  holds `signing_key`'s private half, not that `signing_key` belongs to
+  the claimed sender — those are different facts, and only the second one
+  is what `signing_key_verified` records. A caller that cares about sender
+  attribution on an imported (unsigned-provenance) session must inspect
+  the flag itself before trusting `decrypt`'s output.
 - **Dependency on the secure channel used to share `SessionKey`/
   `ExportedSessionKey`** (megolm.md "Dependency on secure channel for key
   exchange"): any weakness in that channel (unknown-key-share, replay)

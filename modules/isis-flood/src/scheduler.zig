@@ -297,6 +297,21 @@ pub const Scheduler = struct {
         var entries: [max_summary_entries]LspEntry = undefined;
         var m: usize = 0;
 
+        // `db.get(item.lsp_id, now) orelse continue` below can only skip an
+        // entry `ssnIterator` cannot re-resolve if `Lsdb` ever yields a
+        // flagged id it does not also hold — audited as W2 `isis-flood` F4 on
+        // the theory that this could strand the SSN flag forever. Traced
+        // against `Lsdb` (2026-08-08): `FlagIterator.next` walks the SAME
+        // live `self.map` that `get` looks up (`store.zig` `ssnIterator` /
+        // `get`), so any id it yields is by construction present; the only
+        // removal path (`Lsdb.tick`'s `self.map.remove`, `store.zig:634`)
+        // deletes the entry from every future iteration too, so a removed
+        // id is never yielded to begin with. There is no interleaving inside
+        // one synchronous `emitPsnp` call (single-owner, no concurrency) that
+        // could desync the two. The `orelse continue` is therefore
+        // unreachable dead code under `Lsdb`'s current invariants, not a live
+        // stranded-flag bug — left as defensive fail-safety rather than
+        // `unreachable`, since that invariant lives in a different module.
         var qit = db.ssnIterator(iface);
         while (qit.next()) |item| {
             if (m >= entries.len) break;

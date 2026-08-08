@@ -117,7 +117,10 @@ unknown-unicast case is decided inside `forward` against the FDB.
   bridge degrades to flooding when its CAM fills. `max_isids` and
   `max_pes_per_isid` similarly bound the I-SID count and per-I-SID membership.
   Total worst-case memory is `max_isids × max_macs_per_isid` FDB entries plus
-  `max_isids × max_pes_per_isid` membership entries — never unbounded.
+  `max_isids × max_pes_per_isid` membership entries — never unbounded, but at
+  the shipped defaults that ceiling is at least ~500 MiB before hashmap
+  bookkeeping overhead (see `SPEC.md` §"Deliberately generous defaults") —
+  size `max_isids`/`max_macs_per_isid` down for a memory-constrained edge PE.
 
 ## Time-injection contract
 

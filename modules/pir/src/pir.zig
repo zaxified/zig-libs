@@ -81,7 +81,23 @@ const Error = db_mod.Error;
 ///
 /// Both are compile-time because `fss.Dpf` is: the key layout, the domain
 /// index type and the group width are all fixed at compile time.
+///
+/// Uses `fss`'s DEFAULT PRG (`fss.prg.default`, fixed-key AES,
+/// `constant_time = aes.has_hardware_support`). On a target without
+/// AES-NI/ARMv8-AES this falls back to a non-constant-time software AES —
+/// see `PirWith` to select a PRG explicitly, and `SPEC.md`
+/// §"Constant-time PRG selection" for the caveat this matters for (the
+/// client's own DPF-key generation touches the query index).
 pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
+    return PirWith(fss.prg.default, domain_bits, word_bytes);
+}
+
+/// `Pir` with an explicitly chosen PRG (`fss.prg.Aes128Mmo` or
+/// `fss.prg.Sha256Prg`, or any type meeting `fss/prg.zig`'s PRG interface —
+/// see `fss.DpfWith`'s own doc comment). The PRG is part of the DPF key
+/// format, so `PirWith(A, ...)` and `PirWith(B, ...)` keys are NOT
+/// interchangeable, same as `fss.DpfWith` itself.
+pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_bytes: usize) type {
     return struct {
         /// this single-index protocol, so the nested `Multi` layer can reach
         /// its geometry helpers without restating them
@@ -90,7 +106,7 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
         /// the underlying DPF instantiation — exposed so a caller can reach
         /// `fss`'s own verification oracles (`firstMismatch`, `evalAll`)
         /// without re-deriving the parameters
-        pub const Dpf = fss.Dpf(domain_bits, word_bytes);
+        pub const Dpf = fss.DpfWith(Prg, domain_bits, word_bytes);
 
         /// a single ring element: one `word_bytes`-byte chunk of a record
         pub const Word = Dpf.Elem;
@@ -212,8 +228,9 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
         /// records. Note this is `record_len` rounded **up** to a whole word,
         /// so it depends only on the database's geometry — never on which
         /// index was queried.
-        pub fn answerBytesLen(record_len: usize) usize {
-            return answerWords(record_len) * word_bytes;
+        pub fn answerBytesLen(record_len: usize) Error!usize {
+            return std.math.mul(usize, answerWords(record_len), word_bytes) catch
+                error.AnswerLengthMismatch;
         }
 
         /// Server `party`'s answer to `share`, over `database`, into `out`
@@ -396,7 +413,7 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
                 const Mul = @This();
 
                 /// the multi-point FSS instantiation behind this layer
-                pub const Mpf = fss.Mpf(domain_bits, word_bytes, k);
+                pub const Mpf = fss.MpfWith(Prg, domain_bits, word_bytes, k);
                 /// one server's multi-index query share (a multi-point key)
                 pub const Share = Mpf.Key;
                 pub const Word = Single.Word;
@@ -557,7 +574,7 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
                     const want_out = std.math.mul(usize, k, record_len) catch
                         return error.RecordsLengthMismatch;
                     if (records_out.len != want_out) return error.RecordsLengthMismatch;
-                    const per_bytes = Single.answerBytesLen(record_len);
+                    const per_bytes = try Single.answerBytesLen(record_len);
                     for (0..k) |j| {
                         try Single.reconstructFromBytes(
                             a0[j * per_bytes ..][0..per_bytes],
@@ -701,6 +718,39 @@ fn fillDb(bytes: []u8, record_len: usize) void {
     }
 }
 
+test "SELF: PirWith actually threads the PRG through, not just compiles — constant-time-safe Sha256Prg round-trips" {
+    // `Pir`/`Verified` were hard-wired to `fss`'s default PRG
+    // (`Aes128Mmo`, `constant_time = aes.has_hardware_support`). On a target
+    // without AES-NI/ARMv8-AES that PRG falls back to a non-constant-time
+    // software AES, leaking the client's own DPF-key generation (query index)
+    // to a co-resident cache-timing attacker -- and `fss` exposes exactly the
+    // escape hatch this needed (`Sha256Prg`) that nothing in `pir` reached
+    // before `PirWith` existed. This proves the threading actually changes
+    // the instantiation's DPF (an end-to-end query/answer/reconstruct with
+    // the alternate PRG, not merely a type that type-checks).
+    const P = PirWith(fss.prg.Sha256Prg, 4, 8);
+    try testing.expectEqual(fss.prg.Sha256Prg, P.Dpf.Prg);
+    try testing.expect(P.Dpf.Prg != fss.prg.Aes128Mmo);
+
+    const record_len = 20;
+    const count = 9;
+    var bytes: [count * record_len]u8 = undefined;
+    fillDb(&bytes, record_len);
+    const database = try Database.init(&bytes, record_len);
+    const seeds = detSeeds(777);
+    const index = 5;
+
+    const shares = try P.query(index, seeds[0], seeds[1]);
+    var a0: [8]P.Word = undefined;
+    var a1: [8]P.Word = undefined;
+    const n_words = P.answerWords(record_len);
+    try P.answer(0, shares[0], database, a0[0..n_words]);
+    try P.answer(1, shares[1], database, a1[0..n_words]);
+    var out: [record_len]u8 = undefined;
+    try P.reconstruct(a0[0..n_words], a1[0..n_words], &out);
+    try testing.expectEqualSlices(u8, database.record(index), &out);
+}
+
 test "SELF: retrieval returns the right record for EVERY index, across awkward sizes" {
     // Sizes chosen to straddle the DPF's internal tree boundaries: exact
     // powers of two, one below, one above, and the degenerate 1-record case.
@@ -838,7 +888,7 @@ test "SELF: wire round-trip — share and answer survive serialization" {
     fillDb(&bytes, record_len);
     const database = try Database.init(&bytes, record_len);
     const n_words = P.answerWords(record_len);
-    const n_bytes = P.answerBytesLen(record_len);
+    const n_bytes = try P.answerBytesLen(record_len);
     const seeds = detSeeds(1234);
     const i = 37;
 
@@ -956,6 +1006,19 @@ test "SELF: geometry errors are returned, never asserted" {
     try testing.expectError(error.ZeroRecordLen, P.answerSlices(0, shares[0], &zero_len, out[0..0]));
 }
 
+test "SELF: answerBytesLen rejects a record_len whose word count overflows the byte multiply, instead of panicking" {
+    // `answerWords`/`db.wordsPerRecord` are deliberately overflow-safe (a
+    // q + remainder form), but the public `answerBytesLen` helper's final
+    // `* word_bytes` was a plain multiply, undoing that safety at the one
+    // point a caller actually reads a byte length. Every INTERNAL call site
+    // already routes through `std.math.mul` (this is what made the gap
+    // findable: two public helpers were the exception, not the rule).
+    // `record_len` always originates from a `Database` on every path this
+    // module itself takes, so this is latent, not exploitable today.
+    const P = Pir(4, 4);
+    try testing.expectError(error.AnswerLengthMismatch, P.answerBytesLen(std.math.maxInt(usize)));
+}
+
 test "SELF: exhaustive length sweep over every untrusted boundary" {
     // `std.testing.fuzz`'s default corpus is small, and `zig build --fuzz`
     // does not build on Zig 0.16.0's shipped test runner (see SPEC.md
@@ -974,7 +1037,7 @@ test "SELF: exhaustive length sweep over every untrusted boundary" {
     var words: [8]P.Word = undefined;
 
     for (0..b0.len + 1) |l0| for (0..b1.len + 1) |l1| for (0..rec.len + 1) |rl| {
-        const need = P.answerBytesLen(rl);
+        const need = try P.answerBytesLen(rl);
         const r = P.reconstructFromBytes(b0[0..l0], b1[0..l1], rec[0..rl]);
         if (l0 == need and l1 == need) {
             try r;

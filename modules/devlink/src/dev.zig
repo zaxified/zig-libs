@@ -44,7 +44,16 @@ const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
 
-pub const ParseError = codec.Error || error{OutOfMemory};
+pub const ParseError = codec.Error || error{ OutOfMemory, TooManyVersions };
+
+/// Ceiling on the number of version-nest attributes `parseInfo` will collect
+/// per reply. No real driver reports anywhere close to this many (double- and
+/// triple-digit counts are typical for the largest firmware bundles) — the
+/// cap exists because the reply is untrusted-boundary data and the version
+/// list otherwise grows one `ArrayList.append` per attribute with no bound at
+/// all, unlike `resource.zig`'s `max_nodes`/`param.zig`'s `max_values`, which
+/// already cap their own repeated-nest lists the same way.
+pub const max_versions = 4096;
 
 // ── DEVLINK_CMD_GET ────────────────────────────────────────────────────────
 
@@ -204,6 +213,7 @@ pub fn parseInfo(gpa: std.mem.Allocator, attr_bytes: []const u8) ParseError!Info
             // one, so its absence is a malformed reply rather than an
             // anonymous version to be silently kept.
             if (!saw_name) return error.BadLength;
+            if (versions.items.len >= max_versions) return error.TooManyVersions;
             try versions.append(gpa, v);
         },
     };
@@ -307,6 +317,33 @@ test "parseInfo: an unnamed version nest is a malformed reply" {
     try codec.appendAttrString(gpa, &list, uapi.ATTR.INFO_VERSION_VALUE, "1.0");
     codec.nestEnd(&list, nest);
     try testing.expectError(error.BadLength, parseInfo(gpa, list.items));
+}
+
+test "parseInfo: the version list is capped, not grown one append at a time forever" {
+    // `parseInfo`'s reply is untrusted-boundary data (a netlink socket, not
+    // necessarily this host's real kernel), and the version list used to grow
+    // with no bound at all -- one `ArrayList.append` per version-nest
+    // attribute, unlike `resource.zig`/`param.zig`'s own repeated-nest lists,
+    // which already cap. `max_versions + 1` distinct nests must be rejected;
+    // `max_versions` exactly must still be accepted.
+    const gpa = testing.allocator;
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(gpa);
+    var i: usize = 0;
+    while (i < max_versions + 1) : (i += 1) {
+        try appendVersion(gpa, &over, uapi.ATTR.INFO_VERSION_RUNNING, "n", "v");
+    }
+    try testing.expectError(error.TooManyVersions, parseInfo(gpa, over.items));
+
+    var exact: std.ArrayList(u8) = .empty;
+    defer exact.deinit(gpa);
+    i = 0;
+    while (i < max_versions) : (i += 1) {
+        try appendVersion(gpa, &exact, uapi.ATTR.INFO_VERSION_RUNNING, "n", "v");
+    }
+    var info = try parseInfo(gpa, exact.items);
+    defer info.deinit(gpa);
+    try testing.expectEqual(@as(usize, max_versions), info.versions.len);
 }
 
 test "parseInfo: hostile input is a typed error, never a read past the end" {

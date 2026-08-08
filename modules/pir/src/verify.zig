@@ -92,7 +92,23 @@ const Error = db_mod.Error;
 /// default (error ≤ 2^-63); `1` is the floor (error ≤ 2^-7), permitted
 /// because the bound is stated rather than hidden. `0` would be
 /// deterministically forgeable and is a compile error.
+/// Uses `fss`'s DEFAULT PRG for both channels — see `VerifiedWith` to select
+/// one explicitly (same caveat as `pir.Pir`/`pir.PirWith`: the default falls
+/// back to non-constant-time software AES on a target without AES-NI/
+/// ARMv8-AES).
 pub fn Verified(
+    comptime domain_bits: usize,
+    comptime word_bytes: usize,
+    comptime tag_slack_bytes: usize,
+) type {
+    return VerifiedWith(fss.prg.default, domain_bits, word_bytes, tag_slack_bytes);
+}
+
+/// `Verified` with an explicitly chosen PRG, threaded through to both the
+/// value channel (`pir.PirWith`) and the tag channel's DPF
+/// (`fss.DpfWith`) — see `pir.PirWith`'s doc comment.
+pub fn VerifiedWith(
+    comptime Prg: type,
     comptime domain_bits: usize,
     comptime word_bytes: usize,
     comptime tag_slack_bytes: usize,
@@ -108,10 +124,10 @@ pub fn Verified(
     return struct {
         const Ver = @This();
 
-        /// the unmodified base protocol — the value channel IS `Pir(b, L)`
-        pub const Value = pir_mod.Pir(domain_bits, word_bytes);
+        /// the unmodified base protocol — the value channel IS `PirWith(Prg, b, L)`
+        pub const Value = pir_mod.PirWith(Prg, domain_bits, word_bytes);
         /// the tag channel's DPF, over the widened ring `Z_{2^{8(L+S)}}`
-        pub const TagDpf = fss.Dpf(domain_bits, word_bytes + tag_slack_bytes);
+        pub const TagDpf = fss.DpfWith(Prg, domain_bits, word_bytes + tag_slack_bytes);
 
         pub const Word = Value.Word;
         /// a tag-channel ring element (also the type of the secret `m`)
@@ -276,8 +292,9 @@ pub fn Verified(
 
         /// Bytes in a serialized tag answer. Geometry-only, like every other
         /// length here.
-        pub fn tagBytesLen(record_len: usize) usize {
-            return tagWords(record_len) * tag_word_len;
+        pub fn tagBytesLen(record_len: usize) Error!usize {
+            return std.math.mul(usize, tagWords(record_len), tag_word_len) catch
+                error.AnswerLengthMismatch;
         }
 
         /// Server `party`'s answer to a bundled share: the base-protocol value
@@ -625,6 +642,19 @@ test "SELF: honest verified retrieval returns the right record for EVERY index, 
             }
         }
     }
+}
+
+test "SELF: tagBytesLen rejects a record_len whose word count overflows the byte multiply, instead of panicking" {
+    // `tagWords(record_len)` is deliberately overflow-safe (a q + remainder
+    // form, like `db.wordsPerRecord`), but the final `* tag_word_len` was a
+    // plain multiply, undoing that safety at the one point a caller actually
+    // reads a byte length -- the exact class `db.wordsPerRecord`'s own doc
+    // comment was written to prevent. `record_len` always originates from a
+    // `Database` on every path this module itself takes (never wire data
+    // directly), so this is latent, not exploitable today; the test pins the
+    // helper's own contract regardless.
+    const Suite = Verified(4, 4, 2);
+    try testing.expectError(error.AnswerLengthMismatch, Suite.tagBytesLen(std.math.maxInt(usize)));
 }
 
 test "DERIVED: the tag answer equals m·word (+ presence m) computed without any DPF" {

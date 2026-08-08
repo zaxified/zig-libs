@@ -253,11 +253,23 @@ pub const Cache = struct {
     /// Release all resources. **Quiescence requirement:** every `get` must have
     /// returned before `deinit` (no load may be in flight). Leaders remove their
     /// own in-flight entry on completion, so a quiesced cache has an empty
-    /// in-flight map here; any leftover would carry an undefined `Call.result`
-    /// and cannot be safely reclaimed.
+    /// in-flight map here; any leftover means the caller violated quiescence.
+    ///
+    /// This used to free only the map's owned *keys* and silently leak every
+    /// `*Call` still present — a half-cleanup that masked a quiescence
+    /// violation as a plain memory leak instead of making it visibly a
+    /// pair-freeing bug. Both halves of every remaining pair are now
+    /// reclaimed: the owned key AND the `*Call` itself. A leftover entry here
+    /// is still a caller contract violation (its `Call.result` may be
+    /// `undefined` if a load never completed) — this does not make racing
+    /// `deinit` against an in-flight `get` safe, it only stops the map from
+    /// leaking memory on top of it.
     pub fn deinit(self: *Cache) void {
-        var it = self.in_flight.keyIterator();
-        while (it.next()) |k| self.gpa.free(k.*);
+        var it = self.in_flight.iterator();
+        while (it.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.destroy(entry.value_ptr.*);
+        }
         self.in_flight.deinit(self.gpa);
         self.store.deinit();
         self.* = undefined;
@@ -302,6 +314,10 @@ pub const Cache = struct {
                     self.stats.negative_hits += 1;
                     self.lock.unlock();
                     return error.CachedLoaderError;
+                },
+                .corrupt => {
+                    self.lock.unlock();
+                    return error.CorruptEntry;
                 },
             }
         }
@@ -446,19 +462,34 @@ pub const Cache = struct {
 
     // ── internals ─────────────────────────────────────────────────────────────
 
-    const Decoded = union(enum) { value: []const u8, missing, err };
+    const Decoded = union(enum) { value: []const u8, missing, err, corrupt };
 
     /// Look up `key` and, if fresh, decode its tag. Caller holds the lock. The
     /// returned `value` slice borrows ramcache storage — valid only while the
     /// lock is held.
+    ///
+    /// A stored entry is supposed to always have at least its tag byte, and
+    /// the tag byte is supposed to always be one of the three known values —
+    /// but both of those are cross-module invariants this function trusted
+    /// rather than checked (every entry is written by `storeLocked`, which
+    /// upholds them; a zero-length payload is unreachable through `.missing`/
+    /// `.err`, whose payloads are always non-empty). Indexing `raw[0]`
+    /// unchecked and closing with `else => unreachable` turned "nothing in
+    /// THIS module currently violates it" into UB the instant `ramcache`'s
+    /// own contract ever shifted underneath — an OOB read on an empty `raw`,
+    /// or `unreachable` firing in ReleaseFast on an unknown tag, neither of
+    /// which this module's own tests could ever trigger by construction. A
+    /// stored-entry invariant should not be load-bearing for memory safety
+    /// across a module boundary, so both cases now decode to `.corrupt`
+    /// instead.
     fn decodeFreshLocked(self: *Cache, key: []const u8) ?Decoded {
         const raw = self.store.get(key, self.now(), self.generation) orelse return null;
-        // A stored entry always has at least its tag byte.
+        if (raw.len == 0) return .corrupt;
         return switch (raw[0]) {
             tag_value => .{ .value = raw[1..] },
             tag_missing => .missing,
             tag_error => .err,
-            else => unreachable,
+            else => .corrupt,
         };
     }
 
@@ -634,6 +665,44 @@ test "read-through: miss loads, second get is a hit (loader not called again)" {
     try testing.expectEqualStrings("v", b.value);
     try testing.expectEqual(@as(u64, 1), rig.ldr.calls.load(.monotonic)); // still 1: served from cache
     try testing.expectEqual(@as(u64, 1), c.getStats().hits);
+}
+
+test "deinit reclaims BOTH halves of a leftover in-flight pair (key AND Call), not just the key" {
+    // Simulates a quiescence-contract violation the same shape `deinit`'s own
+    // doc comment warns against (a load that never completed before deinit),
+    // WITHOUT actually racing a real load -- inserted directly, the way a
+    // leader's registration (`get`'s `self.in_flight.put(...)`) would have
+    // left it. `testing.allocator` fails this test on any unfreed
+    // allocation, so a regression (freeing only the key, leaking the `*Call`
+    // again) shows up as a leak report pointing at the `create(Call)` below.
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = rig.open(.{});
+
+    const call = try testing.allocator.create(Call);
+    call.* = .{};
+    const kdup = try testing.allocator.dupe(u8, "leftover");
+    try c.in_flight.put(testing.allocator, kdup, call);
+
+    c.deinit(); // must free both `kdup` and `call`, or testing.allocator flags a leak
+}
+
+test "corrupt entry (zero-length payload, no tag byte) surfaces as a typed error, not UB" {
+    // `decodeFreshLocked` used to index `raw[0]` unchecked and close its tag
+    // switch with `else => unreachable` -- safe today only via a cross-module
+    // invariant (every entry `storeLocked` ever writes has a tag byte) that
+    // this test deliberately violates by writing straight through the
+    // underlying `ramcache.Cache`, bypassing `storeLocked` entirely, the way
+    // a future `ramcache` behavior change could.
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = rig.open(.{});
+    defer c.deinit();
+
+    c.store.put("k", &.{}, c.now(), 1_000_000_000, c.generation);
+    try testing.expectError(error.CorruptEntry, c.get("k"));
 }
 
 test "distinct keys load independently" {

@@ -78,8 +78,20 @@ pub const Pending = struct {
     deadline_ms: u64,
     attempts_left: u8,
     /// The encoded datagram, kept so a retry is a resend rather than a
-    /// re-encode (which could differ if the caller's inputs moved).
-    datagram: [256]u8 = undefined,
+    /// re-encode (which could differ if the caller's inputs moved). Sized to
+    /// `transport.max_datagram` (W2 `bacnet` F5) — a fixed 256-octet cap here
+    /// used to refuse (fail-closed, but undocumented) any confirmed request
+    /// whose encoded datagram exceeded it, even though `Config.max_apdu`
+    /// negotiates up to 1476 octets of APDU with the peer (e.g. a
+    /// `ReadPropertyMultiple` over roughly a dozen properties routinely
+    /// exceeded 256 bytes while staying well inside the negotiated max-APDU).
+    /// Matching `transport.max_datagram` — what `sendConfirmed` already
+    /// bounds the encoded datagram to via `self.tx`/`bvll.wrap` — means the
+    /// retry buffer can hold anything this client is capable of sending in
+    /// the first place; `error.NoSpace` now fires only for something that
+    /// could not have been transmitted at all, never for an ordinary
+    /// negotiated-size request.
+    datagram: [transport.max_datagram]u8 = undefined,
     datagram_len: usize = 0,
     active: bool = false,
 };
@@ -1144,6 +1156,56 @@ test "a Forwarded-NPDU is attributed to the original sender, not the BBMD" {
     const ev = try c.poll(0);
     try testing.expect(ev.i_am.from.eql(origin));
     try testing.expect(!ev.i_am.from.eql(rig.device_ep.address));
+}
+
+// Regression (audit W2 `bacnet` F5): a confirmed request whose encoded
+// datagram exceeds the OLD 256-octet `Pending.datagram` cap, but stays well
+// inside the negotiated 1476-octet max-APDU, must now succeed instead of
+// `error.NoSpace` — the retry buffer is sized to `transport.max_datagram`
+// (1500), matching what `sendConfirmed` already bounds the encoded datagram
+// to via `bvll.wrap`.
+test "F5: a ReadPropertyMultiple whose datagram exceeds the old 256-octet cap still sends" {
+    var rig: Rig = .{};
+    rig.wire();
+    var c = DefaultClient.init(rig.client_ep.transport(), .{});
+    var peer: Peer = .{ .tp = &rig.device_ep };
+
+    const two_props = [_]service.PropertyReference{
+        .{ .property = .present_value },
+        .{ .property = .status_flags },
+    };
+    // 30 objects x 2 properties: comfortably past the old 256-byte ceiling
+    // (each object costs roughly a dozen encoded bytes) while staying well
+    // under both the 400-byte local RPM-body buffer and the new 1500-byte
+    // datagram cap.
+    var specs: [30]RpmSpec = undefined;
+    for (&specs, 0..) |*s, i| {
+        s.* = .{
+            .object = .{ .type = .analog_input, .instance = @intCast(i) },
+            .properties = &two_props,
+        };
+    }
+
+    const id = try c.readPropertyMultiple(rig.device_ep.address, &specs, 0);
+
+    const req = (try peer.recvApdu()).?;
+    try testing.expectEqual(id, req.a.confirmed_request.invoke_id);
+    // The whole point: the RPM body alone already exceeds what used to be
+    // the entire datagram's ceiling.
+    try testing.expect(req.a.confirmed_request.data.len > 256);
+
+    // Every object round-trips — nothing was silently truncated to fit.
+    var it = service.RpmRequestIterator.init(req.a.confirmed_request.data);
+    var seen: usize = 0;
+    while (try it.next()) |s| {
+        try testing.expect(s.object.eql(.{ .type = .analog_input, .instance = @intCast(seen) }));
+        seen += 1;
+    }
+    try testing.expectEqual(specs.len, seen);
+
+    // And the pending transaction really did retain the full datagram for a
+    // resend — not just accept the initial send.
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
 }
 
 test "garbage from a stranger does not kill the poll loop" {

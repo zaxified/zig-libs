@@ -288,10 +288,31 @@ fn buildCommonSigMsg(
         try buf.appendSlice(allocator, o.script_pubkey);
         try appendU32LE(&buf, allocator, vin.sequence);
     } else {
-        try appendU32LE(&buf, allocator, @intCast(input_index));
+        // `input_index < transaction.vin.len` is already checked above, but
+        // that bounds it only by the input array's length, not by `u32`'s
+        // range — a `usize` past `maxInt(u32)` (i.e. a transaction with more
+        // than 4 billion inputs) would make a bare `@intCast` UB in
+        // ReleaseFast rather than a typed error. Not reachable through any
+        // parser in this module today (nothing constructs a `Transaction`
+        // with that many inputs), but this is public API over a caller-
+        // supplied `input_index`, so the guard belongs here rather than
+        // resting on every caller happening to stay in range.
+        const idx_u32 = std.math.cast(u32, input_index) orelse return error.InputIndexOutOfRange;
+        try appendU32LE(&buf, allocator, idx_u32);
     }
 
-    // annex: deferred, never signaled/emitted (module doc comment).
+    // Annex commitment: IMPLEMENTED here — `opts.annex_hash`, when the caller
+    // sets it, is emitted right here per BIP341. What is deferred (SPEC.md
+    // §"Deferred") is a HIGHER-layer concern: no caller in this module ever
+    // constructs an annex-carrying `CommonOptions` (every call site here
+    // leaves `annex_hash = null`), there is no annex-parsing/witness-stack-
+    // inspection helper to derive one from a real witness, and (per SPEC.md)
+    // the official test-vector fixture this module's KATs are pinned against
+    // contains no annex case to verify the presence path against. The
+    // wire-layout primitive below is straightforward and reviewed, but is
+    // NOT covered by a byte-exact test with `annex_hash != null` — do not
+    // read its existence as meaning that path is anchored the way the rest
+    // of this file is.
 
     if (opts.annex_hash) |h| try buf.appendSlice(allocator, &h);
 

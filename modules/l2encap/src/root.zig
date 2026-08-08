@@ -232,6 +232,19 @@ pub const DecodeError = error{
 /// bounds-checked before it is read; a truncated, wrong-version, or
 /// reserved-bit-dirty buffer returns a typed error and never panics, reads out
 /// of bounds, loops, or allocates.
+///
+/// **Minimum-payload policy (W2 `l2encap` F5, decided, not left implicit):**
+/// `decode` does NOT enforce a minimum payload length or call
+/// `looksLikeEthernet` — a header-only frame (`bytes.len == header_len`,
+/// `payload.len == 0`) is a VALID decode (pinned by "golden: unicast, I-SID
+/// 0, empty payload" below), not a truncation. The payload is opaque bytes by
+/// design (this module intentionally does not interpret the customer frame's
+/// contents), so there is no length below which it is definitely not a legal
+/// tenant frame — a legitimate keepalive/control frame could be shorter than
+/// an Ethernet header. A caller that DOES want an Ethernet-shaped minimum
+/// (e.g. a fabric edge that only ever carries Ethernet) opts in explicitly by
+/// calling `looksLikeEthernet(dec.payload)` itself; enforcing it unconditionally
+/// here would reject frame shapes this codec has no basis to call invalid.
 pub fn decode(bytes: []const u8) DecodeError!Decoded {
     if (bytes.len > max_frame_len) return error.FrameTooLarge;
     if (bytes.len < header_len) return error.Truncated;
@@ -565,6 +578,24 @@ test "semantics: looksLikeEthernet is a pure length check at the eth_hdr_len bou
     var longer: [eth_hdr_len + 50]u8 = @splat(0);
     try testing.expect(looksLikeEthernet(&longer));
     try testing.expect(!looksLikeEthernet(&.{}));
+}
+
+// Regression / policy-pin (audit W2 `l2encap` F5): the minimum-payload
+// decision is deliberate leniency, not an oversight — `decode` accepts a
+// 0-byte customer frame as a valid decode (it does not call
+// `looksLikeEthernet`), and a caller that wants the stricter Ethernet-shaped
+// policy applies it itself, on the decoded payload, after the fact. This
+// pins BOTH halves of that contract end-to-end so neither can silently drift:
+// `decode` must keep accepting a header-only frame, and `looksLikeEthernet`
+// must keep flagging that exact payload as not Ethernet-shaped.
+test "policy: decode accepts a 0-byte payload; looksLikeEthernet on it says no (caller's opt-in check)" {
+    const fields: Fields = .{ .isid = 1, .ttl = 1, .bum = false, .ingress_pe = 1 };
+    var buf: [header_len]u8 = undefined;
+    const wire = try encode(fields, "", &buf);
+
+    const dec = try decode(wire); // NOT an error: 0-byte payload is a valid decode
+    try testing.expectEqual(@as(usize, 0), dec.payload.len);
+    try testing.expect(!looksLikeEthernet(dec.payload)); // the opt-in check catches it
 }
 
 test "semantics: two I-SIDs decode to distinct tenants (isolation key round-trips)" {

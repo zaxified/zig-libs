@@ -102,6 +102,27 @@ HTTPS client, GETs `<host>/<chainhash>/info` and
 forms), and passes the raw response bodies to `parseInfo`/`parseRound`.
 `roundPath`/`latestPath` build the path string only.
 
+## Freshness is not authenticity
+
+`verifyRound` proves that a round's signature is genuinely a threshold-BLS
+signature under `info`'s chain key for `round.round` — nothing more. It has
+no notion of wall-clock time and no way to tell a round served a millisecond
+ago from one replayed from a year-old capture: a malicious or compromised
+relay that answers `/public/latest` with an old, genuinely-signed round
+verifies exactly as well as a fresh one, forever.
+
+`ChainInfo` carries `genesis_time`/`period_seconds`, which are exactly the
+inputs needed to compute which round *should* be current at a given instant
+— drand's own `chain.CurrentRound` formula:
+`floor((now - genesis_time) / period) + 1` (round 1 for `now < genesis_time`).
+`expectedRound(info, now_unix)` implements this. A caller that needs
+liveness — using the beacon as a *recent* randomness source rather than a
+historical one, e.g. seeding a time-bounded protocol — must call
+`expectedRound` itself and compare the round it actually fetched against
+what came back, deciding its own staleness tolerance. This module does not
+make that comparison automatically, because "how stale is too stale" is
+caller policy, not a fact `verifyRound` can decide.
+
 ## Malformed-input handling (threat model)
 
 Every parser is pure and bounds-checked. The relevant adversary is a

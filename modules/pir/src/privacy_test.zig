@@ -64,7 +64,7 @@ test "EXACT: an answer's length depends only on the database geometry" {
     // the retrieved record, a network observer would narrow down the index.
     const P = pir.Pir(5, 8);
     for ([_]usize{ 1, 7, 8, 9, 64 }) |record_len| {
-        const expected = P.answerBytesLen(record_len);
+        const expected = try P.answerBytesLen(record_len);
         var bytes: [20 * 64]u8 = @splat(0);
         for (&bytes, 0..) |*b, k| b.* = @truncate(k * 31 + 7);
         const database = try Database.init(bytes[0 .. 20 * record_len], record_len);
@@ -355,7 +355,7 @@ test "EXACT: a retrieval answer reveals k; an aggregate answer does not" {
     inline for (.{ 1, 2, 4 }) |k| {
         const M = P.Multi(k);
         try testing.expectEqual(
-            k * P.answerBytesLen(record_len),
+            k * try P.answerBytesLen(record_len),
             try M.answerBytesLen(record_len),
         );
         try testing.expectEqual(P.answerWords(record_len), M.aggregateWords(record_len));

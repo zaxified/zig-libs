@@ -74,6 +74,12 @@ try P.reconstruct(a0[0..n_words], a1[0..n_words], &record_out);
 
 `src/root.zig`'s last test *is* that example, so it cannot drift.
 
+`pir.Pir(domain_bits, word_bytes)` uses `fss`'s default PRG (fixed-key AES,
+falling back to non-constant-time software AES without AES-NI/ARMv8-AES —
+see `SPEC.md` §"Constant-time PRG selection"). On a target where that
+fallback matters, use `pir.PirWith(fss.prg.Sha256Prg, domain_bits,
+word_bytes)` instead (and `verify.VerifiedWith` for the verified layer).
+
 ### Retrieving `k` records at once
 
 ```zig
@@ -223,8 +229,14 @@ Read the security statement before relying on it (`SPEC.md`
   recover `i`), and **both servers agreeing on the same wrong database passes**
   — the MAC binds to the servers' common database, not to a published one.
   Both non-detections are asserted by tests, not just documented.
-- **Privacy is unchanged** — the tag key is one more DPF key, and the abort
-  bit carries no usable index information (no selective-failure attack).
+- **Privacy is unchanged at the recommended `tag_slack_bytes = 8`** — the tag
+  key is one more DPF key, and a single-word tampering's abort bit carries no
+  usable index information beyond the soundness bound above. This does NOT
+  hold uniformly down to the permitted floor `tag_slack_bytes = 1`: a
+  two-word tampering there gives a *conclusive* (not just low-probability)
+  index-dependent abort oracle — `tag_slack_bytes` is a privacy parameter,
+  not purely an integrity one. See `SPEC.md` §"The exact security statement"
+  for the exact construction and bound.
 - Querying an index past the database **rejects** here (the base layer's
   all-zero convention is indistinguishable from a zeroing attack).
 - Costs: 2 keys and ~2 answers of bandwidth, 2 DPF evaluations per record.

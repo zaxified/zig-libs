@@ -366,6 +366,24 @@ pub const Decoder = struct {
             l.finished = true;
             l.d.depth -= 1;
         }
+
+        /// Release this list's depth slot if it was never reached by a clean
+        /// close. Idempotent — safe to call after `next()` already returned
+        /// `false` (a normal, exhausted iteration), so a caller can
+        /// unconditionally `defer it.deinit()` right after `maybeList`
+        /// without double-decrementing `d.depth` on the common path.
+        ///
+        /// `next()`'s own `close()` only runs when iteration reaches `)`
+        /// cleanly; an error thrown while parsing an ELEMENT between `next()`
+        /// calls (the caller's job, not this type's) abandons the list
+        /// without ever calling `next()` again, leaking one `depth` level
+        /// forever on a `Decoder` that outlives the failed parse (see
+        /// `Client.readLine`, which now also resets `depth` per line as a
+        /// second line of defense against exactly this).
+        pub fn deinit(l: *List) void {
+            if (l.finished) return;
+            l.close();
+        }
     };
 
     /// Begin a list if `(` is next.
@@ -413,6 +431,7 @@ pub const Decoder = struct {
         }
         if (try d.maybeList()) |l| {
             var it = l;
+            defer it.deinit(); // safety net if an element below errors mid-list
             while (try it.next()) try d.discardValue();
             return;
         }
@@ -743,6 +762,21 @@ test "discardValue: stays in sync across an unknown extension" {
     const a = try d.expectAtom();
     defer gpa.free(a);
     try testing.expectEqualStrings("DONE", a);
+}
+
+test "discardValue: an error mid-list still releases the depth slot" {
+    // `List.next()` only decrements `d.depth` on a CLEAN close (hitting `)`);
+    // an error thrown while `discardValue` parses an ELEMENT inside the list
+    // (here: a literal declaring more bytes than are present) used to
+    // abandon the list without ever reaching that close, leaking one `depth`
+    // level. `List.deinit`'s defer-safe close at this internal call site
+    // fixes it -- `d.depth` must be back to 0 after the error, not 1.
+    const gpa = testing.allocator;
+    var r = std.Io.Reader.fixed("(a {20}\r\ntoo short)");
+    var d = decoderOver(gpa, &r);
+    try testing.expectEqual(@as(usize, 0), d.depth);
+    try testing.expectError(error.EndOfStream, d.discardValue());
+    try testing.expectEqual(@as(usize, 0), d.depth);
 }
 
 test "a full untagged line, field by field" {

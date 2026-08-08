@@ -113,6 +113,22 @@ Implemented (cheap, and they gate adjacency formation):
   while the inflated hold kept the FSM from ever reaching a clean Down. The
   circuit is released only when the incumbent's hold genuinely expires (`tick`
   → Down clears the neighbour), so a real neighbour change converges in one hold.
+- **Maximum Area Addresses mismatch** — the IIH's common-header Maximum Area
+  Addresses (ISO 10589 §9.6) differs from `Config.max_area_addresses` →
+  `rejected = .max_area_mismatch` (ISO 10589 §8.2). Always enforced; there is
+  no opt-out, since both sides always carry this field on the wire.
+- **Area-address mismatch (Level 1 only)** — ISO 10589 §8.2.2/§7.2.4: a Level 1
+  adjacency requires the neighbour's Area Addresses (#1) TLV to name at least
+  one area in common with `Config.local_areas` → `rejected = .area_mismatch`.
+  Enforced only when the circuit is pure `.level1` **and** `local_areas` is
+  non-empty (opt-in: this module has no configuration source of its own, so an
+  unconfigured area list is treated as "matching not wanted", not "reject
+  everyone"). `.level1_2` circuits are intentionally left unchecked — this FSM
+  tracks one combined state per circuit rather than split L1/L2 sub-states, so
+  rejecting a `.level1_2` circuit on an area mismatch would also block the L2
+  component ISO 10589 says must still form regardless of area. A malformed or
+  absent Area Addresses TLV on an enforced circuit is treated as "no shared
+  area" (fail closed), not skipped.
 
 Malformed input is a typed **error** (not a soft reject) from `rxHelloBytes`:
 a bad common header / P2P body surfaces `isis`'s `pdu.DecodeError`
@@ -127,10 +143,10 @@ change) — a hostile PDU cannot corrupt the machine. The fuzz test pins this
 - **LAN adjacency + DIS election** — this module is P2P-only; the LAN Hello
   (types 15/16) three-way/priority/DIS logic is a separate FSM. `isis` already
   decodes the LAN Hello body, so it is additive.
-- **Area-address matching** — an L1 P2P adjacency should reject a neighbour whose
-  Area Addresses (#1) TLV shares no area with ours. Left as a documented hook: it
-  needs the neighbour's #1 TLV compared against local config, which this
-  increment does not carry. L2 adjacencies form across areas regardless.
+- **Area-address matching for `.level1_2` circuits** — implemented for pure
+  `.level1` circuits (see §5); a `.level1_2` circuit still forms regardless of
+  area, since this FSM has no split L1/L2 sub-state to selectively reject only
+  the L1 half. Splitting the state would need to be a separate increment.
 - **Authentication** — TLV #10 / RFC 5304 / 5310 HMAC validation of the IIH.
 - **Graceful restart** (RFC 5306) and **adjacency-SID** (segment routing).
 - **MTU / padding negotiation** beyond the basics, and full ISO 10589 §8.2

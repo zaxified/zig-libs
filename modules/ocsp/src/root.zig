@@ -187,7 +187,6 @@ const PubKeyAlgo = enum { rsa, ec, other };
 /// The certificate fields OCSP needs, as views over the input DER. Produced by
 /// `parseCert` with the bounds-safe reader — never `std.crypto.Certificate.parse`.
 const CertView = struct {
-    der_bytes: []const u8, // the certificate TLV (trailing garbage trimmed)
     tbs: []const u8, // tbsCertificate TLV — the signed message
     serial: []const u8, // serialNumber INTEGER content
     issuer_name: []const u8, // issuer Name TLV (full SEQUENCE)
@@ -270,7 +269,6 @@ fn parseCert(bytes: []const u8) Malformed!CertView {
     if (sig_content.len < 1) return error.Malformed;
 
     return .{
-        .der_bytes = bytes[0..cert.slice.end],
         .tbs = tlvOf(bytes, tbs_start, tbs),
         .serial = contentOf(bytes, serial),
         .issuer_name = tlvOf(bytes, issuer_start, issuer),

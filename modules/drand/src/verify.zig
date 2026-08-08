@@ -139,6 +139,27 @@ pub fn verifyRound(info: *const ChainInfo, round: *const Round) VerifyError!void
     }
 }
 
+/// The round number a well-behaved drand node would be serving at wall-clock
+/// time `now_unix`, per `info`'s `genesis_time`/`period_seconds` — drand's
+/// own `chain.CurrentRound` formula (`drand/drand`, Go):
+/// `floor((now - genesis_time) / period) + 1` for `now >= genesis_time`,
+/// else round 1 (the chain has not started yet).
+///
+/// **What this does and does not prove.** `verifyRound` proves *authenticity*
+/// — a genuine threshold signature over `round.round` under `info`'s chain
+/// key — never *freshness*. Nothing in the signed bytes ties a round to the
+/// moment it was fetched, so a malicious or compromised relay can replay an
+/// old, genuinely-signed round forever and `verifyRound` accepts it every
+/// time. A caller that needs liveness (e.g. using the beacon as a recent
+/// randomness source, not just a historical one) must call this separately
+/// and compare against the round it actually received — this module does
+/// not do that comparison itself, since "how stale is too stale" is a
+/// caller policy, not a verification fact.
+pub fn expectedRound(info: *const ChainInfo, now_unix: u64) u64 {
+    if (now_unix < info.genesis_time) return 1;
+    return (now_unix - info.genesis_time) / info.period_seconds + 1;
+}
+
 // ── tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -261,6 +282,33 @@ test "verifyRound: an unsupported (chained) scheme → UnsupportedScheme" {
     const info = try chaininfo.parseInfo(testing.allocator, chained);
     const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
     try testing.expectError(error.UnsupportedScheme, verifyRound(&info, &rnd));
+}
+
+// ── expectedRound: freshness, not authenticity ──────────────────────────
+//
+// `verifyRound` only proves the signature is genuine for *some* round; it
+// has no notion of "now" at all. These pin `expectedRound`'s formula
+// (drand's own `chain.CurrentRound`) against the same quicknet chain used
+// throughout this file, whose `genesis_time`/`period` (1692803367 / 3) are
+// the real values fetched from the live quicknet `/info` endpoint.
+
+test "expectedRound: at genesis_time exactly, the round is 1" {
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    try testing.expectEqual(@as(u64, 1), expectedRound(&info, info.genesis_time));
+}
+
+test "expectedRound: before genesis_time, the round is still 1 (chain has not started)" {
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    try testing.expectEqual(@as(u64, 1), expectedRound(&info, info.genesis_time - 1000));
+}
+
+test "expectedRound: round 1000's own start instant round-trips to 1000, not 999 or 1001" {
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    // Round n starts at genesis_time + (n - 1) * period and lasts one period.
+    const round_1000_start = info.genesis_time + 999 * info.period_seconds;
+    try testing.expectEqual(@as(u64, 1000), expectedRound(&info, round_1000_start));
+    try testing.expectEqual(@as(u64, 1000), expectedRound(&info, round_1000_start + info.period_seconds - 1));
+    try testing.expectEqual(@as(u64, 1001), expectedRound(&info, round_1000_start + info.period_seconds));
 }
 
 // ── W2-32: cofactor-torsion malleation of a GENUINE signature ──────────

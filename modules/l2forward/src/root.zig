@@ -1285,6 +1285,26 @@ test {
     std.testing.refAllDecls(@This());
 }
 
+test "SELF: default FDB memory footprint is documented in bytes, not just entry count" {
+    // SPEC.md's "Deliberately generous defaults" section already documented
+    // the entry-count product (4096 x 8192 FDB entries) as "large by
+    // construction", but not what that costs in actual memory an operator
+    // has to provision for -- an entry count alone under-communicates the
+    // risk on an edge PE with a modest memory budget. This pins the byte
+    // estimate SPEC.md/README.md now state, so a future `FdbEntry`/`Mac`
+    // size change re-triggers a doc check here instead of the docs quietly
+    // drifting stale (the pattern noted by the audit for the entry-count
+    // number itself).
+    const raw_bytes_per_entry = @sizeOf(Mac) + @sizeOf(FdbEntry);
+    const default_options = Options{};
+    const worst_case_entries = default_options.max_isids * default_options.max_macs_per_isid;
+    const worst_case_bytes = worst_case_entries * raw_bytes_per_entry;
+    // Lower bound: `AutoHashMapUnmanaged`'s own bookkeeping (control bytes,
+    // load-factor headroom) adds more on top, not less -- this is a floor,
+    // and the documented figure says so.
+    try testing.expect(worst_case_bytes >= 500 * 1024 * 1024); // ~500 MiB floor, matches SPEC.md
+}
+
 test "external anchor: our MAC-move defaults are RFC 7432 §15.1's stated N and M" {
     // Not a style assertion. Every duplicate-MAC test below configures its own
     // small N so it can trip the limit in a few calls, which leaves the shipped

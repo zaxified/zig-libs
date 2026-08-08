@@ -170,7 +170,17 @@ pub fn Reconciler(comptime Key: type, comptime Ctx: type) type {
                 self.q.finish(idx, now, .drop);
                 return;
             }
-            const delay_ms = self.opts.backoff.nextDelay(failures, self.opts.random);
+            // `nextDelay` legally returns 0 — `base_delay_ms = 0`, or the
+            // default `.full` jitter's `rnd.uintAtMost(u64, d)` draw, which is
+            // inclusive of 0. A 0 delay here means `finish`'s computed `due`
+            // is `now` itself, which lands the key straight back on the ready
+            // FIFO (`queue.zig`'s `due <= now` rule) instead of the timer —
+            // so `sleepFor` reports "nothing to wait for" and a caller's event
+            // loop retries the same failing key on every iteration with no
+            // gap: a 100%-CPU spin, not a rate-limited backoff. Floor at 1 ms
+            // (this module's own delay unit) so a backoff pass is always at
+            // least one tick away, never the same instant it failed in.
+            const delay_ms = @max(1, self.opts.backoff.nextDelay(failures, self.opts.random));
             self.q.finish(idx, now, .{ .after = delay_ms *| std.time.ns_per_ms });
         }
 
@@ -409,6 +419,46 @@ test "failure backoff is exponential, capped, and reset by a success" {
     _ = try r.enqueue(1);
     _ = r.tick(now);
     try testing.expectEqual(@as(u64, 1), (r.nextDue(now).? - now) / std.time.ns_per_ms);
+}
+
+// Regression (audit W2 `reconcilable` F4): `base_delay_ms = 0` (a legal,
+// documented-shape config, not malformed input) used to compute a 0 ns
+// backoff delay, which `finish` treats as `due <= now` — straight back onto
+// the ready FIFO, no timer at all. A caller's event loop driven by
+// `sleepFor`/`nextDue` would see "nothing to wait for" and re-tick
+// immediately, retrying the same permanently-failing key every iteration
+// with zero gap: 100% CPU spin, not a rate-limited backoff. The fix floors
+// the computed delay at 1 ms so a failed pass is always at least one tick
+// away from being retried.
+test "F4: base_delay_ms = 0 does not spin — a failed key is never immediately ready again" {
+    var rec = newRecorder();
+    defer rec.deinit();
+    rec.fail_first = 1000; // always fails within this test's tick budget
+    var r = try R.init(testing.allocator, &rec, recorderFn, .{
+        .capacity = 4,
+        .backoff = .{ .base_delay_ms = 0, .factor = 1.0, .max_delay_ms = 0, .jitter = .none },
+    });
+    defer r.deinit();
+
+    _ = try r.enqueue(1);
+    const now: Instant = 0;
+    const report = r.tick(now);
+    try testing.expectEqual(@as(u32, 1), report.reconciled);
+    try testing.expectEqual(@as(u64, 1), r.stats().failed);
+
+    // The key must NOT be ready again at the same `now` — it must be parked
+    // on a timer strictly in the future, not looped straight back onto the
+    // ready FIFO. Before the fix, `nextDue(now) == now` here (0 ns delay)
+    // and a second `tick(now)` would immediately retry it again.
+    const due = r.nextDue(now).?;
+    try testing.expect(due > now);
+    try testing.expectEqual(@as(u64, 1), (due - now) / std.time.ns_per_ms);
+
+    // A second tick at the SAME `now` (the busy-spin scenario) must do
+    // nothing — the key is on a timer, not ready.
+    const spin = r.tick(now);
+    try testing.expectEqual(@as(u32, 0), spin.reconciled);
+    try testing.expectEqual(@as(u64, 1), r.stats().failed); // unchanged: not retried yet
 }
 
 test "F5: Stats.retried counts every backoff (requeue AND failed), like every other counter" {

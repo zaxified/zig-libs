@@ -133,6 +133,19 @@ parentheses; `hqc_ct` and total scale with the HQC parameter set.
 - **Malleability / tamper.** ChaCha20-Poly1305 over the full AAD makes
   every header field and both lock ciphertexts tamper-evident; the round
   number is additionally bound into `K` via the HKDF `info`.
+- **`SealRandomness` reuse is a full break, and this module cannot prevent
+  it.** `(key, nonce)` is a deterministic function of
+  `(s_time, s_pq, suite_id, round)`; the nonce is never transmitted, so it
+  relies entirely on `s_time`/`s_pq` (and therefore `SealRandomness`) being
+  fresh per seal. `SealRandomness` is caller-supplied by design (the
+  repo-wide "randomness is caller's job" convention that also makes
+  byte-exact KATs possible) — the type itself carries no freshness proof.
+  Sealing two different plaintexts to the same `(suite_id, round)` with the
+  same `SealRandomness` value reuses both the ChaCha20-Poly1305 key and the
+  nonce: XOR of the two ciphertexts recovers the XOR of the two plaintexts,
+  and both authentication tags become forgeable. Always draw a new
+  `SealRandomness` (`generate`, or an equivalent fresh draw) for every
+  `seal` call — never cache or replay one.
 
 ## Malformed-input handling
 

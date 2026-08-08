@@ -179,11 +179,25 @@ pub fn unpadPkcs7(buf: []const u8) PaddingError!usize {
 /// unconstrained by the scheme itself, so there is nothing else to check) and
 /// returns `InvalidPadding` on an out-of-range length byte. Returns the
 /// unpadded length on success.
+///
+/// Branch-free on `N` itself, matching `unpadPkcs7`'s shape: `N` is the LAST
+/// byte of the just-decrypted plaintext, i.e. secret-derived, so a data-
+/// dependent early `if (n == 0 or n > block_len)` would branch on that secret
+/// byte. The check used to do exactly that; accumulating into `invalid` and
+/// branching only once, on a value that no longer varies with `N`'s specific
+/// magnitude beyond in/out of range, closes that gap the way `unpadPkcs7`
+/// already does. No *additional* leak follows from the old shape beyond what
+/// the return value (accept/reject) already reveals — `xmlenc`'s decrypt path
+/// has no MAC ahead of this CBC decrypt, so accept/reject is observable
+/// either way — but this SPEC previously claimed BOTH helpers were
+/// branch-free when only `unpadPkcs7` was; this makes the claim true.
 pub fn unpadXmlEnc(buf: []const u8) PaddingError!usize {
     if (buf.len == 0 or buf.len % block_len != 0) return error.InvalidPadding;
     const n = buf[buf.len - 1];
-    if (n == 0 or n > block_len) return error.InvalidPadding;
-    return buf.len - n;
+    const invalid: u1 = @intFromBool(n == 0) | @intFromBool(n > block_len);
+    const pad_len: usize = @min(@as(usize, n), block_len);
+    if (invalid != 0) return error.InvalidPadding;
+    return buf.len - pad_len;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
