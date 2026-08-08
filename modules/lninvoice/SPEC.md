@@ -69,7 +69,21 @@ Merkle-tree BIP-340 signature). Usage: see ./README.md.
   applied on decode too, matching the module's fail-closed posture on the other length-minimality
   rules already enforced elsewhere in the repo (`lnwire`'s BigSize/TLV). NOT applied to `9`
   (features): interpreting individual feature-bit odd/even semantics is BOLT#9's scope, not
-  BOLT#11's — `features` is handed back as raw bytes, uninterpreted.
+  BOLT#11's — `features` is handed back as an uninterpreted feature vector.
+
+- **`9` (features) is a BIT VECTOR, not a byte string** — the one tagged field where the generic
+  quintet⇄byte pair is the wrong tool, and the source of a real defect fixed 2026-08-08. BOLT#11
+  "Feature Bits": *"The field is big-endian. The least-significant bit is numbered 0, which is
+  _even_, and the next most significant bit is numbered 1, which is _odd_."* Bit numbering is
+  anchored at the **end** of the `data_length × 5`-bit string, so the slack that rounds the vector
+  up to a multiple of 5 bits sits at the **front**. Width is fixed by the writer rule *"if `9`
+  contains non-zero bits: MUST use the minimum `data_length` possible to encode the non-zero bits
+  with no 0 field-elements at the start. — otherwise: MUST omit the `9` field altogether"*, i.e.
+  `data_length = ceil((highest_set_bit + 1) / 5)`; `encode` omits the field entirely for an
+  all-zero vector, per that same rule. `features` is exchanged as a big-endian byte vector with
+  bit 0 = least-significant bit of the last byte — the same convention `lnwire` already uses for
+  BOLT#1/#7 feature vectors, so the two modules now agree. Confirmed against every `data_length`
+  the spec's examples use (3, 10, 20, 21) in `bitpack.zig`.
 
 - **Amount encoding/decoding is exact integer arithmetic in `u128`**, never floating point: `msat
   = digits · 10^(11−exp)` for multipliers `none`/`m`/`u`/`n` (exact by construction), and `msat =
@@ -176,28 +190,44 @@ signing the donation vector's own hash with its own documented private key repro
 exact `(r, s, recid)` byte-for-byte, and recovering from that freshly-signed signature reproduces
 the spec's node ID — signer and verifier agree end-to-end.
 
-`UNVERIFIED:` **BOLT#11 ENCODE has no byte-exact external anchor** (wave-2 audit F4). Every check
-above pins DECODE against the spec's own worked examples, and pins the *signature* half of ENCODE
-(RFC 6979 hash-signing reproduces the spec's exact `(r, s, recid)`, byte-for-byte). What is NOT
-pinned is the *serializer*: the tagged-field bit-packing, `data_length` header and field ordering
-`encode()` emits are checked only against this module's OWN `decode()` — a round trip, not an
-anchor (the hazard the campaign's own methodology names explicitly: encoder and decoder sharing one
-author's convention proves agreement, not correctness). The one documented reason: the spec's own
-donation-invoice vector's `9` (features) field uses non-minimal bech32 padding this encoder does not
-bit-for-bit reproduce, so that specific vector cannot be asserted byte-exact through the full encode
-pipeline (`bolt11.zig`'s RFC 6979 test comment). A direct check was attempted for this audit finding
-using a DIFFERENT spec vector without a `9` field (the donation invoice itself, `payment_hash` +
-`payment_secret` + `description`, signed with the spec's own documented private key so the
-signature bytes are reproducible) — the encoded output did **not** match the spec's string
-byte-for-byte, and the divergence starts well before the signature, in the tagged-field region
-itself; a few minutes of investigation did not isolate the layout difference (padding vs field-order
-vs a `data_length`/multiplier interaction is unconfirmed from a quick pass), so pinning down the
-exact behavioral gap needs a real investigation, not a guess. Closing this needs either (a) a
-third-party-generated BOLT#11 invoice (CLN's or LDK's own test corpus, or a fresh vector from either
-implementation) whose exact string this encoder can reproduce field-for-field, or (b) diagnosing and
-fixing the layout divergence the quick attempt above surfaced and THEN re-attempting a spec-vector
-match. Until one of those lands, treat `encode()`'s serializer (as opposed to its signature) as
-unverified against any implementation but its own.
+**BOLT#11 ENCODE is byte-exact against the spec's own invoice string as of 2026-08-08** — this
+closes wave-2 audit finding F4, which is now RESOLVED rather than unverifiable. The KAT
+(`bolt11.zig`, "donation invoice ENCODE byte-exact") rebuilds the spec's first worked example from
+its documented field values, signs with the spec's own documented private key (RFC 6979, so the
+signature bytes are deterministic and reproducible), and `expectEqualStrings` against the literal
+`lnbc1pvjluez…9lfyql` the spec prints. Tagged-field bit-packing, `data_length` headers, the
+timestamp's fixed 7 quintets, the HRP and the signature are therefore all pinned by an authority
+other than this module's own `decode()`. Field ORDER (`s`, `p`, `d`, `9`) is an input to that test,
+not something `encode` reconstructs — BOLT#11 leaves writer order free.
+
+**What the earlier `UNVERIFIED:` marker got wrong, recorded because the mistake is instructive.**
+The marker asserted the vector could not be reproduced because the spec's `9` (features) field
+"uses non-minimal bech32 padding this encoder does not bit-for-bit reproduce", and a later attempt
+claimed to have retried with "a different spec vector without a `9` field". Both halves were false:
+
+1. **The donation vector does have a `9` field** — `9qrsgq`, `data_length` 3. Every one of the 20
+   worked examples in BOLT#11's Examples section carries one.
+2. **The spec's `9` field is perfectly minimal.** `data_length` 3 is exactly
+   `ceil((highest_set_bit + 1) / 5)` for its highest set feature bit, #14 — as it is for all four
+   `data_length` values the spec's examples use (3, 10, 20, 21). The non-minimal encoding was
+   *ours*: `encode` ran the feature vector through the generic byte-string packer, which rounds up
+   to a whole number of bytes first and pads at the wrong end.
+
+The divergence was a single field. Encoding the vector against the pre-fix code diverged at the
+191st character of the invoice — the low quintet of the `9` field's own `data_length` header (spec
+`r` = 3, ours `y` = 4) — with the timestamp, `s`, `p` and `d` fields all already byte-exact. The
+same misalignment made `decode` report the donation vector's feature bits {14, 8} as {7, 1}, and
+made `quintetsToBytesStrict` reject any legal `9` field with a set bit inside its low slack bits
+as `error.NonZeroPadding`. Fixed in `bitpack.featureBytesToQuintets` / `quintetsToFeatureBytes`;
+see the `9`-is-a-bit-vector entry above for the governing rules.
+
+`UNVERIFIED:` **BOLT#11 ENCODE is anchored against the specification, not against a second
+implementation.** The KAT above is a genuine external oracle — the spec's own published string —
+but no CLN-, LDK- or eclair-generated invoice has been run through `encode` byte-for-byte. Field
+shapes the spec's examples never exercise on the ENCODE side are therefore still pinned only by
+this module's own `decode()`: `m` (metadata), and `x`/`c` at widths other than those appearing in
+the vectors. `f` and `r` DO appear in the spec's examples, but only the donation vector is driven
+byte-exact through `encode` today, so they are covered on decode only.
 
 **BOLT#12 offer**: a hand-built minimal offer round-tripped through `lnwire.tlv.appendStream` →
 `bitpack.bytesToQuintets` → `bech32_raw.encodeNoChecksum` → `decodeOffer` (independently

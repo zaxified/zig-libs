@@ -196,6 +196,13 @@ pub const Invoice = struct {
     node_id_field: ?[33]u8,
     fallbacks: []Fallback,
     route_hints: []RouteHint,
+    /// The `9` field as a big-endian feature vector: bit 0 (BOLT#11's
+    /// "least-significant bit is numbered 0") is the low bit of the LAST
+    /// byte, matching how `lnwire` carries BOLT#1/#7 feature vectors. The
+    /// field is a bit string whose width need not be a multiple of 8, so a
+    /// leading zero byte here is normal and carries no meaning. Feature-bit
+    /// semantics (odd/even, dependencies) are BOLT#9's scope, not this
+    /// module's.
     features: ?[]u8,
     signature: ecdsa.Signature,
     /// Compressed SEC1 pubkey: the verified `n` field, or the pubkey
@@ -368,8 +375,12 @@ pub fn decode(allocator: Allocator, invoice_str: []const u8) DecodeError!Invoice
                 }
                 try route_hints.append(allocator, .{ .hops = hops });
             },
+            // `9` is a BIT VECTOR, not a byte string: its slack bits sit at
+            // the FRONT and its low bits are real feature bits, so the
+            // byte-string decoder both misaligns it and can reject it as
+            // "non-zero padding". See `bitpack.quintetsToFeatureBytes`.
             TAG_FEATURES => if (features == null) {
-                features = try bitpack.quintetsToBytesStrict(allocator, value);
+                features = try bitpack.quintetsToFeatureBytes(allocator, value);
             },
             else => {}, // unrecognized tag: already consumed above, discard
         }
@@ -448,6 +459,10 @@ pub const TaggedFieldOut = union(enum) {
     min_final_cltv_expiry: u64,
     fallback: struct { version: u5, program: []const u8 },
     route_hint: []const RouteHop,
+    /// Big-endian feature vector (bit 0 = low bit of the last byte), emitted
+    /// at the minimum `data_length` that covers its highest set bit. An
+    /// all-zero vector omits the `9` field entirely, per BOLT#11's writer
+    /// requirement. Leading zero bytes are ignored, not encoded.
     features: []const u8,
 };
 
@@ -549,7 +564,14 @@ fn appendTaggedField(allocator: Allocator, data: *std.ArrayList(u5), f: TaggedFi
         },
         .features => |s| {
             tag = TAG_FEATURES;
-            try appendBytesAsQuintets(allocator, &value, s);
+            const q = try bitpack.featureBytesToQuintets(allocator, s);
+            defer allocator.free(q);
+            // BOLT#11 writer: "if `9` contains non-zero bits: MUST use the
+            // minimum `data_length` possible ... otherwise: MUST omit the `9`
+            // field altogether." An all-zero vector encodes to zero quintets,
+            // which is exactly that omission case.
+            if (q.len == 0) return;
+            try value.appendSlice(allocator, q);
         },
     }
 
@@ -629,6 +651,11 @@ fn hexToBytes(comptime n: usize, hex: []const u8) [n]u8 {
 const spec_privkey = hexToBytes(32, "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734");
 const spec_node_id = hexToBytes(33, "03e7156ae33b0a208d0744199163177e909e80176e55d97a2f221ede0f934dd9ad");
 
+// BOLT#11's first worked example ("Please make a donation of any amount ..."),
+// driven in BOTH directions below: decoded field-by-field, and rebuilt
+// byte-exact by `encode`.
+const donation_invoice = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
+
 test "BOLT#11 vector: donation invoice, no 'n' field -- recovers the spec's own node ID" {
     const allocator = testing.allocator;
     const invoice = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
@@ -643,6 +670,12 @@ test "BOLT#11 vector: donation invoice, no 'n' field -- recovers the spec's own 
     try testing.expectEqualSlices(u8, &hexToBytes(32, "1111111111111111111111111111111111111111111111111111111111111111"), &inv.payment_secret);
     try testing.expectEqualStrings("Please consider supporting this project", inv.description.?);
     try testing.expectEqual(@as(?[32]u8, null), inv.description_hash);
+    // The spec's breakdown prints the `9` field as `sgq` = `b100000100000000`
+    // -- 15 bits, feature bits 14 and 8 set. Big-endian that is 0x4100. (The
+    // byte-string decoder used to report this as the single byte 0x82, i.e.
+    // bits 7 and 1: every feature bit shifted down by the field's 7 slack
+    // bits, which for `9` sit at the front, not the back.)
+    try testing.expectEqualSlices(u8, &.{ 0x41, 0x00 }, inv.features.?);
     try testing.expectEqual(VerificationSource.recovered, inv.verification);
     try testing.expectEqualSlices(u8, &spec_node_id, &inv.verified_pubkey);
 
@@ -878,11 +911,14 @@ test "RFC6979 byte-exact re-derivation: signing the donation vector's own hash w
     // signed with RFC6979 + the spec's own documented private key must
     // reproduce the EXACT (r, s) the spec's bech32 invoice carries -- not
     // merely "a valid signature", the literal same bytes, since RFC6979 is
-    // deterministic. This sidesteps `encode()`'s tagged-field bit-packing
-    // (the spec's own `9` features field uses non-minimal padding this
-    // module's encoder doesn't reproduce bit-for-bit, so going through the
-    // full encode pipeline can't be asserted byte-exact against this
-    // particular vector -- signing the hash directly can be).
+    // deterministic. Isolates the signature from the serializer: this test
+    // signs the spec's documented hash directly, while the KAT below drives
+    // the whole encode pipeline to the same invoice string.
+    //
+    // (This comment used to claim the spec's `9` field carried "non-minimal
+    // padding" that made a full-pipeline match impossible. That was wrong in
+    // both halves: the spec's field is minimal, and it was this module's own
+    // encoder that mis-sized it -- see the KAT below.)
     const hash = hexToBytes(32, "6daf4d488be41ce7cbb487cab1ef2975e5efcea879b20d421f0ef86b07cbb987");
     const sig = try ecdsa.sign(spec_privkey, hash);
     try testing.expectEqualSlices(u8, &hexToBytes(32, "8d3ce9e28357337f62da0162d9454df827f83cfe499aeb1c1db349d4d8112742"), &sig.r);
@@ -893,6 +929,39 @@ test "RFC6979 byte-exact re-derivation: signing the donation vector's own hash w
     // spec's own node ID -- signer and verifier agree end-to-end.
     const Q = try ecdsa.recoverPubkey(hash, sig.r, sig.s, sig.recid);
     try testing.expectEqualSlices(u8, &spec_node_id, &Q.toCompressedSec1());
+}
+
+test "BOLT#11 KAT: donation invoice ENCODE byte-exact against the spec's own lnbc1... string" {
+    // THE external anchor for the serializer (wave-2 audit F4). Everything
+    // else that touches `encode` ends in this module's own `decode`, which
+    // proves encoder and decoder share a convention, not that the convention
+    // is BOLT#11's. This builds the spec's first worked example from its
+    // documented field values, signs with the spec's own documented private
+    // key (RFC 6979 => deterministic, so the signature bytes are reproducible
+    // too), and demands the literal string the spec prints.
+    //
+    // Field ORDER is taken from the spec's own breakdown (`s`, `p`, `d`, `9`),
+    // which BOLT#11 leaves to the writer -- so it is an input here, not
+    // something `encode` is being asked to reconstruct.
+    const allocator = testing.allocator;
+    const fields = [_]TaggedFieldOut{
+        .{ .payment_secret = hexToBytes(32, "1111111111111111111111111111111111111111111111111111111111111111") },
+        .{ .payment_hash = hexToBytes(32, "0001020304050607080900010203040506070809000102030405060708090102") },
+        .{ .description = "Please consider supporting this project" },
+        // The spec's breakdown prints this field's contents as the 15-bit
+        // string `b100000100000000` -- feature bits 14 and 8 -- whose
+        // big-endian byte form is 0x4100.
+        .{ .features = &[_]u8{ 0x41, 0x00 } },
+    };
+    const str = try encode(allocator, .{
+        .network = .mainnet,
+        .amount_msat = null,
+        .timestamp = 1496314658,
+        .fields = &fields,
+    }, .{ .private_key = spec_privkey });
+    defer allocator.free(str);
+
+    try testing.expectEqualStrings(donation_invoice, str);
 }
 
 // ── fuzz: decode never panics on a user-pasted invoice string ────────────

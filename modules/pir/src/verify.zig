@@ -86,12 +86,32 @@ const Error = db_mod.Error;
 /// Verified two-server PIR: `Pir(domain_bits, word_bytes)`'s protocol plus a
 /// MACed tag channel that detects a lying server.
 ///
-/// `tag_slack_bytes` (`S ≥ 1`, `word_bytes + S ≤ 32`) sets the statistical
-/// soundness error `2^(1−8S)`: an adversary forging without the secret `m`
-/// passes the check with at most that probability. `8` is the recommended
-/// default (error ≤ 2^-63); `1` is the floor (error ≤ 2^-7), permitted
-/// because the bound is stated rather than hidden. `0` would be
-/// deterministically forgeable and is a compile error.
+/// `tag_slack_bytes` (`S ≥ 1`, `word_bytes + S ≤ 32`) is an **integrity AND a
+/// privacy** parameter — not the integrity-only knob an earlier version of
+/// this comment described. It sets:
+///   1. the statistical soundness error `2^(1−8S)` (a forger without the secret
+///      `m` passes the per-word check with at most that probability); and
+///   2. the advantage of a *selective-failure* oracle: a single malicious
+///      server tampering TWO value words with a common `(E,G)` turns the
+///      accept/reject bit into a chosen threshold predicate on `record[i]`,
+///      conclusive (not merely biased) and amplifiable, with per-query
+///      advantage `2^(1−8S)` — see `selective_failure_advantage_log2` below,
+///      the F1 regression test, and `SPEC.md` §"The exact security statement".
+/// `8` is the recommended default: soundness ≤ 2^-63 AND the oracle is
+/// 2^-63-scale, i.e. privacy-irrelevant in practice.
+///
+/// **Decision on the floor (F1 adjudication).** `S = 1` REMAINS permitted, and
+/// deliberately so: the oracle's advantage is exactly `2^(1−8S)` and shrinks
+/// smoothly one byte at a time, so any hard cutoff above 1 would be policy
+/// dressed up as a security boundary, and forbidding low `S` also removes the
+/// bandwidth/integrity knob a size-constrained deployment legitimately trades
+/// on (the tag answer is `S` bytes wider per word). What was actually wrong was
+/// the *claim* that `S` trades only integrity; that is now corrected here, in
+/// `README.md` and in `SPEC.md`. A deployment that wants a hard minimum should
+/// assert it at compile time against `selective_failure_advantage_log2`, e.g.
+/// `comptime std.debug.assert(V.selective_failure_advantage_log2 <= -63);`.
+/// `S = 0` stays a compile error — there the check is not weak but broken
+/// (deterministically forgeable, `m·2^{8L−1} = 2^{8L−1}` for every odd `m`).
 /// Uses `fss`'s DEFAULT PRG for both channels — see `VerifiedWith` to select
 /// one explicitly (same caveat as `pir.Pir`/`pir.PirWith`: the default falls
 /// back to non-constant-time software AES on a target without AES-NI/
@@ -136,6 +156,15 @@ pub fn VerifiedWith(
 
         /// bytes per tag word (`word_bytes + tag_slack_bytes`)
         pub const tag_word_len: usize = word_bytes + tag_slack_bytes;
+
+        /// Base-2 log of BOTH the per-query soundness error and the
+        /// selective-failure oracle's per-query advantage: `1 − 8·S`. Exposed so
+        /// a deployment can enforce its own floor at compile time rather than
+        /// trusting a hard-coded one — e.g.
+        /// `comptime std.debug.assert(V.selective_failure_advantage_log2 <= -63);`
+        /// pins `S ≥ 8`. See the constructor doc's "Decision on the floor".
+        pub const selective_failure_advantage_log2: isize =
+            1 - 8 * @as(isize, @intCast(tag_slack_bytes));
         /// serialized length of one server's bundled share (value key ‖ tag
         /// key) — compile-time constant, identical for every index and every
         /// `m`, so neither leaks through the length
@@ -1067,6 +1096,122 @@ test "EXACT: for a fixed tampering, the reject verdict is identical for EVERY qu
         tampered.va[0][0] +%= 1; // the fixed deviation
         try testing.expectError(error.AnswerRejected, tampered.reconstruct(&got));
     }
+}
+
+test "F1: two-word (E,G) tampering is a carry-coupled selective-failure oracle at the S=1 floor" {
+    // The two-word companion to the SINGLE-word guard test above, and the
+    // reason that one cannot see F1. The single-word test tampers ONE value
+    // word; for a single word the two carry hypotheses are provably
+    // equiprobable, so its verdict genuinely cannot depend on `record[i]` and
+    // it can never exhibit a selective-failure channel. This test tampers TWO
+    // value words with the SAME error `E` and the SAME tag guess `G`, which is
+    // where the channel lives.
+    //
+    // Derivation (SPEC.md §"The exact security statement", two-word bullet).
+    // Accepting value word `j` requires `G ≡ m·(E − δ_j·2^{8L}) (mod 2^{8(L+S)})`,
+    // where `δ_j ∈ {0,1}` is the carry of the value word's mod-`2^{8L}` wrap —
+    // here `δ_j = 1` iff `word_j(record[i]) + E ≥ 2^{8L}`. With the SAME (E,G)
+    // at two words, both accept-conditions subtract to
+    // `m·2^{8L}·(δ_{j1} − δ_{j2}) ≡ 0`, and for odd (hence invertible) `m` with
+    // `S ≥ 1` that holds iff `δ_{j1} = δ_{j2}`. So:
+    //   • carries EQUAL   → accept whenever the single common condition on `m`
+    //                       is met: a ~2^{-8S} event over fresh `m` (STRICTLY
+    //                       positive, and observable at the S=1 floor);
+    //   • carries UNEQUAL → NO odd `m` can satisfy both words → CONCLUSIVE,
+    //                       deterministic reject, independent of `m`.
+    // The two carries are deterministic functions of `record[i]`, so the
+    // accept/reject distribution is a chosen threshold predicate on the record
+    // — the selective-failure oracle the single-word test is blind to.
+    //
+    // This is asserted at the PERMITTED floor `S=1`, which is the entire point:
+    // at the recommended `S=8` the equal-carry accept rate is 2^{-63} and this
+    // test could not observe it in any feasible query budget — that S is a
+    // *privacy* parameter, not only the integrity knob, is exactly what makes
+    // the low end worth pinning here rather than describing in prose.
+    const LowS = Verified(4, 4, 1); // S=1 floor; L=4 ⇒ a value word is u32
+    const record_len = 8; // exactly two value words, no partial tail
+    const E: LowS.Word = @as(LowS.Word, 1) << (@bitSizeOf(LowS.Word) - 1); // 2^31
+    // G must be a multiple of 2^{8L-... } that some odd m can hit; the audit's
+    // reproducer value 2^{8L-1}·0x55 gives the ~2^{-8} equal-carry accept rate.
+    const G: LowS.TagWord = @as(LowS.TagWord, 0x55) << (@bitSizeOf(LowS.Word) - 1);
+
+    // A 2-record database with KNOWN word contents so the carries are pinned,
+    // not reverse-engineered from a hash fill.
+    var db_bytes: [2 * record_len]u8 = undefined;
+    // record 0 — both words top-bit CLEAR ⇒ δ = (0,0): carries EQUAL.
+    std.mem.writeInt(LowS.Word, db_bytes[0..4], 0x11111111, .little);
+    std.mem.writeInt(LowS.Word, db_bytes[4..8], 0x22222222, .little);
+    // record 1 — word0 top-bit SET, word1 CLEAR ⇒ δ = (1,0): carries UNEQUAL.
+    std.mem.writeInt(LowS.Word, db_bytes[8..12], 0x91111111, .little);
+    std.mem.writeInt(LowS.Word, db_bytes[12..16], 0x22222222, .little);
+    const database = try Database.init(&db_bytes, record_len);
+
+    // Assert the premise — that the two records really have the equal/unequal
+    // carry structure the derivation needs — so a future edit to the fill can
+    // never silently turn this into a test of the wrong thing.
+    const eq0 = @addWithOverflow(LowS.Value.wordAt(database.record(0), 0), E)[1];
+    const eq1 = @addWithOverflow(LowS.Value.wordAt(database.record(0), 1), E)[1];
+    const un0 = @addWithOverflow(LowS.Value.wordAt(database.record(1), 0), E)[1];
+    const un1 = @addWithOverflow(LowS.Value.wordAt(database.record(1), 1), E)[1];
+    try testing.expectEqual(eq0, eq1); // record 0: carries equal
+    try testing.expect(un0 != un1); // record 1: carries unequal
+
+    const K = 4000; // the audit's per-index budget; ~2^{-8} ⇒ ~16 equal-carry accepts
+    var out: [record_len]u8 = undefined;
+    var accepts_equal: usize = 0;
+    var accepts_unequal: usize = 0;
+
+    for ([_]usize{ 0, 1 }) |index| {
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            // Fresh, independent seeds AND `m` per query, exactly as the
+            // protocol requires — only the adversary's (E,G) is held fixed.
+            const tag = 700_000 + index * K + k;
+            const q = try LowS.query(
+                index,
+                detMac(LowS.tag_word_len, tag),
+                detSeed(tag * 4 + 0),
+                detSeed(tag * 4 + 1),
+                detSeed(tag * 4 + 2),
+                detSeed(tag * 4 + 3),
+            );
+            var va: [2][2]LowS.Word = undefined;
+            var ta: [2][3]LowS.TagWord = undefined;
+            for (0..2) |b| {
+                try LowS.answer(@intCast(b), q.shares[b], database, &va[b], &ta[b]);
+            }
+            // One malicious server (party 1) adds the SAME error to BOTH value
+            // words and the SAME guess to BOTH value-word tags — never the
+            // presence word (index 2), which must still reconstruct to m.
+            va[1][0] +%= E;
+            va[1][1] +%= E;
+            ta[1][0] +%= G;
+            ta[1][1] +%= G;
+            if (LowS.reconstruct(q.secret, &va[0], &va[1], &ta[0], &ta[1], &out)) |_| {
+                if (index == 0) accepts_equal += 1 else accepts_unequal += 1;
+            } else |_| {}
+        }
+    }
+
+    // The derivation, made executable. UNEQUAL carries: a conclusive,
+    // deterministic reject — no fresh `m` in the whole budget lets the forgery
+    // through. EQUAL carries: strictly positive — the accept is a real,
+    // repeatable event at the S=1 floor, i.e. an oracle bit on record content.
+    try testing.expectEqual(@as(usize, 0), accepts_unequal);
+    try testing.expect(accepts_equal > 0);
+}
+
+test "F1: selective_failure_advantage_log2 is the caller's compile-time floor knob" {
+    // The floor decision (keep S=1) hands the choice to the deployment via this
+    // constant, so pin its meaning: it is 1 − 8·S, matching BOTH the soundness
+    // bound and the two-word oracle advantage the test above exhibits.
+    try testing.expectEqual(@as(isize, -7), Verified(4, 4, 1).selective_failure_advantage_log2);
+    try testing.expectEqual(@as(isize, -15), Verified(4, 4, 2).selective_failure_advantage_log2);
+    try testing.expectEqual(@as(isize, -63), Verified(4, 4, 8).selective_failure_advantage_log2);
+    // The idiom the doc recommends must actually compile-gate: S=8 satisfies a
+    // 2^-63 floor, and the constant is negative-more-is-safer.
+    comptime std.debug.assert(Verified(4, 4, 8).selective_failure_advantage_log2 <= -63);
+    comptime std.debug.assert(Verified(4, 4, 1).selective_failure_advantage_log2 > -63);
 }
 
 test "EXACT: the tag channel's server access order is a function of the record count alone" {
