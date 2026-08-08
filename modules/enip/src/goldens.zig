@@ -61,6 +61,7 @@ const cip = @import("cip.zig");
 const epath = @import("epath.zig");
 const connmgr = @import("connmgr.zig");
 const types = @import("types.zig");
+const adapter_mod = @import("adapter.zig");
 
 pub const Direction = enum { to_target, from_target };
 pub const Source = enum { cpppo, pycomm3 };
@@ -961,4 +962,185 @@ test "no golden carries a real device identity" {
         try testing.expect(std.mem.indexOf(u8, wire, "LOGIX") == null);
         try testing.expect(std.mem.indexOf(u8, wire, "1756") == null);
     }
+}
+
+// ── the reverse direction: real third-party clients against OUR adapter ────
+//
+// Everything above is captured with a third-party *target* on the wire —
+// `table`'s only oracle for `adapter.zig`, this module's one wire-**listening**
+// surface, was our own `Client` reading our own `Adapter`'s replies (a self
+// round trip). This table closes that gap (wave-2 audit finding `enip` F4):
+// both `pycomm3` and `cpppo` were pointed, as real independent EtherNet/IP
+// client stacks, at a `zig-libs` process running exactly the `Adapter`
+// configuration `root.zig`'s "live: a real EtherNet/IP client against our
+// adapter" test builds (`Adapter.init(.{}, &tags)` with the same SCADA/INT,
+// TestTag/DINT, RealTag/REAL bindings), through the same encapsulation-aware
+// recording TCP proxy used for `table` above. No third-party source was read
+// as a design reference — both stacks were driven as black boxes only, same
+// as `table`; see SPEC.md.
+//
+// Captured:
+//
+//   scripts/capped zig build test-enip \
+//     -Dtest-filter="live: a real EtherNet/IP client against our adapter"
+//   ENIP_TEST_LISTEN=127.0.0.1:18944 (adapter under a recording proxy on 18945)
+//
+//   pycomm3 1.2.16: CIPDriver.list_identity("127.0.0.1:18945"); a fresh
+//   CIPDriver.open()/generic_message() session performing an unconnected
+//   Get_Attributes_All on the Identity object, then a connected
+//   Get_Attribute_Single (attribute 7, product name) — which pycomm3 opens
+//   with a **Large_Forward_Open** — followed by Forward_Close.
+//
+//   cpppo 5.2.5 (`python3 -m cpppo.server.enip.client -a 127.0.0.1:18945 -S`):
+//   an array read `SCADA[0-3]`; a write `SCADA[1]=(INT)77` immediately
+//   followed by a read-back of `SCADA[1]` on the same connection; `-s` for a
+//   `ListServices` request plus a read of `SCADA[0]`.
+//
+// No anonymisation was needed: every identity field the adapter answers with
+// (vendor 0x1234, serial 0x00C0FFEE, product name "zig-enip adapter") is
+// this module's own `Config` default, not a captured third party's.
+//
+// The `to_adapter`/`from_adapter` direction naming mirrors `table`'s
+// `to_target`/`from_target`, just naming the other target.
+
+pub const AdapterDirection = enum { to_adapter, from_adapter };
+pub const AdapterSource = enum { pycomm3, cpppo };
+
+pub const AdapterGolden = struct {
+    name: []const u8,
+    dir: AdapterDirection,
+    source: AdapterSource,
+    hex: []const u8,
+};
+
+/// Captured in the chronological order the proxy recorded them. This order
+/// matters for `"a captured client session replays byte-exact through our
+/// own Adapter"` below: `Adapter.next_connection_id` and the tag storage are
+/// mutable state shared across every entry, exactly as they were shared
+/// across every real connection during capture (the Large_Forward_Open here
+/// is the first, and only, `Forward_Open` in the whole session, so it is the
+/// only entry sensitive to ordering; the write and its read-back must stay
+/// adjacent and in this order).
+pub const adapter_table = [_]AdapterGolden{
+    .{ .name = "register session (list_identity call) request", .dir = .to_adapter, .source = .pycomm3, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "register session (list_identity call) reply", .dir = .from_adapter, .source = .pycomm3, .hex = "650004000100a5a5000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "list identity request", .dir = .to_adapter, .source = .pycomm3, .hex = "630000000100a5a5000000005f7079636f6d6d5f00000000" },
+    .{ .name = "list identity reply", .dir = .from_adapter, .source = .pycomm3, .hex = "630038000100a5a5000000005f7079636f6d6d5f0000000001000c00320001000002af1200000000000000000000000034120e00010001003000eeffc000107a69672d656e6970206164617074657203" },
+    .{ .name = "unregister session (list_identity call) request", .dir = .to_adapter, .source = .pycomm3, .hex = "660000000100a5a5000000005f7079636f6d6d5f00000000" },
+    .{ .name = "register session (connected session) request", .dir = .to_adapter, .source = .pycomm3, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "register session (connected session) reply", .dir = .from_adapter, .source = .pycomm3, .hex = "650004000100a5a5000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "get attributes all identity (unconnected) request", .dir = .to_adapter, .source = .pycomm3, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000102200124010000" },
+    .{ .name = "get attributes all identity (unconnected) reply", .dir = .from_adapter, .source = .pycomm3, .hex = "6f0033000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20023008100000034120e00010001003000eeffc000107a69672d656e69702061646170746572" },
+    .{ .name = "large forward open request", .dir = .to_adapter, .source = .pycomm3, .hex = "6f0042000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20032005b02200624010a0500000000d538b1ff27040910f4c5ae9e0700000001402000a00f004201402000a00f0042a30220022401" },
+    .{ .name = "large forward open reply", .dir = .from_adapter, .source = .pycomm3, .hex = "6f002e000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2001e00db000000010000010200000127040910f4c5ae9e01402000014020000000" },
+    .{ .name = "send unit data get attribute single product name request", .dir = .to_adapter, .source = .pycomm3, .hex = "70001e000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b1000a0001000e03200124013007" },
+    .{ .name = "send unit data get attribute single product name reply", .dir = .from_adapter, .source = .pycomm3, .hex = "70002b000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b100170001008e000000107a69672d656e69702061646170746572" },
+    .{ .name = "forward close request", .dir = .to_adapter, .source = .pycomm3, .hex = "6f0026000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20016004e02200624010a0527040910f4c5ae9e020020022401" },
+    .{ .name = "forward close reply", .dir = .from_adapter, .source = .pycomm3, .hex = "6f001e000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000e00ce00000027040910f4c5ae9e0000" },
+    .{ .name = "unregister session (connected session) request", .dir = .to_adapter, .source = .pycomm3, .hex = "660000000100a5a5000000005f7079636f6d6d5f00000000" },
+    .{ .name = "register session (array read) request", .dir = .to_adapter, .source = .cpppo, .hex = "65000400000000000000000000000000000000000000000001000000" },
+    .{ .name = "register session (array read) reply", .dir = .from_adapter, .source = .cpppo, .hex = "650004000100a5a50000000000000000000000000000000001000000" },
+    .{ .name = "read tag SCADA elements 0-3 request", .dir = .to_adapter, .source = .cpppo, .hex = "6f001e000100a5a500000000300000000000000000000000000000000800020000000000b2000e004c05910553434144410028000400" },
+    .{ .name = "read tag SCADA elements 0-3 reply", .dir = .from_adapter, .source = .cpppo, .hex = "6f001e000100a5a500000000300000000000000000000000000000000800020000000000b2000e00cc000000c3000100000000000000" },
+    .{ .name = "register session (write+readback) request", .dir = .to_adapter, .source = .cpppo, .hex = "65000400000000000000000000000000000000000000000001000000" },
+    .{ .name = "register session (write+readback) reply", .dir = .from_adapter, .source = .cpppo, .hex = "650004000100a5a50000000000000000000000000000000001000000" },
+    .{ .name = "write tag SCADA element 1 = 77 request", .dir = .to_adapter, .source = .cpppo, .hex = "6f0022000100a5a500000000300000000000000000000000000000000800020000000000b20012004d0591055343414441002801c30001004d00" },
+    .{ .name = "write tag SCADA element 1 = 77 reply", .dir = .from_adapter, .source = .cpppo, .hex = "6f0014000100a5a500000000300000000000000000000000000000000800020000000000b2000400cd000000" },
+    .{ .name = "read tag SCADA element 1 after write request", .dir = .to_adapter, .source = .cpppo, .hex = "6f001e000100a5a500000000310000000000000000000000000000000800020000000000b2000e004c05910553434144410028010100" },
+    .{ .name = "read tag SCADA element 1 after write reply", .dir = .from_adapter, .source = .cpppo, .hex = "6f0018000100a5a500000000310000000000000000000000000000000800020000000000b2000800cc000000c3004d00" },
+    .{ .name = "register session (list services) request", .dir = .to_adapter, .source = .cpppo, .hex = "65000400000000000000000000000000000000000000000001000000" },
+    .{ .name = "register session (list services) reply", .dir = .from_adapter, .source = .cpppo, .hex = "650004000100a5a50000000000000000000000000000000001000000" },
+    .{ .name = "list services request", .dir = .to_adapter, .source = .cpppo, .hex = "040000000100a5a500000000000000000000000000000000" },
+    .{ .name = "list services reply", .dir = .from_adapter, .source = .cpppo, .hex = "040019000100a5a50000000000000000000000000000000001000001130001002000436f6d6d756e69636174696f6e7300" },
+    .{ .name = "read tag SCADA element 0 request", .dir = .to_adapter, .source = .cpppo, .hex = "6f001e000100a5a500000000300000000000000000000000000000000800020000000000b2000e004c05910553434144410028000100" },
+    .{ .name = "read tag SCADA element 0 reply", .dir = .from_adapter, .source = .cpppo, .hex = "6f0018000100a5a500000000300000000000000000000000000000000800020000000000b2000800cc000000c3000100" },
+};
+
+fn bytesOfAdapter(g: AdapterGolden, buf: []u8) ![]u8 {
+    const n = g.hex.len / 2;
+    if (n > buf.len) return error.BufferTooSmall;
+    _ = try std.fmt.hexToBytes(buf[0..n], g.hex);
+    return buf[0..n];
+}
+
+test "every adapter golden decodes at the encapsulation layer and re-encodes exactly" {
+    var buf: [max_frame_len]u8 = undefined;
+    var round: [max_frame_len]u8 = undefined;
+    for (adapter_table) |g| {
+        const wire = try bytesOfAdapter(g, &buf);
+        const msg = encap.decode(wire) catch |e| {
+            std.debug.print("adapter golden '{s}' failed to decode: {t}\n", .{ g.name, e });
+            return e;
+        };
+        const again = try encap.encode(msg, &round);
+        testing.expectEqualSlices(u8, wire, again) catch |e| {
+            std.debug.print("adapter golden '{s}' did not re-encode\n", .{g.name});
+            return e;
+        };
+    }
+}
+
+// The strong test: this is not decode∘encode agreeing with itself (`table`'s
+// tests already cover that, and the mutation below would not move it) — it
+// replays every captured request through a fresh `Adapter.handle`, in
+// capture order, over tag storage seeded exactly as `root.zig`'s live-listen
+// test seeds it, and requires the reply `Adapter.handle` actually produces
+// to equal the captured reply byte-for-byte. `pycomm3` and `cpppo` are what
+// decided those bytes were acceptable at capture time; this is what proves
+// our adapter still produces them.
+test "a captured client session replays byte-exact through our own Adapter" {
+    var scada: [200]u8 = @splat(0);
+    var dint: [40]u8 = @splat(0);
+    var real: [20]u8 = @splat(0);
+    std.mem.writeInt(i16, scada[0..2], 1, .little);
+    std.mem.writeInt(i32, dint[0..4], 11, .little);
+    const tags = [_]adapter_mod.TagBinding{
+        .{ .name = "SCADA", .type = .int, .bytes = &scada },
+        .{ .name = "TestTag", .type = .dint, .bytes = &dint },
+        .{ .name = "RealTag", .type = .real, .bytes = &real },
+    };
+    var target = adapter_mod.Adapter.init(.{}, &tags);
+
+    var req_buf: [max_frame_len]u8 = undefined;
+    var rep_buf: [max_frame_len]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var replies_checked: usize = 0;
+    var i: usize = 0;
+    while (i < adapter_table.len) : (i += 1) {
+        const req_g = adapter_table[i];
+        if (req_g.dir != .to_adapter) continue;
+        const req = try bytesOfAdapter(req_g, &req_buf);
+        const got = target.handle(req, &out) catch |e| {
+            std.debug.print("adapter golden '{s}' failed to handle: {t}\n", .{ req_g.name, e });
+            return e;
+        };
+        // UnRegisterSession answers nothing, matching no captured reply.
+        if (i + 1 >= adapter_table.len or adapter_table[i + 1].dir != .from_adapter) {
+            try testing.expect(got == null);
+            continue;
+        }
+        const rep_g = adapter_table[i + 1];
+        const want = try bytesOfAdapter(rep_g, &rep_buf);
+        const g = got orelse {
+            std.debug.print("adapter golden '{s}' expected a reply, Adapter answered none\n", .{rep_g.name});
+            return error.TestUnexpectedResult;
+        };
+        testing.expectEqualSlices(u8, want, g) catch |e| {
+            std.debug.print("adapter golden '{s}': our Adapter's reply did not match the captured one\n", .{rep_g.name});
+            return e;
+        };
+        replies_checked += 1;
+        i += 1;
+    }
+    try testing.expect(replies_checked >= 14);
+    // Three Read Tag services (the array read, the post-write read-back, the
+    // final single-element read), one Write Tag, three identity requests
+    // (ListIdentity, Get_Attributes_All, Get_Attribute_Single) — every side
+    // effect the captured session should have driven and no more.
+    try testing.expectEqual(@as(usize, 3), target.reads);
+    try testing.expectEqual(@as(usize, 1), target.writes);
+    try testing.expectEqual(@as(usize, 3), target.identity_requests);
+    // The write landed: element 1 now reads back as 77, matching the last
+    // captured reply.
+    try testing.expectEqual(@as(i16, 77), std.mem.readInt(i16, scada[2..4], .little));
 }

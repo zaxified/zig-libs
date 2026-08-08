@@ -686,3 +686,164 @@ test "live: STARTDT + general interrogation against a real outstation" {
     try testing.expect(stopped);
     std.debug.print("live IEC 104: STOPDT confirmed\n", .{});
 }
+
+/// Taps a real `TcpTransport` and records every distinct APCI frame that
+/// crosses it, in a small ring so a long capture does not grow unbounded.
+/// Only used by the live wrap-capture test below — this is capture
+/// apparatus, not part of the module's shipped seam.
+const RawTap = struct {
+    inner: Transport,
+    ring: [64][apci.max_apdu_len]u8 = undefined,
+    ring_len: [64]usize = @splat(0),
+    ring_dir: [64]u8 = @splat(0), // 'R' read (from peer), 'W' write (to peer)
+    next_slot: usize = 0,
+    total_frames: usize = 0,
+    pending: [apci.max_apdu_len * 8]u8 = undefined,
+    pending_len: usize = 0,
+
+    fn transport(self: *RawTap) Transport {
+        return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+    }
+
+    fn record(self: *RawTap, dir: u8, bytes: []const u8) void {
+        const slot = self.next_slot % self.ring.len;
+        const n = @min(bytes.len, apci.max_apdu_len);
+        @memcpy(self.ring[slot][0..n], bytes[0..n]);
+        self.ring_len[slot] = n;
+        self.ring_dir[slot] = dir;
+        self.next_slot += 1;
+        self.total_frames += 1;
+    }
+
+    /// Splits `pending` on 0x68-length-prefixed APCI boundaries, recording
+    /// every complete frame found and compacting the remainder forward.
+    fn drain(self: *RawTap, dir: u8) void {
+        var off: usize = 0;
+        while (self.pending_len - off >= 2) {
+            if (self.pending[off] != 0x68) {
+                off += 1;
+                continue;
+            }
+            const total = 2 + @as(usize, self.pending[off + 1]);
+            if (self.pending_len - off < total) break;
+            self.record(dir, self.pending[off .. off + total]);
+            off += total;
+        }
+        if (off > 0) {
+            std.mem.copyForwards(u8, self.pending[0 .. self.pending_len - off], self.pending[off..self.pending_len]);
+            self.pending_len -= off;
+        }
+    }
+
+    fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
+        const self: *RawTap = @ptrCast(@alignCast(ctx));
+        const n = try self.inner.read(buf);
+        if (n > 0 and self.pending_len + n <= self.pending.len) {
+            @memcpy(self.pending[self.pending_len..][0..n], buf[0..n]);
+            self.pending_len += n;
+            self.drain('R');
+        }
+        return n;
+    }
+
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+        const self: *RawTap = @ptrCast(@alignCast(ctx));
+        try self.inner.write(bytes);
+        self.record('W', bytes);
+    }
+
+    /// Prints the ring in capture order as hex, oldest first — the frames
+    /// straddling the boundary an aborted or completed capture stopped near.
+    fn dump(self: *RawTap) void {
+        const count = @min(self.total_frames, self.ring.len);
+        const start = self.total_frames -| self.ring.len;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const slot = (start + i) % self.ring.len;
+            std.debug.print("WRAPCAP {c} {x}\n", .{ self.ring_dir[slot], self.ring[slot][0..self.ring_len[slot]] });
+        }
+    }
+};
+
+// Set IEC104_TEST_WRAP=host:port to drive a real outstation through the
+// 15-bit sequence-number wrap (wave-2 F6: the flow-control layer had no
+// external oracle at all, only a self round trip with a fake clock; SPEC.md
+// itself calls this "the part of the protocol that is actually hard"). Not
+// asserted as a permanent regression here — this test exists to GENERATE the
+// wire traffic once (an in-process `RawTap`, no external proxy needed) so a
+// slice straddling the wrap can be frozen as goldens; see goldens.zig's
+// `wrap_table` and the test that replays it offline. Skips like every other
+// live test when no peer is configured.
+test "live: drive send_seq/recv_seq through the 15-bit wrap against a real outstation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const endpoint = envVar("IEC104_TEST_WRAP") orelse {
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 104 wrap capture (set IEC104_TEST_WRAP=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
+    const host = endpoint[0..colon];
+    const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = std.Io.net.IpAddress.parse(host, port) catch return error.SkipZigTest;
+    var tt = TcpTransport.connect(io, addr) catch {
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 104 wrap capture (cannot connect to {s})\n", .{endpoint});
+        return error.SkipZigTest;
+    };
+    defer tt.close();
+    try tt.setReadTimeout(5000);
+
+    var tap = RawTap{ .inner = tt.transport() };
+    var frame_buf: [apci.max_apdu_len * 4]u8 = undefined;
+    var c = try Client.init(tap.transport(), &frame_buf, .{});
+    var now: u64 = 0;
+    c.beginConnect(now);
+    c.onConnected(now);
+    try c.startDataTransfer(now);
+
+    var monitoring: usize = 0;
+    var started = false;
+    var wrapped = false;
+    var rounds: usize = 0;
+    // Past 32768 monitoring ASDUs the outstation's own send_seq has wrapped
+    // at least once; keep going a little past that so the captured proxy log
+    // has frames on both sides of the boundary.
+    while (rounds < 400_000 and monitoring < 32_800 and !wrapped) : (rounds += 1) {
+        now += 10;
+        const event = c.poll(now) catch |e| {
+            std.debug.print(
+                "live IEC 104 wrap DIAGNOSTIC: round={d} monitoring={d} recv_seq={d} send_seq={d} outstanding={d}\n",
+                .{ rounds, monitoring, c.conn.recv_seq, c.conn.send_seq, c.conn.outstanding() },
+            );
+            tap.dump();
+            return e;
+        };
+        switch (event) {
+            .started => started = true,
+            .asdu => |a| {
+                if (a.header.type_id.isMonitoring()) {
+                    monitoring += 1;
+                    if (monitoring % 1000 == 0) {
+                        std.debug.print("live IEC 104 wrap: monitoring={d} recv_seq={d}\n", .{ monitoring, c.conn.recv_seq });
+                    }
+                }
+            },
+            .closed => break,
+            else => {},
+        }
+        // Stop a few frames *after* the wrap (not right at it) so the ring
+        // still holds a couple of post-wrap frames alongside the pre-wrap
+        // ones once it stops growing.
+        if (c.conn.recv_seq >= 5 and c.conn.recv_seq < 50 and monitoring > 32_760) wrapped = true;
+    }
+    std.debug.print(
+        "live IEC 104 wrap: started={} monitoring={d} recv_seq={d} wrapped={}\n",
+        .{ started, monitoring, c.conn.recv_seq, wrapped },
+    );
+    tap.dump();
+    try testing.expect(started);
+    try testing.expect(wrapped);
+}

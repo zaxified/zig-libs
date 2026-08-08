@@ -216,6 +216,126 @@ test "a UTF-8 codepoint split across fragment boundaries validates correctly" {
     }
 }
 
+// External anchor (F5, 2026-08-08): the real `Autobahn|Testsuite` run this
+// finding asks for is unobtainable on this host — `wstest` is a Python-2-era
+// package broken under Python 3 (`from _version import __version__`, an
+// implicit relative import Python 3 removed; confirmed by running it, see
+// SPEC.md "External-anchor investigation"). But the suite's §6 UTF-8 cases
+// are *data*, not runner logic: `autobahntestsuite/case/case6_x_x.py`
+// (installed locally, readable even though the package cannot be imported)
+// embeds Markus Kuhn's UTF-8 decoder stress test verbatim
+// (http://www.cl.cam.ac.uk/~mgk25/ucs/examples/UTF-8-test.txt) as
+// `(is_valid, byte_string)` pairs. That corpus predates this module, RFC
+// 6455 and this repository, and is not something "our reading of RFC 6455"
+// would reproduce — RFC 6455 §5.6 only says a text payload must be valid
+// UTF-8 per RFC 3629; it does not enumerate overlong encodings, lonely
+// continuation bytes or surrogate halves. This is therefore the genuine
+// external anchor F5 asked for, obtained without running the dead suite.
+//
+// A representative subset (every category Kuhn's file distinguishes:
+// boundary conditions, unexpected continuation bytes, lonely start bytes,
+// truncated sequences, overlong encodings of three different code points,
+// UTF-16 surrogate halves and pairs, and the non-character code points that
+// RFC 3629 permits) is transcribed below, each wrapped in a real single-frame
+// unmasked text message and fed through `Connection.receive` — the same
+// code path (`std.unicode.utf8ValidateSlice` at connection.zig:131/145) a
+// live Autobahn run would have exercised.
+const Utf8Vector = struct { bytes: []const u8, valid: bool, label: []const u8 };
+const kuhn_utf8_vectors = [_]Utf8Vector{
+    // 1 — some correct UTF-8 text.
+    .{ .bytes = "hello\x24world", .valid = true, .label = "1: U+0024" },
+    .{ .bytes = "hello\xC2\xA2world", .valid = true, .label = "1: U+00A2" },
+    .{ .bytes = "hello\xE2\x82\xACworld", .valid = true, .label = "1: U+20AC" },
+    .{ .bytes = "hello\xF0\xA4\xAD\xA2world", .valid = true, .label = "1: U+24B62" },
+    .{ .bytes = "\xCE\xBA\xE1\xBD\xB9\xCF\x83\xCE\xBC\xCE\xB5", .valid = true, .label = "1: kosme" },
+    // 2.1 — first possible sequence of a certain length.
+    .{ .bytes = "\x00", .valid = true, .label = "2.1: 1-byte min" },
+    .{ .bytes = "\xC2\x80", .valid = true, .label = "2.1: 2-byte min" },
+    .{ .bytes = "\xE0\xA0\x80", .valid = true, .label = "2.1: 3-byte min" },
+    .{ .bytes = "\xF0\x90\x80\x80", .valid = true, .label = "2.1: 4-byte min" },
+    .{ .bytes = "\xF8\x88\x80\x80\x80", .valid = false, .label = "2.1: 5-byte (never valid)" },
+    .{ .bytes = "\xFC\x84\x80\x80\x80\x80", .valid = false, .label = "2.1: 6-byte (never valid)" },
+    // 2.2 — last possible sequence of a certain length.
+    .{ .bytes = "\x7F", .valid = true, .label = "2.2: 1-byte max" },
+    .{ .bytes = "\xDF\xBF", .valid = true, .label = "2.2: 2-byte max" },
+    .{ .bytes = "\xEF\xBF\xBF", .valid = true, .label = "2.2: 3-byte max" },
+    .{ .bytes = "\xF4\x8F\xBF\xBF", .valid = true, .label = "2.2: 4-byte max (U+10FFFF)" },
+    .{ .bytes = "\xF7\xBF\xBF\xBF", .valid = false, .label = "2.2: 4-byte (never valid)" },
+    // 2.3 — other boundary conditions.
+    .{ .bytes = "\xED\x9F\xBF", .valid = true, .label = "2.3: U+D7FF (just below surrogates)" },
+    .{ .bytes = "\xEE\x80\x80", .valid = true, .label = "2.3: U+E000 (just above surrogates)" },
+    .{ .bytes = "\xF4\x90\x80\x80", .valid = false, .label = "2.3: U+110000 (just past max)" },
+    // 3.1 — unexpected continuation bytes.
+    .{ .bytes = "\x80", .valid = false, .label = "3.1: lone continuation 0x80" },
+    .{ .bytes = "\xBF", .valid = false, .label = "3.1: lone continuation 0xBF" },
+    .{ .bytes = "\x80\xBF\x80\xBF", .valid = false, .label = "3.1: four lone continuations" },
+    // 3.2 — lonely start characters.
+    .{ .bytes = "\xC0 \xDF ", .valid = false, .label = "3.2: lonely 2-byte starts" },
+    .{ .bytes = "\xE0 \xEF ", .valid = false, .label = "3.2: lonely 3-byte starts" },
+    .{ .bytes = "\xF0 \xF7 ", .valid = false, .label = "3.2: lonely 4-byte starts" },
+    // 3.3 — sequences with the last continuation byte missing.
+    .{ .bytes = "\xC0", .valid = false, .label = "3.3: truncated 2-byte" },
+    .{ .bytes = "\xE0\x80", .valid = false, .label = "3.3: truncated 3-byte" },
+    .{ .bytes = "\xF0\x80\x80", .valid = false, .label = "3.3: truncated 4-byte" },
+    .{ .bytes = "\xDF", .valid = false, .label = "3.3: truncated 2-byte (max lead)" },
+    .{ .bytes = "\xEF\xBF", .valid = false, .label = "3.3: truncated 3-byte (max lead)" },
+    // 3.5 — impossible bytes.
+    .{ .bytes = "\xFE", .valid = false, .label = "3.5: impossible byte 0xFE" },
+    .{ .bytes = "\xFF", .valid = false, .label = "3.5: impossible byte 0xFF" },
+    .{ .bytes = "\xFE\xFE\xFF\xFF", .valid = false, .label = "3.5: impossible bytes run" },
+    // 4.1/4.2/4.3 — overlong encodings of '/' (U+002F), U+0000 and the
+    // largest overlong 2-byte form.
+    .{ .bytes = "\xC0\xAF", .valid = false, .label = "4.1: overlong '/' (2-byte)" },
+    .{ .bytes = "\xE0\x80\xAF", .valid = false, .label = "4.1: overlong '/' (3-byte)" },
+    .{ .bytes = "\xF0\x80\x80\xAF", .valid = false, .label = "4.1: overlong '/' (4-byte)" },
+    .{ .bytes = "\xC1\xBF", .valid = false, .label = "4.2: maximum overlong 2-byte" },
+    .{ .bytes = "\xE0\x9F\xBF", .valid = false, .label = "4.2: maximum overlong 3-byte" },
+    .{ .bytes = "\xC0\x80", .valid = false, .label = "4.3: overlong NUL (2-byte)" },
+    .{ .bytes = "\xE0\x80\x80", .valid = false, .label = "4.3: overlong NUL (3-byte)" },
+    .{ .bytes = "\xF0\x80\x80\x80", .valid = false, .label = "4.3: overlong NUL (4-byte)" },
+    // 5.1 — single UTF-16 surrogates (never valid UTF-8).
+    .{ .bytes = "\xED\xA0\x80", .valid = false, .label = "5.1: high surrogate D800" },
+    .{ .bytes = "\xED\xAD\xBF", .valid = false, .label = "5.1: high surrogate DB7F" },
+    .{ .bytes = "\xED\xB0\x80", .valid = false, .label = "5.1: low surrogate DC00" },
+    .{ .bytes = "\xED\xBF\xBF", .valid = false, .label = "5.1: low surrogate DFFF" },
+    // 5.2 — paired UTF-16 surrogates (still never valid UTF-8).
+    .{ .bytes = "\xED\xA0\x80\xED\xB0\x80", .valid = false, .label = "5.2: paired surrogates" },
+    // 5.3 — non-character code points: illegal in some interpretations but
+    // *valid* UTF-8 per RFC 3629 — the positive control against a validator
+    // that over-rejects the FFFE/FFFF range.
+    .{ .bytes = "\xEF\xBF\xBE", .valid = true, .label = "5.3: U+FFFE (non-char, valid UTF-8)" },
+    .{ .bytes = "\xEF\xBF\xBF", .valid = true, .label = "5.3: U+FFFF (non-char, valid UTF-8)" },
+    .{ .bytes = "\xEF\xBF\xBD", .valid = true, .label = "5.3: U+FFFD (replacement char)" },
+};
+
+test "external anchor: Autobahn|Testsuite's frozen UTF-8 stress-test corpus (Markus Kuhn, frozen 2026-08-08)" {
+    var scratch: [32]u8 = undefined;
+    for (kuhn_utf8_vectors) |v| {
+        std.debug.assert(v.bytes.len < 126); // every vector fits the 7-bit length form
+        var wire_buf: [2 + 32]u8 = undefined;
+        wire_buf[0] = 0x81; // FIN=1, opcode=text
+        wire_buf[1] = @intCast(v.bytes.len); // unmasked, 7-bit length
+        @memcpy(wire_buf[2..][0..v.bytes.len], v.bytes);
+        var conn: Connection = .init(.client, &scratch, 1 << 20);
+        const result = conn.receive(wire_buf[0 .. 2 + v.bytes.len]);
+        if (v.valid) {
+            const r = result catch |e| {
+                std.debug.print("expected VALID ({s}) but got {t}\n", .{ v.label, e });
+                return e;
+            };
+            switch (r.event) {
+                .message => |m| try testing.expectEqualSlices(u8, v.bytes, m.payload),
+                else => return error.TestUnexpectedResult,
+            }
+        } else {
+            testing.expectError(error.InvalidUtf8, result) catch |e| {
+                std.debug.print("expected INVALID ({s}) but validation accepted it\n", .{v.label});
+                return e;
+            };
+        }
+    }
+}
+
 test "control frame (ping) interleaves mid-fragmentation without disturbing it" {
     var scratch: [64]u8 = undefined;
     var conn: Connection = .init(.client, &scratch, 1 << 20);

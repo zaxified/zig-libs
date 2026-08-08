@@ -324,6 +324,31 @@ Both live directions passed in Debug, and the whole suite passes in
 `--release=fast`; all three live tests print `SKIPPED: …` and pass when no peer
 is present.
 
+6. **32 byte-exact goldens captured against *our own* `Adapter`**
+   (`goldens.zig`'s `adapter_table`), closing the wave-2 audit's F4 finding:
+   `table` above anchors the client→target direction, but the only oracle
+   `adapter.zig` — this module's one wire-**listening** surface — had was our
+   own `Client` reading its own replies, a self round trip. `ENIP_TEST_LISTEN`
+   ran the same `Adapter.init(.{}, &tags)` configuration item 5 above drove
+   live, this time behind the same kind of recording proxy `table` was
+   captured through, and `pycomm3` 1.2.16 / `cpppo` 5.2.5 were pointed at it
+   as real independent clients: `pycomm3` did `ListIdentity`, an unconnected
+   `Get_Attributes_All`, and a **`Large_Forward_Open`** + connected
+   `Get_Attribute_Single` + `Forward_Close`; `cpppo` (`-S`, CLI) did an array
+   read, a write immediately followed by a read-back on the same connection,
+   and `ListServices`. Two assertions run over the table: the usual
+   decode/re-encode, and — the one that actually closes the gap — every
+   captured request is replayed through a **fresh `Adapter.handle`**, in
+   capture order, and the reply it produces is required to equal the captured
+   reply byte-for-byte. That second assertion is not decode∘encode agreeing
+   with itself: it is pycomm3's and cpppo's own request/reply parsers, at
+   capture time, being the ones who decided these bytes were acceptable.
+   Mutation-tested: dropping `Adapter.next_connection_id`'s seed by one
+   (`0x0100_0001` → `0x0100_0002`) — a value no self round-trip test checks
+   for anything but non-zero and distinctness — passes the whole rest of the
+   suite and fails exactly this new test (`exit 1, 1/156 fail`), which is the
+   class of bug this table exists to catch. Reverted by paired inverse edit.
+
 One divergence worth recording: **the cpppo target refuses a `Read Tag
 Fragmented` that is not wrapped in an `Unconnected_Send`**, answering an
 encapsulation-layer `0x0008`. This is a limitation of that target, not of this

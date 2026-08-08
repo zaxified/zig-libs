@@ -25,6 +25,7 @@ const std = @import("std");
 const apci = @import("apci.zig");
 const asdu = @import("asdu.zig");
 const info = @import("info.zig");
+const state = @import("state.zig");
 
 pub const Direction = enum {
     /// Master -> RTU.
@@ -578,4 +579,202 @@ test "goldens: the capture covers the type ids this module claims to support" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+// ── the flow-control layer: a real peer through the 15-bit sequence wrap ──
+//
+// Everything above anchors the ASDU/APCI *codec*. It does not touch F6: the
+// k/w window, t0..t3 and the 32768-frame sequence wrap were, before this,
+// validated only between two instances of *this* module with a fake clock —
+// SPEC.md itself calls the wrap "the part of the protocol that is actually
+// hard", and no third-party stack had ever been driven through it.
+//
+// Captured 2026-08-08 with a real `c104` 2.2.1 (Fraunhofer FIT's Python
+// binding over `lib60870-C`, the reference C stack) outstation, paced to
+// avoid overrunning its internal send queue:
+//
+//   python3 -c '
+//     import c104, time
+//     srv = c104.Server(ip="127.0.0.1", port=P, tick_rate_ms=50)
+//     srv.protocol_parameters.message_timeout = 60       # t1
+//     srv.protocol_parameters.send_window_size = 100     # k
+//     srv.protocol_parameters.receive_window_size = 50   # w
+//     st = srv.add_station(common_address=1)
+//     pt = st.add_point(io_address=100, type=c104.Type.M_ME_NC_1)
+//     srv.start()
+//     # ...wait for a client, then...
+//     for i in range(33000):
+//         pt.value = float(i % 1000)
+//         pt.transmit(cause=c104.Cot.SPONTANEOUS)
+//         if i % 40 == 39: time.sleep(0.01)   # let the link drain
+//   '
+//
+// against this module's own `Client` (`client.zig`'s
+// `"live: drive send_seq/recv_seq through the 15-bit wrap against a real
+// outstation"`, gated on `IEC104_TEST_WRAP`, an in-process `RawTap` recording
+// every APCI frame — no external proxy). The client's own `recv_seq` wrapped
+// 32767 → 0 exactly where the peer's own N(S) did:
+// `monitoring=32773 recv_seq=5 wrapped=true`.
+//
+// These are the last 64 frames of that run: real `M_ME_NC_1` spontaneous
+// reports (`rx`, type id 13 = `0x0d`) from the outstation's own N(S) counter,
+// the S-format acknowledgements this module's `Client` sent back (`tx`), the
+// 32767→0 wrap itself (frame 60, `feff...`→frame 61, `0000...`), and a few
+// frames past it. No third-party source was read as a design reference —
+// `c104` was driven as a black box only, generating real traffic; under
+// CONVENTIONS §5 that is a test oracle, not a design reference.
+pub const WrapDirection = enum {
+    /// Outstation -> master (this module's `Client`).
+    rx,
+    /// Master -> outstation.
+    tx,
+};
+
+pub const WrapFrame = struct {
+    dir: WrapDirection,
+    hex: []const u8,
+};
+
+/// `recv_seq` (the master's own "next N(S) I expect") immediately before the
+/// first frame in `wrap_table` — this module's own `recv_seq` at that point
+/// in the real capture, read from `RawTap`'s companion debug output.
+pub const wrap_start_recv_seq: apci.Seq = 32716;
+
+pub const wrap_table = [_]WrapFrame{
+    .{ .dir = .rx, .hex = "681298ff00000d01030001006400000000334400" },
+    .{ .dir = .rx, .hex = "68129aff00000d01030001006400000040334400" },
+    .{ .dir = .rx, .hex = "68129cff00000d01030001006400000080334400" },
+    .{ .dir = .rx, .hex = "68129eff00000d010300010064000000c0334400" },
+    .{ .dir = .tx, .hex = "68040100a0ff" },
+    .{ .dir = .rx, .hex = "6812a0ff00000d01030001006400000000344400" },
+    .{ .dir = .rx, .hex = "6812a2ff00000d01030001006400000040344400" },
+    .{ .dir = .rx, .hex = "6812a4ff00000d01030001006400000080344400" },
+    .{ .dir = .rx, .hex = "6812a6ff00000d010300010064000000c0344400" },
+    .{ .dir = .rx, .hex = "6812a8ff00000d01030001006400000000354400" },
+    .{ .dir = .rx, .hex = "6812aaff00000d01030001006400000040354400" },
+    .{ .dir = .rx, .hex = "6812acff00000d01030001006400000080354400" },
+    .{ .dir = .rx, .hex = "6812aeff00000d010300010064000000c0354400" },
+    .{ .dir = .tx, .hex = "68040100b0ff" },
+    .{ .dir = .rx, .hex = "6812b0ff00000d01030001006400000000364400" },
+    .{ .dir = .rx, .hex = "6812b2ff00000d01030001006400000040364400" },
+    .{ .dir = .rx, .hex = "6812b4ff00000d01030001006400000080364400" },
+    .{ .dir = .rx, .hex = "6812b6ff00000d010300010064000000c0364400" },
+    .{ .dir = .rx, .hex = "6812b8ff00000d01030001006400000000374400" },
+    .{ .dir = .rx, .hex = "6812baff00000d01030001006400000040374400" },
+    .{ .dir = .rx, .hex = "6812bcff00000d01030001006400000080374400" },
+    .{ .dir = .rx, .hex = "6812beff00000d010300010064000000c0374400" },
+    .{ .dir = .tx, .hex = "68040100c0ff" },
+    .{ .dir = .rx, .hex = "6812c0ff00000d01030001006400000000384400" },
+    .{ .dir = .rx, .hex = "6812c2ff00000d01030001006400000040384400" },
+    .{ .dir = .rx, .hex = "6812c4ff00000d01030001006400000080384400" },
+    .{ .dir = .rx, .hex = "6812c6ff00000d010300010064000000c0384400" },
+    .{ .dir = .rx, .hex = "6812c8ff00000d01030001006400000000394400" },
+    .{ .dir = .rx, .hex = "6812caff00000d01030001006400000040394400" },
+    .{ .dir = .rx, .hex = "6812ccff00000d01030001006400000080394400" },
+    .{ .dir = .rx, .hex = "6812ceff00000d010300010064000000c0394400" },
+    .{ .dir = .tx, .hex = "68040100d0ff" },
+    .{ .dir = .rx, .hex = "6812d0ff00000d010300010064000000003a4400" },
+    .{ .dir = .rx, .hex = "6812d2ff00000d010300010064000000403a4400" },
+    .{ .dir = .rx, .hex = "6812d4ff00000d010300010064000000803a4400" },
+    .{ .dir = .rx, .hex = "6812d6ff00000d010300010064000000c03a4400" },
+    .{ .dir = .rx, .hex = "6812d8ff00000d010300010064000000003b4400" },
+    .{ .dir = .rx, .hex = "6812daff00000d010300010064000000403b4400" },
+    .{ .dir = .rx, .hex = "6812dcff00000d010300010064000000803b4400" },
+    .{ .dir = .rx, .hex = "6812deff00000d010300010064000000c03b4400" },
+    .{ .dir = .tx, .hex = "68040100e0ff" },
+    .{ .dir = .rx, .hex = "6812e0ff00000d010300010064000000003c4400" },
+    .{ .dir = .rx, .hex = "6812e2ff00000d010300010064000000403c4400" },
+    .{ .dir = .rx, .hex = "6812e4ff00000d010300010064000000803c4400" },
+    .{ .dir = .rx, .hex = "6812e6ff00000d010300010064000000c03c4400" },
+    .{ .dir = .rx, .hex = "6812e8ff00000d010300010064000000003d4400" },
+    .{ .dir = .rx, .hex = "6812eaff00000d010300010064000000403d4400" },
+    .{ .dir = .rx, .hex = "6812ecff00000d010300010064000000803d4400" },
+    .{ .dir = .rx, .hex = "6812eeff00000d010300010064000000c03d4400" },
+    .{ .dir = .tx, .hex = "68040100f0ff" },
+    .{ .dir = .rx, .hex = "6812f0ff00000d010300010064000000003e4400" },
+    .{ .dir = .rx, .hex = "6812f2ff00000d010300010064000000403e4400" },
+    .{ .dir = .rx, .hex = "6812f4ff00000d010300010064000000803e4400" },
+    .{ .dir = .rx, .hex = "6812f6ff00000d010300010064000000c03e4400" },
+    .{ .dir = .rx, .hex = "6812f8ff00000d010300010064000000003f4400" },
+    .{ .dir = .rx, .hex = "6812faff00000d010300010064000000403f4400" },
+    .{ .dir = .rx, .hex = "6812fcff00000d010300010064000000803f4400" },
+    .{ .dir = .rx, .hex = "6812feff00000d010300010064000000c03f4400" },
+    .{ .dir = .tx, .hex = "680401000000" },
+    .{ .dir = .rx, .hex = "6812000000000d01030001006400000000404400" },
+    .{ .dir = .rx, .hex = "6812020000000d01030001006400000040404400" },
+    .{ .dir = .rx, .hex = "6812040000000d01030001006400000080404400" },
+    .{ .dir = .rx, .hex = "6812060000000d010300010064000000c0404400" },
+    .{ .dir = .rx, .hex = "6812080000000d01030001006400000000414400" },
+};
+
+test "goldens: every wrap_table frame decodes and the rx sequence numbers are exactly what the peer sent" {
+    var buf: [apci.max_apdu_len]u8 = undefined;
+    var expected_ns: apci.Seq = wrap_start_recv_seq;
+    var saw_wrap = false;
+    for (wrap_table) |g| {
+        const raw = bytesOf(g.hex, &buf);
+        const f = try apci.decode(raw);
+        switch (g.dir) {
+            .rx => {
+                const ns = f.control.i.send_seq;
+                try testing.expectEqual(expected_ns, ns);
+                if (expected_ns == 32767) saw_wrap = true;
+                expected_ns +%= 1;
+            },
+            .tx => try testing.expect(f.control == .s),
+        }
+    }
+    // The table must actually straddle the wrap, not just approach it.
+    try testing.expect(saw_wrap);
+    try testing.expectEqual(@as(apci.Seq, 5), expected_ns);
+}
+
+// The strong test: replays the captured session through a fresh
+// `state.Connection`, fast-forwarded to the real capture's own starting
+// point (the same technique `state.zig`'s pre-existing self-only wrap test
+// already uses — `recv_seq`/`send_seq`/`ack_seq`/`last_sent_ack` are public
+// fields for exactly this). Every `rx` frame is fed through `onFrame`; `tick`
+// runs after each one, exactly as `Client.poll` does, so the w=8 ack cadence
+// the capture shows is reproduced rather than assumed. This is not
+// decode∘encode agreeing with itself — `onFrame`'s `UnexpectedSequence`
+// check is what a consistent-but-wrong wrap implementation would trip, and
+// nothing here generated the sequence numbers being checked against: a real
+// `lib60870-C` outstation did, live.
+test "a real outstation's session replays byte-exact through this module's own Connection, across the wrap" {
+    var c = try state.Connection.init(.{}, .controlling);
+    c.beginConnect(0);
+    c.onTcpConnected(0);
+    _ = try c.startDataTransfer(0);
+    _ = try c.onFrame(.{ .control = .{ .u = .startdt_con }, .asdu = &.{}, .len = 6 }, 0);
+    try testing.expectEqual(state.State.started, c.state);
+
+    // Fast-forward to the real capture's own starting point. Only the
+    // receive side moves: in the real session the master (this side) never
+    // sent an I-frame of its own, so its send_seq/ack_seq genuinely stayed
+    // at 0 the whole time (confirmed in the live run's own diagnostics,
+    // "send_seq=0 outstanding=0") — every captured `rx` I-frame's own N(R)
+    // is 0 for that reason, not because it was faked here.
+    c.recv_seq = wrap_start_recv_seq;
+    c.last_sent_ack = wrap_start_recv_seq;
+
+    var buf: [apci.max_apdu_len]u8 = undefined;
+    var now: u64 = 1;
+    var rx_count: usize = 0;
+    for (wrap_table) |g| {
+        if (g.dir != .rx) continue;
+        const raw = bytesOf(g.hex, &buf);
+        const f = try apci.decode(raw);
+        const event = c.onFrame(f, now) catch |e| {
+            std.debug.print("wrap replay failed at recv_seq={d}: {t}\n", .{ c.recv_seq, e });
+            return e;
+        };
+        try testing.expect(event == .asdu);
+        rx_count += 1;
+        now += 1;
+        _ = c.tick(now); // let acks go out on the same cadence Client.poll uses
+    }
+    try testing.expectEqual(wrap_table.len - 7, rx_count); // 7 tx (S-format) entries in the table
+    // The wrap actually happened, driven entirely by real captured N(S)
+    // values, not by a hand-picked expected value.
+    try testing.expectEqual(@as(apci.Seq, 5), c.recv_seq);
 }

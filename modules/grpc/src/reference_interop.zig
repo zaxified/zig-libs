@@ -573,6 +573,89 @@ test "LIVE grpcio: several calls multiplexed on one HTTP/2 connection" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Frozen reference bytes (F5, 2026-08-08): the same problem `netconf` solved
+// for its own live oracle — these two live tests establish that grpcio is a
+// real, independent peer, but that proof evaporates on a host with no
+// `grpcio` (every one of the 13 live tests above degrades to
+// `error.SkipZigTest`, and a skip is a pass). So the concrete bytes grpcio
+// put on the wire in one session are captured *once* here and asserted
+// **offline**, with no `Fixture`, no subprocess and no `requireGrpcio` gate,
+// exactly the way `netconf/src/reply.zig`'s `live_netconf_2_1_0_*` constants
+// keep working without the `netconf` Python package installed.
+//
+// Captured by temporarily instrumenting this file to print the undecoded
+// wire values (`std.fmt` hex dumps of `call.initialMetadata()` fields and of
+// the raw bytes `Call.receive()` returned before protobuf-decoding them),
+// running `scripts/capped zig build test-grpc -Dtest-filter="..."` once
+// against the reference server, and transcribing the output below; the
+// instrumentation itself was removed afterwards. The live tests above are
+// what refreshes these constants if the module's wire contract ever
+// deliberately changes.
+
+/// `grpc-status`/`grpc-message`, byte-for-byte as the reference **C-core**
+/// server's Trailers-Only response carried them (`/echo.Echo/Fail`,
+/// `req.count = permission_denied`, `req.text` = the detail string below).
+/// This is genuinely external: the percent-encoding convention this proves —
+/// `\n` → `%0A`, each byte of the multi-byte UTF-8 snowman individually
+/// escaped, a literal `%` → `%25` — comes from grpcio's own encoder, which
+/// this module's `status.zig` never saw. A test that only checked
+/// `encodeMessage` and `decodeMessage` agree with each other (as
+/// `status.zig`'s existing round-trip tests do) cannot catch a decoder that
+/// silently agrees with the *wrong* convention; this one can.
+const live_grpcio_status_value = "7"; // permission_denied
+const live_grpcio_message_wire = "boom%0Aline two %E2%98%83 100%25 done";
+const live_grpcio_message_decoded = "boom\nline two \xe2\x98\x83 100% done";
+
+test "external anchor: grpcio's real Trailers-Only grpc-status/grpc-message wire bytes decode correctly (frozen 2026-08-08)" {
+    const status_mod = @import("status.zig");
+    try testing.expectEqual(grpc.Status.permission_denied, status_mod.parse(live_grpcio_status_value).?);
+
+    var buf: [live_grpcio_message_wire.len]u8 = undefined;
+    const decoded = status_mod.decodeMessage(live_grpcio_message_wire, &buf);
+    try testing.expectEqualStrings(live_grpcio_message_decoded, decoded);
+}
+
+/// The exact bytes the C-core reference server's protobuf library put on the
+/// wire for one `EchoReply` (`/echo.Echo/Unary`, `text = "hello reference"`,
+/// `count = 7`, `blob = {0x00, 0xff, 0x10}`) — the 5-byte gRPC length prefix
+/// already stripped by `Call.receive`'s deframer the same way it was when
+/// captured, so this is the payload exactly as `frame.Deframer.next` handed
+/// it to `pb.decode` in the live session. Field 1 (`0x0a`, length-delimited,
+/// 20 bytes) is `text`, field 2 (`0x10`, varint) is `count`/`index`, field 3
+/// (`0x1a`, length-delimited, 3 bytes) is `blob` — real protobuf-library
+/// wire output, not this repo's own `pb.encode`, so decoding it offline is
+/// an external anchor on `protobuf`'s wire-format compatibility the same way
+/// the message above is one on the percent-encoding.
+const live_grpcio_echo_reply_bytes = [_]u8{
+    0x0a, 0x14, 'e',  'c',  'h',  'o',  ':',  'h', 'e', 'l', 'l', 'o', ' ', 'r', 'e', 'f', 'e', 'r', 'e', 'n', 'c', 'e',
+    0x10, 0x07, 0x1a, 0x03, 0x00, 0xff, 0x10,
+};
+
+test "external anchor: grpcio's real EchoReply wire bytes decode through frame + pb (frozen 2026-08-08)" {
+    const gpa = testing.allocator;
+
+    // Re-frame with this module's own LPM header — its byte layout is
+    // already anchored independently in `frame.zig`'s spec-derived tests —
+    // purely so the exact `Deframer` code path `Call.receive` uses is the
+    // one under test here too, not a shortcut around it.
+    const framed = try frame.encodeAlloc(gpa, &live_grpcio_echo_reply_bytes);
+    defer gpa.free(framed);
+
+    var d: frame.Deframer = .{};
+    defer d.deinit(gpa);
+    try d.push(gpa, framed);
+    const payload = (try d.next()).?;
+    try testing.expectEqualSlices(u8, &live_grpcio_echo_reply_bytes, payload);
+    try testing.expectEqual(@as(?[]const u8, null), try d.next());
+
+    var decoded = try pb.decode(EchoReply, gpa, payload, .{});
+    defer decoded.deinit();
+    try testing.expectEqualStrings("echo:hello reference", decoded.value.text);
+    try testing.expectEqual(@as(i32, 7), decoded.value.index);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0xff, 0x10 }, decoded.value.blob);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The other direction: the reference grpcio CLIENT calling OUR server.
 // ═══════════════════════════════════════════════════════════════════════════
 

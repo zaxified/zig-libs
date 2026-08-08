@@ -138,6 +138,25 @@ or `nft`.
 Both live tests passed in Debug and in `--release=fast`, and both print `SKIPPED: …` and pass when
 no peer is present.
 
+5. **A real outstation driven through the 15-bit sequence-number wrap** (`client.zig`, gated on
+   `IEC104_TEST_WRAP`; closes wave-2 F6 — "no third-party stack was ever driven through a rollover").
+   A `c104` 2.2.1 outstation was configured with `message_timeout=60s`, `send_window_size=100`,
+   `receive_window_size=50` and driven to spontaneously report **33,000** `M_ME_NC_1` values (paced
+   — `time.sleep(0.01)` every 40 `point.transmit()` calls — an unpaced burst overruns the
+   reference stack's own internal send queue and it closes the connection, which is itself worth
+   recording: `lib60870-C` cannot be blasted at application speed with no pacing at all). This
+   module's `Client` drained them with an in-process `RawTap` (no external proxy — one was tried
+   first and its added latency was *also* enough to overrun the peer's queue) recording every raw
+   APCI frame. Observed: `monitoring=32773 recv_seq=5 wrapped=true` — this module's own `recv_seq`
+   wrapped from 32767 to 0 at exactly the frame where the peer's own N(S) did. The last 64 frames of
+   that run (real send_seq 32716→32767→0→…→4, the S-format acknowledgements this module sent back,
+   and the wrap itself) are frozen in `goldens.zig`'s `wrap_table` and replayed through a fresh
+   `state.Connection` fast-forwarded to the capture's own starting point — genuinely external
+   sequence numbers driving the state machine, not a hand-picked `c.recv_seq = 32766` self-test.
+   The t1-timeout half of F6 (driving a real peer to an actual acknowledgement timeout) was not
+   attempted after this — the wrap already required real engineering (see "What is self-derived"
+   below for what remains open).
+
 ### What is self-derived
 
 - Everything not in the capture: the CP24Time2a/CP16Time2a encodings, `M_ME_ND_1`, `M_PS_NA_1`,
@@ -145,13 +164,12 @@ no peer is present.
   interrogation causes, and the 1-/2-octet address profiles. These are encode/decode round-trip
   tests against element sizes and bit positions taken from the standard's documented layouts, not
   against third-party bytes.
-- The **k/w and t0..t3 behaviour** is validated against the standard's description with an injected
-  clock, not against a third-party stack's timing. The live runs exercise `STARTDT`/`STOPDT`,
-  `TESTFR` and the acknowledgement cadence in passing, but no test drives a real peer to a t1
-  timeout.
-- The 32768-frame wrap cycle is a self-consistency test between two instances of this module. No
-  third-party stack was driven through a real sequence-number rollover (that needs 32768 frames on
-  one connection, which the live harness does not do).
+- The **k/w and t0..t3 behaviour** past what item 5 above exercises is still validated against the
+  standard's description with an injected clock, not against a third-party stack's timing. The live
+  runs exercise `STARTDT`/`STOPDT`, `TESTFR` and the acknowledgement cadence in passing, but **no
+  test drives a real peer to an actual t1 (acknowledgement) timeout** — that half of F6 is still
+  open. The 32768-frame sequence-number rollover itself is no longer in this category: item 5 above
+  closes it against a real `lib60870-C` outstation.
 - `tshark` is **not** installed in this environment, so the `104apci`/`104asdu` dissector
   cross-check named in the task was not run. It was not needed: `c104.explain_bytes` (a lib60870
   decoder) served the same purpose, and the goldens came from a real capture rather than being

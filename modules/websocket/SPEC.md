@@ -114,7 +114,7 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
 
 ## Verification
 
-`zig build test-websocket` — 50 offline tests, green in Debug + ReleaseFast.
+`zig build test-websocket` — 62 offline tests, green in Debug + ReleaseFast.
 - **RFC 6455 vector-backed (byte-exact):** the §1.3 handshake worked example
   (`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, both as a standalone
   `computeAcceptKey` check and as a full `acceptHandshake` + `writeResponse` round trip over the
@@ -136,6 +136,67 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   still borrowed from the read buffer), single-frame and reassembled invalid-UTF-8
   rejection, the split-codepoint-across-fragments positive control, and control-frame interleaving
   mid-fragmentation.
+- **External anchor (Markus Kuhn's UTF-8 stress-test corpus, frozen 2026-08-08):** a ~45-vector
+  subset of `http://www.cl.cam.ac.uk/~mgk25/ucs/examples/UTF-8-test.txt`, transcribed from the
+  installed (but unrunnable — see below) `autobahntestsuite` package's own
+  `case/case6_x_x.py`, each wrapped in a real single-frame text message and driven through
+  `Connection.receive` (`connection.zig`, "external anchor: Autobahn|Testsuite's frozen UTF-8
+  stress-test corpus"). This is independent of both this module's own understanding and of RFC
+  6455's prose (RFC 6455 §5.6 only requires "valid UTF-8 per RFC 3629"; it enumerates none of the
+  overlong-encoding, lonely-continuation-byte or surrogate-half cases the corpus covers), so it is
+  a genuine third-party oracle, not a restatement of the spec in test form. See "External-anchor
+  investigation" below for how it was obtained and what remains unanchored.
+
+### External-anchor investigation: Autobahn|Testsuite (2026-08-08)
+
+F5 asked for a real `Autobahn|Testsuite` run, frozen the way `netconf` froze its live server's
+bytes. That turned out not to be obtainable as a *running* suite on this host, but part of it was
+obtainable as *data*, which changes the outcome from a flat gap to a partial anchor plus one
+precisely-scoped remaining gap.
+
+**`wstest` is broken here, confirmed directly, nothing patched or installed.**
+`wstest --help` (and any other invocation) fails immediately:
+```
+File ".../autobahntestsuite/__init__.py", line 19, in <module>
+    from _version import __version__
+ModuleNotFoundError: No module named '_version'
+```
+`from _version import __version__` is an implicit relative import — valid in Python 2, removed by
+[PEP 328](https://peps.python.org/pep-0328/) in Python 3. This host runs Python 3.14;
+`autobahntestsuite` (last released 2013) is Python-2-era and unmaintained upstream. Per this
+campaign's constraints, it was not patched and nothing was installed to work around it.
+
+**The case *definitions* are data, not runner logic, and some of them are obtainable without
+`wstest` running at all.** `autobahntestsuite/case/*.py` is plain, readable Python source — the
+package cannot be *imported* (every submodule transitively hits the same broken `__init__.py`
+and separately uses its own Python-2-era implicit relative imports, e.g. `from case import Case`),
+but it can be *read as text*, which is all a byte-exact freeze needs. Two kinds of content live
+there, with two different verdicts:
+
+- **§6 (UTF-8 validation): a real external anchor, frozen above.** `case6_x_x.py` embeds Markus
+  Kuhn's UTF-8 decoder stress test verbatim, with an explicit citation to its origin in the source
+  comment. That corpus is independently authored, predates this module and this repository, and is
+  not something reading RFC 6455 would reproduce (see the Verification bullet above for why). A
+  representative subset covering every category the corpus distinguishes — boundary lengths,
+  unexpected continuation bytes, lonely start bytes, truncated sequences, three different overlong
+  encodings, single and paired UTF-16 surrogates, and the non-character code points RFC 3629 still
+  permits — was transcribed into `connection.zig` and is asserted through the real `Connection`
+  message path.
+- **§7.9 (close-code validation): not a genuine external anchor, so none was manufactured.**
+  `case7_9_X.py` (the section covering F2's close-code gap) turns out to carry no data beyond what
+  RFC 6455 §7.4.1 already states: its test list is `[0, 999, 1004, 1005, 1006, 1016, 1100, 2000,
+  2999]` — samples from the RFC's own reserved/unassigned close-code ranges — and its expectation
+  is "clean close with protocol error code or drop TCP", i.e. RFC 6455 §7.4.1's MUST-fail-with-1002
+  rule restated in Python. Freezing these values and asserting this module rejects them would be
+  indistinguishable from writing a test against our own reading of RFC 6455 — exactly the
+  fabricated-anchor shape this repo has flagged before. **UNVERIFIED: close-code rejection
+  (`decodeCloseBody`'s F2 fix) has no external oracle in this repository** — the only way to get
+  one is an actual `Autobahn|Testsuite` `wstest` run (or another independent WebSocket
+  implementation's conformance report) verifying that a *real* peer's byte-level close response to
+  each invalid code matches this module's; on a Python-2-only interpreter, or once
+  `autobahntestsuite` is fixed upstream for Python 3, that run is what would unblock it. Until then
+  this gap is covered only by RFC-table-derived tests (`frame.zig`, `connection.zig`), which is a
+  correctness check but not an independent one.
 
 ## Backlog / deferred
 
