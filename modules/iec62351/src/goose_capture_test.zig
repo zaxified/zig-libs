@@ -286,7 +286,7 @@ test "real capture: a genuine APDU wrapped in this module's own HMAC extension r
     const r = try goose.verify(wrapped, .ed2020, verifier);
     try testing.expectEqualSlices(u8, parsed.apdu, r.frame.apdu);
     try testing.expect(r.frame.hasExtension());
-    try testing.expectEqual(@as(u32, 0x2026_08), r.auth.key_id);
+    try testing.expectEqual(@as(u32, 0x2026_08), r.unauthenticated.key_id);
 
     // Tamper a byte inside the *real* captured APDU content -- the gocbRef
     // text, specifically -- and the wrapper must still catch it.

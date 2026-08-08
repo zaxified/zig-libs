@@ -107,6 +107,10 @@ pub const ChannelUpdate = bolt7.ChannelUpdate;
 pub const decodeChannelUpdate = bolt7.decodeChannelUpdate;
 pub const serializeChannelUpdate = bolt7.serializeChannelUpdate;
 pub const channelUpdateDigest = bolt7.channelUpdateDigest;
+pub const EcdsaVerifyFn = bolt7.EcdsaVerifyFn;
+pub const verifyChannelAnnouncement = bolt7.verifyChannelAnnouncement;
+pub const verifyNodeAnnouncement = bolt7.verifyNodeAnnouncement;
+pub const verifyChannelUpdate = bolt7.verifyChannelUpdate;
 pub const QueryShortChannelIds = bolt7.QueryShortChannelIds;
 pub const decodeQueryShortChannelIds = bolt7.decodeQueryShortChannelIds;
 pub const serializeQueryShortChannelIds = bolt7.serializeQueryShortChannelIds;
@@ -131,5 +135,6 @@ test {
     _ = bolt1;
     _ = bolt2;
     _ = bolt7;
+    _ = @import("bolt1_kat_test.zig");
     _ = @import("bolt2_kat_test.zig");
 }

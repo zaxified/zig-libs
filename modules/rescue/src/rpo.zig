@@ -348,6 +348,40 @@ test "Rpo256: domain zero is a no-op, domain non-zero is not" {
     ));
 }
 
+test "Rpo256: hashElementsInDomain writes the domain to capacity slot capacity_start+1" {
+    // Grade 2, same technique as "hash_padding_no_extra_permutation_call"
+    // above: build the expected digest from the *permutation* (externally
+    // anchored) plus the packing rule the doc comment states — domain goes in
+    // the *second* capacity element, capacity_start + 1, not +2 or anywhere
+    // else. No upstream KAT exists for this function (see SPEC.md's
+    // "Anchoring summary"), so this hand-built state is what stands between a
+    // silently-wrong slot and green tests: a slot mutated to capacity_start+2
+    // would still be self-consistent with `hashElementsInDomain`'s own
+    // internals but would disagree with this independently-written literal.
+    var input: [3]gl.Fe = .{ 10, 20, 30 };
+    const domain: gl.Fe = 7;
+    var state: Rpo256.State = @splat(0);
+    state[Rpo256.capacity_start] = @intCast(input.len % Rpo256.rate_width);
+    state[Rpo256.capacity_start + 1] = domain;
+    for (input, 0..) |e, i| state[i] = e;
+    Rpo256.Perm.permute(&state);
+    try std.testing.expectEqualSlices(gl.Fe, state[0..4], &Rpo256.hashElementsInDomain(&input, domain));
+}
+
+test "Rpo256: mergeInDomain writes the domain to capacity slot capacity_start+1" {
+    // Same technique as the hashElementsInDomain check above, for the sibling
+    // function that shares the same unanchored capacity slot.
+    const a: Rpo256.Digest = .{ 1, 2, 3, 4 };
+    const b: Rpo256.Digest = .{ 5, 6, 7, 8 };
+    const domain: gl.Fe = 9;
+    var state: Rpo256.State = @splat(0);
+    @memcpy(state[0..4], &a);
+    @memcpy(state[4..8], &b);
+    state[Rpo256.capacity_start + 1] = domain;
+    Rpo256.Perm.permute(&state);
+    try std.testing.expectEqualSlices(gl.Fe, state[0..4], &Rpo256.mergeInDomain(a, b, domain));
+}
+
 test "Rpo256: 255 different lengths of zero bytes give 255 different digests" {
     // miden-crypto's `sponge_zeroes_collision`; catches a padding rule that
     // forgets the length flag.

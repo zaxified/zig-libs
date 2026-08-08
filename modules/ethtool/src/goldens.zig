@@ -228,6 +228,39 @@ const req_rings_set = hex("30000000170005000200000000000000" ++
     "10010000140001800e000200656e7030" ++
     "73333166360000000800060000020000");
 
+/// Four SET encoders wave-2 F6 found with no golden at all -- self round-trip
+/// only. Captured `unshare -rn` + a `veth0` pair, unprivileged (no
+/// CAP_NET_ADMIN needed to put the bytes on the wire -- same "kernel refuses
+/// only after `sendto`" property `req_rings_set` above relies on; here the
+/// kernel refuses because a `veth` genuinely does not support these settings,
+/// not because of a permission check, but the bytes are just as real either
+/// way). `strace -f -e trace=%network -e write=all -xx -s 16384 -e
+/// abbrev=none ethtool <args>`, same recipe as every other request golden.
+/// `ethtool -L veth0 combined 1`  (refused: "requested channel count exceeds
+/// maximum" -- a veth has no multi-queue support; the bytes are still real)
+const req_channels_set = hex("2c000000170005000200000000000000" ++
+    "12010000100001800a00020076657468" ++
+    "300000000800090001000000");
+
+/// `ethtool -C veth0 adaptive-rx on`  (refused: EOPNOTSUPP -- a veth has no
+/// interrupt coalescing to configure; the bytes are still real)
+const req_coalesce_set = hex("2c000000170005000200000000000000" ++
+    "14010000100001800a00020076657468" ++
+    "3000000005000b0001000000");
+
+/// `ethtool -s veth0 port tp`  (refused: EOPNOTSUPP -- a veth has no physical
+/// port to set; the bytes are still real)
+const req_linkinfo_set = hex("2c000000170005000200000000000000" ++
+    "03010000100001800a00020076657468" ++
+    "300000000500020000000000");
+
+/// `ethtool --set-module veth0 power-mode-policy high`  (refused: "Setting
+/// power mode policy is not supported by this device" -- a veth has no
+/// transceiver module; the bytes are still real)
+const req_module_set = hex("2c000000170005000200000000000000" ++
+    "23010000100001800a00020076657468" ++
+    "300000000500020001000000");
+
 /// `ethtool -A enp0s31f6 autoneg off`  (refused with EPERM)
 const req_pause_set = hex("30000000170005000200000000000000" ++
     "16010000140001800e000200656e7030" ++
@@ -833,6 +866,39 @@ const reply_features_set_honoured = hex("74000000170000000300000000000000" ++
     "00000000000000000c00050000001d00" ++
     "08000000");
 
+/// FEATURES_SET_REPLY, **verbose** — the reply shape this module's own
+/// `setFeaturesByName` actually gets (it never sets `compact_bitsets`; see
+/// `client.zig`'s `setFeaturesImpl`), unlike the two compact goldens above
+/// and below, which are what the real `ethtool` CLI asks for and is all
+/// that had ever been captured. Captured live inside `unshare -rn` against
+/// a fresh veth pair (wave-2 F1): `ethtool -K veth0 tso off`, then a
+/// hand-built `FEATURES_SET` sent over a raw `AF_NETLINK` socket carrying
+/// the SAME verbose WANTED bitset `ethtool -K veth0 tso on` sends (the
+/// bytes are `req_features_set_tso_on`'s own `WANTED` attribute, copied
+/// verbatim) but with the header's `compact_bitsets` FLAGS sub-attribute
+/// omitted — the one byte-level difference between what `ethtool` sends
+/// and what this module's own by-name API sends. `nlmsg_seq`/`nlmsg_pid`
+/// zeroed per this file's own convention (both are runtime, not encoding).
+const reply_features_set_honoured_verbose = hex("30010000170000000000000000000000" ++
+    "0c010000180001800800010003000000" ++
+    "0a000200766574683000000010000380" ++
+    "080002004000000004000380f4000480" ++
+    "0800020040000000e800038028000180" ++
+    "08000100100000001800020074782d74" ++
+    "63702d7365676d656e746174696f6e00" ++
+    "040003002c0001800800010012000000" ++
+    "1c00020074782d7463702d65636e2d73" ++
+    "65676d656e746174696f6e0004000300" ++
+    "34000180080001001300000021000200" ++
+    "74782d7463702d6d616e676c6569642d" ++
+    "7365676d656e746174696f6e00000000" ++
+    "040003002c0001800800010014000000" ++
+    "1900020074782d746370362d7365676d" ++
+    "656e746174696f6e0000000004000300" ++
+    "3000018008000100230000001f000200" ++
+    "74782d7463702d61636365636e2d7365" ++
+    "676d656e746174696f6e000004000300");
+
 /// FEATURES_SET_REPLY, four of five bits refused
 const reply_features_set_partial = hex("74000000170000000300000000000000" ++
     "0c010000180001800800010003000000" ++
@@ -1083,6 +1149,54 @@ test "golden request: FEATURES_SET (ethtool -K enp0s31f6 tso off)" {
     });
     codec.finishHeader(&msg, h);
     try testing.expectEqualSlices(u8, &req_features_set, msg.items);
+}
+
+test "golden request: CHANNELS_SET (ethtool -L veth0 combined 1)" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const h = try beginRequest(gpa, &msg, uapi.MSG.CHANNELS_SET, 2);
+    try header.append(gpa, &msg, uapi.CHANNELS.HEADER, .{ .target = .byName("veth0") });
+    try params.appendChannelsSet(gpa, &msg, .{ .combined_count = 1 });
+    codec.finishHeader(&msg, h);
+    try testing.expectEqualSlices(u8, &req_channels_set, msg.items);
+}
+
+test "golden request: COALESCE_SET (ethtool -C veth0 adaptive-rx on)" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const h = try beginRequest(gpa, &msg, uapi.MSG.COALESCE_SET, 2);
+    try header.append(gpa, &msg, uapi.COALESCE.HEADER, .{ .target = .byName("veth0") });
+    try params.appendCoalesceSet(gpa, &msg, .{ .use_adaptive_rx = true });
+    codec.finishHeader(&msg, h);
+    try testing.expectEqualSlices(u8, &req_coalesce_set, msg.items);
+}
+
+test "golden request: LINKINFO_SET (ethtool -s veth0 port tp)" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const h = try beginRequest(gpa, &msg, uapi.MSG.LINKINFO_SET, 2);
+    try header.append(gpa, &msg, uapi.LINKINFO.HEADER, .{ .target = .byName("veth0") });
+    try link.appendLinkInfoSet(gpa, &msg, .{ .port = .tp });
+    codec.finishHeader(&msg, h);
+    try testing.expectEqualSlices(u8, &req_linkinfo_set, msg.items);
+}
+
+test "golden request: MODULE_SET (ethtool --set-module veth0 power-mode-policy high)" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const h = try beginRequest(gpa, &msg, uapi.MSG.MODULE_SET, 2);
+    try header.append(gpa, &msg, uapi.MODULE.HEADER, .{ .target = .byName("veth0") });
+    try moduleinfo.appendSet(gpa, &msg, .high);
+    codec.finishHeader(&msg, h);
+    try testing.expectEqualSlices(u8, &req_module_set, msg.items);
 }
 
 test "golden request: MODULE_EEPROM_GET (ethtool -m enp0s31f6)" {
@@ -1527,6 +1641,46 @@ test "golden reply: a FEATURES_SET that was fully honoured" {
     // A bit nobody touched has no new state at all.
     try testing.expect(res.newStateAt(0) == null);
     try testing.expect(res.honouredAt(0));
+}
+
+test "golden reply: a verbose FEATURES_SET_REPLY -- the shape setFeaturesByName actually gets" {
+    // Anchors the code path this module's own by-name API drives (see
+    // `reply_features_set_honoured_verbose`'s doc comment): unlike the
+    // compact-reply goldens elsewhere in this file, `honouredByName` is
+    // actually answerable here, because a verbose reply carries names.
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const r = try replyAttrs(&reply_features_set_honoured_verbose);
+    try testing.expectEqual(uapi.REPLY.FEATURES_SET, r.cmd);
+
+    var res = try features.parseSetResult(gpa, r.attrs);
+    defer res.deinit(gpa);
+    try testing.expectEqualStrings("veth0", res.device.name());
+    try testing.expect(res.fullyHonoured());
+    try testing.expectEqual(@as(u32, 0), res.unhonouredCount());
+    try testing.expectEqual(@as(u32, 5), res.changedCount());
+
+    // Bit-index view (works for either encoding): same five TSO bits as the
+    // compact "fully honoured" golden above, all flipped to on.
+    for ([_]u32{ 16, 18, 19, 20, 35 }) |bit| {
+        try testing.expect(res.honouredAt(bit));
+        try testing.expectEqual(@as(?bool, true), res.newStateAt(bit));
+    }
+
+    // Name view -- the whole point of this golden: only meaningful when the
+    // reply is verbose. Every requested name was honoured (no bit refused).
+    for ([_][]const u8{
+        "tx-tcp-segmentation",
+        "tx-tcp-ecn-segmentation",
+        "tx-tcp-mangleid-segmentation",
+        "tx-tcp6-segmentation",
+        "tx-tcp-accecn-segmentation",
+    }) |name| {
+        try testing.expect(res.honouredByName(name));
+    }
+    // A name that was never touched is (vacuously) "honoured" too --
+    // `honouredByName` only reports refusal, and this one was never asked.
+    try testing.expect(res.honouredByName("rx-checksumming"));
 }
 
 test "golden reply: a FEATURES_SET the kernel refused four fifths of" {

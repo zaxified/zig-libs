@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Official BIP-32 (test vectors 1/2/3/5) and BIP-39 (Trezor set) known-
+//! Official BIP-32 (test vectors 1/2/3/4/5) and BIP-39 (Trezor set) known-
 //! answer assertions. See `bip32_vectors.zig` / `bip39_vectors.zig` for the
 //! embedded vector data and provenance.
 
@@ -61,6 +61,10 @@ test "BIP-32 official Test Vector 2 — large indices incl. 2^31-1 hardened, xpr
 
 test "BIP-32 official Test Vector 3 — leading-zero-byte retention, xprv+xpub byte-exact" {
     try runBip32Vector(bip32_vectors.test_vector_3);
+}
+
+test "BIP-32 official Test Vector 4 — leading-zero retention at a different depth, xprv+xpub byte-exact" {
+    try runBip32Vector(bip32_vectors.test_vector_4);
 }
 
 test "BIP-32 official Test Vector 5 — every invalid extended key is rejected" {

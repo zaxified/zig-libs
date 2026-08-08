@@ -54,11 +54,14 @@ beyond its own MIT license.
 
 Where a module ports third-party code, or reproduces third-party data whose
 notice must be preserved, that module carries its own `NOTICE` file next to its
-source, and the notice travels with the module. TWENTY modules do, and
+source, and the notice travels with the module. TWENTY-ONE modules do, and
 these are the ONLY files in the repository that carry a condition naming
 anyone other than the zig-libs authors. Each such file's first line says
 `<name> — third-party attribution`:
 
+  bech32   — `modules/bech32/NOTICE` (Bitcoin Core
+             `base58_encode_decode.json` plain-base58 conformance corpus,
+             MIT; test data only, no source code)
   falcon   — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
              a second copyright holder, no condition beyond MIT's own)
   decimal  — `modules/decimal/NOTICE` (IBM decTest test-case text, reproduced
@@ -124,8 +127,8 @@ anyone other than the zig-libs authors. Each such file's first line says
              `bolt07/extended-queries.json` official test vectors, CC-BY
              4.0, plus lightningdevkit/rust-lightning `msgs.rs` encode/
              decode-test hex for channel_announcement/node_announcement/
-             channel_update, dual MIT/Apache-2.0; test vectors only, no
-             source code)
+             channel_update and for init/error/warning/ping/pong, dual
+             MIT/Apache-2.0; test vectors only, no source code)
   psbt     — `modules/psbt/NOTICE` (BIP174 "Test Vectors" section worked
              examples, bitcoin/bips, BSD-2-Clause, plus Bitcoin Core
              `test/functional/data/rpc_psbt.json` conformance vectors, MIT;

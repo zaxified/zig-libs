@@ -14,7 +14,8 @@ asserted against, and what could go wrong.
 | environment | what it produced |
 |---|---|
 | ordinary unprivileged user, real NICs (`enp0s31f6`, an Intel `e1000e`; `wlp2s0`, `iwlwifi`) | every request golden, and the GET-reply and error goldens |
-| unprivileged user+net namespace (`unshare -rn`) with a `veth` pair | the two `FEATURES_SET_REPLY` goldens and the `FEATURES_NTF` notification golden — all three need CAP_NET_ADMIN to provoke |
+| unprivileged user+net namespace (`unshare -rn`) with a `veth` pair | the two compact `FEATURES_SET_REPLY` goldens and the `FEATURES_NTF` notification golden — all three need CAP_NET_ADMIN to provoke |
+| `unshare -rn` + a raw `AF_NETLINK` socket (Python `socket.AF_NETLINK`, no library beyond stdlib) instead of the real `ethtool` binary | `reply_features_set_honoured_verbose` (wave-2 F1) — the real `ethtool` CLI always requests a *compact* reply, so the *verbose* reply shape this module's own `setFeaturesByName` actually receives had no capture route through `ethtool` itself; sending the request by hand (same verbose `WANTED` bitset, `compact_bitsets` omitted) was the only way to provoke it |
 
 The namespace harness is the one `CONVENTIONS.md` §7 prescribes for netlink
 modules. It is worth stressing that SET *requests* did **not** need it: the
@@ -33,7 +34,7 @@ strace -f -e trace=%network -e write=all -e read=all -xx -s 16384 \
 kernel's replies and none of the requests. That cost an hour and is recorded
 at the top of `src/goldens.zig` so it costs nobody else one.
 
-Seventeen request goldens are committed, one per command line:
+Twenty-one request goldens are committed, one per command line:
 
 | command | pins |
 |---|---|
@@ -45,6 +46,7 @@ Seventeen request goldens are committed, one per command line:
 | `ethtool -G … rx 512`, `-A … autoneg off`, `-K … tso off`, `-s … speed 100 duplex full autoneg on` | the four SET request shapes |
 | `ethtool -m enp0s31f6` | `MODULE_EEPROM_GET` |
 | `unshare -rn` + `ethtool -K veth0 tso on` | the 5-name masked verbose `FEATURES_SET` bitset |
+| `unshare -rn` + `ethtool -L veth0 combined 1` / `-C veth0 adaptive-rx on` / `-s veth0 port tp` / `--set-module veth0 power-mode-policy high` | `CHANNELS_SET`, `COALESCE_SET`, `LINKINFO_SET`, `MODULE_SET` (wave-2 F6 — these four had **no** golden at all, self round-trip only, until this pass) |
 
 Only `nlmsg_seq` is treated as a runtime value (each test builds with the
 sequence the capture used). `nlmsg_pid` needs no special handling — `ethtool`,
@@ -99,7 +101,22 @@ their weight:
   after them.
 - **Two `FEATURES_SET_REPLY`s**, one fully honoured and one where the kernel
   refused four of five requested bits. These are what established the actual
-  diff semantics (§2.3).
+  diff semantics (§2.3). Both are **compact** — the format the real `ethtool`
+  CLI asks for (it always sets `compact_bitsets`, per `bitset.zig`'s file
+  header). This module's own `setFeaturesByName`/`setFeaturesByIndex` never
+  set that flag (`client.zig`'s `setFeaturesImpl`), so the reply shape the
+  shipped code path actually receives was, until wave-2 F1, unanchored —
+  the two committed goldens exercised a request shape our own API doesn't
+  send. Closed by a **third** `FEATURES_SET_REPLY` golden,
+  `reply_features_set_honoured_verbose`, captured live (`unshare -rn`, a raw
+  `AF_NETLINK` socket carrying the exact same verbose `WANTED` bitset
+  `ethtool -K veth0 tso on` sends, header's `compact_bitsets` omitted) — the
+  first byte-exact evidence for what the kernel actually replies with on the
+  path this module's own by-name API drives. (Considered and rejected: just
+  making `setFeaturesImpl` set `compact_bitsets` to match the two existing
+  goldens instead — that would silently break `SetResult.honouredByName`,
+  which only has names to report when the reply is verbose, for every
+  caller of `setFeaturesByName`.)
 - **A real `FEATURES_NTF`** off the `monitor` group, decoded with the ordinary
   `features.parse` to demonstrate that a notification's payload is a GET
   reply's payload.

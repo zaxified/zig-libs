@@ -830,21 +830,54 @@ pub const VerifyError = ParseError || AuthenticationValue.ParseAvError ||
         AuthenticationFailed,
     };
 
-/// Parse and authenticate a frame. Returns the decoded authentication value
-/// (key id, key times, IV) on success so the caller can feed the key-policy
-/// and replay layers; returns `error.AuthenticationFailed` when the tag does
-/// not match the frame's own `macDomain`.
+/// The `Extension` fields `verify` returns that `Frame.macDomain` does **not**
+/// cover — the version octet, the key's current/next-change times and the
+/// key identifier. `verify` succeeding proves the tag/signature matches the
+/// APDU; it proves nothing about these four fields, because they sit outside
+/// the signed/MAC'd range (see `Frame.macDomain`'s doc comment). An attacker
+/// who replays a captured, still-valid frame after rewriting any of them gets
+/// a frame that still verifies — the tag was never computed over this data.
+///
+/// **Do not drive a security decision from this struct without an
+/// out-of-band trust basis.** In particular, `time_to_next_key` is not a safe
+/// input to a subscriber's key-rollover timer: a replayed or attacker-crafted
+/// value verifies exactly as well as a genuine one. Treat every field here
+/// the way you would treat any other attacker-supplied input — logging,
+/// diagnostics and non-security bookkeeping are fine; access control is not.
+pub const UnauthenticatedMetadata = struct {
+    version: u8,
+    time_of_current_key: u32,
+    time_to_next_key: u16,
+    key_id: u32,
+};
+
+/// Parse and authenticate a frame. `tag`/`iv` participate in the check itself
+/// (a tampered `tag` fails verification, so its value is meaningful on
+/// success); `unauthenticated` is the rest of the `Extension` — see
+/// `UnauthenticatedMetadata`'s doc comment for what that means and does not
+/// mean. Returns `error.AuthenticationFailed` when the tag does not match the
+/// frame's own `macDomain`.
 pub fn verify(
     bytes: []const u8,
     profile: HeaderProfile,
     verifier: Verifier,
-) VerifyError!struct { frame: Frame, auth: AuthenticationValue } {
+) VerifyError!struct { frame: Frame, tag: []const u8, iv: ?[12]u8, unauthenticated: UnauthenticatedMetadata } {
     const frame = try parse(bytes, profile);
     if (!frame.hasExtension()) return error.NoExtension;
     const auth = try AuthenticationValue.parse(frame.extension, verifier.needsIv(), verifier.maxTagLen());
     if (verifier.needsIv() != (auth.iv != null)) return error.MalformedExtension;
     if (!checkTag(verifier, frame.macDomain(), auth.iv, auth.tag)) return error.AuthenticationFailed;
-    return .{ .frame = frame, .auth = auth };
+    return .{
+        .frame = frame,
+        .tag = auth.tag,
+        .iv = auth.iv,
+        .unauthenticated = .{
+            .version = auth.version,
+            .time_of_current_key = auth.time_of_current_key,
+            .time_to_next_key = auth.time_to_next_key,
+            .key_id = auth.key_id,
+        },
+    };
 }
 
 fn checkTag(verifier: Verifier, domain: []const u8, iv: ?[12]u8, tag: []const u8) bool {
@@ -912,8 +945,8 @@ test "build/verify round-trip for every modelled MAC algorithm" {
         const r = try verify(frame, .ed2020, .{ .mac = .{ .algorithm = alg, .key = key } });
         try testing.expectEqual(@as(u16, 0x3001), r.frame.appid);
         try testing.expectEqualSlices(u8, &sample_apdu, r.frame.apdu);
-        try testing.expectEqual(@as(u32, 7), r.auth.key_id);
-        try testing.expectEqual(alg.tagLen(), r.auth.tag.len);
+        try testing.expectEqual(@as(u32, 7), r.unauthenticated.key_id);
+        try testing.expectEqual(alg.tagLen(), r.tag.len);
     }
 }
 
@@ -1148,7 +1181,7 @@ test "ts2007: a 2048-bit signature extension does not fit the single length octe
         .auth = .{ .key_id = 1, .tag = &.{} },
     }, .{ .rsa_pss_sha256 = .{ .key = sk1024, .random = prng.random() } });
     const r = try verify(frame_bytes, .ts2007, .{ .rsa_pss_sha256 = try keys.rsa1024PublicKey() });
-    try testing.expectEqual(@as(usize, 128), r.auth.tag.len);
+    try testing.expectEqual(@as(usize, 128), r.tag.len);
 }
 
 test "IV presence must match the algorithm in both directions" {
@@ -1194,7 +1227,7 @@ test "GMAC IV: no (key, IV) pair is ever emitted twice, across publishers of one
             const r = try verify(frame, .ed2020, .{
                 .mac = .{ .algorithm = .aes_gmac_128, .key = &group_key },
             });
-            const iv = r.auth.iv.?;
+            const iv = r.iv.?;
             try testing.expect(!seen.contains(iv)); // the whole guarantee
             try seen.put(iv, {});
         }
@@ -1222,7 +1255,7 @@ test "positive control: a fixed IV repeats, which is what the counter prevents" 
         const r = try verify(frame, .ed2020, .{
             .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 },
         });
-        slot.* = r.auth.iv.?;
+        slot.* = r.iv.?;
     }
     try testing.expect(std.mem.eql(u8, &ivs[0], &ivs[1]));
 }
@@ -1327,8 +1360,8 @@ test "RSASSA-PSS/SHA-256 signature profile round-trips and rejects tampering" {
     }, .{ .rsa_pss_sha256 = .{ .key = sk, .random = prng.random() } });
 
     const r = try verify(frame_bytes, .ed2020, .{ .rsa_pss_sha256 = pk });
-    try testing.expectEqual(@as(usize, 256), r.auth.tag.len);
-    try testing.expectEqual(@as(u32, 42), r.auth.key_id);
+    try testing.expectEqual(@as(usize, 256), r.tag.len);
+    try testing.expectEqual(@as(u32, 42), r.unauthenticated.key_id);
 
     out[apdu_offset + 3] ^= 0x08;
     try testing.expectError(error.AuthenticationFailed, verify(frame_bytes, .ed2020, .{ .rsa_pss_sha256 = pk }));
@@ -1346,7 +1379,7 @@ test "ECDSA P-256/SHA-256 signature profile round-trips and rejects tampering" {
     }, .{ .ecdsa_p256_sha256 = .{ .key_pair = kp, .noise = [_]u8{0x5c} ** EcdsaP256.noise_length } });
 
     const r = try verify(frame_bytes, .ed2020, .{ .ecdsa_p256_sha256 = kp.public_key });
-    try testing.expectEqual(@as(usize, 64), r.auth.tag.len);
+    try testing.expectEqual(@as(usize, 64), r.tag.len);
 
     out[4] ^= 0x00; // no-op, keep Length intact
     out[apdu_offset] ^= 0x40;
@@ -1384,7 +1417,7 @@ test "raw seam: an unmodelled algorithm round-trips and still rejects tampering"
     var out: [512]u8 = undefined;
     const frame_bytes = try build(&out, .{ .appid = 7, .apdu = &sample_apdu, .auth = .{ .tag = &.{} } }, sealer);
     const r = try verify(frame_bytes, .ed2020, verifier);
-    try testing.expectEqual(@as(usize, 20), r.auth.tag.len);
+    try testing.expectEqual(@as(usize, 20), r.tag.len);
 
     out[apdu_offset + 1] ^= 0x02;
     try testing.expectError(error.AuthenticationFailed, verify(frame_bytes, .ed2020, verifier));

@@ -76,8 +76,14 @@ defer allocator.free(wire_bytes); // hand this to bolt8.Transport for encryption
 
 // -- BOLT#7 gossip: verify a channel_announcement's signatures (caller's secp256k1) --
 const ann = try lnwire.decodeChannelAnnouncement(gossip_bytes);
-const digest = try lnwire.channelAnnouncementDigest(gossip_bytes[2..]); // payload, post 2-byte type
-// caller: k256.verify(ann.node_id_1, digest, ann.node_signature_1) and 3 more checks
+// `verifyChannelAnnouncement` names the digest/signature/pubkey pairing so the
+// caller only has to plug in `k256.verify` -- not re-derive which signature
+// goes with which key from BOLT#7. A decoded-but-not-yet-called-verify*
+// announcement is exactly as authenticated as any other unverified wire bytes.
+fn myEcdsaVerify(_: ?*anyopaque, digest: [32]u8, sig: [64]u8, pubkey: [33]u8) bool {
+    return k256.verify(pubkey, digest, sig); // your secp256k1
+}
+const verified = try lnwire.verifyChannelAnnouncement(gossip_bytes[2..], ann, myEcdsaVerify, null);
 ```
 
 ## Verify

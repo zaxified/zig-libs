@@ -297,8 +297,11 @@ the classic surface is entirely unaffected; the public API is purely additive.
   data is refused.
 - **`s7plus_object.zig` — objects, session, integrity.** The Data-PDU inner header is
   `opcode(1) reserved(2) function(2) reserved(2) seqnum(2)`; the reserved fields are checked, not
-  assumed. Objects are `0xa1 <relation-id><class-id> ( attribute | object )* 0xa2`, walked with an
-  independent, stricter depth bound (`max_object_depth = 16`). The **session** carries three running
+  assumed. Objects are `0xa1 <relation-id><class-id> ( attribute | object )* 0xa2`, walked with a
+  stricter depth bound (`max_object_depth = 16`) that an attribute's value walk **inherits**
+  rather than resetting — `walkObject` hands `skipValue` its own remaining budget, not a fresh
+  `value.max_depth`, so the two bounds cannot compose into a worse-than-`max_object_depth` real
+  call-stack depth. The **session** carries three running
   values — the session id (assigned by the CPU at connect), the sequence number (client-incremented,
   echoed by the reply), and the **integrity id** (a running anti-replay value newer firmware checks).
   `Session.verifyIntegrity` enforces that a V3 PDU's id is **exactly** the expected next value and

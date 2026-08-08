@@ -3,7 +3,8 @@
 //! P2SH/WIF/xprv/xpub all ride this) — ported from the well-known
 //! multiply-add bignum algorithm (Bitcoin Core's `base58.cpp`
 //! `EncodeBase58`/`DecodeBase58`; public algorithm, clean-room here, no
-//! source copied — see ../NOTICE if that changes).
+//! source copied). `../NOTICE` carries a condition, but only for the
+//! *test-vector data* in `base58_vectors.zig` — not this file's algorithm.
 //!
 //! No allocation: both directions write into a caller-supplied `out`
 //! buffer and work through a fixed-size stack scratch buffer, so payload/
@@ -15,6 +16,7 @@
 
 const std = @import("std");
 const ripemd160 = @import("ripemd160");
+const base58_vectors = @import("base58_vectors.zig");
 
 pub const alphabet: *const [58]u8 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -220,6 +222,44 @@ test "base58 encode: empty input" {
     var buf: [8]u8 = undefined;
     const enc = try encode(&.{}, &buf);
     try testing.expectEqualStrings("", enc);
+}
+
+test "base58 encode/decode against Bitcoin Core's base58_encode_decode.json (external, 21 vectors)" {
+    // The first real outside oracle this module's plain (non-Check) base58
+    // layer has ever been checked against — see base58_vectors.zig and
+    // ../NOTICE. Both directions, byte-exact, including the leading-zero and
+    // near-alphabet-boundary edge cases the corpus specifically exercises.
+    //
+    // One of the 21 (a 256-byte stress payload, 348 base58 characters) is
+    // larger than this module's documented, deliberate scope: no real
+    // Bitcoin base58 payload exceeds 78 bytes (xprv/xpub), so
+    // `max_payload_len = 128` / `max_encoded_len = 180` are headroom over
+    // real use, not an attempt to match Core's C++ implementation's
+    // unbounded generality. It is asserted below to be rejected
+    // *consistently* by both directions, rather than silently dropped from
+    // the corpus.
+    var enc_buf: [512]u8 = undefined;
+    var dec_buf: [256]u8 = undefined;
+    var hex_buf: [256]u8 = undefined;
+    var oversized_seen: usize = 0;
+    for (base58_vectors.vectors) |v| {
+        const payload = std.fmt.hexToBytes(&hex_buf, v.hex) catch unreachable;
+
+        if (payload.len > max_payload_len) {
+            oversized_seen += 1;
+            try testing.expect(v.base58.len > max_encoded_len);
+            try testing.expectError(error.PayloadTooLarge, encode(payload, &enc_buf));
+            try testing.expectError(error.InputTooLong, decode(v.base58, &dec_buf));
+            continue;
+        }
+
+        const got_enc = try encode(payload, &enc_buf);
+        try testing.expectEqualStrings(v.base58, got_enc);
+
+        const got_dec = try decode(v.base58, &dec_buf);
+        try testing.expectEqualSlices(u8, payload, got_dec);
+    }
+    try testing.expectEqual(@as(usize, 1), oversized_seen); // exactly the 256-byte stress vector
 }
 
 test "base58 decode: invalid character rejected (0, O, I, l excluded)" {

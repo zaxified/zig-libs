@@ -98,7 +98,13 @@ unit of work, not a corner cut inside a message this module claims to implement)
   secp256k1 anywhere in this module (a pure codec has no business owning curve arithmetic — the
   caller verifies `channelAnnouncementDigest(payload)` etc. against the message's signature
   field(s) and `node_id`/`bitcoin_key`, exactly the split `bitcointx`'s sighash functions use
-  relative to their caller's secp256k1).
+  relative to their caller's secp256k1). `verifyChannelAnnouncement`/`verifyNodeAnnouncement`/
+  `verifyChannelUpdate` (`bolt7.zig`) are the seam that does the pairing for the caller: each takes
+  an `EcdsaVerifyFn` (a `(ctx, digest, signature, pubkey) -> bool` function pointer the caller
+  supplies, the same function-pointer-seam shape `iec62351` uses for `RawVerifier`) and calls it
+  once per signature with BOLT#7's own digest/signature/pubkey pairing already resolved — a
+  `decodeChannelAnnouncement` result carries no signal of its own that it is unverified; calling
+  `verify*` (or not) is what a caller's code shows.
 - **Onion routing (BOLT#4)** — `update_add_htlc.onion_routing_packet` is an opaque 1366-byte
   array; encryption/decryption/Sphinx is the sibling `sphinx` module's job, not this codec's.
 - **BOLT#2 messages not in the required set**: Interactive Transaction Construction (`tx_add_input`

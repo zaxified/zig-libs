@@ -78,9 +78,17 @@ const r = goose.verify(received, .ed2020, .{
     else => return err,
 };
 
-// r.frame.apdu  -> hand to your 61850 decoder
-// r.auth.key_id -> which group key was used
+// r.frame.apdu             -> hand to your 61850 decoder
+// r.unauthenticated.key_id -> which group key was used
 ```
+
+`r.unauthenticated`'s field name is the whole warning: `version`/`time_of_current_key`/
+`time_to_next_key`/`key_id` sit inside the `Extension`, which `Frame.macDomain` — the range the
+tag or signature actually covers — excludes. `verify` succeeding proves the tag matches the APDU;
+it proves nothing about these four fields, so do not drive a security decision (e.g. a key-rollover
+timer off `time_to_next_key`) from them without a trust basis outside this module. `r.tag`/`r.iv`
+are different: a tampered `tag` fails verification, so on success they are exactly what the sender
+sent.
 
 ### Algorithms
 

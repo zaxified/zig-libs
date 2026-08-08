@@ -260,6 +260,76 @@ pub fn channelUpdateDigest(payload: []const u8) message.ReadError![32]u8 {
     return sha256d(payload[CHANNEL_UPDATE_SIG_BYTES..]);
 }
 
+// ── verification seam ─────────────────────────────────────────────────────
+//
+// `decodeChannelAnnouncement`/`decodeNodeAnnouncement`/`decodeChannelUpdate`
+// return a fully-populated struct for arbitrary bytes with a well-formed
+// shape, signature included -- decoding never checks that a signature is
+// genuine (this module has no secp256k1 dependency, see the file header).
+// Nothing in the API previously distinguished a *verified* announcement/
+// update from a merely-*decoded* one, unlike the sibling `lninvoice`
+// module's `Invoice.verify`/`InvoiceRequest.verify`. `EcdsaVerifyFn` is the
+// seam that closes that gap without adding a dependency: the caller plugs
+// in whatever secp256k1 they already have (same function-pointer-seam shape
+// as `iec62351`'s `RawVerifier`), and the three `verify*` functions below
+// name, in the type signature, which digest goes with which signature and
+// public key per BOLT#7 -- so "is this checked yet" is a question the
+// caller's own code answers by whether it called `verify*` at all, not by
+// re-deriving BOLT#7's signer/digest pairing from scratch.
+
+/// `true` iff `signature` is a valid ECDSA signature by `pubkey` over
+/// `digest`. The caller supplies this (secp256k1 is out of scope here);
+/// `ctx` is an opaque pointer threaded through for the caller's own state
+/// (a verification context, a key cache, …) -- `null` if unneeded.
+pub const EcdsaVerifyFn = *const fn (ctx: ?*anyopaque, digest: [32]u8, signature: Signature, pubkey: Point) bool;
+
+/// Verifies all four `channel_announcement` signatures (BOLT#7: two node
+/// signatures over `node_id_1`/`node_id_2`, two bitcoin signatures over
+/// `bitcoin_key_1`/`bitcoin_key_2`, all four over the same digest) against
+/// `payload` (the decoded message's own wire bytes, type-prefix excluded --
+/// what `channelAnnouncementDigest` takes). Short-circuits on the first
+/// failing signature; never claims "verified" on a partial check.
+pub fn verifyChannelAnnouncement(
+    payload: []const u8,
+    msg: ChannelAnnouncement,
+    verify_fn: EcdsaVerifyFn,
+    ctx: ?*anyopaque,
+) message.ReadError!bool {
+    const digest = try channelAnnouncementDigest(payload);
+    return verify_fn(ctx, digest, msg.node_signature_1, msg.node_id_1) and
+        verify_fn(ctx, digest, msg.node_signature_2, msg.node_id_2) and
+        verify_fn(ctx, digest, msg.bitcoin_signature_1, msg.bitcoin_key_1) and
+        verify_fn(ctx, digest, msg.bitcoin_signature_2, msg.bitcoin_key_2);
+}
+
+/// Verifies a `node_announcement`'s signature against its own `node_id`
+/// (BOLT#7: a node signs its own announcement).
+pub fn verifyNodeAnnouncement(
+    payload: []const u8,
+    msg: NodeAnnouncement,
+    verify_fn: EcdsaVerifyFn,
+    ctx: ?*anyopaque,
+) message.ReadError!bool {
+    const digest = try nodeAnnouncementDigest(payload);
+    return verify_fn(ctx, digest, msg.signature, msg.node_id);
+}
+
+/// Verifies a `channel_update`'s signature. Unlike the other two messages,
+/// `channel_update` does not carry the announcing node's public key --
+/// BOLT#7 requires the verifier to already know it, learned from the
+/// `channel_announcement` for the same `short_channel_id`/`direction`
+/// (`channel_flags` bit 0) this update belongs to; the caller supplies it.
+pub fn verifyChannelUpdate(
+    payload: []const u8,
+    msg: ChannelUpdate,
+    announcing_node_id: Point,
+    verify_fn: EcdsaVerifyFn,
+    ctx: ?*anyopaque,
+) message.ReadError!bool {
+    const digest = try channelUpdateDigest(payload);
+    return verify_fn(ctx, digest, msg.signature, announcing_node_id);
+}
+
 // ── query_short_channel_ids / reply_short_channel_ids_end (261/262) ─────
 
 pub const QUERY_SHORT_CHANNEL_IDS_TYPE: u16 = 261;
@@ -995,6 +1065,192 @@ test "channel_update: round-trip + digest" {
     var want: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&want_first, &want, .{});
     try testing.expectEqualSlices(u8, &want, &got);
+}
+
+// The three digest tests above (self-round-trip + digest) recompute the
+// expected value with the SAME literal offset (`payload[256..]`/`[64..]`)
+// `channelAnnouncementDigest`/`nodeAnnouncementDigest`/`channelUpdateDigest`
+// themselves use -- an in-house oracle, not an outside one: a wrong offset
+// baked into both the production function and the test would agree with
+// itself and stay green forever. The three tests below are the outside
+// check: each digest is independently recomputed in Python
+// (`hashlib.sha256`, twice, over the tail of one of `au_kat`'s already-
+// externally-sourced rust-lightning `payload_hex` vectors) and frozen as a
+// literal, so a wrong offset here disagrees with a value this module's own
+// code had no part in producing.
+
+test "channelAnnouncementDigest: independently recomputed (Python hashlib) over an external vector" {
+    const allocator = testing.allocator;
+    const payload = try hexDecodeAlloc(allocator, au_kat.channel_announcement_vectors[0].payload_hex);
+    defer allocator.free(payload);
+    const got = try channelAnnouncementDigest(payload);
+    const want = hexToArray(32, "24cda6c903a92a68d80ae36c8b382edba3e19f87c02afcbabc374426fc93e781");
+    try testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "nodeAnnouncementDigest: independently recomputed (Python hashlib) over an external vector" {
+    const allocator = testing.allocator;
+    const payload = try hexDecodeAlloc(allocator, au_kat.node_announcement_vectors[0].payload_hex);
+    defer allocator.free(payload);
+    const got = try nodeAnnouncementDigest(payload);
+    const want = hexToArray(32, "3642f6aad0edeb0664c7f156b00b04284c0112523ccad02a7e437ec7d390eb85");
+    try testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "channelUpdateDigest: independently recomputed (Python hashlib) over an external vector" {
+    const allocator = testing.allocator;
+    const payload = try hexDecodeAlloc(allocator, au_kat.channel_update_vectors[0].payload_hex);
+    defer allocator.free(payload);
+    const got = try channelUpdateDigest(payload);
+    const want = hexToArray(32, "0df68b88dabae0421dd9910e9a9dfe994d6ddcc20408d8ddf928c5c348733bac");
+    try testing.expectEqualSlices(u8, &want, &got);
+}
+
+// ── verification seam tests ────────────────────────────────────────────────
+
+const VerifyCall = struct { digest: [32]u8, signature: Signature, pubkey: Point };
+
+/// A stub `EcdsaVerifyFn`: records every call (for wiring assertions) and
+/// reports valid for every pubkey except `fail_pubkey`, so a test can force
+/// exactly one signature to "fail" without needing real secp256k1.
+const RecordingVerifier = struct {
+    calls: std.ArrayList(VerifyCall) = .empty,
+    fail_pubkey: ?Point = null,
+
+    fn deinit(self: *RecordingVerifier, allocator: Allocator) void {
+        self.calls.deinit(allocator);
+    }
+
+    fn verify(ctx: ?*anyopaque, digest: [32]u8, signature: Signature, pubkey: Point) bool {
+        const self: *RecordingVerifier = @ptrCast(@alignCast(ctx.?));
+        self.calls.append(std.testing.allocator, .{ .digest = digest, .signature = signature, .pubkey = pubkey }) catch @panic("OOM");
+        if (self.fail_pubkey) |fp| {
+            if (std.mem.eql(u8, &fp, &pubkey)) return false;
+        }
+        return true;
+    }
+};
+
+test "verifyChannelAnnouncement: calls back once per signature, correctly paired with its own pubkey" {
+    const allocator = testing.allocator;
+    const msg: ChannelAnnouncement = .{
+        .node_signature_1 = fillPattern(64, 1),
+        .node_signature_2 = fillPattern(64, 2),
+        .bitcoin_signature_1 = fillPattern(64, 3),
+        .bitcoin_signature_2 = fillPattern(64, 4),
+        .features = &.{0x00},
+        .chain_hash = fillPattern(32, 5),
+        .short_channel_id = 0x1122_33_4455,
+        .node_id_1 = fillPattern(33, 6),
+        .node_id_2 = fillPattern(33, 7),
+        .bitcoin_key_1 = fillPattern(33, 8),
+        .bitcoin_key_2 = fillPattern(33, 9),
+    };
+    const bytes = try serializeChannelAnnouncement(allocator, msg);
+    defer allocator.free(bytes);
+    const payload = bytes[2..];
+
+    var v: RecordingVerifier = .{};
+    defer v.deinit(allocator);
+    const ok = try verifyChannelAnnouncement(payload, msg, RecordingVerifier.verify, &v);
+    try testing.expect(ok);
+    try testing.expectEqual(@as(usize, 4), v.calls.items.len);
+
+    const digest = try channelAnnouncementDigest(payload);
+    const expected_pairs = [_]struct { sig: Signature, pk: Point }{
+        .{ .sig = msg.node_signature_1, .pk = msg.node_id_1 },
+        .{ .sig = msg.node_signature_2, .pk = msg.node_id_2 },
+        .{ .sig = msg.bitcoin_signature_1, .pk = msg.bitcoin_key_1 },
+        .{ .sig = msg.bitcoin_signature_2, .pk = msg.bitcoin_key_2 },
+    };
+    for (v.calls.items, expected_pairs) |call, want| {
+        try testing.expectEqualSlices(u8, &digest, &call.digest);
+        try testing.expectEqualSlices(u8, &want.sig, &call.signature);
+        try testing.expectEqualSlices(u8, &want.pk, &call.pubkey);
+    }
+}
+
+test "verifyChannelAnnouncement: false and short-circuits on the first failing signature" {
+    const allocator = testing.allocator;
+    const msg: ChannelAnnouncement = .{
+        .node_signature_1 = fillPattern(64, 1),
+        .node_signature_2 = fillPattern(64, 2),
+        .bitcoin_signature_1 = fillPattern(64, 3),
+        .bitcoin_signature_2 = fillPattern(64, 4),
+        .features = &.{0x00},
+        .chain_hash = fillPattern(32, 5),
+        .short_channel_id = 0x1122_33_4455,
+        .node_id_1 = fillPattern(33, 6),
+        .node_id_2 = fillPattern(33, 7),
+        .bitcoin_key_1 = fillPattern(33, 8),
+        .bitcoin_key_2 = fillPattern(33, 9),
+    };
+    const bytes = try serializeChannelAnnouncement(allocator, msg);
+    defer allocator.free(bytes);
+    const payload = bytes[2..];
+
+    // Fail the FIRST check (node_id_1): `and` must short-circuit there, so
+    // node_id_2/bitcoin_key_1/bitcoin_key_2 are never even asked about.
+    var v: RecordingVerifier = .{ .fail_pubkey = msg.node_id_1 };
+    defer v.deinit(allocator);
+    const ok = try verifyChannelAnnouncement(payload, msg, RecordingVerifier.verify, &v);
+    try testing.expect(!ok);
+    try testing.expectEqual(@as(usize, 1), v.calls.items.len);
+}
+
+test "verifyNodeAnnouncement: calls back once, digest+signature+node_id all correct" {
+    const allocator = testing.allocator;
+    const msg: NodeAnnouncement = .{
+        .signature = fillPattern(64, 1),
+        .features = &.{0x00},
+        .timestamp = 1_700_000_000,
+        .node_id = fillPattern(33, 2),
+        .rgb_color = .{ 1, 2, 3 },
+        .alias = fillPattern(32, 4),
+        .addresses = &.{},
+        .extra = &.{},
+    };
+    const bytes = try serializeNodeAnnouncement(allocator, msg);
+    defer allocator.free(bytes);
+    const payload = bytes[2..];
+
+    var v: RecordingVerifier = .{};
+    defer v.deinit(allocator);
+    const ok = try verifyNodeAnnouncement(payload, msg, RecordingVerifier.verify, &v);
+    try testing.expect(ok);
+    try testing.expectEqual(@as(usize, 1), v.calls.items.len);
+    const digest = try nodeAnnouncementDigest(payload);
+    try testing.expectEqualSlices(u8, &digest, &v.calls.items[0].digest);
+    try testing.expectEqualSlices(u8, &msg.signature, &v.calls.items[0].signature);
+    try testing.expectEqualSlices(u8, &msg.node_id, &v.calls.items[0].pubkey);
+}
+
+test "verifyChannelUpdate: verifies against the caller-supplied announcing node_id, not a field of its own" {
+    const allocator = testing.allocator;
+    const msg: ChannelUpdate = .{
+        .signature = fillPattern(64, 1),
+        .chain_hash = fillPattern(32, 2),
+        .short_channel_id = 0x0102_03_0405,
+        .timestamp = 1_700_000_001,
+        .message_flags = 1,
+        .channel_flags = 0,
+        .cltv_expiry_delta = 40,
+        .htlc_minimum_msat = 1,
+        .fee_base_msat = 1000,
+        .fee_proportional_millionths = 100,
+        .htlc_maximum_msat = 1_000_000_000,
+    };
+    const bytes = try serializeChannelUpdate(allocator, msg);
+    defer allocator.free(bytes);
+    const payload = bytes[2..];
+    const announcing_node_id = fillPattern(33, 0xaa); // not carried by channel_update itself
+
+    var v: RecordingVerifier = .{};
+    defer v.deinit(allocator);
+    const ok = try verifyChannelUpdate(payload, msg, announcing_node_id, RecordingVerifier.verify, &v);
+    try testing.expect(ok);
+    try testing.expectEqual(@as(usize, 1), v.calls.items.len);
+    try testing.expectEqualSlices(u8, &announcing_node_id, &v.calls.items[0].pubkey);
 }
 
 test "hostile: channel_announcement/node_announcement/channel_update truncated fixed fields fail closed" {

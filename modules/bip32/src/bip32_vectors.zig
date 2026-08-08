@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! Official BIP-32 test vectors 1-3 (and the vector-5 invalid-key corpus),
-//! machine-transcribed verbatim from `bitcoin/bips/bip-0032.mediawiki`
-//! "Test Vectors" section; see NOTICE / SPEC.md for provenance. Vector 4
-//! (leading-zero private-key retention) is not pinned here (no distinct
-//! code path from vector 3 in this implementation) but could be added.
+//! Official BIP-32 test vectors 1-5, machine-transcribed verbatim from
+//! `bitcoin/bips/bip-0032.mediawiki` "Test Vectors" section (fetched
+//! 2026-08-08); see NOTICE / SPEC.md for provenance.
 //!
 //! `index` on a `ChainStep` is the raw BIP-32 child index already carrying
 //! the hardened offset (`index >= hardened_offset` means hardened) — the
@@ -102,6 +100,31 @@ pub const test_vector_3 = TestVector{
             .index = hardened_offset + 0,
             .xprv = "xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L",
             .xpub = "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y",
+        },
+    },
+};
+
+// Vector 4: leading-zero retention, this time for a master key/chain whose
+// derivation is documented (per BIP-32's own text) to hit the same
+// leading-zero corner as Vector 3 at a *different* depth. See
+// https://github.com/btcsuite/btcutil/issues/172, cited by the BIP itself.
+// No distinct code path from Vector 3 in this implementation, but it is a
+// genuine, distinct published byte-exact answer this module had never
+// actually been run against.
+pub const test_vector_4 = TestVector{
+    .seed_hex = "3ddd5602285899a946114506157c7997e5444528f3003f6134712147db19b678",
+    .master_xprv = "xprv9s21ZrQH143K48vGoLGRPxgo2JNkJ3J3fqkirQC2zVdk5Dgd5w14S7fRDyHH4dWNHUgkvsvNDCkvAwcSHNAQwhwgNMgZhLtQC63zxwhQmRv",
+    .master_xpub = "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxyL6tmgBUAEPrEz92mBXjByMRiJdba9wpnN37RLLAXa",
+    .chain = &.{
+        .{
+            .index = hardened_offset + 0,
+            .xprv = "xprv9vB7xEWwNp9kh1wQRfCCQMnZUEG21LpbR9NPCNN1dwhiZkjjeGRnaALmPXCX7SgjFTiCTT6bXes17boXtjq3xLpcDjzEuGLQBM5ohqkao9G",
+            .xpub = "xpub69AUMk3qDBi3uW1sXgjCmVjJ2G6WQoYSnNHyzkmdCHEhSZ4tBok37xfFEqHd2AddP56Tqp4o56AePAgCjYdvpW2PU2jbUPFKsav5ut6Ch1m",
+        },
+        .{
+            .index = hardened_offset + 1,
+            .xprv = "xprv9xJocDuwtYCMNAo3Zw76WENQeAS6WGXQ55RCy7tDJ8oALr4FWkuVoHJeHVAcAqiZLE7Je3vZJHxspZdFHfnBEjHqU5hG1Jaj32dVoS6XLT1",
+            .xpub = "xpub6BJA1jSqiukeaesWfxe6sNK9CCGaujFFSJLomWHprUL9DePQ4JDkM5d88n49sMGJxrhpjazuXYWdMf17C9T5XnxkopaeS7jGk1GyyVziaMt",
         },
     },
 };

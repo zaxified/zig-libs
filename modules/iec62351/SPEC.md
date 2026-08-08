@@ -283,8 +283,14 @@ comparison isolated in one function.
   publishers of one group key` and its fixed-IV positive control.
 - **Key management.** No key derivation, distribution, rollover or revocation.
   `time_of_current_key`/`time_to_next_key`/`key_id` are carried and returned to
-  the caller; acting on them is IEC 62351-9 / RFC 8052 GDOI territory and is not
-  implemented.
+  the caller as `verify`'s `unauthenticated: UnauthenticatedMetadata` field —
+  the name is load-bearing: all four sit inside the `Extension`, which
+  `Frame.macDomain` (the tag/signature's covered range) excludes, so a
+  captured, still-valid frame can have any of them rewritten without
+  invalidating the tag. Acting on them (e.g. driving a subscriber's
+  key-rollover timer off `time_to_next_key`) is IEC 62351-9 / RFC 8052 GDOI
+  territory and is not implemented; a caller that does act on them is
+  trusting unauthenticated wire data.
 - **Denial of service.** An attacker flooding the segment with frames that fail
   verification still costs the subscriber a MAC computation per frame. GMAC and
   HMAC are cheap, but the bound is the caller's rate limiting, not this

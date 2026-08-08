@@ -41,6 +41,23 @@
 //! from `linux/nl80211.h` and covered by the round-trip tests in
 //! `connect.zig`. Everything else below came off the wire.
 //!
+//! **UNANCHORED (wave-2 F7, 2026-08-08):** a real `wpa_supplicant` WPA2-PSK
+//! `CONNECT` capture (the fix this finding names — `strace` the same way
+//! the three goldens above it were captured) was attempted and found
+//! impractical in this environment: no root/`CAP_NET_ADMIN` to bring up
+//! `mac80211_hwsim` (`modprobe` refused: "Operation not permitted"), and the
+//! one real WPA2-associated interface on this host is live infrastructure a
+//! test run must not touch. What *is* verified: `scripts/check-uapi-consts.py
+//! nl80211` (the standing check `nl80211` F3 added) diffs every constant in
+//! `uapi.zig`, WPA attributes included, against this host's
+//! `/usr/include/linux/nl80211.h` on every run — `WPA_VERSIONS`=75,
+//! `CIPHER_SUITES_PAIRWISE`=73, `CIPHER_SUITE_GROUP`=74, `AKM_SUITES`=76,
+//! `PREV_BSSID`=79, `SOCKET_OWNER`=204, `PMK`=254, `WANT_1X_4WAY_HS`=257,
+//! `USE_MFP`=66 all currently MATCHED. So the attribute *numbers* are
+//! standing-checked; what remains unverified is the *set, order and payload
+//! shape* of a real WPA2-PSK `CONNECT` message — genuinely different from
+//! "nothing was checked."
+//!
 //! ## How the reply goldens were captured
 //!
 //! ```sh

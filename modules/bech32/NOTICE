@@ -1,0 +1,33 @@
+bech32 — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE DATA whose copyright notice must be
+preserved in any copy. Redistributing this module — alone or as part of
+zig-libs — must keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test vectors.
+
+## Bitcoin Core `base58_encode_decode.json`
+
+`src/base58_vectors.zig` reproduces, in full, the official plain-base58
+encode/decode conformance corpus published by the Bitcoin Core project at
+`src/test/data/base58_encode_decode.json` (fetched 2026-08 from `master`).
+All 21 `[hex, base58]` pairs are included verbatim, transcribed by script.
+This replaces what had been this module's only base58 vector — a value
+independently derived by the same author who wrote `base58.zig`, using a
+throwaway Python bignum script, while authoring the module (still kept
+alongside, labelled as self-derived, since it separately exercises
+Base58Check's version-byte-and-checksum framing that this corpus does not).
+
+  Copyright (c) 2014-present The Bitcoin Core developers
+  Distributed under the MIT software license, see
+  https://opensource.org/licenses/MIT
+
+No Bitcoin Core C++ source is present in this module. `base58.zig`'s
+multiply-add algorithm is clean-room from the well-known Base58/Base58Check
+description (see the module doc comment). What is reproduced here, and only
+here, is conformance DATA — which is precisely why the notice lives beside
+it.

@@ -119,6 +119,19 @@ actually emitted, transcribed mechanically, is an anchor).
     opaque byte slices regardless of address-descriptor kind or feature-bit
     meaning.
 
+  * `lightning/src/ln/msgs.rs`, `encoding_init`/`encoding_error`/
+    `encoding_warning`/`encoding_ping`/`encoding_pong` (fetched 2026-08-08,
+    `main` branch commit `3e0c26973a66e945088c64793b4e35cfb01b9b78`) — two of
+    upstream's five `init` sub-cases (the ones with no legacy-globalfeatures
+    derivation, so every input byte is the literal field value), plus
+    `error`/`warning`'s shared vector and `ping`/`pong`, transcribed
+    mechanically into `src/bolt1_kat_vectors.zig`. Closes the gap
+    `ANCHOR-TASKS.tsv`'s `lnwire` row previously mis-recorded as covered:
+    "BOLT#1 App A/B" (BigSize/TLV) anchors the *primitives* `init`/`error`/
+    `ping`/`pong` are built from, not those messages themselves, which had 0
+    external vectors before this pass — self round-trip and hostile-
+    truncation only. Driven by `bolt1_kat_test.zig`.
+
 Implementation vs. test-data distinction: the BOLT#1/#2/#7 wire-format
 CODEC in `bolt1.zig`/`bolt2.zig`/`bolt7.zig` is this module's own
 clean-room work from the public spec text (`01-messaging.md` /

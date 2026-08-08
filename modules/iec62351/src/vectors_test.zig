@@ -302,8 +302,8 @@ test "self: the frozen HMAC-SHA256-128 frame reproduces byte-exactly" {
     const r = try goose.verify(&kat_frame_hmac128, .ed2020, .{
         .mac = .{ .algorithm = .hmac_sha256_128, .key = &kat.hmac_key },
     });
-    try testing.expectEqual(kat.key_id, r.auth.key_id);
-    try testing.expectEqual(kat.time_of_current_key, r.auth.time_of_current_key);
+    try testing.expectEqual(kat.key_id, r.unauthenticated.key_id);
+    try testing.expectEqual(kat.time_of_current_key, r.unauthenticated.time_of_current_key);
 }
 
 test "self: the frozen tag for each modelled algorithm reproduces byte-exactly" {

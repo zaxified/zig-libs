@@ -76,6 +76,19 @@ check each attribute's type, width and value), which proves the encoder is
 self-consistent but **not** that the kernel likes it. Treat the WPA2 `CONNECT`
 path as the least-verified corner of this module.
 
+**UNANCHORED, attempted 2026-08-08 (wave-2 F7):** a real `wpa_supplicant`
+WPA2-PSK capture was attempted and is impractical here — no root/
+`CAP_NET_ADMIN` to bring up `mac80211_hwsim` (`modprobe` refused), and the
+only WPA2-associated interface on this host is live infrastructure a test
+run must not disturb. Partial mitigation in place: `scripts/check-uapi-consts.py`
+(the standing check §1.1's sibling `nl80211` F3 institutionalized) verifies
+all nine WPA2 attribute constants — `WPA_VERSIONS`, `CIPHER_SUITES_PAIRWISE`,
+`CIPHER_SUITE_GROUP`, `AKM_SUITES`, `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS`,
+`SOCKET_OWNER`, `PREV_BSSID` — against this host's `linux/nl80211.h` on every
+run (currently all MATCHED). That closes the "wrong attribute number" failure
+mode but not the "wrong set/order/payload shape relative to a real supplicant"
+one, which is what a live capture would close.
+
 Everything else — every decoder, and every other request encoder — is backed by
 real bytes.
 

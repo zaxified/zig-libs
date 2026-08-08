@@ -244,6 +244,7 @@ grade 2 where no published vector exists to have. Nothing rests on grade 3.
 |---|---|---|
 | RPO permutation, `m = 12` | 1 | 19 report vectors + 19 miden vectors |
 | RPO permutation, `m = 16` | 1 | 19 report vectors |
+| `m = 16` MDS row | 1 | the report's 160-bit vectors only — unlike the `m = 12` row (independently corroborated by Winterfell's own copy of the same matrix), no second implementation's MDS constant exists to diff against; a wrong `m = 16` row would still pass every test as long as it is self-consistent |
 | `spec128` / `spec160` framing | 1 | the report's vectors |
 | `Rpo256` framing (elements, merge) | 1 | miden-crypto's `EXPECTED` |
 | `Rpo256.hash` (bytes) | 2 | **no upstream byte-input KAT exists** (checked: miden's suite has only inequality properties). Instead its `hash_padding_no_extra_permutation_call` test is ported — the expected digest is built from the *permutation*, which is grade 1, plus the packing rule read from miden's source — and its `hash_padding` inequality cases are reproduced verbatim |

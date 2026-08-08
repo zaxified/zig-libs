@@ -56,9 +56,11 @@ pub const Error = error{
     BufferTooSmall,
 } || value.Error;
 
-/// Depth bound for a nested object graph — independent of, and stricter than,
-/// the value codec's own bound, because objects nest more shallowly than the
-/// typed values inside them.
+/// Depth bound for a nested object graph. **Not independent of the value
+/// codec's own bound**: an attribute's value walk is handed the *remaining*
+/// object-walk budget (see `walkObject`), not a fresh `value.max_depth`, so
+/// the real worst-case recursion at any point is bounded by this single
+/// constant, not by the two constants composing on the call stack.
 pub const max_object_depth: u8 = 16;
 
 // ── opcode + function ───────────────────────────────────────────────────────
@@ -163,7 +165,13 @@ fn walkObject(cur: *value.Cursor, depth: u8) Error!void {
             elem_terminating_object => return,
             elem_attribute => {
                 _ = try cur.varUint(u32, 5); // attribute id
-                try value.skipValue(cur, value.max_depth);
+                // Hand the value walk the *remaining* object-walk budget, not
+                // a fresh `value.max_depth`. A fresh budget here let the two
+                // "independent" bounds compose on the real call stack: an
+                // attribute at object-depth 15 could still open a value
+                // nested 32 deep, for combined recursion nowhere close to
+                // what either constant alone suggests.
+                try value.skipValue(cur, depth);
             },
             elem_start_object => {
                 cur.pos -= 1; // put the marker back for the nested walk
@@ -324,6 +332,46 @@ test "a pathologically nested object is DepthExceeded" {
     var w: usize = 0;
     var i: usize = 0;
     while (i < max_object_depth + 3) : (i += 1) w += (try beginObject(1, 1, buf[w..])).len;
+    try testing.expectError(error.DepthExceeded, objectLen(buf[0..w]));
+}
+
+test "an attribute value inherits the object walk's remaining depth budget, not a fresh one" {
+    // Nest objects to within 3 of `max_object_depth`, then give the innermost
+    // object one attribute whose value needs 5 nested `skipValue` calls (4
+    // `s7struct` layers wrapping one scalar) — well inside `value.max_depth`
+    // (32) on its own, but more than the 3 levels of object-walk budget left
+    // at that point. If the value walk gets a *fresh* budget here (the old
+    // behaviour), this decodes cleanly; if it inherits the remaining object
+    // budget (the fix), it must fail with `DepthExceeded`.
+    var buf: [512]u8 = undefined;
+    var w: usize = 0;
+
+    // `nest_count` objects: walkObject's own call uses depth = max_object_depth
+    // for the 1st, and each further nested object recurses with depth - 1, so
+    // the `nest_count`-th (innermost) frame runs with depth = max_object_depth
+    // + 1 - nest_count. Pick nest_count so that remainder is 3.
+    const nest_count = max_object_depth - 2;
+    var i: usize = 0;
+    while (i < nest_count) : (i += 1) w += (try beginObject(1, 1, buf[w..])).len;
+
+    w += (try beginAttribute(1, buf[w..])).len;
+    // 4 nested s7struct layers, each opening element id 1, then a scalar leaf.
+    var d: usize = 0;
+    while (d < 4) : (d += 1) {
+        buf[w] = 0; // flags
+        w += 1;
+        buf[w] = @intFromEnum(value.Datatype.s7struct);
+        w += 1;
+        w += (try value.putVarUint(1, buf[w..])).len; // element id 1
+    }
+    w += (try value.encodeScalar(.usint, i64, 42, buf[w..])).len;
+    // Terminate each of the 4 struct layers (element id 0).
+    d = 0;
+    while (d < 4) : (d += 1) w += (try value.putVarUint(0, buf[w..])).len;
+
+    i = 0;
+    while (i < nest_count) : (i += 1) w += (try endObject(buf[w..])).len;
+
     try testing.expectError(error.DepthExceeded, objectLen(buf[0..w]));
 }
 

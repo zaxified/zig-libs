@@ -136,8 +136,14 @@ pub const Options = struct {
     /// so this bounds real memory rather than expanded size.
     max_nodes: usize = 10_000_000,
     /// Nesting depth. The parser already refuses to nest past
-    /// `scanner.max_depth`, so this is a second, independent bound that also
-    /// keeps `composeNode`'s recursion off the end of the stack.
+    /// `scanner.max_depth` (4096), but the scanner and parser are iterative —
+    /// they walk a flat event stream, never recursing per nesting level — so
+    /// 4096 there is a sanity ceiling on documents, not a stack-safety bound.
+    /// `composeNode` is this module's only stack-recursive stage (one Zig
+    /// call frame per nesting level), so its bound is deliberately the
+    /// stricter of the two, chosen independently for stack safety rather than
+    /// matched to the scanner's number: a document nested between 1024 and
+    /// 4096 levels deep tokenizes and parses cleanly, then is refused here.
     max_depth: usize = 1024,
     /// Reject a mapping that repeats a key instead of composing it.
     ///
@@ -786,6 +792,37 @@ test "compose rejects a stream that is not exactly one document" {
 test "the node budget bounds a hostile input" {
     try testing.expectError(error.TooManyNodes, compose(testing.allocator, "[1,2,3,4,5,6]\n", .{ .max_nodes = 3 }));
     try testing.expectError(error.TooDeep, compose(testing.allocator, "[[[[[1]]]]]\n", .{ .max_depth = 2 }));
+}
+
+test "composer depth boundary at the real default (1024), not a toy override" {
+    // The only prior depth test used `max_depth = 2` against 5 levels of
+    // nesting — nowhere near the shipped default. `composeNode` recurses one
+    // Zig call frame per level and checks `depth > options.max_depth`, so the
+    // boundary is exactly at `max_depth` levels of nesting (accepted) vs
+    // `max_depth + 1` (refused); this exercises both sides at the real
+    // default with no `Options` override.
+    const gpa = testing.allocator;
+    const n = (Options{}).max_depth; // 1024
+    try testing.expectEqual(@as(usize, 1024), n);
+
+    var at_bound: std.ArrayList(u8) = .empty;
+    defer at_bound.deinit(gpa);
+    for (0..n) |_| try at_bound.append(gpa, '[');
+    try at_bound.append(gpa, '1');
+    for (0..n) |_| try at_bound.append(gpa, ']');
+    try at_bound.append(gpa, '\n');
+
+    const ok = try compose(gpa, at_bound.items, .{});
+    ok.deinit();
+
+    var one_too_deep: std.ArrayList(u8) = .empty;
+    defer one_too_deep.deinit(gpa);
+    for (0..n + 1) |_| try one_too_deep.append(gpa, '[');
+    try one_too_deep.append(gpa, '1');
+    for (0..n + 1) |_| try one_too_deep.append(gpa, ']');
+    try one_too_deep.append(gpa, '\n');
+
+    try testing.expectError(error.TooDeep, compose(gpa, one_too_deep.items, .{}));
 }
 
 test "a malformed document still fails as a parse error" {
