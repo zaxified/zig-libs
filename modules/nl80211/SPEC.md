@@ -64,30 +64,39 @@ Things the goldens caught or pinned that would otherwise have been guesses:
 
 `iw connect` supports only open and **WEP** networks — it has no WPA mode,
 because on ordinary mac80211 hardware WPA needs a userspace supplicant. So
-these `CONNECT` attributes have **no `iw` golden** and were derived from
-`linux/nl80211.h` alone:
+these `CONNECT` attributes have **no `iw` golden**:
 
 `NL80211_ATTR_WPA_VERSIONS`, `CIPHER_SUITES_PAIRWISE`, `CIPHER_SUITE_GROUP`,
 `AKM_SUITES`, `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS`, `SOCKET_OWNER`,
 `PREV_BSSID`.
 
-They are covered by round-trip tests in `src/connect.zig` (build → re-parse →
-check each attribute's type, width and value), which proves the encoder is
-self-consistent but **not** that the kernel likes it. Treat the WPA2 `CONNECT`
-path as the least-verified corner of this module.
+**ANCHORED for five of the nine, 2026-08-08 (wave-2 F7).** `wpa_supplicant`
+2.11 was made to associate WPA2-PSK, for real, to a real `hostapd` AP over the
+kernel's own `mac80211_hwsim` radios inside the repo's privileged VM lane
+(`scripts/vm/run.sh`'s guest — no host radio, no host privilege), and its
+`NL80211_CMD_CONNECT` was captured with the same `strace` recipe as every
+other golden here. The 320 bytes are frozen in `src/goldens.zig`
+(`wpa2_connect_capture`) and compared attribute-by-attribute against what
+`buildConnect` emits for the same association. That anchors **`WPA_VERSIONS`,
+`CIPHER_SUITES_PAIRWISE`, `CIPHER_SUITE_GROUP`, `AKM_SUITES` and
+`SOCKET_OWNER`** — number, length, payload width and value — and with them the
+suite selectors `CIPHER.CCMP` (00-0F-AC:4) and `AKM.PSK` (00-0F-AC:2), neither
+of which any header on the capture host declares. The encoders agreed with the
+supplicant on the first comparison; nothing was adjusted to fit.
 
-**UNANCHORED, attempted 2026-08-08 (wave-2 F7):** a real `wpa_supplicant`
-WPA2-PSK capture was attempted and is impractical here — no root/
-`CAP_NET_ADMIN` to bring up `mac80211_hwsim` (`modprobe` refused), and the
-only WPA2-associated interface on this host is live infrastructure a test
-run must not disturb. Partial mitigation in place: `scripts/check-uapi-consts.py`
-(the standing check §1.1's sibling `nl80211` F3 institutionalized) verifies
-all nine WPA2 attribute constants — `WPA_VERSIONS`, `CIPHER_SUITES_PAIRWISE`,
-`CIPHER_SUITE_GROUP`, `AKM_SUITES`, `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS`,
-`SOCKET_OWNER`, `PREV_BSSID` — against this host's `linux/nl80211.h` on every
-run (currently all MATCHED). That closes the "wrong attribute number" failure
-mode but not the "wrong set/order/payload shape relative to a real supplicant"
-one, which is what a live capture would close.
+Two differences were found and are pinned rather than removed: this module's
+message-wide attribute order follows `iw`'s, not the supplicant's (netlink does
+not care, and the *relative* order of the four security attributes is the same
+in both), and the supplicant emits `SOCKET_OWNER` twice where this module emits
+it once.
+
+**Still unanchored:** `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS` and `PREV_BSSID`. A
+PSK association through cfg80211's own SME sends none of them — the capture is
+asserted to contain none — so they stay round-trip-only. Reaching them needs
+4-way-handshake offload (`PMK`), an MFP-required BSS, an 802.1X network and a
+roam respectively; `mac80211_hwsim` offers no handshake offload, so the first is
+out of reach of this lane entirely. Their attribute *numbers* are
+standing-checked by `scripts/check-uapi-consts.py nl80211` on every run.
 
 Everything else — every decoder, and every other request encoder — is backed by
 real bytes.

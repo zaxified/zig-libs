@@ -178,4 +178,45 @@ VM_DEBIAN_PACKAGES=(
     # on FRR, so capturing here is licence-clean where vendoring their
     # GPL-licensed topotest fixtures would not be.
     frr
+    # nl80211's anchor for the WPA2 half of NL80211_CMD_CONNECT (wave-2 F7).
+    # `iw` has no WPA mode, so the only tool that emits a real WPA2-PSK
+    # CONNECT is a supplicant, and it needs an AP to connect to. The kernel
+    # supplies both radios: mac80211_hwsim IS present in this image's stock
+    # cloud kernel (verified: `modprobe mac80211_hwsim` -> phy0/phy1,
+    # wlan0/wlan1), so hostapd runs the AP on one and wpa_supplicant the STA
+    # on the other, entirely inside the guest, touching no real radio.
+    # strace is the same capture mechanism every other golden in this repo was
+    # taken with. All three are capture-time-only: what lands in the tree is
+    # frozen bytes, and no committed test needs this image to run.
+    wpasupplicant
+    hostapd
+    strace
 )
+
+# ── what this image CANNOT provide, so nobody re-derives it ──────────────
+#
+# `netdevsim` — the kernel's simulated devlink device, and the only way to
+# give the `devlink` module's reply decoders a live counterpart (wave-2
+# devlink F1) — is NOT reachable from this lane, and no package list change
+# fixes it:
+#
+#   * Debian's cloud kernel (6.12.96+deb13-amd64) has no netdevsim.ko:
+#     `modprobe netdevsim` -> "Module netdevsim not found", and
+#     /sys/bus/netdevsim/ does not exist, so it is not built in either.
+#   * Debian's GENERIC kernel is no better — verified empirically by
+#     installing linux-image-amd64 (6.12.101+deb13-amd64) in a throwaway
+#     -snapshot boot: `modinfo -k 6.12.101+deb13-amd64 netdevsim` fails too.
+#     So `linux-image-amd64` is deliberately NOT in the list above; it costs
+#     ~400 MB of guest disk and buys nothing.
+#   * No Debian trixie/amd64 package ships netdevsim.ko at all (packages.
+#     debian.org contents search, exact filename, all sections: no results).
+#     Debian does not set CONFIG_NETDEVSIM.
+#   * OpenWRT 25.12.4 x86/64 has no kmod-netdevsim either (all 1173 kmods in
+#     the release's kmods/ index were listed; the only DSA-family devlink
+#     drivers there — b53, mv88e6xxx, qca8k, vsc73xx — all need real silicon).
+#
+# Closing that row therefore needs a kernel with CONFIG_NETDEVSIM=m, which
+# means a new platform in this manifest (an Ubuntu cloud image, whose
+# linux-modules-*-generic does ship netdevsim.ko) or building
+# drivers/net/netdevsim out of tree against the guest's own kernel headers.
+# Either is a lane change, not a package change.

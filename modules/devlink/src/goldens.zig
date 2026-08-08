@@ -29,13 +29,13 @@
 //! constant: it is whatever nlctrl assigned on that boot, which is exactly why
 //! `client.zig` resolves it at runtime. The goldens pass 25 in.
 //!
-//! ## The capture machine had no devlink hardware
+//! ## The request-capture machine had no devlink hardware
 //!
-//! This is the honest and important caveat. devlink is implemented by SmartNIC
-//! and switch-ASIC drivers (mlx5, mlx4, ice, bnxt, nfp, mlxsw, prestera) and by
-//! `netdevsim`; the capture machine has an Intel e1000e and an Intel Wi-Fi
-//! radio, **neither of which registers a devlink instance**, and loading
-//! `netdevsim` needs real root. `devlink dev show` there returns an empty dump.
+//! devlink is implemented by SmartNIC and switch-ASIC drivers (mlx5, mlx4,
+//! ice, bnxt, nfp, mlxsw, prestera) and by `netdevsim`; the machine the
+//! *request* goldens were captured on has an Intel e1000e and an Intel Wi-Fi
+//! radio, **neither of which registers a devlink instance**. `devlink dev
+//! show` there returns an empty dump.
 //!
 //! What that means for the goldens below:
 //!
@@ -43,15 +43,17 @@
 //!   the kernel can refuse it, so `devlink port split pci/…/1 count 2` puts its
 //!   bytes on the wire and *then* gets `EPERM`/`ENODEV` — the bytes are as real
 //!   as they would be against a switch.
-//! * Four **reply** goldens are real kernel bytes: the nlctrl
-//!   `CTRL_CMD_NEWFAMILY` that carries the family id and the `config`
+//! * Four **reply** goldens are real kernel bytes from that same machine: the
+//!   nlctrl `CTRL_CMD_NEWFAMILY` that carries the family id and the `config`
 //!   multicast group, the `NLMSG_DONE` that terminates an empty dump, and the
 //!   `NLMSG_ERROR` for `ENODEV` and for `EPERM`.
 //! * Every **object** reply golden (device, port, parameter, resource tree,
-//!   region, chunked region read, health reporter, info) is **constructed from
-//!   the UAPI**, not captured. They are marked as such at each test. The
-//!   decoders they exercise are additionally covered by the hostile-input and
-//!   round-trip tests in each source file.
+//!   region, chunked region read, health reporter, info) exists twice: once
+//!   **constructed from the UAPI** — the original goldens, kept because they
+//!   cover shapes `netdevsim` does not have — and once **captured from a real
+//!   `netdevsim` device** in the VM lane, which is what closes the wave-2 F1
+//!   finding. Both are labelled at each test; see the "captured replies"
+//!   section at the bottom of this file.
 //!
 //! ## Two iproute2 quirks these goldens pin
 //!
@@ -1013,4 +1015,469 @@ test "constructed: an INFO_GET reply with a pending firmware update" {
     try testing.expectEqualStrings("0.0.1000", info.find(.running, "fw.version").?.value());
     try testing.expectEqualStrings("0.0.1001", info.find(.stored, "fw.version").?.value());
     try testing.expect(info.hasPendingUpdate());
+}
+
+// ── captured replies: a REAL devlink device (wave-2 F1) ────────────────────
+//
+// Everything above this line that decodes an *object* was constructed from the
+// UAPI, because the machine the request goldens came from has no devlink
+// hardware. That is the gap the wave-2 audit's F1 named, and it proved the gap
+// was real: a consistent mutation of `ATTR.PORT_FLAVOUR` (77 -> 200) left the
+// whole suite green, because our constructed golden and our decoder read the
+// same symbol.
+//
+// These replies are different: **the kernel wrote every byte of them.** They
+// were captured from a live `netdevsim` instance — the kernel's own simulated
+// devlink device, the exact recipe F1's to-do names — running as real root
+// inside the repo's VM lane (`scripts/vm/`).
+//
+// Getting netdevsim required more than `modprobe`, and the reason is worth
+// recording so nobody repeats the search: **no Debian and no OpenWRT package
+// ships `netdevsim.ko`.** Debian does not set `CONFIG_NETDEVSIM` in either its
+// cloud or its generic kernel (checked both, plus a packages.debian.org
+// contents search for the filename: no results), and OpenWRT 25.12.4 x86/64
+// has no `kmod-netdevsim` among its 1173 kmods. So the module was built from
+// the kernel's own sources, out of tree, against the guest's own kernel
+// headers, inside the guest:
+//
+// ```sh
+// apt-get install -y --no-install-recommends build-essential linux-headers-$(uname -r)
+// # drivers/net/netdevsim/{Makefile,netdevsim.h,*.c} @ v6.12.96, matching the
+// # guest kernel exactly, from git.kernel.org's stable tree
+// make -C /lib/modules/$(uname -r)/build M=/root/nds CONFIG_NETDEVSIM=m modules
+// modprobe psample          # netdevsim references psample_* — without this
+//                           # insmod fails "Unknown symbol", which is a
+//                           # missing dependency, not a broken build
+// insmod /root/nds/netdevsim.ko
+// echo "1 2" > /sys/bus/netdevsim/new_device      # one device, two ports
+// ```
+//
+// and the replies were then captured with the same recipe as every request
+// golden in this file:
+//
+// ```sh
+// strace -f -e trace=recvmsg -e read=all -xx -s 8192 -e abbrev=none \
+//     -o r.log devlink <args>
+// ```
+//
+// …with the duplicate `MSG_PEEK` read dropped. The build tools are NOT in
+// `scripts/vm/manifest.sh`: they were installed in a throwaway `-snapshot`
+// boot that was discarded, because the lane's value is that it gives real root
+// **once** — what is committed here is frozen bytes that decode identically on
+// any machine, needing no VM, no kernel module and no privilege.
+//
+// The family id in these captures is **23**, not the 25 the request goldens
+// used. Same reason as always: nlctrl assigns it per boot.
+//
+// `nlmsg_pid` was zeroed, exactly as the file header says for every captured
+// reply. Nothing else was touched. There is no identity to anonymise here in
+// any case — netdevsim's bus/device names, port names and firmware versions
+// are all invented by the simulator.
+//
+// ## The independent oracle
+//
+// The bytes alone would only prove the kernel is self-consistent. What makes
+// these anchors is that iproute2 6.19.0's own `devlink` binary decoded the
+// same replies in the same run, and its human-readable output is quoted at
+// each test below. Where this module's decode and that transcript disagree,
+// the transcript wins.
+//
+// All eight object shapes F1 named — device, port, parameter, resource tree,
+// region, chunked region read, health reporter, info — are captured below.
+// The constructed tests above are kept, not replaced: netdevsim has no
+// representor ports, no tripped health reporter and no pending firmware
+// update, so those remain the only coverage of those shapes.
+
+/// One captured reply message, ready for `codec.MessageIterator`.
+fn capturedReply(comptime s: []const u8) [s.len / 2]u8 {
+    return hex(s);
+}
+
+/// The devlink family id nlctrl assigned on the boot these replies came from.
+const cap_fam: u16 = 23;
+
+/// Walk a captured datagram the way `client.Walk` does, but against `cap_fam`.
+fn capturedMessages(buf: []const u8) CapturedWalker {
+    return .{ .it = .{ .buf = buf } };
+}
+
+const CapturedWalker = struct {
+    it: codec.MessageIterator,
+
+    fn next(w: *CapturedWalker) !?struct { cmd: u8, attrs: []const u8 } {
+        while (try w.it.next()) |m| {
+            if (m.type == codec.NLMSG_DONE) return null;
+            if (m.type != cap_fam) continue;
+            const p = try genl.splitPayload(m.payload);
+            return .{ .cmd = p.cmd, .attrs = p.attrs };
+        }
+        return null;
+    }
+};
+
+// `devlink dev show`  ->  netdevsim/netdevsim1
+const cap_dev_show = capturedReply(
+    "c8000000170002003513776a00000000030100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d31000005008800000000008c009c80" ++
+        "28009d802400a28005009900010000001800a38014009e8005009f0000000000" ++
+        "0800a000000000006000a1802400a28005009900010000001800a38014009e80" ++
+        "05009f00000000000800a000000000003800a28005009900020000002c00a380" ++
+        "14009e8005009f00000000000800a0000000000014009e8005009f0001000000" ++
+        "0800a00000000000",
+);
+
+test "captured: DEVLINK_CMD_NEW from a real netdevsim device" {
+    try skipUnlessLittleEndian();
+    var w = capturedMessages(&cap_dev_show);
+    const m = (try w.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(uapi.CMD.NEW, m.cmd);
+
+    const d = try dev.parseDevice(m.attrs);
+    // `devlink dev show` printed exactly: netdevsim/netdevsim1
+    try testing.expectEqualStrings("netdevsim", d.handle.bus());
+    try testing.expectEqualStrings("netdevsim1", d.handle.dev());
+    try testing.expect(d.handle.isComplete());
+    try testing.expectEqual(@as(?bool, false), d.reload_failed);
+
+    // The real reply also carries a large nested statistics attribute this
+    // module does not model. Decoding must ignore it rather than trip on it —
+    // a constructed golden would never have contained one.
+    try testing.expect(m.attrs.len > 100);
+}
+
+// `devlink port show` ->
+//   netdevsim/netdevsim1/0: type eth netdev eni1np1 flavour physical port 1 splittable false
+//   netdevsim/netdevsim1/1: type eth netdev eni1np2 flavour physical port 2 splittable false
+const cap_port_show = capturedReply(
+    "70000000170002003513776a00000000070100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d310000080003000000000006000400" ++
+        "0200000008000600030000000c000700656e69316e7031000500940000000000" ++
+        "06004d000000000008004e0001000000" ++
+        "70000000170002003513776a00000000070100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d310000080003000100000006000400" ++
+        "0200000008000600040000000c000700656e69316e7032000500940000000000" ++
+        "06004d000000000008004e0002000000",
+);
+
+test "captured: a PORT_GET dump of two real netdevsim ports" {
+    try skipUnlessLittleEndian();
+    var w = capturedMessages(&cap_port_show);
+    var ports: [2]port.Port = undefined;
+    var n: usize = 0;
+    while (try w.next()) |m| : (n += 1) {
+        try testing.expectEqual(uapi.CMD.PORT_NEW, m.cmd);
+        if (n >= ports.len) return error.TestUnexpectedResult;
+        ports[n] = try port.parse(m.attrs);
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+
+    // Every field below is quoted from the `devlink port show` transcript.
+    try testing.expectEqual(@as(?u32, 0), ports[0].index);
+    try testing.expectEqual(@as(?uapi.PortType, .eth), ports[0].type);
+    try testing.expectEqualStrings("eni1np1", ports[0].netdevName());
+    try testing.expectEqual(@as(?uapi.PortFlavour, .physical), ports[0].flavour);
+    try testing.expectEqual(@as(?u32, 1), ports[0].number);
+    try testing.expectEqual(@as(?bool, false), ports[0].splittable);
+
+    try testing.expectEqual(@as(?u32, 1), ports[1].index);
+    try testing.expectEqualStrings("eni1np2", ports[1].netdevName());
+    try testing.expectEqual(@as(?u32, 2), ports[1].number);
+}
+
+// `devlink dev param show` ->
+//   name max_macs type generic
+//     values:
+//       cmode driverinit value 32
+//   name test1 type driver-specific
+//     values:
+//       cmode driverinit value true
+const cap_param_show = capturedReply(
+    "6c000000170002003513776a00000000260100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d310000380050000d0051006d61785f" ++
+        "6d61637300000000040052000500530003000000180054001400550005005700" ++
+        "010000000800560020000000" ++
+        "60000000170002003513776a00000000260100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d3100002c0050000a00510074657374" ++
+        "3100000005005300060000001400540010005500050057000100000004005600",
+);
+
+test "captured: a PARAM_GET dump with a generic u32 and a driver-specific flag" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var w = capturedMessages(&cap_param_show);
+
+    const m0 = (try w.next()) orelse return error.TestUnexpectedResult;
+    // The kernel answers a *param* dump with `PARAM_GET` (38), the same
+    // command that was asked — **not** `PARAM_NEW` (40), which is what the
+    // device and port dumps use for their replies (`NEW`, `PORT_NEW`). This
+    // asymmetry is real and was found by this capture: the assertion here
+    // originally said `PARAM_NEW` on the strength of the sibling dumps and
+    // the constructed golden, and the kernel disagreed. Nothing in this
+    // module depends on it — `client.params` parses every message in the
+    // dump rather than filtering on the reply command, which is why the
+    // asymmetry is harmless here — but it is pinned so that a future
+    // "tighten the dump loop by checking the command" change is caught by a
+    // test instead of by a user with a real NIC.
+    try testing.expectEqual(uapi.CMD.PARAM_GET, m0.cmd);
+    var p0 = try param.parse(gpa, m0.attrs);
+    defer p0.deinit(gpa);
+    try testing.expectEqualStrings("max_macs", p0.name());
+    try testing.expect(p0.generic); // the CLI printed "type generic"
+    try testing.expectEqual(@as(?uapi.ParamType, .u32_), p0.type);
+    const v0 = p0.forCmode(.driverinit) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?u64, 32), v0.value.?.asInt());
+
+    const m1 = (try w.next()) orelse return error.TestUnexpectedResult;
+    var p1 = try param.parse(gpa, m1.attrs);
+    defer p1.deinit(gpa);
+    try testing.expectEqualStrings("test1", p1.name());
+    try testing.expect(!p1.generic); // "type driver-specific"
+    try testing.expectEqual(@as(?uapi.ParamType, .flag), p1.type);
+    // A flag's value IS the presence of a zero-length PARAM_VALUE_DATA. The
+    // real kernel really does encode `true` that way — this is the shape the
+    // module's own comment claims, now confirmed against the kernel rather
+    // than against a fixture we wrote to match the comment.
+    const v1 = p1.forCmode(.driverinit) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?param.Value, .{ .flag = true }), v1.value);
+}
+
+// `devlink region show` (after `devlink region new netdevsim/netdevsim1/dummy`)
+//   -> netdevsim/netdevsim1/dummy: size 32768 snapshot [0] max 16
+const cap_region_show = capturedReply(
+    "64000000170002003513776a000000002a0100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d3100000a00580064756d6d79000000" ++
+        "0c00590000800000000000000800aa001000000010005a000c005b0008005c00" ++
+        "00000000",
+);
+
+test "captured: a REGION_GET reply for netdevsim's dummy region" {
+    try skipUnlessLittleEndian();
+    var w = capturedMessages(&cap_region_show);
+    const m = (try w.next()) orelse return error.TestUnexpectedResult;
+    // Same asymmetry as the param dump: `REGION_GET` (42), not `REGION_NEW`
+    // (44) — which is what the constructed golden above wraps its message in.
+    try testing.expectEqual(uapi.CMD.REGION_GET, m.cmd);
+    const r = try region.parseRegion(m.attrs);
+
+    try testing.expectEqualStrings("dummy", r.name());
+    try testing.expectEqual(@as(?u64, 32768), r.size);
+    try testing.expectEqualSlices(u32, &.{0}, r.snapshots());
+
+    // Structural fact only a capture could establish: the kernel sends
+    // REGION_SNAPSHOTS and REGION_SNAPSHOT **without** NLA_F_NESTED set. The
+    // constructed golden above uses `codec.nestBegin`, which also omits the
+    // bit, so the two agree — but until now that agreement was ours with
+    // ourselves. A decoder that required the bit would fail here and pass
+    // there.
+    var it: codec.AttrIterator = .{ .buf = m.attrs };
+    var checked = false;
+    while (try it.next()) |a| {
+        if (a.type != uapi.ATTR.REGION_SNAPSHOTS) continue;
+        try testing.expectEqual(a.type, a.raw_type); // no NLA_F_NESTED
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+// `devlink region read netdevsim/netdevsim1/dummy snapshot 0 address 0 length 32`
+//   -> 0000000000000000 1c cc cc f9 33 10 48 64 4e 62 e3 6a 31 02 72 b1
+//      0000000000000010 4d d2 6d a0 86 cb 82 68 25 9a 1d 08 0a b8 d1 fa
+const cap_region_read = capturedReply(
+    "78000000170006003513776a000000002e0100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d3100000a00580064756d6d79000000" ++
+        "38005d0034005e0024005f001cccccf9331048644e62e36a310272b14dd26da0" ++
+        "86cb8268259a1d080ab8d1fa0c0060000000000000000000",
+);
+
+test "captured: a REGION_READ chunk reassembles to the bytes the CLI printed" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var assembler = try region.Assembler.init(gpa, 0, 32);
+    errdefer assembler.deinit(gpa);
+    var w = capturedMessages(&cap_region_read);
+    while (try w.next()) |m| {
+        try testing.expectEqual(uapi.CMD.REGION_READ, m.cmd);
+        try assembler.feed(m.attrs);
+    }
+    var data = assembler.finish(gpa);
+    defer data.deinit(gpa);
+
+    try testing.expect(data.isComplete());
+    try testing.expectEqual(@as(u64, 0), data.address);
+    // The right-hand side is transcribed from iproute2's own hexdump of this
+    // same snapshot in this same run — an independent decoder of the same
+    // bytes, which is exactly what the constructed region test lacked.
+    try testing.expectEqualSlices(u8, &hex(
+        "1cccccf9331048644e62e36a310272b1" ++
+            "4dd26da086cb8268259a1d080ab8d1fa",
+    ), data.bytes);
+}
+
+// `devlink health show` ->
+//   reporter empty
+//     state healthy error 0 recover 0 auto_dump true
+//   reporter dummy
+//     state healthy error 0 recover 0 grace_period 0 auto_recover true auto_dump true
+const cap_health_show = capturedReply(
+    "6c000000170002003513776a00000000340100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d310000380072000a007300656d7074" ++
+        "7900000005007400000000000c00750000000000000000000c00760000000000" ++
+        "0000000005008d0001000000" ++
+        "80000000170002003513776a00000000340100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d3100004c0072000a00730064756d6d" ++
+        "7900000005007400000000000c00750000000000000000000c00760000000000" ++
+        "000000000c0078000000000000000000050079000100000005008d0001000000",
+);
+
+test "captured: a HEALTH_REPORTER_GET dump of two real reporters" {
+    try skipUnlessLittleEndian();
+    var w = capturedMessages(&cap_health_show);
+
+    const m0 = (try w.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(uapi.CMD.HEALTH_REPORTER_GET, m0.cmd);
+    const r0 = try health.parse(m0.attrs);
+    try testing.expectEqualStrings("empty", r0.name());
+    try testing.expectEqual(@as(?bool, true), r0.isHealthy());
+    try testing.expectEqual(@as(?u64, 0), r0.err_count);
+    try testing.expectEqual(@as(?u64, 0), r0.recover_count);
+    // The transcript prints no grace_period and no auto_recover for this
+    // reporter, and the bytes agree: the kernel omits the attributes rather
+    // than sending zeros. A decoder that defaulted them to 0 instead of null
+    // would look right against a constructed fixture and wrong here.
+    try testing.expectEqual(@as(?u64, null), r0.graceful_period);
+    try testing.expectEqual(@as(?bool, null), r0.auto_recover);
+
+    const m1 = (try w.next()) orelse return error.TestUnexpectedResult;
+    const r1 = try health.parse(m1.attrs);
+    try testing.expectEqualStrings("dummy", r1.name());
+    try testing.expectEqual(@as(?bool, true), r1.isHealthy());
+    try testing.expectEqual(@as(?u64, 0), r1.graceful_period);
+    try testing.expectEqual(@as(?bool, true), r1.auto_recover);
+}
+
+// `devlink dev info` ->
+//   netdevsim/netdevsim1:
+//     driver netdevsim
+//     versions:
+//         running:
+//           fw.mgmt 10.20.30
+//         stored:
+//           fw.mgmt 10.20.30
+const cap_dev_info = capturedReply(
+    "84000000170002003513776a00000000330100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d310000200066000c00670066772e6d" ++
+        "676d74000d00680031302e32302e333000000000200065000c00670066772e6d" ++
+        "676d74000d00680031302e32302e3330000000000e0062006e65746465767369" ++
+        "6d000000",
+);
+
+test "captured: an INFO_GET reply from a real driver" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var w = capturedMessages(&cap_dev_info);
+    const m = (try w.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(uapi.CMD.INFO_GET, m.cmd);
+
+    var info = try dev.parseInfo(gpa, m.attrs);
+    defer info.deinit(gpa);
+    try testing.expectEqualStrings("netdevsim", info.driverName());
+    try testing.expectEqual(@as(usize, 2), info.versions.len);
+    try testing.expectEqualStrings("10.20.30", info.find(.running, "fw.mgmt").?.value());
+    try testing.expectEqualStrings("10.20.30", info.find(.stored, "fw.mgmt").?.value());
+    // Running == stored, so there is nothing pending. The constructed golden
+    // only ever exercised the "pending" side of this predicate.
+    try testing.expect(!info.hasPendingUpdate());
+
+    // Ordering fact the constructed golden had backwards: the kernel sends
+    // INFO_DRIVER_NAME **after** the version nests, not before. Nothing in
+    // netlink requires an order, and this module does not depend on one — but
+    // a decoder that stopped at the first unknown attribute, or that assumed
+    // the driver name came first, would have passed every constructed test.
+    var it: codec.AttrIterator = .{ .buf = m.attrs };
+    var saw_version = false;
+    var driver_after_versions = false;
+    while (try it.next()) |a| {
+        if (a.type == uapi.ATTR.INFO_VERSION_RUNNING or a.type == uapi.ATTR.INFO_VERSION_STORED)
+            saw_version = true;
+        if (a.type == uapi.ATTR.INFO_DRIVER_NAME and saw_version) driver_after_versions = true;
+    }
+    try testing.expect(driver_after_versions);
+}
+
+// `devlink resource show netdevsim/netdevsim1` ->
+//   name IPv4 size unlimited unit entry size_min 0 size_max unlimited size_gran 1
+//     resources:
+//       name fib       size unlimited occ 9 unit entry …
+//       name fib-rules size unlimited occ 3 unit entry …
+//   name IPv6 …
+//     resources:
+//       name fib       … occ 9
+//       name fib-rules … occ 2
+//   name nexthops … occ 1
+const cap_resource_dump = capturedReply(
+    "dc02000017000200eb13776a00000000240100000e0001006e65746465767369" ++
+        "6d0000000f0002006e657464657673696d310000a8023f002001400009004100" ++
+        "49507634000000000c004300ffffffffffffffff0c0042000100000000000000" ++
+        "0c00480001000000000000000c004700ffffffffffffffff0c00460000000000" ++
+        "0000000005004900000000000500450001000000c4003f005c00400008004100" ++
+        "666962000c004300ffffffffffffffff0c00420002000000000000000c004a00" ++
+        "09000000000000000c00480001000000000000000c004700ffffffffffffffff" ++
+        "0c00460000000000000000000500490000000000640040000e0041006669622d" ++
+        "72756c65730000000c004300ffffffffffffffff0c0042000300000000000000" ++
+        "0c004a0003000000000000000c00480001000000000000000c004700ffffffff" ++
+        "ffffffff0c004600000000000000000005004900000000002001400009004100" ++
+        "49507636000000000c004300ffffffffffffffff0c0042000400000000000000" ++
+        "0c00480001000000000000000c004700ffffffffffffffff0c00460000000000" ++
+        "0000000005004900000000000500450001000000c4003f005c00400008004100" ++
+        "666962000c004300ffffffffffffffff0c00420005000000000000000c004a00" ++
+        "09000000000000000c00480001000000000000000c004700ffffffffffffffff" ++
+        "0c00460000000000000000000500490000000000640040000e0041006669622d" ++
+        "72756c65730000000c004300ffffffffffffffff0c0042000600000000000000" ++
+        "0c004a0002000000000000000c00480001000000000000000c004700ffffffff" ++
+        "ffffffff0c00460000000000000000000500490000000000640040000d004100" ++
+        "6e657874686f7073000000000c004300ffffffffffffffff0c00420007000000" ++
+        "000000000c004a0001000000000000000c00480001000000000000000c004700" ++
+        "ffffffffffffffff0c00460000000000000000000500490000000000",
+);
+
+test "captured: a real recursive RESOURCE_DUMP from netdevsim" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var w = capturedMessages(&cap_resource_dump);
+    const m = (try w.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(uapi.CMD.RESOURCE_DUMP, m.cmd);
+
+    var rs = try resource.parse(gpa, m.attrs);
+    defer rs.deinit(gpa);
+
+    // Three roots, each field below read off the `devlink resource show`
+    // transcript rather than off our own encoder.
+    try testing.expectEqual(@as(usize, 3), rs.roots.len);
+    try testing.expectEqualStrings("IPv4", rs.roots[0].name());
+    try testing.expectEqualStrings("IPv6", rs.roots[1].name());
+    try testing.expectEqualStrings("nexthops", rs.roots[2].name());
+
+    // "size unlimited" is how iproute2 renders the u64 all-ones sentinel.
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), rs.roots[0].size);
+    try testing.expectEqual(@as(?uapi.ResourceUnit, .entry), rs.roots[0].unit);
+    try testing.expectEqual(@as(?u64, 0), rs.roots[0].size_min);
+    try testing.expectEqual(@as(?u64, 1), rs.roots[0].size_gran);
+
+    // The recursion is real: two levels, and the occupancies differ between
+    // the IPv4 and IPv6 subtrees, so a decoder that collapsed the tree or
+    // reused one child for both roots would be caught.
+    try testing.expectEqual(@as(usize, 2), rs.roots[0].children.len);
+    try testing.expectEqualStrings("fib", rs.roots[0].children[0].name());
+    try testing.expectEqualStrings("fib-rules", rs.roots[0].children[1].name());
+    try testing.expectEqual(@as(?u64, 9), rs.roots[0].children[0].occ);
+    try testing.expectEqual(@as(?u64, 3), rs.roots[0].children[1].occ);
+    try testing.expectEqual(@as(?u64, 9), rs.roots[1].children[0].occ);
+    try testing.expectEqual(@as(?u64, 2), rs.roots[1].children[1].occ);
+    try testing.expectEqual(@as(?u64, 1), rs.roots[2].occ);
+    try testing.expectEqual(@as(usize, 7), rs.count());
+
+    // The root nodes carry SIZE_VALID and the leaves do not — an asymmetry no
+    // hand-written fixture would have invented.
+    try testing.expectEqual(@as(?bool, true), rs.roots[0].size_valid);
+    try testing.expectEqual(@as(?bool, null), rs.roots[0].children[0].size_valid);
 }

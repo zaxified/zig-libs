@@ -35,28 +35,25 @@
 //!
 //! `iw connect` supports only open and **WEP** networks — it has no WPA mode,
 //! because on ordinary mac80211 hardware WPA needs a userspace supplicant (see
-//! `connect.zig`'s header). So the WPA2 attributes (`WPA_VERSIONS`,
-//! `CIPHER_SUITES_PAIRWISE`, `CIPHER_SUITE_GROUP`, `AKM_SUITES`, `PMK`,
-//! `USE_MFP`, `WANT_1X_4WAY_HS`) have **no `iw` golden**; they are derived
-//! from `linux/nl80211.h` and covered by the round-trip tests in
-//! `connect.zig`. Everything else below came off the wire.
+//! `connect.zig`'s header). So the WPA2 attributes have **no `iw` golden**.
 //!
-//! **UNANCHORED (wave-2 F7, 2026-08-08):** a real `wpa_supplicant` WPA2-PSK
-//! `CONNECT` capture (the fix this finding names — `strace` the same way
-//! the three goldens above it were captured) was attempted and found
-//! impractical in this environment: no root/`CAP_NET_ADMIN` to bring up
-//! `mac80211_hwsim` (`modprobe` refused: "Operation not permitted"), and the
-//! one real WPA2-associated interface on this host is live infrastructure a
-//! test run must not touch. What *is* verified: `scripts/check-uapi-consts.py
-//! nl80211` (the standing check `nl80211` F3 added) diffs every constant in
-//! `uapi.zig`, WPA attributes included, against this host's
-//! `/usr/include/linux/nl80211.h` on every run — `WPA_VERSIONS`=75,
-//! `CIPHER_SUITES_PAIRWISE`=73, `CIPHER_SUITE_GROUP`=74, `AKM_SUITES`=76,
-//! `PREV_BSSID`=79, `SOCKET_OWNER`=204, `PMK`=254, `WANT_1X_4WAY_HS`=257,
-//! `USE_MFP`=66 all currently MATCHED. So the attribute *numbers* are
-//! standing-checked; what remains unverified is the *set, order and payload
-//! shape* of a real WPA2-PSK `CONNECT` message — genuinely different from
-//! "nothing was checked."
+//! **Five of them are now anchored anyway (wave-2 F7, 2026-08-08):** the fix
+//! this finding named was captured from a real `wpa_supplicant` after all, by
+//! going where the privilege legitimately exists — the VM lane at
+//! `scripts/vm/`. `mac80211_hwsim` gives the guest two fully simulated radios,
+//! `hostapd` runs a WPA2-PSK AP on one and `wpa_supplicant` associates on the
+//! other, and the resulting `NL80211_CMD_CONNECT` is frozen below as
+//! `wpa2_connect_capture`. It anchors `WPA_VERSIONS`,
+//! `CIPHER_SUITES_PAIRWISE`, `CIPHER_SUITE_GROUP`, `AKM_SUITES` and
+//! `SOCKET_OWNER` — and with them `CIPHER.CCMP` and `AKM.PSK`, two suite
+//! selectors no header on this host declares.
+//!
+//! `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS` and `PREV_BSSID` stay round-trip-only:
+//! a PSK association through cfg80211's own SME sends none of them, which the
+//! test asserts rather than assumes. Their attribute *numbers* are
+//! standing-checked by `scripts/check-uapi-consts.py nl80211` against this
+//! host's `/usr/include/linux/nl80211.h` on every run (`PMK`=254,
+//! `USE_MFP`=66, `WANT_1X_4WAY_HS`=257, `PREV_BSSID`=79).
 //!
 //! ## How the reply goldens were captured
 //!
@@ -386,6 +383,227 @@ test "golden: CONNECT with a WEP key (the nested ATTR_KEYS shape)" {
     });
     defer testing.allocator.free(req);
     try expectSameRequest(&captured, req);
+}
+
+// ── captured request: a real WPA2-PSK CONNECT (wave-2 F7) ──────────────────
+//
+// `iw` cannot produce this message — it has no WPA mode — so until now the
+// WPA half of `buildConnect` was self-consistency only. This capture is the
+// external counterpart, taken from **wpa_supplicant 2.11 associating for real
+// to a real hostapd AP**, both driven by the kernel's own fully simulated
+// radio, entirely inside the repo's privileged VM lane (`scripts/vm/`). No
+// host radio and no host privilege were involved.
+//
+// How to reproduce it, in the guest, as real root:
+//
+// ```sh
+// modprobe mac80211_hwsim radios=2        # -> phy0/wlan0 and phy1/wlan1
+// hostapd -B -t -f /tmp/hostapd.log /tmp/hostapd.conf
+// #   interface=wlan0 driver=nl80211 ssid=ziglibs-anchor hw_mode=g channel=1
+// #   wpa=2 wpa_passphrase=ziglibsanchor wpa_key_mgmt=WPA-PSK rsn_pairwise=CCMP
+// strace -f -e trace=sendmsg -e write=all -xx -s 8192 -e abbrev=none \
+//     -o /tmp/st.log \
+//     wpa_supplicant -i wlan1 -c /tmp/wpa.conf -D nl80211 -d
+// #   /tmp/wpa.conf carries driver_param=force_connect_cmd=1 and a
+// #   proto=RSN / key_mgmt=WPA-PSK / pairwise=CCMP / group=CCMP network block
+// ```
+//
+// `force_connect_cmd=1` is the load-bearing line. On a mac80211 driver
+// wpa_supplicant runs its own SME and would emit `AUTHENTICATE` +
+// `ASSOCIATE`; that driver parameter clears its `WPA_DRIVER_FLAGS_SME` and
+// makes it take the `NL80211_CMD_CONNECT` path this module implements —
+// which cfg80211 then services with its in-kernel SME. The run really did
+// associate: `wpa_cli status` reported `wpa_state=COMPLETED`,
+// `key_mgmt=WPA2-PSK`, `pairwise_cipher=CCMP`, `group_cipher=CCMP`, and the
+// supplicant log shows `nl80211: Connect (ifindex=4)` followed by
+// `WPA: Key negotiation completed … [PTK=CCMP GTK=CCMP]`.
+//
+// Exactly one `CONNECT` appeared in the whole 147-message capture; these are
+// its 320 bytes verbatim, in wpa_supplicant's own attribute order (which is
+// **not** this module's — see the test). The family id that boot was 35, not
+// the 41 the `iw` captures used, which is the point `client.zig` resolves it
+// at runtime. Nothing was anonymised: the addresses are mac80211_hwsim's
+// fixed 02:00:00:00:00:0x, the SSID and passphrase were made up for the run,
+// and `nlmsg_pid` is the guest supplicant's ephemeral port id.
+const wpa2_connect_fam: u16 = 35;
+const wpa2_connect_seq: u32 = 1_786_187_557;
+const wpa2_connect_ifindex: u32 = 4;
+const wpa2_connect_bssid: uapi.Mac = .{ 0x02, 0, 0, 0, 0, 0 };
+const wpa2_connect_capture = hex(
+    "4001000023000500250f776a91020086" ++ // len=320 type=35 flags=REQ|ACK
+        "2e000000" ++ // cmd 46 = CONNECT, version 0
+        "0800030004000000" ++ // IFINDEX = 4
+        "0400cc00" ++ // SOCKET_OWNER (flag)
+        "0a0006000200000000000000" ++ // MAC = 02:00:00:00:00:00
+        "0a00c8000200000000000000" ++ // MAC_HINT (200) — not modelled here
+        "080026006c090000" ++ // WIPHY_FREQ = 2412
+        "0800c9006c090000" ++ // WIPHY_FREQ_HINT (201) — not modelled here
+        "120034007a69676c6962732d616e63686f720000" ++ // SSID, not NUL-terminated
+        "3e002a00" ++ // IE (42), 58 bytes: RSN IE ‖ extended capabilities
+        "30140100000fac040100000fac040100000fac0200007f0b04004a0201404040" ++
+        "0001203b155151525354737475767778797a7b7c7d7e7f8081820000" ++
+        "08004b0002000000" ++ // WPA_VERSIONS = 2
+        "0800490004ac0f00" ++ // CIPHER_SUITES_PAIRWISE = 00-0F-AC:4
+        "08004a0004ac0f00" ++ // CIPHER_SUITE_GROUP = 00-0F-AC:4
+        "08004c0002ac0f00" ++ // AKM_SUITES = 00-0F-AC:2
+        "04004400" ++ // CONTROL_PORT (68, flag)
+        "1e001f0063000000000000000000000000000000000000000000000000000000" ++ // HT_CAPABILITY
+        "1e00940063000000000000000000000000000000000000000000000000000000" ++ // HT_CAPABILITY_MASK
+        "10009d00000000000000000000000000" ++ // VHT_CAPABILITY
+        "1000b000000000000000000000000000" ++ // VHT_CAPABILITY_MASK
+        "0800350000000000" ++ // AUTH_TYPE = 0 (open system)
+        "04004600" ++ // PRIVACY (flag)
+        "04000801" ++ // CONTROL_PORT_OVER_NL80211 (264, flag)
+        "0400cc00" ++ // SOCKET_OWNER again — see the quirk note in the test
+        "060066008e880000" ++ // CONTROL_PORT_ETHERTYPE (102) = 0x888e (EAPOL)
+        "04001e01", // CONTROL_PORT_NO_PREAUTH (286, flag)
+);
+
+/// The whole aligned-out TLV of the *first* attribute of type `want`, header
+/// included, or null. Deliberately returns the header too: an anchor that
+/// compared only payloads would not notice a changed attribute number or a
+/// changed length encoding, which is half of what this capture is for.
+fn attrTlv(msg: []const u8, want: u16) ?[]const u8 {
+    var off: usize = codec.header_len + genl.header_len;
+    while (off + 4 <= msg.len) {
+        const alen: usize = std.mem.readInt(u16, msg[off..][0..2], native_endian);
+        const raw = std.mem.readInt(u16, msg[off..][2..4], native_endian);
+        if (alen < 4 or off + alen > msg.len) return null;
+        if (raw & codec.NLA_TYPE_MASK == want) return msg[off .. off + alen];
+        off += @min(codec.alignUp(alen), msg.len - off);
+    }
+    return null;
+}
+
+/// Ordinal position of the first attribute of type `want` (0-based), or null.
+fn attrPos(msg: []const u8, want: u16) ?usize {
+    var off: usize = codec.header_len + genl.header_len;
+    var i: usize = 0;
+    while (off + 4 <= msg.len) : (i += 1) {
+        const alen: usize = std.mem.readInt(u16, msg[off..][0..2], native_endian);
+        const raw = std.mem.readInt(u16, msg[off..][2..4], native_endian);
+        if (alen < 4 or off + alen > msg.len) return null;
+        if (raw & codec.NLA_TYPE_MASK == want) return i;
+        off += @min(codec.alignUp(alen), msg.len - off);
+    }
+    return null;
+}
+
+test "golden: a real wpa_supplicant WPA2-PSK CONNECT, attribute for attribute" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const cap: []const u8 = &wpa2_connect_capture;
+
+    // Message level: this really is a CONNECT request, and the family id is
+    // whatever that boot assigned.
+    try testing.expectEqual(@as(usize, 320), cap.len);
+    try testing.expectEqual(@as(u32, 320), std.mem.readInt(u32, cap[0..4], native_endian));
+    try testing.expectEqual(wpa2_connect_fam, std.mem.readInt(u16, cap[4..6], native_endian));
+    try testing.expectEqual(
+        @as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK),
+        std.mem.readInt(u16, cap[6..8], native_endian),
+    );
+    const split = try genl.splitPayload(cap[codec.header_len..]);
+    try testing.expectEqual(uapi.CMD.CONNECT, split.cmd);
+
+    // The same association, built by this module. No PMK and no MFP policy:
+    // hwsim offers no 4-way-handshake offload, so the supplicant ran the
+    // handshake itself and sent neither attribute (asserted below).
+    const ours = try connect.buildConnect(gpa, wpa2_connect_fam, wpa2_connect_seq, .{
+        .ifindex = wpa2_connect_ifindex,
+        .ssid = "ziglibs-anchor",
+        .bssid = wpa2_connect_bssid,
+        .freq_mhz = 2412,
+        .auth_type = .open_system,
+        .privacy = true,
+        .wpa_versions = uapi.WPA_VERSION.@"2",
+        .ciphers_pairwise = &.{uapi.CIPHER.CCMP},
+        .cipher_group = uapi.CIPHER.CCMP,
+        .akm_suites = &.{uapi.AKM.PSK},
+        .socket_owner = true,
+    });
+    defer gpa.free(ours);
+
+    // Every attribute both sides emit must agree byte for byte: the attribute
+    // number, the length, the payload width and the value. Four of these —
+    // WPA_VERSIONS, CIPHER_SUITES_PAIRWISE, CIPHER_SUITE_GROUP, AKM_SUITES —
+    // had no external evidence of any kind before this capture, and two of
+    // them additionally pin a suite selector (`CIPHER.CCMP` = 00-0F-AC:4,
+    // `AKM.PSK` = 00-0F-AC:2) that no header on the capture host declares.
+    const shared = [_]struct { t: u16, what: []const u8 }{
+        .{ .t = uapi.ATTR.IFINDEX, .what = "IFINDEX" },
+        .{ .t = uapi.ATTR.MAC, .what = "MAC" },
+        .{ .t = uapi.ATTR.SSID, .what = "SSID" },
+        .{ .t = uapi.ATTR.WIPHY_FREQ, .what = "WIPHY_FREQ" },
+        .{ .t = uapi.ATTR.AUTH_TYPE, .what = "AUTH_TYPE" },
+        .{ .t = uapi.ATTR.PRIVACY, .what = "PRIVACY" },
+        .{ .t = uapi.ATTR.WPA_VERSIONS, .what = "WPA_VERSIONS" },
+        .{ .t = uapi.ATTR.CIPHER_SUITES_PAIRWISE, .what = "CIPHER_SUITES_PAIRWISE" },
+        .{ .t = uapi.ATTR.CIPHER_SUITE_GROUP, .what = "CIPHER_SUITE_GROUP" },
+        .{ .t = uapi.ATTR.AKM_SUITES, .what = "AKM_SUITES" },
+        .{ .t = uapi.ATTR.SOCKET_OWNER, .what = "SOCKET_OWNER" },
+    };
+    for (shared) |c| {
+        const theirs = attrTlv(cap, c.t) orelse {
+            std.debug.print("wpa_supplicant's CONNECT has no {s}\n", .{c.what});
+            return error.TestUnexpectedResult;
+        };
+        const mine = attrTlv(ours, c.t) orelse {
+            std.debug.print("this module's CONNECT has no {s}\n", .{c.what});
+            return error.TestUnexpectedResult;
+        };
+        testing.expectEqualSlices(u8, theirs, mine) catch |e| {
+            std.debug.print("attribute {s} ({d}) differs from the capture\n", .{ c.what, c.t });
+            return e;
+        };
+    }
+
+    // Order: the two encoders disagree on the message-wide order (ours
+    // follows `iw`'s, and netlink does not care), but the four security
+    // attributes appear in the same relative order in both — recorded so a
+    // future reshuffle is a deliberate act rather than a silent one.
+    const sec = [_]u16{
+        uapi.ATTR.WPA_VERSIONS,
+        uapi.ATTR.CIPHER_SUITES_PAIRWISE,
+        uapi.ATTR.CIPHER_SUITE_GROUP,
+        uapi.ATTR.AKM_SUITES,
+    };
+    for (sec[0 .. sec.len - 1], sec[1..]) |a, b| {
+        try testing.expect(attrPos(cap, a).? < attrPos(cap, b).?);
+        try testing.expect(attrPos(ours, a).? < attrPos(ours, b).?);
+    }
+    // …but the message-wide orders really are different: the supplicant puts
+    // SSID after MAC, this module puts it before. Pinned so the claim in
+    // `buildConnect`'s doc comment ("attribute order matches `iw`'s") stays
+    // honest rather than quietly drifting toward the supplicant's.
+    try testing.expect(attrPos(cap, uapi.ATTR.SSID).? > attrPos(cap, uapi.ATTR.MAC).?);
+    try testing.expect(attrPos(ours, uapi.ATTR.SSID).? < attrPos(ours, uapi.ATTR.MAC).?);
+
+    // What this capture does NOT anchor, asserted rather than asserted-about:
+    // a PSK association through cfg80211's own SME sends none of these, so
+    // `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS` and `PREV_BSSID` remain covered by
+    // round-trip only. Their attribute numbers are standing-checked by
+    // `scripts/check-uapi-consts.py nl80211`.
+    for ([_]u16{
+        uapi.ATTR.PMK,
+        uapi.ATTR.USE_MFP,
+        uapi.ATTR.WANT_1X_4WAY_HS,
+        uapi.ATTR.PREV_BSSID,
+    }) |t| try testing.expect(attrTlv(cap, t) == null);
+
+    // Two facts about the real message worth keeping, neither of which this
+    // module emits: the supplicant sends SOCKET_OWNER **twice** (netlink
+    // policy takes the last occurrence, so the kernel is unaffected — the
+    // same shape as iproute2's duplicated `health recover` attributes), and
+    // it opens a userspace control port for EAPOL over nl80211.
+    var seen_socket_owner: usize = 0;
+    var it: codec.AttrIterator = .{ .buf = split.attrs };
+    while (try it.next()) |a| {
+        if (a.type == uapi.ATTR.SOCKET_OWNER) seen_socket_owner += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen_socket_owner);
+    const ethertype = attrTlv(cap, 102) orelse return error.TestUnexpectedResult; // CONTROL_PORT_ETHERTYPE
+    try testing.expectEqual(@as(u16, 0x888e), std.mem.readInt(u16, ethertype[4..6], native_endian));
 }
 
 test "golden: DISCONNECT" {

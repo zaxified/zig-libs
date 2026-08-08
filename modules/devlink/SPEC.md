@@ -246,21 +246,42 @@ Two iproute2 quirks are pinned rather than normalised:
 - an `NLMSG_ERROR` carrying `-ENODEV`;
 - an `NLMSG_ERROR` carrying `-EPERM` (from the privileged `ESWITCH_GET`).
 
-**UAPI-derived, explicitly not captured** — every object reply: the device
-dump, the port dump (physical port + two VF representors), the parameter reply
-with all three cmodes, the recursive mlxsw-shaped resource tree, the region
-reply with snapshots, the chunked three-message `REGION_READ`, the health
-reporter dump and the `INFO_GET` reply. They are built at whole-message level
-and walked through `codec.MessageIterator` + `genl.splitPayload`, so the
-plumbing between socket and parser is exercised too — but they are the module's
-reading of the UAPI, not a driver's output, and are labelled as such in the
-file.
+**Captured from a real device (2026-08-08, wave-2 F1)** — all eight object
+replies: the device reply, the two-port dump, the parameter dump (a generic
+`u32` and a driver-specific flag), the recursive resource tree, the region
+reply with a snapshot, the `REGION_READ` chunk, the health-reporter dump and
+the `INFO_GET` reply. They came from a live `netdevsim` instance running as
+real root inside the repo's VM lane, and iproute2 6.19.0's own `devlink`
+decoded the same replies in the same run — its transcript is quoted at each
+test and is the oracle the assertions are read from.
 
-**Why:** the capture machine has an Intel e1000e and an Intel Wi-Fi 8265.
-Neither registers a devlink instance. `netdevsim`, the kernel's own devlink
-simulator, needs real root to instantiate (`/sys/bus/netdevsim/new_device` is
-root-owned and not namespaced; module autoload from a user namespace loads the
-module but does not grant the write). See §6 for how to close this gap.
+`netdevsim.ko` is shipped by no Debian and no OpenWRT package (Debian does not
+set `CONFIG_NETDEVSIM` in either its cloud or its generic kernel), so it was
+built from the kernel's own sources out of tree against the guest's kernel
+headers, inside a throwaway `-snapshot` guest. Full recipe in
+`src/goldens.zig`'s "captured replies" header. Nothing in the committed tests
+needs a VM, a kernel module or any privilege to run.
+
+**Still UAPI-derived, and kept for exactly that reason:** the constructed
+replies covering shapes `netdevsim` does not have — VF representor ports, a
+parameter with all three cmodes, a tripped health reporter, a pending firmware
+update, a multi-message chunked `REGION_READ` arriving out of order. Those are
+labelled as constructed in the file and were not removed when the captures
+landed.
+
+**What the captures found.** Two structural facts that had been asserted only
+against ourselves turned out to be different from what the constructed goldens
+assumed, and both are now pinned:
+
+1. A **param** dump is answered with `DEVLINK_CMD_PARAM_GET` (38), and a
+   **region** dump with `REGION_GET` (42) — *not* with `PARAM_NEW` (40) /
+   `REGION_NEW` (44), which is the pattern the device and port dumps follow
+   (`NEW`, `PORT_NEW`) and which the constructed goldens used. Harmless today,
+   because `client.params`/`regions` parse every message in the dump rather
+   than filtering on the reply command — but a future "tighten the dump loop by
+   checking the command" change would have silently returned nothing on real
+   hardware.
+2. `INFO_DRIVER_NAME` arrives **after** the version nests, not before.
 
 ### 4.3 Anonymisation
 
@@ -328,16 +349,14 @@ design decision here.
 
 ## 6. Backlog
 
-1. **Verify against `netdevsim`.** The one thing this module has not had: a
-   real devlink device. `sudo modprobe netdevsim; echo "1 2" | sudo tee
-   /sys/bus/netdevsim/new_device` yields an instance with ports, parameters
-   (`max_macs`, `test1`), resources (`IPv4/fib`, nested), regions
-   (`dummy`, snapshot-capable) and health reporters (`dummy`, with a
-   `HEALTH_REPORTER_TEST` that trips it on demand) — i.e. it exercises **every**
-   decoder here, including the recursive and chunked ones, and would turn the
-   §4.2 UAPI-derived replies into real captures. Needs root on the test host.
-2. **`PARAM_SET` request golden.** Blocked by the same thing: iproute2 will not
-   emit one without a device (§4.1 quirk 1). `netdevsim` closes it.
+1. ~~**Verify against `netdevsim`.**~~ **DONE 2026-08-08** — see §4.2. All
+   eight object replies are now real captures from a live `netdevsim` in the
+   VM lane. What is *not* yet captured from it: a **tripped** health reporter
+   (`HEALTH_REPORTER_TEST` trips `dummy` on demand) and a notification on the
+   `config` group; both are reachable with the same recipe.
+2. **`PARAM_SET` request golden.** iproute2 will not emit one without a device
+   (§4.1 quirk 1), and `netdevsim` now supplies one — reachable with the same
+   recipe, in the same guest, and no longer blocked.
 3. **A notification golden.** Same: `devlink monitor` prints, and nothing on
    this machine ever emits on the `config` group.
 4. **Port functions**, then **rate objects** — the two deferred items with the

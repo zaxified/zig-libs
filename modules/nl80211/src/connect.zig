@@ -39,10 +39,15 @@
 //! The `CONNECT` (SSID / frequency / privacy / WEP `KEYS` nest) and
 //! `DISCONNECT` attribute layouts here were verified byte-for-byte against
 //! requests captured from `iw` (see `goldens.zig`). `iw` has no WPA2 mode, so
-//! the WPA-specific attributes — `WPA_VERSIONS`, `CIPHER_SUITES_PAIRWISE`,
-//! `CIPHER_SUITE_GROUP`, `AKM_SUITES`, `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS` —
-//! are **derived from the UAPI header**, not from a capture, and are covered
-//! only by round-trip tests. That gap is stated again in SPEC.md.
+//! the WPA-specific attributes needed a different counterpart: a real
+//! `wpa_supplicant` associating WPA2-PSK to a real `hostapd` over
+//! `mac80211_hwsim`, captured in the VM lane. That capture anchors
+//! `WPA_VERSIONS`, `CIPHER_SUITES_PAIRWISE`, `CIPHER_SUITE_GROUP`,
+//! `AKM_SUITES` and `SOCKET_OWNER` (`goldens.zig`, `wpa2_connect_capture`).
+//! `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS` and `PREV_BSSID` are still **derived
+//! from the UAPI header**, not from a capture, and are covered only by
+//! round-trip tests — a PSK association through cfg80211's own SME emits none
+//! of them. That remaining gap is stated again in SPEC.md.
 
 const std = @import("std");
 const netlink = @import("netlink");

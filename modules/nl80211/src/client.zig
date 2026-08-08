@@ -78,6 +78,19 @@ pub const RequestError = error{
     Busy,
     /// Not connected (e.g. `DISCONNECT` on an idle interface).
     NotConnected,
+    /// The interface exists but is administratively down (`ENETDOWN`), so the
+    /// command cannot reach the radio. Distinct from `NoSuchDevice` (there is
+    /// a device) and from `NotConnected` (that is about association state, not
+    /// link state).
+    ///
+    /// Found by running this module's own live tests as real root against a
+    /// real radio in the VM lane (`scripts/vm/run.sh nl80211 debian`), which
+    /// is the first time the `TRIGGER_SCAN` test had the CAP_NET_ADMIN to get
+    /// this far: the kernel answered `-100` and `errnoToError` had no case for
+    /// it, so the single most ordinary failure of a scan — "the interface is
+    /// down" — surfaced as `error.Unexpected`. Nothing could have caught that
+    /// on an unprivileged host, because the only test that reaches it skipped.
+    NetworkDown,
     SystemResources,
     Unexpected,
     /// **W2 audit finding, campaign C-06 (`nl80211` F5)**: `Dump.next`/
@@ -109,6 +122,9 @@ pub fn errnoToError(code: i32) RequestError {
         @intFromEnum(linux.E.BUSY), @intFromEnum(linux.E.AGAIN) => error.Busy,
         @intFromEnum(linux.E.NOTCONN), @intFromEnum(linux.E.ALREADY) => error.NotConnected,
         @intFromEnum(linux.E.NOBUFS), @intFromEnum(linux.E.NOMEM) => error.SystemResources,
+        // Measured, not assumed: `TRIGGER_SCAN` on an administratively-down
+        // interface answers `-100` (ENETDOWN). See `NetworkDown`.
+        @intFromEnum(linux.E.NETDOWN) => error.NetworkDown,
         else => error.Unexpected,
     };
 }

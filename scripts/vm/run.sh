@@ -104,6 +104,42 @@ route_platform() {
 
 [[ -z "$PLATFORM" ]] && PLATFORM="$(route_platform "$MODULE")"
 
+# ── guest-side setup ─────────────────────────────────────────────────────
+# A few modules' live tests need a device that only exists once a kernel
+# module has been loaded as real root — which is the whole reason this lane
+# exists. Kept as a table here, beside the routing table, rather than as an
+# env var, so `run.sh <module>` stays reproducible from the module name alone.
+#
+#   nl80211 -> mac80211_hwsim, the kernel's fully simulated 802.11 radio.
+#              Verified present in Debian's stock cloud kernel (see
+#              manifest.sh). Two radios, so an AP and a STA can coexist on
+#              the one simulated medium. Without this the module's eight live
+#              tests skip on a headless guest exactly as they do on a host
+#              with no wireless card.
+#
+#              The interfaces are brought UP as part of the setup, and that
+#              is not cosmetic: hwsim registers them down, and TRIGGER_SCAN
+#              on a down interface fails with ENETDOWN, so leaving them down
+#              buys a skip where the point of this lane is to actually run
+#              the privileged path. (That ENETDOWN is how the unmapped-errno
+#              defect in client.errnoToError was found in the first place.)
+#
+# NOT here, deliberately: devlink/netdevsim. netdevsim.ko is shipped by no
+# Debian and no OpenWRT package — see manifest.sh's "what this image CANNOT
+# provide" note rather than re-deriving it.
+guest_setup() {
+    case "$1" in
+        nl80211)
+            printf '%s' \
+                'modprobe mac80211_hwsim radios=2 && ip link set wlan0 up && ' \
+                'ip link set wlan1 up && echo SETUP_OK || echo SETUP_FAIL; '
+            ;;
+        *) printf '' ;;
+    esac
+}
+SETUP="$(guest_setup "$MODULE")"
+[[ -n "$SETUP" ]] && echo "vm: guest setup: ${SETUP%; }"
+
 case "$PLATFORM" in
     openwrt) TARGET_TRIPLE="x86_64-linux-musl" ;;
     debian) TARGET_TRIPLE="x86_64-linux-gnu" ;;
@@ -274,12 +310,12 @@ VMLOG="$WORK_DIR/${MODULE}-${PLATFORM}-vm.log"
 t0=$(date +%s)
 case "$PLATFORM" in
     openwrt)
-        RUNCMD="(tftp -g -r $BIN_NAME -l /tmp/$BIN_NAME 10.0.2.2 && echo TFTP_OK) || echo TFTP_FAIL; if \[ ! -s /tmp/$BIN_NAME \]; then wget http://10.0.2.2:$HTTP_PORT/$BIN_NAME -O /tmp/$BIN_NAME >/dev/null 2>&1 && echo WGET_OK || echo WGET_FAIL; fi; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; echo GUEST_EXIT=\$?"
+        RUNCMD="$SETUP(tftp -g -r $BIN_NAME -l /tmp/$BIN_NAME 10.0.2.2 && echo TFTP_OK) || echo TFTP_FAIL; if \[ ! -s /tmp/$BIN_NAME \]; then wget http://10.0.2.2:$HTTP_PORT/$BIN_NAME -O /tmp/$BIN_NAME >/dev/null 2>&1 && echo WGET_OK || echo WGET_FAIL; fi; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; echo GUEST_EXIT=\$?"
         expect "$SCRIPT_DIR/boot-openwrt.exp" "$IMG" 256 "$RUNCMD" >"$VMLOG" 2>&1
         ;;
     debian)
         HASH='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'  # throwaway VM-only password "zigvm" — ephemeral -snapshot guest, no host port exposed
-        RUNCMD="curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; echo GUEST_EXIT=\$?"
+        RUNCMD="${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; echo GUEST_EXIT=\$?"
         expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" 512 "$RUNCMD" >"$VMLOG" 2>&1
         ;;
 esac
@@ -293,6 +329,16 @@ echo "vm: wall time $((t1 - t0))s (full log: $VMLOG)"
 
 if ! echo "$GUEST_OUT" | grep -q "FETCH_OK\|TFTP_OK\|WGET_OK"; then
     echo "run.sh: FAIL — binary transfer into the guest never succeeded" >&2
+    exit 1
+fi
+
+# A failed setup must not be allowed to look like a pass. Without the device
+# the module's live tests skip, and a suite that skips everything still exits
+# 0 — the exact "silent skip reads as success" failure this lane exists to
+# avoid.
+if [[ -n "$SETUP" ]] && ! echo "$GUEST_OUT" | grep -q "SETUP_OK"; then
+    echo "run.sh: FAIL — guest setup for '$MODULE' did not report SETUP_OK" >&2
+    echo "        (the live tests would have skipped and the run would have looked green)" >&2
     exit 1
 fi
 

@@ -361,6 +361,12 @@ test "live (root): trigger a scan and wait for its completion event" {
         error.AccessDenied => return skip("TRIGGER_SCAN (needs CAP_NET_ADMIN)"),
         error.Busy => return skip("TRIGGER_SCAN (a scan is already running)"),
         error.NotSupported, error.NoSuchDevice => return skip("TRIGGER_SCAN on this device"),
+        // A radio nobody has brought up cannot scan. This arm only became
+        // reachable once the test was first run with real CAP_NET_ADMIN (the
+        // VM lane); before that it always stopped at the AccessDenied arm
+        // above, which is why `ENETDOWN` had gone unmapped — see
+        // `client.RequestError.NetworkDown`.
+        error.NetworkDown => return skip("TRIGGER_SCAN (the interface is down)"),
         else => return e,
     };
 
