@@ -137,6 +137,51 @@ fn requireGrpcio(io: std.Io, python: []const u8) error{SkipZigTest}!void {
 
 const script = @embedFile("testdata/reference_server.py");
 
+/// F1: how long a single `Fixture`'s lifetime (`start` → `deinit`) may run
+/// before the watchdog below assumes the forward direction has hung and
+/// kills the whole test process. The reverse direction already has this —
+/// `testdata/reference_client.py` carries a per-call deadline plus its own
+/// 90 s `threading.Timer` backstop — but `Fixture` opened an h2c session
+/// with no read deadline at all, so a framing regression here didn't fail,
+/// it hung: the fault-injected little-endian length-prefix flip (this
+/// file's own doc comment, and F1's evidence) ran **10 minutes** before an
+/// external `timeout` had to SIGTERM the suite. 20 s is generous headroom
+/// over the whole live suite's *normal* runtime (a few seconds, subprocess
+/// spawn included) and two orders of magnitude below that hang.
+const fixture_watchdog_ms: u64 = 20_000;
+
+/// Distinct `exit()` code the watchdog uses, so a hang is unmistakably this
+/// mechanism firing and not an unrelated process death — mirrors
+/// `reference_client.py`'s own `os._exit(7)` backstop for the reverse
+/// direction, which is why they don't share a number.
+const watchdog_exit_code: u8 = 94;
+
+/// Polls `stop` on a short interval until it is set or `fixture_watchdog_ms`
+/// elapses, then exits the whole process with `watchdog_exit_code`. Runs on
+/// its own thread, started by `Fixture.start` and stopped by `Fixture.deinit`
+/// — so it brackets exactly the span in which a hang can happen: opening the
+/// h2c session and every RPC the test makes on it.
+fn watchdogFn(stop: *std.atomic.Value(bool)) void {
+    const poll_ms: u64 = 50;
+    var waited_ms: u64 = 0;
+    while (waited_ms < fixture_watchdog_ms) : (waited_ms += poll_ms) {
+        if (stop.load(.acquire)) return;
+        var ts: std.posix.timespec = .{
+            .sec = @intCast(poll_ms / 1000),
+            .nsec = @intCast((poll_ms % 1000) * 1_000_000),
+        };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    if (stop.load(.acquire)) return;
+    std.debug.print(
+        "\nGRPC FORWARD-DIRECTION WATCHDOG FIRED: a live Fixture ran past {d} ms " ++
+            "without reaching deinit — framing regression or a hung read (F1). " ++
+            "Exiting {d} instead of hanging the suite.\n",
+        .{ fixture_watchdog_ms, watchdog_exit_code },
+    );
+    std.process.exit(watchdog_exit_code);
+}
+
 /// Heap-allocated because `http.Client` and the h2 session hold pointers into
 /// each other — none of this may move once connected.
 const Fixture = struct {
@@ -148,6 +193,15 @@ const Fixture = struct {
     ch: grpc.Channel,
     /// Backs `interpreter`'s constructed path for the child's lifetime.
     path_buf: [512]u8 = undefined,
+    /// F1: set just before `deinit` tears anything down, so the watchdog
+    /// thread below stops polling instead of firing on a fixture that
+    /// finished normally.
+    watchdog_stop: std.atomic.Value(bool) = .init(false),
+    /// Null only if the watchdog thread itself failed to spawn (never
+    /// observed, but `deinit` must not crash if it happens) — a fixture with
+    /// no watchdog is worse than the pre-fix world, so this is not silently
+    /// tolerated by `start`: see the `orelse` there.
+    watchdog_thread: ?std.Thread = null,
 
     fn start(gpa: std.mem.Allocator, options: grpc.Options) !*Fixture {
         if (builtin.os.tag != .linux) return skip("grpc reference interop is exercised on Linux");
@@ -156,6 +210,8 @@ const Fixture = struct {
         errdefer gpa.destroy(f);
         f.gpa = gpa;
         f.io = io;
+        f.watchdog_stop = .init(false);
+        f.watchdog_thread = null;
 
         const python = interpreter(&f.path_buf);
         try requireGrpcio(io, python);
@@ -167,6 +223,15 @@ const Fixture = struct {
             .stderr = .ignore,
         }) catch return skip("could not spawn the grpcio reference server");
         errdefer f.child.kill(io);
+
+        // Arm the watchdog before anything that can block: the port line can
+        // hang just as easily as the h2c session that follows it.
+        f.watchdog_thread = std.Thread.spawn(.{}, watchdogFn, .{&f.watchdog_stop}) catch
+            return skip("could not start the F1 watchdog thread — refusing to run a live fixture unguarded");
+        errdefer {
+            f.watchdog_stop.store(true, .release);
+            if (f.watchdog_thread) |t| t.join();
+        }
 
         // The server prints `PORT <n>` after bind()+start(), so anything we
         // connect afterwards is guaranteed to find a listening socket.
@@ -188,6 +253,11 @@ const Fixture = struct {
     }
 
     fn deinit(f: *Fixture) void {
+        // Stop the watchdog FIRST: teardown itself must not race a firing
+        // watchdog, and a fixture that reached deinit at all is by
+        // definition not the hang the watchdog exists to catch.
+        f.watchdog_stop.store(true, .release);
+        if (f.watchdog_thread) |t| t.join();
         f.hs.close();
         f.client.deinit();
         f.child.kill(f.io);

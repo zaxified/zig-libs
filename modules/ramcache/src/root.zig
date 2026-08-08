@@ -385,7 +385,7 @@ pub const Cache = struct {
         if (ttl_expired or gen_stale) {
             self.stats.expired += 1;
             self.stats.misses += 1;
-            self.dropKey(key);
+            _ = self.dropKey(key);
             return null;
         }
         self.tick += 1;
@@ -520,6 +520,23 @@ pub const Cache = struct {
         self.syncStats();
     }
 
+    /// Explicitly remove one entry if present — frees its key/value/index
+    /// node, updates `stats`/`bytes`/region counts, and fires `on_evict` with
+    /// reason `.evicted` (the same reason capacity-driven removal uses: from
+    /// the caller's perspective the entry left uninvited either way). O(1)
+    /// map lookup plus the same O(log n) heap removal capacity eviction
+    /// already pays — never a scan. Returns `true` if `key` was resident and
+    /// removed, `false` if it was already absent (harmless no-op, same shape
+    /// as `markClean`).
+    ///
+    /// This is the targeted counterpart to `clear()`: a caller that owns a
+    /// narrower invalidation scope than "everything" (e.g. `pagecache`
+    /// forgetting one file's pages on close, without discarding every other
+    /// open file's hot pages) does not have to pay for a full-cache wipe.
+    pub fn remove(self: *Cache, key: []const u8) bool {
+        return self.dropKey(key);
+    }
+
     // ── write-behind seam: dirty-set ────────────────────────────────────────
 
     /// True if `key` is present and its dirty bit is set. Side-effect-free:
@@ -590,8 +607,11 @@ pub const Cache = struct {
         if (self.sketch) |*s| s.record(key);
     }
 
-    fn dropKey(self: *Cache, key: []const u8) void {
-        if (self.map.fetchRemove(key)) |kv| {
+    /// Returns `true` if `key` was present and removed, `false` if it was
+    /// already absent — so callers that need to know (`remove`) and callers
+    /// that don't (lazy TTL/generation drop, `evictStep`) share one path.
+    fn dropKey(self: *Cache, key: []const u8) bool {
+        const found = if (self.map.fetchRemove(key)) |kv| blk: {
             self.lruRemove(kv.value.region, kv.value.node);
             self.expRemove(kv.value.node);
             self.alloc.destroy(kv.value.node);
@@ -604,8 +624,10 @@ pub const Cache = struct {
             self.bytes -= kv.value.value.len;
             self.alloc.free(kv.value.value);
             self.alloc.free(kv.key);
-        }
+            break :blk true;
+        } else false;
         self.syncStats();
+        return found;
     }
 
     /// Fire `Options.on_evict` if one is set. Called just before the
@@ -848,7 +870,7 @@ pub const Cache = struct {
     fn evictStep(self: *Cache, now_ns: i64) bool {
         if (self.map.count() == 0) return false;
         if (self.findExpiredKey(now_ns)) |k| {
-            self.dropKey(k);
+            _ = self.dropKey(k);
             self.stats.evictions += 1;
             return true;
         }
@@ -856,19 +878,19 @@ pub const Cache = struct {
             // no window entries — evict straight from the main region
             const vk = self.regionLruKey(.probation) orelse
                 self.regionLruKey(.protected) orelse return false;
-            self.dropKey(vk);
+            _ = self.dropKey(vk);
             self.stats.evictions += 1;
             return true;
         };
         const victim = self.regionLruKey(.probation) orelse
             self.regionLruKey(.protected) orelse {
             // main region empty — plain LRU within the window
-            self.dropKey(cand);
+            _ = self.dropKey(cand);
             self.stats.evictions += 1;
             return true;
         };
         if (self.admit(cand, victim)) {
-            self.dropKey(victim);
+            _ = self.dropKey(victim);
             const e = self.map.getPtr(cand).?;
             if (self.lruMove(e.node, .window, .probation)) {
                 e.region = .probation;
@@ -878,11 +900,11 @@ pub const Cache = struct {
             } else {
                 // OOM re-indexing the winner; drop it rather than leave the
                 // cache over its cap. Same outcome shape as a rejection.
-                self.dropKey(cand);
+                _ = self.dropKey(cand);
                 self.stats.rejections += 1;
             }
         } else {
-            self.dropKey(cand);
+            _ = self.dropKey(cand);
             self.stats.rejections += 1;
         }
         self.stats.evictions += 1;
@@ -1196,6 +1218,68 @@ test "on-evict fires once per entry on clear, and not at all when unset" {
         }
     }
     try testing.expect(saw_a and saw_b);
+}
+
+test "remove: drops exactly the named key, leaves siblings untouched, no-ops on absent" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "22", 0, 0, 0);
+    try testing.expectEqual(@as(usize, 2), c.stats.entries);
+    try testing.expectEqual(@as(usize, 3), c.bytes);
+
+    try testing.expect(c.remove("a")); // present → true, removed
+    try testing.expect(!c.map.contains("a")); // physically gone
+    try testing.expect(c.map.contains("b")); // sibling untouched
+    try testing.expectEqual(@as(usize, 1), c.stats.entries);
+    try testing.expectEqual(@as(usize, 2), c.bytes); // only "b"'s 2 bytes remain
+    try testing.expect(c.get("a", 1, 0) == null); // truly gone, not just stale
+    try testing.expectEqualStrings("22", c.get("b", 1, 0).?);
+
+    try testing.expect(!c.remove("a")); // already absent → false, harmless no-op
+    try testing.expect(!c.remove("never-existed"));
+    try testing.expectEqual(@as(usize, 1), c.stats.entries); // unchanged by the no-ops
+}
+
+test "remove: fires on_evict with reason .evicted and frees the entry's memory (no leak)" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 16,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+    c.put("k", "value", 0, 0, 0);
+    try testing.expectEqual(@as(usize, 0), sink.len); // put alone must not fire it
+
+    try testing.expect(c.remove("k"));
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualStrings("k", sink.recs[0].key());
+    try testing.expectEqualStrings("value", sink.recs[0].val());
+    try testing.expectEqual(EvictReason.evicted, sink.recs[0].reason);
+
+    try testing.expect(!c.remove("k")); // second call: already gone → no double-fire
+    try testing.expectEqual(@as(usize, 1), sink.len);
+}
+
+test "remove: a removed key's slot can be reused by a fresh put (heap index not left dangling)" {
+    // Targets the index-node bookkeeping `remove` shares with capacity
+    // eviction: after removing a key, inserting a new key must land cleanly
+    // in the region heaps rather than tripping over a stale node reference.
+    var c = testCache(1 << 20, 4);
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 1, 0, 0);
+    c.put("c", "3", 2, 0, 0);
+    try testing.expect(c.remove("b"));
+    c.put("d", "4", 3, 0, 0);
+    c.put("e", "5", 4, 0, 0); // more churn to exercise the heaps post-removal
+    try testing.expect(c.get("a", 5, 0) != null);
+    try testing.expect(c.get("b", 5, 0) == null);
+    try testing.expect(c.get("c", 5, 0) != null);
+    try testing.expect(c.get("d", 5, 0) != null);
+    try testing.expect(c.get("e", 5, 0) != null);
 }
 
 test "dirty bit: set on put, cleared by markClean; markClean on an absent key is a harmless no-op" {

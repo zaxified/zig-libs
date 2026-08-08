@@ -352,6 +352,72 @@ buffer — call it a megabyte each in a realistic configuration, so an OPC UA
 fleet is measured in hundreds, not thousands. That is a property of the
 protocol, not of this module.
 
+## Searching for a failure — the fleet as a `netsim` protocol
+
+`Fleet.applyNetsimTrace` borrows netsim's *schedule fuzzer*: a generated
+`FaultTrace` is translated into fleet faults and executed. It cannot borrow the
+*search*, because nothing in that path decides whether the resulting run was
+good — so no seed can be looked for, and `shrinkTrace` has no oracle to
+minimise against. A failure could only ever be reported as "seed N breaks it".
+
+`src/vopr.zig` closes that: it plugs a `Fleet` into netsim's engine as an
+ordinary `Protocol`, so `run` / `replay` / `findFailing` / `shrinkTrace` work on
+a device fleet exactly as they already do for `raft` or `df-elect`. netsim node
+0 is the master (the SCADA poller), nodes `1..N` are the devices, one
+bidirectional link each — the same star the threat-model section describes.
+
+**The seam is a clean split, not a second copy of the same model.** netsim owns
+the network (latency plus the whole adversary: drop / duplicate / delay spike /
+link down+up / partition+heal / crash+restart); fleetsim owns the devices
+(framing, the responders, point behaviour, the slot pool, the total order). The
+fleet's own link-fault knobs are left at zero, deliberately: modelling loss at
+both layers would make a minimised trace a lie, because half of what perturbed
+the run would not be in the trace handed back, and ddmin would shrink against
+noise. `onTimer` on the master is the poll loop; `onMessage` on a device is the
+only place the fleet is driven (`submit`, then `advance` up to netsim's clock,
+then every frame in `outbound()` goes back on the wire).
+
+Five invariants are checked after **every** netsim event, all of them at the
+master and all of them on bytes the devices authored — netsim can lose,
+duplicate, delay and reorder a payload but cannot write one, so none of them can
+fire merely because a fault fired: `MalformedReply` (not exactly one complete
+frame of the sender's own `Framing`), `UnitIdMismatch` (cross-routing),
+`UnknownTransaction` (an id this master never issued to that device),
+`ValueOutOfRange` (outside the band the `Signal`'s driver can produce), and
+`SlotLeak` (slot-pool conservation — the same property the fuzz target asserts
+once at the end, here asserted continuously under an adversary).
+
+Liveness is deliberately **not** an invariant. An adversary free to cut a link
+and never heal it, or to crash the master, can starve any device of any reply;
+"every poll is answered" would report the adversary as a bug.
+
+**Teeth.** netsim's contract for a consumer is a deliberately-broken positive
+control (its own `LoopyForward`, `raft`'s `BrokenRaft`). `BrokenDevice` is this
+module's, and it carries four defects — one per master-side invariant. Each is
+gated on the same transaction id arriving twice, which **only a duplicated
+request can produce**, so each is provably unreachable on a clean run: the test
+`every bug is unreachable without the adversary` replays each of them with an
+empty fault trace and requires `.ok` *and* more than 20 answered polls. The
+search then finds all four, and minimises each to a single fault:
+
+```
+length_counts_retransmit: seed=4 err=error.MalformedReply     trace 26 -> 1 events
+stale_unit_id:            seed=4 err=error.UnitIdMismatch     trace 26 -> 1 events
+invented_transaction:     seed=4 err=error.UnknownTransaction trace 26 -> 1 events
+stale_register_buffer:    seed=4 err=error.ValueOutOfRange    trace 26 -> 1 events
+    t= 489 dup_once 0->1
+    replay(minimised) -> violated
+```
+
+That single surviving `dup_once 0->1` at t=489 is the root cause stated exactly:
+one duplicated request on the master → device link. The same harness running the
+real `adapters.Modbus` is clean across the whole seed sweep.
+
+Every search here is **bounded** and modest (seeds 1..60, `until = 1200` ticks,
+a 20-tick poll period): a netsim sweep is one replay per seed and ddmin is one
+replay per candidate cut, so an unbounded budget would be a runaway rather than
+a better test.
+
 ## Hostile input & fuzzing
 
 `std.testing.fuzz` drives `fuzzSmith` → `fuzzDispatch`, which builds a
@@ -433,10 +499,12 @@ and the multi-connection binding. What is still open:
 - **`applyNetsimTrace` drops `clock_jump`** and returns the count of unmapped
   events. Per-node clock skew would need a per-node clock offset, which the
   single total order does not currently model.
-- **No shrinker of its own.** `netsim` has delta-debugging over a `FaultTrace`;
-  a failing fleet run can be shrunk by shrinking the netsim trace it came from,
-  but a fleet-native shrinker (over `Fault` lists and submitted frames) does not
-  exist yet.
+- **No fleet-native shrinker.** Delta-debugging over a *netsim* `FaultTrace` now
+  works end to end on a fleet — see "Searching for a failure" above — so a
+  failing run comes back as a minimised fault trace. What still does not exist
+  is a shrinker over the fleet's *own* inputs (`Fault` lists and submitted
+  frames), which is what you would want to minimise a failure that a netsim
+  schedule cannot express.
 - **RTU framing is `opaque_whole`** — a Modbus RTU node cannot be fed a
   concatenated stream, only whole frames, because RTU has no length field (real
   RTU uses inter-character timing). Fine for TCP fleets; a serial-gateway

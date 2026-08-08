@@ -59,6 +59,12 @@ connect.
   `Fleet.applyNetsimTrace` maps a `netsim`-fuzzed fault schedule straight onto
   the fleet, so that churn-and-recover fuzzer and its shrinker are reused rather
   than rewritten.
+- **Model checking** — `Vopr` (`src/vopr.zig`) plugs a `Fleet` into `netsim` as
+  an ordinary `Protocol`, so the simulator can **search** for a failure instead
+  of replaying a schedule you handed it: `netsim.findFailing` sweeps seeds and
+  `netsim.shrinkTrace` returns a **minimised fault trace**, not a seed. Five
+  invariants are checked after every event, and the module ships the
+  deliberately-broken device that proves they bite. See SPEC.md.
 - **Transport binding** — `serveTcp` / `serveUdp` / `serveTcpMulti` in
   `tcp.zig`, the only file that knows what a socket is. `serveTcpMulti` binds
   several listeners and services several peers **concurrently** from one thread
@@ -146,7 +152,11 @@ iterator, every adapter's round-trip plus its restart and its trouble path
 a whole `NodeStore`+`Server`, the drivers, the scheduler, three determinism
 proofs plus a fourth over a toy node, hostile input, a `std.testing.fuzz` target
 over three-adapter dispatch, the 1000-node scale run, the shim's buffer
-discipline, and the multi-peer binding driven by two in-process clients at once.
+discipline, the multi-peer binding driven by two in-process clients at once, and
+the `netsim` model-checking harness — a bounded seed sweep over the real
+`ModbusNode` that must stay clean, plus four planted device defects that
+`findFailing` must catch and `shrinkTrace` must reduce to the single duplicated
+request that causes them.
 
 The live tests print `SKIPPED: …` and pass unless an endpoint is given.
 Each one binds, waits for its master, and schedules a `trouble` fault at

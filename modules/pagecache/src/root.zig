@@ -101,6 +101,19 @@ pub const PageCache = struct {
     page_size: usize,
     hits: u64 = 0,
     misses: u64 = 0,
+    gpa: std.mem.Allocator,
+    /// Per-handle set of page indices this `PageCache` has ever put into
+    /// `cache` since that handle was last opened. Lets `vClose` forget only
+    /// the closing handle's pages via `ramcache.Cache.remove` (F5) instead of
+    /// `cache.clear()`-ing every other open file's hot pages too. A page
+    /// index stays listed even after `cache` itself evicts it under capacity
+    /// pressure — `remove` on an absent key is a defined no-op (see its doc
+    /// comment), so the set is an over-approximation of residency, never an
+    /// under-approximation, which is the direction that matters for
+    /// correctness. It costs 8 bytes of metadata per distinct page ever
+    /// touched by an open handle (vs. the 4 KiB the page itself would cost),
+    /// freed in full on `vClose`.
+    handle_pages: std.AutoHashMapUnmanaged(Storage.Handle, std.AutoHashMapUnmanaged(u64, void)) = .empty,
 
     /// Key layout for a cached page: the backend handle (so two files opened
     /// through the same cache never alias) followed by the page index.
@@ -116,11 +129,15 @@ pub const PageCache = struct {
                 .max_bytes = options.max_pages * options.page_size,
             }),
             .page_size = options.page_size,
+            .gpa = gpa,
         };
     }
 
     pub fn deinit(self: *PageCache) void {
         self.cache.deinit();
+        var it = self.handle_pages.valueIterator();
+        while (it.next()) |pages| pages.deinit(self.gpa);
+        self.handle_pages.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -157,6 +174,18 @@ pub const PageCache = struct {
         std.mem.writeInt(u32, k[0..4], handle, .little);
         std.mem.writeInt(u64, k[4..12], page_index, .little);
         return k;
+    }
+
+    /// Record that `page_index` was just inserted into `cache` under `h`, so
+    /// `vClose` can find it later. Best-effort: on allocation failure the
+    /// page simply stays untracked (it was already cached best-effort by
+    /// `ramcache.put`, which is itself a silent no-op on OOM) — it will
+    /// outlive this handle's close and only leave via `cache`'s own eviction
+    /// or a whole-cache `clear()`, same as every page did before this fix.
+    fn trackPage(self: *PageCache, h: Storage.Handle, page_index: u64) void {
+        const gop = self.handle_pages.getOrPut(self.gpa, h) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.put(self.gpa, page_index, {}) catch {};
     }
 
     // ── Storage vtable ───────────────────────────────────────────────────────
@@ -207,7 +236,10 @@ pub const PageCache = struct {
         const n = try self.inner.pread(h, buf, off);
         // Only a full, present page is a cacheable unit (a short read means the
         // page is not fully on media — never cache a partial page).
-        if (n == self.page_size) self.cache.put(&key, buf, 0, 0, 0);
+        if (n == self.page_size) {
+            self.cache.put(&key, buf, 0, 0, 0);
+            self.trackPage(h, off / self.page_size);
+        }
         return n;
     }
 
@@ -219,10 +251,12 @@ pub const PageCache = struct {
         try self.inner.writeAll(h, bytes, off);
 
         if (self.isFullPage(off, bytes.len)) {
-            const key = pageKey(h, off / self.page_size);
+            const page_index = off / self.page_size;
+            const key = pageKey(h, page_index);
             // Replace-in-place if resident (put over an existing key always
             // succeeds and never mis-admits), else offer it to the cache.
             self.cache.put(&key, bytes, 0, 0, 0);
+            self.trackPage(h, page_index);
         } else {
             // A sub-page or unaligned write could partially overlap resident
             // pages we cannot selectively invalidate; drop everything to stay
@@ -246,8 +280,20 @@ pub const PageCache = struct {
         const self = cast(ctx);
         self.inner.close(h);
         // The handle number may be recycled by the backend for a different
-        // file; forget its pages so a future open cannot read stale bytes.
-        self.cache.clear();
+        // file; forget ONLY this handle's pages (F5) — other files sharing
+        // the cache keep their hot pages resident. `remove` on an already-
+        // evicted page index is a defined no-op, so an over-approximating
+        // tracked set (see `handle_pages`'s doc comment) costs a few extra
+        // no-op lookups here, never a missed invalidation.
+        if (self.handle_pages.fetchRemove(h)) |removed| {
+            var pages = removed.value;
+            var it = pages.keyIterator();
+            while (it.next()) |page_index| {
+                const key = pageKey(h, page_index.*);
+                _ = self.cache.remove(&key);
+            }
+            pages.deinit(self.gpa);
+        }
     }
 
     fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
@@ -726,4 +772,48 @@ test "F4: vTryLockExclusive forwards to the inner Storage verbatim (dead in kvtr
     st.close(a); // releases; there is no unlock op
     try testing.expect(try st.tryLockExclusive(b));
     st.close(b);
+}
+
+test "F5: vClose forgets only the closing handle's pages, not every open file's (per-handle invalidation via ramcache.remove)" {
+    // The defect: `vClose` called `self.cache.clear()` — a whole-cache wipe —
+    // so closing ONE of several files sharing this PageCache discarded every
+    // OTHER open file's resident pages too. Two files, two handles, one
+    // shared cache: closing "alpha" must leave "beta"'s page hot.
+    const gpa = testing.allocator;
+    const page = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page);
+    @memset(page, 0xCD);
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    // Open both handles FIRST: a `.create_truncate` open clears the whole
+    // cache (unrelated to F5 — see `vOpen`), so both opens must happen
+    // before either write or the second open would wipe the first's page.
+    const ha = try st.open("alpha", .create_truncate);
+    const hb = try st.open("beta", .create_truncate);
+    try st.writeAll(ha, page, 0); // caches alpha's page 0 (write-through also caches)
+    try st.writeAll(hb, page, 0); // caches beta's page 0
+
+    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages);
+
+    st.close(ha); // must forget ONLY alpha's page
+
+    // alpha's page is gone (the handle is closed and its number may be
+    // recycled, so this is the correct half).
+    try testing.expectEqual(@as(usize, 1), pc.stats().resident_pages);
+
+    // beta's page must still be resident: reading it must be a HIT, not a
+    // fresh miss. Before the fix, `vClose` cleared beta's page too, so this
+    // read would fall through to the inner Storage and bump `pc.misses`.
+    const misses_before = pc.misses;
+    const hits_before = pc.hits;
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(hb, &buf, 0);
+    try testing.expectEqual(misses_before, pc.misses); // no new miss
+    try testing.expectEqual(hits_before + 1, pc.hits); // served from RAM
+    try testing.expectEqualSlices(u8, page, &buf);
 }

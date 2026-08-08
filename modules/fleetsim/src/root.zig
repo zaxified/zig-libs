@@ -121,6 +121,16 @@ pub const Window = shim.Window;
 pub const StreamShim = shim.StreamShim;
 pub const DatagramShim = shim.DatagramShim;
 
+/// The fleet plugged into `netsim` as a `Protocol`, so a fault schedule can be
+/// SEARCHED for rather than handed over: `netsim.findFailing` +
+/// `netsim.shrinkTrace` return a minimised fault trace instead of a seed. See
+/// the file header for the division of labour between the two simulators, and
+/// for why `Fleet.applyNetsimTrace` (which borrows netsim's fuzzer but has no
+/// oracle) could not do this on its own.
+pub const vopr = @import("vopr.zig");
+pub const Vopr = vopr.Vopr;
+pub const VoprViolation = vopr.Violation;
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1761,4 +1771,5 @@ test {
     _ = @import("tcp.zig");
     _ = @import("shim.zig");
     _ = @import("goldens.zig");
+    _ = @import("vopr.zig");
 }
