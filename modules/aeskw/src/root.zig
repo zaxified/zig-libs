@@ -63,6 +63,7 @@ pub const Error = error{
 /// KAT: RFC 3394 §4.1, §4.3, §4.5, §4.6 (this file's tests below).
 pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
     if (plaintext.len < 16 or plaintext.len % 8 != 0) return error.InvalidLength;
+    if (kek.len != 16 and kek.len != 32) return error.UnsupportedKeyLength;
     const n = plaintext.len / 8;
     const total = plaintext.len + 8;
     if (out.len < total) return error.BufferTooSmall;
@@ -342,4 +343,22 @@ test "length + KEK validation (incl. the 192-bit-KEK std gap), with positive con
     const kek192 = [_]u8{0} ** 24;
     try std.testing.expectError(error.UnsupportedKeyLength, wrap(&kek192, &[_]u8{0} ** 16, &buf));
     try std.testing.expectError(error.UnsupportedKeyLength, unwrap(&kek192, &[_]u8{0} ** 24, &buf));
+}
+
+test "F4 regression: wrap validates KEK width before writing plaintext into `out`" {
+    // Before the fix, `wrap` copied the caller's plaintext key material into
+    // `out[8..]` before the KEK width was checked (validation only happened
+    // lazily inside `encBlock` on the first block). A caller that reused
+    // `out` as scratch and relied on `error.UnsupportedKeyLength` meaning
+    // "out untouched" — the discipline `unwrap` already gives, and the one
+    // `wrap`'s own module doc claims for the pair — would see its plaintext
+    // sitting in `out` despite the reported failure (wave-2 audit finding
+    // `aeskw` F4).
+    const kek192 = [_]u8{0} ** 24; // std has no AES-192 core -> unsupported
+    const plaintext = [_]u8{0xAA} ** 16;
+    var out = [_]u8{0} ** 24;
+    try std.testing.expectError(error.UnsupportedKeyLength, wrap(&kek192, &plaintext, &out));
+    // `out` must still be all-zero: the plaintext must never have been
+    // copied in before the KEK width was validated.
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), &out);
 }

@@ -432,9 +432,28 @@ pub fn parse(allocator: Allocator, bytes: []const u8) ParseError!Psbt {
     try validateGlobalMap(global);
 
     const utx_rec = global.find(global_key.UNSIGNED_TX) orelse return error.MissingUnsignedTx;
-    var utx = try bitcointx.deserialize(allocator, utx_rec.value);
+    // `bitcointx.deserialize` now refuses a BIP144-marked tx whose witness
+    // stacks are all empty (`error.SuperfluousWitnessRecord`, wave-2 audit
+    // finding `bitcointx` F3). An UNSIGNED tx's inputs never carry witness
+    // data by definition (nothing has signed yet), so a witness-serialized
+    // unsigned tx is EXACTLY that shape -- every occurrence of
+    // `SuperfluousWitnessRecord` on this specific field means "should have
+    // been legacy-serialized", the PSBT-level, BIP174-specific, officially
+    // vectored `error.UnsignedTxNotLegacySerialization` this function
+    // already raises below for the has_witness-but-nonempty case.
+    // Translate it rather than pre-empting it with the generic tx-level
+    // error, and rather than re-deriving the marker/flag ambiguity by
+    // peeking at the raw bytes here: BIP174's own "0 inputs" vector shows
+    // why that would be unsafe (a legacy 0-vin tx can coincidentally start
+    // with the same two bytes as a marker+flag -- see `core_kat_test.zig`'s
+    // `valid[5]` note), so only `bitcointx`'s own parser -- which resolves
+    // the ambiguity by committing to the segwit path and running out of
+    // bytes -- gets to decide.
+    var utx = bitcointx.deserialize(allocator, utx_rec.value) catch |err| switch (err) {
+        error.SuperfluousWitnessRecord => return error.UnsignedTxNotLegacySerialization,
+        else => return err,
+    };
     defer utx.deinit(allocator);
-    if (utx.has_witness) return error.UnsignedTxNotLegacySerialization;
     for (utx.vin) |vin| {
         if (vin.script_sig.len != 0) return error.UnsignedTxHasScriptSig;
     }
@@ -527,10 +546,24 @@ fn keysEqual(a: Record, b: Record) bool {
     return a.keytype == b.keytype and std.mem.eql(u8, a.keydata, b.keydata);
 }
 
-fn containsKey(records: []const Record, r: Record) bool {
-    for (records) |x| if (keysEqual(x, r)) return true;
-    return false;
-}
+/// Hashes/compares a `Record` by its key only (`keytype`+`keydata`, matching
+/// `keysEqual`) — lets `mergeMaps` dedup with a real hash set instead of an
+/// O(n) `containsKey` scan per record of `b` (parseMap's `seen` does the same
+/// job with a `StringHashMapUnmanaged` because it already has the raw
+/// concatenated key bytes on hand; here the key is split across two fields,
+/// so a small `Context` is the natural equivalent instead of allocating a
+/// synthetic concatenated key just to reuse `StringHashMapUnmanaged`).
+const RecordKeyContext = struct {
+    pub fn hash(_: RecordKeyContext, r: Record) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&r.keytype));
+        h.update(r.keydata);
+        return h.final();
+    }
+    pub fn eql(_: RecordKeyContext, a: Record, b: Record) bool {
+        return keysEqual(a, b);
+    }
+};
 
 /// Byte-lexicographic order of the raw key (encoded keytype ++ keydata) —
 /// matches BIP174's own worked Combiner example ("A combiner which orders
@@ -553,9 +586,19 @@ fn lessThanKey(_: void, a: Record, b: Record) bool {
 fn mergeMaps(allocator: Allocator, a: Map, b: Map) Allocator.Error!Map {
     var list: std.ArrayList(Record) = .empty;
     errdefer list.deinit(allocator);
-    for (a.records) |r| try list.append(allocator, r);
+
+    var seen: std.HashMapUnmanaged(Record, void, RecordKeyContext, std.hash_map.default_max_load_percentage) = .empty;
+    defer seen.deinit(allocator);
+
+    for (a.records) |r| {
+        try list.append(allocator, r);
+        try seen.put(allocator, r, {});
+    }
     for (b.records) |r| {
-        if (!containsKey(list.items, r)) try list.append(allocator, r);
+        if (!seen.contains(r)) {
+            try list.append(allocator, r);
+            try seen.put(allocator, r, {});
+        }
     }
     std.mem.sort(Record, list.items, {}, lessThanKey);
     return .{ .records = try list.toOwnedSlice(allocator) };

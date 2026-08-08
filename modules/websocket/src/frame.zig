@@ -151,8 +151,24 @@ pub const ParseResult = union(enum) {
 /// XOR-mask (or unmask — the operation is its own inverse) `payload`
 /// in-place with the 4-byte `key`, cycling the key over the payload
 /// (§5.3).
+///
+/// Word-wise: the key is broadcast to a `u64` (two copies of the 4-byte key
+/// back to back), so an 8-byte-aligned run is XORed 8 bytes at a time
+/// instead of one byte at a time — this is every frame's one O(payload)
+/// operation, on both the parse and write paths. Correct because 8 is a
+/// multiple of the 4-byte key period: the key phase at the start of every
+/// 8-byte chunk is always `key[0]` again, so chunking never desyncs the
+/// cycle. The tail (`payload.len % 8` bytes) falls back to the byte-at-a-time
+/// form.
 pub fn applyMask(payload: []u8, key: [4]u8) void {
-    for (payload, 0..) |*b, i| b.* ^= key[i % 4];
+    const key32 = std.mem.readInt(u32, &key, .little);
+    const key64: u64 = @as(u64, key32) | (@as(u64, key32) << 32);
+    var i: usize = 0;
+    while (i + 8 <= payload.len) : (i += 8) {
+        const chunk = std.mem.readInt(u64, payload[i..][0..8], .little);
+        std.mem.writeInt(u64, payload[i..][0..8], chunk ^ key64, .little);
+    }
+    while (i < payload.len) : (i += 1) payload[i] ^= key[i % 4];
 }
 
 /// Parse one frame from the front of `buf`. `buf` is mutable because a
@@ -271,12 +287,18 @@ pub fn writeFrame(w: *std.Io.Writer, opts: WriteOptions) std.Io.Writer.Error!voi
     if (opts.mask_key) |key| {
         try w.writeAll(&key);
         // Mask through a small stack buffer so `opts.payload` (const) is
-        // never mutated and no allocation is needed.
+        // never mutated and no allocation is needed. `tmp.len` (512) is a
+        // multiple of 4 (the key period), so the key phase at the start of
+        // every chunk is `key[0]` again — each chunk can go through the
+        // shared `applyMask` (which always starts a fresh mask at `key[0]`)
+        // and still reproduce exactly the single-call-over-the-whole-payload
+        // result, instead of re-implementing the masking loop here.
         var tmp: [512]u8 = undefined;
         var i: usize = 0;
         while (i < len) {
             const n = @min(tmp.len, len - i);
-            for (0..n) |j| tmp[j] = opts.payload[i + j] ^ key[(i + j) % 4];
+            @memcpy(tmp[0..n], opts.payload[i..][0..n]);
+            applyMask(tmp[0..n], key);
             try w.writeAll(tmp[0..n]);
             i += n;
         }
@@ -526,6 +548,27 @@ test "masking round-trip: applyMask is its own inverse" {
     try testing.expect(!std.mem.eql(u8, &orig, &data));
     applyMask(&data, key);
     try testing.expectEqualSlices(u8, &orig, &data);
+}
+
+// W2-B/websocket-F4: a round trip through `applyMask` alone (mask then
+// unmask, or write-then-parse, which both call the same `applyMask`) cannot
+// catch a broken word-wise key broadcast — a bug that zeroes the same half
+// of the mask on both the masking and unmasking call is still its own
+// inverse, so the previous round-trip test above passes either way. This one
+// checks against an INDEPENDENT byte-at-a-time computation of §5.3's
+// definition instead, on a payload long enough (19 bytes: two full 8-byte
+// word chunks plus a 3-byte tail) to actually exercise the word path.
+test "applyMask matches an independent byte-at-a-time oracle across the word/tail boundary" {
+    var payload: [19]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i * 7 + 3);
+    const key: [4]u8 = .{ 0xaa, 0x55, 0x11, 0xf0 };
+
+    var want: [19]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = payload[i] ^ key[i % 4];
+
+    var got = payload;
+    applyMask(&got, key);
+    try testing.expectEqualSlices(u8, &want, &got);
 }
 
 test "positive control: valid masked frame with max control payload (125) is accepted" {

@@ -31,9 +31,7 @@ fn arbitraryFr(comptime Fr: type, smith: *std.testing.Smith) Fr {
     return Fr.reduceWide(&be);
 }
 
-fn fuzzInjective(_: void, smith: *std.testing.Smith) !void {
-    const P = bn.Perm(3).init();
-
+fn fuzzInjective(P: bn.Perm(3), smith: *std.testing.Smith) !void {
     var a: [3]bn.Fr = undefined;
     for (&a) |*x| x.* = arbitraryFr(bn.Fr, smith);
 
@@ -57,14 +55,18 @@ fn fuzzInjective(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the BN254 t=3 permutation is injective" {
-    try std.testing.fuzz({}, fuzzInjective, .{});
+    // `Perm(3).init()` re-derives the round constants (Grain LFSR) and MDS
+    // matrix — real work, ~2ms — so it is computed ONCE here and passed as
+    // the fuzz context, not inside `fuzzInjective` where it would otherwise
+    // re-run on every single fuzzed iteration and burn most of the budget on
+    // constant re-derivation instead of the property under test.
+    try std.testing.fuzz(bn.Perm(3).init(), fuzzInjective, .{});
 }
 
-fn fuzzFramingAgrees(_: void, smith: *std.testing.Smith) !void {
+fn fuzzFramingAgrees(P: bn.Perm(5), smith: *std.testing.Smith) !void {
     // `hash` is `hashN(1, zero, …)`; `hashN(k, …)` must be a prefix of the
     // permutation output for any k. Cheap, total, and it pins the framing
     // against a "helpful" future change that starts squeezing or padding.
-    const P = bn.Perm(5).init();
     var in: [4]bn.Fr = undefined;
     for (&in) |*x| x.* = arbitraryFr(bn.Fr, smith);
     const init_state = arbitraryFr(bn.Fr, smith);
@@ -83,13 +85,12 @@ fn fuzzFramingAgrees(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: hash framing is a prefix of the permutation" {
-    try std.testing.fuzz({}, fuzzFramingAgrees, .{});
+    try std.testing.fuzz(bn.Perm(5).init(), fuzzFramingAgrees, .{});
 }
 
-fn fuzzBlsInjective(_: void, smith: *std.testing.Smith) !void {
+fn fuzzBlsInjective(P: bls.Perm(3), smith: *std.testing.Smith) !void {
     // Same property on the other field — different prime, different Grain
     // seed width, entirely separate constant tables.
-    const P = bls.Perm(3).init();
     var a: [3]bls.Fr = undefined;
     for (&a) |*x| x.* = arbitraryFr(bls.Fr, smith);
     const slot = smith.value(u8) % 3;
@@ -108,5 +109,5 @@ fn fuzzBlsInjective(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the BLS12-381 t=3 permutation is injective" {
-    try std.testing.fuzz({}, fuzzBlsInjective, .{});
+    try std.testing.fuzz(bls.Perm(3).init(), fuzzBlsInjective, .{});
 }

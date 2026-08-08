@@ -53,6 +53,7 @@ pub const cap_interleave = "urn:ietf:params:netconf:capability:interleave:1.0";
 pub const default_client_capabilities = [_][]const u8{
     cap_base_1_0,
     cap_base_1_1,
+    cap_notification,
 };
 
 pub const HelloError = error{
@@ -228,13 +229,23 @@ pub fn writeHello(
     try w.writeAll("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     try w.print("<hello xmlns=\"{s}\">\n", .{base_ns});
     try w.writeAll("  <capabilities>\n");
-    for (uris) |u| try w.print("    <capability>{s}</capability>\n", .{u});
+    for (uris) |u| {
+        try w.writeAll("    <capability>");
+        // Routed through the same character-data escaping every other text
+        // emission in the module uses (`rpc.writeEscaped`) -- this was the
+        // one un-escaped text emission left: a caller-supplied vendor
+        // capability URI containing `&`/`<`/`>` produced a malformed
+        // `<hello>` (wave-2 audit finding `netconf` F5).
+        try rpc.writeEscaped(w, u);
+        try w.writeAll("</capability>\n");
+    }
     try w.writeAll("  </capabilities>\n");
     if (session_id) |sid| try w.print("  <session-id>{d}</session-id>\n", .{sid});
     try w.writeAll("</hello>\n");
 }
 
 const framing = @import("framing.zig");
+const rpc = @import("rpc.zig");
 
 /// RFC 6242 §4.1: chunked framing iff BOTH peers advertise `:base:1.1`.
 /// Also enforces RFC 6241 §8.1's "MUST verify that the other peer has
@@ -359,6 +370,39 @@ test "negotiate: the dialect is the capability intersection, nothing else" {
     try testing.expectEqual(framing.Dialect.end_of_message, try negotiate(&only10, &only10));
     try testing.expectError(error.NoCommonBaseVersion, negotiate(&only10, &only11));
     try testing.expectError(error.NoCommonBaseVersion, negotiate(&both, &none));
+}
+
+test "F4 regression: default_client_capabilities advertises :notification:1.0, matching its own doc comment" {
+    // Before the fix, the array held only the two base versions while its
+    // doc comment claimed "plus the notification capability, which is what
+    // makes create-subscription legal" -- `Client.createSubscription` was
+    // exposed regardless, so a default-configured client would subscribe
+    // without ever having advertised the capability (wave-2 audit finding
+    // `netconf` F4).
+    var found = false;
+    for (default_client_capabilities) |c| {
+        if (std.mem.eql(u8, c, cap_notification)) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "F5 regression: writeHello escapes a capability URI's XML metacharacters" {
+    // Before the fix, `writeHello` emitted each capability URI with a raw
+    // `w.print("<capability>{s}</capability>", .{u})` -- the one
+    // un-escaped text emission in the module, unlike every other text
+    // value which is routed through `rpc.writeEscaped` (wave-2 audit
+    // finding `netconf` F5). A caller-supplied vendor capability URI
+    // containing `&`/`<`/`>` produced a malformed `<hello>`.
+    const gpa = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const hostile = [_][]const u8{"urn:example:cap?a=1&b=<2>"};
+    try writeHello(&aw.writer, &hostile, null);
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "a=1&amp;b=&lt;2&gt;") != null);
+    // And it must not contain the raw, unescaped metacharacters inside the
+    // capability element (would make the XML ill-formed).
+    try testing.expect(std.mem.indexOf(u8, out, "a=1&b=<2>") == null);
 }
 
 test "writeHello round-trips through parseHello" {

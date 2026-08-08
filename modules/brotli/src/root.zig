@@ -121,6 +121,43 @@ test "decode: output cap enforced (DoS guard)" {
     try testing.expectError(error.OutputTooLarge, decompress(testing.allocator, comp, .{ .max_output = 1000 }));
 }
 
+test "F3 regression: DEFAULT options bound output relative to input size, not just the 256 MiB absolute cap" {
+    // Before the fix, `Options.max_output`'s default (256 MiB) was the ONLY
+    // guard: a several-KB `br` body could legitimately cost up to 256 MiB
+    // of RSS with the caller never having opted into anything but the
+    // defaults (wave-2 audit finding `brotli` F3). This 14-byte stream
+    // (produced independently by the reference `brotli` Python package --
+    // `brotli.compress(b'\x00' * 4*1024*1024)` -- not this module's own
+    // encoder) decompresses to 4 MiB of zeros, a ~300000x ratio. Under
+    // completely default `Options{}` it must now be refused: 4 MiB is far
+    // past both the 1 MiB floor and any reasonable ratio of a 14-byte input.
+    const bomb = [_]u8{ 0x9b, 0xff, 0xff, 0x3f, 0xf8, 0x27, 0x00, 0xe2, 0xb1, 0x40, 0x20, 0xf7, 0xfe, 0x07 };
+    try testing.expectError(error.OutputTooLarge, decompress(testing.allocator, &bomb, .{}));
+    // Positive control: the same bytes DO decode correctly once a caller
+    // deliberately opts out of the ratio guard too (raising `max_output`
+    // alone is not enough -- `max_ratio`/`min_output_floor` are separate
+    // knobs precisely so raising the absolute ceiling doesn't silently
+    // also waive the ratio policy), so the rejection above is the
+    // ratio/floor guard, not a decoder bug on this input.
+    const out = try decompress(testing.allocator, &bomb, .{
+        .max_output = 8 * 1024 * 1024,
+        .min_output_floor = 8 * 1024 * 1024,
+    });
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(usize, 4 * 1024 * 1024), out.len);
+    for (out) |b| try testing.expectEqual(@as(u8, 0), b);
+
+    // Positive control: the guard does NOT fire for a legitimately small
+    // decompressed size at a tiny ratio (the existing `zeros` fixture, 13
+    // bytes -> 256 KiB, already exercised via `expectDecodes` elsewhere in
+    // this file with default options -- this makes the "the floor rescues
+    // it" reasoning explicit and pinned).
+    const zeros_comp = @embedFile("testdata/zeros.compressed");
+    const zeros_out = try decompress(testing.allocator, zeros_comp, .{});
+    defer testing.allocator.free(zeros_out);
+    try testing.expectEqual(@as(usize, 256 * 1024), zeros_out.len);
+}
+
 test "decode: truncated input errors, never panics" {
     const comp = @embedFile("testdata/alice29.txt.compressed");
     // A batch of truncations must all error cleanly (no panic, no crash).

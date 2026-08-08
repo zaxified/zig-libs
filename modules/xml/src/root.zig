@@ -792,10 +792,13 @@ const Parser = struct {
         const start = self.i;
         self.i += "<![CDATA[".len;
         const body_start = self.i;
-        while (self.i + 2 < self.src.len + 1) : (self.i += 1) {
-            if (self.i + 2 < self.src.len + 1 and self.i + 2 <= self.src.len and
-                self.i + 3 <= self.src.len and std.mem.eql(u8, self.src[self.i .. self.i + 3], "]]>"))
-            {
+        // The loop runs exactly while a 3-byte "]]>" read at `self.i` is
+        // in bounds — one guard, not three overlapping reformulations of
+        // it (the previous shape mixed a `+ 1`-fudged outer bound with two
+        // more bound checks and a separate inner `break`, which read as
+        // safe but was one edit away from an OOB slice).
+        while (self.i + 3 <= self.src.len) : (self.i += 1) {
+            if (std.mem.eql(u8, self.src[self.i .. self.i + 3], "]]>")) {
                 const body = self.src[body_start..self.i];
                 try self.validateChars(body);
                 self.i += 3;
@@ -803,7 +806,6 @@ const Parser = struct {
                 try top.children.append(self.a, .{ .content = .{ .cdata = body }, .span = .{ .start = start, .end = self.i } });
                 return;
             }
-            if (self.i + 3 > self.src.len) break;
         }
         return error.MalformedCData;
     }
@@ -1327,6 +1329,28 @@ test "namespaces: default, prefixed, scoping, shadowing, resolution" {
     try testing.expectEqualStrings("urn:x", d.resolveNs("x").?);
     // default at <d> is d2
     try testing.expectEqualStrings("urn:d2", d.resolveNs("").?);
+}
+
+// W2-B/xml-F3: `parseCData`'s old loop bound was three overlapping
+// reformulations of "room for a 3-byte read" (a `+1`-fudged outer `while`,
+// two more inline checks, and a separate inner `break`) — the audit called
+// it "one edit away from an OOB". No existing test ever drove an
+// *unterminated* CDATA section at all, so a bound that was off by one in
+// either direction would not have been caught. This tries every truncation
+// length near the boundary and requires a typed error, never a panic.
+test "parseCData: unterminated CDATA is MalformedCData (never a panic) at every truncation length near the boundary" {
+    const gpa = testing.allocator;
+    var len: usize = 0;
+    while (len <= 12) : (len += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "<doc><![CDATA[");
+        var i: usize = 0;
+        while (i < len) : (i += 1) try buf.append(gpa, 'x');
+        // Deliberately no closing "]]>" (and no "</doc>" either — parseCData
+        // must fail on its own bound, not on a later well-formedness check).
+        try testing.expectError(error.MalformedCData, parse(gpa, buf.items, .{}));
+    }
 }
 
 test "infoset fidelity: prefixes, comments, PIs, CDATA, mixed content" {

@@ -14,9 +14,42 @@ const errors = @import("errors.zig");
 pub const BrotliError = errors.BrotliError;
 
 pub const Options = struct {
-    /// Hard cap on decompressed size (DoS guard). Default 256 MiB.
+    /// Hard cap on decompressed size (DoS guard). Default 256 MiB. This
+    /// alone is an absolute-only bound: at the default, a few-KB `br` body
+    /// can cost up to 256 MiB of RSS regardless of its own size, which is
+    /// the wrong default for decompressing an untrusted, attacker-sized
+    /// body (wave-2 audit finding `brotli` F3). `decompress` combines it
+    /// with `max_ratio`/`min_output_floor` below — see `effectiveCap`.
     max_output: usize = 256 * 1024 * 1024,
+    /// Output-to-input expansion ratio allowed once `min_output_floor` is
+    /// exceeded (see `effectiveCap`). 10000x is deliberately generous: this
+    /// decoder's own test corpus legitimately hits ~20000x on a run of
+    /// zeros (13 bytes -> 256 KiB, `testdata/zeros.compressed`), which is
+    /// why that case is rescued by the floor rather than the ratio — the
+    /// ratio bound exists to catch a *few-KB* hostile body inflating all
+    /// the way to the absolute cap, not to bound legitimately
+    /// highly-compressible small payloads.
+    max_ratio: usize = 10000,
+    /// Below this absolute output size, the ratio bound above does not
+    /// apply at all: a decompressed size this small is not a meaningful
+    /// memory-exhaustion risk on its own, whatever the input was.
+    ///
+    /// `max_ratio`/`min_output_floor` are deliberately independent of
+    /// `max_output`: raising `max_output` alone does not also waive the
+    /// ratio policy (see `effectiveCap`) -- a caller who wants to opt out
+    /// of ratio-based rejection for a specific trusted source must raise
+    /// this floor (or `max_ratio`) explicitly, not just the absolute cap.
+    min_output_floor: usize = 1024 * 1024,
 };
+
+/// The output cap actually enforced for a stream of `input_len` bytes:
+/// the smaller of the absolute `max_output` and a ratio bound relative to
+/// `input_len`, but the ratio bound never drops below `min_output_floor`.
+pub fn effectiveCap(options: Options, input_len: usize) usize {
+    const ratio_bound = input_len *| options.max_ratio;
+    const bounded = @max(options.min_output_floor, ratio_bound);
+    return @min(options.max_output, bounded);
+}
 
 const block_size_cap: u32 = 1 << 24;
 
@@ -648,7 +681,7 @@ pub fn decompress(gpa: std.mem.Allocator, input: []const u8, options: Options) B
         .arena = arena_state.allocator(),
         .br = &br,
         .out = &out,
-        .max_output = options.max_output,
+        .max_output = effectiveCap(options, input.len),
     };
     try dec.run();
 

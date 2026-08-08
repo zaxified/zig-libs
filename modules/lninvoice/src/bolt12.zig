@@ -50,6 +50,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const lnwire = @import("lnwire");
 const bip340 = @import("bip340");
 const bech32raw = @import("bech32_raw.zig");
@@ -253,18 +254,6 @@ fn branchHash(a: [32]u8, b: [32]u8) [32]u8 {
     return bip340.taggedHash("LnBranch", &buf);
 }
 
-/// `H("LnNonce"||first_tlv, tlv_type)` — the *tag* is the literal string
-/// `"LnNonce"` concatenated with the whole first TLV record of the stream
-/// (so it varies per stream and cannot use the comptime-midstate helper),
-/// and the message is the current record's type-field bytes.
-/// `bip340.hash.taggedHashRuntime` implements the shared runtime-tag form
-/// of the tagged-hash definition `SHA256(SHA256(tag) || SHA256(tag) ||
-/// msg)`, taking the tag as parts so the `"LnNonce" || first_tlv`
-/// concatenation needs no intermediate buffer.
-fn nonceLeaf(first_tlv: []const u8, type_bytes: []const u8) [32]u8 {
-    return bip340.hash.taggedHashRuntime(&.{ "LnNonce", first_tlv }, type_bytes);
-}
-
 /// Recursively combine an ascending list of (already leaf+nonce-paired) node
 /// hashes into a single root. When `nodes.len` is not a power of two, the
 /// split is the largest power of two strictly less than the length — BOLT#12:
@@ -296,6 +285,15 @@ pub fn merkleRoot(allocator: Allocator, tlv_stream: []const u8) MerkleError![32]
     defer nodes.deinit(allocator);
 
     var first_tlv: ?[]const u8 = null;
+    // `H("LnNonce"||first_tlv, tlv_type)` per leaf — the *tag* is
+    // `"LnNonce"` concatenated with the whole first TLV record, so it is
+    // fixed for the rest of this stream once `first_tlv` is known. Computed
+    // once as a midstate (`bip340.hash.taggedHasherRuntime` absorbs the
+    // tag's fixed 64-byte prefix and returns a snapshot right at that block
+    // boundary — a plain value-copy of it is a legitimate continuation
+    // point, per the module's own doc comment) instead of re-hashing
+    // `"LnNonce" || first_tlv` from scratch for every record.
+    var nonce_base: ?Sha256 = null;
     var offset: usize = 0;
     while (offset < tlv_stream.len) {
         const type_start = offset;
@@ -311,9 +309,14 @@ pub fn merkleRoot(allocator: Allocator, tlv_stream: []const u8) MerkleError![32]
         offset += len;
 
         if (isSignatureType(t.value)) continue;
-        if (first_tlv == null) first_tlv = rec_bytes;
+        if (first_tlv == null) {
+            first_tlv = rec_bytes;
+            nonce_base = bip340.hash.taggedHasherRuntime(&.{ "LnNonce", rec_bytes });
+        }
         const leaf = bip340.taggedHash("LnLeaf", rec_bytes);
-        const nonce = nonceLeaf(first_tlv.?, type_bytes);
+        var nonce_hasher = nonce_base.?;
+        nonce_hasher.update(type_bytes);
+        const nonce = nonce_hasher.finalResult();
         try nodes.append(allocator, branchHash(leaf, nonce));
     }
     if (nodes.items.len == 0) return error.EmptyMerkleStream;

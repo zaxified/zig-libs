@@ -140,13 +140,17 @@ pub fn fingerprint(compressed_pubkey: [33]u8) [4]u8 {
 pub fn ckdPriv(parent: ExtendedPrivKey, index: u32) CkdError!ExtendedPrivKey {
     const hardened = index >= hardened_offset;
 
+    // Computed once and reused for both the non-hardened HMAC input and the
+    // parent fingerprint below — `pubkeyFromPriv` is a scalar EC multiply,
+    // not free, and the parent scalar does not change within this call.
+    const parent_pub = pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey;
+
     var data: [37]u8 = undefined;
     defer std.crypto.secureZero(u8, &data); // holds the parent privkey when hardened
     if (hardened) {
         data[0] = 0x00;
         @memcpy(data[1..33], &parent.privkey);
     } else {
-        const parent_pub = pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey;
         @memcpy(data[0..33], &parent_pub);
     }
     std.mem.writeInt(u32, data[33..37], index, .big);
@@ -165,8 +169,6 @@ pub fn ckdPriv(parent: ExtendedPrivKey, index: u32) CkdError!ExtendedPrivKey {
     var child_priv = Secp256k1.scalar.add(parent.privkey, il, .big) catch return error.InvalidChildKey;
     defer std.crypto.secureZero(u8, &child_priv);
     if (std.mem.allEqual(u8, &child_priv, 0)) return error.InvalidChildKey;
-
-    const parent_pub = pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey;
 
     return .{
         .depth = parent.depth +% 1,
@@ -363,7 +365,12 @@ pub const PathError = error{
 /// mark hardened) into raw BIP-32 child indices (hardened offset already
 /// folded in) written into `out`.
 pub fn parsePath(path: []const u8, out: []u32) PathError![]const u32 {
-    var it = std.mem.tokenizeScalar(u8, path, '/');
+    // `splitScalar`, not `tokenizeScalar`: tokenize silently collapses empty
+    // segments, so a doubled or trailing `/` (`m//0/`) would parse as `m/0`
+    // instead of being rejected. A derivation path is an identity — two
+    // spellings must not map to the same key path (wave-2 audit finding
+    // `bip32` F5).
+    var it = std.mem.splitScalar(u8, path, '/');
     var count: usize = 0;
     var first = true;
     while (it.next()) |seg| {
@@ -383,6 +390,13 @@ pub fn parsePath(path: []const u8, out: []u32) PathError![]const u32 {
             }
         }
         if (s.len == 0) return error.InvalidPathSegment;
+        // Digits only: `std.fmt.parseUnsigned` on its own accepts a leading
+        // `+` and `_` digit separators (Zig number-literal leniency), which
+        // would let `m/+5` and `m/1_0'` parse as valid indices distinct in
+        // spelling but identical in the index they produce.
+        for (s) |c| {
+            if (c < '0' or c > '9') return error.InvalidPathSegment;
+        }
         const idx = std.fmt.parseUnsigned(u32, s, 10) catch return error.InvalidPathSegment;
         if (idx >= hardened_offset) return error.IndexOutOfRange;
 
@@ -486,6 +500,26 @@ test "parsePath: m/44'/0'/0'/0/0 and bare relative paths" {
     // first and hit InvalidPathSegment instead — this exercises the range
     // check specifically, not the parse-overflow path).
     try testing.expectError(error.IndexOutOfRange, parsePath("m/2147483648", &out)); // 2^31
+}
+
+test "F5 regression: parsePath rejects +/_ leniency and empty segments from doubled/trailing slashes" {
+    var out: [max_path_depth]u32 = undefined;
+
+    // `std.fmt.parseUnsigned` on its own accepts these; the path parser must
+    // not, or `m/+5` and `m/5` become the same identity under two spellings.
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/+5", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/1_0'", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/-5", &out));
+
+    // Doubled/trailing/leading slashes must not silently collapse to a
+    // shorter, differently-spelled path.
+    try testing.expectError(error.InvalidPathSegment, parsePath("m//0", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/0/", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("/m/0", &out));
+
+    // Positive control: the legitimate spelling still parses.
+    const p = try parsePath("m/0", &out);
+    try testing.expectEqualSlices(u32, &.{0}, p);
 }
 
 test "derivePath matches manual chained ckdPriv" {

@@ -161,9 +161,29 @@ pub const BumTree = struct {
     }
 
     /// Is `node` an I-SID member (→ local delivery)? False for an out-of-range id.
+    ///
+    /// NOTE: `true` does not by itself mean `node` will ever RECEIVE a
+    /// BUM-from-source frame to deliver locally -- `is_member` is set for
+    /// every in-range member id, even one unreachable from `source`, which
+    /// "simply never receives the frame" (see `NodePlan.is_member`'s doc
+    /// comment). A caller that wants "will this node actually deliver
+    /// locally" must consult `deliversLocally`, not this alone (wave-2
+    /// audit finding `bumtree` F5).
     pub fn isMember(self: *const BumTree, node: NodeId) bool {
         if (node >= self.node_count) return false;
         return self.nodes[node].is_member;
+    }
+
+    /// Is `node` an I-SID member that will ACTUALLY deliver a
+    /// BUM-from-source frame locally? True iff `isMember(node)` AND `node`
+    /// is reachable from `source` -- either `node == source` (the source
+    /// always "receives" its own originated frame) or `rpfIngress(node) !=
+    /// null` (it has an SPT predecessor, i.e. it's on the tree). Closes the
+    /// gap `isMember` alone leaves: an in-range member partitioned away
+    /// from `source` has `isMember == true` but `deliversLocally == false`.
+    pub fn deliversLocally(self: *const BumTree, node: NodeId) bool {
+        if (!self.isMember(node)) return false;
+        return node == self.source or self.rpfIngress(node) != null;
     }
 };
 
@@ -707,6 +727,20 @@ test "degenerate: source not in graph, no members, single member == source, isol
         try testing.expectEqual(@as(?NodeId, null), bt.rpfIngress(2));
         // Members are flagged even though unreachable (they never receive).
         try testing.expect(bt.isMember(1) and bt.isMember(2));
+        // F5 regression: `isMember` alone is a trap here -- both are
+        // members but neither will ever actually deliver, since neither is
+        // reachable from source 0. `deliversLocally` must say so.
+        try testing.expect(!bt.deliversLocally(1));
+        try testing.expect(!bt.deliversLocally(2));
+        // The source itself always delivers locally when it's a member
+        // (positive control, reusing the "single member == source" case
+        // above's tree shape via a fresh build here for a self-contained
+        // assertion).
+        var g2 = try goldenGraph(gpa);
+        defer g2.deinit();
+        var bt2 = try build(gpa, &g2, 0, &.{0});
+        defer bt2.deinit();
+        try testing.expect(bt2.deliversLocally(0));
     }
 }
 

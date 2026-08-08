@@ -781,8 +781,16 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             const script_code = try scriptCodeFor(allocator, state.script, state.last_codesep, state.sig_version, state.flags, sigs);
 
             if (stack.items.len < 1) return error.InvalidStackOperation;
+            // Popped here (the dummy element must come off the stack either
+            // way) but the NULLDUMMY check itself is deferred until after
+            // the matching loop's NULLFAIL check below: Core's
+            // `OP_CHECKMULTISIG` raises `SIG_NULLFAIL` inside the
+            // stack-cleanup loop that runs BEFORE it pops the dummy and
+            // raises `SIG_NULLDUMMY`, so a script violating both must
+            // report `SigNullfail`, not `SigNulldummy` (wave-2 audit
+            // finding `bitcoinscript` F7 — error-class ordering, not the
+            // pass/fail verdict, which was already correct either way).
             const dummy = stack.pop().?;
-            if (state.flags.nulldummy and dummy.len != 0) return error.SigNulldummy;
 
             // Direct translation of Bitcoin Core's matching loop
             // (`interpreter.cpp` `OP_CHECKMULTISIG`): `key_i`/`sig_i` index
@@ -823,6 +831,8 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
                     if (s.len != 0) return error.SigNullfail;
                 }
             }
+
+            if (state.flags.nulldummy and dummy.len != 0) return error.SigNulldummy;
 
             if (opcode == @intFromEnum(Opcode.OP_CHECKMULTISIGVERIFY)) {
                 if (!success) return error.Checkmultisigverify;

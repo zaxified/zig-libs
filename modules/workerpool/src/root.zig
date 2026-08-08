@@ -53,6 +53,35 @@ comptime {
     std.debug.assert(@sizeOf(usize) <= @sizeOf(u64));
 }
 
+/// Test-and-test-and-set mutual exclusion for `submit`'s shared-producer
+/// path, escalating through `lockfree.Backoff` instead of a bare
+/// `spinLoopHint()` spin — the same shape as this repo's `kv` F1 (a
+/// preempted lock holder otherwise stalls every other `submit` caller for a
+/// full scheduler quantum with no yield/backoff). Not `lockfree.SpinLock`:
+/// that type is documented "test-only... never used on a lock-free path",
+/// so a real production lock lives here instead of widening that type's
+/// contract.
+const BackoffSpinLock = struct {
+    state: std.atomic.Value(u32) = .init(unlocked),
+
+    const unlocked: u32 = 0;
+    const locked: u32 = 1;
+
+    fn lock(self: *BackoffSpinLock) void {
+        if (self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+        var backoff: lockfree.Backoff = .{};
+        while (true) {
+            while (self.state.load(.monotonic) != unlocked) backoff.pause();
+            if (self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+            backoff.pause();
+        }
+    }
+
+    fn unlock(self: *BackoffSpinLock) void {
+        self.state.store(unlocked, .release);
+    }
+};
+
 pub const meta = .{
     // std.Thread + std.atomic + the std.Io futex are cross-OS; the pool logic
     // is portable. (The blocking wait needs an `Io`, which the caller supplies.)
@@ -168,7 +197,7 @@ pub const WorkerPool = struct {
     /// their own participants. Also used single-threaded at teardown to drain
     /// leftover boxes.
     shared_producer: *Participant,
-    producer_lock: lockfree.SpinLock = .{},
+    producer_lock: BackoffSpinLock = .{},
 
     /// Idle-worker wakeup generation. Bumped (and a futex wake issued) after
     /// every publish and every state transition; workers park on a snapshot of
@@ -790,6 +819,57 @@ test "STRESS: many concurrent producers via Submitter + pool consuming (MP)" {
         threads[i] = try std.Thread.spawn(.{}, Producer.run, .{pr});
     }
     // Producers must quiesce (join) before drain — the lifecycle contract.
+    for (&threads) |*t| t.join();
+
+    pool.drain();
+    try testing.expectEqual(n_producers * per_producer, c.n.load(.seq_cst));
+    try testing.expectEqual(n_producers * per_producer, pool.completedCount());
+}
+
+// W2-B/workerpool-F5: `producer_lock` (guarding the shared zero-setup
+// `submit` path) had no test exercising it under real concurrent contention
+// — every other `submit`-path test calls it sequentially from one thread;
+// only the `Submitter` stress test above spawns real threads, and each
+// `Submitter` has its own participant, entirely bypassing `producer_lock`.
+// This spawns several real OS threads all calling the SAME `WorkerPool.submit`
+// (the shared-producer path) concurrently — the shape that actually exercises
+// mutual exclusion under contention — and checks no job is lost or
+// double-counted, which a broken lock (or a bare-spin lock racing a
+// descheduled holder) could otherwise silently corrupt.
+test "STRESS: many concurrent producers via the SHARED submit path (producer_lock under real contention)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const n_producers = 8;
+    const per_producer: u64 = 5_000;
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 6 });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 30_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+
+    const Producer = struct {
+        pool: *WorkerPool,
+        counter: *Counter,
+        count: u64,
+        fn run(self: *@This()) void {
+            var i: u64 = 0;
+            while (i < self.count) : (i += 1)
+                self.pool.submit(.{ .func = incr, .ctx = self.counter }) catch @panic("submit");
+        }
+    };
+
+    var producers: [n_producers]Producer = undefined;
+    var threads: [n_producers]std.Thread = undefined;
+    for (&producers, 0..) |*pr, i| {
+        pr.* = .{ .pool = pool, .counter = &c, .count = per_producer };
+        threads[i] = try std.Thread.spawn(.{}, Producer.run, .{pr});
+    }
     for (&threads) |*t| t.join();
 
     pool.drain();

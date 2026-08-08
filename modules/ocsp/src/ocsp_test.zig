@@ -33,6 +33,7 @@ const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }
 const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
 const oid_p256_curve = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
 const oid_sha256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+const oid_sha1 = [_]u8{ 0x2b, 0x0e, 0x03, 0x02, 0x1a };
 const oid_ocsp_basic = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01 };
 const oid_ocsp_nonce = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02 };
 const oid_ext_key_usage = [_]u8{ 0x55, 0x1d, 0x25 }; // 2.5.29.37
@@ -217,7 +218,37 @@ fn nonceExtsDer(b: der_writer.Builder, nonce: []const u8) ![]const u8 {
     return b.explicit(1, try b.seqOf(&.{nonce_ext})); // responseExtensions [1]
 }
 
+/// A CertID that names the same issuer as `spec` under SHA-1 (not SHA-256)
+/// but with a deliberately wrong hash/serial — so it never matches, but it
+/// *does* force a SHA-1 issuer-digest computation ahead of the real
+/// SHA-256 entry when both are walked in one `BasicOCSPResponse`.
+fn decoySha1CertIdDer(b: der_writer.Builder) ![]const u8 {
+    const zero20 = [_]u8{0} ** 20;
+    const alg = try b.seq(&.{ try b.oid(&oid_sha1), try b.null() });
+    return b.seq(&.{
+        alg,
+        try b.octet(&zero20),
+        try b.octet(&zero20),
+        try b.integerRaw(&[_]u8{0x01}),
+    });
+}
+
 fn buildResponse(gpa: std.mem.Allocator, spec: RespSpec) ![]u8 {
+    return buildResponseImpl(gpa, spec, false);
+}
+
+/// Same as `buildResponse`, but the `responses` SEQUENCE OF carries an extra,
+/// non-matching SHA-1 `SingleResponse` *ahead of* the real SHA-256 one —
+/// regression coverage for W2-B/ocsp-F6: `findMatchingSingle`'s per-algorithm
+/// issuer-digest cache must key on the CertID's actual hash algorithm, not
+/// just "the first algorithm seen in this walk", or the SHA-1 decoy's cached
+/// digest gets silently reused (wrong length, wrong bytes) for the real
+/// SHA-256 entry and the genuinely matching response is missed.
+fn buildResponseWithSha1Decoy(gpa: std.mem.Allocator, spec: RespSpec) ![]u8 {
+    return buildResponseImpl(gpa, spec, true);
+}
+
+fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const b: der_writer.Builder = .{ .a = arena.allocator() };
@@ -234,7 +265,19 @@ fn buildResponse(gpa: std.mem.Allocator, spec: RespSpec) ![]u8 {
         try single_parts.append(b.a, try b.explicit(0, try b.generalizedTime(nu)));
     }
     const single = try b.seq(single_parts.items);
-    const responses = try b.seqOf(&.{single});
+    const responses = if (with_decoy) blk: {
+        var decoy_parts = std.ArrayList([]const u8).empty;
+        try decoy_parts.appendSlice(b.a, &[_][]const u8{
+            try decoySha1CertIdDer(b),
+            try statusDer(b, spec.status),
+            try b.generalizedTime(spec.this_update),
+        });
+        if (spec.next_update) |nu| {
+            try decoy_parts.append(b.a, try b.explicit(0, try b.generalizedTime(nu)));
+        }
+        const decoy = try b.seq(decoy_parts.items);
+        break :blk try b.seqOf(&.{ decoy, single });
+    } else try b.seqOf(&.{single});
 
     // ResponseData (tbs): responderID byName [1] or byKey [2], producedAt, responses [, exts]
     const responder_id = if (spec.responder_by_name) |name|
@@ -572,6 +615,35 @@ test "verify: CertID for a different serial → CertIdMismatch" {
 
     const parsed = try ocsp.parseResponse(resp_der);
     try testing.expectError(error.CertIdMismatch, ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()));
+}
+
+// W2-B/ocsp-F6: `findMatchingSingle` walks a `BasicOCSPResponse`'s
+// `responses` and caches the issuer's name/key digests to avoid recomputing
+// them per entry. RFC 6960 lets different SingleResponses use different
+// CertID hash algorithms, so the cache must key on the algorithm actually in
+// each CertID — not just compute once and reuse regardless. This response
+// carries a non-matching SHA-1 entry ahead of the real SHA-256 one; a cache
+// that ignores the algorithm would populate itself from the SHA-1 entry and
+// then wrongly reuse those (wrong-length) digests for the SHA-256 entry,
+// missing the genuine match.
+test "verify: a non-matching SHA-1 entry ahead of the real SHA-256 one does not poison the digest cache" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    const resp_der = try buildResponseWithSha1Decoy(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = issuer.subject_name,
+        .sign_rsa = fx.kp.secret_key,
+    });
+    defer gpa.free(resp_der);
+
+    const parsed = try ocsp.parseResponse(resp_der);
+    const verdict = try ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts());
+    try testing.expect(verdict.status == .good);
 }
 
 test "verify: stale response (now > nextUpdate) → ResponseStale" {

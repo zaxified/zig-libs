@@ -114,3 +114,31 @@ test "script_tests.json pinned subset: every vector's result class matches Bitco
     try testing.expect(err_count > 100);
     try testing.expectEqual(vectors_mod.vectors.len, ok_count + err_count);
 }
+
+test "F7 regression: NULLFAIL takes precedence over NULLDUMMY when a script violates both" {
+    // Reuses the exact scriptSig/scriptPubKey bytes of the pinned corpus's
+    // "3-of-3 NOT with invalid sig with nonzero dummy" vector
+    // (`script_tests_vectors.zig`, NULLDUMMY-only there, expect="SigNulldummy")
+    // but additionally turns on NULLFAIL -- this row is hand-authored, NOT
+    // part of the machine-transcribed `script_tests.json` corpus, so it does
+    // not belong in `script_tests_vectors.zig`.
+    //
+    // Before the fix, `interpreter.zig`'s OP_CHECKMULTISIG popped the dummy
+    // element and raised SigNulldummy BEFORE running the sig/pubkey matching
+    // loop, so it always won regardless of NULLFAIL. Bitcoin Core's own
+    // OP_CHECKMULTISIG raises SIG_NULLFAIL inside the matching loop's
+    // stack-cleanup step, which runs BEFORE it pops the dummy and raises
+    // SIG_NULLDUMMY -- so a script violating both must report SigNullfail,
+    // not SigNulldummy (wave-2 audit finding `bitcoinscript` F7). The
+    // pass/fail verdict was never wrong; only the reported error class was.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v: vectors_mod.Vector = .{
+        .script_sig = "1 0x47 0x304402201bb2edab700a5d020236df174fefed78087697143731f659bea59642c759c16d022061f42cdbae5bcd3e8790f20bf76687443436e94a634321c16a72aa54cbc7c2ea01 0x47 0x304402204bb4a64f2a6e5c7fb2f07fef85ee56fde5e6da234c6a984262307a20e99842d702206f8303aaba5e625d223897e2ffd3f88ef1bcffef55f38dc3768e5f2e94c923f901 0x47 0x3044022040c2809b71fffb155ec8b82fe7a27f666bd97f941207be4e14ade85a1249dd4d02204d56c85ec525dd18e29a0533d5ddf61b6b1bb32980c2f63edf951aebf7a27bfe01",
+        .script_pubkey = "3 0x21 0x0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 0x21 0x038282263212c609d9ea2a6e3e172de238d8c39cabd5ac1ca10646e23fd5f51508 0x21 0x03363d90d447b00c9c99ceac05b6262ee053441c7e55552ffe526bad8f83ff4640 3 CHECKMULTISIG NOT",
+        .flags = .{ .nulldummy = true, .nullfail = true },
+        .expect = "SigNullfail",
+        .comment = "F7 regression: both NULLDUMMY and NULLFAIL violated -> Core reports SigNullfail first",
+    };
+    try runVector(arena.allocator(), v);
+}

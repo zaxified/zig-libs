@@ -33,7 +33,19 @@ pub const HeaderError = error{
     ControlCharacterInHeader,
     /// A line could not be folded below `Options.max_line`.
     LineTooLong,
+    /// `Address.addr` isn't `command.validateMailbox`-shaped. Without this,
+    /// `writeAddress`/`writeAddressList` validated only CR/LF/NUL
+    /// (`checkValue`) and then interpolated `addr` straight into
+    /// `"<{s}>{s}"` -- an `addr` of `a@x.test>, <victim@y.test` produced a
+    /// forged second visible recipient for any caller using this layer
+    /// directly (`message.writeAddrHeader` already closed this by routing
+    /// through `command.validateMailbox` first; this module is documented
+    /// as "each usable on its own", so it needed the same gate — wave-2
+    /// audit finding `smtp` F4).
+    InvalidAddress,
 } || std.Io.Writer.Error;
+
+const command = @import("command.zig");
 
 pub const Options = struct {
     /// Where folding starts trying to break (RFC 5322 §2.1.1 "SHOULD").
@@ -322,6 +334,10 @@ fn writeQuotedName(f: *Folder, s: []const u8) HeaderError!void {
 /// opportunity (the comma of an address list).
 pub fn writeAddress(f: *Folder, a: Address, trailing: []const u8, opts: Options) HeaderError!void {
     try checkValue(a.addr);
+    command.validateMailbox(a.addr, .{}, true) catch |e| return switch (e) {
+        error.ControlCharacterInArgument => error.ControlCharacterInHeader,
+        else => error.InvalidAddress,
+    };
     if (a.name) |n| {
         try checkValue(n);
         if (headerTextNeedsEncoding(n)) {
@@ -753,6 +769,22 @@ fn decodeEncodedWord(gpa: std.mem.Allocator, word: []const u8, out: *std.ArrayLi
             }
         }
     }
+}
+
+test "F4 regression: writeAddressList refuses an addr that would forge a second recipient" {
+    // Before the fix, `writeAddress`/`writeAddressList` validated only
+    // CR/LF/NUL and then interpolated `addr` straight into `"<{s}>{s}"` --
+    // an `addr` of `a@x.test>, <victim@y.test` produced `To: <a@x.test>,
+    // <victim@y.test>`, a forged second visible recipient, for any caller
+    // using this layer directly (`message.writeAddrHeader` already closed
+    // this via `command.validateMailbox`, but `mime` is documented as
+    // "each usable on its own" -- wave-2 audit finding `smtp` F4).
+    const gpa = testing.allocator;
+    const hostile = Address{ .addr = "a@x.test>, <victim@y.test" };
+    try testing.expectError(
+        error.InvalidAddress,
+        renderHeader(gpa, writeAddressList, .{ "To", &[_]Address{hostile}, Options{} }),
+    );
 }
 
 test "address headers: display names plain, quoted and encoded" {

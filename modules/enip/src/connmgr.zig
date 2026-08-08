@@ -61,6 +61,12 @@ pub const DecodeError = error{
     ConnectionPathOverruns,
     /// The reserved octet after a route-path size is not zero.
     BadReserved,
+    /// Bytes remain after the last declared field. Unlike `encap.decode`
+    /// (exact) and `cpf.decode` (`TrailingData`), these three bodies used
+    /// to be silent prefix decoders with no name saying so -- a consumer
+    /// calling `decode` alone would accept a padded body without knowing it
+    /// (wave-2 audit finding `enip` F3).
+    TrailingData,
 };
 
 pub const EncodeError = error{
@@ -129,6 +135,7 @@ pub const UnconnectedSend = struct {
         if (bytes[off + 1] != 0) return error.BadReserved;
         off += 2;
         if (off + route_words * 2 > bytes.len) return error.RoutePathOverruns;
+        if (off + route_words * 2 != bytes.len) return error.TrailingData;
         return .{
             .timeout = .{ .priority_time_tick = bytes[0], .timeout_ticks = bytes[1] },
             .embedded = embedded,
@@ -399,6 +406,7 @@ pub const ForwardOpen = struct {
         const path_words: usize = bytes[off];
         off += 1;
         if (off + path_words * 2 > bytes.len) return error.ConnectionPathOverruns;
+        if (off + path_words * 2 != bytes.len) return error.TrailingData;
         return .{
             .timeout = timeout,
             .o_to_t_connection_id = o_t_id,
@@ -540,6 +548,7 @@ pub const ForwardClose = struct {
         if (bytes.len < 12) return error.Truncated;
         const words: usize = bytes[10];
         if (12 + words * 2 > bytes.len) return error.ConnectionPathOverruns;
+        if (12 + words * 2 != bytes.len) return error.TrailingData;
         return .{
             .timeout = .{ .priority_time_tick = bytes[0], .timeout_ticks = bytes[1] },
             .connection_serial = std.mem.readInt(u16, bytes[2..4], .little),
@@ -687,6 +696,14 @@ test "unconnected send pads an odd embedded message and not an even one" {
     try testing.expectEqual(@as(usize, 2 + 2 + 8 + 2 + 2), wire2.len);
     const back2 = try UnconnectedSend.decode(wire2);
     try testing.expectEqualSlices(u8, &even, back2.embedded);
+
+    // F3 regression: bytes past the declared route path used to be
+    // silently accepted (`decode` was a prefix decoder with no name saying
+    // so) -- wave-2 audit finding `enip` F3.
+    var padded: [64]u8 = undefined;
+    @memcpy(padded[0..wire2.len], wire2);
+    padded[wire2.len] = 0xAA;
+    try testing.expectError(error.TrailingData, UnconnectedSend.decode(padded[0 .. wire2.len + 1]));
 }
 
 test "an embedded size that overruns the request is refused" {
@@ -883,6 +900,14 @@ test "a forward open connection path that overruns is refused" {
     bad[wire.len - 5] = 0x40; // claim 64 words of connection path
     try testing.expectError(error.ConnectionPathOverruns, ForwardOpen.decode(bad[0..wire.len], false));
     try testing.expectError(error.Truncated, ForwardOpen.decode(wire[0..10], false));
+
+    // F3 regression: bytes past the declared connection path used to be
+    // silently accepted (`decode` was a prefix decoder with no name saying
+    // so) -- wave-2 audit finding `enip` F3.
+    var padded: [512]u8 = undefined;
+    @memcpy(padded[0..wire.len], wire);
+    padded[wire.len] = 0xAA; // one trailing octet past the declared body
+    try testing.expectError(error.TrailingData, ForwardOpen.decode(padded[0 .. wire.len + 1], false));
 }
 
 test "forward open and close replies round trip" {
@@ -932,6 +957,12 @@ test "forward close round trips and matches on the triple" {
     @memcpy(bad[0..wire.len], wire);
     bad[10] = 0x40;
     try testing.expectError(error.ConnectionPathOverruns, ForwardClose.decode(bad[0..wire.len]));
+
+    // F3 regression (ForwardClose side): see the ForwardOpen test above.
+    var padded: [512]u8 = undefined;
+    @memcpy(padded[0..wire.len], wire);
+    padded[wire.len] = 0xAA;
+    try testing.expectError(error.TrailingData, ForwardClose.decode(padded[0 .. wire.len + 1]));
 }
 
 test "wrapping produces a message router request addressed to class 6" {

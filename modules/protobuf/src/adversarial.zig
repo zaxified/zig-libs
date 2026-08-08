@@ -154,7 +154,7 @@ test "hostile: truncation at every offset of a valid message never panics" {
             var m = d.*;
             m.deinit();
         } else |err| switch (err) {
-            error.Truncated, error.VarintOverflow, error.FieldNumberZero, error.UnsupportedWireType => {},
+            error.Truncated, error.VarintOverflow, error.FieldNumberZero, error.FieldNumberOutOfRange, error.UnsupportedWireType => {},
             else => return err,
         }
     }
@@ -183,6 +183,7 @@ test "hostile: byte-flip sweep never panics" {
                 error.Truncated,
                 error.VarintOverflow,
                 error.FieldNumberZero,
+                error.FieldNumberOutOfRange,
                 error.UnsupportedWireType,
                 error.DepthExceeded,
                 // A flip inside a `names` element can turn its payload into

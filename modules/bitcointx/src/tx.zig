@@ -174,10 +174,25 @@ pub const Transaction = struct {
         return hash256.sha256d(ser);
     }
 
+    /// True if any vin actually carries witness data. Deliberately checked
+    /// against content, not merely `has_witness`: the latter reflects
+    /// whether a BIP144 marker/flag was present on the wire (or was set by
+    /// hand), which `deserializePartial` now refuses to decouple from
+    /// content (`error.SuperfluousWitnessRecord`) -- but `wtxid()` must
+    /// hold its own invariant regardless of how a `Transaction` value was
+    /// built, not only for ones that went through the decoder.
+    pub fn hasWitnessData(self: Transaction) bool {
+        if (!self.has_witness) return false;
+        for (self.witness) |w| {
+            if (w.items.len > 0) return true;
+        }
+        return false;
+    }
+
     /// `sha256d` of the full segwit serialization (BIP141: "wtxid"). For a
     /// transaction with no witness data, `wtxid == txid` per BIP141.
     pub fn wtxid(self: Transaction, allocator: Allocator) Allocator.Error![32]u8 {
-        if (!self.has_witness) return self.txid(allocator);
+        if (!self.hasWitnessData()) return self.txid(allocator);
         const ser = try serializeSegwit(allocator, self);
         defer allocator.free(ser);
         return hash256.sha256d(ser);
@@ -193,6 +208,9 @@ pub const DecodeError = CompactSizeError || error{
     /// A marker byte (`0x00`) was seen but the following flag byte was not
     /// `0x01` (the only flag any deployed spec defines).
     InvalidWitnessFlag,
+    /// The BIP144 marker/flag says witness data follows, but every vin's
+    /// witness stack decoded empty -- Core's "Superfluous witness record".
+    SuperfluousWitnessRecord,
     /// `deserialize` (whole-buffer convenience) had bytes left over after a
     /// complete, valid transaction. `deserializePartial` never returns this.
     TrailingBytes,
@@ -329,6 +347,24 @@ pub fn deserializePartial(allocator: Allocator, bytes: []const u8) DeserializeEr
     if (has_witness) {
         var i: u64 = 0;
         while (i < vin.items.len) : (i += 1) try witness.append(allocator, try decodeWitness(allocator, bytes, &offset));
+
+        // BIP144: the marker/flag says "witness data follows", so there
+        // must actually BE some -- Core's `UnserializeTransaction` throws
+        // "Superfluous witness record" for a segwit-marked tx whose every
+        // vin's witness stack is empty (`if (flags & 1) { ... if
+        // (!tx.HasWitness()) throw; }`). Without this, a decoder accepts a
+        // wire form Core rejects, and `wtxid()` would key off the flag
+        // rather than actual content and diverge from `txid()` for a
+        // transaction that carries no witness data at all -- contradicting
+        // BIP141 (wave-2 audit finding `bitcointx` F3).
+        var any_witness_data = false;
+        for (witness.items) |w| {
+            if (w.items.len > 0) {
+                any_witness_data = true;
+                break;
+            }
+        }
+        if (!any_witness_data) return error.SuperfluousWitnessRecord;
     }
 
     const locktime = try readU32(bytes, &offset);
@@ -541,6 +577,70 @@ fn buildMinimalSegwitTx(allocator: Allocator) Allocator.Error![]u8 {
     try appendCompactSize(&buf, allocator, 0);
     try appendU32LE(&buf, allocator, 0);
     return buf.toOwnedSlice(allocator);
+}
+
+fn buildSuperfluousWitnessTx(allocator: Allocator) Allocator.Error![]u8 {
+    // Same shape as `buildMinimalSegwitTx` (1-in-1-out, BIP144 marker/flag)
+    // but the sole input's witness stack has ZERO items instead of two --
+    // the marker says "witness data follows" and none actually does.
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendI32LE(&buf, allocator, 2);
+    try buf.append(allocator, 0x00);
+    try buf.append(allocator, 0x01);
+    try appendCompactSize(&buf, allocator, 1);
+    try buf.appendSlice(allocator, &([_]u8{0xaa} ** 32));
+    try appendU32LE(&buf, allocator, 1);
+    try appendCompactSize(&buf, allocator, 0);
+    try appendU32LE(&buf, allocator, 0xffffffff);
+    try appendCompactSize(&buf, allocator, 1);
+    try appendI64LE(&buf, allocator, 1234567);
+    try appendCompactSize(&buf, allocator, 0);
+    // witness: 1 input, 0 items -- the superfluous-record shape.
+    try appendCompactSize(&buf, allocator, 0);
+    try appendU32LE(&buf, allocator, 0);
+    return buf.toOwnedSlice(allocator);
+}
+
+test "F3 regression: a BIP144-marked tx whose witness stacks are all empty is rejected, not accepted as a wtxid != txid transaction" {
+    // Before the fix, `deserializePartial` accepted this wire form and
+    // `wtxid()` keyed off `has_witness` (set purely from the marker/flag),
+    // so it would diverge from `txid()` despite the transaction carrying no
+    // actual witness data -- contradicting this file's own documented
+    // BIP141 invariant "wtxid == txid" for a witness-free transaction.
+    // Bitcoin Core's `UnserializeTransaction` throws "Superfluous witness
+    // record" for exactly this shape (wave-2 audit finding `bitcointx` F3).
+    const allocator = testing.allocator;
+    const raw = try buildSuperfluousWitnessTx(allocator);
+    defer allocator.free(raw);
+    try testing.expectError(error.SuperfluousWitnessRecord, deserialize(allocator, raw));
+}
+
+test "F3 regression: wtxid() honors actual witness content, not just the has_witness flag" {
+    // Defense in depth beyond the decoder-level reject above: a
+    // hand-constructed `Transaction` with `has_witness = true` but an empty
+    // witness stack must still satisfy `wtxid() == txid()`.
+    const allocator = testing.allocator;
+    var vin = [_]TxIn{.{
+        .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 1 },
+        .script_sig = &.{},
+        .sequence = 0xffffffff,
+    }};
+    var vout = [_]TxOut{.{ .value = 1234567, .script_pubkey = &.{} }};
+    var empty_items = [_][]const u8{};
+    var witness = [_]Witness{.{ .items = &empty_items }}; // present but empty
+    const tx: Transaction = .{
+        .version = 2,
+        .vin = &vin,
+        .vout = &vout,
+        .witness = &witness,
+        .locktime = 0,
+        .has_witness = true, // flag says "segwit", content says otherwise
+    };
+    try testing.expectEqual(false, tx.hasWitnessData());
+    const the_txid = try tx.txid(allocator);
+    const the_wtxid = try tx.wtxid(allocator);
+    try testing.expectEqualSlices(u8, &the_txid, &the_wtxid);
 }
 
 test "segwit tx: deserialize -> serialize is byte-exact, and txid != wtxid" {

@@ -410,7 +410,13 @@ pub const Coordinator = struct {
     /// so a `del` is visible immediately. Cleared by a later `put`. Owns keys.
     tombstones: std.StringHashMapUnmanaged(void) = .empty,
     /// Scratch list of duped keys collected from `drainDirty`/`orphans`.
+    /// The strings themselves are arena-allocated (`scratch_arena`) — every
+    /// consumer of `scratch.items` (`startKey`/`addKeySet`/`startFlush`)
+    /// dupes what it needs to keep, so a whole-arena `reset` after each
+    /// `kick()` is exactly as safe as freeing each string individually was,
+    /// and avoids a general-purpose alloc+free pair per key on every tick.
     scratch: std.ArrayList([]u8) = .empty,
+    scratch_arena: std.heap.ArenaAllocator = undefined,
 
     // completion channel (worker → coordinator)
     completion_lock: SpinLock = .{},
@@ -442,6 +448,7 @@ pub const Coordinator = struct {
                 std.math.maxInt(u32)
             else
                 options.max_flush_attempts,
+            .scratch_arena = std.heap.ArenaAllocator.init(gpa),
         };
 
         self.pool = try workerpool.WorkerPool.init(gpa, .{
@@ -482,8 +489,8 @@ pub const Coordinator = struct {
         self.freeKeySet(&self.in_flight);
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
-        for (self.scratch.items) |k| self.gpa.free(k);
         self.scratch.deinit(self.gpa);
+        self.scratch_arena.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -505,8 +512,8 @@ pub const Coordinator = struct {
         self.freeKeySet(&self.in_flight);
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
-        for (self.scratch.items) |k| self.gpa.free(k);
         self.scratch.deinit(self.gpa);
+        self.scratch_arena.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -728,33 +735,33 @@ pub const Coordinator = struct {
     /// Select every dirty/orphan key not in flight and submit a flush for its
     /// oldest queued WAL record.
     fn kick(self: *Coordinator) void {
-        for (self.scratch.items) |k| self.gpa.free(k);
         self.scratch.clearRetainingCapacity();
+        _ = self.scratch_arena.reset(.retain_capacity);
 
         // Collect dirty keys (duped — the callback's slices are iteration-scoped
-        // and we submit after the sweep).
+        // and we submit after the sweep). Duped from `scratch_arena`, not `gpa`:
+        // a fresh general-purpose alloc+free pair per key, every tick, is real
+        // churn a bump-allocated scratch region with one bulk reset avoids.
         self.cache.drainDirty(collectDirty, self);
         // Collect orphan keys.
         var it = self.orphans.keyIterator();
         while (it.next()) |k| {
             if (self.in_flight.contains(k.*)) continue;
-            const dup = self.gpa.dupe(u8, k.*) catch continue;
-            self.scratch.append(self.gpa, dup) catch {
-                self.gpa.free(dup);
-            };
+            const dup = self.scratch_arena.allocator().dupe(u8, k.*) catch continue;
+            self.scratch.append(self.gpa, dup) catch {};
         }
 
         for (self.scratch.items) |k| self.startKey(k);
-        for (self.scratch.items) |k| self.gpa.free(k);
         self.scratch.clearRetainingCapacity();
+        _ = self.scratch_arena.reset(.retain_capacity);
     }
 
     fn collectDirty(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
         _ = value;
         const self: *Coordinator = @ptrCast(@alignCast(ctx.?));
         if (self.in_flight.contains(key)) return;
-        const dup = self.gpa.dupe(u8, key) catch return;
-        self.scratch.append(self.gpa, dup) catch self.gpa.free(dup);
+        const dup = self.scratch_arena.allocator().dupe(u8, key) catch return;
+        self.scratch.append(self.gpa, dup) catch {};
     }
 
     /// Begin flushing `key` (idempotent w.r.t. in-flight): lease its oldest WAL

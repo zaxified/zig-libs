@@ -89,6 +89,10 @@ pub const Options = struct {
     /// Refuse to queue more than this many unread notifications; beyond it a
     /// `call` fails rather than growing without bound.
     max_queued_notifications: usize = 1024,
+    /// Refuse to buffer more than this many out-of-order replies (see
+    /// `Client.receiveReply`'s reply queue); beyond it a `receiveReply` call
+    /// fails rather than growing without bound.
+    max_queued_replies: usize = 1024,
 };
 
 pub const SessionError = error{
@@ -99,6 +103,8 @@ pub const SessionError = error{
     InvalidState,
     /// More notifications queued than `Options.max_queued_notifications`.
     NotificationQueueFull,
+    /// More out-of-order replies buffered than `Options.max_queued_replies`.
+    ReplyQueueFull,
 } || TransportError || framing.FramerError || framing.WriteError ||
     capabilities.HelloError || reply_mod.ParseError || reply_mod.CheckError ||
     reply_mod.NotificationError ||
@@ -131,6 +137,19 @@ pub const Client = struct {
     current: std.ArrayList(u8) = .empty,
     /// Notifications received while waiting for a reply, in arrival order.
     notifications: std.ArrayList([]u8) = .empty,
+    /// Replies received while waiting for a *different* `message-id` — a
+    /// pipelining caller may have several requests outstanding at once, and
+    /// RFC 6241 does not require the server to answer them in request order.
+    /// Buffered here (already parsed and owned) until the matching
+    /// `receiveReply(id)` call claims them.
+    pending_replies: std.ArrayList(reply_mod.Reply) = .empty,
+    /// ids `send` has handed out that no `receiveReply` has yet returned or
+    /// buffered — the set a reply's id is checked against before it is
+    /// trusted enough to buffer. Without this, a reply carrying an id nobody
+    /// asked for (forged, or a stale reply from a previous session) would be
+    /// indistinguishable from a legitimately out-of-order pipelined one and
+    /// would sit buffered forever instead of failing loudly.
+    outstanding_ids: std.ArrayList(u64) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, transport: Transport, opts: Options) std.mem.Allocator.Error!Client {
         const buf = try gpa.alloc(u8, opts.read_buffer_size);
@@ -152,6 +171,9 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         for (self.notifications.items) |n| self.gpa.free(n);
         self.notifications.deinit(self.gpa);
+        for (self.pending_replies.items) |*r| r.deinit();
+        self.pending_replies.deinit(self.gpa);
+        self.outstanding_ids.deinit(self.gpa);
         self.current.deinit(self.gpa);
         if (self.server) |*s| s.deinit();
         self.ours.deinit();
@@ -247,14 +269,24 @@ pub const Client = struct {
         const payload = try rpc_mod.buildRpc(self.gpa, id, rpc);
         defer self.gpa.free(payload);
         try self.sendRaw(payload);
+        try self.outstanding_ids.append(self.gpa, id);
         return id;
     }
 
     /// Wait for the `<rpc-reply>` carrying `id`, queueing any notification that
-    /// arrives first. The reply is returned parsed and owned by the caller,
+    /// arrives first and buffering (not discarding) any reply that carries a
+    /// *different* id — a pipelining caller may have several `send`s
+    /// outstanding, and RFC 6241 does not require the server to answer them
+    /// in request order, so a mismatched id here is not necessarily an error;
+    /// it may just belong to a `receiveReply(other_id)` call the caller
+    /// hasn't made yet. The reply is returned parsed and owned by the caller,
     /// **including** when it carries `<rpc-error>` — inspect `Reply.errors`, or
     /// call `Reply.expectOk`/`expectData` for the typed error.
     pub fn receiveReply(self: *Client, id: u64) SessionError!reply_mod.Reply {
+        // Already buffered by an earlier receiveReply(other_id) call.
+        for (self.pending_replies.items, 0..) |*r, i| {
+            if (matchesId(r, id)) return self.pending_replies.orderedRemove(i);
+        }
         while (true) {
             const msg = try self.receive();
             switch (reply_mod.classify(msg)) {
@@ -268,11 +300,46 @@ pub const Client = struct {
                 .rpc_reply => {
                     var r = try reply_mod.parseReply(self.gpa, msg);
                     errdefer r.deinit();
-                    try r.expectMessageId(id);
-                    return r;
+                    if (matchesId(&r, id)) {
+                        self.removeOutstanding(id);
+                        return r;
+                    }
+                    // Only buffer a reply for an id THIS client actually has
+                    // outstanding — otherwise a forged or stale id would sit
+                    // buffered forever instead of failing loudly, exactly
+                    // like a real correlation failure should.
+                    // `errdefer r.deinit()` above covers both error returns
+                    // below — do not also deinit by hand, or it double-frees.
+                    const other_id = self.findOutstanding(&r) orelse return error.MessageIdMismatch;
+                    self.removeOutstanding(other_id);
+                    if (self.pending_replies.items.len >= self.opts.max_queued_replies)
+                        return error.ReplyQueueFull;
+                    try self.pending_replies.append(self.gpa, r);
                 },
                 // A client never receives <hello> twice or an <rpc>.
                 .hello, .rpc, .unknown => return error.UnexpectedMessage,
+            }
+        }
+    }
+
+    fn matchesId(r: *const reply_mod.Reply, id: u64) bool {
+        r.expectMessageId(id) catch return false;
+        return true;
+    }
+
+    /// Which of `self.outstanding_ids` (if any) `r` carries.
+    fn findOutstanding(self: *const Client, r: *const reply_mod.Reply) ?u64 {
+        for (self.outstanding_ids.items) |oid| {
+            if (matchesId(r, oid)) return oid;
+        }
+        return null;
+    }
+
+    fn removeOutstanding(self: *Client, id: u64) void {
+        for (self.outstanding_ids.items, 0..) |oid, i| {
+            if (oid == id) {
+                _ = self.outstanding_ids.orderedRemove(i);
+                return;
             }
         }
     }
@@ -479,6 +546,11 @@ const FakePeer = struct {
     /// Answer the next request with this message-id instead of the real one.
     forge_message_id: ?u64 = null,
     hello_sent: bool = false,
+    /// Hold the next reply back instead of putting it in `outbox` — released
+    /// later with `releaseHeld`, so a test can make a *later* request's
+    /// reply arrive on the wire first (out-of-order pipelined replies).
+    hold_next_reply: bool = false,
+    held: std.ArrayList(u8) = .empty,
 
     fn init(gpa: std.mem.Allocator, caps: []const []const u8) FakePeer {
         return .{ .gpa = gpa, .caps = caps, .decoder = .init(gpa, .end_of_message, .{}) };
@@ -487,8 +559,16 @@ const FakePeer = struct {
     fn deinit(self: *FakePeer) void {
         self.inbox.deinit(self.gpa);
         self.outbox.deinit(self.gpa);
+        self.held.deinit(self.gpa);
         self.decoder.deinit();
         self.* = undefined;
+    }
+
+    /// Put a previously-held reply onto the wire now, after whatever is
+    /// already queued in `outbox` — so it is read by the client second.
+    fn releaseHeld(self: *FakePeer) !void {
+        try self.outbox.appendSlice(self.gpa, self.held.items);
+        self.held.clearRetainingCapacity();
     }
 
     fn transport(self: *FakePeer) Transport {
@@ -498,10 +578,14 @@ const FakePeer = struct {
     const vtable: Transport.VTable = .{ .read = readFn, .write = writeFn };
 
     fn emit(self: *FakePeer, payload: []const u8) !void {
+        try self.emitTo(&self.outbox, payload);
+    }
+
+    fn emitTo(self: *FakePeer, dest: *std.ArrayList(u8), payload: []const u8) !void {
         var aw: std.Io.Writer.Allocating = .init(self.gpa);
         defer aw.deinit();
         try framing.writeMessage(&aw.writer, self.dialect, payload);
-        try self.outbox.appendSlice(self.gpa, aw.written());
+        try dest.appendSlice(self.gpa, aw.written());
     }
 
     fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
@@ -602,7 +686,12 @@ const FakePeer = struct {
         } else {
             try w.print("<rpc-reply message-id=\"{s}\" xmlns=\"{s}\"><ok/></rpc-reply>", .{ id_text, capabilities.base_ns });
         }
-        try self.emit(aw.written());
+        if (self.hold_next_reply) {
+            self.hold_next_reply = false;
+            try self.emitTo(&self.held, aw.written());
+        } else {
+            try self.emit(aw.written());
+        }
     }
 };
 
@@ -680,6 +769,36 @@ test "a forged message-id is rejected" {
     try h.client.hello();
     h.peer.forge_message_id = 9999;
     try testing.expectError(error.MessageIdMismatch, h.client.call(.discard_changes));
+}
+
+// W2-B/netconf-F3: `receiveReply(id)` used to fail the whole call with
+// `error.MessageIdMismatch` the instant it read a reply for any OTHER id —
+// which broke a pipelining caller (the exact use `send`'s own doc comment
+// advertises: "returned so a pipelining caller can correlate later") the
+// moment the server answered two outstanding requests out of order, which
+// RFC 6241 never promises not to do. The fix buffers a reply that belongs to
+// a *known-outstanding* id and keeps reading for the one actually awaited.
+test "receiveReply survives a pipelined reply arriving out of order" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    // Two requests outstanding; the peer answers the SECOND one first.
+    h.peer.hold_next_reply = true;
+    const id_a = try h.client.send(.discard_changes);
+    const id_b = try h.client.send(.discard_changes);
+    try h.peer.releaseHeld(); // id_a's reply now lands on the wire AFTER id_b's
+
+    var r_a = try h.client.receiveReply(id_a);
+    defer r_a.deinit();
+    try r_a.expectOk();
+    try testing.expectEqualStrings("1", r_a.message_id.?);
+
+    var r_b = try h.client.receiveReply(id_b);
+    defer r_b.deinit();
+    try r_b.expectOk();
+    try testing.expectEqualStrings("2", r_b.message_id.?);
 }
 
 test "one byte at a time: the whole session works with a 1-byte transport" {

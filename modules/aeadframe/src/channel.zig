@@ -21,6 +21,14 @@ const replay = @import("replay.zig");
 
 pub const key_length = 32;
 
+/// Upper bound on the caller-supplied `aad` accepted by `seal`/`open`. Both
+/// sides bind the wire header (which carries `version`) into the AAD by
+/// prepending it ahead of the caller's own `aad` in a fixed-size stack
+/// scratch buffer — see `effectiveAad` below — so the total must stay
+/// bounded to keep both functions allocation-free. Generous for the
+/// tenant/I-SID context strings this module's callers actually pass.
+pub const max_caller_aad = 1024;
+
 /// Errors from `Sealer.seal`.
 pub const SealError = error{
     /// The per-epoch sequence space is exhausted. Refused rather than wrapping
@@ -29,7 +37,28 @@ pub const SealError = error{
     SequenceExhausted,
     /// The output buffer is smaller than `sealedLen(plaintext.len)`.
     BufferTooSmall,
+    /// `aad.len > max_caller_aad`.
+    AadTooLarge,
 };
+
+/// Concatenate `header_bytes` (the 13-byte wire header, which carries
+/// `version`) ahead of the caller's `aad` into `scratch`, and return the
+/// combined slice to feed the AEAD as its authenticated data.
+///
+/// Binding the header this way means a tampered `version` byte breaks AEAD
+/// authentication, not merely the `parse`-time equality check — today the
+/// only valid version is 1 and `parse` already refuses anything else, so
+/// this closes the gap a *future* multi-version wire would otherwise reopen
+/// (wave-2 audit finding `aeadframe` F4): without this binding, the version
+/// byte would sit outside both the nonce and the AAD, so a downgrade/
+/// confusion edit to it would go unauthenticated the moment a second
+/// version exists.
+fn effectiveAad(scratch: *[record.header_len + max_caller_aad]u8, header_bytes: *const [record.header_len]u8, aad: []const u8) error{AadTooLarge}![]const u8 {
+    if (aad.len > max_caller_aad) return error.AadTooLarge;
+    @memcpy(scratch[0..record.header_len], header_bytes);
+    @memcpy(scratch[record.header_len..][0..aad.len], aad);
+    return scratch[0 .. record.header_len + aad.len];
+}
 
 /// Error from `Sealer.bumpEpoch` (same-key epoch bump).
 pub const EpochError = error{
@@ -63,6 +92,8 @@ pub const OpenError = error{
     Replayed,
     /// The output buffer is smaller than the record's plaintext.
     BufferTooSmall,
+    /// `aad.len > max_caller_aad`.
+    AadTooLarge,
 } || std.crypto.errors.AuthenticationError;
 
 /// Build a record/frame channel over a concrete AEAD.
@@ -100,15 +131,18 @@ pub fn Channel(comptime Aead: type) type {
             pub fn seal(self: *Sealer, out: []u8, plaintext: []const u8, aad: []const u8) SealError!usize {
                 const need = record.overhead + plaintext.len;
                 if (out.len < need) return error.BufferTooSmall;
+                if (aad.len > max_caller_aad) return error.AadTooLarge;
                 // Refuse rather than wrap: a wrapped seq reuses a nonce.
                 if (self.seq == std.math.maxInt(u64)) return error.SequenceExhausted;
 
                 const seq = self.seq;
                 (record.Header{ .epoch = self.epoch, .seq = seq }).encode(out[0..record.header_len]);
                 const nonce = record.deriveNonce(self.epoch, seq);
+                var aad_scratch: [record.header_len + max_caller_aad]u8 = undefined;
+                const eff_aad = try effectiveAad(&aad_scratch, out[0..record.header_len], aad);
                 const ct = out[record.header_len..][0..plaintext.len];
                 var tag: [record.tag_len]u8 = undefined;
-                Aead.encrypt(ct, &tag, plaintext, aad, nonce, self.key);
+                Aead.encrypt(ct, &tag, plaintext, eff_aad, nonce, self.key);
                 @memcpy(out[record.header_len + plaintext.len ..][0..record.tag_len], &tag);
 
                 self.seq += 1;
@@ -191,14 +225,17 @@ pub fn Channel(comptime Aead: type) type {
                 const p = try record.parse(rec);
                 if (p.header.epoch != self.epoch) return error.EpochMismatch;
                 if (out.len < p.ct_len) return error.BufferTooSmall;
+                if (aad.len > max_caller_aad) return error.AadTooLarge;
                 if (!self.window.accepts(p.header.seq)) return error.Replayed;
 
                 const nonce = record.deriveNonce(p.header.epoch, p.header.seq);
                 const ct = rec[p.ct_off..][0..p.ct_len];
                 var tag: [record.tag_len]u8 = undefined;
                 @memcpy(&tag, rec[p.tag_off..][0..record.tag_len]);
+                var aad_scratch: [record.header_len + max_caller_aad]u8 = undefined;
+                const eff_aad = try effectiveAad(&aad_scratch, rec[0..record.header_len], aad);
                 const pt = out[0..p.ct_len];
-                Aead.decrypt(pt, ct, tag, aad, nonce, self.key) catch |e| {
+                Aead.decrypt(pt, ct, tag, eff_aad, nonce, self.key) catch |e| {
                     // Uniform across AEADs: std's AES-GCM leaves `m` undefined
                     // on failure, chachapoly zeroes it. Make the "no garbage
                     // plaintext" contract hold for both.
@@ -549,9 +586,16 @@ test "rekey to the SAME (key, epoch) is refused: no keystream reuse" {
 // ── KAT: the framing is byte-anchored, not merely self-consistent ─────────────
 
 test "ChaCha record KAT: exact ct+tag for fixed key/epoch/seq/aad/pt" {
-    // Anchors header layout + nonce derivation + record framing. The ct+tag
-    // were produced independently by std.crypto.aead.chacha_poly (byte-exact
-    // to the chachapoly sibling) over nonce = deriveNonce(0x11223344, 42).
+    // Anchors header layout + nonce derivation + record framing. The
+    // ciphertext were produced independently by std.crypto.aead.chacha_poly
+    // (byte-exact to the chachapoly sibling) over nonce =
+    // deriveNonce(0x11223344, 42); the tag over the *effective* AAD this
+    // module now authenticates — the 13-byte wire header (which carries
+    // `version`) followed by the caller's own `aad` (see `effectiveAad`,
+    // wave-2 audit finding `aeadframe` F4). ChaCha20-Poly1305's ciphertext
+    // does not depend on AAD at all (RFC 8439: keystream XOR is a function
+    // of key/nonce/plaintext only), so binding the header changes only the
+    // tag, not `expect_ct`.
     const key = blk: {
         var k: [32]u8 = undefined;
         for (&k, 0..) |*b, i| b.* = @intCast(i);
@@ -564,7 +608,7 @@ test "ChaCha record KAT: exact ct+tag for fixed key/epoch/seq/aad/pt" {
         0x48, 0x5a, 0xad, 0xfb, 0x97, 0x7c, 0xaa, 0xed, 0xa7, 0xd7, 0x89, 0x33, 0x35,
     };
     const expect_tag = [_]u8{
-        0xa4, 0xfb, 0x09, 0xe9, 0x57, 0x49, 0xc9, 0x75, 0x93, 0x04, 0x2e, 0x7d, 0xfb, 0xb6, 0x5b, 0x24,
+        0x63, 0x05, 0x2e, 0x8f, 0x26, 0xed, 0x72, 0x30, 0x62, 0xd1, 0xce, 0x83, 0x4e, 0x1f, 0x0f, 0x7f,
     };
 
     var s = ChaChaChannel.Sealer.init(key, 0x11223344);
@@ -585,6 +629,60 @@ test "ChaCha record KAT: exact ct+tag for fixed key/epoch/seq/aad/pt" {
     // move the opener's expected epoch is already set; window fresh accepts seq 42
     const m = try o.open(&out, rec[0..n], aad);
     try testing.expectEqualSlices(u8, pt, out[0..m]);
+}
+
+test "F4 regression: version byte is bound into the AEAD tag, not just parse's equality check" {
+    // Before the fix, `version` sat outside both the nonce and the AAD:
+    // `record.parse`'s raw `record[0] != version` check was the ONLY thing
+    // standing between a tampered version byte and a successful decrypt.
+    // That is fine while exactly one version is valid (parse's equality
+    // check already refuses anything else), but it means a future opener
+    // that accepts more than one version would get no AEAD-level protection
+    // against a version-downgrade edit — the byte would just be unauthenticated
+    // header data. This test exercises the binding at the level beneath
+    // `record.parse`, the way a future multi-version opener would need it to
+    // hold, by feeding the AEAD `effectiveAad` computed for two different
+    // header bytes directly and checking the tags disagree + cross-checking
+    // fails to authenticate.
+    const key = testKey(99);
+    var s = ChaChaChannel.Sealer.init(key, 3);
+    var rec: [ChaChaChannel.Sealer.sealedLen(5)]u8 = undefined;
+    const n = try s.seal(&rec, "hello", "ctx");
+    try testing.expectEqual(rec.len, n);
+
+    const ct = rec[record.header_len..][0..5];
+    var real_tag: [record.tag_len]u8 = undefined;
+    @memcpy(&real_tag, rec[record.header_len + 5 ..][0..record.tag_len]);
+    const nonce = record.deriveNonce(3, 0);
+
+    // The header actually used to seal (version = 1).
+    const header_v1 = rec[0..record.header_len].*;
+    // A hypothetical future record claiming version 2, everything else equal.
+    var header_v2 = header_v1;
+    header_v2[0] = 2;
+    try testing.expect(!std.mem.eql(u8, &header_v1, &header_v2));
+
+    var scratch1: [record.header_len + 3]u8 = undefined;
+    @memcpy(scratch1[0..record.header_len], &header_v1);
+    @memcpy(scratch1[record.header_len..], "ctx");
+    var scratch2: [record.header_len + 3]u8 = undefined;
+    @memcpy(scratch2[0..record.header_len], &header_v2);
+    @memcpy(scratch2[record.header_len..], "ctx");
+
+    // effectiveAad disagrees for the two headers (the binding exists)...
+    try testing.expect(!std.mem.eql(u8, &scratch1, &scratch2));
+
+    // ...and decrypting the real ciphertext+tag against the version-2 AAD
+    // (as a future multi-version opener would compute it for a tampered
+    // record) must fail authentication, not silently succeed.
+    var pt_out: [5]u8 = undefined;
+    try testing.expectError(
+        error.AuthenticationFailed,
+        chachapoly.ChaCha20Poly1305.decrypt(&pt_out, ct, real_tag, &scratch2, nonce, key),
+    );
+    // Sanity: the correct (version-1) AAD does authenticate.
+    try chachapoly.ChaCha20Poly1305.decrypt(&pt_out, ct, real_tag, &scratch1, nonce, key);
+    try testing.expectEqualSlices(u8, "hello", &pt_out);
 }
 
 // ── positive controls: permanent sentinels proving the safety tests have teeth ─

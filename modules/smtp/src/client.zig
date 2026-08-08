@@ -114,7 +114,17 @@ pub const Client = struct {
     read_buf: []u8,
     body_buf: []u8,
 
-    pub fn init(gpa: std.mem.Allocator, transport: Transport, opts: Options) std.mem.Allocator.Error!Client {
+    /// `writeBody`'s worst case leaves up to `body_chunk*2 - 1` bytes
+    /// buffered going into `Stuffer.finish`, which itself writes up to 5
+    /// bytes (a line-ending completion plus the `.CRLF` terminator) — both
+    /// must fit in `body_buf` (`body_chunk*4`): `body_chunk*2 - 1 + 5 <=
+    /// body_chunk*4`, i.e. `body_chunk >= 3`. Below that, `finish` can
+    /// overflow the fixed buffer and fail with a generic `error.WriteFailed`
+    /// that gives no hint the real problem is the configured chunk size.
+    pub const min_body_chunk = 3;
+
+    pub fn init(gpa: std.mem.Allocator, transport: Transport, opts: Options) (std.mem.Allocator.Error || error{BodyChunkTooSmall})!Client {
+        if (opts.body_chunk < min_body_chunk) return error.BodyChunkTooSmall;
         const rbuf = try gpa.alloc(u8, opts.read_buffer_size);
         errdefer gpa.free(rbuf);
         const bbuf = try gpa.alloc(u8, opts.body_chunk * 4);
@@ -523,6 +533,24 @@ test "a large body streams through bounded buffers" {
     try c.connect();
     try c.sendEnvelope(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = body });
     try testing.expectEqualStrings(body, srv.messages.items[0]);
+}
+
+// W2-B/smtp-F5: `writeBody`'s fixed `body_buf` (`body_chunk*4`) is exactly
+// tight against `Stuffer.finish`'s worst-case 5-byte trailer for
+// `body_chunk < min_body_chunk` (3) — below that, `finish` can overflow the
+// buffer and the caller sees a generic `error.WriteFailed` that gives no
+// hint the real problem is its own `Options.body_chunk`. `init` now rejects
+// it up front with a named error instead.
+test "Client.init rejects a body_chunk too small for Stuffer.finish's worst case" {
+    const gpa = testing.allocator;
+    var srv = FakeServer.init(gpa, &.{});
+    defer srv.deinit();
+
+    try testing.expectError(error.BodyChunkTooSmall, Client.init(gpa, srv.transport(), .{ .body_chunk = 0 }));
+    try testing.expectError(error.BodyChunkTooSmall, Client.init(gpa, srv.transport(), .{ .body_chunk = 2 }));
+
+    var c = try Client.init(gpa, srv.transport(), .{ .body_chunk = Client.min_body_chunk });
+    c.deinit();
 }
 
 // ── live interop against a real third-party SMTP server (gated) ─────────────

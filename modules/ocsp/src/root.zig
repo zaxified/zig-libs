@@ -889,6 +889,45 @@ const SingleResult = struct {
     next_update_unix: ?i64,
 };
 
+/// The issuer's `(nameHash, keyHash)` under one `HashAlgo`, computed once and
+/// reused for every `SingleResponse` in a walk that uses that algorithm.
+const IssuerDigests = struct {
+    name_buf: [64]u8 = undefined,
+    key_buf: [64]u8 = undefined,
+    name_len: u8 = 0,
+    key_len: u8 = 0,
+
+    fn name(self: *const IssuerDigests) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    fn key(self: *const IssuerDigests) []const u8 {
+        return self.key_buf[0..self.key_len];
+    }
+};
+
+/// Lazily-populated per-`HashAlgo` cache: a malicious or merely large
+/// `BasicOCSPResponse` may bundle many `SingleResponse`s before the one that
+/// matches, and RFC 6960 puts no constraint on every entry using the same
+/// hash algorithm — so this caches by algorithm rather than assuming there is
+/// only one, and still costs at most one digest pair per *distinct* algorithm
+/// actually seen, instead of one pair per response.
+const DigestCache = struct {
+    slots: [std.enums.values(HashAlgo).len]?IssuerDigests = @splat(null),
+
+    fn get(self: *DigestCache, algo: HashAlgo, issuer: CertView) *const IssuerDigests {
+        const i = @intFromEnum(algo);
+        if (self.slots[i] == null) {
+            var d: IssuerDigests = .{};
+            const n = digest(algo, issuer.subject_name, &d.name_buf);
+            d.name_len = @intCast(n.len);
+            const k = digest(algo, issuer.pub_key_bits, &d.key_buf);
+            d.key_len = @intCast(k.len);
+            self.slots[i] = d;
+        }
+        return &self.slots[i].?;
+    }
+};
+
 /// Iterate SingleResponses, returning the first whose CertID recomputes to the
 /// subject cert. Recomputes issuerNameHash/issuerKeyHash with the algorithm
 /// named in each CertID, so a SHA-1 or SHA-256 CertID both bind correctly.
@@ -896,6 +935,7 @@ fn findMatchingSingle(basic: Basic, issuer: CertView, subject_serial: []const u8
     const bytes = basic.source;
     var pos: u32 = @intCast(@intFromPtr(basic.responses.ptr) - @intFromPtr(bytes.ptr));
     const end: u32 = pos + @as(u32, @intCast(basic.responses.len));
+    var digests: DigestCache = .{};
 
     while (pos < end) {
         const single = el(bytes, pos) catch return error.Malformed;
@@ -905,7 +945,7 @@ fn findMatchingSingle(basic: Basic, issuer: CertView, subject_serial: []const u8
         const cert_id = el(bytes, single.slice.start) catch return error.Malformed;
         if (cert_id.identifier.tag != .sequence) return error.Malformed;
 
-        if (!(certIdBinds(bytes, cert_id, issuer, subject_serial) catch return error.Malformed))
+        if (!(certIdBinds(&digests, bytes, cert_id, issuer, subject_serial) catch return error.Malformed))
             continue;
 
         return try parseSingleTail(bytes, single, cert_id);
@@ -914,8 +954,9 @@ fn findMatchingSingle(basic: Basic, issuer: CertView, subject_serial: []const u8
 }
 
 /// CertID = SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serial }.
-/// Recompute the two hashes over the issuer cert and compare all three fields.
-fn certIdBinds(bytes: []const u8, cert_id: Element, issuer: CertView, subject_serial: []const u8) Malformed!bool {
+/// Compares against the issuer hashes for this CertID's algorithm, computing
+/// them (via `digests`) at most once per algorithm for the whole walk.
+fn certIdBinds(digests: *DigestCache, bytes: []const u8, cert_id: Element, issuer: CertView, subject_serial: []const u8) Malformed!bool {
     const alg_seq = try el(bytes, cert_id.slice.start);
     if (alg_seq.identifier.tag != .sequence) return error.Malformed;
     const alg_oid = try el(bytes, alg_seq.slice.start);
@@ -929,13 +970,10 @@ fn certIdBinds(bytes: []const u8, cert_id: Element, issuer: CertView, subject_se
     const serial = try el(bytes, key_hash.slice.end);
     if (serial.identifier.tag != .integer) return error.Malformed;
 
-    var nb: [64]u8 = undefined;
-    var kb: [64]u8 = undefined;
-    const want_name = digest(algo, issuer.subject_name, &nb);
-    const want_key = digest(algo, issuer.pub_key_bits, &kb);
+    const want = digests.get(algo, issuer);
 
-    return std.mem.eql(u8, contentOf(bytes, name_hash), want_name) and
-        std.mem.eql(u8, contentOf(bytes, key_hash), want_key) and
+    return std.mem.eql(u8, contentOf(bytes, name_hash), want.name()) and
+        std.mem.eql(u8, contentOf(bytes, key_hash), want.key()) and
         std.mem.eql(u8, contentOf(bytes, serial), subject_serial);
 }
 

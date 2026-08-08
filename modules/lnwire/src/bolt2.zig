@@ -320,6 +320,12 @@ pub fn decodeUpdateAddHtlc(allocator: Allocator, bytes: []const u8) (DecodeError
 pub fn serializeUpdateAddHtlc(allocator: Allocator, msg: UpdateAddHtlc) Allocator.Error![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
+    // Fixed-size fields alone are 1452 bytes (dominated by the 1366-byte
+    // onion routing packet). Pre-sizing for them avoids the ~8 geometric
+    // reallocs an empty-`ArrayList` start would otherwise force before the
+    // first `putBytes(&msg.onion_routing_packet)` call; the (usually empty)
+    // TLV extension still grows on top as needed.
+    try w.list.ensureTotalCapacity(allocator, 2 + 32 + 8 + 8 + 32 + 4 + msg.onion_routing_packet.len);
     try message.putFrameType(&w, allocator, UPDATE_ADD_HTLC_TYPE);
     try w.putBytes(allocator, &msg.channel_id);
     try w.putU64be(allocator, msg.id);

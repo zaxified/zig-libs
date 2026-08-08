@@ -389,6 +389,20 @@ pub const Cache = struct {
     /// and is memcpy'd into the handshake buffer regardless, next to a
     /// handshake's own asymmetric-crypto cost. Callers with a per-connection
     /// arena can pass it here and never free at all.
+    ///
+    /// ## Concurrency: this call needs the SAME external lock `refresh` does
+    ///
+    /// `Cache` is `.single_owner` (see `meta` above) — internally
+    /// unsynchronized. A TLS server that staples from N accept threads while
+    /// a scheduler thread calls `refresh` on the same `Cache` must take a
+    /// lock around **both** `getStapled` and `refresh`, not just `refresh`:
+    /// this reads `entries` (a plain `AutoHashMapUnmanaged`), and a `refresh`
+    /// running concurrently can resize/rehash it out from under an
+    /// unsynchronized read, which is undefined behavior — not merely a stale
+    /// answer. (nginx's own design sidesteps needing that lock at all, by
+    /// swapping an atomic staple pointer per `SSL_CTX` instead of sharing one
+    /// mutable cache; that shape is a larger change than this module makes
+    /// today — see the module's own to-do backlog.)
     pub fn getStapled(
         self: *Cache,
         gpa: std.mem.Allocator,

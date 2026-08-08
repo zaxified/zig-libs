@@ -101,7 +101,34 @@ pub const DecodeError = error{
     PayloadTooLarge,
     /// `sha256d(payload)[0..4]` doesn't match the header's `checksum`.
     BadChecksum,
+    /// The 12-byte command field is not `IsCommandValid()`-shaped (Bitcoin
+    /// Core `CMessageHeader::IsCommandValid()`, `src/protocol.cpp`): every
+    /// byte before the first NUL must be printable ASCII (`0x20..0x7E`),
+    /// and every byte from the first NUL onward must also be NUL. Without
+    /// this, `"version\x00EVIL"` and `"version\x00\x00\x00\x00\x00"` are
+    /// indistinguishable to `commandName()` (both cut at the first NUL),
+    /// letting a peer smuggle arbitrary bytes past any logging/
+    /// rate-limiting/dedup keyed on the command name.
+    InvalidCommand,
 };
+
+/// Bitcoin Core's `CMessageHeader::IsCommandValid()`: every byte before
+/// the first NUL is printable ASCII, every byte from the first NUL
+/// onward (inclusive) is NUL. Rejects both a non-printable command byte
+/// and "junk after the NUL padding starts" in one pass.
+fn isCommandValid(command: [COMMAND_LEN]u8) bool {
+    var seen_nul = false;
+    for (command) |b| {
+        if (seen_nul) {
+            if (b != 0) return false;
+        } else if (b == 0) {
+            seen_nul = true;
+        } else if (b < 0x20 or b > 0x7e) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /// One decoded message: the raw (NUL-padded) command string and a
 /// borrowed view of the payload (see module doc comment -- `bytes`
@@ -137,6 +164,7 @@ pub fn decodeMessage(bytes: []const u8, network: Network) DecodeError!DecodedMes
 
     var command: [COMMAND_LEN]u8 = undefined;
     @memcpy(&command, bytes[4..16]);
+    if (!isCommandValid(command)) return error.InvalidCommand;
 
     const length = std.mem.readInt(u32, bytes[16..20], .little);
     if (length > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
@@ -280,6 +308,31 @@ test "hostile: tampered payload fails checksum" {
     defer allocator.free(wire);
     wire[wire.len - 1] ^= 0xff; // flip a payload byte after the checksum was computed
     try testing.expectError(error.BadChecksum, decodeMessage(wire, .mainnet));
+}
+
+test "F1 regression: junk after the command's NUL padding starts is rejected (IsCommandValid)" {
+    // Before the fix, `commandName()` cut at the first NUL and nothing
+    // validated the bytes AFTER it, so `"version\x00EVIL"` and
+    // `"version\x00\x00\x00\x00\x00"` decoded to the identical command
+    // string -- a peer could smuggle 4 arbitrary bytes past any
+    // logging/rate-limiting/dedup keyed on the command name (wave-2 audit
+    // finding `btcp2p` F1). The checksum covers only the payload, not the
+    // command field, so tampering the command post-encode keeps it valid.
+    const allocator = testing.allocator;
+    var wire = try encodeMessage(allocator, .mainnet, "version", "");
+    defer allocator.free(wire);
+    // command field is bytes[4..16]; "version" is 7 bytes, so [11..16) is
+    // NUL padding today -- overwrite one padding byte with non-NUL junk.
+    wire[4 + 11] = 'X';
+    try testing.expectError(error.InvalidCommand, decodeMessage(wire, .mainnet));
+}
+
+test "F1 regression: a non-printable byte before the NUL is rejected (IsCommandValid)" {
+    const allocator = testing.allocator;
+    var wire = try encodeMessage(allocator, .mainnet, "version", "");
+    defer allocator.free(wire);
+    wire[4 + 0] = 0x01; // first command byte -> control character, not printable ASCII
+    try testing.expectError(error.InvalidCommand, decodeMessage(wire, .mainnet));
 }
 
 test "hostile: a length field claiming more than MAX_PAYLOAD_LENGTH is rejected before any slicing" {

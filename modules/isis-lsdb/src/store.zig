@@ -259,6 +259,10 @@ pub const Lsdb = struct {
     /// separate request budget is enforced against (kept incrementally so
     /// `requestMissing` stays O(1); an SNP with `n` entries must not cost O(n²)).
     request_count: usize = 0,
+    /// Scratch buffer for `tick`'s removal pass — retained across calls so a
+    /// steady-state tick allocates nothing once it has warmed up to the
+    /// high-water mark of entries removed in one tick.
+    tick_victims: std.ArrayList(LspId) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Lsdb {
         std.debug.assert(cfg.interface_count <= max_interfaces);
@@ -271,6 +275,7 @@ pub const Lsdb = struct {
             if (kv.value_ptr.bytes.len > 0) self.alloc.free(kv.value_ptr.bytes);
         }
         self.map.deinit(self.alloc);
+        self.tick_victims.deinit(self.alloc);
     }
 
     /// Number of stored LSP-IDs (includes request placeholders).
@@ -586,32 +591,41 @@ pub const Lsdb = struct {
         }
 
         // Pass 2: remove purge-hold entries whose ZeroAgeLifetime elapsed, and
-        // request placeholders whose `request_timeout` elapsed. Removal
-        // invalidates the iterator, so re-scan after each removal. Purge
-        // removals are rare (only at ZeroAgeLifetime expiry), so the re-scan
-        // cost is negligible and the pass allocates nothing.
-        while (true) {
+        // request placeholders whose `request_timeout` elapsed. Collected in
+        // one scan (removing mid-iteration is not safe: `EntryMap` is open
+        // addressing, and a removal can backward-shift a not-yet-visited
+        // entry into an already-visited slot, silently skipping it), then
+        // removed in a second pass with no rescans. At `capacity` (default
+        // 4096) a neighbour-death storm that flags many entries in the same
+        // tick no longer costs O(n·k) probes — one scan plus one bounded
+        // removal pass, however many victims there are.
+        self.tick_victims.clearRetainingCapacity();
+        {
             var rit = self.map.iterator();
-            const victim: ?LspId = blk: {
-                while (rit.next()) |kv| {
-                    const e = kv.value_ptr;
-                    // ISO/IEC 10589 §7.3.15.2: an SNP entry for an LSP we lack
-                    // makes us *request* it; the request is re-established by
-                    // the neighbour's next periodic CSNP. Holding the
-                    // placeholder past that window serves nothing and lets one
-                    // SNP full of fabricated LSP-IDs occupy the database
-                    // forever, so it is timed out.
-                    if (e.is_request) {
-                        if (now >= e.set_now + self.cfg.request_timeout) break :blk kv.key_ptr.*;
-                        continue;
+            while (rit.next()) |kv| {
+                const e = kv.value_ptr;
+                // ISO/IEC 10589 §7.3.15.2: an SNP entry for an LSP we lack
+                // makes us *request* it; the request is re-established by
+                // the neighbour's next periodic CSNP. Holding the
+                // placeholder past that window serves nothing and lets one
+                // SNP full of fabricated LSP-IDs occupy the database
+                // forever, so it is timed out.
+                if (e.is_request) {
+                    if (now >= e.set_now + self.cfg.request_timeout) {
+                        self.tick_victims.append(self.alloc, kv.key_ptr.*) catch break;
                     }
-                    if (e.purge_deadline) |dl| {
-                        if (now >= dl) break :blk kv.key_ptr.*;
-                    }
+                    continue;
                 }
-                break :blk null;
-            };
-            const key = victim orelse break;
+                if (e.purge_deadline) |dl| {
+                    if (now >= dl) self.tick_victims.append(self.alloc, kv.key_ptr.*) catch break;
+                }
+            }
+        }
+        // A collection-time OOM (never observed at realistic `capacity`
+        // sizes) just leaves the remaining victims for next tick — the
+        // conditions that qualified them persist, so nothing is lost, only
+        // deferred by one tick.
+        for (self.tick_victims.items) |key| {
             var was_request = false;
             if (self.map.getPtr(key)) |e| {
                 if (e.bytes.len > 0) self.alloc.free(e.bytes);
@@ -1212,6 +1226,42 @@ test "aging: keeps before expiry, purges at expiry, removes after ZeroAge" {
     const r2 = db.tick(160);
     try testing.expectEqual(@as(usize, 1), r2.removed);
     try testing.expect(db.get(id, 160) == null);
+}
+
+// W-B/isis-lsdb-F6 regression: `tick`'s removal pass used to collect victims
+// into a scratch buffer that was only cleared implicitly by the old
+// scan-per-removal loop. The collect-then-remove rewrite MUST clear that
+// scratch buffer at the start of every `tick` call — otherwise a key removed
+// in one tick lingers in the buffer and gets "removed" again (a no-op on the
+// map, but `rep.removed` still counts it) the next time `tick` runs, even
+// though nothing new actually left the store.
+test "tick: a removal from an earlier tick does not phantom-inflate a later tick's report" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .zero_age_lifetime = 60 });
+    defer db.deinit();
+    var buf_a: [128]u8 = undefined;
+    var buf_b: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf_a, sys_other, 0, 1, 100), 0, 0); // LSP A: expires at t=100
+    _ = try db.insert(buildLsp(&buf_b, sys_other, 1, 1, 200), 0, 0); // LSP B: expires at t=200
+    const id_a = idOf(sys_other, 0);
+    const id_b = idOf(sys_other, 1);
+
+    // t=100: A enters purge (dl=160). B is untouched.
+    const r0 = db.tick(100);
+    try testing.expectEqual(@as(usize, 1), r0.entered_purge);
+
+    // t=160: A is actually removed. This is the tick whose scratch buffer
+    // must not leak into the next call.
+    const r1 = db.tick(160);
+    try testing.expectEqual(@as(usize, 1), r1.removed);
+    try testing.expect(db.get(id_a, 160) == null);
+
+    // t=200: B enters purge — nothing is actually removed yet (B's ZeroAge
+    // hold ends at 260). A correct report says `removed == 0` here; a stale
+    // scratch buffer re-processing A's already-gone key would wrongly say 1.
+    const r2 = db.tick(200);
+    try testing.expectEqual(@as(usize, 1), r2.entered_purge);
+    try testing.expectEqual(@as(usize, 0), r2.removed);
+    try testing.expect(db.get(id_b, 200) != null);
 }
 
 test "self-originated near expiry is flagged for refresh, never purged" {

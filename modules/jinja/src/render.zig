@@ -897,6 +897,10 @@ const Renderer = struct {
             return;
         }
         if (!self.opts.autoescape or (v == .string and v.string.safe)) {
+            // A plain string needs no formatting at all — write it straight
+            // through, the same short-circuit `value.strAlloc` already takes,
+            // instead of copying it into a throwaway arena buffer first.
+            if (v == .string) return self.out.writeAll(v.string.bytes);
             var aw: std.Io.Writer.Allocating = .init(self.arena);
             try value.strTo(&aw.writer, v);
             return self.out.writeAll(aw.written());

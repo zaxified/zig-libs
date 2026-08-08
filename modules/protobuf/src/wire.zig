@@ -40,6 +40,16 @@ pub const Error = error{
     VarintOverflow,
     /// Field number 0, which the wire format reserves and no encoder emits.
     FieldNumberZero,
+    /// Field number above `2^29-1`, the wire format's ceiling (field
+    /// numbers are packed into 29 bits alongside the 3-bit wire type). A
+    /// deliberately stricter choice than the reference implementation,
+    /// which accepts an out-of-range field number and treats it as unknown
+    /// (verified: `protoc`-generated Python accepted a tag naming field
+    /// `2^29` and produced an empty message) -- this codec refuses instead.
+    /// Previously conflated with `FieldNumberZero` under that name, which
+    /// named the wrong cause for this half of the check (wave-2 audit
+    /// finding `protobuf` F4).
+    FieldNumberOutOfRange,
     /// Wire type 3 or 4 (groups), or one of the two unassigned wire types
     /// (6, 7) that no conforming encoder produces.
     UnsupportedWireType,
@@ -156,7 +166,8 @@ pub const Cursor = struct {
     pub fn tag(self: *Cursor) Error!Tag {
         const raw = try self.varint();
         const number: u64 = raw >> 3;
-        if (number == 0 or number > std.math.maxInt(u29)) return error.FieldNumberZero;
+        if (number == 0) return error.FieldNumberZero;
+        if (number > std.math.maxInt(u29)) return error.FieldNumberOutOfRange;
         const wire: WireType = @enumFromInt(@as(u3, @truncate(raw)));
         switch (wire) {
             .varint, .i64, .len, .i32 => {},
@@ -331,6 +342,28 @@ test "cursor: tag rejects field 0 and group wire types" {
     try testing.expectError(error.UnsupportedWireType, c3.tag());
     var c4 = Cursor.init(&.{0x0e}); // field 1, wire 6 (unassigned)
     try testing.expectError(error.UnsupportedWireType, c4.tag());
+}
+
+test "F4 regression: a field number above 2^29-1 is FieldNumberOutOfRange, not FieldNumberZero" {
+    // Before the fix, both field 0 AND field > 2^29-1 returned the same
+    // `error.FieldNumberZero`, which named the wrong cause for the second
+    // half of the check (wave-2 audit finding `protobuf` F4). The reference
+    // implementation actually ACCEPTS an out-of-range field number and
+    // treats it as unknown; this module deliberately stays stricter, but
+    // the error it raises must say so.
+    var buf: [10]u8 = undefined;
+    // tag = (2^29 << 3) | wire_type(0), varint-encoded.
+    const raw_tag: u64 = (@as(u64, 1) << 29) << 3;
+    var c = Cursor.init(encodeVarint(raw_tag, &buf));
+    try testing.expectError(error.FieldNumberOutOfRange, c.tag());
+
+    // Positive control/boundary: the maximum IN-range field number (2^29-1)
+    // must still be accepted, not swept up by an off-by-one in the bound.
+    var buf2: [10]u8 = undefined;
+    const max_tag: u64 = (@as(u64, std.math.maxInt(u29)) << 3);
+    var c2 = Cursor.init(encodeVarint(max_tag, &buf2));
+    const t = try c2.tag();
+    try testing.expectEqual(@as(u32, std.math.maxInt(u29)), t.number);
 }
 
 test "cursor: skipValue returns exactly the bytes of the value" {

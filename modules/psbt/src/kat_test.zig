@@ -223,3 +223,54 @@ test "combine rejects PSBTs for different transactions" {
 
     try testing.expectError(error.DifferentTransactions, psbt.combine(allocator, a, b));
 }
+
+// W2-B/psbt-F6: `mergeMaps`'s dedup must key on the WHOLE record key
+// (`keytype` + `keydata`), not `keytype` alone — two different signers'
+// PARTIAL_SIG records for the same input share `keytype` (0x02) but have
+// different `keydata` (their own pubkey), and BIP174's Combiner role
+// requires "all of the key-value pairs from both" to survive. A dedup
+// structure that only hashes/compares `keytype` would treat signer B's
+// PARTIAL_SIG as "already present" once signer A's is in the accumulator
+// and silently drop it — turning a 2-of-2 multisig into a 1-of-2 during
+// combine, which is a signature-loss bug, not merely a slow one.
+test "combine: two signers' PARTIAL_SIG records for the same input both survive (same keytype, different keydata)" {
+    const allocator = testing.allocator;
+    const tx_bytes = "dummy-tx-for-combine-key-collision-test";
+    const pubkey_a = [_]u8{0xAA} ** 33;
+    const pubkey_b = [_]u8{0xBB} ** 33;
+
+    var a: psbt.Psbt = .{
+        .global = .{ .records = try allocator.dupe(psbt.Record, &.{
+            .{ .keytype = psbt.global_key.UNSIGNED_TX, .keydata = &.{}, .value = tx_bytes },
+        }) },
+        .inputs = try allocator.dupe(psbt.Map, &.{
+            .{ .records = try allocator.dupe(psbt.Record, &.{
+                .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey_a, .value = "sig-from-signer-A" },
+            }) },
+        }),
+        .outputs = try allocator.dupe(psbt.Map, &.{}),
+    };
+    defer a.deinit(allocator);
+
+    var b: psbt.Psbt = .{
+        .global = .{ .records = try allocator.dupe(psbt.Record, &.{
+            .{ .keytype = psbt.global_key.UNSIGNED_TX, .keydata = &.{}, .value = tx_bytes },
+        }) },
+        .inputs = try allocator.dupe(psbt.Map, &.{
+            .{ .records = try allocator.dupe(psbt.Record, &.{
+                .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey_b, .value = "sig-from-signer-B" },
+            }) },
+        }),
+        .outputs = try allocator.dupe(psbt.Map, &.{}),
+    };
+    defer b.deinit(allocator);
+
+    var combined = try psbt.combine(allocator, a, b);
+    defer combined.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 2), combined.inputs[0].records.len);
+    const got_a = combined.inputs[0].findKeyed(psbt.input_key.PARTIAL_SIG, &pubkey_a) orelse return error.TestExpectedEqual;
+    const got_b = combined.inputs[0].findKeyed(psbt.input_key.PARTIAL_SIG, &pubkey_b) orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("sig-from-signer-A", got_a.value);
+    try testing.expectEqualStrings("sig-from-signer-B", got_b.value);
+}

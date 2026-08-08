@@ -160,7 +160,10 @@ pub fn validDomain(d: []const u8, allow_utf8: bool) bool {
             else => allow_utf8 and c >= 0x80,
         };
         if (!ok) return false;
-        if (label_len > 63) return false;
+        // RFC 1035 §2.3.4: a label is at most 63 octets. Checked BEFORE the
+        // increment so the 64th character is refused, not accepted with
+        // rejection deferred to the 65th (wave-2 audit finding `smtp` F3).
+        if (label_len >= 63) return false;
         label_len += 1;
         prev = c;
         _ = i;
@@ -496,6 +499,16 @@ test "EHLO argument must be a domain or an address literal" {
     try testing.expectEqualStrings("EHLO [IPv6:2001:db8::1]\r\n", try ehlo(&buf, "[IPv6:2001:db8::1]", .{}));
     // localhost (a single label) is legal syntax, whatever a server thinks of it.
     try testing.expectEqualStrings("EHLO localhost\r\n", try ehlo(&buf, "localhost", .{}));
+
+    // F3 regression: RFC 1035 §2.3.4 caps a label at 63 octets. Before the
+    // fix, `label_len > 63` was checked BEFORE the increment, so the 64th
+    // character passed with `label_len == 63` and rejection only happened
+    // on the 65th -- a stated ceiling that was one off (wave-2 audit
+    // finding `smtp` F3).
+    const label63 = "a" ** 63 ++ ".example";
+    const label64 = "a" ** 64 ++ ".example";
+    try testing.expect(validDomain(label63, false)); // exactly at the limit: legal
+    try testing.expect(!validDomain(label64, false)); // one over: must be refused
 }
 
 test "addressLiteral formats what ehlo accepts" {

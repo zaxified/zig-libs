@@ -320,15 +320,23 @@ pub const Call = struct {
     // ── send ────────────────────────────────────────────────────────────────
 
     /// Frame and send one message. `end` closes the request side with it.
+    ///
+    /// Alloc-free: the 5-byte gRPC length-prefix header goes out as its own
+    /// `sendData` call from a stack buffer, then `message` itself — mirroring
+    /// `Stream(Rep).send`'s server-side path (`server.zig`), which never had
+    /// to allocate+memcpy the whole framed message just to hand it to the
+    /// transport. The two writes land as separate HTTP/2 DATA frames on the
+    /// wire, which is immaterial to the receiver: the deframer reassembles
+    /// by the declared length prefix, not by DATA-frame boundaries.
     pub fn sendMessage(c: *Call, message: []const u8, end: bool) Error!void {
         if (c.ch.options.max_send_message_size) |limit| {
             if (message.len > limit) return error.SendMessageTooLarge;
         }
         if (message.len > std.math.maxInt(u32)) return error.SendMessageTooLarge;
-        const gpa = c.ch.gpa;
-        const framed = try frame.encodeAlloc(gpa, message);
-        defer gpa.free(framed);
-        try c.ch.session.sendData(c.sid, framed, end);
+        var hdr: [frame.header_len]u8 = undefined;
+        frame.writeHeader(&hdr, false, @intCast(message.len));
+        try c.ch.session.sendData(c.sid, &hdr, false);
+        try c.ch.session.sendData(c.sid, message, end);
     }
 
     /// Half-close the request side with no further message.
