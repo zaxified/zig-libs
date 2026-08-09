@@ -31,12 +31,51 @@ Two jobs, deliberately in one process:
    silently change what gets captured, and it records what actually crossed
    the wire rather than what a library said it was about to send.
 
+3. **Report the grade back through the protocol.** See below — this is what
+   makes the Zig-side live test an anchor rather than a liveness check.
+
+## The verdict block: why the master writes its own marks to the device
+
+The first version of this lane was measured and found wanting. With the
+device's register encoder byte-swapped — *every value the master read was
+wrong* — the Zig live test still passed, because all it asserted was
+`stats.delivered > 0 and stats.replied > 0`: frames arrived, frames left. The
+run only went red because this script printed MODBUS_MASTER_FAIL and `run.sh`'s
+marker gate missed MODBUS_MASTER_OK. So the grade lived entirely outside the
+test suite, in a shell gate, and the "live test" graded nothing.
+
+The fix is to give the master a way to *say what it decoded* in terms the
+device can observe, and then assert on that in Zig. Everything this script
+decodes is folded into a small verdict block and written back with FC 0x10:
+
+    holding[24] = 0xF135          "a real master was here" magic
+    holding[25] = graded checks   how many operations were run
+    holding[26] = failures        how many of them the master rejected
+    holding[27] = exception code  what the master decoded from the OOB read
+    holding[28] = sum of the 8 holding registers it decoded  (mod 2^16)
+    holding[29] = sum of the 4 input registers it decoded    (mod 2^16)
+    holding[30] = the 8 coils it decoded, LSB-first, as a bitmap
+    coil[31]    = true iff failures == 0
+
+Note what is *not* done here: the decoded values are not echoed back verbatim.
+An echo would be an inverse of the read, so a device that mis-encoded and
+mis-decoded consistently (a byte-swap on both paths) would round-trip cleanly
+and the mutation would hide. Sums and a bitmap are computed in the master's own
+number domain and compared, on the Zig side, against constants derived from the
+fixture — so a wrong decode lands on a wrong constant, whichever direction the
+error is in.
+
 Usage: fleetsim-modbus-master.py <device-host> <device-port> [wait-seconds]
 
 Output: a human-readable transcript, then one JSON object per operation
-between FLEETSIM_CAPTURE_BEGIN/END markers, then MODBUS_MASTER_OK (exit 0) or
-MODBUS_MASTER_FAIL (exit 1). `run.sh` fails the whole run if the OK marker is
-absent, so "the master never actually connected" cannot read as a pass.
+between FLEETSIM_CAPTURE_BEGIN/END markers, then MODBUS_MASTER_DONE, then
+MODBUS_MASTER_OK (exit 0) or MODBUS_MASTER_FAIL (exit 1).
+
+`run.sh` requires MODBUS_MASTER_DONE — *presence*, i.e. "the counterpart really
+did connect and run its script to the end", which a shell gate is the right
+place for. It deliberately does NOT require MODBUS_MASTER_OK: correctness is
+the Zig test's job now, via the verdict block above. Keeping the grade in the
+shell gate is what let a liveness check pass for an anchor for so long.
 """
 
 import json
@@ -222,6 +261,10 @@ def main():
 
     records = []
     failures = []
+    # What the master itself decoded, keyed by operation. The verdict block is
+    # computed from this — never from the expectations — so that a decode which
+    # merely *matched* and a decode which was never made stay distinguishable.
+    marks = {}
 
     def op(name, deterministic, fn, check):
         """Run one operation, record its bytes, grade the master's own decode."""
@@ -264,20 +307,24 @@ def main():
             flush=True,
         )
 
-    def regs(expected):
+    def regs(expected, mark=None):
         def check(rr):
             if rr.isError():
                 return {"error": str(rr)}, "master reports an error response"
             got = list(rr.registers)
+            if mark is not None:
+                marks[mark] = got
             return {"registers": got}, None if got == expected else "expected %s" % (expected,)
 
         return check
 
-    def bits(expected):
+    def bits(expected, mark=None):
         def check(rr):
             if rr.isError():
                 return {"error": str(rr)}, "master reports an error response"
             got = [bool(b) for b in rr.bits][: len(expected)]
+            if mark is not None:
+                marks[mark] = got
             return {"bits": got}, None if got == expected else "expected %s" % (expected,)
 
         return check
@@ -301,10 +348,10 @@ def main():
     # — which is what lets these captures be frozen.
     op("read_holding_1_8", True,
        lambda: call(client.read_holding_registers, address=1, count=8, device_id=1),
-       regs([111, 222, 333, 444, 555, 666, 777, 888]))
+       regs([111, 222, 333, 444, 555, 666, 777, 888], mark="holding_1_8"))
     op("read_input_0_4", True,
        lambda: call(client.read_input_registers, address=0, count=4, device_id=1),
-       regs([1000, 2000, 3000, 4000]))
+       regs([1000, 2000, 3000, 4000], mark="input_0_4"))
     op("read_coils_0_16", True,
        lambda: call(client.read_coils, address=0, count=16, device_id=1),
        bits([False] * 16))
@@ -322,7 +369,7 @@ def main():
        written(None))
     op("read_coils_0_8_after_write", True,
        lambda: call(client.read_coils, address=0, count=8, device_id=1),
-       bits([False, False, False, True, False, False, False, False]))
+       bits([False, False, False, True, False, False, False, False], mark="coils_0_8"))
 
     def out_of_range(rr):
         # An exception reply is the most valuable single vector here: the
@@ -332,7 +379,9 @@ def main():
         # expectation of it.
         if not rr.isError():
             return {"unexpected_ok": str(rr)}, "expected an exception reply"
-        return {"exception": str(rr), "exception_code": getattr(rr, "exception_code", None)}, None
+        code = getattr(rr, "exception_code", None)
+        marks["oob_exception_code"] = code
+        return {"exception": str(rr), "exception_code": code}, None
 
     op("read_holding_200_4_oob", True,
        lambda: call(client.read_holding_registers, address=200, count=4, device_id=1),
@@ -365,6 +414,49 @@ def main():
        lambda: call(client.read_holding_registers, address=0, count=1, device_id=1),
        sine_range)
 
+    # ── the verdict block ───────────────────────────────────────────────────
+    # Everything above this line is graded here, in the master's own number
+    # domain, and the marks are written back into the device so the Zig live
+    # test can assert on them. See the module docstring for why this exists and
+    # why it is sums-and-a-bitmap rather than an echo.
+    #
+    # `graded` counts the operations attempted before this point, so a script
+    # that died halfway cannot look like a complete run: the Zig side pins the
+    # exact number.
+    graded = len(records)
+
+    def u16(x):
+        return int(x) & 0xFFFF
+
+    hsum = u16(sum(marks.get("holding_1_8", [])))
+    isum = u16(sum(marks.get("input_0_4", [])))
+    coil_bitmap = 0
+    for i, b in enumerate(marks.get("coils_0_8", [])):
+        if b:
+            coil_bitmap |= 1 << i
+    exc = marks.get("oob_exception_code")
+    verdict = [
+        0xF135,                       # holding[24] magic
+        u16(graded),                  # holding[25]
+        u16(len(failures)),           # holding[26]
+        u16(exc if exc is not None else 0xFFFF),  # holding[27]
+        hsum,                         # holding[28]
+        isum,                         # holding[29]
+        u16(coil_bitmap),             # holding[30]
+    ]
+    op("write_verdict_block", True,
+       lambda: call(client.write_registers, address=24, values=verdict, device_id=1),
+       written(None))
+
+    # Written LAST and unconditionally, both ways: an explicit `false` here is
+    # the master saying "I was here and I am not satisfied", which is a
+    # different fact from "no master ever connected" (magic absent). A test that
+    # cannot tell those apart cannot tell a broken device from a broken lane.
+    all_passed = not failures
+    op("write_verdict_coil", True,
+       lambda: call(client.write_coil, address=31, value=all_passed, device_id=1),
+       written(None))
+
     client.close()
     time.sleep(0.2)
     tap.stop()
@@ -374,6 +466,12 @@ def main():
     for rec in records:
         print(json.dumps(rec, separators=(",", ":")), flush=True)
     print(CAPTURE_END, flush=True)
+
+    # Presence, not grade. `run.sh` gates on this one: it says the counterpart
+    # connected, ran every operation and wrote its verdict into the device.
+    # Whether that verdict is a pass is asserted in Zig, not here.
+    print("master: verdict block %s, all_passed=%s" % (verdict, all_passed), flush=True)
+    print("MODBUS_MASTER_DONE", flush=True)
 
     if failures:
         for f in failures:

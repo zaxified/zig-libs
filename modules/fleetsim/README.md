@@ -189,19 +189,37 @@ scripts/vm/run.sh fleetsim debian
 That boots the provisioned Debian guest, runs the live Modbus test inside it
 with `FLEETSIM_EXPECT_LIVE=1`, and points a **real pymodbus 3.14.0** at the
 simulated slave (installed into the image by the provisioning recipe, not by
-you). It exits non-zero if the master does not complete its whole script, so
-"nobody was listening" cannot read as a pass. ~80 s end to end; the one-off
-`scripts/vm/provision.sh debian` before it takes ~2 min.
+you). ~80 s end to end; the one-off `scripts/vm/provision.sh debian` before it
+takes ~2 min.
+
+**Two gates, and the split between them matters.** `run.sh` requires the
+guest to print `MODBUS_MASTER_DONE`, which means only "the counterpart really
+was there and ran its script to the end" — that is a presence check and a shell
+`grep` is the right place for it. *Correctness* is asserted in Zig: the master
+grades every read against the fixture and writes its marks back into the device
+(a magic word, how many checks it ran, how many it rejected, the exception code
+it named, the sums of the registers it decoded, the coil bitmap it unpacked, a
+pass bit), and `modbus_verdict` in `src/root.zig` asserts on all of it.
+
+That split is not decoration. Before it, the live test asserted only
+`delivered > 0`/`replied > 0`, and a device with a byte-swapped register
+encoder — every value wrong — **passed it**; only the shell gate went red. With
+the verdict block the same mutation fails the live test itself. See
+[SPEC.md](./SPEC.md)'s "What was verified live" for the measurement.
 
 Only Modbus is wired up so far. Adding the next master is two edits that must
 happen together — its pinned spec in `scripts/vm/manifest.sh`'s
-`VM_DEBIAN_PIP`, and its test in `run.sh`'s `guest_default_filter` — plus a
-guest-side driver script alongside
-`scripts/vm/guests/fleetsim-modbus-master.py`.
+`VM_DEBIAN_PIP`, and its test in `run.sh`'s `guest_default_filter` (which takes
+a list; `--test-filter` is repeatable and a union) — plus a guest-side driver
+script alongside `scripts/vm/guests/fleetsim-modbus-master.py`. Budget for a
+verdict channel too: a master that only reads leaves no trace of what it
+understood, so each protocol needs some writable point the master can command
+its marks into.
 
 What that run produced is frozen in `src/master_goldens.zig` and replays
 offline on every build, so the ordinary `zig build test-fleetsim` carries the
-third-party evidence even with no VM in sight.
+third-party evidence even with no VM in sight — including the two verdict
+exchanges, whose request bytes are a function of what the device said.
 
 ### Installing the masters on a host, instead
 
@@ -217,8 +235,13 @@ pip install --user --break-system-packages \
 ```
 
 `c104` is the only one carrying a compiled extension (it wraps lib60870-C).
-Its published wheels stop at CPython 3.13, so on a newer interpreter pip falls
-back to a source build and needs `build-essential` and `cmake`.
+Its published wheels stop at CPython 3.13, so on a **newer** interpreter pip
+falls back to a source build and needs `build-essential` and `cmake`. Checked,
+not inherited: Debian 13 (trixie) ships Python 3.13 and c104 2.2.1 publishes a
+`cp313-manylinux_2_28_x86_64` wheel, so in the VM lane's guest it installs from
+a wheel with no toolchain at all (`pip install c104==2.2.1` → `Successfully
+installed c104-2.2.1`, verified). The warning is about interpreters ahead of
+that image, not about this lane.
 
 DNP3 has no usable Python master: `pydnp3` on PyPI is a 2018 work-in-progress
 and is *not* what the transcript was taken against. Build the real thing:

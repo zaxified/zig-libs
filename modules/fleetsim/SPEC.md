@@ -210,22 +210,46 @@ Proved, not asserted, by three tests:
 >    exchanges that a third party's encoder composed and its decoder accepted.
 >    The other six masters are still prose.
 >
-> **And a caution the VM lane produced, which the prose below cannot give you.**
+> **The caution the VM lane produced — and what was done about it.**
 > A live master is not automatically an anchor. `test "live: a real Modbus
-> master drives a simulated slave over the TCP binding"` asserts exactly two
-> things — `stats.delivered > 0` and `stats.replied > 0`. Both are liveness:
-> frames arrived, frames left. It asserts **nothing** about what the device
-> said. Byte-swapping the register encoder (`.big` → `.little` in
+> master drives a simulated slave over the TCP binding"` used to assert exactly
+> two things: `stats.delivered > 0` and `stats.replied > 0`. Both are liveness —
+> frames arrived, frames left — and neither says anything about what the device
+> said. Measured: byte-swapping the register encoder (`.big` → `.little` in
 > `modules/modbus/src/server.zig`'s read-registers reply) and re-running the
-> live lane produced `GUEST_EXIT=0` — the live test passed with every register
-> value wrong, because a wrong answer is still an answer and still gets
-> counted. What went red was the master's own grading: pymodbus decoded 28416
-> where 111 was expected, `run.sh` did not see the `MODBUS_MASTER_OK` marker,
-> and the run exited 1. The lesson generalises to all eight live tests as
-> written: **the value of the live lane is in the counterpart's assertions,
-> not in the counterpart's presence.** A live test that only counts frames is a
-> liveness check wearing an anchor's clothes, and the seven tests that still
-> have no master are not the only ones that need work.
+> live lane produced **`GUEST_EXIT=0`: the live test passed with every register
+> value wrong**, because a wrong answer is still an answer and still gets
+> counted. What went red was the master's own grading, enforced by a `grep` in
+> `run.sh` for its `MODBUS_MASTER_OK` marker. A grade enforced by a shell gate
+> is not a test suite.
+>
+> **The fix is that the master now reports what it decoded, in-band, and the
+> live test grades that.** `scripts/vm/guests/fleetsim-modbus-master.py`
+> compares every read against the fixture in its own number domain and writes
+> its marks back into the device with FC 0x10 and FC 0x05 — a magic word, the
+> number of checks it ran, the number it rejected, the exception code it
+> *named* for an out-of-range read, the sum of the holding registers it
+> decoded, the sum of the input registers, the coil bitmap it unpacked, and a
+> pass bit written either way. `modbus_verdict` in `src/root.zig` asserts on all
+> of it against constants derived from the fixture. Note what is deliberately
+> *not* done: the decoded values are never echoed back verbatim, because an echo
+> is the inverse of the read and a device that encoded and decoded with the same
+> wrong convention would round-trip cleanly — sums and a bitmap cannot cancel
+> that way.
+>
+> The gate in `run.sh` was correspondingly demoted to `MODBUS_MASTER_DONE`,
+> which means "the counterpart connected and ran to the end" and never "the
+> counterpart was satisfied". Re-running the same byte-swap mutation against the
+> new arrangement: the marker gate passes, and **the live test itself fails**
+> (`expected 0, found 4` on the master's failure count) — `GUEST_EXIT=1`,
+> `run.sh` exit 1. The same marks are frozen into `src/master_goldens.zig`, so
+> the offline suite carries the grading too.
+>
+> **The other six live tests still have the old shape** — each ends in
+> `replied > 0`-class checks — so installing the remaining six masters would not
+> by itself close this. Each needs a counterpart that grades and a verdict
+> channel of its own; the value of the live lane is in the counterpart's
+> assertions, not in the counterpart's presence.
 
 **All seven protocols now have third-party-master evidence through the adapter
 and the module's own binding**, on Linux, Debug build. Each run schedules a

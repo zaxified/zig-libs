@@ -5,7 +5,7 @@
 # between ===VM_CMD_BEGIN=== / ===VM_CMD_END=== markers so run.sh can slice
 # out just the guest's own output from the surrounding kernel/systemd noise.
 #
-# Args: <image> <hashed-root-password> <memory-MB> <command-to-run> [<command-timeout-s>]
+# Args: <image> <hashed-root-password> <memory-MB> <command-to-run> [<command-timeout-s>] [<vcpus>]
 #
 # The command timeout is separate from the boot timeout on purpose. Booting is
 # a fixed cost and 90s is generous for it; the COMMAND can be anything from a
@@ -41,8 +41,16 @@ set mem [lindex $argv 2]
 set runcmd [lindex $argv 3]
 set cmd_timeout [lindex $argv 4]
 if {$cmd_timeout eq ""} { set cmd_timeout 90 }
+# vCPUs. One is right for a netlink suite. It is NOT right for a lane that runs
+# the device, two third-party master processes and their capture taps at once:
+# measured on one vCPU, the IEC 104 client's link timers expired under the
+# contention and it redialled five times in a 60s window, reporting 3 points
+# instead of 45. Starving the counterpart is a lane defect that presents as a
+# protocol failure.
+set vcpus [lindex $argv 5]
+if {$vcpus eq ""} { set vcpus 1 }
 
-spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -m $mem -no-reboot -nographic -snapshot \
+spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -smp $vcpus -m $mem -no-reboot -nographic -snapshot \
     -drive file=$img,format=qcow2,if=virtio \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
     -fw_cfg name=opt/io.systemd.credentials/passwd.hashed-password.root,string=$hash \
@@ -78,13 +86,28 @@ expect {
     timeout { puts "\nTIMEOUT waiting for shell after login"; exit 1 }
 }
 
-send "echo ===VM_CMD_BEGIN===; $runcmd; echo ===VM_CMD_END===\r"
+# The end marker is sent SPLIT — `===VM_CMD_"END"===` — and the shell strips
+# the quotes before echoing it back, so what the terminal echoes is
+# `===VM_CMD_"END"===` while what the command finally prints is
+# `===VM_CMD_END===`. That difference is load-bearing.
+#
+# Without it the pattern below matches the tty's echo of this very line, the
+# instant it is sent: `expect` then falls straight through to the poweroff
+# stage while the batch has not even started, `poweroff` sits unread in the
+# tty input buffer, and the only thing actually bounding the run is the 90s
+# EOF wait further down — NOT $cmd_timeout, which never applied to anything.
+# It looked fine for as long as every batch happened to finish inside that 90s.
+# It stopped looking fine the moment a two-protocol fleetsim run needed ~150s:
+# the guest was cut off mid-run, the counterpart logs were never printed, and
+# the failure presented as "TIMEOUT on poweroff", which points at the wrong
+# end of the script entirely.
+send "echo ===VM_CMD_BEGIN===; $runcmd; echo ===VM_CMD_\"END\"===\r"
 set timeout $cmd_timeout
 expect {
     -re {===VM_CMD_END===} {}
     timeout { puts "\nTIMEOUT waiting for command to finish" }
 }
-set timeout 90
+set timeout 120
 
 send "\rpoweroff\r"
 expect {

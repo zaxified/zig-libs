@@ -13,9 +13,11 @@
 #                 routing table below, or debian (the verified superset) if
 #                 the module isn't listed
 #   --test-filter forwarded to `zig test --test-filter` to run one test.
-#                 Some modules have a DEFAULT filter (guest_default_filter
-#                 below) because running their whole suite in here would be
-#                 wrong; passing this explicitly overrides it.
+#                 REPEATABLE, and a union: zig skips tests matching no filter,
+#                 so two of them run both. Some modules have a DEFAULT filter
+#                 list (guest_default_filter below) because running their whole
+#                 suite in here would be wrong; passing any explicitly replaces
+#                 the whole default list.
 #
 # What it does, in order:
 #   1. resolve <module>'s forward dependency closure from `zig build
@@ -53,11 +55,14 @@ fi
 shift
 
 PLATFORM=""
-TEST_FILTER=""
+# Repeatable: `zig test --test-filter` is documented as "skip tests that do not
+# match ANY filter", so several of them are a union, not an intersection. That
+# is what lets one guest boot drive several protocols' live tests in sequence.
+TEST_FILTERS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         openwrt|debian) PLATFORM="$1"; shift ;;
-        --test-filter) TEST_FILTER="$2"; shift 2 ;;
+        --test-filter) TEST_FILTERS+=("$2"); shift 2 ;;
         *) echo "run.sh: unrecognized argument '$1'" >&2; exit 1 ;;
     esac
 done
@@ -188,9 +193,20 @@ guest_files() {
 # same defence as the SETUP_OK check: a live test that silently did not run
 # leaves an all-green suite behind it, so the counterpart has to say for
 # itself that it was there.
+#
+# PRESENCE ONLY — deliberately. fleetsim's marker used to be
+# MODBUS_MASTER_OK, i.e. the master's own *grade*, and that turned out to be
+# the only thing carrying the anchor: with the device's register encoder
+# byte-swapped the Zig live test still passed (it asserted frame counts and
+# nothing else) and the run went red purely because this gate missed the OK.
+# A grade enforced by a shell `grep` is not a test suite. The masters now write
+# what they decoded back into the device (a "verdict block"), the live tests
+# assert on it, and this gate is left with the one job it is actually good at:
+# proving the counterpart was there at all. _DONE means "ran to the end",
+# never "was satisfied".
 guest_require() {
     case "$1" in
-        fleetsim) printf '%s\n' MODBUS_MASTER_OK ;;
+        fleetsim) printf '%s\n' MODBUS_MASTER_DONE ;;
         *) printf '' ;;
     esac
 }
@@ -223,14 +239,17 @@ guest_cmd_timeout() {
 # VM_DEBIAN_PIP and widen this filter together, never separately.
 guest_default_filter() {
     case "$1" in
-        fleetsim) printf '%s' 'live: a real Modbus master' ;;
+        fleetsim) printf '%s\n' 'live: a real Modbus master' ;;
         *) printf '' ;;
     esac
 }
 
-if [[ -z "$TEST_FILTER" ]]; then
-    TEST_FILTER="$(guest_default_filter "$MODULE")"
-    [[ -n "$TEST_FILTER" ]] && echo "vm: default --test-filter for $MODULE: '$TEST_FILTER'"
+if [[ ${#TEST_FILTERS[@]} -eq 0 ]]; then
+    while IFS= read -r _f; do
+        [[ -z "$_f" ]] && continue
+        TEST_FILTERS+=("$_f")
+        echo "vm: default --test-filter for $MODULE: '$_f'"
+    done < <(guest_default_filter "$MODULE")
 fi
 
 case "$PLATFORM" in
@@ -356,7 +375,11 @@ done
 BIN="$WORK_DIR/${MODULE}-${PLATFORM}-test"
 rm -f "$BIN"
 ZIG_CMD=(zig test "${ZIG_ARGS[@]}" -target "$TARGET_TRIPLE" --test-no-exec -femit-bin="$BIN")
-[[ -n "$TEST_FILTER" ]] && ZIG_CMD+=(--test-filter "$TEST_FILTER")
+# Guarded: `"${arr[@]}"` on an empty array trips `set -u` on bash before 4.4,
+# and this script is expected to run on whatever bash the host ships.
+if [[ ${#TEST_FILTERS[@]} -gt 0 ]]; then
+    for _f in "${TEST_FILTERS[@]}"; do ZIG_CMD+=(--test-filter "$_f"); done
+fi
 
 echo "vm: compiling for $TARGET_TRIPLE (host never executes this binary)..."
 if ! "${ZIG_CMD[@]}"; then

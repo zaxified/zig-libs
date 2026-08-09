@@ -1398,7 +1398,92 @@ test "live: a real Modbus master drives a simulated slave over the TCP binding" 
     );
     try testing.expect(st.delivered > 0);
     try testing.expect(st.replied > 0);
+    // …and then the part that makes this an anchor rather than a frame
+    // counter. See `modbus_verdict` below: everything asserted from here on is
+    // a mark the third-party master computed from what IT decoded.
+    try modbus_verdict.expectAllPassed(&holdings, &coils);
 }
+
+/// The contract between `scripts/vm/guests/fleetsim-modbus-master.py` and the
+/// live Modbus test — and the reason that test is worth running.
+///
+/// **The defect this closes.** The live test used to end at `delivered > 0`
+/// and `replied > 0`. Both are liveness: frames arrived, frames left. Measured
+/// consequence — with `modules/modbus/src/server.zig`'s register encoder
+/// byte-swapped, so that *every value the master read was wrong*, the live test
+/// still passed. The run went red only because the master printed a FAIL line
+/// and a shell `grep` in `run.sh` missed its OK marker. A third-party master a
+/// wrong implementation still satisfies is not an oracle; it is a liveness
+/// check wearing an anchor's clothes.
+///
+/// **The mechanism.** A master that only reads leaves no trace of what it
+/// understood. So this one grades itself — it knows the fixture, it compares
+/// what pymodbus decoded against it — and then writes its marks back into the
+/// device through ordinary Modbus writes. Those marks are device state, which
+/// this test can read directly.
+///
+/// **Why marks and not an echo.** Echoing the decoded registers back would be
+/// the inverse of the read, so a device that encoded and decoded with the same
+/// wrong convention would round-trip cleanly and the mutation would vanish —
+/// the "consistent mutation hides from every local test" trap. A *sum* and a
+/// *bitmap* are computed in the master's number domain and land on constants
+/// derived here from the fixture, so a wrong decode lands on a wrong constant
+/// in either direction.
+const modbus_verdict = struct {
+    /// "A real master was here." Absent ⇒ nothing ever wrote the block, which
+    /// is a broken lane, not a broken device — a distinction the old test could
+    /// not make at all.
+    const magic: u16 = 0xF135;
+    /// Operations the master runs before writing the block. Pinned exactly: a
+    /// script that died halfway would otherwise report a clean pass over the
+    /// prefix it managed.
+    const graded_checks: u16 = 10;
+    /// 111 + 222 + … + 888 — the fixture's `holding[i] = i*111` for i in 1..8,
+    /// as pymodbus decoded them.
+    const holding_sum: u16 = 3996;
+    /// 1000 + 2000 + 3000 + 4000, as pymodbus decoded the input registers.
+    const input_sum: u16 = 10_000;
+    /// The eight coils after `write_coil(3, true)`, packed LSB-first the way
+    /// pymodbus unpacked them: bit 3 set, nothing else. Grades the bit order
+    /// against a third party's unpacking rather than against our own.
+    const coil_bitmap: u16 = 0b0000_1000;
+    /// MODBUS Application Protocol §7: 0x02 Illegal Data Address, which is what
+    /// pymodbus *named* the reply to a read past the end of the bank. Distinct
+    /// from the 0x04 Server Device Failure the trouble state uses — the two
+    /// must not collapse into one.
+    const oob_exception: u16 = 0x02;
+
+    const base = 24; // holding[24..31] is the block; coil[31] is the verdict bit
+
+    fn expectAllPassed(holdings: []const u16, coils: []const bool) !void {
+        if (holdings[base] != magic) {
+            std.debug.print(
+                "live fleetsim Modbus: no verdict block (holding[{d}]=0x{X:0>4}, want 0x{X:0>4}) —" ++
+                    " the master never wrote its marks, so nothing here graded the device\n",
+                .{ base, holdings[base], magic },
+            );
+            return error.NoMasterVerdict;
+        }
+        std.debug.print(
+            "live fleetsim Modbus verdict: checks={d} failures={d} exception={d}" ++
+                " holding_sum={d} input_sum={d} coil_bitmap=0b{b:0>8} all_passed={}\n",
+            .{
+                holdings[base + 1], holdings[base + 2], holdings[base + 3],
+                holdings[base + 4], holdings[base + 5], holdings[base + 6],
+                coils[31],
+            },
+        );
+        try testing.expectEqual(graded_checks, holdings[base + 1]);
+        try testing.expectEqual(@as(u16, 0), holdings[base + 2]);
+        try testing.expectEqual(oob_exception, holdings[base + 3]);
+        try testing.expectEqual(holding_sum, holdings[base + 4]);
+        try testing.expectEqual(input_sum, holdings[base + 5]);
+        try testing.expectEqual(coil_bitmap, holdings[base + 6]);
+        // Written last and written either way: `false` is the master saying it
+        // was here and is not satisfied.
+        try testing.expect(coils[31]);
+    }
+};
 
 test "live: a real EtherNet/IP master drives a simulated adapter" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

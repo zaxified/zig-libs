@@ -58,6 +58,25 @@
 //! `coil[3]`, and exchanges 6 and 8 read them back. Replaying out of order is a
 //! different test.
 //!
+//! ## The verdict exchanges, and why a replay corpus needs them
+//!
+//! The first nine exchanges are a *replay*: our device produced those bytes
+//! once, and this test checks it still produces them. That catches a change,
+//! but it says nothing about whether the bytes were ever right — a corpus
+//! recorded from a wrong device would freeze the wrong answers just as happily.
+//! What upgrades it is that the last two exchanges are the master's own marks:
+//! pymodbus decoded the replies, summed and packed what it understood in its
+//! own number domain, and wrote the result back with FC 0x10 and FC 0x05. Those
+//! request bytes are therefore a function of what the device said, computed by
+//! a third party — and the test below recomputes the expected values from the
+//! fixture rather than restating them, so the two have to agree.
+//!
+//! Concretely: a device whose register encoder was byte-swapped would have made
+//! pymodbus read 28416, 56832, … instead of 111, 222, …, so the sum in exchange
+//! 11 would not be 0x0F9C and the pass bit in exchange 12 would be 0x0000. That
+//! is the same defect the live test now catches (F1b); this file catches it
+//! offline, on every build, with no VM.
+//!
 //! ## Provenance and licence
 //!
 //! Nothing from pymodbus is copied, translated or redistributed here. What is
@@ -172,6 +191,36 @@ const session = [_]Exchange{
         .response = &.{ 0x00, 0x09, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02 },
         .decoded = "ExceptionResponse(function_code=131, exception_code=2 Illegal Data Address)",
     },
+    // Transaction id 0x000A is the sine read, deliberately not frozen (see the
+    // header). 0x000B and 0x000C are the master's VERDICT — the two exchanges
+    // that make this corpus grade rather than merely replay.
+    .{
+        // FC 0x10, seven registers at 24. Every value in this payload is a
+        // number the *master* computed from what it decoded, not a number we
+        // sent it: f135 magic, 10 checks run, 0 failures, exception code 2,
+        // 0x0F9C = 3996 = the sum of the eight holding registers it read,
+        // 0x2710 = 10000 = the sum of the four input registers, 0x0008 = the
+        // eight coils packed LSB-first. Freezing the request means a device
+        // that mis-encoded its replies could not produce these bytes: the
+        // master would have summed different numbers.
+        .op = "write_registers(address=24, values=<the master's verdict>)",
+        .request = &.{
+            0x00, 0x0B, 0x00, 0x00, 0x00, 0x15, 0x01, 0x10, 0x00, 0x18, 0x00, 0x07, 0x0E,
+            0xF1, 0x35, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x02, 0x0F, 0x9C, 0x27, 0x10, 0x00,
+            0x08,
+        },
+        .response = &.{ 0x00, 0x0B, 0x00, 0x00, 0x00, 0x06, 0x01, 0x10, 0x00, 0x18, 0x00, 0x07 },
+        .decoded = "WriteMultipleRegistersResponse(address=24, count=7)",
+    },
+    .{
+        // The pass bit, written last and written either way. 0xFF00 here is
+        // pymodbus saying "satisfied"; a 0x0000 in this slot would be a real
+        // master reporting, in-band, that the device it just drove is wrong.
+        .op = "write_coil(address=31, value=True) — the master's pass bit",
+        .request = &.{ 0x00, 0x0C, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x1F, 0xFF, 0x00 },
+        .response = &.{ 0x00, 0x0C, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x1F, 0xFF, 0x00 },
+        .decoded = "WriteSingleCoilResponse(address=31, bits=[True])",
+    },
 };
 
 test "anchor: replay a real pymodbus 3.14.0 master's recorded session offline" {
@@ -216,4 +265,32 @@ test "anchor: replay a real pymodbus 3.14.0 master's recorded session offline" {
     // never stored.
     try testing.expectEqual(@as(u16, 0x1234), holdings[10]);
     try testing.expect(coils[3]);
+
+    // ── the master's verdict, replayed ──────────────────────────────────────
+    // The last two exchanges carry numbers pymodbus computed from what it
+    // decoded. Comparing them against the fixture — recomputed here, not
+    // restated as literals — is the part of this corpus that grades the
+    // device's encoding rather than replaying it. A byte-swapped register
+    // encoder cannot reach these values: the master would have summed 28416,
+    // 56832, … instead of 111, 222, ….
+    try testing.expectEqual(@as(u16, 0xF135), holdings[24]); // "a real master was here"
+    try testing.expectEqual(@as(u16, 10), holdings[25]); // operations it graded
+    try testing.expectEqual(@as(u16, 0), holdings[26]); // and none of them failed
+    try testing.expectEqual(@as(u16, 0x02), holdings[27]); // Illegal Data Address, as pymodbus named it
+
+    var want_hsum: u16 = 0;
+    for (1..9) |i| want_hsum +%= @intCast(i * 111);
+    try testing.expectEqual(want_hsum, holdings[28]);
+
+    var want_isum: u16 = 0;
+    for (inputs) |v| want_isum +%= v;
+    try testing.expectEqual(want_isum, holdings[29]);
+
+    // Coil 3 set, LSB-first within the byte — the bit order as a third party
+    // unpacked it, not as we packed it.
+    try testing.expectEqual(@as(u16, 1 << 3), holdings[30]);
+
+    // The pass bit. `false` here would be a real master saying, over the wire,
+    // that it was there and is not satisfied.
+    try testing.expect(coils[31]);
 }

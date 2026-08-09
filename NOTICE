@@ -1153,6 +1153,15 @@ re-examined 2026-07-29 (both recorded in the project git history).
                because the reasoning has to be checkable, not because
                BSD-3-Clause made it close.
 
+               The last two exchanges in that file are the master's own
+               VERDICT: numbers pymodbus computed from what it decoded (two
+               sums, a bit-packing, the exception code it named) and wrote back
+               into the device. Those are equally the output of a conversation
+               rather than an expression of pymodbus's — no threshold, table or
+               algorithm of theirs is reproduced; what is frozen is arithmetic
+               over values THIS repository chose, performed on the far side of
+               a socket.
+
   readthrough — the read-through cache, its cross-thread miss coalescing and
                its invalidation semantics are the authors' own original work.
                The single-flight shape follows Go's `singleflight`
