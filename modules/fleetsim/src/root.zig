@@ -1771,5 +1771,6 @@ test {
     _ = @import("tcp.zig");
     _ = @import("shim.zig");
     _ = @import("goldens.zig");
+    _ = @import("master_goldens.zig");
     _ = @import("vopr.zig");
 }

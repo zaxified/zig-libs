@@ -5,7 +5,13 @@
 # between ===VM_CMD_BEGIN=== / ===VM_CMD_END=== markers so run.sh can slice
 # out just the guest's own output from the surrounding kernel/systemd noise.
 #
-# Args: <image> <hashed-root-password> <memory-MB> <command-to-run>
+# Args: <image> <hashed-root-password> <memory-MB> <command-to-run> [<command-timeout-s>]
+#
+# The command timeout is separate from the boot timeout on purpose. Booting is
+# a fixed cost and 90s is generous for it; the COMMAND can be anything from a
+# 6-second netlink suite to a live interop test that holds a socket open for a
+# 60-second budget by design (fleetsim). Sharing one number would either kill
+# the long runs or hide a hung short one.
 #
 # "nocloud" only means "no cloud-init datasource" — it does NOT mean
 # unattended boot. Without credentials, systemd-firstboot blocks on an
@@ -33,6 +39,8 @@ set img [lindex $argv 0]
 set hash [lindex $argv 1]
 set mem [lindex $argv 2]
 set runcmd [lindex $argv 3]
+set cmd_timeout [lindex $argv 4]
+if {$cmd_timeout eq ""} { set cmd_timeout 90 }
 
 spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -m $mem -no-reboot -nographic -snapshot \
     -drive file=$img,format=qcow2,if=virtio \
@@ -71,10 +79,12 @@ expect {
 }
 
 send "echo ===VM_CMD_BEGIN===; $runcmd; echo ===VM_CMD_END===\r"
+set timeout $cmd_timeout
 expect {
     -re {===VM_CMD_END===} {}
     timeout { puts "\nTIMEOUT waiting for command to finish" }
 }
+set timeout 90
 
 send "\rpoweroff\r"
 expect {

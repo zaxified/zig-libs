@@ -3,7 +3,7 @@
 # that deliberately runs WITHOUT -snapshot, because its entire purpose is to
 # make disk changes that survive poweroff.
 #
-# Args: <writable-image> <hashed-root-password> <memory-MB> <space-separated-packages>
+# Args: <writable-image> <hashed-root-password> <memory-MB> <space-separated-apt-packages> [<space-separated-pip-specs>]
 #
 # Called only by provision.sh, and only ever on a *copy* (provision.sh copies
 # the checksum-verified stock qcow2 to a temp name first, provisions that,
@@ -31,6 +31,7 @@ set img [lindex $argv 0]
 set hash [lindex $argv 1]
 set mem [lindex $argv 2]
 set pkgs [lindex $argv 3]
+set pips [lindex $argv 4]
 
 spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -m $mem -no-reboot -nographic \
     -drive file=$img,format=qcow2,if=virtio \
@@ -75,9 +76,25 @@ expect {
 }
 expect -re {[#\$] $}
 
+# pip, if the recipe asked for any. `--break-system-packages` is deliberate
+# and safe *here specifically*: this is a throwaway guest built from a recipe,
+# so PEP 668's "don't fight the distro package manager" hazard has nobody to
+# hurt, and a venv would have to be re-activated by every consumer of the
+# image. Each spec is then re-read back out of `pip freeze` with an exact
+# match (-Fxq), so "pip resolved a DIFFERENT version than the recipe pinned"
+# fails the provisioning run instead of silently shipping an image whose
+# contents disagree with its own recipe hash.
+set pipcmd ""
+if {[string trim $pips] ne ""} {
+    append pipcmd " && python3 -m pip install --break-system-packages --no-cache-dir --no-input $pips"
+    foreach spec $pips {
+        append pipcmd " && python3 -m pip freeze | grep -Fxq $spec"
+    }
+}
+
 # One command batch, one exit code. DEBIAN_FRONTEND=noninteractive so a
 # postinst that wants a debconf answer can't wedge the console forever.
-send "export DEBIAN_FRONTEND=noninteractive; echo ===VM_CMD_BEGIN===; apt-get update && apt-get install -y --no-install-recommends $pkgs && apt-get clean; echo PROVISION_EXIT=\$?; echo ===VM_CMD_END===\r"
+send "export DEBIAN_FRONTEND=noninteractive; echo ===VM_CMD_BEGIN===; apt-get update && apt-get install -y --no-install-recommends $pkgs$pipcmd && apt-get clean; echo PROVISION_EXIT=\$?; echo ===VM_CMD_END===\r"
 expect {
     -re {===VM_CMD_END===} {}
     timeout { puts "\nTIMEOUT during apt-get"; exit 1 }

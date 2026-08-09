@@ -202,6 +202,30 @@ Proved, not asserted, by three tests:
 >    every build with no new dependency. It grades frames, so it does not
 >    replace a real master's state machine; it does mean a green
 >    `test-fleetsim` is no longer entirely self-anchored.
+> 3. **`scripts/vm/run.sh fleetsim debian`** — the live lane, actually run, in a
+>    disposable VM with a real pymodbus 3.14.0 installed by the provisioning
+>    recipe. Its recorded session is frozen in **`src/master_goldens.zig`** and
+>    replays offline on every build. So for Modbus specifically, the transcript
+>    below is no longer only prose: it is a committed set of byte-exact
+>    exchanges that a third party's encoder composed and its decoder accepted.
+>    The other six masters are still prose.
+>
+> **And a caution the VM lane produced, which the prose below cannot give you.**
+> A live master is not automatically an anchor. `test "live: a real Modbus
+> master drives a simulated slave over the TCP binding"` asserts exactly two
+> things — `stats.delivered > 0` and `stats.replied > 0`. Both are liveness:
+> frames arrived, frames left. It asserts **nothing** about what the device
+> said. Byte-swapping the register encoder (`.big` → `.little` in
+> `modules/modbus/src/server.zig`'s read-registers reply) and re-running the
+> live lane produced `GUEST_EXIT=0` — the live test passed with every register
+> value wrong, because a wrong answer is still an answer and still gets
+> counted. What went red was the master's own grading: pymodbus decoded 28416
+> where 111 was expected, `run.sh` did not see the `MODBUS_MASTER_OK` marker,
+> and the run exited 1. The lesson generalises to all eight live tests as
+> written: **the value of the live lane is in the counterpart's assertions,
+> not in the counterpart's presence.** A live test that only counts frames is a
+> liveness check wearing an anchor's clothes, and the seven tests that still
+> have no master are not the only ones that need work.
 
 **All seven protocols now have third-party-master evidence through the adapter
 and the module's own binding**, on Linux, Debug build. Each run schedules a

@@ -176,7 +176,34 @@ FLEETSIM_MULTI_LISTEN=127.0.0.1:15026,15027 zig build test-fleetsim  # two maste
 The DNP3 test matches opendnp3's `master-demo` defaults (outstation address 10,
 master 1, port 20000) so the oracle needs no patching.
 
-### Installing the masters
+### The one-command route: the disposable-VM lane
+
+Installing a SCADA master on a dev host is the reason these tests sat unrun.
+The repo's VM lane removes that constraint entirely — inside a throwaway guest
+there is no reason not to install freely, because the host is never touched:
+
+```
+scripts/vm/run.sh fleetsim debian
+```
+
+That boots the provisioned Debian guest, runs the live Modbus test inside it
+with `FLEETSIM_EXPECT_LIVE=1`, and points a **real pymodbus 3.14.0** at the
+simulated slave (installed into the image by the provisioning recipe, not by
+you). It exits non-zero if the master does not complete its whole script, so
+"nobody was listening" cannot read as a pass. ~80 s end to end; the one-off
+`scripts/vm/provision.sh debian` before it takes ~2 min.
+
+Only Modbus is wired up so far. Adding the next master is two edits that must
+happen together — its pinned spec in `scripts/vm/manifest.sh`'s
+`VM_DEBIAN_PIP`, and its test in `run.sh`'s `guest_default_filter` — plus a
+guest-side driver script alongside
+`scripts/vm/guests/fleetsim-modbus-master.py`.
+
+What that run produced is frozen in `src/master_goldens.zig` and replays
+offline on every build, so the ordinary `zig build test-fleetsim` carries the
+third-party evidence even with no VM in sight.
+
+### Installing the masters on a host, instead
 
 The versions below are the ones the transcripts in [SPEC.md](./SPEC.md) were
 recorded against; pin them, because a master's own defaults are part of the

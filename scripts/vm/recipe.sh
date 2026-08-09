@@ -74,6 +74,14 @@ recipe_text() {
             for p in "${VM_DEBIAN_PACKAGES[@]}"; do
                 printf 'package: %s\n' "$p"
             done
+            # pip specs are part of the recipe for the same reason apt names
+            # are: they change what is installed in the image. They are
+            # required to be `name==version` (manifest.sh), so this stays a
+            # fact about the image and not a fact about the day it was built.
+            for p in "${VM_DEBIAN_PIP[@]:-}"; do
+                [[ -z "$p" ]] && continue
+                printf 'pip: %s\n' "$p"
+            done
             ;;
         *)
             echo "recipe.sh: unknown platform '$platform'" >&2

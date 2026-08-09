@@ -191,6 +191,37 @@ VM_DEBIAN_PACKAGES=(
     wpasupplicant
     hostapd
     strace
+    # fleetsim's live lane needs a real third-party SCADA master to point at a
+    # simulated device. Every one of them is a Python library (see
+    # VM_DEBIAN_PIP below), so the interpreter and pip come from apt and the
+    # masters themselves from PyPI at their pinned versions.
+    python3
+    python3-pip
+)
+
+# DECLARATIVE pip list for the provisioned Debian image, installed inside the
+# same provisioning boot, right after apt.
+#
+# Why pip at all, when everything else here is apt: the third-party SCADA
+# masters `fleetsim`'s live tests need are pip-only. No Debian package exists
+# for pycomm3/bacpypes3/python-snap7/asyncua/c104, and `python3-pymodbus` in
+# trixie is 3.8.6 — years behind the 3.14.0 the module's SPEC.md transcripts
+# were recorded against. A master's own defaults are part of the oracle, so
+# the version is pinned exactly, not floated.
+#
+# `--break-system-packages` is correct here and nowhere else: this is a
+# throwaway guest built from a recipe, PEP 668's "don't fight the distro
+# package manager" hazard has no owner to hurt, and a venv would have to be
+# re-activated by every consumer of the image. The HOST never runs any of
+# this — that is the entire point of routing fleetsim's live lane here.
+#
+# Every entry MUST be `name==version`. An unpinned spec would make the recipe
+# hash lie: the same recipe text would resolve to a different image on a
+# different day, which is exactly what the hash exists to prevent.
+VM_DEBIAN_PIP=(
+    # pymodbus 3.14.0 — the Modbus master `fleetsim`'s live Modbus test is
+    # written against (modules/fleetsim/README.md "Installing the masters").
+    pymodbus==3.14.0
 )
 
 # ── what this image CANNOT provide, so nobody re-derives it ──────────────

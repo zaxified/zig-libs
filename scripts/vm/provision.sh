@@ -212,10 +212,23 @@ provision_debian() {
     echo "debian: copying verified stock image -> $(basename "$tmp")"
     cp "$stock" "$tmp"
 
+    # An unpinned pip spec would make the recipe hash a lie: the same recipe
+    # text would install different bytes tomorrow. Refuse before booting.
+    local spec
+    for spec in "${VM_DEBIAN_PIP[@]:-}"; do
+        [[ -z "$spec" ]] && continue
+        if [[ "$spec" != *"=="* ]]; then
+            echo "provision: pip spec '$spec' is not pinned (name==version) — refusing" >&2
+            echo "           the recipe hash must describe exactly what lands in the image" >&2
+            exit 1
+        fi
+    done
+
     local hash='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'
     local log="$WORK_DIR/provision-debian.log"
     echo "debian: booting (no -snapshot) to apt-get install ${VM_DEBIAN_PACKAGES[*]}"
-    if ! expect "$SCRIPT_DIR/provision-debian.exp" "$tmp" "$hash" 1024 "${VM_DEBIAN_PACKAGES[*]}" >"$log" 2>&1; then
+    [[ ${#VM_DEBIAN_PIP[@]} -gt 0 ]] && echo "debian:   then pip install ${VM_DEBIAN_PIP[*]}"
+    if ! expect "$SCRIPT_DIR/provision-debian.exp" "$tmp" "$hash" 1024 "${VM_DEBIAN_PACKAGES[*]}" "${VM_DEBIAN_PIP[*]:-}" >"$log" 2>&1; then
         echo "provision: debian provisioning boot FAILED — see $log" >&2
         tail -30 "$log" >&2
         rm -f "$tmp"

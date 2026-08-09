@@ -1137,6 +1137,22 @@ re-examined 2026-07-29 (both recorded in the project git history).
                their PUBLIC DOCUMENTATION — observable behavior only, no
                source consulted or copied.
 
+               `src/master_goldens.zig` freezes a session in which a real
+               third-party Modbus master — pymodbus 3.14.0, BSD-3-Clause (read
+               off the installed distribution's own metadata at capture time,
+               not from memory) — drove a simulated slave inside this repo's
+               disposable-VM lane. Nothing from pymodbus is copied, translated
+               or redistributed: what is frozen is the byte output of a
+               conversation between two programs speaking the PUBLIC MODBUS
+               Application Protocol specification, plus, in comments, what the
+               master reported it decoded. pymodbus is neither vendored nor a
+               build dependency — it exists only inside the throwaway guest
+               (scripts/vm/manifest.sh), and the committed test replays frozen
+               bytes offline with the VM deleted. A permissive licence would
+               not have constrained this either way; the statement is recorded
+               because the reasoning has to be checkable, not because
+               BSD-3-Clause made it close.
+
   readthrough — the read-through cache, its cross-thread miss coalescing and
                its invalidation semantics are the authors' own original work.
                The single-flight shape follows Go's `singleflight`

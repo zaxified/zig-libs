@@ -97,6 +97,7 @@ real test binaries in them (not by reading docs):
 | `nftables` | openwrt | execution-verified (73 tests incl. live round-trip) |
 | `conntrack` | openwrt | execution-verified (28 tests) |
 | `ebpf` | debian | execution-verified, **137/137**. Six live attach tests (kprobe, uprobe, tracepoint, raw tracepoint, cgroup link) need `CAP_BPF` + `CAP_PERFMON` and skip on any normal host; OpenWRT's kernel has no BPF tooling at all, so this one is debian-only |
+| `fleetsim` | debian | execution-verified. **Not a privilege gap — a *counterpart* gap** (see below): a real pymodbus 3.14.0 master drives a simulated Modbus slave, 10 operations, all satisfied. ~80s |
 | everything else | debian (default) | most NETNS_MODULES don't need this lane at all — `unshare -rn` already covers them (see `scripts/test.sh`'s own `NETNS_MODULES` comment); route here only for isolation, not privilege |
 
 Override with `scripts/vm/run.sh <module> openwrt|debian` when the default
@@ -219,6 +220,82 @@ cls_u32 cls_flower sch_fq_codel ifb veth`.
 |---|---|---|
 | `iproute2`, `ethtool` | yes | declares the guarantee explicitly rather than assuming it (apt makes it a no-op) |
 | `kmod`, `bpftool` | **no** (verified: absent on stock) | future eBPF/module-probing test needs |
+| `python3`, `python3-pip` | pip: **no** | the interpreter and installer for `VM_DEBIAN_PIP`; every SCADA master `fleetsim`'s live lane needs is a pip-only library |
+
+### Debian pip list (`VM_DEBIAN_PIP`)
+
+| Spec | Why |
+|---|---|
+| `pymodbus==3.14.0` | the Modbus master `fleetsim`'s live Modbus test is written against. `python3-pymodbus` in trixie is 3.8.6 — years behind, and a master's own defaults are part of the oracle, so the version is pinned rather than floated. BSD-3-Clause; read off the installed distribution's metadata at capture time and recorded in the root `NOTICE`, not quoted from memory |
+
+Pinning is enforced, not documented: `provision.sh` refuses a spec without
+`==` before booting, and the guest greps each spec back out of `pip freeze`
+with `-Fxq` so an image whose contents disagree with its own recipe hash never
+gets written.
+
+## A fourth reason to use this lane: a counterpart you may not install
+
+The three gaps at the top of this file are all about *privilege*. `fleetsim`
+found a fourth that has nothing to do with root: a test needs a **third-party
+counterpart process** that is not allowed on the dev host. Its eight `test
+"live: …"` cases each need a real SCADA master (pymodbus, pycomm3, bacpypes3,
+python-snap7, asyncua, c104, opendnp3), every one of them pip-only or a C++
+build, and the standing rule here is that a host venv is one-shot and
+persistent counterparts must be system-installed by whoever runs them. So the
+module's only external anchor never ran, and a green `test-fleetsim` certified
+zero third-party interop.
+
+Inside a disposable guest that constraint evaporates: `apt` and `pip` may do
+whatever they like, `-snapshot` throws the result away, and the host stays
+clean. Three small pieces make it work, all of them general rather than
+fleetsim-specific:
+
+- **`VM_DEBIAN_PIP` in `manifest.sh`** — a declarative pip list installed in
+  the same provisioning boot as apt, and hashed into the recipe exactly like
+  the apt list, so the image's contents and its filename cannot drift apart.
+  Every spec must be `name==version`; `provision.sh` refuses an unpinned one
+  before booting, and the guest re-reads each spec back out of `pip freeze`
+  with an exact match so "pip resolved a different version" fails the build
+  instead of silently shipping.
+- **`guest_files` / `guest_setup` / `guest_after` in `run.sh`** — extra files
+  served over the same one-off http server the test binary arrives on, a
+  command batch that runs before the binary (start the counterpart, export the
+  endpoint) and one that runs after it (collect the counterpart's log). The
+  counterpart retries its connect, so which process wins the start race is not
+  load-bearing.
+- **`guest_require` in `run.sh`** — markers the guest must print for the run to
+  count. This is the important one, and the next section says why.
+
+### The counterpart has to *grade*, not merely exist
+
+`run.sh fleetsim` fails unless the guest prints `MODBUS_MASTER_OK`, and that is
+not belt-and-braces. Measured, not assumed:
+
+Byte-swapping the register encoder in `modules/modbus/src/server.zig` (`.big` →
+`.little` in the read-registers reply) and re-running this lane gives
+**`GUEST_EXIT=0`** — the live test itself *passes* with every register value
+wrong. It asserts only `delivered > 0` and `replied > 0`; a wrong answer is
+still an answer and still gets counted. The run went red solely because
+pymodbus decoded 28416 where 111 was expected, said `MODBUS_MASTER_FAIL`, and
+`guest_require` did not find its marker (`run.sh` exit 1).
+
+So: **a live counterpart whose verdict nobody reads is a liveness check wearing
+an anchor's clothes.** When adding a module here, put the assertions on the
+counterpart's side and gate the run on them by name — the module's own suite
+being green is exactly the signal that cannot be trusted, because that is the
+state the whole lane exists to disprove.
+
+### And freeze what the live run said
+
+A live test that only runs in a VM nobody spins up is barely better than a
+skip. `scripts/vm/guests/fleetsim-modbus-master.py` therefore drives the device
+through an in-process byte tap and prints the whole session — every request and
+response ADU, plus what the master decoded — between
+`FLEETSIM_CAPTURE_BEGIN`/`END` markers. Those bytes are frozen into
+`modules/fleetsim/src/master_goldens.zig`, which replays them offline on every
+build, never skips, and needs no VM. The tap is a plain socket relay rather
+than the library's debug logging so the capture depends on no pymodbus
+internal and records what actually crossed the wire.
 
 ## Adding a module to the VM lane
 
@@ -270,7 +347,10 @@ Two different costs, not to be confused:
     downloads from downloads.openwrt.org are included in both.
   - Debian boot+apt: **1m12s** end to end — copy the 388 MB stock qcow2,
     boot without `-snapshot`, `apt-get update` (28.4 MB of index over slirp,
-    ~38s), install, `sync`, poweroff.
+    ~38s), install, `sync`, poweroff. Measured again after adding python3 +
+    pip + `pymodbus==3.14.0`: **1m45s**, and the resulting image is **752 MB**
+    (was 639 MB). Old provisioned images are not deleted automatically —
+    `provision.sh` lists them as safe to delete, and each is ~700 MB.
   - Cache hit (recipe unchanged): **50 ms**, no boot, no build.
 - **Steady-state `scripts/vm/run.sh`** (cache hit, no rebuild): ~20-30s per
   invocation end to end (compile + boot + transfer + run + shutdown),

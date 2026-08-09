@@ -12,7 +12,10 @@
 #   [platform]    openwrt | debian — defaults to this module's entry in the
 #                 routing table below, or debian (the verified superset) if
 #                 the module isn't listed
-#   --test-filter forwarded to `zig test --test-filter` to run one test
+#   --test-filter forwarded to `zig test --test-filter` to run one test.
+#                 Some modules have a DEFAULT filter (guest_default_filter
+#                 below) because running their whole suite in here would be
+#                 wrong; passing this explicitly overrides it.
 #
 # What it does, in order:
 #   1. resolve <module>'s forward dependency closure from `zig build
@@ -127,6 +130,20 @@ route_platform() {
 # NOT here, deliberately: devlink/netdevsim. netdevsim.ko is shipped by no
 # Debian and no OpenWRT package — see manifest.sh's "what this image CANNOT
 # provide" note rather than re-deriving it.
+#   fleetsim -> a real third-party SCADA master. Its live tests are the only
+#              external anchor the module has, and every one of them needs a
+#              counterpart process that cannot be installed on the dev host
+#              (pip-only libraries, and the owner's standing rule is that a
+#              venv is one-shot). Inside a disposable guest that constraint
+#              does not apply: pymodbus 3.14.0 is baked into the provisioned
+#              image by the recipe (manifest.sh's VM_DEBIAN_PIP), and
+#              guests/fleetsim-modbus-master.py drives the simulated slave
+#              through a byte tap so the session can also be frozen into the
+#              offline suite. The master retries its connect, so which of the
+#              two processes wins the start race does not matter.
+#
+# guest_setup runs BEFORE the test binary, so it may only set up and launch;
+# anything that has to read a result afterwards belongs in guest_after.
 guest_setup() {
     case "$1" in
         nl80211)
@@ -134,11 +151,87 @@ guest_setup() {
                 'modprobe mac80211_hwsim radios=2 && ip link set wlan0 up && ' \
                 'ip link set wlan1 up && echo SETUP_OK || echo SETUP_FAIL; '
             ;;
+        fleetsim)
+            # No quotes anywhere in here: the whole command line is passed to
+            # expect as one argv element and read back with `lindex`, and
+            # keeping it quote-free keeps that round-trip boring.
+            printf '%s' \
+                'export FLEETSIM_TEST_LISTEN=127.0.0.1:15020; ' \
+                'export FLEETSIM_EXPECT_LIVE=1; ' \
+                "curl -fsS http://10.0.2.2:$HTTP_PORT/fleetsim-modbus-master.py -o /tmp/fm.py && " \
+                'python3 -m pip show pymodbus > /dev/null && echo SETUP_OK || echo SETUP_FAIL; ' \
+                'nohup python3 /tmp/fm.py 127.0.0.1 15020 120 > /tmp/fm.log 2>&1 & '
+            ;;
         *) printf '' ;;
     esac
 }
-SETUP="$(guest_setup "$MODULE")"
-[[ -n "$SETUP" ]] && echo "vm: guest setup: ${SETUP%; }"
+
+# Runs AFTER the test binary, before GUEST_EXIT is reported. Its own exit code
+# is deliberately discarded — the binary's is what this lane propagates.
+guest_after() {
+    case "$1" in
+        fleetsim) printf '%s' 'wait; cat /tmp/fm.log; ' ;;
+        *) printf '' ;;
+    esac
+}
+
+# Extra files to serve alongside the test binary, repo-relative. Fetched by
+# guest_setup over the same one-off http server.
+guest_files() {
+    case "$1" in
+        fleetsim) printf '%s\n' scripts/vm/guests/fleetsim-modbus-master.py ;;
+        *) printf '' ;;
+    esac
+}
+
+# Markers the guest MUST print, beyond the binary's own exit code. This is the
+# same defence as the SETUP_OK check: a live test that silently did not run
+# leaves an all-green suite behind it, so the counterpart has to say for
+# itself that it was there.
+guest_require() {
+    case "$1" in
+        fleetsim) printf '%s\n' MODBUS_MASTER_OK ;;
+        *) printf '' ;;
+    esac
+}
+
+# Guest RAM, MB. 512 is enough for a netlink suite; a simulation harness that
+# stands up a thousand in-process devices is not that.
+guest_mem() {
+    case "$1" in
+        fleetsim) echo 1024 ;;
+        *) echo 512 ;;
+    esac
+}
+
+# Seconds boot-debian.exp will wait for the command batch. The default 90 is
+# sized for a suite that runs in seconds; fleetsim's live tests each hold a
+# socket open for a 60s budget by design.
+guest_cmd_timeout() {
+    case "$1" in
+        fleetsim) echo 420 ;;
+        *) echo 90 ;;
+    esac
+}
+
+# A default --test-filter, when running the WHOLE suite in the VM would be
+# wrong. fleetsim: the guest carries one master (Modbus), and
+# FLEETSIM_EXPECT_LIVE=1 turns "did not run" into a failure for every live
+# test — so without a filter the six live tests whose master is not installed
+# would fail for the wrong reason. Filtering to the one test the guest can
+# actually serve keeps the failure signal honest. Add masters to
+# VM_DEBIAN_PIP and widen this filter together, never separately.
+guest_default_filter() {
+    case "$1" in
+        fleetsim) printf '%s' 'live: a real Modbus master' ;;
+        *) printf '' ;;
+    esac
+}
+
+if [[ -z "$TEST_FILTER" ]]; then
+    TEST_FILTER="$(guest_default_filter "$MODULE")"
+    [[ -n "$TEST_FILTER" ]] && echo "vm: default --test-filter for $MODULE: '$TEST_FILTER'"
+fi
 
 case "$PLATFORM" in
     openwrt) TARGET_TRIPLE="x86_64-linux-musl" ;;
@@ -282,6 +375,18 @@ mkdir -p "$SERVE_DIR"
 BIN_NAME="runme"
 cp "$BIN" "$SERVE_DIR/$BIN_NAME"
 
+# Anything guest_setup will curl. Served from the same directory as the test
+# binary so there is exactly one transfer mechanism to reason about.
+while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if [[ ! -f "$REPO_ROOT/$f" ]]; then
+        echo "run.sh: guest file missing: $f" >&2
+        exit 1
+    fi
+    cp "$REPO_ROOT/$f" "$SERVE_DIR/$(basename "$f")"
+    echo "vm: serving guest file $(basename "$f")"
+done < <(guest_files "$MODULE")
+
 HTTP_PID=""
 cleanup() {
     [[ -n "$HTTP_PID" ]] && kill "$HTTP_PID" >/dev/null 2>&1
@@ -304,19 +409,24 @@ if ! curl -fsS "http://127.0.0.1:$HTTP_PORT/$BIN_NAME" -o /dev/null 2>/dev/null;
     exit 1
 fi
 
+# Now that the port is known, the setup line can reference it.
+SETUP="$(guest_setup "$MODULE")"
+AFTER="$(guest_after "$MODULE")"
+[[ -n "$SETUP" ]] && echo "vm: guest setup: ${SETUP%; }"
+
 VMLOG="$WORK_DIR/${MODULE}-${PLATFORM}-vm.log"
 
 # ── 4/5. boot + fetch + run ──────────────────────────────────────────────
 t0=$(date +%s)
 case "$PLATFORM" in
     openwrt)
-        RUNCMD="$SETUP(tftp -g -r $BIN_NAME -l /tmp/$BIN_NAME 10.0.2.2 && echo TFTP_OK) || echo TFTP_FAIL; if \[ ! -s /tmp/$BIN_NAME \]; then wget http://10.0.2.2:$HTTP_PORT/$BIN_NAME -O /tmp/$BIN_NAME >/dev/null 2>&1 && echo WGET_OK || echo WGET_FAIL; fi; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; echo GUEST_EXIT=\$?"
+        RUNCMD="$SETUP(tftp -g -r $BIN_NAME -l /tmp/$BIN_NAME 10.0.2.2 && echo TFTP_OK) || echo TFTP_FAIL; if \[ ! -s /tmp/$BIN_NAME \]; then wget http://10.0.2.2:$HTTP_PORT/$BIN_NAME -O /tmp/$BIN_NAME >/dev/null 2>&1 && echo WGET_OK || echo WGET_FAIL; fi; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
         expect "$SCRIPT_DIR/boot-openwrt.exp" "$IMG" 256 "$RUNCMD" >"$VMLOG" 2>&1
         ;;
     debian)
         HASH='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'  # throwaway VM-only password "zigvm" — ephemeral -snapshot guest, no host port exposed
-        RUNCMD="${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; echo GUEST_EXIT=\$?"
-        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" 512 "$RUNCMD" >"$VMLOG" 2>&1
+        RUNCMD="${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
+        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" >"$VMLOG" 2>&1
         ;;
 esac
 t1=$(date +%s)
@@ -341,6 +451,18 @@ if [[ -n "$SETUP" ]] && ! echo "$GUEST_OUT" | grep -q "SETUP_OK"; then
     echo "        (the live tests would have skipped and the run would have looked green)" >&2
     exit 1
 fi
+
+# Same defence one level up: a counterpart process that never reached the
+# device leaves the suite green (the live test just skips), so anything the
+# guest was supposed to prove has to be asserted by name.
+while IFS= read -r marker; do
+    [[ -z "$marker" ]] && continue
+    if ! echo "$GUEST_OUT" | grep -q "$marker"; then
+        echo "run.sh: FAIL — guest never printed '$marker'" >&2
+        echo "        (the live counterpart did not complete; the suite alone would have looked green)" >&2
+        exit 1
+    fi
+done < <(guest_require "$MODULE")
 
 EXIT_LINE="$(echo "$GUEST_OUT" | grep -o 'GUEST_EXIT=[0-9]*' | tail -1)"
 if [[ -z "$EXIT_LINE" ]]; then
