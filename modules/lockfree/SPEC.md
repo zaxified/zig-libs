@@ -155,6 +155,14 @@ theorem, but far more of the ordering is doing real work at runtime, so the
 empirical stress would exercise it harder. Bottom line: correctness is carried by
 the argument, not by the ISA; the "verified on" claim is x86_64-TSO only.
 
+What the discipline *costs* is a separate question from what it buys, and it is
+now measured rather than estimated — see **§7.0a**. Short version: on x86-64 and
+on the aarch64 baseline, demoting every non-interlock `seq_cst` site to
+acquire/release changes **not one instruction**; the only x86-64 instruction the
+discipline pays for is the `xchg` behind `enterCritical`'s pin store (≈8.7 ns per
+pin), which is the Dekker store and cannot be given up. A real barrier gap exists
+only on riscv64 and ARMv8.3+.
+
 **Self-draining `unregister`.** The Phase-1 scaffold's contract was "the caller
 must have drained its limbo bags before unregistering," asserted in Debug. That
 is **not deterministically satisfiable** by a caller: draining needs the global
@@ -395,10 +403,10 @@ All sites **CORRECT** on both arches, both opt levels. Grouped by role:
 | `register` `in_use` CAS | `.acquire`/`.monotonic` | claim slot | `ldaxrb`+`stxrb` | `lr`/`sc` (acq) |
 | `register` `local_epoch` store | `.release` | init slot epoch | `stlr` | `fence rw,w`+`sd` |
 | `unregister` `in_use` store | `.release` | free slot | `stlrb` | `fence rw,w`+`sb` |
-| `unregister` `orphaned` store † | `.release` | publish orphaned bags | `stlrb` | `fence rw,w`+`sb` |
-| `adoptOrphans` `orphaned` CAS † | `.acquire`/`.monotonic` | claim orphaned bags | `ldaxrb`+`stxrb` | `lr`/`sc` (acq) |
-| `adoptOrphans` `global_epoch` load † | `.seq_cst` | adopter's observed epoch | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
-| `orphan_count` load / fetchAdd / fetchSub † | `.monotonic` | hint only, no hb obligation | plain `ldr` / `ldxr`+`stxr` | plain `ld` / `lr`/`sc` |
+| `unregister` `orphaned` store | `.release` | publish orphaned bags | `stlrb` | `fence rw,w`+`sb` |
+| `adoptOrphans` `orphaned` CAS | `.acquire`/`.monotonic` | claim orphaned bags | `ldaxrb`+`stxrb` | `lr.w.aq`+`sc.w` |
+| `adoptOrphans` `global_epoch` load | `.seq_cst` | adopter's observed epoch | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `orphan_count` load / fetchAdd / fetchSub | `.monotonic` | hint only, no hb obligation | plain `ldr` / `ldxr`+`stxr` | plain `ld` / `amoadd.d` |
 | `enqueue` `tail` load | `.seq_cst` | MS pointer read | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
 | `enqueue` `t.next` load | `.seq_cst` | MS pointer read | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
 | `enqueue` `t.next` CAS (link) | `.seq_cst`/`.seq_cst` | linearization | `ldaxr`+`stlxr` | `lr.d.aqrl`+`sc.d.rl` |
@@ -412,19 +420,21 @@ All sites **CORRECT** on both arches, both opt levels. Grouped by role:
 | single-owner assert loads (`enter`/`exit`/`retire`/`unregister`) | `.monotonic` | debug assert, no cross-thread role | plain `ldr` | plain `ld` |
 | `deinit` chain-walk loads | `.monotonic` | teardown (quiescent) | plain `ldr` | plain `ld` |
 
-† Added after the original audit run, by the non-blocking `unregister` hand-off
-(finding F4). These rows are **inferred, not re-measured**: the codegen audit
-itself has not been re-run since. That is a deliberate, bounded claim — each new
-site deliberately REUSES an ordering pair already certified in this table at the
-same width, so it lowers to an instruction sequence already verified here:
-`orphaned` (a `bool`) uses exactly the `register` `in_use` acquire-CAS ⇄
-`unregister` `in_use` release-store pair; `adoptOrphans`'s epoch load is
-byte-identical in ordering and type to the `tryAdvance` `global_epoch` seq_cst
-load; and `orphan_count` is `.monotonic`, in the same "no cross-thread
-happens-before obligation" class as the TTAS spin load. **No existing site's
-ordering was changed**, so §7's and §7.1's verdicts on the Dekker interlock and
-the grace-period argument stand untouched. A re-run of the codegen audit is the
-right hygiene step before push.
+The four `unregister`/`adoptOrphans`/`orphan_count` rows were added by the
+non-blocking `unregister` hand-off (finding F4) and originally carried a `†`
+marking them **inferred, not re-measured**. That `†` is now **removed**: the
+codegen audit was re-run (2026-08-09, same `-femit-asm` method, same two targets,
+both opt levels) and every one of those four rows was read off real instructions.
+Two of them are now *more* precise than the inference was: on riscv64 the
+`orphaned` `bool` CAS lowers to a **word**-width `lr.w.aq`+`sc.w` (RVWMO has no
+byte LR/SC, so LLVM emits a masked word CAS — the same shape as `register`'s
+`in_use`), and the `orphan_count` RMWs lower to a bare `amoadd.d` with no
+`.aq`/`.rl` suffix rather than an `lr`/`sc` pair. Neither changes the verdict:
+all four are CORRECT at their site. The re-run also re-confirmed the two
+load-bearing observations above — `dmb` still appears **zero** times in the whole
+module on aarch64 at both opt levels, and the leading `fence rw,rw` is still
+present on every seq_cst load and absent from `Domain.epoch`'s `.acquire` load.
+No site's ordering has ever been changed, so §7.1's litmus verdicts stand.
 
 Note on the seq_cst queue-pointer ops: they are stronger than the queue's own
 linearizability needs (acquire/release would linearize the queue alone), but that
@@ -434,6 +444,80 @@ total order S. So they are classified CORRECT, not too-strong: demoting them wou
 keep the queue correct while silently breaking reclamation. The `.monotonic` sites
 (TTAS spin, debug asserts, quiescent teardown) are intentionally plain and safe at
 their site — none carries a cross-thread happens-before obligation.
+
+### 7.0a What relaxing the non-interlock atomics would actually buy (measured)
+
+The standing perf question against this discipline is: *how much throughput does
+`seq_cst`-everywhere cost, and how much of it could a selective demotion to
+acquire/release recover?* It was answered on 2026-08-09 by measurement rather
+than by reasoning, and the answer is **nothing on x86-64 and nothing on the
+aarch64 baseline**.
+
+**Method.** A *maximally relaxed* probe was built outside the tree: a verbatim
+copy of `src/` with **14 of the 15** `seq_cst` sites demoted — every
+`global_epoch` load (`enterCritical`/`retire`/`tryAdvance`/`adoptOrphans`) and
+the epoch CAS to `.acquire`/`.acq_rel`, and every `mpmc` `head`/`tail`/
+`Node.next` load and CAS likewise — keeping `seq_cst` on exactly the two Dekker
+interlock sites (`enterCritical`'s `local_epoch` store, `tryAdvance`'s
+`local_epoch` scan load). That probe is deliberately **unsound** under the
+grace-period theorem — it is the *upper bound* of what any selective relaxation
+could ever recover, built to be timed and disassembled, never to be shipped.
+Both variants were compiled with the same `-femit-asm` driver as the rest of §7
+and their instruction streams compared site by site (labels/anon-symbol indices
+normalized).
+
+| Target | Instruction-stream delta, current vs maximally relaxed |
+|---|---|
+| `x86_64-linux`, ReleaseFast **and** ReleaseSafe | **byte-identical** at every site |
+| `aarch64-linux` (default baseline), ReleaseFast | **byte-identical** at every site |
+| `aarch64-linux` `-mcpu=generic+rcpc` (ARMv8.3) | differs: 16 loads become `ldapr` instead of `ldar` |
+| `riscv64-linux`, ReleaseFast | differs: the leading `fence rw,rw` disappears from every demoted load — `dequeue` 10→2, `enqueue` 4→1, `tryAdvance` 3→1, `retire` 1→0 |
+
+Two of those rows correct the intuition this SPEC previously stated:
+
+1. **On x86-64 a `seq_cst` *load* and a `seq_cst` *CAS* cost exactly nothing.**
+   The loads are plain `mov`; every CAS is `lock cmpxchg` at any ordering ≥
+   monotonic. The *only* x86-64 instruction in this module that exists because of
+   `seq_cst` is the `xchg` that `enterCritical`'s `local_epoch` store lowers to —
+   and that is precisely the Dekker store, the one edge TSO does not give for
+   free and the one the theorem cannot surrender. Measured on this host
+   (8-core x86-64, ReleaseFast, 20 M pin/unpin pairs, best of 3): the `seq_cst`
+   pin store costs **9.25 ns/pin** against **0.57 ns/pin** for a `.release` store,
+   i.e. the Dekker store costs **≈8.7 ns per pin**. That number is the entire
+   x86-64 price of the discipline, it is already at the x86 optimum (`xchg` is
+   cheaper than the `mov`+`mfence` form of the classic fence recipe, which Zig
+   0.16 cannot express anyway — `@fence` is gone), and buying it back is exactly
+   the use-after-free §5's sabotage self-check could not detect in 60 runs.
+2. **On the aarch64 baseline an `.acquire` load is also `ldar`.** Without
+   `+rcpc` LLVM has no cheaper acquire load to emit, so demoting a `seq_cst`
+   load to `.acquire` changes no instruction there either. A real gap opens only
+   at ARMv8.3+ (`ldapr`) and on riscv64 (the leading full fence). So the barrier
+   cost this discipline pays off-x86 is **riscv64-and-ARMv8.3+ specific**, not
+   "every weakly-ordered target".
+
+**End-to-end timing, same binary, same inputs.** Both module copies were linked
+into one ReleaseFast binary and run against the same 4-producer × 4-consumer ×
+20 000-items-per-producer workload, 7 rounds with the variant order alternated to
+cancel drift:
+
+| Variant | min | mean |
+|---|---|---|
+| current (`seq_cst`) | 29.31 ms | 30.48 ms |
+| maximally relaxed | 29.58 ms | 31.03 ms |
+
+Ratio relaxed/current: **1.009× at min, 1.018× at mean** — i.e. the "relaxed"
+build measured *marginally slower*, which is the expected reading given the two
+builds are the same machine code. The spread is thread-scheduling noise, and
+that is the point: **on x86-64 there is no win to recover, not a small one.**
+
+**Conclusion.** The perf-portability reservation is real only on riscv64 and
+ARMv8.3+. Recovering it means demoting atomics the grace-period theorem (§4a)
+places in the total order S, which §7.1's `-relaxed` litmus controls show
+re-admits the bug outcome under both formal models. Unless and until a
+weak-memory target is actually deployed *and* someone redoes the reduction with
+explicit release-sequence reasoning in place of S, the discipline stays as it is.
+Do not re-open this as a portable perf win; on the deployed target it is
+measurably zero.
 
 ### QEMU functional run (sanity only — does NOT certify weak-memory ordering)
 

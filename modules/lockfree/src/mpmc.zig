@@ -94,9 +94,14 @@ pub const MpmcQueue = struct {
     // retired node" in the seq_cst total order S, and that anchoring needs the
     // pointer loads and the unlink CAS themselves to be members of S. Demoting
     // them to acquire/release would keep the queue's own linearizability but
-    // silently invalidate the reclamation proof. (On x86_64 the cost is nil:
-    // seq_cst loads are plain MOVs and every CAS is a LOCK CMPXCHG anyway;
-    // only the pin/unpin stores in ebr.zig pay an XCHG.)
+    // silently invalidate the reclamation proof. (On x86_64 the cost is nil,
+    // and that is MEASURED, not asserted — SPEC §7.0a: demoting all fourteen
+    // non-interlock seq_cst sites to acquire/release yields a BYTE-IDENTICAL
+    // x86_64 instruction stream at both opt levels, because seq_cst loads are
+    // plain MOVs and every CAS is a LOCK CMPXCHG at any ordering. The single
+    // x86_64 instruction this discipline costs is the XCHG that
+    // `enterCritical`'s pin store lowers to — the Dekker store, ~8.7 ns/pin,
+    // and not surrenderable. The UNPIN store is `.release`, i.e. a plain MOV.)
     //
     // ABA safety — why raw pointer CAS needs no tag/DCAS here: an ABA failure
     // would require the bit-pattern of a node address to reappear (node freed,
