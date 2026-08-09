@@ -45,6 +45,7 @@ const std = @import("std");
 const cs = @import("ciphersuite.zig");
 const keys = @import("keys.zig");
 const gate = @import("gate.zig");
+const bls = @import("bls12_381");
 
 pub const G1 = cs.G1;
 pub const G2 = cs.G2;
@@ -229,6 +230,120 @@ fn computeB(domain: Fr, generators: []const G1.Affine, message_scalars: []const 
     return b;
 }
 
+// ── verifier-side MSM crossover (F4) ─────────────────────────────────────
+//
+// `computeB` above stays exactly as it was: a sequential per-generator
+// `scalarMul` loop, and the ONLY path `sign` and `proofGen` use. Those two
+// callers' `message_scalars` can include UNDISCLOSED credential attributes
+// (`proofGen` folds ALL messages, disclosed and undisclosed, into `B` — the
+// undisclosed ones are exactly what the selective-disclosure proof exists
+// to hide) or a signer's private message content (`sign`). `bls12_381`'s
+// `kzg.g1Msm` (Pippenger bucket MSM) is EXPLICITLY variable-time — which
+// bucket a term lands in, and even which windows go idle, depends on the
+// scalar's bit pattern — so using it there would open a timing side
+// channel on exactly the values this module's own CT posture (audit A6)
+// protects with `bls12_381`'s constant-time `scalarMul`. That would be a
+// worse regression than the LOW-severity perf gap F4 flags.
+//
+// `verify`'s `computeB` call and `proofVerify`'s `ProofVerifyInit` `d_j`/
+// `t_j` accumulation are different: every scalar involved is already
+// public to whoever can observe the timing. `verify`'s `message_scalars`
+// are the caller's own plaintext messages (non-selective CoreVerify — the
+// verifier already holds them in full). `proofVerify`'s `d_j` uses only
+// `disclosed_scalars` (revealed by definition) plus the public
+// `domain`/`P1`/generators; its `t_j` uses only wire-received proof fields
+// (`Abar`/`Bbar`/`r2_hat`/`r3_hat`/`m_hat`/`c`) the prover already
+// transmitted in the clear — the verifier has no secret of its own in that
+// computation to leak. Those two call sites are safe for a variable-time
+// MSM and are what this crossover applies to.
+
+/// `Σ scalars[i] * points[i]` via the plain sequential loop —
+/// `computeB`'s own accumulation shape, factored out so the crossover
+/// dispatcher's "small L" branch and `computeB` never drift apart.
+fn msmLoop(points: []const G1.Affine, scalars: []const Fr) G1.Jacobian {
+    std.debug.assert(points.len == scalars.len);
+    var acc = G1.Jacobian.identity;
+    for (points, scalars) |p, s| acc = acc.add(G1.Jacobian.fromAffine(p).scalarMul(s));
+    return acc;
+}
+
+/// `Σ scalars[i] * points[i]` via `bls12_381.kzg.g1Msm` (Pippenger bucket
+/// MSM). `g1Msm`'s only fallible step is its two internal `allocator.alloc`
+/// calls (see `kzg.zig`'s `g1Msm` body) — no other error path exists for
+/// well-formed equal-length input, so every other `KzgError` variant is
+/// `unreachable` here.
+fn msmPippenger(allocator: std.mem.Allocator, points: []const G1.Affine, scalars: []const Fr) std.mem.Allocator.Error!G1.Jacobian {
+    return bls.kzg.g1Msm(allocator, points, scalars) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => unreachable, // g1Msm's other `KzgError` variants (trusted-setup parsing etc.) are unreachable from a well-formed points/scalars call.
+    };
+}
+
+/// Crossover point (term count) between `msmLoop` and `msmPippenger`,
+/// MEASURED on this host at `-Doptimize=ReleaseFast`
+/// (`BBS_BENCH=1 scripts/capped zig build test-bbs -Doptimize=ReleaseFast`,
+/// the "bench (opt-in via BBS_BENCH)" test below):
+///
+/// ```
+///   n |     loop ns/op | pippenger ns/op | winner
+///   1 |         720272 |         450771  |  MSM (1.6x)
+///   2 |       1,441711 |         679862  |  MSM (2.1x)
+///   4 |       2,988500 |       1,164915  |  MSM (2.6x)
+///   8 |       5,941928 |       1,555471  |  MSM (3.8x)
+///  16 |      11,674799 |       2,518119  |  MSM (4.6x)
+///  32 |      23,330754 |       3,585844  |  MSM (6.5x)
+///  64 |      50,611939 |       5,859254  |  MSM (8.6x)
+/// 128 |      93,999985 |       9,006337  |  MSM (10.4x)
+/// 256 |     189,265820 |      15,135721  |  MSM (12.5x)
+/// 512 |     373,324049 |      25,407709  |  MSM (14.7x)
+/// ```
+///
+/// There is NO regime in this data where the sequential loop wins — the
+/// crossover is degenerate, at the bottom of the measurable range. This
+/// is NOT the "Pippenger has less asymptotic work" story alone: `msmLoop`
+/// calls `bls12_381`'s CONSTANT-TIME `scalarMul` once per term (paid
+/// because `computeB`, its production counterpart, MUST tolerate secret
+/// scalars), while `msmPippenger`'s bucket phase uses `bls12_381`'s
+/// variable-time mixed-add formulas throughout — cheaper per point-op
+/// even before Pippenger's asymptotic win compounds it. `verify`'s and
+/// `proofVerify`'s call sites never construct fewer than 2 terms (`P1` +
+/// `Q_1` are always present), so in production this dispatcher always
+/// takes the Pippenger branch; the loop branch below is kept only so
+/// `msmPublic` degrades sanely for the n<2 case no real caller hits.
+const msm_crossover: usize = 2;
+
+/// `Σ scalars[i] * points[i]`, dispatching on `msm_crossover`.
+///
+/// SAFETY (variable-time!): only call this when every scalar in
+/// `scalars` is already public to whoever can observe the timing — see
+/// the section comment above. NEVER call it on `sign`'s or `proofGen`'s
+/// message scalars.
+fn msmPublic(allocator: std.mem.Allocator, points: []const G1.Affine, scalars: []const Fr) std.mem.Allocator.Error!G1.Jacobian {
+    std.debug.assert(points.len == scalars.len);
+    if (points.len < msm_crossover) return msmLoop(points, scalars);
+    return msmPippenger(allocator, points, scalars);
+}
+
+/// `computeB`'s exact value (`P1 + [domain]Q_1 + sum_i [msg_i]H_i`),
+/// computed via `msmPublic` instead of `computeB`'s sequential loop. See
+/// the section comment above for why this may ONLY be called on public
+/// message scalars (`verify`, never `sign`/`proofGen`).
+fn computeBPublic(allocator: std.mem.Allocator, domain: Fr, generators: []const G1.Affine, message_scalars: []const Fr) std.mem.Allocator.Error!G1.Jacobian {
+    std.debug.assert(generators.len == message_scalars.len + 1);
+    const n = generators.len + 1; // + P1
+    const points = try allocator.alloc(G1.Affine, n);
+    defer allocator.free(points);
+    const scalars = try allocator.alloc(Fr, n);
+    defer allocator.free(scalars);
+    points[0] = cs.P1;
+    scalars[0] = Fr.one;
+    points[1] = generators[0];
+    scalars[1] = domain;
+    @memcpy(points[2..], generators[1..]);
+    @memcpy(scalars[2..], message_scalars);
+    return msmPublic(allocator, points, scalars);
+}
+
 fn appendU64(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) std.mem.Allocator.Error!void {
     var b: [8]u8 = undefined;
     std.mem.writeInt(u64, &b, v, .big);
@@ -397,7 +512,11 @@ pub fn verify(allocator: std.mem.Allocator, pk: PublicKey, signature: [Signature
     const generators = try cs.createGenerators(allocator, messages.len + 1);
     defer allocator.free(generators);
     const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
-    const b = computeB(domain, generators, message_scalars).toAffine();
+    // `message_scalars` here are the caller's OWN plaintext messages
+    // (non-selective CoreVerify) — public to this call, so the
+    // MSM-crossover path (`computeBPublic`) is safe; see the section
+    // comment above `computeBPublic`'s definition.
+    const b = (try computeBPublic(allocator, domain, generators, message_scalars)).toAffine();
 
     // e(A, W + [e]BP2) == e(B, BP2)  <=>
     // e(A, W + [e]BP2) * e(B, -BP2) == 1  (draft §3.6.2 step 6).
@@ -614,18 +733,43 @@ pub fn proofVerify(
     defer allocator.free(generators);
     const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
 
-    // -- ProofVerifyInit (draft §3.7.3) --
-    var d_j = G1.Jacobian.fromAffine(cs.P1)
-        .add(G1.Jacobian.fromAffine(generators[0]).scalarMul(domain));
-    for (disclosed_indexes, disclosed_scalars) |i, m| {
-        d_j = d_j.add(G1.Jacobian.fromAffine(generators[i + 1]).scalarMul(m));
+    // -- ProofVerifyInit (draft §3.7.3), MSM-crossover form --
+    //
+    // Every scalar below is PUBLIC to the verifier: `disclosed_scalars`
+    // are revealed by definition, and `r2_hat`/`r3_hat`/`m_hat`/`c` are
+    // wire-received proof fields the prover already sent in the clear —
+    // see the section comment above `msmPublic`'s definition for why
+    // that makes the variable-time MSM safe here (unlike `sign`/
+    // `proofGen`).
+    const d_points = try allocator.alloc(G1.Affine, disclosed_indexes.len + 2);
+    defer allocator.free(d_points);
+    const d_scalars = try allocator.alloc(Fr, disclosed_indexes.len + 2);
+    defer allocator.free(d_scalars);
+    d_points[0] = cs.P1;
+    d_scalars[0] = Fr.one;
+    d_points[1] = generators[0];
+    d_scalars[1] = domain;
+    for (disclosed_indexes, disclosed_scalars, d_points[2..], d_scalars[2..]) |i, m, *dp, *ds| {
+        dp.* = generators[i + 1];
+        ds.* = m;
     }
-    var t_j = G1.Jacobian.fromAffine(parsed.abar).scalarMul(parsed.r2_hat)
-        .add(G1.Jacobian.fromAffine(parsed.bbar).scalarMul(parsed.r3_hat));
-    for (undisclosed, parsed.m_hat) |j, mh| {
-        t_j = t_j.add(G1.Jacobian.fromAffine(generators[j + 1]).scalarMul(mh));
+    const d_j = try msmPublic(allocator, d_points, d_scalars);
+
+    const t_points = try allocator.alloc(G1.Affine, undisclosed.len + 3);
+    defer allocator.free(t_points);
+    const t_scalars = try allocator.alloc(Fr, undisclosed.len + 3);
+    defer allocator.free(t_scalars);
+    t_points[0] = parsed.abar;
+    t_scalars[0] = parsed.r2_hat;
+    t_points[1] = parsed.bbar;
+    t_scalars[1] = parsed.r3_hat;
+    for (undisclosed, parsed.m_hat, t_points[2 .. 2 + undisclosed.len], t_scalars[2 .. 2 + undisclosed.len]) |j, mh, *tp, *ts| {
+        tp.* = generators[j + 1];
+        ts.* = mh;
     }
-    t_j = t_j.add(d_j.scalarMul(parsed.c));
+    t_points[t_points.len - 1] = d_j.toAffine();
+    t_scalars[t_scalars.len - 1] = parsed.c;
+    const t_j = try msmPublic(allocator, t_points, t_scalars);
 
     // -- ProofChallengeCalculate (draft §3.7.4) — MUST reproduce c --
     const challenge = try calculateChallenge(allocator, parsed.abar, parsed.bbar, t_j.toAffine(), disclosed_indexes, disclosed_scalars, domain, ph);
@@ -867,4 +1011,214 @@ fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
     const proof = Proof.fromBytes(testing.allocator, buf[0..len]) catch return;
     defer proof.deinit(testing.allocator);
     if (proof.toBytes(testing.allocator)) |out| testing.allocator.free(out) else |_| {}
+}
+
+// ── F4: computeB MSM crossover — differential oracle + bench ────────────
+
+fn testRandomFr(rand: std.Random) Fr {
+    var buf: [48]u8 = undefined;
+    rand.bytes(&buf);
+    return Fr.reduceWide(&buf);
+}
+
+/// TEST-ONLY oracle: reproduces `proofVerify`'s ORIGINAL (pre-F4)
+/// sequential `ProofVerifyInit` `d_j`/`t_j` accumulation verbatim,
+/// unchanged, so the MSM-crossover form now live in `proofVerify` has
+/// something to be checked against that never itself changed. Not called
+/// from production code — differential-test anchor only.
+fn proofVerifyInitLoopOracle(
+    generators: []const G1.Affine,
+    domain: Fr,
+    disclosed_indexes: []const usize,
+    disclosed_scalars: []const Fr,
+    undisclosed: []const usize,
+    m_hat: []const Fr,
+    abar: G1.Affine,
+    bbar: G1.Affine,
+    r2_hat: Fr,
+    r3_hat: Fr,
+    c: Fr,
+) struct { d: G1.Jacobian, t: G1.Jacobian } {
+    var d_j = G1.Jacobian.fromAffine(cs.P1)
+        .add(G1.Jacobian.fromAffine(generators[0]).scalarMul(domain));
+    for (disclosed_indexes, disclosed_scalars) |i, m| {
+        d_j = d_j.add(G1.Jacobian.fromAffine(generators[i + 1]).scalarMul(m));
+    }
+    var t_j = G1.Jacobian.fromAffine(abar).scalarMul(r2_hat)
+        .add(G1.Jacobian.fromAffine(bbar).scalarMul(r3_hat));
+    for (undisclosed, m_hat) |j, mh| {
+        t_j = t_j.add(G1.Jacobian.fromAffine(generators[j + 1]).scalarMul(mh));
+    }
+    t_j = t_j.add(d_j.scalarMul(c));
+    return .{ .d = d_j, .t = t_j };
+}
+
+test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPublic, bit-exact, across L" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xB855_F0FA);
+    const rand = prng.random();
+
+    // L = 0, 1, 2 (the brief's mandated minimum), straddling msm_crossover
+    // (== 2, see its doc comment) on both sides, and well past it.
+    const ls = [_]usize{ 0, 1, 2, 3, 4, 8, 16, 64, 300 };
+
+    for (ls) |l| {
+        const generators = try cs.createGenerators(allocator, l + 1);
+        defer allocator.free(generators);
+        const message_scalars = try allocator.alloc(Fr, l);
+        defer allocator.free(message_scalars);
+        for (message_scalars) |*m| m.* = testRandomFr(rand);
+        const domain = testRandomFr(rand);
+
+        // The oracle: computeB, UNCHANGED, still `sign`'s/`proofGen`'s only
+        // path.
+        const want = computeB(domain, generators, message_scalars).toAffine();
+        const want_bytes = G1.toBytesCompressed(want);
+
+        // The same (points, scalars) computeBPublic assembles internally.
+        const points = try allocator.alloc(G1.Affine, l + 2);
+        defer allocator.free(points);
+        const scalars = try allocator.alloc(Fr, l + 2);
+        defer allocator.free(scalars);
+        points[0] = cs.P1;
+        scalars[0] = Fr.one;
+        points[1] = generators[0];
+        scalars[1] = domain;
+        @memcpy(points[2..], generators[1..]);
+        @memcpy(scalars[2..], message_scalars);
+
+        const got_loop = msmLoop(points, scalars).toAffine();
+        try testing.expectEqualSlices(u8, &want_bytes, &G1.toBytesCompressed(got_loop));
+
+        // Force the Pippenger path regardless of `msm_crossover`, so the
+        // MSM algorithm itself is checked at every L, not only where the
+        // dispatcher happens to route to it.
+        const got_pippenger = (try msmPippenger(allocator, points, scalars)).toAffine();
+        try testing.expectEqualSlices(u8, &want_bytes, &G1.toBytesCompressed(got_pippenger));
+
+        // The actual dispatcher, as `verify` calls it.
+        const got_public = (try computeBPublic(allocator, domain, generators, message_scalars)).toAffine();
+        try testing.expectEqualSlices(u8, &want_bytes, &G1.toBytesCompressed(got_public));
+    }
+}
+
+test "F4 oracle: proofVerify's ProofVerifyInit — MSM form matches the original sequential form, bit-exact, across L" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x0D5F_1E17);
+    const rand = prng.random();
+
+    // total = R (disclosed) + U (undisclosed); cover R/U = 0 and a spread
+    // straddling msm_crossover (== 2) for each of the two MSM calls (d_j
+    // has R+2 terms, t_j has U+3).
+    const totals = [_]usize{ 0, 1, 2, 3, 8, 300 };
+
+    for (totals) |total| {
+        const generators = try cs.createGenerators(allocator, total + 1);
+        defer allocator.free(generators);
+
+        // Split roughly in half: disclosed = evens, undisclosed = odds.
+        var disclosed_indexes: std.ArrayList(usize) = .empty;
+        defer disclosed_indexes.deinit(allocator);
+        var undisclosed: std.ArrayList(usize) = .empty;
+        defer undisclosed.deinit(allocator);
+        for (0..total) |i| {
+            if (i % 2 == 0) try disclosed_indexes.append(allocator, i) else try undisclosed.append(allocator, i);
+        }
+
+        const disclosed_scalars = try allocator.alloc(Fr, disclosed_indexes.items.len);
+        defer allocator.free(disclosed_scalars);
+        for (disclosed_scalars) |*s| s.* = testRandomFr(rand);
+        const m_hat = try allocator.alloc(Fr, undisclosed.items.len);
+        defer allocator.free(m_hat);
+        for (m_hat) |*s| s.* = testRandomFr(rand);
+
+        const domain = testRandomFr(rand);
+        const abar = G1.Jacobian.fromAffine(G1.Affine.generator).scalarMul(testRandomFr(rand)).toAffine();
+        const bbar = G1.Jacobian.fromAffine(G1.Affine.generator).scalarMul(testRandomFr(rand)).toAffine();
+        const r2_hat = testRandomFr(rand);
+        const r3_hat = testRandomFr(rand);
+        const c = testRandomFr(rand);
+
+        const want = proofVerifyInitLoopOracle(generators, domain, disclosed_indexes.items, disclosed_scalars, undisclosed.items, m_hat, abar, bbar, r2_hat, r3_hat, c);
+
+        // Reproduce exactly what `proofVerify` now builds.
+        const d_points = try allocator.alloc(G1.Affine, disclosed_indexes.items.len + 2);
+        defer allocator.free(d_points);
+        const d_scalars = try allocator.alloc(Fr, disclosed_indexes.items.len + 2);
+        defer allocator.free(d_scalars);
+        d_points[0] = cs.P1;
+        d_scalars[0] = Fr.one;
+        d_points[1] = generators[0];
+        d_scalars[1] = domain;
+        for (disclosed_indexes.items, disclosed_scalars, d_points[2..], d_scalars[2..]) |i, m, *dp, *ds| {
+            dp.* = generators[i + 1];
+            ds.* = m;
+        }
+        const got_d = try msmPublic(allocator, d_points, d_scalars);
+        try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.d.toAffine()), &G1.toBytesCompressed(got_d.toAffine()));
+
+        const t_points = try allocator.alloc(G1.Affine, undisclosed.items.len + 3);
+        defer allocator.free(t_points);
+        const t_scalars = try allocator.alloc(Fr, undisclosed.items.len + 3);
+        defer allocator.free(t_scalars);
+        t_points[0] = abar;
+        t_scalars[0] = r2_hat;
+        t_points[1] = bbar;
+        t_scalars[1] = r3_hat;
+        for (undisclosed.items, m_hat, t_points[2 .. 2 + undisclosed.items.len], t_scalars[2 .. 2 + undisclosed.items.len]) |j, mh, *tp, *ts| {
+            tp.* = generators[j + 1];
+            ts.* = mh;
+        }
+        t_points[t_points.len - 1] = got_d.toAffine();
+        t_scalars[t_scalars.len - 1] = c;
+        const got_t = try msmPublic(allocator, t_points, t_scalars);
+        try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.t.toAffine()), &G1.toBytesCompressed(got_t.toAffine()));
+    }
+}
+
+fn nowNsBench() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "bench (opt-in via BBS_BENCH): computeB-shape loop vs Pippenger MSM crossover" {
+    if (std.testing.environ.getPosix("BBS_BENCH") == null) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xF4F4_CAFE);
+    const rand = prng.random();
+
+    // Term counts (= L + 2, the size computeB/computeBPublic actually
+    // handle). All well under a KB of G1.Affine each — see the module doc
+    // comment for why this stays far from the sizes that have OOM-killed
+    // this host before.
+    const ns = [_]usize{ 1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512 };
+
+    std.debug.print("\nbbs F4: computeB-shape MSM crossover (msmLoop vs msmPippenger, n terms)\n", .{});
+    std.debug.print("{s:>6} | {s:>14} | {s:>14} | {s:>8}\n", .{ "n", "loop ns/op", "pippenger ns/op", "winner" });
+
+    for (ns) |n| {
+        const points = try allocator.alloc(G1.Affine, n);
+        defer allocator.free(points);
+        const scalars = try allocator.alloc(Fr, n);
+        defer allocator.free(scalars);
+        const gens = try cs.createGenerators(allocator, n);
+        defer allocator.free(gens);
+        @memcpy(points, gens);
+        for (scalars) |*s| s.* = testRandomFr(rand);
+
+        // Repeat instead of enlarge for timing stability.
+        const iters: usize = if (n <= 32) 300 else if (n <= 128) 60 else 15;
+
+        const t0 = nowNsBench();
+        for (0..iters) |_| std.mem.doNotOptimizeAway(msmLoop(points, scalars));
+        const loop_ns = (nowNsBench() - t0) / iters;
+
+        const t1 = nowNsBench();
+        for (0..iters) |_| std.mem.doNotOptimizeAway(msmPippenger(allocator, points, scalars) catch unreachable);
+        const pip_ns = (nowNsBench() - t1) / iters;
+
+        std.debug.print("{d:>6} | {d:>14} | {d:>14} | {s:>8}\n", .{ n, loop_ns, pip_ns, if (pip_ns < loop_ns) "MSM" else "loop" });
+    }
 }
