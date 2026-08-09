@@ -1,0 +1,63 @@
+websocket — third-party attribution and corpus provenance
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). This file records
+where its two external conformance corpora came from and why neither carries a
+condition beyond MIT's own "preserve the notice".
+
+No third-party SOURCE CODE is present in this module. Nothing was copied,
+translated, or redistributed from any of the implementations named below.
+
+
+## 1. UTF-8 stress-test corpus (Markus Kuhn), frozen 2026-08-08
+
+`src/connection.zig`'s `kuhn_utf8_vectors` transcribes a representative subset
+of Markus Kuhn's UTF-8 decoder capability-and-stress test, reached via
+`autobahntestsuite`'s `case/case6_x_x.py`, which embeds it verbatim with an
+explicit citation to its origin:
+
+  UTF-8 decoder capability and stress test
+  Markus Kuhn <http://www.cl.cam.ac.uk/~mgk25/> — 2015-08-28
+  http://www.cl.cam.ac.uk/~mgk25/ucs/examples/UTF-8-test.txt
+  "You may use this file for any purpose."
+
+What is reproduced is conformance DATA — byte sequences and whether each is
+well-formed UTF-8 — not code. See SPEC.md "External-anchor investigation" for
+why the same suite's §7.9 close-code cases were deliberately NOT frozen.
+
+
+## 2. Foreign-peer verdict corpus, frozen 2026-08-09
+
+`src/connection.zig`'s `foreign_peer_corpus` records what three independently
+authored WebSocket implementations DID when 54 byte strings were put in front
+of them:
+
+  * python-websockets 15.0.1 — BSD-3-Clause
+    Copyright (c) Aymeric Augustin and contributors
+    https://github.com/python-websockets/websockets
+  * github.com/coder/websocket v1.8.15 — ISC
+    Copyright (c) 2023 Anmol Sethi
+  * github.com/gorilla/websocket v1.5.3 — BSD-2-Clause
+    Copyright (c) 2023 The Gorilla WebSocket Authors
+
+Licence reasoning, stated explicitly because the brief that produced this
+corpus requires it:
+
+  * All three licences are permissive (BSD-3-Clause / ISC / BSD-2-Clause) and
+    impose no condition MIT does not already impose. Even a full copy would
+    have been unproblematic; none was made.
+  * Nothing is copied, translated, or redistributed from any of them. Not one
+    line of their source appears here, and no conclusion was drawn by reading
+    their source — the corpus is the OBSERVED OUTPUT of running them.
+  * The frozen `wire` fields are byte strings this repository composed itself
+    (RFC 6455 §5 frames, masked with the §5.7 mask key). The frozen `peers`
+    fields are numeric close codes and accept/reject outcomes those three
+    programs emitted on a socket in response. Observed numeric behaviour of a
+    public wire specification is not a copyrightable expression of theirs.
+  * That statement is true of what was actually done: the capture scripts live
+    outside the repository in `~/.cache/zig-libs-websocket/` and read no
+    upstream source file; the Go harness only dials a loopback socket and
+    records the bytes that come back.
+
+The three implementations are build- and test-time absent. These tests run
+offline, never skip, and are unaffected by deleting all three.

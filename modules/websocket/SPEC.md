@@ -146,6 +146,13 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   overlong-encoding, lonely-continuation-byte or surrogate-half cases the corpus covers), so it is
   a genuine third-party oracle, not a restatement of the spec in test form. See "External-anchor
   investigation" below for how it was obtained and what remains unanchored.
+- **External anchor (three foreign WebSocket peers, executed and frozen 2026-08-09):**
+  `connection.zig`'s `foreign_peer_corpus` — 54 masked client→server byte strings, each put in
+  front of **python-websockets 15.0.1**, **github.com/coder/websocket v1.8.15** and
+  **github.com/gorilla/websocket v1.5.3**, with what each of the three actually did recorded next
+  to it. 24 rows all three accepted, 23 all three rejected (with the close code they agreed on),
+  7 are divergences or splits, individually documented. This is what closes the §7.9 gap the
+  2026-08-08 investigation left open — see "Foreign-peer corpus" below.
 
 ### External-anchor investigation: Autobahn|Testsuite (2026-08-08)
 
@@ -189,14 +196,67 @@ there, with two different verdicts:
   is "clean close with protocol error code or drop TCP", i.e. RFC 6455 §7.4.1's MUST-fail-with-1002
   rule restated in Python. Freezing these values and asserting this module rejects them would be
   indistinguishable from writing a test against our own reading of RFC 6455 — exactly the
-  fabricated-anchor shape this repo has flagged before. **UNVERIFIED: close-code rejection
-  (`decodeCloseBody`'s F2 fix) has no external oracle in this repository** — the only way to get
-  one is an actual `Autobahn|Testsuite` `wstest` run (or another independent WebSocket
-  implementation's conformance report) verifying that a *real* peer's byte-level close response to
-  each invalid code matches this module's; on a Python-2-only interpreter, or once
-  `autobahntestsuite` is fixed upstream for Python 3, that run is what would unblock it. Until then
-  this gap is covered only by RFC-table-derived tests (`frame.zig`, `connection.zig`), which is a
-  correctness check but not an independent one.
+  fabricated-anchor shape this repo has flagged before. **That refusal stands and was correct.**
+  What was missing was not better case data but a different *kind* of oracle — see below.
+
+### Foreign-peer corpus: three implementations, executed (2026-08-09)
+
+The §7.9 gap above is now closed, not by resurrecting `wstest` (which stays dead) but by
+replacing the suite with **real peers**. A conformance suite reports pass/fail against its
+author's interpretation; a real peer emits *bytes*, and bytes are what freeze.
+
+**What was run.** 54 masked client→server frames (mask key `37 fa 21 3d`, the RFC 6455 §5.7 key)
+covering valid traffic, header-level violations, length-form boundaries, and every close-code
+class, were put in front of three independently authored implementations in two languages:
+
+| Implementation | Licence | How it was driven |
+|---|---|---|
+| python-websockets 15.0.1 | BSD-3-Clause | its sans-io `ServerProtocol` state machine, fed directly |
+| github.com/coder/websocket v1.8.15 | ISC | real server on loopback; its close frame read off a raw socket |
+| github.com/gorilla/websocket v1.5.3 | BSD-2-Clause | likewise |
+
+Nobody's source was read for a conclusion; all three were *executed* and their behaviour
+recorded. The distinction from the refused §7.9 case data is the whole point — this is an oracle
+that can disagree with us, and on its first run it did.
+
+**What it caught immediately: close codes 1012-1014 were wrongly rejected.** `isValidCloseCode`
+permitted `1000-1003, 1007-1011, 3000-4999`, which is exactly what RFC 6455 §7.4.1's own text
+enumerates — and is wrong. §7.4.2/§11.7 make the IANA *WebSocket Close Code Number Registry* the
+authority for the 1000-2999 range, and that registry has since assigned **1012 Service Restart,
+1013 Try Again Later, 1014 Bad Gateway**. All three peers accept 1012 and 1013; two of the three
+accept 1014. The module now accepts 1012-1014 and still rejects 1015 and 1016-2999, which all
+three peers also reject. The pre-existing self-authored close-code tests were green throughout —
+they asserted the same misreading, because they were written from the same paragraph.
+
+**Divergences, kept rather than smoothed over.** Seven rows do not produce a clean shared verdict
+and are recorded as such instead of being dropped:
+
+- **Non-minimal length encodings (3 rows).** RFC 6455 §5.2 requires "the minimal number of bytes
+  MUST be used to encode the length". *None of the three enforces it* — a 126/127 form carrying a
+  value the shorter form could hold is accepted by all of them. This module rejects it
+  (`InvalidPayloadLength`, close 1002) and keeps doing so; the divergence is pinned so the choice
+  cannot drift silently.
+- **UTF-8 validation on receive (4 rows).** RFC 6455 §8.1 requires failing an invalid-UTF-8 text
+  message with close 1007. *None of the three validates UTF-8 at this layer* — invalid text
+  payloads pass through all of them. This is precisely why Autobahn has a §6 section at all, and
+  why the Kuhn corpus above, not these peers, is what carries that half of the anchor.
+- **Genuine three-way splits (4 rows, `.split`).** `close_code_1014` (gorilla rejects, the other
+  two accept), `close_body_1byte` (gorilla treats a 1-byte body as a no-code close; the other two
+  reject 1002), `close_reason_bad_utf8` (python 1007 — matching this module; gorilla 1002; coder
+  accepts), and a 64-bit length with the MSB set (both Go peers drop the TCP connection with no
+  close frame; python's reader simply waits for the 2^63 bytes). No majority verdict was
+  manufactured for these; the three answers are recorded and *this module's* answer is pinned.
+
+**Offline and non-skipping.** The capture scripts live outside the repository in
+`~/.cache/zig-libs-websocket/`; `build.zig.zon` stays empty. All three implementations can be
+deleted and the tests are unchanged — they never skip. Licence reasoning is in this module's
+`NOTICE`.
+
+**Teeth, demonstrated.** Restoring `isValidCloseCode` to its previous range *together with* the
+previous self-authored close-code tests reproduces the module's state before this corpus existed:
+`zig build test-websocket` then reports 62/63 passing — every self-authored test green — with the
+**only** failure being `close_code_1012: all three peers accepted but we rejected with close 1002`.
+The RED comes from the foreign corpus and from nothing else.
 
 ## Backlog / deferred
 

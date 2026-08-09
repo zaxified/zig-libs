@@ -336,6 +336,199 @@ test "external anchor: Autobahn|Testsuite's frozen UTF-8 stress-test corpus (Mar
     }
 }
 
+// ── external anchor: three foreign WebSocket implementations, executed ──────
+//
+// F5 asked for an `Autobahn|Testsuite` result. `wstest` is dead on this host
+// (Python-2-era package, see SPEC.md "External-anchor investigation"), and its
+// §7.9 close-code *case data* was deliberately refused as a freeze target
+// because it is only RFC 6455 §7.4.1 restated in Python — our own reading of
+// the spec wearing someone else's name. That refusal stands.
+//
+// What replaces it is not a suite but three real peers, **run**, not read:
+//
+//   * python-websockets 15.0.1 (BSD-3-Clause) — its sans-io `ServerProtocol`
+//     state machine, driven directly with the bytes below;
+//   * github.com/coder/websocket v1.8.15 (ISC) — a real server on loopback;
+//   * github.com/gorilla/websocket v1.5.3 (BSD-2-Clause) — likewise.
+//
+// Each `wire` field is the exact masked client→server byte string that was put
+// in front of all three (mask key `37 fa 21 3d`, the RFC 6455 §5.7 key), and
+// each `peers` field records what they actually did with it — for the two Go
+// servers, decoded from the close frame they wrote back onto the socket. The
+// distinction from the refused §7.9 case data is the whole point: nobody's
+// source was transcribed, three independently-authored implementations were
+// executed and their behaviour recorded. It is an oracle that can disagree
+// with us, and on its first run it did — see `close_code_1012`/`1013`.
+//
+// Frozen 2026-08-09 by ~/.cache/zig-libs-websocket/{cases,oracle_python,
+// emit_zig}.py + a Go harness. These tests run offline and never skip; all
+// three implementations can be deleted and nothing here changes. Licences are
+// all permissive and nothing is copied, translated or redistributed from any
+// of them — what is frozen is observed numeric behaviour on a public wire
+// format, which is not a copyrightable expression of theirs.
+//
+// Verdicts:
+//   .accept      all three accepted; this module must too.
+//   .reject      all three rejected; this module must too, with `close_code`
+//                when they agreed on one.
+//   .divergence  all three accepted, this module deliberately rejects. Two
+//                independent causes, both of them findings in their own right:
+//                (a) RFC 6455 §5.2's minimal-length-encoding MUST ("the
+//                minimal number of bytes MUST be used to encode the length"),
+//                which none of the three enforces — a 126/127 form carrying a
+//                value the shorter form could hold sails through all of them;
+//                (b) RFC 6455 §8.1's MUST to fail a text message that is not
+//                valid UTF-8 with close 1007 — none of the three validates
+//                UTF-8 on receive, which is precisely why Autobahn's §6
+//                section exists and why the Kuhn corpus above is carrying
+//                that half of the anchor rather than these peers. Pinned so
+//                the choice cannot drift silently.
+//   .split       the three disagreed with each other, so there is no foreign
+//                verdict to assert against — manufacturing a majority here
+//                would be inventing an anchor that does not exist. Their
+//                three answers are kept in `peers`, and `ours_rejects` /
+//                `close_code` pin *this module's* answer so the choice made
+//                in the presence of a genuine disagreement cannot drift
+//                silently either.
+const ForeignVerdict = enum { accept, reject, divergence, split };
+const ForeignCase = struct {
+    label: []const u8,
+    wire: []const u8,
+    verdict: ForeignVerdict,
+    /// For `.reject`/`.divergence`: the close code the peers agreed on, if
+    /// they agreed on one. For `.split`: the close code *this module*
+    /// produces. Unused for `.accept`.
+    close_code: ?u16,
+    /// `.split` only: whether this module rejects these bytes.
+    ours_rejects: bool = false,
+    peers: []const u8,
+};
+
+const foreign_peer_corpus = [_]ForeignCase{
+    .{ .label = "valid_text_hello", .wire = "\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_ping_hello", .wire = "\x89\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_pong_hello", .wire = "\x8a\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_text_125", .wire = "\x81\xfd\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_text_126_16bit", .wire = "\x81\xfe\x00\x7e\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56\x9b", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_text_empty", .wire = "\x81\x80\x37\xfa\x21\x3d", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_ctrl_125", .wire = "\x89\xfd\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_close_1000", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x12", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1000 gorilla=ACCEPT/1000" },
+    .{ .label = "valid_close_1000_reason", .wire = "\x88\x85\x37\xfa\x21\x3d\x34\x12\x43\x44\x52", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1000 gorilla=ACCEPT/1000" },
+    .{ .label = "valid_close_empty", .wire = "\x88\x80\x37\xfa\x21\x3d", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_close_1001", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x13", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1001 gorilla=ACCEPT/1001" },
+    .{ .label = "valid_close_1003", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x11", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1003 gorilla=ACCEPT/1003" },
+    .{ .label = "valid_close_1007", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x15", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1007 gorilla=ACCEPT/1007" },
+    .{ .label = "valid_close_1011", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x09", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1011 gorilla=ACCEPT/1011" },
+    .{ .label = "valid_close_3000", .wire = "\x88\x82\x37\xfa\x21\x3d\x3c\x42", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/3000 gorilla=ACCEPT/3000" },
+    .{ .label = "valid_close_4999", .wire = "\x88\x82\x37\xfa\x21\x3d\x24\x7d", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/4999 gorilla=ACCEPT/4999" },
+    .{ .label = "valid_utf8_2byte", .wire = "\x81\x82\x37\xfa\x21\x3d\xf4\x53", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_utf8_4byte", .wire = "\x81\x84\x37\xfa\x21\x3d\xc7\x65\xb3\x94", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "rsv1_set", .wire = "\xc1\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "rsv2_set", .wire = "\xa1\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "rsv3_set", .wire = "\x91\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "opcode_0x3_reserved", .wire = "\x83\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "opcode_0x7_reserved", .wire = "\x87\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "opcode_0xB_reserved", .wire = "\x8b\x80\x37\xfa\x21\x3d", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "opcode_0xF_reserved", .wire = "\x8f\x80\x37\xfa\x21\x3d", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "fragmented_ping", .wire = "\x09\x81\x37\xfa\x21\x3d\x4f", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "fragmented_close", .wire = "\x08\x82\x37\xfa\x21\x3d\x34\x12", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "control_payload_126", .wire = "\x89\xfe\x00\x7e\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56\x9b", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "nonminimal_len16", .wire = "\x81\xfe\x00\x05\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .divergence, .close_code = 1002, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "nonminimal_len16_zero", .wire = "\x81\xfe\x00\x00\x37\xfa\x21\x3d", .verdict = .divergence, .close_code = 1002, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "nonminimal_len64", .wire = "\x81\xff\x00\x00\x00\x00\x00\x00\x00\x05\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .divergence, .close_code = 1002, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    // SPLIT: py=ACCEPT coder=REJECT gorilla=REJECT
+    .{ .label = "len64_msb_set", .wire = "\x81\xff\x80\x00\x00\x00\x00\x00\x00\x00\x37\xfa\x21\x3d", .verdict = .split, .close_code = 1002, .ours_rejects = true, .peers = "py=ACCEPT coder=REJECT gorilla=REJECT" },
+    .{ .label = "orphan_continuation", .wire = "\x80\x86\x37\xfa\x21\x3d\x58\x88\x51\x55\x56\x94", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "bad_utf8_text", .wire = "\x81\x82\x37\xfa\x21\x3d\xc8\x04", .verdict = .divergence, .close_code = 1007, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "bad_utf8_overlong", .wire = "\x81\x82\x37\xfa\x21\x3d\xf7\x55", .verdict = .divergence, .close_code = 1007, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "bad_utf8_surrogate", .wire = "\x81\x83\x37\xfa\x21\x3d\xda\x5a\xa1", .verdict = .divergence, .close_code = 1007, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "bad_utf8_truncated", .wire = "\x81\x82\x37\xfa\x21\x3d\xd5\x78", .verdict = .divergence, .close_code = 1007, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "close_code_0", .wire = "\x88\x82\x37\xfa\x21\x3d\x37\xfa", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_999", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x1d", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_1004", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x16", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_1005", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x17", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_1006", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x14", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_1012", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x0e", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1012 gorilla=ACCEPT/1012" },
+    .{ .label = "close_code_1013", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x0f", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1013 gorilla=ACCEPT/1013" },
+    // SPLIT: py=ACCEPT coder=ACCEPT/1014 gorilla=REJECT/1002
+    .{ .label = "close_code_1014", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x0c", .verdict = .split, .close_code = null, .ours_rejects = false, .peers = "py=ACCEPT coder=ACCEPT/1014 gorilla=REJECT/1002" },
+    .{ .label = "close_code_1015", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x0d", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_1016", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x02", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_1100", .wire = "\x88\x82\x37\xfa\x21\x3d\x33\xb6", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_2000", .wire = "\x88\x82\x37\xfa\x21\x3d\x30\x2a", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_2999", .wire = "\x88\x82\x37\xfa\x21\x3d\x3c\x4d", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_5000", .wire = "\x88\x82\x37\xfa\x21\x3d\x24\x72", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "close_code_65535", .wire = "\x88\x82\x37\xfa\x21\x3d\xc8\x05", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    // SPLIT: py=REJECT/1002 coder=REJECT/1002 gorilla=ACCEPT
+    .{ .label = "close_body_1byte", .wire = "\x88\x81\x37\xfa\x21\x3d\x34", .verdict = .split, .close_code = 1002, .ours_rejects = true, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=ACCEPT" },
+    // SPLIT: py=REJECT/1007 coder=ACCEPT/1000 gorilla=REJECT/1002
+    .{ .label = "close_reason_bad_utf8", .wire = "\x88\x84\x37\xfa\x21\x3d\x34\x12\xde\xc3", .verdict = .split, .close_code = 1007, .ours_rejects = true, .peers = "py=REJECT/1007 coder=ACCEPT/1000 gorilla=REJECT/1002" },
+};
+
+/// Do to `wire` exactly what the three foreign servers did with it: hand the
+/// bytes to a full server-role connection. This has to be the `Connection`
+/// layer, not bare `parseFrame` — the peers are complete stacks, and rules
+/// like "a continuation frame with nothing to continue" live above the frame
+/// codec here (`orphan_continuation` in the table below is exactly that case,
+/// and it is what caught this when the driver was written one layer too low).
+fn peerVerdict(buf: []u8) struct { rejected: bool, code: ?u16 } {
+    var msg_buf: [1024]u8 = undefined;
+    var conn: Connection = .init(.server, &msg_buf, 1 << 20);
+    const r = conn.receive(buf) catch |e| return .{ .rejected = true, .code = frame.closeCode(e) };
+    return switch (r.event) {
+        .need_more => .{ .rejected = true, .code = null },
+        else => .{ .rejected = false, .code = null },
+    };
+}
+
+test "external anchor: frozen verdicts of three foreign WebSocket peers (2026-08-09)" {
+    var scratch: [1024]u8 = undefined;
+    var checked: usize = 0;
+    var splits: usize = 0;
+    for (foreign_peer_corpus) |c| {
+        @memcpy(scratch[0..c.wire.len], c.wire);
+        const buf = scratch[0..c.wire.len];
+        const ours = peerVerdict(buf);
+        switch (c.verdict) {
+            .accept => {
+                if (ours.rejected) {
+                    std.debug.print("{s}: all three peers accepted ({s}) but we rejected with close {?d}\n", .{ c.label, c.peers, ours.code });
+                    return error.TestUnexpectedResult;
+                }
+                checked += 1;
+            },
+            .reject, .divergence => {
+                if (!ours.rejected) {
+                    std.debug.print("{s}: expected rejection ({s}) but we accepted\n", .{ c.label, c.peers });
+                    return error.TestUnexpectedResult;
+                }
+                if (c.close_code) |want| {
+                    if (ours.code != want) {
+                        std.debug.print("{s}: peers said close {d} ({s}), we said {?d}\n", .{ c.label, want, c.peers, ours.code });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+                checked += 1;
+            },
+            .split => {
+                if (ours.rejected != c.ours_rejects) {
+                    std.debug.print("{s}: peers disagreed ({s}); this module's pinned answer changed\n", .{ c.label, c.peers });
+                    return error.TestUnexpectedResult;
+                }
+                if (c.ours_rejects and ours.code != c.close_code) {
+                    std.debug.print("{s}: peers disagreed ({s}); our close code moved to {?d}\n", .{ c.label, c.peers, ours.code });
+                    return error.TestUnexpectedResult;
+                }
+                splits += 1;
+            },
+        }
+    }
+    // Guard against the table being emptied or the loop being short-circuited:
+    // a corpus that asserts nothing passes silently otherwise.
+    try testing.expect(checked >= 45);
+    try testing.expectEqual(@as(usize, 4), splits);
+}
+
 test "control frame (ping) interleaves mid-fragmentation without disturbing it" {
     var scratch: [64]u8 = undefined;
     var conn: Connection = .init(.client, &scratch, 1 << 20);

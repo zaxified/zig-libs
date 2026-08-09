@@ -349,11 +349,20 @@ pub const CloseInfo = struct { code: ?u16, reason: []const u8 };
 /// NOT be set as a status code in a Close frame by an endpoint" (they name
 /// conditions with no corresponding close frame — 1005/1006 mean "no status
 /// code was actually present"/"the connection was closed abnormally", 1004
-/// and 1015 are reserved outright); 1012-2999 (minus 1015) are simply
-/// unassigned. This is Autobahn|Testsuite's 7.9.x class.
+/// and 1015 are reserved outright). This is Autobahn|Testsuite's 7.9.x class.
+///
+/// **1012-1014 are legal, and reading §7.4.1 alone gets that wrong.** §7.4.1's
+/// own text stops at 1011, but §7.4.2/§11.7 establish the IANA "WebSocket
+/// Close Code Number Registry" as the authority for the 1000-2999 range, and
+/// that registry has since assigned 1012 (Service Restart), 1013 (Try Again
+/// Later) and 1014 (Bad Gateway). This module rejected all three until the
+/// external-peer corpus below caught it: python-websockets, coder/websocket
+/// and gorilla/websocket all accept 1012 and 1013 on the wire, and two of the
+/// three accept 1014 (see `foreign_peer_corpus` in `connection.zig`). Everything still unassigned
+/// — 1015, 1016-2999 — stays rejected, and all three peers agree on that too.
 fn isValidCloseCode(code: u16) bool {
     return switch (code) {
-        1000...1003, 1007...1011, 3000...4999 => true,
+        1000...1003, 1007...1014, 3000...4999 => true,
         else => false,
     };
 }
@@ -642,8 +651,8 @@ test "decodeCloseBody: rejects every RFC 6455 §7.4.1 illegal close code" {
     const illegal = [_]u16{
         0, 1, 999, // 0-999: not used
         1004, 1005, 1006, // explicitly "MUST NOT be set"
-        1012, 1013, 1014, 1015, // unassigned (1015 also "MUST NOT be set")
-        2999, // top of the unassigned 1012-2999 range
+        1015, // reserved, "MUST NOT be set"
+        1016, 2000, 2999, // unassigned remainder of the 1016-2999 range
         5000, 65535, // past the 4000-4999 private-use ceiling
     };
     for (illegal) |code| {
@@ -654,7 +663,12 @@ test "decodeCloseBody: rejects every RFC 6455 §7.4.1 illegal close code" {
 }
 
 test "decodeCloseBody: accepts every RFC 6455 §7.4.1 legal close code" {
-    const legal = [_]u16{ 1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 3000, 3999, 4000, 4999 };
+    const legal = [_]u16{
+        1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011,
+        // IANA-registered after RFC 6455 §7.4.1 was written, per the registry
+        // §11.7 establishes — see `isValidCloseCode`.
+        1012, 1013, 1014, 3000, 3999, 4000, 4999,
+    };
     for (legal) |code| {
         var payload: [2]u8 = undefined;
         std.mem.writeInt(u16, &payload, code, .big);
