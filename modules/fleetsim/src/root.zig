@@ -1112,15 +1112,30 @@ test "live: a real IEC 104 master drives a simulated outstation, and sees iv qua
     var f = try Fleet.init(testing.allocator, .{ .seed = 6, .max_frame_len = 512, .outbox_bytes = 1 << 16 });
     defer f.deinit();
 
+    // The monitored fixture, then the control-direction verdict channel. See
+    // `iec104_verdict`: IOA 900..909 are `C_SE_NB_1` set-point commands the
+    // master writes its marks into, and 910 is the `C_SC_NA_1` pass bit.
+    // Deliberately more than one measured TYPE — a single short float grades
+    // one codec, and mark 905 is a difference across two of them.
     var points = [_]iec104.Point{
         .{ .ioa = 101, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } } },
         .{ .ioa = 102, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = false } } },
-        .{ .ioa = 201, .type_id = .m_me_nc_1, .element = .{ .short_float = .{ .value = 21.5, .quality = .{} } } },
-    };
+        .{ .ioa = 103, .type_id = .m_dp_na_1, .element = .{ .diq = .{ .state = .on } } },
+        .{ .ioa = 201, .type_id = .m_me_nc_1, .element = .{
+            .short_float = .{ .value = iec104_verdict.float_value, .quality = .{} },
+        } },
+        .{ .ioa = 202, .type_id = .m_me_nb_1, .element = .{
+            .scaled = .{ .value = iec104_verdict.scaled_value, .quality = .{} },
+        } },
+        .{ .ioa = 301, .type_id = .m_it_na_1, .element = .{ .counter = .{
+            .counter = iec104_verdict.counter_value,
+            .sequence = iec104_verdict.counter_sequence,
+        } } },
+    } ++ iec104_verdict.commandPoints();
     var frame_buf: [512]u8 = undefined;
-    var queue_buf: [8192]u8 = undefined;
+    var queue_buf: [16384]u8 = undefined;
     var rtu: Iec104Node = undefined;
-    try rtu.init(.{ .common_address = 47 }, &points, &frame_buf, &queue_buf, .{});
+    try rtu.init(.{ .common_address = iec104_verdict.common_address }, &points, &frame_buf, &queue_buf, .{});
     const id = try f.addNode(.{ .node = rtu.node(), .tag = 2, .tick_period_ms = 500 });
 
     try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
@@ -1142,13 +1157,165 @@ test "live: a real IEC 104 master drives a simulated outstation, and sees iv qua
             report.peers_accepted,            report.frames_in,
             report.frames_out,                st.delivered,
             st.replied,                       rtu.server.isStarted(),
-            points[0].element.siq.quality.iv, points[2].element.short_float.quality.iv,
+            points[0].element.siq.quality.iv, points[3].element.short_float.quality.iv,
         },
     );
     try testing.expect(st.delivered > 0);
     try testing.expect(st.replied > 0);
-    try testing.expect(points[2].element.short_float.quality.iv);
+    try testing.expect(points[3].element.short_float.quality.iv);
+    // …and the part that grades what the master DECODED. See `iec104_verdict`.
+    try iec104_verdict.expectAllPassed(&points);
 }
+
+/// The contract between `scripts/vm/guests/fleetsim-iec104-master.py` and the
+/// live IEC 104 test.
+///
+/// **The write-back channel IEC 104 offers.** Commands in the control
+/// direction. Ten `C_SE_NB_1` set-point points at IOA 900..909 carry the marks
+/// and a `C_SC_NA_1` at 910 carries the pass bit, sent last and sent either
+/// way. The outstation stores a commanded value into the point (`onCommand`:
+/// `p.element = o.element`), so the marks are readable here after the run.
+///
+/// **Why these marks and not an echo.** The measured value on the wire is an
+/// IEEE-754 short float; commanding it back as a short float is the exact
+/// inverse of the read, so an outstation whose float codec was wrong in both
+/// directions would round-trip cleanly. Mark 904 leaves the float domain
+/// (scaled to a tenth-integer); mark 905 is a *difference across two different
+/// type decodes* — the SVA of `M_ME_NB_1` minus that scaled float — which no
+/// echo of either operand can produce; mark 906 checksums the whole
+/// interrogation SET (which IOAs, under which type ids), so a device reporting
+/// a superset or the right values under the wrong types fails it; marks 907
+/// and 908 are causes the outstation itself chose for two *different* errors,
+/// as c104 itself named them, so collapsing "no such IOA" into "not my common
+/// address" is caught.
+const iec104_verdict = struct {
+    const common_address: u16 = 47;
+    const foreign_ca: u16 = 99;
+
+    const float_value: f32 = 21.5;
+    const scaled_value: i16 = -12345;
+    const counter_value: i32 = 1_234_567;
+    const counter_sequence: u5 = 5;
+
+    const base_ioa: u32 = 900;
+    const slots = 10;
+    const pass_ioa: u32 = 910;
+    /// Prime, and small enough that the running sum stays inside an `i16`.
+    const checksum_mod: i32 = 30011;
+
+    const magic: i16 = 26104;
+    /// One `open_connection` record, two interrogations, the two named
+    /// refusals, and the post-fault interrogation. The eleven verdict commands
+    /// are appended *after* this count is taken, so it does not count itself.
+    const graded_checks: i16 = 6;
+    /// §7.2.3 cause 47, "unknown information object address".
+    const unknown_ioa_cause: i16 = 47;
+    /// §7.2.3 cause 46, "unknown common address of ASDU".
+    const unknown_ca_cause: i16 = 46;
+
+    /// The six monitored fixture points, in the order the master bits them.
+    const graded_ioas = [_]u32{ 101, 102, 103, 201, 202, 301 };
+    /// Every fixture point decoded correctly, plus the "reported set is
+    /// exactly these six" bit.
+    const observed_all: i16 = (1 << (graded_ioas.len + 1)) - 1;
+    /// `trouble_on` sets `iv` on every element that *has* a quality octet.
+    /// `M_IT_NA_1` carries its IV inside the BCR instead of a QDS, so the
+    /// counter is deliberately not in this mask — see `Iec104.setQuality`.
+    const invalid_after_fault: i16 = (1 << (graded_ioas.len - 1)) - 1;
+
+    fn commandPoints() [slots + 1]iec104.Point {
+        var out: [slots + 1]iec104.Point = undefined;
+        for (0..slots) |i| {
+            out[i] = .{
+                .ioa = base_ioa + @as(u32, @intCast(i)),
+                .type_id = .c_se_nb_1,
+                .element = .{ .setpoint_scaled = .{ .value = 0, .qos = .{} } },
+            };
+        }
+        out[slots] = .{ .ioa = pass_ioa, .type_id = .c_sc_na_1, .element = .{ .sco = .{} } };
+        return out;
+    }
+
+    /// Recomputed from the fixture, exactly as the master computes it from what
+    /// it decoded: `sum(ioa * 7 + type_id)` over the reported set, mod a prime.
+    fn giChecksum(points: []const iec104.Point) i16 {
+        var sum: i32 = 0;
+        for (points) |p| {
+            if (!p.type_id.isMonitoring()) continue;
+            sum = @rem(sum + @as(i32, @intCast(p.ioa)) * 7 + @intFromEnum(p.type_id), checksum_mod);
+        }
+        return @intCast(sum);
+    }
+
+    fn measuredX10() i16 {
+        return @intFromFloat(@round(float_value * 10));
+    }
+
+    fn mark(points: []const iec104.Point, i: usize) ?i16 {
+        for (points) |p| {
+            if (p.ioa != base_ioa + i) continue;
+            return switch (p.element) {
+                .setpoint_scaled => |v| v.value,
+                else => null,
+            };
+        }
+        return null;
+    }
+
+    fn passBit(points: []const iec104.Point) ?bool {
+        for (points) |p| {
+            if (p.ioa != pass_ioa) continue;
+            return switch (p.element) {
+                .sco => |v| v.on,
+                else => null,
+            };
+        }
+        return null;
+    }
+
+    fn expectAllPassed(points: []const iec104.Point) !void {
+        const got_magic = mark(points, 0) orelse {
+            std.debug.print(
+                "live fleetsim IEC 104: IOA {d} is not a scaled set-point — the point" ++
+                    " database is wrong\n",
+                .{base_ioa},
+            );
+            return error.NoMasterVerdict;
+        };
+        if (got_magic != magic) {
+            std.debug.print(
+                "live fleetsim IEC 104: no verdict block (IOA {d}={d}, want {d}) — the master" ++
+                    " never commanded its marks, so nothing here graded the outstation\n",
+                .{ base_ioa, got_magic, magic },
+            );
+            return error.NoMasterVerdict;
+        }
+        std.debug.print(
+            "live fleetsim IEC 104 verdict: checks={?d} failures={?d} observed=0b{b}" ++
+                " measured_x10={?d} scaled_minus_measured={?d} gi_checksum={?d}" ++
+                " unknown_ioa={?d} unknown_ca={?d} iv_mask=0b{b} pass={?}\n",
+            .{
+                mark(points, 1),                              mark(points, 2),
+                @as(u16, @bitCast(mark(points, 3) orelse 0)), mark(points, 4),
+                mark(points, 5),                              mark(points, 6),
+                mark(points, 7),                              mark(points, 8),
+                @as(u16, @bitCast(mark(points, 9) orelse 0)), passBit(points),
+            },
+        );
+        try testing.expectEqual(@as(?i16, graded_checks), mark(points, 1));
+        try testing.expectEqual(@as(?i16, 0), mark(points, 2));
+        try testing.expectEqual(@as(?i16, observed_all), mark(points, 3));
+        try testing.expectEqual(@as(?i16, measuredX10()), mark(points, 4));
+        try testing.expectEqual(@as(?i16, scaled_value - measuredX10()), mark(points, 5));
+        try testing.expectEqual(@as(?i16, giChecksum(points)), mark(points, 6));
+        try testing.expectEqual(@as(?i16, unknown_ioa_cause), mark(points, 7));
+        try testing.expectEqual(@as(?i16, unknown_ca_cause), mark(points, 8));
+        try testing.expectEqual(@as(?i16, invalid_after_fault), mark(points, 9));
+        // Commanded last and commanded either way: `false` is a real master
+        // saying, over the wire, that it was here and is not satisfied.
+        try testing.expectEqual(@as(?bool, true), passBit(points));
+    }
+};
 
 test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

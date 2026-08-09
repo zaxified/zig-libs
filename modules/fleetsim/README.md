@@ -226,15 +226,14 @@ encoder and decoder share the same wrong convention round-trips it cleanly and
 the fault hides inside the mark. OPC UA is where that bites hardest (Int32 in,
 Int32 out), which is why its value mark folds a Double-derived term in.
 
-Two masters are still not wired: **opendnp3** publishes no wheel (it is a C++
-library with a `master-demo` example that has to be built), and **c104** is
-blocked on a conformance defect in `modules/iec104` — see SPEC.md. Adding one
-is four edits that must happen together, all listed in `run.sh`'s fleetsim
-master table: the pinned spec in `scripts/vm/manifest.sh`'s `VM_DEBIAN_PIP`, a
-row in that table (which drives the launcher, the marker gate and the test
-filter at once), a driver script in `scripts/vm/guests/`, and a verdict channel
-in the live test. A master that only reads leaves no trace of what it
-understood.
+One master is still not wired: **opendnp3** publishes no wheel — it is a C++
+library with a `master-demo` example that has to be built, which is a different
+kind of provisioning step from `pip install`. Adding a master is four edits that
+must happen together, all listed in `run.sh`'s fleetsim master table: the pinned
+spec in `scripts/vm/manifest.sh`'s `VM_DEBIAN_PIP`, a row in that table (which
+drives the launcher, the marker gate and the test filter at once), a driver
+script in `scripts/vm/guests/`, and a verdict channel in the live test. A master
+that only reads leaves no trace of what it understood.
 
 What those runs produced is frozen in `src/master_goldens.zig` and replays
 offline on every build, so the ordinary `zig build test-fleetsim` carries the
@@ -254,17 +253,49 @@ pip install --user --break-system-packages \
     python-snap7==3.1.0 asyncua==2.0.1 c104==2.2.1
 ```
 
-`c104` is the only one carrying a compiled extension (it wraps lib60870-C).
-Its published wheels stop at CPython 3.13, so on a **newer** interpreter pip
-falls back to a source build and needs `build-essential` and `cmake`. Checked,
-not inherited: Debian 13 (trixie) ships Python 3.13 and c104 2.2.1 publishes a
-`cp313-manylinux_2_28_x86_64` wheel, so in the VM lane's guest it installs from
-a wheel with no toolchain at all (`pip install c104==2.2.1` → `Successfully
-installed c104-2.2.1`, verified). The warning is about interpreters ahead of
-that image, not about this lane.
+`c104` is the only one carrying a compiled extension (it wraps lib60870-C) and
+the only one under a copyleft licence (**GPL-3.0-or-later**; it runs as a
+separate process in a throwaway guest, nothing is linked against it and nothing
+from it is redistributed — see the root `NOTICE`). Its published wheels stop at
+CPython 3.13, so on a **newer** interpreter pip falls back to a source build and
+needs `build-essential` and `cmake`. Checked, not inherited: Debian 13 (trixie)
+ships Python 3.13 and c104 2.2.1 publishes a `cp313-manylinux_2_28_x86_64`
+wheel (954 KB), so in the VM lane's guest it installs from a wheel with **no
+toolchain at all** — re-verified while provisioning the current image
+(`Downloading c104-2.2.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl`,
+`Successfully installed … c104-2.2.1`, `PROVISION_EXIT=0`). The warning is
+about interpreters ahead of that image, not about this lane.
 
-DNP3 has no usable Python master: `pydnp3` on PyPI is a 2018 work-in-progress
-and is *not* what the transcript was taken against. Build the real thing:
+### DNP3: what exists, and what it would cost
+
+Surveyed 2026-08-10, because "no wheel" is the reason this one master is still
+outstanding and the alternatives deserve to be on the record rather than
+re-derived:
+
+| Candidate | Verdict |
+|---|---|
+| `pydnp3` (PyPI, pybind11 over opendnp3) | **Dead.** Last release 2018-06-07. No Linux binary wheel ever published — the only wheels are macOS `cp27/cp35/cp36` plus `cpXX-none-any`. On Python 3.13 pip falls through to the sdist, i.e. a full C++ build. |
+| `dnp3-python` (PyPI, VOLTTRON, wrapper over opendnp3) | **Wrong interpreter.** Newest wheel is `0.3.0b2-cp310-manylinux1_x86_64` (2024-11). No cp311+ build exists, and Debian 13 ships 3.13 — so it does not install, wheel or otherwise. |
+| Debian package (`dnp3*`, `libopendnp3*`) | **Does not exist.** `packages.debian.org` returns no match in *any* suite, and there is no `opendnp3` source package. The cheap apt route is closed. |
+| `stepfunc/dnp3` (Rust, the actively-maintained successor) | **Licence blocker.** Alive (crates.io 1.7.0-RC4, pushed 2026-07), but `LICENSE.txt` is a proprietary evaluation agreement limited to "non-commercial and non-production" use — an owner decision, not a drop-in. |
+| `opendnp3` C++ itself | **Archived** upstream on 2022-05-18; last release 3.1.2 (2022-04-22), Apache-2.0. Still builds. |
+
+So the only free, unencumbered DNP3 master is a source build of an archived C++
+library. **Measured** (this host, 8 cores, `-j4`, g++ 15.2, `-DDNP3_TLS=OFF`):
+`cmake` configure + build of 3.1.2 with `-DDNP3_EXAMPLES=ON` took **53 s** and
+produced a **34 MB** build tree containing `cpp/examples/master/master-demo`.
+It compiles clean on a 2026 toolchain despite the 2022 freeze.
+
+The compile is *not* the expensive part. The VM lane caches its guest on a hash
+of the recipe (`scripts/vm/recipe.sh`), and that recipe text has exactly two
+slots — an apt package list and a pinned pip list. A from-source master needs a
+third: a pinned source (URL + tag + checksum, matching what
+`fetch-images.sh` already does for the images) and a build command, threaded
+through `recipe_text` and `provision-debian.exp`, plus `build-essential` and
+`cmake` in the guest. That is a change to how the lane defines an image, not a
+list edit — which is why it is still open rather than done.
+
+To run the master by hand instead:
 
 ```
 git clone --branch release https://github.com/dnp3/opendnp3.git

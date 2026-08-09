@@ -219,7 +219,7 @@ VM_DEBIAN_PACKAGES=(
 # hash lie: the same recipe text would resolve to a different image on a
 # different day, which is exactly what the hash exists to prevent.
 VM_DEBIAN_PIP=(
-    # The five third-party SCADA masters `fleetsim`'s live tests are written
+    # The six third-party SCADA masters `fleetsim`'s live tests are written
     # against (modules/fleetsim/README.md "Installing the masters"). One image
     # carries all of them, so one boot can drive every protocol in sequence.
     pymodbus==3.14.0
@@ -235,6 +235,20 @@ VM_DEBIAN_PIP=(
     # nothing from it is redistributed — which is the reasoning recorded in
     # modules/fleetsim/NOTICE rather than only here.
     asyncua==2.0.1
+    # c104 wraps lib60870-C (the reference IEC 60870-5-104 implementation) in
+    # pybind11 and is GPL-3.0-or-later — the strongest licence in this list.
+    # Same posture as asyncua and for the same reason: it runs as a separate
+    # process inside a throwaway guest, nothing is linked against it, nothing
+    # from it is copied or redistributed, and what leaves the guest is the
+    # numeric output of a public IEC standard. Recorded in
+    # modules/fleetsim/NOTICE, not only here.
+    #
+    # Checked, not assumed: c104 2.2.1 publishes
+    # `cp313-manylinux_2_28_x86_64` (954 KB), and Debian 13 trixie ships
+    # Python 3.13 — so it installs from a WHEEL with no build toolchain. An
+    # earlier note in fleetsim's README claiming it needs build-essential +
+    # cmake was wrong and has been corrected.
+    c104==2.2.1
 )
 
 # ── what this image CANNOT provide, so nobody re-derives it ──────────────

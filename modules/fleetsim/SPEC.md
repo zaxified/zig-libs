@@ -292,15 +292,22 @@ Proved, not asserted, by three tests:
 > the master itself wrote (`expected 0, found 1`) — the master graded, disagreed,
 > and said so in-band.
 
-> **Not wired into the VM lane, deliberately.** *opendnp3* publishes no wheel —
-> it is a C++ library whose `master-demo` has to be built, which is a different
-> kind of provisioning step. *c104* installs from a wheel fine, but the IEC 104
-> lane was built once and **rolled back**: the link would not stay up in a
-> two-master run, and the instability traces to a conformance defect in
-> `modules/iec104` (its outstation confirms a global-common-address
-> interrogation by echoing 0xFFFF back instead of identifying itself with its
-> own CA 47). A half-wired lane that fails by default is worse than an absent
-> one.
+> **One master is still not wired: opendnp3.** It publishes no wheel — it is a
+> C++ library whose `master-demo` has to be built — and that is a different
+> kind of provisioning step from `pip install`; see README.md "Installing the
+> masters on a host, instead" for what was surveyed and what it would cost.
+>
+> **IEC 104 is wired now.** An earlier attempt was built and rolled back
+> because the link would not stay up, and the instability was attributed to the
+> global-common-address conformance defect in `modules/iec104`. That attribution
+> was wrong twice over. The defect is real and is fixed (`4158b1d`: a station
+> answering a broadcast identifies itself with its own CA), but re-running the
+> lane against the *pre*-fix code did not break either — and the rebuilt lane
+> runs with **zero reconnects** (`CLOSED_AWAIT_OPEN → OPEN_MUTED → OPEN`, one
+> `OPEN`, then an orderly `OPEN_AWAIT_CLOSED → CLOSED`). What actually made the
+> difference was on the master's side: one connection, opened once, never
+> racing c104's auto-reconnect. The single-`Transport`/single-`state.Connection`
+> shape of `iec104.OutstationServer` was never exercised beyond one peer.
 
 **All seven protocols now have third-party-master evidence through the adapter
 and the module's own binding**, on Linux, Debug build. Each run schedules a
@@ -333,16 +340,40 @@ one of the seven.
   set by the scheduled fault and seen by the master. Our side:
   `live fleetsim DNP3: peers=1 peak=1 frames_in=17 frames_out=17 bytes_in=370 bytes_out=558 delivered=17 replied=17 device_trouble=true`
 
-- **`c104` 2.2.1 (lib60870-C) → `Iec104Node`** (`FLEETSIM_IEC104_LISTEN`,
-  `serveTcpMulti`). The client's state machine went
-  `CLOSED_AWAIT_OPEN → OPEN_MUTED → OPEN` (i.e. our `STARTDT con` was accepted),
-  then issued **14 station interrogations** and received **76 APDUs**, including
-  the byte-exact `680e0000020064010700ffff00000014` (C_IC_NA_1 activation
-  confirm) and the M_ME_NC_1 report `6812060002000d8114002f00c900000000ac4100`
-  carrying 21.5. **45 point updates**, quality
-  `Quality set: {}, is_good: True` → **`Quality set: { Invalid }, is_good: False`**
-  at t=15 s on all three points. Our side:
-  `live fleetsim IEC 104: peers=1 frames_in=17 frames_out=76 delivered=17 replied=16 started=true iv101=true iv201=true`
+- **`c104` 2.2.1 (lib60870-C, GPL-3.0) → `Iec104Node`** (`FLEETSIM_IEC104_LISTEN`,
+  `serveTcpMulti`), **in the VM lane, grading and frozen.** The client's state
+  machine went `CLOSED_AWAIT_OPEN → OPEN_MUTED → OPEN` (i.e. our `STARTDT con`
+  was accepted) and stayed there — **zero reconnects**. `Init.INTERROGATION`
+  opens with the automatic interrogation of the **global common address
+  0xFFFF**, and our outstation answered it under its own CA 47
+  (`680e0000020064010700`**`2f00`**`00000014`), which is §7.2.4's rule and the
+  behaviour `4158b1d` fixed. Then a station interrogation, a counter
+  interrogation, a command to an unbound IOA, an interrogation of a foreign
+  common address, and — after the t=15 s fault — a second station
+  interrogation across which every quality octet went `00` → `80`
+  (`Invalid`). c104 decoded 21.5 as `M_ME_NC_1`, -12345 as `M_ME_NB_1`, the
+  double point as `Double.ON`, and the integrated total 1234567 with sequence
+  5. It then commanded **ten `C_SE_NB_1` marks into IOA 900..909 and a
+  `C_SC_NA_1` pass bit into 910**; `iec104_verdict` in `root.zig` asserts on
+  them. Our side:
+  `live fleetsim IEC 104: peers=1 frames_in=21 frames_out=52 delivered=21 replied=20 started=true iv101=true iv201=true`
+  `live fleetsim IEC 104 verdict: checks=6 failures=0 observed=0b1111111 measured_x10=215 scaled_minus_measured=-12560 gi_checksum=7114 unknown_ioa=47 unknown_ca=46 iv_mask=0b11111 pass=true`
+
+  **Why a scaled integer and not the float.** Commanding 21.5 back as a
+  `C_SE_NC_1` short float would be the exact inverse of the read: an outstation
+  whose float codec was wrong in both directions would round-trip it clean.
+  Mark 904 leaves the float domain (`×10` to an integer), mark 905 is a
+  difference across two *different* type decodes (SVA minus that scaled float),
+  mark 906 checksums the whole interrogation set, and marks 907/908 are two
+  different causes the outstation itself chose — 47 for an unbound IOA, 46 for
+  a foreign common address — as c104's own `explain_bytes_dict` named them.
+
+  **Measured teeth.** `modules/iec104/src/info.zig`'s `writeI16` flipped
+  `.little` → `.big` (the SVA encoder — a constant, not a guard): c104 read
+  IOA 202 as **-14385** instead of -12345 and said so, the master still printed
+  `IEC104_MASTER_DONE` so the shell gate passed, and the **live test** failed on
+  the master's own failure count — `expected 0, found 1`, `1 passed; 0 skipped;
+  1 failed`, `GUEST_EXIT=1`. Reverted; `git diff` over `modules/iec104/` empty.
 
 - **`python-snap7` 3.1.0 → `S7Node`** (`FLEETSIM_S7_LISTEN`, `serveTcpMulti`).
   COTP connect, `Setup communication` negotiating a **480-byte PDU**, then 14

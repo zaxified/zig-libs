@@ -1162,6 +1162,27 @@ re-examined 2026-07-29 (both recorded in the project git history).
                over values THIS repository chose, performed on the far side of
                a socket.
 
+               The same file now freezes sessions recorded the same way against
+               four more third-party masters — pycomm3 1.2.16 (MIT),
+               bacpypes3 0.0.106 (MIT), python-snap7 3.1.0 (MIT) and **c104
+               2.2.1**, which wraps lib60870-C and is **GPL-3.0-or-later** —
+               and drives a fifth, asyncua 2.0.1 (LGPL-3.0), live without
+               freezing it. c104 is the strongest licence in that list and so
+               the one that has to be stated exactly: it is installed ONLY
+               inside the disposable VM guest (scripts/vm/manifest.sh), it is
+               never vendored, never a build dependency, never linked against,
+               and no part of it — source, header, binary or documentation
+               text — is copied, translated or redistributed by this
+               repository. What crosses out of the guest and into
+               `src/master_goldens.zig` is the octet stream of a conversation
+               between two separate processes speaking IEC 60870-5-104, a
+               public IEC standard, plus the numeric marks c104 computed from
+               what it decoded and commanded back as `C_SE_NB_1` set-points.
+               Those numbers are arithmetic over values THIS repository chose,
+               performed on the far side of a socket; no threshold, table or
+               algorithm of c104's is reproduced. The GPL attaches to c104's
+               own work, and none of c104's own work is here.
+
   readthrough — the read-through cache, its cross-thread miss coalescing and
                its invalidation semantics are the authors' own original work.
                The single-flight shape follows Go's `singleflight`

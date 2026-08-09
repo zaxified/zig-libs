@@ -205,7 +205,7 @@ guest_setup() {
 # one driver). It is a development affordance, not a supported mode: the
 # default is every master, and that is what the lane is judged on.
 fleetsim_masters() {
-    printf '%s\n' "${FLEETSIM_MASTERS:-modbus enip bacnet s7 opcua}"
+    printf '%s\n' "${FLEETSIM_MASTERS:-modbus enip bacnet s7 opcua iec104}"
 }
 
 fleetsim_master_env() {
@@ -215,6 +215,7 @@ fleetsim_master_env() {
         bacnet) echo FLEETSIM_BACNET_LISTEN ;;
         s7)     echo FLEETSIM_S7_LISTEN ;;
         opcua)  echo FLEETSIM_OPCUA_LISTEN ;;
+        iec104) echo FLEETSIM_IEC104_LISTEN ;;
     esac
 }
 
@@ -225,6 +226,7 @@ fleetsim_master_port() {
         bacnet) echo 15022 ;;
         s7)     echo 15024 ;;
         opcua)  echo 15025 ;;
+        iec104) echo 15023 ;;
     esac
 }
 
@@ -235,6 +237,7 @@ fleetsim_master_marker() {
         bacnet) echo BACNET_MASTER_DONE ;;
         s7)     echo S7_MASTER_DONE ;;
         opcua)  echo OPCUA_MASTER_DONE ;;
+        iec104) echo IEC104_MASTER_DONE ;;
     esac
 }
 
@@ -246,6 +249,7 @@ fleetsim_master_filter() {
         bacnet) echo 'live: a real BACnet client' ;;
         s7)     echo 'live: a real S7 client' ;;
         opcua)  echo 'live: a real OPC UA client' ;;
+        iec104) echo 'live: a real IEC 104 master' ;;
     esac
 }
 
@@ -328,19 +332,19 @@ guest_mem() {
 # socket open for a 60s budget by design.
 guest_cmd_timeout() {
     case "$1" in
-        # Five live tests, each holding its socket for the full 60 s
+        # Six live tests, each holding its socket for the full 60 s
         # `live_run_ms`, run one after another — plus boot, plus the rest of
-        # the filtered suite. 900 leaves headroom over the ~340 s that costs.
+        # the filtered suite. 900 leaves headroom over the ~390 s that costs.
         fleetsim) echo 900 ;;
         *) echo 90 ;;
     esac
 }
 
 # A default --test-filter, when running the WHOLE suite in the VM would be
-# wrong. fleetsim: the guest carries five masters, and FLEETSIM_EXPECT_LIVE=1
+# wrong. fleetsim: the guest carries six masters, and FLEETSIM_EXPECT_LIVE=1
 # turns "did not run" into a failure for every live test — so without a filter
-# the live tests whose master is NOT installed (DNP3's opendnp3, IEC 104's
-# c104, and the two-masters case) would fail for the wrong reason. Filtering to
+# the live tests whose master is NOT installed (DNP3's opendnp3 — no wheel
+# exists — and the two-masters case) would fail for the wrong reason. Filtering to
 # the tests the guest can actually serve keeps the failure signal honest. The
 # master table above is the single place all of this is listed, so adding a
 # master widens the pip list, the filter, the marker gate and the launcher
