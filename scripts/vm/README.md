@@ -97,7 +97,7 @@ real test binaries in them (not by reading docs):
 | `nftables` | openwrt | execution-verified (73 tests incl. live round-trip) |
 | `conntrack` | openwrt | execution-verified (28 tests) |
 | `ebpf` | debian | execution-verified, **137/137**. Six live attach tests (kprobe, uprobe, tracepoint, raw tracepoint, cgroup link) need `CAP_BPF` + `CAP_PERFMON` and skip on any normal host; OpenWRT's kernel has no BPF tooling at all, so this one is debian-only |
-| `fleetsim` | debian | execution-verified. **Not a privilege gap — a *counterpart* gap** (see below): a real pymodbus 3.14.0 master drives a simulated Modbus slave, 10 operations, all satisfied. ~80s |
+| `fleetsim` | debian | execution-verified. **Not a privilege gap — a *counterpart* gap** (see below): **five** real masters drive five simulated devices in one boot — pymodbus 3.14.0 (Modbus), pycomm3 1.2.16 (EtherNet/IP), bacpypes3 0.0.106 (BACnet), python-snap7 3.1.0 (S7comm), asyncua 2.0.1 (OPC UA) — each grading what it decoded and commanding its marks back into the device. ~5m20s (the live tests run one after another, each holding its socket for a 60 s budget) |
 | everything else | debian (default) | most NETNS_MODULES don't need this lane at all — `unshare -rn` already covers them (see `scripts/test.sh`'s own `NETNS_MODULES` comment); route here only for isolation, not privilege |
 
 Override with `scripts/vm/run.sh <module> openwrt|debian` when the default
@@ -227,6 +227,10 @@ cls_u32 cls_flower sch_fq_codel ifb veth`.
 | Spec | Why |
 |---|---|
 | `pymodbus==3.14.0` | the Modbus master `fleetsim`'s live Modbus test is written against. `python3-pymodbus` in trixie is 3.8.6 — years behind, and a master's own defaults are part of the oracle, so the version is pinned rather than floated. BSD-3-Clause; read off the installed distribution's metadata at capture time and recorded in the root `NOTICE`, not quoted from memory |
+| `pycomm3==1.2.16` | the EtherNet/IP master. MIT. Note it cannot open a stock `LogixDriver` session against this adapter — the Symbol Object tag-list service is not implemented — and that its single-tag `write()` puts the request on the wire twice; both are documented in `guests/fleetsim-enip-master.py` |
+| `bacpypes3==0.0.106` | the BACnet client. MIT. Its protocol errors derive from `BaseException`, which is worth knowing before writing anything against it |
+| `python-snap7==3.1.0` | the S7 client. MIT, and **pure Python** from 3.x — it speaks TPKT/COTP/S7 over an ordinary socket, so no `libsnap7` apt package is needed or installed. Verified, not assumed: the wheel is `py3-none-any` and the client connects with no `lib_location` |
+| `asyncua==2.0.1` | the OPC UA client. **LGPL-3.0-or-later** — the only non-permissive entry here. Run as a separate process in a disposable guest; nothing is linked against it and nothing of it is redistributed. Reasoning recorded in `modules/fleetsim/SPEC.md` |
 
 Pinning is enforced, not documented: `provision.sh` refuses a spec without
 `==` before booting, and the guest greps each spec back out of `pip freeze`
@@ -268,34 +272,56 @@ fleetsim-specific:
 
 ### The counterpart has to *grade*, not merely exist
 
-`run.sh fleetsim` fails unless the guest prints `MODBUS_MASTER_OK`, and that is
-not belt-and-braces. Measured, not assumed:
-
-Byte-swapping the register encoder in `modules/modbus/src/server.zig` (`.big` →
-`.little` in the read-registers reply) and re-running this lane gives
-**`GUEST_EXIT=0`** — the live test itself *passes* with every register value
-wrong. It asserts only `delivered > 0` and `replied > 0`; a wrong answer is
-still an answer and still gets counted. The run went red solely because
-pymodbus decoded 28416 where 111 was expected, said `MODBUS_MASTER_FAIL`, and
-`guest_require` did not find its marker (`run.sh` exit 1).
+Measured, not assumed. Byte-swapping the register encoder in
+`modules/modbus/src/server.zig` (`.big` → `.little` in the read-registers
+reply) and re-running this lane gave **`GUEST_EXIT=0`** — the live test itself
+*passed* with every register value wrong. It asserted only `delivered > 0` and
+`replied > 0`; a wrong answer is still an answer and still gets counted. The
+run went red solely because pymodbus decoded 28416 where 111 was expected, said
+`MODBUS_MASTER_FAIL`, and `guest_require` did not find its marker.
 
 So: **a live counterpart whose verdict nobody reads is a liveness check wearing
-an anchor's clothes.** When adding a module here, put the assertions on the
-counterpart's side and gate the run on them by name — the module's own suite
-being green is exactly the signal that cannot be trusted, because that is the
-state the whole lane exists to disprove.
+an anchor's clothes** — and a grade enforced by a shell `grep` is not a test
+suite either. The arrangement that replaced it, and the one to copy:
+
+1. the counterpart **grades** what it decoded, in its own number domain;
+2. it **commands its marks back into the device** through that protocol's own
+   write service (Modbus FC 0x10/0x05, CIP `Write Tag`, BACnet `WriteProperty`,
+   an S7 DB write, the OPC UA `Write` service);
+3. the module's **test** asserts on those marks, against constants recomputed
+   from the fixture;
+4. `guest_require` is demoted to **presence** (`*_MASTER_DONE`) — the one job a
+   shell gate is actually good at.
+
+Marks must be sums, differences, bitmaps, checksums, scaled integers or error
+codes the counterpart itself named — **never an echo of the decoded value**. An
+echo is the inverse of the read, so a device whose encoder and decoder share
+the same wrong convention round-trips it cleanly and the fault hides inside it.
+All five masters here were held to that bar by injecting a wrong value into
+their adapter and checking the **test** went red with the presence marker still
+printed; the four measurements are tabulated in `modules/fleetsim/SPEC.md`.
 
 ### And freeze what the live run said
 
 A live test that only runs in a VM nobody spins up is barely better than a
-skip. `scripts/vm/guests/fleetsim-modbus-master.py` therefore drives the device
-through an in-process byte tap and prints the whole session — every request and
-response ADU, plus what the master decoded — between
-`FLEETSIM_CAPTURE_BEGIN`/`END` markers. Those bytes are frozen into
-`modules/fleetsim/src/master_goldens.zig`, which replays them offline on every
-build, never skips, and needs no VM. The tap is a plain socket relay rather
-than the library's debug logging so the capture depends on no pymodbus
-internal and records what actually crossed the wire.
+skip. Every `scripts/vm/guests/fleetsim-*-master.py` therefore drives its device
+through a byte tap and prints the whole session — every request and response
+frame, plus what the master decoded — between `FLEETSIM_CAPTURE_BEGIN`/`END`
+markers. Those bytes are frozen into `modules/fleetsim/src/master_goldens.zig`,
+which replays them offline on every build, never skips, and needs no VM. The
+taps are plain socket relays rather than the libraries' debug logging, so a
+capture depends on no library internal and records what actually crossed the
+wire; each reassembles frames from the protocol's own length field, so the
+vectors are frames rather than TCP segments.
+
+**One protocol cannot be frozen, and saying so is part of the method.** An OPC
+UA session is established with material the *server* mints — a nonce, a session
+id, an authentication token — and every later request carries the token it was
+handed, so a recorded ReadRequest cannot be replayed against a freshly
+constructed server. There is no byte-exact offline replay of a UA session, and
+none is claimed: the asyncua transcript is graded live and recorded in prose.
+Freezing something that merely looked like a corpus would have been worse than
+the gap.
 
 ## Adding a module to the VM lane
 
@@ -349,8 +375,11 @@ Two different costs, not to be confused:
     boot without `-snapshot`, `apt-get update` (28.4 MB of index over slirp,
     ~38s), install, `sync`, poweroff. Measured again after adding python3 +
     pip + `pymodbus==3.14.0`: **1m45s**, and the resulting image is **752 MB**
-    (was 639 MB). Old provisioned images are not deleted automatically —
-    `provision.sh` lists them as safe to delete, and each is ~700 MB.
+    (was 639 MB). Measured again after adding the other four SCADA masters
+    (pycomm3, bacpypes3, python-snap7, asyncua — asyncua drags in cryptography
+    and pyOpenSSL, which is most of the difference): **2m39s**, image **833 MB**.
+    Old provisioned images are not deleted automatically —
+    `provision.sh` lists them as safe to delete, and each is ~700-850 MB.
   - Cache hit (recipe unchanged): **50 ms**, no boot, no build.
 - **Steady-state `scripts/vm/run.sh`** (cache hit, no rebuild): ~20-30s per
   invocation end to end (compile + boot + transfer + run + shutdown),

@@ -186,39 +186,59 @@ there is no reason not to install freely, because the host is never touched:
 scripts/vm/run.sh fleetsim debian
 ```
 
-That boots the provisioned Debian guest, runs the live Modbus test inside it
-with `FLEETSIM_EXPECT_LIVE=1`, and points a **real pymodbus 3.14.0** at the
-simulated slave (installed into the image by the provisioning recipe, not by
-you). ~80 s end to end; the one-off `scripts/vm/provision.sh debian` before it
-takes ~2 min.
+That boots the provisioned Debian guest and runs **five** live tests inside it
+with `FLEETSIM_EXPECT_LIVE=1`, each with a real third-party counterpart
+installed into the image by the provisioning recipe, not by you:
 
-**Two gates, and the split between them matters.** `run.sh` requires the
-guest to print `MODBUS_MASTER_DONE`, which means only "the counterpart really
-was there and ran its script to the end" — that is a presence check and a shell
-`grep` is the right place for it. *Correctness* is asserted in Zig: the master
-grades every read against the fixture and writes its marks back into the device
-(a magic word, how many checks it ran, how many it rejected, the exception code
-it named, the sums of the registers it decoded, the coil bitmap it unpacked, a
-pass bit), and `modbus_verdict` in `src/root.zig` asserts on all of it.
+| test | counterpart | write-back channel |
+|------|-------------|--------------------|
+| Modbus | pymodbus 3.14.0 | FC 0x10 / FC 0x05 into holding registers + a coil |
+| EtherNet/IP | pycomm3 1.2.16 | CIP `Write Tag` into `Verdict` DINT[8] |
+| BACnet | bacpypes3 0.0.106 | `WriteProperty` into eight analog-values + a binary-value |
+| S7comm | python-snap7 3.1.0 | a DB write into DB2 |
+| OPC UA | asyncua 2.0.1 | the `Write` service into `ns=1;s=verdict.*` |
 
-That split is not decoration. Before it, the live test asserted only
+~6 min end to end (the live tests run one after another, each holding its
+socket for the full 60 s `live_run_ms`); the one-off `scripts/vm/provision.sh
+debian` before it takes ~3 min.
+
+**Two gates, and the split between them matters.** `run.sh` requires the guest
+to print each master's `*_MASTER_DONE`, which means only "the counterpart
+really was there and ran its script to the end" — that is a presence check and
+a shell `grep` is the right place for it. *Correctness* is asserted in Zig:
+every master grades what it read against the fixture **in its own number
+domain** and commands the marks back into the device, and a `*_verdict` block
+in `src/root.zig` asserts on them against constants recomputed from the
+fixture.
+
+That split is not decoration. Before it, the live Modbus test asserted only
 `delivered > 0`/`replied > 0`, and a device with a byte-swapped register
 encoder — every value wrong — **passed it**; only the shell gate went red. With
-the verdict block the same mutation fails the live test itself. See
-[SPEC.md](./SPEC.md)'s "What was verified live" for the measurement.
+the verdict block the same mutation fails the live test itself, and each of the
+four masters added afterwards was held to the same bar: a wrong value injected
+into its adapter must turn *the test* red. See [SPEC.md](./SPEC.md)'s "What was
+verified live" for the measurements.
 
-Only Modbus is wired up so far. Adding the next master is two edits that must
-happen together — its pinned spec in `scripts/vm/manifest.sh`'s
-`VM_DEBIAN_PIP`, and its test in `run.sh`'s `guest_default_filter` (which takes
-a list; `--test-filter` is repeatable and a union) — plus a guest-side driver
-script alongside `scripts/vm/guests/fleetsim-modbus-master.py`. Budget for a
-verdict channel too: a master that only reads leaves no trace of what it
-understood, so each protocol needs some writable point the master can command
-its marks into.
+**Never a plain echo.** Every mark is a sum, a bitmap, a checksum, a scaled
+integer or an error code the counterpart itself named — never the decoded value
+handed straight back. An echo is the inverse of the read, so a device whose
+encoder and decoder share the same wrong convention round-trips it cleanly and
+the fault hides inside the mark. OPC UA is where that bites hardest (Int32 in,
+Int32 out), which is why its value mark folds a Double-derived term in.
 
-What that run produced is frozen in `src/master_goldens.zig` and replays
+Two masters are still not wired: **opendnp3** publishes no wheel (it is a C++
+library with a `master-demo` example that has to be built), and **c104** is
+blocked on a conformance defect in `modules/iec104` — see SPEC.md. Adding one
+is four edits that must happen together, all listed in `run.sh`'s fleetsim
+master table: the pinned spec in `scripts/vm/manifest.sh`'s `VM_DEBIAN_PIP`, a
+row in that table (which drives the launcher, the marker gate and the test
+filter at once), a driver script in `scripts/vm/guests/`, and a verdict channel
+in the live test. A master that only reads leaves no trace of what it
+understood.
+
+What those runs produced is frozen in `src/master_goldens.zig` and replays
 offline on every build, so the ordinary `zig build test-fleetsim` carries the
-third-party evidence even with no VM in sight — including the two verdict
+third-party evidence even with no VM in sight — including the verdict
 exchanges, whose request bytes are a function of what the device said.
 
 ### Installing the masters on a host, instead

@@ -203,12 +203,14 @@ Proved, not asserted, by three tests:
 >    replace a real master's state machine; it does mean a green
 >    `test-fleetsim` is no longer entirely self-anchored.
 > 3. **`scripts/vm/run.sh fleetsim debian`** — the live lane, actually run, in a
->    disposable VM with a real pymodbus 3.14.0 installed by the provisioning
->    recipe. Its recorded session is frozen in **`src/master_goldens.zig`** and
->    replays offline on every build. So for Modbus specifically, the transcript
->    below is no longer only prose: it is a committed set of byte-exact
->    exchanges that a third party's encoder composed and its decoder accepted.
->    The other six masters are still prose.
+>    disposable VM with **five** real masters installed by the provisioning
+>    recipe: pymodbus 3.14.0, pycomm3 1.2.16, bacpypes3 0.0.106, python-snap7
+>    3.1.0 and asyncua 2.0.1. Their recorded sessions are frozen in
+>    **`src/master_goldens.zig`** and replay offline on every build. So for
+>    those five, the transcripts below are no longer only prose: they are
+>    committed, byte-exact exchanges that a third party's encoder composed and
+>    its decoder accepted. DNP3 (opendnp3) and IEC 104 (c104) are still prose —
+>    see "Not wired into the VM lane" below.
 >
 > **The caution the VM lane produced — and what was done about it.**
 > A live master is not automatically an anchor. `test "live: a real Modbus
@@ -245,11 +247,60 @@ Proved, not asserted, by three tests:
 > `run.sh` exit 1. The same marks are frozen into `src/master_goldens.zig`, so
 > the offline suite carries the grading too.
 >
-> **The other six live tests still have the old shape** — each ends in
-> `replied > 0`-class checks — so installing the remaining six masters would not
-> by itself close this. Each needs a counterpart that grades and a verdict
-> channel of its own; the value of the live lane is in the counterpart's
-> assertions, not in the counterpart's presence.
+> **Four more masters were then held to exactly that bar**, each with a verdict
+> channel of its own, because the value of the live lane is in the counterpart's
+> assertions and not in the counterpart's presence:
+>
+> | protocol | counterpart | write-back channel | marks |
+> |----------|-------------|--------------------|-------|
+> | EtherNet/IP | pycomm3 1.2.16 | CIP `Write Tag` 0x4D into `Verdict` DINT[8] + `VerdictPass` | magic, checks, failures, sum of a six-element DINT array, a REAL scaled x10, a checksum of the `ListIdentity` product name, the CIP general status it named for an unserved tag, and the sum of a three-element slice starting at element 2 (which grades array-element addressing) |
+> | BACnet | bacpypes3 0.0.106 | `WriteProperty` into `analog-value,1..8` + `binary-value,1` | magic, checks, failures, present-value x10, an object-name checksum, the four status flags packed from what it unpacked *by name*, the device instance learned from an `I-Am`, and the error code it named for a missing property |
+> | S7comm | python-snap7 3.1.0 | a DB write into DB2 | magic, checks, failures, the sum of DB1[16..47], a REAL x10, `DINT - INT` from a typed record, the two *different* S7 return codes it named for an unbound DB (0x0A) and a read past the end of a bound one (0x05), and the PDU length the device chose |
+> | OPC UA | asyncua 2.0.1 | the `Write` service into `ns=1;s=verdict.0..7` + `verdict.pass` | magic, checks, failures, the Int32 measurement **plus** the Double setpoint x10, a decoded String checksum, the numeric `StatusCode` it named for an unknown node, a checksum of namespace 1's URI read from the server's own `NamespaceArray`, and DataType x100 + AccessLevel |
+>
+> **Never a plain echo, and OPC UA is why that rule is not pedantry.** An
+> Int32 read followed by an Int32 write of the same number is precisely the
+> round trip a server whose integer codec is byte-swapped in *both* directions
+> survives untouched. Every numeric mark above is therefore a sum, a
+> difference, a bitmap, a checksum, a scaled integer or a status code the
+> counterpart itself named — a form a symmetric codec fault moves instead of
+> cancelling inside.
+>
+> **Each was measured, not asserted.** For every one of the four, a wrong value
+> was injected into that protocol's adapter and the run repeated; the exit
+> codes are in "Mutation proofs" below. A master that connects but whose test
+> survives a wrong value is not an anchor, and landing one would repeat exactly
+> the defect this section is about.
+>
+> **Mutation proofs — one wrong value per adapter, measured, not asserted.**
+> Each was injected on a clean tree, the offline suite and that master's live
+> lane were run, and the file was reverted and `cmp`-checked byte-identical
+> (`git diff --stat` empty in all four cases). What matters in the last column
+> is that the master's presence marker still printed: the run went red because
+> **the test** rejected the marks, not because a shell `grep` missed a marker.
+>
+> | master | mutation | offline `test-fleetsim` | live lane |
+> |--------|----------|-------------------------|-----------|
+> | pycomm3 | `modules/enip/src/adapter.zig` `pathElement` → always 0 (array member segment ignored) | **exit 1** — the frozen pycomm3 corpus bites | `ENIP_MASTER_DONE` present, `live: a real EtherNet/IP master … FAIL (TestExpectedEqual)`, `expected 0, found 1`, `1 passed; 0 skipped; 1 failed`, **`GUEST_EXIT=1`, `run.sh` exit 1** |
+> | bacpypes3 | `modules/bacnet/src/tag.zig` `appReal` `.big` → `.little` | **exit 1** — the frozen bacpypes3 corpus bites | `BACNET_MASTER_DONE` present, `live: a real BACnet client … FAIL (TestExpectedEqual)`, `expected 0, found 1`, **`GUEST_EXIT=1`, `run.sh` exit 1** |
+> | python-snap7 | `modules/s7comm/src/items.zig` `byteOffset` `>> 3` → `>> 2` | **exit 1** — the frozen python-snap7 corpus bites | `S7_MASTER_DONE` present, `live: a real S7 client … FAIL (TestExpectedEqual)`, **`expected 1008, found 1520`** — i.e. the client summed a different window, **`GUEST_EXIT=1`, `run.sh` exit 1** |
+> | asyncua | `modules/opcua/src/encoding.zig` `encodeDouble` `.little` → `.big` | **exit 0, and that is expected** — there is no frozen OPC UA corpus to bite (see above) | `OPCUA_MASTER_DONE` present, `live: a real OPC UA client … FAIL (TestExpectedEqual)`, `expected 0, found 1`, **`GUEST_EXIT=1`, `run.sh` exit 1** |
+>
+> The S7 line is the most legible of the four: the mark is a *sum over a byte
+> window*, so a halved address shift moves it from 1008 to 1520 and the failure
+> message names both numbers. The other three report through the failure count
+> the master itself wrote (`expected 0, found 1`) — the master graded, disagreed,
+> and said so in-band.
+
+> **Not wired into the VM lane, deliberately.** *opendnp3* publishes no wheel —
+> it is a C++ library whose `master-demo` has to be built, which is a different
+> kind of provisioning step. *c104* installs from a wheel fine, but the IEC 104
+> lane was built once and **rolled back**: the link would not stay up in a
+> two-master run, and the instability traces to a conformance defect in
+> `modules/iec104` (its outstation confirms a global-common-address
+> interrogation by echoing 0xFFFF back instead of identifying itself with its
+> own CA 47). A half-wired lane that fails by default is worse than an absent
+> one.
 
 **All seven protocols now have third-party-master evidence through the adapter
 and the module's own binding**, on Linux, Debug build. Each run schedules a
@@ -594,6 +645,20 @@ and the multi-connection binding. What is still open:
   run as black-box compatibility oracles only, which CONVENTIONS §5 explicitly
   says needs no entry. (`opendnp3` already has a NOTICE entry from the `dnp3`
   module's own interop work; nothing new is owed.)
+
+  **The licences were checked rather than assumed**, because four of the five
+  masters now baked into the VM image also have their sessions *frozen* into
+  `src/master_goldens.zig`. pymodbus is BSD-3-Clause; pycomm3, bacpypes3 and
+  python-snap7 are MIT; **asyncua is LGPL-3.0-or-later** and is the only one
+  that would have needed thought. It did not need much: asyncua is run as a
+  separate process inside a disposable guest, nothing from it is copied,
+  translated, linked or redistributed, and — as it happens — nothing of its
+  session is frozen either, because an OPC UA session is not byte-replayable
+  (see `master_goldens.zig`). What *is* frozen for the other four is the byte
+  output of two programs exchanging messages defined by public specifications
+  (MODBUS Application Protocol, ODVA CIP Vol 1/2, ASHRAE 135, the published S7
+  frame layouts), plus what each master reported it decoded. That statement is
+  true of what was actually done.
 - **`modules/dnp3` gained one additive public function**
   (`outstation.Session.unsolicitedFrames`) plus its test and doc updates. The
   existing public API is unchanged and source-compatible.

@@ -1165,10 +1165,22 @@ test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
 
     var db1 = [_]u8{0} ** 64;
     for (&db1, 0..) |*b, i| b.* = @intCast(i);
-    var db2 = [_]u8{0} ** 32;
+    // DB2 is the verdict channel — see `s7_verdict`. Sized for its ten
+    // big-endian u32 marks and nothing else, so a client that wrote past the
+    // block is refused rather than quietly scribbling into a neighbour.
+    var db2 = [_]u8{0} ** (4 * s7_verdict.slots);
+    // DB3 is a fixed typed record the client decodes with its OWN accessors:
+    // a REAL, an INT and a DINT, all big-endian per the S7 process image. It
+    // exists because DB1 is bytes — a byte sum grades framing but not typed
+    // decoding, and a sine drives DB1.DBD8 so DB1 cannot be summed whole.
+    var db3 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, db3[0..4], @bitCast(s7_verdict.real_value), .big);
+    std.mem.writeInt(i16, db3[4..6], s7_verdict.int_value, .big);
+    std.mem.writeInt(i32, db3[6..10], s7_verdict.dint_value, .big);
     const areas = [_]s7comm.AreaBinding{
         .{ .area = .db, .db_number = 1, .bytes = &db1 },
         .{ .area = .db, .db_number = 2, .bytes = &db2 },
+        .{ .area = .db, .db_number = 3, .bytes = &db3 },
     };
     var plc = S7Node.init(.{}, &areas);
     const id = try f.addNode(.{ .node = plc.node(), .tag = 3 });
@@ -1209,7 +1221,92 @@ test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
     try testing.expect(st.delivered > 0);
     try testing.expect(st.replied > 0);
     try testing.expectEqual(s7comm.CpuStatus.stop, plc.responder.config.cpu_status);
+    // …and the part that grades what the client DECODED. See `s7_verdict`.
+    try s7_verdict.expectAllPassed(&db2, plc.responder.pdu_length);
 }
+
+/// The contract between `scripts/vm/guests/fleetsim-s7-master.py` and the live
+/// S7comm test.
+///
+/// **The write-back channel S7 offers.** A DB write. DB2 exists for nothing
+/// else: the client commands ten big-endian `u32` marks into it, the last of
+/// them in a separate write issued unconditionally.
+///
+/// **Why these marks and not an echo.** A byte-range sum over DB1 grades the
+/// read's framing and offset without echoing anything; a REAL scaled to a
+/// tenth-integer and a `DINT - INT` difference grade typed big-endian decoding
+/// (and the difference cannot be produced by echoing either operand); the two
+/// S7 return codes grade that the device distinguishes "no such block" from
+/// "address out of range" — a device that collapsed them into one answer would
+/// still satisfy any single-error test.
+const s7_verdict = struct {
+    const slots = 10;
+
+    /// DB3's typed record, kept here so the expectations are derived once.
+    const real_value: f32 = 21.5;
+    const int_value: i16 = -1234;
+    const dint_value: i32 = 100_000;
+    /// The DB1 window the client sums. Deliberately starts at 16: a sine
+    /// drives DB1.DBD8, so bytes 8..11 are not freezable.
+    const db1_from = 16;
+    const db1_len = 32;
+
+    const magic: u32 = 0x0000_F157;
+    /// Includes the recorded COTP/setup-communication exchange.
+    const graded_checks: u32 = 8;
+    /// S7 data-section return codes, as python-snap7's own `S7_RETURN_CODES`
+    /// table names them: `0x0A Object does not exist` for a DB that is not
+    /// bound, `0x05 Invalid address` for a read that runs past one that is.
+    const no_such_block: u32 = 0x0A;
+    const invalid_address: u32 = 0x05;
+
+    fn db1Sum() u32 {
+        var s: u32 = 0;
+        for (db1_from..db1_from + db1_len) |i| s += @intCast(i);
+        return s;
+    }
+
+    fn slot(db: []const u8, i: usize) u32 {
+        return std.mem.readInt(u32, db[i * 4 ..][0..4], .big);
+    }
+
+    fn expectAllPassed(db2: []const u8, pdu_length: u16) !void {
+        if (slot(db2, 0) != magic) {
+            std.debug.print(
+                "live fleetsim S7comm: no verdict block (DB2.DBD0=0x{X:0>8}, want 0x{X:0>8}) —" ++
+                    " the client never wrote its marks, so nothing here graded the device\n",
+                .{ slot(db2, 0), magic },
+            );
+            return error.NoMasterVerdict;
+        }
+        std.debug.print(
+            "live fleetsim S7comm verdict: checks={d} failures={d} db1_sum={d} real_x10={d}" ++
+                " dint_minus_int={d} no_such_block={d} invalid_address={d} pdu={d} pass={d}\n",
+            .{
+                slot(db2, 1), slot(db2, 2), slot(db2, 3), slot(db2, 4),
+                slot(db2, 5), slot(db2, 6), slot(db2, 7), slot(db2, 8),
+                slot(db2, 9),
+            },
+        );
+        try testing.expectEqual(graded_checks, slot(db2, 1));
+        try testing.expectEqual(@as(u32, 0), slot(db2, 2));
+        try testing.expectEqual(db1Sum(), slot(db2, 3));
+        try testing.expectEqual(@as(u32, @intFromFloat(@round(real_value * 10))), slot(db2, 4));
+        try testing.expectEqual(
+            @as(u32, @intCast(dint_value - @as(i32, int_value))),
+            slot(db2, 5),
+        );
+        try testing.expectEqual(no_such_block, slot(db2, 6));
+        try testing.expectEqual(invalid_address, slot(db2, 7));
+        // The PDU length is the DEVICE's choice, learned by the client during
+        // the S7 setup-communication negotiation — so this grades the
+        // negotiation, not a data read.
+        try testing.expectEqual(@as(u32, pdu_length), slot(db2, 8));
+        // Written last and written either way: 0 is a real client saying, over
+        // the wire, that it was here and is not satisfied.
+        try testing.expectEqual(@as(u32, 1), slot(db2, 9));
+    }
+};
 
 test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFailure" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
@@ -1269,7 +1366,106 @@ test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFa
         @as(?opcua.encoding.StatusCode, OpcuaNode.status_bad_device_failure),
         fx.measurementStatus(),
     );
+    // …and the part that grades what the client DECODED. See `opcua_verdict`.
+    try opcua_verdict.expectAllPassed(&fx);
 }
+
+/// The contract between `scripts/vm/guests/fleetsim-opcua-master.py` and the
+/// live OPC UA test.
+///
+/// **The write-back channel OPC UA offers.** The `Write` service on a Variable
+/// whose `AccessLevel` includes `CurrentWrite`. The address space therefore
+/// carries eight writable `Int32` nodes and one writable `Boolean`, all under
+/// string NodeIds in namespace 1 — so the client has to encode the identifier
+/// as well as address the node.
+///
+/// **Why these marks and not an echo.** This one matters more here than
+/// anywhere else in this module: an Int32 read followed by an Int32 write is
+/// *exactly* the shape that a server whose integer codec is wrong in both
+/// directions round-trips cleanly. Every numeric mark is therefore a
+/// combination — the Int32 measurement plus the scaled Double setpoint, a
+/// checksum over a decoded String, the numeric `StatusCode` the client named
+/// for an unknown node, the DataType and AccessLevel attributes folded into
+/// one number — so a symmetric codec fault moves the mark instead of
+/// cancelling inside it.
+const opcua_verdict = struct {
+    const slots = 8;
+    const slot_ids = [slots][]const u8{
+        "verdict.0", "verdict.1", "verdict.2", "verdict.3",
+        "verdict.4", "verdict.5", "verdict.6", "verdict.7",
+    };
+
+    /// The fixture, kept here so the expectations are derived once.
+    const measurement_value: i32 = 42;
+    const setpoint: f64 = 21.5;
+    const label = "zig-fleetsim";
+    const ns_uri = "urn:zig-libs:fleetsim";
+
+    const magic: i32 = 0x0000_F10C;
+    /// Includes the recorded session bring-up.
+    const graded_checks: i32 = 7;
+    /// OPC 10000-4 Table 178 `Bad_NodeIdUnknown` = 0x8034_0000, which is what
+    /// this server answers for a node it does not have and what asyncua
+    /// *named* it. Stored as the two's-complement `Int32` an OPC UA client
+    /// writes when it puts a StatusCode into an Int32 node.
+    const bad_node_id_unknown: i32 = @bitCast(@as(u32, 0x8034_0000));
+    /// `Int32`'s numeric NodeId in namespace 0, times 100, plus the
+    /// measurement's AccessLevel (`CurrentRead | CurrentWrite` = 3). One mark
+    /// over two attributes, so neither can be right by accident.
+    const datatype_and_access: i32 = 6 * 100 + 3;
+
+    fn checksum(s: []const u8) i32 {
+        var t: i32 = 0;
+        for (s) |c| t += c;
+        return t;
+    }
+
+    fn expectAllPassed(fx: *OpcuaFixture) !void {
+        const got0 = fx.verdictSlot(0) orelse {
+            std.debug.print(
+                "live fleetsim OPC UA: verdict.0 is not an Int32 — the address space is wrong\n",
+                .{},
+            );
+            return error.NoMasterVerdict;
+        };
+        if (got0 != magic) {
+            // Printed through `u32` because the slot is a SIGNED Int32 — a
+            // client writing a StatusCode into one of these makes negative
+            // values ordinary, and `{X}` on a negative signed integer prints a
+            // sign, not a word.
+            std.debug.print(
+                "live fleetsim OPC UA: no verdict block (verdict.0=0x{X:0>8}, want 0x{X:0>8}) —" ++
+                    " the client never wrote its marks, so nothing here graded the server\n",
+                .{ @as(u32, @bitCast(got0)), @as(u32, @bitCast(magic)) },
+            );
+            return error.NoMasterVerdict;
+        }
+        std.debug.print(
+            "live fleetsim OPC UA verdict: checks={?d} failures={?d} value_plus_setpoint={?d}" ++
+                " label_checksum={?d} bad_node_status=0x{X:0>8} ns_uri_checksum={?d}" ++
+                " datatype_access={?d} pass={?}\n",
+            .{
+                fx.verdictSlot(1),                       fx.verdictSlot(2),
+                fx.verdictSlot(3),                       fx.verdictSlot(4),
+                @as(u32, @bitCast(fx.verdictSlot(5).?)), fx.verdictSlot(6),
+                fx.verdictSlot(7),                       fx.verdictPass(),
+            },
+        );
+        try testing.expectEqual(@as(?i32, graded_checks), fx.verdictSlot(1));
+        try testing.expectEqual(@as(?i32, 0), fx.verdictSlot(2));
+        try testing.expectEqual(
+            @as(?i32, measurement_value + @as(i32, @intFromFloat(@round(setpoint * 10)))),
+            fx.verdictSlot(3),
+        );
+        try testing.expectEqual(@as(?i32, checksum(label)), fx.verdictSlot(4));
+        try testing.expectEqual(@as(?i32, bad_node_id_unknown), fx.verdictSlot(5));
+        try testing.expectEqual(@as(?i32, checksum(ns_uri)), fx.verdictSlot(6));
+        try testing.expectEqual(@as(?i32, datatype_and_access), fx.verdictSlot(7));
+        // Written last and written either way: `false` is a real client saying,
+        // over the wire, that it was here and is not satisfied.
+        try testing.expectEqual(@as(?bool, true), fx.verdictPass());
+    }
+};
 
 test "live: two real masters, two nodes, one binding thread" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
@@ -1501,9 +1697,27 @@ test "live: a real EtherNet/IP master drives a simulated adapter" {
     var speed = [_]u8{0} ** 4;
     var level = [_]u8{0} ** 4;
     std.mem.writeInt(i32, speed[0..4], 1500, .little);
+    // `Counts` is a DINT array with six deliberately unequal elements, and
+    // `Setpoint` a fixed REAL. Neither is driven by a signal, so both are
+    // freezable — and both exist so the master has something to *sum* and
+    // something to *scale*, rather than something to echo. See `enip_verdict`.
+    var counts = [_]u8{0} ** (4 * enip_verdict.counts.len);
+    for (enip_verdict.counts, 0..) |v, i| {
+        std.mem.writeInt(i32, counts[i * 4 ..][0..4], v, .little);
+    }
+    var setpoint = [_]u8{0} ** 4;
+    std.mem.writeInt(u32, setpoint[0..4], @bitCast(enip_verdict.setpoint), .little);
+    // The verdict channel: an eight-element DINT array the master writes its
+    // marks into, and a separate DINT it writes its pass mark into.
+    var verdict = [_]u8{0} ** (4 * enip_verdict.slots);
+    var verdict_pass = [_]u8{0} ** 4;
     const tags = [_]enip.TagBinding{
         .{ .name = "Speed", .type = .dint, .bytes = &speed },
         .{ .name = "Level", .type = .real, .bytes = &level },
+        .{ .name = "Counts", .type = .dint, .bytes = &counts },
+        .{ .name = "Setpoint", .type = .real, .bytes = &setpoint },
+        .{ .name = "Verdict", .type = .dint, .bytes = &verdict },
+        .{ .name = "VerdictPass", .type = .dint, .bytes = &verdict_pass },
     };
     var dev = EnipNode.init(.{ .product_name = "zig-fleetsim adapter" }, &tags);
     const id = try f.addNode(.{ .node = dev.node() });
@@ -1546,7 +1760,108 @@ test "live: a real EtherNet/IP master drives a simulated adapter" {
     try testing.expect(f.stats(id).replied > 0);
     // The scheduled fault landed: the Identity status word says major fault.
     try testing.expect(dev.adapter.cfg.identity_status != 0x0030);
+    // …and the part that grades what the master DECODED. See `enip_verdict`.
+    try enip_verdict.expectAllPassed(&verdict, &verdict_pass);
 }
+
+/// The contract between `scripts/vm/guests/fleetsim-enip-master.py` and the
+/// live EtherNet/IP test — the same shape as `modbus_verdict`, for the same
+/// reason: `replied > 0` is liveness, not interop.
+///
+/// **The write-back channel this protocol offers.** CIP `Write Tag` (0x4D) by
+/// symbolic name. The master commands its marks into a `Verdict` DINT[8] and a
+/// separate `VerdictPass` DINT, both of which are ordinary tags this adapter
+/// serves — so the marks are device state the test reads directly.
+///
+/// **Why these marks and not an echo.** Every one of them is a number pycomm3
+/// computed *from* what it decoded, never the decoded bytes handed back: the
+/// sum of a six-element DINT array, the sum of a three-element slice of that
+/// same array starting at element 2 (which grades array-element addressing),
+/// a REAL scaled to a tenth-integer (which grades float32 decoding without
+/// letting a symmetric encoding error cancel), a checksum of the ASCII product
+/// name it read out of `ListIdentity`, and the CIP general status *it* named
+/// for a tag the device does not have. A device that encoded and decoded with
+/// the same wrong convention would round-trip an echo cleanly; it cannot reach
+/// these numbers.
+const enip_verdict = struct {
+    /// The `Counts` DINT array's contents. Deliberately unequal and spread
+    /// across byte boundaries so a truncation or a swap moves the sum.
+    const counts = [_]i32{ 7, 140, 3300, 41_000, 555, 66 };
+    /// The `Setpoint` REAL. 21.5 is exactly representable, so the scaled mark
+    /// is exact and a mismatch means a decode fault, not a rounding one.
+    const setpoint: f32 = 21.5;
+    /// The device's `product_name`, which `ListIdentity` reports and pycomm3
+    /// decodes as a SHORT_STRING. Kept here so the checksum below is derived
+    /// rather than restated.
+    const product_name = "zig-fleetsim adapter";
+    /// How many DINTs the `Verdict` tag holds.
+    const slots = 8;
+
+    /// "A real master was here." Absent ⇒ nothing wrote the block at all,
+    /// which is a broken lane rather than a broken device.
+    const magic: i32 = 0x0000_F1E9;
+    /// Operations the master grades before writing the block — the session
+    /// bring-up counts, because it is recorded too (the frozen corpus has to
+    /// replay from the adapter's initial state). Pinned exactly: a script that
+    /// died halfway would otherwise report a clean pass over the prefix it
+    /// managed.
+    const graded_checks: i32 = 7;
+    /// CIP Vol 1 §B-1.1 `0x05 Path destination unknown` — what this adapter
+    /// answers for a tag it does not serve, and what pycomm3 *named* it.
+    const missing_tag_status: i32 = 0x05;
+
+    fn countsSum() i32 {
+        var s: i32 = 0;
+        for (counts) |v| s += v;
+        return s;
+    }
+
+    fn countsSliceSum() i32 {
+        var s: i32 = 0;
+        for (counts[2..5]) |v| s += v;
+        return s;
+    }
+
+    fn nameChecksum() i32 {
+        var s: i32 = 0;
+        for (product_name) |c| s += c;
+        return s;
+    }
+
+    fn slot(bytes: []const u8, i: usize) i32 {
+        return std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
+    }
+
+    fn expectAllPassed(verdict: []const u8, verdict_pass: []const u8) !void {
+        if (slot(verdict, 0) != magic) {
+            std.debug.print(
+                "live fleetsim EtherNet/IP: no verdict block (Verdict[0]=0x{X:0>8}, want 0x{X:0>8}) —" ++
+                    " the master never wrote its marks, so nothing here graded the device\n",
+                .{ slot(verdict, 0), magic },
+            );
+            return error.NoMasterVerdict;
+        }
+        std.debug.print(
+            "live fleetsim EtherNet/IP verdict: checks={d} failures={d} counts_sum={d}" ++
+                " setpoint_x10={d} name_checksum={d} missing_tag_status={d} slice_sum={d} pass={d}\n",
+            .{
+                slot(verdict, 1), slot(verdict, 2),      slot(verdict, 3),
+                slot(verdict, 4), slot(verdict, 5),      slot(verdict, 6),
+                slot(verdict, 7), slot(verdict_pass, 0),
+            },
+        );
+        try testing.expectEqual(graded_checks, slot(verdict, 1));
+        try testing.expectEqual(@as(i32, 0), slot(verdict, 2));
+        try testing.expectEqual(countsSum(), slot(verdict, 3));
+        try testing.expectEqual(@as(i32, @intFromFloat(@round(setpoint * 10))), slot(verdict, 4));
+        try testing.expectEqual(nameChecksum(), slot(verdict, 5));
+        try testing.expectEqual(missing_tag_status, slot(verdict, 6));
+        try testing.expectEqual(countsSliceSum(), slot(verdict, 7));
+        // Written in both outcomes: 0 is a real master saying, over the wire,
+        // that it was here and is not satisfied.
+        try testing.expectEqual(@as(i32, 1), slot(verdict_pass, 0));
+    }
+};
 
 test "live: a real BACnet client discovers a simulated device over UDP" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
@@ -1564,10 +1879,15 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
 
     // Clause 12's fault triple, so `trouble` has something real to move and a
     // client has something real to read.
-    const healthy_flags = [_]u8{0x00};
+    //
+    // `status_flags` is deliberately NOT all-clear: bit 2 (`overridden`) is set
+    // so the bitmap the client unpacks is a number that can be wrong in both
+    // directions. An all-zero bit string is decoded identically by a client
+    // that reads the bit order backwards, which makes it useless as a mark.
+    const healthy_flags = [_]u8{bacnet_verdict.status_flags_byte};
     var ai_props = [_]bacnet.Property{
-        .{ .id = .object_name, .value = .{ .string = "Zone-1-Temp" } },
-        .{ .id = .present_value, .value = .{ .real = 21.5 }, .cov_reported = true },
+        .{ .id = .object_name, .value = .{ .string = bacnet_verdict.ai_name } },
+        .{ .id = .present_value, .value = .{ .real = bacnet_verdict.present_value }, .cov_reported = true },
         .{ .id = .units, .value = .{ .enumerated = 62 } },
         .{ .id = .status_flags, .value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &healthy_flags } }, .cov_reported = true },
         .{ .id = .reliability, .value = .{ .enumerated = 0 } },
@@ -1577,9 +1897,30 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
         .{ .id = .object_name, .value = .{ .string = "zig-fleetsim device" } },
         .{ .id = .vendor_name, .value = .{ .string = "zig-libs" } },
     };
-    var objects = [_]bacnet.Object{
-        .{ .id = .{ .type = .analog_input, .instance = 1 }, .properties = &ai_props },
-        .{ .id = .{ .type = .device, .instance = 260_001 }, .properties = &dev_props },
+    // The verdict channel: one analog-value object per mark, whose
+    // `present_value` is writable, plus a binary-value carrying the pass mark.
+    // BACnet has no "write eight numbers at once" service that a plain client
+    // reaches for, so the marks are eight objects rather than one array — and
+    // a REAL holds every integer below 2^24 exactly, so nothing here rounds.
+    var verdict_props: [bacnet_verdict.slots][1]bacnet.Property = undefined;
+    var pass_props = [_]bacnet.Property{
+        .{ .id = .present_value, .value = .{ .enumerated = 0 }, .writable = true },
+    };
+    var objects: [bacnet_verdict.slots + 3]bacnet.Object = undefined;
+    objects[0] = .{ .id = .{ .type = .analog_input, .instance = 1 }, .properties = &ai_props };
+    objects[1] = .{ .id = .{ .type = .device, .instance = 260_001 }, .properties = &dev_props };
+    for (0..bacnet_verdict.slots) |i| {
+        verdict_props[i] = .{
+            .{ .id = .present_value, .value = .{ .real = 0 }, .writable = true },
+        };
+        objects[2 + i] = .{
+            .id = .{ .type = .analog_value, .instance = @intCast(bacnet_verdict.first_instance + i) },
+            .properties = &verdict_props[i],
+        };
+    }
+    objects[2 + bacnet_verdict.slots] = .{
+        .id = .{ .type = .binary_value, .instance = bacnet_verdict.pass_instance },
+        .properties = &pass_props,
     };
     var dev: BacnetNode = undefined;
     dev.init(
@@ -1622,7 +1963,103 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
     // The scheduled fault landed on the object model a client reads.
     try testing.expectEqual(@as(u32, 7), ai.find(.reliability).?.value.enumerated);
     try testing.expect(ai.find(.out_of_service).?.value.boolean);
+    // …and the part that grades what the client DECODED. See `bacnet_verdict`.
+    try bacnet_verdict.expectAllPassed(objects[2..], &pass_props);
 }
+
+/// The contract between `scripts/vm/guests/fleetsim-bacnet-master.py` and the
+/// live BACnet test.
+///
+/// **The write-back channel BACnet offers.** `WriteProperty` (Clause 15.9) on
+/// a property whose `writable` flag is set. The device therefore carries eight
+/// `analog-value` objects whose `present_value` is writable — one per mark —
+/// and a `binary-value` for the pass mark. Eight objects rather than one
+/// array property because that is what a stock client writes without being
+/// told about array indices, and because a wrong object instance then lands on
+/// a wrong slot instead of silently overwriting a neighbour.
+///
+/// **Why these marks and not an echo.** The present value is scaled to a
+/// tenth-integer, the object name becomes a checksum, the status flags become
+/// a bitmap the *client* packed from the bits it unpacked, and the device
+/// instance is the one the client learned from an `I-Am` rather than the one
+/// it was told to ask. Each is a number computed from a decode, so a device
+/// that mis-encoded and a client that mis-decoded cannot cancel.
+const bacnet_verdict = struct {
+    /// `analog-value` instances 1..8 carry the marks; `binary-value` 1 the pass
+    /// mark.
+    const slots = 8;
+    const first_instance = 1;
+    const pass_instance = 1;
+
+    /// The fixture, kept here so the expectations below are derived from one
+    /// place rather than restated in two.
+    const ai_name = "Zone-1-Temp";
+    const present_value: f32 = 21.5;
+    /// `overridden` (bit 2 of Clause 12's four-bit BACnetStatusFlags), with the
+    /// four unused bits zero. A bit string whose only content is zeroes cannot
+    /// grade a bit order.
+    const status_flags_byte: u8 = 0b0010_0000;
+    /// What the client packs from the four flags it unpacked, LSB-first:
+    /// in_alarm, fault, overridden, out_of_service.
+    const status_flags_bitmap: i64 = 1 << 2;
+    const device_instance: i64 = 260_001;
+    /// ASHRAE 135 Clause 18 `unknown-property` (error class `property`, code
+    /// 32) — what this device answers for a property it does not carry, and
+    /// what bacpypes3 *named* it.
+    const unknown_property_code: i64 = 32;
+
+    const magic: i64 = 61_882;
+    const graded_checks: i64 = 7;
+
+    fn nameChecksum() i64 {
+        var s: i64 = 0;
+        for (ai_name) |c| s += c;
+        return s;
+    }
+
+    /// Signed on purpose: the client writes `-1` into a slot whose mark it
+    /// could not compute, and a slot read as an unsigned integer would panic
+    /// on exactly the case worth seeing.
+    fn slot(objs: []const bacnet.Object, i: usize) i64 {
+        const v = objs[i].find(.present_value).?.value.real;
+        return @intFromFloat(@round(v));
+    }
+
+    fn expectAllPassed(verdict_objs: []const bacnet.Object, pass: []const bacnet.Property) !void {
+        if (slot(verdict_objs, 0) != magic) {
+            std.debug.print(
+                "live fleetsim BACnet: no verdict block (analog-value,{d} present_value={d}," ++
+                    " want {d}) — the client never wrote its marks, so nothing here graded" ++
+                    " the device\n",
+                .{ first_instance, slot(verdict_objs, 0), magic },
+            );
+            return error.NoMasterVerdict;
+        }
+        std.debug.print(
+            "live fleetsim BACnet verdict: checks={d} failures={d} pv_x10={d} name_checksum={d}" ++
+                " status_bitmap={d} device_instance={d} unknown_property={d} pass={d}\n",
+            .{
+                slot(verdict_objs, 1), slot(verdict_objs, 2),
+                slot(verdict_objs, 3), slot(verdict_objs, 4),
+                slot(verdict_objs, 5), slot(verdict_objs, 6),
+                slot(verdict_objs, 7), pass[0].value.enumerated,
+            },
+        );
+        try testing.expectEqual(graded_checks, slot(verdict_objs, 1));
+        try testing.expectEqual(@as(i64, 0), slot(verdict_objs, 2));
+        try testing.expectEqual(
+            @as(i64, @intFromFloat(@round(present_value * 10))),
+            slot(verdict_objs, 3),
+        );
+        try testing.expectEqual(nameChecksum(), slot(verdict_objs, 4));
+        try testing.expectEqual(status_flags_bitmap, slot(verdict_objs, 5));
+        try testing.expectEqual(device_instance, slot(verdict_objs, 6));
+        try testing.expectEqual(unknown_property_code, slot(verdict_objs, 7));
+        // Written in both outcomes: `inactive` is a real client saying, over
+        // the wire, that it was here and is not satisfied.
+        try testing.expectEqual(@as(u32, 1), pass[0].value.enumerated);
+    }
+};
 
 // ── OPC UA: a whole simulated server, offline and live ──────────────────────
 
@@ -1645,7 +2082,46 @@ const OpcuaFixture = struct {
     /// `trouble` degrades.
     const measurement: opcua.encoding.NodeId =
         .{ .string = .{ .namespace = 1, .id = "the.measurement" } };
+    /// A Double and a String beside it, so the verdict marks are not all
+    /// derived from one built-in type.
+    const setpoint: opcua.encoding.NodeId =
+        .{ .string = .{ .namespace = 1, .id = "the.setpoint" } };
+    const label: opcua.encoding.NodeId =
+        .{ .string = .{ .namespace = 1, .id = "the.label" } };
+    const pass_node: opcua.encoding.NodeId =
+        .{ .string = .{ .namespace = 1, .id = "verdict.pass" } };
     const ns_uri = "urn:zig-libs:fleetsim";
+
+    /// The DataValue a client reads back for one verdict slot.
+    fn verdictSlot(self: *OpcuaFixture, i: usize) ?i32 {
+        const nid: opcua.encoding.NodeId =
+            .{ .string = .{ .namespace = 1, .id = opcua_verdict.slot_ids[i] } };
+        const n = self.store.getNode(nid) orelse return null;
+        return switch (n.attributes) {
+            .variable => |v| switch (v.value.value orelse return null) {
+                .scalar => |sc| switch (sc) {
+                    .int32 => |x| x,
+                    else => null,
+                },
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    fn verdictPass(self: *OpcuaFixture) ?bool {
+        const n = self.store.getNode(pass_node) orelse return null;
+        return switch (n.attributes) {
+            .variable => |v| switch (v.value.value orelse return null) {
+                .scalar => |sc| switch (sc) {
+                    .boolean => |b| b,
+                    else => null,
+                },
+                else => null,
+            },
+            else => null,
+        };
+    }
 
     fn init(self: *OpcuaFixture, gpa: std.mem.Allocator, endpoint_url: []const u8) !void {
         self.* = .{
@@ -1668,6 +2144,61 @@ const OpcuaFixture = struct {
             .display_name = .{ .locale = "en", .text = "the measurement" },
             .value = .{ .scalar = .{ .int32 = 42 } },
             .data_type = opcua.nodestore.n0(opcua.nodestore.id.int32),
+            .access_level = opcua.nodestore.access_level.read_write,
+            .timestamp = self.start_time,
+        });
+
+        // Two more typed process values, so a client has something to decode
+        // that is NOT an Int32 — a mark built only from Int32 reads could be
+        // cancelled by a byte order that is wrong on both the read and the
+        // write path. See `opcua_verdict`.
+        try self.store.addVariable(.{
+            .node_id = setpoint,
+            .parent_id = opcua.nodestore.n0(opcua.nodestore.id.objects_folder),
+            .reference_type_id = opcua.nodestore.n0(opcua.nodestore.id.organizes),
+            .browse_name = .{ .namespace_index = 1, .name = "the.setpoint" },
+            .display_name = .{ .locale = "en", .text = "the setpoint" },
+            .value = .{ .scalar = .{ .double = opcua_verdict.setpoint } },
+            .data_type = opcua.nodestore.n0(opcua.nodestore.id.double),
+            .access_level = opcua.nodestore.access_level.current_read,
+            .timestamp = self.start_time,
+        });
+        try self.store.addVariable(.{
+            .node_id = label,
+            .parent_id = opcua.nodestore.n0(opcua.nodestore.id.objects_folder),
+            .reference_type_id = opcua.nodestore.n0(opcua.nodestore.id.organizes),
+            .browse_name = .{ .namespace_index = 1, .name = "the.label" },
+            .display_name = .{ .locale = "en", .text = "the label" },
+            .value = .{ .scalar = .{ .string = opcua_verdict.label } },
+            .data_type = opcua.nodestore.n0(opcua.nodestore.id.string),
+            .access_level = opcua.nodestore.access_level.current_read,
+            .timestamp = self.start_time,
+        });
+
+        // The verdict channel: eight writable Int32 nodes and one writable
+        // Boolean. `ns=1;s=verdict.N` — a string NodeId, so the client has to
+        // encode the identifier as well as address the node.
+        for (0..opcua_verdict.slots) |i| {
+            try self.store.addVariable(.{
+                .node_id = .{ .string = .{ .namespace = 1, .id = opcua_verdict.slot_ids[i] } },
+                .parent_id = opcua.nodestore.n0(opcua.nodestore.id.objects_folder),
+                .reference_type_id = opcua.nodestore.n0(opcua.nodestore.id.organizes),
+                .browse_name = .{ .namespace_index = 1, .name = opcua_verdict.slot_ids[i] },
+                .display_name = .{ .locale = "en", .text = opcua_verdict.slot_ids[i] },
+                .value = .{ .scalar = .{ .int32 = 0 } },
+                .data_type = opcua.nodestore.n0(opcua.nodestore.id.int32),
+                .access_level = opcua.nodestore.access_level.read_write,
+                .timestamp = self.start_time,
+            });
+        }
+        try self.store.addVariable(.{
+            .node_id = pass_node,
+            .parent_id = opcua.nodestore.n0(opcua.nodestore.id.objects_folder),
+            .reference_type_id = opcua.nodestore.n0(opcua.nodestore.id.organizes),
+            .browse_name = .{ .namespace_index = 1, .name = "verdict.pass" },
+            .display_name = .{ .locale = "en", .text = "verdict pass" },
+            .value = .{ .scalar = .{ .boolean = false } },
+            .data_type = opcua.nodestore.n0(opcua.nodestore.id.boolean),
             .access_level = opcua.nodestore.access_level.read_write,
             .timestamp = self.start_time,
         });

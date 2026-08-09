@@ -219,9 +219,22 @@ VM_DEBIAN_PACKAGES=(
 # hash lie: the same recipe text would resolve to a different image on a
 # different day, which is exactly what the hash exists to prevent.
 VM_DEBIAN_PIP=(
-    # pymodbus 3.14.0 — the Modbus master `fleetsim`'s live Modbus test is
-    # written against (modules/fleetsim/README.md "Installing the masters").
+    # The five third-party SCADA masters `fleetsim`'s live tests are written
+    # against (modules/fleetsim/README.md "Installing the masters"). One image
+    # carries all of them, so one boot can drive every protocol in sequence.
     pymodbus==3.14.0
+    pycomm3==1.2.16
+    bacpypes3==0.0.106
+    # python-snap7 3.x is PURE PYTHON — 3.1.0 speaks TPKT/COTP/S7 over an
+    # ordinary socket and needs no libsnap7.so, so no apt package goes with it.
+    # Checked, not assumed: the wheel is `py3-none-any`, and the client
+    # connects and reads with no `lib_location` argument.
+    python-snap7==3.1.0
+    # asyncua is LGPL-3.0-or-later, unlike the MIT four above. It is used as a
+    # separate process in a disposable guest — nothing is linked against it and
+    # nothing from it is redistributed — which is the reasoning recorded in
+    # modules/fleetsim/NOTICE rather than only here.
+    asyncua==2.0.1
 )
 
 # ── what this image CANNOT provide, so nobody re-derives it ──────────────
