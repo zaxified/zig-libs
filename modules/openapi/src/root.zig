@@ -23,9 +23,10 @@
 //! - **`Endpoint`** — an *intercepting* `router.Middleware` (the
 //!   `metrics.Endpoint` pattern — `router.Handler` is a stateless fn
 //!   pointer, it cannot close over state) serving the generated document
-//!   on `GET /openapi.json` as `application/json`. The document is
-//!   generated per request from the live Router, so the endpoint can (and
-//!   must, chi's rule) be registered *before* the routes it documents.
+//!   on `GET /openapi.json` as `application/json`. The document is built
+//!   once, lazily, on the first request and cached thereafter (the Router
+//!   is immutable once serving), so the endpoint can (and must, chi's rule)
+//!   be registered *before* the routes it documents.
 //!   Optionally serves a tiny self-contained docs HTML page (`docs_path`)
 //!   — **no external assets**: Swagger-UI needs CDN JS/CSS, so instead a
 //!   minimal vanilla-JS viewer fetches the spec and lists the operations.
@@ -54,9 +55,11 @@ const http = @import("http");
 pub const meta = .{
     .platform = .any,
     .role = .util,
-    // Pure function of an immutable (post-build) Router — no shared state;
-    // the Endpoint generates per request on the dispatching thread.
-    .concurrency = .reentrant,
+    // `Generator.build` itself is a pure function of an immutable
+    // (post-build) Router — reentrant, no shared state. `Endpoint.spec`
+    // adds one piece of shared mutable state (the cache) behind a spinlock,
+    // so the middleware as a whole is `.threadsafe`, not `.reentrant`.
+    .concurrency = .threadsafe,
     .model_after = "FastAPI auto-docs (generated-spec shape) + utoipa (Rust) / OpenAPI 3.1 spec",
     .deps = .{ "router", "http" },
 };
@@ -289,14 +292,16 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Erro
 /// **self-contained** docs HTML page there (vanilla JS fetching the spec —
 /// deliberately not Swagger-UI, which would pull external JS/CSS).
 ///
-/// The document is generated per request from the live Router — register
-/// the middleware router-level *before* the routes (chi's rule); the spec
-/// still reflects everything registered by serve time. Generation is
-/// read-only over an immutable Router, so concurrent requests are safe.
+/// The document is generated **once**, lazily, on the first request that
+/// needs it — register the middleware router-level *before* the routes
+/// (chi's rule); the spec still reflects everything registered by the time
+/// the first request arrives. A built `router.Router` is immutable while
+/// serving (`router/SPEC.md` §Concurrency), so a document generated once
+/// stays correct for the Endpoint's whole lifetime — caching it removes the
+/// per-request re-walk-and-re-parse cost with no invalidation to get wrong.
 /// The Endpoint must outlive the Router, at a stable address.
 pub const Endpoint = struct {
-    /// Per-request generation scratch; must be thread-safe when the server
-    /// dispatches on multiple connection threads.
+    /// Generation scratch and the cache's owner.
     gpa: Allocator,
     router: *const router.Router,
     info: Info,
@@ -305,10 +310,35 @@ pub const Endpoint = struct {
     /// Optional docs-page path (e.g. "/docs"); null = no docs page.
     docs_path: ?[]const u8 = null,
 
+    /// The cached document, built on first access; `null` until then.
+    /// Guarded by `lock` — `spec()` may race across the server's
+    /// per-connection threads on the first request.
+    cached: ?[]const u8 = null,
+    lock: std.atomic.Mutex = .unlocked,
+
     pub fn middleware(e: *Endpoint) router.Middleware {
         return .{ .state = e, .run = endpointRun };
     }
+
+    /// Free the cached document, if one was ever built. Call when the
+    /// Endpoint is done serving.
+    pub fn deinit(e: *Endpoint) void {
+        if (e.cached) |c| e.gpa.free(c);
+        e.* = undefined;
+    }
+
+    /// The generated document, building it (once) on first use.
+    fn spec(e: *Endpoint) ![]const u8 {
+        lockSpin(&e.lock);
+        defer e.lock.unlock();
+        if (e.cached == null) e.cached = try Generator.build(e.gpa, e.router, e.info);
+        return e.cached.?;
+    }
 };
+
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
 
 fn endpointRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const e: *Endpoint = @ptrCast(@alignCast(state.?));
@@ -323,8 +353,7 @@ fn serveIntercepted(e: *Endpoint, ctx: *router.Ctx, what: enum { spec, docs }) a
     switch (ctx.req.method) {
         .get, .head => switch (what) {
             .spec => {
-                const json = try Generator.build(e.gpa, e.router, e.info);
-                defer e.gpa.free(json);
+                const json = try e.spec();
                 ctx.res.setStatus(200);
                 try ctx.res.setHeader("Content-Type", "application/json");
                 try ctx.res.writeAll(json);
@@ -867,8 +896,9 @@ test "endpoint: serves the spec, 405 on other methods, passthrough elsewhere" {
         .router = &r,
         .info = .{ .title = "Wired API", .version = "2.0" },
     };
-    // Middleware first (chi's rule) — the spec is generated per request,
-    // so it still sees the routes registered below.
+    defer e.deinit();
+    // Middleware first (chi's rule) — the spec is generated lazily on first
+    // request, so it still sees the routes registered below.
     try r.use(e.middleware());
     try r.get("/hello", hHello);
     try r.addDoc(.get, "/users/:id", hOk, .{ .summary = "Fetch" });
@@ -906,6 +936,34 @@ test "endpoint: serves the spec, 405 on other methods, passthrough elsewhere" {
     }
 }
 
+test "endpoint: the spec is built once and cached, not regenerated per request (F1)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var e: Endpoint = .{
+        .gpa = testing.allocator,
+        .router = &r,
+        .info = .{ .title = "T", .version = "1" },
+    };
+    defer e.deinit();
+    try r.use(e.middleware());
+    try r.get("/hello", hHello);
+
+    var buf: [16384]u8 = undefined;
+    // First request builds (and caches) the document — "/late" is not
+    // registered yet, so it must be absent.
+    const first = runWire(&r, wire("GET", "/openapi.json"), &buf);
+    try expectStatus(first, "200");
+    try testing.expect(std.mem.indexOf(u8, bodyOf(first), "/late") == null);
+
+    // Register a route AFTER the cache was populated. A per-request
+    // generator (the old behavior) would pick this up on the very next
+    // request; a cache must not.
+    try r.get("/late", hHello);
+    const second = runWire(&r, wire("GET", "/openapi.json"), &buf);
+    try expectStatus(second, "200");
+    try testing.expect(std.mem.indexOf(u8, bodyOf(second), "/late") == null);
+}
+
 test "endpoint: self-contained docs page (no external assets)" {
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
@@ -915,6 +973,7 @@ test "endpoint: self-contained docs page (no external assets)" {
         .info = .{ .title = "T", .version = "1" },
         .docs_path = "/docs",
     };
+    defer e.deinit();
     try r.use(e.middleware());
     try r.get("/hello", hHello);
 
@@ -951,6 +1010,7 @@ test "integration: GET /openapi.json over a real socket returns the documented r
         .router = &r,
         .info = .{ .title = "Integration API", .version = "0.1.0" },
     };
+    defer e.deinit();
     try r.use(e.middleware());
     try r.get("/hello", hHello);
     try r.addDoc(.post, "/users", hOk, .{

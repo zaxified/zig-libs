@@ -527,6 +527,10 @@ pub const Builder = struct {
             .v4 => |q| .{ &q, addr_family_ipv4 },
             .v6 => |q| .{ &q, addr_family_ipv6 },
         };
+        // Guard both the OID-length byte (`@intCast` to `u8` below) and the
+        // fixed 64-byte scratch buffer itself, matching `addOrgSpecific`'s
+        // bounds-check pattern.
+        if (opts.oid.len > 255 or 2 + addr.len + 6 + opts.oid.len > scratch.len) return BuildError.ValueTooLong;
         scratch[n] = @intCast(1 + addr.len); // addr string length
         scratch[n + 1] = family;
         @memcpy(scratch[n + 2 ..][0..addr.len], addr);
@@ -694,6 +698,26 @@ test "LLDP: network-address chassis id + IPv6 management address" {
         .max_frame_size => |s| try testing.expectEqual(@as(u16, 1522), s),
         else => return error.WrongOrgValue,
     }
+}
+
+test "LLDP: an oversized management-address OID is refused, not a scratch-buffer overrun" {
+    var buf: [256]u8 = undefined;
+    var b = Builder.init(&buf);
+    // `scratch` in addManagementAddress is a fixed [64]u8; an IPv6 address
+    // consumes 2 + 16 + 6 = 24 of it, leaving 40 for the OID. 41 bytes used
+    // to overrun the buffer before the length guard was added.
+    const long_oid = [_]u8{7} ** 41;
+    try testing.expectError(BuildError.ValueTooLong, b.addManagementAddress(.{
+        .ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} },
+        .oid = &long_oid,
+    }));
+
+    // A 40-byte OID (the exact boundary) still fits and round-trips.
+    const max_oid = [_]u8{7} ** 40;
+    try b.addManagementAddress(.{
+        .ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} },
+        .oid = &max_oid,
+    });
 }
 
 test "LLDP: unknown optional TLV passes through, never fails parse" {

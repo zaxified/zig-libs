@@ -118,6 +118,25 @@ test "parseArp: malformed rows are skipped, not fatal" {
     try testing.expectEqual(@as(u16, 6), entries[0].flags);
 }
 
+test "parseMac: a MAC field with more than 6 colon-separated groups is rejected, not an OOB write" {
+    // `mac: [6]u8` is fixed-size; the `i >= 6` guard (arp.zig:32) is the only
+    // thing stopping a 7th group from writing past the end of it. Without
+    // the guard this panics: `index out of bounds: index 6, len 6`.
+    try testing.expectEqual(@as(?[6]u8, null), parseMac("aa:bb:cc:dd:ee:ff:11"));
+    // Sanity: a well-formed 6-group MAC still parses.
+    try testing.expectEqual(
+        @as(?[6]u8, [6]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff }),
+        parseMac("aa:bb:cc:dd:ee:ff"),
+    );
+}
+
+test "parseArp: a >6-group MAC field is a malformed row, skipped not fatal" {
+    const text = "hdr\n10.0.1.9 0x1 0x2 aa:bb:cc:dd:ee:ff:11 * eth0\n";
+    const entries = try parseArp(testing.allocator, text);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
 test "parseArp: device name longer than IFNAMSIZ is truncated, not dropped" {
     const text = "hdr\n10.0.0.1 0x1 0x2 aa:bb:cc:dd:ee:ff * this-interface-name-is-way-too-long\n";
     const entries = try parseArp(testing.allocator, text);

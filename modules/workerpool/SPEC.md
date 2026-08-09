@@ -89,13 +89,31 @@ generation counter** `notify: u32` and the `std.Io` futex.
 **Producer/shutdown side** (after making the event visible):
 
 ```
-submit:     enqueue(box)          // publish the job (seq_cst MS-queue)
-            notify += 1           // bump generation (seq_cst)
-            futexWake(&notify, 1) // wake one worker
-shutdown:   state = draining/…    // publish the state (seq_cst, CAS)
+submit:     enqueue(box)              // publish the job (seq_cst MS-queue)
+            notify += 1               // bump generation (seq_cst) — ALWAYS
+            if idle > 0:               // F4: skip the syscall if nobody could
+              futexWake(&notify, 1)   //   be asleep to miss it (see below)
+shutdown:   state = draining/…        // publish the state (seq_cst, CAS)
             notify += 1
-            futexWake(&notify, ∞) // wake all
+            futexWake(&notify, ∞)     // wake all — unconditional, always cheap
 ```
+
+**F4 — the wake is gated, the bump never is.** `submit`'s `notify += 1` always
+happens; only the `futexWake` *syscall* is conditional, on `idle: usize` — a
+count of workers that have committed to (are about to, or already did) block
+in `futexWaitUncancelable`, incremented immediately before that call and
+decremented immediately after it returns. A `futexWake` is only ever
+*required* to release a worker that is genuinely asleep in the kernel; a
+worker that is not yet asleep self-corrects for free, because
+`futexWaitUncancelable` itself atomically re-tests `*notify == gen` at entry
+(see the no-lost-wakeup argument below) — no signal needed for that case.
+`idle` is a safe superset of "possibly asleep": it may be briefly nonzero for
+a worker that turns out not to block at all (costing one avoidable wake, safe
+direction), but is never zero while a worker is genuinely parked, because the
+increment happens-before the blocking call on that worker's own thread. This
+turns a saturated pool's per-submit cost from "always one `futexWake` syscall"
+into "one atomic increment, no syscall, once no worker is idle" — `shutdown`'s
+wake-all is left unconditional since it is not a hot path.
 
 **Worker side** (park only on the exact generation last observed):
 
@@ -108,7 +126,9 @@ loop:
   gen = notify.load(seq_cst)                // SNAPSHOT before parking
   if dequeue() |v|: run(v); continue        // re-check queue …
   if state.load(seq_cst) != running: continue   // … and state
+  idle += 1                                 // F4: about to (maybe) block
   futexWaitUncancelable(&notify, gen)       // sleeps iff *notify == gen
+  idle -= 1
 ```
 
 **No lost wakeup.** The producer bumps `notify` *after* publishing the job, and

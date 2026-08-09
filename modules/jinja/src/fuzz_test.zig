@@ -17,6 +17,15 @@
 const std = @import("std");
 const jinja = @import("root.zig");
 
+/// F12: was 1024 — below F4's ~10 KB expression-nesting-depth cliff, so that
+/// crash class was structurally unreachable by this harness no matter how
+/// long a sweep ran. Named (rather than inlined) so the regression test
+/// below is pinned to the *real* production buffer size, not a duplicate
+/// magic number that could drift from it.
+const fuzz_template_buf_len: usize = 16384;
+/// F12: was 512; raised by the same order of magnitude.
+const fuzz_whitespace_buf_len: usize = 4096;
+
 fn drawSource(smith: *std.testing.Smith, buf: []u8) []const u8 {
     const n = smith.indexWithHash(buf.len, 0);
     smith.bytes(buf[0..n]);
@@ -25,9 +34,16 @@ fn drawSource(smith: *std.testing.Smith, buf: []u8) []const u8 {
 
 /// Arbitrary bytes as a template. Compiling must either succeed or return an
 /// error; a template that compiles must then render or return an error.
+///
+/// F12: the template buffer was 1024 bytes and the context was the fixed
+/// four keys below — below F4's ~10 KB expression-nesting-depth cliff, and
+/// with no attacker-*data* path fuzzed at all. Raised to 16 KiB (past the
+/// cliff) and `s` is now fuzzer-drawn bytes instead of the literal `"text"`,
+/// so a defect reachable only via hostile context data (F2/F3/F5's shape)
+/// is now in the sweep's reach, not just template-*syntax* defects.
 fn fuzzCompileAndRender(_: void, smith: *std.testing.Smith) !void {
     const gpa = std.testing.allocator;
-    var buf: [1024]u8 = undefined;
+    var buf: [fuzz_template_buf_len]u8 = undefined;
     const src = drawSource(smith, &buf);
 
     var env = try jinja.Environment.init(gpa, .{ .undefined_policy = .lenient });
@@ -39,9 +55,12 @@ fn fuzzCompileAndRender(_: void, smith: *std.testing.Smith) !void {
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
+    var sbuf: [256]u8 = undefined;
+    const sn = smith.indexWithHash(sbuf.len, 1); // hash 1: decorrelate from drawSource's hash 0
+    smith.bytes(sbuf[0..sn]);
     const ctx = try jinja.valueFrom(arena.allocator(), .{
         .a = @as(i64, 3),
-        .s = "text",
+        .s = sbuf[0..sn],
         .l = [_]i64{ 1, 2, 3 },
         .d = .{ .k = "v" },
     });
@@ -52,10 +71,11 @@ fn fuzzCompileAndRender(_: void, smith: *std.testing.Smith) !void {
 
 /// The same, with the syntax options that rewrite whitespace turned on — the
 /// slice edits in `applyWhitespace` are the part most likely to walk off the
-/// end of a text chunk.
+/// end of a text chunk. F12: buffer raised from 512 to 4096 bytes, matching
+/// the order-of-magnitude increase given to the harness above.
 fn fuzzWhitespaceOptions(_: void, smith: *std.testing.Smith) !void {
     const gpa = std.testing.allocator;
-    var buf: [512]u8 = undefined;
+    var buf: [fuzz_whitespace_buf_len]u8 = undefined;
     const src = drawSource(smith, &buf);
 
     var env = try jinja.Environment.init(gpa, .{
@@ -120,8 +140,9 @@ const num_sites = [_]NumSite{
 
 /// The numeric-argument surface, which the two harnesses above cannot reach.
 ///
-/// They draw arbitrary bytes into a 1024/512-byte buffer and render them
-/// against a fixed four-key context, so reaching any of these sites would mean
+/// They draw arbitrary bytes into a 16384/4096-byte buffer and render them
+/// against a mostly-fixed context (only `s` is fuzzed, as raw bytes), so
+/// reaching any of these sites would mean
 /// synthesising `|replace('a','b',-1)` or `* 4611686018427387904` by chance —
 /// which is why a clean 121-second sweep certified nothing about the eleven
 /// unchecked narrowing casts that were found by hand instead. Here the template
@@ -266,6 +287,27 @@ fn fuzzAutoescapeInvariant(_: void, smith: *std.testing.Smith) !void {
         );
         return error.AutoescapeBypass;
     }
+}
+
+test "F12: the template draw buffer now reaches well past the old 1024-byte cap" {
+    // Regression guard on the buffer-size fix, not on the fuzzer itself: a
+    // deterministic Smith replay (`.in` set, no live fuzzer needed) whose
+    // first 8 bytes select a draw length of 5000 — impossible to reach
+    // through the old `[1024]u8` buffer, since `drawSource`'s `n` is drawn
+    // from `[0, buf.len)` and a value outside that range falls back to `0`.
+    // Sized off `fuzz_template_buf_len`, the same constant the harness
+    // itself uses, so shrinking that constant back down (the historical
+    // regression this guards against) fails this test rather than silently
+    // narrowing the sweep's reach again.
+    var backing: [5100]u8 = undefined;
+    std.mem.writeInt(u64, backing[0..8], 5000, .little);
+    @memset(backing[8..], '(');
+    var smith: std.testing.Smith = .{ .in = &backing };
+
+    var buf: [fuzz_template_buf_len]u8 = undefined;
+    const src = drawSource(&smith, &buf);
+    try std.testing.expect(src.len > 1024);
+    try std.testing.expectEqual(@as(usize, 5000), src.len);
 }
 
 test "fuzz: arbitrary bytes as a template never panic" {

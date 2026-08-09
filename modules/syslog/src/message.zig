@@ -84,6 +84,11 @@ pub const CalendarTime = struct {
 /// instant RFC 3339's 4-digit year (`{d:0>4}`) can represent.
 const max_epoch_secs: i64 = 253402300799;
 
+/// Largest sane UTC offset magnitude, in minutes: ±23:59. Real timezone
+/// offsets never exceed ±14:00, but this is the widest value `±HH:MM`
+/// (two-digit hours) can still render meaningfully.
+const max_offset_minutes: u16 = 1439;
+
 pub const DecomposeError = error{
     /// The shifted instant is before the Unix epoch, or past year 9999 —
     /// not representable as an RFC 3339 calendar time. Guards against a
@@ -137,7 +142,10 @@ fn writeCalendar(w: *std.Io.Writer, c: CalendarTime) std.Io.Writer.Error!void {
             try w.writeAll("+00:00");
         } else {
             const sign: u8 = if (om < 0) '-' else '+';
-            const a: u16 = @abs(om);
+            // Clamp to the largest sane UTC offset (±23:59 = 1439 minutes) so a
+            // wild-but-in-range `i16` (e.g. from a hostile/buggy caller) still
+            // prints a valid `±HH:MM` instead of a nonsensical `±546:07`.
+            const a: u16 = @min(@as(u16, @abs(om)), max_offset_minutes);
             try w.writeByte(sign);
             try w.print("{d:0>2}:{d:0>2}", .{ a / 60, a % 60 });
         }
@@ -436,6 +444,25 @@ test "format renders NILVALUE '-' for a hostile out-of-range timestamp" {
     var buf: [64]u8 = undefined;
     // No panic; the timestamp field is the NILVALUE, like an absent one.
     try t.expectEqualStrings("<13>1 - - - - - -", try bufPrint(&msg, &buf));
+}
+
+test "writeRfc3339 clamps a wild offset_minutes instead of printing garbage" {
+    // offset_minutes = maxInt/minInt(i16) is nonsense for a UTC offset (real
+    // offsets never exceed ±14:00), but the type allows it. Without a clamp
+    // this prints "+546:07"/"-546:08"; clamped, it prints the largest sane
+    // offset "±23:59". The calendar date itself still shifts by the full
+    // (unclamped) offset via `decompose` — only the printed `±HH:MM` suffix
+    // is clamped — so this only checks the suffix, not the date.
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeRfc3339(&w, .{ .unix_ms = 0, .offset_minutes = 32767 });
+    try t.expect(std.mem.endsWith(u8, w.buffered(), "+23:59"));
+
+    w = std.Io.Writer.fixed(&buf);
+    // Base far enough from the epoch that shifting back ~22.7 days by the
+    // wild negative offset stays inside decompose's valid range.
+    try writeRfc3339(&w, .{ .unix_ms = 100_000_000_000, .offset_minutes = -32768 });
+    try t.expect(std.mem.endsWith(u8, w.buffered(), "-23:59"));
 }
 
 test "bufPrint reports NoSpaceLeft when the buffer is too small" {

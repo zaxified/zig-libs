@@ -204,6 +204,19 @@ pub const WorkerPool = struct {
     /// it. Monotonic; wraparound is harmless (the futex compares for equality).
     notify: std.atomic.Value(u32) = .init(0),
 
+    /// Count of workers that have committed to (are about to, or already did)
+    /// block on `notify` in `futexWaitUncancelable` — incremented strictly
+    /// before that call, decremented strictly after it returns (see
+    /// `workerRun`). `enqueueJob` skips its wake when this is 0: nobody is
+    /// asleep to miss it, and a worker still mid-flight self-corrects via the
+    /// futex's own compare-current-value-at-entry semantics (see F4 in
+    /// SPEC.md) — a wake is only ever REQUIRED for a worker already parked in
+    /// the kernel, and this counter is a safe superset of that set (it may be
+    /// briefly nonzero for a worker that turns out not to block at all, which
+    /// only costs one avoidable wake — never zero while a worker is actually
+    /// asleep).
+    idle: std.atomic.Value(usize) = .init(0),
+
     state: std.atomic.Value(State) = .init(.running),
 
     // observability (also lets tests assert exact run counts)
@@ -427,12 +440,16 @@ pub const WorkerPool = struct {
             return error.SubmitFailed;
         };
 
-        // Wake exactly one worker AFTER the job is published. Bumping `notify`
-        // first defeats the lost-wakeup window: a worker that observed the
-        // queue empty and snapshotted the old generation will find it changed
-        // and skip parking (or, if already parked, be woken here).
+        // Bump `notify` unconditionally — this is what defeats the lost-wakeup
+        // window: a worker that observed the queue empty and snapshotted the
+        // old generation will find it changed at its own compare-and-block
+        // entry and return immediately, wake or no wake (see `idle`'s doc).
+        // The actual `futexWake` syscall is only needed to release a worker
+        // that is *already* asleep in the kernel, so skip it when `idle`
+        // (F4) says nobody is (a saturated pool would otherwise pay a wake
+        // call on every single submit for no one to receive it).
         _ = self.notify.fetchAdd(1, .seq_cst);
-        self.io.futexWake(u32, &self.notify.raw, 1);
+        if (self.idle.load(.seq_cst) > 0) self.io.futexWake(u32, &self.notify.raw, 1);
     }
 
     /// Check a box out of the pool, counting it. Every `boxes.acquire` in the
@@ -547,7 +564,13 @@ fn workerRun(w: *Worker) void {
             if (park_seam.load(.seq_cst)) |f| f();
         }
         if (self.state.load(.seq_cst) != .running) continue; // re-handle stop/drain
+        // F4: counted as idle for exactly the span that can include actually
+        // being asleep in the kernel — incremented immediately before the
+        // call that may block, decremented immediately after it returns, so
+        // `enqueueJob`'s gate is never 0 while this worker could be parked.
+        _ = self.idle.fetchAdd(1, .seq_cst);
         self.io.futexWaitUncancelable(u32, &self.notify.raw, gen);
+        _ = self.idle.fetchSub(1, .seq_cst);
         // Woken (real, or spurious) — loop and re-evaluate.
     }
     // NB: the worker does NOT unregister its own participant here. `deinit`
@@ -750,6 +773,61 @@ test "idle → wake: a submit into an idle pool runs promptly" {
         } }) catch {};
     }
     try testing.expectEqual(@as(u64, 1), c.n.load(.seq_cst));
+}
+
+/// A job that busy-waits until `gate` becomes nonzero, so a test can hold a
+/// worker "busy" (never parked) for exactly as long as it needs to.
+fn waitForGate(ctx: *anyopaque) void {
+    const gate: *std.atomic.Value(u32) = @ptrCast(@alignCast(ctx));
+    while (gate.load(.seq_cst) == 0) std.atomic.spinLoopHint();
+}
+
+test "F4: idle tracks reality — 0 while the only worker is busy, back to 1 once parked" {
+    // Regression guard on the F4 wake-gating fix itself (not just "the suite
+    // still passes"): `idle` must be 0 whenever a worker could not possibly
+    // be parked, and must return to nonzero once it genuinely parks again —
+    // `enqueueJob`'s gate trusts this counter to decide whether a wake is
+    // needed at all.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 5000 };
+    try wd.start();
+    defer wd.finish();
+
+    var scratch = std.atomic.Value(u32).init(0);
+    const pollUntil = struct {
+        fn call(dio: std.Io, s: *std.atomic.Value(u32), pool_: *WorkerPool, want_idle: bool) void {
+            while ((pool_.idle.load(.seq_cst) != 0) != want_idle) {
+                dio.futexWaitTimeout(u32, &s.raw, 0, .{ .duration = .{
+                    .raw = .fromMilliseconds(5),
+                    .clock = .awake,
+                } }) catch {};
+            }
+        }
+    }.call;
+
+    // The one worker starts with nothing queued: it parks, so idle -> 1.
+    pollUntil(io, &scratch, pool, true);
+    try testing.expectEqual(@as(usize, 1), pool.idle.load(.seq_cst));
+
+    // A job that occupies the worker until released: idle must drop to 0
+    // while it runs — this worker cannot be asleep in the futex right now.
+    var gate = std.atomic.Value(u32).init(0);
+    try pool.submit(.{ .func = waitForGate, .ctx = &gate });
+    pollUntil(io, &scratch, pool, false);
+    try testing.expectEqual(@as(usize, 0), pool.idle.load(.seq_cst));
+
+    // Release the job; the worker finds the queue empty again and parks —
+    // idle must climb back to 1.
+    gate.store(1, .seq_cst);
+    io.futexWake(u32, &gate.raw, 1);
+    pollUntil(io, &scratch, pool, true);
+    try testing.expectEqual(@as(usize, 1), pool.idle.load(.seq_cst));
 }
 
 test "drain is idempotent: a second call (and a shutdownNow after) is a safe no-op" {

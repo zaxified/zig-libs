@@ -400,15 +400,45 @@ fn acceptsSse(req: *const http.Server.Request) bool {
 }
 
 /// Best-effort check whether a POST body is an `initialize` request (so the
-/// transport assigns a session). A throwaway parse; a malformed body is not an
-/// initialize (`handleMessage` will surface the real error).
+/// transport assigns a session). A single-pass token scan — not a full
+/// `std.json.Value` tree parse — since this only needs to answer one
+/// question (does the top-level `method` say `"initialize"`?) and
+/// `handleMessage`/`handleMessageFrom` does the real, authoritative parse
+/// right after this returns; paying for a second full recursive-descent
+/// parse (with a nested-map allocation per object/array level) just to ask
+/// that one question was the redundant work. A malformed body here is not
+/// an initialize either way — the real parse right after surfaces the
+/// actual error.
 fn isInitialize(gpa: std.mem.Allocator, body: []const u8) bool {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{}) catch return false;
-    if (v != .object) return false;
-    const m = v.object.get("method") orelse return false;
-    return m == .string and std.mem.eql(u8, m.string, "initialize");
+    var scanner: std.json.Scanner = .initCompleteInput(gpa, body);
+    defer scanner.deinit();
+    // Far longer than any real "method" key or "initialize" value; bounds
+    // the scan against a pathological single giant token.
+    const max_field_len = 64;
+
+    if ((scanner.next() catch return false) != .object_begin) return false;
+    var result = false;
+    while (true) {
+        const key_tok = scanner.nextAllocMax(gpa, .alloc_if_needed, max_field_len) catch return false;
+        const key: []const u8 = switch (key_tok) {
+            .object_end => return result,
+            .string, .allocated_string => |k| k,
+            else => return false, // malformed; the real parse will report it
+        };
+        defer if (key_tok == .allocated_string) gpa.free(key);
+
+        if (std.mem.eql(u8, key, "method")) {
+            const val_tok = scanner.nextAllocMax(gpa, .alloc_if_needed, max_field_len) catch return false;
+            const val: []const u8 = switch (val_tok) {
+                .string, .allocated_string => |s| s,
+                else => "",
+            };
+            defer if (val_tok == .allocated_string) gpa.free(val);
+            result = std.mem.eql(u8, val, "initialize");
+        } else {
+            scanner.skipValue() catch return false;
+        }
+    }
 }
 
 /// The `Last-Event-ID` request header as a u64 (0 when absent/invalid ⇒ replay
@@ -809,6 +839,37 @@ fn deleteWithSession(buf: []u8, sid: []const u8) []const u8 {
 
 fn hApp(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("app");
+}
+
+test "isInitialize: single-pass scan matches the old full-tree-parse semantics (F2)" {
+    const gpa = testing.allocator;
+    // Plain, "method" first.
+    try testing.expect(isInitialize(gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"));
+    // A different method.
+    try testing.expect(!isInitialize(gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"));
+    // "method" preceded by nested objects/arrays the scan must skip *without
+    // desyncing* (`skipValue` on every non-"method" key) — the part most
+    // likely to break in a hand-rolled scan.
+    try testing.expect(isInitialize(gpa,
+        \\{"a":{"nested":[1,2,{"x":3}]},"b":[1,[2,3],{}],"c":null,"d":true,"method":"initialize"}
+    ));
+    try testing.expect(!isInitialize(gpa,
+        \\{"a":{"nested":[1,2,{"x":3}]},"b":[1,[2,3],{}],"method":"tools/list"}
+    ));
+    // Escaped method value still compares correctly (forces the
+    // `.allocated_string` path, not just the zero-copy `.string` one).
+    try testing.expect(isInitialize(gpa, "{\"method\":\"in\\u0069tialize\"}"));
+    // No "method" key at all.
+    try testing.expect(!isInitialize(gpa, "{\"jsonrpc\":\"2.0\",\"id\":1}"));
+    // Malformed / non-object bodies are never an initialize — the real
+    // parse in `handleMessage` surfaces the actual error.
+    try testing.expect(!isInitialize(gpa, "not json"));
+    try testing.expect(!isInitialize(gpa, "[1,2,3]"));
+    try testing.expect(!isInitialize(gpa, "{"));
+    try testing.expect(!isInitialize(gpa, "{}"));
+    // A "method" value long enough to require allocation past a short cap
+    // is still read correctly (regression guard on `max_field_len`).
+    try testing.expect(!isInitialize(gpa, "{\"method\":\"" ++ "x" ** 100 ++ "\"}"));
 }
 
 test "POST initialize → 200 application/json with a result" {

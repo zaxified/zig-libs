@@ -224,6 +224,15 @@ pub const Options = struct {
     /// least-recently-used key is evicted — an evicted key seen again starts
     /// over with a full bucket. Must be ≥ 1.
     max_keys: usize = 4096,
+    /// At most this many bytes of a key are stored/looked-up; a longer key is
+    /// truncated to this prefix before it ever reaches the map. Bounds
+    /// per-entry memory when `key = .forwarded_ip` and the deployment is
+    /// directly internet-facing, where the stored key is an attacker-chosen,
+    /// otherwise-unbounded `X-Forwarded-For`/`X-Real-IP` header value. Two
+    /// distinct long keys sharing the same first `max_key_len` bytes
+    /// deliberately collide into one bucket — a coarser key, not a bypass.
+    /// Must be ≥ 1.
+    max_key_len: usize = 128,
     /// Idle expiry: a key untouched this long is dropped (swept from the LRU
     /// tail when new keys arrive) or reset to a full bucket on its next hit.
     /// 0 disables. Memory stays bounded by `max_keys` either way — the TTL
@@ -269,6 +278,7 @@ pub const Limiter = struct {
         std.debug.assert(options.rate_per_s > 0 and std.math.isFinite(options.rate_per_s));
         std.debug.assert(options.burst >= 1);
         std.debug.assert(options.max_keys >= 1);
+        std.debug.assert(options.max_key_len >= 1);
         return .{ .gpa = gpa, .options = options };
     }
 
@@ -290,9 +300,12 @@ pub const Limiter = struct {
 
     /// `allow` at an explicit instant — the deterministic-test entry point.
     /// `now_ns` must be non-decreasing across calls.
-    pub fn allowAt(l: *Limiter, key: []const u8, now_ns: u64) Decision {
+    pub fn allowAt(l: *Limiter, raw_key: []const u8, now_ns: u64) Decision {
         const cfg: TokenBucket.Config = .{ .rate_per_s = l.options.rate_per_s, .burst = l.options.burst };
         const ttl_ns = l.options.ttl_ms *| std.time.ns_per_ms;
+        // Cap the stored/looked-up key length (F3 hardening — see
+        // `Options.max_key_len`) before it ever reaches the map.
+        const key = raw_key[0..@min(raw_key.len, l.options.max_key_len)];
 
         lockSpin(&l.lock);
         defer l.lock.unlock();
@@ -596,6 +609,29 @@ test "Limiter: LRU eviction at max_keys; evicted keys restart fresh" {
     try testing.expect(l.allow("b").allowed);
     try testing.expect(l.allow("b").allowed);
     try testing.expectEqual(@as(usize, 2), l.keyCount());
+}
+
+test "Limiter: max_key_len truncates over-long keys instead of storing them whole" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{
+        .rate_per_s = 1,
+        .burst = 1,
+        .max_key_len = 8,
+        .clock = tc.clock(),
+    });
+    defer l.deinit();
+
+    // Two distinct 12-byte keys sharing the same first 8 bytes. Without
+    // truncation each gets its own bucket (both allowed, keyCount == 2). With
+    // `max_key_len = 8` they collide into one stored 8-byte key: the first
+    // request spends the single burst token and the second — for a
+    // *different* raw key — is denied because it lands on the same,
+    // already-exhausted bucket.
+    const key_a = "12345678AAAA";
+    const key_b = "12345678BBBB";
+    try testing.expect(l.allow(key_a).allowed);
+    try testing.expect(!l.allow(key_b).allowed);
+    try testing.expectEqual(@as(usize, 1), l.keyCount());
 }
 
 test "Limiter: TTL resets idle keys and sweeps their memory" {
