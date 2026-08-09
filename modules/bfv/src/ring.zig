@@ -79,23 +79,25 @@ pub fn RnsPoly(comptime N: usize, comptime L: usize) type {
         }
 
         /// Pointwise `self *= other` — only valid in the NTT domain, where it
-        /// realises negacyclic multiplication in `R_q`.
-        pub fn mulPointwise(self: *Self, other: *const Self, primes: *const [L]u64) void {
+        /// realises negacyclic multiplication in `R_q`. Takes the engines
+        /// rather than the bare primes because both factors vary, so this uses
+        /// each engine's precomputed Barrett constant instead of a division.
+        pub fn mulPointwise(self: *Self, other: *const Self, engines: *const [L]Engine) void {
             std.debug.assert(self.domain == .ntt and other.domain == .ntt);
-            for (0..L) |i| {
-                for (&self.limbs[i], other.limbs[i]) |*x, y| x.* = ma.mulMod(x.*, y, primes[i]);
-            }
+            for (0..L) |i| engines[i].pointwiseMul(&self.limbs[i], &other.limbs[i]);
         }
 
         /// Coefficient-domain negacyclic multiply via NTT: `out = self·other`
-        /// in `R_q` (both inputs coeff domain, output coeff domain).
-        pub fn mul(self: *const Self, other: *const Self, engines: *const [L]Engine, primes: *const [L]u64) Self {
+        /// in `R_q` (both inputs coeff domain, output coeff domain). The RNS
+        /// primes no longer need to be passed separately: each engine carries
+        /// its own prime plus the precomputed Barrett/Shoup constants.
+        pub fn mul(self: *const Self, other: *const Self, engines: *const [L]Engine) Self {
             std.debug.assert(self.domain == .coeff and other.domain == .coeff);
             var a = self.*;
             var b = other.*;
             a.toNtt(engines);
             b.toNtt(engines);
-            a.mulPointwise(&b, primes);
+            a.mulPointwise(&b, engines);
             a.fromNtt(engines);
             return a;
         }
@@ -144,7 +146,7 @@ test "ring multiply via NTT == schoolbook per limb" {
         };
         const a = P.fromCoeffs(&primes, raw_a);
         const b = P.fromCoeffs(&primes, raw_b);
-        const prod = a.mul(&b, &engines, &primes);
+        const prod = a.mul(&b, &engines);
         // cross-check each limb against the independent schoolbook oracle
         for (0..2) |i| {
             const want = nttmod.Ntt(8).mulSchoolbook(primes[i], &a.limbs[i], &b.limbs[i]);

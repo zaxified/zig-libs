@@ -28,12 +28,13 @@ The whole computational backbone FHE stands on is implemented and tested:
 
 | Piece | File | What |
 |---|---|---|
-| Modular arithmetic | `modarith.zig` | word-size ops mod an NTT prime `q<2^62`: `mulMod`/`powMod`/`invMod`, deterministic Miller-Rabin `isPrime`, `primitive2NthRoot` |
-| Negacyclic NTT | `ntt.zig` | `Ntt(N)` — Cooley-Tukey forward / Gentleman-Sande inverse over `Z_q[X]/(X^N+1)`; `mulNegacyclic` (O(N log N)) + `mulSchoolbook` (the independent O(N²) cross-check) |
-| RNS / CRT | `rns.zig` | `Basis` — residue representation of `q=∏qᵢ`, exact CRT reconstruct, exact base conversion |
+| Modular arithmetic | `modarith.zig` | word-size ops mod an NTT prime `q<2^62`: division-free `Modulus` (Barrett) + `Shoup` (fixed multiplier) for the hot paths, `mulMod` (the `%q` division) retained as their differential oracle and for cold setup; `powMod`/`invMod`, deterministic Miller-Rabin `isPrime`, `primitive2NthRoot` |
+| Negacyclic NTT | `ntt.zig` | `Ntt(N)` — Cooley-Tukey forward / Gentleman-Sande inverse over `Z_q[X]/(X^N+1)` with Shoup butterflies; `mulNegacyclic` (O(N log N)) + `mulSchoolbook` (the independent O(N²) cross-check); `forwardRef`/`inverseRef` keep the original division-based bodies as the differential oracle |
+| RNS / CRT | `rns.zig` | `Basis` — residue representation of `q=∏qᵢ`, exact CRT reconstruct, exact base conversion. `Bfv` hoists the same CRT constants to `init` (`Bfv.reconstruct`) and keeps `Basis.reconstruct` as its oracle |
 | RLWE ring | `ring.zig` | `RnsPoly(N,L)` — `R_q` add/negate/NTT/pointwise-multiply |
 | Plaintext | `encode.zig` | `Plaintext(N)` — `R_t` coefficient + integer encodings, `addRef`/`mulRef` references |
 | Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; `test_tiny`, `bfv_toy`, `test_mul` sets |
+| Benchmarks | `bench.zig` | old-path-vs-new-path ns/op, opt-in: `BFV_BENCH=1 zig build test-bfv -Doptimize=ReleaseFast` |
 
 ## The scheme core (Part 2) + the Fable core (Part 3)
 

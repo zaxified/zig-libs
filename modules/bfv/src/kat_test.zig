@@ -141,7 +141,7 @@ fn scaledPlaintext(m: *const encode.Plaintext(P.n), scale: [2]u64) Ring8 {
 
 /// The checker: does `c0 + c1·s` equal the expected `Δ·m` ring element?
 fn scaleCheck(c0: *const Ring8, c1: *const Ring8, s: *const Ring8, expected: *const Ring8, engines: *const [2]Ring8.Engine) bool {
-    var acc = c1.mul(s, engines, &primes8); // c1·s in R_q
+    var acc = c1.mul(s, engines); // c1·s in R_q
     acc.addAssign(c0, &primes8); // + c0
     return acc.eql(expected);
 }
@@ -161,7 +161,7 @@ test "positive control: wrong-scale encryptor is rejected, correct one accepted"
     const target_one = scaledPlaintext(&m, .{ 1, 1 }); // 1·m  (WRONG scale)
 
     // CORRECT construction: c0 = Δ·m − c1·s. scaleCheck against Δ·m ACCEPTS.
-    var c1s = c1.mul(&s, &engines, &primes8);
+    var c1s = c1.mul(&s, &engines);
     var c0_correct = target_delta;
     c0_correct.subAssign(&c1s, &primes8);
     try testing.expect(scaleCheck(&c0_correct, &c1, &s, &target_delta, &engines));
@@ -210,7 +210,7 @@ test "decrypt KAT: noiseless Δ-rescale round-trips; margin boundary bites (dete
 
     // Noiseless: c0 = Δ·m − c1·s  ⇒  c0 + c1·s == Δ·m exactly.
     const target = scaledPlaintext(&m, deltaLimbs()); // Δ·m
-    const c1s = c1.mul(&s, &engines, &primes8);
+    const c1s = c1.mul(&s, &engines);
     var c0 = target;
     c0.subAssign(&c1s, &primes8);
 
@@ -254,7 +254,7 @@ test "noiseBudget KAT: noiseless ciphertext hits the exact vmax==0 case; added n
     const s = Ring8.fromCoeffs(&primes8, .{ [_]u64{ 1, 0, 16, 1, 0, 16, 1, 0 }, [_]u64{ 1, 0, 96, 1, 0, 96, 1, 0 } });
     const c1 = Ring8.fromCoeffs(&primes8, .{ [_]u64{ 3, 5, 7, 9, 11, 13, 15, 2 }, [_]u64{ 30, 50, 70, 90, 11, 33, 55, 77 } });
     const target = scaledPlaintext(&m, deltaLimbs());
-    const c1s = c1.mul(&s, &engines, &primes8);
+    const c1s = c1.mul(&s, &engines);
     var c0 = target;
     c0.subAssign(&c1s, &primes8);
 
@@ -394,6 +394,225 @@ test "enc/dec round-trip at realistic dimension (bfv_toy N=1024, comfortable mar
         const sum = inst.decrypt(&kp.sk, &inst.add(&ea, &eb));
         try testing.expectEqualSlices(u64, &Pt.addRef(&a, &b).coeffs, &sum.coeffs);
     }
+}
+
+// ── 4. Differential anchors for the RNS-NTT multiply rewrite ──────────────────
+//
+// `mul` no longer computes the tensor as an O(N²) exact-`i256` schoolbook; it
+// runs it through an auxiliary RNS basis of NTT-friendly primes (7 transforms +
+// 4N pointwise products per aux prime) and lifts the result back with a
+// centered CRT. That is an EXACT algorithm, not an approximation, so the bar is
+// bit-identical output — and the oracle is the OLD code, kept verbatim as
+// `mulExactRef`, never a second fast path.
+//
+// The random corpus alone is not enough: real ciphertext coefficients are
+// ~uniform in [0,q), so `|T|` concentrates far below the worst case that sizes
+// `num_aux`. The extreme vectors below drive every centered coefficient to
+// ±(q−1)/2 with aligned signs, which is exactly the input that saturates the
+// `∏p_j > 2·tensor_bound` bound the exactness argument rests on.
+
+/// Build a ring element whose j-th coefficient is the integer `vals[j] mod q`
+/// (decomposed into its RNS residues) — lets a test pin exact big-integer
+/// coefficients rather than only sampling residues.
+fn ringFromIntegers(comptime B: type, primes_: []const u64, vals: []const u128) B.Ring {
+    var out = B.Ring.zero(.coeff);
+    for (0..B.num_primes) |i| {
+        for (0..B.degree) |j| out.limbs[i][j] = @intCast(vals[j] % primes_[i]);
+    }
+    return out;
+}
+
+fn diffMul(comptime PP: params.Params, iters: usize, seed: u64) !void {
+    const B = bfv.Bfv(PP);
+    const inst = try B.init();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const q: u128 = B.q_product;
+    const half: u128 = (q - 1) / 2;
+
+    for (0..iters) |it| {
+        var v: [4][B.degree]u128 = undefined;
+        for (0..4) |c| {
+            for (0..B.degree) |j| {
+                v[c][j] = switch (it) {
+                    // Saturating vectors: every centered coefficient at
+                    // ±(q−1)/2, signs aligned so the convolution sums rather
+                    // than cancels.
+                    0 => half,
+                    1 => q - half,
+                    2 => if (j % 2 == 0) half else q - half,
+                    // Mixed extremes + the 0 / 1 / q−1 boundary.
+                    3 => ([_]u128{ 0, 1, q - 1, half, q - half })[j % 5],
+                    else => rnd.int(u128) % q,
+                };
+            }
+        }
+        const x = B.Ciphertext{ .components = .{
+            ringFromIntegers(B, PP.primes, &v[0]),
+            ringFromIntegers(B, PP.primes, &v[1]),
+            B.Ring.zero(.coeff),
+        }, .len = 2 };
+        const y = B.Ciphertext{ .components = .{
+            ringFromIntegers(B, PP.primes, &v[2]),
+            ringFromIntegers(B, PP.primes, &v[3]),
+            B.Ring.zero(.coeff),
+        }, .len = 2 };
+
+        const fast = inst.mulRnsNtt(&x, &y); // direct, regardless of `mul`'s dispatch
+        const ref = inst.mulExactRef(&x, &y);
+        try testing.expectEqual(ref.len, fast.len);
+        for (0..3) |c| {
+            for (0..B.num_primes) |i| {
+                try testing.expectEqualSlices(u64, &ref.components[c].limbs[i], &fast.components[c].limbs[i]);
+            }
+        }
+    }
+}
+
+/// N=8, two ~60-bit primes: `q ≈ 2^120` drives `num_aux` to 4 (and the CRT
+/// accumulator to `u320`), which none of the shipped parameter sets reaches.
+/// Correctness-only, like every set in `params.zig`.
+const wide_aux = params.Params{
+    .n = 8,
+    .t = 4,
+    .primes = &.{ 1152921504606846577, 1152921504606846097 },
+};
+
+test "RNS-NTT tensor is bit-identical to the i256 schoolbook oracle (num_aux = 1, 2, 4)" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    // num_aux == 1 (test_tiny, q = 1649)
+    try testing.expectEqual(@as(usize, 1), bfv.Bfv(params.test_tiny).num_aux);
+    try diffMul(params.test_tiny, 24, 0xD1);
+    // num_aux == 2 (test_mul, q ≈ 2^35.6) — the set the mul anchors run on
+    try testing.expectEqual(@as(usize, 2), bfv.Bfv(params.test_mul).num_aux);
+    try diffMul(params.test_mul, 24, 0xD2);
+    // num_aux == 4 (q ≈ 2^120) — exercises a multi-prime aux CRT and the
+    // widened accumulator.
+    try testing.expectEqual(@as(usize, 4), bfv.Bfv(wide_aux).num_aux);
+    try diffMul(wide_aux, 24, 0xD3);
+}
+
+test "instance CRT reconstruct is bit-identical to rns.Basis.reconstruct" {
+    inline for (.{ params.test_tiny, params.test_mul, wide_aux }) |PP| {
+        const B = bfv.Bfv(PP);
+        const inst = try B.init();
+        const basis = try rns.Basis.init(PP.primes);
+        var prng = std.Random.DefaultPrng.init(0xC27);
+        const rnd = prng.random();
+        var res: [PP.primes.len]u64 = undefined;
+        // Boundary residue vectors first (all-zero, all-max), then random.
+        for (0..2_000) |it| {
+            for (0..PP.primes.len) |i| res[i] = switch (it) {
+                0 => 0,
+                1 => PP.primes[i] - 1,
+                2 => 1,
+                else => rnd.uintLessThan(u64, PP.primes[i]),
+            };
+            try testing.expectEqual(basis.reconstruct(&res), inst.reconstruct(&res));
+        }
+    }
+}
+
+// ── 5. Ternary sampler KAT (the constant-time rewrite needs teeth) ────────────
+//
+// Gap found by mutation testing DURING the F3 rewrite: swapping the `−1` and
+// `+1` arms of the (new, branchless) trit select left ALL tests green — the
+// ternary distribution is symmetric, so the scheme keeps working and every
+// end-to-end anchor still passes. Nothing in the suite pinned what the sampler
+// actually maps a draw to. That is precisely the hole a "constant-time" rewrite
+// of a secret sampler must not be landed through, so this KAT drives `keyGen`
+// with a SCRIPTED random source and pins the draw→trit map exactly, including
+// both boundary words where `⌊3x/2^64⌋` steps.
+
+/// A `std.Random` that emits a fixed cycle of 64-bit words (little-endian),
+/// so a test can dictate exactly which trit the sampler must produce.
+const ScriptedRandom = struct {
+    words: []const u64,
+    idx: usize = 0,
+
+    fn fill(ptr: *anyopaque, buf: []u8) void {
+        const self: *ScriptedRandom = @ptrCast(@alignCast(ptr));
+        var off: usize = 0;
+        while (off < buf.len) {
+            var tmp: [8]u8 = undefined;
+            std.mem.writeInt(u64, &tmp, self.words[self.idx % self.words.len], .little);
+            self.idx += 1;
+            const n = @min(tmp.len, buf.len - off);
+            @memcpy(buf[off..][0..n], tmp[0..n]);
+            off += n;
+        }
+    }
+    fn random(self: *ScriptedRandom) std.Random {
+        return .{ .ptr = self, .fillFn = fill };
+    }
+};
+
+test "ternary sampler KAT: scripted draws map to the exact trits (-1, 0, +1)" {
+    if (!gate.scheme_core_implemented) return error.SkipZigTest;
+    // `⌊3x/2^64⌋`: 0 for x ≤ 6148914691236517205, 1 up to 12297829382473034410,
+    // 2 above. Both step points are included, from either side.
+    var script = ScriptedRandom{
+        .words = &.{
+            0, // r=0 → −1
+            6_148_914_691_236_517_205, // r=0 → −1  (last word below the first step)
+            6_148_914_691_236_517_206, // r=1 →  0  (first word at/above it)
+            12_297_829_382_473_034_410, // r=1 →  0  (last below the second step)
+            12_297_829_382_473_034_411, // r=2 → +1  (first at/above it)
+            std.math.maxInt(u64), // r=2 → +1
+            1, // r=0 → −1
+            1 << 63, // r=1 →  0
+        },
+    };
+    const want_trit = [_]i8{ -1, -1, 0, 0, 1, 1, -1, 0 };
+
+    const B = bfv.Bfv(P); // N=8, primes {17,97}
+    const inst = try B.init();
+    const kp = inst.keyGen(script.random()); // `s` is sampled first, from words[0..8]
+
+    for (0..P.primes.len) |i| {
+        const qi = primes8[i];
+        for (0..P.n) |j| {
+            const want: u64 = switch (want_trit[j]) {
+                -1 => qi - 1,
+                0 => 0,
+                else => 1,
+            };
+            try testing.expectEqual(want, kp.sk.s.limbs[i][j]);
+        }
+    }
+}
+
+test "ternary sampler: every limb is a trit, consistently across limbs, all three occur" {
+    if (!gate.scheme_core_implemented) return error.SkipZigTest;
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    var prng = std.Random.DefaultPrng.init(0x7E12);
+    const rnd = prng.random();
+    var seen = [_]usize{ 0, 0, 0 };
+    for (0..400) |_| {
+        const kp = inst.keyGen(rnd);
+        for (0..P.n) |j| {
+            // Limb 0 decides the trit; every other limb must encode the SAME
+            // small integer (this is the invariant that keeps the decrypt
+            // noise a genuine small integer rather than a random residue).
+            const v0 = kp.sk.s.limbs[0][j];
+            const trit: usize = if (v0 == primes8[0] - 1) 0 else if (v0 == 0) 1 else if (v0 == 1) 2 else {
+                return error.NotATrit;
+            };
+            seen[trit] += 1;
+            for (0..P.primes.len) |i| {
+                const want: u64 = switch (trit) {
+                    0 => primes8[i] - 1,
+                    1 => 0,
+                    else => 1,
+                };
+                try testing.expectEqual(want, kp.sk.s.limbs[i][j]);
+            }
+        }
+    }
+    // 3200 draws: each trit's count is ~1067; a mapping that collapsed two
+    // cases (or dropped one) shows up immediately.
+    for (seen) |c| try testing.expect(c > 800 and c < 1400);
 }
 
 test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget (random + boundary)" {

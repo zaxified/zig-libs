@@ -26,9 +26,25 @@
 //!     noise-management core. Anchored by the mul+relin and multiply-DEPTH
 //!     end-to-end tests on `params.test_mul`, whose worst-case noise ledger
 //!     (params.zig) makes depth-2 correctness a guarantee, not a
-//!     probabilistic pass. Exact-reconstruction tensor path only (toy
-//!     moduli); the fast BEHZ/HPS RNS base-conversion multiply is the
-//!     deferred security-grade increment.
+//!     probabilistic pass.
+//!
+//! ## Arithmetic (what the multiply actually runs on)
+//! The tensor is computed in an **auxiliary RNS basis of NTT-friendly primes**
+//! (`mulRnsNtt`): forward-NTT the four input polynomials per auxiliary prime,
+//! form the three components pointwise, inverse-NTT, then lift back with a
+//! centered CRT whose basis is sized (`num_aux`) so the lift is EXACT, not
+//! approximate. That replaces the `O(N²)` exact-integer schoolbook with
+//! `O(num_aux·N log N)`. The schoolbook survives as `mulExactRef`: it is the
+//! differential oracle (`mulRnsNtt` must be bit-identical to it), and below
+//! `ntt_tensor_min_degree` it is also what `mul` dispatches to, because at
+//! small `N` it is measurably faster. Word arithmetic is division-free —
+//! Shoup for the NTT twiddles, Barrett elsewhere (see `modarith`).
+//!
+//! Still deferred: the `⌊t/q·…⌉` rescale materialises the exact integer and
+//! divides by `q`, and `q_product` is a `u128` — so security-grade parameters
+//! (log q ≳ 218) remain out of reach. The BEHZ/HPS **rescale-in-RNS** (fast
+//! base conversion, never materialising the integer) is the increment that
+//! lifts that, and it is NOT implemented here.
 //!
 //! Randomness is caller-supplied (`std.Random`, frost/bbs-style) so the module
 //! stays `platform = .any` and KATs are reproducible.
@@ -84,18 +100,99 @@ pub fn Bfv(comptime P: params.Params) type {
         };
 
         comptime {
-            // Exact-tensor width guard for `mul`: the rounding numerator
-            // `|2·t·T + q|` with `|T| ≤ N·(q/2)²` must fit in i256.
+            // The tensor's integer width is no longer pinned at `i256` — it is
+            // derived from the parameters (`TensorI` below), so the old
+            // "2·q_bits + n_bits + t_bits + 2 ≤ 255" guard is gone. What still
+            // binds is the `u128` ciphertext modulus: `q_product`, `delta`, the
+            // CRT accumulator and the decrypt rescale are all `u128`, and the
+            // accumulator adds one `[0,q)` term at a time, so `2q < 2^128`.
+            // THIS is what still blocks security-grade parameters (log q ≳ 218);
+            // lifting it is the deferred BEHZ/HPS increment (SPEC.md), which
+            // removes the materialised integer altogether.
             const q_bits = 128 - @clz(q_product);
-            const n_bits = 64 - @clz(@as(u64, N));
-            const t_bits = 64 - @clz(P.t);
-            if (2 * q_bits + n_bits + t_bits + 2 > 255)
-                @compileError("bfv: parameter set too large for the exact-tensor multiply path");
+            if (q_bits > 127)
+                @compileError("bfv: ciphertext modulus too large for the u128 CRT accumulator");
         }
+
+        // ── auxiliary RNS basis for the RNS-NTT tensor (see `mul`) ───────────
+        //
+        // `q_product` as an arbitrary-precision comptime integer, so the bound
+        // arithmetic below cannot silently wrap a `u128`.
+        const q_int: comptime_int = blk: {
+            var m: comptime_int = 1;
+            for (primes) |p| m *= p;
+            break :blk m;
+        };
+        /// Worst-case magnitude of ANY tensor component coefficient. Centered
+        /// inputs satisfy `|x| ≤ (q−1)/2`; a negacyclic convolution coefficient
+        /// sums `N` such products, and the middle component `t1` is a sum of
+        /// TWO convolutions — hence the factor 2.
+        const tensor_bound: comptime_int = blk: {
+            const half: comptime_int = (q_int + 1) / 2;
+            const n_int: comptime_int = N;
+            break :blk 2 * n_int * half * half;
+        };
+        /// Every auxiliary prime is found by scanning DOWN from `2^62`, so each
+        /// contributes at least this many bits to the product.
+        const aux_min_bits: comptime_int = 61;
+        /// How many auxiliary primes make `∏p_j > 2·tensor_bound`, which is
+        /// exactly the condition for the centered CRT lift of the tensor to be
+        /// unambiguous (and therefore for the fast path to be EXACT, not
+        /// approximate).
+        pub const num_aux: usize = blk: {
+            var need: comptime_int = 2 * tensor_bound + 1;
+            var b: comptime_int = 0;
+            while (need > 0) : (b += 1) need >>= 1;
+            break :blk @intCast((b + aux_min_bits - 1) / aux_min_bits);
+        };
+        /// Accumulator type for the auxiliary-basis CRT. Each aux prime is
+        /// `< 2^62`, so `∏p_j < 2^(62·num_aux)`; the accumulator is kept below
+        /// `∏p_j` by a conditional subtract after every term, so the widest
+        /// value it ever holds is `< 2^(62·num_aux + 1) ≤ 2^(64·num_aux)`.
+        /// Sizing it at exactly `64·num_aux` (rather than one limb wider) keeps
+        /// the common `num_aux = 2` case in a NATIVE `u128`.
+        const AuxU = std.meta.Int(.unsigned, 64 * num_aux);
+
+        /// Exact width the `⌊t/q·T⌉` rescale numerator `|2·t·T + q|` needs,
+        /// plus a sign bit. The tensor used to be hardcoded to `i256` — the
+        /// widest thing the old comptime guard would admit — which made every
+        /// parameter set pay 256-bit division whether it needed it or not.
+        /// `test_mul` actually needs 85 bits, so it now rescales in `i128`.
+        const rescale_bits: u16 = blk: {
+            var v: comptime_int = 2 * @as(comptime_int, P.t) * tensor_bound + q_int;
+            var b: u16 = 1; // sign bit
+            while (v > 0) : (b += 1) v >>= 1;
+            break :blk b;
+        };
+        /// Signed integer type the exact tensor and its rescale run in. Sized
+        /// from the parameters instead of pinned at `i256`.
+        pub const TensorI = std.meta.Int(.signed, @max(65, rescale_bits));
 
         /// The `L` per-prime NTT engines + the prime chain, built once.
         engines: [L]Engine,
         primes: [L]u64,
+        /// Precomputed CRT constants for the MAIN basis. `reconstruct` in
+        /// `rns.zig` recomputes `∏q`, each `∏_{k≠i} q_k` and a full
+        /// `invMod` (a 62-squaring `powMod`) on EVERY call — and the scheme
+        /// calls it once per coefficient, i.e. `N` times per decrypt and `4N`
+        /// times per multiply. These hoist all of that to `init`.
+        crt_mi: [L]u128, // ∏_{k≠i} q_k
+        crt_inv: [L]u64, // (crt_mi[i] mod q_i)^{-1} mod q_i
+        /// Shoup constant for `Δ mod q_i` (fixed multiplier of `scaledPlaintext`).
+        delta_shoup: [L]ma.Shoup,
+
+        /// Auxiliary basis: NTT engines over primes large enough that the
+        /// EXACT integer tensor product is recoverable by CRT from its
+        /// residues. This is what lets `mul` run the tensor in `O(N log N)`
+        /// per prime instead of `O(N²)` over `i256`.
+        aux_engines: [num_aux]Engine,
+        aux_primes: [num_aux]u64,
+        aux_mi: [num_aux]AuxU, // ∏_{k≠j} p_k
+        aux_inv: [num_aux]u64, // (aux_mi[j] mod p_j)^{-1} mod p_j
+        aux_modulus: AuxU, // ∏ p_j
+        /// `q mod p_j` — folds the "centered" correction into the residue
+        /// reduction without ever materialising a signed wide integer.
+        q_mod_aux: [num_aux]u64,
 
         pub const SecretKey = struct {
             s: Ring,
@@ -132,12 +229,88 @@ pub fn Bfv(comptime P: params.Params) type {
             }
         };
 
-        /// Build the instance (validates `P`, builds NTT engines).
+        /// Build the instance: validates `P`, builds the `L` main NTT engines,
+        /// hoists the main-basis CRT constants, and searches for + builds the
+        /// `num_aux` auxiliary NTT engines the fast tensor needs.
         pub fn init() !Self {
             try P.validate();
             var local = primes;
             const engines = try ring.makeEngines(N, L, &local);
-            return .{ .engines = engines, .primes = primes };
+
+            // Main-basis CRT constants (hoisted out of `rns.Basis.reconstruct`).
+            var crt_mi: [L]u128 = undefined;
+            var crt_inv: [L]u64 = undefined;
+            for (0..L) |i| {
+                const mi = q_product / primes[i];
+                crt_mi[i] = mi;
+                crt_inv[i] = try ma.invMod(@intCast(mi % primes[i]), primes[i]);
+            }
+            var delta_shoup: [L]ma.Shoup = undefined;
+            for (0..L) |i| delta_shoup[i] = ma.Shoup.init(@intCast(delta % primes[i]), primes[i]);
+
+            // Auxiliary basis: the largest NTT-friendly primes below 2^62,
+            // scanning down. Distinct by construction (strictly decreasing).
+            var aux_primes: [num_aux]u64 = undefined;
+            {
+                const two_n: u64 = 2 * @as(u64, N);
+                var cand: u64 = (@as(u64, 1) << ma.max_prime_bits) - 1;
+                cand -= (cand - 1) % two_n; // largest v < 2^62 with v ≡ 1 mod 2N
+                var found: usize = 0;
+                while (found < num_aux) : (cand -= two_n) {
+                    if (cand <= (@as(u64, 1) << @intCast(aux_min_bits))) return error.NoAuxiliaryPrimes;
+                    if (!ma.isPrime(cand)) continue;
+                    aux_primes[found] = cand;
+                    found += 1;
+                }
+            }
+            var aux_engines: [num_aux]Engine = undefined;
+            for (0..num_aux) |j| aux_engines[j] = try Engine.init(aux_primes[j]);
+
+            var aux_modulus: AuxU = 1;
+            for (aux_primes) |p| aux_modulus *= p;
+            var aux_mi: [num_aux]AuxU = undefined;
+            var aux_inv: [num_aux]u64 = undefined;
+            var q_mod_aux: [num_aux]u64 = undefined;
+            for (0..num_aux) |j| {
+                const p = aux_primes[j];
+                const mi = aux_modulus / p;
+                aux_mi[j] = mi;
+                aux_inv[j] = try ma.invMod(@intCast(mi % p), p);
+                q_mod_aux[j] = @intCast(q_product % p);
+            }
+
+            return .{
+                .engines = engines,
+                .primes = primes,
+                .crt_mi = crt_mi,
+                .crt_inv = crt_inv,
+                .delta_shoup = delta_shoup,
+                .aux_engines = aux_engines,
+                .aux_primes = aux_primes,
+                .aux_mi = aux_mi,
+                .aux_inv = aux_inv,
+                .aux_modulus = aux_modulus,
+                .q_mod_aux = q_mod_aux,
+            };
+        }
+
+        /// Exact CRT reconstruction of one coefficient's residues into
+        /// `[0, q)`, using the constants hoisted at `init`. Bit-identical to
+        /// `rns.Basis.reconstruct` (which stays as the differential oracle),
+        /// but with no `invMod` / no `∏q` recomputation per call.
+        ///
+        /// The accumulator adds one `[0,q)` term at a time with a conditional
+        /// subtract, so it never exceeds `2q < 2^128` (comptime-guarded).
+        pub fn reconstruct(self: *const Self, residues: *const [L]u64) u128 {
+            var acc: u128 = 0;
+            for (0..L) |i| {
+                const c: u64 = self.engines[i].modulus.mul(residues[i], self.crt_inv[i]);
+                // `crt_mi[i]·c ≤ (q/q_i)·(q_i−1) < q`, so each term needs no
+                // reduction of its own and `acc + term < 2q < 2^128`.
+                acc += self.crt_mi[i] * @as(u128, c);
+                if (acc >= q_product) acc -= q_product;
+            }
+            return acc;
         }
 
         // ── REAL, ungated ops ────────────────────────────────────────────────
@@ -175,16 +348,49 @@ pub fn Bfv(comptime P: params.Params) type {
         /// encryption randomness `u`, and the small errors `e,e0,e1` — a
         /// consistent small integer per coefficient across all RNS limbs
         /// (`−1 ↦ q_i−1`), which keeps the decrypt-noise a genuine small
-        /// integer. NOT constant-time (toy parameters; see SPEC.md).
+        /// integer.
+        ///
+        /// ## Constant-time shape (what this does and does not buy)
+        /// This sampler produces the secret key `s` and the errors `e,e0,e1` —
+        /// the module's most sensitive values — so it must not branch on, or
+        /// index by, the trit it drew. Two things were needed:
+        ///
+        ///   - **The draw.** `std.Random.uintLessThan(u8, 3)` is a *rejection*
+        ///     loop: its iteration count depends on the value drawn, which
+        ///     correlates with the trit. It is replaced by std's own
+        ///     documented constant-time variant, `uintLessThanBiased`, over a
+        ///     full 64-bit word — the fixed-cost multiply-shift map
+        ///     `r = ⌊x·3 / 2^64⌋` (Lemire's reduction with the rejection step
+        ///     dropped). The width matters: at `u8` the bias would be `3/256`,
+        ///     at `u64` it is not. This is not exactly uniform: the outcomes get
+        ///     `⌈2^64/3⌉ , ⌊2^64/3⌋ , ⌊2^64/3⌋` of the `2^64` words, so each
+        ///     probability is within `2/(3·2^64) < 2^-63` of `1/3`. Summed over
+        ///     every coefficient this module ever samples the statistical
+        ///     distance from a true uniform ternary is far below `2^-50` —
+        ///     cryptographically irrelevant, and unlike the rejection loop it
+        ///     is fixed-cost.
+        ///   - **The store.** The `switch (r)` on the secret trit is replaced by
+        ///     an arithmetic mask select (`is_neg`/`is_pos` are all-ones or
+        ///     all-zero words derived from `@intFromBool`, and the two cases are
+        ///     mutually exclusive so `|` merges them).
+        ///
+        /// **Not** claimed: this is source-level constant time only. The
+        /// compiler may rematerialise a branch from a mask, `random`'s own
+        /// implementation is the caller's to choose (a rejection-based or
+        /// buffered PRNG can reintroduce data-dependent timing upstream of
+        /// here), and nothing constrains the microarchitecture. See SPEC.md
+        /// "Threats / caveats" for the parts of the module that are still not
+        /// constant-time at all.
         fn sampleTernary(self: *const Self, random: std.Random) Ring {
             var out = Ring.zero(.coeff);
             for (0..N) |j| {
-                const r = random.uintLessThan(u8, 3); // 0,1,2 ↦ −1,0,1
-                for (0..L) |i| out.limbs[i][j] = switch (r) {
-                    0 => self.primes[i] - 1, // −1
-                    1 => 0,
-                    else => 1,
-                };
+                // r ∈ {0,1,2} ↦ −1,0,+1 — fixed cost, no rejection loop.
+                const r: u64 = random.uintLessThanBiased(u64, 3);
+                const is_neg: u64 = 0 -% @as(u64, @intFromBool(r == 0));
+                const is_pos: u64 = 0 -% @as(u64, @intFromBool(r == 2));
+                for (0..L) |i| {
+                    out.limbs[i][j] = ((self.primes[i] - 1) & is_neg) | (1 & is_pos);
+                }
             }
             return out;
         }
@@ -207,8 +413,11 @@ pub fn Bfv(comptime P: params.Params) type {
             var out = Ring.zero(.coeff);
             for (0..L) |i| {
                 const qi = self.primes[i];
-                const delta_i: u64 = @intCast(delta % qi);
-                for (0..N) |j| out.limbs[i][j] = ma.mulMod(delta_i, pt.coeffs[j] % qi, qi);
+                // `Δ mod q_i` is fixed for the whole limb ⇒ Shoup; the
+                // coefficient reduction is Barrett. Neither divides.
+                const ds = self.delta_shoup[i];
+                const m = &self.engines[i].modulus;
+                for (0..N) |j| out.limbs[i][j] = ds.mul(m.reduce(pt.coeffs[j]), qi);
             }
             return out;
         }
@@ -220,7 +429,7 @@ pub fn Bfv(comptime P: params.Params) type {
             const s = self.sampleTernary(random);
             const a = self.sampleUniform(random);
             const e = self.sampleTernary(random);
-            var p0 = a.mul(&s, &self.engines, &self.primes); // a·s
+            var p0 = a.mul(&s, &self.engines); // a·s
             p0.addAssign(&e, &self.primes); // a·s + e
             p0.negate(&self.primes); // −(a·s + e)
             return .{ .sk = .{ .s = s }, .pk = .{ .p0 = p0, .p1 = a } };
@@ -233,10 +442,10 @@ pub fn Bfv(comptime P: params.Params) type {
             const e0 = self.sampleTernary(random);
             const e1 = self.sampleTernary(random);
             var c0 = self.scaledPlaintext(pt); // Δ·m
-            var p0u = pk.p0.mul(&u, &self.engines, &self.primes);
+            var p0u = pk.p0.mul(&u, &self.engines);
             c0.addAssign(&p0u, &self.primes); // + p0·u
             c0.addAssign(&e0, &self.primes); // + e0
-            var c1 = pk.p1.mul(&u, &self.engines, &self.primes);
+            var c1 = pk.p1.mul(&u, &self.engines);
             c1.addAssign(&e1, &self.primes); // p1·u + e1
             return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
         }
@@ -251,22 +460,21 @@ pub fn Bfv(comptime P: params.Params) type {
             var acc = ct.components[0];
             if (ct.len >= 2) {
                 var spow = sk.s; // s^1
-                var term = ct.components[1].mul(&spow, &self.engines, &self.primes);
+                var term = ct.components[1].mul(&spow, &self.engines);
                 acc.addAssign(&term, &self.primes);
                 var i: usize = 2;
                 while (i < ct.len) : (i += 1) {
-                    spow = spow.mul(&sk.s, &self.engines, &self.primes); // s^i
-                    var t2 = ct.components[i].mul(&spow, &self.engines, &self.primes);
+                    spow = spow.mul(&sk.s, &self.engines); // s^i
+                    var t2 = ct.components[i].mul(&spow, &self.engines);
                     acc.addAssign(&t2, &self.primes);
                 }
             }
             // ⌊t/q · phase⌉ mod t, coefficient-wise, via exact CRT reconstruction.
-            const basis = rns.Basis{ .primes = self.primes[0..] };
             var out = Plaintext.zero(P.t);
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
                 for (0..L) |i| res[i] = acc.limbs[i][j];
-                const v = basis.reconstruct(&res); // in [0, q)
+                const v = self.reconstruct(&res); // in [0, q)
                 // round(t·v/q) = ⌊(2·t·v + q) / (2q)⌋ ; then reduce mod t.
                 const rounded = (2 * @as(u128, P.t) * v + q_product) / (2 * q_product);
                 out.coeffs[j] = @intCast(rounded % @as(u128, P.t));
@@ -297,29 +505,50 @@ pub fn Bfv(comptime P: params.Params) type {
         // RNS base extension, never materialising the integer) is the
         // deferred increment (SPEC.md).
 
-        /// Exact centered integer coefficients of a coeff-domain ring element:
-        /// CRT-reconstruct each coefficient to `[0,q)`, then center into
-        /// `(−q/2, q/2)`. i256 so tensor products below stay exact.
-        fn centeredCoeffs(self: *const Self, r: *const Ring) [N]i256 {
+        /// Exact CRT lift of a coeff-domain ring element: every coefficient
+        /// reconstructed to its canonical `[0, q)` representative. Both the
+        /// reference tensor (which centers these into `i256`) and the fast
+        /// tensor (which reduces them into the auxiliary basis) start here.
+        fn rawCoeffs(self: *const Self, r: *const Ring) [N]u128 {
             std.debug.assert(r.domain == .coeff);
-            const basis = rns.Basis{ .primes = self.primes[0..] };
-            const half = q_product / 2;
-            var out: [N]i256 = undefined;
+            var out: [N]u128 = undefined;
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
                 for (0..L) |i| res[i] = r.limbs[i][j];
-                const v = basis.reconstruct(&res); // [0, q)
-                out[j] = if (v > half)
-                    -@as(i256, @intCast(q_product - v))
-                else
-                    @as(i256, @intCast(v));
+                out[j] = self.reconstruct(&res);
             }
             return out;
         }
 
+        /// Center `[0,q)` representatives into `(−q/2, q/2]` as `i256`, so the
+        /// reference tensor products stay exact.
+        fn centerRaw(raw: *const [N]u128) [N]TensorI {
+            const half = q_product / 2;
+            var out: [N]TensorI = undefined;
+            for (0..N) |j| {
+                const v = raw[j];
+                out[j] = if (v > half)
+                    -@as(TensorI, @intCast(q_product - v))
+                else
+                    @as(TensorI, @intCast(v));
+            }
+            return out;
+        }
+
+        /// Exact centered integer coefficients of a coeff-domain ring element.
+        fn centeredCoeffs(self: *const Self, r: *const Ring) [N]TensorI {
+            const raw = self.rawCoeffs(r);
+            return centerRaw(&raw);
+        }
+
         /// `acc += a·b mod (X^N+1)` over the integers (exact schoolbook
         /// negacyclic convolution; |terms| ≤ N·(q/2)², guarded comptime).
-        fn negaMulAcc(a: *const [N]i256, b: *const [N]i256, acc: *[N]i256) void {
+        ///
+        /// **This is the oracle**, not the hot path: `mul` runs the tensor
+        /// through the auxiliary RNS-NTT basis (`tensorNtt`) and
+        /// `mulExactRef` — this `O(N²)` `i256` schoolbook — is what the
+        /// differential test asserts it is bit-identical to.
+        fn negaMulAcc(a: *const [N]TensorI, b: *const [N]TensorI, acc: *[N]TensorI) void {
             for (0..N) |i| {
                 for (0..N) |j| {
                     const p = a[i] * b[j];
@@ -329,26 +558,132 @@ pub fn Bfv(comptime P: params.Params) type {
             }
         }
 
+        /// Residues mod the auxiliary prime `p_j` of the CENTERED integers
+        /// whose `[0,q)` representatives are `raw`. Centering is folded in
+        /// arithmetically: for `v > q/2` the centered value is `v − q`, so its
+        /// residue is `(v mod p) − (q mod p)`. No signed wide integer, and no
+        /// `i256`-by-`u64` division, ever appears.
+        fn auxResidues(self: *const Self, raw: *const [N]u128, j: usize) [N]u64 {
+            const p = self.aux_primes[j];
+            const m = &self.aux_engines[j].modulus;
+            const qm = self.q_mod_aux[j];
+            const half = q_product / 2;
+            var out: [N]u64 = undefined;
+            for (0..N) |i| {
+                const v = raw[i];
+                const r = m.reduce(v);
+                out[i] = if (v > half) ma.subMod(r, qm, p) else r;
+            }
+            return out;
+        }
+
+        /// Centered CRT lift from the auxiliary basis back to an exact `i256`.
+        /// Unambiguous because `∏p_j > 2·tensor_bound ≥ 2·|T|` by construction
+        /// of `num_aux` — this is what makes the NTT tensor EXACT rather than
+        /// an approximation with an error term to bound.
+        fn auxCenter(self: *const Self, residues: *const [num_aux]u64) TensorI {
+            var acc: AuxU = 0;
+            for (0..num_aux) |j| {
+                const c: u64 = self.aux_engines[j].modulus.mul(residues[j], self.aux_inv[j]);
+                // `aux_mi[j]·c ≤ (∏p/p_j)·(p_j−1) < ∏p`, so one conditional
+                // subtract per term keeps `acc < ∏p`.
+                acc += self.aux_mi[j] * @as(AuxU, c);
+                if (acc >= self.aux_modulus) acc -= self.aux_modulus;
+            }
+            const half = self.aux_modulus / 2; // ∏p is odd ⇒ (∏p−1)/2
+            return if (acc > half)
+                -@as(TensorI, @intCast(self.aux_modulus - acc))
+            else
+                @as(TensorI, @intCast(acc));
+        }
+
+        /// The RNS-NTT exact tensor — the replacement for the `O(N²)` `i256`
+        /// schoolbook. For each auxiliary prime: forward-NTT the four input
+        /// polynomials, form the three tensor components by POINTWISE products
+        /// in the NTT domain, inverse-NTT them, and keep the residues. A
+        /// centered CRT lift over the auxiliary basis then recovers the exact
+        /// integer tensor.
+        ///
+        /// Cost: `7` transforms + `4N` pointwise products per auxiliary prime,
+        /// i.e. `O(num_aux · N log N)` word operations, against the reference's
+        /// `O(N²)` `i256` (4-limb) multiplies.
+        fn tensorNtt(
+            self: *const Self,
+            x0: *const [N]u128,
+            x1: *const [N]u128,
+            y0: *const [N]u128,
+            y1: *const [N]u128,
+            out: *[3][N]TensorI,
+        ) void {
+            var res: [3][num_aux][N]u64 = undefined;
+            for (0..num_aux) |j| {
+                const eng = &self.aux_engines[j];
+                const p = eng.q;
+                const m = &eng.modulus;
+                var a0 = self.auxResidues(x0, j);
+                var a1 = self.auxResidues(x1, j);
+                var b0 = self.auxResidues(y0, j);
+                var b1 = self.auxResidues(y1, j);
+                eng.forward(&a0);
+                eng.forward(&a1);
+                eng.forward(&b0);
+                eng.forward(&b1);
+                var t0: [N]u64 = undefined;
+                var t1: [N]u64 = undefined;
+                var t2: [N]u64 = undefined;
+                for (0..N) |i| {
+                    t0[i] = m.mul(a0[i], b0[i]);
+                    t1[i] = ma.addMod(m.mul(a0[i], b1[i]), m.mul(a1[i], b0[i]), p);
+                    t2[i] = m.mul(a1[i], b1[i]);
+                }
+                eng.inverse(&t0);
+                eng.inverse(&t1);
+                eng.inverse(&t2);
+                res[0][j] = t0;
+                res[1][j] = t1;
+                res[2][j] = t2;
+            }
+            for (0..3) |c| {
+                for (0..N) |i| {
+                    var r: [num_aux]u64 = undefined;
+                    for (0..num_aux) |j| r[j] = res[c][j][i];
+                    out[c][i] = self.auxCenter(&r);
+                }
+            }
+        }
+
         /// `⌊t/q · T⌉ mod q` per coefficient (round half up via floor
         /// division, exact for negative T), decomposed back into RNS limbs.
-        fn rescaleTensor(self: *const Self, tc: *const [N]i256) Ring {
+        ///
+        /// MEASURED NOTE (bench.zig): the two `i256` big-integer divisions here
+        /// look like the obvious next target once the tensor stops being
+        /// `O(N²)`, and they are NOT. Replacing the `@mod` with a division-free
+        /// 4-limb Horner reduction (`2^64 mod q_i` + Barrett, exploiting
+        /// `q_i | q`) was implemented and measured: it made the rescale go from
+        /// ~31 ns to ~250 ns per coefficient and `mul` at N=16 from 8.8 µs to
+        /// 19.4 µs — an 8x REGRESSION. LLVM lowers these `i256` divisions well
+        /// (the divisor is a loop constant), and the Horner chain is fully
+        /// serialised. Reverted; do not "optimise" this again without a bench.
+        fn rescaleTensor(self: *const Self, tc: *const [N]TensorI) Ring {
             var out = Ring.zero(.coeff);
-            const qi: i256 = @intCast(q_product);
-            const ti: i256 = @intCast(P.t);
+            const qi: TensorI = @intCast(q_product);
+            const ti: TensorI = @intCast(P.t);
             for (0..N) |j| {
                 const rounded = @divFloor(2 * ti * tc[j] + qi, 2 * qi);
                 const v: u128 = @intCast(@mod(rounded, qi)); // canonical [0, q)
-                for (0..L) |i| out.limbs[i][j] = @intCast(v % self.primes[i]);
+                for (0..L) |i| out.limbs[i][j] = self.engines[i].modulus.reduce(v);
             }
             return out;
         }
 
         /// `scalar·r` for a `[0,q)` scalar, per-limb (legal in either domain).
+        /// The per-limb scalar is fixed for the whole limb ⇒ Shoup.
         fn scalarMul(self: *const Self, r: *const Ring, scalar: u128) Ring {
             var out = r.*;
             for (0..L) |i| {
-                const c: u64 = @intCast(scalar % self.primes[i]);
-                for (&out.limbs[i]) |*x| x.* = ma.mulMod(x.*, c, self.primes[i]);
+                const qi = self.primes[i];
+                const s = ma.Shoup.init(self.engines[i].modulus.reduce(scalar), qi);
+                for (&out.limbs[i]) |*x| x.* = s.mul(x.*, qi);
             }
             return out;
         }
@@ -358,14 +693,14 @@ pub fn Bfv(comptime P: params.Params) type {
         /// fresh ternary error `e_i`: `(b_i, a_i) = (−(a_i·s + e_i) + w^i·s²,
         /// a_i)`. `random` supplies the uniform `a_i` and ternary `e_i`.
         pub fn genRelinKey(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
-            const s2 = sk.s.mul(&sk.s, &self.engines, &self.primes);
+            const s2 = sk.s.mul(&sk.s, &self.engines);
             var rlk: RelinKey = undefined;
             var w_pow: u128 = 1; // w^i < q for all rows used (see relin_digits)
             for (0..relin_digits) |i| {
                 const a_i = self.sampleUniform(random);
                 const e_i = self.sampleTernary(random);
                 var b_i = self.scalarMul(&s2, w_pow); // w^i·s²
-                var mask = a_i.mul(&sk.s, &self.engines, &self.primes); // a_i·s
+                var mask = a_i.mul(&sk.s, &self.engines); // a_i·s
                 mask.addAssign(&e_i, &self.primes); // + e_i
                 b_i.subAssign(&mask, &self.primes); // w^i·s² − (a_i·s + e_i)
                 rlk.b[i] = b_i;
@@ -382,15 +717,69 @@ pub fn Bfv(comptime P: params.Params) type {
         /// then the `⌊t/q·…⌉` rescale per component, which keeps the plaintext
         /// scaled by `Δ` (not `Δ²`). Decrypts with `(1, s, s²)`;
         /// `relinearize` reduces it back to 2 components.
+        /// Ring degree at or above which `mul` takes the RNS-NTT tensor. Below
+        /// it the `O(N²)` schoolbook is genuinely faster: at small `N` the
+        /// per-multiply fixed costs (CRT lift + the `⌊t/q·⌉` rescale) dominate
+        /// both paths, and `7·num_aux` transforms cost more than `N²` narrow
+        /// multiplies. MEASURED (bench.zig, ReleaseFast, this host — schoolbook
+        /// vs RNS-NTT, so >1 means the NTT path wins):
+        ///
+        /// | N   | q≈2^36 (num_aux=2) | q≈2^60 (num_aux=3) |
+        /// |-----|--------------------|--------------------|
+        /// |  16 | 1.1x  (0.9–1.1)    | 1.1x  (1.0–1.1)    |
+        /// |  32 | 1.5x               | 1.3x               |
+        /// |  64 | 2.5x               | 2.0x               |
+        /// | 256 | 3.5x               | 2.8x               |
+        /// | 512 | 5.9x               | 4.7x               |
+        ///
+        /// At N=16 the two are within run-to-run noise (the parenthesised range
+        /// is across repeats); `32` is the first degree where the NTT path wins
+        /// consistently at BOTH modulus sizes. The shipped sets land on either
+        /// side deliberately:
+        /// `test_tiny`/`test_mul` (N=8/16) keep the schoolbook, `bfv_toy`
+        /// (N=1024) takes the NTT tensor.
+        pub const ntt_tensor_min_degree: usize = 32;
+
+        /// Homomorphic multiply. Dispatches at COMPTIME between the two tensor
+        /// implementations — both are exact and, by the differential test,
+        /// bit-identical; the choice is purely which is faster at this `N`.
         pub fn mul(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
+            return if (comptime N >= ntt_tensor_min_degree)
+                self.mulRnsNtt(x, y)
+            else
+                self.mulExactRef(x, y);
+        }
+
+        /// Tensor via the auxiliary RNS-NTT basis: `O(num_aux · N log N)`.
+        /// Called directly by the differential test at EVERY parameter set, so
+        /// it stays covered even where `mul` does not dispatch to it.
+        pub fn mulRnsNtt(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
+            std.debug.assert(x.len == 2 and y.len == 2);
+            const x0 = self.rawCoeffs(&x.components[0]);
+            const x1 = self.rawCoeffs(&x.components[1]);
+            const y0 = self.rawCoeffs(&y.components[0]);
+            const y1 = self.rawCoeffs(&y.components[1]);
+            var t: [3][N]TensorI = undefined;
+            self.tensorNtt(&x0, &x1, &y0, &y1, &t);
+            return .{ .components = .{
+                self.rescaleTensor(&t[0]),
+                self.rescaleTensor(&t[1]),
+                self.rescaleTensor(&t[2]),
+            }, .len = 3 };
+        }
+
+        /// The ORIGINAL `O(N²)` exact-integer schoolbook multiply, kept as the
+        /// differential ORACLE for `mulRnsNtt` — and, below
+        /// `ntt_tensor_min_degree`, as the path `mul` actually takes.
+        pub fn mulExactRef(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
             std.debug.assert(x.len == 2 and y.len == 2);
             const x0 = self.centeredCoeffs(&x.components[0]);
             const x1 = self.centeredCoeffs(&x.components[1]);
             const y0 = self.centeredCoeffs(&y.components[0]);
             const y1 = self.centeredCoeffs(&y.components[1]);
-            var t0 = [_]i256{0} ** N;
-            var t1 = [_]i256{0} ** N;
-            var t2 = [_]i256{0} ** N;
+            var t0 = [_]TensorI{0} ** N;
+            var t1 = [_]TensorI{0} ** N;
+            var t2 = [_]TensorI{0} ** N;
             negaMulAcc(&x0, &y0, &t0);
             negaMulAcc(&x0, &y1, &t1);
             negaMulAcc(&x1, &y0, &t1);
@@ -413,13 +802,12 @@ pub fn Bfv(comptime P: params.Params) type {
         /// by an encryption of the same value under `s`.
         pub fn relinearize(self: *const Self, ct: *const Ciphertext, rlk: *const RelinKey) Ciphertext {
             std.debug.assert(ct.len == 3);
-            const basis = rns.Basis{ .primes = self.primes[0..] };
             // Exact base-w digits of every coefficient of c2.
             var digits: [relin_digits][N]u64 = undefined;
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
                 for (0..L) |i| res[i] = ct.components[2].limbs[i][j];
-                var v = basis.reconstruct(&res); // [0, q)
+                var v = self.reconstruct(&res); // [0, q)
                 for (0..relin_digits) |i| {
                     digits[i][j] = @intCast(v & (relin_base - 1));
                     v >>= relin_base_log2;
@@ -433,11 +821,12 @@ pub fn Bfv(comptime P: params.Params) type {
                 // ternary sampler.
                 var d = Ring.zero(.coeff);
                 for (0..L) |l| {
-                    for (0..N) |j| d.limbs[l][j] = digits[i][j] % self.primes[l];
+                    const m = &self.engines[l].modulus;
+                    for (0..N) |j| d.limbs[l][j] = m.reduce(digits[i][j]);
                 }
-                var tb = d.mul(&rlk.b[i], &self.engines, &self.primes);
+                var tb = d.mul(&rlk.b[i], &self.engines);
                 c0.addAssign(&tb, &self.primes);
-                var ta = d.mul(&rlk.a[i], &self.engines, &self.primes);
+                var ta = d.mul(&rlk.a[i], &self.engines);
                 c1.addAssign(&ta, &self.primes);
             }
             return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
@@ -453,22 +842,21 @@ pub fn Bfv(comptime P: params.Params) type {
             var acc = ct.components[0];
             if (ct.len >= 2) {
                 var spow = sk.s;
-                var term = ct.components[1].mul(&spow, &self.engines, &self.primes);
+                var term = ct.components[1].mul(&spow, &self.engines);
                 acc.addAssign(&term, &self.primes);
                 var i: usize = 2;
                 while (i < ct.len) : (i += 1) {
-                    spow = spow.mul(&sk.s, &self.engines, &self.primes);
-                    var t2 = ct.components[i].mul(&spow, &self.engines, &self.primes);
+                    spow = spow.mul(&sk.s, &self.engines);
+                    var t2 = ct.components[i].mul(&spow, &self.engines);
                     acc.addAssign(&t2, &self.primes);
                 }
             }
-            const basis = rns.Basis{ .primes = self.primes[0..] };
             const half = q_product / 2;
             var vmax: u128 = 0;
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
                 for (0..L) |i| res[i] = acc.limbs[i][j];
-                const phase = basis.reconstruct(&res); // [0, q)
+                const phase = self.reconstruct(&res); // [0, q)
                 // m_j exactly as decrypt recovers it (round half up, mod t).
                 const rounded = (2 * @as(u128, P.t) * phase + q_product) / (2 * q_product);
                 const m_j = rounded % @as(u128, P.t);

@@ -199,12 +199,31 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 - **No security level claimed.** `test_tiny`/`bfv_toy` are correctness-only
   toy parameters; do not encrypt anything real until a security-grade parameter
   set + Part 2/3 land.
-- **Not constant-time.** `powMod`/`primitive2NthRoot`/table setup are public-data
-  only, but the future secret paths (`keyGen`/`encrypt`/`decrypt`) must be
-  audited for timing when implemented — flagged for Parts 2–3.
+- **Partially constant-time — read the boundary, do not round it up.**
+  What IS source-level constant time now: the ternary sampler (`sampleTernary`
+  draws with the fixed-cost `uintLessThanBiased` instead of a rejection loop and
+  selects the trit with an arithmetic mask, so neither the draw nor the store
+  branches on the secret), and the word-arithmetic leaves every secret-bearing
+  product routes through (`addMod`/`subMod`/`Modulus.mul`/`Shoup.mul` end in a
+  masked conditional subtract, `modarith.csub`, and the `%q` division that had
+  data-dependent latency on some µarch is gone).
+  What is NOT, and is not claimed to be: `powMod`/`invMod`/`primitive2NthRoot`/
+  the auxiliary-prime search are public-data setup and remain variable-time;
+  `sampleUniform` still uses the rejection-based `uintLessThan` (its output is
+  a public mask, not a secret); `decrypt`/`noiseBudget`/`centerRaw`/
+  `auxResidues` branch on reconstructed coefficient values; `relinearize`'s
+  digit decomposition is value-shaped; and the caller's `std.Random` is outside
+  our control. Above all this is **source-level** CT — the compiler may
+  rematerialise a branch from a mask, and nothing here is verified codegen or a
+  microarchitectural claim.
 - **Exact CRT reconstruction uses `u128`** — fine for KAT/toy moduli (product
   fits in 128 bits); production RNS never materialises the integer (stays in
-  residues). Fast base conversion is the deferred increment.
+  residues). This `u128` ceiling on `q` is now **the** blocker for
+  security-grade parameters (log q ≳ 218): the tensor's own integer width is no
+  longer pinned (`Bfv.TensorI` is sized from the parameters), so what remains is
+  `q_product`/`delta`/the CRT accumulator/the decrypt rescale all being `u128`.
+  Fast base conversion (BEHZ/HPS), which removes the materialised integer
+  altogether, is the deferred increment.
 - **Verifiability risk (flagged in Part 1, addressed in Part 3):** BFV
   ciphertext noise is randomised, so the Part-3 multiply's correctness at depth
   has no byte-exact external KAT — the noise-budget accounting is exactly the
