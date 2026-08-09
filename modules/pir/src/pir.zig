@@ -233,6 +233,80 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
                 error.AnswerLengthMismatch;
         }
 
+        /// Server `party`'s answer to `share`, over the index range
+        /// `[lo, hi)` ONLY (`0 <= lo <= hi <= database.count()`, else
+        /// `InvalidRange`) — into `out`, which is still
+        /// `answerWords(database.record_len)` long, exactly as for `answer`.
+        /// A range answer is a PARTIAL SUM over the same record-shaped
+        /// accumulator, not one slot per queried index, so shards do not
+        /// concatenate — they ADD: summing `T` disjoint ranges' answers word
+        /// by word (`accumulate`, ring addition `+%=`) reproduces `answer`'s
+        /// full-database result bit-for-bit, by the same distributivity
+        /// identity the module doc derives for the single-record vs. block
+        /// case (`Σ_x f(x)·rec[x]` splits over any partition of `x`'s range).
+        ///
+        /// This is `answer`'s server-side **sharding entry point** (audit
+        /// finding F4): `answer` costs `O(count())` PRG calls via
+        /// `fss.Dpf`'s tree-reuse `evalFullWith`, which only ever starts a
+        /// walk at the root and offers a `[0, hi)` PREFIX — a caller wanting
+        /// to split that work across `T` cores had no way to seed a walk
+        /// anywhere else, so `T` naive full re-walks (discarding
+        /// `(T-1)/T` of each) cost `O(T·count())` instead of `O(count())`.
+        /// `answerRange` drives `fss.Dpf.evalRangeWith`, which prunes BOTH
+        /// edges of the tree walk before their PRG calls: a shard over
+        /// `[lo, hi)` costs `O(hi - lo)` PRG calls for its own leaves plus
+        /// at most `O(domain_bits)` extra for the two root-to-boundary
+        /// descents. `T` disjoint shards covering `[0, count())` therefore
+        /// cost at most `O(count() + T·domain_bits)` server work in total —
+        /// additive in `T`, not multiplicative — which is what makes
+        /// splitting the work across cores worth doing.
+        ///
+        /// `answer(party, share, database, out)` is defined as exactly
+        /// `answerRange(party, share, database, 0, database.count(), out)`
+        /// below — the SAME call, not a second parallel implementation, so
+        /// there is only one server loop to keep correct and to keep
+        /// constant-access-pattern.
+        ///
+        /// **This module still starts no threads** (`meta.platform = .any`
+        /// in `root.zig`): the caller owns the thread pool, if any, and is
+        /// free to run `answerRange` for disjoint shards on separate cores
+        /// and combine the partial answers with `accumulate` however it
+        /// schedules that. `answerRange` itself stays a plain,
+        /// single-threaded, reentrant function like everything else here.
+        ///
+        /// **What sharding does and does not reveal:** `lo`/`hi` are the
+        /// CALLER's own work-partitioning choice — public, fixed before the
+        /// share is even looked at — never derived from `share` or from
+        /// which index the client queried. The access pattern inside one
+        /// shard call is a function of `(lo, hi, database)` alone: it
+        /// touches records `lo..hi` in ascending order, unconditionally,
+        /// with no early exit and no branch on the evaluated share
+        /// (`fss.Dpf.evalRangeWith`'s own doc comment states the same
+        /// non-dependence at the walk level, and the same "every record in
+        /// range influences the result" test this module already has for
+        /// `answer` is repeated here for a shard). Two different indices'
+        /// shares, evaluated over the identical `[lo, hi)`, make the
+        /// identical sequence of record accesses — a worker's assigned
+        /// shard therefore tells an observer nothing about `i` beyond the
+        /// partitioning the deployment already chose, and per-shard work is
+        /// exactly `hi - lo` regardless of `i`, the same way `answer`'s
+        /// per-database work is exactly `count()` regardless of `i`.
+        pub fn answerRange(party: u1, share: Share, database: Database, lo: usize, hi: usize, out: []Word) Error!void {
+            if (out.len != answerWords(database.record_len)) return error.AnswerLengthMismatch;
+            const n = database.count();
+            if (n > domain_size) return error.DomainTooSmall;
+            if (lo > hi or hi > n) return error.InvalidRange;
+
+            @memset(out, 0);
+            const Ctx = struct { database: Database, out: []Word };
+            Dpf.evalRangeWith(party, share, lo, hi, Ctx{ .database = database, .out = out }, struct {
+                fn emit(ctx: Ctx, x: usize, sel: Word) void {
+                    const rec = ctx.database.record(x);
+                    for (ctx.out, 0..) |*w, j| w.* +%= sel *% wordAt(rec, j);
+                }
+            }.emit);
+        }
+
         /// Server `party`'s answer to `share`, over `database`, into `out`
         /// (`out.len` must be `answerWords(database.record_len)`).
         ///
@@ -243,50 +317,61 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// this is load-bearing, and there is a test asserting every record
         /// influences the result.
         ///
-        /// The evaluation is `fss.Dpf`'s tree-reuse `evalFullWith` — one walk
-        /// over the `[0, count())` prefix, ~1 PRG call per record instead of
-        /// `domain_bits` per record — in its STREAMING form because this
-        /// module has no allocator and no runtime-sized scratch anywhere
-        /// (`SPEC.md` §"Where the library stops"): each evaluation is folded
-        /// into `out` as the walk produces it, so no `count()`-sized buffer
-        /// exists. The domain's unused tail past `count()` is still never
-        /// evaluated (the walk skips those subtrees before their PRG calls).
+        /// Exactly `answerRange(party, share, database, 0, database.count(),
+        /// out)` — the whole database is the degenerate one-shard case of
+        /// range sharding, not a separate code path. See `answerRange`'s doc
+        /// comment for the walk this drives (`fss.Dpf.evalRangeWith`, one
+        /// walk over the `[0, count())` prefix, ~1 PRG call per record) and
+        /// for the sharding this module now exposes on top of it.
         pub fn answer(party: u1, share: Share, database: Database, out: []Word) Error!void {
-            if (out.len != answerWords(database.record_len)) return error.AnswerLengthMismatch;
-            const n = database.count();
-            if (n > domain_size) return error.DomainTooSmall;
-
-            @memset(out, 0);
-            const Ctx = struct { database: Database, out: []Word };
-            Dpf.evalFullWith(party, share, n, Ctx{ .database = database, .out = out }, struct {
-                fn emit(ctx: Ctx, x: usize, sel: Word) void {
-                    const rec = ctx.database.record(x);
-                    for (ctx.out, 0..) |*w, j| w.* +%= sel *% wordAt(rec, j);
-                }
-            }.emit);
+            return answerRange(party, share, database, 0, database.count(), out);
         }
 
-        /// `answer` over a slice of records rather than one flat buffer, for
-        /// callers whose database is not contiguous. Every record must have
-        /// the same length (`RaggedRecords` otherwise) — see `db.zig` for why
-        /// that is a hard requirement and not a convenience.
-        pub fn answerSlices(party: u1, share: Share, records: []const []const u8, out: []Word) Error!void {
+        /// `answerRange` over a slice of records rather than one flat
+        /// buffer, for callers whose database is not contiguous. Every
+        /// record must have the same length (`RaggedRecords` otherwise —
+        /// see `db.zig` for why that is a hard requirement and not a
+        /// convenience), and `0 <= lo <= hi <= records.len`.
+        pub fn answerSlicesRange(party: u1, share: Share, records: []const []const u8, lo: usize, hi: usize, out: []Word) Error!void {
             if (records.len == 0) return error.EmptyDatabase;
             if (records.len > domain_size) return error.DomainTooSmall;
             const record_len = records[0].len;
             if (record_len == 0) return error.ZeroRecordLen;
             for (records) |r| if (r.len != record_len) return error.RaggedRecords;
             if (out.len != answerWords(record_len)) return error.AnswerLengthMismatch;
+            if (lo > hi or hi > records.len) return error.InvalidRange;
 
             @memset(out, 0);
-            // Same tree-reuse streaming walk as `answer`, same reasons.
+            // Same tree-reuse range walk as `answerRange`, same reasons.
             const Ctx = struct { records: []const []const u8, out: []Word };
-            Dpf.evalFullWith(party, share, records.len, Ctx{ .records = records, .out = out }, struct {
+            Dpf.evalRangeWith(party, share, lo, hi, Ctx{ .records = records, .out = out }, struct {
                 fn emit(ctx: Ctx, x: usize, sel: Word) void {
                     const rec = ctx.records[x];
                     for (ctx.out, 0..) |*w, j| w.* +%= sel *% wordAt(rec, j);
                 }
             }.emit);
+        }
+
+        /// `answer` over a slice of records rather than one flat buffer.
+        /// Exactly `answerSlicesRange(party, share, records, 0, records.len,
+        /// out)` — see `answerSlicesRange`.
+        pub fn answerSlices(party: u1, share: Share, records: []const []const u8, out: []Word) Error!void {
+            return answerSlicesRange(party, share, records, 0, records.len, out);
+        }
+
+        /// Combine two answer-shaped buffers by ring (wrapping) addition,
+        /// `dst[j] +%= src[j]` word by word. This is how a caller sums
+        /// `answerRange`'s partial answers for disjoint shards of
+        /// `[0, count())` back into one full-database answer — shards do
+        /// NOT concatenate, they add, per `answerRange`'s doc comment.
+        /// `dst.len` and `src.len` must already match (both are always
+        /// `answerWords(record_len)` for the same database, so a caller
+        /// combining its own shards never has a mismatch in practice; the
+        /// check exists for the untrusted-shape discipline every other
+        /// function here keeps).
+        pub fn accumulate(dst: []Word, src: []const Word) Error!void {
+            if (dst.len != src.len) return error.AnswerLengthMismatch;
+            for (dst, src) |*d, s| d.* +%= s;
         }
 
         /// Serialize an answer, little-endian per word.
@@ -947,6 +1032,217 @@ test "SELF: every database record influences the answer (no index-dependent acce
         bytes[x * record_len] ^= 0x01;
         try testing.expect(!std.mem.eql(P.Word, base[0..n_words], perturbed[0..n_words]));
     }
+}
+
+// ── answerRange: the sharding entry point (F4) ──────────────────────────────
+//
+// The oracle for all of this is `answer` itself, UNCHANGED (it is now defined
+// as `answerRange(..., 0, count, ...)`, but that definition is exactly what
+// is under test — these tests never assume it, they call `answer` and
+// `answerRange` as two independently-named entry points and check they agree
+// with each other and, via `reconstruct`, with the record actually stored).
+
+test "DERIVED: summing answerRange shards reproduces answer bit-for-bit, over several shard counts (incl. non-dividing) and domain sizes, incl. len-0 and len-1 shards" {
+    const cases = .{
+        .{ .bits = 3, .count = 7 }, // one below a power of two
+        .{ .bits = 5, .count = 20 }, // the general awkward case
+        .{ .bits = 6, .count = 33 }, // one above a power of two
+    };
+    const record_len = 9;
+
+    inline for (cases) |c| {
+        const P = Pir(c.bits, 4);
+        var bytes: [64 * 9]u8 = undefined;
+        const db_bytes = bytes[0 .. c.count * record_len];
+        fillDb(db_bytes, record_len);
+        const database = try Database.init(db_bytes, record_len);
+        const n_words = P.answerWords(record_len);
+
+        // Query several indices, including in-domain-but-past-the-database.
+        const query_indices = [_]usize{ 0, c.count / 2, c.count - 1 };
+        for (query_indices) |qi| {
+            const seeds = detSeeds(@as(u64, c.bits) * 7_919 + qi);
+            const shares = try P.query(qi, seeds[0], seeds[1]);
+
+            var want0: [3]P.Word = undefined;
+            var want1: [3]P.Word = undefined;
+            try P.answer(0, shares[0], database, want0[0..n_words]);
+            try P.answer(1, shares[1], database, want1[0..n_words]);
+
+            // Shard counts: 1 (degenerate single shard), 2 (divides evenly
+            // for even counts), 3 (does not divide most of these), and a
+            // count larger than the database (forces len-0/len-1 shards).
+            const shard_counts = [_]usize{ 1, 2, 3, c.count + 5 };
+            for (shard_counts) |shards| {
+                var got0: [3]P.Word = @splat(0);
+                var got1: [3]P.Word = @splat(0);
+                var lo: usize = 0;
+                var s: usize = 0;
+                var shard_lens_seen_zero = false;
+                var shard_lens_seen_one = false;
+                while (s < shards) : (s += 1) {
+                    const remaining_shards = shards - s;
+                    const remaining = c.count - lo;
+                    const len = (remaining + remaining_shards - 1) / remaining_shards;
+                    const hi = @min(lo + len, c.count);
+                    if (hi - lo == 0) shard_lens_seen_zero = true;
+                    if (hi - lo == 1) shard_lens_seen_one = true;
+
+                    var part0: [3]P.Word = undefined;
+                    var part1: [3]P.Word = undefined;
+                    try P.answerRange(0, shares[0], database, lo, hi, part0[0..n_words]);
+                    try P.answerRange(1, shares[1], database, lo, hi, part1[0..n_words]);
+                    try P.accumulate(got0[0..n_words], part0[0..n_words]);
+                    try P.accumulate(got1[0..n_words], part1[0..n_words]);
+                    lo = hi;
+                }
+                try testing.expectEqual(c.count, lo);
+                try testing.expectEqualSlices(P.Word, want0[0..n_words], got0[0..n_words]);
+                try testing.expectEqualSlices(P.Word, want1[0..n_words], got1[0..n_words]);
+                // shard_counts = count+5 must have produced at least one
+                // len-0 and one len-1 shard at the tail, or this case isn't
+                // exercising what it claims to.
+                if (shards == c.count + 5) {
+                    try testing.expect(shard_lens_seen_zero);
+                    try testing.expect(shard_lens_seen_one);
+                }
+
+                // And the reconstruction still recovers the queried record —
+                // not just internal agreement between two answer routes.
+                var got_rec: [record_len]u8 = undefined;
+                try P.reconstruct(got0[0..n_words], got1[0..n_words], &got_rec);
+                if (qi < c.count) {
+                    try testing.expectEqualSlices(u8, database.record(qi), &got_rec);
+                } else {
+                    try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got_rec);
+                }
+            }
+        }
+    }
+}
+
+test "SELF: answerRange explicit len-0 (start/middle/end) and len-1 shards, boundary-adjacent to the queried index" {
+    const P = Pir(5, 4);
+    const record_len = 8;
+    const count = 20;
+    var bytes: [count * record_len]u8 = undefined;
+    fillDb(&bytes, record_len);
+    const database = try Database.init(&bytes, record_len);
+    const n_words = P.answerWords(record_len);
+    const qi = 9;
+    const seeds = detSeeds(24601);
+    const shares = try P.query(qi, seeds[0], seeds[1]);
+
+    // len-0 at the very start, exactly at the query index (both edges), and
+    // at the database end — a shard with nothing to do must be a no-op, not
+    // a partial or garbage contribution.
+    for ([_][2]usize{ .{ 0, 0 }, .{ qi, qi }, .{ qi + 1, qi + 1 }, .{ count, count } }) |range| {
+        var out: [2]P.Word = @splat(0xAB); // poison, so a stray write is visible
+        try P.answerRange(0, shares[0], database, range[0], range[1], out[0..n_words]);
+        try testing.expectEqualSlices(P.Word, &(([2]P.Word){ 0, 0 }), out[0..n_words]);
+    }
+
+    // len-1 exactly on the queried index must, on its own, be the same as
+    // querying the record straight (both parties, then reconstruct) — this
+    // is the sharpest boundary case: get the ±1 wrong and this is where it
+    // shows.
+    {
+        var a0: [2]P.Word = undefined;
+        var a1: [2]P.Word = undefined;
+        try P.answerRange(0, shares[0], database, qi, qi + 1, a0[0..n_words]);
+        try P.answerRange(1, shares[1], database, qi, qi + 1, a1[0..n_words]);
+        var got: [record_len]u8 = undefined;
+        try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
+        try testing.expectEqualSlices(u8, database.record(qi), &got);
+    }
+    // len-1 one before and one after the queried index must reconstruct to
+    // all zero (the DPF's spike is not in either singleton shard).
+    for ([_][2]usize{ .{ qi - 1, qi }, .{ qi + 1, qi + 2 } }) |range| {
+        var a0: [2]P.Word = undefined;
+        var a1: [2]P.Word = undefined;
+        try P.answerRange(0, shares[0], database, range[0], range[1], a0[0..n_words]);
+        try P.answerRange(1, shares[1], database, range[0], range[1], a1[0..n_words]);
+        var got: [record_len]u8 = undefined;
+        try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
+        try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
+    }
+}
+
+test "SELF: every record in a shard's range influences that shard's answer (no index-dependent access pattern)" {
+    // The same teeth as the full-database version, restricted to a shard —
+    // answerRange must not skip a record inside its own range either.
+    const P = Pir(5, 4);
+    const record_len = 8;
+    const count = 20;
+    var bytes: [count * record_len]u8 = undefined;
+    fillDb(&bytes, record_len);
+    const seeds = detSeeds(556);
+    const shares = try P.query(15, seeds[0], seeds[1]);
+    const n_words = P.answerWords(record_len);
+    const lo = 6;
+    const hi = 17;
+
+    var base: [2]P.Word = undefined;
+    try P.answerRange(0, shares[0], try Database.init(&bytes, record_len), lo, hi, base[0..n_words]);
+
+    for (lo..hi) |x| {
+        bytes[x * record_len] ^= 0x01;
+        var perturbed: [2]P.Word = undefined;
+        try P.answerRange(0, shares[0], try Database.init(&bytes, record_len), lo, hi, perturbed[0..n_words]);
+        bytes[x * record_len] ^= 0x01;
+        try testing.expect(!std.mem.eql(P.Word, base[0..n_words], perturbed[0..n_words]));
+    }
+}
+
+// `answerRange`'s access-pattern independence from the queried index is a
+// STRUCTURAL claim (the pruning decision in `walkRange` depends only on
+// `(lo, hi, level, base)`, never on `s`/`t`/anything key-derived — see
+// `fss/src/dpf.zig`'s `evalRangeWith` doc comment), and it is pinned where
+// it can actually be observed: `fss/src/kat_test.zig`'s
+// `evalRangeWith`/`walkRange` tests fix the emission order and set of `x`
+// touched for a given `(lo, hi)` regardless of which `α` the key hides. A
+// wrapper test at this layer would only re-assert the same structural fact
+// through an extra hop (`Database.record`, which is a pure index→slice
+// function with nothing to instrument), so it is not repeated here.
+
+test "SELF: answerSlicesRange agrees with answerRange over the flat database" {
+    const P = Pir(5, 4);
+    const record_len = 8;
+    const count = 20;
+    var bytes: [count * record_len]u8 = undefined;
+    fillDb(&bytes, record_len);
+    const database = try Database.init(&bytes, record_len);
+    var recs: [count][]const u8 = undefined;
+    for (&recs, 0..) |*r, x| r.* = database.record(x);
+    const n_words = P.answerWords(record_len);
+
+    const seeds = detSeeds(7331);
+    const shares = try P.query(12, seeds[0], seeds[1]);
+    for ([_][2]usize{ .{ 0, count }, .{ 3, 11 }, .{ 0, 0 }, .{ 19, 20 } }) |range| {
+        var flat: [2]P.Word = undefined;
+        var sliced: [2]P.Word = undefined;
+        try P.answerRange(0, shares[0], database, range[0], range[1], flat[0..n_words]);
+        try P.answerSlicesRange(0, shares[0], &recs, range[0], range[1], sliced[0..n_words]);
+        try testing.expectEqualSlices(P.Word, flat[0..n_words], sliced[0..n_words]);
+    }
+}
+
+test "SELF: answerRange rejects a malformed [lo, hi) instead of computing garbage" {
+    const P = Pir(4, 4);
+    const record_len = 8;
+    var bytes: [10 * record_len]u8 = undefined;
+    fillDb(&bytes, record_len);
+    const database = try Database.init(&bytes, record_len);
+    const n_words = P.answerWords(record_len);
+    const seeds = detSeeds(404);
+    const shares = try P.query(2, seeds[0], seeds[1]);
+    var out: [2]P.Word = undefined;
+
+    try testing.expectError(error.InvalidRange, P.answerRange(0, shares[0], database, 5, 3, out[0..n_words])); // lo > hi
+    try testing.expectError(error.InvalidRange, P.answerRange(0, shares[0], database, 0, 11, out[0..n_words])); // hi > count()
+    try testing.expectError(error.InvalidRange, P.answerRange(0, shares[0], database, 11, 11, out[0..n_words])); // lo == hi but both past count()
+    // hi == count() exactly is the valid boundary, not an error.
+    try P.answerRange(0, shares[0], database, 0, 10, out[0..n_words]);
 }
 
 test "SELF: an index inside the domain but past the database reconstructs to zero" {

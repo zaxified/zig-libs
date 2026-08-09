@@ -36,7 +36,12 @@
 //!     `shareToBytes`/`shareFromBytes`/`answerToBytes`/`answerFromBytes`/
 //!     `reconstructFromBytes`. The server side runs on `fss`'s tree-reuse
 //!     `evalFull` — ~1 PRG call per record, never touching the domain's
-//!     unused tail.
+//!     unused tail. `.answerRange(party, share, db, lo, hi, out)` shards
+//!     that same walk by index range — `.answer` is now its `[0, count())`
+//!     special case — so a caller with `T` cores can split a server's
+//!     `O(N)` answer computation across them (each shard: `O((hi-lo) +
+//!     domain_bits)`, not `O(N)` per shard) and combine the partial answers
+//!     with `.accumulate`. This module still starts no threads itself.
 //!   - `Pir(...).queryKeyword(kw, s0, s1)` — **lookup by keyword**: exactly
 //!     `query(keywordIndex(kw), …)`, where `keywordIndex` is a public, total,
 //!     deterministic SHA-256→index map. A miss is the same call as a hit —
@@ -117,6 +122,7 @@ test {
     _ = pir_mod;
     _ = verify_mod;
     _ = @import("privacy_test.zig");
+    _ = @import("bench.zig");
 }
 
 test "SELF: the README's end-to-end example compiles and retrieves" {

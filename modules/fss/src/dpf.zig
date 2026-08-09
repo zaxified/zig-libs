@@ -371,7 +371,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
                     o[x] = v;
                 }
             };
-            walkPrefix([]Elem, sink.emit, P.init(), &key, b, key.seed, b, 0, 0, out.len, out);
+            walkRange([]Elem, sink.emit, P.init(), &key, b, key.seed, b, 0, 0, 0, out.len, out);
         }
 
         /// **EvalFullWith** — the same tree-reuse prefix walk as `evalFull`,
@@ -388,18 +388,68 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             comptime emit: fn (@TypeOf(context), usize, Elem) void,
         ) void {
             std.debug.assert(count <= domain_size);
-            walkPrefix(@TypeOf(context), emit, P.init(), &key, b, key.seed, b, 0, 0, count, context);
+            walkRange(@TypeOf(context), emit, P.init(), &key, b, key.seed, b, 0, 0, 0, count, context);
         }
 
-        /// The shared walk under `evalFull`/`evalFullWith`. Recursive; depth
-        /// is bounded by `n <= 31` with a small frame, so stack use is
-        /// trivial. Per level this applies exactly `eval`'s formulas — the
-        /// seed CW XOR gated by the PARENT's control bit, the child control
-        /// bits from `t_cw_l`/`t_cw_r` — and at a leaf exactly `eval`'s output
-        /// step (`convert`, `t`-gated `cw_final`, `(-1)^b`). Equivalence to
-        /// `eval` is asserted element-for-element in `kat_test.zig`, with
-        /// `evalAll`'s independent naive loop as the oracle.
-        fn walkPrefix(
+        /// **EvalRangeWith** — the tree-reuse walk restricted to
+        /// `x ∈ [lo, hi)`, `0 <= lo <= hi <= domain_size`. `emit(context, x,
+        /// elem)` fires once per `x` in the range, in ascending order,
+        /// bit-for-bit what `eval(b, key, x)` returns for that `x` — same
+        /// guarantee as `evalFullWith`, just windowed on the low end too
+        /// instead of only the high end.
+        ///
+        /// This generalizes `evalFullWith`'s prefix pruning ("a subtree
+        /// lying entirely at/past `count` is skipped before its PRG call")
+        /// symmetrically: a subtree lying entirely *before* `lo` is now
+        /// skipped the same way, before its PRG call. `evalFullWith(b, key,
+        /// count, ctx, emit)` IS `evalRangeWith(b, key, 0, count, ctx,
+        /// emit)` — the identical walk, one call site each — so a caller
+        /// that shards `[0, N)` into disjoint `[lo_i, hi_i)` ranges and calls
+        /// this once per shard runs the bit-for-bit same code as the
+        /// unsharded `evalFullWith`, not a second implementation that could
+        /// drift from it. Per shard the cost is `O(hi-lo)` PRG calls for the
+        /// shard's own leaves plus at most `O(n_bits)` extra for the two
+        /// root-to-boundary paths — `T` disjoint shards covering `[0, N)`
+        /// cost at most `O(N + T·n_bits)` total, not `O(T·N)`, which is the
+        /// whole point of seeding from the range instead of re-walking the
+        /// full prefix and discarding what falls outside it.
+        ///
+        /// **What the range reveals, and what it does not:** the pruning
+        /// decision at every node depends only on `(lo, hi, level, base)` —
+        /// the caller's own range and the node's position in the tree —
+        /// never on `s`, `t`, or anything else derived from the key. Two
+        /// calls with the same `(lo, hi)` over keys generated for
+        /// *different* `α` therefore make the exact same sequence of PRG
+        /// calls and emit into the exact same set of `x`, in the same
+        /// order; the shard boundaries a caller chooses are public
+        /// information the caller already had (they are the caller's own
+        /// work-partitioning decision), and evaluating a shard reveals
+        /// nothing beyond that about which index the key hides. This is the
+        /// same access-pattern discipline `evalFullWith` already has over
+        /// `[0, count)`, just also enforced on the left edge.
+        pub fn evalRangeWith(
+            b: u1,
+            key: Key,
+            lo: usize,
+            hi: usize,
+            context: anytype,
+            comptime emit: fn (@TypeOf(context), usize, Elem) void,
+        ) void {
+            std.debug.assert(lo <= hi);
+            std.debug.assert(hi <= domain_size);
+            walkRange(@TypeOf(context), emit, P.init(), &key, b, key.seed, b, 0, 0, lo, hi, context);
+        }
+
+        /// The shared walk under `evalFull`/`evalFullWith`/`evalRangeWith`.
+        /// Recursive; depth is bounded by `n <= 31` with a small frame, so
+        /// stack use is trivial. Per level this applies exactly `eval`'s
+        /// formulas — the seed CW XOR gated by the PARENT's control bit, the
+        /// child control bits from `t_cw_l`/`t_cw_r` — and at a leaf exactly
+        /// `eval`'s output step (`convert`, `t`-gated `cw_final`, `(-1)^b`).
+        /// Equivalence to `eval` is asserted element-for-element in
+        /// `kat_test.zig`, with `evalAll`'s independent naive loop as the
+        /// oracle.
+        fn walkRange(
             comptime Context: type,
             comptime emit: fn (Context, usize, Elem) void,
             p: P,
@@ -409,13 +459,17 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             t: u1,
             level: usize,
             base: usize,
-            count: usize,
+            lo: usize,
+            hi: usize,
             context: Context,
         ) void {
             // This node's subtree covers leaves [base, base + 2^(n-level)).
-            // If that lies entirely at/past the prefix end, skip before the
-            // PRG call — the unused tail of the domain costs zero hashes.
-            if (base >= count) return;
+            // Skip before the PRG call if the subtree lies entirely at/past
+            // `hi` (the original prefix pruning) OR entirely before `lo`
+            // (symmetric: the new left-edge pruning `evalRangeWith` needs).
+            if (base >= hi) return;
+            const size = @as(usize, 1) << @intCast(n_bits - level);
+            if (base + size <= lo) return;
             if (level == n_bits) {
                 const leaf: Elem = p.convert(out_bytes, s);
                 const v0 = G.add(leaf, key.cw_final & (0 -% @as(Elem, t)));
@@ -425,17 +479,17 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             }
             const e = p.expand(s);
             const c = key.cw[level];
-            const half = @as(usize, 1) << @intCast(n_bits - 1 - level);
+            const half = size >> 1;
 
             var s_l = e.s_l;
             const t_l = e.t_l ^ (t & c.t_cw_l);
             xorMasked(&s_l, c.s_cw, t);
-            walkPrefix(Context, emit, p, key, b, s_l, t_l, level + 1, base, count, context);
+            walkRange(Context, emit, p, key, b, s_l, t_l, level + 1, base, lo, hi, context);
 
             var s_r = e.s_r;
             const t_r = e.t_r ^ (t & c.t_cw_r);
             xorMasked(&s_r, c.s_cw, t);
-            walkPrefix(Context, emit, p, key, b, s_r, t_r, level + 1, base + half, count, context);
+            walkRange(Context, emit, p, key, b, s_r, t_r, level + 1, base + half, lo, hi, context);
         }
 
         /// Full-domain correctness checker (REAL/ungated). Given both parties'

@@ -315,3 +315,161 @@ test "evalFullWith streams the same values, each index exactly once, in order" {
         try std.testing.expectEqualSlices(D.Elem, &buf, &vals);
     }
 }
+
+// ── evalRangeWith: the sharding entry point (F4) ────────────────────────────
+//
+// `evalRangeWith(b, key, lo, hi, ...)` is `evalFullWith`'s prefix pruning made
+// symmetric on the left edge, so it can seed a walk at any [lo, hi) window
+// instead of only [0, hi). The oracle for all of this is `evalFull` — the
+// UNCHANGED tree-reuse full-prefix walk, itself already anchored against the
+// structurally-independent `evalAll` above. Bit-identical, not "close".
+
+test "evalRangeWith(0, hi) reproduces evalFullWith(hi) — the lo=0 case is not a second implementation" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const D = Dpf(9, 4);
+    const seeds = efSeeds(61);
+    const keys = D.genWithSeeds(200, 0x1357, seeds[0], seeds[1]);
+    const count = 300;
+    inline for (.{ 0, 1 }) |b| {
+        var full: [count]D.Elem = undefined;
+        D.evalFull(b, keys[b], &full);
+
+        var ranged: [count]D.Elem = undefined;
+        const Ctx = struct {
+            out: *[count]D.Elem,
+            fn emit(ctx: @This(), x: usize, v: D.Elem) void {
+                ctx.out[x] = v;
+            }
+        };
+        D.evalRangeWith(b, keys[b], 0, count, Ctx{ .out = &ranged }, Ctx.emit);
+        try std.testing.expectEqualSlices(D.Elem, &full, &ranged);
+    }
+}
+
+test "evalRangeWith: disjoint shards sum to evalFull, over several shard counts incl. ones that don't divide the domain, incl. len-0 and len-1 shards" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    // 200 leaves: deliberately not a power of two, so shard counts that
+    // don't divide it evenly are the common case, not a special one.
+    const D = Dpf(10, 4);
+    const seeds = efSeeds(88);
+    const keys = D.genWithSeeds(137, 0xF00D, seeds[0], seeds[1]);
+    const n = 200;
+
+    var want: [n]D.Elem = undefined;
+    D.evalFull(0, keys[0], &want);
+
+    // shard_counts includes 1 (degenerate: one shard, the whole range),
+    // 2 and 3 (2 divides 200 evenly, 3 does not — 200/3 leaves a remainder
+    // shard), and a count deliberately larger than n so most shards are
+    // len-0 or len-1 at the tail.
+    const shard_counts = [_]usize{ 1, 2, 3, 7, 251 };
+    const Ctx = struct {
+        out: *[n]D.Elem,
+        fn emit(ctx: @This(), x: usize, v: D.Elem) void {
+            ctx.out[x] = v;
+        }
+    };
+    for (shard_counts) |shards| {
+        var got: [n]D.Elem = @splat(0);
+        var saw: [n]bool = @splat(false);
+        var lo: usize = 0;
+        var shard_idx: usize = 0;
+        while (shard_idx < shards) : (shard_idx += 1) {
+            // ceil-divide the remaining range across the remaining shards so
+            // every leaf lands in exactly one shard, including the len-0
+            // shards once `lo == n` (shards > n).
+            const remaining_shards = shards - shard_idx;
+            const remaining = n - lo;
+            const len = (remaining + remaining_shards - 1) / remaining_shards;
+            const hi = @min(lo + len, n);
+            D.evalRangeWith(0, keys[0], lo, hi, Ctx{ .out = &got }, Ctx.emit);
+            for (lo..hi) |x| {
+                try std.testing.expect(!saw[x]); // each leaf touched by exactly one shard
+                saw[x] = true;
+            }
+            lo = hi;
+        }
+        try std.testing.expectEqual(n, lo);
+        for (0..n) |x| try std.testing.expect(saw[x]);
+        try std.testing.expectEqualSlices(D.Elem, &want, &got);
+    }
+}
+
+test "evalRangeWith: explicit len-0 and len-1 shards at the domain start, middle, and end" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const D = Dpf(8, 4);
+    const seeds = efSeeds(99);
+    const keys = D.genWithSeeds(0, 5, seeds[0], seeds[1]); // α at the very first index
+    const Ctx = struct {
+        calls: *usize,
+        last_x: *usize,
+        fn emit(ctx: @This(), x: usize, v: D.Elem) void {
+            _ = v;
+            ctx.calls.* += 1;
+            ctx.last_x.* = x;
+        }
+    };
+    inline for (.{ 0, 1 }) |b| {
+        // len 0 at the start: no emits at all.
+        {
+            var calls: usize = 0;
+            var last_x: usize = 0;
+            D.evalRangeWith(b, keys[b], 0, 0, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            try std.testing.expectEqual(@as(usize, 0), calls);
+        }
+        // len 0 in the middle (lo == hi, both nonzero): no emits.
+        {
+            var calls: usize = 0;
+            var last_x: usize = 0;
+            D.evalRangeWith(b, keys[b], 40, 40, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            try std.testing.expectEqual(@as(usize, 0), calls);
+        }
+        // len 0 at the domain end: no emits.
+        {
+            var calls: usize = 0;
+            var last_x: usize = 0;
+            D.evalRangeWith(b, keys[b], D.domain_size, D.domain_size, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            try std.testing.expectEqual(@as(usize, 0), calls);
+        }
+        // len 1 exactly on α (index 0): the on-path single-leaf shard.
+        {
+            var calls: usize = 0;
+            var last_x: usize = 0;
+            D.evalRangeWith(b, keys[b], 0, 1, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            try std.testing.expectEqual(@as(usize, 1), calls);
+            try std.testing.expectEqual(@as(usize, 0), last_x);
+        }
+        // len 1 well off-path, at the last index.
+        {
+            var calls: usize = 0;
+            var last_x: usize = 0;
+            D.evalRangeWith(b, keys[b], D.domain_size - 1, D.domain_size, Ctx{ .calls = &calls, .last_x = &last_x }, Ctx.emit);
+            try std.testing.expectEqual(@as(usize, 1), calls);
+            try std.testing.expectEqual(D.domain_size - 1, last_x);
+        }
+    }
+    // Reconstruct from three shards touching α at index 0, plus a len-1 and
+    // a len-0 shard elsewhere, and check the sum still lands on β at α and
+    // 0 everywhere else queried — the off-by-one risk at a shard boundary
+    // is exactly what this pins.
+    {
+        var a0_on: D.Elem = undefined;
+        var a1_on: D.Elem = undefined;
+        const OnCtx = struct {
+            out: *D.Elem,
+            fn emit(ctx: @This(), x: usize, v: D.Elem) void {
+                _ = x;
+                ctx.out.* = v;
+            }
+        };
+        D.evalRangeWith(0, keys[0], 0, 1, OnCtx{ .out = &a0_on }, OnCtx.emit);
+        D.evalRangeWith(1, keys[1], 0, 1, OnCtx{ .out = &a1_on }, OnCtx.emit);
+        try std.testing.expectEqual(@as(D.Elem, 5), D.G.add(a0_on, a1_on));
+
+        var a0_off: D.Elem = undefined;
+        var a1_off: D.Elem = undefined;
+        D.evalRangeWith(0, keys[0], 1, 2, OnCtx{ .out = &a0_off }, OnCtx.emit);
+        D.evalRangeWith(1, keys[1], 1, 2, OnCtx{ .out = &a1_off }, OnCtx.emit);
+        try std.testing.expectEqual(@as(D.Elem, 0), D.G.add(a0_off, a1_off));
+    }
+}

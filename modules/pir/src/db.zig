@@ -57,6 +57,11 @@ pub const Error = error{
     /// (or the queried index is past the database — see `verify.zig` on why
     /// that case rejects). Detection only: no recovery, no attribution.
     AnswerRejected,
+    /// `answerRange`/`answerSlicesRange`'s `[lo, hi)` was malformed: `lo >
+    /// hi`, or `hi` past the database's record count. A caller sharding
+    /// `[0, count())` by hand cannot produce this from correct arithmetic —
+    /// it means the shard boundaries themselves are wrong.
+    InvalidRange,
 };
 
 /// A borrowed, fixed-record-length view over a database. Both servers MUST
