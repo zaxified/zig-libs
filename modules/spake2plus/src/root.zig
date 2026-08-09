@@ -833,6 +833,8 @@ pub fn verifierFinish(
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("bssl_w0w1_vectors.zig");
+    _ = @import("bssl_w0w1_test.zig");
 }
 
 test "meta.model_after names RFC 9383 / SPAKE2+ (not RFC 9382 / plain SPAKE2)" {

@@ -80,6 +80,39 @@ part of the repository and is not itself a design reference for the Zig
 code (the Zig `root.zig` doc comments are the authoritative construction
 description, written first).
 
+External interop vectors (captured, not copied)
+-----------------------------------------------
+
+`interop_vectors.zig` holds bytes CAPTURED by running source (1) above:
+
+  crate:    schnorr_fun 0.13.0   (license 0BSD)
+  crate:    secp256kfun 0.12.1   (license 0BSD, pulled transitively)
+  repo:     https://github.com/LLFourn/secp256kfun
+  captured: 2026-08-09, rustc 1.93.1
+  command:  cargo run --release --manifest-path ~/.cache/zig-libs-adaptor/Cargo.toml \
+              > modules/adaptor/src/interop_vectors.zig
+
+The generator (a ~300-line Rust program kept OUTSIDE this repository, under
+`~/.cache/zig-libs-adaptor/`, exactly like the other modules' live
+counterparts) links the published crates and records the values they compute
+at run time. No secp256kfun/schnorr_fun source is copied or translated into
+this repository, and `build.zig.zon` gains no dependency: the captured bytes
+are permanent, so `zig build test-adaptor` runs fully offline with the Rust
+toolchain deleted, and never skips.
+
+0BSD ("BSD Zero Clause") is public-domain-equivalent and carries NO
+attribution or notice-retention condition, so nothing about these vectors
+propagates a foreign term into the root `NOTICE`. This section exists as the
+same design-reference courtesy as source (1), plus reproducibility.
+
+Two corpora are frozen. `foreign_vectors` are pre-signatures schnorr_fun
+ORIGINATED — inputs this module's own `preSign` can never produce, since the
+two nonce derivations differ by design — against which `preVerify`, `adapt`
+and `extract` are asserted byte-exact. `self_authored_cross_check` is
+schnorr_fun's verdict and outputs on the six self-authored vectors above:
+`verify_encrypted_signature` accepted all six, and its `decrypt_signature`
+output is byte-identical to each vector's `sig` field.
+
 **Status: scaffold.** Wire codecs (`AdaptorPoint`, `PreSignature`) are
 implemented and tested for real. The four crypto cores (`preSign`,
 `preVerify`, `adapt`, `extract`) are `@panic("TODO(fable): ...")` stubs

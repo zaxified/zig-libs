@@ -25,6 +25,17 @@
 //! exact adaptor secret, and every tamper — wrong `T`, wrong message,
 //! wrong pre-signature — is rejected).
 //!
+//! Because a self-authored corpus cannot catch a convention error it shares
+//! with the code, `interop_vectors.zig` additionally carries EXTERNAL vectors
+//! captured from LLFourn/secp256kfun's `schnorr_fun::adaptor` (0BSD): twelve
+//! pre-signatures that implementation ORIGINATED (which `preSign` here can
+//! never produce — the nonce derivations differ by design), plus its verdict
+//! on all six self-authored vectors. `interop_test.zig` asserts `preVerify`
+//! accepts them, and that `adapt`/`extract` reproduce `decrypt_signature`/
+//! `recover_decryption_key` byte-for-byte. The bytes are frozen, so those
+//! tests are fully offline; see `NOTICE` for versions and the regeneration
+//! command.
+//!
 //! Zig std GAP: yes, same shape as `bip340`/`musig2` — `std.crypto.ecc.
 //! Secp256k1` supplies the curve group; this module supplies the adaptor-
 //! signature-specific convention (the adapted-nonce point `R + T`, the
@@ -578,6 +589,8 @@ pub fn extract(presig: PreSignature, full_sig: bip340.Signature, adaptor_point: 
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("interop_vectors.zig");
+    _ = @import("interop_test.zig");
 }
 
 test "meta.model_after names the scriptless-scripts construction and the sibling bip340 dep" {

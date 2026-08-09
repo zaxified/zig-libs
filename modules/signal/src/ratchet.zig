@@ -12,9 +12,13 @@
 //! **Status: COMPLETE.** State, both `KDF_RK`/`KDF_CK`, the symmetric-key
 //! and DH ratchets, `MAX_SKIP`-bounded skipped-message handling, a
 //! transactional (fail-closed) `decrypt`, and the header codec are all
-//! real and tested (self-consistency + spec-adherence — see "Test
-//! vectors" in `../NOTICE`; the spec, like X3DH/XEdDSA, publishes no
-//! numeric worked example).
+//! real and tested. The spec, like X3DH/XEdDSA, publishes no numeric worked
+//! example, and no whole-MESSAGE interop vector can exist for this
+//! instantiation (see the AEAD note below) — but the ratchet's KDF core is
+//! externally anchored: `interop_vectors.zig` freezes chain-ratchet ladders
+//! and root-ratchet steps captured from **libsignal**, and the tests at the
+//! foot of this file assert `kdfCk` and `KDF_RK`'s spec-fixed part
+//! byte-for-byte against them. See "Test vectors" in `../NOTICE`.
 //!
 //! ## The two ratchets (spec §3)
 //!
@@ -489,16 +493,15 @@ fn dhRatchet(work: *Scalars, header: Header, io: std.Io) DecryptError!void {
 
     const dh_recv = X25519.scalarmult(work.dhs.secret_key, header.dh) catch
         return error.KeyAgreementFailed;
-    const recv = kdfRk(work.rk, dh_recv);
-    work.rk = recv.rk;
-    work.ckr = recv.ck;
-
-    work.dhs = X25519.KeyPair.generate(io);
-    const dh_send = X25519.scalarmult(work.dhs.secret_key, header.dh) catch
+    const new_dhs = X25519.KeyPair.generate(io);
+    const dh_send = X25519.scalarmult(new_dhs.secret_key, header.dh) catch
         return error.KeyAgreementFailed;
-    const send = kdfRk(work.rk, dh_send);
-    work.rk = send.rk;
-    work.cks = send.ck;
+
+    const step = rootRatchet(work.rk, dh_recv, dh_send);
+    work.dhs = new_dhs;
+    work.rk = step.rk;
+    work.ckr = step.ckr;
+    work.cks = step.cks;
 }
 
 // ── KDFs (spec §5.2) ────────────────────────────────────────────────────
@@ -506,15 +509,61 @@ fn dhRatchet(work: *Scalars, header: Header, io: std.Io) DecryptError!void {
 const RkStep = struct { rk: [root_key_length]u8, ck: [chain_key_length]u8 };
 const CkStep = struct { ck: [chain_key_length]u8, mk: [message_key_length]u8 };
 
-/// `KDF_RK(RK, dh_out)` = HKDF-SHA256(salt = RK, ikm = dh_out,
-/// info = kdf_rk_info) -> 64 bytes -> `RK' ‖ CK`.
-fn kdfRk(rk: [root_key_length]u8, dh_out: [key_length]u8) RkStep {
+/// `KDF_RK` with the HKDF `info` left open. The spec makes `info`
+/// application-defined, so it is the ONE part of `KDF_RK` on which two
+/// correct implementations legitimately differ — everything else (root key as
+/// the Extract SALT and the DH output as the IKM, **not** the reverse; a
+/// 64-byte Expand; the `RK' ‖ CK` split in that order) is fixed by §5.2 and is
+/// exactly where a self-consistent implementation can diverge invisibly.
+/// Parameterising `info` is what lets `interop_vectors.zig`'s libsignal bytes
+/// check that fixed part byte-for-byte against the real production code path;
+/// `kdfRk` below pins this module's own constant.
+fn kdfRkWithInfo(comptime info: []const u8, rk: [root_key_length]u8, dh_out: [key_length]u8) RkStep {
     const prk = HkdfSha256.extract(&rk, &dh_out);
     var okm: [root_key_length + chain_key_length]u8 = undefined;
-    HkdfSha256.expand(&okm, kdf_rk_info, prk);
+    HkdfSha256.expand(&okm, info, prk);
     const result: RkStep = .{ .rk = okm[0..root_key_length].*, .ck = okm[root_key_length..].* };
     std.crypto.secureZero(u8, &okm);
     return result;
+}
+
+/// `KDF_RK(RK, dh_out)` = HKDF-SHA256(salt = RK, ikm = dh_out,
+/// info = kdf_rk_info) -> 64 bytes -> `RK' ‖ CK`.
+fn kdfRk(rk: [root_key_length]u8, dh_out: [key_length]u8) RkStep {
+    return kdfRkWithInfo(kdf_rk_info, rk, dh_out);
+}
+
+const RootRatchetStep = struct {
+    rk: [root_key_length]u8,
+    ckr: [chain_key_length]u8,
+    cks: [chain_key_length]u8,
+};
+
+/// The ROOT half of a DH ratchet step: two chained `KDF_RK` calls, the
+/// receiving chain first, with the root key threaded from the first into the
+/// second. The ORDER matters and is not observable from a self-consistent
+/// round trip — swapping the two DH outputs, or feeding the original `RK`
+/// into the second call instead of the freshly derived one, leaves Alice and
+/// Bob agreeing with each other while diverging from every other
+/// implementation. `interop_vectors.zig` anchors it against libsignal's
+/// `RootKey::create_chain` pair.
+fn rootRatchetWithInfo(
+    comptime info: []const u8,
+    rk: [root_key_length]u8,
+    dh_recv: [key_length]u8,
+    dh_send: [key_length]u8,
+) RootRatchetStep {
+    const recv = kdfRkWithInfo(info, rk, dh_recv);
+    const send = kdfRkWithInfo(info, recv.rk, dh_send);
+    return .{ .rk = send.rk, .ckr = recv.ck, .cks = send.ck };
+}
+
+fn rootRatchet(
+    rk: [root_key_length]u8,
+    dh_recv: [key_length]u8,
+    dh_send: [key_length]u8,
+) RootRatchetStep {
+    return rootRatchetWithInfo(kdf_rk_info, rk, dh_recv, dh_send);
 }
 
 /// `KDF_CK(CK)` = HMAC-SHA256 keyed by `CK`: `HMAC(CK, 0x01) -> MK`,
@@ -987,4 +1036,108 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
     // untouched on any error per `decrypt`'s transactional-commit doc.
     const pt = bob.decrypt(alloc, header, ct_buf[0..ct_len], io) catch return;
     alloc.free(pt);
+}
+
+// ── EXTERNAL interop: libsignal-captured KDF vectors ────────────────────
+//
+// Everything above this line is anchored by self-consistency and spec
+// adherence: Alice and Bob agreeing with each other. That proves they share a
+// convention, not that the convention is the Double Ratchet's (audit finding
+// `signal` F1). The tests below are the first oracle in this file that fails
+// INDEPENDENTLY of its author — the bytes come from libsignal. See
+// `interop_vectors.zig` for provenance, licence reasoning, and why full
+// per-message interop is deliberately out of scope.
+//
+// Frozen bytes: these run offline, need no Rust toolchain, and never skip.
+
+const interop = @import("interop_vectors.zig");
+
+fn hex32(hex_str: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex_str) catch unreachable;
+    return out;
+}
+
+test "interop corpus is present and non-degenerate" {
+    // A corpus that quietly shrank to nothing would leave every assertion
+    // below vacuously green.
+    try testing.expect(interop.chain_ladders.len >= 3);
+    try testing.expect(interop.root_ratchets.len >= 3);
+    for (interop.chain_ladders) |ladder| {
+        try testing.expect(ladder.steps.len >= 5);
+        // The ladder really is a chain: step 0 starts at the declared key and
+        // each step's `ck` is the previous step's `next_ck`.
+        try testing.expectEqualStrings(ladder.start_ck, ladder.steps[0].ck);
+        for (ladder.steps[1..], ladder.steps[0 .. ladder.steps.len - 1]) |cur, prev| {
+            try testing.expectEqualStrings(prev.next_ck, cur.ck);
+        }
+    }
+}
+
+test "interop (libsignal): kdfCk reproduces libsignal's chain ratchet BYTE-EXACTLY" {
+    // `KDF_CK` is spec-FIXED, not application-defined, so this is a true
+    // byte-exact cross-implementation anchor. It pins the two things a
+    // self-consistent ratchet can get wrong without ever noticing: which
+    // constant yields the message key vs the next chain key (0x01/0x02), and
+    // which operand of the HMAC the chain key is (key, not message).
+    for (interop.chain_ladders) |ladder| {
+        var ck = hex32(ladder.start_ck);
+        for (ladder.steps) |st| {
+            try testing.expectEqualSlices(u8, &hex32(st.ck), &ck);
+            const step = kdfCk(ck);
+            try testing.expectEqualSlices(u8, &hex32(st.mk), &step.mk);
+            try testing.expectEqualSlices(u8, &hex32(st.next_ck), &step.ck);
+            ck = step.ck;
+        }
+    }
+}
+
+test "interop (libsignal): KDF_RK's fixed part matches RootKey::create_chain BYTE-EXACTLY" {
+    // Driven with libsignal's own `info`, since that one field is
+    // application-defined by the spec (ours is pinned by literal below).
+    // Everything this asserts IS fixed by §5.2: root key as Extract salt and
+    // DH output as IKM (swapping them is the classic HKDF inversion, and it
+    // round-trips perfectly between two copies of the same bug), the 64-byte
+    // Expand, and the `RK' ‖ CK` split order.
+    for (interop.root_ratchets) |rr| {
+        const first = kdfRkWithInfo(interop.libsignal_kdf_rk_info, hex32(rr.rk), hex32(rr.dh_recv));
+        try testing.expectEqualSlices(u8, &hex32(rr.rk1), &first.rk);
+        try testing.expectEqualSlices(u8, &hex32(rr.ckr), &first.ck);
+    }
+}
+
+test "interop (libsignal): the two-step DH-ratchet root composition matches libsignal" {
+    // `rootRatchetWithInfo` is the exact function `dhRatchet` calls in
+    // production. This pins the COMPOSITION as well as each step: receiving
+    // chain first, then the sending chain re-keyed from the root the first
+    // call produced (not from the original root, and not in the other order).
+    for (interop.root_ratchets) |rr| {
+        const step = rootRatchetWithInfo(
+            interop.libsignal_kdf_rk_info,
+            hex32(rr.rk),
+            hex32(rr.dh_recv),
+            hex32(rr.dh_send),
+        );
+        try testing.expectEqualSlices(u8, &hex32(rr.ckr), &step.ckr);
+        try testing.expectEqualSlices(u8, &hex32(rr.cks), &step.cks);
+        try testing.expectEqualSlices(u8, &hex32(rr.rk2), &step.rk);
+    }
+}
+
+test "interop: this module's own KDF_RK info is a pinned literal, and is NOT libsignal's" {
+    // Two separate jobs. (1) Pin the CONSTANT by literal: the test above is
+    // written in terms of `interop.libsignal_kdf_rk_info`, so on its own it
+    // would survive someone editing `kdf_rk_info` — it checks the mechanism,
+    // not the value. (2) Prove the `info` parameter is genuinely wired
+    // through: if `kdfRkWithInfo` ignored its argument and hardcoded
+    // `kdf_rk_info`, or if `kdfRk` were changed to libsignal's string, the
+    // inequality below would fail.
+    try testing.expectEqualStrings("zig-libs/signal/ratchet/rk/v1", kdf_rk_info);
+    try testing.expectEqualStrings("zig-libs/signal/ratchet/aead/v1", aead_info);
+    try testing.expect(!std.mem.eql(u8, kdf_rk_info, interop.libsignal_kdf_rk_info));
+
+    const rr = interop.root_ratchets[0];
+    const ours = kdfRk(hex32(rr.rk), hex32(rr.dh_recv));
+    try testing.expect(!std.mem.eql(u8, &ours.rk, &hex32(rr.rk1)));
+    try testing.expect(!std.mem.eql(u8, &ours.ck, &hex32(rr.ckr)));
 }

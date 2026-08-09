@@ -33,6 +33,14 @@
 //! independently of `needs_negation`); the rest have an already-even-y
 //! public key. Vector 3 additionally covers the empty message
 //! (`msg.len == 0`, mirroring BIP340 test-vector index 15's coverage).
+//!
+//! **These vectors are NOT the module's external anchor** — by construction
+//! they cannot be, since their author is the construction under test. The
+//! external anchor is `interop_vectors.zig`, captured from secp256kfun. Note
+//! that secp256kfun's `verify_encrypted_signature` was run over all six of
+//! these pre-signatures and accepted every one, and its `decrypt_signature`
+//! reproduced each `sig` field below byte-for-byte
+//! (`interop_vectors.self_authored_cross_check`).
 
 pub const Vector = struct {
     label: []const u8,

@@ -80,6 +80,36 @@ Verification is Alice-and-Bob independently-advanced-ratchets agreement
 across many DH ratchets, out-of-order delivery, `MAX_SKIP` DoS rejection,
 and a tamper battery — see `SPEC.md`'s "Test-vector honesty".
 
+That paragraph remains true of a whole MESSAGE, but it overstated the case
+for the ratchet's KDF core, and `src/interop_vectors.zig` now closes that
+gap. The Double Ratchet's `KDF_CK` is NOT application-defined: the spec
+fixes it as `HMAC-SHA256(CK, 0x01) -> MK` and `HMAC-SHA256(CK, 0x02) -> CK'`,
+so any faithful implementation agrees byte-for-byte, and libsignal does.
+`KDF_RK`'s `info` string IS application-defined, but the rest of it (root
+key as the HKDF-Extract salt with the DH output as IKM, a 64-byte Expand,
+and the `RK' || CK` split order) is fixed too, and is checked against
+libsignal by driving the production code path with libsignal's own `info`.
+Both classes of divergence are invisible to an Alice-and-Bob harness —
+demonstrated, not assumed: swapping `KDF_CK`'s 0x01/0x02, and inverting
+HKDF-Extract's salt/IKM, each leave the ENTIRE pre-existing self-consistency
+suite green and are caught only by these vectors.
+
+Provenance and licence for those bytes: signalapp/libsignal at commit
+`857c4dc`, crate `libsignal-protocol` 0.1.0, captured 2026-08-09 by
+appending a local-only `#[cfg(test)]` driver to a throwaway checkout under
+`~/.cache/zig-libs-signal/` (libsignal's `ChainKey`/`RootKey` are
+`pub(crate)`) and printing the results — see `src/interop_vectors.zig` for
+the exact command. libsignal is **AGPL-3.0**. No libsignal source is copied,
+translated or vendored into this repository, `build.zig.zon` gains no
+dependency, and the modified checkout is never redistributed; what is
+recorded are numeric HMAC/HKDF outputs of a PUBLIC specification for fixed
+inputs, each equally derivable from the spec text plus any HMAC/HKDF
+implementation. This is the same posture, for the same reason, under which
+this module already carries libsignal's XEdDSA known-answer vector below.
+Note that the "No GPL/LGPL/AGPL source was consulted or copied" line above
+has, since the XEdDSA pass, meant "copied" — reading was already disclosed
+there and is disclosed here.
+
 For XEdDSA, `src/kat_test.zig` embeds the known-answer vector from
 libsignal's own test suite (`test_curve25519_signature` in
 libsignal-protocol-c's `tests/test_curve25519.c`, GPLv3; the identical

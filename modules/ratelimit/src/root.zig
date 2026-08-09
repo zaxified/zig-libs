@@ -540,6 +540,64 @@ test "TokenBucket: denials consume nothing; backwards clock is a no-op" {
     try testing.expectEqual(@as(u64, 1000), b.allowAt(cfg, 500).retry_after_ms);
 }
 
+// ── tests: the external anchor (captured x/time/rate trace) ────────────────
+
+/// Frozen reference trace from Go `golang.org/x/time/rate` — the package this
+/// bucket is modelled on. See the file header for provenance; it is a plain
+/// data table, so this test runs offline and can never skip.
+const xrate = @import("xrate_vectors.zig");
+
+/// Nanoseconds → whole milliseconds, rounded up, in integer arithmetic. Applied
+/// to the *reference's* durations so the comparison against `retry_after_ms` /
+/// `reset_after_ms` does not go back through `ceilMs`, the very function under
+/// test.
+fn ceilNsToMs(ns: u64) u64 {
+    return (ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+}
+
+test "TokenBucket: replays a captured golang.org/x/time/rate AllowN trace" {
+    // The other `TokenBucket` tests assert hand-computed expectations: honest,
+    // but self-authored, so they cannot disagree with us. This one replays a
+    // sequence produced by the reference implementation itself.
+    //
+    // Float balances are compared with a tolerance, not bit-for-bit: x/time/rate
+    // converts elapsed time via `time.Duration.Seconds()` (a split
+    // seconds+nanos sum) where we divide a single u64 by 1e9, so the two can
+    // land an ULP apart. Everything a caller can observe — the allow/deny
+    // decision, `remaining`, `retry_after_ms`, `reset_after_ms` — is compared
+    // exactly.
+    const tokens_tolerance = 1e-12;
+
+    for (xrate.cases) |c| {
+        const cfg: TokenBucket.Config = .{ .rate_per_s = c.rate_per_s, .burst = c.burst };
+        // Every captured case opens at its start instant, where x/time/rate's
+        // zero-valued `last` has already refilled the bucket to `burst`.
+        try testing.expectEqual(@as(u64, 0), c.steps[0].at_ms);
+        var b: TokenBucket = .full(cfg, 0);
+
+        for (c.steps, 0..) |s, i| {
+            const d = b.allowAt(cfg, s.at_ms * std.time.ns_per_ms);
+            errdefer std.debug.print(
+                "\nx/time/rate vector mismatch: case \"{s}\" step {d} at {d} ms\n" ++
+                    "  reference: allowed={} remaining={d} wait={d} ns reset={d} ns tokens={d}\n" ++
+                    "  ours:      allowed={} remaining={d} retry_after={d} ms reset_after={d} ms tokens={d}\n",
+                .{
+                    c.name,      i,                s.at_ms,
+                    s.allowed,   s.remaining,      s.wait_ns,
+                    s.reset_ns,  s.tokens_after,   d.allowed,
+                    d.remaining, d.retry_after_ms, d.reset_after_ms,
+                    b.tokens,
+                },
+            );
+            try testing.expectEqual(s.allowed, d.allowed);
+            try testing.expectEqual(s.remaining, d.remaining);
+            try testing.expectEqual(ceilNsToMs(s.wait_ns), d.retry_after_ms);
+            try testing.expectEqual(ceilNsToMs(s.reset_ns), d.reset_after_ms);
+            try testing.expect(@abs(s.tokens_after - b.tokens) <= tokens_tolerance);
+        }
+    }
+}
+
 // ── tests: the keyed limiter (injected clock, no HTTP) ──────────────────────
 
 /// Deterministic test clock.
