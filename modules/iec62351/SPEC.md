@@ -521,7 +521,35 @@ Stated, not hidden:
   agreement with an independent ASN.1 decoder, and primitive-level agreement
   with OpenSSL — but **not** against another 62351 implementation. Anyone with
   access to one should run the frozen frame in `vectors_test.zig` through it
-  before deploying.
+  before deploying. **This is a settled property of the module, not an open
+  task — see below.**
+
+### Settled: there is no public IEC 62351-6 interop oracle
+
+Recorded 2026-08-09 so this is not re-surveyed a fourth time. A dated,
+exhaustive negative survey (2026-08-08) closed every route:
+
+- `libiec61850`'s open build has **no 62351-6 support**. Its README claims
+  62351-3/4 (TLS) only, and a code search across the repository returns zero
+  hits for the security-extension fields.
+- The academic `61850security` framework (GoSV / S-GoSV) repositories contain a
+  README and nothing else — no code. `R-GoSV`'s README documents six programs;
+  the tree contains two, both unsecured.
+- `pygoose` and the scapy GOOSE tooling do not implement 62351-6.
+- All **493** real GOOSE frames across the five vendored `.pcap` files carry
+  `Reserved 1` = `Reserved 2` = `0x0000`, i.e. **no security extension is
+  present in any publicly available capture**.
+
+So the `0x85` tag, the field order inside the authentication value and the BER
+framing of the `Extension` SEQUENCE rest on public secondary descriptions of
+the standard. That is the honest ceiling for a clean-room implementation of a
+paywalled standard whose deployed instances are not publicly captured.
+
+**Do not re-run this survey.** It unblocks only two ways, and both are events
+outside this repository: `libiec61850` (or an equivalent open stack) shipping
+62351-6, or someone contributing a capture taken from an IED with the security
+profile actually switched on. If either happens, the frozen frame in
+`vectors_test.zig` is the thing to run through it.
 
 ## Coordinator notes
 

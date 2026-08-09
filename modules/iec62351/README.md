@@ -305,6 +305,30 @@ production deployment uses. And a symmetric group MAC authenticates the
 *group*, not the publisher: any holder of the key can forge any publisher's
 frames. `SPEC.md` has the full threat model.
 
+## No implementation on the other side has ever read these frames
+
+Read this before you deploy. The module is clean-room from public descriptions
+of a **paywalled** standard, and — as a settled, surveyed fact — **there is no
+public IEC 62351-6 implementation or capture to check it against.** Verified
+exhaustively 2026-08-08: `libiec61850`'s open build implements 62351-3/4 (TLS)
+only; the academic GoSV / S-GoSV / R-GoSV repositories are README-only or ship
+unsecured programs; `pygoose` and scapy do not implement the profile; and all
+493 real GOOSE frames in the five vendored captures carry
+`Reserved 1` = `Reserved 2` = `0x0000`, i.e. no security extension at all.
+
+What that means concretely: the cryptography is anchored (primitive-level
+agreement with OpenSSL, structural agreement with an independent ASN.1
+decoder), but the **wire shape of the security extension** — the `0x85` tag,
+the field order inside the authentication value, the BER framing of the
+`Extension` SEQUENCE — is this module's reading of the specification and has
+never been confirmed by a second implementation.
+
+**If you have access to a 62351-6 stack, run the frozen frame in
+`src/vectors_test.zig` through it and report what it says.** That is the single
+most valuable contribution this module can receive. See `SPEC.md` §"Settled:
+there is no public IEC 62351-6 interop oracle" for the closed routes; the
+survey does not need repeating.
+
 ## Verify
 
 ```sh
