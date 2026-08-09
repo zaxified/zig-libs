@@ -111,14 +111,58 @@ consistency" test pins this directly by comparing the canonical,
 un-cubed `pairing(d_id, U)` against the canonical, un-cubed
 `fp12Pow(Gid, r)`.
 
-## KAT plan — self-consistent, honestly
+## KAT plan — the assembly is anchored, the parameters cannot be
 
-**No external BF-IBE-over-BLS12-381 test vector exists** for this
-module to check against: `tlock` can byte-exact-verify against a real
-drand-Go-produced ciphertext because it specializes a widely-deployed
-external system; `ibe` is this repo's own standalone scheme (a
-caller-run PKG over an arbitrary identity string), which no other
-library publishes vectors for. What `kat_test.zig` verifies instead:
+This module splits into an **assembly** (which hash output feeds which
+XOR, the FO consistency check, where `fp12Pow` sits, where `U`/`V`/`W`
+land in the wire encoding) and a set of **parameters** (`ciphersuite.
+zig`'s hash tags, its `dst_g1`, the 32-byte block width, and the
+canonical un-cubed `Gt` representation). `ibe.Scheme` makes the split
+explicit — the assembly is written once and takes the ciphersuite as a
+`comptime` parameter; `ibe`'s public API is `Scheme(ciphersuite)`. The
+two halves are anchored completely differently, and saying so precisely
+is the point of this section:
+
+**The assembly IS externally anchored.** `kat_test.zig` section 5
+instantiates `ibe.Scheme` with DRAND's parameters — drand's DSTs and
+`IBE-H{2,3,4}` tags (reused from `modules/tlock`'s ciphersuite, not
+restated), its 16-byte block width, and the `gt -> gt³` representation
+adapter `kilic/bls12-381`'s final exponentiation requires — and
+requires the result to reproduce, byte for byte, a genuine ciphertext
+produced by drand's own Go `tle` CLI (the fixture frozen in
+`modules/tlock/src/kat_test.zig` section 3; provenance in
+`tlock/NOTICE`). It is `ibe.zig`'s own `encrypt`/`decrypt`/`fp12Pow`/
+`Ciphertext` bodies doing the work — the same ones the default
+instantiation uses, not a copy and not a re-derivation in another
+language, either of which would be a sibling implementation and would
+prove nothing. Both the byte-exact `encrypt` direction and the
+`decrypt` direction are checked, plus rejection under a wrong key.
+
+*Verified to have teeth, by mutation, twice.* (1) Swapping `V` and `W`
+in `Ciphertext.toBytes` AND `fromBytes` — a consistent change, so the
+codec still round-trips: `exit 1`, **40 pass / 2 fail**, and both
+failures are section 5's. (2) Feeding `H4` the ciphertext's `V` instead
+of `sigma` in `encrypt` AND `decrypt` — again consistent, so every
+round-trip and tamper test still passes: `exit 1`, **40 pass / 2 fail**,
+again only section 5's. Both mutations are exactly the systematic
+assembly error a self-consistency suite is structurally blind to, and
+in both cases the entire pre-existing suite stayed green while the
+foreign fixture caught it. Reverted; `test-ibe` back to `exit 0`,
+42/42.
+
+**The parameters CANNOT be externally anchored — by construction, not
+for want of effort.** RFC 9380 §3.1 *requires* every application to
+choose its own domain-separation tag, so there is no external value for
+`dst_g1` or `zig-libs/ibe/H{2,3,4}` to agree with: a tag of ours that
+matched somebody else's would be a defect, not an anchor. The no-cube
+decision (see "No drand-style cube" above) is the same kind of choice —
+`tlock`'s cube exists only to match `kilic`'s final-exponentiation
+convention, and with no external byte target any self-consistent
+representation is correct. `Fr.reduceWide`-based `h3` likewise. These
+are pinned by the self-consistency tests below and by nothing else, and
+that is the end state, not an open to-do.
+
+What `kat_test.zig` verifies on the parameter side:
 
 - **Round-trip (done)**: `setup -> extract -> encrypt -> decrypt`
   recovers the original message, across five distinct
@@ -142,17 +186,31 @@ library publishes vectors for. What `kat_test.zig` verifies instead:
   `id_B`, and a private key extracted under a DIFFERENT PKG's `msk` —
   all six must return `error.FoCheckFailed`, never a garbage plaintext.
 
-This is meaningful, not weak, because every primitive `ibe` is built
-from is ALREADY externally grounded: `bls12_381.pairing`/
-`hash_to_curve`/`g1`/`g2` are byte-exact-KAT'd against the IETF
-pairing-friendly-curves draft and RFC 9380 (`bls12_381`'s own
-`root.zig`), and the encrypt/decrypt ASSEMBLY (which hash feeds which
-XOR, the FO consistency check, the `fp12Pow` construction) is the exact
-shape `tlock`'s sibling module already proved byte-exact against a
-genuine drand-Go-produced ciphertext. What `ibe` adds on top of that
-proven shape — its own DSTs/hash tags, `Fr.reduceWide`-based `h3`
-instead of rejection sampling, and no drand-style cube — is exactly the
-surface these self-consistency tests exercise directly.
+- **drand-parameterised interop anchor (done)**: section 5, described
+  above — `ibe.Scheme` under drand's parameters, byte-compared against
+  a genuine Go-`tle`-produced ciphertext in both directions, plus a
+  provenance check (`e(sig, G2gen) == e(h1(beaconId(round)), P_pub)`)
+  so a typo in the transcribed fixture constants is a RED rather than a
+  silently weaker anchor. This is the only test in the module whose
+  expected bytes nobody here authored.
+
+Underneath all of it, every primitive `ibe` is built from is itself
+externally grounded: `bls12_381.pairing`/`hash_to_curve`/`g1`/`g2` are
+byte-exact-KAT'd against the IETF pairing-friendly-curves draft and
+RFC 9380 (`bls12_381`'s own `root.zig`).
+
+**What is deliberately NOT claimed.** The anchor does not certify
+`ibe`'s own DSTs, tags, `h3` construction, block width or no-cube
+choice — section 5 runs with drand's, not ours, precisely because ours
+have no external counterpart. Nor does a passing section 5 make `ibe`
+drand-compatible: `Scheme(drand_ciphersuite)` exists only inside the
+test file, and the published module is `Scheme(ciphersuite)` alone.
+Anyone wanting real drand timelock interop wants `modules/tlock`.
+Finally, the anchor exercises the assembly at drand's 16-byte block
+width, so a defect that manifests ONLY at this module's 32-byte width
+would slip past it — the bodies are generic in `cs.block_bytes` and use
+no width-specific arithmetic, which is why that residual is judged
+narrow rather than absent, but it is a residual and not nothing.
 
 ## Honest tier note
 

@@ -47,11 +47,17 @@
 //!   `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec, `encrypt`/
 //!   `decrypt` (the BF-IBE FullIdent core) + the private `fp12Pow` `Gt`
 //!   exponentiation helper.
-//! - `kat_test.zig` — round-trip, pairing-consistency, and soundness
-//!   (tamper/wrong-key rejection) KATs — see that file's module doc
-//!   comment for why this module's verification is necessarily
-//!   self-consistent (no external BF-IBE-over-BLS12-381 vector exists
-//!   to check against) and why that is still meaningful.
+//! - `kat_test.zig` — round-trip, pairing-consistency and soundness
+//!   (tamper/wrong-key rejection) KATs, plus the **drand-parameterised
+//!   interop anchor**: `ibe.Scheme` instantiated with drand's
+//!   ciphersuite must reproduce a genuine ciphertext produced by
+//!   drand's own Go `tle` CLI, byte for byte, which is what pins this
+//!   module's ASSEMBLY against a foreign artifact. This module's own
+//!   DSTs/tags and its no-cube choice are pinned by the
+//!   self-consistency tests and cannot be anchored externally (RFC 9380
+//!   §3.1 requires each application to pick its own DST — there is no
+//!   foreign value to match). See that file's module doc comment for
+//!   the full split.
 //!
 //! ## Honest limitations (read before reaching for this module)
 //!

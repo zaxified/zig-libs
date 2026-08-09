@@ -78,9 +78,9 @@
 //! convention (drand's Go implementation), whose final exponentiation
 //! computes a fixed CUBE of the canonical pairing value this repo's
 //! `bls12_381.pairing` implements (see `tlock`'s `SPEC.md`, "Gt
-//! serialization"). `ibe` has **no external implementation to
-//! interop with** — it is this repo's OWN scheme, not a specialization
-//! of anyone else's. `encrypt` and `decrypt` both call
+//! serialization"). `ibe` has **no external deployment whose bytes it
+//! must match** — it is this repo's OWN scheme, not a specialization of
+//! anyone else's. `encrypt` and `decrypt` both call
 //! `bls12_381.pairing.pairing`/the shared `fp12Pow` and feed
 //! `ciphersuite.h2` the SAME (canonical, uncubed) `Fp12` representation
 //! on both sides, so correctness only requires INTERNAL consistency —
@@ -90,6 +90,29 @@
 //! here would be pure cargo-culting: there is no reference byte
 //! sequence it would need to match. See `SPEC.md`'s "No drand-style
 //! cube" section for the KAT that pins this directly.
+//!
+//! ## The ciphersuite seam, and what it anchors
+//!
+//! Everything above splits cleanly in two: an ASSEMBLY (which hash
+//! output feeds which XOR, the FO consistency check, where `fp12Pow`
+//! sits, where `U`/`V`/`W` land in the encoding) and a set of
+//! PARAMETERS (hash tags, hash-to-curve DST, block width, `Gt`
+//! representation). `Scheme` below makes that split explicit: the
+//! assembly is written once and takes the parameters as a `comptime`
+//! ciphersuite; `ibe`'s public API is `Scheme(ciphersuite)`.
+//!
+//! That is not decoration — it is what gives this module an external
+//! oracle it could not otherwise have. The parameters are unanchorable
+//! in principle (RFC 9380 §3.1 *requires* each application to pick its
+//! own DST, so there is no foreign value to match, and the no-cube
+//! choice above has no external byte target either). The ASSEMBLY is
+//! not: instantiated with drand's parameters, it must reproduce a
+//! genuine ciphertext produced by drand's own Go `tle` CLI, byte for
+//! byte — and `kat_test.zig` section 5 requires exactly that, running
+//! THIS code rather than a copy of it. A systematic assembly error
+//! (the one failure mode a round-trip/tamper suite is structurally
+//! blind to) fails there and nowhere else; both halves of that claim
+//! were verified by mutation.
 
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
@@ -138,64 +161,12 @@ pub fn setup(io: std.Io) KeyPair {
     return .{ .msk = msk, .mpk = mpk };
 }
 
-/// **PKG Extract — REAL.** Derives the BF-IBE private key for `id`:
-/// `d_id = msk · H1(id) ∈ G1`. Deterministic in `(msk, id)` — the SAME
-/// identity always yields the SAME private key from the SAME PKG,
-/// which is BF-IBE's point (a sender can encrypt to `id` before the
-/// recipient has ever contacted the PKG; `Extract` reproduces the
-/// matching key on demand, exactly like `tlock`'s round-signature
-/// beacon publishes the same signature no matter when it's fetched).
-pub fn extract(msk: Fr, id: []const u8) g1.Affine {
-    const qid = ciphersuite.h1(id);
-    return g1.Jacobian.fromAffine(qid).scalarMul(msk).toAffine();
-}
-
-// ── Ciphertext: REAL struct + byte codec ────────────────────────────
-
-/// The `(U, V, W)` BF-IBE ciphertext (Boneh-Franklin §4.2's
-/// `FullIdent` output shape). See this file's module doc comment for
-/// the full construction and for why `U` lives in `G2`.
-pub const Ciphertext = struct {
-    /// `r * G2_generator` — the randomized "commitment" half of the
-    /// ciphertext; `decrypt`'s FO check recomputes this from the
-    /// recovered `(sigma, message)` and rejects on mismatch.
-    u: g2.Affine,
-    /// `sigma XOR H2(Gid^r)` — the random pad `sigma`, masked by a
-    /// hash of the pairing value only someone with `d_id` (or the
-    /// encryptor, who computed `Gid^r` directly) can recover.
-    v: [block_bytes]u8,
-    /// `message XOR H4(sigma)` — the actual plaintext block, masked by
-    /// a hash of `sigma` (recoverable only after `v` is unmasked).
-    w: [block_bytes]u8,
-
-    pub const encoded_bytes = g2.compressed_bytes + block_bytes + block_bytes; // 96 + 32 + 32 = 160
-
-    /// `U (96B compressed G2) || V (32B) || W (32B)`. REAL: plain
-    /// concatenation over `bls12_381`'s already-real
-    /// `g2.toBytesCompressed`.
-    pub fn toBytes(self: Ciphertext) [encoded_bytes]u8 {
-        var out: [encoded_bytes]u8 = undefined;
-        out[0..g2.compressed_bytes].* = g2.toBytesCompressed(self.u);
-        out[g2.compressed_bytes..][0..block_bytes].* = self.v;
-        out[g2.compressed_bytes + block_bytes ..][0..block_bytes].* = self.w;
-        return out;
-    }
-
-    /// Inverse of `toBytes`. Does NOT subgroup-check `U` (same
-    /// deserialization contract as `bls12_381.bls_sig.Signature.
-    /// fromBytes` — see that type's doc comment); `decrypt` performs
-    /// its own consistency check (`U == r*gen`) on every call, which is
-    /// a STRONGER, scheme-specific check than a bare subgroup test, so
-    /// no separate subgroup-check obligation is placed on callers here.
-    pub fn fromBytes(bytes: [encoded_bytes]u8) g2.G2Error!Ciphertext {
-        const u = try g2.fromBytesCompressed(bytes[0..g2.compressed_bytes].*);
-        return .{
-            .u = u,
-            .v = bytes[g2.compressed_bytes..][0..block_bytes].*,
-            .w = bytes[g2.compressed_bytes + block_bytes ..][0..block_bytes].*,
-        };
-    }
-};
+// `extract`, `Ciphertext`, `encrypt` and `decrypt` are the four
+// declarations that actually CONSUME a ciphersuite, so they live inside
+// `Scheme` (below the `fp12Pow` helper) rather than at file scope; the
+// default instantiation is re-exported at the bottom of this file, so
+// `ibe.extract`/`ibe.Ciphertext`/`ibe.encrypt`/`ibe.decrypt` mean exactly
+// what they always did.
 
 // ── private helpers: Gt (Fp12) exponentiation ───────────────────────
 //
@@ -290,7 +261,11 @@ fn fp12Pow(base: Fp12, exp: Fr) Fp12 {
     return acc;
 }
 
-// ── encrypt / decrypt ────────────────────────────────────────────────
+// ── internal test hook: expose fp12Pow to kat_test.zig ──────────────
+
+pub const testing_fp12Pow = fp12Pow;
+
+// ── Scheme: the ciphersuite seam ────────────────────────────────────
 
 pub const DecryptError = error{
     /// The Fiat-Shamir-Okamoto consistency check (`U == r*gen` after
@@ -303,105 +278,248 @@ pub const DecryptError = error{
     FoCheckFailed,
 };
 
-/// **REAL.** BF-IBE FullIdent encryption (Boneh-Franklin §4.2). See
-/// this file's module doc comment for the full 9-step construction
-/// this function transcribes (`id -> Qid -> Gid -> r -> U -> gid_r ->
-/// V -> W`).
+/// The BF-IBE construction, PARAMETERISED over its ciphersuite.
 ///
-/// ## Randomness — explicit parameter, not internal entropy
+/// ## Why this is a `comptime` seam and not four hard-wired functions
 ///
-/// `sigma` (BF-IBE's random `block_bytes`-wide pad) is a PLAIN
-/// PARAMETER here, not read from `std.Io`/internal entropy directly —
-/// mirroring `tlock`/`bbs`/`frost`'s "randomness is an explicit input"
-/// convention. This is what lets a KAT harness pin the ciphertext
-/// deterministically: `encrypt`'s OTHER inputs (`mpk`, `id`, `message`)
-/// are already fully deterministic, so supplying `sigma` explicitly
-/// makes the entire output reproducible — a production caller instead
-/// sources `sigma` from `ciphersuite.randomSigma(io)`.
+/// The four declarations below (`extract`, `Ciphertext`, `encrypt`,
+/// `decrypt`) are the module's ASSEMBLY: which hash output feeds which
+/// XOR, in what order the FO consistency check recomputes and compares,
+/// where `fp12Pow` sits, and where `U`/`V`/`W` land in the wire
+/// encoding. That assembly is *independent* of which hash tags,
+/// which hash-to-curve DST, which block width and which `Gt`
+/// representation the scheme is instantiated with — those are the
+/// `ciphersuite` parameters.
 ///
-/// `message.len`/`sigma.len` are both fixed to `block_bytes` (32 —
-/// see `ciphersuite.block_bytes`'s doc comment).
-pub fn encrypt(mpk: g2.Affine, id: []const u8, message: [block_bytes]u8, sigma: [block_bytes]u8) Ciphertext {
-    // Steps 1-2: identity -> Qid -> Gid. `pairing.pairing` takes
-    // `(G1, G2)`.
-    const qid = ciphersuite.h1(id);
-    const gid = pairing.pairing(qid, mpk);
+/// Splitting them apart is what makes this module's assembly
+/// EXTERNALLY CHECKABLE. `ibe`'s own parameters
+/// (`ciphersuite.zig`'s `zig-libs/ibe/H{2,3,4}` tags, its own
+/// `dst_g1`, 32-byte blocks, the canonical un-cubed `Gt`
+/// representation) are this repo's own choice, so no third party
+/// publishes bytes for them and nothing external can pin them. But the
+/// SAME assembly, instantiated with drand's parameters, must reproduce
+/// drand's real ciphertexts — and one of those exists, frozen in the
+/// sibling `tlock` module, produced by drand's own Go `tle` CLI. So
+/// `kat_test.zig` drives THIS code (not a copy of it, not a
+/// re-derivation of it in another language) with a drand-shaped
+/// ciphersuite and byte-compares against that fixture. See
+/// `kat_test.zig`'s "drand-parameterised interop anchor" section, and
+/// `SPEC.md`'s "KAT plan" for what that does and does not prove.
+///
+/// ## The ciphersuite interface
+///
+/// `cs` must provide:
+///
+/// - `pub const block_bytes: usize` — the `V`/`W` width.
+/// - `pub fn h1(id: []const u8) g1.Affine` — identity to `G1`.
+/// - `pub fn h2(gt: Fp12) [block_bytes]u8` — `Gt` element to a mask.
+///   A ciphersuite whose reference implementation hashes a DIFFERENT
+///   representation of the pairing value (drand/`kilic` hash the
+///   canonical value's cube) applies that adapter HERE, inside its own
+///   `h2` — `encrypt`/`decrypt` below always hand it
+///   `bls12_381.pairing`'s canonical output and never adapt it
+///   themselves, which is what keeps the assembly representation-
+///   agnostic.
+/// - `pub fn h3(sigma: []const u8, msg: []const u8) Fr` — the
+///   FO-transform binding scalar.
+/// - `pub fn h4(sigma: []const u8) [block_bytes]u8` — `sigma` to a
+///   mask.
+pub fn Scheme(comptime cs: type) type {
+    return struct {
+        /// Self-reference. The nested types below must be named through
+        /// it: this file ALSO declares `Ciphertext` (the default
+        /// instantiation's alias, at the bottom), and a bare
+        /// `Ciphertext` inside here would be visible from two enclosing
+        /// container scopes at once — which Zig rejects as an ambiguous
+        /// reference rather than silently picking one.
+        const Self = @This();
 
-    // Step 4: r = H3(sigma, M) — the FO-transform binding scalar.
-    const r = ciphersuite.h3(&sigma, &message);
+        pub const block_bytes = cs.block_bytes;
 
-    // Step 5: U = r * G2_generator (constant-time scalarMul).
-    const u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r).toAffine();
+        /// **PKG Extract — REAL.** Derives the BF-IBE private key for
+        /// `id`: `d_id = msk · H1(id) ∈ G1`. Deterministic in
+        /// `(msk, id)` — the SAME identity always yields the SAME
+        /// private key from the SAME PKG, which is BF-IBE's point (a
+        /// sender can encrypt to `id` before the recipient has ever
+        /// contacted the PKG; `Extract` reproduces the matching key on
+        /// demand, exactly like `tlock`'s round-signature beacon
+        /// publishes the same signature no matter when it's fetched).
+        pub fn extract(msk: Fr, id: []const u8) g1.Affine {
+            const qid = cs.h1(id);
+            return g1.Jacobian.fromAffine(qid).scalarMul(msk).toAffine();
+        }
 
-    // Step 6: gid_r = Gid^r — Gt exponentiation (see fp12Pow above).
-    // No drand-style cube — see this file's module doc comment,
-    // "No drand-style cube".
-    const gid_r = fp12Pow(gid, r);
+        /// The `(U, V, W)` BF-IBE ciphertext (Boneh-Franklin §4.2's
+        /// `FullIdent` output shape). See this file's module doc
+        /// comment for the full construction and for why `U` lives in
+        /// `G2`.
+        pub const Ciphertext = struct {
+            /// `r * G2_generator` — the randomized "commitment" half of
+            /// the ciphertext; `decrypt`'s FO check recomputes this from
+            /// the recovered `(sigma, message)` and rejects on mismatch.
+            u: g2.Affine,
+            /// `sigma XOR H2(Gid^r)` — the random pad `sigma`, masked by
+            /// a hash of the pairing value only someone with `d_id` (or
+            /// the encryptor, who computed `Gid^r` directly) can recover.
+            v: [cs.block_bytes]u8,
+            /// `message XOR H4(sigma)` — the actual plaintext block,
+            /// masked by a hash of `sigma` (recoverable only after `v`
+            /// is unmasked).
+            w: [cs.block_bytes]u8,
 
-    // Step 7: V = sigma XOR H2(gid_r).
-    var v = ciphersuite.h2(gid_r);
-    for (&v, sigma) |*b, s| b.* ^= s;
+            /// `96 + block_bytes + block_bytes` (160 for `ibe`'s own
+            /// 32-byte blocks; 128 for drand's 16-byte ones).
+            pub const encoded_bytes = g2.compressed_bytes + cs.block_bytes + cs.block_bytes;
 
-    // Step 8: W = M XOR H4(sigma).
-    var w = ciphersuite.h4(&sigma);
-    for (&w, message) |*b, m| b.* ^= m;
+            /// `U (96B compressed G2) || V || W`. REAL: plain
+            /// concatenation over `bls12_381`'s already-real
+            /// `g2.toBytesCompressed`.
+            pub fn toBytes(self: @This()) [encoded_bytes]u8 {
+                var out: [encoded_bytes]u8 = undefined;
+                out[0..g2.compressed_bytes].* = g2.toBytesCompressed(self.u);
+                out[g2.compressed_bytes..][0..cs.block_bytes].* = self.v;
+                out[g2.compressed_bytes + cs.block_bytes ..][0..cs.block_bytes].* = self.w;
+                return out;
+            }
 
-    return .{ .u = u, .v = v, .w = w };
+            /// Inverse of `toBytes`. Does NOT subgroup-check `U` (same
+            /// deserialization contract as `bls12_381.bls_sig.
+            /// Signature.fromBytes` — see that type's doc comment);
+            /// `decrypt` performs its own consistency check
+            /// (`U == r*gen`) on every call, which is a STRONGER,
+            /// scheme-specific check than a bare subgroup test, so no
+            /// separate subgroup-check obligation is placed on callers
+            /// here.
+            pub fn fromBytes(bytes: [encoded_bytes]u8) g2.G2Error!@This() {
+                const u = try g2.fromBytesCompressed(bytes[0..g2.compressed_bytes].*);
+                return .{
+                    .u = u,
+                    .v = bytes[g2.compressed_bytes..][0..cs.block_bytes].*,
+                    .w = bytes[g2.compressed_bytes + cs.block_bytes ..][0..cs.block_bytes].*,
+                };
+            }
+        };
+
+        /// **REAL.** BF-IBE FullIdent encryption (Boneh-Franklin §4.2).
+        /// See this file's module doc comment for the full 9-step
+        /// construction this function transcribes (`id -> Qid -> Gid ->
+        /// r -> U -> gid_r -> V -> W`).
+        ///
+        /// ## Randomness — explicit parameter, not internal entropy
+        ///
+        /// `sigma` (BF-IBE's random `block_bytes`-wide pad) is a PLAIN
+        /// PARAMETER here, not read from `std.Io`/internal entropy
+        /// directly — mirroring `tlock`/`bbs`/`frost`'s "randomness is
+        /// an explicit input" convention. This is what lets a KAT
+        /// harness pin the ciphertext deterministically: `encrypt`'s
+        /// OTHER inputs (`mpk`, `id`, `message`) are already fully
+        /// deterministic, so supplying `sigma` explicitly makes the
+        /// entire output reproducible — a production caller instead
+        /// sources `sigma` from `ciphersuite.randomSigma(io)`.
+        ///
+        /// `message.len`/`sigma.len` are both fixed to `block_bytes`
+        /// (32 for the default instantiation — see
+        /// `ciphersuite.block_bytes`'s doc comment).
+        pub fn encrypt(mpk: g2.Affine, id: []const u8, message: [cs.block_bytes]u8, sigma: [cs.block_bytes]u8) Self.Ciphertext {
+            // Steps 1-2: identity -> Qid -> Gid. `pairing.pairing` takes
+            // `(G1, G2)`.
+            const qid = cs.h1(id);
+            const gid = pairing.pairing(qid, mpk);
+
+            // Step 4: r = H3(sigma, M) — the FO-transform binding scalar.
+            const r = cs.h3(&sigma, &message);
+
+            // Step 5: U = r * G2_generator (constant-time scalarMul).
+            const u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r).toAffine();
+
+            // Step 6: gid_r = Gid^r — Gt exponentiation (see fp12Pow
+            // above). Handed to `h2` in `bls12_381.pairing`'s CANONICAL
+            // representation; a ciphersuite needing another one (drand's
+            // cube) adapts inside its own `h2`. See this file's module
+            // doc comment, "No drand-style cube".
+            const gid_r = fp12Pow(gid, r);
+
+            // Step 7: V = sigma XOR H2(gid_r).
+            var v = cs.h2(gid_r);
+            for (&v, sigma) |*b, s| b.* ^= s;
+
+            // Step 8: W = M XOR H4(sigma).
+            var w = cs.h4(&sigma);
+            for (&w, message) |*b, m| b.* ^= m;
+
+            return .{ .u = u, .v = v, .w = w };
+        }
+
+        /// **REAL.** BF-IBE FullIdent decryption + the
+        /// Fiat-Shamir-Okamoto consistency check. See this file's module
+        /// doc comment for the full construction this function
+        /// transcribes (`gid_r -> sigma -> message -> recompute r ->
+        /// check U`).
+        ///
+        /// `d_id` is the identity's BF-IBE private key, from
+        /// `extract(msk, id)` — this function does NOT verify `d_id`
+        /// against `mpk`/`id` itself (a caller-side sanity check,
+        /// analogous to `tlock.decrypt`'s note about verifying
+        /// `round_signature` against the beacon public key before
+        /// trusting it — see that module's `kat_test.zig` for the
+        /// pairing-check idiom, `e(d_id, G2gen) == e(H1(id), mpk)`,
+        /// which applies here unchanged). Returns
+        /// `error.FoCheckFailed` (never a garbage `message`) if the
+        /// recomputed `U' != ct.u` — the CCA-rejection path.
+        pub fn decrypt(d_id: g1.Affine, ct: Self.Ciphertext) DecryptError![cs.block_bytes]u8 {
+            // Step 1: gid_r = e(d_id, U) — ONE pairing call reconstructs
+            // encrypt's Gid^r by bilinearity (see the module doc
+            // comment). The SAME canonical pairing representation
+            // `encrypt` fed to h2 above.
+            const gid_r = pairing.pairing(d_id, ct.u);
+
+            // Step 2: sigma = V XOR H2(gid_r). Purely internal scratch —
+            // never returned — so it is wiped on every exit (success or
+            // reject).
+            var sigma = cs.h2(gid_r);
+            for (&sigma, ct.v) |*b, x| b.* ^= x;
+            defer std.crypto.secureZero(u8, &sigma);
+
+            // Step 3: message = W XOR H4(sigma).
+            var message = cs.h4(&sigma);
+            for (&message, ct.w) |*b, x| b.* ^= x;
+
+            // Step 4: FO/CCA consistency — recompute r' = H3(sigma,
+            // message) and reject unless U == r' * G2_generator. Compare
+            // via the canonical compressed encoding (unique for every
+            // point incl. infinity). The check's outcome (accept/reject)
+            // is public, so a non-constant-time byte compare is fine
+            // here; what must NOT happen is returning a
+            // partially-decrypted message on mismatch — so on reject,
+            // wipe the (untrusted, about-to-be-discarded) recovered
+            // `message` before returning the error instead of leaving it
+            // sitting on the stack.
+            const r_check = cs.h3(&sigma, &message);
+            const u_check = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r_check).toAffine();
+            if (!std.mem.eql(u8, &g2.toBytesCompressed(u_check), &g2.toBytesCompressed(ct.u))) {
+                std.crypto.secureZero(u8, &message);
+                return error.FoCheckFailed;
+            }
+
+            return message;
+        }
+    };
 }
 
-/// **REAL.** BF-IBE FullIdent decryption + the Fiat-Shamir-Okamoto
-/// consistency check. See this file's module doc comment for the full
-/// construction this function transcribes (`gid_r -> sigma -> message
-/// -> recompute r -> check U`).
-///
-/// `d_id` is the identity's BF-IBE private key, from `extract(msk,
-/// id)` — this function does NOT verify `d_id` against `mpk`/`id`
-/// itself (a caller-side sanity check, analogous to `tlock.decrypt`'s
-/// note about verifying `round_signature` against the beacon public
-/// key before trusting it — see that module's `kat_test.zig` for the
-/// pairing-check idiom, `e(d_id, G2gen) == e(H1(id), mpk)`, which
-/// applies here unchanged). Returns `error.FoCheckFailed` (never a
-/// garbage `message`) if the recomputed `U' != ct.u` — the
-/// CCA-rejection path.
-pub fn decrypt(d_id: g1.Affine, ct: Ciphertext) DecryptError![block_bytes]u8 {
-    // Step 1: gid_r = e(d_id, U) — ONE pairing call reconstructs
-    // encrypt's Gid^r by bilinearity (see the module doc comment). No
-    // drand-style cube — the SAME canonical pairing representation
-    // `encrypt` fed to h2 above.
-    const gid_r = pairing.pairing(d_id, ct.u);
+// ── the default instantiation: this module's own scheme ─────────────
+//
+// `ibe`'s public API is `Scheme(ciphersuite)` — the parameterisation
+// above is a TESTABILITY seam, not a new public surface for callers to
+// pick a ciphersuite from; `root.zig` re-exports only these.
 
-    // Step 2: sigma = V XOR H2(gid_r). Purely internal scratch — never
-    // returned — so it is wiped on every exit (success or reject).
-    var sigma = ciphersuite.h2(gid_r);
-    for (&sigma, ct.v) |*b, x| b.* ^= x;
-    defer std.crypto.secureZero(u8, &sigma);
+/// This module's own BF-IBE scheme: `ciphersuite.zig`'s DSTs, tags,
+/// 32-byte blocks and canonical (un-cubed) `Gt` representation.
+pub const Default = Scheme(ciphersuite);
 
-    // Step 3: message = W XOR H4(sigma).
-    var message = ciphersuite.h4(&sigma);
-    for (&message, ct.w) |*b, x| b.* ^= x;
-
-    // Step 4: FO/CCA consistency — recompute r' = H3(sigma, message)
-    // and reject unless U == r' * G2_generator. Compare via the
-    // canonical compressed encoding (unique for every point incl.
-    // infinity). The check's outcome (accept/reject) is public, so a
-    // non-constant-time byte compare is fine here; what must NOT
-    // happen is returning a partially-decrypted message on mismatch —
-    // so on reject, wipe the (untrusted, about-to-be-discarded)
-    // recovered `message` before returning the error instead of
-    // leaving it sitting on the stack.
-    const r_check = ciphersuite.h3(&sigma, &message);
-    const u_check = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r_check).toAffine();
-    if (!std.mem.eql(u8, &g2.toBytesCompressed(u_check), &g2.toBytesCompressed(ct.u))) {
-        std.crypto.secureZero(u8, &message);
-        return error.FoCheckFailed;
-    }
-
-    return message;
-}
-
-// ── internal test hook: expose fp12Pow to kat_test.zig ──────────────
-
-pub const testing_fp12Pow = fp12Pow;
+pub const Ciphertext = Default.Ciphertext;
+pub const extract = Default.extract;
+pub const encrypt = Default.encrypt;
+pub const decrypt = Default.decrypt;
 
 // ── tests: Ciphertext codec (REAL, ungated) ─────────────────────────
 

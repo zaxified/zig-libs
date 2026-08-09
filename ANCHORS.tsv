@@ -111,7 +111,7 @@ hpke	B	EXTERNAL	RFC 9180 Appendix A KAT, byte-exact in all 4 modes (README)
 hqc	B	EXTERNAL	official NIST KAT, byte-exact pk/sk/ct/ss (README)
 http	A	MIXED	HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self
 chachapoly	B	EXTERNAL	RFC 8439 KATs byte-exact + std oracle differential (README/SPEC)
-ibe	B	SELF	SPEC.md: no external BF-IBE vector exists; round-trip + algebraic identities only
+ibe	B	MIXED	assembly byte-exact vs a genuine drand Go tle ciphertext: ibe.Scheme (comptime ciphersuite seam) driven with drand's parameters reproduces the fixture in kat_test.zig §5, encrypt and decrypt both directions; own DSTs/tags/h3/no-cube remain self-only and are unanchorable by construction (RFC 9380 §3.1 mandates a per-application DST, so no foreign value exists to match)
 icmp	A	MIXED	RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test
 idempotency	D	n/a	own design over Stripe/IETF-draft pattern, no byte wire format (SPEC.md)
 iec104	A	EXTERNAL	72 byte-exact goldens captured from real c104/lib60870 traffic (SPEC.md)

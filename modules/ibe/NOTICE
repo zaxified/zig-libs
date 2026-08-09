@@ -39,10 +39,49 @@ No third-party source code (beyond this repository's own `tlock`
 module, covered above) was consulted or copied anywhere in this
 module.
 
+Test-only third-party DATA (drand interop anchor)
+-------------------------------------------------
+
+`src/kat_test.zig` section 5 contains six frozen hex constants — a
+BLS12-381 `G2` public key, a `G1` round signature, a 128-byte BF-IBE
+ciphertext, a 16-byte plaintext and a 16-byte `sigma` pad — copied
+verbatim from `modules/tlock/src/kat_test.zig` section 3, where they
+have lived since 2026-07-16. Their origin chain (a `tle`-armored age
+fixture from `github.com/drand/tlock` commit
+`7ceb44a598293f10c43d2291df9e669c4251fe24`, plus a round signature
+fetched live from the quicknet-t beacon) is recorded in full in
+`modules/tlock/NOTICE`, which is the authoritative record for them;
+nothing new is fetched, and nothing is redistributed here that this
+repository was not already distributing.
+
+Licence posture: these are NUMERIC OUTPUT of a public cryptographic
+specification (Boneh-Franklin FullIdent over BLS12-381, drand's
+`bls-unchained-g1-rfc9380` scheme) produced by running a third-party
+implementation — not source code, not a translation of source code,
+and not a creative work. No drand or `kilic/bls12-381` source was read
+or transcribed for this module: the drand-side ciphersuite section 5
+drives is `modules/tlock`'s, imported as a test-only dependency
+(`build.zig`'s `test_deps`), so this module adds no new third-party
+provenance chain of its own. The published `ibe` module contains none
+of this — it is test data only, and `zig build check-testonly` proves
+the `tlock` import never reaches the module a consumer imports.
+
+Why the bytes are copied rather than imported: `tlock`'s constants are
+private to its own test file, and `modules/tlock/` is shared with
+other consumers, so exporting them would mean changing a module this
+work had no mandate to change. The copy is guarded by its own
+consistency test (the pairing identity binding public key, round
+signature and identity together), so a transcription error fails
+loudly instead of quietly weakening the anchor.
+
 **Status: REAL.** `ciphersuite.zig`, `ibe.Ciphertext`'s byte codec,
 `ibe.setup`/`ibe.extract`, and `ibe.encrypt`/`ibe.decrypt` (the BF-IBE
 FullIdent core) are all implemented and tested — see `SPEC.md`'s "KAT
-plan" for the self-consistency verification chain (round-trip, direct
-pairing-consistency, and soundness/CCA-rejection tests) and its
-"Honest tier note" for why no external test vector exists for this
-standalone scheme.
+plan" for the verification chain: the encrypt/decrypt ASSEMBLY is
+pinned byte-exactly against a genuine drand-Go-produced ciphertext by
+instantiating `ibe.Scheme` with drand's ciphersuite, while this
+module's own DSTs/tags/no-cube choices are pinned by round-trip,
+pairing-consistency and soundness/CCA-rejection tests and cannot be
+anchored externally at all (RFC 9380 §3.1 requires each application to
+choose its own DST — there is no foreign value for one of ours to
+match).

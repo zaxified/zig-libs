@@ -10,12 +10,23 @@ extracted.
 
 **Status: REAL — fully implemented, no stubs.** `setup`, `extract`,
 `encrypt`, and `decrypt` are all real, built on `bls12_381`'s
-already-proven field/group/pairing/hash-to-curve primitives and the
-exact BF-IBE assembly this repo's sibling `tlock` module proved
-interop-verified against drand's Go implementation. See
-[SPEC.md](SPEC.md) for the full construction, the KAT plan, and the
-one deliberate divergence from `tlock` (no drand-style Gt cube — this
-module has no external implementation to match).
+already-proven field/group/pairing/hash-to-curve primitives.
+
+**How it is anchored.** The encrypt/decrypt *assembly* is checked
+against a foreign artifact: `ibe.Scheme` is a `comptime` seam over the
+ciphersuite, and the tests instantiate this module's own
+`encrypt`/`decrypt`/`fp12Pow`/`Ciphertext` code with **drand's**
+parameters and require it to reproduce a genuine ciphertext produced by
+drand's own Go `tle` CLI, byte for byte. This module's own *parameters*
+— its DSTs and hash tags, and the one deliberate divergence from
+`tlock` (no drand-style Gt cube) — cannot be anchored externally at
+all: RFC 9380 §3.1 requires every application to pick its own DST, so
+there is no foreign value for ours to match, and with no external byte
+target the cube is a free choice. Those rest on the round-trip,
+pairing-consistency and soundness tests, and that is the end state.
+See [SPEC.md](SPEC.md)'s "KAT plan" for both halves, including the
+mutations that showed the anchor catches what the self-consistency
+tests structurally cannot.
 
 **Relationship to `tlock`**: `tlock` (this repo) is the SAME
 Boneh-Franklin primitive specialized so the PKG is a drand randomness
@@ -28,7 +39,7 @@ at any time.
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
 | `ciphersuite.zig` | `h1` (identity -> `G1`), `h2`/`h3`/`h4` (this module's own domain-separated hash constructions), `randomSigma` |
 | `ibe.zig` | `KeyPair`, `setup`/`extract` (the PKG API), `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec, `encrypt`/`decrypt` + the private `fp12Pow` `Gt`-exponentiation helper |
-| `kat_test.zig` | Round-trip, pairing-consistency, and soundness (tamper/wrong-key rejection) KATs |
+| `kat_test.zig` | Round-trip, pairing-consistency and soundness (tamper/wrong-key rejection) KATs, plus the drand-parameterised interop anchor (test-only `tlock` import) |
 
 ## Import
 
@@ -83,9 +94,14 @@ const sigma = [_]u8{0x11} ** ibe.block_bytes;
 
 ```
 ibe → bls12_381 (G1/G2 point arithmetic, the pairing, RFC 9380 hash-to-curve)
+
+tests only:
+ibe → tlock  (drand's ciphersuite + its frozen drand interop fixture)
 ```
 
-`meta.deps = .{"bls12_381"}`.
+`meta.deps = .{"bls12_381"}`. `tlock` is a `test_deps` entry in
+`build.zig`, never part of the published module — `zig build
+check-testonly` proves it.
 
 ## Verify
 
@@ -98,6 +114,6 @@ zig fmt --check modules/ibe/
 All tests PASS in both Debug and ReleaseFast — ciphersuite hash
 tests, `Ciphertext` codec tests, `setup`/`extract` tests, the private
 `fp12Pow` algebraic-law tests, and `kat_test.zig`'s round-trip,
-pairing-consistency, and soundness/CCA-rejection KATs.
+pairing-consistency, soundness/CCA-rejection and drand-anchor KATs.
 
 Provenance: see [NOTICE](NOTICE).

@@ -236,7 +236,12 @@ const module_list = [_]Module{
     .{ .name = "bbs", .deps = &.{"bls12_381"} },
     .{ .name = "coconut", .deps = &.{"bls12_381"}, .heavy = true },
     .{ .name = "tlock", .deps = &.{"bls12_381"} },
-    .{ .name = "ibe", .deps = &.{"bls12_381"}, .heavy = true },
+    // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own
+    // encrypt/decrypt through `ibe.Scheme` with drand's ciphersuite, to
+    // byte-compare against the genuine drand-Go-produced ciphertext `tlock`
+    // already has frozen. The published `ibe` module never imports it --
+    // `zig build check-testonly` proves that.
+    .{ .name = "ibe", .deps = &.{"bls12_381"}, .test_deps = &.{"tlock"}, .heavy = true },
     .{ .name = "bn254", .heavy = true },
     .{ .name = "ed448" },
     .{ .name = "decaf448", .deps = &.{"ed448"} },
