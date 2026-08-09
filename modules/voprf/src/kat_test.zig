@@ -51,7 +51,7 @@ test "OPRF A.1.1: blind, blindEvaluate, finalize, and direct evaluate all match"
         try testing.expectEqualSlices(u8, &v.blinded_element, &blinded.toBytes());
 
         // (3) BlindEvaluate reproduces EvaluationElement.
-        const evaluated = try voprf.blindEvaluate(kat.oprf_sk, blinded);
+        const evaluated = voprf.blindEvaluate(kat.oprf_sk, blinded);
         try testing.expectEqualSlices(u8, &v.evaluation_element, &evaluated.toBytes());
 
         // (6) Finalize reproduces Output.
@@ -286,7 +286,7 @@ test "e2e OPRF: fresh key + fresh blind round-trips and agrees with evaluate" {
     const input = "e2e private input";
 
     const blinded = try voprf.blind(.oprf, input, blind_scalar);
-    const evaluated = try voprf.blindEvaluate(kp.sk, blinded);
+    const evaluated = voprf.blindEvaluate(kp.sk, blinded);
     const output = try voprf.finalize(input, blind_scalar, evaluated);
     const direct = try voprf.evaluate(.oprf, kp.sk, input);
     try testing.expectEqualSlices(u8, &direct, &output);
@@ -366,13 +366,17 @@ test "finalize REJECTS a zero blind scalar (degenerate unblind, RFC 9497 Invalid
     // A zero blind is canonical (deserializeScalar accepts it — see
     // root.zig's "zero is canonical" test), so the ONLY thing standing
     // between a degenerate blind and a silently-wrong Finalize is
-    // unblind's explicit zero check (`blind` itself already independently
-    // rejects blinding BY zero — std's own Ristretto255.mul refuses to
-    // produce the identity element — so this test drives a genuine,
+    // unblind's explicit zero check. `blind` itself no longer rejects
+    // blinding BY zero: it used to inherit that rejection from std's
+    // `Ristretto255.mul`, which is a branch on the SECRET blind, so the
+    // multiply now runs constant-time and returns the identity as a value
+    // (see `blind REPORTS NOTHING about a zero blind` below). `unblind` is
+    // where the exclusion genuinely belongs — there the blind is being
+    // INVERTED, and zero has no inverse. This test drives a genuine,
     // properly-blinded evaluation through the real protocol and only
     // substitutes a zero blind_scalar at the FINALIZE call, exactly the
     // shape a caller-side bug — e.g. losing track of which blind matches
-    // which evaluation — would take). No test anywhere in this suite
+    // which evaluation — would take. No test anywhere in this suite
     // (KAT or e2e) ever exercises unblind's own zero-blind guard — every
     // vector's/e2e test's blind scalar is a genuine nonzero value, so
     // this guard could be deleted without any existing test noticing.
@@ -383,6 +387,6 @@ test "finalize REJECTS a zero blind scalar (degenerate unblind, RFC 9497 Invalid
     const input = "zero blind input";
 
     const blinded = try voprf.blind(.oprf, input, real_blind);
-    const evaluated = try voprf.blindEvaluate(kp.sk, blinded);
+    const evaluated = voprf.blindEvaluate(kp.sk, blinded);
     try testing.expectError(error.InvalidBlind, voprf.finalize(input, zero_blind, evaluated));
 }

@@ -80,9 +80,53 @@
 //! 9381 Appendix B.3 (`kat_vectors.zig`/`kat_test.zig`).
 
 const std = @import("std");
+const ct25519 = @import("ct25519");
 const Edwards25519 = std.crypto.ecc.Edwards25519;
 const scalar = Edwards25519.scalar;
 const Sha512 = std.crypto.hash.sha2.Sha512;
+
+// ── constant-time scalar multiplication on a SECRET scalar ──────────────
+//
+// `Edwards25519.mul` (std) is internally constant-time — a 4-bit fixed
+// window over a 16-entry precomputed table selected with `cMov`, 64 fixed
+// iterations regardless of the scalar — EXCEPT that `pcMul16`
+// (`std/crypto/25519/edwards25519.zig`) ends with `try q.rejectIdentity()`,
+// turning "the product is the neutral element" into
+// `error.IdentityElement`. `rejectIdentity` is `if (p.x.isZero())` — a
+// BRANCH on a value derived from the scalar — and the error union then
+// forces every caller to branch a second time. Both branches are
+// secret-dependent when the scalar is the VRF secret `x` or the nonce `k`:
+// they reveal whether that scalar was zero mod the group order. The old
+// shape here was `catch @panic(...)` / `catch unreachable` at five call
+// sites, which is the loudest possible form of that branch.
+//
+// `ct25519.mul`/`ct25519.mulBase` (sibling module) are std's own
+// constant-time ladder with the trailing rejection removed: the neutral
+// element is simply returned as a value. They have no error union, so no
+// call site can branch on the scalar, and their control flow (precompute
+// or load the base table, then 64 window iterations, each an unconditional
+// 15-entry `cMov` select + add + 4 doublings) is identical for every
+// scalar including zero. This module used to carry its own private copy of
+// that ladder; it now depends on `ct25519` instead, so the fix (and its
+// test coverage) lives in one place for every caller that needs it
+// (`voprf`, `opaque`, `signal`, `bulletproofs`, and this module).
+//
+// Nothing is validated away by dropping the rejection. All five call sites
+// treated the error as UNREACHABLE, and it provably is: RFC 8032 clamping
+// puts `x` in `[2^254, 2^254 + 2^251)`, and `2^254/L ≈ 4.004` while
+// `(2^254 + 2^251)/L ≈ 4.504`, so no clamped `x` is a multiple of `L` and
+// `[x]B` is never the identity. For the nonce `k` the identity result has
+// probability ~2^-252 and, if it ever occurred, the proof would simply
+// carry `U = O` — `verify` recomputes `U` the same way, and a degenerate
+// PUBLIC key is still rejected by `validateKey` (§5.4.5) on the verifier
+// side, which is where that check belongs. The point-side guard std also
+// has (`xpc[4].rejectIdentity()` ⇒ `error.WeakPublicKey`) is likewise not
+// a validation here: `ct25519.mul`'s only non-base argument is `H`, which
+// `encodeToCurve` has already cofactor-cleared and checked non-identity,
+// so it cannot be low-order.
+//
+// The VERIFIER is untouched: `mulDoubleBasePublic` runs over public inputs
+// only and stays variable-time by design.
 
 /// RFC 9381 §5.5: the one-byte ciphersuite identifier for
 /// ECVRF-EDWARDS25519-SHA512-TAI. NOT 0x04 (that is the sibling ELL2
@@ -151,12 +195,12 @@ pub fn secretScalar(sk: SecretKey) [32]u8 {
 }
 
 /// `Y = x*B` (RFC 9381's parameter list), compressed — RFC 9381 §5.5 /
-/// RFC 8032 §5.1.5's public-key derivation.
+/// RFC 8032 §5.1.5's public-key derivation. `ct25519.mulBase`, not
+/// `Edwards25519.mul`: `x` is secret and std's `mul` ends in a branch on
+/// whether `[x]B` is the identity (see the module doc comment).
 pub fn publicKey(sk: SecretKey) PublicKey {
     const x = secretScalar(sk);
-    const y = Edwards25519.basePoint.mul(x) catch
-        @panic("ecvrf: degenerate secret key (clamped scalar is 0 mod the group order — probability ~2^-252)");
-    return y.toBytes();
+    return ct25519.mulBase(x).toBytes();
 }
 
 /// RFC 9381 §5.4.1.1 `ECVRF_encode_to_curve_try_and_increment`, fixed to
@@ -286,9 +330,10 @@ pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
     defer std.crypto.secureZero(u8, &exp.x);
     defer std.crypto.secureZero(u8, &exp.prefix);
 
-    // Step 1: x, Y = x*B.
-    const y_point = Edwards25519.basePoint.mul(exp.x) catch
-        @panic("ecvrf: degenerate secret key (clamped scalar is 0 mod the group order)");
+    // Step 1: x, Y = x*B. `ct25519.mulBase` (constant-time, no error union)
+    // — `x` is the VRF secret scalar; see the module doc comment for why
+    // std's `mul` is not usable on a secret here.
+    const y_point = ct25519.mulBase(exp.x);
     const y_string = y_point.toBytes();
 
     // Step 2-3: H = encode_to_curve(PK_string, alpha), h_string = point_to_string(H).
@@ -298,21 +343,25 @@ pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
     // never fail.
     const h_point = Edwards25519.fromBytes(h_string) catch unreachable;
 
-    // Step 4: Gamma = x*H. H has prime order q (cofactor already
-    // cleared, identity already excluded by encodeToCurve), and x != 0
-    // mod q (else the Y = x*B step above would already have panicked),
-    // so this can neither hit WeakPublicKey (H is not low-order) nor
-    // IdentityElement (x is nonzero mod ord(H)).
-    const gamma_point = h_point.mul(exp.x) catch unreachable;
+    // Step 4: Gamma = x*H. H has prime order q (cofactor already cleared,
+    // identity already excluded by encodeToCurve) and clamped x is never 0
+    // mod q, so neither of std's two rejections could ever have fired here
+    // — they were pure secret-dependent branches, which is why
+    // `ct25519.mul` drops them rather than keeping a `catch unreachable`.
+    const gamma_point = ct25519.mul(h_point, exp.x);
     const gamma_string = gamma_point.toBytes();
 
     // Step 5: k = nonce_generation(SK, h_string).
     const k = nonceGeneration(sk, h_string);
 
-    // Step 6: c = challenge_generation(Y, H, Gamma, k*B, k*H).
-    const u_point = Edwards25519.basePoint.mul(k) catch
-        @panic("ecvrf: nonce reduced to 0 mod the group order — probability ~2^-252");
-    const v_point = h_point.mul(k) catch unreachable; // same non-low-order/non-identity argument as gamma_point
+    // Step 6: c = challenge_generation(Y, H, Gamma, k*B, k*H). `k` is the
+    // secret nonce — the one scalar here that CAN legitimately be 0 mod q
+    // (probability ~2^-252), and therefore the one whose rejection branch
+    // was a genuine leak rather than dead code. `ct25519.mul`/`mulBase`
+    // return the neutral element as a value; `verify` recomputes `U`/`V`
+    // identically.
+    const u_point = ct25519.mulBase(k);
+    const v_point = ct25519.mul(h_point, k);
     const c = challengeGeneration(y_string, h_string, gamma_string, u_point.toBytes(), v_point.toBytes());
 
     // Step 7: s = (k + c*x) mod q.
@@ -389,6 +438,33 @@ test "wire-shape constants match RFC 9381 §5.5 (ECVRF-EDWARDS25519-SHA512-TAI)"
     try std.testing.expectEqual(@as(usize, 80), proof_len);
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(Proof));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(Output));
+}
+
+// The ladder's own correctness oracle ("agrees with std's Edwards25519.mul
+// on every nonzero scalar, base point and non-base point alike") and its
+// "neutral element is a VALUE, not error.IdentityElement" pin now live in
+// `ct25519`'s own test suite (`modules/ct25519/src/root.zig`: "mul:
+// bit-exact against std's Edwards25519.mul on the base point", "... on
+// non-base points", and "mul: the neutral element is a VALUE, where std
+// raises an error") — this module used to carry a private copy of both
+// checks alongside its private copy of the ladder; now that the ladder is
+// `ct25519.mul`/`mulBase`, so is the coverage. Not re-duplicated here.
+
+test "every secret-scalar multiply in this module is total (no error union to branch on)" {
+    // Structural, not behavioural: the leak the constant-time ladder closes
+    // is a TIMING property, and a revert that keeps the branch but
+    // swallows the error (`catch identityElement`) is behaviourally
+    // indistinguishable. What is NOT indistinguishable is the signature —
+    // an error union is what forces a second, caller-side, secret-dependent
+    // branch. `ct25519.mul`/`mulBase` are pinned total in their own test
+    // suite ("mul: carries no error set, so no call site can branch on the
+    // scalar"); `publicKey` and `prove` are likewise total here: neither
+    // can report, or branch on, "your secret scalar was zero".
+    try std.testing.expectEqual(PublicKey, @typeInfo(@TypeOf(publicKey)).@"fn".return_type.?);
+    try std.testing.expectEqual(Proof, @typeInfo(@TypeOf(prove)).@"fn".return_type.?);
+
+    // The defect being worked around, pinned at its source.
+    try std.testing.expect(@typeInfo(@typeInfo(@TypeOf(Edwards25519.mul)).@"fn".return_type.?) == .error_union);
 }
 
 test "padChallenge zero-extends the low 16 bytes and leaves the high 16 zero" {

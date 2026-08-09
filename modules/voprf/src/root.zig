@@ -41,8 +41,9 @@
 //! the only missing piece was `expand_message_xmd`, implemented here
 //! (`expandMessageXmd`) per RFC 9380 §5.4.1. The rest of the group
 //! interface maps 1:1 onto std (all MIT, part of Zig itself):
-//! `Ristretto255.basePoint` (Generator), `.mul(s: [32]u8)` (constant-
-//! time scalar mult, returns `IdentityElementError||WeakPublicKeyError`),
+//! `Ristretto255.basePoint` (Generator), `.mul(s: [32]u8)` (a
+//! constant-time ladder that then BRANCHES on its own result — see the
+//! Security notes; used here only for PUBLIC scalars),
 //! `.add`/`.sub`, `.fromBytes`/`.toBytes` (RFC 9496 Decode/Encode,
 //! Ne = 32), `.rejectIdentity`; `Ristretto255.scalar` (the shared
 //! edwards25519 scalar field, order `2^252 + 27742317777372353535851937
@@ -55,10 +56,27 @@
 //!
 //! ## Security notes
 //!
-//! - Secrets (`skS`, the client `blind`, POPRF's tweak scalar `t`) only
-//!   ever touch the constant-time std paths: `Ristretto255.mul` and the
-//!   `scalar` add/sub/mul/invert ops. No variable-time scalar mult is
-//!   used anywhere.
+//! - **Secret scalars do not go through `Ristretto255.mul`.** This was
+//!   the module's own claim for a long time and it was WRONG. std's
+//!   `mul` IS a constant-time 4-bit-window ladder — and then its
+//!   `pcMul16` ends with `try q.rejectIdentity()`, a branch on a
+//!   scalar-derived value, whose error union forced a `catch` at every
+//!   one of the nine secret-scalar call sites in this file. Those nine
+//!   now use the sibling `ct25519` (std's identical ladder with that
+//!   tail removed, neutral element returned as a value, no error union
+//!   to `catch`): `skS` in `deriveKeyPair`/`blindEvaluate`/`evaluate`/
+//!   `computeCompositesFast`, the client `blind` in `blind` and its
+//!   inverse in `unblind`, POPRF's tweak `t`/`t_inv`, and the DLEQ proof
+//!   nonce `r` in `generateProof` (`s = r - c*k` hands `k` to anyone who
+//!   learns `r`). The `scalar` add/sub/mul/invert ops are std's and are
+//!   constant-time as-is.
+//! - **Public scalars deliberately stay on std's `mul`.** `verifyProof`'s
+//!   `s`/`c` come off the wire; the per-term composite scalars `di` are
+//!   hashes of wire elements; POPRF's `m` is a hash of the PUBLIC `info`.
+//!   Variable-time or result-branching behaviour on those leaks nothing
+//!   that is not already published, and `error.DegenerateComposite` /
+//!   `error.InvalidProof` are genuine fail-closed rejections of peer
+//!   data. No variable-time scalar mult (`mulPublic`) is used anywhere.
 //! - `verifyProof` compares the recomputed challenge with
 //!   `std.crypto.timing_safe.eql`, and `finalizeVerifiable`/
 //!   `finalizePoprf` run `verifyProof` BEFORE unblinding — an invalid
@@ -66,14 +84,20 @@
 //! - `Element.fromBytes` enforces RFC 9497 §4.1 DeserializeElement:
 //!   canonical ristretto255 decoding AND identity-element rejection.
 //!   `deserializeScalar` enforces canonical (< group order) scalars.
-//! - Per RFC 9497 §3.2.1/§4.7, `deriveKeyPair`'s rejection loop and the
-//!   POPRF `t == 0` check branch on secret-derived "is zero" conditions
-//!   exactly where the RFC's own pseudocode does (the branch outcome is
-//!   part of the protocol, not a side channel on a fixed secret).
+//! - Per RFC 9497 §3.2.1/§4.7, `deriveKeyPair`'s rejection loop, the
+//!   POPRF `t == 0` check and `unblind`'s zero-blind check branch on
+//!   secret-derived "is zero" conditions exactly where the RFC's own
+//!   pseudocode does (the branch outcome is part of the protocol, not a
+//!   side channel on a fixed secret). These are the ONLY remaining
+//!   secret-dependent branches, and each one guards an operation that is
+//!   arithmetically undefined for zero (a key that PRFs everything to the
+//!   identity; an inverse that does not exist) rather than reporting a
+//!   scalar multiplication's result.
 //!
 //! Wire sizes (§4.1): Ne = Ns = 32, Nh = 64; `Proof` = 64 bytes (c||s).
 
 const std = @import("std");
+const ct25519 = @import("ct25519");
 const Sha512 = std.crypto.hash.sha2.Sha512;
 
 /// Re-exported: the std group backing this ciphersuite (see the module
@@ -86,7 +110,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no allocation, no RNG
     .concurrency = .reentrant, // no globals; all types are plain values
     .model_after = "RFC 9497 (\"Oblivious Pseudorandom Functions (OPRFs) Using Prime-Order Groups\"), §4.1 ristretto255-SHA512 ciphersuite, OPRF+VOPRF+POPRF modes; RFC 9380 §5.4.1 expand_message_xmd + Appendix B hash_to_ristretto255; std.crypto.ecc.Ristretto255 supplies the group",
-    .deps = .{},
+    .deps = .{"ct25519"}, // constant-time secret-scalar multiply (see Security notes)
 };
 
 // ── ciphersuite constants (RFC 9497 §3.1 / §4.1) ─────────────────────────
@@ -298,8 +322,10 @@ pub fn deriveKeyPair(comptime mode: Mode, seed: [32]u8, info: []const u8) Derive
         const sk = hashToScalarDst(&.{ &seed, &info_len, info, &counter_byte }, dst);
         // skS == 0 → retry (this zero test is the RFC's own loop condition).
         if (std.mem.allEqual(u8, &sk, 0)) continue;
-        const pk = Ristretto255.basePoint.mul(sk) catch continue; // unreachable for sk != 0
-        return .{ .sk = sk, .pk = .{ .p = pk } };
+        // SECRET scalar: `ct25519.mulRistrettoBase`, not std's `mul` (see
+        // the Security notes). The `catch continue` this replaces was a
+        // second branch on `sk` on top of the RFC's own zero test.
+        return .{ .sk = sk, .pk = .{ .p = ct25519.mulRistrettoBase(sk) } };
     }
     return error.DeriveKeyPairFailed;
 }
@@ -365,7 +391,11 @@ fn computeCompositesFast(
         const term = c_i.p.mul(d_scalar) catch return error.DegenerateComposite;
         m_acc = if (i == 0) term else m_acc.add(term);
     }
-    const z = m_acc.mul(k) catch return error.DegenerateComposite;
+    // `k` is the SECRET key: constant-time multiply, no `catch`. (The
+    // per-term `di` above are PUBLIC — derived by hash from wire elements
+    // — so std's ladder is correct for them and its rejection branches on
+    // nothing secret.)
+    const z = ct25519.mulRistretto(m_acc, k);
     return .{ .m = .{ .p = m_acc }, .z = .{ .p = z } };
 }
 
@@ -437,8 +467,10 @@ pub fn generateProof(
 ) GenerateProofError!Proof {
     const comp = computeCompositesFast(mode, k, b, c_list, d_list) catch
         return error.ProofGenerationFailed;
-    const t2 = a.p.mul(r) catch return error.ProofGenerationFailed;
-    const t3 = comp.m.p.mul(r) catch return error.ProofGenerationFailed;
+    // `r` is the SECRET proof nonce — `s = r - c*k` reveals `k` to anyone
+    // who learns `r`, so it gets the same treatment as `k` itself.
+    const t2 = ct25519.mulRistretto(a.p, r);
+    const t3 = ct25519.mulRistretto(comp.m.p, r);
     const c = challengeScalar(mode, b, comp.m, comp.z, .{ .p = t2 }, .{ .p = t3 });
     const s = scalar.sub(r, scalar.mul(c, k)); // s = r - c * k (mod Order)
     return .{ .c = c, .s = s };
@@ -508,13 +540,20 @@ fn unblind(blind_scalar: [Ns]u8, evaluated_element: Element) FinalizeError![Ne]u
     _ = deserializeScalar(blind_scalar) catch return error.InvalidBlind;
     if (std.mem.allEqual(u8, &blind_scalar, 0)) return error.InvalidBlind;
     const inv = scalar.Scalar.fromBytes(blind_scalar).invert().toBytes();
-    const n = evaluated_element.p.mul(inv) catch return error.InvalidBlind;
-    return n.toBytes();
+    // `inv` is derived from the SECRET blind: constant-time multiply.
+    return ct25519.mulRistretto(evaluated_element.p, inv).toBytes();
 }
 
 // ── OPRF mode (RFC 9497 §3.3.1) ──────────────────────────────────────────
 
-pub const BlindError = error{ InvalidInput, InvalidBlind };
+/// `InvalidBlind` is deliberately NOT a member: blinding multiplies a
+/// SECRET scalar, and the only way the multiply could report anything about
+/// it is by branching on it. `blind` therefore accepts every 32-byte blind
+/// and returns a group element for it; a degenerate blind (`0 mod L`) yields
+/// the identity, which `finalize` still rejects on the way back out (there
+/// the scalar is being INVERTED, so zero has to be excluded arithmetically
+/// rather than as a side channel). See the Security notes.
+pub const BlindError = error{InvalidInput};
 
 /// RFC 9497 §3.3.1 `Blind(input)` with caller-supplied blind scalar
 /// (the RFC's `blind = G.RandomScalar()` — MUST be fresh, uniformly
@@ -525,17 +564,22 @@ pub const BlindError = error{ InvalidInput, InvalidBlind };
 /// normally use `blindPoprf`, which also derives the tweaked key).
 pub fn blind(comptime mode: Mode, input: []const u8, blind_scalar: [Ns]u8) BlindError!Element {
     const input_element = try hashToGroup(mode, input);
-    const blinded = input_element.p.mul(blind_scalar) catch return error.InvalidBlind;
-    return .{ .p = blinded };
+    // `blind_scalar` is the client's SECRET: constant-time multiply.
+    return .{ .p = ct25519.mulRistretto(input_element.p, blind_scalar) };
 }
-
-pub const BlindEvaluateError = error{InvalidSecretKey};
 
 /// RFC 9497 §3.3.1 `BlindEvaluate(skS, blindedElement)` — the OPRF-mode
 /// server evaluation: `skS * blindedElement`, constant-time in `skS`.
-pub fn blindEvaluate(sk: [Ns]u8, blinded_element: Element) BlindEvaluateError!Element {
-    const p = blinded_element.p.mul(sk) catch return error.InvalidSecretKey;
-    return .{ .p = p };
+///
+/// Returns an `Element`, NOT an error union: `skS` is secret, and the only
+/// failure std's `Ristretto255.mul` could report is "the product is the
+/// identity", which for this prime-order group and a validated non-identity
+/// `blindedElement` happens iff `skS == 0 (mod L)` — a broken server key,
+/// never anything a client can induce. Reporting it would mean branching on
+/// `skS`. `deriveKeyPair` is what guarantees `skS != 0`, by the RFC's own
+/// rejection loop (§3.2.1).
+pub fn blindEvaluate(sk: [Ns]u8, blinded_element: Element) Element {
+    return .{ .p = ct25519.mulRistretto(blinded_element.p, sk) };
 }
 
 pub const FinalizeError = error{InvalidBlind};
@@ -548,7 +592,7 @@ pub fn finalize(input: []const u8, blind_scalar: [Ns]u8, evaluated_element: Elem
     return finalizeHash(input, null, unblinded);
 }
 
-pub const EvaluateError = error{ InvalidInput, InvalidSecretKey };
+pub const EvaluateError = error{InvalidInput}; // see blindEvaluate re: the dropped InvalidSecretKey
 
 /// RFC 9497 §3.3.1 `Evaluate(skS, input)` — the direct (non-oblivious)
 /// PRF, computable by anyone holding both `skS` and `input`. Used by
@@ -556,13 +600,13 @@ pub const EvaluateError = error{ InvalidInput, InvalidSecretKey };
 /// KATs assert it agrees with the blinded protocol round trip.
 pub fn evaluate(comptime mode: Mode, sk: [Ns]u8, input: []const u8) EvaluateError![Nh]u8 {
     const input_element = try hashToGroup(mode, input);
-    const evaluated = input_element.p.mul(sk) catch return error.InvalidSecretKey;
+    const evaluated = ct25519.mulRistretto(input_element.p, sk); // SECRET sk
     return finalizeHash(input, null, evaluated.toBytes());
 }
 
 // ── VOPRF mode (RFC 9497 §3.3.2) ─────────────────────────────────────────
 
-pub const BlindEvaluateVerifiableError = error{ InvalidSecretKey, ProofGenerationFailed };
+pub const BlindEvaluateVerifiableError = error{ProofGenerationFailed}; // see blindEvaluate re: the dropped InvalidSecretKey
 
 /// The result of a single-element VOPRF `BlindEvaluate`.
 pub const VerifiableEvaluation = struct {
@@ -598,7 +642,7 @@ pub fn blindEvaluateVerifiableBatch(
 ) BlindEvaluateVerifiableError!Proof {
     std.debug.assert(blinded.len >= 1 and evaluated_out.len == blinded.len);
     for (blinded, evaluated_out) |blinded_element, *out| {
-        out.* = try blindEvaluate(sk, blinded_element);
+        out.* = blindEvaluate(sk, blinded_element);
     }
     return generateProof(.voprf, sk, Element.generator, pk, blinded, evaluated_out, proof_r);
 }
@@ -663,7 +707,7 @@ pub fn blindPoprf(
 /// server's private key (`t = skS + m == 0`). Per the RFC, a client
 /// triggering this should be assumed to know `skS` — servers seeing it
 /// should rotate their key.
-pub const PoprfEvaluateError = error{ InverseError, InvalidSecretKey, ProofGenerationFailed };
+pub const PoprfEvaluateError = error{ InverseError, ProofGenerationFailed }; // see blindEvaluate re: the dropped InvalidSecretKey
 
 /// Batched RFC 9497 §3.3.3 `BlindEvaluate(skS, blindedElement, info)`:
 /// `evaluated[i] = (skS + m)^-1 * blinded[i]`, plus one DLEQ proof over
@@ -683,10 +727,10 @@ pub fn blindEvaluatePoprfBatch(
     if (std.mem.allEqual(u8, &t, 0)) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
     for (blinded, evaluated_out) |blinded_element, *out| {
-        const p = blinded_element.p.mul(t_inv) catch return error.InvalidSecretKey;
-        out.* = .{ .p = p };
+        // `t_inv`/`t` are derived from the SECRET key: constant-time.
+        out.* = .{ .p = ct25519.mulRistretto(blinded_element.p, t_inv) };
     }
-    const tweaked = Ristretto255.basePoint.mul(t) catch return error.InvalidSecretKey;
+    const tweaked = ct25519.mulRistrettoBase(t);
     return generateProof(.poprf, t, Element.generator, .{ .p = tweaked }, evaluated_out, blinded, proof_r) catch
         return error.ProofGenerationFailed;
 }
@@ -736,7 +780,7 @@ pub fn finalizePoprfUnverified(
     return finalizeHash(input, info, unblinded);
 }
 
-pub const PoprfDirectEvaluateError = error{ InvalidInput, InverseError, InvalidSecretKey };
+pub const PoprfDirectEvaluateError = error{ InvalidInput, InverseError }; // see blindEvaluate re: the dropped InvalidSecretKey
 
 /// RFC 9497 §3.3.3 `Evaluate(skS, input, info)` — the direct
 /// (non-oblivious) POPRF, computable by anyone holding `skS`, `input`,
@@ -747,7 +791,7 @@ pub fn evaluatePoprf(sk: [Ns]u8, input: []const u8, info: []const u8) PoprfDirec
     const t = scalar.add(sk, m);
     if (std.mem.allEqual(u8, &t, 0)) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
-    const evaluated = input_element.p.mul(t_inv) catch return error.InvalidSecretKey;
+    const evaluated = ct25519.mulRistretto(input_element.p, t_inv); // SECRET t_inv
     return finalizeHash(input, info, evaluated.toBytes());
 }
 
@@ -781,6 +825,51 @@ test "Element.fromBytes rejects the identity element and junk" {
     try std.testing.expectError(error.InvalidElement, Element.fromBytes([_]u8{0} ** 32));
     // Non-canonical / invalid encoding.
     try std.testing.expectError(error.InvalidElement, Element.fromBytes([_]u8{0xff} ** 32));
+}
+
+// ── constant-time regression: no API reports a secret scalar's value ─────
+//
+// std's `Ristretto255.mul` ends its constant-time ladder with
+// `try q.rejectIdentity()` — a branch on a scalar-derived value — and the
+// error union that produces forced a `catch` at every secret-scalar call
+// site here. The observable symptom of that leak is that a degenerate
+// SECRET scalar came back as a distinct ERROR instead of a group element.
+// These three tests pin the fixed behaviour: the degenerate case is an
+// ordinary value, and the two entry points carry no error to branch on.
+// Route any of these multiplies back through `.mul(...) catch return
+// error.X` and all three go red.
+
+test "blind REPORTS NOTHING about a zero blind (constant-time, ct25519)" {
+    // Old shape: `input_element.p.mul(blind_scalar) catch return
+    // error.InvalidBlind` — an error whose presence is decided by the
+    // client's SECRET blind. Now the product is simply the identity.
+    const zero_blind = [_]u8{0} ** Ns;
+    const blinded = try blind(.oprf, "ct regression", zero_blind);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Ne, &blinded.toBytes());
+    // And the same input under std's own multiply really does error —
+    // pinning that this is a behaviour change, not a tautology.
+    const p = try hashToGroup(.oprf, "ct regression");
+    try std.testing.expectError(error.IdentityElement, p.p.mul(zero_blind));
+}
+
+test "blindEvaluate REPORTS NOTHING about a degenerate skS (constant-time)" {
+    // Old shape: `blinded_element.p.mul(sk) catch return
+    // error.InvalidSecretKey`. `deriveKeyPair` guarantees skS != 0, so this
+    // path was unreachable in the protocol and existed only to leak.
+    const blinded = try blind(.oprf, "ct regression", scalarFromWideBytes([_]u8{0x5a} ** 64));
+    const evaluated = blindEvaluate([_]u8{0} ** Ns, blinded);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Ne, &evaluated.toBytes());
+}
+
+test "blind/blindEvaluate carry no error a caller could branch on a secret with" {
+    // `blindEvaluate` has no error union at all; `blind`'s only member is
+    // `InvalidInput`, which comes from `hashToGroup` (PUBLIC input framing),
+    // never from the multiply. `InvalidBlind` must NOT be back.
+    try std.testing.expect(@typeInfo(@TypeOf(blindEvaluate)).@"fn".return_type.? == Element);
+    const blind_err = @typeInfo(@typeInfo(@TypeOf(blind)).@"fn".return_type.?).error_union.error_set;
+    const members = @typeInfo(blind_err).error_set.?;
+    try std.testing.expectEqual(@as(usize, 1), members.len);
+    try std.testing.expectEqualStrings("InvalidInput", members[0].name);
 }
 
 test "deserializeScalar enforces canonicity" {

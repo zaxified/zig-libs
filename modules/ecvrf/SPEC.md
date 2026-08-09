@@ -85,16 +85,45 @@ real — see "Implementation notes" below.
 
 ## Threat model / limits
 
-- **Not constant-time on the secret-input paths.** `prove` uses
-  `Edwards25519.basePoint.mul`/`Edwards25519.mul` (std's own
-  constant-time-in-the-scalar scalar multiplication) for every operation
-  touching the secret scalar `x` or the secret nonce `k` — so the curve
-  arithmetic ITSELF is constant-time by relying on std's primitive, the
-  same posture `xeddsa.zig`/`bip340.sign` in this repository take. This
-  module does **not** additionally harden the SHA-512 framing, byte
-  copies, or control flow around those calls against timing side
-  channels beyond what std's own primitives provide — no KAT can detect
-  a timing leak; this is a documented posture, not a verified one.
+- **Secret-scalar multiplication is constant-time — but NOT via std's
+  `Edwards25519.mul`.** This bullet previously claimed `prove` got that
+  property by "relying on std's primitive". That claim was **false**, and
+  measurement is what caught it. `Edwards25519.mul` is constant-time in
+  its ladder (4-bit fixed window, `cMov` table select, 64 unconditional
+  iterations) but ends in `pcMul16`'s `try q.rejectIdentity()` — i.e.
+  `if (q.x.isZero())`, a **branch on a value derived from the scalar**,
+  which then propagates an error union that forces the caller to branch
+  a second time. `prove`/`publicKey` did exactly that at five call sites
+  (`catch @panic(...)` / `catch unreachable`), leaking whether the secret
+  scalar `x` or the secret nonce `k` was zero mod the group order.
+  The sibling module `ct25519` (`ct25519.mul`/`mulBase`) replaces it: std's
+  own ladder with the trailing rejection removed, returning the neutral
+  element as an ordinary value, no error union, so no call site can branch
+  on the scalar at all. `ecvrf.zig` used to carry its own private copy of
+  that ladder; it now depends on `ct25519` instead, so the same fix (and
+  its correctness/timing test coverage) is shared with `voprf`, `opaque`,
+  `signal` and `bulletproofs` rather than duplicated per module. No
+  validation was dropped — see `ecvrf.zig`'s module doc comment for why the
+  rejection was provably dead for `x` (clamping puts it strictly between
+  `4L` and `5L`) and harmless for `k` (`validateKey` rejects a degenerate
+  public key on the VERIFIER side, which is where that check belongs).
+
+  **Verified, not asserted** (`ctgrind`-style: the seed marked
+  `MAKE_MEM_UNDEFINED`, `valgrind --tool=memcheck` over `publicKey` +
+  `prove`, ReleaseFast): **11 errors / 10 contexts before, 4 / 3 after.**
+  Five of the ten "before" contexts are `pcMul16`'s rejection reached
+  from `publicKey`, `prove`'s `[x]B`, `[x]H`, `[k]B` and `[k]H`. The
+  three remaining "after" contexts are all inside `encodeToCurve`
+  (`Edwards25519.fromBytes`'s validity branch and its `rejectIdentity`
+  retry) and are branches on `Y`/`H`, not on a secret: re-running with
+  `Y` explicitly declassified — which is sound, `Y` is the published
+  public key and `H = encode_to_curve(PK_string, alpha)` is recomputed
+  by every verifier from public inputs — reports **0 errors / 0
+  contexts**. Their timing dependence on `alpha` is the separate,
+  RFC-acknowledged try-and-increment property documented below.
+
+  What is still NOT hardened: the SHA-512 framing and byte copies around
+  those calls, beyond what std's own primitives provide.
 - **`verify` is deliberately variable-time** — `mulDoubleBasePublic`,
   `Edwards25519.fromBytes`/`neg`, and the final byte comparison all
   operate on public inputs only (the public key, the input `alpha`, and

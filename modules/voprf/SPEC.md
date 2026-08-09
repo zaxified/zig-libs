@@ -79,12 +79,35 @@ order; `contextString = "OPRFV1-" ‖ I2OSP(mode,1) ‖ "-" ‖
   (§4.1 DeserializeElement); `deserializeScalar`/`Proof.fromBytes`
   enforce canonical scalars. Applications MUST deserialize received
   elements through these (per §3.3).
-- **Side channels**: `skS`, the client `blind`, and POPRF's `t` only
-  touch constant-time std paths (`Ristretto255.mul`, scalar
-  add/sub/mul/invert). The proof-challenge comparison uses
-  `std.crypto.timing_safe.eql`. The `skS == 0` retry in `deriveKeyPair`
-  and POPRF's `t == 0` check branch exactly where RFC 9497's own
-  pseudocode branches.
+- **Side channels**: `skS`, the client `blind` (and its inverse), POPRF's
+  `t`/`t_inv` and the DLEQ nonce `r` are multiplied by the sibling
+  **`ct25519`**, not by `Ristretto255.mul`.
+
+  This SPEC used to say they "only touch constant-time std paths
+  (`Ristretto255.mul`, …)", and that was **false**. std's `mul` is a
+  constant-time 4-bit-window ladder that then ends with
+  `try q.rejectIdentity()` — a branch on a scalar-derived value — and the
+  error union it returns forced a `catch` at all nine secret-scalar call
+  sites in `root.zig`, so the leak was reproduced once per site. Reading
+  "the ladder is constant-time" and stopping there is exactly how the
+  claim survived an audit that graded the module `A6 const-time: PASS` on
+  the same reasoning. `ct25519` is std's identical ladder with that tail
+  removed: the neutral element is a value, there is no error union, and
+  no call site can branch on the scalar. Verified with a ctgrind-style
+  valgrind harness (`MAKE_MEM_UNDEFINED` over `skS`/`blind`/`r`), not by
+  re-reading the source.
+
+  PUBLIC scalars stay on std's `mul` on purpose: `verifyProof`'s `s`/`c`
+  are wire data, the composite `di` are hashes of wire elements, and
+  POPRF's `m` is a hash of the public `info` — nothing there is secret,
+  and the rejections are genuine fail-closed checks on peer input.
+
+  The proof-challenge comparison uses `std.crypto.timing_safe.eql`. The
+  `skS == 0` retry in `deriveKeyPair`, POPRF's `t == 0` check and
+  `unblind`'s zero-blind check branch exactly where RFC 9497's own
+  pseudocode branches; they are the only secret-dependent branches left,
+  and each guards an operation that is undefined at zero rather than
+  reporting the result of a multiplication.
 - **Randomness**: this module has NO internal RNG. The `blind` scalar
   and the proof randomness `r` are caller-supplied (`scalarFromWideBytes`
   turns 64 CSPRNG bytes into a uniform scalar, §4.7.2). Reusing `r`

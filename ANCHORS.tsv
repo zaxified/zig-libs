@@ -71,6 +71,7 @@ cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic
 cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only
 csvsafe	C	n/a	OWASP CSV-injection escape heuristic, no wire byte-agreement question
 csvstream	A	SELF	RFC 4180 reader/writer, hand-authored fixtures, no captured third-party CSVs
+ct25519	B	EXTERNAL	RFC 8032 §7.1 TEST 1/2 public keys re-derived byte-exact; bit-exact vs std.crypto.ecc.Edwards25519.mul/Ristretto255.mul
 ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only
 dataset	C	n/a	internal tabular Value/Dataset abstraction, no wire format
 datefmt	C	n/a	internal calendar/date-epoch arithmetic (Hinnant's algorithm), no wire

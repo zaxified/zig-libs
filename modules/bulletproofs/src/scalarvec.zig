@@ -24,6 +24,7 @@
 //! module's convention — see its `root.zig` doc comment).
 
 const std = @import("std");
+const ct25519 = @import("ct25519");
 const Ristretto255 = std.crypto.ecc.Ristretto255;
 const scalar = Ristretto255.scalar;
 
@@ -92,7 +93,7 @@ pub fn powers(allocator: std.mem.Allocator, x: [32]u8, n: usize) std.mem.Allocat
     return out;
 }
 
-// ── constant-time scalar multiplication ─────────────────────────────────────
+// ── constant-time scalar multiplication ─────────────────────────
 //
 // `Ristretto255.mul` (std) is internally constant-time — a 4-bit fixed
 // window over a 16-entry precomputed table selected with `cMov`, 64 fixed
@@ -107,31 +108,12 @@ pub fn powers(allocator: std.mem.Allocator, x: [32]u8, n: usize) std.mem.Allocat
 // skipped the whole subsequent group addition, so a zero scalar cost one
 // fewer point add than a nonzero one.
 //
-// `mulCt` below is std's own constant-time ladder with the trailing
-// rejection removed: the neutral element is simply returned as a value.
-// It has no error union, so no call site can branch on the scalar, and
-// its control flow (precompute, then 64 window iterations, each an
-// unconditional 15-entry `cMov` select + add + 4 doublings) is identical
-// for every scalar including zero.
-
-const Curve = Ristretto255.Curve; // Edwards25519
-const Fe = Curve.Fe;
-
-/// Branch-free select of `pc[slot]` (`slot == 0` selects the identity),
-/// mirroring std's private `Edwards25519.pcSelect`: every entry is touched
-/// with a `cMov` whose mask is `1` exactly when `slot ^ i == 0`.
-fn pcSelect(pc: *const [16]Curve, slot: u4) Curve {
-    var t = Curve.identityElement;
-    comptime var i: u8 = 1;
-    inline while (i < 16) : (i += 1) {
-        const c: u64 = ((@as(usize, @as(u8, slot) ^ i) -% 1) >> 8) & 1;
-        Fe.cMov(&t.x, pc[i].x, c);
-        Fe.cMov(&t.y, pc[i].y, c);
-        Fe.cMov(&t.z, pc[i].z, c);
-        Fe.cMov(&t.t, pc[i].t, c);
-    }
-    return t;
-}
+// That leak is not ours and not Bulletproofs-specific: `voprf`, `opaque`
+// and `signal` each had their own `catch` on the same std tail, on OPRF
+// blinds, 3DH private keys and XEdDSA nonces. The fixed ladder therefore
+// lives in the sibling `ct25519` module rather than here — one home, one
+// set of differential tests against std — and this name stays as the
+// call-site spelling `ipa.zig`/`rangeproof.zig` already use.
 
 /// `s * p` over Ristretto255, **constant-time in `s` and total** — the
 /// neutral element is returned as an ordinary value rather than raised as
@@ -143,27 +125,9 @@ fn pcSelect(pc: *const [16]Curve, slot: u4) Curve {
 /// Same algorithm and same cost as `std`'s `Ristretto255.mul`: a 4-bit
 /// fixed window over a 16-entry table, 64 unconditional iterations. Safe
 /// for SECRET scalars; use `multiScalarMulVartime` when the scalars are
-/// public and speed matters.
-pub fn mulCt(p: Ristretto255, s: [32]u8) Ristretto255 {
-    // pc[i] = i*p for i in 0..15 (pc[0] = neutral).
-    var pc: [16]Curve = undefined;
-    pc[0] = Curve.identityElement;
-    pc[1] = p.p;
-    comptime var i: usize = 2;
-    inline while (i < 16) : (i += 1) {
-        pc[i] = if (i % 2 == 0) pc[i / 2].dbl() else pc[i - 1].add(p.p);
-    }
-
-    var q = Curve.identityElement;
-    var pos: usize = 252;
-    while (true) : (pos -= 4) {
-        const slot: u4 = @truncate(s[pos >> 3] >> @as(u3, @truncate(pos)));
-        q = q.add(pcSelect(&pc, slot));
-        if (pos == 0) break;
-        q = q.dbl().dbl().dbl().dbl();
-    }
-    return .{ .p = q };
-}
+/// public and speed matters. Implementation + differential tests against
+/// std live in `ct25519`.
+pub const mulCt = ct25519.mulRistretto;
 
 pub const MultiScalarMulError = error{LengthMismatch};
 

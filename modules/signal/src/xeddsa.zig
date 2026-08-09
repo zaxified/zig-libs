@@ -46,11 +46,25 @@
 //! DH and signing contexts) this scheme deliberately accepts.
 //!
 //! Constant-time posture: `sign` handles the secret scalar exclusively
-//! with `Edwards25519.scalar`'s constant-time ops and a constant-time
-//! `basePoint.mul`; the negate-if-sign-1 selection is a branchless
-//! masked select (and the sign bit itself is not meaningfully secret —
-//! it is a deterministic function of the public key pair `±A`, and
-//! deployed libsignal literally transmits it in every signature).
+//! with `Edwards25519.scalar`'s constant-time ops and `ct25519.mulBase`;
+//! the negate-if-sign-1 selection is a branchless masked select (and the
+//! sign bit itself is not meaningfully secret — it is a deterministic
+//! function of the public key pair `±A`, and deployed libsignal
+//! literally transmits it in every signature).
+//!
+//! It used to say "a constant-time `basePoint.mul`", meaning std's, and
+//! that was only three-quarters true. std's `Edwards25519.mul` IS a
+//! constant-time 4-bit-window ladder — and then `pcMul16` ends with
+//! `try q.rejectIdentity()`, a branch on a scalar-derived value. Both of
+//! this module's base multiplications feed it a SECRET (the sign-0 key
+//! scalar `a`; the per-signature nonce `r`, from which `s = r + h*a`
+//! hands out `a`), and both had to `catch @panic(...)` — a control-flow
+//! decision taken from a value only the signer's secrets determine.
+//! `ct25519.mulBase` is the same ladder with that tail removed: no error
+//! union, neutral element as a value, identical cost. Neither panic was
+//! ever reachable in the first place (see `calculateKeyPair`), so only
+//! the leak was real, and it is gone.
+//!
 //! `verify` operates on public inputs only (variable-time
 //! `mulDoubleBasePublic` is fine, mirroring `std.crypto.sign.Ed25519`'s
 //! own verifier) and fails CLOSED — every malformed input returns
@@ -63,6 +77,7 @@
 //! facts only). See `../NOTICE`.
 
 const std = @import("std");
+const ct25519 = @import("ct25519");
 const Edwards25519 = std.crypto.ecc.Edwards25519;
 const Fe = Edwards25519.Fe;
 const scalar = Edwards25519.scalar;
@@ -160,12 +175,14 @@ fn calculateKeyPair(montgomery_priv: [32]u8) struct {
     scalar.clamp(&t);
     var k = scalar.reduce(t);
     defer std.crypto.secureZero(u8, &k);
-    // Identity is only reachable for the single clamped scalar equal to
-    // 8L (probability 2^-251 over honest keys; such a key is equally
-    // unusable for X25519 itself) — not attacker-triggerable through
-    // `verify`, so an explicit panic beats silently signing garbage.
-    const e = Edwards25519.basePoint.mul(k) catch
-        @panic("xeddsa: degenerate private key (clamped scalar is 0 mod L)");
+    // SECRET scalar, so `ct25519.mulBase` (std's own window ladder minus
+    // the trailing `rejectIdentity`) rather than `Edwards25519.mul`. The
+    // `catch @panic(...)` this replaces branched on `k` — and it could
+    // never fire: a clamped seed lies in `[2^254, 2^255)` and is divisible
+    // by 8, while the only multiples of `L` that reduce to 0 are `m*L`, and
+    // `8L > 2^255` while `m <= 7` is never divisible by 8. So the panic was
+    // unreachable AND leaked; only the leak was real.
+    const e = ct25519.mulBase(k);
     var public = e.toBytes();
     const sign_bit: u8 = public[31] >> 7;
     public[31] &= 0x7F;
@@ -215,11 +232,10 @@ pub fn sign(montgomery_priv: [32]u8, msg: []const u8, z: RandomData) Signature {
     var r = scalar.reduce64(r64);
     defer std.crypto.secureZero(u8, &r);
 
-    // r == 0 mod L would need SHA-512 output reducing to exactly 0
-    // (probability 2^-252 per signature) — same posture as
-    // calculateKeyPair's degenerate-key case.
-    const r_point = Edwards25519.basePoint.mul(r) catch
-        @panic("xeddsa: nonce reduced to 0 mod L");
+    // `r` is the per-signature SECRET nonce — `s = r + h*a` hands `a` to
+    // anyone who learns it — so the same constant-time ladder, and no
+    // `catch @panic` deciding a control-flow question from `r`'s value.
+    const r_point = ct25519.mulBase(r);
     const r_bytes = r_point.toBytes();
 
     st = Sha512.init(.{});
@@ -303,8 +319,8 @@ fn naturalKeyPair(montgomery_priv: [32]u8) struct {
     // Same degenerate-key posture as calculateKeyPair (see its comment):
     // unreachable for an honest key, not attacker-triggerable through
     // verify.
-    const e = Edwards25519.basePoint.mul(k) catch
-        @panic("xeddsa: degenerate private key (clamped scalar is 0 mod L)");
+    // SECRET scalar — see `calculateKeyPair`.
+    const e = ct25519.mulBase(k);
     return .{ .scalar = k, .public = e.toBytes() };
 }
 
@@ -343,8 +359,8 @@ pub const libsignal = struct {
         var r = scalar.reduce64(r64);
         defer std.crypto.secureZero(u8, &r);
 
-        const r_point = Edwards25519.basePoint.mul(r) catch
-            @panic("xeddsa: nonce reduced to 0 mod L");
+        // SECRET nonce — see the top-level `sign`.
+        const r_point = ct25519.mulBase(r);
         const r_bytes = r_point.toBytes();
 
         st = Sha512.init(.{});
@@ -409,6 +425,42 @@ pub const libsignal = struct {
 // round-trip, tamper-rejection, libsignal known-answer vector (the
 // EXTERNAL anchor, exercised against both variants), and X3DH end-to-end
 // tests live in `kat_test.zig` (imported by `root.zig`'s aggregator).
+
+test "a clamped X25519 seed can NEVER reduce to 0 mod L (the panic that was not)" {
+    // Both secret base multiplications used to end in
+    // `Edwards25519.basePoint.mul(k) catch @panic(...)`, documented as a
+    // "probability 2^-251" degenerate key. It is probability ZERO, and this
+    // pins why — which matters, because the comment was the justification
+    // for keeping a branch on a secret in the signing path.
+    //
+    // `scalar.clamp` clears the low 3 bits and forces bit 254 while clearing
+    // bit 255, so a clamped seed `t` satisfies `2^254 <= t < 2^255` and
+    // `t % 8 == 0`. `scalar.reduce(t) == 0` iff `t == m*L` for some integer
+    // `m`; `L` is odd, so `8 | m*L` requires `8 | m`, and the smallest such
+    // positive `m` is 8 — but `8L > 2^255`, above the clamped range, while
+    // `m = 0` gives `t = 0`, below it. No clamped seed is in the set.
+    const L: u256 = scalar.field_order;
+    try std.testing.expect(L % 2 == 1); // odd, so 8 | m*L  =>  8 | m
+    try std.testing.expect(8 * L > (1 << 255)); // the m = 8 case is out of range
+    try std.testing.expect(L < (1 << 254)); // ...and m in 1..7 is below the range floor
+    try std.testing.expect(7 * L < (1 << 255));
+
+    // Empirically, over the structural extremes of the clamped range.
+    const seeds = [_][32]u8{
+        [_]u8{0x00} ** 32,
+        [_]u8{0xff} ** 32,
+        [_]u8{0x08} ++ [_]u8{0x00} ** 31,
+        [_]u8{0x00} ** 31 ++ [_]u8{0xff},
+    };
+    for (seeds) |seed| {
+        var t = seed;
+        scalar.clamp(&t);
+        const v = std.mem.readInt(u256, &t, .little);
+        try std.testing.expect(v >= (1 << 254) and v < (1 << 255));
+        try std.testing.expect(v % 8 == 0);
+        try std.testing.expect(!std.mem.allEqual(u8, &scalar.reduce(t), 0));
+    }
+}
 
 test "Signature/RandomData sizes match the XEdDSA wire shape" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(Signature));

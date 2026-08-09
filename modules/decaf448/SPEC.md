@@ -152,4 +152,19 @@ are constructed by machinery independent of the stub under test.
   `oneWayMap` is real.
 - Batch verification / multi-scalar-multiplication speedups — `Element.
   scalarMul` is a plain per-call delegation to `ed448.ed448.Point.mul`'s
-  constant-time double-and-add; no windowing/precomputation of its own.
+  constant-time 4-bit fixed window (it was a double-and-add until ed448
+  F1; no windowing/precomputation of decaf448's own on top).
+
+## Constant-time note (measured)
+
+`Element.scalarMul` is safe for a SECRET scalar, and that is measured
+rather than argued. A `ctgrind`-style run (the scalar marked
+`MAKE_MEM_UNDEFINED`, `valgrind --tool=memcheck`, ReleaseFast) reports
+**0 errors / 0 contexts** through `scalarMul`; re-introducing a
+variable-time `if (nibble != 0)` table lookup inside `ed448.Point.mul`
+makes the same run report 860, so the harness genuinely reaches the
+ladder. This module is *not* exposed to the defect that forced
+`ecvrf`'s `mulCt`: `std.crypto.ecc.Edwards25519.mul` ends in a
+`rejectIdentity` branch on a scalar-derived value, but `ed448`'s
+`Point.mul` — which is what decaf448 rides — has no such rejection and
+no error union at all.

@@ -125,10 +125,19 @@ known-answer vector pinned against BOTH XEdDSA variants; see
   clamped Montgomery ladder) — this module performs no additional
   secret-dependent branching of its own in the DH/HKDF path.
   `xeddsa.sign` handles the secret scalar with `Edwards25519.scalar`'s
-  constant-time ops, a constant-time `basePoint.mul`, and a BRANCHLESS
-  masked select for the negate-if-sign-1 step (the sign bit itself is
-  public-equivalent — it is a deterministic function of the public key
-  pair `±A`, and deployed libsignal transmits it in every signature);
+  constant-time ops, **`ct25519.mulBase`** and a BRANCHLESS
+  masked select for the negate-if-sign-1 step. This line used to read
+  "a constant-time `basePoint.mul`", meaning std's; std's ladder is
+  constant-time and then ends with `try q.rejectIdentity()`, a branch on
+  a scalar-derived value, which forced a `catch @panic(...)` on both of
+  this module's secret base multiplications (the key scalar `a` and the
+  nonce `r`). `ct25519.mulBase` is that ladder without the tail. Neither
+  panic could ever fire — a clamped seed lies in `[2^254, 2^255)` and is
+  divisible by 8, and the smallest multiple of `L` that is divisible by 8
+  is `8L > 2^255` (pinned by a test) — so the reachable defect was the
+  leak, not the abort. (The sign bit itself is public-equivalent — it is
+  a deterministic function of the public key pair `±A`, and deployed
+  libsignal transmits it in every signature.) Signing
   secrets are `std.crypto.secureZero`d on exit. `xeddsa.verify` operates
   on public inputs only (variable-time `mulDoubleBasePublic`, like std's
   own Ed25519 verifier) and fails closed on every malformed input.

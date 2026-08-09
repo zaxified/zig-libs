@@ -69,11 +69,9 @@
 //!   `update`/`final` plus one-shot `create`.
 //! - `std.crypto.hash.sha2.Sha512` — §2.3 `Hash` (the AKE transcript).
 //! - `std.crypto.ecc.Ristretto255` (via `voprf.Element`) — §6.4.1.1
-//!   3DH: `DiffieHellman(k, B)` is `Ristretto255.mul` (constant-time)
-//!   after `voprf.Element.fromBytes` (canonical decode + identity
-//!   rejection = the §10.7 input validation, and `mul`'s own
-//!   weak/identity-output rejection covers "shared secret is not the
-//!   identity").
+//!   3DH input validation: `voprf.Element.fromBytes` is the §10.7
+//!   canonical-decode + identity-rejection check on the PEER's element.
+//!   The multiply itself is NOT std's: see the Security notes.
 //! - `std.crypto.timing_safe.eql` — every MAC comparison (§1.2
 //!   `ct_equal`): envelope `auth_tag`, `server_mac` on the client,
 //!   `client_mac` on the server. All fail CLOSED to typed errors.
@@ -82,8 +80,15 @@
 //!
 //! - Secrets (`server_private_key`, the derived client private key,
 //!   ephemeral secrets, OPRF blinds, `randomized_password` and every
-//!   key expanded from it) only touch constant-time std paths:
-//!   `Ristretto255.mul`, HMAC, HKDF. Verification MACs compare via
+//!   key expanded from it) only touch constant-time paths. HMAC and
+//!   HKDF are std's. The 3DH scalar multiplication is **not** — this
+//!   doc used to say `Ristretto255.mul` and that was wrong: std's `mul`
+//!   is a constant-time ladder that then ends with
+//!   `try q.rejectIdentity()`, a branch on a scalar-derived value, and
+//!   `diffieHellman` had to `catch` it, branching on the private key a
+//!   second time. It now uses the sibling `ct25519` (same ladder,
+//!   trailing rejection removed, no error union). Verification MACs
+//!   compare via
 //!   `timing_safe.eql` and fail closed (`error.EnvelopeRecovery`,
 //!   `error.ServerAuthentication`, `error.ClientAuthentication`) —
 //!   never a panic. Working copies of `randomized_password`-derived
@@ -109,6 +114,7 @@
 
 const std = @import("std");
 const voprf = @import("voprf");
+const ct25519 = @import("ct25519");
 
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
@@ -120,7 +126,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no allocation, no RNG
     .concurrency = .reentrant, // no globals; all state is caller-held values
     .model_after = "RFC 9807 (\"The OPAQUE Augmented Password-Authenticated Key Exchange (aPAKE) Protocol\"), ristretto255-SHA-512 configuration, 3DH AKE, internal-keying Envelope (§4.1), KSF = Identity; OPRF layer = the sibling voprf module (RFC 9497 modeOPRF); std supplies HKDF-SHA-512 / HMAC-SHA-512 / SHA-512 / Ristretto255",
-    .deps = .{"voprf"},
+    .deps = .{ "voprf", "ct25519" },
 };
 
 // ── configuration constants (RFC 9807 §2 / §7, ristretto255-SHA-512) ─────
@@ -442,13 +448,26 @@ fn deriveOprfKey(oprf_seed: [Nh]u8, credential_identifier: []const u8) error{Der
 
 /// §6.4.1.1 `DiffieHellman(k, B)`: RFC 9496 Decode (with §10.7 input
 /// validation: canonical + non-identity, via `voprf.Element.fromBytes`)
-/// then constant-time `Ristretto255.mul`; the identity/weak-output
-/// rejection inside `mul` covers "the shared secret MUST NOT be the
-/// identity". Output is the 32-byte encoded element.
+/// then a scalar multiplication that is constant-time in `k` AND does not
+/// branch on its own result — `ct25519.mulRistretto`, not
+/// `Ristretto255.mul`. Output is the 32-byte encoded element.
+///
+/// **How §6.4.1.1's "the shared secret MUST NOT be the identity element"
+/// is satisfied.** It used to be satisfied by `catch`ing the rejection
+/// std's `mul` performs on its own output — i.e. by branching on a value
+/// derived from the SECRET `private_key`. It is now satisfied
+/// structurally, which is stronger: ristretto255 is a group of PRIME
+/// order `L` (that is the entire point of the ristretto abstraction — no
+/// cofactor, no small subgroup), and `fromBytes` has already rejected the
+/// identity, so `B` generates the whole group and `k*B` is the identity
+/// **iff `k == 0 (mod L)`**. A peer therefore cannot induce it at all,
+/// with any element it can encode. `k` is either a `voprf.deriveKeyPair`
+/// output (the RFC 9497 §3.2.1 loop rejects zero) or a caller-supplied
+/// long-term server key held to the same rule. There is nothing left for
+/// a runtime check to catch that a branch on `k` would not simply leak.
 fn diffieHellman(private_key: [Nsk]u8, public_key: [Npk]u8) error{InvalidPublicKey}![Npk]u8 {
     const point = voprf.Element.fromBytes(public_key) catch return error.InvalidPublicKey;
-    const shared = point.p.mul(private_key) catch return error.InvalidPublicKey;
-    return shared.toBytes();
+    return ct25519.mulRistretto(point.p, private_key).toBytes();
 }
 
 /// §5.2.3/§6.3.2.3's `randomized_password` = `Extract("",
@@ -609,7 +628,7 @@ pub fn createRegistrationResponse(
 ) CreateRegistrationResponseError!RegistrationResponse {
     const oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
     const blinded = voprf.Element.fromBytes(request.blinded_message) catch return error.InvalidMessage;
-    const evaluated = try voprf.blindEvaluate(oprf_key, blinded);
+    const evaluated = voprf.blindEvaluate(oprf_key, blinded);
     return .{
         .evaluated_message = evaluated.toBytes(),
         .server_public_key = server_public_key,
@@ -739,7 +758,7 @@ pub fn generateKE2(
     const oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
     const blinded = voprf.Element.fromBytes(ke1.credential_request.blinded_message) catch
         return error.InvalidMessage;
-    const evaluated = try voprf.blindEvaluate(oprf_key, blinded);
+    const evaluated = voprf.blindEvaluate(oprf_key, blinded);
 
     var masked = credentialResponsePad(&record.masking_key, masking_nonce);
     const plaintext = server_public_key ++ record.envelope.toBytes();
@@ -981,6 +1000,35 @@ fn runKeySchedule(
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+}
+
+// ── constant-time regression: the 3DH multiply does not report `k` ───────
+//
+// `diffieHellman` used to be `point.p.mul(private_key) catch return
+// error.InvalidPublicKey`. std's `Ristretto255.mul` ends its constant-time
+// ladder with `try q.rejectIdentity()`, so that `catch` fired on a
+// condition decided entirely by the SECRET private key — and it blamed the
+// PEER's public key for it, which was wrong twice over. The observable
+// symptom was that a degenerate local key produced a distinct error instead
+// of a group element. Restore the `.mul(...) catch ...` shape and this
+// test goes red.
+test "diffieHellman REPORTS NOTHING about a degenerate private key (ct25519)" {
+    // A perfectly valid, non-identity peer element.
+    const peer = voprf.Element.generator.toBytes();
+    const shared = try diffieHellman([_]u8{0} ** Nsk, peer);
+    // k = 0 => the identity, which ristretto255 encodes as 32 zero bytes.
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Npk, &shared);
+
+    // std really does refuse this — pinning that the line above is a
+    // behaviour change and not a tautology.
+    const point = try voprf.Element.fromBytes(peer);
+    try std.testing.expectError(error.IdentityElement, point.p.mul([_]u8{0} ** Nsk));
+
+    // And a nonzero key still agrees with std byte-for-byte, so the swap
+    // changed the leak and nothing else.
+    const k = voprf.scalarFromWideBytes([_]u8{0x3c} ** 64);
+    const want = try point.p.mul(k);
+    try std.testing.expectEqualSlices(u8, &want.toBytes(), &(try diffieHellman(k, peer)));
 }
 
 test "wire sizes match RFC 9807 §6.1 (ristretto255-SHA-512)" {

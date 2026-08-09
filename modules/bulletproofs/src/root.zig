@@ -71,8 +71,9 @@
 //!   scalar multiplication on a SECRET scalar (the bit-vectors
 //!   `a_L`/`a_R`/`s_L`/`s_R`, the blindings `alpha`/`rho`/`tau1`/`tau2`/
 //!   `gamma`, the committed value `v`, the IPA fold challenges) goes
-//!   through `scalarvec.mulCt` — std's constant-time 4-bit-window ladder
-//!   with the trailing `rejectIdentity` removed, so a zero scalar takes
+//!   through `scalarvec.mulCt` (the sibling `ct25519` module) — std's
+//!   constant-time 4-bit-window ladder with the trailing `rejectIdentity`
+//!   removed, so a zero scalar takes
 //!   exactly the same path and the same time as any other. Earlier
 //!   revisions used `Ristretto255.mul` with `catch continue`/`catch
 //!   identity`, which skipped work for a zero scalar and so leaked whether
@@ -104,7 +105,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values
     .model_after = "Bünz/Bootle/Boneh/Poelstra/Wuille/Maxwell, \"Bulletproofs: Short Proofs for Confidential Transactions and More\", IEEE S&P 2018 (eprint 2017/1066), §3 (Inner-Product Argument) + §4.1/§4.2 (range proof); dalek-cryptography/bulletproofs (Rust) consulted for construction SHAPE only, no source ported (this module's Fiat-Shamir transcript is its own SHA-512 chain, not Merlin — see transcript.zig); std.crypto.ecc.Ristretto255 supplies the group",
-    .deps = .{},
+    .deps = .{"ct25519"}, // the constant-time secret-scalar ladder behind scalarvec.mulCt
 };
 
 pub const gate = @import("gate.zig");
@@ -167,8 +168,13 @@ test "meta.model_after names Bulletproofs + Ristretto255" {
     try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Ristretto255") != null);
 }
 
-test "meta.deps is empty (std-only)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is exactly ct25519 (the constant-time secret-scalar ladder)" {
+    // The module is otherwise std-only. `ct25519` is the ONE sibling, and it
+    // exists because std's `Ristretto255.mul` ends in a branch on a
+    // scalar-derived value (finding F2); `voprf`/`opaque`/`signal` had the
+    // same leak, so the fixed ladder has one home rather than four copies.
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("ct25519", meta.deps[0]);
 }
 
 test "gate is flipped: both ZK cores are implemented" {

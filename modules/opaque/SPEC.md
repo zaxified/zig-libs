@@ -139,9 +139,18 @@ Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
 - **No allocation, no I/O**; all state is in caller-held value types
   (`ClientLoginState` borrows only the password slice).
 - Public-key/OPRF-element inputs are validated on deserialization
-  (canonical ristretto255 + identity rejection via `voprf.Element`);
-  DH outputs reject identity/weak results inside `Ristretto255.mul`
-  (§10.7).
+  (canonical ristretto255 + identity rejection via `voprf.Element`,
+  §10.7). §6.4.1.1's "the DH shared secret MUST NOT be the identity"
+  is **no longer** discharged by the rejection inside
+  `Ristretto255.mul`, as this line used to claim: that rejection is a
+  branch on a value derived from the SECRET private key, and `catch`ing
+  it made `diffieHellman` branch on it a second time. The multiply now
+  runs on the sibling `ct25519` (std's ladder without the trailing
+  `rejectIdentity`) and the requirement is met structurally: ristretto255
+  has PRIME order and the peer element is already validated non-identity,
+  so `k*B` is the identity iff `k == 0 (mod L)` — a broken LOCAL key,
+  unreachable for any element a peer can encode, and excluded by
+  `voprf.deriveKeyPair`'s own §3.2.1 zero-rejection loop.
 
 ## Out of scope (deliberate)
 

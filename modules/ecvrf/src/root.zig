@@ -60,7 +60,7 @@ pub const meta = .{
     .role = .util, // pure computation over caller-supplied keys/bytes — no owned socket/transport
     .concurrency = .reentrant, // no globals; every function here is a plain caller-owned value
     .model_after = "RFC 9381 §5 (Elliptic Curve VRF) + §5.5's ECVRF-EDWARDS25519-SHA512-TAI ciphersuite fixing, referencing RFC 8032 §5.1.2/§5.1.5 for point/scalar encoding and secret-key derivation; std.crypto.ecc.Edwards25519 (+ its scalar submodule) and std.crypto.hash.sha2.Sha512 supply every primitive",
-    .deps = .{}, // std only
+    .deps = .{"ct25519"}, // constant-time secret-scalar multiply (see ecvrf.zig's module doc comment)
 };
 
 pub const ecvrf = @import("ecvrf.zig");
@@ -102,8 +102,9 @@ test {
     _ = @import("kat_test.zig");
 }
 
-test "meta.deps is empty (std only)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is exactly {ct25519} (the constant-time secret-scalar ladder)" {
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("ct25519", meta.deps[0]);
 }
 
 test "suite_string is 0x03 (ECVRF-EDWARDS25519-SHA512-TAI), not the sibling ELL2 ciphersuite's 0x04" {

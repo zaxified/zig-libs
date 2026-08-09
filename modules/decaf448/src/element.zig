@@ -244,7 +244,17 @@ pub const Element = struct {
     /// element"). REAL: converts decaf448's 56-byte `scalar.
     /// CompressedScalar` to `ed448.scalar`'s 57-byte width (`scalar.
     /// toEd448` — pure zero-pad, see `scalar.zig`) and delegates to
-    /// `Point.mul`'s already-real, constant-time double-and-add.
+    /// `Point.mul`, which is a constant-time 4-bit fixed window (a masked
+    /// 16-entry table scan per nibble; it stopped being a double-and-add
+    /// when ed448 F1 landed). Unlike `std.crypto.ecc.Edwards25519.mul`,
+    /// which ends in a `rejectIdentity` branch on a scalar-derived value
+    /// and so cannot be handed a secret scalar without leaking whether it
+    /// was zero, `Point.mul` returns a `Point` — no rejection, no error
+    /// union, nothing for a caller to branch on. Confirmed by measurement,
+    /// not by reading: a ctgrind-style run with the scalar marked
+    /// `MAKE_MEM_UNDEFINED` reports 0 memcheck errors through this
+    /// function, and re-introducing a `if (nibble != 0)` table lookup in
+    /// `Point.mul` makes the same run report 860.
     pub fn scalarMul(a: Element, s: scalar.CompressedScalar) Element {
         return .{ .p = Point.mul(a.p, scalar.toEd448(s)) };
     }

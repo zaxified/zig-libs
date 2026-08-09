@@ -53,7 +53,7 @@ pub const meta = .{
     .model_after = "Signal X3DH (signal.org/docs/specifications/x3dh) + XEdDSA (signal.org/docs/specifications/xeddsa) + Double Ratchet (signal.org/docs/specifications/doubleratchet); std.crypto.dh.X25519 supplies the DH (agreement + ratchet), std.crypto.ecc.Edwards25519/std.crypto.hash.sha2.Sha512 supply XEdDSA's building blocks, std.crypto.kdf.hkdf.HkdfSha256 supplies the KDFs (X3DH + KDF_RK), std.crypto.auth.hmac.sha2.HmacSha256 supplies KDF_CK, the chachapoly sibling (byte-exact to std.crypto.aead.chacha_poly.ChaCha20Poly1305) supplies the ratchet AEAD",
     // chachapoly: the ratchet AEAD (byte-exact to std; one audited
     // ChaCha20-Poly1305 across the repo). Everything else is std.
-    .deps = .{"chachapoly"},
+    .deps = .{ "chachapoly", "ct25519" },
 };
 
 pub const xeddsa = @import("xeddsa.zig");
@@ -92,9 +92,14 @@ test {
     _ = @import("kat_test.zig");
 }
 
-test "meta.deps is exactly {chachapoly} (the ratchet AEAD; everything else std)" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {chachapoly, ct25519} (the ratchet AEAD + the CT ladder)" {
+    // `ct25519` is std's own Edwards25519 window ladder with the trailing
+    // `rejectIdentity` removed — XEdDSA multiplies the base point by two
+    // SECRET scalars (the sign-0 key scalar and the per-signature nonce),
+    // and std's `mul` ends by branching on the result of exactly those.
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[0]);
+    try std.testing.expectEqualStrings("ct25519", meta.deps[1]);
 }
 
 test "meta.role is .util (no owned transport/socket, unlike a .client/.server module)" {

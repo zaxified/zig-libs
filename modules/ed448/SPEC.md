@@ -95,8 +95,9 @@ for how each formerly-stubbed piece was built.
   current caller's exponent is public), `isZero`/`eql` (accumulator
   compares, no early exit), `ctSelect`/`ctSwap` (byte-mask merges);
   `x448.zig`'s ladder (fixed 448 iterations, `ctSwap` swaps);
-  `ed448.zig`'s `Point.mul` (fixed 448 iterations, unconditional
-  point-add mask-selected in or out) — used by keygen and signing;
+  `ed448.zig`'s `Point.mul` / `mulBasePoint` (fixed 112 nibble windows,
+  each a masked 16-entry table scan plus an unconditional point-add) —
+  used by keygen and signing, and by `decaf448`;
   `scalar.zig`'s `reduceWide`/`add`/`mul`/`mulAdd` (fixed-iteration
   binary reduction, branch-free conditional subtracts). Deliberately
   VARIABLE-time, public inputs only: `verify`/`verifyPh` (`Point.
@@ -106,8 +107,26 @@ for how each formerly-stubbed piece was built.
   secret path — the ladder's `z_2.invert() catch Fe.zero` — branches
   only on whether the PUBLIC input point has small order, never on
   scalar bits (see `ladder`'s comment). KATs cannot detect timing
-  side-channels; this posture was maintained by construction, per the
-  scaffold's stated design intent.
+  side-channels — so this posture is now MEASURED, not merely
+  constructed: a `ctgrind`-style run (the seed marked
+  `MAKE_MEM_UNDEFINED`, `valgrind --tool=memcheck`, ReleaseFast) over
+  `KeyPair.create` + `sign` + `x448.scalarmult` reports **3 errors / 3
+  contexts**, and all three are the SAME line — `Fe.invert`'s
+  `if (a.isZero())` guard, reached from `Point.toBytes` (twice) and from
+  the X448 ladder's final `z_2.invert()`. Neither is a leak, and neither
+  may be removed: for `Point.toBytes` the operand is a projective `Z` on
+  a complete Edwards curve, so the branch outcome is invariantly
+  "nonzero" for every scalar; for the ladder it is the small-order case
+  above, fixed by the public input point. Both are genuine VALIDATIONS
+  (`error.NotInvertible` on zero), the opposite of the scalar-derived
+  rejection `ecvrf` had to strip out of `std`'s `Edwards25519.mul` —
+  which this module is not exposed to, since `Point.mul` has no
+  rejection and no error union. The ladders themselves, measured in
+  isolation (`Point.mul`, `Point.mulBasePoint`, and decaf448's
+  `Element.scalarMul` on top of them, with no `toBytes` downstream),
+  report **0 errors / 0 contexts**; re-introducing a variable-time
+  `if (nibble != 0)` table lookup in `Point.mul` makes the same run
+  report 860, so the harness does reach them.
 - **X448's `scalarmult` REJECTS non-canonical `u`** rather than silently
   masking the high bit the way RFC 7748 §5's own text permits
   ("implementations SHOULD mask the most significant bit in the final
