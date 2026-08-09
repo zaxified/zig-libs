@@ -157,6 +157,24 @@ no peer is present.
    attempted after this — the wrap already required real engineering (see "What is self-derived"
    below for what remains open).
 
+6. **The global (broadcast) common address, captured from a real RTU** (`goldens.zig`'s
+   `global_ca_*` constants; replayed in `outstation.zig`). A `c104` controlling station interrogated
+   a `c104` controlled station on **CA 0xFFFF** through the same recording proxy. The third-party
+   outstation answered every legal broadcast — general interrogation, counter interrogation, clock
+   synchronisation — with **its own station address 47** in the confirmation, in the data and in the
+   termination alike; `explain_bytes` itself renders the request's address as `GLOBAL` and the
+   confirmation's as `CA 47`. A second run gave the controlled station **two** stations (CA 47 and
+   CA 99): one global interrogation produced two confirmations and two terminations, one per
+   station, and no monitor-direction frame in the whole exchange carried 0xFFFF. That is
+   IEC 60870-5-101 §7.2.4 — an ASDU with the broadcast address in the control direction is answered
+   in the monitor direction with the specific defined common address (the station address).
+
+   This closed a **real defect**: before it, `Outstation` echoed the received address in every
+   confirmation and termination while `emitPoint` used its own, so one global interrogation went out
+   under two station identities. The same run also froze the *counter*-example — a request to a
+   common address the RTU does not serve (CA 200) gets that address echoed back, because cause 46
+   exists to name it — which this module already matched octet for octet and must keep matching.
+
 ### What is self-derived
 
 - Everything not in the capture: the CP24Time2a/CP16Time2a encodings, `M_ME_ND_1`, `M_PS_NA_1`,
@@ -252,6 +270,13 @@ Honest list of what a full IEC 60870-5-104 implementation has and this one does 
   in its `ACTIVATION TERMINATION`; this outstation echoes the execute element, which is what the
   standard describes. Likewise, that RTU silently dropped an ASDU with an unknown type id where this
   one replies with cause 44 as §7.2.3 prescribes.
+- **A broadcast *test command* is answered by lib60870-C and dropped here.** On CA 0xFFFF the
+  observed third-party RTU replied to `C_TS_TA_1` (type 107) and echoed 0xFFFF doing it
+  (`goldens.global_ca_test_command_reply`). §7.2.4 lists only type ids **100, 101, 103 and 105** as
+  valid with the global address, so this module answers nothing outside those four — a station that
+  replies to a broadcast the standard does not define for it makes every station on the link reply
+  to one frame. The same reasoning drops an *unmodelled* type id on the global address instead of
+  answering it with cause 44, which is otherwise this module's behaviour (see the entry above).
 - **`tshark` cross-check** — not run (no `tshark` in this environment); see "What is self-derived".
 
 ## Investigated: the "paired Stream.Reader/Writer stops writes" report

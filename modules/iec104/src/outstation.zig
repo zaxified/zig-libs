@@ -95,8 +95,15 @@ pub const Error = SinkError || asdu_mod.Error;
 /// §7.2.4: which type ids the global (broadcast) common address is valid for.
 /// Only station/counter interrogation, clock synchronisation and reset process.
 /// Everything else — every control-direction command in particular — must be
-/// ignored when addressed to the broadcast address. Matches lib60870's CS101/
-/// CS104 slave, whose broadcast handling covers exactly these four type ids.
+/// ignored when addressed to the broadcast address.
+///
+/// ⚠ A live `lib60870-C` outstation is *looser* than this: it also answers a
+/// test command (`C_TS_TA_1`, type 107) sent to the global address, echoing
+/// 0xFFFF as it does so. That frame is frozen in `goldens.zig`
+/// (`global_ca_test_command_reply`) and deliberately not imitated — §7.2.4
+/// lists four type ids and 107 is not one of them, and a station that answers
+/// broadcasts the standard does not define for it turns one master frame into a
+/// reply from every station on the link.
 fn broadcastable(type_id: asdu_mod.TypeId) bool {
     return switch (type_id) {
         .c_ic_na_1, .c_ci_na_1, .c_cs_na_1, .c_rp_na_1 => true,
@@ -134,22 +141,6 @@ pub const Outstation = struct {
     pub fn handle(self: *Outstation, request: []const u8, sink: Sink) Error!void {
         const header = try asdu_mod.decodeHeader(request, self.opts.params);
 
-        // Unknown type identification (§7.2.3 cause 44).
-        if (asdu_mod.shapeOf(header.type_id) == null) {
-            try self.echoRaw(request, header, .unknown_type_id, true, sink);
-            return;
-        }
-
-        // Wrong station. Broadcast is accepted by every station.
-        const is_broadcast = header.common_address == self.opts.params.broadcastCa();
-        if (header.common_address != self.opts.common_address and !is_broadcast) {
-            // Matches what a real RTU does: a negative activation
-            // confirmation first, then a separate ASDU carrying cause 46.
-            try self.echoRaw(request, header, .activation_con, true, sink);
-            try self.echoRaw(request, header, .unknown_common_address, false, sink);
-            return;
-        }
-
         // §7.2.4: the global (broadcast) common address is defined only for the
         // interrogation / clock-sync / reset-process system commands. Any other
         // type id addressed to it — above all a control-direction command — must
@@ -157,9 +148,27 @@ pub const Outstation = struct {
         // fire that output on *every* station on the link, unauthenticated. Such
         // a frame is dropped silently (no actuation, and no reply storm from the
         // whole link answering one broadcast).
-        if (is_broadcast and header.common_address != self.opts.common_address and
-            !broadcastable(header.type_id))
-        {
+        //
+        // This test comes *before* the unknown-type-id branch below on purpose:
+        // an unmodelled type id is by definition not one of the four the global
+        // address is defined for, so answering it with cause 44 would have every
+        // station on the link reply to one frame. `broadcastable` only ever
+        // admits known type ids, so nothing modelled is lost by the order.
+        const is_broadcast = self.isBroadcast(header.common_address);
+        if (is_broadcast and !broadcastable(header.type_id)) return;
+
+        // Unknown type identification (§7.2.3 cause 44).
+        if (asdu_mod.shapeOf(header.type_id) == null) {
+            try self.echoRaw(request, header, .unknown_type_id, true, sink);
+            return;
+        }
+
+        // Wrong station. Broadcast is accepted by every station.
+        if (header.common_address != self.opts.common_address and !is_broadcast) {
+            // Matches what a real RTU does: a negative activation
+            // confirmation first, then a separate ASDU carrying cause 46.
+            try self.echoRaw(request, header, .activation_con, true, sink);
+            try self.echoRaw(request, header, .unknown_common_address, false, sink);
             return;
         }
 
@@ -339,6 +348,31 @@ pub const Outstation = struct {
 
     // ── reply builders ──────────────────────────────────────────────────────
 
+    /// True when `received` is the global (broadcast) common address *and* this
+    /// station has one of its own to answer with. A station configured with the
+    /// all-ones address itself has nothing else to say, so it keeps echoing.
+    fn isBroadcast(self: *const Outstation, received: u16) bool {
+        const bc = self.opts.params.broadcastCa();
+        return received == bc and self.opts.common_address != bc;
+    }
+
+    /// The common address every reply must carry, given the one that arrived.
+    ///
+    /// §7.2.4: "ASDUs with a broadcast address in control direction have to be
+    /// answered in monitor direction by the address that is the specific
+    /// defined common address (station address)." A station answering a global
+    /// request identifies *itself*; echoing 0xFFFF back would put two station
+    /// identities in one exchange, because the data ASDUs that follow the
+    /// confirmation always carry this station's own address.
+    ///
+    /// Every other case — including the cause-46 "unknown common address"
+    /// reply, which must name the address that was not recognised — echoes what
+    /// arrived. Verified against a real `lib60870-C` outstation, whose answers
+    /// to both cases are frozen in `goldens.zig` (`global_ca_table`).
+    fn replyCa(self: *const Outstation, received: u16) u16 {
+        return if (self.isBroadcast(received)) self.opts.common_address else received;
+    }
+
     fn emitPoint(self: *Outstation, p: *const Point, cause: asdu_mod.Cot, sink: Sink) Error!void {
         try self.emitPointWithLayout(p, cause, self.opts.interrogation_sq, sink);
     }
@@ -375,7 +409,7 @@ pub const Outstation = struct {
                 .is_test = a.header.cause.is_test,
                 .originator = a.header.cause.originator,
             },
-            a.header.common_address,
+            self.replyCa(a.header.common_address),
             a.header.vsq.sq,
         );
         var it = a.objects();
@@ -407,7 +441,7 @@ pub const Outstation = struct {
                 .is_test = header.cause.is_test,
                 .originator = header.cause.originator,
             },
-            .common_address = header.common_address,
+            .common_address = self.replyCa(header.common_address),
         }, self.opts.params, &self.scratch);
         @memcpy(self.scratch[hdr.len..][0..body.len], body);
         try sink.send(self.scratch[0 .. hdr.len + body.len]);
@@ -951,6 +985,136 @@ test "outstation: the broadcast common address is accepted" {
     const a = try asdu_mod.decode(s.get(0), asdu_mod.default_params);
     try testing.expectEqual(asdu_mod.Cot.activation_con, a.header.cause.cot);
     try testing.expect(!a.header.cause.negative);
+}
+
+/// Decodes each collected reply and returns nothing but its common address,
+/// so a failure reads as "we answered with 65535" rather than a hex diff.
+fn replyCommonAddresses(s: *const CollectSink, out: []u16) ![]u16 {
+    var i: usize = 0;
+    while (i < s.count) : (i += 1) {
+        const a = try asdu_mod.decode(s.get(i), asdu_mod.default_params);
+        out[i] = a.header.common_address;
+    }
+    return out[0..s.count];
+}
+
+test "outstation: a global-CA request is answered with this station's own address, not 0xFFFF" {
+    // The oracle: a real `c104` 2.2.1 / `lib60870-C` outstation whose points are
+    // the ones `demoPoints()` models, driven by a real `c104` controlling
+    // station through a recording proxy. Its answers to a general
+    // interrogation, a counter interrogation and a clock sync on CA 0xFFFF are
+    // frozen in `goldens.zig`; every one of them carries CA 47.
+    //
+    // Before this was fixed, our confirmation and termination echoed 0xFFFF
+    // while the data ASDUs between them carried 47 — one exchange, two station
+    // identities, which is what §7.2.4 forbids.
+    const goldens = @import("goldens.zig");
+    var buf: [apci.max_asdu_len]u8 = undefined;
+
+    const cases = [_]struct { request: []const u8, replies: []const []const u8 }{
+        .{ .request = goldens.global_ca_gi_request, .replies = &goldens.global_ca_gi_replies },
+        .{ .request = goldens.global_ca_ci_request, .replies = &goldens.global_ca_ci_replies },
+        .{ .request = goldens.global_ca_cs_request, .replies = &goldens.global_ca_cs_replies },
+    };
+
+    for (cases) |c| {
+        var points = demoPoints();
+        var o = try Outstation.init(.{ .common_address = 47 }, &points);
+        var s = CollectSink{};
+        const req = std.fmt.hexToBytes(&buf, c.request) catch unreachable;
+        try o.handle(req, s.sink());
+
+        // Address first: the identity is the thing under test, and a bare hex
+        // mismatch would not say which field went wrong.
+        var addrs: [8]u16 = undefined;
+        for (try replyCommonAddresses(&s, &addrs)) |ca| {
+            try testing.expectEqual(@as(u16, 47), ca);
+        }
+
+        try testing.expectEqual(c.replies.len, s.count);
+        var expected: [apci.max_asdu_len]u8 = undefined;
+        for (c.replies, 0..) |want_hex, i| {
+            const want = std.fmt.hexToBytes(&expected, want_hex) catch unreachable;
+            try testing.expectEqualSlices(u8, want, s.get(i));
+        }
+    }
+}
+
+test "outstation: a station whose own CA is 0xFFFF still answers as itself" {
+    // Degenerate but reachable configuration: `replyCa` must not substitute an
+    // address it would have echoed anyway, and the broadcast guard must not
+    // start dropping this station's own traffic.
+    var points = demoPoints();
+    var o = try Outstation.init(.{ .common_address = 0xFFFF }, &points);
+    var s = CollectSink{};
+    try o.handle(&hex("64010600ffff00000014"), s.sink());
+    try testing.expectEqual(@as(usize, 4), s.count);
+    var addrs: [8]u16 = undefined;
+    for (try replyCommonAddresses(&s, &addrs)) |ca| {
+        try testing.expectEqual(@as(u16, 0xFFFF), ca);
+    }
+}
+
+test "outstation: an unknown common address is still echoed back, byte for byte" {
+    // The counterweight to the fix above: cause 46 has to name the address that
+    // was not recognised, so this path must keep echoing. The expected octets
+    // are the same third-party RTU's, replying to CA 200 which it did not serve.
+    const goldens = @import("goldens.zig");
+    var buf: [apci.max_asdu_len]u8 = undefined;
+    var expected: [apci.max_asdu_len]u8 = undefined;
+
+    const cases = [_]struct { request: []const u8, replies: []const []const u8 }{
+        .{ .request = goldens.unknown_ca_gi_request, .replies = &goldens.unknown_ca_gi_replies },
+        .{ .request = goldens.unknown_ca_cs_request, .replies = &goldens.unknown_ca_cs_replies },
+    };
+    for (cases) |c| {
+        var points = demoPoints();
+        var o = try Outstation.init(.{ .common_address = 47 }, &points);
+        var s = CollectSink{};
+        try o.handle(std.fmt.hexToBytes(&buf, c.request) catch unreachable, s.sink());
+        try testing.expectEqual(c.replies.len, s.count);
+        for (c.replies, 0..) |want_hex, i| {
+            const want = std.fmt.hexToBytes(&expected, want_hex) catch unreachable;
+            try testing.expectEqualSlices(u8, want, s.get(i));
+        }
+    }
+}
+
+test "outstation: nothing at all is answered on the global CA outside the four §7.2.4 types" {
+    var points = demoPoints();
+    var o = try Outstation.init(.{ .common_address = 47 }, &points);
+    var s = CollectSink{};
+
+    // Test command with time tag (C_TS_TA_1). A real lib60870-C outstation DOES
+    // answer this one, echoing 0xFFFF as it goes (`goldens.global_ca_test_
+    // command_reply`); §7.2.4 does not list type 107 among the four valid with
+    // the global address, so this module stays silent instead.
+    const goldens = @import("goldens.zig");
+    var buf: [apci.max_asdu_len]u8 = undefined;
+    try o.handle(std.fmt.hexToBytes(&buf, goldens.global_ca_test_command_request) catch unreachable, s.sink());
+    try testing.expectEqual(@as(usize, 0), s.count);
+
+    // Test command without time tag, read command, a single command, and a type
+    // id this module does not model at all — none of them may draw a reply out
+    // of a station that shares the link with every other station. The unmodelled
+    // one matters most: answering it with cause 44 would have the whole link
+    // reply to one frame.
+    s.reset();
+    try o.handle(&hex("68010600ffff000000aa55"), s.sink()); // C_TS_NA_1 (104)
+    try testing.expectEqual(@as(usize, 0), s.count);
+    try o.handle(&hex("66010500ffff00650000"), s.sink()); // C_RD_NA_1 (102), IOA 101
+    try testing.expectEqual(@as(usize, 0), s.count);
+    try o.handle(&hex("2d010600ffff2d010001"), s.sink()); // C_SC_NA_1 (45)
+    try testing.expectEqual(@as(usize, 0), s.count);
+    try o.handle(&hex("f4010600ffff000000"), s.sink()); // unmodelled type 244
+    try testing.expectEqual(@as(usize, 0), s.count);
+
+    // Reset process (type 105) IS one of the four, and is confirmed as us.
+    try o.handle(&hex("69010600ffff00000001"), s.sink());
+    try testing.expectEqual(@as(usize, 1), s.count);
+    const a = try asdu_mod.decode(s.get(0), asdu_mod.default_params);
+    try testing.expectEqual(@as(u16, 47), a.header.common_address);
+    try testing.expectEqual(asdu_mod.Cot.activation_con, a.header.cause.cot);
 }
 
 test "outstation: a broadcast control command never operates the point (§7.2.4)" {

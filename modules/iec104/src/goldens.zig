@@ -889,3 +889,181 @@ test "live-derived: the frames a real controlling station sent before its t1 fir
     // QOI 20 = station interrogation (global).
     try testing.expectEqual(@as(u8, 20), @intFromEnum(obj.element.qoi));
 }
+
+// ── the global (broadcast) common address 0xFFFF, captured live ─────────────
+//
+// Provenance, 2026-08-09. A `c104` 2.2.1 **controlling** station was pointed at
+// a `c104` 2.2.1 **controlled** station through the same recording TCP proxy as
+// the table at the top of this file. Neither endpoint is this module. The
+// controlled station's points are the ones `outstation.zig`'s `demoPoints()`
+// models: single-point 101 = on, normalized 105 = 0.5, counter 108 = 0.
+//
+//   python3 - <<'PY'
+//   import c104, time
+//   srv = c104.Server(ip="127.0.0.1", port=P)
+//   st  = srv.add_station(common_address=47)
+//   st.add_point(io_address=101, type=c104.Type.M_SP_NA_1).value = True
+//   st.add_point(io_address=105, type=c104.Type.M_ME_NA_1).info = \
+//       c104.NormalizedInfo(c104.NormalizedFloat(0.5))
+//   st.add_point(io_address=108, type=c104.Type.M_IT_NA_1)
+//   srv.start()                       # second run also adds station CA 99
+//   cl = c104.Client(); conn = cl.add_connection(ip="127.0.0.1", port=PROXY,
+//                                                init=c104.Init.NONE)
+//   cl.start(); time.sleep(1.5)
+//   conn.interrogation(common_address=0xFFFF)
+//   conn.counter_interrogation(common_address=0xFFFF)
+//   conn.clock_sync(common_address=0xFFFF, wait_for_response=False)
+//   conn.test(common_address=0xFFFF, wait_for_response=False)
+//   conn.interrogation(common_address=200, wait_for_response=False)
+//   PY
+//
+// **What the third-party outstation did, and why it matters.** Every reply to a
+// request addressed to 0xFFFF carries the *station's own* common address 47 —
+// the confirmation, the data and the termination alike. `c104.explain_bytes`
+// says so in its own words: it renders the request's CA as `GLOBAL` and the
+// confirmation's as `CA 47`. IEC 60870-5-101 §7.2.4 requires exactly this:
+// an ASDU with the broadcast address in the control direction is answered in
+// the monitor direction with the specific defined common address (the station
+// address). Echoing 0xFFFF back would put two station identities in one
+// exchange, since the data ASDUs are unavoidably the station's own.
+//
+// The second run made this unmistakable by giving the controlled station *two*
+// stations, CA 47 and CA 99: one global interrogation produced **two**
+// confirmations and **two** terminations, one per station, and no frame in the
+// whole exchange carried 0xFFFF in the monitor direction (see
+// `global_ca_two_station_replies`).
+//
+// ⚠ One divergence, deliberately not copied — see `global_ca_test_command_*`.
+// `lib60870-C` answers a *test command* (`C_TS_TA_1`, type 107) on the global
+// address, and that one reply does echo 0xFFFF. §7.2.4 lists only type ids 100,
+// 101, 103 and 105 as valid with the global address, so this module drops a
+// broadcast test command instead of answering it. The frames are frozen here so
+// the divergence is documented rather than discovered in the field.
+
+/// Master -> RTU, general interrogation on the global common address, and the
+/// three ASDUs the third-party RTU answered with. Replayed byte-for-byte
+/// through `Outstation.handle` in `outstation.zig`.
+pub const global_ca_gi_request = "64010600ffff00000014";
+pub const global_ca_gi_replies = [_][]const u8{
+    "640107002f0000000014", // ACTIVATION_CON  — CA 47, *not* 0xFFFF
+    "018114002f0065000001", // M_SP_NA_1  IOA 101
+    "098114002f00690000004000", // M_ME_NA_1  IOA 105
+    "64010a002f0000000014", // ACTIVATION_TERMINATION — CA 47
+};
+
+/// The same for a counter interrogation on the global common address.
+pub const global_ca_ci_request = "65010600ffff00000005";
+pub const global_ca_ci_replies = [_][]const u8{
+    "650107002f0000000005", // ACTIVATION_CON — CA 47
+    "0f8125002f006c00000000000000", // M_IT_NA_1  IOA 108
+    "65010a002f0000000005", // ACTIVATION_TERMINATION — CA 47
+};
+
+/// And for a clock synchronisation command on the global common address.
+pub const global_ca_cs_request = "67010600ffff000000b6bc251309081a";
+pub const global_ca_cs_replies = [_][]const u8{
+    "670107002f00000000b6bc251309081a", // ACTIVATION_CON — CA 47
+};
+
+/// The divergence: `lib60870-C` answers a broadcast test command and echoes the
+/// global address doing it. This module drops the request (§7.2.4).
+pub const global_ca_test_command_request = "6b010600ffff0000000000b2c5251309081a";
+pub const global_ca_test_command_reply = "6b010700ffff0000000000b2c5251309081a";
+
+/// A request to a common address the RTU does *not* serve. Here the received
+/// address IS echoed — cause 46 has to name the address that was unknown — and
+/// this module already matched it octet for octet before the global-address fix.
+pub const unknown_ca_gi_request = "64010600c80000000014";
+pub const unknown_ca_gi_replies = [_][]const u8{
+    "64014700c80000000014", // ACTIVATION_CON, NEGATIVE, CA 200 echoed
+    "64012e00c80000000014", // UNKNOWN_COMMON_ADDRESS_OF_ASDU, CA 200 echoed
+};
+pub const unknown_ca_cs_request = "67010600c800000000cac7261309081a";
+pub const unknown_ca_cs_replies = [_][]const u8{
+    "67014700c800000000cac7261309081a",
+    "67012e00c800000000cac7261309081a",
+};
+
+/// Second run: the controlled station served CA 47 **and** CA 99, and the
+/// master issued one global interrogation, one global counter interrogation and
+/// one global clock sync. Every ASDU the RTU produced, in wire order, APCI
+/// stripped. Two stations, two of every confirmation and termination, each
+/// naming itself — and 0xFFFF appears nowhere in the monitor direction.
+pub const global_ca_two_stations = [_][]const u8{
+    "640107002f0000000014", // C_IC_NA_1 ACT_CON           CA 47
+    "64010700630000000014", // C_IC_NA_1 ACT_CON           CA 99
+    "018114002f0065000001", // M_SP_NA_1 IOA 101           CA 47
+    "098114002f00690000004000", // M_ME_NA_1 IOA 105       CA 47
+    "018114006300c9000001", // M_SP_NA_1 IOA 201           CA 99
+    "64010a002f0000000014", // C_IC_NA_1 ACT_TERM          CA 47
+    "64010a00630000000014", // C_IC_NA_1 ACT_TERM          CA 99
+    "650107002f0000000005", // C_CI_NA_1 ACT_CON           CA 47
+    "65010700630000000005", // C_CI_NA_1 ACT_CON           CA 99
+    "0f8125002f006c00000000000000", // M_IT_NA_1 IOA 108   CA 47
+    "0f8125006300d000000000000000", // M_IT_NA_1 IOA 208   CA 99
+    "65010a002f0000000005", // C_CI_NA_1 ACT_TERM          CA 47
+    "65010a00630000000005", // C_CI_NA_1 ACT_TERM          CA 99
+    "670107002f00000000eab1261309081a", // C_CS_NA_1 ACT_CON  CA 47
+    "670107006300000000eab1261309081a", // C_CS_NA_1 ACT_CON  CA 99
+};
+
+test "live-derived: a third-party RTU answers the global common address with its own" {
+    var buf: [apci.max_apdu_len]u8 = undefined;
+    const params = asdu.Params{};
+
+    // The requests really were addressed to the broadcast address.
+    for ([_][]const u8{
+        global_ca_gi_request,
+        global_ca_ci_request,
+        global_ca_cs_request,
+        global_ca_test_command_request,
+    }) |h| {
+        const a = try asdu.decode(bytesOf(h, &buf), params);
+        try testing.expectEqual(params.broadcastCa(), a.header.common_address);
+        try testing.expectEqual(asdu.Cot.activation, a.header.cause.cot);
+    }
+
+    // Every reply the RTU sent to those three legal broadcasts named station 47.
+    var replies: usize = 0;
+    for ([_][]const []const u8{
+        &global_ca_gi_replies,
+        &global_ca_ci_replies,
+        &global_ca_cs_replies,
+    }) |group| {
+        for (group) |h| {
+            const a = try asdu.decode(bytesOf(h, &buf), params);
+            try testing.expectEqual(@as(u16, 47), a.header.common_address);
+            replies += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 8), replies);
+
+    // Two stations behind one link: two confirmations, two terminations, and
+    // the only addresses on the wire are the two station addresses.
+    var seen_47: usize = 0;
+    var seen_99: usize = 0;
+    for (global_ca_two_stations) |h| {
+        const a = try asdu.decode(bytesOf(h, &buf), params);
+        try testing.expect(a.header.common_address != params.broadcastCa());
+        switch (a.header.common_address) {
+            47 => seen_47 += 1,
+            99 => seen_99 += 1,
+            else => return error.UnexpectedCommonAddress,
+        }
+    }
+    try testing.expectEqual(@as(usize, 8), seen_47);
+    try testing.expectEqual(@as(usize, 7), seen_99);
+
+    // The counter-example that keeps the rule honest: a request to a common
+    // address the RTU does not serve gets that address echoed back, because
+    // cause 46 exists to name it.
+    for ([_][]const u8{
+        unknown_ca_gi_replies[0],
+        unknown_ca_gi_replies[1],
+        unknown_ca_cs_replies[0],
+        unknown_ca_cs_replies[1],
+    }) |h| {
+        const a = try asdu.decode(bytesOf(h, &buf), params);
+        try testing.expectEqual(@as(u16, 200), a.header.common_address);
+    }
+}
