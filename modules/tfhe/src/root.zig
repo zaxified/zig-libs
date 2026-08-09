@@ -47,6 +47,9 @@ pub const meta = .{
 // Mechanical backbone (all REAL, ungated).
 pub const torus = @import("torus.zig");
 pub const poly = @import("poly.zig");
+/// Exact `O(N log N)` negacyclic ring multiply (integer NTT, no FFT, no
+/// rounding budget) — the engine behind `poly.Poly(N).mul` for large `N`.
+pub const ntt = @import("ntt.zig");
 pub const gadget = @import("gadget.zig");
 pub const params = @import("params.zig");
 
@@ -67,10 +70,12 @@ test {
     std.testing.refAllDecls(@This());
     _ = torus;
     _ = poly;
+    _ = ntt;
     _ = gadget;
     _ = params;
     _ = tfhe_mod;
     _ = @import("harness_test.zig");
+    _ = @import("bench.zig");
 }
 
 test "meta.model_after names TFHE + FHEW" {

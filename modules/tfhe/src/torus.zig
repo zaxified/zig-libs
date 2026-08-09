@@ -6,11 +6,14 @@
 //!
 //!   - `q = 2^32` means modular addition/subtraction/multiplication are just
 //!     **wrapping `u32` arithmetic** (`+%`, `-%`, `*%`) — natively exact, no
-//!     modular reduction, no NTT prime, and (crucially) **no FFT precision
-//!     bound** to reason about. Unlike a prime-modulus RLWE ring, negacyclic
-//!     polynomial multiplication here is an exact integer convolution mod
-//!     `2^32` (see `poly.zig`), so the mechanical layer has zero rounding
-//!     debt of its own.
+//!     modular reduction, and (crucially) **no FFT precision bound** to reason
+//!     about. Unlike a prime-modulus RLWE ring, negacyclic polynomial
+//!     multiplication here is an exact integer convolution mod `2^32`, so the
+//!     mechanical layer has zero rounding debt of its own. `poly.zig` computes
+//!     that convolution in `O(N log N)` for larger degrees via an **integer**
+//!     NTT (`ntt.zig`) over an auxiliary 64-bit prime, which is bit-identical
+//!     to the schoolbook result — the exactness above is a property of the
+//!     ring, not of the algorithm, and it survives the faster path.
 //!
 //! All helpers here are REAL/ungated: message (de)coding by a scaling factor
 //! `Δ`, the round-to-nearest rescale used by modulus switching (`q → 2N`), and

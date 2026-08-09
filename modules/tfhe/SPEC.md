@@ -20,7 +20,7 @@ every gate.
 |---|---|---|
 | What it refreshes | one LWE ciphertext per bootstrap (a gate) | a full packed BFV ciphertext |
 | Core machinery | blind rotation = CMux/external-product loop | slot-packing + homomorphic digit-extraction polynomials |
-| Ring modulus | power-of-two `2^32` ⇒ **exact wrapping `u32`**, no NTT prime, no FFT precision bound | NTT-prime RNS ring (already in `bfv`) |
+| Ring modulus | power-of-two `2^32` ⇒ **exact wrapping `u32`**, no FFT precision bound (the `ntt.zig` fast path uses an auxiliary prime internally but is bit-identical) | NTT-prime RNS ring (already in `bfv`) |
 | Size / verifiability | self-contained; ~one accumulator loop | very large; digit-extraction is hard to get right and to verify |
 | Dedup with `bfv` | none — a different scheme family | would extend `bfv` |
 
@@ -73,7 +73,8 @@ is nontrivial):
 - **The mechanical layer is Opus/Sonnet, NOT Fable.** The ring, the gadget, mod
   switch, sample extraction, and key switch are deterministic or bounded-noise
   and are pinned by exact/round-trip tests (schoolbook `mul` is byte-exact by
-  construction; `decompose`/`recompose` has an exact error bound;
+  construction and is the differential oracle the NTT path must reproduce bit
+  for bit; `decompose`/`recompose` has an exact error bound;
   `sampleExtract`/`keySwitch` decrypt round-trips). Small fix-space, strong
   feedback.
 - **The four core functions are genuine Fable.** Two independent triggers fire:
@@ -156,21 +157,55 @@ set (raise `σ` for a hard LWE problem, re-balance `(ℓ, B_g)` to hold the marg
 
 The torus modulus is `q = 2^32`, so modular add/sub/mul are wrapping `u32`
 (`+%`/`-%`/`*%`) — natively exact. The negacyclic ring multiply is therefore an
-**exact** `O(N²)` integer convolution mod `2^32`, with **no NTT prime and no FFT
-precision bound** to reason about (contrast `bfv`, which needs NTT-friendly
-primes and CRT). A production TFHE swaps the schoolbook `mul` for a `u64`/complex
-NTT for speed; here the exact schoolbook is the correctness oracle and is fine
-for the toy dimensions (`N ≤ 512`). The only rounding in the mechanical layer is
-the modulus switch's half-ulp, which is deterministic and bounded.
+**exact** integer convolution mod `2^32`, with **no FFT precision bound** to
+reason about. The only rounding in the mechanical layer is the modulus switch's
+half-ulp, which is deterministic and bounded.
+
+Reference TFHE implementations buy speed with an `f64` complex negacyclic FFT
+and pay for it with a rounding-error budget. This module keeps exactness and
+still gets the asymptotics: `poly.mul` dispatches to `ntt.zig`, an **integer**
+negacyclic NTT over the auxiliary prime `p = 2^64 − 2^32 + 1`, with both
+operands split into 16-bit halves so the whole convolution provably fits in
+`p` (`|C_k| ≤ N·2^49 < p/2` for every `N ≤ 2^13`) and is reconstructed exactly
+mod `2^32`. Four forward transforms and one inverse per product; the `2^16`
+weighting and both cross terms are combined inside the transform domain. The
+schoolbook convolution is retained as `mulSchoolbook` and is the differential
+oracle: `poly.zig`'s tests assert **bit-identical** output for `N = 2 … 1024`,
+including saturating and sign-boundary coefficients.
+
+Measured (ReleaseFast, `bench.zig`, schoolbook ÷ NTT on identical inputs in
+one binary, min of three alternating passes): `N=16` 0.11×, `32` 0.23×, `64`
+0.48×, `128` 0.92×, `256` **1.67×**, `512` 3.36×, `1024` 7.02×, `2048`
+12.08×. That crossover is why `ntt_min_degree = 256`. End to end a `toy` gate
+bootstrap goes **54.4 ms → 33.3 ms** (1.64×), measured by building
+`ntt_min_degree` both ways.
+
+What this does *not* buy: the remaining factor. A bootstrap issues
+`n·2·(2ℓ) = 1024` products, and each transforms its GGSW operand from scratch.
+Caching the bootstrap key in the transform domain and accumulating the whole
+external product there before a single inverse would cut ~80 transforms per
+external product to ~18 — the standard TFHE optimisation, and a separate
+change with its own bound (`2ℓ·N·2^49.5 < p/2`, i.e. `2ℓ·N < 2^13.5`) and its
+own ~4× memory cost for the prepared key.
 
 ## Threats / caveats
 
 - **No security level claimed.** `toy` is correctness-only; do not encrypt
   anything real until a security-grade parameter set lands.
-- **Not constant-time.** Samplers and gadget code are public-data-shaped, but the
-  secret-dependent paths (keygen/encrypt and blind rotation, now implemented)
-  have not had a dedicated timing audit — still an open item, not something
-  landing the core resolved.
+- **Source-level constant-time in the key path; not verified codegen.** The
+  secret samplers are fixed-cost and branch-free: `sampleBit` takes the top bit
+  of one `u32` draw (bit-identical to the `std.Random.uintLessThan(u32, 2)` it
+  replaced, but without that routine's rejection branch), `sampleError` is a
+  64-bit multiply-shift instead of `intRangeAtMost`'s rejection loop, and
+  `clearBootstrap` selects on the secret key bit arithmetically instead of
+  branching. `lweKeyGen`/`glweKeyGen` are fixed-trip loops over `sampleBit`.
+  What this does **not** claim: the compiler may still reintroduce a branch —
+  this is source-level constant time, not verified machine code, and no timing
+  measurement was taken. `gadget.decompose` still branches on digit values, but
+  it is only ever applied to ciphertext mask/body coefficients, never to key
+  material. `sampleError`'s multiply-shift is biased by ≈`2^-53` in statistical
+  distance (a rejection-free sampler cannot be exactly uniform on a
+  non-power-of-two range); the previous sampler was unbiased but variable-time.
 - **Probabilistic correctness.** Bootstrapping correctness is average-case (see
   the ledger); the toy set's `≈68σ` margin makes failure astronomically
   unlikely, but there is no worst-case guarantee — this is intrinsic to TFHE and
@@ -181,8 +216,9 @@ the modulus switch's half-ulp, which is deterministic and bounded.
 ## Per-module backlog (mechanical, not Fable)
 
 - Byte codecs for the key/ciphertext types.
-- A `u64`/complex-FFT negacyclic multiply (perf) behind the same `Poly` API,
-  cross-checked against the exact schoolbook.
+- Transform-domain caching of the bootstrap key (a "prepared" GGSW), and
+  accumulating a whole external product before one inverse transform — the
+  remaining ~4× on top of the `ntt.zig` multiply. See the exactness bound above.
 - General `k > 1` GLWE; multi-value / larger-precision LUTs.
 - Security-grade parameter sets + a parameter-selection helper driven by the
   `erfc` ledger.

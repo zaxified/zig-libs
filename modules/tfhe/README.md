@@ -9,8 +9,10 @@ correct. This module implements the TFHE/FHEW line (Chillotti–Gama–Georgieva
 Izabachène; Ducas–Micciancio): LWE/GLWE/GGSW ciphertexts over the power-of-two
 torus `Z_{2^32}`, blind rotation by CMux over a GGSW bootstrap key, sample
 extraction, and LWE key switching. It is self-contained and **std-only** — no
-pairing, no NTT prime (the `2^32` modulus makes the ring arithmetic exact
-wrapping `u32`), no external C.
+pairing, no floating point, no external C. The ring modulus stays `2^32`
+(exact wrapping `u32`); an auxiliary 64-bit prime is used *inside* `ntt.zig`
+purely to compute the same convolution faster, and its output is bit-identical
+to the schoolbook one.
 
 **The module is complete**: the entire mechanical layer is real and tested,
 and the irreducible soundness core (external product / CMux / blind rotation /
@@ -23,7 +25,8 @@ remains). Toy/test parameters only — **no security level is claimed**.
 | Piece | File | What |
 |---|---|---|
 | Torus | `torus.zig` | `Z_{2^32}` encode/decode by a scale `Δ`, round-to-nearest modulus switch (`q → 2N`), gadget weights — exact integer rounding |
-| Negacyclic ring | `poly.zig` | `Poly(N)` over `Z_{2^32}[X]/(X^N+1)` — add/sub/negate/scalar, **exact** `O(N²)` schoolbook `mul` (wrapping `u32`, no FFT), monomial rotation `X^e` |
+| Negacyclic ring | `poly.zig` | `Poly(N)` over `Z_{2^32}[X]/(X^N+1)` — add/sub/negate/scalar, monomial rotation `X^e`, and `mul`: **exact** `O(N²)` schoolbook below `ntt_min_degree`, **exact** `O(N log N)` integer NTT above it (bit-identical, no FFT, no rounding budget) |
+| Exact NTT | `ntt.zig` | negacyclic transform over the Goldilocks prime `2^64−2^32+1` with 16-bit operand splitting; 4 forward + 1 inverse transform per product. Measured vs schoolbook: 1.7× at `N=256`, 7.0× at `N=1024`, 12.1× at `N=2048`; a `toy` gate bootstrap goes 54.4 ms → 33.3 ms |
 | Gadget | `gadget.zig` | signed (balanced) base-`2^b` decomposition into `ℓ` digits + `recompose`, with an explicit `maxError` bound |
 | Parameters | `params.zig` | `Params` + validation; the `toy` set and the failure-probability ledger |
 | Scheme | `tfhe.zig` | `Tfhe(P)`: LWE/GLWE/GGSW keygen·encrypt·decrypt, bootstrap-key + key-switch-key gen, `sampleExtract`, `keySwitch`, `decomposeGlwe`, LUT builder, and `clearBootstrap` (the cleartext oracle) |
