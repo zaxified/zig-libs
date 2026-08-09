@@ -23,6 +23,26 @@
 //! `RaftServer` through the fuzzed crash/partition/reorder/clock-skew sweep with
 //! all five safety invariants enforced live. Membership changes (§6) remain
 //! design-only (`jointMajority` implemented, not yet wired into the protocol).
+//!
+//! **What the LIVE sweep actually catches** — stated explicitly, because a
+//! checker that cannot fail is worse than no checker:
+//!   - leaders propose DISTINCT client commands, one per heartbeat, identified
+//!     `(term, index)` (`server.commandFor`), so the apply-keyed State Machine
+//!     Safety check and the command-comparing Log Matching / Leader
+//!     Completeness predicates all have a value that VARIES. Before this, every
+//!     replicated entry was the leader's own `command = 0` no-op and State
+//!     Machine Safety compared zero against zero at every index.
+//!   - `BrokenRaft` (leadership declared with no election at all) trips
+//!     **Election Safety** live, on a clean run and across a seed sweep;
+//!   - the `index_only_up_to_date` injection — §5.4.1 with the term-first clause
+//!     dropped — trips **Leader Completeness** live on a directed
+//!     partition/crash schedule;
+//!   - the `naive_truncation` injection — §5.3 without the conflict-only
+//!     qualifier — is NOT caught by the sweep even so: an entry's identity is
+//!     `(creating term, index)`, so the same leader re-replicating a rolled-back
+//!     index restores a byte-identical entry. It is covered by `safety.zig`'s
+//!     `§5.3 the trap` unit test and by `server.zig`'s rollback regression test,
+//!     which is where that rule's teeth live.
 
 const std = @import("std");
 const netsim = @import("netsim");

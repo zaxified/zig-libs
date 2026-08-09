@@ -287,6 +287,14 @@ not baked into `build.zig`.
 
 ## 6. Out of scope — next increments
 
+*(Removed from this list 2026-08-09: "non-blocking `unregister` via a global
+limbo". It is implemented — see `ebr.Domain.unregister` / `adoptOrphans`. The
+shape landed is orphan-slot adoption rather than a domain-global bag: the
+departing thread leaves its garbage in its own slot and publishes an `orphaned`
+flag, and the next `tryAdvance` by any participant CASes that flag to take
+exclusive ownership. Same effect, and it needs no new shared container and no
+new memory ordering.)*
+
 - **Lock-free hash map** (the F-LF vein's third structure) — a split-ordered or
   open-addressing lock-free map over the same EBR domain. Deliberately **not**
   scaffolded in Phase 1; it is the next module increment once the queue core
@@ -387,6 +395,10 @@ All sites **CORRECT** on both arches, both opt levels. Grouped by role:
 | `register` `in_use` CAS | `.acquire`/`.monotonic` | claim slot | `ldaxrb`+`stxrb` | `lr`/`sc` (acq) |
 | `register` `local_epoch` store | `.release` | init slot epoch | `stlr` | `fence rw,w`+`sd` |
 | `unregister` `in_use` store | `.release` | free slot | `stlrb` | `fence rw,w`+`sb` |
+| `unregister` `orphaned` store † | `.release` | publish orphaned bags | `stlrb` | `fence rw,w`+`sb` |
+| `adoptOrphans` `orphaned` CAS † | `.acquire`/`.monotonic` | claim orphaned bags | `ldaxrb`+`stxrb` | `lr`/`sc` (acq) |
+| `adoptOrphans` `global_epoch` load † | `.seq_cst` | adopter's observed epoch | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `orphan_count` load / fetchAdd / fetchSub † | `.monotonic` | hint only, no hb obligation | plain `ldr` / `ldxr`+`stxr` | plain `ld` / `lr`/`sc` |
 | `enqueue` `tail` load | `.seq_cst` | MS pointer read | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
 | `enqueue` `t.next` load | `.seq_cst` | MS pointer read | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
 | `enqueue` `t.next` CAS (link) | `.seq_cst`/`.seq_cst` | linearization | `ldaxr`+`stlxr` | `lr.d.aqrl`+`sc.d.rl` |
@@ -399,6 +411,20 @@ All sites **CORRECT** on both arches, both opt levels. Grouped by role:
 | `SpinLock.lock` TTAS spin load | `.monotonic` | non-locking spin read | plain `ldr` | plain `ld` |
 | single-owner assert loads (`enter`/`exit`/`retire`/`unregister`) | `.monotonic` | debug assert, no cross-thread role | plain `ldr` | plain `ld` |
 | `deinit` chain-walk loads | `.monotonic` | teardown (quiescent) | plain `ldr` | plain `ld` |
+
+† Added after the original audit run, by the non-blocking `unregister` hand-off
+(finding F4). These rows are **inferred, not re-measured**: the codegen audit
+itself has not been re-run since. That is a deliberate, bounded claim — each new
+site deliberately REUSES an ordering pair already certified in this table at the
+same width, so it lowers to an instruction sequence already verified here:
+`orphaned` (a `bool`) uses exactly the `register` `in_use` acquire-CAS ⇄
+`unregister` `in_use` release-store pair; `adoptOrphans`'s epoch load is
+byte-identical in ordering and type to the `tryAdvance` `global_epoch` seq_cst
+load; and `orphan_count` is `.monotonic`, in the same "no cross-thread
+happens-before obligation" class as the TTAS spin load. **No existing site's
+ordering was changed**, so §7's and §7.1's verdicts on the Dekker interlock and
+the grace-period argument stand untouched. A re-run of the codegen audit is the
+right hygiene step before push.
 
 Note on the seq_cst queue-pointer ops: they are stronger than the queue's own
 linearizability needs (acquire/release would linearize the queue alone), but that

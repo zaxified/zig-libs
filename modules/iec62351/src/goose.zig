@@ -769,6 +769,34 @@ pub const BuildParams = struct {
 /// tag is computed over `Frame.macDomain` of that finished header, and only
 /// then is the extension appended.
 pub fn build(out: []u8, params: BuildParams, sealer: Sealer) SealError![]u8 {
+    switch (sealer) {
+        inline else => |_, tag| {
+            var tag_buf: [tagBufLen(tag)]u8 = undefined;
+            return buildWithTagBuf(out, params, sealer, &tag_buf);
+        },
+    }
+}
+
+/// Largest tag `Sealer` variant `tag` can produce, used only to size `build`'s
+/// stack scratch buffer at comptime. This is deliberately *not* `Sealer.tagLen`
+/// (a runtime value derived from the actual key/algorithm) — it exists so a
+/// 10-octet HMAC tag does not reserve the same `rsa.max_modulus_len` (512)
+/// bytes an RSA-4096 signature needs (wave-2 audit `iec62351` F6). `.raw`
+/// keeps the RSA-sized ceiling because a `RawSealer`'s `tag_len` is a runtime
+/// field the caller sets with no declared upper bound.
+fn tagBufLen(comptime tag: std.meta.Tag(Sealer)) usize {
+    return switch (tag) {
+        .mac => max_mac_tag_len,
+        .ecdsa_p256_sha256 => EcdsaP256.Signature.encoded_length,
+        .rsa_pss_sha256, .raw => rsa.max_modulus_len,
+    };
+}
+
+/// Largest tag any `MacAlgorithm` produces today (`hmac_sha256_256`, 32
+/// octets) — the ceiling `tagBufLen(.mac)` reserves.
+const max_mac_tag_len: usize = 32;
+
+fn buildWithTagBuf(out: []u8, params: BuildParams, sealer: Sealer, tag_buf: []u8) SealError![]u8 {
     const tag_len = sealer.tagLen();
     if (tag_len == 0) return error.UnsupportedAlgorithm;
     // The IV is a sealer-side decision with a uniqueness contract (`IvSource`),
@@ -779,7 +807,6 @@ pub fn build(out: []u8, params: BuildParams, sealer: Sealer) SealError![]u8 {
 
     var auth = params.auth;
     auth.iv = if (params.iv_source) |source| try source.take() else null;
-    var tag_buf: [rsa.max_modulus_len]u8 = undefined;
     if (tag_len > tag_buf.len) return error.BufferTooSmall;
     auth.tag = tag_buf[0..tag_len];
     const ext_len = auth.encodedLen();
@@ -1469,6 +1496,29 @@ test "constantTimeEql agrees with mem.eql on every length it special-cases" {
         }
     }
     try testing.expect(!constantTimeEql(a[0..8], a[0..16]));
+}
+
+test "F6: build's tag scratch buffer is sized per sealer, not always rsa.max_modulus_len" {
+    // The wave-2 audit's F6: goose.zig reserved rsa.max_modulus_len (512
+    // bytes) even for a 10-octet HMAC tag. tagBufLen must track the sealer:
+    // MAC and ECDSA get a buffer sized to their own worst case, and only the
+    // RSA/raw variants — which can genuinely need up to a 4096-bit modulus —
+    // pay for the full rsa.max_modulus_len ceiling.
+    try testing.expectEqual(@as(usize, 32), tagBufLen(.mac));
+    try testing.expectEqual(EcdsaP256.Signature.encoded_length, tagBufLen(.ecdsa_p256_sha256));
+    try testing.expectEqual(rsa.max_modulus_len, tagBufLen(.rsa_pss_sha256));
+    try testing.expectEqual(rsa.max_modulus_len, tagBufLen(.raw));
+    try testing.expect(tagBufLen(.mac) < rsa.max_modulus_len);
+    try testing.expect(tagBufLen(.ecdsa_p256_sha256) < rsa.max_modulus_len);
+
+    // And build() still round-trips correctly through the now-per-variant-
+    // sized buffer for the smallest (MAC) case.
+    var out: [128]u8 = undefined;
+    const key = [_]u8{0x2a} ** 16;
+    const sealer: Sealer = .{ .mac = .{ .algorithm = .hmac_sha256_80, .key = &key } };
+    const frame = try build(&out, .{ .appid = 1, .apdu = "abc" }, sealer);
+    const r = try verify(frame, .ed2020, .{ .mac = .{ .algorithm = .hmac_sha256_80, .key = &key } });
+    try testing.expectEqual(@as(usize, 10), r.tag.len);
 }
 
 test "fuzz: frame parse never panics and stays inside the buffer" {

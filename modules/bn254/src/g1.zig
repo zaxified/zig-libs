@@ -198,8 +198,26 @@ pub const Jacobian = struct {
     /// Scalar multiplication `[s]P`, constant-time double-and-add-always
     /// over `s`'s 32-byte (`Fr.encoded_bytes`) encoding. Same
     /// construction as `bls12_381.g1.Jacobian.scalarMul`.
+    ///
+    /// `s` is commonly a SECRET scalar for any future signer/prover built
+    /// on this module (a private key, a witness scalar, blinding
+    /// randomness) even though today's shipped consumers only ever pass
+    /// public data — so the plaintext big-endian byte serialization this
+    /// function itself produces is wiped before returning (wave-2 audit
+    /// `bn254` F9).
     pub fn scalarMul(p: Jacobian, s: Fr) Jacobian {
-        return scalarMulBytes(p, &s.toBytes());
+        var buf: [Fr.encoded_bytes]u8 = undefined;
+        return scalarMulZeroing(p, s, &buf);
+    }
+
+    /// `scalarMul`'s body, factored out with the scratch buffer as an
+    /// explicit out-parameter so a test can hold onto it after the call
+    /// returns and confirm the wipe actually happened — a caller cannot
+    /// observe a callee's own stack scratch once the call unwinds.
+    fn scalarMulZeroing(p: Jacobian, s: Fr, buf: *[Fr.encoded_bytes]u8) Jacobian {
+        buf.* = s.toBytes();
+        defer std.crypto.secureZero(u8, buf);
+        return scalarMulBytes(p, buf);
     }
 
     /// `[s]P` for an arbitrary-width big-endian scalar byte string — the
@@ -364,6 +382,20 @@ test "G1 scalarMul edge cases: [0]P = O, [1]P = P, [2]P = double(P)" {
     const two = Fr.one.add(Fr.one);
     try expectSamePoint(g.scalarMul(two), g.double());
     try std.testing.expect(Jacobian.identity.scalarMul(two).isIdentity());
+}
+
+test "G1 scalarMul wipes its own secret-scalar byte scratch before returning (F9)" {
+    // Regression for the wave-2 audit's F9: scalarMul's plaintext
+    // big-endian serialization of a (potentially secret) scalar used to be
+    // left on the stack with no secureZero. Using the out-parameter seam
+    // (`scalarMulZeroing`) to hold onto the scratch buffer after the call:
+    // if the wipe did not run, `buf` would still hold `s`'s nonzero bytes.
+    var s_bytes = [_]u8{0xff} ** 32;
+    s_bytes[0] = 0x01; // stay < r (r's top byte is 0x30)
+    const s = try Fr.fromBytes(s_bytes);
+    var buf: [Fr.encoded_bytes]u8 = undefined;
+    _ = Jacobian.scalarMulZeroing(jacGen(), s, &buf);
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0));
 }
 
 test "G1 scalarMul distributes: [a+b]G == [a]G + [b]G and [a*b]G == [a]([b]G)" {

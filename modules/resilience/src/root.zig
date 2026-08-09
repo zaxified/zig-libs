@@ -221,8 +221,10 @@ fn noopSleepNs(_: ?*anyopaque, _: u64) void {}
 ///
 /// Usage contract: ask `allow()` before each call; when it returns true,
 /// report the outcome with **exactly one** of `onSuccess()`/`onFailure()`.
-/// A half-open probe whose outcome is never reported permanently occupies
-/// its probe slot (nothing times probes out) — don't lose results. Results
+/// A half-open probe whose outcome is never reported occupies its probe slot
+/// until `Options.probe_timeout_ms` (default: `cooldown_ms`) elapses, or until
+/// `abandonProbe()` releases it — don't lose results, but losing one no longer
+/// wedges the breaker half-open forever. Results
 /// reported while `open` (from calls admitted before the trip that finished
 /// late) are ignored: they neither extend the cooldown nor count as probes.
 ///
@@ -240,6 +242,9 @@ pub const CircuitBreaker = struct {
     /// Half-open only: probes admitted / succeeded so far.
     probes_admitted: u32 = 0,
     probes_succeeded: u32 = 0,
+    /// Half-open only: instant of the most recent probe admission — the anchor
+    /// for `Options.probe_timeout_ms`.
+    last_admit_ns: u64 = 0,
 
     pub const State = enum { closed, open, half_open };
 
@@ -251,6 +256,20 @@ pub const CircuitBreaker = struct {
         /// Probe calls admitted while `half_open`; all of them must succeed
         /// to close the breaker (one failure re-opens). Must be ≥ 1.
         half_open_probes: u32 = 1,
+        /// How long an admitted half-open probe may go unreported before its
+        /// slot is reclaimed. `null` (the default) means `cooldown_ms` — the
+        /// operator has already said how long they are willing to wait before
+        /// retrying, and a probe that has been outstanding that long is, for
+        /// every practical purpose, lost.
+        ///
+        /// Without this, a single probe whose outcome is never reported pins
+        /// the breaker half-open FOREVER at the default `half_open_probes = 1`:
+        /// it admits nothing further and can never close, because only
+        /// `onSuccess`/`onFailure` released the slot. `run()` cannot cause that
+        /// (it reports exactly one outcome per admitted attempt, even on
+        /// timeout), but a hand-driven `allow()`/`onX()` caller can. Set to `0`
+        /// to disable reclamation and keep the strict "never reclaim" behaviour.
+        probe_timeout_ms: ?u64 = null,
         /// Time source — inject a fake for deterministic tests. The breaker
         /// never reads a wall clock on its own.
         clock: Clock = .monotonic,
@@ -279,14 +298,52 @@ pub const CircuitBreaker = struct {
                 cb.cur_state = .half_open;
                 cb.probes_admitted = 1;
                 cb.probes_succeeded = 0;
+                cb.last_admit_ns = now_ns;
                 return true;
             },
             .half_open => {
+                const now_ns = cb.options.clock.now();
+                cb.reclaimStaleProbes(now_ns);
                 if (cb.probes_admitted >= cb.options.half_open_probes) return false;
                 cb.probes_admitted += 1;
+                cb.last_admit_ns = now_ns;
                 return true;
             },
         }
+    }
+
+    /// Reclaim probe slots whose outcome never arrived (see
+    /// `Options.probe_timeout_ms`). Caller holds the lock.
+    ///
+    /// Coarse ON PURPOSE: it releases the whole outstanding set at once rather
+    /// than timing each probe individually, which would need per-probe storage
+    /// for a breaker whose entire state is five scalars. That is exact at the
+    /// default `half_open_probes = 1` — the configuration the wedge actually
+    /// bites — and conservative above it: the only effect is that MORE probes
+    /// may be admitted. It never closes the breaker and never re-opens it, so
+    /// no failure verdict can be manufactured by a clock reading.
+    fn reclaimStaleProbes(cb: *CircuitBreaker, now_ns: u64) void {
+        const timeout_ms = cb.options.probe_timeout_ms orelse cb.options.cooldown_ms;
+        if (timeout_ms == 0) return; // reclamation disabled
+        if (cb.probes_admitted <= cb.probes_succeeded) return; // nothing outstanding
+        if (now_ns -| cb.last_admit_ns < timeout_ms *| std.time.ns_per_ms) return;
+        cb.probes_admitted = cb.probes_succeeded;
+    }
+
+    /// Release ONE outstanding half-open probe slot, for a caller that knows it
+    /// has lost a probe's outcome and does not want to wait out
+    /// `probe_timeout_ms`. Returns true if a slot was actually released.
+    ///
+    /// Deliberately not `onSuccess`/`onFailure`: abandoning a probe is not a
+    /// verdict about the downstream service, and must not count toward closing
+    /// the breaker or toward re-opening it. No-op outside `half_open`.
+    pub fn abandonProbe(cb: *CircuitBreaker) bool {
+        lockSpin(&cb.lock);
+        defer cb.lock.unlock();
+        if (cb.cur_state != .half_open) return false;
+        if (cb.probes_admitted <= cb.probes_succeeded) return false;
+        cb.probes_admitted -= 1;
+        return true;
     }
 
     /// Report a successful call. Closed: resets the failure streak.
@@ -298,6 +355,11 @@ pub const CircuitBreaker = struct {
         switch (cb.cur_state) {
             .closed => cb.consecutive_failures = 0,
             .half_open => {
+                // Never count more successes than there are outstanding
+                // probes: after a stale slot has been reclaimed the lost probe
+                // may still report, and an unguarded increment would let a
+                // result nobody was waiting for close the breaker.
+                if (cb.probes_succeeded >= cb.probes_admitted) return;
                 cb.probes_succeeded += 1;
                 if (cb.probes_succeeded >= cb.options.half_open_probes) {
                     cb.cur_state = .closed;
@@ -879,6 +941,92 @@ test "CircuitBreaker: half_open admits at most half_open_probes; all must succee
     try testing.expect(!cb.allow()); // still deciding
     cb.onSuccess(); // 2 of 2 — closed
     try testing.expectEqual(.closed, cb.state());
+    try testing.expect(cb.allow());
+}
+
+test "CircuitBreaker: a probe whose outcome is never reported does not wedge the breaker (audit F1)" {
+    var tc: TestClock = .{};
+    var cb: CircuitBreaker = .init(.{ .failure_threshold = 1, .cooldown_ms = 1000, .clock = tc.clock() });
+
+    cb.onFailure();
+    tc.advanceMs(1000);
+    try testing.expect(cb.allow()); // probe admitted…
+    try testing.expectEqual(.half_open, cb.state());
+    // …and its outcome is LOST — no onSuccess, no onFailure. At the default
+    // half_open_probes = 1 this used to pin the breaker half-open forever:
+    // never admitting, never closing.
+    tc.advanceMs(999);
+    try testing.expect(!cb.allow()); // slot still legitimately held
+
+    tc.advanceMs(1); // probe_timeout_ms defaults to cooldown_ms = 1000
+    try testing.expect(cb.allow()); // slot reclaimed, a new probe gets in
+    try testing.expectEqual(.half_open, cb.state()); // …and only that: no verdict invented
+
+    // The reclaimed run still behaves normally.
+    cb.onSuccess();
+    try testing.expectEqual(.closed, cb.state());
+}
+
+test "CircuitBreaker: a lost probe's late success cannot close the breaker after reclamation" {
+    var tc: TestClock = .{};
+    var cb: CircuitBreaker = .init(.{
+        .failure_threshold = 1,
+        .cooldown_ms = 1000,
+        .half_open_probes = 2,
+        .clock = tc.clock(),
+    });
+
+    cb.onFailure();
+    tc.advanceMs(1000);
+    try testing.expect(cb.allow()); // probe 1 — outcome will be lost
+    try testing.expect(cb.allow()); // probe 2 — outcome will be lost
+    try testing.expect(!cb.allow());
+
+    tc.advanceMs(1000); // both go stale
+    try testing.expect(cb.allow()); // reclaimed: one fresh probe
+    cb.onSuccess(); // 1 of 2
+    try testing.expectEqual(.half_open, cb.state());
+
+    // Now the two LOST probes finally report success. They must not be counted
+    // — nobody was waiting for them — so the breaker stays half-open.
+    cb.onSuccess();
+    cb.onSuccess();
+    try testing.expectEqual(.half_open, cb.state());
+}
+
+test "CircuitBreaker: abandonProbe releases a slot without pronouncing a verdict" {
+    var tc: TestClock = .{};
+    var cb: CircuitBreaker = .init(.{ .failure_threshold = 1, .cooldown_ms = 1000, .clock = tc.clock() });
+
+    try testing.expect(!cb.abandonProbe()); // closed: nothing to abandon
+    cb.onFailure();
+    try testing.expect(!cb.abandonProbe()); // open: nothing to abandon
+
+    tc.advanceMs(1000);
+    try testing.expect(cb.allow());
+    try testing.expect(!cb.allow()); // budget spent
+    try testing.expect(cb.abandonProbe()); // caller admits it lost the result
+    try testing.expect(!cb.abandonProbe()); // …and only the one slot existed
+    try testing.expectEqual(.half_open, cb.state()); // NOT a success, NOT a failure
+    try testing.expect(cb.allow()); // the freed slot is usable immediately
+    cb.onSuccess();
+    try testing.expectEqual(.closed, cb.state());
+}
+
+test "CircuitBreaker: probe_timeout_ms = 0 keeps the strict never-reclaim behaviour" {
+    var tc: TestClock = .{};
+    var cb: CircuitBreaker = .init(.{
+        .failure_threshold = 1,
+        .cooldown_ms = 1000,
+        .probe_timeout_ms = 0,
+        .clock = tc.clock(),
+    });
+    cb.onFailure();
+    tc.advanceMs(1000);
+    try testing.expect(cb.allow());
+    tc.advanceMs(1_000_000); // an eternity
+    try testing.expect(!cb.allow()); // opted out: the slot is held forever
+    try testing.expect(cb.abandonProbe()); // the explicit escape hatch still works
     try testing.expect(cb.allow());
 }
 

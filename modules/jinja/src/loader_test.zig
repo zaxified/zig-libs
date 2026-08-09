@@ -136,15 +136,15 @@ test "DirLoader does not traverse a symlink, file or directory component" {
 
     // Both names are lexically innocent and live inside the root; only
     // refusing to follow the link keeps the secret in.
+    //
+    // F13 (wave-2 audit): a symlink escape must come back as
+    // `error.LoaderFailed`, not `null`. The old code let `error.SymLinkLoop`
+    // fall through to `return null`, so this loop used to accept *either*
+    // outcome and never actually distinguished "refused" from "absent" — see
+    // the lexical-escape test above, which does pin `LoaderFailed`. Pinning
+    // it here the same way is the regression test for that gap.
     for ([_][]const u8{ "leak.j2", "up/SECRET" }) |name| {
-        const got = l.load(l.ctx, a, name) catch |e| {
-            try testing.expect(e == error.LoaderFailed);
-            continue;
-        };
-        if (got) |bytes| {
-            std.debug.print("\nDirLoader followed a symlink out of the root via '{s}': '{s}'\n", .{ name, bytes });
-            return error.ContainmentBreached;
-        }
+        try testing.expectError(error.LoaderFailed, l.load(l.ctx, a, name));
     }
 }
 

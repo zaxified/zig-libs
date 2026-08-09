@@ -1334,6 +1334,105 @@ test "SELF: default FDB memory footprint is documented in bytes, not just entry 
     try testing.expect(worst_case_bytes >= 500 * 1024 * 1024); // ~500 MiB floor, matches SPEC.md
 }
 
+// ── fuzz: a random op stream over the whole public API (F6) ────────────────
+//
+// Wave-2 audit F6: `l2forward` has no `pub fn` taking `[]const u8`/`Reader`
+// (build.zig's `checkFuzz` correctly does not obligate it — it is an FSM over
+// already-typed `Isid`/`Mac`/`PeId`/`Time` values, not a wire decoder), so it
+// is invisible to `scripts/fuzz-sweep.sh`'s target list. But those typed
+// values are still attacker-influenced (a received frame's I-SID/MAC and the
+// PE that claims to have sent it), and this is the module with the most
+// interesting *state* — the cap/prune/quarantine/split-horizon interaction is
+// exactly where a stateful fuzz harness earns its keep even without a byte
+// decoder to drive. This harness synthesizes a random sequence of every
+// mutating/reading operation from fuzzer bytes and checks, after every step,
+// the three invariants a caller actually depends on: the caps never break,
+// `deinit` never leaks (via `testing.allocator`), and a core-ingress frame
+// never gets relayed back into the fabric (F1's whole point).
+const FuzzOp = enum {
+    learn,
+    learn_static,
+    forget,
+    add_member,
+    remove_member,
+    add_isid,
+    remove_isid,
+    tick,
+    forward_access,
+    forward_core,
+};
+
+test "fuzz: a random op stream never breaks a cap, never leaks, and a core frame never relays" {
+    try std.testing.fuzz({}, fuzzOps, .{});
+}
+
+fn fuzzOps(_: void, smith: *std.testing.Smith) !void {
+    const gpa = testing.allocator;
+    // Small caps and a small pool of IDs so a bounded op stream actually
+    // presses on `TooManyIsids`/`TooManyMembers`/`FdbFull`/quarantine, not
+    // just the happy path.
+    const opts: Options = .{
+        .max_isids = 3,
+        .max_pes_per_isid = 3,
+        .max_macs_per_isid = 3,
+        .aging_ticks = 20,
+        .max_mac_moves = 3,
+        .mac_move_window = 20,
+    };
+    var t = Table.init(gpa, opts);
+    defer t.deinit();
+
+    const isid_pool = [_]Isid{ 1, 2, 3, 4 }; // one more than max_isids
+    const pe_pool = [_]PeId{ 10, 11, 12, 13, 14 };
+    const mac_pool = [_]Mac{
+        .{ 1, 1, 1, 1, 1, 1 },
+        .{ 2, 2, 2, 2, 2, 2 },
+        .{ 3, 3, 3, 3, 3, 3 },
+        .{ 4, 4, 4, 4, 4, 4 },
+        .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, // broadcast — a BUM address
+    };
+    var out: [opts.max_pes_per_isid]PeId = undefined;
+    var now: Time = 0;
+
+    const n_ops = smith.valueRangeAtMost(u16, 0, 300);
+    var i: u16 = 0;
+    while (i < n_ops) : (i += 1) {
+        const isid = isid_pool[smith.index(isid_pool.len)];
+        const pe = pe_pool[smith.index(pe_pool.len)];
+        const mac = mac_pool[smith.index(mac_pool.len)];
+        now += smith.valueRangeAtMost(Time, 0, 10);
+
+        switch (smith.value(FuzzOp)) {
+            .learn => _ = t.learn(isid, mac, pe, now) catch {},
+            .learn_static => t.learnStatic(isid, mac, pe, now) catch {},
+            .forget => _ = t.forget(isid, mac),
+            .add_member => t.addMember(isid, pe) catch {},
+            .remove_member => t.removeMember(isid, pe),
+            .add_isid => t.addIsid(isid) catch {},
+            .remove_isid => _ = t.removeIsid(isid),
+            .tick => t.tick(now),
+            .forward_access => _ = t.forward(isid, mac, .access, now, &out) catch {},
+            .forward_core => {
+                // The invariant: a frame that arrived from the core is NEVER
+                // relayed back into the fabric, on ANY table state this
+                // random walk can reach — not just the hand-written scenarios
+                // in the tests above. `local_only` carries an empty forward
+                // set by construction (the module's fabric side is empty),
+                // so this also structurally cannot contain `pe`.
+                const decision = t.forward(isid, mac, .{ .core = pe }, now, &out) catch continue;
+                if (decision != .local_only) return error.CoreIngressWasRelayed;
+            },
+        }
+
+        // Caps hold after every mutating op, on every I-SID this run touched.
+        if (t.isidCount() > opts.max_isids) return error.TooManyIsidsAdmitted;
+        for (isid_pool) |check_isid| {
+            if (t.memberCount(check_isid) > opts.max_pes_per_isid) return error.TooManyMembersAdmitted;
+            if (t.fdbCount(check_isid) > opts.max_macs_per_isid) return error.FdbOverCap;
+        }
+    }
+}
+
 test "external anchor: our MAC-move defaults are RFC 7432 §15.1's stated N and M" {
     // Not a style assertion. Every duplicate-MAC test below configures its own
     // small N so it can trip the limit in a few calls, which leaves the shipped

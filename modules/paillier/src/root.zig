@@ -1209,6 +1209,22 @@ pub fn decrypt(sk: SecretKey, c: Ciphertext) DecryptError!Fe {
     // remainder means c was not a valid ciphertext under this key. The
     // arena is amply sized for the handful of fixed-capacity big ints
     // below, so allocation failures are impossible (`catch unreachable`).
+    //
+    // `divFloor` is variable-time in `x` (`paillier` F3 / `threshold_ecdsa`
+    // F5, wave-2 audit): this is a real, accepted timing leak on the
+    // decrypted plaintext `m = L(x)*mu mod n`, not on the secret key
+    // (`lambda`/`mu`/the CRT factors never reach this division). It is
+    // accepted rather than made constant-time because `threshold_ecdsa`'s
+    // MtA — this repo's one consumer that decrypts a value it did not
+    // choose itself — never decrypts a bare secret: Bob's MtA ciphertext
+    // carries `a*b + beta'`, and `beta'` is drawn uniformly fresh per MtA
+    // instance (`samplePaillierRandomness`) *before* Alice's secret `a`
+    // (the nonce-share timing this leak would otherwise threaten) is
+    // combined into it. A uniform mask makes the masked sum
+    // information-theoretically independent of `a`, so whatever this
+    // division's timing reveals about `x`/`m` reveals nothing about the
+    // masked-out secret. Revisit if a future consumer ever decrypts an
+    // unmasked secret directly.
     var scratch: [scratch_bytes]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const gpa = fba.allocator();

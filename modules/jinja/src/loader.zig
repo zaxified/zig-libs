@@ -170,7 +170,18 @@ pub const DirLoader = struct {
             const child = dir.openDir(self.io, pending, .{
                 .follow_symlinks = self.options.allow_symlinks,
             }) catch |e| switch (e) {
-                error.FileNotFound, error.NotDir, error.AccessDenied, error.SymLinkLoop => return null,
+                error.FileNotFound, error.AccessDenied => return null,
+                // A symlink escape attempt is a signal, not a missing file
+                // (D17). `error.SymLinkLoop` (`ELOOP`) is the textbook errno
+                // for "refused to follow a symlink" — but for a *directory*
+                // component opened with `O_DIRECTORY | O_NOFOLLOW`, Linux
+                // reports the refused symlink as `ENOTDIR`
+                // (`error.NotDir`) instead, because the kernel resolves
+                // O_DIRECTORY's "is this a directory" check against the
+                // unfollowed symlink itself. Both therefore fall through to
+                // `LoaderFailed` here rather than reading as "absent" and
+                // letting `ignore missing` swallow them (wave-2 audit
+                // `jinja` F13).
                 else => return error.LoaderFailed,
             };
             if (opened) dir.close(self.io);
@@ -185,7 +196,9 @@ pub const DirLoader = struct {
             .follow_symlinks = self.options.allow_symlinks,
             .resolve_beneath = true,
         }) catch |e| switch (e) {
-            error.FileNotFound, error.IsDir, error.AccessDenied, error.SymLinkLoop, error.NotDir => return null,
+            error.FileNotFound, error.IsDir, error.AccessDenied, error.NotDir => return null,
+            // See the matching comment above: a symlink escape reads as a
+            // refusal (`LoaderFailed`), not as "file absent".
             else => return error.LoaderFailed,
         };
         defer file.close(self.io);

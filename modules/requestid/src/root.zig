@@ -109,13 +109,23 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 }
 
 /// An incoming ID is adopted only when it is non-empty, within
-/// `max_adopt_len`, and every byte is a printable, non-space ASCII character
-/// (no controls — which would also be rejected by `setHeader` — and no spaces,
-/// keeping the echoed token a single word). Otherwise a fresh ID is generated.
+/// `max_adopt_len`, and every byte is a token-safe character:
+/// `[A-Za-z0-9._-]`, the same charset nginx's own `$request_id` (hex) and
+/// most upstream correlation-id conventions produce. This is narrower than
+/// "printable ASCII, no space": the wider set still let a crafted
+/// `X-Request-Id` carry `"`, `\`, `,`, `{`, `}` and other structured-log
+/// metacharacters straight through to `current()` — no header/log-*line*
+/// injection (CR/LF/NUL were always rejected), but a caller that reflects
+/// `current()` into an unescaped JSON/logfmt sink could still get a malformed
+/// record from an adopted ID (wave-2 audit `requestid` F1). Otherwise a fresh
+/// ID is generated.
 fn isAdoptable(v: []const u8) bool {
     if (v.len == 0 or v.len > max_adopt_len) return false;
     for (v) |c| {
-        if (c <= ' ' or c >= 0x7f) return false;
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        }
     }
     return true;
 }
@@ -246,11 +256,26 @@ test "adopts a valid incoming ID" {
     try testing.expectEqualStrings("edge-abc-123", bodyOf(got));
 }
 
-test "isAdoptable: DEL (0x7f) and high-bit bytes are rejected, 0x7e is fine" {
+test "isAdoptable: DEL (0x7f) and high-bit bytes are rejected" {
     try testing.expect(!isAdoptable("abc\x7fdef"));
     try testing.expect(!isAdoptable("abc\xffdef"));
-    try testing.expect(isAdoptable("abc\x7edef")); // '~', the last printable ASCII byte
     try testing.expect(!isAdoptable("")); // empty is never adoptable
+}
+
+test "isAdoptable: only the token-safe charset is adopted (F1 regression)" {
+    // Regression for the wave-2 audit's F1: the old guard was "printable
+    // ASCII, no space", which let `"`, `\`, `,`, `{`, `}` and other
+    // structured-log metacharacters through an incoming X-Request-Id and out
+    // through `current()` unescaped. The charset is now `[A-Za-z0-9._-]`,
+    // matching nginx's own $request_id output.
+    try testing.expect(isAdoptable("edge-abc_123.456")); // hyphen/underscore/dot: fine
+    try testing.expect(isAdoptable("0123456789abcdef0123456789abcdef")); // hex, nginx's shape
+    try testing.expect(!isAdoptable("abc\x7edef")); // '~' is printable ASCII but not token-safe
+    try testing.expect(!isAdoptable("id,injected"));
+    try testing.expect(!isAdoptable("id\"injected\""));
+    try testing.expect(!isAdoptable("id\\injected"));
+    try testing.expect(!isAdoptable("id{injected}"));
+    try testing.expect(!isAdoptable("id injected")); // space, already rejected before the fix
 }
 
 test "adopt length boundary: exactly max_adopt_len is adopted, one over is regenerated" {

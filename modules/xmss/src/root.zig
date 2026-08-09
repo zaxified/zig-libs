@@ -70,7 +70,10 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation
-    .concurrency = .reentrant, // no globals; SecretKey mutation is caller-owned
+    // No globals. Bare `SecretKey` mutation is caller-owned and NOT safe to
+    // share across threads (`sign` reads then writes `idx`); `SigningKey` is
+    // the hardened handle that IS safe to share — see its doc comment.
+    .concurrency = .reentrant,
     .model_after = "RFC 8391 (XMSS); XMSS/xmss-reference as KAT oracle",
     .deps = .{}, // std only (SHA-256)
 };
@@ -409,6 +412,116 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             pub_seed: [n]u8,
             /// BDS auth-path traversal state; kept in lockstep with `idx`.
             bds: BdsState,
+
+            /// Wipe the two secret seeds. `SecretKey` is a value type with no
+            /// `deinit`, so this is opt-in: call it on every copy you made
+            /// once the key is retired. `root`/`pub_seed`/`idx` are public
+            /// values and are deliberately left alone — a zeroed `idx` would
+            /// look like a fresh key, which is the opposite of safe here.
+            pub fn zeroize(sk: *SecretKey) void {
+                std.crypto.secureZero(u8, &sk.sk_seed);
+                std.crypto.secureZero(u8, &sk.sk_prf);
+            }
+        };
+
+        /// A hardened handle around a `SecretKey`, for the two hazards a
+        /// value-type stateful key cannot defend against on its own (audit
+        /// F1). Entirely opt-in: `SecretKey` + `sign` keep working exactly as
+        /// before for callers that own the state discipline themselves.
+        ///
+        /// It defends three things, none of which the bare API can:
+        ///
+        ///  1. **Concurrent `sign` on one key.** Bare `sign` reads `sk.idx`
+        ///     and writes it back with no interlock, so two threads sharing
+        ///     one `*SecretKey` can both observe the same index — the same
+        ///     WOTS+ one-time key signs two messages, which is a *key
+        ///     recovery* break, not a mere reuse. Here the whole
+        ///     read-persist-sign-advance sequence runs under a lock, so leaf
+        ///     indices are handed out exactly once.
+        ///  2. **Struct copy.** A `SigningKey` records the address it was
+        ///     initialized at; a copy (or a move) lands at a different
+        ///     address and `sign` returns `error.KeyHandleCopied` instead of
+        ///     quietly forking the counter into two keys that both think they
+        ///     are at leaf `k`. This is the whole reason `init` writes through
+        ///     a `*SigningKey` rather than returning one by value.
+        ///  3. **Crash between signing and persisting.** The optional
+        ///     `persist` hook is invoked with the NEXT index *before* any
+        ///     signature bytes are produced, and a failure aborts the sign
+        ///     with the leaf UNCONSUMED. So the durable index is never behind
+        ///     the emitted signatures — the direction that would allow reuse
+        ///     after a restart. (NIST SP 800-208 §7 makes exactly this the
+        ///     deployer's obligation; this hook is where it attaches.)
+        ///
+        /// What it deliberately does NOT do: prevent you from also holding a
+        /// `*SecretKey` into `handle.sk` and signing with it directly, or from
+        /// restoring an old serialized key. Rollback across process lifetimes
+        /// is a storage property, not an API one.
+        pub const SigningKey = struct {
+            sk: SecretKey,
+            /// The address `init` was called on. `sign` refuses to run
+            /// anywhere else — see hazard 2 above.
+            home: *const SigningKey,
+            /// Test-and-set guard over the whole sign sequence. A tiny local
+            /// spin lock rather than `std.Thread.Mutex` so this module keeps
+            /// `meta.platform = .any` and `deps = .{}` (std hashing only): the
+            /// critical section is one XMSS signature, and the contended case
+            /// is a caller doing something they were told not to.
+            busy: std.atomic.Value(bool),
+            persist: ?Persist,
+
+            /// Durable-index hook. `write` is called with the index that must
+            /// already be on stable storage before the signature at index
+            /// `next_idx - 1` is released.
+            pub const Persist = struct {
+                ctx: *anyopaque,
+                write: *const fn (ctx: *anyopaque, next_idx: u32) anyerror!void,
+            };
+
+            pub const Error = error{
+                /// All 2^h one-time keys are spent.
+                KeyExhausted,
+                /// This handle is not at the address it was initialized at —
+                /// it was copied or moved. Re-`init` it at its new home if the
+                /// move was intended, having made sure the OLD handle is dead.
+                KeyHandleCopied,
+                /// The `persist` hook failed. No leaf was consumed.
+                PersistFailed,
+            };
+
+            /// Initialize `dst` in place, taking ownership of `sk`'s state.
+            /// `dst` must already be at its final address.
+            pub fn init(dst: *SigningKey, sk: SecretKey, persist: ?Persist) void {
+                dst.* = .{ .sk = sk, .home = dst, .busy = .init(false), .persist = persist };
+            }
+
+            /// Next unused leaf. Racy to read while another thread signs —
+            /// it is a progress indicator, not a claim.
+            pub fn index(self: *const SigningKey) u32 {
+                return self.sk.idx;
+            }
+
+            /// Wipe the underlying secret seeds (see `SecretKey.zeroize`).
+            pub fn zeroize(self: *SigningKey) void {
+                self.sk.zeroize();
+            }
+
+            pub fn sign(self: *SigningKey, out: *[signature_length]u8, msg: []const u8) Error!void {
+                if (self.home != self) return error.KeyHandleCopied;
+                while (self.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+                    std.atomic.spinLoopHint();
+                }
+                defer self.busy.store(false, .release);
+
+                // Check exhaustion BEFORE persisting: a rejected sign must not
+                // move the durable index either.
+                if (self.sk.idx >= max_signatures) return error.KeyExhausted;
+                if (self.persist) |p| {
+                    p.write(p.ctx, self.sk.idx + 1) catch return error.PersistFailed;
+                }
+                Self.sign(&self.sk, out, msg) catch |e| switch (e) {
+                    error.KeyExhausted => unreachable, // checked above, under the lock
+                };
+            }
         };
 
         pub const PublicKey = struct {
@@ -898,6 +1011,141 @@ test "stateful discipline: sign advances idx, never repeats, fails closed when e
     try std.testing.expectEqual(@as(u32, X.max_signatures), kp.sk.idx);
     try std.testing.expectError(error.KeyExhausted, X.sign(&kp.sk, &sig, "message"));
     try std.testing.expectEqual(@as(u32, X.max_signatures), kp.sk.idx);
+}
+
+// ── the hardened handle (audit F1) ──────────────────────────────────────────
+
+const TestX = XmssSha2(4, 0xDDDDDDDD); // 16 one-time keys — full lifecycle in ms
+
+fn testKeyPair() TestX.KeyPair {
+    var sk_seed: [n]u8 = undefined;
+    var sk_prf: [n]u8 = undefined;
+    var pub_seed: [n]u8 = undefined;
+    for (&sk_seed, 0..) |*b, i| b.* = @truncate(i + 3);
+    for (&sk_prf, 0..) |*b, i| b.* = @truncate(i + 103);
+    for (&pub_seed, 0..) |*b, i| b.* = @truncate(i + 203);
+    return TestX.keyGen(sk_seed, sk_prf, pub_seed);
+}
+
+test "SigningKey: a COPIED handle refuses to sign instead of forking the counter" {
+    const kp = testKeyPair();
+    var handle: TestX.SigningKey = undefined;
+    TestX.SigningKey.init(&handle, kp.sk, null);
+
+    var sig: [TestX.signature_length]u8 = undefined;
+    try handle.sign(&sig, "one");
+    try std.testing.expectEqual(@as(u32, 1), handle.index());
+
+    // THE HAZARD: a plain struct copy of a stateful key. Both copies believe
+    // they are at leaf 1, so both would sign with the same one-time key — a
+    // key-recovery break, not a duplicate signature. The bare `SecretKey` API
+    // cannot see this; the handle can.
+    var forked = handle;
+    try std.testing.expectEqual(@as(u32, 1), forked.sk.idx); // the fork is real…
+    try std.testing.expectError(error.KeyHandleCopied, forked.sign(&sig, "two"));
+    try std.testing.expectEqual(@as(u32, 1), forked.sk.idx); // …and it consumed nothing
+
+    // The original is unaffected and keeps signing.
+    try handle.sign(&sig, "two");
+    try std.testing.expectEqual(@as(u32, 2), handle.index());
+    try std.testing.expect(TestX.verify(kp.pk, "two", &sig));
+}
+
+const PersistLog = struct {
+    last: u32 = 0,
+    calls: usize = 0,
+    fail: bool = false,
+
+    fn write(ctx: *anyopaque, next_idx: u32) anyerror!void {
+        const self: *PersistLog = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.fail) return error.DiskFull;
+        self.last = next_idx;
+    }
+
+    fn hook(self: *PersistLog) TestX.SigningKey.Persist {
+        return .{ .ctx = self, .write = write };
+    }
+};
+
+test "SigningKey: the durable index is written BEFORE the signature, and a failed write burns no leaf" {
+    const kp = testKeyPair();
+    var log: PersistLog = .{};
+    var handle: TestX.SigningKey = undefined;
+    TestX.SigningKey.init(&handle, kp.sk, log.hook());
+
+    var sig: [TestX.signature_length]u8 = undefined;
+    try handle.sign(&sig, "a");
+    // The hook saw the index AFTER this signature — never behind it, which is
+    // the direction that would permit reuse after a crash+restart.
+    try std.testing.expectEqual(@as(usize, 1), log.calls);
+    try std.testing.expectEqual(@as(u32, 1), log.last);
+    try std.testing.expectEqual(@as(u32, 1), handle.index());
+
+    // A failing persist aborts the sign with the leaf UNCONSUMED …
+    log.fail = true;
+    try std.testing.expectError(error.PersistFailed, handle.sign(&sig, "b"));
+    try std.testing.expectEqual(@as(u32, 1), handle.index());
+    try std.testing.expectEqual(@as(u32, 1), log.last);
+
+    // … and once storage recovers, leaf 1 is still available.
+    log.fail = false;
+    try handle.sign(&sig, "b");
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, sig[0..4], .big));
+    try std.testing.expectEqual(@as(u32, 2), log.last);
+
+    // Exhaustion must not move the durable index either.
+    while (handle.index() < TestX.max_signatures) try handle.sign(&sig, "x");
+    const at_end = log.last;
+    try std.testing.expectError(error.KeyExhausted, handle.sign(&sig, "over"));
+    try std.testing.expectEqual(at_end, log.last);
+}
+
+test "SigningKey: concurrent signing on one shared handle never repeats a leaf" {
+    const kp = testKeyPair();
+    var handle: TestX.SigningKey = undefined;
+    TestX.SigningKey.init(&handle, kp.sk, null);
+
+    const Worker = struct {
+        hk: *TestX.SigningKey,
+        seen: *[TestX.max_signatures]std.atomic.Value(u32),
+        fn run(self: @This()) void {
+            var sig: [TestX.signature_length]u8 = undefined;
+            while (true) {
+                self.hk.sign(&sig, "concurrent") catch return; // KeyExhausted ends it
+                const idx = std.mem.readInt(u32, sig[0..4], .big);
+                _ = self.seen[idx].fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var seen: [TestX.max_signatures]std.atomic.Value(u32) = undefined;
+    for (&seen) |*s| s.* = .init(0);
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .hk = &handle, .seen = &seen }});
+    for (&threads) |*t| t.join();
+
+    // Every one-time key was used EXACTLY once. Without the interlock two
+    // threads read the same `sk.idx` and one leaf signs two messages.
+    for (&seen, 0..) |*s, i| {
+        std.testing.expectEqual(@as(u32, 1), s.load(.monotonic)) catch |e| {
+            std.debug.print("leaf {d} used {d} times\n", .{ i, s.load(.monotonic) });
+            return e;
+        };
+    }
+    try std.testing.expectEqual(@as(u32, TestX.max_signatures), handle.index());
+}
+
+test "SecretKey.zeroize wipes the seeds and leaves the public state alone" {
+    var kp = testKeyPair();
+    const root_before = kp.sk.root;
+    kp.sk.idx = 7;
+    kp.sk.zeroize();
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** n, &kp.sk.sk_seed);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** n, &kp.sk.sk_prf);
+    try std.testing.expectEqualSlices(u8, &root_before, &kp.sk.root);
+    try std.testing.expectEqual(@as(u32, 7), kp.sk.idx); // a zeroed idx would look fresh
 }
 
 test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {

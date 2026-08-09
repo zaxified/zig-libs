@@ -139,7 +139,8 @@ pub const FragmentError = error{
     /// `frame.len` exceeds `max_frame_len`.
     FrameTooLarge,
     /// `carrier_mtu` leaves no room for even one payload byte after
-    /// `header_overhead` + this codec's own `header_len`.
+    /// `header_overhead` + this codec's own `header_len` — including the
+    /// degenerate case where that sum does not fit in a `usize` at all.
     MtuTooSmall,
     /// The frame would split into more than `max_fragments_per_frame`
     /// pieces at this MTU.
@@ -170,7 +171,17 @@ pub fn fragment(
 ) FragmentError![]Fragment {
     if (frame.len > max_frame_len) return error.FrameTooLarge;
 
-    const overhead = header_overhead + header_len;
+    // Checked BEFORE the add, not after. `header_overhead` is caller-supplied
+    // local config (the outer framing's own header size), never wire data, so
+    // this is not an attacker-reachable path — but a plain `header_overhead +
+    // header_len` panics on integer overflow in Debug/ReleaseSafe (and is UB
+    // in ReleaseFast) for a pathological value near `usize` max, which is the
+    // one place in this module where a config-shaped input was not validated
+    // before use. Every other one is (`frame.len` above, `ReassemblerConfig`'s
+    // fields by assert). An overflowing `header_overhead` can only ever have
+    // meant "no room left", which is exactly `MtuTooSmall`. (Audit F1.)
+    const overhead = std.math.add(usize, header_overhead, header_len) catch
+        return error.MtuTooSmall;
     if (overhead >= carrier_mtu) return error.MtuTooSmall;
     const payload_cap = carrier_mtu - overhead;
 
@@ -544,6 +555,27 @@ test "reordered delivery still reassembles correctly" {
 test "fragment: MTU too small for header overhead is rejected" {
     try testing.expectError(error.MtuTooSmall, fragment(testing.allocator, "x", 0, header_len, 0));
     try testing.expectError(error.MtuTooSmall, fragment(testing.allocator, "x", 0, header_len - 1, 0));
+}
+
+test "fragment: a header_overhead that overflows usize is a typed error, not a panic" {
+    // Audit F1. `header_overhead + header_len` used to be a plain checked add
+    // evaluated BEFORE any bound on `header_overhead`, so these calls aborted
+    // with "integer overflow" in Debug/ReleaseSafe instead of returning an
+    // error the caller can handle (and were UB in ReleaseFast).
+    const max = std.math.maxInt(usize);
+    try testing.expectError(error.MtuTooSmall, fragment(testing.allocator, "x", 0, 1500, max));
+    // The exact boundary: the largest overhead that still fits, and the
+    // smallest that does not. `max - header_len` sums to exactly `max`, which
+    // is representable — so it must be rejected for the ORDINARY reason (it is
+    // >= any carrier_mtu), and one more must be rejected for the new one.
+    try testing.expectError(error.MtuTooSmall, fragment(testing.allocator, "x", 0, 1500, max - header_len));
+    try testing.expectError(error.MtuTooSmall, fragment(testing.allocator, "x", 0, 1500, max - header_len + 1));
+
+    // Not over-tight: a large-but-sane overhead that still leaves payload room
+    // continues to work, so the guard did not turn into a blanket refusal.
+    const frags = try fragment(testing.allocator, "hello", 0, 4096, 1024);
+    defer freeFragments(testing.allocator, frags);
+    try testing.expectEqual(@as(usize, 1), frags.len);
 }
 
 test "fragment: frame larger than max_frame_len is rejected" {

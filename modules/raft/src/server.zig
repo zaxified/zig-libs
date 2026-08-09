@@ -56,6 +56,52 @@ pub const RaftConfig = struct {
     /// How often a leader emits heartbeats. Must be well under
     /// `election_timeout` so a live leader keeps followers from timing out.
     heartbeat_period: Time = 30,
+    /// Propose one DISTINCT client command per heartbeat while leader.
+    ///
+    /// This is what gives the live State-Machine-Safety and Log-Matching
+    /// checkers teeth. With it off, every replicated entry is the leader's own
+    /// `command = 0` no-op, so `SafetyChecker.recordApply` — which keys on the
+    /// command VALUE — compares zero against zero at every index and can never
+    /// observe a divergent apply: the deepest invariant certifies instead of
+    /// checking. See `commandFor` and the `bug:` positive controls.
+    propose_client_commands: bool = true,
+};
+
+/// The command payload for the entry a leader creates at `index` while serving
+/// `term`: the pair packed into the sim's `u64` command word.
+///
+/// Distinctness is the whole point. Two servers may legally hold DIFFERENT
+/// entries at the same index (an uncommitted tail from a deposed leader), and
+/// State Machine Safety is the claim that they never *apply* different ones
+/// there. That claim is only observable if entries created by different terms
+/// at the same index carry different commands — Election Safety already gives
+/// at most one leader per term, so `(term, index)` uniquely names an entry's
+/// creator, and equal commands at an index now mean "the same entry" rather
+/// than "both were zero".
+pub fn commandFor(term: Term, index: LogIndex) Command {
+    return (@as(Command, @truncate(term)) << 32) | @as(Command, @truncate(index));
+}
+
+/// A deliberately-wrong Raft rule, injectable into the REAL `RaftServer` so the
+/// live model-check can be shown to catch it. Distinct from `BrokenRaft`, which
+/// is a separate protocol that never calls `safety.zig` at all: these mutate
+/// one clause of the real algorithm, which is the shape a regression actually
+/// takes. Both were injected by hand during the audit, and both PASSED the
+/// 300-seed sweep back when every entry was a `command = 0` no-op — they are
+/// the exact reason `propose_client_commands` exists.
+pub const InjectedBug = enum {
+    /// The real algorithm.
+    none,
+    /// §5.3 conflict rule replaced by the naive "truncate everything after
+    /// prevLogIndex, then append the whole batch" — a delayed or duplicated
+    /// AppendEntries rolls back entries the follower already accepted (and may
+    /// already have applied) from a later RPC.
+    naive_truncation,
+    /// §5.4.1 election restriction with the TERM-first clause dropped: a
+    /// candidate is up-to-date iff its log is at least as LONG. A partitioned
+    /// ex-leader with a long stale-term tail can then win and overwrite
+    /// committed entries.
+    index_only_up_to_date,
 };
 
 pub fn scenario(sim: *Sim) anyerror!void {
@@ -175,6 +221,11 @@ pub const RaftServer = struct {
     /// bearing rather than decorative.
     malformed_dropped: u64 = 0,
 
+    /// Deliberate defect to run instead of the real rule. `.none` in every
+    /// production path; the positive-control tests set it and REQUIRE the live
+    /// checker to trip. See `InjectedBug`.
+    bug: InjectedBug = .none,
+
     pub fn init(gpa: Allocator, node_count: usize, cfg: RaftConfig) Allocator.Error!RaftServer {
         const nodes = try gpa.alloc(NodeState, node_count);
         var made: usize = 0;
@@ -239,6 +290,7 @@ pub const RaftServer = struct {
         const self = cast(ctx);
         if (timer_id == HEARTBEAT_TIMER) {
             if (self.nodes[node].role == .leader) {
+                if (self.cfg.propose_client_commands) try self.proposeClientCommand(node);
                 try self.broadcastAppendEntries(sim, node);
                 try sim.setTimer(node, self.cfg.heartbeat_period, HEARTBEAT_TIMER);
             }
@@ -277,8 +329,17 @@ pub const RaftServer = struct {
         // Election Safety witness: assert exactly one leader per term.
         try self.checker.recordLeader(self.gpa, ns.current_term, node);
         // A fresh leader appends a no-op in its own term so prior-term entries
-        // can commit indirectly (the Figure-8 mechanism, §5.4.2).
-        try ns.log.append(self.gpa, .{ .term = ns.current_term, .kind = .noop, .command = 0 });
+        // can commit indirectly (the Figure-8 mechanism, §5.4.2). It carries a
+        // `(term, index)` command like every other entry: a real no-op has no
+        // payload, but two DIFFERENT no-ops (different terms, same index) that
+        // both encode `command = 0` are invisible to the apply-keyed State
+        // Machine Safety check — see `commandFor`.
+        const noop_index = ns.log.lastIndex() + 1;
+        try ns.log.append(self.gpa, .{
+            .term = ns.current_term,
+            .kind = .noop,
+            .command = commandFor(ns.current_term, noop_index),
+        });
         const last = ns.log.lastIndex();
         for (ns.next_index, ns.match_index) |*ni, *mi| {
             ni.* = last + 1;
@@ -301,6 +362,22 @@ pub const RaftServer = struct {
     }
 
     // ── replication ────────────────────────────────────────────────────────────
+
+    /// Append one distinct client command to the leader's own log. Stands in
+    /// for a client request arriving at the leader; the sim has no clients, so
+    /// the heartbeat tick drives it.
+    fn proposeClientCommand(self: *RaftServer, node: NodeId) anyerror!void {
+        const ns = &self.nodes[node];
+        const idx = ns.log.lastIndex() + 1;
+        try ns.log.append(self.gpa, .{
+            .term = ns.current_term,
+            .kind = .command,
+            .command = commandFor(ns.current_term, idx),
+        });
+        // The leader replicates to itself synchronously (Figure 2: a leader
+        // counts its own log toward the majority).
+        ns.match_index[node] = ns.log.lastIndex();
+    }
 
     fn broadcastAppendEntries(self: *RaftServer, sim: *Sim, node: NodeId) anyerror!void {
         const ns = &self.nodes[node];
@@ -376,7 +453,19 @@ pub const RaftServer = struct {
         const req = types.RequestVoteReq.decode(payload) catch |e| return self.dropMalformed(e);
         // THE FABLE CORE: the grant decision (term step-up + single-vote +
         // up-to-date restriction).
-        const d = safety.handleRequestVote(ns.current_term, ns.voted_for, ns.log.info(), req);
+        var d = safety.handleRequestVote(ns.current_term, ns.voted_for, ns.log.info(), req);
+        if (self.bug == .index_only_up_to_date and !d.grant) {
+            // INJECTED DEFECT (§5.4.1 with the term-first clause dropped): keep
+            // every other clause of the real decision and widen the up-to-date
+            // test to "at least as long". Only ever ADDS grants, so a refusal
+            // for any other reason (stale term, already voted) still stands.
+            const effective_vote: NodeId = if (d.term_advanced) no_vote else ns.voted_for;
+            const may_vote = effective_vote == no_vote or effective_vote == req.candidate_id;
+            if (req.term >= ns.current_term and may_vote and req.last_log_index >= ns.log.lastIndex()) {
+                d.grant = true;
+                d.voted_for = req.candidate_id;
+            }
+        }
         if (d.term_advanced) {
             ns.current_term = d.new_term;
             ns.role = .follower;
@@ -416,7 +505,14 @@ pub const RaftServer = struct {
         const req = types.AppendEntriesReq.decode(payload, &scratch) catch |e| return self.dropMalformed(e);
         // THE FABLE CORE: consistency check + conflict-only truncation +
         // follower commit advancement.
-        const out = safety.handleAppendEntries(ns.current_term, &ns.log, ns.commit_index, req);
+        var out = safety.handleAppendEntries(ns.current_term, &ns.log, ns.commit_index, req);
+        if (self.bug == .naive_truncation and out.success) {
+            // INJECTED DEFECT (§5.3 conflict rule → naive rule): cut everything
+            // after prevLogIndex and re-append the whole batch, instead of
+            // cutting only at the first genuine term conflict.
+            out.truncate_to = req.prev_log_index;
+            out.append_from = 0;
+        }
         if (out.term_advanced) {
             ns.current_term = out.new_term;
             ns.voted_for = no_vote;
@@ -723,6 +819,214 @@ test "real: a leader is eventually elected on a quiet network (liveness sanity)"
         if (n.role == .leader) leaders += 1;
     }
     try testing.expect(leaders >= 1);
+}
+
+// ── the live State-Machine-Safety key actually varies ───────────────────────
+//
+// The audit's F1: `becomeLeader` appended only `.{ .kind = .noop, .command = 0 }`
+// and nothing else was ever proposed, so every replicated entry in the whole
+// run carried the SAME command. `SafetyChecker.recordApply` keys on the command
+// value, so it compared 0 against 0 at every index — State Machine Safety, the
+// deepest of the five, could not fail no matter what the algorithm did. The two
+// tests below are the ones that go RED if that returns: the first fails on the
+// distinctness itself, the second and third fail because the injected defects
+// stop being visible.
+
+/// How many DIFFERENT command values the run applied, and whether any two
+/// indices were applied the same command (which would mean the key does not
+/// separate entries).
+fn appliedCommandStats(gpa: Allocator, c: *const checks.SafetyChecker) !struct { total: usize, distinct: usize } {
+    var seen: std.AutoHashMapUnmanaged(Command, void) = .empty;
+    defer seen.deinit(gpa);
+    var it = c.applied.iterator();
+    var total: usize = 0;
+    while (it.next()) |kv| {
+        total += 1;
+        try seen.put(gpa, kv.value_ptr.*, {});
+    }
+    return .{ .total = total, .distinct = seen.count() };
+}
+
+test "real: every applied index carries a DISTINCT command (State Machine Safety has a key that varies)" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+    const case = netsim.Case{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+    const r = try netsim.replay(gpa, case, &.{}, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+
+    const stats = try appliedCommandStats(gpa, &srv.checker);
+    // Several entries were committed and applied…
+    try testing.expect(stats.total >= 3);
+    // …and no two indices shared a command value. With the pre-fix harness
+    // (`propose_client_commands = false` and a zero no-op payload) this is
+    // `distinct == 1` for any `total`, and the assert fires.
+    try testing.expectEqual(stats.total, stats.distinct);
+
+    // Each applied command names the (term, index) of the leader that created
+    // it — mutate `commandFor` to a constant and this pins it.
+    var it = srv.checker.applied.iterator();
+    while (it.next()) |kv| {
+        const rec = srv.checker.committed.get(kv.key_ptr.*).?;
+        try testing.expectEqual(commandFor(rec.term, kv.key_ptr.*), kv.value_ptr.*);
+    }
+}
+
+/// The minority side of the directed schedule below: node 0 alone.
+const CUT0 = [_]NodeId{0};
+
+/// The interleaving §5.4.1 exists to forbid, as a hand-built fault schedule —
+/// no seed search, no luck. Four beats:
+///
+///  1. `partition` node 0 away. It is the term-1 leader and stays leader inside
+///     its minority (Raft has no lease), so it keeps proposing — accumulating a
+///     LONG tail of STALE-term entries. This is the shape that could not exist
+///     before F1 was fixed: with no client commands proposed, a partitioned
+///     leader's log grew by exactly one no-op per term and could never outgrow
+///     the majority's.
+///  2. `crash` the majority's term-2 leader, so the term-3 leader elected in its
+///     place has never spoken to node 0 — its `nextIndex[0]` starts at its own
+///     log end, so re-syncing node 0 needs a long walk-back rather than one
+///     matching batch.
+///  3. `heal`. Node 0 hears the term-3 leader, steps down and re-arms its
+///     election timer, but the walk-back has not yet cut its stale tail.
+///  4. `crash` the term-3 leader before the walk-back finishes. Node 0 times out
+///     first (lowest `election_spread` offset) and campaigns while still holding
+///     the long stale tail.
+///
+/// A term-first §5.4.1 refuses it (last term 1 < 3). An index-only §5.4.1 sees
+/// only "longer" and elects it — and it then overwrites entries the majority
+/// had already committed.
+fn directedStaleTailSchedule(partition_at: Time, crash1_at: Time, heal_after: Time, crash2_after: Time) [4]netsim.FaultEvent {
+    return .{
+        .{ .time = partition_at, .kind = .{ .partition = .{ .id = 1, .cut = &CUT0 } } },
+        .{ .time = crash1_at, .kind = .{ .crash_node = .{ .node = 1 } } },
+        .{ .time = crash1_at + heal_after, .kind = .{ .heal = .{ .id = 1 } } },
+        .{ .time = crash1_at + heal_after + crash2_after, .kind = .{ .crash_node = .{ .node = 2 } } },
+    };
+}
+
+const DIRECTED_UNTIL: Time = 3000;
+
+test "positive control: the index-only §5.4.1 election restriction is caught LIVE (directed stale-tail schedule)" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const trace = directedStaleTailSchedule(200, 700, 100, 40);
+
+    // (a) The real algorithm survives the schedule — no false positive.
+    {
+        var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+        defer srv.deinit(gpa);
+        const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = srv.protocol(), .until = DIRECTED_UNTIL };
+        const r = try netsim.replay(gpa, case, &trace, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    }
+
+    // (b) Drop the term-first clause and the LIVE check bites. During the audit
+    // this exact injection PASSED the whole 300-seed sweep and was caught only
+    // by `safety.zig`'s unit test — that is audit finding F1.
+    {
+        var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+        defer srv.deinit(gpa);
+        srv.bug = .index_only_up_to_date;
+        const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = srv.protocol(), .until = DIRECTED_UNTIL };
+        const r = try netsim.replay(gpa, case, &trace, null);
+        try testing.expectEqual(netsim.RunOutcome.violated, r.outcome);
+        try testing.expectEqual(error.LeaderCompleteness, r.violation.?.err);
+    }
+
+    // (c) …and this is WHY it used to pass: with no client commands proposed
+    // (the pre-fix harness) the same defect, the same schedule and the same
+    // checkers see nothing at all, because a partitioned leader's log cannot
+    // grow and the index-only comparison never has anything to be wrong about.
+    // Set `propose_client_commands = false` and (b) above stops failing.
+    {
+        var cfg = DEFAULT_CFG;
+        cfg.propose_client_commands = false;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        srv.bug = .index_only_up_to_date;
+        const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = srv.protocol(), .until = DIRECTED_UNTIL };
+        const r = try netsim.replay(gpa, case, &trace, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    }
+}
+
+/// Drive raw payloads into `node` as if they arrived from `from`, through the
+/// real `Protocol` vtable.
+fn feedFrom(srv: *RaftServer, node: NodeId, from: NodeId, payloads: []const []const u8) !void {
+    const gpa = testing.allocator;
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, srv.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    try scenario(&sim);
+    const p = srv.protocol();
+    for (payloads) |payload| try p.onMessageFn(p.ctx, &sim, node, from, payload);
+}
+
+/// AppendEntries wire bytes, written into `buf`.
+fn encodeAppend(buf: *[types.AppendEntriesReq.max_wire]u8, prev_index: LogIndex, prev_term: Term, entries: []const LogEntry, leader_commit: LogIndex) []const u8 {
+    const n = (types.AppendEntriesReq{
+        .term = 1,
+        .leader_id = 1,
+        .prev_log_index = prev_index,
+        .prev_log_term = prev_term,
+        .entries = entries,
+        .leader_commit = leader_commit,
+    }).encode(buf);
+    return buf[0..n];
+}
+
+test "the naive §5.3 truncation rule rolls back COMMITTED entries; the conflict-only rule keeps them" {
+    const gpa = testing.allocator;
+    const e = [_]LogEntry{
+        .{ .term = 1, .command = commandFor(1, 1) },
+        .{ .term = 1, .command = commandFor(1, 2) },
+        .{ .term = 1, .command = commandFor(1, 3) },
+        .{ .term = 1, .command = commandFor(1, 4) },
+        .{ .term = 1, .command = commandFor(1, 5) },
+    };
+    var b1: [types.AppendEntriesReq.max_wire]u8 = undefined;
+    var b2: [types.AppendEntriesReq.max_wire]u8 = undefined;
+    const ae1 = encodeAppend(&b1, 0, 0, e[0..3], 0);
+    const ae2 = encodeAppend(&b2, 3, 1, e[3..5], 5);
+    // AE#1, then AE#2, then a DUPLICATE of AE#1 arriving late (netsim's
+    // `dup_once` / `delay_once` produce exactly this).
+    const stream = [_][]const u8{ ae1, ae2, ae1 };
+
+    // Conflict-only (§5.3): the duplicate matches entry-for-entry, so nothing
+    // is cut and nothing is re-appended.
+    {
+        var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+        defer srv.deinit(gpa);
+        try feedFrom(&srv, 0, 1, &stream);
+        try testing.expectEqual(@as(LogIndex, 5), srv.nodes[0].log.lastIndex());
+        try testing.expectEqual(@as(LogIndex, 5), srv.nodes[0].commit_index);
+        try testing.expectEqual(@as(LogIndex, 5), srv.nodes[0].last_applied);
+    }
+
+    // Naive ("cut everything after prevLogIndex, re-append the batch"): the
+    // duplicate deletes indices 4 and 5 — which this follower had already
+    // COMMITTED and APPLIED. The state machine is now ahead of the log.
+    {
+        var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+        defer srv.deinit(gpa);
+        srv.bug = .naive_truncation;
+        try feedFrom(&srv, 0, 1, &stream);
+        try testing.expectEqual(@as(LogIndex, 3), srv.nodes[0].log.lastIndex());
+        try testing.expect(srv.nodes[0].last_applied > srv.nodes[0].log.lastIndex());
+    }
+
+    // NOTE (beyond the finding): this rollback is still INVISIBLE to the live
+    // model-check, distinct commands or not. An entry's identity is
+    // `(creating term, index)` — Election Safety makes that unique — so when the
+    // same leader re-replicates indices 4 and 5 it restores byte-identical
+    // entries, and `recordApply` sees the value it already has. The §5.3
+    // conflict-rule trap therefore remains covered by `safety.zig`'s unit test
+    // (`§5.3 the trap`) and by this test, NOT by the fuzzed sweep. F1's other
+    // half — the §5.4.1 election restriction — is the one the sweep now catches.
 }
 
 // ── malformed inbound messages: dropped, counted, never fatal ───────────────

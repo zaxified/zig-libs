@@ -27,6 +27,28 @@ small fixed set (method, status class, route pattern) — never raw path/user id
 registry becomes an unbounded memory leak. This is why the middleware defaults to status classes,
 not raw path. No push-gateway / remote-write — text exposition only.
 
+Deliberately **not** a `metrics`-owned auth wrapper (wave-2 audit F2's finding, resolved as a doc
+pointer rather than new code): this module has no business knowing about bearer tokens, sessions or
+API keys, and `zig-libs` already has a module for exactly that — `aaa-gate` (bearer/API-key auth as
+a `router.Middleware`, fail-closed by default, RFC 6750). Bolting a second, metrics-specific auth
+implementation onto this module would duplicate `aaa-gate` and give the two constructions a chance
+to disagree. The composition is ordinary `router` middleware ordering, most simply done by putting
+`/metrics` on its own router/listener that carries nothing else public:
+
+```zig
+var gate = try aaa_gate.Gate.init(gpa, .{ .token = op_token }); // .protect defaults to .all
+var ep: metrics.Endpoint = .{ .registry = &reg };
+
+var ops_router = router.Router.init(gpa);
+try ops_router.use(gate.middleware()); // everything behind it now needs Authorization: Bearer
+try ops_router.use(ep.middleware());   // GET /metrics — reachable only past the gate
+// ... any other ops-only endpoint (healthz, pprof) goes on the same router
+```
+
+If `/metrics` must share a router with unauthenticated public routes instead of its own
+listener, scope the gate with `router.Router.group("/metrics")` (or the equivalent internal-only
+network policy) rather than gating the whole router with `.all`.
+
 ## Verification
 `zig build test-metrics` covers: counter monotonicity + get-or-register identity, gauge
 set/inc/dec/add/sub, histogram cumulative buckets (inclusive `le`, `_sum`/`_count`,

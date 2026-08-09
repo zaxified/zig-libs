@@ -226,8 +226,22 @@ pub const Jacobian = struct {
         return .{ .x = a.x, .y = a.y.neg(), .z = a.z };
     }
 
+    /// `s` is commonly a SECRET scalar for any future signer/prover built
+    /// on this module even though today's shipped consumers only ever
+    /// pass public data — see `g1.zig`'s `scalarMul` doc comment (wave-2
+    /// audit `bn254` F9).
     pub fn scalarMul(p: Jacobian, s: Fr) Jacobian {
-        return scalarMulBytes(p, &s.toBytes());
+        var buf: [Fr.encoded_bytes]u8 = undefined;
+        return scalarMulZeroing(p, s, &buf);
+    }
+
+    /// See `g1.zig`'s identically-shaped helper: the scratch buffer is an
+    /// explicit out-parameter so a test can inspect it after the call and
+    /// confirm the wipe happened.
+    fn scalarMulZeroing(p: Jacobian, s: Fr, buf: *[Fr.encoded_bytes]u8) Jacobian {
+        buf.* = s.toBytes();
+        defer std.crypto.secureZero(u8, buf);
+        return scalarMulBytes(p, buf);
     }
 
     /// `[s]P` for an arbitrary-width big-endian scalar byte string —
@@ -432,6 +446,16 @@ test "G2 scalarMul edge cases: [0]P = O, [1]P = P, [2]P = double(P)" {
     const two = Fr.one.add(Fr.one);
     try expectSamePoint(g.scalarMul(two), g.double());
     try std.testing.expect(Jacobian.identity.scalarMul(two).isIdentity());
+}
+
+test "G2 scalarMul wipes its own secret-scalar byte scratch before returning (F9)" {
+    // See g1.zig's identically-shaped test — same wave-2 audit F9.
+    var s_bytes = [_]u8{0xff} ** 32;
+    s_bytes[0] = 0x01; // stay < r (r's top byte is 0x30)
+    const s = try Fr.fromBytes(s_bytes);
+    var buf: [Fr.encoded_bytes]u8 = undefined;
+    _ = Jacobian.scalarMulZeroing(jacGen(), s, &buf);
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0));
 }
 
 test "G2 scalarMul distributes: [a+b]G == [a]G + [b]G and [a*b]G == [a]([b]G)" {

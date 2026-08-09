@@ -1531,3 +1531,77 @@ test "the two-way-check toggle is not a field of the public Options struct" {
         try testing.expect(std.mem.indexOf(u8, f.name, "two_way") == null);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// coverage-guided fuzz (audit W2 `isis-spf` F4)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `computeWith` is not a leaf. Every call re-decodes the LSDB's stored bytes
+// (`isis.Lsp.decode`) and walks `tlvIterator` / `ExtIsReachIterator` /
+// `IsReachIterator` over them — and those bytes arrive from the network via
+// `isis-lsdb`. The module had no `testing.fuzz` harness, which also kept it out
+// of `scripts/fuzz-sweep.sh` entirely: that script derives its target list with
+// `grep -rl 'testing\.fuzz(' modules/*/src/*.zig`, so a module with no harness
+// is not "clean", it is *absent* — and absent looks the same as covered from
+// the outside. The harness below puts it in the list.
+//
+// ⭐ THE HARNESS MUST REACH THE TRAVERSAL, NOT JUST THE FRONT DOOR. Feeding raw
+// fuzz bytes to `Lsdb.insert` alone would be near-useless: essentially every
+// random buffer fails `Lsp.decode`'s framing checks, the LSDB stays empty, and
+// `compute` returns an empty table without ever touching a TLV iterator — a
+// harness structurally unable to reach its target. So the input is ALSO spliced
+// into the TLV region of a WELL-FORMED, correctly-checksummed LSP header, once
+// per plausible originator, which is what gets the iterators actually walking
+// attacker-chosen bytes. Reachability was demonstrated, not assumed: with
+// `addDirected`'s `@max(1, …)` metric clamp replaced by
+// `std.debug.assert(raw_metric != 0)` — the shape this code had before the
+// clamp — the harness panics in seconds on an input carrying a zero-metric
+// extended-IS-reachability entry.
+
+fn fuzzComputeOverLsdb(_: void, smith: *testing.Smith) anyerror!void {
+    const gpa = testing.allocator;
+    var input_buf: [256]u8 = undefined;
+    smith.bytes(&input_buf);
+    const input: []const u8 = input_buf[0..smith.valueRangeAtMost(u16, 0, input_buf.len)];
+    const local = sysId(0xA);
+    var db = lsdb.Lsdb.init(gpa, cfgFor(local));
+    defer db.deinit();
+
+    // (1) The front door: raw bytes straight at the LSDB's framing/validation
+    // path, exactly as a hostile neighbour would send them.
+    _ = db.insert(input, null, 0) catch {};
+
+    // (2) The traversal: the same bytes as the TLV region of a well-formed LSP.
+    // Two originators so the two-way check has something to correlate and the
+    // graph-building stage is reachable, not just the extraction stage.
+    for ([_]u8{ 0xA, 0xB }) |last| {
+        const origin = sysId(last);
+        var buf: [1500]u8 = undefined;
+        var b = isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 1000,
+            .lsp_id = .{ origin[0], origin[1], origin[2], origin[3], origin[4], origin[5], 0, 0 },
+            .sequence_number = 1,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        }) catch continue;
+        const room = buf.len - isis.pdu.lsp_fixed_len;
+        const take = @min(input.len, room);
+        @memcpy(buf[isis.pdu.lsp_fixed_len..][0..take], input[0..take]);
+        b.tlvs.pos = take;
+        _ = db.insert(b.finishStamped(), null, 0) catch {};
+    }
+
+    // Both entry points, including the one with the extra failure mode.
+    var rt = compute(gpa, &db, local, 0) catch |e| switch (e) {
+        error.OutOfMemory => return,
+    };
+    rt.deinit();
+
+    var rt2 = computeWith(gpa, &db, local, 0, .{ .reject_asymmetric = true }) catch |e| switch (e) {
+        error.OutOfMemory, error.AsymmetricMetric, error.NodeIdTooLarge => return,
+    };
+    rt2.deinit();
+}
+
+test "fuzz: SPF over an LSDB fed arbitrary bytes never panics" {
+    try testing.fuzz({}, fuzzComputeOverLsdb, .{});
+}

@@ -590,6 +590,43 @@ test "shape: missing path node → empty dataset (not an error)" {
     try testing.expectEqual(@as(usize, 1), d.columns.len);
 }
 
+test "shape: a missing intermediate segment fails the whole path — a sibling key of the SAME name is not picked up" {
+    // Audit F1. The `orelse return .null` in `descend` must abandon the walk at
+    // the FIRST missing segment. The existing "missing path" test above cannot
+    // see this: mutate that line to `orelse node` (silently stay put) and its
+    // `{"a":1}` / `"nope.array"` case still lands on a non-array node, so it
+    // still passes. The decoy here is the point — the root object also carries
+    // an `"array"` key, so a `descend` that skips the missing `"nope"` segment
+    // instead of failing walks straight into the SIBLING and returns rows that
+    // the requested path does not name at all.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{"a":1,"array":[{"v":7},{"v":8}]}
+    ;
+    const d = try shape(a, json, .{ .path = "nope.array", .columns = &.{
+        .{ .name = "v", .key = "v", .type = .float },
+    } });
+    try testing.expectEqual(@as(usize, 0), d.rows.len);
+
+    // Control: the same document at the path that DOES exist yields the rows,
+    // so the assertion above is about the missing segment and not about the
+    // fixture being unreadable.
+    const ok = try shape(a, json, .{ .path = "array", .columns = &.{
+        .{ .name = "v", .key = "v", .type = .float },
+    } });
+    try testing.expectEqual(@as(usize, 2), ok.rows.len);
+    try testing.expectEqual(@as(f64, 7), ok.cell(0, "v").?.float);
+
+    // The same trap one level deeper: a missing FINAL segment must not resolve
+    // to the object it was looked up in.
+    const deep = try shape(a, "{\"outer\":{\"a\":1,\"array\":[{\"v\":9}]}}", .{ .path = "outer.nope.array", .columns = &.{
+        .{ .name = "v", .key = "v", .type = .float },
+    } });
+    try testing.expectEqual(@as(usize, 0), deep.rows.len);
+}
+
 test "shape: malformed JSON → BadJson" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

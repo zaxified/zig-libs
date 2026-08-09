@@ -346,13 +346,35 @@ fn digestT(
 /// `proto.digestLen()` bytes lying inside `message`. Null otherwise (so the
 /// caller reports `BadAuthParams`). Uses pointer identity; do not pass a
 /// `params` parsed from a different buffer.
+///
+/// **Why the pointer alone is not enough (audit F1).** The address-range check
+/// only proves the pointer lands *somewhere* in `message`. A `params` parsed
+/// from a DIFFERENT allocation that happens to overlap that range passes it and
+/// yields an offset pointing at unrelated bytes, which `verify`/`sign` would
+/// then treat as the digest field — zeroing the wrong 12 bytes of the message.
+/// Content equality cannot catch that: at a coinciding address the "two" byte
+/// ranges ARE the same memory, so `eql` is vacuously true. What DOES catch it
+/// is structure: `msgAuthenticationParameters` is a BER OCTET STRING, and its
+/// length is always one of 12/16/24/32/48 — short form — so the two bytes
+/// immediately before the value are necessarily `04 n`. A stray pointer has to
+/// land on that 16-bit pattern by coincidence rather than pass by construction.
+///
+/// This is defensive depth, not a wire fix: an attacker controls the bytes of
+/// `message`, never the caller's pointer plumbing, so this path was never
+/// remotely reachable. It exists so the function's correctness rests on the
+/// data rather than only on a doc comment.
 pub fn authOffsetFor(proto: AuthProtocol, message: []const u8, params: UsmSecurityParameters) ?usize {
     const n = proto.digestLen();
     if (params.auth_params.len != n) return null;
     const base = @intFromPtr(message.ptr);
     const ap = @intFromPtr(params.auth_params.ptr);
     if (ap < base or ap + n > base + message.len) return null;
-    return ap - base;
+    const off = ap - base;
+    // The value must be preceded by its own `04 n` OCTET STRING header.
+    if (off < 2) return null;
+    if (message[off - 2] != ber.tag.octet_string) return null;
+    if (message[off - 1] != n) return null;
+    return off;
 }
 
 /// `authOffsetFor` fixed to the 12-byte HMAC-*-96 field length (RFC 3414).
@@ -824,6 +846,68 @@ test "verify: non-12-byte auth_params -> BadAuthParams" {
     };
     const key = [_]u8{0} ** 16;
     try testing.expectError(error.BadAuthParams, verify(.hmac_md5, &key, &msg, params));
+}
+
+test "authOffsetFor: a pointer landing INSIDE the message but not on the field is refused" {
+    // Audit F1. The address-range guard passes for any pointer inside
+    // `message`; only the `04 n` OCTET STRING header in front of the value
+    // distinguishes the real field from a coincidental hit. Build a genuine
+    // authenticated datagram, find the true offset, then fabricate a `params`
+    // whose `auth_params` is the SAME LENGTH and still inside the message but
+    // shifted off the field by one byte — the shape a `params` parsed from a
+    // different, overlapping allocation would have.
+    const proto: AuthProtocol = .hmac_sha1;
+    const dlen = proto.digestLen();
+    const zeros = [_]u8{0} ** max_digest_len;
+
+    var usm_buf: [160]u8 = undefined;
+    const usm_wire = try encode(&usm_buf, .{
+        .engine_id = &rfc3414_engine_id,
+        .engine_boots = 1,
+        .engine_time = 42,
+        .user_name = "bert",
+        .auth_params = zeros[0..dlen],
+        .priv_params = "",
+    });
+    var enc_buf: [256]u8 = undefined;
+    const dg = try v3.encode(&enc_buf, .{
+        .msg_id = 100,
+        .flags = .{ .auth = true, .reportable = true },
+        .security_parameters = usm_wire,
+        .context_engine_id = &rfc3414_engine_id,
+        .pdu = .{ .type = .trap_v2, .request_id = 7 },
+    });
+    var msg_buf: [256]u8 = undefined;
+    @memcpy(msg_buf[0..dg.len], dg);
+    const msg = msg_buf[0..dg.len];
+
+    const m = try v3.decode(msg);
+    const params = try parse(m.security_parameters);
+    const off = authOffsetFor(proto, msg, params) orelse return error.TestUnexpectedResult;
+    // The header really is there — the premise of the guard, asserted.
+    try testing.expect(off >= 2);
+    try testing.expectEqual(ber.tag.octet_string, msg[off - 2]);
+    try testing.expectEqual(@as(u8, @intCast(dlen)), msg[off - 1]);
+
+    // …and every nearby in-range impostor is refused.
+    for ([_]usize{ 1, 2, 3 }) |shift| {
+        var impostor = params;
+        impostor.auth_params = msg[off + shift ..][0..dlen];
+        try testing.expectEqual(@as(?usize, null), authOffsetFor(proto, msg, impostor));
+        const key = [_]u8{0} ** 20;
+        try testing.expectError(error.BadAuthParams, verify(proto, &key, msg, impostor));
+    }
+    // Including one that lands before the field, where `off < 2` is not the
+    // reason it is rejected.
+    var early = params;
+    early.auth_params = msg[off - 3 ..][0..dlen];
+    try testing.expectEqual(@as(?usize, null), authOffsetFor(proto, msg, early));
+
+    // Not over-tight: the genuine params still resolve, and still verify.
+    var key_buf: [max_key_len]u8 = undefined;
+    const key = try passwordToKey(proto, "maplesyrup", &rfc3414_engine_id, &key_buf);
+    sign(proto, key, msg, off);
+    try verify(proto, key, msg, params);
 }
 
 test "authOffset: 12-byte auth_params from a DIFFERENT buffer -> null / BadAuthParams" {

@@ -99,10 +99,17 @@ pub const Stuffer = struct {
             else => {},
         }
         if (self.at_line_start and c == '.') {
-            // §4.5.2: the sender doubles a leading period. The extra octet does
-            // not count against the line-length limit, which is a limit on the
-            // *text*.
+            // §4.5.2: the sender doubles a leading period. The doubled dot IS
+            // part of the transmitted line §4.5.3.1.6's 998-octet limit
+            // covers, so it must be checked and charged against `line_len`
+            // exactly like any other octet — the *receiving* side
+            // (`Unstuffer`) already counts it, so a `Stuffer` that let it
+            // through free could emit a line one octet longer than its own
+            // `Unstuffer` (or any compliant receiver) will accept (wave-2
+            // audit `smtp` F2).
+            if (self.line_len >= self.opts.max_line) return error.LineTooLong;
             try w.writeByte('.');
+            self.line_len += 1;
         }
         if (self.line_len >= self.opts.max_line) return error.LineTooLong;
         try w.writeByte(c);
@@ -332,6 +339,46 @@ test "the 998-octet line limit is enforced on send and on receive" {
     defer gpa.free(raised);
 }
 
+test "F2: a line-start dot counts against the line limit on both send and receive" {
+    // Regression for the wave-2 audit's F2: Stuffer used to exclude the
+    // transparency dot from `line_len`, so a body line of exactly `max_line`
+    // (998) octets starting with '.' produced a 999-octet wire line — one
+    // octet longer than Unstuffer (which DOES count the dot) will accept.
+    // Reproduced pre-fix: `stuffAlloc` on ". A"*997 ++"\r\n" succeeded, and
+    // feeding that exact wire output straight back into `unstuffAlloc`
+    // failed with `error.LineTooLong` — our own encoder emitted a line our
+    // own decoder rejected.
+    const gpa = testing.allocator;
+
+    // A leading dot doubles on the wire, so a source line of `n` octets
+    // starting with '.' becomes an (n+1)-octet wire line — one octet of the
+    // 998-octet wire budget is spent on the doubling itself. At the cap:
+    // source "." + 996 'A's = 997 source octets → wire ".." + 996 'A's = 998
+    // wire octets, exactly the budget. Both the stuffer and a receiver
+    // applying the same 998-octet cap must accept it, and stuffing then
+    // unstuffing it must round-trip.
+    {
+        const body = "." ++ "A" ** 996 ++ "\r\n";
+        const wire = try stuffAlloc(gpa, body, .{});
+        defer gpa.free(wire);
+        const back = try unstuffAlloc(gpa, wire, .{});
+        defer gpa.free(back);
+        try testing.expectEqualStrings(body, back);
+    }
+
+    // One source octet more — "." + 997 'A's = 998 source octets — would
+    // double to a 999-octet wire line, one over budget. This is the exact
+    // audit repro: the OLD Stuffer accepted this (it never charged the
+    // doubled dot against `line_len`), producing a wire line its own
+    // Unstuffer then refused with `error.LineTooLong`. The fixed Stuffer
+    // must refuse it too, at the point of writing, not silently emit a
+    // non-compliant line for its own receiver to reject.
+    {
+        const body = "." ++ "A" ** 997 ++ "\r\n";
+        try testing.expectError(error.LineTooLong, stuffAlloc(gpa, body, .{}));
+    }
+}
+
 test "SMTP smuggling: only CRLF.CRLF terminates the data" {
     const gpa = testing.allocator;
     // A bare LF is refused outright by default...
@@ -401,7 +448,12 @@ test "fuzz: stuffing then un-stuffing is the identity, and neither crashes" {
 
 fn fuzzDots(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
-    var raw: [256]u8 = undefined;
+    // F2 (wave-2 audit): 256 raw bytes, even doubled by stuffing, could never
+    // reach the 1000-octet `max_line` both sides below are configured with,
+    // so this harness could never exercise the line-length boundary where
+    // the stuffer/unstuffer asymmetry lived. 1100 comfortably clears it
+    // (worst case a single all-dots line, doubled, still exceeds 1000).
+    var raw: [1100]u8 = undefined;
     smith.bytes(&raw);
     const len = smith.valueRangeAtMost(u16, 0, raw.len);
     const input = raw[0..len];

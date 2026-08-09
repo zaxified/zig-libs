@@ -158,9 +158,15 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
 - **Not** a distributed/replicated store: one process owns the cache + WAL + sink. Multi-writer,
   cross-process coordination, and sink transactions spanning multiple keys are out of scope.
 - **`del` read-shadowing** uses an in-memory `tombstones` set so a `get` after `del` misses
-  immediately; it grows with distinct deleted keys until each is overwritten by a `put`. For a
-  delete-heavy workload, prefer periodic `flushAll` + a fresh coordinator, or a sink whose
-  read-through returns the (now absent) key. (v1 scope note.)
+  immediately. A tombstone is reclaimed as soon as either happens: a later `put` supersedes it
+  (immediate, synchronous), or its delete's own flush is durably confirmed (in `finishTask`, once
+  the sink no longer holds the pre-delete value, a `get` read-through would correctly miss on its
+  own — F2, wave-2 audit). The one case a tombstone still outlives its delete forever is a
+  **poisoned** (dead-lettered) delete: it never reached the sink, so dropping its tombstone would
+  let a later `get` read-through resurrect the stale value — deliberately conservative, and only
+  reachable with a finite `Options.max_flush_attempts` (the default never dead-letters). For that
+  edge case, prefer periodic `flushAll` + a fresh coordinator, or a sink whose read-through returns
+  the (now absent) key.
 - **Key size** is capped at `jobqueue.max_field_len` (4096) — it is the WAL partition; value size at
   the WAL payload cap (default 1 MiB). Both surface as typed `PutError`s before any durable write.
 - Correctness of the async wake/park, the lock-free queue, and the durable log lives in
@@ -174,4 +180,8 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   `put` is always non-blocking and the WAL is unbounded.
 - Coalescing superseded WAL records for a hot key (bounded WAL growth under repeated overwrites);
   correctness already holds without it, this is a space optimization.
-- A tombstone GC / compaction pass for delete-heavy workloads.
+- ~~A tombstone GC / compaction pass for delete-heavy workloads.~~ Done (F2, wave-2 audit) for the
+  case that matters — GC on durable delete-flush confirmation, in `finishTask`. What is still
+  backlog: a tombstone behind a **poisoned** delete is retained forever by design (see "Threat
+  model" above) — there is no compaction pass for that residue today, only the existing
+  `flushAll`-and-restart workaround.

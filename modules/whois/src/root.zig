@@ -218,8 +218,9 @@ pub fn nextServer(response: []const u8) ?Referral {
 /// conventional `localhost` name, or an IP literal in loopback
 /// (`127.0.0.0/8`, `::1`), RFC 1918 private (`10/8`, `172.16/12`,
 /// `192.168/16`), link-local (`169.254.0.0/16`, `fe80::/10`), IPv6
-/// unique-local (`fc00::/7`), unspecified (`0.0.0.0`, `::`) or multicast
-/// space. A referral host that is a *hostname* other than `localhost` is not
+/// unique-local (`fc00::/7`), unspecified (`0.0.0.0`, `::`), multicast, or
+/// documentation space (RFC 5737 TEST-NET-1/2/3 and RFC 3849 `2001:db8::/32`).
+/// A referral host that is a *hostname* other than `localhost` is not
 /// classified here (this module never resolves DNS itself); a caller whose
 /// `Transport` does its own resolution should apply the same check to the
 /// resolved address before connecting.
@@ -231,15 +232,31 @@ pub fn isSpecialUseHost(host: []const u8) bool {
 }
 
 fn isSpecialUseIp(ip: netaddr.Ip) bool {
-    if (ip.isUnspecified() or ip.isLoopback() or ip.isLinkLocalUnicast() or
-        ip.isMulticast() or ip.isUniqueLocal()) return true;
-    // netaddr has no RFC 1918 helper (out of scope for that module); the
-    // three private ranges are cheap enough to check directly here.
+    return ip.isUnspecified() or ip.isLoopback() or ip.isLinkLocalUnicast() or
+        ip.isMulticast() or ip.isUniqueLocal() or ip.isPrivate() or
+        isDocumentationIp(ip);
+}
+
+/// IANA special-purpose documentation space: RFC 5737's TEST-NET-1
+/// (`192.0.2.0/24`), TEST-NET-2 (`198.51.100.0/24`) and TEST-NET-3
+/// (`203.0.113.0/24`), plus RFC 3849's `2001:db8::/32`.
+///
+/// Why a referral here is refused rather than dialed. These prefixes are
+/// reserved for documentation and examples and are **not routable on the
+/// public internet**, so a WHOIS referral naming one is never a legitimate
+/// registry — but on a lab or private network where TEST-NET happens to be
+/// routed internally, following it is exactly the internal-connect the rest of
+/// this guard exists to prevent. Refusing is also the consistent choice: this
+/// module already default-denies RFC 1918, which a lab is far more likely to
+/// use for a real internal WHOIS server than TEST-NET, so nothing that worked
+/// before stops working. (Audit `netaddr` F3, whose fix was correctly scoped
+/// to here rather than to `netaddr`.)
+fn isDocumentationIp(ip: netaddr.Ip) bool {
     return switch (ip.unmap()) {
-        .v4 => |q| (q[0] == 10) or
-            (q[0] == 172 and q[1] >= 16 and q[1] <= 31) or
-            (q[0] == 192 and q[1] == 168),
-        .v6 => false,
+        .v4 => |q| (q[0] == 192 and q[1] == 0 and q[2] == 2) or
+            (q[0] == 198 and q[1] == 51 and q[2] == 100) or
+            (q[0] == 203 and q[1] == 0 and q[2] == 113),
+        .v6 => |o| o[0] == 0x20 and o[1] == 0x01 and o[2] == 0x0d and o[3] == 0xb8,
     };
 }
 
@@ -601,7 +618,29 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(isSpecialUseHost("LOCALHOST"));
     try testing.expect(isSpecialUseHost("foo.localhost"));
     try testing.expect(!isSpecialUseHost("whois.verisign-grs.com"));
-    try testing.expect(!isSpecialUseHost("192.0.2.1")); // TEST-NET-1, not special-cased here
+    // RFC 5737 / RFC 3849 documentation space — refused, see `isDocumentationIp`.
+    try testing.expect(isSpecialUseHost("192.0.2.1")); // TEST-NET-1
+    try testing.expect(isSpecialUseHost("192.0.2.255")); // TEST-NET-1, top of range
+    try testing.expect(isSpecialUseHost("198.51.100.7")); // TEST-NET-2
+    try testing.expect(isSpecialUseHost("203.0.113.9")); // TEST-NET-3
+    try testing.expect(isSpecialUseHost("2001:db8::1")); // RFC 3849
+    try testing.expect(isSpecialUseHost("::ffff:192.0.2.1")); // v4-mapped TEST-NET-1
+    // …and the guard is not over-wide: the neighbouring /24s stay public.
+    try testing.expect(!isSpecialUseHost("192.0.1.1"));
+    try testing.expect(!isSpecialUseHost("192.0.3.1"));
+    try testing.expect(!isSpecialUseHost("198.51.101.1"));
+    try testing.expect(!isSpecialUseHost("203.0.114.1"));
+    try testing.expect(!isSpecialUseHost("2001:db9::1"));
+}
+
+test "lookup: refer: to RFC 5737 TEST-NET is refused, chase stops (netaddr audit F3)" {
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "whois.iana.org", .response = "refer: 192.0.2.1\n" },
+    } };
+    var buf: [256]u8 = undefined;
+    const result = try lookup(scripted.transport(), "example.com", .{}, &buf);
+    try testing.expectEqual(@as(usize, 1), result.chain.count); // never appended the hop
+    try testing.expectEqual(@as(usize, 1), scripted.call_count); // 192.0.2.1 never dialed
 }
 
 test "lookup: refer: to a loopback host is refused, chase stops (no SSRF)" {

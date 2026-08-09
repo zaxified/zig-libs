@@ -35,7 +35,6 @@
 
 const std = @import("std");
 const gate = @import("gate.zig");
-const atomic = @import("atomic.zig");
 
 /// A retired object awaiting safe reclamation: a type-erased pointer plus the
 /// callback that will actually free it (e.g. return it to a `NodePool`). The
@@ -89,6 +88,22 @@ pub const Participant = struct {
     /// `unpinned` (init + the register/unregister contract), so scanning all
     /// slots' `local_epoch` is both sufficient and race-free.
     in_use: std.atomic.Value(bool),
+    /// Set by `unregister` when the departing thread still had limbo garbage it
+    /// could not drain without waiting on someone else's pin. The slot then
+    /// stays `in_use` and its bags stay put; any participant's next
+    /// `tryAdvance` CASes this flag `true`→`false` to take **exclusive**
+    /// ownership of the orphaned bags, drains whatever has expired, and frees
+    /// the slot once they are empty (re-setting the flag if they are not).
+    ///
+    /// The CAS is the ONLY mutual exclusion over a departed slot's bags — bags
+    /// are single-owner storage, and this transfers that ownership. Its
+    /// `.acquire` success ordering pairs with `unregister`'s `.release` store,
+    /// which is what makes the departing thread's final bag / `bag_epoch`
+    /// writes visible to the adopter. Deliberately the SAME ordering pair the
+    /// registry already uses for `in_use` (`register`'s acquire CAS ⇄
+    /// `unregister`'s release store), so it introduces no new lowering — see
+    /// SPEC §7.
+    orphaned: std.atomic.Value(bool),
     /// Limbo bags indexed by `epoch % num_epochs`. `retire` appends to the
     /// current bag; `tryAdvance` drains bags that are ≥ 2 epochs old. Bags
     /// (and `bag_epoch`) are single-owner: only the owning thread ever touches
@@ -116,6 +131,7 @@ pub const Participant = struct {
     fn initInPlace(self: *Participant) void {
         self.local_epoch = .init(unpinned);
         self.in_use = .init(false);
+        self.orphaned = .init(false);
         for (&self.bags) |*b| b.* = .empty;
         self.bag_epoch = @splat(0);
         self.dropped_retires = 0;
@@ -153,6 +169,14 @@ pub const Domain = struct {
     global_epoch: std.atomic.Value(u64),
     participants: []Participant,
     allocator: std.mem.Allocator,
+    /// How many slots are currently orphaned (see `Participant.orphaned`). A
+    /// hint only: `tryAdvance` reads it `.monotonic` on its hot path and skips
+    /// the orphan scan when it reads zero. A stale zero costs nothing — the
+    /// orphan is adopted by a later `tryAdvance`; reclamation in EBR is
+    /// eventual by construction (garbage sits in a bag until *somebody*
+    /// advances). Nothing about the grace-period proof depends on this
+    /// counter, which is why it may be `.monotonic`.
+    orphan_count: std.atomic.Value(usize),
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) std.mem.Allocator.Error!Domain {
         const parts = try allocator.alloc(Participant, cfg.max_participants);
@@ -172,9 +196,20 @@ pub const Domain = struct {
             .global_epoch = .init(0),
             .participants = parts,
             .allocator = allocator,
+            .orphan_count = .init(0),
         };
     }
 
+    /// Free the registry. Any garbage still sitting in a limbo bag — including
+    /// an orphaned slot's (see `unregister`) — has its *staging storage* freed
+    /// but its reclaim callback is deliberately NOT run: the callback returns
+    /// a node to a pool that the consumer's teardown order may already have
+    /// destroyed (the harness deinits pool before domain), so running it here
+    /// would be the use-after-free this module exists to prevent. The effect is
+    /// the same conservative direction `retire`'s abandon path takes — the
+    /// nodes are never reused, never freed twice, and the storage they occupy
+    /// is released by the pool's own `deinit`. Call `orphanedSlots()` before
+    /// teardown if a consumer wants to assert nothing was left behind.
     pub fn deinit(self: *Domain) void {
         for (self.participants) |*p| p.deinitBags(self.allocator);
         self.allocator.free(self.participants);
@@ -199,34 +234,119 @@ pub const Domain = struct {
         return RegisterError.TooManyParticipants;
     }
 
-    /// Release a participant slot. Caller must be unpinned (asserted).
+    /// Upper bound on the `tryAdvance` attempts `unregister` makes before it
+    /// hands its leftover garbage off instead of draining it itself.
     ///
-    /// Self-draining, may briefly block: any garbage still in this
-    /// participant's limbo bags is reclaimed here by spinning `tryAdvance`
-    /// (unpinned, with backoff) until the bags empty. The scaffold's original
-    /// contract — "caller must have drained its bags" — is not satisfiable
-    /// deterministically by a caller: draining needs the global epoch to move
-    /// ≥ 2 past the last retire, and any concurrently pinned thread (e.g. one
-    /// the OS preempted mid-pin) stalls that for as long as it likes, so a
-    /// finite "drain then unregister" dance in the caller always has a losing
-    /// schedule (observed as a rare unregister-assert abort in the gated
-    /// stress test). Waiting is safe here: bags are single-owner, the spin
-    /// runs unpinned (it cannot stall anyone else's reclamation), and it
-    /// terminates under the module's own liveness contract — no thread stays
-    /// pinned forever (per-attempt pins in `mpmc`; SPEC §2). A lone or last
-    /// participant self-drains deterministically (its own scans see no other
-    /// pins, so every `tryAdvance` advances). A non-blocking alternative —
-    /// migrating leftovers to a domain-global limbo, crossbeam-style — is a
-    /// documented next increment.
+    /// A lone or last participant drains deterministically: its own scan sees
+    /// no other pins, so every attempt advances the epoch by one, and garbage
+    /// tagged `e'` is freed once the epoch reaches `e'+2` — at most one
+    /// generation per bag, i.e. `num_epochs` bags plus the two-epoch window.
+    /// Anything beyond that means some OTHER thread's pin is blocking the
+    /// advance, and no number of further attempts is guaranteed to help — that
+    /// is precisely the case this bound refuses to spin on.
+    const max_unregister_advances = num_epochs + 2;
+
+    /// Release a participant slot. Caller must be unpinned (asserted).
+    /// **Non-blocking: never waits on another thread.**
+    ///
+    /// Two phases. First a BOUNDED self-drain (`max_unregister_advances`
+    /// `tryAdvance` attempts, no backoff, no retry loop): this is the common
+    /// case and it completes deterministically for a lone or last participant,
+    /// so a single-threaded teardown still leaves nothing behind. If garbage
+    /// remains — which can only mean a concurrently pinned peer is blocking the
+    /// epoch, e.g. one the OS preempted mid-pin — the slot is **orphaned**
+    /// instead: `orphaned` is published, `in_use` stays set (the bags are still
+    /// live storage), and the call returns. Any participant's next
+    /// `tryAdvance` adopts the slot, drains what has expired, and frees it.
+    ///
+    /// This replaces the previous unbounded `while (remainingGarbage) {
+    /// tryAdvance; backoff.pause(); }` spin. That spin could not deadlock (the
+    /// spinner is unpinned, so it stalls nobody else's reclamation) and it
+    /// terminated under the module's liveness contract — no thread stays pinned
+    /// forever (SPEC §2) — but its termination *depended on other threads*,
+    /// which is exactly the property a lock-free module should not have. The
+    /// scaffold's original contract, "caller must have drained its bags", is
+    /// not satisfiable deterministically by a caller either: draining needs the
+    /// global epoch to move ≥ 2 past the last retire, and any pinned peer
+    /// stalls that for as long as it likes, so a finite "drain then unregister"
+    /// dance in the caller always has a losing schedule (observed as a rare
+    /// unregister-assert abort in the gated stress test).
+    ///
+    /// **Ordering:** unchanged from before for every reclamation-relevant
+    /// atomic. The one new access is the `orphaned` `.release` store, which
+    /// publishes the departing thread's final bag / `bag_epoch` writes to
+    /// whichever adopter wins the `.acquire` CAS in `adoptOrphans` — the same
+    /// release/acquire pair the registry already uses for `in_use`. The
+    /// grace-period theorem at `tryAdvance` is untouched: it never named the
+    /// draining thread, only the epoch it observed, and `adoptOrphans` re-reads
+    /// the epoch after acquiring the slot (see there).
     pub fn unregister(self: *Domain, p: *Participant) void {
         std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
-        var backoff: atomic.Backoff = .{};
-        while (remainingGarbage(p) != 0) {
+        var attempts: usize = 0;
+        while (remainingGarbage(p) != 0 and attempts < max_unregister_advances) : (attempts += 1) {
             self.tryAdvance(p);
-            if (remainingGarbage(p) == 0) break;
-            backoff.pause();
+        }
+        if (remainingGarbage(p) != 0) {
+            // Hand off. `in_use` deliberately stays `true`: the slot is not
+            // free until its garbage is gone, and `tryAdvance`'s scan reads
+            // `local_epoch` (= `unpinned` here), never `in_use`, so an orphan
+            // slot cannot block an epoch advance.
+            _ = self.orphan_count.fetchAdd(1, .monotonic);
+            p.orphaned.store(true, .release);
+            return;
         }
         p.in_use.store(false, .release);
+    }
+
+    /// Adopt any orphaned slot: take exclusive ownership of its bags, reclaim
+    /// what has expired, and free the slot when they are empty. Called from
+    /// `tryAdvance`; a no-op (one `.monotonic` load) when there are none.
+    ///
+    /// Why this is safe to do from a foreign thread. The grace-period theorem
+    /// (`tryAdvance`) is a statement about a bag's tag and the epoch the
+    /// draining thread observed — it never names *which* thread drains. Two
+    /// obligations remain, and both are discharged here:
+    ///
+    ///  1. **Exclusivity.** Bags are single-owner storage. The
+    ///     `true`→`false` CAS on `orphaned` has exactly one winner, and the
+    ///     departing thread has already returned, so the winner is the sole
+    ///     accessor. Its `.acquire` success ordering pairs with `unregister`'s
+    ///     `.release` store, making the departing thread's last bag and
+    ///     `bag_epoch` writes visible.
+    ///  2. **No epoch underflow.** `reclaimExpired` computes
+    ///     `observed - bag_epoch[i]`, which is safe only when `observed` is at
+    ///     least the tag. For a thread's OWN bags that holds by per-thread
+    ///     monotonicity of its epoch reads. For a foreign bag it does not — so
+    ///     the epoch is re-read HERE, after the acquiring CAS. The departing
+    ///     thread's tag-producing `global_epoch` read happens-before its
+    ///     release store, which happens-before our acquiring CAS, which
+    ///     precedes this load in program order; read-read coherence on
+    ///     `global_epoch` then forbids this load from returning a value older
+    ///     than the tag. (Passing the caller's earlier `e` would NOT be sound:
+    ///     that load can precede the orphan's retire in the modification
+    ///     order.)
+    fn adoptOrphans(self: *Domain) void {
+        if (self.orphan_count.load(.monotonic) == 0) return;
+        for (self.participants) |*q| {
+            if (!q.orphaned.load(.monotonic)) continue;
+            if (q.orphaned.cmpxchgStrong(true, false, .acquire, .monotonic) != null) continue;
+            // Exclusive owner of q's bags from here.
+            const eo = self.global_epoch.load(.seq_cst);
+            reclaimExpired(q, eo);
+            if (remainingGarbage(q) == 0) {
+                _ = self.orphan_count.fetchSub(1, .monotonic);
+                q.in_use.store(false, .release);
+            } else {
+                // Still expiring — publish it back for a later adopter.
+                q.orphaned.store(true, .release);
+            }
+        }
+    }
+
+    /// Slots whose owner has departed but whose limbo garbage has not expired
+    /// yet. Mechanical accessor for tests and teardown assertions.
+    pub fn orphanedSlots(self: *const Domain) usize {
+        return self.orphan_count.load(.monotonic);
     }
 
     fn remainingGarbage(p: *const Participant) usize {
@@ -453,6 +573,9 @@ pub const Domain = struct {
     pub fn tryAdvance(self: *Domain, p: *Participant) void {
         const e = self.global_epoch.load(.seq_cst);
         reclaimExpired(p, e);
+        // Inherit any departed participant's leftover garbage. Costs one
+        // `.monotonic` load when there is none, which is the steady state.
+        self.adoptOrphans();
 
         // The safe-to-advance predicate: every pinned participant has been
         // observed AT the current epoch. Scans local_epoch of ALL slots —
@@ -560,6 +683,80 @@ test "init pre-allocates the limbo reserve, so retire never touches the allocato
     d.allocator = testing.allocator;
     d.unregister(p); // self-drains; every victim is reclaimed
     try testing.expectEqual(@as(usize, 8), freed);
+}
+
+test "unregister never waits on a pinned peer: it orphans the slot and a peer's tryAdvance adopts it" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 4, .bag_reserve = 4 });
+    defer d.deinit();
+    const a = try d.register();
+    const b = try d.register();
+
+    var freed: usize = 0;
+    var victims: [3]u64 = @splat(0);
+    for (&victims) |*v| {
+        const g = d.enterCritical(a);
+        d.retire(a, .{ .ptr = v, .ctx = &freed, .reclaim = countingReclaim });
+        g.release();
+    }
+
+    // `b` pins and STAYS pinned — the OS-preempted peer of the F4 finding.
+    // The epoch can move at most one step past b's pinned value, never the two
+    // `a`'s garbage needs, so `a` can never drain its own bags.
+    const held = d.enterCritical(b);
+
+    // The load-bearing line. Before the fix this was an unbounded
+    // `while (remainingGarbage(p) != 0) { tryAdvance; backoff.pause(); }` and
+    // it NEVER RETURNS on this schedule — the RED here is a hang, not a
+    // failed assert.
+    d.unregister(a);
+
+    // Handed off, not dropped and not freed early: freeing under a pin is the
+    // one outcome that would be a use-after-free.
+    try testing.expectEqual(@as(usize, 1), d.orphanedSlots());
+    try testing.expectEqual(@as(usize, 0), freed);
+    // The slot is still occupied — its bags are live storage — but it is
+    // `unpinned`, so it cannot block anyone's epoch advance.
+    try testing.expect(a.in_use.load(.monotonic));
+    try testing.expectEqual(Participant.unpinned, a.local_epoch.load(.monotonic));
+
+    held.release();
+
+    // Adoption is opportunistic: whichever participant next advances inherits
+    // the orphan. Bounded here so a regression fails instead of hanging.
+    var i: usize = 0;
+    while (i < 16 and d.orphanedSlots() != 0) : (i += 1) d.tryAdvance(b);
+    try testing.expectEqual(@as(usize, 0), d.orphanedSlots());
+    try testing.expectEqual(victims.len, freed);
+    try testing.expectEqual(@as(usize, 0), Domain.remainingGarbage(a));
+
+    // …and the slot is genuinely free again, not merely drained.
+    try testing.expect(!a.in_use.load(.monotonic));
+    const c = try d.register();
+    try testing.expectEqual(a, c);
+    d.unregister(c);
+    d.unregister(b);
+}
+
+test "unregister's bounded self-drain still reclaims everything when nobody else is pinned" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 4, .bag_reserve = 4 });
+    defer d.deinit();
+    const a = try d.register();
+    const b = try d.register(); // registered but never pinned
+
+    var freed: usize = 0;
+    var victims: [4]u64 = @splat(0);
+    for (&victims) |*v| {
+        const g = d.enterCritical(a);
+        d.retire(a, .{ .ptr = v, .ctx = &freed, .reclaim = countingReclaim });
+        g.release();
+    }
+    d.unregister(a);
+    // No hand-off was needed: `max_unregister_advances` is enough for a
+    // participant whose scans see no other pin.
+    try testing.expectEqual(@as(usize, 0), d.orphanedSlots());
+    try testing.expectEqual(victims.len, freed);
+    try testing.expect(!a.in_use.load(.monotonic));
+    d.unregister(b);
 }
 
 test "retire abandons (never panics, never frees early) when the bag cannot grow" {

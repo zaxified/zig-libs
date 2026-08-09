@@ -811,8 +811,9 @@ fn isHttpUrl(s: []const u8) bool {
 /// non-routable address space: the conventional `localhost` name, or an IP
 /// literal in loopback (`127.0.0.0/8`, `::1`), RFC 1918 private (`10/8`,
 /// `172.16/12`, `192.168/16`), link-local (`169.254.0.0/16`, `fe80::/10`),
-/// IPv6 unique-local (`fc00::/7`), unspecified (`0.0.0.0`, `::`) or multicast
-/// space. A host that is a hostname other than `localhost` is not classified
+/// IPv6 unique-local (`fc00::/7`), unspecified (`0.0.0.0`, `::`), multicast,
+/// or documentation space (RFC 5737 TEST-NET-1/2/3, RFC 3849 `2001:db8::/32`).
+/// A host that is a hostname other than `localhost` is not classified
 /// here — it is left to the caller's `Fetcher`/`http.Client`'s own resolver;
 /// this check catches the literal-IP and `localhost` cases the audit found
 /// directly exploitable.
@@ -830,7 +831,26 @@ fn isSpecialUseHost(host: []const u8) bool {
 /// because that is the threat model, not addressing.
 fn isSpecialUseIp(ip: netaddr.Ip) bool {
     return ip.isUnspecified() or ip.isLoopback() or ip.isLinkLocalUnicast() or
-        ip.isMulticast() or ip.isUniqueLocal() or ip.isPrivate();
+        ip.isMulticast() or ip.isUniqueLocal() or ip.isPrivate() or
+        isDocumentationIp(ip);
+}
+
+/// IANA special-purpose documentation space: RFC 5737's TEST-NET-1
+/// (`192.0.2.0/24`), TEST-NET-2 (`198.51.100.0/24`), TEST-NET-3
+/// (`203.0.113.0/24`) and RFC 3849's `2001:db8::/32`. Not routable on the
+/// public internet, so a `related` href naming one is never a real registry —
+/// but on a lab network where TEST-NET is routed internally, following it is
+/// the same internal-connect this guard exists to refuse. Kept byte-for-byte
+/// in step with `whois.isDocumentationIp`; `netaddr` deliberately does not
+/// carry this predicate (it is threat model, not addressing — audit
+/// `netaddr` F3 scoped the fix to the two consumers, not to `netaddr`).
+fn isDocumentationIp(ip: netaddr.Ip) bool {
+    return switch (ip.unmap()) {
+        .v4 => |q| (q[0] == 192 and q[1] == 0 and q[2] == 2) or
+            (q[0] == 198 and q[1] == 51 and q[2] == 100) or
+            (q[0] == 203 and q[1] == 0 and q[2] == 113),
+        .v6 => |o| o[0] == 0x20 and o[1] == 0x01 and o[2] == 0x0d and o[3] == 0xb8,
+    };
 }
 
 // ── default fetcher over our http client ────────────────────────────────────
@@ -1479,6 +1499,17 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(isSpecialUseHost("fc00::1")); // IPv6 unique-local
     try testing.expect(isSpecialUseHost("localhost"));
     try testing.expect(!isSpecialUseHost("rdap.markmonitor.com"));
+    // RFC 5737 / RFC 3849 documentation space — refused (audit `netaddr` F3).
+    try testing.expect(isSpecialUseHost("192.0.2.1")); // TEST-NET-1
+    try testing.expect(isSpecialUseHost("198.51.100.7")); // TEST-NET-2
+    try testing.expect(isSpecialUseHost("203.0.113.9")); // TEST-NET-3
+    try testing.expect(isSpecialUseHost("2001:db8::1")); // RFC 3849
+    try testing.expect(isSpecialUseHost("::ffff:203.0.113.9")); // v4-mapped TEST-NET-3
+    // …and not over-wide: the neighbouring prefixes stay public.
+    try testing.expect(!isSpecialUseHost("192.0.3.1"));
+    try testing.expect(!isSpecialUseHost("198.51.101.1"));
+    try testing.expect(!isSpecialUseHost("203.0.114.1"));
+    try testing.expect(!isSpecialUseHost("2001:db9::1"));
 }
 
 test "client: related link at a loopback host is refused, falls back to the first document" {

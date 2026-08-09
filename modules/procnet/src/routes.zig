@@ -40,6 +40,25 @@ fn leHexToV4(s: []const u8) ?netaddr.Ip {
     } };
 }
 
+/// Whether `octets` (in real network order — first entry is the first
+/// transmitted octet, e.g. `leHexToV4`'s output) is a valid CIDR netmask: a
+/// contiguous run of leading one-bits followed only by zero-bits. `@popCount`
+/// alone (what `parseRoutes` used to feed straight into `Prefix.bits`) cannot
+/// tell a real mask like `255.255.255.0` from a non-contiguous bit pattern
+/// like `255.255.0.255` — both have 24 set bits, but only the first describes
+/// the same address set as a `/24` prefix (wave-2 audit `procnet` F3).
+fn isContiguousMask(octets: [4]u8) bool {
+    const v: u32 = (@as(u32, octets[0]) << 24) | (@as(u32, octets[1]) << 16) |
+        (@as(u32, octets[2]) << 8) | @as(u32, octets[3]);
+    const inv = ~v;
+    // A run of leading ones followed by trailing zeros in `v` is exactly a
+    // run of leading zeros followed by trailing ones in `~v`, i.e. `~v` is
+    // `2^k - 1` for some k — the classic `n & (n +% 1) == 0` test (wrapping
+    // add so `~v == 0xFFFFFFFF`, the `/0` mask, is handled without overflow
+    // UB: `0xFFFFFFFF +% 1` wraps to `0`).
+    return inv & (inv +% 1) == 0;
+}
+
 /// Parse `/proc/net/route` (header line, then `Iface Destination Gateway
 /// Flags RefCnt Use Metric Mask MTU Window IRTT` columns, addresses as
 /// little-endian hex) into typed entries. Malformed rows are skipped, not
@@ -64,10 +83,13 @@ pub fn parseRoutes(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.E
 
         const dst = leHexToV4(dhex) orelse continue;
         const gw = leHexToV4(ghex) orelse continue;
-        const mask = std.fmt.parseInt(u32, mhex, 16) catch continue;
+        const mask_ip = leHexToV4(mhex) orelse continue;
+        if (!isContiguousMask(mask_ip.v4)) continue; // F3: not a real CIDR mask
 
+        var mask_bits: u8 = 0;
+        for (mask_ip.v4) |byte| mask_bits += @popCount(byte);
         var e: RouteEntry = .{
-            .dest = .{ .addr = dst, .bits = @popCount(mask) },
+            .dest = .{ .addr = dst, .bits = mask_bits },
             .gateway = if (gw.v4[0] == 0 and gw.v4[1] == 0 and gw.v4[2] == 0 and gw.v4[3] == 0) null else gw,
             .metric = std.fmt.parseInt(u32, metric_s, 10) catch 0,
         };
@@ -126,6 +148,38 @@ test "parseRoutes: malformed rows are skipped, not fatal" {
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(u32, 100), entries[0].metric);
+}
+
+test "parseRoutes: a non-contiguous mask is skipped, not silently accepted (F3)" {
+    // Regression for the wave-2 audit's F3: `@popCount(mask)` alone cannot
+    // tell 255.255.255.0 (a real /24) from 255.255.0.255 (24 set bits, but
+    // not a contiguous run — no such CIDR prefix exists). "FF00FFFF" decodes
+    // (via the same little-endian scheme as the address columns) to network
+    // octets [255,255,0,255]: 24 bits set, none of them contiguous from the
+    // top. The good row alongside it (00FFFFFF = 255.255.255.0, a real /24)
+    // proves the parser is not just rejecting every row.
+    const text =
+        \\Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+        \\eth0 0001000A 00000000 0001 0 0 100 FF00FFFF 0 0 0
+        \\eth0 0001000A 00000000 0001 0 0 200 00FFFFFF 0 0 0
+        \\
+    ;
+    const entries = try parseRoutes(testing.allocator, text);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(u32, 200), entries[0].metric);
+    try testing.expectEqual(@as(u8, 24), entries[0].dest.bits);
+}
+
+test "isContiguousMask: leading-ones masks accepted, non-contiguous rejected" {
+    try testing.expect(isContiguousMask(.{ 0, 0, 0, 0 })); // /0
+    try testing.expect(isContiguousMask(.{ 255, 255, 255, 255 })); // /32
+    try testing.expect(isContiguousMask(.{ 255, 255, 255, 0 })); // /24
+    try testing.expect(isContiguousMask(.{ 255, 255, 254, 0 })); // /23
+    try testing.expect(isContiguousMask(.{ 255, 255, 255, 128 })); // /25
+    try testing.expect(!isContiguousMask(.{ 255, 255, 0, 255 })); // hole in the middle
+    try testing.expect(!isContiguousMask(.{ 0, 255, 255, 255 })); // ones not leading
+    try testing.expect(!isContiguousMask(.{ 255, 0, 255, 0 })); // scattered
 }
 
 test "parseRoutes: interface name longer than IFNAMSIZ is truncated, not dropped" {

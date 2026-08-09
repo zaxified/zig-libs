@@ -237,6 +237,88 @@ pub fn serializeHeaders(allocator: Allocator, h: Headers) Allocator.Error![]u8 {
 
 const testing = std.testing;
 
+test "external anchor: Wireshark's bitcoin dissector reads our inv payload field-for-field" {
+    // Audit F4. `inv`/`getdata`/`notfound` is the highest-volume message on the
+    // network and had NO oracle that could fail independently of whoever wrote
+    // this encoder — the wiki documents the field layout but publishes no hex
+    // dump, so the only decode test was self-labelled `in-house` and everything
+    // else was round-trip. A round-trip proves our encoder and our decoder share
+    // a convention, not that the convention is Bitcoin's.
+    //
+    // The oracle here is Wireshark's `bitcoin` dissector: a mature third-party
+    // reading of the same specification, which this repo already uses for the
+    // same purpose elsewhere (`scripts/dissect.py`). These bytes were emitted,
+    // wrapped in Ethernet/IPv4/TCP:8333, and handed to `sharkd`; the assertions
+    // below are what IT said they mean, transcribed. It is not a captured
+    // packet — no network access here — but it is an independent decoder, which
+    // is the property the finding was actually missing.
+    //
+    // Reproduce (needs `text2pcap` + `sharkd`, wireshark-common; sharkd needs
+    // `decode_as_entry: tcp.port,8333,(none),Bitcoin` in its config dir because
+    // the dissector does not claim the port on its own):
+    //
+    //   bitcoin.magic      == 0xf9beb4d9   Packet magic
+    //   bitcoin.command    == "inv"        Command name
+    //   bitcoin.length     == 73           Payload Length
+    //   bitcoin.checksum   == 0x5ac96253   Payload checksum
+    //   bitcoin.inv.count  == 2            Count            @ payload offset 0
+    //   bitcoin.inv.type   == 1            MSG_TX (1)       @ payload offset 1
+    //   bitcoin.inv.hash   == d3ad…0304    Data hash        @ payload offset 5
+    //   bitcoin.inv.type   == 2            MSG_BLOCK (2)    @ payload offset 37
+    //   bitcoin.inv.hash   == 6fe2…0000    Data hash        @ payload offset 41
+    //
+    // The oracle demonstrably BITES: re-emitting the same payload with the
+    // `type` field big-endian instead of little-endian makes the same dissector
+    // report `Type: Unknown (16777216)` and `Type: Unknown (33554432)` instead
+    // of MSG_TX/MSG_BLOCK. It is reading the field, not echoing us.
+    const allocator = testing.allocator;
+
+    // The exact payload bytes sharkd was shown (the `inv` message payload,
+    // i.e. after magic/command/length/checksum).
+    const wire = [_]u8{
+        0x02, // CompactSize count = 2
+        0x01, 0x00, 0x00, 0x00, // type = MSG_TX (LE)
+        0xd3, 0xad, 0x1b, 0x0b,
+        0x2e, 0x8f, 0x6a, 0x7c,
+        0x4d, 0x5e, 0x6f, 0x70,
+        0x81, 0x92, 0xa3, 0xb4,
+        0xc5, 0xd6, 0xe7, 0xf8,
+        0x09, 0x1a, 0x2b, 0x3c,
+        0x4d, 0x5e, 0x6f, 0x70,
+        0x81, 0x92, 0x03, 0x04,
+        0x02, 0x00, 0x00, 0x00, // type = MSG_BLOCK (LE)
+        // the mainnet genesis block hash, wire (internal) byte order
+        0x6f, 0xe2, 0x8c, 0x0a,
+        0xb6, 0xf1, 0xb3, 0x72,
+        0xc1, 0xa6, 0xa2, 0x46,
+        0xae, 0x63, 0xf7, 0x4f,
+        0x93, 0x1e, 0x83, 0x65,
+        0xe1, 0x5a, 0x08, 0x9c,
+        0x68, 0xd6, 0x19, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+
+    // 1. Our decoder agrees with the dissector's reading of these bytes.
+    var list = try decodeInventoryList(allocator, &wire);
+    defer list.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqual(INV_MSG_TX, list.items[0].kind);
+    try testing.expectEqualStrings("MSG_TX", knownName(list.items[0].kind).?);
+    try testing.expectEqualSlices(u8, wire[5..37], &list.items[0].hash);
+    try testing.expectEqual(INV_MSG_BLOCK, list.items[1].kind);
+    try testing.expectEqualStrings("MSG_BLOCK", knownName(list.items[1].kind).?);
+    try testing.expectEqualSlices(u8, wire[41..73], &list.items[1].hash);
+
+    // 2. Our ENCODER produces those bytes — this is the direction the finding
+    // was about, and the one a decode-only test cannot pin.
+    const out = try serializeInventoryList(allocator, list);
+    defer allocator.free(out);
+    try testing.expectEqualSlices(u8, &wire, out);
+
+    // 3. The framed length the dissector reported.
+    try testing.expectEqual(@as(usize, 73), wire.len);
+}
+
 test "in-house: InventoryList decodes a single MSG_TX inv_vect" {
     // The wiki documents `inv_vect`'s fields and the type-value table but
     // publishes no standalone hex dump for `inv`/`getdata`/`notfound`;
@@ -376,4 +458,35 @@ fn fuzzHeaders(_: void, smith: *std.testing.Smith) !void {
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     var h = decodeHeaders(allocator, buf[0..len]) catch return;
     defer h.deinit(allocator);
+}
+
+test "external anchor: the inventory type numbers are the protocol's, not ours" {
+    // `knownName` and the frozen `inv` anchor above only ever exercise MSG_TX
+    // and MSG_BLOCK, and they compare against these very constants — so every
+    // assertion stays true if a constant is edited. That is a test of the
+    // mechanism, not of the value. These numbers are wire contract: a wrong one
+    // means we ask a peer for an inventory type it does not recognise, or we
+    // silently misread the type it sends us, with no local test disagreeing.
+    //
+    // Values as published, spelled out here so the source is auditable:
+    //   0,1,2   — Bitcoin protocol `inv` message, ERROR/MSG_TX/MSG_BLOCK
+    //   3       — BIP37 `MSG_FILTERED_BLOCK` (getdata-only)
+    //   4       — BIP152 `MSG_CMPCT_BLOCK`
+    //   0x4000… — BIP144 sets bit 30 on the base type to request the witness
+    //             serialisation, giving 0x40000001/2/3.
+    try testing.expectEqual(@as(u32, 0), INV_ERROR);
+    try testing.expectEqual(@as(u32, 1), INV_MSG_TX);
+    try testing.expectEqual(@as(u32, 2), INV_MSG_BLOCK);
+    try testing.expectEqual(@as(u32, 3), INV_MSG_FILTERED_BLOCK);
+    try testing.expectEqual(@as(u32, 4), INV_MSG_CMPCT_BLOCK);
+    try testing.expectEqual(@as(u32, 0x40000001), INV_MSG_WITNESS_TX);
+    try testing.expectEqual(@as(u32, 0x40000002), INV_MSG_WITNESS_BLOCK);
+    try testing.expectEqual(@as(u32, 0x40000003), INV_MSG_FILTERED_WITNESS_BLOCK);
+
+    // The BIP144 witness flag is bit 30 of the base type, not three unrelated
+    // magic numbers — pin the relationship too, so a future type stays derivable.
+    const witness_flag: u32 = 1 << 30;
+    try testing.expectEqual(INV_MSG_WITNESS_TX, INV_MSG_TX | witness_flag);
+    try testing.expectEqual(INV_MSG_WITNESS_BLOCK, INV_MSG_BLOCK | witness_flag);
+    try testing.expectEqual(INV_MSG_FILTERED_WITNESS_BLOCK, INV_MSG_FILTERED_BLOCK | witness_flag);
 }

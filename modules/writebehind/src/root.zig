@@ -723,6 +723,22 @@ pub const Coordinator = struct {
             } else {
                 _ = self.cache.markClean(t.key);
                 self.removeKeySet(&self.orphans, t.key);
+                // F2: a durably-applied delete is exactly the point it is safe
+                // to garbage-collect its tombstone — the sink no longer has the
+                // key, so a future `get` miss (cache-miss + sink read-through)
+                // will correctly return null even without the tombstone
+                // shadowing it. `cache.remove` MUST run in the same breath as
+                // `dropTombstone`: they are the two halves of one atomic-on-
+                // this-thread step (Coordinator is `.single_owner` — no other
+                // call can interleave here), because a stale cached value from
+                // an earlier `put` to this key (its own flush already
+                // completed and `markClean`'d it, but nothing ever evicted it)
+                // would otherwise be served by `get`'s cache-hit path the
+                // instant the tombstone stops shadowing it.
+                if (t.op == .del) {
+                    _ = self.cache.remove(t.key);
+                    self.dropTombstone(t.key);
+                }
             }
         } else {
             // Sink write failed: return the record to the WAL for retry. The key
@@ -748,6 +764,15 @@ pub const Coordinator = struct {
                 } else {
                     _ = self.cache.markClean(t.key);
                     self.removeKeySet(&self.orphans, t.key);
+                    // Deliberately NOT the F2 tombstone-GC step above: a
+                    // dead-lettered delete never actually reached the sink
+                    // (that is what `poisonedCount`/`n_poisoned` mean), so the
+                    // sink still holds the pre-delete value. Dropping the
+                    // tombstone here would let a later `get` read-through
+                    // straight to that stale value — the tombstone must
+                    // outlive a poisoned delete forever, which is the
+                    // conservative side of the data loss `poisonedCount`
+                    // already documents.
                 }
             }
         }
@@ -1179,6 +1204,62 @@ test "F3: del() propagates OOM in tombstone/orphan registration instead of swall
     try testing.expectError(error.OutOfMemory, result);
 }
 
+test "F2: a durably-flushed delete's tombstone is reclaimed, and the stale cache entry with it" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = try rig.open(4);
+    defer c.deinit();
+
+    // A prior put, durably flushed — this is the stale cache entry that must
+    // not resurface once the tombstone stops shadowing it.
+    try c.put("k", "v1");
+    c.flushAll();
+    try testing.expectEqualStrings("v1", rig.sink.peek("k").?);
+
+    try c.del("k");
+    // Before the delete flushes: shadowed by the tombstone, and the
+    // bookkeeping this finding is about is present.
+    try testing.expect(c.tombstones.contains("k"));
+    try testing.expectEqual(@as(?[]const u8, null), try c.get("k"));
+
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 0), rig.sink.count()); // sink applied the delete
+
+    // F2: the tombstone is gone — reclaimed on durable delete-flush
+    // completion, not left to grow until some future `put` to this exact
+    // key. Without the fix this assertion is what goes RED (the tombstone
+    // set still contains "k" here).
+    try testing.expect(!c.tombstones.contains("k"));
+
+    // And the miss is still correct with the tombstone gone: `get` now falls
+    // through to a cache-miss + sink-read-through-miss, NOT a stale cache
+    // hit. This is the safety half of F2 — GC-ing the tombstone without also
+    // evicting the stale "v1" cache entry would resurrect deleted data here.
+    try testing.expectEqual(@as(?[]const u8, null), try c.get("k"));
+}
+
+test "F2: a poisoned (dead-lettered) delete keeps its tombstone forever, on purpose" {
+    // A sink whose delete always fails, so the WAL record dead-letters once
+    // it burns its (finite, here) attempt budget — the delete never actually
+    // reaches the sink.
+    var failing_rig: FailRig = undefined;
+    failing_rig.init(.{ .gpa = testing.allocator, .fail_delete = true });
+    defer failing_rig.deinit();
+    var c = try failing_rig.open(1); // max_flush_attempts = 1: dead-letters fast
+    defer c.deinit();
+
+    try c.del("k");
+    try testing.expect(c.tombstones.contains("k"));
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    // The delete never landed in the sink — GC-ing the tombstone here would
+    // let a later `get` read-through resurrect whatever the sink still has
+    // for "k". It must still be shadowed.
+    try testing.expect(c.tombstones.contains("k"));
+}
+
 test "F3: onEvict's dropped orphan registration is counted, not silently lost" {
     var rig: Rig = undefined;
     rig.init();
@@ -1487,6 +1568,10 @@ const FailingSink = struct {
     reject_key: ?[]const u8 = null,
     /// Total write attempts seen (accepted or not).
     seen: usize = 0,
+    /// Every delete attempt is rejected, forever (F2's poisoned-delete test:
+    /// unlike `fail_n`/`reject_key`, which only ever gate `write`, this is
+    /// the only way to make a delete never durably land).
+    fail_delete: bool = false,
 
     fn deinit(self: *FailingSink) void {
         var it = self.map.iterator();
@@ -1528,6 +1613,7 @@ const FailingSink = struct {
         const self: *FailingSink = @ptrCast(@alignCast(ptr));
         self.lock.lock();
         defer self.lock.unlock();
+        if (self.fail_delete) return error.SinkRejected;
         if (self.map.fetchRemove(key)) |old| {
             self.gpa.free(old.key);
             self.gpa.free(old.value);
