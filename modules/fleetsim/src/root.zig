@@ -1039,9 +1039,42 @@ test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
     });
     defer f.deinit();
 
-    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = false, .class = .class1 }} ** 8;
-    var analogs = [_]dnp3.outstation.AnalogInput{.{ .value = 0, .class = .class2 }} ** 4;
-    var counters = [_]dnp3.outstation.Counter{.{ .value = 0, .class = .class3 }} ** 2;
+    // The monitored fixture, then the control-direction verdict channel. See
+    // `dnp3_verdict`: analog output points 0..10 are the g41v1 slots the master
+    // writes its marks into, point 11 is bounded so a big write is *refused*,
+    // and binary outputs 0 and 1 are the two g12v1 control-relay bits.
+    //
+    // Deliberately more than one measured TYPE — three g30v1 signed integers,
+    // one g30v5 short float, two g20v1 unsigned counters and eight packed
+    // binaries — because a mark that spans two different decodes is one no
+    // echo of either operand can produce.
+    //
+    // Nothing here is animated. The earlier version of this test drove analog
+    // input 0 with a ramp, which made every response a function of when the
+    // poll landed and would have made the frozen replay in `master_goldens.zig`
+    // pin the scheduler instead of the protocol. The dynamic element of this
+    // test is the scheduled fault, which is what its name is about.
+    var binaries: [8]dnp3.outstation.BinaryInput = undefined;
+    for (&binaries, dnp3_verdict.binary_pattern) |*b, v| b.* = .{ .value = v, .class = .class1 };
+    var analogs = [_]dnp3.outstation.AnalogInput{
+        .{ .value = dnp3_verdict.analog_int[0], .class = .class2 },
+        .{ .value = dnp3_verdict.analog_int[1], .class = .class2 },
+        .{ .value = dnp3_verdict.analog_int[2], .class = .class2 },
+        // g30v5: an IEEE-754 short float, so the master has two different
+        // analog codecs to disagree with us about.
+        .{ .value = dnp3_verdict.analog_float, .class = .class2, .static_variation = 5 },
+    };
+    var counters = [_]dnp3.outstation.Counter{
+        .{ .value = dnp3_verdict.counters[0], .class = .class3 },
+        .{ .value = dnp3_verdict.counters[1], .class = .class3 },
+    };
+    var binary_outputs = [_]dnp3.outstation.BinaryOutputStatus{.{}} ** dnp3_verdict.binary_output_count;
+    var analog_outputs = [_]dnp3.outstation.AnalogOutputStatus{.{}} ** dnp3_verdict.analog_output_count;
+    // The last analog output is range-bounded, so the OUTSTATION gets to
+    // choose the refusal code for a write outside it. What the master writes
+    // back is the code opendnp3 read off the echoed command object — not our
+    // arithmetic wearing its name.
+    analog_outputs[dnp3_verdict.bounded_slot] = .{ .min = 0, .max = 100 };
     var events: [64]dnp3.outstation.Event = undefined;
     var rx_buf: [2048]u8 = undefined;
     var scratch: [512]u8 = undefined;
@@ -1052,24 +1085,19 @@ test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
     // setup instead of a patched example.
     station.init(
         .{ .address = 10, .master_address = 1, .unsolicited_supported = true },
-        .{ .binary_inputs = &binaries, .analog_inputs = &analogs, .counters = &counters },
+        .{
+            .binary_inputs = &binaries,
+            .analog_inputs = &analogs,
+            .counters = &counters,
+            .binary_outputs = &binary_outputs,
+            .analog_outputs = &analog_outputs,
+        },
         dnp3.outstation.EventBuffer.init(&events),
         &rx_buf,
         &scratch,
         &tx_fragment,
     );
     const id = try f.addNode(.{ .node = station.node(), .tag = 1, .tick_period_ms = 500 });
-
-    // A ramp animates analog input 0 while the master polls it.
-    var ai0: f64 = 0;
-    var s_ai = Cell{ .cell = &ai0 };
-    const sinks = [_]Sink{s_ai.sink()};
-    var sig = Signal{
-        .driver = .{ .ramp = .{ .start = 0, .per_ms = 0.01, .min = 0, .max = 100, .wrap = true } },
-        .sinks = &sinks,
-        .period_ms = 500,
-    };
-    try f.addSignal(&sig);
 
     try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
 
@@ -1097,7 +1125,183 @@ test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
     try testing.expect(st.replied > 0);
     // The scheduled fault really landed on the outstation.
     try testing.expect(station.station.device_trouble);
+    // …and the part that grades what the master DECODED. See `dnp3_verdict`.
+    try dnp3_verdict.expectAllPassed(&binary_outputs, &analog_outputs);
 }
+
+/// The contract between `scripts/vm/guests/fleetsim-dnp3-master.cpp` and the
+/// live DNP3 test.
+///
+/// **The write-back channel DNP3 offers.** The control direction: g41 analog
+/// output blocks and g12 control relay output blocks. `modules/dnp3`'s
+/// outstation implements both (`executeCommand`, `outstation.zig`) and stores
+/// what it accepted into `Database.analog_outputs` / `Database.binary_outputs`,
+/// so a mark commanded over the wire is readable here after the run. Nothing
+/// in the outstation was changed to make this lane work — the two write types
+/// this needs were already there.
+///
+/// **Why these marks and not an echo.** An echo is the exact inverse of the
+/// read, so a codec wrong in *both* directions round-trips clean and the fault
+/// hides inside it. So: `binary_bitmap` is packed from eight separate decodes;
+/// `analog_sum` is a sum over three; `counter_minus_analog` is a difference
+/// across two different type decodes (g20 unsigned counter minus g30 signed
+/// analog), which no echo of either operand can produce; `float_minus_analog`
+/// leaves the float domain entirely (a g30v5 short float scaled x100) and is
+/// then differenced against a g30v1 integer decode; `poll_checksum` folds every
+/// point of the integrity poll together with the DNP3 *group* opendnp3's own
+/// dispatch chose for it, so a superset, a missing header or right-values-under
+/// -the-wrong-type all fail it; `out_of_range` and `not_supported` are two
+/// different refusals the OUTSTATION chose and opendnp3 named, so collapsing
+/// "no such point" into "value out of range" is caught; and `iin_mask` is read
+/// off the application header rather than the object data, a channel no point
+/// value can reach.
+const dnp3_verdict = struct {
+    const binary_pattern = [8]bool{ true, false, true, true, false, true, false, true };
+    const analog_int = [3]f64{ 12345, -6789, 1000 };
+    const analog_float: f64 = 21.5;
+    const counters = [2]u32{ 100_000, 777 };
+
+    const binary_output_count = 4;
+    const analog_output_count = 12;
+    /// The range-bounded analog output. Also the LAST one, so it is still part
+    /// of the integrity poll and therefore of `poll_checksum`.
+    const bounded_slot = analog_output_count - 1;
+
+    /// Verdict slots, in the order the master writes them.
+    const slot_magic = 0;
+    const slot_checks = 1;
+    const slot_failures = 2;
+    const slot_bitmap = 3;
+    const slot_analog_sum = 4;
+    const slot_counter_minus_analog = 5;
+    const slot_float_minus_analog = 6;
+    const slot_poll_checksum = 7;
+    const slot_out_of_range = 8;
+    const slot_not_supported = 9;
+    const slot_iin_mask = 10;
+
+    /// Control relay output blocks.
+    const bo_pass = 0;
+    const bo_trouble_seen = 1;
+
+    const magic: i32 = 53619; // 0xD173
+    /// Prime; the running sum stays far inside an i32.
+    const checksum_mod: i64 = 30011;
+    /// Every `check(...)` in the master, counted where the master counts them:
+    /// after the two refusals and before the marks are written, so the verdict
+    /// writes do not count themselves.
+    const graded_checks: i32 = 20;
+
+    /// IEEE 1815 §A "Command status" codes, as opendnp3's `CommandStatus`
+    /// enumerates them. Not our numbering: the master writes back
+    /// `static_cast<int32_t>` of what its own parser produced.
+    const out_of_range_code: i32 = 12;
+    const not_supported_code: i32 = 4;
+
+    /// bit0 IIN1.7 seen at startup · bit1 IIN1.6 clear before the fault ·
+    /// bit2 IIN1.6 set after it.
+    const iin_mask_all: i32 = 0b111;
+
+    fn bitmap() i32 {
+        var m: i32 = 0;
+        for (binary_pattern, 0..) |v, i| {
+            if (v) m |= @as(i32, 1) << @intCast(i);
+        }
+        return m;
+    }
+
+    fn analogSum() i32 {
+        var s: f64 = 0;
+        for (analog_int) |v| s += v;
+        return @intFromFloat(s);
+    }
+
+    fn floatX100() i32 {
+        return @intFromFloat(@round(analog_float * 100));
+    }
+
+    fn counterMinusAnalog() i32 {
+        return @as(i32, @intCast(counters[0])) - @as(i32, @intFromFloat(analog_int[0]));
+    }
+
+    fn floatMinusAnalog() i32 {
+        return floatX100() - @as(i32, @intFromFloat(analog_int[1]));
+    }
+
+    /// Recomputed from the fixture, exactly as the master computes it from what
+    /// it decoded: `sum(index * 7 + group)` over every point of the integrity
+    /// response, mod a prime. The group is the one opendnp3 chose by handing
+    /// the values to a particular typed `ISOEHandler::Process` overload.
+    fn pollChecksum() i32 {
+        const kinds = [_]struct { n: usize, group: i64 }{
+            .{ .n = binary_pattern.len, .group = 1 },
+            .{ .n = analog_int.len + 1, .group = 30 },
+            .{ .n = counters.len, .group = 20 },
+            .{ .n = binary_output_count, .group = 10 },
+            .{ .n = analog_output_count, .group = 40 },
+        };
+        var sum: i64 = 0;
+        for (kinds) |k| {
+            for (0..k.n) |i| sum += @as(i64, @intCast(i)) * 7 + k.group;
+        }
+        return @intCast(@rem(sum, checksum_mod));
+    }
+
+    fn mark(analog_outputs: []const dnp3.outstation.AnalogOutputStatus, i: usize) i32 {
+        return @intFromFloat(analog_outputs[i].value);
+    }
+
+    fn expectAllPassed(
+        binary_outputs: []const dnp3.outstation.BinaryOutputStatus,
+        analog_outputs: []const dnp3.outstation.AnalogOutputStatus,
+    ) !void {
+        const got_magic = mark(analog_outputs, slot_magic);
+        if (got_magic != magic) {
+            std.debug.print(
+                "live fleetsim DNP3: no verdict block (analog output {d}={d}, want {d}) — the" ++
+                    " master never commanded its marks, so nothing here graded the outstation\n",
+                .{ slot_magic, got_magic, magic },
+            );
+            return error.NoMasterVerdict;
+        }
+        std.debug.print(
+            "live fleetsim DNP3 verdict: checks={d} failures={d} bitmap=0b{b} analog_sum={d}" ++
+                " counter_minus_analog={d} float_minus_analog={d} poll_checksum={d}" ++
+                " out_of_range={d} not_supported={d} iin_mask=0b{b} trouble_seen={} pass={}\n",
+            .{
+                mark(analog_outputs, slot_checks),
+                mark(analog_outputs, slot_failures),
+                @as(u32, @bitCast(mark(analog_outputs, slot_bitmap))),
+                mark(analog_outputs, slot_analog_sum),
+                mark(analog_outputs, slot_counter_minus_analog),
+                mark(analog_outputs, slot_float_minus_analog),
+                mark(analog_outputs, slot_poll_checksum),
+                mark(analog_outputs, slot_out_of_range),
+                mark(analog_outputs, slot_not_supported),
+                @as(u32, @bitCast(mark(analog_outputs, slot_iin_mask))),
+                binary_outputs[bo_trouble_seen].value,
+                binary_outputs[bo_pass].value,
+            },
+        );
+        try testing.expectEqual(graded_checks, mark(analog_outputs, slot_checks));
+        try testing.expectEqual(@as(i32, 0), mark(analog_outputs, slot_failures));
+        try testing.expectEqual(bitmap(), mark(analog_outputs, slot_bitmap));
+        try testing.expectEqual(analogSum(), mark(analog_outputs, slot_analog_sum));
+        try testing.expectEqual(counterMinusAnalog(), mark(analog_outputs, slot_counter_minus_analog));
+        try testing.expectEqual(floatMinusAnalog(), mark(analog_outputs, slot_float_minus_analog));
+        try testing.expectEqual(pollChecksum(), mark(analog_outputs, slot_poll_checksum));
+        try testing.expectEqual(out_of_range_code, mark(analog_outputs, slot_out_of_range));
+        try testing.expectEqual(not_supported_code, mark(analog_outputs, slot_not_supported));
+        try testing.expectEqual(iin_mask_all, mark(analog_outputs, slot_iin_mask));
+        // The bounded slot must still be untouched: its refusal is a mark in
+        // itself, and a device that accepted 999999 there would show up here.
+        try testing.expectEqual(@as(f64, 0), analog_outputs[bounded_slot].value);
+        try testing.expect(binary_outputs[bo_trouble_seen].value);
+        // Commanded last and commanded either way: `false` is a real master
+        // saying, over the wire, that it was here and is not satisfied.
+        try testing.expect(binary_outputs[bo_pass].value);
+    }
+};
 
 test "live: a real IEC 104 master drives a simulated outstation, and sees iv quality" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

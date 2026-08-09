@@ -166,15 +166,16 @@ t=15 s so the master watches the device degrade under it:
 FLEETSIM_TEST_LISTEN=127.0.0.1:15020    zig build test-fleetsim   # pymodbus
 FLEETSIM_ENIP_LISTEN=127.0.0.1:15021    zig build test-fleetsim   # pycomm3
 FLEETSIM_BACNET_LISTEN=127.0.0.1:15022  zig build test-fleetsim   # bacpypes3 (UDP)
-FLEETSIM_DNP3_LISTEN=127.0.0.1:20000    zig build test-fleetsim   # opendnp3 master-demo
+FLEETSIM_DNP3_LISTEN=127.0.0.1:15026    zig build test-fleetsim   # opendnp3 3.1.2 (C++)
 FLEETSIM_IEC104_LISTEN=127.0.0.1:15023  zig build test-fleetsim   # c104 (lib60870)
 FLEETSIM_S7_LISTEN=127.0.0.1:15024      zig build test-fleetsim   # python-snap7
 FLEETSIM_OPCUA_LISTEN=127.0.0.1:15025   zig build test-fleetsim   # asyncua
-FLEETSIM_MULTI_LISTEN=127.0.0.1:15026,15027 zig build test-fleetsim  # two masters at once
+FLEETSIM_MULTI_LISTEN=127.0.0.1:15027,15028 zig build test-fleetsim  # two masters at once
 ```
 
-The DNP3 test matches opendnp3's `master-demo` defaults (outstation address 10,
-master 1, port 20000) so the oracle needs no patching.
+The DNP3 test keeps opendnp3's `master-demo` link addressing (outstation 10,
+master 1) so the oracle needs no patching; the port is the lane's, not 20000,
+because seven masters share one guest.
 
 ### The one-command route: the disposable-VM lane
 
@@ -186,7 +187,7 @@ there is no reason not to install freely, because the host is never touched:
 scripts/vm/run.sh fleetsim debian
 ```
 
-That boots the provisioned Debian guest and runs **five** live tests inside it
+That boots the provisioned Debian guest and runs **seven** live tests inside it
 with `FLEETSIM_EXPECT_LIVE=1`, each with a real third-party counterpart
 installed into the image by the provisioning recipe, not by you:
 
@@ -197,6 +198,8 @@ installed into the image by the provisioning recipe, not by you:
 | BACnet | bacpypes3 0.0.106 | `WriteProperty` into eight analog-values + a binary-value |
 | S7comm | python-snap7 3.1.0 | a DB write into DB2 |
 | OPC UA | asyncua 2.0.1 | the `Write` service into `ns=1;s=verdict.*` |
+| IEC 104 | c104 2.2.1 | `C_SE_NB_1` set-points at IOA 900..909 + a `C_SC_NA_1` pass bit |
+| DNP3 | opendnp3 3.1.2 (built from source) | g41v1 analog output blocks 0..10 + two g12v1 control relay blocks |
 
 ~6 min end to end (the live tests run one after another, each holding its
 socket for the full 60 s `live_run_ms`); the one-off `scripts/vm/provision.sh
@@ -226,14 +229,13 @@ encoder and decoder share the same wrong convention round-trips it cleanly and
 the fault hides inside the mark. OPC UA is where that bites hardest (Int32 in,
 Int32 out), which is why its value mark folds a Double-derived term in.
 
-One master is still not wired: **opendnp3** publishes no wheel — it is a C++
-library with a `master-demo` example that has to be built, which is a different
-kind of provisioning step from `pip install`. Adding a master is four edits that
-must happen together, all listed in `run.sh`'s fleetsim master table: the pinned
-spec in `scripts/vm/manifest.sh`'s `VM_DEBIAN_PIP`, a row in that table (which
-drives the launcher, the marker gate and the test filter at once), a driver
-script in `scripts/vm/guests/`, and a verdict channel in the live test. A master
-that only reads leaves no trace of what it understood.
+All seven are wired. Adding a master is four edits that must happen together,
+all reachable from `run.sh`'s fleetsim master table: a pinned spec in
+`scripts/vm/manifest.sh` (`VM_DEBIAN_PIP` for a wheel, `VM_DEBIAN_SRC` for a
+source build), a row in that table — which drives the source file, the
+compile-or-not step, the launcher, the marker gate and the test filter at once —
+a driver in `scripts/vm/guests/`, and a verdict channel in the live test. A
+master that only reads leaves no trace of what it understood.
 
 What those runs produced is frozen in `src/master_goldens.zig` and replays
 offline on every build, so the ordinary `zig build test-fleetsim` carries the
@@ -266,44 +268,66 @@ toolchain at all** — re-verified while provisioning the current image
 `Successfully installed … c104-2.2.1`, `PROVISION_EXIT=0`). The warning is
 about interpreters ahead of that image, not about this lane.
 
-### DNP3: what exists, and what it would cost
+### DNP3: why the seventh master is built from source
 
-Surveyed 2026-08-10, because "no wheel" is the reason this one master is still
-outstanding and the alternatives deserve to be on the record rather than
-re-derived:
+Surveyed 2026-08-10 and **built** 2026-08-10. "No wheel" is why this master sat
+out four sessions; the alternatives are on the record so nobody re-derives them:
 
 | Candidate | Verdict |
 |---|---|
-| `pydnp3` (PyPI, pybind11 over opendnp3) | **Dead.** Last release 2018-06-07. No Linux binary wheel ever published — the only wheels are macOS `cp27/cp35/cp36` plus `cpXX-none-any`. On Python 3.13 pip falls through to the sdist, i.e. a full C++ build. |
+| `pydnp3` (PyPI, pybind11 over opendnp3) | **Dead.** Last release 2018-06-07. No Linux binary wheel ever published — the only wheels are macOS `cp27/cp35/cp36` plus `cpXX-none-any`. On Python 3.13 pip falls through to the sdist, i.e. a full C++ build of a 2018 pybind11 project. |
 | `dnp3-python` (PyPI, VOLTTRON, wrapper over opendnp3) | **Wrong interpreter.** Newest wheel is `0.3.0b2-cp310-manylinux1_x86_64` (2024-11). No cp311+ build exists, and Debian 13 ships 3.13 — so it does not install, wheel or otherwise. |
 | Debian package (`dnp3*`, `libopendnp3*`) | **Does not exist.** `packages.debian.org` returns no match in *any* suite, and there is no `opendnp3` source package. The cheap apt route is closed. |
 | `stepfunc/dnp3` (Rust, the actively-maintained successor) | **Licence blocker.** Alive (crates.io 1.7.0-RC4, pushed 2026-07), but `LICENSE.txt` is a proprietary evaluation agreement limited to "non-commercial and non-production" use — an owner decision, not a drop-in. |
-| `opendnp3` C++ itself | **Archived** upstream on 2022-05-18; last release 3.1.2 (2022-04-22), Apache-2.0. Still builds. |
+| `opendnp3` C++ itself | **What is used.** Archived upstream 2022-05-18, last release 3.1.2 (2022-04-22), Apache-2.0, and still compiling clean on a 2026 toolchain. |
 
-So the only free, unencumbered DNP3 master is a source build of an archived C++
-library. **Measured** (this host, 8 cores, `-j4`, g++ 15.2, `-DDNP3_TLS=OFF`):
-`cmake` configure + build of 3.1.2 with `-DDNP3_EXAMPLES=ON` took **53 s** and
-produced a **34 MB** build tree containing `cpp/examples/master/master-demo`.
-It compiles clean on a 2026 toolchain despite the 2022 freeze.
+The compile was never the expensive part — it is about a minute. What cost
+something is that the VM lane caches its guest on a hash of the recipe
+(`scripts/vm/recipe.sh`), and that recipe text had exactly **two** slots: an apt
+package list and a pinned pip list. A from-source master needed a **third**, and
+adding it as a manual step instead would have broken the one property the hash
+exists to guarantee — that a stale image is *unreachable* rather than silently
+reused.
 
-The compile is *not* the expensive part. The VM lane caches its guest on a hash
-of the recipe (`scripts/vm/recipe.sh`), and that recipe text has exactly two
-slots — an apt package list and a pinned pip list. A from-source master needs a
-third: a pinned source (URL + tag + checksum, matching what
-`fetch-images.sh` already does for the images) and a build command, threaded
-through `recipe_text` and `provision-debian.exp`, plus `build-essential` and
-`cmake` in the guest. That is a change to how the lane defines an image, not a
-list edit — which is why it is still open rather than done.
-
-To run the master by hand instead:
+So `manifest.sh` gained `VM_DEBIAN_SRC`, five `|`-separated fields per entry:
 
 ```
-git clone --branch release https://github.com/dnp3/opendnp3.git
-cmake -S opendnp3 -B opendnp3/build -DDNP3_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build opendnp3/build -j"$(nproc)"
+name | version | url | sha256 | cmake-flags
 ```
 
-then run its `master-demo` example unpatched.
+* the **sha256 is verified inside the guest**, before a byte is extracted, so a
+  regenerated or substituted upstream archive fails provisioning loudly instead
+  of quietly producing an image that disagrees with its own recipe;
+* **all five fields are hashed** into the recipe, exactly like an apt name or a
+  pip pin. Verified rather than assumed: changing the tag, the checksum, the URL
+  or a single cmake flag each produces a different `recipe-sha256` and therefore
+  a different image *filename*;
+* the **build is part of provisioning** (`provision-debian.exp`: fetch → verify
+  → extract → configure → build → install → `ldconfig`), never a step somebody
+  has to remember;
+* `build-essential` and `cmake` are in the apt slot, and the guest went from
+  832 MB to **1.4 GB** as a result.
+
+opendnp3's own CMake pulls asio 1.16.0, exe4cpp and ser4cpp with `FetchContent`
+at configure time, each declared with a `URL_HASH SHA1=…` in `deps/*.cmake` — so
+the chain of custody holds one level down without this repo restating it.
+
+Because DNP3 has no scriptable master binary (`master-demo` is an interactive
+REPL), the driver is a program: `scripts/vm/guests/fleetsim-dnp3-master.cpp`,
+compiled in the guest against opendnp3's public headers. It **calls** the
+library rather than reimplementing it — there is no DNP3 framing, no CRC and no
+object parsing of ours anywhere in the path, and the only protocol-aware line in
+the driver is a length-field read used to cut the recorded byte stream into
+frames for the capture.
+
+To build it by hand outside the lane:
+
+```
+curl -fsSLO https://codeload.github.com/dnp3/opendnp3/tar.gz/refs/tags/3.1.2
+cmake -S opendnp3-3.1.2 -B build -DCMAKE_BUILD_TYPE=Release -DDNP3_TLS=OFF
+cmake --build build -j"$(nproc)" && cmake --install build
+g++ -std=c++17 -O1 -o fm-dnp3 scripts/vm/guests/fleetsim-dnp3-master.cpp -lopendnp3 -lpthread
+```
 
 What was actually run against real third-party masters (all seven protocols,
 with the transcript of what each master did), the determinism proof, the

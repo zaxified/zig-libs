@@ -224,11 +224,39 @@ provision_debian() {
         fi
     done
 
+    # A source slot with no checksum, no URL or a floating tag would make the
+    # recipe hash a lie in exactly the way an unpinned pip spec would: the same
+    # recipe text would build different bytes tomorrow. Refuse before booting.
+    local rec name ver url sha
+    for rec in "${VM_DEBIAN_SRC[@]:-}"; do
+        [[ -z "$rec" ]] && continue
+        IFS='|' read -r name ver url sha _ <<< "$rec"
+        if [[ -z "$name" || -z "$ver" || -z "$url" || -z "$sha" ]]; then
+            echo "provision: source spec '$rec' is missing a field (name|version|url|sha256|cmake-flags)" >&2
+            exit 1
+        fi
+        if [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "provision: source spec '$name' has no sha256 — refusing" >&2
+            echo "           the recipe hash must describe exactly what lands in the image" >&2
+            exit 1
+        fi
+    done
+
     local hash='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'
     local log="$WORK_DIR/provision-debian.log"
     echo "debian: booting (no -snapshot) to apt-get install ${VM_DEBIAN_PACKAGES[*]}"
     [[ ${#VM_DEBIAN_PIP[@]} -gt 0 ]] && echo "debian:   then pip install ${VM_DEBIAN_PIP[*]}"
-    if ! expect "$SCRIPT_DIR/provision-debian.exp" "$tmp" "$hash" 1024 "${VM_DEBIAN_PACKAGES[*]}" "${VM_DEBIAN_PIP[*]:-}" >"$log" 2>&1; then
+    for rec in "${VM_DEBIAN_SRC[@]:-}"; do
+        [[ -z "$rec" ]] && continue
+        IFS='|' read -r name ver url sha _ <<< "$rec"
+        echo "debian:   then build $name $ver from source ($url)"
+    done
+    # 2048 MB, not 1024: the source slot runs four g++ processes at once.
+    local srcarg=""
+    if [[ ${#VM_DEBIAN_SRC[@]} -gt 0 ]]; then
+        srcarg="$(printf '%s\n' "${VM_DEBIAN_SRC[@]}")"
+    fi
+    if ! expect "$SCRIPT_DIR/provision-debian.exp" "$tmp" "$hash" 2048 "${VM_DEBIAN_PACKAGES[*]}" "${VM_DEBIAN_PIP[*]:-}" "$srcarg" >"$log" 2>&1; then
         echo "provision: debian provisioning boot FAILED — see $log" >&2
         tail -30 "$log" >&2
         rm -f "$tmp"

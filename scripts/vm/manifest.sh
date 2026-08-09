@@ -172,6 +172,16 @@ VM_DEBIAN_PACKAGES=(
     ethtool
     kmod
     bpftool
+    # Declared rather than assumed (like iproute2 above): run.sh's guest_setup
+    # curls the test binary and the master drivers out of a one-off host HTTP
+    # server, and the source-build slot below fetches a tarball over TLS.
+    curl
+    ca-certificates
+    # The toolchain the VM_DEBIAN_SRC slot below needs. Present ONLY because a
+    # from-source build is in the recipe — see that block for why DNP3 leaves
+    # no other route.
+    build-essential
+    cmake
     # isis-spf's anchor: a real IS-IS speaker whose SPF result we capture
     # ourselves. FRR is GPL, but GPLv2 §0 restricts only the program, not its
     # output — a routing table computed from our topology is not a work based
@@ -249,6 +259,69 @@ VM_DEBIAN_PIP=(
     # earlier note in fleetsim's README claiming it needs build-essential +
     # cmake was wrong and has been corrected.
     c104==2.2.1
+)
+
+# DECLARATIVE from-source build list for the provisioned Debian image — the
+# THIRD recipe slot, alongside apt and pip. Installed inside the same
+# provisioning boot, after both of them.
+#
+# ── why a third slot exists at all ───────────────────────────────────────
+#
+# It exists for exactly one counterpart, and only after the cheap routes were
+# checked and found closed. `fleetsim`'s seventh live master is DNP3, and
+# there is no packaged DNP3 master this guest can install:
+#
+#   * `pydnp3` (PyPI, pybind11 over opendnp3) last released 2018-06-07 and
+#     never published a Linux binary wheel. On Python 3.13 pip falls through
+#     to the sdist, i.e. a full C++ build of a 2018 pybind11 project — which
+#     is strictly worse than building opendnp3 itself.
+#   * `dnp3-python` (VOLTTRON) newest wheel is cp310; this guest is Debian 13
+#     / Python 3.13. It does not install.
+#   * Debian packages no DNP3 stack in ANY suite — no `dnp3`, no `opendnp3`,
+#     no source package. The apt route, the cheap one, is closed.
+#   * `stepfunc/dnp3`, the actively maintained Rust successor, ships a
+#     PROPRIETARY evaluation licence limited to non-commercial, non-production
+#     use. Out on licence, not on technique.
+#
+# What is left is `opendnp3` itself: Apache-2.0, upstream archived 2022-05-18,
+# last release 3.1.2, and still compiling clean on a 2026 toolchain.
+#
+# ── what a slot is, and what makes it safe ───────────────────────────────
+#
+# Five `|`-separated fields: name | version | url | sha256 | cmake-flags.
+#
+#   * the sha256 is verified IN THE GUEST, before anything is extracted, so
+#     the image cannot silently change under us if the archive is regenerated
+#     upstream. Same posture as fetch-images.sh's pins (stage 1), applied one
+#     level further in.
+#   * every field goes into the recipe text and therefore into the recipe
+#     hash, exactly like an apt name or a pip pin. Change the version, the
+#     URL, the checksum or a cmake flag and the provisioned image's FILENAME
+#     changes — so a stale image is unreachable rather than silently reused.
+#     That is the whole point of the hash and this slot does not weaken it.
+#   * the build is part of provisioning (provision-debian.exp), never a manual
+#     step somebody has to remember. A manual step is precisely what the hash
+#     cannot describe.
+#
+# The BUILD PROCEDURE itself — fetch, verify, extract, `cmake -S … -B …` with
+# these flags, `cmake --build -j`, `cmake --install`, `ldconfig` — lives in
+# provision-debian.exp and is covered by VM_RECIPE_VERSION, which is what that
+# knob is for. A slot that needed a different procedure would be a procedure
+# change, not a list edit.
+#
+# ── the transitive pins ──────────────────────────────────────────────────
+#
+# opendnp3's CMake pulls four dependencies with FetchContent at CONFIGURE
+# time: asio 1.16.0, Catch2 2.11.3, exe4cpp and ser4cpp. Checked, not assumed:
+# every one of them is declared with a `URL_HASH SHA1=…` in deps/*.cmake, so
+# the chain of custody holds one level down without us restating it. (Catch2
+# is only used with -DDNP3_TESTS=ON, which is off here.)
+#
+# Nothing from opendnp3 is vendored into this repository. It is fetched,
+# built, run as a separate process inside a disposable guest, and discarded
+# with the guest. The licence posture is recorded in modules/fleetsim/NOTICE.
+VM_DEBIAN_SRC=(
+    "opendnp3|3.1.2|https://codeload.github.com/dnp3/opendnp3/tar.gz/refs/tags/3.1.2|183cc29222c3cb58099a9753c43defed5cb8677fda985c3f88e38b5c19a36ff2|-DCMAKE_BUILD_TYPE=Release -DDNP3_TLS=OFF -DDNP3_TESTS=OFF -DDNP3_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX=/usr/local"
 )
 
 # ── what this image CANNOT provide, so nobody re-derives it ──────────────

@@ -135,19 +135,21 @@ route_platform() {
 # NOT here, deliberately: devlink/netdevsim. netdevsim.ko is shipped by no
 # Debian and no OpenWRT package — see manifest.sh's "what this image CANNOT
 # provide" note rather than re-deriving it.
-#   fleetsim -> five real third-party SCADA masters. Its live tests are the
+#   fleetsim -> seven real third-party SCADA masters. Its live tests are the
 #              only external anchor the module has, and every one of them
 #              needs a counterpart process that cannot be installed on the dev
 #              host (pip-only libraries, and the owner's standing rule is that
 #              a venv is one-shot). Inside a disposable guest that constraint
 #              does not apply: pymodbus 3.14.0, pycomm3 1.2.16, bacpypes3
-#              0.0.106, python-snap7 3.1.0 and asyncua 2.0.1 are baked into
-#              the provisioned image by the recipe (manifest.sh's
-#              VM_DEBIAN_PIP), and guests/fleetsim-<protocol>-master.py drives
-#              each simulated device through a byte tap so the sessions can
-#              also be frozen into the offline suite. Every master retries its
-#              connect for the whole run budget, so neither the start race nor
-#              the sequential test order matters.
+#              0.0.106, python-snap7 3.1.0, asyncua 2.0.1 and c104 2.2.1 are
+#              baked into the provisioned image by the recipe (manifest.sh's
+#              VM_DEBIAN_PIP), and opendnp3 3.1.2 is BUILT into it from a
+#              pinned source (VM_DEBIAN_SRC) because DNP3 has no installable
+#              master for this interpreter. guests/fleetsim-<protocol>-master.*
+#              drives each simulated device through a byte tap so the sessions
+#              can also be frozen into the offline suite. Every master retries
+#              its connect for the whole run budget, so neither the start race
+#              nor the sequential test order matters.
 #
 #              Each master also GRADES: it writes what it decoded back into
 #              the device through that protocol's own write service, and the
@@ -182,11 +184,17 @@ guest_setup() {
             done
             setup+='export FLEETSIM_EXPECT_LIVE=1; '
             for m in $(fleetsim_masters); do
-                setup+="curl -fsS http://10.0.2.2:$HTTP_PORT/fleetsim-$m-master.py -o /tmp/fm-$m.py && "
+                setup+="curl -fsS http://10.0.2.2:$HTTP_PORT/$(basename "$(fleetsim_master_src "$m")") -o /tmp/$(basename "$(fleetsim_master_src "$m")") && "
+            done
+            # A master whose driver is not already executable is prepared here,
+            # inside the same `&&` chain, so a failed compile lands as
+            # SETUP_FAIL rather than as a mysteriously absent counterpart.
+            for m in $(fleetsim_masters); do
+                setup+="$(fleetsim_master_prep "$m")"
             done
             setup+='python3 -m pip show pymodbus > /dev/null && echo SETUP_OK || echo SETUP_FAIL; '
             for m in $(fleetsim_masters); do
-                setup+="nohup python3 /tmp/fm-$m.py 127.0.0.1 $(fleetsim_master_port "$m") $FLEETSIM_MASTER_WAIT > /tmp/fm-$m.log 2>&1 & "
+                setup+="nohup $(fleetsim_master_run "$m") 127.0.0.1 $(fleetsim_master_port "$m") $FLEETSIM_MASTER_WAIT > /tmp/fm-$m.log 2>&1 & "
             done
             printf '%s' "$setup"
             ;;
@@ -205,7 +213,7 @@ guest_setup() {
 # one driver). It is a development affordance, not a supported mode: the
 # default is every master, and that is what the lane is judged on.
 fleetsim_masters() {
-    printf '%s\n' "${FLEETSIM_MASTERS:-modbus enip bacnet s7 opcua iec104}"
+    printf '%s\n' "${FLEETSIM_MASTERS:-modbus enip bacnet s7 opcua iec104 dnp3}"
 }
 
 fleetsim_master_env() {
@@ -216,6 +224,7 @@ fleetsim_master_env() {
         s7)     echo FLEETSIM_S7_LISTEN ;;
         opcua)  echo FLEETSIM_OPCUA_LISTEN ;;
         iec104) echo FLEETSIM_IEC104_LISTEN ;;
+        dnp3)   echo FLEETSIM_DNP3_LISTEN ;;
     esac
 }
 
@@ -227,6 +236,7 @@ fleetsim_master_port() {
         s7)     echo 15024 ;;
         opcua)  echo 15025 ;;
         iec104) echo 15023 ;;
+        dnp3)   echo 15026 ;;
     esac
 }
 
@@ -238,6 +248,7 @@ fleetsim_master_marker() {
         s7)     echo S7_MASTER_DONE ;;
         opcua)  echo OPCUA_MASTER_DONE ;;
         iec104) echo IEC104_MASTER_DONE ;;
+        dnp3)   echo DNP3_MASTER_DONE ;;
     esac
 }
 
@@ -250,14 +261,52 @@ fleetsim_master_filter() {
         s7)     echo 'live: a real S7 client' ;;
         opcua)  echo 'live: a real OPC UA client' ;;
         iec104) echo 'live: a real IEC 104 master' ;;
+        dnp3)   echo 'live: a real DNP3 master' ;;
+    esac
+}
+
+# The driver's source file, repo-relative. Six of the seven are Python
+# libraries; DNP3 is a C++ program against the opendnp3 stack the recipe's
+# source slot builds into the guest, because no installable DNP3 master exists
+# for this interpreter (see manifest.sh's VM_DEBIAN_SRC). The extension is what
+# drives the two functions below, so the difference lives in this table rather
+# than in the setup line.
+fleetsim_master_src() {
+    case "$1" in
+        dnp3) echo "scripts/vm/guests/fleetsim-$1-master.cpp" ;;
+        *)    echo "scripts/vm/guests/fleetsim-$1-master.py" ;;
+    esac
+}
+
+# Anything that must happen between fetching the driver and launching it,
+# as an `&&`-terminated fragment of the SETUP_OK chain. Empty for a script.
+fleetsim_master_prep() {
+    case "$1" in
+        dnp3) printf '%s' "g++ -std=c++17 -O1 -o /tmp/fm-dnp3 /tmp/fleetsim-dnp3-master.cpp -lopendnp3 -lpthread && " ;;
+        *)    printf '' ;;
+    esac
+}
+
+# How the driver is launched. It is always invoked as `<cmd> <host> <port>
+# <wait-seconds>`.
+fleetsim_master_run() {
+    case "$1" in
+        dnp3) echo "/tmp/fm-dnp3" ;;
+        *)    echo "python3 /tmp/fleetsim-$1-master.py" ;;
     esac
 }
 
 # How long each master waits for its device, in seconds. Sized from the run
 # itself: N live tests x `live_run_ms` (60 s each, sequential) plus boot and
 # the binary's own startup. Deliberately generous — the cost of overshooting
-# is a process sleeping in a VM that is about to be discarded.
-FLEETSIM_MASTER_WAIT=420
+# is a process sleeping in a VM that is about to be discarded, while the cost
+# of undershooting is the LAST master in the order giving up seconds before its
+# device binds, which presents as a broken lane rather than as a timeout.
+#
+# At seven masters the old 420 was exactly 7 x 60 — i.e. zero margin, and only
+# green because the last test starts before the full budget has elapsed. Sized
+# with slack instead of to the cliff.
+FLEETSIM_MASTER_WAIT=600
 
 # Runs AFTER the test binary, before GUEST_EXIT is reported. Its own exit code
 # is deliberately discarded — the binary's is what this lane propagates.
@@ -284,7 +333,7 @@ guest_files() {
         fleetsim)
             local m
             for m in $(fleetsim_masters); do
-                printf '%s\n' "scripts/vm/guests/fleetsim-$m-master.py"
+                fleetsim_master_src "$m"
             done
             ;;
         *) printf '' ;;
@@ -332,22 +381,23 @@ guest_mem() {
 # socket open for a 60s budget by design.
 guest_cmd_timeout() {
     case "$1" in
-        # Six live tests, each holding its socket for the full 60 s
-        # `live_run_ms`, run one after another — plus boot, plus the rest of
-        # the filtered suite. 900 leaves headroom over the ~390 s that costs.
-        fleetsim) echo 900 ;;
+        # Seven live tests, each holding its socket for the full 60 s
+        # `live_run_ms`, run one after another — plus boot, plus the g++
+        # compile of the DNP3 driver, plus the rest of the filtered suite.
+        # 1200 leaves headroom over the ~450 s that costs.
+        fleetsim) echo 1200 ;;
         *) echo 90 ;;
     esac
 }
 
 # A default --test-filter, when running the WHOLE suite in the VM would be
-# wrong. fleetsim: the guest carries six masters, and FLEETSIM_EXPECT_LIVE=1
+# wrong. fleetsim: the guest carries seven masters, and FLEETSIM_EXPECT_LIVE=1
 # turns "did not run" into a failure for every live test — so without a filter
-# the live tests whose master is NOT installed (DNP3's opendnp3 — no wheel
-# exists — and the two-masters case) would fail for the wrong reason. Filtering to
-# the tests the guest can actually serve keeps the failure signal honest. The
-# master table above is the single place all of this is listed, so adding a
-# master widens the pip list, the filter, the marker gate and the launcher
+# the one live test with no counterpart in this guest (the two-masters/one-
+# thread case) would fail for the wrong reason. Filtering to the tests the
+# guest can actually serve keeps the failure signal honest. The master table
+# above is the single place all of this is listed, so adding a master widens
+# the recipe pin, the driver, the launcher, the marker gate and the filter
 # together — never separately.
 guest_default_filter() {
     case "$1" in
@@ -581,7 +631,7 @@ echo "vm: wall time $((t1 - t0))s (full log: $VMLOG)"
 # pipefail` — which this script sets — `grep -q` exits the moment it matches,
 # `echo` then dies of SIGPIPE (141), and the PIPELINE reports 141 even though
 # the pattern WAS found. That is invisible while the guest prints a few lines
-# and fires the moment it prints a lot: a five-master fleetsim run whose every
+# and fires the moment it prints a lot: a seven-master fleetsim run whose every
 # marker was present, whose suite passed and whose GUEST_EXIT was 0 came back
 # as "binary transfer into the guest never succeeded". A herestring has no
 # pipeline and no early-exit hazard.

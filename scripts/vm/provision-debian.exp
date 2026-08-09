@@ -3,7 +3,12 @@
 # that deliberately runs WITHOUT -snapshot, because its entire purpose is to
 # make disk changes that survive poweroff.
 #
-# Args: <writable-image> <hashed-root-password> <memory-MB> <space-separated-apt-packages> [<space-separated-pip-specs>]
+# Args: <writable-image> <hashed-root-password> <memory-MB> <space-separated-apt-packages> [<space-separated-pip-specs>] [<newline-separated-source-builds>]
+#
+# A source-build record is five `|`-separated fields — name|version|url|
+# sha256|cmake-flags — exactly as manifest.sh's VM_DEBIAN_SRC writes them. See
+# that block for why a third slot exists; see recipe.sh for why all five
+# fields are in the recipe hash.
 #
 # Called only by provision.sh, and only ever on a *copy* (provision.sh copies
 # the checksum-verified stock qcow2 to a temp name first, provisions that,
@@ -25,15 +30,21 @@
 # systemd credentials — "nocloud" does NOT mean unattended). After this run
 # firstboot has actually completed on disk, so later boots skip it outright.
 
-# apt over slirp is the slow part (~750 kB/s here) — 90s is not enough.
-set timeout 900
+# apt over slirp is the slow part (~750 kB/s here) — 90s is not enough. Since
+# the recipe gained a from-source slot the batch also contains a C++ build, so
+# this is sized for apt + pip + compile rather than apt alone.
+set timeout 3600
 set img [lindex $argv 0]
 set hash [lindex $argv 1]
 set mem [lindex $argv 2]
 set pkgs [lindex $argv 3]
 set pips [lindex $argv 4]
+set srcs [lindex $argv 5]
 
-spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -m $mem -no-reboot -nographic \
+# -smp 4: the source slot compiles, and a single vCPU turns a one-minute build
+# into a five-minute one. It changes nothing about what lands in the image, so
+# it is not part of the recipe.
+spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -smp 4 -m $mem -no-reboot -nographic \
     -drive file=$img,format=qcow2,if=virtio \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
     -fw_cfg name=opt/io.systemd.credentials/passwd.hashed-password.root,string=$hash \
@@ -92,12 +103,50 @@ if {[string trim $pips] ne ""} {
     }
 }
 
+# From-source builds, if the recipe asked for any. The chain is deliberately
+# fetch -> VERIFY -> extract -> configure -> build -> install: the checksum is
+# checked in the guest, before a single byte of the archive is unpacked, so a
+# regenerated or substituted upstream archive fails provisioning loudly
+# instead of quietly producing an image that disagrees with its own recipe
+# hash. Same posture as fetch-images.sh applies to the base image.
+#
+# `--one-top-level=<dir> --strip-components=1` extracts into a directory THIS
+# script names, so nothing depends on what the archive's top-level directory
+# happens to be called.
+set srccmd ""
+foreach rec [split [string trim $srcs] "\n"] {
+    if {[string trim $rec] eq ""} { continue }
+    set f [split $rec "|"]
+    set sname [lindex $f 0]
+    set sver [lindex $f 1]
+    set surl [lindex $f 2]
+    set ssha [lindex $f 3]
+    set sflags [lindex $f 4]
+    set tgz "/usr/local/src/$sname-$sver.tar.gz"
+    set tree "/usr/local/src/$sname-$sver"
+    set bld "/usr/local/src/$sname-$sver-build"
+    append srccmd " && mkdir -p $tree"
+    append srccmd " && curl -fsSL --retry 3 -o $tgz $surl"
+    append srccmd " && echo \"$ssha  $tgz\" | sha256sum -c -"
+    append srccmd " && tar xzf $tgz -C $tree --strip-components=1"
+    append srccmd " && cmake -S $tree -B $bld $sflags"
+    append srccmd " && cmake --build $bld -j4"
+    append srccmd " && cmake --install $bld"
+    append srccmd " && ldconfig"
+}
+
 # One command batch, one exit code. DEBIAN_FRONTEND=noninteractive so a
 # postinst that wants a debconf answer can't wedge the console forever.
-send "export DEBIAN_FRONTEND=noninteractive; echo ===VM_CMD_BEGIN===; apt-get update && apt-get install -y --no-install-recommends $pkgs$pipcmd && apt-get clean; echo PROVISION_EXIT=\$?; echo ===VM_CMD_END===\r"
+#
+# The END marker is sent SPLIT (===VM_CMD_"END"=== — the shell strips the
+# quotes) so it differs from the tty's echo of the line that sends it. Without
+# that, `expect` matches its own echo the instant the line is sent and falls
+# straight through; the batch then only ever got bounded by whatever the next
+# `expect` waited for. Same defect, same fix, as boot-debian.exp.
+send "export DEBIAN_FRONTEND=noninteractive; echo ===VM_CMD_BEGIN===; apt-get update && apt-get install -y --no-install-recommends $pkgs$pipcmd$srccmd && apt-get clean; echo PROVISION_EXIT=\$?; echo ===VM_CMD_\"END\"===\r"
 expect {
     -re {===VM_CMD_END===} {}
-    timeout { puts "\nTIMEOUT during apt-get"; exit 1 }
+    timeout { puts "\nTIMEOUT during the provisioning batch"; exit 1 }
 }
 expect -re {[#\$] $}
 

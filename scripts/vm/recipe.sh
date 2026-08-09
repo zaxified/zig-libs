@@ -20,6 +20,13 @@
 #
 #     recipe-version + platform + upstream artifact checksum + package list
 #
+# "package list" is three slots on debian, not one: apt names, pinned pip
+# specs, and pinned from-source builds (URL + tag + sha256 + cmake flags).
+# All three go into the text below verbatim. A from-source build that was NOT
+# in the hash would be the one way to change what an image contains without
+# changing its name — exactly the silent-cache-hit failure this file exists
+# to prevent — so the third slot is hashed on the same terms as the other two.
+#
 # Two hosts running the same recipe get equivalent images; a changed package
 # list is a changed recipe. So the recipe hash — not the image hash — is the
 # cache key, and it is baked into the provisioned image's *filename*. A stale
@@ -81,6 +88,23 @@ recipe_text() {
             for p in "${VM_DEBIAN_PIP[@]:-}"; do
                 [[ -z "$p" ]] && continue
                 printf 'pip: %s\n' "$p"
+            done
+            # From-source builds are part of the recipe for the same reason
+            # apt names and pip pins are — more so, in fact: an unhashed
+            # source pin would let the same recipe text produce an image
+            # carrying a different library. Every field is printed, one per
+            # line, so a reader can see exactly what was built and recompute
+            # the hash by hand. The build PROCEDURE that consumes these fields
+            # lives in provision-debian.exp and is covered by
+            # recipe-version above.
+            local s name ver url sha flags
+            for s in "${VM_DEBIAN_SRC[@]:-}"; do
+                [[ -z "$s" ]] && continue
+                IFS='|' read -r name ver url sha flags <<< "$s"
+                printf 'src: %s %s\n' "$name" "$ver"
+                printf 'src-url: %s\n' "$url"
+                printf 'src-sha256: %s\n' "$sha"
+                printf 'src-cmake: %s\n' "$flags"
             done
             ;;
         *)

@@ -203,14 +203,18 @@ Proved, not asserted, by three tests:
 >    replace a real master's state machine; it does mean a green
 >    `test-fleetsim` is no longer entirely self-anchored.
 > 3. **`scripts/vm/run.sh fleetsim debian`** — the live lane, actually run, in a
->    disposable VM with **five** real masters installed by the provisioning
+>    disposable VM with **all seven** real masters provided by the provisioning
 >    recipe: pymodbus 3.14.0, pycomm3 1.2.16, bacpypes3 0.0.106, python-snap7
->    3.1.0 and asyncua 2.0.1. Their recorded sessions are frozen in
->    **`src/master_goldens.zig`** and replay offline on every build. So for
->    those five, the transcripts below are no longer only prose: they are
->    committed, byte-exact exchanges that a third party's encoder composed and
->    its decoder accepted. DNP3 (opendnp3) and IEC 104 (c104) are still prose —
->    see "Not wired into the VM lane" below.
+>    3.1.0, asyncua 2.0.1 and c104 2.2.1 from pinned wheels, and **opendnp3
+>    3.1.2 built from a pinned source** — DNP3 has no installable master for
+>    this interpreter, so the recipe grew a third slot (`VM_DEBIAN_SRC`) whose
+>    URL, tag, sha256 and cmake flags are all part of the recipe hash. Six of
+>    the seven recorded sessions are frozen in **`src/master_goldens.zig`** and
+>    replay offline on every build, so their transcripts below are no longer
+>    only prose: they are committed, byte-exact exchanges that a third party's
+>    encoder composed and its decoder accepted. **OPC UA is the one exception,
+>    and deliberately so** — a UA session carries server-minted material, so a
+>    recording cannot be replayed against a freshly built server.
 >
 > **The caution the VM lane produced — and what was done about it.**
 > A live master is not automatically an anchor. `test "live: a real Modbus
@@ -292,10 +296,17 @@ Proved, not asserted, by three tests:
 > the master itself wrote (`expected 0, found 1`) — the master graded, disagreed,
 > and said so in-band.
 
-> **One master is still not wired: opendnp3.** It publishes no wheel — it is a
-> C++ library whose `master-demo` has to be built — and that is a different
-> kind of provisioning step from `pip install`; see README.md "Installing the
-> masters on a host, instead" for what was surveyed and what it would cost.
+> **DNP3 is wired now, and it is the reason the lane can build from source at
+> all.** opendnp3 publishes no wheel and Debian packages no DNP3 stack in any
+> suite; the maintained Rust successor is under a proprietary non-commercial
+> licence. So the recipe gained `VM_DEBIAN_SRC` — `name|version|url|sha256|
+> cmake-flags`, checksum verified *in the guest* before extraction, every field
+> hashed into the recipe so a changed pin makes the image's filename change and
+> a stale guest stays unreachable. Verified rather than asserted: mutating the
+> tag, the checksum, the URL or one cmake flag each produced a different
+> `recipe-sha256`. `master-demo` is an interactive REPL and no scriptable master
+> binary exists, so the driver is a C++ program of ours against opendnp3's
+> public headers — it calls the stack, it does not reimplement it.
 >
 > **IEC 104 is wired now.** An earlier attempt was built and rolled back
 > because the link would not stay up, and the instability was attributed to the
@@ -327,18 +338,35 @@ one of the seven.
   — byte-identical to the first pass, i.e. the multi-peer work changed nothing
   for the single-peer path.
 
-- **`opendnp3` `master-demo` → `Dnp3Node`** (`FLEETSIM_DNP3_LISTEN`,
-  `serveTcpMulti`). opendnp3 built from source (`release` branch, Apache-2.0),
-  used unpatched: its demo dials 127.0.0.1:20000 with LocalAddr 1 / RemoteAddr
-  10, so the test's outstation is configured to match. It ran its startup tasks,
-  a 1-minute integrity poll, a 5-second Class-1 exception poll, three demanded
-  integrity scans, a demanded exception scan and an ad-hoc range scan
-  (`001,002 Binary Input - With Flags, 16-bit start stop [0, 3]`), decoding
-  `001,001 Binary Input - Packed Format` and `030,001 Analog Input - 32-bit With
-  Flag` on every response. **IIN over the run: `[0x90, 0x00]` (restart+need-time)
-  → `[0x10, 0x00]` → `[0x50, 0x00]`** — that 0x40 is IIN1.6 `device_trouble`,
-  set by the scheduled fault and seen by the master. Our side:
-  `live fleetsim DNP3: peers=1 peak=1 frames_in=17 frames_out=17 bytes_in=370 bytes_out=558 delivered=17 replied=17 device_trouble=true`
+- **`opendnp3` 3.1.2 (Apache-2.0) → `Dnp3Node`** (`FLEETSIM_DNP3_LISTEN`,
+  `serveTcpMulti`), **in the VM lane, grading and frozen.** Built from a pinned
+  source inside the provisioning recipe (`VM_DEBIAN_SRC`) and driven by
+  `scripts/vm/guests/fleetsim-dnp3-master.cpp`, which calls opendnp3's own stack
+  and contains no DNP3 framing, CRC or object parsing of its own. It ran the
+  library's real startup sequence — disable unsolicited, clear the restart IIN,
+  a class 3/2/1/0 startup integrity poll, enable unsolicited — then a second
+  integrity poll on the far side of the scheduled fault, then two commands the
+  outstation was *expected to refuse*, then its marks.
+
+  **IIN over the run: `[0x90, 0x00]` (restart + need-time) → `[0x10, 0x00]`
+  → `[0x50, 0x00]`** — that 0x40 is IIN1.6 `device_trouble`, set by the fault at
+  t=15 s and seen by the master. Its twenty checks all passed and its marks came
+  back through DNP3's control direction: eleven g41v1 analog output blocks and
+  two g12v1 control relay output blocks.
+
+  **Why none of the marks is an echo.** A bitmap packed from eight separate
+  binary decodes (173); a sum over three g30v1 analogs (6556); a difference
+  across two *different* type decodes — an unsigned g20 counter minus a signed
+  g30v1 analog (87655) — which no echo of either operand can make; the g30v5
+  short float taken out of the float domain (x100) and differenced against a
+  signed integer decode (8939); a checksum over the whole integrity poll folding
+  every point's index with the DNP3 group opendnp3's own dispatch chose for it
+  (1437), so a superset or right-values-wrong-type fails; **two different
+  refusal codes the outstation chose and opendnp3 named** — `OUT_OF_RANGE` (12)
+  for a write past a bounded analog output's limit and `NOT_SUPPORTED` (4) for a
+  control against an index that does not exist; an IIN bitmap read off the
+  application header rather than the object data (0b111); and a pass bit
+  commanded last and commanded *either way*.
 
 - **`c104` 2.2.1 (lib60870-C, GPL-3.0) → `Iec104Node`** (`FLEETSIM_IEC104_LISTEN`,
   `serveTcpMulti`), **in the VM lane, grading and frozen.** The client's state
@@ -677,11 +705,16 @@ and the multi-connection binding. What is still open:
   says needs no entry. (`opendnp3` already has a NOTICE entry from the `dnp3`
   module's own interop work; nothing new is owed.)
 
-  **The licences were checked rather than assumed**, because four of the five
-  masters now baked into the VM image also have their sessions *frozen* into
+  **The licences were checked rather than assumed**, because six of the seven
+  masters now carried by the VM image also have their sessions *frozen* into
   `src/master_goldens.zig`. pymodbus is BSD-3-Clause; pycomm3, bacpypes3 and
-  python-snap7 are MIT; **asyncua is LGPL-3.0-or-later** and is the only one
-  that would have needed thought. It did not need much: asyncua is run as a
+  python-snap7 are MIT; **opendnp3 is Apache-2.0** and is the only one built
+  from source rather than installed — nothing of it is vendored, and Apache-2.0
+  would have permitted vendoring, which is what makes the choice not to a clean
+  statement rather than an attribution obligation; **c104 is GPL-3.0-or-later**,
+  the strictest in the list, and is stated exactly in the root NOTICE;
+  **asyncua is LGPL-3.0-or-later** and is the one whose session is not frozen at
+  all. It did not need much: asyncua is run as a
   separate process inside a disposable guest, nothing from it is copied,
   translated, linked or redistributed, and — as it happens — nothing of its
   session is frozen either, because an OPC UA session is not byte-replayable
