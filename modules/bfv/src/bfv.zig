@@ -29,22 +29,31 @@
 //!     probabilistic pass.
 //!
 //! ## Arithmetic (what the multiply actually runs on)
-//! The tensor is computed in an **auxiliary RNS basis of NTT-friendly primes**
-//! (`mulRnsNtt`): forward-NTT the four input polynomials per auxiliary prime,
-//! form the three components pointwise, inverse-NTT, then lift back with a
-//! centered CRT whose basis is sized (`num_aux`) so the lift is EXACT, not
-//! approximate. That replaces the `O(N²)` exact-integer schoolbook with
-//! `O(num_aux·N log N)`. The schoolbook survives as `mulExactRef`: it is the
-//! differential oracle (`mulRnsNtt` must be bit-identical to it), and below
-//! `ntt_tensor_min_degree` it is also what `mul` dispatches to, because at
-//! small `N` it is measurably faster. Word arithmetic is division-free —
-//! Shoup for the NTT twiddles, Barrett elsewhere (see `modarith`).
+//! Three exact implementations of the same function, all bit-identical (the
+//! differential test asserts it), with a comptime dispatch in `mul`:
 //!
-//! Still deferred: the `⌊t/q·…⌉` rescale materialises the exact integer and
-//! divides by `q`, and `q_product` is a `u128` — so security-grade parameters
-//! (log q ≳ 218) remain out of reach. The BEHZ/HPS **rescale-in-RNS** (fast
-//! base conversion, never materialising the integer) is the increment that
-//! lifts that, and it is NOT implemented here.
+//!   - `mulExactRef` — the ORIGINAL `O(N²)` schoolbook tensor over an exact
+//!     integer, plus the `⌊t/q·…⌉` rescale by big-integer division. **The
+//!     oracle.** Still the fastest path at tiny degree and small modulus.
+//!   - `mulRnsNtt` — the tensor in an **auxiliary RNS basis** sized (`num_aux`)
+//!     so the centered CRT lift is EXACT: `O(num_aux·N log N)` instead of
+//!     `O(N²)`. Still materialises the integer for the rescale.
+//!   - `mulBehz` — **BEHZ/HPS**: the tensor in residues over the main basis,
+//!     an auxiliary sub-basis and one redundant modulus `m̃`, and the
+//!     `⌊t/q·…⌉` rescale done ENTIRELY in residues — an exact RNS division
+//!     chain plus a Shenoy–Kumaresan base extension. The exact integer is
+//!     never materialised and there is no big-integer division at all. This is
+//!     what makes security-grade parameters reachable, and `mul` dispatches to
+//!     it whenever `TensorI` outgrows a native 128-bit integer.
+//!
+//! Word arithmetic is division-free — Shoup for the NTT twiddles, Barrett
+//! elsewhere (see `modarith`).
+//!
+//! Nothing in the module is pinned to `u128` any more: `QU` (the `[0,q)` /
+//! CRT-accumulator type) and `TensorI` are both derived from the parameter set,
+//! so `params.sec_n8192_logq218` (`N = 8192`, `log q = 218`) builds and runs —
+//! see the end-to-end test in `kat_test.zig`. Still deferred: bootstrapping,
+//! CKKS, Galois automorphisms, CRT-slot batch encoding.
 //!
 //! Randomness is caller-supplied (`std.Random`, frost/bbs-style) so the module
 //! stays `platform = .any` and KATs are reproducible.
@@ -77,52 +86,80 @@ pub fn Bfv(comptime P: params.Params) type {
         pub const Engine = ring.RnsPoly(N, L).Engine;
         pub const Plaintext = encode.Plaintext(N);
 
-        /// Full ciphertext modulus `q = ∏ q_i` as an integer (fits `u128` for
-        /// the KAT/toy parameter sets; production RNS never materialises it).
-        pub const q_product: u128 = blk: {
-            var m: u128 = 1;
-            for (primes) |p| m *= p;
-            break :blk m;
-        };
-        /// The BFV scaling factor `Δ = ⌊q/t⌋` (plaintext lives in the high bits).
-        pub const delta: u128 = q_product / P.t;
-
-        /// Relinearisation gadget base `w = 2^relin_base_log2` (Part 3).
-        pub const relin_base_log2: u7 = 8;
-        pub const relin_base: u64 = 1 << relin_base_log2;
-        /// Number of base-`w` digits covering `q`: `w^relin_digits ≥ q` and
-        /// `w^(relin_digits−1) < q` (so every `w^i` used is a `[0,q)` scalar).
-        pub const relin_digits: usize = blk: {
-            var k: usize = 0;
-            var m: u128 = q_product;
-            while (m > 0) : (k += 1) m >>= relin_base_log2;
-            break :blk k;
-        };
-
-        comptime {
-            // The tensor's integer width is no longer pinned at `i256` — it is
-            // derived from the parameters (`TensorI` below), so the old
-            // "2·q_bits + n_bits + t_bits + 2 ≤ 255" guard is gone. What still
-            // binds is the `u128` ciphertext modulus: `q_product`, `delta`, the
-            // CRT accumulator and the decrypt rescale are all `u128`, and the
-            // accumulator adds one `[0,q)` term at a time, so `2q < 2^128`.
-            // THIS is what still blocks security-grade parameters (log q ≳ 218);
-            // lifting it is the deferred BEHZ/HPS increment (SPEC.md), which
-            // removes the materialised integer altogether.
-            const q_bits = 128 - @clz(q_product);
-            if (q_bits > 127)
-                @compileError("bfv: ciphertext modulus too large for the u128 CRT accumulator");
-        }
-
-        // ── auxiliary RNS basis for the RNS-NTT tensor (see `mul`) ───────────
+        // ── integer widths, all derived from the parameters ──────────────────
         //
         // `q_product` as an arbitrary-precision comptime integer, so the bound
-        // arithmetic below cannot silently wrap a `u128`.
+        // arithmetic below cannot silently wrap a fixed-width accumulator.
         const q_int: comptime_int = blk: {
             var m: comptime_int = 1;
             for (primes) |p| m *= p;
             break :blk m;
         };
+        fn bitsOf(v: comptime_int) u16 {
+            var x = v;
+            var b: u16 = 0;
+            while (x > 0) : (b += 1) x >>= 1;
+            return b;
+        }
+        /// `⌈log2(q+1)⌉` — `q < 2^q_bits`.
+        pub const q_bits: u16 = bitsOf(q_int);
+
+        /// Unsigned type holding a canonical `[0,q)` value AND the CRT
+        /// accumulator, which transiently reaches `2q` (one conditional
+        /// subtract per term) — hence `q_bits + 1`.
+        ///
+        /// This used to be a hard `u128`, and that — not the deleted `i256`
+        /// tensor guard — was the last structural block on security-grade
+        /// parameters (`log q ≳ 218`). It is now sized from `P`. The `@max(128,
+        /// …)` floor keeps every parameter set that fitted before on exactly
+        /// the same type, so their arithmetic is bit-identical to what it was.
+        pub const QU = std.meta.Int(.unsigned, @max(128, q_bits + 1));
+        /// Unsigned type for the round-half-up rescale numerator `2·t·v + q`
+        /// (`v < q`), used by `decrypt` / `noiseBudget`. The tight requirement
+        /// is `2t(q−1) + q < 2^bits`, i.e. `q_bits + t_bits + 2` in the worst
+        /// case (when both `t` and `q` sit just under their bit boundaries);
+        /// for every set shipped here `+1` would also fit, so a mutant that
+        /// narrows this by one bit survives — by luck of the parameters, not by
+        /// equivalence.
+        const QRescale = std.meta.Int(.unsigned, @max(128, q_bits + bitsOf(P.t) + 2));
+
+        /// Full ciphertext modulus `q = ∏ q_i` as an integer. Production RNS
+        /// never materialises it in the multiply hot path (see `mulBehz`), but
+        /// `decrypt`/`noiseBudget`/setup still do.
+        pub const q_product: QU = q_int;
+        /// The BFV scaling factor `Δ = ⌊q/t⌋` (plaintext lives in the high bits).
+        pub const delta: QU = q_product / P.t;
+
+        /// Relinearisation gadget base `w = 2^relin_base_log2` (Part 3).
+        /// Parameter-controlled: at `log q ≈ 218` a `w = 2^8` gadget would need
+        /// 28 rows, i.e. a 56-polynomial relin key, so security-grade sets pick
+        /// a wide base (the key-switch noise `digits·N·(w−1)` is still far under
+        /// `Δ/2` there — see the ledger on `params.sec_n8192_logq218`).
+        pub const relin_base_log2: u7 = P.relin_base_log2;
+        pub const relin_base: u64 = @as(u64, 1) << relin_base_log2;
+        /// Number of base-`w` digits covering `q`: `w^relin_digits ≥ q` and
+        /// `w^(relin_digits−1) < q` (so every `w^i` used is a `[0,q)` scalar).
+        pub const relin_digits: usize = blk: {
+            var k: usize = 0;
+            var m: comptime_int = q_int;
+            while (m > 0) : (k += 1) m >>= relin_base_log2;
+            break :blk k;
+        };
+
+        comptime {
+            // Neither the tensor's integer width nor the ciphertext modulus is
+            // pinned any more (`TensorI`, `QU` — both derived from `P`), so the
+            // old "2·q_bits + n_bits + t_bits + 2 ≤ 255" and "log q ≤ 127"
+            // guards are both gone. What the arithmetic below does still
+            // require:
+            //   * `t < q` — Δ = ⌊q/t⌋ ≥ 1, and the `mulBehz` quotient bound
+            //     `|⌊t·T/q⌋| < ∏p / 2` is derived from it (see `div_bound`).
+            //   * `w < 2^63` — the gadget digit is a `u64`.
+            if (P.t >= q_int) @compileError("bfv: plaintext modulus t must be < q");
+            if (relin_base_log2 >= 63) @compileError("bfv: relin_base_log2 must be < 63");
+        }
+
+        // ── auxiliary RNS basis (see `mulRnsNtt` / `mulBehz`) ────────────────
         /// Worst-case magnitude of ANY tensor component coefficient. Centered
         /// inputs satisfy `|x| ≤ (q−1)/2`; a negacyclic convolution coefficient
         /// sums `N` such products, and the middle component `t1` is a sum of
@@ -153,6 +190,70 @@ pub fn Bfv(comptime P: params.Params) type {
         /// the common `num_aux = 2` case in a NATIVE `u128`.
         const AuxU = std.meta.Int(.unsigned, 64 * num_aux);
 
+        // ── BEHZ rescale-in-RNS: bounds and basis sizing ─────────────────────
+        //
+        // `mulBehz` never materialises `T` and never divides a big integer. It
+        // computes `D = ⌊t·T/q⌋` by an exact RNS division chain (one main prime
+        // at a time) and then base-extends `D` back into the main basis. Two
+        // bounds make that exact; both are checked comptime below.
+        //
+        // (B1) The quotient bound. `|T| ≤ tensor_bound`, so
+        //          |t·T/q| ≤ t·tensor_bound/q =: x
+        //      and `D = ⌊t·T/q⌋ ∈ [−x−1, x]`, hence `|D| ≤ x + 1`.
+        //      `div_shift` below is `trunc(x) + 2 > (x−1) + 2 = x + 1 ≥ |D|`,
+        //      so the SHIFTED quotient `z := D + div_shift` satisfies
+        //          0 ≤ z ≤ 2·div_shift .
+        //      Working with `z` rather than `D` is what lets the base extension
+        //      assume a non-negative value in `[0, ∏p)` — see (B2).
+        //
+        //      MUTATION NOTE. `div_shift` has ~2× slack and halving it is
+        //      undetectable, for a reason worth writing down: the correction in
+        //      step 3 recovers `α − c` where `c = ⌊z/∏p⌋`, so it reconstructs
+        //      the TRUE signed `z`, not `z mod ∏p`, for every `z` in
+        //      `(−(m̃−num_rs)·∏p, ∏p)`. The shift is therefore only needed to
+        //      keep `z` below `∏p`, not to keep it non-negative — but it is
+        //      kept, and (B2) provisioned to the textbook `z ∈ [0,∏p)` bound,
+        //      because that is the invariant the code states. What is NOT slack
+        //      is (B2) itself: dropping one auxiliary prime is RED.
+        const div_shift: comptime_int = (@as(comptime_int, P.t) * tensor_bound) / q_int + 2;
+
+        /// Number of auxiliary primes `mulBehz` actually uses — a PREFIX of
+        /// `aux_primes`. It needs only
+        ///
+        ///   (B2)  ∏_{j<num_rs} p_j  >  2·div_shift ,
+        ///
+        /// so that `z ∈ [0, 2·div_shift] ⊂ [0, ∏p)` and the Shenoy–Kumaresan
+        /// base extension recovers it exactly. That is weaker than the
+        /// exact-lift basis's `∏p_j > 2·tensor_bound` by a factor ≈ `q/t`, so
+        /// `num_rs ≤ num_aux` always (asserted comptime) and the rescale pays
+        /// for far fewer primes than `mulRnsNtt`'s lift would.
+        pub const num_rs: usize = blk: {
+            var need: comptime_int = 2 * div_shift + 1;
+            var b: comptime_int = 0;
+            while (need > 0) : (b += 1) need >>= 1;
+            const k: usize = @intCast((b + aux_min_bits - 1) / aux_min_bits);
+            break :blk @max(1, k);
+        };
+        /// Moduli `mulBehz` runs the tensor over, on top of the main chain:
+        /// `p_0…p_{num_rs−1}` plus the redundant `m̃` (`sk_prime`).
+        const num_behz: usize = num_rs + 1;
+
+        comptime {
+            // (B2) sizing: every aux prime is ≥ 2^aux_min_bits by construction
+            // of the descending scan, so ∏_{j<num_rs} p_j ≥ 2^(61·num_rs), and
+            // `num_rs` was chosen with 61·num_rs ≥ bits(2·div_shift + 1), i.e.
+            // 2^(61·num_rs) > 2·div_shift. Nothing to check at runtime.
+            if (num_rs > num_aux)
+                @compileError("bfv: BEHZ sub-basis larger than the exact-lift basis (t ≥ q?)");
+            // The base extension recovers `α = ⌊Σ_j ω_j/p_j⌋ ∈ [0, num_rs)` as
+            // a residue mod `m̃`; that is only injective while `num_rs < m̃`.
+            // `m̃` is ≥ 2^61 and `num_rs` is a handful, so this is slack by ~60
+            // bits — but it is the load-bearing inequality, so it is written
+            // down rather than assumed.
+            if (num_rs >= (1 << aux_min_bits))
+                @compileError("bfv: too many auxiliary primes for the redundant modulus");
+        }
+
         /// Exact width the `⌊t/q·T⌉` rescale numerator `|2·t·T + q|` needs,
         /// plus a sign bit. The tensor used to be hardcoded to `i256` — the
         /// widest thing the old comptime guard would admit — which made every
@@ -176,7 +277,7 @@ pub fn Bfv(comptime P: params.Params) type {
         /// `invMod` (a 62-squaring `powMod`) on EVERY call — and the scheme
         /// calls it once per coefficient, i.e. `N` times per decrypt and `4N`
         /// times per multiply. These hoist all of that to `init`.
-        crt_mi: [L]u128, // ∏_{k≠i} q_k
+        crt_mi: [L]QU, // ∏_{k≠i} q_k
         crt_inv: [L]u64, // (crt_mi[i] mod q_i)^{-1} mod q_i
         /// Shoup constant for `Δ mod q_i` (fixed multiplier of `scaledPlaintext`).
         delta_shoup: [L]ma.Shoup,
@@ -193,6 +294,35 @@ pub fn Bfv(comptime P: params.Params) type {
         /// `q mod p_j` — folds the "centered" correction into the residue
         /// reduction without ever materialising a signed wide integer.
         q_mod_aux: [num_aux]u64,
+
+        // ── BEHZ rescale-in-RNS constants (all hoisted to `init`) ────────────
+        /// `m̃`, the redundant modulus that makes the auxiliary→main base
+        /// extension EXACT rather than "exact up to a bounded α·∏p". It is one
+        /// more NTT-friendly prime (so the tensor can be computed over it too)
+        /// taken from the same descending scan, and it is NOT part of `∏p`.
+        sk_prime: u64,
+        sk_engine: Engine,
+        q_mod_sk: u64,
+        /// `t mod g` for every modulus `g` the rescale chain runs over.
+        t_mod_q: [L]u64,
+        t_mod_rs: [num_rs]u64,
+        t_mod_sk: u64,
+        /// `q_i^{-1} mod g` for each main prime `q_i` divided out by the chain
+        /// and each modulus `g` that survives that step.
+        qinv_q: [L][L]u64, // only k > i is ever read
+        qinv_rs: [L][num_rs]u64,
+        qinv_sk: [L]u64,
+        /// Shenoy–Kumaresan base-extension constants for `P = ∏_{j<num_rs} p_j`.
+        rs_hat_inv: [num_rs]u64, // (P/p_j)^{-1} mod p_j
+        rs_hat_q: [num_rs][L]u64, // (P/p_j) mod q_i
+        rs_hat_sk: [num_rs]u64, // (P/p_j) mod m̃
+        rs_mod_q: [L]u64, // P mod q_i
+        rs_inv_sk: u64, // P^{-1} mod m̃
+        /// `div_shift mod g` — the constant that keeps the base-extended
+        /// quotient non-negative (bound (B1)).
+        shift_q: [L]u64,
+        shift_rs: [num_rs]u64,
+        shift_sk: u64,
 
         pub const SecretKey = struct {
             s: Ring,
@@ -238,7 +368,7 @@ pub fn Bfv(comptime P: params.Params) type {
             const engines = try ring.makeEngines(N, L, &local);
 
             // Main-basis CRT constants (hoisted out of `rns.Basis.reconstruct`).
-            var crt_mi: [L]u128 = undefined;
+            var crt_mi: [L]QU = undefined;
             var crt_inv: [L]u64 = undefined;
             for (0..L) |i| {
                 const mi = q_product / primes[i];
@@ -250,21 +380,35 @@ pub fn Bfv(comptime P: params.Params) type {
 
             // Auxiliary basis: the largest NTT-friendly primes below 2^62,
             // scanning down. Distinct by construction (strictly decreasing).
+            // One EXTRA prime past `num_aux` is taken as the redundant modulus
+            // `m̃` the BEHZ base extension needs; it is deliberately outside
+            // `∏p` (both for the aux CRT and for the `num_rs` prefix).
             var aux_primes: [num_aux]u64 = undefined;
+            var sk_prime: u64 = 0;
             {
                 const two_n: u64 = 2 * @as(u64, N);
                 var cand: u64 = (@as(u64, 1) << ma.max_prime_bits) - 1;
                 cand -= (cand - 1) % two_n; // largest v < 2^62 with v ≡ 1 mod 2N
                 var found: usize = 0;
-                while (found < num_aux) : (cand -= two_n) {
+                while (found < num_aux + 1) : (cand -= two_n) {
                     if (cand <= (@as(u64, 1) << @intCast(aux_min_bits))) return error.NoAuxiliaryPrimes;
                     if (!ma.isPrime(cand)) continue;
-                    aux_primes[found] = cand;
+                    // The auxiliary primes must be coprime to the main chain;
+                    // they are ≥ 2^61 and distinct from each other, but a
+                    // parameter set MAY legitimately use a 61/62-bit main
+                    // prime, so skip any collision rather than assume.
+                    var clash = false;
+                    for (primes) |qp| {
+                        if (qp == cand) clash = true;
+                    }
+                    if (clash) continue;
+                    if (found < num_aux) aux_primes[found] = cand else sk_prime = cand;
                     found += 1;
                 }
             }
             var aux_engines: [num_aux]Engine = undefined;
             for (0..num_aux) |j| aux_engines[j] = try Engine.init(aux_primes[j]);
+            const sk_engine = try Engine.init(sk_prime);
 
             var aux_modulus: AuxU = 1;
             for (aux_primes) |p| aux_modulus *= p;
@@ -279,6 +423,49 @@ pub fn Bfv(comptime P: params.Params) type {
                 q_mod_aux[j] = @intCast(q_product % p);
             }
 
+            // ── BEHZ constants ───────────────────────────────────────────────
+            // `P = ∏_{j<num_rs} p_j` as a comptime-sized unsigned; `num_rs`
+            // primes of < 2^62 fit in `64·num_rs` bits with room to spare.
+            const RsU = std.meta.Int(.unsigned, 64 * num_rs);
+            var rs_modulus: RsU = 1;
+            for (0..num_rs) |j| rs_modulus *= aux_primes[j];
+
+            var t_mod_q: [L]u64 = undefined;
+            var t_mod_rs: [num_rs]u64 = undefined;
+            var shift_q: [L]u64 = undefined;
+            var shift_rs: [num_rs]u64 = undefined;
+            var rs_mod_q: [L]u64 = undefined;
+            var qinv_q: [L][L]u64 = undefined;
+            var qinv_rs: [L][num_rs]u64 = undefined;
+            var qinv_sk: [L]u64 = undefined;
+            var rs_hat_inv: [num_rs]u64 = undefined;
+            var rs_hat_q: [num_rs][L]u64 = undefined;
+            var rs_hat_sk: [num_rs]u64 = undefined;
+
+            // `div_shift` is a comptime_int that can exceed `u64`; reduce it
+            // modularly at comptime, once per modulus, via its bit expansion.
+            const ShiftU = std.meta.Int(.unsigned, @max(64, bitsOf(div_shift) + 1));
+            const shift_val: ShiftU = div_shift;
+
+            for (0..L) |i| {
+                const qi = primes[i];
+                t_mod_q[i] = P.t % qi;
+                shift_q[i] = @intCast(shift_val % qi);
+                rs_mod_q[i] = @intCast(rs_modulus % qi);
+                for (0..L) |k| qinv_q[i][k] = if (k == i) 0 else try ma.invMod(qi % primes[k], primes[k]);
+                for (0..num_rs) |j| qinv_rs[i][j] = try ma.invMod(qi % aux_primes[j], aux_primes[j]);
+                qinv_sk[i] = try ma.invMod(qi % sk_prime, sk_prime);
+            }
+            for (0..num_rs) |j| {
+                const p = aux_primes[j];
+                t_mod_rs[j] = P.t % p;
+                shift_rs[j] = @intCast(shift_val % p);
+                const hat = rs_modulus / p; // P/p_j
+                rs_hat_inv[j] = try ma.invMod(@intCast(hat % p), p);
+                for (0..L) |i| rs_hat_q[j][i] = @intCast(hat % primes[i]);
+                rs_hat_sk[j] = @intCast(hat % sk_prime);
+            }
+
             return .{
                 .engines = engines,
                 .primes = primes,
@@ -291,6 +478,23 @@ pub fn Bfv(comptime P: params.Params) type {
                 .aux_inv = aux_inv,
                 .aux_modulus = aux_modulus,
                 .q_mod_aux = q_mod_aux,
+                .sk_prime = sk_prime,
+                .sk_engine = sk_engine,
+                .q_mod_sk = @intCast(q_product % sk_prime),
+                .t_mod_q = t_mod_q,
+                .t_mod_rs = t_mod_rs,
+                .t_mod_sk = P.t % sk_prime,
+                .qinv_q = qinv_q,
+                .qinv_rs = qinv_rs,
+                .qinv_sk = qinv_sk,
+                .rs_hat_inv = rs_hat_inv,
+                .rs_hat_q = rs_hat_q,
+                .rs_hat_sk = rs_hat_sk,
+                .rs_mod_q = rs_mod_q,
+                .rs_inv_sk = try ma.invMod(@intCast(rs_modulus % sk_prime), sk_prime),
+                .shift_q = shift_q,
+                .shift_rs = shift_rs,
+                .shift_sk = @intCast(shift_val % sk_prime),
             };
         }
 
@@ -300,17 +504,26 @@ pub fn Bfv(comptime P: params.Params) type {
         /// but with no `invMod` / no `∏q` recomputation per call.
         ///
         /// The accumulator adds one `[0,q)` term at a time with a conditional
-        /// subtract, so it never exceeds `2q < 2^128` (comptime-guarded).
-        pub fn reconstruct(self: *const Self, residues: *const [L]u64) u128 {
-            var acc: u128 = 0;
+        /// subtract, so it never exceeds `2q` — which is why `QU` is sized at
+        /// `q_bits + 1` and not `q_bits`.
+        pub fn reconstruct(self: *const Self, residues: *const [L]u64) QU {
+            var acc: QU = 0;
             for (0..L) |i| {
                 const c: u64 = self.engines[i].modulus.mul(residues[i], self.crt_inv[i]);
                 // `crt_mi[i]·c ≤ (q/q_i)·(q_i−1) < q`, so each term needs no
-                // reduction of its own and `acc + term < 2q < 2^128`.
-                acc += self.crt_mi[i] * @as(u128, c);
+                // reduction of its own and `acc + term < 2q ≤ 2^(q_bits+1)`.
+                acc += self.crt_mi[i] * @as(QU, c);
                 if (acc >= q_product) acc -= q_product;
             }
             return acc;
+        }
+
+        /// `x mod q_i` for a wide `[0,q)` value — Barrett Horner over 64-bit
+        /// limbs, never a big-integer division. Compiles to the plain `u128`
+        /// Barrett reduce for every parameter set whose `q` fits in 128 bits,
+        /// so those stay bit-identical AND cost-identical to before.
+        inline fn reduceQ(m: *const ma.Modulus, v: QU) u64 {
+            return m.reduceWide(QU, v);
         }
 
         // ── REAL, ungated ops ────────────────────────────────────────────────
@@ -476,8 +689,10 @@ pub fn Bfv(comptime P: params.Params) type {
                 for (0..L) |i| res[i] = acc.limbs[i][j];
                 const v = self.reconstruct(&res); // in [0, q)
                 // round(t·v/q) = ⌊(2·t·v + q) / (2q)⌋ ; then reduce mod t.
-                const rounded = (2 * @as(u128, P.t) * v + q_product) / (2 * q_product);
-                out.coeffs[j] = @intCast(rounded % @as(u128, P.t));
+                // `QRescale` is exactly wide enough for `2·t·v + q < 2·t·q + q`.
+                const qr: QRescale = q_product;
+                const rounded = (2 * @as(QRescale, P.t) * @as(QRescale, v) + qr) / (2 * qr);
+                out.coeffs[j] = @intCast(rounded % @as(QRescale, P.t));
             }
             return out;
         }
@@ -509,9 +724,9 @@ pub fn Bfv(comptime P: params.Params) type {
         /// reconstructed to its canonical `[0, q)` representative. Both the
         /// reference tensor (which centers these into `i256`) and the fast
         /// tensor (which reduces them into the auxiliary basis) start here.
-        fn rawCoeffs(self: *const Self, r: *const Ring) [N]u128 {
+        fn rawCoeffs(self: *const Self, r: *const Ring) [N]QU {
             std.debug.assert(r.domain == .coeff);
-            var out: [N]u128 = undefined;
+            var out: [N]QU = undefined;
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
                 for (0..L) |i| res[i] = r.limbs[i][j];
@@ -522,7 +737,7 @@ pub fn Bfv(comptime P: params.Params) type {
 
         /// Center `[0,q)` representatives into `(−q/2, q/2]` as `i256`, so the
         /// reference tensor products stay exact.
-        fn centerRaw(raw: *const [N]u128) [N]TensorI {
+        fn centerRaw(raw: *const [N]QU) [N]TensorI {
             const half = q_product / 2;
             var out: [N]TensorI = undefined;
             for (0..N) |j| {
@@ -558,23 +773,57 @@ pub fn Bfv(comptime P: params.Params) type {
             }
         }
 
-        /// Residues mod the auxiliary prime `p_j` of the CENTERED integers
+        /// Residues mod one auxiliary modulus `g` of the CENTERED integers
         /// whose `[0,q)` representatives are `raw`. Centering is folded in
         /// arithmetically: for `v > q/2` the centered value is `v − q`, so its
-        /// residue is `(v mod p) − (q mod p)`. No signed wide integer, and no
-        /// `i256`-by-`u64` division, ever appears.
-        fn auxResidues(self: *const Self, raw: *const [N]u128, j: usize) [N]u64 {
-            const p = self.aux_primes[j];
-            const m = &self.aux_engines[j].modulus;
-            const qm = self.q_mod_aux[j];
+        /// residue is `(v mod g) − (q mod g)`. No signed wide integer, and no
+        /// wide-by-`u64` division, ever appears.
+        fn centeredResidues(eng: *const Engine, q_mod_g: u64, raw: *const [N]QU) [N]u64 {
+            const p = eng.q;
+            const m = &eng.modulus;
             const half = q_product / 2;
             var out: [N]u64 = undefined;
             for (0..N) |i| {
                 const v = raw[i];
-                const r = m.reduce(v);
-                out[i] = if (v > half) ma.subMod(r, qm, p) else r;
+                const r = reduceQ(m, v);
+                out[i] = if (v > half) ma.subMod(r, q_mod_g, p) else r;
             }
             return out;
+        }
+
+        /// The three exact-integer tensor components, reduced mod ONE modulus
+        /// `g`: 4 forward NTTs, 3 pointwise components, 3 inverse NTTs. Shared
+        /// by `mulRnsNtt` (which then CRT-lifts them) and `mulBehz` (which
+        /// never lifts them at all).
+        fn tensorModulus(
+            eng: *const Engine,
+            q_mod_g: u64,
+            x0: *const [N]QU,
+            x1: *const [N]QU,
+            y0: *const [N]QU,
+            y1: *const [N]QU,
+            o0: *[N]u64,
+            o1: *[N]u64,
+            o2: *[N]u64,
+        ) void {
+            const p = eng.q;
+            const m = &eng.modulus;
+            var a0 = centeredResidues(eng, q_mod_g, x0);
+            var a1 = centeredResidues(eng, q_mod_g, x1);
+            var b0 = centeredResidues(eng, q_mod_g, y0);
+            var b1 = centeredResidues(eng, q_mod_g, y1);
+            eng.forward(&a0);
+            eng.forward(&a1);
+            eng.forward(&b0);
+            eng.forward(&b1);
+            for (0..N) |i| {
+                o0[i] = m.mul(a0[i], b0[i]);
+                o1[i] = ma.addMod(m.mul(a0[i], b1[i]), m.mul(a1[i], b0[i]), p);
+                o2[i] = m.mul(a1[i], b1[i]);
+            }
+            eng.inverse(o0);
+            eng.inverse(o1);
+            eng.inverse(o2);
         }
 
         /// Centered CRT lift from the auxiliary basis back to an exact `i256`.
@@ -607,41 +856,27 @@ pub fn Bfv(comptime P: params.Params) type {
         /// Cost: `7` transforms + `4N` pointwise products per auxiliary prime,
         /// i.e. `O(num_aux · N log N)` word operations, against the reference's
         /// `O(N²)` `i256` (4-limb) multiplies.
-        fn tensorNtt(
+        pub fn tensorNtt(
             self: *const Self,
-            x0: *const [N]u128,
-            x1: *const [N]u128,
-            y0: *const [N]u128,
-            y1: *const [N]u128,
+            x0: *const [N]QU,
+            x1: *const [N]QU,
+            y0: *const [N]QU,
+            y1: *const [N]QU,
             out: *[3][N]TensorI,
         ) void {
             var res: [3][num_aux][N]u64 = undefined;
             for (0..num_aux) |j| {
-                const eng = &self.aux_engines[j];
-                const p = eng.q;
-                const m = &eng.modulus;
-                var a0 = self.auxResidues(x0, j);
-                var a1 = self.auxResidues(x1, j);
-                var b0 = self.auxResidues(y0, j);
-                var b1 = self.auxResidues(y1, j);
-                eng.forward(&a0);
-                eng.forward(&a1);
-                eng.forward(&b0);
-                eng.forward(&b1);
-                var t0: [N]u64 = undefined;
-                var t1: [N]u64 = undefined;
-                var t2: [N]u64 = undefined;
-                for (0..N) |i| {
-                    t0[i] = m.mul(a0[i], b0[i]);
-                    t1[i] = ma.addMod(m.mul(a0[i], b1[i]), m.mul(a1[i], b0[i]), p);
-                    t2[i] = m.mul(a1[i], b1[i]);
-                }
-                eng.inverse(&t0);
-                eng.inverse(&t1);
-                eng.inverse(&t2);
-                res[0][j] = t0;
-                res[1][j] = t1;
-                res[2][j] = t2;
+                tensorModulus(
+                    &self.aux_engines[j],
+                    self.q_mod_aux[j],
+                    x0,
+                    x1,
+                    y0,
+                    y1,
+                    &res[0][j],
+                    &res[1][j],
+                    &res[2][j],
+                );
             }
             for (0..3) |c| {
                 for (0..N) |i| {
@@ -664,25 +899,25 @@ pub fn Bfv(comptime P: params.Params) type {
         /// 19.4 µs — an 8x REGRESSION. LLVM lowers these `i256` divisions well
         /// (the divisor is a loop constant), and the Horner chain is fully
         /// serialised. Reverted; do not "optimise" this again without a bench.
-        fn rescaleTensor(self: *const Self, tc: *const [N]TensorI) Ring {
+        pub fn rescaleTensor(self: *const Self, tc: *const [N]TensorI) Ring {
             var out = Ring.zero(.coeff);
             const qi: TensorI = @intCast(q_product);
             const ti: TensorI = @intCast(P.t);
             for (0..N) |j| {
                 const rounded = @divFloor(2 * ti * tc[j] + qi, 2 * qi);
-                const v: u128 = @intCast(@mod(rounded, qi)); // canonical [0, q)
-                for (0..L) |i| out.limbs[i][j] = self.engines[i].modulus.reduce(v);
+                const v: QU = @intCast(@mod(rounded, qi)); // canonical [0, q)
+                for (0..L) |i| out.limbs[i][j] = reduceQ(&self.engines[i].modulus, v);
             }
             return out;
         }
 
         /// `scalar·r` for a `[0,q)` scalar, per-limb (legal in either domain).
         /// The per-limb scalar is fixed for the whole limb ⇒ Shoup.
-        fn scalarMul(self: *const Self, r: *const Ring, scalar: u128) Ring {
+        fn scalarMul(self: *const Self, r: *const Ring, scalar: QU) Ring {
             var out = r.*;
             for (0..L) |i| {
                 const qi = self.primes[i];
-                const s = ma.Shoup.init(self.engines[i].modulus.reduce(scalar), qi);
+                const s = ma.Shoup.init(reduceQ(&self.engines[i].modulus, scalar), qi);
                 for (&out.limbs[i]) |*x| x.* = s.mul(x.*, qi);
             }
             return out;
@@ -695,7 +930,7 @@ pub fn Bfv(comptime P: params.Params) type {
         pub fn genRelinKey(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
             const s2 = sk.s.mul(&sk.s, &self.engines);
             var rlk: RelinKey = undefined;
-            var w_pow: u128 = 1; // w^i < q for all rows used (see relin_digits)
+            var w_pow: QU = 1; // w^i < q for all rows used (see relin_digits)
             for (0..relin_digits) |i| {
                 const a_i = self.sampleUniform(random);
                 const e_i = self.sampleTernary(random);
@@ -705,7 +940,8 @@ pub fn Bfv(comptime P: params.Params) type {
                 b_i.subAssign(&mask, &self.primes); // w^i·s² − (a_i·s + e_i)
                 rlk.b[i] = b_i;
                 rlk.a[i] = a_i;
-                w_pow = @intCast((@as(u256, w_pow) << relin_base_log2) % q_product);
+                const WPow = std.meta.Int(.unsigned, @as(u16, @bitSizeOf(QU)) + relin_base_log2);
+                w_pow = @intCast((@as(WPow, w_pow) << relin_base_log2) % @as(WPow, q_product));
             }
             return rlk;
         }
@@ -724,26 +960,77 @@ pub fn Bfv(comptime P: params.Params) type {
         /// multiplies. MEASURED (bench.zig, ReleaseFast, this host — schoolbook
         /// vs RNS-NTT, so >1 means the NTT path wins):
         ///
-        /// | N   | q≈2^36 (num_aux=2) | q≈2^60 (num_aux=3) |
-        /// |-----|--------------------|--------------------|
-        /// |  16 | 1.1x  (0.9–1.1)    | 1.1x  (1.0–1.1)    |
-        /// |  32 | 1.5x               | 1.3x               |
-        /// |  64 | 2.5x               | 2.0x               |
-        /// | 256 | 3.5x               | 2.8x               |
-        /// | 512 | 5.9x               | 4.7x               |
+        /// This constant now only decides the SMALL-modulus corner
+        /// (`TensorI ≤ behz_min_tensor_bits`); above that `mul` takes BEHZ at
+        /// every degree. Re-measured after the dead-code guard went into
+        /// `bench.zig`, at `q ≈ 2^36` (the only modulus size still in this
+        /// regime), schoolbook µs vs `mulRnsNtt` µs:
         ///
-        /// At N=16 the two are within run-to-run noise (the parenthesised range
-        /// is across repeats); `32` is the first degree where the NTT path wins
-        /// consistently at BOTH modulus sizes. The shipped sets land on either
-        /// side deliberately:
-        /// `test_tiny`/`test_mul` (N=8/16) keep the schoolbook, `bfv_toy`
-        /// (N=1024) takes the NTT tensor.
+        /// | N   | schoolbook | RNS-NTT | ratio |
+        /// |-----|------------|---------|-------|
+        /// |  16 |    4.4     |   4.96  | 0.89  |
+        /// |  32 |   12.9     |  10.4   | 1.24  |
+        /// |  64 |   43.0     |  21.4   | 2.01  |
+        /// | 256 |  507.5     | 174.8   | 2.90  |
+        /// | 512 | 1985.5     | 357.3   | 5.56  |
+        ///
+        /// `32` is still the first degree where the transform pays for itself.
+        /// The shipped sets land deliberately: `test_tiny`/`test_mul` (N=8/16,
+        /// `TensorI` = i65/i86) keep the schoolbook; `bfv_toy` (`TensorI` =
+        /// i142) and `sec_n8192_logq218` (i467) take BEHZ.
         pub const ntt_tensor_min_degree: usize = 32;
 
-        /// Homomorphic multiply. Dispatches at COMPTIME between the two tensor
-        /// implementations — both are exact and, by the differential test,
-        /// bit-identical; the choice is purely which is faster at this `N`.
+        /// `TensorI` width above which `mul` takes the BEHZ path. This is the
+        /// measured discriminator, and it has a mechanical reason: the exact
+        /// rescale's `@divFloor`/`@mod` have a COMPILE-TIME constant divisor
+        /// (`q` is a `pub const`), and LLVM turns such a division into a
+        /// multiply-by-reciprocal only while the dividend fits a native
+        /// 128-bit integer. One limb wider and it becomes a multi-limb library
+        /// routine whose cost grows superlinearly — 44 ns → 424 ns → 1868 ns →
+        /// 5577 ns per coefficient at `TensorI` = i81 / i142 / i369 / i608.
+        /// BEHZ pays `L` extra prime-NTT sets for the main-basis tensor and
+        /// stays flat (64 → 111 → 232 → 378 ns), so the two curves cross
+        /// exactly where the native division stops.
+        ///
+        /// MEASURED (`bench.zig`, `-Doptimize=ReleaseFast`, this host; the
+        /// whole 3-component result is kept alive — see the note there, an
+        /// earlier draft let LLVM dead-code two thirds of every path and
+        /// reported the crossover ~2× too high). Ratio = BEHZ over the best
+        /// non-BEHZ path; `>1` means BEHZ wins:
+        ///
+        /// | log2 q | chain  | N        | TensorI | ratio (2 runs)  |
+        /// |--------|--------|----------|---------|-----------------|
+        /// |   36   | 2×18b  | 16…512   | i81–i90 | 0.54–0.69       |
+        /// |   60   | 2×30b  | 16…512   | i130+   | 1.14–2.34       |
+        /// |   60   | 2×30b  | 256      | i134    | 0.97 / 1.19  ←  |
+        /// |   90   | 3×30b  | 256      | i194    | 1.33            |
+        /// |  120   | 4×30b  | 256      | i254    | 1.19 / 1.31     |
+        /// |  120   | 2×60b  | 256      | i254    | 1.95            |
+        /// |  150   | 5×30b  | 256      | i314    | 1.47 / 1.53     |
+        /// |  180   | 3×60b  | 256/16   | i374    | 2.45–2.51 / 4.7–5.1 |
+        /// |  240   | 4×60b  | 256      | i494    | 2.80 / 2.89     |
+        /// |  300   | 5×60b  | 256/8    | i614    | 3.43 / 7.6–10.7 |
+        /// |  360   | 6×60b  | 256      | i734    | 3.42 / 4.02     |
+        ///
+        /// Every set with `TensorI ≤ 128` prefers the old path, every set above
+        /// it prefers BEHZ, at every degree measured. The single genuinely
+        /// borderline row is marked `←`: `TensorI = i134` is six bits past the
+        /// line and the two runs straddle 1.0, which is exactly what a real
+        /// crossover looks like — the cost of getting it wrong there is a few
+        /// percent, against 3–10× further out.
+        ///
+        /// The `log2 q = 36` row is the only one below the line and it is also
+        /// the only one where the schoolbook is still in play, which is why the
+        /// dispatch below checks this FIRST: at wide moduli BEHZ beats the
+        /// schoolbook even at N=8 (10.7× at `log q = 300`).
+        pub const behz_min_tensor_bits: u16 = 128;
+
+        /// Homomorphic multiply. Dispatches at COMPTIME between the three
+        /// tensor+rescale implementations — all three are exact and, by the
+        /// differential test, bit-identical; the choice is purely which is
+        /// faster at these parameters.
         pub fn mul(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
+            if (comptime @bitSizeOf(TensorI) > behz_min_tensor_bits) return self.mulBehz(x, y);
             return if (comptime N >= ntt_tensor_min_degree)
                 self.mulRnsNtt(x, y)
             else
@@ -754,13 +1041,8 @@ pub fn Bfv(comptime P: params.Params) type {
         /// Called directly by the differential test at EVERY parameter set, so
         /// it stays covered even where `mul` does not dispatch to it.
         pub fn mulRnsNtt(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
-            std.debug.assert(x.len == 2 and y.len == 2);
-            const x0 = self.rawCoeffs(&x.components[0]);
-            const x1 = self.rawCoeffs(&x.components[1]);
-            const y0 = self.rawCoeffs(&y.components[0]);
-            const y1 = self.rawCoeffs(&y.components[1]);
             var t: [3][N]TensorI = undefined;
-            self.tensorNtt(&x0, &x1, &y0, &y1, &t);
+            self.tensorExactLift(x, y, &t);
             return .{ .components = .{
                 self.rescaleTensor(&t[0]),
                 self.rescaleTensor(&t[1]),
@@ -768,8 +1050,204 @@ pub fn Bfv(comptime P: params.Params) type {
             }, .len = 3 };
         }
 
+        /// The exact integer tensor, materialised — auxiliary-basis NTT plus
+        /// the centered CRT lift. Split out of `mulRnsNtt` so `bench.zig` can
+        /// feed the OLD rescale a real tensor without timing the transform.
+        pub fn tensorExactLift(self: *const Self, x: *const Ciphertext, y: *const Ciphertext, out: *[3][N]TensorI) void {
+            std.debug.assert(x.len == 2 and y.len == 2);
+            const x0 = self.rawCoeffs(&x.components[0]);
+            const x1 = self.rawCoeffs(&x.components[1]);
+            const y0 = self.rawCoeffs(&y.components[0]);
+            const y1 = self.rawCoeffs(&y.components[1]);
+            self.tensorNtt(&x0, &x1, &y0, &y1, out);
+        }
+
+        // ── BEHZ: the `⌊t/q·T⌉` rescale done entirely in residues ────────────
+        //
+        // `rescaleTensor` above needs the exact integer `T`, and therefore a CRT
+        // lift into a `2·q_bits`-wide signed type plus two big-integer divisions
+        // per coefficient. That is what kept the module on toy moduli. The
+        // routine below computes the SAME value with word arithmetic only.
+        //
+        // Notation: `T` is one exact integer tensor component coefficient,
+        // `A₀ = t·T`, `q = ∏_{i<L} q_i`, `P = ∏_{j<num_rs} p_j`, `m̃ = sk_prime`.
+        //
+        // STEP 1 — the rounding bit. With `D := ⌊t·T/q⌋` (floor, exact for
+        //   negative `T` too) and `ρ := [t·T]_q ∈ [0,q)`:
+        //       2tT + q = 2qD + 2ρ + q ,
+        //   so `⌊(2tT+q)/(2q)⌋ = D + ⌊(2ρ+q)/(2q)⌋ = D + b`, where `b = 1`
+        //   exactly when `2ρ > q` (`q` is odd, so `2ρ = q` cannot happen).
+        //   `ρ` is the main-basis CRT reconstruction of `A₀`'s `q_i` residues —
+        //   `L` wide multiply-adds, no division.
+        //
+        // STEP 2 — the quotient, by an exact RNS division chain. For a single
+        //   prime, `⌊A/q_i⌋ = (A − [A]_{q_i})/q_i` is an EXACT integer division,
+        //   and mod any modulus `g` coprime to `q_i` its residue is
+        //       (A_g − [A]_{q_i}) · (q_i^{-1} mod g)   (mod g),
+        //   pure word arithmetic. Iterating over `i = 0…L−1` gives
+        //   `⌊⌊…⌊A₀/q_0⌋/q_1⌋…/q_{L−1}⌋ = ⌊A₀/q⌋ = D` (the floor-of-floor
+        //   identity holds for every integer `A₀` and positive divisors). The
+        //   `q_i` slot dies at step `i` (`q_i` is not invertible mod itself),
+        //   which is exactly why `D` comes out in the AUXILIARY basis and has to
+        //   be carried back — step 3.
+        //
+        // STEP 3 — exact base extension `P → q`, Shenoy–Kumaresan. Let
+        //   `ω_j = [z_j·(P/p_j)^{-1}]_{p_j}` for `z := D + div_shift ∈ [0, P)`
+        //   (bound (B1)/(B2) above). Then `Σ_j ω_j·(P/p_j) = z + α·P` with
+        //   `α ∈ [0, num_rs)` because every `ω_j < p_j`. Evaluating that sum mod
+        //   the REDUNDANT modulus `m̃` — for which `z mod m̃` is known, because
+        //   `m̃` is carried through steps 1–2 as an extra residue — gives
+        //       α ≡ (Σ_j ω_j·(P/p_j) − z) · P^{-1}   (mod m̃),
+        //   and since `0 ≤ α < num_rs < m̃` that residue IS `α`. Subtracting
+        //   `α·(P mod q_i)` from the same sum evaluated mod `q_i` yields
+        //   `z mod q_i` exactly. No approximation, no error term to bound: the
+        //   only inequalities are (B1), (B2) and `num_rs < m̃`, all comptime.
+        //
+        // Finally `⌊t/q·T⌉ mod q_i = z − div_shift + b (mod q_i)`.
+
+        /// One coefficient of the RNS rescale. `aq` are `A₀ = t·T`'s residues
+        /// in the main basis (consumed), `ar`/`ask` the same in the auxiliary
+        /// sub-basis and mod `m̃`. Writes `⌊t/q·T⌉ mod q_i` into `out`.
+        fn rescaleCoeff(
+            self: *const Self,
+            aq: *[L]u64,
+            ar: *[num_rs]u64,
+            ask: *u64,
+            out: *[L]u64,
+        ) void {
+            // STEP 1 — rounding bit from ρ = [t·T]_q.
+            const rho = self.reconstruct(aq);
+            const b: u64 = @intFromBool(2 * rho > q_product);
+
+            // STEP 2 — divide out q_0 … q_{L−1}, exactly, one prime at a time.
+            for (0..L) |i| {
+                const rho_i = aq[i]; // [A_i]_{q_i}
+                for (i + 1..L) |k| {
+                    const mk = &self.engines[k].modulus;
+                    aq[k] = mk.mul(ma.subMod(aq[k], mk.reduce(rho_i), self.primes[k]), self.qinv_q[i][k]);
+                }
+                for (0..num_rs) |j| {
+                    const p = self.aux_primes[j];
+                    const mp = &self.aux_engines[j].modulus;
+                    ar[j] = mp.mul(ma.subMod(ar[j], mp.reduce(rho_i), p), self.qinv_rs[i][j]);
+                }
+                const msk = &self.sk_engine.modulus;
+                ask.* = msk.mul(ma.subMod(ask.*, msk.reduce(rho_i), self.sk_prime), self.qinv_sk[i]);
+            }
+
+            // z = D + div_shift ∈ [0, 2·div_shift] ⊂ [0, P).
+            var omega: [num_rs]u64 = undefined;
+            for (0..num_rs) |j| {
+                const p = self.aux_primes[j];
+                const z_j = ma.addMod(ar[j], self.shift_rs[j], p);
+                omega[j] = self.aux_engines[j].modulus.mul(z_j, self.rs_hat_inv[j]);
+            }
+            const z_sk = ma.addMod(ask.*, self.shift_sk, self.sk_prime);
+
+            // STEP 3a — α, via the redundant modulus.
+            const msk = &self.sk_engine.modulus;
+            var sum_sk: u64 = 0;
+            for (0..num_rs) |j| {
+                sum_sk = ma.addMod(sum_sk, msk.mul(omega[j], self.rs_hat_sk[j]), self.sk_prime);
+            }
+            const alpha = msk.mul(ma.subMod(sum_sk, z_sk, self.sk_prime), self.rs_inv_sk);
+
+            // STEP 3b — z mod q_i, then unshift and add the rounding bit.
+            for (0..L) |i| {
+                const qi = self.primes[i];
+                const mi = &self.engines[i].modulus;
+                var s: u64 = 0;
+                for (0..num_rs) |j| s = ma.addMod(s, mi.mul(omega[j], self.rs_hat_q[j][i]), qi);
+                const z_i = ma.subMod(s, mi.mul(alpha, self.rs_mod_q[i]), qi);
+                out[i] = ma.addMod(ma.subMod(z_i, self.shift_q[i], qi), b, qi);
+            }
+        }
+
+        /// Homomorphic multiply with the tensor AND the `⌊t/q·…⌉` rescale in
+        /// RNS — the BEHZ/HPS shape. The exact integer tensor is never
+        /// materialised and no big-integer division is performed: the only wide
+        /// arithmetic left is the `[0,q)` CRT lift of the four INPUT components
+        /// (needed to decide the centering `v > q/2`) and the per-coefficient
+        /// reconstruction of `ρ` for the rounding bit — both `O(L)` multiply-adds.
+        ///
+        /// Bit-identical to `mulExactRef` by construction (see the derivation
+        /// above), and asserted so by the differential test.
+        pub fn mulBehz(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
+            var tq: [3]Ring = undefined;
+            var ta: [3][num_behz][N]u64 = undefined;
+            self.tensorAll(x, y, &tq, &ta);
+            var outc: [3]Ring = undefined;
+            for (0..3) |c| outc[c] = self.rescaleRns(&tq[c], &ta[c]);
+            return .{ .components = outc, .len = 3 };
+        }
+
+        /// The exact integer tensor `(c0d0, c0d1+c1d0, c1d1)` expressed in
+        /// residues over BOTH the main basis (`tq`) and the BEHZ auxiliary
+        /// sub-basis plus `m̃` (`ta`). Split out of `mulBehz` so `bench.zig` can
+        /// time the tensor and the rescale separately.
+        pub fn tensorAll(
+            self: *const Self,
+            x: *const Ciphertext,
+            y: *const Ciphertext,
+            tq: *[3]Ring,
+            ta: *[3][num_behz][N]u64,
+        ) void {
+            std.debug.assert(x.len == 2 and y.len == 2);
+            const x0 = self.rawCoeffs(&x.components[0]);
+            const x1 = self.rawCoeffs(&x.components[1]);
+            const y0 = self.rawCoeffs(&y.components[0]);
+            const y1 = self.rawCoeffs(&y.components[1]);
+
+            // Auxiliary sub-basis + `m̃`: needs the CENTERED representatives,
+            // hence the `[0,q)` lift above.
+            for (0..num_behz) |k| {
+                const eng = if (k < num_rs) &self.aux_engines[k] else &self.sk_engine;
+                const qg = if (k < num_rs) self.q_mod_aux[k] else self.q_mod_sk;
+                tensorModulus(eng, qg, &x0, &x1, &y0, &y1, &ta[0][k], &ta[1][k], &ta[2][k]);
+            }
+
+            // Main basis: centering is INVISIBLE here — it shifts each
+            // representative by a multiple of `q`, which is `0 mod q_i` — so
+            // this is an ordinary `R_{q_i}` ring tensor, no lift involved.
+            var a0 = x.components[0];
+            var a1 = x.components[1];
+            var b0 = y.components[0];
+            var b1 = y.components[1];
+            a0.toNtt(&self.engines);
+            a1.toNtt(&self.engines);
+            b0.toNtt(&self.engines);
+            b1.toNtt(&self.engines);
+            tq.* = .{ a0, a0, a1 };
+            tq[0].mulPointwise(&b0, &self.engines);
+            tq[1].mulPointwise(&b1, &self.engines);
+            var cross = a1;
+            cross.mulPointwise(&b0, &self.engines);
+            tq[1].addAssign(&cross, &self.primes);
+            tq[2].mulPointwise(&b1, &self.engines);
+            for (tq) |*r| r.fromNtt(&self.engines);
+        }
+
+        /// `⌊t/q · T⌉ mod q` for one whole tensor component, from residues
+        /// only. The replacement for `rescaleTensor` — same value, no exact
+        /// integer, no big-integer division.
+        pub fn rescaleRns(self: *const Self, tq: *const Ring, ta: *const [num_behz][N]u64) Ring {
+            var out = Ring.zero(.coeff);
+            for (0..N) |j| {
+                // A₀ = t·T for this coefficient, in every basis.
+                var aq: [L]u64 = undefined;
+                for (0..L) |i| aq[i] = self.engines[i].modulus.mul(self.t_mod_q[i], tq.limbs[i][j]);
+                var ar: [num_rs]u64 = undefined;
+                for (0..num_rs) |k| ar[k] = self.aux_engines[k].modulus.mul(self.t_mod_rs[k], ta[k][j]);
+                var ask: u64 = self.sk_engine.modulus.mul(self.t_mod_sk, ta[num_rs][j]);
+                var res: [L]u64 = undefined;
+                self.rescaleCoeff(&aq, &ar, &ask, &res);
+                for (0..L) |i| out.limbs[i][j] = res[i];
+            }
+            return out;
+        }
+
         /// The ORIGINAL `O(N²)` exact-integer schoolbook multiply, kept as the
-        /// differential ORACLE for `mulRnsNtt` — and, below
+        /// differential ORACLE for `mulRnsNtt`/`mulBehz` — and, below
         /// `ntt_tensor_min_degree`, as the path `mul` actually takes.
         pub fn mulExactRef(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
             std.debug.assert(x.len == 2 and y.len == 2);
@@ -807,7 +1285,7 @@ pub fn Bfv(comptime P: params.Params) type {
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
                 for (0..L) |i| res[i] = ct.components[2].limbs[i][j];
-                var v = self.reconstruct(&res); // [0, q)
+                var v: QU = self.reconstruct(&res); // [0, q)
                 for (0..relin_digits) |i| {
                     digits[i][j] = @intCast(v & (relin_base - 1));
                     v >>= relin_base_log2;
@@ -852,23 +1330,24 @@ pub fn Bfv(comptime P: params.Params) type {
                 }
             }
             const half = q_product / 2;
-            var vmax: u128 = 0;
+            var vmax: QU = 0;
+            const qr: QRescale = q_product;
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
                 for (0..L) |i| res[i] = acc.limbs[i][j];
                 const phase = self.reconstruct(&res); // [0, q)
                 // m_j exactly as decrypt recovers it (round half up, mod t).
-                const rounded = (2 * @as(u128, P.t) * phase + q_product) / (2 * q_product);
-                const m_j = rounded % @as(u128, P.t);
+                const rounded = (2 * @as(QRescale, P.t) * @as(QRescale, phase) + qr) / (2 * qr);
+                const m_j: QU = @intCast(rounded % @as(QRescale, P.t));
                 const dm = delta * m_j; // < q (m_j ≤ t−1, Δ·(t−1) < q)
                 const d = (phase + q_product - dm) % q_product;
                 const v = if (d > half) q_product - d else d; // |centered|
                 vmax = @max(vmax, v);
             }
-            if (vmax == 0) return @intCast(std.math.log2_int(u128, q_product / 2));
+            if (vmax == 0) return @intCast(std.math.log2_int(QU, q_product / 2));
             const ratio = q_product / (2 * vmax);
             if (ratio <= 1) return 0;
-            return @intCast(std.math.log2_int(u128, ratio));
+            return @intCast(std.math.log2_int(QU, ratio));
         }
     };
 }

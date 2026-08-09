@@ -56,11 +56,12 @@ cleanly** rather than everything half-built:
 Deferred increments (all out of the whole three-part arc): **bootstrapping**
 (the biggest single deferred piece), **CKKS** (approximate arithmetic), **key
 rotation / Galois automorphisms** (for batched-slot rotations), full **CRT-slot
-SIMD batch encoding** (needs `t ≡ 1 mod 2N`), fast RNS base conversion
-(Bajard/Halevi-Polyakov — Part 1 ships the exact O(reconstruct) version),
-constant-time secret paths, and **security-grade parameter sets** (`N≥4096`,
-~128-bit). **Part 1 claims no security level** — `test_tiny`/`bfv_toy` exist for
-correctness testing only.
+SIMD batch encoding** (needs `t ≡ 1 mod 2N`), and byte codecs. Since landed:
+constant-time secret paths (see "Threats / caveats"), fast RNS base conversion
+(BEHZ/HPS — `mulBehz`), and a **security-grade parameter set**
+(`params.sec_n8192_logq218`, `N = 8192` / `log q = 218`). The `rns.Basis`
+helpers still ship only the exact O(reconstruct) base conversion; the fast one
+lives with the scheme layer, where its bounds are checkable against `P`.
 
 ## Fable boundary + honest tier call
 
@@ -135,19 +136,31 @@ Two anchor families, per the plan:
 The Fable core (`mul`/`genRelinKey`/`relinearize`/`noiseBudget`) is REAL.
 Design decisions and the noise argument, for audit:
 
-- **Exact integer tensor (the correctness crux).** `mul` CRT-reconstructs the
-  four input components to centered integer polynomials, computes the tensor
-  `(c0d0, c0d1+c1d0, c1d1)` EXACTLY over `Z[X]/(X^N+1)` (i256 schoolbook), and
-  only then applies the per-component `⌊t/q·T_i⌉` rescale. This is forced: the
-  rescale does not commute with mod-`q` reduction (`⌊t/q·[T]_q⌉` differs from
-  `[⌊t/q·T⌉]_q` by `t·k ≢ 0 (mod q)`), so a "stay in RNS, multiply in the
-  ring, then rescale" shortcut decrypts to garbage. Verified by fault
-  injection: that exact variant, and a dropped-rescale (`Δ²`) variant, and a
-  wrong-gadget-base relin variant were each injected and each turns the two
-  mul anchors red deterministically. The security-grade fast path (BEHZ/HPS
-  RNS base extension to an auxiliary basis, never materialising the integer)
-  is the deferred increment; the exact path is O(reconstruct + N²) and fine
-  for the toy/test moduli (guarded by a comptime width check).
+- **Exact integer tensor (the correctness crux).** The tensor
+  `(c0d0, c0d1+c1d0, c1d1)` must be the EXACT integer product of fixed
+  representatives (centered here, to halve the noise constants) before the
+  per-component `⌊t/q·T_i⌉` rescale. This is forced: the rescale does not
+  commute with mod-`q` reduction (`⌊t/q·[T]_q⌉` differs from `[⌊t/q·T⌉]_q` by
+  `t·k ≢ 0 (mod q)`), so a "stay in RNS, multiply in the ring, then rescale"
+  shortcut decrypts to garbage. Verified by fault injection: that exact
+  variant, and a dropped-rescale (`Δ²`) variant, and a wrong-gadget-base relin
+  variant were each injected and each turns the two mul anchors red
+  deterministically.
+- **How the exact tensor is obtained — three paths, one value.** `mulExactRef`
+  is the `O(N²)` schoolbook over an exact integer (the ORACLE). `mulRnsNtt`
+  computes it in an auxiliary RNS basis sized so the centered CRT lift is exact
+  (`O(num_aux·N log N)`), then still rescales by big-integer division.
+  **`mulBehz`** is the BEHZ/HPS path: the tensor stays in residues (main basis,
+  an auxiliary sub-basis, and one redundant modulus `m̃`) and the rescale is an
+  exact RNS division chain followed by a Shenoy–Kumaresan base extension — the
+  exact integer is never materialised and no big-integer division happens. It
+  is EXACT, not approximate: the only inequalities it rests on are
+  `∏p > 2·div_shift` and `num_rs < m̃`, both comptime-checked, and the
+  differential test asserts bit-identity with `mulExactRef` at
+  `log q ∈ {11, 36, 120, 300}` including saturating inputs. `mul` picks the
+  path by a MEASURED rule (`Bfv.behz_min_tensor_bits`): BEHZ as soon as
+  `TensorI` outgrows a native 128-bit integer, which is exactly where LLVM
+  stops lowering the constant-divisor division to a multiply.
 - **Why the rescale keeps the scale at `Δ`.** With `ct_i(s) = Δm_i + v_i +
   q·r_i` over the integers and `tΔ = q − r_t`: `(t/q)·ct1(s)ct2(s) ≡
   Δ[m1m2]_t + (m1v2+m2v1) + t(r1v2+r2v1) − r_t(…small…) + ⌊·⌉-error (mod q)`
@@ -196,9 +209,18 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 
 ## Threats / caveats (Part 1)
 
-- **No security level claimed.** `test_tiny`/`bfv_toy` are correctness-only
-  toy parameters; do not encrypt anything real until a security-grade parameter
-  set + Part 2/3 land.
+- **Security status.** `test_tiny` / `test_mul` / `bfv_toy` remain
+  correctness-only toy parameters and claim nothing.
+  `params.sec_n8192_logq218` is the one set with a security claim: `N = 8192`,
+  four NTT primes totalling `log2 q = 218.000`, `t = 65537`, ternary secret —
+  the shape the HomomorphicEncryption.org tables give for ~128-bit classical
+  security. What is VERIFIED here is correctness at those parameters (a depth-2
+  evaluation over boundary + random plaintexts decrypts exactly, and the
+  worst-case ledger in `params.zig` guarantees depth 4); the ~128-bit figure is
+  a citation of the standard tables, **not** a lattice estimate run in this
+  repo. There is also no side-channel hardening beyond the boundary in
+  "Partially constant-time" below, and no byte codecs — so this is a set to
+  benchmark and reason about, not one to deploy behind.
 - **Partially constant-time — read the boundary, do not round it up.**
   What IS source-level constant time now: the ternary sampler (`sampleTernary`
   draws with the fixed-cost `uintLessThanBiased` instead of a rejection loop and
@@ -216,14 +238,14 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   our control. Above all this is **source-level** CT — the compiler may
   rematerialise a branch from a mask, and nothing here is verified codegen or a
   microarchitectural claim.
-- **Exact CRT reconstruction uses `u128`** — fine for KAT/toy moduli (product
-  fits in 128 bits); production RNS never materialises the integer (stays in
-  residues). This `u128` ceiling on `q` is now **the** blocker for
-  security-grade parameters (log q ≳ 218): the tensor's own integer width is no
-  longer pinned (`Bfv.TensorI` is sized from the parameters), so what remains is
-  `q_product`/`delta`/the CRT accumulator/the decrypt rescale all being `u128`.
-  Fast base conversion (BEHZ/HPS), which removes the materialised integer
-  altogether, is the deferred increment.
+- **No fixed integer width remains.** `Bfv.QU` (the `[0,q)` value and CRT
+  accumulator) and `Bfv.TensorI` are both derived from the parameter set; the
+  `u128` ceiling that used to cap `log q` at 127 is gone, and so is the older
+  `i256` tensor guard. `params.sec_n8192_logq218` (`N = 8192`, `log q = 218`,
+  `t = 65537`) builds and evaluates a depth-2 circuit exactly — see "Security
+  status" above. `decrypt`/`noiseBudget` still reconstruct a wide integer per
+  coefficient (that is inherent to `⌊t/q·…⌉` at decrypt time); the MULTIPLY no
+  longer does.
 - **Verifiability risk (flagged in Part 1, addressed in Part 3):** BFV
   ciphertext noise is randomised, so the Part-3 multiply's correctness at depth
   has no byte-exact external KAT — the noise-budget accounting is exactly the
@@ -239,4 +261,5 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   serialisation to fill in with Part 2).
 - Fast RNS base conversion (Halevi–Polyakov) replacing `convertExact`.
 - CRT-slot batch encoding (`encode.zig`), needs `t ≡ 1 mod 2N`.
-- Security-grade parameter sets + a parameter-selection helper.
+- A parameter-selection helper (`sec_n8192_logq218` is hand-derived; there is
+  no function that picks a chain for a target `N`/`log q`/depth).

@@ -50,9 +50,20 @@
 //! worst-case noise-ledger argument in SPEC.md. No SEAL output, KAT vector,
 //! or transcript exists anywhere in this repo for bfv.
 //!
+//! ## Parameters
+//! `params.test_tiny` / `test_mul` / `bfv_toy` are correctness-only toy sets
+//! and claim no security level. `params.sec_n8192_logq218` (`N = 8192`,
+//! `log2 q = 218`, `t = 65537`) is the security-grade set — the shape the
+//! HomomorphicEncryption.org tables give for ~128-bit classical security with a
+//! ternary secret. Correctness at those parameters is tested end to end (a
+//! depth-2 evaluation decrypts exactly; the worst-case ledger in `params.zig`
+//! guarantees depth 4); the 128-bit figure is a citation of those tables, not a
+//! lattice estimate run here, and nothing about deployment hardening (byte
+//! codecs, side channels beyond `SPEC.md`'s stated boundary) is claimed.
+//!
 //! Deferred increments: bootstrapping, CKKS (approximate), key rotation /
 //! Galois automorphisms (batching rotations), full CRT-slot SIMD encoding,
-//! security-grade parameter sets. **No security level is claimed in Part 1.**
+//! byte codecs.
 
 const std = @import("std");
 

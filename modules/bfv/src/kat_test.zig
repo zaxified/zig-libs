@@ -414,7 +414,7 @@ test "enc/dec round-trip at realistic dimension (bfv_toy N=1024, comfortable mar
 /// Build a ring element whose j-th coefficient is the integer `vals[j] mod q`
 /// (decomposed into its RNS residues) — lets a test pin exact big-integer
 /// coefficients rather than only sampling residues.
-fn ringFromIntegers(comptime B: type, primes_: []const u64, vals: []const u128) B.Ring {
+fn ringFromIntegers(comptime B: type, primes_: []const u64, vals: []const B.QU) B.Ring {
     var out = B.Ring.zero(.coeff);
     for (0..B.num_primes) |i| {
         for (0..B.degree) |j| out.limbs[i][j] = @intCast(vals[j] % primes_[i]);
@@ -422,16 +422,26 @@ fn ringFromIntegers(comptime B: type, primes_: []const u64, vals: []const u128) 
     return out;
 }
 
+/// A uniform `[0, q)` draw for an arbitrary-width `QU` (`std.Random` only
+/// offers up to `u64` reliably, and `q` is now allowed past 128 bits).
+fn randQ(comptime QU: type, rnd: std.Random, q: QU) QU {
+    var x: QU = 0;
+    var b: usize = 0;
+    while (b < @bitSizeOf(QU)) : (b += 64) x |= @as(QU, rnd.int(u64)) << @intCast(b);
+    return x % q;
+}
+
 fn diffMul(comptime PP: params.Params, iters: usize, seed: u64) !void {
     const B = bfv.Bfv(PP);
     const inst = try B.init();
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
-    const q: u128 = B.q_product;
-    const half: u128 = (q - 1) / 2;
+    const QU = B.QU;
+    const q: QU = B.q_product;
+    const half: QU = (q - 1) / 2;
 
     for (0..iters) |it| {
-        var v: [4][B.degree]u128 = undefined;
+        var v: [4][B.degree]QU = undefined;
         for (0..4) |c| {
             for (0..B.degree) |j| {
                 v[c][j] = switch (it) {
@@ -442,8 +452,8 @@ fn diffMul(comptime PP: params.Params, iters: usize, seed: u64) !void {
                     1 => q - half,
                     2 => if (j % 2 == 0) half else q - half,
                     // Mixed extremes + the 0 / 1 / q−1 boundary.
-                    3 => ([_]u128{ 0, 1, q - 1, half, q - half })[j % 5],
-                    else => rnd.int(u128) % q,
+                    3 => ([_]QU{ 0, 1, q - 1, half, q - half })[j % 5],
+                    else => randQ(QU, rnd, q),
                 };
             }
         }
@@ -458,12 +468,17 @@ fn diffMul(comptime PP: params.Params, iters: usize, seed: u64) !void {
             B.Ring.zero(.coeff),
         }, .len = 2 };
 
-        const fast = inst.mulRnsNtt(&x, &y); // direct, regardless of `mul`'s dispatch
+        // Both fast paths are called DIRECTLY, regardless of `mul`'s dispatch,
+        // so each stays covered at every parameter set.
+        const fast = inst.mulRnsNtt(&x, &y);
+        const behz = inst.mulBehz(&x, &y);
         const ref = inst.mulExactRef(&x, &y);
         try testing.expectEqual(ref.len, fast.len);
+        try testing.expectEqual(ref.len, behz.len);
         for (0..3) |c| {
             for (0..B.num_primes) |i| {
                 try testing.expectEqualSlices(u64, &ref.components[c].limbs[i], &fast.components[c].limbs[i]);
+                try testing.expectEqualSlices(u64, &ref.components[c].limbs[i], &behz.components[c].limbs[i]);
             }
         }
     }
@@ -478,7 +493,22 @@ const wide_aux = params.Params{
     .primes = &.{ 1152921504606846577, 1152921504606846097 },
 };
 
-test "RNS-NTT tensor is bit-identical to the i256 schoolbook oracle (num_aux = 1, 2, 4)" {
+/// N=8, FIVE ~60-bit primes: `q ≈ 2^300`, i.e. **past the old `u128` ceiling**
+/// and past the `log q ≳ 218` bar the audit finding names. `QU` is a `u301`
+/// here. This is the set that proves the widening is exact, not merely
+/// compiling: all three multiply paths must still agree bit-for-bit, including
+/// on the saturating vectors. Correctness-only (N=8 is not a security level —
+/// `params.sec_n8192_logq218` is the set with the security claim).
+const wide_q300 = params.Params{
+    .n = 8,
+    .t = 4,
+    .primes = &.{
+        1152921504606846577, 1152921504606846097, 1152921504606845777,
+        1152921504606845473, 1152921504606844913,
+    },
+};
+
+test "RNS-NTT + BEHZ tensors are bit-identical to the schoolbook oracle (num_aux = 1, 2, 4, 10)" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     // num_aux == 1 (test_tiny, q = 1649)
     try testing.expectEqual(@as(usize, 1), bfv.Bfv(params.test_tiny).num_aux);
@@ -490,6 +520,12 @@ test "RNS-NTT tensor is bit-identical to the i256 schoolbook oracle (num_aux = 1
     // widened accumulator.
     try testing.expectEqual(@as(usize, 4), bfv.Bfv(wide_aux).num_aux);
     try diffMul(wide_aux, 24, 0xD3);
+    // q ≈ 2^300 — past the old `u128` ceiling entirely: `QU` is 301 bits, the
+    // exact-lift basis needs 10 auxiliary primes and the BEHZ sub-basis 5.
+    try testing.expectEqual(@as(u16, 300), bfv.Bfv(wide_q300).q_bits);
+    try testing.expectEqual(@as(usize, 10), bfv.Bfv(wide_q300).num_aux);
+    try testing.expectEqual(@as(usize, 5), bfv.Bfv(wide_q300).num_rs);
+    try diffMul(wide_q300, 16, 0xD4);
 }
 
 test "instance CRT reconstruct is bit-identical to rns.Basis.reconstruct" {
@@ -613,6 +649,103 @@ test "ternary sampler: every limb is a trit, consistently across limbs, all thre
     // 3200 draws: each trit's count is ~1067; a mapping that collapsed two
     // cases (or dropped one) shows up immediately.
     for (seen) |c| try testing.expect(c > 800 and c < 1400);
+}
+
+// ── 6. Security-grade parameters, end to end ──────────────────────────────────
+//
+// The audit finding this closes says the module "structurally cannot reach
+// security-grade params (N=8192, log q ≳ 218)". `params.sec_n8192_logq218` is
+// exactly that set — 128-bit-class per the HomomorphicEncryption.org table for
+// a ternary secret — and this is the test that makes it a fact rather than a
+// compile.
+//
+// Two structural things had to go: the `u128` ciphertext modulus (`QU` is a
+// 219-bit type here) and the big-integer `⌊t/q·…⌉` rescale (`mul` dispatches to
+// `mulBehz`, which never materialises the tensor). What is asserted below is
+// not "it runs": it is that a depth-2 evaluation decrypts EXACTLY to the
+// plaintext-space reference `encode.mulRef`, that the noise budget strictly
+// decreases per level, and that it is still far from exhausted — which is what
+// the worst-case ledger in `params.zig` predicts.
+//
+// Runs on its own thread with a large stack: at N=8192 with L=4 limbs a single
+// `Ring` is 256 KiB, a `RelinKey` is 2 MiB and `mulBehz`'s working set is a few
+// MiB more, which does not fit the default 8 MiB test-runner stack. That is a
+// property of the parameters, not of the algorithm.
+
+const SEC = params.sec_n8192_logq218;
+const BSEC = bfv.Bfv(SEC);
+
+fn secEndToEnd() !void {
+    const inst = try BSEC.init();
+    var prng = std.Random.DefaultPrng.init(0x5EC0_0001);
+    const rnd = prng.random();
+    const kp = inst.keyGen(rnd);
+    const rlk = inst.genRelinKey(&kp.sk, rnd);
+    const Pt = BSEC.Plaintext;
+    const t = SEC.t;
+
+    var ac: [BSEC.degree]u64 = undefined;
+    var bc: [BSEC.degree]u64 = undefined;
+    var cc: [BSEC.degree]u64 = undefined;
+    // Boundary plaintexts: the all-(t−1) worst-case message norm the ledger is
+    // written for, on the low half; random on the high half.
+    for (&ac, &bc, &cc, 0..) |*x, *y, *z, i| {
+        const boundary = i < BSEC.degree / 2;
+        x.* = if (boundary) t - 1 else rnd.uintLessThan(u64, t);
+        y.* = if (boundary) t - 1 else rnd.uintLessThan(u64, t);
+        z.* = if (boundary) t - 1 else rnd.uintLessThan(u64, t);
+    }
+    const a = Pt.fromCoeffs(t, ac);
+    const b = Pt.fromCoeffs(t, bc);
+    const c = Pt.fromCoeffs(t, cc);
+
+    const ea = inst.encrypt(&kp.pk, &a, rnd);
+    const eb = inst.encrypt(&kp.pk, &b, rnd);
+    const ec = inst.encrypt(&kp.pk, &c, rnd);
+    // Fresh encryption round-trips.
+    try testing.expectEqualSlices(u64, &a.coeffs, &inst.decrypt(&kp.sk, &ea).coeffs);
+
+    const want_ab = Pt.mulRef(&a, &b);
+    const prod3 = inst.mul(&ea, &eb);
+    try testing.expectEqual(@as(usize, 3), prod3.numComponents());
+    // The tensor+rescale must be right BEFORE relin, isolating `mulBehz`.
+    try testing.expectEqualSlices(u64, &want_ab.coeffs, &inst.decrypt(&kp.sk, &prod3).coeffs);
+    const ab = inst.relinearize(&prod3, &rlk);
+    try testing.expectEqualSlices(u64, &want_ab.coeffs, &inst.decrypt(&kp.sk, &ab).coeffs);
+
+    // Depth 2.
+    const want_abc = Pt.mulRef(&want_ab, &c);
+    const abc = inst.relinearize(&inst.mul(&ab, &ec), &rlk);
+    try testing.expectEqualSlices(u64, &want_abc.coeffs, &inst.decrypt(&kp.sk, &abc).coeffs);
+
+    // The budget must fall per level and still be far from exhausted — the
+    // ledger says depth 4 fits, so depth 2 must have well over 60 bits left.
+    const bud_fresh = inst.noiseBudget(&kp.sk, &ea);
+    const bud_ab = inst.noiseBudget(&kp.sk, &ab);
+    const bud_abc = inst.noiseBudget(&kp.sk, &abc);
+    try testing.expect(bud_fresh > bud_ab);
+    try testing.expect(bud_ab > bud_abc);
+    try testing.expect(bud_abc > 60);
+}
+
+fn secThread(slot: *?anyerror) void {
+    secEndToEnd() catch |e| {
+        slot.* = e;
+    };
+}
+
+test "security-grade N=8192 / log q=218: depth-2 evaluation decrypts exactly" {
+    if (!gate.scheme_core_implemented or !gate.fable_core_implemented) return error.SkipZigTest;
+    // The structural facts the finding was about, pinned so a parameter edit
+    // cannot silently drop them.
+    try testing.expectEqual(@as(u16, 218), BSEC.q_bits);
+    try testing.expect(@bitSizeOf(BSEC.QU) > 128); // the old ceiling is gone
+    try testing.expectEqual(@as(usize, 4), BSEC.relin_digits);
+
+    var slot: ?anyerror = null;
+    const th = try std.Thread.spawn(.{ .stack_size = 256 << 20 }, secThread, .{&slot});
+    th.join();
+    if (slot) |e| return e;
 }
 
 test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget (random + boundary)" {

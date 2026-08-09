@@ -110,6 +110,31 @@ pub const Modulus = struct {
     pub inline fn mul(self: *const Modulus, a: u64, b: u64) u64 {
         return self.reduce(@as(u128, a) * @as(u128, b));
     }
+
+    /// `x mod q` for an unsigned `x` of ARBITRARY width (`u128`, `u256`,
+    /// `u512`, …). Needed once the ciphertext modulus `q = ∏ q_i` stops
+    /// fitting in a `u128`: reducing such a value with `%` is a genuine
+    /// multi-limb library division, and unlike the `i256`-by-constant divisions
+    /// elsewhere in this module the divisor here is a *runtime* prime, so LLVM
+    /// cannot turn it into a magic-multiply.
+    ///
+    /// Instead: Horner over 64-bit limbs, most significant first, each step
+    /// `acc·2^64 + limb (mod q)` done with the Barrett `reduce` above. Exact —
+    /// `acc < q < 2^62`, so `(acc << 64) | limb < 2^126 + 2^64 < 2^128` and the
+    /// `u128` intermediate never wraps. Costs `⌈bits/64⌉` Barrett reductions.
+    pub fn reduceWide(self: *const Modulus, comptime T: type, x: T) u64 {
+        const bits = @bitSizeOf(T);
+        if (comptime bits <= 128) return self.reduce(@intCast(x));
+        const limbs = comptime (bits + 63) / 64;
+        var acc: u64 = 0;
+        var i: usize = limbs;
+        while (i > 0) {
+            i -= 1;
+            const limb: u64 = @truncate(x >> @intCast(64 * i));
+            acc = self.reduce((@as(u128, acc) << 64) | limb);
+        }
+        return acc;
+    }
 };
 
 /// A **fixed** multiplier `w` with its Shoup constant `w' = ⌊w·2^64/q⌋`
@@ -277,6 +302,27 @@ test "Modulus (Barrett) is bit-identical to the mulMod division oracle" {
             try std.testing.expectEqual(@as(u64, @intCast(p % q)), m.reduce(p));
         }
         try std.testing.expectEqual(@as(u64, @intCast(@as(u128, std.math.maxInt(u128)) % q)), m.reduce(std.math.maxInt(u128)));
+    }
+}
+
+test "Modulus.reduceWide is bit-identical to `%` at u128/u256/u320/u466/u512" {
+    var prng = std.Random.DefaultPrng.init(0x1DE_2A17);
+    const rnd = prng.random();
+    for (diff_primes) |q| {
+        const m = try Modulus.init(q);
+        inline for (.{ u128, u256, u320, u466, u512 }) |T| {
+            // Boundaries first: 0, 1, q−1, q, maxInt — an off-by-one in the
+            // Horner chain or a dropped top limb shows up here.
+            for ([_]T{ 0, 1, q - 1, q, q + 1, std.math.maxInt(T), std.math.maxInt(T) - 1 }) |x| {
+                try std.testing.expectEqual(@as(u64, @intCast(x % q)), m.reduceWide(T, x));
+            }
+            for (0..3_000) |_| {
+                var x: T = 0;
+                var b: usize = 0;
+                while (b < @bitSizeOf(T)) : (b += 64) x |= @as(T, rnd.int(u64)) << @intCast(b);
+                try std.testing.expectEqual(@as(u64, @intCast(x % q)), m.reduceWide(T, x));
+            }
+        }
     }
 }
 

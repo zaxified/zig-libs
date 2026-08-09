@@ -33,7 +33,7 @@ The whole computational backbone FHE stands on is implemented and tested:
 | RNS / CRT | `rns.zig` | `Basis` — residue representation of `q=∏qᵢ`, exact CRT reconstruct, exact base conversion. `Bfv` hoists the same CRT constants to `init` (`Bfv.reconstruct`) and keeps `Basis.reconstruct` as its oracle |
 | RLWE ring | `ring.zig` | `RnsPoly(N,L)` — `R_q` add/negate/NTT/pointwise-multiply |
 | Plaintext | `encode.zig` | `Plaintext(N)` — `R_t` coefficient + integer encodings, `addRef`/`mulRef` references |
-| Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; `test_tiny`, `bfv_toy`, `test_mul` sets |
+| Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; toy sets `test_tiny`, `bfv_toy`, `test_mul`, plus the security-grade `sec_n8192_logq218` (`N=8192`, `log2 q=218`, `t=65537`) |
 | Benchmarks | `bench.zig` | old-path-vs-new-path ns/op, opt-in: `BFV_BENCH=1 zig build test-bfv -Doptimize=ReleaseFast` |
 
 ## The scheme core (Part 2) + the Fable core (Part 3)

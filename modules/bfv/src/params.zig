@@ -21,6 +21,13 @@ pub const Params = struct {
     t: u64,
     /// RNS prime chain for the ciphertext modulus `q = ∏ primes`.
     primes: []const u64,
+    /// Relinearisation gadget base, as `log2 w`. The key-switch decomposes
+    /// `c2` into `⌈log2 q / log2 w⌉` base-`w` digits, so this trades key size
+    /// and key-switch cost (one gadget row per digit) against key-switch noise
+    /// (`digits·N·(w−1)`). `8` is the historical default and is what every toy
+    /// set uses; a `log q ≈ 218` set would need 28 rows at that base — a
+    /// 56-polynomial relin key — so security-grade sets raise it.
+    relin_base_log2: u7 = 8,
 
     /// Structural validity: `N` a power of two, `t ≥ 2`, and every prime
     /// distinct, prime, and `≡ 1 (mod 2N)`. Does NOT assert any security
@@ -84,7 +91,67 @@ pub const test_mul = Params{
     .primes = &.{ 65537, 786433 },
 };
 
+/// **Security-grade set** — `N = 8192`, `t = 65537`, four NTT primes of
+/// 55/55/54/54 bits, `log2 q = 218.000` exactly. This is the shape the
+/// HomomorphicEncryption.org security tables give for ~128-bit classical
+/// security with a ternary secret (`N = 8192 ⇒ log q ≤ 218`), and it is the
+/// parameter set the module could NOT express before: the `u128` ciphertext
+/// modulus capped `log q` at 127. `Bfv.QU` is now sized from `P` (here a
+/// 219-bit accumulator) and the multiply runs `mulBehz`, whose `⌊t/q·…⌉`
+/// rescale is pure residue arithmetic — no big-integer division at all.
+///
+/// `t = 65537 ≡ 1 (mod 2N)` (`65536 = 4·16384`), the standard batching prime,
+/// so this set is also the one a future CRT-slot encoder would use.
+/// `relin_base_log2 = 55` ⇒ 4 gadget rows; at the historical `w = 2^8` this
+/// modulus would need 28 rows, i.e. a 56-polynomial relin key.
+///
+/// ## Worst-case noise ledger (same shape as `test_mul`)
+/// Ternary `s,u,e,e0,e1`; `ct(s) = Δm + v + q·r` over the integers with
+/// centered representatives; `B := ‖v‖_∞`; `Δ = ⌊q/t⌋` (202 bits);
+/// `r_t = q mod t = 23199`.
+///   - fresh:  `B ≤ 2N+1 = 16385 < 2^14`; `‖r‖ ≤ (N+3)/2 = 4098 < 2^12.1`;
+///     `‖m‖ ≤ t−1 = 65536 = 2^16`.
+///   - one tensor+rescale of inputs with noise `B1,B2` adds
+///       `t·N·‖r‖·(B1+B2)`          = 2.20e12·(B1+B2) ≈ `2^41.0·(B1+B2)`
+///     + `N·‖m‖·(B1+B2)`            = 5.37e8·(B1+B2)
+///     + `r_t·(2N‖r‖‖m‖ + N‖m‖²/t)` ≈ 1.02e17 ≈ `2^56.5`
+///     + `(1+N+N²)/2`               ≈ 3.36e7  ≈ `2^25`
+///     ⇒ `B_out ≤ 2^41.1·(B1+B2) + 2^56.6`.
+///   - the relin key-switch (`w = 2^55`, 4 digits, ternary `e_i`) adds
+///     `≤ digits·N·(w−1) = 4·8192·(2^55−1) ≈ 2^70.0` — which DOMINATES the
+///     tensor term at depth 1.
+/// Chaining (each level: multiply, then relinearise):
+///   `B_1 ≤ 2^57.4 + 2^70.0 ≈ 2^70.1`
+///   `B_2 ≤ 2^41.1·2^70.1 ≈ 2^111.2`
+///   `B_3 ≤ 2^41.1·2^111.2 ≈ 2^152.3`
+///   `B_4 ≤ 2^41.1·2^152.3 ≈ 2^193.4`
+/// Decryption stays exact while `t·B + r_t·‖m‖ < q/2 = 2^217`:
+///   depth 4 ⇒ `2^16·2^193.4 = 2^209.4 < 2^217` — a `2^7.6 ≈ 190×` margin.
+///   depth 5 ⇒ `2^250` — fails. So **multiplicative depth 4 is a worst-case
+/// guarantee** for every seed and every plaintext including all-`(t−1)`; the
+/// end-to-end test exercises depth 3 (the runtime at `N = 8192` is the only
+/// reason it stops there, not the budget).
+pub const sec_n8192_logq218 = Params{
+    .n = 8192,
+    .t = 65537,
+    .primes = &.{ 36028797018652673, 36028797017571329, 18014398508400641, 18014398508138497 },
+    .relin_base_log2 = 55,
+};
+
 const testing = std.testing;
+
+test "sec_n8192_logq218 validates and has the documented shape" {
+    try sec_n8192_logq218.validate();
+    var q: u512 = 1;
+    for (sec_n8192_logq218.primes) |p| q *= p;
+    // log2 q == 218 exactly: q ∈ [2^217, 2^218).
+    try testing.expectEqual(@as(usize, 218), 512 - @clz(q));
+    // The ledger's r_t and the batching condition t ≡ 1 mod 2N.
+    try testing.expectEqual(@as(u512, 23199), q % sec_n8192_logq218.t);
+    try testing.expectEqual(@as(u64, 1), sec_n8192_logq218.t % (2 * @as(u64, sec_n8192_logq218.n)));
+    // Δ = ⌊q/t⌋ has 202 bits, so Δ/2 ≈ 2^201 — the ledger's decryption margin.
+    try testing.expectEqual(@as(usize, 202), 512 - @clz(q / sec_n8192_logq218.t));
+}
 
 test "test_tiny validates" {
     try test_tiny.validate();
