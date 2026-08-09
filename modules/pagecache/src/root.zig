@@ -78,6 +78,23 @@ pub const Options = struct {
     max_pages: usize,
 };
 
+/// One borrowed page: `bytes` points **into cache storage**, not into a
+/// caller buffer, so obtaining it copied nothing. Hand it back with
+/// `PageCache.releasePage` (or `Storage.releaseRef`) exactly once.
+///
+/// The lifetime rule is enforced by the cache, not by this doc comment: while
+/// the borrow is live the underlying entry is not an eviction candidate at all
+/// (`ramcache.Cache.pin` takes it out of the structures victim selection reads
+/// from), and a write or invalidation that lands on the same page parks the
+/// old bytes with this borrow instead of freeing them under it. So neither
+/// eviction pressure nor a same-page overwrite can turn `bytes` into a
+/// dangling read — the failure mode that made `ocspcache` F4 a real
+/// use-after-free.
+pub const Page = struct {
+    bytes: []const u8,
+    borrow: ramcache.Cache.Borrow,
+};
+
 /// Cumulative + current cache figures (a superset of `ramcache.Stats`).
 pub const Stats = struct {
     /// Page-aligned reads served from RAM without touching the inner Storage.
@@ -90,6 +107,16 @@ pub const Stats = struct {
     resident_bytes: usize,
     /// Lifetime pages removed by the bounded cache to stay within budget.
     evictions: u64,
+    /// Pages currently lent out by `preadRef` and not yet released. They are
+    /// resident and unevictable for as long as they are borrowed, so the
+    /// budget can legitimately be exceeded by up to this many pages.
+    borrowed_pages: usize,
+    /// Page-aligned reads served as a borrow — **zero** copies, versus one
+    /// `@memcpy` of a whole page for a `pread` hit.
+    ref_hits: u64,
+    /// `preadRef` misses filled straight into cache storage: one copy (the
+    /// inner `pread`) instead of the two a `pread` miss pays.
+    ref_misses: u64,
 };
 
 /// A bounded, write-through page cache in front of one inner `Storage`.
@@ -101,6 +128,8 @@ pub const PageCache = struct {
     page_size: usize,
     hits: u64 = 0,
     misses: u64 = 0,
+    ref_hits: u64 = 0,
+    ref_misses: u64 = 0,
     gpa: std.mem.Allocator,
     /// Per-handle set of page indices this `PageCache` has ever put into
     /// `cache` since that handle was last opened. Lets `vClose` forget only
@@ -155,7 +184,65 @@ pub const PageCache = struct {
             .resident_pages = self.cache.stats.entries,
             .resident_bytes = self.cache.stats.bytes,
             .evictions = self.cache.stats.evictions,
+            .borrowed_pages = self.cache.stats.pinned,
+            .ref_hits = self.ref_hits,
+            .ref_misses = self.ref_misses,
         };
+    }
+
+    // ── borrow path (zero-copy reads) ───────────────────────────────────────
+
+    /// Read exactly one whole page **without copying it**: the returned
+    /// `Page.bytes` points into cache storage. A hit copies nothing at all; a
+    /// miss copies once (the inner `pread` lands directly in the cache slot
+    /// that will hold the page) instead of the two copies `pread` pays — once
+    /// into the caller's buffer, once again when `cache.put` dupes it.
+    ///
+    /// Returns `null` when this access cannot be lent, and the caller must
+    /// then use `pread`:
+    ///   * `off`/`len` is not exactly one aligned page (never cached at all),
+    ///   * the page is not fully present on media (a short read at EOF) —
+    ///     a partial page is not a cacheable unit, same rule as `vPread`,
+    ///   * the cache could not allocate the entry.
+    /// There is deliberately no internal fall-back to a copying read: the
+    /// point of this path is that a caller can tell whether it engaged.
+    ///
+    /// Release with `releasePage` exactly once. Holding a page across other
+    /// operations on this cache is *safe* (that is what the pin is for) — a
+    /// borrowed page is never evicted, and a write to the same page parks the
+    /// borrowed bytes rather than overwriting them, so the borrow keeps the
+    /// snapshot it was given while later readers see the new bytes.
+    pub fn preadRef(self: *PageCache, h: Storage.Handle, len: usize, off: u64) Storage.Error!?Page {
+        if (!self.isFullPage(off, len)) return null;
+        const page_index = off / self.page_size;
+        const key = pageKey(h, page_index);
+
+        if (self.cache.pin(&key, 0, 0)) |borrow| {
+            self.ref_hits += 1;
+            return .{ .bytes = borrow.bytes, .borrow = borrow };
+        }
+        // Miss: hand the inner Storage the cache's own slot to read into, so
+        // the page is materialised exactly once.
+        const fill = self.cache.reserve(&key, self.page_size, 0, 0, 0) orelse return null;
+        const n = self.inner.pread(h, fill.bytes, off) catch |err| {
+            self.cache.discard(fill);
+            return err;
+        };
+        if (n != self.page_size) {
+            // Never cache a partially-present page (same gate as `vPread`).
+            self.cache.discard(fill);
+            return null;
+        }
+        self.ref_misses += 1;
+        self.trackPage(h, page_index);
+        const borrow = self.cache.commit(fill);
+        return .{ .bytes = borrow.bytes, .borrow = borrow };
+    }
+
+    /// End a borrow taken with `preadRef`. The page becomes an ordinary
+    /// eviction candidate again.
+    pub fn releasePage(self: *PageCache, p: Page) void {
+        self.cache.release(p.borrow);
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -202,6 +289,13 @@ pub const PageCache = struct {
         .delete = vDelete,
         .syncDir = vSyncDir,
         .tryLockExclusive = vTryLockExclusive,
+        // This is the one backend in the seam that *can* lend: it is the only
+        // one that holds page bytes in its own memory. `FsStorage` and
+        // `SimStorage` leave these null and `Storage.canLend()` answers false
+        // for them, so a caller reading through a raw backend keeps the
+        // copying path and knows it.
+        .preadRef = vPreadRef,
+        .releaseRef = vReleaseRef,
     };
 
     fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
@@ -318,6 +412,23 @@ pub const PageCache = struct {
     fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
         return cast(ctx).inner.tryLockExclusive(h);
     }
+
+    fn vPreadRef(ctx: *anyopaque, h: Storage.Handle, len: usize, off: u64) Storage.Error!?Storage.Ref {
+        const self = cast(ctx);
+        const page = (try self.preadRef(h, len, off)) orelse return null;
+        // The borrow's index node is a stable heap allocation for exactly this
+        // reason: it survives the cache's hash map rehashing, so it is a legal
+        // opaque token to hand across the seam and back.
+        return .{ .bytes = page.bytes, .token = @ptrCast(page.borrow.node) };
+    }
+
+    fn vReleaseRef(ctx: *anyopaque, ref: Storage.Ref) void {
+        const self = cast(ctx);
+        self.releasePage(.{
+            .bytes = ref.bytes,
+            .borrow = .{ .bytes = ref.bytes, .node = @ptrCast(@alignCast(ref.token)) },
+        });
+    }
 };
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -334,6 +445,8 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+    // CONVENTIONS §6.3: a bare import does not pull the file's tests in.
+    _ = @import("bench.zig");
 }
 
 /// A tiny deterministic PRNG so the workload is reproducible.
@@ -772,6 +885,250 @@ test "F4: vTryLockExclusive forwards to the inner Storage verbatim (dead in kvtr
     st.close(a); // releases; there is no unlock op
     try testing.expect(try st.tryLockExclusive(b));
     st.close(b);
+}
+
+/// Write `n` distinct full pages (page `i` filled with byte `i+1`) through
+/// `st`, then leave the cache empty so a following read is a genuine miss.
+fn seedPages(gpa: std.mem.Allocator, pc: *PageCache, st: Storage, n: usize) !Storage.Handle {
+    const h = try st.open("pages", .create_truncate);
+    const page = try gpa.alloc(u8, pc.page_size);
+    defer gpa.free(page);
+    for (0..n) |i| {
+        @memset(page, @as(u8, @truncate(i + 1)));
+        try st.writeAll(h, page, i * pc.page_size);
+    }
+    pc.cache.clear(); // start every borrow test from a cold cache
+    return h;
+}
+
+test "F3: a borrowed page is unevictable — it survives pressure that discards every other page, and is evictable again once released" {
+    // The borrow path's whole safety claim. Without the pin, `preadRef` would
+    // be `get`'s slice with `get`'s rule ("valid until this key is replaced,
+    // evicted, or the cache is cleared") — and 23 fills into a 4-page budget
+    // is exactly that. Two things must hold while the borrow is live: the
+    // bytes are still page 0's bytes, and page 0 is still RESIDENT (so the
+    // borrow is the real entry, not a copy that got orphaned). And one thing
+    // must hold after: releasing puts it back in the eviction index, or the
+    // budget would leak a slot per borrow forever.
+    //
+    // **Why `max_pages = 1`.** The first version of this test used a 4-page
+    // budget and 23 competing reads, and it passed *with the pin mechanism
+    // disabled* — W-TinyLFU is scan-resistant on purpose, so a page touched
+    // twice beats a stream of one-hit-wonder pages and simply was never
+    // chosen as a victim. The harness could not reach the thing it was
+    // testing. At a budget of 1 the eviction decision is forced and has no
+    // frequency contest in it: an unpinned page 0 is the window's LRU and is
+    // dropped by the very next fill, a pinned one is not in the window heap
+    // at all so the incoming page is dropped instead.
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+
+    const budget = 1;
+    const n_pages = 8;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = budget });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try seedPages(gpa, &pc, st, n_pages);
+
+    // Borrow page 0 — zero copies: `bytes` IS the cache's storage.
+    const borrowed = (try pc.preadRef(h, default_page_size, 0)).?;
+    try testing.expectEqual(@as(u64, 1), pc.stats().ref_misses);
+
+    // Stream every other page through the one-page cache.
+    const evictions_before = pc.stats().evictions;
+    var buf: [default_page_size]u8 = undefined;
+    for (1..n_pages) |i| _ = try st.pread(h, &buf, i * default_page_size);
+    try testing.expect(pc.stats().evictions - evictions_before >= n_pages - 1 - budget);
+    // Every one of those fills competed for the single slot page 0 holds.
+    try testing.expectEqual(@as(usize, 1), pc.stats().resident_pages);
+
+    // 1) The borrowed bytes are still page 0's bytes. Freed storage would be
+    //    a use-after-free; a recycled slot would show some other page.
+    for (borrowed.bytes) |b| try testing.expectEqual(@as(u8, 1), b);
+
+    // 2) Page 0 is still resident — re-reading it costs no inner read. This
+    //    is the assertion that fails if the borrow is not pinned: at a budget
+    //    of 1, seven competing fills evict it and this read becomes a miss.
+    const misses_before = pc.misses;
+    _ = try st.pread(h, &buf, 0);
+    try testing.expectEqual(misses_before, pc.misses);
+    try testing.expectEqualSlices(u8, borrowed.bytes, &buf);
+    try testing.expectEqual(@as(usize, 1), pc.stats().borrowed_pages);
+
+    pc.releasePage(borrowed);
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+
+    // 3) Released means evictable again: the same pressure now does drop it.
+    for (1..n_pages) |i| _ = try st.pread(h, &buf, i * default_page_size);
+    const misses_after = pc.misses;
+    _ = try st.pread(h, &buf, 0);
+    try testing.expectEqual(misses_after + 1, pc.misses); // a real miss
+    for (buf) |b| try testing.expectEqual(@as(u8, 1), b); // and still correct
+}
+
+test "F3: a write to a borrowed page neither corrupts the borrow nor leaves the cache stale" {
+    // The `ocspcache` F4 shape: a borrow invalidated by the next refresh. A
+    // write-through cache MUST make the new bytes visible to the next reader,
+    // and MUST NOT free or overwrite bytes a borrower is still reading. Doing
+    // one at the cost of the other is the bug; the cache does both by parking
+    // the old page with its borrower and inserting the new one fresh.
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try seedPages(gpa, &pc, st, 4);
+
+    const borrowed = (try pc.preadRef(h, default_page_size, 0)).?;
+    for (borrowed.bytes) |b| try testing.expectEqual(@as(u8, 1), b);
+
+    // Overwrite page 0 through the cache while the borrow is live.
+    const fresh = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(fresh);
+    @memset(fresh, 0xBB);
+    try st.writeAll(h, fresh, 0);
+
+    // The borrow still reads its own snapshot, not the new bytes and not
+    // freed memory.
+    for (borrowed.bytes) |b| try testing.expectEqual(@as(u8, 1), b);
+
+    // And the cache is NOT stale: the next reader sees the write.
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    try testing.expectEqualSlices(u8, fresh, &buf);
+
+    // Same for a fresh borrow of the same page.
+    const reborrowed = (try pc.preadRef(h, default_page_size, 0)).?;
+    try testing.expectEqualSlices(u8, fresh, reborrowed.bytes);
+    try testing.expect(reborrowed.bytes.ptr != borrowed.bytes.ptr); // two live snapshots
+
+    pc.releasePage(reborrowed);
+    pc.releasePage(borrowed); // frees the parked page; a leak here fails the test
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+}
+
+test "F3: invalidation guards still empty the cache with a borrow outstanding (nothing findable, nothing freed under the borrower)" {
+    // `clear()` is the other way a borrowed entry can die. The six guards'
+    // contract (F2) is "resident_pages drops to 0" — that must stay literally
+    // true even when one of those pages is lent out.
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try seedPages(gpa, &pc, st, 2);
+
+    const borrowed = (try pc.preadRef(h, default_page_size, 0)).?;
+    try testing.expectEqual(@as(usize, 1), pc.stats().resident_pages);
+
+    try st.truncate(h, 0); // one of the six clear() guards
+    try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+    // Still a valid, unchanged snapshot for the borrower.
+    for (borrowed.bytes) |b| try testing.expectEqual(@as(u8, 1), b);
+    // And no stale hit: the file is empty now.
+    var buf: [default_page_size]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try st.pread(h, &buf, 0));
+
+    pc.releasePage(borrowed);
+}
+
+test "F3: only a backend that really holds the bytes advertises lending; the rest say so instead of silently copying" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+
+    // The raw backend cannot lend and admits it — no stub that copies behind
+    // the caller's back, so `canLend` is a usable branch condition.
+    try testing.expect(!sim.storage().canLend());
+    const raw_h = try sim.storage().open("x", .create_truncate);
+    try testing.expect(try sim.storage().preadRef(raw_h, default_page_size, 0) == null);
+
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    try testing.expect(st.canLend());
+
+    const h = try seedPages(gpa, &pc, st, 2);
+
+    // Non-page-shaped accesses are not lendable either — same rule as the
+    // copying path's "only aligned whole pages are cached".
+    try testing.expect(try st.preadRef(h, 8, 5) == null);
+    try testing.expect(try st.preadRef(h, default_page_size, 5) == null);
+    // Nor is a page that is not fully present on media.
+    try testing.expect(try st.preadRef(h, default_page_size, 9 * default_page_size) == null);
+
+    // The whole seam round-trip: borrow through the vtable, release through it.
+    const ref = (try st.preadRef(h, default_page_size, default_page_size)).?;
+    for (ref.bytes) |b| try testing.expectEqual(@as(u8, 2), b);
+    try testing.expectEqual(@as(usize, 1), pc.stats().borrowed_pages);
+    st.releaseRef(ref);
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+
+    // A borrowed read returns exactly what the copying read returns.
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    const p = (try pc.preadRef(h, default_page_size, 0)).?;
+    defer pc.releasePage(p);
+    try testing.expectEqualSlices(u8, &buf, p.bytes);
+    try testing.expect(p.bytes.ptr != @as([*]const u8, &buf)); // not a copy of the caller's buffer
+}
+
+test "F3: kvtree's read descent really takes the borrow seam, and still reads identically to the copying one" {
+    // A seam nothing calls is a seam nothing checks. `kvtree`'s `lookup`
+    // descent is the one tree path that can borrow (read-only, one page live
+    // at a time), so this asserts it *does* — `ref_hits` counts pages handed
+    // to it without a copy — and that the answers are byte-identical to the
+    // same store read through the raw backend.
+    const gpa = testing.allocator;
+
+    var raw_sim = kv.SimStorage.init(gpa);
+    defer raw_sim.deinit();
+    raw_sim.allow_overwrite = true;
+    var raw_db = try kvtree.Db.open(gpa, raw_sim.storage(), "t.kvt", .{});
+    defer raw_db.close();
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 64 });
+    defer pc.deinit();
+    var db = try kvtree.Db.open(gpa, pc.storage(), "t.kvt", .{});
+    defer db.close();
+
+    const scratch = try gpa.alloc(u8, 64);
+    defer gpa.free(scratch);
+    try runWorkload(&raw_db, 0xF00D, 600, 150, 64, scratch);
+    try runWorkload(&db, 0xF00D, 600, 150, 64, scratch);
+
+    const ref_hits_before = pc.stats().ref_hits;
+    var kbuf: [32]u8 = undefined;
+    var id: u64 = 0;
+    while (id < 150) : (id += 1) {
+        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const a = try raw_db.get(gpa, key);
+        defer if (a) |v| gpa.free(v);
+        const b = try db.get(gpa, key);
+        defer if (b) |v| gpa.free(v);
+        if (a) |av| {
+            try testing.expect(b != null);
+            try testing.expectEqualSlices(u8, av, b.?);
+        } else {
+            try testing.expect(b == null);
+        }
+    }
+    // The descent borrowed resident pages instead of copying them, and gave
+    // every one of them back.
+    try testing.expect(pc.stats().ref_hits > ref_hits_before);
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
 }
 
 test "F5: vClose forgets only the closing handle's pages, not every open file's (per-handle invalidation via ramcache.remove)" {

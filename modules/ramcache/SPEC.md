@@ -41,6 +41,48 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   callback set + dirty API unused ⇒ behavior and performance are byte-identical to before this
   existed.
 
+## Borrow seam — `pin` / `reserve` / `release`
+
+`get` returns a slice into cache storage whose validity rule is "until this key
+is replaced, evicted, or the cache is cleared" — a rule a caller can only obey
+by copying immediately. The borrow seam removes the rule instead of restating
+it, for callers whose values are big enough that the copy matters (`pagecache`
+pays a whole 4 KiB page per hit; see its SPEC's F3 note).
+
+- `pin(key, now, gen) ?Borrow` — like `get`, but the entry becomes
+  **unevictable** for the borrow's lifetime.
+- `reserve(key, len, now, ttl, gen) ?Fill` — insert `len` bytes of
+  *uninitialized* storage and lend them **writable**, so a caller that would
+  otherwise fill a scratch buffer and then `put` (two copies) produces the value
+  straight into its final home (one). Finish with `commit` (keep, downgrade to a
+  read borrow) or `discard` (the fill failed; the entry never becomes visible,
+  and `on_evict` is not fired over uninitialized bytes).
+- `release(borrow)` — end it. Nested borrows of one entry are counted; the last
+  release re-files the entry.
+
+Two invariants make this safe without asking the caller to be careful:
+
+1. **A pinned node is out of the index.** `pin` removes it from its region-LRU
+   heap and the expiry heap; victim selection only ever reads heap roots, so a
+   borrowed entry is not reachable from the structures eviction chooses from.
+   This is why "borrowed entries are unevictable" costs nothing per eviction and
+   cannot be forgotten at a call site. `release` pushes it back with the tick of
+   its last access; if that push OOMs the entry is dropped instead (a live entry
+   outside the index would be un-evictable forever). While pins are held the
+   cache may exceed `max_entries`/`max_bytes` — a borrowed entry is resident by
+   definition — and `Stats.pinned` reports how many.
+2. **Anything that would destroy a borrowed entry parks it instead.** `put` over
+   the key, `remove`, `clear`, and lazy TTL/generation expiry all unlink the
+   entry from the map immediately (no stale hit is possible, and `clear()` still
+   leaves nothing findable) while moving the value bytes onto the node, which
+   owns them until the last `release`. Freeing them instead is a use-after-free;
+   *refusing* the write instead is a stale hit. The parking list's capacity is
+   reserved at pin time, one slot per borrowed entry, so parking is infallible —
+   it must never be forced to free memory a caller is reading.
+
+`deinit` frees any still-parked values: tearing the cache down with borrows
+outstanding is a caller bug, but leaking is not an improvement on it.
+
 ## `Sharded` — the internally-synchronized wrapper
 
 `Cache` stays lock-free; `Sharded` is a second type in the same module holding N `Cache` instances,

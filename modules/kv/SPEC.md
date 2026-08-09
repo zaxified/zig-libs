@@ -25,6 +25,23 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   because `compact()`'s `rename(2)` would otherwise strand it on an unlinked inode. Opt out:
   `Options.lock = .none`. See README for what is *not* promised (advisory only; NFS/SMB/9p/FUSE).
 
+## Optional borrow methods on `Storage`
+
+`preadRef` / `releaseRef` are `?*const fn` vtable slots defaulting to `null`.
+`null` means "this backend cannot lend", which is the truthful answer for a
+descriptor-backed backend: the bytes only exist once the kernel has copied them
+somewhere. `FsStorage`, `SimStorage` and the VOPR backend therefore leave them
+alone and `Storage.canLend()` answers `false` for them — the defaults exist
+precisely so no implementer is pushed into writing a stub that quietly copies.
+
+`preadRef` returns `Error!?Ref`; `null` is never an error and never a partial or
+stale success, it is "use `pread`". There is deliberately no internal fall-back
+to a copying read, because a fall-back that looks like a success makes "did the
+fast path engage?" unanswerable at the call site. A non-null `Ref` must go back
+to `releaseRef` exactly once; between the two, the backend guarantees the bytes
+neither move nor change nor are freed. `pagecache` is the implementor today
+(it holds page bytes in its own memory); `kvtree`'s read descent is the caller.
+
 ## Threat model / out of scope
 
 Reliability, not adversarial security:

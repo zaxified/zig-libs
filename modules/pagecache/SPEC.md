@@ -17,8 +17,11 @@ changing kvtree or its durability guarantees.
 
 `PageCache` **wraps one inner `Storage` and itself implements the exact same
 `Storage` vtable** kvtree drives (`open`, `size`, `pread`, `writeAll`, `sync`,
-`truncate`, `close`, `rename`, `delete`, `syncDir`, `tryLockExclusive`). So it
-composes by substitution:
+`truncate`, `close`, `rename`, `delete`, `syncDir`, `tryLockExclusive`), plus
+the seam's two **optional** borrow methods (`preadRef`, `releaseRef`) — which
+`PageCache` is currently the only implementor of, because it is the only
+`Storage` that holds page bytes in its own memory. So it composes by
+substitution:
 
 ```zig
 var fs = kvtree.FsStorage.init(io, dir);
@@ -136,53 +139,88 @@ place); an absent page is always refetched from the authoritative inner store.
 5. **Pass-through** — sub-page / unaligned reads bypass the cache and return
    exact inner bytes without registering as page hits/misses.
 
-## Copy cost vs. a borrowing seam (design note, wave-2 audit F3)
+## Zero-copy reads: the borrow seam (wave-2 audit F3, implemented)
 
-A hit today copies a whole page once (`@memcpy(buf, cached)` into the caller's
-buffer); a miss copies it **twice** (`inner.pread` into `buf`, then
-`ramcache.put` dupes `buf` into cache storage, which itself allocates and
-frees a `page_size` buffer per fill). LMDB's mmap'd pages are the zero-copy
-alternative: the caller gets a pointer straight into the resident page, 0
-copies, 0 allocations.
+The copying `pread` seam costs a whole-page `@memcpy` on a **hit**
+(`@memcpy(buf, cached)` into the caller's buffer) and **two** page copies on a
+**miss** (`inner.pread` into `buf`, then `ramcache.put` duping `buf` into cache
+storage). LMDB, the named C reference, hands the caller a pointer straight into
+the mapped page: 0 copies. That gap is inherent to `Storage.pread(h, buf, off)`,
+which hands the *caller* the destination — so `PageCache` has no way to answer
+"here is my copy" instead. The fix is therefore a seam addition, not a local
+optimisation, and it is now in place:
 
-That is inherent to the current `pread(buf)` shape of the `Storage` seam, not
-a local inefficiency — `Storage.pread(h, buf, off) !usize` hands the *caller*
-an already-allocated destination, so `PageCache` cannot answer with "here is
-my copy" instead. Removing the copy needs a **different seam**, not a local
-optimisation:
+```zig
+// kv.Storage, optional vtable slots (default null = "cannot lend")
+preadRef:   ?*const fn (ctx, h, len: usize, off: u64) Error!?Ref
+releaseRef: ?*const fn (ctx, ref: Ref) void
+pub const Ref = struct { bytes: []const u8, token: *anyopaque };
+```
 
-- Add a borrowing pair to `Storage` — e.g. `preadRef(h, off) !PinnedPage` /
-  `unpin(PinnedPage)` — that a cache-aware backend can implement by handing
-  back a pointer into resident storage (mmap for a real file, the cache slot
-  itself for `PageCache`), falling back to `pread`-into-an-owned-buffer for
-  backends with nothing to borrow from (e.g. plain `FsStorage` without mmap).
-  The pin must have a bounded lifetime the caller signals explicitly
-  (`unpin`), since the byte range it points at is not caller-owned the way a
-  `pread` buffer is.
-  - Any pin held across a `writeAll`/`truncate`/`close` on the same page turns
-    write-through's in-place `ramcache.put` (`vWriteAll`) or the coarse
-    `clear()` guards (F2) into a use-after-free/UAF-into-stale-bytes hazard —
-    the pin holder would need to either block the mutation or be invalidated
-    itself, and "invalidated while pinned" has no answer in the current
-    write-through model.
-  - `kvtree`'s own pager would need a second, borrowing call path alongside
-    its current `pread`-into-scratch one — a page-cache B-tree normally reads
-    a page once per descent and holds it only for the duration of that visit,
-    so the pin lifetime maps naturally to "duration of one page visit", but
-    that is a `kvtree` change, not a `pagecache` one.
-  - Every other `Storage` implementor (`FsStorage`, `SimStorage`, and any
-    future backend) would need to grow the new vtable method (even if only as
-    a `pread`-and-copy fallback), which is the "changes the seam every
-    backend implements" cost the module's own to-do #3 flags as needing a
-    design decision before it is actionable.
+* **Hit — 0 copies.** `PageCache.preadRef` pins the resident entry and returns
+  a slice of cache storage.
+* **Miss — 1 copy.** `ramcache.Cache.reserve` allocates the entry's value
+  uninitialized and lends it *writable*, so the inner `pread` lands directly in
+  the slot that will hold the page. There is no second dupe.
+* **Cannot lend — `null`, explicitly.** `FsStorage`/`SimStorage` leave the two
+  slots at their `null` default: `Storage.canLend()` answers `false` and
+  `preadRef` returns `null`. There is deliberately **no** internal fall-back to
+  a copying read, because a fall-back that looks like a success makes "did the
+  fast path engage?" unanswerable at the call site. `null` is also the answer
+  for an access that is not exactly one aligned page, and for a page that is
+  not fully present on media.
 
-**Verdict of this note:** real, not urgent — no measured consumer is
-bottlenecked on the extra copy today (the O(1)-victim-selection fix, F1/
-`a1d7229`, was the one that mattered at the measured page counts). Scope a
-`preadRef`/`pin`/`unpin` addition to `Storage` as its own cross-module task
-(touches `kv`, `kvtree`, and every backend, not `pagecache` alone) if a real
-caller's profile ever shows the double copy as the bottleneck rather than a
-constant-factor cost against an O(1) fill.
+### How the pin lifetime is enforced
+
+The earlier version of this note flagged the hard part correctly: *"any pin held
+across a `writeAll`/`truncate`/`close` on the same page turns write-through's
+in-place `ramcache.put` or the coarse `clear()` guards into a use-after-free —
+and 'invalidated while pinned' has no answer in the current write-through
+model."* It has one now, and it is structural rather than documentary:
+
+1. **A borrowed entry is not an eviction candidate.** `pin` removes the entry's
+   index node from `ramcache`'s region-LRU and expiry heaps. Victim selection
+   reads heap *roots* and nothing else, so there is no eviction path that has to
+   remember to check a flag — a pinned entry is simply not reachable from the
+   structures eviction chooses from, at zero cost per eviction. `release` files
+   it back. While pins are held the cache may sit over `max_entries`/`max_bytes`
+   (a borrowed page is resident by definition); `Stats.pinned` reports it.
+2. **A write or invalidation over a borrowed page *parks* it.** `put`, `remove`,
+   `clear` and lazy TTL expiry on a pinned entry unlink it from the map — so it
+   can never be served again, and `clear()`'s contract ("resident pages drop to
+   0", which the six invalidation guards of F2 rest on) stays literally true —
+   while the value bytes move to the node, which owns them until the last
+   `release`. The borrower keeps reading the snapshot it was handed; the next
+   reader sees the new bytes. Doing only one of those two is the bug: freeing
+   the bytes is `ocspcache` F4's use-after-free, and refusing the write is a
+   stale hit, which is precisely what a write-through cache exists to prevent.
+   The parking slot's capacity is reserved *at pin time*, so parking can never
+   fail partway and be forced to free memory somebody is still reading.
+
+### Who uses it
+
+`kvtree`'s read descent (`lookup`, behind `Db.get`/`Txn.get`/`Snapshot.get`)
+takes the borrow when the store can lend: it is the one tree path that only
+*reads* its pages and holds exactly one at a time. The copy-on-write write path
+and the `Cursor`'s root-to-leaf frame stack keep their own page copies on
+purpose — they mutate or outlive their pages, and a borrow is read-only.
+
+### Measured (see `src/bench.zig`, `PAGECACHE_BENCH=1`, ReleaseFast, 4 KiB pages)
+
+| access | copies | allocs | ns/access |
+|--------|--------|--------|-----------|
+| hit, `pread` | 1 | 0 | 116–171 |
+| hit, `preadRef` | **0** | 0 | **93–102** |
+| miss, `pread` | 2 | 3 | 1612–1727 |
+| miss, `preadRef` | **1** | 3 | 1585–1951 |
+
+Read the two shapes differently. The **hit** is a real, repeatable win — one
+whole-page `memcpy` removed, ~20–45 % off the access. The **miss** is a wash:
+allocations are the same three either way (key dup, page buffer, index node —
+the copying path's second buffer is the *caller's*, not the cache's), and the
+~40 ns the removed copy saves is about what `pin`+`reserve`+`release` costs in
+extra index work over `get`+`put`. Its claim is one fewer copy, not fewer
+nanoseconds; against a real `read(2)` both are noise.
 
 ## Backlog / non-goals
 

@@ -48,6 +48,26 @@ pub const Pager = struct {
         try self.store.preadFull(self.handle, buf, offsetOf(id));
     }
 
+    /// Borrow page `id` instead of copying it, when the store can lend
+    /// (`Storage.canLend` — today that means a `pagecache` is in front of the
+    /// backend and already holds the page in RAM). `null` means "this store
+    /// cannot lend this page" and the caller must use `readPage`; it is never
+    /// a partial or stale success, so a caller can tell whether the zero-copy
+    /// path engaged rather than guessing.
+    ///
+    /// The returned bytes are **read-only and borrowed**: they stay valid, and
+    /// stay this page's bytes, until `releasePageRef`. They are unsuitable for
+    /// the copy-on-write path, which mutates its page in place — that is why
+    /// only the read-only descent uses this.
+    pub fn readPageRef(self: *Pager, id: PageId) StorageError!?kv.Storage.Ref {
+        return self.store.preadRef(self.handle, page_size, offsetOf(id));
+    }
+
+    /// Hand back a borrow from `readPageRef`.
+    pub fn releasePageRef(self: *Pager, ref: kv.Storage.Ref) void {
+        self.store.releaseRef(ref);
+    }
+
     /// Write page `id` (no fsync — durability is `sync`'s job, ordered by
     /// `core.commit`). Writing at/after end-of-file extends it.
     pub fn writePage(self: *Pager, id: PageId, buf: *const [page_size]u8) StorageError!void {

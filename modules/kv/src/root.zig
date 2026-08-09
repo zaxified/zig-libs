@@ -141,6 +141,24 @@ pub const Storage = struct {
 
     pub const OpenMode = enum { open_or_create, create_truncate };
 
+    /// A **borrowed** run of bytes owned by the backend — the zero-copy read
+    /// path (`preadRef`). `bytes` stays valid, and stays the bytes that were
+    /// read, until it is handed back to `releaseRef`; the backend guarantees
+    /// nothing it does in the meantime (cache eviction, an overwrite of the
+    /// same region, a `clear`) can move or free it. `token` is the backend's
+    /// own bookkeeping — opaque here, and the reason release is by value
+    /// rather than by offset: two borrows of the same page are distinct.
+    ///
+    /// Only backends that genuinely hold the bytes in memory can lend; see
+    /// `canLend`. There is deliberately no automatic fall-back to a copying
+    /// read inside `preadRef`, because a fall-back that looks like a success
+    /// makes "did the fast path actually engage?" unanswerable at the call
+    /// site — exactly the question a caller adopts this API to control.
+    pub const Ref = struct {
+        bytes: []const u8,
+        token: *anyopaque,
+    };
+
     pub const Error = error{
         /// SimStorage only: the simulated machine died at this operation.
         Crashed,
@@ -180,6 +198,16 @@ pub const Storage = struct {
         delete: *const fn (ctx: *anyopaque, path: []const u8) Error!void,
         syncDir: *const fn (ctx: *anyopaque) Error!void,
         tryLockExclusive: *const fn (ctx: *anyopaque, h: Handle) Error!bool,
+
+        /// Optional zero-copy read. `null` (the default) means this backend
+        /// cannot lend — a file-descriptor backend has nothing to lend, since
+        /// the bytes only exist once the kernel has copied them somewhere.
+        /// Defaulted so every existing implementer keeps compiling and keeps
+        /// answering "no" truthfully, rather than being forced to write a
+        /// stub that quietly copies.
+        preadRef: ?*const fn (ctx: *anyopaque, h: Handle, len: usize, off: u64) Error!?Ref = null,
+        /// Hand a `Ref` back. Must be non-null whenever `preadRef` is.
+        releaseRef: ?*const fn (ctx: *anyopaque, ref: Ref) void = null,
     };
 
     pub fn open(s: Storage, path: []const u8, mode: OpenMode) Error!Handle {
@@ -201,6 +229,33 @@ pub const Storage = struct {
             index += n;
         }
     }
+    /// Can this backend serve reads without copying (`preadRef`)? Ask once
+    /// and branch; a caller that never asks simply keeps using `pread` and
+    /// pays a copy, which is always correct.
+    pub fn canLend(s: Storage) bool {
+        return s.vtable.preadRef != null;
+    }
+
+    /// Borrow exactly `len` bytes at `off` instead of copying them into a
+    /// buffer. Returns `null` — never an error — when this backend cannot
+    /// lend at all, or cannot lend *this* access (wrong shape, the bytes are
+    /// not resident, a short read at end-of-file). `null` is the caller's
+    /// signal to use `pread`; it is never a stale or partial success.
+    ///
+    /// Every non-null result must be passed to `releaseRef` exactly once.
+    pub fn preadRef(s: Storage, h: Handle, len: usize, off: u64) Error!?Ref {
+        const f = s.vtable.preadRef orelse return null;
+        return f(s.ctx, h, len, off);
+    }
+
+    /// Return a borrow taken with `preadRef`.
+    pub fn releaseRef(s: Storage, ref: Ref) void {
+        // Unreachable unless a backend set `preadRef` without `releaseRef`,
+        // which its own construction forbids.
+        const f = s.vtable.releaseRef.?;
+        f(s.ctx, ref);
+    }
+
     pub fn writeAll(s: Storage, h: Handle, bytes: []const u8, off: u64) Error!void {
         return s.vtable.writeAll(s.ctx, h, bytes, off);
     }

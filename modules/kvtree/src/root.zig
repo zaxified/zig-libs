@@ -381,11 +381,23 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
     var page: [page_size]u8 = undefined;
     var id = root;
     while (true) {
-        try pager.readPage(id, &page);
-        switch (format.kindOf(&page)) {
-            .branch => id = format.Branch.init(&page).childFor(key),
+        // The descent only ever *reads* its pages, and holds exactly one at a
+        // time, so it is the one tree path that can take the store's borrow
+        // seam when there is one (a `pagecache` in front of the backend): a
+        // resident page then costs no copy per level instead of a whole-page
+        // `@memcpy` per level. Everything else here — the copy-on-write write
+        // path and the cursor's root-to-leaf frame stack — mutates or outlives
+        // its pages and correctly keeps its own copies.
+        const ref = try pager.readPageRef(id);
+        defer if (ref) |r| pager.releasePageRef(r);
+        const bytes: *const [page_size]u8 = if (ref) |r| r.bytes[0..page_size] else blk: {
+            try pager.readPage(id, &page);
+            break :blk &page;
+        };
+        switch (format.kindOf(bytes)) {
+            .branch => id = format.Branch.init(bytes).childFor(key),
             .leaf => {
-                const leaf = format.Leaf.init(&page);
+                const leaf = format.Leaf.init(bytes);
                 const s = leaf.search(key);
                 if (!s.found) return null;
                 return try gpa.dupe(u8, leaf.valAt(s.index));
