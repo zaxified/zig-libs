@@ -368,4 +368,5 @@ test {
     _ = @import("compare.zig");
     _ = @import("store.zig");
     _ = @import("goldens.zig");
+    _ = @import("bench.zig");
 }

@@ -224,13 +224,10 @@ const Entry = struct {
     /// Owned raw PDU bytes (the LSP as `[0..pdu_length]`); empty for a request
     /// placeholder.
     bytes: []u8,
-    /// Per-interface Send-Routing-Message flag: this LSP must be flooded out the
-    /// set circuits.
-    srm: InterfaceSet,
-    /// Per-interface Send-Sequence-Numbers flag: a PSNP entry for this LSP must
-    /// be sent out the set circuits.
-    ssn: InterfaceSet,
-
+    /// SRM ("must be flooded out these circuits") and SSN ("a PSNP entry must
+    /// be sent out these circuits") are **not** stored here. They live
+    /// exclusively in `Lsdb.srm_queue`/`ssn_queue` — see the note there for
+    /// why keeping a second, per-entry copy of the same fact was the bug.
     fn remainingLifetime(e: *const Entry, now: Time) u16 {
         if (e.purge_deadline != null or e.is_request) return 0;
         const elapsed: Time = if (now > e.set_now) now - e.set_now else 0;
@@ -249,6 +246,14 @@ const Entry = struct {
 
 const EntryMap = std.AutoHashMapUnmanaged(LspId, Entry);
 
+/// A per-interface flooding-flag queue: the *set* of LSP-IDs currently
+/// flagged (SRM or SSN) on one circuit, in the order they were flagged. Dense
+/// (`.keys()` is a contiguous slice), O(1) amortized insert/remove/contains
+/// (`std.AutoArrayHashMapUnmanaged`) — this is what makes `srmIterator` /
+/// `ssnIterator` / `interfacesWithSrm` O(#queued) / O(interface_count)
+/// instead of a full-database scan. See `Lsdb.srm_queue`/`ssn_queue`.
+const FlagQueue = std.AutoArrayHashMapUnmanaged(LspId, void);
+
 /// The link-state database. Single-owner: one caller/loop drives it; it holds no
 /// shared state and takes a lock nowhere.
 pub const Lsdb = struct {
@@ -263,6 +268,34 @@ pub const Lsdb = struct {
     /// steady-state tick allocates nothing once it has warmed up to the
     /// high-water mark of entries removed in one tick.
     tick_victims: std.ArrayList(LspId) = .empty,
+    /// The SRM/SSN flooding-flag queues, one per circuit — the **sole**
+    /// record of which LSP-IDs are flagged on which interface (audit F7). The
+    /// previous shape stored an `InterfaceSet` bitset *per Entry* and
+    /// answered `srmIterator`/`ssnIterator`/`interfacesWithSrm` by scanning
+    /// every entry in the database checking that bitset, i.e. O(n) — or
+    /// O(n·I) for one flooding pass over `I` circuits — even when nothing at
+    /// all was queued. Reference implementations (FRR's `isis_circuit`
+    /// `lsp_queue`) keep a per-circuit send queue instead; this is that queue.
+    ///
+    /// There is deliberately **no** per-Entry bitset alongside this. Two
+    /// representations of the same fact (a bit AND a queue entry) can only be
+    /// kept in agreement by remembering to update both at every one of the
+    /// dozen SRM/SSN mutation sites in this file — exactly the class of bug
+    /// this finding was filed to prevent, not fix once and re-risk. With the
+    /// queue as the only representation there is nothing for it to disagree
+    /// with: `srmSet`/`ssnSet` (single-entry, all-interfaces) and
+    /// `interfacesWithSrm` (all-entries, single-fact) are both *derived* from
+    /// these queues on demand, not read from a second copy. See the
+    /// `"a removed entry's SRM/SSN queue membership does not survive it"`
+    /// test for the failure mode this closes: an entry removed from `map`
+    /// without also being removed from every queue it was flagged in would
+    /// leak a phantom "something queued" signal on `interfacesWithSrm`
+    /// forever (the entry itself was never observable this way, since
+    /// `FlagIterator` cross-checks against `map` — but the *union* query
+    /// was not, before that test).
+    srm_queue: [max_interfaces]FlagQueue = [_]FlagQueue{.empty} ** max_interfaces,
+    /// SSN counterpart of `srm_queue`. See there.
+    ssn_queue: [max_interfaces]FlagQueue = [_]FlagQueue{.empty} ** max_interfaces,
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Lsdb {
         std.debug.assert(cfg.interface_count <= max_interfaces);
@@ -276,6 +309,8 @@ pub const Lsdb = struct {
         }
         self.map.deinit(self.alloc);
         self.tick_victims.deinit(self.alloc);
+        for (&self.srm_queue) |*q| q.deinit(self.alloc);
+        for (&self.ssn_queue) |*q| q.deinit(self.alloc);
     }
 
     /// Number of stored LSP-IDs (includes request placeholders).
@@ -405,7 +440,7 @@ pub const Lsdb = struct {
                 if (ord != .newer) {
                     // Stale or identical: the ordinary matrix is right (and does
                     // not touch the stored copy).
-                    if (ord == .same) self.applySame(e, arrival_iface) else self.applyOlder(e, arrival_iface);
+                    if (ord == .same) self.applySame(id, arrival_iface) else self.applyOlder(id, arrival_iface);
                     return .{ .ordering = ord, .stored = false, .lsp_id = id };
                 }
                 e.refresh_pending = true;
@@ -414,8 +449,9 @@ pub const Lsdb = struct {
                 // bytes to flood (see `reconcileOne`, which never creates one
                 // for a self LSP-ID).
                 if (!e.is_request) {
-                    self.setSrmAll(e);
-                    e.ssn = InterfaceSet.initEmpty();
+                    self.setSrmAll(id);
+                    var i: u8 = 0;
+                    while (i < self.cfg.interface_count) : (i += 1) _ = self.ssn_queue[i].swapRemove(id);
                 }
                 return .{ .ordering = ord, .stored = false, .lsp_id = id, .self_challenge = lsp.sequence_number };
             }
@@ -430,10 +466,10 @@ pub const Lsdb = struct {
             switch (ord) {
                 .newer => {
                     try self.fillEntry(e, lsp, bytes, now);
-                    self.applyNewer(e, arrival_iface);
+                    self.applyNewer(id, arrival_iface);
                 },
-                .same => self.applySame(e, arrival_iface),
-                .older => self.applyOlder(e, arrival_iface),
+                .same => self.applySame(id, arrival_iface),
+                .older => self.applyOlder(id, arrival_iface),
             }
             return .{ .ordering = ord, .stored = ord == .newer, .lsp_id = id };
         }
@@ -446,7 +482,7 @@ pub const Lsdb = struct {
         if (self.map.count() >= self.cfg.capacity) return error.DatabaseFull;
         const gop = try self.map.getOrPut(self.alloc, id);
         gop.value_ptr.* = try self.newEntry(lsp, bytes, now);
-        self.applyNewer(gop.value_ptr, arrival_iface);
+        self.applyNewer(id, arrival_iface);
         return .{ .ordering = .newer, .stored = true, .lsp_id = id };
     }
 
@@ -502,8 +538,6 @@ pub const Lsdb = struct {
             .challenge_seq = 0,
             .snp_seen = false,
             .bytes = owned,
-            .srm = InterfaceSet.initEmpty(),
-            .ssn = InterfaceSet.initEmpty(),
         };
     }
 
@@ -528,32 +562,57 @@ pub const Lsdb = struct {
         e.challenge_seq = 0;
     }
 
-    fn setSsnIfP2p(self: *Lsdb, e: *Entry, iface: u8) void {
-        if (!self.cfg.broadcast_interfaces.isSet(iface)) e.ssn.set(iface);
+    /// Add `id` to interface `iface`'s SRM queue (idempotent). Best-effort
+    /// under allocator failure: on OOM the id is simply not queued this time
+    /// (matches the drop-under-OOM convention already used for
+    /// `tick_victims`/`requestMissing` elsewhere in this file) — a later
+    /// comparison event re-attempts it, so nothing is silently lost forever,
+    /// only deferred.
+    fn queueSrm(self: *Lsdb, id: LspId, iface: u8) void {
+        self.srm_queue[iface].put(self.alloc, id, {}) catch {};
     }
 
-    fn applyNewer(self: *Lsdb, e: *Entry, arrival_iface: ?u8) void {
-        e.srm = InterfaceSet.initEmpty();
-        e.ssn = InterfaceSet.initEmpty();
+    /// Add `id` to interface `iface`'s SSN queue. See `queueSrm`.
+    fn queueSsn(self: *Lsdb, id: LspId, iface: u8) void {
+        self.ssn_queue[iface].put(self.alloc, id, {}) catch {};
+    }
+
+    fn setSsnIfP2p(self: *Lsdb, id: LspId, iface: u8) void {
+        if (!self.cfg.broadcast_interfaces.isSet(iface)) self.queueSsn(id, iface);
+    }
+
+    /// Remove `id` from every interface's SRM and SSN queue — the queue
+    /// counterpart of resetting an `InterfaceSet` bitset to empty. Bounded by
+    /// `interface_count` (<= `max_interfaces` = 32), not by database size.
+    fn dequeueAll(self: *Lsdb, id: LspId) void {
+        var i: u8 = 0;
+        while (i < self.cfg.interface_count) : (i += 1) {
+            _ = self.srm_queue[i].swapRemove(id);
+            _ = self.ssn_queue[i].swapRemove(id);
+        }
+    }
+
+    fn applyNewer(self: *Lsdb, id: LspId, arrival_iface: ?u8) void {
+        self.dequeueAll(id);
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
             if (arrival_iface) |a| if (i == a) continue;
-            e.srm.set(i);
+            self.queueSrm(id, i);
         }
-        if (arrival_iface) |a| self.setSsnIfP2p(e, a);
+        if (arrival_iface) |a| self.setSsnIfP2p(id, a);
     }
 
-    fn applySame(self: *Lsdb, e: *Entry, arrival_iface: ?u8) void {
+    fn applySame(self: *Lsdb, id: LspId, arrival_iface: ?u8) void {
         if (arrival_iface) |a| {
-            e.srm.unset(a);
-            self.setSsnIfP2p(e, a);
+            _ = self.srm_queue[a].swapRemove(id);
+            self.setSsnIfP2p(id, a);
         }
     }
 
-    fn applyOlder(_: *Lsdb, e: *Entry, arrival_iface: ?u8) void {
+    fn applyOlder(self: *Lsdb, id: LspId, arrival_iface: ?u8) void {
         if (arrival_iface) |a| {
-            e.srm.set(a);
-            e.ssn.unset(a);
+            self.queueSrm(id, a);
+            _ = self.ssn_queue[a].swapRemove(id);
         }
     }
 
@@ -585,7 +644,7 @@ pub const Lsdb = struct {
             if (rem == 0) {
                 e.purge_deadline = now + self.cfg.zero_age_lifetime;
                 self.retainHeaderOnly(e);
-                self.setSrmAll(e);
+                self.setSrmAll(kv.key_ptr.*);
                 rep.entered_purge += 1;
             }
         }
@@ -632,6 +691,11 @@ pub const Lsdb = struct {
                 was_request = e.is_request;
             }
             _ = self.map.remove(key);
+            // The entry is gone; its SRM/SSN queue membership must not
+            // outlive it (F7 — see `Lsdb.srm_queue`'s doc comment on why a
+            // phantom queue entry for a removed LSP is exactly the drift a
+            // second state representation would risk).
+            self.dequeueAll(key);
             if (was_request) {
                 self.request_count -= 1;
                 rep.requests_expired += 1;
@@ -643,9 +707,9 @@ pub const Lsdb = struct {
         return rep;
     }
 
-    fn setSrmAll(self: *Lsdb, e: *Entry) void {
+    fn setSrmAll(self: *Lsdb, id: LspId) void {
         var i: u8 = 0;
-        while (i < self.cfg.interface_count) : (i += 1) e.srm.set(i);
+        while (i < self.cfg.interface_count) : (i += 1) self.queueSrm(id, i);
     }
 
     /// ISO/IEC 10589 §7.3.16.4 b) for the **aging** path: an entry whose
@@ -677,66 +741,102 @@ pub const Lsdb = struct {
     }
 
     // ── flooding-flag queries (the flooding layer's read/clear surface) ─────
+    //
+    // audit F7: every query here used to be a full `self.map.iterator()` scan
+    // (O(n), or O(n·I) for one flooding pass over `I` circuits) even when
+    // nothing at all was queued, because the only record of "is SRM/SSN set"
+    // was a bitset buried inside each of the n entries. They now read
+    // `srm_queue`/`ssn_queue` directly: `interfacesWithSrm` is
+    // O(interface_count), and `srmIterator`/`ssnIterator` are O(#queued) on
+    // that one circuit — matching the reference implementation's per-circuit
+    // send queue (see `srm_queue`'s doc comment).
 
-    /// The union of SRM flags across all LSPs — the set of interfaces that have
-    /// something queued to flood.
+    /// The set of interfaces that have something queued to flood (SRM
+    /// non-empty on that circuit).
     pub fn interfacesWithSrm(self: *const Lsdb) InterfaceSet {
         var acc = InterfaceSet.initEmpty();
-        var it = self.map.iterator();
-        while (it.next()) |kv| acc.setUnion(kv.value_ptr.srm);
+        var i: u8 = 0;
+        while (i < self.cfg.interface_count) : (i += 1) {
+            if (self.srm_queue[i].count() != 0) acc.set(i);
+        }
         return acc;
     }
 
     /// The SRM flag set for one LSP, or `null` if it is not stored.
     pub fn srmSet(self: *const Lsdb, id: LspId) ?InterfaceSet {
-        const e = self.map.getPtr(id) orelse return null;
-        return e.srm;
+        if (!self.map.contains(id)) return null;
+        var acc = InterfaceSet.initEmpty();
+        var i: u8 = 0;
+        while (i < self.cfg.interface_count) : (i += 1) {
+            if (self.srm_queue[i].contains(id)) acc.set(i);
+        }
+        return acc;
     }
 
     /// The SSN flag set for one LSP, or `null` if it is not stored.
     pub fn ssnSet(self: *const Lsdb, id: LspId) ?InterfaceSet {
-        const e = self.map.getPtr(id) orelse return null;
-        return e.ssn;
+        if (!self.map.contains(id)) return null;
+        var acc = InterfaceSet.initEmpty();
+        var i: u8 = 0;
+        while (i < self.cfg.interface_count) : (i += 1) {
+            if (self.ssn_queue[i].contains(id)) acc.set(i);
+        }
+        return acc;
     }
 
     /// Clear the SRM flag for `id` on `iface` — the flooding layer calls this
     /// after transmitting the LSP out that circuit.
     pub fn clearSrm(self: *Lsdb, id: LspId, iface: u8) void {
-        if (self.map.getPtr(id)) |e| e.srm.unset(iface);
+        _ = self.srm_queue[iface].swapRemove(id);
     }
 
     /// Clear the SSN flag for `id` on `iface` — called after the PSNP ack for it
     /// has been sent out that circuit.
     pub fn clearSsn(self: *Lsdb, id: LspId, iface: u8) void {
-        if (self.map.getPtr(id)) |e| e.ssn.unset(iface);
+        _ = self.ssn_queue[iface].swapRemove(id);
     }
 
     /// Iterate the LSPs with SRM set on `iface` — the flooding loop for one
     /// circuit. Read `bytes` to transmit, then `clearSrm`. Do not mutate the
-    /// store while iterating.
+    /// store (in particular, do not `clearSrm`/`clearSsn` on this same
+    /// interface) while iterating — same contract as before, now because it
+    /// walks `srm_queue[iface]`'s dense array directly rather than the whole
+    /// map.
+    ///
+    /// **Iteration order changed by this fix.** It used to be
+    /// `self.map.iterator()`'s bucket order (a function of the whole
+    /// database's insertion/rehash history) filtered down to the flagged
+    /// subset; it is now `srm_queue[iface]`'s own insertion order — the order
+    /// in which SRM was most recently *set* on this circuit for each id
+    /// (FIFO, matching the reference per-circuit send queue). Both are
+    /// deterministic for a given operation sequence (which is what
+    /// `isis-flood`'s determinism test actually pins), but the specific
+    /// sequence differs from before this commit.
     pub fn srmIterator(self: *const Lsdb, iface: u8) FlagIterator {
-        return .{ .it = self.map.iterator(), .iface = iface, .want_srm = true, .now = 0 };
+        return .{ .ids = self.srm_queue[iface].keys(), .idx = 0, .map = &self.map };
     }
 
     /// Iterate the LSPs with SSN set on `iface` — to build a PSNP for one
-    /// circuit.
+    /// circuit. Same order note as `srmIterator`.
     pub fn ssnIterator(self: *const Lsdb, iface: u8) FlagIterator {
-        return .{ .it = self.map.iterator(), .iface = iface, .want_srm = false, .now = 0 };
+        return .{ .ids = self.ssn_queue[iface].keys(), .idx = 0, .map = &self.map };
     }
 
     pub const FlagIterator = struct {
-        it: EntryMap.Iterator,
-        iface: u8,
-        want_srm: bool,
-        now: Time,
+        ids: []const LspId,
+        idx: usize,
+        map: *const EntryMap,
 
         /// Yields the LSP-ID and owned PDU bytes of the next flagged LSP.
+        /// Defensively re-resolves each id against `map` rather than trusting
+        /// the queue's bytes are still there — belt-and-braces should the
+        /// queue and the map ever disagree despite `dequeueAll` (see
+        /// `Lsdb.srm_queue`).
         pub fn next(fi: *FlagIterator) ?struct { lsp_id: LspId, bytes: []const u8 } {
-            while (fi.it.next()) |kv| {
-                const set = if (fi.want_srm) kv.value_ptr.srm else kv.value_ptr.ssn;
-                if (set.isSet(fi.iface)) {
-                    return .{ .lsp_id = kv.key_ptr.*, .bytes = kv.value_ptr.bytes };
-                }
+            while (fi.idx < fi.ids.len) {
+                const id = fi.ids[fi.idx];
+                fi.idx += 1;
+                if (fi.map.getPtr(id)) |e| return .{ .lsp_id = id, .bytes = e.bytes };
             }
             return null;
         }
@@ -887,7 +987,7 @@ pub const Lsdb = struct {
                 const e = kv.value_ptr;
                 if (e.is_request) continue;
                 if (!inRange(kv.key_ptr.*, start, end)) continue;
-                if (!e.snp_seen) e.srm.set(iface);
+                if (!e.snp_seen) self.queueSrm(kv.key_ptr.*, iface);
             }
         }
     }
@@ -928,12 +1028,12 @@ pub const Lsdb = struct {
                 .newer => {
                     e.refresh_pending = true;
                     e.challenge_seq = @max(e.challenge_seq, entry.sequence_number);
-                    e.srm.set(iface);
+                    self.queueSrm(entry.lsp_id, iface);
                 },
                 // Ours is newer → flood it to them.
-                .older => e.srm.set(iface),
+                .older => self.queueSrm(entry.lsp_id, iface),
                 // In sync → stop flooding it to them.
-                .same => e.srm.unset(iface),
+                .same => _ = self.srm_queue[iface].swapRemove(entry.lsp_id),
             }
             return;
         }
@@ -941,16 +1041,16 @@ pub const Lsdb = struct {
             e.snp_seen = true;
             if (e.is_request) {
                 // We already want it — keep requesting.
-                self.setSsnIfP2p(e, iface);
+                self.setSsnIfP2p(entry.lsp_id, iface);
                 return;
             }
             switch (compare(their, e.versionAt(now))) {
                 // Their copy is newer → request it (SSN → PSNP).
-                .newer => self.setSsnIfP2p(e, iface),
+                .newer => self.setSsnIfP2p(entry.lsp_id, iface),
                 // Ours is newer → flood ours to them (SRM).
-                .older => e.srm.set(iface),
+                .older => self.queueSrm(entry.lsp_id, iface),
                 // In sync → stop flooding it to them (implicit ack).
-                .same => e.srm.unset(iface),
+                .same => _ = self.srm_queue[iface].swapRemove(entry.lsp_id),
             }
         } else {
             // We lack it. A summary entry that is itself an all-zero purge for an
@@ -997,12 +1097,10 @@ pub const Lsdb = struct {
                 .challenge_seq = 0,
                 .snp_seen = true,
                 .bytes = &.{},
-                .srm = InterfaceSet.initEmpty(),
-                .ssn = InterfaceSet.initEmpty(),
             };
             self.request_count += 1;
         }
-        self.setSsnIfP2p(gop.value_ptr, iface);
+        self.setSsnIfP2p(id, iface);
     }
 };
 
@@ -1226,6 +1324,52 @@ test "aging: keeps before expiry, purges at expiry, removes after ZeroAge" {
     const r2 = db.tick(160);
     try testing.expectEqual(@as(usize, 1), r2.removed);
     try testing.expect(db.get(id, 160) == null);
+}
+
+// audit F7 regression: `srmIterator`/`ssnIterator`/`interfacesWithSrm` used to
+// scan the whole database per call; they now read per-interface queues
+// (`Lsdb.srm_queue`/`ssn_queue`) that are the *only* record of which LSP-IDs
+// are flagged. That shape removes the "flag says set, queue says something
+// else" class of bug by construction (there is only one representation to
+// read) — but it introduces a different way for it to drift: an entry
+// removed from `map` (purge-hold expiry, request timeout) must *also* be
+// removed from every queue it was in, or `interfacesWithSrm` keeps reporting
+// "something queued" on that circuit forever for an LSP that is gone. This
+// pins that cleanup. It goes RED without `tick`'s `self.dequeueAll(key)`
+// call: commenting that line out (verified by hand this session) makes
+// `interfacesWithSrm()` after full removal still report both interfaces set,
+// failing the final assertion below — `scripts/capped zig build
+// test-isis-lsdb` went from 0 to a failing test with that one line removed,
+// reverted immediately after.
+test "a removed entry's SRM/SSN queue membership does not survive it" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .zero_age_lifetime = 60 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 100), 0, 0);
+    const id = idOf(sys_other, 0);
+
+    // Reaches ZeroAge purge-hold: `setSrmAll` queues SRM on every interface
+    // for this entry (the purge must be flooded).
+    _ = db.tick(100);
+    try testing.expect(db.get(id, 100).?.is_purge);
+    try testing.expectEqual(@as(usize, 2), db.interfacesWithSrm().count());
+    var sit = db.srmIterator(0);
+    try testing.expect(sit.next() != null);
+
+    // Past ZeroAgeLifetime: the entry is removed from `map` entirely. This is
+    // the ONLY entry that ever queued anything, on either interface.
+    const r = db.tick(160);
+    try testing.expectEqual(@as(usize, 1), r.removed);
+    try testing.expect(db.get(id, 160) == null);
+
+    // The queues must have been cleaned up along with the entry — not just
+    // filtered out at read time (`FlagIterator.next` already does that
+    // defensively, which would otherwise mask exactly this leak).
+    try testing.expectEqual(@as(usize, 0), db.interfacesWithSrm().count());
+    var sit2 = db.srmIterator(0);
+    try testing.expect(sit2.next() == null);
+    var sit3 = db.srmIterator(1);
+    try testing.expect(sit3.next() == null);
 }
 
 // W-B/isis-lsdb-F6 regression: `tick`'s removal pass used to collect victims

@@ -2097,7 +2097,10 @@ fn buildCb(pk: paillier.PublicKey, c_a: paillier.Ciphertext, x_bytes: []const u8
 }
 
 test "GG18 A.1 honest accept: Alice's range proof verifies, and re-verifies after a codec round-trip" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0001);
     const pk = setup.kp.public;
@@ -2129,7 +2132,10 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     // real protocol on the real witness) must be rejected by equation 1
     // alone. Driven through the byte-level inner prover because the
     // Scalar-typed public API cannot even express m > q.
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0002);
     const pk = setup.kp.public;
@@ -2157,7 +2163,10 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
 }
 
 test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof field" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0003);
     const pk = setup.kp.public;
@@ -2209,7 +2218,10 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof 
 }
 
 test "GG18 A.3 honest accept: Bob's MtA proof over checked-MtA-shaped ciphertexts, and after a codec round-trip" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0001);
     const pk = setup.kp.public;
@@ -2244,7 +2256,10 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
     // degree of freedom Alpha-Rays-class attacks exploit. The t1 case is
     // specifically the tss-lib/GG20 hardening the GG18 paper does not
     // have (see the module doc comment) — this test is what pins it.
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0002);
     const pk = setup.kp.public;
@@ -2285,7 +2300,10 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
 }
 
 test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, and every mangled proof field" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0003);
     const pk = setup.kp.public;
@@ -2357,7 +2375,10 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
 }
 
 test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol proof reuse all reject" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0004);
     const pk = setup.kp.public;

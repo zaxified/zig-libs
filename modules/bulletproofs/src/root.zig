@@ -67,14 +67,20 @@
 //!   gated. `meta.platform` is `.linux` to reflect the most-restrictive
 //!   reachable path honestly (porting `fillRandom` to a POSIX/Windows
 //!   entropy call would lift this).
-//! - **Not constant-time.** `scalarvec.multiScalarMul` skips zero scalars
-//!   (a `catch continue` on std's "result is the identity element" error),
-//!   so the time to form commitment `A` (built over the secret bit-vector
-//!   `a_L`/`a_R`) depends on the committed value's bit pattern — a mild
-//!   timing side-channel. A range proof's PRIVACY rests on the proof's
-//!   zero-knowledge property (the proof reveals nothing about `v`), not on
-//!   constant-time proving, so this does not break the ZK guarantee; it is
-//!   documented here for honest threat-modelling of the prover host.
+//! - **Proving is constant-time; verifying is deliberately not.** Every
+//!   scalar multiplication on a SECRET scalar (the bit-vectors
+//!   `a_L`/`a_R`/`s_L`/`s_R`, the blindings `alpha`/`rho`/`tau1`/`tau2`/
+//!   `gamma`, the committed value `v`, the IPA fold challenges) goes
+//!   through `scalarvec.mulCt` — std's constant-time 4-bit-window ladder
+//!   with the trailing `rejectIdentity` removed, so a zero scalar takes
+//!   exactly the same path and the same time as any other. Earlier
+//!   revisions used `Ristretto255.mul` with `catch continue`/`catch
+//!   identity`, which skipped work for a zero scalar and so leaked whether
+//!   a witness/blinding scalar was zero (audit finding F2); that shape is
+//!   gone. The VERIFIER's multi-scalar multiplications
+//!   (`scalarvec.multiScalarMulVartime`) are variable-time on purpose —
+//!   they consume only PUBLIC data (the proof, the statement, and the
+//!   Fiat-Shamir challenges replayed from them).
 //!
 //! ## Layout
 //!

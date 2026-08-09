@@ -184,6 +184,23 @@ shape and say so.
   confirm with no preceding edit is refused rather than committing whatever was in the buffer, and
   `SelectEditSG` pre-loads the group so that editing one attribute and confirming does not blank the
   rest. A real IED refuses an `SE` read with no edit group selected; so does this one.
+- **`report.Report` is decoded into caller-owned storage, not returned by value** (audit F4).
+  `Report.decode(out: *Report, results: *mms.AccessResultIterator) Error!void` and
+  `decodeInformationReport(out: *Report, body: []const u8) Error!void` write into `out` instead of
+  returning a `Report` — the struct is 9,344 bytes (dominated by the fixed
+  `entries: [max_entries]Entry` array), and returning it by value cost a full struct copy on the
+  client's report-receive hot path (measured: 3,514 ns/call before, 514 ns/call after, one 106-octet
+  captured report per call, `ReleaseFast`, `IEC61850_BENCH=1 scripts/capped zig build
+  test-iec61850 -Doptimize=ReleaseFast`). `ReportHandler.on_report` follows the same contract one
+  hop downstream: it takes `r: *const report.Report`, a borrow into the client's own decode-scratch
+  storage, valid only for the duration of the call. **Partial-failure contract**: on an error, some
+  scalar fields of `out` may already be overwritten while others still hold whatever `out` held
+  before the call (decode is not transactional across the whole struct — see `Report.decode`'s doc
+  comment) — but `out.entries`/`out.entry_count` specifically are never left showing a mix of the
+  old and new report, because every fallible read completes before the one loop that writes
+  `entries` runs, and `entry_count` is reset to `0` as soon as `rpt_id`/`opt_flds` succeed, before
+  any of the fields that can still fail. A caller reusing one `Report` across calls therefore never
+  observes `included()` returning entries misattributed to a report that failed to decode.
 
 ### SCL
 

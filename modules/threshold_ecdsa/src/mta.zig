@@ -597,7 +597,9 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     // zkproofs.zig's own proof-level accept/reject tests.
     // 2048-bit keys throughout: this test drives the checked prove entry
     // points, which now enforce the audit-F2 floor (Paillier N and aux Ñ
-    // both > q⁷ ≈ 2^1792). Slow in Debug -> ReleaseFast only.
+    // both > q⁷ ≈ 2^1792). Slow in real Debug, so it is gated -- but this
+    // module is `heavy` in build.zig, so the DEFAULT lane builds it at
+    // ReleaseSafe and DOES run this; it skips ONLY under `-Dstrict-debug`.
     if (builtin.mode == .Debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x66696e616c697a65); // "finalize"
     const krandom = kprng.random();

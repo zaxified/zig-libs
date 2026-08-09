@@ -92,29 +92,98 @@ pub fn powers(allocator: std.mem.Allocator, x: [32]u8, n: usize) std.mem.Allocat
     return out;
 }
 
+// ── constant-time scalar multiplication ─────────────────────────────────────
+//
+// `Ristretto255.mul` (std) is internally constant-time — a 4-bit fixed
+// window over a 16-entry precomputed table selected with `cMov`, 64 fixed
+// iterations regardless of the scalar — EXCEPT for one thing: it ends with
+// `q.rejectIdentity()` (`std/crypto/25519/edwards25519.zig`'s `pcMul16`),
+// which turns "the product is the neutral element" into
+// `error.IdentityElement`. That is a **branch on a scalar-derived value**,
+// and every caller then has to branch again to handle the error. When the
+// scalar is SECRET (a witness bit, a blinding factor, a fold challenge),
+// both branches are secret-dependent: they reveal whether that scalar was
+// zero. The old shape here was worse still — `p.mul(s) catch continue`
+// skipped the whole subsequent group addition, so a zero scalar cost one
+// fewer point add than a nonzero one.
+//
+// `mulCt` below is std's own constant-time ladder with the trailing
+// rejection removed: the neutral element is simply returned as a value.
+// It has no error union, so no call site can branch on the scalar, and
+// its control flow (precompute, then 64 window iterations, each an
+// unconditional 15-entry `cMov` select + add + 4 doublings) is identical
+// for every scalar including zero.
+
+const Curve = Ristretto255.Curve; // Edwards25519
+const Fe = Curve.Fe;
+
+/// Branch-free select of `pc[slot]` (`slot == 0` selects the identity),
+/// mirroring std's private `Edwards25519.pcSelect`: every entry is touched
+/// with a `cMov` whose mask is `1` exactly when `slot ^ i == 0`.
+fn pcSelect(pc: *const [16]Curve, slot: u4) Curve {
+    var t = Curve.identityElement;
+    comptime var i: u8 = 1;
+    inline while (i < 16) : (i += 1) {
+        const c: u64 = ((@as(usize, @as(u8, slot) ^ i) -% 1) >> 8) & 1;
+        Fe.cMov(&t.x, pc[i].x, c);
+        Fe.cMov(&t.y, pc[i].y, c);
+        Fe.cMov(&t.z, pc[i].z, c);
+        Fe.cMov(&t.t, pc[i].t, c);
+    }
+    return t;
+}
+
+/// `s * p` over Ristretto255, **constant-time in `s` and total** — the
+/// neutral element is returned as an ordinary value rather than raised as
+/// `error.IdentityElement`, so there is no `catch` and therefore no
+/// secret-dependent branch at any call site (that error, and the
+/// `catch continue`/`catch identity_point` idioms it forced, were audit
+/// finding `bulletproofs` F2).
+///
+/// Same algorithm and same cost as `std`'s `Ristretto255.mul`: a 4-bit
+/// fixed window over a 16-entry table, 64 unconditional iterations. Safe
+/// for SECRET scalars; use `multiScalarMulVartime` when the scalars are
+/// public and speed matters.
+pub fn mulCt(p: Ristretto255, s: [32]u8) Ristretto255 {
+    // pc[i] = i*p for i in 0..15 (pc[0] = neutral).
+    var pc: [16]Curve = undefined;
+    pc[0] = Curve.identityElement;
+    pc[1] = p.p;
+    comptime var i: usize = 2;
+    inline while (i < 16) : (i += 1) {
+        pc[i] = if (i % 2 == 0) pc[i / 2].dbl() else pc[i - 1].add(p.p);
+    }
+
+    var q = Curve.identityElement;
+    var pos: usize = 252;
+    while (true) : (pos -= 4) {
+        const slot: u4 = @truncate(s[pos >> 3] >> @as(u3, @truncate(pos)));
+        q = q.add(pcSelect(&pc, slot));
+        if (pos == 0) break;
+        q = q.dbl().dbl().dbl().dbl();
+    }
+    return .{ .p = q };
+}
+
 pub const MultiScalarMulError = error{LengthMismatch};
 
 /// `sum_i scalars_i * points_i` over Ristretto255 — a naive (non-Pippenger)
-/// weighted sum: one `Ristretto255.mul` + `.add` per term. `s_i == 0`
-/// (or, negligibly, `s_i * points_i` landing on the identity for any other
-/// reason) is handled by skipping that term's contribution (`p.mul(s)`
-/// returns `error.IdentityElement`/`error.WeakPublicKey` in exactly that
-/// case per std's own doc comment — a zero contribution either way, so
-/// `catch continue` is exact, not an approximation).
+/// weighted sum: one `mulCt` + `.add` per term, **constant-time**: every
+/// term costs exactly the same whatever its scalar is, including zero (a
+/// zero scalar contributes the neutral element, which is added like any
+/// other term rather than skipped). This is the MSM the PROVER uses, over
+/// secret witness/blinding scalars.
 ///
-/// Performance note: this is the mechanical, obviously-correct version —
-/// good enough for a scaffold and for the KAT harness below. A production
-/// pass MAY swap this for a windowed/Pippenger multi-scalar-multiplication
-/// without changing this function's signature or the callers in `ipa.zig`/
-/// `rangeproof.zig`; that is a performance optimization, not a
-/// cryptographic-judgment change, so it is explicitly OUT of scope for the
-/// Fable core pass (see `ipa.zig`'s module doc comment).
+/// Performance note: this is the mechanical, obviously-correct version.
+/// The verifier's public-scalar MSMs use the windowed/bucket
+/// `multiScalarMulVartime` below instead; a faster CONSTANT-TIME MSM would
+/// have to keep the per-term cost scalar-independent, so the vartime
+/// bucket method is not a legal substitute here.
 pub fn multiScalarMul(scalars: []const [32]u8, points: []const Ristretto255) MultiScalarMulError!Ristretto255 {
     if (scalars.len != points.len) return error.LengthMismatch;
     var acc = identity_point;
     for (scalars, points) |s, p| {
-        const term = p.mul(s) catch continue;
-        acc = acc.add(term);
+        acc = acc.add(mulCt(p, s));
     }
     return acc;
 }
@@ -191,7 +260,7 @@ pub fn multiScalarMulVartime(scalars: []const [32]u8, points: []const Ristretto2
 
     if (n < pippenger_min) {
         var acc = identity_point;
-        for (scalars, points) |s, p| acc = acc.add(p.mul(s) catch continue);
+        for (scalars, points) |s, p| acc = acc.add(mulCt(p, s));
         return acc;
     }
 
@@ -314,6 +383,55 @@ test "powers: n=0 gives empty slice" {
     const got = try powers(std.testing.allocator, two, 0);
     defer std.testing.allocator.free(got);
     try std.testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "mulCt: differential vs std Ristretto255.mul over random scalars" {
+    // std's `mul` is the oracle for every scalar whose product is NOT the
+    // identity (where it refuses to answer at all). Sweep random scalars
+    // plus the structural edge cases (1, 2, L-1 via -1, high bit set).
+    var prng = std.Random.DefaultPrng.init(0xC7_1A_DDE1);
+    const random = prng.random();
+    const g = Ristretto255.basePoint;
+    const p2 = g.dbl().add(g); // 3G — a non-base point, exercises precompute
+
+    for (0..64) |_| {
+        var wide: [64]u8 = undefined;
+        random.bytes(&wide);
+        const s = scalar.reduce64(wide);
+        for ([_]Ristretto255{ g, p2 }) |p| {
+            const want = try p.mul(s);
+            try std.testing.expect(mulCt(p, s).equivalent(want));
+        }
+    }
+
+    const minus_one = scalar.sub(zero, one);
+    for ([_][32]u8{ one, two, minus_one }) |s| {
+        for ([_]Ristretto255{ g, p2 }) |p| {
+            const want = try p.mul(s);
+            try std.testing.expect(mulCt(p, s).equivalent(want));
+        }
+    }
+}
+
+test "mulCt: zero scalar yields the identity as a value, not an error" {
+    // This is the case `Ristretto255.mul` refuses (`error.IdentityElement`)
+    // and that the old `catch continue` shape turned into a
+    // secret-dependent skip. `mulCt` must simply return the neutral element.
+    const g = Ristretto255.basePoint;
+    try std.testing.expect(mulCt(g, zero).equivalent(identity_point));
+    try std.testing.expect(mulCt(identity_point, zero).equivalent(identity_point));
+    try std.testing.expect(mulCt(identity_point, two).equivalent(identity_point));
+    // std really does error here — pinning WHY mulCt exists.
+    try std.testing.expectError(error.IdentityElement, g.mul(zero));
+}
+
+test "mulCt: signature carries no error set (no call site can branch on the scalar)" {
+    // Finding F2 was not "the wrong answer", it was "a branch whose taken-ness
+    // depends on a secret scalar". The structural guarantee that no such
+    // branch can be reintroduced at a CALL SITE is that this primitive has no
+    // error union to `catch`. Assert that in the type system.
+    const info = @typeInfo(@TypeOf(mulCt)).@"fn";
+    try std.testing.expect(info.return_type.? == Ristretto255);
 }
 
 test "multiScalarMul: 2*G + 3*basePoint.dbl() matches direct computation" {

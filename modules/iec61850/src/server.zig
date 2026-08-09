@@ -2067,7 +2067,7 @@ var seen_gi: usize = 0;
 var seen_dchg: usize = 0;
 var seen_integrity: usize = 0;
 
-fn onReport(_: *anyopaque, r: report.Report) void {
+fn onReport(_: *anyopaque, r: *const report.Report) void {
     seen_reports += 1;
     seen_entries += r.entry_count;
     for (r.included()) |e| {
@@ -2211,7 +2211,8 @@ test "our server's report is what our own decoder reads, byte for byte" {
     try contexts.define(presentation.context_mms, &ber.oids.mms_abstract_syntax);
     try contexts.applyResults(&[_]presentation.Result{.acceptance});
     const pdv = try presentation.decodeUserData(ppdu, &contexts);
-    const r = try report.decodeInformationReport((try mms.decode(pdv.value)).unconfirmed.body);
+    var r: report.Report = undefined;
+    try report.decodeInformationReport(&r, (try mms.decode(pdv.value)).unconfirmed.body);
     try testing.expectEqualStrings("Events1", r.rpt_id);
     try testing.expectEqualStrings(domain ++ "/LLN0$Events", r.dat_set.?);
     try testing.expectEqual(@as(u16, 4), r.entry_count);
@@ -2529,8 +2530,8 @@ var seg_members: usize = 0;
 var seg_segments: u32 = 0;
 var seg_errors: usize = 0;
 
-fn onSegment(_: *anyopaque, r: report.Report) void {
-    const done = seg_re.push(r) catch {
+fn onSegment(_: *anyopaque, r: *const report.Report) void {
+    const done = seg_re.push(r.*) catch {
         seg_errors += 1;
         seg_re.reset();
         return;

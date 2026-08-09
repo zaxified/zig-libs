@@ -663,7 +663,8 @@ test "every captured InformationReport decodes as a report and rebuilds" {
             else => continue,
         };
         // It is a real IEC 61850 report.
-        const r = try report.decodeInformationReport(u.body);
+        var r: report.Report = undefined;
+        try report.decodeInformationReport(&r, u.body);
         try testing.expectEqualStrings("Events1", r.rpt_id);
         try testing.expectEqual(@as(u32, 1), r.conf_rev.?);
         try testing.expectEqualStrings("simpleIOGenericIO/LLN0$Events", r.dat_set.?);

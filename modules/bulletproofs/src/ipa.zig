@@ -121,12 +121,13 @@ const transcript_mod = @import("transcript.zig");
 const Transcript = transcript_mod.Transcript;
 const scalarvec = @import("scalarvec.zig");
 
-/// `p*s`, mapping std's "result is the identity element" error (raised
-/// exactly when `s == 0 mod L`, per `Ristretto255.mul`'s doc) to the
-/// identity element itself — the same exact-not-approximate convention
-/// `scalarvec.multiScalarMul` documents for its own `catch continue`.
+/// `p*s` via the branch-free constant-time ladder `scalarvec.mulCt`, which
+/// returns the identity element as a VALUE where `Ristretto255.mul` would
+/// raise `error.IdentityElement` (i.e. when `s == 0 mod L`). Using it here
+/// rather than `p.mul(s) catch identity` keeps the fold's timing
+/// independent of the secret challenge/witness scalars — audit finding F2.
 fn mulOrIdentity(p: Ristretto255, s: [32]u8) Ristretto255 {
-    return p.mul(s) catch scalarvec.identity_point;
+    return scalarvec.mulCt(p, s);
 }
 
 /// `s^{-1} (mod L)` via std's expanded-scalar exponentiation chain.

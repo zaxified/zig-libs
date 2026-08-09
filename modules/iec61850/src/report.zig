@@ -291,37 +291,72 @@ pub const Report = struct {
         return self.entries[0..self.entry_count];
     }
 
-    /// Decodes an `InformationReport`'s access-result list into a report.
+    /// Decodes an `InformationReport`'s access-result list into `out`.
+    ///
+    /// **Out-parameter, not a return value** (audit F4): `Report` is 9,344
+    /// bytes — dominated by the fixed `entries: [max_entries]Entry` array —
+    /// so returning it by value meant every inbound report cost a full
+    /// struct copy on top of the decode itself, on what is the client's hot
+    /// path. `out` is caller-owned storage (a stack slot, a field of a
+    /// longer-lived struct, whatever the caller already has), matching the
+    /// caller-owns-storage discipline the rest of this module follows
+    /// (`Reassembler`'s `slots`/`arena`, the RCB decode's caller-supplied
+    /// `Rcb`).
+    ///
+    /// **Partial-failure contract.** Every scalar field (`rpt_id`, `opt_flds`,
+    /// the optional header fields, `inclusion`) is written to `out.*` as soon
+    /// as it is decoded, so on a `TruncatedReport`/`BadReportField` partway
+    /// through, some of those may already be updated while others still hold
+    /// whatever `out` held before the call — the same "decode as you go"
+    /// shape the old return-by-value version had internally, just visible
+    /// sooner. What *is* guaranteed on every error, including a partial one:
+    /// `out.entries` is never written to (every fallible read happens before
+    /// the one loop that populates it) and `out.entry_count` is reset to `0`
+    /// before any of those fallible reads run — so `out.included()` reads as
+    /// empty rather than a previous call's stale entries, or a half-written
+    /// mix, on any failure. A caller that reuses one `Report` across calls
+    /// therefore never observes entries misattributed to the report that
+    /// failed to decode.
     ///
     /// `results` is consumed. Every field is read in the order `OptFlds`
     /// dictates; a field of the wrong `Data` alternative is `BadReportField`
     /// rather than a silently shifted parse.
-    pub fn decode(results: *mms.AccessResultIterator) Error!Report {
+    pub fn decode(out: *Report, results: *mms.AccessResultIterator) Error!void {
         const rpt_id_d = try nextValue(results);
         const opt_d = try nextValue(results);
         const opt_flds = OptFlds.parse(try opt_d.bitString());
-        var r = Report{
+        // From here on, every field is written straight into `out.*` — never
+        // into a same-shaped local that then gets copied in. `out.entry_count`
+        // becomes 0 right here, before any of the fallible reads below run —
+        // see the "partial-failure contract" note above.
+        out.* = .{
             .rpt_id = try rpt_id_d.visibleString(),
             .opt_flds = opt_flds,
             .inclusion = undefined,
+            // `entries`/`entry_count` deliberately omitted: both default to
+            // "empty" (`undefined`/`0`), which costs nothing to materialise
+            // (unlike naming `out.entries` here, which would read the whole
+            // 128-entry array just to write the same bytes back — exactly
+            // the copy this fix removes). Every slot `included()` can reach
+            // is written below before `entry_count` is set to match.
         };
-        if (opt_flds.sequence_number) r.sq_num = try (try nextValue(results)).unsigned(u32);
-        if (opt_flds.report_time_stamp) r.time_of_entry = try (try nextValue(results)).binaryTime();
-        if (opt_flds.data_set_name) r.dat_set = try (try nextValue(results)).visibleString();
-        if (opt_flds.buffer_overflow) r.buf_ovfl = try (try nextValue(results)).boolean();
-        if (opt_flds.entry_id) r.entry_id = try (try nextValue(results)).octetString();
-        if (opt_flds.conf_revision) r.conf_rev = try (try nextValue(results)).unsigned(u32);
+        if (opt_flds.sequence_number) out.sq_num = try (try nextValue(results)).unsigned(u32);
+        if (opt_flds.report_time_stamp) out.time_of_entry = try (try nextValue(results)).binaryTime();
+        if (opt_flds.data_set_name) out.dat_set = try (try nextValue(results)).visibleString();
+        if (opt_flds.buffer_overflow) out.buf_ovfl = try (try nextValue(results)).boolean();
+        if (opt_flds.entry_id) out.entry_id = try (try nextValue(results)).octetString();
+        if (opt_flds.conf_revision) out.conf_rev = try (try nextValue(results)).unsigned(u32);
         if (opt_flds.segmentation) {
-            r.sub_seq_num = try (try nextValue(results)).unsigned(u32);
-            r.more_segments_follow = try (try nextValue(results)).boolean();
+            out.sub_seq_num = try (try nextValue(results)).unsigned(u32);
+            out.more_segments_follow = try (try nextValue(results)).boolean();
         }
-        r.inclusion = try (try nextValue(results)).bitString();
+        out.inclusion = try (try nextValue(results)).bitString();
 
         // How many members the inclusion bit string says are present.
         var count: usize = 0;
         var i: usize = 0;
-        while (i < r.inclusion.bitCount()) : (i += 1) {
-            if (r.inclusion.bit(i)) count += 1;
+        while (i < out.inclusion.bitCount()) : (i += 1) {
+            if (out.inclusion.bit(i)) count += 1;
         }
         if (count > max_entries) return error.TooManyEntries;
 
@@ -340,12 +375,13 @@ pub const Report = struct {
             while (k < count) : (k += 1) reasons[k] = Reason.parse(try (try nextValue(results)).bitString());
         }
 
-        // Map each present value back to its data-set index.
+        // Map each present value back to its data-set index — written
+        // directly into `out.entries`, the caller's own storage.
         var slot: usize = 0;
         i = 0;
-        while (i < r.inclusion.bitCount()) : (i += 1) {
-            if (!r.inclusion.bit(i)) continue;
-            r.entries[slot] = .{
+        while (i < out.inclusion.bitCount()) : (i += 1) {
+            if (!out.inclusion.bit(i)) continue;
+            out.entries[slot] = .{
                 .index = i,
                 .reference = if (opt_flds.data_reference) refs[slot] else null,
                 .value = values[slot],
@@ -353,8 +389,7 @@ pub const Report = struct {
             };
             slot += 1;
         }
-        r.entry_count = @intCast(slot);
-        return r;
+        out.entry_count = @intCast(slot);
     }
 
     fn nextValue(results: *mms.AccessResultIterator) Error!mmsdata.Data {
@@ -366,11 +401,12 @@ pub const Report = struct {
     }
 };
 
-/// Decodes an `InformationReport` PDU body straight into a `Report`, checking
-/// that it really is a report (`RPT` VMD-specific variable list) first.
-pub fn decodeInformationReport(body: []const u8) Error!Report {
+/// Decodes an `InformationReport` PDU body straight into `out`, checking that
+/// it really is a report (`RPT` VMD-specific variable list) first. See
+/// `Report.decode` for the out-parameter contract.
+pub fn decodeInformationReport(out: *Report, body: []const u8) Error!void {
     var ir = try mms.decodeInformationReport(body);
-    return Report.decode(&ir.results);
+    try Report.decode(out, &ir.results);
 }
 
 /// The conventional VMD-specific name an `InformationReport` carrying a report
@@ -634,7 +670,8 @@ const captured_report_integrity = [_]u8{
 
 test "the captured report decodes field by field" {
     const pdu = try mms.decode(&captured_report);
-    const r = try decodeInformationReport(pdu.unconfirmed.body);
+    var r: Report = undefined;
+    try decodeInformationReport(&r, pdu.unconfirmed.body);
     try testing.expectEqualStrings("Events1", r.rpt_id);
     try testing.expect(r.opt_flds.sequence_number);
     try testing.expect(r.opt_flds.report_time_stamp);
@@ -664,14 +701,16 @@ test "the captured report decodes field by field" {
 
 test "the fourth captured report shows the reason changing to integrity" {
     const pdu = try mms.decode(&captured_report_integrity);
-    const r = try decodeInformationReport(pdu.unconfirmed.body);
+    var r: Report = undefined;
+    try decodeInformationReport(&r, pdu.unconfirmed.body);
     try testing.expectEqual(@as(u32, 3), r.sq_num.?);
     for (r.included()) |e| {
         try testing.expect(e.reason.?.integrity);
         try testing.expect(!e.reason.?.general_interrogation);
     }
     // The two captured reports carry the same OptFlds and inclusion set.
-    const first = try decodeInformationReport((try mms.decode(&captured_report)).unconfirmed.body);
+    var first: Report = undefined;
+    try decodeInformationReport(&first, (try mms.decode(&captured_report)).unconfirmed.body);
     try testing.expectEqual(first.opt_flds, r.opt_flds);
     try testing.expectEqual(first.entry_count, r.entry_count);
 }
@@ -822,7 +861,8 @@ test "a partial report maps its values back to the right data-set indices" {
     try mms.closeInformationReport(&w, m, .{ .variable_list = .{ .vmd_specific = report_variable_name } });
 
     const pdu = try mms.decode(w.done());
-    const r = try decodeInformationReport(pdu.unconfirmed.body);
+    var r: Report = undefined;
+    try decodeInformationReport(&r, pdu.unconfirmed.body);
     try testing.expectEqualStrings("RPT1", r.rpt_id);
     try testing.expectEqual(@as(u32, 7), r.sq_num.?);
     try testing.expect(r.time_of_entry == null);
@@ -849,7 +889,8 @@ test "data references are read when OptFlds asks for them" {
     try mms.closeInformationReport(&w, m, .{ .variable_list = .{ .vmd_specific = report_variable_name } });
 
     const pdu = try mms.decode(w.done());
-    const r = try decodeInformationReport(pdu.unconfirmed.body);
+    var r: Report = undefined;
+    try decodeInformationReport(&r, pdu.unconfirmed.body);
     try testing.expectEqual(@as(u16, 1), r.entry_count);
     try testing.expectEqualStrings("LD/GGIO1$ST$Ind1$stVal", r.included()[0].reference.?);
     try testing.expectEqual(@as(i32, 42), try r.included()[0].value.integer(i32));
@@ -869,7 +910,8 @@ test "a segmented report reads its two extra fields" {
     try mms.closeInformationReport(&w, m, .{ .variable_list = .{ .vmd_specific = report_variable_name } });
 
     const pdu = try mms.decode(w.done());
-    const r = try decodeInformationReport(pdu.unconfirmed.body);
+    var r: Report = undefined;
+    try decodeInformationReport(&r, pdu.unconfirmed.body);
     try testing.expectEqual(@as(u32, 2), r.sub_seq_num.?);
     try testing.expect(r.more_segments_follow.?);
     try testing.expectEqual(@as(u16, 1), r.entry_count);
@@ -884,7 +926,57 @@ test "a report that ends before OptFlds promised is refused" {
     try mmsdata.Emit.visibleString(&w, "RPT4");
     try mms.closeInformationReport(&w, m, .{ .variable_list = .{ .vmd_specific = report_variable_name } });
     const pdu = try mms.decode(w.done());
-    try testing.expectError(error.TruncatedReport, decodeInformationReport(pdu.unconfirmed.body));
+    var r: Report = undefined;
+    try testing.expectError(error.TruncatedReport, decodeInformationReport(&r, pdu.unconfirmed.body));
+}
+
+// audit F4 regression: `Report.decode`/`decodeInformationReport` used to
+// return a fresh `Report` by value, so a caller reusing one `Report` across
+// calls never had to think about what a FAILED decode left behind — the old
+// value simply stayed bound, untouched, because the failed call's return was
+// never assigned. The out-parameter contract (`report.zig`'s `Report.decode`
+// doc comment, "partial-failure contract") makes that a real question again:
+// `out` is written to incrementally as fields decode, so this pins the one
+// guarantee that actually holds on every error — `out.entries`/
+// `out.entry_count` are never left showing a mix of the old and new report.
+// Goes RED without the early `entry_count` reset this relies on: adding
+// `.entry_count = out.entry_count` to the `out.* = .{ ... }` literal in
+// `Report.decode` (preserving whatever `out` held instead of zeroing it) made
+// this test fail — `expected 0, found 4` — `scripts/capped zig build
+// test-iec61850` exit 1, 394 pass / 1 fail / 10 skip. Reverted immediately
+// after. (Separately, the out-parameter signature itself is also pinned by
+// every other call site in this file and the rest of the module: reverting
+// `decode`/`decodeInformationReport` to return `Report` by value does not
+// compile against any of them.)
+test "a partial decode failure hides the previous entries rather than mixing them in" {
+    // A good decode first, into a `Report` we are about to reuse.
+    var r: Report = undefined;
+    {
+        const pdu = try mms.decode(&captured_report);
+        try decodeInformationReport(&r, pdu.unconfirmed.body);
+    }
+    try testing.expectEqual(@as(u16, 4), r.entry_count);
+
+    // Then decode a truncated report into the SAME storage: OptFlds parses
+    // (so `out.rpt_id`/`out.opt_flds` are overwritten and `out.entry_count`
+    // is reset to 0 — see `Report.decode`), but the body ends right after,
+    // before `SqNum` (which `OptFlds` promised) ever arrives.
+    var buf: [128]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    const m = w.mark();
+    try (OptFlds{ .sequence_number = true, .report_time_stamp = true }).emit(&w);
+    try mmsdata.Emit.visibleString(&w, "RPT-TRUNC");
+    try mms.closeInformationReport(&w, m, .{ .variable_list = .{ .vmd_specific = report_variable_name } });
+    const pdu2 = try mms.decode(w.done());
+    try testing.expectError(error.TruncatedReport, decodeInformationReport(&r, pdu2.unconfirmed.body));
+
+    // Proves the failed call really did reach the partial-write path (not a
+    // total no-op): the header was overwritten to the second report's...
+    try testing.expectEqualStrings("RPT-TRUNC", r.rpt_id);
+    // ...but its entries were not: `included()` must read empty, never the
+    // first report's 4 entries now wrongly attributed to "RPT-TRUNC".
+    try testing.expectEqual(@as(u16, 0), r.entry_count);
+    try testing.expectEqual(@as(usize, 0), r.included().len);
 }
 
 test "a report field of the wrong Data alternative is refused, not shifted" {
@@ -898,7 +990,8 @@ test "a report field of the wrong Data alternative is refused, not shifted" {
     try mmsdata.Emit.visibleString(&w, "RPT5");
     try mms.closeInformationReport(&w, m, .{ .variable_list = .{ .vmd_specific = report_variable_name } });
     const pdu = try mms.decode(w.done());
-    try testing.expectError(error.WrongDataType, decodeInformationReport(pdu.unconfirmed.body));
+    var r: Report = undefined;
+    try testing.expectError(error.WrongDataType, decodeInformationReport(&r, pdu.unconfirmed.body));
 }
 
 test "an access-result failure inside a report is refused" {
@@ -910,7 +1003,8 @@ test "an access-result failure inside a report is refused" {
     try mmsdata.Emit.visibleString(&w, "RPT6");
     try mms.closeInformationReport(&w, m, .{ .variable_list = .{ .vmd_specific = report_variable_name } });
     const pdu = try mms.decode(w.done());
-    try testing.expectError(error.BadReportField, decodeInformationReport(pdu.unconfirmed.body));
+    var r: Report = undefined;
+    try testing.expectError(error.BadReportField, decodeInformationReport(&r, pdu.unconfirmed.body));
 }
 
 test "an RCB structure that stops early is refused" {
@@ -930,7 +1024,8 @@ fn fuzzReport(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    _ = decodeInformationReport(buf[0..len]) catch {};
+    var r: Report = undefined;
+    decodeInformationReport(&r, buf[0..len]) catch {};
     const d = mmsdata.Data.decode(buf[0..len]) catch return;
     d.validate() catch return;
     _ = Rcb.decode(d, .unbuffered) catch {};
@@ -987,7 +1082,9 @@ fn segmentFor(
 
 fn decodeSegment(bytes: []const u8) !Report {
     const pdu = try mms.decode(bytes);
-    return decodeInformationReport(pdu.unconfirmed.body);
+    var r: Report = undefined;
+    try decodeInformationReport(&r, pdu.unconfirmed.body);
+    return r;
 }
 
 test "three segments reassemble into one report with every member in order" {

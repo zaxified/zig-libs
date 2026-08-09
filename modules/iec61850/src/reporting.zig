@@ -1375,7 +1375,8 @@ test "every OptFlds combination the encoder supports round trips through the dec
         }, 6, &included);
 
         const pdu = try mms.decode(w.done());
-        const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+        var r: report.Report = undefined;
+        try report.decodeInformationReport(&r, pdu.unconfirmed.body);
         try testing.expectEqualStrings("RPT-X", r.rpt_id);
         try testing.expectEqual(opt, r.opt_flds);
         try testing.expectEqual(@as(u16, 3), r.entry_count);
@@ -1448,7 +1449,9 @@ const Harness = struct {
         var w = ber.Writer.init(&self.out);
         if (!try cb.emitNext(self.src.source(), &w)) return null;
         const pdu = try mms.decode(w.done());
-        return try report.decodeInformationReport(pdu.unconfirmed.body);
+        var r: report.Report = undefined;
+        try report.decodeInformationReport(&r, pdu.unconfirmed.body);
+        return r;
     }
 };
 
@@ -1933,7 +1936,8 @@ test "a report larger than the PDU budget is split, and every segment decodes" {
         // that never exceeds the budget.
         try testing.expect(w.done().len <= 200);
         const pdu = try mms.decode(w.done());
-        const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+        var r: report.Report = undefined;
+        try report.decodeInformationReport(&r, pdu.unconfirmed.body);
         try testing.expectEqual(@as(u32, @intCast(segments - 1)), r.sub_seq_num.?);
         // Every segment repeats the same header.
         try testing.expectEqualStrings("SEG1", r.rpt_id);
@@ -1974,7 +1978,8 @@ test "a segmented report keeps one SqNum and one EntryID across its segments" {
         var w = ber.Writer.init(&h.out);
         if (!try cb.emitNext(h.src.source(), &w)) break;
         const pdu = try mms.decode(w.done());
-        const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+        var r: report.Report = undefined;
+        try report.decodeInformationReport(&r, pdu.unconfirmed.body);
         if (n == 0) {
             @memcpy(&first_id, r.entry_id.?[0..8]);
         } else {
@@ -1989,7 +1994,8 @@ test "a segmented report keeps one SqNum and one EntryID across its segments" {
     var w2 = ber.Writer.init(&h.out);
     try testing.expect(try cb.emitNext(h.src.source(), &w2));
     const pdu2 = try mms.decode(w2.done());
-    const r2 = try report.decodeInformationReport(pdu2.unconfirmed.body);
+    var r2: report.Report = undefined;
+    try report.decodeInformationReport(&r2, pdu2.unconfirmed.body);
     try testing.expectEqual(@as(u32, 0), r2.sub_seq_num.?);
     try testing.expectEqual(@as(u32, 1), r2.sq_num.?);
 }
@@ -2015,7 +2021,8 @@ test "segmentation is off unless both OptFlds and a budget say so" {
     var w2 = ber.Writer.init(&h.out);
     try testing.expect(try cb2.emitNext(h.src.source(), &w2));
     const pdu = try mms.decode(w2.done());
-    const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+    var r: report.Report = undefined;
+    try report.decodeInformationReport(&r, pdu.unconfirmed.body);
     try testing.expectEqual(@as(u16, 6), r.entry_count);
     try testing.expectEqual(@as(u32, 0), r.sub_seq_num.?);
     try testing.expect(!r.more_segments_follow.?);
@@ -2420,7 +2427,8 @@ test "golden: a two-segment report is emitted octet for octet" {
 test "golden: both segments decode and re-encode to the identical octets" {
     for ([_][]const u8{ &segmented_report_first, &segmented_report_last }) |golden| {
         const pdu = try mms.decode(golden);
-        const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+        var r: report.Report = undefined;
+        try report.decodeInformationReport(&r, pdu.unconfirmed.body);
         try testing.expectEqualStrings("SEG1", r.rpt_id);
         try testing.expectEqual(@as(u32, 0), r.sq_num.?);
         try testing.expectEqual(@as(u32, 3), r.conf_rev.?);
@@ -2523,7 +2531,8 @@ fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
         // ordered runs.
         if (smith.valueRangeAtMost(u8, 0, 3) == 0) continue;
         const pdu = mms.decode(w.done()) catch continue;
-        const r = report.decodeInformationReport(pdu.unconfirmed.body) catch continue;
+        var r: report.Report = undefined;
+        report.decodeInformationReport(&r, pdu.unconfirmed.body) catch continue;
         _ = re.push(r) catch {
             re.reset();
             continue;

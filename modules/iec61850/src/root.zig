@@ -237,6 +237,7 @@ test {
     _ = server;
     _ = goldens;
     _ = controlgoldens;
+    _ = @import("bench.zig");
 }
 
 // ── tests: the whole stack, client against server ──────────────────────────
@@ -418,7 +419,7 @@ fn splitEndpoint(endpoint: []const u8) ?Endpoint {
 var live_reports: usize = 0;
 var live_report_entries: usize = 0;
 
-fn onLiveReport(_: *anyopaque, r: Report) void {
+fn onLiveReport(_: *anyopaque, r: *const Report) void {
     live_reports += 1;
     live_report_entries += r.entry_count;
 }

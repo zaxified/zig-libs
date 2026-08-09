@@ -86,9 +86,13 @@ pub const Config = struct {
 };
 
 /// Called for every `InformationReport` the server pushes.
+///
+/// `r` is a borrow into `Client`'s own decode-scratch storage (audit F4: the
+/// same out-parameter contract as `report.Report.decode`), valid only for the
+/// duration of the call — copy out anything that must outlive it.
 pub const ReportHandler = struct {
     ctx: *anyopaque,
-    on_report: *const fn (ctx: *anyopaque, r: report.Report) void,
+    on_report: *const fn (ctx: *anyopaque, r: *const report.Report) void,
 };
 
 /// Called for every unsolicited **control** notification — a
@@ -859,8 +863,9 @@ pub const Client = struct {
         } else |_| {}
         self.reports_received += 1;
         const h = self.handler orelse return;
-        const r = report.decodeInformationReport(u.body) catch return;
-        h.on_report(h.ctx, r);
+        var r: report.Report = undefined;
+        report.decodeInformationReport(&r, u.body) catch return;
+        h.on_report(h.ctx, &r);
     }
 
     /// Strips session + presentation and checks the context id.

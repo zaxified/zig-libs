@@ -711,7 +711,10 @@ fn expectVerifies(shares: []const root.KeyShare, message: []const u8, sig: Signa
 }
 
 test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> verifies under std EcdsaSecp256k1Sha256" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x736967_6e696e67); // "signing"
     const random = prng.random();
@@ -727,7 +730,10 @@ test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> ver
 }
 
 test "signWithShares: different t-subsets of n all produce signatures that verify under X" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7375627365747300); // "subsets"
     const random = prng.random();
@@ -745,7 +751,10 @@ test "signWithShares: different t-subsets of n all produce signatures that verif
 }
 
 test "signWithShares: tampered signature share does not verify" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x74616d706572); // "tamper"
     const random = prng.random();
@@ -765,7 +774,10 @@ test "signWithShares: tampered signature share does not verify" {
 }
 
 test "signWithShares: signature over one message does not verify against a different message" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6d69736d61746368); // "mismatch"
     const random = prng.random();
@@ -781,7 +793,10 @@ test "signWithShares: signature over one message does not verify against a diffe
 }
 
 test "signWithShares: rejects a subset with fewer than 2 shares or mismatched group_public_key" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x76616c6964617465); // "validate"
     const random = prng.random();
@@ -845,7 +860,10 @@ test "signWithShares: gamma_i values that sum to ZERO abort with SigningAborted,
     // ...)`). Rigging `gamma_1 = 1`, `gamma_2 = -1` forces the ALGEBRAIC
     // IDENTITY `delta = k * gamma = k * 0 = 0` exactly — not approximately —
     // so this is a reliable trigger, not a probabilistic one.
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x646567656e657261); // "degenera"
     const setup_random = prng.random();
@@ -901,7 +919,10 @@ test "round-message codecs round-trip" {
 }
 
 test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group secret (self-consistency)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6c6167_72616e6765); // "lagrange"
     const random = prng.random();

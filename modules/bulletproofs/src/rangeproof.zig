@@ -165,22 +165,24 @@ pub const transcript_domain = "bulletproofs/range-proof/v1";
 /// (distinct from the vector Pedersen commitments `A`/`S`/`T1`/`T2` a
 /// `RangeProof` itself carries). REAL — two scalar multiplications and a
 /// point add, no ZK judgment. `v == 0` or `gamma == 0` correctly yields
-/// (respectively) `gamma*gens.h`/`v*gens.g`/the identity, via
-/// `scalarvec.identity_point` (`Ristretto255.mul` errors on a zero scalar
-/// since the result is the identity element; that error is exactly the
-/// "contributes nothing" case, not a real failure).
+/// (respectively) `gamma*gens.h`/`v*gens.g`/the identity. Both the
+/// committed value and the blinding factor are SECRET, so both
+/// multiplications go through the branch-free `scalarvec.mulCt` (which
+/// returns the identity as a VALUE) rather than `Ristretto255.mul`, whose
+/// `error.IdentityElement` would make the commitment's timing depend on
+/// whether `v`/`gamma` was zero — audit finding F2.
 pub fn commit(gens: Generators, v: [32]u8, gamma: [32]u8) Ristretto255 {
-    const vg = gens.g.mul(v) catch scalarvec.identity_point;
-    const gh = gens.h.mul(gamma) catch scalarvec.identity_point;
+    const vg = scalarvec.mulCt(gens.g, v);
+    const gh = scalarvec.mulCt(gens.h, gamma);
     return vg.add(gh);
 }
 
-/// `p*s`, mapping std's "result is the identity element" error (raised
-/// exactly when `s == 0 mod L`) to the identity element itself — the
-/// same exact-not-approximate convention `commit` above and
-/// `scalarvec.multiScalarMul` already use.
+/// `p*s` via the branch-free constant-time ladder `scalarvec.mulCt`, which
+/// returns the identity element as a VALUE where `Ristretto255.mul` would
+/// raise `error.IdentityElement` (i.e. when `s == 0 mod L`) — no `catch`,
+/// hence no secret-dependent branch on the prove path (audit finding F2).
 fn mulOrIdentity(p: Ristretto255, s: [32]u8) Ristretto255 {
-    return p.mul(s) catch scalarvec.identity_point;
+    return scalarvec.mulCt(p, s);
 }
 
 /// `s^{-1} (mod L)`; `invert(0) == 0` (std's documented behavior), so a
