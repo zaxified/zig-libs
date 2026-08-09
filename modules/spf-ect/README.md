@@ -55,6 +55,17 @@ primary-tree overlap key for the second tree.
 Adjacency is kept sorted by neighbor id, so relaxation order is deterministic
 and a run does not depend on insertion order.
 
+## Node ids are dense, and that is enforced
+
+`Graph` indexes a flat array by `NodeId`, so `ensureNode(id)` materialises every
+id from 0 up to `id`. That is right for a topology numbered `0..n` and wrong for
+an identity mapped 1:1 out of something wide — a 32-bit router id, a hash —
+where `ensureNode(0xDEAD_BEEF)` is not a big graph but a 3.7-billion-element
+allocation from one call. Ids at or above `Graph.max_nodes` (2^20) are therefore
+refused with `error.NodeIdTooLarge`, from `ensureNode`, `addEdge` and `addArc`
+alike, leaving the graph untouched. Hitting it means renumber into a dense
+range, not raise the cap.
+
 ## Directed arcs
 
 `Graph.addArc(from, to, w)` adds one direction; `addEdge(a, b, w)` is exactly

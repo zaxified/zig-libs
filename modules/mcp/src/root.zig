@@ -223,6 +223,17 @@ pub fn writeResultLine(w: *std.Io.Writer, id: ?std.json.Value, raw_result_json: 
 
 /// Append the request id verbatim (re-serialized from its parsed Value).
 /// Null => `null`.
+/// JSON-RPC 2.0 §4: a request `id` "MUST contain a String, Number, or NULL
+/// value if included". `.number_string` is a Number that `std.json` left
+/// unparsed (it appears when `parse_numbers` is off), so it counts. Everything
+/// else — object, array, bool — is not an identifier.
+fn conformingId(v: std.json.Value) bool {
+    return switch (v) {
+        .string, .integer, .float, .number_string, .null => true,
+        .object, .array, .bool => false,
+    };
+}
+
 fn writeId(w: *std.Io.Writer, id: ?std.json.Value) std.Io.Writer.Error!void {
     if (id) |v| {
         try std.json.Stringify.value(v, .{}, w);
@@ -1798,6 +1809,17 @@ pub const Server = struct {
         }
         const obj = root.object;
         const id: ?std.json.Value = obj.get("id"); // absent => notification, no response
+        // JSON-RPC 2.0 §4: `id` MUST be a String, Number or NULL if present.
+        // Anything else — an object, an array, a bool — is not an identifier,
+        // and echoing it back verbatim (which `writeId` will happily do, the
+        // serializer being shape-agnostic) hands a strict client a response it
+        // cannot match against any request it made, or must reject outright.
+        // Checked once, here, so no later path can echo a shape we did not
+        // vet.
+        const id_conforms = if (id) |v| conformingId(v) else true;
+        // §5: when the id cannot be determined, the error response carries a
+        // NULL id. A non-conforming id is exactly that case — we must not
+        // mirror it — so every rejection below answers with null.
 
         const method_v = obj.get("method") orelse {
             // No `method` but an `id` plus `result`/`error` is the CLIENT
@@ -1805,17 +1827,32 @@ pub const Server = struct {
             // it and write nothing: JSON-RPC never responds to a response —
             // answering here would bounce an error back at the client's id
             // forever.
-            if (id != null and (obj.get("result") != null or obj.get("error") != null)) {
+            if (id != null and id_conforms and (obj.get("result") != null or obj.get("error") != null)) {
                 self.deliverResponse(arena, id.?, obj, peer);
                 return;
             }
-            if (id != null) return sendError(arena, out, id, error_code.invalid_request, "Missing method");
+            // A response-shaped message with a non-conforming id correlates to
+            // nothing we ever sent (we only issue conforming ids), and JSON-RPC
+            // forbids answering a response — so it falls through to the
+            // request path below and is refused there, or dropped if id-less.
+            if (id != null) return sendError(
+                arena,
+                out,
+                if (id_conforms) id else null,
+                error_code.invalid_request,
+                if (id_conforms) "Missing method" else "Invalid request id",
+            );
             return;
         };
         if (method_v != .string) {
+            if (!id_conforms) return sendError(arena, out, null, error_code.invalid_request, "Invalid request id");
             if (id != null) return sendError(arena, out, id, error_code.invalid_request, "Invalid method");
             return;
         }
+        // Every remaining path answers with `id`, so the shape gate closes
+        // here — one place, in front of all of them, rather than at each
+        // `writeId` call site.
+        if (!id_conforms) return sendError(arena, out, null, error_code.invalid_request, "Invalid request id");
         const method = method_v.string;
 
         // A request (has `id`) gets exactly one response; a notification (no
@@ -2530,6 +2567,63 @@ test "jsonrpc: string id is echoed with quotes; ping answers {}" {
         \\{"jsonrpc":"2.0","id":7,"result":{}}
         \\
     );
+}
+
+test "jsonrpc: a non-conforming id shape is -32600 with a NULL id, never echoed back" {
+    // JSON-RPC 2.0 §4 allows String | Number | NULL. The serializer will
+    // happily mirror an object or an array, which is what made this worth
+    // checking at the boundary instead of trusting the shape.
+    var s = testServer(null);
+    defer s.deinit();
+    const bad_ids = [_][]const u8{
+        "{}",
+        "{\"a\":1}",
+        "[]",
+        "[1,2]",
+        "true",
+        "false",
+    };
+    inline for (bad_ids) |bad| {
+        // As a request…
+        try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":" ++ bad ++ ",\"method\":\"ping\"}",
+            \\{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request id"}}
+            \\
+        );
+        // …and as a message with no method at all, where the id used to be
+        // echoed verbatim in the "Missing method" error.
+        try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":" ++ bad ++ "}",
+            \\{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request id"}}
+            \\
+        );
+        // …and as a response-shaped message, which must never be answered
+        // with anything that could bounce: it correlates to no request of
+        // ours, so it is refused once, with a null id.
+        try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":" ++ bad ++ ",\"result\":{}}",
+            \\{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request id"}}
+            \\
+        );
+    }
+
+    // The three legal shapes still pass through untouched — this is the half
+    // that fails if the check is written too strictly.
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":\"s-1\",\"method\":\"ping\"}",
+        \\{"jsonrpc":"2.0","id":"s-1","result":{}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":-12,\"method\":\"ping\"}",
+        \\{"jsonrpc":"2.0","id":-12,"result":{}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"ping\"}",
+        \\{"jsonrpc":"2.0","id":1.5,"result":{}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}",
+        \\{"jsonrpc":"2.0","id":null,"result":{}}
+        \\
+    );
+    // A notification (no id at all) is still silent, not an id error.
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}", "");
 }
 
 test "jsonrpc: encode all standard error codes" {

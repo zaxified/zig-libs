@@ -143,10 +143,34 @@ pub const Graph = struct {
         return @intCast(self.adj.items.len);
     }
 
+    /// Ids are DENSE by contract: the node table is a flat array indexed by
+    /// `NodeId`, so `ensureNode(id)` materialises **every** id from 0 to `id`,
+    /// each with its own (empty) adjacency list. That is the right shape for
+    /// the intended caller — a link-state SPF over a topology whose nodes are
+    /// numbered `0..n` — and the wrong shape for an identity mapped 1:1 out of
+    /// something wide (a 32-bit router id, a hash). `ensureNode(0xDEAD_BEEF)`
+    /// on the latter is not a large graph, it is a 3.7-billion-element
+    /// allocation from one call.
+    ///
+    /// `max_nodes` turns that from an OOM into an error. It is not a topology
+    /// limit anyone should be near — it is the line past which the caller has
+    /// clearly mapped ids rather than assigned them, and should be
+    /// renumbering into a dense range instead.
+    pub const max_nodes: u32 = 1 << 20;
+
+    pub const EnsureNodeError = Allocator.Error || error{
+        /// `id >= max_nodes`: see `max_nodes`. Signals a sparse/hashed id
+        /// space, not a big topology.
+        NodeIdTooLarge,
+    };
+
     /// Grow the node table so `id` is a valid node (new nodes start
     /// isolated, no edges). Idempotent — a no-op if `id` already exists.
-    pub fn ensureNode(self: *Graph, id: NodeId) Allocator.Error!void {
+    /// Rejects `id >= max_nodes` (see there) rather than attempting the
+    /// allocation it implies.
+    pub fn ensureNode(self: *Graph, id: NodeId) EnsureNodeError!void {
         if (id < self.nodeCount()) return;
+        if (id >= max_nodes) return error.NodeIdTooLarge;
         const old_len = self.adj.items.len;
         try self.adj.resize(self.gpa, @as(usize, id) + 1);
         for (self.adj.items[old_len..]) |*list| list.* = .empty;
@@ -163,7 +187,7 @@ pub const Graph = struct {
         /// (see `Weight`): a 0-weight edge can yield a predecessor 2-cycle
         /// that makes `Tree.pathTo` loop unbounded.
         ZeroWeight,
-    } || Allocator.Error;
+    } || EnsureNodeError;
 
     /// Add undirected edge `a <-> b` with `weight` (must be `>= 1`) — i.e.
     /// the two arcs `a → b` and `b → a`, both at `weight`. Both endpoints
@@ -1140,4 +1164,33 @@ test "property: disjointness — secondary overlaps primary less than the trivia
     // The graph offers a fully link-disjoint 3rd chain, so a real
     // disjointness-aware tie-break must beat the trivial baseline.
     try testing.expect(overlap < primary_edges.len);
+}
+
+test "ensureNode: a sparse id is rejected instead of allocating the range it implies" {
+    var g = Graph.init(testing.allocator);
+    defer g.deinit();
+
+    // The dense contract still works right up to the line.
+    try g.ensureNode(Graph.max_nodes - 1);
+    try testing.expectEqual(Graph.max_nodes, g.nodeCount());
+
+    // …and one past it is an error, not a 4-billion-element allocation.
+    // Literal arithmetic on the constant, so moving `max_nodes` moves both
+    // sides together while the assertion below pins the value itself.
+    var g2 = Graph.init(testing.allocator);
+    defer g2.deinit();
+    try testing.expectError(error.NodeIdTooLarge, g2.ensureNode(Graph.max_nodes));
+    try testing.expectError(error.NodeIdTooLarge, g2.ensureNode(0xDEAD_BEEF));
+    try testing.expectError(error.NodeIdTooLarge, g2.ensureNode(std.math.maxInt(NodeId)));
+    // A rejected id leaves the graph untouched — no partial growth.
+    try testing.expectEqual(@as(u32, 0), g2.nodeCount());
+
+    // The edge builders inherit the guard (they call `ensureNode` for the
+    // larger endpoint), which is the path an untrusted id actually arrives on.
+    try testing.expectError(error.NodeIdTooLarge, g2.addEdge(0, 0xDEAD_BEEF, 10));
+    try testing.expectError(error.NodeIdTooLarge, g2.addArc(0xDEAD_BEEF, 0, 10));
+    try testing.expectEqual(@as(u32, 0), g2.nodeCount());
+
+    // The cap itself, pinned: a change to it is a deliberate edit here.
+    try testing.expectEqual(@as(u32, 1 << 20), Graph.max_nodes);
 }

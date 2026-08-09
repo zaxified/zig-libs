@@ -15,6 +15,16 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   object `{"<tag>": {...}}` — the union tag *is* the message type on the wire, no separate
   discriminator field needed, even when a payload struct itself contains an inner `enum` field
   (serializes as its tag name, a plain JSON string).
+- **`T` should be fixed-shape.** With structs/enums/ints/slices-of-those, parse cost is already
+  bounded by the frame (`std.json`'s `max_value_len` defaults to the input length) and the type's
+  nesting depth is a compile-time constant. A `T` that embeds a dynamic `std.json.Value` takes its
+  shape from the wire instead: `Value.jsonParse` is iterative so it will not smash the stack, but a
+  1 MiB frame of `[[[[…` still becomes ~1M live containers, and `Value`'s *stringify* IS recursive,
+  so echoing such a value back out would then overflow the stack. `parse` therefore rejects nesting
+  deeper than `default_max_json_depth` (64) with `error.JsonNestingTooDeep` before `std.json` sees
+  the bytes; `parseLimited` takes a caller-chosen cap. The check is one allocation-free,
+  string-aware pass (brackets inside a JSON string are text, not structure) and is a no-op for the
+  fixed-shape case.
 - **`max_frame` is a runtime parameter** (`Limits{ .max_frame = ... }`, default 1 MiB), not a
   compile-time constant, enforced on both `writeFrame` (before touching the writer) and
   `readFrame` (checked against both the announced length and the caller's buffer capacity).

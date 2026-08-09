@@ -66,6 +66,24 @@ const Allocator = std.mem.Allocator;
 /// (enforced at `add` time, so matching never overflows).
 pub const max_params = 16;
 
+/// Upper bound on the number of path segments `matchRec` will descend through.
+/// A path with more segments than this cannot match anything and is refused as
+/// a 404 without recursing further.
+///
+/// This exists so the recursion depth is bounded by THIS module rather than by
+/// whatever the transport in front of it happens to cap a path at. `matchRec`
+/// recurses once per segment, so with only the server's
+/// `http.Server.max_normalized_path` (8 KiB) to stop it, a path of `"/a/a/…"`
+/// drives ~4096 frames — safe on a default 8-16 MiB thread stack, but safe by
+/// an argument that lives in a different module and could be re-tuned there
+/// (or bypassed entirely by a caller invoking `dispatch` directly, which is a
+/// supported use: `Router` does not require `http.Server`).
+///
+/// 256 is far past anything routable: the deepest registered pattern is what
+/// actually decides a match, and a real one is a handful of segments. A path
+/// deeper than this has no pattern to hit.
+pub const max_path_segments = 256;
+
 const method_count = @typeInfo(http.Method).@"enum".fields.len;
 
 // ── the per-request vocabulary ──────────────────────────────────────────────
@@ -689,8 +707,22 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// (used to probe `path ++ "/"` without building the string). Recursion
 /// depth = segment count, bounded by the server's max_header_bytes.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
+    return matchRecDepth(node, rest, extra, params, 0);
+}
+
+fn matchRecDepth(
+    node: *const Node,
+    rest: ?[]const u8,
+    extra: bool,
+    params: *Params,
+    depth: u32,
+) ?*const Node {
+    // Router-owned recursion bound (see `max_path_segments`). A path this deep
+    // cannot match a registered pattern, so refusing it costs nothing and the
+    // frame count stops depending on the transport's path cap.
+    if (depth > max_path_segments) return null;
     const r = rest orelse {
-        if (extra) return matchRec(node, "", false, params);
+        if (extra) return matchRecDepth(node, "", false, params, depth + 1);
         return if (node.hasEndpoint()) node else null;
     };
     var seg = r;
@@ -700,12 +732,12 @@ fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) 
         next = r[i + 1 ..];
     }
     if (node.static.get(seg)) |child| {
-        if (matchRec(child, next, extra, params)) |n| return n;
+        if (matchRecDepth(child, next, extra, params, depth + 1)) |n| return n;
     }
     if (seg.len != 0) if (node.param) |p| {
         const saved = params.len;
         params.push(p.name, seg);
-        if (matchRec(p.node, next, extra, params)) |n| return n;
+        if (matchRecDepth(p.node, next, extra, params, depth + 1)) |n| return n;
         params.len = saved;
     };
     if (node.wildcard) |wc| {
@@ -1507,4 +1539,57 @@ test "integration: router behind http.Server, driven by http.Client" {
         try testing.expectEqual(@as(u16, 405), res.status);
         try testing.expectEqualStrings("GET, HEAD", res.header("allow").?);
     }
+}
+
+test "match depth is bounded by the router, not by whatever caps the path upstream" {
+    // Audit finding router-F1: `matchRec` recurses once per segment and the
+    // only thing that stopped it was `http.Server.max_normalized_path` (8 KiB)
+    // — a bound in a different module, which a caller driving the router
+    // directly (a supported use; `Router` does not require `http.Server`) never
+    // passes through at all. The bound is now the router's own, so this test
+    // goes at `matchRec` rather than through the wire: the point is precisely
+    // that it holds without a server in front.
+    const gpa = testing.allocator;
+    var r = Router.init(gpa);
+    defer r.deinit();
+
+    // Two registered routes: one exactly AT the depth limit, one just past it.
+    // Both are perfectly well-formed patterns — the second is refused at match
+    // time by the cap, not by `add`.
+    var at_limit: std.ArrayList(u8) = .empty;
+    defer at_limit.deinit(gpa);
+    for (0..max_path_segments) |_| try at_limit.appendSlice(gpa, "/a");
+    var past_limit: std.ArrayList(u8) = .empty;
+    defer past_limit.deinit(gpa);
+    try past_limit.appendSlice(gpa, at_limit.items);
+    try past_limit.appendSlice(gpa, "/a");
+
+    try r.get(at_limit.items, hRoot);
+    try r.get(past_limit.items, hHello);
+
+    // At the limit: matched.
+    {
+        var params: Params = .{};
+        try testing.expect(matchRec(&r.root, at_limit.items[1..], false, &params) != null);
+    }
+    // One segment deeper: refused, even though the pattern is registered and
+    // the path is its exact spelling. Without the cap this returns the node.
+    {
+        var params: Params = .{};
+        try testing.expectEqual(
+            @as(?*const Node, null),
+            matchRec(&r.root, past_limit.items[1..], false, &params),
+        );
+    }
+    // Depth is the only thing being refused: ordinary routes still match, so
+    // the cap cannot have been set somewhere that breaks real routing.
+    try r.get("/hello", hHello);
+    try r.get("/users/:id", hUser);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire("GET", "/hello"), &buf)));
+    try testing.expectEqualStrings("user=42", bodyOf(runWire(&r, wire("GET", "/users/42"), &buf)));
+
+    // The value itself, pinned — every assertion above is written in terms of
+    // `max_path_segments`, so this is what stops the constant drifting.
+    try testing.expectEqual(@as(usize, 256), max_path_segments);
 }

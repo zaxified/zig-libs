@@ -361,6 +361,7 @@ test {
     _ = @import("engine_test.zig");
     _ = @import("corpus.zig");
     _ = @import("golden_test.zig");
+    _ = @import("bench.zig");
     _ = @import("reference_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("loader.zig");

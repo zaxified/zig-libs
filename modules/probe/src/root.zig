@@ -183,6 +183,33 @@ pub const Options = struct {
 /// Hard cap on repetitions per target, independent of `Options.count`.
 pub const max_repetitions: u16 = 4096;
 
+/// Hard ceiling on the workers `probeMany` will use, independent of
+/// `Options.max_concurrent` — same shape as `max_repetitions`, and for the
+/// same reason: a knob a caller can set to anything should not be the only
+/// thing standing between the module and its resource use.
+///
+/// Without it, `max_concurrent` sized the helper-thread count directly, so an
+/// aggressive config (a large `max_concurrent` over a target list up to
+/// `max_targets` = 65 536) asked the OS for tens of thousands of threads. It
+/// never crashed — a failed `Thread.spawn` breaks the loop and the remainder
+/// runs inline, and in-flight connects stayed bounded either way — but
+/// "degrades gracefully once the OS says no" is a different property from
+/// "never asks".
+///
+/// `max_concurrent` therefore remains an upper bound on connects in flight,
+/// now clamped by this one: past 256 workers a probe sweep is limited by the
+/// network and the peer, not by local parallelism.
+pub const max_workers: u32 = 256;
+
+/// Total workers (calling thread included) `probeMany` uses for `targets`
+/// targets at `max_concurrent`. Split out as a pure function so the three
+/// bounds it composes — the caller's knob, this module's ceiling, and "never
+/// more workers than targets" — are testable without spawning anything.
+pub fn workerCount(max_concurrent: u32, targets: usize) usize {
+    const requested: usize = @min(@as(usize, max_concurrent), @as(usize, max_workers));
+    return @max(1, @min(requested, targets));
+}
+
 pub const ManyError = error{ TooManyTargets, OutOfMemory };
 
 fn effectiveCount(opts: Options) u16 {
@@ -291,8 +318,9 @@ fn runFanout(gpa: Allocator, results: []TargetResult, opts: Options) void {
     var ctx: FanCtx = .{ .results = results, .opts = opts, .next = &next };
 
     // At most `max_concurrent` connects in flight = the calling thread plus
-    // `max_concurrent - 1` helpers, never more workers than targets.
-    const total: usize = @max(1, @min(@as(usize, opts.max_concurrent), n));
+    // `max_concurrent - 1` helpers, never more workers than targets, and never
+    // more than `max_workers` no matter what the caller asked for.
+    const total: usize = workerCount(opts.max_concurrent, n);
     const helpers = total - 1;
     if (helpers == 0) {
         runInline(&ctx);
@@ -412,6 +440,18 @@ const FakeConnector = struct {
     /// Busy-spin count inside connect to widen the overlap window so the
     /// concurrency assertion is meaningful with real threads.
     spins: usize = 20_000,
+    /// When non-zero, hold inside `connect` until this many calls are in
+    /// flight at once (or the budget below runs out). Turns "the threads
+    /// happened to overlap" into "every worker that exists is inside connect
+    /// together", which is what makes an upper-bound assertion on
+    /// `max_in_flight` able to FAIL when the bound is not enforced. Without
+    /// it, spawn latency (~10 us/thread) outruns a fixed spin and the early
+    /// workers finish before the late ones start — verified: a fault-injected
+    /// `runFanout` that ignored the ceiling still passed.
+    hold_until_in_flight: u32 = 0,
+    /// Spin budget for the hold above, so a bound that IS enforced (and can
+    /// therefore never reach the target) still terminates.
+    hold_budget: usize = 50_000,
 
     fn connector(self: *FakeConnector) Connector {
         return .{ .ctx = self, .connectFn = connectImpl };
@@ -424,6 +464,19 @@ const FakeConnector = struct {
         const cur = self.in_flight.fetchAdd(1, .acq_rel) + 1;
         _ = self.max_in_flight.fetchMax(cur, .acq_rel);
         _ = self.total_calls.fetchAdd(1, .monotonic);
+
+        if (self.hold_until_in_flight != 0) {
+            // YIELD, do not spin: the workers are spawned one at a time by a
+            // thread that needs CPU to finish the loop, and a few hundred
+            // busy-spinning holders starve it — measured, the peak stalled at
+            // 119 of 264 workers and the fault injection below passed.
+            var waited: usize = 0;
+            while (waited < self.hold_budget) : (waited += 1) {
+                if (self.in_flight.load(.acquire) >= self.hold_until_in_flight) break;
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+            _ = self.max_in_flight.fetchMax(self.in_flight.load(.acquire), .acq_rel);
+        }
 
         var i: usize = 0;
         while (i < self.spins) : (i += 1) std.atomic.spinLoopHint();
@@ -622,7 +675,7 @@ test "probeMany over many targets: all returned, order stable, concurrency bound
 }
 
 // Backing storage for per-host single-outcome slices used by the fan-out test.
-var outcome_store: [64]ConnectOutcome = undefined;
+var outcome_store: [max_workers + 8]ConnectOutcome = undefined;
 fn outcomes_slot(i: usize, o: ConnectOutcome) []const ConnectOutcome {
     outcome_store[i] = o;
     return outcome_store[i .. i + 1];
@@ -693,4 +746,85 @@ test "LiveConnector.overBudget: a slow success is a timeout, not an up" {
 
     // A zero budget means "no budget", not "everything times out".
     try testing.expectEqual(Status.up, LiveConnector.overBudget(30 * std.time.ns_per_s, 0).status);
+}
+
+test "worker count is bounded by the module, not only by the caller's knob" {
+    // Audit finding probe-F1: helper threads were sized straight from
+    // `Options.max_concurrent`, so an aggressive config over a `max_targets`
+    // list asked the OS for tens of thousands of spawns. It degraded
+    // gracefully (spawn failure → run inline), but nothing stopped it asking.
+    //
+    // Three bounds compose here, and each is pinned separately because each
+    // has its own failure mode: the caller's knob (too many workers), the
+    // target count (idle workers), and this module's ceiling (the finding).
+
+    // The caller's knob decides while it is below the ceiling…
+    try testing.expectEqual(@as(usize, 1), workerCount(1, 1000));
+    try testing.expectEqual(@as(usize, 16), workerCount(16, 1000)); // the default
+    try testing.expectEqual(@as(usize, 255), workerCount(255, 1000));
+    // …and stops deciding at it. Literal values on both sides of the boundary.
+    try testing.expectEqual(@as(usize, 256), workerCount(256, 1000));
+    try testing.expectEqual(@as(usize, 256), workerCount(257, 1000));
+    try testing.expectEqual(@as(usize, 256), workerCount(65_536, 100_000));
+    try testing.expectEqual(
+        @as(usize, 256),
+        workerCount(std.math.maxInt(u32), std.math.maxInt(usize)),
+    );
+    // Never more workers than there is work…
+    try testing.expectEqual(@as(usize, 3), workerCount(1000, 3));
+    try testing.expectEqual(@as(usize, 1), workerCount(1000, 1));
+    // …and never fewer than the calling thread, even for a degenerate config.
+    try testing.expectEqual(@as(usize, 1), workerCount(0, 10));
+    try testing.expectEqual(@as(usize, 1), workerCount(0, 0));
+
+    // The ceiling itself, pinned — every assertion above is written against
+    // this value, so this is what stops it drifting.
+    try testing.expectEqual(@as(u32, 256), max_workers);
+    // It must sit under `max_targets`, or it would never bind on a real sweep.
+    try testing.expect(@as(usize, max_workers) < (Options{ .connector = undefined }).max_targets);
+}
+
+test "probeMany honors the ceiling end to end, not just in the arithmetic" {
+    // The same claim through the real fanout: a caller asking for far more
+    // concurrency than the module allows gets the module's number, and every
+    // target is still probed exactly once.
+    //
+    // The target count deliberately EXCEEDS `max_workers`. At n < max_workers
+    // the "never more workers than targets" bound already caps the fanout, so
+    // a `runFanout` that computed its own count and skipped the ceiling would
+    // pass — that exact fault injection was run and did pass, which is why the
+    // list is this long.
+    const n = max_workers + 8;
+    var targets: [n]Target = undefined;
+    var scripts: [n]FakeConnector.Script = undefined;
+    var host_bufs: [n][16]u8 = undefined;
+    for (0..n) |i| {
+        const host = std.fmt.bufPrint(&host_bufs[i], "c{d}", .{i}) catch unreachable;
+        scripts[i] = .{ .host = host, .outcomes = outcomes_slot(i, .{ .status = .up, .rtt_ns = 1 }) };
+        targets[i] = .{ .host = host, .port = 80 };
+    }
+
+    // Hold every call inside `connect` until one MORE than the ceiling is in
+    // flight. Correct code can never reach that (only `max_workers` workers
+    // exist), so the hold falls through its budget; code that ignored the
+    // ceiling has `n` workers, they all pile up, and `max_in_flight` blows
+    // past the bound asserted below.
+    var fake: FakeConnector = .{
+        .scripts = &scripts,
+        .spins = 0,
+        .hold_until_in_flight = max_workers + 1,
+    };
+    const results = try probeMany(testing.allocator, &targets, .{
+        .connector = fake.connector(),
+        .count = 1,
+        .max_concurrent = 100_000, // absurd on purpose
+    });
+    defer freeResults(testing.allocator, results);
+
+    try testing.expectEqual(@as(usize, n), results.len);
+    try testing.expectEqual(@as(u32, n), fake.total_calls.load(.acquire));
+    // In flight never exceeded what the module permits, even though both the
+    // caller's knob (100 000) and the target count are far above it.
+    try testing.expect(fake.max_in_flight.load(.acquire) <= max_workers);
+    try testing.expect(fake.max_in_flight.load(.acquire) >= 1);
 }

@@ -165,11 +165,18 @@ no peer is present.
   tests against element sizes and bit positions taken from the standard's documented layouts, not
   against third-party bytes.
 - The **k/w and t0..t3 behaviour** past what item 5 above exercises is still validated against the
-  standard's description with an injected clock, not against a third-party stack's timing. The live
-  runs exercise `STARTDT`/`STOPDT`, `TESTFR` and the acknowledgement cadence in passing, but **no
-  test drives a real peer to an actual t1 (acknowledgement) timeout** — that half of F6 is still
-  open. The 32768-frame sequence-number rollover itself is no longer in this category: item 5 above
-  closes it against a real `lib60870-C` outstation.
+  standard's description with an injected clock, not against a third-party stack's timing —
+  **except t1, which is no longer in this category**. A real `c104` 2.2.1 / `lib60870-C`
+  controlling station was driven to an ACTUAL t1 expiry against a deliberately silent endpoint of
+  ours: with its I-frame left unacknowledged it tore the link down 15.03 s later, on a stack whose
+  t1 is 15 s (`goldens.zig`, "the t1 half of F6"). The 32768-frame sequence-number rollover is
+  likewise closed against a real `lib60870-C` outstation by item 5 above.
+  ⚠ That run also found a **semantic divergence worth knowing about**: `lib60870-C` does not arm t1
+  on an outstanding `STARTDT act` — left unconfirmed, it waited t3 (20 s), sent `TESTFR act`, and
+  died 15 s after *that* (35.06 s total). This module arms t1 on any U-format *act*, `STARTDT`
+  included, so it hangs up 20 s earlier in that scenario. Both fit §5.5's "time-out of send or test
+  APDUs"; ours is the stricter reading, it is one-way, and it changes no frame on the wire. The
+  measurements and the captured frames are pinned in `goldens.zig`.
 - `tshark` is **not** installed in this environment, so the `104apci`/`104asdu` dissector
   cross-check named in the task was not run. It was not needed: `c104.explain_bytes` (a lib60870
   decoder) served the same purpose, and the goldens came from a real capture rather than being

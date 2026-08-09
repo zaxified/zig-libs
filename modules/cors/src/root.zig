@@ -681,6 +681,66 @@ test "actual: allowed list origin → echo + Vary: Origin; credentials + exposed
     try testing.expect(flag.hit); // handler ran (next was called)
 }
 
+/// Handler that overwrites `Vary` with its own single value — the exact shape
+/// F2 (audit 2026-08-06) describes.
+fn hVaryClobber(ctx: *router.Ctx) anyerror!void {
+    try ctx.res.setHeader("Vary", "Accept-Encoding");
+    try ctx.res.writeAll("ok");
+}
+
+/// The same handler written the safe way: it keeps `Origin` in the list.
+fn hVaryMerged(ctx: *router.Ctx) anyerror!void {
+    try ctx.res.setHeader("Vary", "Accept-Encoding, Origin");
+    try ctx.res.writeAll("ok");
+}
+
+test "actual: a handler's own Vary CLOBBERS Vary: Origin — pinned, and the safe shape beside it" {
+    // This is audit finding F2, pinned rather than fixed: `http`'s
+    // `ResponseWriter` has no append-or-read primitive for response headers
+    // (`setHeader` replaces by case-insensitive name, `addSetCookie` is the one
+    // append path and is Set-Cookie-specific, and nothing can read a header
+    // back), so `cors` CANNOT merge — not before `next` (the handler has not
+    // written yet) and not after it (it cannot see what the handler set, and by
+    // then the head is usually on the wire). Making it fixable is an `http` API
+    // change, deliberately out of this module.
+    //
+    // Why it matters enough to pin: the response still carries a PER-ORIGIN
+    // `Access-Control-Allow-Origin`, so a shared cache that keys only on the
+    // remaining `Vary` list can hand one origin's ACAO to another origin's
+    // request. This test is the tripwire — the day `http` grows an append, the
+    // first assertion below is what has to be flipped, on purpose.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+    });
+    defer c.deinit();
+
+    var buf: [2048]u8 = undefined;
+    { // the hazard
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(c.middleware());
+        try r.get("/t", hVaryClobber);
+        const got = runWire(&r, wire("GET", "/t", "Origin: https://app.example\r\n"), &buf);
+        try expectStatus(got, "200");
+        // The per-origin echo ships…
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        // …but its Vary does not: exactly one Vary header, and Origin is not in it.
+        try expectHeaderLine(got, "Vary: Accept-Encoding");
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\r\nVary: "));
+        try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, got, "\r\nVary: Origin\r\n"));
+    }
+    { // the shape the README tells such a handler to use instead
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(c.middleware());
+        try r.get("/t", hVaryMerged);
+        const got = runWire(&r, wire("GET", "/t", "Origin: https://app.example\r\n"), &buf);
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectHeaderLine(got, "Vary: Accept-Encoding, Origin");
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\r\nVary: "));
+    }
+}
+
 test "actual: .any emits literal * and no Vary; no credentials header unless enabled" {
     var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .any });
     defer c.deinit();

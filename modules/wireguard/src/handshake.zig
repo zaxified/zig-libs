@@ -3,6 +3,9 @@
 //! message wire layouts (`MessageInitiation`/`MessageResponse`/`CookieReply`/
 //! `MessageTransport`) and the `Handshake` state machine that produces and
 //! consumes them, ending in a split pair of transport data-plane keys.
+//! Plus the cookie/mac2 layer (whitepaper 5.4.7): `CookieChecker.admit` is
+//! the responder's cheap under-load gate in FRONT of that state machine, and
+//! `PeerCookie` the initiator's side of the same round trip.
 //!
 //! This is the DATA-PLANE crypto handshake — distinct from (and independent
 //! of) `../src/root.zig` (plus the `genetlink` module it builds on), which
@@ -249,6 +252,16 @@ pub const Handshake = struct {
     /// `receiver_index` on our replies / all transport packets to them).
     remote_index: u32 = 0,
 
+    /// The cookie most recently learned from this peer's `CookieReply`, or
+    /// null when we hold none that is still fresh — which is the normal
+    /// steady state, since cookies only ever appear when the peer is under
+    /// load. Set it from `PeerCookie.current(now_s)` before
+    /// `createInitiation`/`createResponse`: non-null stamps a real `mac2`
+    /// into the message we build, null stamps the protocol's all-zero mac2.
+    /// Kept as a plain value (not a `*PeerCookie`) so this struct stays
+    /// clock-free — freshness is `PeerCookie`'s job.
+    cookie: ?noise.Mac = null,
+
     /// The initiator's decrypted TAI64N timestamp, recorded by
     /// `consumeInitiation` so the caller can do the required per-peer
     /// most-recent-handshake bookkeeping (this module keeps no cross-attempt
@@ -385,7 +398,7 @@ pub const Handshake = struct {
         std.crypto.secureZero(u8, &st.ck);
 
         msg.mac1 = self.computeMac1(std.mem.asBytes(&msg)[0..@offsetOf(MessageInitiation, "mac1")]);
-        msg.mac2 = @splat(0);
+        msg.mac2 = self.stampMac2(std.mem.asBytes(&msg)[0..@offsetOf(MessageInitiation, "mac2")]);
         self.state = .initiation_sent;
         return msg;
     }
@@ -397,6 +410,14 @@ pub const Handshake = struct {
     /// The caller is responsible for looking up which configured peer
     /// `remote_static_public` (decrypted here) belongs to, and for
     /// last-handshake/timestamp bookkeeping across repeated attempts.
+    ///
+    /// This is the EXPENSIVE path (one X25519 before anything can be
+    /// rejected as forged), and it deliberately does not check mac2: mac2 is
+    /// a MAC over the sender's source ADDRESS, which a `Handshake` never
+    /// sees. Under load, run `CookieChecker.admit` on the raw datagram first
+    /// — it checks mac1 and mac2 and answers with a `CookieReply` without
+    /// constructing a `Handshake` at all, which is the only ordering in which
+    /// the cookie layer actually sheds a flood.
     pub fn consumeInitiation(self: *Handshake, msg: MessageInitiation) ConsumeInitiationError!void {
         std.debug.assert(self.state == .idle); // one attempt per Handshake
 
@@ -515,7 +536,7 @@ pub const Handshake = struct {
         noise.mixHash(&self.hash, &msg.encrypted_nothing);
 
         msg.mac1 = self.computeMac1(std.mem.asBytes(&msg)[0..@offsetOf(MessageResponse, "mac1")]);
-        msg.mac2 = @splat(0);
+        msg.mac2 = self.stampMac2(std.mem.asBytes(&msg)[0..@offsetOf(MessageResponse, "mac2")]);
         self.state = .complete;
         return msg;
     }
@@ -636,6 +657,356 @@ pub const Handshake = struct {
     ) noise.Mac {
         _ = self;
         return noise.keyedMac(&cookie, msg_bytes_before_mac2);
+    }
+
+    /// The mac2 field of a message we are building: `computeMac2` under the
+    /// cookie held in `self.cookie`, or the protocol's all-zero mac2 when we
+    /// hold none. This is the ONE place the two cases are decided, so no
+    /// message-building path can forget either half.
+    fn stampMac2(self: *const Handshake, msg_bytes_before_mac2: []const u8) noise.Mac {
+        const cookie = self.cookie orelse return @splat(0);
+        return self.computeMac2(msg_bytes_before_mac2, cookie);
+    }
+};
+
+// ── cookie / mac2: the under-load DoS mitigation (whitepaper 5.4.7) ────────
+//
+// mac1 alone is not a DoS defense: its key is `HASH(LABEL_MAC1 ||
+// responder_static_public)`, derived from a PUBLIC value, so anyone who knows
+// the responder's public key can forge a mac1-passing initiation from a
+// spoofed source address and make the responder spend an X25519 plus two AEAD
+// opens on it. The cookie layer is what turns that into a round-trip
+// requirement: a loaded responder answers with a `CookieReply` carrying
+// `cookie = MAC(Rm, Am)` — a MAC of the SOURCE ADDRESS under a secret that
+// rotates every two minutes — and thereafter only accepts messages from that
+// address whose `mac2` proves possession of the cookie. A spoofed source never
+// receives the reply, so it can never produce the mac2.
+//
+// Two pieces of state, one per role:
+//   * `CookieChecker` — responder side: the rotating secret `Rm`, mac2
+//     validation, and cookie-reply generation.
+//   * `PeerCookie` — initiator side: the cookie learned from a peer's reply
+//     and how long it stays usable.
+// Neither reads a clock or a socket: the caller passes `now_s` (seconds, any
+// monotonic epoch) and the opaque source-address bytes, matching this module's
+// standing rule that its codecs are pure functions over bytes.
+
+/// The responder's cookie secret `Rm` "changes every two minutes" (5.4.7).
+pub const cookie_secret_lifetime_s: u64 = 120;
+/// …and a cookie is derived from that secret, so an initiator must stop using
+/// one after the same two minutes: past that the responder has (or is about to
+/// have) rotated `Rm` and the mac2 would simply be rejected.
+pub const cookie_lifetime_s: u64 = 120;
+
+/// The three regions of a handshake message the cookie layer works on, plus
+/// the two MACs already in it. Slices borrow the caller's buffer.
+pub const MacFields = struct {
+    /// `msg.sender_index` — echoed as the cookie reply's `receiver_index`.
+    sender_index: u32,
+    /// `msg[0 .. offsetof(msg.mac1)]` — what mac1 is computed over.
+    mac1_input: []const u8,
+    /// `msg[0 .. offsetof(msg.mac2)]` — what mac2 is computed over (mac1
+    /// included: mac2 covers the whole message before itself).
+    mac2_input: []const u8,
+    /// The mac1 carried by the message. Doubles as the associated data of a
+    /// cookie reply sent in answer to it.
+    mac1: noise.Mac,
+    /// The mac2 carried by the message (all-zero when the sender held no cookie).
+    mac2: noise.Mac,
+};
+
+pub const MacFieldsError = error{
+    /// Not a type-1/type-2 handshake message of the exact protocol length —
+    /// nothing the cookie layer has any business MACing.
+    NotAHandshakeMessage,
+};
+
+comptime {
+    // `macFields` below indexes both message types by the same rule (indices
+    // at 4, the two MACs as the trailing 32 bytes). Assert that rather than
+    // trust it, so a field reorder fails the build instead of MACing garbage.
+    std.debug.assert(@offsetOf(MessageInitiation, "sender_index") == 4);
+    std.debug.assert(@offsetOf(MessageResponse, "sender_index") == 4);
+    std.debug.assert(@offsetOf(MessageInitiation, "mac1") == @sizeOf(MessageInitiation) - 32);
+    std.debug.assert(@offsetOf(MessageResponse, "mac1") == @sizeOf(MessageResponse) - 32);
+    std.debug.assert(@offsetOf(MessageInitiation, "mac2") == @sizeOf(MessageInitiation) - 16);
+    std.debug.assert(@offsetOf(MessageResponse, "mac2") == @sizeOf(MessageResponse) - 16);
+}
+
+/// Locate the mac1/mac2 regions of a raw handshake datagram, rejecting
+/// anything that is not exactly a `MessageInitiation` or `MessageResponse`.
+/// Length is checked against the type tag (not merely `>= 32`) so a truncated
+/// or oversized datagram is dropped before any MAC is computed over it.
+pub fn macFields(msg_bytes: []const u8) MacFieldsError!MacFields {
+    if (msg_bytes.len < 8) return error.NotAHandshakeMessage;
+    const wire_len: usize = switch (@as(MessageType, @enumFromInt(
+        std.mem.readInt(u32, msg_bytes[0..4], .little),
+    ))) {
+        .handshake_initiation => @sizeOf(MessageInitiation),
+        .handshake_response => @sizeOf(MessageResponse),
+        else => return error.NotAHandshakeMessage,
+    };
+    if (msg_bytes.len != wire_len) return error.NotAHandshakeMessage;
+    return .{
+        .sender_index = std.mem.readInt(u32, msg_bytes[4..8], .little),
+        .mac1_input = msg_bytes[0 .. wire_len - 32],
+        .mac2_input = msg_bytes[0 .. wire_len - 16],
+        .mac1 = msg_bytes[wire_len - 32 ..][0..16].*,
+        .mac2 = msg_bytes[wire_len - 16 ..][0..16].*,
+    };
+}
+
+/// What a responder should do with an inbound handshake datagram, decided
+/// before any Diffie-Hellman happens — the whole point of the layer.
+pub const Admission = union(enum) {
+    /// mac1 is valid and either we are not under load or mac2 checked out:
+    /// go ahead and spend the asymmetric crypto (`Handshake.consumeInitiation`
+    /// / `consumeResponse`).
+    accept,
+    /// Under load and the sender has no valid cookie for this source address:
+    /// send these 64 bytes back and do NO further work on the datagram.
+    cookie_reply: CookieReply,
+    /// Not a handshake message, or mac1 does not verify: drop silently, as
+    /// WireGuard's design requires (never answer an unauthenticated packet
+    /// with anything but a cookie reply).
+    drop,
+};
+
+/// Responder-side cookie state — one per local device (it is keyed on OUR
+/// static public key, not on any peer's), shared across every peer and every
+/// in-flight handshake.
+pub const CookieChecker = struct {
+    /// `HASH(LABEL_MAC1 || our_static_public)` — precomputed mac1 key for
+    /// messages addressed to us.
+    mac1_key: noise.HandshakeHash,
+    /// `HASH(LABEL_COOKIE || our_static_public)` — the XAEAD key our cookie
+    /// replies are encrypted under. Derived from a public value by design:
+    /// the reply is meant to be readable by whoever actually received it, and
+    /// its authentication comes from the associated data (the mac1 of the
+    /// message being answered), which only someone on the path or the genuine
+    /// sender knows.
+    cookie_key: noise.HandshakeHash,
+    /// `Rm` — the rotating secret every cookie is MACed under. Secret: wipe
+    /// with `wipe()` when discarding the checker.
+    secret: [32]u8,
+    /// When `secret` was generated, in the caller's `now_s` epoch.
+    secret_born_s: u64,
+
+    /// Fresh checker with a random `Rm`.
+    pub fn init(our_static_public: PublicKey, io: std.Io, now_s: u64) CookieChecker {
+        var self = initWithSecret(our_static_public, undefined, now_s);
+        io.random(&self.secret);
+        return self;
+    }
+
+    /// Deterministic-test seam: a checker with a caller-chosen `Rm`. Use
+    /// `init` in production — a predictable secret makes every cookie
+    /// forgeable, which is the whole security of this layer.
+    pub fn initWithSecret(our_static_public: PublicKey, secret: [32]u8, now_s: u64) CookieChecker {
+        return .{
+            .mac1_key = noise.mac1Key(our_static_public),
+            .cookie_key = noise.cookieKey(our_static_public),
+            .secret = secret,
+            .secret_born_s = now_s,
+        };
+    }
+
+    /// Wipe `Rm`. Every cookie issued under it stops verifying.
+    pub fn wipe(self: *CookieChecker) void {
+        std.crypto.secureZero(u8, &self.secret);
+        self.secret_born_s = 0;
+    }
+
+    /// Roll `Rm` once it has lived `cookie_secret_lifetime_s`, which is what
+    /// bounds a stolen cookie's usefulness. A clock that moved BACKWARDS also
+    /// rolls it: extending a secret's life on a bad timestamp is the one
+    /// failure mode worth avoiding here, and re-rolling only costs the peers
+    /// one extra round trip.
+    pub fn refresh(self: *CookieChecker, io: std.Io, now_s: u64) void {
+        if (now_s >= self.secret_born_s and
+            now_s - self.secret_born_s < cookie_secret_lifetime_s) return;
+        io.random(&self.secret);
+        self.secret_born_s = now_s;
+    }
+
+    /// `cookie = MAC(Rm, Am)` for one source address, rotating `Rm` first if
+    /// it is due. `source_address` is opaque to this module — whatever stable
+    /// encoding of the peer's address the caller uses (e.g. 4-or-16 IP bytes
+    /// plus the 2 port bytes). It only has to be the SAME bytes when the
+    /// cookie is issued and when a later mac2 is checked; anything that varies
+    /// per packet would issue cookies that can never be used.
+    pub fn cookieFor(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        source_address: []const u8,
+    ) noise.Mac {
+        self.refresh(io, now_s);
+        return noise.keyedMac(&self.secret, source_address);
+    }
+
+    /// Constant-time mac1 check — the cheap "is this even addressed to us"
+    /// filter that runs before everything else.
+    pub fn checkMac1(self: *const CookieChecker, f: MacFields) bool {
+        const expected = noise.keyedMac(&self.mac1_key, f.mac1_input);
+        return std.crypto.timing_safe.eql(noise.Mac, expected, f.mac1);
+    }
+
+    /// Constant-time mac2 check against the cookie this source address would
+    /// currently be issued. An all-zero mac2 (the sender holds no cookie)
+    /// simply fails to match, which is exactly the desired outcome.
+    pub fn checkMac2(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        f: MacFields,
+        source_address: []const u8,
+    ) bool {
+        const cookie = self.cookieFor(io, now_s, source_address);
+        const expected = noise.keyedMac(&cookie, f.mac2_input);
+        return std.crypto.timing_safe.eql(noise.Mac, expected, f.mac2);
+    }
+
+    /// Build the type-3 answer to a message we refuse to work on:
+    /// `encrypted_cookie = XAEAD(cookie_key, nonce, cookie, msg.mac1)` with a
+    /// fresh random nonce (5.4.7).
+    pub fn createReply(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        f: MacFields,
+        source_address: []const u8,
+    ) CookieReply {
+        var nonce: [noise.XAead.nonce_length]u8 = undefined;
+        io.random(&nonce);
+        return self.createReplyWithNonce(io, now_s, f, source_address, nonce);
+    }
+
+    /// Deterministic-test seam for `createReply`. Production callers use
+    /// `createReply`: two replies under one `Rm` with the same nonce leak the
+    /// XOR of their cookies.
+    pub fn createReplyWithNonce(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        f: MacFields,
+        source_address: []const u8,
+        nonce: [noise.XAead.nonce_length]u8,
+    ) CookieReply {
+        const cookie = self.cookieFor(io, now_s, source_address);
+        var reply: CookieReply = .{
+            .type = @intFromEnum(MessageType.cookie_reply),
+            .receiver_index = f.sender_index,
+            .nonce = nonce,
+            .encrypted_cookie = undefined,
+        };
+        noise.XAead.encrypt(
+            reply.encrypted_cookie[0..16],
+            reply.encrypted_cookie[16..32],
+            &cookie,
+            &f.mac1, // associated data — binds the reply to the exact message
+            nonce,
+            self.cookie_key,
+        );
+        return reply;
+    }
+
+    /// The complete inbound decision for one handshake datagram: parse, mac1,
+    /// then (only when `under_load`) mac2, answering with a cookie reply when
+    /// the sender cannot prove a round trip. Runs before any `Handshake`
+    /// exists — that is what makes it a defense rather than a formality, since
+    /// the expensive X25519 lives on the far side of `.accept`.
+    ///
+    /// `under_load` is the caller's policy call (queue depth, handshakes/sec —
+    /// whatever it measures); this module has no view of the socket. Callers
+    /// should additionally rate-limit replies per source address, so that a
+    /// flood cannot turn one 148-byte initiation into one 64-byte reply
+    /// forever.
+    pub fn admit(
+        self: *CookieChecker,
+        io: std.Io,
+        now_s: u64,
+        msg_bytes: []const u8,
+        source_address: []const u8,
+        under_load: bool,
+    ) Admission {
+        const f = macFields(msg_bytes) catch return .drop;
+        if (!self.checkMac1(f)) return .drop;
+        if (!under_load) return .accept;
+        if (self.checkMac2(io, now_s, f, source_address)) return .accept;
+        return .{ .cookie_reply = self.createReply(io, now_s, f, source_address) };
+    }
+};
+
+/// Initiator-side cookie state — one per peer we send handshake messages to
+/// (it is keyed on THAT peer's static public key). Feed `Handshake.cookie`
+/// from `current(now_s)`.
+pub const PeerCookie = struct {
+    /// `HASH(LABEL_COOKIE || peer_static_public)` — the key the peer encrypts
+    /// its cookie replies to us under.
+    cookie_key: noise.HandshakeHash,
+    /// The cookie from the peer's last reply, if any.
+    cookie: ?noise.Mac = null,
+    /// When that cookie arrived, in the caller's `now_s` epoch.
+    cookie_born_s: u64 = 0,
+    /// mac1 of the last handshake message we sent this peer — the associated
+    /// data any cookie reply to it will be authenticated with, so a reply can
+    /// only be consumed by whoever actually saw that message.
+    last_sent_mac1: ?noise.Mac = null,
+
+    pub fn init(peer_static_public: PublicKey) PeerCookie {
+        return .{ .cookie_key = noise.cookieKey(peer_static_public) };
+    }
+
+    /// Record a handshake message we just put on the wire. Call it for every
+    /// initiation/response sent to this peer: without the stored mac1 a reply
+    /// to it cannot be opened.
+    pub fn recordSent(self: *PeerCookie, msg_bytes: []const u8) MacFieldsError!void {
+        self.last_sent_mac1 = (try macFields(msg_bytes)).mac1;
+    }
+
+    pub const ConsumeReplyError = error{
+        /// No `recordSent` since the last consumed reply — nothing this reply
+        /// could be an answer to.
+        NoPendingMessage,
+        /// The XAEAD tag did not verify under `cookie_key` and the stored
+        /// mac1: a reply to some other message, or a forgery by someone who
+        /// never saw ours.
+        DecryptionFailed,
+    };
+
+    /// Decrypt a peer's `CookieReply` and adopt the cookie inside it. Callers
+    /// route the datagram here by its `receiver_index` (our own session index
+    /// on the message we sent). On failure nothing is adopted — a bad reply
+    /// cannot clear a cookie we already hold.
+    pub fn consumeReply(
+        self: *PeerCookie,
+        reply: CookieReply,
+        now_s: u64,
+    ) ConsumeReplyError!void {
+        const aad = self.last_sent_mac1 orelse return error.NoPendingMessage;
+        var cookie: noise.Mac = undefined;
+        noise.XAead.decrypt(
+            &cookie,
+            reply.encrypted_cookie[0..16],
+            reply.encrypted_cookie[16..32].*,
+            &aad,
+            reply.nonce,
+            self.cookie_key,
+        ) catch return error.DecryptionFailed;
+        self.cookie = cookie;
+        self.cookie_born_s = now_s;
+    }
+
+    /// The cookie to stamp into `Handshake.cookie`, or null once it has aged
+    /// past `cookie_lifetime_s` (or the clock moved backwards) — at which
+    /// point the protocol says to go back to an all-zero mac2 rather than send
+    /// one the peer will reject.
+    pub fn current(self: *const PeerCookie, now_s: u64) ?noise.Mac {
+        const cookie = self.cookie orelse return null;
+        if (now_s < self.cookie_born_s) return null;
+        if (now_s - self.cookie_born_s >= cookie_lifetime_s) return null;
+        return cookie;
     }
 };
 
@@ -1070,6 +1441,259 @@ test "call-order errors" {
     var idle = kat.initiator();
     const msg2: MessageResponse = std.mem.zeroes(MessageResponse);
     try testing.expectError(error.NoPendingInitiation, idle.consumeResponse(msg2));
+}
+
+// ── cookie / mac2 KAT (independent reference for whitepaper 5.4.7) ─────────
+//
+// No official cookie test vector is published by the WireGuard project (the
+// same situation as the full handshake above), so this vector was produced by
+// an INDEPENDENT implementation of 5.4.7 — Python `hashlib.blake2s` (keyed,
+// 16-byte parameterised output) for the MACs and libsodium's
+// `crypto_aead_xchacha20poly1305_ietf_encrypt` (via PyNaCl) for the XAEAD —
+// written straight from the protocol description and sharing no code with
+// this file. Its inputs are the ALREADY-ANCHORED KAT initiation above: the
+// generator recomputes that message's mac1 from `LABEL_MAC1 || Sr_pub` and
+// asserts it equals the pinned byte, which is what ties this vector to the
+// same protocol as the rest of the module rather than to our encoder.
+const cookie_kat = struct {
+    /// `Rm`, the responder's rotating secret.
+    const secret = hex("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f");
+    /// The XAEAD nonce (fixed here; random in production).
+    const nonce = hex("a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7");
+    /// `Am` — an opaque source-address blob (192.0.2.33 : 51820).
+    const addr = hex("c0000221ca6c");
+    /// A different source address, for the anti-spoofing assertions.
+    const other_addr = hex("c000020bca6c");
+    /// The responder's static public key (`X25519(sr_priv, base)`).
+    const responder_pub = hex("79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a");
+    /// `HASH(LABEL_COOKIE || Sr_pub)`.
+    const cookie_key = hex("ee8d30ab43585e5d27713eb4488a5f275a6a7e26d5ccf3bbbd6f4b8b53a21975");
+    /// `cookie = MAC(Rm, Am)`.
+    const cookie = hex("c8ee034b61e95b02fd1c9a49446b57d6");
+    /// `MAC(cookie, kat.msg1[0 .. offsetof(mac2)])` — the mac2 the initiator
+    /// stamps on its retry once it holds that cookie.
+    const mac2 = hex("44160b966e907b635f23ae541472f9a1");
+    /// The whole 64-byte type-3 reply, byte for byte.
+    const reply = hex(
+        "0300000011111111a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7" ++
+            "72de0f334caad275e56c278656d0c2a55e2bc097c515e4d2426a1cd7cd15530f",
+    );
+};
+
+fn expectAdmission(actual: Admission, want: std.meta.Tag(Admission)) !void {
+    try testing.expectEqual(want, std.meta.activeTag(actual));
+}
+
+test "KAT: cookie reply and mac2 byte-exact against the independent reference" {
+    const io = std.testing.io;
+
+    // The message being answered is the pinned KAT initiation.
+    const f = try macFields(&kat.msg1);
+    try testing.expectEqual(kat.idx_i, f.sender_index);
+    try testing.expectEqual(@as(usize, 148 - 32), f.mac1_input.len);
+    try testing.expectEqual(@as(usize, 148 - 16), f.mac2_input.len);
+    // The sender held no cookie, so it sent the protocol's all-zero mac2 —
+    // which is exactly the case a loaded responder has to answer.
+    try testing.expectEqual(@as(noise.Mac, @splat(0)), f.mac2);
+
+    const rpub = (try Keypair.fromPrivateKey(kat.sr_priv)).public;
+    try testing.expectEqual(cookie_kat.responder_pub, rpub);
+    try testing.expectEqual(cookie_kat.cookie_key, noise.cookieKey(rpub));
+
+    var checker = CookieChecker.initWithSecret(rpub, cookie_kat.secret, 1_000);
+    try testing.expectEqual(cookie_kat.cookie, checker.cookieFor(io, 1_000, &cookie_kat.addr));
+
+    const reply = checker.createReplyWithNonce(io, 1_000, f, &cookie_kat.addr, cookie_kat.nonce);
+    try testing.expectEqualSlices(u8, &cookie_kat.reply, std.mem.asBytes(&reply));
+
+    // The retry the initiator then sends: identical to the pinned initiation
+    // up to mac2 (the cookie changes nothing inside the Noise transcript) and
+    // carrying the reference's mac2, which the responder accepts.
+    var ini = kat.initiator();
+    ini.cookie = cookie_kat.cookie;
+    const retry = try ini.createInitiation(io, kat.timestamp);
+    try testing.expectEqualSlices(u8, kat.msg1[0 .. 148 - 16], std.mem.asBytes(&retry)[0 .. 148 - 16]);
+    try testing.expectEqual(cookie_kat.mac2, retry.mac2);
+    try testing.expect(checker.checkMac2(
+        io,
+        1_000,
+        try macFields(std.mem.asBytes(&retry)),
+        &cookie_kat.addr,
+    ));
+
+    // Without a cookie the same message still goes out with an all-zero mac2 —
+    // the pre-existing behavior, unchanged.
+    var plain = kat.initiator();
+    const first = try plain.createInitiation(io, kat.timestamp);
+    try testing.expectEqual(@as(noise.Mac, @splat(0)), first.mac2);
+    try testing.expectEqualSlices(u8, &kat.msg1, std.mem.asBytes(&first));
+}
+
+test "cookie reply: our decryptor opens the independent reference's bytes, and is AAD-bound" {
+    var reply: CookieReply = undefined;
+    @memcpy(std.mem.asBytes(&reply), &cookie_kat.reply);
+    try testing.expectEqual(@intFromEnum(MessageType.cookie_reply), reply.type);
+    try testing.expectEqual(kat.idx_i, reply.receiver_index);
+
+    var peer = PeerCookie.init(cookie_kat.responder_pub);
+    // Nothing sent yet → no associated data → nothing this could answer.
+    try testing.expectError(error.NoPendingMessage, peer.consumeReply(reply, 5));
+
+    try peer.recordSent(&kat.msg1);
+    try peer.consumeReply(reply, 5);
+    try testing.expectEqual(cookie_kat.cookie, peer.cookie.?);
+
+    // The reply is bound to the mac1 of the message it answers: replayed
+    // against a different sent message it does not open, and the cookie we
+    // already hold survives the failure.
+    try peer.recordSent(&kat.msg2);
+    try testing.expectError(error.DecryptionFailed, peer.consumeReply(reply, 9));
+    try testing.expectEqual(cookie_kat.cookie, peer.cookie.?);
+    try testing.expectEqual(@as(u64, 5), peer.cookie_born_s);
+
+    // A tampered ciphertext does not open either.
+    try peer.recordSent(&kat.msg1);
+    var bad = reply;
+    bad.encrypted_cookie[0] ^= 1;
+    try testing.expectError(error.DecryptionFailed, peer.consumeReply(bad, 9));
+}
+
+test "admit: a mac1-only flood is shed under load until the cookie round trip completes" {
+    const io = std.testing.io;
+    const rpub = (try Keypair.fromPrivateKey(kat.sr_priv)).public;
+    var checker = CookieChecker.init(rpub, io, 1_000); // random secret, as in production
+    defer checker.wipe();
+
+    var ini = kat.initiator();
+    const msg1 = try ini.createInitiation(io, kat.timestamp);
+    const bytes1 = std.mem.asBytes(&msg1);
+
+    // Not under load: mac1 is all that is asked for (today's behavior).
+    try expectAdmission(checker.admit(io, 1_000, bytes1, &cookie_kat.addr, false), .accept);
+
+    // Under load, mac1 alone buys nothing: the responder answers with 64 bytes
+    // and does zero asymmetric work.
+    const adm = checker.admit(io, 1_000, bytes1, &cookie_kat.addr, true);
+    const reply = switch (adm) {
+        .cookie_reply => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@intFromEnum(MessageType.cookie_reply), reply.type);
+    try testing.expectEqual(kat.idx_i, reply.receiver_index);
+
+    // The genuine initiator — which, unlike a spoofed source, actually
+    // receives the reply — retries with a valid mac2 and is admitted.
+    var peer = PeerCookie.init(rpub);
+    try peer.recordSent(bytes1);
+    try peer.consumeReply(reply, 1_000);
+    var ini2 = kat.initiator();
+    ini2.cookie = peer.current(1_000);
+    try testing.expect(ini2.cookie != null);
+    const retry = try ini2.createInitiation(io, kat.timestamp);
+    const bytes2 = std.mem.asBytes(&retry);
+    try expectAdmission(checker.admit(io, 1_000, bytes2, &cookie_kat.addr, true), .accept);
+
+    // THE anti-spoofing claim: the cookie is a MAC of the source address, so
+    // the very same mac2-bearing message replayed from another address is
+    // still shed.
+    try expectAdmission(
+        checker.admit(io, 1_000, bytes2, &cookie_kat.other_addr, true),
+        .cookie_reply,
+    );
+
+    // Unauthenticated junk is dropped silently, never answered: a bad mac1, a
+    // truncated datagram, and a type we do not MAC.
+    var forged = msg1;
+    forged.mac1[0] ^= 1;
+    try expectAdmission(
+        checker.admit(io, 1_000, std.mem.asBytes(&forged), &cookie_kat.addr, true),
+        .drop,
+    );
+    try expectAdmission(checker.admit(io, 1_000, bytes1[0..100], &cookie_kat.addr, true), .drop);
+    try expectAdmission(
+        checker.admit(io, 1_000, &cookie_kat.reply, &cookie_kat.addr, true),
+        .drop,
+    );
+
+    // A response (type 2) travels the same gate — mac2 is on both message types.
+    var rsp = kat.responder();
+    try rsp.consumeInitiation(msg1);
+    const msg2 = try rsp.createResponse(io);
+    try expectAdmission(
+        checker.admit(io, 1_000, std.mem.asBytes(&msg2), &cookie_kat.addr, false),
+        .drop, // msg2's mac1 is keyed on the INITIATOR's static key, not ours
+    );
+}
+
+test "cookie secret rotates after two minutes, on both sides of the exchange" {
+    const io = std.testing.io;
+    const rpub = cookie_kat.responder_pub;
+
+    // The two-minute figure itself, pinned (whitepaper 5.4.7 "every two
+    // minutes"). The behavioral assertions below use literal seconds, not
+    // these constants, so moving the value goes red here AND there.
+    try testing.expectEqual(@as(u64, 120), cookie_secret_lifetime_s);
+    try testing.expectEqual(@as(u64, 120), cookie_lifetime_s);
+
+    var checker = CookieChecker.initWithSecret(rpub, cookie_kat.secret, 1_000);
+    const at_0 = checker.cookieFor(io, 1_000, &cookie_kat.addr);
+    try testing.expectEqual(cookie_kat.cookie, at_0);
+
+    // 119 s in: same secret, same cookie.
+    try testing.expectEqual(at_0, checker.cookieFor(io, 1_119, &cookie_kat.addr));
+    try testing.expectEqual(cookie_kat.secret, checker.secret);
+
+    // 120 s in: rolled, and every cookie issued under the old secret dies.
+    const at_120 = checker.cookieFor(io, 1_120, &cookie_kat.addr);
+    try testing.expect(!std.mem.eql(u8, &at_0, &at_120));
+    try testing.expect(!std.mem.eql(u8, &cookie_kat.secret, &checker.secret));
+    try testing.expectEqual(@as(u64, 1_120), checker.secret_born_s);
+
+    // A clock that jumps backwards rolls it too, rather than extending its life.
+    const rolled = checker.secret;
+    _ = checker.cookieFor(io, 999, &cookie_kat.addr);
+    try testing.expect(!std.mem.eql(u8, &rolled, &checker.secret));
+
+    // wipe() ends the secret's life immediately.
+    checker.wipe();
+    try testing.expectEqual(@as([32]u8, @splat(0)), checker.secret);
+
+    // Initiator side: the same two minutes bound how long a cookie is stamped.
+    var peer = PeerCookie.init(rpub);
+    peer.cookie = cookie_kat.cookie;
+    peer.cookie_born_s = 1_000;
+    try testing.expectEqual(cookie_kat.cookie, peer.current(1_119).?);
+    try testing.expectEqual(@as(?noise.Mac, null), peer.current(1_120));
+    try testing.expectEqual(@as(?noise.Mac, null), peer.current(999));
+    try testing.expectEqual(@as(?noise.Mac, null), (PeerCookie.init(rpub)).current(1_000));
+}
+
+test "macFields admits exactly the two handshake message shapes" {
+    var buf: [200]u8 = undefined;
+    @memset(&buf, 0);
+
+    // Too short to even hold a type tag and an index.
+    try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..7]));
+    // Right type, wrong length — both directions.
+    @memcpy(buf[0..148], &kat.msg1);
+    try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..147]));
+    try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..149]));
+    _ = try macFields(buf[0..148]);
+    // A response's bytes are 92, not 148: mislabeling either way is rejected.
+    @memcpy(buf[0..92], &kat.msg2);
+    _ = try macFields(buf[0..92]);
+    std.mem.writeInt(u32, buf[0..4], @intFromEnum(MessageType.handshake_initiation), .little);
+    try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..92]));
+    // Types the cookie layer does not MAC.
+    for ([_]u32{ 0, 3, 4, 5, 0xFFFF_FFFF }) |t| {
+        std.mem.writeInt(u32, buf[0..4], t, .little);
+        try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..92]));
+        try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..148]));
+    }
+    // recordSent inherits the same gate rather than storing garbage as a mac1.
+    var peer = PeerCookie.init(cookie_kat.responder_pub);
+    try testing.expectError(error.NotAHandshakeMessage, peer.recordSent(buf[0..64]));
+    try testing.expectEqual(@as(?noise.Mac, null), peer.last_sent_mac1);
 }
 
 // ── integration test (real kernel WireGuard as the protocol oracle) ────────

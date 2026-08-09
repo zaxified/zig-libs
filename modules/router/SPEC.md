@@ -35,6 +35,13 @@ middleware (e.g. an auth layer) points at, not via router state. Handler/middlew
 propagate to `http.Server`, which produces a plain 500 when nothing was sent; the router does not
 catch or classify errors itself.
 
+**Match depth is bounded by this module.** `matchRec` descends one frame per path segment, and
+`max_path_segments` (256) refuses anything deeper — a 404, since nothing that deep is routable.
+The bound used to be inherited from `http.Server.max_normalized_path` (8 KiB, i.e. ~4096 frames for
+`/a/a/…`): safe on a default stack, but by an argument living in another module, and not applying
+at all to a caller driving `Router` directly, which is a supported use. The regression test goes at
+`matchRec` rather than through the wire for exactly that reason.
+
 ## Verification
 
 Offline: the full matrix (matching, precedence, backtracking, params, 404/405 + `Allow`,

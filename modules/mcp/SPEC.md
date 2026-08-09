@@ -9,6 +9,11 @@ the zig-libs authors (MIT).
   followed by one `\n` (raw `\n`/`\r` inside a spliced JSON literal are stripped to preserve the
   one-object-per-line invariant); no `Content-Length` headers. JSON-RPC batch arrays are
   unsupported (MCP does not use them) → -32600.
+- **The `id` shape is validated, not just echoed.** JSON-RPC 2.0 §4 allows String, Number or NULL;
+  an object, array or bool `id` is refused with -32600 and a **NULL** id in the reply (§5: when the
+  id cannot be determined the error carries null). The gate sits once in front of every dispatch
+  path rather than at each `writeId`, because the serializer is shape-agnostic and would mirror any
+  value back — handing a strict client a response it cannot correlate to any request it made.
 - **Protocol surface:** `initialize` (echo the client's requested revision when in
   `supported_versions` = {2025-11-25, 2025-06-18}, else the latest), `notifications/initialized`,
   `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`,

@@ -27,8 +27,15 @@ CORS is a browser-enforced contract, not a server-side access-control mechanism:
 request from executing server-side, only whether a cross-origin script may read the response — must
 not be used as an authorization boundary. Exact-byte origin matching means case/trailing-slash/port
 mismatches silently fail to match (documented, not a bug); normalization is the caller's job. A
-handler that sets `Vary` itself replaces (not merges) the middleware's value. rs/cors's
-`OptionsPassthrough` and `Access-Control-Allow-Private-Network` are out of scope for now.
+handler that sets `Vary` itself replaces (not merges) the middleware's value — unfixable inside this
+module, since `http.Server.ResponseWriter` exposes neither an append (`addSetCookie` is
+Set-Cookie-only) nor a way to read a set response header, so there is nothing to merge WITH, before
+or after `next`. Consequence: the per-origin `Access-Control-Allow-Origin` ships with a `Vary` that
+no longer names `Origin`, which a shared cache can turn into a cross-origin response mix-up; the
+caller-side rule is that a handler setting `Vary` on a CORS route lists `Origin` too. Both the
+hazard and the safe shape are pinned by a test, so an `http` append primitive would arrive with a
+red assertion pointing at the fix. rs/cors's `OptionsPassthrough` and
+`Access-Control-Allow-Private-Network` are out of scope for now.
 
 ## Verification
 `zig build test-cors`. Offline goldens over the socket-free `http.Server.serveStream`:

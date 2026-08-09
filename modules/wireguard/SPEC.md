@@ -89,6 +89,21 @@ Secret material (DH outputs, chaining key, ephemeral privates, KDF scratch) is `
 `consumeResponse` works on copies so a forged response can't corrupt a pending handshake. No `netlink`
 dependency (std.crypto only).
 
+**Cookie / mac2 (whitepaper §5.4.7) — the under-load DoS layer.** mac1 is keyed on
+`HASH(LABEL_MAC1 ‖ responder_static_public)`, a *public* value, so a mac1-passing initiation is
+forgeable from a spoofed source and costs the responder an X25519 plus two AEAD opens. The cookie
+layer turns that into a round-trip requirement and is implemented, not merely declared:
+`CookieChecker` (responder side — the `Rm` secret rotating every 120 s, `checkMac1`/`checkMac2`,
+`createReply`, and the `admit()` gate returning `accept`/`cookie_reply`/`drop` **before** any
+`Handshake` exists, which is what makes it a defense rather than a formality) and `PeerCookie`
+(initiator side — opens the reply, ages the cookie out after 120 s, feeds `Handshake.cookie`, which
+is the single place `mac2` is either stamped or left all-zero). `under_load` and per-source reply
+rate-limiting are the caller's policy: this module sees neither socket nor clock, so `now_s` and the
+opaque `source_address` bytes are passed in. The cookie reply is XChaCha20-Poly1305 (`noise.XAead`,
+**std, deliberately** — `chachapoly` implements RFC 8439 only and the X-variant is a different
+construction; substituting it would be a silent security break, not a speed-up), keyed on
+`HASH(LABEL_COOKIE ‖ responder_static_public)` with the answered message's `mac1` as associated data.
+
 Endianness: the `extern struct` wire layouts match the WireGuard byte layout only on a little-endian
 host (true of every platform this repo currently targets); a big-endian target would need explicit
 `std.mem.readInt`/`writeInt(..., .little)`, the same way `root.zig`'s `parseEndpoint`/`appendEndpoint`
@@ -105,6 +120,13 @@ Initiator↔responder self-consistency (both sides agree the transport-key pair;
 wrong PSK fail closed). A netns-gated **live in-kernel WireGuard interop** test (Linux + euid 0 +
 `unshare -rn` + `ip`/wireguard module) runs a real handshake against the kernel and AEAD-decrypts a
 kernel-sent transport packet under the derived key, including a non-zero PSK.
+The cookie layer has no published vector either, so it is pinned the same way: a second independent
+reference (Python `hashlib.blake2s` keyed at a 16-byte parameterised output + libsodium's
+XChaCha20-Poly1305 via PyNaCl, written from §5.4.7 and sharing no code with this module) fixes the
+64-byte cookie reply, the cookie, and the resulting mac2 byte-exact — and that generator recomputes
+the pinned KAT initiation's own mac1 from `LABEL_MAC1 ‖ Sr_pub` as its cross-check, so the vector is
+tied to the already-anchored handshake rather than to our encoder. The reverse direction is covered
+too: `PeerCookie.consumeReply` opens the foreign implementation's ciphertext.
 
 ## Transport data plane (`transport.zig`)
 

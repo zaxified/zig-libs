@@ -117,12 +117,19 @@ pub const Options = struct {
     reject_asymmetric: bool = false,
 };
 
-/// `computeWith` fails for two reasons only.
+/// `computeWith` fails for three reasons only.
 pub const Error = Allocator.Error || error{
     /// A link was advertised in both directions with **different** metrics,
     /// and `Options.reject_asymmetric` was set. The engine represents this
     /// fine; the caller asked to be told instead. See that option.
     AsymmetricMetric,
+    /// The LSDB advertised more distinct system-ids than `spf.Graph.max_nodes`
+    /// (2^20). Node ids here are assigned densely (`0..node_count`) from the
+    /// sorted id set, so reaching this means the database itself holds over a
+    /// million routers — far past any real IS-IS area, and reachable only by a
+    /// flooded/forged LSDB. Surfaced rather than turned into a multi-gigabyte
+    /// allocation.
+    NodeIdTooLarge,
 };
 
 /// The computed forwarding table — routes sorted ascending by destination
@@ -184,6 +191,13 @@ pub fn compute(gpa: Allocator, db: *const lsdb.Lsdb, local: SystemId, now: Time)
         error.OutOfMemory => error.OutOfMemory,
         // Unreachable by construction: only `reject_asymmetric` raises it.
         error.AsymmetricMetric => unreachable,
+        // Reachable in principle (an LSDB with >2^20 system-ids), and folded
+        // into OOM rather than widening this convenience wrapper's contract:
+        // it IS the allocation refusal it stands for — `spf.Graph` declined to
+        // materialise a node table it could not have completed. Callers that
+        // want to tell the two apart call `computeWith`, whose error set names
+        // it.
+        error.NodeIdTooLarge => error.OutOfMemory,
     };
 }
 
@@ -392,6 +406,11 @@ fn computeInternal(
             // `addDirected`'s clamp. Swallow the structural ones, propagate OOM.
             error.DuplicateEdge, error.SelfLoop, error.ZeroWeight => {},
             error.OutOfMemory => return error.OutOfMemory,
+            // Cannot fire here — `ensureNode(node_count - 1)` above already
+            // admitted the whole id range — but propagated rather than
+            // asserted: `unreachable` is undefined behaviour in ReleaseFast,
+            // and this arm costs nothing.
+            error.NodeIdTooLarge => return error.NodeIdTooLarge,
         };
     }
 

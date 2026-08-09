@@ -96,10 +96,23 @@ pub const Config = struct {
 /// message-mechanics PRNG (see module doc + sim.replay).
 const salt: u64 = 0x5eed_fa17_c0de_9a1b;
 
+pub const ConfigError = error{
+    /// `Config.horizon` is 0, i.e. an empty `[0, horizon)` window to draw
+    /// disruption times from. There is no schedule to generate: every event
+    /// would land at t=0 and every repair at t=1, which is not a churn
+    /// schedule but a rounding artefact. Rejected rather than quietly
+    /// produced — this is the boundary where a zero bound enters, and
+    /// `Prng.below` deliberately does not guess on the caller's behalf.
+    ZeroHorizon,
+};
+
+pub const Error = Allocator.Error || ConfigError;
+
 /// Fuzz a churn-and-recover fault schedule for `seed` over `topo`. Deterministic
 /// in (seed, topo, cfg). The returned trace is sorted by time (stable) and owns
 /// all of its memory.
-pub fn generate(gpa: Allocator, seed: u64, topo: Topo, cfg: Config) Allocator.Error!FaultTrace {
+pub fn generate(gpa: Allocator, seed: u64, topo: Topo, cfg: Config) Error!FaultTrace {
+    if (cfg.horizon == 0) return error.ZeroHorizon;
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -267,4 +280,25 @@ test "generate: a partition cut is always a non-empty proper subset" {
             else => {},
         };
     }
+}
+
+test "config boundary: horizon 0 is rejected, not silently collapsed to t=0" {
+    // The finding (netsim F3): `cfg.horizon` reaches `Prng.below` unchecked, so
+    // a 0 was `assert(n > 0)` in Debug and `next() % 0` — illegal behaviour —
+    // in ReleaseFast. Both halves are covered here: the config boundary now
+    // says no, and `Prng.below` is total in every build (see prng.zig's test).
+    try testing.expectError(
+        error.ZeroHorizon,
+        generate(testing.allocator, 7, sampleTopo(), .{ .horizon = 0 }),
+    );
+    // Nothing else about the config is second-guessed: a horizon of 1 is a
+    // legal, if degenerate, window and still produces a trace.
+    var tr = try generate(testing.allocator, 7, sampleTopo(), .{ .horizon = 1 });
+    defer tr.deinit();
+    for (tr.events) |e| try testing.expect(e.time <= 2); // t in [0,1), repair t+1+[0,1)
+    // `max_events = 0` is a legal "no faults" schedule, so it must NOT be
+    // rejected — the guard is about the time window, not about emptiness.
+    var none = try generate(testing.allocator, 7, sampleTopo(), .{ .max_events = 0 });
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.events.len);
 }

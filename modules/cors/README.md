@@ -108,8 +108,13 @@ greppable opt-in to the footgun.
   (`https://app.example`, `http://localhost:5173`). `HTTPS://APP.EXAMPLE`
   will not match — deliberate, per this module's spec.
 
-Known limitations: a handler that sets `Vary` itself replaces the
-middleware's value (`setHeader` replaces by name); rs/cors's
+Known limitations: a handler that sets `Vary` itself **replaces** the
+middleware's `Vary: Origin` (`http`'s `setHeader` replaces by name and has no
+append-or-read counterpart, so `cors` cannot merge). The response still carries
+a per-origin `Access-Control-Allow-Origin`, so a shared cache keyed on the
+surviving `Vary` list can serve one origin's response to another — **a handler
+that sets `Vary` on a CORS route must include `Origin` in its own list**
+(`Vary: Accept-Encoding, Origin`). Both shapes are pinned by a test; rs/cors's
 `OptionsPassthrough` (let intercepted preflights fall through to your own
 `OPTIONS` routes) and `Access-Control-Allow-Private-Network` are out of
 scope for now.

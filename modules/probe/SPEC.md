@@ -13,7 +13,7 @@ rep counted as loss), `probeMany` (a target list, order-stable). Bounded concurr
 deals work via an atomic next-target counter; the calling thread plus up to `max_concurrent - 1`
 helper threads each own disjoint `TargetResult` slots, so no locking is needed and in-flight
 connects never exceed `max_concurrent`; degrades to inline on one thread if spawning is
-unavailable. Counts bounded (`max_repetitions = 4096`, `max_targets`). Error policy: a malformed
+unavailable, and never spawns more than `max_workers = 256` helpers no matter what `max_concurrent` says — the ceiling is the module's, not the caller's, so an aggressive config over a `max_targets` list cannot ask the OS for tens of thousands of threads (it degraded gracefully when the OS refused, which is a weaker property than never asking). Counts bounded (`max_repetitions = 4096`, `max_workers = 256`, `max_targets`). Error policy: a malformed
 `host:port` is a typed `Target.ParseError` (Go `SplitHostPort` semantics via
 `netaddr.parseHostPort`, port required, `[v6]:port` supported); a DNS/connect failure is an
 `error` `Result`, never a panic. Optional `AppCheck` runs after a handshake and downgrades

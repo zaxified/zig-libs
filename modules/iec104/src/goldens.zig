@@ -778,3 +778,114 @@ test "a real outstation's session replays byte-exact through this module's own C
     // values, not by a hand-picked expected value.
     try testing.expectEqual(@as(apci.Seq, 5), c.recv_seq);
 }
+
+// ── the t1 half of F6: a real peer driven to an ACTUAL acknowledgement
+//    timeout ─────────────────────────────────────────────────────────────────
+//
+// The wrap capture above closed one half of audit finding F6; this closes the
+// other. Until now no test had driven a third-party stack to a real t1
+// expiry — the t1/t2/t3 behaviour was validated only between two instances of
+// this module with an injected clock, i.e. against our own reading of §5.5.
+//
+// Method (2026-08-09): the third-party stack is the ACTIVE side and WE are a
+// deliberately silent APCI endpoint — a bare TCP socket that acknowledges
+// nothing. A conforming controlling station must give up after t1. Two runs,
+// with `c104` 2.2.1 (Fraunhofer FIT's binding over `lib60870-C`) as the
+// client, both at that stack's stock timers (t1 = 15 s, t3 = 20 s):
+//
+//   python3 -c '
+//     # ...accept() on 127.0.0.1:P in a thread, log every APDU, reply only
+//     # with STARTDT con in scenario I, never with an S-format...
+//     import c104
+//     cl = c104.Client(tick_rate_ms=100, command_timeout_ms=1000)
+//     cl.add_connection(ip="127.0.0.1", port=P, init=c104.Init.INTERROGATION)
+//     cl.start()
+//   '
+//
+// Scenario I — we confirm STARTDT, then never acknowledge its I-frame:
+//
+//   t+ 0.00s  U STARTDT act              680407000000
+//   t+ 0.00s  (ours) STARTDT con         68040b000000
+//   t+ 0.00s  I N(S)=0 N(R)=0            680e0000000064010600ffff00000014
+//   t+15.03s  peer closed the connection (FIN)
+//
+// 15.03 s after an unacknowledged I-frame, on a stack whose t1 is 15 s: **t1
+// on an I-frame is confirmed live against a third-party implementation.**
+// That is the assertion F6 asked for and never had.
+//
+// ⚠ Scenario U — we never confirm the STARTDT act at all:
+//
+//   t+ 0.00s  U STARTDT act              680407000000
+//   t+20.03s  U TESTFR act               680443000000
+//   t+35.06s  peer closed the connection (FIN)
+//
+// lib60870-C did **not** arm t1 on its outstanding `STARTDT act`: had it, the
+// link would have died at t+15. It instead sat idle until t3 (20 s), sent
+// `TESTFR act`, and died 15.03 s after THAT — t1 on the test APDU. This
+// module is deliberately STRICTER: `state.Connection` arms t1 on any U-format
+// *act*, `STARTDT`/`STOPDT` included (see `state.zig`'s "t1 expiry on an
+// unconfirmed U-format act closes the connection"). Both readings fit §5.5's
+// "time-out of send or test APDUs" — lib60870 reads "send or test" as
+// I-format and TESTFR only. The divergence is one-way and safe: we drop a
+// link whose STARTDT went unanswered for t1 where lib60870 waits t3+t1, and
+// a peer that cannot confirm STARTDT within 15 s is dead either way. It is
+// NOT a wire-format difference — nothing about the frames changes. Recorded
+// here because an interop surprise ("why did the Zig side hang up during
+// startup?") is exactly what an external anchor is for.
+//
+// `c104` was driven as a black box generating real traffic; no third-party
+// source was read as a design reference (CONVENTIONS §5).
+
+/// The frames the real controlling station put on the wire in the two runs
+/// above, in order. `startdt_con` is the only one WE sent.
+pub const t1_startdt_act = "680407000000";
+pub const t1_startdt_con = "68040b000000";
+pub const t1_interrogation = "680e0000000064010600ffff00000014";
+pub const t1_testfr_act = "680443000000";
+
+/// Seconds from the unacknowledged frame to the peer's FIN, as measured.
+pub const t1_measured_i_frame_s = 15.03;
+pub const t1_measured_testfr_s = 15.03; // 35.06 - 20.03
+/// Seconds the peer sat idle before sending `TESTFR act` — its t3.
+pub const t1_measured_t3_s = 20.03;
+
+test "live-derived: the frames a real controlling station sent before its t1 fired" {
+    var buf: [apci.max_apdu_len]u8 = undefined;
+
+    // The two U-format frames, decoded as this module sees them.
+    try testing.expectEqual(
+        apci.Control{ .u = .startdt_act },
+        (try apci.decode(bytesOf(t1_startdt_act, &buf))).control,
+    );
+    try testing.expectEqual(
+        apci.Control{ .u = .startdt_con },
+        (try apci.decode(bytesOf(t1_startdt_con, &buf))).control,
+    );
+    try testing.expectEqual(
+        apci.Control{ .u = .testfr_act },
+        (try apci.decode(bytesOf(t1_testfr_act, &buf))).control,
+    );
+    // `TESTFR act` is the frame lib60870-C DID arm t1 on, and `STARTDT act`
+    // the one it did not — both are `act`s by our classification, which is
+    // exactly where the two implementations part company.
+    try testing.expect(apci.UFunction.startdt_act.isAct());
+    try testing.expect(apci.UFunction.testfr_act.isAct());
+
+    // The I-frame it never got acknowledged: the very first one on the link,
+    // N(S)=0 / N(R)=0, carrying a general interrogation to the BROADCAST
+    // common address 65535 — a CA no other golden in this file exercises
+    // (the captures above use 47 and 99).
+    const frame = try apci.decode(bytesOf(t1_interrogation, &buf));
+    try testing.expectEqual(apci.Control{ .i = .{ .send_seq = 0, .recv_seq = 0 } }, frame.control);
+    const a = try asdu.decode(frame.asdu, .{});
+    try testing.expectEqual(asdu.TypeId.c_ic_na_1, a.header.type_id);
+    try testing.expectEqual(@as(u16, 65535), a.header.common_address);
+    try testing.expectEqual(asdu.Cot.activation, a.header.cause.cot);
+    try testing.expect(!a.header.cause.negative);
+    try testing.expectEqual(@as(u8, 1), a.header.vsq.count);
+    var it = a.objects();
+    const obj = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 0), obj.ioa);
+    // QOI 20 = station interrogation (global).
+    try testing.expectEqual(@as(u8, 20), @intFromEnum(obj.element.qoi));
+}

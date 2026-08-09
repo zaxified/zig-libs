@@ -132,6 +132,14 @@ pub fn write(entry: Entry, format: Format, w: *std.Io.Writer) std.Io.Writer.Erro
 /// record — no matter what a field contains — stays exactly one line and
 /// one JSON object, provably so by round-tripping it through
 /// `std.json.parseFromSlice` (see the tests).
+///
+/// ⚠ One documented limit on that round trip: RFC 8259 requires a JSON text
+/// to be UTF-8, and a field byte >= 0x20 is passed through verbatim even when
+/// it is not valid UTF-8 (see `writeJsonString`). Such a line keeps every
+/// injection property above but a conforming parser — `std.json` included —
+/// rejects it outright. Fields known to carry arbitrary bytes (request target,
+/// User-Agent) should be UTF-8-sanitized by the caller if the sink must never
+/// drop a record. Pinned by its own test.
 pub fn writeJsonLines(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"ts\":{d},\"remote_addr\":", .{entry.timestamp_ns});
     try writeJsonOptString(w, entry.remote_addr);
@@ -161,7 +169,11 @@ pub fn writeJsonLines(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void 
 /// control byte as `\u00XX`. Bytes ≥ 0x20 (including any non-ASCII/invalid
 /// UTF-8 byte) pass through verbatim — this module deliberately does not
 /// validate UTF-8, so a malformed byte can never trigger a decode panic;
-/// it only ever affects display, never the string's structural validity.
+/// it only ever affects the string's DISPLAY and its acceptance by a
+/// UTF-8-enforcing parser — never the record's structure (still one line, one
+/// object, no escaped delimiter). See `writeJsonLines`' warning and the
+/// non-UTF-8 test: `std.json` refuses such a line, which is a
+/// dropped-record/log-evasion risk, not an injection one.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     try w.writeByte('"');
     for (s) |c| switch (c) {
@@ -1018,4 +1030,231 @@ test "JSON Lines: round-trips through std.json — null byte escapes" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, without_nl, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("null\x00byte", parsed.value.object.get("method").?.string);
+}
+
+// ── fuzz: arbitrary attacker bytes in every field, one record stays one line ─
+//
+// The three `write*` functions are the module's whole security surface:
+// `method`/`target`/`protocol`/`user_agent`/`referer`/`remote_addr`/
+// `request_id` are copied verbatim off the wire by `entryFromRequest`, so a
+// log-injection bug here forges log RECORDS, not just ugly output. The
+// curated `evil_payload` tests above pin a handful of hand-picked byte
+// sequences; this pushes arbitrary bytes — including every control byte, lone
+// `\r`, `"`, `\`, `=`, and NUL — through all three escapers at once.
+//
+// Three invariants, one per format, all of them structural rather than
+// cosmetic:
+//   * every format: the record is exactly one line — a single trailing `\n`
+//     and no other `\n` anywhere. This is the injection property itself.
+//   * JSON Lines: the line parses as one JSON object and every string field
+//     comes back BYTE-EXACT, which is the strong form (an escaper that
+//     mangled or dropped bytes would still parse).
+//   * logfmt / Combined: no raw control byte survives into the output, so no
+//     field can smuggle a terminal escape or a delimiter past the escaper.
+//
+// Deliberately not a round trip against our own reader — this module has no
+// reader. `std.json` is a foreign parser; for logfmt/Combined the byte-class
+// assertions are what stands in for one.
+
+/// The widest field this harness feeds, and the per-field slot in the byte
+/// pool below. JSON's `\u00XX` is the worst expansion (6x), so the output
+/// buffer is sized for every field being maximum-length control bytes.
+const fuzz_field_max = 32;
+
+fn fuzzEntry(smith: *std.testing.Smith, pool: *[8 * fuzz_field_max]u8) Entry {
+    smith.bytes(pool);
+    var fields: [8][]const u8 = undefined;
+    for (&fields, 0..) |*f, i| {
+        const len: usize = smith.valueRangeAtMost(u8, 0, fuzz_field_max);
+        f.* = pool[i * fuzz_field_max ..][0..len];
+    }
+    return .{
+        .timestamp_ns = smith.value(i64),
+        .time_formatted = if (smith.value(bool)) fields[0] else null,
+        .remote_addr = if (smith.value(bool)) fields[1] else null,
+        .method = fields[2],
+        .target = fields[3],
+        .protocol = fields[4],
+        .status = smith.value(u16),
+        .request_bytes = if (smith.value(bool)) smith.value(u64) else null,
+        .response_bytes = if (smith.value(bool)) smith.value(u64) else null,
+        .latency_ns = if (smith.value(bool)) smith.value(u64) else null,
+        .user_agent = if (smith.value(bool)) fields[5] else null,
+        .referer = if (smith.value(bool)) fields[6] else null,
+        .request_id = if (smith.value(bool)) fields[7] else null,
+    };
+}
+
+/// True when every string field JSON Lines actually EMITS is valid UTF-8 — the
+/// exact condition under which the record is parseable by a conforming parser
+/// (RFC 8259 requires JSON text to be UTF-8).
+///
+/// `time_formatted` is deliberately absent: `writeJsonLines` ignores it (only
+/// Combined renders it), so invalid bytes there cannot reach the JSON output.
+/// Including it made this predicate over-strict and the fuzzer found that
+/// within ~500 runs — a reminder that the harness's oracle needs the same
+/// scrutiny as the code, since an over-strict oracle is just a red test and an
+/// under-strict one is a harness that can never fail.
+fn jsonFieldsAreUtf8(entry: Entry) bool {
+    const v = std.unicode.utf8ValidateSlice;
+    if (!v(entry.method) or !v(entry.target) or !v(entry.protocol)) return false;
+    for ([_]?[]const u8{
+        entry.remote_addr,
+        entry.user_agent,
+        entry.referer,
+        entry.request_id,
+    }) |o| if (o) |t| if (!v(t)) return false;
+    return true;
+}
+
+/// `out` must end with exactly one `\n` and contain no other one: whatever the
+/// fields carried, the reader downstream sees a single record.
+fn expectOneLine(out: []const u8) !void {
+    try testing.expect(out.len > 0);
+    try testing.expectEqual(@as(u8, '\n'), out[out.len - 1]);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, out[0 .. out.len - 1], '\n'));
+}
+
+test "fuzz: JSON Lines stays one line and round-trips byte-exact through std.json" {
+    try testing.fuzz({}, fuzzJsonLines, .{});
+}
+
+fn fuzzJsonLines(_: void, smith: *std.testing.Smith) !void {
+    var pool: [8 * fuzz_field_max]u8 = undefined;
+    const entry = fuzzEntry(smith, &pool);
+
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonLines(entry, &w);
+    const out = w.buffered();
+    try expectOneLine(out);
+
+    // ⚠ Two-sided on purpose: a conforming JSON parser accepts this line if and
+    // only if every string field was valid UTF-8. `writeJsonString` passes
+    // every byte >= 0x20 through verbatim, so a field carrying a raw 0xFF (a
+    // request target or User-Agent can) produces a line `std.json` rejects
+    // outright with `error.SyntaxError` — see the dedicated test below for what
+    // that means and why it is pinned rather than silently tolerated. The
+    // one-line invariant above holds either way; it is only the PARSEABILITY
+    // that UTF-8 governs.
+    const fields_are_utf8 = jsonFieldsAreUtf8(entry);
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        out[0 .. out.len - 1],
+        .{},
+    ) catch |err| {
+        try testing.expectEqual(error.SyntaxError, err);
+        try testing.expect(!fields_are_utf8);
+        return;
+    };
+    defer parsed.deinit();
+    try testing.expect(fields_are_utf8);
+    const obj = parsed.value.object;
+
+    // Byte-exact, not merely parseable.
+    try testing.expectEqualStrings(entry.method, obj.get("method").?.string);
+    try testing.expectEqualStrings(entry.target, obj.get("target").?.string);
+    try testing.expectEqualStrings(entry.protocol, obj.get("protocol").?.string);
+    const opts = [_]struct { k: []const u8, v: ?[]const u8 }{
+        .{ .k = "remote_addr", .v = entry.remote_addr },
+        .{ .k = "user_agent", .v = entry.user_agent },
+        .{ .k = "referer", .v = entry.referer },
+        .{ .k = "request_id", .v = entry.request_id },
+    };
+    for (opts) |o| switch (obj.get(o.k).?) {
+        .null => try testing.expectEqual(@as(?[]const u8, null), o.v),
+        .string => |s| try testing.expectEqualStrings(o.v.?, s),
+        else => return error.TestUnexpectedResult,
+    };
+}
+
+test "fuzz: logfmt stays one line with no raw control byte" {
+    try testing.fuzz({}, fuzzLogfmt, .{});
+}
+
+fn fuzzLogfmt(_: void, smith: *std.testing.Smith) !void {
+    var pool: [8 * fuzz_field_max]u8 = undefined;
+    const entry = fuzzEntry(smith, &pool);
+
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLogfmt(entry, &w);
+    const out = w.buffered();
+    try expectOneLine(out);
+    for (out[0 .. out.len - 1]) |c| try testing.expect(c >= 0x20);
+}
+
+test "fuzz: Combined stays one line with no raw control byte" {
+    try testing.fuzz({}, fuzzCombined, .{});
+}
+
+fn fuzzCombined(_: void, smith: *std.testing.Smith) !void {
+    var pool: [8 * fuzz_field_max]u8 = undefined;
+    const entry = fuzzEntry(smith, &pool);
+
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeCombined(entry, &w);
+    const out = w.buffered();
+    try expectOneLine(out);
+    for (out[0 .. out.len - 1]) |c| try testing.expect(c >= 0x20 and c != 0x7F);
+}
+
+// ⚠ FOUND BY THE FUZZ HARNESS ABOVE, on its first sweep (3 000 iterations).
+// Not part of the finding that asked for the harness — pinned here, deliberately
+// NOT "fixed", because the fix is a format-policy decision for the module owner
+// (see below).
+//
+// `writeJsonString` passes every byte >= 0x20 through verbatim, including bytes
+// that are not valid UTF-8. RFC 8259 requires a JSON text to be UTF-8, and
+// conforming parsers enforce it: `std.json` rejects such a line with
+// `error.SyntaxError`, and so do jq / Go's `encoding/json` / every log pipeline
+// downstream. The consequence is the opposite of log INJECTION but just as bad
+// for an access log: a client that sends a non-UTF-8 `User-Agent` or request
+// target makes ITS OWN record unparseable, i.e. droppable — log EVASION. The
+// module doc's claim that a malformed byte "only ever affects display, never the
+// string's structural validity" is true of the line's SHAPE and false of its
+// validity as JSON; both doc sites have been corrected to say so.
+//
+// The fix is not free and not obviously ours to pick: the only ways to keep the
+// line parseable are lossy (replace ill-formed bytes with U+FFFD, as Go's
+// `encoding/json` does) or non-standard (a private escape), and either one ends
+// the byte-exact round-trip this module currently guarantees for UTF-8 input.
+// nginx's `escape=json` has exactly this same behavior; Caddy (Go) does not.
+// Pinned so the current behavior is visible and any change to it is deliberate.
+test "JSON Lines: a non-UTF-8 field byte survives verbatim and makes the line unparseable" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var entry = sampleEntry();
+    entry.user_agent = "curl\xffbad"; // lone 0xFF: never valid UTF-8
+    try writeJsonLines(entry, &w);
+    const out = w.buffered();
+
+    // The injection invariants still hold — this is not a structural break.
+    try testing.expectEqual(@as(u8, '\n'), out[out.len - 1]);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, out[0 .. out.len - 1], '\n'));
+    // The byte is passed through, not escaped…
+    try testing.expect(std.mem.indexOfScalar(u8, out, 0xFF) != null);
+    // …and that is exactly what a conforming JSON parser refuses.
+    try testing.expectError(error.SyntaxError, std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        out[0 .. out.len - 1],
+        .{},
+    ));
+
+    // Control: the same field as valid UTF-8 (U+00FF) parses and round-trips.
+    var w2: std.Io.Writer = .fixed(&buf);
+    entry.user_agent = "curl\u{00ff}bad";
+    try writeJsonLines(entry, &w2);
+    const out2 = w2.buffered();
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        out2[0 .. out2.len - 1],
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqualStrings("curl\u{00ff}bad", parsed.value.object.get("user_agent").?.string);
 }

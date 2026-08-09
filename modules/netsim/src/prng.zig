@@ -29,9 +29,18 @@ pub const Prng = struct {
         return z ^ (z >> 31);
     }
 
-    /// Uniform-ish integer in [0, n). Modulo bias is irrelevant here.
+    /// Uniform-ish integer in `[0, n)`. Modulo bias is irrelevant here.
+    ///
+    /// `n == 0` is an EMPTY range and yields 0. It used to `assert(n > 0)`,
+    /// which is a no-op in ReleaseFast and therefore left `next() % 0` — a
+    /// division by zero, illegal behaviour — as the actual release-build
+    /// outcome of a config that set a bound to 0. A guard that only exists in
+    /// safe builds is not a guard for the build that ships. The loud rejection
+    /// belongs where such a bound ENTERS: `fault.generate` returns
+    /// `error.ZeroHorizon` rather than silently drawing every disruption at
+    /// t=0. Note `chance(num, 0)` is `0 < num` by the same rule.
     pub fn below(p: *Prng, n: usize) usize {
-        std.debug.assert(n > 0);
+        if (n == 0) return 0;
         return @intCast(p.next() % @as(u64, n));
     }
 
@@ -72,4 +81,20 @@ test "Prng: permille(0) never fires, permille(1000) always fires" {
         try testing.expect(!p.permille(0));
         try testing.expect(p.permille(1000));
     }
+}
+
+test "below is total: an empty range yields 0 in every build, never a modulo by zero" {
+    var p = Prng.init(0xC0FFEE);
+    // The case that used to be `assert` in safe builds and `% 0` in ReleaseFast.
+    try std.testing.expectEqual(@as(usize, 0), p.below(0));
+    try std.testing.expectEqual(@as(usize, 0), p.below(0));
+    // A one-element range is the other degenerate end, and is genuinely uniform.
+    for (0..8) |_| try std.testing.expectEqual(@as(usize, 0), p.below(1));
+    // …and a real range still spans it: with 2 outcomes over 64 draws, seeing
+    // only one would mean `below` had stopped depending on `next()`.
+    var seen: [2]usize = .{ 0, 0 };
+    for (0..64) |_| seen[p.below(2)] += 1;
+    try std.testing.expect(seen[0] > 0 and seen[1] > 0);
+    // `chance` inherits the rule: an empty denominator is never "true".
+    try std.testing.expect(!p.chance(0, 0));
 }

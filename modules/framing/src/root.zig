@@ -80,6 +80,53 @@ pub fn readFrameAlloc(r: *std.Io.Reader, gpa: std.mem.Allocator, limits: Limits)
 
 // ── generic JSON tagged-union envelope codec ────────────────────────────────
 
+/// Default cap on JSON nesting depth accepted by `EnvelopeCodec(T).parse`.
+/// Deep enough that no hand-written envelope will ever reach it (JSON-RPC-
+/// shaped messages sit at 3-5), shallow enough that the per-level cost of a
+/// dynamic `std.json.Value` cannot be amplified by a full frame of `[`.
+pub const default_max_json_depth: u16 = 64;
+
+/// Parse-side limits for `EnvelopeCodec(T).parseLimited`. Separate from
+/// `Limits` (which is about frame bytes) because this one only bites when `T`
+/// embeds a dynamic `std.json.Value`.
+pub const JsonLimits = struct {
+    max_depth: u16 = default_max_json_depth,
+};
+
+/// True when no `[`/`{` in `bytes` nests deeper than `max_depth`. One pass, no
+/// allocation, and string-aware: brackets inside a JSON string (including
+/// after a `\\` escape) are text, not structure, so a payload that merely
+/// CONTAINS `"[[[[…"` is not penalised. Runs before `std.json` sees the input,
+/// which is the point — rejecting afterwards would already have paid for the
+/// allocations.
+pub fn jsonDepthWithin(bytes: []const u8, max_depth: u16) bool {
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (bytes) |c| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else switch (c) {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                else => {},
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > max_depth) return false;
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+    return true;
+}
+
 /// A JSON envelope codec over any `T` that is a `union(enum)` whose payload
 /// types are `std.json`-serializable. Zig's `std.json.Stringify` serializes a
 /// plain tagged union as a tag-keyed object `{"<tag>": {...}}` by default —
@@ -87,6 +134,28 @@ pub fn readFrameAlloc(r: *std.Io.Reader, gpa: std.mem.Allocator, limits: Limits)
 /// field is needed (this holds even when a payload struct itself contains an
 /// inner `enum` field: that field serializes as its tag name, a plain JSON
 /// string).
+///
+/// ## `T` should be fixed-shape — and what happens when it is not
+///
+/// With a fixed-shape `T` (structs, enums, ints, fixed arrays, slices of
+/// those) the parse cost is bounded by the frame: `std.json`'s
+/// `max_value_len` defaults to the input length, so every string/array
+/// allocation is already self-bounded by `limits.max_frame`, and the type's
+/// own nesting depth is a compile-time constant.
+///
+/// A `T` that embeds a **dynamic `std.json.Value`** field is different: that
+/// sub-value's shape comes from the wire, so its nesting depth is bounded only
+/// by the frame length. It will not smash the stack on the way IN
+/// (`std.json.Value.jsonParse` is iterative — an explicit heap stack, not
+/// call-frame recursion), but a 1 MiB frame of `[[[[…` still becomes ~1M live
+/// container objects, an allocation amplification of one input byte into tens
+/// of bytes; and `Value`'s *stringify* IS recursive, so echoing such a value
+/// back out through `encodeAlloc` would then overflow the native stack.
+///
+/// `parse` therefore refuses more than `default_max_json_depth` levels of
+/// nesting before `std.json` ever sees the bytes (`parseLimited` to choose
+/// your own cap). The check costs one allocation-free pass and is a no-op for
+/// the fixed-shape case, whose depth is a constant well under the cap.
 pub fn EnvelopeCodec(comptime T: type) type {
     if (@typeInfo(T) != .@"union") @compileError("EnvelopeCodec(T): T must be a union(enum)");
 
@@ -96,8 +165,24 @@ pub fn EnvelopeCodec(comptime T: type) type {
             return std.json.Stringify.valueAlloc(gpa, msg, .{});
         }
 
-        /// Parse JSON bytes into a `T`. Caller calls `.deinit()` on the result.
+        /// Parse JSON bytes into a `T`. Caller calls `.deinit()` on the
+        /// result. Nesting deeper than `default_max_json_depth` is rejected
+        /// with `error.JsonNestingTooDeep` — see the type doc for why that
+        /// matters only when `T` embeds a dynamic `std.json.Value`.
         pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
+            return parseLimited(gpa, bytes, .{});
+        }
+
+        /// `parse` with a caller-chosen nesting cap. Use it when `T` embeds a
+        /// `std.json.Value` whose legitimate depth is known — tighter than the
+        /// default is the useful direction; raising it re-opens exactly the
+        /// amplification the default exists to bound.
+        pub fn parseLimited(
+            gpa: std.mem.Allocator,
+            bytes: []const u8,
+            limits: JsonLimits,
+        ) !std.json.Parsed(T) {
+            if (!jsonDepthWithin(bytes, limits.max_depth)) return error.JsonNestingTooDeep;
             return std.json.parseFromSlice(T, gpa, bytes, .{});
         }
 
@@ -358,4 +443,101 @@ test "readFrameAlloc: an oversize announced length is refused before allocating"
         error.FrameTooLarge,
         readFrameAlloc(&r, std.testing.failing_allocator, .{}),
     );
+}
+
+// ── dynamic-payload depth guard ─────────────────────────────────────────────
+//
+// The case the guard exists for: an envelope whose payload is a raw
+// `std.json.Value`, i.e. a shape chosen by the sender rather than by `T`.
+
+const DynEnvelope = union(enum) {
+    /// Deliberately dynamic — the shape F1 warns about.
+    passthrough: std.json.Value,
+    ping: struct { seq: u32 },
+};
+
+/// `"[" * n ++ "]" * n` wrapped in the `passthrough` variant.
+fn nestedDyn(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\"passthrough\":");
+    try out.appendNTimes(gpa, '[', n);
+    try out.appendNTimes(gpa, ']', n);
+    try out.appendSlice(gpa, "}");
+    return out.toOwnedSlice(gpa);
+}
+
+test "envelope: a dynamic payload nested past the cap is refused before std.json sees it" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const Codec = EnvelopeCodec(DynEnvelope);
+
+    // Just inside the cap parses…
+    {
+        const bytes = try nestedDyn(gpa, default_max_json_depth - 1);
+        defer gpa.free(bytes);
+        var parsed = try Codec.parse(gpa, bytes);
+        defer parsed.deinit();
+        try t.expect(parsed.value == .passthrough);
+    }
+    // …one level past it does not. Literal arithmetic on the constant, so
+    // moving `default_max_json_depth` moves both sides of this test together
+    // while the two assertions below pin the VALUE itself.
+    {
+        const bytes = try nestedDyn(gpa, default_max_json_depth + 1);
+        defer gpa.free(bytes);
+        try t.expectError(error.JsonNestingTooDeep, Codec.parse(gpa, bytes));
+    }
+    // A frame-sized wall of brackets — the actual amplification input — is
+    // refused at a fixed, tiny cost rather than turned into ~1M live objects.
+    {
+        const bytes = try nestedDyn(gpa, 100_000);
+        defer gpa.free(bytes);
+        try t.expectError(error.JsonNestingTooDeep, Codec.parse(gpa, bytes));
+    }
+    // The cap is a parameter: a caller who knows its payloads are flat can
+    // tighten it, and the tightened value is the one that decides.
+    {
+        // 5 nested arrays inside the envelope object = depth 6, the object
+        // itself being level 1 — the cap counts the whole document, which is
+        // what bounds the work.
+        const bytes = try nestedDyn(gpa, 5);
+        defer gpa.free(bytes);
+        try t.expectError(
+            error.JsonNestingTooDeep,
+            Codec.parseLimited(gpa, bytes, .{ .max_depth = 5 }),
+        );
+        var parsed = try Codec.parseLimited(gpa, bytes, .{ .max_depth = 6 });
+        parsed.deinit();
+    }
+}
+
+test "depth scan counts structure, not text: brackets inside strings are payload" {
+    const t = std.testing;
+    // The pinned default, so a change to it is a deliberate edit here.
+    try t.expectEqual(@as(u16, 64), default_max_json_depth);
+
+    // 500 brackets, all inside one JSON string → depth 2, accepted.
+    const gpa = t.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "{\"passthrough\":\"");
+    try buf.appendNTimes(gpa, '[', 500);
+    try buf.appendSlice(gpa, "\"}");
+    var parsed = try EnvelopeCodec(DynEnvelope).parse(gpa, buf.items);
+    defer parsed.deinit();
+    try t.expectEqualStrings(
+        buf.items[16 .. buf.items.len - 2],
+        parsed.value.passthrough.string,
+    );
+
+    // …and an escaped quote does not end the string early, so the brackets
+    // after it are still text. `\"` then 200 '[' then the real closing quote.
+    try t.expect(jsonDepthWithin("{\"a\":\"\\\"" ++ ("[" ** 200) ++ "\"}", 8));
+    // The same brackets OUTSIDE a string are structure, and are counted.
+    try t.expect(!jsonDepthWithin("{\"a\":" ++ ("[" ** 200), 8));
+    // A closing bracket pops, so a long flat sequence never accumulates.
+    try t.expect(jsonDepthWithin("[]" ** 1000, 2));
+    // Unbalanced closers saturate at zero instead of wrapping around.
+    try t.expect(jsonDepthWithin("]" ** 100 ++ "[", 1));
 }

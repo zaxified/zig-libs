@@ -61,6 +61,14 @@ a plain JSON string) — covered by the "enum-payload variant" test.
 both `writeFrame` (before touching the writer) and `readFrame` (checked
 against both the announced length and the caller's buffer capacity).
 
+Keep `T` fixed-shape if you can. A `T` embedding a dynamic `std.json.Value`
+lets the sender choose the nesting depth, so `parse` caps it at
+`default_max_json_depth` (64) and returns `error.JsonNestingTooDeep` above
+that — `parseLimited(gpa, bytes, .{ .max_depth = n })` to pick your own. Without
+that cap a 1 MiB frame of `[[[[…` parses into ~1M live containers, and echoing
+the result back out through `encodeAlloc` (whose `Value` stringify is
+recursive, unlike the parse) would overflow the stack.
+
 ## Tests
 
 `zig build test-framing` — tests run on a domain-free test-only

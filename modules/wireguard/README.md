@@ -112,6 +112,15 @@ ChaCha20-Poly1305, keyed BLAKE2s-128 for mac1, HKDF-over-HMAC-BLAKE2s); no
 initiator↔responder self-consistency, and a netns-gated live interop
 against the in-kernel WireGuard implementation. Provenance: see `/NOTICE`.
 
+WireGuard's under-load DoS mitigation (whitepaper §5.4.7) is part of it:
+`CookieChecker.admit()` decides `accept` / `cookie_reply` / `drop` for an
+inbound datagram *before* any Diffie-Hellman, answering a mac1-only flood
+with a 64-byte cookie reply instead of an X25519, and `PeerCookie` holds the
+cookie a peer sent us so the retry carries a valid `mac2`. mac1 alone is not
+a defense — its key is derived from the responder's *public* key, so anyone
+can forge one. The caller supplies the load signal, the clock (`now_s`) and
+the source-address bytes; the module keeps neither socket nor clock.
+
 ## Transport data — the data plane (`transport.zig`)
 
 What the handshake keys are *for*: type-4 transport-data messages. One

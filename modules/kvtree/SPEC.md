@@ -173,12 +173,19 @@ first half of a write, which always covers the whole 48-byte meta record, so
 meta corruption has to be injected to give the double-buffer invariant
 teeth). Still future work: a full randomized VOPR (fuzzed op/crash schedules
 chained across epochs) the way `kv/vopr.zig` is, plus a sabotage self-test
-and a delta-debugging shrinker. Known sim modeling caveat, inherited and
-documented at `kv.SimStorage.allow_overwrite`: an un-synced in-place
-OVERWRITE below the durable watermark survives most crash modes
-(optimistic), so a missing FINAL meta fsync is not currently provable by
-this harness — recovery-to-a-committed-prefix accepts both outcomes anyway,
-and fixing it needs overwrite-durability modeling in `kv`'s sim.
+and a delta-debugging shrinker. The sim modeling caveat that used to sit
+here — an un-synced in-place OVERWRITE below the durable watermark surviving most
+crash modes — **is fixed**: `kv.SimStorage` now keeps an undo log when
+`allow_overwrite` is set, so `.lose_unsynced` rolls the whole un-synced window
+back (overwrites included) and `.reorder_unsynced` restores a dropped range's
+pre-write bytes instead of zero-filling it. Overlapping writes within one sync
+window are consequently allowed too. `.torn_tail` is unchanged on purpose: its
+"first half of the write survives" rule is what the meta-corruption reasoning
+above depends on. ⚠ Note the caveat's stated CONSEQUENCE did not hold even
+before that fix: deleting commit's final `pager.sync()` was checked by fault
+injection against the pre-fix tree and the gated crash sweep already failed with
+`RecoveredStateNotCommitted`. The optimism was real; "a missing final meta fsync
+is not provable by this harness" was not.
 
 ## Threat model / out of scope
 

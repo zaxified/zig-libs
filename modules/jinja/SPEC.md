@@ -401,6 +401,31 @@ API makes easy to get wrong.
 If recompilation ever shows up in a profile, the fix is a caller-owned cache
 passed *into* `render`, not a mutable environment.
 
+**It has now been profiled** (`src/bench.zig`, `JINJA_BENCH=1 scripts/capped zig build test-jinja
+-Doptimize=ReleaseFast`), and it does not clear that bar. The bench renders a page that
+`{% extends %}`es a real-sized base layout and `{% include %}`s a row partial per row, against a
+byte-equivalent inlined page that loads nothing, asserting the two outputs match. The gap between
+them splits cleanly:
+
+| rows | composed | inlined | composition |
+|------|----------|---------|-------------|
+| 0    | 7.4 us   | 1.4 us  | 6.0 us      |
+| 10   | 14.1 us  | 7.6 us  | 6.5 us      |
+| 100  | 123 us   | 51.8 us | 71.2 us     |
+| 1000 | 1.04 ms  | 0.70 ms | 338 us      |
+
+The composition cost is `~6 us + ~330 ns/row`. The **fixed ~6 us is the part a cache could remove**
+(and even that is an upper bound — it also contains the loader lookup and the inheritance
+machinery); the ~330 ns/row is executing one `{% include %}` per row, which a compiled-template
+cache does not remove and which the reference pays as well.
+
+So the cost is a **constant per render, not an asymptotic gap**: ~5% of a 100-row page, 0.6% of a
+1000-row page, and 6 us of a 7 us page that nobody profiles. Against that, a caller-owned cache
+buys back the mutable-state question §9 exists to avoid. Left as designed; the bench stays in the
+tree so the bar above is re-checkable rather than re-argued. (Note the bench deliberately does not
+use `std.testing.allocator`: that is a `DebugAllocator` with guard pages, and it costs ~50 us per
+render — measured — which drowns the entire effect.)
+
 ## 10. Loader containment and expansion bounds
 
 Part 1 had no way to name another template. Part 2 has one, so it has an attack
@@ -494,7 +519,9 @@ makes these bound tests rather than "it errored eventually" tests.
   waiting for a consumer that wants them.
 - Line statements and configurable delimiters — cheap in the lexer, wanted only
   if a real consumer asks.
-- A caller-owned template cache passed into `render` (§9), if recompilation ever
-  shows up in a profile.
+- ~~A caller-owned template cache passed into `render` (§9), if recompilation ever
+  shows up in a profile.~~ **Profiled 2026-08-09 and it does not** — the cache-removable cost is a
+  flat ~6 us per render (~5% of a 100-row page, 0.6% of a 1000-row one), not the asymptotic gap it
+  was assumed to be. See §9; the bench is `src/bench.zig`.
 - A lazy context adapter (§2), if a context ever appears that is too large to
   convert eagerly.
