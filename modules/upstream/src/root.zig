@@ -243,6 +243,20 @@ pub const CallOptions = struct {
     max_tries: u32 = 3,
 };
 
+/// A `pick()` outcome scoped for a `defer`-paired `report()` — see
+/// `Pool.pickGuarded`'s doc comment for the intended usage and what this
+/// does and does not guarantee (audit `upstream` F1).
+pub const PickGuard = struct {
+    pool: *Pool,
+    upstream: *Upstream,
+
+    /// Exactly `pool.report(upstream, ok, rtt_ns)` — see `Pool.report`'s doc
+    /// for what each parameter does.
+    pub fn report(g: PickGuard, ok: bool, rtt_ns: ?u64) void {
+        g.pool.report(g.upstream, ok, rtt_ns);
+    }
+};
+
 pub const Pool = struct {
     gpa: Allocator,
     options: Options,
@@ -324,6 +338,31 @@ pub const Pool = struct {
         lockSpin(&pool.lock);
         defer pool.lock.unlock();
         return pool.pickLocked();
+    }
+
+    /// `pick()` wrapped in a value that scopes the mandatory `report()` call
+    /// to a `defer` right where the pick happens, instead of two calls a
+    /// later refactor can accidentally separate (audit F1 — the bare
+    /// `pick`/`report` seam is an easy-to-misuse hazard for callers who
+    /// don't go through `call()`, which already encapsulates the pairing
+    /// correctly and does not need this).
+    ///
+    /// ```
+    /// const g = pool.pickGuarded() orelse return error.NoHealthyUpstream;
+    /// defer g.report(ok, rtt_ns); // set `ok`/`rtt_ns` before this fires
+    /// var ok = false;
+    /// var rtt_ns: ?u64 = null;
+    /// // ... do the call, then set ok/rtt_ns before falling out of scope ...
+    /// ```
+    ///
+    /// This does not (cannot — Zig has no destructors) *enforce* the
+    /// discipline; it only makes the correct shape a single `defer` instead
+    /// of a call the caller must remember to place on every exit path
+    /// (including error returns) by hand. `g.upstream` is `pick()`'s
+    /// return value; `g.report` is exactly `pool.report(g.upstream, ...)`.
+    pub fn pickGuarded(pool: *Pool) ?PickGuard {
+        const u = pool.pick() orelse return null;
+        return .{ .pool = pool, .upstream = u };
     }
 
     fn pickLocked(pool: *Pool) ?*Upstream {
@@ -793,6 +832,56 @@ test "pick skips a bulkhead-full upstream and returns null when all are full" {
     pool.report(pool.getById("a").?, true, null);
     pool.report(b, true, null);
     try testing.expectEqual(0, pool.stats().in_flight); // nothing leaked
+}
+
+test "pickGuarded: defer-scoped report survives an early error return where bare pick/report leaks (audit F1)" {
+    // First, reproduce the hazard F1 describes with the bare seam: a
+    // caller that does real work between pick() and report(), with an
+    // early-return error path that forgets to call report() before
+    // returning — an easy mistake, and exactly what F1 flags.
+    {
+        var pool: Pool = .init(testing.allocator, .{ .max_per_upstream = 1 });
+        defer pool.deinit();
+        _ = try pool.add(.{ .id = "a", .address = "10.0.0.1:80" });
+
+        const BareWork = struct {
+            fn run(pool_: *Pool, fail: bool) !void {
+                const u = pool_.pick() orelse return error.NoHealthyUpstream;
+                if (fail) return error.SimulatedFailure; // BUG: no report() here
+                pool_.report(u, true, null);
+            }
+        };
+        try testing.expectError(error.SimulatedFailure, BareWork.run(&pool, true));
+        // The slot from the failed attempt was never released: a second
+        // pick on this single-slot upstream finds nothing.
+        try testing.expectError(error.NoHealthyUpstream, BareWork.run(&pool, false));
+        try testing.expectEqual(1, pool.stats().in_flight); // leaked, as F1 describes
+    }
+
+    // Now the same shape through `pickGuarded`: the mandatory report is a
+    // single `defer` right after the pick, so it fires on every exit path
+    // (including the early error return) without the caller having to
+    // remember to place a matching call on each one by hand.
+    {
+        var pool: Pool = .init(testing.allocator, .{ .max_per_upstream = 1 });
+        defer pool.deinit();
+        _ = try pool.add(.{ .id = "a", .address = "10.0.0.1:80" });
+
+        const GuardedWork = struct {
+            fn run(pool_: *Pool, fail: bool) !void {
+                const g = pool_.pickGuarded() orelse return error.NoHealthyUpstream;
+                var ok = false;
+                defer g.report(ok, null);
+                if (fail) return error.SimulatedFailure;
+                ok = true;
+            }
+        };
+        try testing.expectError(error.SimulatedFailure, GuardedWork.run(&pool, true));
+        // No leak this time: the defer fired on the error return too, so
+        // the slot is free again for the next pick.
+        try GuardedWork.run(&pool, false);
+        try testing.expectEqual(0, pool.stats().in_flight); // nothing leaked
+    }
 }
 
 test "least_connections picks the least-loaded upstream" {

@@ -275,7 +275,7 @@ pub const DfElect = struct {
     fn floodFrom(self: *DfElect, sim: *Sim, node: NodeId, payload: []const u8, exclude: ?NodeId) anyerror!void {
         _ = self;
         var nb: [16]NodeId = undefined;
-        const n = sim.neighbors(node, &nb);
+        const n = try sim.neighbors(node, &nb);
         for (nb[0..n]) |peer| {
             if (exclude) |ex| {
                 if (peer == ex) continue;
@@ -520,7 +520,7 @@ pub const BrokenAlwaysDf = struct {
 
     fn floodFrom(sim: *Sim, node: NodeId, payload: []const u8, exclude: ?NodeId) anyerror!void {
         var nb: [16]NodeId = undefined;
-        const n = sim.neighbors(node, &nb);
+        const n = try sim.neighbors(node, &nb);
         for (nb[0..n]) |peer| {
             if (exclude) |ex| {
                 if (peer == ex) continue;

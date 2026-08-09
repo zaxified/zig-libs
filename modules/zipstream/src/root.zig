@@ -92,6 +92,13 @@ pub const Entry = struct {
     uncompressed_size: u64,
     /// Offset of this entry's local file header within the archive.
     file_offset: u64,
+    /// CRC-32 of the *uncompressed* content, from the central directory (not
+    /// the local header — the local header's own copy is zero when the
+    /// writer used a post-data data descriptor, e.g. real-world streaming
+    /// writers like LibreOffice; the central directory's copy is always
+    /// authoritative, written after all data). Verified automatically by
+    /// `EntryReader` at end-of-stream — see its doc comment.
+    crc32: u32,
 };
 
 /// A central-directory-parsed ZIP archive. Borrows an already-open `File` (does
@@ -176,6 +183,7 @@ pub const Archive = struct {
                 .compressed_size = e.compressed_size,
                 .uncompressed_size = e.uncompressed_size,
                 .file_offset = e.file_offset,
+                .crc32 = e.crc32,
             });
         }
     }
@@ -235,9 +243,20 @@ pub fn isSafeEntryName(name: []const u8) bool {
 /// (≥ `std.compress.flate.max_window_len` for deflate). The window must outlive
 /// the `EntryReader`. Opening a new `EntryReader` reseeks the shared file
 /// cursor, so a previous one must be finished first.
+///
+/// Integrity: `reader()` accumulates a running CRC-32 over every decompressed
+/// byte it yields and checks it against the entry's central-directory
+/// `crc32` once the stream is exhausted — a corrupted or tampered member is
+/// therefore never delivered to the end as if it were valid data. Because
+/// `std.Io.Reader`'s vtable has a fixed `StreamError` set (`ReadFailed` /
+/// `WriteFailed` / `EndOfStream`, no room for a dedicated error), a mismatch
+/// surfaces as `error.ReadFailed` — call `crcMismatch()` after such an error
+/// to tell a corrupted-content failure apart from an underlying I/O failure
+/// (the same out-of-band-reason pattern `http`'s `ChunkedReader` uses).
 pub const EntryReader = struct {
     decompress: std.compress.flate.Decompress,
     limited: std.Io.Reader.Limited,
+    crc_reader: CrcReader,
 
     /// Open an entry with the default decompression-bomb cap
     /// (`default_max_output`). See `initMax` to choose the cap.
@@ -283,13 +302,74 @@ pub const EntryReader = struct {
             },
             else => return Error.UnsupportedCompressionMethod,
         }
+        self.crc_reader = CrcReader.init(&self.limited.interface, entry.crc32);
     }
 
-    /// The decompressed-byte reader, bounded by the output cap. Valid until the
-    /// next `EntryReader.init` against the same archive (which reseeks the file
-    /// cursor).
+    /// The decompressed-byte reader, bounded by the output cap and verified
+    /// against the entry's CRC-32 at end-of-stream (see the type doc).
+    /// Valid until the next `EntryReader.init` against the same archive
+    /// (which reseeks the file cursor).
     pub fn reader(self: *EntryReader) *std.Io.Reader {
-        return &self.limited.interface;
+        return &self.crc_reader.interface;
+    }
+
+    /// True once `reader()` has failed with `error.ReadFailed` *because* the
+    /// accumulated CRC-32 did not match the entry's declared checksum, i.e.
+    /// the member's content was corrupted or tampered with — as opposed to
+    /// an unrelated I/O failure, which also surfaces as `error.ReadFailed`
+    /// but leaves this false. Only meaningful after such an error.
+    pub fn crcMismatch(self: *const EntryReader) bool {
+        return self.crc_reader.crc_mismatch;
+    }
+};
+
+/// Wraps a `Reader` (the decompressed/limited stream of one ZIP entry),
+/// accumulating a running CRC-32 over every byte forwarded through it. When
+/// the wrapped reader reaches its own end-of-stream, the accumulated CRC is
+/// compared against `expected`; on mismatch the read fails (`crc_mismatch`
+/// is set and `error.ReadFailed` returned) instead of silently completing as
+/// if the content were untouched — closing the gap where a corrupted or
+/// tampered archive member was previously delivered as valid data (audit
+/// finding `zipstream` F4).
+const CrcReader = struct {
+    source: *std.Io.Reader,
+    interface: std.Io.Reader,
+    crc: std.hash.Crc32,
+    expected: u32,
+    crc_mismatch: bool = false,
+
+    fn init(source: *std.Io.Reader, expected: u32) CrcReader {
+        return .{
+            .source = source,
+            .interface = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+            .crc = std.hash.Crc32.init(),
+            .expected = expected,
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *CrcReader = @alignCast(@fieldParentPtr("interface", r));
+        // Pull into a local scratch buffer (rather than delegating straight
+        // to `self.source.stream(w, limit)`) so the bytes are visible here to
+        // hash, not just forwarded zero-copy into `w`.
+        var scratch: [4096]u8 = undefined;
+        const want = limit.minInt(scratch.len);
+        if (want == 0) return 0;
+        const n = self.source.readSliceShort(scratch[0..want]) catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+        };
+        if (n == 0) {
+            // `readSliceShort` returns fewer bytes than requested if and only
+            // if the source stream has ended — this is the real end-of-entry.
+            if (self.crc.final() != self.expected) {
+                self.crc_mismatch = true;
+                return error.ReadFailed;
+            }
+            return error.EndOfStream;
+        }
+        self.crc.update(scratch[0..n]);
+        try w.writeAll(scratch[0..n]);
+        return n;
     }
 };
 
@@ -553,6 +633,11 @@ fn buildZip(a: Allocator, members: []const TestMember) ![]u8 {
 
     for (members, compressed.items) |m, c| {
         try offs.append(a, @intCast(buf.items.len));
+        // Real CRC-32 of the *uncompressed* content — matches what a genuine
+        // writer emits, and what `EntryReader`'s CRC verification (F4 fix)
+        // now checks on read. A hardcoded 0 here would make every decode
+        // test below fail against its own fixture once verification exists.
+        const crc = std.hash.Crc32.hash(m.data);
         const lfh = std.zip.LocalFileHeader{
             .signature = std.zip.local_file_header_sig,
             .version_needed_to_extract = 20,
@@ -560,7 +645,7 @@ fn buildZip(a: Allocator, members: []const TestMember) ![]u8 {
             .compression_method = m.method,
             .last_modification_time = 0,
             .last_modification_date = 0,
-            .crc32 = 0,
+            .crc32 = crc,
             .compressed_size = @intCast(c.len),
             .uncompressed_size = @intCast(m.data.len),
             .filename_len = @intCast(m.name.len),
@@ -581,7 +666,7 @@ fn buildZip(a: Allocator, members: []const TestMember) ![]u8 {
             .compression_method = m.method,
             .last_modification_time = 0,
             .last_modification_date = 0,
-            .crc32 = 0,
+            .crc32 = std.hash.Crc32.hash(m.data),
             .compressed_size = @intCast(c.len),
             .uncompressed_size = @intCast(m.data.len),
             .filename_len = @intCast(m.name.len),
@@ -636,6 +721,9 @@ fn buildZip64(a: Allocator, name: []const u8, data: []const u8, method: std.zip.
         else => try a.dupe(u8, data),
     };
     defer a.free(compressed);
+    // Real CRC-32 of the uncompressed content — see the identical note in
+    // `buildZip`; a stub 0 here would fail `EntryReader`'s new verification.
+    const crc = std.hash.Crc32.hash(data);
 
     // --- Local file header + zip64 extra (uncompressed_size, compressed_size) ---
     const local_offset: u32 = @intCast(buf.items.len);
@@ -646,7 +734,7 @@ fn buildZip64(a: Allocator, name: []const u8, data: []const u8, method: std.zip.
         .compression_method = method,
         .last_modification_time = 0,
         .last_modification_date = 0,
-        .crc32 = 0,
+        .crc32 = crc,
         .compressed_size = 0xFFFFFFFF,
         .uncompressed_size = 0xFFFFFFFF,
         .filename_len = @intCast(name.len),
@@ -677,7 +765,7 @@ fn buildZip64(a: Allocator, name: []const u8, data: []const u8, method: std.zip.
         .compression_method = method,
         .last_modification_time = 0,
         .last_modification_date = 0,
-        .crc32 = 0,
+        .crc32 = crc,
         .compressed_size = 0xFFFFFFFF,
         .uncompressed_size = 0xFFFFFFFF,
         .filename_len = @intCast(name.len),
@@ -877,6 +965,56 @@ test "EntryReader: multi-entry archive with Store + Deflate mix" {
     defer out_store2.deinit(a);
     try er_store2.reader().appendRemaining(a, &out_store2, .unlimited);
     try testing.expectEqualStrings("another stored member", out_store2.items);
+
+    // All three reads above completed to a clean EOF with matching content,
+    // so `EntryReader`'s new CRC-32 verification (audit F4) ran and agreed —
+    // confirms the happy path isn't broken by the fix.
+    try testing.expect(!er_store1.crcMismatch());
+    try testing.expect(!er_deflate.crcMismatch());
+    try testing.expect(!er_store2.crcMismatch());
+}
+
+test "EntryReader: CRC-32 mismatch on a tampered member is caught, not delivered as valid data (audit F4)" {
+    // Reproduces the exact defect F4 flagged: a member whose actual bytes
+    // disagree with the archive's own declared checksum was previously
+    // returned to the caller as if nothing were wrong. Patch the central
+    // directory's crc32 field only (data bytes untouched, still a fully
+    // valid Store or Deflate stream) so this cannot be confused with a
+    // decode-format error from a corrupted compressed bitstream — this
+    // isolates the CRC check itself, for both compression methods.
+    const a = testing.allocator;
+    for ([_]std.zip.CompressionMethod{ .store, .deflate }) |method| {
+        const zip = try buildZip(a, &.{.{ .name = "a.dat", .data = "not corrupted at all, honest", .method = method }});
+        defer a.free(zip);
+
+        const cd_sig = std.zip.central_file_header_sig;
+        const cd_start = std.mem.indexOf(u8, zip, &cd_sig).?;
+        // crc32 sits at offset 16 within CentralDirectoryFileHeader (after
+        // signature(4)+version_made_by(2)+version_needed(2)+flags(2)+
+        // compression_method(2)+mtime(2)+mdate(2) = 16), same struct this
+        // module's own "hostile filename_len" CRIT test patches by offset.
+        const real_crc = std.mem.readInt(u32, zip[cd_start + 16 ..][0..4], .little);
+        std.mem.writeInt(u32, zip[cd_start + 16 ..][0..4], real_crc ^ 0xFFFFFFFF, .little);
+
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var f = try openZip(&tmp, zip);
+        defer f.close(testing.io);
+
+        var archive: Archive = undefined;
+        try archive.init(testing.io, a, f);
+        defer archive.deinit();
+        const entry = archive.find("a.dat").?;
+
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var er: EntryReader = undefined;
+        try er.init(&archive, entry, &window);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try testing.expectError(error.ReadFailed, er.reader().appendRemaining(a, &out, .unlimited));
+        try testing.expect(er.crcMismatch());
+    }
 }
 
 test "Archive: empty archive has zero entries" {
@@ -979,10 +1117,17 @@ test "EntryReader: a size lie beyond physical EOF errors cleanly, not UB" {
 
     const buf = try a.alloc(u8, lying_entry.uncompressed_size);
     defer a.free(buf);
-    // Reading the full (lying) declared size must hit the reader's own
-    // EndOfStream error, cleanly, instead of looping forever or reading
-    // past the allocation.
-    try testing.expectError(error.EndOfStream, er.reader().readSliceAll(buf));
+    // Reading the full (lying) declared size must hit a clean error instead
+    // of looping forever or reading past the allocation. Before the CRC-32
+    // check (audit F4) this surfaced as a bare `error.EndOfStream` once the
+    // physical file ran out; now the extra bytes it ran into (central
+    // directory + EOCD, past the true entry boundary) get folded into the
+    // running CRC too, so it *also* disagrees with `lying_entry.crc32` (the
+    // real short entry's checksum) — a strictly sharper diagnosis of the
+    // same underlying problem ("this data doesn't match what it claims to
+    // be"), not just "the stream stopped".
+    try testing.expectError(error.ReadFailed, er.reader().readSliceAll(buf));
+    try testing.expect(er.crcMismatch());
 }
 
 test "isSafeEntryName flags zip-slip names, accepts ordinary member paths" {

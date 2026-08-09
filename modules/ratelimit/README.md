@@ -40,7 +40,12 @@ var limiter = ratelimit.Limiter.init(gpa, .{
     .burst = 10, // bucket capacity per key
     .max_keys = 4096, // memory bound: LRU-evicted beyond
     .ttl_ms = 10 * std.time.ms_per_min, // idle keys dropped/reset
-    // .key = .{ .header = "X-Api-Key" },  // or .forwarded_ip (default) / .custom
+    // No default (deliberately — see "Client-key trust policy" in root.zig):
+    // pick `.forwarded_ip` only behind a trusted reverse proxy that always
+    // sets X-Forwarded-For/X-Real-IP; a directly internet-facing server
+    // MUST use `.custom` straight to the socket peer instead, or a client
+    // can forge its way into a fresh bucket per request.
+    .key = .forwarded_ip, // or .{ .header = "X-Api-Key" } / .custom
 });
 defer limiter.deinit();
 

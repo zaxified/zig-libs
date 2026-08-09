@@ -1194,6 +1194,45 @@ test "packed_single and fbp encode/decode against literal wire bytes, not just e
     try testing.expectEqual(f, try decodeElement(.fbp, &[_]u8{ 0x34, 0x12 }));
 }
 
+// iec104-F2 (remainder): the audit's disposition for the fix above left the
+// rest of the "self-derived, no byte-level oracle" class open — the two
+// multi-byte members of it are `.normalized_no_quality` (M_ME_ND_1, 2-byte
+// I16) and `.bitstring_command` (C_BO_NA_1/C_BO_TA_1, 4-byte U32). Unlike
+// `packed_single`/`fbp` before their fix, these two were never hand-rolled —
+// `decodeElement`/`encodeElement` already route them through the same
+// independently-tested `info.readI16`/`writeI16`/`readU32`/`writeU32`
+// helpers ("scalar helpers are little-endian" in info.zig), so a consistent
+// endianness swap has nowhere to hide today. This test pins that with a
+// literal-byte oracle anyway, matching the pattern above, rather than
+// leaving it as an inference from reading the source.
+//
+// The class's remaining three members — C_RP_NA_1 (`.qrp`), C_CD_NA_1
+// (`.empty` value; its CP16Time2a time tag already has a literal-byte test,
+// "CP24Time2a and CP16Time2a round-trip" in info.zig) and M_EI_NA_1
+// (`.coi`) — are single-byte or zero-byte VALUE payloads. The defect class
+// this finding describes (a byte-order swap that's consistent between
+// encode/decode) has no purchase on a field with no internal byte order, so
+// they are not applicable, not merely untested.
+test "normalized_no_quality and bitstring_command encode/decode against literal wire bytes (iec104-F2 remainder)" {
+    var buf: [8]u8 = undefined;
+
+    // I16 -3200 (0xF380) LE -> 80 F3.
+    const e: Element = .{ .normalized_no_quality = .{ .raw = -3200 } };
+    const n = try encodeElement(e, &buf);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x80, 0xF3 }, buf[0..n]);
+    try testing.expectEqual(e, try decodeElement(.normalized_no_quality, buf[0..n]));
+    try testing.expectEqual(e, try decodeElement(.normalized_no_quality, &[_]u8{ 0x80, 0xF3 }));
+
+    // U32 0xCAFEBABE LE -> BE BA FE CA.
+    const f: Element = .{ .bitstring_command = 0xCAFEBABE };
+    const nf = try encodeElement(f, &buf);
+    try testing.expectEqual(@as(usize, 4), nf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xBE, 0xBA, 0xFE, 0xCA }, buf[0..nf]);
+    try testing.expectEqual(f, try decodeElement(.bitstring_command, buf[0..nf]));
+    try testing.expectEqual(f, try decodeElement(.bitstring_command, &[_]u8{ 0xBE, 0xBA, 0xFE, 0xCA }));
+}
+
 test "the parameter-loading types (P_ME/P_AC) round-trip too" {
     // p_me_na_1/nb_1/nc_1 (-> .parameter, 3 octets) and p_ac_na_1 (-> .qrp,
     // "same width" per its comment) are the only four `shapeOf` rows neither

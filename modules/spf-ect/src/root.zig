@@ -391,6 +391,18 @@ pub fn comparePaths(a: Path, b: Path) Order {
     return std.mem.order(NodeId, a, b);
 }
 
+/// Same contract and same result as `comparePaths` — see its doc comment —
+/// but O(len log len) via `orderItemMultisetsAlloc` instead of O(len²).
+/// Internal: used only by `dijkstraWithTieBreak`'s hot path, which already
+/// has a per-comparison scratch arena in scope.
+fn comparePathsAlloc(arena: Allocator, a: Path, b: Path) Allocator.Error!Order {
+    const by_nodes = try orderItemMultisetsAlloc(.node, arena, a, b);
+    if (by_nodes != .eq) return by_nodes;
+    const by_edges = try orderItemMultisetsAlloc(.edge, arena, a, b);
+    if (by_edges != .eq) return by_edges;
+    return std.mem.order(NodeId, a, b);
+}
+
 /// Which per-position item `orderItemMultisets` streams out of a path:
 /// its node ids, or its undirected edges packed canonically as
 /// `(@min(u,v) << 32) | @max(u,v)`.
@@ -469,6 +481,38 @@ fn orderItemMultisets(comptime kind: PathItem, a: Path, b: Path) Order {
     }
 }
 
+/// Same lexicographic-sorted-multiset comparison as `orderItemMultisets`
+/// (identical result — sorting produces the same ascending sequence
+/// regardless of *how* it's produced), but O(len log len) instead of
+/// O(len²): materializes each side into `arena` and sorts it, rather than
+/// repeatedly re-scanning for "smallest value not yet emitted". Used only on
+/// `dijkstraWithTieBreak`'s hot path (audit `isis-spf` F5, tracked here since
+/// this is the module that owns the comparator), where a per-comparison
+/// scratch arena already exists for path reconstruction — `orderItemMultisets`
+/// itself is untouched and stays the plain no-allocator entry point for
+/// `comparePaths`/`comparePathsDisjoint`'s existing callers (tests included),
+/// so nothing about the proven-correct pure API changes.
+fn orderItemMultisetsAlloc(comptime kind: PathItem, arena: Allocator, a: Path, b: Path) Allocator.Error!Order {
+    const sa = try arena.alloc(u64, pathItemCount(kind, a));
+    for (sa, 0..) |*slot, i| slot.* = pathItemAt(kind, a, i);
+    std.mem.sort(u64, sa, {}, std.sort.asc(u64));
+
+    const sb = try arena.alloc(u64, pathItemCount(kind, b));
+    for (sb, 0..) |*slot, i| slot.* = pathItemAt(kind, b, i);
+    std.mem.sort(u64, sb, {}, std.sort.asc(u64));
+
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        if (i == sa.len and j == sb.len) return .eq;
+        if (i == sa.len) return .gt; // a exhausted first: pads to +inf > y
+        if (j == sb.len) return .lt;
+        if (sa[i] != sb[j]) return if (sa[i] < sb[j]) .lt else .gt;
+        i += 1;
+        j += 1;
+    }
+}
+
 /// Secondary tie-break used to build `disjointTrees`' second ("backup"/PRP)
 /// tree. Same strict-total-order + reversal-invariance contract as
 /// `comparePaths` (see its doc comment), PLUS it should prefer candidates
@@ -508,6 +552,15 @@ pub fn comparePathsDisjoint(primary: *const Tree, a: Path, b: Path) Order {
     return comparePaths(a, b);
 }
 
+/// Same contract and same result as `comparePathsDisjoint` — see its doc
+/// comment — but O(len log len) via `comparePathsAlloc` instead of O(len²).
+/// Internal: used only by `dijkstraWithTieBreak`'s hot path.
+fn comparePathsDisjointAlloc(arena: Allocator, primary: *const Tree, a: Path, b: Path) Allocator.Error!Order {
+    const overlap = std.math.order(primaryOverlap(primary, a), primaryOverlap(primary, b));
+    if (overlap != .eq) return overlap;
+    return comparePathsAlloc(arena, a, b);
+}
+
 /// Is undirected edge `{x, y}` one of `primary`'s resolved tree edges
 /// (`pred[child] == parent` in either orientation)?
 fn isPrimaryTreeEdge(primary: *const Tree, x: NodeId, y: NodeId) bool {
@@ -545,18 +598,24 @@ const PQ = std.PriorityQueue(QueueItem, void, queueOrder);
 /// needs (`comparePathsDisjoint` needs the primary tree; `comparePaths`
 /// needs nothing). Internal — the public entry points below wire up the two
 /// Fable-core comparators; callers never construct a `TieBreak` directly.
+/// `compare` takes an allocator (audit `isis-spf` F5, owned/fixed here):
+/// `dijkstraWithTieBreak` already has a per-comparison scratch arena for
+/// path reconstruction, so the adapters route through the O(len log len)
+/// `*Alloc` comparators instead of the plain O(len²) ones — same contract,
+/// same result (sorting a multiset produces the same sequence regardless of
+/// algorithm), just less work per tie on the hot path.
 const TieBreak = struct {
     ctx: ?*anyopaque = null,
-    compare: *const fn (ctx: ?*anyopaque, a: Path, b: Path) Order,
+    compare: *const fn (ctx: ?*anyopaque, arena: Allocator, a: Path, b: Path) Allocator.Error!Order,
 };
 
-fn comparePathsAdapter(_: ?*anyopaque, a: Path, b: Path) Order {
-    return comparePaths(a, b);
+fn comparePathsAdapter(_: ?*anyopaque, arena: Allocator, a: Path, b: Path) Allocator.Error!Order {
+    return comparePathsAlloc(arena, a, b);
 }
 
-fn comparePathsDisjointAdapter(ctx: ?*anyopaque, a: Path, b: Path) Order {
+fn comparePathsDisjointAdapter(ctx: ?*anyopaque, arena: Allocator, a: Path, b: Path) Allocator.Error!Order {
     const primary: *const Tree = @ptrCast(@alignCast(ctx.?));
-    return comparePathsDisjoint(primary, a, b);
+    return comparePathsDisjointAlloc(arena, primary, a, b);
 }
 
 /// Reconstruct `root .. via .. target` (via's own predecessor chain, plus
@@ -624,7 +683,7 @@ fn dijkstraWithTieBreak(gpa: Allocator, graph: *const Graph, root: NodeId, tie_b
                 const sa = scratch.allocator();
                 const challenger = try reconstructVia(sa, pred, root, u, e.to);
                 const incumbent = try reconstructVia(sa, pred, root, pred[e.to].?, e.to);
-                if (tie_break.compare(tie_break.ctx, challenger, incumbent) == .lt) {
+                if (try tie_break.compare(tie_break.ctx, sa, challenger, incumbent) == .lt) {
                     pred[e.to] = u;
                 }
             }

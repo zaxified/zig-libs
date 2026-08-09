@@ -142,12 +142,24 @@ pub const Fabric = struct {
     slot_visited: [MAX_FRAMES]u8 = [_]u8{0} ** MAX_FRAMES,
     slot_last: [MAX_FRAMES]u8 = [_]u8{0} ** MAX_FRAMES,
     next_frame_id: u32 = 0,
+    /// Count of frame ids that have terminated (delivered, dropped, or
+    /// loop-violated — see `deliverAt`'s three terminal branches), i.e. can
+    /// never again be the target of a hop. `next_frame_id - retired_frame_id`
+    /// is therefore the number of frame ids genuinely still in flight; used
+    /// only to bound-check a fresh claim against `MAX_FRAMES` (audit F2) —
+    /// this module does not otherwise need frame lifecycle tracking.
+    retired_frame_id: u32 = 0,
 
     /// FIFO of FIB updates scheduled but not yet applied, keyed by a
     /// globally-increasing id (`% MAX_PENDING` for storage) so overlapping
     /// topology changes never alias each other's pending updates.
     pending: [MAX_PENDING]PendingUpdate = undefined,
     next_pending_id: u64 = 0,
+    /// Count of pending ids actually applied so far (`onTimer`'s
+    /// `FIB_APPLY_BASE` arm). `next_pending_id - applied_pending_id` is the
+    /// number of scheduled-but-not-yet-applied updates; used only to
+    /// bound-check a fresh claim against `MAX_PENDING` (audit F2).
+    applied_pending_id: u64 = 0,
 
     /// Absolute sim time at which the LAST-scheduled pending FIB update will
     /// apply — the conductor's transition-serialization watermark. A new
@@ -274,6 +286,12 @@ pub const Fabric = struct {
         if (self.last_apply_time + self.step_gap > base) base = self.last_apply_time + self.step_gap;
 
         for (order, 0..) |n, k| {
+            // Audit F2: `pending` is a fixed ring buffer with no ownership
+            // tag (unlike the frame slots below) — a claim past capacity
+            // would silently overwrite a still-outstanding update, and
+            // `onTimer`'s FIB_APPLY_BASE arm would then apply the WRONG
+            // node's next-hop with no way to detect it. Fail loud instead.
+            std.debug.assert(self.next_pending_id - self.applied_pending_id < MAX_PENDING);
             const slot = self.next_pending_id % MAX_PENDING;
             self.pending[slot] = .{ .node = n, .next_hop = new_tree.pred[n] };
             const apply_time: netsim.Time = base + @as(netsim.Time, @intCast(k)) * self.step_gap;
@@ -309,12 +327,19 @@ pub const Fabric = struct {
             self.loop_violation = true;
             self.loop_frame = frame_id;
             self.loop_node = node;
+            self.retired_frame_id += 1; // terminal: no further hop for this frame_id
             return;
         }
         self.slot_visited[slot] |= bit;
         self.slot_last[slot] = last_plus_one;
-        if (node == self.dest) return; // delivered
-        const next = self.next_hop[node] orelse return; // no route: drop
+        if (node == self.dest) {
+            self.retired_frame_id += 1; // terminal: delivered
+            return;
+        }
+        const next = self.next_hop[node] orelse {
+            self.retired_frame_id += 1; // terminal: no route, dropped
+            return;
+        };
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, frame_id, .little);
         try sim.send(node, next, &buf);
@@ -348,6 +373,12 @@ pub const Fabric = struct {
     fn onTimer(ctxp: *anyopaque, sim: *netsim.Sim, node: NodeId, timer_id: u64) anyerror!void {
         const self = cast(ctxp);
         if (timer_id == ORIGIN_TIMER) {
+            // Audit F2: bound-check before claiming a fresh frame slot —
+            // `slot_owner`'s mismatch check keeps stale data from being
+            // mistaken for live data, but a claim past `MAX_FRAMES`
+            // in-flight frames would still stomp a genuinely live frame's
+            // tracking state mid-flight (a mis-attributed loop check).
+            std.debug.assert(self.next_frame_id - self.retired_frame_id < MAX_FRAMES);
             const frame_id = self.next_frame_id;
             self.next_frame_id += 1;
             try self.deliverAt(sim, node, frame_id);
@@ -356,6 +387,7 @@ pub const Fabric = struct {
             const slot = (timer_id - FIB_APPLY_BASE) % MAX_PENDING;
             const upd = self.pending[slot];
             self.next_hop[upd.node] = upd.next_hop;
+            self.applied_pending_id += 1;
         } else if (timer_id >= CONDUCTOR_BASE) {
             const idx = timer_id - CONDUCTOR_BASE;
             if (idx < self.schedule.len) try self.applyTopologyChange(sim, self.schedule[idx]);
@@ -376,7 +408,9 @@ pub const Fabric = struct {
         @memset(&self.slot_visited, 0);
         @memset(&self.slot_last, 0);
         self.next_frame_id = 0;
+        self.retired_frame_id = 0;
         self.next_pending_id = 0;
+        self.applied_pending_id = 0;
         self.last_apply_time = 0;
         self.loop_violation = false;
         self.loop_frame = null;

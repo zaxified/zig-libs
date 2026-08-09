@@ -511,6 +511,14 @@ pub fn decryptCompact(
 
     const cek_len = parsed.enc.cekLen() orelse return error.UnsupportedEnc;
     var cek_buf: [max_cek_len]u8 = undefined;
+    // Z1 (CONVENTIONS.md §2.1): module-owned storage holding the recovered
+    // CEK, known death at function return, not on the Z2/Z3 lists — MUST
+    // wipe. Registered before any of the per-`alg` arms below (all fallible)
+    // fill it, so every error path still wipes whatever was written so far.
+    // `enc.decrypt` below is the CEK's last use, so this defer also covers
+    // the success path. Matches the `z_buf`/`kek_buf` defers already present
+    // in this same function's ECDH-ES/GCMKW arms.
+    defer std.crypto.secureZero(u8, &cek_buf);
     const cek = cek_buf[0..cek_len];
 
     const encrypted_key = try decodeSegmentAlloc(arena, ek_b64);
@@ -537,6 +545,12 @@ pub fn decryptCompact(
             // own buffer-size check can't leak length info) — use a
             // dedicated max-size scratch, then copy the actual CEK out.
             var oaep_buf: [max_encrypted_key_len]u8 = undefined;
+            // Z1 (CONVENTIONS.md §2.1, audit F1): this scratch holds the
+            // full OAEP-decrypted message (the recovered CEK is a prefix of
+            // it) — module-owned, known death, not Z2/Z3. Registered before
+            // the fallible unwrap call so a failed/rejected unwrap still
+            // wipes whatever the RSA op wrote.
+            defer std.crypto.secureZero(u8, &oaep_buf);
             const got = try alg.rsaOaepUnwrap(sk, hash, encrypted_key, &oaep_buf);
             if (got.len != cek_len) return error.InvalidKey;
             @memcpy(cek, got[0..cek_len]);

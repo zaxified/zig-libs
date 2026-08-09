@@ -556,13 +556,20 @@ pub const Bulkhead = struct {
 /// step.
 pub const Jitter = enum {
     /// No randomization — delays are exactly the exponential schedule.
-    /// The default only because randomness must be injected (Zig 0.16 std
-    /// has no ambient entropy and this module has no hidden globals) —
-    /// production callers with many clients should pass a seeded
-    /// `std.Random` and pick `.full`.
+    /// Not the default (audit F2): synchronized retrying clients would
+    /// stampede a recovering upstream in lockstep, the exact failure mode
+    /// this type exists to prevent. Still explicitly available for tests
+    /// (byte-exact delay assertions) and genuinely single-client callers
+    /// where there's no herd to desynchronize.
     none,
-    /// **Full jitter** (recommended): uniform in `[0, d]`. Best contention
-    /// spread per AWS "Exponential Backoff And Jitter" (Brooker, 2015).
+    /// **Full jitter** (recommended, and the default): uniform in `[0, d]`.
+    /// Best contention spread per AWS "Exponential Backoff And Jitter"
+    /// (Brooker, 2015). Only takes effect when `Policy.random` (or
+    /// `nextDelay`'s `random` argument) is non-null — Zig 0.16 std has no
+    /// ambient entropy and this module has no hidden globals, so a caller
+    /// who never supplies randomness gets the plain `.none` schedule
+    /// regardless of this default (see `nextDelay`'s doc). Production
+    /// callers with many clients should pass a seeded `std.Random`.
     full,
     /// Equal jitter: uniform in `[d/2, d]` — keeps at least half the
     /// backoff when a minimum spacing matters more than maximum spread.
@@ -584,7 +591,12 @@ pub const Retry = struct {
     /// Upper bound on any single delay (applied before jitter, so it also
     /// bounds every jittered delay).
     max_delay_ms: u64 = 30_000,
-    jitter: Jitter = .none,
+    /// Default `.full` (audit F2 — was `.none`; see `Jitter`'s doc). Harmless
+    /// to leave at the default: it only changes behavior once a real
+    /// `random` is also supplied (`Policy.random` / `nextDelay`'s argument),
+    /// so a caller who hasn't wired up entropy gets today's un-jittered
+    /// schedule exactly as before.
+    jitter: Jitter = .full,
     /// Only errors this returns true for are retried (resilience4j
     /// `retryExceptions`); anything else propagates immediately. The
     /// default retries everything — including `error.Timeout` from the
@@ -1340,6 +1352,27 @@ test "Retry.nextDelay: jitter bounds and seeded determinism" {
 
     // A jittered policy without an rng falls back to the plain schedule.
     try testing.expectEqual(200, full.nextDelay(2, null));
+}
+
+test "Retry.nextDelay: jitter defaults to .full — supplying randomness alone is enough to jitter (audit F2)" {
+    // No `.jitter` set — relies entirely on `Retry`'s field default.
+    const r: Retry = .{ .base_delay_ms = 1000, .factor = 1.0, .max_delay_ms = 1000 };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    // Un-jittered (the old default, `.none`), every draw would be exactly
+    // 1000 — `nextDelay` would never look at `rnd` at all. With the new
+    // default (`.full`) and real entropy supplied, a uniform draw in
+    // [0, 1000] lands strictly below the ceiling with overwhelming
+    // probability at least once across 49 attempts (odds of all 49 landing
+    // exactly on 1000 are ~(1/1001)^49) — proof the default flavor actually
+    // took effect, not just that `nextDelay` ran.
+    var saw_below_ceiling = false;
+    for (1..50) |attempt| {
+        const d = r.nextDelay(@intCast(attempt), rnd);
+        try testing.expect(d <= 1000);
+        if (d < 1000) saw_below_ceiling = true;
+    }
+    try testing.expect(saw_below_ceiling);
 }
 
 test "Deadline: expired/remaining through the injected clock" {

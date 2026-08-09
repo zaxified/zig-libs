@@ -694,7 +694,7 @@ pub const BrokenRaft = struct {
         var buf: [types.AppendEntriesResp.wire_len]u8 = undefined;
         (types.AppendEntriesResp{ .term = self.current_term[node], .success = true, .match_index = 0 }).encode(&buf);
         var nb: [CLUSTER_N]NodeId = undefined;
-        const n = sim.neighbors(node, &nb);
+        const n = try sim.neighbors(node, &nb);
         for (nb[0..n]) |peer| try sim.send(node, peer, &buf);
         try sim.setTimer(node, self.timeout, 0);
     }

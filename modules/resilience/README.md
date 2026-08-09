@@ -97,12 +97,14 @@ the point; call `run` again later to probe after the cooldown.
   half_open` transition is lazy — `state()` reports `.open` after the
   cooldown until an `allow()` asks to probe.
 - **Jitter:** **full jitter** is the recommended flavor (uniform `[0, d]`,
-  best contention spread per the AWS analysis); `equal` (`[d/2, d]`) and
-  `none` are available. The *default* is `none` only because randomness must
-  be injected — Zig 0.16 std has no ambient entropy and this module has no
-  hidden globals; pass a seeded `std.Random` and pick `.full` in production.
-  With a jittered flavor and no rng, delays deterministically fall back to
-  the un-jittered schedule.
+  best contention spread per the AWS analysis) and the *default*; `equal`
+  (`[d/2, d]`) and `none` are also available. A jittered flavor only takes
+  effect once you also pass a seeded `std.Random` — Zig 0.16 std has no
+  ambient entropy and this module has no hidden globals, so with no rng
+  supplied, delays deterministically fall back to the un-jittered schedule
+  regardless of `jitter`'s value (safe default even before you wire up
+  entropy). Pick `none` explicitly for byte-exact test assertions or a
+  genuinely single-client caller with no herd to desynchronize.
 - **Delay injection:** waits between attempts go through `Policy.delay` —
   `.blocking` (posix `nanosleep`, the production default) or `.none`, or any
   injected fn; tests inject a recording no-op, so no test ever sleeps.

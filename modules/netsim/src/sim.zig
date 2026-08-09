@@ -366,14 +366,16 @@ pub const Sim = struct {
     }
 
     /// Fill `out` with `node`'s out-neighbors; returns how many were written.
-    pub fn neighbors(self: *const Sim, node: NodeId, out: []NodeId) usize {
-        var n: usize = 0;
-        for (self.out_adj.items[node].items) |idx| {
-            if (n >= out.len) break;
-            out[n] = self.links.items[idx].b;
-            n += 1;
-        }
-        return n;
+    /// Fails closed rather than silently truncating (audit F2): a node with
+    /// more out-neighbors than `out` can hold previously dropped the excess
+    /// with no signal, which could mask (or fabricate) a protocol bug under
+    /// a scenario the caller never sized its buffer for — exactly the class
+    /// of failure this simulator exists to catch, not hide.
+    pub fn neighbors(self: *const Sim, node: NodeId, out: []NodeId) error{TooManyNeighbors}!usize {
+        const adj = self.out_adj.items[node].items;
+        if (adj.len > out.len) return error.TooManyNeighbors;
+        for (adj, 0..) |idx, n| out[n] = self.links.items[idx].b;
+        return adj.len;
     }
 
     /// Schedule delivery of `payload` (copied) from `from` to `to`, subject to
@@ -769,14 +771,23 @@ test "adjacency index stays in agreement with the link list" {
         }
 
         var out: [8]NodeId = undefined;
-        try testing.expectEqual(expected, sim.neighbors(@intCast(a), &out));
+        try testing.expectEqual(expected, try sim.neighbors(@intCast(a), &out));
     }
 
     // The isolated node has no out-neighbors and no links.
     var out: [8]NodeId = undefined;
-    try testing.expectEqual(@as(usize, 0), sim.neighbors(ids[5], &out));
+    try testing.expectEqual(@as(usize, 0), try sim.neighbors(ids[5], &out));
 
-    // `neighbors` still honors a short output buffer.
+    // audit F2: `neighbors` now fails closed instead of silently truncating.
+    // `ids[0]` has 4 real out-neighbors (to ids[1]/ids[2]/ids[3] via the
+    // bi-links above, plus the self-loop) — a buffer that can hold only 2
+    // must be refused, not quietly handed the first 2 and no signal.
     var tiny: [2]NodeId = undefined;
-    try testing.expectEqual(@as(usize, 2), sim.neighbors(ids[0], &tiny));
+    try testing.expectError(error.TooManyNeighbors, sim.neighbors(ids[0], &tiny));
+    // A buffer sized to fit exactly is fine, and `out` past the written
+    // count is untouched (unlike the old always-fill-what-fits behavior,
+    // there is no partial write to be careful about on error, but pin it
+    // anyway as a contract, not an accident of the current implementation).
+    var exact: [4]NodeId = undefined;
+    try testing.expectEqual(@as(usize, 4), try sim.neighbors(ids[0], &exact));
 }

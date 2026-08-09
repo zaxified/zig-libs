@@ -34,6 +34,7 @@ techniques. See ../../NOTICE.
 |---|---|---|
 | `Pool.add(spec)` | register `{ id, "host:port", weight }`; builds breaker + optional bulkhead | nothing (typed errors, bounded fleet) |
 | `pick()` | next healthy upstream per `Strategy`, skipping down / breaker-open / bulkhead-full; null when none | a matching `report()` per pick |
+| `pickGuarded()` | `pick()`, wrapped in a `PickGuard` so the mandatory report is one `defer g.report(ok, rtt)` | same admission as `pick()` — see semantics notes |
 | `report(u, ok, rtt)` | passive health: feeds the breaker, frees the slot, folds latency/EWMA | — |
 | `healthTick(now)` | active health: mark up/down + breaker recovery probe, at most once per interval | an injected `HealthChecker`, caller-supplied `now` |
 | `call(op, .{.max_tries})` | route + failover: pick → run → report → next healthy on failure | an op with `call(self, u: *Upstream) E!T` |
@@ -89,7 +90,11 @@ pool.healthTick(now_ns);
   upstream's bulkhead slot and its breaker admission and bumped in-flight —
   follow every successful pick with **exactly one** `report()` (`call()`
   does this for you). A lost report leaks the slot and, in a half-open
-  breaker, the probe budget.
+  breaker, the probe budget. If you're not going through `call()`, prefer
+  `pickGuarded()` over the bare `pick()`/`report()` pair — it returns a
+  `PickGuard` so the mandatory report is a single `defer g.report(ok, rtt)`
+  right after the pick, which fires on every exit path (including an early
+  error return) instead of a call you have to remember to place on each one.
 - **Passive vs active health.** `report(ok=false)` feeds the breaker —
   `failure_threshold` consecutive failures trip it and `pick` skips the
   upstream until the cooldown admits a probe. `healthTick` is orthogonal:

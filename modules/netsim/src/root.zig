@@ -150,7 +150,7 @@ const Flood = struct {
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, epoch, .little);
         var nb: [16]NodeId = undefined;
-        const n = sim.neighbors(node, &nb);
+        const n = try sim.neighbors(node, &nb);
         for (nb[0..n]) |peer| {
             if (exclude) |ex| {
                 if (peer == ex) continue;

@@ -241,8 +241,19 @@ pub const Options = struct {
     /// Time source — inject a fake for deterministic tests. The algorithm
     /// never reads a wall clock on its own.
     clock: Clock = .monotonic,
-    /// Client-key extraction used by `middleware()`.
-    key: KeySource = .forwarded_ip,
+    /// Client-key extraction used by `middleware()`. **No default, by
+    /// design** (audit F1): `.forwarded_ip` is the right choice behind a
+    /// trusted reverse proxy but is client-forgeable — a direct-internet
+    /// deployment that silently inherited it as a default would let an
+    /// attacker rotate `X-Forwarded-For` values to dodge the limiter almost
+    /// entirely (a fresh bucket per forged value, not just "their own
+    /// bucket"). There is no universally-safe default either way: flipping
+    /// it to peer-address-only would silently misbehave for the (likely
+    /// more common) proxied deployment, collapsing every client behind the
+    /// proxy into one shared bucket. Forcing an explicit choice here trades
+    /// a silent footgun for a compile-time decision point — see the module
+    /// doc comment's "Client-key trust policy" section before picking.
+    key: KeySource,
 };
 
 /// Per-key token buckets in a bounded LRU store.
@@ -553,6 +564,7 @@ test "Limiter: burst-then-throttle and refill through the injected clock" {
         .rate_per_s = 1,
         .burst = 2,
         .clock = tc.clock(),
+        .key = .forwarded_ip,
     });
     defer l.deinit();
 
@@ -571,7 +583,7 @@ test "Limiter: burst-then-throttle and refill through the injected clock" {
 
 test "Limiter: per-key isolation" {
     var tc: TestClock = .{};
-    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 1, .clock = tc.clock() });
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
     defer l.deinit();
 
     try testing.expect(l.allow("alice").allowed);
@@ -591,6 +603,7 @@ test "Limiter: LRU eviction at max_keys; evicted keys restart fresh" {
         .max_keys = 2,
         .ttl_ms = 0,
         .clock = tc.clock(),
+        .key = .forwarded_ip,
     });
     defer l.deinit();
 
@@ -618,6 +631,7 @@ test "Limiter: max_key_len truncates over-long keys instead of storing them whol
         .burst = 1,
         .max_key_len = 8,
         .clock = tc.clock(),
+        .key = .forwarded_ip,
     });
     defer l.deinit();
 
@@ -643,6 +657,7 @@ test "Limiter: TTL resets idle keys and sweeps their memory" {
         .burst = 2,
         .ttl_ms = 1000,
         .clock = tc.clock(),
+        .key = .forwarded_ip,
     });
     defer l.deinit();
 
@@ -666,7 +681,7 @@ test "Limiter: TTL resets idle keys and sweeps their memory" {
 test "Limiter: fail-open when the allocator is exhausted" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var tc: TestClock = .{};
-    var l = Limiter.init(failing.allocator(), .{ .rate_per_s = 1, .burst = 1, .clock = tc.clock() });
+    var l = Limiter.init(failing.allocator(), .{ .rate_per_s = 1, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
     defer l.deinit();
 
     // Tracking the key fails → request allowed, nothing stored.
@@ -684,6 +699,7 @@ test "Limiter: concurrent allow admits exactly burst (no over-admission)" {
         .rate_per_s = 0.000001,
         .burst = burst,
         .clock = tc.clock(),
+        .key = .forwarded_ip,
     });
     defer l.deinit();
 
@@ -773,7 +789,7 @@ const RouterUnderLimit = struct {
 
 test "middleware: burst then golden 429 with Retry-After; deny skips the handler" {
     var tc: TestClock = .{};
-    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 2, .clock = tc.clock() });
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 2, .clock = tc.clock(), .key = .forwarded_ip });
     defer l.deinit();
     var rl = try RouterUnderLimit.init(&l);
     defer rl.deinit();
@@ -812,7 +828,7 @@ test "middleware: burst then golden 429 with Retry-After; deny skips the handler
 
 test "middleware: key extraction — XFF forms, X-Real-IP, fallback key" {
     var tc: TestClock = .{};
-    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock() });
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
     defer l.deinit();
     var rl = try RouterUnderLimit.init(&l);
     defer rl.deinit();
@@ -843,7 +859,7 @@ test "middleware: key extraction — XFF forms, X-Real-IP, fallback key" {
 
 test "middleware: socket peer address is the fallback key (port-insensitive, v4-mapped unified)" {
     var tc: TestClock = .{};
-    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock() });
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
     defer l.deinit();
     var rl = try RouterUnderLimit.init(&l);
     defer rl.deinit();
@@ -929,7 +945,7 @@ test "integration: limited route over loopback — 200s, 429 + Retry-After, key 
 
     // Real monotonic clock; refill is slow (0.1/s) so the burst can't
     // recover within the test even on a very slow machine.
-    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.1, .burst = 2 });
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.1, .burst = 2, .key = .forwarded_ip });
     defer l.deinit();
 
     var r = router.Router.init(testing.allocator);

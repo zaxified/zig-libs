@@ -168,6 +168,11 @@ test "EntryReader decodes xl/sharedStrings.xml from the real fixture: exact byte
     // recomputed here via std.hash.Crc32 — independent of this module's read
     // path (the CRC-32 the archive itself reports is never consulted).
     try testing.expectEqual(@as(u32, 0x72036c90), std.hash.Crc32.hash(out.items));
+    // `EntryReader`'s own CRC-32 verification (audit F4) also ran during the
+    // read above and agreed — proof it works against a real writer's local
+    // header with zeroed crc/sizes (LibreOffice's data-descriptor shape, see
+    // this file's doc comment), not just against this module's own encoder.
+    try testing.expect(!er.crcMismatch());
 
     // The shared-strings table for the source CSV (name,qty / widget,3 /
     // gadget,7) must literally contain these four values as XML text.
@@ -204,4 +209,5 @@ test "EntryReader decodes xl/worksheets/sheet1.xml from the real fixture: exact 
     try testing.expectEqual(@as(u32, 0x85dd2fb9), std.hash.Crc32.hash(out.items));
     try testing.expect(std.mem.indexOf(u8, out.items, "<worksheet") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "dimension ref=\"A1:B3\"") != null);
+    try testing.expect(!er.crcMismatch());
 }
