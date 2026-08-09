@@ -1,5 +1,8 @@
-websocket — third-party attribution and corpus provenance
+websocket — provenance note
 ====================================================================
+
+Record only. Nothing here carries a condition beyond MIT's own "preserve the
+notice" — see the licence reasoning in §2. CONVENTIONS.md §5.
 
 This module's own code is MIT (see the repository LICENSE). This file records
 where its two external conformance corpora came from and why neither carries a
