@@ -178,7 +178,7 @@ non-exhaustive function-code decode; `objects` (18) — qualifier byte round-tri
 round-trips for every implemented range shape (1/2/4-byte start-stop, all-values, count+prefix,
 4-byte count), range/qualifier-mismatch and value-out-of-range errors, a short/garbage decode
 sweep, flags-byte round-trip, and an encode/decode round-trip for every core object
-(g1v1 packed bits, g1v2, g12v1 CROB, g20v1/v2, g30v1/v2/v5, g40v1, g41v1/v2/v3, g50v1) plus a
+(g1v1 packed bits, g1v2, g12v1 CROB, g20v1/v2, g30v1/v2, g40v1, g41v1/v2/v3, g50v1) plus a
 short-record error sweep; `sa` (20) — AES-KW RFC 3394 §4.1/§4.3/§4.6 vectors + wrong-KEK/corruption
 reject + malformed-length errors (integration tests through the shared `modules/aeskw` module, which
 carries its own byte-exact KAT suite), HMAC-SHA-256 (RFC 4231) and HMAC-SHA-1 (RFC 2202) truncation KATs,

@@ -530,25 +530,11 @@ pub const g30 = struct {
         }
     };
 
-    /// g30v5: flags(1) + IEEE-754 single-precision float(4, LE) -- 5 bytes.
-    pub const V5 = struct {
-        flags: Flags,
-        value: f32,
-
-        pub const wire_len = 5;
-
-        pub fn encode(self: V5, out: []u8) error{BufferTooSmall}![]u8 {
-            if (out.len < wire_len) return error.BufferTooSmall;
-            out[0] = self.flags.toByte();
-            std.mem.writeInt(u32, out[1..5], @bitCast(self.value), .little);
-            return out[0..wire_len];
-        }
-
-        pub fn decode(bytes: []const u8) error{ShortRecord}!V5 {
-            if (bytes.len < wire_len) return error.ShortRecord;
-            return .{ .flags = Flags.fromByte(bytes[0]), .value = @bitCast(std.mem.readInt(u32, bytes[1..5], .little)) };
-        }
-    };
+    // g30v5 (flags + IEEE-754 single-precision float, 5 bytes) has no
+    // dedicated codec here: the real analog-input path (`outstation.zig`'s
+    // `analogValue()` -> `records.zig`'s table-driven `.f32` encode/decode)
+    // covers the identical wire shape, and nothing else in this module reads
+    // or writes g30v5 through a standalone struct. See `records.zig`.
 };
 
 // ── g40: Analog Output Status ────────────────────────────────────────────────
@@ -861,7 +847,7 @@ test "g20 counter v1/v2 round-trip" {
     try testing.expectEqual(@as(u16, 4321), back2.value);
 }
 
-test "g30 analog input v1/v2/v5 round-trip (incl. negative + float)" {
+test "g30 analog input v1/v2 round-trip (incl. negative)" {
     var out: [8]u8 = undefined;
     const v1 = g30.V1{ .flags = .{}, .value = -12345 };
     const back1 = try g30.V1.decode(try v1.encode(&out));
@@ -870,10 +856,6 @@ test "g30 analog input v1/v2/v5 round-trip (incl. negative + float)" {
     const v2 = g30.V2{ .flags = .{}, .value = -100 };
     const back2 = try g30.V2.decode(try v2.encode(&out));
     try testing.expectEqual(@as(i16, -100), back2.value);
-
-    const v5 = g30.V5{ .flags = .{}, .value = 3.14159 };
-    const back5 = try g30.V5.decode(try v5.encode(&out));
-    try testing.expectApproxEqAbs(@as(f32, 3.14159), back5.value, 0.0001);
 }
 
 test "g40 analog output status round-trip" {
@@ -912,7 +894,7 @@ test "record decode: short buffers are typed errors, never panics" {
     try testing.expectError(error.ShortRecord, g1.V2.decode(&.{}));
     try testing.expectError(error.ShortRecord, g12.V1.decode(&.{ 0, 0 }));
     try testing.expectError(error.ShortRecord, g20.V1.decode(&.{0}));
-    try testing.expectError(error.ShortRecord, g30.V5.decode(&.{ 0, 0, 0 }));
+    try testing.expectError(error.ShortRecord, g30.V1.decode(&.{ 0, 0, 0 }));
     try testing.expectError(error.ShortRecord, g50.V1.decode(&.{ 0, 0 }));
 }
 
