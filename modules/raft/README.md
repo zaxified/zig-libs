@@ -45,14 +45,18 @@ reusable against any Raft-shaped state.
 ## Verify
 
 ```
-zig build test-raft                      # Debug        — 41 pass
-zig build test-raft -Doptimize=ReleaseFast   # ReleaseFast — 41 pass
+zig build test-raft                      # Debug        — 58 pass
+zig build test-raft -Doptimize=ReleaseFast   # ReleaseFast — 58 pass
 ```
 
-The two model-check tests drive the real `RaftServer` through a 300-seed fuzzed
-fault sweep (all five invariants live) and a quiet-network election-liveness
-run. The `BrokenRaft` positive-control tests MUST trip the Election-Safety
-checker — proving the harness has teeth independent of the core.
+The model-check tests drive the real `RaftServer` through a 300-seed fuzzed
+fault sweep (all five invariants live), a quiet-network election-liveness run,
+and two step-down regressions that demote a real leader with a higher-term
+RESPONSE and then require it to stand for election again AND to grant a vote in
+the term it just adopted (see SPEC.md — stepping down must clear `votedFor` and
+re-arm the election timer). The `BrokenRaft` positive-control
+tests MUST trip the Election-Safety checker — proving the harness has teeth
+independent of the core.
 
 Provenance: clean-room from the Raft paper (a public spec — no third-party source
 ported or studied). VOPR-style model-checking methodology via `netsim`. No

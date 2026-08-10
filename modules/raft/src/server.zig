@@ -280,6 +280,27 @@ pub const RaftServer = struct {
         try sim.setTimer(node, delay, ns.election_epoch);
     }
 
+    /// Adopt `new_term`, revert to follower (§5.1) and RE-ARM the election
+    /// timer.
+    ///
+    /// The re-arm is the part that is easy to lose, and losing it is a silent
+    /// liveness bug rather than a crash. A leader holds NO live election timer:
+    /// `onTimer` swallows the one it armed as a candidate (`role == .leader` →
+    /// return) without re-arming, because a leader must not campaign against
+    /// itself. So from one timeout after its election, a leader's only way back
+    /// to an armed timer is a step-down that re-arms. A step-down that does not
+    /// leaves a node that answers every RPC correctly and is never electable
+    /// again — see the `demoted by a RESPONSE` regression test, which asserts an
+    /// election actually STARTS, since asserting `role == .follower` passes
+    /// either way.
+    fn stepDown(self: *RaftServer, sim: *Sim, node: NodeId, new_term: Term) anyerror!void {
+        const ns = &self.nodes[node];
+        ns.current_term = new_term;
+        ns.role = .follower;
+        ns.voted_for = no_vote;
+        try self.resetElectionTimer(sim, node);
+    }
+
     fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
         const self = cast(ctx);
         self.nodes[node].role = .follower;
@@ -298,6 +319,11 @@ pub const RaftServer = struct {
         }
         // Election timer — ignore if superseded by a newer epoch.
         if (timer_id != self.nodes[node].election_epoch) return;
+        // A leader does not campaign, so its election timer is dropped here
+        // WITHOUT being re-armed — which is precisely why every step-down must
+        // re-arm it (`stepDown`). Do not "simplify" this by re-arming here: the
+        // node would then campaign on the remainder of a stale timeout instead
+        // of a fresh one.
         if (self.nodes[node].role == .leader) return;
         try self.startElection(sim, node);
     }
@@ -466,11 +492,10 @@ pub const RaftServer = struct {
                 d.voted_for = req.candidate_id;
             }
         }
-        if (d.term_advanced) {
-            ns.current_term = d.new_term;
-            ns.role = .follower;
-            ns.voted_for = no_vote;
-        }
+        // Step down BEFORE the grant branch: a refused vote (the candidate's
+        // log is not up to date) still adopts the term and still demotes, and
+        // then only `stepDown`'s re-arm keeps this node electable.
+        if (d.term_advanced) try self.stepDown(sim, node, d.new_term);
         if (d.grant) {
             ns.voted_for = d.voted_for;
             try self.resetElectionTimer(sim, node);
@@ -485,9 +510,7 @@ pub const RaftServer = struct {
         const resp = types.RequestVoteResp.decode(payload) catch |e| return self.dropMalformed(e);
         const obs = safety.observeTerm(ns.current_term, resp.term);
         if (obs.term_advanced) {
-            ns.current_term = obs.new_term;
-            ns.role = .follower;
-            ns.voted_for = no_vote;
+            try self.stepDown(sim, node, obs.new_term);
             return;
         }
         if (ns.role != .candidate or resp.term != ns.current_term) return;
@@ -540,14 +563,11 @@ pub const RaftServer = struct {
     }
 
     fn handleAppendResp(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
-        _ = sim;
         const ns = &self.nodes[node];
         const resp = types.AppendEntriesResp.decode(payload) catch |e| return self.dropMalformed(e);
         const obs = safety.observeTerm(ns.current_term, resp.term);
         if (obs.term_advanced) {
-            ns.current_term = obs.new_term;
-            ns.role = .follower;
-            ns.voted_for = no_vote;
+            try self.stepDown(sim, node, obs.new_term);
             return;
         }
         if (ns.role != .leader or resp.term != ns.current_term) return;
@@ -950,6 +970,302 @@ test "positive control: the index-only §5.4.1 election restriction is caught LI
         const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = srv.protocol(), .until = DIRECTED_UNTIL };
         const r = try netsim.replay(gpa, case, &trace, null);
         try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    }
+}
+
+// ── stepping down must RE-ARM the election timer (a liveness regression) ────
+//
+// A leader has NO live election timer: `onTimer` sees `role == .leader` and
+// swallows the fired timer without re-arming it (a leader does not campaign
+// against itself), and `resetElectionTimer` is what re-arms. So from one full
+// timeout after it was elected, a leader's only route back to an armed timer is
+// a step-down that calls `resetElectionTimer`.
+//
+// `handleAppendReq` does that. Every OTHER step-down path did not: a higher term
+// observed on an AppendEntries RESPONSE, on a RequestVote response, or on a
+// RequestVote request that is refused (candidate's log not up to date) demoted
+// the node to `.follower` and left it with no timer at all. Such a node is not
+// wedged in any way a crash test can see — it answers every RPC correctly — it
+// has simply stopped being electable, forever, unless some other leader happens
+// to talk to it. If the rest of the cluster is gone, the cluster is dead with a
+// perfectly healthy-looking node in it.
+//
+// Hence the assertion below is on LIVENESS, not on state: a test that checked
+// `role == .follower` after the step-down passes against the bug — that part was
+// always right. What fails is that the timeout never comes.
+
+const StepDownVia = enum {
+    /// `handleAppendResp` — a follower/candidate replies with a higher term.
+    append_resp,
+    /// `handleVoteResp` — a peer's vote reply carries a higher term.
+    vote_resp,
+    /// `handleVoteReq` — a candidate at a higher term whose log is NOT up to
+    /// date: the vote is REFUSED (so the grant branch's re-arm never runs) but
+    /// the term is still adopted and the role still drops to follower. Not
+    /// named in the finding; found by sweeping every `role = .follower` site.
+    vote_req_refused,
+};
+
+/// Wraps `RaftServer`'s vtable and, at a chosen time, hand-delivers ONE forged
+/// higher-term message to `target` — the step-down trigger — through the real
+/// `onMessageFn`. Everything else is forwarded untouched, so the cluster,
+/// timers and safety checks are the real ones.
+const StepDownProbe = struct {
+    srv: *RaftServer,
+    via: StepDownVia,
+    target: NodeId,
+    inject_at: Time,
+    /// If set, deliver a SECOND message this many ticks after the step-down: a
+    /// legitimate RequestVote at the term the node has just adopted, from a
+    /// candidate whose log is exactly as up-to-date. Nothing about that message
+    /// carries a term bump, so `handleRequestVote`'s own step-up compensation
+    /// does not apply and the grant depends purely on `votedFor` having been
+    /// cleared by the step-down.
+    follow_up_after: ?Time = null,
+    /// Observed at injection time — the preconditions the test asserts, so a
+    /// scheduling change that stops producing the situation FAILS rather than
+    /// silently testing nothing.
+    injected: bool = false,
+    was_leader: bool = false,
+    term_before: Term = 0,
+    voted_for_before: NodeId = no_vote,
+    role_after: Role = .follower,
+    term_after: Term = 0,
+    follow_up_done: bool = false,
+    follow_up_term: Term = 0,
+    voted_for_after_follow_up: NodeId = no_vote,
+
+    const INJECT_TIMER: u64 = std.math.maxInt(u64) - 1;
+    const FOLLOWUP_TIMER: u64 = std.math.maxInt(u64) - 2;
+
+    fn protocol(self: *StepDownProbe) Protocol {
+        return .{
+            .ctx = self,
+            .onStartFn = onStart,
+            .onMessageFn = onMessage,
+            .onTimerFn = onTimer,
+            .checkFn = check,
+            .resetFn = reset,
+        };
+    }
+
+    fn cast(ctx: *anyopaque) *StepDownProbe {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn reset(ctx: *anyopaque) void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        inner.resetFn.?(inner.ctx);
+        self.injected = false;
+        self.was_leader = false;
+        self.term_before = 0;
+        self.voted_for_before = no_vote;
+        self.role_after = .follower;
+        self.term_after = 0;
+        self.follow_up_done = false;
+        self.follow_up_term = 0;
+        self.voted_for_after_follow_up = no_vote;
+    }
+
+    fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        try inner.onStartFn.?(inner.ctx, sim, node);
+        if (node == self.target) try sim.setTimer(node, self.inject_at, INJECT_TIMER);
+    }
+
+    fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        try inner.onMessageFn(inner.ctx, sim, node, from, payload);
+    }
+
+    fn onTimer(ctx: *anyopaque, sim: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        switch (timer_id) {
+            INJECT_TIMER => try self.stepDownInjection(inner, sim, node),
+            FOLLOWUP_TIMER => try self.voteReqInjection(inner, sim, node),
+            else => try inner.onTimerFn.?(inner.ctx, sim, node, timer_id),
+        }
+    }
+
+    fn stepDownInjection(self: *StepDownProbe, inner: Protocol, sim: *Sim, node: NodeId) anyerror!void {
+        const ns = &self.srv.nodes[node];
+        self.injected = true;
+        self.was_leader = ns.role == .leader;
+        self.term_before = ns.current_term;
+        self.voted_for_before = ns.voted_for;
+        const higher = ns.current_term + 1;
+        const peer: NodeId = if (node == 0) 1 else 0;
+        switch (self.via) {
+            .append_resp => {
+                var buf: [types.AppendEntriesResp.wire_len]u8 = undefined;
+                (types.AppendEntriesResp{ .term = higher, .success = false, .match_index = 0 }).encode(&buf);
+                try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
+            },
+            .vote_resp => {
+                var buf: [types.RequestVoteResp.wire_len]u8 = undefined;
+                (types.RequestVoteResp{ .term = higher, .vote_granted = false }).encode(&buf);
+                try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
+            },
+            .vote_req_refused => {
+                var buf: [types.RequestVoteReq.wire_len]u8 = undefined;
+                // An EMPTY log at a higher term: §5.4.1 refuses the vote (the
+                // leader's own log is long), so only the term step-down runs.
+                (types.RequestVoteReq{
+                    .term = higher,
+                    .candidate_id = peer,
+                    .last_log_index = 0,
+                    .last_log_term = 0,
+                }).encode(&buf);
+                try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
+            },
+        }
+        self.role_after = ns.role;
+        self.term_after = ns.current_term;
+        if (self.follow_up_after) |d| try sim.setTimer(node, d, FOLLOWUP_TIMER);
+    }
+
+    /// The second message: a legitimate RequestVote at the node's CURRENT term
+    /// (no step-up), from a candidate claiming this node's own log summary — so
+    /// §5.4.1 is satisfied exactly, and the only remaining gate is `votedFor`.
+    fn voteReqInjection(self: *StepDownProbe, inner: Protocol, sim: *Sim, node: NodeId) anyerror!void {
+        const ns = &self.srv.nodes[node];
+        const peer: NodeId = if (node == 0) 1 else 0;
+        const info = ns.log.info();
+        self.follow_up_term = ns.current_term;
+        var buf: [types.RequestVoteReq.wire_len]u8 = undefined;
+        (types.RequestVoteReq{
+            .term = ns.current_term,
+            .candidate_id = peer,
+            .last_log_index = info.last_index,
+            .last_log_term = info.last_term,
+        }).encode(&buf);
+        try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
+        self.follow_up_done = true;
+        self.voted_for_after_follow_up = ns.voted_for;
+    }
+
+    fn check(ctx: *anyopaque, sim: *const Sim) anyerror!void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        try inner.checkFn.?(inner.ctx, sim);
+    }
+};
+
+/// Node 0 is the only candidate at t=100 and wins term 1 uncontested: the next
+/// node's first timeout is 40 ticks later, far past the ~12 ticks the election
+/// takes on a 5±2-tick link. Its own election timer then fires at t=200 and is
+/// swallowed by the `role == .leader` branch of `onTimer`, which is the state
+/// the regression needs.
+const LIVENESS_CFG = RaftConfig{ .election_timeout = 100, .election_spread = 40, .heartbeat_period = 30 };
+const INJECT_AT: Time = 600;
+const LIVENESS_UNTIL: Time = 1400;
+
+/// Isolate the target by crashing every peer one tick before the step-down, so
+/// that after it nothing can re-arm its timer FOR it. Without this the bug is
+/// masked: a surviving leader's next heartbeat lands in `handleAppendReq`, which
+/// re-arms — the one step-down path that was already correct.
+const CRASH_PEERS = [_]netsim.FaultEvent{
+    .{ .time = INJECT_AT - 1, .kind = .{ .crash_node = .{ .node = 1 } } },
+    .{ .time = INJECT_AT - 1, .kind = .{ .crash_node = .{ .node = 2 } } },
+    .{ .time = INJECT_AT - 1, .kind = .{ .crash_node = .{ .node = 3 } } },
+    .{ .time = INJECT_AT - 1, .kind = .{ .crash_node = .{ .node = 4 } } },
+};
+
+test "real: a leader demoted by a RESPONSE re-arms its election timer and stands for election again" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    for ([_]StepDownVia{ .append_resp, .vote_resp, .vote_req_refused }) |via| {
+        var srv = try RaftServer.init(gpa, CLUSTER_N, LIVENESS_CFG);
+        defer srv.deinit(gpa);
+        var probe = StepDownProbe{ .srv = &srv, .via = via, .target = 0, .inject_at = INJECT_AT };
+        const case = netsim.Case{
+            .seed = 5,
+            .scenario = scenario,
+            .protocol = probe.protocol(),
+            .until = LIVENESS_UNTIL,
+        };
+        const r = try netsim.replay(gpa, case, &CRASH_PEERS, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+
+        // Preconditions — the situation the regression is about actually arose.
+        try testing.expect(probe.injected);
+        try testing.expect(probe.was_leader);
+        // The step-down itself. THIS is the assertion that passes against the
+        // bug, which is exactly why it cannot be the whole test.
+        try testing.expectEqual(Role.follower, probe.role_after);
+        try testing.expectEqual(probe.term_before + 1, probe.term_after);
+
+        // Liveness: 800 ticks — eight election timeouts — after the step-down,
+        // the node must have STOOD FOR ELECTION. With the timer left unarmed it
+        // sits at exactly `term_after` in `.follower` forever, answering RPCs.
+        try testing.expect(srv.nodes[0].current_term > probe.term_after);
+        try testing.expectEqual(Role.candidate, srv.nodes[0].role);
+        try testing.expectEqual(@as(NodeId, 0), srv.nodes[0].voted_for);
+    }
+}
+
+/// Ten ticks after the step-down — well inside the fresh election timeout, so
+/// the node is still sitting at the term it just adopted and has not yet
+/// campaigned (which would set `votedFor` to itself and destroy the observable).
+const FOLLOW_UP_AFTER: Time = 10;
+
+test "real: a step-down CLEARS votedFor, so the node can still vote in the term it just adopted" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // Two messages, because one cannot see this. `handleRequestVote` computes
+    // `effective_vote = if (term_advanced) no_vote else voted_for`, so the
+    // message that CARRIES the higher term is decided as if the vote were
+    // already cleared — a single-message test is green either way. The stale
+    // `votedFor` only bites the NEXT request, which arrives at a term that is no
+    // longer new: `term_advanced` is false, the compensation does not fire, and
+    // the node refuses a vote it must grant. §5.1 requires `votedFor` to reset
+    // whenever `currentTerm` changes, and that reset is `stepDown`'s job.
+    //
+    // The consequence is liveness again, and again invisible to a state-based
+    // `checkFn`: the refusal is a perfectly well-formed reply, and every node
+    // involved looks healthy. The cluster just fails to elect for another term.
+    for ([_]StepDownVia{ .append_resp, .vote_resp, .vote_req_refused }) |via| {
+        var srv = try RaftServer.init(gpa, CLUSTER_N, LIVENESS_CFG);
+        defer srv.deinit(gpa);
+        var probe = StepDownProbe{
+            .srv = &srv,
+            .via = via,
+            .target = 0,
+            .inject_at = INJECT_AT,
+            .follow_up_after = FOLLOW_UP_AFTER,
+        };
+        const case = netsim.Case{
+            .seed = 5,
+            .scenario = scenario,
+            .protocol = probe.protocol(),
+            .until = LIVENESS_UNTIL,
+        };
+        const r = try netsim.replay(gpa, case, &CRASH_PEERS, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+
+        // Preconditions: it was the leader of `term_before`, which means it had
+        // voted for ITSELF in that term — the stale value that must not survive
+        // into the next one.
+        try testing.expect(probe.injected);
+        try testing.expect(probe.was_leader);
+        try testing.expectEqual(@as(NodeId, 0), probe.voted_for_before);
+        try testing.expectEqual(probe.term_before + 1, probe.term_after);
+
+        // The second message arrived at the SAME term the step-down adopted —
+        // the condition under which `handleRequestVote`'s step-up compensation
+        // cannot help.
+        try testing.expect(probe.follow_up_done);
+        try testing.expectEqual(probe.term_after, probe.follow_up_term);
+
+        // …and the vote was GRANTED. With `votedFor` left naming node 0 itself,
+        // `may_vote` is false and this stays 0 (the stale self-vote).
+        try testing.expectEqual(@as(NodeId, 1), probe.voted_for_after_follow_up);
     }
 }
 

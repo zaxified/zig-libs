@@ -54,6 +54,38 @@ plus one near-mechanical helper:
   not inflate its Fable surface. It sits in `safety.zig` for cohesion (it is a
   term/role safety rule), not because it is hard.
 
+**Stepping down must clear `votedFor` AND re-arm the election timer** — two
+protocol rules the decision kernel cannot enforce, because both the vote slot's
+lifetime and the timer live in the plumbing. Both failures are liveness-only and
+produce a node that answers every RPC correctly.
+
+*Clearing the vote* is §5.1's "if `currentTerm` changes, `votedFor` resets" — one
+ballot per term. `handleRequestVote` computes its own `effective_vote =
+if (term_advanced) no_vote else voted_for`, but that covers **only the message
+that itself carries the higher term**: the caller cannot pre-clear the slot,
+because it learns of the step-down from the returned decision. A step-down
+driven by some *other* message (an AppendEntries or RequestVote **response**)
+leaves the next same-term RequestVote with `term_advanced == false`, the
+compensation dormant, and a `votedFor` still naming last term's candidate —
+so the node refuses a vote it must grant and the cluster burns another term.
+The two mechanisms are complementary, not duplicated, and each is pinned by a
+test the other does not fail: dropping `effective_vote` trips `safety.zig`'s
+"§5.2 … a fresh (higher) term clears an old vote"; dropping `stepDown`'s clear
+trips `server.zig`'s "a step-down CLEARS votedFor" and nothing else.
+
+*Re-arming the timer.* A leader holds
+no live election timer: the one it armed as a candidate fires and is *dropped*
+by `onTimer` (`role == .leader` → return, deliberately not re-armed, so a
+step-down starts a fresh full timeout rather than the remainder of a stale one).
+So from one timeout after its election, a leader's only route back to an armed
+timer is a step-down that re-arms — every path that sets `role = .follower`
+therefore goes through `server.zig`'s `stepDown`. A step-down that skips the
+re-arm produces a node that is **not wedged in any way a crash test can see**:
+it answers every RPC correctly and is simply never electable again, so if the
+rest of the cluster is gone the cluster is dead with a healthy-looking node in
+it. That is why the regression test asserts an election actually *starts*;
+asserting `role == .follower` after the step-down passes either way.
+
 Two additional safety-relevant verdicts surfaced during the core pass and now
 live in the core's contract rather than the plumbing:
 
@@ -190,9 +222,12 @@ checkers / the safety kernel (one test per documented wrong-but-plausible
 implementation, including the Figure-8 counterexample and the
 duplicated-AppendEntries rollback trap), plus `netsim` property + shrink +
 seed-sweep teeth tests. `zig build test-raft` is green in Debug and ReleaseFast:
-41 pass, 0 skip — including the two real-`RaftServer` model-check tests (a
-300-seed fuzzed fault sweep enforcing all five invariants live, and a
-quiet-network election-liveness run). During the core pass the suite was
+58 pass, 0 skip — including the real-`RaftServer` model-check tests (a 300-seed
+fuzzed fault sweep enforcing all five invariants live, a quiet-network
+election-liveness run, and the two step-down regressions, which drive a real
+leader to a demotion by response and then require it to campaign again and to
+grant a vote in the term it just adopted).
+During the core pass the suite was
 additionally validated against an extended 1500-seed default sweep and a
 500-seed heavy sweep (40 fault events, horizon 2500, until 3000) — both clean
 (ad-hoc runs, not part of the committed suite).
@@ -210,10 +245,25 @@ contract tested independently.
    two real-cluster model-check tests green across the seed sweep.~~ **Done.**
 2. Add a bounded-liveness property (a leader is eventually elected and progress
    is made on a network that is quiet long enough) — a post-run analyzer akin to
-   df-elect's bounded-DF-window, distinct from the safety invariants.
+   df-elect's bounded-DF-window, distinct from the safety invariants. **This is
+   the gap both step-down defects fell through**: `netsim` runs `checkFn` after
+   every event, but a `checkFn` can only reject a *state*, and neither "this node
+   has stopped being electable" nor "this node refuses a vote it should grant"
+   is a bad state — each is a good event that never arrives. Note what that
+   costs: the vote-clear defect was sitting *behind* the timer defect, invisible
+   until the first was fixed and probed, and the module's whole 300-seed sweep
+   never saw either. **Every liveness property this module relies on needs its
+   own event-shaped test** — drive the cluster into the situation, advance time
+   or deliver the next message, and assert the good thing HAPPENS. Two exist
+   (`re-arms its election timer`, `CLEARS votedFor`); the general property that
+   would subsume them does not.
 3. Membership changes (§6) — wire `jointMajority` in: joint consensus,
-   config-entry semantics, fuzz churn.
-4. Client command proposals in the harness (today only leader no-ops populate
-   the log — distinct terms already exercise conflict/commit shapes, but
-   distinct commands would sharpen `recordApply`'s teeth).
+   config-entry semantics, fuzz churn. Note for whoever does it: a config change
+   that removes this node from the voter set is another `role = .follower` site,
+   and must go through `stepDown` (or deliberately stop the timer) — see the
+   re-arm rule above.
+4. ~~Client command proposals in the harness (today only leader no-ops populate
+   the log).~~ **Done** — `RaftConfig.propose_client_commands` (default on) makes
+   the leader propose one distinct `(term, index)` command per heartbeat, which
+   is what gives `recordApply` a key that varies.
 5. Log compaction / snapshotting (§7) — out of current scope.
