@@ -292,6 +292,6 @@ see skip reasons.
 Message **compression** (`grpc-encoding` other than `identity`) — a compressed frame is refused
 rather than handed to the decoder as if it were plaintext. **Retries**, **channel load balancing
 / name resolution**, **`grpc-status-details-bin`** (the `google.rpc.Status` detail payload),
-**gRPC-Web** framing, and **reflection/health** services. On the server: concurrent handlers (the
-h2 server runs one connection's streams sequentially) and preemptive deadline cancellation. See
-SPEC.md for why each.
+**gRPC-Web** framing, and **reflection/health** services. On the server: concurrent handlers (`h2_server`
+has the dispatch seam, but `grpc.Server` installs no pool of its own — the default stays
+sequential per connection) and preemptive deadline cancellation. See SPEC.md for why each.

@@ -74,7 +74,14 @@ Hardened for direct internet exposure (no reverse proxy required):
   request-count cap; inbound gzip is zip-bomb-capped (`max_decompressed_request_bytes` → 413).
 - **HTTP/2 DoS:** rapid-reset (CVE-2023-44487), CONTINUATION-flood (CVE-2024-27316),
   MAX_CONCURRENT_STREAMS, control-frame flood budgets, total-streams-per-conn cap — all
-  configurable, safe by default (so `enable_h2c` is hardened out of the box).
+  configurable, safe by default (so `enable_h2c` is hardened out of the box). With
+  `Options.h2_dispatcher` installed (concurrent handlers, off by default) two more caps apply:
+  per-connection `Dispatcher.max_concurrent_handlers` (a ready stream over it waits in the
+  already-bounded jobs map) and the dispatcher's own global admission, whose refusal is answered
+  with RST_STREAM(REFUSED_STREAM) rather than a queue. Rapid-reset stays a *budget* rather than a
+  consequence of one-handler-at-a-time: a cancellation after dispatch is charged exactly like one
+  before it. **Not covered:** per-user connection-rate limiting — that belongs on the accept path
+  (`Options.on_connect`), not in the h2 loop.
 - **Header injection:** outbound header names/values reject CR/LF/NUL (response-splitting guard).
 - Response bodies of 304/204/1xx are suppressed (framing correctness).
 - **Out of scope:** TLS termination (bring-your-own via the seam — reverse proxy today, ianic/std

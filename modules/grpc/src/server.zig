@@ -66,7 +66,10 @@
 //! `send`. It cannot be enforced *during* a blocking body read: handlers run
 //! on the connection's task and the h2 request-body reader has no deadline
 //! hook, so a handler that blocks forever on a peer that never sends blocks
-//! the connection. `http`'s own `read_timeout_ms` / `request_timeout_ms` are
+//! the connection — unless the application installs
+//! `Server.Options.h2_dispatcher`, which moves handlers onto a bounded pool
+//! and keeps the connection's read side live (it still does not *cancel* the
+//! blocked handler). `http`'s own `read_timeout_ms` / `request_timeout_ms` are
 //! the backstop for that, and they are transport-level, not per-call. The
 //! clock is injected (`Options.clock`) so none of the above needs a real one
 //! under test.

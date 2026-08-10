@@ -289,6 +289,15 @@ pub const Options = struct {
     ///
     /// See `h2_server.Options.stream_request`.
     h2_stream_request: ?H2StreamRequestFn = null,
+    /// Run HTTP/2 handlers on a caller-supplied bounded worker pool instead
+    /// of on the connection's own task (only meaningful with `enable_h2c`,
+    /// or via `h2_server.serveStream`). Null (the default) keeps the
+    /// historical sequential behavior. See `h2_server.Dispatcher` and the
+    /// "Concurrent handlers" section of that module's doc — in particular
+    /// the obligation that `gpa` and `on_conn_state` be thread-safe once a
+    /// dispatcher is installed. This does NOT affect HTTP/1.1, which is
+    /// already one connection per thread.
+    h2_dispatcher: ?H2Dispatcher = null,
 };
 
 /// Re-export of `h2_server.Limits` for `Options.h2_limits`.
@@ -299,6 +308,12 @@ pub const H2StreamRequestFn = h2s.StreamRequestFn;
 
 /// Re-export of `h2_server.RequestPreview` — what `h2_stream_request` sees.
 pub const H2RequestPreview = h2s.RequestPreview;
+
+/// Re-export of `h2_server.Dispatcher` for `Options.h2_dispatcher`.
+pub const H2Dispatcher = h2s.Dispatcher;
+
+/// Re-export of `h2_server.Task` — the unit `H2Dispatcher.spawn` receives.
+pub const H2Task = h2s.Task;
 
 /// `io` must support the net + concurrency vtable operations (e.g.
 /// `std.Io.Threaded`). The allocator provides per-connection buffers.
@@ -650,6 +665,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .on_conn_state_ctx = o.on_conn_state_ctx,
                 .limits = o.h2_limits,
                 .stream_request = o.h2_stream_request,
+                .dispatcher = o.h2_dispatcher,
             }, &tr.reader, &tw.writer);
             return;
         }

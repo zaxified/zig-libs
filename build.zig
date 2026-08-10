@@ -39,7 +39,15 @@ const module_list = [_]Module{
     // Test-only harness. Consumers reach it through `test_deps`, never `deps`.
     .{ .name = "testkit" },
     .{ .name = "netaddr" },
-    .{ .name = "http", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    // `workerpool` is a TEST-only dep: `h2_server.Options.dispatcher` is an
+    // injectable seam (a function pointer + a context pointer), so the
+    // published `http` module implements no pool at all — deliberately, since
+    // `websocket`/`accesslog`/`grpc`/`mcp-http`/… all depend on `http` and
+    // none of them should acquire threads by transitive accident. The tests
+    // wire a real `workerpool.WorkerPool` into that seam because the five
+    // concurrency invariants can only be exercised by real threads.
+    // `zig build check-testonly` proves the published module never needs it.
+    .{ .name = "http", .deps = &.{"netaddr"}, .test_deps = &.{ "testkit", "workerpool" } },
     .{ .name = "websocket", .deps = &.{"http"} },
     .{ .name = "accesslog", .deps = &.{"http"} },
     .{ .name = "staticfiles", .deps = &.{"http"} },

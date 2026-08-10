@@ -62,9 +62,13 @@ a no-op.
 
 ### What the server does not do
 
-- **Concurrent handlers.** `h2_server` serves one connection's streams sequentially on the
-  connection's task, so a slow handler holds up the other streams on that connection. Multiple
-  connections are served in parallel by the accept engine.
+- **Concurrent handlers — not wired up here, but no longer absent.** `h2_server` gained an
+  injectable dispatch seam (`h2_server.Options.dispatcher` / `Server.Options.h2_dispatcher`):
+  with one installed, a connection's streams run on a bounded worker pool and a slow handler no
+  longer holds up the others. `grpc.Server` does not install one — it passes the `http` options
+  through, so the choice (and the thread pool) belongs to the application. **Left as-is, the
+  default is still sequential**: one connection's streams are served on the connection's task,
+  and only multiple *connections* run in parallel via the accept engine.
 - **Preemptive deadlines.** `grpc-timeout` is enforced at every engine boundary, but a handler
   blocked in a body read cannot be interrupted — there is no deadline hook on the h2 request-body
   reader. `http`'s `read_timeout_ms`/`request_timeout_ms` are the transport-level backstop.

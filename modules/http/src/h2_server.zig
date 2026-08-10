@@ -25,9 +25,12 @@
 //!
 //! Model (correct over fancy): frames are demultiplexed as they arrive —
 //! per-stream request state (decoded header list + the DATA bytes)
-//! accumulates in a map, so interleaved streams are all collected — but
-//! requests are handled **sequentially** on the connection's task (no
-//! concurrent-stream scheduling yet). The handler writes an ordinary
+//! accumulates in a map, so interleaved streams are all collected — and
+//! requests are handled either **sequentially** on the connection's task
+//! (the default: no `Options.dispatcher`, byte-for-byte the behavior this
+//! module has always had) or **concurrently** on a caller-supplied bounded
+//! worker pool (`Options.dispatcher`, see `Dispatcher` and the
+//! "Concurrent handlers" section below). The handler writes an ordinary
 //! HTTP/1.1 response through the stock `ResponseWriter`, which is re-framed
 //! as h2 HEADERS + DATA (+ a trailing HEADERS frame when the handler set
 //! response trailers — §8.1, which also moves END_STREAM off the last DATA
@@ -77,9 +80,10 @@
 //! - **Rapid reset (CVE-2023-44487)** and **CONTINUATION flood
 //!   (CVE-2024-27316)** guards plus a control-frame flood budget live in
 //!   `h2.Connection` (see its module doc); breaches surface here as
-//!   connection violations answered with GOAWAY(ENHANCE_YOUR_CALM).
-//!   Handlers run sequentially on the connection's task, so cancelled
-//!   streams never fan out concurrent server-side work.
+//!   connection violations answered with GOAWAY(ENHANCE_YOUR_CALM). The
+//!   rapid-reset defence is a **budget**, not a consequence of running one
+//!   handler at a time — see "Concurrent handlers" for why that distinction
+//!   had to be made explicit and what now carries it.
 //! - **SETTINGS_MAX_CONCURRENT_STREAMS** (`max_concurrent_streams`) is
 //!   advertised in the server preface and enforced: request streams above
 //!   the limit are refused with RST_STREAM(REFUSED_STREAM) — safely
@@ -87,6 +91,81 @@
 //! - **`max_streams_per_connection`** bounds total streams on one
 //!   connection; once reached, ready requests finish and the connection
 //!   closes with a graceful GOAWAY(NO_ERROR) so the client reconnects.
+//!
+//! ## Concurrent handlers (`Options.dispatcher`)
+//!
+//! Without a dispatcher every handler runs to completion on the connection's
+//! own task. That is not merely slow, it is a *liveness* bug on a
+//! multiplexed protocol: `pump` — the only thing that reads the socket — has
+//! three call sites, all of them inside the response path, so a handler
+//! blocked on anything that is **not** h2 read/write (a database, a lock, an
+//! application queue a gRPC bidi handler is waiting on) stops the connection
+//! from reading at all. PING, SETTINGS and WINDOW_UPDATE stop being
+//! processed for every other stream on that connection.
+//!
+//! `Options.dispatcher` is the seam that fixes it: a two-function interface
+//! whose implementation the **caller** supplies, so `http` keeps depending
+//! on nothing but `netaddr` and no consumer of `http` pulls in threads it
+//! did not ask for (`modules/workerpool` is the intended implementation; a
+//! worked one is in this file's tests). With a dispatcher installed, a
+//! stream is handed to a worker thread and the connection task goes straight
+//! back to reading.
+//!
+//! **What is dispatched, and when.** Only after a *complete* HEADERS block
+//! has been decoded and admitted into the jobs map — the same instant
+//! `takeReady` already used. Rubbish (a truncated header sequence, a stream
+//! over `max_concurrent_streams`, a CONTINUATION flood) is refused before it
+//! can occupy a thread.
+//!
+//! **Two caps, both enforced, and they are not interchangeable.**
+//!   * per connection: `Dispatcher.max_concurrent_handlers` (default 8).
+//!     Over it, a ready stream simply waits in the jobs map — which
+//!     `max_concurrent_streams` already bounds — exactly as *every* stream
+//!     waits today; no new unbounded state exists, so there is nothing to
+//!     refuse.
+//!   * globally: the dispatcher's own admission control. `spawn` returning
+//!     false means "the pool is full", and that IS refused —
+//!     RST_STREAM(REFUSED_STREAM), retryable per §8.7 — never queued, so a
+//!     fleet of connections cannot accumulate work behind a saturated pool.
+//!
+//! **Rapid reset, re-derived.** The old justification was structural: one
+//! handler at a time meant a cancelled stream could never fan out concurrent
+//! server work. A dispatch pool deletes that property by construction, so
+//! the defence is now stated as three independent facts:
+//!   1. cancellation is *charged*: a peer RST_STREAM on a stream that has
+//!      not completed counts against `max_reset_streams` whether or not it
+//!      was dispatched (`h2.Connection`, §rst_stream — a dispatched request
+//!      stream is `half_closed_remote`, never `closed`, so "cancel after the
+//!      thread is handed out" costs the attacker exactly as much as "cancel
+//!      before"). Over budget ⇒ GOAWAY(ENHANCE_YOUR_CALM);
+//!   2. the fan-out is *bounded* by the two caps above, so the work a
+//!      cancelled stream can have started is bounded by the pool, not by the
+//!      number of streams the attacker opened;
+//!   3. a cancelled stream stops paying: `Job.rst` is polled by the response
+//!      framer and the request-body reader, so a handler on a reset stream
+//!      is aborted at its next write or read rather than running to
+//!      completion.
+//!
+//! **Five invariants that used to hold for free.** One thread made them
+//! true; `Session.mu` makes them true now, and each is stated where it is
+//! enforced: stateful HPACK (`Framer.sendHead`, `Session.respondError`) ·
+//! one shared `wire` (every `flushWire` caller) · flow control's
+//! check-then-act (`Framer.emit`) · job lifetime (`Session.dropJob`) · the
+//! rehashing jobs map (`Session.jobs`). `Session.lock` documents the whole
+//! scheme, including what deliberately runs *outside* the lock.
+//!
+//! **Caller obligations with a dispatcher installed:** the `gpa` and the
+//! `on_conn_state` hook must be thread-safe, and `Dispatcher.spawn` must run
+//! the task on a *different* thread (running it inline self-deadlocks).
+//!
+//! **Not here: per-user connection rate limiting.** The other half of the
+//! DoS answer (max N new connections/s per user, identified by source IP +
+//! a configured user-ip-list) cannot live in this file — by the time
+//! `serve` is called the connection is already accepted and the preface is
+//! being read. Its seam is `Server.Options.on_connect`
+//! (`Server.ConnDecision.reject`), which runs on the accept loop with the
+//! peer address and before a single byte is read; `modules/ratelimit`
+//! already has the token bucket it needs.
 //!
 //! Provenance: clean-room from RFC 9113 (prior knowledge §3.3, malformed
 //! requests §8.1.1, header validity §8.2.1/§8.2.2, request pseudo-headers
@@ -151,6 +230,52 @@ pub const Options = struct {
     /// cannot be made from inside the handler, because by the time a
     /// handler runs the choice has already been acted on.
     stream_request: ?StreamRequestFn = null,
+    /// Run handlers on a caller-supplied bounded worker pool instead of on
+    /// the connection's own task. Null (the default) is the historical
+    /// sequential behavior, byte-for-byte — the locking below is compiled
+    /// in but never taken. See the module doc's "Concurrent handlers".
+    dispatcher: ?Dispatcher = null,
+};
+
+/// One unit of handler work, shaped exactly like `workerpool.Job` so a
+/// `workerpool.WorkerPool` can carry it without an adapter struct.
+pub const Task = struct {
+    func: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+};
+
+/// The injectable handler-execution seam (`Options.dispatcher`).
+///
+/// `http` deliberately does not implement this: it depends on `netaddr` and
+/// nothing else, and `websocket`/`accesslog`/`grpc`/`mcp-http` all depend on
+/// `http` — none of them should acquire a thread pool by transitive
+/// accident. The intended implementation is `modules/workerpool` in ~30
+/// lines of caller code (this file's tests contain a worked one, which is
+/// also what the concurrency tests run against).
+pub const Dispatcher = struct {
+    /// Passed back to `spawn`.
+    ctx: ?*anyopaque = null,
+    /// Run `task.func(task.ctx)` on a thread **other than the caller's**,
+    /// exactly once, and return true.
+    ///
+    /// Return **false** to refuse: the stream is answered with
+    /// RST_STREAM(REFUSED_STREAM) (retryable, §8.7) and nothing is queued.
+    /// That is the global-capacity answer — the owner ruling is "refuse, do
+    /// not queue", so a saturated pool sheds load instead of growing a
+    /// backlog behind it.
+    ///
+    /// ⚠ Running the task inline on the calling thread self-deadlocks: the
+    /// caller holds `Session.mu`, which the task needs.
+    spawn: *const fn (ctx: ?*anyopaque, task: Task) bool,
+    /// Handlers allowed to run concurrently on **one** connection.
+    ///
+    /// Deliberately NOT `Limits.max_concurrent_streams`, which bounds
+    /// in-flight *state* (the jobs map) and defaults to 100: using it as a
+    /// thread count would manufacture a 100-way fan-out per connection, i.e.
+    /// a new DoS surface rather than a closed one. A ready stream over this
+    /// cap waits in the (already bounded) jobs map and is dispatched the
+    /// moment a slot frees — the same wait every stream does today.
+    max_concurrent_handlers: u32 = 8,
 };
 
 /// Predicate selecting the incremental request-body surface for one stream
@@ -232,6 +357,7 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
         .opts = opts,
         .in = in,
         .out = out,
+        .threaded = opts.dispatcher != null,
         .conn = .init(gpa, .server, .{
             .settings = .{
                 .enable_push = false, // §8.4: we never push
@@ -351,11 +477,75 @@ const Session = struct {
     /// `*Job` across a pump: the map rehashes when a new stream is admitted.
     /// Look up by id, every time.
     jobs: std.AutoArrayHashMapUnmanaged(u31, Job) = .empty,
-    /// Stream id currently being served, if any — the one job `dropJob` must
-    /// mark instead of freeing (see `Job.rst`).
-    serving: ?u31 = null,
     req_index: u32 = 0,
     peer_goaway: bool = false,
+
+    // ── concurrency (all four are inert without `Options.dispatcher`) ────
+
+    /// **Invariants 1–5.** The one lock over everything reachable from a
+    /// worker thread: `conn` (HPACK encoder *and* decoder, both flow-control
+    /// windows, the stream table), `wire`, `out`, `events`, `jobs` (the map
+    /// *and* every `Job` in it), `req_index`, `peer_goaway`, `inflight`,
+    /// `closing`.
+    ///
+    /// `std.atomic.Mutex` + yield-spin rather than a blocking mutex: Zig
+    /// 0.16 std has no `std.Thread.Mutex`/`Condition`/`Futex`, and the
+    /// io-less lock that may be held across blocking I/O is already this
+    /// module's idiom (`h2_upstream.lockBlocking`, `Client.lockSpin`). No
+    /// new synchronisation primitive is invented here.
+    ///
+    /// **Held across a socket write** (`flushWire`), on purpose: staging a
+    /// frame and putting it on the wire in one section is what keeps the
+    /// HPACK dynamic table in step with the bytes the peer actually sees
+    /// (invariant 1), and it makes `wire` FIFO for every producer
+    /// (invariant 2). A write that blocks on TCP backpressure therefore
+    /// stalls the connection — which it would anyway, since every reply we
+    /// could compute meanwhile would still be unsendable.
+    ///
+    /// **Deliberately outside the lock:** the handler body (the entire
+    /// point), `in.peekGreedy` in `pump` (so a running handler never blocks
+    /// the reading side), and `Writer.writeAll` out of `StreamBody`
+    /// (it re-enters `Framer`, which locks for itself).
+    mu: std.atomic.Mutex = .unlocked,
+    /// `opts.dispatcher != null`, hoisted: when false every `lock`/`unlock`
+    /// is a no-op and the sequential path is exactly what it always was.
+    threaded: bool = false,
+    /// Handlers dispatched and not yet retired on THIS connection.
+    inflight: u32 = 0,
+    /// A worker returned `.close`: stop dispatching and end the connection
+    /// once the last handler is off it.
+    closing: bool = false,
+    /// The connection task has left `run` and is waiting for handlers to
+    /// drain. Read without the lock by the two wait loops, which must not
+    /// keep waiting for a peer nobody is reading from any more.
+    gone: std.atomic.Value(bool) = .init(false),
+
+    /// Take `mu` (no-op on the sequential path). Yield-spin: this lock is
+    /// held across blocking writes, so a plain `spinLoopHint` spin could
+    /// starve the holder on a busy core — same reasoning, same shape as
+    /// `h2_upstream.lockBlocking`.
+    fn lock(s: *Session) void {
+        if (!s.threaded) return;
+        while (!s.mu.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    fn unlock(s: *Session) void {
+        if (!s.threaded) return;
+        s.mu.unlock();
+    }
+
+    /// Wait for the connection task to make progress (a WINDOW_UPDATE, more
+    /// DATA). **Must not be called holding `mu`.**
+    ///
+    /// Sequential: there is no other task, so the caller pumps the
+    /// connection itself — unchanged behavior. Threaded: only the connection
+    /// task may touch `in`, so a worker yields and re-checks; `gone` is what
+    /// stops it waiting forever once nobody is reading any more.
+    fn waitForPeer(s: *Session) error{Closed}!void {
+        if (!s.threaded) return s.pump();
+        if (s.gone.load(.acquire)) return error.Closed;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
 
     fn deinit(s: *Session) void {
         for (s.jobs.values()) |*job| job.deinit(s.gpa);
@@ -372,33 +562,146 @@ const Session = struct {
     fn run(s: *Session) void {
         s.fireConnState(.new);
         defer s.fireConnState(.closed);
+        // Threaded: no worker may still be holding a `*Job`, the `wire` or
+        // the socket writer when `deinit` frees them. `gone` first, so a
+        // worker parked in `waitForPeer` stops waiting for a connection task
+        // that has left.
+        defer if (s.threaded) {
+            s.gone.store(true, .release);
+            while (true) {
+                s.lock();
+                const busy = s.inflight != 0;
+                s.unlock();
+                if (!busy) break;
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        };
         // §3.4 server preface: our SETTINGS, before anything else.
         s.conn.sendPreface(&s.wire) catch return;
         s.flushWire() catch return;
         while (true) {
-            while (s.takeReady()) |id| {
+            if (s.threaded) {
+                s.lock();
+                s.dispatchReady();
+                const done = s.closing and s.inflight == 0;
+                s.unlock();
+                if (done) return;
+            } else while (s.takeReady()) |id| {
                 s.fireConnState(.active);
-                s.serving = id;
-                const disp = s.serveJob(id);
-                s.serving = null;
+                const disp = s.serveJob(id, s.req_index);
                 s.finishJob(id, disp);
                 s.req_index += 1;
                 s.fireConnState(.idle);
                 if (disp == .close) return;
             }
+            s.lock();
             // Total-streams cap: enough streams for one connection — what
             // was ready has been served; close gracefully (NO_ERROR) so a
             // legitimate client just reconnects.
-            if (s.conn.remote_streams_total >= s.opts.limits.max_streams_per_connection) {
+            const over_total =
+                s.conn.remote_streams_total >= s.opts.limits.max_streams_per_connection and
+                s.inflight == 0;
+            if (over_total) {
                 s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
                 s.flushWire() catch {};
-                return;
             }
             // Graceful shutdown: the peer said GOAWAY and nothing is left.
-            if (s.peer_goaway and s.jobs.count() == 0) return;
+            const drained = s.peer_goaway and s.jobs.count() == 0;
+            s.unlock();
+            if (over_total or drained) return;
             s.pump() catch return;
         }
     }
+
+    /// Hand every ready-and-undispatched stream to `Options.dispatcher`, up
+    /// to the per-connection cap. **Caller holds `mu`.**
+    ///
+    /// Called from two places, and it needs both: the connection task's loop
+    /// (a stream became ready because bytes arrived) and the tail of every
+    /// worker task (a slot freed). Without the second, a stream held back by
+    /// the cap would wait for the *next wire event* to be dispatched, which
+    /// on an idle connection never comes.
+    fn dispatchReady(s: *Session) void {
+        const d = s.opts.dispatcher orelse return;
+        // ⚠ Why the per-connection cap DEFERS while a full pool REFUSES, and
+        // why that is not an inconsistency to "fix".
+        //
+        // The owner ruling is "when the pool is full, refuse — do not queue".
+        // What that rules out is **unbounded** queueing: work piling up behind
+        // a saturated pool across every connection in the fleet, which is the
+        // shape that turns a load spike into an outage. `spawn` returning
+        // false is exactly that case, and `refuse` answers it below.
+        //
+        // A stream held back by THIS loop's condition is a different thing. It
+        // is not queued anywhere new — it stays in `jobs`, which
+        // `Limits.max_concurrent_streams` already bounds (100 by default), and
+        // it waits precisely as every stream waits on today's sequential
+        // engine. Refusing at the cap instead would cut a client's usable
+        // parallelism on one connection from the 100 we advertise in our own
+        // SETTINGS to 8, i.e. it would answer a DoS question by breaking
+        // ordinary multiplexed traffic. So: bounded wait here, refusal there.
+        while (!s.closing and s.inflight < d.max_concurrent_handlers) {
+            // Ruling #1: only a stream whose HEADERS block is complete and
+            // admitted is here at all — nothing half-decoded reaches a thread.
+            const id = s.takeReadyUndispatched() orelse return;
+            const job = s.jobs.getPtr(id).?;
+            job.dispatched = true;
+            const h = s.gpa.create(Handoff) catch {
+                // Cannot even describe the work: shed the stream, keep the
+                // connection (same policy as `onHeaders`' allocation failure).
+                s.refuse(id);
+                continue;
+            };
+            h.* = .{ .s = s, .id = id, .req_index = s.req_index };
+            s.req_index += 1;
+            s.inflight += 1;
+            if (d.spawn(d.ctx, .{ .func = Handoff.entry, .ctx = h })) continue;
+            // Ruling #4: the pool is full ⇒ refuse, never queue.
+            s.inflight -= 1;
+            s.gpa.destroy(h);
+            s.refuse(id);
+        }
+    }
+
+    /// RST_STREAM(REFUSED_STREAM) + drop the state. **Caller holds `mu`.**
+    fn refuse(s: *Session, id: u31) void {
+        // Marked dispatched by `dispatchReady` a moment ago and never handed
+        // to a thread, so nothing holds it (see `removeJob`'s assertion).
+        if (s.jobs.getPtr(id)) |job| job.dispatched = false;
+        s.conn.sendRstStream(&s.wire, id, .refused_stream) catch {};
+        s.removeJob(id);
+        s.flushWire() catch {};
+    }
+
+    /// One dispatched stream's ticket. Heap-allocated because it outlives
+    /// `dispatchReady`'s frame; freed by the worker that runs it.
+    const Handoff = struct {
+        s: *Session,
+        id: u31,
+        req_index: u32,
+
+        fn entry(ctx: *anyopaque) void {
+            const h: *Handoff = @ptrCast(@alignCast(ctx));
+            const s = h.s;
+            const id = h.id;
+            s.fireConnState(.active);
+            const disp = s.serveJob(id, h.req_index);
+            // Everything that touches `s` outside the lock happens BEFORE
+            // `inflight` drops: the connection task's drain in `run` treats
+            // `inflight == 0` as "the Session may now be destroyed", and it
+            // can only observe that after the `unlock` below.
+            s.gpa.destroy(h);
+            s.fireConnState(.idle);
+            s.lock();
+            s.finishJob(id, disp);
+            if (disp == .close) s.closing = true;
+            s.inflight -= 1;
+            // A slot just freed: pull the next ready stream in now rather
+            // than at the next wire event (see `dispatchReady`).
+            s.dispatchReady();
+            s.unlock();
+        }
+    };
 
     /// Flush staged wire bytes through the (timeout-guarded) socket writer.
     fn flushWire(s: *Session) Writer.Error!void {
@@ -413,8 +716,14 @@ const Session = struct {
     /// ACKs, WINDOW_UPDATEs). Stream-scoped violations answer RST_STREAM
     /// and processing continues (§5.4.2); connection-scoped ones answer
     /// GOAWAY with the layer's code and close (§5.4.1).
+    /// Threaded: called **only** by the connection task (a worker waits in
+    /// `waitForPeer` instead), and the blocking read deliberately happens
+    /// with `mu` released — that is what keeps PING/SETTINGS/WINDOW_UPDATE
+    /// flowing while handlers run.
     fn pump(s: *Session) error{Closed}!void {
         _ = s.in.peekGreedy(1) catch return error.Closed; // EOF/timeout/reset
+        s.lock();
+        defer s.unlock();
         const bytes = s.in.buffered();
         var chunk: []const u8 = bytes;
         s.in.toss(bytes.len);
@@ -616,22 +925,50 @@ const Session = struct {
         return null;
     }
 
+    /// `takeReady`, skipping streams already handed to a worker — the
+    /// threaded path's selector. **Caller holds `mu`.**
+    fn takeReadyUndispatched(s: *Session) ?u31 {
+        for (s.jobs.keys()) |id| {
+            const job = s.jobs.getPtr(id).?;
+            if (job.dispatched) continue;
+            if (job.streaming or job.complete or job.over_cap) return id;
+        }
+        return null;
+    }
+
     /// The stream is gone (peer RST_STREAM, or our own stream-scoped
     /// recovery). Frees the job — unless its handler is running, in which
     /// case `serveJob` holds slices into it and only a flag may be set.
+    ///
+    /// **Invariant 4.** This used to hang on a single `serving` slot, which
+    /// is the shape of "one handler at a time" written into the data model:
+    /// with N handlers in flight there is no single current stream, so the
+    /// question "may I free this job?" is answered by the job itself.
+    /// `dispatched` is set under `mu` before the worker is spawned, so there
+    /// is no window in which a job is on its way to a thread and still
+    /// looks free.
     fn dropJob(s: *Session, id: u31) void {
-        if (s.serving) |cur| {
-            if (cur == id) {
-                if (s.jobs.getPtr(id)) |job| job.rst = true;
+        if (s.jobs.getPtr(id)) |job| {
+            if (job.dispatched) {
+                job.rst = true;
                 return;
             }
         }
         s.removeJob(id);
     }
 
+    /// **Invariant 4, enforced rather than assumed.** `serveJob` keeps
+    /// slices into the job (`Request.path`/`.target`, the decoded field
+    /// list, the buffered body) alive for the whole handler call, so freeing
+    /// a job whose handler is still running is a use-after-free whose
+    /// symptom is *silence* — measured: with `dropJob`'s guard deleted the
+    /// entire `http` suite still passed. The assertion is what makes that
+    /// mistake loud. Callers legitimately retiring a dispatched job clear
+    /// the flag first (`finishJob`, `refuse`).
     fn removeJob(s: *Session, id: u31) void {
         if (s.jobs.fetchOrderedRemove(id)) |kv| {
             var job = kv.value;
+            std.debug.assert(!job.dispatched);
             // Everything received and never credited back is being thrown
             // away now; the connection window is owed it (§6.9.1). The
             // stream window is moot — the stream is gone.
@@ -648,13 +985,13 @@ const Session = struct {
     /// `removeJob` handing the unread octets' credit back, is what keeps a
     /// handler which never reads the body from wedging the connection.
     fn finishJob(s: *Session, id: u31, disp: Disposition) void {
-        if (disp != .close) {
-            if (s.jobs.getPtr(id)) |job| {
-                if (!job.complete and !job.rst and !job.over_cap) {
-                    s.conn.sendRstStream(&s.wire, id, .no_error) catch {};
-                    s.flushWire() catch {};
-                }
+        if (s.jobs.getPtr(id)) |job| {
+            if (disp != .close and !job.complete and !job.rst and !job.over_cap) {
+                s.conn.sendRstStream(&s.wire, id, .no_error) catch {};
+                s.flushWire() catch {};
             }
+            // The handler has returned: nothing points into the job any more.
+            job.dispatched = false;
         }
         s.removeJob(id);
     }
@@ -665,25 +1002,37 @@ const Session = struct {
     /// `id` rather than a `*Job`: the job stays in `s.jobs` for the whole
     /// call (see the field's doc) and every pump can rehash the map, so the
     /// pointer is re-derived at each use and never held.
-    fn serveJob(s: *Session, id: u31) Disposition {
+    /// Threaded: this whole function runs on a **worker** thread. It holds
+    /// `mu` only in the short sections that touch the session; the handler
+    /// call itself is the point of the exercise and runs without it.
+    fn serveJob(s: *Session, id: u31, req_index: u32) Disposition {
+        s.lock();
         const job = s.jobs.getPtr(id).?;
         job.dispatched = true;
         const streaming = job.streaming;
         // The decoded header list is a heap slice: rehashing moves the `Job`
-        // struct and never these bytes, and the job outlives this call.
+        // struct and never these bytes, and the job outlives this call
+        // (`dropJob` may only flag a dispatched job, never free it) — so it
+        // survives the unlock below. **Invariant 5**: the `*Job` itself does
+        // not, and is re-derived under `mu` at every later use.
         const req_headers = job.headers;
-        if (job.over_cap) {
-            // h1 parity: over-limit body → 413, connection closes (the
-            // rest of the body is unbounded — never drain it).
-            _ = s.respondError(id, 413);
-            s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
-            s.flushWire() catch {};
-            return .close;
-        }
+        const over_cap = job.over_cap;
         // Buffered surface only: the whole body is already in, and nothing
         // appends to a dispatched buffered job (`onData` guards on it), so
         // this slice is stable for the handler's lifetime.
         const buffered_body: []const u8 = if (streaming) "" else job.body.items;
+        s.unlock();
+
+        if (over_cap) {
+            // h1 parity: over-limit body → 413, connection closes (the
+            // rest of the body is unbounded — never drain it).
+            _ = s.respondError(id, 413);
+            s.lock();
+            defer s.unlock();
+            s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
+            s.flushWire() catch {};
+            return .close;
+        }
 
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();
@@ -824,7 +1173,12 @@ const Session = struct {
         // field in when the body ends. ONE trailer surface either way.
         var trailer_block: ?[]const u8 = null;
         if (!streaming) {
-            if (s.jobs.getPtr(id).?.trailers) |hl| {
+            s.lock();
+            const hl_opt = s.jobs.getPtr(id).?.trailers;
+            s.unlock();
+            if (hl_opt) |hl| {
+                // The field bytes are heap slices owned by the job, which
+                // outlives this call; only the `*Job` needed the lock.
                 var tb: Writer.Allocating = .init(arena);
                 for (hl.fields) |f|
                     tb.writer.print("{s}: {s}\r\n", .{ f.name, f.value }) catch return .close;
@@ -841,7 +1195,7 @@ const Session = struct {
             .trailer_block = trailer_block,
             .context = s.opts.context,
             .peer = s.opts.peer,
-            .conn_request_index = s.req_index,
+            .conn_request_index = req_index,
         };
 
         // ── run the handler against the stock ResponseWriter ────────────
@@ -902,6 +1256,8 @@ const Session = struct {
             // h1 closes the connection here; h2 can do better and kill just
             // this stream (§5.4.2) — the client sees a failed stream instead
             // of a truncated body silently passed off as complete.
+            s.lock();
+            defer s.unlock();
             s.conn.sendRstStream(&s.wire, id, .internal_error) catch {};
             s.flushWire() catch return .close;
             return .keep;
@@ -910,6 +1266,8 @@ const Session = struct {
         if (rw.connectionMustClose()) {
             // The handler asked for `Connection: close` — h2 has no such
             // header, the equivalent is a graceful GOAWAY (§6.8).
+            s.lock();
+            defer s.unlock();
             s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
             s.flushWire() catch {};
             return .close;
@@ -920,7 +1278,13 @@ const Session = struct {
     /// Minimal error response on one stream (h1 `respondError` parity:
     /// status + text/plain reason body, END_STREAM), leaving the connection
     /// alive. Always returns `.keep` so callers can `return s.respondError(...)`.
+    ///
+    /// **Invariant 1** (the other HPACK encode site besides `Framer
+    /// .sendHead`): the whole response — encode, stage, flush — is one
+    /// critical section. Callers must NOT hold `mu`.
     fn respondError(s: *Session, id: u31, status: u16) Disposition {
+        s.lock();
+        defer s.unlock();
         const reason = Server.reasonPhrase(status);
         var status_buf: [8]u8 = undefined;
         var len_buf: [8]u8 = undefined;
@@ -1246,7 +1610,23 @@ const Framer = struct {
         }
     }
 
+    /// **Invariant 1 — stateful HPACK.** The encoder's dynamic table is
+    /// connection-global and every emitted block is an *edit* to it, so the
+    /// encode, the append to `wire` and the flush are ONE critical section.
+    /// Split them across two threads and each block is still individually
+    /// well-formed while referring to a table state the peer never reached:
+    /// silent corruption of somebody else's headers, not a crash. (Splitting
+    /// only the flush out would be safe — `wire` stays FIFO — but is not
+    /// The flush belongs in the same section for a second, independent
+    /// reason (**invariant 2**): `flushWire` is itself a read-then-clear of
+    /// the shared `wire`, so two unlocked flushers can both observe the same
+    /// staged bytes and write them twice. ⚠ Measured: moving *only* the
+    /// flush out of this section did NOT fail the suite in a full run — the
+    /// window is a memcpy wide. Treat that as a known blind spot, not as
+    /// evidence the split is safe.
     fn sendHead(f: *Framer, end_stream: bool) Writer.Error!void {
+        f.s.lock();
+        defer f.s.unlock();
         f.s.conn.sendHeaders(&f.s.wire, f.id, f.fields.items, end_stream) catch |err|
             switch (err) {
                 error.OutOfMemory => return f.die(.close),
@@ -1264,41 +1644,71 @@ const Framer = struct {
     /// The pump is what makes bidirectional streaming work: a handler
     /// blocked writing its response keeps the receive side live, so the
     /// request body it is also reading continues to arrive.
+    /// **Invariant 3 — flow control is check-then-act.** The two windows are
+    /// signed and §6.9.1 forbids them going negative; if they do, it is the
+    /// **peer** that GOAWAYs us. Reading the window and consuming it are one
+    /// critical section here, so two handlers cannot both observe the same
+    /// room and both spend it. What is deliberately outside the section is
+    /// the *wait*: yielding while holding `mu` would keep the connection task
+    /// from ever delivering the WINDOW_UPDATE being waited for.
+    ///
+    /// ⚠ `conn_send_window` — the term two workers actually share, since a
+    /// stream window belongs to one handler — must stay in the minimum below.
+    /// Dropping it does not corrupt anything, because `h2.sendData` re-checks
+    /// `len > conn_send_window` itself; it turns a correct chop into a
+    /// **livelock**, where `emit` keeps asking for a chunk the connection
+    /// window cannot fund and waits for credit that only arrives if it makes
+    /// progress. That failure is invisible until one `emit` call carries more
+    /// than the connection window, which needs `response_buffer_size` above
+    /// the body size — see the test "the connection window bounds two
+    /// concurrent senders", which is built specifically to reach it.
+    const Step = enum { sent, wait, dead_keep, dead_close };
+
     fn emit(f: *Framer, body: []const u8, end_stream: bool) Writer.Error!void {
         const s = f.s;
         var off: usize = 0;
         while (off < body.len) {
-            if (s.jobs.getPtr(f.id)) |job| {
-                if (job.rst) return f.die(.keep);
-            }
-            const st = s.conn.stream(f.id) orelse return f.die(.keep);
-            switch (st.state) {
-                .open, .half_closed_remote => {},
-                else => return f.die(.keep), // peer reset the stream: abandon
-            }
-            const win = @min(s.conn.conn_send_window, st.send_window);
-            if (win <= 0) {
-                s.pump() catch return f.die(.close);
-                continue;
-            }
-            const n = @min(body.len - off, @as(usize, @intCast(win)));
-            const last = end_stream and off + n == body.len;
-            s.conn.sendData(&s.wire, f.id, body[off..][0..n], last) catch |err| switch (err) {
-                error.OutOfMemory => return f.die(.close),
-                // Raced a SETTINGS window shrink applied by a pump above.
-                error.WindowExhausted => {
-                    s.pump() catch return f.die(.close);
-                    continue;
-                },
-                else => return f.die(.keep), // stream reset: abandon
+            var n: usize = 0;
+            const step: Step = blk: {
+                s.lock();
+                defer s.unlock();
+                if (s.jobs.getPtr(f.id)) |job| {
+                    if (job.rst) break :blk .dead_keep;
+                }
+                const st = s.conn.stream(f.id) orelse break :blk .dead_keep;
+                switch (st.state) {
+                    .open, .half_closed_remote => {},
+                    else => break :blk .dead_keep, // peer reset the stream: abandon
+                }
+                const win = @min(s.conn.conn_send_window, st.send_window);
+                if (win <= 0) break :blk .wait;
+                n = @min(body.len - off, @as(usize, @intCast(win)));
+                const last = end_stream and off + n == body.len;
+                s.conn.sendData(&s.wire, f.id, body[off..][0..n], last) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => break :blk .dead_close,
+                        // Raced a SETTINGS window shrink applied meanwhile.
+                        error.WindowExhausted => break :blk .wait,
+                        else => break :blk .dead_keep, // stream reset: abandon
+                    };
+                s.flushWire() catch break :blk .dead_close;
+                break :blk .sent;
             };
-            off += n;
-            f.data_sent = true;
-            s.flushWire() catch return f.die(.close);
+            switch (step) {
+                .sent => {
+                    off += n;
+                    f.data_sent = true;
+                },
+                .wait => s.waitForPeer() catch return f.die(.close),
+                .dead_keep => return f.die(.keep),
+                .dead_close => return f.die(.close),
+            }
         }
         if (end_stream and body.len == 0) {
             // Post-flush: the last real DATA frame is long gone, so
             // END_STREAM needs a frame of its own.
+            s.lock();
+            defer s.unlock();
             s.conn.sendData(&s.wire, f.id, "", true) catch return f.die(.keep);
             s.flushWire() catch return f.die(.close);
         }
@@ -1323,6 +1733,8 @@ const Framer = struct {
         // the stream instead of shipping a short body as a complete one.
         if (f.chunked and f.cstate != .done) {
             if (f.headers_sent) {
+                f.s.lock();
+                defer f.s.unlock();
                 f.s.conn.sendRstStream(&f.s.wire, f.id, .internal_error) catch {};
                 f.s.flushWire() catch return .close;
                 return .keep;
@@ -1340,6 +1752,10 @@ const Framer = struct {
             f.emit("", true) catch return f.disp;
         }
         if (has_trailers) {
+            // **Invariant 1** again: the trailer block is a second edit to
+            // the same dynamic table.
+            f.s.lock();
+            defer f.s.unlock();
             f.s.conn.sendHeaders(&f.s.wire, f.id, f.trailers.items, true) catch |err|
                 switch (err) {
                     error.OutOfMemory => return .close,
@@ -1412,52 +1828,76 @@ const StreamBody = struct {
         };
     }
 
+    const Step = enum { copied, wait, eof, fail, exceeded };
+
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const b: *StreamBody = @alignCast(@fieldParentPtr("reader", r));
         while (true) {
-            const job = b.s.jobs.getPtr(b.id) orelse return error.ReadFailed;
-            if (job.rst) return error.ReadFailed;
-            const src = limit.sliceConst(job.unread());
-            if (src.len != 0) {
-                const n = @min(src.len, b.scratch.len);
-                if (b.budget) |left| {
-                    if (n > left) {
-                        b.exceeded = true;
-                        return error.ReadFailed;
+            var n: usize = 0;
+            // **Invariants 4+5**: the `*Job` is re-derived under `mu` and
+            // never leaves this section — `onData` may append to (and so
+            // reallocate) `job.body` from the connection task at any moment,
+            // and the map rehashes when a new stream is admitted.
+            const step: Step = blk: {
+                b.s.lock();
+                defer b.s.unlock();
+                const job = b.s.jobs.getPtr(b.id) orelse break :blk .fail;
+                if (job.rst) break :blk .fail;
+                const src = limit.sliceConst(job.unread());
+                if (src.len != 0) {
+                    n = @min(src.len, b.scratch.len);
+                    if (b.budget) |left| {
+                        if (n > left) break :blk .exceeded;
+                        b.budget = left - n;
                     }
-                    b.budget = left - n;
+                    if (b.remaining) |rem| {
+                        // §8.1.1: more DATA than the declared content-length.
+                        if (n > rem) break :blk .fail;
+                        b.remaining = rem - n;
+                    }
+                    @memcpy(b.scratch[0..n], src[0..n]);
+                    break :blk .copied;
                 }
-                if (b.remaining) |rem| {
-                    // §8.1.1: more DATA than the declared content-length.
-                    if (n > rem) return error.ReadFailed;
-                    b.remaining = rem - n;
+                // Only END_STREAM ends the body — a lull in the DATA frames
+                // does not, and neither does a trailer section that has not
+                // landed.
+                if (job.complete) {
+                    b.materializeTrailers();
+                    if (b.remaining) |rem| {
+                        // §8.1.1: fewer DATA octets than the declared length.
+                        if (rem != 0) break :blk .fail;
+                    }
+                    break :blk .eof;
                 }
-                @memcpy(b.scratch[0..n], src[0..n]);
-                // From here on nothing may touch `job` again: this write can
-                // re-enter the connection (see `scratch`).
-                try w.writeAll(b.scratch[0..n]);
-                const jp = b.s.jobs.getPtr(b.id) orelse return error.ReadFailed;
-                jp.read_pos += n;
-                if (jp.read_pos == jp.body.items.len) {
-                    // Fully drained: reclaim the buffer instead of letting a
-                    // long upload accumulate behind the cursor.
-                    jp.body.clearRetainingCapacity();
-                    jp.read_pos = 0;
-                }
-                b.s.grantJob(b.id, n);
-                return n;
+                break :blk .wait;
+            };
+            switch (step) {
+                .fail => return error.ReadFailed,
+                .exceeded => {
+                    b.exceeded = true;
+                    return error.ReadFailed;
+                },
+                .eof => return error.EndOfStream,
+                .wait => b.s.waitForPeer() catch return error.ReadFailed,
+                .copied => {
+                    // Outside the lock on purpose: this write can re-enter
+                    // the connection through `Framer` (see `scratch`), which
+                    // takes `mu` for itself.
+                    try w.writeAll(b.scratch[0..n]);
+                    b.s.lock();
+                    defer b.s.unlock();
+                    const jp = b.s.jobs.getPtr(b.id) orelse return error.ReadFailed;
+                    jp.read_pos += n;
+                    if (jp.read_pos == jp.body.items.len) {
+                        // Fully drained: reclaim the buffer instead of
+                        // letting a long upload accumulate behind the cursor.
+                        jp.body.clearRetainingCapacity();
+                        jp.read_pos = 0;
+                    }
+                    b.s.grantJob(b.id, n);
+                    return n;
+                },
             }
-            // Only END_STREAM ends the body — a lull in the DATA frames does
-            // not, and neither does a trailer section that has not landed.
-            if (job.complete) {
-                b.materializeTrailers();
-                if (b.remaining) |rem| {
-                    // §8.1.1: fewer DATA octets than the declared length.
-                    if (rem != 0) return error.ReadFailed;
-                }
-                return error.EndOfStream;
-            }
-            b.s.pump() catch return error.ReadFailed;
         }
     }
 
@@ -3036,4 +3476,791 @@ test "h2c integration: detection — near-miss preface and disabled h2c take the
         const res = try h1.ResponseHead.parse(try h1.readHead(&sr.interface, &head_buf));
         try testing.expectEqual(@as(u16, 505), res.status);
     }
+}
+
+// ── concurrent handlers (`Options.dispatcher`) ──────────────────────────────
+//
+// Real threads throughout: the five invariants the module doc lists exist
+// only because two handlers can be inside the session at once, so nothing
+// short of a real pool exercises them. `workerpool` is a TEST-only dependency
+// of `http` (see build.zig) — the published module implements no pool, only
+// the seam.
+//
+// ⚠ Timing discipline. Every rendezvous here is a *gate*: a thread waits for
+// a fact another thread publishes (an atomic flag), never for a duration. The
+// only wall-clock numbers are (a) `gate_timeout_ms`, which exists so that a
+// regression fails the suite instead of hanging it — it is never reached by a
+// passing run — and (b) the 300 ms sleep in the overlap measurement, which
+// reproduces the original F3 measurement and whose assertion has that whole
+// 300 ms as its margin.
+
+const workerpool = @import("workerpool");
+
+/// How long a gate waits before declaring the run deadlocked. Only the
+/// FAILURE path ever observes this, so it is deliberately enormous.
+const gate_timeout_ms: u64 = 30_000;
+
+fn nowNs(io: std.Io) i96 {
+    return std.Io.Timestamp.now(io, .awake).nanoseconds;
+}
+
+/// Block until `flag` is set. Returns `error.GateTimeout` rather than
+/// spinning forever, so a broken run fails loudly instead of wedging CI.
+fn awaitFlag(io: std.Io, flag: *std.atomic.Value(bool)) error{GateTimeout}!void {
+    const deadline = nowNs(io) + @as(i96, gate_timeout_ms) * std.time.ns_per_ms;
+    while (!flag.load(.acquire)) {
+        if (nowNs(io) >= deadline) return error.GateTimeout;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+}
+
+fn awaitAtLeast(io: std.Io, c: *std.atomic.Value(u64), n: u64) error{GateTimeout}!void {
+    const deadline = nowNs(io) + @as(i96, gate_timeout_ms) * std.time.ns_per_ms;
+    while (c.load(.acquire) < n) {
+        if (nowNs(io) >= deadline) return error.GateTimeout;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+}
+
+fn awaitCount(io: std.Io, c: *std.atomic.Value(u32), n: u32) error{GateTimeout}!void {
+    const deadline = nowNs(io) + @as(i96, gate_timeout_ms) * std.time.ns_per_ms;
+    while (c.load(.acquire) < n) {
+        if (nowNs(io) >= deadline) return error.GateTimeout;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+}
+
+/// The reference `Dispatcher` implementation — `modules/workerpool` plus the
+/// **global** admission cap. The split is deliberate and is the owner ruling:
+/// the per-connection cap is `Dispatcher.max_concurrent_handlers` and the
+/// server enforces it (a stream over it waits in the already-bounded jobs
+/// map); the global cap belongs to whoever owns the pool, because it is the
+/// only place that can see every connection at once. Defaults from the
+/// ruling: per-connection 8, global 4 × CPU count.
+const PoolDispatcher = struct {
+    gpa: Allocator,
+    pool: *workerpool.WorkerPool,
+    global_cap: u32,
+    live: std.atomic.Value(u32) = .init(0),
+
+    /// One dispatched handler: the caller's task plus the back-pointer that
+    /// releases its global slot when it finishes.
+    const Slot = struct { d: *PoolDispatcher, task: Task };
+
+    fn defaultGlobalCap() u32 {
+        const cpus = std.Thread.getCpuCount() catch 1;
+        return @intCast(@max(1, cpus * 4));
+    }
+
+    fn init(gpa: Allocator, io: std.Io, workers: usize, cap: u32) !PoolDispatcher {
+        return .{
+            .gpa = gpa,
+            .pool = try workerpool.WorkerPool.init(gpa, .{ .io = io, .n_workers = workers }),
+            .global_cap = cap,
+        };
+    }
+
+    fn deinit(d: *PoolDispatcher) void {
+        d.pool.drain();
+        d.pool.deinit();
+    }
+
+    fn iface(d: *PoolDispatcher, per_conn: u32) Dispatcher {
+        return .{ .ctx = d, .spawn = spawn, .max_concurrent_handlers = per_conn };
+    }
+
+    fn spawn(ctx: ?*anyopaque, task: Task) bool {
+        const d: *PoolDispatcher = @ptrCast(@alignCast(ctx.?));
+        // Reserve the global slot BEFORE enqueueing, so "the pool is full"
+        // is answered by refusing (false → RST_STREAM(REFUSED_STREAM)) and
+        // never by growing a queue behind a saturated pool.
+        while (true) {
+            const cur = d.live.load(.monotonic);
+            if (cur >= d.global_cap) return false;
+            if (d.live.cmpxchgWeak(cur, cur + 1, .acq_rel, .monotonic) == null) break;
+        }
+        const slot = d.gpa.create(Slot) catch {
+            _ = d.live.fetchSub(1, .acq_rel);
+            return false;
+        };
+        slot.* = .{ .d = d, .task = task };
+        d.pool.submit(.{ .func = runSlot, .ctx = slot }) catch {
+            d.gpa.destroy(slot);
+            _ = d.live.fetchSub(1, .acq_rel);
+            return false;
+        };
+        return true;
+    }
+
+    fn runSlot(ctx: *anyopaque) void {
+        const slot: *Slot = @ptrCast(@alignCast(ctx));
+        const d = slot.d;
+        const task = slot.task;
+        d.gpa.destroy(slot);
+        task.func(task.ctx);
+        _ = d.live.fetchSub(1, .acq_rel);
+    }
+};
+
+/// A `Reader` that releases the client's bytes in *stages*, each gated on a
+/// fact the server must publish first. This is what makes "the reading side
+/// keeps working while a handler is blocked" testable without a socket and
+/// without a sleep: stage N+1 simply does not exist on the wire until the
+/// server has demonstrably reached the state stage N was supposed to cause.
+const StagedReader = struct {
+    io: std.Io,
+    stages: []const Stage,
+    idx: usize = 0,
+    off: usize = 0,
+    reader: Reader,
+
+    const Stage = struct {
+        /// Withhold these bytes until the flag is set (null = no flag gate).
+        gate: ?*std.atomic.Value(bool) = null,
+        /// Withhold them until `counter` reaches `at_least` — the shape a
+        /// flow-control test needs, where the fact being waited for is "the
+        /// server has spent N octets of window", not a boolean. A stage with
+        /// empty `bytes` is then a pure barrier (useful as the last stage, to
+        /// keep EOF from racing the workers).
+        counter: ?*std.atomic.Value(u64) = null,
+        at_least: u64 = 0,
+        bytes: []const u8,
+    };
+
+    fn init(io: std.Io, stages: []const Stage, buffer: []u8) StagedReader {
+        return .{
+            .io = io,
+            .stages = stages,
+            .reader = .{ .vtable = &.{ .stream = streamFn }, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        const sr: *StagedReader = @alignCast(@fieldParentPtr("reader", r));
+        while (true) {
+            if (sr.idx >= sr.stages.len) return error.EndOfStream;
+            const st = sr.stages[sr.idx];
+            if (sr.off == 0) {
+                if (st.gate) |g| awaitFlag(sr.io, g) catch return error.ReadFailed;
+                if (st.counter) |c|
+                    awaitAtLeast(sr.io, c, st.at_least) catch return error.ReadFailed;
+            }
+            const src = limit.sliceConst(st.bytes[sr.off..]);
+            if (src.len == 0) {
+                sr.idx += 1;
+                sr.off = 0;
+                continue;
+            }
+            try w.writeAll(src);
+            sr.off += src.len;
+            if (sr.off == st.bytes.len) {
+                sr.idx += 1;
+                sr.off = 0;
+            }
+            return src.len;
+        }
+    }
+};
+
+/// A `Writer` that collects the server's output AND classifies the frames as
+/// they are written, publishing what it saw through atomics. Classification
+/// has to happen here rather than in the test body: the server writes from
+/// several threads under `Session.mu`, so the accumulated buffer is only safe
+/// to read once `serve` has returned — but the gates need to fire *during*
+/// the run.
+const FrameWatcher = struct {
+    gpa: Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    scan: usize = 0,
+    ping_ack: std.atomic.Value(bool) = .init(false),
+    goaway: std.atomic.Value(bool) = .init(false),
+    refused: std.atomic.Value(u32) = .init(0),
+    /// Total DATA payload octets written — i.e. exactly the send-window
+    /// credit the server has spent.
+    data_bytes: std.atomic.Value(u64) = .init(0),
+    writer: Writer,
+
+    fn init(gpa: Allocator, buffer: []u8) FrameWatcher {
+        return .{
+            .gpa = gpa,
+            .writer = .{ .vtable = &.{ .drain = drainFn }, .buffer = buffer },
+        };
+    }
+
+    fn deinit(fw: *FrameWatcher) void {
+        fw.buf.deinit(fw.gpa);
+    }
+
+    fn drainFn(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const fw: *FrameWatcher = @alignCast(@fieldParentPtr("writer", w));
+        const buffered = w.buffer[0..w.end];
+        w.end = 0;
+        fw.buf.appendSlice(fw.gpa, buffered) catch return error.WriteFailed;
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            fw.buf.appendSlice(fw.gpa, d) catch return error.WriteFailed;
+            consumed += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| fw.buf.appendSlice(fw.gpa, last) catch return error.WriteFailed;
+        consumed += last.len * splat;
+        fw.classify();
+        return consumed;
+    }
+
+    /// Walk whole frames off the accumulated output (§4.1: 3-octet length,
+    /// type, flags, 4-octet stream id) and publish the three facts the gates
+    /// wait on.
+    fn classify(fw: *FrameWatcher) void {
+        while (fw.buf.items.len - fw.scan >= 9) {
+            const h = fw.buf.items[fw.scan..][0..9];
+            const len = (@as(usize, h[0]) << 16) | (@as(usize, h[1]) << 8) | h[2];
+            if (fw.buf.items.len - fw.scan < 9 + len) return;
+            const payload = fw.buf.items[fw.scan + 9 ..][0..len];
+            switch (h[3]) {
+                0x0 => _ = fw.data_bytes.fetchAdd(len, .acq_rel), // DATA
+                0x3 => if (len >= 4) { // RST_STREAM
+                    const code = std.mem.readInt(u32, payload[0..4], .big);
+                    if (code == 7) _ = fw.refused.fetchAdd(1, .acq_rel); // REFUSED_STREAM
+                },
+                0x6 => if (h[4] & 0x1 != 0) fw.ping_ack.store(true, .release), // PING ACK
+                0x7 => fw.goaway.store(true, .release), // GOAWAY
+                else => {},
+            }
+            fw.scan += 9 + len;
+        }
+    }
+};
+
+/// Client bytes for one complete GET stream, staged into `peer.wire`.
+fn stageGet(peer: *TestPeer, path: []const u8) !u31 {
+    return peer.conn.startStream(&peer.wire, &fieldsFor("GET", path), true);
+}
+
+// ── the F3 measurement, before and after ────────────────────────────────────
+
+const OverlapProbe = struct {
+    io: std.Io,
+    t0: i96 = 0,
+    slow_enter: i96 = 0,
+    slow_exit: i96 = 0,
+    fast_enter: i96 = 0,
+    fast_exit: i96 = 0,
+
+    fn ms(p: *const OverlapProbe, t: i96) i64 {
+        return @intCast(@divTrunc(t - p.t0, std.time.ns_per_ms));
+    }
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *OverlapProbe = @ptrCast(@alignCast(req.context.?));
+        if (std.mem.eql(u8, req.path, "/slow")) {
+            p.slow_enter = nowNs(p.io);
+            const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(300), .clock = .awake };
+            d.sleep(p.io) catch {};
+            p.slow_exit = nowNs(p.io);
+        } else {
+            p.fast_enter = nowNs(p.io);
+            p.fast_exit = nowNs(p.io);
+        }
+        try rw.writeAll("ok");
+    }
+};
+
+test "dispatcher: /fast completes while /slow is still sleeping (F3 measurement)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Both streams are complete on the wire before the server reads a byte —
+    // the exact shape of the original measurement.
+    var out_buf: [16 * 1024]u8 = undefined;
+
+    // BEFORE: no dispatcher. Handlers run on the connection's own task.
+    var seq: OverlapProbe = .{ .io = io };
+    {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const slow = try stageGet(&peer, "/slow");
+        const fast = try stageGet(&peer, "/fast");
+        seq.t0 = nowNs(io);
+        try runOffline(&peer, .{
+            .handler = OverlapProbe.handler,
+            .context = &seq,
+        }, &out_buf);
+        try testing.expectEqual(@as(u16, 200), peer.resp(slow).status);
+        try testing.expectEqual(@as(u16, 200), peer.resp(fast).status);
+    }
+    // Sequential by construction: /fast cannot even start until /slow is out.
+    try testing.expect(seq.fast_enter >= seq.slow_exit);
+
+    // AFTER: the same bytes, the same handler, a bounded pool underneath.
+    var pd = try PoolDispatcher.init(gpa, io, 4, PoolDispatcher.defaultGlobalCap());
+    defer pd.deinit();
+    var par: OverlapProbe = .{ .io = io };
+    {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const slow = try stageGet(&peer, "/slow");
+        const fast = try stageGet(&peer, "/fast");
+        par.t0 = nowNs(io);
+        try runOffline(&peer, .{
+            .handler = OverlapProbe.handler,
+            .context = &par,
+            .dispatcher = pd.iface(8),
+        }, &out_buf);
+        try testing.expectEqual(@as(u16, 200), peer.resp(slow).status);
+        try testing.expectEqual(@as(u16, 200), peer.resp(fast).status);
+    }
+    // Overlap: /fast entered AND returned while /slow was still inside its
+    // 300 ms sleep. Timing-dependent only in that /fast must not itself take
+    // 300 ms — the whole sleep is the margin.
+    // Measured on this machine, both halves of this very test:
+    //   sequential: slow enter +0 ms / exit +300 ms . fast enter +301 ms / exit +301 ms
+    //   pooled:     slow enter +1 ms / exit +301 ms . fast enter   +0 ms / exit   +0 ms
+    // The first line is, to the millisecond, the audit's original F3
+    // measurement — which is the point: the same bytes, the same handler,
+    // and only `Options.dispatcher` differs.
+    try testing.expect(par.fast_enter < par.slow_exit);
+    try testing.expect(par.fast_exit < par.slow_exit);
+    // And the connection as a whole no longer costs 2 × the slow handler.
+    try testing.expect(par.ms(par.fast_exit) < 300);
+}
+
+// ── the reading side keeps working ──────────────────────────────────────────
+
+const PingProbe = struct {
+    io: std.Io,
+    /// Published by the handler once it is inside and blocked.
+    entered: std.atomic.Value(bool) = .init(false),
+    /// The server's PING ACK, observed by `FrameWatcher`.
+    ack: *std.atomic.Value(bool),
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *PingProbe = @ptrCast(@alignCast(req.context.?));
+        p.entered.store(true, .release);
+        // Blocked on something that is NOT h2 I/O — a gRPC bidi handler
+        // waiting on application state does exactly this. The old engine
+        // stopped reading the socket right here.
+        try awaitFlag(p.io, p.ack);
+        try rw.writeAll("ok");
+    }
+};
+
+test "dispatcher: a PING is answered while a handler is blocked on non-h2 work" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    // Stage 0: preface + one request. Stage 1: a PING, withheld until the
+    // handler is demonstrably inside and blocked — so an ACK can only mean
+    // the connection kept reading with a handler stuck in it.
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/block");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendPing(&peer.wire, .{ 0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef });
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+
+    var probe: PingProbe = .{ .io = io, .ack = &fw.ping_ack };
+
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .gate = &probe.entered, .bytes = stage1 },
+    }, &rbuf);
+
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+
+    serve(gpa, .{
+        .handler = PingProbe.handler,
+        .context = &probe,
+        .dispatcher = pd.iface(8),
+    }, &sr.reader, &fw.writer);
+
+    // Reaching here at all is the result: the handler could only return
+    // because the ACK it was waiting for was produced by the connection task
+    // while it blocked. Sequentially this deadlocks (and `gate_timeout_ms`
+    // would fail the run instead).
+    try testing.expect(fw.ping_ack.load(.acquire));
+    try peer.feed(fw.buf.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+}
+
+// ── a full pool refuses, it does not queue ──────────────────────────────────
+
+const RefuseProbe = struct {
+    io: std.Io,
+    refused: *std.atomic.Value(u32),
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *RefuseProbe = @ptrCast(@alignCast(req.context.?));
+        // Hold the pool's single slot until the second stream has been
+        // answered — by a refusal, if the pool really refuses rather than
+        // queueing behind us.
+        const deadline = nowNs(p.io) + @as(i96, gate_timeout_ms) * std.time.ns_per_ms;
+        while (p.refused.load(.acquire) == 0) {
+            if (nowNs(p.io) >= deadline) return error.GateTimeout;
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        try rw.writeAll("ok");
+    }
+};
+
+test "dispatcher: a full pool answers RST_STREAM(REFUSED_STREAM), never a queue" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const first = try stageGet(&peer, "/a");
+    const second = try stageGet(&peer, "/b");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var probe: RefuseProbe = .{ .io = io, .refused = &fw.refused };
+
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{.{ .bytes = stage0 }}, &rbuf);
+
+    // Global capacity ONE. The per-connection cap is deliberately left at 8
+    // so the refusal can only come from the global admission control.
+    var pd = try PoolDispatcher.init(gpa, io, 2, 1);
+    defer pd.deinit();
+
+    serve(gpa, .{
+        .handler = RefuseProbe.handler,
+        .context = &probe,
+        .dispatcher = pd.iface(8),
+    }, &sr.reader, &fw.writer);
+
+    try peer.feed(fw.buf.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(first).status);
+    // Refused, not queued and not hung: retryable per §8.7.
+    try testing.expectEqual(@as(?h2.ErrorCode, .refused_stream), peer.resp(second).rst);
+    try testing.expectEqual(@as(?[]const u8, null), peer.resp(second).header(":status"));
+}
+
+// ── rapid reset still costs the attacker after dispatch ─────────────────────
+
+const CancelProbe = struct {
+    io: std.Io,
+    entered: std.atomic.Value(u32) = .init(0),
+    goaway: *std.atomic.Value(bool),
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *CancelProbe = @ptrCast(@alignCast(req.context.?));
+        _ = p.entered.fetchAdd(1, .acq_rel);
+        // Still running when the cancellation arrives — the situation the
+        // old structural argument ("handlers run sequentially, so cancelled
+        // streams never fan out concurrent work") no longer covers.
+        awaitFlag(p.io, p.goaway) catch {};
+        rw.writeAll("ok") catch {};
+    }
+};
+
+test "dispatcher: streams cancelled AFTER dispatch are charged to the rapid-reset budget" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    var sids: [3]u31 = undefined;
+    for (&sids) |*sid| sid.* = try stageGet(&peer, "/hold");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    // The cancellations, withheld until all three handlers are running.
+    for (sids) |sid| try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var probe: CancelProbe = .{ .io = io, .goaway = &fw.goaway };
+
+    // A gate on a counter needs a bool for `StagedReader`; publish one.
+    var all_in: std.atomic.Value(bool) = .init(false);
+    const Waiter = struct {
+        fn run(p: *CancelProbe, flag: *std.atomic.Value(bool), i: std.Io) void {
+            awaitCount(i, &p.entered, 3) catch {};
+            flag.store(true, .release);
+        }
+    };
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ &probe, &all_in, io });
+    defer waiter.join();
+
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .gate = &all_in, .bytes = stage1 },
+    }, &rbuf);
+
+    var pd = try PoolDispatcher.init(gpa, io, 4, 8);
+    defer pd.deinit();
+
+    serve(gpa, .{
+        .handler = CancelProbe.handler,
+        .context = &probe,
+        // Budget 2: the third post-dispatch cancellation must break it.
+        .limits = .{ .max_reset_streams = 2 },
+        .dispatcher = pd.iface(8),
+    }, &sr.reader, &fw.writer);
+
+    try testing.expectEqual(@as(u32, 3), probe.entered.load(.acquire));
+    try peer.feed(fw.buf.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, .enhance_your_calm), peer.goaway);
+}
+
+// ── invariant 1: the HPACK dynamic table under concurrent encoders ──────────
+
+const table_streams = 8;
+
+const HpackProbe = struct {
+    io: std.Io,
+    arrived: std.atomic.Value(u32) = .init(0),
+
+    /// Each stream answers with a header whose NAME and VALUE are unique to
+    /// it and long enough to be inserted into the connection's single HPACK
+    /// dynamic table. Every response is therefore an edit to shared encoder
+    /// state, and the peer's decoder replays those edits in wire order: if
+    /// two encoders interleave, the table the peer builds is not the table
+    /// the server thinks it built, and the values come back wrong (or the
+    /// block fails to decode at all).
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *HpackProbe = @ptrCast(@alignCast(req.context.?));
+        const n = req.path[req.path.len - 1];
+        _ = p.arrived.fetchAdd(1, .acq_rel);
+        // All encoders enter `sendHead` at once: the collision is scheduled,
+        // not hoped for.
+        try awaitCount(p.io, &p.arrived, table_streams);
+        var name_buf: [32]u8 = undefined;
+        var val_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "x-table-{c}", .{n});
+        @memset(&val_buf, n);
+        const val: []const u8 = &val_buf;
+        try rw.setHeader(name, val);
+        try rw.writeAll(val[0..8]);
+    }
+};
+
+test "dispatcher: concurrent responses keep the HPACK dynamic table coherent" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    var sids: [table_streams]u31 = undefined;
+    var paths: [table_streams][8]u8 = undefined;
+    for (&sids, &paths, 0..) |*sid, *path, i| {
+        path.* = .{ '/', 't', 'a', 'b', '/', 'x', 'x', @intCast('a' + i) };
+        sid.* = try stageGet(&peer, path);
+    }
+
+    var probe: HpackProbe = .{ .io = io };
+    var pd = try PoolDispatcher.init(gpa, io, table_streams, table_streams);
+    defer pd.deinit();
+
+    var out_buf: [64 * 1024]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = HpackProbe.handler,
+        .context = &probe,
+        .dispatcher = pd.iface(table_streams),
+    }, &out_buf);
+
+    for (sids, 0..) |sid, i| {
+        const c = peer.resp(sid);
+        try testing.expectEqual(@as(u16, 200), c.status);
+        var name_buf: [32]u8 = undefined;
+        var val_buf: [64]u8 = undefined;
+        const ch: u8 = @intCast('a' + i);
+        const name = try std.fmt.bufPrint(&name_buf, "x-table-{c}", .{ch});
+        @memset(&val_buf, ch);
+        const val: []const u8 = &val_buf;
+        try testing.expectEqualStrings(val, c.header(name) orelse return error.HeaderLost);
+        try testing.expectEqualStrings(val[0..8], c.body.items);
+    }
+}
+
+// ── the per-connection cap holds work back without losing it ────────────────
+
+test "dispatcher: streams over the per-connection cap wait, and are all served" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    var sids: [6]u31 = undefined;
+    for (&sids) |*sid| sid.* = try stageGet(&peer, "/hello");
+
+    // Cap of 2 with 6 ready streams: the other four are NOT refused — they
+    // wait in the (already bounded) jobs map and are dispatched by the tail
+    // of each finishing worker, which is the only thing that can do it on a
+    // connection with no further wire events.
+    var pd = try PoolDispatcher.init(gpa, io, 4, 64);
+    defer pd.deinit();
+
+    var out_buf: [32 * 1024]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .dispatcher = pd.iface(2),
+    }, &out_buf);
+
+    for (sids) |sid| {
+        const c = peer.resp(sid);
+        try testing.expectEqual(@as(u16, 200), c.status);
+        try testing.expect(c.end);
+        try testing.expectEqual(@as(?h2.ErrorCode, null), c.rst);
+        try testing.expectEqualStrings("hello", c.body.items);
+    }
+}
+
+// ── invariant 3: the CONNECTION window as the binding constraint ────────────
+//
+// The connection send window (§6.9.1) is the one piece of flow-control state
+// two workers genuinely share — a stream window belongs to one handler, the
+// connection window belongs to all of them — and it is the one whose breach
+// gets us GOAWAYed by the *peer* rather than caught locally.
+//
+// Making it the binding constraint takes three deliberate settings, and
+// without all three the test is a no-op that passes for the wrong reason:
+//   * the peer advertises a LARGE SETTINGS_INITIAL_WINDOW_SIZE, so per-stream
+//     windows are not what limits anything (the connection window is fixed at
+//     65535 and no SETTINGS can raise it — only WINDOW_UPDATE can);
+//   * `response_buffer_size` is larger than the response body, so the whole
+//     body reaches `Framer.emit` as ONE slice. With the default 4 KiB buffer
+//     every `emit` call is a 4 KiB chunk that fits the connection window
+//     trivially, and `h2.sendData`'s own `len > conn_send_window` check masks
+//     any mistake `emit` makes — which is exactly why an earlier version of
+//     this file could drop `conn_send_window` from the minimum and stay green;
+//   * the credit is replenished in instalments, each gated on octets actually
+//     sent, so a server that waits for the *whole* remaining body to fit at
+//     once never reaches the next instalment and deadlocks instead of
+//     completing slowly.
+//
+// Two streams, so the pooled path is the one under test: both workers sit in
+// `emit` spending the same connection window, and both park in the
+// outside-the-lock wait while the connection task applies the WINDOW_UPDATE
+// that frees them — the replenishment half of the liveness argument.
+
+const fc_body_len = 96 * 1024;
+const fc_stream_window = 1 << 20;
+const fc_grant: u31 = 65535;
+
+const FlowProbe = struct {
+    body_a: [fc_body_len]u8 = @splat('a'),
+    body_b: [fc_body_len]u8 = @splat('b'),
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *FlowProbe = @ptrCast(@alignCast(req.context.?));
+        const body: []const u8 = if (std.mem.endsWith(u8, req.path, "a"))
+            &p.body_a
+        else
+            &p.body_b;
+        try rw.writeAll(body);
+    }
+};
+
+test "dispatcher: the connection window bounds two concurrent senders (§6.9.1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Stream windows wide open; the connection window is the only limit.
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = fc_stream_window });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_a = try stageGet(&peer, "/big/a");
+    const sid_b = try stageGet(&peer, "/big/b");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+
+    // Three connection-level instalments. `sendWindowUpdate` also raises the
+    // peer's own receive window, which is what lets it decode 192 KiB later.
+    var grants: [3][]u8 = undefined;
+    for (&grants) |*g| {
+        try peer.conn.sendWindowUpdate(&peer.wire, 0, fc_grant);
+        g.* = try gpa.dupe(u8, peer.wire.items);
+        peer.wire.clearRetainingCapacity();
+    }
+    defer for (grants) |g| gpa.free(g);
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        // Each gate is below the credit outstanding at that point, so a
+        // correct server always reaches it; a server that demands the whole
+        // remainder in one window never sends a byte and hangs at the first.
+        .{ .counter = &fw.data_bytes, .at_least = 60_000, .bytes = grants[0] },
+        .{ .counter = &fw.data_bytes, .at_least = 125_000, .bytes = grants[1] },
+        .{ .counter = &fw.data_bytes, .at_least = 190_000, .bytes = grants[2] },
+        // Pure barrier: hold EOF back until both bodies are out, so tearing
+        // the connection down cannot race the workers.
+        .{ .counter = &fw.data_bytes, .at_least = 2 * fc_body_len, .bytes = "" },
+    }, &rbuf);
+
+    var probe: FlowProbe = .{};
+    var pd = try PoolDispatcher.init(gpa, io, 4, 8);
+    defer pd.deinit();
+
+    serve(gpa, .{
+        .handler = FlowProbe.handler,
+        .context = &probe,
+        // > body length: the whole response reaches `emit` as one slice.
+        .response_buffer_size = 128 * 1024,
+        .dispatcher = pd.iface(8),
+    }, &sr.reader, &fw.writer);
+
+    try peer.feed(fw.buf.items);
+    // Never GOAWAYed: had either sender overspent the shared window, §6.9.1
+    // says the peer is the one that ends the connection.
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+    for ([_]u31{ sid_a, sid_b }, [_]u8{ 'a', 'b' }) |sid, ch| {
+        const c = peer.resp(sid);
+        try testing.expectEqual(@as(u16, 200), c.status);
+        try testing.expect(c.end);
+        try testing.expectEqual(@as(usize, fc_body_len), c.body.items.len);
+        for (c.body.items) |b| try testing.expectEqual(ch, b);
+    }
+    // The connection window really was the binding constraint: more octets
+    // were delivered than it ever held at once.
+    try testing.expect(fw.data_bytes.load(.acquire) > fc_grant);
 }
