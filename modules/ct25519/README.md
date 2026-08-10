@@ -42,8 +42,17 @@ and the finding that started this).
 base and non-base points over deterministic pseudorandom scalars; RFC 8032 §7.1
 TEST 1/TEST 2 public keys re-derived as `[clamp(SHA-512(sk)[0..32])]B`
 byte-exactly; the two scalars std refuses (`s = 0`, `s = L`) pinned to the
-neutral element as a value; and scalar-additivity `(a+b)·B == a·B + b·B` as a
-std-independent property over the window seams.
+neutral element as a value; the inputs std refuses outright (the identity, an
+order-8 torsion point) checked against repeated addition; all 256 scalar bits
+checked against a doubling chain; and scalar-additivity `(a+b)·B == a·B + b·B`
+as a std-independent property over the window seams.
+
+**The test suite is not the constant-time oracle.** A secret-dependent branch
+that changes no output byte passes every test here — demonstrated, not
+assumed. The property this module is named after is checked by a ctgrind-style
+valgrind run, and [SPEC.md](SPEC.md) carries the harness, the two flags without
+which it silently reports a false clean, and the limits of the claim. Read it
+before trusting a green `zig build test-ct25519`.
 
 Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
 `std/crypto/25519/edwards25519.zig` (MIT, part of Zig itself) with the trailing

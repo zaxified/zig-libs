@@ -67,13 +67,28 @@
 //!
 //! ## Verification
 //!
+//! **The tests below are NOT the constant-time oracle.** They compare
+//! outputs, and the defect class this module exists to remove — a branch
+//! on a secret that changes no output byte — is invisible to all of them:
+//! injecting `if (s == 0) return identityElement;` into `mul` leaves
+//! `zig build test-ct25519` green. Constant time is checked with a
+//! ctgrind-style valgrind run instead; `SPEC.md` carries the harness, the
+//! two flags without which it reports a false clean, and the limits of
+//! the claim. What the tests DO establish:
+//!
 //! `mul`/`mulRistretto` are held **bit-exact** against `std`'s own
 //! `Edwards25519.mul`/`Ristretto255.mul` wherever std is willing to answer
 //! (i.e. every non-degenerate case) over random and edge scalars, on both
 //! the base point and random points; RFC 8032 §7.1's published Ed25519
 //! public keys are re-derived as `[clamp(H(sk))]B` byte-exactly; and the
 //! cases where std refuses (`s = 0`, `s = L`) are pinned to the neutral
-//! element as a value. See the tests at the bottom of this file.
+//! element as a value. The inputs std refuses *outright* — the identity
+//! and an order-8 torsion point, where this module deliberately answers
+//! and std returns `error.WeakPublicKey` — are checked against repeated
+//! addition, an oracle independent of both ladders; and scalar bits
+//! 250..255 are checked against a doubling chain, because every other
+//! test here feeds a reduced or clamped scalar in which the top bits are
+//! never set. See the tests at the bottom of this file.
 
 const std = @import("std");
 
@@ -140,9 +155,14 @@ fn pcSelect(pc: *const [16]Edwards25519, slot: u4) Edwards25519 {
 /// `error.IdentityElement`. Safe for a SECRET `s`.
 ///
 /// `s` is used as-is (no clamping, no reduction) — the same contract as
-/// std's `Edwards25519.mul`; only the low 253 bits are read, so a scalar
-/// that is not already reduced mod `L` must be reduced by the caller
-/// (`scalar.reduce`/`reduce64`) exactly as it must be for std.
+/// std's `Edwards25519.mul`. **All 256 bits are read**: the top window sits
+/// at `pos = 252` and covers bits 252..255, so an unreduced `s` yields
+/// `s·P` for the full 256-bit integer, NOT for `s mod L`. A protocol that
+/// needs the reduced value must reduce first (`scalar.reduce`/`reduce64`),
+/// exactly as it must for std. (This comment previously said "only the low
+/// 253 bits are read", which was false; the audit's `I2` fault injection —
+/// masking bit 255 off inside `mul` — left the whole suite green, because
+/// every scalar the tests used was either reduced mod `L` or clamped.)
 ///
 /// The input point is NOT validated: see the module doc comment. Use
 /// std's `mulPublic`/`mulDoubleBasePublic` when `s` is public and speed
@@ -290,6 +310,89 @@ test "mulBase: re-derives RFC 8032 §7.1's published Ed25519 public keys" {
         var a: [32]u8 = h[0..32].*;
         scalar.clamp(&a);
         try testing.expectEqualSlices(u8, &want, &mulBase(a).toBytes());
+    }
+}
+
+test "mul: reads ALL 256 scalar bits (no silent truncation of the top window)" {
+    // Every other test in this file feeds a scalar that is either reduced
+    // mod `L` (`nthScalar` ⇒ < 2^253) or clamped (RFC 8032 ⇒ bit 255 forced
+    // to 0), so bit 255 is set in NONE of them. Masking it off inside `mul`
+    // therefore used to leave the suite green — the audit's `I2` injection.
+    // Oracles here are BOTH std's `mul` and a doubling chain, so this pins
+    // the value and not merely std's agreement with us.
+    var bit: u16 = 250;
+    while (bit < 256) : (bit += 1) {
+        var s = [_]u8{0} ** 32;
+        s[bit >> 3] = @as(u8, 1) << @as(u3, @truncate(bit));
+        const ours = mulBase(s).toBytes();
+        const want = try Edwards25519.basePoint.mul(s);
+        try testing.expectEqualSlices(u8, &want.toBytes(), &ours);
+        var chain = Edwards25519.basePoint;
+        var i: u16 = 0;
+        while (i < bit) : (i += 1) chain = chain.dbl();
+        try testing.expectEqualSlices(u8, &chain.toBytes(), &ours);
+    }
+    // 2^256 - 1: an unreduced scalar far above `L`, to pin that nothing
+    // silently reduces or rejects it.
+    const ones = [_]u8{0xff} ** 32;
+    const want_ones = try Edwards25519.basePoint.mul(ones);
+    try testing.expectEqualSlices(u8, &want_ones.toBytes(), &mulBase(ones).toBytes());
+}
+
+test "mul: degenerate INPUT points, where std refuses to answer at all" {
+    // This module deliberately drops std's `WeakPublicKey` check on the
+    // point (see the module doc comment), so it answers on inputs std
+    // rejects — and those answers were previously untested. The oracle is
+    // repeated addition: independent of std's ladder AND of this one.
+    const s = nthScalar(9_001);
+    try testing.expectEqualSlices(
+        u8,
+        &Edwards25519.identityElement.toBytes(),
+        &mul(Edwards25519.identityElement, s).toBytes(),
+    );
+
+    // A point of order exactly 8 (asserted below) — the RFC 8032 §5.1.7
+    // "small order" shape. std's `mul` refuses it outright.
+    const torsion_bytes = [_]u8{
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b,
+        0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39,
+        0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+    };
+    const t8 = try Edwards25519.fromBytes(torsion_bytes);
+    try testing.expectError(error.WeakPublicKey, t8.mul(s));
+    try testing.expectError(error.WeakPublicKey, t8.rejectLowOrder());
+
+    const id_bytes = Edwards25519.identityElement.toBytes();
+    var acc = Edwards25519.identityElement; // acc == k*t8
+    var k: u8 = 0;
+    while (k < 10) : (k += 1) {
+        var sk = [_]u8{0} ** 32;
+        sk[0] = k;
+        try testing.expectEqualSlices(u8, &acc.toBytes(), &mul(t8, sk).toBytes());
+        // order exactly 8: identity at k = 0 and k = 8, nowhere between.
+        const is_id = std.mem.eql(u8, &acc.toBytes(), &id_bytes);
+        try testing.expectEqual(k % 8 == 0, is_id);
+        acc = acc.add(t8);
+    }
+}
+
+test "mulBase/mulRistrettoBase take the comptime base table, and both table paths agree" {
+    // The comptime table is reached only while std still marks its own base
+    // points `is_base` — a std internal this module cannot enforce. If a std
+    // upgrade ever built `Ristretto255.basePoint` from bytes instead, every
+    // `mulRistrettoBase` call would quietly start doing an online 15-entry
+    // precomputation and no other test would notice. Pin the precondition.
+    try testing.expect(Edwards25519.basePoint.is_base);
+    try testing.expect(Ristretto255.basePoint.p.is_base);
+
+    // ...and the comptime-folded table must agree with the online one, so a
+    // future divergence is a red test rather than only a slowdown.
+    const b = try Edwards25519.fromBytes(Edwards25519.basePoint.toBytes());
+    try testing.expect(!b.is_base);
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        const s = nthScalar(i +% 7_000);
+        try testing.expectEqualSlices(u8, &mulBase(s).toBytes(), &mul(b, s).toBytes());
     }
 }
 
