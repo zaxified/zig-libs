@@ -24,6 +24,7 @@ Provenance: clean-room (token-bucket + keyed store). Design refs
 | `TokenBucket` | the bare algorithm | none — caller passes `now_ns` |
 | `Limiter` | per-key buckets, bounded LRU store | injected `Clock`, internal lock |
 | `Limiter.middleware()` | `router.Middleware`, 429 + `Retry-After` | key from request headers / socket peer |
+| `ConnectionLimiter` | new **connections** per **user**, for `on_connect` | injected `Clock`, internal lock |
 
 The algorithm never reads a wall clock: time comes from `Options.clock`
 (default = OS `CLOCK_MONOTONIC`), so tests are fully deterministic
@@ -105,6 +106,78 @@ extractor that walks the chain past your own hops.
 `KeySource.header` (API-key limiting) uses the named header's value as the
 key and falls back to the forwarded-IP chain when the header is absent.
 
+## Connection-establishment limiting (`ConnectionLimiter`) — security relevant
+
+A different question from the one above: not "how many requests may this
+client send" but **"how fast may this user open new connections"**. It runs
+in `http.Server.Options.on_connect`, on the accept loop, **before a byte is
+read** — the only place a connection can be refused for the price of one
+`close()` and zero response bytes.
+
+```zig
+const acme_v4 = netaddr.parsePrefix("192.0.2.0/24").?;
+const acme_v6 = netaddr.parsePrefix("2001:db8:1::/48").?;
+const users = [_]ratelimit.ConnUser{
+    // Both prefixes are the SAME user → one shared bucket.
+    .{ .name = "acme", .prefixes = &.{ acme_v4, acme_v6 } },
+    // Per-user override.
+    .{ .name = "bulk", .prefixes = &.{bulk_v4}, .rate_per_s = 50, .burst = 100 },
+};
+var conn_limit = try ratelimit.ConnectionLimiter.init(gpa, .{
+    .users = &users,
+    .rate_per_s = 4, // default: 4 new connections/s per user
+    .burst = 8,      // …plus 8 of headroom
+});
+defer conn_limit.deinit();
+
+var server = http.Server.init(io, gpa, .{
+    .handler = r.handler(),
+    .context = &r,
+    .on_connect = ratelimit.ConnectionLimiter.onConnect,
+    .on_connect_ctx = &conn_limit,
+});
+```
+
+- **Identity = a list of CIDR prefixes.** No mTLS, no JWT — nothing but the
+  peer address exists yet. Prefixes, not single addresses: every address of
+  a user shares **one** bucket, otherwise "4/s per user" is really "4/s per
+  address" and means nothing to anyone with a /24. First configured match
+  wins, so a specific prefix listed before its enclosing range works.
+- **Dual-stack peers are unmapped before matching.** A dual-stack listener
+  is handed `::ffff:192.0.2.7` for a v4 client, and that must reach the same
+  bucket as plain `192.0.2.7`. Skipping the unmap is a silent bypass, not a
+  cosmetic bug: a customer configured with v4 prefixes stops matching at
+  all, falls through to the *unlisted* default (so their per-user override
+  quietly does not apply), and — since only unlisted keys are evictable —
+  becomes flushable by the very address-rotation flood the fixed-array
+  design exists to stop. On top of that every v4-mapped address shares the
+  `::/64` key, so all v4 clients would collapse into **one** unlisted
+  bucket and any single one of them could starve the rest.
+  **Consequence for operators:** spell a v4 user in **v4 CIDR**.
+  `::ffff:0:0/96` matches nothing, precisely because peers are unmapped
+  first. The reverse never happens: `Prefix.contains` is family-strict, so
+  a v4 peer cannot fall into a v6 customer's bucket, and unmap merges only
+  the two spellings of one host — two different addresses keep two buckets.
+- **Unlisted addresses get a defined default**, `rate_per_s`/`burst`, **per
+  address** — never one shared bucket (that would let a single stranger
+  starve every other stranger), never "unlimited", never "denied".
+- **IPv6 rotation.** Unlisted v6 peers are keyed by their **/64**
+  (`unlisted_v6_bits`), the standard single-host allocation, so rotating
+  inside one — the free case — is a single bucket. Unlisted v4 keys per
+  address (`unlisted_v4_bits = 32`).
+- **The table is bounded** at `max_unlisted_keys` (LRU + idle TTL). **What
+  an attacker gets, plainly:** with a /48 they still hold 2^16 distinct /64s
+  and can churn the unlisted table, evicting *other unlisted* keys — an
+  evicted key restarts full, so a flood can hand other strangers up to
+  `burst` extra connections. What they cannot touch is a **configured
+  user**: listed users' buckets live in a fixed array allocated at `init`,
+  never in the evictable table, so no amount of rotation resets a customer's
+  limit or grows memory on their behalf.
+- **Not a spoofing concern** — the TCP handshake completes before the hook
+  runs, so the peer address is real. **NAT is solved for listed users only**:
+  a company behind one address gets its own bucket because it is listed;
+  unlisted traffic behind a shared address shares that address's bucket.
+
 ## Semantics notes (x/time/rate parity)
 
 - Bucket starts **full** (a fresh key gets its whole burst).
@@ -120,7 +193,13 @@ key and falls back to the forwarded-IP chain when the header is absent.
 
 ## Verification
 
-`zig build test-ratelimit` — offline deterministic tests (bucket math, refill
+`zig build test-ratelimit` — for `ConnectionLimiter`: two addresses of one
+user sharing a bucket (the 5th connection of a second refused from either),
+a per-user override actually overriding while the default user does not,
+unlisted addresses limited and isolated from one another, rotation inside a
+/64 collapsing to one bucket, and a 4096-/64 flood leaving the table bounded
+and a listed user's drained bucket untouched — all on an injected clock, no
+sleeps. Plus offline deterministic tests (bucket math, refill
 and `retry_after` exactness, per-key isolation, LRU eviction + TTL sweep, an
 8-thread over-admission race check, fail-open OOM), middleware goldens over
 the socket-free `http.Server.serveStream` (429 wire bytes, XFF/X-Real-IP/

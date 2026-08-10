@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! ratelimit — token-bucket request limiting: a pure keyed limiter plus a
-//! `router` middleware answering **429 + Retry-After**.
+//! ratelimit — token-bucket limiting: a pure keyed limiter plus a `router`
+//! middleware answering **429 + Retry-After**, and a per-user limiter for
+//! new *connections* on the accept loop.
 //!
 //! Layering (each usable on its own):
 //! - `TokenBucket` — the bare algorithm (Go `golang.org/x/time/rate`
@@ -14,6 +15,12 @@
 //! - `Limiter.middleware()` — a `router.Middleware`: allowed requests flow
 //!   to `next` untouched; denied ones get a 429 with `Retry-After` and IETF
 //!   draft `RateLimit-*` headers, and `next` is never called.
+//! - `ConnectionLimiter` (conn.zig) — a different question: how fast may a
+//!   **user** open new connections. Keyed by configured CIDR prefixes, not
+//!   by request headers, and plugged into `http.Server.Options.on_connect`
+//!   so a refusal costs one `close` and no response bytes. See its own
+//!   module doc for the identity model and for what an address-rotating
+//!   attacker does and does not get.
 //!
 //! ## Client-key trust policy (X-Forwarded-For / socket peer)
 //!
@@ -63,6 +70,21 @@ pub const meta = .{
 };
 
 const Allocator = std.mem.Allocator;
+
+// ── connection-establishment limiting (conn.zig) ────────────────────────────
+
+const conn = @import("conn.zig");
+
+/// Per-user limiter for **new connections**, for
+/// `http.Server.Options.on_connect`. See conn.zig's module doc.
+pub const ConnectionLimiter = conn.ConnectionLimiter;
+/// A configured user: a name plus the CIDR prefixes that identify it.
+pub const ConnUser = conn.User;
+/// Configuration for `ConnectionLimiter`.
+pub const ConnOptions = conn.Options;
+/// Owner's ruling: 4 new connections per second per user, burst 8.
+pub const default_conn_rate_per_s = conn.default_conn_rate_per_s;
+pub const default_conn_burst = conn.default_conn_burst;
 
 // ── clock injection ─────────────────────────────────────────────────────────
 
@@ -477,6 +499,16 @@ pub fn clientKey(req: *const http.Server.Request, peer_buf: *[peer_key_len_max]u
 // ── tests: the pure algorithm (no clock, no HTTP) ───────────────────────────
 
 const testing = std.testing;
+
+test {
+    // Pull conn.zig's tests into this module's test binary. Zig only
+    // collects tests from files it actually *analyses*, and a
+    // container-level `@import` whose decls no test references is never
+    // analysed: without this line `zig build test-ratelimit` reported
+    // "18/18 tests passed" while all 8 connection-limiter tests silently
+    // did not exist — a whole file's worth of green that was never run.
+    _ = @import("conn.zig");
+}
 
 test "TokenBucket: burst allowed, then throttled with exact retry_after" {
     const cfg: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 3 };
