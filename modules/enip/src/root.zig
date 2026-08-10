@@ -598,6 +598,315 @@ test "round trip: an adapter refuses Reset unless it was allowed" {
     try testing.expect(allowed.reset_requested);
 }
 
+// ── discovery: the Program Name and Symbol objects ─────────────────────────
+//
+// `goldens.zig`'s `discovery_table` anchors the happy path against a real
+// stock `LogixDriver`'s own parsers. These cover what that one session does
+// not reach: a scalar, a binding the list must leave out, the continuation
+// across replies, and the refusals.
+
+/// One `Get_Instance_Attribute_List` request for attributes 1 (name), 2
+/// (symbol type) and 8 (array dimensions), resuming at `start_instance`.
+/// Everything referenced is copied into `out` by `Request.encode`.
+fn symbolListRequest(start_instance: u32, out: []u8) []const u8 {
+    var path_buf: [16]u8 = undefined;
+    const path = epath.logicalPath(
+        @intFromEnum(cip.ClassCode.symbol),
+        start_instance,
+        null,
+        &path_buf,
+    ) catch unreachable;
+    const attrs = [_]u16{ 1, 2, 8 };
+    var data_buf: [2 + attrs.len * 2]u8 = undefined;
+    std.mem.writeInt(u16, data_buf[0..2], attrs.len, .little);
+    for (attrs, 0..) |a, i| std.mem.writeInt(u16, data_buf[2 + i * 2 ..][0..2], a, .little);
+    return (cip.Request{
+        .service = cip.LogixService.get_instance_attribute_list,
+        .path = path,
+        .data = &data_buf,
+    }).encode(out) catch unreachable;
+}
+
+const SymbolRecord = struct {
+    id: u32,
+    name: []const u8,
+    symbol_type: u16,
+    dims: [3]u32,
+};
+
+/// Decodes the reply body `symbolListRequest` asks for. Deliberately written
+/// against that exact attribute list rather than generically, so a record
+/// laid out in some other order fails to parse instead of being tolerated.
+fn parseSymbolRecords(data: []const u8, out: []SymbolRecord) !usize {
+    var off: usize = 0;
+    var n: usize = 0;
+    while (off < data.len) : (n += 1) {
+        if (n == out.len) return error.TooManyRecords;
+        if (off + 6 > data.len) return error.Truncated;
+        const id = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+        const len = std.mem.readInt(u16, data[off..][0..2], .little);
+        off += 2;
+        if (off + len + 2 + 12 > data.len) return error.Truncated;
+        const name = data[off..][0..len];
+        off += len;
+        const st = std.mem.readInt(u16, data[off..][0..2], .little);
+        off += 2;
+        var dims: [3]u32 = undefined;
+        for (&dims) |*d| {
+            d.* = std.mem.readInt(u32, data[off..][0..4], .little);
+            off += 4;
+        }
+        out[n] = .{ .id = id, .name = name, .symbol_type = st, .dims = dims };
+    }
+    return n;
+}
+
+test "the tag list calls a one-element binding a scalar and an array by its element count" {
+    var speed: [4]u8 = @splat(0);
+    var counts: [24]u8 = @splat(0);
+    const tags = [_]TagBinding{
+        .{ .name = "Speed", .type = .dint, .bytes = &speed },
+        .{ .name = "Counts", .type = .dint, .bytes = &counts },
+    };
+    var target = Adapter.init(.{}, &tags);
+
+    var req_buf: [64]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    const reply = try cip.Reply.decode(
+        try target.messageRouter(symbolListRequest(0, &req_buf), &out),
+    );
+    try testing.expectEqual(cip.GeneralStatus.success, reply.general_status);
+
+    var recs: [4]SymbolRecord = undefined;
+    try testing.expectEqual(@as(usize, 2), try parseSymbolRecords(reply.data, &recs));
+
+    // The scalar: dimension bits clear, and dimensions all zero. A device
+    // that advertised DINT[1] here would make a client hand back `[1500]`
+    // where the program expects `1500`.
+    try testing.expectEqualStrings("Speed", recs[0].name);
+    try testing.expectEqual(@as(u32, 1), recs[0].id);
+    try testing.expectEqual(@as(u16, 0x00C4), recs[0].symbol_type);
+    try testing.expectEqual([3]u32{ 0, 0, 0 }, recs[0].dims);
+
+    // The array: one dimension (bit 13), six elements — not six bytes, and
+    // not the 24 octets the binding actually holds.
+    try testing.expectEqualStrings("Counts", recs[1].name);
+    try testing.expectEqual(@as(u32, 2), recs[1].id);
+    try testing.expectEqual(@as(u16, 0x20C4), recs[1].symbol_type);
+    try testing.expectEqual([3]u32{ 6, 0, 0 }, recs[1].dims);
+}
+
+test "a binding whose element width is unknown is left out of the tag list but stays readable" {
+    var scalar: [4]u8 = @splat(0);
+    var opaque_bytes: [8]u8 = @splat(0);
+    std.mem.writeInt(i32, scalar[0..4], 5, .little);
+    const tags = [_]TagBinding{
+        // A structure needs a Template Object (class 0x6C) to be described,
+        // and this adapter has none — so it must not appear in a tag list
+        // that would promise one.
+        .{ .name = "Recipe", .type = .structure, .bytes = &opaque_bytes },
+        .{ .name = "Speed", .type = .dint, .bytes = &scalar },
+    };
+    var target = Adapter.init(.{}, &tags);
+    try testing.expect(!tags[0].isEnumerable());
+    try testing.expect(tags[1].isEnumerable());
+
+    var req_buf: [64]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    const reply = try cip.Reply.decode(
+        try target.messageRouter(symbolListRequest(0, &req_buf), &out),
+    );
+    try testing.expectEqual(cip.GeneralStatus.success, reply.general_status);
+    var recs: [4]SymbolRecord = undefined;
+    const n = try parseSymbolRecords(reply.data, &recs);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("Speed", recs[0].name);
+    // Its id is its position in the binding table, so the omitted neighbour
+    // did not renumber it.
+    try testing.expectEqual(@as(u32, 2), recs[0].id);
+
+    // Invisible to discovery is not absent from the device: it still reads by
+    // name, which is the whole claim `isEnumerable`'s doc comment makes.
+    var read_buf: [64]u8 = undefined;
+    const read = try client.encodeReadTag("Recipe", 1, &read_buf);
+    const rr = try cip.Reply.decode(try target.messageRouter(read, &out));
+    try testing.expectEqual(cip.GeneralStatus.success, rr.general_status);
+}
+
+test "the tag list resumes where the previous reply stopped instead of dropping the rest" {
+    var storage: [6][4]u8 = @splat(@splat(0));
+    var tags: [6]TagBinding = undefined;
+    const names = [_][]const u8{ "TagA", "TagB", "TagC", "TagD", "TagE", "TagF" };
+    for (&tags, names, &storage) |*t, name, *bytes| {
+        t.* = .{ .name = name, .type = .dint, .bytes = bytes };
+    }
+    // Small enough that the six records cannot be answered in one reply.
+    var target = Adapter.init(.{ .max_reply = 80 }, &tags);
+
+    var req_buf: [64]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    var seen: [6][]const u8 = undefined;
+    var total: usize = 0;
+    var next: u32 = 0;
+    var rounds: usize = 0;
+    var saw_partial = false;
+    while (rounds < 10) : (rounds += 1) {
+        const reply = try cip.Reply.decode(
+            try target.messageRouter(symbolListRequest(next, &req_buf), &out),
+        );
+        var recs: [6]SymbolRecord = undefined;
+        const n = try parseSymbolRecords(reply.data, &recs);
+        // Progress is mandatory: a reply that says "more" while returning
+        // nothing is the shape that spins a client forever.
+        try testing.expect(n > 0);
+        for (recs[0..n]) |r| {
+            // The names are copied out because `reply.data` points into `out`,
+            // which the next round overwrites.
+            seen[total] = names[r.id - 1];
+            try testing.expectEqualStrings(seen[total], r.name);
+            total += 1;
+            next = r.id + 1;
+        }
+        if (reply.general_status == .success) break;
+        try testing.expectEqual(cip.GeneralStatus.partial_transfer, reply.general_status);
+        saw_partial = true;
+    }
+    // The point of the test: it took more than one reply, and nothing was
+    // lost between them.
+    try testing.expect(saw_partial);
+    try testing.expectEqual(@as(usize, 6), total);
+    for (names, seen) |want, got| try testing.expectEqualStrings(want, got);
+}
+
+test "an attribute the Symbol Object does not implement is refused, and refused whole" {
+    var speed: [4]u8 = @splat(0);
+    const tags = [_]TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &speed }};
+    var target = Adapter.init(.{}, &tags);
+
+    var path_buf: [16]u8 = undefined;
+    const path = try epath.logicalPath(@intFromEnum(cip.ClassCode.symbol), 0, null, &path_buf);
+    // Attribute 1 is supported, 4 is not. The supported one being first is
+    // the point: the refusal must not arrive after a partial record.
+    const attrs = [_]u16{ 1, 4 };
+    var data_buf: [2 + attrs.len * 2]u8 = undefined;
+    std.mem.writeInt(u16, data_buf[0..2], attrs.len, .little);
+    for (attrs, 0..) |a, i| std.mem.writeInt(u16, data_buf[2 + i * 2 ..][0..2], a, .little);
+    var req_buf: [64]u8 = undefined;
+    const req = try (cip.Request{
+        .service = cip.LogixService.get_instance_attribute_list,
+        .path = path,
+        .data = &data_buf,
+    }).encode(&req_buf);
+
+    var out: [1024]u8 = undefined;
+    const reply = try cip.Reply.decode(try target.messageRouter(req, &out));
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, reply.general_status);
+    try testing.expectEqual(@as(usize, 0), reply.data.len);
+}
+
+test "the Symbol Object's service code means nothing on another class" {
+    var speed: [4]u8 = @splat(0);
+    const tags = [_]TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &speed }};
+    var target = Adapter.init(.{}, &tags);
+
+    var path_buf: [16]u8 = undefined;
+    // Same service code, Identity class instead of the Symbol Object.
+    const path = try epath.logicalPath(@intFromEnum(cip.ClassCode.identity), 0, null, &path_buf);
+    var req_buf: [64]u8 = undefined;
+    const req = try (cip.Request{
+        .service = cip.LogixService.get_instance_attribute_list,
+        .path = path,
+        .data = &[_]u8{ 1, 0, 1, 0 },
+    }).encode(&req_buf);
+
+    var out: [1024]u8 = undefined;
+    const reply = try cip.Reply.decode(try target.messageRouter(req, &out));
+    try testing.expectEqual(cip.GeneralStatus.service_not_supported, reply.general_status);
+}
+
+test "the Program Name object answers instance 1 only, and can be withheld entirely" {
+    var speed: [4]u8 = @splat(0);
+    const tags = [_]TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &speed }};
+    var out: [1024]u8 = undefined;
+    var req_buf: [64]u8 = undefined;
+    const class = @intFromEnum(cip.ClassCode.program_name);
+
+    var target = Adapter.init(.{ .program_name = "MainProgram" }, &tags);
+    const ok = try cip.Reply.decode(try target.messageRouter(
+        try cip.getAttributesAll(class, 1, &req_buf),
+        &out,
+    ));
+    try testing.expectEqual(cip.GeneralStatus.success, ok.general_status);
+    // A `STRING`: 16-bit length, then the octets, no terminator and no pad.
+    try testing.expectEqual(@as(usize, 2 + 11), ok.data.len);
+    try testing.expectEqual(@as(u16, 11), std.mem.readInt(u16, ok.data[0..2], .little));
+    try testing.expectEqualStrings("MainProgram", ok.data[2..]);
+
+    // No second instance exists.
+    const other = try cip.Reply.decode(try target.messageRouter(
+        try cip.getAttributesAll(class, 2, &req_buf),
+        &out,
+    ));
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, other.general_status);
+
+    // Withheld: the class answers exactly as it did before it existed, which
+    // is what a device with no Program Name object genuinely says.
+    var without = Adapter.init(.{ .program_name = "" }, &tags);
+    const none = try cip.Reply.decode(try without.messageRouter(
+        try cip.getAttributesAll(class, 1, &req_buf),
+        &out,
+    ));
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, none.general_status);
+
+    // And serving it must not have been counted as an identity request.
+    try testing.expectEqual(@as(usize, 0), target.identity_requests);
+}
+
+test "a symbol instance id addresses the same tag as its name, and an unknown one is refused" {
+    var speed: [4]u8 = @splat(0);
+    var counts: [24]u8 = @splat(0);
+    std.mem.writeInt(i32, counts[4..8], 77, .little);
+    const tags = [_]TagBinding{
+        .{ .name = "Speed", .type = .dint, .bytes = &speed },
+        .{ .name = "Counts", .type = .dint, .bytes = &counts },
+    };
+    var target = Adapter.init(.{}, &tags);
+    var out: [1024]u8 = undefined;
+
+    // `20 6B 24 02 28 01` — the Symbol Object, instance 2, member 1: the same
+    // element `Counts[1]` names.
+    var path_buf: [16]u8 = undefined;
+    var pb = epath.Builder.init(&path_buf);
+    try pb.class(@intFromEnum(cip.ClassCode.symbol));
+    try pb.instance(2);
+    try pb.member(1);
+    var req_buf: [64]u8 = undefined;
+    const req = try (cip.Request{
+        .service = cip.LogixService.read_tag,
+        .path = pb.bytes(),
+        .data = &[_]u8{ 1, 0 },
+    }).encode(&req_buf);
+    const reply = try cip.Reply.decode(try target.messageRouter(req, &out));
+    try testing.expectEqual(cip.GeneralStatus.success, reply.general_status);
+    const td = try types.TagData.decode(reply.data);
+    try testing.expectEqual(DataType.dint, td.type);
+    try testing.expectEqual(@as(i64, 77), (try td.at(0)).asInt().?);
+
+    // An id past the end of the binding table names nothing.
+    var missing_path: [16]u8 = undefined;
+    var mb = epath.Builder.init(&missing_path);
+    try mb.class(@intFromEnum(cip.ClassCode.symbol));
+    try mb.instance(99);
+    const missing = try (cip.Request{
+        .service = cip.LogixService.read_tag,
+        .path = mb.bytes(),
+        .data = &[_]u8{ 1, 0 },
+    }).encode(&req_buf);
+    const refused = try cip.Reply.decode(try target.messageRouter(missing, &out));
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, refused.general_status);
+}
+
 test "round trip: a message before RegisterSession is refused at the encapsulation layer" {
     var scada: [8]u8 = @splat(0);
     var dint: [8]u8 = @splat(0);

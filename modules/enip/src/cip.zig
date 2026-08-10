@@ -134,6 +134,10 @@ pub const ClassCode = enum(u16) {
     s_gas_calibration = 0x34,
     trip_point = 0x35,
     file_object = 0x37,
+    /// The Logix **Program Name** object. Not in Vol 1 Table A-1 — it is
+    /// vendor-specific, documented only in Rockwell KB 23341, and every Logix
+    /// tool asks instance 1 for it to learn the running program's name.
+    program_name = 0x64,
     /// The Logix "symbol object" a tag read names when it is not symbolic.
     symbol = 0x6B,
     /// The Logix template object describing a UDT's layout.

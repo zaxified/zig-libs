@@ -191,6 +191,25 @@ layout never depends on Zig's bitfield-packing rules.
   `Multiple_Service_Packet` inside itself) is **depth-capped**, because
   unbounded nesting is a stack-exhaustion primitive a hostile peer controls.
 
+  It also answers enough for a browsing tool to **discover** its tags rather
+  than be told them: the Program Name object (`0x64`, one `STRING`) and the
+  Symbol Object's `Get_Instance_Attribute_List` (`0x6B` / `0x55`), which
+  enumerates the bound tags with their names, CIP type codes, array dimensions
+  and instance ids, continuing across replies through `partial_transfer` when
+  the list does not fit one message. Those instance ids are also accepted as
+  tag addresses (`20 6B 24 <id>` in place of a symbolic path), because a
+  client switches to that form unprompted once the reported major revision is
+  high enough — a device that hands ids out and then refuses them browses and
+  cannot be read.
+
+  The boundary is deliberate and narrow: **no Template Object (`0x6C`)**, so
+  struct-typed bindings are left out of the uploaded list rather than
+  advertised as something whose layout cannot then be described; no
+  program-scoped tags; no other Symbol Object attribute or service. A
+  one-element binding is advertised as a scalar, because `TagBinding` does not
+  distinguish `DINT` from `DINT[1]`, and multi-dimensional arrays are
+  advertised flat. It is a discoverable simulator, not a ControlLogix model.
+
 Concurrency: `.single_owner` — one `Client`/`Adapter` owns one connection's
 buffers, session handle and sequence counters; nothing is shared or global, and
 any threading is the caller's.
@@ -348,6 +367,38 @@ is present.
    for anything but non-zero and distinctness — passes the whole rest of the
    suite and fails exactly this new test (`exit 1, 1/156 fail`), which is the
    class of bug this table exists to catch. Reverted by paired inverse edit.
+
+7. **Discovery: 46 byte-exact goldens of a *stock* `LogixDriver` browsing our
+   adapter** (`goldens.zig`'s `discovery_table` and
+   `discovery_instance_table`). Item 6 anchors our replies to a client that
+   was already told which tags exist; this anchors the step a real Logix tool
+   has to take first — finding out. A stock `pycomm3.LogixDriver("host:port")`
+   — no subclass, no overridden `_initialize_driver`, no tag table supplied by
+   us — was pointed through the same recording proxy at the same
+   `Adapter.init(cfg, &tags)` configuration, and it opened a session, read the
+   Program Name object, uploaded the tag list, and read and wrote tags it had
+   learned of only from that upload. pycomm3 derived `SCADA INT[100]`,
+   `TestTag DINT[10]` and `RealTag REAL[5]` at instance ids 1-3 from the wire
+   alone. Two sessions were captured, differing only in the major revision the
+   adapter reports, because that number changes what the client asks for:
+   at `revision_major = 1` the upload requests attributes 1/2/3/5/6/8 and tags
+   are addressed symbolically; at `revision_major = 21` pycomm3 adds attribute
+   10 (external access) and switches to **symbol instance addressing**, so
+   every read and write carries `20 6B 24 <id>` and no name at all. Both are
+   replayed through a fresh `Adapter.handle` and required to match
+   byte-for-byte. Mutation-tested three ways, each reverted by paired inverse
+   edit: the `base_tag_bit` constant `1 << 26` → `1 << 25` (a value nothing
+   else in the repo pins) fails both replay tests (`exit 1, 2/159 fail`); the
+   `symbol_type` dimension shift `<< 13` → `<< 12` likewise (`exit 1, 2/159
+   fail`); and answering the tag list `success` where it should say
+   `partial_transfer` — a silent truncation that hides every tag past the
+   first reply — fails the continuation test (`exit 1, 1/166 fail`).
+
+   Before this was implemented, that session got no further than its fifth
+   request: `get_plc_name` answered `0x05 Path destination unknown` and
+   pycomm3 raised `ResponseError: failed to get the plc name` out of `open()`.
+   Every frame in these tables from that request onwards is traffic that could
+   not previously have been recorded at all.
 
 One divergence worth recording: **the cpppo target refuses a `Read Tag
 Fragmented` that is not wrapped in an `Unconnected_Send`**, answering an
@@ -523,14 +574,20 @@ not:
 - **DeviceNet and ControlNet ports.** Only the EtherNet/IP adaptation is built.
   Port segments can *name* another port so a route through a gateway can be
   expressed, but nothing here speaks those link layers.
-- **The Logix symbol and template objects (`0x6B` / `0x6C`).** Uploading a
-  controller's tag list and decoding UDT definitions — which is how a real
-  driver learns what tags exist and how a structure is laid out — is not
-  implemented. `Get Instance Attribute List` (0x55) is named and nothing more.
-  Consequently a structure read returns its handle and raw member octets rather
-  than named members.
-- **Object-model coverage beyond what is built.** Only the Identity object
-  (class 1) is served by the `Adapter`. The Message Router, Assembly,
+- **The Logix template object (`0x6C`), and therefore UDT definitions.**
+  Decoding a structure's member layout — how a real driver learns what is
+  inside a UDT — is not implemented, so a structure read still returns its
+  handle and raw member octets rather than named members. The Symbol Object
+  (`0x6B`) is no longer on this list: `Get_Instance_Attribute_List` (0x55) is
+  implemented on the target side and a tag list uploads (see the `adapter`
+  component note and verification item 7), but only for bindings of a
+  fixed-width elementary type. A
+  struct-typed binding is deliberately **left out of the uploaded list**,
+  because advertising it would promise the Template Object this list item is
+  about.
+- **Object-model coverage beyond what is built.** The `Adapter` serves the
+  Identity object (class 1), the Program Name object (`0x64`) and the Symbol
+  Object (`0x6B`), and no other class. The Message Router, Assembly,
   Connection, TCP/IP Interface (`0xF5`), Ethernet Link (`0xF6`), Port (`0xF4`)
   and Connection Configuration objects are named in `ClassCode` and not
   implemented on the target side; a *client* can of course address any of them

@@ -41,25 +41,32 @@ segment.
 Both were found by running it, and both are recorded here rather than in a
 commit message because the next person to touch this file will hit them.
 
-1. **`LogixDriver.open()` cannot complete against this adapter.** Its
-   `_initialize_driver` calls `get_plc_name()` (CIP class 0x64, the Program
-   Name object) and `get_tag_list()` (class 0x6B Symbol Object enumerated with
-   service 0x55 `Get_Instance_Attribute_List`). `modules/enip`'s adapter
-   implements neither, so both come back `0x05 Path destination unknown` and
-   pycomm3 raises. The driver below therefore overrides `_initialize_driver`
-   to keep the part the adapter *does* answer — `get_plc_info()`, a real
-   Get_Attributes_All on the Identity object, decoded by pycomm3 — and to
-   supply the tag table instead of uploading it.
+1. **This driver supplies its own tag table instead of uploading one.**
+   `LogixDriver._initialize_driver` calls `get_plc_name()` (CIP class 0x64,
+   the Program Name object) and `get_tag_list()` (class 0x6B Symbol Object
+   enumerated with service 0x55 `Get_Instance_Attribute_List`).
 
-   That is a deliberate line, and it is worth being precise about which side
-   of it the oracle lives on. What is supplied is *configuration*: tag names
-   and their CIP type codes, i.e. exactly what a tag upload would have
-   returned. What is NOT supplied, and what makes this an anchor, is every
-   byte on the wire: pycomm3 encodes the symbolic EPATH, frames the CIP
-   request, and decodes the reply's type code and payload with no knowledge of
-   how this repository produced them. A wrong type code, a wrong endianness, a
-   wrong element count or a wrong array offset all land on a wrong number
-   here.
+   This override was originally forced: `modules/enip`'s adapter implemented
+   neither, both came back `0x05 Path destination unknown`, and `open()`
+   raised before a single tag was read. **That is no longer true** — the
+   adapter serves both, and a stock `LogixDriver` opens and browses it; see
+   `discovery_table` in `modules/enip/src/goldens.zig`, which is a capture of
+   exactly that.
+
+   The override is kept anyway, and deliberately. Removing it would put a tag
+   upload on the wire ahead of every operation below, which would re-cut the
+   frozen session in `modules/fleetsim/src/master_goldens.zig` — a corpus
+   whose value is that it has not moved. If it is ever dropped, that corpus
+   has to be **re-captured**, not edited to match.
+
+   It is worth being precise about which side of the line the oracle lives on,
+   because that has not changed. What is supplied is *configuration*: tag
+   names and their CIP type codes, i.e. exactly what a tag upload would have
+   returned. What is NOT supplied is every byte on the wire: pycomm3 encodes
+   the symbolic EPATH, frames the CIP request, and decodes the reply's type
+   code and payload with no knowledge of how this repository produced them. A
+   wrong type code, a wrong endianness, a wrong element count or a wrong array
+   offset all land on a wrong number here.
 
 2. **A single-tag `write()` emits a duplicated PDU.** `RequestPacket.
    _setup_message` appends to `self._msg` and never resets it, while
@@ -297,13 +304,15 @@ def main():
     tap.start()
 
     class Driver(LogixDriver):
-        """`LogixDriver` minus the two services this adapter does not serve.
+        """`LogixDriver` with the tag table supplied rather than uploaded.
 
-        See the module docstring, point 1: `get_plc_name` (class 0x64) and
-        `get_tag_list` (class 0x6B / service 0x55) are not implemented by
-        `modules/enip`, so a stock `open()` raises before any tag is read.
-        `get_plc_info` IS kept — it is a real Get_Attributes_All on the
-        Identity object, decoded by pycomm3.
+        See the module docstring, point 1. `get_plc_name` (class 0x64) and
+        `get_tag_list` (class 0x6B / service 0x55) ARE served by
+        `modules/enip` now, so this override is no longer required to open a
+        session — it is kept so the frozen corpus in
+        `modules/fleetsim/src/master_goldens.zig` stays the session it
+        recorded. `get_plc_info` is called here as before: a real
+        Get_Attributes_All on the Identity object, decoded by pycomm3.
         """
 
         def _initialize_driver(self, init_tags, init_program_tags, tag_namespace_filter=""):

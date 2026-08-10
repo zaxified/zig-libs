@@ -83,7 +83,13 @@ fleet-simulation target.
   `Forward_Open` / `Forward_Close`.
 - **`adapter`** — the target side as a pure function from one message to one
   message, backed by caller-owned tag storage. Stand one up per simulated
-  device for fleet simulation.
+  device for fleet simulation. It is **browsable**: a stock Logix driver can
+  open a session and upload the tag list off it — the Program Name object
+  (`0x64`) and the Symbol Object's `Get_Instance_Attribute_List` (`0x6B` /
+  `0x55`) are served, so tags are discovered rather than configured in. The
+  boundary is deliberate: no Template Object (`0x6C`), so struct-typed
+  bindings stay out of the uploaded list (they remain readable by name), and
+  there are no program-scoped tags. See SPEC.md.
 - Hostile input never panics anywhere: an encapsulation length disagreeing
   with the payload, a CPF item count that overruns, an item length pointing
   past the buffer, an EPATH segment running past the path, a symbolic segment

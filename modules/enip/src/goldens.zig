@@ -1144,3 +1144,239 @@ test "a captured client session replays byte-exact through our own Adapter" {
     // captured reply.
     try testing.expectEqual(@as(i16, 77), std.mem.readInt(i16, scada[2..4], .little));
 }
+
+// ── discovery: a STOCK pycomm3 LogixDriver browsing our adapter ───────────
+//
+// `adapter_table` above proves our replies to a client that already knows
+// which tags exist. It cannot prove the thing a real Logix tool has to do
+// first: find out. The capture below is the whole of that — a **stock**
+// `LogixDriver("host:port")`, no subclass, no overridden `_initialize_driver`
+// and no tag table supplied by us, opening a session and uploading the tag
+// list off the device before reading anything.
+//
+// Before the Program Name object (class 0x64) and the Symbol Object's
+// `Get_Instance_Attribute_List` (class 0x6B, service 0x55) existed, this
+// session got no further than the fifth request: `get_plc_name` answered
+// `0x05 Path destination unknown`, and pycomm3 raised
+// `ResponseError: failed to get the plc name` out of `open()`. Every frame
+// from "get_plc_name request" onwards is therefore traffic that could not
+// have been recorded at all, which is what makes the table a regression test
+// rather than a restatement.
+//
+// What is anchored here is the *decoding*: pycomm3 parsed these replies with
+// its own parsers and derived, with no input from us, that the device serves
+// `SCADA INT[100]`, `TestTag DINT[10]` and `RealTag REAL[5]` at instance ids
+// 1, 2 and 3 — names, CIP type codes, array dimensions and instance ids all
+// read off the wire. A wrong length prefix on a symbol name, a wrong
+// `symbol_type` word, a wrong dimension or a record laid out in an order the
+// request did not ask for lands on a different tag table or on an exception,
+// not on a reply only our own decoder would accept.
+//
+// Captured exactly as `adapter_table` was — same recording proxy, same
+// `Adapter` configuration `root.zig`'s "live: a real EtherNet/IP client
+// against our adapter" test builds (`Adapter.init(cfg, &tags)` over the same
+// SCADA/INT, TestTag/DINT, RealTag/REAL bindings):
+//
+//   scripts/capped zig build test-enip \
+//     -Dtest-filter="live: a real EtherNet/IP client against our adapter"
+//   ENIP_TEST_LISTEN=127.0.0.1:18951 (adapter behind a recording proxy)
+//   pycomm3 1.2.16: LogixDriver(proxy).open(); read SCADA{4}; read
+//   TestTag[1]; write TestTag[1]=4242 and TestTag[2]=7; read TestTag{4}.
+//
+// Two sessions, differing **only** in the major revision the adapter reports,
+// because that one number changes what the client asks for:
+//
+// * `discovery_table` — `revision_major = 1`, this module's `Config` default.
+//   The tag list is requested with attributes 1, 2, 3, 5, 6 and 8, and tags
+//   are addressed symbolically (`91 05 "SCADA"`).
+// * `discovery_instance_table` — `revision_major = 21`. pycomm3 adds
+//   attribute 10 (external access, added in Logix v18) to the upload, and
+//   switches to **symbol instance addressing**: every read and write in that
+//   session carries `20 6B 24 <instance id>` and no symbol name at all. That
+//   session is the reason `findTag` accepts instance ids — captured against a
+//   build that did not, every one of its reads came back `0x05`.
+//
+// No anonymisation was needed or applied: every identity field in these
+// frames is this module's own `Config` default.
+
+/// A discovery frame. Same direction naming as `AdapterGolden`; no `source`
+/// field because every frame here came from the one stock `LogixDriver`.
+pub const DiscoveryGolden = struct {
+    name: []const u8,
+    dir: AdapterDirection,
+    hex: []const u8,
+};
+
+/// The tag-list reply is longer than any frame in the tables above, which is
+/// what `max_frame_len` was sized for.
+pub const max_discovery_frame_len: usize = 256;
+
+/// `revision_major = 1`: symbolic addressing, no external-access attribute.
+pub const discovery_table = [_]DiscoveryGolden{
+    .{ .name = "register session request", .dir = .to_adapter, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "register session reply", .dir = .from_adapter, .hex = "650004000100a5a5000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "list identity request", .dir = .to_adapter, .hex = "630000000100a5a5000000005f7079636f6d6d5f00000000" },
+    .{ .name = "list identity reply", .dir = .from_adapter, .hex = "630038000100a5a5000000005f7079636f6d6d5f0000000001000c00320001000002af1200000000000000000000000034120e00010001003000eeffc000107a69672d656e6970206164617074657203" },
+    .{ .name = "get_plc_info: unconnected Get_Attributes_All on the Identity object request", .dir = .to_adapter, .hex = "6f0024000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20014005202200624010a05060001022001240101000100" },
+    .{ .name = "get_plc_info: unconnected Get_Attributes_All on the Identity object reply", .dir = .from_adapter, .hex = "6f0033000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20023008100000034120e00010001003000eeffc000107a69672d656e69702061646170746572" },
+    .{ .name = "large forward open request", .dir = .to_adapter, .hex = "6f0044000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20034005b02200624010a05000000004095e6692704091059753a920700000001402000a00f004201402000a00f0042a303010020022401" },
+    .{ .name = "large forward open reply", .dir = .from_adapter, .hex = "6f002e000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2001e00db00000001000001020000012704091059753a9201402000014020000000" },
+    .{ .name = "get_plc_name: Get_Attributes_All on the Program Name object (class 0x64) request", .dir = .to_adapter, .hex = "70001c000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b10008000100010220642401" },
+    .{ .name = "get_plc_name: Get_Attributes_All on the Program Name object (class 0x64) reply", .dir = .from_adapter, .hex = "700024000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b100100001008100000008007a69672d656e6970" },
+    .{ .name = "get_tag_list: Get_Instance_Attribute_List on the Symbol Object (class 0x6B) request", .dir = .to_adapter, .hex = "70002a000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b100160002005502206b24000600010002000300050006000800" },
+    .{ .name = "get_tag_list: Get_Instance_Attribute_List on the Symbol Object (class 0x6B) reply", .dir = .from_adapter, .hex = "70008d000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b10079000200d50000000100000005005343414441c32000000000000000000000000464000000000000000000000002000000070054657374546167c4200000000000000000000000040a00000000000000000000000300000007005265616c546167ca20000000000000000000000004050000000000000000000000" },
+    .{ .name = "read SCADA elements 0-3 request", .dir = .to_adapter, .hex = "700022000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b1000e0003004c0491055343414441000400" },
+    .{ .name = "read SCADA elements 0-3 reply", .dir = .from_adapter, .hex = "700024000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b10010000300cc000000c3000100000000000000" },
+    .{ .name = "read TestTag element 1 request", .dir = .to_adapter, .hex = "700026000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b100120004004c069107546573745461670028010100" },
+    .{ .name = "read TestTag element 1 reply", .dir = .from_adapter, .hex = "700020000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b1000c000400cc000000c40000000000" },
+    .{ .name = "multiple service packet: write TestTag[1]=4242 and TestTag[2]=7 request", .dir = .to_adapter, .hex = "70004e000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b1003a0007000a0220022401020006001c004d06910754657374546167002801c4000100921000004d06910754657374546167002802c400010007000000" },
+    .{ .name = "multiple service packet: write TestTag[1]=4242 and TestTag[2]=7 reply", .dir = .from_adapter, .hex = "700028000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b100140007008a000000020006000a00cd000000cd000000" },
+    .{ .name = "read TestTag elements 0-3 request", .dir = .to_adapter, .hex = "700024000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b100100008004c05910754657374546167000400" },
+    .{ .name = "read TestTag elements 0-3 reply", .dir = .from_adapter, .hex = "70002c000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b10018000800cc000000c4000b000000921000000700000000000000" },
+    .{ .name = "forward close request", .dir = .to_adapter, .hex = "6f0028000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20018004e02200624010a052704091059753a920300010020022401" },
+    .{ .name = "forward close reply", .dir = .from_adapter, .hex = "6f001e000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000e00ce0000002704091059753a920000" },
+    .{ .name = "unregister session request", .dir = .to_adapter, .hex = "660000000100a5a5000000005f7079636f6d6d5f00000000" },
+};
+
+/// `revision_major = 21`: the upload also asks for attribute 10, and every
+/// tag access is by symbol instance id.
+pub const discovery_instance_table = [_]DiscoveryGolden{
+    .{ .name = "register session request", .dir = .to_adapter, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "register session reply", .dir = .from_adapter, .hex = "650004000100a5a5000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "list identity request", .dir = .to_adapter, .hex = "630000000100a5a5000000005f7079636f6d6d5f00000000" },
+    .{ .name = "list identity reply", .dir = .from_adapter, .hex = "630038000100a5a5000000005f7079636f6d6d5f0000000001000c00320001000002af1200000000000000000000000034120e00010015003000eeffc000107a69672d656e6970206164617074657203" },
+    .{ .name = "get_plc_info: unconnected Get_Attributes_All on the Identity object request", .dir = .to_adapter, .hex = "6f0024000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20014005202200624010a05060001022001240101000100" },
+    .{ .name = "get_plc_info: unconnected Get_Attributes_All on the Identity object reply", .dir = .from_adapter, .hex = "6f0033000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20023008100000034120e00010015003000eeffc000107a69672d656e69702061646170746572" },
+    .{ .name = "large forward open request", .dir = .to_adapter, .hex = "6f0044000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20034005b02200624010a05000000005e53fbcf27040910a514fca70700000001402000a00f004201402000a00f0042a303010020022401" },
+    .{ .name = "large forward open reply", .dir = .from_adapter, .hex = "6f002e000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2001e00db000000010000010200000127040910a514fca701402000014020000000" },
+    .{ .name = "get_plc_name: Get_Attributes_All on the Program Name object (class 0x64) request", .dir = .to_adapter, .hex = "70001c000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b10008000100010220642401" },
+    .{ .name = "get_plc_name: Get_Attributes_All on the Program Name object (class 0x64) reply", .dir = .from_adapter, .hex = "700024000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b100100001008100000008007a69672d656e6970" },
+    .{ .name = "get_tag_list: Get_Instance_Attribute_List on the Symbol Object (class 0x6B) request", .dir = .to_adapter, .hex = "70002c000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b100180002005502206b240007000100020003000500060008000a00" },
+    .{ .name = "get_tag_list: Get_Instance_Attribute_List on the Symbol Object (class 0x6B) reply", .dir = .from_adapter, .hex = "700090000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b1007c000200d50000000100000005005343414441c3200000000000000000000000046400000000000000000000000002000000070054657374546167c4200000000000000000000000040a0000000000000000000000000300000007005265616c546167ca2000000000000000000000000405000000000000000000000000" },
+    .{ .name = "read SCADA elements 0-3 request", .dir = .to_adapter, .hex = "70001e000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b1000a0003004c02206b24010400" },
+    .{ .name = "read SCADA elements 0-3 reply", .dir = .from_adapter, .hex = "700024000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b10010000300cc000000c3000100000000000000" },
+    .{ .name = "read TestTag element 1 request", .dir = .to_adapter, .hex = "700020000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b1000c0004004c03206b240228010100" },
+    .{ .name = "read TestTag element 1 reply", .dir = .from_adapter, .hex = "700020000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b1000c000400cc000000c40000000000" },
+    .{ .name = "multiple service packet: write TestTag[1]=4242 and TestTag[2]=7 request", .dir = .to_adapter, .hex = "700042000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b1002e0007000a02200224010200060016004d03206b24022801c4000100921000004d03206b24022802c400010007000000" },
+    .{ .name = "multiple service packet: write TestTag[1]=4242 and TestTag[2]=7 reply", .dir = .from_adapter, .hex = "700028000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b100140007008a000000020006000a00cd000000cd000000" },
+    .{ .name = "read TestTag elements 0-3 request", .dir = .to_adapter, .hex = "70001e000100a5a5000000005f7079636f6d6d5f00000000000000000a000200a100040001000001b1000a0008004c02206b24020400" },
+    .{ .name = "read TestTag elements 0-3 reply", .dir = .from_adapter, .hex = "70002c000100a5a5000000005f7079636f6d6d5f000000000000000000000200a100040001000001b10018000800cc000000c4000b000000921000000700000000000000" },
+    .{ .name = "forward close request", .dir = .to_adapter, .hex = "6f0028000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20018004e02200624010a0527040910a514fca70300010020022401" },
+    .{ .name = "forward close reply", .dir = .from_adapter, .hex = "6f001e000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000e00ce00000027040910a514fca70000" },
+    .{ .name = "unregister session request", .dir = .to_adapter, .hex = "660000000100a5a5000000005f7079636f6d6d5f00000000" },
+};
+
+fn bytesOfDiscovery(g: DiscoveryGolden, buf: []u8) ![]u8 {
+    const n = g.hex.len / 2;
+    if (n > buf.len) return error.BufferTooSmall;
+    _ = try std.fmt.hexToBytes(buf[0..n], g.hex);
+    return buf[0..n];
+}
+
+/// Replays one captured session through `target` in capture order, requiring
+/// every reply to match byte-for-byte. Returns how many replies were compared
+/// so a caller can refuse a table that silently stopped matching early.
+fn replayDiscovery(target: *adapter_mod.Adapter, session: []const DiscoveryGolden) !usize {
+    var req_buf: [max_discovery_frame_len]u8 = undefined;
+    var rep_buf: [max_discovery_frame_len]u8 = undefined;
+    // The same width `root.zig`'s live-listen test answers into, so the reply
+    // ceiling in play here is the one that was in play at capture time.
+    var out: [8192]u8 = undefined;
+    var checked: usize = 0;
+    var i: usize = 0;
+    while (i < session.len) : (i += 1) {
+        const req_g = session[i];
+        if (req_g.dir != .to_adapter) continue;
+        const req = try bytesOfDiscovery(req_g, &req_buf);
+        const got = target.handle(req, &out) catch |e| {
+            std.debug.print("discovery golden '{s}' failed to handle: {t}\n", .{ req_g.name, e });
+            return e;
+        };
+        // UnRegisterSession closes the session and answers nothing.
+        if (i + 1 >= session.len or session[i + 1].dir != .from_adapter) {
+            try testing.expect(got == null);
+            continue;
+        }
+        const rep_g = session[i + 1];
+        const want = try bytesOfDiscovery(rep_g, &rep_buf);
+        const g = got orelse {
+            std.debug.print("discovery golden '{s}' expected a reply, Adapter answered none\n", .{rep_g.name});
+            return error.TestUnexpectedResult;
+        };
+        testing.expectEqualSlices(u8, want, g) catch |e| {
+            std.debug.print("discovery golden '{s}': our Adapter's reply did not match the captured one\n", .{rep_g.name});
+            return e;
+        };
+        checked += 1;
+        i += 1;
+    }
+    return checked;
+}
+
+test "every discovery golden decodes at the encapsulation layer and re-encodes exactly" {
+    var buf: [max_discovery_frame_len]u8 = undefined;
+    var round: [max_discovery_frame_len]u8 = undefined;
+    for (discovery_table ++ discovery_instance_table) |g| {
+        const wire = try bytesOfDiscovery(g, &buf);
+        const msg = encap.decode(wire) catch |e| {
+            std.debug.print("discovery golden '{s}' failed to decode: {t}\n", .{ g.name, e });
+            return e;
+        };
+        const again = try encap.encode(msg, &round);
+        testing.expectEqualSlices(u8, wire, again) catch |e| {
+            std.debug.print("discovery golden '{s}' did not re-encode\n", .{g.name});
+            return e;
+        };
+    }
+}
+
+/// Seeded exactly as `root.zig`'s live-listen test seeds it, which is how it
+/// was seeded at capture time.
+fn discoveryTags(scada: []u8, dint: []u8, real: []u8) [3]adapter_mod.TagBinding {
+    std.mem.writeInt(i16, scada[0..2], 1, .little);
+    std.mem.writeInt(i32, dint[0..4], 11, .little);
+    return .{
+        .{ .name = "SCADA", .type = .int, .bytes = scada },
+        .{ .name = "TestTag", .type = .dint, .bytes = dint },
+        .{ .name = "RealTag", .type = .real, .bytes = real },
+    };
+}
+
+test "a stock LogixDriver's browse session replays byte-exact through our own Adapter" {
+    var scada: [200]u8 = @splat(0);
+    var dint: [40]u8 = @splat(0);
+    var real: [20]u8 = @splat(0);
+    const tags = discoveryTags(&scada, &dint, &real);
+    var target = adapter_mod.Adapter.init(.{}, &tags);
+
+    const checked = try replayDiscovery(&target, &discovery_table);
+    try testing.expectEqual(@as(usize, 11), checked);
+    // Three Read Tag services and one Multiple_Service_Packet carrying two
+    // Write Tags; the identity count covers ListIdentity and the unconnected
+    // Get_Attributes_All, and must NOT have been moved by the Program Name
+    // object sharing that service code.
+    try testing.expectEqual(@as(usize, 3), target.reads);
+    try testing.expectEqual(@as(usize, 2), target.writes);
+    try testing.expectEqual(@as(usize, 2), target.identity_requests);
+    // Both writes landed where the captured read-back said they did.
+    try testing.expectEqual(@as(i32, 4242), std.mem.readInt(i32, dint[4..8], .little));
+    try testing.expectEqual(@as(i32, 7), std.mem.readInt(i32, dint[8..12], .little));
+}
+
+test "a stock LogixDriver addressing tags by symbol instance id replays byte-exact" {
+    var scada: [200]u8 = @splat(0);
+    var dint: [40]u8 = @splat(0);
+    var real: [20]u8 = @splat(0);
+    const tags = discoveryTags(&scada, &dint, &real);
+    // The one field that differs from the session above, and the only reason
+    // the client behaves differently.
+    var target = adapter_mod.Adapter.init(.{ .revision_major = 21 }, &tags);
+
+    const checked = try replayDiscovery(&target, &discovery_instance_table);
+    try testing.expectEqual(@as(usize, 11), checked);
+    try testing.expectEqual(@as(usize, 3), target.reads);
+    try testing.expectEqual(@as(usize, 2), target.writes);
+    try testing.expectEqual(@as(usize, 2), target.identity_requests);
+    try testing.expectEqual(@as(i32, 4242), std.mem.readInt(i32, dint[4..8], .little));
+    try testing.expectEqual(@as(i32, 7), std.mem.readInt(i32, dint[8..12], .little));
+}
