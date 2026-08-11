@@ -949,3 +949,19 @@ test "servePublickey: an ed25519 key blob, its OWN valid signature, wrapped in a
     });
     try t.expectEqual(PublickeyOutcome.failure, outcome);
 }
+
+test "delivered DoS-limit defaults are pinned to their documented values" {
+    // audit `ssh` F3: these guard peer-supplied lengths (see call sites at
+    // :188,243,326,464,498,535,560,612,440) but nothing pinned the *values*
+    // — every one could be loosened 16x-256x with the suite staying green.
+    // Pin the literals directly, not in terms of themselves, so a future
+    // change to any of these is a deliberate, visible edit.
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 255), max_user_len);
+    try t.expectEqual(@as(usize, 64), max_service_len);
+    try t.expectEqual(@as(usize, 1024), max_password_len);
+    try t.expectEqual(@as(usize, 4 * 1024), max_key_blob_len);
+    try t.expectEqual(@as(usize, 4 * 1024), max_signature_len);
+    try t.expectEqual(@as(usize, 8 * 1024), max_banner_len);
+    try t.expectEqual(@as(u32, 20), (AuthConfig{}).max_attempts);
+}

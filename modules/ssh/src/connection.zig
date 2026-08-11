@@ -148,7 +148,12 @@ fn sendWindowAdjust(t: *transport.Transport, recipient: u32, add: u32) ChannelEr
 /// we advertised (the same hysteresis OpenSSH uses — one adjust per half
 /// window rather than one per packet).
 fn maybeAdjustWindow(t: *transport.Transport, ch: *ChannelState) ChannelError!void {
-    if (ch.local_window * 2 > ch.local_window_initial) return;
+    // audit `ssh` F4: `local_window * 2` overflows u32 (ReleaseSafe panic)
+    // once a caller configures a window above 0x7FFF_FFFF via
+    // `SessionOptions.window_size`/`ServeConfig.window_size`. The
+    // non-overflowing equivalent of "consumed at least half" avoids the
+    // multiply entirely.
+    if (ch.local_window >= ch.local_window_initial / 2) return;
     const add = ch.local_window_initial - ch.local_window;
     if (add == 0) return;
     try sendWindowAdjust(t, ch.remote_id, add);
@@ -829,13 +834,25 @@ fn sendChannelData(
             const mt: messages.MessageType = @enumFromInt(msgType(pkt));
             switch (mt) {
                 .SSH_MSG_CHANNEL_WINDOW_ADJUST => {
+                    // audit `ssh` F5: this used to discard `recipient_channel`
+                    // (`_ = try c.uint32()`) instead of checking it like
+                    // every other channel message site does — latent while
+                    // the module is single-channel, but a WINDOW_ADJUST for
+                    // some other channel would have been silently credited
+                    // to this one the moment a second channel exists.
                     var c = Cursor{ .b = pkt.payload[1..] };
-                    _ = try c.uint32();
+                    try expectChannel(ch, &c);
                     ch.remote_window +|= try c.uint32();
                 },
                 .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => {},
-                .SSH_MSG_CHANNEL_EOF => ch.got_eof = true,
+                .SSH_MSG_CHANNEL_EOF => {
+                    var c = Cursor{ .b = pkt.payload[1..] };
+                    try expectChannel(ch, &c);
+                    ch.got_eof = true;
+                },
                 .SSH_MSG_CHANNEL_CLOSE => {
+                    var c = Cursor{ .b = pkt.payload[1..] };
+                    try expectChannel(ch, &c);
                     ch.got_close = true;
                     return error.ChannelClosed;
                 },
@@ -891,11 +908,85 @@ test "ChannelState: a chunk over the advertised maximum packet size is refused" 
     try t.expectError(error.PacketTooLarge, ch.acceptData(1025));
 }
 
+test "maybeAdjustWindow does not overflow u32 on a large configured window" {
+    // audit `ssh` F4: `local_window * 2` used to overflow (ReleaseSafe panic)
+    // once a caller passed `window_size` above 0x7FFF_FFFF via
+    // `SessionOptions`/`ServeConfig`. Not peer-reachable, but the caller-
+    // config path itself must not panic.
+    const t = std.testing;
+    var sink_buf: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var r: std.Io.Reader = .fixed(&.{});
+    var tr = transport.Transport.init(&r, &sink);
+
+    // `local_window` alone is > 0x7FFF_FFFF, so `local_window * 2` (the old
+    // formula) overflows u32 regardless of which branch is taken — the
+    // multiply itself panics under ReleaseSafe before the comparison runs.
+    var ch = ChannelState{
+        .local_id = 0,
+        .remote_id = 3,
+        .local_window = 0x9000_0000, // still > half of initial: no top-up due
+        .local_window_initial = 0xF000_0000,
+        .local_max_packet = 1024,
+    };
+    try maybeAdjustWindow(&tr, &ch);
+    try t.expectEqual(@as(u32, 0x9000_0000), ch.local_window); // unchanged
+}
+
+test "sendChannelData rejects a WINDOW_ADJUST addressed to another channel" {
+    // audit `ssh` F5: the wait loop used to discard `recipient_channel`
+    // (`_ = try c.uint32()`) instead of checking it against `expectChannel`
+    // like every other channel-message site. Latent while the module is
+    // single-channel, but this proves the guard now rejects a mismatched id
+    // rather than silently crediting our window with someone else's grant.
+    const t = std.testing;
+
+    // WINDOW_ADJUST addressed to channel 99, while our local id is 5.
+    var wa_buf: [16]u8 = undefined;
+    var ww: std.Io.Writer = .fixed(&wa_buf);
+    try writeChannelHeader(&ww, .SSH_MSG_CHANNEL_WINDOW_ADJUST, 99);
+    try writeU32(&ww, 1000);
+
+    var wire: [256]u8 = undefined;
+    const framed = try framePackets(&wire, &.{ww.buffered()});
+
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+
+    var ch = ChannelState{
+        .local_id = 5,
+        .remote_id = 7,
+        .local_window = 1 << 20,
+        .local_window_initial = 1 << 20,
+        .local_max_packet = 1024,
+        .remote_window = 0, // forces the wait loop to run
+        .remote_max_packet = 1024,
+        .open = true,
+    };
+    var scratch: [256]u8 = undefined;
+    try t.expectError(error.ChannelClosed, sendChannelData(&tr, &ch, "hello", null, &scratch));
+    // The mismatched grant must not have been credited.
+    try t.expectEqual(@as(u32, 0), ch.remote_window);
+}
+
 test "max_send_chunk fits in one binary packet" {
     // `transport.writePacket` encodes into an 8 KiB stack buffer; a full
     // chunk plus CHANNEL_EXTENDED_DATA header, padding and a 32-byte MAC
     // must stay under it or `exec` would fail on large output.
     try std.testing.expect(max_send_chunk + 13 + 16 + 32 + 4 < 8192);
+}
+
+test "delivered flow-control and output-cap defaults are pinned to their documented values" {
+    // audit `ssh` F3: `default_window_size`/`default_max_packet_size` guard
+    // RFC 4254 §5.2 accounting (:114-122) and `default_max_output` bounds
+    // the one-shot `exec` collector — none of the three had a test pinning
+    // the literal, only the inequality on `max_send_chunk` above did.
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 2 * 1024 * 1024), default_window_size);
+    try t.expectEqual(@as(u32, 32 * 1024), default_max_packet_size);
+    try t.expectEqual(@as(usize, 8 * 1024 * 1024), default_max_output);
 }
 
 // ── full-stack loopback self-interop: our client ↔ our server ──────────────

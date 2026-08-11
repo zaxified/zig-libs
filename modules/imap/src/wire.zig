@@ -519,6 +519,15 @@ test "literal: the payload is bounded by max_literal, not by the line budget" {
     try testing.expectEqual(@as(usize, 6), d.line_bytes); // only `{20}\r\n`
 }
 
+test "Options.max_line's delivered default is pinned to 64 KiB" {
+    // audit `imap` F8: the boundary test below sets its own explicit
+    // `.max_line = 16`, and the "under the DEFAULT options" test right after
+    // this one sizes its input as `opts.max_line + 1` — both are written *in
+    // terms of* the constant, so neither pins the value a `Client` built
+    // with `Options{}` actually ships with. Pin the literal.
+    try testing.expectEqual(@as(usize, 64 * 1024), (Options{}).max_line);
+}
+
 test "run: an unterminated line is refused, not accumulated, under the DEFAULT options" {
     // The reproducer from the audit: a server that starts an atom and never
     // ends the line. It was accepted at 8 MiB with `Options{}` — there was no

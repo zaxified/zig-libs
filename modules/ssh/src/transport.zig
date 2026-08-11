@@ -2406,11 +2406,22 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
     }) catch return error.SkipZigTest;
     defer sshd.kill(io); // idempotent + reaps; safe even if never connected
 
-    // Connect (retry until sshd is listening, ~3s budget).
+    // Connect (retry until sshd is listening, ~15s budget).
+    //
+    // audit `ssh` F6: this lane was intermittently red in the build. Diagnosed
+    // by running the compiled test binary N-way concurrently (`.zig-cache`
+    // stays the same binary; a real sshd fork+exec+privsep startup was forced
+    // to compete for CPU): under load `sshd` occasionally takes noticeably
+    // longer than the old ~3s budget (60 * 50ms) to reach `listen`, and the
+    // retry loop gave up and took the (honest, but anchor-erasing)
+    // `error.SkipZigTest` path — reproduced twice with a diagnostic print at
+    // this exact `return`. 300 * 50ms keeps the same poll cadence (so a fast
+    // `sshd` still resolves in one or two ticks) but gives a loaded host 5x
+    // the headroom before conceding.
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
     var stream: std.Io.net.Stream = blk: {
         var tries: usize = 0;
-        while (tries < 60) : (tries += 1) {
+        while (tries < 300) : (tries += 1) {
             if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
             var ts = std.os.linux.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
             _ = std.os.linux.nanosleep(&ts, null);

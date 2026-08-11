@@ -401,6 +401,25 @@ test "the max_line budget is per line, and it is this Reader that starts one" {
     try testing.expectError(error.LineTooLong, rd.next());
 }
 
+test "the DEFAULT max_line is what LineTooLong actually fires at through this Reader" {
+    // audit `imap` F8, second half: the harness that fuzzes this layer
+    // capped its input at 512 bytes, 128x below `wire.Options{}.max_line`
+    // (64 KiB), so `error.LineTooLong` was unreachable from it under the
+    // default options `Client` actually ships with — every other test at
+    // this layer sets its own small `.max_line`. This one uses `.{}`.
+    const gpa = testing.allocator;
+    const opts: wire.Options = .{};
+    const buf = try gpa.alloc(u8, opts.max_line + 1);
+    defer gpa.free(buf);
+    @memset(buf, 'A');
+
+    var r = std.Io.Reader.fixed(buf);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var rd = Reader.init(arena.allocator(), &r, .{});
+    try testing.expectError(error.LineTooLong, rd.next());
+}
+
 test "RFC 9051 §6.3.2: the whole SELECT transcript" {
     var f = Fixture.init(
         "* 172 EXISTS\r\n" ++
@@ -653,18 +672,36 @@ test "FETCH, SEARCH and ESEARCH now come back parsed, not as raw text" {
 //     announced sizes must not OOM. The arena below would make such a bug
 //     loud rather than hidden.
 //
-// The budget is deliberately small: the interesting inputs are short, and a
-// 512-byte window keeps the fuzzer's mutation density on the grammar rather
-// than on payload bytes it will never reach.
+// The window used to be a flat 512 bytes — small enough to keep the
+// fuzzer's mutation density on the grammar rather than on payload bytes it
+// will never reach, but 128x below `wire.Options{}.max_line` (64 KiB), which
+// made `error.LineTooLong` unreachable from this harness under the default
+// options it actually runs with (audit `imap` F8). Most iterations still
+// draw a short length, via the weighting below, so the grammar-density
+// argument above still mostly holds; a minority draw enough bytes to clear
+// the 64 KiB line budget and exercise the refusal itself.
 
 test "fuzz: response parsing never panics on arbitrary server bytes" {
     try testing.fuzz({}, fuzzResponse, .{});
 }
 
 fn fuzzResponse(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [80 * 1024]u8 = undefined;
+    // Draw the LENGTH FIRST. `Smith.bytes` consumes `min(out.len, in.len)`
+    // bytes of the corpus and leaves the rest of `out` at the default value,
+    // so filling an 80 KiB buffer up front drains `in` completely and every
+    // subsequent draw — including this one — degenerates to its default. That
+    // is why the first version of this harness never reached `LineTooLong`
+    // despite the raised window: the weighting was being read off an empty
+    // corpus.
+    //
+    // Heavily weighted toward short inputs (grammar-dense) but able to reach
+    // past `max_line` (64 KiB) so `error.LineTooLong` is actually exercised.
+    const len: usize = smith.valueWeighted(u32, &.{
+        std.testing.Smith.Weight.rangeAtMost(u32, 0, 512, 8),
+        std.testing.Smith.Weight.rangeAtMost(u32, 513, buf.len, 1),
+    });
+    smith.bytes(buf[0..len]);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -678,6 +715,53 @@ fn fuzzResponse(_: void, smith: *std.testing.Smith) !void {
     // the state actually accumulates.
     var guard: usize = 0;
     while (guard < 64) : (guard += 1) {
-        _ = rd.next() catch return;
+        _ = rd.next() catch |e| {
+            if (e == error.LineTooLong) f8_line_too_long_reached += 1;
+            return;
+        };
     }
+}
+
+var f8_line_too_long_reached: usize = 0;
+
+// audit `imap` F8, second half regression: `zig build test` (no `--fuzz=N`)
+// never actually invokes a `std.testing.fuzz` body, so this drives
+// `fuzzResponse` directly off `std.testing.Smith{ .in = ... }` (documented as
+// "intended to be initialized directly") the same way `zipstream`'s F8 fix
+// does, and checks the harness's own `error.LineTooLong` counter went > 0 —
+// proof the raised window (512 -> 80 KiB, weighted) actually reaches the
+// refusal rather than merely compiling.
+test "fuzz harness (F8 regression): LineTooLong is actually reachable from fuzzResponse" {
+    // `zig build test` (no `--fuzz=N`) never invokes a `std.testing.fuzz`
+    // body, so this drives `fuzzResponse` directly off a corpus-backed
+    // `std.testing.Smith` and checks the harness's own counter moved. It is a
+    // proof that the raised window is REACHED, not merely that it compiles.
+    //
+    // The corpus has to be built deliberately, and each requirement here is
+    // one way the harness could have looked green while never reaching the
+    // refusal:
+    //
+    //   1. A corpus-backed `Smith` reads each weighted draw as a little-endian
+    //      u64 and falls back to `weights[0].min` unless that u64 lands inside
+    //      a declared range. Random bytes therefore draw 0 almost always, so
+    //      random corpora can never take the long branch — at any iteration
+    //      count. The length is written explicitly.
+    //   2. `fuzzResponse` returns on the FIRST error of any kind, so the
+    //      payload must be free of CRLF *and* of any byte that ends an atom:
+    //      the parser would reject on grammar long before the line budget is
+    //      consulted.
+    //   3. `Smith.bytes` copies `min(out.len, in.len)` and pads the rest with
+    //      the default byte — which is one of those atom-ending bytes. So the
+    //      corpus must be long enough to fill the whole drawn length itself.
+    const gpa = testing.allocator;
+    const draw_len: u64 = 70_000; // > wire.Options{}.max_line (64 KiB)
+    const scratch = try gpa.alloc(u8, 8 + draw_len);
+    defer gpa.free(scratch);
+    @memset(scratch, 'A');
+    std.mem.writeInt(u64, scratch[0..8], draw_len, .little);
+
+    f8_line_too_long_reached = 0;
+    var smith = std.testing.Smith{ .in = scratch };
+    fuzzResponse({}, &smith) catch {};
+    try testing.expect(f8_line_too_long_reached > 0);
 }

@@ -1191,6 +1191,16 @@ test "EntryReader: a decompression bomb (declared size over the cap) is refused,
     try testing.expectEqual(@as(usize, 256 * 1024), out.items.len);
 }
 
+test "default_max_output is pinned to the documented 1 GiB decompression-bomb ceiling" {
+    // audit `zipstream` F7: this is the *delivered* cap for every caller of
+    // plain `EntryReader.init` (13 call sites in this suite alone), but the
+    // bomb-cap tests above only exercise the mechanism through `initMax`'s
+    // own explicit values (64 KiB / 1 MiB) — nothing pinned the shipped
+    // default itself, so it could be loosened arbitrarily with the suite
+    // staying green. Pin the literal, not an inequality on the constant.
+    try testing.expectEqual(@as(u64, 1 << 30), default_max_output);
+}
+
 // ---------------------------------------------------------------------------
 // Writer tests
 // ---------------------------------------------------------------------------
@@ -1409,9 +1419,115 @@ test "Archive/EntryReader: zip64 with Deflate-compressed data" {
 // End Of Central Directory signature near the tail, so stamp one in about
 // half the fuzz cases to get the parser past the "is this even a zip"
 // rejection and into the directory-walking logic the regression above hit.
+//
+// audit `zipstream` F8: this used to stop at `Archive.init`+`deinit` and
+// never open an `EntryReader`, so the CRC check, the bomb cap (`initMax`)
+// and the local-vs-central `data_off` disagreement were never fuzzed — only
+// the central-directory walk was, even though the audit's own temporary
+// fuzz did "`Archive.init` then bounded-read every entry". Fixed two ways:
+// (1) every path below that gets a parsed `Archive` now also opens and
+// bounded-reads each entry; (2) purely-random bytes almost never assemble a
+// byte-exact, walkable central directory (that is what F1 needed a crafted
+// case to find), so on top of the random-bytes path this harness now also
+// starts from a real, valid archive built through `ArchiveWriter` (both
+// Store and Deflate members) and applies a handful of random byte mutations
+// — the same "mutated-valid" shape the audit used to find F1 — which stays
+// walkable far more often and is what actually drives `EntryReader` on most
+// iterations.
 
 test "fuzz: Archive.init never panics on an arbitrary file" {
     try testing.fuzz({}, fuzzArchiveInit, .{});
+}
+
+var f8_entry_reader_reached: usize = 0;
+
+// `zig build test` (no `--fuzz=N`) never actually invokes a
+// `std.testing.fuzz` body — the "fuzz test" above is only *registered*, not
+// run, in the plain test lane, so a counter incremented from inside it can't
+// be asserted on there. `std.testing.Smith` documents itself as "intended to
+// be initialized directly", so this regression drives `fuzzArchiveInit`
+// itself, directly, off a handful of PRNG-filled inputs, as an ordinary test
+// — proving the harness's *logic* really does reach `EntryReader` (not just
+// `Archive.init`+`deinit`) without depending on the opaque `--fuzz` engine.
+test "fuzz harness (F8 regression): EntryReader is actually reached, not just Archive.init" {
+    f8_entry_reader_reached = 0;
+    var prng = std.Random.DefaultPrng.init(0xF8_F8_F8_F8);
+    var scratch: [4096]u8 = undefined;
+    for (0..64) |_| {
+        prng.random().bytes(&scratch);
+        var smith = testing.Smith{ .in = &scratch };
+        fuzzArchiveInit({}, &smith) catch {};
+    }
+    try testing.expect(f8_entry_reader_reached > 0);
+}
+
+fn tryEntries(archive: *Archive) void {
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    for (archive.entries.items) |*entry| {
+        var er: EntryReader = undefined;
+        // A small explicit `max_output` keeps a crafted huge
+        // `uncompressed_size` cheap to reject via `ZipEntryTooLarge` rather
+        // than attempting a large allocation from a small fuzz input.
+        er.initMax(archive, entry, &window, 64 * 1024) catch continue;
+        f8_entry_reader_reached += 1;
+        var sink_buf: [256]u8 = undefined;
+        _ = er.reader().readSliceShort(&sink_buf) catch {};
+        _ = er.reader().discardRemaining() catch {};
+    }
+}
+
+// Path 1: purely-random bytes (with an EOCD signature stamped in about half
+// the cases to get past the "is this even a zip" rejection). A helper of its
+// own — not inlined into `fuzzArchiveInit` — specifically so its `catch
+// return`s bail out of *this* path only and cannot skip path 2 below (that
+// was the shape of an earlier draft's bug: `return` inside a bare `{ }`
+// block still returns the whole enclosing function in Zig).
+fn tryRandomBytesPath(bytes: []const u8) void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    tmp.dir.writeFile(testing.io, .{ .sub_path = "f.zip", .data = bytes }) catch return;
+    var f = tmp.dir.openFile(testing.io, "f.zip", .{}) catch return;
+    defer f.close(testing.io);
+
+    var archive: Archive = undefined;
+    archive.init(testing.io, testing.allocator, f) catch return;
+    defer archive.deinit();
+    tryEntries(&archive);
+}
+
+// Path 2: start from a real, valid Store+Deflate archive and apply random
+// byte-level mutations, so most iterations stay walkable enough to reach
+// `EntryReader` (see the module doc comment above) — same reasoning as
+// `tryRandomBytesPath`'s doc comment for why this is its own function.
+fn tryMutatedValidPath(smith: *std.testing.Smith) void {
+    var base_buf: [4096]u8 = undefined;
+    var base_writer: std.Io.Writer = .fixed(&base_buf);
+    var zw = ArchiveWriter.init(testing.allocator, &base_writer);
+    defer zw.deinit();
+    zw.addEntry("a.txt", "hello fuzz world, this member is stored verbatim", .{ .method = .store }) catch return;
+    zw.addEntry("b.txt", "hello fuzz world, this member is deflated " ** 20, .{ .method = .deflate }) catch return;
+    zw.finish() catch return;
+    const base = base_writer.buffered();
+
+    var mbuf: [4096]u8 = undefined;
+    @memcpy(mbuf[0..base.len], base);
+    const mutated = mbuf[0..base.len];
+    const n_mut = smith.valueRangeAtMost(u8, 0, 24);
+    for (0..n_mut) |_| {
+        const idx = smith.index(mutated.len);
+        mutated[idx] = smith.value(u8);
+    }
+
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    tmp2.dir.writeFile(testing.io, .{ .sub_path = "m.zip", .data = mutated }) catch return;
+    var f2 = tmp2.dir.openFile(testing.io, "m.zip", .{}) catch return;
+    defer f2.close(testing.io);
+
+    var archive2: Archive = undefined;
+    archive2.init(testing.io, testing.allocator, f2) catch return;
+    defer archive2.deinit();
+    tryEntries(&archive2);
 }
 
 fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
@@ -1425,15 +1541,8 @@ fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
         bytes[bytes.len - 22 ..][0..4].* = .{ 0x50, 0x4b, 0x05, 0x06 };
     }
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    tmp.dir.writeFile(testing.io, .{ .sub_path = "f.zip", .data = bytes }) catch return;
-    var f = tmp.dir.openFile(testing.io, "f.zip", .{}) catch return;
-    defer f.close(testing.io);
-
-    var archive: Archive = undefined;
-    archive.init(testing.io, testing.allocator, f) catch return;
-    defer archive.deinit();
+    tryRandomBytesPath(bytes);
+    tryMutatedValidPath(smith);
 }
 
 // ── offline write-path anchor (real unzip/zipinfo capture, no subprocess) ─
