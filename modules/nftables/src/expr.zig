@@ -261,6 +261,12 @@ pub const Reg = enum(u32) {
 
 pub const RegError = error{OutOfRegisters};
 
+/// Width, in bytes, of one legacy data register (`NFT_REG_1`…`NFT_REG_4`).
+/// `payloadCmp`/`payloadMaskedCmp` load into a single such register, so a
+/// requested `len` above this cannot be serviced — see the register model
+/// in the file header.
+pub const max_value_len: u32 = 16;
+
 /// Hands out `NFT_REG_1`…`NFT_REG_4` in order; `reset` starts over.
 pub const RegAlloc = struct {
     next: u32 = 1,
@@ -711,6 +717,7 @@ pub const Program = struct {
         value: []const u8,
     ) *Program {
         if (value.len != len) return p.fail(error.ValueWidthMismatch);
+        if (len > max_value_len) return p.fail(error.ValueWidthMismatch);
         const cmp_op = op.cmpOp() orelse return p.fail(error.UnsupportedOperator);
         p.regs.reset();
         const reg = p.regs.alloc() catch |e| return p.fail(e);
@@ -731,6 +738,7 @@ pub const Program = struct {
         value: []const u8,
     ) *Program {
         if (value.len != len or mask.len != len) return p.fail(error.ValueWidthMismatch);
+        if (len > max_value_len) return p.fail(error.ValueWidthMismatch);
         const cmp_op = op.cmpOp() orelse return p.fail(error.UnsupportedOperator);
         p.regs.reset();
         const reg = p.regs.alloc() catch |e| return p.fail(e);
@@ -1027,6 +1035,31 @@ test "cmp value width is validated against the load" {
     defer r.deinit();
     _ = r.metaCmp(.mark, .in, &.{ 0, 0, 0, 1 });
     try testing.expectError(error.UnsupportedOperator, r.finish());
+}
+
+test "payloadCmp/payloadMaskedCmp reject a value wider than one data register" {
+    // 16 bytes = width of one legacy nft_registers data register
+    // (NFT_REG_1..NFT_REG_4, see the register model in the file header);
+    // pinned literally, not via `max_value_len`, so a change to the
+    // constant is caught here.
+    const over_wide: [17]u8 = @splat(0);
+    const exactly_wide: [16]u8 = @splat(0);
+
+    var p = Program.init(testing.allocator, .inet);
+    defer p.deinit();
+    _ = p.payloadCmp(.nh, 0, 17, .eq, &over_wide);
+    try testing.expectError(error.ValueWidthMismatch, p.finish());
+
+    // The boundary itself must still be accepted.
+    var q = Program.init(testing.allocator, .inet);
+    defer q.deinit();
+    _ = q.payloadCmp(.nh, 0, 16, .eq, &exactly_wide);
+    _ = try q.finish();
+
+    var r = Program.init(testing.allocator, .inet);
+    defer r.deinit();
+    _ = r.payloadMaskedCmp(.nh, 0, 17, &over_wide, .eq, &over_wide);
+    try testing.expectError(error.ValueWidthMismatch, r.finish());
 }
 
 test "an unmappable meta key is rejected at encode time" {

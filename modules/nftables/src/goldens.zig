@@ -102,6 +102,32 @@ const g_rule_tcp_dport =
     "00160000140001800c000100636f756e7465720004000280300001800e000100696d6d6564696174650000001c000280" ++
     "0800010000000000100002800c0002800800010000000001140000001100010002000000000000000000000a";
 
+// ### nft add rule inet filter input tcp sport 22 counter accept
+// Anchors `Program.tcpSport`'s native offset (`expr.zig` `.th, 0, 2`), which
+// had no oracle in either lane before this golden — see audit finding
+// `nftables` F1.
+const g_rule_tcp_sport =
+    "140000001000010000000000000000000000000a24010000060a010c0100000000000000010000000b00010066696c746572" ++
+    "00000a000200696e707574000000f800048024000180090001006d6574610000000014000280080002000000001008000100" ++
+    "000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100060000003400" ++
+    "01800c0001007061796c6f616400240002800800010000000001080002000000000208000300000000000800040000000002" ++
+    "2c00018008000100636d700020000280080001000000000108000200000000000c0003800600010000160000140001800c00" ++
+    "0100636f756e7465720004000280300001800e000100696d6d6564696174650000001c000280080001000000000010000280" ++
+    "0c0002800800010000000001140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input ip daddr 10.0.0.1 drop
+// Anchors `Program.ipDaddr`'s native offset (`expr.zig` `.nh, 16, 4`), which
+// had no oracle in either lane before this golden — see audit finding
+// `nftables` F1.
+const g_rule_ip_daddr =
+    "140000001000010000000000000000000000000a10010000060a010c0100000000000000010000000b00010066696c746572" ++
+    "00000a000200696e707574000000e400048024000180090001006d6574610000000014000280080002000000000f08000100" ++
+    "000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100020000003400" ++
+    "01800c0001007061796c6f616400240002800800010000000001080002000000000108000300000000100800040000000004" ++
+    "2c00018008000100636d700020000280080001000000000108000200000000000c000380080001000a000001300001800e00" ++
+    "0100696d6d6564696174650000001c0002800800010000000000100002800c00028008000100000000001400000011000100" ++
+    "02000000000000000000000a";
+
 // ### nft add rule inet filter input ip saddr 10.0.0.0/8 drop
 // A byte-aligned prefix needs no `bitwise`: nft shortens the payload load to
 // the one covered byte.
@@ -303,6 +329,38 @@ test "golden: rule — tcp dport 22 counter accept" {
         .exprs = try p.finish(),
     });
     try expectGolden(g_rule_tcp_dport, try b.finish());
+}
+
+test "golden: rule — tcp sport 22 counter accept" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.tcpSport(22).counter().accept();
+
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addRule(.{
+        .family = .inet,
+        .table = "filter",
+        .chain = "input",
+        .exprs = try p.finish(),
+    });
+    try expectGolden(g_rule_tcp_sport, try b.finish());
+}
+
+test "golden: rule — ip daddr 10.0.0.1 drop" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.ipDaddr(.{ 10, 0, 0, 1 }).drop();
+
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addRule(.{
+        .family = .inet,
+        .table = "filter",
+        .chain = "input",
+        .exprs = try p.finish(),
+    });
+    try expectGolden(g_rule_ip_daddr, try b.finish());
 }
 
 test "golden: rule — ip saddr 10.0.0.0/8 drop (byte-aligned prefix, no bitwise)" {

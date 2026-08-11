@@ -106,6 +106,20 @@ MODULES = {
         ],
         "prefixes": [""],
     },
+    "netlink": {
+        # `bridge.zig`'s ~100 hand-transcribed AF_BRIDGE constants (audit
+        # finding `netlink` F3) -- previously outside this gate entirely.
+        # The module's own namespace names (`IFLA_BR`, `IFLA_BRPORT`,
+        # `IFLA_BRIDGE`, `BRIDGE_FLAGS`, `BRIDGE_MODE`, `BR_STATE`) are
+        # already the kernel's own prefix, same shape as `conntrack` below.
+        "zig_files": ["modules/netlink/src/bridge.zig"],
+        "headers": [
+            "/usr/include/linux/if_link.h",
+            "/usr/include/linux/if_bridge.h",
+            "/usr/include/linux/rtnetlink.h",
+        ],
+        "prefixes": [""],
+    },
 }
 
 # ── Zig side: structurally extract dotted-name -> int from a uapi.zig-shaped

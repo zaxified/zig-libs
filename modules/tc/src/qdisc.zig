@@ -1382,6 +1382,34 @@ test "spec validation rejects unbuildable qdiscs before allocating" {
     try testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
+test "kind_max is the delivered 16-byte TCA_KIND budget, and the boundary is exact" {
+    // 16 is the shipped limit (`kind_max` above), pinned literally so a
+    // change to the constant is caught here rather than read off the symbol
+    // it is checked against. The longest real qdisc kind on this host's
+    // iproute2/kernel is "pfifo_head_drop" (15 bytes), one under the limit;
+    // `codec.asString` trims the trailing NUL before this is reached, so the
+    // margin really is one byte.
+    try testing.expectEqual(@as(usize, 16), kind_max);
+
+    var buf: [kind_max]u8 = undefined;
+    var len: u8 = 0;
+
+    // Exactly at the boundary: accepted.
+    const at_boundary = "0123456789abcdef"; // 16 bytes
+    try testing.expectEqual(@as(usize, 16), at_boundary.len);
+    try copyKind(&buf, &len, at_boundary);
+    try testing.expectEqualStrings(at_boundary, buf[0..len]);
+
+    // One byte over: rejected, not truncated.
+    const over_boundary = "0123456789abcdefg"; // 17 bytes
+    try testing.expectEqual(@as(usize, 17), over_boundary.len);
+    try testing.expectError(error.BadLength, copyKind(&buf, &len, over_boundary));
+
+    // The real-world longest kind name still fits comfortably.
+    try copyKind(&buf, &len, "pfifo_head_drop");
+    try testing.expectEqualStrings("pfifo_head_drop", buf[0..len]);
+}
+
 test "QdiscSpec.kind covers every modelled kind" {
     try testing.expectEqualStrings("netem", (QdiscSpec{ .netem = .{} }).kind());
     try testing.expectEqualStrings("htb", (QdiscSpec{ .htb = .{} }).kind());

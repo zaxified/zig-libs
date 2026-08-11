@@ -478,6 +478,16 @@ pub const Socket = struct {
 
 const testing = std.testing;
 
+test "max_dump_attempts is the delivered restart budget, not just any value" {
+    // 4 is the shipped `NLM_F_DUMP_INTR` restart budget (`max_dump_attempts`
+    // above) — pinned literally so a change to the constant is caught here,
+    // not read off the constant itself. `dumpInto`'s retry loop cannot be
+    // driven to `.restart` without a live kernel dump interrupted mid-flight
+    // (see the F2 audit note in modules/nftables.md), so this only pins the
+    // delivered magnitude, not the retry behaviour itself.
+    try testing.expectEqual(@as(usize, 4), max_dump_attempts);
+}
+
 test "errno mapping covers what nf_tables actually answers" {
     try testing.expectEqual(KernelError.NotFound, errorFromErrno(-2));
     try testing.expectEqual(KernelError.Exists, errorFromErrno(-17));

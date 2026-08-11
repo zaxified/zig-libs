@@ -822,6 +822,49 @@ test "extended ACK: NLMSGERR_ATTR_MSG extracted for capped and echoed errors" {
     try testing.expectEqual(@as(?[]const u8, null), try plain.errorMessage());
 }
 
+test "extended ACK: NLMSGERR_ATTR_MSG id is really 1 on a real kernel's wire (external anchor)" {
+    // Every other extended-ACK test in this file writes and reads
+    // `NLMSGERR_ATTR.MSG` through the same symbol, so a consistent mutation
+    // of the id is invisible to the whole suite (audit finding `netlink` F1).
+    // This one is different: the bytes below are a genuine `NLMSG_ERROR`
+    // reply, captured verbatim from a real Linux kernel — not built with
+    // `appendAttrString`/`NLMSGERR_ATTR.MSG` at all.
+    //
+    // Capture recipe (`iproute2-6.19.0`, unprivileged netns):
+    //   unshare -rn strace -f -e trace=recvmsg -e read=all -xx -s 4096 \
+    //           -e abbrev=none ip link set br1 master br0
+    // (two bridges, the second enslaved to the first — the kernel's
+    // `br_add_if()` rejects "bridge under a bridge" with an extack string,
+    // NLM_F_ACK_TLVS set, NLM_F_CAPPED clear so the whole original request
+    // is echoed before the TLVs, exactly the "uncapped" shape the sibling
+    // test above exercises with synthetic bytes).
+    //
+    // `-e read=all -xx` dumps the raw recv buffer with no re-encoding step;
+    // the TLV header immediately preceding the message string reads
+    // `29 00 01 00` little-endian = nla_len 0x29 (41), nla_type **0x0001**.
+    // That `01 00` is the literal being pinned here, independent of
+    // `NLMSGERR_ATTR.MSG`'s value in this file.
+    const raw = [_]u8{
+        0x68, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x02, 0x01, 0x9b, 0x7a, 0x6a,
+        0x8a, 0x5b, 0x12, 0x00, 0xd8, 0xff, 0xff, 0xff, 0x28, 0x00, 0x00, 0x00,
+        0x10, 0x00, 0x05, 0x00, 0x01, 0x9b, 0x7a, 0x6a, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x29, 0x00, 0x01, 0x00, 'C',  'a',  'n',  ' ',  'n',  'o',  't',  ' ',
+        'e',  'n',  's',  'l',  'a',  'v',  'e',  ' ',  'a',  ' ',  'b',  'r',
+        'i',  'd',  'g',  'e',  ' ',  't',  'o',  ' ',  'a',  ' ',  'b',  'r',
+        'i',  'd',  'g',  'e',  0x00, 0x00, 0x00, 0x00,
+    };
+    // The id byte pinned literally: byte 62 is the low byte of the
+    // little-endian nla_type in the `29 00 01 00` TLV header above.
+    try testing.expectEqual(@as(u8, 0x01), raw[62]);
+
+    var it: MessageIterator = .{ .buf = &raw };
+    const m = (try it.next()).?;
+    try testing.expectEqual(@as(i32, -40), try m.errorCode()); // -ELOOP
+    try testing.expectEqualStrings("Can not enslave a bridge to a bridge", (try m.errorMessage()).?);
+}
+
 test "extended ACK: hostile offsets are rejected, never over-read" {
     // NLM_F_ACK_TLVS set but the payload is shorter than struct nlmsgerr.
     const short: Message = .{ .type = NLMSG_ERROR, .flags = NLM_F_ACK_TLVS, .seq = 0, .pid = 0, .payload = &.{ 0, 0, 0, 0 } };

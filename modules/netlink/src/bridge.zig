@@ -102,8 +102,16 @@ pub const IFLA_BR = struct {
     pub const ROOT_PATH_COST: u16 = 13;
     pub const TOPOLOGY_CHANGE: u16 = 14;
     pub const TOPOLOGY_CHANGE_DETECTED: u16 = 15;
-    pub const VLAN_DEFAULT_PVID: u16 = 22;
-    pub const VLAN_STATS_ENABLED: u16 = 24;
+    /// Corrected by `scripts/check-uapi-consts.py` (audit finding `netlink`
+    /// F3): was hand-transcribed as 22, which is `linux/if_link.h`'s
+    /// position *before* the block of `IFLA_BR_HELLO_TIMER`…
+    /// `IFLA_BR_NF_CALL_ARPTABLES` entries this module does not name; the
+    /// kernel's real value is 39. Unused by this module (no call sites), so
+    /// the wrong id was latent, not live.
+    pub const VLAN_DEFAULT_PVID: u16 = 39;
+    /// Same correction as `VLAN_DEFAULT_PVID` above; kernel value is 41
+    /// (was 24). Also unused.
+    pub const VLAN_STATS_ENABLED: u16 = 41;
     pub const MCAST_SNOOPING: u16 = 23;
 };
 
@@ -1903,13 +1911,25 @@ test "wire constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 29), IFLA_EXT_MASK);
     try testing.expectEqual(@as(u16, 2), RTEXT_FILTER.BRVLAN);
     try testing.expectEqual(@as(usize, 4), bridge_vlan_info_len);
+    // 802.1Q's usable VID range (0 and 4095 are reserved) — pinned as
+    // literals here, independent of `vlan_id_min`/`vlan_id_max` below, per
+    // audit finding `netlink` F3: the old version of this test wrote 4094
+    // into the buffer with a bare literal and then compared the parser's
+    // output back against `vlan_id_max`, which only proves `VlanInfo.parse`
+    // round-trips whatever `vlan_id_max` happens to be — it never checks the
+    // constant's own value. `vlan_id_min`/`vlan_id_max` aren't literal
+    // `#define`s in the kernel headers (802.1Q, not a netlink UAPI symbol),
+    // so `scripts/check-uapi-consts.py` cannot anchor them either; pinning
+    // both ends independently here is the substitute.
+    try testing.expectEqual(@as(u16, 1), vlan_id_min);
+    try testing.expectEqual(@as(u16, 4094), vlan_id_max);
     // struct bridge_vlan_info is {u16 flags, u16 vid} in host order.
     var raw: [4]u8 = undefined;
     std.mem.writeInt(u16, raw[0..2], BRIDGE_VLAN_INFO.PVID | BRIDGE_VLAN_INFO.UNTAGGED, native_endian);
     std.mem.writeInt(u16, raw[2..4], 4094, native_endian);
     const info = try VlanInfo.parse(&raw);
     try testing.expectEqual(@as(u16, 6), info.flags);
-    try testing.expectEqual(vlan_id_max, info.vid);
+    try testing.expectEqual(@as(u16, 4094), info.vid);
 }
 
 test "fuzz: bridge builders never crash on arbitrary spec bytes" {

@@ -14,12 +14,19 @@
 //! them the same way.
 //!
 //! `parse` accepts every form `tc show` prints, including the reserved values
-//! spelled numerically (`ffff:fff1`, `0:`). `format` does **not** reproduce
-//! iproute2's `print_tc_classid` byte for byte: it prefers the symbolic names
-//! (`root` / `ingress` / `none`) where iproute2 prints `ffff:fff1` or `0:`,
-//! and it prints a major-0 handle as `0:10` where iproute2 prints `:10`.
-//! `format` → `parse` still recovers the identical `raw`, so the round-trip is
-//! value-exact; it is only the rendering that differs from `tc`.
+//! spelled numerically (`ffff:fff1`, `0:`). `format` reproduces a real `tc`
+//! binary's rendering (`iproute2-6.19.0`, verified live with
+//! `unshare -rn tc qdisc show dev lo` / `tc qdisc add … clsact`):
+//! `TC_H_ROOT` is the only reserved value with a symbolic form (`root`);
+//! `TC_H_UNSPEC` prints as `0:`, not `none` — real `tc` uses the symbolic
+//! `none` only for the *parent* field's absence, never for a handle, and this
+//! type does not distinguish the two positions, so it follows the handle
+//! rendering, the one directly observed; `TC_H_INGRESS`/`TC_H_CLSACT` have no
+//! symbolic form either — they fall through to the plain `major:minor` hex
+//! pair (`ffff:fff1`), matching the live `parent ffff:fff1` capture; and a
+//! major-0 handle prints `:10`, not `0:10`, matching `print_tc_classid`'s
+//! explicit `:%x` branch. `format` → `parse` still recovers the identical
+//! `raw`, so the round-trip is value-exact.
 
 const std = @import("std");
 
@@ -159,12 +166,14 @@ pub const Handle = struct {
         return @intCast(v);
     }
 
-    /// Render in iproute2 form: `root`, `none`, `ingress`, `1:` (minor 0) or
-    /// `1:10` — hexadecimal, matching `tc show` output.
+    /// Render in real `tc`'s form: `root`, `0:` (unspec), `1:` (minor 0),
+    /// `:10` (major 0) or `1:10` — hexadecimal. See the file header for the
+    /// live evidence behind each case; `TC_H_INGRESS`/`TC_H_CLSACT` have no
+    /// symbolic form and fall through to the last `{x}:{x}` branch.
     pub fn format(h: Handle, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (h.isRoot()) return w.writeAll("root");
-        if (h.isIngress()) return w.writeAll("ingress");
-        if (h.isUnspec()) return w.writeAll("none");
+        if (h.isUnspec()) return w.print("{x}:", .{h.major()});
+        if (h.major() == 0) return w.print(":{x}", .{h.minor()});
         if (h.minor() == 0) return w.print("{x}:", .{h.major()});
         return w.print("{x}:{x}", .{ h.major(), h.minor() });
     }
@@ -210,15 +219,51 @@ test "parse is hexadecimal, like iproute2" {
     try testing.expectError(error.HandleOverflow, Handle.parse("10000:0"));
 }
 
-test "format round-trips parse" {
+test "format round-trips parse (identical spelling)" {
     var buf: [32]u8 = undefined;
-    const cases = [_][]const u8{ "1:10", "1:", "abcd:1234", "root", "ingress", "none" };
+    // ":10" (major-0) was the gap the audit found: `parse` already accepted
+    // it (see "parse is hexadecimal, like iproute2" above) but no round-trip
+    // case ever rendered it, so the `0:10` mis-format below went unnoticed.
+    const cases = [_][]const u8{ "1:10", "1:", ":10", "abcd:1234", "root", "0:" };
     for (cases) |c| {
         const h = try Handle.parse(c);
         const s = try std.fmt.bufPrint(&buf, "{f}", .{h});
         try testing.expectEqualStrings(c, s);
         try testing.expectEqual(h.raw, (try Handle.parse(s)).raw);
     }
+}
+
+test "format round-trips parse (different spelling, same value) for ingress/unspec/clsact" {
+    // `parse` still accepts the symbolic forms; `format` no longer produces
+    // them (see the next test), so only the *value* survives the round trip.
+    var buf: [32]u8 = undefined;
+    const cases = [_][]const u8{ "ingress", "clsact", "none" };
+    for (cases) |c| {
+        const h = try Handle.parse(c);
+        const s = try std.fmt.bufPrint(&buf, "{f}", .{h});
+        try testing.expectEqual(h.raw, (try Handle.parse(s)).raw);
+    }
+}
+
+test "format matches a real `tc` binary on the three cases where it used to diverge" {
+    // Captured live, `iproute2-6.19.0`, `unshare -rn`:
+    //   `tc qdisc add dev lo clsact; tc qdisc show dev lo`
+    //     -> "qdisc clsact ffff: parent ffff:fff1" — the *parent* field
+    //        (raw TC_H_INGRESS) prints as plain hex, not "ingress".
+    //   `tc qdisc show dev lo` (no qdiscs added)
+    //     -> "qdisc noqueue 0: root" — the qdisc's own handle (raw
+    //        TC_H_UNSPEC = 0) prints "0:", not "none".
+    // Pinned as literal strings, not derived from the constants, per the
+    // audit's F2 finding (`tc.md`).
+    var buf: [32]u8 = undefined;
+
+    try testing.expectEqualStrings("ffff:fff1", try std.fmt.bufPrint(&buf, "{f}", .{Handle.ingress}));
+    try testing.expectEqualStrings("ffff:fff1", try std.fmt.bufPrint(&buf, "{f}", .{Handle.clsact}));
+    try testing.expectEqualStrings("0:", try std.fmt.bufPrint(&buf, "{f}", .{Handle.unspec}));
+    // The major-0 case: matches iproute2's `print_tc_classid`'s explicit
+    // `:%x` branch (not directly re-captured live, but a stable read of the
+    // reference implementation's source shape — see the file header).
+    try testing.expectEqualStrings(":10", try std.fmt.bufPrint(&buf, "{f}", .{Handle.init(0, 0x10)}));
 }
 
 test "TC_H_MAKE composes a filter's tcm_info (prio + protocol)" {

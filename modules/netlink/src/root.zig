@@ -2898,6 +2898,17 @@ const ScriptedTransport = struct {
     }
 };
 
+test "the dump/ACK/ext-ack budgets are the delivered magnitudes, not just any value" {
+    // Pinned literally (not via the constants themselves), per the audit's
+    // F2 finding: the two tests below assert `t.recvs == max_dump_messages`
+    // etc., which follows the constant wherever it goes and would stay
+    // green through a shrink that silently breaks a large legitimate dump,
+    // or a grow that quietly re-opens the spin-forever DoS `a77c388` closed.
+    try testing.expectEqual(@as(u32, 65536), max_dump_messages);
+    try testing.expectEqual(@as(u32, 65536), max_await_messages);
+    try testing.expectEqual(@as(usize, 256), ext_ack_msg_max);
+}
+
 test "awaitAckStrict gives up instead of spinning when the ACK never arrives" {
     // A NOOP addressed to us on our own sequence: matched, then ignored by the
     // `else` arm, forever. Without a budget this loop never returns.

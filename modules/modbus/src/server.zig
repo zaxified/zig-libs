@@ -837,7 +837,27 @@ test "quantity limits: over-large reads are IllegalDataValue, not truncated read
     }
 }
 
-test "quantity limits: over-large writes are IllegalDataValue" {
+test "quantity limits: over-large writes are IllegalDataValue, and only because of the limit" {
+    // Audit finding `modbus` F2: the old version of this test built each
+    // probe PDU with a header only (no data bytes) and, separately, a byte
+    // count that did not match the quantity either — so a probe was
+    // rejected by *two* independent checks at once (`byte_count !=
+    // expected` and `body.len != 5 + byte_count`, both `server.zig`) and
+    // this test could not tell which one actually fired. Raising the
+    // relevant limit by one left it green, because the byte-count/length
+    // check took over — proven by fault injection: `limits.max_write_registers`
+    // 123 -> 124 flipped the *client* encoder test (`root.zig`) red but left
+    // this one green.
+    //
+    // Every PDU built below is otherwise completely well-formed — byte
+    // count matches the quantity, body length matches the byte count, and
+    // the address window (a 3000-coil / 200-register backing store) is wide
+    // enough to succeed — so the *only* reason any of them is rejected is
+    // the quantity limit itself. Confirmed live: bumping the matching
+    // `limits.max_write_*`/`max_rw_*` constant by one turns the matching
+    // probe below into a real accepted write (`reply.len == 5`, not an
+    // exception), which fails `expectException` below rather than staying
+    // green.
     var bits = [_]bool{false} ** 3000;
     var regs = [_]u16{0} ** 200;
     var server = Server.init(.{ .unit_id = 1, .framing = .rtu }, .{
@@ -846,20 +866,66 @@ test "quantity limits: over-large writes are IllegalDataValue" {
     });
     var out: [mb.max_pdu_len]u8 = undefined;
 
-    // FC 0F: 1968 (0x07B0) coils is the limit. Build the header only — the
-    // limit check must fire before anything reads the (absent) data bytes.
-    var req: [16]u8 = .{ 0x0F, 0x00, 0x00, 0x07, 0xB1, 0xF6 } ++ [_]u8{0} ** 10;
-    try expectException(try server.handlePdu(req[0..6], &out), 0x0F, .illegal_data_value);
+    // FC 0F: 1968 (0x07B0) coils is the limit; probe one over.
+    {
+        const qty: u16 = mb.limits.max_write_bits + 1;
+        const byte_count = mb.bitByteCount(qty);
+        var req: [1 + 5 + 247]u8 = undefined;
+        try testing.expectEqual(@as(usize, 247), byte_count); // pin the shape
+        req[0] = 0x0F;
+        std.mem.writeInt(u16, req[1..3], 0, .big);
+        std.mem.writeInt(u16, req[3..5], qty, .big);
+        req[5] = @intCast(byte_count);
+        @memset(req[6..], 0);
+        try expectException(try server.handlePdu(&req, &out), 0x0F, .illegal_data_value);
+    }
 
-    // FC 10: 123 (0x7B) registers is the limit.
-    req = .{ 0x10, 0x00, 0x00, 0x00, 0x7C, 0xF8 } ++ [_]u8{0} ** 10;
-    try expectException(try server.handlePdu(req[0..6], &out), 0x10, .illegal_data_value);
+    // FC 10: 123 (0x7B) registers is the limit; probe one over.
+    {
+        const qty: u16 = mb.limits.max_write_registers + 1;
+        const byte_count = 2 * @as(usize, qty);
+        var req: [1 + 5 + 248]u8 = undefined;
+        try testing.expectEqual(@as(usize, 248), byte_count);
+        req[0] = 0x10;
+        std.mem.writeInt(u16, req[1..3], 0, .big);
+        std.mem.writeInt(u16, req[3..5], qty, .big);
+        req[5] = @intCast(byte_count);
+        @memset(req[6..], 0);
+        try expectException(try server.handlePdu(&req, &out), 0x10, .illegal_data_value);
+    }
 
-    // FC 17: 125 read / 121 write.
-    const rw_read_over = [_]u8{ 0x17, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00 };
-    try expectException(try server.handlePdu(&rw_read_over, &out), 0x17, .illegal_data_value);
-    const rw_write_over = [_]u8{ 0x17, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x7A, 0xF4 };
-    try expectException(try server.handlePdu(&rw_write_over, &out), 0x17, .illegal_data_value);
+    // FC 17: 125 read / 121 write are the limits — two probes, each
+    // well-formed apart from the one quantity it targets.
+    {
+        // Read quantity one over (126); write quantity valid (1).
+        const rq: u16 = mb.limits.max_rw_read_registers + 1;
+        const wq: u16 = 1;
+        const byte_count = 2 * @as(usize, wq);
+        var req: [1 + 9 + 2]u8 = undefined;
+        req[0] = 0x17;
+        std.mem.writeInt(u16, req[1..3], 0, .big);
+        std.mem.writeInt(u16, req[3..5], rq, .big);
+        std.mem.writeInt(u16, req[5..7], 0, .big);
+        std.mem.writeInt(u16, req[7..9], wq, .big);
+        req[9] = @intCast(byte_count);
+        @memset(req[10..], 0);
+        try expectException(try server.handlePdu(&req, &out), 0x17, .illegal_data_value);
+    }
+    {
+        // Write quantity one over (122); read quantity valid (1).
+        const rq: u16 = 1;
+        const wq: u16 = mb.limits.max_rw_write_registers + 1;
+        const byte_count = 2 * @as(usize, wq);
+        var req: [1 + 9 + 244]u8 = undefined;
+        req[0] = 0x17;
+        std.mem.writeInt(u16, req[1..3], 0, .big);
+        std.mem.writeInt(u16, req[3..5], rq, .big);
+        std.mem.writeInt(u16, req[5..7], 0, .big);
+        std.mem.writeInt(u16, req[7..9], wq, .big);
+        req[9] = @intCast(byte_count);
+        @memset(req[10..], 0);
+        try expectException(try server.handlePdu(&req, &out), 0x17, .illegal_data_value);
+    }
 }
 
 // ── hostile / malformed PDUs ────────────────────────────────────────────────
