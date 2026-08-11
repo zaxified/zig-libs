@@ -158,13 +158,54 @@ are constructed by machinery independent of the stub under test.
 ## Constant-time note (measured)
 
 `Element.scalarMul` is safe for a SECRET scalar, and that is measured
-rather than argued. A `ctgrind`-style run (the scalar marked
-`MAKE_MEM_UNDEFINED`, `valgrind --tool=memcheck`, ReleaseFast) reports
-**0 errors / 0 contexts** through `scalarMul`; re-introducing a
-variable-time `if (nibble != 0)` table lookup inside `ed448.Point.mul`
-makes the same run report 860, so the harness genuinely reaches the
-ladder. This module is *not* exposed to the defect that forced
-`ecvrf`'s `mulCt`: `std.crypto.ecc.Edwards25519.mul` ends in a
+rather than argued. Since 2026-08-11 the measurement is a **committed
+program**, not a number to take on faith:
+[`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
+`scripts/ctgrind.sh decaf448`. It marks the scalar
+`MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer cannot
+feed the ladder a defined register copy, and drives it through
+`Element.generator.scalarMul`.
+
+**Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64,
+ReleaseFast, 2026-08-11; `in-file` = memcheck CONTEXTS whose stack
+names a `decaf448` or `ed448` source):
+
+| `-fvalgrind` | scalar tainted | total contexts | in decaf448+ed448 | exit |
+|---|---|---|---|---|
+| yes | **yes** | 6 | **0** | 99 |
+| yes | no | 0 | 0 | 0 *(control)* |
+| **no** | yes | 0 | 0 | 0 *(trap)* |
+
+The three rows are the whole point. The **trap** row is what a
+ReleaseFast build without `-fvalgrind` reports —
+`std.valgrind.doClientRequest` returns early unless
+`builtin.valgrind_support`, which the release modes disable, so a
+"clean" run built without the switch measures nothing. The **control**
+row shows an untainted scalar reports 0 everywhere, so the counts are
+taint-caused. And the claim row's `total` is **non-zero** — those 6
+contexts are inside the harness's own (non-constant-time) hex
+formatter, which proves the taint travelled scalar → point → stdout, so
+the **0** means "no branch found in the ladder", not "the taint never
+arrived". The witness prints raw projective coordinates through
+`Fe.toBytes` rather than `Element.encode`, because `encode` runs
+`Fe.invert`, whose own validation branch is accounted for separately in
+`ed448`'s harness.
+
+Re-attribute the column yourself with
+`scripts/ctgrind.sh decaf448 --pattern 'ed448[.]zig'` (also **0**), or
+read the frames with `--stacks`.
+
+**Teeth, measured 2026-08-11.** Re-introducing a variable-time
+`if (nibble != 0) acc = acc.add(table[nibble]);` inside
+`ed448.Point.mul` moves this table from **6 total / 0 in-file** to
+**4 / 4, exit 99** — the harness genuinely reaches the ladder.
+Reverted; `cmp` against a pre-mutation copy confirmed byte-identical.
+*(An earlier note recorded this mutation as "report 860". That was the
+ERROR count, not the context count — the same run here reports 421
+errors from 4 contexts. The two units are not interchangeable.)*
+
+This module is *not* exposed to the defect that forced `ecvrf`'s move
+to `ct25519`: `std.crypto.ecc.Edwards25519.mul` ends in a
 `rejectIdentity` branch on a scalar-derived value, but `ed448`'s
 `Point.mul` — which is what decaf448 rides — has no such rejection and
 no error union at all.

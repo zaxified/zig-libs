@@ -195,6 +195,7 @@ harness_smoke() {
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     step "check-catalog" zig build check-catalog
     step "check-testonly" zig build check-testonly
+    step "check-ctgrind" zig build check-ctgrind
     run_modules "$plain $netns"
     graph_save
     summary
@@ -614,6 +615,11 @@ cmd_changed() {
     # and it is ~0.5s cold, ~0.15s warm, so gating would save nothing.
     step "check-testonly" zig build check-testonly
 
+    # Same reasoning as `check-testonly` above: ~0.1s warm, and the change
+    # signal that would gate it (editing a harness, or editing the module it
+    # measures) is exactly what a developer is doing when it matters.
+    step "check-ctgrind" zig build check-ctgrind
+
     if [[ -z "$closure" ]]; then
         graph_save
         summary
@@ -641,6 +647,18 @@ cmd_all() {
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     step "check-catalog" zig build check-catalog
     step "check-testonly" zig build check-testonly
+    # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
+    # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
+    # -- which needs valgrind -- is deliberately NOT in this gate. Left alone
+    # they would rot into unbuildable recipes the first time a module's API
+    # moved, and the SPEC.md tables they back would silently become claims
+    # nobody can re-take. This compiles them (semantic analysis only; the build
+    # system emits no binary because nothing asks for one) and runs no valgrind:
+    # ~0.1s warm. It is spelled out here rather than left to `zig build test`'s
+    # dependency on it, because this driver never runs `zig build test` -- it
+    # runs `test-<module>` per module, so anything hung off the aggregate step
+    # alone would never execute in the gate.
+    step "check-ctgrind" zig build check-ctgrind
     run_modules "$all_mods"
     graph_save
     summary

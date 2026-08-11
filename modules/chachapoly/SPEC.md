@@ -169,32 +169,61 @@ so that a deferred-carry bounds mistake panics instead of silently forging a
 tag; in `Debug` / `ReleaseSafe` the compiler turns each of those into an
 overflow branch on a secret-derived value.
 
-**The measurement, in full, so the claim is exactly as wide as the evidence**
-(valgrind/memcheck, `std.valgrind.memcheck.makeMemUndefined` over the 32-byte
-Poly1305 key, Zig 0.16, `lanes = 4`, i7-7920HQ, re-measured 2026-08-11; the code
-under test is `Poly1305.create` at 16/64/192/1024/8192 B plus a chunked
-`update`/`pad`/`update`/`final` stream):
+**The measurement, in full, so the claim is exactly as wide as the evidence.**
+Since 2026-08-11 it is a **committed program**, not numbers a reader has to take
+on faith: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
+[`../../scripts/ctgrind.sh`](../../scripts/ctgrind.sh). It marks the 32-byte
+Poly1305 key `MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer
+cannot keep a defined register copy, and drives it through `Poly1305.create` at
+16/64/192/1024/8192 B plus a chunked `update`/`pad`/`update`/`final` stream.
+Run it:
 
-| build | `-fvalgrind` | key tainted | contexts | of those, inside `poly1305.zig` |
-|---|---|---|---|---|
-| `ReleaseFast` | yes | yes | **3** | **0** |
-| `ReleaseSafe` | yes | yes | **280** | **275** |
-| `Debug`       | yes | yes | **294** | many |
-| `ReleaseFast` | yes | **no** — negative control | 0 | 0 |
-| `ReleaseSafe` | yes | **no** — negative control | 0 | 0 |
-| `ReleaseFast` | **no** | yes | 0 | 0 |
-| `ReleaseSafe` | **no** | yes | 0 | 0 |
+```sh
+scripts/ctgrind.sh chachapoly
+```
 
-Three things make the `ReleaseFast` zero mean something. First, the last two
-rows: **without `-fvalgrind` every run reads 0 regardless**, because
+Zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ), `lanes = 4`, 2026-08-11.
+`in-file` = memcheck error CONTEXTS whose stack names `poly1305.zig`, not error
+counts:
+
+| build | `-fvalgrind` | key tainted | contexts | of those, inside `poly1305.zig` | exit |
+|---|---|---|---|---|---|
+| `ReleaseFast` | yes | yes | **4** | **0** | 99 |
+| `ReleaseSafe` | yes | yes | **214** | **210** | 99 |
+| `Debug`       | yes | yes | **285** | **281** | 99 |
+| `ReleaseFast` | yes | **no** — negative control | 0 | 0 | 0 |
+| `ReleaseSafe` | yes | **no** — negative control | 0 | 0 | 0 |
+| `Debug`       | yes | **no** — negative control | 0 | 0 | 0 |
+| `ReleaseFast` | **no** | yes — trap | 0 | 0 | 0 |
+| `ReleaseSafe` | **no** | yes — trap | 0 | 0 | 0 |
+| `Debug`       | **no** | yes — trap | 0 | 0 | 0 |
+
+(An earlier hand-run of the same experiment recorded 3 / 280 / 294 across the
+first three rows. Same shape, same conclusion; the small differences are the
+committed harness's slightly different message set, and these are the numbers
+that can now be re-taken.)
+
+Three things make the `ReleaseFast` zero mean something. First, the trap rows:
+**without `-fvalgrind` every run reads 0 regardless**, because
 `std.valgrind.doClientRequest` returns early unless `builtin.valgrind_support`,
 which the release modes disable — a clean run built without the switch is a
 silent no-op, not a result. Second, the negative-control rows: untainted, every
 mode reports 0, so the counts above are taint-caused and not ambient noise.
-Third, the `ReleaseFast` count is **non-zero** — its 3 contexts are branches on
-the *tag*, raised inside the harness's own integer formatter, which is the proof
+Third, the `ReleaseFast` count is **non-zero** — its 4 contexts are branches on
+the *tag*, raised inside the harness's own hex formatter, which is the proof
 that taint travelled key → tag through the entire MAC and that the MAC left no
 branch behind on the way.
+
+**Teeth, measured 2026-08-11.** The `ReleaseSafe`/`Debug` rows are already a
+positive control no optimizer can delete — 210 and 281 contexts *inside*
+`poly1305.zig` prove the taint reaches the MAC's arithmetic. For the
+`ReleaseFast` row specifically, injecting a secret-dependent early return
+(`var z: u8 = 0; for (key) |b| z |= b; if (z == 0) { @memset(out, 0); return; }`
+at the top of `create` — the exact defect class) moves it from **4 total / 0
+in-file** to **5 / 1, exit 99**. This matters because the obvious cheap defect
+does *not* survive: an `if (key[0] > 128)` compiles to a branchless select at
+ReleaseFast and proves nothing. Reverted; `cmp` against a pre-mutation copy
+confirmed byte-identical.
 
 The `ReleaseSafe` innermost frames are precisely the checked operators: the five
 schoolbook rows of `mulRed`, the carry chain, `buildPowers`' power table and the

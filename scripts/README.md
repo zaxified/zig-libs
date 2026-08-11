@@ -204,6 +204,78 @@ read. Use them outside the driver; inside it the check is already running.
 `-Dtest-filter` compiles a subset on purpose, so the driver **skips** the check
 (loudly) rather than reporting a phantom shortfall.
 
+## Constant-time harnesses (ctgrind)
+
+`scripts/ctgrind.sh [module ...]` runs every committed
+`modules/<m>/src/ctgrind_harness.zig` under `valgrind --tool=memcheck` and
+prints a control table. A harness marks a secret `MAKE_MEM_UNDEFINED`, drives
+it through the code whose constant-time property that module's `SPEC.md`
+claims, and formats the result through a deliberately non-constant-time
+printer as a propagation witness.
+
+    scripts/ctgrind.sh                    # every module with a harness
+    scripts/ctgrind.sh ed448              # just this one
+    scripts/ctgrind.sh --stacks ecvrf     # …and dump each row's memcheck log
+    scripts/ctgrind.sh --pattern 'root[.]zig' ecvrf   # re-attribute the in-file column
+    scripts/ctgrind.sh --check            # compare against scripts/ctgrind-expected.tsv
+
+Needs `valgrind` on PATH. Not part of `zig build test`: a memcheck context
+count is valgrind's own verdict, not something a Zig test can assert on.
+
+**Every (mode, target) triple is three rows, never one.** The claim, an
+UNTAINTED negative control, and a build without `-fvalgrind`. The last one is
+not decoration: `std.valgrind.doClientRequest` opens with
+`if (!builtin.valgrind_support) return default;`, and the release optimize
+modes turn that flag off, so a ReleaseFast binary built **without the switch**
+is a silent no-op under valgrind and reports a clean `0 errors` whatever the
+code does. A ctgrind claim that does not state its **mode**, its **switch** and
+its **context count** is therefore unfalsifiable — indistinguishable from a
+measurement that never happened. Five modules carried exactly such a claim
+(one of them with a seven-row table) before these harnesses existed.
+
+The `--pattern` flag exists so that an attribution written in a `SPEC.md`
+("these three contexts are all in `encodeToCurve`", "none are in `ct25519`'s
+ladder") can be re-checked rather than believed.
+
+### What keeps them from rotting
+
+`zig build check-ctgrind` compiles every harness with `-fvalgrind`. It runs
+**no** valgrind, so the gate never depends on that tool being installed and
+never pays for a memcheck run. Semantic analysis only — the build system elides
+the binary because nothing asks for it — so a warm run is ~0.1 s. It catches
+the rot mode that actually happens: a harness that stops compiling because the
+module's API moved, leaving the `SPEC.md` table it backs as an unfalsifiable
+claim again. Verified by renaming a function the `ecvrf` harness calls: the
+step failed, exit 1.
+
+It is an **explicit `step` in all three of this driver's paths** (`all`,
+`changed`, and the harness smoke set), not only a dependency of
+`zig build test`. That distinction is the whole difference between a check and
+a decoration: this driver never runs `zig build test` — it runs `test-<module>`
+per module — so anything hung off the aggregate step alone would never execute
+in the gate. `-fvalgrind` is forced on for the check even though it emits
+nothing: the client-request bodies sit behind a comptime
+`builtin.valgrind_support` branch, so a check built without the switch would
+leave the taint calls unanalysed and would not notice a harness that had
+stopped compiling against them.
+
+`scripts/ctgrind.sh --check` catches the other direction — the code growing a
+secret-dependent branch. It asserts what the claims actually rest on, not the
+raw totals: every untainted control is 0, every no-`-fvalgrind` trap is 0, each
+claim row's in-file count matches `scripts/ctgrind-expected.tsv`, and each
+claim row's total is non-zero so a propagation witness demonstrably fired.
+Totals are deliberately *not* diffed — they include the harness's own hex
+formatter and std internals, so pinning them would go red on a compiler upgrade
+for a reason that says nothing about the module, and a check that reds for the
+wrong reason gets muted. Verified by re-introducing a variable-time
+`if (nibble != 0)` table lookup in `ed448`'s `Point.mul`: `--check` reported
+both affected rows and exited 1.
+
+**What neither catches:** nothing compares a `SPEC.md` table against
+`ctgrind-expected.tsv`, so prose and expectation can still drift apart if
+someone edits one and not the other; and `--check` needs valgrind and a human
+(or a lane that has it) to run it — it is not in the gate, by design.
+
 ## Standards citations
 
 `scripts/check-citations.py [module ...]` fetches the RFC/BIP/BOLT/W3C text

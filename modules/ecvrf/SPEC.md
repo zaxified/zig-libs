@@ -108,19 +108,65 @@ real — see "Implementation notes" below.
   `4L` and `5L`) and harmless for `k` (`validateKey` rejects a degenerate
   public key on the VERIFIER side, which is where that check belongs).
 
-  **Verified, not asserted** (`ctgrind`-style: the seed marked
-  `MAKE_MEM_UNDEFINED`, `valgrind --tool=memcheck` over `publicKey` +
-  `prove`, ReleaseFast): **11 errors / 10 contexts before, 4 / 3 after.**
-  Five of the ten "before" contexts are `pcMul16`'s rejection reached
-  from `publicKey`, `prove`'s `[x]B`, `[x]H`, `[k]B` and `[k]H`. The
-  three remaining "after" contexts are all inside `encodeToCurve`
-  (`Edwards25519.fromBytes`'s validity branch and its `rejectIdentity`
-  retry) and are branches on `Y`/`H`, not on a secret: re-running with
-  `Y` explicitly declassified — which is sound, `Y` is the published
-  public key and `H = encode_to_curve(PK_string, alpha)` is recomputed
-  by every verifier from public inputs — reports **0 errors / 0
-  contexts**. Their timing dependence on `alpha` is the separate,
-  RFC-acknowledged try-and-increment property documented below.
+  **Verified, not asserted**, and since 2026-08-11 by a **committed
+  program** rather than by numbers taken once by hand:
+  [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
+  `scripts/ctgrind.sh ecvrf`. It marks the 32-byte secret key
+  `MAKE_MEM_UNDEFINED`, forces a volatile reload, and drives it through
+  `publicKey` + `prove`.
+
+  **Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64,
+  ReleaseFast, 2026-08-11; `in-file` = memcheck CONTEXTS whose stack
+  names `ecvrf.zig`):
+
+  | `-fvalgrind` | sk tainted | total contexts | in `ecvrf.zig` | exit |
+  |---|---|---|---|---|
+  | yes | **yes** | 7 | **3** | 99 |
+  | yes | no | 0 | 0 | 0 *(control)* |
+  | **no** | yes | 0 | 0 | 0 *(trap)* |
+
+  **The number the dependency on `ct25519` is actually about is zero**:
+  `scripts/ctgrind.sh ecvrf --pattern 'ct25519|root[.]zig'` reports
+  **0** contexts in the constant-time ladder, for all nine secret-scalar
+  multiplications `publicKey`/`prove` perform. The remaining 4 of the 7
+  total are inside the harness's own non-constant-time hex formatter —
+  the propagation witness that makes that zero mean "no branch found"
+  rather than "the taint never arrived".
+
+  The three `ecvrf.zig` contexts are branches on `Y`/`H`, not on a
+  secret. `Y` is the published public key and
+  `H = encode_to_curve(PK_string, alpha)` is recomputed by every
+  verifier from public inputs; they show up at all only because this
+  harness taints `sk`, from which `Y` is derived, and memcheck has no
+  notion of "public function of a secret". Their timing dependence on
+  `alpha` is the separate, RFC-acknowledged try-and-increment property
+  documented below. Located exactly (`--stacks`):
+
+  - `ecvrf.zig:230` — `Edwards25519.fromBytes`'s validity branch inside
+    `encodeToCurve`'s try-and-increment loop;
+  - `ecvrf.zig:232` — that loop's `rejectIdentity() catch continue`;
+  - `ecvrf.zig:344` — `prove`'s own
+    `Edwards25519.fromBytes(h_string) catch unreachable`.
+
+  *(Corrected 2026-08-11: an earlier version of this bullet said all
+  three were "inside `encodeToCurve`". The third is in `prove` itself —
+  same conclusion, since it decodes the same public `H`, but the stated
+  location was wrong. It also claimed a re-run "with `Y` explicitly
+  declassified reports 0 errors / 0 contexts"; that run is not
+  reproducible from outside the module, because `prove` recomputes `Y`
+  internally from `sk`, so there is no seam at which a caller can
+  declassify it. The `--pattern` measurement above is what replaces it,
+  and it pins the stronger of the two claims.)*
+
+  **Teeth, measured 2026-08-11.** Re-creating the historical defect —
+  pointing `prove`'s three secret-scalar multiplications back at
+  `std.crypto.ecc.Edwards25519`'s ladder, whose trailing
+  `rejectIdentity` branches on a scalar-derived value — moves the table
+  from **7 total / 3 in `ecvrf.zig`** to **12 / 8**, with the
+  `edwards25519.zig` attribution going 2 → 7. That is the same shape as
+  the "before" figure this bullet used to quote from memory (11 errors /
+  10 contexts), and it is now reproducible. Reverted; `cmp` against a
+  pre-mutation copy confirmed byte-identical.
 
   What is still NOT hardened: the SHA-512 framing and byte copies around
   those calls, beyond what std's own primitives provide.

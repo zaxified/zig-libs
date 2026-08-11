@@ -520,7 +520,124 @@ pub fn build(b: *std.Build) void {
         .modules = dark_modules,
     };
     check_dark.dependOn(&check_dark_inner.step);
+
+    // ── Constant-time (ctgrind) harnesses ───────────────────────────────
+    //
+    // `zig build ctgrind` builds every `modules/<m>/src/ctgrind_harness.zig`
+    // into `<prefix>/ctgrind/ctgrind-<m>`; `scripts/ctgrind.sh` drives them
+    // under `valgrind --tool=memcheck` and prints the control table. They are
+    // NOT tests and are NOT run by `zig build test`: memcheck's context count
+    // is valgrind's own verdict, not something a Zig test can assert on.
+    //
+    // WHY THEY ARE COMPILED BY THE GATE ANYWAY (`check-ctgrind`, below). A
+    // harness that nothing builds decays into an unbuildable recipe the first
+    // time the module's API moves, and then the SPEC table it backs becomes
+    // exactly the unfalsifiable claim the harness was written to end. The gate
+    // therefore compiles them — cheap, needs no valgrind installed — while
+    // leaving the measurement itself out of the critical path.
+    //
+    // `-Dctgrind-valgrind=false` builds with `-fno-valgrind`. That is not a
+    // convenience: `std.valgrind.doClientRequest` opens with
+    // `if (!builtin.valgrind_support) return default;`, which the release
+    // optimize modes turn off, so a ReleaseFast binary built without the
+    // switch is a SILENT no-op under valgrind and reports a clean 0 whatever
+    // the code does. The driver builds both ways and prints the no-switch run
+    // as its own row, so that trap is a measurement rather than an
+    // unstated assumption.
+    const ctgrind_valgrind = b.option(
+        bool,
+        "ctgrind-valgrind",
+        "Build the ctgrind harnesses with -fvalgrind (default true; false reproduces the silent-no-op trap)",
+    ) orelse true;
+    const ctgrind_only = b.option(
+        []const []const u8,
+        "ctgrind-module",
+        "Limit `zig build ctgrind` to this module (repeatable; default: every harness)",
+    ) orelse &.{};
+
+    const ctgrind = b.step("ctgrind", "Build the constant-time harnesses into <prefix>/ctgrind/ (run them with scripts/ctgrind.sh)");
+    const check_ctgrind = b.step("check-ctgrind", "Compile every ctgrind harness — rot guard, runs no valgrind");
+    for (ctgrind_harnesses) |name| {
+        const src = b.path(b.fmt("modules/{s}/src/ctgrind_harness.zig", .{name}));
+        const deps = blk: {
+            for (module_list) |m| {
+                if (std.mem.eql(u8, m.name, name)) break :blk m.deps;
+            }
+            @panic("ctgrind_harnesses names a module that is not in module_list");
+        };
+
+        var selected = ctgrind_only.len == 0;
+        for (ctgrind_only) |want| {
+            if (std.mem.eql(u8, want, name)) selected = true;
+        }
+        if (selected) {
+            // The harness's root module compiles the module under test from
+            // its own sources (`@import("root.zig")`, a sibling path), so the
+            // code being measured is built at exactly the optimize mode the
+            // driver asked for. Only cross-module deps come from `mods`; none
+            // of the five modules involved is `heavy`, so there is no
+            // heavy_optimize substitution to reason about.
+            const hmod = b.createModule(.{
+                .root_source_file = src,
+                .target = target,
+                .optimize = optimize,
+                .valgrind = ctgrind_valgrind,
+                // Symbol names are how `scripts/ctgrind.sh` attributes a
+                // memcheck context to a file; a stripped binary reports
+                // `???` and the whole table becomes unreadable.
+                .strip = false,
+            });
+            for (deps) |dep| hmod.addImport(dep, mods.get(dep).?);
+            const exe = b.addExecutable(.{ .name = b.fmt("ctgrind-{s}", .{name}), .root_module = hmod });
+            const inst = b.addInstallArtifact(exe, .{
+                .dest_dir = .{ .override = .{ .custom = "ctgrind" } },
+            });
+            ctgrind.dependOn(&inst.step);
+        }
+
+        // The rot guard compiles at Debug (fastest) with `-fvalgrind` forced
+        // on, so the guard builds the same configuration the real run uses --
+        // a harness that compiles only with the switch off would otherwise
+        // pass the guard and fail the moment anyone ran it.
+        //
+        // It is NOT what makes the taint calls visible to the guard, and the
+        // tempting version of this comment ("the client-request bodies are
+        // behind a comptime `builtin.valgrind_support` check, so without the
+        // switch they go unanalysed") is wrong. `doClientRequest`'s guard is a
+        // runtime early return, so the call and its arguments are analysed
+        // either way. Measured 2026-08-11: a type error inside
+        // `makeMemUndefined`'s argument fails this step with `.valgrind = true`
+        // AND with `.valgrind = false`, both exit 1.
+        //
+        // `addExecutable`, not `addObject`: Zig analyses container-level
+        // decls lazily, and only an executable forces `main` -- and therefore
+        // everything the harness calls -- to be analysed at all. THAT is the
+        // load-bearing choice here.
+        const cmod = b.createModule(.{
+            .root_source_file = src,
+            .target = target,
+            .optimize = .Debug,
+            .valgrind = true,
+        });
+        for (deps) |dep| cmod.addImport(dep, mods.get(dep).?);
+        const cexe = b.addExecutable(.{ .name = b.fmt("check-ctgrind-{s}", .{name}), .root_module = cmod });
+        check_ctgrind.dependOn(&cexe.step);
+    }
+    test_step.dependOn(check_ctgrind);
 }
+
+/// Modules carrying a `src/ctgrind_harness.zig` — a standalone program that
+/// taints a secret with valgrind's `MAKE_MEM_UNDEFINED` client request and
+/// drives it through the code whose constant-time property that module's
+/// SPEC.md claims. Adding a row here is what puts the new harness into
+/// `zig build ctgrind` and into the `check-ctgrind` rot guard.
+const ctgrind_harnesses = [_][]const u8{
+    "chachapoly",
+    "ct25519",
+    "decaf448",
+    "ecvrf",
+    "ed448",
+};
 
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
 /// to parse Zig source. One line per module:

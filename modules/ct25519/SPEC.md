@@ -122,7 +122,7 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
 Reasoning is not the evidence here; the harness is, and — since 2026-08-11 —
 it is a **committed program**, not a code block a reader has to retype:
 [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
-[`../../scripts/ctgrind-ct25519.sh`](../../scripts/ctgrind-ct25519.sh). It
+[`../../scripts/ctgrind.sh`](../../scripts/ctgrind.sh). It
 marks a runtime (not comptime-folded) scalar uninitialised with valgrind's
 client request, forces a volatile reload so the optimizer cannot keep a
 defined register copy from before the taint, drives it through either
@@ -133,7 +133,7 @@ control), and finally prints the result through `std.debug.print`
 (deliberately not constant-time) as a propagation witness. Run it:
 
 ```sh
-scripts/ctgrind-ct25519.sh
+scripts/ctgrind.sh ct25519
 ```
 
 **Full control table**, ReleaseFast, zig 0.16.0, valgrind 3.26.0, x86_64,
@@ -214,7 +214,7 @@ rows in the table above rather than assumed.**
 
 **Teeth, re-verified 2026-08-11.** Injecting
 `var z: u8 = 0; for (s) |b| z |= b; if (z == 0) return identityElement;` at
-the top of `mul` and re-running `scripts/ctgrind-ct25519.sh` moves row 1 from
+the top of `mul` and re-running `scripts/ctgrind.sh ct25519` moves row 1 from
 `2 total / 0 in-file` to **`3 total / 1 in root.zig`, exit 99** — the harness
 catches the exact defect class the module exists to prevent. Reverted;
 `cmp` against a pre-mutation copy confirmed byte-identical, `git diff
@@ -224,6 +224,16 @@ catches the exact defect class the module exists to prevent. Reverted;
 run that reports nothing is indistinguishable from a ctgrind run that is not
 wired up — which is why the table above keeps both controls next to the
 claim instead of stating the claim alone.
+
+**What stops the harness rotting.** `zig build check-ctgrind` compiles it
+(with `-fvalgrind`, so the client-request bodies are actually analysed) and
+is part of `zig build test`; it runs no valgrind, so the gate neither needs
+that tool installed nor pays for a memcheck run. `scripts/ctgrind.sh --check`
+re-measures and compares against `scripts/ctgrind-expected.tsv`, asserting
+that every control and trap row is 0 and that this table's in-file counts are
+unchanged. Neither compares the prose above against either — see
+`scripts/README.md` § Constant-time harnesses for exactly what each does and
+does not catch.
 
 ### What the in-suite tests provably cannot catch
 
@@ -237,7 +247,7 @@ if (z == 0) return Edwards25519.identityElement;   // exactly the defect the mod
 ```
 
 into `mul` leaves `zig build test-ct25519` **green (exit 0)** — the output is
-byte-identical on every input — while `scripts/ctgrind-ct25519.sh` catches it
+byte-identical on every input — while `scripts/ctgrind.sh ct25519` catches it
 (**exit 99**, 1 context in `root.zig`, up from 0 — see "Teeth, re-verified
 2026-08-11" above for the exact command and revert). That asymmetry is the
 reason the harness is documented here rather than treated as optional:

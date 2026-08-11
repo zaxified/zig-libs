@@ -251,10 +251,17 @@ pub const Element = struct {
     /// and so cannot be handed a secret scalar without leaking whether it
     /// was zero, `Point.mul` returns a `Point` — no rejection, no error
     /// union, nothing for a caller to branch on. Confirmed by measurement,
-    /// not by reading: a ctgrind-style run with the scalar marked
-    /// `MAKE_MEM_UNDEFINED` reports 0 memcheck errors through this
-    /// function, and re-introducing a `if (nibble != 0)` table lookup in
-    /// `Point.mul` makes the same run report 860.
+    /// not by reading, and the measurement is a committed program:
+    /// `ctgrind_harness.zig` in this directory, run by
+    /// `../../../scripts/ctgrind.sh decaf448`. With the scalar marked
+    /// `MAKE_MEM_UNDEFINED` it reports **0 contexts** naming any
+    /// decaf448/ed448 source (out of 6 total, all inside the harness's own
+    /// non-constant-time formatter — the propagation witness that makes
+    /// the zero mean "no branch found" rather than "taint never
+    /// arrived"), against 0/0 for the untainted control and 0/0 for a
+    /// build without `-fvalgrind`. Re-introducing an `if (nibble != 0)`
+    /// table lookup in `Point.mul` moves it to 4 in-file, exit 99. See
+    /// `SPEC.md`'s "Constant-time note (measured)" for the full table.
     pub fn scalarMul(a: Element, s: scalar.CompressedScalar) Element {
         return .{ .p = Point.mul(a.p, scalar.toEd448(s)) };
     }

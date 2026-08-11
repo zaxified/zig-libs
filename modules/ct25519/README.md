@@ -50,7 +50,7 @@ as a std-independent property over the window seams.
 **The test suite is not the constant-time oracle.** A secret-dependent branch
 that changes no output byte passes every test here — demonstrated, not
 assumed. The property this module is named after is checked by a ctgrind-style
-valgrind run — `scripts/ctgrind-ct25519.sh` builds and runs it — and
+valgrind run — `scripts/ctgrind.sh ct25519` builds and runs it — and
 [SPEC.md](SPEC.md) carries the full control table, the two flags without
 which it silently reports a false clean, and the limits of the claim. Read it
 before trusting a green `zig build test-ct25519`.

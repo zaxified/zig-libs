@@ -107,26 +107,60 @@ for how each formerly-stubbed piece was built.
   secret path — the ladder's `z_2.invert() catch Fe.zero` — branches
   only on whether the PUBLIC input point has small order, never on
   scalar bits (see `ladder`'s comment). KATs cannot detect timing
-  side-channels — so this posture is now MEASURED, not merely
-  constructed: a `ctgrind`-style run (the seed marked
-  `MAKE_MEM_UNDEFINED`, `valgrind --tool=memcheck`, ReleaseFast) over
-  `KeyPair.create` + `sign` + `x448.scalarmult` reports **3 errors / 3
-  contexts**, and all three are the SAME line — `Fe.invert`'s
-  `if (a.isZero())` guard, reached from `Point.toBytes` (twice) and from
-  the X448 ladder's final `z_2.invert()`. Neither is a leak, and neither
-  may be removed: for `Point.toBytes` the operand is a projective `Z` on
-  a complete Edwards curve, so the branch outcome is invariantly
-  "nonzero" for every scalar; for the ladder it is the small-order case
-  above, fixed by the public input point. Both are genuine VALIDATIONS
+  side-channels — so this posture is MEASURED, not merely constructed,
+  and since 2026-08-11 the measurement is a **committed program** rather
+  than a number to take on faith:
+  [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
+  `scripts/ctgrind.sh ed448`. It marks the seed `MAKE_MEM_UNDEFINED`,
+  forces a volatile reload, and drives it through two targets. **Full
+  control table** (zig 0.16.0, valgrind 3.26.0, x86_64, ReleaseFast,
+  2026-08-11; `in-file` = memcheck CONTEXTS whose stack names an `ed448`
+  source):
+
+  | target | `-fvalgrind` | seed tainted | total contexts | in `ed448` src | exit |
+  |---|---|---|---|---|---|
+  | `full` (`KeyPair.create` + `sign` + `x448.scalarmult`) | yes | **yes** | 9 | **3** | 99 |
+  | `full` | yes | no | 0 | 0 | 0 *(control)* |
+  | `full` | **no** | yes | 0 | 0 | 0 *(trap)* |
+  | `ladder` (`Point.mul` + `Point.mulBasePoint`, no `toBytes`) | yes | **yes** | 12 | **0** | 99 |
+  | `ladder` | yes | no | 0 | 0 | 0 *(control)* |
+  | `ladder` | **no** | yes | 0 | 0 | 0 *(trap)* |
+
+  All three `full` contexts are the SAME line — `Fe.invert`'s
+  `if (a.isZero())` guard at `field.zig:473` — reached from
+  `Point.toBytes` (`ed448.zig:314`, once from `KeyPair.create` and once
+  from `signInternal`) and from the X448 ladder's final `z_2.invert()`
+  (`x448.zig:156`). Read them yourself with
+  `scripts/ctgrind.sh --stacks ed448` rather than trusting this
+  sentence. Neither is a leak, and neither may be removed: for
+  `Point.toBytes` the operand is a projective `Z` on a complete Edwards
+  curve, so the branch outcome is invariantly "nonzero" for every
+  scalar; for the ladder it is the small-order case above, fixed by the
+  public input point. Both are genuine VALIDATIONS
   (`error.NotInvertible` on zero), the opposite of the scalar-derived
   rejection `ecvrf` had to strip out of `std`'s `Edwards25519.mul` —
   which this module is not exposed to, since `Point.mul` has no
-  rejection and no error union. The ladders themselves, measured in
-  isolation (`Point.mul`, `Point.mulBasePoint`, and decaf448's
-  `Element.scalarMul` on top of them, with no `toBytes` downstream),
-  report **0 errors / 0 contexts**; re-introducing a variable-time
-  `if (nibble != 0)` table lookup in `Point.mul` makes the same run
-  report 860, so the harness does reach them.
+  rejection and no error union.
+
+  The non-zero `total` on both rows is the propagation witness: the
+  taint demonstrably reached the harness's (non-constant-time) hex
+  formatter, so `ladder`'s **0** means "no branch found", not "the taint
+  never arrived". `ladder` uses `Fe.toBytes` rather than
+  `Point.toBytes` precisely so the `Fe.invert` context above cannot
+  double as its own witness.
+
+  **Teeth, measured 2026-08-11.** Re-introducing a variable-time
+  `if (nibble != 0) acc = acc.add(table[nibble]);` in `Point.mul` moves
+  the `ladder` row from **12 total / 0 in-file** to **10 / 4** (and
+  `decaf448`'s own harness, which rides this ladder, from 6/0 to 4/4) —
+  the harness reaches the code it claims to. It does NOT move the `full`
+  row, which stays 3: `KeyPair.create`/`sign` use the fixed-base
+  `mulBasePoint` comb and X448 has its own ladder, so `Point.mul` is not
+  on that path at all. Reverted; `cmp` against a pre-mutation copy
+  confirmed byte-identical. *(An earlier note recorded this mutation as
+  "report 860" — that was the ERROR count, not the context count;
+  measured here as 421 errors from 4 contexts. Errors and contexts are
+  not interchangeable and the earlier phrasing mixed them.)*
 - **X448's `scalarmult` REJECTS non-canonical `u`** rather than silently
   masking the high bit the way RFC 7748 §5's own text permits
   ("implementations SHOULD mask the most significant bit in the final

@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "Constant-time
 //! check" section, as an actual committed program instead of a code block a
-//! reader has to retype. Run it through `scripts/ctgrind-ct25519.sh`, which
+//! reader has to retype. Run it through `../../../scripts/ctgrind.sh ct25519`, which
 //! builds every mode/switch/taint combination and prints the control table;
 //! that script's header has the exact commands. This file is deliberately
 //! NOT wired into `zig build test-ct25519` — memcheck's context count is

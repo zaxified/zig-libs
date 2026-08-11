@@ -98,7 +98,7 @@ order; `contextString = "OPRFV1-" ‖ I2OSP(mode,1) ‖ "-" ‖
   switch and counts stated** (the shape the previous sentence lacked, per
   `~/CML/20260808-zig-libs-audit/modules/ct25519.md`'s F6 to-do): the harness
   lives in `ct25519` (`modules/ct25519/src/ctgrind_harness.zig`, run by
-  `scripts/ctgrind-ct25519.sh`) since it is `ct25519`, not `voprf`, that
+  `scripts/ctgrind.sh ct25519`) since it is `ct25519`, not `voprf`, that
   performs the multiply, and all nine of the call sites named above reduce
   to `ct25519.mulRistrettoBase`/`mulRistretto`. At **ReleaseFast, built with
   `-fvalgrind`**, tainting the scalar (`MAKE_MEM_UNDEFINED`) and driving it

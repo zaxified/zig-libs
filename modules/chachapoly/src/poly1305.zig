@@ -90,26 +90,29 @@
 //! (see the deferred-carry section), and in `Debug`/`ReleaseSafe` the compiler
 //! turns each of those into an overflow branch on a secret-derived value. So
 //! the claim is mode-dependent, and the mode boundary is where it breaks —
-//! measured, not reasoned:
+//! measured, not reasoned, and re-measurable: `ctgrind_harness.zig` in this
+//! directory is the program, `../../../scripts/ctgrind.sh chachapoly` runs it.
 //!
 //! ```
 //!   build            -fvalgrind  key tainted   contexts   in poly1305.zig
-//!   ReleaseFast          yes         yes           3            0
-//!   ReleaseSafe          yes         yes         280          275
-//!   Debug                yes         yes         294          many
+//!   ReleaseFast          yes         yes           4            0
+//!   ReleaseSafe          yes         yes         214          210
+//!   Debug                yes         yes         285          281
 //!   ReleaseFast          yes         NO            0            0   (control)
 //!   ReleaseSafe          yes         NO            0            0   (control)
+//!   Debug                yes         NO            0            0   (control)
 //!   ReleaseFast          NO          yes           0            0   (trap)
 //!   ReleaseSafe          NO          yes           0            0   (trap)
+//!   Debug                NO          yes           0            0   (trap)
 //! ```
 //!
 //! (valgrind/memcheck, `makeMemUndefined` over the 32-byte key, `lanes = 4`,
-//! i7-7920HQ, 2026-08-11. The `ReleaseSafe` innermost frames are the schoolbook
-//! rows of `mulRed`, the carry chain, and `buildPowers`' power table — i.e.
-//! exactly the checked operators.)
+//! zig 0.16.0, valgrind 3.26.0, i7-7920HQ, 2026-08-11. The `ReleaseSafe`
+//! innermost frames are the schoolbook rows of `mulRed`, the carry chain, and
+//! `buildPowers`' power table — i.e. exactly the checked operators.)
 //!
-//! Read the two control rows before reading the `ReleaseFast` zero. Untainted,
-//! every mode reports 0, so the 3 `ReleaseFast` contexts are taint-caused —
+//! Read the control rows before reading the `ReleaseFast` zero. Untainted,
+//! every mode reports 0, so the 4 `ReleaseFast` contexts are taint-caused —
 //! they are branches on the *tag*, inside the harness's own formatter, which is
 //! what proves the taint travelled key → tag through the whole MAC and left no
 //! branch behind on the way. And **without `-fvalgrind` every row reads 0**:
