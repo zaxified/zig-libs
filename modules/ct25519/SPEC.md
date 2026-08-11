@@ -119,54 +119,111 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
 
 ### Constant-time check (ctgrind-style, valgrind memcheck)
 
-Reasoning is not the evidence here; the harness is. Mark the scalar
-uninitialised with valgrind's client request and let memcheck report every
-conditional jump whose outcome depends on it:
-
-```zig
-// ctgrind.zig — build alongside src/root.zig
-var s = Edwards25519.scalar.reduce64(runtime_wide_bytes); // NOT a constant
-mc.makeMemUndefined(&s);
-const sv: *volatile [32]u8 = &s;   // see the two traps below
-const sec: [32]u8 = sv.*;
-const a = ct.mul(p_runtime, sec);
-const b = ct.mulBase(sec);
-const c = ct.mulRistretto(p_r_runtime, sec);
-const d = ct.mulRistrettoBase(sec);
-```
+Reasoning is not the evidence here; the harness is, and — since 2026-08-11 —
+it is a **committed program**, not a code block a reader has to retype:
+[`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
+[`../../scripts/ctgrind-ct25519.sh`](../../scripts/ctgrind-ct25519.sh). It
+marks a runtime (not comptime-folded) scalar uninitialised with valgrind's
+client request, forces a volatile reload so the optimizer cannot keep a
+defined register copy from before the taint, drives it through either
+`mulRistrettoBase` (`--target ct25519`, what all of `voprf`'s secret-scalar
+call sites reduce to) or `std.crypto.ecc.Ristretto255.mul`
+(`--target std` — the function this module replaces, run as the negative
+control), and finally prints the result through `std.debug.print`
+(deliberately not constant-time) as a propagation witness. Run it:
 
 ```sh
-zig build-exe ctgrind.zig -OReleaseFast -fvalgrind    # BOTH flags are load-bearing
-valgrind -q --error-exitcode=9 ./ctgrind              # judge by the exit code
+scripts/ctgrind-ct25519.sh
 ```
 
-Result at 2026-08-10 (zig 0.16.0, valgrind 3.26.0, x86_64):
-**0 errors, exit 0.**
+**Full control table**, ReleaseFast, zig 0.16.0, valgrind 3.26.0, x86_64,
+2026-08-11 (`in-file` = memcheck error CONTEXTS, not error count, whose
+stack includes the named file — the number the "constant-time" claim is
+actually about; `total` includes the harness's own `std.debug.print`, which
+is not constant-time by design — see "propagation witness" above):
 
-**Two traps that make this harness silently meaningless — check for them
-before believing a clean run.**
+| target | `-fvalgrind` | scalar tainted | total contexts | contexts in target's own code | exit |
+|---|---|---|---|---|---|
+| `ct25519` (`mulRistrettoBase`) | yes | **yes** | 2 | **0** in `root.zig` | 99 |
+| `ct25519` | yes | no | 0 | 0 | 0 *(control)* |
+| `ct25519` | **no** | yes | 0 | 0 | 0 *(trap)* |
+| `std` (`Ristretto255.mul`) | yes | **yes** | 3 | **1** in `edwards25519.zig` | 99 |
+| `std` | yes | no | 0 | 0 | 0 *(control)* |
+| `std` | **no** | yes | 0 | 0 | 0 *(trap)* |
 
-1. **`-fvalgrind` is mandatory outside Debug.** `std.valgrind.doClientRequest`
-   opens with `if (!builtin.valgrind_support) return default;`, and
-   `valgrind_support` is off by default in the release modes. Without the
-   flag every client request compiles to nothing and the harness reports
-   `0 errors` *unconditionally*. Measured: with a literal
-   `if (s[0] == 7) return identityElement;` injected into `mul`, ReleaseFast
-   without `-fvalgrind` reported **0 errors, exit 0**; with `-fvalgrind`,
-   **4 contexts at `mul`, exit 9**.
-2. **The volatile reload is mandatory.** Without it the optimizer keeps a
-   *defined* register copy of `s` from the hash that produced it and the
-   ladder never reads the memory that was marked — same false clean.
+Reading each row:
+
+- **Row 1 is the claim**, measured: tainting the scalar and driving it
+  through this module's own `mul` produces **zero** memcheck contexts
+  anywhere in `root.zig`. The 2 total contexts are both inside the harness's
+  `std.debug.print` (`Io.Writer.printHex`) — proof the taint reached the
+  *output*, so "zero in `root.zig`" means "no branch found", not "taint
+  never arrived here".
+- **Row 2 is the paired negative control** the first row is meaningless
+  without: with the identical binary and the identical code path, an
+  *untainted* scalar reports zero everywhere, including the print. If row 1
+  read 2/0 regardless of whether the scalar was tainted, that would mean the
+  print always trips memcheck for some unrelated reason — it does not.
+- **Row 3 is the trap**, reproduced deliberately: built *without*
+  `-fvalgrind`, `std.valgrind.doClientRequest`'s
+  `if (!builtin.valgrind_support) return default;` makes `MAKE_MEM_UNDEFINED`
+  silently do nothing, so even a genuinely tainted scalar reports 0/0 — a
+  clean run that measured nothing, not evidence of anything.
+- **Rows 4-6 are the actual point of the exercise**: the *same* harness, the
+  *same* tainted scalar, routed through `std.crypto.ecc.Ristretto255.mul`
+  instead — the function `ct25519` exists to replace. Row 4 reports a real
+  context **inside `edwards25519.zig`**, at exactly the line this module's
+  doc comments name: `pcMul16`'s `try q.rejectIdentity()`
+  (`edwards25519.zig:266`, `if (p.x.isZero()) return error.IdentityElement;`
+  in `rejectIdentity` itself). That the *same* harness, the *same* scalar,
+  the *same* build flags produce a real hit on std and none on this module
+  is what makes row 1's zero mean "this module removed the leak", not
+  "this harness cannot see leaks". Rows 5-6 are std's own paired control and
+  trap, included for symmetry — they read exactly like ct25519's.
+
+**Reproduce the claim row directly:**
+
+```sh
+scripts/capped zig build-exe modules/ct25519/src/ctgrind_harness.zig \
+    -OReleaseFast -fno-strip -fvalgrind -femit-bin=/tmp/ct25519_ctgrind
+valgrind --tool=memcheck --error-exitcode=99 /tmp/ct25519_ctgrind ct25519 yes
+```
+
+**Two traps that make this harness silently meaningless — both are now
+rows in the table above rather than assumed.**
+
+1. **`-fvalgrind` is mandatory outside Debug** (table rows 3, 6). Without it
+   every client request compiles to nothing and the harness reports
+   `0 errors` *unconditionally*, tainted or not.
+2. **The volatile reload is mandatory** (`reloadVolatile` in the harness).
+   Without it the optimizer can keep a *defined* register copy of the scalar
+   from the hash that produced it, and the ladder never reads the memory
+   that was marked — same false clean, and nothing in the table above would
+   catch it, since it looks identical to a genuinely clean run.
 3. Run it at **ReleaseFast**, not Debug or ReleaseSafe. There, Zig's own
    integer-overflow safety checks inside `std.crypto.25519.field`
    (`Fe.mul`/`sq`/`add`/`sub`/`_carry128`) are themselves conditional jumps
-   on the tainted limbs and flood the report (>1000 contexts). Their outcome
-   is invariant — the limbs are masked to 51 bits and cannot overflow — so
-   they are not a leak, but they bury the signal.
+   on the tainted limbs and flood the report. **Measured**: the identical
+   `ct25519`/tainted/`-fvalgrind` build at `-OReleaseSafe` reports
+   **89 956 errors from 1000 contexts** — 1000 being valgrind's own default
+   `--error-limit` cutoff ("More than 1000 different errors detected. I'm
+   not reporting any more."), i.e. the true count is capped, not exactly
+   1000. Their outcome is invariant — the limbs are masked to 51 bits and
+   cannot overflow — so they are not a leak, but they bury the signal
+   completely, which is why the claim above is stated for ReleaseFast only.
+
+**Teeth, re-verified 2026-08-11.** Injecting
+`var z: u8 = 0; for (s) |b| z |= b; if (z == 0) return identityElement;` at
+the top of `mul` and re-running `scripts/ctgrind-ct25519.sh` moves row 1 from
+`2 total / 0 in-file` to **`3 total / 1 in root.zig`, exit 99** — the harness
+catches the exact defect class the module exists to prevent. Reverted;
+`cmp` against a pre-mutation copy confirmed byte-identical, `git diff
+--stat` empty.
 
 **Always re-run the positive control after changing the harness.** A ctgrind
 run that reports nothing is indistinguishable from a ctgrind run that is not
-wired up.
+wired up — which is why the table above keeps both controls next to the
+claim instead of stating the claim alone.
 
 ### What the in-suite tests provably cannot catch
 
@@ -180,9 +237,10 @@ if (z == 0) return Edwards25519.identityElement;   // exactly the defect the mod
 ```
 
 into `mul` leaves `zig build test-ct25519` **green (exit 0)** — the output is
-byte-identical on every input — while the ctgrind harness above catches it
-(**exit 9**, 4 contexts at `mul`). That asymmetry is the reason the harness
-is documented here rather than treated as optional: **for this module the
-valgrind run is not a nicety, it is the only oracle for the property the
-module is named after.** Re-run it after any change to `mul`, `pcSelect` or
-`precompute`.
+byte-identical on every input — while `scripts/ctgrind-ct25519.sh` catches it
+(**exit 99**, 1 context in `root.zig`, up from 0 — see "Teeth, re-verified
+2026-08-11" above for the exact command and revert). That asymmetry is the
+reason the harness is documented here rather than treated as optional:
+**for this module the valgrind run is not a nicety, it is the only oracle
+for the property the module is named after.** Re-run it after any change to
+`mul`, `pcSelect` or `precompute`.

@@ -93,9 +93,26 @@ order; `contextString = "OPRFV1-" ‖ I2OSP(mode,1) ‖ "-" ‖
   claim survived an audit that graded the module `A6 const-time: PASS` on
   the same reasoning. `ct25519` is std's identical ladder with that tail
   removed: the neutral element is a value, there is no error union, and
-  no call site can branch on the scalar. Verified with a ctgrind-style
-  valgrind harness (`MAKE_MEM_UNDEFINED` over `skS`/`blind`/`r`), not by
-  re-reading the source.
+  no call site can branch on the scalar. Not verified by re-reading the
+  source — verified with a ctgrind-style valgrind/memcheck run, **mode,
+  switch and counts stated** (the shape the previous sentence lacked, per
+  `~/CML/20260808-zig-libs-audit/modules/ct25519.md`'s F6 to-do): the harness
+  lives in `ct25519` (`modules/ct25519/src/ctgrind_harness.zig`, run by
+  `scripts/ctgrind-ct25519.sh`) since it is `ct25519`, not `voprf`, that
+  performs the multiply, and all nine of the call sites named above reduce
+  to `ct25519.mulRistrettoBase`/`mulRistretto`. At **ReleaseFast, built with
+  `-fvalgrind`**, tainting the scalar (`MAKE_MEM_UNDEFINED`) and driving it
+  through `ct25519.mulRistrettoBase` reports **0 memcheck contexts in
+  `ct25519/src/root.zig`** (2 total, both inside the harness's own
+  `std.debug.print`, proving the taint reached the output rather than never
+  arriving). The paired negative control — the **same** harness, the
+  **same** tainted scalar, routed through `std.crypto.ecc.Ristretto255.mul`
+  instead — reports a real hit: **1 context in `edwards25519.zig`**, at
+  `pcMul16`'s `try q.rejectIdentity()` line, i.e. the exact branch this
+  paragraph describes. Without `-fvalgrind` both report 0/0 regardless of
+  taint — the documented no-op trap, reproduced rather than assumed. Full
+  control table (6 rows: tainted × untainted × with/without `-fvalgrind`,
+  for both `ct25519` and std): `ct25519/SPEC.md` §"Constant-time check".
 
   PUBLIC scalars stay on std's `mul` on purpose: `verifyProof`'s `s`/`c`
   are wire data, the composite `di` are hashes of wire elements, and
