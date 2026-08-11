@@ -704,7 +704,7 @@ pub fn Group(comptime S: type) type {
             var gi_reader = codec.Reader.init(gi_bytes);
             const group_info = try welcome_mod.GroupInfo.decode(arena, &gi_reader);
             if (!gi_reader.atEnd()) return error.Malformed;
-            if (group_info.group_context.cipher_suite != S.id) return error.CipherSuiteMismatch;
+            try checkGroupInfoVersionAndSuite(S, group_info.group_context);
 
             // ── §12.4.3.3's tree + §12.4.3.1's integrity block.
             var rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree);
@@ -823,6 +823,7 @@ pub fn Group(comptime S: type) type {
             };
             try welcome_mod.verifyTreeHash(S, gpa, &rt, group_info.group_context);
             try treekem.validateParentHashes(S, gpa, &rt);
+            try verifyEveryLeafSignature(S, gpa, &rt, group_info.group_context.group_id);
             const signer_key = try leafSignatureKey(&rt, group_info.signer);
             try group_info.verifySignature(S, gpa, signer_key);
             return rt;
@@ -1909,7 +1910,7 @@ pub fn Group(comptime S: type) type {
             if (!gi_reader.atEnd()) return error.Malformed;
             if (gi_msg != .group_info) return error.WrongContentType;
             const group_info = gi_msg.group_info;
-            if (group_info.group_context.cipher_suite != S.id) return error.CipherSuiteMismatch;
+            try checkGroupInfoVersionAndSuite(S, group_info.group_context);
 
             const rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree);
 
@@ -2952,6 +2953,77 @@ fn verifyLeafSignature(
     // why passing the wrong ones for a KeyPackage cannot mask a bad
     // signature.
     try leaf.verifySignature(S, gpa, group_id orelse "", leaf_index orelse 0);
+}
+
+/// RFC 9420 §12.4.3.1's first joiner bullet, BOTH halves: "Verify that the
+/// group's protocol version and cipher suite are ones this client
+/// supports". The cipher-suite half was always here; the version half was
+/// not, so a `GroupInfo` whose `GroupContext` declared some future version
+/// was joined and operated as MLS 1.0 — the decoder does not reject it
+/// either (`ProtocolVersion` is non-exhaustive on purpose: which versions
+/// are acceptable is a validation decision, and this is where it is made).
+///
+/// One function rather than two adjacent lines at each call site, because
+/// the two checks are one RFC bullet and the version half went missing
+/// exactly by being a line somebody had to remember to add next to the
+/// suite check.
+fn checkGroupInfoVersionAndSuite(comptime S: type, gc: keyschedule.GroupContext) !void {
+    if (gc.version != .mls10) return error.UnsupportedProtocolVersion;
+    if (gc.cipher_suite != S.id) return error.CipherSuiteMismatch;
+}
+
+/// RFC 9420 §12.4.3.1's third tree-integrity bullet: "Verify the signature
+/// on all the LeafNodes in the tree" — the one a joiner has to run over a
+/// ratchet tree it is HANDED, as opposed to one it built by processing
+/// Adds/Updates/Commits one at a time (where `verifyLeafSignature` already
+/// runs on every leaf as it arrives).
+///
+/// Without this, whoever builds the `Welcome` (or the `GroupInfo` behind an
+/// external Commit) picks the roster: `verifyTreeHash` only proves the tree
+/// hashes to the value the `GroupInfo` signature covers, and that signature
+/// is made by the welcomer itself, so a hostile welcomer can seat leaves
+/// carrying any `Credential` it likes next to a `signature_key` it holds.
+/// The tree hash then matches, the parent hashes match, the `GroupInfo`
+/// signature matches — and the joiner reports forged members to the
+/// application. Every leaf's own `LeafNodeTBS` signature is the only thing
+/// that binds a `Credential` to a key the claimed member actually has.
+///
+/// The scheme and the signed content are the leaf's own, not the group's:
+/// `VerifyWithLabel(leaf.signature_key, "LeafNodeTBS", LeafNodeTBS,
+/// leaf.signature)` under the ciphersuite's `S.Sig` (`tree.LeafNode
+/// .verifySignature`). `LeafNodeTBS` binds `group_id`/`leaf_index` only for
+/// `update`- and `commit`-sourced leaves (§7.2), so the tree's own leaf
+/// index is passed for every leaf and `key_package`-sourced leaves ignore
+/// it — which is why a leaf cannot be moved between positions or between
+/// groups once it is in one.
+///
+/// `leaf_node_source` is checked against the three §7.2 values rather than
+/// against one expected value (all three legitimately occur in a tree: an
+/// Add leaves `key_package`, an Update leaves `update`, a Commit's own leaf
+/// leaves `commit`). A reserved/unknown source is rejected outright,
+/// because `tbsEncode`'s `else` arm would sign it with no group binding at
+/// all — i.e. an unknown source would be an `update` leaf that forgot to
+/// bind its group.
+fn verifyEveryLeafSignature(
+    comptime S: type,
+    gpa: std.mem.Allocator,
+    t: *const tree.RatchetTree,
+    group_id: []const u8,
+) !void {
+    const n_leaves = t.nLeaves();
+    var i: u32 = 0;
+    while (i < n_leaves) : (i += 1) {
+        const node = t.nodes[@as(usize, i) * 2] orelse continue; // blank leaf
+        const leaf = switch (node) {
+            .leaf => |l| l,
+            .parent => return error.Malformed, // a parent node at a leaf index
+        };
+        switch (leaf.leaf_node_source) {
+            .key_package, .update, .commit => {},
+            else => return error.Malformed,
+        }
+        try leaf.verifySignature(S, gpa, group_id, i);
+    }
 }
 
 /// `tree.LeafNode` has `encodedLen`/`encode` but no allocating helper of
@@ -5553,4 +5625,265 @@ test "§8.4: PSKs resolve POSITIONALLY — out[i] is the resolution of ids[i] an
             .history = &history,
         }));
     }
+}
+
+// ── §12.4.3.1: the third tree-integrity bullet, on a HANDED tree ──────────
+
+test "§12.4.3.1: a joiner refuses a handed ratchet tree whose leaf signatures do not verify" {
+    // Regression for the "forged roster" defect: the joiner ran
+    // `verifyTreeHash`, `validateParentHashes` and the `GroupInfo`
+    // signature and then trusted every leaf. All three are computed and
+    // signed by the party that HANDS the tree over, so none of them says
+    // anything about who the other leaves belong to — only each leaf's own
+    // `LeafNodeTBS` signature binds a `Credential` to a key its owner
+    // actually holds.
+    //
+    // Alice is the attacker here: she publishes a `GroupInfo` for a group
+    // that really exists, but rewrites bob's leaf to claim a different
+    // identity, leaving bob's (now wrong) signature on it. She then
+    // recomputes the tree hash over her forgery and re-signs the whole
+    // `GroupInfo`, so the forgery is perfect everywhere except the one
+    // place she cannot forge.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 91);
+    const bob = try TestClient.init(aa, "bob", 92);
+    const dave = try TestClient.init(aa, "dave", 93);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "forged-roster",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try aa.dupe(u8, c.group_info);
+    };
+
+    // Non-vacuity: the honest `GroupInfo` this forgery is built from really
+    // does admit a stranger. Whatever the forged one is rejected for, it is
+    // not a broken fixture.
+    {
+        var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+            .io = io,
+            .group_info_msg = published_gi,
+            .key_package_msg = dave.kp_msg,
+            .signature_key_pair = dave.sig,
+        });
+        joined.group.deinit();
+        joined.messages.deinit(gpa);
+    }
+
+    var gi_reader = codec.Reader.init(published_gi);
+    const gi_msg = try framing.MLSMessage.decode(aa, &gi_reader);
+    try testing.expect(gi_reader.atEnd());
+    const gi = gi_msg.group_info;
+
+    // The forged tree. Bob's leaf keeps his signature_key, his
+    // encryption_key and his signature; only the identity the application
+    // will be shown changes, so his `LeafNodeTBS` signature no longer
+    // covers it.
+    //
+    // The forged leaf is seated under a BLANK parent, because §7.9.2's
+    // per-parent "exactly one descendant" check hashes the sibling
+    // subtree's TREE hash — a non-blank parent would therefore catch a
+    // rewritten leaf below it as a side effect, and this test would then
+    // pass without the leaf-signature check existing at all. A blank
+    // parent is not a contrivance: it is what an Add-only Commit (no
+    // `UpdatePath`) leaves behind, so this is the tree shape a real
+    // welcomer really can hand over.
+    var t = try gi.ratchetTree(aa);
+    var bob_leaf = t.nodes[2].?.leaf;
+    try testing.expectEqualSlices(u8, "bob", bob_leaf.credential.basic);
+    bob_leaf.credential = .{ .basic = "ceo@example.com" };
+    t.nodes[1] = null;
+    t.nodes[2] = .{ .leaf = bob_leaf };
+
+    // Recompute the two things a receiver checks over the tree itself...
+    const forged_tree_bytes = try t.encode(aa);
+    const forged_root = try treehash.rootHash(TestSuite, aa, &t);
+
+    const forged_exts = try aa.alloc(tree.Extension, gi.extensions.len);
+    var replaced_tree_ext = false;
+    for (gi.extensions, forged_exts) |src, *dst| {
+        dst.* = src;
+        if (src.extension_type == welcome_mod.extension_type_ratchet_tree) {
+            dst.extension_data = forged_tree_bytes;
+            replaced_tree_ext = true;
+        }
+    }
+    try testing.expect(replaced_tree_ext);
+
+    var forged_gc = gi.group_context;
+    forged_gc.tree_hash = &forged_root;
+    var forged: welcome_mod.GroupInfo = .{
+        .group_context = forged_gc,
+        .extensions = forged_exts,
+        .confirmation_tag = gi.confirmation_tag,
+        .signer = gi.signer,
+        .signature = &.{},
+    };
+    // ...and re-sign, as the attacker who owns the signer leaf can.
+    forged.signature = try aa.dupe(u8, &(try forged.sign(TestSuite, aa, alice.sig)).toBytes());
+
+    // The forgery really is perfect except for the leaf signature: every
+    // check that existed before this regression accepts it. Without this
+    // block the expectError below could be passing for the wrong reason.
+    {
+        var check_tree = try forged.ratchetTree(aa);
+        try welcome_mod.verifyTreeHash(TestSuite, gpa, &check_tree, forged.group_context);
+        try treekem.validateParentHashes(TestSuite, gpa, &check_tree);
+        const signer_key = try leafSignatureKey(&check_tree, forged.signer);
+        try forged.verifySignature(TestSuite, gpa, signer_key);
+        // And the leaf itself is exactly what the joiner must catch.
+        try testing.expectError(
+            error.SignatureVerificationFailed,
+            check_tree.nodes[2].?.leaf.verifySignature(TestSuite, gpa, forged.group_context.group_id, 1),
+        );
+    }
+
+    const forged_msg: framing.MLSMessage = .{ .group_info = forged };
+    const forged_bytes = try forged_msg.encodeAlloc(aa);
+
+    try testing.expectError(error.SignatureVerificationFailed, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = forged_bytes,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    }));
+}
+
+// ── §12.4.3.1 / §6: the protocol version is not decoration ────────────────
+
+test "§6: MLSMessage.decode refuses a version it does not implement" {
+    // Regression: the outer wire door read `ProtocolVersion` and threw it
+    // away, so bytes announcing any version at all were parsed as MLS 1.0.
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 94);
+
+    // Non-vacuity: unmodified, this exact buffer decodes.
+    {
+        var r = codec.Reader.init(alice.kp_msg);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        try testing.expect(r.atEnd());
+        try testing.expect(msg == .key_package);
+    }
+
+    // `MLSMessage`'s first field is `ProtocolVersion`, a uint16 — RFC 9420
+    // §6's struct order, and §17.1's Table 7 gives `mls10` the value 1.
+    try testing.expectEqual(@as(u8, 0), alice.kp_msg[0]);
+    try testing.expectEqual(@as(u8, 1), alice.kp_msg[1]);
+
+    for ([_]u16{ 0, 2, 0x0999, 0xffff }) |v| {
+        errdefer std.debug.print("version 0x{x:0>4}\n", .{v});
+        const forged = try aa.dupe(u8, alice.kp_msg);
+        std.mem.writeInt(u16, forged[0..2], v, .big);
+        var r = codec.Reader.init(forged);
+        try testing.expectError(error.UnsupportedProtocolVersion, framing.MLSMessage.decode(aa, &r));
+    }
+}
+
+test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version it does not implement" {
+    // Regression: `GroupContext.version` was decoded, stored, mixed into
+    // the key schedule — and never compared to anything, one line away
+    // from the cipher-suite check that WAS made. The field is inside the
+    // signed `GroupInfoTBS`, so the attacker here is the welcomer itself:
+    // it declares a version, re-signs, and the joiner used to operate the
+    // group as MLS 1.0 regardless.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 95);
+    const dave = try TestClient.init(aa, "dave", 96);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "wrong-version",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try aa.dupe(u8, c.group_info);
+    };
+
+    // Non-vacuity: the honest GroupInfo admits a stranger.
+    {
+        var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+            .io = io,
+            .group_info_msg = published_gi,
+            .key_package_msg = dave.kp_msg,
+            .signature_key_pair = dave.sig,
+        });
+        joined.group.deinit();
+        joined.messages.deinit(gpa);
+    }
+
+    var gi_reader = codec.Reader.init(published_gi);
+    const gi_msg = try framing.MLSMessage.decode(aa, &gi_reader);
+    try testing.expect(gi_reader.atEnd());
+    const gi = gi_msg.group_info;
+    try testing.expectEqual(keyschedule.ProtocolVersion.mls10, gi.group_context.version);
+
+    var forged_gc = gi.group_context;
+    forged_gc.version = @enumFromInt(0x0999);
+    var forged: welcome_mod.GroupInfo = .{
+        .group_context = forged_gc,
+        .extensions = gi.extensions,
+        .confirmation_tag = gi.confirmation_tag,
+        .signer = gi.signer,
+        .signature = &.{},
+    };
+    forged.signature = try aa.dupe(u8, &(try forged.sign(TestSuite, aa, alice.sig)).toBytes());
+
+    // Everything else about it is intact — the GroupInfo signature over the
+    // rewritten context verifies, so the rejection below is the version
+    // check and nothing else.
+    {
+        var check_tree = try forged.ratchetTree(aa);
+        try welcome_mod.verifyTreeHash(TestSuite, gpa, &check_tree, forged.group_context);
+        const signer_key = try leafSignatureKey(&check_tree, forged.signer);
+        try forged.verifySignature(TestSuite, gpa, signer_key);
+    }
+
+    const forged_msg: framing.MLSMessage = .{ .group_info = forged };
+    const forged_bytes = try forged_msg.encodeAlloc(aa);
+
+    try testing.expectError(error.UnsupportedProtocolVersion, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = forged_bytes,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    }));
 }

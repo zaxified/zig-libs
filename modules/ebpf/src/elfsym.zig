@@ -595,12 +595,13 @@ pub const Image = struct {
     }
 
     /// Decode symbol `n` of symbol-table section `i`.
+    ///
+    /// `n` is UNBOUNDED by contract: `object.zig`'s relocation walk passes
+    /// `rel.sym`, which is the high half of a raw `r_info` straight off the
+    /// wire, with no count check. See `entryOffset` for why that is safe.
     pub fn symbol(self: *const Image, i: usize, n: u32) ImageError!RawSymbol {
         const data = try self.sectionData(i);
-        const ent = self.entSize(i, SYM_SIZE);
-        if (ent < SYM_SIZE) return error.MalformedElf;
-        const at = @as(u64, n) * ent;
-        if (at + SYM_SIZE > data.len) return error.MalformedElf;
+        const at = try entryOffset(data.len, self.entSize(i, SYM_SIZE), n, SYM_SIZE);
         const r = data[@intCast(at)..][0..SYM_SIZE];
         return .{
             .index = n,
@@ -631,13 +632,11 @@ pub const Image = struct {
         return @intCast(data.len / ent);
     }
 
-    /// Decode relocation `n` of `SHT_REL` section `i`.
+    /// Decode relocation `n` of `SHT_REL` section `i`. `n` is unbounded by
+    /// contract, exactly as in `symbol` — same shape, same guard.
     pub fn relocation(self: *const Image, i: usize, n: u32) ImageError!Relocation {
         const data = try self.sectionData(i);
-        const ent = self.entSize(i, REL_SIZE);
-        if (ent < REL_SIZE) return error.MalformedElf;
-        const at = @as(u64, n) * ent;
-        if (at + REL_SIZE > data.len) return error.MalformedElf;
+        const at = try entryOffset(data.len, self.entSize(i, REL_SIZE), n, REL_SIZE);
         const r = data[@intCast(at)..][0..REL_SIZE];
         const info = rd(u64, r, rel_info);
         return .{
@@ -652,6 +651,41 @@ pub const Image = struct {
         return if (e == 0) dflt else e;
     }
 };
+
+/// Byte offset of entry `n` in a table of `len` bytes whose entries are
+/// `ent` bytes wide and whose decoded record needs `min` bytes — or
+/// `error.MalformedElf`.
+///
+/// **Why this is a function and not two lines in each accessor.** `symbol`
+/// and `relocation` used to carry an identical copy of
+///
+/// ```zig
+/// if (ent < min) return error.MalformedElf;
+/// const at = @as(u64, n) * ent;          // ① overflows
+/// if (at + min > data.len) return ...;   // ② also overflows
+/// ```
+///
+/// and both were wrong the same way. `ent` is the section header's raw
+/// `sh_entsize`, an unvalidated `u64` out of the file, bounded only from
+/// BELOW; `n` is an unvalidated `u32` off the wire at `symbol`'s one
+/// unbounded call site. `n * ent` overflows `u64`, and even with a
+/// checked multiply the `at + min` in ② overflows whenever `at` lands near
+/// `maxInt(u64)` — so a crafted `.o` PANICKED (`integer overflow`) where it
+/// had to return a typed error. Two byte-identical bugs is what a copied
+/// guard buys.
+///
+/// The repair does the whole check by DIVISION, so no product and no sum is
+/// ever formed that could wrap: bound `ent` from above by the table itself
+/// (`ent > len` is nonsense on its face), which also makes `len - min`
+/// non-negative since `len >= ent >= min`; then `n <= (len - min) / ent` is
+/// exactly `n * ent + min <= len`, decided without multiplying.
+fn entryOffset(len: usize, ent: u64, n: u32, min: usize) ImageError!u64 {
+    if (ent < min or ent > len) return error.MalformedElf;
+    if (n > (len - min) / ent) return error.MalformedElf;
+    const at = @as(u64, n) * ent; // < len by the line above; cannot wrap
+    std.debug.assert(at + min <= len);
+    return at;
+}
 
 /// `SHT_NOBITS` / `SHT_REL` / `SHT_STRTAB`, from std.
 const SHT_NOBITS: u32 = @intFromEnum(elf.SHT.NOBITS);
@@ -1057,23 +1091,86 @@ fn fuzzOpenImage(_: void, smith: *std.testing.Smith) !void {
     var image = openImage(gpa, mutant, false) catch return;
     defer image.deinit();
 
-    // Walk the deferred-validation accessors: every one of these must fail
-    // closed (a typed `ImageError`), never panic, even against a section
-    // table whose sh_offset/sh_size/sh_entsize the mutation above may have
-    // pushed out of range.
     if (image.sections.len > 0) {
-        const i = smith.index(image.sections.len);
-        _ = image.sectionName(i);
-        _ = image.sectionData(i) catch {};
-        if (image.symbolCount(i) catch null) |cnt| {
-            if (cnt > 0) _ = image.symbol(i, @intCast(smith.index(cnt))) catch {};
-        }
-        if (image.relocationCount(i) catch null) |rcnt| {
-            if (rcnt > 0) _ = image.relocation(i, @intCast(smith.index(rcnt))) catch {};
-        }
+        fuzzWalkAccessors(&image, smith.index(image.sections.len), smith.value(u32));
     }
     _ = image.symtabIndex();
     _ = image.findSection("license");
+}
+
+/// The accessor walk one fuzz iteration performs, factored out so the
+/// reachability test below drives the SAME calls the fuzzer makes rather
+/// than a look-alike. Every one of these must fail closed (a typed
+/// `ImageError`), never panic, against a section table whose
+/// `sh_offset`/`sh_size`/`sh_entsize` a mutation may have pushed anywhere.
+///
+/// **`n` is an UNBOUNDED `u32`, and that is the point.** This walk used to
+/// draw its index as `smith.index(symbolCount(i))` — i.e. always
+/// `n < data.len / ent`, which is precisely the constraint that makes
+/// `n * ent` unable to overflow. The harness therefore excluded, by
+/// construction, the one domain in which the accessors' index arithmetic
+/// could go wrong; the overflow panic that lived there was found by reading
+/// the code, not by this fuzzer, and `object.zig`'s relocation walk feeds
+/// exactly that domain (`rel.sym`, the high half of a raw `r_info`).
+/// The in-range case is kept too — reduced from the same draw so it costs
+/// no extra entropy — because the success path has to stay covered.
+fn fuzzWalkAccessors(image: *const Image, i: usize, n: u32) void {
+    _ = image.sectionName(i);
+    _ = image.sectionData(i) catch {};
+    _ = image.symbol(i, n) catch {};
+    _ = image.relocation(i, n) catch {};
+    if (image.symbolCount(i) catch null) |cnt| {
+        if (cnt > 0) _ = image.symbol(i, n % cnt) catch {};
+    }
+    if (image.relocationCount(i) catch null) |rcnt| {
+        if (rcnt > 0) _ = image.relocation(i, n % rcnt) catch {};
+    }
+}
+
+test "the elfsym fuzz harness reaches the unbounded entry-index domain (reachability)" {
+    // Guards the harness that guards the parser. The hostile shape is a
+    // `sh_entsize` the file format never bounds from above; combined with an
+    // index straight off the wire it is the arithmetic that used to panic.
+    const gpa = testing.allocator;
+    const seed = try SynthElf.build(gpa);
+    defer gpa.free(seed);
+
+    // Non-vacuity first, on the UNPATCHED image: the same walk over the
+    // synthetic symtab (section 2) really does reach working accessors and
+    // decode a symbol, so this test is not merely watching everything fail.
+    {
+        var ok_image = try openImage(gpa, seed, false);
+        defer ok_image.deinit();
+        try testing.expectEqual(@as(u32, 5), try ok_image.symbolCount(2));
+        const sym = try ok_image.symbol(2, 1);
+        try testing.expectEqualStrings("flat_fn", ok_image.symbolName(2, sym));
+        fuzzWalkAccessors(&ok_image, 2, std.math.maxInt(u32));
+    }
+
+    // `1 << 62` is chosen so that the product with any index above 3
+    // exceeds `maxInt(u64)` — the value the reject path must reach without
+    // ever forming that product.
+    const huge: u64 = 1 << 62;
+    SynthElf.wr(u64, seed, SynthElf.shdr_off + 2 * SHDR_SIZE + shdr_entsize, huge);
+    SynthElf.wr(u64, seed, SynthElf.shdr_off + 3 * SHDR_SIZE + shdr_entsize, huge);
+
+    var image = try openImage(gpa, seed, false);
+    defer image.deinit();
+
+    // The exact call `object.zig:collectRelocations` makes — an index with
+    // no count check in front of it — on both accessors, because the two
+    // are byte-identical in shape and only one of them had a caller.
+    try testing.expectError(error.MalformedElf, image.symbol(2, std.math.maxInt(u32)));
+    try testing.expectError(error.MalformedElf, image.relocation(3, std.math.maxInt(u32)));
+    // And the boundary of the overflow itself: n = 4 is the smallest index
+    // whose product with `1 << 62` wraps.
+    try testing.expectError(error.MalformedElf, image.symbol(2, 4));
+    try testing.expectError(error.MalformedElf, image.relocation(3, 4));
+
+    // Finally the harness's own walk, with the same unbounded index, over
+    // both patched sections: it returns, which is the whole claim.
+    fuzzWalkAccessors(&image, 2, std.math.maxInt(u32));
+    fuzzWalkAccessors(&image, 3, std.math.maxInt(u32));
 }
 
 /// Write `bytes` to a private temp path and return the path (caller frees).
@@ -1236,6 +1333,84 @@ fn fileOffsetViaSections(gpa: std.mem.Allocator, path: []const u8, vaddr: u64) !
         return sh_off + (vaddr - sh_addr);
     }
     return null;
+}
+
+test "the elfsym size ceilings are the shipped literals, and each one rejects BEFORE it allocates" {
+    // These three are the only guards on allocations sized straight from
+    // the file: `max_sections` bounds `gpa.alloc(Section, shnum)` in the
+    // file-reading path (which, unlike `openImage`, has no "the table must
+    // fit in the file" cross-check), and `max_table_bytes` is the ONLY
+    // bound on `gpa.alloc(u8, strtab.sh_size)` — `sh_size` is never
+    // compared to the file length before that allocation.
+    //
+    // Written as decimal literals rather than as `1 << 16` / `64 << 20`,
+    // and never as `max_sections + 1`: a test phrased in terms of the
+    // constant re-asserts whatever the constant happens to be and stays
+    // green for any value at all.
+    try testing.expectEqual(@as(u64, 65536), max_sections); // 1 << 16
+    try testing.expectEqual(@as(u64, 4096), max_segments); // 1 << 12
+    try testing.expectEqual(@as(u64, 67108864), max_table_bytes); // 64 << 20
+
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // Every oversized *read* in this file already ends in
+    // `error.MalformedElf` (that is what `readExact` returns at EOF), so an
+    // error code alone cannot tell "the ceiling refused it" from "it was
+    // allowed through and died later". A budgeted allocator can: the whole
+    // resolve runs inside 1 MiB, so anything that gets PAST a ceiling and
+    // allocates from the file's own numbers comes back `OutOfMemory`
+    // instead. That is the discriminator below.
+    const budget = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(budget);
+
+    // Non-vacuity: an untouched image resolves inside that budget, so the
+    // two `MalformedElf`s below are the ceilings and not the budget.
+    {
+        const img = try SynthElf.build(testing.allocator);
+        defer testing.allocator.free(img);
+        const path = try writeTempFile(testing.allocator, "capok", img);
+        defer {
+            _ = linux.unlink(path.ptr);
+            testing.allocator.free(path);
+        }
+        var fba = std.heap.FixedBufferAllocator.init(budget);
+        const sym = try resolve(fba.allocator(), path, "flat_fn");
+        try testing.expectEqual(SynthElf.flat_vaddr, sym.vaddr);
+    }
+
+    // `max_sections`. `e_shnum == 0` is the gABI escape that moves the real
+    // count into section 0's `sh_size`, so the count is a full u64 and this
+    // ceiling is the only thing in its way. One past the shipped value.
+    {
+        const img = try SynthElf.build(testing.allocator);
+        defer testing.allocator.free(img);
+        SynthElf.wr(u16, img, ehdr_shnum, 0);
+        SynthElf.wr(u64, img, SynthElf.shdr_off + shdr_size, 65537);
+        const path = try writeTempFile(testing.allocator, "shcap", img);
+        defer {
+            _ = linux.unlink(path.ptr);
+            testing.allocator.free(path);
+        }
+        var fba = std.heap.FixedBufferAllocator.init(budget);
+        // With the ceiling: refused. Without it: 65537 `Section`s are
+        // allocated from a 1 MiB budget and the answer is `OutOfMemory`.
+        try testing.expectError(error.MalformedElf, resolve(fba.allocator(), path, "flat_fn"));
+    }
+
+    // `max_table_bytes`, same shape: the string table's `sh_size` is what
+    // sizes the allocation, and nothing has compared it to the file length.
+    {
+        const img = try SynthElf.build(testing.allocator);
+        defer testing.allocator.free(img);
+        SynthElf.wr(u64, img, SynthElf.shdr_off + 1 * SHDR_SIZE + shdr_size, 67108865);
+        const path = try writeTempFile(testing.allocator, "tblcap", img);
+        defer {
+            _ = linux.unlink(path.ptr);
+            testing.allocator.free(path);
+        }
+        var fba = std.heap.FixedBufferAllocator.init(budget);
+        try testing.expectError(error.MalformedElf, resolve(fba.allocator(), path, "flat_fn"));
+    }
 }
 
 test "real library: resolved offsets agree with an independent derivation" {

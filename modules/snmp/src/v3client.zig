@@ -28,14 +28,23 @@
 //!
 //! **Trust note.** The discovery Report is by construction unauthenticated, so
 //! its clock is *unverified*. This client therefore only adopts an
-//! unauthenticated clock while undiscovered. If it was spoofed, the very next
-//! authenticated request falls outside the engine's real window and the engine
-//! answers with an **authenticated** `usmStatsNotInTimeWindows` Report; that
-//! one is verified before its clock is latched, and the request is retried
-//! once. That is the RFC 3414 §3.2 self-correction, and it is why a
-//! v3 client needs no clock of its own — this module makes no time-of-day
-//! calls at all. `setEngineTime` / `advanceEngineTime` are there for callers
-//! that do keep a clock.
+//! unauthenticated clock while undiscovered. If it was spoofed LOW, the very
+//! next authenticated request falls outside the engine's real window and the
+//! engine answers with an **authenticated** `usmStatsNotInTimeWindows` Report;
+//! that one is verified and dated before its clock is latched forward, and the
+//! request is retried once. That is the RFC 3414 §3.2 self-correction, and it
+//! is why a v3 client needs no clock of its own — this module makes no
+//! time-of-day calls at all.
+//!
+//! The correction is deliberately one-way. Peer-driven clock updates go through
+//! `timewin.latch`, which only ever moves boots/time FORWARD, so no Report can
+//! lower `latestReceivedEngineTime` and re-open the replay window; and an
+//! authenticated Report about an engine we already hold is itself put through
+//! the ±150 s window before it is acted on, so a captured Report cannot be
+//! replayed into a clock rewind. The price is that a clock spoofed *ahead*
+//! during discovery cannot be walked back by a Report — that needs a fresh
+//! `discover`. `setEngineTime` / `advanceEngineTime` remain available for
+//! callers that keep a clock of their own.
 //!
 //! A Report is never returned as data: it becomes a typed `report.ReportError`.
 //!
@@ -61,6 +70,12 @@ const Transport = client_mod.Transport;
 
 /// Largest `snmpEngineID` (RFC 3411 SnmpEngineID is SIZE(5..32)).
 pub const max_engine_id_len = 32;
+
+/// Smallest `snmpEngineID` (RFC 3411 SnmpEngineID is SIZE(5..32)). Not a
+/// tuning knob: an engine ID shorter than 5 octets cannot carry the
+/// enterprise number the format is built around, so a peer offering one is
+/// not offering an `SnmpEngineID`.
+pub const min_engine_id_len = 5;
 
 /// Largest `msgUserName` (RFC 3414 §2.4 — SIZE(0..32)).
 pub const max_user_name_len = 32;
@@ -280,7 +295,7 @@ pub const V3Client = struct {
     /// user's localized keys for it. Use when the engineID/boots/time are
     /// already known (a cached peer, or a caller-driven discovery).
     pub fn seedEngine(c: *V3Client, engine_id: []const u8, boots: u32, time: u32) Error!void {
-        if (engine_id.len == 0 or engine_id.len > max_engine_id_len) return error.BadEngineId;
+        if (engine_id.len < min_engine_id_len or engine_id.len > max_engine_id_len) return error.BadEngineId;
         if (c.user.name.len > max_user_name_len) return error.BadUserName;
 
         @memcpy(c.engine.id_buf[0..engine_id.len], engine_id);
@@ -580,6 +595,40 @@ pub const V3Client = struct {
         // move state we already trust.
         if (scoped.pdu == .report) {
             const info = try report_mod.classify(scoped);
+
+            // RFC 3414 §2.2.3/§3.2: a Report carries the authoritative
+            // engine's boots/time like every other message, and is subject
+            // to the same ±150 s window. It used to be the one message this
+            // client never dated — and an authenticated Report's digest
+            // covers fixed bytes, so a captured one verifies forever. That
+            // made a replayed Report a clock-rewind primitive: it dropped
+            // `latestReceivedEngineTime` back to the captured value and
+            // re-opened the window around it for every authenticated
+            // datagram captured at the same time.
+            //
+            // Checked on a COPY of the clock, because the non-authoritative
+            // check latches before it decides (`timewin.checkTimeWindow`)
+            // and the real update belongs to the per-reason branches below,
+            // which need to know whether they moved anything (`acted`
+            // drives the one permitted retry).
+            //
+            // Only for a Report that is both authenticated and about the
+            // engine we already hold a clock for: an unauthenticated Report
+            // is already forbidden from moving trusted state, and a Report
+            // naming a DIFFERENT engine is discovery, where our cached
+            // clock belongs to somebody else and says nothing about its age.
+            if (authenticated and c.engine.discovered and
+                std.mem.eql(u8, params.engine_id, c.engine.id()))
+            {
+                var probe = c.engine.clock;
+                try timewin.checkTimeWindow(
+                    .non_authoritative,
+                    &probe,
+                    params.engine_boots,
+                    params.engine_time,
+                );
+            }
+
             var acted = false;
             switch (info.reason) {
                 .unknown_engine_ids => {
@@ -599,8 +648,23 @@ pub const V3Client = struct {
                     if (authenticated or !level.hasAuth()) {
                         if (!std.mem.eql(u8, params.engine_id, c.engine.id()))
                             return error.EngineIdMismatch;
-                        c.setEngineTime(params.engine_boots, params.engine_time);
-                        acted = true;
+                        // RFC 3414 §3.2's non-authoritative update rule is a
+                        // LATCH: adopt the larger boots, and at equal boots
+                        // the larger engineTime. This used to be
+                        // `setEngineTime`, i.e. `EngineTimeState.init` — a
+                        // hard overwrite that also discarded
+                        // `latestReceivedEngineTime`, so a Report could move
+                        // the anti-replay floor backwards. It cannot now:
+                        // `latch` returns false when the Report carries
+                        // nothing newer, and a Report that carries nothing
+                        // newer is not a resync, so `acted` stays false and
+                        // the Report becomes a typed error instead of a
+                        // retry.
+                        acted = timewin.latch(
+                            &c.engine.clock,
+                            params.engine_boots,
+                            params.engine_time,
+                        );
                     }
                 },
                 else => {},
@@ -1388,4 +1452,116 @@ test "too many oids -> TooManyOids without touching the transport" {
     var oids: [max_request_oids + 1]Oid = @splat(try Oid.parse("1.3.6.1"));
     try testing.expectError(error.TooManyOids, c.get(&oids));
     try testing.expectEqual(@as(usize, 0), agent.probes);
+}
+
+test "a replayed notInTimeWindows Report cannot rewind the anti-replay clock (RFC 3414 §2.2.3/§3.2)" {
+    // Regression. A Report used to be exempt from the ±150 s window
+    // entirely — `processReply` returned from the Report branch before ever
+    // reaching `checkTimeWindow` — and the `notInTimeWindows` branch then
+    // OVERWROTE the clock (`EngineTimeState.init`) instead of latching it
+    // forward. An authenticated Report's digest covers fixed bytes, so one
+    // captured genuine Report replays forever, and each replay dropped
+    // `latestReceivedEngineTime` back to the captured value, re-opening the
+    // window around it for every authenticated datagram captured with it.
+    const vals = try sysNameVarBinds();
+    const user: User = .{
+        .name = "rfcUser",
+        .level = .auth_no_priv,
+        .auth_protocol = .hmac_sha1,
+        .auth_password = "maplesyrup",
+    };
+    var agent: FakeAgent = .{ .user = user, .values = &vals, .time = 5000 };
+    var c = V3Client.init(agent.transport(), user, .{});
+    try c.discover();
+    _ = try c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
+    try testing.expectEqual(@as(u32, 5000), c.engine.clock.latest_received_engine_time);
+
+    // The replay: an authenticated `notInTimeWindows` Report carrying an
+    // engineTime from long before the floor. 4850 is 5000 − 150, spelled
+    // out rather than derived, so this test pins the window that was
+    // actually shipped.
+    agent.time = 100;
+    agent.force_report = .not_in_time_windows;
+    try testing.expectError(error.NotInTimeWindow, c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")}));
+    try testing.expectEqual(@as(u32, 5000), c.engine.clock.latest_received_engine_time);
+    try testing.expectEqual(@as(u32, 5000), c.engine.clock.engine_time);
+    try testing.expectEqual(@as(u32, 1), c.engine.clock.engine_boots);
+
+    // The same replay wearing the other recoverable reason. This is the
+    // shape the window check alone catches: an authenticated
+    // `unknownEngineIDs` Report about the engine we already hold goes to
+    // `seedEngine`, which re-seeds the clock unconditionally
+    // (`EngineTimeState.init`) — a hard rewind that no latch guards,
+    // because the branch does not go through one. Only dating the Report
+    // stops it.
+    agent.time = 100;
+    agent.force_report = .unknown_engine_ids;
+    try testing.expectError(error.NotInTimeWindow, c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")}));
+    try testing.expectEqual(@as(u32, 5000), c.engine.clock.latest_received_engine_time);
+    try testing.expectEqual(@as(u32, 5000), c.engine.clock.engine_time);
+
+    // The second half of the same defect, and the half the window check
+    // alone does NOT cover: a Report that is INSIDE the window but carries
+    // nothing newer. 4900 is only 100 s back, so it passes the ±150 s
+    // check — and an overwrite would still drop the floor from 4850 to
+    // 4750 and hand the attacker 150 s of replayable past per Report. RFC
+    // 3414 §3.2's non-authoritative update is a latch: nothing older is
+    // ever adopted, and a Report that moves nothing is not a resync, so it
+    // is a typed error rather than a retry.
+    agent.time = 4900;
+    agent.force_report = .not_in_time_windows;
+    try testing.expectError(error.NotInTimeWindow, c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")}));
+    try testing.expectEqual(@as(u32, 5000), c.engine.clock.latest_received_engine_time);
+    try testing.expectEqual(@as(u32, 5000), c.engine.clock.engine_time);
+
+    // Non-vacuity: a Report carrying something genuinely NEWER is still the
+    // RFC 3414 §3.2 self-correction it is supposed to be — clock latched,
+    // request retried, data returned.
+    agent.time = 9000;
+    agent.force_report = .not_in_time_windows;
+    const resp = try c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
+    var it = resp.varbinds.iterator();
+    try testing.expectEqualStrings("zig-libs", (try it.next()).?.value.octet_string);
+    try testing.expectEqual(@as(u32, 9000), c.engine.clock.latest_received_engine_time);
+}
+
+test "the three v3 client limits are the values RFC 3411/3414 fix, not whatever the constants say" {
+    // The boundary tests elsewhere in this file are written in terms of the
+    // constants (`max_engine_id_len + 1` and friends), so they verify the
+    // mechanism and stay green for any value. These are the values.
+    //
+    // Provenance:
+    //   * RFC 3411 `SnmpEngineID ::= TEXTUAL-CONVENTION … SIZE(5..32)`
+    //   * RFC 3414 §2.4 `msgUserName … SIZE(0..32)`
+    //   * `max_request_oids` is this stack's own send-side cap (one
+    //     `[32]VarBind` stack array per request, `client.zig:37`), not an
+    //     RFC number — pinned so a silent widening of the stack buffer is
+    //     a test failure rather than a bigger frame.
+    try testing.expectEqual(@as(usize, 5), min_engine_id_len);
+    try testing.expectEqual(@as(usize, 32), max_engine_id_len);
+    try testing.expectEqual(@as(usize, 32), max_user_name_len);
+    try testing.expectEqual(@as(usize, 32), max_request_oids);
+
+    // And the enforcement really is at those values — a 4-octet engine ID
+    // is refused, a 5-octet one accepted, a 32-octet one accepted, a
+    // 33-octet one refused. Every length below is a literal.
+    var agent: FakeAgent = .{ .user = .{ .name = "u" } };
+    const user: User = .{ .name = "u" }; // noAuthNoPriv: no passwords needed
+    var c = V3Client.init(agent.transport(), user, .{});
+    try testing.expectError(error.BadEngineId, c.seedEngine(&[_]u8{0} ** 4, 1, 1));
+    try c.seedEngine(&[_]u8{0} ** 5, 1, 1);
+    try c.seedEngine(&[_]u8{0} ** 32, 1, 1);
+    try testing.expectError(error.BadEngineId, c.seedEngine(&[_]u8{0} ** 33, 1, 1));
+
+    var c32 = V3Client.init(agent.transport(), .{ .name = &[_]u8{'x'} ** 32 }, .{});
+    try c32.seedEngine(&[_]u8{0} ** 5, 1, 1);
+    var c33 = V3Client.init(agent.transport(), .{ .name = &[_]u8{'x'} ** 33 }, .{});
+    try testing.expectError(error.BadUserName, c33.seedEngine(&[_]u8{0} ** 5, 1, 1));
+
+    // 32 OIDs go out; 33 are refused without touching the transport.
+    var oids: [33]Oid = @splat(try Oid.parse("1.3.6.1"));
+    var c2 = V3Client.init(agent.transport(), user, .{});
+    try c2.seedEngine(&usm.netsnmp_engine_id, 1, 1);
+    try testing.expectError(error.TooManyOids, c2.get(oids[0..33]));
+    try testing.expectEqual(@as(usize, 0), agent.served);
 }

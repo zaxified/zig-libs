@@ -94,7 +94,19 @@ pub const V3Message = struct {
     data: ScopedData,
 };
 
-pub const DecodeError = message.DecodeError || error{NotV3};
+pub const DecodeError = message.DecodeError || error{
+    /// The message did not announce `version = 3`.
+    NotV3,
+    /// RFC 3412 §7.2 step 5 / RFC 3414 §3.1: `msgFlags` had privFlag set
+    /// with authFlag clear — an unauthenticated message claiming to be
+    /// encrypted. `snmpInvalidMsgs`; the message is discarded here rather
+    /// than decrypted.
+    InvalidSecurityFlags,
+    /// `msgSecurityModel` named a security model this stack does not
+    /// implement. Only USM (RFC 3411 model 3) is implemented, and a message
+    /// naming another model must not be handed to USM anyway.
+    UnsupportedSecurityModel,
+};
 
 /// Decode an SNMPv3 message envelope. A non-v3 `msgVersion` is `error.NotV3`.
 /// The ScopedPDU is fully parsed when plaintext (privacy clear); when the
@@ -110,6 +122,22 @@ pub fn decode(bytes: []const u8) DecodeError!V3Message {
     if (try ber.parseInteger(try m.expect(ber.tag.integer)) != 3) return error.NotV3;
 
     const header = try decodeHeader(try m.expect(ber.tag.sequence));
+
+    // RFC 3412 §7.2 step 5: privFlag without authFlag is not a legal
+    // combination, and the message is discarded (`snmpInvalidMsgs`) BEFORE
+    // anything is done with it. Enforced at the envelope door rather than
+    // in the client, because "before any crypto runs" is the whole point:
+    // downstream, `msgData` being an encryptedPDU is what sends the bytes
+    // into the privacy layer under the real localized key, and that must
+    // not happen for a message nobody authenticated.
+    if (header.flags.priv and !header.flags.auth) return error.InvalidSecurityFlags;
+    // RFC 3411: `msgSecurityModel` selects the model that processes
+    // `msgSecurityParameters`. This stack implements USM only, so a message
+    // naming any other model is not one whose security parameters may be
+    // parsed as USM.
+
+    if (header.security_model != security_model_usm) return error.UnsupportedSecurityModel;
+
     const security_parameters = try m.expect(ber.tag.octet_string);
 
     const data_tlv = try m.any();
@@ -445,4 +473,64 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     _ = decode(buf[0..len]) catch return;
+}
+
+test "RFC 3412 §7.2 step 5: privFlag without authFlag is discarded before anything is decrypted" {
+    const vbs = try sampleTrapVarbinds();
+    var buf: [256]u8 = undefined;
+    const params: EncodeParams = .{
+        .msg_id = 7,
+        .flags = .{ .priv = true },
+        .security_parameters = "usm-blob",
+        .context_engine_id = "\x80\x00\x1f\x88\x80",
+        .pdu = .{ .type = .trap_v2, .request_id = 1, .varbinds = &vbs },
+    };
+    const dg = try encode(&buf, params);
+    try testing.expectError(error.InvalidSecurityFlags, decode(dg));
+
+    // Non-vacuity, and the exact bit that matters: the same datagram with
+    // authFlag ALSO set decodes. So the rejection is the illegal
+    // combination, not the privFlag and not this message shape.
+    var buf2: [256]u8 = undefined;
+    var both = params;
+    both.flags = .{ .priv = true, .auth = true };
+    const dg2 = try encode(&buf2, both);
+    const m = try decode(dg2);
+    try testing.expect(m.header.flags.priv and m.header.flags.auth);
+
+    // And the three legal combinations of the two bits all still decode.
+    for ([_]MsgFlags{
+        .{},
+        .{ .auth = true },
+        .{ .auth = true, .priv = true },
+    }) |f| {
+        errdefer std.debug.print("flags byte 0x{x:0>2}\n", .{f.toByte()});
+        var b: [256]u8 = undefined;
+        var p = params;
+        p.flags = f;
+        _ = try decode(try encode(&b, p));
+    }
+}
+
+test "RFC 3411: a message naming a security model other than USM is refused" {
+    const vbs = try sampleTrapVarbinds();
+    const params: EncodeParams = .{
+        .msg_id = 8,
+        .security_parameters = "usm-blob",
+        .context_engine_id = "\x80\x00\x1f\x88\x80",
+        .pdu = .{ .type = .trap_v2, .request_id = 1, .varbinds = &vbs },
+    };
+    // USM is model 3 (RFC 3411's `SnmpSecurityModel`: 1 = SNMPv1,
+    // 2 = SNMPv2c, 3 = USM). Written as a literal here so this pins the
+    // value and not the symbol.
+    try testing.expectEqual(@as(u32, 3), security_model_usm);
+    for ([_]u32{ 0, 1, 2, 4, 256 }) |model| {
+        errdefer std.debug.print("security model {d}\n", .{model});
+        var b: [256]u8 = undefined;
+        var p = params;
+        p.security_model = model;
+        try testing.expectError(error.UnsupportedSecurityModel, decode(try encode(&b, p)));
+    }
+    var b3: [256]u8 = undefined;
+    _ = try decode(try encode(&b3, params)); // model 3: fine
 }

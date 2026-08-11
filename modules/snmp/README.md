@@ -62,7 +62,16 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     this — see SPEC.md for what the guarantee covers and what it does not.
   - **Anti-replay** (`timewin`): the RFC 3414 §3.2 ±150 s window with
     per-engine boots/time state, in both the authoritative and
-    non-authoritative roles.
+    non-authoritative roles. **Report-PDUs are held to the same window** as
+    data (an authenticated Report about the engine we already hold a clock
+    for is dated before it is acted on), and the non-authoritative clock is
+    only ever LATCHED FORWARD — RFC 3414 §3.2's update rule: adopt the
+    larger boots, and at equal boots the larger `engineTime`. Nothing a peer
+    sends can move `latestReceivedEngineTime` backwards, so no Report can
+    lower the replay floor. The cost of that is stated plainly: a client
+    whose cached clock has been driven too far AHEAD (only reachable through
+    the unauthenticated discovery probe) cannot be walked back down by a
+    Report — it has to re-discover.
   - **Reports** (`report`): the Report-PDU is the engine's error channel, not
     data. Every RFC 3414 §5 `usmStats*` counter and RFC 3412 §5.2
     `snmpUnknown*` counter is classified into a typed `Reason`/error

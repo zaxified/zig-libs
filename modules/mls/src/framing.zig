@@ -1083,7 +1083,12 @@ pub const MLSMessage = union(enum) {
     }
 
     pub fn decode(allocator: std.mem.Allocator, r: *codec.Reader) !MLSMessage {
-        _ = try r.readEnum(keyschedule.ProtocolVersion);
+        // RFC 9420 §6: `MLSMessage.version` selects the rest of the
+        // structure, so a version this implementation does not know is not
+        // a message it can parse — reading the field and DISCARDING it
+        // means happily decoding `0x0999` bytes as if they were MLS 1.0.
+        // `mls10` is the only version RFC 9420 defines.
+        if (try r.readEnum(keyschedule.ProtocolVersion) != .mls10) return error.UnsupportedProtocolVersion;
         return switch (try r.readEnum(WireFormat)) {
             .mls_public_message => .{ .public_message = try PublicMessage.decode(allocator, r) },
             .mls_private_message => .{ .private_message = try PrivateMessage.decode(r) },
@@ -1400,7 +1405,74 @@ fn fuzzMlsMessageDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [2048]u8 = undefined;
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    var r = codec.Reader.init(buf[0..len]);
-    const msg = MLSMessage.decode(std.testing.allocator, &r) catch return;
-    msg.deinit(std.testing.allocator);
+    // Three iterations in four get a well-formed 4-byte header written over
+    // the front, because the two fields the decoder reads FIRST are the two
+    // it is strictest about: `ProtocolVersion` admits exactly one of 65 536
+    // values and `WireFormat` five of them. Left to chance, roughly one
+    // input in 13 000 would get past them, and the five sub-decoders this
+    // harness exists to cover would see essentially nothing. The remaining
+    // quarter is left untouched so the two rejections themselves stay
+    // fuzzed.
+    if (len >= 4 and smith.valueRangeAtMost(u8, 0, 3) != 0) {
+        std.mem.writeInt(u16, buf[0..2], @intFromEnum(keyschedule.ProtocolVersion.mls10), .big);
+        std.mem.writeInt(u16, buf[2..4], smith.valueRangeAtMost(u16, 1, 5), .big);
+    }
+    _ = fuzzDecodeOnce(std.testing.allocator, buf[0..len]) catch return;
+}
+
+/// The body of one fuzz iteration, named so the reachability test below can
+/// drive the SAME call the fuzzer makes rather than a look-alike. Returns
+/// the arm that was reached, which is what "reached" means here.
+fn fuzzDecodeOnce(allocator: std.mem.Allocator, bytes: []const u8) !WireFormat {
+    var r = codec.Reader.init(bytes);
+    const msg = try MLSMessage.decode(allocator, &r);
+    defer msg.deinit(allocator);
+    return msg.wireFormat();
+}
+
+test "the MLSMessage fuzz harness reaches all five sub-decoders (reachability)" {
+    // Guards the harness that guards the decoder: a fuzz harness whose
+    // inputs all die two fields in covers nothing, and passes silently
+    // while doing it. Everything below goes through `fuzzDecodeOnce`, the
+    // exact call `fuzzMlsMessageDecode` makes.
+    const a = testing.allocator;
+
+    // 1. The header the harness writes is accepted for every §17.2 wire
+    //    format: each one fails INSIDE its own sub-decoder (it runs out of
+    //    input) rather than at the version compare or the format switch.
+    //    `error.Malformed` here would mean the switch refused the arm.
+    for ([_]WireFormat{
+        .mls_public_message,
+        .mls_private_message,
+        .mls_welcome,
+        .mls_group_info,
+        .mls_key_package,
+    }) |wf| {
+        errdefer std.debug.print("wire format {t}\n", .{wf});
+        var header: [4]u8 = undefined;
+        std.mem.writeInt(u16, header[0..2], @intFromEnum(keyschedule.ProtocolVersion.mls10), .big);
+        std.mem.writeInt(u16, header[2..4], @intFromEnum(wf), .big);
+        try testing.expectError(error.BufferTooShort, fuzzDecodeOnce(a, &header));
+    }
+
+    // 2. And a complete message decodes all the way to a value through that
+    //    same call — proof the path ends in a decoder that can succeed, not
+    //    merely in one that can fail late.
+    const gi: welcome_mod.GroupInfo = .{
+        .group_context = .{
+            .version = .mls10,
+            .cipher_suite = @enumFromInt(1),
+            .group_id = "reach",
+            .epoch = 7,
+            .tree_hash = &[_]u8{0xAA} ** 32,
+            .confirmed_transcript_hash = &[_]u8{0xBB} ** 32,
+        },
+        .confirmation_tag = &[_]u8{0xCC} ** 32,
+        .signer = 0,
+        .signature = &[_]u8{0xDD} ** 64,
+    };
+    const msg: MLSMessage = .{ .group_info = gi };
+    const bytes = try msg.encodeAlloc(a);
+    defer a.free(bytes);
+    try testing.expectEqual(WireFormat.mls_group_info, try fuzzDecodeOnce(a, bytes));
 }

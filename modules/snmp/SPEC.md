@@ -80,19 +80,36 @@ USM is the security-sensitive part.
     if that matters. Consequence of getting it wrong: AES-CFB reuses the keystream outright
     (`C1 XOR C2 = P1 XOR P2`); DES-CBC reuses the IV, which leaks equality of ScopedPDU block
     prefixes — and SNMP ScopedPDU prefixes are highly structured.
+- **Illegal security flags.** `v3.decode` discards a message whose `msgFlags` has privFlag set with
+  authFlag clear (`error.InvalidSecurityFlags`, RFC 3412 §7.2 step 5 / RFC 3414 §3.1's
+  `snmpInvalidMsgs`), and one whose `msgSecurityModel` is not USM (`error.UnsupportedSecurityModel`,
+  RFC 3411 model 3). Both are enforced at the envelope door, i.e. **before** `msgData` can be handed
+  to the privacy layer under the real localized key — an unauthenticated "encrypted" message must
+  not be decrypted even as an oracle.
 - **Anti-replay window.** engineBoots/engineTime ±150 s check (§3.2), per-engine state, both roles.
+  The non-authoritative clock is a **latch**: `timewin.latch` adopts the larger boots and, at equal
+  boots, the larger `engineTime`. Every peer-driven update goes through it, so
+  `latestReceivedEngineTime` — the replay floor — never decreases while an engine identity is held.
+  The two paths that do NOT latch are both deliberate and both outside a peer's reach at that point:
+  `seedEngine` seeds a *new* engine identity from scratch (discovery, or a caller-supplied cached
+  peer), and `setEngineTime` / `advanceEngineTime` are the API for a caller that keeps its own clock.
 - **Report handling and trust.** A Report-PDU is never returned as data — it becomes a typed error.
   Trust rules in `V3Client.processReply`, in order: (1) a reply claiming `authFlag` must verify
-  before *anything* in it is read; (2) a Report may legitimately arrive **unauthenticated** — real
+  before *anything* in it is read; (2) an **authenticated** Report about the engine we already hold
+  a clock for is put through the §3.2 window like any other message, before any branch acts on it —
+  a Report is a datagram, its digest covers fixed bytes, and a captured one would otherwise replay
+  forever; (3) a Report may legitimately arrive **unauthenticated** — real
   agents (net-snmp included, see the `report_wrong_digest` golden) send `usmStatsWrongDigests` with
   `msgFlags = 0x00` — so Reports are exempt from the downgrade rule, but an unauthenticated Report
   may **not** move state we already trust: `unknownEngineIDs` re-seeds only while undiscovered or
   when authenticated, and `notInTimeWindows` moves the clock only when authenticated (otherwise an
-  off-path attacker could park the replay window anywhere); (3) only then is DATA held to the
+  off-path attacker could park the replay window anywhere); (4) only then is DATA held to the
   security level — an `authNoPriv`/`authPriv` request answered unauthenticated or unencrypted is
-  `error.SecurityLevelDowngrade`; (4) the engine ID must match the one our keys are localized to.
+  `error.SecurityLevelDowngrade`; (5) the engine ID must match the one our keys are localized to.
   A Report we could not act on is terminal immediately; only an acted-on Report earns the single
-  retry, so a hostile peer cannot spin the client.
+  retry, so a hostile peer cannot spin the client. "Acted on" is now literal: the `notInTimeWindows`
+  branch calls `timewin.latch`, so a Report carrying nothing newer moves nothing, does not earn the
+  retry, and comes back as `error.NotInTimeWindow`.
 - **Discovery bootstrap.** The RFC 3414 §4 probe is unauthenticated by construction, so the engine
   ID *and clock* it yields are unverified. That is inherent to the handshake; the self-correction is
   that a spoofed clock makes the next authenticated request fall outside the engine's real window,
