@@ -79,12 +79,49 @@
 //! L ∈ {1,2,4,8} on every target, including ones where `lanes == 1` means the
 //! shipped MAC never runs it.
 //!
-//! ## Constant time
+//! ## Constant time — in `ReleaseFast`, and measurably NOT in `ReleaseSafe`
 //!
-//! Add / multiply / shift / mask only. No secret-dependent branch, no
-//! secret-indexed load; the final conditional subtraction of `2^130−5` is std's
-//! borrow-mask select, unchanged. The only branches added here are on message
-//! length and buffer occupancy, which are public.
+//! Add / multiply / shift / mask only. No secret-indexed load; the final
+//! conditional subtraction of `2^130−5` is std's borrow-mask select, unchanged.
+//! The only branches this code *writes* are on message length and buffer
+//! occupancy, which are public.
+//!
+//! But the arithmetic above is deliberately **checked** `*`/`+`, not `*%`/`+%`
+//! (see the deferred-carry section), and in `Debug`/`ReleaseSafe` the compiler
+//! turns each of those into an overflow branch on a secret-derived value. So
+//! the claim is mode-dependent, and the mode boundary is where it breaks —
+//! measured, not reasoned:
+//!
+//! ```
+//!   build            -fvalgrind  key tainted   contexts   in poly1305.zig
+//!   ReleaseFast          yes         yes           3            0
+//!   ReleaseSafe          yes         yes         280          275
+//!   Debug                yes         yes         294          many
+//!   ReleaseFast          yes         NO            0            0   (control)
+//!   ReleaseSafe          yes         NO            0            0   (control)
+//!   ReleaseFast          NO          yes           0            0   (trap)
+//!   ReleaseSafe          NO          yes           0            0   (trap)
+//! ```
+//!
+//! (valgrind/memcheck, `makeMemUndefined` over the 32-byte key, `lanes = 4`,
+//! i7-7920HQ, 2026-08-11. The `ReleaseSafe` innermost frames are the schoolbook
+//! rows of `mulRed`, the carry chain, and `buildPowers`' power table — i.e.
+//! exactly the checked operators.)
+//!
+//! Read the two control rows before reading the `ReleaseFast` zero. Untainted,
+//! every mode reports 0, so the 3 `ReleaseFast` contexts are taint-caused —
+//! they are branches on the *tag*, inside the harness's own formatter, which is
+//! what proves the taint travelled key → tag through the whole MAC and left no
+//! branch behind on the way. And **without `-fvalgrind` every row reads 0**:
+//! `std.valgrind.doClientRequest` returns early unless `builtin.valgrind_support`,
+//! which the release modes disable, so a clean run built without the switch is
+//! a no-op, not a result.
+//!
+//! The checked operators STAY. A deferred-carry bounds mistake that panics is
+//! strictly better than one that silently forges a tag, and the branches in
+//! question are never *taken* on correct input — what `ReleaseSafe` loses is
+//! the machine-checkable absence of the branch, not a demonstrated leak. The
+//! contract, therefore: **ship `ReleaseFast` if constant time matters.**
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -107,6 +144,38 @@ else
 
 /// True when `Poly1305` below is the vector implementation rather than std's.
 pub const simd_active = lanes > 1;
+
+// ── engine witness: the ONLY thing that can see a wrong `wide_min_groups` ────
+//
+// Every test in this file compares bytes, and both engines produce the same
+// bytes — the wide path exists to be *faster*, not different. So moving
+// `wide_min_groups` (or reversing its comparison) leaves every RFC 8439 vector,
+// every length-sweep differential against std and every fuzz case GREEN while
+// switching the lane-parallel MAC off entirely: measured, `wide_min_groups = 3
+// → 4096` cost the 8 KiB MAC 4048 → 1698 MB/s (2.47× → 1.06× vs std) and the
+// AEAD 1504 → 941, with `zig build test-chachapoly` still exit 0.
+//
+// `root.zig` already carries exactly this device for its two delegation
+// thresholds (`chacha_path` / `aead_path`); this is the same device for the
+// third threshold, which had none. Same rules as there: `is_test` is comptime,
+// so outside a test build `Witness` is `void`, `note` is a store to a
+// zero-sized value, nothing reaches the object file, and the module's
+// `.reentrant` claim is untouched because the mutable state only exists in a
+// single-threaded test binary. It is not runtime dispatch and non-test code
+// must never read it.
+
+/// Which engine the last `update` call used for its bulk.
+pub const Path = enum { serial_std, wide };
+
+const Witness = if (builtin.is_test) Path else void;
+const witness_init: Witness = if (builtin.is_test) .serial_std else {};
+
+/// Engine taken by the last `Generic(L).update` call, at any `L`.
+pub var mac_path: Witness = witness_init;
+
+inline fn note(p: Path) void {
+    if (builtin.is_test) mac_path = p;
+}
 
 /// The MAC this module's AEAD uses. API-identical to
 /// `std.crypto.onetimeauth.Poly1305` either way.
@@ -429,6 +498,7 @@ pub fn Generic(comptime L: usize) type {
             // branch — the short-packet case must not pay for the wide path's
             // bookkeeping.
             if (L == 1 or m.len + block_length < wide_min_bytes) {
+                note(.serial_std);
                 st.inner.update(m);
                 return;
             }
@@ -445,9 +515,12 @@ pub fn Generic(comptime L: usize) type {
 
             // 2. Long run of whole blocks → vector engine, whole groups only.
             if (L > 1 and st.inner.leftover == 0 and mb.len >= wide_min_bytes) {
+                note(.wide);
                 const groups = mb.len / (block_length * L);
                 st.wide(mb[0 .. groups * block_length * L]);
                 mb = mb[groups * block_length * L ..];
+            } else {
+                note(.serial_std);
             }
 
             // 3. The remainder (< L blocks, plus any trailing partial) is
@@ -778,6 +851,68 @@ test "pad() matches std's pad() across leftover states" {
 
             try testing.expectEqualSlices(u8, &tt, &ot);
         }
+    }
+}
+
+// THE ONLY TEST THAT CAN FAIL ON A WRONG `wide_min_groups`.
+//
+// The lane-parallel engine is byte-identical to the serial one by design, so
+// no differential, KAT, sweep or fuzz case in this file can tell whether it
+// ran. Without this test the threshold could be raised to 4096 groups — i.e.
+// the vector engine switched off at every size this module will ever see —
+// with `zig build test-chachapoly` still reporting exit 0 and every test
+// green, while the MAC quietly dropped from 2.47× std to 1.06×.
+//
+// The byte counts below are **literals**, deliberately. Written as
+// `wide_min_bytes - 1` / `wide_min_bytes` they would re-assert whatever the
+// constant happens to be and stay green for any value of it — which is the
+// exact defect this test exists to close, one level up.
+test "wide_min_groups routes each length to the engine it was measured for" {
+    // `wide_min_bytes = 16 · L · wide_min_groups`, so with the shipped
+    // `wide_min_groups = 3` the first length that reaches the vector engine is
+    // 48·L: 96 B at L=2, 192 B at L=4, 384 B at L=8. A single `update` of one
+    // byte less must stay entirely on std's serial core.
+    try testing.expectEqual(@as(usize, 3), Generic(4).wide_min_groups);
+    try testing.expectEqual(@as(usize, 96), Generic(2).wide_min_bytes);
+    try testing.expectEqual(@as(usize, 192), Generic(4).wide_min_bytes);
+    try testing.expectEqual(@as(usize, 384), Generic(8).wide_min_bytes);
+
+    const key = [_]u8{0x7C} ** 32;
+    var msg: [1024]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 97);
+    var tag: [16]u8 = undefined;
+    var ref: [16]u8 = undefined;
+
+    const Case = struct { L: usize, len: usize, want: Path, why: []const u8 };
+    inline for ([_]Case{
+        // L = 2 — threshold 96 bytes
+        .{ .L = 2, .len = 95, .want = .serial_std, .why = "one below" },
+        .{ .L = 2, .len = 96, .want = .wide, .why = "at the threshold" },
+        .{ .L = 2, .len = 512, .want = .wide, .why = "well past it" },
+        // L = 4 — threshold 192 bytes (the shipped width on any AVX2 host)
+        .{ .L = 4, .len = 32, .want = .serial_std, .why = "short packet" },
+        .{ .L = 4, .len = 191, .want = .serial_std, .why = "one below" },
+        .{ .L = 4, .len = 192, .want = .wide, .why = "at the threshold" },
+        .{ .L = 4, .len = 1024, .want = .wide, .why = "well past it" },
+        // L = 8 — threshold 384 bytes (the AVX-512 width)
+        .{ .L = 8, .len = 383, .want = .serial_std, .why = "one below" },
+        .{ .L = 8, .len = 384, .want = .wide, .why = "at the threshold" },
+        // L = 1 has no wide engine at all, at any length.
+        .{ .L = 1, .len = 1024, .want = .serial_std, .why = "no vector engine" },
+    }) |c| {
+        mac_path = .serial_std;
+        Generic(c.L).create(&tag, msg[0..c.len], &key);
+        testing.expectEqual(c.want, mac_path) catch |e| {
+            std.debug.print(
+                "L={d}: {d} B ({s}) routed to {s}\n",
+                .{ c.L, c.len, c.why, @tagName(mac_path) },
+            );
+            return e;
+        };
+        // The routing assertion above would also pass on a call that computed
+        // nothing, so pin the bytes too — against std, the independent oracle.
+        StdPoly.create(&ref, msg[0..c.len], &key);
+        try testing.expectEqualSlices(u8, &ref, &tag);
     }
 }
 

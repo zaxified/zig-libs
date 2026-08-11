@@ -157,6 +157,11 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
         );
     }
 
+    // Every session below is born at `bench_now_s` and every seal/open
+    // happens at the same instant: the session-age check (`REJECT_AFTER_TIME`)
+    // is measured, but no session expires mid-run.
+    const bench_now_s: u64 = 1_700_000_000;
+
     // ── the REAL data-plane path: `transport.SendSession.seal` /
     //    `RecvSession.open`, i.e. the AEAD plus everything the module wraps
     //    around it — the 16-byte header write, the copy-and-pad into the
@@ -165,10 +170,10 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
     //    in; the AEAD-only lines above are its lower bound. Still no socket
     //    and no routing table. ──
     {
-        var s = transport.SendSession.init(key, 0xDEADBEEF);
+        var s = transport.SendSession.init(key, 0xDEADBEEF, bench_now_s);
         var t0 = nowNs();
         for (0..iters) |_| {
-            const r = s.seal(&sealed_scratch, &packet) catch unreachable;
+            const r = s.seal(&sealed_scratch, &packet, bench_now_s) catch unreachable;
             std.mem.doNotOptimizeAway(r.len);
         }
         var dt = nowNs() - t0;
@@ -177,17 +182,17 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
         // Open needs distinct counters (a replay is rejected by design), so
         // pre-seal a small ring and reset the receiver once per lap. The
         // reset is a `.{}` assignment amortised over `ring_len` opens.
-        var ring_sender = transport.SendSession.init(key, 0xDEADBEEF);
-        for (&open_ring) |*slot| _ = ring_sender.seal(slot, &packet) catch unreachable;
+        var ring_sender = transport.SendSession.init(key, 0xDEADBEEF, bench_now_s);
+        for (&open_ring) |*slot| _ = ring_sender.seal(slot, &packet, bench_now_s) catch unreachable;
         const msg_len = transport.sealedLen(mtu);
 
-        var r = transport.RecvSession.init(key, 0xDEADBEEF);
+        var r = transport.RecvSession.init(key, 0xDEADBEEF, bench_now_s);
         t0 = nowNs();
         var done: usize = 0;
         while (done < iters) : (done += open_ring.len) {
             r.window.reset();
             for (&open_ring) |*slot| {
-                const o = r.open(&out_padded, slot[0..msg_len]) catch unreachable;
+                const o = r.open(&out_padded, slot[0..msg_len], bench_now_s) catch unreachable;
                 std.mem.doNotOptimizeAway(o.len);
             }
         }
@@ -218,9 +223,13 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
     //    derivation every AEAD call makes regardless of length. `chachapoly`
     //    now delegates short runs to std at two measured thresholds
     //    (`delegate_max_bytes` / `aead_delegate_max` in `chachapoly/root.zig`)
-    //    and no payload size loses: 1.00x up to 128 bytes because the code
-    //    that runs there IS std's, then 1.06x at 144 rising to 2.4x at a full
-    //    MTU. A row MATERIALLY below 1.00x here means a threshold moved —
+    //    and no payload size loses: ~1.0x up to 128 bytes because the code
+    //    that runs there IS std's, then ~1.1x at 144 rising to 2.4-2.5x at a
+    //    full MTU. (Re-measured 2026-08-11 over four runs: the delegated rows
+    //    span 0.87-1.13x run to run — that spread is this single-run timer on
+    //    identical machine code, not a threshold moving, which is exactly why
+    //    only a MATERIAL drop counts.)
+    //    A row MATERIALLY below 1.00x here means a threshold moved —
     //    material, because unlike `chachapoly`'s own sweep this one is a
     //    single timed run, so +/-2% on the delegated rows is timer noise on
     //    what is literally the same machine code both times. ──

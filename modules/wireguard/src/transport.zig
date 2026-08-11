@@ -50,10 +50,31 @@
 //! replay bitmap. Nothing branches on secret data — the counter, the receiver
 //! index and the message length are all cleartext header fields.
 //!
+//! **Session lifetime — what §6.1 says and who enforces which half.** §6.1
+//! bounds a session in two independent dimensions, messages *and* wall-clock
+//! time, and both are enforced here:
+//!
+//! * `REJECT_AFTER_MESSAGES` / `REKEY_AFTER_MESSAGES` — the counter half,
+//!   enforced by `seal`/`open` against the session counter.
+//! * `REJECT_AFTER_TIME` (180 s) / `REKEY_AFTER_TIME` (120 s) — the clock
+//!   half, enforced by `seal`/`open` against a **caller-supplied `now_s`**.
+//!   Every session records a `born_s` at `init` and every seal/open takes the
+//!   current time, exactly as the cookie layer's `CookieChecker.refresh` /
+//!   `PeerCookie.current` already do. This module reads no clock; it makes the
+//!   caller pass one, which is the only way a "you own the timers" contract
+//!   cannot be silently skipped.
+//!
+//! The three §6.1 constants NOT here are the ones that need a socket and a
+//! timer wheel rather than a session: `REKEY_TIMEOUT` (handshake retry
+//! backoff), `REKEY_ATTEMPT_TIME` (give-up deadline) and `KEEPALIVE_TIMEOUT`
+//! (when to emit a keepalive). They govern *scheduling* — when to send
+//! something — and this module never sends anything. They are the caller's,
+//! explicitly and by name.
+//!
 //! Provenance: clean-room from the WireGuard whitepaper (§5.4.6 and the
-//! constants in §6.1); the counter/replay behaviour follows the RFC 6479
-//! bitmap the reference implementations use. No source consulted or copied —
-//! see ../NOTICE.
+//! session-limit constants of §6.1 named above); the counter/replay behaviour
+//! follows the RFC 6479 bitmap the reference implementations use. No source
+//! consulted or copied — see ../NOTICE.
 
 const std = @import("std");
 const noise = @import("noise.zig");
@@ -99,12 +120,31 @@ pub const reject_after_messages: u64 = std.math.maxInt(u64) - (1 << 13);
 /// dropping a packet the peer will still accept.
 pub const rekey_after_messages: u64 = 1 << 60;
 
+/// `REJECT_AFTER_TIME` = 180 seconds. The wall-clock twin of
+/// `reject_after_messages`: past this age a session's keys must not be used in
+/// either direction, no matter how few packets went through it. Enforced by
+/// `seal`/`open` against the caller-supplied `now_s`, because a session whose
+/// lifetime is nobody's job is a session that lives forever.
+pub const reject_after_time_s: u64 = 180;
+
+/// `REKEY_AFTER_TIME` = 120 seconds. The wall-clock twin of
+/// `rekey_after_messages`: past this age a fresh handshake must be started,
+/// but the session keeps working until `reject_after_time_s`. Like its
+/// message-count sibling this is reported (`RekeyState.due`), not enforced.
+pub const rekey_after_time_s: u64 = 120;
+
 comptime {
     // Spelled out, so a refactor of the expression above cannot quietly move
     // the constants the whole nonce-safety argument rests on.
     std.debug.assert(reject_after_messages == 18446744073709543423); // 2^64-2^13-1
     std.debug.assert(rekey_after_messages == 1152921504606846976); // 2^60
     std.debug.assert(rekey_after_messages < reject_after_messages);
+    std.debug.assert(reject_after_time_s == 180);
+    std.debug.assert(rekey_after_time_s == 120);
+    // The rekey deadline must leave a usable margin before the hard reject, in
+    // both dimensions — otherwise "start a handshake" and "stop talking"
+    // coincide and there is no window to complete the handshake in.
+    std.debug.assert(rekey_after_time_s < reject_after_time_s);
 }
 
 /// Largest plaintext a transport-data message can carry. One WireGuard message
@@ -230,7 +270,16 @@ pub fn ReplayWindow(comptime bits: usize) type {
 
         /// Would `counter` be accepted right now? Read-only. A caller MUST
         /// still verify the AEAD tag before `commit`ing it.
+        ///
+        /// `maxInt(u64)` is rejected rather than tracked: the internal
+        /// representation is `counter + 1`, so that one value is
+        /// unrepresentable. `RecvSession.open` can never reach it (it refuses
+        /// at `reject_after_messages`, which is `maxInt(u64) - 8192`), but this
+        /// generic is public and a caller wiring its own demultiplexer must get
+        /// a `false`, not an integer-overflow panic, on an attacker-chosen
+        /// header field.
         pub fn accepts(self: *const Self, counter: u64) bool {
+            if (counter == std.math.maxInt(u64)) return false;
             const n = counter + 1;
             if (n > self.last) return true; // ahead of the window: fresh
             if (self.last - n > capacity) return false; // fell off the trailing edge
@@ -239,7 +288,13 @@ pub fn ReplayWindow(comptime bits: usize) type {
 
         /// Record `counter` as accepted, sliding the window forward if it is a
         /// new high. MUST only be called after the tag has verified.
+        ///
+        /// `maxInt(u64)` is ignored, for the same representation reason
+        /// `accepts` rejects it — reaching here with it means the caller
+        /// committed a counter `accepts` said no to, and dropping it is
+        /// strictly safer than wrapping the bitmap index.
         pub fn commit(self: *Self, counter: u64) void {
+            if (counter == std.math.maxInt(u64)) return;
             const n = counter + 1;
             if (n > self.last) {
                 const from = self.last >> 6;
@@ -274,18 +329,27 @@ pub fn ReplayWindow(comptime bits: usize) type {
 
 // ── seal / open ─────────────────────────────────────────────────────────────
 
-/// Whether a session has passed `rekey_after_messages` and must be replaced by
-/// a fresh handshake. Returned alongside every seal/open rather than acted on
-/// here: this module keeps no timers and owns no handshake scheduling, but a
-/// caller that ignores the signal must do so explicitly.
+/// Whether a session has passed `rekey_after_messages` **or**
+/// `rekey_after_time_s` and must be replaced by a fresh handshake. Returned
+/// alongside every seal/open rather than acted on here: this module owns no
+/// handshake scheduling and reads no clock, but a caller that ignores the
+/// signal must do so explicitly.
 pub const RekeyState = enum {
-    /// Below `rekey_after_messages` — keep using the session.
+    /// Below both rekey limits — keep using the session.
     ok,
-    /// At or past `rekey_after_messages` — start a new handshake. The session
-    /// keeps working until `reject_after_messages`, which is 2^60 packets of
-    /// margin; this is a deadline, not a failure.
+    /// At or past `rekey_after_messages` or `rekey_after_time_s` — start a new
+    /// handshake. The session keeps working until `reject_after_messages` /
+    /// `reject_after_time_s`; this is a deadline, not a failure.
     due,
 };
+
+/// Age of a session in whole seconds, from its `born_s` to the caller's
+/// `now_s`. Saturating: a `now_s` that moved backwards (a clock step, a
+/// caller mixing two time sources) yields 0 rather than wrapping to a
+/// gigantic age, so a bad clock can never make a fresh session look expired.
+fn ageSeconds(born_s: u64, now_s: u64) u64 {
+    return now_s -| born_s;
+}
 
 pub const SealResult = struct {
     /// Bytes written to `out` (`sealedLen(packet.len)`).
@@ -304,35 +368,63 @@ pub const SealError = error{
     /// wrapped — a wrapped counter reuses a nonce. Only a new handshake
     /// (a fresh key, counter back to 0) can continue.
     MessageLimitReached,
+    /// The session is `reject_after_time_s` (180 s) or more old, per the
+    /// caller-supplied `now_s`. Only a new handshake can continue.
+    SessionExpired,
 };
 
-/// Sender half of a session: one transport key, the peer's session index, and
-/// a monotonic counter. `single_owner` — one loop/thread owns it, no lock.
+/// Sender half of a session: one transport key, the peer's session index, a
+/// monotonic counter and the session's birth time. `single_owner` — one
+/// loop/thread owns it, no lock.
 pub const SendSession = struct {
     /// `T_send` from `Handshake.deriveTransportKeys`.
     key: [32]u8,
     /// The PEER's session index, which goes out as `receiver_index` on every
     /// packet we send them (it is *their* index, not ours).
     receiver_index: u32,
-    /// Next counter to use. Public for inspection and for tests that need to
-    /// sit at a boundary; the safe way to move it is `seal`.
+    /// When this session was keyed, on the caller's own clock — the base for
+    /// `reject_after_time_s` / `rekey_after_time_s`.
+    born_s: u64,
+    /// Next counter to use. **Read-only in production.** Rewinding it — to 0
+    /// or to any already-used value — re-emits `AEAD(key, counterNonce(n), …)`
+    /// under the same key: ChaCha20 keystream reuse *and* a forgeable Poly1305
+    /// key, i.e. exactly the catastrophe `reject_after_messages` exists to
+    /// prevent, reached by assignment instead of by wrapping. The only safe
+    /// way to move it forward is `seal`; the only sanctioned way to move it at
+    /// all is `seekUnsafeForTest`, whose name says what it costs.
     counter: u64 = 0,
 
-    pub fn init(key: [32]u8, receiver_index: u32) SendSession {
-        return .{ .key = key, .receiver_index = receiver_index };
+    pub fn init(key: [32]u8, receiver_index: u32, now_s: u64) SendSession {
+        return .{ .key = key, .receiver_index = receiver_index, .born_s = now_s };
+    }
+
+    /// Deterministic-test seam: place the counter at an arbitrary value so a
+    /// test can sit on a boundary (`reject_after_messages - 1`, a chosen nonce)
+    /// without sealing 2^60 packets to get there. **Never call this in
+    /// production** — moving the counter anywhere it has already been is
+    /// silent nonce reuse under a live key. Use `seal`, which is the only
+    /// operation that advances it safely.
+    pub fn seekUnsafeForTest(self: *SendSession, counter: u64) void {
+        self.counter = counter;
     }
 
     /// Seal one plaintext packet into `out` as a complete transport-data
     /// message. `out` must be at least `sealedLen(packet.len)` bytes and must
-    /// NOT overlap `packet`. Zero allocation; the padding and the AEAD are
-    /// done in place inside `out`.
-    pub fn seal(self: *SendSession, out: []u8, packet: []const u8) SealError!SealResult {
+    /// NOT overlap `packet`. `now_s` is the caller's current wall-clock time in
+    /// seconds, on the same clock `init` was given: it enforces
+    /// `REJECT_AFTER_TIME` and reports `REKEY_AFTER_TIME`. Zero allocation; the
+    /// padding and the AEAD are done in place inside `out`.
+    pub fn seal(self: *SendSession, out: []u8, packet: []const u8, now_s: u64) SealError!SealResult {
         if (packet.len > max_payload) return error.PacketTooLarge;
         const ct_len = paddedLen(packet.len);
         const need = overhead + ct_len;
         if (out.len < need) return error.BufferTooSmall;
         // Refuse rather than wrap: a wrapped counter repeats a nonce.
         if (self.counter >= reject_after_messages) return error.MessageLimitReached;
+        // The clock half of §6.1: a session older than REJECT_AFTER_TIME is
+        // dead regardless of how few packets it carried.
+        const age_s = ageSeconds(self.born_s, now_s);
+        if (age_s >= reject_after_time_s) return error.SessionExpired;
 
         const counter = self.counter;
         (Header{ .receiver_index = self.receiver_index, .counter = counter }).encode(out[0..header_len]);
@@ -353,12 +445,20 @@ pub const SendSession = struct {
         );
 
         self.counter = counter + 1;
-        return .{ .len = need, .counter = counter, .rekey = rekeyState(counter) };
+        return .{ .len = need, .counter = counter, .rekey = rekeyState(counter, age_s) };
     }
 
-    /// Whether the next `seal` would be past `rekey_after_messages`.
-    pub fn rekeyDue(self: *const SendSession) bool {
-        return self.counter >= rekey_after_messages;
+    /// Whether the next `seal` would be past `rekey_after_messages` or the
+    /// session is already past `rekey_after_time_s`.
+    pub fn rekeyDue(self: *const SendSession, now_s: u64) bool {
+        return rekeyState(self.counter, ageSeconds(self.born_s, now_s)) == .due;
+    }
+
+    /// Whether this session has passed `reject_after_time_s` and will refuse
+    /// every further `seal`. Exposed so a caller can retire it proactively
+    /// rather than discovering it on a dropped packet.
+    pub fn expired(self: *const SendSession, now_s: u64) bool {
+        return ageSeconds(self.born_s, now_s) >= reject_after_time_s;
     }
 
     /// Wipe the key material.
@@ -392,6 +492,9 @@ pub const OpenError = error{
     /// The counter is at or past `reject_after_messages`; no session may ever
     /// legitimately produce it.
     MessageLimitReached,
+    /// The session is `reject_after_time_s` (180 s) or more old, per the
+    /// caller-supplied `now_s`. Only a new handshake can continue.
+    SessionExpired,
     /// `out` is smaller than the message's padded plaintext.
     BufferTooSmall,
 } || std.crypto.errors.AuthenticationError;
@@ -409,29 +512,53 @@ pub const RecvSession = struct {
     /// this session (a device demultiplexes on it via `parseHeader` first;
     /// this check is the backstop).
     local_index: u32,
+    /// When this session was keyed, on the caller's own clock — the base for
+    /// `reject_after_time_s` / `rekey_after_time_s`.
+    born_s: u64,
     window: Window = .{},
 
-    pub fn init(key: [32]u8, local_index: u32) RecvSession {
-        return .{ .key = key, .local_index = local_index };
+    pub fn init(key: [32]u8, local_index: u32, now_s: u64) RecvSession {
+        return .{ .key = key, .local_index = local_index, .born_s = now_s };
     }
 
     /// Open one transport-data message into `out`, returning the padded
-    /// plaintext length. Order: parse + bounds-check → receiver check →
-    /// counter-limit check → replay PRE-check → AEAD verify+decrypt → commit
-    /// the counter. The window is committed only after authentication, so a
-    /// forged packet can never burn a legitimate counter's slot. On an
-    /// authentication failure `out[0..ct_len]` is zeroed — never garbage
-    /// plaintext; the checks before it never write to `out` at all. `out`
-    /// should not overlap `msg` (the zeroing would clobber the ciphertext).
+    /// plaintext length. `now_s` is the caller's current wall-clock time in
+    /// seconds, on the same clock `init` was given; a session at or past
+    /// `reject_after_time_s` refuses every message. Order: parse +
+    /// bounds-check → receiver check → counter-limit check → session-age check
+    /// → replay PRE-check → AEAD verify+decrypt → commit the counter. The
+    /// window is committed only after authentication, so a forged packet can
+    /// never burn a legitimate counter's slot. On an authentication failure
+    /// `out[0..ct_len]` is zeroed — never garbage plaintext; the checks before
+    /// it never write to `out` at all. `out` should not overlap `msg` (the
+    /// zeroing would clobber the ciphertext).
+    ///
+    /// **Deliberate divergence from the references, documented rather than
+    /// silent:** the replay window is consulted BEFORE the AEAD. The Linux
+    /// kernel (`wg_packet_decrypt` then `counter_validate`) and wireguard-go
+    /// (`RoutineDecryption` then `keypair.replayFilter.ValidateCounter`) both
+    /// authenticate first and only then consult the filter. The
+    /// security-critical half is identical either way — `commit` is strictly
+    /// post-authentication here too, so a forgery cannot burn a slot. What the
+    /// early return costs is an *unauthenticated* distinction: someone who can
+    /// guess `receiver_index` learns from the typed error whether a chosen
+    /// counter already sits in the receive window, without holding the key.
+    /// Over a socket both outcomes are a silent drop, so this is observable
+    /// only through a caller that logs or meters `error.Replayed` separately
+    /// from `error.AuthenticationFailed` — such a caller should merge the two.
+    /// The order is kept because it sheds a replayed flood without paying an
+    /// AEAD per packet, which is the cheap-DoS-shortcut the references forgo.
     ///
     /// The padded ciphertext length is NOT required to be a multiple of 16:
     /// every conforming sender pads, but the tag is the authority on what this
     /// peer actually sent, and rejecting an authentic packet for a framing
     /// nicety would be a rejection for the wrong reason.
-    pub fn open(self: *RecvSession, out: []u8, msg: []const u8) OpenError!OpenResult {
+    pub fn open(self: *RecvSession, out: []u8, msg: []const u8, now_s: u64) OpenError!OpenResult {
         const h = try parseHeader(msg);
         if (h.receiver_index != self.local_index) return error.WrongReceiver;
         if (h.counter >= reject_after_messages) return error.MessageLimitReached;
+        const age_s = ageSeconds(self.born_s, now_s);
+        if (age_s >= reject_after_time_s) return error.SessionExpired;
         const ct_len = msg.len - overhead;
         if (out.len < ct_len) return error.BufferTooSmall;
         if (!self.window.accepts(h.counter)) return error.Replayed;
@@ -449,13 +576,22 @@ pub const RecvSession = struct {
             return e;
         };
         self.window.commit(h.counter);
-        return .{ .len = ct_len, .counter = h.counter, .rekey = rekeyState(h.counter) };
+        return .{ .len = ct_len, .counter = h.counter, .rekey = rekeyState(h.counter, age_s) };
     }
 
-    /// Whether the highest counter seen is past `rekey_after_messages`.
-    pub fn rekeyDue(self: *const RecvSession) bool {
+    /// Whether the highest counter seen is past `rekey_after_messages`, or the
+    /// session is past `rekey_after_time_s`.
+    pub fn rekeyDue(self: *const RecvSession, now_s: u64) bool {
+        const age_s = ageSeconds(self.born_s, now_s);
+        if (age_s >= rekey_after_time_s) return true;
         const hi = self.window.highest() orelse return false;
         return hi >= rekey_after_messages;
+    }
+
+    /// Whether this session has passed `reject_after_time_s` and will refuse
+    /// every further `open`.
+    pub fn expired(self: *const RecvSession, now_s: u64) bool {
+        return ageSeconds(self.born_s, now_s) >= reject_after_time_s;
     }
 
     /// Wipe the key material.
@@ -465,8 +601,10 @@ pub const RecvSession = struct {
     }
 };
 
-fn rekeyState(counter: u64) RekeyState {
-    return if (counter >= rekey_after_messages) .due else .ok;
+fn rekeyState(counter: u64, age_s: u64) RekeyState {
+    if (counter >= rekey_after_messages) return .due;
+    if (age_s >= rekey_after_time_s) return .due;
+    return .ok;
 }
 
 /// Both halves of one keyed session. Built from the handshake's own
@@ -479,11 +617,20 @@ pub const Session = struct {
     send: SendSession,
     recv: RecvSession,
 
-    pub fn init(keys: TransportKeys, local_index: u32, remote_index: u32) Session {
+    /// `now_s` is the caller's clock at the moment the handshake completed; it
+    /// becomes both halves' `born_s` and is what `reject_after_time_s` /
+    /// `rekey_after_time_s` are measured from.
+    pub fn init(keys: TransportKeys, local_index: u32, remote_index: u32, now_s: u64) Session {
         return .{
-            .send = SendSession.init(keys.send, remote_index),
-            .recv = RecvSession.init(keys.recv, local_index),
+            .send = SendSession.init(keys.send, remote_index, now_s),
+            .recv = RecvSession.init(keys.recv, local_index, now_s),
         };
+    }
+
+    /// Whether the session has passed `reject_after_time_s` (both halves share
+    /// one `born_s`, so this is one question, not two).
+    pub fn expired(self: *const Session, now_s: u64) bool {
+        return self.send.expired(now_s);
     }
 
     pub fn wipe(self: *Session) void {
@@ -503,6 +650,12 @@ fn testKey(seed: u8) [32]u8 {
     return k;
 }
 
+/// A fixed "now" for every test that does not care about time. Sessions are
+/// born at `t0` and every seal/open happens at `t0`, i.e. at age 0 — well
+/// inside `reject_after_time_s`. The tests that DO care about time state their
+/// own literal offsets from it.
+const t0: u64 = 1_700_000_000;
+
 test "constants match the whitepaper" {
     try testing.expectEqual(@as(u32, 4), message_type);
     try testing.expectEqual(@as(usize, 16), header_len);
@@ -516,6 +669,91 @@ test "constants match the whitepaper" {
     try testing.expectEqual(std.math.maxInt(u64) - 8192, reject_after_messages);
     // The headroom below the u64 ceiling is exactly one replay window.
     try testing.expectEqual(@as(u64, default_window_bits), std.math.maxInt(u64) - reject_after_messages);
+    // §6.1's two SESSION-lifetime timers, as absolute seconds — the numbers a
+    // peer's own timers are set from, not expressions over each other.
+    try testing.expectEqual(@as(u64, 180), reject_after_time_s);
+    try testing.expectEqual(@as(u64, 120), rekey_after_time_s);
+}
+
+// ── the delivered values of the two limits that used to be blind ───────────
+//
+// F4/F5 of the 2026-08-11 re-audit: every test that touched `max_payload` or
+// `Window.capacity` was written IN TERMS OF the constant (`max_payload + 1`,
+// `highest - counter <= W.capacity`), so the oracle moved with the code and
+// either constant could be cut to a fraction of its documented value with the
+// suite green. These pin the DELIVERED numbers — the ones README and SPEC
+// quote — so the shrinking direction bites too.
+test "delivered limits: max_payload and the replay window widths are the documented numbers" {
+    // 65507 (max IPv4 UDP payload) − 32 (header+tag) = 65475, rounded down to a
+    // multiple of 16. Written as the absolute the docs promise, not as the
+    // expression that computes it.
+    try testing.expectEqual(@as(usize, 65472), max_payload);
+    try testing.expectEqual(@as(usize, 65504), sealedLen(max_payload));
+
+    // The default receive window: 8192 tracked bits, of which 8128 counters
+    // are usable (one 64-bit block of redundancy is what stops a still-valid
+    // counter aliasing a stale block).
+    try testing.expectEqual(@as(usize, 8192), default_window_bits);
+    try testing.expectEqual(@as(u64, 8128), RecvSession.Window.capacity);
+    // …and at the other widths the oracle test instantiates, so a `@min(…)`
+    // style cut that spares those widths still cannot hide.
+    try testing.expectEqual(@as(u64, 64), ReplayWindow(128).capacity);
+    try testing.expectEqual(@as(u64, 192), ReplayWindow(256).capacity);
+    try testing.expectEqual(@as(u64, 960), ReplayWindow(1024).capacity);
+    try testing.expectEqual(@as(u64, 4032), ReplayWindow(4096).capacity);
+}
+
+test "delivered limits: a 65472-byte payload really seals, and 65473 does not" {
+    // The pin above is arithmetic; this one is behaviour. The whole suite's
+    // next-largest payload is 1500 bytes, so without this a cut `max_payload`
+    // would silently refuse every packet between the new cap and a full
+    // datagram while `sealedLen` still looked right.
+    const key = testKey(30);
+    var s = SendSession.init(key, 0x4242, t0);
+    var r = RecvSession.init(key, 0x4242, t0);
+
+    const big = try testing.allocator.alloc(u8, 65473);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const wire = try testing.allocator.alloc(u8, 65504);
+    defer testing.allocator.free(wire);
+    const back = try testing.allocator.alloc(u8, 65504);
+    defer testing.allocator.free(back);
+
+    // 65472 bytes: accepted, and the sealed message is exactly 65504 bytes —
+    // one IPv4 UDP datagram, which is the bound the constant encodes.
+    const sr = try s.seal(wire, big[0..65472], t0);
+    try testing.expectEqual(@as(usize, 65504), sr.len);
+    const orr = try r.open(back, wire[0..sr.len], t0);
+    try testing.expectEqual(@as(usize, 65472), orr.len);
+    try testing.expectEqualSlices(u8, big[0..65472], back[0..65472]);
+
+    // One byte more: refused, and nothing consumed.
+    try testing.expectError(error.PacketTooLarge, s.seal(wire, big[0..65473], t0));
+    try testing.expectEqual(@as(u64, 1), s.counter);
+}
+
+test "delivered limits: the default window really reaches 8128 counters back" {
+    // Behavioural twin of the `capacity == 8128` pin, expressed in literals so
+    // a halved window drops these packets instead of moving the expectation.
+    const key = testKey(31);
+    var s = SendSession.init(key, 5, t0);
+    var r = RecvSession.init(key, 5, t0);
+
+    var high: [overhead + 16]u8 = undefined; // counter 10_000
+    s.seekUnsafeForTest(10_000);
+    _ = try s.seal(&high, "high", t0);
+    var edge: [overhead + 16]u8 = undefined; // counter 10_000 − 8128 = 1872
+    s.seekUnsafeForTest(1_872);
+    _ = try s.seal(&edge, "edge", t0);
+    var over: [overhead + 16]u8 = undefined; // counter 1871, one too far back
+    s.seekUnsafeForTest(1_871);
+    _ = try s.seal(&over, "over", t0);
+
+    var out: [64]u8 = undefined;
+    _ = try r.open(&out, &high, t0);
+    _ = try r.open(&out, &edge, t0); // 8128 behind: still inside
+    try testing.expectError(error.Replayed, r.open(&out, &over, t0)); // 8129: gone
 }
 
 // ── THE anchor test for the classic mistake ────────────────────────────────
@@ -575,13 +813,13 @@ test "padding: plaintext is zero-padded up to a multiple of 16, and 0 stays 0" {
         .{ .pt = 1419, .padded = 1424 },
         .{ .pt = 1420, .padded = 1424 },
     };
-    var s = SendSession.init(testKey(1), 0xAABBCCDD);
+    var s = SendSession.init(testKey(1), 0xAABBCCDD, t0);
     var buf: [2048]u8 = undefined;
     var pt: [1420]u8 = @splat(0x5A);
     for (cases) |c| {
         try testing.expectEqual(c.padded, paddedLen(c.pt));
         try testing.expectEqual(overhead + c.padded, sealedLen(c.pt));
-        const r = try s.seal(&buf, pt[0..c.pt]);
+        const r = try s.seal(&buf, pt[0..c.pt], t0);
         try testing.expectEqual(overhead + c.padded, r.len);
         // The ciphertext length on the wire is always a multiple of 16.
         try testing.expectEqual(@as(usize, 0), (r.len - overhead) % pad_multiple);
@@ -592,10 +830,10 @@ test "padding: plaintext is zero-padded up to a multiple of 16, and 0 stays 0" {
 }
 
 test "header: byte-exact layout, type 4 with zero reserved bytes" {
-    var s = SendSession.init(testKey(2), 0x11223344);
-    s.counter = 0x0102_0304_0506_0708;
+    var s = SendSession.init(testKey(2), 0x11223344, t0);
+    s.seekUnsafeForTest(0x0102_0304_0506_0708);
     var buf: [64]u8 = undefined;
-    const r = try s.seal(&buf, "hi");
+    const r = try s.seal(&buf, "hi", t0);
     try testing.expectEqualSlices(u8, &.{
         4, 0, 0, 0, // type = 4, three RESERVED ZERO bytes
         0x44, 0x33, 0x22, 0x11, // receiver_index, little-endian
@@ -640,9 +878,9 @@ test "differential: the sealed message is byte-identical to an independent rebui
 
     for (lens) |len| {
         for (cases) |c| {
-            var s = SendSession.init(key, idx);
-            s.counter = c.counter;
-            const r = try s.seal(&ours, payload[0..len]);
+            var s = SendSession.init(key, idx, t0);
+            s.seekUnsafeForTest(c.counter);
+            const r = try s.seal(&ours, payload[0..len], t0);
 
             // Independent rebuild: header written field by field, padding
             // written explicitly, std's AEAD, nonce from the literal table.
@@ -686,17 +924,17 @@ test "differential: the sealed message is byte-identical to an independent rebui
 test "round trip: a sealed packet opens under the matching receive session" {
     const keys = TransportKeys{ .send = testKey(4), .recv = testKey(5) };
     // A ↔ B: A's send key is B's receive key and vice versa.
-    var a = Session.init(keys, 0x0A0A0A0A, 0x0B0B0B0B);
-    var b = Session.init(.{ .send = keys.recv, .recv = keys.send }, 0x0B0B0B0B, 0x0A0A0A0A);
+    var a = Session.init(keys, 0x0A0A0A0A, 0x0B0B0B0B, t0);
+    var b = Session.init(.{ .send = keys.recv, .recv = keys.send }, 0x0B0B0B0B, 0x0A0A0A0A, t0);
 
     var wire: [2048]u8 = undefined;
     var out: [2048]u8 = undefined;
     const msg = "the quick brown fox jumps over the lazy dog";
     for (0..8) |i| {
-        const sr = try a.send.seal(&wire, msg);
+        const sr = try a.send.seal(&wire, msg, t0);
         try testing.expectEqual(@as(u64, i), sr.counter);
         try testing.expectEqual(RekeyState.ok, sr.rekey);
-        const orr = try b.recv.open(&out, wire[0..sr.len]);
+        const orr = try b.recv.open(&out, wire[0..sr.len], t0);
         try testing.expectEqual(@as(u64, i), orr.counter);
         try testing.expectEqual(paddedLen(msg.len), orr.len);
         try testing.expectEqualSlices(u8, msg, out[0..msg.len]);
@@ -704,21 +942,21 @@ test "round trip: a sealed packet opens under the matching receive session" {
         for (out[msg.len..orr.len]) |pad| try testing.expectEqual(@as(u8, 0), pad);
     }
     // …and the reverse direction, under the other key.
-    const sr = try b.send.seal(&wire, "reply");
-    const orr = try a.recv.open(&out, wire[0..sr.len]);
+    const sr = try b.send.seal(&wire, "reply", t0);
+    const orr = try a.recv.open(&out, wire[0..sr.len], t0);
     try testing.expectEqualSlices(u8, "reply", out[0..5]);
     try testing.expectEqual(@as(usize, 16), orr.len);
 }
 
 test "keepalive: an empty payload is a 32-byte message that opens to nothing" {
     const key = testKey(6);
-    var s = SendSession.init(key, 7);
-    var r = RecvSession.init(key, 7);
+    var s = SendSession.init(key, 7, t0);
+    var r = RecvSession.init(key, 7, t0);
     var wire: [64]u8 = undefined;
-    const sr = try s.seal(&wire, "");
+    const sr = try s.seal(&wire, "", t0);
     try testing.expectEqual(@as(usize, 32), sr.len);
     var out: [16]u8 = undefined;
-    const orr = try r.open(&out, wire[0..sr.len]);
+    const orr = try r.open(&out, wire[0..sr.len], t0);
     try testing.expectEqual(@as(usize, 0), orr.len);
 }
 
@@ -726,21 +964,21 @@ test "send and receive keys are NOT interchangeable" {
     // The failure this catches is invisible to a round trip: swapping the two
     // keys on BOTH ends round-trips perfectly and fails against a real peer.
     const keys = TransportKeys{ .send = testKey(7), .recv = testKey(8) };
-    var a = Session.init(keys, 1, 2);
+    var a = Session.init(keys, 1, 2, t0);
     var wire: [128]u8 = undefined;
-    const sr = try a.send.seal(&wire, "payload");
+    const sr = try a.send.seal(&wire, "payload", t0);
 
     var out: [64]u8 = undefined;
     // The packet is addressed to the peer (index 2). A peer that hands its
     // receiver the WRONG half of the pair cannot open it — and the failure is
     // an authentication failure, not a framing error.
-    var wrong = RecvSession.init(keys.recv, 2);
-    try testing.expectError(error.AuthenticationFailed, wrong.open(&out, wire[0..sr.len]));
+    var wrong = RecvSession.init(keys.recv, 2, t0);
+    try testing.expectError(error.AuthenticationFailed, wrong.open(&out, wire[0..sr.len], t0));
     for (out[0..16]) |b| try testing.expectEqual(@as(u8, 0), b); // zeroed, not garbage
 
     // The correctly-paired peer can: our `send` key is its `recv` key.
-    var right = RecvSession.init(keys.send, 2);
-    _ = try right.open(&out, wire[0..sr.len]);
+    var right = RecvSession.init(keys.send, 2, t0);
+    _ = try right.open(&out, wire[0..sr.len], t0);
 
     // Session.init wires the pair: our sender holds `keys.send`, our receiver
     // holds `keys.recv` — never the other way round.
@@ -756,70 +994,70 @@ test "send and receive keys are NOT interchangeable" {
 
 test "replay: a duplicate is rejected, out-of-order-within-window is accepted" {
     const key = testKey(9);
-    var s = SendSession.init(key, 3);
-    var r = RecvSession.init(key, 3);
+    var s = SendSession.init(key, 3, t0);
+    var r = RecvSession.init(key, 3, t0);
 
     var msgs: [8][overhead + 16]u8 = undefined;
-    for (&msgs) |*m| _ = try s.seal(m, "packet");
+    for (&msgs) |*m| _ = try s.seal(m, "packet", t0);
 
     var out: [64]u8 = undefined;
     // Deliver 0, then 3 (a gap), then the skipped 1 and 2 — all fresh.
-    _ = try r.open(&out, &msgs[0]);
-    _ = try r.open(&out, &msgs[3]);
-    _ = try r.open(&out, &msgs[1]);
-    _ = try r.open(&out, &msgs[2]);
+    _ = try r.open(&out, &msgs[0], t0);
+    _ = try r.open(&out, &msgs[3], t0);
+    _ = try r.open(&out, &msgs[1], t0);
+    _ = try r.open(&out, &msgs[2], t0);
     // Every one of them is now a replay.
-    for (0..4) |i| try testing.expectError(error.Replayed, r.open(&out, &msgs[i]));
+    for (0..4) |i| try testing.expectError(error.Replayed, r.open(&out, &msgs[i], t0));
     // …and the still-unseen ones remain openable.
-    _ = try r.open(&out, &msgs[5]);
-    _ = try r.open(&out, &msgs[4]);
-    try testing.expectError(error.Replayed, r.open(&out, &msgs[5]));
+    _ = try r.open(&out, &msgs[5], t0);
+    _ = try r.open(&out, &msgs[4], t0);
+    try testing.expectError(error.Replayed, r.open(&out, &msgs[5], t0));
 }
 
 test "replay: a counter that fell off the trailing edge is rejected" {
     const key = testKey(10);
-    var s = SendSession.init(key, 3);
-    var r = RecvSession.init(key, 3);
+    var s = SendSession.init(key, 3, t0);
+    var r = RecvSession.init(key, 3, t0);
     const cap = RecvSession.Window.capacity;
 
     // Three packets, positioned relative to a high-water mark of 100 + cap:
     // exactly `cap` behind it (the last in-window slot), `cap + 1` behind it
     // (the first one off the edge), and the mark itself.
     var edge: [overhead + 16]u8 = undefined; // counter 100
-    s.counter = 100;
-    _ = try s.seal(&edge, "edge");
+    s.seekUnsafeForTest(100);
+    _ = try s.seal(&edge, "edge", t0);
 
     var old: [overhead + 16]u8 = undefined; // counter 99
-    s.counter = 99;
-    _ = try s.seal(&old, "old");
+    s.seekUnsafeForTest(99);
+    _ = try s.seal(&old, "old", t0);
 
     var high: [overhead + 16]u8 = undefined; // counter 100 + cap
-    s.counter = 100 + cap;
-    _ = try s.seal(&high, "high");
+    s.seekUnsafeForTest(100 + cap);
+    _ = try s.seal(&high, "high", t0);
 
     var out: [64]u8 = undefined;
     // Jump the high-water mark to 100 + cap …
-    _ = try r.open(&out, &high);
+    _ = try r.open(&out, &high, t0);
     // … the counter exactly `cap` behind it is still inside the window …
-    _ = try r.open(&out, &edge);
+    _ = try r.open(&out, &edge, t0);
     // … and 99, one further back, has fallen off the trailing edge.
-    try testing.expectError(error.Replayed, r.open(&out, &old));
+    try testing.expectError(error.Replayed, r.open(&out, &old, t0));
 }
 
 test "replay: a forged packet cannot burn a legitimate counter's window slot" {
     const key = testKey(11);
-    var s = SendSession.init(key, 3);
-    var r = RecvSession.init(key, 3);
+    var s = SendSession.init(key, 3, t0);
+    var r = RecvSession.init(key, 3, t0);
     var good: [overhead + 16]u8 = undefined;
-    _ = try s.seal(&good, "genuine");
+    _ = try s.seal(&good, "genuine", t0);
 
     var forged = good;
     forged[overhead - 1] +%= 1; // corrupt a ciphertext byte, keep the header
     var out: [64]u8 = undefined;
-    try testing.expectError(error.AuthenticationFailed, r.open(&out, &forged));
+    try testing.expectError(error.AuthenticationFailed, r.open(&out, &forged, t0));
     // The window was NOT committed by the failed open: the genuine packet
     // carrying the same counter still opens.
-    const orr = try r.open(&out, &good);
+    const orr = try r.open(&out, &good, t0);
     try testing.expectEqualSlices(u8, "genuine", out[0..7]);
     try testing.expectEqual(@as(u64, 0), orr.counter);
 }
@@ -890,139 +1128,278 @@ test "window: a jump clear of the whole bitmap resets it without stale bits" {
 
 test "seal refuses at REJECT_AFTER_MESSAGES instead of wrapping the nonce" {
     const key = testKey(12);
-    var s = SendSession.init(key, 3);
+    var s = SendSession.init(key, 3, t0);
     var buf: [64]u8 = undefined;
 
     // One below the limit still works …
-    s.counter = reject_after_messages - 1;
-    const r = try s.seal(&buf, "last");
+    s.seekUnsafeForTest(reject_after_messages - 1);
+    const r = try s.seal(&buf, "last", t0);
     try testing.expectEqual(reject_after_messages - 1, r.counter);
     try testing.expectEqual(reject_after_messages, s.counter);
     // … and the very next one fails, leaving the counter untouched.
-    try testing.expectError(error.MessageLimitReached, s.seal(&buf, "one too many"));
+    try testing.expectError(error.MessageLimitReached, s.seal(&buf, "one too many", t0));
     try testing.expectEqual(reject_after_messages, s.counter);
     // Far past the limit fails too (no wrap-around window of validity).
-    s.counter = std.math.maxInt(u64);
-    try testing.expectError(error.MessageLimitReached, s.seal(&buf, "wrapped"));
+    s.seekUnsafeForTest(std.math.maxInt(u64));
+    try testing.expectError(error.MessageLimitReached, s.seal(&buf, "wrapped", t0));
 }
 
 test "open refuses a counter at or past REJECT_AFTER_MESSAGES" {
     const key = testKey(13);
-    var s = SendSession.init(key, 3);
-    var r = RecvSession.init(key, 3);
+    var s = SendSession.init(key, 3, t0);
+    var r = RecvSession.init(key, 3, t0);
     var buf: [64]u8 = undefined;
     var out: [64]u8 = undefined;
 
-    s.counter = reject_after_messages - 1;
-    const sr = try s.seal(&buf, "last");
-    _ = try r.open(&out, buf[0..sr.len]); // opens: still legal
+    s.seekUnsafeForTest(reject_after_messages - 1);
+    const sr = try s.seal(&buf, "last", t0);
+    _ = try r.open(&out, buf[0..sr.len], t0); // opens: still legal
     try testing.expectEqual(@as(u64, reject_after_messages - 1), r.window.highest().?);
 
     // Forge the header's counter to the limit: rejected before any crypto,
     // by its own error rather than as an authentication failure.
     std.mem.writeInt(u64, buf[8..16], reject_after_messages, .little);
-    try testing.expectError(error.MessageLimitReached, r.open(&out, buf[0..sr.len]));
+    try testing.expectError(error.MessageLimitReached, r.open(&out, buf[0..sr.len], t0));
     std.mem.writeInt(u64, buf[8..16], std.math.maxInt(u64), .little);
-    try testing.expectError(error.MessageLimitReached, r.open(&out, buf[0..sr.len]));
+    try testing.expectError(error.MessageLimitReached, r.open(&out, buf[0..sr.len], t0));
 }
 
 test "rekey is signalled at REKEY_AFTER_MESSAGES, not silently continued" {
     const key = testKey(14);
-    var s = SendSession.init(key, 3);
-    var r = RecvSession.init(key, 3);
+    var s = SendSession.init(key, 3, t0);
+    var r = RecvSession.init(key, 3, t0);
     var buf: [64]u8 = undefined;
     var out: [64]u8 = undefined;
 
-    s.counter = rekey_after_messages - 1;
-    try testing.expect(!s.rekeyDue());
-    var sr = try s.seal(&buf, "before");
+    s.seekUnsafeForTest(rekey_after_messages - 1);
+    try testing.expect(!s.rekeyDue(t0));
+    var sr = try s.seal(&buf, "before", t0);
     try testing.expectEqual(RekeyState.ok, sr.rekey);
-    var orr = try r.open(&out, buf[0..sr.len]);
+    var orr = try r.open(&out, buf[0..sr.len], t0);
     try testing.expectEqual(RekeyState.ok, orr.rekey);
-    try testing.expect(!r.rekeyDue());
+    try testing.expect(!r.rekeyDue(t0));
 
     // At the limit: the session keeps working (there is 2^60 of margin to
     // REJECT_AFTER_MESSAGES) but every seal/open now says `.due`.
-    try testing.expect(s.rekeyDue());
-    sr = try s.seal(&buf, "at the limit");
+    try testing.expect(s.rekeyDue(t0));
+    sr = try s.seal(&buf, "at the limit", t0);
     try testing.expectEqual(rekey_after_messages, sr.counter);
     try testing.expectEqual(RekeyState.due, sr.rekey);
-    orr = try r.open(&out, buf[0..sr.len]);
+    orr = try r.open(&out, buf[0..sr.len], t0);
     try testing.expectEqual(RekeyState.due, orr.rekey);
-    try testing.expect(r.rekeyDue());
+    try testing.expect(r.rekeyDue(t0));
+}
+
+// ── session lifetime: the CLOCK half of §6.1 ───────────────────────────────
+//
+// Every boundary below is written in LITERAL seconds since the session's
+// birth, never as `reject_after_time_s ± 1`: the point of these tests is the
+// delivered number (180 s / 120 s), which is what a peer's own timers are set
+// against and what the docs promise. Written relative to the constant they
+// would stay green if 180 became 18 000 and a session outlived its keys by two
+// orders of magnitude.
+
+test "lifetime: seal refuses at 180 seconds, and 179 still works" {
+    const key = testKey(20);
+    const born: u64 = 1_000_000;
+    var s = SendSession.init(key, 9, born);
+    var buf: [64]u8 = undefined;
+
+    _ = try s.seal(&buf, "at birth", born);
+    _ = try s.seal(&buf, "one second in", born + 1);
+    _ = try s.seal(&buf, "179 seconds in", born + 179); // last legal second
+    try testing.expect(!s.expired(born + 179));
+
+    try testing.expectError(error.SessionExpired, s.seal(&buf, "180", born + 180));
+    try testing.expect(s.expired(born + 180));
+    try testing.expectError(error.SessionExpired, s.seal(&buf, "an hour later", born + 3600));
+    // Refusal consumes nothing: the counter still sits where the three
+    // successful seals left it.
+    try testing.expectEqual(@as(u64, 3), s.counter);
+}
+
+test "lifetime: open refuses at 180 seconds, and the packet is otherwise perfect" {
+    const key = testKey(21);
+    const born: u64 = 5_000;
+    var s = SendSession.init(key, 4, born);
+    var r = RecvSession.init(key, 4, born);
+    var out: [64]u8 = undefined;
+
+    var early: [overhead + 16]u8 = undefined;
+    _ = try s.seal(&early, "in time", born + 10);
+    var late: [overhead + 16]u8 = undefined;
+    _ = try s.seal(&late, "too late", born + 100);
+
+    _ = try r.open(&out, &early, born + 179); // last legal second
+    // Same session, same key, a counter the window has never seen, a tag that
+    // verifies — refused purely on age.
+    try testing.expectError(error.SessionExpired, r.open(&out, &late, born + 180));
+    try testing.expectError(error.SessionExpired, r.open(&out, &late, born + 100_000));
+    try testing.expect(r.expired(born + 180));
+    // Rejected on age BEFORE the AEAD ran, so the window never recorded it:
+    // a receiver that is rekeyed rather than expired would still accept it.
+    var fresh = RecvSession.init(key, 4, born);
+    _ = try fresh.open(&out, &late, born + 179);
+}
+
+test "lifetime: rekey is due at 120 seconds, well before the session dies" {
+    const key = testKey(22);
+    const born: u64 = 42;
+    var s = SendSession.init(key, 6, born);
+    var r = RecvSession.init(key, 6, born);
+    var buf: [64]u8 = undefined;
+    var out: [64]u8 = undefined;
+
+    try testing.expect(!s.rekeyDue(born + 119));
+    try testing.expect(!r.rekeyDue(born + 119));
+    var sr = try s.seal(&buf, "119", born + 119);
+    try testing.expectEqual(RekeyState.ok, sr.rekey);
+    var orr = try r.open(&out, buf[0..sr.len], born + 119);
+    try testing.expectEqual(RekeyState.ok, orr.rekey);
+
+    // At 120 s the session still carries traffic — this is a deadline, not a
+    // failure — but every seal and open now says so.
+    try testing.expect(s.rekeyDue(born + 120));
+    try testing.expect(r.rekeyDue(born + 120));
+    sr = try s.seal(&buf, "120", born + 120);
+    try testing.expectEqual(RekeyState.due, sr.rekey);
+    orr = try r.open(&out, buf[0..sr.len], born + 120);
+    try testing.expectEqual(RekeyState.due, orr.rekey);
+    // …and there are 60 more seconds of margin before it stops working.
+    sr = try s.seal(&buf, "179", born + 179);
+    try testing.expectEqual(RekeyState.due, sr.rekey);
+}
+
+test "lifetime: a clock that runs backwards cannot age a session out" {
+    // `now_s` is the caller's, so it can jump. A naive `now_s - born_s` would
+    // wrap a one-second backward step into ~1.8e19 seconds of age and kill a
+    // brand-new session; the saturating subtraction makes it age 0.
+    const key = testKey(23);
+    const born: u64 = 1_000_000;
+    var s = SendSession.init(key, 8, born);
+    var r = RecvSession.init(key, 8, born);
+    var buf: [64]u8 = undefined;
+    var out: [64]u8 = undefined;
+
+    try testing.expectEqual(@as(u64, 0), ageSeconds(born, born - 1));
+    try testing.expectEqual(@as(u64, 0), ageSeconds(born, 0));
+    const sr = try s.seal(&buf, "clock stepped back", born - 5_000);
+    try testing.expectEqual(RekeyState.ok, sr.rekey);
+    const orr = try r.open(&out, buf[0..sr.len], 0);
+    try testing.expectEqual(RekeyState.ok, orr.rekey);
+    try testing.expect(!s.expired(0));
+    try testing.expect(!r.expired(0));
+}
+
+test "lifetime: Session.init gives both halves one birth time" {
+    const keys = TransportKeys{ .send = testKey(24), .recv = testKey(25) };
+    const born: u64 = 777;
+    var a = Session.init(keys, 1, 2, born);
+    try testing.expectEqual(born, a.send.born_s);
+    try testing.expectEqual(born, a.recv.born_s);
+    try testing.expect(!a.expired(born + 179));
+    try testing.expect(a.expired(born + 180));
+
+    var wire: [64]u8 = undefined;
+    try testing.expectError(error.SessionExpired, a.send.seal(&wire, "x", born + 180));
+}
+
+// ── replay window: the unrepresentable counter ─────────────────────────────
+
+test "window: maxInt(u64) is refused, not an integer-overflow panic" {
+    // The window tracks `counter + 1`, so `maxInt(u64)` has no representation.
+    // `RecvSession.open` can never reach it (it refuses at
+    // `reject_after_messages` = maxInt − 8192 first), but `ReplayWindow` is a
+    // public generic whose doc invites callers to wire their own demultiplexer
+    // against it — and the counter is an attacker-chosen header field.
+    const W = ReplayWindow(128);
+    var w = W{};
+    w.commit(10);
+    try testing.expect(!w.accepts(std.math.maxInt(u64)));
+    try testing.expect(w.accepts(std.math.maxInt(u64) - 1)); // its neighbour is ordinary
+    w.commit(std.math.maxInt(u64)); // must be a no-op, not a wrap
+    try testing.expectEqual(@as(?u64, 10), w.highest());
+    // The neighbouring value is ordinary: only the single unrepresentable one
+    // is special-cased.
+    var w2 = W{};
+    try testing.expect(w2.accepts(std.math.maxInt(u64) - 1));
+    w2.commit(std.math.maxInt(u64) - 1);
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u64) - 1), w2.highest());
+    try testing.expect(!w2.accepts(std.math.maxInt(u64) - 1));
+    try testing.expect(!w2.accepts(std.math.maxInt(u64)));
 }
 
 // ── untrusted input ────────────────────────────────────────────────────────
 
 test "open rejects truncated, wrong-type, wrong-receiver and tampered messages" {
     const key = testKey(15);
-    var s = SendSession.init(key, 0x1234);
-    var r = RecvSession.init(key, 0x1234);
+    var s = SendSession.init(key, 0x1234, t0);
+    var r = RecvSession.init(key, 0x1234, t0);
     var buf: [overhead + 16]u8 = undefined;
-    const n = (try s.seal(&buf, "twelve bytes")).len;
+    const n = (try s.seal(&buf, "twelve bytes", t0)).len;
     var out: [64]u8 = undefined;
 
     // Shorter than the 32-byte minimum.
-    try testing.expectError(error.Truncated, r.open(&out, buf[0 .. overhead - 1]));
-    try testing.expectError(error.Truncated, r.open(&out, buf[0..0]));
+    try testing.expectError(error.Truncated, r.open(&out, buf[0 .. overhead - 1], t0));
+    try testing.expectError(error.Truncated, r.open(&out, buf[0..0], t0));
     // A handshake message type, and a type-4 message with a dirty reserved byte.
     {
         var bad = buf;
         bad[0] = 1;
-        try testing.expectError(error.NotTransportData, r.open(&out, bad[0..n]));
+        try testing.expectError(error.NotTransportData, r.open(&out, bad[0..n], t0));
         bad = buf;
         bad[2] = 1; // reserved byte must be zero
-        try testing.expectError(error.NotTransportData, r.open(&out, bad[0..n]));
+        try testing.expectError(error.NotTransportData, r.open(&out, bad[0..n], t0));
     }
     // Addressed to another session index.
     {
         var bad = buf;
         std.mem.writeInt(u32, bad[4..8], 0x1235, .little);
-        try testing.expectError(error.WrongReceiver, r.open(&out, bad[0..n]));
+        try testing.expectError(error.WrongReceiver, r.open(&out, bad[0..n], t0));
     }
     // Tampered ciphertext / tag / counter → authentication failure, and the
     // output buffer is zeroed rather than left holding garbage.
     for ([_]usize{ header_len, n - 1, 8 }) |off| {
         var bad = buf;
         bad[off] +%= 1;
-        var fresh = RecvSession.init(key, 0x1234);
-        try testing.expectError(error.AuthenticationFailed, fresh.open(&out, bad[0..n]));
+        var fresh = RecvSession.init(key, 0x1234, t0);
+        try testing.expectError(error.AuthenticationFailed, fresh.open(&out, bad[0..n], t0));
         for (out[0..16]) |b| try testing.expectEqual(@as(u8, 0), b);
     }
     // The untouched message still opens.
-    var fresh = RecvSession.init(key, 0x1234);
-    const orr = try fresh.open(&out, buf[0..n]);
+    var fresh = RecvSession.init(key, 0x1234, t0);
+    const orr = try fresh.open(&out, buf[0..n], t0);
     try testing.expectEqualSlices(u8, "twelve bytes", out[0..12]);
     try testing.expectEqual(@as(usize, 16), orr.len);
 }
 
 test "buffer sizing: seal and open reject an undersized output buffer" {
     const key = testKey(16);
-    var s = SendSession.init(key, 1);
+    var s = SendSession.init(key, 1, t0);
     var too_small: [overhead + 16 - 1]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, s.seal(&too_small, "seventeen bytes!!"));
+    try testing.expectError(error.BufferTooSmall, s.seal(&too_small, "seventeen bytes!!", t0));
     // The exact size is enough (17 bytes pads to 32).
     var exact: [overhead + 32]u8 = undefined;
-    const n = (try s.seal(&exact, "seventeen bytes!!")).len;
+    const n = (try s.seal(&exact, "seventeen bytes!!", t0)).len;
     try testing.expectEqual(exact.len, n);
 
-    var r = RecvSession.init(key, 1);
+    var r = RecvSession.init(key, 1, t0);
     var out_small: [31]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, r.open(&out_small, exact[0..n]));
+    try testing.expectError(error.BufferTooSmall, r.open(&out_small, exact[0..n], t0));
     var out_exact: [32]u8 = undefined;
-    _ = try r.open(&out_exact, exact[0..n]);
+    _ = try r.open(&out_exact, exact[0..n], t0);
 }
 
 test "seal rejects a plaintext that cannot fit one UDP datagram" {
     const key = testKey(17);
-    var s = SendSession.init(key, 1);
+    var s = SendSession.init(key, 1, t0);
     const big = try testing.allocator.alloc(u8, max_payload + 1);
     defer testing.allocator.free(big);
     @memset(big, 0);
     var tiny: [1]u8 = undefined;
     // Checked before the output-buffer size, so a 1-byte `out` still reports
     // the real reason.
-    try testing.expectError(error.PacketTooLarge, s.seal(&tiny, big));
+    try testing.expectError(error.PacketTooLarge, s.seal(&tiny, big, t0));
     try testing.expectEqual(@as(u64, 0), s.counter); // nothing consumed
 }
 
@@ -1033,10 +1410,10 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
     var out: [160]u8 = undefined;
-    var r = RecvSession.init(@splat(0x5A), 0);
+    var r = RecvSession.init(@splat(0x5A), 0, t0);
     // Arbitrary bytes must only ever yield a typed error or a plaintext length
     // <= input — never a panic, an OOB read, or an allocation.
-    const orr = r.open(&out, buf[0..len]) catch return;
+    const orr = r.open(&out, buf[0..len], t0) catch return;
     try testing.expect(orr.len + overhead == len);
 }
 

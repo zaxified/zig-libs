@@ -632,10 +632,17 @@ pub const Handshake = struct {
     /// and the local/remote index assignment impossible to swap (a swap
     /// round-trips against yourself and fails against every real peer).
     /// Consumes the handshake exactly as `deriveTransportKeys` does.
-    pub fn transportSession(self: *Handshake, is_initiator: bool) transport.Session {
+    ///
+    /// `now_s` is the caller's clock at the moment the handshake completed —
+    /// the session's `born_s`, from which `transport.reject_after_time_s` (180 s)
+    /// and `transport.rekey_after_time_s` (120 s) are measured. Required, not
+    /// optional: a session with no birth time is a session that never expires,
+    /// and the same `now_s` convention already runs through this file's cookie
+    /// layer (`CookieChecker.refresh`, `PeerCookie.current`).
+    pub fn transportSession(self: *Handshake, is_initiator: bool, now_s: u64) transport.Session {
         const local = self.local_index;
         const remote = self.remote_index;
-        return transport.Session.init(self.deriveTransportKeys(is_initiator), local, remote);
+        return transport.Session.init(self.deriveTransportKeys(is_initiator), local, remote, now_s);
     }
 
     /// `MAC(mac1_key(remote_static_public), msg_bytes_before_mac1)` — the
@@ -1239,6 +1246,12 @@ test "handshake → data plane: the KAT session carries packets both ways" {
     // independent reference, so this asserts the WIRING against those pinned
     // values — a swapped pair would still round-trip, so the equality checks
     // below (not the round trip) are the test.
+    //
+    // The session is born at `kat_now_s` and every seal/open here happens at
+    // the same instant, i.e. at age 0 — comfortably inside
+    // `transport.reject_after_time_s`. The lifetime rule itself is pinned in
+    // `transport.zig`; this test is about the wiring.
+    const kat_now_s: u64 = 1_700_000_000;
     const io = std.testing.io;
     var ini = kat.initiator();
     var rsp = kat.responder();
@@ -1247,8 +1260,8 @@ test "handshake → data plane: the KAT session carries packets both ways" {
     const msg2 = try rsp.createResponse(io);
     try ini.consumeResponse(msg2);
 
-    var i_sess = ini.transportSession(true);
-    var r_sess = rsp.transportSession(false);
+    var i_sess = ini.transportSession(true, kat_now_s);
+    var r_sess = rsp.transportSession(false, kat_now_s);
 
     // Keys land on the half that uses them, against the KAT's fixed values.
     try testing.expectEqual(kat.t_initiator_send, i_sess.send.key);
@@ -1265,21 +1278,21 @@ test "handshake → data plane: the KAT session carries packets both ways" {
     var wire: [1500]u8 = undefined;
     var out: [1500]u8 = undefined;
     const packet = "an inner IP packet";
-    const sr = try i_sess.send.seal(&wire, packet);
+    const sr = try i_sess.send.seal(&wire, packet, kat_now_s);
     // The header carries the responder's index, as any real peer would expect.
     try testing.expectEqual(kat.idx_r, (try transport.parseHeader(wire[0..sr.len])).receiver_index);
     // Cross-wiring fails: the initiator's own receiver cannot open what the
     // initiator sent — it is addressed to the responder's index.
-    try testing.expectError(error.WrongReceiver, i_sess.recv.open(&out, wire[0..sr.len]));
+    try testing.expectError(error.WrongReceiver, i_sess.recv.open(&out, wire[0..sr.len], kat_now_s));
 
-    const orr = try r_sess.recv.open(&out, wire[0..sr.len]);
+    const orr = try r_sess.recv.open(&out, wire[0..sr.len], kat_now_s);
     try testing.expectEqualSlices(u8, packet, out[0..packet.len]);
     try testing.expectEqual(transport.paddedLen(packet.len), orr.len);
 
     // …and the reverse direction, under the other key.
     var wire2: [1500]u8 = undefined;
-    const sr2 = try r_sess.send.seal(&wire2, "and one back");
-    const orr2 = try i_sess.recv.open(&out, wire2[0..sr2.len]);
+    const sr2 = try r_sess.send.seal(&wire2, "and one back", kat_now_s);
+    const orr2 = try i_sess.recv.open(&out, wire2[0..sr2.len], kat_now_s);
     try testing.expectEqualSlices(u8, "and one back", out[0..12]);
     try testing.expectEqual(@as(usize, 16), orr2.len);
 }
@@ -1720,6 +1733,16 @@ fn runCmd(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !u8 {
     };
 }
 
+/// Wall-clock seconds for the live interop test — the one place in this module
+/// that needs a real clock, and it is a *test harness*, which is exactly the
+/// role `transport.zig` assigns to the caller. Product code here never reads a
+/// clock; it takes `now_s`.
+fn nowSeconds() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
 test "integration (root): live handshake with kernel WireGuard, keepalive decrypts" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
@@ -1816,7 +1839,7 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                 // Through the real data-plane API, not a hand-rolled AEAD
                 // call: this is what makes the kernel an oracle for
                 // `transport.zig`'s framing, not only for the handshake.
-                session = hs.transportSession(false);
+                session = hs.transportSession(false, nowSeconds());
                 const src_len_const: linux.socklen_t = src_len;
                 const wrc = linux.sendto(
                     fd,
@@ -1844,7 +1867,7 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                 // Everything the kernel had to agree with us about is in this
                 // one call — nonce layout and endianness, empty AAD, header
                 // layout, receiver index, and the padding rule.
-                const r = try sess.recv.open(&empty, buf[0..n]);
+                const r = try sess.recv.open(&empty, buf[0..n], nowSeconds());
                 try testing.expectEqual(@as(usize, 0), r.len);
                 return; // interop proven
             },

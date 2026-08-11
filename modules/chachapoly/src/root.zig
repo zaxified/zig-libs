@@ -940,12 +940,24 @@ test "differential vs std across the ChaCha20 delegation threshold" {
 //   1. That the constants are the RIGHT numbers. They came from a measurement
 //      on one host; only rerunning `bench.zig` can re-derive them. This test
 //      pins the routing, not the tuning.
-//      Operationally, though: the case tables below are written in terms of
-//      the CURRENT values, so CHANGING a constant turns the suite red (the
-//      across-threshold differential aborts). That is intended -- retuning on
-//      another host is a deliberate act, not a silent one -- but it means the
-//      cases must be updated together with the constant. A red suite after
-//      re-deriving the threshold is the tables being stale, not a broken port.
+//      CORRECTED 2026-08-11. This note used to claim: "the case tables below
+//      are written in terms of the CURRENT values, so CHANGING a constant
+//      turns the suite red (the across-threshold differential aborts)". That
+//      was FALSE, and measurably so: the tables reference the constants
+//      SYMBOLICALLY (`.{ .m = aead_delegate_max, ... }`), so every case moves
+//      with the constant and re-asserts whatever it now is. Mutation:
+//      `aead_delegate_max` 128 -> 130 exited 0; `delegate_max_bytes` 64 -> 80
+//      exited 0. The only thing that ever went red was a change big enough to
+//      overrun the 256-byte buffer in the across-threshold differential —
+//      a buffer bound, not a guard.
+//      The fix is the LITERAL table added at the end of this test: it pins the
+//      delivered numbers (64 and 128) and the routing they produce, so a
+//      retune is red for the right reason. The symbolic tables above are kept
+//      because they express the SHAPE — every comparison replayed against
+//      every implementation of it — which is a different property and still
+//      worth having. Re-deriving a threshold on another host now means editing
+//      the literals too: that is the deliberate act the old note claimed, made
+//      true.
 //   2. The ENTRY fast path in `xor`/`stream`. Disabling it (`in.len <= 0`)
 //      leaves every test green — correctly so, because it is not a routing
 //      change: the tail branch still hands the run to std, so the witness
@@ -1047,6 +1059,57 @@ test "delegation thresholds route each length to the engine it was measured for"
         };
         // The routing assertions above would also pass on a call that did
         // nothing at all, so pin the bytes too.
+        try testing.expectEqualSlices(u8, buf[0..c.m], dec[0..c.m]);
+    }
+
+    // ── the DELIVERED numbers, in literals ──────────────────────────────────
+    //
+    // Everything above is symbolic, so it re-asserts whatever the constants
+    // are: `aead_delegate_max` 128 -> 130 and `delegate_max_bytes` 64 -> 80
+    // both exited 0 against it. These three lines are what make a retune
+    // deliberate — they are the numbers `bench.zig`'s tables and this file's
+    // "AFTER" comment quote, and the ones a consumer reads to know which sizes
+    // get std's speed and which get this module's.
+    try testing.expectEqual(@as(usize, 64), delegate_max_bytes);
+    try testing.expectEqual(@as(usize, 128), aead_delegate_max);
+    try testing.expectEqual(@as(usize, 8), wide); // 8 blocks = a 512-byte group
+
+    // …and the routing those literals imply, replayed the same way as above so
+    // a moved constant fails on behaviour and not only on arithmetic.
+    for ([_]CipherCase{
+        .{ .len = 64, .want = .std_delegated, .why = "64 B: last delegated size" },
+        .{ .len = 65, .want = .wide, .why = "65 B: first wide size" },
+        .{ .len = 512 + 64, .want = .std_delegated, .why = "512 B group + 64 B tail" },
+        .{ .len = 512 + 65, .want = .wide, .why = "512 B group + 65 B tail" },
+    }) |c| {
+        ChaCha20.xor(out[0..c.len], buf[0..c.len], 1, key, nonce);
+        testing.expectEqual(c.want, chacha_path) catch |e| {
+            std.debug.print("xor routed {d} B ({s}) to {s}\n", .{ c.len, c.why, @tagName(chacha_path) });
+            return e;
+        };
+        ChaCha20.stream(out[0..c.len], 1, key, nonce);
+        testing.expectEqual(c.want, chacha_path) catch |e| {
+            std.debug.print("stream routed {d} B ({s}) to {s}\n", .{ c.len, c.why, @tagName(chacha_path) });
+            return e;
+        };
+    }
+    for ([_]AeadCase{
+        .{ .m = 128, .ad = 0, .want = .std_delegated, .why = "128 B msg: last delegated" },
+        .{ .m = 129, .ad = 0, .want = .wide, .why = "129 B msg: first wide" },
+        .{ .m = 16, .ad = 112, .want = .std_delegated, .why = "16+112 = 128 exactly" },
+        .{ .m = 16, .ad = 113, .want = .wide, .why = "16+113 = 129, one past" },
+        .{ .m = 0, .ad = 129, .want = .wide, .why = "AD alone crosses 128" },
+    }) |c| {
+        ChaCha20Poly1305.encrypt(out[0..c.m], &tag, buf[0..c.m], buf[0..c.ad], nonce, key);
+        testing.expectEqual(c.want, aead_path) catch |e| {
+            std.debug.print("seal routed m={d} ad={d} ({s}) to {s}\n", .{ c.m, c.ad, c.why, @tagName(aead_path) });
+            return e;
+        };
+        try ChaCha20Poly1305.decrypt(dec[0..c.m], out[0..c.m], tag, buf[0..c.ad], nonce, key);
+        testing.expectEqual(c.want, aead_path) catch |e| {
+            std.debug.print("open routed c={d} ad={d} ({s}) to {s}\n", .{ c.m, c.ad, c.why, @tagName(aead_path) });
+            return e;
+        };
         try testing.expectEqualSlices(u8, buf[0..c.m], dec[0..c.m]);
     }
 }

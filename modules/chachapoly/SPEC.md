@@ -166,15 +166,48 @@ only. Tag verification uses `std.crypto.timing_safe.eql`, and a failed `decrypt`
 **This holds in `ReleaseFast`, which is what ships — and only there.** The
 lane-parallel MAC uses *checked* `*` / `+` rather than `*%` / `+%` on purpose,
 so that a deferred-carry bounds mistake panics instead of silently forging a
-tag; in `Debug` / `ReleaseSafe` those checks are branches on secret-derived
-values. Measured with valgrind/memcheck over a tainted key (Zig 0.16,
-`-fvalgrind`, positive control fires): `ReleaseFast` → **0** tainted-branch
-contexts anywhere in `poly1305.zig`, the only reports being the AEAD's
-accept/reject branch after `timing_safe.eql`, which `std`'s own AEAD reports
-identically. `Debug` → ~180 contexts inside `mulRed` / `carryLimbs` /
-`buildPowers` / `wide`, the overflow checks; `std`'s scalar `Poly1305` shows the
-same class of artifact in its `mulWide`. Do not ship this module at
-`ReleaseSafe` if constant time matters.
+tag; in `Debug` / `ReleaseSafe` the compiler turns each of those into an
+overflow branch on a secret-derived value.
+
+**The measurement, in full, so the claim is exactly as wide as the evidence**
+(valgrind/memcheck, `std.valgrind.memcheck.makeMemUndefined` over the 32-byte
+Poly1305 key, Zig 0.16, `lanes = 4`, i7-7920HQ, re-measured 2026-08-11; the code
+under test is `Poly1305.create` at 16/64/192/1024/8192 B plus a chunked
+`update`/`pad`/`update`/`final` stream):
+
+| build | `-fvalgrind` | key tainted | contexts | of those, inside `poly1305.zig` |
+|---|---|---|---|---|
+| `ReleaseFast` | yes | yes | **3** | **0** |
+| `ReleaseSafe` | yes | yes | **280** | **275** |
+| `Debug`       | yes | yes | **294** | many |
+| `ReleaseFast` | yes | **no** — negative control | 0 | 0 |
+| `ReleaseSafe` | yes | **no** — negative control | 0 | 0 |
+| `ReleaseFast` | **no** | yes | 0 | 0 |
+| `ReleaseSafe` | **no** | yes | 0 | 0 |
+
+Three things make the `ReleaseFast` zero mean something. First, the last two
+rows: **without `-fvalgrind` every run reads 0 regardless**, because
+`std.valgrind.doClientRequest` returns early unless `builtin.valgrind_support`,
+which the release modes disable — a clean run built without the switch is a
+silent no-op, not a result. Second, the negative-control rows: untainted, every
+mode reports 0, so the counts above are taint-caused and not ambient noise.
+Third, the `ReleaseFast` count is **non-zero** — its 3 contexts are branches on
+the *tag*, raised inside the harness's own integer formatter, which is the proof
+that taint travelled key → tag through the entire MAC and that the MAC left no
+branch behind on the way.
+
+The `ReleaseSafe` innermost frames are precisely the checked operators: the five
+schoolbook rows of `mulRed`, the carry chain, `buildPowers`' power table and the
+lane fold. `std`'s own scalar `Poly1305` shows the same class of artifact in its
+`mulWide`.
+
+**Decision (recorded, not deferred): the checked operators stay.** A
+deferred-carry bounds mistake that panics is strictly better than one that
+silently forges a tag, and the branches in question are never *taken* on correct
+input — what `ReleaseSafe` loses is the machine-checkable absence of the branch,
+not a demonstrated leak. So the contract is narrowed rather than the code:
+**ship this module at `ReleaseFast` if constant time matters**, and do not read
+the structural argument above as covering `ReleaseSafe`.
 
 Beyond that measurement this is a *structural* CT argument (no secret-dependent
 control flow exists in the source), not a machine-checked-disassembly audit like
@@ -209,6 +242,34 @@ The `std` differential is what makes the SIMD safe: correctness of the transpose
 layout + tail handling + counter carry is pinned to `std`'s scalar/diagonal
 implementation at every awkward length, so a wrong keystream cannot ship.
 
+### Threshold guards — the one property bytes cannot check
+
+This module has **three** tuning constants, and all three are invisible to every
+byte-comparing test in it, because both engines produce identical bytes: the
+faster path exists to be faster, not different. So each has a test-build-only
+*witness* recording which engine a call took, and a table test asserting the
+routing:
+
+| constant | value | witness | first size on the fast path |
+|---|---|---|---|
+| `delegate_max_bytes` (ChaCha20) | **64** | `root.chacha_path` | 65 B |
+| `aead_delegate_max` (whole AEAD, `m.len + ad.len`) | **128** | `root.aead_path` | 129 B |
+| `wide_min_groups` (Poly1305 lanes) | **3** | `poly1305.mac_path` | 96/192/384 B at L = 2/4/8 |
+
+The witnesses are `void` outside a test build (`builtin.is_test` is comptime),
+so none of this reaches shipped code and the `.reentrant` claim is unaffected.
+
+**The numbers are asserted as literals, not as expressions over themselves.** A
+case table written `.{ .m = aead_delegate_max, .want = .std_delegated }` moves
+with the constant and stays green for any value of it — verified: mutating
+`aead_delegate_max` 128 → 130 and `delegate_max_bytes` 64 → 80 both exited 0
+against the symbolic tables alone. The literal tables that now follow them turn
+both red, as does `wide_min_groups` 3 → 4096 (the mutation that switches the
+lane-parallel MAC off entirely: measured cost, MAC 4048 → 1698 MB/s at 8 KiB,
+2.47× → 1.06× vs std) and 3 → 2. The symbolic tables are kept because they pin a
+different property — every comparison replayed against every implementation of
+it, which is how two real routing holes in `decrypt` and `stream` were found.
+
 ## Non-goals / backlog
 
 - **AVX-512 (L = 8) is correctness-tested but perf-unmeasured** — no AVX-512
@@ -221,11 +282,11 @@ implementation at every awkward length, so a wrong keystream cannot ship.
 - Machine-checked CT disassembly audit (as done for the asm field modules). The
   valgrind/memcheck tainted-key measurement in the constant-time section above
   is not a substitute for one.
-- **A test-build path witness for `wide_min_groups`**, the way `chacha_path` /
-  `aead_path` guard the other two thresholds. Without it the lane-parallel MAC
-  can be disabled outright (raise the constant) with the whole suite still
-  green — measured, and the cost is the module's entire reason to exist
-  (MAC 2.5× → 1.0×, AEAD 2.9× → 1.9× at 8 KiB).
+- ~~A test-build path witness for `wide_min_groups`~~ — **DONE 2026-08-11.**
+  `poly1305.mac_path` is now the third witness alongside `chacha_path` /
+  `aead_path`, and the boundaries it asserts are written as literal byte counts
+  (96 / 192 / 384 at L = 2 / 4 / 8) rather than as `wide_min_bytes ± 1`, so the
+  test cannot re-assert a retuned constant. See "Threshold guards" below.
 
 Consumers already wired to this module (`@import("chachapoly")`, all using
 `ChaCha20Poly1305`): `noise`, `wireguard`, `dtls`, `quic-crypto`, `hpke`,

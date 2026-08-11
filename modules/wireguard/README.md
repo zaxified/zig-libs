@@ -132,20 +132,23 @@ anti-replay window. Zero allocation on both paths (caller buffers only).
 const transport = wireguard.transport;
 
 // From a completed handshake, in one call — this is what makes the
-// send/recv key and the local/remote index impossible to swap:
-var sess = hs.transportSession(is_initiator);
+// send/recv key and the local/remote index impossible to swap. `now_s` is
+// YOUR clock; it becomes the session's birth time.
+var sess = hs.transportSession(is_initiator, now_s);
 
 // Outbound: `out` must be >= transport.sealedLen(packet.len) and must not
-// overlap `packet`.
+// overlap `packet`. Every seal/open takes the current time — that is how
+// REJECT_AFTER_TIME gets enforced without this module owning a clock.
 var out: [transport.sealedLen(1420)]u8 = undefined;
-const s = try sess.send.seal(&out, ip_packet);
+const s = try sess.send.seal(&out, ip_packet, now_s);
 if (s.rekey == .due) startNewHandshake(); // typed signal, never silent
 try udp.send(out[0..s.len]);
 
 // Inbound: demultiplex on the header first, then open under that session.
 const hdr = try transport.parseHeader(datagram);   // -> receiver_index
 var plain: [1440]u8 = undefined;
-const o = try sess.recv.open(&plain, datagram);    // Replayed / auth errors
+const o = try sess.recv.open(&plain, datagram, now_s); // Replayed / auth /
+                                                       // SessionExpired
 // o.len is the PADDED length — the true packet length comes from the inner
 // IP header, exactly as the protocol intends.
 ```
@@ -157,9 +160,30 @@ const o = try sess.recv.open(&plain, datagram);    // Replayed / auth errors
   `reject_after_messages` (2^64−2^13−1) rather than wrapping a nonce, and
   every seal/open reports `RekeyState.due` once past `rekey_after_messages`
   (2^60).
-- **Anti-replay:** an RFC-6479-style circular bitmap 8192 counters wide (the
-  same width `reject_after_messages` reserves below the u64 ceiling).
+- **Session lifetime is enforced too, not left to you by accident.** §6.1
+  bounds a session in seconds as well as in messages, so `seal`/`open` take
+  a caller-supplied `now_s` and refuse with `error.SessionExpired` at
+  `reject_after_time_s` (**180 s**) after the session's birth, and report
+  `RekeyState.due` from `rekey_after_time_s` (**120 s**). The module still
+  reads no clock — it makes you pass one, which is the difference between a
+  documented contract and a silently skipped one. A `now_s` that moves
+  backwards saturates to age 0, so a clock step cannot kill a live session.
+  The §6.1 timers that are genuinely yours are the *scheduling* ones, and
+  they are yours by name: `REKEY_TIMEOUT`, `REKEY_ATTEMPT_TIME` and
+  `KEEPALIVE_TIMEOUT` all say *when to send something*, and this module never
+  sends anything.
+- **`SendSession.counter` is read-only in production.** Rewinding it is
+  silent nonce reuse under a live key — keystream reuse *and* a forgeable
+  Poly1305 key. `seal` is the only safe way to move it; `seekUnsafeForTest`
+  is the only sanctioned way to move it at all, and its name is the warning.
+- **Anti-replay:** an RFC-6479-style circular bitmap 8192 counters wide (of
+  which 8128 counters are usable — one 64-bit block is redundancy — the same
+  width `reject_after_messages` reserves below the u64 ceiling).
   Out-of-order inside the window is accepted once; a duplicate or a
   too-old counter is `error.Replayed`. The window is committed only *after*
-  the tag verifies, so a forged packet cannot burn a legitimate slot.
+  the tag verifies, so a forged packet cannot burn a legitimate slot. Note
+  the *pre-check* runs **before** the AEAD, which is a deliberate divergence
+  from the kernel and wireguard-go — see SPEC.md and `RecvSession.open`'s
+  doc-comment; if you log or meter `error.Replayed`, merge it with
+  `error.AuthenticationFailed`.
 - Not built on the `aeadframe` sibling — see SPEC.md for exactly why.

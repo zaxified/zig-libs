@@ -320,6 +320,22 @@ test "kernel golden: this module's own encoder is semantically equal to wg-tool'
 // One kernel-authored capture (GET_DEVICE reply) + one external-tool capture
 // (SET_DEVICE request) + one same-config cross-check = 3 kernel/tool-anchored
 // tests. If this file grows or shrinks that set, update this count.
+//
+// The count is DERIVED from the test binary's own table, not written twice.
+// The previous form was `expectEqual(3, 3)` — a tautology that constant-folds
+// away, so deleting all three anchored tests (or adding ten) left it green,
+// and the file's most load-bearing property (that the external captures are
+// still actually exercised) was guarded by nothing at all.
 test "count canary: kernel/tool-anchored golden tests" {
-    try testing.expectEqual(@as(usize, 3), 3);
+    // `builtin.test_functions` is the runner's own list of collected tests;
+    // names are fully qualified, e.g.
+    // "wireguard.kernel_goldens.test.kernel golden: …".
+    var found: usize = 0;
+    for (@import("builtin").test_functions) |t| {
+        if (std.mem.indexOf(u8, t.name, "kernel golden: ") != null) found += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), found);
+    // Positive control: the search string really matches something, so a typo
+    // that made it match nothing could not read as "0 == 0".
+    try testing.expect(found > 0);
 }

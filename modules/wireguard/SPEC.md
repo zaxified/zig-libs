@@ -146,13 +146,48 @@ with 2^60 of margin left, so it is surfaced as a typed `RekeyState.due` on every
 rather than enforced: continuing silently would be wrong, but dropping a packet the peer will still
 accept would be worse. Anti-replay is an RFC-6479 circular bitmap `default_window_bits` (8192)
 counters wide — the same width `REJECT_AFTER_MESSAGES` reserves below the u64 ceiling and the width
-the Linux implementation uses. Counters are tracked internally as `counter + 1` so the all-zero
-state means "nothing received" and counter 0 stays an ordinary first packet. `accepts` is a
+the Linux implementation uses — of which `Window.capacity` = **8128** counters are usable, the
+remaining 64-bit block being the redundancy that stops a still-valid counter aliasing a stale block.
+Counters are tracked internally as `counter + 1` so the all-zero
+state means "nothing received" and counter 0 stays an ordinary first packet; the one consequence is
+that `maxInt(u64)` has no representation, so `ReplayWindow.accepts` refuses it outright rather than
+overflowing (`RecvSession.open` can never present it — it refuses at `REJECT_AFTER_MESSAGES`, which
+is `maxInt(u64) − 8192` — but the generic is public and callers wire their own demultiplexers
+against it). `accepts` is a
 read-only pre-check and `commit` runs only after the tag verifies, so a forged packet can never burn
 a legitimate counter's window slot. Nothing branches on secret data: the counter, the receiver index
 and the length are all cleartext header fields. Zero allocation — every entry point writes into a
 caller buffer, and `seal` pads and encrypts in place inside it (`chachapoly` documents and tests the
-`c == m` case).
+`c == m` case). `max_payload` is **65472** bytes — 65507 (an IPv4 UDP payload) minus the 32-byte
+overhead, rounded down to a multiple of 16 — so `sealedLen(max_payload)` is exactly 65504 and one
+WireGuard message always fits one datagram.
+
+**Session lifetime — the clock half of §6.1, and who owns the rest.** §6.1 bounds a session in two
+independent dimensions and both are enforced here. The message half is `REJECT_AFTER_MESSAGES` /
+`REKEY_AFTER_MESSAGES` above. The clock half is `REJECT_AFTER_TIME` (**180 s**) and
+`REKEY_AFTER_TIME` (**120 s**): every session records a `born_s` at `init` and every `seal`/`open`
+takes the caller's current `now_s`, refusing with `error.SessionExpired` at 180 s and reporting
+`RekeyState.due` from 120 s. The module still reads no clock; it makes the caller pass one, which is
+the only form of "you own the timers" that cannot be silently skipped — and it is the same `now_s`
+convention the cookie layer already uses (`CookieChecker.refresh`, `PeerCookie.current`). Age is a
+*saturating* subtraction, so a `now_s` that moves backwards yields age 0 rather than wrapping to
+~1.8e19 seconds and killing a brand-new session. The three §6.1 constants deliberately **not** here
+are the scheduling timers — `REKEY_TIMEOUT` (handshake retry backoff), `REKEY_ATTEMPT_TIME`
+(give-up deadline) and `KEEPALIVE_TIMEOUT` (when to emit a keepalive). Each says *when to send
+something*; this module never sends anything, owns no socket and no timer wheel, so they are the
+caller's, named explicitly rather than left as an unstated gap.
+
+**A deliberate divergence from the reference implementations.** `RecvSession.open` consults the
+replay window **before** the AEAD; the Linux kernel (`wg_packet_decrypt` then `counter_validate`)
+and wireguard-go (`RoutineDecryption` then `keypair.replayFilter.ValidateCounter`) both authenticate
+first. The security-critical half is identical either way — `commit` is strictly
+post-authentication here too, so a forgery still cannot burn a legitimate counter's slot. What the
+early return buys is shedding a replayed flood without paying an AEAD per packet; what it costs is
+an *unauthenticated* distinction: someone who can guess `receiver_index` learns from the typed error
+whether a chosen counter already sits in the window, without holding the key. Over a socket both
+outcomes are a silent drop, so this is observable only through a caller that logs or meters
+`error.Replayed` separately from `error.AuthenticationFailed` — such a caller should merge the two.
+Recorded here so the divergence is a decision on the record rather than an unremarked one.
 
 **Why not built on the `aeadframe` sibling.** `aeadframe` is the right shape in the abstract — per-key
 AEAD records, monotonic counter nonce, sliding-window anti-replay, refuse-don't-wrap — and its
@@ -192,13 +227,43 @@ packet not burning a window slot, `REJECT_AFTER_MESSAGES` refused on both seal a
 dirty-reserved-byte / wrong-receiver / tampered inputs, buffer sizing on both sides, and a
 `std.testing.fuzz` harness over `open`.
 
-**Measured** (i7-7920HQ, AVX2, ReleaseFast, `-Dcpu=native`, 1420-byte payload, `WIREGUARD_BENCH=1`):
-the full `seal` path — header write, copy-and-pad, AEAD, counter limits — runs **~1.3–1.5 µs/packet
-(~0.7 Mpps, ~1.0 GB/s)**, and `open` (which additionally updates the replay window) the same within
-noise. The bare AEAD alone is ~1.3–1.4 µs, so the module's framing costs approximately nothing next
-to the crypto; the 2.3–2.4× `chachapoly`-over-std ratio therefore survives to the API a consumer
-actually calls. Still no socket, no routing table and no queue in the timed region — a real tunnel
-adds a syscall (~1–2 µs) per packet on top, which will dominate.
+**The limits are pinned to their delivered values, not to their own expressions.** A boundary test
+written as `max_payload + 1`, or an oracle written as `highest − counter <= W.capacity`, moves with
+the constant and stays green for *any* value of it — the receive window could halve and the maximum
+packet size drop 40× with the suite untouched. So the numbers a consumer reads here are asserted as
+absolutes: `max_payload == 65472` and `sealedLen(max_payload) == 65504`; `default_window_bits ==
+8192` with `Window.capacity == 8128`, plus `ReplayWindow(128/256/1024/4096).capacity ==
+64/192/960/4032` so a cut that spares the oracle's own widths still cannot hide; and behaviourally,
+a 65472-byte payload really seals and round-trips while 65473 is `error.PacketTooLarge`, and a
+counter exactly 8128 behind the high-water mark is still accepted while 8129 is `error.Replayed`.
+The two lifetime constants are pinned the same way — `reject_after_time_s == 180`,
+`rekey_after_time_s == 120`, with the behavioural boundaries written in literal seconds since the
+session's birth (179 s seals, 180 s is `error.SessionExpired`; 119 s is `RekeyState.ok`, 120 s is
+`.due`) rather than as offsets from the constants they are testing. The `kernel_goldens.zig` count
+canary likewise derives its count from `builtin.test_functions` instead of comparing a literal
+against itself.
+
+**Measured** (i7-7920HQ, AVX2, ReleaseFast, `-Dcpu=native`, 1420-byte payload, `WIREGUARD_BENCH=1`;
+re-measured 2026-08-11, four runs).
+
+The durable claim is the **ratio**, because it is the only figure that survives a shared machine:
+`chachapoly`-over-std is **2.4–2.6× on both `seal` and `open`** at a full MTU, and it does not move
+between an idle and a loaded host. The absolute figures do move: the full `seal` path — header
+write, copy-and-pad, AEAD, counter limits, session age — measured **1.36 µs/packet (0.73 Mpps,
+~1.04 GB/s)** on the least-contended of four runs and **1.75 µs (0.57 Mpps, ~0.81 GB/s)** on the
+most-contended, on a box carrying an unrelated build at load ~4/8. `open` (which additionally
+consults and updates the replay window) tracks it within 2 % in every run. Read the absolutes as
+"about 1.3–1.8 µs/packet on this class of core, single-threaded" and the ratio as the number a
+regression should be judged against; an earlier note quoting `~1.3–1.5 µs` and `2.3–2.4×` was
+narrower than the run-to-run spread the same command actually produces.
+
+The bare AEAD alone measured 1.34–1.74 µs across the same runs — i.e. indistinguishable from the
+full path, so the module's framing (and the §6.1 limit checks) cost approximately nothing next to
+the crypto, and the `chachapoly` win survives to the API a consumer actually calls. The by-size
+sweep still shows no payload size losing materially: ~1.0× up to 128 bytes (where the executed code
+literally *is* std's, via `chachapoly`'s delegation thresholds), ~1.1× at 144 B, then 2.0× at 512 B
+and 2.4–2.5× at 1420 B. Still no socket, no routing table and no queue in the timed region — a real
+tunnel adds a syscall (~1–2 µs) per packet on top, which will dominate.
 
 ## Status
 `gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly` — canonical source is
