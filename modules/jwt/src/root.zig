@@ -212,6 +212,18 @@ pub const ParseError = error{
     /// A known header parameter or registered claim has the wrong JSON type
     /// (e.g. string `exp`, numeric `iss`, non-string entry in an `aud` array).
     InvalidClaim,
+    /// `crit` (RFC 7515 §4.1.11) is present but malformed: not an array, an
+    /// empty array, a non-string or empty-string entry, a duplicate entry, a
+    /// name that is not itself present in the JOSE header, or an
+    /// RFC-registered header parameter name (all of which the RFC forbids in
+    /// `crit`).
+    InvalidCrit,
+    /// `crit` is well-formed but lists an extension header parameter this
+    /// implementation does not understand *and* process. RFC 7515 §4.1.11 is a
+    /// MUST ("if any of the listed extension Header Parameters are not
+    /// understood and supported by the recipient, then the JWS is invalid"),
+    /// restated by RFC 8725 §3.3 — so the token is rejected, not ignored.
+    UnsupportedCritHeader,
     OutOfMemory,
 };
 
@@ -268,7 +280,93 @@ pub const Header = struct {
     /// Key ID — Part 4's JWKS lookup key.
     kid: ?[]const u8 = null,
     cty: ?[]const u8 = null,
+    /// RFC 7515 §4.1.11 `crit` — the extension header parameter names the
+    /// producer marked critical, exposed so a caller can inspect them.
+    /// A `ParsedToken` only ever reaches a caller with this non-null when
+    /// **every** listed name is in `understood_crit_headers`; `parse` rejects
+    /// the token otherwise (`InvalidCrit` / `UnsupportedCritHeader`). Since
+    /// this library implements no JWS extension, that set is empty today and
+    /// any `crit` token fails closed.
+    crit: ?[]const []const u8 = null,
 };
+
+/// Header parameter names this implementation both **understands and
+/// actually processes** when a producer lists them in `crit` (RFC 7515
+/// §4.1.11). Deliberately empty: this library implements no JWS extension
+/// (no RFC 7797 `b64`, no OIDC `at_hash`-style header extension), so there is
+/// no name it may honour a `crit` marking for. Adding an extension means
+/// adding its name here *and* processing it — never one without the other.
+pub const understood_crit_headers: []const []const u8 = &.{};
+
+/// Header parameter names registered by RFC 7515 §4.1 / RFC 7516 §4.1 /
+/// RFC 7518, which "MUST NOT" appear in `crit` (RFC 7515 §4.1.11: the list
+/// carries *extension* parameters only). Note `b64` (RFC 7797) is absent on
+/// purpose — it is an extension whose spec *requires* a `crit` marking.
+const registered_header_params = [_][]const u8{
+    // RFC 7515 §4.1 (JWS) — incl. the ones this module reads.
+    "alg", "jku", "jwk",  "kid", "x5u", "x5c", "x5t", "x5t#S256",
+    "typ", "cty", "crit",
+    // RFC 7516 §4.1 / RFC 7518 §4.6-4.8 (JWE / key management) — equally
+    // registered, so equally forbidden in a `crit` list.
+    "enc", "zip", "epk", "apu", "apv",
+    "iv",  "tag", "p2s",  "p2c",
+};
+
+fn isRegisteredHeaderParam(name: []const u8) bool {
+    for (registered_header_params) |r| {
+        if (std.mem.eql(u8, r, name)) return true;
+    }
+    return false;
+}
+
+fn isUnderstoodCritHeader(name: []const u8) bool {
+    for (understood_crit_headers) |u| {
+        if (std.mem.eql(u8, u, name)) return true;
+    }
+    return false;
+}
+
+/// RFC 7515 §4.1.11 `crit`: parse the list, enforce every syntactic rule the
+/// RFC states, then fail closed on any name this implementation does not
+/// understand. Called from `parse`, so **every** entry point (offline verify,
+/// JWKS, `Provider`, `ResourceServer`, `Guard`, the RP's `acceptIdToken*`)
+/// inherits the rejection — a critical extension can never be silently
+/// ignored.
+fn extractCrit(arena: std.mem.Allocator, obj: std.json.ObjectMap) ParseError!?[]const []const u8 {
+    const v = obj.get("crit") orelse return null;
+    // "the value MUST be an array of Header Parameter names" …
+    if (v != .array) return error.InvalidCrit;
+    const items = v.array.items;
+    // … "MUST NOT be empty" (nor may producers emit an empty entry).
+    if (items.len == 0) return error.InvalidCrit;
+
+    const out = try arena.alloc([]const u8, items.len);
+    for (items, 0..) |item, i| {
+        const name = switch (item) {
+            .string => |s| s,
+            else => return error.InvalidCrit,
+        };
+        if (name.len == 0) return error.InvalidCrit;
+        // "MUST NOT include Header Parameter names defined by [RFC 7515] or
+        // [RFC 7518]".
+        if (isRegisteredHeaderParam(name)) return error.InvalidCrit;
+        // "MUST NOT include … any Header Parameter … not present in the JOSE
+        // Header".
+        if (obj.get(name) == null) return error.InvalidCrit;
+        // "MUST NOT include duplicate names" — a recipient may treat the JWS
+        // as invalid, and this one does.
+        for (out[0..i]) |seen| {
+            if (std.mem.eql(u8, seen, name)) return error.InvalidCrit;
+        }
+        out[i] = name;
+    }
+    // The MUST-reject itself: understood *and* processed, or the JWS is
+    // invalid.
+    for (out) |name| {
+        if (!isUnderstoodCritHeader(name)) return error.UnsupportedCritHeader;
+    }
+    return out;
+}
 
 /// The `aud` claim (RFC 7519 §4.1.3): absent, a single StringOrURI, or an
 /// array of them.
@@ -368,6 +466,12 @@ pub const ParsedToken = struct {
 /// **not** validate any claim (call `validateClaims` — and, from Part 2 on,
 /// `verify` — separately). The result owns copies of everything it needs;
 /// `token` may be freed immediately after this returns.
+///
+/// One header rule IS enforced here, because it is a property of this
+/// implementation rather than of caller policy: RFC 7515 §4.1.11 `crit`
+/// (see `extractCrit`). A token marking any extension header parameter
+/// critical is rejected — never parsed-and-ignored — so no downstream path
+/// can accept it.
 pub fn parse(gpa: std.mem.Allocator, token: []const u8) ParseError!ParsedToken {
     // Split into exactly three segments (an unsecured JWT's third segment
     // is legitimately empty, so only header/payload must be non-empty).
@@ -405,6 +509,7 @@ pub fn parse(gpa: std.mem.Allocator, token: []const u8) ParseError!ParsedToken {
         .typ = try optionalString(header_obj, "typ"),
         .kid = try optionalString(header_obj, "kid"),
         .cty = try optionalString(header_obj, "cty"),
+        .crit = try extractCrit(arena, header_obj),
     };
 
     // Payload / claims.
@@ -2022,26 +2127,45 @@ pub const BearerChallengeParams = struct {
 /// Write an RFC 6750 §3 `WWW-Authenticate: Bearer …` header *value* to `w` —
 /// the header-value helper a resource server uses for its 401/403 challenges.
 /// `Guard` and `ResourceServer` precompute their challenge strings with it.
+///
+/// Grammar (RFC 7235 §2.1): `challenge = auth-scheme [ 1*SP ( token68 /
+/// #auth-param ) ]`. `#auth-param` is a **comma**-delimited list (RFC 7230
+/// §7), which is also the form of RFC 6750 §3's own example
+/// (`Bearer realm="example", error="invalid_token", …`): one space after the
+/// scheme, then `", "` between parameters. Space-separated parameters are
+/// malformed — a conforming `1#challenge` parser splitting on commas would
+/// read the tail as a second challenge with a bogus auth-scheme.
 pub fn writeBearerChallenge(w: *Writer, p: BearerChallengeParams) Writer.Error!void {
     try w.writeAll("Bearer");
+    var wrote_param = false;
     if (p.realm) |r| {
-        try w.writeAll(" realm=\"");
+        try writeAuthParamSep(w, &wrote_param);
+        try w.writeAll("realm=\"");
         try w.writeAll(r);
         try w.writeByte('"');
     }
     if (p.error_code) |code| {
-        try w.writeAll(" error=\"");
+        try writeAuthParamSep(w, &wrote_param);
+        try w.writeAll("error=\"");
         try w.writeAll(code);
         try w.writeByte('"');
     }
     if (p.scopes.len != 0) {
-        try w.writeAll(", scope=\"");
+        try writeAuthParamSep(w, &wrote_param);
+        try w.writeAll("scope=\"");
         for (p.scopes, 0..) |s, i| {
             if (i != 0) try w.writeByte(' ');
             try w.writeAll(s);
         }
         try w.writeByte('"');
     }
+}
+
+/// The `auth-scheme`→first-param separator is SP; every later one is `", "`
+/// (RFC 7235 §2.1 + RFC 7230 §7 list syntax).
+fn writeAuthParamSep(w: *Writer, wrote_param: *bool) Writer.Error!void {
+    try w.writeAll(if (wrote_param.*) ", " else " ");
+    wrote_param.* = true;
 }
 
 fn allocBearerChallenge(gpa: std.mem.Allocator, p: BearerChallengeParams) error{OutOfMemory}![]const u8 {
@@ -2684,9 +2808,10 @@ fn tokenStringMember(obj: std.json.ObjectMap, name: []const u8) error{InvalidFie
 /// mandatory `iss`/`aud`) plus the ID-Token-specific RP checks (OIDC Core
 /// §3.1.3.7).
 pub const IdTokenError = ParseAndVerifyError || error{
-    /// `aud` has more than one value but `azp` is absent or does not equal
-    /// `client_id` (OIDC Core §3.1.3.7 steps 3-4 — a multi-audience ID Token
-    /// MUST name its authorized party explicitly).
+    /// The authorized-party check failed (OIDC Core §3.1.3.7 steps 3-4):
+    /// either `azp` is present and is not exactly this `client_id` — at ANY
+    /// `aud` arity, step 4 has no audience-count precondition — or `aud` has
+    /// more than one value and `azp` is absent (step 3).
     AzpMismatch,
     /// The ID Token has no `nonce` claim at all, though this RP's
     /// authorization request always sends one — a conforming OP echoes it
@@ -2709,9 +2834,10 @@ pub const IdTokenOptions = struct {
     leeway_s: u32 = 60,
     /// Expected `iss` — the OP's issuer identifier.
     issuer: []const u8,
-    /// This RP's client_id — checked against `aud` (MUST be contained) and,
-    /// when `aud` has multiple values, against `azp` (MUST be present and
-    /// equal).
+    /// This RP's client_id — checked against `aud` (MUST be contained) and
+    /// against `azp` whenever that claim is present (OIDC Core §3.1.3.7
+    /// step 4); with multiple audiences `azp` must additionally be there at
+    /// all (step 3).
     client_id: []const u8,
     /// The nonce generated for this authorization request (`generateNonce`)
     /// — MUST match the token's `nonce` claim exactly.
@@ -2788,11 +2914,23 @@ pub fn acceptIdTokenProvider(
 }
 
 fn enforceIdTokenRpChecks(parsed: *const ParsedToken, client_id: []const u8, nonce: []const u8) IdTokenError!void {
-    // OIDC Core §3.1.3.7 steps 3-4: multiple audiences require an explicit
-    // authorized party naming THIS client.
-    if (parsed.claims.aud == .many and parsed.claims.aud.many.len > 1) {
-        const azp = parsed.claims.claimStr("azp") orelse return error.AzpMismatch;
+    // OIDC Core §3.1.3.7 step 4 — "If an `azp` Claim is present, the Client
+    // SHOULD verify that its client_id is the Claim Value" — carries NO
+    // audience-count precondition. Enforce it whenever `azp` is present, at
+    // any `aud` arity: a token minted **for another client** at the same OP
+    // but audienced at us is not our login (the cross-client-identity /
+    // Authorized-Party shape). A non-string `azp` is a wrong-typed identity
+    // claim, so it fails the same way rather than being ignored.
+    if (parsed.claims.claim("azp")) |azp_val| {
+        const azp = switch (azp_val) {
+            .string => |s| s,
+            else => return error.AzpMismatch,
+        };
         if (!std.mem.eql(u8, azp, client_id)) return error.AzpMismatch;
+    } else if (parsed.claims.aud == .many and parsed.claims.aud.many.len > 1) {
+        // Step 3: with multiple audiences `azp` SHOULD be present — an OP is
+        // not trusted to imply which of several audiences authorized it.
+        return error.AzpMismatch;
     }
     // Step 11: the nonce this RP generated MUST come back unchanged.
     const nonce_claim = parsed.claims.claimStr("nonce") orelse return error.MissingNonce;
@@ -3358,6 +3496,155 @@ test "malformed: wrong-typed registered claims are rejected" {
     ,
         \\{"iss":"joe"}
     )));
+}
+
+test "SECURITY: RFC 7515 §4.1.11 `crit` — an unsupported critical header fails closed" {
+    const gpa = testing.allocator;
+    var buf: [512]u8 = undefined;
+
+    // A well-formed `crit` naming an extension header parameter that is also
+    // really present in the header. This module implements NO JWS extension,
+    // so the RFC's MUST applies: the JWS is invalid, not "verify and ignore".
+    try testing.expectError(error.UnsupportedCritHeader, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","http://example.com/exp2":true,"crit":["http://example.com/exp2"]}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // RFC 7797 `b64` is the canonical real-world case: an extension whose own
+    // spec REQUIRES the `crit` marking. Unsupported here ⇒ rejected.
+    try testing.expectError(error.UnsupportedCritHeader, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","b64":false,"crit":["b64"]}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // Two names, only the second unknown — the whole list must be understood.
+    try testing.expectError(error.UnsupportedCritHeader, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","b64":false,"x":1,"crit":["b64","x"]}
+    ,
+        \\{"iss":"joe"}
+    )));
+
+    // A token with NO crit still parses — the check must not be a blanket
+    // rejection of every header.
+    var ok = try parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","kid":"k1"}
+    ,
+        \\{"iss":"joe"}
+    ));
+    defer ok.deinit();
+    try testing.expectEqual(@as(?[]const []const u8, null), ok.header.crit);
+}
+
+test "RFC 7515 §4.1.11 `crit`: every degenerate form the RFC calls out is rejected" {
+    const gpa = testing.allocator;
+    var buf: [512]u8 = undefined;
+
+    // Not an array.
+    try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","b64":false,"crit":"b64"}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // Empty array ("MUST NOT be empty").
+    try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","crit":[]}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // Non-string entry.
+    try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","crit":[42]}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // Empty-string entry.
+    try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","":1,"crit":[""]}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // Duplicate entry.
+    try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","b64":false,"crit":["b64","b64"]}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // A name that is not present in the JOSE header at all.
+    try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf,
+        \\{"alg":"HS256","crit":["b64"]}
+    ,
+        \\{"iss":"joe"}
+    )));
+    // RFC-registered names are forbidden in `crit` — including the ones this
+    // module itself reads, which is exactly the shape that would let a
+    // producer "critically" redefine `alg`/`kid`/`typ`.
+    const registered_headers = [_][]const u8{
+        \\{"alg":"HS256","crit":["alg"]}
+        ,
+        \\{"alg":"HS256","crit":["crit"]}
+        ,
+        \\{"alg":"HS256","kid":"k","crit":["kid"]}
+        ,
+        \\{"alg":"HS256","typ":"JWT","crit":["typ"]}
+        ,
+        \\{"alg":"HS256","cty":"x","crit":["cty"]}
+        ,
+        \\{"alg":"HS256","enc":"x","crit":["enc"]}
+        ,
+        \\{"alg":"HS256","zip":"DEF","crit":["zip"]}
+        ,
+        \\{"alg":"HS256","x5t#S256":"x","crit":["x5t#S256"]}
+        ,
+    };
+    for (registered_headers) |header| {
+        try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf, header,
+            \\{"iss":"joe"}
+        )));
+    }
+}
+
+test "SECURITY: a cryptographically VALID token carrying `crit` is still rejected end-to-end" {
+    // Positive control for the fail-closed claim: the HMAC is genuine, every
+    // claim is fine, and the ONLY defect is the critical extension header.
+    // A recipient that verified-and-ignored it would honour a token whose
+    // producer explicitly said "do not process this without understanding
+    // my extension" (RFC 8725 §3.3).
+    const gpa = testing.allocator;
+    const secret = "crit-test-secret";
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"HS256","http://example.com/UNDEFINED":true,"crit":["http://example.com/UNDEFINED"]}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://svc","exp":100000}
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, secret);
+    const token = finishToken(&buf, si.len, &mac);
+
+    // The same signing input + MAC, minus the crit header, DOES verify — so
+    // the rejection below is provably about `crit`, not a broken signature.
+    {
+        var plain_buf: [512]u8 = undefined;
+        const plain_si = signingInputInto(&plain_buf,
+            \\{"alg":"HS256"}
+        ,
+            \\{"iss":"https://issuer.example","aud":"api://svc","exp":100000}
+        );
+        var plain_mac: [32]u8 = undefined;
+        hmac_sha2.HmacSha256.create(&plain_mac, plain_si, secret);
+        var good = try parseAndVerify(gpa, finishToken(&plain_buf, plain_si.len, &plain_mac), .{ .hmac = secret }, .{
+            .now_s = 1000,
+            .issuer = .{ .required = "https://issuer.example" },
+            .audience = .{ .required = "api://svc" },
+        });
+        good.deinit();
+    }
+
+    try testing.expectError(error.UnsupportedCritHeader, parseAndVerify(gpa, token, .{ .hmac = secret }, .{
+        .now_s = 1000,
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .{ .required = "api://svc" },
+    }));
 }
 
 test "garbage sweep: arbitrary bytes never panic" {
@@ -5436,7 +5723,7 @@ test "ResourceServer: expired and insufficient-scope tokens, and the scope chall
         const req = resWire(&req_buf, "GET", "/data", bearer);
         const got = resRunWire(&r, req, &out_buf);
         try resExpectStatus(got, "401");
-        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"invalid_token\"");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\", error=\"invalid_token\"");
     }
 
     // Valid + fresh but missing the required "admin" scope → 403.
@@ -5448,7 +5735,7 @@ test "ResourceServer: expired and insufficient-scope tokens, and the scope chall
         const req = resWire(&req_buf, "GET", "/data", bearer);
         const got = resRunWire(&r, req, &out_buf);
         try resExpectStatus(got, "403");
-        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"insufficient_scope\", scope=\"admin\"");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\", error=\"insufficient_scope\", scope=\"admin\"");
     }
 }
 
@@ -5597,6 +5884,48 @@ test "scope helpers: scopeGranted + require single/all/any over `scope` string a
     try testing.expect(!scopeGranted(t3.claims, "d"));
 }
 
+/// Read one of this module's shipped Markdown docs for the doc-drift test.
+/// Tries the repo-root-relative path first (`zig build` runs test binaries
+/// with the build root as cwd) and the module dir second; if neither exists
+/// the test FAILS rather than skipping — an unreadable doc must not read as
+/// an in-sync doc.
+fn readModuleDoc(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    var path_buf: [128]u8 = undefined;
+    const candidates = [_][]const u8{ "modules/jwt/", "", "../" };
+    for (candidates) |prefix| {
+        const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ prefix, name }) catch unreachable;
+        return cwd.readFileAlloc(io, path, gpa, .limited(1 << 20)) catch continue;
+    }
+    return error.ModuleDocNotFound;
+}
+
+test "docs track the code: no std-only-crypto claim, `p256` listed everywhere deps are" {
+    // Doc drift is invisible to every other test in this file, so the two
+    // provenance claims that outlived the code (`3403d47` moved ES256 onto
+    // the in-repo `p256`) are pinned against the shipped Markdown itself.
+    const gpa = testing.allocator;
+    const spec_md = try readModuleDoc(gpa, "SPEC.md");
+    defer gpa.free(spec_md);
+    const readme_md = try readModuleDoc(gpa, "README.md");
+    defer gpa.free(readme_md);
+
+    // `pub const meta` is the canonical dep list — SPEC.md's Status line must
+    // agree with it, name for name.
+    inline for (meta.deps) |d| {
+        try testing.expect(std.mem.indexOf(u8, spec_md, "`" ++ d ++ "`") != null);
+        try testing.expect(std.mem.indexOf(u8, readme_md, d) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, spec_md, "deps `http`, `router`, `p256`") != null);
+
+    // Neither document may claim the crypto is std-only any more.
+    try testing.expect(std.mem.indexOf(u8, spec_md, "std-only") == null);
+    try testing.expect(std.mem.indexOf(u8, readme_md, "std-only") == null);
+}
+
 test "writeBearerChallenge: RFC 6750 §3 header-value formatting" {
     var buf: [256]u8 = undefined;
     {
@@ -5622,9 +5951,41 @@ test "writeBearerChallenge: RFC 6750 §3 header-value formatting" {
             .scopes = &.{ "read", "write" },
         });
         try testing.expectEqualStrings(
-            "Bearer realm=\"svc\" error=\"insufficient_scope\", scope=\"read write\"",
+            "Bearer realm=\"svc\", error=\"insufficient_scope\", scope=\"read write\"",
             w.buffered(),
         );
+    }
+    // Every non-first auth-param is comma-delimited (RFC 7235 §2.1
+    // `#auth-param` + RFC 7230 §7), not SP-delimited. Checked structurally as
+    // well as by the exact strings above: parse the value the way a strict
+    // `1#challenge` recipient does — split on commas — and require that only
+    // the FIRST element carries the auth-scheme and that every element is a
+    // single `name="value"` pair.
+    {
+        var w: Writer = .fixed(&buf);
+        try writeBearerChallenge(&w, .{
+            .realm = "svc",
+            .error_code = "insufficient_scope",
+            .scopes = &.{ "read", "write" },
+        });
+        const value = w.buffered();
+        var it = std.mem.splitScalar(u8, value, ',');
+        const first = it.next().?;
+        try testing.expectEqualStrings("Bearer realm=\"svc\"", first);
+        var params: usize = 1;
+        while (it.next()) |raw_part| {
+            const part = std.mem.trimStart(u8, raw_part, " ");
+            // No element after the first may look like a new challenge, i.e.
+            // it must be exactly one auth-param: `name="…"`, no interior SP
+            // outside the quoted value.
+            const eq = std.mem.indexOfScalar(u8, part, '=') orelse return error.TestUnexpectedResult;
+            try testing.expect(eq > 0);
+            try testing.expect(std.mem.indexOfScalar(u8, part[0..eq], ' ') == null);
+            try testing.expectEqual(@as(u8, '"'), part[eq + 1]);
+            try testing.expectEqual(@as(u8, '"'), part[part.len - 1]);
+            params += 1;
+        }
+        try testing.expectEqual(@as(usize, 3), params);
     }
 }
 
@@ -5677,7 +6038,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
     {
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", "Bearer not.a.jwt"), &out_buf);
         try resExpectStatus(got, "401");
-        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"invalid_token\"");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\", error=\"invalid_token\"");
     }
     // Valid signature but expired (exp 500 < now 1000) → 401 invalid_token.
     {
@@ -5696,7 +6057,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{narrow}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "403");
-        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"insufficient_scope\", scope=\"read\"");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\", error=\"insufficient_scope\", scope=\"read\"");
     }
     // Unsecured alg:none (kid rs) → 401 invalid_token — never trusted (RFC 8725 §2.1).
     {
@@ -5706,7 +6067,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{none_tok}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "401");
-        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"invalid_token\"");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\", error=\"invalid_token\"");
     }
     // alg confusion: an HS256 header pointing at the RSA verification key
     // (the classic RS→HS downgrade). The alg/key TYPE mismatch is caught
@@ -5844,6 +6205,32 @@ test "PKCE: pkceGenerateS256 — lengths, cross-checks pkceChallengeS256, distin
     try testing.expect(!std.mem.eql(u8, p1.challenge(), p2.challenge()));
 }
 
+test "SECURITY: pkceGenerate* deliver the CSPRNG's next 32 bytes verbatim (entropy pin)" {
+    // Found by mutating `pkceGenerateS256` the same way `generateCsrfToken`
+    // was mutated: draw 4 bytes, zero-fill the other 28 — a 32-bit
+    // `code_verifier` — and the whole suite stayed green. RFC 7636 §7.1
+    // requires the verifier to have at least 256 bits of entropy, and it is
+    // the ONLY thing standing between an intercepted authorization code and
+    // token redemption, so the delivered draw is pinned like `state`/`nonce`.
+    var oracle = std.Random.DefaultCsprng.init([_]u8{0x4d} ** 32);
+    var raw: [32]u8 = undefined;
+    oracle.random().bytes(&raw);
+    var expect: [43]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&expect, &raw);
+
+    var s256_rng = std.Random.DefaultCsprng.init([_]u8{0x4d} ** 32);
+    const s256 = pkceGenerateS256(s256_rng.random());
+    try testing.expectEqualStrings(&expect, s256.verifier());
+
+    var plain_rng = std.Random.DefaultCsprng.init([_]u8{0x4d} ** 32);
+    const plain = pkceGeneratePlain(plain_rng.random());
+    try testing.expectEqualStrings(&expect, plain.verifier());
+
+    // 43 chars = base64url of exactly 32 bytes (24 bytes → 32 chars,
+    // 16 bytes → 22): written as literals, not as the module's constants.
+    try testing.expectEqual(@as(usize, 43), s256.verifier().len);
+}
+
 test "PKCE: pkceGeneratePlain — challenge equals verifier verbatim (discouraged fallback)" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
     const p = pkceGeneratePlain(csprng.random());
@@ -5868,6 +6255,53 @@ test "generateState / generateNonce: non-empty, correct length, high entropy, ba
     try testing.expect(!std.mem.eql(u8, &s1, &n1));
     for (s1) |c| try testing.expect(isBase64UrlChar(c));
     for (n1) |c| try testing.expect(isBase64UrlChar(c));
+}
+
+test "SECURITY: generateState/generateNonce deliver the CSPRNG's next 32 bytes verbatim (entropy pin)" {
+    // The test above pins LENGTH and ALPHABET only, and both survive gutting
+    // the entropy (draw 4 bytes, zero-fill the rest: still 43 base64url
+    // characters, still all-distinct across calls — and only 32 bits to
+    // guess). `state` (RFC 6749 §10.12, login CSRF) and `nonce` (OIDC Core
+    // §3.1.2.1, ID-Token replay) are precisely the values whose security IS
+    // their unguessability, so the delivered draw itself is pinned here.
+
+    // (a) Literal pin: this seed, through the shipped code path, produces
+    //     exactly these 43 characters. Any change to how much randomness is
+    //     drawn, or to how it is encoded, changes them.
+    {
+        var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+        const s = generateState(csprng.random());
+        try testing.expectEqualStrings("2-3w7lc6IlUMeknpJ4FakX5bquD-YmXDpYbbdfGdcAc", &s);
+        const n = generateNonce(csprng.random());
+        try testing.expectEqualStrings("ItOi8Swzi4OA9Zk-XTh6WCLdWEL12tDTPg-CXrt-tYM", &n);
+    }
+
+    // (b) Independent oracle for WHAT those characters are: base64url of the
+    //     generator's next 32 bytes — nothing truncated, padded, reused or
+    //     zero-filled. `32` and `43` are written as literals on purpose; a
+    //     test phrased in terms of the module's own constants would only
+    //     re-assert them.
+    {
+        var oracle = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+        var raw: [32]u8 = undefined;
+        oracle.random().bytes(&raw);
+        var expect: [43]u8 = undefined;
+        _ = std.base64.url_safe_no_pad.Encoder.encode(&expect, &raw);
+
+        var csprng = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+        const s = generateState(csprng.random());
+        try testing.expectEqualStrings(&expect, &s);
+
+        // Same for `nonce`: it must consume the same 32-byte draw, not a
+        // narrower one.
+        var csprng2 = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+        const n = generateNonce(csprng2.random());
+        try testing.expectEqualStrings(&expect, &n);
+
+        // And the pinned draw really is the full 32 bytes: base64url of 32
+        // bytes is 43 chars, of 24 bytes 32 chars, of 16 bytes 22.
+        try testing.expectEqual(@as(usize, 43), s.len);
+    }
 }
 
 test "buildAuthorizationUrl: builds the OIDC/RFC 6749 query, percent-encoded" {
@@ -5971,6 +6405,85 @@ test "buildTokenRequest: body round-trips through http.body.urlencoded (compatib
     try testing.expectEqualStrings("code_verifier", p5.name);
     try testing.expectEqualStrings("v", p5.value);
     try testing.expectEqual(@as(?http.body.FormPair, null), it.next());
+}
+
+test "fuzz: parseTokenResponse never panics on arbitrary or near-valid token bodies" {
+    try testing.fuzz({}, fuzzParseTokenResponse, .{});
+}
+
+/// Adversarial JSON values a hostile or broken OP could put in a
+/// token-endpoint member: wrong types, extremes, empties, and numbers that do
+/// not fit an `i64`.
+const token_response_values = [_][]const u8{
+    "\"at\"",
+    "\"\"",
+    "0",
+    "-1",
+    "9223372036854775807",
+    "-9223372036854775808",
+    "12345678901234567890123456789",
+    "3.5",
+    "-0.0",
+    "1e400",
+    "-1e400",
+    "true",
+    "false",
+    "null",
+    "{}",
+    "[]",
+    "[\"a\"]",
+    "{\"a\":1}",
+    "\"\\u0000\\u001f\"",
+};
+
+const token_response_members = [_][]const u8{
+    "access_token", "token_type", "id_token", "expires_in", "refresh_token", "scope", "unknown_ext",
+};
+
+/// `parseTokenResponse` is untrusted-wire input like `parse` and `parseJwks`:
+/// the body arrives over TLS from the OP, but a compromised or simply broken
+/// OP still controls every byte. Two regions per iteration:
+///   (a) pure garbage bytes — the shape the two sibling harnesses use;
+///   (b) a *well-formed* JSON object with the right member names, sweeping
+///       every adversarial value through every member. A byte fuzzer would
+///       essentially never reach that region on its own, and it is where the
+///       typed extraction actually lives, so the sweep is exhaustive rather
+///       than smith-sampled — one iteration covers the whole table.
+fn fuzzParseTokenResponse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    {
+        smith.bytes(&buf);
+        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+        // NB: a typed error here must NOT abandon the iteration — nearly every
+        // random byte string is a parse error, and an early `return` would
+        // silently skip the structured sweep below (the skip-as-pass shape).
+        if (parseTokenResponse(testing.allocator, buf[0..len])) |ok| {
+            var resp = ok;
+            resp.deinit();
+        } else |_| {}
+    }
+
+    // Valid filler for the members not under test, so the value under test is
+    // always reached rather than short-circuited by a missing required member.
+    const filler = [token_response_members.len][]const u8{
+        "\"at\"", "\"Bearer\"", "\"x.y.z\"", "3600", "\"rt\"", "\"openid\"", "1",
+    };
+    for (token_response_members, 0..) |_, under_test| {
+        for (token_response_values) |value| {
+            var w: Writer = .fixed(&buf);
+            w.writeByte('{') catch continue;
+            for (token_response_members, 0..) |name, i| {
+                if (i != 0) w.writeByte(',') catch continue;
+                w.writeByte('"') catch continue;
+                w.writeAll(name) catch continue;
+                w.writeAll("\":") catch continue;
+                w.writeAll(if (i == under_test) value else filler[i]) catch continue;
+            }
+            w.writeByte('}') catch continue;
+            var resp = parseTokenResponse(testing.allocator, w.buffered()) catch continue;
+            resp.deinit();
+        }
+    }
 }
 
 test "parseTokenResponse: full response, missing-required and wrong-typed-optional errors" {
@@ -6175,6 +6688,195 @@ test "acceptIdToken: multiple audiences require a matching azp (OIDC Core §3.1.
             .nonce = id_token_nonce,
         });
         accepted.deinit();
+    }
+}
+
+test "SECURITY: a SINGLE-aud ID Token whose azp names a DIFFERENT client is rejected (OIDC Core §3.1.3.7 step 4)" {
+    const gpa = testing.allocator;
+    // The cross-client-identity shape: the OP minted this token FOR
+    // `attacker-client` (that is what `azp` states) and merely audienced it
+    // at us. Every other check passes — signature, iss, aud contains our
+    // client_id, exp, nonce. Step 4 has no `aud`-count precondition, so the
+    // authorized party must be verified here too.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"azp\":\"attacker-client\",\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        // Positive control: it really is cryptographically valid on its own.
+        var parsed = try parse(gpa, token);
+        defer parsed.deinit();
+        try verify(&parsed, .{ .hmac = id_token_secret });
+
+        try testing.expectError(error.AzpMismatch, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+    // Same shape with a single-element `aud` ARRAY — the arity, not the JSON
+    // encoding, is what used to gate the check.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":[\"" ++ id_token_client_id ++ "\"]," ++
+                "\"azp\":\"attacker-client\",\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.AzpMismatch, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+    // A wrong-typed `azp` is not a free pass either.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"azp\":42,\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.AzpMismatch, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+    // Controls: single `aud` with a CORRECT `azp`, and single `aud` with no
+    // `azp` at all, both still accepted (step 3 only demands `azp` when the
+    // audience is ambiguous).
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"azp\":\"" ++ id_token_client_id ++ "\",\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        var accepted = try acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        });
+        accepted.deinit();
+    }
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        var accepted = try acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        });
+        accepted.deinit();
+    }
+}
+
+test "IdTokenOptions.leeway_s: the default clock-skew window is exactly 60 s (blind-constant pin)" {
+    const gpa = testing.allocator;
+    // The default is a security parameter — it is how long an EXPIRED ID
+    // Token stays acceptable. Nothing pinned it: the only bound in the suite
+    // was a 900 s-stale token, leaving the whole [60, 899] band invisible.
+    // These two cases sit either side of the boundary, so the default cannot
+    // be widened OR narrowed without this test going red.
+
+    // exp = 940 with now = 1000 → expired by exactly 60 s → still inside the
+    // default leeway.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"exp\":940,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        var accepted = try acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        });
+        accepted.deinit();
+    }
+    // exp = 939 → expired by 61 s → one second outside it.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"exp\":939,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.Expired, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+}
+
+test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 60 s (blind-constant pin)" {
+    // Same boundary, through the Provider path — whose `leeway_s` default was
+    // never set OR checked by any test at all.
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** 32);
+    const pub_bytes = kp.public_key.toBytes();
+    var x_b64: [43]u8 = undefined;
+    var set_buf: [256]u8 = undefined;
+    const set = try std.fmt.bufPrint(&set_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"op-key","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&x_b64, &pub_bytes)});
+
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+        .{ .url = test_jwks_url, .body = set },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer provider.deinit();
+
+    // exp = 940, now = 1000 → 60 s stale → accepted under the default.
+    {
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(
+            &buf,
+            \\{"alg":"EdDSA","kid":"op-key"}
+        ,
+            "{\"iss\":\"https://issuer.example\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"exp\":940,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        const sig = (try kp.sign(si, null)).toBytes();
+        var accepted = try acceptIdTokenProvider(&provider, gpa, finishToken(&buf, si.len, &sig), 1000, .{
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        });
+        accepted.deinit();
+    }
+    // exp = 939 → 61 s stale → rejected.
+    {
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(
+            &buf,
+            \\{"alg":"EdDSA","kid":"op-key"}
+        ,
+            "{\"iss\":\"https://issuer.example\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"exp\":939,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        const sig = (try kp.sign(si, null)).toBytes();
+        try testing.expectError(error.Expired, acceptIdTokenProvider(&provider, gpa, finishToken(&buf, si.len, &sig), 1000, .{
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
     }
 }
 

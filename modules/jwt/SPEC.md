@@ -11,8 +11,11 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   and have no `http` dep in the hot path; only `Provider`/`HttpFetcher` reach the network, behind a
   `Fetcher` seam. P7 also does no I/O — it builds requests and parses responses; the caller's HTTP
   client sends the request (same seam philosophy as P5's `Fetcher`).
-- **std-only crypto:** `std.base64.url_safe_no_pad`, `std.json`, `std.crypto` (RSA via
-  `std.crypto.Certificate.rsa` PKCS1-v1_5 over `std.crypto.ff`) — no bespoke crypto. Modeled after
+- **No bespoke crypto:** `std.base64.url_safe_no_pad`, `std.json`, `std.crypto` (RSA via
+  `std.crypto.Certificate.rsa` PKCS1-v1_5 over `std.crypto.ff`; HMAC, Ed25519 and ES384 from
+  `std.crypto` too) — plus the **in-repo `p256` module for ES256** since `3403d47`, which is
+  byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256` and carries that module's own KAT /
+  differential evidence. Nothing is hand-rolled here. Modeled after
   the JOSE/OAuth2 RFCs (7515/7519/7517/7518/8037/8017/8725, OIDC Discovery/RFC 8414, RFC 6750, RFC
   6749, RFC 7636); see NOTICE for full citation list.
 - **Concurrency:** reentrant except `Provider` (one mutable key cache) — the caller injects a lock
@@ -33,6 +36,15 @@ This is the security core; the defenses are the point:
 - **Algorithm confusion (RFC 8725):** `alg` is never trusted from the token to pick a key *class* —
   `none` is rejected; an HMAC `alg` can never verify against an asymmetric key (no RS/ES→HS
   downgrade); the expected algorithm/key type is fixed by the verifier, not the attacker.
+- **Critical header parameters (RFC 7515 §4.1.11 / RFC 8725 §3.3):** a token whose header carries
+  `crit` is **rejected in `parse`**, so every entry point (offline verify, JWKS, `Provider`,
+  `ResourceServer`, `Guard`, the RP's `acceptIdToken*`) inherits the rejection and no path can
+  verify-and-ignore an extension the producer marked as MUST-understand. `understood_crit_headers`
+  is the (currently empty) set of names this implementation both understands and processes; any
+  name outside it is `UnsupportedCritHeader`. The syntactic rules are enforced too
+  (`InvalidCrit`): non-array, empty array, non-string or empty entry, duplicate entry, a name not
+  actually present in the header, and any RFC-registered header parameter name — the last of which
+  is what would otherwise let a producer "critically" redefine `alg`/`kid`/`typ`.
 - **JWKS smuggling:** key selection is by `kid` against the *trusted* key set; an embedded `jwk`/
   `jku`/`x5u` in the token header is ignored — keys come only from the configured JWKS/Provider.
 - **Claims:** `exp`/`nbf`/`iat` validated against an injected clock with configurable skew; scope
@@ -87,10 +99,15 @@ This is the security core; the defenses are the point:
   stops replay/injection of an ID Token minted for a different authentication attempt. Verified by
   a positive-control test: a token that `verify()` accepts on its own is still rejected by
   `acceptIdToken` when the nonce differs.
-- **`azp` enforced only when `aud` is ambiguous (OIDC Core §3.1.3.7 steps 3-4):** a single-audience
-  token needs no `azp` (the mandatory `aud` check already pins it to this RP); a multi-audience
-  token without a matching `azp` is rejected (`AzpMismatch`) — an OP is not trusted to imply which
-  of several audiences actually authorized the token.
+- **`azp` verified whenever it is present, at any `aud` arity (OIDC Core §3.1.3.7 steps 3-4):**
+  step 4 ("If an `azp` Claim is present, the Client SHOULD verify that its `client_id` is the Claim
+  Value") has **no audience-count precondition** — only step 3 (`azp` SHOULD be *present*) is
+  conditioned on multiple audiences. So a present `azp` that is not this `client_id` is rejected
+  (`AzpMismatch`) even for a single-audience token: that is the cross-client-identity shape, an
+  ID Token minted **for another client** at the same OP and merely audienced at us. A wrong-typed
+  `azp` fails the same way. Absent `azp` is fine for a single audience (the mandatory `aud` check
+  already pins the token to this RP) but is rejected for a multi-audience token — an OP is not
+  trusted to imply which of several audiences actually authorized it.
 - **Discovery `authorization_endpoint`/`token_endpoint` are additive, not required:** `Metadata`
   gained these two optional fields for P7; a discovery document from an issuer that only ever
   served this module's original resource-server (P5) scope, and never populated them, still parses
@@ -135,5 +152,5 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
 
 ## Status
 
-`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router` — canonical
-source is `pub const meta` in src/root.zig.
+`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256` —
+canonical source is `pub const meta` in src/root.zig.

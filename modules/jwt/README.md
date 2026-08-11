@@ -9,10 +9,12 @@ for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384** (ECDSA P-256/P-384),
 RFC 8017 — the OIDC default), and **JWKS key sets** (RFC 7517): parse a
 `{"keys":[…]}` document into a typed `JwkSet`, select the key by the token
 header's `kid`, verify via `verifyWithJwks`/`parseVerifyJwks`. The signature
-core is std-only — `std.base64.url_safe_no_pad` for the segments, `std.json`
-for header/payload/JWKS, `std.crypto` for the signatures (RSA via
-`std.crypto.Certificate.rsa`'s PKCS1-v1_5 verify over `std.crypto.ff`
-modexp).
+core hand-rolls no crypto — `std.base64.url_safe_no_pad` for the segments,
+`std.json` for header/payload/JWKS, and `std.crypto` for the signatures (RSA
+via `std.crypto.Certificate.rsa`'s PKCS1-v1_5 verify over `std.crypto.ff`
+modexp), with the single exception of **ES256**, which runs on the in-repo
+`p256` module (byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`, ~2.7×
+faster verify) — see the Deps bullet below.
 
 On top of the offline core sit two turnkey layers: the **networked
 `Provider`** (P5) — OpenID Connect Discovery 1.0 (`<issuer>/.well-known/
@@ -81,6 +83,13 @@ that. Never authorize from a `ParsedToken` alone.
 `verify` implements the RFC 8725 hardening rules:
 
 - **`alg: "none"` is always rejected** (`UnsecuredToken`), key or no key.
+- **A `crit` header fails closed** — RFC 7515 §4.1.11 / RFC 8725 §3.3 make a
+  JWS invalid when it marks an extension header parameter critical that the
+  recipient does not understand *and* process. This library implements no JWS
+  extension (`understood_crit_headers` is empty), so any `crit` token is
+  rejected — in `parse`, before verification, so every entry point inherits
+  it. Malformed lists (non-array, empty, non-string/empty/duplicate entry, a
+  name absent from the header, or an RFC-registered name) are `InvalidCrit`.
 - **The token's `alg` must match the provided key's type**
   (`AlgKeyMismatch`) — an HS token offered an EC/Ed public key refuses
   *before any MAC math*, which blocks the classic RS/ES→HS downgrade where
@@ -119,7 +128,7 @@ ID-token acceptance).
 |---|---|
 | `parse(gpa, token) ParseError!ParsedToken` | split → base64url-decode → JSON → typed models; owns copies (one arena), input may be freed immediately |
 | `ParsedToken` | `header`, `claims`, `signing_input`, `signature` (raw bytes), `alg` (typed enum) + `deinit()` |
-| `Header` | `alg` (required), `typ`/`kid`/`cty` (optional) |
+| `Header` | `alg` (required), `typ`/`kid`/`cty` (optional), `crit` (RFC 7515 §4.1.11 — see SECURITY; a token carrying it is rejected by `parse` unless every listed name is in `understood_crit_headers`, which is empty) |
 | `Claims` | `iss`/`sub`/`aud`/`exp`/`nbf`/`iat`/`jti` + `raw` payload; `claim`/`claimStr`/`claimInt`/`claimBool` getters for custom claims (`scope`, …) |
 | `Audience` | `none` \| `single` \| `many` — the parsed `aud` (string OR array), with `contains()` |
 | `AudiencePolicy` / `IssuerPolicy` | mandatory-choice unions for `Options`: `.{ .required = "…" }` (must match) \| `.any` (conscious opt-out). No default — see "Mandatory audience/issuer" |
@@ -186,7 +195,7 @@ pin `.issuer = .{ .required = "…" }` or opt out with `.issuer = .any`.
 
 Typed errors, never a panic: `ParseError` = `MalformedToken` ·
 `InvalidBase64` · `InvalidJson` · `NotAnObject` · `MissingAlg` ·
-`InvalidClaim` · `OutOfMemory`; `ValidateError` = `Expired` · `NotYetValid`
+`InvalidClaim` · `InvalidCrit` · `UnsupportedCritHeader` · `OutOfMemory`; `ValidateError` = `Expired` · `NotYetValid`
 · `IssuedInFuture` · `IssuerMismatch` · `AudienceMismatch` · `MissingExp`;
 `VerifyError` = `UnsecuredToken` · `AlgKeyMismatch` · `UnsupportedAlg` ·
 `BadSignature` · `InvalidKey` · `NoMatchingKey` (JWKS resolution only);
