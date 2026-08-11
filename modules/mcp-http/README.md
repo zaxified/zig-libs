@@ -13,7 +13,12 @@ dispatch, error objects) and, per the MCP spec, rejects JSON-RPC batches.
 
 **Sessions** are optional. Leave `Transport.sessions` null for a **stateless**
 server (no `Mcp-Session-Id`; `GET`/`DELETE` → 405; every POST independent — the
-spec permits this). Set a `*Sessions` to enable the full session model: an
+spec permits this). One thing a stateless endpoint cannot do is complete a
+server→client round trip: with no session there is no handle to tell two
+clients apart, so a client's *response* to a `sampling`/`elicitation` request
+is refused with **400** rather than delivered into whichever flow happens to
+match the id. Set `stateless_responses = .single_client` to opt back in when
+the endpoint really does serve one client — see [Security](#security). Set a `*Sessions` to enable the full session model: an
 `Mcp-Session-Id` assigned at `initialize` and validated on later requests
 (unknown → 404, so the client re-initializes), `DELETE /mcp` teardown, and a
 server→client **`GET /mcp` stream**. That stream is **drain-and-close** (a
@@ -40,6 +45,13 @@ or put auth in front: register an `aaa-gate` / `jwt` middleware **before** this
 one (MCP has no read/write method split, so gate every POST). The MCP spec also
 requires validating the `Origin` header against DNS-rebinding for locally-bound
 servers — do that with a dedicated middleware or a reverse proxy.
+
+**Server→client answers need a session.** A stateless endpoint cannot attribute
+a client's response to a `sampling`/`elicitation` request — every POST is peer
+0 — so it refuses those POSTs with 400 by default
+(`Transport.stateless_responses`). Configure `sessions` for a multi-client
+endpoint; set `.single_client` only where one client is a fact about the
+deployment, not a hope.
 
 ## Concurrency
 
@@ -92,10 +104,11 @@ module's README for the issue-now / correlate-later shape.
 
 What this transport adds:
 
-- **Per-session peer scoping.** Each session gets a handle (`Sessions.tagOf`)
-  passed to `mcp.Server.handleMessageFrom`, so a response POSTed on one session
-  can never resolve a request issued to another. Pass it as
-  `mcp.RequestOptions.peer` when you issue a request out of band:
+- **Per-session peer scoping — this is what `sessions` buys you.** Each session
+  gets a handle (`Sessions.tagOf`) passed to `mcp.Server.handleMessageFrom`, so
+  a response POSTed on one session can never resolve a request issued to
+  another. Pass it as `mcp.RequestOptions.peer` when you issue a request out of
+  band:
 
   ```zig
   var line: std.Io.Writer.Allocating = .init(gpa);
@@ -113,3 +126,17 @@ What this transport adds:
   it).
 - **The answer** POSTs to `/mcp` and produces no reply → **202 Accepted**; your
   `mcp.ResponseHandler` runs during that request.
+- **Without `sessions`, the answer is refused (400).** Peer scoping is not a
+  property of this transport as such — it is a property of the *session
+  handle*. A stateless endpoint has none: every POST would be peer 0, and
+  `mcp`'s peer check only ever compares the issuing peer to the answering one,
+  so it cannot separate two clients that are both 0. Request ids are small
+  consecutive integers, so a second client guessing one is not work. Rather
+  than deliver a stranger's answer into your tool call, a stateless endpoint
+  refuses any POST that could correlate — no `method`, integer `id`, a `result`
+  or `error` — and leaves the request pending. Everything else (requests,
+  notifications) is unaffected. If your endpoint genuinely serves **one**
+  client, say so with `stateless_responses = .single_client` and the round trip
+  works as before; on a multi-client endpoint that flag is a data leak between
+  clients and the transport cannot tell the two situations apart, which is why
+  it is an explicit opt-in.

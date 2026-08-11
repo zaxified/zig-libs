@@ -60,9 +60,14 @@ the zig-libs authors (MIT).
   `negotiateVersion` returns one of **our** static literals, never the caller's slice — the request
   is parsed on a per-message arena, so echoing it back would dangle in `negotiated_version`.
 - **Peer scoping.** `handleMessageFrom(msg, out, peer)` correlates a response only to a pending
-  request issued to the *same* peer; `handleMessage` is `peer = 0`. Multiplexing transports
-  (`mcp-http` sessions) pass a per-session handle, so one session cannot consume another's sampling
-  completion or the user's elicitation answer. Not a wildcard in either direction.
+  request issued to the *same* peer; `handleMessage` is `peer = 0`. Not a wildcard in either
+  direction. The check compares two handles and nothing else, so **it is exactly as good as the
+  transport's peer assignment** — it cannot separate two clients a transport has given the same
+  handle. A multiplexing transport must therefore supply a per-client handle: `mcp-http` does when
+  a `Sessions` registry is configured, and when one is not (its stateless mode, where every POST
+  would be peer 0) it refuses to hand us correlatable responses at all rather than let this check
+  wave them through. Until 2026-08-11 this bullet claimed the property outright, without naming
+  the condition the transport has to meet for it to hold.
 - **Elicitation schema subset + credential refusal.** `requestedSchema` is validated against the
   spec's restricted subset (flat object of primitives; single-select enums in both the 2025-06-18
   `enum`/`enumNames` and 2025-11-25 `oneOf` spellings; 2025-11-25 multi-select enum arrays) and is

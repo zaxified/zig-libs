@@ -168,8 +168,10 @@ transport can express.
   capped (`max_pending`, default 256); `cancelRequest` drops one and tells the
   client.
 - **Peer scoping.** `RequestOptions.peer` + `handleMessageFrom` keep a response
-  from resolving another connection's request (`mcp-http` wires each session's
-  handle automatically).
+  from resolving another connection's request — as long as the transport gives
+  each connection its own handle. `mcp-http` wires each *session's* handle
+  automatically; its stateless mode has no handle to wire, so it refuses
+  client responses instead of feeding them here as peer 0.
 
 ### Elicitation: schemas are restricted, and secrets are refused
 

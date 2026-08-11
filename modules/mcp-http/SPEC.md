@@ -20,12 +20,27 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **Server→client requests (sampling / elicitation)** are supported to exactly the degree HTTP
   allows: the client's answer is a *later, separate POST*, so nothing parks waiting for it (the same
   constraint the drain-and-close `GET` documents). Three concrete pieces: (1) each session's numeric
-  handle (`Sessions.tagOf`, allocated from the create-lock's `seq`, never reused) is passed to
+  handle (`Sessions.tag`, allocated from the create-lock's `seq`, never reused, and returned
+  *by `create` itself* so the transport never re-looks-it-up) is passed to
   `mcp.Server.handleMessageFrom` as the **peer**, so a response POSTed on session B cannot resolve a
   request issued to session A — a cross-tenant data-delivery bug, not a cosmetic one; (2) a request
   issued from inside a `tools/call` rides that POST's response — an SSE `data:` event in stream
   mode, or (JSON mode) the session queue; (3) the client's response POST produces no reply line, so
   the endpoint answers **202 Accepted** and the `mcp.ResponseHandler` runs during that POST.
+- **Peer scoping needs a session; a stateless endpoint refuses to correlate instead of guessing.**
+  The peer handle is the *only* thing that separates two clients here, and a stateless endpoint
+  (`sessions == null`) has none: every POST would be peer 0, which `mcp`'s peer check — it compares
+  the issuing peer against the answering one, nothing more — cannot tell apart. Outbound request
+  ids are small consecutive integers, so guessing one is not work. A stateless endpoint therefore
+  **refuses** (`400`) any POST that could correlate: no `method`, an integer `id`, and a `result` or
+  `error` — precisely the set `mcp.Server.handleMessageFrom` routes to `deliverResponse`, so nothing
+  else changes behaviour. Set `Transport.stateless_responses = .single_client` to opt back in where
+  the endpoint genuinely serves one client (a loopback bridge, a sidecar); on a multi-client
+  endpoint that flag *is* a leak between clients and the transport cannot detect the difference,
+  which is why it is named, explicit and not the default. Before 2026-08-11 the promise "one session
+  cannot consume another's sampling reply" was written without this qualifier while the stateless
+  mode silently shared peer 0 — the promise was true of the configuration it described and false of
+  the default one. Latent, not exploited: only `bxp-gui` speaks HTTP/SSE today.
 - **The `application/json` body is exactly one JSON object.** The server may write several lines for
   one message (progress notifications, and now server→client requests) before the response line;
   only the last is the body and the earlier ones are pushed to the session's `GET` queue (dropped on
@@ -59,6 +74,22 @@ refused (session B's answer leaves session A's request pending, and the request 
 `GET` stream), the `application/json` body carrying exactly one object while the tool's elicitation
 goes to the session queue, and the SSE ordering (request event precedes the tool result). 18 tests.
 
+The peer-scoping promise is pinned by an **attacker's** test in each configuration, not a
+happy-path one — client A has a request outstanding, client B (who was never asked anything) posts
+a response carrying A's id — with an innocent third party's pending request as a bystander oracle,
+so "still pending" cannot pass for the wrong reason (nothing resolving anything). Session-ful: B's
+answer leaves both A's and C's requests pending, A's own answer resolves only A's. Stateless: B's
+answer is refused with 400 and so is A's, which is the *documented cost* of the default rather than
+a filter that happens to catch attackers; ordinary requests on the same endpoint are unaffected.
+Six mutations, each red on behaviour and attributed to a named test: dropping `mcp`'s peer check
+(session-ful test, on the leak assertion), forcing the transport's peer to a constant (session-ful
+test, on the genuine answer no longer arriving), giving every session the same handle (the
+tag-distinctness precondition — and, with that precondition disabled, the leak assertion itself),
+flipping the stateless default back to `.single_client` (stateless test, leak assertion), making
+the response detector never fire (same), and dropping its `!has_method` term (detector test — this
+one *survived* until a `{"id":1,"method":"tools/list","result":{}}` case was added, the only input
+that separates precision from safety here).
+
 ### Oracle: a real captured session from the official `mcp` Python SDK
 
 This module's README/NOTICE previously described the behavioral contract as "cross-checked for
@@ -70,7 +101,7 @@ package `mcp` 2.0.0) — its real `ClientSession` + `streamable_http_client` tal
 byte-logging proxy observing (not altering) the exchange — captured `initialize`,
 `notifications/initialized`, `GET` session-stream open, `tools/list`, and two `tools/call`s (one
 with two live `notifications/progress` events), through `DELETE`. Frozen once in
-`oracle_vectors.zig`; `root.zig`'s 8 "oracle:" tests replay those exact request bytes through this
+`oracle_vectors.zig`; `root.zig`'s "oracle:" tests replay those exact request bytes through this
 module's own `Transport` (offline, the same in-memory `runWire` harness every other test uses — no
 socket) and assert:
 
@@ -93,7 +124,10 @@ wire-identical to any `EventSource`. See `oracle_vectors.zig`'s doc comment for 
 recap and provenance. `mcp` run as a black-box test oracle needs no root `NOTICE` entry (§0); no
 `mcp_dart`, the official SDK, or any other MCP-transport source was ported or copied.
 
-26 tests total (18 + 8). Run: `zig build test-mcp-http`.
+**30 tests total**, of which 5 are the oracle replays above and 3 came from the 2026-08-11
+peer-scoping pass. (Earlier revisions of this line said "26 (18 + 8)" — a hand-kept split that had
+already drifted from the tree; the total is now the counted one, and `scripts/dark-tests.sh`
+asserts every declared test actually runs.) Run: `zig build test-mcp-http`.
 
 ## Backlog / deferred
 

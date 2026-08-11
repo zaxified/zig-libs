@@ -28,11 +28,15 @@
 //! waiting for it (same constraint as the `GET` stream — see `Sessions`).
 //! What this transport wires up:
 //!
-//! - **Peer scoping.** Each session gets a numeric handle (`Sessions.tagOf`)
-//!   passed to `mcp.Server.handleMessageFrom` as the *peer*. A response POSTed
-//!   on session B can never resolve a request issued to session A, so one
-//!   user's sampling completion or elicitation answer cannot be delivered into
-//!   another user's tool call.
+//! - **Peer scoping — requires `sessions`.** Each session gets a numeric handle
+//!   (`Sessions.tagOf`) passed to `mcp.Server.handleMessageFrom` as the *peer*.
+//!   A response POSTed on session B can never resolve a request issued to
+//!   session A, so one user's sampling completion or elicitation answer cannot
+//!   be delivered into another user's tool call. **A stateless endpoint has no
+//!   such handle** — every POST is peer 0, which the peer check cannot
+//!   distinguish — so it refuses correlatable responses outright (400) unless
+//!   you assert it serves a single client with
+//!   `stateless_responses = .single_client`. See `Transport.StatelessResponses`.
 //! - **Delivery.** A request issued from inside a `tools/call` rides that
 //!   POST's own response — an SSE `data:` event in stream mode; in
 //!   `application/json` mode the body must stay a single object, so it is
@@ -59,7 +63,9 @@
 //! `DELETE /mcp`, and serves server→client messages on `GET /mcp` — a
 //! drain-and-close SSE stream with resumable replay (`Last-Event-ID`); enqueue
 //! with `Sessions.push`. Leave `sessions` null for a **stateless** server (no
-//! session id; `GET`/`DELETE` → 405). See `Sessions` for the delivery model.
+//! session id; `GET`/`DELETE` → 405; a client's *response* to a server→client
+//! request → 400, because a stateless endpoint cannot tell which client sent
+//! it). See `Sessions` for the delivery model.
 //!
 //! ## Security
 //!
@@ -210,9 +216,16 @@ pub const Sessions = struct {
         self.gpa.destroy(s);
     }
 
-    /// Create a session; returns its id (store-owned, stable). Caller echoes it
-    /// in the response `Mcp-Session-Id` header.
-    fn create(self: *Sessions) error{ OutOfMemory, TooManySessions }![]const u8 {
+    /// A freshly created session: its id (store-owned, stable — the caller
+    /// echoes it in the `Mcp-Session-Id` header) together with its peer handle.
+    /// Both are returned from `create` so the caller never has to look the tag
+    /// back up by id: that second lookup was a failure mode with no honest
+    /// answer (the session exists — it was just made), and it used to be
+    /// swallowed with `orelse 0`, i.e. dropped into the shared peer-0 bucket.
+    pub const Created = struct { id: []const u8, tag: u64 };
+
+    /// Create a session; returns its id and peer handle (see `Created`).
+    fn create(self: *Sessions) error{ OutOfMemory, TooManySessions }!Created {
         lockSpin(&self.lock);
         defer self.lock.unlock();
         if (self.map.count() >= self.max_sessions) return error.TooManySessions;
@@ -231,7 +244,7 @@ pub const Sessions = struct {
         // peer handle for this session's lifetime.
         s.* = .{ .id = id, .tag = self.seq };
         try self.map.put(self.gpa, id, s);
-        return id;
+        return .{ .id = id, .tag = s.tag };
     }
 
     fn exists(self: *Sessions, id: []const u8) bool {
@@ -340,8 +353,39 @@ pub const Transport = struct {
     /// validation and the server→client `GET /mcp` stream. Must outlive the
     /// Router.
     sessions: ?*Sessions = null,
+    /// What a **stateless** endpoint does with a client's JSON-RPC *response*
+    /// to a server→client request. Only consulted when `sessions` is null;
+    /// with a registry every POST carries its session's peer handle and the
+    /// question does not arise. See `StatelessResponses`.
+    stateless_responses: StatelessResponses = .reject,
 
     pub const StreamMode = enum { auto, off };
+
+    /// Whether a stateless endpoint may correlate a client's response to a
+    /// server→client request (`sampling/createMessage`, `elicitation/create`).
+    ///
+    /// Without a `Sessions` registry the transport has **no** way to tell two
+    /// clients apart: every POST is peer 0, so `mcp`'s peer check (which only
+    /// ever compares the issuing peer against the answering one) admits any
+    /// client's answer to any client's request. Request ids are small
+    /// consecutive integers, so guessing one is not work.
+    pub const StatelessResponses = enum {
+        /// Fail closed (the default). A POST that could correlate — no
+        /// `method`, an integer `id`, and a `result` or `error` — is refused
+        /// with **400** and never reaches `mcp.Server`, so no client's answer
+        /// can land in another client's flow. A stateless endpoint therefore
+        /// cannot complete a sampling/elicitation round trip at all; configure
+        /// `sessions` for that, which is what the transport spec's session
+        /// model is for.
+        reject,
+        /// Trust every client to be the same client: correlate responses as
+        /// peer 0. Only for an endpoint that genuinely serves **one** client
+        /// (a loopback bridge, a test harness, a single-tenant sidecar). On a
+        /// multi-client endpoint this is a data leak between clients, and the
+        /// transport cannot detect the difference — that is the whole reason
+        /// this is an explicit opt-in and not the default.
+        single_client,
+    };
 
     pub fn middleware(t: *const Transport) router.Middleware {
         return .{ .state = @constCast(t), .run = middlewareRun };
@@ -441,6 +485,58 @@ fn isInitialize(gpa: std.mem.Allocator, body: []const u8) bool {
     }
 }
 
+/// Whether this POST body is a JSON-RPC message that could resolve one of our
+/// pending server→client requests: a top-level object with **no** `method`, a
+/// `result` or `error`, and an `id` that is a non-negative integer.
+///
+/// That is exactly `mcp.Server`'s own correlation predicate (`deliverResponse`
+/// drops any id that is not a non-negative integer, and `handleMessageFrom`
+/// only routes a `method`-less object carrying `result`/`error` there), so a
+/// stateless endpoint refusing this set refuses precisely what it cannot
+/// attribute — and nothing else keeps its previous behaviour. Same single-pass
+/// scan as `isInitialize`, for the same reason: the authoritative parse happens
+/// in `handleMessageFrom` right after.
+fn correlatableResponse(gpa: std.mem.Allocator, body: []const u8) bool {
+    var scanner: std.json.Scanner = .initCompleteInput(gpa, body);
+    defer scanner.deinit();
+    const max_field_len = 64; // longer than any key here or than a u64 in decimal
+
+    if ((scanner.next() catch return false) != .object_begin) return false;
+    var has_method = false;
+    var has_payload = false;
+    var has_int_id = false;
+    while (true) {
+        const key_tok = scanner.nextAllocMax(gpa, .alloc_if_needed, max_field_len) catch return false;
+        const key: []const u8 = switch (key_tok) {
+            .object_end => return !has_method and has_payload and has_int_id,
+            .string, .allocated_string => |k| k,
+            else => return false, // malformed; the real parse will report it
+        };
+        defer if (key_tok == .allocated_string) gpa.free(key);
+
+        if (std.mem.eql(u8, key, "id")) {
+            // Peek first so a non-numeric id is skipped as one whole value —
+            // consuming only an `object_begin` here would desync the scan and
+            // let a nested key masquerade as a top-level one.
+            if ((scanner.peekNextTokenType() catch return false) != .number) {
+                scanner.skipValue() catch return false;
+                continue;
+            }
+            const val_tok = scanner.nextAllocMax(gpa, .alloc_if_needed, max_field_len) catch return false;
+            const txt: []const u8 = switch (val_tok) {
+                .number, .allocated_number => |n| n,
+                else => "",
+            };
+            defer if (val_tok == .allocated_number) gpa.free(txt);
+            has_int_id = if (std.fmt.parseInt(u64, txt, 10)) |_| true else |_| false;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "method")) has_method = true;
+        if (std.mem.eql(u8, key, "result") or std.mem.eql(u8, key, "error")) has_payload = true;
+        scanner.skipValue() catch return false;
+    }
+}
+
 /// The `Last-Event-ID` request header as a u64 (0 when absent/invalid ⇒ replay
 /// the whole buffer).
 fn parseLastEventId(req: *const http.Server.Request) u64 {
@@ -513,7 +609,7 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     var peer: u64 = 0;
     if (t.sessions) |sessions| {
         if (isInitialize(t.gpa, body)) {
-            const new_sid = sessions.create() catch |err| switch (err) {
+            const created = sessions.create() catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.TooManySessions => {
                     ctx.res.setStatus(429);
@@ -522,14 +618,28 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
                     return;
                 },
             };
-            try ctx.res.setHeader("Mcp-Session-Id", new_sid);
-            sid = new_sid;
-            peer = sessions.tagOf(new_sid) orelse 0;
+            try ctx.res.setHeader("Mcp-Session-Id", created.id);
+            sid = created.id;
+            // The tag comes back from `create` itself: there is no second
+            // lookup that could fail, so no failure to answer inconsistently
+            // (this line used to be `tagOf(new_sid) orelse 0`, which put a
+            // session it could not resolve into the *shared* peer-0 bucket,
+            // while the sibling lookup below fails closed with a 404).
+            peer = created.tag;
         } else {
             const have = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
             peer = sessions.tagOf(have) orelse return notFound(ctx);
             sid = have;
         }
+    } else if (t.stateless_responses == .reject and correlatableResponse(t.gpa, body)) {
+        // Stateless: every client is peer 0, so correlating this response
+        // would let any client consume any other client's sampling completion
+        // or elicitation answer. Refuse rather than guess (see
+        // `Transport.StatelessResponses`).
+        ctx.res.setStatus(400);
+        try ctx.res.setHeader("Content-Type", "text/plain");
+        try ctx.res.writeAll("Client Responses Require A Session\n");
+        return;
     }
 
     if (t.stream == .auto and acceptsSse(ctx.req)) return streamResponse(t, ctx, body, peer);
@@ -1231,11 +1341,14 @@ fn askTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
     return false;
 }
 
-test "POST of a JSON-RPC response → 202 and the handler runs" {
+test "stateless single_client: POST of a JSON-RPC response → 202 and the handler runs" {
+    // The `.single_client` opt-in is what makes a stateless round trip work at
+    // all: the default refuses this POST (next test but one), because without
+    // a session it cannot know the answer came from the client it asked.
     const gpa = testing.allocator;
     var server = try buildServer(gpa);
     defer server.deinit();
-    var transport = Transport{ .gpa = gpa, .server = &server };
+    var transport = Transport{ .gpa = gpa, .server = &server, .stateless_responses = .single_client };
 
     var r = router.Router.init(gpa);
     defer r.deinit();
@@ -1267,6 +1380,194 @@ test "POST of a JSON-RPC response → 202 and the handler runs" {
     try testing.expectEqual(@as(usize, 0), server.pendingCount());
 }
 
+/// A tool that asks the client's LLM for a completion **and registers a
+/// handler for the answer** — the shape an app uses when it actually needs the
+/// reply. `ctx` is the `*Answers` the answer is recorded into, so the test can
+/// see exactly whose flow a given response landed in.
+fn samplingTool(ctx: ?*anyopaque, call: *mcp.ToolCall) bool {
+    _ = call.requestSampling(.{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "which city?" } }},
+        .max_tokens = 32,
+    }, .{ .on_response = &Answers.on, .ctx = ctx }) catch return call.fail("refused");
+    call.write("{\"asked\":true}");
+    return false;
+}
+
+test "stateless: a third party's response POST must not resolve another client's pending request" {
+    // The attacker's test for the peer-scoping promise, on a **stateless**
+    // endpoint (`sessions == null`). Every `runWire` call below is a separate
+    // connection — a separate client — and the transport has no session handle
+    // to tell them apart, which is exactly the question: does the promise
+    // "one client cannot consume another's sampling reply" hold here too?
+    //
+    // Two distinct victims are in play on purpose. A one-client scenario
+    // cannot distinguish "peer scoping works" from "peer scoping does not
+    // exist": the bystander is an innocent third party whose pending request
+    // must be untouched whatever the attacker does.
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var victim = Answers{};
+    var bystander = Answers{};
+    try server.addTool(.{
+        .name = "ask_a",
+        .description = "asks the client's LLM (client A's flow)",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = samplingTool,
+        .ctx = &victim,
+    });
+    try server.addTool(.{
+        .name = "ask_c",
+        .description = "asks the client's LLM (bystander C's flow)",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = samplingTool,
+        .ctx = &bystander,
+    });
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var out: [8192]u8 = undefined;
+    _ = runWire(&r, post("/mcp", init_sampling_body), &out);
+
+    // Client A's tool call leaves `sampling/createMessage` id 1 outstanding,
+    // delivered to A on its own POST's SSE stream.
+    var out_a: [8192]u8 = undefined;
+    const a_call = runWire(&r, postAccept("text/event-stream",
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ask_a"}}
+    ), &out_a);
+    try testing.expect(std.mem.indexOf(u8, a_call, "sampling/createMessage") != null);
+
+    // Bystander C does the same: id 2 outstanding, nothing to do with A.
+    var out_c: [8192]u8 = undefined;
+    _ = runWire(&r, postAccept("text/event-stream",
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ask_c"}}
+    ), &out_c);
+    try testing.expectEqual(@as(usize, 2), server.pendingCount()); // both really pending
+
+    // Client B — a different client, never asked anything — POSTs a response
+    // carrying A's request id. It must not reach A's handler, and must not
+    // disturb the bystander either.
+    var out_b: [4096]u8 = undefined;
+    const from_b = runWire(&r, post("/mcp",
+        \\{"jsonrpc":"2.0","id":1,"result":{"role":"assistant","content":{"type":"text","text":"attacker"},"model":"m","stopReason":"endTurn"}}
+    ), &out_b);
+    try testing.expectEqual(@as(u32, 0), victim.calls); // A's flow untouched
+    try testing.expectEqual(@as(u32, 0), bystander.calls); // C's flow untouched
+    try testing.expectEqual(@as(usize, 2), server.pendingCount());
+    // …because the endpoint refused to correlate it at all: with no session
+    // there is no honest answer to "which client is this?".
+    try testing.expect(std.mem.startsWith(u8, from_b, "HTTP/1.1 400"));
+
+    // The refusal is the *documented cost*, not a filter that happens to catch
+    // attackers: A's own answer is refused too, for the identical reason. A
+    // stateless endpoint cannot complete this round trip — configure sessions.
+    var out_a2: [4096]u8 = undefined;
+    const from_a = runWire(&r, post("/mcp",
+        \\{"jsonrpc":"2.0","id":1,"result":{"role":"assistant","content":{"type":"text","text":"genuine"},"model":"m","stopReason":"endTurn"}}
+    ), &out_a2);
+    try testing.expect(std.mem.startsWith(u8, from_a, "HTTP/1.1 400"));
+    try testing.expectEqual(@as(u32, 0), victim.calls);
+
+    // Everything that is not a correlatable response is unaffected: an
+    // ordinary request still works on the same stateless endpoint.
+    var out_l: [4096]u8 = undefined;
+    const list = runWire(&r, post("/mcp", list_body), &out_l);
+    try testing.expect(std.mem.startsWith(u8, list, "HTTP/1.1 200"));
+}
+
+test "stateless single_client: the opt-in really does correlate any client's response (its cost)" {
+    // The other half of the decision, asserted rather than described: under
+    // `.single_client` a response from a *different* connection resolves the
+    // pending request. That is a leak on a multi-client endpoint — which is
+    // why it is an explicit opt-in — and it is what a genuinely single-client
+    // deployment is buying. If this test ever fails, the opt-in has stopped
+    // meaning anything and the flag should go.
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var victim = Answers{};
+    try server.addTool(.{
+        .name = "ask_a",
+        .description = "asks the client's LLM",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = samplingTool,
+        .ctx = &victim,
+    });
+    var transport = Transport{ .gpa = gpa, .server = &server, .stateless_responses = .single_client };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var out: [8192]u8 = undefined;
+    _ = runWire(&r, post("/mcp", init_sampling_body), &out);
+    var out_a: [8192]u8 = undefined;
+    _ = runWire(&r, postAccept("text/event-stream",
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ask_a"}}
+    ), &out_a);
+    try testing.expectEqual(@as(usize, 1), server.pendingCount());
+
+    var out_b: [4096]u8 = undefined;
+    const from_b = runWire(&r, post("/mcp",
+        \\{"jsonrpc":"2.0","id":1,"result":{"role":"assistant","content":{"type":"text","text":"anyone"},"model":"m","stopReason":"endTurn"}}
+    ), &out_b);
+    try testing.expect(std.mem.startsWith(u8, from_b, "HTTP/1.1 202"));
+    try testing.expectEqual(@as(u32, 1), victim.calls);
+    try testing.expectEqualStrings("anyone", victim.text[0..victim.len]);
+}
+
+test "correlatableResponse: exactly the shapes mcp would route to deliverResponse" {
+    const gpa = testing.allocator;
+    // Responses: no `method`, an integer id, a result or an error.
+    try testing.expect(correlatableResponse(gpa,
+        \\{"jsonrpc":"2.0","id":1,"result":{"x":1}}
+    ));
+    try testing.expect(correlatableResponse(gpa,
+        \\{"jsonrpc":"2.0","id":42,"error":{"code":-1,"message":"user rejected"}}
+    ));
+    try testing.expect(correlatableResponse(gpa,
+        \\{"result":null,"id":7}
+    )); // key order is not a signal
+    // Requests and notifications keep their old path (`method` present).
+    try testing.expect(!correlatableResponse(gpa,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ));
+    try testing.expect(!correlatableResponse(gpa,
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ));
+    // `method` decides even when a bogus `result` rides along: `mcp` looks up
+    // `method` first and dispatches this as a *request*, so refusing it here
+    // would change the behaviour of a message this transport is not entitled
+    // to judge. Dropping the `!has_method` term otherwise survives the whole
+    // suite — the malformed-but-method-bearing body is the only input that
+    // separates the two.
+    try testing.expect(!correlatableResponse(gpa,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list","result":{}}
+    ));
+    // Nothing our ids could ever match: no id, a non-integer id, a negative
+    // id, no payload at all. `mcp` drops or refuses these itself.
+    try testing.expect(!correlatableResponse(gpa, "{\"result\":{}}"));
+    try testing.expect(!correlatableResponse(gpa, "{\"id\":\"1\",\"result\":{}}"));
+    try testing.expect(!correlatableResponse(gpa, "{\"id\":-1,\"result\":{}}"));
+    try testing.expect(!correlatableResponse(gpa, "{\"id\":1.5,\"result\":{}}"));
+    try testing.expect(!correlatableResponse(gpa, "{\"jsonrpc\":\"2.0\",\"id\":1}"));
+    // A non-numeric id must be skipped as one whole value: if the scan
+    // consumed only its `object_begin`, the nested "result" below would be
+    // read as a top-level key and this would answer true on a body that
+    // carries no top-level payload at all.
+    try testing.expect(!correlatableResponse(gpa,
+        \\{"id":{"result":1},"jsonrpc":"2.0"}
+    ));
+    // Malformed / non-object bodies are not responses; the real parse reports.
+    try testing.expect(!correlatableResponse(gpa, "not json"));
+    try testing.expect(!correlatableResponse(gpa, "[{\"id\":1,\"result\":{}}]"));
+    try testing.expect(!correlatableResponse(gpa, "{"));
+    try testing.expect(!correlatableResponse(gpa, "{}"));
+}
+
 test "sessions: a response POSTed on another session cannot resolve the request" {
     const gpa = testing.allocator;
     var server = try buildServer(gpa);
@@ -1294,11 +1595,21 @@ test "sessions: a response POSTed on another session cannot resolve the request"
     const b_hdr = headerValue(b_init, "Mcp-Session-Id").?;
     @memcpy(b_buf[0..b_hdr.len], b_hdr);
     const sid_b = b_buf[0..b_hdr.len];
+    const c_init = runWire(&r, postWithSession(&rbuf, "", init_sampling_body), &out);
+    var c_buf: [64]u8 = undefined;
+    const c_hdr = headerValue(c_init, "Mcp-Session-Id").?;
+    @memcpy(c_buf[0..c_hdr.len], c_hdr);
+    const sid_c = c_buf[0..c_hdr.len];
     try testing.expect(!std.mem.eql(u8, sid_a, sid_b));
     try testing.expect(sessions.tagOf(sid_a).? != sessions.tagOf(sid_b).?);
+    try testing.expect(sessions.tagOf(sid_c).? != sessions.tagOf(sid_a).?);
 
-    // A sampling request bound to session A.
+    // A sampling request bound to session A (id 1) — and one bound to the
+    // bystander session C (id 2), which must survive every step below
+    // untouched. Without the bystander, "the request stayed pending" could
+    // pass for the wrong reason (nothing ever resolves anything).
     var answers = Answers{};
+    var bystander = Answers{};
     var line: std.Io.Writer.Allocating = .init(gpa);
     defer line.deinit();
     _ = try server.sendSamplingRequest(&line.writer, .{
@@ -1306,6 +1617,15 @@ test "sessions: a response POSTed on another session cannot resolve the request"
         .max_tokens = 32,
     }, .{ .peer = sessions.tagOf(sid_a).?, .on_response = &Answers.on, .ctx = &answers });
     _ = try sessions.push(sid_a, std.mem.trimEnd(u8, line.written(), "\n"));
+
+    var line_c: std.Io.Writer.Allocating = .init(gpa);
+    defer line_c.deinit();
+    _ = try server.sendSamplingRequest(&line_c.writer, .{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+        .max_tokens = 32,
+    }, .{ .peer = sessions.tagOf(sid_c).?, .on_response = &Answers.on, .ctx = &bystander });
+    _ = try sessions.push(sid_c, std.mem.trimEnd(u8, line_c.written(), "\n"));
+    try testing.expectEqual(@as(usize, 2), server.pendingCount());
 
     const answer =
         \\{"jsonrpc":"2.0","id":1,"result":{"role":"assistant","content":{"type":"text","text":"leaked"},"model":"m"}}
@@ -1315,14 +1635,26 @@ test "sessions: a response POSTed on another session cannot resolve the request"
     const from_b = runWire(&r, postWithSession(&rbuf, sid_b, answer), &out);
     try testing.expect(std.mem.startsWith(u8, from_b, "HTTP/1.1 202"));
     try testing.expectEqual(@as(u32, 0), answers.calls);
-    try testing.expectEqual(@as(usize, 1), server.pendingCount());
+    try testing.expectEqual(@as(u32, 0), bystander.calls);
+    try testing.expectEqual(@as(usize, 2), server.pendingCount());
 
-    // Session A answers: delivered.
+    // B tries the bystander's id too — a foreign session is foreign to every
+    // pending request, not just to the one it was aimed at.
+    const at_c =
+        \\{"jsonrpc":"2.0","id":2,"result":{"role":"assistant","content":{"type":"text","text":"leaked"},"model":"m"}}
+    ;
+    const from_b2 = runWire(&r, postWithSession(&rbuf, sid_b, at_c), &out);
+    try testing.expect(std.mem.startsWith(u8, from_b2, "HTTP/1.1 202"));
+    try testing.expectEqual(@as(u32, 0), bystander.calls);
+    try testing.expectEqual(@as(usize, 2), server.pendingCount());
+
+    // Session A answers: delivered — and only A's own request resolves.
     const from_a = runWire(&r, postWithSession(&rbuf, sid_a, answer), &out);
     try testing.expect(std.mem.startsWith(u8, from_a, "HTTP/1.1 202"));
     try testing.expectEqual(@as(u32, 1), answers.calls);
     try testing.expectEqualStrings("leaked", answers.text[0..answers.len]);
-    try testing.expectEqual(@as(usize, 0), server.pendingCount());
+    try testing.expectEqual(@as(u32, 0), bystander.calls);
+    try testing.expectEqual(@as(usize, 1), server.pendingCount());
 
     // The request itself was delivered to A's GET stream, not B's.
     const a_stream = runWire(&r, getWithSession(&rbuf, sid_a, null), &out);
@@ -1413,7 +1745,7 @@ test "Sessions.push: past replay_depth, the OLDEST event is evicted (mutation gu
     var s = Sessions.init(testing.allocator);
     defer s.deinit();
     s.replay_depth = 2;
-    const id = try s.create();
+    const id = (try s.create()).id;
 
     _ = try s.push(id, "a");
     _ = try s.push(id, "b");
@@ -1465,9 +1797,15 @@ test "Sessions.create: refuses new sessions past max_sessions (audit MED)" {
     var s = Sessions.init(testing.allocator);
     defer s.deinit();
     s.max_sessions = 2;
-    _ = try s.create();
-    _ = try s.create();
+    const first = try s.create();
+    const second = try s.create();
     try testing.expectError(error.TooManySessions, s.create());
+    // Every session's peer handle is distinct, and it is the one `tagOf`
+    // reports — `create` hands it back so the transport never has to look it
+    // up again (and never has to answer a lookup that failed).
+    try testing.expect(first.tag != second.tag);
+    try testing.expectEqual(first.tag, s.tagOf(first.id).?);
+    try testing.expectEqual(second.tag, s.tagOf(second.id).?);
 }
 
 // ── oracle: replay of a real python-mcp SDK session (see oracle_vectors.zig) ─
