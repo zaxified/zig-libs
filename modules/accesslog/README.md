@@ -99,6 +99,36 @@ backslash escaping, Apache's `ap_escape_logitem`) — see `SPEC.md` for the exac
 format and the adversarial vectors the test suite exercises (quotes, CR/LF, braces, a fake
 `status=200` logfmt pair, control bytes, and a full forged-line attempt against Combined).
 
+## The log is always readable — and what that costs
+
+**Every JSON Lines record this module emits is valid JSON, whatever bytes the request
+carried.** That is the mirror of the injection guarantee and it matters just as much: RFC 8259
+requires a JSON text to be UTF-8, so a client sending a non-UTF-8 `User-Agent` or request
+target used to be able to make its **own** record unparseable — and therefore droppable by the
+log pipeline. Log evasion.
+
+To get that, `writeJsonLines` replaces each ill-formed UTF-8 subsequence with **U+FFFD**
+(`\u{fffd}`), one per subsequence — Unicode 16.0 §3.9's "U+FFFD Substitution of Maximal
+Subparts" recommendation, the same rule the WHATWG Encoding Standard and Rust's
+`String::from_utf8_lossy` follow, so a reader who re-decodes the field sees what this module
+emitted. Lone surrogates, overlong encodings,
+truncated sequences and bare continuation bytes are all covered.
+
+⚠ **The round trip is byte-exact for valid UTF-8 only.** A field carrying arbitrary bytes comes
+back with U+FFFD where those bytes were, and the originals are not recoverable from the JSON
+output — that is the deliberate trade for a log that never loses a record. logfmt and Combined
+are byte-oriented text formats with no encoding requirement of their own, are **not**
+sanitized, and keep their byte-exact round trip. `SPEC.md` has the preserved/replaced table,
+the exact substitution vectors, and what the choice means one hop downstream.
+
+```zig
+entry.user_agent = "curl\xffbad"; // a client's arbitrary bytes
+try accesslog.writeJsonLines(entry, &w);
+// ..."user_agent":"curl\u{fffd}bad"...   ← parses; the bad byte is marked, not passed on
+try accesslog.writeCombined(entry, &w);
+// ..."curl\xffbad"                       ← byte-exact; Combined has no encoding requirement
+```
+
 ## Missing fields
 
 Only `timestamp_ns`/`method`/`target`/`status` are required (`protocol` defaults to

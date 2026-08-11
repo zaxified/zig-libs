@@ -46,6 +46,9 @@ One JSON object per line, LF-terminated, **fixed key order** (`ts`, `remote_addr
 `referer`, `request_id`), every key always present — an absent optional renders as JSON `null`
 rather than being omitted, so the record has a stable schema for log-pipeline consumers.
 
+**Every emitted line is valid JSON, for any input bytes whatsoever** — see "Encoding contract"
+below for what that costs.
+
 ### logfmt (`writeLogfmt`, `Format.logfmt`)
 
 `key=value` pairs, space-separated, LF-terminated, same key order as JSON Lines. An absent
@@ -83,7 +86,7 @@ the wire.
   newline (always `\n` the two-character escape, never byte `0x0A`), and therefore never forge a
   sibling key or a second line. Verified by round-tripping the emitted line through
   `std.json.parseFromSlice` and asserting the parsed field equals the original payload
-  byte-for-byte.
+  byte-for-byte. The same function additionally enforces the encoding contract below.
 - **logfmt** — a value is quoted only when `logfmtNeedsQuote` is true: it is empty or contains a
   space, `"`, `=`, `\`, or any control byte (`0x00-0x1F` or `0x7F`). When quoted, `"`/`\` are
   backslash-escaped, `\n`/`\r`/`\t` get short escapes, any other control byte becomes `\xHH`.
@@ -106,6 +109,79 @@ exactly one line out, no raw `\n`/`\r`/other tested control byte on the wire, an
 exact round-trip through `std.json`. A benign positive-control value (a normal User-Agent
 string, a normal Referer URL) is asserted to pass through unchanged in each format, proving the
 escaping isn't over-aggressive.
+
+## Encoding contract — the log must always be readable
+
+Log **evasion** is the mirror image of log injection: a record the pipeline cannot parse is a
+record the pipeline drops, so a client able to make its own record unparseable has erased
+itself from the log. RFC 8259 requires a JSON text to be UTF-8 and conforming parsers enforce
+it, and a request target or `User-Agent` carries whatever bytes the client sent. **JSON Lines
+output is therefore unconditionally parseable**: `writeJsonString` replaces ill-formed UTF-8
+rather than passing it through.
+
+### What is preserved, what is replaced
+
+| Input | JSON Lines | logfmt / Combined |
+|---|---|---|
+| ASCII, and any well-formed UTF-8 | **byte-exact**, modulo the JSON escapes above | byte-exact, modulo each format's escapes |
+| ill-formed UTF-8 (surrogates, overlongs, truncated sequences, bare continuation bytes, `F5`–`FF`) | **replaced** with U+FFFD, one per ill-formed subsequence | passed through unchanged |
+| control bytes `0x00`–`0x1F` | escaped (`\n`, `\u0007`, …) — unchanged by this contract | escaped (`\xHH`) — unchanged |
+
+**This ends the byte-exact round trip for non-UTF-8 input, and that is deliberate.** Before
+2026-08-11 the JSON writer passed every byte ≥ `0x20` through verbatim and the module's docs
+claimed a malformed byte "only ever affects display, never the string's structural validity" —
+that sentence was the opposite of the truth (`std.json` answers `error.SyntaxError` on such a
+line, as does CPython's `json`). The owner's decision, 2026-08-11: *the access log must always
+be readable; a bad byte must never break it.* The original bytes of an ill-formed field are
+**not recoverable** from JSON Lines output; a deployment that needs them must keep the raw
+value elsewhere (see "Not shipped" below).
+
+### Substitution policy: one U+FFFD per maximal subpart
+
+Unicode 16.0 §3.9's "U+FFFD Substitution of Maximal Subparts" recommendation, i.e. one
+replacement character per *ill-formed subsequence* — the same behaviour as the WHATWG
+Encoding Standard and Rust's `String::from_utf8_lossy`, so a reader who re-decodes the field
+with any of those sees the string this module emitted. The alternative, one U+FFFD per ill-formed *byte* (what Go's
+`encoding/json` does, since its `utf8.DecodeRune` reports size 1 on every error), was not
+chosen.
+
+The two policies are observably different exactly on a **truncated but otherwise valid
+prefix**, and the tests assert the emitted bytes rather than the rule:
+
+| Input | maximal subpart (this module) | per byte |
+|---|---|---|
+| `E2 82` (start of `€`) | `U+FFFD` | `U+FFFD U+FFFD` |
+| `F0 9F 98` (start of `😀`) | `U+FFFD` | `U+FFFD U+FFFD U+FFFD` |
+| `ED A0 80` (U+D800 surrogate) | `U+FFFD U+FFFD U+FFFD` | `U+FFFD U+FFFD U+FFFD` |
+| `C0 AF` (overlong `/`) | `U+FFFD U+FFFD` | `U+FFFD U+FFFD` |
+
+The surrogate row is worth reading twice: the two policies **agree** there, because `ED A0` is
+not a prefix of any well-formed sequence (Unicode Table 3-7 caps `ED`'s second byte at `9F`),
+so `ED` alone is the maximal subpart. A test on that vector alone could not tell the policies
+apart; the truncated-prefix rows are what discriminate.
+
+### logfmt and Combined are out of scope, on purpose
+
+Neither format carries an encoding requirement — both are byte-oriented text — so neither is
+sanitized and both keep the byte-exact round trip. Measured, not assumed: `goaccess` 1.10.2
+reads a Combined log whose `%r` and User-Agent contain `FF` and `ED A0 80` with `valid=3,
+failed=0`. What *is* worth knowing is that the exposure re-appears one hop downstream — the
+same goaccess run re-emits those bytes into its own JSON report (`-o report.json`), and that
+file is then not valid UTF-8 and is rejected by CPython's `json` (`jq` accepts it, substituting
+U+FFFD itself while reading, so jq cannot be used as the oracle for this). A deployment that
+feeds Combined or logfmt into a JSON-producing analyser inherits the problem at that boundary;
+using this module's JSON Lines output avoids it at the source.
+
+### Not shipped: recovering the original bytes
+
+Keeping the raw value recoverable is cheap and was deliberately **not** made the default: an
+opt-in flag could emit an extra sibling key (e.g. `"user_agent_raw":"<hex>"`) for each field
+whose input was ill-formed, hex being both compact enough and unconditionally UTF-8-safe. It
+costs one extra key only on the records that need it, keeps the default lossy-but-parseable per
+the decision above, and is a strictly additive schema change (the fixed key order stays; the
+raw keys appear after the field they belong to). Not implemented — no consumer asked for it,
+and an always-present raw copy of every attacker-controlled field is also an unbounded-size
+amplifier on a hot path.
 
 ## `entryFromRequest` — the http bridge
 
@@ -169,3 +245,32 @@ payload, plus a benign positive control per format); `entryFromRequest` pulling 
 a socket-free `http.Server.Request`/`ResponseWriter` pair (HTTP/1.1 with a peer address and
 headers, HTTP/1.0 with none, and a `request_bytes` override), and one test proving its output
 feeds straight into `writeCombined`.
+
+For the encoding contract: a table of ~30 vectors asserting the **exact bytes** emitted for
+every ill-formed shape (surrogates, overlongs, truncations, bare continuations, `F5`–`FF`) and
+for every boundary of Table 3-7 that must pass through untouched; an exhaustive cross-check of
+the well-formedness classifier against `std.unicode` over every 1- and 2-byte string and the
+boundary-byte 3-/4-byte extensions; a brute-forced check that each reported ill-formed length
+really is the *maximal* subpart, using `std.unicode` rather than a second copy of this module's
+table; and the surviving byte-exact round trip stated as its own test. Externally anchored on
+CPython's `json` (which enforces UTF-8 at the decode step): 16/16 vectors accepted with
+sanitization, 14/16 rejected without it. `jq` is deliberately not used as that oracle — it
+substitutes U+FFFD itself while reading and so accepts both.
+
+Three `testing.fuzz` harnesses, one per format, driven from a **written** corpus. The JSON
+oracle is one-sided and absolute: for any input bytes the emitted line parses, with no
+predicate guarding the assertion; a field that was valid UTF-8 additionally comes back
+byte-exact, one that was not comes back valid UTF-8 containing U+FFFD. The corpus is written
+rather than generated because a corpus-driven `std.testing.Smith` resolves every *weighted*
+draw (`bool`, a small `valueRangeAtMost`) to the range minimum, which would leave every field
+empty and every optional absent outside `zig build fuzz`; a dedicated test decodes the corpus
+back and asserts that each JSON-visible slot receives ill-formed UTF-8 at least once, so the
+harness cannot silently degenerate.
+
+Cost, measured (`ACCESSLOG_BENCH=1 … -Doptimize=ReleaseFast`, `src/bench.zig`, 200 000 records
+× 5 alternating rounds, minimum, against a frozen copy of the pre-change writer): a clean ASCII
+record **456.7 → 256.2 ns** (−43.9 %, because the sanitizing scan batches pass-through runs
+into one `writeAll` where the old escaper wrote byte by byte), a valid-UTF-8 record 436.1 →
+329.2 ns (−24.5 %), and a record whose fields are mostly ill-formed 363.4 → 456.9 ns (+25.7 %,
+i.e. +93 ns and only for records that actually carry bad bytes). Nothing is allocated and
+nothing is copied when the input is clean.
