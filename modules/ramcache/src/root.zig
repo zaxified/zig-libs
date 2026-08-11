@@ -472,6 +472,23 @@ pub const Cache = struct {
     pub fn put(self: *Cache, key: []const u8, value: []const u8, now_ns: i64, ttl_ns: i64, gen: u64) void {
         self.noteAccess(key);
         if (self.map.getPtr(key)) |e| replace: {
+            if (value.len > self.options.max_bytes) {
+                // Same single-item ceiling a fresh insert enforces below. It
+                // has to be checked HERE too: without it an update-only
+                // workload (a fixed key set, written over and over — the
+                // session-store / write-behind shape) never takes the insert
+                // path again, so `max_bytes` stops being a bound at all.
+                //
+                // Dropping the entry rather than refusing the write is the
+                // same call the pinned branch below makes: keeping the old
+                // bytes would serve pre-write data indefinitely, which is the
+                // stale-hit class a write-through cache exists to prevent. The
+                // key simply becomes absent, so the next `get` misses and the
+                // caller refetches. Reason is `.evicted`, not `.replaced` —
+                // nothing took the entry's place.
+                _ = self.dropKey(key);
+                return;
+            }
             if (e.node.pins > 0) {
                 // Somebody is reading the current bytes. Freeing them here is
                 // the `ocspcache` use-after-free shape verbatim, and *refusing*
@@ -504,6 +521,11 @@ pub const Cache = struct {
             self.lruTouched(e.region, node);
             self.expUpdate(node, now_ns, ttl_ns);
             self.bytes += vdup.len;
+            // A replace can push `bytes` over the cap just as an insert can
+            // (a bigger value for the same key), so it owes the same eviction
+            // pass. `e` may be dangling once this returns — `maintain` can
+            // evict the entry just written — so nothing below may touch it.
+            self.maintain(now_ns);
             self.syncStats();
             return;
         }
@@ -1344,6 +1366,64 @@ test "replace updates value and byte accounting" {
     try testing.expectEqualStrings("bb", c.get("k", 2, 0).?);
     try testing.expectEqual(@as(usize, 2), c.bytes);
     try testing.expectEqual(@as(usize, 1), c.stats.entries);
+}
+
+test "replace refuses a value larger than the whole cache, and drops the entry rather than serving the old bytes" {
+    // The replace path used to return before the single-item ceiling, so
+    // overwriting a resident key stored a value of ANY size.
+    var c = testCache(64, 16); // 64-byte cache
+    defer c.deinit();
+    c.put("a", "aaaaaaaaaa", 0, 0, 0); // 10 bytes
+    c.put("b", "bbbbbbbbbb", 1, 0, 0); // 10 bytes
+    c.put("k", "small", 2, 0, 0); // 5 bytes — 25 total, well under the cap
+    const big = [_]u8{'x'} ** 200; // 200 > 64 — unstorable however it arrives
+    c.put("k", &big, 3, 0, 0);
+    // Not the new bytes (3x the whole cache) and not the old ones either: a
+    // refused write that keeps the previous value serves pre-write data
+    // forever. Absent is the honest outcome — the caller refetches.
+    try testing.expect(c.get("k", 4, 0) == null);
+    // The oracle that separates "rejected at the ceiling" from "stored, then
+    // evicted by the maintenance pass": admitting 200 bytes into a 64-byte
+    // cache costs the INNOCENT residents their slots, because the freshly
+    // written entry is the most-recently-used one and the LRU victims are the
+    // bystanders. Rejecting it costs nothing.
+    try testing.expectEqualStrings("aaaaaaaaaa", c.get("a", 5, 0).?);
+    try testing.expectEqualStrings("bbbbbbbbbb", c.get("b", 5, 0).?);
+    try testing.expectEqual(@as(usize, 20), c.bytes);
+    try testing.expectEqual(@as(usize, 2), c.stats.entries);
+    // Nothing was ever admitted, so no capacity eviction ran at all.
+    try testing.expectEqual(@as(u64, 0), c.stats.evictions);
+}
+
+test "an update-only workload never grows past max_bytes (replace runs maintenance too)" {
+    // The shape this matters for: a fixed key set written over and over (a
+    // session store, a write-behind cache). No fresh insert ever happens after
+    // the first round, so before the fix `maintain` was never reached again and
+    // occupancy climbed monotonically: 256 -> 512 -> 1024 -> 2048 on a
+    // 512-byte cache.
+    var c = testCache(512, 64); // entry cap never binds: 32 keys < 64
+    defer c.deinit();
+    var kbuf: [8]u8 = undefined;
+    var val: [64]u8 = undefined;
+    @memset(&val, 'v');
+    const rounds = [_]usize{ 8, 16, 32, 64 };
+    var now: i64 = 0;
+    for (rounds) |vlen| {
+        var i: usize = 0;
+        while (i < 32) : (i += 1) {
+            const key = std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable;
+            now += 1;
+            c.put(key, val[0..vlen], now, 0, 0);
+            // The bound, checked after every single write — not just at the end.
+            try testing.expect(c.bytes <= 512);
+        }
+    }
+    // ...and the run really did apply pressure rather than fitting all along:
+    // 32 x 64B = 2048 bytes were offered against a 512-byte cap.
+    try testing.expect(c.stats.evictions > 0);
+    try testing.expect(c.map.count() > 0);
+    try testing.expect(c.bytes <= 512);
+    try testing.expectEqual(c.bytes, c.stats.bytes);
 }
 
 test "entry-count eviction is LRU" {

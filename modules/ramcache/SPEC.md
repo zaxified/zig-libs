@@ -86,11 +86,11 @@ outstanding is a caller bug, but leaking is not an improvement on it.
 ## `Sharded` — the internally-synchronized wrapper
 
 `Cache` stays lock-free; `Sharded` is a second type in the same module holding N `Cache` instances,
-one spinlock each, keyed by `Wyhash(shard_seed, key) & (N-1)`. Full contract in its doc comment;
+one lock each, keyed by `Wyhash(seed, key) & (N-1)` with a **per-instance** seed. Full contract in its doc comment;
 the design commitments an auditor needs:
 
 - **Safety is structural, not empirical.** (1) Every field of a shard's `Cache` is touched only
-  between `lockSpin` and `unlock` — `shards` is private and no `*Cache` escapes. (2) Nothing derived
+  between `lockAcquire` and `unlock` — `shards` is private and no `*Cache` escapes. (2) Nothing derived
   from a `Cache` outlives its critical section (no method returns a slice into cache storage).
   (3) A key maps to exactly one shard by a pure function of the key bytes, and entries never move,
   so no two shards share a byte. (4) No operation holds two shard locks at once — the aggregate
@@ -109,7 +109,24 @@ the design commitments an auditor needs:
   shard evicts while a cold one has room, and the single-item ceiling tightens to `max_bytes / N`.
   The shard count is rounded up to a power of two, then clamped down so no shard gets a zero cap.
   The shard hash uses a seed distinct from the sketch's: sharing it would confine each shard's keys
-  to 1/N of the doorkeeper index space.
+  to 1/N of the doorkeeper index space. The ceiling holds on the **replace** path too — overwriting
+  a resident key with a value over the bar drops the entry rather than storing it or leaving the
+  pre-write bytes to be served forever (an update-only workload otherwise never reaches eviction at
+  all, and `max_bytes` stops being a bound; see the threat-model section).
+- **Adversarial key distribution is a liveness problem here, not a hashing one.** `Cache`'s threat
+  model — unkeyed Wyhash, collisions cost lookup time and nothing else — does **not** carry over,
+  because on this type the key picks a *lock*. Keys ground onto one shard cost `(N−1)/N` of the
+  usable capacity and queue every writer on one lock. Two answers, of which the second is the
+  load-bearing one: (1) the shard seed is derived per instance (`deriveSeed`: base constant mixed
+  with the shards allocation's address and a process-wide counter) instead of being a public
+  compile-time constant, so a shard's preimage cannot be ground out offline from the source —
+  `Options.shard_seed` overrides it for callers needing reproducible placement. This is ASLR plus a
+  counter, **not** a keyed MAC: `ramcache` is `platform = .any` and takes no `Io`, and Zig has no
+  field privacy, so it raises the cost of the attack rather than closing it. (2) `lockAcquire` spins
+  `spin_budget = 64` times and then yields, so the funnelled case degrades to ordinary queueing
+  instead of N cores spinning at 100 % across an eviction loop, an allocation under the lock, or a
+  caller callback — which is what would make `Sharded` strictly *worse* than one global mutex. This
+  holds whether or not the seed is known.
 - **Aggregates are not atomic.** `stats` is per-shard-consistent and globally approximate — because
   the lifetime counters are monotonic, the returned sum lies between the true aggregate at the first
   shard read and the true aggregate at the last; `entries`/`bytes` are non-monotonic and get no such
@@ -135,7 +152,10 @@ not hardened against adversarial hash-collision flooding; intended for trusted i
 strings, URLs), not attacker-chosen keys. No persistence — `on_evict`/dirty-set (see above) is a
 *seam* for a caller-built write-behind layer, not persistence itself; the cache does no I/O and
 `on_evict` must not call back into the `Cache` (reentrancy mid-removal, e.g. during `clear`'s
-iteration, is unsupported). An item larger than `max_bytes` is never stored. Victim
+iteration, is unsupported). An item larger than `max_bytes` is never stored — on a fresh insert or
+on an overwrite of a resident key, where the entry is dropped rather than kept at its pre-write
+value. `Sharded` does **not** inherit the "trusted keys only" posture above unchanged: there the key
+selects a lock, so it gets a per-instance shard seed and a yielding waiter (see its section). Victim
 selection is **O(1)**: a binary min-heap per region ordered by the logical access tick, plus one
 over TTL deadlines, so `regionLruKey` and `findExpiredKey` read a heap root instead of walking the
 map. Each entry carries a small stable index node (a separate allocation, because a hash map moves
@@ -180,8 +200,29 @@ allocator): a mixed get/put/evict/clear stress where every stored value is a sel
 (key id + round + derived pattern) verified on both read paths *and* inside `on_evict`, with
 `expectInvariants` re-deriving byte totals, region counters and the key→shard mapping from the raw
 maps after the join; a parallel-`clear` race; and a dedicated test that a value is never freed while
-being copied out — large values plus a `clear`-spinning thread, so an early lock release is caught
-by construction rather than by luck.
+being copied out.
+
+That copy-window test used to rest on a *memory-shaped* oracle alone — large values plus a
+`clear`-spinning thread, on the theory that an early lock release would then be caught by
+construction. Measured against the real mutation (`getBuf` unlocking right after the lookup) it was
+**5 red / 4 green over nine fresh compiles**: a coin flip, which in a gate reads as harness flake and
+gets re-run until green. Its primary oracle is now exact instead: a test-only probe (`copy_probe`,
+compiled out of non-test builds) fires from *inside* `getBuf`'s critical section and tries to take
+the very lock the copy is supposed to run under. `std.atomic.Mutex` is non-reentrant, so while the
+lock is genuinely held that `tryLock` fails on every schedule and every run — mutual exclusion, no
+window to miss. The mutation is now caught 9/9; isolated (a momentary unlock with nothing left
+dangling) the probe alone reports 6032 violations where the memory oracle sees none.
+
+Also covered since the 2026-08-11 re-audit: the **delivered** defaults (`.shards` omitted ⇒ 16
+shards and the caps divided by 16 — every other test passes `.shards` explicitly, so `1` used to
+leave the suite green); the shard seed (base constant pinned as a literal and against both sketch
+seeds; two instances from identical options disagree on where >128 of 256 keys live; an explicit
+`shard_seed` is honoured verbatim); a waiter yielding rather than spinning, proven by holding a shard
+lock by hand while a second thread blocks on it; `drainDirty`'s lock under two writer threads and a
+sweeping thread, where the callback `tryLock`s its own shard (deleting the lock previously left the
+suite green); `stats()` compared to a per-shard sum **reflectively over every `Stats` field**, with a
+real borrow taken through a shard's `Cache` so `pinned` is non-zero and the comparison is not
+vacuous; and the aggregate/per-shard byte cap under an update-only workload.
 
 **Mutation-tested.** Each central invariant was checked by mutating the implementation and
 confirming a test goes red: shard lock released before `getBuf`'s copy (8/8 red — and 0/5 before the

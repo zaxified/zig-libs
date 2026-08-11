@@ -79,7 +79,7 @@ c.drainDirty(Flusher.drain, null); // call periodically
 ## `Sharded` — the thread-safe option
 
 `ramcache.Sharded` holds **N independent `Cache` instances**, each behind its own
-spinlock, selected by a hash of the key. `Cache` itself is untouched: a
+lock, selected by a hash of the key. `Cache` itself is untouched: a
 single-owner consumer keeps its lock-free hit path.
 
 ```zig
@@ -87,6 +87,7 @@ var sc = try ramcache.Sharded.init(gpa, .{
     .max_bytes = 32 << 20,  // AGGREGATE budget — divided by the shard count
     .max_entries = 4096,    // ditto
     .shards = 16,           // rounded up to a power of two, clamped (see below)
+    // .shard_seed = null,  // default: derived per instance, see "adversarial keys"
 });
 defer sc.deinit();
 
@@ -120,7 +121,14 @@ instead of corrupting memory under load.
   doorkeeper, the aging counter and the recency order are all per shard, so each
   sketch sees ~1/N of the traffic and admission quality drops. `max_bytes` /
   `max_entries` are floor-divided per shard, so a hot shard evicts while a cold
-  one has room, and a single value must fit `max_bytes / N`.
+  one has room, and a single value must fit `max_bytes / N` — on an overwrite of
+  an existing key as much as on a fresh insert.
+- **Attacker-chosen keys pick a *lock*, not just a hash bucket.** `Cache`'s
+  threat model (unkeyed Wyhash, collisions cost lookup time) does not carry over:
+  keys ground onto one shard cost `(N−1)/N` of the capacity *and* put every
+  writer on one lock. Two answers — the shard seed is derived per instance rather
+  than being a public constant, and a waiter yields after a bounded spin, so the
+  funnelled case degrades to queueing instead of pinning a core per writer.
 - **Aggregate operations are not atomic across shards.** `stats()` is an
   approximate, per-shard-consistent snapshot; `clear()` guarantees only that each
   entry present when its shard was locked is gone; `drainDirty` visits each entry
