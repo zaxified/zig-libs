@@ -1901,6 +1901,10 @@ const SeamHarness = struct {
             @as(usize, self.c.map.count()),
             self.c.window_count + self.c.probation_count + self.c.protected_count,
         );
+        // ...and they count the same entries the region heaps index. That is a
+        // strictly stronger statement than the partition above, which stays
+        // true while an entry is counted in one region and indexed in another.
+        try expectRegionHeapsAgree(&self.c);
         // Every parked node knows where it is parked, and is still borrowed.
         for (self.c.doomed.items, 0..) |n, i| {
             try testing.expectEqual(@as(u32, @intCast(i)), n.doom_idx);
@@ -2224,6 +2228,146 @@ test "borrow: a doomed TTL node must not stall eviction" {
     // ...and the borrower kept its snapshot the whole way through.
     try testing.expectEqualStrings("v", b.bytes);
     c.release(b);
+}
+
+/// The region counters and the region heaps are two different structures over
+/// the same entries, and they are read by different code: the counters drive
+/// `maintain`'s window loop and `enforceProtectedCap`, while the heaps decide
+/// *which* entry those loops — and eviction — actually take. An entry counted
+/// in one region but indexed in another therefore has no symptom in either
+/// structure read on its own: the counters still partition the map, and every
+/// heap is still a valid heap ordered by tick. This asserts the two name the
+/// same entries, which is the property `release`'s re-file has to preserve.
+fn expectRegionHeapsAgree(c: *Cache) !void {
+    var live = [_]usize{ 0, 0, 0 }; // live map entries, by `Entry.region`
+    var indexed = [_]usize{ 0, 0, 0 }; // ...of those, the ones a heap must hold
+    var it = c.map.iterator();
+    while (it.next()) |kv| {
+        const r = @intFromEnum(kv.value_ptr.region);
+        live[r] += 1;
+        // A borrowed node is deliberately out of both heaps (see `Node.pins`).
+        if (kv.value_ptr.node.pins == 0) indexed[r] += 1;
+    }
+    try testing.expectEqual(live[0], c.window_count);
+    try testing.expectEqual(live[1], c.probation_count);
+    try testing.expectEqual(live[2], c.protected_count);
+    for (&c.lru, 0..) |*h, r| {
+        try testing.expectEqual(indexed[r], h.items.len);
+        for (h.items, 0..) |n, i| {
+            try testing.expectEqual(@as(u32, @intCast(i)), n.heap_idx);
+            const e = c.map.getPtr(n.key) orelse return error.HeapHoldsAnUnmappedNode;
+            try testing.expectEqual(@as(usize, r), @intFromEnum(e.region));
+        }
+    }
+}
+
+test "borrow: release re-files the entry into its OWN region heap, from every region" {
+    // `release` re-files an ended borrow with `lruPush(e.region, n)`. Pushing
+    // it into a fixed region instead is a plausible refactor and a real bug —
+    // heap membership diverging from the region the entry is *counted* in —
+    // and it used to be invisible here: only `pagecache` failed, i.e. the rule
+    // lived at the consumer, so this module was free to break it the moment
+    // that consumer changed.
+    //
+    // A cache whose entries all sit in `.window` cannot see it: correct and
+    // wrong agree exactly. So every borrow below is taken from an entry that
+    // has genuinely reached the region under test, through the module's own
+    // promotion path, and that is asserted before the pin — otherwise a future
+    // change to the promotion policy would silently turn this into a tautology.
+    var c = testCache(1 << 20, 3); // window cap 1, protected cap 1
+    defer c.deinit();
+    c.put("a", "A", 0, 0, 0);
+    c.put("b", "B", 0, 0, 0);
+    c.put("c", "C", 0, 0, 0); // window overflow demotes a, then b, to probation
+    try expectRegionHeapsAgree(&c);
+
+    // .window — the newest insert, still in the admission window.
+    try testing.expectEqual(Cache.Region.window, c.map.getPtr("c").?.region);
+    c.release(c.pin("c", 0, 0).?);
+    try expectRegionHeapsAgree(&c);
+
+    // .probation — demoted out of the window by `maintain`.
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("a").?.region);
+    c.release(c.pin("a", 0, 0).?);
+    try expectRegionHeapsAgree(&c);
+
+    // .protected — promoted by the SLRU re-reference rule in `get`.
+    _ = c.get("b", 0, 0).?;
+    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("b").?.region);
+    try testing.expectEqual(@as(usize, 1), c.protected_count);
+    c.release(c.pin("b", 0, 0).?);
+    try expectRegionHeapsAgree(&c);
+}
+
+test "borrow: a released protected entry keeps its SLRU standing, so demotion takes the right victim" {
+    // The consequence of the divergence above, observed through a bystander:
+    // `enforceProtectedCap` picks its demotion victim from the protected heap
+    // and counts it in `protected_count`. If a released protected entry is
+    // filed anywhere else, the heap it should head is empty, and the demotion
+    // falls on whichever entry *is* in there — the one just promoted for being
+    // hot — while the entry that was actually least-recently-used keeps a
+    // protected slot it is not in.
+    var c = testCache(1 << 20, 3); // window cap 1, protected cap 1
+    defer c.deinit();
+    c.put("old", "O", 0, 0, 0);
+    c.put("new", "N", 0, 0, 0);
+    c.put("win", "W", 0, 0, 0);
+
+    _ = c.get("old", 0, 0).?; // probation → protected
+    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("old").?.region);
+    try testing.expectEqual(@as(usize, 1), c.protected_count);
+
+    c.release(c.pin("old", 0, 0).?); // the borrow under test
+
+    // "new" is re-referenced and promoted, which puts the protected region one
+    // over its cap and forces exactly one demotion.
+    _ = c.get("new", 0, 0).?;
+    try testing.expectEqual(@as(usize, 1), c.protected_count);
+
+    // The victim must be "old" (protected the longest ago), not the bystander
+    // that just earned its place. Note both entries are still resident either
+    // way, and both counters still partition the map either way — only *which*
+    // entry was demoted differs.
+    try testing.expectEqual(Cache.Region.protected, c.map.getPtr("new").?.region);
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("old").?.region);
+    try expectRegionHeapsAgree(&c);
+}
+
+test "borrow: a released probation entry is still the region's eviction candidate" {
+    // Same divergence, seen at the other structure that reads a heap root:
+    // victim selection. The bystander here is a neighbour in the same region —
+    // it survives when the released entry is where it belongs, and is evicted
+    // in its place when it is not.
+    var c = testCache(1 << 20, 3); // window cap 1
+    defer c.deinit();
+    c.put("lru", "L", 0, 0, 0);
+    c.put("mru", "M", 0, 0, 0);
+    c.put("win", "W", 0, 0, 0);
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("lru").?.region);
+    try testing.expectEqual(Cache.Region.probation, c.map.getPtr("mru").?.region);
+
+    c.release(c.pin("lru", 0, 0).?); // the borrow under test
+
+    // The pin refreshed "lru"'s tick, so re-write the neighbour to put the
+    // ordering back: "lru" is the probation LRU again, hence the victim.
+    c.put("mru", "M2", 0, 0, 0);
+    try testing.expect(c.map.getPtr("lru").?.node.tick < c.map.getPtr("mru").?.node.tick);
+
+    // Borrow the sole window entry so the window heap is empty. That takes the
+    // admission gate out of the eviction path entirely: with no candidate,
+    // `evictOne` goes straight to the main region's LRU root, so the victim is
+    // decided by heap membership alone and nothing here depends on frequency.
+    const wb = c.pin("win", 0, 0).?;
+    try testing.expectEqual(@as(usize, 0), c.lru[@intFromEnum(Cache.Region.window)].items.len);
+
+    // A reservation is pinned from birth, so it adds pressure without adding a
+    // window candidate: one entry over the cap, one eviction.
+    const f = c.reserve("r", 1, 0, 0, 0).?;
+    try testing.expectEqualStrings("M2", c.get("mru", 0, 0).?); // bystander survives
+    try testing.expect(c.get("lru", 0, 0) == null); // the LRU went, as it should
+
+    c.discard(f);
+    c.release(wb);
 }
 
 test "item larger than cache is not stored" {
