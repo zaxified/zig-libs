@@ -95,9 +95,11 @@ fixed `i128 @ 1e12` can't bound ahead of time: an unbounded `std.math.big.int.Ma
 precision-widening branch of `rescale` need no rounding decision (arbitrary precision makes `+ − ×`
 exact). `div` and the precision-*narrowing* branch of `rescale`/`quantize`/`roundToIntegral` route
 through `roundedDivMag`, the one sign-aware rounding primitive — every `RoundingMode`
-(`half_even`/`half_up`/`half_down`/`up`/`down`/`ceiling`/`floor`) resolved at arbitrary precision,
-KAT-verified against the IBM decTest suite. See SPEC.md's "BigDecimal" section for the design and
-the `std.math.big.int` inventory behind it.
+(`half_even`/`half_up`/`half_down`/`up`/`down`/`ceiling`/`floor`) resolved at arbitrary precision.
+The IBM decTest suite anchors the `half_even` and `half_up` paths (those are the only modes its
+vectors exercise here); the five directed modes are pinned by this module's own sign-aware
+round-trip and bridge tests instead, not by an external vector. See SPEC.md's "BigDecimal" section
+for the design and the `std.math.big.int` inventory behind it.
 
 Also available: `remainder` (sign of the dividend, exponent `min(ea, eb)`), `min`/`max` (with GDA's
 exponent tie rule), `precision`, `signum`, `scaleByPowerOfTen`, `stripTrailingZeros` (an alias of

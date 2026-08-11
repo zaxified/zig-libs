@@ -75,11 +75,22 @@ const kind = try d.expectAtom();      // "EXISTS"
 try d.expectCrlf();
 ```
 
-Two decisions in here are load-bearing rather than stylistic:
+Three decisions in here are load-bearing rather than stylistic:
 
 - **A literal's length arrives from the network and is used to allocate**, so
-  `Options.max_literal` is checked *before* the allocation. That is the exact
-  shape of three real bugs found elsewhere in this repo.
+  `Options.max_literal` (8 MiB) is checked *before* the allocation. That is the
+  exact shape of three real bugs found elsewhere in this repo.
+- **Everything that is not a literal is bounded too.** A literal at least
+  announces its size; an atom, a quoted string, a capability list or a status
+  text just runs until CRLF, so a server that never sends one would otherwise
+  allocate until the process dies. `Options.max_line` (64 KiB, go-imap's
+  `Decoder.MaxSize`, which this port originally dropped) is the ceiling on one
+  response line **excluding** literal payloads — those have `max_literal`.
+  Every byte the decoder keeps is charged against it *before* it is kept, and
+  the budget is started in exactly one place, `response.Reader.next`, because a
+  line is what that function reads. Refusal is `error.LineTooLong`; nothing is
+  truncated, since a silently shortened mailbox name is a wrong answer rather
+  than a smaller one.
 - **A server may not send `{123+}`.** The non-synchronising literal is a
   client-to-server construct (RFC 7888); go-imap accepts it only when decoding
   as a server, and so this rejects it outright rather than being liberal about

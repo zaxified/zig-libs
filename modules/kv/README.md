@@ -161,6 +161,18 @@ durable writes. In-process, no randomness, no real process kill.
 `SimStorage` is exported (`kv.SimStorage`) so consumers can crash-test their
 own recovery logic.
 
+The vtable also carries two **optional** read slots, `preadRef`/`releaseRef`,
+defaulting to `null` — a backend that really holds the bytes in its own memory
+can lend them instead of copying. `null` is the truthful answer for anything
+descriptor-backed, so `FsStorage`, `SimStorage` and the VOPR backend all leave
+them alone and `Storage.canLend()` reports `false` for them; there is
+deliberately no internal fall-back to a copying read, because a fall-back that
+looks like a success makes "did the fast path engage?" unanswerable at the call
+site. A non-null `Ref` must go back to `releaseRef` exactly once, and until it
+does the backend guarantees the bytes neither move nor change nor are freed.
+`pagecache` is the implementor today and `kvtree`'s read descent the caller; see
+`SPEC.md`.
+
 ## VOPR extras: pluggable fault scheduling + failing-seed search
 
 Beyond the fixed sweep, `vopr.zig` runs thousands of *randomized* fault

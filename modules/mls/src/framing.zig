@@ -1389,3 +1389,18 @@ test "MLSMessage: every §17.2 wire format decodes; an unregistered value is Mal
     try testing.expectEqual(@as(u16, 4), @intFromEnum(WireFormat.mls_group_info));
     try testing.expectEqual(@as(u16, 5), @intFromEnum(WireFormat.mls_key_package));
 }
+
+// ── fuzz: the outermost untrusted-wire decoder never panics/OOB ───────────
+
+test "fuzz: MLSMessage.decode never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzMlsMessageDecode, .{});
+}
+
+fn fuzzMlsMessageDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [2048]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var r = codec.Reader.init(buf[0..len]);
+    const msg = MLSMessage.decode(std.testing.allocator, &r) catch return;
+    msg.deinit(std.testing.allocator);
+}

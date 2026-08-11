@@ -1577,6 +1577,61 @@ fn channelOpenPayload(buf: []u8, sender: u32, window: u32, max_packet: u32) ![]c
     return w.buffered();
 }
 
+// ── fuzz: the CHANNEL-layer decode entry (RFC 4254), not the transport ─────
+//
+// The module's other four fuzz targets all sit at or below the Binary Packet
+// Protocol (`messages.readString`/`readMpint`, `KexInit.decode`,
+// `transport.readPacket`). None of them reach this file: `serveSession` and
+// `Session.pumpOnce` decode their fields with `messages.Cursor`, a different
+// decoder from the allocating `readString`/`readMpint` pair that is fuzzed —
+// so before this harness the entire §5/§6 message layer had zero fuzz
+// coverage. This drives arbitrary *well-framed* channel messages (the packet
+// layer is already trusted by the time they arrive) into the server loop,
+// which is where a peer's bytes are turned into channel ids, window
+// arithmetic and length-prefixed payloads.
+test "fuzz: serveSession never panics on an arbitrary channel message stream" {
+    try std.testing.fuzz({}, fuzzServeSession, .{});
+}
+
+fn fuzzServeSession(_: void, smith: *std.testing.Smith) !void {
+    var payload_store: [6][192]u8 = undefined;
+    var payloads: [6][]const u8 = undefined;
+    const n: usize = smith.valueRangeAtMost(u8, 1, @intCast(payloads.len));
+    for (0..n) |i| {
+        var w: std.Io.Writer = .fixed(&payload_store[i]);
+        // Bias the message type into the channel range (90..100) so the
+        // budget is spent inside RFC 4254 handling rather than bouncing off
+        // the `else => ProtocolError` arm.
+        const mt: u8 = if (smith.boolWeighted(4, 1))
+            smith.valueRangeAtMost(u8, 90, 100)
+        else
+            smith.valueRangeAtMost(u8, 0, 255);
+        w.writeByte(mt) catch return;
+        var body: [160]u8 = undefined;
+        const present: usize = smith.valueRangeAtMost(u8, 0, @intCast(body.len));
+        smith.bytes(body[0..present]);
+        w.writeAll(body[0..present]) catch return;
+        payloads[i] = w.buffered();
+    }
+
+    var wire: [4096]u8 = undefined;
+    const framed = framePackets(&wire, payloads[0..n]) catch return;
+
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [8192]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+
+    // Small window/packet bounds so the flow-control arithmetic is exercised
+    // near its edges rather than under a 2 MiB default that never closes.
+    serveSession(&tr, std.testing.allocator, .{
+        .exec = testExecHandler,
+        .window_size = 64,
+        .max_packet_size = 128,
+        .max_input = 4096,
+    }) catch return;
+}
+
 test "serveSession REJECT: a peer that overruns the advertised window" {
     const t = std.testing;
 

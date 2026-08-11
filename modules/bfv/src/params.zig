@@ -129,8 +129,9 @@ pub const test_mul = Params{
 ///   depth 4 ⇒ `2^16·2^193.4 = 2^209.4 < 2^217` — a `2^7.6 ≈ 190×` margin.
 ///   depth 5 ⇒ `2^250` — fails. So **multiplicative depth 4 is a worst-case
 /// guarantee** for every seed and every plaintext including all-`(t−1)`; the
-/// end-to-end test exercises depth 3 (the runtime at `N = 8192` is the only
-/// reason it stops there, not the budget).
+/// end-to-end test exercises depth 2 (the runtime at `N = 8192` is the only
+/// reason it stops there, not the budget) — `kat_test.zig`'s
+/// "security-grade N=8192 / log q=218: depth-2 evaluation decrypts exactly".
 pub const sec_n8192_logq218 = Params{
     .n = 8192,
     .t = 65537,
@@ -144,6 +145,19 @@ test "sec_n8192_logq218 validates and has the documented shape" {
     try sec_n8192_logq218.validate();
     var q: u512 = 1;
     for (sec_n8192_logq218.primes) |p| q *= p;
+    // ── the security claim is the (N, log q) PAIR, so BOTH ends are pinned ──
+    // N is load-bearing and nothing else in this file constrains it. Measured
+    // 2026-08-11: cutting N to 1024 while leaving log q = 218 left the ENTIRE
+    // suite at exit 0. Every other assertion here is N-independent — `log2 q`,
+    // `q mod t` and `bits(Δ)` do not mention N, `validate()` still passes
+    // (1024 is a power of two and 2·1024 divides p−1 because 2·8192 does), and
+    // the end-to-end correctness test gets EASIER because a smaller N grows
+    // less noise, so its "budget > 60 bits" assertion still holds. The result
+    // would be a set still named `sec_…` and still advertised as the ~128-bit
+    // row of the HomomorphicEncryption.org tables while sitting at a
+    // (N=1024, log q=218) shape those tables cap near log q ≈ 27 — i.e. no
+    // meaningful security at all. Pin it.
+    try testing.expectEqual(@as(usize, 8192), sec_n8192_logq218.n);
     // log2 q == 218 exactly: q ∈ [2^217, 2^218).
     try testing.expectEqual(@as(usize, 218), 512 - @clz(q));
     // The ledger's r_t and the batching condition t ≡ 1 mod 2N.

@@ -571,6 +571,24 @@ That single surviving `dup_once 0->1` at t=489 is the root cause stated exactly:
 one duplicated request on the master → device link. The same harness running the
 real `adapters.Modbus` is clean across the whole seed sweep.
 
+`BrokenDevice` has **no arm for the fifth invariant**, `SlotLeak` — it is
+fleet-internal, so a device cannot express it. Its teeth were measured instead,
+by deleting `self.freeSlot(slot)` from the success path of `Fleet.onEmit`
+(`src/fleet.zig`): `findFailing` reported `error.SlotLeak at seed 1`, all seven
+`vopr` tests went red and `test-fleetsim` exited 1 (69 pass / 8 skip / 11 fail).
+This matters because the invariant is written in terms of `slotsHeld + free_count`
+and `slotsHeld` is **always zero in this configuration** (the fleet's own link
+delays are zero here, so a submit and its reply resolve inside one `advance`) —
+so what actually bites is the `free_count` term, and the measurement is what
+distinguishes that from an invariant that only looks like one.
+
+The harness also has teeth against the **real** module, not just its own toy: a
+`.big` → `.little` flip of the register writer in `modules/modbus/src/server.zig`
+takes `adapters.Modbus`'s reported values outside the `Signal` band and
+`findFailing` reports `error.ValueOutOfRange at seed 1`. The bounds are
+load-bearing too, not decorative: widening `value_hi` 701 → 65535 or narrowing
+the sweep to seeds 1..2 each makes the planted-defect search fail.
+
 Every search here is **bounded** and modest (seeds 1..60, `until = 1200` ticks,
 a 20-tick poll period): a netsim sweep is one replay per seed and ddmin is one
 replay per candidate cut, so an unbounded budget would be a runaway rather than

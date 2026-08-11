@@ -315,6 +315,14 @@ test "every PRG: convert is deterministic and width-correct" {
         // the two-block path (L > 16) must also be stable and non-trivial
         try std.testing.expectEqual(p.convert(32, s), p.convert(32, s));
         try std.testing.expect(p.convert(32, s) >> 128 != 0);
+        // ...and the two blocks must be INDEPENDENT, not the same block twice.
+        // "Non-zero upper half" does not say that: giving the second block the
+        // same tweak as the first leaves it non-zero and stable while halving
+        // convert's entropy to 128 bits for every out_bytes in 17..32, with the
+        // top half a byte-for-byte copy of the bottom. Measured 2026-08-11: that
+        // mutation left the whole suite at exit 0 before this assertion existed.
+        const wide = p.convert(32, s);
+        try std.testing.expect(@as(u128, @truncate(wide)) != @as(u128, @truncate(wide >> 128)));
     }
 }
 

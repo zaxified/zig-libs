@@ -215,11 +215,21 @@ ENIP_TEST_CONNECTED=127.0.0.1:44818 zig build test-enip
 ENIP_TEST_LISTEN=127.0.0.1:44830 zig build test-enip
 ```
 
-The offline suite includes **61 byte-exact goldens captured from real traffic
-between three independent third-party implementations** — every one decodes
-and re-encodes to the identical octets, every CIP path is rebuilt from its
-*decoded segments*, and a coverage assertion fails if the table stops
-containing any command, item type, service or routing shape — plus full
+The offline suite includes **139 byte-exact goldens captured from real
+traffic between three independent third-party implementations**, covering
+*both* directions of the wire:
+
+- **61** proxied between a third-party client (`cpppo`, `pycomm3`) and a
+  third-party target — our **client** direction;
+- **32** (`adapter_table`) recorded with those same two clients driving **our
+  own `Adapter`** — our **listening** direction;
+- **46** (`discovery_table`, `discovery_instance_table`) of a *stock*
+  `pycomm3.LogixDriver` browsing our adapter end to end: Program Name object,
+  tag-list upload, and reads/writes of tags it derived from the wire alone.
+
+Every one decodes and re-encodes to the identical octets, every CIP path is
+rebuilt from its *decoded segments*, and a coverage assertion fails if the
+table stops containing any command, item type, service or routing shape — plus full
 client↔adapter round trips over an in-memory wire and `std.testing.fuzz`
 sweeps over every decoder, the tag-path parser, the client's reply handling
 and the adapter's request handler. See SPEC.md for what is third-party

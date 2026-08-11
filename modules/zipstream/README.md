@@ -95,6 +95,19 @@ way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
 - **Bounded memory.** The archive's own bookkeeping is O(entry count) (one
   name arena); streaming an entry is O(one window) — `std.compress.flate`'s
   window for Deflate, or the caller's buffer size for Store.
+- **Decompression-bomb cap.** `EntryReader.init` refuses an entry whose
+  declared uncompressed size exceeds `zipstream.default_max_output`
+  (**1 GiB**) with `Error.ZipEntryTooLarge`, before any byte is decompressed;
+  the running Deflate output is additionally clamped to that declared size.
+  `EntryReader.initMax` takes the cap explicitly for callers that legitimately
+  need larger (or much smaller) entries. Note this is an absolute *size* cap,
+  not a compression-*ratio* cap.
+- **CRC-32 is verified on read.** `reader()` accumulates a running CRC-32 over
+  every decompressed byte and compares it against the entry's
+  central-directory checksum at end-of-stream; a mismatch fails the read with
+  `error.ReadFailed` (the `std.Io.Reader` vtable has no room for a dedicated
+  error) with `EntryReader.crcMismatch()` set, so tampered content is never
+  delivered as if it were valid.
 
 ## Ceiling (documented, not a bug)
 

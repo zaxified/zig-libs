@@ -63,8 +63,10 @@ connect.
   an ordinary `Protocol`, so the simulator can **search** for a failure instead
   of replaying a schedule you handed it: `netsim.findFailing` sweeps seeds and
   `netsim.shrinkTrace` returns a **minimised fault trace**, not a seed. Five
-  invariants are checked after every event, and the module ships the
-  deliberately-broken device that proves they bite. See SPEC.md.
+  invariants are checked after every event. The module ships a
+  deliberately-broken device whose four defects prove the four *master-side*
+  invariants bite; the fifth, slot-pool conservation, has no arm on that device
+  and was proved separately by leaking a slot in `fleet.zig`. See SPEC.md.
 - **Transport binding** — `serveTcp` / `serveUdp` / `serveTcpMulti` in
   `tcp.zig`, the only file that knows what a socket is. `serveTcpMulti` binds
   several listeners and services several peers **concurrently** from one thread

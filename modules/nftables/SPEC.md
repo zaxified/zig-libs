@@ -195,9 +195,10 @@ order because the captured message also carried the userdata stamp).
 
 **Hostile input.** Truncated/over-long/zero-length TLVs, an `NFTA_TABLE_FLAGS` of the wrong width,
 a payload shorter than `nfgenmsg`, and expression nests whose declared length runs past the buffer
-are all rejected with `Truncated`/`BadLength`. Three fuzz targets (`std.testing.fuzz`) drive the
-expression walker, the object decoders and the netlink walkers with arbitrary bytes and assert a
-step bound so no input can loop.
+are all rejected with `Truncated`/`BadLength`. Two in-module fuzz targets (`std.testing.fuzz`)
+drive the expression walker (`expr.zig`) and the object decoders (`wire.zig`) with arbitrary bytes
+and assert a step bound so no input can loop; the netlink walkers `nl.zig` aliases are fuzzed one
+layer down, in `netlink`'s own `codec.zig`.
 
 Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build test-nftables`.
 
@@ -252,6 +253,11 @@ Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build te
   through `payloadMaskedCmp` with a caller-supplied 16-byte mask.
 - **Event monitoring.** `NFNLGRP_NFTABLES` multicast (`nft monitor`) is not wired up; the socket
   binds no groups. `conntrack`'s event seam is the shape to copy.
+- **Unanchored header offsets.** `Program.tcpSport` (transport offset 0) and `Program.ipDaddr`
+  (network offset 16, the exact-address form) appear in neither a byte golden nor the netns
+  consistency ruleset — mutating either offset leaves `zig build test-nftables` green in **both**
+  lanes (verified 2026-08-10). The values are right, but nothing would catch a future edit that
+  broke them. Every other `Program` match helper is pinned by a golden or by the consistency test.
 - **Non-x86 goldens.** The captures are little-endian; every golden test skips on a big-endian
   host (netlink's host-endian header fields would differ). The wire layer itself is
   endian-explicit and would need a big-endian capture to be pinned.

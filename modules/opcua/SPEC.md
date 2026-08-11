@@ -147,10 +147,23 @@ explicitly, each with a test:
 | queued Publish requests | `Config.max_publish_requests` | `BadTooManyPublishRequests` |
 | retained notifications (Republish) | `Config.max_retransmission_queue` | oldest dropped |
 | continuation points per session | `Config.max_continuation_points` | `BadNoContinuationPoints` |
-| operations per request | `Config.max_operations_per_request` | `BadTooManyOperations` |
+| operations per request | `Config.max_operations_per_request` — Read, Write, Browse, BrowseNext, TranslateBrowsePaths, Call and CreateMonitoredItems only | `BadTooManyOperations` |
 | publishing / sampling interval | `Config.min_*_interval_ms` | revised up |
 | publishing cycles per `tick` | `max_cycles_per_tick` | deadline resynchronised |
 | type-hierarchy walk depth | `nodestore.max_subtype_depth` | walk stops |
+
+Known gaps in the table above, stated rather than implied:
+`SetPublishingMode`, `DeleteSubscriptions`, `ModifyMonitoredItems`,
+`SetMonitoringMode` and `DeleteMonitoredItems` do **not** apply
+`max_operations_per_request` — their operation arrays are bounded only by the
+negotiated `max_message_size`, and `Publish` silently drops an
+acknowledgement batch larger than the cap instead of faulting. Both are
+post-authentication CPU/arena amplification, not memory-exhaustion.
+Sessions bound to a SecureChannel that was superseded by a later
+`OpenSecureChannel(issue)` — or whose connection went away — are **not
+reaped**; they hold a `max_sessions` slot until `RevisedSessionTimeout`, and
+`Server.expireSessions` only runs from `Connection.tick`, so a server with no
+live connection reaps nothing.
 
 Continuation points are **session-scoped**: a handle from another session (or
 a guessed one) is `BadContinuationPointInvalid`, never someone else's cursor.

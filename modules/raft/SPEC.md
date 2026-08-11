@@ -164,6 +164,18 @@ and panicked on anything unexpected. Concretely it now rejects
   16-byte image claiming 1,000,000 entries used to allocate 24 MB and then read
   far past the buffer; `0xFFFFFFFF` demanded ~103 GB.
 
+**What the decoders deliberately do *not* range-limit: `term`.** `Term` is a `u64` and
+`RequestVoteReq`/`AppendEntriesReq`/the two responses accept any value in it; `stepDown` then
+assigns it verbatim (`server.zig:296-298`). Inside the harness that is exactly right — every byte
+on the wire comes from our own `encode`, so a term only ever advances by one — but it is the one
+remaining piece of wire-driven arithmetic that is not fail-closed the way the count fields above
+now are: a peer that asserts `term = 2^64-1` leaves every node that observes it at
+`current_term = maxInt(u64)`, and the next `startElection`'s `ns.current_term += 1`
+(`server.zig:333-335`) then panics under Debug/ReleaseSafe or, under ReleaseFast, **wraps to 0** — a
+term *regression*, which is precisely the failure `observeTerm` exists to make impossible. A
+deployment reusing these codecs against untrusted peers must bound the adopted term (or use a
+saturating increment) as well as the lengths and enum bytes.
+
 **Policy on a malformed message: drop it and count it** (`RaftServer.
 malformed_dropped`). Figure 2 defines no negative acknowledgement, so there is
 nothing legal to reply, and inventing one would add both a protocol message and

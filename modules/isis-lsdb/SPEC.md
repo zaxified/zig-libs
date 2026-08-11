@@ -153,10 +153,19 @@ a zero-lifetime flood cannot grow the DB. Reported as `{ ordering = .same, store
     primitive that no checksum defends;
   - an **aged-out** LSP is flooded as a purge rather than as a copy of itself at
     its original lifetime, so the removal actually propagates.
-- **Pass 2 (remove)** — any purge-hold entry with `now ≥ purge_deadline` is
-  removed and its bytes freed (`AgeReport.removed`). Removal invalidates the map
-  iterator, so the pass re-scans after each removal; purge removals are rare (only
-  at `ZeroAgeLifetime` expiry), so the cost is negligible and nothing is allocated.
+- **Pass 2 (remove)** — two kinds of entry are dropped: any **purge-hold** entry
+  with `now ≥ purge_deadline` (bytes freed, `AgeReport.removed`) and any
+  **request placeholder** with `now ≥ set_now + request_timeout` (§7,
+  `AgeReport.requests_expired`, its budget slot returned). Removing mid-iteration
+  is not safe — the entry map is open-addressing, and a removal can backward-shift
+  a not-yet-visited entry into an already-visited slot — so the pass collects
+  victims into a reusable `Lsdb.tick_victims` list in **one** scan and then
+  removes them in a single bounded pass, with no rescans: one mass expiry costs
+  `O(n + k)`, not `O(n·k)`. That list is the pass's only allocation (amortised
+  away by `clearRetainingCapacity`); an allocation failure while collecting just
+  defers the remaining victims to the next `tick`. Every removal also clears the
+  entry's SRM/SSN queue membership, so a queue can never name an LSP the store no
+  longer holds.
 
 An LSP received *already* purged (zero lifetime) for an LSP-ID we **do** hold is
 stored via the newer path directly into the purge hold (so it re-floods and is

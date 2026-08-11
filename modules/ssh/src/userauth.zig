@@ -686,6 +686,72 @@ fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
     return w.buffered();
 }
 
+// ── fuzz: the USERAUTH decode entry (RFC 4252), not the transport ──────────
+//
+// `serveUserauth`/`servePublickey` parse a pre-authentication peer's user,
+// service, method, algorithm, key blob and signature with `messages.Cursor`.
+// The module's transport-layer fuzz targets never reach this code, and this
+// is the one decoder in the module that runs for a peer who has proved
+// nothing at all — so it is the highest-value fuzz entry in the file.
+test "fuzz: serveUserauth never panics on an arbitrary userauth message stream" {
+    try std.testing.fuzz({}, fuzzServeUserauth, .{});
+}
+
+fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
+    var payload_store: [4][256]u8 = undefined;
+    var payloads: [4][]const u8 = undefined;
+    const n: usize = smith.valueRangeAtMost(u8, 1, @intCast(payloads.len));
+    for (0..n) |i| {
+        var w: std.Io.Writer = .fixed(&payload_store[i]);
+        // Mostly SSH_MSG_USERAUTH_REQUEST (50), so the budget is spent inside
+        // the request parser rather than on the dispatch table.
+        const mt: u8 = if (smith.boolWeighted(4, 1))
+            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)
+        else
+            smith.valueRangeAtMost(u8, 0, 255);
+        w.writeByte(mt) catch return;
+
+        // Half the time build a *structurally plausible* request — the shape
+        // that actually reaches `servePublickey`'s blob/signature decoding —
+        // and half the time raw bytes.
+        if (smith.boolWeighted(1, 1)) {
+            messages.writeString(&w, "alice") catch return;
+            messages.writeString(&w, connection_service) catch return;
+            const method: []const u8 = if (smith.boolWeighted(2, 1)) "publickey" else "password";
+            messages.writeString(&w, method) catch return;
+        }
+        var body: [200]u8 = undefined;
+        const present: usize = smith.valueRangeAtMost(u8, 0, 160);
+        smith.bytes(body[0..present]);
+        w.writeAll(body[0..present]) catch return;
+        payloads[i] = w.buffered();
+    }
+
+    var wire: [4096]u8 = undefined;
+    const framed = framePackets(&wire, payloads[0..n]) catch return;
+
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [8192]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+    tr.session_id = transport.SessionId.from("fuzz-session-id");
+
+    const res = serveUserauth(&tr, std.testing.allocator, .{
+        .authorized_key = struct {
+            fn f(_: []const u8, _: []const u8, _: []const u8) bool {
+                return true;
+            }
+        }.f,
+        .password = struct {
+            fn f(_: []const u8, _: []const u8) bool {
+                return true;
+            }
+        }.f,
+    }) catch return;
+    // A success must never carry a user name longer than the declared bound.
+    std.debug.assert(res.user().len <= max_user_len);
+}
+
 test "serveUserauth: an oversize peer string is a typed error, not a panic" {
     const t = std.testing;
 

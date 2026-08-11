@@ -11,8 +11,15 @@
 //!
 //! **Handles are hexadecimal.** `tc class add … classid 1:10` means minor
 //! 0x10 = 16, not 10 — iproute2 parses both halves with base 16 and prints
-//! them the same way. `parse`/`format` here follow that convention exactly,
-//! so a string round-trips through `tc show` output unchanged.
+//! them the same way.
+//!
+//! `parse` accepts every form `tc show` prints, including the reserved values
+//! spelled numerically (`ffff:fff1`, `0:`). `format` does **not** reproduce
+//! iproute2's `print_tc_classid` byte for byte: it prefers the symbolic names
+//! (`root` / `ingress` / `none`) where iproute2 prints `ffff:fff1` or `0:`,
+//! and it prints a major-0 handle as `0:10` where iproute2 prints `:10`.
+//! `format` → `parse` still recovers the identical `raw`, so the round-trip is
+//! value-exact; it is only the rendering that differs from `tc`.
 
 const std = @import("std");
 

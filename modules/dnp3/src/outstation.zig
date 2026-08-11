@@ -388,8 +388,20 @@ pub const CommandHook = struct {
 
 pub const Config = struct {
     /// This outstation's data-link address.
+    ///
+    /// ⚠ Today this is used **only as the source address of frames we send**.
+    /// `Session.feedFrame` does not compare it against an inbound frame's
+    /// destination, so a caller that puts one `Session` on a shared link
+    /// (serial multi-drop, or a TCP listener carrying several link addresses)
+    /// will act on frames addressed to a *different* outstation. Until that
+    /// filter exists here, the caller must reject mismatched frames before
+    /// calling `feedFrame`.
     address: u16 = 1024,
     /// The master's data-link address.
+    ///
+    /// ⚠ Same caveat as `address`: this is the *destination* we address our
+    /// replies to, not an inbound source filter — `feedFrame` accepts user
+    /// data from any source address.
     master_address: u16 = 1,
 
     /// Largest application fragment this outstation will emit. §4.1.2 fixes

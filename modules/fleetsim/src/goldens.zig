@@ -85,13 +85,27 @@ test "anchor: Wireshark reads the Modbus adapter's read reply, and its trouble e
     //     0... .... = Exception: No         [modbus.exception == False]
     //     .000 0011 = Function Code: Read Holding Registers (3)
     //     Byte Count: 4                     [modbus.byte_cnt == 4]
-    //     Register 0 (UINT16): 4369         [modbus.regval_uint16 == 4369]
-    //     Register 1 (UINT16): 8738         [modbus.regval_uint16 == 8738]
+    //     Register 0 (UINT16): 258          [modbus.regnum16 == 0]
+    //                                       [modbus.regval_uint16 == 258]
+    //     Register 1 (UINT16): 772          [modbus.regnum16 == 1]
+    //                                       [modbus.regval_uint16 == 772]
     //
     // Note what an independent reader confirms that our own round trip cannot:
     // that the MBAP `Length` field counts unit-id + PDU (7, not 6 or 8), and
-    // that 0x1111/0x2222 land big-endian in register order.
-    var holdings = [_]u16{ 0x1111, 0x2222, 0x3333, 0x4444 };
+    // that 0x0102/0x0304 land big-endian *within* each register — Wireshark
+    // says 258 and 772, where a byte-swapped encoder would have made it read
+    // 513 and 1027.
+    //
+    // The register values are deliberately **asymmetric**. The first version of
+    // this vector used 0x1111/0x2222, which are byte-palindromes: flipping the
+    // encoder's endianness emits the identical frame, so the reading above
+    // could not have distinguished it and the claim in this comment was one the
+    // vector did not support. Measured: with `modules/modbus/src/server.zig`'s
+    // register writer at `.little`, this test stayed GREEN on the old fixture
+    // (six other fleetsim tests went red) and goes RED on this one. A golden
+    // that a real external tool produced is still only worth the distinctions
+    // its inputs can express.
+    var holdings = [_]u16{ 0x0102, 0x0304, 0x3333, 0x4444 };
     var slave = adapters.Modbus.init(
         .{ .unit_id = 5, .framing = .tcp },
         .{ .holding_registers = .{ .base = 0, .values = &holdings } },
@@ -103,7 +117,7 @@ test "anchor: Wireshark reads the Modbus adapter's read reply, and its trouble e
     const req = try modbus.tcp.encodeAdu(&req_buf, 0x1234, 5, &.{ 0x03, 0x00, 0x00, 0x00, 0x02 });
     const reply = (try n.deliver(req, &out, 0)).?;
     try testing.expectEqualSlices(u8, &.{
-        0x12, 0x34, 0x00, 0x00, 0x00, 0x07, 0x05, 0x03, 0x04, 0x11, 0x11, 0x22, 0x22,
+        0x12, 0x34, 0x00, 0x00, 0x00, 0x07, 0x05, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04,
     }, reply);
 
     // sharkd, same stream, on the trouble reply:

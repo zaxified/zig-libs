@@ -867,17 +867,64 @@ fn fuzzP384AuthDecap(_: void, smith: *std.testing.Smith) !void {
 // while making the module wire-incompatible with every other HPKE
 // implementation on earth.
 //
-// This test is the narrowest thing that is NOT self-referential: RFC 9180
-// §7.1 Table 2 fixes DHKEM(P-384, HKDF-SHA384)'s internal KDF, and HKDF's PRK
-// length is its hash's output length — 48 bytes for SHA-384, 64 for SHA-512,
-// 32 for SHA-256. The number comes from the spec, not from us, so a
-// consistently-wrong hash cannot satisfy it. It does not prove the KEM is
-// byte-correct; it proves the one parameter a self-consistency test structurally
-// cannot see.
-test "P384Kem's internal KDF is HKDF-SHA384, pinned by the spec's own output length" {
+// The width checks below are NOT sufficient on their own, and the re-audit of
+// 2026-08-11 proved it by measurement: `Nsecret` is a separately-declared
+// constant that `extractAndExpand` takes as its own comptime parameter, and
+// `labeledExpand` expands to whatever length it is asked for — so swapping this
+// KEM's `HkdfSha384` for `HkdfSha256` (or `HkdfSha512`) still yields a 48-byte
+// `shared_secret`, leaves `HkdfSha384.prk_length == 48` true (that is a property
+// of the alias, not of what `P384Kem` calls), and left `test-hpke` at exit 0.
+// The width test is kept because it does pin `Npk`/`Nsk`/`kem_id`, but the
+// derivation test below is what actually discriminates the hash.
+test "P384Kem: type widths and PRK width match RFC 9180 §7.1 Table 2" {
     try std.testing.expectEqual(@as(usize, 48), HkdfSha384.prk_length);
     try std.testing.expectEqual(@as(usize, 48), P384Kem.Nsecret);
     // The sibling KEMs' internal KDF is HKDF-SHA256 (same table), so the same
     // check pins them against a P-384-shaped copy-paste in either direction.
     try std.testing.expectEqual(@as(usize, 32), HkdfSha256.prk_length);
+}
+
+// The discriminating test. `P384Kem` has no RFC 9180 Appendix A vector (see
+// SPEC.md done-record item 16), so every OTHER test it has is self-consistent:
+// `encap` and `decap` run the same code, and a mutation applied to both stays
+// invisible. A wrong internal KDF is exactly that shape of defect — and it is
+// not cosmetic, it makes the module wire-incompatible with every other HPKE
+// implementation while every round trip still agrees with itself.
+//
+// This test breaks the self-reference by recomputing `shared_secret` from the
+// RFC's own §4.1/§7.1.2 recipe through an INDEPENDENT path: `std`'s one-shot
+// `Hkdf.extract`/`.expand` over hand-concatenated labeled buffers, rather than
+// `suite.labeledExtract`'s streaming HMAC that the implementation uses. Both
+// the hash choice and the labeled-input layout have to agree for it to pass.
+test "P384Kem's internal KDF is HKDF-SHA384: shared_secret matches an independent labeled-HKDF derivation" {
+    const skR = P384Kem.deriveKeyPair("hpke p384 kdf-discriminator receiver");
+    const eph = P384Kem.deriveKeyPair("hpke p384 kdf-discriminator ephemeral");
+    const got = try P384Kem.encapDeterministic(skR.public_key, eph);
+
+    // dh, recomputed here from the curve rather than taken from the KEM.
+    const shared_point = try (try P384.fromSec1(&skR.public_key)).mul(eph.secret_key, .big);
+    const dh = shared_point.affineCoordinates().x.toBytes(.big);
+
+    const kem_suite_id = suite.kemSuiteId(0x0011); // "KEM" || I2OSP(0x0011, 2)
+
+    // eae_prk = LabeledExtract("", "eae_prk", dh), concatenated not streamed.
+    var ikm: [7 + 5 + 7 + 48]u8 = undefined;
+    @memcpy(ikm[0..7], "HPKE-v1");
+    @memcpy(ikm[7..12], &kem_suite_id);
+    @memcpy(ikm[12..19], "eae_prk");
+    @memcpy(ikm[19..], &dh);
+    const eae_prk = HkdfSha384.extract("", &ikm);
+
+    // shared_secret = LabeledExpand(eae_prk, "shared_secret", kem_context, 48)
+    var info: [2 + 7 + 5 + 13 + 2 * P384Kem.Npk]u8 = undefined;
+    std.mem.writeInt(u16, info[0..2], 48, .big); // I2OSP(L, 2)
+    @memcpy(info[2..9], "HPKE-v1");
+    @memcpy(info[9..14], &kem_suite_id);
+    @memcpy(info[14..27], "shared_secret");
+    @memcpy(info[27 .. 27 + P384Kem.Npk], &eph.public_key);
+    @memcpy(info[27 + P384Kem.Npk ..], &skR.public_key);
+    var want: [48]u8 = undefined;
+    HkdfSha384.expand(&want, &info, eae_prk);
+
+    try testing.expectEqualSlices(u8, &want, &got.shared_secret);
 }

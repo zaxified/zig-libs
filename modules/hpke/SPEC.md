@@ -530,6 +530,24 @@ implemented and KAT-verified (order preserved):
     vector. Exit 1 mutated, exit 0 restored — see this repo's task record
     for the exact line and both exit codes.
 
+    ⚠ **Corrected 2026-08-11 (re-audit).** The paragraph above used to be
+    the whole teeth story, and it was not enough. The list of anchors above
+    leaves ONE parameter unpinned: the KEM's own internal KDF. The
+    type-width test asserts `HkdfSha384.prk_length == 48` and
+    `P384Kem.Nsecret == 48`, but the first is a property of the *alias* and
+    the second is a separately-declared constant that `extractAndExpand`
+    takes as its own comptime parameter — `labeledExpand` expands to
+    whatever length it is asked for. So swapping `P384Kem`'s four
+    `extractAndExpand(HkdfSha384, …)` call sites to `HkdfSha256` (and,
+    separately, to HKDF-SHA512) left the ENTIRE suite at **exit 0** — a
+    module wire-incompatible with every other HPKE implementation, with
+    every round trip still agreeing with itself. `dhkem.zig` now carries a
+    discriminating test ("shared_secret matches an independent labeled-HKDF
+    derivation") that recomputes `shared_secret` via std's one-shot
+    `Hkdf.extract`/`.expand` over hand-concatenated labeled buffers instead
+    of `suite.labeledExtract`'s streaming HMAC; the same SHA-256 mutation is
+    now **exit 1**, clean tree **exit 0**.
+
 ## Verification status
 
 1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — all tests

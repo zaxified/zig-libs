@@ -65,12 +65,25 @@ median of three runs:
 | full AEAD encrypt | 1406 MB/s | 502 MB/s | **2.8×** |
 | AEAD, 1420 B packet | 1127 MB/s | 441 MB/s | **2.6×** |
 
+(Re-measured 2026-08-10 on the same host: 1.66× / 3.18× / 2.47× / 2.90× / 2.48×.
+Run-to-run spread on these lines is a few percent — read them as ratios.)
+
 Poly1305 is lane-parallel above a size threshold and std's scalar core below it,
-so the MAC speedup is size-dependent — and deliberately never a *loss*:
+so the MAC speedup is size-dependent. Below the threshold the executed code *is*
+std's, so those columns are parity by construction and the ±2–3% there is timer
+noise, not a difference:
 
 | message | 32 B | 128 B | 256 B | 512 B | 1420 B | 4 KiB | 8 KiB |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| ours vs std | 1.0× | 0.98× | 1.06× | 1.53× | 2.0× | 2.4× | 2.5× |
+| ours vs std | 1.0× | 1.0× | 1.06× | 1.5× | 2.0× | 2.4× | 2.5× |
+
+**Short AEAD calls run std, not this module.** When `message + AD ≤ 128 bytes`
+the whole AEAD is handed to `std.crypto.aead.chacha_poly`, and when a ChaCha run
+(or its post-group tail) is ≤ 64 bytes the cipher is handed to
+`std.crypto.stream.chacha`. So a WireGuard keepalive, a tunnelled ACK or a short
+handshake payload gets exactly std's speed — by design, so that no size loses.
+The wins above start at 144 B. Both branches are on lengths only, never on key
+or plaintext; see `SPEC.md`.
 
 **The XOR is fused.** `ChaCha20.xor` used to stage the keystream into a stack
 buffer and then XOR it byte-wise; that loop was not vectorised at all (LLVM could

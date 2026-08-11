@@ -702,6 +702,52 @@ test "streaming update splits agree with one-shot (leftover + pad)" {
     }
 }
 
+test "pad() after a WIDE run, every lane width" {
+    // The test below only ever pads an accumulator the *serial* engine last
+    // touched (its `a` is at most 70 bytes). But the AEAD's own shape is
+    // `update(ad) / pad / update(ct) / pad / update(lens) / final`, and with AD
+    // longer than `wide_min_bytes` the pad lands directly on an accumulator the
+    // vector engine just wrote back — a seam nothing else exercises.
+    var prng = std.Random.DefaultPrng.init(0xBEEF_5A5A);
+    const rand = prng.random();
+    var key: [32]u8 = undefined;
+    rand.bytes(&key);
+    var a: [1500]u8 = undefined;
+    var b: [1500]u8 = undefined;
+    rand.bytes(&a);
+    rand.bytes(&b);
+
+    const lens = [_]usize{ 176, 177, 191, 192, 193, 255, 256, 383, 384, 385, 512, 1024, 1500 };
+    inline for (widths) |L| {
+        for (lens) |n| {
+            for (lens) |m| {
+                var ours = Generic(L).init(&key);
+                ours.update(a[0..n]);
+                ours.pad();
+                ours.update(b[0..m]);
+                ours.pad();
+                ours.update(a[0..17]);
+                var ot: [16]u8 = undefined;
+                ours.final(&ot);
+
+                var theirs = StdPoly.init(&key);
+                theirs.update(a[0..n]);
+                theirs.pad();
+                theirs.update(b[0..m]);
+                theirs.pad();
+                theirs.update(a[0..17]);
+                var tt: [16]u8 = undefined;
+                theirs.final(&tt);
+
+                testing.expectEqualSlices(u8, &tt, &ot) catch |e| {
+                    std.debug.print("pad-after-wide mismatch L={d} n={d} m={d}\n", .{ L, n, m });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
 test "pad() matches std's pad() across leftover states" {
     var prng = std.Random.DefaultPrng.init(0xFEED_BEEF);
     const rand = prng.random();

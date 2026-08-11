@@ -514,7 +514,12 @@ Everything below is out of scope for this module as it stands, deliberately and 
   Request`, `Security-Payload`, key update/distribution) are recognised by type and passed through
   uninterpreted. Note that base BACnet has **no authentication of any kind**: any host that can
   reach port 47808 can write any writable property. Treat a BACnet segment as a trust boundary and
-  put the access control somewhere else.
+  put the access control somewhere else. The one resource an unauthenticated peer can *hold* is a
+  COV subscription slot (`Device(max_subscriptions)`'s `subs` array), so the device clamps every
+  answered subscription to `Config.max_cov_lifetime_s` — **default 3600 s** — and a request for
+  "indefinite" (lifetime 0) is granted that bound instead. Setting `max_cov_lifetime_s = 0`
+  disables the clamp and *does* let a vanished subscriber pin a slot forever; it is a deliberate
+  opt-out, not a safe value.
 - **BBMD *behaviour***, as opposed to its frames. Registering as a foreign device (with its
   30-second grace period and re-registration timer), maintaining a broadcast distribution table
   and re-emitting broadcasts as `Forwarded-NPDU` are policy this module encodes for but does not

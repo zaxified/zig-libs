@@ -45,15 +45,57 @@ block `counter +% j`. Then:
 `N = wide = 8`. A `@Vector(8, u32)` lowers to one 256-bit AVX2 register when the
 target enables AVX2 (`-Dcpu=native` or any `x86_64_v3`+ target), and to a pair of
 128-bit SSE2 registers on `baseline` — correct either way, faster when AVX2 is
-on. The `<8`-block tail (including the final partial block) runs the **same
-generic engine instantiated at `N = 1`**, so there is exactly one keystream code
-path, just at two widths.
+on.
 
-**Counter semantics.** IETF ChaCha20 has a 32-bit block counter; this module
-increments it with wrapping (`+%`). `std` *asserts* the stream stays within
-`64·(2^32 − counter)` bytes and does not wrap — so the differential tests stay
-inside that domain (wrap past 2^32 blocks is out of `std`'s and RFC's defined
-range and is not diffed).
+**The `<8`-block tail.** There is no `N = 1` instantiation of the engine any
+more: a tail longer than one block generates one *whole* `N = 8` group and
+discards the unused suffix (a wide group costs about what a single scalar block
+costs), and a tail of one block or less is handed to
+`std.crypto.stream.chacha` — see `delegate_max_bytes` below. So the module has
+exactly one *width* of its own keystream code, plus std's for short runs.
+
+**Counter semantics.** IETF ChaCha20 has a 32-bit block counter. `ChaCha20.xor`
+and `.stream` *assert* that the request stays inside `64·(2^32 − counter)`
+bytes, matching `std`'s own assert — a wrap would restart and reuse the
+keystream (two-time pad). Inside the loop the counter still advances with `+%`;
+the discarded lanes of a tail group may run past 2^32−1, but those bytes are
+never emitted. The differential tests stay inside the non-wrapping domain (wrap
+past 2^32 blocks is out of `std`'s and the RFC's defined range and is not
+diffed).
+
+## Short inputs are std's code — the two delegation thresholds
+
+Both engines here are block- or lane-*parallel*, so their cost is flat in the
+length: a group costs the same whether it emits 65 bytes or 512. Below a
+break-even size that loses to `std`, which vectorises *within* a block and has a
+cheap single-block shape. Rather than ship a documented regression on
+short-packet traffic, the module hands those lengths back to `std`:
+
+| constant | in | condition | what runs |
+|---|---|---|---|
+| `delegate_max_bytes` = 64 | `ChaCha20.xor` / `.stream` | whole call, or the post-group tail, is ≤ 64 B | `std.crypto.stream.chacha.ChaCha20IETF` |
+| `aead_delegate_max` = 128 | `ChaCha20Poly1305.encrypt` / `.decrypt` | `m.len + ad.len ≤ 128` | `std.crypto.aead.chacha_poly.ChaCha20Poly1305` |
+| `wide_min_groups` = 3 | `poly1305.Generic(L).update` | fewer than 3 whole lane groups (< 192 B at L = 4) | `std.crypto.onetimeauth.Poly1305` |
+
+**Consumer-visible consequence, stated plainly:** for an AEAD call whose message
+plus AD is 128 bytes or less — a WireGuard keepalive, a tunnelled TCP ACK, a
+Noise handshake payload — this module *is* `std.crypto.aead.chacha_poly`, and
+none of the speedups quoted below apply. That is deliberate: parity there is
+exact by construction rather than by tuning. The wins start at 144 B and reach
+2.5–3× by 1420 B / 8 KiB.
+
+Every one of these branches is on a **length** — public, on the wire before a
+byte is authenticated. None may ever be made to depend on key or plaintext.
+
+The AEAD-threshold branch is the one place delegation is not a straight
+hand-off: `std`'s `decrypt` leaves `m` *undefined* on rejection, while this
+module promises `m` is zeroed, so the delegated failure path re-adds the
+`secureZero` by hand (`root.zig:538`).
+
+`delegate_max_bytes` and `aead_delegate_max` are guarded by a test-build path
+witness (`chacha_path` / `aead_path`) that asserts which engine each length was
+routed to; a mis-routing is otherwise byte-invisible. `wide_min_groups` has
+**no** such witness — see the audit note in `~/CML/20260808-zig-libs-audit/`.
 
 ## Poly1305 — lane-parallel above a threshold, std's scalar core below it
 
@@ -114,14 +156,29 @@ ChaCha and Poly1305 are inherently constant-time: only add / xor / rotate /
 (Poly1305) multiply / mask, no secret-indexed memory access and no data-dependent
 branches. The lane-parallel MAC adds only arithmetic of that same shape; every
 branch it introduces is on message length or buffer occupancy, both public, and
-the lane count is a comptime constant rather than a runtime dispatch. The `@Vector` ops preserve this (SIMD lanes are data-oblivious). The
+the lane count is a comptime constant rather than a runtime dispatch. The
+`@Vector` ops preserve this (SIMD lanes are data-oblivious). The
 byte-serialization transpose indexes vectors by **comptime** lane/word indices
 only. Tag verification uses `std.crypto.timing_safe.eql`, and a failed `decrypt`
-`secureZero`s the computed tag and `@memset`s the plaintext buffer before
-returning `error.AuthenticationFailed` — a caller must not read `m` on error.
+`secureZero`s both the computed tag and the plaintext buffer before returning
+`error.AuthenticationFailed` — a caller must not read `m` on error.
 
-This is a *structural* CT argument (no secret-dependent control flow exists in
-the source), not a machine-checked-disassembly audit like `montint`/`k256`.
+**This holds in `ReleaseFast`, which is what ships — and only there.** The
+lane-parallel MAC uses *checked* `*` / `+` rather than `*%` / `+%` on purpose,
+so that a deferred-carry bounds mistake panics instead of silently forging a
+tag; in `Debug` / `ReleaseSafe` those checks are branches on secret-derived
+values. Measured with valgrind/memcheck over a tainted key (Zig 0.16,
+`-fvalgrind`, positive control fires): `ReleaseFast` → **0** tainted-branch
+contexts anywhere in `poly1305.zig`, the only reports being the AEAD's
+accept/reject branch after `timing_safe.eql`, which `std`'s own AEAD reports
+identically. `Debug` → ~180 contexts inside `mulRed` / `carryLimbs` /
+`buildPowers` / `wide`, the overflow checks; `std`'s scalar `Poly1305` shows the
+same class of artifact in its `mulWide`. Do not ship this module at
+`ReleaseSafe` if constant time matters.
+
+Beyond that measurement this is a *structural* CT argument (no secret-dependent
+control flow exists in the source), not a machine-checked-disassembly audit like
+`montint`/`k256`.
 
 ## Verification
 
@@ -154,9 +211,6 @@ implementation at every awkward length, so a wrong keystream cannot ship.
 
 ## Non-goals / backlog
 
-- **Fusing `ChaCha20.xor`'s keystream generation with the XOR** — now the AEAD's
-  actual bottleneck (see the throughput note above), worth more than further MAC
-  work.
 - **AVX-512 (L = 8) is correctness-tested but perf-unmeasured** — no AVX-512
   hardware here. The selection is comptime, so a host that has it takes the
   8-lane path untested for *speed*; it is not untested for *correctness*.
@@ -164,6 +218,17 @@ implementation at every awkward length, so a wrong keystream cannot ship.
   not beat one 64×64→128 scalar multiply, so those targets stay on std.
 - **XChaCha20 / XChaCha20-Poly1305** (24-byte extended nonce, HChaCha20) — not
   needed by current consumers; add if a consumer wants it.
-- Machine-checked CT disassembly audit (as done for the asm field modules).
-- Consumer rewiring (`signal`/`noise`/`wireguard`/`hpke`/`quic-crypto`/`bolt8`)
-  is a separate follow-up, conditional on the S1b userland-WireGuard direction.
+- Machine-checked CT disassembly audit (as done for the asm field modules). The
+  valgrind/memcheck tainted-key measurement in the constant-time section above
+  is not a substitute for one.
+- **A test-build path witness for `wide_min_groups`**, the way `chacha_path` /
+  `aead_path` guard the other two thresholds. Without it the lane-parallel MAC
+  can be disabled outright (raise the constant) with the whole suite still
+  green — measured, and the cost is the module's entire reason to exist
+  (MAC 2.5× → 1.0×, AEAD 2.9× → 1.9× at 8 KiB).
+
+Consumers already wired to this module (`@import("chachapoly")`, all using
+`ChaCha20Poly1305`): `noise`, `wireguard`, `dtls`, `quic-crypto`, `hpke`,
+`signal`, `aeadframe`, `timelock_envelope`. `bolt8` still uses `std`'s. Any
+change to the delegation thresholds or the MAC is therefore live on those
+paths, not staged behind a rewiring step.

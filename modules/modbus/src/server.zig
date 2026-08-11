@@ -1410,3 +1410,63 @@ test "fuzz: structurally valid requests with wire-controlled fields never panic"
         try testing.expect(reply[0] == frame[0] or reply[0] == frame[0] | 0x80);
     }
 }
+
+// The two loops above are fixed-seed: they are reproducible, but `zig build
+// --fuzz` (and therefore `scripts/fuzz-sweep.sh`) only drives
+// `std.testing.fuzz` entry points, so without the harness below the whole
+// server — the only part of this module that an unauthenticated peer can
+// reach and that writes to a process image — would never be explored by the
+// coverage-guided sweep.
+
+test "fuzz: the server never panics and always answers or stays silent" {
+    try testing.fuzz({}, fuzzServer, .{});
+}
+
+fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
+    var coils = [_]bool{false} ** 64;
+    var discretes = [_]bool{false} ** 64;
+    var holdings = [_]u16{0} ** 64;
+    var inputs = [_]u16{0} ** 64;
+    var server = Server.init(.{
+        .unit_id = 5,
+        .framing = if (smith.value(bool)) .tcp else .rtu,
+        .exception_status = 0x11,
+        .slave_id = "fuzz",
+    }, .{
+        .coils = .{ .base = 0, .values = &coils },
+        .discrete_inputs = .{ .base = 10, .values = &discretes },
+        // Deliberately butted against the top of the 16-bit address space so
+        // that any `addr + quantity` computed in a narrow type wraps here.
+        .holding_registers = .{ .base = 0xFFC0, .values = &holdings },
+        .input_registers = .{ .base = 1000, .values = &inputs },
+    });
+
+    var frame: [300]u8 = undefined;
+    smith.bytes(&frame);
+    const len: usize = smith.valueRangeAtMost(u16, 0, frame.len);
+    const bytes = frame[0..len];
+
+    // Half the budget goes to PDUs that start with a real function code, so
+    // the fuzzer spends its time inside the handlers rather than bouncing off
+    // the dispatch table.
+    if (len > 0 and smith.value(bool)) {
+        const fcs = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0F, 0x10, 0x11, 0x17 };
+        frame[0] = fcs[smith.index(fcs.len)];
+    }
+
+    var pdu_out: [mb.max_pdu_len]u8 = undefined;
+    const reply = try server.handlePdu(bytes, &pdu_out);
+    try testing.expect(reply.len >= 2 and reply.len <= mb.max_pdu_len);
+    if (len > 0) {
+        try testing.expect(reply[0] == bytes[0] or reply[0] == bytes[0] | 0x80);
+    }
+
+    var out: [mb.tcp.max_adu_len]u8 = undefined;
+    if (try server.handleAdu(bytes, &out)) |adu| {
+        // Whatever we put on the wire must be a frame we can decode again.
+        switch (server.config.framing) {
+            .tcp => _ = try mb.tcp.decodeAdu(adu),
+            .rtu => _ = try mb.rtu.decodeAdu(adu),
+        }
+    }
+}

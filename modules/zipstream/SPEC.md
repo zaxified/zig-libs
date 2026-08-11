@@ -48,7 +48,15 @@ Untrusted-archive hardening: a corrupted local file header signature → `EntryR
 `Error.ZipBadFileOffset` cleanly (never over-reads); a central-directory size that lies beyond the
 physical file (simulated truncation/corruption of just one entry's bookkeeping) hits
 `error.EndOfStream` cleanly instead of looping or over-reading; a truncated archive (missing central
-directory/EOCD) → `Archive.init` returns `error.ZipNoEndRecord` cleanly. zip64 archives/entries (> 4
+directory/EOCD) → `Archive.init` returns `error.ZipNoEndRecord` cleanly. A **decompression bomb** is
+bounded twice: `EntryReader.init` refuses up front (`Error.ZipEntryTooLarge`) any entry whose declared
+uncompressed size exceeds `default_max_output` (1 GiB — an absolute size cap, not a ratio cap;
+`EntryReader.initMax` takes the cap explicitly), and the running Deflate output is clamped to the
+declared size, so a stream that expands past its own central-directory bound is cut off there rather
+than read unbounded. **Content integrity** is checked, not assumed: `reader()` accumulates a CRC-32 over
+every decompressed byte and compares it against the entry's *central-directory* checksum (authoritative
+even under a post-data data descriptor, where the local header's copy is zero) at end-of-stream — a
+mismatch fails the read with `error.ReadFailed` and `EntryReader.crcMismatch()` set. zip64 archives/entries (> 4
 GiB, or > 65535 records) are read correctly — not a ceiling, see "Design & invariants" above. Documented
 ceiling, not a bug: **no encrypted entries** (`std.zip.Iterator` already rejects these,
 `error.ZipEncryptionUnsupported`); **Store + Deflate only** — any other method (bzip2, LZMA, …) is

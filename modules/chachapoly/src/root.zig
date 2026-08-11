@@ -779,6 +779,50 @@ test "differential AEAD vs std: seal/open/tamper across edge lengths" {
     }
 }
 
+test "differential AEAD vs std with LONG associated data" {
+    // The sweep above derives `ad_len` from `len % 64`, so it never sends more
+    // than 63 bytes of AD, and the threshold test below caps it at 129. Neither
+    // reaches the MAC's own wide threshold (176 B at L = 4), so nothing else
+    // here exercises the AEAD's real long-AD shape: the vector engine absorbs
+    // the AD, `pad16` lands on the accumulator it just wrote back, and the
+    // vector engine then absorbs the ciphertext. An AEAD open with a large AD
+    // and a small ciphertext is an ordinary protocol shape, not a corner case.
+    var prng = std.Random.DefaultPrng.init(0xA11CE);
+    const rand = prng.random();
+    var key: [32]u8 = undefined;
+    var nonce: [12]u8 = undefined;
+    rand.bytes(&key);
+    rand.bytes(&nonce);
+
+    var msg: [2100]u8 = undefined;
+    var ad: [2100]u8 = undefined;
+    rand.bytes(&msg);
+    rand.bytes(&ad);
+    var ours_c: [2100]u8 = undefined;
+    var std_c: [2100]u8 = undefined;
+    var dec: [2100]u8 = undefined;
+
+    const lens = [_]usize{ 0, 1, 16, 127, 128, 129, 175, 176, 177, 191, 192, 193, 256, 384, 512, 1000, 1420, 2048, 2100 };
+    for (lens) |ad_len| {
+        for (lens) |m_len| {
+            var ours_tag: [16]u8 = undefined;
+            var std_tag: [16]u8 = undefined;
+            ChaCha20Poly1305.encrypt(ours_c[0..m_len], &ours_tag, msg[0..m_len], ad[0..ad_len], nonce, key);
+            StdAead.encrypt(std_c[0..m_len], &std_tag, msg[0..m_len], ad[0..ad_len], nonce, key);
+            testing.expectEqualSlices(u8, std_c[0..m_len], ours_c[0..m_len]) catch |e| {
+                std.debug.print("ct mismatch ad={d} m={d}\n", .{ ad_len, m_len });
+                return e;
+            };
+            testing.expectEqualSlices(u8, &std_tag, &ours_tag) catch |e| {
+                std.debug.print("tag mismatch ad={d} m={d}\n", .{ ad_len, m_len });
+                return e;
+            };
+            try ChaCha20Poly1305.decrypt(dec[0..m_len], std_c[0..m_len], std_tag, ad[0..ad_len], nonce, key);
+            try testing.expectEqualSlices(u8, msg[0..m_len], dec[0..m_len]);
+        }
+    }
+}
+
 // ── tests: the delegation seams ──────────────────────────────────────────────
 //
 // `delegate_max_bytes` and `aead_delegate_max` each introduce a seam where two
@@ -1012,7 +1056,7 @@ test "delegation thresholds route each length to the engine it was measured for"
 // (a) a mis-transposed lane, (b) a wrong block in the discarded tail suffix, and
 // (c) an off-by-one at the group/tail seam. A handful of edge lengths does not
 // cover that: the tail can be any of 0..511 bytes and the tail engine switches
-// between the wide and the N=1 core at 64. Sweep EVERY length up to 1024 — two
+// between the wide group and std at `delegate_max_bytes`. Sweep EVERY length up to 1024 — two
 // whole wide groups plus every possible tail — byte-exact against std.
 test "exhaustive length sweep 0..1024: xor byte-exact vs std" {
     var prng = std.Random.DefaultPrng.init(0xFACE_B00C);
