@@ -1236,6 +1236,66 @@ test "COV lifetime is clamped so a vanished subscriber cannot pin a slot forever
     }
 }
 
+test "COV lifetime: the delivered default (3600 s) is the value actually granted" {
+    // The prior test above pins the MECHANISM against a config value it
+    // supplies itself (60), which stays green for any clamp value at all.
+    // This one names the literal a caller who never touches `Config` actually
+    // gets — an unauthenticated peer's only bound on its only held resource —
+    // so a change to the shipped default is a red test, not a silent shift.
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, db.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+
+    // Ask for "indefinite" (lifetime 0); the default config clamps it.
+    _ = try c.subscribeCov(rig.device_ep.address, 7, .{ .type = .analog_input, .instance = 5 }, false, 0, 0);
+    try settle(&c, &dev, 0);
+    for (dev.subs) |s| {
+        if (s.active) try testing.expectEqual(@as(?u64, 3_600_000), s.expires_ms);
+    }
+}
+
+test "COV lifetime: max_cov_lifetime_s = 0 is a deliberate opt-out, not an accident" {
+    // SPEC documents 0 as "clamp disabled" — the one config the campaign's
+    // own re-audit flagged as indistinguishable from a bug by exit code alone
+    // (both 0 and 1 left the suite green). Cover it explicitly, two ways:
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{
+        .instance = 599,
+        .max_cov_lifetime_s = 0,
+    }, db.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+
+    // (a) An unauthenticated peer requesting an indefinite lifetime (0)
+    // against a device configured with the clamp off gets exactly that — a
+    // permanent slot — the vulnerability F7 names.
+    _ = try c.subscribeCov(rig.device_ep.address, 7, .{ .type = .analog_input, .instance = 5 }, false, 0, 0);
+    try settle(&c, &dev, 0);
+    for (dev.subs) |s| {
+        if (s.active) try testing.expectEqual(@as(?u64, null), s.expires_ms);
+    }
+
+    // (b) A degenerate all-zero request cannot distinguish "clamp disabled"
+    // from "clamp to 0" — both give `expires_ms == null`. Request a large,
+    // explicit, non-zero lifetime instead: the opt-out must leave it
+    // UNTOUCHED (999_999 s), not silently cut it down to the config's own
+    // (zero) value. This is what actually discriminates the guard from a
+    // clamp-to-zero implementation of "0".
+    _ = try c.subscribeCov(rig.device_ep.address, 9, .{ .type = .analog_input, .instance = 5 }, false, 999_999, 1);
+    try settle(&c, &dev, 1);
+    var found = false;
+    for (dev.subs) |s| {
+        if (s.active and s.process_id == 9) {
+            found = true;
+            try testing.expectEqual(@as(?u64, 1 + 999_999_000), s.expires_ms);
+        }
+    }
+    try testing.expect(found);
+}
+
 test "Who-Has by name and by identifier, answered with I-Have" {
     var rig: Rig = .{};
     rig.wire();

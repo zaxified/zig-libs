@@ -41,6 +41,20 @@ const Allocator = std.mem.Allocator;
 /// pre-election bootstrap term; real terms start at 1.
 pub const Term = u64;
 
+/// Ceiling on a wire-carried `Term`. `startElection` does an unconditional
+/// `current_term += 1` on every election timeout (`server.zig`); a peer that
+/// could push a node's `current_term` to `maxInt(Term)` would turn that
+/// increment into a panic under Debug/ReleaseSafe or a wrap to 0 — a term
+/// *regression* — under ReleaseFast, exactly what `observeTerm` exists to
+/// rule out. One term of headroom below `maxInt` is far more than any real
+/// cluster reaches; every other field (`term = 0` included) is otherwise
+/// unrestricted.
+pub const max_term: Term = std.math.maxInt(Term) - 1;
+
+fn checkTerm(term: Term) DecodeError!void {
+    if (term > max_term) return error.InvalidEncoding;
+}
+
 /// A 1-based position in the replicated log. 0 is the sentinel "before the first
 /// entry" (an empty log has `lastIndex() == 0`, `lastTerm() == 0`).
 pub const LogIndex = u64;
@@ -162,8 +176,10 @@ pub const RequestVoteReq = struct {
 
     pub fn decode(p: []const u8) DecodeError!RequestVoteReq {
         if (p.len < wire_len) return error.Truncated;
+        const term = std.mem.readInt(u64, p[1..9], .little);
+        try checkTerm(term);
         return .{
-            .term = std.mem.readInt(u64, p[1..9], .little),
+            .term = term,
             .candidate_id = std.mem.readInt(u32, p[9..13], .little),
             .last_log_index = std.mem.readInt(u64, p[13..21], .little),
             .last_log_term = std.mem.readInt(u64, p[21..29], .little),
@@ -185,8 +201,10 @@ pub const RequestVoteResp = struct {
 
     pub fn decode(p: []const u8) DecodeError!RequestVoteResp {
         if (p.len < wire_len) return error.Truncated;
+        const term = std.mem.readInt(u64, p[1..9], .little);
+        try checkTerm(term);
         return .{
-            .term = std.mem.readInt(u64, p[1..9], .little),
+            .term = term,
             .vote_granted = p[9] != 0,
         };
     }
@@ -235,6 +253,8 @@ pub const AppendEntriesReq = struct {
     /// bugs; a wire field is someone else's input and needs a real check.
     pub fn decode(p: []const u8, out: *[max_entries_per_msg]LogEntry) DecodeError!AppendEntriesReq {
         if (p.len < header_len) return error.Truncated;
+        const term = std.mem.readInt(u64, p[1..9], .little);
+        try checkTerm(term);
         const count = std.mem.readInt(u16, p[37..39], .little);
         if (count > max_entries_per_msg) return error.InvalidEncoding;
         // Only now is `count` known to fit `out`; check the payload can back it
@@ -247,7 +267,7 @@ pub const AppendEntriesReq = struct {
             off += LogEntry.wire_len;
         }
         return .{
-            .term = std.mem.readInt(u64, p[1..9], .little),
+            .term = term,
             .leader_id = std.mem.readInt(u32, p[9..13], .little),
             .prev_log_index = std.mem.readInt(u64, p[13..21], .little),
             .prev_log_term = std.mem.readInt(u64, p[21..29], .little),
@@ -281,8 +301,10 @@ pub const AppendEntriesResp = struct {
 
     pub fn decode(p: []const u8) DecodeError!AppendEntriesResp {
         if (p.len < wire_len) return error.Truncated;
+        const term = std.mem.readInt(u64, p[1..9], .little);
+        try checkTerm(term);
         return .{
-            .term = std.mem.readInt(u64, p[1..9], .little),
+            .term = term,
             .success = p[9] != 0,
             .match_index = std.mem.readInt(u64, p[10..18], .little),
         };
@@ -517,13 +539,76 @@ test "decoders reject undefined tag and entry-kind bytes" {
     }
 }
 
+test "decoders reject a wire term that would overflow the next election increment" {
+    // `startElection` does an unconditional `current_term += 1` on every
+    // election timeout; a peer that could push a node to `maxInt(Term)` turns
+    // that increment into a panic under Debug/ReleaseSafe or a wrap to 0 — a
+    // term REGRESSION — under ReleaseFast. `max_term` reserves one term of
+    // headroom so the increment always fits; pin the literal relationship,
+    // not just the fact that some ceiling exists.
+    try testing.expectEqual(@as(Term, std.math.maxInt(Term) - 1), max_term);
+
+    // RequestVoteReq: rejected one past the ceiling, still works AT it.
+    {
+        var rq: [RequestVoteReq.wire_len]u8 = undefined;
+        (RequestVoteReq{ .term = max_term + 1, .candidate_id = 0, .last_log_index = 0, .last_log_term = 0 }).encode(&rq);
+        try testing.expectError(error.InvalidEncoding, RequestVoteReq.decode(&rq));
+        (RequestVoteReq{ .term = max_term, .candidate_id = 0, .last_log_index = 0, .last_log_term = 0 }).encode(&rq);
+        try testing.expectEqual(max_term, (try RequestVoteReq.decode(&rq)).term);
+    }
+
+    // RequestVoteResp
+    {
+        var rs: [RequestVoteResp.wire_len]u8 = undefined;
+        (RequestVoteResp{ .term = max_term + 1, .vote_granted = false }).encode(&rs);
+        try testing.expectError(error.InvalidEncoding, RequestVoteResp.decode(&rs));
+        (RequestVoteResp{ .term = max_term, .vote_granted = false }).encode(&rs);
+        try testing.expectEqual(max_term, (try RequestVoteResp.decode(&rs)).term);
+    }
+
+    // AppendEntriesReq — the RPC F5 also guards; term-bound check must run
+    // independently of the entry-count check.
+    {
+        var scratch: [max_entries_per_msg]LogEntry = undefined;
+        var buf: [AppendEntriesReq.max_wire]u8 = undefined;
+        const bad = AppendEntriesReq{ .term = max_term + 1, .leader_id = 0, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 };
+        var n = bad.encode(&buf);
+        try testing.expectError(error.InvalidEncoding, AppendEntriesReq.decode(buf[0..n], &scratch));
+        const good = AppendEntriesReq{ .term = max_term, .leader_id = 0, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 };
+        n = good.encode(&buf);
+        try testing.expectEqual(max_term, (try AppendEntriesReq.decode(buf[0..n], &scratch)).term);
+    }
+
+    // AppendEntriesResp
+    {
+        var buf: [AppendEntriesResp.wire_len]u8 = undefined;
+        (AppendEntriesResp{ .term = max_term + 1, .success = false, .match_index = 0 }).encode(&buf);
+        try testing.expectError(error.InvalidEncoding, AppendEntriesResp.decode(&buf));
+        (AppendEntriesResp{ .term = max_term, .success = false, .match_index = 0 }).encode(&buf);
+        try testing.expectEqual(max_term, (try AppendEntriesResp.decode(&buf)).term);
+    }
+}
+
 test "AppendEntriesReq rejects a wire entry count the buffer cannot back" {
+    // Pin the constant to the literal the boundary check below depends on. If
+    // `max_entries_per_msg` is ever resized, this line goes red first and says
+    // so, instead of silently moving the boundary the next assertion checks.
+    try testing.expectEqual(@as(comptime_int, 8), max_entries_per_msg);
+
     var scratch: [max_entries_per_msg]LogEntry = undefined;
+
+    // The buffer-overrun boundary itself: one entry more than `scratch` can
+    // hold must already be rejected. Driven off the constant (so it still
+    // fires if the array is ever resized), not just off an arbitrarily large
+    // count — a bound anywhere in [9, 65534] would pass a bare "reject 0xFFFF"
+    // check, including one that has quietly stopped protecting `scratch`.
+    var p = [_]u8{0} ** AppendEntriesReq.header_len;
+    std.mem.writeInt(u16, p[37..39], max_entries_per_msg + 1, .little);
+    try testing.expectError(error.InvalidEncoding, AppendEntriesReq.decode(&p, &scratch));
 
     // A bare header claiming 65535 entries. This is the out-of-bounds WRITE:
     // with safety off the old `std.debug.assert` vanished and the loop wrote
     // ~1.5 MB past `scratch` (measured: SIGSEGV under ReleaseFast).
-    var p = [_]u8{0} ** AppendEntriesReq.header_len;
     std.mem.writeInt(u16, p[37..39], 0xFFFF, .little);
     try testing.expectError(error.InvalidEncoding, AppendEntriesReq.decode(&p, &scratch));
 
