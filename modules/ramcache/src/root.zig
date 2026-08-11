@@ -316,14 +316,25 @@ pub const Cache = struct {
         /// root — so a borrowed entry is normally never even *considered*,
         /// at zero cost per eviction. `release` puts it back.
         ///
-        /// ⚠ That unlinking is the fast path, **not** the safety property.
-        /// Safety is `dropKeyReason`'s `pins > 0` check, which dooms rather
-        /// than frees. Measured, not argued: deleting the `expRemove` call in
-        /// `pinEntry` leaves `ramcache`, `pagecache` and `kvtree` all green,
-        /// because a pinned entry that stays in the expiry heap is still
-        /// doomed correctly when selected. Do not read the unlinking as the
-        /// thing that prevents the use-after-free — it is belt, and the flag
-        /// check is braces.
+        /// ⚠ Two different properties rest on two different things, and an
+        /// earlier version of this comment conflated them:
+        ///
+        ///   * *No use-after-free* is `dropKeyReason`'s `pins > 0` check,
+        ///     which dooms rather than frees. The unlinking is not what
+        ///     prevents it.
+        ///   * *Eviction still terminates* is the unlinking itself. A node
+        ///     that stays in a heap after it is doomed has `key = &.{}`
+        ///     (`parkNode`), so `regionLruKey`/`findExpiredKey` hand
+        ///     `evictStep` a key the map does not hold and nothing is
+        ///     removed. Until `evictStep` grew its progress guard that was an
+        ///     unbounded loop in `maintain`; with the guard it is a cache
+        ///     stuck over its cap. Neither is a fast-path concern.
+        ///
+        /// So: do NOT delete the unlinking on the grounds that the suites stay
+        /// green. Deleting `expRemove` alone *is* green across `ramcache`,
+        /// `pagecache` and `kvtree` — measured — because no test used to reach
+        /// the shape; `borrow: a doomed TTL node must not stall eviction`
+        /// reaches it, and that test fails when the unlinking goes.
         pins: u32 = 0,
         /// Position in `Cache.doomed`, or `not_queued` when the node is a
         /// live map entry. A *doomed* node is one whose entry was
@@ -336,6 +347,14 @@ pub const Cache = struct {
         /// Value bytes this node owns while doomed (`doom_idx != not_queued`);
         /// otherwise the value belongs to the map `Entry` and this is empty.
         owned: []u8 = &.{},
+        /// False between `reserve` and `commit`: the entry is published and
+        /// findable, but its bytes are uninitialized. Only `on_evict` reads
+        /// this — an entry can die in that window (overwritten, removed,
+        /// cleared, TTL-dropped) and its value must not be handed to a
+        /// caller's hook, which is the rule `discard` already states for
+        /// itself. Every other way of creating an entry writes its value
+        /// before publishing it, hence the `true` default.
+        filled: bool = true,
 
         const not_queued: u32 = std.math.maxInt(u32);
     };
@@ -502,11 +521,15 @@ pub const Cache = struct {
             }
             // replace value in place, keep the stored key
             const vdup = self.alloc.dupe(u8, value) catch return;
-            self.fireOnEvict(key, e.value, e.dirty, .replaced);
+            self.fireOnEvict(e.node, key, e.value, e.dirty, .replaced);
             self.bytes -= e.value.len;
             self.alloc.free(e.value);
             self.tick += 1;
             const node = e.node; // survives the rewrite: same key, same slot
+            // An entry can only be replaced in place when nothing borrows it,
+            // and an unfilled reservation is borrowed by definition (`pins`
+            // is 1 from birth), so this path never inherits `filled == false`.
+            std.debug.assert(node.filled);
             e.* = .{
                 .value = vdup,
                 .inserted_ns = now_ns,
@@ -596,7 +619,7 @@ pub const Cache = struct {
     pub fn clear(self: *Cache) void {
         var it = self.map.iterator();
         while (it.next()) |kv| {
-            self.fireOnEvict(kv.key_ptr.*, kv.value_ptr.value, kv.value_ptr.dirty, .cleared);
+            self.fireOnEvict(kv.value_ptr.node, kv.key_ptr.*, kv.value_ptr.value, kv.value_ptr.dirty, .cleared);
             if (kv.value_ptr.node.pins > 0) {
                 // Borrowed: unlink it like every other entry (a `clear` must
                 // really leave nothing findable — that is what pagecache's
@@ -724,18 +747,23 @@ pub const Cache = struct {
     ///
     /// Finish with `commit` (keep it, downgrade to a read borrow) or `discard`
     /// (the fill failed — remove it without ever exposing the garbage).
-    /// `null` on OOM or when `len` exceeds the whole cache's byte budget.
+    /// `null` on OOM or when `len` exceeds the whole cache's byte budget —
+    /// and a `null` return leaves the cache **exactly as it was**, including
+    /// any entry `key` already had. A reservation that both fails and evicts
+    /// would be an invisible loss: the caller is told to use the copying path
+    /// and has no way to learn that its previous value went with the refusal.
     pub fn reserve(self: *Cache, key: []const u8, len: usize, now_ns: i64, ttl_ns: i64, gen: u64) ?Fill {
         self.noteAccess(key);
         if (len > self.options.max_bytes) return null;
-        if (self.map.getPtr(key)) |e| {
-            // Same reasoning as `put`: an existing entry is either freed or,
-            // if borrowed, parked — never left findable with old bytes.
-            if (e.node.pins > 0) self.doomEntry(key, .replaced) else _ = self.dropKeyReason(key, .replaced);
-        }
-        // Reserve the parking slot before the entry exists, so that once the
-        // bytes are lent out every path that could destroy them is infallible.
+        // Every fallible step runs FIRST, before anything is mutated: the
+        // parking slot, the map slot, and the three allocations. That is what
+        // makes the promise above true, and it is also what makes the
+        // `.replaced` reason below honest — by the time the old entry is
+        // dropped, the entry that replaces it is certain to exist. (`put`'s
+        // ceiling path makes the same distinction the other way round: it
+        // drops with `.evicted`, because nothing takes the entry's place.)
         self.doomed.ensureTotalCapacity(self.alloc, self.pinned_entries + 1) catch return null;
+        self.map.ensureUnusedCapacity(self.alloc, 1) catch return null;
         const kdup = self.alloc.dupe(u8, key) catch return null;
         const vbuf = self.alloc.alloc(u8, len) catch {
             self.alloc.free(kdup);
@@ -746,9 +774,15 @@ pub const Cache = struct {
             self.alloc.free(vbuf);
             return null;
         };
+        // Nothing below this line can fail.
+        if (self.map.getPtr(key)) |e| {
+            // Same reasoning as `put`: an existing entry is either freed or,
+            // if borrowed, parked — never left findable with old bytes.
+            if (e.node.pins > 0) self.doomEntry(key, .replaced) else _ = self.dropKeyReason(key, .replaced);
+        }
         self.tick += 1;
-        node.* = .{ .key = kdup, .tick = self.tick, .pins = 1 };
-        self.map.put(self.alloc, kdup, .{
+        node.* = .{ .key = kdup, .tick = self.tick, .pins = 1, .filled = false };
+        self.map.putAssumeCapacity(kdup, .{
             .value = vbuf,
             .inserted_ns = now_ns,
             .ttl_ns = ttl_ns,
@@ -757,12 +791,7 @@ pub const Cache = struct {
             .region = .window,
             .dirty = true,
             .node = node,
-        }) catch {
-            self.alloc.destroy(node);
-            self.alloc.free(kdup);
-            self.alloc.free(vbuf);
-            return null;
-        };
+        });
         // Deliberately NOT pushed into the window heap or the expiry heap:
         // `pins == 1`, and a pinned node is out of the index (see `Node.pins`).
         // `release` files it in the moment the borrow ends.
@@ -776,20 +805,56 @@ pub const Cache = struct {
 
     /// Downgrade a filled `Fill` to a read-only borrow of the same bytes,
     /// keeping the pin. Release it with `release` like any other borrow.
+    ///
+    /// A `Fill` is **consumed** by whichever of `commit`/`discard` it reaches
+    /// first, and a `Borrow` by `release`. They are plain copyable structs
+    /// holding a `*Node`, so a stale copy used a second time is a
+    /// use-after-free the cache cannot always see: once the node has been
+    /// freed there is nothing left to ask. The `filled` flag catches the half
+    /// that is still detectable — a second `commit`, or a `discard` after a
+    /// `commit` whose borrow is still outstanding — as a Debug assert here.
+    /// Using a `Fill` after the entry it named has been freed is undetectable
+    /// by construction and is the caller's rule to keep.
     pub fn commit(self: *Cache, f: Fill) Borrow {
         _ = self;
+        std.debug.assert(f.node.pins > 0);
+        std.debug.assert(!f.node.filled); // consumed already, or never a reservation
+        f.node.filled = true;
         return .{ .bytes = f.bytes, .node = f.node };
     }
 
-    /// Throw away a reservation whose fill failed. The entry is removed
-    /// without firing `on_evict` — the bytes were never written, and handing a
-    /// caller's hook uninitialized memory would be a disclosure, not a hook.
+    /// Throw away a reservation whose fill failed. The entry is removed —
+    /// always, including when the caller holds a second borrow of it — without
+    /// firing `on_evict`: the bytes were never written, and handing a caller's
+    /// hook uninitialized memory would be a disclosure, not a hook.
+    /// Consumes the `Fill`; see `commit` for what that does and does not
+    /// catch.
     pub fn discard(self: *Cache, f: Fill) void {
         const n = f.node;
         std.debug.assert(n.pins > 0);
-        if (n.doom_idx != Node.not_queued or n.pins != 1) {
-            // Something already unlinked it (a concurrent-ish put/clear on the
-            // same key between `reserve` and here). Ordinary release then.
+        std.debug.assert(!n.filled); // already committed, or already discarded
+        if (n.doom_idx != Node.not_queued) {
+            // Something already unlinked it (a put/remove/clear/TTL drop on
+            // the same key between `reserve` and here). It is out of the map
+            // already and its bytes are parked, so an ordinary release — which
+            // frees them if ours is the last — is exactly right.
+            self.release(.{ .bytes = f.bytes, .node = n });
+            return;
+        }
+        if (n.pins != 1) {
+            // The caller also `pin`ned the key it was filling, so ours is not
+            // the last release and the entry cannot simply be destroyed here.
+            // It must still leave the map: "removed without ever exposing the
+            // garbage" is the contract above, and a plain release would leave
+            // the entry resident with uninitialized bytes that `get` and `pin`
+            // would happily hand out. So doom it — unlinked now, its storage
+            // parked with the borrow that is still outstanding and freed by
+            // that borrow's release — and fire no hook, for the same reason
+            // the single-owner path below fires none. (`n.key` aliases the
+            // map's stored key, which `parkNode` frees; `doomEntry` uses the
+            // key it got back from `fetchRemove` and never touches the
+            // parameter afterwards.)
+            self.doomEntry(n.key, null);
             self.release(.{ .bytes = f.bytes, .node = n });
             return;
         }
@@ -839,6 +904,13 @@ pub const Cache = struct {
     }
 
     /// True while `key` is resident and has at least one live borrow.
+    ///
+    /// Note the *resident* half: a **doomed** entry — one overwritten,
+    /// removed, cleared or expired while borrowed — has already left the map,
+    /// so this answers `false` for it even though the borrow is still live and
+    /// its bytes are still allocated. `false` therefore means "not a pinned
+    /// map entry", never "nobody is reading anything for this key";
+    /// `Stats.pinned` is the count that still includes doomed entries.
     pub fn isPinned(self: *Cache, key: []const u8) bool {
         const e = self.map.getPtr(key) orelse return false;
         return e.node.pins > 0;
@@ -934,13 +1006,16 @@ pub const Cache = struct {
         const found = if (self.map.fetchRemove(key)) |kv| blk: {
             self.lruRemove(kv.value.region, kv.value.node);
             self.expRemove(kv.value.node);
-            self.alloc.destroy(kv.value.node);
             switch (kv.value.region) {
                 .window => self.window_count -= 1,
                 .probation => self.probation_count -= 1,
                 .protected => self.protected_count -= 1,
             }
-            self.fireOnEvict(kv.key, kv.value.value, kv.value.dirty, reason);
+            // The hook reads `node.filled`, so the node outlives it. It is
+            // already out of the map and out of both heaps by now, so nothing
+            // can reach it either way; only the free order changed.
+            self.fireOnEvict(kv.value.node, kv.key, kv.value.value, kv.value.dirty, reason);
+            self.alloc.destroy(kv.value.node);
             self.bytes -= kv.value.value.len;
             self.alloc.free(kv.value.value);
             self.alloc.free(kv.key);
@@ -975,10 +1050,13 @@ pub const Cache = struct {
     /// gone for lookup purposes the instant this returns — a doomed page can
     /// never be served again — while the outstanding borrow keeps reading the
     /// snapshot it was given.
-    fn doomEntry(self: *Cache, key: []const u8, reason: EvictReason) void {
+    fn doomEntry(self: *Cache, key: []const u8, reason: ?EvictReason) void {
         const kv = self.map.fetchRemove(key).?;
         std.debug.assert(kv.value.node.pins > 0);
-        self.fireOnEvict(kv.key, kv.value.value, kv.value.dirty, reason);
+        // A `null` reason means "unlink it, but tell nobody" — `discard`'s
+        // case, where the bytes were never written and handing a caller's
+        // hook uninitialized memory would be a disclosure, not a hook.
+        if (reason) |r| self.fireOnEvict(kv.value.node, kv.key, kv.value.value, kv.value.dirty, r);
         switch (kv.value.region) {
             .window => self.window_count -= 1,
             .probation => self.probation_count -= 1,
@@ -1018,7 +1096,17 @@ pub const Cache = struct {
 
     /// Fire `Options.on_evict` if one is set. Called just before the
     /// caller-visible value memory for `key` is freed.
-    fn fireOnEvict(self: *Cache, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void {
+    ///
+    /// Silent for an entry that is still between `reserve` and `commit`
+    /// (`!node.filled`). Its bytes are uninitialized heap, and every way such
+    /// an entry can die — `put` over it, `remove`, `clear`, a lazy TTL drop —
+    /// would otherwise pass that memory straight to a caller's callback.
+    /// `discard` refuses to do exactly this ("a disclosure, not a hook"), and
+    /// the rule cannot be discard's alone: the four paths that fire this are
+    /// how such an entry usually dies. The hook is a write-behind signal, and
+    /// there is nothing to write behind — the value never existed.
+    fn fireOnEvict(self: *Cache, node: *const Node, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void {
+        if (!node.filled) return;
         if (self.options.on_evict) |cb| cb(self.options.on_evict_ctx, key, value, dirty, reason);
     }
 
@@ -1255,12 +1343,37 @@ pub const Cache = struct {
     ///      — the frequency loser is evicted (admission moves the winner from
     ///      the window into probation),
     ///   3. degenerate fallbacks (main-only or window-only occupancy → LRU).
-    /// Returns false only when the map is empty.
+    /// Returns false when the map did not shrink — an empty map, no reachable
+    /// victim, or a heap root that named a key the map no longer holds.
+    ///
+    /// `maintain` loops on this answer, so "true" has to mean *an entry was
+    /// actually removed*, never "a branch was taken". The two are not the same
+    /// thing: a node left in a region or expiry heap after it was doomed
+    /// carries `key = &.{}` (`parkNode`), so `regionLruKey`/`findExpiredKey`
+    /// hand back a key `dropKey` cannot find and every branch below would
+    /// still report an eviction. That is an unbounded loop in `maintain` — a
+    /// hang, which surfaces as a CI timeout rather than a failing test, and is
+    /// strictly worse to diagnose than either a red test or a cache that
+    /// merely sits over its cap. The guard is deliberately the *only*
+    /// termination mechanism here: it is stated once, in terms of the map, so
+    /// that no branch added later can forget it and no second, redundant check
+    /// can hide it going wrong.
     fn evictStep(self: *Cache, now_ns: i64) bool {
+        const before = self.map.count();
+        if (!self.evictOne(now_ns)) return false;
+        if (self.map.count() == before) return false; // progress guard
+        // Counted here rather than per branch for the same reason: one
+        // eviction is one entry gone, not one branch entered.
+        self.stats.evictions += 1;
+        return true;
+    }
+
+    /// The choice itself. May report `true` without having removed anything —
+    /// `evictStep` is what turns that into an honest answer.
+    fn evictOne(self: *Cache, now_ns: i64) bool {
         if (self.map.count() == 0) return false;
         if (self.findExpiredKey(now_ns)) |k| {
             _ = self.dropKey(k);
-            self.stats.evictions += 1;
             return true;
         }
         const cand = self.regionLruKey(.window) orelse {
@@ -1268,14 +1381,12 @@ pub const Cache = struct {
             const vk = self.regionLruKey(.probation) orelse
                 self.regionLruKey(.protected) orelse return false;
             _ = self.dropKey(vk);
-            self.stats.evictions += 1;
             return true;
         };
         const victim = self.regionLruKey(.probation) orelse
             self.regionLruKey(.protected) orelse {
             // main region empty — plain LRU within the window
             _ = self.dropKey(cand);
-            self.stats.evictions += 1;
             return true;
         };
         if (self.admit(cand, victim)) {
@@ -1296,7 +1407,6 @@ pub const Cache = struct {
             _ = self.dropKey(cand);
             self.stats.rejections += 1;
         }
-        self.stats.evictions += 1;
         return true;
     }
 };
@@ -1591,6 +1701,527 @@ test "borrow: a pinned entry with a TTL is not expired out from under the borrow
     // Well past the deadline: the entry must leave the lookup path...
     try testing.expect(c.get("k", 5000, 0) == null);
     // ...but its bytes are still the borrower's.
+    try testing.expectEqualStrings("v", b.bytes);
+    c.release(b);
+}
+
+// The next two tests are the only ones in the repo that park more than one
+// value at a time, which is what makes `freeDoomed`'s swap-remove run at all.
+// Three is the smallest number that discriminates, and that is measured, not
+// assumed: with two parked nodes a stale `doom_idx` is self-correcting — the
+// survivor's index is then out of range of a one-element list, so the fixup
+// branch is skipped and it frees itself correctly either way.
+//
+// Parking order is deliberate rather than incidental: `clear` would park in
+// map-iteration order, so which node lands in slot 0 would be a hash detail.
+// Overwriting each pinned key in turn appends in call order.
+test "borrow: releasing parked values out of order re-indexes the doomed list" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("a", "AAA", 0, 0, 0);
+    c.put("b", "BBB", 0, 0, 0);
+    c.put("c", "CCC", 0, 0, 0);
+    const ba = c.pin("a", 0, 0).?;
+    const bb = c.pin("b", 0, 0).?;
+    const bc = c.pin("c", 0, 0).?;
+    c.put("a", "aaa", 0, 0, 0);
+    c.put("b", "bbb", 0, 0, 0);
+    c.put("c", "ccc", 0, 0, 0);
+
+    try testing.expectEqual(@as(usize, 3), c.doomed.items.len);
+    try testing.expectEqual(@as(u32, 0), ba.node.doom_idx);
+    try testing.expectEqual(@as(u32, 1), bb.node.doom_idx);
+    try testing.expectEqual(@as(u32, 2), bc.node.doom_idx);
+
+    // Release the FIRST parked node. The last one is swap-moved into slot 0
+    // and has to learn where it now lives; a node whose `doom_idx` still
+    // names its old slot indexes a stranger on its own release.
+    c.release(ba);
+    try testing.expectEqual(@as(usize, 2), c.doomed.items.len);
+    try testing.expectEqual(bc.node, c.doomed.items[0]);
+    try testing.expectEqual(@as(u32, 0), bc.node.doom_idx);
+    try testing.expectEqual(bb.node, c.doomed.items[1]);
+    try testing.expectEqual(@as(u32, 1), bb.node.doom_idx);
+
+    // Both snapshots are intact — the swap moved a slot, not any bytes.
+    try testing.expectEqualStrings("BBB", bb.bytes);
+    try testing.expectEqualStrings("CCC", bc.bytes);
+    c.release(bc);
+    c.release(bb);
+    try testing.expectEqual(@as(usize, 0), c.doomed.items.len);
+    try testing.expectEqual(@as(usize, 0), c.stats.pinned);
+}
+
+test "borrow: a parked value outliving two out-of-order releases is freed exactly once" {
+    // Same shape as above with no assertions on internals: the oracle is
+    // `testing.allocator`. Releasing slot 0 and then the node that was swapped
+    // into it, with a third borrow still outstanding at `deinit`, is the
+    // ordering in which a missed re-index frees one node twice (once by
+    // `release`, once by `deinit`'s sweep) and leaks the other.
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("a", "AAA", 0, 0, 0);
+    c.put("b", "BBB", 0, 0, 0);
+    c.put("c", "CCC", 0, 0, 0);
+    const ba = c.pin("a", 0, 0).?;
+    const bb = c.pin("b", 0, 0).?;
+    const bc = c.pin("c", 0, 0).?;
+    c.put("a", "aaa", 0, 0, 0);
+    c.put("b", "bbb", 0, 0, 0);
+    c.put("c", "ccc", 0, 0, 0);
+
+    c.release(ba); // slot 0 freed, "c" swapped into it
+    c.release(bc); // the swapped node — reached only through its new index
+    // "b" is still borrowed and still readable; `deinit` frees it below, and
+    // it must be the only thing left to free.
+    try testing.expectEqualStrings("BBB", bb.bytes);
+    try testing.expectEqual(@as(usize, 1), c.doomed.items.len);
+}
+
+// ── borrow-seam operation sequences (scripted + fuzzed) ─────────────────────
+//
+// Every scenario above is hand-built, which means the seam is only ever tested
+// in shapes somebody already thought of — and the two most expensive defects
+// in it (a stale `doom_idx`, and byte/region accounting that never comes back
+// down) were both invisible to every hand-built shape in the repo. This drives
+// arbitrary op sequences over a four-key cache instead, and checks the
+// structural invariants after *every* operation rather than at the end.
+//
+// The script is raw bytes with a small modulus, deliberately not a weighted
+// draw: a weighted draw over a random corpus never leaves its first range, so
+// the rare operations would simply not exist on a plain build. And because a
+// random corpus needs luck to reach the interesting interleavings at all, the
+// shapes that matter are also driven as fixed scripts below, so they run in
+// the ordinary suite.
+const SeamHarness = struct {
+    const key_pool = [_][]const u8{ "k0", "k1", "k2", "k3" };
+    const payload = "abcdefgh";
+
+    const op_put = 0;
+    const op_get = 1;
+    const op_pin = 2;
+    const op_reserve = 3;
+    const op_commit = 4;
+    const op_discard = 5;
+    const op_release = 6;
+    const op_remove = 7;
+    const op_clear = 8;
+    const op_count = 9;
+
+    c: Cache,
+    /// Outstanding read borrows. A script that pins more than this simply
+    /// releases the extras at once — it never drops one on the floor.
+    borrows: [8]?Cache.Borrow = @splat(null),
+    fill: ?Cache.Fill = null,
+    now: i64 = 0,
+
+    /// Deliberately tiny caps: three entries and 24 bytes mean real eviction
+    /// pressure within a handful of operations, which is where the borrow
+    /// seam and the eviction machinery actually meet.
+    fn init(alloc: std.mem.Allocator) SeamHarness {
+        return .{ .c = Cache.init(alloc, .{ .max_bytes = 24, .max_entries = 3 }) };
+    }
+
+    fn deinit(self: *SeamHarness) void {
+        if (self.fill) |f| {
+            self.c.discard(f);
+            self.fill = null;
+        }
+        for (&self.borrows) |*slot| {
+            if (slot.*) |b| self.c.release(b);
+            slot.* = null;
+        }
+        self.c.deinit();
+    }
+
+    fn store(self: *SeamHarness, b: Cache.Borrow) void {
+        for (&self.borrows) |*slot| {
+            if (slot.* == null) {
+                slot.* = b;
+                return;
+            }
+        }
+        self.c.release(b);
+    }
+
+    fn takeBorrow(self: *SeamHarness, which: usize) ?Cache.Borrow {
+        for (0..self.borrows.len) |i| {
+            const idx = (which + i) % self.borrows.len;
+            if (self.borrows[idx]) |b| {
+                self.borrows[idx] = null;
+                return b;
+            }
+        }
+        return null;
+    }
+
+    /// `arg` is packed so that no single script byte is degenerate: the low
+    /// two bits pick the key, bit 3 picks a TTL, and the high nibble picks the
+    /// value length. A length of zero everywhere would make the byte-accounting
+    /// invariant below true for the wrong reason.
+    fn step(self: *SeamHarness, op: u8, arg: u8) !void {
+        const k = key_pool[arg % key_pool.len];
+        const len = (arg >> 4) % (payload.len + 1);
+        const ttl: i64 = if (arg & 8 != 0) 50 else 0;
+        self.now += 10;
+        switch (op % op_count) {
+            op_put => self.c.put(k, payload[0..len], self.now, ttl, 0),
+            op_get => _ = self.c.get(k, self.now, 0),
+            op_pin => if (self.c.pin(k, self.now, 0)) |b| self.store(b),
+            op_reserve => if (self.fill == null) {
+                if (self.c.reserve(k, len, self.now, ttl, 0)) |f| self.fill = f;
+            },
+            op_commit => if (self.fill) |f| {
+                @memset(f.bytes, 'z');
+                self.store(self.c.commit(f));
+                self.fill = null;
+            },
+            op_discard => if (self.fill) |f| {
+                self.c.discard(f);
+                self.fill = null;
+            },
+            op_release => if (self.takeBorrow(arg)) |b| self.c.release(b),
+            op_remove => _ = self.c.remove(k),
+            op_clear => self.c.clear(),
+            else => unreachable,
+        }
+        try self.check();
+    }
+
+    /// What must be true after every single operation, borrowed or not.
+    fn check(self: *SeamHarness) !void {
+        // `bytes` counts live map values and nothing else — not a value that
+        // was parked with a borrower, not one a discarded reservation held.
+        var total: usize = 0;
+        var it = self.c.map.iterator();
+        while (it.next()) |kv| total += kv.value_ptr.value.len;
+        try testing.expectEqual(total, self.c.bytes);
+        // The region counters partition the live map.
+        try testing.expectEqual(
+            @as(usize, self.c.map.count()),
+            self.c.window_count + self.c.probation_count + self.c.protected_count,
+        );
+        // Every parked node knows where it is parked, and is still borrowed.
+        for (self.c.doomed.items, 0..) |n, i| {
+            try testing.expectEqual(@as(u32, @intCast(i)), n.doom_idx);
+            try testing.expect(n.pins > 0);
+        }
+        // The parking list never outgrows the reservation `pinEntry`/`reserve`
+        // made for it — the invariant that lets `parkNode` be infallible.
+        try testing.expect(self.c.doomed.items.len <= self.c.pinned_entries);
+    }
+
+    fn run(alloc: std.mem.Allocator, script: []const u8) !void {
+        var h = SeamHarness.init(alloc);
+        defer h.deinit();
+        var i: usize = 0;
+        while (i + 1 < script.len) : (i += 2) try h.step(script[i], script[i + 1]);
+    }
+};
+
+test "seam scripts: parked values released out of order, and reservations that die mid-fill" {
+    const H = SeamHarness;
+    // Three values parked at once and released out of order — the shape that
+    // makes `freeDoomed`'s swap-remove run, which no other test in the repo
+    // reaches by accident. Args carry a non-zero length (high nibble).
+    try H.run(testing.allocator, &.{
+        H.op_put,     0x30, H.op_put,     0x31, H.op_put,    0x32,
+        H.op_pin,     0x30, H.op_pin,     0x31, H.op_pin,    0x32,
+        H.op_remove,  0x30, H.op_remove,  0x31, H.op_remove, 0x32,
+        H.op_release, 0x00, H.op_release, 0x02, H.op_get,    0x30,
+    });
+
+    // A reservation that is borrowed a second time and then discarded, and a
+    // reservation that is cleared out from under the fill before it commits.
+    try H.run(testing.allocator, &.{
+        H.op_reserve, 0x30, H.op_pin,     0x30, H.op_discard, 0x00,
+        H.op_get,     0x30, H.op_release, 0x00, H.op_reserve, 0x41,
+        H.op_clear,   0x00, H.op_commit,  0x00, H.op_release, 0x00,
+    });
+
+    // Eviction pressure with everything borrowed: puts that cannot evict a
+    // pinned entry, TTLs expiring underneath live borrows, then a clear.
+    try H.run(testing.allocator, &.{
+        H.op_put,     0x38, H.op_pin,     0x38, H.op_put,   0x59,
+        H.op_pin,     0x59, H.op_put,     0x6a, H.op_put,   0x7b,
+        H.op_get,     0x38, H.op_put,     0x3c, H.op_clear, 0x00,
+        H.op_release, 0x00, H.op_release, 0x01,
+    });
+}
+
+fn fuzzSeam(_: void, smith: *std.testing.Smith) !void {
+    // One raw-byte draw of a fixed length, read as (op, arg) pairs. Lengths
+    // before payloads is moot here because there is exactly one draw; what
+    // matters is that no weighted draw decides which operation runs.
+    var script: [64]u8 = undefined;
+    smith.bytes(&script);
+    try SeamHarness.run(testing.allocator, &script);
+}
+
+test "fuzz: arbitrary borrow-seam operation sequences keep every structural invariant" {
+    try testing.fuzz({}, fuzzSeam, .{});
+}
+
+test "borrow: discarding a reservation the caller also pinned still removes it" {
+    // `discard`'s fallback for "somebody else is holding this too". The
+    // contract is that the entry goes away without its garbage ever being
+    // exposed, so it has to leave the map here as well — the second borrow
+    // keeps the storage alive, it does not keep the entry findable.
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("bystander", "B", 0, 0, 0);
+
+    const f = c.reserve("half", 8, 0, 0, 0).?;
+    const also = c.pin("half", 0, 0).?; // a second borrow of the same entry
+    c.discard(f);
+
+    try testing.expect(c.get("half", 0, 0) == null);
+    try testing.expect(c.pin("half", 0, 0) == null);
+    try testing.expect(!c.isPinned("half")); // not resident...
+    try testing.expectEqual(@as(usize, 1), c.stats.pinned); // ...but still borrowed
+    try testing.expectEqual(@as(usize, 8), also.bytes.len); // storage still alive
+    try testing.expectEqual(@as(usize, 1), c.bytes); // and out of the accounting
+
+    c.release(also);
+    try testing.expectEqual(@as(usize, 0), c.stats.pinned);
+    try testing.expectEqualStrings("B", c.get("bystander", 0, 0).?);
+}
+
+test "borrow: a reserve that fails leaves the caller's existing entry alone" {
+    // Every early return in `reserve` is allocator-failure-only, so a failing
+    // allocator is the only way to walk that ladder at all. Sweeping the fail
+    // index takes it one rung at a time; the invariant under test is the same
+    // on every rung — a refused reservation must not also evict, because the
+    // caller is told "use the copying path" and has no way to notice that its
+    // previous value left with the refusal.
+    var failures: usize = 0;
+    for (0..6) |n| {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var c = Cache.init(fa.allocator(), .{ .max_bytes = 1 << 20, .max_entries = 16 });
+        defer c.deinit();
+        c.put("k", "value", 0, 0, 0);
+        c.put("bystander", "B", 0, 0, 0);
+        fa.fail_index = fa.alloc_index + n; // the n-th allocation from here on fails
+
+        if (c.reserve("k", 8, 0, 0, 0)) |f| {
+            // This rung's allocation was not one `reserve` had to make.
+            @memset(f.bytes, 'x');
+            c.release(c.commit(f));
+            continue;
+        }
+        failures += 1;
+        // Spelled out rather than `.?` so that a reservation which failed AND
+        // evicted reports itself as this test failing, not as a null unwrap.
+        const kept = c.get("k", 0, 0) orelse return error.FailedReserveAlsoEvicted;
+        try testing.expectEqualStrings("value", kept);
+        const bystander = c.get("bystander", 0, 0) orelse return error.FailedReserveAlsoEvicted;
+        try testing.expectEqualStrings("B", bystander);
+    }
+    // Guard against the whole sweep quietly becoming a no-op: several rungs
+    // must really have failed for the assertions above to have meant anything.
+    try testing.expect(failures >= 4);
+}
+
+test "on-evict: reserve over an existing key replaces it, and says so" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 16,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+    c.put("k", "old", 0, 0, 0);
+    const f = c.reserve("k", 3, 0, 0, 0).?;
+    @memcpy(f.bytes, "new");
+    c.release(c.commit(f));
+
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualStrings("k", sink.recs[0].key());
+    try testing.expectEqualStrings("old", sink.recs[0].val());
+    // `.replaced` is only truthful because the drop now happens after the
+    // last fallible step: something really did take the entry's place.
+    try testing.expectEqual(EvictReason.replaced, sink.recs[0].reason);
+    try testing.expectEqualStrings("new", c.get("k", 0, 0).?);
+}
+
+test "on-evict: an uncommitted reservation's uninitialized bytes never reach the hook" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 16,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+
+    // 1) overwritten between reserve and commit (fires from `doomEntry`)
+    const f1 = c.reserve("half", 8, 0, 0, 0).?;
+    c.put("half", "written", 0, 0, 0);
+    try testing.expectEqual(@as(usize, 0), sink.len);
+    c.discard(f1);
+
+    // Positive control on the same hook, same key: a *filled* value does fire.
+    try testing.expect(c.remove("half"));
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualStrings("written", sink.recs[0].val());
+
+    // 2) removed between reserve and commit (fires from `dropKeyReason`)
+    const f2 = c.reserve("gone", 8, 0, 0, 0).?;
+    try testing.expect(c.remove("gone"));
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    c.discard(f2);
+
+    // 3) cleared between reserve and commit (fires from `clear`)
+    const f3 = c.reserve("swept", 8, 0, 0, 0).?;
+    c.clear();
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    c.discard(f3);
+
+    // 4) and once committed, the same entry is an ordinary one again.
+    const f4 = c.reserve("full", 4, 0, 0, 0).?;
+    @memcpy(f4.bytes, "abcd");
+    c.release(c.commit(f4));
+    c.clear();
+    try testing.expectEqual(@as(usize, 2), sink.len);
+    try testing.expectEqualStrings("abcd", sink.recs[1].val());
+    try testing.expectEqual(EvictReason.cleared, sink.recs[1].reason);
+}
+
+test "borrow: isPinned tracks live borrows, and says false for a doomed entry" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    try testing.expect(!c.isPinned("absent"));
+    c.put("k", "v", 0, 0, 0);
+    try testing.expect(!c.isPinned("k")); // resident, nobody borrowing
+
+    const b = c.pin("k", 0, 0).?;
+    try testing.expect(c.isPinned("k"));
+    c.release(b);
+    try testing.expect(!c.isPinned("k"));
+
+    // The answer that is least obvious and most likely to be misread: a
+    // doomed entry is *still borrowed*, but it is no longer in the map, so
+    // this is false. A caller must not read that as "safe to free".
+    const b2 = c.pin("k", 0, 0).?;
+    try testing.expect(c.remove("k"));
+    try testing.expect(!c.isPinned("k"));
+    try testing.expectEqual(@as(usize, 1), c.stats.pinned); // ...while the borrow is very much alive
+    try testing.expectEqualStrings("v", b2.bytes);
+    c.release(b2);
+    try testing.expectEqual(@as(usize, 0), c.stats.pinned);
+}
+
+// ── borrow-path accounting ──────────────────────────────────────────────────
+//
+// Parking a value moves it out of the cache's books and into a node's private
+// ownership, so every counter the entry contributed to has to be given back.
+// Getting that wrong is not cosmetic: `bytes` never comes down again, so
+// `maintain` believes the cache is over `max_bytes` for the rest of its life
+// and evicts on every single insert. Each test below therefore checks the
+// counter *and* keeps an innocent bystander entry that a phantom over-count
+// would evict — the counter alone would also be satisfied by a cache that
+// zeroed everything.
+
+test "borrow: parking a doomed value returns its bytes to the accounting" {
+    // 100-byte budget, 40-byte values: two fit, three do not. If the doomed
+    // 40 bytes stay counted, the second live entry pushes the *phantom* total
+    // to 120 and the cache evicts to get back under the cap.
+    var c = testCache(100, 16);
+    defer c.deinit();
+    c.put("a", "A" ** 40, 0, 0, 0);
+    const b = c.pin("a", 0, 0).?;
+    c.put("a", "B" ** 40, 0, 0, 0); // dooms the borrowed 40 bytes
+    try testing.expectEqual(@as(usize, 40), c.bytes);
+
+    c.put("bystander", "C" ** 40, 0, 0, 0);
+    try testing.expectEqual(@as(usize, 80), c.bytes);
+    try testing.expectEqualStrings("C" ** 40, c.get("bystander", 0, 0).?);
+    try testing.expectEqualStrings("B" ** 40, c.get("a", 0, 0).?);
+    try testing.expectEqualStrings("A" ** 40, b.bytes);
+    c.release(b);
+    try testing.expectEqual(@as(usize, 80), c.bytes); // release frees, it does not un-count
+}
+
+test "borrow: parking a doomed value returns its region slot to the accounting" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("a", "AAA", 0, 0, 0);
+    c.put("b", "BBB", 0, 0, 0);
+    const borrow = c.pin("a", 0, 0).?;
+    c.put("a", "aaa", 0, 0, 0); // dooms the borrowed node, inserts a fresh one
+
+    // The region counters partition the live map, and a doomed node is no
+    // longer in it. This sum is the invariant `maintain`'s window/protected
+    // loops are driven by; an entry counted twice makes them demote entries
+    // that are not there.
+    const regions = c.window_count + c.probation_count + c.protected_count;
+    try testing.expectEqual(@as(usize, c.map.count()), regions);
+    try testing.expectEqual(@as(usize, 2), regions);
+    try testing.expectEqualStrings("AAA", borrow.bytes);
+    c.release(borrow);
+    try testing.expectEqual(@as(usize, c.map.count()), c.window_count + c.probation_count + c.protected_count);
+}
+
+test "borrow: a discarded reservation returns its bytes to the accounting" {
+    var c = testCache(100, 16);
+    defer c.deinit();
+    c.put("keep", "K" ** 40, 0, 0, 0);
+    const f = c.reserve("tmp", 40, 0, 0, 0).?;
+    try testing.expectEqual(@as(usize, 80), c.bytes);
+    c.discard(f);
+    try testing.expectEqual(@as(usize, 40), c.bytes);
+    try testing.expectEqual(@as(usize, c.map.count()), c.window_count + c.probation_count + c.protected_count);
+
+    // Bystander: a phantom 40 would put this insert at 120 and evict "keep".
+    c.put("other", "O" ** 40, 0, 0, 0);
+    try testing.expectEqualStrings("K" ** 40, c.get("keep", 0, 0).?);
+    try testing.expectEqualStrings("O" ** 40, c.get("other", 0, 0).?);
+}
+
+test "borrow: deinit frees values still parked for an outstanding borrow" {
+    // Tearing the cache down mid-borrow is a caller bug, and this is the only
+    // test in the repo that commits it — without one, `deinit`'s doomed sweep
+    // could be deleted and `testing.allocator` would never see the leak.
+    var c = testCache(1 << 20, 16);
+    c.put("a", "AAA", 0, 0, 0);
+    const b = c.pin("a", 0, 0).?;
+    c.clear(); // parks the borrowed value with its node
+    try testing.expectEqualStrings("AAA", b.bytes);
+    try testing.expectEqual(@as(usize, 1), c.doomed.items.len);
+    c.deinit(); // the oracle is `testing.allocator`: parked bytes must be freed
+}
+
+test "borrow: a doomed TTL node must not stall eviction" {
+    // The shape that used to hang. A borrowed TTL entry is overwritten, so
+    // its node is doomed; `parkNode` sets that node's key to `&.{}`. If the
+    // node is also left in the expiry heap — which is exactly what deleting
+    // `pinEntry`'s `expRemove` does — then `findExpiredKey` hands `evictStep`
+    // a key `dropKey` cannot find. `evictStep` must not call that an
+    // eviction: `maintain` loops until the cache is back under its cap, so a
+    // branch that reports progress it did not make never terminates.
+    //
+    // Only the doomed node carries a TTL here, so it is the expiry heap's
+    // root deterministically rather than by heap-order luck.
+    var c = testCache(1 << 20, 2);
+    defer c.deinit();
+
+    c.put("k", "v", 0, 1_000, 0);
+    const b = c.pin("k", 0, 0).?;
+    c.put("k", "new", 0, 0, 0); // dooms the borrowed node; no TTL on the new one
+
+    // Two inserts, both well past the doomed node's deadline and one past
+    // the entry cap, so this pass consults the expiry heap and then has to
+    // evict for real.
+    c.put("x", "1", 5_000, 0, 0);
+    c.put("y", "2", 5_000, 0, 0);
+
+    // Terminated *and* evicted something real. The cap alone would also hold
+    // for a cache that emptied itself, so the newest insert is the bystander:
+    // it must still be resident.
+    try testing.expectEqual(@as(u32, 2), c.map.count());
+    try testing.expectEqualStrings("2", c.get("y", 5_000, 0).?);
+    // ...and the borrower kept its snapshot the whole way through.
     try testing.expectEqualStrings("v", b.bytes);
     c.release(b);
 }
