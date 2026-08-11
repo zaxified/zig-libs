@@ -386,22 +386,36 @@ pub const CommandHook = struct {
 
 // ── configuration ───────────────────────────────────────────────────────────
 
+/// IEEE 1815 §9.2.4.1.4 reserves the top of the data-link address space. The
+/// three broadcast destinations differ only in what application confirmation
+/// they ask for; for the receiving station the rule they share is the one that
+/// matters here: **execute the request, send nothing back**. A station that
+/// answers a broadcast turns one frame into a reply from every station on the
+/// bus.
+pub const broadcast_first: u16 = 0xFFFD;
+pub const broadcast_last: u16 = 0xFFFF;
+
+/// True for the three IEEE 1815 broadcast destination addresses.
+pub fn isBroadcast(address: u16) bool {
+    return address >= broadcast_first and address <= broadcast_last;
+}
+
 pub const Config = struct {
     /// This outstation's data-link address.
     ///
-    /// ⚠ Today this is used **only as the source address of frames we send**.
-    /// `Session.feedFrame` does not compare it against an inbound frame's
-    /// destination, so a caller that puts one `Session` on a shared link
-    /// (serial multi-drop, or a TCP listener carrying several link addresses)
-    /// will act on frames addressed to a *different* outstation. Until that
-    /// filter exists here, the caller must reject mismatched frames before
-    /// calling `feedFrame`.
+    /// `Session.feedFrame` drops any frame whose destination is neither this
+    /// address nor one of the three broadcast addresses (`isBroadcast`), so one
+    /// `Session` on a shared link (serial multi-drop, or a listener carrying
+    /// several link addresses) only acts on what is addressed to it.
     address: u16 = 1024,
     /// The master's data-link address.
     ///
-    /// ⚠ Same caveat as `address`: this is the *destination* we address our
-    /// replies to, not an inbound source filter — `feedFrame` accepts user
-    /// data from any source address.
+    /// ⚠ This is the *destination* we address our replies to, **not** an
+    /// inbound source filter — `feedFrame` accepts user data addressed to us
+    /// from any source address, and the armed SELECT is not bound to the peer
+    /// that armed it. On a bus with more than one master-capable station, the
+    /// caller must still authenticate the source (DNP3-SA, or a source check of
+    /// its own) before treating a command as authorised.
     master_address: u16 = 1,
 
     /// Largest application fragment this outstation will emit. §4.1.2 fixes
@@ -530,6 +544,14 @@ pub const Outstation = struct {
     /// back to "sequence number + length", which is what the spec's minimum
     /// requires anyway.
     pub const max_select_bytes = 128;
+
+    /// Largest point index a command may address. This is not a tunable: a
+    /// DNP3 object index is 16 bits everywhere in this module (`executeCommand`
+    /// takes a `u16`, the point arrays are indexed by it), while a `start_stop`
+    /// range field is up to 32 bits wide on the wire. Anything above this is
+    /// unaddressable and must be refused, never truncated — see the F5 comment
+    /// in `doCommand`.
+    pub const max_point_index: u64 = std.math.maxInt(u16);
 
     /// A resumable position in a multi-fragment response.
     pub const Cursor = struct {
@@ -1086,6 +1108,10 @@ pub const Outstation = struct {
         pos: *usize,
         item_pos: *usize,
     ) bool {
+        // Safe in u32 *only* because `parseReadHeader` has already bounded both
+        // ends against the database (`stop < n`, `stop >= start`) before this
+        // is reached — the wire never gets here unfiltered. Wire-driven range
+        // arithmetic must go through `Range.objectCount()` instead (F4).
         const total = stop - start + 1;
         while (item_pos.* < total) {
             const first: u32 = start + @as(u32, @intCast(item_pos.*));
@@ -1351,16 +1377,16 @@ pub const Outstation = struct {
             rest = rest[hdr.consumed..];
             const h = hdr.header;
 
-            const count: u32 = switch (h.range) {
-                .count => |c| c,
-                .start_stop => |r| if (r.stop >= r.start) r.stop - r.start + 1 else {
-                    extra.parameter_error = true;
-                    break;
-                },
-                .all_values => {
-                    extra.parameter_error = true;
-                    break;
-                },
+            // ⚠ Never recompute `stop - start + 1` here (nor anywhere else on a
+            // wire-driven path): both values are full u32 wire fields, so the
+            // subtraction overflows in u32 for `start = 0, stop = 0xFFFFFFFF`
+            // and panics in Debug/ReleaseSafe — that was finding F4, a remote
+            // kill from one 15-byte fragment. `Range.objectCount()` is the
+            // widened (u64) form, and its `null` covers exactly the two shapes
+            // this path cannot act on: an inverted range and `all_values`.
+            const count: u64 = h.range.objectCount() orelse {
+                extra.parameter_error = true;
+                break;
             };
             const prefix_len: usize = switch (h.qualifier.prefix_code) {
                 .none => 0,
@@ -1400,17 +1426,31 @@ pub const Outstation = struct {
             @memcpy(out[pos..][0..header_bytes.len], header_bytes);
             pos += header_bytes.len;
 
-            var i: u32 = 0;
+            var i: u64 = 0;
             while (i < count) : (i += 1) {
                 if (rest.len < prefix_len + record_len) {
                     extra.parameter_error = true;
                     break;
                 }
-                const index: u16 = switch (prefix_len) {
-                    0 => @intCast(switch (h.range) {
-                        .start_stop => |r| r.start + i,
+                var index: u16 = undefined;
+                if (prefix_len == 0) {
+                    // A prefix-less header carries no index of its own, so the
+                    // point index is the range's — and the range comes off the
+                    // wire as u32 while a point index is u16. `@intCast` here
+                    // panicked (finding F5) and `@truncate` would have actuated
+                    // a *different* output point, so an index outside the
+                    // addressable space is a PARAMETER_ERROR. Computed in u64
+                    // so `start + i` cannot wrap on the way to the check.
+                    const wire_index: u64 = switch (h.range) {
+                        .start_stop => |r| @as(u64, r.start) + i,
                         else => i,
-                    }),
+                    };
+                    if (wire_index > max_point_index) {
+                        extra.parameter_error = true;
+                        break;
+                    }
+                    index = @intCast(wire_index);
+                } else index = switch (prefix_len) {
                     1 => rest[0],
                     2 => std.mem.readInt(u16, rest[0..2], .little),
                     else => @truncate(std.mem.readInt(u32, rest[0..4], .little)),
@@ -1780,12 +1820,27 @@ pub const Session = struct {
         const decoded = try link.decodeFrame(frame_bytes, self.scratch);
         const control = decoded.control;
 
-        // Data-link layer service requests get data-link answers.
+        // §9.2.4.1.4 — the destination address decides whether this frame is
+        // ours at all. Without this test one `Session` on a shared link (serial
+        // multi-drop, or a listener carrying several link addresses) executes
+        // commands addressed to a *different* outstation, physical outputs
+        // included: finding F6.
+        const broadcast = isBroadcast(decoded.dest);
+        if (!broadcast and decoded.dest != self.outstation.config.address) return null;
+
+        // Data-link layer service requests get data-link answers — but never in
+        // answer to a broadcast, which would turn one broadcast into a reply
+        // from every station on the bus at once.
         if (control.prm) {
             switch (control.primaryFunction()) {
-                .reset_link_states => return try self.linkReply(.ack, decoded.src, out),
-                .request_link_status => return try self.linkReply(.link_status, decoded.src, out),
-                .test_link_states => return try self.linkReply(.ack, decoded.src, out),
+                .reset_link_states, .test_link_states => {
+                    if (broadcast) return null;
+                    return try self.linkReply(.ack, decoded.src, out);
+                },
+                .request_link_status => {
+                    if (broadcast) return null;
+                    return try self.linkReply(.link_status, decoded.src, out);
+                },
                 .confirmed_user_data, .unconfirmed_user_data => {},
                 _ => return null,
             }
@@ -1795,7 +1850,17 @@ pub const Session = struct {
         }
 
         const fragment = (try self.rx.feed(self.scratch[0..decoded.user_data_len])) orelse return null;
-        const reply = (try self.outstation.handle(fragment, now_ms, self.tx_fragment)) orelse {
+        const maybe_reply = try self.outstation.handle(fragment, now_ms, self.tx_fragment);
+        if (broadcast) {
+            // A broadcast request is *executed* but never answered. Whatever
+            // response the application layer built is dropped here, and any
+            // multi-fragment series it started is abandoned so a later
+            // `nextFrames` cannot leak the reply the broadcast must not get.
+            self.outstation.cursor = null;
+            self.outstation.awaiting_confirm = false;
+            return null;
+        }
+        const reply = maybe_reply orelse {
             // A CONFIRM that lands mid-series releases the next fragment.
             if (self.outstation.cursor != null) return try self.nextFrames(now_ms, out);
             return null;
@@ -1928,23 +1993,21 @@ fn objectHeaders(fragment: []const u8, out: []objects.ObjectHeader) !usize {
         rest = rest[hdr.consumed..];
         // Skip the data belonging to this header.
         const layout = records.layoutOf(hdr.header.group, hdr.header.variation) orelse break;
-        const count: usize = switch (hdr.header.range) {
-            .start_stop => |r| r.stop - r.start + 1,
-            .count => |c| c,
-            .all_values => break,
-        };
+        // Same rule as `doCommand` (F4): the widened helper, never the raw
+        // subtraction — this walks fragments a fuzz target hands it too.
+        const count = std.math.cast(usize, hdr.header.range.objectCount() orelse break) orelse break;
         const prefix: usize = switch (hdr.header.qualifier.prefix_code) {
             .none => 0,
             .index_1b => 1,
             .index_2b => 2,
             else => break,
         };
-        const size = if (layout.isPacked())
+        const size: u64 = if (layout.isPacked())
             (if (layout.value == .packed_bit) records.packedBitBytes(count) else records.packedDoubleBitBytes(count))
         else
-            count * (layout.wireLen().? + prefix);
-        if (size > rest.len) break;
-        rest = rest[size..];
+            (hdr.header.range.objectSpanBytes(layout.wireLen().? + prefix) orelse break);
+        if (size > @as(u64, rest.len)) break;
+        rest = rest[@intCast(size)..];
     }
     return n;
 }
@@ -2422,6 +2485,38 @@ fn buildCrobTcc(
         .on_time_ms = 100,
         .off_time_ms = 100,
     }).encode(buf[pos..])).len;
+    return buf[0..pos];
+}
+
+/// Builds a command fragment whose g12v1 header carries a **prefix-less**
+/// 4-byte start/stop range, i.e. the shape where the point index comes off the
+/// wire as a u32 (F4/F5). `bodies` CROBs follow the header.
+fn buildCrobRange(
+    buf: []u8,
+    seq: u4,
+    function: FunctionCode,
+    start: u32,
+    stop: u32,
+    bodies: usize,
+) ![]u8 {
+    var pos = (try application.encodeRequestHeader(
+        .{ .control = .{ .fir = true, .fin = true, .seq = seq }, .function = function },
+        buf,
+    )).len;
+    pos += (try objects.encodeObjectHeader(.{
+        .group = 12,
+        .variation = 1,
+        .qualifier = .{ .prefix_code = .none, .range_code = .start_stop_4b },
+        .range = .{ .start_stop = .{ .start = start, .stop = stop } },
+    }, buf[pos..])).len;
+    for (0..bodies) |_| {
+        pos += (try (objects.g12.V1{
+            .control_code = .{ .op_type = .latch_on, .tcc = .nul },
+            .count = 1,
+            .on_time_ms = 100,
+            .off_time_ms = 100,
+        }).encode(buf[pos..])).len;
+    }
     return buf[0..pos];
 }
 
@@ -3005,11 +3100,8 @@ fn countPoints(fragment: []const u8) !usize {
     const n = try objectHeaders(fragment, &headers);
     var total: usize = 0;
     for (headers[0..n]) |h| {
-        total += switch (h.range) {
-            .start_stop => |r| r.stop - r.start + 1,
-            .count => |c| c,
-            .all_values => 0,
-        };
+        // Widened helper, not the raw subtraction — see F4.
+        total += std.math.cast(usize, h.range.objectCount() orelse 0) orelse 0;
     }
     return total;
 }
@@ -3074,6 +3166,130 @@ test "Session: link-layer service requests get link-layer answers" {
     const reply = (try session.feedFrame(status, 200, &out)).?;
     const d2 = try link.decodeFrame(reply, &scratch);
     try testing.expectEqual(link.SecondaryFunction.link_status, d2.control.secondaryFunction());
+}
+
+/// Wraps `fragment` in one unconfirmed-user-data link frame addressed to
+/// `dest`, transport header included.
+fn frameFor(dest: u16, src: u16, fragment: []const u8, out: []u8) ![]u8 {
+    var user: [link.max_user_data_len]u8 = undefined;
+    user[0] = 0xC0; // transport FIR + FIN, seq 0
+    @memcpy(user[1..][0..fragment.len], fragment);
+    return try link.encodeFrame(
+        .{ .dir = true, .prm = true, .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data) },
+        dest,
+        src,
+        user[0 .. 1 + fragment.len],
+        out,
+    );
+}
+
+test "Session: a frame addressed to another outstation is dropped, not executed" {
+    // F6. `feedFrame` used to hand any decodable frame straight to `handle`,
+    // so on a multi-drop bus (or a listener carrying several link addresses) a
+    // DIRECT_OPERATE meant for station 999 actuated *this* station's outputs.
+    var req: [64]u8 = undefined;
+    const command = try buildCrob(&req, 1, .direct_operate, 2, .latch_on);
+
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var frame_buf: [128]u8 = undefined;
+
+    // Addressed elsewhere: no reply, no actuation, and the reassembler is not
+    // even fed (a foreign frame cannot poison a fragment in progress).
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = 10, .master_address = 1 });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const foreign = try frameFor(999, 77, command, &frame_buf);
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(foreign, 100, &out));
+        try testing.expect(!fix.bouts[2].value);
+        try testing.expectEqual(@as(usize, 0), session.rx.len);
+    }
+
+    // The very same bytes addressed to us: this is what proves the vector above
+    // was live rather than inert.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = 10, .master_address = 1 });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const ours = try frameFor(10, 77, command, &frame_buf);
+        const reply = (try session.feedFrame(ours, 100, &out)).?;
+        try testing.expect(reply.len > 0);
+        try testing.expect(fix.bouts[2].value);
+    }
+
+    // A link-service request addressed elsewhere gets no link answer either.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = 10, .master_address = 1 });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const reset = try link.encodeFrame(
+            .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(link.PrimaryFunction.reset_link_states) },
+            999,
+            1,
+            &.{},
+            &frame_buf,
+        );
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(reset, 100, &out));
+    }
+}
+
+test "Session: a broadcast is executed but never answered" {
+    // IEEE 1815 §9.2.4.1.4: 0xFFFD-0xFFFF are broadcast destinations. Dropping
+    // them along with the foreign addresses would be a different bug (a
+    // broadcast command must still act); answering them turns one frame into a
+    // reply from every station on the bus.
+    var req: [64]u8 = undefined;
+    const command = try buildCrob(&req, 1, .direct_operate, 3, .latch_on);
+
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var frame_buf: [128]u8 = undefined;
+
+    for ([_]u16{ 0xFFFD, 0xFFFE, 0xFFFF }) |dest| {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = 10, .master_address = 1 });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const frame = try frameFor(dest, 1, command, &frame_buf);
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(frame, 100, &out));
+        try testing.expect(fix.bouts[3].value); // executed
+        try testing.expectEqual(@as(?Outstation.Cursor, null), station.cursor);
+        // Nothing is left queued that a later poll could emit.
+        try testing.expectEqual(@as(?[]u8, null), try session.nextFrames(200, &out));
+    }
+
+    // A broadcast READ leaves no response series behind either.
+    {
+        var binaries: [200]BinaryInput = undefined;
+        for (&binaries) |*p| p.* = .{ .static_variation = 2, .class = .class1 };
+        var storage: [2]Event = undefined;
+        var station = Outstation.init(
+            .{ .address = 10, .master_address = 1 },
+            .{ .binary_inputs = &binaries },
+            EventBuffer.init(&storage),
+        );
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        var big_req: [64]u8 = undefined;
+        const integrity = try buildRead(&big_req, 3, &.{objects.g60.readClassHeader(.class0)});
+        const frame = try frameFor(0xFFFF, 1, integrity, &frame_buf);
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(frame, 100, &out));
+        try testing.expectEqual(@as(?Outstation.Cursor, null), station.cursor);
+        try testing.expectEqual(@as(?[]u8, null), try session.nextFrames(200, &out));
+    }
+
+    // 0xFFFC is *not* a broadcast address: it is just somebody else's.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = 10, .master_address = 1 });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const frame = try frameFor(0xFFFC, 1, command, &frame_buf);
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(frame, 100, &out));
+        try testing.expect(!fix.bouts[3].value);
+    }
 }
 
 test "Session: unsolicitedFrames wraps an outstation-initiated fragment in link frames" {
@@ -3304,11 +3520,373 @@ test "hostile: a command whose object count overruns the fragment is PARAMETER_E
     try testing.expect((try responseIin(reply.fragment)).parameter_error);
 }
 
+test "hostile: a full-width command range is a parameter error, not an integer overflow" {
+    // F4. `stop - start + 1` over the full u32 range is 0x1_0000_0000, which
+    // does not fit u32: this fragment used to panic the process, from one
+    // unauthenticated 13-byte fragment, before any group/variation or arming
+    // check — no valid point, no object body and no arming needed.
+    var fix = Fixture{};
+    var station = fix.station(.{});
+    var out: [256]u8 = undefined;
+    var req: [64]u8 = undefined;
+
+    const frag = try buildCrobRange(&req, 1, .direct_operate, 0, 0xFFFF_FFFF, 0);
+    try testing.expectEqual(@as(usize, 13), frag.len);
+    const reply = (try station.handle(frag, 100, &out)).?;
+    try testing.expect((try responseIin(reply.fragment)).parameter_error);
+    for (fix.bouts) |b| try testing.expect(!b.value);
+
+    // Same shape on the other three command function codes.
+    for ([_]FunctionCode{ .select, .operate, .direct_operate_no_ack }) |func| {
+        const f = try buildCrobRange(&req, 2, func, 0, 0xFFFF_FFFF, 0);
+        _ = try station.handle(f, 200, &out);
+    }
+    try testing.expectEqual(@as(?Outstation.Select, null), station.select);
+
+    // An inverted range is still refused, and a legal narrow range still works.
+    const inverted = try buildCrobRange(&req, 3, .direct_operate, 7, 6, 1);
+    const inv_reply = (try station.handle(inverted, 300, &out)).?;
+    try testing.expect((try responseIin(inv_reply.fragment)).parameter_error);
+    const ok = try buildCrobRange(&req, 4, .direct_operate, 1, 1, 1);
+    const ok_reply = (try station.handle(ok, 400, &out)).?;
+    try testing.expect(!(try responseIin(ok_reply.fragment)).parameter_error);
+    try testing.expectEqual(CommandStatus.success, try commandStatus(ok_reply.fragment));
+    try testing.expect(fix.bouts[1].value);
+}
+
+test "hostile: a command range above the u16 index space is refused, not truncated" {
+    // F5. A prefix-less header takes its point index from the range, which is
+    // 32 bits on the wire and 16 bits everywhere in this module. `@intCast`
+    // panicked here; `@truncate` would have latched output 0 on a request that
+    // named point 0x10000, which is worse than a crash.
+    var fix = Fixture{};
+    var station = fix.station(.{});
+    var out: [256]u8 = undefined;
+    var req: [64]u8 = undefined;
+
+    const over = try buildCrobRange(&req, 1, .direct_operate, 0x1_0000, 0x1_0000, 1);
+    const reply = (try station.handle(over, 100, &out)).?;
+    try testing.expect((try responseIin(reply.fragment)).parameter_error);
+    for (fix.bouts) |b| try testing.expect(!b.value); // nothing actuated
+
+    // The last addressable index is *accepted* — it is a real (if absent)
+    // point, answered NOT_SUPPORTED by the database, not a parameter error.
+    // Pinned as the literal 0xFFFF so the pair brackets the boundary from both
+    // sides rather than restating whatever the constant happens to be.
+    const edge = try buildCrobRange(&req, 2, .direct_operate, 0xFFFF, 0xFFFF, 1);
+    const edge_reply = (try station.handle(edge, 200, &out)).?;
+    try testing.expect(!(try responseIin(edge_reply.fragment)).parameter_error);
+    try testing.expectEqual(CommandStatus.not_supported, try commandStatus(edge_reply.fragment));
+
+    // A start just inside the space with a stop far outside it must not wrap on
+    // the way to the check either.
+    const straddle = try buildCrobRange(&req, 3, .direct_operate, 0xFFFF_FFFF, 0xFFFF_FFFF, 1);
+    const straddle_reply = (try station.handle(straddle, 300, &out)).?;
+    try testing.expect((try responseIin(straddle_reply.fragment)).parameter_error);
+    for (fix.bouts) |b| try testing.expect(!b.value);
+}
+
 test "hostile: a tiny output buffer is a typed error, not a stomp" {
     var fix = Fixture{};
     var station = fix.station(.{});
     var tiny: [4]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, station.handle(&.{ 0xC0, 0x01, 60, 1, 0x06 }, 100, &tiny));
+}
+
+// ── structured hostile-input generation (F7) ────────────────────────────────
+//
+// Uniformly random bytes are a poor fuzzer for a framed protocol: a fragment
+// only reaches the command path if byte 1 is one of four function codes, the
+// object header decodes, and the range field carries a *boundary* value. Two
+// remote panics (F4, F5) sat behind 20 000 uniform draws precisely because
+// `stop = 0xFFFF_FFFF` has probability 2^-32 per header. The generator below
+// draws each field from the values that sit on a representable boundary, and
+// the tests using it assert they actually produced the shapes — a generator
+// that silently stops reaching them is the defect F7 named.
+
+/// Range-field values: every boundary of the 8/16/32-bit index spaces, plus the
+/// first value past each of them.
+const hostile_range_values = [_]u32{
+    0,           1,           2,           0x7F,
+    0xFF,        0x100,       0xFFFE,      0xFFFF,
+    0x1_0000,    0x1_0001,    0x7FFF_FFFF, 0x8000_0000,
+    0xFFFF_FFFE, 0xFFFF_FFFF,
+};
+
+/// Function codes: the ones this outstation implements, an unassigned one and
+/// two response codes (which a request must never carry).
+const hostile_functions = [_]u8{
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x09, 0x0D, 0x0E, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x21, 0x81,
+};
+
+/// Group/variation pairs: command objects, static objects, class objects, and
+/// a pair no table knows.
+const hostile_objects = [_][2]u8{
+    .{ 12, 1 }, .{ 41, 1 }, .{ 41, 2 }, .{ 41, 3 },
+    .{ 41, 4 }, .{ 1, 2 },  .{ 2, 2 },  .{ 10, 2 },
+    .{ 20, 1 }, .{ 30, 1 }, .{ 50, 1 }, .{ 60, 1 },
+    .{ 60, 2 }, .{ 80, 1 }, .{ 99, 7 },
+};
+
+const hostile_range_codes = [_]u8{ 0, 1, 2, 6, 7, 8, 9, 3 };
+const hostile_prefix_codes = [_]u8{ 0, 1, 2, 3, 5 };
+/// Object-body lengths: nothing, a short record, exactly one CROB (11), a few
+/// CROBs, and a length no record size divides.
+const hostile_body_lens = [_]usize{ 0, 1, 3, 5, 11, 22, 33, 7 };
+
+/// Which attacker-interesting shapes a drawn fragment actually contained.
+const DrawnShapes = struct {
+    /// A command function whose start/stop range spans the whole u32 space —
+    /// the F4 overflow.
+    full_width_range: bool = false,
+    /// A command function with a prefix-less header whose start is past the
+    /// u16 index space, with enough body to reach the index computation — F5.
+    index_past_u16: bool = false,
+};
+
+/// Deterministic drawer for the in-tree loops.
+const Xorshift = struct {
+    state: u32,
+
+    fn below(self: *Xorshift, n: usize) usize {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 17;
+        self.state ^= self.state << 5;
+        return self.state % n;
+    }
+};
+
+/// The same interface backed by the fuzzer, so `std.testing.fuzz` explores the
+/// identical shape space with coverage feedback instead of a fixed seed.
+const SmithDrawer = struct {
+    smith: *testing.Smith,
+
+    fn below(self: *SmithDrawer, n: usize) usize {
+        return self.smith.index(n);
+    }
+};
+
+/// Draws one structured DNP3 request fragment into `buf`.
+fn drawRequest(d: anytype, buf: []u8, shapes: *DrawnShapes) []u8 {
+    const seq: u8 = @intCast(d.below(16));
+    var ctrl: u8 = seq;
+    if (d.below(8) != 0) ctrl |= 0x80; // FIR, usually set
+    if (d.below(8) != 0) ctrl |= 0x40; // FIN, usually set
+    if (d.below(4) == 0) ctrl |= 0x20; // CON
+    if (d.below(4) == 0) ctrl |= 0x10; // UNS
+    buf[0] = ctrl;
+    const function = hostile_functions[d.below(hostile_functions.len)];
+    buf[1] = function;
+    const is_command = function >= 0x03 and function <= 0x06;
+    var pos: usize = 2;
+
+    const headers = 1 + d.below(3);
+    for (0..headers) |_| {
+        if (pos + 12 > buf.len) break;
+        const gv = hostile_objects[d.below(hostile_objects.len)];
+        buf[pos] = gv[0];
+        buf[pos + 1] = gv[1];
+        const prefix_code = hostile_prefix_codes[d.below(hostile_prefix_codes.len)];
+        const range_code = hostile_range_codes[d.below(hostile_range_codes.len)];
+        buf[pos + 2] = (prefix_code << 4) | range_code;
+        pos += 3;
+
+        const width: usize = switch (range_code) {
+            0, 7 => 1,
+            1, 8 => 2,
+            2, 9 => 4,
+            else => 0,
+        };
+        const is_start_stop = range_code <= 2;
+        const fields: usize = if (is_start_stop) 2 else if (width > 0) 1 else 0;
+        var start: u32 = 0;
+        var stop: u32 = 0;
+        for (0..fields) |field| {
+            const v = hostile_range_values[d.below(hostile_range_values.len)];
+            if (field == 0) start = v else stop = v;
+            switch (width) {
+                1 => buf[pos] = @truncate(v),
+                2 => std.mem.writeInt(u16, buf[pos..][0..2], @truncate(v), .little),
+                else => std.mem.writeInt(u32, buf[pos..][0..4], v, .little),
+            }
+            pos += width;
+        }
+
+        const want = hostile_body_lens[d.below(hostile_body_lens.len)];
+        const body = @min(want, buf.len - pos);
+        for (buf[pos..][0..body]) |*b| b.* = @intCast(d.below(256));
+        pos += body;
+
+        // Full-width fields only exist in the 4-byte range codes; the narrower
+        // ones truncate, which is why the shape bookkeeping is per header.
+        if (is_command and width == 4 and is_start_stop) {
+            if (start == 0 and stop == 0xFFFF_FFFF) shapes.full_width_range = true;
+            if (prefix_code == 0 and start > 0xFFFF and stop >= start and body >= 11) {
+                shapes.index_past_u16 = true;
+            }
+        }
+    }
+    return buf[0..pos];
+}
+
+/// Feeds one drawn fragment to `station`, asserting the contract every request
+/// must satisfy: no panic, and anything emitted is a decodable response.
+fn checkDrawnFragment(station: *Outstation, fragment: []const u8, now_ms: u64, out: []u8) !void {
+    const maybe = station.handle(fragment, now_ms, out) catch |err| {
+        try testing.expectEqual(error.BufferTooSmall, err);
+        return;
+    };
+    if (maybe) |reply| {
+        const decoded = try application.decodeResponseHeader(reply.fragment);
+        try testing.expect(decoded.header.function == .response or
+            decoded.header.function == .unsolicited_response);
+    }
+    while (station.cursor != null) {
+        _ = station.next(now_ms, out) catch break;
+    }
+}
+
+test "fuzz: structured request fragments reach the command path and never panic" {
+    var fix = Fixture{};
+    var station = fix.station(.{
+        .select_timeout_ms = 1000,
+        .unsolicited_supported = true,
+        .allow_restart = true,
+    });
+    var out: [2048]u8 = undefined;
+    var buf: [200]u8 = undefined;
+
+    var d = Xorshift{ .state = 0x9E37_79B9 };
+    var shapes = DrawnShapes{};
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) {
+        const fragment = drawRequest(&d, &buf, &shapes);
+        try checkDrawnFragment(&station, fragment, i * 7, &out);
+    }
+
+    // The harness must be able to *reach* what it is aimed at. Both of these
+    // were unreachable in the uniform-byte loop below, which is why F4 and F5
+    // shipped.
+    try testing.expect(shapes.full_width_range);
+    try testing.expect(shapes.index_past_u16);
+}
+
+test "fuzz: structured frames through a Session never panic" {
+    var fix = Fixture{};
+    var station = fix.station(.{ .address = 10, .master_address = 1, .allow_restart = true });
+    var rx: [1024]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    var tx: [1024]u8 = undefined;
+    var session = Session.init(&station, &rx, &scratch, &tx);
+    var out: [2048]u8 = undefined;
+    var buf: [200]u8 = undefined;
+    var user: [link.max_user_data_len]u8 = undefined;
+    var frame_buf: [512]u8 = undefined;
+
+    // Ours, a neighbour's, the address just below the broadcast block, and all
+    // three broadcast addresses.
+    const dests = [_]u16{ 10, 11, 999, 0xFFFC, 0xFFFD, 0xFFFE, 0xFFFF };
+    const link_functions = [_]u4{ 0, 1, 2, 3, 4, 9 };
+
+    var d = Xorshift{ .state = 0x2B7E_1516 };
+    var shapes = DrawnShapes{};
+    var accepted: usize = 0;
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) {
+        const fragment = drawRequest(&d, &buf, &shapes);
+        user[0] = 0xC0 | @as(u8, @intCast(d.below(64))); // transport header
+        const carried = @min(fragment.len, user.len - 1);
+        @memcpy(user[1..][0..carried], fragment[0..carried]);
+        const dest = dests[d.below(dests.len)];
+        const frame = link.encodeFrame(
+            .{
+                .dir = true,
+                .prm = d.below(8) != 0,
+                .function = link_functions[d.below(link_functions.len)],
+            },
+            dest,
+            @intCast(d.below(4)),
+            user[0 .. 1 + carried],
+            &frame_buf,
+        ) catch continue;
+        if (dest == 10 or isBroadcast(dest)) accepted += 1;
+        _ = session.feedFrame(frame, i * 3, &out) catch {};
+    }
+
+    // A Session fuzzer that only ever draws addresses the filter drops would be
+    // testing the filter, not the outstation behind it.
+    try testing.expect(accepted > 0);
+    try testing.expect(shapes.full_width_range);
+    try testing.expect(shapes.index_past_u16);
+}
+
+test "fuzz: Outstation.handle over structured fragments" {
+    try testing.fuzz({}, fuzzStructuredHandle, .{});
+}
+
+fn fuzzStructuredHandle(_: void, smith: *testing.Smith) !void {
+    var fix = Fixture{};
+    var station = fix.station(.{
+        .select_timeout_ms = 1000,
+        .unsolicited_supported = true,
+        .allow_restart = true,
+    });
+    var out: [2048]u8 = undefined;
+    var buf: [200]u8 = undefined;
+    var d = SmithDrawer{ .smith = smith };
+    var shapes = DrawnShapes{};
+
+    // Several fragments against one station, so state built by an earlier
+    // fragment (an armed SELECT, an unconfirmed series) is reachable.
+    var i: usize = 0;
+    while (i < 32 and !smith.eos()) : (i += 1) {
+        const fragment = drawRequest(&d, &buf, &shapes);
+        try checkDrawnFragment(&station, fragment, i * 7, &out);
+    }
+}
+
+test "fuzz: Session.feedFrame over structured frames" {
+    try testing.fuzz({}, fuzzStructuredSession, .{});
+}
+
+fn fuzzStructuredSession(_: void, smith: *testing.Smith) !void {
+    var fix = Fixture{};
+    var station = fix.station(.{ .address = 10, .master_address = 1, .allow_restart = true });
+    var rx: [1024]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    var tx: [1024]u8 = undefined;
+    var session = Session.init(&station, &rx, &scratch, &tx);
+    var out: [2048]u8 = undefined;
+    var buf: [200]u8 = undefined;
+    var user: [link.max_user_data_len]u8 = undefined;
+    var frame_buf: [512]u8 = undefined;
+    var d = SmithDrawer{ .smith = smith };
+    var shapes = DrawnShapes{};
+
+    const dests = [_]u16{ 10, 11, 999, 0xFFFC, 0xFFFD, 0xFFFE, 0xFFFF };
+    const link_functions = [_]u4{ 0, 1, 2, 3, 4, 9 };
+
+    var i: usize = 0;
+    while (i < 32 and !smith.eos()) : (i += 1) {
+        const fragment = drawRequest(&d, &buf, &shapes);
+        user[0] = 0xC0 | @as(u8, @intCast(d.below(64)));
+        const carried = @min(fragment.len, user.len - 1);
+        @memcpy(user[1..][0..carried], fragment[0..carried]);
+        const frame = link.encodeFrame(
+            .{
+                .dir = true,
+                .prm = d.below(8) != 0,
+                .function = link_functions[d.below(link_functions.len)],
+            },
+            dests[d.below(dests.len)],
+            @intCast(d.below(4)),
+            user[0 .. 1 + carried],
+            &frame_buf,
+        ) catch return;
+        _ = session.feedFrame(frame, i * 3, &out) catch {};
+    }
 }
 
 test "fuzz: random request fragments never panic and always resolve" {

@@ -113,11 +113,27 @@ out-of-bounds reads, across every decode entry point (`link.decodeFrame`,
 
 The outstation widens the attack surface, so its entry points get the same treatment: a request
 fragment that is not FIR+FIN, an object header whose range is inverted or empty, a range or count
-that runs past the database, a count that overruns the fragment, a variation the module does not
-implement, an unassigned function code, and a zero-length fragment all resolve to a response with
-the right IIN bits rather than an error or a crash. Two 20 000-iteration fuzz loops (random
-application fragments, random link frames through a `Session`) assert that whatever comes out is
-always a decodable response fragment.
+that runs past the database, a count that overruns the fragment, a start/stop range spanning the
+whole 32-bit space, a prefix-less command header naming a point index past the 16-bit index space,
+a variation the module does not implement, an unassigned function code, and a zero-length fragment
+all resolve to a response with the right IIN bits rather than an error or a crash. Wire-driven
+object-instance counts always go through `objects.Range.objectCount()` / `objectSpanBytes()`, whose
+arithmetic is widened to `u64`; a raw `stop - start + 1` on a wire value is a defect, and an index
+that does not fit the 16-bit point space is refused, never truncated onto a different point.
+
+`Session.feedFrame` filters on the data-link destination address: a frame addressed to another
+station is dropped without being decoded further, and the three IEEE 1815 broadcast addresses
+(0xFFFD-0xFFFF) are executed but never answered. It does **not** filter on the source address, and
+an armed SELECT is not bound to the peer that armed it — on a link where more than one station can
+send, authorising the source is still the caller's job (or DNP3-SA's).
+
+Four fuzz harnesses back this: two 20 000-iteration loops over uniformly random bytes (application
+fragments, link frames through a `Session`), and two over *structured* draws — function code,
+group/variation, qualifier, and range fields drawn from the boundary values of each field's
+representable range, which is the only way a fragment ever reaches the command path's range
+arithmetic. The structured loops assert they produced those shapes, so a generator that stops
+reaching them fails rather than reading green. `std.testing.fuzz` targets over the same generator
+(`Outstation.handle`, `Session.feedFrame`) hand the shape space to the real fuzzer.
 
 Out of scope: unsolicited *retry* policy (the fragment builder is here, the timer is the caller's),
 file-transfer objects (g70), data-set objects (g85-g88), device attributes (g0), octet strings
@@ -167,14 +183,14 @@ derivation (the GMAC primitive is provided and KAT-validated; the caller supplie
 
 ## Verification
 
-127 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
-Breakdown: `link` (11) — CRC catalogue + KAT vectors, control-octet round-trip, frame round-trips
+139 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
+Breakdown: `link` (12) — CRC catalogue + KAT vectors, control-octet round-trip, frame round-trips
 (empty/short/multi-block/exact-16-byte-boundary user data), encode/decode error paths including a
 malformed-input sweep; `transport` (9) — transport-octet round-trip, empty-fragment/single-segment/
 multi-segment segmentation+reassembly, sequence-mismatch/continuation-before-FIR/FIR-restart/
 buffer-too-small/empty-segment error paths; `application` (7) — app-control round-trip, IIN
 round-trip, request/response header round-trips, `buildRequest`, short-fragment errors,
-non-exhaustive function-code decode; `objects` (18) — qualifier byte round-trip, object-header
+non-exhaustive function-code decode; `objects` (20) — qualifier byte round-trip, object-header
 round-trips for every implemented range shape (1/2/4-byte start-stop, all-values, count+prefix,
 4-byte count), range/qualifier-mismatch and value-out-of-range errors, a short/garbage decode
 sweep, flags-byte round-trip, and an encode/decode round-trip for every core object
@@ -186,13 +202,13 @@ AES-GMAC (McGrew GCM test case 1) + compute/verify, constant-time verify accept/
 g120 object-header + v1/v3/v4/v5/v6/v7/v9 codec round-trips, short/garbage decode sweep, session-key
 wrap/unwrap (128- and 256-bit, wrong-update-key reject), the full challenge-response flow
 (build v1 → compute v2 → verify accept; tamper MAC or ASDU → reject), and the `SeqCounter`/
-`KeyExpiry`/`lookupUpdateKey` state helpers; `root` (3) — full link→transport→application
+`KeyExpiry`/`lookupUpdateKey` state helpers; `root` (4) — full link→transport→application
 stack round-trips (single-frame and forced multi-frame >250-byte fragments) and a
 master-builds-READ/outstation-parses + outstation-builds-RESPONSE/master-parses round trip;
-`records` (10) — the layout table's wire lengths against the object library, state-in-flags
+`records` (11) — the layout table's wire lengths against the object library, state-in-flags
 encoding for binary and double-bit, absolute-time and float variations, narrow-variation range
 rejection, packed shapes, a short-record sweep, and the point-kind ↔ group mapping both ways;
-`outstation` (35) — IIN (restart set/cleared, need-time, class bits, overflow latch,
+`outstation` (51) — IIN (restart set/cleared, need-time, class bits, overflow latch,
 func-not-supported, object-unknown), READ (class 0 walking all seven point types in order, every
 qualifier shape, variation 0 per-point selection, packed variations, mixed-variation header
 splitting, hostile ranges), events (oldest-first with the right group/variation/index prefix,
@@ -202,9 +218,11 @@ different objects, different index, DIRECT_OPERATE and its no-ack form, all four
 nonexistent and command-less points, analog output bounds, hook veto), DELAY_MEASURE, restart
 (refused and allowed), ENABLE/DISABLE_UNSOLICITED, unsolicited responses, freeze and freeze-clear,
 ASSIGN_CLASS, fragmentation (FIR/FIN/SEQ across a series, and a new request abandoning one),
-`Session` (link-service replies, a request split across transport segments, out-of-order segments,
-bad CRC, `unsolicitedFrames` framing an outstation-initiated response and advancing `tx_seq`),
-hostile input, and two fuzz loops; `goldens` (5) — the captured-session replays.
+`Session` (link-service replies, a frame addressed to another station dropped, a broadcast executed
+but unanswered, a request split across transport segments, out-of-order segments, bad CRC,
+`unsolicitedFrames` framing an outstation-initiated response and advancing `tx_seq`), hostile input
+(including a full-width command range and a point index past the 16-bit space), and four fuzz
+harnesses; `goldens` (5) — the captured-session replays.
 
 **Interop (2026-07-23).** The captures in `src/goldens.zig` were taken against **opendnp3**
 (Apache-2.0, `release` branch, built from source in this sandbox) used strictly as a black-box

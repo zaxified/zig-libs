@@ -186,6 +186,13 @@ if (try session.nextFrames(now_ms, &out)) |more| { /* next response fragment */ 
 if (try session.unsolicitedFrames(now_ms, &out)) |uns| { /* unsolicited response */ }
 ```
 
+`Session.feedFrame` drops any frame whose data-link destination is neither
+`config.address` nor one of the three broadcast addresses (0xFFFD-0xFFFF); a
+broadcast is executed but never answered, per IEEE 1815 §9.2.4.1.4. The
+*source* address is not filtered and an armed SELECT is not bound to the peer
+that armed it, so on a link carrying more than one master-capable station the
+caller still has to authorise the source itself.
+
 `Session` frames all three directions the outstation can speak: replies to a
 request (`feedFrame`), the continuation fragments of a multi-fragment response
 (`nextFrames`) and unsolicited responses (`unsolicitedFrames`). All three share
@@ -212,7 +219,7 @@ zig build test-dnp3 -Doptimize=ReleaseFast
 zig fmt --check modules/dnp3
 ```
 
-127 offline tests: DNP3 CRC-16 known-answer vectors (the reveng
+139 offline tests: DNP3 CRC-16 known-answer vectors (the reveng
 CRC-catalogue "CRC-16/DNP" check value plus additional vectors cross-checked
 against an independent from-scratch bit-serial CRC reference — see SPEC.md),
 data-link frame round-trips (empty/short/exact-block-boundary/multi-block user
@@ -224,9 +231,12 @@ and a full link→transport→application stack round-trip in both directions
 implements, the IIN bits, the event confirm/retire/timeout cycle, buffer
 overflow, select-before-operate in all four failure modes, and multi-fragment
 responses. Every decode path is exercised with short/corrupt/garbage input to
-confirm it returns a typed error rather than panicking, and two
-20 000-iteration fuzz loops drive random application fragments and random link
-frames through the outstation and its `Session`.
+confirm it returns a typed error rather than panicking, and four fuzz harnesses
+drive fragments and link frames through the outstation and its `Session`: two
+20 000-iteration loops over uniformly random bytes, and two over structured
+draws (function code, group/variation, qualifier and range fields drawn from
+each field's boundary values) that assert they reached the command path's range
+arithmetic. The same generator backs two `std.testing.fuzz` targets.
 
 **Interop (2026-07-23).** `src/goldens.zig` replays two sessions captured from
 a live **opendnp3** peer (built from source):
