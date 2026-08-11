@@ -159,6 +159,16 @@ pub const Precomputed = struct {
     /// such check at all (correspondence is the caller's responsibility);
     /// this is deliberately stricter than parity, not a correctness
     /// requirement BIP143 itself imposes.
+    ///
+    /// ⚠ F12 (2026-08-11 re-audit) — the precondition this fingerprint does
+    /// NOT relieve the caller of: **`pre` is invalidated by any mutation of
+    /// the transaction or its spent outputs; the fingerprint detects
+    /// substitution only.** Mutating `transaction.vout[0].value` in place
+    /// leaves every pointer and length identical, so `matches` still says
+    /// yes and `sighashWith` returns the digest of the transaction as it was
+    /// at `precompute` time — no error. That is the same property Core's
+    /// `PrecomputedTransactionData` has (parity, not divergence), and it is
+    /// asserted rather than hidden by the F12 test in `precomputed.zig`.
     vin_ptr: [*]const tx.TxIn,
     vin_len: usize,
     vout_ptr: [*]const tx.TxOut,

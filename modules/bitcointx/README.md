@@ -50,6 +50,13 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup:
   call, which is `O(n²)` in transaction size on input an attacker chooses — the exact cost BIP143
   was written to eliminate. A validator wants `precompute` + `bip143.sighashWith` /
   `bip341.sighashWith`, which are byte-identical to the uncached forms.
+  ⚠ **Precondition: `pre` is invalidated by any mutation of the transaction or its spent outputs;
+  the fingerprint detects substitution only.** The `*With` entry points refuse a `pre` built from a
+  *different* transaction (`error.PrecomputedMismatch`), but that check is an O(1) pointer/length
+  fingerprint: an in-place edit — filling in a `script_sig`, bumping an output value — leaves the
+  pointers identical and silently yields the pre-edit digest. Rebuild `pre` after every change.
+  Bitcoin Core's `PrecomputedTransactionData` behaves the same way; detecting mutation would mean
+  re-hashing the transaction on every call, i.e. paying back exactly what the cache saves.
 
 Deliberately deferred (structurally noted, not half-built — SPEC.md has the full rationale): BIP342
 tapscript signature hashing itself (the message layout is shared, the tapscript semantics live in

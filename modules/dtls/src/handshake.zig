@@ -416,6 +416,75 @@ test "reassembler: buffer too small for declared total length" {
     try testing.expectError(error.BufferTooSmall, reasm.feed(hdr, "AAAA"));
 }
 
+test "reassembler: the DECLARED fragment_length must agree with the bytes actually PRESENT" {
+    // `feed`'s first line is the only place in this module where a length a
+    // peer DECLARED in a header is reconciled against the bytes that
+    // actually arrived in the datagram. Everything downstream — the
+    // `end > total` range check, the overlap scan, the `@memcpy` and the
+    // completion scan — mixes the two numbers freely, so if they are allowed
+    // to disagree the reassembler either marks bytes received that were
+    // never delivered (declared > present) or writes past the range it
+    // claimed (present > declared, an out-of-bounds write when the fragment
+    // sits near the end of the buffer).
+    //
+    // Both directions are pinned, and at the ±1 boundary rather than only at
+    // an absurd value: an off-by-one in the comparison (`<`, `>`, `>=`) is
+    // the realistic regression, and a test that only ever tries "declared =
+    // 9999" passes against every one of those.
+    var buf: [8]u8 = undefined;
+    var received: [8]bool = undefined;
+    var reasm = Reassembler.init(&buf, &received);
+
+    // Declared one byte MORE than present, at the boundary.
+    try testing.expectError(error.FragmentOutOfRange, reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 4 },
+        "AAA",
+    ));
+    // Declared one byte FEWER than present, at the boundary.
+    try testing.expectError(error.FragmentOutOfRange, reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 4 },
+        "AAAAA",
+    ));
+    // The degenerate boundary on each side: nothing declared but something
+    // present, and something declared but nothing present. The empty
+    // fragment is a legal shape (a zero-length handshake message), so these
+    // are not covered by any "reject the empty body" rule.
+    try testing.expectError(error.FragmentOutOfRange, reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 0 },
+        "A",
+    ));
+    try testing.expectError(error.FragmentOutOfRange, reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 1 },
+        "",
+    ));
+    // Far from the boundary too, so the check is not merely "off by one".
+    try testing.expectError(error.FragmentOutOfRange, reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 1 },
+        "AAAAAAAA",
+    ));
+    // ...and at a non-zero offset, where the disagreement is checked BEFORE
+    // the `fragment_offset + fragment_length <= length` range check that
+    // this header would otherwise pass.
+    try testing.expectError(error.FragmentOutOfRange, reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 4, .fragment_length = 4 },
+        "BB",
+    ));
+
+    // Every rejection above must have left the reassembler untouched — the
+    // check runs before any state is written, so a real message delivered
+    // afterwards reassembles normally and yields exactly its own bytes.
+    // This is also the control: the check refuses disagreement, not traffic.
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 4 },
+        "AAAA",
+    ));
+    const done = (try reasm.feed(
+        .{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 4, .fragment_length = 4 },
+        "BBBB",
+    )).?;
+    try testing.expectEqualSlices(u8, "AAAABBBB", done);
+}
+
 // ── fuzz: the reassembly (stitching) layer ─────────────────────────────────
 //
 // `Reassembler.feed` is where an attacker-chosen `fragment_offset` /
@@ -425,17 +494,120 @@ test "reassembler: buffer too small for declared total length" {
 // have had fuzz targets since the module was written; this layer had none,
 // and hand-built vectors only ever cover the shapes their author thought of.
 //
-// The harness deliberately does BOTH halves in every iteration:
+// The harness deliberately does ALL THREE parts in every iteration:
 //   (1) an arbitrary fragment storm, whose only contract is "typed error or
-//       success, never a panic / never an out-of-bounds write", and
-//   (2) a real two-fragment message that MUST stitch back together
+//       success, never a panic / never an out-of-bounds write",
+//   (2) a CONSTRUCTED declared-vs-present length disagreement, which must be
+//       refused (see `feed`'s first line), and
+//   (3) a real two-fragment message that MUST stitch back together
 //       byte-for-byte afterwards — so the target cannot decay into a test
 //       that merely bounces every input off an early `return error` without
 //       ever reaching the copy/complete path.
+//
+// ── on the corpus, and why it is WRITTEN rather than sampled ──────────────
+//
+// Without `-Dfuzz`/`--fuzz` the test runner does not generate anything: it
+// replays exactly the corpus a target declares, plus one empty input
+// (`lib/compiler/test_runner.zig`'s `fuzz`). And a corpus-backed `Smith`
+// decodes every weighted draw by reading EIGHT bytes as a little-endian
+// `u64` and using it only if it lands inside the declared range, falling
+// back to the range's minimum otherwise (`lib/std/testing/Smith.zig`,
+// `valueWeightedWithHashInner`). Two consequences drive the shape below:
+//
+//   * A corpus of arbitrary/random bytes decodes to "every draw is its
+//     range minimum" — a `u64` whose upper seven bytes are not zero is
+//     outside every small range here. Sampling therefore cannot steer this
+//     storm at any iteration count; only exact 8-byte little-endian
+//     integers can, so the corpus is written by hand.
+//   * `Smith.bytes` consumes `min(out.len, in.len)` and zero-pads the rest,
+//     so a payload drawn before the lengths that describe it would drain
+//     the corpus and leave every later draw on its fallback. Lengths are
+//     therefore drawn BEFORE payloads throughout.
+//
+// Part (2) exists because of this: an undirected storm reaches the
+// length-agreement check only when two independent draws happen to
+// disagree, which the fallback behaviour above makes impossible on a plain
+// build. Constructing the disagreement makes that check reachable in every
+// run — corpus or no corpus — while its magnitude and direction stay
+// peer-chosen.
 
 test "fuzz: Reassembler.feed survives arbitrary fragments and still stitches a real message" {
-    try testing.fuzz({}, fuzzReassemble, .{});
+    try testing.fuzz({}, fuzzReassemble, .{ .corpus = &reassemble_corpus });
 }
+
+const CorpusItem = union(enum) {
+    /// One weighted draw (`value` / `valueRangeAtMost` / `boolWeighted`).
+    int: u64,
+    /// Raw payload bytes for a `Smith.bytes` call.
+    raw: []const u8,
+};
+
+fn corpusBytes(comptime items: []const CorpusItem) []const u8 {
+    const result = comptime result: {
+        var buf: [
+            len: {
+                var n = 0;
+                for (items) |it| n += switch (it) {
+                    .int => 8,
+                    .raw => |r| r.len,
+                };
+                break :len n;
+            }
+        ]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (items) |it| switch (it) {
+            .int => |v| w.writeInt(u64, v, .little) catch unreachable,
+            .raw => |r| w.writeAll(r) catch unreachable,
+        };
+        break :result buf;
+    };
+    return &result;
+}
+
+/// One storm iteration's six draws, in the order `fuzzReassemble` makes
+/// them, followed by the fragment body. Anything the corpus does not cover
+/// falls back to the range minimums (see the note above), which is a
+/// well-defined, harmless shape: an empty fragment of an empty message.
+fn stormFragment(
+    comptime body_len: u64,
+    comptime msg_type: u64,
+    comptime length: u64,
+    comptime message_seq: u64,
+    comptime fragment_offset: u64,
+    comptime fragment_length: u64,
+    comptime body: []const u8,
+) []const CorpusItem {
+    std.debug.assert(body.len == body_len);
+    return &.{
+        .{ .int = body_len },
+        .{ .int = msg_type },
+        .{ .int = length },
+        .{ .int = message_seq },
+        .{ .int = fragment_offset },
+        .{ .int = fragment_length },
+        .{ .raw = body },
+    };
+}
+
+/// Each entry steers the storm's leading iterations into a shape the
+/// length-agreement check must refuse, in a way random bytes cannot reach.
+/// Every one keeps `fragment_offset + body.len` inside the 96-byte buffer,
+/// so a build in which the check is missing fails on the assertion rather
+/// than dying on an out-of-bounds write — the mismatch is the finding, not
+/// the crash it can also cause.
+const reassemble_corpus = [_][]const u8{
+    // Declared one byte MORE than present, at a non-zero offset, followed by
+    // the same fragment delivered honestly (so the storm still reaches the
+    // copy/accept path in this entry, not only the rejection).
+    corpusBytes(stormFragment(3, 22, 32, 1, 8, 4, "abc") ++
+        stormFragment(4, 22, 32, 1, 8, 4, "abcd")),
+    // Declared one byte FEWER than present.
+    corpusBytes(stormFragment(5, 1, 64, 2, 0, 4, "vwxyz")),
+    // The two degenerate boundaries: nothing declared but bytes present, and
+    // bytes declared but nothing present.
+    corpusBytes(stormFragment(0, 5, 16, 0, 0, 7, "") ++
+        stormFragment(7, 5, 16, 0, 0, 0, "ABCDEFG")),
+};
 
 fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
     const cap = 96;
@@ -446,10 +618,14 @@ fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
     // (1) Fragment storm. Every header field is peer-chosen, and the body
     // length is allowed to disagree with `fragment_length` — that
     // disagreement is itself one of the rejection paths.
+    //
+    // The body length is drawn BEFORE the body: `Smith.bytes` consumes
+    // `min(out.len, in.len)` corpus bytes and zero-pads the rest, so filling
+    // the whole 96-byte buffer first would drain the corpus and leave every
+    // later draw of this iteration (and of the next) on its fallback.
     var body: [cap]u8 = undefined;
     var i: usize = 0;
     while (i < 6) : (i += 1) {
-        smith.bytes(&body);
         const body_len: usize = smith.valueRangeAtMost(u8, 0, cap);
         const hdr = HandshakeHeader{
             .msg_type = smith.value(u8),
@@ -461,10 +637,71 @@ fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
             .fragment_offset = smith.valueRangeAtMost(u24, 0, cap + 8),
             .fragment_length = smith.valueRangeAtMost(u24, 0, cap + 8),
         };
+        smith.bytes(body[0..body_len]);
+        if (body_len != @as(usize, hdr.fragment_length)) {
+            // A declared length that disagrees with the bytes present is
+            // never "close enough to carry on with": it is refused outright,
+            // whatever else about the header is wrong. Asserted rather than
+            // swallowed by `catch continue`, which is what let this whole
+            // class go unnoticed here before.
+            try testing.expectError(
+                error.FragmentOutOfRange,
+                reasm.feed(hdr, body[0..body_len]),
+            );
+            continue;
+        }
         _ = reasm.feed(hdr, body[0..body_len]) catch continue;
     }
 
-    // (2) The stitching path, asserted rather than hoped for. `message_seq`
+    // (2) The declared-vs-present length disagreement, CONSTRUCTED rather
+    // than hoped for (see the note above the test for why an undirected
+    // storm cannot arrange one on a plain build). Direction and magnitude
+    // stay peer-chosen; only the fact that the two numbers differ is fixed.
+    //
+    // The header is otherwise impeccable — fresh `message_seq`, offset 0,
+    // `length` covering whichever of the two numbers is larger and still
+    // inside the buffer — so `FragmentOutOfRange` here can only come from
+    // the length disagreement, not from a range or capacity check.
+    {
+        const present: usize = smith.valueRangeAtMost(u8, 1, cap - 1);
+        const declared: usize = if (smith.boolWeighted(1, 1))
+            present + smith.valueRangeAtMost(u8, 1, @intCast(cap - present))
+        else
+            present - smith.valueRangeAtMost(u8, 1, @intCast(present));
+        std.debug.assert(declared != present);
+
+        var probe: [cap]u8 = undefined;
+        smith.bytes(probe[0..present]);
+
+        const mismatched = HandshakeHeader{
+            .msg_type = 33,
+            .length = @intCast(@max(present, declared)),
+            .message_seq = 9,
+            .fragment_offset = 0,
+            .fragment_length = @intCast(declared),
+        };
+        try testing.expectError(
+            error.FragmentOutOfRange,
+            reasm.feed(mismatched, probe[0..present]),
+        );
+
+        // The rejection must have written nothing and started nothing: the
+        // same bytes delivered with an honest header reassemble normally.
+        // Doubles as the control — the check refuses disagreement, not
+        // traffic.
+        const honest = HandshakeHeader{
+            .msg_type = 33,
+            .length = @intCast(present),
+            .message_seq = 9,
+            .fragment_offset = 0,
+            .fragment_length = @intCast(present),
+        };
+        const whole = (try reasm.feed(honest, probe[0..present])) orelse
+            return error.TestExpectedStitch;
+        try testing.expectEqualSlices(u8, probe[0..present], whole);
+    }
+
+    // (3) The stitching path, asserted rather than hoped for. `message_seq`
     // 7 is outside the storm's range, so this always starts a fresh message
     // whatever state the storm left behind.
     const total: usize = smith.valueRangeAtMost(u8, 2, cap);

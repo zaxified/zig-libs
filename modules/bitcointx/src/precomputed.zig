@@ -37,6 +37,40 @@
 //! }
 //! ```
 //!
+//! ## ⚠ Precondition: `pre` is a SNAPSHOT, and mutation invalidates it
+//!
+//! **`pre` is invalidated by any mutation of the transaction or its spent
+//! outputs; the fingerprint detects substitution only.** Rebuild it after
+//! every change, and treat the transaction as frozen for as long as a `pre`
+//! built from it is alive.
+//!
+//! `pre` holds hashes of the transaction's contents AS THEY WERE at
+//! `init` time. The `*With` entry points carry a cheap O(1) identity
+//! fingerprint (the `vin`/`vout`/`spent_outputs` slice pointers and lengths,
+//! see F11) that refuses a `pre` paired with a DIFFERENT transaction value
+//! with `error.PrecomputedMismatch`. That fingerprint cannot see a change
+//! made THROUGH those same slices:
+//!
+//! ```zig
+//! const pre = try bitcointx.PrecomputedTransactionData.init(a, t, spent);
+//! t.vout[0].value += 1;                    // same slices, same pointers, same lengths
+//! const h = try bip143.sighashWith(a, pre.segwit_v0, t, 0, sc, amount, ht);
+//! // ^ NO error. `h` is the digest of the transaction BEFORE the mutation.
+//! ```
+//!
+//! This is the realistic route to a wrong consensus digest — filling in a
+//! `script_sig`, adjusting an output and signing again is an ordinary
+//! PSBT-shaped flow, whereas passing a wholly different transaction is a
+//! coding slip. It is not a fork risk: Bitcoin Core's
+//! `PrecomputedTransactionData` has exactly the same property (it carries no
+//! correspondence check at all and leaves the whole question to the caller),
+//! so this is **parity, documented**. Catching mutation would mean hashing
+//! the transaction's contents on every call — which is precisely the `O(n)`
+//! per-input cost the cache exists to eliminate, so the check would cost
+//! more than the thing it guards. `precomputed.zig`'s F12 test asserts this
+//! limit rather than hiding it, so the behaviour cannot change without this
+//! paragraph changing with it.
+//!
 //! Every `*With` entry point is byte-identical to its uncached counterpart —
 //! the `hash_type`-dependent selection over the cached hashes lives in one
 //! place per algorithm, shared by both routes, so a cached validator and an
@@ -55,6 +89,19 @@ const tx = @import("tx.zig");
 
 pub const PrecomputedError = bip341.Bip341Error;
 
+/// A snapshot of one transaction's per-transaction commitment hashes.
+///
+/// ⚠ **Precondition — `pre` is invalidated by any mutation of the
+/// transaction or its spent outputs; the fingerprint detects substitution
+/// only.** The `*With` entry points refuse a `pre` paired with a different
+/// `Transaction` VALUE (`error.PrecomputedMismatch`, F11), but a mutation
+/// made in place — through the very `vin`/`vout`/`spent_outputs` slices this
+/// was built from — leaves pointers and lengths identical and is therefore
+/// invisible: the call succeeds and returns the digest of the transaction as
+/// it was at `init` time. Rebuild after every change. This matches Bitcoin
+/// Core's `PrecomputedTransactionData`, which carries no check at all; see
+/// the module doc comment above for why detecting it would cost exactly what
+/// the cache exists to save.
 pub const PrecomputedTransactionData = struct {
     /// BIP143 segwit-v0: `hashPrevouts`/`hashSequence`/`hashOutputs`.
     segwit_v0: bip143.Precomputed,
@@ -261,4 +308,78 @@ test "F11: a precomputed cache built from one transaction is refused against a d
     // from still works — this isn't refusing everything.
     _ = try bip143.sighashWith(a, pre1.segwit_v0, t1, 0, &[_]u8{0xAA}, 12345, bip143.ALL);
     _ = try bip341.sighashWith(a, pre1.taproot.?, t1, 0, 0x00, spent1);
+}
+
+test "F12: an IN-PLACE mutation is NOT detected — the documented limit, asserted rather than hidden" {
+    // F12 (2026-08-11 re-audit). This test asserts what the code DOES, which
+    // here is deliberately less than a reader might assume from F11: the
+    // identity fingerprint catches SUBSTITUTION (a `pre` paired with a
+    // different `Transaction` value) and cannot catch MUTATION (the same
+    // slices, edited in place) — pointers and lengths are unchanged, so
+    // `matches` says yes and the caller gets the pre-mutation digest with no
+    // error.
+    //
+    // Recorded as parity, not as a defect: Bitcoin Core's
+    // `PrecomputedTransactionData` has exactly the same property, and the
+    // only check that would see through an in-place edit is a hash of the
+    // transaction's contents — an `O(n)` cost per call, which is precisely
+    // what the cache exists to remove. The disposition is therefore
+    // documentation plus a precondition (see this file's module doc comment,
+    // both `Precomputed` doc comments, README.md and SPEC.md), and this test
+    // is the thing that keeps the documentation honest.
+    //
+    // ⚠ IF THIS TEST FAILS because the binding was strengthened: that is a
+    // behaviour change, and the four places above now say something untrue.
+    // Update them together with this test — do not simply relax it.
+    const a = testing.allocator;
+    const t = try buildTx(a, 3);
+    defer freeTx(a, t);
+    const spent = try a.alloc(tx.TxOut, 3);
+    defer a.free(spent);
+    for (spent, 0..) |*o, i| o.* = .{ .value = @intCast(5000 + i), .script_pubkey = &.{} };
+
+    const pre = try PrecomputedTransactionData.init(a, t, spent);
+
+    const before_v0 = try bip143.sighashWith(a, pre.segwit_v0, t, 0, &[_]u8{0xAA}, 12345, bip143.ALL);
+    const before_tr = try bip341.sighashWith(a, pre.taproot.?, t, 0, 0x00, spent);
+
+    // ── mutation 1: an output value, committed to by both algorithms ──────
+    t.vout[0].value +%= 1;
+
+    const stale_v0 = bip143.sighashWith(a, pre.segwit_v0, t, 0, &[_]u8{0xAA}, 12345, bip143.ALL) catch
+        return error.InPlaceMutationIsNowDetected_UpdateTheDocumentedPrecondition;
+    const stale_tr = bip341.sighashWith(a, pre.taproot.?, t, 0, 0x00, spent) catch
+        return error.InPlaceMutationIsNowDetected_UpdateTheDocumentedPrecondition;
+
+    // Not merely "no error": the digest handed back is the one from BEFORE
+    // the mutation. That is the sharp end of the limit — a caller who signs
+    // this has signed a transaction that no longer exists.
+    try testing.expectEqualSlices(u8, &before_v0, &stale_v0);
+    try testing.expectEqualSlices(u8, &before_tr, &stale_tr);
+
+    // ...and it really is stale, not accidentally equal: the uncached entry
+    // points, which read the transaction as it is now, disagree with it.
+    const fresh_v0 = try bip143.sighash(a, t, 0, &[_]u8{0xAA}, 12345, bip143.ALL);
+    const fresh_tr = try bip341.sighash(a, t, 0, 0x00, spent);
+    try testing.expect(!std.mem.eql(u8, &stale_v0, &fresh_v0));
+    try testing.expect(!std.mem.eql(u8, &stale_tr, &fresh_tr));
+
+    // Rebuilding is the documented remedy, and it works.
+    const rebuilt = try PrecomputedTransactionData.init(a, t, spent);
+    const rebuilt_v0 = try bip143.sighashWith(a, rebuilt.segwit_v0, t, 0, &[_]u8{0xAA}, 12345, bip143.ALL);
+    const rebuilt_tr = try bip341.sighashWith(a, rebuilt.taproot.?, t, 0, 0x00, spent);
+    try testing.expectEqualSlices(u8, &fresh_v0, &rebuilt_v0);
+    try testing.expectEqualSlices(u8, &fresh_tr, &rebuilt_tr);
+
+    // ── mutation 2: a SPENT OUTPUT, which only BIP341 commits to ──────────
+    // The precondition names the spent outputs as well as the transaction,
+    // so it is pinned separately: `spent` is a distinct allocation from the
+    // transaction, with its own pointer in the fingerprint.
+    const tr_before_spent_edit = try bip341.sighashWith(a, rebuilt.taproot.?, t, 0, 0x00, spent);
+    spent[0].value +%= 1;
+    const tr_stale = bip341.sighashWith(a, rebuilt.taproot.?, t, 0, 0x00, spent) catch
+        return error.InPlaceMutationIsNowDetected_UpdateTheDocumentedPrecondition;
+    try testing.expectEqualSlices(u8, &tr_before_spent_edit, &tr_stale);
+    const tr_fresh = try bip341.sighash(a, t, 0, 0x00, spent);
+    try testing.expect(!std.mem.eql(u8, &tr_stale, &tr_fresh));
 }

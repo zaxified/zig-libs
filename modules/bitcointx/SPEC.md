@@ -32,7 +32,14 @@ provides. Five files:
   construction — the `hash_type`-dependent selection over the commitment hashes lives in one place
   per algorithm and both routes share it — and pinned as such by a test over every hash type and
   every input. Complexity is guarded by a deterministic counter of commitment-hash computations
-  (`instrument.zig`), not a stopwatch.
+  (`instrument.zig`), not a stopwatch. **Caller precondition: `pre` is invalidated by any mutation
+  of the transaction or its spent outputs; the fingerprint detects substitution only.** The `*With`
+  entry points carry an O(1) identity fingerprint (`vin`/`vout`/`spent_outputs` pointers and
+  lengths) that refuses a `pre` paired with a different transaction, but an in-place edit through
+  those same slices is invisible to it and yields the pre-edit digest with no error — parity with
+  Bitcoin Core's struct, which carries no check at all. A content hash would catch it and would
+  cost per call exactly the `O(n)` this cache exists to remove, so the limit is documented and
+  asserted (the F12 test) rather than engineered away.
 - `instrument.zig` — that counter. `builtin.is_test`-gated, so it is `void` and compiles away
   entirely outside a test build.
 

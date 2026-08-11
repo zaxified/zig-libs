@@ -206,6 +206,14 @@ pub const Precomputed = struct {
     /// slice pointers and lengths, not a content hash. See
     /// `bip143.Precomputed`'s doc comment for why this is O(1) by design
     /// rather than a re-hash, and what class of mismatch it catches.
+    ///
+    /// ⚠ F12 (2026-08-11 re-audit): **`pre` is invalidated by any mutation
+    /// of the transaction or its spent outputs; the fingerprint detects
+    /// substitution only.** BIP341 commits to every input's spent amount and
+    /// scriptPubKey, so mutating `spent_outputs[i].value` in place is as
+    /// invalidating as mutating the transaction — and equally invisible
+    /// here, since the slice pointer and length are unchanged. Rebuild after
+    /// every change (parity with Core; see `precomputed.zig`).
     vin_ptr: [*]const tx.TxIn,
     vin_len: usize,
     vout_ptr: [*]const tx.TxOut,
