@@ -208,6 +208,15 @@ pub const Storage = struct {
         preadRef: ?*const fn (ctx: *anyopaque, h: Handle, len: usize, off: u64) Error!?Ref = null,
         /// Hand a `Ref` back. Must be non-null whenever `preadRef` is.
         releaseRef: ?*const fn (ctx: *anyopaque, ref: Ref) void = null,
+
+        /// Self-check for a backend author: true iff `preadRef` and
+        /// `releaseRef` are either both set or both null. `Storage.releaseRef`
+        /// panics at the first borrow release if this is false — call this
+        /// (e.g. in a test that builds your vtable) to catch the mistake at
+        /// the vtable's own construction instead of at first use.
+        pub fn consistent(vt: VTable) bool {
+            return (vt.preadRef == null) == (vt.releaseRef == null);
+        }
     };
 
     pub fn open(s: Storage, path: []const u8, mode: OpenMode) Error!Handle {
@@ -249,10 +258,19 @@ pub const Storage = struct {
     }
 
     /// Return a borrow taken with `preadRef`.
+    ///
+    /// Precondition: `s.vtable.releaseRef` is non-null whenever
+    /// `s.vtable.preadRef` is (see the field doc comments on `VTable`, and
+    /// `VTable.consistent` for a self-check backend authors can call). A
+    /// backend that violates this — sets `preadRef` but not `releaseRef` —
+    /// is a construction bug in that backend, not a caller error, so this
+    /// panics with a message that names the actual problem instead of an
+    /// opaque null-unwrap.
     pub fn releaseRef(s: Storage, ref: Ref) void {
-        // Unreachable unless a backend set `preadRef` without `releaseRef`,
-        // which its own construction forbids.
-        const f = s.vtable.releaseRef.?;
+        const f = s.vtable.releaseRef orelse std.debug.panic(
+            "kv.Storage.VTable contract violation: preadRef is set but releaseRef is null",
+            .{},
+        );
         f(s.ctx, ref);
     }
 
@@ -1519,6 +1537,110 @@ test "FsStorage: the default handle table holds more than one store's worth of f
         h.* = try st.open(name, .open_or_create);
     }
     for (handles) |h| st.close(h);
+}
+
+test "FsStorage: the default handle table is exactly 64, not merely at least 8" {
+    // F3 (2026-08-11 re-audit): the test above pins an honest but INDEPENDENT
+    // floor of 8 ("four two-handle stores"), which is a lower bound only —
+    // any `default_max_handles` in `[8, 16)` passes it too. That leaves the
+    // actual delivered literal, 64 (chosen headroom above the 8-handle floor
+    // for "a handful of stores over one backend", see the doc comment on
+    // `default_max_handles`), pinned by nothing. This test writes the literal
+    // 64 directly — not `default_max_handles` — so a change to the constant
+    // moves this number out from under the test instead of moving with it.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    const st = fs_store.storage();
+
+    var handles: [64]Storage.Handle = undefined;
+    for (&handles, 0..) |*h, i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "h{d}.bin", .{i});
+        h.* = try st.open(name, .open_or_create);
+    }
+    // The 65th handle is refused: the table is 64 wide, not 65 or unbounded.
+    try testing.expectError(error.HandleTableFull, st.open("h64.bin", .open_or_create));
+    for (handles) |h| st.close(h);
+}
+
+test "Storage.VTable.consistent: catches a backend that sets preadRef without releaseRef" {
+    // F3's sibling gap: `Storage.releaseRef` did an unchecked `s.vtable.releaseRef.?`,
+    // which panics for a backend that sets `preadRef` without `releaseRef`, with
+    // nothing pinning the precondition. `releaseRef` now panics with a named
+    // message instead of an opaque unwrap (see its doc comment); this test
+    // pins the self-check a backend author is pointed at to catch the mistake
+    // before it reaches `releaseRef` at all.
+    const Stub = struct {
+        fn open(_: *anyopaque, _: []const u8, _: Storage.OpenMode) Storage.Error!Storage.Handle {
+            unreachable;
+        }
+        fn size(_: *anyopaque, _: Storage.Handle) Storage.Error!u64 {
+            unreachable;
+        }
+        fn pread(_: *anyopaque, _: Storage.Handle, _: []u8, _: u64) Storage.Error!usize {
+            unreachable;
+        }
+        fn writeAll(_: *anyopaque, _: Storage.Handle, _: []const u8, _: u64) Storage.Error!void {
+            unreachable;
+        }
+        fn sync(_: *anyopaque, _: Storage.Handle) Storage.Error!void {
+            unreachable;
+        }
+        fn truncate(_: *anyopaque, _: Storage.Handle, _: u64) Storage.Error!void {
+            unreachable;
+        }
+        fn close(_: *anyopaque, _: Storage.Handle) void {
+            unreachable;
+        }
+        fn rename(_: *anyopaque, _: []const u8, _: []const u8) Storage.Error!void {
+            unreachable;
+        }
+        fn delete(_: *anyopaque, _: []const u8) Storage.Error!void {
+            unreachable;
+        }
+        fn syncDir(_: *anyopaque) Storage.Error!void {
+            unreachable;
+        }
+        fn tryLockExclusive(_: *anyopaque, _: Storage.Handle) Storage.Error!bool {
+            unreachable;
+        }
+        fn preadRef(_: *anyopaque, _: Storage.Handle, _: usize, _: u64) Storage.Error!?Storage.Ref {
+            unreachable;
+        }
+        fn releaseRef(_: *anyopaque, _: Storage.Ref) void {
+            unreachable;
+        }
+    };
+    const base = Storage.VTable{
+        .open = Stub.open,
+        .size = Stub.size,
+        .pread = Stub.pread,
+        .writeAll = Stub.writeAll,
+        .sync = Stub.sync,
+        .truncate = Stub.truncate,
+        .close = Stub.close,
+        .rename = Stub.rename,
+        .delete = Stub.delete,
+        .syncDir = Stub.syncDir,
+        .tryLockExclusive = Stub.tryLockExclusive,
+    };
+
+    // Neither set: consistent (this is what every real backend in this repo
+    // does today — none implements the borrow seam yet).
+    try testing.expect(base.consistent());
+
+    // Both set: consistent.
+    var both = base;
+    both.preadRef = Stub.preadRef;
+    both.releaseRef = Stub.releaseRef;
+    try testing.expect(both.consistent());
+
+    // preadRef set, releaseRef missing: the exact defect F3 named — caught
+    // here rather than surfacing as a panic the first time a ref is released.
+    var bad = base;
+    bad.preadRef = Stub.preadRef;
+    try testing.expect(!bad.consistent());
 }
 
 test "real filesystem: torn tail on disk is recovered" {

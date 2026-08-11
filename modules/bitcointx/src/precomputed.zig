@@ -216,3 +216,49 @@ test "precomputed: taproot half is optional, and a bad spent-outputs count is re
     const too_few = [_]tx.TxOut{.{ .value = 1, .script_pubkey = &.{} }};
     try testing.expectError(error.PrevoutsCountMismatch, PrecomputedTransactionData.init(a, t, &too_few));
 }
+
+test "F11: a precomputed cache built from one transaction is refused against a different one" {
+    // F11 (2026-08-11 re-audit): `pre` and `transaction` used to be two
+    // independent arguments with no correspondence check — a caller that
+    // hoisted `pre` for one transaction and then called `sighashWith` with a
+    // DIFFERENT transaction got a silently wrong consensus digest, no error,
+    // no assert. `fuzzSighash` (root.zig) structurally could not find this
+    // class, since it always builds `pre` from the same `t` it passes on
+    // (see the test right after this one, which closes that gap too).
+    const a = testing.allocator;
+    const t1 = try buildTx(a, 3);
+    defer freeTx(a, t1);
+    const t2 = try buildTx(a, 3); // same shape, DIFFERENT backing allocation
+    defer freeTx(a, t2);
+    const spent1 = try a.alloc(tx.TxOut, 3);
+    defer a.free(spent1);
+    for (spent1, 0..) |*o, i| o.* = .{ .value = @intCast(5000 + i), .script_pubkey = &.{} };
+    const spent2 = try a.alloc(tx.TxOut, 3);
+    defer a.free(spent2);
+    for (spent2, 0..) |*o, i| o.* = .{ .value = @intCast(5000 + i), .script_pubkey = &.{} };
+
+    const pre1 = try PrecomputedTransactionData.init(a, t1, spent1);
+
+    // bip143: pre from t1, transaction argument is t2.
+    try testing.expectError(
+        error.PrecomputedMismatch,
+        bip143.sighashWith(a, pre1.segwit_v0, t2, 0, &[_]u8{0xAA}, 12345, bip143.ALL),
+    );
+    // bip341: pre from t1 (built with spent1), transaction argument is t2.
+    try testing.expectError(
+        error.PrecomputedMismatch,
+        bip341.sighashWith(a, pre1.taproot.?, t2, 0, 0x00, spent1),
+    );
+    // bip341: pre from t1, right transaction but a DIFFERENT spent_outputs —
+    // BIP341 commits to the spent outputs too, so a mismatch there is the
+    // same class of bug.
+    try testing.expectError(
+        error.PrecomputedMismatch,
+        bip341.sighashWith(a, pre1.taproot.?, t1, 0, 0x00, spent2),
+    );
+
+    // Sanity: the SAME transaction and spent_outputs the cache was built
+    // from still works — this isn't refusing everything.
+    _ = try bip143.sighashWith(a, pre1.segwit_v0, t1, 0, &[_]u8{0xAA}, 12345, bip143.ALL);
+    _ = try bip341.sighashWith(a, pre1.taproot.?, t1, 0, 0x00, spent1);
+}

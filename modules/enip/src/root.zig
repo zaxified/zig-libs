@@ -971,8 +971,23 @@ test "fuzz: the adapter never panics on arbitrary messages" {
     try std.testing.fuzz({}, fuzzAdapter, .{});
 }
 
+// F6 (2026-08-11 re-audit): `Config.max_reply`'s default (4000) used to be
+// structurally unreachable from `fuzzAdapter` — `out` was `[2048]u8`, smaller
+// than the default, so `@min(cfg.max_reply, out.len)` had `out.len` as the
+// binding term on every single run, no matter what bytes were generated. Both
+// sizes below exist so that is no longer categorically true: `fuzz_out_len`
+// is bigger than the shipped default so `max_reply` *can* be the binding
+// term, and `fuzz_scada_len` is bigger than the body room that leaves
+// (`max_reply - 8`) so a full read of it *can* exceed that room. See the
+// deterministic test below, which proves (rather than hopes) the cap fires
+// under this exact shape — a random byte fuzzer essentially never lands a
+// specific service + path + oversized count by chance (the same "weighted
+// branch" reachability gap the campaign has documented elsewhere).
+const fuzz_scada_len = 4200;
+const fuzz_out_len = 8192;
+
 fn fuzzAdapter(_: void, smith: *std.testing.Smith) !void {
-    var scada: [32]u8 = @splat(0);
+    var scada: [fuzz_scada_len]u8 = @splat(0);
     var dint: [16]u8 = @splat(0);
     var real: [16]u8 = @splat(0);
     var tags = testTags(&scada, &dint, &real);
@@ -984,12 +999,60 @@ fn fuzzAdapter(_: void, smith: *std.testing.Smith) !void {
     var input: [1024]u8 = undefined;
     smith.bytes(&input);
     const len: usize = smith.valueRangeAtMost(u16, 0, input.len);
-    var out: [2048]u8 = undefined;
+    var out: [fuzz_out_len]u8 = undefined;
     const reply = target.handle(input[0..len], &out) catch return;
     const r = reply orelse return;
     // Anything the adapter emits must itself be a legal message.
     const msg = try encap.decode(r);
     try testing.expectEqual(r.len, msg.total_len);
+}
+
+/// Builds the CIP `Read Tag Fragmented` request bytes `Client.readTagFragmented`
+/// would send for round 0 (offset 0), without needing a live `Client`/transport
+/// round trip — the same low-level building blocks `messageRouter` itself
+/// consumes.
+fn readTagFragmentedRequest(name: []const u8, count: u16, out: []u8) ![]const u8 {
+    var path_buf: [256]u8 = undefined;
+    const path = try tagpath.encodePath(name, &path_buf);
+    var data_buf: [6]u8 = undefined;
+    const data = try (types.ReadTagFragmentedRequest{ .count = count, .byte_offset = 0 }).encode(&data_buf);
+    return (cip.Request{
+        .service = cip.LogixService.read_tag_fragmented,
+        .path = path,
+        .data = data,
+    }).encode(out);
+}
+
+test "F6: the SHIPPED default max_reply (Config omits it) actually binds under the exact shape fuzzAdapter now uses" {
+    // Half 1 of F6: pins the literal 4000 (as `4000 - 8 = 3992`, the body
+    // room `readTag`'s `-| 8` encapsulation-header accounting leaves) rather
+    // than `cfg.max_reply` or `cfg.max_reply - 8`, so a change to the
+    // constant moves this number out from under the test.
+    //
+    // Half 2 of F6: proves — by direct construction, not by sampling — that
+    // the cap is reachable under `fuzz_scada_len`/`fuzz_out_len`, the exact
+    // shape `fuzzAdapter` now uses. `readTagFragmentedRequest` builds the same
+    // bytes `Client.readTagFragmented`'s round 0 would put on the wire.
+    var scada: [fuzz_scada_len]u8 = undefined;
+    for (&scada, 0..) |*b, i| b.* = @intCast(i % 251);
+    var dint: [16]u8 = @splat(0);
+    var real: [16]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags); // max_reply NOT set: the shipped default.
+
+    // SCADA is `.int` (2-byte elements); ask for more than fits in one reply.
+    var req_buf: [512]u8 = undefined;
+    const req = try readTagFragmentedRequest("SCADA[0]", fuzz_scada_len / 2, &req_buf);
+
+    var out: [fuzz_out_len]u8 = undefined; // > 4000, so max_reply is the binding term.
+    const reply = try cip.Reply.decode(try target.messageRouter(req, &out));
+    try testing.expectEqual(cip.GeneralStatus.partial_transfer, reply.general_status);
+    const td = try types.TagData.decode(reply.data);
+    // The literal: 4000 (max_reply) - 8 (encap header accounting) = 3992 is
+    // the most data any single reply can carry by default — not "however
+    // much max_reply happens to allow".
+    try testing.expectEqual(@as(usize, 3992), td.data.len);
+    try testing.expectEqualSlices(u8, scada[0..3992], td.data);
 }
 
 test "fuzz: a client survives an arbitrary reply without panicking" {

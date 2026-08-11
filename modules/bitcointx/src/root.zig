@@ -137,6 +137,34 @@ test "fuzz: every decoded transaction through legacy/BIP143/BIP341 sighash" {
     try std.testing.fuzz({}, fuzzSighash, .{ .corpus = sighash_seeds });
 }
 
+/// F11 (2026-08-11 re-audit): a same-shape clone of `t` with an
+/// INDEPENDENT `vin`/`vout` backing allocation, so `PrecomputedTransactionData`
+/// built from `t` never structurally matches it — pairing `t.clone()` with
+/// `t`'s cache is exactly the class of caller mistake F11 named. `witness`
+/// is shared with `t` deliberately (not duplicated): the clone is never
+/// `deinit`'d, only `.free`'d, so there is no double-free.
+const ClonedVinVout = struct {
+    tx: Transaction,
+    fn free(self: *ClonedVinVout, allocator: std.mem.Allocator) void {
+        allocator.free(self.tx.vin);
+        allocator.free(self.tx.vout);
+    }
+};
+
+fn cloneVinVout(allocator: std.mem.Allocator, t: Transaction) !ClonedVinVout {
+    const vin = try allocator.dupe(TxIn, t.vin);
+    errdefer allocator.free(vin);
+    const vout = try allocator.dupe(TxOut, t.vout);
+    return .{ .tx = .{
+        .version = t.version,
+        .vin = vin,
+        .vout = vout,
+        .witness = t.witness,
+        .locktime = t.locktime,
+        .has_witness = t.has_witness,
+    } };
+}
+
 fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
     const a = std.testing.allocator;
     var buf: [256]u8 = undefined;
@@ -179,6 +207,21 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
         const h2 = bip143.sighashWith(a, pre, t, idx, script, amount, ht32) catch
             return error.PrecomputedSeamRefusedAnAcceptedInput;
         if (!std.mem.eql(u8, &h, &h2)) return error.Bip143PrecomputedDiverged;
+
+        // F11 (2026-08-11 re-audit): this harness used to ALWAYS pair `pre`
+        // with the exact `t` it was built from, so it could not reach the
+        // mismatched-pair defect class no matter how long it ran. Half the
+        // draws now build a same-shape clone with an independent backing
+        // allocation and pair it with `pre` on purpose, asserting the
+        // refusal fires rather than a wrong digest or a crash.
+        if (smith.value(bool)) {
+            var clone = try cloneVinVout(a, t);
+            defer clone.free(a);
+            try std.testing.expectError(
+                error.PrecomputedMismatch,
+                bip143.sighashWith(a, pre, clone.tx, idx, script, amount, ht32),
+            );
+        }
     } else |_| {}
 
     // BIP341 commits to every spent output, so it needs one per input.
@@ -200,6 +243,26 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
             const h2 = bip341.sighashWith(a, pre, t, idx, ht8, outs) catch
                 return error.PrecomputedSeamRefusedAnAcceptedInput;
             if (!std.mem.eql(u8, &h, &h2)) return error.Bip341PrecomputedDiverged;
+
+            // F11: same coverage as the bip143 branch above, and additionally
+            // covers the `spent_outputs` half of the identity — the same
+            // transaction, but a differently-allocated `spent_outputs`.
+            if (smith.value(bool)) {
+                var clone = try cloneVinVout(a, t);
+                defer clone.free(a);
+                try std.testing.expectError(
+                    error.PrecomputedMismatch,
+                    bip341.sighashWith(a, pre, clone.tx, idx, ht8, outs),
+                );
+            }
+            if (smith.value(bool)) {
+                var outs2: [8]TxOut = undefined;
+                @memcpy(outs2[0..outs.len], outs);
+                try std.testing.expectError(
+                    error.PrecomputedMismatch,
+                    bip341.sighashWith(a, pre, t, idx, ht8, outs2[0..outs.len]),
+                );
+            }
         } else |_| {}
     }
 }

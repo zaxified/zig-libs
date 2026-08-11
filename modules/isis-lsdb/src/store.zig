@@ -1670,6 +1670,41 @@ test "request placeholders are not immortal: they time out and return their slot
     try testing.expectEqual(@as(usize, 4), db.count());
 }
 
+test "request placeholders: the SHIPPED default timeout (Config omits request_timeout) is 60, not just 'the configured value'" {
+    // F9 (2026-08-11 re-audit): the test above sets `.request_timeout = 60`
+    // explicitly in its own `Config`, so it re-asserts its own literal and
+    // never touches the shipped default. This test omits the field —
+    // exercising `Config.request_timeout`'s default (`default_request_timeout`)
+    // — and writes the boundary as the literal 60 directly, so a change to
+    // the constant moves these numbers out from under the test instead of
+    // moving with it.
+    var db = Lsdb.init(testing.allocator, .{
+        .local_system_id = sys_local,
+        .interface_count = 2,
+        .capacity = 8,
+        .request_capacity = 4,
+        // request_timeout: deliberately NOT set — this is the point.
+    });
+    defer db.deinit();
+
+    var cbuf: [512]u8 = undefined;
+    const entries = fabricatedEntries(4);
+    const csnp = try isis.Csnp.decode(buildCsnp(&cbuf, &entries));
+    db.reconcileCsnp(csnp, 1, 0);
+    try testing.expectEqual(@as(usize, 4), db.count());
+
+    // Just inside the shipped default window: still requested.
+    const r1 = db.tick(59);
+    try testing.expectEqual(@as(usize, 0), r1.requests_expired);
+    try testing.expectEqual(@as(usize, 4), db.count());
+
+    // At the shipped default window: dropped.
+    const r2 = db.tick(60);
+    try testing.expectEqual(@as(usize, 4), r2.requests_expired);
+    try testing.expectEqual(@as(usize, 0), r2.removed);
+    try testing.expectEqual(@as(usize, 0), db.count());
+}
+
 test "own LSP (§7.3.16.1): a peer's purge of our self-originated LSP is refused" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8, .zero_age_lifetime = 60 });
     defer db.deinit();

@@ -29,7 +29,14 @@ pub const NONE = hashtype.NONE;
 pub const SINGLE = hashtype.SINGLE;
 pub const ANYONECANPAY = hashtype.ANYONECANPAY;
 
-pub const Bip143Error = error{InputIndexOutOfRange} || Allocator.Error;
+pub const Bip143Error = error{
+    InputIndexOutOfRange,
+    /// F11 (2026-08-11 re-audit): `pre` was computed from a different
+    /// `Transaction` than the one passed alongside it — see `Precomputed`'s
+    /// doc comment. Refused rather than silently mixing another
+    /// transaction's cached commitment hashes into this one's preimage.
+    PrecomputedMismatch,
+} || Allocator.Error;
 
 pub const Midstates = struct {
     hash_prevouts: [32]u8,
@@ -133,6 +140,34 @@ pub const Precomputed = struct {
     hash_prevouts: [32]u8,
     hash_sequence: [32]u8,
     hash_outputs: [32]u8,
+    /// F11 (2026-08-11 re-audit): a cheap **identity fingerprint** of the
+    /// `Transaction` these hashes were computed from — `precompute`'s
+    /// `transaction.vin`/`.vout` slice pointers and lengths, not a hash of
+    /// their contents. `selectMidstates` compares it against the
+    /// `transaction` argument passed in alongside `pre` (`midstatesFrom`/
+    /// `preimageWith`/`sighashWith`) and refuses with
+    /// `error.PrecomputedMismatch` on a mismatch, rather than silently
+    /// mixing one transaction's cached commitment hashes into another's
+    /// preimage. Deliberately O(1): re-hashing the transaction to check
+    /// would reintroduce the exact per-call `O(n)` cost this cache exists to
+    /// eliminate, so this catches "wrong `Transaction` value entirely" (a
+    /// hoisted `pre` reused across transactions, e.g. from a pool) rather
+    /// than "a different transaction that happens to occupy identical
+    /// backing storage" — the class the fuzz harness could actually produce
+    /// once it stopped only ever pairing `pre` with the tx it was built
+    /// from. Bitcoin Core's own `PrecomputedTransactionData` carries no
+    /// such check at all (correspondence is the caller's responsibility);
+    /// this is deliberately stricter than parity, not a correctness
+    /// requirement BIP143 itself imposes.
+    vin_ptr: [*]const tx.TxIn,
+    vin_len: usize,
+    vout_ptr: [*]const tx.TxOut,
+    vout_len: usize,
+
+    fn matches(self: Precomputed, transaction: tx.Transaction) bool {
+        return self.vin_ptr == transaction.vin.ptr and self.vin_len == transaction.vin.len and
+            self.vout_ptr == transaction.vout.ptr and self.vout_len == transaction.vout.len;
+    }
 };
 
 /// Compute the per-transaction commitment hashes once. Cost is `O(n)` in
@@ -142,6 +177,10 @@ pub fn precompute(allocator: Allocator, transaction: tx.Transaction) Allocator.E
         .hash_prevouts = try hashPrevouts(allocator, transaction),
         .hash_sequence = try hashSequence(allocator, transaction),
         .hash_outputs = try hashOutputs(allocator, transaction),
+        .vin_ptr = transaction.vin.ptr,
+        .vin_len = transaction.vin.len,
+        .vout_ptr = transaction.vout.ptr,
+        .vout_len = transaction.vout.len,
     };
 }
 
@@ -156,6 +195,7 @@ fn selectMidstates(
     hash_type: u32,
     pre: ?Precomputed,
 ) Bip143Error!Midstates {
+    if (pre) |p| if (!p.matches(transaction)) return error.PrecomputedMismatch;
     if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
     const base = hashtype.baseType(hash_type);
     const anyone_can_pay = hashtype.isAnyoneCanPay(hash_type);

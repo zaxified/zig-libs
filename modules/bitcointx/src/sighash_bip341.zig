@@ -69,6 +69,11 @@ pub const Bip341Error = error{
     /// Not one of the 7 values BIP341 defines
     /// (`{0x00,0x01,0x02,0x03,0x81,0x82,0x83}`).
     InvalidHashType,
+    /// F11 (2026-08-11 re-audit): `pre` was computed from a different
+    /// `Transaction` than the one passed alongside it — see `Precomputed`'s
+    /// doc comment. Refused rather than silently mixing another
+    /// transaction's cached commitment hashes into this one's sig message.
+    PrecomputedMismatch,
 } || Allocator.Error;
 
 pub fn validateHashType(hash_type: u8) Bip341Error!void {
@@ -196,6 +201,23 @@ pub const Precomputed = struct {
     sha_scriptpubkeys: [32]u8,
     sha_sequences: [32]u8,
     sha_outputs: [32]u8,
+    /// F11 (2026-08-11 re-audit): a cheap **identity fingerprint** of the
+    /// `Transaction` (and `spent_outputs`) these hashes were computed from —
+    /// slice pointers and lengths, not a content hash. See
+    /// `bip143.Precomputed`'s doc comment for why this is O(1) by design
+    /// rather than a re-hash, and what class of mismatch it catches.
+    vin_ptr: [*]const tx.TxIn,
+    vin_len: usize,
+    vout_ptr: [*]const tx.TxOut,
+    vout_len: usize,
+    spent_outputs_ptr: [*]const tx.TxOut,
+    spent_outputs_len: usize,
+
+    fn matches(self: Precomputed, transaction: tx.Transaction, spent_outputs: []const tx.TxOut) bool {
+        return self.vin_ptr == transaction.vin.ptr and self.vin_len == transaction.vin.len and
+            self.vout_ptr == transaction.vout.ptr and self.vout_len == transaction.vout.len and
+            self.spent_outputs_ptr == spent_outputs.ptr and self.spent_outputs_len == spent_outputs.len;
+    }
 };
 
 /// Compute the five per-transaction commitment hashes once. `spent_outputs`
@@ -213,6 +235,12 @@ pub fn precompute(
         .sha_scriptpubkeys = try shaScriptPubkeys(allocator, spent_outputs),
         .sha_sequences = try shaSequences(allocator, transaction),
         .sha_outputs = try shaOutputs(allocator, transaction),
+        .vin_ptr = transaction.vin.ptr,
+        .vin_len = transaction.vin.len,
+        .vout_ptr = transaction.vout.ptr,
+        .vout_len = transaction.vout.len,
+        .spent_outputs_ptr = spent_outputs.ptr,
+        .spent_outputs_len = spent_outputs.len,
     };
 }
 
@@ -251,6 +279,7 @@ fn buildCommonSigMsg(
     pre: ?Precomputed,
 ) Bip341Error![]u8 {
     try validateHashType(hash_type);
+    if (pre) |p| if (!p.matches(transaction, spent_outputs)) return error.PrecomputedMismatch;
     if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
     if (spent_outputs.len != transaction.vin.len) return error.PrevoutsCountMismatch;
 

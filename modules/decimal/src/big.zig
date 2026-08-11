@@ -1082,6 +1082,32 @@ test "parse — literal exponent overflow is a clean error, not a trap" {
     try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e99999999999999999999"));
 }
 
+test "add: max_align_shift is exactly 1_000_000, not merely 'the configured value' (F4)" {
+    // F4 (2026-08-11 re-audit): `max_align_shift` is the module's only DoS
+    // guard on the exponent-alignment path, reachable straight from `parse`
+    // (a hostile/typo'd exponent needs no other gate before it drives `add`),
+    // and nothing referenced the delivered literal — a 9x raise to
+    // `9_000_000` passed `test-decimal` clean. This test writes the boundary
+    // as literals (1_000_000 / 1_000_001), not `BigDecimal.max_align_shift`,
+    // so a change to the constant moves these numbers out from under the
+    // test instead of moving with it.
+    var a = try BigDecimal.parse(talloc, "1E1000000"); // exponent = 1_000_000
+    defer a.deinit();
+    var b = try BigDecimal.parse(talloc, "1"); // exponent = 0
+    defer b.deinit();
+
+    // Exactly at the ceiling: succeeds (the guard, not merely the constant,
+    // must let this through — see the M1 mutation note in the audit log).
+    var sum = try BigDecimal.add(talloc, a, b);
+    defer sum.deinit();
+
+    var a2 = try BigDecimal.parse(talloc, "1E1000001"); // exponent = 1_000_001
+    defer a2.deinit();
+    // One past the ceiling: refused before any 10^1_000_001 integer is
+    // materialised, not silently allowed through.
+    try testing.expectError(error.Overflow, BigDecimal.add(talloc, a2, b));
+}
+
 test "isZero, negate, absVal" {
     var z = dec("0");
     defer z.deinit();
@@ -1520,6 +1546,44 @@ test "sqrt — errors and the correctly-rounded contract" {
     defer cr.deinit();
     try expectStr(cr, "1.0000");
     try testing.expectEqual(@as(u32, 5), try cr.precision(talloc));
+}
+
+test "sqrt — the five directed rounding modes are observable without a tie (F3)" {
+    // F3 (2026-08-11 re-audit): `sqrt.vec`'s rounding column is 3203
+    // `half_even` + 65 `half_up` vectors, but a sqrt tie is essentially
+    // unreachable (the true root would need to terminate in `5·10^(drop-1)`),
+    // so every one of those vectors lands where the choice makes no
+    // difference — forcing `half_up` to behave as `half_even` inside `sqrt`
+    // passed the whole `test-decimal` suite clean. The five DIRECTED modes
+    // (`up`/`down`/`ceiling`/`floor`/`half_down`), by contrast, ARE
+    // observable in `sqrt` without any tie, and had zero vectors and zero
+    // local tests before this. This pins all five at once, at the exact
+    // boundary the audit's own evidence cites.
+    //
+    // sqrt(2) = 1.41421356237309504880... — at 9 significant digits the next
+    // (10th) digit is 2 (< 5, not a tie): `down`/`floor` truncate toward
+    // zero, `up`/`ceiling` round away from zero, and `half_down` agrees with
+    // `down` since the discarded digit is unambiguously below the halfway
+    // point. `sqrt`'s result is never negative, so `ceiling`≡`up` and
+    // `floor`≡`down` here by construction — not a redundant check, since it
+    // pins that `roundBump`'s `result_neg` branch is fed `false` correctly
+    // for a `sqrt` result rather than left at some other default.
+    var two = dec("2");
+    defer two.deinit();
+
+    const Case = struct { mode: RoundingMode, want: []const u8 };
+    const cases = [_]Case{
+        .{ .mode = .down, .want = "1.41421356" },
+        .{ .mode = .floor, .want = "1.41421356" },
+        .{ .mode = .half_down, .want = "1.41421356" },
+        .{ .mode = .up, .want = "1.41421357" },
+        .{ .mode = .ceiling, .want = "1.41421357" },
+    };
+    for (cases) |c| {
+        var r = try BigDecimal.sqrt(talloc, two, 9, c.mode);
+        defer r.deinit();
+        try expectStr(r, c.want);
+    }
 }
 
 test "pow — exact, and the digit budget refuses before it allocates" {
