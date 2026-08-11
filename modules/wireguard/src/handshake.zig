@@ -1733,6 +1733,30 @@ fn runCmd(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !u8 {
     };
 }
 
+/// Print an external command's output; `false` when it could not be spawned.
+/// Diagnostics only, on a failure path — a failing diagnostic must never
+/// replace the real error, so this reports and returns rather than failing.
+fn dumpCmd(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
+    const res = std.process.run(gpa, io, .{ .argv = argv }) catch return false;
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+    std.debug.print("  --- ", .{});
+    for (argv) |a| std.debug.print("{s} ", .{a});
+    std.debug.print("---\n{s}{s}", .{ res.stdout, res.stderr });
+    return true;
+}
+
+/// The netfilter ruleset, which is the first thing an EPERM from `sendto`
+/// asks about. `nft` usually lives in sbin, which spawn's PATH lookup may not
+/// cover — `modules/nftables` carries the same candidate list for the same
+/// reason.
+fn dumpRuleset(gpa: std.mem.Allocator, io: std.Io) void {
+    for ([_][]const u8{ "nft", "/usr/sbin/nft", "/sbin/nft" }) |argv0| {
+        if (dumpCmd(gpa, io, &.{ argv0, "list", "ruleset" })) return;
+    }
+    std.debug.print("  (no nft binary — netfilter state unknown)\n", .{});
+}
+
 /// Wall-clock seconds for the live interop test — the one place in this module
 /// that needs a real clock, and it is a *test harness*, which is exactly the
 /// role `transport.zig` assigns to the caller. Product code here never reads a
@@ -1849,6 +1873,43 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                     @ptrCast(&src),
                     src_len_const,
                 );
+                // A blink here is expensive to diagnose after the fact: the
+                // errno alone cannot tell a netfilter LOCAL_OUT/POSTROUTING
+                // drop (which the kernel reports as EPERM) from a cgroup BPF
+                // egress program (also EPERM, and orthogonal to the network
+                // namespace) from a malformed destination. Print what
+                // separates them, so one future occurrence is conclusive
+                // instead of costing another reproduction campaign.
+                if (linux.errno(wrc) != .SUCCESS) {
+                    var self_addr: linux.sockaddr.in = undefined;
+                    var self_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+                    const gs = linux.getsockname(fd, @ptrCast(&self_addr), &self_len);
+                    std.debug.print(
+                        "\nwireguard live interop: sendto failed\n" ++
+                            "  errno={s} ret={d}\n" ++
+                            "  dst: family={d} addr=0x{x:0>8} port={d} (addrlen={d}, sizeof(sockaddr_in)={d})\n" ++
+                            "  src: family={d} addr=0x{x:0>8} port={d} (getsockname errno={s})\n" ++
+                            "  cgroup: ",
+                        .{
+                            @tagName(linux.errno(wrc)),
+                            @as(isize, @bitCast(wrc)),
+                            src.family,
+                            std.mem.bigToNative(u32, src.addr),
+                            std.mem.bigToNative(u16, src.port),
+                            src_len_const,
+                            @sizeOf(linux.sockaddr.in),
+                            self_addr.family,
+                            std.mem.bigToNative(u32, self_addr.addr),
+                            std.mem.bigToNative(u16, self_addr.port),
+                            @tagName(linux.errno(gs)),
+                        },
+                    );
+                    _ = dumpCmd(gpa, io, &.{ "cat", "/proc/self/cgroup" });
+                    dumpRuleset(gpa, io);
+                    _ = dumpCmd(gpa, io, &.{ "ip", "-o", "addr" });
+                    _ = dumpCmd(gpa, io, &.{ "ip", "-o", "link" });
+                    _ = dumpCmd(gpa, io, &.{ "ip", "route", "show", "table", "all" });
+                }
                 try testing.expectEqual(.SUCCESS, linux.errno(wrc));
                 try testing.expectEqual(@sizeOf(MessageResponse), wrc);
             },

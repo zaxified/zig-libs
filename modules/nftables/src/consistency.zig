@@ -362,7 +362,19 @@ fn buildJson(rs: *root.Ruleset) !void {
     try rh.ret().apply();
 
     var rp1 = rs.rule(.inet, table_name, post_chain);
-    try rp1.masquerade().apply();
+    // Qualified by `oifname` on purpose, exactly as the module's own golden
+    // (`nft add rule ip nat post oifname "eth0" masquerade`) writes it. A BARE
+    // masquerade matches every locally generated packet, and this test commits
+    // its ruleset into a real, shared network namespace: with only
+    // `127.0.0.1/8 scope host` present, `nf_nat_masquerade_ipv4` finds no
+    // RT_SCOPE_UNIVERSE source address, returns NF_DROP, and POSTROUTING
+    // reports that to the sender as EPERM. That black-holed every other module
+    // sharing the namespace for the ~20 ms this ruleset is committed — which is
+    // what made `wireguard`'s live handshake test blink (see
+    // `20260808-zig-libs-audit/modules/wireguard.md`). `eth0` does not exist
+    // here, so the statement is still encoded, dumped and compared, but never
+    // matches a packet.
+    try rp1.oifname("eth0").masquerade().apply();
 
     var rp2 = rs.rule(.inet, table_name, post_chain);
     try rp2.ipSaddr(root.cidr("10.0.0.0", 24)).snat(.{ .addr = "203.0.113.5", .family = .ip }).apply();
@@ -442,7 +454,7 @@ fn buildNative(gpa: std.mem.Allocator, b: *wire.Batch, programs: *[rule_count]ex
     programs[9] = expr.Program.init(gpa, .inet);
     _ = programs[9].ret();
     programs[10] = expr.Program.init(gpa, .inet);
-    _ = programs[10].masquerade();
+    _ = programs[10].ifnameCmp(.oifname, .eq, "eth0").masquerade();
     programs[11] = expr.Program.init(gpa, .inet);
     _ = programs[11].ipSaddrPrefix(.{ 10, 0, 0, 0 }, 24).nat(.snat, .ip, &.{ 203, 0, 113, 5 }, null, 0);
     programs[12] = expr.Program.init(gpa, .inet);
