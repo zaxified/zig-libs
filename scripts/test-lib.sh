@@ -7,6 +7,19 @@
 # glob, which works on any bash. See bxp/scripts/test-lib.sh for the sibling
 # implementation this one is patterned after.
 
+# ── the netns-wrapped module set ──────────────────────────────────────────
+# Modules whose tests open AF_NETLINK/raw sockets gated on CAP_NET_ADMIN or
+# CAP_NET_RAW *in the current network namespace* — `unshare -rn` (an
+# unprivileged user+net namespace, mapped to root inside it) is enough to
+# grant those and let the tests actually run instead of skipping. The long
+# empirical justification, including why `icmp`/`traceroute`/`tc` are NOT in
+# this list, is in test.sh at its only consumer of `run_modules`.
+#
+# It lives here, not in test.sh, because dark-tests.sh has to make the same
+# split for the same reason (a module whose build FAILS prints no test count)
+# and a second copy of this list would rot.
+NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables wireguard rawsock"
+
 # Sub-second timing via bash 5+ EPOCHREALTIME; fall back to whole seconds.
 # EPOCHREALTIME honours the locale's decimal point (e.g. "1.234,56" in
 # cs_CZ), which awk would parse as an integer — normalise comma -> period.
@@ -84,6 +97,14 @@ section() {
 # unexpected printed (a stray debug print, a warning, a forgotten verbose
 # skip) — the run is downgraded to FAIL and both streams are replayed.
 # On a genuine nonzero exit, replays both streams and exits with that code.
+#
+# Set _ZL_KEEP_OUT to a path to have the captured stdout APPENDED there before
+# it is discarded. That is how the dark-test check gets the `--summary all`
+# output of the gate's own run instead of paying for a second one: Zig does not
+# cache test RUN steps (measured — the same multi-module command takes the same
+# 13.3 s twice in a row), so re-running the suites just to count their tests
+# would roughly double the gate.
+_ZL_KEEP_OUT=""
 step() {
     local label="$1"; shift
     local out err
@@ -97,6 +118,29 @@ step() {
     ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} "$@" >"$out" 2>"$err" || rc=$?
     t1=$(_now)
     dur=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
+
+    # ⭐ `zig build --summary all` prints the build summary to STDERR, and the
+    # rule above is that ANY stderr is a problem. The summary is the one
+    # expected exception, and it is exactly identifiable: on a successful build
+    # it is a contiguous block emitted LAST, beginning at the line
+    # `Build Summary:` (progress goes to a TTY, never to a pipe, so nothing else
+    # reaches stderr before it). So when a caller asked to keep the output, both
+    # streams are copied out and only that trailing block is removed from the
+    # stderr under judgement — a stray debug print, warning or forgotten verbose
+    # skip still lands before it and still fails the step exactly as before.
+    #
+    # On a NONZERO exit nothing is filtered: the step is failing anyway and the
+    # replay below must show everything, including the `error: the following
+    # build command failed` line zig prints after the summary.
+    if [[ -n "$_ZL_KEEP_OUT" ]]; then
+        cat "$out" "$err" >> "$_ZL_KEEP_OUT"
+        if [[ $rc -eq 0 ]]; then
+            local trimmed
+            trimmed=$(mktemp)
+            sed '/^Build Summary:/,$d' "$err" > "$trimmed"
+            mv "$trimmed" "$err"
+        fi
+    fi
 
     if [[ $rc -eq 0 && ! -s "$err" ]]; then
         local dots_n=$(( _ZL_OK_COL - 5 - ${#label} ))

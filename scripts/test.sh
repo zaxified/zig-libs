@@ -37,10 +37,10 @@ export ZIGLIBS_TEST_T0="$(_now)"
 
 cd "$REPO_ROOT"
 
-# Modules whose tests open AF_NETLINK/raw sockets gated on CAP_NET_ADMIN or
-# CAP_NET_RAW *in the current network namespace* — `unshare -rn` (an
-# unprivileged user+net namespace, mapped to root inside it) is enough to
-# grant those and let the tests actually run instead of skipping.
+# NETNS_MODULES — the set of modules run under `unshare -rn` — is defined in
+# test-lib.sh, because scripts/dark-tests.sh needs the identical split and a
+# second copy would rot. Why each member is in it, and why `icmp`/`traceroute`
+# are deliberately NOT:
 #
 # Verified empirically (2026-07-28), not just grepped:
 #   - `zig build test-netlink` on a bare dev host FAILS outright (a
@@ -63,7 +63,6 @@ cd "$REPO_ROOT"
 #     source documents this (grep `initial user namespace`). Nothing this
 #     script can do about that short of real root; the capability check
 #     prints the one-off `sudo unshare -n zig build test-tc` for it.
-NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables wireguard rawsock"
 
 # ── module-graph plumbing ────────────────────────────────────────────────
 
@@ -270,6 +269,9 @@ EXTRA_ZIG_ARGS=()
 # command (not a loop of 1-module invocations!) so zig's own step
 # parallelism is preserved; only the netns partition is wrapped in
 # `unshare -rn`, and only when it's actually available.
+#
+# `--summary all` is passed unconditionally and the output is kept, because the
+# dark-test check below reads it. See `dark_check`.
 run_modules() {
     local mods="$1"
     [[ -z "${mods// /}" ]] && return 0
@@ -283,22 +285,71 @@ run_modules() {
         esac
     done
 
+    _ZL_KEEP_OUT="$(mktemp)"
+
     if [[ ${#rest[@]} -gt 0 ]]; then
         local -a targets=()
         for m in "${rest[@]}"; do targets+=("test-$m"); done
-        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
+        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all "${EXTRA_ZIG_ARGS[@]}"
     fi
 
     if [[ ${#netns[@]} -gt 0 ]]; then
         local -a targets=()
         for m in "${netns[@]}"; do targets+=("test-$m"); done
         if have_unshare; then
-            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
+            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}" --summary all "${EXTRA_ZIG_ARGS[@]}"
         else
             echo "note: unshare -rn unavailable — running netns-gated modules plainly; their privileged tests will SKIP" >&2
-            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
+            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}" --summary all "${EXTRA_ZIG_ARGS[@]}"
         fi
     fi
+
+    local log="$_ZL_KEEP_OUT"
+    _ZL_KEEP_OUT=""
+    dark_check "$mods" "$log"
+    rm -f "$log"
+}
+
+# ⭐ Dark-test gate. A test that never runs has NO symptom: Zig collects tests
+# only from the files it analyses, so a source reachable only through a
+# `pub const x = @import("x.zig");` re-export contributes nothing to the test
+# binary — no failure, no skip, no warning. `websocket` once shipped running
+# ZERO of its 52 tests, and `ratelimit` reported `18/18 passed`, exit 0, with an
+# entire new suite absent. Nothing else in this driver can see that.
+#
+# scripts/dark-tests.sh compares each module's declared test count against the
+# `(N total)` field of its run-test line and requires EQUALITY. It is handed the
+# `--summary all` output the run above already produced, so it costs a few
+# milliseconds of awk rather than a second full suite run — Zig does not cache
+# test run steps, so building the summary again would roughly double this gate.
+dark_check() {
+    local mods="$1" log="$2"
+
+    # An empty log is NOT "nothing to check". run_modules only gets here after
+    # at least one `step` returned successfully, and a successful
+    # `zig build … --summary all` always prints a summary — so an empty log
+    # means the plumbing broke, and passing vacuously on it would recreate the
+    # exact silent-hole class this check exists to close.
+    if [[ ! -s "$log" ]]; then
+        echo "test.sh: the build produced no --summary output, so the dark-test check has nothing to read." >&2
+        echo "  This is a harness failure, not a pass. Check step()'s _ZL_KEEP_OUT handling." >&2
+        exit 1
+    fi
+
+    # `-Dtest-filter` compiles only the tests whose name matches, so `(N total)`
+    # is deliberately smaller than the declared count and equality is the wrong
+    # question. Say so rather than reporting a phantom violation.
+    local a
+    for a in ${EXTRA_ZIG_ARGS[@]+"${EXTRA_ZIG_ARGS[@]}"}; do
+        case "$a" in
+            -Dtest-filter*)
+                echo "  dark-tests ... SKIPPED (-Dtest-filter compiles a subset on purpose)"
+                return 0
+                ;;
+        esac
+    done
+
+    step "dark-tests" "$SCRIPT_DIR/dark-tests.sh" --summary "$log" $mods
 }
 
 # ── file -> module mapping ───────────────────────────────────────────────
@@ -658,7 +709,15 @@ Usage: scripts/test.sh [subcommand] [args]
                         BASE_REF, changes since that ref — plus their
                         reverse-dependency closure.
   all                   test every module: fmt check + check-catalog + the
-                        full suite. The pre-commit/CI gate.
+                        full suite + the dark-test check. The pre-commit/CI
+                        gate.
+                        The dark-test check requires each module's declared
+                        `^test ` count to EQUAL the `(N total)` its test binary
+                        reports, so a file whose tests were never compiled —
+                        which has no other symptom at all — fails the gate.
+                        It reads the `--summary all` output of the run above
+                        rather than making its own, so it costs ~2.4 s of the
+                        ~511 s gate. See scripts/dark-tests.sh.
                         NOT included: `zig build check-fuzz`, which fails a
                         module that faces the wire and has no fuzz harness.
                         It is red on pre-existing debt (27 modules as of

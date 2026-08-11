@@ -145,6 +145,65 @@ execute instead of skipping. That is not a formality — the `tc` action-table
 bug in `modules/tc` was invisible for as long as its test skipped. See
 [vm/README.md](vm/README.md).
 
+## Dark tests
+
+A test that never runs has no symptom. Zig collects tests only from the files it
+**analyses**, so a source reachable only through a `pub const conn =
+@import("conn.zig");` re-export contributes nothing to the test binary — no
+failure, no skip, no warning, and the suite total agrees with itself because it
+is computed from what ran. `websocket` once shipped running **zero** of its 52
+tests, one of which did not even compile; `ratelimit` reported `18/18 passed`,
+exit 0, with `conn.zig`'s whole suite absent.
+
+`scripts/dark-tests.sh` compares, per module, the number of `^test ` blocks in
+`modules/<m>/src/**/*.zig` against the `(N total)` field of that module's
+run-test line in `--summary all`, and requires them to be **equal**.
+
+Two details are the whole check:
+
+- **`(N total)`, not the pass count.** `run test 38 pass 3 skipped (41 total)` —
+  the pass count is smaller than the declared count for any module with skips,
+  so reading it makes every such module look short and hides a real dark file in
+  that noise. `(N total)` is the number of test declarations the binary was
+  built from, which is exactly what the disk count predicts.
+- **Equality, not a ratio.** The earlier version only failed at zero and merely
+  *reported* `ran < disk/2`. `ratelimit` had 21 on disk and 18 running — nowhere
+  near half — so the shape that motivated the check would have passed it.
+
+`^test ` is an **exact** count here, not an upper bound: Zig has no block
+comments, a `//` comment cannot begin with `test` at column 0, every line of a
+multi-line string starts with `\\`, test declarations are container-level and
+`zig fmt` puts those at column 0, and the gate runs `zig fmt --check` over
+`modules`. Verified across the tree: no indented `test "` / `test {` exists. The
+count is **recursive** — `modules/protobuf/src/testdata/golden_bytes.zig` is
+`@import`ed by `golden_test.zig` and is as much part of the compilation as any
+top-level file. An aggregator `test { _ = conn; }` is itself a test: it is
+counted on disk and it runs, so it appears on both sides and cancels.
+
+A module that legitimately owns `.zig` sources its own compilation never
+analyses gets an explicit row in the script's `DECLARED_EXEMPT`, with the count
+and a written reason. That table is **empty**, and that is a measurement: as of
+2026-08-11 all 224 modules satisfy declared == `(N total)` exactly.
+
+### What it costs
+
+Nothing in the gate. Zig does **not** cache test *run* steps — the same
+multi-module `zig build … --summary all` takes the same 13.3 s twice in a row,
+`compile test … cached` on both — so re-running the suites to count their tests
+would roughly double `scripts/test.sh all`. Instead the driver passes
+`--summary all` to the run it was already making, keeps that output, and hands
+it to `scripts/dark-tests.sh --summary <file>`, which builds nothing.
+
+    zig build check-dark-tests                     # standalone: builds+runs everything
+    zig build check-dark-tests -Ddark-module=http  # …or just one module
+    scripts/dark-tests.sh ratelimit                # same thing without the build step
+
+The standalone forms pay for a full suite run, because they have no summary to
+read. Use them outside the driver; inside it the check is already running.
+
+`-Dtest-filter` compiles a subset on purpose, so the driver **skips** the check
+(loudly) rather than reporting a phantom shortfall.
+
 ## Standards citations
 
 `scripts/check-citations.py [module ...]` fetches the RFC/BIP/BOLT/W3C text

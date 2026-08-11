@@ -498,6 +498,28 @@ pub fn build(b: *std.Build) void {
         .makeFn = checkUapi,
     });
     check_uapi.dependOn(check_uapi_inner);
+
+    // Dark-test gate: `zig build check-dark-tests`. Proves every test block on
+    // disk is a test the compiler actually built. See `checkDarkTests` for why
+    // this shells out, why it is not part of `zig build test`, and what it
+    // costs.
+    const dark_modules = b.option(
+        []const []const u8,
+        "dark-module",
+        "Limit check-dark-tests to this module (repeatable; default: every module)",
+    ) orelse &.{};
+    const check_dark = b.step("check-dark-tests", "Verify every declared test block is one the test binary actually ran");
+    const check_dark_inner = b.allocator.create(DarkTestsStep) catch @panic("OOM");
+    check_dark_inner.* = .{
+        .step = std.Build.Step.init(.{
+            .id = .custom,
+            .name = "check-dark-tests",
+            .owner = b,
+            .makeFn = DarkTestsStep.make,
+        }),
+        .modules = dark_modules,
+    };
+    check_dark.dependOn(&check_dark_inner.step);
 }
 
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
@@ -1142,6 +1164,82 @@ fn checkUapi(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
         else => |t| return step.fail("check-uapi-consts.py terminated abnormally: {any}", .{t}),
     }
 }
+
+/// `zig build check-dark-tests` — every test block on disk must be a test the
+/// compiler actually built.
+///
+/// ⭐ THE FAILURE THIS EXISTS TO CATCH HAS NO OTHER SYMPTOM. Zig collects tests
+/// only from the files it ANALYSES. A re-export (`pub const conn =
+/// @import("conn.zig");`) does not analyse anything on its own, so unless some
+/// analysed code references a decl of that file — in practice a
+/// `test { _ = conn; }` aggregator — the file's tests are never compiled and
+/// never run. There is no failure, no skip, no warning, and the suite total is
+/// computed from what ran, so it agrees with itself. `websocket` shipped running
+/// ZERO of its 52 tests (one did not even compile); `ratelimit` reported
+/// `18/18 passed`, exit 0, with `conn.zig`'s entire suite absent.
+///
+/// WHY IT SHELLS OUT. Same reason as `check-uapi`: the script is the artifact.
+/// It is also the only place that CAN do this — the quantity it needs,
+/// `(N total)`, exists only in the build runner's `--summary all` output, which
+/// a step inside that same build cannot read.
+///
+/// WHY IT IS NOT FOLDED INTO `zig build test` OR INTO `check-catalog`.
+/// Measured, not assumed: Zig does not cache test RUN steps. The same
+/// `zig build test-bech32 test-decimal test-seqmap test-kv test-tar test-mcp
+/// --summary all` takes 13.3 s twice in a row, `compile test … cached` on both,
+/// with every run step re-executing. So a step that reruns the suites in order
+/// to count their tests costs a second full test run — it would roughly double
+/// the ~367 s gate. `scripts/test.sh` therefore does NOT call this step: it
+/// passes `--summary all` to the run it was going to make anyway, keeps the
+/// output, and hands it to `scripts/dark-tests.sh --summary <file>`, which
+/// builds nothing. That path is the gate; this step is the standalone entry
+/// point for a CI shape that does not go through the driver, and for running
+/// the check by hand. `-Ddark-module=<name>` narrows it.
+const DarkTestsStep = struct {
+    step: std.Build.Step,
+    /// From `-Ddark-module`; empty means every module. Carried on the step
+    /// rather than read at make time because `b.option` is only callable while
+    /// the graph is being built.
+    modules: []const []const u8,
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *DarkTestsStep = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const io = b.graph.io;
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(b.allocator, "bash");
+        try argv.append(b.allocator, b.pathFromRoot("scripts/dark-tests.sh"));
+        for (self.modules) |m| try argv.append(b.allocator, m);
+
+        const result = std.process.run(b.allocator, io, .{
+            .argv = argv.items,
+            // The script builds and runs every module's suite, so its output is
+            // a whole `--summary all` tree plus, for a red module, that
+            // module's own test output. `stdout_limit` defaults to
+            // `.unlimited`, which is what this needs.
+            .cwd = .{ .dir = b.build_root.handle },
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.log.warn("check-dark-tests: SKIP -- bash not found on PATH", .{});
+                return;
+            },
+            else => return err,
+        };
+        defer b.allocator.free(result.stdout);
+        defer b.allocator.free(result.stderr);
+
+        if (result.stdout.len > 0) std.log.info("{s}", .{result.stdout});
+        if (result.stderr.len > 0) std.log.err("{s}", .{result.stderr});
+
+        switch (result.term) {
+            .exited => |code| if (code != 0)
+                return step.fail("dark tests found -- a module declares tests the test binary never ran; see output above", .{}),
+            else => |t| return step.fail("dark-tests.sh terminated abnormally: {any}", .{t}),
+        }
+    }
+};
 
 fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
     _ = options;
