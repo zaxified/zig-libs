@@ -79,7 +79,12 @@ const Allocator = std.mem.Allocator;
 
 /// Dial + request + await failures. `Client.Error` covers the dial (connect/
 /// TLS/DNS); `h2_client.Error` covers the stream (protocol/reset/goaway).
-pub const Error = Client.Error || h2_client.Error;
+pub const Error = Client.Error || h2_client.Error || error{
+    /// `Backend.host` is wider than an `Entry` can hold (see
+    /// `Entry.max_host`). Reported rather than truncated: a truncated host
+    /// silently defeated connection reuse and eventually wedged the pool.
+    BackendHostTooLong,
+};
 
 /// One upstream origin to multiplex onto. `secure` selects h2-over-TLS,
 /// which requires a custom `Options.dialer` (this module ships only the
@@ -156,6 +161,12 @@ const Entry = struct {
     current: ?*Shared = null,
     dial_mutex: std.atomic.Mutex = .unlocked,
 
+    /// Widest backend host an entry can hold, inline. A DNS name is at most
+    /// 253 octets (RFC 1035 §2.3.4's 255-octet wire form minus the length
+    /// and root bytes) and a bracketed IPv6 literal at most 47, so this
+    /// covers every addressable backend. A host that does NOT fit is
+    /// rejected (`error.BackendHostTooLong`), never truncated — see
+    /// `getOrCreateEntry`.
     const max_host = 255;
 
     fn host(e: *const Entry) []const u8 {
@@ -309,9 +320,20 @@ pub const Pool = struct {
         defer p.mutex.unlock();
         for (p.entries.items) |e| if (e.matches(backend)) return e;
         if (p.entries.items.len >= p.options.max_backends) return error.ConnectFailed;
+        // A host wider than the entry used to be TRUNCATED into `host_buf`
+        // while `matches` compared the truncated copy against the full
+        // `backend.host` — different lengths, so the entry never matched
+        // its own backend. Every `begin` then allocated a fresh entry and
+        // dialed a NEW upstream connection (multiplexing and reuse both
+        // silently lost), and once `max_backends` entries had accumulated —
+        // they are never removed — every further request to that backend
+        // failed `ConnectFailed` forever. Reject it up front instead: this
+        // is a configuration error, and a silent wrong answer is the worst
+        // possible way to report one.
+        if (backend.host.len > Entry.max_host) return error.BackendHostTooLong;
         const e = p.gpa.create(Entry) catch return error.OutOfMemory;
         errdefer p.gpa.destroy(e);
-        const n: u8 = @intCast(@min(backend.host.len, Entry.max_host));
+        const n: u8 = @intCast(backend.host.len);
         e.* = .{ .host_len = n, .port = backend.port, .secure = backend.secure };
         @memcpy(e.host_buf[0..n], backend.host[0..n]);
         p.entries.append(p.gpa, e) catch return error.OutOfMemory;
@@ -484,6 +506,49 @@ fn h2Backend(io: std.Io) !*Server {
         return error.SkipZigTest;
     };
     return s;
+}
+
+test "h2_upstream: a backend host too wide for an entry is REJECTED, not truncated" {
+    // The bug this pins: `getOrCreateEntry` truncated the host into
+    // `Entry.host_buf` while `Entry.matches` compared that truncated copy
+    // against the FULL `backend.host`. Different lengths, so the entry could
+    // never match its own backend — every request dialed a new upstream
+    // connection (reuse and multiplexing silently lost), and after
+    // `max_backends` (256) entries piled up, every further request to that
+    // backend failed `ConnectFailed` permanently, since entries are never
+    // removed. No dialing happens in this test: it is all pool bookkeeping.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var client = Client.init(threaded.io(), gpa, .{});
+    defer client.deinit();
+    var pool = Pool.init(gpa, .{ .client = &client });
+    defer pool.deinit();
+
+    // 255 bytes is the widest host an entry holds (`Entry.max_host`).
+    // Accepted — and, decisively, it MATCHES ITSELF on the next lookup, so
+    // one backend keeps exactly one entry and one connection.
+    const host_255 = "h" ** 255;
+    const be_255: Backend = .{ .host = host_255, .port = 8080 };
+    const e1 = try pool.getOrCreateEntry(be_255);
+    try testing.expectEqual(@as(usize, 255), e1.host().len);
+    try testing.expectEqualStrings(host_255, e1.host());
+    try testing.expect(e1.matches(be_255));
+    const e2 = try pool.getOrCreateEntry(be_255);
+    try testing.expectEqual(e1, e2);
+    try testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+
+    // 256 bytes: a typed error at the first call, and no entry is created.
+    const host_256 = "h" ** 256;
+    const be_256: Backend = .{ .host = host_256, .port = 8080 };
+    try testing.expectError(error.BackendHostTooLong, pool.getOrCreateEntry(be_256));
+    try testing.expectError(error.BackendHostTooLong, pool.getOrCreateEntry(be_256));
+    try testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+
+    // ...and the reason truncation could never have worked: a 255-byte entry
+    // does not match a 256-byte backend, so the truncated entry was dead
+    // weight the moment it was written.
+    try testing.expect(!e1.matches(be_256));
 }
 
 test "h2_upstream: multiplex two proxied streams over one upstream connection" {

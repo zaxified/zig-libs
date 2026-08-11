@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! dtls — DTLS 1.3 (RFC 9147). TWO key-exchange modes (`Config.key_exchange`,
+//! dtls — DTLS 1.3 (RFC 9147). Key-exchange modes (`Config.key_exchange`,
 //! see `Connection.KeyExchange`):
 //!   - `.psk` (default): PSK-only (`psk_ke`, no (EC)DHE), with an ADDITIVE
 //!     certificate-mode AUTHENTICATION layer (RFC 8446 §4.4 Certificate/
@@ -20,6 +20,14 @@
 //!     RFC 8448 §3's external ECDHE vector, the secp256r1 ECDH against a
 //!     Python-`cryptography`/OpenSSL vector (X coordinate only, RFC 8446
 //!     §7.4.2), and the full flow against a live wolfSSL peer in BOTH roles.
+//!     **Fails closed**: `Config.validate` rejects a `.cert_dhe` client with
+//!     no `peer_verify` policy and a `.cert_dhe` server with no `cert`, so a
+//!     Config that sets nothing but the mode can no longer complete an
+//!     unauthenticated handshake in the mode named for authentication.
+//!   - `.cert_dhe_insecure_unauthenticated`: the same (EC)DHE exchange with
+//!     peer authentication switched off — encryption to an unknown party,
+//!     indistinguishable from encryption to an active MITM. Spelled out in
+//!     full so it can only be chosen deliberately.
 //! Certificate mode reuses `std.crypto.Certificate.Parsed.verify` for the
 //! actual issuer/validity/signature checks plus this module's existing
 //! `rsa` dependency (`certauth.zig`), but — unlike an earlier pass of this
@@ -286,7 +294,8 @@ pub const Connection = connection.Connection;
 pub const Config = connection.Config;
 pub const Role = connection.Role;
 pub const CipherSuite = connection.CipherSuite;
-/// PSK (`.psk`) vs. PSK-less ephemeral-X25519 certificate (`.cert_dhe`) mode
+/// PSK (`.psk`) vs. PSK-less ephemeral-X25519 certificate (`.cert_dhe`, or
+/// its unauthenticated `.cert_dhe_insecure_unauthenticated` sibling) mode
 /// selector for `Config.key_exchange` — see `Connection.KeyExchange`.
 pub const KeyExchange = connection.KeyExchange;
 

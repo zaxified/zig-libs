@@ -24,6 +24,11 @@ pub const MessageError = error{
     /// `decodeCertificate`'s `entries_out` is smaller than the number of
     /// `CertificateEntry` values the wire message declares.
     TooManyCertificateEntries,
+    /// RFC 8446 §4.2: "There MUST NOT be more than one extension of the same
+    /// type in a given extension block ... a receiver MUST ... abort the
+    /// handshake with an `illegal_parameter` alert." See `decodeExtensions`
+    /// for why this is a security property here, not pedantry.
+    DuplicateExtension,
 };
 
 /// RFC 8446 §4 handshake message types. `certificate`/`certificate_request`/
@@ -158,6 +163,21 @@ pub fn encodeExtensions(exts: []const Extension, out: []u8) MessageError![]u8 {
 
 /// Decodes an extension list into caller-supplied `out`. Each returned
 /// `Extension.data` aliases into `buf` — no copy.
+///
+/// A repeated extension type is `error.DuplicateExtension` (RFC 8446 §4.2 /
+/// RFC 6347 §4.2: "There MUST NOT be more than one extension of the same
+/// type in a given extension block ... abort ... with an
+/// `illegal_parameter` alert"). This is not spec pedantry: with duplicates
+/// accepted, WHICH copy takes effect is a property of each consumer's loop
+/// rather than of the message — this module's own consumers used to disagree
+/// (last-wins for `pre_shared_key`, the HRR `cookie` and
+/// `signature_algorithms`; first-wins for `key_share`), so an attacker who
+/// can append to an extension block picks the winner per field. Rejecting
+/// the block is the only resolution that cannot be gamed.
+///
+/// The scan is O(n²) over `n <= out.len`, and every caller in this module
+/// passes a fixed, small `out` array (the `TooManyExtensions` cap), so the
+/// work is bounded by our own buffer, not by the peer.
 pub fn decodeExtensions(buf: []const u8, out: []Extension) MessageError![]Extension {
     if (buf.len < 2) return error.BufferTooShort;
     const body_len: usize = std.mem.readInt(u16, buf[0..2], .big);
@@ -173,6 +193,9 @@ pub fn decodeExtensions(buf: []const u8, out: []Extension) MessageError![]Extens
         i += 4;
         if (i + len > end) return error.Malformed;
         if (n >= out.len) return error.TooManyExtensions;
+        for (out[0..n]) |prev| {
+            if (prev.ext_type == ext_type) return error.DuplicateExtension;
+        }
         out[n] = .{ .ext_type = ext_type, .data = buf[i..][0..len] };
         n += 1;
         i += len;
@@ -980,6 +1003,63 @@ test "extension list: too many for caller's buffer" {
     const enc = try encodeExtensions(&exts, &buf);
     var out: [1]Extension = undefined;
     try testing.expectError(error.TooManyExtensions, decodeExtensions(enc, &out));
+}
+
+test "extension list: a repeated extension type is rejected (RFC 8446 §4.2 illegal_parameter)" {
+    // Two `key_share` (51) extensions, exactly as an attacker appending to a
+    // ClientHello would produce them. Accepting this block made "which copy
+    // wins" a per-consumer accident: first-wins in `clientHelloShare`/
+    // `serverHelloShare`, last-wins for `pre_shared_key`, the HRR `cookie`
+    // and `signature_algorithms`.
+    const dup = [_]Extension{
+        .{ .ext_type = 51, .data = "first-copy" },
+        .{ .ext_type = 51, .data = "second-copy" },
+    };
+    var buf: [128]u8 = undefined;
+    const enc = try encodeExtensions(&dup, &buf);
+    var out: [8]Extension = undefined;
+    try testing.expectError(error.DuplicateExtension, decodeExtensions(enc, &out));
+
+    // Non-adjacent duplicates too — a scan that only compared with the
+    // previous entry would miss this one.
+    const spread = [_]Extension{
+        .{ .ext_type = 43, .data = "supported_versions" },
+        .{ .ext_type = 13, .data = "signature_algorithms" },
+        .{ .ext_type = 43, .data = "supported_versions again" },
+    };
+    const enc2 = try encodeExtensions(&spread, &buf);
+    try testing.expectError(error.DuplicateExtension, decodeExtensions(enc2, &out));
+
+    // ...and a block of DISTINCT types is unaffected (this is a rejection of
+    // duplicates, not of extension blocks).
+    const distinct = [_]Extension{
+        .{ .ext_type = 43, .data = "a" },
+        .{ .ext_type = 13, .data = "b" },
+        .{ .ext_type = 51, .data = "c" },
+        .{ .ext_type = 41, .data = "d" },
+    };
+    const enc3 = try encodeExtensions(&distinct, &buf);
+    try testing.expectEqual(@as(usize, 4), (try decodeExtensions(enc3, &out)).len);
+}
+
+test "ClientHello with a duplicated extension is rejected by the decoder the handshake uses" {
+    // The same check as it is actually reached on the wire — through
+    // `decodeClientHello`, the first thing a server does with an
+    // unauthenticated datagram.
+    const dup = [_]Extension{
+        .{ .ext_type = @intFromEnum(ExtensionType.supported_versions), .data = &.{ 2, 0xFE, 0xFC } },
+        .{ .ext_type = @intFromEnum(ExtensionType.supported_versions), .data = &.{ 2, 0xFE, 0xFD } },
+    };
+    var ch_buf: [256]u8 = undefined;
+    const ch = try encodeClientHello(.{
+        .random = [_]u8{0x11} ** 32,
+        .legacy_session_id = &.{},
+        .cipher_suites = &.{0x1301},
+        .extensions = &dup,
+    }, &ch_buf);
+
+    var out: [8]Extension = undefined;
+    try testing.expectError(error.DuplicateExtension, decodeClientHello(ch, &out));
 }
 
 test "cookie extension round-trip" {

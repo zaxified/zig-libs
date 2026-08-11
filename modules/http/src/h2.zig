@@ -32,10 +32,13 @@
 //!   (RFC 7541) applies after reassembly, independently.
 //! - **Control-frame floods**: frames that make no progress (PING,
 //!   SETTINGS after the handshake, PRIORITY, zero-length DATA without
-//!   END_STREAM, repeated HEADERS on an existing stream, unknown types)
-//!   consume a shared budget of `max_unproductive_frames` consecutive
-//!   frames; progress (a new request stream, DATA that carries bytes or
-//!   END_STREAM) resets it. PINGs are still answered while under budget.
+//!   END_STREAM, repeated HEADERS on an existing stream, unknown types,
+//!   and WINDOW_UPDATE that grants credit we have not spent — including
+//!   every grant to a closed stream) consume a shared budget of
+//!   `max_unproductive_frames` consecutive frames; progress (a new request
+//!   stream, DATA that carries bytes or END_STREAM, a WINDOW_UPDATE that
+//!   replenishes credit `sendData` actually consumed) resets it. PINGs are
+//!   still answered while under budget.
 //!
 //! Provenance: clean-room implementation from RFC 9113 (with RFC 7540
 //! consulted only where it clarifies the same rules, e.g. §5.1/§6.9.2)
@@ -802,6 +805,12 @@ pub const Connection = struct {
     /// Consecutive no-progress frames (see the module doc); reset by
     /// productive frames.
     unproductive_frames: u32 = 0,
+    /// Set by `sendData`, cleared by the next WINDOW_UPDATE we credit as
+    /// progress. A WINDOW_UPDATE that replenishes a window we actually
+    /// SPENT is the flow-control loop doing its job; every further one
+    /// before we spend again grants room to a sender that is not sending,
+    /// which is no progress at all. See the `.window_update` dispatch arm.
+    data_sent_since_window_update: bool = false,
     /// Total peer-initiated streams ever opened on this connection; the
     /// serve layer's `max_streams_per_connection` cap reads this.
     remote_streams_total: u32 = 0,
@@ -994,6 +1003,10 @@ pub const Connection = struct {
         }
         c.conn_send_window -= len;
         st.send_window -= len;
+        // We just consumed flow-control credit, so the peer's next
+        // WINDOW_UPDATE is replenishing something real (see the
+        // `.window_update` dispatch arm's flood accounting).
+        c.data_sent_since_window_update = true;
         if (end_stream) sendEndStream(st);
     }
 
@@ -1324,18 +1337,45 @@ pub const Connection = struct {
                 } });
             },
             .window_update => |wu| {
+                // WINDOW_UPDATE used to be the one no-progress frame class
+                // outside the flood budget: PING, SETTINGS, PRIORITY,
+                // zero-length DATA, repeat HEADERS and unknown types all
+                // charge it, while a `WINDOW_UPDATE(0, +1)` flood was free.
+                // The only bound left was §6.9.1's 2^31 ceiling — ~27 GB of
+                // wire at 13 bytes a frame, i.e. a bound no attacker reaches
+                // and no operator wants to rely on (CVE-2023-44487 is the
+                // shape: cheap frames that cost the server real work).
+                //
+                // "Progress" here is asymmetric on purpose: a WINDOW_UPDATE
+                // that replenishes credit we actually SPENT (`sendData` set
+                // the flag) is the flow-control loop working, and a long
+                // download — where the peer sends nothing but WINDOW_UPDATEs
+                // for minutes — must not be mistaken for a flood. A grant to
+                // a sender that has not sent anything since the last grant
+                // makes no progress and is charged like its siblings. A
+                // grant to a CLOSED stream can never be spent at all, so it
+                // is never progress.
+                var replenishes_spent_credit = false;
                 if (wu.stream_id == 0) {
                     c.conn_send_window += wu.increment;
                     if (c.conn_send_window > max_window_size)
                         return c.fail(.connection, 0, error.FlowControlError); // §6.9.1
+                    replenishes_spent_credit = c.data_sent_since_window_update;
                 } else if (c.streams.getPtr(wu.stream_id)) |st| {
                     if (st.state != .closed) {
                         st.send_window += wu.increment;
                         if (st.send_window > max_window_size)
                             return c.fail(.stream, wu.stream_id, error.FlowControlError);
-                    } // closed: ignore (§5.1 short-lived-frame grace)
+                        replenishes_spent_credit = c.data_sent_since_window_update;
+                    } // closed: ignore (§5.1 short-lived-frame grace) — and never productive
                 } else {
                     return c.fail(.connection, wu.stream_id, error.ProtocolError); // idle
+                }
+                if (replenishes_spent_credit) {
+                    c.data_sent_since_window_update = false;
+                    c.unproductive_frames = 0;
+                } else {
+                    try c.noteUnproductive();
                 }
                 try events.append(c.gpa, .{ .window_update = .{
                     .stream_id = wu.stream_id,
@@ -2614,6 +2654,84 @@ test "connection: SETTINGS and empty-DATA floods → ENHANCE_YOUR_CALM" {
         for (0..8) |_| try encodeData(gpa, &wire, 1, "", .{});
         try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
     }
+}
+
+test "connection: WINDOW_UPDATE flood → ENHANCE_YOUR_CALM (it is not exempt from the budget)" {
+    const gpa = testing.allocator;
+    // Connection-level `WINDOW_UPDATE(0, +1)`: no reply frame, no
+    // allocation, no window growth worth noticing — and, before this was
+    // accounted, no cost to the peer either. The only bound was §6.9.1's
+    // 2^31 ceiling: ~2^31 increments at 13 bytes a frame ≈ 27 GB of wire.
+    {
+        var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        // Exactly the budget: 4 no-progress frames are tolerated…
+        for (0..4) |_| try encodeWindowUpdate(gpa, &wire, 0, 1);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var events: std.ArrayList(Event) = .empty;
+        defer freeEvents(&events);
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(?Violation, null), conn.violation);
+        try testing.expectEqual(@as(u32, 4), conn.unproductive_frames);
+
+        // …and the 5th is over it.
+        wire.clearRetainingCapacity();
+        try encodeWindowUpdate(gpa, &wire, 0, 1);
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
+    // Stream-level, on a CLOSED stream: the branch that was a comment-only
+    // no-op. It grants credit that can never be spent, so it is never
+    // progress no matter what we sent earlier.
+    {
+        var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{ .end_stream = true });
+        try encodeRstStream(gpa, &wire, 1, .cancel); // stream closed
+        for (0..8) |_| try encodeWindowUpdate(gpa, &wire, 1, 1);
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
+}
+
+test "connection: a real download's WINDOW_UPDATE stream is NOT a flood — replenishing spent credit is progress" {
+    // The false positive this fix has to avoid: during a large response the
+    // peer sends nothing BUT WINDOW_UPDATEs, potentially for minutes. Those
+    // replenish credit `sendData` actually consumed, so they must reset the
+    // budget rather than burn it. 40 rounds against a budget of 4 — a naive
+    // "charge every WINDOW_UPDATE" would have died on round 5.
+    const gpa = testing.allocator;
+    var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+    defer conn.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+
+    // One request stream, then a response we keep feeding.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{ .end_stream = true });
+    try conn.recv(wire.items, &out, &events);
+    try conn.sendHeaders(&out, 1, &.{.{ .name = ":status", .value = "200" }}, false);
+
+    const chunk = "0123456789";
+    for (0..40) |_| {
+        try conn.sendData(&out, 1, chunk, false);
+        wire.clearRetainingCapacity();
+        // Both grants a real peer sends per chunk: stream and connection.
+        try encodeWindowUpdate(gpa, &wire, 1, chunk.len);
+        try encodeWindowUpdate(gpa, &wire, 0, chunk.len);
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(?Violation, null), conn.violation);
+    }
+    // The second grant of each pair had no freshly-spent credit behind it,
+    // so the budget sits at 1, not 0 — and never accumulates.
+    try testing.expectEqual(@as(u32, 1), conn.unproductive_frames);
 }
 
 // ── fuzz: HTTP/2 frame parse + connection recv, never panic ────────────────

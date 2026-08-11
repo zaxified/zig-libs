@@ -351,6 +351,25 @@ pub const Limits = struct {
 /// error occurs. The client preface has NOT been consumed — the whole
 /// stream from byte 0 (preface + frames) is read here. `out` is flushed
 /// after every batch of frames. Never fails: all errors end the connection.
+/// The `Limits` -> `h2.Connection.Options` wiring, factored out of `serve`
+/// so a test can assert what the SHIPPED defaults actually become on the
+/// protocol core — a limit that never reaches `h2.Connection` bounds
+/// nothing, however good its value looks in `Limits`.
+fn connOptions(opts: Options) h2.Connection.Options {
+    return .{
+        .settings = .{
+            .enable_push = false, // §8.4: we never push
+            .max_concurrent_streams = opts.limits.max_concurrent_streams,
+            .max_header_list_size = std.math.cast(u32, opts.max_header_bytes) orelse
+                std.math.maxInt(u32),
+        },
+        .max_header_block = opts.limits.max_header_block,
+        .max_continuation_frames = opts.limits.max_continuation_frames,
+        .max_reset_streams = opts.limits.max_reset_streams,
+        .max_unproductive_frames = opts.limits.max_unproductive_frames,
+    };
+}
+
 pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
     var s: Session = .{
         .gpa = gpa,
@@ -358,18 +377,7 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
         .in = in,
         .out = out,
         .threaded = opts.dispatcher != null,
-        .conn = .init(gpa, .server, .{
-            .settings = .{
-                .enable_push = false, // §8.4: we never push
-                .max_concurrent_streams = opts.limits.max_concurrent_streams,
-                .max_header_list_size = std.math.cast(u32, opts.max_header_bytes) orelse
-                    std.math.maxInt(u32),
-            },
-            .max_header_block = opts.limits.max_header_block,
-            .max_continuation_frames = opts.limits.max_continuation_frames,
-            .max_reset_streams = opts.limits.max_reset_streams,
-            .max_unproductive_frames = opts.limits.max_unproductive_frames,
-        }),
+        .conn = .init(gpa, .server, connOptions(opts)),
     };
     defer s.deinit();
     s.run();
@@ -2314,6 +2322,81 @@ fn runOffline(peer: *TestPeer, opts: Options, out_buf: []u8) !void {
     serve(testing.allocator, opts, &in, &out);
     peer.wire.clearRetainingCapacity();
     try peer.feed(out.buffered());
+}
+
+test "h2 DoS limits: the SHIPPED default values, written out as literals" {
+    // Every h2 DoS test overrides the limit it exercises with its own tiny
+    // value (`max_reset_streams = 4`, `max_header_block = 256`, ...), so the
+    // suite pins the MECHANISM and nothing pinned the VALUE: all six
+    // defaults could be weakened by 4-20 orders of magnitude with
+    // `zig build test-http` fully green. These are the exposed product
+    // surface — `Server.Options.h2_limits` hands them to every `enable_h2c`
+    // consumer, and SPEC.md sells them as "safe by default".
+    //
+    // Each literal below is the delivered value, with where it comes from.
+    const d: Limits = .{};
+
+    // 100 concurrent streams: the SETTINGS_MAX_CONCURRENT_STREAMS value RFC
+    // 9113 §6.5.2 recommends as a floor ("no smaller than 100") for peers
+    // that impose a limit at all. NOT a worker bound — that is
+    // `Dispatcher.max_concurrent_handlers` (8).
+    try testing.expectEqual(@as(u32, 100), d.max_concurrent_streams);
+
+    // 10 000 request streams per connection, then GOAWAY(NO_ERROR): stream
+    // ids are 31-bit and never reused, so a connection must eventually be
+    // retired; this is a graceful-recycle bound, not an attack bound.
+    try testing.expectEqual(@as(u32, 10_000), d.max_streams_per_connection);
+
+    // 100 rapid resets (CVE-2023-44487): one per concurrent stream we would
+    // have admitted anyway, so a well-behaved client that cancels every
+    // in-flight request still fits, while the "cancel and immediately
+    // re-open, forever" pattern the CVE describes does not.
+    try testing.expectEqual(@as(u32, 100), d.max_reset_streams);
+
+    // 32 CONTINUATION frames per header sequence (CVE-2024-27316): with the
+    // default 16 KiB SETTINGS_MAX_FRAME_SIZE that is ~512 KiB of frames for
+    // one header block, far above any real request and far below "unbounded".
+    try testing.expectEqual(@as(u32, 32), d.max_continuation_frames);
+
+    // 1 MiB reassembled header block — the total-octets twin of the frame
+    // count above, so zero-length CONTINUATIONs cannot dodge the size cap.
+    try testing.expectEqual(@as(usize, 1 << 20), d.max_header_block);
+    try testing.expectEqual(@as(usize, 1_048_576), d.max_header_block);
+
+    // 1024 consecutive no-progress frames (PING/SETTINGS/PRIORITY/empty
+    // DATA/unknown/unspent WINDOW_UPDATE) before GOAWAY(ENHANCE_YOUR_CALM);
+    // any real progress resets it, so this is a burst allowance, not a rate.
+    try testing.expectEqual(@as(u32, 1024), d.max_unproductive_frames);
+}
+
+test "h2 DoS limits: the shipped defaults are the values that actually reach the protocol core" {
+    // A default is only a bound if it arrives at `h2.Connection`. This pins
+    // the wiring `serve` uses, so a limit that quietly stops being passed
+    // through fails here rather than in production.
+    const co = connOptions(.{ .handler = testHandler });
+    try testing.expectEqual(@as(u32, 100), co.settings.max_concurrent_streams.?);
+    try testing.expectEqual(@as(usize, 1 << 20), co.max_header_block);
+    try testing.expectEqual(@as(u32, 32), co.max_continuation_frames);
+    try testing.expectEqual(@as(u32, 100), co.max_reset_streams);
+    try testing.expectEqual(@as(u32, 1024), co.max_unproductive_frames);
+    // ...and the h2 core's own defaults agree with what this layer ships,
+    // so the two cannot drift apart unnoticed.
+    const core: h2.Connection.Options = .{};
+    try testing.expectEqual(@as(usize, 1 << 20), core.max_header_block);
+    try testing.expectEqual(@as(u32, 32), core.max_continuation_frames);
+    try testing.expectEqual(@as(u32, 100), core.max_reset_streams);
+    try testing.expectEqual(@as(u32, 1024), core.max_unproductive_frames);
+
+    // The re-export consumers actually configure (`Server.Options.h2_limits`)
+    // must be the same struct with the same defaults — that field is how
+    // every `enable_h2c` caller inherits all of the above.
+    const via_server: Server.Options = .{ .handler = testHandler };
+    try testing.expectEqual(@as(u32, 100), via_server.h2_limits.max_concurrent_streams);
+    try testing.expectEqual(@as(u32, 10_000), via_server.h2_limits.max_streams_per_connection);
+    try testing.expectEqual(@as(u32, 100), via_server.h2_limits.max_reset_streams);
+    try testing.expectEqual(@as(u32, 32), via_server.h2_limits.max_continuation_frames);
+    try testing.expectEqual(@as(usize, 1 << 20), via_server.h2_limits.max_header_block);
+    try testing.expectEqual(@as(u32, 1024), via_server.h2_limits.max_unproductive_frames);
 }
 
 test "h2c serve: GET and POST round-trip through the shared handler (offline)" {

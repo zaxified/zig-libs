@@ -74,7 +74,10 @@ Hardened for direct internet exposure (no reverse proxy required):
   request-count cap; inbound gzip is zip-bomb-capped (`max_decompressed_request_bytes` → 413).
 - **HTTP/2 DoS:** rapid-reset (CVE-2023-44487), CONTINUATION-flood (CVE-2024-27316),
   MAX_CONCURRENT_STREAMS, control-frame flood budgets, total-streams-per-conn cap — all
-  configurable, safe by default (so `enable_h2c` is hardened out of the box). With
+  configurable, safe by default (so `enable_h2c` is hardened out of the box), and the shipped
+  default VALUES are pinned by tests, not only the mechanisms. The flood budget covers every
+  no-progress frame class, WINDOW_UPDATE included: a grant that replenishes credit we actually
+  spent is progress, one to a sender that has not sent (or to a closed stream) is not. With
   `Options.h2_dispatcher` installed (concurrent handlers, off by default) two more caps apply:
   per-connection `Dispatcher.max_concurrent_handlers` (a ready stream over it waits in the
   already-bounded jobs map) and the dispatcher's own global admission, whose refusal is answered

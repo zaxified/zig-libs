@@ -415,3 +415,93 @@ test "reassembler: buffer too small for declared total length" {
     const hdr = HandshakeHeader{ .msg_type = 1, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 4 };
     try testing.expectError(error.BufferTooSmall, reasm.feed(hdr, "AAAA"));
 }
+
+// ── fuzz: the reassembly (stitching) layer ─────────────────────────────────
+//
+// `Reassembler.feed` is where an attacker-chosen `fragment_offset` /
+// `fragment_length` / `length` triple meets a fixed buffer and a byte-map —
+// the only place in this module that does index arithmetic on three
+// independent peer-supplied numbers at once. The decoders below/around it
+// have had fuzz targets since the module was written; this layer had none,
+// and hand-built vectors only ever cover the shapes their author thought of.
+//
+// The harness deliberately does BOTH halves in every iteration:
+//   (1) an arbitrary fragment storm, whose only contract is "typed error or
+//       success, never a panic / never an out-of-bounds write", and
+//   (2) a real two-fragment message that MUST stitch back together
+//       byte-for-byte afterwards — so the target cannot decay into a test
+//       that merely bounces every input off an early `return error` without
+//       ever reaching the copy/complete path.
+
+test "fuzz: Reassembler.feed survives arbitrary fragments and still stitches a real message" {
+    try testing.fuzz({}, fuzzReassemble, .{});
+}
+
+fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
+    const cap = 96;
+    var buf: [cap]u8 = undefined;
+    var received: [cap]bool = undefined;
+    var reasm = Reassembler.init(&buf, &received);
+
+    // (1) Fragment storm. Every header field is peer-chosen, and the body
+    // length is allowed to disagree with `fragment_length` — that
+    // disagreement is itself one of the rejection paths.
+    var body: [cap]u8 = undefined;
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        smith.bytes(&body);
+        const body_len: usize = smith.valueRangeAtMost(u8, 0, cap);
+        const hdr = HandshakeHeader{
+            .msg_type = smith.value(u8),
+            // Deliberately allowed to exceed `buf.len` (-> BufferTooSmall).
+            .length = smith.valueRangeAtMost(u24, 0, cap + 8),
+            // A small seq space so restarts and same-message overlaps both
+            // happen often.
+            .message_seq = smith.valueRangeAtMost(u16, 0, 2),
+            .fragment_offset = smith.valueRangeAtMost(u24, 0, cap + 8),
+            .fragment_length = smith.valueRangeAtMost(u24, 0, cap + 8),
+        };
+        _ = reasm.feed(hdr, body[0..body_len]) catch continue;
+    }
+
+    // (2) The stitching path, asserted rather than hoped for. `message_seq`
+    // 7 is outside the storm's range, so this always starts a fresh message
+    // whatever state the storm left behind.
+    const total: usize = smith.valueRangeAtMost(u8, 2, cap);
+    const split: usize = smith.valueRangeAtMost(u8, 1, @intCast(total - 1));
+    var msg: [cap]u8 = undefined;
+    smith.bytes(msg[0..total]);
+
+    const head = HandshakeHeader{
+        .msg_type = 22,
+        .length = @intCast(total),
+        .message_seq = 7,
+        .fragment_offset = 0,
+        .fragment_length = @intCast(split),
+    };
+    const tail = HandshakeHeader{
+        .msg_type = 22,
+        .length = @intCast(total),
+        .message_seq = 7,
+        .fragment_offset = @intCast(split),
+        .fragment_length = @intCast(total - split),
+    };
+
+    // Half the iterations deliver the two fragments out of order (DTLS runs
+    // over UDP; reordering is the ordinary case, not the exotic one).
+    const in_order = smith.boolWeighted(1, 1);
+    const first = if (in_order) head else tail;
+    const second = if (in_order) tail else head;
+    const first_body = if (in_order) msg[0..split] else msg[split..total];
+    const second_body = if (in_order) msg[split..total] else msg[0..split];
+
+    // The first fragment cannot complete the message: this is the
+    // "incomplete, keep buffering" branch.
+    try testing.expect((try reasm.feed(first, first_body)) == null);
+    // A byte-identical re-delivery of it is legal and must not disturb
+    // anything (retransmission, the other ordinary UDP case).
+    try testing.expect((try reasm.feed(first, first_body)) == null);
+    // ...and the closing fragment completes it, byte-for-byte.
+    const done = (try reasm.feed(second, second_body)) orelse return error.TestExpectedStitch;
+    try testing.expectEqualSlices(u8, msg[0..total], done);
+}

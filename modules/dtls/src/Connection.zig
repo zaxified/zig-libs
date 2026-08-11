@@ -83,7 +83,39 @@ pub const Role = enum { client, server };
 ///   wiring is new. Authentication is by certificate (server always presents
 ///   one; the client optionally, via `request_client_cert`), reusing the
 ///   same `certverify`/`certauth` plumbing as certificate-over-PSK mode.
-pub const KeyExchange = enum { psk, cert_dhe };
+///   **Fails closed** (`Config.validate`): a client must carry a
+///   `peer_verify` policy and a server must carry a `cert`, because a
+///   certificate mode that completes without a certificate authenticates
+///   nobody.
+/// - `.cert_dhe_insecure_unauthenticated`: the SAME (EC)DHE exchange with
+///   peer authentication switched off — an encrypted channel with no idea
+///   who is on the other end, i.e. an active MITM is indistinguishable from
+///   the intended peer. It exists for opportunistic-encryption / local-fixture
+///   callers and for tests; it is spelled out in full so that no config
+///   typo, no defaulted field and no partially-filled `Config` can reach it
+///   by accident. Never use it on an untrusted network.
+pub const KeyExchange = enum {
+    psk,
+    cert_dhe,
+    cert_dhe_insecure_unauthenticated,
+
+    /// True for both certificate-mode (EC)DHE variants — i.e. "this
+    /// connection runs the PSK-less ephemeral key exchange", regardless of
+    /// whether the peer is authenticated.
+    pub fn isCertDhe(self: KeyExchange) bool {
+        return switch (self) {
+            .psk => false,
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => true,
+        };
+    }
+
+    /// True only for the mode that promises certificate authentication.
+    /// Gates both the config-time posture checks (`Config.validate`) and the
+    /// handshake-time "the peer presented no certificate at all" rejection.
+    pub fn requiresPeerAuth(self: KeyExchange) bool {
+        return self == .cert_dhe;
+    }
+};
 
 /// RFC 8446 §B.4 registry values. `aes_128_ccm_8_sha256` is RFC 7925 §4.2's
 /// default for the CoAP/constrained-IoT profile — the suite this module's
@@ -109,6 +141,19 @@ pub const ConfigError = error{
     /// documented, because the resulting server would look like it was doing
     /// the check.
     EmptyPeerBinding,
+    /// `key_exchange = .cert_dhe` with no way to decide whether the peer's
+    /// certificate is trustworthy: a client left at `peer_verify = .none`,
+    /// or a server that asks for a client certificate (`request_client_cert`)
+    /// while leaving `peer_verify = .none`. Either would run the whole
+    /// certificate dance and then trust whatever showed up, which is the
+    /// posture `.cert_dhe_insecure_unauthenticated` is named for — a caller
+    /// who wants it has to say so.
+    PeerVerificationRequired,
+    /// `key_exchange = .cert_dhe` on a server with `cert == null`: the server
+    /// would present no Certificate at all, so a conforming client has
+    /// nothing to verify and an accommodating one would complete an
+    /// anonymous handshake in "certificate" mode.
+    LocalCertificateRequired,
 };
 
 /// Server-side HelloRetryRequest / stateless-cookie configuration — RFC 9147
@@ -212,6 +257,15 @@ pub const PeerVerify = union(enum) {
     /// propagated (it becomes `error.CertificateRejected`) — log inside the
     /// hook if the caller needs the specific reason.
     verify_fn: *const fn (leaf_cert_der: []const u8) anyerror!void,
+
+    /// "No trust decision is made." Kept as a method rather than an `==`
+    /// comparison because `PeerVerify` carries payloads.
+    pub fn isNone(self: PeerVerify) bool {
+        return switch (self) {
+            .none => true,
+            .trust_anchor, .verify_fn => false,
+        };
+    }
 };
 
 pub const Config = struct {
@@ -310,11 +364,35 @@ pub const Config = struct {
                 if (self.psk.len == 0) return error.EmptyPsk;
                 if (self.psk_identity.len == 0) return error.EmptyPskIdentity;
             },
-            // `.cert_dhe`: PSK fields are unused, so they are NOT required.
-            // Authentication material (`cert`/`peer_verify`) is role-specific
-            // (a server presents a cert, a client trusts one) and validated
-            // at handshake time, not here.
-            .cert_dhe => {},
+            // `.cert_dhe`: PSK fields are unused, so they are NOT required —
+            // but the AUTHENTICATION material is, and this is the only place
+            // that can demand it. Left to the handshake, the checks are all
+            // gated on flags that default off (`require_peer_cert`) or on a
+            // peer actually presenting something (`peer_verify`), so a
+            // `Config` that sets nothing but `key_exchange = .cert_dhe`
+            // reached `.connected` against a peer that presented no
+            // certificate at all — an (EC)DHE channel with zero peer
+            // authentication in the one mode whose entire purpose is
+            // certificate authentication. Fail closed instead; a caller who
+            // genuinely wants that has to spell out
+            // `.cert_dhe_insecure_unauthenticated`.
+            .cert_dhe => switch (self.role) {
+                // A client with no trust policy cannot tell its server from
+                // an active MITM, whatever certificate arrives.
+                .client => if (self.peer_verify.isNone()) return error.PeerVerificationRequired,
+                .server => {
+                    // A server with no certificate authenticates itself to
+                    // nobody.
+                    if (self.cert == null) return error.LocalCertificateRequired;
+                    // ...and asking the client for a certificate while
+                    // holding no trust policy accepts any certificate at all,
+                    // which is not client authentication.
+                    if (self.request_client_cert and self.peer_verify.isNone()) return error.PeerVerificationRequired;
+                },
+            },
+            // The opt-in: the caller has said, in the mode's own name, that
+            // this connection authenticates nobody.
+            .cert_dhe_insecure_unauthenticated => {},
         }
     }
 };
@@ -1208,7 +1286,7 @@ pub const Connection = struct {
             // `advertised_groups[0]` — the group a first ClientHello offers a
             // share in. A server that wants a different one says so with a
             // HelloRetryRequest (`handleHelloRetryRequest`).
-            .cert_dhe => try self.buildClientHelloCertDhe(random, null, advertised_groups[0], &ch_body_buf),
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(random, null, advertised_groups[0], &ch_body_buf),
         };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
         // ClientHello1 is the first message, so the transcript hash right
@@ -2580,7 +2658,7 @@ pub const Connection = struct {
                 const expected_binder = keyschedule.pskBinder(Hkdf, Hmac, bk, &binder_th);
                 if (!std.crypto.timing_safe.eql([32]u8, expected_binder, binder0[0..32].*)) return error.BinderVerifyFailed;
             },
-            .cert_dhe => {
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => {
                 // PSK-less (EC)DHE: pick a usable client share, make our own
                 // ephemeral key pair IN THE SAME GROUP, and compute the shared
                 // secret. The early secret's IKM is the zero PSK (RFC 8446
@@ -2640,7 +2718,7 @@ pub const Connection = struct {
                 messages.encodeSelectedIdentity(0, sh_ext_data_buf[0..2]);
                 break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = sh_ext_data_buf[0..2] };
             },
-            .cert_dhe => blk: {
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => blk: {
                 const ks = messages.encodeKeyShareServerHello(.{
                     .group = self.ecdhe_group,
                     .key_exchange = self.ecdhe_public[0..self.ecdhe_public_len],
@@ -2918,7 +2996,7 @@ pub const Connection = struct {
                 // upgrade the exchange to `psk_dhe_ke`, which this engine
                 // does not implement — so say so instead of pretending.
                 .psk => return error.HelloRetryRequestUnsupported,
-                .cert_dhe => {
+                .cert_dhe, .cert_dhe_insecure_unauthenticated => {
                     // RFC 8446 §4.1.4: the client MUST abort if
                     // `selected_group` was not in its own `supported_groups`.
                     // The server does not get to pick a group off-menu.
@@ -2958,7 +3036,7 @@ pub const Connection = struct {
         var ch_body_buf: [512]u8 = undefined;
         const ch_body = switch (self.config.key_exchange) {
             .psk => try self.buildClientHello(random, cookie orelse return error.HelloRetryRequestUnsupported, &ch_body_buf),
-            .cert_dhe => try self.buildClientHelloCertDhe(random, cookie, retry_group, &ch_body_buf),
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(random, cookie, retry_group, &ch_body_buf),
         };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
 
@@ -3051,7 +3129,7 @@ pub const Connection = struct {
                 const es = keyschedule.earlySecret(Hkdf, self.config.psk);
                 hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, null);
             },
-            .cert_dhe => {
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => {
                 const server_share = try serverHelloShare(sh_dec.extensions);
                 // RFC 8446 §4.2.8: the server's share MUST be in the same
                 // group as the client's. After a HelloRetryRequest that is
@@ -3099,7 +3177,13 @@ pub const Connection = struct {
         // unprotect+reassemble call it replaces.
         const cert_result = try self.consumeOptionalCertMessages(datagram, &pos, .server, true);
         if (cert_result.saw_cert and cert_result.leaf_len > 0 and !cert_result.saw_cv) return error.Malformed;
-        if (self.config.require_peer_cert and cert_result.leaf_len == 0) return error.PeerCertificateRequired;
+        // `.cert_dhe` requires the peer certificate unconditionally: a server
+        // that sends no Certificate message never reaches `verifyPeerCert`,
+        // so `peer_verify` would never be consulted and the handshake would
+        // complete anonymously. `require_peer_cert` stays the knob for the
+        // PSK-with-certificates mode, where the PSK already authenticates.
+        if (cert_result.leaf_len == 0 and (self.config.require_peer_cert or self.config.key_exchange.requiresPeerAuth()))
+            return error.PeerCertificateRequired;
 
         const server_fin = messages.decodeFinished(cert_result.finishedVerifyData());
         if (server_fin.verify_data.len != 32) return error.Malformed;
@@ -3839,6 +3923,73 @@ fn splitSourceFromEpoch0(record_bytes: []const u8) !SplitSource {
     return out;
 }
 
+// ── fuzz: `handleFlight`, the real untrusted-datagram entry point ─────────
+//
+// Everything a peer sends during a handshake arrives here, and this is the
+// layer that ACCUMULATES across datagrams: append into `rx_flight`, snapshot
+// the whole `Connection`, parse, and either commit or roll the snapshot back.
+// The decoders underneath it have carried fuzz targets since the module was
+// written; this stitching transaction had none, and its hand-built vectors
+// only cover the shapes their author imagined.
+//
+// Every iteration proves it REACHES the stitching path rather than bouncing
+// off an early error: a genuine first half of a real ClientHello must come
+// back as `need_more_data` before the fuzzed continuation is fed in.
+
+test "fuzz: handleFlight survives arbitrary continuations of a half-delivered flight" {
+    try testing.fuzz({}, fuzzHandleFlight, .{});
+}
+
+fn fuzzHandleFlight(_: void, smith: *std.testing.Smith) !void {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+
+    var buf1: [1500]u8 = undefined;
+    var out: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const src = try splitSourceFromEpoch0(ch);
+
+    // (1) A REAL first fragment, split at a peer-chosen point. This must
+    // leave the server buffering — i.e. the accumulate/snapshot transaction
+    // is live for the fuzzed datagram that follows.
+    const split: usize = smith.valueRangeAtMost(u16, 1, @intCast(src.body_len - 1));
+    var frag_buf: [1500]u8 = undefined;
+    var rec_buf: [1500]u8 = undefined;
+    const head = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, src.slice()[0..split], &frag_buf);
+    const r1 = try server.handleFlight(handBuiltPlaintextRecord(0, head, &rec_buf), rnd, 0, &out);
+    try testing.expect(r1.need_more_data);
+
+    // (2) The attacker's continuation: every header field of the second
+    // fragment is peer-chosen, including ones that contradict the first
+    // (a different `msg_type`, a different total `length`, an offset past
+    // the end, a body that disagrees with `fragment_length`). Some of these
+    // complete the message, most are typed errors; none may panic, corrupt
+    // the buffer, or leave the connection half-advanced.
+    var body: [256]u8 = undefined;
+    const body_len: usize = smith.valueRangeAtMost(u8, 0, 255);
+    smith.bytes(body[0..body_len]);
+    // Half the time, feed the TRUE remaining bytes at the TRUE offset, so
+    // the completing path is reached too and not only the rejecting one.
+    const truthful = smith.boolWeighted(1, 1) and src.body_len > split;
+    const off: u24 = if (truthful) @intCast(split) else smith.valueRangeAtMost(u16, 0, @intCast(src.total_len + 8));
+    const payload = if (truthful) src.slice()[split..] else body[0..body_len];
+    const total_len: u24 = if (truthful) src.total_len else smith.valueRangeAtMost(u16, 0, @intCast(src.total_len + 8));
+    const msg_type: u8 = if (truthful) src.msg_type else smith.value(u8);
+    const seq: u16 = if (truthful) src.message_seq else smith.valueRangeAtMost(u16, 0, 2);
+
+    var frag_buf2: [1500]u8 = undefined;
+    var rec_buf2: [1500]u8 = undefined;
+    if (@as(u64, off) + payload.len > total_len) return; // decodeHeader would reject the frame before reassembly sees it
+    const tail = handBuiltHandshakeFragment(msg_type, total_len, seq, off, payload, &frag_buf2);
+    const datagram = handBuiltPlaintextRecord(1, tail, &rec_buf2);
+    _ = server.handleFlight(datagram, rnd, 0, &out) catch return;
+}
+
 test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORDER" {
     const psk_identity = "device-042";
     const psk = "a-shared-pre-shared-key";
@@ -4096,8 +4247,26 @@ test "reassembly: buffered bytes are capped — a peer that never completes a me
     // It must have taken more than a couple of datagrams — i.e. the engine
     // really is buffering, not rejecting the second one outright.
     try testing.expect(i > 2);
-    // Bounded by the documented cap, not by anything the peer chose.
-    try testing.expect(i <= max_flight_bytes);
+
+    // The VALUE of the bound, not just the mechanism. `i <= max_flight_bytes`
+    // compares the constant with itself and stays green for any value; the
+    // literals below do not.
+    //
+    // 4096 bytes is the delivered `max_flight_bytes`: it is the size of the
+    // per-`Connection` `rx_flight` buffer AND — because `handleFlight` takes
+    // a whole-struct stack snapshot of `*Connection` on every datagram — a
+    // bound on this engine's stack consumption. It is sized from the largest
+    // flight this engine can legitimately receive (see the byte-budget note
+    // above `max_flight_bytes`), so growing it is a deliberate act, not a
+    // rounding.
+    try testing.expectEqual(@as(usize, 4096), max_flight_bytes);
+    // ...and here is that same 4096 observed from OUTSIDE the module, as the
+    // exact number of dribble datagrams the engine accepts before it says
+    // FlightTooLarge: each datagram is a 13-byte DTLSPlaintext header + a
+    // 12-byte handshake-fragment header + 1 payload byte = 26 bytes, and
+    // 4096 / 26 = 157 (the 158th no longer fits).
+    try testing.expectEqual(@as(usize, 26), datagram.len);
+    try testing.expectEqual(@as(usize, 157), i);
     // The accumulator is dropped, so the connection is reusable.
     try testing.expectEqual(@as(usize, 0), server.rx_flight_len);
 }
@@ -4228,6 +4397,73 @@ test "recv: anti-replay window accepts in-order delivery and within-window reord
     try testing.expectError(error.ReplayedRecord, server.recv(recs[0], &plain));
     try testing.expectError(error.ReplayedRecord, server.recv(recs[1], &plain));
     try testing.expectError(error.ReplayedRecord, server.recv(recs[2], &plain));
+}
+
+test "recv: the anti-replay window is exactly 64 records wide — 63 back is accepted, 64 back is not" {
+    // WIDTH, not mechanism. The reordering test above only ever exercises
+    // `diff == 1`, so the window could be narrowed to 2 (dropping legitimately
+    // reordered records on any lossy link) or widened to 4096 (keeping a
+    // 4096-entry replay history the RFC never asked for) with the suite green.
+    //
+    // 64 is the delivered value and it is written out as a literal here:
+    // RFC 9147 §4.5.1 / RFC 6347 §4.1.2.6 require a window of AT LEAST 32,
+    // and the implementation's history is a single `u64` bitmap — one bit per
+    // record, bit 0 == the high-water mark — so 64 is what a `u64` holds.
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x35, &client, &server);
+
+    var plain: [256]u8 = undefined;
+    var wires: [65][64]u8 = undefined;
+    var recs: [65][]const u8 = undefined;
+    for (&wires, 0..) |*w, i| {
+        var msg: [8]u8 = undefined;
+        const m = std.fmt.bufPrint(&msg, "s{d}", .{i}) catch unreachable;
+        const r = try client.send(m, w);
+        recs[i] = w[0..r.len];
+    }
+
+    // Deliver the newest record first: the high-water mark is now seq 64 and
+    // the window covers seq 1..64 inclusive.
+    try testing.expectEqualSlices(u8, "s64", try server.recv(recs[64], &plain));
+
+    // seq 0 is 64 back from the high-water mark — one PAST the floor.
+    try testing.expectError(error.ReplayedRecord, server.recv(recs[0], &plain));
+    // seq 1 is 63 back — the oldest record the window can still accept. A
+    // window narrower than 64 rejects this; a wider one would have accepted
+    // seq 0 above.
+    try testing.expectEqualSlices(u8, "s1", try server.recv(recs[1], &plain));
+    // ...and it is still a one-shot: the same record again is a replay.
+    try testing.expectError(error.ReplayedRecord, server.recv(recs[1], &plain));
+}
+
+test "replayCheckAndUpdate: the 64-wide floor and the 64-record forward jump, at the boundary" {
+    // Same width pinned directly on the primitive, with literal sequence
+    // numbers so no constant in the module can rename the boundary.
+    var seen = false;
+    var high: u48 = 0;
+    var window: u64 = 0;
+
+    try testing.expect(replayCheckAndUpdate(&seen, &high, &window, 1000));
+    // 1000 - 63 = 937 is inside the window; 1000 - 64 = 936 is outside it.
+    try testing.expect(replayCheckAndUpdate(&seen, &high, &window, 937));
+    try testing.expect(!replayCheckAndUpdate(&seen, &high, &window, 936));
+    // Neither of those moved the high-water mark.
+    try testing.expectEqual(@as(u48, 1000), high);
+    // A duplicate inside the window is still rejected.
+    try testing.expect(!replayCheckAndUpdate(&seen, &high, &window, 937));
+
+    // Forward jumps: a jump of exactly 63 keeps the old bits (so the record
+    // 63 places behind the OLD high-water mark is still remembered), while a
+    // jump of 64 or more resets the bitmap to "only this record seen".
+    var seen2 = false;
+    var high2: u48 = 0;
+    var window2: u64 = 0;
+    try testing.expect(replayCheckAndUpdate(&seen2, &high2, &window2, 1000));
+    try testing.expect(replayCheckAndUpdate(&seen2, &high2, &window2, 1063)); // +63
+    try testing.expect(!replayCheckAndUpdate(&seen2, &high2, &window2, 1000)); // still remembered
+    try testing.expect(replayCheckAndUpdate(&seen2, &high2, &window2, 1127)); // +64 -> reset
+    try testing.expectEqual(@as(u64, 1), window2);
 }
 
 test "recv: a forged (bad-tag) record cannot poison the anti-replay window" {
@@ -5756,12 +5992,116 @@ test "cert-DHE reject: a cert-DHE server rejects a ClientHello with no key_share
 
 test "cert-DHE: Config.validate does not require PSK fields in cert-DHE mode" {
     // A cert-DHE Config with empty psk/psk_identity must validate cleanly
-    // (the PSK fields are unused in this mode).
-    const cfg = Config{ .role = .server, .key_exchange = .cert_dhe, .cipher_suites = &.{.aes_128_gcm_sha256} };
-    try cfg.validate();
+    // (the PSK fields are unused in this mode) — as long as it carries the
+    // authentication material its role owes (see the fail-closed tests
+    // below); `certDheServerConfig`/`certDheClientConfig` set no PSK at all.
+    try certDheServerConfig().validate();
+    try certDheClientConfig().validate();
     // ...but PSK mode still rejects an empty PSK (regression guard).
     const psk_cfg = Config{ .role = .client, .cipher_suites = &.{.aes_128_gcm_sha256} };
     try testing.expectError(error.EmptyPsk, psk_cfg.validate());
+}
+
+// ── `.cert_dhe` fails closed: the default Config cannot reach an
+// unauthenticated "certificate" handshake ────────────────────────────────
+//
+// The hole these pin: `peer_verify` defaults to `.none` and
+// `require_peer_cert` to `false`, so a Config that set nothing but
+// `key_exchange = .cert_dhe` used to reach `.connected` against a peer that
+// presented no certificate at all — an (EC)DHE channel with no peer
+// authentication whatsoever, in the one mode named for certificate
+// authentication.
+
+test "cert-DHE fail-closed: a Config that sets only key_exchange = .cert_dhe is rejected, in BOTH roles" {
+    // The exact minimal Config a caller writes when they want "TLS-style
+    // certificate DTLS": nothing but the mode.
+    const client_cfg = Config{ .role = .client, .key_exchange = .cert_dhe, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    try testing.expectError(error.PeerVerificationRequired, client_cfg.validate());
+    try testing.expectError(error.PeerVerificationRequired, Connection.clientInit(client_cfg));
+
+    const server_cfg = Config{ .role = .server, .key_exchange = .cert_dhe, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    try testing.expectError(error.LocalCertificateRequired, server_cfg.validate());
+    try testing.expectError(error.LocalCertificateRequired, Connection.serverInit(server_cfg));
+
+    // A client that supplies a certificate of its OWN but still no trust
+    // policy is the same hole wearing a costume — it authenticates itself to
+    // the server and learns nothing about the server.
+    var client_with_own_cert = client_cfg;
+    client_with_own_cert.cert = .{ .chain = &.{&cert_kat.client_cert_der}, .private_key = clientEcdsaKeyPair() };
+    try testing.expectError(error.PeerVerificationRequired, client_with_own_cert.validate());
+
+    // A server that ASKS for a client certificate while holding no trust
+    // policy would accept any certificate at all.
+    var server_asking = certDheServerConfig();
+    server_asking.request_client_cert = true;
+    server_asking.peer_verify = .none;
+    try testing.expectError(error.PeerVerificationRequired, server_asking.validate());
+
+    // PSK mode is untouched by all of this: there the PSK binder does the
+    // authenticating, so `.none` is the correct default.
+    const psk_cfg = Config{ .role = .client, .psk_identity = "device-042", .psk = "a-shared-pre-shared-key", .cipher_suites = &.{.aes_128_gcm_sha256} };
+    try psk_cfg.validate();
+}
+
+test "cert-DHE fail-closed: a server that presents NO certificate cannot complete a .cert_dhe handshake, require_peer_cert or not" {
+    // The peer is a `.cert_dhe_insecure_unauthenticated` server with no
+    // `cert` — i.e. exactly what an anonymous (or stripped-down MITM) peer
+    // looks like on the wire: a well-formed PSK-less (EC)DHE flight with no
+    // Certificate/CertificateVerify in it.
+    var cfg_c = certDheClientConfig();
+    cfg_c.require_peer_cert = false; // the knob that used to be the ONLY guard
+    var client = try Connection.clientInit(cfg_c);
+    var server = try Connection.serverInit(.{
+        .role = .server,
+        .key_exchange = .cert_dhe_insecure_unauthenticated,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+    });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7f} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expectError(error.PeerCertificateRequired, client.handleFlight(flight2.out, rnd, 0, &buf1));
+    try testing.expect(client.state != .connected);
+}
+
+test "cert-DHE: the unauthenticated mode is reachable ONLY by its own name, and then it really is unauthenticated" {
+    // The escape hatch works — otherwise "fail closed" would just be "does
+    // not work". Both sides spell out the insecure mode; the server presents
+    // nothing and the client verifies nothing.
+    const insecure_client = Config{
+        .role = .client,
+        .key_exchange = .cert_dhe_insecure_unauthenticated,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+    };
+    const insecure_server = Config{
+        .role = .server,
+        .key_exchange = .cert_dhe_insecure_unauthenticated,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+    };
+    try insecure_client.validate();
+    try insecure_server.validate();
+
+    var client = try Connection.clientInit(insecure_client);
+    var server = try Connection.serverInit(insecure_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x80} ** 32);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try testing.expectEqual(State.connected, client.state);
+    try testing.expectEqual(State.connected, server.state);
+
+    // ...and the two names are NOT interchangeable: the same Config with the
+    // authenticated name is a config error, so nothing that merely omits a
+    // field can land in the insecure mode.
+    var renamed_client = insecure_client;
+    renamed_client.key_exchange = .cert_dhe;
+    try testing.expectError(error.PeerVerificationRequired, renamed_client.validate());
+    var renamed_server = insecure_server;
+    renamed_server.key_exchange = .cert_dhe;
+    try testing.expectError(error.LocalCertificateRequired, renamed_server.validate());
 }
 
 // ── (EC)DHE group plumbing + secp256r1 ───────────────────────────────────
