@@ -187,6 +187,21 @@ pub const Config = struct {
     max_session_timeout_ms: f64 = 600_000,
     min_session_timeout_ms: f64 = 10_000,
     max_sessions: usize = 16,
+    /// Sessions **one SecureChannel** may hold at once. `max_sessions` alone
+    /// is a global pool, so without this a single socket can take all of it
+    /// and keep it for a whole `RevisedSessionTimeout` — pre-authentication,
+    /// since `CreateSession` needs no credential. A conforming client uses one
+    /// session per channel; four leaves room for the session-rollover shapes
+    /// (create the next one before closing the current) without letting one
+    /// peer own the server. Exceeding it is `BadTooManySessions`.
+    max_sessions_per_channel: usize = 4,
+    /// Longest `SessionName` (§5.6.2) this server will store, bytes. The name
+    /// is a human-readable diagnostic string that no service ever reads back,
+    /// but it is copied into *server*-lifetime memory by an unauthenticated
+    /// peer, so without a cap it is bounded only by `max_message_size`
+    /// (4 MiB × `max_sessions`). Longer is `BadEncodingLimitsExceeded` —
+    /// refused, never silently truncated.
+    max_session_name_len: usize = 512,
     max_subscriptions_per_session: usize = 16,
     max_monitored_items_per_subscription: usize = 256,
     /// Queued `PublishRequest`s per session; one more gets
@@ -642,6 +657,46 @@ pub const Server = struct {
         }
     }
 
+    /// How many live sessions are bound to `channel_id`.
+    pub fn sessionsOnChannel(srv: *const Server, channel_id: u32) usize {
+        var n: usize = 0;
+        for (srv.sessions.items) |session| {
+            if (session.channel_id == channel_id) n += 1;
+        }
+        return n;
+    }
+
+    /// Delete every session bound to `channel_id` and return how many went.
+    ///
+    /// This is the *exact* reclamation trigger for this module: a session is
+    /// pinned to the SecureChannel it was created on (`sessionOrFault`), and
+    /// session transfer to another channel is deliberately not implemented, so
+    /// the moment a channel goes away its sessions are unreachable **by
+    /// anyone** — keeping them until `RevisedSessionTimeout` would only hold
+    /// slots that nothing can ever use again. Called when a channel is closed
+    /// or superseded, never on a channel that is still serving.
+    ///
+    /// `channel_id == 0` (a connection that never opened a channel) matches
+    /// nothing: `CreateSession` refuses to run without a channel, so no
+    /// session can carry that id.
+    pub fn closeChannelSessions(srv: *Server, channel_id: u32) usize {
+        if (channel_id == 0) return 0;
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < srv.sessions.items.len) {
+            const session = srv.sessions.items[i];
+            if (session.channel_id == channel_id) {
+                _ = srv.sessions.orderedRemove(i);
+                session.deinit();
+                srv.allocator.destroy(session);
+                removed += 1;
+                continue;
+            }
+            i += 1;
+        }
+        return removed;
+    }
+
     /// Close every session whose `RevisedSessionTimeout` elapsed without a
     /// request (§5.6.2: the server "shall" delete it, along with its
     /// subscriptions).
@@ -747,13 +802,33 @@ pub const Connection = struct {
         return .{ .server = server, .recv = recv_buf, .msg = msg_buf };
     }
 
-    /// Release this connection's security state: free the peer certificate
-    /// and `secureZero` both key sets. A `SecurityPolicy#None` connection
-    /// owns nothing, so this is a no-op there — which is why the pre-security
-    /// callers that never had a `deinit` to call are still correct. Any
-    /// caller that opens `Config.security` channels must call it (the
-    /// certificate copy is heap-allocated).
+    /// Give up this connection's SecureChannel: reclaim every session bound to
+    /// it, then forget the channel and its tokens.
+    ///
+    /// Sessions are pinned to their channel and this module implements no
+    /// session transfer, so a session whose channel is gone is unreachable by
+    /// anyone; leaving it to idle out would let one peer strand
+    /// `max_sessions` slots for a whole `RevisedSessionTimeout`. Idempotent —
+    /// `channel_id` is cleared, so a second call reclaims nothing.
+    fn closeChannel(c: *Connection) void {
+        _ = c.server.closeChannelSessions(c.channel_id);
+        c.channel_id = 0;
+        c.token_id = 0;
+        c.prev_token_id = 0;
+        c.prev_token_valid_until_ms = 0;
+    }
+
+    /// Release everything this connection holds: the sessions on its
+    /// SecureChannel (they die with the channel — see `closeChannel`), the
+    /// peer certificate, and both key sets, `secureZero`ed.
+    ///
+    /// **Every driver must call this when the socket goes away**, including at
+    /// `SecurityPolicy#None`: a peer that vanishes without a `CLO` reaches no
+    /// other reclamation path, and its session slots would be held until they
+    /// time out. (Before session reclamation existed, a None connection owned
+    /// nothing and skipping `deinit` was merely wasteful; now it leaks slots.)
     pub fn deinit(c: *Connection) void {
+        c.closeChannel();
         if (c.client_certificate) |cert| c.server.allocator.free(cert);
         c.client_certificate = null;
         if (c.keys) |*k| k.wipe();
@@ -1296,6 +1371,9 @@ pub const Connection = struct {
     /// the socket with it.
     fn fail(c: *Connection, out: *std.Io.Writer, code: encoding.StatusCode, reason: []const u8) ServerError!void {
         c.state = .closed;
+        // The socket goes with the `ERR`, and so does the SecureChannel: its
+        // sessions can never be reached again, so their slots come back now.
+        c.closeChannel();
         c.resetAssembly();
         const size: usize = header_size + 4 + 4 + reason.len;
         try writeChunkHeader(out, .error_msg, .final, size);
@@ -1538,7 +1616,9 @@ pub const Connection = struct {
         }
         if (ctx.message_type == .close_secure_channel) {
             // §5.5.3: no response — the channel (and the socket) just close.
+            // Every session on the channel dies with it (`closeChannel`).
             c.state = .closed;
+            c.closeChannel();
             return;
         }
 
@@ -1670,6 +1750,12 @@ pub const Connection = struct {
 
         switch (request.request_type) {
             .issue => {
+                // A second `issue` on the same connection *supersedes* the
+                // channel this connection had. The sessions bound to it are
+                // instantly unreachable (no session transfer), so reclaim
+                // their slots here rather than letting a peer mint channel
+                // after channel and strand the whole session pool.
+                c.closeChannel();
                 c.channel_id = c.server.next_channel_id;
                 c.server.next_channel_id +%= 1;
                 if (c.server.next_channel_id == 0) c.server.next_channel_id = 1;
@@ -1794,6 +1880,22 @@ pub const Connection = struct {
         if (ctx.srv.sessions.items.len >= ctx.srv.config.max_sessions) {
             try sendFault(ctx, status.bad_too_many_sessions);
             return;
+        }
+        // One channel may not take the whole pool: `max_sessions` is global,
+        // and `CreateSession` needs no credential.
+        if (ctx.srv.sessionsOnChannel(c.channel_id) >= ctx.srv.config.max_sessions_per_channel) {
+            try sendFault(ctx, status.bad_too_many_sessions);
+            return;
+        }
+        // §5.6.2's SessionName is a diagnostic string, and an uncapped copy of
+        // it into server-lifetime memory is an unauthenticated peer's lever on
+        // this server's heap. Refused, not truncated: the client must be able
+        // to tell that its name was not kept.
+        if (request.session_name) |peer_name| {
+            if (peer_name.len > ctx.srv.config.max_session_name_len) {
+                try sendFault(ctx, status.bad_encoding_limits_exceeded);
+                return;
+            }
         }
 
         const requested = request.requested_session_timeout;
@@ -2620,6 +2722,10 @@ pub const Connection = struct {
             try sendFault(ctx, status.bad_nothing_to_do);
             return;
         }
+        if (ids.len > ctx.srv.config.max_operations_per_request) {
+            try sendFault(ctx, status.bad_too_many_operations);
+            return;
+        }
         const results = try ctx.arena.alloc(encoding.StatusCode, ids.len);
         for (ids, 0..) |sub_id, i| {
             if (session.findSubscription(sub_id)) |sub| {
@@ -2644,6 +2750,10 @@ pub const Connection = struct {
         const ids = request.subscription_ids orelse &.{};
         if (ids.len == 0) {
             try sendFault(ctx, status.bad_nothing_to_do);
+            return;
+        }
+        if (ids.len > ctx.srv.config.max_operations_per_request) {
+            try sendFault(ctx, status.bad_too_many_operations);
             return;
         }
         const results = try ctx.arena.alloc(encoding.StatusCode, ids.len);
@@ -2789,6 +2899,10 @@ pub const Connection = struct {
             try sendFault(ctx, status.bad_nothing_to_do);
             return;
         }
+        if (items.len > ctx.srv.config.max_operations_per_request) {
+            try sendFault(ctx, status.bad_too_many_operations);
+            return;
+        }
         const results = try ctx.arena.alloc(services.MonitoredItemModifyResult, items.len);
         for (items, 0..) |mod, i| {
             const item = sub.findItem(mod.monitored_item_id) orelse {
@@ -2834,6 +2948,10 @@ pub const Connection = struct {
             try sendFault(ctx, status.bad_nothing_to_do);
             return;
         }
+        if (ids.len > ctx.srv.config.max_operations_per_request) {
+            try sendFault(ctx, status.bad_too_many_operations);
+            return;
+        }
         const results = try ctx.arena.alloc(encoding.StatusCode, ids.len);
         for (ids, 0..) |item_id, i| {
             if (sub.findItem(item_id)) |item| {
@@ -2862,6 +2980,10 @@ pub const Connection = struct {
         const ids = request.monitored_item_ids orelse &.{};
         if (ids.len == 0) {
             try sendFault(ctx, status.bad_nothing_to_do);
+            return;
+        }
+        if (ids.len > ctx.srv.config.max_operations_per_request) {
+            try sendFault(ctx, status.bad_too_many_operations);
             return;
         }
         const results = try ctx.arena.alloc(encoding.StatusCode, ids.len);
@@ -2897,7 +3019,15 @@ pub const Connection = struct {
         // *next* response this session gets (§5.13.5), so they are stashed on
         // the session (owned — the per-request arena dies with this call).
         const acks = request.subscription_acknowledgements orelse &.{};
-        if (acks.len > 0 and acks.len <= ctx.srv.config.max_operations_per_request) {
+        // An over-cap batch is a fault, not a silent discard: dropping it
+        // would leave the client unable to tell "your acknowledgements were
+        // processed and had nothing to say" from "we threw them away", and it
+        // would keep retransmitting messages the server never released.
+        if (acks.len > ctx.srv.config.max_operations_per_request) {
+            try sendFault(ctx, status.bad_too_many_operations);
+            return;
+        }
+        if (acks.len > 0) {
             const results = try ctx.srv.allocator.alloc(encoding.StatusCode, acks.len);
             for (acks, 0..) |ack, i| results[i] = acknowledge(session, ack);
             if (session.pending_ack_results) |old| ctx.srv.allocator.free(old);
@@ -3526,6 +3656,10 @@ const TestRig = struct {
     }
 
     fn createSession(rig: *TestRig) !void {
+        return rig.createSessionNamed("test");
+    }
+
+    fn createSessionNamed(rig: *TestRig, session_name: []const u8) !void {
         const response = try rig.call(
             .message,
             services.type_id.create_session_request,
@@ -3543,7 +3677,7 @@ const TestRig = struct {
                 },
                 .server_uri = null,
                 .endpoint_url = test_endpoint_url,
-                .session_name = "test",
+                .session_name = session_name,
                 .client_nonce = &.{},
                 .client_certificate = null,
                 .requested_session_timeout = 120_000,
@@ -4797,6 +4931,266 @@ test "sessions expire once RevisedSessionTimeout elapses without a request" {
         services.result_fns.read,
     ));
     try testing.expectEqual(status.bad_session_id_invalid, rig.channel.last_service_result);
+}
+
+// ── session-slot reclamation (F4) ───────────────────────────────────────────
+
+test "hostile: re-issuing the SecureChannel cannot strand the session pool from one socket" {
+    // The attack: one socket, no credentials. Every `OpenSecureChannel(issue)`
+    // mints a new channel id, and a session created on the superseded channel
+    // is unreachable by anyone (no session transfer) — so without reclamation
+    // each round leaks one of the 16 slots and the 17th CreateSession is
+    // answered `BadTooManySessions` while nothing is actually being served.
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.handshake();
+
+    var round: usize = 0;
+    while (round < 40) : (round += 1) {
+        try rig.openChannel();
+        try rig.createSession();
+        // The superseded channel's session went with it: exactly the one just
+        // created is live, however many rounds the peer runs.
+        try testing.expectEqual(@as(usize, 1), rig.srv.sessionCount());
+        try testing.expectEqual(@as(usize, 1), rig.srv.sessionsOnChannel(rig.channel.channel_id));
+    }
+}
+
+test "hostile: CloseSecureChannel releases the session slots bound to that channel" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessionCount());
+
+    try rig.channel.sendService(
+        .close_secure_channel,
+        services.type_id.close_secure_channel_request,
+        services.CloseSecureChannelRequest,
+        .{ .request_header = rig.header(rig.authToken()) },
+        services.encodeCloseSecureChannelRequest,
+    );
+    try rig.pump();
+    rig.clearServerOut();
+
+    // §5.5.3 answers nothing, so the only observable is the slot coming back.
+    try testing.expect(rig.conn.isClosed());
+    try testing.expectEqual(@as(usize, 0), rig.srv.sessionCount());
+}
+
+test "hostile: a socket that vanishes without CLO releases its session slots on deinit" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessionCount());
+
+    // What a driver does when the peer's TCP connection disappears: no CLO,
+    // no ERR, just `deinit`. Idempotent, so `rig.deinit`'s own call is fine.
+    rig.conn.deinit();
+    try testing.expectEqual(@as(usize, 0), rig.srv.sessionCount());
+}
+
+test "hostile: a transport ERR releases the session slots on the aborted channel" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessionCount());
+
+    // A chunk header claiming more than the negotiated receive buffer: §7.1.4
+    // takes the socket with the `ERR`, so the channel — and its sessions — are
+    // gone the moment the abort is written, not when the driver gets round to
+    // `deinit`.
+    var header_bytes: [8]u8 = undefined;
+    header_bytes[0..3].* = "MSG".*;
+    header_bytes[3] = @intFromEnum(transport.ChunkType.final);
+    std.mem.writeInt(u32, header_bytes[4..8], 10_000_000, .little);
+    try rig.conn.feed(&header_bytes, &rig.server_out.writer, 0);
+    try rig.expectTransportError(status.bad_tcp_message_too_large);
+    try testing.expectEqual(@as(usize, 0), rig.srv.sessionCount());
+}
+
+test "hostile: one SecureChannel holds at most 4 sessions" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    // `max_sessions` is 16 here: the cap that bites below is the per-channel
+    // one, and 4 is the delivered value — not `config.max_sessions_per_channel`
+    // read back, which would only re-assert whatever the field happens to say.
+    try rig.handshake();
+    try rig.openChannel();
+
+    try rig.createSession();
+    try rig.createSession();
+    try rig.createSession();
+    try rig.createSession();
+    try testing.expectEqual(@as(usize, 4), rig.srv.sessionCount());
+
+    try testing.expectError(error.ServiceFault, rig.createSession());
+    try testing.expectEqual(status.bad_too_many_sessions, rig.channel.last_service_result);
+    try testing.expectEqual(@as(usize, 4), rig.srv.sessionCount());
+    // The global pool is untouched — 12 slots are still there for other peers.
+    try testing.expect(rig.srv.sessionCount() < rig.srv.config.max_sessions);
+}
+
+// ── SessionName bound (F6) ──────────────────────────────────────────────────
+
+test "hostile: a SessionName over 512 bytes is refused, 512 is kept" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.handshake();
+    try rig.openChannel();
+
+    // 513 bytes: one past the delivered cap.
+    const too_long = [_]u8{'n'} ** 513;
+    try testing.expectError(error.ServiceFault, rig.createSessionNamed(&too_long));
+    try testing.expectEqual(status.bad_encoding_limits_exceeded, rig.channel.last_service_result);
+    try testing.expectEqual(@as(usize, 0), rig.srv.sessionCount());
+
+    // Exactly 512 is accepted and stored verbatim — the cap is a bound, not a
+    // truncation, and this pins its value from below.
+    const at_cap = [_]u8{'n'} ** 512;
+    try rig.createSessionNamed(&at_cap);
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessionCount());
+    try testing.expectEqualSlices(u8, &at_cap, rig.srv.sessions.items[0].session_name);
+}
+
+// ── operation-count cap, uniformly (F5) ─────────────────────────────────────
+
+test "over-cap: SetPublishingMode refuses 1001 subscription ids and accepts 1000" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+
+    const ids = try testing.allocator.alloc(u32, 1001);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast(i + 1);
+
+    // 1001 > the delivered `max_operations_per_request` of 1000.
+    try testing.expectError(error.ServiceFault, rig.call(
+        .message,
+        services.type_id.set_publishing_mode_request,
+        services.SetPublishingModeRequest,
+        .{ .request_header = rig.header(rig.authToken()), .publishing_enabled = false, .subscription_ids = ids },
+        services.encodeSetPublishingModeRequest,
+        services.SetPublishingModeResponse,
+        services.type_id.set_publishing_mode_response,
+        services.decodeSetPublishingModeResponse,
+        services.result_fns.set_publishing_mode,
+    ));
+    try testing.expectEqual(status.bad_too_many_operations, rig.channel.last_service_result);
+
+    // 1000 is served (every id is bogus, but the *service* succeeds) — so the
+    // boundary is pinned on both sides.
+    const at_cap = try rig.call(
+        .message,
+        services.type_id.set_publishing_mode_request,
+        services.SetPublishingModeRequest,
+        .{ .request_header = rig.header(rig.authToken()), .publishing_enabled = false, .subscription_ids = ids[0..1000] },
+        services.encodeSetPublishingModeRequest,
+        services.SetPublishingModeResponse,
+        services.type_id.set_publishing_mode_response,
+        services.decodeSetPublishingModeResponse,
+        services.result_fns.set_publishing_mode,
+    );
+    defer services.freeSetPublishingModeResponse(rig.gpa, at_cap);
+    try testing.expectEqual(@as(usize, 1000), at_cap.results.?.len);
+}
+
+test "over-cap: the four remaining array services answer BadTooManyOperations" {
+    var rig: TestRig = undefined;
+    var config = TestRig.defaultConfig();
+    config.max_operations_per_request = 4;
+    try rig.init(testing.allocator, config);
+    defer rig.deinit();
+    try rig.connect();
+
+    const sub = try createSubscription(&rig, 100, 3);
+    defer services.freeCreateSubscriptionResponse(rig.gpa, sub);
+
+    const five_ids = [_]u32{ 1, 2, 3, 4, 5 };
+
+    try testing.expectError(error.ServiceFault, rig.call(
+        .message,
+        services.type_id.delete_subscriptions_request,
+        services.DeleteSubscriptionsRequest,
+        .{ .request_header = rig.header(rig.authToken()), .subscription_ids = &five_ids },
+        services.encodeDeleteSubscriptionsRequest,
+        services.DeleteSubscriptionsResponse,
+        services.type_id.delete_subscriptions_response,
+        services.decodeDeleteSubscriptionsResponse,
+        services.result_fns.delete_subscriptions,
+    ));
+    try testing.expectEqual(status.bad_too_many_operations, rig.channel.last_service_result);
+
+    var mods: [5]services.MonitoredItemModifyRequest = undefined;
+    for (&mods, 0..) |*m, i| m.* = .{
+        .monitored_item_id = @intCast(i + 1),
+        .requested_parameters = .{ .client_handle = 1, .sampling_interval = 250, .filter = services.no_filter, .queue_size = 5, .discard_oldest = true },
+    };
+    try testing.expectError(error.ServiceFault, rig.call(
+        .message,
+        services.type_id.modify_monitored_items_request,
+        services.ModifyMonitoredItemsRequest,
+        .{ .request_header = rig.header(rig.authToken()), .subscription_id = sub.subscription_id, .timestamps_to_return = .both, .items_to_modify = &mods },
+        services.encodeModifyMonitoredItemsRequest,
+        services.ModifyMonitoredItemsResponse,
+        services.type_id.modify_monitored_items_response,
+        services.decodeModifyMonitoredItemsResponse,
+        modifyMonitoredItemsResult,
+    ));
+    try testing.expectEqual(status.bad_too_many_operations, rig.channel.last_service_result);
+
+    try testing.expectError(error.ServiceFault, rig.call(
+        .message,
+        services.type_id.set_monitoring_mode_request,
+        services.SetMonitoringModeRequest,
+        .{ .request_header = rig.header(rig.authToken()), .subscription_id = sub.subscription_id, .monitoring_mode = .disabled, .monitored_item_ids = &five_ids },
+        services.encodeSetMonitoringModeRequest,
+        services.SetMonitoringModeResponse,
+        services.type_id.set_monitoring_mode_response,
+        services.decodeSetMonitoringModeResponse,
+        setMonitoringModeResult,
+    ));
+    try testing.expectEqual(status.bad_too_many_operations, rig.channel.last_service_result);
+
+    try testing.expectError(error.ServiceFault, rig.call(
+        .message,
+        services.type_id.delete_monitored_items_request,
+        services.DeleteMonitoredItemsRequest,
+        .{ .request_header = rig.header(rig.authToken()), .subscription_id = sub.subscription_id, .monitored_item_ids = &five_ids },
+        services.encodeDeleteMonitoredItemsRequest,
+        services.DeleteMonitoredItemsResponse,
+        services.type_id.delete_monitored_items_response,
+        services.decodeDeleteMonitoredItemsResponse,
+        services.result_fns.delete_monitored_items,
+    ));
+    try testing.expectEqual(status.bad_too_many_operations, rig.channel.last_service_result);
+}
+
+test "over-cap: Publish faults on an oversize acknowledgement batch instead of dropping it" {
+    var rig: TestRig = undefined;
+    var config = TestRig.defaultConfig();
+    config.max_operations_per_request = 4;
+    try rig.init(testing.allocator, config);
+    defer rig.deinit();
+    try rig.connect();
+
+    const sub = try createSubscription(&rig, 100, 3);
+    defer services.freeCreateSubscriptionResponse(rig.gpa, sub);
+
+    var acks: [5]services.SubscriptionAcknowledgement = undefined;
+    for (&acks, 0..) |*a, i| a.* = .{ .subscription_id = sub.subscription_id, .sequence_number = @intCast(i + 1) };
+
+    // The old behaviour answered a perfectly normal PublishResponse with the
+    // acknowledgements silently thrown away, so the client could not tell that
+    // its batch had been discarded.
+    try testing.expectError(error.ServiceFault, publish(&rig, &acks));
+    try testing.expectEqual(status.bad_too_many_operations, rig.channel.last_service_result);
 }
 
 // ── chunking + hostile input ────────────────────────────────────────────────

@@ -144,26 +144,31 @@ explicitly, each with a test:
 | reassembled size | negotiated `max_message_size` + the caller's buffer | `ERR BadTcpMessageTooLarge`, close |
 | response size | `max_chunk_count` | `ServiceFault BadEncodingLimitsExceeded` |
 | sessions / subscriptions / monitored items | `Config` | `BadTooManySessions` / `…Subscriptions` / `…MonitoredItems` |
+| sessions on one SecureChannel | `Config.max_sessions_per_channel` (4) | `BadTooManySessions` |
+| `SessionName` length | `Config.max_session_name_len` (512) | `BadEncodingLimitsExceeded` |
 | queued Publish requests | `Config.max_publish_requests` | `BadTooManyPublishRequests` |
 | retained notifications (Republish) | `Config.max_retransmission_queue` | oldest dropped |
 | continuation points per session | `Config.max_continuation_points` | `BadNoContinuationPoints` |
-| operations per request | `Config.max_operations_per_request` — Read, Write, Browse, BrowseNext, TranslateBrowsePaths, Call and CreateMonitoredItems only | `BadTooManyOperations` |
+| operations per request | `Config.max_operations_per_request` — every array-taking service, `Publish` acknowledgements included | `BadTooManyOperations` |
 | publishing / sampling interval | `Config.min_*_interval_ms` | revised up |
 | publishing cycles per `tick` | `max_cycles_per_tick` | deadline resynchronised |
 | type-hierarchy walk depth | `nodestore.max_subtype_depth` | walk stops |
 
-Known gaps in the table above, stated rather than implied:
-`SetPublishingMode`, `DeleteSubscriptions`, `ModifyMonitoredItems`,
-`SetMonitoringMode` and `DeleteMonitoredItems` do **not** apply
-`max_operations_per_request` — their operation arrays are bounded only by the
-negotiated `max_message_size`, and `Publish` silently drops an
-acknowledgement batch larger than the cap instead of faulting. Both are
-post-authentication CPU/arena amplification, not memory-exhaustion.
-Sessions bound to a SecureChannel that was superseded by a later
-`OpenSecureChannel(issue)` — or whose connection went away — are **not
-reaped**; they hold a `max_sessions` slot until `RevisedSessionTimeout`, and
-`Server.expireSessions` only runs from `Connection.tick`, so a server with no
-live connection reaps nothing.
+**Session slots are reclaimed when the channel dies, not when it times out.**
+A session is pinned to the SecureChannel it was created on, and session
+transfer is not implemented, so a session whose channel is gone can never be
+used by anyone again. `Server.closeChannelSessions` therefore runs the moment
+a channel ends — superseded by a later `OpenSecureChannel(issue)`, closed by
+`CLO`, aborted with an `ERR`, or dropped by the driver via
+`Connection.deinit` — instead of leaving the slot pinned for a
+client-requested `RevisedSessionTimeout` (up to `max_session_timeout_ms`,
+600 s). `RevisedSessionTimeout` (`Server.expireSessions`, driven from
+`Connection.tick`) remains the bound for a channel that is still alive but
+idle; `max_sessions_per_channel` bounds what one live channel may hold at
+once, so a single unauthenticated socket cannot take the whole
+`max_sessions` pool. **A driver must call `Connection.deinit` when the socket
+goes away** — that is the only reclamation path for a peer that simply
+vanishes.
 
 Continuation points are **session-scoped**: a handle from another session (or
 a guessed one) is `BadContinuationPointInvalid`, never someone else's cursor.

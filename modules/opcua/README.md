@@ -167,10 +167,12 @@ devices sharing one event loop.
   requests park until a data change or the keep-alive count expires, with
   sequence numbers, piggy-backed acknowledgements and Republish, all as a
   time-injected state machine the caller drives.
-- **Config** (`server.Config`) is where the DoS bounds live: sessions,
-  subscriptions per session, monitored items, queued publish requests,
-  continuation points, operations per request, and the fastest sampling /
-  publishing intervals a client may be granted.
+- **Config** (`server.Config`) is where the DoS bounds live: sessions (in
+  total *and* per SecureChannel), SessionName length, subscriptions per
+  session, monitored items, queued publish requests, continuation points,
+  operations per request, and the fastest sampling / publishing intervals a
+  client may be granted. A session dies with its SecureChannel, so the driver
+  must call `Connection.deinit` when a socket goes away — see SPEC.md.
 
 ## Server: security (`opcua.server`, `opcua.security`)
 
