@@ -149,12 +149,54 @@ pub const MethodAnchor = struct {
     reason: []const u8 = "",
 };
 
+/// Every method `handleMessage` dispatches, as the enum its dispatch switch is
+/// written over. **This is the list, not a copy of it:** the switch is
+/// exhaustive, so an arm cannot exist without a tag here and a tag cannot
+/// exist without an arm — and the spec-anchor canary reads these tag names
+/// instead of a hardcoded count, so a new dispatch arm without a matching
+/// `spec_anchor_index` entry turns the suite RED.
+///
+/// (Re-audit 2026-08-11, F9: the canary used to compare `spec_anchor_index`
+/// against the literals 14/8/6 and never read the dispatch chain at all, so it
+/// only fired when someone edited the index itself — the one direction that
+/// needs no guard. A method added to `handleMessage` was invisible to it,
+/// proved by adding one and watching the suite stay green.)
+pub const DispatchMethod = enum {
+    @"notifications/initialized",
+    initialize,
+    @"tools/list",
+    ping,
+    @"tools/call",
+    @"resources/list",
+    @"resources/read",
+    @"resources/templates/list",
+    @"prompts/list",
+    @"prompts/get",
+};
+
+/// Every method this server ORIGINATES (server→client request or
+/// notification). The emitters below print `@tagName` of these rather than
+/// their own string literal, so the wire name and this list are the same
+/// bytes, and the canary reads it the same way it reads `DispatchMethod`.
+pub const OriginatedMethod = enum {
+    @"notifications/progress",
+    @"notifications/cancelled",
+    @"sampling/createMessage",
+    @"elicitation/create",
+
+    pub fn wire(self: OriginatedMethod) []const u8 {
+        return @tagName(self);
+    }
+};
+
 /// Every JSON-RPC method this server dispatches or originates, classified per
 /// `SpecAnchor`. This is the "nothing silently filtered" index: a method
 /// added to (or removed from) `handleMessage`'s dispatch chain, or to the
-/// server→client send surface, without a matching update here (and to the
-/// canary counts in the "mcp: spec-anchor classification" test) is a
-/// classification bug, not just a missing test.
+/// server→client send surface, without a matching update here is a
+/// classification bug, not just a missing test — and the canary test
+/// ("mcp: spec-anchor classification …") enforces exactly that by checking
+/// this index against `DispatchMethod` + `OriginatedMethod` in both
+/// directions.
 pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "initialize", .anchor = .partial, .reason = "spec's lifecycle.mdx request (roots/sampling/elicitation/tasks capabilities, extended clientInfo) decodes verbatim; the response cannot be byte-identical because this server always advertises its own fixed, narrower capability set (no logging, no tasks, listChanged:false) -- a deliberate design choice (SPEC.md), not a gap" },
     .{ .method = "notifications/initialized", .anchor = .literal_example, .reason = "" },
@@ -281,8 +323,8 @@ pub const Progress = struct {
         var buf: [1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         w.print(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{s},\"progress\":{d},\"total\":{d},\"message\":",
-            .{ self.token_json, progress, total },
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"progressToken\":{s},\"progress\":{d},\"total\":{d},\"message\":",
+            .{ OriginatedMethod.@"notifications/progress".wire(), self.token_json, progress, total },
         ) catch return;
         std.json.Stringify.encodeJsonString(message, .{}, &w) catch return;
         w.writeAll("}}\n") catch return;
@@ -329,32 +371,74 @@ pub const ClientCapabilities = struct {
     /// Parse the `capabilities` value from `initialize` params. Anything
     /// unparseable yields all-false (fail closed) — a malformed handshake must
     /// never *grant* a capability.
+    ///
+    /// "Unparseable" is judged against the **shape the MCP spec defines**, not
+    /// against "is there something here":
+    ///   * every capability (`sampling`, `elicitation`, `roots`) is an OBJECT.
+    ///     `{"sampling":true}`, `{"roots":"yes"}`, `{"elicitation":5}` are
+    ///     malformed declarations and grant nothing.
+    ///   * a sub-capability that the spec declares as an object
+    ///     (`sampling.tools`, `sampling.context`, `elicitation.form`,
+    ///     `elicitation.url`) must be an object, and one it declares as a flag
+    ///     (`roots.listChanged`) must be a bool. A wrong-shaped sub-capability
+    ///     fails the **whole** parent closed rather than being ignored: it means
+    ///     we do not understand what the client declared, and the elicitation
+    ///     case shows why guessing is dangerous — `{"elicitation":"url"}` used to
+    ///     grant *form* (the phishing-relevant mode) and deny url, the exact
+    ///     inverse of what the client tried to say.
+    ///   * JSON `null` stays "absent" everywhere (see `present`), and
+    ///     `listChanged:false` is a declaration of absence, not a grant.
     pub fn parse(caps_opt: ?std.json.Value) ClientCapabilities {
         var c: ClientCapabilities = .{};
         const caps = present(caps_opt) orelse return c;
         if (caps != .object) return c;
 
-        if (present(caps.object.get("sampling"))) |s| {
+        if (present(caps.object.get("sampling"))) |s| grant: {
+            if (s != .object) break :grant;
+            const tools = objectSubCap(s.object, "tools");
+            const context = objectSubCap(s.object, "context");
+            if (tools == .malformed or context == .malformed) break :grant;
             c.sampling = true;
-            c.sampling_tools = present(sub(s, "tools")) != null;
-            c.sampling_context = present(sub(s, "context")) != null;
+            c.sampling_tools = tools == .present;
+            c.sampling_context = context == .present;
         }
-        if (present(caps.object.get("elicitation"))) |e| {
+        if (present(caps.object.get("elicitation"))) |e| grant: {
+            if (e != .object) break :grant;
+            const form = objectSubCap(e.object, "form");
+            const url = objectSubCap(e.object, "url");
+            if (form == .malformed or url == .malformed) break :grant;
             c.elicitation = true;
-            const has_form = present(sub(e, "form")) != null;
-            const has_url = present(sub(e, "url")) != null;
             // Spec backwards compatibility: `elicitation:{}` ≡ `{"form":{}}`.
             // Only an explicit url-only declaration turns form mode off.
-            c.elicitation_form = has_form or !has_url;
-            c.elicitation_url = has_url;
+            c.elicitation_form = form == .present or url != .present;
+            c.elicitation_url = url == .present;
         }
-        if (present(caps.object.get("roots"))) |r| {
+        if (present(caps.object.get("roots"))) |r| grant: {
+            if (r != .object) break :grant;
+            const list_changed = boolSubCap(r.object, "listChanged");
+            if (list_changed == .malformed) break :grant;
             c.roots = true;
-            c.roots_list_changed = present(sub(r, "listChanged")) != null;
+            c.roots_list_changed = list_changed == .present;
         }
         return c;
     }
 };
+
+/// How a sub-capability was declared, for the fail-closed parse above.
+const SubCap = enum { absent, present, malformed };
+
+/// A sub-capability the spec spells as a nested capability object (`{}`).
+fn objectSubCap(o: std.json.ObjectMap, key: []const u8) SubCap {
+    const v = present(o.get(key)) orelse return .absent;
+    return if (v == .object) .present else .malformed;
+}
+
+/// A sub-capability the spec spells as a boolean flag (`"listChanged": true`).
+fn boolSubCap(o: std.json.ObjectMap, key: []const u8) SubCap {
+    const v = present(o.get(key)) orelse return .absent;
+    if (v != .bool) return .malformed;
+    return if (v.bool) .present else .absent;
+}
 
 /// JSON `null` is "absent" for capability purposes — a declared-but-null
 /// capability must not grant anything.
@@ -362,11 +446,6 @@ fn present(v: ?std.json.Value) ?std.json.Value {
     const x = v orelse return null;
     if (x == .null) return null;
     return x;
-}
-
-fn sub(v: std.json.Value, key: []const u8) ?std.json.Value {
-    if (v != .object) return null;
-    return v.object.get(key);
 }
 
 // ── server→client requests: sampling + elicitation ──────────────────────────
@@ -871,17 +950,32 @@ const secret_needles = [_][]const u8{
 /// phrase`. It is a guardrail against the accident, not a defense against the
 /// adversary; the structural answer is URL mode.
 pub fn looksLikeSecretField(name: []const u8) bool {
-    var buf: [128]u8 = undefined;
+    // No length limit: the normalized name is scanned through a sliding window
+    // exactly as long as the longest needle, so a name of ANY length is
+    // searched in full without allocating. (Re-audit 2026-08-11, F8: this used
+    // to normalize into a fixed `[128]u8` and `break` on overflow, so a
+    // credential word past the 128th alphanumeric character — a 130-character
+    // label ending in `password` — was never seen. An attacker-supplied field
+    // name is exactly where a padded label costs nothing.)
+    const window_len = comptime blk: {
+        var longest: usize = 0;
+        for (secret_needles) |needle| longest = @max(longest, needle.len);
+        break :blk longest;
+    };
+    var win: [window_len]u8 = undefined;
     var n: usize = 0;
     for (name) |c| {
         if (!std.ascii.isAlphanumeric(c)) continue;
-        if (n == buf.len) break;
-        buf[n] = std.ascii.toLower(c);
+        if (n == win.len) {
+            std.mem.copyForwards(u8, win[0 .. win.len - 1], win[1..]);
+            n -= 1;
+        }
+        win[n] = std.ascii.toLower(c);
         n += 1;
-    }
-    const norm = buf[0..n];
-    for (secret_needles) |needle| {
-        if (std.mem.indexOf(u8, norm, needle) != null) return true;
+        const seen = win[0..n];
+        for (secret_needles) |needle| {
+            if (needle.len <= seen.len and std.mem.eql(u8, seen[seen.len - needle.len ..], needle)) return true;
+        }
     }
     return false;
 }
@@ -998,18 +1092,73 @@ fn versionHasElicitationModes(version: []const u8) bool {
     return !eql(version, "2025-06-18");
 }
 
+/// The `host[:port]` of an RFC 3986 authority, with any `userinfo@` stripped.
+const HostPort = struct {
+    /// Case-preserved host. An IPv6 literal keeps its brackets (`[::1]`).
+    host: []const u8,
+    /// Digits only, `""` when no `:` was present.
+    port: []const u8,
+};
+/// Split the part of a URL after `scheme://` into its authority's host and
+/// port. Returns null when it is not a well-formed `[userinfo@]host[:port]`.
+///
+/// **Userinfo ends at the LAST `@` of the authority** (RFC 3986 §3.2.1: the
+/// userinfo subcomponent may itself contain `@`-free characters only, so the
+/// final `@` is the delimiter). This is the whole point of parsing rather than
+/// prefix-matching: in `http://localhost:8080@evil.example/steal` the host is
+/// `evil.example`, and `localhost:8080` is merely a username — a
+/// prefix/first-delimiter check reads that as loopback and lets an arbitrary
+/// plaintext-http host through. The authority itself ends at the first `/`,
+/// `?` or `#`, so an `@` in the *path* (`http://evil.example/@localhost`)
+/// cannot pull the host apart either.
+fn splitAuthority(after_scheme: []const u8) ?HostPort {
+    const end = std.mem.indexOfAny(u8, after_scheme, "/?#") orelse after_scheme.len;
+    var authority = after_scheme[0..end];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+
+    var host = authority;
+    var port: []const u8 = "";
+    const bracketed = host.len != 0 and host[0] == '[';
+    if (bracketed) {
+        // IPv6 literal: the host ends at ']' and only ":port" may follow it.
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return null;
+        const after = host[close + 1 ..];
+        host = host[0 .. close + 1];
+        if (after.len != 0) {
+            if (after[0] != ':') return null;
+            port = after[1..];
+        }
+    } else if (std.mem.indexOfScalar(u8, host, ':')) |colon| {
+        port = host[colon + 1 ..];
+        host = host[0..colon];
+    }
+    if (host.len == 0) return null;
+    // `port = *DIGIT` — anything else (a second ':', an '@' we somehow kept,
+    // a hostname) means this is not the authority shape we think it is.
+    for (port) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+    }
+    // A bracket in a *registered-name* host is malformed (a bracketed literal
+    // was consumed above and keeps exactly its own two).
+    if (!bracketed and std.mem.indexOfAny(u8, host, "[]") != null) return null;
+    return .{ .host = host, .port = port };
+}
+
 /// Scheme check for a URL-mode elicitation: `https://` anywhere, or `http://`
 /// only for loopback (the development case). This blocks `javascript:`,
 /// `data:` and `file:` payloads reaching a client that is about to open them;
 /// it says nothing about where an https URL points.
+///
+/// The loopback allowance compares the **parsed host** (see `splitAuthority`)
+/// against the three loopback spellings, exactly — not a prefix, so neither
+/// userinfo (`http://localhost:8080@evil.example/`) nor a longer name that
+/// merely starts with one (`http://localhost.evil.example/`) is loopback.
 fn isSafeElicitationUrl(url: []const u8) bool {
     if (std.ascii.startsWithIgnoreCase(url, "https://")) return url.len > "https://".len;
     if (std.ascii.startsWithIgnoreCase(url, "http://")) {
-        const rest = url["http://".len..];
+        const hp = splitAuthority(url["http://".len..]) orelse return false;
         for ([_][]const u8{ "localhost", "127.0.0.1", "[::1]" }) |host| {
-            if (!std.ascii.startsWithIgnoreCase(rest, host)) continue;
-            const tail = rest[host.len..];
-            if (tail.len == 0 or tail[0] == '/' or tail[0] == ':' or tail[0] == '?') return true;
+            if (std.ascii.eqlIgnoreCase(hp.host, host)) return true;
         }
     }
     return false;
@@ -1108,7 +1257,7 @@ fn writeSamplingParams(jw: *std.json.Stringify, req: SamplingRequest) std.Io.Wri
 /// One `sampling/createMessage` request line (public: reusable when wiring a
 /// custom transport that needs the bytes rather than a writer).
 pub fn writeSamplingRequestLine(w: *std.Io.Writer, id: u64, req: SamplingRequest) std.Io.Writer.Error!void {
-    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"sampling/createMessage\",\"params\":", .{id});
+    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ id, OriginatedMethod.@"sampling/createMessage".wire() });
     var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
     try writeSamplingParams(&jw, req);
     try w.writeAll("}\n");
@@ -1124,7 +1273,7 @@ pub fn writeElicitationRequestLine(
     req: ElicitationRequest,
     emit_mode: bool,
 ) (std.Io.Writer.Error || error{SchemaNotJson})!void {
-    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"elicitation/create\",\"params\":", .{id});
+    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ id, OriginatedMethod.@"elicitation/create".wire() });
     var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
     try jw.beginObject();
     switch (req) {
@@ -1658,8 +1807,8 @@ pub const Server = struct {
         defer aw.deinit();
         const w = &aw.writer;
         w.print(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{d}",
-            .{id},
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"requestId\":{d}",
+            .{ OriginatedMethod.@"notifications/cancelled".wire(), id },
         ) catch return error.OutOfMemory;
         if (reason.len != 0) {
             w.writeAll(",\"reason\":") catch return error.OutOfMemory;
@@ -1859,36 +2008,42 @@ pub const Server = struct {
         // `id`) must get none. `notifications/initialized` is the only method
         // accepted without an id — every other id-less line is a stray
         // notification we drop.
-        if (eql(method, "notifications/initialized")) {
+        //
+        // The chain is a switch over `DispatchMethod` rather than a ladder of
+        // `eql` literals so that the method NAMES are a comptime list the
+        // spec-anchor canary can read (see `DispatchMethod`): the switch is
+        // exhaustive, so an arm cannot exist without a tag, and the canary
+        // fails when a tag has no `spec_anchor_index` entry.
+        const dm = std.meta.stringToEnum(DispatchMethod, method);
+        if (dm == .@"notifications/initialized") {
             self.client_initialized = true;
-        } else if (id == null) {
-            // notification for a request-only method: ignore, never respond.
-        } else if (eql(method, "initialize")) {
-            try self.handleInitialize(arena, out, id, obj.get("params"));
-        } else if (eql(method, "tools/list")) {
-            const list = self.buildToolsList(arena) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // A registered schema literal that is not valid JSON is a
-                // server-side defect — surface it as -32603, don't crash.
-                else => return sendError(arena, out, id, error_code.internal_error, "failed to build tools/list"),
-            };
-            try sendResultRaw(arena, out, id, list);
-        } else if (eql(method, "ping")) {
-            try sendResultRaw(arena, out, id, "{}");
-        } else if (eql(method, "tools/call")) {
-            try self.handleCall(arena, out, id, obj.get("params"), peer);
-        } else if (eql(method, "resources/list")) {
-            try self.handleResourcesList(arena, out, id);
-        } else if (eql(method, "resources/read")) {
-            try self.handleResourcesRead(arena, out, id, obj.get("params"));
-        } else if (eql(method, "resources/templates/list")) {
-            try self.handleTemplatesList(arena, out, id);
-        } else if (eql(method, "prompts/list")) {
-            try self.handlePromptsList(arena, out, id);
-        } else if (eql(method, "prompts/get")) {
-            try self.handlePromptsGet(arena, out, id, obj.get("params"));
-        } else {
-            try sendError(arena, out, id, error_code.method_not_found, "Method not found");
+            return;
+        }
+        // Notification for a request-only method (or for one we do not know at
+        // all): ignore, never respond.
+        if (id == null) return;
+        const m = dm orelse
+            return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+        switch (m) {
+            // Handled above, before the id check — a notification by definition.
+            .@"notifications/initialized" => unreachable,
+            .initialize => try self.handleInitialize(arena, out, id, obj.get("params")),
+            .@"tools/list" => {
+                const list = self.buildToolsList(arena) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // A registered schema literal that is not valid JSON is a
+                    // server-side defect — surface it as -32603, don't crash.
+                    else => return sendError(arena, out, id, error_code.internal_error, "failed to build tools/list"),
+                };
+                try sendResultRaw(arena, out, id, list);
+            },
+            .ping => try sendResultRaw(arena, out, id, "{}"),
+            .@"tools/call" => try self.handleCall(arena, out, id, obj.get("params"), peer),
+            .@"resources/list" => try self.handleResourcesList(arena, out, id),
+            .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params")),
+            .@"resources/templates/list" => try self.handleTemplatesList(arena, out, id),
+            .@"prompts/list" => try self.handlePromptsList(arena, out, id),
+            .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params")),
         }
     }
 
@@ -3321,6 +3476,67 @@ test "readLine: an over-long unterminated line is capped, not buffered unbounded
     try testing.expectEqualStrings("hello", l2.?);
 }
 
+test "readLine: the cap is 16 MiB exactly, and it is the delivered value (re-audit F5)" {
+    // Re-audit 2026-08-11 F5: the test above is written entirely in terms of
+    // `max_line_len`, so it stays green for ANY value of it — `16 * 1024 * 1024`
+    // → `1024` was a green mutation (exit 0), i.e. the DoS bound this constant
+    // exists for was unpinned on the very line the previous audit's CRIT was
+    // closed with. Everything here is an absolute number on purpose.
+    try testing.expectEqual(@as(usize, 16 * 1024 * 1024), max_line_len);
+    try testing.expectEqual(@as(usize, 16777216), max_line_len);
+
+    const alloc = testing.allocator;
+    // A 1 MiB line — far above any plausible "small" cap, far below 16 MiB —
+    // must be DELIVERED, not refused. This is the half a shrunken cap breaks.
+    {
+        const big = try alloc.alloc(u8, 1024 * 1024 + 1);
+        defer alloc.free(big);
+        @memset(big, 'x');
+        big[big.len - 1] = '\n';
+        var in: std.Io.Reader = .fixed(big);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(alloc);
+        const line = try readLine(alloc, &in, &buf);
+        try testing.expectEqual(@as(usize, 1024 * 1024), line.?.len);
+    }
+    // 17 MiB unterminated must be REFUSED, with the buffer bounded by the cap.
+    // This is the half an enlarged (or removed) cap breaks.
+    {
+        const big = try alloc.alloc(u8, 17 * 1024 * 1024);
+        defer alloc.free(big);
+        @memset(big, 'x');
+        var in: std.Io.Reader = .fixed(big);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(alloc);
+        try testing.expect(try readLine(alloc, &in, &buf) == null);
+        try testing.expectEqual(@as(usize, 16777216), buf.items.len);
+    }
+    // And the boundary itself: exactly 16 MiB of payload plus its newline is
+    // the longest line that still arrives.
+    {
+        const exact = try alloc.alloc(u8, 16 * 1024 * 1024 + 1);
+        defer alloc.free(exact);
+        @memset(exact, 'x');
+        exact[exact.len - 1] = '\n';
+        var in: std.Io.Reader = .fixed(exact);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(alloc);
+        const line = try readLine(alloc, &in, &buf);
+        try testing.expectEqual(@as(usize, 16777216), line.?.len);
+    }
+    // One byte more of payload, and the line is refused outright.
+    {
+        const over = try alloc.alloc(u8, 16 * 1024 * 1024 + 2);
+        defer alloc.free(over);
+        @memset(over, 'x');
+        over[over.len - 1] = '\n';
+        var in: std.Io.Reader = .fixed(over);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(alloc);
+        try testing.expect(try readLine(alloc, &in, &buf) == null);
+    }
+}
+
 // ── sampling + elicitation: client capabilities ─────────────────────────────
 
 /// Feed one message and discard whatever the server answered — for tests that
@@ -3394,6 +3610,80 @@ test "ClientCapabilities.parse: the spec's declaration shapes" {
     try testing.expect(!nulled.sampling and !nulled.elicitation);
     const wrong = ClientCapabilities.parse(.{ .string = "nope" });
     try testing.expect(!wrong.sampling and !wrong.elicitation);
+}
+
+test "ClientCapabilities.parse: a malformed declaration grants nothing (re-audit F7)" {
+    // Re-audit 2026-08-11 F7: `parse` granted a capability on ANY non-null
+    // value, so it failed OPEN — contradicting its own doc ("Anything
+    // unparseable yields all-false (fail closed) — a malformed handshake must
+    // never *grant* a capability"). Worst shape: `{"elicitation":"url"}` used
+    // to grant FORM (the phishing-relevant mode) and deny url, the inverse of
+    // the declaration.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parse = struct {
+        fn f(a: std.mem.Allocator, txt: []const u8) !ClientCapabilities {
+            return ClientCapabilities.parse(try std.json.parseFromSliceLeaky(std.json.Value, a, txt, .{}));
+        }
+    }.f;
+
+    // The re-audit's own reproduction line: every capability granted by junk.
+    const junk = try parse(arena, "{\"elicitation\":true,\"sampling\":5,\"roots\":\"yes\"}");
+    try testing.expect(!junk.elicitation and !junk.elicitation_form and !junk.elicitation_url);
+    try testing.expect(!junk.sampling and !junk.sampling_tools and !junk.sampling_context);
+    try testing.expect(!junk.roots and !junk.roots_list_changed);
+
+    // The inverse-grant shape: a non-object elicitation must not hand out form.
+    for ([_][]const u8{
+        "{\"elicitation\":\"url\"}",
+        "{\"elicitation\":\"form\"}",
+        "{\"elicitation\":true}",
+        "{\"elicitation\":1}",
+        "{\"elicitation\":[]}",
+        "{\"elicitation\":[\"url\"]}",
+    }) |txt| {
+        const c = try parse(arena, txt);
+        testing.expect(!c.elicitation and !c.elicitation_form and !c.elicitation_url) catch {
+            std.debug.print("granted elicitation on: {s}\n", .{txt});
+            return error.TestUnexpectedResult;
+        };
+    }
+
+    // A wrong-shaped SUB-capability fails the whole parent closed: we do not
+    // know what was declared, so we grant none of it.
+    for ([_][]const u8{
+        "{\"sampling\":{\"tools\":true}}",
+        "{\"sampling\":{\"context\":\"yes\"}}",
+        "{\"elicitation\":{\"url\":true}}",
+        "{\"elicitation\":{\"form\":1}}",
+        "{\"roots\":{\"listChanged\":{}}}",
+        "{\"roots\":{\"listChanged\":\"true\"}}",
+    }) |txt| {
+        const c = try parse(arena, txt);
+        testing.expect(!c.sampling and !c.elicitation and !c.roots) catch {
+            std.debug.print("granted on malformed sub-capability: {s}\n", .{txt});
+            return error.TestUnexpectedResult;
+        };
+    }
+
+    // `listChanged:false` is a declaration of absence, not a grant; the roots
+    // capability itself is still validly declared.
+    const lc_false = try parse(arena, "{\"roots\":{\"listChanged\":false}}");
+    try testing.expect(lc_false.roots and !lc_false.roots_list_changed);
+
+    // …and the gate the capability feeds really refuses: a client that
+    // declared `elicitation` as a bare `true` gets no form-mode request.
+    var s = try serverWithCaps("{\"elicitation\":true}");
+    defer s.deinit();
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    try testing.expectError(error.ElicitationNotSupported, s.sendElicitationRequest(&sink.writer, .{ .form = .{
+        .message = "Please provide your GitHub username",
+        .requested_schema = simple_schema,
+    } }, .{}));
+    try testing.expectEqualStrings("", sink.written());
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
 }
 
 // ── sampling: the capability gate + the spec's wire example ─────────────────
@@ -3896,6 +4186,53 @@ test "looksLikeSecretField: separator/case forms and the words it does NOT claim
     }
 }
 
+test "looksLikeSecretField: a long name is searched in full, not truncated (re-audit F8)" {
+    // Re-audit 2026-08-11 F8: normalization ran into a fixed [128]u8 and
+    // `break`ed on overflow, so only the first 128 alphanumeric characters
+    // were ever searched — a padded label ending in a credential word slipped
+    // through the form-mode refusal entirely. Pad lengths straddle the old
+    // buffer from every side, including the case where the needle STRADDLES
+    // the old boundary (partially inside, partially past it).
+    const alloc = testing.allocator;
+    for ([_]usize{ 0, 1, 120, 121, 126, 127, 128, 129, 200, 1000 }) |pad| {
+        const name = try alloc.alloc(u8, pad + "password".len);
+        defer alloc.free(name);
+        @memset(name[0..pad], 'a');
+        @memcpy(name[pad..], "password");
+        testing.expect(looksLikeSecretField(name)) catch {
+            std.debug.print("missed a credential word after {d} padding characters\n", .{pad});
+            return error.TestUnexpectedResult;
+        };
+    }
+    // Separators do not count towards the name's length, so the same must hold
+    // for a human-shaped label: "a a a … a password".
+    {
+        var name: std.ArrayList(u8) = .empty;
+        defer name.deinit(alloc);
+        for (0..300) |_| try name.appendSlice(alloc, "a ");
+        try name.appendSlice(alloc, "Pass Phrase");
+        try testing.expect(looksLikeSecretField(name.items));
+    }
+    // ...and a long name that really contains no needle is still not a hit —
+    // a sliding window must not manufacture one across its own wrap point.
+    {
+        const name = try alloc.alloc(u8, 4096);
+        defer alloc.free(name);
+        @memset(name, 'a');
+        try testing.expect(!looksLikeSecretField(name));
+    }
+    {
+        // "pass" + 200 filler + "word" must NOT match: the window may only
+        // ever see contiguous characters.
+        var name: std.ArrayList(u8) = .empty;
+        defer name.deinit(alloc);
+        try name.appendSlice(alloc, "pass");
+        for (0..200) |_| try name.append(alloc, 'x');
+        try name.appendSlice(alloc, "word");
+        try testing.expect(!looksLikeSecretField(name.items));
+    }
+}
+
 test "elicitation: url mode rejects non-navigable schemes and empty ids" {
     var s = try serverWithCaps("{\"elicitation\":{\"url\":{}}}");
     defer s.deinit();
@@ -3942,6 +4279,89 @@ test "elicitation: url mode rejects non-navigable schemes and empty ids" {
         .url = "https://ok.example/",
         .elicitation_id = "e",
     } }, .{}));
+}
+
+test "elicitation: userinfo cannot smuggle a host past the http loopback allowance (re-audit F3)" {
+    // Re-audit 2026-08-11 F3: the loopback check matched a host PREFIX and
+    // accepted the tail as soon as its first byte was '/', ':' or '?'. The ':'
+    // branch swallowed the rest of the authority, so RFC 3986 userinfo defeated
+    // it: in `http://localhost:8080@evil.example/steal` the real host is
+    // `evil.example` and `localhost:8080` is a username. Every URL below was
+    // ACCEPTED before the fix (except where noted) and points at a non-loopback
+    // host over plaintext http, inside a dialog the client renders as trusted.
+    var s = try serverWithCaps("{\"elicitation\":{\"url\":{}}}");
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    const smuggled = [_][]const u8{
+        // The four shapes the re-audit reproduced.
+        "http://localhost:@evil.example/steal",
+        "http://localhost:8080@evil.example/steal",
+        "http://127.0.0.1:1@evil.example/steal",
+        "http://[::1]:80@evil.example/steal",
+        // The '@'-directly-after-host form was already caught; keep it pinned.
+        "http://localhost@evil.example/steal",
+        "http://127.0.0.1@evil.example/steal",
+        "http://[::1]@evil.example/steal",
+        // Userinfo containing its own '@' — the delimiter is the LAST one.
+        "http://localhost@127.0.0.1@evil.example/steal",
+        "http://user:localhost@evil.example/steal",
+        // Userinfo plus the '.'-suffix host confusion the existing test knows:
+        // both halves must fail, in either order.
+        "http://localhost@localhost.evil.example/steal",
+        "http://localhost:80@localhostage.example/steal",
+        "http://[::1]@[::1].evil.example/steal",
+        // A trailing-dot FQDN is not one of the three loopback spellings, and
+        // this guard is deliberately fail-closed about it.
+        "http://localhost./steal",
+        "http://127.0.0.1.:8080/steal",
+        // An IPv6 literal that is not ::1, and a malformed one.
+        "http://[2001:db8::1]/steal",
+        "http://[::1/steal",
+        "http://[::1]x/steal",
+        // Not an authority shape at all: a non-numeric port, an empty host.
+        "http://localhost:80x/steal",
+        "http://localhost:8080:9090/steal",
+        "http:///steal",
+        // '@' in the PATH must not be read as a userinfo delimiter.
+        "http://evil.example/@localhost",
+        "http://evil.example/?x=@127.0.0.1",
+    };
+    for (smuggled) |u| {
+        testing.expectError(error.InvalidUrl, s.sendElicitationRequest(&aw.writer, .{ .url = .{
+            .message = "go here",
+            .url = u,
+            .elicitation_id = "e-1",
+        } }, .{})) catch |err| {
+            std.debug.print("url accepted: {s}\n", .{u});
+            return err;
+        };
+    }
+
+    // The loopback development case must still work in all three spellings,
+    // with and without a port, an IPv6 literal, a query, and (legitimately)
+    // userinfo whose host really is loopback.
+    for ([_][]const u8{
+        "http://localhost/connect",
+        "http://localhost:7717/connect",
+        "http://LocalHost:7717/connect",
+        "http://127.0.0.1:8080/connect?x=1",
+        "http://[::1]/connect",
+        "http://[::1]:7717/connect",
+        "http://user@localhost:7717/connect",
+        "http://localhost",
+        "http://localhost?x=1",
+    }) |u| {
+        _ = s.sendElicitationRequest(&aw.writer, .{ .url = .{
+            .message = "go here",
+            .url = u,
+            .elicitation_id = "e-1",
+        } }, .{}) catch |err| {
+            std.debug.print("loopback url refused: {s}\n", .{u});
+            return err;
+        };
+    }
 }
 
 // ── correlation: the inbound response path ─────────────────────────────────
@@ -4215,6 +4635,36 @@ test "outbound: a cancelled request's late answer is ignored" {
     try testing.expectEqualStrings("", aw.written());
 }
 
+test "outbound: the pending table's DEFAULT cap is 256 (re-audit F6)" {
+    // Re-audit 2026-08-11 F6: the test below sets `max_pending = 2` itself, so
+    // the DEFAULT — the only value any in-tree consumer actually runs with —
+    // was unpinned: `256` → `maxInt(usize)` was a green mutation (exit 0),
+    // which is exactly "a client that never answers grows this without bound".
+    // Absolute numbers only; the field is never assigned here.
+    var s = try serverWithCaps("{\"sampling\":{}}");
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 256), s.max_pending);
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    const req = SamplingRequest{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+        .max_tokens = 10,
+    };
+    // 256 unanswered requests fit; the 257th is refused.
+    for (0..256) |i| {
+        _ = s.sendSamplingRequest(&aw.writer, req, .{}) catch |err| {
+            std.debug.print("refused at request {d}\n", .{i + 1});
+            return err;
+        };
+        aw.clearRetainingCapacity();
+    }
+    try testing.expectEqual(@as(usize, 256), s.pendingCount());
+    try testing.expectError(error.TooManyPending, s.sendSamplingRequest(&aw.writer, req, .{}));
+    try testing.expectEqualStrings("", aw.written()); // refused before anything is written
+    try testing.expectEqual(@as(usize, 256), s.pendingCount());
+}
+
 test "outbound: the pending table is capped" {
     var s = try serverWithCaps("{\"sampling\":{}}");
     defer s.deinit();
@@ -4429,7 +4879,51 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
     // If this trips, a method was added to/removed from handleMessage's
     // dispatch chain (or the server->client send surface) without updating
     // `spec_anchor_index` -- reclassify, don't just bump the numbers.
-    try testing.expectEqual(@as(usize, 14), spec_anchor_index.len);
+    //
+    // Re-audit 2026-08-11 F9: this canary used to assert the literals 14/8/6
+    // and NEVER READ the dispatch chain, so it could only fire when someone
+    // edited the index itself. A dispatch arm added without a spec anchor was
+    // invisible (proved by adding `zzprobe/undeclared` to handleMessage: exit
+    // 0). It now derives one side from the other -- `DispatchMethod` is the
+    // list `handleMessage`'s exhaustive switch is written over, and
+    // `OriginatedMethod` supplies the wire name every emitter prints -- and
+    // checks both directions, so neither list can drift from the index.
+    const dispatched = std.meta.fieldNames(DispatchMethod);
+    const originated = std.meta.fieldNames(OriginatedMethod);
+
+    // Direction 1: every method the code really speaks is classified here.
+    for (dispatched ++ originated) |name| {
+        var found = false;
+        for (spec_anchor_index) |m| {
+            if (eql(m.method, name)) found = true;
+        }
+        testing.expect(found) catch {
+            std.debug.print("method with no spec_anchor_index entry: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        };
+    }
+    // Direction 2: no stale entry -- everything classified is really spoken.
+    for (spec_anchor_index) |m| {
+        var found = false;
+        for (dispatched ++ originated) |name| {
+            if (eql(m.method, name)) found = true;
+        }
+        testing.expect(found) catch {
+            std.debug.print("spec_anchor_index entry for a method nothing speaks: {s}\n", .{m.method});
+            return error.TestUnexpectedResult;
+        };
+    }
+    // ...and no duplicate entries, which would let one method's classification
+    // stand in for another's in the two loops above.
+    for (spec_anchor_index, 0..) |a, i| {
+        for (spec_anchor_index[i + 1 ..]) |b| {
+            try testing.expect(!eql(a.method, b.method));
+        }
+    }
+    try testing.expectEqual(dispatched.len + originated.len, spec_anchor_index.len);
+
+    // The classification split stays pinned (a downgrade to `.no_example`
+    // must be a deliberate edit), and every non-literal entry must say why.
     var literal: usize = 0;
     var partial: usize = 0;
     var no_example: usize = 0;
@@ -4776,4 +5270,288 @@ fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     s.handleMessage(buf[0..len], &aw.writer) catch return;
+    // The peer arm of the same entry point: `handleMessageFrom` with a
+    // non-zero peer, which the harness above never exercised.
+    s.handleMessageFrom(buf[0..len], &aw.writer, smith.value(u64)) catch return;
+}
+
+// ── fuzz: the inbound RESPONSE path (re-audit 2026-08-11, F4) ───────────────
+//
+// The harness above builds `testServer(null)`, which never ISSUES a
+// server→client request, so `Server.pending` is empty on every iteration and
+// `deliverResponse` returns at its `const idx = found orelse return;` before
+// touching one attacker-controlled byte. Everything past that line — the
+// JSON-RPC `error`-object decode, `ClientResponse.samplingResult` /
+// `elicitationResult` / `userRejected`, `SamplingResult.parse` +
+// `parseContentBlock` and `ElicitationResult.parse`, i.e. *every* parser that
+// eats client bytes on the newest surface — had zero fuzz coverage.
+//
+// This harness pre-arms the pending table (both request kinds, two peers) and
+// feeds response lines whose id and peer MATCH BY CONSTRUCTION, so the
+// correlation always lands and the fuzzer's bytes are spent on the parsers
+// instead of on the id lookup. Because the landing is by construction, the
+// harness can **assert** it: three hand-written canary deliveries prove the
+// aim (handler entered, both result parsers reached, the error branch
+// decoded), and every fuzzed round asserts the handler was entered too. If a
+// future edit narrows the harness back — arming dropped, the wrong peer, an
+// id that cannot match — these assertions fail instead of the suite reading
+// green while fuzzing nothing.
+
+const ResponseFuzzProbe = struct {
+    calls: u32 = 0,
+    sampling_ok: u32 = 0,
+    elicitation_ok: u32 = 0,
+    err_payloads: u32 = 0,
+    rejected: u32 = 0,
+
+    fn on(ctx: ?*anyopaque, resp: *const ClientResponse) void {
+        const self: *ResponseFuzzProbe = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        switch (resp.payload) {
+            .err => |e| {
+                self.err_payloads += 1;
+                std.mem.doNotOptimizeAway(e.code);
+                std.mem.doNotOptimizeAway(e.message.len);
+                if (e.data) |d| std.mem.doNotOptimizeAway(@intFromEnum(std.meta.activeTag(d)));
+                if (resp.userRejected()) self.rejected += 1;
+            },
+            .result => {},
+        }
+        // Reach BOTH result parsers on every response, not just the one the
+        // request kind implies — a client can answer either shape.
+        if (resp.samplingResult()) |r| {
+            if (resp.kind == .sampling) self.sampling_ok += 1;
+            std.mem.doNotOptimizeAway(r.model.len);
+            switch (r.content) {
+                .text => |t| std.mem.doNotOptimizeAway(t.len),
+                .image, .audio => |m| {
+                    std.mem.doNotOptimizeAway(m.data.len);
+                    std.mem.doNotOptimizeAway(m.mime_type.len);
+                },
+            }
+        } else |_| {}
+        if (resp.elicitationResult()) |r| {
+            if (resp.kind == .elicitation) self.elicitation_ok += 1;
+            std.mem.doNotOptimizeAway(@intFromEnum(r.action));
+            if (r.content) |c| std.mem.doNotOptimizeAway(c == .object);
+        } else |_| {}
+    }
+};
+
+/// Arm one pending server→client request of `kind` for `peer`, and forget the
+/// request line itself — this harness is about the ANSWER.
+fn armPending(s: *Server, probe: *ResponseFuzzProbe, kind: RequestKind, peer: u64) !u64 {
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    const opts: RequestOptions = .{ .on_response = &ResponseFuzzProbe.on, .ctx = probe, .peer = peer };
+    return switch (kind) {
+        .sampling => try s.sendSamplingRequest(&sink.writer, .{
+            .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+            .max_tokens = 8,
+        }, opts),
+        .elicitation => try s.sendElicitationRequest(&sink.writer, .{ .form = .{
+            .message = "who are you?",
+            .requested_schema = simple_schema,
+        } }, opts),
+    };
+}
+
+/// Feed one response line and assert the JSON-RPC invariant that holds for
+/// every one of them: a response is never answered.
+fn deliverFuzzLine(s: *Server, line: []const u8, peer: u64) !void {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try s.handleMessageFrom(line, &out.writer, peer);
+    try testing.expectEqualStrings("", out.written());
+}
+
+/// Field names and enum tokens from the spec's own result shapes, so the
+/// fuzzer reaches PAST each parser's first type check instead of bouncing off
+/// it — the deep branches (`parseContentBlock`'s image/audio arms,
+/// `ElicitationResult`'s accept-with-content arm) are the point.
+const fuzz_vocab = [_][]const u8{
+    "role",    "content", "model",     "stopReason", "type",
+    "text",    "data",    "mimeType",  "action",     "accept",
+    "decline", "cancel",  "assistant", "user",       "image",
+    "audio",   "code",    "message",   "endTurn",    "",
+};
+
+/// Printable ASCII only: the LINE must stay valid JSON (the older harness owns
+/// the "is this even JSON" question), so fuzzer bytes are spent on structure
+/// and on the tag decisions the parsers make, not on UTF-8 validity.
+const fuzz_key_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-/.:\\\"{}[]";
+
+fn fuzzJsonString(smith: *std.testing.Smith, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    // Mostly a spec token, otherwise fuzzer text (see `fuzz_key_alphabet`).
+    const pick = smith.index(fuzz_vocab.len + 1);
+    if (pick < fuzz_vocab.len) {
+        try std.json.Stringify.encodeJsonString(fuzz_vocab[pick], .{}, w);
+        return;
+    }
+    var raw: [32]u8 = undefined;
+    const n = smith.slice(&raw);
+    var mapped: [32]u8 = undefined;
+    for (raw[0..n], 0..) |b, i| mapped[i] = fuzz_key_alphabet[b % fuzz_key_alphabet.len];
+    try std.json.Stringify.encodeJsonString(mapped[0..n], .{}, w);
+}
+
+fn fuzzJsonValue(smith: *std.testing.Smith, w: *std.Io.Writer, depth: u8) std.Io.Writer.Error!void {
+    switch (smith.index(if (depth == 0) 6 else 8)) {
+        0 => try fuzzJsonString(smith, w),
+        1 => try w.print("{d}", .{smith.value(i32)}),
+        2 => try w.writeAll("true"),
+        3 => try w.writeAll("false"),
+        4 => try w.writeAll("null"),
+        5 => try w.print("{d}.5", .{smith.value(i16)}),
+        6 => {
+            try w.writeByte('{');
+            const n = smith.index(4);
+            // Keys must be UNIQUE: `std.json`'s default
+            // `duplicate_field_behavior` is `.@"error"`, so a repeated key
+            // makes the whole line a -32700 parse error and it never reaches
+            // `deliverResponse` at all (measured — this cost the first fuzz
+            // run of this harness). A vocab key is skipped when already used;
+            // a fuzzer-generated key is prefixed with its slot, so two of them
+            // cannot collide either.
+            var used: [4]usize = @splat(fuzz_vocab.len);
+            var emitted: usize = 0;
+            for (0..n) |i| {
+                const pick = smith.index(fuzz_vocab.len + 1);
+                if (pick < fuzz_vocab.len) {
+                    var dup = false;
+                    for (used[0..emitted]) |u| {
+                        if (u == pick) dup = true;
+                    }
+                    if (dup) continue;
+                }
+                if (emitted != 0) try w.writeByte(',');
+                used[emitted] = pick;
+                emitted += 1;
+                if (pick < fuzz_vocab.len) {
+                    try std.json.Stringify.encodeJsonString(fuzz_vocab[pick], .{}, w);
+                } else {
+                    var raw: [12]u8 = undefined;
+                    const m = smith.slice(&raw);
+                    var kbuf: [32]u8 = undefined;
+                    var key_len: usize = (std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable).len;
+                    for (raw[0..m]) |b| {
+                        kbuf[key_len] = fuzz_key_alphabet[b % fuzz_key_alphabet.len];
+                        key_len += 1;
+                    }
+                    try std.json.Stringify.encodeJsonString(kbuf[0..key_len], .{}, w);
+                }
+                try w.writeByte(':');
+                try fuzzJsonValue(smith, w, depth - 1);
+            }
+            try w.writeByte('}');
+        },
+        else => {
+            try w.writeByte('[');
+            const n = smith.index(4);
+            for (0..n) |i| {
+                if (i != 0) try w.writeByte(',');
+                try fuzzJsonValue(smith, w, depth - 1);
+            }
+            try w.writeByte(']');
+        },
+    }
+}
+
+/// `{"jsonrpc":"2.0","id":<id>,"result":<fuzz>}` or the `"error"` twin — the
+/// exact two shapes `deliverResponse` decodes.
+fn buildFuzzResponse(smith: *std.testing.Smith, w: *std.Io.Writer, id: u64) std.Io.Writer.Error!void {
+    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},", .{id});
+    if (smith.index(4) == 0) {
+        try w.writeAll("\"error\":");
+        // Mostly the spec's error-object shape, sometimes an arbitrary value,
+        // so both the `e == .object` arm and its else are exercised.
+        if (smith.index(4) != 0) {
+            try w.writeAll("{\"code\":");
+            try fuzzJsonValue(smith, w, 0);
+            try w.writeAll(",\"message\":");
+            try fuzzJsonValue(smith, w, 0);
+            try w.writeAll(",\"data\":");
+            try fuzzJsonValue(smith, w, 1);
+            try w.writeByte('}');
+        } else {
+            try fuzzJsonValue(smith, w, 2);
+        }
+    } else {
+        try w.writeAll("\"result\":");
+        try fuzzJsonValue(smith, w, 2);
+    }
+    try w.writeByte('}');
+}
+
+test "fuzz: an arbitrary client RESPONSE never panics and always reaches the parsers" {
+    try testing.fuzz({}, fuzzClientResponse, .{});
+}
+
+fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
+    var s = try serverWithCaps("{\"sampling\":{},\"elicitation\":{\"form\":{},\"url\":{}}}");
+    defer s.deinit();
+    var probe: ResponseFuzzProbe = .{};
+    var line: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer line.deinit();
+
+    // ── aim canary: three hand-written, correlating answers. These do not
+    // depend on the fuzzer at all — they fail the moment this harness stops
+    // reaching the surface it exists for.
+    {
+        const id = try armPending(&s, &probe, .sampling, 0);
+        line.clearRetainingCapacity();
+        try line.writer.print(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"role\":\"assistant\",\"content\":{{\"type\":\"text\",\"text\":\"ok\"}},\"model\":\"m\"}}}}",
+            .{id},
+        );
+        try deliverFuzzLine(&s, line.written(), 0);
+    }
+    {
+        const id = try armPending(&s, &probe, .elicitation, 7);
+        line.clearRetainingCapacity();
+        try line.writer.print(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"action\":\"accept\",\"content\":{{\"name\":\"z\"}}}}}}",
+            .{id},
+        );
+        try deliverFuzzLine(&s, line.written(), 7);
+    }
+    {
+        const id = try armPending(&s, &probe, .sampling, 0);
+        line.clearRetainingCapacity();
+        try line.writer.print(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-1,\"message\":\"User rejected\",\"data\":{{\"k\":1}}}}}}",
+            .{id},
+        );
+        try deliverFuzzLine(&s, line.written(), 0);
+    }
+    try testing.expectEqual(@as(u32, 3), probe.calls);
+    try testing.expectEqual(@as(u32, 1), probe.sampling_ok); // SamplingResult.parse + parseContentBlock
+    try testing.expectEqual(@as(u32, 1), probe.elicitation_ok); // ElicitationResult.parse
+    try testing.expectEqual(@as(u32, 1), probe.err_payloads); // the error-object decode
+    try testing.expectEqual(@as(u32, 1), probe.rejected); // ClientResponse.userRejected
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
+
+    // ── the fuzzed rounds: arbitrary result/error payloads on a correlating
+    // id + peer, so every one of them MUST reach the handler.
+    for (0..4) |_| {
+        const kind: RequestKind = if (smith.index(2) == 0) .sampling else .elicitation;
+        const peer: u64 = smith.index(3);
+        const id = try armPending(&s, &probe, kind, peer);
+        line.clearRetainingCapacity();
+        try buildFuzzResponse(smith, &line.writer, id);
+        const before = probe.calls;
+        try deliverFuzzLine(&s, line.written(), peer);
+        try testing.expectEqual(before + 1, probe.calls);
+        try testing.expectEqual(@as(usize, 0), s.pendingCount());
+    }
+
+    // ── and the miss paths: an id/peer the fuzzer chose freely, against one
+    // armed entry. No assertion on `calls` — the point here is that a
+    // non-matching id, a foreign peer or a junk id shape is a silent drop.
+    {
+        _ = try armPending(&s, &probe, .sampling, 1);
+        line.clearRetainingCapacity();
+        try buildFuzzResponse(smith, &line.writer, smith.value(u64));
+        try deliverFuzzLine(&s, line.written(), smith.value(u64));
+    }
 }

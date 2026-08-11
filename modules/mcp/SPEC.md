@@ -50,7 +50,11 @@ the zig-libs authors (MIT).
   this, a client's response hit the "Missing method" branch and got a -32600 *reply*.
 - **Capabilities are stored, not just parsed.** `initialize` records `client_capabilities` (and
   `negotiated_version`), replacing any prior set wholesale, and all-false before a handshake — so a
-  server fails closed. The spec's MUST NOTs (no `sampling/createMessage` without `sampling`, no
+  server fails closed. A capability is granted only by **the JSON shape the spec defines** (each
+  capability an object; `roots.listChanged` a bool), never by "something is present": a malformed
+  declaration such as `{"elicitation":true}` or `{"elicitation":"url"}` grants nothing at all. (The
+  latter used to grant *form* mode and deny url — the inverse of the declaration, and the
+  phishing-relevant half; re-audit 2026-08-11 F7.) The spec's MUST NOTs (no `sampling/createMessage` without `sampling`, no
   `elicitation/create` without `elicitation`, no elicitation *mode* the client did not declare, with
   `elicitation:{}` meaning form-only for backwards compatibility) are enforced at the send seam.
   `negotiateVersion` returns one of **our** static literals, never the caller's slice — the request
@@ -99,7 +103,10 @@ context. This module refuses form schemas whose property names/titles look like 
 is pinned). **Its limits are real**: it matches names only — not the free-text `message`, not intent,
 and not what the value is later used for — so it stops the accident, not the adversary. The
 structural mitigation is `.url` mode, whose URL is scheme-checked (https, or http for loopback only)
-so `javascript:`/`data:`/`file:` payloads never reach a client that is about to open them; every
+so `javascript:`/`data:`/`file:` payloads never reach a client that is about to open them. The
+loopback allowance compares the **parsed authority's host** — userinfo stripped at the last `@`,
+IPv6 literals kept bracketed, port digits only — so neither `http://localhost:8080@evil.example/`
+nor `http://localhost.evil.example/` is loopback (the first was accepted before re-audit F3). Every
 other URL-safety rule in the spec (no credentials in the URL, no pre-authenticated links, verifying
 that the user who opens it is the user it was minted for) is the application's, not this module's.
 
@@ -145,9 +152,13 @@ shape and reason text exactly, except `requestId` is always a bare integer (this
 monotonic ids) where the spec's illustrative id is a quoted string — JSON-RPC permits either as a
 request id, so this is not a divergence. The full classification (`.literal_example` / `.partial` /
 `.no_example`, with a `reason` for every non-full entry) lives in `pub const spec_anchor_index` in
-src/root.zig, guarded by a count-canary test so a method added to (or dropped from) the dispatch
-surface without updating the classification fails loudly — the same protection sibling modules use
-for a vendored-corpus count. **No disagreements were found**: every spec example this server can
+src/root.zig, guarded by a canary test that **derives one side from the other**: `DispatchMethod` is
+the enum `handleMessage`'s exhaustive switch is written over and `OriginatedMethod` supplies the
+wire name every outbound emitter prints, and the canary checks both lists against the index in both
+directions, so a method added to (or dropped from) the dispatch surface without updating the
+classification fails loudly. (Until re-audit 2026-08-11 F9 this was a *count* canary comparing the
+index against hardcoded numbers; it never read the dispatch chain, so the drift it promised to
+catch was invisible to it.) **No disagreements were found**: every spec example this server can
 reproduce byte-for-byte, it does. Retrieved from
 `modelcontextprotocol/modelcontextprotocol` (2025-11-25 spec pages) directly, never reconstructed
 from memory.
@@ -176,6 +187,15 @@ spec-literal anchors were spot-checked the same way: swapping `progress`/`total`
 `notifications/progress` spec-anchor test red (wrong numbers on the wire), confirming a compile-only
 mutation was not mistaken for coverage; reverted byte-for-byte (`md5sum` before/after matched).
 Run: `zig build test-mcp`.
+
+**What those 21 did not cover** (re-audit 2026-08-11): every one of them is a *behaviour/guard*
+mutation, so the module's **limit values** were unpinned — `max_line_len` could be shrunk to 1 KiB
+and `max_pending` raised to `maxInt(usize)` with the suite green. Both are now pinned by absolute
+numbers (16 MiB exactly, with a 1 MiB line still delivered and 17 MiB refused; 256 unanswered
+requests fit and the 257th does not) rather than in terms of the constant they check. The fuzz layer
+was one direction short as well: the response harness now pre-arms pending entries so
+`SamplingResult.parse`, `parseContentBlock`, `ElicitationResult.parse` and the error-object decode
+are actually reached, and asserts that it reached them.
 
 ## Backlog / deferred
 
