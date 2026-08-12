@@ -31,10 +31,27 @@
 //!
 //! ## Randomness
 //!
-//! Following the `bbs`/`frost`/`ibe` convention, the blinding + witness
-//! nonces are supplied by a caller `std.Random` (keygen: `keys.keygen`;
-//! show: `proveCredential`) rather than read from `std.Io` internally, so
-//! a seeded PRNG makes issuance/show deterministic in tests.
+//! Both entry points that sample secrets — `keygen` (the authority master
+//! secret `(x, y₁…y_q)` and its Shamir blinding) and `proveCredential` (the
+//! re-randomisation scalars and the Sigma-protocol witness nonces) — take
+//! `io: std.Io` and draw from `std.Io.random`, which is CONTRACTUALLY a
+//! CSPRNG. This is the `bbs`/`ibe`/`tlock` shape, and it is a TYPE-LEVEL
+//! guarantee rather than a documented request: a `std.Random.DefaultPrng` is
+//! not expressible at that parameter.
+//!
+//! It matters because the consequences are total, not marginal. A
+//! seed-derived master secret lets anyone who recovers the seed issue
+//! arbitrary valid credentials — the `t`-of-`n` threshold split becomes
+//! decoration, since the dealer's secret never had to be reassembled from
+//! shares. A witness nonce that repeats across two shows lets a verifier who
+//! sees both extract the hidden attributes and the blinding by the standard
+//! two-transcript Sigma-protocol argument, which is precisely what selective
+//! disclosure exists to prevent.
+//!
+//! Coconut has no published byte-exact test vector (SPEC §3), so nothing
+//! outside this repo needs a deterministic issuance. This module's own suites
+//! get one from `keygenSeededForTest` / `proveCredentialSeededForTest` —
+//! named so that a production call site cannot reach determinism by accident.
 //!
 //! ## Layout
 //!
@@ -66,7 +83,10 @@ pub const VerificationKey = keys.VerificationKey;
 pub const SecretKeyShare = keys.SecretKeyShare;
 pub const VerificationKeyShare = keys.VerificationKeyShare;
 pub const ThresholdKeys = keys.ThresholdKeys;
+pub const Entropy = keys.Entropy;
 pub const keygen = keys.keygen;
+/// TEST ONLY — see `keys.keygenSeededForTest`.
+pub const keygenSeededForTest = keys.keygenSeededForTest;
 pub const aggregateVerificationKeys = keys.aggregateVerificationKeys;
 pub const Credential = credential.Credential;
 pub const PartialCredential = credential.PartialCredential;
@@ -75,6 +95,8 @@ pub const CoconutError = credential.CoconutError;
 pub const signPartial = credential.signPartial;
 pub const aggregateCredential = credential.aggregateCredential;
 pub const proveCredential = credential.proveCredential;
+/// TEST ONLY — see `credential.proveCredentialSeededForTest`.
+pub const proveCredentialSeededForTest = credential.proveCredentialSeededForTest;
 pub const verifyCredential = credential.verifyCredential;
 pub const psSignWithSecret = credential.psSignWithSecret;
 pub const psVerifyPlain = credential.psVerifyPlain;
@@ -82,7 +104,7 @@ pub const psVerifyPlain = credential.psVerifyPlain;
 pub const meta = .{
     .platform = .any, // pure Fr/G1/G2/pairing math over bls12_381
     .role = .util,
-    .concurrency = .reentrant, // no shared state; randomness is a caller param
+    .concurrency = .reentrant, // no shared state; the one entropy source (keygen/proveCredential) takes a portable std.Io, no raw getrandom(2)
     .model_after = "asonnino/coconut (Python) + nymtech/coconut (Rust/Go), Coconut NDSS 2019",
     .deps = .{"bls12_381"},
 };

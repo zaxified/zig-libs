@@ -55,10 +55,28 @@
 //! see the end-to-end test in `kat_test.zig`. Still deferred: bootstrapping,
 //! CKKS, Galois automorphisms, CRT-slot batch encoding.
 //!
-//! Randomness is caller-supplied (`std.Random`, frost/bbs-style) so the module
-//! stays `platform = .any` and KATs are reproducible.
+//! ## Randomness — a security contract, not a portability tag
+//!
+//! `keyGen`, `encrypt` and `genRelinKey` — the three production entry points
+//! that consume entropy — take `io: std.Io` and draw from `std.Io.random`,
+//! which is **contractually a CSPRNG** (`std/Io.zig`: "Obtains entropy from a
+//! cryptographically secure pseudo-random number generator"). A `std.Random`
+//! parameter would accept `DefaultPrng.init(0)` at a call site that looks
+//! identical to a correct one, and here that is not a weakening but a break:
+//! `encrypt`'s `u,e0,e1` are the whole of BFV's IND-CPA claim, so a predictable
+//! stream lets anyone compute `c0 − p0·u − e0 = Δ·m` and read the plaintext
+//! **without the secret key**; `keyGen`'s `s` becomes a function of the seed;
+//! and `genRelinKey` publishes an encryption of `s²` to the evaluator under
+//! masks the evaluator can reproduce.
+//!
+//! The `…ForTest` twins keep a `std.Random` parameter, because the KATs in
+//! `kat_test.zig` (including the scripted-word test that pins WHICH draws
+//! `keyGen` makes, in order) and the seeded end-to-end tests must stay
+//! reproducible. Taking `std.Io` rather than reading OS entropy directly keeps
+//! the module `platform = .any` — the same shape `bbs`/`ibe`/`tlock` use.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const params = @import("params.zig");
 const ring = @import("ring.zig");
 const encode = @import("encode.zig");
@@ -635,10 +653,35 @@ pub fn Bfv(comptime P: params.Params) type {
             return out;
         }
 
-        /// Generate a BFV keypair. `random` supplies the secret (ternary) key,
-        /// the uniform public-key mask `a`, and the small error `e`.
+        /// Generate a BFV keypair. `io`'s CSPRNG supplies the secret (ternary)
+        /// key `s`, the uniform public-key mask `a`, and the small error `e`.
         /// `pk = (p0, p1) = (−(a·s + e), a)`.
-        pub fn keyGen(self: *const Self, random: std.Random) KeyPair {
+        ///
+        /// `io` must be a real `std.Io` — `std.Io.random` is documented as a
+        /// CSPRNG, which is why this parameter is not a `std.Random`. All three
+        /// values come off one stream, so a seeded PRNG makes `s` a
+        /// deterministic function of the seed: whoever guesses it, or reads it
+        /// out of the consumer's binary, decrypts every ciphertext ever
+        /// produced under that key. See `keyGenForTest` for the reproducible
+        /// twin the KATs use.
+        pub fn keyGen(self: *const Self, io: std.Io) KeyPair {
+            var src: std.Random.IoSource = .{ .io = io };
+            return self.keyGenForTest(src.interface());
+        }
+
+        /// TEST/KAT ONLY — `keyGen` with caller-chosen draws, so the KATs can
+        /// script the exact word sequence `s`, `a` and `e` are sampled from.
+        /// A `std.Random` here may be `DefaultPrng.init(0)`, which as a *key*
+        /// source is equivalent to publishing the key.
+        pub fn keyGenForTest(self: *const Self, random: std.Random) KeyPair {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             const s = self.sampleTernary(random);
             const a = self.sampleUniform(random);
             const e = self.sampleTernary(random);
@@ -649,8 +692,31 @@ pub fn Bfv(comptime P: params.Params) type {
         }
 
         /// Encrypt `pt ∈ R_t`: `c0 = Δ·m + p0·u + e0`, `c1 = p1·u + e1`,
-        /// `Δ = ⌊q/t⌋`. `random` supplies the ternary `u,e0,e1`.
-        pub fn encrypt(self: *const Self, pk: *const PublicKey, pt: *const Plaintext, random: std.Random) Ciphertext {
+        /// `Δ = ⌊q/t⌋`. `io`'s CSPRNG supplies the ternary `u,e0,e1`.
+        ///
+        /// `io` must be a real `std.Io`. These three values ARE the encryption:
+        /// the ciphertext is a deterministic function of `(pk, m, u, e0, e1)`,
+        /// so if the stream is predictable an attacker recomputes `u` and `e0`
+        /// and reads `c0 − p0·u − e0 = Δ·m` — recovering the plaintext with no
+        /// secret key involved at all. Encryption randomness is the whole of
+        /// BFV's IND-CPA claim, which is why this takes `std.Io` and not a
+        /// `std.Random` a seeded PRNG could satisfy.
+        pub fn encrypt(self: *const Self, pk: *const PublicKey, pt: *const Plaintext, io: std.Io) Ciphertext {
+            var src: std.Random.IoSource = .{ .io = io };
+            return self.encryptForTest(pk, pt, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `encrypt` with caller-chosen draws (deterministic
+        /// ciphertexts for the round-trip and noise-ledger tests).
+        pub fn encryptForTest(self: *const Self, pk: *const PublicKey, pt: *const Plaintext, random: std.Random) Ciphertext {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             const u = self.sampleTernary(random);
             const e0 = self.sampleTernary(random);
             const e1 = self.sampleTernary(random);
@@ -926,8 +992,29 @@ pub fn Bfv(comptime P: params.Params) type {
         /// Generate the relinearisation key: a base-`w` gadget key-switching
         /// key for `s²`. Row `i` pseudo-encrypts `w^i·s²` under `s` with a
         /// fresh ternary error `e_i`: `(b_i, a_i) = (−(a_i·s + e_i) + w^i·s²,
-        /// a_i)`. `random` supplies the uniform `a_i` and ternary `e_i`.
-        pub fn genRelinKey(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
+        /// a_i)`. `io`'s CSPRNG supplies the uniform `a_i` and ternary `e_i`.
+        ///
+        /// `io` must be a real `std.Io`. The relinearisation key is *published*
+        /// to whoever evaluates the circuit, and every row is an encryption of
+        /// a gadget multiple of `s²` under masks drawn here: with a predictable
+        /// stream the evaluator subtracts the known `a_i·s + e_i` and reads
+        /// `w^i·s²` off directly, i.e. the key hands the secret key to the
+        /// party it was meant to hide it from.
+        pub fn genRelinKey(self: *const Self, sk: *const SecretKey, io: std.Io) RelinKey {
+            var src: std.Random.IoSource = .{ .io = io };
+            return self.genRelinKeyForTest(sk, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `genRelinKey` with caller-chosen draws.
+        pub fn genRelinKeyForTest(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             const s2 = sk.s.mul(&sk.s, &self.engines);
             var rlk: RelinKey = undefined;
             var w_pow: QU = 1; // w^i < q for all rows used (see relin_digits)
@@ -1396,10 +1483,71 @@ test "SecretKey.deinit zeroes the secret ring" {
     const inst = try B.init();
     var prng = std.Random.DefaultPrng.init(0xBEEF);
     const rnd = prng.random();
-    var kp = inst.keyGen(rnd);
+    var kp = inst.keyGenForTest(rnd);
     // Sanity: the freshly generated ternary key is not all-zero (astronomically
     // unlikely for a real key, and this instance's seed is fixed).
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.sk), 0));
     kp.sk.deinit();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp.sk), 0));
+}
+
+// ── the RNG seam (B6) ─────────────────────────────────────────────────────────
+
+/// Type of a function's LAST parameter, or `null` if that parameter is itself
+/// generic. Used by the seam test below to read a signature at comptime.
+fn lastParamType(comptime F: type) ?type {
+    const p = @typeInfo(F).@"fn".params;
+    return p[p.len - 1].type;
+}
+
+test "RNG seam: keyGen/encrypt/genRelinKey take std.Io, only the ForTest twins take std.Random" {
+    const B = Bfv(params.test_tiny);
+    // The point of this test is the SIGNATURE, not the value. `std.Random` is a
+    // vtable — `DefaultPrng.init(0).random()` is indistinguishable from a CSPRNG
+    // at the call site — and with a predictable stream `encrypt` leaks the
+    // plaintext (`c0 − p0·u − e0 = Δ·m`, no secret key needed) and `genRelinKey`
+    // leaks `s²` to the evaluator. `std.Io.random` is contractually a CSPRNG and
+    // no `DefaultPrng` can be turned into a `std.Io`, so the degraded input is
+    // not expressible. Reintroducing a `std.Random` parameter fails here.
+    inline for (.{ @TypeOf(B.keyGen), @TypeOf(B.encrypt), @TypeOf(B.genRelinKey) }) |F| {
+        try testing.expect(lastParamType(F).? == std.Io);
+        try testing.expect(lastParamType(F).? != std.Random);
+    }
+    inline for (.{ @TypeOf(B.keyGenForTest), @TypeOf(B.encryptForTest), @TypeOf(B.genRelinKeyForTest) }) |F| {
+        try testing.expect(lastParamType(F).? == std.Random);
+    }
+}
+
+test "RNG seam: the std.Io path really draws entropy, and round-trips end to end" {
+    const B = Bfv(params.test_tiny);
+    const inst = try B.init();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A signature pin alone would pass over a body that ignores `io`. Two
+    // keypairs from the same `io` must differ — `s` is a ternary vector of
+    // length N=8 over 3 values plus a uniform mask `a` over the full modulus, so
+    // an equal `pk` here means the entropy is not being read.
+    const kp1 = inst.keyGen(io);
+    const kp2 = inst.keyGen(io);
+    try testing.expect(!kp1.pk.p0.eql(&kp2.pk.p0));
+
+    // Same for `encrypt`: two encryptions of the SAME plaintext under the SAME
+    // key must differ, which is exactly the property a seeded PRNG destroys.
+    var pt = B.Plaintext.zero(params.test_tiny.t);
+    pt.coeffs[0] = 3;
+    pt.coeffs[1] = 1;
+    const c1 = inst.encrypt(&kp1.pk, &pt, io);
+    const c2 = inst.encrypt(&kp1.pk, &pt, io);
+    try testing.expect(!c1.components[0].eql(&c2.components[0]));
+
+    // And the production path is a working path, not just a typed one.
+    const back = inst.decrypt(&kp1.sk, &c1);
+    try testing.expectEqualSlices(u64, &pt.coeffs, &back.coeffs);
+
+    // `genRelinKey` too — rows drawn from `io` differ between two keys.
+    const rlk1 = inst.genRelinKey(&kp1.sk, io);
+    const rlk2 = inst.genRelinKey(&kp1.sk, io);
+    try testing.expect(!rlk1.a[0].eql(&rlk2.a[0]));
 }

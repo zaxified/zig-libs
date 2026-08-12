@@ -74,7 +74,7 @@ test "POSITIVE CONTROL: psVerifyPlain accepts Lagrange aggregation, rejects Lagr
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0xF00D);
-    var kk = try keys.keygen(allocator, prng.random(), 3, 2, 4); // t=2, n=4
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 4); // t=2, n=4
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(5), frOf(6), frOf(7) };
@@ -104,7 +104,7 @@ test "POSITIVE CONTROL: any two distinct t-subsets aggregate to the same credent
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0xABCD);
-    var kk = try keys.keygen(allocator, prng.random(), 2, 3, 5); // t=3, n=5
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 3, 5); // t=3, n=5
     defer kk.deinit(allocator);
     const attrs = [_]Fr{ frOf(42), frOf(99) };
     const h = p.commonBase(&attrs);
@@ -136,7 +136,7 @@ test "ANCHOR (gated): threshold-issue → aggregate → show → verify PASSES" 
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x1234);
-    var kk = try keys.keygen(allocator, prng.random(), 3, 2, 4);
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 4);
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(1), frOf(2), frOf(3) };
@@ -151,7 +151,7 @@ test "ANCHOR (gated): threshold-issue → aggregate → show → verify PASSES" 
 
     // Disclose attribute 0, hide 1 and 2.
     const disclosed = [_]bool{ true, false, false };
-    const proof = try cred.proveCredential(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed);
+    const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed);
     defer proof.deinit(allocator);
 
     const disclosed_values = [_]Fr{attrs[0]};
@@ -164,7 +164,7 @@ test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated c
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x9999);
-    var kk = try keys.keygen(allocator, prng.random(), 2, 2, 3);
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(11), frOf(22) };
@@ -175,7 +175,7 @@ test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated c
     };
     const credential = try cred.aggregateCredential(allocator, &partials, 2);
     const disclosed = [_]bool{ true, false };
-    const proof = try cred.proveCredential(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed);
+    const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed);
     defer proof.deinit(allocator);
 
     // 1. wrong disclosed value → reject
@@ -200,7 +200,7 @@ test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated c
     // on the REAL vector. The PS pairing equation e(σ₁',κ)==e(σ₂'·ν,g2) is the
     // backstop that binds the credential to the claimed attributes and REJECTS.
     const forged_attrs = [_]Fr{ frOf(11), frOf(999) };
-    const forged = try cred.proveCredential(allocator, prng.random(), p, kk.master_vk, credential, &forged_attrs, &disclosed);
+    const forged = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &forged_attrs, &disclosed);
     defer forged.deinit(allocator);
     try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, forged, &good_disclosed));
 }
@@ -211,7 +211,7 @@ test "THRESHOLD (gated): fewer than t partials fails aggregation" {
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x2468);
-    var kk = try keys.keygen(allocator, prng.random(), 2, 3, 5); // t=3
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 3, 5); // t=3
     defer kk.deinit(allocator);
     const attrs = [_]Fr{ frOf(7), frOf(8) };
     const h = p.commonBase(&attrs);

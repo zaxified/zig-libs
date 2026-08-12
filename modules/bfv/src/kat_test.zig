@@ -285,12 +285,12 @@ test "homomorphic ADD end-to-end: Dec(Enc(a) ⊕ Enc(b)) == a+b (mod t)" {
     const inst = try B.init();
     var prng = std.Random.DefaultPrng.init(1);
     const rnd = prng.random();
-    const kp = inst.keyGen(rnd);
+    const kp = inst.keyGenForTest(rnd);
     const Pt = B.Plaintext;
     const ma_pt = Pt.fromCoeffs(P.t, .{ 1, 2, 3, 0, 1, 2, 3, 0 });
     const mb_pt = Pt.fromCoeffs(P.t, .{ 3, 3, 1, 2, 0, 0, 1, 1 });
-    const ca = inst.encrypt(&kp.pk, &ma_pt, rnd);
-    const cb = inst.encrypt(&kp.pk, &mb_pt, rnd);
+    const ca = inst.encryptForTest(&kp.pk, &ma_pt, rnd);
+    const cb = inst.encryptForTest(&kp.pk, &mb_pt, rnd);
     const cs = inst.add(&ca, &cb);
     const got = inst.decrypt(&kp.sk, &cs);
     const want = Pt.addRef(&ma_pt, &mb_pt);
@@ -313,8 +313,8 @@ test "homomorphic MUL+RELIN end-to-end: Dec(relin(Enc(a) ⊗ Enc(b))) == a·b (m
     const inst = try BM.init();
     var prng = std.Random.DefaultPrng.init(2);
     const rnd = prng.random();
-    const kp = inst.keyGen(rnd);
-    const rlk = inst.genRelinKey(&kp.sk, rnd);
+    const kp = inst.keyGenForTest(rnd);
+    const rlk = inst.genRelinKeyForTest(&kp.sk, rnd);
     const Pt = BM.Plaintext;
     const t = PM.t;
     for (0..8) |it| {
@@ -328,8 +328,8 @@ test "homomorphic MUL+RELIN end-to-end: Dec(relin(Enc(a) ⊗ Enc(b))) == a·b (m
         }
         const a = Pt.fromCoeffs(t, ac);
         const b = Pt.fromCoeffs(t, bc);
-        const ca = inst.encrypt(&kp.pk, &a, rnd);
-        const cb = inst.encrypt(&kp.pk, &b, rnd);
+        const ca = inst.encryptForTest(&kp.pk, &a, rnd);
+        const cb = inst.encryptForTest(&kp.pk, &b, rnd);
         const want = Pt.mulRef(&a, &b);
         const prod3 = inst.mul(&ca, &cb); // 3-component
         try testing.expectEqual(@as(usize, 3), prod3.numComponents());
@@ -347,8 +347,8 @@ test "positive control: corrupted relin key is caught by the mul anchor (key-swi
     const inst = try BM.init();
     var prng = std.Random.DefaultPrng.init(4);
     const rnd = prng.random();
-    const kp = inst.keyGen(rnd);
-    var rlk = inst.genRelinKey(&kp.sk, rnd);
+    const kp = inst.keyGenForTest(rnd);
+    var rlk = inst.genRelinKeyForTest(&kp.sk, rnd);
     // Corrupt the gadget rows' b-components: they no longer pseudo-encrypt
     // w^i·s², so the key-switched phase is wrong and the product must NOT
     // decrypt to a·b (deterministic seed ⇒ deterministic catch).
@@ -360,8 +360,8 @@ test "positive control: corrupted relin key is caught by the mul anchor (key-swi
     const Pt = BM.Plaintext;
     const a = Pt.fromCoeffs(PM.t, [_]u64{3} ** BM.degree);
     const b = Pt.fromCoeffs(PM.t, [_]u64{5} ** BM.degree);
-    const ca = inst.encrypt(&kp.pk, &a, rnd);
-    const cb = inst.encrypt(&kp.pk, &b, rnd);
+    const ca = inst.encryptForTest(&kp.pk, &a, rnd);
+    const cb = inst.encryptForTest(&kp.pk, &b, rnd);
     const prod2 = inst.relinearize(&inst.mul(&ca, &cb), &rlk);
     const got = inst.decrypt(&kp.sk, &prod2);
     const want = Pt.mulRef(&a, &b);
@@ -374,7 +374,7 @@ test "enc/dec round-trip at realistic dimension (bfv_toy N=1024, comfortable mar
     const inst = try B.init();
     var prng = std.Random.DefaultPrng.init(0xB5F);
     const rnd = prng.random();
-    const kp = inst.keyGen(rnd);
+    const kp = inst.keyGenForTest(rnd);
     const Pt = B.Plaintext;
     const t = params.bfv_toy.t;
     // A few random plaintexts + a homomorphic add, all decrypt back exactly:
@@ -388,8 +388,8 @@ test "enc/dec round-trip at realistic dimension (bfv_toy N=1024, comfortable mar
         }
         const a = Pt.fromCoeffs(t, ca);
         const b = Pt.fromCoeffs(t, cb);
-        const ea = inst.encrypt(&kp.pk, &a, rnd);
-        const eb = inst.encrypt(&kp.pk, &b, rnd);
+        const ea = inst.encryptForTest(&kp.pk, &a, rnd);
+        const eb = inst.encryptForTest(&kp.pk, &b, rnd);
         try testing.expectEqualSlices(u64, &a.coeffs, &inst.decrypt(&kp.sk, &ea).coeffs);
         const sum = inst.decrypt(&kp.sk, &inst.add(&ea, &eb));
         try testing.expectEqualSlices(u64, &Pt.addRef(&a, &b).coeffs, &sum.coeffs);
@@ -603,7 +603,7 @@ test "ternary sampler KAT: scripted draws map to the exact trits (-1, 0, +1)" {
 
     const B = bfv.Bfv(P); // N=8, primes {17,97}
     const inst = try B.init();
-    const kp = inst.keyGen(script.random()); // `s` is sampled first, from words[0..8]
+    const kp = inst.keyGenForTest(script.random()); // `s` is sampled first, from words[0..8]
 
     for (0..P.primes.len) |i| {
         const qi = primes8[i];
@@ -626,7 +626,7 @@ test "ternary sampler: every limb is a trit, consistently across limbs, all thre
     const rnd = prng.random();
     var seen = [_]usize{ 0, 0, 0 };
     for (0..400) |_| {
-        const kp = inst.keyGen(rnd);
+        const kp = inst.keyGenForTest(rnd);
         for (0..P.n) |j| {
             // Limb 0 decides the trit; every other limb must encode the SAME
             // small integer (this is the invariant that keeps the decrypt
@@ -679,8 +679,8 @@ fn secEndToEnd() !void {
     const inst = try BSEC.init();
     var prng = std.Random.DefaultPrng.init(0x5EC0_0001);
     const rnd = prng.random();
-    const kp = inst.keyGen(rnd);
-    const rlk = inst.genRelinKey(&kp.sk, rnd);
+    const kp = inst.keyGenForTest(rnd);
+    const rlk = inst.genRelinKeyForTest(&kp.sk, rnd);
     const Pt = BSEC.Plaintext;
     const t = SEC.t;
 
@@ -699,9 +699,9 @@ fn secEndToEnd() !void {
     const b = Pt.fromCoeffs(t, bc);
     const c = Pt.fromCoeffs(t, cc);
 
-    const ea = inst.encrypt(&kp.pk, &a, rnd);
-    const eb = inst.encrypt(&kp.pk, &b, rnd);
-    const ec = inst.encrypt(&kp.pk, &c, rnd);
+    const ea = inst.encryptForTest(&kp.pk, &a, rnd);
+    const eb = inst.encryptForTest(&kp.pk, &b, rnd);
+    const ec = inst.encryptForTest(&kp.pk, &c, rnd);
     // Fresh encryption round-trips.
     try testing.expectEqualSlices(u64, &a.coeffs, &inst.decrypt(&kp.sk, &ea).coeffs);
 
@@ -753,8 +753,8 @@ test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget
     const inst = try BM.init();
     var prng = std.Random.DefaultPrng.init(3);
     const rnd = prng.random();
-    const kp = inst.keyGen(rnd);
-    const rlk = inst.genRelinKey(&kp.sk, rnd);
+    const kp = inst.keyGenForTest(rnd);
+    const rlk = inst.genRelinKeyForTest(&kp.sk, rnd);
     const Pt = BM.Plaintext;
     const t = PM.t;
     for (0..4) |it| {
@@ -770,9 +770,9 @@ test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget
         const a = Pt.fromCoeffs(t, ac);
         const b = Pt.fromCoeffs(t, bc);
         const c = Pt.fromCoeffs(t, cc);
-        const ea = inst.encrypt(&kp.pk, &a, rnd);
-        const eb = inst.encrypt(&kp.pk, &b, rnd);
-        const ec = inst.encrypt(&kp.pk, &c, rnd);
+        const ea = inst.encryptForTest(&kp.pk, &a, rnd);
+        const eb = inst.encryptForTest(&kp.pk, &b, rnd);
+        const ec = inst.encryptForTest(&kp.pk, &c, rnd);
         const ab = inst.relinearize(&inst.mul(&ea, &eb), &rlk);
         // Budget must still be positive after one multiply…
         const budget_fresh = inst.noiseBudget(&kp.sk, &ea);

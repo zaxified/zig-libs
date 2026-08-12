@@ -33,11 +33,21 @@
 //! breakdown and the failure-probability ledger.
 //!
 //! **Toy/test parameters only — no security level is claimed.**
+//!
+//! ## Randomness
+//!
+//! Key generation and encryption take `io: std.Io` and draw from
+//! `std.Io.random`, which is contractually a CSPRNG. A `std.Random` parameter
+//! would let a consumer pass `DefaultPrng.init(0)` at a call site that looks
+//! identical to a correct one, and a predictable stream does not weaken this
+//! scheme — it removes it (`dim` ciphertexts then recover the secret key by
+//! Gaussian elimination). The `…ForTest` twins keep `std.Random` for the KATs
+//! and seeded end-to-end tests; see `tfhe.zig`'s "Randomness" doc comment.
 
 const std = @import("std");
 
 pub const meta = .{
-    .platform = .any, // pure computation; caller-supplied std.Random (no OS RNG)
+    .platform = .any, // pure computation; the entropy seam is a portable std.Io (contractually a CSPRNG), no raw getrandom(2)
     .role = .util,
     .concurrency = .reentrant, // no shared state; caller supplies all inputs
     .model_after = "TFHE (Chillotti–Gama–Georgieva–Izabachène, ePrint 2016/870) + FHEW (Ducas–Micciancio, EUROCRYPT 2015)",

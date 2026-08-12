@@ -34,7 +34,7 @@ const coconut = @import("coconut");
 // Setup + trusted-dealer threshold keygen (t-of-n over q attributes).
 const p = try coconut.Parameters.generate(allocator, q);
 defer p.deinit(allocator);
-const keys = try coconut.keygen(allocator, prng.random(), q, t, n);
+const keys = try coconut.keygen(allocator, io, q, t, n); // io: std.Io — a CSPRNG by contract
 defer keys.deinit(allocator);
 
 // Group verification key from any t vk shares (Lagrange-in-exponent) — REAL.
@@ -47,14 +47,31 @@ const h = p.commonBase(&attributes);
 // Fable cores (threshold-issue → aggregate → selective-disclosure show → verify):
 const partial = try coconut.signPartial(keys.sk_shares[j], h, &attributes);
 const cred    = try coconut.aggregateCredential(allocator, partials, t);
-const proof   = try coconut.proveCredential(allocator, prng.random(), p, vk, cred, &attributes, &disclosed);
+const proof   = try coconut.proveCredential(allocator, io, p, vk, cred, &attributes, &disclosed);
 defer proof.deinit(allocator);
 const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed_values);
 ```
 
-Randomness (keygen blinding, show nonces) is a caller-supplied `std.Random`, so
-a seeded PRNG makes issuance and show deterministic in tests — the
-`bbs`/`frost`/`ibe` convention.
+## Randomness
+
+`keygen` and `proveCredential` take `io: std.Io` and draw from
+`std.Io.random`, which is **contractually a CSPRNG** — the `bbs`/`ibe`/`tlock`
+shape. A `std.Random.DefaultPrng` is not expressible at that parameter, which
+is the whole point:
+
+- A seed-derived master secret `(x, y₁…y_q)` lets anyone who recovers the seed
+  issue arbitrary valid credentials for the entire system. The `t`-of-`n`
+  threshold split becomes decoration, because the dealer's secret never had to
+  be reassembled from shares.
+- A witness nonce that repeats across two shows lets a verifier who sees both
+  extract the hidden attributes and the blinding `r` by the standard
+  two-transcript Sigma-protocol argument — the exact privacy selective
+  disclosure exists to provide.
+
+Coconut has no published byte-exact vector (`SPEC.md` §3), so no consumer needs
+a deterministic issuance. This module's own tests use
+`keygenSeededForTest` / `proveCredentialSeededForTest`; the names are the
+signal, and there is no seeded option on the production functions.
 
 ## Verify
 

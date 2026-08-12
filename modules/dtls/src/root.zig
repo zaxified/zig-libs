@@ -200,6 +200,33 @@
 //! server: without it, a spoofed ClientHello turns the server into an
 //! amplifier.
 //!
+//! ## Randomness — a caller obligation, stated once here and at each entry point
+//!
+//! `Connection.startHandshake` and `Connection.handleFlight` take a
+//! `std.Random`. It **MUST be a cryptographically secure source**
+//! (`std.Random.DefaultCsprng` seeded from real OS entropy in production);
+//! std 0.16 removed `std.crypto.random`, so this module has no hidden RNG —
+//! the same caller-injected seam `jwt`/`jwe` use.
+//!
+//! The stake is the ephemeral (EC)DHE private key: in `.cert_dhe` mode those
+//! calls reach `ecdheGenerate`, and under a seeded PRNG a passive eavesdropper
+//! who learns the seed derives the same private key, recomputes the shared
+//! secret and decrypts every recorded session from that peer RETROACTIVELY —
+//! forward secrecy, the reason an ephemeral key exists, is gone. Smaller but
+//! real: a constant ClientHello/ServerHello `random` (byte-identical, linkable
+//! handshakes) and a repeated RSA-PSS CertificateVerify salt.
+//!
+//! `std.Random` is a vtable: a seeded generator is indistinguishable from
+//! `getrandom(2)` at the call site, so **this module cannot detect the mistake
+//! and does not try to.** The parameter type is deliberate — `Connection` is a
+//! sans-I/O state machine (no socket, no clock, no allocator; every external
+//! fact is an input value) and `handleFlight` is the only way to drive it, so
+//! a `std.Io` capability handle threaded through it per datagram would
+//! contradict that design. `certverify.sign` shows where a type CAN carry the
+//! requirement: it takes `?std.Random` and fails closed with
+//! `error.RandomRequired` for RSA-PSS, while the ECDSA/Ed25519 arms fall back
+//! to RFC 6979/8032 deterministic derivation.
+//!
 //! **Out of scope (deliberate, not deferred-as-a-stub):** 0-RTT/early data; session
 //! resumption (`res binder`/NewSessionTicket); key update (RFC 8446
 //! §4.6.3); and the CCM

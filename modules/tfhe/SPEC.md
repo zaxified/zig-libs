@@ -191,7 +191,23 @@ own ~4× memory cost for the prepared key.
 ## Threats / caveats
 
 - **No security level claimed.** `toy` is correctness-only; do not encrypt
-  anything real until a security-grade parameter set lands.
+  anything real until a security-grade parameter set lands. `Params` is an open
+  struct, though — a consumer can instantiate `Tfhe(P)` at whatever dimensions
+  it likes — so the entropy seam below is written for the production case, not
+  for `toy`.
+- **The entropy seam is typed, not documented.** Key generation and encryption
+  take `io: std.Io` and draw from `std.Io.random`, which std documents as a
+  CSPRNG. They deliberately do NOT take `std.Random`: that is a vtable, its
+  quality cannot be read at the call site, and `DefaultPrng.init(0).random()`
+  looks exactly like a correct argument. The consequence of getting it wrong is
+  not a weakened instance but no instance: with `a` and `e` predictable,
+  `b = ⟨a,s⟩ + μ + e` is a linear equation in `s`, and `dim` ciphertexts recover
+  the secret key by Gaussian elimination — while the bootstrap and key-switch
+  keys, which a deployment *publishes*, are encryptions of that same key. The
+  `…ForTest` twins keep `std.Random` so the draw→value KATs and the seeded
+  end-to-end tests stay reproducible; the name is the only thing separating them
+  from the production path, and `tfhe.zig`'s "RNG seam" tests pin both halves of
+  that split at comptime.
 - **Source-level constant-time in the key path; not verified codegen.** The
   secret samplers are fixed-cost and branch-free: `sampleBit` takes the top bit
   of one `u32` draw (bit-identical to the `std.Random.uintLessThan(u32, 2)` it

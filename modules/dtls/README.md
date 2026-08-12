@@ -201,6 +201,7 @@ var conn = try dtls.Connection.clientInit(cfg); // real, validated, no panic
 
 // The handshake flight engine drives a real RFC 9147 §5 PSK handshake:
 var out: [1500]u8 = undefined;
+// `random` MUST be a cryptographically secure source — see "Randomness" below.
 const client_hello = try conn.startHandshake(random, now_ms, &out);
 // send client_hello to the peer, feed its reply to conn.handleFlight(...);
 // see Connection.zig's tests for a full client<->server loopback.
@@ -211,6 +212,37 @@ try conn.installApplicationKeys(.aes_128_gcm_sha256, client_ap_secret, server_ap
 const record = try conn.send("hello", &out);   // AEAD + seq-number encryption
 // peer:  const msg = try peer.recv(record, &buf);
 ```
+
+
+## Randomness — what the caller must supply
+
+`startHandshake` and `handleFlight` take a `std.Random`. It **MUST be a
+cryptographically secure source** (`std.Random.DefaultCsprng` seeded from real
+OS entropy in production); std 0.16 removed `std.crypto.random`, so this module
+has no hidden RNG and cannot obtain one — the same caller-injected seam the
+`jwt`/`jwe` siblings use.
+
+This is not a style note. In `.cert_dhe` mode those two calls draw the
+**x25519 / secp256r1 ephemeral private key**. Under a seeded PRNG a passive
+eavesdropper who learns the seed derives that key, recomputes the (EC)DHE
+shared secret and decrypts every recorded session from that peer,
+**retroactively** — including traffic captured long before the seed leaked.
+Forward secrecy, the reason the handshake generates an ephemeral key at all,
+is what is lost. Lesser but real: the ClientHello/ServerHello 32-byte `random`
+becomes constant (every handshake byte-identical and linkable), and the
+RSA-PSS CertificateVerify salt repeats.
+
+`std.Random` is a vtable, so a seeded generator and `getrandom(2)` are
+indistinguishable at the call site — **this module cannot detect the mistake,
+and does not try to.** The parameter type was kept deliberately: `Connection`
+is a sans-I/O state machine (no socket, no clock, no allocator — every
+external fact arrives as an input value, see the HelloRetryRequest section),
+and `handleFlight` is the only way to drive it, so taking a `std.Io` capability
+handle per datagram would contradict that design and would leave the seeded
+path as the one every test exercises. The consequence is stated plainly rather
+than engineered away: **a caller who passes a seeded PRNG still gets a
+predictable ephemeral key.** `Connection.zig` carries a test that demonstrates
+exactly that, so the warning above is verified rather than asserted.
 
 The `dtls.keyschedule` and `dtls.aead` modules are the KAT-validated crypto
 core; `dtls.record`/`handshake`/`flight`/`messages` are the pure framing

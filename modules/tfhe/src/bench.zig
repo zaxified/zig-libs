@@ -106,16 +106,16 @@ test "bench: end-to-end gate bootstrap at the toy parameter set" {
     const Toy = tfhe.Tfhe(params.toy);
     var prng = std.Random.DefaultPrng.init(0xB007);
     const rnd = prng.random();
-    const small = Toy.lweKeyGen(64, rnd);
-    const glwe = Toy.glweKeyGen(rnd);
-    const bsk = Toy.bootstrapKeyGen(&small, &glwe, rnd);
-    const ksk = Toy.keySwitchKeyGen(&glwe, &small, rnd);
+    const small = Toy.lweKeyGenForTest(64, rnd);
+    const glwe = Toy.glweKeyGenForTest(rnd);
+    const bsk = Toy.bootstrapKeyGenForTest(&small, &glwe, rnd);
+    const ksk = Toy.keySwitchKeyGenForTest(&glwe, &small, rnd);
 
     // Identity LUT over a 2-slot message space — the same one the harness's
     // end-to-end anchor uses.
     const id = Toy.testPolynomial(2, .{ Toy.encodeBit(0), Toy.encodeBit(1) });
 
-    const ct = Toy.lweEncrypt(64, &small, Toy.encodeBit(1), rnd);
+    const ct = Toy.lweEncryptForTest(64, &small, Toy.encodeBit(1), rnd);
     const reps: usize = 10;
     var sink: u32 = 0;
     const t0 = nowNs();

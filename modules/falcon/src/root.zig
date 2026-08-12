@@ -274,23 +274,45 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
             return Self.Signer.signWithRng(&sk.tree, msg, rng, nonce_out, sig_out, Self.sig_bound);
         }
 
-        /// Deterministic signing: seeds `sign.ShakePrng` from `seed`
-        /// instead of a real CSPRNG, so the same (key, msg, seed)
-        /// always yields the same signature. NOTE: this is NOT the
-        /// NIST-KAT derandomization scheme (the KATs draw the nonce and
-        /// the signer seed as two separate AES-CTR-DRBG calls — see
-        /// `kat_sign_test.zig`'s replay harness); it is this module's
-        /// own deterministic mode.
-        pub fn signDeterministic(
-            sk: *const Self.SigningKey,
-            msg: []const u8,
-            seed: []const u8,
-            nonce_out: *[nonce_length]u8,
-            sig_out: []u8,
-        ) Self.Signer.SignError!usize {
-            var prng = sign.ShakePrng.init(seed);
-            return Self.Signer.signWithRng(&sk.tree, msg, prng.random(), nonce_out, sig_out, Self.sig_bound);
-        }
+        // Deliberately ABSENT: a seeded "deterministic" signing mode.
+        //
+        // This module used to expose `signDeterministic(sk, msg, seed)`,
+        // which fed `signWithRng` a `sign.ShakePrng` seeded from `seed`
+        // ALONE — so the 40-byte salt r AND the entire Gaussian sampling
+        // tape were a function of the seed only, identical for every
+        // message signed under one seed (the name invited exactly that:
+        // "deterministic" in Ed25519/RFC 6979 means derived from key and
+        // message). That voids Falcon's GPV security argument: each
+        // signature on its own is a spherical Gaussian around
+        // c = H(r || msg) and leaks nothing about the secret basis, but
+        // two signatures drawn from a SHARED tape at different centres
+        // are jointly basis-dependent — the correlation structure reopens
+        // the Nguyen–Regev "learning a parallelepiped" key-recovery
+        // class that per-signature independent Gaussian sampling exists
+        // to close (the spec sizes r at 320 bits precisely so no two
+        // signatures under one key ever sample around the same point).
+        // The constant salt also trivially links every signature made
+        // under one seed.
+        //
+        // It was removed rather than derandomized RFC-6979-style
+        // (absorbing sk and msg) because (a) Falcon specifies no
+        // deterministic mode and the reference implementation ships
+        // none, so any absorption order / domain separation chosen here
+        // would be a novel construction with no KAT or reference anchor
+        // — in a module whose entire warrant is byte-exact anchoring;
+        // and (b) even a correctly derandomized signer re-signs an
+        // identical message identically, which is exactly what
+        // fault-differential and trace-averaging attacks on
+        // deterministic lattice signers need — on top of a `samplerZ`
+        // that has had no machine-checked side-channel verification
+        // (see gaussian.zig). Nor is the NIST-KAT DRBG a model for a
+        // production API: it derives everything from a harness seed,
+        // never from (sk, msg), so it has the same per-seed salt reuse.
+        //
+        // Tests that need reproducible signatures seed `sign.ShakePrng`
+        // and call `sign.Signer.signWithRng` directly, owning the PRNG
+        // substitution explicitly (the KAT tests replay the NIST DRBG
+        // through that same seam).
     };
 }
 
@@ -329,7 +351,6 @@ pub const SigningKey = P512.SigningKey;
 pub const KeygenError = P512.KeygenError;
 pub const generateKeyPair = P512.generateKeyPair;
 pub const signRandomized = P512.signRandomized;
-pub const signDeterministic = P512.signDeterministic;
 
 // ---- Falcon-1024: same shape, `_1024`-suffixed. ----
 
@@ -354,7 +375,17 @@ pub const SigningKey1024 = P1024.SigningKey;
 pub const KeygenError1024 = P1024.KeygenError;
 pub const generateKeyPair1024 = P1024.generateKeyPair;
 pub const signRandomized1024 = P1024.signRandomized;
-pub const signDeterministic1024 = P1024.signDeterministic;
+
+test "no seeded signing mode in the public surface (salt-reuse guard)" {
+    // Guard for the decision documented at `signRandomized`: the removed
+    // `signDeterministic(sk, msg, seed)` drew the 40-byte salt from a
+    // ShakePrng seeded by `seed` ALONE, so every message signed under one
+    // seed shared a salt (verified empirically before removal: two
+    // different messages, one seed, byte-identical nonces). This test is
+    // RED as long as any such entry point exists on the public surface.
+    try std.testing.expect(!@hasDecl(@This(), "signDeterministic"));
+    try std.testing.expect(!@hasDecl(@This(), "signDeterministic1024"));
+}
 
 test "public API surface: sizes, headers, bound" {
     try std.testing.expectEqual(@as(usize, 897), PublicKey.encoded_length);

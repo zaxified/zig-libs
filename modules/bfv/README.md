@@ -64,13 +64,18 @@ const T = bfv.Ntt(1024);
 const engine = try T.init(1073750017); // prime ≡ 1 mod 2048
 const product = engine.mulNegacyclic(a, b); // a·b mod (X^1024 + 1)
 
-// Scheme surface (complete):
+// Scheme surface (complete). `io` is a `std.Io`: key generation, encryption and
+// the relin key draw from `std.Io.random`, which is contractually a CSPRNG.
+// That is deliberate — a `std.Random` parameter would accept
+// `DefaultPrng.init(0)` at a call site that looks identical, and with `u,e0,e1`
+// predictable `c0 − p0·u − e0 = Δ·m` recovers the plaintext WITHOUT the secret
+// key. The `…ForTest` twins take a `std.Random` for KAT reproducibility.
 const B = bfv.Bfv(bfv.params.test_mul);
 const inst = try B.init();
-const kp = inst.keyGen(rand);
-const rlk = inst.genRelinKey(&kp.sk, rand);
-const ca = inst.encrypt(&kp.pk, &pa, rand);
-const cb = inst.encrypt(&kp.pk, &pb, rand);
+const kp = inst.keyGen(io);
+const rlk = inst.genRelinKey(&kp.sk, io);
+const ca = inst.encrypt(&kp.pk, &pa, io);
+const cb = inst.encrypt(&kp.pk, &pb, io);
 const sum = inst.add(&ca, &cb);                   // Dec == a+b (mod t)
 const prod = inst.relinearize(&inst.mul(&ca, &cb), &rlk); // Dec == a·b (mod t)
 const bits_left = inst.noiseBudget(&kp.sk, &prod); // remaining headroom (bits)

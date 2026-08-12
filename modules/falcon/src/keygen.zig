@@ -63,8 +63,8 @@ pub fn Keygen(comptime Ring: type) type {
             /// key is no longer needed (e.g. after persisting
             /// `toSecretKeyBytes()` to a dedicated secret store) —
             /// idempotent, safe to call more than once. This struct is the
-            /// caller-owned, long-lived signing key (every `signRandomized`/
-            /// `signDeterministic` call reuses it), so unlike the
+            /// caller-owned, long-lived signing key (every `signRandomized`
+            /// call reuses it), so unlike the
             /// per-signature scratch in `ffsampling.sampleSignature` it is
             /// never wiped automatically — the caller decides when signing
             /// is done.
@@ -81,8 +81,11 @@ pub fn Keygen(comptime Ring: type) type {
         };
 
         /// Generate a fresh Falcon key pair. `rng` is the entropy
-        /// source: `std.crypto.random` for production keygen, or
-        /// `sign.ShakePrng` seeded from a KAT `seed` for
+        /// source: for production keygen an OS-entropy-backed
+        /// `std.Random` (Zig 0.16 removed the global `std.crypto.random`;
+        /// on Linux wrap `std.os.linux.getrandom` in a `std.Random` —
+        /// the repo-wide idiom, see e.g. `modules/ssh`'s `fillRandom`),
+        /// or `sign.ShakePrng` seeded from a KAT `seed` for
         /// deterministic/reproducible generation (see `sign.zig`).
         /// Errors only if the generated `f` is non-invertible mod q —
         /// `ntru.generate`'s own acceptance loop already rules that out

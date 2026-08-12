@@ -25,8 +25,26 @@
 //!   - `externalProduct` (GGSW ⊠ GLWE), `cmux`, `blindRotate`, `bootstrap` — all
 //!     real; no `@panic` remains behind the gate.
 //!
-//! Randomness is caller-supplied (`std.Random`) so the module is `platform =
-//! .any` and tests are reproducible.
+//! ## Randomness — a security contract, not a portability tag
+//!
+//! Every production key-generation and encryption entry point takes
+//! `io: std.Io` and draws from `std.Io.random`, which is **contractually a
+//! CSPRNG** (`std/Io.zig`: "Obtains entropy from a cryptographically secure
+//! pseudo-random number generator"). That is deliberate and it is the whole
+//! point of the signature: a `std.Random` parameter would accept
+//! `DefaultPrng.init(0)` at a call site that looks identical to a correct one,
+//! and a seeded stream does not weaken this scheme — it removes it. With `e`
+//! and `a` predictable, `b = ⟨a,s⟩ + μ + e` is a linear system: `dim`
+//! ciphertexts recover the secret key `s` by Gaussian elimination. The
+//! bootstrap and key-switch keys are GLWE/GGSW encryptions of that same key and
+//! are *published* to the evaluator, so predictable masking there hands the key
+//! over directly.
+//!
+//! The `…ForTest` twins keep a `std.Random` parameter, because the draw→value
+//! KATs at the bottom of this file and the seeded end-to-end tests must stay
+//! reproducible. They are named so that a production call site cannot use one
+//! by accident. Taking `std.Io` (rather than reading OS entropy directly) keeps
+//! the module `platform = .any`, the same shape `bbs`/`ibe`/`tlock` use.
 //!
 //! ## Constant-time posture (key path)
 //!
@@ -42,6 +60,7 @@
 //! coefficients, never on key material.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const params = @import("params.zig");
 const torus = @import("torus.zig");
 const polymod = @import("poly.zig");
@@ -232,14 +251,72 @@ pub fn Tfhe(comptime P: params.Params) type {
         }
 
         // ── keygen ───────────────────────────────────────────────────────────
+        //
+        // Every randomness-consuming entry point in this file exists twice:
+        //
+        //   - `f(…, io: std.Io)`               — PRODUCTION. `std.Io.random` is
+        //     contractually a CSPRNG, so the degraded input is not expressible
+        //     at the type: a consumer cannot hand `std.Io` a `DefaultPrng`.
+        //   - `fForTest(…, random: std.Random)` — TEST/KAT ONLY. Reproducible
+        //     draws for the KATs and the seeded end-to-end tests. Never call
+        //     one of these from production code; the name is the signal.
+        //
+        // See the module doc comment for what a predictable stream actually
+        // costs (it does not weaken the scheme, it removes it).
 
-        pub fn lweKeyGen(comptime dim: usize, random: std.Random) LweKey(dim) {
+        /// Generate a binary LWE secret key of dimension `dim` — the module's
+        /// most sensitive value — with every bit drawn from `io`'s CSPRNG.
+        ///
+        /// `io` must be a real `std.Io` (its `random` is documented as
+        /// cryptographically secure). If the bits were drawn from a seeded PRNG
+        /// the key would be a deterministic function of that seed: anyone who
+        /// guesses it, or reads it out of the consumer's binary, decrypts every
+        /// ciphertext the deployment ever produced. That is why this takes
+        /// `std.Io` and `lweKeyGenForTest` — which takes anything — is named
+        /// the way it is.
+        pub fn lweKeyGen(comptime dim: usize, io: std.Io) LweKey(dim) {
+            var src: std.Random.IoSource = .{ .io = io };
+            return lweKeyGenForTest(dim, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `lweKeyGen` with caller-chosen draws, so the
+        /// draw→key-bit mapping can be frozen by a KAT and the end-to-end tests
+        /// stay reproducible. A `std.Random` here may be `DefaultPrng.init(0)`,
+        /// which as a *key* source is equivalent to publishing the key.
+        pub fn lweKeyGenForTest(comptime dim: usize, random: std.Random) LweKey(dim) {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             var key: LweKey(dim) = undefined;
             for (&key.s) |*x| x.* = sampleBit(random);
             return key;
         }
 
-        pub fn glweKeyGen(random: std.Random) GlweKey {
+        /// Generate the binary GLWE secret key (one polynomial) from `io`'s
+        /// CSPRNG. Same contract and same stakes as `lweKeyGen`: this key is
+        /// what the accumulator and every GGSW row are encrypted under, and
+        /// `extractGlweKey` reads its coefficients out as a plain LWE key, so a
+        /// seeded stream here compromises the whole bootstrapping pipeline.
+        pub fn glweKeyGen(io: std.Io) GlweKey {
+            var src: std.Random.IoSource = .{ .io = io };
+            return glweKeyGenForTest(src.interface());
+        }
+
+        /// TEST/KAT ONLY — see `lweKeyGenForTest`.
+        pub fn glweKeyGenForTest(random: std.Random) GlweKey {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             var s = Poly.zero();
             for (&s.c) |*x| x.* = sampleBit(random);
             return .{ .s = s };
@@ -256,7 +333,30 @@ pub fn Tfhe(comptime P: params.Params) type {
 
         // ── LWE encrypt / decrypt ────────────────────────────────────────────
 
-        pub fn lweEncrypt(comptime dim: usize, key: *const LweKey(dim), mu: T, random: std.Random) Lwe(dim) {
+        /// Encrypt an already-scaled torus message `μ` under `key`, drawing the
+        /// mask `a` and the noise `e` from `io`'s CSPRNG.
+        ///
+        /// `io` must be a real `std.Io`. Both halves of the ciphertext come off
+        /// one stream, so if that stream is predictable then `a` and `e` are
+        /// known to the attacker and `b − ⟨a,s⟩ = μ + e` is a linear equation
+        /// in `s` with no unknown noise left: `dim` such ciphertexts recover
+        /// `s` by Gaussian elimination. Predictable noise is not a weakened LWE
+        /// instance, it is no LWE instance.
+        pub fn lweEncrypt(comptime dim: usize, key: *const LweKey(dim), mu: T, io: std.Io) Lwe(dim) {
+            var src: std.Random.IoSource = .{ .io = io };
+            return lweEncryptForTest(dim, key, mu, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `lweEncrypt` with caller-chosen draws.
+        pub fn lweEncryptForTest(comptime dim: usize, key: *const LweKey(dim), mu: T, random: std.Random) Lwe(dim) {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             var ct: Lwe(dim) = undefined;
             var b: T = mu +% sampleError(random);
             for (&ct.a, key.s) |*ai, si| {
@@ -281,8 +381,30 @@ pub fn Tfhe(comptime P: params.Params) type {
 
         // ── GLWE encrypt / decrypt ───────────────────────────────────────────
 
-        /// Encrypt an already-scaled plaintext polynomial `μ`: `b = a·s + μ + e`.
-        pub fn glweEncrypt(key: *const GlweKey, msg: *const Poly, random: std.Random) Glwe {
+        /// Encrypt an already-scaled plaintext polynomial `μ`: `b = a·s + μ + e`,
+        /// with the mask polynomial `a` and the noise polynomial `e` drawn from
+        /// `io`'s CSPRNG.
+        ///
+        /// `io` must be a real `std.Io`. The ring version of `lweEncrypt`'s
+        /// failure is worse, not better: one GLWE ciphertext carries `N`
+        /// coefficient equations, so a single ciphertext under a predictable
+        /// stream is already an `N`-equation linear system in the `N`
+        /// coefficients of the GLWE key.
+        pub fn glweEncrypt(key: *const GlweKey, msg: *const Poly, io: std.Io) Glwe {
+            var src: std.Random.IoSource = .{ .io = io };
+            return glweEncryptForTest(key, msg, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `glweEncrypt` with caller-chosen draws.
+        pub fn glweEncryptForTest(key: *const GlweKey, msg: *const Poly, random: std.Random) Glwe {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             const a = sampleUniformPoly(random);
             var b = a.mul(&key.s);
             b.addAssign(msg);
@@ -291,9 +413,28 @@ pub fn Tfhe(comptime P: params.Params) type {
             return .{ .a = a, .b = b };
         }
 
-        pub fn glweEncryptZero(key: *const GlweKey, random: std.Random) Glwe {
+        /// Fresh encryption of the zero polynomial from `io`'s CSPRNG — the
+        /// masking term every GGSW row is built on (see `ggswEncryptPoly`).
+        /// `io` must be a real `std.Io`: a GLWE(0) whose `a` and `e` are
+        /// predictable masks nothing at all, so every row that adds a gadget
+        /// term to it publishes that term in the clear.
+        pub fn glweEncryptZero(key: *const GlweKey, io: std.Io) Glwe {
+            var src: std.Random.IoSource = .{ .io = io };
+            return glweEncryptZeroForTest(key, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `glweEncryptZero` with caller-chosen draws.
+        pub fn glweEncryptZeroForTest(key: *const GlweKey, random: std.Random) Glwe {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             const z = Poly.zero();
-            return glweEncrypt(key, &z, random);
+            return glweEncryptForTest(key, &z, random);
         }
 
         /// Phase `b − a·s = μ + e`.
@@ -321,47 +462,124 @@ pub fn Tfhe(comptime P: params.Params) type {
 
         // ── GGSW / bootstrap key / key-switch key ────────────────────────────
 
-        /// Encrypt a message polynomial `μ` as a GGSW (gadget matrix). Each row
-        /// is a fresh GLWE(0) plus the gadget term `μ·q/B_g^{i+1}` in the
-        /// component the block selects.
-        pub fn ggswEncryptPoly(key: *const GlweKey, msg: *const Poly, random: std.Random) Ggsw {
+        /// Encrypt a message polynomial `μ` as a GGSW (gadget matrix) from
+        /// `io`'s CSPRNG. Each row is a fresh GLWE(0) plus the gadget term
+        /// `μ·q/B_g^{i+1}` in the component the block selects.
+        ///
+        /// `io` must be a real `std.Io`. GGSW is where the stakes are highest:
+        /// the messages this module encrypts as GGSW are the LWE secret key
+        /// bits themselves (`bootstrapKeyGen`), and the resulting key is
+        /// *published* to whoever evaluates the circuit. Predictable row masks
+        /// therefore do not merely leak a plaintext, they hand over the key.
+        pub fn ggswEncryptPoly(key: *const GlweKey, msg: *const Poly, io: std.Io) Ggsw {
+            var src: std.Random.IoSource = .{ .io = io };
+            return ggswEncryptPolyForTest(key, msg, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `ggswEncryptPoly` with caller-chosen draws.
+        pub fn ggswEncryptPolyForTest(key: *const GlweKey, msg: *const Poly, random: std.Random) Ggsw {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             var g: Ggsw = undefined;
             for (0..ell) |i| {
                 const w = torus.gadgetWeight(bg_bits, i);
                 const scaled = msg.scalarMul(w);
                 // block A: gadget term in mask component `a`.
-                var ra = glweEncryptZero(key, random);
+                var ra = glweEncryptZeroForTest(key, random);
                 ra.a.addAssign(&scaled);
                 g.rows[i] = ra;
                 // block B: gadget term in body component `b`.
-                var rb = glweEncryptZero(key, random);
+                var rb = glweEncryptZeroForTest(key, random);
                 rb.b.addAssign(&scaled);
                 g.rows[ell + i] = rb;
             }
             return g;
         }
 
-        /// GGSW of a scalar (constant polynomial), e.g. a secret key bit.
-        pub fn ggswEncryptScalar(key: *const GlweKey, m: T, random: std.Random) Ggsw {
-            const c = Poly.constant(m);
-            return ggswEncryptPoly(key, &c, random);
+        /// GGSW of a scalar (constant polynomial), e.g. a secret key bit, from
+        /// `io`'s CSPRNG. `io` must be a real `std.Io` — see
+        /// `ggswEncryptPoly` for what a predictable stream costs here.
+        pub fn ggswEncryptScalar(key: *const GlweKey, m: T, io: std.Io) Ggsw {
+            var src: std.Random.IoSource = .{ .io = io };
+            return ggswEncryptScalarForTest(key, m, src.interface());
         }
 
-        /// Bootstrap key: `GGSW(s_i)` for each LWE secret bit, under the GLWE key.
-        pub fn bootstrapKeyGen(lwe_key: *const LweKey(n), glwe_key: *const GlweKey, random: std.Random) BootstrapKey {
+        /// TEST/KAT ONLY — `ggswEncryptScalar` with caller-chosen draws.
+        pub fn ggswEncryptScalarForTest(key: *const GlweKey, m: T, random: std.Random) Ggsw {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
+            const c = Poly.constant(m);
+            return ggswEncryptPolyForTest(key, &c, random);
+        }
+
+        /// Bootstrap key: `GGSW(s_i)` for each LWE secret bit, under the GLWE
+        /// key, with every row's masking drawn from `io`'s CSPRNG.
+        ///
+        /// `io` must be a real `std.Io`. This key is the one a deployment ships
+        /// to the evaluator, and its rows encrypt the LWE secret key bit by
+        /// bit: with a predictable stream the evaluator (or anyone who sees the
+        /// key) subtracts the known masks and reads `s` off directly — no
+        /// lattice problem is involved.
+        pub fn bootstrapKeyGen(lwe_key: *const LweKey(n), glwe_key: *const GlweKey, io: std.Io) BootstrapKey {
+            var src: std.Random.IoSource = .{ .io = io };
+            return bootstrapKeyGenForTest(lwe_key, glwe_key, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `bootstrapKeyGen` with caller-chosen draws.
+        pub fn bootstrapKeyGenForTest(lwe_key: *const LweKey(n), glwe_key: *const GlweKey, random: std.Random) BootstrapKey {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             var bsk: BootstrapKey = undefined;
-            for (0..n) |i| bsk.ggsw[i] = ggswEncryptScalar(glwe_key, lwe_key.s[i], random);
+            for (0..n) |i| bsk.ggsw[i] = ggswEncryptScalarForTest(glwe_key, lwe_key.s[i], random);
             return bsk;
         }
 
-        /// Key-switch key from the big (extracted) GLWE key to the small LWE key.
-        pub fn keySwitchKeyGen(glwe_key: *const GlweKey, small_key: *const LweKey(n), random: std.Random) KeySwitchKey {
+        /// Key-switch key from the big (extracted) GLWE key to the small LWE
+        /// key, with every row encrypted from `io`'s CSPRNG.
+        ///
+        /// `io` must be a real `std.Io`. Each row is an LWE encryption of a
+        /// gadget multiple of a *big-key coordinate*, so this key too is a
+        /// published encryption of secret material: predictable masks turn its
+        /// `N·ℓ_ks` rows into a solved linear system for the GLWE key.
+        pub fn keySwitchKeyGen(glwe_key: *const GlweKey, small_key: *const LweKey(n), io: std.Io) KeySwitchKey {
+            var src: std.Random.IoSource = .{ .io = io };
+            return keySwitchKeyGenForTest(glwe_key, small_key, src.interface());
+        }
+
+        /// TEST/KAT ONLY — `keySwitchKeyGen` with caller-chosen draws.
+        pub fn keySwitchKeyGenForTest(glwe_key: *const GlweKey, small_key: *const LweKey(n), random: std.Random) KeySwitchKey {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
             const big = extractGlweKey(glwe_key);
             var ksk: KeySwitchKey = undefined;
             for (0..N) |j| {
                 for (0..ell_ks) |i| {
                     const msg = big.s[j] *% torus.gadgetWeight(bks_bits, i);
-                    ksk.rows[j][i] = lweEncrypt(n, small_key, msg, random);
+                    ksk.rows[j][i] = lweEncryptForTest(n, small_key, msg, random);
                 }
             }
             return ksk;
@@ -576,10 +794,10 @@ test "LWE encrypt/decrypt round-trips a bit (bounded noise ≪ Δ/2)" {
     _ = inst;
     var prng = std.Random.DefaultPrng.init(1);
     const rnd = prng.random();
-    const key = Toy.lweKeyGen(64, rnd);
+    const key = Toy.lweKeyGenForTest(64, rnd);
     for (0..50) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct = Toy.lweEncrypt(64, &key, Toy.encodeBit(b), rnd);
+        const ct = Toy.lweEncryptForTest(64, &key, Toy.encodeBit(b), rnd);
         try testing.expectEqual(b, Toy.lweDecryptBit(64, &key, &ct));
     }
 }
@@ -587,11 +805,11 @@ test "LWE encrypt/decrypt round-trips a bit (bounded noise ≪ Δ/2)" {
 test "GLWE encrypt/decrypt round-trips a scaled plaintext" {
     var prng = std.Random.DefaultPrng.init(2);
     const rnd = prng.random();
-    const key = Toy.glweKeyGen(rnd);
+    const key = Toy.glweKeyGenForTest(rnd);
     // plaintext: Δ·(coefficient bits)
     var msg = Toy.Poly.zero();
     for (&msg.c, 0..) |*c, i| c.* = Toy.encodeBit(@intCast(i & 1));
-    const ct = Toy.glweEncrypt(&key, &msg, rnd);
+    const ct = Toy.glweEncryptForTest(&key, &msg, rnd);
     const phase = Toy.glwePhase(&key, &ct);
     for (phase.c, msg.c) |ph, m| {
         // |phase − msg| ≤ err_bound
@@ -603,7 +821,7 @@ test "GLWE encrypt/decrypt round-trips a scaled plaintext" {
 test "sampleExtract yields an LWE of coefficient 0 (decrypts under extracted key)" {
     var prng = std.Random.DefaultPrng.init(3);
     const rnd = prng.random();
-    const gk = Toy.glweKeyGen(rnd);
+    const gk = Toy.glweKeyGenForTest(rnd);
     const big_key = Toy.extractGlweKey(&gk);
     for (0..20) |_| {
         const b0 = rnd.uintLessThan(u32, 2);
@@ -611,7 +829,7 @@ test "sampleExtract yields an LWE of coefficient 0 (decrypts under extracted key
         msg.c[0] = Toy.encodeBit(b0);
         // fill other coeffs with arbitrary scaled bits (must NOT leak into coeff 0)
         for (msg.c[1..]) |*c| c.* = Toy.encodeBit(rnd.uintLessThan(u32, 2));
-        const ct = Toy.glweEncrypt(&gk, &msg, rnd);
+        const ct = Toy.glweEncryptForTest(&gk, &msg, rnd);
         const lwe = Toy.sampleExtract(&ct);
         try testing.expectEqual(b0, Toy.lweDecryptBit(N_big, &big_key, &lwe));
     }
@@ -621,13 +839,13 @@ const N_big = params.toy.N;
 test "keySwitch preserves the message (big key → small key)" {
     var prng = std.Random.DefaultPrng.init(4);
     const rnd = prng.random();
-    const gk = Toy.glweKeyGen(rnd);
+    const gk = Toy.glweKeyGenForTest(rnd);
     const big_key = Toy.extractGlweKey(&gk);
-    const small_key = Toy.lweKeyGen(64, rnd);
-    const ksk = Toy.keySwitchKeyGen(&gk, &small_key, rnd);
+    const small_key = Toy.lweKeyGenForTest(64, rnd);
+    const ksk = Toy.keySwitchKeyGenForTest(&gk, &small_key, rnd);
     for (0..20) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct_big = Toy.lweEncrypt(N_big, &big_key, Toy.encodeBit(b), rnd);
+        const ct_big = Toy.lweEncryptForTest(N_big, &big_key, Toy.encodeBit(b), rnd);
         const ct_small = Toy.keySwitch(&ksk, &ct_big);
         try testing.expectEqual(b, Toy.lweDecryptBit(64, &small_key, &ct_small));
     }
@@ -636,8 +854,8 @@ test "keySwitch preserves the message (big key → small key)" {
 test "decomposeGlwe recomposes each component within the gadget error bound" {
     var prng = std.Random.DefaultPrng.init(5);
     const rnd = prng.random();
-    const gk = Toy.glweKeyGen(rnd);
-    const ct = Toy.glweEncryptZero(&gk, rnd);
+    const gk = Toy.glweKeyGenForTest(rnd);
+    const ct = Toy.glweEncryptZeroForTest(&gk, rnd);
     const d = Toy.decomposeGlwe(&ct);
     const bound = gadget.maxError(params.toy.bg_bits, params.toy.ell);
     for (0..N_big) |j| {
@@ -700,7 +918,7 @@ test "KAT: lweKeyGen's draw→key-bit mapping (frozen) and its fixed cost" {
     _ = try std.fmt.hexToBytes(&frozen, "c99999b333366666");
 
     var sc: ScriptedRandom = .{};
-    const key = Toy.lweKeyGen(64, sc.random());
+    const key = Toy.lweKeyGenForTest(64, sc.random());
     for (0..64) |i| {
         try testing.expectEqual(bitOfHex(&frozen, i), key.s[i]);
         // Independent derivation: bit `i` is the TOP bit of the little-endian
@@ -719,7 +937,7 @@ test "KAT: glweKeyGen's draw→key-bit mapping (frozen) and its fixed cost" {
         "c99999b3333666664ccccd9999b3333266666ccccd999993333366666ccccc99",
     );
     var sc: ScriptedRandom = .{};
-    const gk = Toy.glweKeyGen(sc.random());
+    const gk = Toy.glweKeyGenForTest(sc.random());
     for (0..N_big) |i| {
         try testing.expectEqual(bitOfHex(&frozen, i), gk.s.c[i]);
         try testing.expectEqual(@as(u32, ScriptedRandom.byteAt(4 * i + 3) >> 7), gk.s.c[i]);
@@ -733,8 +951,8 @@ test "sampled key bits really are bits, and both keygens agree bit-for-bit" {
     // would be a silent scheme bug, not a style difference.
     var s1: ScriptedRandom = .{};
     var s2: ScriptedRandom = .{};
-    const lk = Toy.lweKeyGen(N_big, s1.random());
-    const gk = Toy.glweKeyGen(s2.random());
+    const lk = Toy.lweKeyGenForTest(N_big, s1.random());
+    const gk = Toy.glweKeyGenForTest(s2.random());
     try testing.expectEqualSlices(T, &lk.s, &gk.s.c);
     try testing.expectEqual(s1.pos, s2.pos);
     for (lk.s) |b| try testing.expect(b == 0 or b == 1);
@@ -797,25 +1015,103 @@ test "deinit zeroes LWE/GLWE secret keys, bootstrap key, and key-switch key" {
     var prng = std.Random.DefaultPrng.init(6);
     const rnd = prng.random();
 
-    var lwe_key = Toy.lweKeyGen(64, rnd);
+    var lwe_key = Toy.lweKeyGenForTest(64, rnd);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&lwe_key), 0));
     lwe_key.deinit();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&lwe_key), 0));
 
-    var glwe_key = Toy.glweKeyGen(rnd);
+    var glwe_key = Toy.glweKeyGenForTest(rnd);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&glwe_key), 0));
     glwe_key.deinit();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&glwe_key), 0));
 
-    const gk2 = Toy.glweKeyGen(rnd);
-    const small_key = Toy.lweKeyGen(64, rnd);
-    var bsk = Toy.bootstrapKeyGen(&small_key, &gk2, rnd);
+    const gk2 = Toy.glweKeyGenForTest(rnd);
+    const small_key = Toy.lweKeyGenForTest(64, rnd);
+    var bsk = Toy.bootstrapKeyGenForTest(&small_key, &gk2, rnd);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&bsk), 0));
     bsk.deinit();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&bsk), 0));
 
-    var ksk = Toy.keySwitchKeyGen(&gk2, &small_key, rnd);
+    var ksk = Toy.keySwitchKeyGenForTest(&gk2, &small_key, rnd);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&ksk), 0));
     ksk.deinit();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&ksk), 0));
+}
+
+// ── the RNG seam (B6) ────────────────────────────────────────────────────────
+
+/// Type of a function's LAST parameter, or `null` if that parameter is itself
+/// generic. Used by the seam test below to read a signature at comptime.
+fn lastParamType(comptime F: type) ?type {
+    const p = @typeInfo(F).@"fn".params;
+    return p[p.len - 1].type;
+}
+
+test "RNG seam: every production keygen/encrypt takes std.Io, only the ForTest twins take std.Random" {
+    // The point of this test is the SIGNATURE, not the value. `std.Random` is a
+    // vtable — `DefaultPrng.init(0).random()` and a CSPRNG are indistinguishable
+    // at a call site — so as long as a production entry point accepts one, a
+    // consumer can silently generate an FHE secret key that is a function of a
+    // seed. `std.Io.random` is contractually a CSPRNG, and no `DefaultPrng` can
+    // be turned into a `std.Io`, so the degraded input stops being expressible.
+    // If someone reintroduces a `std.Random` parameter on any of these, this
+    // fails to compile or fails here.
+    inline for (.{
+        @TypeOf(Toy.lweKeyGen), // generic in `dim`; the entropy parameter is still concrete
+        @TypeOf(Toy.glweKeyGen),
+        @TypeOf(Toy.lweEncrypt),
+        @TypeOf(Toy.glweEncrypt),
+        @TypeOf(Toy.glweEncryptZero),
+        @TypeOf(Toy.ggswEncryptPoly),
+        @TypeOf(Toy.ggswEncryptScalar),
+        @TypeOf(Toy.bootstrapKeyGen),
+        @TypeOf(Toy.keySwitchKeyGen),
+    }) |F| {
+        try testing.expect(lastParamType(F).? == std.Io);
+        try testing.expect(lastParamType(F).? != std.Random);
+    }
+    // …and the reproducible twins keep `std.Random`, under a name a production
+    // call site cannot use by accident.
+    inline for (.{
+        @TypeOf(Toy.lweKeyGenForTest),
+        @TypeOf(Toy.glweKeyGenForTest),
+        @TypeOf(Toy.lweEncryptForTest),
+        @TypeOf(Toy.glweEncryptForTest),
+        @TypeOf(Toy.glweEncryptZeroForTest),
+        @TypeOf(Toy.ggswEncryptPolyForTest),
+        @TypeOf(Toy.ggswEncryptScalarForTest),
+        @TypeOf(Toy.bootstrapKeyGenForTest),
+        @TypeOf(Toy.keySwitchKeyGenForTest),
+    }) |F| {
+        try testing.expect(lastParamType(F).? == std.Random);
+    }
+}
+
+test "RNG seam: the std.Io path really draws entropy, and round-trips end to end" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A signature pin alone would pass over a body that ignores `io`. Two keys
+    // drawn from the same `io` must differ: 64 independent bits each, so a
+    // collision here is 2^-64 unless the entropy is not being read.
+    const k1 = Toy.lweKeyGen(64, io);
+    const k2 = Toy.lweKeyGen(64, io);
+    try testing.expect(!std.mem.eql(T, &k1.s, &k2.s));
+    const g1 = Toy.glweKeyGen(io);
+    const g2 = Toy.glweKeyGen(io);
+    try testing.expect(!std.mem.eql(T, &g1.s.c, &g2.s.c));
+
+    // And the production path is a working path, not just a typed one.
+    for (0..8) |b| {
+        const bit: u32 = @intCast(b & 1);
+        const ct = Toy.lweEncrypt(64, &k1, Toy.encodeBit(bit), io);
+        try testing.expectEqual(bit, Toy.lweDecryptBit(64, &k1, &ct));
+    }
+    const msg = Toy.Poly.zero();
+    const gct = Toy.glweEncrypt(&g1, &msg, io);
+    for (Toy.glwePhase(&g1, &gct).c) |ph| {
+        const err = @min(ph, 0 -% ph);
+        try testing.expect(err <= params.toy.err_bound);
+    }
 }

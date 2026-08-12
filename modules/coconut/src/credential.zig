@@ -411,13 +411,51 @@ pub fn aggregateCredential(
 /// and run the Fiat-Shamir selective-disclosure NIZK proving knowledge of
 /// the HIDDEN attributes `{mᵢ : ¬disclosed[i]}` and the blinding `r`.
 /// `disclosed` (length `q`) selects revealed indices; `attributes` is the
-/// full length-`q` vector. `random` supplies the blinding + witness
-/// nonces. GATED core — the genuinely Fable-hard construction (the
-/// challenge MUST commit to `κ`, `ν`, `σ'`, and every disclosed index/value
-/// or the proof is unsound). Caller frees the returned proof.
+/// full length-`q` vector. GATED core — the genuinely Fable-hard construction
+/// (the challenge MUST commit to `κ`, `ν`, `σ'`, and every disclosed
+/// index/value or the proof is unsound). Caller frees the returned proof.
+///
+/// **Entropy.** `io` supplies the re-randomisation scalars `r'`/`r` and the
+/// Sigma-protocol witness nonces `r̃`/`m̃ⱼ`. `std.Io.random` is a CSPRNG by
+/// contract, and that is load-bearing here: a stream that REPEATS across two
+/// shows (a re-seeded `DefaultPrng`, PRNG state inherited across a `fork`)
+/// produces two transcripts with identical witnesses but different challenges
+/// `c` — different `κ`/`ν`/disclosure set means a different Fiat-Shamir hash.
+/// Subtracting the two responses recovers `r̃`, hence the blinding `r` and
+/// every HIDDEN attribute, by the standard two-transcript extraction. A
+/// verifier who simply watches two shows learns exactly what selective
+/// disclosure exists to withhold. Tests use `proveCredentialSeededForTest`.
 pub fn proveCredential(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    parameters: Parameters,
+    vk: VerificationKey,
+    cred: Credential,
+    attributes: []const Fr,
+    disclosed: []const bool,
+) CoconutError!ShowProof {
+    return proveCredentialFrom(allocator, .{ .io = io }, parameters, vk, cred, attributes, disclosed);
+}
+
+/// **TEST ONLY** — `proveCredential` over a caller-seeded `std.Random`, so a
+/// suite can reproduce a show. Two shows from the same seed leak the hidden
+/// attributes to anyone who sees both (see `proveCredential`'s entropy note).
+/// Production callers want `proveCredential`.
+pub fn proveCredentialSeededForTest(
+    allocator: std.mem.Allocator,
     random: std.Random,
+    parameters: Parameters,
+    vk: VerificationKey,
+    cred: Credential,
+    attributes: []const Fr,
+    disclosed: []const bool,
+) CoconutError!ShowProof {
+    return proveCredentialFrom(allocator, .{ .seeded_for_test = random }, parameters, vk, cred, attributes, disclosed);
+}
+
+fn proveCredentialFrom(
+    allocator: std.mem.Allocator,
+    entropy: keys.Entropy,
     parameters: Parameters,
     vk: VerificationKey,
     cred: Credential,
@@ -436,12 +474,12 @@ pub fn proveCredential(
     // is trivially satisfiable).
     var r_prime = blk: {
         while (true) {
-            const c = keys.randomScalar(random);
+            const c = entropy.scalar();
             if (!c.isZero()) break :blk c;
         }
     };
     defer std.crypto.secureZero(u8, std.mem.asBytes(&r_prime));
-    var r = keys.randomScalar(random);
+    var r = entropy.scalar();
     defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
     const sigma1_jac = g1.Jacobian.fromAffine(cred.h).scalarMul(r_prime);
     const sigma1 = sigma1_jac.toAffine();
@@ -456,14 +494,14 @@ pub fn proveCredential(
     // blinding r, one per HIDDEN attribute:
     //   Aw = [r̃] g2 + Σ_{hidden j} [m̃ⱼ] βⱼ   (the κ-side witness)
     //   Bw = [r̃] σ₁'                          (the ν-side witness)
-    var r_tilde = keys.randomScalar(random);
+    var r_tilde = entropy.scalar();
     defer std.crypto.secureZero(u8, std.mem.asBytes(&r_tilde));
     const m_tilde = try allocator.alloc(Fr, hidden);
     defer {
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(m_tilde));
         allocator.free(m_tilde);
     }
-    for (m_tilde) |*m| m.* = keys.randomScalar(random);
+    for (m_tilde) |*m| m.* = entropy.scalar();
 
     var aw_acc = g2gen.scalarMul(r_tilde);
     {
@@ -608,7 +646,7 @@ test "psSignWithSecret / psVerifyPlain: valid credential accepted, tamper reject
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x5151);
-    var kk = try keys.keygen(allocator, prng.random(), 3, 2, 3);
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 3);
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(10), frOf(20), frOf(30) };
@@ -650,7 +688,7 @@ test "Credential / PartialCredential codec round-trips" {
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(7);
-    var kk = try keys.keygen(allocator, prng.random(), 2, 2, 3);
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
     defer kk.deinit(allocator);
     const attrs = [_]Fr{ frOf(3), frOf(4) };
     const h = p.commonBase(&attrs);
@@ -745,4 +783,20 @@ fn fuzzShowProofDecode(_: void, smith: *std.testing.Smith) !void {
 }
 test "fuzz ShowProof.fromBytes never panics" {
     try std.testing.fuzz({}, fuzzShowProofDecode, .{});
+}
+
+// ── RNG-seam pin (B6, 2026-08-12) ───────────────────────────────────────────
+
+test "proveCredential's entropy parameter is std.Io — a repeated witness nonce is not one call away" {
+    const gen_params = @typeInfo(@TypeOf(proveCredential)).@"fn".params;
+    // Two shows under a nonce stream that repeats (a re-seeded PRNG, a forked
+    // process inheriting PRNG state) give two transcripts with the same
+    // witnesses `r̃`/`m̃` but a different challenge `c` — the standard
+    // Sigma-protocol two-transcript extraction, which recovers the HIDDEN
+    // attributes and the blinding `r`. That is the module's entire purpose,
+    // gone. `std.Io.random` is contractually a CSPRNG and a `DefaultPrng`
+    // cannot be spelled at this type.
+    try std.testing.expectEqual(std.Io, gen_params[1].type.?);
+    const test_params = @typeInfo(@TypeOf(proveCredentialSeededForTest)).@"fn".params;
+    try std.testing.expectEqual(std.Random, test_params[1].type.?);
 }

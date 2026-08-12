@@ -42,11 +42,11 @@ fn lutNot() Toy.Poly {
 test "clearBootstrap oracle: identity LUT decodes every bit (LUT+modswitch+rotation)" {
     var prng = std.Random.DefaultPrng.init(100);
     const rnd = prng.random();
-    const key = Toy.lweKeyGen(64, rnd);
+    const key = Toy.lweKeyGenForTest(64, rnd);
     const lut = lutIdentity();
     for (0..64) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct = Toy.lweEncrypt(64, &key, Toy.encodeBit(b), rnd);
+        const ct = Toy.lweEncryptForTest(64, &key, Toy.encodeBit(b), rnd);
         const val = Toy.clearBootstrap(&lut, &ct, &key);
         try testing.expectEqual(b, Toy.decodeBit(val)); // identity: out == in
     }
@@ -55,11 +55,11 @@ test "clearBootstrap oracle: identity LUT decodes every bit (LUT+modswitch+rotat
 test "clearBootstrap oracle: NOT LUT flips every bit" {
     var prng = std.Random.DefaultPrng.init(101);
     const rnd = prng.random();
-    const key = Toy.lweKeyGen(64, rnd);
+    const key = Toy.lweKeyGenForTest(64, rnd);
     const lut = lutNot();
     for (0..64) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct = Toy.lweEncrypt(64, &key, Toy.encodeBit(b), rnd);
+        const ct = Toy.lweEncryptForTest(64, &key, Toy.encodeBit(b), rnd);
         try testing.expectEqual(1 - b, Toy.decodeBit(Toy.clearBootstrap(&lut, &ct, &key)));
     }
 }
@@ -82,7 +82,7 @@ fn brokenSampleExtract(ct: *const Toy.Glwe) Toy.LweBig {
 test "positive control: sign-dropped sample extraction gives the wrong coefficient" {
     var prng = std.Random.DefaultPrng.init(200);
     const rnd = prng.random();
-    const gk = Toy.glweKeyGen(rnd);
+    const gk = Toy.glweKeyGenForTest(rnd);
     const big_key = Toy.extractGlweKey(&gk);
     var wrong_count: usize = 0;
     for (0..40) |_| {
@@ -90,7 +90,7 @@ test "positive control: sign-dropped sample extraction gives the wrong coefficie
         var msg = Toy.Poly.zero();
         msg.c[0] = Toy.encodeBit(b0);
         for (msg.c[1..]) |*c| c.* = Toy.encodeBit(rnd.uintLessThan(u32, 2));
-        const ct = Toy.glweEncrypt(&gk, &msg, rnd);
+        const ct = Toy.glweEncryptForTest(&gk, &msg, rnd);
         // real extraction is always correct …
         try testing.expectEqual(b0, Toy.lweDecryptBit(P.N, &big_key, &Toy.sampleExtract(&ct)));
         // … the broken one is wrong on some inputs (the checker bites).
@@ -144,13 +144,13 @@ fn brokenClearBootstrap(lut: *const Toy.Poly, ct: *const Toy.LweN, key: *const T
 test "positive control: wrong-sign rotation exponent misdecodes (checker bites)" {
     var prng = std.Random.DefaultPrng.init(202);
     const rnd = prng.random();
-    const key = Toy.lweKeyGen(64, rnd);
+    const key = Toy.lweKeyGenForTest(64, rnd);
     const lut = lutIdentity();
     var real_ok = true;
     var broken_wrong = false;
     for (0..64) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct = Toy.lweEncrypt(64, &key, Toy.encodeBit(b), rnd);
+        const ct = Toy.lweEncryptForTest(64, &key, Toy.encodeBit(b), rnd);
         if (Toy.decodeBit(Toy.clearBootstrap(&lut, &ct, &key)) != b) real_ok = false;
         if (Toy.decodeBit(brokenClearBootstrap(&lut, &ct, &key)) != b) broken_wrong = true;
     }
@@ -168,13 +168,13 @@ const KeySet = struct {
 };
 
 fn setupKeys(rnd: std.Random) KeySet {
-    const small = Toy.lweKeyGen(64, rnd);
-    const glwe = Toy.glweKeyGen(rnd);
+    const small = Toy.lweKeyGenForTest(64, rnd);
+    const glwe = Toy.glweKeyGenForTest(rnd);
     return .{
         .small = small,
         .glwe = glwe,
-        .bsk = Toy.bootstrapKeyGen(&small, &glwe, rnd),
-        .ksk = Toy.keySwitchKeyGen(&glwe, &small, rnd),
+        .bsk = Toy.bootstrapKeyGenForTest(&small, &glwe, rnd),
+        .ksk = Toy.keySwitchKeyGenForTest(&glwe, &small, rnd),
     };
 }
 
@@ -187,7 +187,7 @@ test "programmable gate: bootstrap(identity) and bootstrap(NOT) decode correctly
     const not = lutNot();
     for (0..16) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct = Toy.lweEncrypt(64, &ks.small, Toy.encodeBit(b), rnd);
+        const ct = Toy.lweEncryptForTest(64, &ks.small, Toy.encodeBit(b), rnd);
         const refreshed = Toy.bootstrap(&ks.bsk, &ks.ksk, &id, &ct);
         try testing.expectEqual(b, Toy.lweDecryptBit(64, &ks.small, &refreshed));
         const negated = Toy.bootstrap(&ks.bsk, &ks.ksk, &not, &ct);
@@ -206,8 +206,8 @@ test "programmable 2-input gate: homomorphic AND via LWE sum + LUT" {
     for (0..4) |it| {
         const a: u32 = @intCast(it & 1);
         const b: u32 = @intCast((it >> 1) & 1);
-        var ca = Toy.lweEncrypt(64, &ks.small, torus.encode(a, d8), rnd);
-        const cb = Toy.lweEncrypt(64, &ks.small, torus.encode(b, d8), rnd);
+        var ca = Toy.lweEncryptForTest(64, &ks.small, torus.encode(a, d8), rnd);
+        const cb = Toy.lweEncryptForTest(64, &ks.small, torus.encode(b, d8), rnd);
         for (&ca.a, cb.a) |*x, y| x.* +%= y; // homomorphic add of the two bits
         ca.b +%= cb.b;
         const out = Toy.bootstrap(&ks.bsk, &ks.ksk, &and_lut, &ca);
@@ -224,7 +224,7 @@ test "UNLIMITED DEPTH: a long chain of bootstraps preserves the message" {
     const id = lutIdentity();
     const chain = 16; // a leveled scheme fails long before this; bootstrapping does not.
     for ([_]u32{ 0, 1 }) |b| {
-        var ct = Toy.lweEncrypt(64, &ks.small, Toy.encodeBit(b), rnd);
+        var ct = Toy.lweEncryptForTest(64, &ks.small, Toy.encodeBit(b), rnd);
         for (0..chain) |_| {
             ct = Toy.bootstrap(&ks.bsk, &ks.ksk, &id, &ct);
             // message survives every single refresh (noise is RESET, not grown).
@@ -250,7 +250,7 @@ test "positive control: a corrupted bootstrap key must NOT bootstrap correctly" 
     var mismatches: usize = 0;
     for (0..8) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct = Toy.lweEncrypt(64, &ks.small, Toy.encodeBit(b), rnd);
+        const ct = Toy.lweEncryptForTest(64, &ks.small, Toy.encodeBit(b), rnd);
         const out = Toy.bootstrap(&ks.bsk, &ks.ksk, &id, &ct);
         if (Toy.lweDecryptBit(64, &ks.small, &out) != b) mismatches += 1;
     }
@@ -265,7 +265,7 @@ test "noise budget: a bootstrapped ciphertext has noise well below Δ/2" {
     const id = lutIdentity();
     for (0..16) |_| {
         const b = rnd.uintLessThan(u32, 2);
-        const ct = Toy.lweEncrypt(64, &ks.small, Toy.encodeBit(b), rnd);
+        const ct = Toy.lweEncryptForTest(64, &ks.small, Toy.encodeBit(b), rnd);
         const out = Toy.bootstrap(&ks.bsk, &ks.ksk, &id, &ct);
         const phase = Toy.lwePhase(64, &ks.small, &out);
         const clean = Toy.encodeBit(b);

@@ -38,17 +38,46 @@ pub const KeysError = error{
     MismatchedAttributes,
 } || lagrange.LagrangeError || std.mem.Allocator.Error;
 
-/// A uniformly-random `Fr` from a `std.Random` (rejection sampling, same
-/// shape as `bls12_381`'s `Fr.random` but over the caller's PRNG so keygen
-/// is deterministic under a seeded generator in tests — the `frost`/`dkg`
-/// convention).
-pub fn randomScalar(random: std.Random) Fr {
-    var buf: [32]u8 = undefined;
-    while (true) {
-        random.bytes(&buf);
-        return Fr.fromBytes(buf) catch continue;
+/// Where this module's secret scalars come from.
+///
+/// **Why this is a type and not a `std.Random` parameter.** `std.Random` is a
+/// vtable: `DefaultPrng.init(0)` and a real CSPRNG are indistinguishable at
+/// the call site, and the previous shape of this file printed "seed it for
+/// deterministic tests" next to the parameter — an instruction a consumer can
+/// follow straight into production. `std.Io.random` is CONTRACTUALLY a CSPRNG
+/// (see `std/Io.zig`'s `random` doc), so `.io` cannot be handed a seeded
+/// generator at all: a `DefaultPrng` is not expressible at that type. The
+/// seeded arm still exists — this module's own tests need reproducible
+/// issuance, and there is no external byte-exact Coconut vector to anchor
+/// against (SPEC §3) — but it is reachable only through a declaration whose
+/// name says what it is, never as an option on a production entry point.
+///
+/// Mirrors `bbs`/`ibe`/`tlock` (`io: std.Io` for the real draw, an explicitly
+/// named deterministic path for tests).
+pub const Entropy = union(enum) {
+    /// PRODUCTION. `std.Io.random` is a CSPRNG by contract.
+    io: std.Io,
+    /// **TEST ONLY.** A caller-seeded generator, so this module's own suites
+    /// can reproduce an issuance/show. Using this to generate a real
+    /// authority key hands every credential in the system to whoever
+    /// recovers the seed.
+    seeded_for_test: std.Random,
+
+    /// A uniformly-random `Fr` (rejection sampling — a raw wide reduction
+    /// would bias the sample, see `Fr.random`'s doc comment).
+    pub fn scalar(self: Entropy) Fr {
+        return switch (self) {
+            .io => |io| Fr.random(io),
+            .seeded_for_test => |random| blk: {
+                var buf: [32]u8 = undefined;
+                while (true) {
+                    random.bytes(&buf);
+                    break :blk Fr.fromBytes(buf) catch continue;
+                }
+            },
+        };
     }
-}
+};
 
 /// Master secret key `(x, y₁…y_q)`. Heap-owned `ys`; call `deinit`.
 pub const SecretKey = struct {
@@ -148,11 +177,47 @@ pub const ThresholdKeys = struct {
 /// §4.4 `TTPKeyGen(t, n, q)`: sample `sk = (x, y₁…y_q)`, Shamir-share each
 /// component with an independent degree-`t−1` polynomial, evaluate at
 /// authority indices `1..n`, and derive every party's `vk` share. REAL,
-/// mechanical (the dealer holds the plaintext secrets). `random` is the
-/// caller's PRNG (seed it for deterministic tests).
+/// mechanical (the dealer holds the plaintext secrets).
+///
+/// **Entropy.** `io` supplies EVERY scalar this function samples: the master
+/// secret `(x, y₁…y_q)` itself and all `q+1` degree-`t−1` Shamir blinding
+/// polynomials. `std.Io.random` is a CSPRNG by contract, which is the point —
+/// if this took a `std.Random`, a consumer could pass `DefaultPrng.init(seed)`
+/// and the authority master secret would be a pure function of that seed.
+/// Anyone who recovers it (a constant in a shipped binary, a PID, a boot
+/// timestamp) reconstructs `sk` and issues arbitrary valid credentials for the
+/// entire system; the `t`-of-`n` threshold split becomes decoration, because
+/// the dealer's secret never needed to be reassembled from shares. Tests that
+/// need a reproducible key use `keygenSeededForTest`.
 pub fn keygen(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    q: usize,
+    t: u64,
+    n: u64,
+) KeysError!ThresholdKeys {
+    return keygenFrom(allocator, .{ .io = io }, q, t, n);
+}
+
+/// **TEST ONLY** — `keygen` over a caller-seeded `std.Random`, so a suite can
+/// reproduce an issuance byte-for-byte. Coconut has no published byte-exact
+/// vector to anchor against (SPEC §3), so this module's own tests are the only
+/// legitimate caller. A key generated here is a deterministic function of the
+/// seed: using it in production hands every credential in the system to
+/// whoever recovers that seed. Production callers want `keygen`.
+pub fn keygenSeededForTest(
+    allocator: std.mem.Allocator,
     random: std.Random,
+    q: usize,
+    t: u64,
+    n: u64,
+) KeysError!ThresholdKeys {
+    return keygenFrom(allocator, .{ .seeded_for_test = random }, q, t, n);
+}
+
+fn keygenFrom(
+    allocator: std.mem.Allocator,
+    entropy: Entropy,
     q: usize,
     t: u64,
     n: u64,
@@ -175,7 +240,7 @@ pub fn keygen(
     for (polys) |*p| {
         p.* = try allocator.alloc(Fr, ncoef);
         allocated += 1;
-        for (p.*) |*c| c.* = randomScalar(random);
+        for (p.*) |*c| c.* = entropy.scalar();
     }
 
     var master_sk = SecretKey{
@@ -279,7 +344,7 @@ pub fn aggregateVerificationKeys(
 test "keygen: any t shares Lagrange-reconstruct the master secret key vector" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xC0C0);
-    var keys = try keygen(allocator, prng.random(), 3, 2, 4);
+    var keys = try keygenSeededForTest(allocator, prng.random(), 3, 2, 4);
     defer keys.deinit(allocator);
 
     // Reconstruct x and each y_j in the SCALAR field from shares {2,3}.
@@ -300,7 +365,7 @@ test "keygen: any t shares Lagrange-reconstruct the master secret key vector" {
 test "aggregateVerificationKeys: Lagrange-in-exponent recovers the master vk" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xBEEF);
-    var keys = try keygen(allocator, prng.random(), 2, 3, 5);
+    var keys = try keygenSeededForTest(allocator, prng.random(), 2, 3, 5);
     defer keys.deinit(allocator);
 
     // Aggregate a t=3 subset of vk shares (indices 1,3,5).
@@ -343,11 +408,57 @@ fn commitFr(v: u32) Fr {
 test "keygen: rejects invalid thresholds" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(1);
-    try std.testing.expectError(error.InvalidThreshold, keygen(allocator, prng.random(), 2, 0, 3));
-    try std.testing.expectError(error.InvalidThreshold, keygen(allocator, prng.random(), 2, 4, 3));
-    try std.testing.expectError(error.InvalidThreshold, keygen(allocator, prng.random(), 0, 2, 3));
+    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(allocator, prng.random(), 2, 0, 3));
+    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(allocator, prng.random(), 2, 4, 3));
+    try std.testing.expectError(error.InvalidThreshold, keygenSeededForTest(allocator, prng.random(), 0, 2, 3));
 }
 
 fn g2Eql(a: g2.Affine, b: g2.Affine) bool {
     return a.x.eql(b.x) and a.y.eql(b.y) and a.infinity == b.infinity;
+}
+
+// ── RNG-seam pins (B6, 2026-08-12) ──────────────────────────────────────────
+//
+// These exist because the OLD shape of this file actively invited the bug:
+// `keygen` took a `std.Random` and its doc said "seed it for deterministic
+// tests", with nothing saying "and never in production". A consumer who
+// followed that advice shipped an authority master secret `(x, y₁…y_q)` that
+// is a pure function of the seed — anyone who recovers the seed issues
+// arbitrary valid credentials for the whole system and the threshold split
+// becomes decoration. The fix is structural, so the pin is structural too.
+
+fn testIo() std.Io.Threaded {
+    return std.Io.Threaded.init(std.testing.allocator, .{});
+}
+
+test "keygen's entropy parameter is std.Io — a seeded PRNG is not expressible at the type" {
+    const gen_params = @typeInfo(@TypeOf(keygen)).@"fn".params;
+    // `std.Io.random` is contractually a CSPRNG; `std.Random` is a vtable
+    // whose quality cannot be read at the call site. If this ever flips back,
+    // `keygen(alloc, prng.random(), …)` compiles again and the Coldcard-shaped
+    // mistake is one line away for every consumer.
+    try std.testing.expectEqual(std.Io, gen_params[1].type.?);
+    // The seeded form still exists, but only under a name that says out loud
+    // what it is — it can never be reached by a consumer who merely followed
+    // the happy path.
+    const test_params = @typeInfo(@TypeOf(keygenSeededForTest)).@"fn".params;
+    try std.testing.expectEqual(std.Random, test_params[1].type.?);
+}
+
+test "keygen draws a fresh authority master secret on every call" {
+    const allocator = std.testing.allocator;
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var k1 = try keygen(allocator, io, 2, 2, 3);
+    defer k1.deinit(allocator);
+    var k2 = try keygen(allocator, io, 2, 2, 3);
+    defer k2.deinit(allocator);
+
+    // Two calls, one `io`: a seed-derived master secret would repeat here.
+    try std.testing.expect(!k1.master_sk.x.eql(k2.master_sk.x));
+    try std.testing.expect(!k1.master_sk.ys[0].eql(k2.master_sk.ys[0]));
+    // The Shamir blinding is redrawn too (share 0 is x(1), not x).
+    try std.testing.expect(!k1.sk_shares[0].x.eql(k2.sk_shares[0].x));
 }

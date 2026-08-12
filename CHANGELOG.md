@@ -26,12 +26,17 @@ Each entry below is a one-line pointer; the detail lives in the linked
 file. A `BREAKING` tag means the module's own changelog flags at least
 one breaking change in its `Unreleased` section.
 
+- [`bfv`](modules/bfv/CHANGELOG.md) — **BREAKING** — `keyGen`/`encrypt`/
+  `genRelinKey` take `std.Io` (a CSPRNG by contract) instead of `std.Random`.
 - [`bip340`](modules/bip340/CHANGELOG.md) — runtime-tag tagged hash,
   `xonlyBytesOf`.
 - [`brotli`](modules/brotli/CHANGELOG.md) — encoder now actually
   compresses (LZ77 + Huffman).
 - [`chachapoly`](modules/chachapoly/CHANGELOG.md) — SIMD implementation
   (performance campaign).
+- [`coconut`](modules/coconut/CHANGELOG.md) — **BREAKING** — `keygen`/
+  `proveCredential` take `std.Io` (a CSPRNG by contract) instead of
+  `std.Random`.
 - [`csvsafe`](modules/csvsafe/CHANGELOG.md) — security-audit fix.
 - [`decimal`](modules/decimal/CHANGELOG.md) — `Decimal`/`BigDecimal`
   interop, new `BigDecimal` ops.
@@ -83,6 +88,8 @@ one breaking change in its `Unreleased` section.
 - [`snmp`](modules/snmp/CHANGELOG.md) — **BREAKING** — library-generated
   USM privacy salt.
 - [`stun`](modules/stun/CHANGELOG.md) — security-audit memory-safety fix.
+- [`tfhe`](modules/tfhe/CHANGELOG.md) — **BREAKING** — keygen/encrypt entry
+  points take `std.Io` (a CSPRNG by contract) instead of `std.Random`.
 - [`threshold_ecdsa`](modules/threshold_ecdsa/CHANGELOG.md) —
   **BREAKING** — Paillier generator bound into Fiat-Shamir transcript.
 - [`tsdb`](modules/tsdb/CHANGELOG.md) — new: time-series persistence over

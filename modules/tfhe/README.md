@@ -51,13 +51,20 @@ const tfhe = @import("tfhe");
 const T = tfhe.Tfhe(tfhe.params.toy);
 const inst = try T.init();
 
-const sk   = T.lweKeyGen(64, rand);
-const gk   = T.glweKeyGen(rand);
-const bsk  = T.bootstrapKeyGen(&sk, &gk, rand);
-const ksk  = T.keySwitchKeyGen(&gk, &sk, rand);
+// `io` is a `std.Io`: key generation and encryption draw from `std.Io.random`,
+// which is contractually a CSPRNG. That is deliberate — a `std.Random`
+// parameter would accept `DefaultPrng.init(0)` at a call site that looks
+// identical, and with predictable `e`/`a` the LWE problem collapses into linear
+// algebra (`dim` ciphertexts recover `sk`). The `…ForTest` twins take a
+// `std.Random` for KAT reproducibility and are named so you cannot reach for
+// one by accident.
+const sk   = T.lweKeyGen(64, io);
+const gk   = T.glweKeyGen(io);
+const bsk  = T.bootstrapKeyGen(&sk, &gk, io);
+const ksk  = T.keySwitchKeyGen(&gk, &sk, io);
 
 const lut  = T.testPolynomial(2, .{ T.encodeBit(0), T.encodeBit(1) }); // identity
-const ct   = T.lweEncrypt(64, &sk, T.encodeBit(1), rand);
+const ct   = T.lweEncrypt(64, &sk, T.encodeBit(1), io);
 const fresh = T.bootstrap(&bsk, &ksk, &lut, &ct);   // Dec == 1, noise reset
 ```
 

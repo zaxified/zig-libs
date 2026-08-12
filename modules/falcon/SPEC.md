@@ -190,8 +190,14 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
   pipeline and a fresh-key sign → verify round trip). `ntru.zig` also
   KAT-pins NTRUSolve in isolation: solving from the vectors' own (f, g)
   reproduces the sk's F byte-exactly at both degrees.
-- Deterministic-signing caveat: `signDeterministic` is this module's own
-  seeded mode (single SHAKE stream), NOT the NIST-KAT derandomization
-  (which draws nonce and signer seed as two separate DRBG calls) — the KAT
-  tests replay the DRBG explicitly instead.
+- No deterministic signing mode: the former `signDeterministic` (single
+  SHAKE stream seeded from the caller's seed alone) reused the 40-byte
+  salt — and the Gaussian sampling tape — across every message signed
+  under one seed, voiding the GPV per-signature-independence argument;
+  it was removed rather than derandomized because Falcon specifies no
+  deterministic mode (no anchor for a homemade one) and deterministic
+  lattice signing invites fault-differential/trace-averaging attacks —
+  see the decision comment in `root.zig`. Reproducible signing for tests
+  = `sign.ShakePrng` + `sign.Signer.signWithRng` (the KAT tests replay
+  the NIST DRBG's two separate draws through that seam explicitly).
 - FIPS 206 (FN-DSA) rebase once final — applies to the whole module.

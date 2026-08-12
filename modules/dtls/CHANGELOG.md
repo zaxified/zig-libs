@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- The `std.Random` requirement is now stated, not implied. `startHandshake`,
+  `handleFlight` and `ecdheGenerate` said only *why* the parameter exists
+  ("std 0.16 removed `std.crypto.random`") — a migration note a consumer reads
+  as "any `std.Random` will do", and `DefaultPrng` is what std's own examples
+  show. Those calls draw the x25519 / secp256r1 ephemeral PRIVATE key: under a
+  seeded generator a passive eavesdropper who learns the seed recomputes the
+  (EC)DHE shared secret and decrypts every recorded session from that peer,
+  retroactively. Each entry point now carries the `jwt`/`jwe` sentence
+  ("`random` MUST be a cryptographically secure source") together with what
+  breaks, and `README.md` / `root.zig` gained a Randomness section.
+
+  **No signature changed and no behaviour changed** — this is documentation.
+  The mistake is still expressible and this module still cannot detect it
+  (`std.Random` is a vtable). Converting to `std.Io` was considered and
+  rejected: `Connection` is a sans-I/O state machine (no socket, no clock, no
+  allocator — every external fact is an input value) and `handleFlight` is the
+  only way to drive it, so an I/O capability handle per datagram contradicts
+  the design. Two tests pin the outcome: one demonstrates the seeded-RNG
+  hazard is real (same seed ⇒ byte-identical ephemeral private key), one
+  asserts the sentence is present at each of the three declarations.
+
 - `signature_algorithms` is now genuinely negotiated instead of
   advertised-and-ignored. New `Config.signature_algorithms` drives both
   what this side offers and what it will accept; the scheme used to sign

@@ -4,11 +4,14 @@
 //! `ffsampling.sampleSignature`, rejects candidates over the
 //! degree's norm bound and retries (mirroring the spec's own outer
 //! accept/reject loop — real code, not stubbed), and compresses the
-//! accepted s2 via REUSED `codec.compEncode`. Two entry points funnel
-//! through the same `signWithRng` core: `root.zig`'s `signRandomized`
-//! (a real CSPRNG — production use) and `signDeterministic` (a
-//! SHAKE256-seeded `ShakePrng` — KAT reproduction, once the stubs below
-//! it are filled in).
+//! accepted s2 via REUSED `codec.compEncode`. The one public entry
+//! point, `root.zig`'s `signRandomized` (a real CSPRNG — production
+//! use), funnels through the `signWithRng` core; tests that need
+//! reproducible signatures seed `ShakePrng` and call `signWithRng`
+//! directly, owning the PRNG substitution explicitly. `root.zig`
+//! deliberately exposes NO seeded signing mode — a tape derived from a
+//! seed alone reuses the 40-byte salt across messages; see the decision
+//! comment in `root.zig` (below `signRandomized`).
 //!
 //! NOT constant-time, and cannot be made so by anything in this file:
 //! the actual side-channel-sensitive step is `gaussian.samplerZ`
@@ -29,11 +32,14 @@ pub const nonce_length = 40;
 /// it is NOT the outer NIST-KAT AES-256-CTR-DRBG
 /// (`KAT/generator/katrng.c`) that produces the .rsp `seed` field in the
 /// first place; that harness-level DRBG is test tooling and has no
-/// business in this module's public signing API. Because the reference
-/// draws the nonce and the signer seed as two SEPARATE DRBG calls,
-/// `signDeterministic`'s single SHAKE stream is this module's own
-/// deterministic mode, not the NIST-KAT derandomization — the KAT tests
-/// replay the DRBG explicitly instead (`kat_sign_test.zig`). This PRNG
+/// business in this module's public signing API. SIGNING CAVEAT: a
+/// ShakePrng handed to `signWithRng` yields a salt (and sampling tape)
+/// that is a function of the seed alone — sign two messages off one
+/// instance, or two instances with one seed, and they share the salt.
+/// That is why `root.zig` exposes no seeded signing mode (see the
+/// decision comment there); this type is a test/KAT seam, and the KAT
+/// tests replay the reference's two separate DRBG draws explicitly
+/// instead (`kat_sign_test.zig`). This PRNG
 /// IS, however, exactly the reference's SHAKE256 keygen RNG: seed it
 /// with the DRBG's 48-byte keypair draw and `generateKeyPair`
 /// reproduces the KAT pk/sk byte-for-byte (`keygen_sign_test.zig`).

@@ -873,6 +873,19 @@ const EcdheKeyPair = struct {
 /// RNG (std 0.16 removed `std.crypto.random`, so every source of randomness
 /// in this collection is an argument).
 ///
+/// `random` MUST be a cryptographically secure source. This is the highest-
+/// consequence use of randomness in the module: the bytes drawn here ARE the
+/// x25519 / secp256r1 ephemeral PRIVATE KEY. Under a predictable generator —
+/// `std.Random.DefaultPrng.init(seed)`, a PID, a boot timestamp — a passive
+/// eavesdropper who learns the seed derives the same private key, recomputes
+/// the (EC)DHE shared secret, and decrypts every session recorded from that
+/// peer, retroactively; forward secrecy, the entire reason the handshake
+/// generates an ephemeral key at all, is gone. Use `std.Random.DefaultCsprng`
+/// seeded from real OS entropy in production. There is no way for this
+/// function to tell a real CSPRNG from a seeded PRNG — `std.Random` is a
+/// vtable — so the guarantee is the caller's, and it is stated at every entry
+/// point that reaches here (`startHandshake`, `handleFlight`).
+///
 ///   * x25519 (RFC 7748 / RFC 8446 §4.2.8.1): 32 random bytes as the secret
 ///     scalar — `generateDeterministic` clamps — and the 32-byte public key
 ///     as the share.
@@ -1271,11 +1284,28 @@ pub const Connection = struct {
     /// Client-only: builds and sends flight 1 (RFC 9147 §5.3) — a
     /// ClientHello offering `config.psk_identity` under `psk_ke` (no DHE,
     /// no certificates), with a real RFC 8446 §4.2.11.2 PSK binder computed
-    /// over the transcript. `random` supplies the ClientHello's 32-byte
-    /// `random` field (std 0.16 removed `std.crypto.random`, so — like the
-    /// rest of this collection — the caller provides a `std.Random`);
-    /// `now_ms` arms the retransmission timer `poll` later checks.
-    /// Transitions `.start` -> `.wait_server_hello`.
+    /// over the transcript. `now_ms` arms the retransmission timer `poll`
+    /// later checks. Transitions `.start` -> `.wait_server_hello`.
+    ///
+    /// `random` MUST be a cryptographically secure source: this module has no
+    /// hidden RNG, the same caller-injected seam the `jwt`/`jwe` siblings use
+    /// (std 0.16 removed `std.crypto.random`) — `std.Random.DefaultCsprng`
+    /// seeded from real OS entropy in production. What breaks under a seeded
+    /// PRNG is concrete and not recoverable after the fact:
+    ///
+    ///   * In `cert_dhe` mode this call draws the x25519 / secp256r1
+    ///     ephemeral PRIVATE KEY (`ecdheGenerate`). A passive eavesdropper
+    ///     who knows the seed derives it, recomputes the (EC)DHE shared
+    ///     secret, and decrypts every session recorded from this peer,
+    ///     retroactively — including sessions captured before the seed leaked.
+    ///   * The ClientHello's 32-byte `random` field becomes a constant, so
+    ///     every handshake this peer starts is byte-identical on the wire and
+    ///     trivially linkable across networks. Bounded next to the above (the
+    ///     field is public), but it is the symptom that shows first.
+    ///
+    /// `std.Random` is a vtable, so this module cannot check the quality of
+    /// what it is handed; a seeded generator and `getrandom(2)` look the same
+    /// at this call site. The requirement is the caller's to meet.
     pub fn startHandshake(self: *Connection, random: std.Random, now_ms: u64, out: []u8) HandshakeError![]const u8 {
         if (self.role != .client) return error.WrongState;
         if (self.state != .start) return error.WrongState;
@@ -1317,6 +1347,23 @@ pub const Connection = struct {
     /// noise) — harmless to pass through unconditionally otherwise. Errors
     /// are always typed (a wrong PSK, a tampered record, an out-of-order
     /// message, ...) — never a panic.
+    ///
+    /// `random` MUST be a cryptographically secure source — the same
+    /// caller-injected seam as `startHandshake` (std 0.16 removed
+    /// `std.crypto.random`), `std.Random.DefaultCsprng` seeded from real OS
+    /// entropy in production. The consequence is worst on the SERVER side of
+    /// certificate mode, where this call — not `startHandshake` — is what
+    /// draws the ephemeral (EC)DHE private key (`ecdheGenerate`, via
+    /// `serverProcessClientHello`): under a predictable generator a passive
+    /// eavesdropper who knows the seed recomputes the shared secret for every
+    /// association this server ever accepted and decrypts them all,
+    /// retroactively. It also draws the ServerHello `random` and, whenever
+    /// this side signs a CertificateVerify, the RSA-PSS salt — a PSS salt
+    /// that repeats weakens the signature's proof, and `certverify.sign`
+    /// refuses `null` outright (`error.RandomRequired`) for exactly that
+    /// reason. Passing the same `std.Random` to every call in a connection
+    /// loop is correct and expected; passing a SEEDED one is the hazard.
+    /// `std.Random` is a vtable, so nothing here can tell the two apart.
     ///
     /// **Reassembly across calls (RFC 9147 §5.2).** A flight need not arrive
     /// in one datagram, and a single handshake message need not either — a
@@ -6702,4 +6749,65 @@ test "cert-DHE: our server accepts a secp256r1 client share and answers in the s
     _ = flight2;
     const shared_c = try ecdheSharedSecret(secp256r1_group, client.ecdhe_secret, server.ecdhe_public[0..server.ecdhe_public_len]);
     try testing.expectEqual(@as(usize, 32), shared_c.len);
+}
+
+// ── RNG-seam pins (B6, 2026-08-12) ─────────────────────────────────────────
+//
+// `startHandshake`/`handleFlight` keep taking a `std.Random`: this module is a
+// deliberately sans-I/O state machine (no socket, no clock, no allocator —
+// every external fact is an input VALUE), so handing it a `std.Io` capability
+// handle would contradict the invariant the rest of the file is built on, and
+// `handleFlight` is the ONLY way to drive the engine, so a `…ForTest` twin
+// would make the seeded path the one every test exercises and the production
+// path the untested one. See `../../../CML`-side audit note; the honest
+// consequence is recorded here in code: the hazard below REMAINS REACHABLE,
+// and what changed is the signal, not the structure.
+
+test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE private key exactly" {
+    // This is R1 from the audit, demonstrated rather than asserted. Two
+    // `Connection`s driven from generators in the same state derive the SAME
+    // x25519 ephemeral secret, so a passive eavesdropper who knows the seed
+    // recovers the shared secret and decrypts every session, retroactively.
+    var a = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    var b = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    const ka = try ecdheGenerate(x25519_group, a.random());
+    const kb = try ecdheGenerate(x25519_group, b.random());
+    try testing.expectEqualSlices(u8, &ka.secret, &kb.secret);
+    try testing.expectEqualSlices(u8, ka.public[0..ka.public_len], kb.public[0..kb.public_len]);
+
+    // ... and it really is the generator that decides, not a constant in the
+    // code: a different seed gives a different key. Both halves are needed —
+    // the first alone would also pass if `ecdheGenerate` returned a fixed key.
+    var c = std.Random.DefaultCsprng.init([_]u8{0x6B} ** 32);
+    const kc = try ecdheGenerate(x25519_group, c.random());
+    try testing.expect(!std.mem.eql(u8, &ka.secret, &kc.secret));
+
+    // Same for P-256, whose rejection-sampling loop could plausibly have
+    // masked the dependency.
+    var d = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    var e = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    const kd = try ecdheGenerate(secp256r1_group, d.random());
+    const ke = try ecdheGenerate(secp256r1_group, e.random());
+    try testing.expectEqualSlices(u8, &kd.secret, &ke.secret);
+}
+
+test "doc: every entry point where randomness enters states the CSPRNG requirement" {
+    // Documentation IS the fix here, so it is what gets pinned. Assembled
+    // from fragments so this test cannot match its own source text.
+    const needle = "MUST be a " ++ "cryptographically secure";
+    const src = @embedFile("Connection.zig");
+
+    // Each declaration's preceding doc block must carry the sentence. The
+    // window is generous (these doc comments are long) but strictly BEFORE
+    // the declaration, so a sentence added anywhere else does not count.
+    const decls = [_][]const u8{
+        "pub fn startHandshake(",
+        "pub fn handleFlight(",
+        "fn ecdheGenerate(",
+    };
+    for (decls) |decl| {
+        const at = std.mem.indexOf(u8, src, decl) orelse return error.DeclarationNotFound;
+        const window_start = at -| 6000;
+        try testing.expect(std.mem.indexOf(u8, src[window_start..at], needle) != null);
+    }
 }

@@ -61,6 +61,16 @@
 //! lattice estimate run here, and nothing about deployment hardening (byte
 //! codecs, side channels beyond `SPEC.md`'s stated boundary) is claimed.
 //!
+//! ## Randomness
+//!
+//! `keyGen`, `encrypt` and `genRelinKey` take `io: std.Io` and draw from
+//! `std.Io.random`, which is contractually a CSPRNG. A `std.Random` parameter
+//! would let a consumer pass `DefaultPrng.init(0)` at a call site that looks
+//! identical to a correct one — and here that is not a weakening but a break:
+//! with `u,e0,e1` predictable, `c0 − p0·u − e0 = Δ·m` recovers the plaintext
+//! **without the secret key**. The `…ForTest` twins keep `std.Random` so the
+//! KATs stay reproducible; see `bfv.zig`'s "Randomness" doc comment.
+//!
 //! Deferred increments: bootstrapping, CKKS (approximate), key rotation /
 //! Galois automorphisms (batching rotations), full CRT-slot SIMD encoding,
 //! byte codecs.
@@ -68,7 +78,7 @@
 const std = @import("std");
 
 pub const meta = .{
-    .platform = .any, // pure computation; caller-supplied std.Random (no OS RNG)
+    .platform = .any, // pure computation; the entropy seam is a portable std.Io (contractually a CSPRNG), no raw getrandom(2)
     .role = .util,
     .concurrency = .reentrant, // no shared state; caller supplies all inputs
     .model_after = "Fan-Vercauteren BFV (ePrint 2012/144) + Microsoft SEAL RNS/NTT design",
