@@ -360,3 +360,85 @@ modules document in their own SPEC.md "no NOTICE entry" reasoning; this
 file exists only because items 3-8's vector-fetch and item 2's
 direct-port relationship warrant the same explicit-citation caution
 `bn254`/`bls12_381` apply to their own KAT sources.
+
+
+===================================================================
+Provenance chain, traced 2026-08-12
+===================================================================
+
+Everything above described `mlswg/mls-implementations` as a repository
+with no licence file, and reasoned from there. That framing was
+incomplete in a way that matters: the WG repository is a COLLECTION
+POINT, so "the collection has no licence" says nothing about where the
+bytes came from before they landed there. A corpus donated by one
+project and re-hosted by another can carry the first project's terms
+with it, and that possibility was never checked. It has been now.
+
+WHAT WAS VERIFIED. All fifteen files under `src/data/` trace byte-exact
+to `mlswg/mls-implementations` at commit
+`cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`. Nine are byte-identical to
+upstream as fetched; the other six reproduce exactly by running the `jq`
+filter commands this file already documents. Nothing was silently edited
+or substituted. `passive-client-random.json` — the largest and the one
+carrying the thinnest argument below — was re-fetched and `cmp`'d
+independently: 1,948,393 bytes, identical.
+
+WHO GENERATED THEM, which is what the chain question was really about:
+
+  crypto-basics.json, treekem.json, welcome.json
+      Richard Barnes (`bifurcation`), RFC 9420 editor and author of
+      mlspp (Cisco, BSD-2-Clause).
+  tree-validation.json, tree-operations.json, secret-tree.json,
+  psk_secret.json, message-protection.json, passive-client-welcome.json,
+  passive-client-handling-commit.json, passive-client-random.json
+      Marta Mularczyk (`mulmarta`), a principal contributor to
+      awslabs/mls-rs (Apache-2.0).
+  transcript-hashes.json
+      Théophile Wallez (CISPA), generated on MLS* (Inria-Prosecco,
+      Apache-2.0) — PR #107.
+  messages.json
+      Damian Poddebniak (`duesee`), PR #82, not traceable to a named
+      implementation.
+  key-schedule.json, tree-math.json
+      Barnes (2019) with later updates from Franziskus Kiefer (Cryspen);
+      the generating tool was not established.
+
+THE POINT OF LISTING THEM. None of these files is a verbatim copy of any
+of those projects' own test suites — code search against cisco/mlspp and
+awslabs/mls-rs returns zero hits for the file contents. They are original
+contributions authored FOR the working group repository. So no
+implementation's licence travels with the bytes, and the chain is clean
+rather than laundered: there is no upstream licence we are failing to
+honour, because there is no upstream licence at all.
+
+THE IETF GRANT DOES NOT RESCUE THIS, and it is worth recording why so the
+question is not reopened hopefully. Contributions to an IETF working
+group are normally governed by BCP 78/79, under which Code Components are
+licensed under the Revised BSD Licence — which would have replaced the
+merger-doctrine reasoning with an actual grant. It does not reach here.
+RFC 8874 conditions that on the repository carrying a CONTRIBUTING notice
+citing the Note Well, and `mlswg/mls-implementations` has no CONTRIBUTING
+file, no Note Well statement and no licence file anywhere in its tree.
+The merger-doctrine argument above therefore remains the operative one.
+
+WHERE THAT ARGUMENT IS STRONG AND WHERE IT IS THIN. It is comfortable for
+the small numeric and combinatorial files: `tree-math.json` is pure index
+arithmetic that this module could regenerate from RFC 9420 Appendix C
+outright, and the key-schedule / secret-tree / transcript-hash / crypto
+vectors are values the specification dictates, where any correct
+implementation must produce the same bytes.
+
+It is thinnest for `passive-client-random.json`. At 1.9 MB it is not a
+table of spec-mandated constants but one implementation's SCENARIO DESIGN
+— a randomised 200-epoch session whose shape (an UpdatePath first
+reaching depth 7 only at epoch 110) reflects choices about coverage that
+the RFC does not dictate. Selection and arrangement of that kind is
+exactly what merger doctrine does not cover. It is also the one file this
+module could not regenerate even in principle: `group.zig` returns
+`error.PrivateHandshakeNotSupported` for encrypted Commits (lines 895 and
+2163), so the state machine cannot drive the scenario at all, and
+byte-identical reproduction would additionally need the exact PRNG seed
+of whatever tool built it.
+
+That single file is therefore an open question for the repository owner,
+recorded rather than resolved. The other fourteen are not.
