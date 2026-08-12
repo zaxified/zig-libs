@@ -442,3 +442,33 @@ of whatever tool built it.
 
 That single file is therefore an open question for the repository owner,
 recorded rather than resolved. The other fourteen are not.
+
+THE SECOND ARGUMENT, which fits the one thin case better than the first.
+Everything above asks whether the vectors are COPYRIGHTABLE. That is only
+half the question; the other half is whether permission was granted by the
+CONTEXT OF PUBLICATION even though no licence file exists.
+
+`mls-implementations` is the IETF MLS working group's interop repository.
+Its sole purpose — stated in its own README and in the working group's
+process — is that independent implementations run these vectors against
+their own code to demonstrate conformance. The files were not left lying
+in a personal repository and discovered; they were contributed there by
+their authors specifically so that other implementations would consume
+them for exactly this use.
+
+That is the classic setting for an implied non-exclusive licence: a rights
+holder who makes a work available in a forum whose only function is that
+others use it in a particular way is understood to have permitted that use,
+notwithstanding the absence of a written grant. Running and redistributing
+the vectors as conformance data inside a conforming implementation is the
+use the publication was FOR.
+
+This matters because it inverts the strength of the two arguments across
+the corpus. For the small numeric files, merger doctrine is the strong
+argument and implied licence is merely additional. For
+`passive-client-random.json` — where merger is thin, because a 200-epoch
+randomised scenario embodies coverage choices the specification does not
+dictate — implied licence is the STRONGER of the two, because that file's
+scenario design is precisely what its author published it to have others
+exercise. Neither argument is a licence, and both are recorded here as
+reasoning rather than as permission obtained.
