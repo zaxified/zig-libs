@@ -57,7 +57,7 @@ const key = [_]u8{0x2b} ** 32;
 var csprng = std.Random.DefaultCsprng.init(seed); // your own CSPRNG, not std.crypto.random (removed in 0.16)
 const token = try jwe.encryptCompact(
     gpa, .dir, .A256GCM, .{ .symmetric = &key }, "attack at dawn", "",
-    csprng.random(), .{},
+    .{ .csprng = csprng.random() }, .{},
 );
 defer gpa.free(token);
 
@@ -67,7 +67,7 @@ defer gpa.free(plaintext);
 // RSA-OAEP-256 + A128GCM: also fully real.
 const token2 = try jwe.encryptCompact(
     gpa, .@"RSA-OAEP-256", .A128GCM, .{ .rsa_public = pk }, "top secret", "",
-    csprng.random(), .{},
+    .{ .csprng = csprng.random() }, .{},
 );
 defer gpa.free(token2);
 const plaintext2 = try jwe.decryptCompact(gpa, .{ .rsa_private = sk }, token2, .{});
@@ -94,10 +94,21 @@ honest fit here.
 - **`zip` (compression) is always rejected**, encode or decode — this module
   implements no decompression, and "decrypt untrusted ciphertext, then
   decompress" is exactly the shape of a zip-bomb/compression-oracle attack.
-- **`random` MUST be cryptographically secure** — it supplies the CEK (when
-  `alg` isn't `dir`), the content IV, the AxxxGCMKW wrap IV, and the PBES2
-  salt input. `std.crypto.random` was removed in Zig 0.16; supply your own
-  CSPRNG (e.g. `std.Random.DefaultCsprng` seeded from real OS entropy).
+- **Randomness is a caller obligation, and the type makes you name it.**
+  `encryptCompact` takes `jwe.Entropy` — `.{ .csprng = r }` or
+  `.{ .fixed_for_test = r }` — not a bare `std.Random`. It supplies the CEK
+  (when `alg` isn't `dir`), the content IV, the AxxxGCMKW wrap IV, the PBES2
+  salt input and the ECDH-ES ephemeral scalar. `std.crypto.random` was removed
+  in Zig 0.16; supply your own CSPRNG (e.g. `std.Random.DefaultCsprng` seeded
+  from real OS entropy). **`dir` is the sharp case:** there the CEK *is* your
+  long-lived key, so the content IV is the only thing separating two messages
+  — a repeated IV under `A128GCM`/`A256GCM` yields `C1 XOR C2 = P1 XOR P2`
+  **and** exposes the GHASH subkey, i.e. forgery of every other token under
+  that key. A repeated IV under `AxxxCBC-HSxxx` is bounded by comparison
+  (block-prefix equality, no key recovery). This is a *fail-visible* seam, not
+  a fail-closed one: `std.Random` is a vtable, so `.csprng` is a claim the
+  module cannot check. See `src/entropy.zig` for why a stateless RFC 7516
+  encoder cannot prevent nonce reuse outright.
 - **Compact serialization carries no extra AAD** (RFC 7516 §5.1) — a
   non-empty `aad_extra` to `encryptCompact` is `error.CompactSerializationNoAad`.
 - See SPEC.md for the full threat model (constant-time tag compare,

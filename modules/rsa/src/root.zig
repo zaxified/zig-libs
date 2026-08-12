@@ -56,12 +56,20 @@
 //! F3 (Bellcore/BDL): every CRT private op re-encrypts the recovered `m` and
 //! checks `m^e ≡ c (mod n)`, returning `error.FaultDetected` on mismatch rather
 //! than a faulty value an attacker could use to factor `n`. F2 (base blinding):
-//! when an rng is available (`signPss`, or a caller passing one through), the op
-//! runs on `c·r^e mod n` for a fresh random unit `r` and unblinds by `r⁻¹ mod n`,
-//! masking any residual (compiler-defeated) timing/power signal on the secret
-//! exponent. Deterministic APIs without an rng (`signPkcs1v15`, `decryptOaep`)
-//! run unblinded but keep the F3 check. Both add roughly one extra public-modexp
-//! (plus, when blinding, an inverse) per private op — the expected cost.
+//! with a `Blinding.csprng` the op runs on `c·r^e mod n` for a fresh random
+//! unit `r` and unblinds by `r⁻¹ mod n`, masking any residual
+//! (compiler-defeated) timing/power signal on the secret exponent. Both add
+//! roughly one extra public-modexp (plus, when blinding, an inverse) per
+//! private op — the expected cost.
+//!
+//! `signPss` blinds always (it holds a CSPRNG for the salt anyway). The
+//! deterministic entry points — `signPkcs1v15`, `decryptOaep`/`decryptOaepH`,
+//! `rsadpCrt` — default to `Blinding.none`, since std 0.16 removed
+//! `std.crypto.random` and they take no generator; each has a `…Blinded` twin
+//! that accepts one, so a consumer running an OAEP decryption oracle on
+//! attacker-chosen ciphertext can turn masking on without editing this module
+//! (B6 seam audit, 2026-08-12). The F3 check runs on every path regardless.
+//! See `Blinding` for the full argument.
 //!
 //! Provenance: clean-room implementation from RFC 8017 (PKCS#1 v2.2); design
 //! reference = Zig std's internal `std.crypto.Certificate.rsa` (MIT) for the
@@ -721,16 +729,61 @@ fn privateOp(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     writeMontResult(out, res);
 }
 
+/// Whether a CRT private op masks its input with F2 base blinding, and with
+/// what.
+///
+/// **Why this is a type and not a `?std.Random`.** Blinding is the one
+/// countermeasure on the secret path that this module cannot supply for
+/// itself: std 0.16 removed `std.crypto.random`, so entropy has to arrive as
+/// an argument, and the deterministic entry points (`decryptOaep`,
+/// `signPkcs1v15`, `rsadpCrt`) have no argument to arrive in. Until the B6
+/// seam audit that meant those three ran unblinded with *no way for a
+/// consumer to change it* — an internal comment was the only trace. A `null`
+/// in a `?std.Random` slot says nothing about what was given up; `.none`
+/// names it, and `.csprng` names the assertion the caller is making about
+/// their generator (`std.Random` is a vtable, so nothing here can check it).
+///
+/// Blinding is **defence in depth, not the primary defence**: both CRT
+/// exponentiations run through `montPowSecret`, which is constant-time in the
+/// secret exponent, and the F3 Bellcore fault check runs on every path
+/// regardless of this value. What blinding buys is that a residual leak in
+/// that constant-time claim — a compiler that defeats it, a microarchitectural
+/// channel it does not model — is not correlated with an attacker-chosen
+/// base, which is what turns a leak into a key recovery.
+pub const Blinding = union(enum) {
+    /// Base blinding ON, using this generator for the masking factor `r`.
+    /// It MUST be cryptographically secure: a predictable `r` voids the
+    /// masking entirely (the attacker just divides it back out).
+    csprng: std.Random,
+
+    /// Base blinding OFF — the operation runs directly on the caller's input.
+    /// This is what every deterministic entry point does by default, and it
+    /// is the right choice when the base is not attacker-chosen or when no
+    /// CSPRNG is in hand. It is NOT the right choice for an OAEP decryption
+    /// oracle exposed to the network.
+    none,
+
+    /// Deliberately NOT `pub`: the point of the type is that the choice is
+    /// visible at the call site, and a public accessor would hand callers
+    /// back the flat `?std.Random` this replaced.
+    fn rng(self: Blinding) ?std.Random {
+        return switch (self) {
+            .csprng => |r| r,
+            .none => null,
+        };
+    }
+};
+
 /// F2 base-blinding factors for one CRT private op: `c_blinded = c·r^e mod n`
 /// for a fresh random unit `r`, plus `r_inv = r⁻¹ mod n` to undo it afterwards
 /// (`m·r_inv = (c·r^e)^d·r⁻¹ = c^d·r·r⁻¹ = c^d mod n`).
-const Blinding = struct { c_blinded: Fe, r_inv: Fe };
+const BlindingFactors = struct { c_blinded: Fe, r_inv: Fe };
 
 /// Draw a fresh blinding pair. All arithmetic here is on the PUBLIC modulus n
 /// and on `r` (a secret-independent random value), so the variable-time inverse
 /// and the `r^e` public modexp leak nothing about the private exponent. `rng`
 /// MUST be cryptographically secure — a predictable `r` voids the masking.
-fn makeBlinding(sk: SecretKey, c: Fe, rng: std.Random) Blinding {
+fn makeBlinding(sk: SecretKey, c: Fe, rng: std.Random) BlindingFactors {
     const n_len = byteLen(sk.n.bits());
     var n_be: [max_modulus_len]u8 = undefined;
     sk.n.toBytes(n_be[0..n_len], .big) catch unreachable;
@@ -776,17 +829,17 @@ fn invModN(n_be: []const u8, r_be: []const u8, out: *[max_modulus_len]u8) ?[]con
     return out[0..];
 }
 
-fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8, rng: ?std.Random) PrimitiveError!void {
+fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8, blinding: Blinding) PrimitiveError!void {
     const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
 
-    // F2 (base blinding): with an rng, run the CRT op on c' = c·r^e mod n and
-    // unblind the result by r⁻¹ mod n below. This randomizes every secret-
+    // F2 (base blinding): with `.csprng`, run the CRT op on c' = c·r^e mod n
+    // and unblind the result by r⁻¹ mod n below. This randomizes every secret-
     // dependent intermediate so any residual (compiler-defeated) timing/power
-    // signal is masked. With no rng (deterministic APIs, e.g. PKCS#1 v1.5
-    // signing) the op runs unblinded but the F3 fault check still applies.
+    // signal is masked. With `.none` the op runs unblinded but the F3 fault
+    // check still applies.
     var r_inv: ?Fe = null;
     var c_eff = c;
-    if (rng) |g| {
+    if (blinding.rng()) |g| {
         const b = makeBlinding(sk, c, g);
         c_eff = b.c_blinded;
         r_inv = b.r_inv;
@@ -870,10 +923,19 @@ pub fn rsadp(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey) Pri
 
 /// RSADP via CRT (RFC 8017 §5.1.2, form (2), steps 2.a-2.d) — the fast path
 /// using p, q, dP, dQ, qInv instead of a single full-width modexp.
+///
+/// Runs with F2 base blinding **OFF** (`Blinding.none`) — see `Blinding` for
+/// what that costs and why the default is this way. Use `rsadpCrtBlinded` to
+/// supply a CSPRNG when `c` is attacker-chosen.
 pub fn rsadpCrt(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey) PrimitiveError![modulus_len]u8 {
+    return rsadpCrtBlinded(modulus_len, c, sk, .none);
+}
+
+/// `rsadpCrt` with an explicit F2 base-blinding choice.
+pub fn rsadpCrtBlinded(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey, blinding: Blinding) PrimitiveError![modulus_len]u8 {
     comptime std.debug.assert(modulus_len <= max_modulus_len);
     var out: [modulus_len]u8 = undefined;
-    try privateOpCrt(sk, &c, &out, null);
+    try privateOpCrt(sk, &c, &out, blinding);
     return out;
 }
 
@@ -946,16 +1008,30 @@ pub const SignPkcs1v15Error = EmsaEncodeError || error{ BufferTooSmall, FaultDet
 /// Sign `msg` with EMSA-PKCS1-v1_5 encoding (RFC 8017 §9.2) + the RSASP1
 /// signature primitive (§8.2.1). `out` must be at least as long as the
 /// modulus (`sk.n` byte length); returns the written subslice.
+///
+/// PKCS#1 v1.5 signing is deterministic by definition, so this entry point
+/// takes no generator and runs the private op with F2 base blinding **OFF**
+/// (`Blinding.none`). The signature itself does not depend on the blinding
+/// factor, so a caller who signs attacker-supplied messages with a long-lived
+/// key can pass a CSPRNG through `signPkcs1v15Blinded` and get byte-identical
+/// signatures with the masking on — see `Blinding`.
 pub fn signPkcs1v15(sk: SecretKey, comptime Hash: type, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
+    return signPkcs1v15Blinded(sk, Hash, .none, msg, out);
+}
+
+/// `signPkcs1v15` with an explicit F2 base-blinding choice. The emitted
+/// signature is identical either way (blinding is undone before output);
+/// only the side-channel posture of the private op differs.
+pub fn signPkcs1v15Blinded(sk: SecretKey, comptime Hash: type, blinding: Blinding, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
     const k = byteLen(sk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     var em_buf: [max_modulus_len]u8 = undefined;
     const em = em_buf[0..k];
     try emsaPkcs1v15Encode(Hash, msg, em);
     // EM starts with 0x00 0x01, so its integer value is < n by construction;
-    // the range check inside the primitive cannot fail. Deterministic API ->
-    // no blinding rng; a Bellcore fault (F3) is surfaced, never signed over.
-    privateOpCrt(sk, em, out[0..k], null) catch |err| switch (err) {
+    // the range check inside the primitive cannot fail. A Bellcore fault (F3)
+    // is surfaced on either blinding setting, never signed over.
+    privateOpCrt(sk, em, out[0..k], blinding) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => unreachable,
         error.FaultDetected => return error.FaultDetected,
     };
@@ -1047,6 +1123,14 @@ pub fn encryptOaep(pk: PublicKey, comptime Hash: type, random: std.Random, msg: 
 /// independent parameters); real-world XML-Encryption `rsa-oaep` configs use
 /// e.g. digest=SHA-256 with MGF1=SHA-1. See `encryptOaep` for the argument
 /// contract; identical apart from the split hash parameters.
+///
+/// `random` supplies the mandatory fresh OAEP seed and MUST be cryptographically
+/// secure — OAEP's security proof assumes an unpredictable
+/// seed, and a deterministic or low-entropy source makes the ciphertext a
+/// function of the plaintext alone, so anyone holding the public key confirms
+/// a guessed plaintext by re-encrypting it. (Stated here because it is stated
+/// on `encryptOaep`: the two entry points carry the same requirement, and
+/// only one of them used to say so.)
 pub fn encryptOaepH(pk: PublicKey, comptime LabelHash: type, comptime MgfHash: type, random: std.Random, msg: []const u8, label: []const u8, out: []u8) EncryptOaepError![]u8 {
     const h_len = LabelHash.digest_length;
     const k = byteLen(pk.n.bits());
@@ -1100,10 +1184,22 @@ pub const DecryptOaepError = error{ DecryptionError, BufferTooSmall };
 /// only length checks that branch early (`ct.len != k`, undersized `out`,
 /// RSADP range) depend purely on public values.
 ///
+/// Runs the private op with F2 base blinding **OFF** (`Blinding.none`). This
+/// is the entry point most likely to be sitting behind a network-facing
+/// decryption oracle, where the base `ct` is entirely attacker-chosen — use
+/// `decryptOaepBlinded` with a CSPRNG there. See `Blinding` for exactly what
+/// blinding does and does not buy, and why the default stayed off.
+///
 /// Uses a single `Hash` for both the label digest (`lHash`) and MGF1; a thin
 /// wrapper over `decryptOaepH` with `LabelHash == MgfHash == Hash`.
 pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
-    return decryptOaepH(sk, Hash, Hash, ct, label, out);
+    return decryptOaepHBlinded(sk, Hash, Hash, .none, ct, label, out);
+}
+
+/// `decryptOaep` with an explicit F2 base-blinding choice. The recovered
+/// plaintext and every error are identical either way.
+pub fn decryptOaepBlinded(sk: SecretKey, comptime Hash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    return decryptOaepHBlinded(sk, Hash, Hash, blinding, ct, label, out);
 }
 
 /// Decoupled-hash RSAES-OAEP decrypt (RFC 8017 §7.1.2). `LabelHash` is the
@@ -1112,8 +1208,15 @@ pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []
 /// decrypt ciphertext produced with a digest hash that differs from the MGF1
 /// hash (e.g. XML-Encryption `rsa-oaep` with digest=SHA-256, MGF1=SHA-1). The
 /// same constant-time / single-generic-error posture as `decryptOaep` applies
-/// (all padding-decode failures collapse to `error.DecryptionError`).
+/// (all padding-decode failures collapse to `error.DecryptionError`), F2 base
+/// blinding **OFF** included — `decryptOaepHBlinded` is the opt-in.
 pub fn decryptOaepH(sk: SecretKey, comptime LabelHash: type, comptime MgfHash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    return decryptOaepHBlinded(sk, LabelHash, MgfHash, .none, ct, label, out);
+}
+
+/// `decryptOaepH` with an explicit F2 base-blinding choice — the one entry
+/// point through which every other OAEP-decrypt path reaches the private op.
+pub fn decryptOaepHBlinded(sk: SecretKey, comptime LabelHash: type, comptime MgfHash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
     const h_len = LabelHash.digest_length;
     const k = byteLen(sk.n.bits());
     // §7.1.2 step 1: ciphertext must be exactly k octets and k >= 2 hLen + 2.
@@ -1126,9 +1229,11 @@ pub fn decryptOaepH(sk: SecretKey, comptime LabelHash: type, comptime MgfHash: t
     var em_buf: [max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, em_buf[0..k]);
     const em = em_buf[0..k];
-    // No rng here (deterministic decrypt API) -> unblinded; the F3 fault check
-    // still runs. A fault maps to the same generic DecryptionError (no oracle).
-    privateOpCrt(sk, ct, em, null) catch return error.DecryptionError;
+    // `blinding` is the caller's F2 choice — `.none` on the deterministic
+    // entry points, `.csprng` when they opted in. The F3 fault check runs
+    // either way, and a fault maps to the same generic DecryptionError (no
+    // oracle), as does a blinded run.
+    privateOpCrt(sk, ct, em, blinding) catch return error.DecryptionError;
 
     // step 3: EME-OAEP decode, branch-free. EM = Y || maskedSeed || maskedDB.
     // hLen is the label hash length; MGF1 uses `MgfHash`.
@@ -1267,7 +1372,7 @@ pub fn signPss(sk: SecretKey, comptime Hash: type, random: std.Random, msg: []co
     // cleared the top bits), so the primitive's range check cannot fail.
     // `random` also drives F2 base blinding inside the CRT op; a Bellcore
     // fault (F3) is surfaced, never signed over.
-    privateOpCrt(sk, em_buf[0..k], out[0..k], random) catch |err| switch (err) {
+    privateOpCrt(sk, em_buf[0..k], out[0..k], .{ .csprng = random }) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => unreachable,
         error.FaultDetected => return error.FaultDetected,
     };
@@ -2728,16 +2833,16 @@ test "privateOpCrt Bellcore check rejects a faulted CRT half (audit F3)" {
 
     var out: [max_modulus_len]u8 = undefined;
     // Baseline: the intact key produces a value and passes the check.
-    try privateOpCrt(sk, msg[0..k], out[0..k], null);
+    try privateOpCrt(sk, msg[0..k], out[0..k], .none);
 
     // Inject a persistent single-half fault: dP <- dP + 1 (mod p). Now
     // m1 = c^(dP+1) mod p is wrong, so the recombined m ≢ c^d and m^e ≢ c.
     sk.dp = sk.p.add(sk.dp, sk.p.one());
-    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], null));
+    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], .none));
 
     // Same rejection on the blinded path (blinding must not mask a real fault).
     var prng = std.Random.DefaultPrng.init(0xfa17_1717_c0de_0003);
-    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], prng.random()));
+    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], .{ .csprng = prng.random() }));
 }
 
 // A faulted key also fails at the public sign entry points (fault propagates as
@@ -2769,9 +2874,9 @@ test "CRT base blinding round-trips and matches the unblinded result (audit F2)"
         var out_plain: [max_modulus_len]u8 = undefined;
         var out_blind1: [max_modulus_len]u8 = undefined;
         var out_blind2: [max_modulus_len]u8 = undefined;
-        try privateOpCrt(sk, msg[0..k], out_plain[0..k], null);
-        try privateOpCrt(sk, msg[0..k], out_blind1[0..k], random);
-        try privateOpCrt(sk, msg[0..k], out_blind2[0..k], random);
+        try privateOpCrt(sk, msg[0..k], out_plain[0..k], .none);
+        try privateOpCrt(sk, msg[0..k], out_blind1[0..k], .{ .csprng = random });
+        try privateOpCrt(sk, msg[0..k], out_blind2[0..k], .{ .csprng = random });
         // Blinding with two independent random r's yields the same plaintext.
         try testing.expectEqualSlices(u8, out_plain[0..k], out_blind1[0..k]);
         try testing.expectEqualSlices(u8, out_plain[0..k], out_blind2[0..k]);
@@ -2782,6 +2887,123 @@ test "CRT base blinding round-trips and matches the unblinded result (audit F2)"
         try publicOp(pk, out_blind1[0..k], recovered[0..k]);
         try testing.expectEqualSlices(u8, msg[0..k], recovered[0..k]);
     }
+}
+
+// ── B6 RNG-seam pins (2026-08-12) ─────────────────────────────────────
+//
+// R1 was: F2 base blinding existed (`makeBlinding`) but the three private-key
+// entry points that run over ATTACKER-CHOSEN input — `decryptOaep`,
+// `decryptOaepH`, `signPkcs1v15` (and the `rsadpCrt` primitive) — hard-coded
+// `privateOpCrt(…, null)`, and the public API had no parameter through which a
+// consumer could turn it on. The default is unchanged (see `Blinding`); what
+// changed is that there is now a way to ask, and the choice has a name.
+
+test "Blinding: exactly two arms, and the unblinded one is a name rather than a null" {
+    const info = @typeInfo(Blinding).@"union";
+    try testing.expectEqual(@as(usize, 2), info.fields.len);
+    try testing.expectEqualStrings("csprng", info.fields[0].name);
+    try testing.expectEqualStrings("none", info.fields[1].name);
+    // `.none` carries no payload — it is a decision, not an absent argument.
+    try testing.expectEqual(void, info.fields[1].type);
+
+    var prng = std.Random.DefaultPrng.init(0xb11d_0000_5eed_0009);
+    const on: Blinding = .{ .csprng = prng.random() };
+    const off: Blinding = .none;
+    try testing.expect(on.rng() != null);
+    try testing.expect(off.rng() == null);
+}
+
+test "the blinded twins reach makeBlinding from the PUBLIC API, and produce identical output (audit R1)" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const k = byteLen(sk.n.bits());
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    // Two generators in the same state. Every case below drives one of them
+    // through a `…Blinded` entry point and leaves the other untouched: if the
+    // generator never reaches `makeBlinding`, the two states stay equal and
+    // the assertion fails. That is what pins "the knob is wired", as opposed
+    // to "the knob exists".
+    const seed = 0xb11d_0000_5eed_000a;
+    var used = std.Random.DefaultPrng.init(seed);
+    var untouched = std.Random.DefaultPrng.init(seed);
+    const drawnFrom = struct {
+        fn check(a: *std.Random.DefaultPrng, b: *std.Random.DefaultPrng) !void {
+            try testing.expect(!std.mem.eql(u8, std.mem.asBytes(a), std.mem.asBytes(b)));
+        }
+    }.check;
+
+    // (1) OAEP decrypt — the network-facing oracle this finding is about.
+    var seed_rng = std.Random.DefaultPrng.init(0x0ae9_5eed_0001);
+    const secret = "attacker cannot choose this, but they choose the ciphertext";
+    var ct: [max_modulus_len]u8 = undefined;
+    const ct_slice = try encryptOaep(pk, Sha256, seed_rng.random(), secret, "", ct[0..k]);
+
+    var plain_unblinded: [max_modulus_len]u8 = undefined;
+    var plain_blinded: [max_modulus_len]u8 = undefined;
+    const got_unblinded = try decryptOaep(sk, Sha256, ct_slice, "", &plain_unblinded);
+    const got_blinded = try decryptOaepBlinded(sk, Sha256, .{ .csprng = used.random() }, ct_slice, "", &plain_blinded);
+    try testing.expectEqualSlices(u8, secret, got_unblinded);
+    try testing.expectEqualSlices(u8, secret, got_blinded);
+    try drawnFrom(&used, &untouched);
+
+    // The decoupled-hash twin is the one every other OAEP path funnels
+    // through, so it gets its own case rather than riding on the wrapper.
+    used = std.Random.DefaultPrng.init(seed);
+    const got_h = try decryptOaepHBlinded(sk, Sha256, Sha256, .{ .csprng = used.random() }, ct_slice, "", &plain_blinded);
+    try testing.expectEqualSlices(u8, secret, got_h);
+    try drawnFrom(&used, &untouched);
+
+    // A blinded decrypt of a CORRUPTED ciphertext must still fail closed with
+    // the same generic error — blinding must not become an oracle of its own.
+    var bad: [max_modulus_len]u8 = undefined;
+    @memcpy(bad[0..k], ct_slice);
+    bad[k - 1] ^= 0x01;
+    try testing.expectError(error.DecryptionError, decryptOaepBlinded(sk, Sha256, .{ .csprng = used.random() }, bad[0..k], "", &plain_blinded));
+
+    // (2) PKCS#1 v1.5 signing — deterministic by definition, so the emitted
+    // signature must be byte-identical with the masking on. It is also the
+    // published KAT value, so this doubles as an anchor check.
+    used = std.Random.DefaultPrng.init(seed);
+    var sig_plain: [max_modulus_len]u8 = undefined;
+    var sig_blind: [max_modulus_len]u8 = undefined;
+    const s_plain = try signPkcs1v15(sk, Sha256, kat2048.msg, &sig_plain);
+    const s_blind = try signPkcs1v15Blinded(sk, Sha256, .{ .csprng = used.random() }, kat2048.msg, &sig_blind);
+    try testing.expectEqualSlices(u8, &kat2048.sig_sha256, s_plain);
+    try testing.expectEqualSlices(u8, s_plain, s_blind);
+    try drawnFrom(&used, &untouched);
+
+    // (3) The raw CRT primitive.
+    used = std.Random.DefaultPrng.init(seed);
+    var c_fixed: [256]u8 = @splat(0);
+    c_fixed[255] = 0x2a;
+    const m_plain = try rsadpCrt(256, c_fixed, sk);
+    const m_blind = try rsadpCrtBlinded(256, c_fixed, sk, .{ .csprng = used.random() });
+    try testing.expectEqualSlices(u8, &m_plain, &m_blind);
+    try drawnFrom(&used, &untouched);
+}
+
+// The doc half of the finding: `encryptOaep` stated the CSPRNG requirement and
+// its decoupled-hash twin `encryptOaepH` did not, even though the seed it
+// draws is the same seed with the same consequence. Pinned against the source
+// text so the two cannot drift apart again silently. The needle is assembled
+// from fragments so this test cannot match its own source.
+test "doc: both OAEP encrypt entry points state the CSPRNG requirement" {
+    const src = @embedFile("root.zig");
+    // Both needles are assembled from fragments so this test cannot match its
+    // own source text.
+    const decl = "pub fn " ++ "encryptOaep";
+    const needle = "MUST be " ++ "cryptographically";
+
+    const at0 = std.mem.indexOf(u8, src, decl).?;
+    const at1 = std.mem.indexOfPos(u8, src, at0 + decl.len, decl).?;
+    try testing.expect(std.mem.indexOfPos(u8, src, at1 + decl.len, decl) == null); // exactly two
+
+    // The requirement must sit in the doc block immediately BEFORE each
+    // declaration. The second window starts at the END of the first
+    // declaration, so `encryptOaep`'s own doc cannot satisfy `encryptOaepH`.
+    try testing.expect(std.mem.indexOf(u8, src[at0 -| 1600..at0], needle) != null);
+    try testing.expect(std.mem.indexOf(u8, src[at0 + decl.len .. at1], needle) != null);
 }
 
 // Regression for the montint-rewire CRIT: a sub-max key driven through the

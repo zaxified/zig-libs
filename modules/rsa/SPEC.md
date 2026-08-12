@@ -43,8 +43,21 @@ precomputed once per key at construction, so no per-operation setup cost is paid
 carries both fault- and side-channel countermeasures: F3 (Bellcore/BDL) — every CRT private op
 re-encrypts the recovered `m` and checks `m^e ≡ c (mod n)`, returning `error.FaultDetected` on
 mismatch rather than handing an attacker a faulty value that could factor `n`; F2 (base blinding) —
-when an rng is available, the op runs on `c·r^e mod n` for a fresh random unit `r` and unblinds by
+with a `Blinding.csprng`, the op runs on `c·r^e mod n` for a fresh random unit `r` and unblinds by
 `r⁻¹ mod n`.
+
+**The blinding seam (B6 RNG-seam audit, 2026-08-12).** `privateOpCrt` takes a `Blinding` — a tagged
+union with a `csprng` arm and a payload-free `none` arm, plus a private `rng()` accessor — rather
+than a `?std.Random`. `signPss` blinds unconditionally (it already holds a CSPRNG for the salt).
+The deterministic entry points cannot: std 0.16 removed `std.crypto.random`, so entropy has to be
+an argument, and `signPkcs1v15`/`decryptOaep`/`decryptOaepH`/`rsadpCrt` have none. Until this audit
+that meant they ran unblinded with **no way for a consumer to change it**, which is the actual
+finding — not the default itself. Each now has a `…Blinded` twin taking an explicit `Blinding`; the
+unblinded default is unchanged, because turning it on would be a breaking signature change to
+public API with seven in-repo consumers, and because the primary constant-time defence
+(`montPowSecret`) and the F3 fault check are on either way. Blinding here is defence in depth: what
+it buys is that a residual leak in the constant-time claim is not correlated with an
+attacker-chosen base.
 
 ## Threat model / out of scope
 

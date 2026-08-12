@@ -743,7 +743,10 @@ test "golden replay through V3Client: the captured discovery Report drives the h
             .priv_protocol = .aes128_cfb,
             .priv_password = password,
         },
-        .{},
+        // Replay fixture: this test only drives `discover()`, which is
+        // plaintext, but the user is authPriv — pin the seed so the shape is
+        // the one a reader should copy (never `.csprng` in a test).
+        .{ .salt_seed = .{ .fixed_for_test = 0x0102030405060708 } },
     );
     try c.discover();
     try testing.expectEqualSlices(u8, &engine_id, c.engine.id());
@@ -854,7 +857,9 @@ test "live: SNMPv3 GET + walk against a real agent" {
         .auth_password = auth_pw,
         .priv_protocol = priv_proto,
         .priv_password = priv_pw,
-    }, .{});
+        // A live agent at authPriv needs a salt seed (RFC 3826 §3.1.2.1); this
+        // is a test against a throwaway agent, so it names the test arm.
+    }, .{ .salt_seed = .{ .fixed_for_test = 0x5a5a_a5a5_3c3c_c3c3 } });
 
     c.discover() catch |err| {
         if (verboseSkip()) std.debug.print(

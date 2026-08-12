@@ -42,17 +42,34 @@ const shared = try bolt8.Secp256k1DH.dh(my_secret, remote_pub_33_bytes); // [32]
 **The handshake driver**:
 
 ```zig
+// `Ephemeral` is a tagged union, not a bare `std.Random`: the Act One/Two
+// ephemeral IS the per-session secret, so which kind of generator produced it
+// has to be written out at the call site. `.csprng` is the production arm and
+// is an assertion you make (std 0.16 removed `std.crypto.random`, so this
+// module has no RNG of its own and cannot check it); `.seeded_for_test` is the
+// other arm, and choosing it in production costs you initiator forward secrecy.
+var csprng = std.Random.DefaultCsprng.init(seed_from_getrandom);
+const entropy: bolt8.handshake.Ephemeral = .{ .csprng = csprng.random() };
+
 var initiator = bolt8.Initiator.init(my_static_keypair, responder_static_pubkey);
-const act1 = try initiator.genAct1(random);
+const act1 = try initiator.genAct1(entropy);
 try initiator.readAct2(act2_from_wire);
 const done = try initiator.genAct3();
 // done.msg -> send over the wire; done.result -> bolt8.Transport.init(done.result)
 
 var responder = bolt8.Responder.init(my_static_keypair);
 try responder.readAct1(act1_from_wire);
-const act2 = try responder.genAct2(random);
+const act2 = try responder.genAct2(entropy);
 const result = try responder.readAct3(act3_from_wire);
 ```
+
+Each `Initiator`/`Responder` drives **one** handshake, in order. A second
+`genAct1` (or any act out of sequence) is `error.WrongState`, never a silent
+reuse of the previous ephemeral share — build a fresh one to retry. The
+ephemeral itself is always drawn inside `genAct1`/`genAct2`; there is no way to
+pin it from production code (the Appendix A vectors reach the
+`genAct1WithEphemeral`/`genAct2WithEphemeral` hooks, which `@compileError`
+outside a test build).
 
 **The post-handshake transport** (once a `HandshakeResult` is in hand):
 

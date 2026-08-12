@@ -147,6 +147,11 @@ pub const V3Walker = v3client_mod.Walker;
 pub const SecurityLevel = v3client_mod.SecurityLevel;
 pub const User = v3client_mod.User;
 pub const EngineState = v3client_mod.EngineState;
+/// Where `V3Client`'s privacy-salt counter starts (RFC 3826 §3.1.2.1's
+/// pseudo-random "local 64-bit integer"). A named union, not a `u64`: an
+/// authPriv client has to say whether the value came from a CSPRNG or is a
+/// pinned test value, and one without a seed refuses to encrypt.
+pub const SaltSeed = v3client_mod.SaltSeed;
 
 test {
     _ = ber;

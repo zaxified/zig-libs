@@ -71,15 +71,32 @@ USM is the security-sensitive part.
     AES-CFB IV is `boots‖time‖salt`, so the engine clock varies it even if a salt repeats; the
     DES-CBC IV is `pre_iv XOR salt`, with **no** boots/time input at all, so the salt is the only
     thing separating two IVs. DES is therefore fully dependent on this layer.
-  - **Cross-restart.** No in-process state can see a previous run. `V3Client` therefore seeds its
-    counter from the engine's discovered `engineBoots‖engineTime` before the first encrypted message
-    (RFC 3414 §8.1.1.1 asks for a pseudo-random boot-time value; this module owns no clock and no RNG
-    by design, and the engine clock is the varying value it already has). That separates two runs
-    starting more than one engine-second apart. It does **not** separate two runs that reach their
-    first authPriv message inside the same second — pass `Options.initial_salt` with a random value
-    if that matters. Consequence of getting it wrong: AES-CFB reuses the keystream outright
-    (`C1 XOR C2 = P1 XOR P2`); DES-CBC reuses the IV, which leaks equality of ScopedPDU block
-    prefixes — and SNMP ScopedPDU prefixes are highly structured.
+  - **The counter's STARTING value is a caller obligation, and the API says so.** No in-process
+    state can see a previous run, and none can see another manager. RFC 3826 §3.1.2.1 (and RFC 3414
+    §8.1.1.1 for DES) require the local 64-bit integer to be "initialized to a pseudo-random value
+    at boot time"; RFC 3826 §4 then accepts the residual risk of a duplicate IV **only** on the
+    grounds that two managers "accidentally select the same 64-bit integer within a second" is
+    *unlikely* — which is a statement about a pseudo-random value, not about any value.
+    `V3Client.Options.salt_seed` is therefore a `SaltSeed` union, not a `u64`: `.csprng = v` is the
+    caller asserting that `v` came from a cryptographically secure source, `.fixed_for_test = v`
+    names the reproducible-vector path, and `null` (the default) means "this client never sends
+    authPriv" — the first encrypted message it attempts is refused with `error.SaltSeedRequired`.
+    This module owns no RNG (std 0.16 removed `std.crypto.random`) and no clock, so it has nothing
+    unpredictable of its own to fall back on, and every value it *could* pick is public.
+    ⚠ **Superseded design, recorded because it was wrong in an instructive way:** the counter used
+    to be seeded from the engine's discovered `engineBoots‖engineTime`. Those are clock/boot
+    registers standing in for entropy, and both are read off the same wire by every manager talking
+    to that engine — so two clients that reach their first authPriv message in the same engine
+    second started from the *same* value. RFC 3414 §2.6 key localization is `H(Ku ‖ engineID ‖ Ku)`
+    with nothing per-client in it, so those two clients also hold the same localized privacy key:
+    same key, same IV sequence. Consequence, per mode and measured by a test in `v3client.zig`:
+    AES-CFB reuses the keystream outright, so `C1 XOR C2 = P1 XOR P2` over the plaintexts' common
+    prefix **and the first block in which they differ** (CFB feeds the previous *ciphertext* block
+    forward, so the keystream stays shared until the ciphertexts diverge) — with an SNMP ScopedPDU's
+    known prefix that is plaintext recovery, not merely a distinguisher. DES-CBC is strictly weaker:
+    a repeated IV under a shared key makes identical plaintext blocks encrypt identically, which
+    leaks how far two ScopedPDUs agree (and that a message repeats), but carries no XOR relation to
+    the plaintexts and recovers nothing.
 - **Illegal security flags.** `v3.decode` discards a message whose `msgFlags` has privFlag set with
   authFlag clear (`error.InvalidSecurityFlags`, RFC 3412 §7.2 step 5 / RFC 3414 §3.1's
   `snmpInvalidMsgs`), and one whose `msgSecurityModel` is not USM (`error.UnsupportedSecurityModel`,

@@ -58,8 +58,15 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     `msgPrivacyParameters` from a never-repeating counter and hands it back in
     `Encrypted.salt`, so no caller can accidentally reuse one. Pinning a salt to
     reproduce a published vector or a captured datagram is the explicit opt-in
-    `priv.SaltSource.fixedForInterop`. `V3Client` needs no configuration for
-    this — see SPEC.md for what the guarantee covers and what it does not.
+    `priv.SaltSource.fixedForInterop`. What the counter cannot supply on its
+    own is where it *starts*: RFC 3826 §3.1.2.1 requires a pseudo-random
+    boot-time value, and this module owns neither an RNG nor a clock, so an
+    authPriv `V3Client` must name one —
+    `.{ .salt_seed = .{ .csprng = <64 bits from your CSPRNG> } }`. Leaving it
+    out is not a default, it is `error.SaltSeedRequired` on the first encrypted
+    message; `.fixed_for_test` is the reproducible-vector arm. See SPEC.md for
+    what the guarantee covers, what it does not, and what a shared seed costs
+    per cipher mode.
   - **Anti-replay** (`timewin`): the RFC 3414 §3.2 ±150 s window with
     per-engine boots/time state, in both the authoritative and
     non-authoritative roles. **Report-PDUs are held to the same window** as

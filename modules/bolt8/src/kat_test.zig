@@ -23,10 +23,12 @@ const transport = @import("transport.zig");
 fn initiatorAfterAct1() !handshake.Initiator {
     const ls = try dh.KeyPair.generateDeterministic(kv.init_ls_priv.*);
     var initiator = handshake.Initiator.init(ls, kv.resp_ls_pub.*);
-    initiator.e = try dh.KeyPair.generateDeterministic(kv.init_e_priv.*);
-    // `undefined` random: `e` is pre-set (Appendix A's own KAT hook), so
-    // genAct1 never draws randomness.
-    const a1 = try initiator.genAct1(undefined);
+    // Appendix A fixes `e.priv`, so this goes through the test-build-only
+    // `genAct1WithEphemeral` hook — the ONLY way to pin the ephemeral since
+    // the B6 seam audit; `genAct1` itself always draws from its `Ephemeral`.
+    const a1 = try initiator.genAct1WithEphemeral(
+        try dh.KeyPair.generateDeterministic(kv.init_e_priv.*),
+    );
     try testing.expectEqualSlices(u8, kv.act1_bytes, &a1.toBytes());
     return initiator;
 }
@@ -38,8 +40,9 @@ fn responderAfterAct2() !handshake.Responder {
     const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
     var responder = handshake.Responder.init(ls);
     try responder.readAct1(try act.Act1.fromBytes(kv.act1_bytes));
-    responder.e = try dh.KeyPair.generateDeterministic(kv.resp_e_priv.*);
-    const a2 = try responder.genAct2(undefined);
+    const a2 = try responder.genAct2WithEphemeral(
+        try dh.KeyPair.generateDeterministic(kv.resp_e_priv.*),
+    );
     try testing.expectEqualSlices(u8, kv.act2_bytes, &a2.toBytes());
     return responder;
 }

@@ -49,7 +49,7 @@
 //! var csprng = std.Random.DefaultCsprng.init(seed); // caller's real CSPRNG
 //! const token = try jwe.encryptCompact(
 //!     gpa, .dir, .A256GCM, .{ .symmetric = &key }, "attack at dawn", "",
-//!     csprng.random(), .{},
+//!     .{ .csprng = csprng.random() }, .{},
 //! );
 //! defer gpa.free(token);
 //!
@@ -69,6 +69,12 @@
 //!   supplied (`error.KeyMaterialMismatch`) — this is the "confusion"
 //!   defense named in the threat model (SPEC.md).
 //! - `zip` (compression) is always rejected — see `header.zig`.
+//! - **Randomness is a named caller obligation.** `encryptCompact` takes an
+//!   `Entropy`, not a `std.Random`: the caller writes `.csprng` (a claim this
+//!   module cannot verify) or `.fixed_for_test`. `dir` is the mode where
+//!   getting it wrong is catastrophic rather than merely bad — the CEK is the
+//!   caller's long-lived key, so a repeated content IV under `AxxxGCM` gives
+//!   up plaintext AND the GHASH authentication subkey. See `entropy.zig`.
 //! - Compact serialization carries no extra AAD (RFC 7516 §5.1); passing a
 //!   non-empty `aad_extra` to `encryptCompact` is `error.CompactSerializationNoAad`.
 
@@ -78,6 +84,7 @@ const rsa = @import("rsa");
 pub const header = @import("header.zig");
 pub const enc = @import("enc.zig");
 pub const alg = @import("alg.zig");
+pub const Entropy = @import("entropy.zig").Entropy;
 pub const aeskw = alg.aeskw;
 pub const ecdhes = alg.ecdhes;
 
@@ -267,10 +274,19 @@ pub const DecryptError = error{
     InvalidKey,
 } || header.ParseError || alg.Error || enc.Error;
 
-/// Encrypt `plaintext` into a compact-serialization JWE. `random` supplies
-/// every fresh value this call needs (CEK when `alg` isn't `dir`, the
-/// content IV, the AxxxGCMKW wrap IV, the PBES2 salt input) and MUST be
-/// cryptographically secure. Returns a `gpa`-owned string; free with `gpa`.
+/// Encrypt `plaintext` into a compact-serialization JWE. `entropy` supplies
+/// every fresh value this call needs — the CEK (when `alg` isn't `dir`), the
+/// content IV, the AxxxGCMKW wrap IV, the PBES2 salt input, the ECDH-ES
+/// ephemeral private scalar — and its arm is the caller's written claim about
+/// what kind of generator that is. Returns a `gpa`-owned string; free with
+/// `gpa`.
+///
+/// The consequence of getting it wrong is not uniform across `alg`: under
+/// `dir` the CEK is the caller's long-lived key and the IV is the only thing
+/// separating two messages, so a repeated IV under `AxxxGCM` recovers
+/// plaintext **and** the GHASH authentication subkey, i.e. forgery of every
+/// other token under that key. See `entropy.zig` for the full statement and
+/// for why a stateless RFC 7516 encoder cannot prevent this outright.
 ///
 /// `aad_extra` must be empty — see the module doc comment.
 pub fn encryptCompact(
@@ -280,9 +296,15 @@ pub fn encryptCompact(
     key: KeyMaterial,
     plaintext: []const u8,
     aad_extra: []const u8,
-    random: std.Random,
+    entropy: Entropy,
     opts: EncryptOptions,
 ) EncryptError![]u8 {
+    // Unwrapped here rather than through an accessor on `Entropy` — see the
+    // note at the bottom of `entropy.zig`.
+    const random: std.Random = switch (entropy) {
+        .csprng => |r| r,
+        .fixed_for_test => |r| r,
+    };
     if (aad_extra.len != 0) return error.CompactSerializationNoAad;
     if (key_alg == .unknown) return error.UnsupportedAlg;
     if (content_enc == .unknown) return error.UnsupportedEnc;
@@ -316,7 +338,7 @@ pub fn encryptCompact(
             };
             random.bytes(cek);
             const hash: alg.OaepHash = if (key_alg == .@"RSA-OAEP") .sha1 else .sha256;
-            break :blk try alg.rsaOaepWrap(pk, hash, random, cek, &ek_buf);
+            break :blk try alg.rsaOaepWrap(pk, hash, entropy, cek, &ek_buf);
         },
         .A128KW, .A192KW, .A256KW => blk: {
             const kek = switch (key) {
@@ -367,7 +389,7 @@ pub fn encryptCompact(
                 else => return error.KeyMaterialMismatch,
             };
             const curve = std.meta.activeTag(pk);
-            var eph = ecdhes.generateEphemeral(curve, random);
+            var eph = ecdhes.generateEphemeral(curve, entropy);
             defer eph.private.wipe();
             var z_buf: [ecdhes.max_z_len]u8 = undefined;
             defer std.crypto.secureZero(u8, &z_buf);
@@ -638,14 +660,15 @@ pub fn decryptCompact(
     return trimmed;
 }
 
-/// Deterministic CSPRNG for tests only — production callers must supply
-/// their own cryptographically secure `std.Random` (see the module doc
-/// comment's usage example; std 0.16 removed `std.crypto.random`).
-fn testRandom() std.Random {
+/// The one place this file's test call sites enter `Entropy`'s weak arm.
+/// Returns the tagged VALUE, not a `std.Random`, so no test can hand a
+/// generator to `encryptCompact` without the claim travelling with it.
+/// Production callers supply `.{ .csprng = … }` — see `entropy.zig`.
+fn seededForTest() Entropy {
     const S = struct {
         var csprng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
     };
-    return S.csprng.random();
+    return .{ .fixed_for_test = S.csprng.random() };
 }
 
 fn decodeSegmentAlloc(arena: std.mem.Allocator, segment: []const u8) error{ OutOfMemory, InvalidBase64 }![]u8 {
@@ -667,7 +690,7 @@ test {
 
 test "dir + A128GCM real round-trip" {
     const key = [_]u8{0x2b} ** 16;
-    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "attack at dawn", "", testRandom(), .{});
+    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "attack at dawn", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     const plaintext = try decryptCompact(std.testing.allocator, .{ .symmetric = &key }, token, .{});
@@ -677,7 +700,7 @@ test "dir + A128GCM real round-trip" {
 
 test "dir + A256GCM real round-trip, empty plaintext" {
     const key = [_]u8{0x11} ** 32;
-    const token = try encryptCompact(std.testing.allocator, .dir, .A256GCM, .{ .symmetric = &key }, "", "", testRandom(), .{});
+    const token = try encryptCompact(std.testing.allocator, .dir, .A256GCM, .{ .symmetric = &key }, "", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     const plaintext = try decryptCompact(std.testing.allocator, .{ .symmetric = &key }, token, .{});
@@ -687,7 +710,7 @@ test "dir + A256GCM real round-trip, empty plaintext" {
 
 test "A128GCMKW + A128GCM real round-trip" {
     const kek = [_]u8{0x77} ** 16;
-    const token = try encryptCompact(std.testing.allocator, .A128GCMKW, .A128GCM, .{ .symmetric = &kek }, "the eagle flies at midnight", "", testRandom(), .{});
+    const token = try encryptCompact(std.testing.allocator, .A128GCMKW, .A128GCM, .{ .symmetric = &kek }, "the eagle flies at midnight", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     const plaintext = try decryptCompact(std.testing.allocator, .{ .symmetric = &kek }, token, .{});
@@ -697,7 +720,7 @@ test "A128GCMKW + A128GCM real round-trip" {
 
 test "tampered ciphertext fails authentication, never returns garbage plaintext" {
     const key = [_]u8{0x2b} ** 16;
-    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "attack at dawn", "", testRandom(), .{});
+    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "attack at dawn", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     var mutable = try std.testing.allocator.dupe(u8, token);
@@ -719,7 +742,7 @@ test "tampered ciphertext fails authentication, never returns garbage plaintext"
 
 test "key-material confusion is rejected: dir token vs RSA key" {
     const key = [_]u8{0x2b} ** 16;
-    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "", testRandom(), .{});
+    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     const bogus_rsa = rsa.PublicKey.fromBytes(&[_]u8{0xff} ** 64, &[_]u8{ 0x01, 0x00, 0x01 }) catch unreachable;
@@ -728,17 +751,17 @@ test "key-material confusion is rejected: dir token vs RSA key" {
 
 test "compact serialization rejects non-empty aad_extra" {
     const key = [_]u8{0x2b} ** 16;
-    try std.testing.expectError(error.CompactSerializationNoAad, encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "extra", testRandom(), .{}));
+    try std.testing.expectError(error.CompactSerializationNoAad, encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "extra", seededForTest(), .{}));
 }
 
 test "unknown alg/enc are rejected up front" {
     const key = [_]u8{0x2b} ** 16;
-    try std.testing.expectError(error.UnsupportedAlg, encryptCompact(std.testing.allocator, .unknown, .A128GCM, .{ .symmetric = &key }, "hi", "", testRandom(), .{}));
-    try std.testing.expectError(error.UnsupportedEnc, encryptCompact(std.testing.allocator, .dir, .unknown, .{ .symmetric = &key }, "hi", "", testRandom(), .{}));
+    try std.testing.expectError(error.UnsupportedAlg, encryptCompact(std.testing.allocator, .unknown, .A128GCM, .{ .symmetric = &key }, "hi", "", seededForTest(), .{}));
+    try std.testing.expectError(error.UnsupportedEnc, encryptCompact(std.testing.allocator, .dir, .unknown, .{ .symmetric = &key }, "hi", "", seededForTest(), .{}));
 }
 
 test "ECDH-ES direct + A128GCM real round-trip (P-256, apu/apv, empty encrypted_key)" {
-    const recipient = ecdhes.generateEphemeral(.p256, testRandom());
+    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
     const token = try encryptCompact(
         std.testing.allocator,
         .@"ECDH-ES",
@@ -746,7 +769,7 @@ test "ECDH-ES direct + A128GCM real round-trip (P-256, apu/apv, empty encrypted_
         .{ .ec_public = recipient.public },
         "meet at the old bridge",
         "",
-        testRandom(),
+        seededForTest(),
         .{ .apu = "Alice", .apv = "Bob" },
     );
     defer std.testing.allocator.free(token);
@@ -765,7 +788,7 @@ test "ECDH-ES direct + A128GCM real round-trip (P-256, apu/apv, empty encrypted_
 }
 
 test "ECDH-ES+A256KW over X25519 real round-trip" {
-    const recipient = ecdhes.generateEphemeral(.x25519, testRandom());
+    const recipient = ecdhes.generateEphemeral(.x25519, seededForTest());
     const token = try encryptCompact(
         std.testing.allocator,
         .@"ECDH-ES+A256KW",
@@ -773,7 +796,7 @@ test "ECDH-ES+A256KW over X25519 real round-trip" {
         .{ .ec_public = recipient.public },
         "the eagle flies at midnight",
         "",
-        testRandom(),
+        seededForTest(),
         .{},
     );
     defer std.testing.allocator.free(token);
@@ -786,7 +809,7 @@ test "ECDH-ES+A256KW over X25519 real round-trip" {
 }
 
 test "ECDH-ES+A128KW + A128CBC-HS256 real round-trip (P-256)" {
-    const recipient = ecdhes.generateEphemeral(.p256, testRandom());
+    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
     const token = try encryptCompact(
         std.testing.allocator,
         .@"ECDH-ES+A128KW",
@@ -794,7 +817,7 @@ test "ECDH-ES+A128KW + A128CBC-HS256 real round-trip (P-256)" {
         .{ .ec_public = recipient.public },
         "wrapped CEK, CBC-HMAC content",
         "",
-        testRandom(),
+        seededForTest(),
         .{ .apv = "bob@example.org" },
     );
     defer std.testing.allocator.free(token);
@@ -805,17 +828,17 @@ test "ECDH-ES+A128KW + A128CBC-HS256 real round-trip (P-256)" {
 }
 
 test "ECDH-ES cross-curve confusion is rejected: P-256 token vs X25519 key (typed)" {
-    const p256_recipient = ecdhes.generateEphemeral(.p256, testRandom());
-    const x25519_recipient = ecdhes.generateEphemeral(.x25519, testRandom());
-    const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = p256_recipient.public }, "hi", "", testRandom(), .{});
+    const p256_recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    const x25519_recipient = ecdhes.generateEphemeral(.x25519, seededForTest());
+    const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = p256_recipient.public }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     try std.testing.expectError(error.CurveMismatch, decryptCompact(std.testing.allocator, .{ .ec_private = x25519_recipient.private }, token, .{}));
 }
 
 test "ECDH-ES key-material confusion is rejected: ECDH token vs symmetric key" {
-    const recipient = ecdhes.generateEphemeral(.p256, testRandom());
-    const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", testRandom(), .{});
+    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     const key = [_]u8{0x2b} ** 16;
@@ -823,8 +846,8 @@ test "ECDH-ES key-material confusion is rejected: ECDH token vs symmetric key" {
 }
 
 test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
-    const recipient = ecdhes.generateEphemeral(.p256, testRandom());
-    const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", testRandom(), .{});
+    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
     // Splice a non-empty Encrypted Key into the (empty) second segment.
@@ -839,8 +862,8 @@ test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
 }
 
 test "ECDH-ES+A192KW is the documented AES-192 std gap" {
-    const recipient = ecdhes.generateEphemeral(.p256, testRandom());
-    try std.testing.expectError(error.UnsupportedKeyLength, encryptCompact(std.testing.allocator, .@"ECDH-ES+A192KW", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", testRandom(), .{}));
+    const recipient = ecdhes.generateEphemeral(.p256, seededForTest());
+    try std.testing.expectError(error.UnsupportedKeyLength, encryptCompact(std.testing.allocator, .@"ECDH-ES+A192KW", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{}));
 }
 
 test "malformed compact tokens are rejected, never panic on arbitrary bytes" {
@@ -865,4 +888,97 @@ fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
     // reaching a decrypted plaintext.
     const pt = decryptCompact(std.testing.allocator, .{ .symmetric = &key }, raw[0..len], .{}) catch return;
     std.testing.allocator.free(pt);
+}
+
+// ── the randomness seam (RNG-seam audit, `entropy.zig`) ────────────────────
+//
+// `encryptCompact` takes an `Entropy`, not a `std.Random`. The two generators
+// are indistinguishable once they are a vtable, so the caller names which one
+// it is handing over. The first test pins that the type keeps exactly the two
+// arms; the second measures what naming the wrong one actually costs, so the
+// doc comment's warning is a fact and not a claim.
+
+test "Entropy: exactly two arms, production and test are distinct, and nothing else is admitted" {
+    const info = @typeInfo(Entropy).@"union";
+    try std.testing.expectEqual(@as(usize, 2), info.fields.len);
+    try std.testing.expectEqualStrings("csprng", info.fields[0].name);
+    try std.testing.expectEqualStrings("fixed_for_test", info.fields[1].name);
+
+    // The SAME generator under the two arms — different claims about the same
+    // bytes is precisely the distinction the type exists to carry.
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    const production: Entropy = .{ .csprng = csprng.random() };
+    const for_test: Entropy = .{ .fixed_for_test = csprng.random() };
+    try std.testing.expect(std.meta.activeTag(production) != std.meta.activeTag(for_test));
+}
+
+test "the CSPRNG requirement is load-bearing: dir + A256GCM with a repeated generator reuses the IV" {
+    // `dir` is the sharp case: the CEK is the caller's long-lived key, so the
+    // content IV is the only thing separating two messages. Two generators in
+    // the same state stand in for "the consumer reached for DefaultPrng".
+    const gpa = std.testing.allocator;
+    const key = [_]u8{0x2b} ** 32;
+    const p1 = "transfer 100 to alice!!!";
+    const p2 = "transfer 999 to mallory??";
+
+    var g1 = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
+    var g2 = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32); // same seed
+    var g3 = std.Random.DefaultCsprng.init([_]u8{0x12} ** 32); // different
+
+    const t1 = try encryptCompact(gpa, .dir, .A256GCM, .{ .symmetric = &key }, p1, "", .{ .fixed_for_test = g1.random() }, .{});
+    defer gpa.free(t1);
+    const t2 = try encryptCompact(gpa, .dir, .A256GCM, .{ .symmetric = &key }, p2, "", .{ .fixed_for_test = g2.random() }, .{});
+    defer gpa.free(t2);
+    const t3 = try encryptCompact(gpa, .dir, .A256GCM, .{ .symmetric = &key }, p2, "", .{ .fixed_for_test = g3.random() }, .{});
+    defer gpa.free(t3);
+
+    var iv1: [12]u8 = undefined;
+    var iv2: [12]u8 = undefined;
+    var iv3: [12]u8 = undefined;
+    var c1: [64]u8 = undefined;
+    var c2: [64]u8 = undefined;
+    var c3: [64]u8 = undefined;
+    const n1 = try segmentsOf(t1, &iv1, &c1);
+    const n2 = try segmentsOf(t2, &iv2, &c2);
+    const n3 = try segmentsOf(t3, &iv3, &c3);
+    try std.testing.expectEqual(p1.len, n1);
+    try std.testing.expectEqual(p2.len, n2);
+    try std.testing.expectEqual(p2.len, n3);
+
+    // Same generator state ⇒ byte-identical 96-bit GCM nonce under the same key.
+    try std.testing.expectEqualSlices(u8, &iv1, &iv2);
+    // GCM is CTR mode underneath, so the leak is the full-length keystream —
+    // not a prefix, the way a CBC-mode IV repeat would be.
+    const common = @min(p1.len, p2.len);
+    for (c1[0..common], c2[0..common], p1[0..common], p2[0..common]) |x, y, a, b| {
+        try std.testing.expectEqual(a ^ b, x ^ y);
+    }
+    // Stated as the attack: knowing one plaintext recovers the other.
+    var recovered: [24]u8 = undefined;
+    for (&recovered, c1[0..24], c2[0..24], p1[0..24]) |*r, x, y, a| r.* = x ^ y ^ a;
+    try std.testing.expectEqualStrings(p2[0..24], &recovered);
+
+    // Not vacuous: a different generator state breaks both the IV equality and
+    // the XOR relation, so the test is measuring the reuse and not arithmetic.
+    try std.testing.expect(!std.mem.eql(u8, &iv1, &iv3));
+    var still_leaks = true;
+    for (c1[0..common], c3[0..common], p1[0..common], p2[0..common]) |x, y, a, b| {
+        if ((a ^ b) != (x ^ y)) still_leaks = false;
+    }
+    try std.testing.expect(!still_leaks);
+}
+
+/// Split a compact JWE into its IV and ciphertext segments (test helper).
+/// Returns the ciphertext length written into `ct_out`.
+fn segmentsOf(token: []const u8, iv_out: *[12]u8, ct_out: []u8) !usize {
+    const b64 = std.base64.url_safe_no_pad;
+    var it = std.mem.splitScalar(u8, token, '.');
+    _ = it.next() orelse return error.MalformedToken; // header
+    _ = it.next() orelse return error.MalformedToken; // encrypted key (empty for dir)
+    const iv_seg = it.next() orelse return error.MalformedToken;
+    const ct_seg = it.next() orelse return error.MalformedToken;
+    try b64.Decoder.decode(iv_out, iv_seg);
+    const n = try b64.Decoder.calcSizeForSlice(ct_seg);
+    try b64.Decoder.decode(ct_out[0..n], ct_seg);
+    return n;
 }

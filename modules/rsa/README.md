@@ -40,7 +40,15 @@ vectors (see "Verification" below).
   serialization. This module does not implement its own bignum.
 - **Hardening:** the CRT private op carries fault detection (Bellcore/BDL:
   re-encrypt-and-compare, `error.FaultDetected` on mismatch rather than
-  leaking a faulty value) and base blinding when an rng is available.
+  leaking a faulty value) and, when a `Blinding.csprng` is supplied, base
+  blinding.
+- **The blinding seam:** `signPss` blinds always. The deterministic entry
+  points — `signPkcs1v15`, `decryptOaep`/`decryptOaepH`, `rsadpCrt` — take no
+  generator (std 0.16 removed `std.crypto.random`) and default to
+  `Blinding.none`; each has a `…Blinded` twin taking an explicit `Blinding`,
+  so a consumer whose input is attacker-chosen (an OAEP decryption oracle
+  above all) can turn masking on without editing the module. Output is
+  byte-identical either way; only the side-channel posture differs.
 
 ## Provenance
 

@@ -27,6 +27,7 @@
 //! cryptographically secure, same contract as `encryptCompact`'s `random`.
 
 const std = @import("std");
+pub const Entropy = @import("entropy.zig").Entropy;
 // P-256 curve group from the asm-accelerated `p256` module (byte-exact to
 // `std.crypto.ecc.P256`); X25519 stays on std (p256 covers only P-256).
 const P256 = @import("p256").P256;
@@ -145,12 +146,19 @@ pub const EphemeralKeyPair = struct {
     public: PublicKey,
 };
 
-/// Generate the encrypt-side ephemeral key pair on `curve`. `random` MUST
-/// be cryptographically secure — this scalar protects every message key.
-/// P-256 rejection-samples a canonical nonzero scalar (uniform over the
-/// group order); X25519 takes any 32 random bytes (clamping happens in the
-/// scalar mult, per RFC 7748).
-pub fn generateEphemeral(curve: Curve, random: std.Random) EphemeralKeyPair {
+/// Generate the encrypt-side ephemeral key pair on `curve`. The bytes drawn
+/// here ARE the ephemeral private scalar, and it protects every message key
+/// derived from it — which is why the parameter is an `Entropy`, not a
+/// `std.Random`: see `entropy.zig`. P-256 rejection-samples a canonical
+/// nonzero scalar (uniform over the group order); X25519 takes any 32 random
+/// bytes (clamping happens in the scalar mult, per RFC 7748).
+pub fn generateEphemeral(curve: Curve, entropy: Entropy) EphemeralKeyPair {
+    // Unwrapped here rather than through an accessor on `Entropy` — see the
+    // note at the bottom of `entropy.zig`.
+    const random: std.Random = switch (entropy) {
+        .csprng => |r| r,
+        .fixed_for_test => |r| r,
+    };
     switch (curve) {
         .p256 => {
             while (true) {
@@ -356,8 +364,8 @@ test "Concat KDF counter loop — 64-byte output is round-1 digest ‖ round-2 d
 test "ephemeral generation + agreement — both curves, both directions agree" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x37} ** 32);
     inline for (.{ Curve.p256, Curve.x25519 }) |curve| {
-        const a = generateEphemeral(curve, csprng.random());
-        const b = generateEphemeral(curve, csprng.random());
+        const a = generateEphemeral(curve, .{ .fixed_for_test = csprng.random() });
+        const b = generateEphemeral(curve, .{ .fixed_for_test = csprng.random() });
         var za_buf: [max_z_len]u8 = undefined;
         var zb_buf: [max_z_len]u8 = undefined;
         const za = try deriveZ(a.private, b.public, &za_buf);
@@ -376,8 +384,8 @@ test "ephemeral generation + agreement — both curves, both directions agree" {
 
 test "cross-curve agreement is a typed CurveMismatch, never a wrong-key derivation" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x38} ** 32);
-    const p = generateEphemeral(.p256, csprng.random());
-    const x = generateEphemeral(.x25519, csprng.random());
+    const p = generateEphemeral(.p256, .{ .fixed_for_test = csprng.random() });
+    const x = generateEphemeral(.x25519, .{ .fixed_for_test = csprng.random() });
     var z_buf: [max_z_len]u8 = undefined;
     try testing.expectError(error.CurveMismatch, deriveZ(p.private, x.public, &z_buf));
     try testing.expectError(error.CurveMismatch, deriveZ(x.private, p.public, &z_buf));
@@ -398,13 +406,13 @@ test "invalid peer material is rejected: off-curve point, bad lengths, missing y
 
 test "invalid private scalars: zero / non-canonical P-256 d, low-order X25519 peer" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x39} ** 32);
-    const peer = generateEphemeral(.p256, csprng.random());
+    const peer = generateEphemeral(.p256, .{ .fixed_for_test = csprng.random() });
     var z_buf: [max_z_len]u8 = undefined;
     try testing.expectError(error.InvalidKey, deriveZ(.{ .p256 = [_]u8{0} ** 32 }, peer.public, &z_buf));
     try testing.expectError(error.InvalidKey, deriveZ(.{ .p256 = [_]u8{0xff} ** 32 }, peer.public, &z_buf));
 
     // X25519 low-order peer (the all-zero point) must fail, not yield Z=0.
-    const xkp = generateEphemeral(.x25519, csprng.random());
+    const xkp = generateEphemeral(.x25519, .{ .fixed_for_test = csprng.random() });
     try testing.expectError(error.InvalidKey, deriveZ(xkp.private, .{ .x25519 = [_]u8{0} ** 32 }, &z_buf));
 }
 
@@ -413,7 +421,7 @@ test "PrivateKey.wipe zeroes the scalar" {
         const S = struct {
             var csprng = std.Random.DefaultCsprng.init([_]u8{0x3a} ** 32);
         };
-        break :blk S.csprng.random();
+        break :blk Entropy{ .fixed_for_test = S.csprng.random() };
     });
     kp.private.wipe();
     try testing.expect(std.mem.allEqual(u8, &kp.private.p256, 0));

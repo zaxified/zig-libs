@@ -20,6 +20,7 @@
 //!     against RFC 7518 Appendix C; see `ecdhes.zig`.
 
 const std = @import("std");
+pub const Entropy = @import("entropy.zig").Entropy;
 const rsa = @import("rsa");
 const aead = std.crypto.aead.aes_gcm;
 
@@ -59,7 +60,13 @@ pub const OaepHash = enum { sha1, sha256 };
 /// `rsa.encryptOaep` with the JOSE-mandated empty label. `random` MUST be
 /// cryptographically secure (OAEP's security proof requires an
 /// unpredictable seed — see `rsa`'s own doc comment).
-pub fn rsaOaepWrap(pk: rsa.PublicKey, hash: OaepHash, random: std.Random, cek: []const u8, out: []u8) Error![]u8 {
+pub fn rsaOaepWrap(pk: rsa.PublicKey, hash: OaepHash, entropy: Entropy, cek: []const u8, out: []u8) Error![]u8 {
+    // Unwrapped here rather than through an accessor on `Entropy` — see the
+    // note at the bottom of `entropy.zig`.
+    const random: std.Random = switch (entropy) {
+        .csprng => |r| r,
+        .fixed_for_test => |r| r,
+    };
     return switch (hash) {
         .sha1 => rsa.encryptOaep(pk, std.crypto.hash.Sha1, random, cek, "", out) catch return error.WrapFailed,
         .sha256 => rsa.encryptOaep(pk, std.crypto.hash.sha2.Sha256, random, cek, "", out) catch return error.WrapFailed,
@@ -207,7 +214,7 @@ test "RSA-OAEP-256 wrap/unwrap real round-trip (RFC 7516 A.1's 2048-bit key, SHA
     const cek = [_]u8{0x77} ** 32;
     var wrapped: [256]u8 = undefined;
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
-    const ek = try rsaOaepWrap(pk, .sha256, csprng.random(), &cek, &wrapped);
+    const ek = try rsaOaepWrap(pk, .sha256, .{ .fixed_for_test = csprng.random() }, &cek, &wrapped);
 
     var recovered: [256]u8 = undefined;
     const got = try rsaOaepUnwrap(sk, .sha256, ek, &recovered);

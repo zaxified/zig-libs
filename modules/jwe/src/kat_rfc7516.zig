@@ -129,7 +129,7 @@ test "RFC 7516 A.3: A128KW + A128CBC-HS256 — byte-exact, both directions" {
         .{ .symmetric = &kek },
         "Live long and prosper.",
         "",
-        std.Random.init(&fixed, FixedStream.fill),
+        .{ .fixed_for_test = std.Random.init(&fixed, FixedStream.fill) },
         .{},
     );
     defer std.testing.allocator.free(re_encrypted);

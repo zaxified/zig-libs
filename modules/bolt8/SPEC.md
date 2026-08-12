@@ -217,7 +217,8 @@ re-enabled; the module now carries **zero skips**:
 1. **`Initiator.genAct1`** — `mixHash(e.pub)` → `es = ECDH(e.priv, rs)` →
    `mixKey(es)` → `encryptAndHash("")`. Reproduces
    `kat_vectors.act1_bytes` byte-exact (KAT-injected ephemeral via the
-   pre-set `self.e` hook; `generate(random)` only when unset).
+   test-build-only `genAct1WithEphemeral` hook; `genAct1` itself always
+   draws from its `Ephemeral` argument — see "RNG seam" below).
 2. **`Responder.readAct1`** — mirror (`es = ECDH(s.priv, re)`),
    `decryptAndHash(tag)` fail-closed. Accepts `act1_bytes`, rejects
    `act1_bad_mac` with `error.DecryptionFailed`.
@@ -286,3 +287,31 @@ the published message-0 vector, responder decrypts it back).
   negative vectors (`act2_bad_mac`, `act1_bad_mac`, `act3_bad_ciphertext`,
   `act3_bad_tag`, `act3_bad_rs_message`) — all in `kat_test.zig`, zero
   `SkipZigTest` remaining.
+
+## RNG seam (B6 audit, 2026-08-12)
+
+BOLT#8's Act One `e` is the initiator's only per-session secret input: the
+Act-One wire bytes and `es = ECDH(e.priv, rs)` are pure functions of it. Two
+shapes in the original driver let a consumer fix that value without ever
+deciding to.
+
+- `Initiator.e`/`Responder.e` were **public input fields** and the act steps
+  did `self.e orelse dh.KeyPair.generate(random)`. Assigning the field made the
+  `random` argument dead code, so every Act One carried the same `e_pub` —
+  cross-session linkability, a constant `es`, no initiator forward secrecy.
+  The fields are now named `ephemeral` and are pure **outputs**: `genAct1`/
+  `genAct2` always draw. The KAT injection Appendix A needs moved to
+  `genAct1WithEphemeral`/`genAct2WithEphemeral`, which `@compileError` outside
+  a test build (`assertTestOnly`) — production cannot express a pinned
+  ephemeral at all.
+- The generator argument is now `Ephemeral`, a tagged union with a `csprng`
+  arm and a `seeded_for_test` arm and a private `source()` accessor (the same
+  shape as `dtls`'s `Connection.Entropy`). `std.Random` is a vtable, so
+  `DefaultPrng.init(0).random()` and a real CSPRNG are indistinguishable at a
+  bare parameter; naming the arm is what makes the choice a decision. This is
+  *fail-visible*, not fail-closed: nothing checks what is inside `.csprng`.
+
+Both acts are additionally guarded by a linear state machine
+(`start → awaiting_act2 → ready_act3 → done` and the responder's mirror), so a
+second `genAct1` on one object is `error.WrongState` rather than a silent reuse
+of the cached share.

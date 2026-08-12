@@ -118,6 +118,57 @@ pub const User = struct {
     priv_password: []const u8 = &.{},
 };
 
+/// Where the privacy-salt counter's starting value comes from.
+///
+/// RFC 3826 §3.1.2.1 specifies the AES-CFB IV as
+/// `snmpEngineBoots ‖ snmpEngineTime ‖ local-64-bit-integer` and requires that
+/// the local integer "is initialized to a pseudo-random value at boot time";
+/// RFC 3414 §8.1.1.1 says the same for the DES-CBC salt. §4 (Security
+/// Considerations) then accepts a residual risk in exactly these words: a
+/// duplicate IV is possible "in the very unlikely event that multiple
+/// managers, communicating with a single authoritative engine, both
+/// accidentally select the same 64-bit integer within a second", and the
+/// probability "is very low". **That risk assessment is conditioned on the
+/// value being pseudo-random.** A starting value derived from the engine's own
+/// clock — which is what this client used to do — makes the collision not
+/// unlikely but *certain* for any two managers that begin polling in the same
+/// engine second: the seed is a public number both of them read off the wire.
+///
+/// This module owns no RNG (std 0.16 removed `std.crypto.random`) and no
+/// clock, so the value has to arrive from the caller. Once it is a `u64` the
+/// two kinds are indistinguishable — `0` from a pinned test vector looks
+/// exactly like `0` that a CSPRNG happened to produce — so which kind it is
+/// has to be something the caller writes out by name.
+pub const SaltSeed = union(enum) {
+    /// PRODUCTION. 64 bits the caller drew from a cryptographically secure
+    /// source (`getrandom(2)` or equivalent), once per client instance. This
+    /// module cannot verify the claim; naming this arm IS the claim.
+    csprng: u64,
+
+    /// **TEST / INTEROP ONLY.** A pinned starting value, so a captured
+    /// datagram or a published vector reproduces byte-for-byte.
+    ///
+    /// What choosing this in production costs, concretely: two clients that
+    /// use the same pinned seed against the same engine, under the same USM
+    /// user, hold byte-identical localized keys (RFC 3414 §2.6 localization is
+    /// `H(Ku ‖ engineID ‖ Ku)` — nothing per-client enters it) and emit the
+    /// same salt sequence, hence the same IV sequence. Under AES-CFB that
+    /// leaks the XOR of the two ScopedPDUs over their common prefix and the
+    /// first block in which they differ; under DES-CBC it leaks how long that
+    /// common prefix is.
+    fixed_for_test: u64,
+
+    /// The starting counter value, for the one place in this file that seeds
+    /// the source. Deliberately NOT `pub`: the point of the type is that the
+    /// choice stays visible at the call site.
+    fn value(self: SaltSeed) u64 {
+        return switch (self) {
+            .csprng => |v| v,
+            .fixed_for_test => |v| v,
+        };
+    }
+};
+
 /// The client's view of one authoritative engine: its ID, its clock, and the
 /// localized keys derived for the configured user against that ID.
 pub const EngineState = struct {
@@ -181,6 +232,12 @@ pub const Error = client_mod.TransportError || message.DecodeError ||
     SecurityLevelDowngrade,
     /// A recoverable Report kept coming back after the allowed retry.
     ReportRetryExhausted,
+    /// An authPriv message was attempted on a client whose `Options.salt_seed`
+    /// was left `null`. The privacy-salt counter has no pseudo-random starting
+    /// value (RFC 3826 §3.1.2.1), so encrypting would emit an IV sequence any
+    /// other manager on the same engine could reproduce. Supply
+    /// `.{ .csprng = <64 bits from a CSPRNG> }`.
+    SaltSeedRequired,
 };
 
 /// Allocation-free SNMPv3 manager. Single-owner: it holds the msgID/request-id
@@ -194,16 +251,13 @@ pub const V3Client = struct {
     next_request_id: i32,
     /// The privacy salt source (`priv.SaltSource`) — it, not the caller, owns
     /// `msgPrivacyParameters`, so no code path here can hand the cipher a
-    /// repeated salt. If `Options.initial_salt` was left null the counter is
-    /// re-seeded from the engine's discovered `engineBoots‖engineTime` before
-    /// the first encrypted message, so a client restart does not resume the
-    /// counter from the same place (RFC 3414 §8.1.1.1 "pseudo-random at boot").
-    /// That gives one-second separation, not a guarantee: two runs that reach
-    /// their first authPriv message inside the same engine second still start
-    /// from the same value.
+    /// repeated salt *within one client*. Uniqueness ACROSS clients sharing a
+    /// localized key is a property of the starting value only, which is why
+    /// that value comes in as a named `SaltSeed` and is never derived here.
     salt_source: priv.SaltSource,
-    /// Whether `salt_source` still needs its engine-derived seed.
-    salt_needs_seed: bool,
+    /// Whether `Options.salt_seed` supplied a starting value. False means this
+    /// client may not send authPriv (`error.SaltSeedRequired`).
+    salt_seeded: bool,
     /// `contextName` sent in every ScopedPDU (RFC 3412 §6.8); "" is the default
     /// context and what agents expect.
     context_name: []const u8,
@@ -215,11 +269,19 @@ pub const V3Client = struct {
     pub const Options = struct {
         initial_msg_id: i32 = 1,
         initial_request_id: i32 = 1,
-        /// Seed for the privacy-salt counter. `null` (the default) means "derive
-        /// it from the engine's discovered clock" — see `salt_source`. Set it
-        /// explicitly only to make salts reproducible in a test, or to supply a
-        /// better (random) seed than the engine clock.
-        initial_salt: ?u64 = null,
+        /// Starting value for the privacy-salt counter — RFC 3826 §3.1.2.1's
+        /// "local 64-bit integer", which that RFC requires to be pseudo-random
+        /// at boot. See `SaltSeed` for why it is a named union and not a
+        /// plain `u64`.
+        ///
+        /// `null` (the default) is legal ONLY for a client that never sends
+        /// authPriv. It does not mean "pick something for me": the first
+        /// encrypted message a seedless client attempts is refused with
+        /// `error.SaltSeedRequired`, because every value this module could
+        /// pick on its own — the engine clock, a constant, a counter — is
+        /// public or shared, and picking one silently is precisely the defect
+        /// this field replaced.
+        salt_seed: ?SaltSeed = null,
         context_name: []const u8 = &.{},
     };
 
@@ -229,8 +291,8 @@ pub const V3Client = struct {
             .user = user,
             .next_msg_id = options.initial_msg_id,
             .next_request_id = options.initial_request_id,
-            .salt_source = priv.SaltSource.counter(options.initial_salt orelse 0),
-            .salt_needs_seed = options.initial_salt == null,
+            .salt_source = priv.SaltSource.counter(if (options.salt_seed) |s| s.value() else 0),
+            .salt_seeded = options.salt_seed != null,
             .context_name = options.context_name,
         };
     }
@@ -487,7 +549,11 @@ pub const V3Client = struct {
         // salt is an output of encryption here, not an input to it.
         var sp_buf: [128]u8 = undefined;
         const wire = if (level.hasPriv()) w: {
-            c.seedSaltSource();
+            // RFC 3826 §3.1.2.1 / RFC 3414 §8.1.1.1: the salt counter's
+            // starting value must be pseudo-random. This module has no RNG,
+            // so if the caller named no `SaltSeed` there is nothing safe to
+            // start from — refuse rather than pick a public number.
+            if (!c.salt_seeded) return error.SaltSeedRequired;
             const plain = try v3.encodeScopedPdu(&c.scoped_buf, .{
                 .context_engine_id = c.engine.id(),
                 .context_name = c.context_name,
@@ -725,21 +791,6 @@ pub const V3Client = struct {
         const rid = c.next_request_id;
         c.next_request_id = if (rid == std.math.maxInt(i32)) 1 else rid + 1;
         return rid;
-    }
-
-    /// Give the salt counter its one-time engine-derived seed, unless the caller
-    /// pinned one via `Options.initial_salt`. RFC 3414 §8.1.1.1 wants the local
-    /// integer "set to a pseudo-random value at boot time"; this module owns no
-    /// clock and no RNG (deliberately — see SPEC), so the closest varying value
-    /// available is the engine's own `engineBoots‖engineTime`, which is already
-    /// on the wire anyway. It separates two runs of this client that start more
-    /// than a second apart; it does not separate two runs inside one second.
-    fn seedSaltSource(c: *V3Client) void {
-        if (!c.salt_needs_seed) return;
-        c.salt_needs_seed = false;
-        const seed = (@as(u64, c.engine.clock.engine_boots) << 32) |
-            @as(u64, c.engine.clock.engine_time);
-        c.salt_source = priv.SaltSource.counter(seed);
     }
 };
 
@@ -1027,6 +1078,13 @@ test "noAuthNoPriv: auto-discovery then a plaintext GET" {
 
 /// Drive a full discover + GET at `level` with `auth`/`privp`, against a
 /// FakeAgent that runs the real USM checks.
+/// The one place this file's authPriv tests enter `SaltSeed`'s weak arm: a
+/// pinned starting value, so a failing test's datagrams are reproducible.
+/// Never a shape for production — see `SaltSeed.fixed_for_test`. Written as a
+/// tagged VALUE so no test can pass a bare `u64` without the claim travelling
+/// with it.
+const test_salt_seed: SaltSeed = .{ .fixed_for_test = 0xa5a5_5a5a_c3c3_3c3c };
+
 fn expectLevelRoundTrip(level: SecurityLevel, auth: usm.AuthProtocol, privp: priv.PrivProtocol) !void {
     const vals = try sysNameVarBinds();
     const user: User = .{
@@ -1038,7 +1096,7 @@ fn expectLevelRoundTrip(level: SecurityLevel, auth: usm.AuthProtocol, privp: pri
         .priv_password = "maplesyrup",
     };
     var agent: FakeAgent = .{ .user = user, .values = &vals };
-    var c = V3Client.init(agent.transport(), user, .{});
+    var c = V3Client.init(agent.transport(), user, .{ .salt_seed = test_salt_seed });
     try c.discover();
     try testing.expect(c.engine.discovered);
     try testing.expectEqual(auth.keyLen(), c.engine.authKey().len);
@@ -1181,7 +1239,7 @@ test "an authPriv request answered with a plaintext Response is a downgrade, not
         .priv_password = "maplesyrup",
     };
     var agent: FakeAgent = .{ .user = user, .values = &vals, .downgrade = true };
-    var c = V3Client.init(agent.transport(), user, .{});
+    var c = V3Client.init(agent.transport(), user, .{ .salt_seed = test_salt_seed });
     try c.discover();
     try testing.expectError(error.SecurityLevelDowngrade, c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")}));
 }
@@ -1224,7 +1282,7 @@ test "the privacy salt never repeats across real authPriv requests" {
             .priv_password = "maplesyrup",
         };
         var agent: FakeAgent = .{ .user = user, .values = &vals };
-        var c = V3Client.init(agent.transport(), user, .{});
+        var c = V3Client.init(agent.transport(), user, .{ .salt_seed = test_salt_seed });
         try c.discover();
 
         const oid = try Oid.parse("1.3.6.1.2.1.1.5.0");
@@ -1255,38 +1313,156 @@ test "the privacy salt never repeats across real authPriv requests" {
     }
 }
 
-test "the salt counter is seeded from the engine clock, not from a constant" {
-    // Two clients built identically must not start their salt counters at the
-    // same place when the engine clock differs — the cross-restart hazard.
+// ── the privacy-salt seed (RFC 3826 §3.1.2.1 / RFC 3414 §8.1.1.1) ───────────
+//
+// The counter that produces `msgPrivacyParameters` is monotonic, so salts
+// never repeat WITHIN one client. Across clients that share a localized key
+// the only thing separating them is the counter's starting value, and this
+// client used to derive it from `engineBoots ‖ engineTime` — two public
+// numbers both clients read off the same wire. These three tests pin the
+// replacement: the seed is a caller-supplied `SaltSeed`, its two kinds are
+// distinct by name, and a client without one refuses to encrypt.
+
+test "SaltSeed: exactly two arms, production and test are distinct, and nothing else is admitted" {
+    const info = @typeInfo(SaltSeed).@"union";
+    try testing.expectEqual(@as(usize, 2), info.fields.len);
+    try testing.expectEqualStrings("csprng", info.fields[0].name);
+    try testing.expectEqualStrings("fixed_for_test", info.fields[1].name);
+
+    // Same 64 bits, different claim about where they came from — the whole
+    // point of the type is that these are not the same value.
+    const production: SaltSeed = .{ .csprng = 0x0102030405060708 };
+    const for_test: SaltSeed = .{ .fixed_for_test = 0x0102030405060708 };
+    try testing.expect(std.meta.activeTag(production) != std.meta.activeTag(for_test));
+    try testing.expectEqual(production.value(), for_test.value());
+}
+
+test "an authPriv client with no salt seed refuses to encrypt rather than inventing one" {
     const vals = try sysNameVarBinds();
     const user: User = .{
         .name = "privUser",
         .level = .auth_priv,
         .auth_protocol = .hmac_sha1,
         .auth_password = "maplesyrup",
-        .priv_protocol = .des_cbc,
+        .priv_protocol = .aes128_cfb,
         .priv_password = "maplesyrup",
     };
-    var salts: [2][8]u8 = undefined;
-    inline for (.{ 1000, 2000 }, 0..) |agent_time, i| {
-        var agent: FakeAgent = .{ .user = user, .values = &vals, .time = agent_time };
-        var c = V3Client.init(agent.transport(), user, .{});
-        try c.discover();
-        _ = try c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
-        const m = try v3.decode(agent.lastRequest());
-        const sp = try usm.parse(m.security_parameters);
-        salts[i] = sp.priv_params[0..8].*;
-    }
-    try testing.expect(!std.mem.eql(u8, &salts[0], &salts[1]));
 
-    // An explicit seed still overrides it (reproducible salts for tests/KATs).
+    // Seedless: discovery (which is plaintext) still works, so the refusal
+    // lands on the encrypting call and not somewhere vague before it.
     var agent: FakeAgent = .{ .user = user, .values = &vals, .time = 1000 };
-    var c = V3Client.init(agent.transport(), user, .{ .initial_salt = 0x0102030405060708 });
+    var c = V3Client.init(agent.transport(), user, .{});
     try c.discover();
-    _ = try c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
-    const m = try v3.decode(agent.lastRequest());
-    const sp = try usm.parse(m.security_parameters);
-    try testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7, 8 }, sp.priv_params[4..8]);
+    try testing.expectError(
+        error.SaltSeedRequired,
+        c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")}),
+    );
+
+    // Naming a seed — either arm — makes the same call go through, so the
+    // refusal is about the missing seed and not about anything else.
+    inline for (.{
+        SaltSeed{ .csprng = 0x0f1e2d3c4b5a6978 },
+        SaltSeed{ .fixed_for_test = 0x0102030405060708 },
+    }) |seed| {
+        var a2: FakeAgent = .{ .user = user, .values = &vals, .time = 1000 };
+        var c2 = V3Client.init(a2.transport(), user, .{ .salt_seed = seed });
+        try c2.discover();
+        _ = try c2.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
+        const m = try v3.decode(a2.lastRequest());
+        const sp = try usm.parse(m.security_parameters);
+        // AES-CFB puts the whole 64-bit counter on the wire (RFC 3826 §3.1.2.1).
+        try testing.expectEqual(seed.value(), std.mem.readInt(u64, sp.priv_params[0..8], .big));
+    }
+
+    // A noAuthNoPriv client never encrypts, so `null` stays legal there — the
+    // seed is not a field every caller must fill in by reflex.
+    var a3: FakeAgent = .{ .user = .{ .name = "plain" }, .values = &vals };
+    var c3 = V3Client.init(a3.transport(), .{ .name = "plain" }, .{});
+    try c3.discover();
+    _ = try c3.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
+}
+
+test "what a shared salt seed actually costs, per cipher mode" {
+    // Two clients, same USM user, same engine: RFC 3414 §2.6 localization is
+    // H(Ku ‖ engineID ‖ Ku), so their localized privacy keys are byte-identical
+    // — nothing per-client enters the key. If their salt counters also start
+    // at the same value, their IVs are identical. This is what that buys an
+    // attacker, measured rather than asserted.
+    const key = [_]u8{
+        0x8f, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70,
+        0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8,
+    };
+    const boots: u32 = 3;
+    const time: u32 = 1000;
+    const seed: u64 = (@as(u64, boots) << 32) | @as(u64, time); // the OLD default
+
+    // 32 bytes: an identical first AES block (the ScopedPDU's contextEngineID
+    // and PDU framing are the same for both managers) then a differing one.
+    const common = "ScopedPDU-prefix-abc"; // 20 bytes both managers emit
+    const p1 = common ++ "secret-one!!";
+    const p2 = common ++ "secret-two??";
+    comptime std.debug.assert(common.len == 20 and p1.len == 32 and p2.len == 32);
+
+    // ── AES-CFB (RFC 3826): a stream mode. IV reuse ⇒ keystream reuse ⇒ the
+    //    XOR of the two plaintexts, i.e. real plaintext recovery whenever one
+    //    side is known — and an SNMP ScopedPDU's prefix always is.
+    {
+        var s1 = priv.SaltSource.counter(seed);
+        var s2 = priv.SaltSource.counter(seed);
+        var b1: [64]u8 = undefined;
+        var b2: [64]u8 = undefined;
+        const e1 = try priv.encrypt(.aes128_cfb, &key, boots, time, &s1, p1, &b1);
+        const e2 = try priv.encrypt(.aes128_cfb, &key, boots, time, &s2, p2, &b2);
+        try testing.expectEqualSlices(u8, &e1.salt, &e2.salt); // same IV
+
+        // C1 ⊕ C2 == P1 ⊕ P2 across the whole 32 bytes: the first block shares
+        // a keystream block outright, and the second inherits it because CFB
+        // feeds the (identical) first ciphertext block forward.
+        for (e1.ciphertext, e2.ciphertext, p1, p2) |c1, c2, a, b| {
+            try testing.expectEqual(a ^ b, c1 ^ c2);
+        }
+        // Stated as the attack: knowing P1 recovers P2 byte for byte.
+        var recovered: [32]u8 = undefined;
+        for (&recovered, e1.ciphertext, e2.ciphertext, p1) |*r, c1, c2, a| r.* = c1 ^ c2 ^ a;
+        try testing.expectEqualStrings(p2, &recovered);
+
+        // Not vacuous: with different seeds the relation collapses.
+        var s3 = priv.SaltSource.counter(seed +% 1);
+        var b3: [64]u8 = undefined;
+        const e3 = try priv.encrypt(.aes128_cfb, &key, boots, time, &s3, p2, &b3);
+        try testing.expect(!std.mem.eql(u8, e2.ciphertext, e3.ciphertext));
+        var same = true;
+        for (e1.ciphertext, e3.ciphertext, p1, p2) |c1, c3, a, b| {
+            if ((a ^ b) != (c1 ^ c3)) same = false;
+        }
+        try testing.expect(!same);
+    }
+
+    // ── DES-CBC (RFC 3414 §8.1.1.2): a block mode. IV reuse under a shared key
+    //    does NOT leak a keystream — it leaks EQUALITY. Identical plaintext
+    //    blocks encrypt identically, so an attacker learns how long the two
+    //    ScopedPDUs agree for (and that a message repeats), not what they say.
+    //    Strictly weaker than the CFB case above, and worth recording as such.
+    {
+        var s1 = priv.SaltSource.counter(seed);
+        var s2 = priv.SaltSource.counter(seed);
+        var b1: [64]u8 = undefined;
+        var b2: [64]u8 = undefined;
+        const e1 = try priv.encrypt(.des_cbc, &key, boots, time, &s1, p1, &b1);
+        const e2 = try priv.encrypt(.des_cbc, &key, boots, time, &s2, p2, &b2);
+        try testing.expectEqualSlices(u8, &e1.salt, &e2.salt); // same IV
+
+        // The 19-byte common prefix covers DES blocks 0 and 1 (16 bytes).
+        try testing.expectEqualSlices(u8, e1.ciphertext[0..16], e2.ciphertext[0..16]);
+        // Where they differ, the ciphertext differs — and carries no XOR
+        // relation to the plaintexts, so nothing is recovered.
+        try testing.expect(!std.mem.eql(u8, e1.ciphertext[16..32], e2.ciphertext[16..32]));
+        var leaks = true;
+        for (e1.ciphertext[16..32], e2.ciphertext[16..32], p1[16..32], p2[16..32]) |c1, c2, a, b| {
+            if ((a ^ b) != (c1 ^ c2)) leaks = false;
+        }
+        try testing.expect(!leaks);
+    }
 }
 
 test "msgID mismatch and request-id mismatch are typed errors" {
@@ -1371,7 +1547,7 @@ test "bit-flip sweep over a valid authPriv reply: never a panic, never wrong dat
     };
     // Capture one good reply, then replay mutated copies through processReply.
     var agent: FakeAgent = .{ .user = user, .values = &vals };
-    var c = V3Client.init(agent.transport(), user, .{});
+    var c = V3Client.init(agent.transport(), user, .{ .salt_seed = test_salt_seed });
     try c.discover();
     _ = try c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
 

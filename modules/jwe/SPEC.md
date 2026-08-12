@@ -70,11 +70,34 @@ placement).
   BREACH belong to, whenever compression crosses a trust boundary) — refusing
   it outright is cheaper and safer than trying to bound it.
 - **RSA-OAEP randomness:** `encryptOaep`'s security proof requires an
-  unpredictable seed; `rsaOaepWrap`'s `random` parameter is never optional
-  and is documented as MUST-be-cryptographically-secure at every call site
-  (`alg.zig`, `root.zig`, README). Because OAEP is randomized, `KAT`
-  round-trip testing of the RFC 7516 A.1 vector can only assert the DECRYPT
-  direction — see `kat_rfc7516.zig`.
+  unpredictable seed; `rsaOaepWrap`'s entropy parameter is never optional.
+  Because OAEP is randomized, `KAT` round-trip testing of the RFC 7516 A.1
+  vector can only assert the DECRYPT direction — see `kat_rfc7516.zig`.
+- **The randomness seam is a named union, not a `std.Random`.**
+  `encryptCompact`, `alg.rsaOaepWrap` and `ecdhes.generateEphemeral` take
+  `Entropy` (`entropy.zig`), whose two arms are `.csprng` (the caller's claim,
+  unverifiable here — `std.Random` is a vtable) and `.fixed_for_test`. The
+  weak path still exists; it can no longer be reached without writing its
+  name, which is the bar this repo's RNG-seam audit sets. Consequence, stated
+  per mode because it is not uniform: under `dir` the CEK *is* the caller's
+  long-lived key, so a repeated content IV under `A128GCM`/`A256GCM` recovers
+  plaintext (`C1 XOR C2 = P1 XOR P2` — GCM is CTR underneath, so the leak is
+  full-length, not a prefix) **and** exposes the GHASH subkey `H = E_K(0^128)`
+  from the two tags, giving forgery of every other token under that key; under
+  `AxxxCBC-HSxxx` a repeated IV leaks only plaintext-block-prefix equality and
+  recovers no key; under every non-`dir` `alg` the CEK is drawn fresh per call,
+  so the damage is confined to the messages that shared the draw.
+  **Why not fail-closed** (module draws its own entropy via `io: std.Io`, as
+  `bfv`/`tfhe` do): this module is a pure codec with no I/O authority, and the
+  injection point is load-bearing for its strongest external anchor — RFC 7516
+  §A.3 is reproduced byte-exact **in the encrypt direction** by feeding the
+  RFC's published CEK ‖ IV through a fixed byte stream (`kat_rfc7516.zig`).
+  **Why not merely documented:** documentation changes what a careful reader
+  knows, not what a careless one can express.
+  **Why not structurally prevented:** `encryptCompact` is a pure function over
+  caller-owned key material; guaranteeing IV uniqueness needs per-key state
+  surviving process restarts, and the deterministic alternative (SIV, RFC
+  5297) is not an RFC 7518 §5 `enc` value, so it would not be JWE.
 - **Header-size-bounded decode:** `decryptCompact` rejects a base64url
   header segment longer than `header.max_header_b64_len` (16 KiB) before
   doing any base64/JSON work — bounds the allocation a decrypt call performs
