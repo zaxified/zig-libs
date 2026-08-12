@@ -1486,6 +1486,13 @@ pub const max_response_trailers = 8;
 /// Stable storage for the generated `Trailer` header value ("A, B, C").
 const trailer_decl_bytes = 256;
 
+/// Backing store for COPIED response header and trailer bytes — see
+/// `ResponseWriter.header_buf`. Sized so that a full table of 32 headers plus 8
+/// trailers has ~100 bytes each with room to spare for the handful of headers
+/// that are legitimately long (a `Content-Security-Policy` runs to a kilobyte,
+/// a `Set-Cookie` with attributes to a few hundred bytes).
+const header_copy_bytes = 4096;
+
 /// Response builder + body writer for one request. Buffers the body up to
 /// its buffer's capacity: a handler that finishes within it gets an exact
 /// automatic `Content-Length`; larger bodies switch to chunked streaming
@@ -1495,8 +1502,10 @@ const trailer_decl_bytes = 256;
 /// Managed headers: `Content-Length` (when set, selects identity framing
 /// and the written byte count is enforced), `Connection` (only "close" is
 /// honored), `Transfer-Encoding` (ignored — framing is the writer's job);
-/// `Date` and `Server` are added automatically unless set. Header
-/// name/value slices must outlive the response. HEAD/204/304 responses
+/// `Date` and `Server` are added automatically unless set. Header and trailer
+/// name/value bytes are COPIED into the writer, so a handler may build them in
+/// a stack buffer that dies when it returns — see `header_buf` for why that is
+/// a correctness requirement rather than a convenience. HEAD/204/304 responses
 /// discard body writes and frame correctly.
 ///
 /// Compression (when `InitOptions.compression` is set): eligible bodies
@@ -1546,10 +1555,37 @@ pub const ResponseWriter = struct {
     /// table entry and every `declared_trailers` slice point into it.
     trailer_decl_buf: [trailer_decl_bytes]u8 = undefined,
     trailer_decl_len: usize = 0,
-    /// Trailer fields to emit after the body (`setTrailer`); like
-    /// `headers`, the name/value slices are stored WITHOUT copying.
+    /// Trailer fields to emit after the body (`setTrailer`); like `headers`,
+    /// the name/value bytes live in `header_buf`.
     trailers: [max_response_trailers]http.Header = undefined,
     trailers_len: usize = 0,
+    /// Stable backing store for every header and trailer name/value byte.
+    ///
+    /// WHY THIS EXISTS. `headers` and `trailers` used to hold the CALLER's
+    /// slices. That is only sound if those slices outlive the response, and no
+    /// realistic handler can promise it: `writeHead` runs inside `end()`, and
+    /// both servers call `end()` AFTER the handler returns (`Server.zig`'s h1
+    /// loop and `h2_server.zig`'s `serveJob`). A handler that formats a value
+    /// into a stack buffer — the obvious way to write one — therefore had its
+    /// bytes read after its frame was gone. It was documented ("slices must
+    /// outlive the response") and still wrong in practice: two unrelated
+    /// modules, `tracecontext` and `idempotency`, had already been pushed into
+    /// `threadlocal var` buffers to satisfy it, which is the shape a contract
+    /// takes when it cannot be met honestly.
+    ///
+    /// It hid because it is undefined behaviour, not a check: Debug and
+    /// ReleaseFast happened to still find the original bytes in the dead frame
+    /// and passed. Only ReleaseSafe reused the stack soon enough to expose it,
+    /// which is why twelve green full-gate runs never saw it.
+    ///
+    /// A bump allocator, not a heap: replacing a header by name appends new
+    /// bytes and abandons the old ones rather than compacting, so a handler
+    /// that rewrites the same header in a loop spends budget each time. With
+    /// `header_copy_bytes` against 32 headers that is deliberate — the code is
+    /// simpler and the slices already handed out stay valid, which compaction
+    /// would break.
+    header_buf: [header_copy_bytes]u8 = undefined,
+    header_buf_len: usize = 0,
     sent_head: bool = false,
     ended: bool = false,
     failed: bool = false,
@@ -1634,7 +1670,7 @@ pub const ResponseWriter = struct {
         if (!rw.sent_head) rw.status = status;
     }
 
-    pub const SetHeaderError = error{ HeadersSent, TooManyHeaders, InvalidHeader };
+    pub const SetHeaderError = error{ HeadersSent, TooManyHeaders, InvalidHeader, HeaderBytesExhausted };
 
     /// Set a header, replacing an existing one of the same name
     /// (case-insensitive). See the managed-header rules in the type doc.
@@ -1715,16 +1751,36 @@ pub const ResponseWriter = struct {
     /// place the table grows, bypassing the managed-header interception in
     /// `setHeader` (which is how `declareTrailer` maintains its `Trailer`
     /// entry without recursing).
-    fn putHeader(rw: *ResponseWriter, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
-        for (rw.headers[0..rw.headers_len]) |*hd| {
-            if (std.ascii.eqlIgnoreCase(hd.name, name)) {
-                hd.* = .{ .name = name, .value = value };
-                return;
-            }
+    fn putHeader(rw: *ResponseWriter, name: []const u8, value: []const u8) PutHeaderError!void {
+        // Copy BEFORE touching the table: a `HeaderBytesExhausted` must leave
+        // the response exactly as it was, not with a half-replaced entry whose
+        // name is new and whose value is stale.
+        const replacing = for (rw.headers[0..rw.headers_len]) |*hd| {
+            if (std.ascii.eqlIgnoreCase(hd.name, name)) break hd;
+        } else null;
+        if (replacing == null and rw.headers_len == max_response_headers) return error.TooManyHeaders;
+
+        const n = try rw.dupe(name);
+        const v = try rw.dupe(value);
+        if (replacing) |hd| {
+            hd.* = .{ .name = n, .value = v };
+            return;
         }
-        if (rw.headers_len == max_response_headers) return error.TooManyHeaders;
-        rw.headers[rw.headers_len] = .{ .name = name, .value = value };
+        rw.headers[rw.headers_len] = .{ .name = n, .value = v };
         rw.headers_len += 1;
+    }
+
+    const PutHeaderError = error{ TooManyHeaders, HeaderBytesExhausted };
+
+    /// Copy `bytes` into `header_buf` and return a slice of the copy, stable
+    /// for the life of the response. The one place header/trailer bytes enter
+    /// the writer.
+    fn dupe(rw: *ResponseWriter, bytes: []const u8) error{HeaderBytesExhausted}!([]const u8) {
+        if (bytes.len > rw.header_buf.len - rw.header_buf_len) return error.HeaderBytesExhausted;
+        const at = rw.header_buf_len;
+        @memcpy(rw.header_buf[at..][0..bytes.len], bytes);
+        rw.header_buf_len += bytes.len;
+        return rw.header_buf[at..][0..bytes.len];
     }
 
     /// Append a `Set-Cookie` response header (RFC 6265) — the one response
@@ -1744,7 +1800,9 @@ pub const ResponseWriter = struct {
         // Appended straight to the header table (no replace scan), so
         // multiple Set-Cookie entries coexist and each is serialized by
         // `writeHead` like any other header.
-        rw.headers[rw.headers_len] = .{ .name = "Set-Cookie", .value = value };
+        // The name is a literal and needs no copy; the value is the caller's
+        // and gets the same stable storage every other header value gets.
+        rw.headers[rw.headers_len] = .{ .name = "Set-Cookie", .value = try rw.dupe(value) };
         rw.headers_len += 1;
     }
 
@@ -1760,6 +1818,10 @@ pub const ResponseWriter = struct {
         ForbiddenTrailer,
         /// `setTrailer` for a name that no `Trailer` header advertised.
         TrailerNotDeclared,
+        /// The response's copied-header storage is full — see
+        /// `ResponseWriter.header_buf`. Distinct from `TooManyTrailers`,
+        /// which is about the field COUNT: this is about total bytes.
+        HeaderBytesExhausted,
         /// This response cannot carry a trailer section at all — see
         /// `trailersSupported`.
         TrailersUnsupported,
@@ -1892,14 +1954,20 @@ pub const ResponseWriter = struct {
         if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
         if (!rw.declaredTrailer(name)) return error.TrailerNotDeclared;
         if (!rw.trailersSupported()) return error.TrailersUnsupported;
-        for (rw.trailers[0..rw.trailers_len]) |*t| {
-            if (std.ascii.eqlIgnoreCase(t.name, name)) {
-                t.* = .{ .name = name, .value = value };
-                return;
-            }
+        const replacing = for (rw.trailers[0..rw.trailers_len]) |*t| {
+            if (std.ascii.eqlIgnoreCase(t.name, name)) break t;
+        } else null;
+        if (replacing == null and rw.trailers_len == max_response_trailers) return error.TooManyTrailers;
+
+        // Trailers are read even later than headers — after the body — so the
+        // caller's slices are even less likely to be alive. Same storage.
+        const n = try rw.dupe(name);
+        const v = try rw.dupe(value);
+        if (replacing) |t| {
+            t.* = .{ .name = n, .value = v };
+            return;
         }
-        if (rw.trailers_len == max_response_trailers) return error.TooManyTrailers;
-        rw.trailers[rw.trailers_len] = .{ .name = name, .value = value };
+        rw.trailers[rw.trailers_len] = .{ .name = n, .value = v };
         rw.trailers_len += 1;
     }
 
@@ -2036,6 +2104,7 @@ pub const ResponseWriter = struct {
         std.debug.assert(!rw.sent_head);
         rw.status = 200;
         rw.headers_len = 0;
+        rw.header_buf_len = 0;
         rw.declared_len = null;
         rw.declared_trailers_len = 0;
         rw.trailer_decl_len = 0;
@@ -2897,6 +2966,58 @@ test "ResponseWriter: header validation and managed headers" {
         "Content-Length: 0\r\n" ++
         "\r\n", out.buffered());
     try testing.expectError(error.HeadersSent, rw.setHeader("X-Late", "1"));
+}
+
+test "ResponseWriter: header bytes are copied, so a dead caller buffer is harmless" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // The bug this guards: `writeHead` runs inside `end()`, which both servers
+    // call AFTER the handler returns, so a value formatted into the handler's
+    // stack frame was read after that frame died. Reproduced here without any
+    // server at all — the inner block IS the handler's frame, and scribbling
+    // over it afterwards is what the next stack user would have done.
+    {
+        var scratch: [64]u8 = undefined;
+        @memset(&scratch, 'v');
+        const name = try std.fmt.bufPrint(scratch[0..16], "X-Doomed-{d}", .{7});
+        try rw.setHeader(name, scratch[16..]);
+    }
+    var clobber: [64]u8 = undefined;
+    @memset(&clobber, '#');
+    std.mem.doNotOptimizeAway(&clobber);
+
+    try rw.end();
+    // Both halves matter: a copied NAME as well as a copied value.
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "X-Doomed-7: vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "#") == null);
+}
+
+test "ResponseWriter: the copy store is bounded, and says so instead of truncating" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // Copying bought a byte budget that storing slices did not have. A budget
+    // nothing exercises is where a wrong constant hides, so spend it: values
+    // just under a quarter of the store, four of which cannot fit alongside
+    // their names.
+    var big: [header_copy_bytes / 4]u8 = undefined;
+    @memset(&big, 'x');
+    try rw.setHeader("X-A", &big);
+    try rw.setHeader("X-B", &big);
+    try rw.setHeader("X-C", &big);
+    try testing.expectError(error.HeaderBytesExhausted, rw.setHeader("X-D", &big));
+
+    // Refused cleanly: the table is unchanged and the response still works.
+    try testing.expectEqual(@as(usize, 3), rw.headers_len);
+    try rw.setHeader("X-Small", "ok");
+    try testing.expectEqual(@as(usize, 4), rw.headers_len);
 }
 
 test "ResponseWriter: header CR/LF/NUL + invalid name rejected (response-splitting guard)" {
