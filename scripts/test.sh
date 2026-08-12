@@ -193,6 +193,10 @@ harness_smoke() {
     echo "  instead — this is NOT the gate:"
     echo "      scripts/test.sh all      <- run this before committing a harness change"
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
+    # The commit-time formatting hook is only as good as the last edit to it; a
+    # hook that always exits 0 looks exactly like "nothing was ever unformatted".
+    # ~0.2 s in a throwaway repo. See scripts/hooks/test-pre-commit.sh.
+    step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "check-catalog" zig build check-catalog
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
@@ -645,6 +649,11 @@ cmd_all() {
     local n=${#G_NAMES[@]}
     echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
+    # `af6a148` is why the fmt step is first and why the hook exists: six files
+    # had drifted out of fmt, the gate stops on the first failure, and so NO
+    # module was being tested locally at all. The hook stops that landing in a
+    # commit -- but only while the hook itself works, which is what this checks.
+    step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "check-catalog" zig build check-catalog
     step "check-testonly" zig build check-testonly
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
