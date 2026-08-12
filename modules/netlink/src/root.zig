@@ -1153,6 +1153,21 @@ pub const RequestError = error{
     /// The nexthop is not reachable (ENETUNREACH/EHOSTUNREACH) — e.g. a
     /// gateway outside every configured prefix.
     NetworkUnreachable,
+    /// The device is not operationally up (ENETDOWN), so the request cannot
+    /// take effect: the kernel's `br_set_port_state` refuses anything but
+    /// `BR_STATE_DISABLED` unless `netif_oper_up()` holds for the port, and a
+    /// veth whose peer is still down never satisfies that.
+    ///
+    /// Distinct from `NoSuchDevice` (there *is* a device) and from
+    /// `NetworkUnreachable` (that is about routing, not link state). This
+    /// mapping was missing: the single most ordinary way a bridge-port state
+    /// change fails arrived as `error.Unexpected`, which says nothing, and
+    /// SPEC.md recorded that as deliberate on the grounds that widening the
+    /// shared table would disturb the sibling modules composing this set.
+    /// It does not — adding a member to a Zig error set is source-compatible,
+    /// and the sibling `nl80211` had already mapped the identical errno to its
+    /// own `NetworkDown` for the identical reason.
+    NetworkDown,
     /// The device or entry is busy (EBUSY).
     Busy,
     /// The kernel rejected the request's shape (EINVAL).
@@ -1183,6 +1198,7 @@ pub fn writeErrorFromCode(code: i32) RequestError {
         @intFromEnum(linux.E.NODEV) => error.NoSuchDevice,
         @intFromEnum(linux.E.ADDRNOTAVAIL) => error.AddressNotAvailable,
         @intFromEnum(linux.E.NETUNREACH), @intFromEnum(linux.E.HOSTUNREACH) => error.NetworkUnreachable,
+        @intFromEnum(linux.E.NETDOWN) => error.NetworkDown,
         @intFromEnum(linux.E.BUSY) => error.Busy,
         @intFromEnum(linux.E.INVAL) => error.InvalidRequest,
         @intFromEnum(linux.E.OPNOTSUPP),
@@ -1317,6 +1333,10 @@ pub const Socket = struct {
     /// the next request.
     ext_ack_buf: [ext_ack_msg_max]u8 = @splat(0),
     ext_ack_len: usize = 0,
+    /// Errno carried by the most recent `NLMSG_ERROR` reply (see
+    /// `lastErrorCode`), kept next to the reason string because the two answer
+    /// the same question and only one of them is ever populated by the kernel.
+    last_errno: i32 = 0,
 
     /// Open an `NETLINK_ROUTE` socket — the rtnetlink shorthand for
     /// `openProtocol(gpa, linux.NETLINK.ROUTE)`, and the only form that makes
@@ -1694,6 +1714,16 @@ pub const Socket = struct {
         return self.ext_ack_buf[0..self.ext_ack_len];
     }
 
+    /// The raw negative errno the kernel put in the last `NLMSG_ERROR` on this
+    /// socket (0 when it was an ACK). The typed errors above are a lossy
+    /// projection of it — every errno outside the mapped set folds onto
+    /// `error.Unexpected`, which by itself says nothing about what happened —
+    /// so a caller diagnosing an unexpected failure needs this number.
+    /// Valid until the next request on this socket.
+    pub fn lastErrorCode(self: *const Socket) i32 {
+        return self.last_errno;
+    }
+
     /// Allocate the next sequence number. Public so sibling modules that build
     /// their own rtnetlink messages (tc, conntrack…) can drive `requestAck`.
     pub fn nextSeq(self: *Socket) u32 {
@@ -1755,6 +1785,7 @@ pub const Socket = struct {
     /// scripted transport can drive it without a real socket.
     pub fn awaitAckStrict(self: *Socket, seq: u32) StrictRequestError!void {
         self.ext_ack_len = 0;
+        self.last_errno = 0;
         return awaitAckOver(self, seq);
     }
 
@@ -1775,6 +1806,7 @@ pub const Socket = struct {
     /// string for the errors they map themselves.
     pub fn captureExtAck(self: *Socket, m: codec.Message) void {
         self.ext_ack_len = 0;
+        self.last_errno = m.errorCode() catch 0;
         const msg = (m.errorMessage() catch return) orelse return;
         const n = @min(msg.len, self.ext_ack_buf.len);
         @memcpy(self.ext_ack_buf[0..n], msg[0..n]);
@@ -2005,7 +2037,13 @@ fn collectDumpPass(
                 .skip => {},
                 .restart => return .restart,
                 .done => return .done,
-                .failed => |code| return errorFromCode(code),
+                .failed => |code| {
+                    // Same capture as the ACK path: a failed dump carries an
+                    // errno and often a reason string too, and without this
+                    // both were dropped on the floor.
+                    transport.captureExtAck(m);
+                    return errorFromCode(code);
+                },
                 .overrun => return error.SystemResources,
                 .malformed => return error.MalformedReply,
                 .record => |rec| {
@@ -2737,6 +2775,10 @@ test "writeErrorFromCode maps the write-path errnos" {
         error.NetworkUnreachable,
         writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NETUNREACH))),
     );
+    try testing.expectEqual(
+        error.NetworkDown,
+        writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NETDOWN))),
+    );
     try testing.expectEqual(error.Busy, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.BUSY))));
     try testing.expectEqual(error.InvalidRequest, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.INVAL))));
     try testing.expectEqual(error.NotSupported, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
@@ -3167,6 +3209,42 @@ const netns_fail: u8 = 1;
 /// Interface created inside the child's namespace; never visible to the host.
 const netns_dev = "nltest0";
 
+/// The call the netns child is currently making. The child cannot fail a Zig
+/// assertion — it exits with a status byte — so the only record of what went
+/// wrong is what it prints, and `@errorName(err)` alone is not a record:
+/// `error.Unexpected` is precisely the case where the errno was not one this
+/// module maps, i.e. the case where the error name carries no information.
+/// Set before each kernel call so a failure names the call that produced it.
+var netns_step: []const u8 = "(none)";
+
+fn netnsStep(name: []const u8) void {
+    netns_step = name;
+}
+
+/// `"EINVAL"` for -22, and never a panic: `linux.E` is an exhaustive enum, so
+/// `@enumFromInt` on an errno it does not list is illegal behaviour — and an
+/// errno the enum does not list is exactly the input this function exists for.
+fn errnoName(code: i32) []const u8 {
+    if (code >= 0 or code == std.math.minInt(i32)) return "-";
+    const n: u32 = @intCast(-code);
+    inline for (@typeInfo(linux.E).@"enum".fields) |f| {
+        if (f.value == n) return f.name;
+    }
+    return "?";
+}
+
+/// Print everything the child knows about a failure before it exits: the call
+/// it was making, the Zig error, the kernel's raw errno with its symbolic name,
+/// and the extended-ACK reason string. Called from the round-trip wrappers,
+/// which are the last scope still holding the socket those last two live on.
+fn netnsReport(scope: []const u8, err: anyerror, nl: *const Socket) void {
+    const code = nl.lastErrorCode();
+    std.debug.print(
+        "netns {s} round-trip failed: step={s} err={s} errno={d} ({s}) ext_ack='{s}'\n",
+        .{ scope, netns_step, @errorName(err), code, errnoName(code), nl.lastErrorMessage() },
+    );
+}
+
 test "integration (netns): link/address/route/neighbor write→read round-trip" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const rc = linux.fork();
@@ -3184,8 +3262,7 @@ test "integration (netns): link/address/route/neighbor write→read round-trip" 
         if (enterNetns()) {
             if (netnsRoundTrip()) |_| {
                 code = 0;
-            } else |err| {
-                std.debug.print("netns round-trip failed: {s}\n", .{@errorName(err)});
+            } else |_| {
                 code = netns_fail;
             }
         }
@@ -3263,34 +3340,51 @@ fn findLink(nl: *Socket, name: []const u8) !?Link {
 /// path. Uses the page allocator (raw mmap) — no lock a fork could have caught
 /// mid-flight.
 fn netnsRoundTrip() !void {
-    const gpa = std.heap.page_allocator;
-    var nl = try Socket.open(gpa);
+    netnsStep("Socket.open");
+    var nl = Socket.open(std.heap.page_allocator) catch |err| {
+        std.debug.print("netns link/address/route round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
+        return err;
+    };
     defer nl.close();
+    // The report needs the socket the errno and the reason string live on, so
+    // it is made here rather than in the caller — which has already lost it.
+    return netnsRoundTripOn(&nl) catch |err| {
+        netnsReport("link/address/route", err, &nl);
+        return err;
+    };
+}
+
+fn netnsRoundTripOn(nl: *Socket) !void {
+    const gpa = std.heap.page_allocator;
 
     // 1. Create a dummy device. If the kernel has no dummy driver, fall back
     //    to `lo` — which exists in every fresh namespace, down and unaddressed.
     var created = true;
+    netnsStep("linkAdd(dummy)");
     nl.linkAdd(.{ .name = netns_dev, .kind = "dummy" }, .{}) catch |err| switch (err) {
         error.NotSupported, error.InvalidRequest, error.NotFound => created = false,
         else => return err,
     };
     const dev = if (created)
-        (try findLink(&nl, netns_dev)) orelse return error.TestDummyNotFound
+        (try findLink(nl, netns_dev)) orelse return error.TestDummyNotFound
     else
-        (try findLink(&nl, "lo")) orelse return error.TestLoopbackNotFound;
+        (try findLink(nl, "lo")) orelse return error.TestLoopbackNotFound;
     const ifindex = dev.index;
 
     // 2. Admin up + MTU, verified through RTM_GETLINK.
+    netnsStep("linkUp");
     try nl.linkUp(ifindex);
+    netnsStep("linkSet(mtu)");
     try nl.linkSet(ifindex, .{ .mtu = 1400 });
     {
-        const l = (try findLink(&nl, if (created) netns_dev else "lo")).?;
+        const l = (try findLink(nl, if (created) netns_dev else "lo")).?;
         if (l.flags & IFF.UP == 0) return error.TestLinkNotUp;
         if (l.mtu != 1400) return error.TestMtuNotApplied;
     }
 
     // 3. Address add, verified through RTM_GETADDR.
     const ip: [4]u8 = .{ 10, 11, 12, 1 };
+    netnsStep("addressAdd");
     try nl.addressAdd(.{ .ifindex = ifindex, .local = &ip, .prefixlen = 24 }, .{});
     {
         const addrs = try nl.addresses(.{ .ifindex = ifindex, .family = AF.INET });
@@ -3309,6 +3403,7 @@ fn netnsRoundTrip() !void {
 
     // 4. Route add (on-link, scope LINK), verified through RTM_GETROUTE.
     const dst: [4]u8 = .{ 10, 99, 0, 0 };
+    netnsStep("routeAdd");
     try nl.routeAdd(.{
         .dst = &dst,
         .dst_prefixlen = 24,
@@ -3329,6 +3424,7 @@ fn netnsRoundTrip() !void {
     const neigh_ip: [4]u8 = .{ 10, 11, 12, 55 };
     const lladdr: [6]u8 = .{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
     var neigh_supported = true;
+    netnsStep("neighborAdd");
     nl.neighborAdd(.{
         .ifindex = ifindex,
         .dst = &neigh_ip,
@@ -3368,6 +3464,7 @@ fn netnsRoundTrip() !void {
     ));
 
     // 7. Tear everything down again and verify each removal.
+    netnsStep("routeDel");
     try nl.routeDel(.{ .dst = &dst, .dst_prefixlen = 24, .oif = ifindex, .scope = RT_SCOPE.LINK });
     {
         const rs = try nl.routes(.{ .ifindex = ifindex, .family = AF.INET });
@@ -3376,6 +3473,7 @@ fn netnsRoundTrip() !void {
             if (std.mem.eql(u8, r.dstBytes(), &dst)) return error.TestRouteNotRemoved;
         }
     }
+    netnsStep("addressDel");
     try nl.addressDel(.{ .ifindex = ifindex, .local = &ip, .prefixlen = 24 });
     {
         const addrs = try nl.addresses(.{ .ifindex = ifindex, .family = AF.INET });
@@ -3384,14 +3482,16 @@ fn netnsRoundTrip() !void {
             if (std.mem.eql(u8, a.bytes(), &ip)) return error.TestAddressNotRemoved;
         }
     }
+    netnsStep("linkDown");
     try nl.linkDown(ifindex);
     {
-        const l = (try findLink(&nl, if (created) netns_dev else "lo")).?;
+        const l = (try findLink(nl, if (created) netns_dev else "lo")).?;
         if (l.flags & IFF.UP != 0) return error.TestLinkStillUp;
     }
     if (created) {
+        netnsStep("linkDel(dummy)");
         try nl.linkDel(ifindex);
-        if (try findLink(&nl, netns_dev) != null) return error.TestLinkNotDeleted;
+        if (try findLink(nl, netns_dev) != null) return error.TestLinkNotDeleted;
     }
 }
 
@@ -3418,10 +3518,12 @@ test "integration (netns): bridge/FDB/VLAN/brport write→read round-trip" {
     if (rc == 0) {
         var code: u8 = netns_skip;
         if (enterNetns()) {
+            // The failure report is printed by `netnsBridgeRoundTrip` itself,
+            // which is the only scope that still holds the socket the errno
+            // and the reason string live on.
             if (netnsBridgeRoundTrip()) |ok| {
                 code = if (ok) 0 else netns_skip;
-            } else |err| {
-                std.debug.print("netns bridge round-trip failed: {s}\n", .{@errorName(err)});
+            } else |_| {
                 code = netns_fail;
             }
         }
@@ -3454,9 +3556,64 @@ test "integration (netns): bridge/FDB/VLAN/brport write→read round-trip" {
     }
 }
 
+/// A second, independent bound on `waitOperUp` so a clock that refuses to
+/// advance cannot turn it into an infinite loop: one poll is one
+/// `RTM_GETLINK` dump, ~90 µs on this host, so this is ~18 s of polling.
+const oper_up_max_polls: u32 = 200_000;
+
+/// Block until the kernel reports `IFF_RUNNING` on `ifindex`.
+///
+/// `IFF_RUNNING` is not a flag anyone sets: `dev_get_flags` derives it from
+/// `netif_oper_up(dev)`, which is the exact predicate `br_set_port_state`
+/// requires before it will accept anything but `BR_STATE_DISABLED` — it
+/// answers `ENETDOWN` otherwise. So this waits on the kernel's own documented
+/// precondition for the next call, and is not a retry of a call that failed.
+///
+/// The wait is needed because the two halves of "the link is up" are not
+/// published together. `RTM_SETLINK IFF_UP` applies the *admin* state before
+/// its ACK, but the *operational* state that follows the resulting carrier
+/// change is published by the kernel's `linkwatch` **workqueue**, i.e. by a
+/// worker thread that has to be scheduled. On an idle host it lands within
+/// microseconds; measured on this host under the netns lane's ten parallel
+/// test binaries plus CPU load it lands 0.5–2.8 ms later, while this test
+/// enslaves the port and asks for `FORWARDING` about 250 µs after admin-up.
+/// That gap was the whole flake — 8 failures in 120 loaded lane runs, every
+/// one of them `ENETDOWN` at `brportSet(FORWARDING)`, and 0 in 60 idle runs.
+///
+/// Bounded, and a timeout is a **failure**, not a skip: a veth pair with both
+/// ends admin-up that never becomes operationally up is a real defect. The
+/// bound is three orders of magnitude above the worst latency measured.
+fn waitOperUp(nl: *Socket, ifindex: u32) !void {
+    const timeout_ns: i128 = 10_000_000_000; // 10 s
+    const started = monotonicNanos();
+    var polls: u32 = 0;
+    while (polls < oper_up_max_polls) : (polls += 1) {
+        const ls = try nl.links();
+        defer std.heap.page_allocator.free(ls);
+        for (ls) |l| {
+            if (l.index == ifindex and l.flags & IFF.RUNNING != 0) return;
+        }
+        if (monotonicNanos() - started > timeout_ns) break;
+    }
+    return error.TestPortNeverCameOperUp;
+}
+
+fn monotonicNanos() i128 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+
 /// Admin-up every non-loopback device in the namespace and return the index of
 /// the veth peer — the one device that is neither the bridge nor the port. Its
 /// name is chosen by the kernel, so it can only be identified positionally.
+///
+/// "The one device" is an assumption about the namespace, so it is checked
+/// rather than assumed: a fresh netns holds exactly `lo`, the bridge, the port
+/// and the peer. If a second candidate ever appeared, the old code silently
+/// kept the last one it walked past, and the "deleting one end takes the peer
+/// with it" check at the end of the round-trip would then have been asserting
+/// something about the wrong device.
 fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
     const ls = try nl.links();
     defer std.heap.page_allocator.free(ls);
@@ -3464,7 +3621,10 @@ fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
     for (ls) |l| {
         if (l.flags & IFF.LOOPBACK != 0) continue;
         try nl.linkUp(l.index);
-        if (l.index != br_index and l.index != port_index) peer = l.index;
+        if (l.index != br_index and l.index != port_index) {
+            if (peer != null) return error.TestAmbiguousVethPeer;
+            peer = l.index;
+        }
     }
     return peer;
 }
@@ -3472,11 +3632,23 @@ fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
 /// Returns false (→ SKIP) when the kernel has no bridge or veth driver;
 /// an error means a real failure of this module.
 fn netnsBridgeRoundTrip() !bool {
-    const gpa = std.heap.page_allocator;
-    var nl = try Socket.open(gpa);
+    netnsStep("Socket.open");
+    var nl = Socket.open(std.heap.page_allocator) catch |err| {
+        std.debug.print("netns bridge round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
+        return err;
+    };
     defer nl.close();
+    return netnsBridgeRoundTripOn(&nl) catch |err| {
+        netnsReport("bridge", err, &nl);
+        return err;
+    };
+}
+
+fn netnsBridgeRoundTripOn(nl: *Socket) !bool {
+    const gpa = std.heap.page_allocator;
 
     // 1. Bridge with VLAN filtering on, plus a veth pair to enslave.
+    netnsStep("bridgeAdd");
     nl.bridgeAdd(.{
         .name = netns_bridge,
         .vlan_filtering = true,
@@ -3487,25 +3659,36 @@ fn netnsBridgeRoundTrip() !bool {
         error.NotSupported, error.InvalidRequest, error.NotFound => return false,
         else => return err,
     };
-    const br = (try findLink(&nl, netns_bridge)) orelse return error.TestBridgeNotFound;
+    netnsStep("findLink(bridge)");
+    const br = (try findLink(nl, netns_bridge)) orelse return error.TestBridgeNotFound;
+    netnsStep("linkAdd(veth)");
     nl.linkAdd(.{ .name = netns_veth_a, .kind = "veth" }, .{}) catch |err| switch (err) {
         error.NotSupported, error.InvalidRequest, error.NotFound => return false,
         else => return err,
     };
-    const port = (try findLink(&nl, netns_veth_a)) orelse return error.TestVethNotFound;
+    netnsStep("findLink(veth)");
+    const port = (try findLink(nl, netns_veth_a)) orelse return error.TestVethNotFound;
     // Both ends of the pair must be up, or the port has no carrier and the
     // kernel answers ENETDOWN to a FORWARDING state change. The peer's name is
     // kernel-generated, so bring every non-loopback device up.
-    const peer = try upAllButLoopback(&nl, br.index, port.index);
+    netnsStep("upAllButLoopback");
+    const peer = try upAllButLoopback(nl, br.index, port.index);
+    // …and admin-up is only half of it: the operational state the bridge
+    // actually checks is published asynchronously. See `waitOperUp`.
+    netnsStep("waitOperUp(port)");
+    try waitOperUp(nl, port.index);
 
     // 2. Enslave, verified through IFLA_MASTER in a link dump.
+    netnsStep("portEnslave");
     try nl.portEnslave(port.index, br.index);
     {
+        netnsStep("brportInfo(after enslave)");
         const info = (try nl.brportInfo(port.index)) orelse return error.TestPortNotEnslaved;
         if (info.master != br.index) return error.TestWrongMaster;
     }
 
     // 3. Bridge-port options, verified through IFLA_PROTINFO.
+    netnsStep("brportSet(FORWARDING)");
     try nl.brportSet(port.index, .{
         .state = BR_STATE.FORWARDING,
         .learning = false,
@@ -3513,6 +3696,7 @@ fn netnsBridgeRoundTrip() !bool {
         .isolated = true,
     });
     {
+        netnsStep("brportInfo(after brportSet)");
         const info = (try nl.brportInfo(port.index)).?;
         if (info.state != BR_STATE.FORWARDING) return error.TestBrportStateNotApplied;
         if (info.learning != false) return error.TestBrportLearningNotApplied;
@@ -3523,9 +3707,11 @@ fn netnsBridgeRoundTrip() !bool {
 
     // 4. VLANs: a single PVID/untagged VLAN plus a range, read back through
     //    the RTEXT_FILTER_BRVLAN dump.
+    netnsStep("bridgeVlanAdd");
     try nl.bridgeVlanAdd(port.index, .{ .vid = 10, .pvid = true, .untagged = true });
     try nl.bridgeVlanAdd(port.index, .{ .vid = 100, .vid_end = 200 });
     {
+        netnsStep("bridgeVlans");
         const vlans = try nl.bridgeVlans(.{ .ifindex = port.index });
         defer gpa.free(vlans);
         var saw_pvid = false;
@@ -3549,6 +3735,7 @@ fn netnsBridgeRoundTrip() !bool {
     // 5. FDB: add a static entry in the master's database, read it back, then
     //    a self entry, then delete both.
     const mac: [6]u8 = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    netnsStep("fdbAdd");
     try nl.fdbAdd(.{
         .ifindex = port.index,
         .lladdr = &mac,
@@ -3556,6 +3743,7 @@ fn netnsBridgeRoundTrip() !bool {
         .state = NUD.REACHABLE | NUD.NOARP,
     }, .{});
     {
+        netnsStep("fdbEntries(ifindex)");
         const fdb = try nl.fdbEntries(.{ .ifindex = port.index });
         defer gpa.free(fdb);
         var found = false;
@@ -3569,6 +3757,7 @@ fn netnsBridgeRoundTrip() !bool {
     }
     // Kernel-side `bridge fdb show br <bridge>` scoping returns the same entry.
     {
+        netnsStep("fdbEntries(master)");
         const fdb = try nl.fdbEntries(.{ .master = br.index });
         defer gpa.free(fdb);
         var found = false;
@@ -3585,6 +3774,7 @@ fn netnsBridgeRoundTrip() !bool {
         .state = NUD.REACHABLE | NUD.NOARP,
     }, .{}));
 
+    netnsStep("fdbDel");
     try nl.fdbDel(.{ .ifindex = port.index, .lladdr = &mac, .vlan = 10 });
     {
         const fdb = try nl.fdbEntries(.{ .ifindex = port.index });
@@ -3596,6 +3786,7 @@ fn netnsBridgeRoundTrip() !bool {
     }
 
     // 6. Tear the VLANs down and verify they are gone.
+    netnsStep("bridgeVlanDel");
     try nl.bridgeVlanDel(port.index, .{ .vid = 100, .vid_end = 200 });
     try nl.bridgeVlanDel(port.index, .{ .vid = 10 });
     {
@@ -3607,21 +3798,24 @@ fn netnsBridgeRoundTrip() !bool {
     }
 
     // 7. Release the port and delete both devices.
+    netnsStep("portRelease");
     try nl.portRelease(port.index);
     {
         const info = try nl.brportInfo(port.index);
         if (info != null and info.?.master != null) return error.TestPortStillEnslaved;
     }
+    netnsStep("linkDel(veth)");
     try nl.linkDel(port.index);
-    if (try findLink(&nl, netns_veth_a) != null) return error.TestVethNotDeleted;
+    if (try findLink(nl, netns_veth_a) != null) return error.TestVethNotDeleted;
     // Deleting one end of a veth pair takes the peer with it.
     if (peer) |p| {
         const ls = try nl.links();
         defer gpa.free(ls);
         for (ls) |l| if (l.index == p) return error.TestVethPeerNotDeleted;
     }
+    netnsStep("linkDel(bridge)");
     try nl.linkDel(br.index);
-    if (try findLink(&nl, netns_bridge) != null) return error.TestBridgeNotDeleted;
+    if (try findLink(nl, netns_bridge) != null) return error.TestBridgeNotDeleted;
     return true;
 }
 

@@ -208,10 +208,14 @@ Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
 - **VLAN specs are validated before the syscall:** VID must be 1..4094
   (`error.InvalidVlanId`), a range must be ascending and can never be a PVID
   (`error.InvalidVlanRange`), and `self`+`master` together is rejected.
-- **Known unmapped errno:** setting a port to `FORWARDING` while its carrier is
-  down answers `ENETDOWN`, which `writeErrorFromCode` reports as
-  `error.Unexpected` (the mapping table is shared with the other write ops and
-  was left untouched). Bring both ends of a veth pair up first.
+- **A port must be *operationally* up before `FORWARDING`:** the kernel refuses
+  any state but `BR_STATE_DISABLED` unless `netif_oper_up()` holds for the port,
+  and answers `ENETDOWN` — `error.NetworkDown` — otherwise. Bringing both ends of
+  a veth pair admin-up is not sufficient *at the moment the ACK arrives*: admin
+  state is applied synchronously, but the operational state that follows the
+  carrier change is published by the kernel's `linkwatch` workqueue and lands
+  later — measured here at 0.5–2.8 ms later under load. Wait for `IFF_RUNNING`
+  in a link dump (that flag *is* `netif_oper_up`) before setting the state.
 - **Out of scope (deliberate extension points):** multicast event monitoring,
   qdiscs/filters (sibling `tc` module), conntrack, policy rules, multipath
   routes, and — within the bridge surface — MDB/multicast snooping

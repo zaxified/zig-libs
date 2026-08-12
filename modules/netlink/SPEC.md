@@ -206,12 +206,24 @@ state → isolated for the golden-covered subset), and an empty change is `Nothi
 port state back needs `RTM_GETLINK` with `ifi_family = AF_BRIDGE`: a plain AF_UNSPEC link dump
 (`ip link show`) carries no `IFLA_PROTINFO`, which was verified on a live kernel.
 
-**Error mapping** is unchanged and shared — the bridge ops add only `InvalidVlanId`/
-`InvalidVlanRange` to the *build* side, in a separate `bridge.BuildError`/`bridge.WriteError` so the
-existing `BuildError`/`WriteError` sets stay byte-for-byte compatible for sibling modules. One
-kernel errno is deliberately left unmapped: `ENETDOWN` (moving a carrier-down port to
-`BR_STATE_FORWARDING`) surfaces as `error.Unexpected`, because widening the shared
-`writeErrorFromCode` table would change a public error set other modules compose with.
+**Error mapping** is shared — the bridge ops add only `InvalidVlanId`/`InvalidVlanRange` to the
+*build* side, in a separate `bridge.BuildError`/`bridge.WriteError` so the existing
+`BuildError`/`WriteError` sets stay byte-for-byte compatible for sibling modules.
+
+`ENETDOWN` (moving an operationally-down port to `BR_STATE_FORWARDING`) maps to
+`error.NetworkDown`. It used to be left unmapped on the stated grounds that widening the shared
+`writeErrorFromCode` table "would change a public error set other modules compose with" — which is
+not a cost: adding a member to a Zig error set is source-compatible, no consumer switches
+exhaustively over `RequestError`, and the sibling `nl80211` had already mapped the identical errno
+to its own `NetworkDown` after the identical symptom. The real cost was on the other side: the
+single most ordinary failure of a bridge-port state change arrived as `error.Unexpected`, which
+carries no information at all, and that is exactly what a flaky netns test then reported for weeks
+(2026-08-12; see `waitOperUp` for the race behind it).
+
+**`Socket.lastErrorCode`** exists for the same reason: the typed error sets are a lossy projection
+of the kernel's errno, and every unmapped errno collapses onto `error.Unexpected`. A caller
+diagnosing one needs the number, so the socket keeps it beside the extended-ACK reason string, set
+on the ACK path and — new — on the dump path, which previously discarded both.
 
 ## Provenance / licensing
 The kernel UAPI headers this module cites are GPL-2.0, but that does not make the module a GPL
@@ -243,7 +255,7 @@ decoder *handles* compressed ranges, but the request always asks for the uncompr
 MRP, CFM and MST (`IFLA_BRIDGE_MRP`/`_CFM`/`_MST`); bridge-port backup port
 (`IFLA_BRPORT_BACKUP_PORT`), `IFLA_BRPORT_FLUSH` and the read-only STP timers/ids; and reading the
 bridge device's own `IFLA_BR_*` options back out of a link dump (only the port-side
-`IFLA_PROTINFO` block is decoded). `ENETDOWN` is unmapped, see above.
+`IFLA_PROTINFO` block is decoded).
 
 ## Verification
 Offline unit tests over canned payloads built by the codec's own encoders: per-type parse
