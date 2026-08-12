@@ -25,13 +25,25 @@ TAG_SH="$SCRIPT_DIR/tag.sh"
 }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Captured stdout must live OUTSIDE the repo under test. Writing it into $WORK
+# made an untracked file in that repo, so tag.sh refused on the dirty-tree
+# guard and never ran a lane — the log cases below then read a stale log from
+# an earlier case and reported a logging bug that did not exist. Third time
+# today that guard masked what was behind it.
+OUT="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$OUT"' EXIT
 mkdir -p "$WORK/scripts"
 cp "$TAG_SH" "$WORK/scripts/tag.sh"
 cd "$WORK" || exit 1
 git init -q -b main .
 git config user.email t@t
 git config user.name t
+# The real repo gitignores `.zig-cache/`; this throwaway one must too, or the
+# lane logs tag.sh writes there make the tree dirty and every LATER case
+# refuses on the dirty-tree guard instead of testing what it meant to. That
+# is how the first version of these log cases failed: not because the logging
+# was broken, but because the fixture was.
+printf '.zig-cache/\n' > .gitignore
 
 fails=0
 check() { # check <label> <expected-exit> <actual-exit>
@@ -47,9 +59,15 @@ check() { # check <label> <expected-exit> <actual-exit>
 # empty = the default lane, or a flag string, or "none" for an all-green run.
 cat > scripts/test.sh <<'STUB'
 #!/usr/bin/env bash
+# Prints on BOTH paths. A stub that stayed silent would let the log-content
+# cases below pass vacuously, which is exactly the hole they exist to close.
 lane="${2-}"
-[[ "${RED_LANE-none}" == "none" ]] && exit 0
-[[ "$lane" == "${RED_LANE}" ]] && exit 1
+echo "stub: lane '${lane}' running"
+if [[ "${RED_LANE-none}" != "none" && "$lane" == "${RED_LANE}" ]]; then
+    echo "stub: DELIBERATE FAILURE MARKER for '${lane}'"
+    exit 1
+fi
+echo "stub: lane '${lane}' green"
 exit 0
 STUB
 chmod +x scripts/test.sh
@@ -70,10 +88,16 @@ check "second tag same day -> suffixed, no collision" 0 $?
 git rev-parse -q --verify refs/tags/2026-08-12.1 >/dev/null ||
     { printf '  FAIL %-54s\n' "second tag became 2026-08-12.1"; fails=$((fails + 1)); }
 
-# 3-6: THE POINT OF THE SCRIPT. Each lane, one at a time, must be able to
-# veto the tag on its own — a loop that collects failures but only ever looks
-# at the last one would pass a single-lane test and still be broken.
-for lane in "" "-Dstrict-debug" "-Doptimize=ReleaseFast" "-Doptimize=ReleaseSafe"; do
+# 3-5: THE POINT OF THE SCRIPT. Each lane, one at a time, must be able to veto
+# the tag on its own — a loop that collects failures but only ever looks at the
+# last one would pass a single-lane test and still be broken. With fail-fast in
+# place, the LAST lane vetoing is the interesting case: it only gets to run
+# because the earlier ones passed.
+#
+# ⚠ This list must match tag.sh's `lanes` array. It carried a fourth entry for
+# the default lane after that lane was dropped, and said so by failing — which
+# is the behaviour wanted from a fixture that has gone out of date.
+for lane in "-Doptimize=ReleaseSafe" "-Doptimize=ReleaseFast" "-Dstrict-debug"; do
     before="$(git tag | wc -l)"
     RED_LANE="$lane" bash scripts/tag.sh 2026-09-01 >/dev/null 2>&1
     check "red lane '${lane:-default}' -> refuse" 1 $?
@@ -104,6 +128,40 @@ check "--dry-run, all green -> succeeds" 0 $?
 # 10: a malformed date is refused rather than becoming a tag name.
 RED_LANE=none bash scripts/tag.sh v1.2.3 >/dev/null 2>&1
 check "semver-shaped argument -> refuse" 1 $?
+
+# 11-13: THE LOGGING, which the first version of this file never checked. The
+# script's real run lost three of four lane logs to /tmp and left the fourth
+# as bytes with no content, so an hour of gate time bought a refusal that
+# could not be explained. Every case below existed and passed while that was
+# true — a self-test that never looks at the output is a self-test with a
+# blind spot the size of the feature.
+git reset -q --hard >/dev/null 2>&1
+RED_LANE="-Dstrict-debug" bash scripts/tag.sh 2026-10-01 >"$OUT/out.txt" 2>&1
+logf="$WORK/.zig-cache/tag-logs/_Dstrict_debug.log"
+# Say what was actually seen on failure. A self-test that reports FAIL without
+# the observed value sends its reader to do the measuring again by hand, which
+# is how the first version of these three cases cost an afternoon.
+if [[ -s "$logf" ]]; then
+    printf '  ok   %-54s\n' "failing lane's log exists and is non-empty"
+else
+    printf '  FAIL %-54s (%s bytes at %s)\n' "failing lane's log exists and is non-empty" \
+        "$(stat -c%s "$logf" 2>/dev/null || echo missing)" "$logf"
+    fails=$((fails + 1))
+fi
+if grep -q "DELIBERATE FAILURE MARKER" "$logf" 2>/dev/null; then
+    printf '  ok   %-54s\n' "the log holds the lane's real output"
+else
+    printf '  FAIL %-54s saw: %s\n' "the log holds the lane's real output" \
+        "$(head -1 "$logf" 2>/dev/null || echo '<no such file>')"
+    fails=$((fails + 1))
+fi
+if grep -q "DELIBERATE FAILURE MARKER" "$OUT/out.txt" 2>/dev/null; then
+    printf '  ok   %-54s\n' "the REASON is printed, not just filed away"
+else
+    printf '  FAIL %-54s stdout was %s bytes\n' "the REASON is printed, not just filed away" \
+        "$(stat -c%s "$OUT/out.txt" 2>/dev/null || echo missing)"
+    fails=$((fails + 1))
+fi
 
 echo
 if [[ $fails -eq 0 ]]; then

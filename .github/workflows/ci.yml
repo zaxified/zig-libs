@@ -18,7 +18,7 @@ on:
 #   pull_request        -> `test.sh changed`, one lane. Tests the modules the
 #                          branch touched plus their reverse-dependency
 #                          closure, computed from `zig build module-graph`.
-#   push to main / tag  -> `test.sh all`, four optimize lanes.
+#   push to main / tag  -> `test.sh all`, three optimize lanes.
 #
 # WHY SCOPING IS SOUND, rather than merely cheaper. The driver decides the
 # escalation from the GRAPH, not from which file was edited: it keeps a
@@ -33,14 +33,25 @@ on:
 # percentile, 61 at worst (`testkit`). A leaf change costs ~5 s against ~540 s
 # for the full gate.
 #
-# THE FOUR LANES are deliberate. Compute-heavy modules build at ReleaseSafe when
+# THREE LANES, and the fourth was dropped on 2026-08-12 with a reason rather
+# than a preference. `heavy_optimize` in build.zig substitutes ReleaseSafe for
+# Debug on the heavy modules, which makes the old default lane's every
+# (module, mode) pair a SUBSET of strict-debug's and ReleaseSafe's — it had no
+# combination of its own to prove. Locally that overlap makes it nearly free to
+# run after those two, since its artifacts are already built; here, where every
+# lane is a separate job with its own cache, it was paying a full build for
+# coverage that was already bought.
+#
+# The three that remain share nothing: each names one mode for every module, so
+# no ordering saves a compile. They run in parallel anyway.
+#
+# THE LANES THEMSELVES are deliberate. Compute-heavy modules build at ReleaseSafe when
 # Debug is requested (see `heavy` in build.zig — it takes bls12_381 from 182s to
-# 5s and it is the suite's critical path), so the plain lane no longer proves
-# anything about real Debug. `-Dstrict-debug` forces it back, keeping
+# 5s and it is the suite's critical path). `-Dstrict-debug` forces it back, keeping
 # CONVENTIONS §6.4's "green in Debug and ReleaseFast" honest. Integrators build
 # in all three release modes; ReleaseSafe was the only one no lane covered — and
 # it earned its place on 2026-08-12 by being the only lane that caught a
-# use-after-scope in http's response path that the other three passed by luck
+# use-after-scope in http's response path that every other lane passed by luck
 # (see `ResponseWriter.header_buf`).
 #
 # They run as separate jobs so the slow one does not gate the fast one.
@@ -48,7 +59,7 @@ on:
 # ⚠ CACHE KEYS ARE NOT OPTIONAL HERE. `setup-zig` preserves the Zig cache
 # between runs, but it cannot tell one matrix job from another on its own — its
 # own README says to populate `cache-key` with the matrix variables. Without
-# that, all four lanes shared a single key and clobbered each other's cache
+# that, the lanes shared a single key and clobbered each other's cache
 # every run, so every lane was effectively cold. The default 2 GiB
 # `cache-size-limit` compounded it; this repo's cache runs to tens of GiB
 # locally, so the action was also discarding the cache almost every time.
@@ -78,21 +89,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: default (heavy modules at ReleaseSafe)
-            args: ""
-          - name: strict Debug
-            args: "-Dstrict-debug"
-          - name: ReleaseFast
-            args: "-Doptimize=ReleaseFast"
           - name: ReleaseSafe
             args: "-Doptimize=ReleaseSafe"
+          - name: ReleaseFast
+            args: "-Doptimize=ReleaseFast"
+          - name: strict Debug
+            args: "-Dstrict-debug"
     name: full — ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          # One cache per lane. Four optimize modes cannot share one entry.
+          # One cache per lane. Distinct optimize modes cannot share an entry.
           cache-key: full-${{ matrix.name }}
           cache-size-limit: 8192
       # scripts/test.sh all runs the format check, the hook self-test, the
@@ -103,9 +112,12 @@ jobs:
       # cannot do, so a lane that silently covers less than it looks like is
       # visible in the log.
       #
-      # Local wall clock 2026-08-12 with a warm cache: 537 s for the default
-      # lane and 648 s for ReleaseSafe, which sets the pace. Treat both as
-      # lower bounds — a cold lane is materially slower, and the previous
-      # figure in this file (~1170 s) was never rechecked after it was written.
+      # ⚠ NO RELIABLE WALL-CLOCK FIGURE IS RECORDED HERE ON PURPOSE. Every
+      # local measurement taken on 2026-08-12 was confounded by cache state:
+      # ReleaseSafe 587 s warm, ReleaseFast 2053 s cold, strict Debug 1091 s
+      # in between. Those numbers cannot be compared with each other, and the
+      # figure this file carried before them (~1170 s) had never been
+      # rechecked at all. A CI run with per-lane caches is the first honest
+      # measurement; take it from there rather than from a comment.
       - name: Test (${{ matrix.name }})
         run: bash scripts/test.sh all ${{ matrix.args }}

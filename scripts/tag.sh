@@ -14,7 +14,7 @@
 # 2.0"; they learn what they need from those modules' CHANGELOG entries. So the
 # tag carries the one fact it can carry honestly: a date, and a green gate.
 #
-#   usage: scripts/tag.sh [--dry-run] [YYYY-MM-DD]
+#   usage: scripts/tag.sh [--dry-run] [--all-lanes] [YYYY-MM-DD]
 #
 # With no date, today's. A second tag on the same day gets a `.1`, `.2`, … so
 # the name stays sortable and never collides.
@@ -25,10 +25,12 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 dry_run=0
+all_lanes=0
 date_arg=""
 for a in "$@"; do
     case "$a" in
         --dry-run) dry_run=1 ;;
+        --all-lanes) all_lanes=1 ;;
         -h | --help)
             sed -n '2,20p' "$0"
             exit 0
@@ -73,24 +75,71 @@ echo
 # runs and what the tag claims. They are sequential: this is a release step,
 # not an inner loop, and running them concurrently would make the wall-clock
 # numbers meaningless while contending for the same build cache.
-lanes=("" "-Dstrict-debug" "-Doptimize=ReleaseFast" "-Doptimize=ReleaseSafe")
+# Logs go beside the build cache, not into /tmp. `/tmp` is not dependable
+# here — the first real run of this script lost three of four lane logs to it
+# and left the fourth as 1509 bytes of nothing, so an hour of gate time
+# produced a refusal nobody could explain. Under `.zig-cache/` they sit next
+# to the build they describe and are already gitignored.
+LOG_DIR=".zig-cache/tag-logs"
+mkdir -p "$LOG_DIR"
+
+# ORDER IS DELIBERATE, and it is not about cache reuse — there is none to have.
+# `heavy_optimize` (build.zig) substitutes ReleaseSafe for Debug on the heavy
+# modules, which makes the DEFAULT lane's every (module, mode) pair a subset of
+# strict-debug's and ReleaseSafe's. Those three therefore share artifacts; the
+# three below share nothing at all, since each names one mode for every module.
+# No ordering can save a single compile between them.
+#
+# So the order optimises TIME TO FIRST FAILURE instead:
+#   ReleaseSafe  first — optimisations AND safety checks, the combination that
+#                        caught the only real defect of 2026-08-12 while Debug
+#                        and ReleaseFast both passed it by luck.
+#   ReleaseFast  next  — same optimisations, no checks.
+#   strict-debug last  — structurally the most expensive, since it is the one
+#                        lane that builds the heavy modules in real Debug.
+#
+# The default lane is absent on purpose: it has no (module, mode) pair the
+# other two do not already cover. Locally it is nearly free to add after them
+# — its artifacts are already built — but it proves nothing new, so it is not
+# worth the test-run time here.
+lanes=("-Doptimize=ReleaseSafe" "-Doptimize=ReleaseFast" "-Dstrict-debug")
 failed=()
 for lane in "${lanes[@]}"; do
     label="${lane:-default}"
+    log="$LOG_DIR/${label//[^a-zA-Z0-9]/_}.log"
     printf 'tag.sh: lane %-24s ... ' "$label"
     start=$(date +%s)
-    if bash scripts/test.sh all $lane >"/tmp/ziglibs-tag-${label//[^a-zA-Z0-9]/_}.log" 2>&1; then
+    if bash scripts/test.sh all $lane >"$log" 2>&1; then
         printf 'OK   %ss\n' "$(($(date +%s) - start))"
     else
-        printf 'FAILED %ss  (log: /tmp/ziglibs-tag-%s.log)\n' \
-            "$(($(date +%s) - start))" "${label//[^a-zA-Z0-9]/_}"
+        printf 'FAILED %ss\n' "$(($(date +%s) - start))"
         failed+=("$label")
+        # The reason belongs HERE, not in a file the reader has to go find.
+        # A refusal you cannot explain is barely better than no refusal.
+        printf '\n  ── why %s failed (last 25 lines of %s) ──\n' "$label" "$log"
+        if [[ -s "$log" ]]; then
+            sed 's/^/  | /' <<<"$(tail -25 "$log")"
+        else
+            printf '  | (the lane wrote NO output — that is itself the finding:\n'
+            printf '  |  the gate died before it could say anything)\n'
+        fi
+        printf '\n'
+        # Stop at the first red lane unless asked otherwise. The 2026-08-12
+        # run spent 2053 s on ReleaseFast and 587 s on ReleaseSafe AFTER
+        # strict-debug had already failed — 44 minutes producing a verdict
+        # that was going to be discarded, because a red lane means fixing and
+        # re-running anyway.
+        if [[ $all_lanes -eq 0 ]]; then
+            printf 'tag.sh: stopping at the first red lane (--all-lanes to run them all)\n\n'
+            break
+        fi
     fi
 done
 
 echo
 if [[ ${#failed[@]} -gt 0 ]]; then
     echo "tag.sh: NOT tagging — ${#failed[@]} lane(s) red: ${failed[*]}" >&2
+    echo "Reasons are printed above; full logs in $LOG_DIR/." >&2
     echo "A tag here would assert something untrue. Fix the lane, then run this again." >&2
     exit 1
 fi
