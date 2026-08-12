@@ -440,8 +440,17 @@ module could not regenerate even in principle: `group.zig` returns
 byte-identical reproduction would additionally need the exact PRNG seed
 of whatever tool built it.
 
-That single file is therefore an open question for the repository owner,
-recorded rather than resolved. The other fourteen are not.
+DECIDED 2026-08-12. The repository owner accepted the residual risk on that
+single file, and the reasoning is recorded here rather than left implicit.
+Two arguments cover it — merger doctrine weakly, implied licence from the
+context of publication strongly — and neither is a written grant, so a
+residue remains. It is small and, more importantly, BOUNDED: the exposure is
+one test fixture in a source repository, nothing reaches a product or a
+distributed binary, and the remedy if the question were ever raised is to
+delete one file and lose one long-run test. That is a better trade than
+paying a certain loss of 200-epoch coverage now against an uncertain claim
+that the file's own author published it to invite. The other fourteen files
+never needed a decision.
 
 THE SECOND ARGUMENT, which fits the one thin case better than the first.
 Everything above asks whether the vectors are COPYRIGHTABLE. That is only
