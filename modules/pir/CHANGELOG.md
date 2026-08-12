@@ -28,11 +28,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   is index-independent, so the check adds no selective-failure oracle.
   `S = 0` is a `@compileError`: in the un-widened ring
   `m·2^(8L-1) = 2^(8L-1)` for every odd `m`, so a top-bit forgery would
-  pass with probability 1. Querying past the database now **rejects**
-  rather than reconstructing to zero, because an honest all-zero answer
-  is indistinguishable from the coordinated-zeroing forgery the presence
-  word exists to stop. Authenticated PIR against a published digest
-  (Colombo et al.) is the composable upgrade and is named as such;
+  pass with probability 1. Under `Verified`, querying past the database
+  **rejects** rather than reconstructing to zero as the unverified base
+  layer still does, because an honest all-zero answer is indistinguishable
+  from the coordinated-zeroing forgery the presence word exists to stop.
+  Authenticated PIR against a published digest (Colombo et al.) is the
+  composable upgrade and is named as such;
   cross-checking by repetition was rejected outright, since a server
   adding the same constant every time produces identical wrong
   reconstructions.

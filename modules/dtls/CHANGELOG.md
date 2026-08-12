@@ -118,9 +118,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   exactly the kind of thing only a live peer can check: replacing it with
   the naive "CH1 || HRR || CH2" leaves every self-interop test green and
   fails only the live test. (Serving an HRR was still missing at this
-  point; the entry below closes that half.) `error.
-  HelloRetryRequestUnsupported` narrows to the two cases that remain (an
-  HRR in `.cert_dhe` mode, or one carrying nothing to change). New
+  point; the entry below closes that half.) **BEHAVIOURAL, not
+  breaking:** `error.HelloRetryRequestUnsupported` narrows to the two
+  cases that remain (an HRR in `.cert_dhe` mode, or one carrying nothing
+  to change). **What changes for a consumer:** a PSK handshake against a
+  default-configured server used to end in that error — it could not
+  complete at all — and now completes after a second ClientHello, so a
+  caller branching on the error takes a different path and two flights go
+  out where one did. The error stays a member of `HandshakeError`
+  (nothing stops compiling), no previously-successful handshake changes,
+  and the retry is authenticated exactly as before — a second HRR is
+  refused, so no trust boundary moves. New
   `Connection.sawHelloRetryRequest`.
 
 - **Serving** a HelloRetryRequest — RFC 9147 §5.1's stateless
@@ -142,7 +150,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (cookie_secret, label || peer_binding || version || cipher_suite ||
   Hash(ClientHello1))`, checked with `std.crypto.timing_safe.eql`; the
   new `error.CookieVerifyFailed` covers every rejection cause without
-  distinguishing them. `HelloRetryConfig.peer_binding` is
+  distinguishing them. **BREAKING (API):** that error joins the declared
+  `HandshakeError`, and `ConfigError` gains `EmptyCookieSecret` and
+  `EmptyPeerBinding` — **what a consumer must change:** an exhaustive
+  `switch` over either set has to handle the new members before it
+  compiles again; a `catch |e| switch (e) { … else => }` and every
+  `hello_retry = null` caller are otherwise untouched, since the feature
+  itself is opt-in. `HelloRetryConfig.peer_binding` is
   **caller-supplied** because the module never touches a socket — the
   peer's address is an input, like `Config.now_sec` and the
   `std.Random` arguments — and an empty one is `error.EmptyPeerBinding`
@@ -160,7 +174,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   §5.2). A message split across datagrams — a certificate chain past the
   path MTU, in practice — is now buffered and reassembled by
   `fragment_offset` (never arrival order), tolerating out-of-order and
-  duplicate fragments; `error.FragmentedMessageUnsupported` is gone.
+  duplicate fragments. **BREAKING (API):** `HandshakeError` **loses**
+  `FragmentedMessageUnsupported` and gains `FlightIncomplete`,
+  `FlightTooLarge` and `InterleavedFragments`; `handshake.ReassembleError`
+  — which `HandshakeError` includes — gains `InconsistentMessageType` and
+  `OverlappingFragment`. Both sets are declared, so **what a consumer must
+  change:** any `switch` prong naming `error.FragmentedMessageUnsupported`
+  has to go, and it stops compiling even with an `else` (a prong naming a
+  non-member is a type error, not dead code); an exhaustive `switch` must
+  also handle the five new members. A `catch |e| switch (e) { … else => }`
+  that never named the removed error is unaffected.
   `HandshakeResult` gains `need_more_data` (defaulted, so
   existing construction sites are unaffected): while a flight is
   incomplete the connection is rolled back to its exact pre-call state,
@@ -186,12 +209,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   group, so `secp256r1` is now a real key-exchange group (65-byte
   uncompressed SEC1 share, shared secret = the X coordinate per RFC 8446
   §7.4.2) rather than something advertised and not implemented.
-  `error.HelloRetryRequestUnsupported` no longer covers cert-mode
-  retries; new `error.UnsupportedGroup` (retry named a group we never
-  advertised) and `error.IllegalHelloRetryRequest` (retry named a
-  group we already offered a share in — the peer-driven retry loop; or a
-  ServerHello that switched cipher suite after the retry committed to
-  one). A cookie-only retry deliberately leaves the `key_share`
+  **BEHAVIOURAL, not breaking:** `error.HelloRetryRequestUnsupported` no
+  longer covers cert-mode retries. **What changes for a consumer:** a
+  `.cert_dhe` handshake against a server that answers with an HRR used to
+  end in that error and now completes, so a caller that treated it as
+  "this peer is unusable, fall back" takes a different path. Nothing that
+  previously succeeded changes: the error remains a member of
+  `HandshakeError`, the retry is still fully authenticated, and a peer
+  that never sends an HRR is byte-for-byte unaffected.
+  **BREAKING (API):** `HandshakeError` gains `error.UnsupportedGroup`
+  (retry named a group we never advertised) and
+  `error.IllegalHelloRetryRequest` (retry named a group we already
+  offered a share in — the peer-driven retry loop; or a ServerHello that
+  switched cipher suite after the retry committed to one) — an exhaustive
+  `switch` over the set stops compiling until it handles both; a `catch
+  |e| switch (e) { … else => }` is unaffected.
+  A cookie-only retry deliberately leaves the `key_share`
   byte-identical: §4.1.2 permits no gratuitous change. Live-anchored
   against wolfSSL in three shapes (cookie only, group change only, both),
   and the P-256 ECDH is additionally KAT'd byte-exact against Python

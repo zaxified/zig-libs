@@ -725,6 +725,70 @@ test "childOf keeps the trace and generated ids are unique / non-zero" {
     try testing.expect(!isZero(&newSpanId()));
 }
 
+/// The handler half of the dead-frame test below: format the outgoing
+/// traceparent into a buffer that dies with THIS frame — exactly what
+/// `middlewareRun`'s echo block does — and hand it to `setHeader`. Mirrors
+/// `http`'s and `cookies`' own `setFromDeadFrame`.
+///
+/// A separate `noinline` function, not a block inside the test: Zig gives
+/// each local its own slot for the enclosing function's entire body in
+/// Debug, so a block scope frees nothing and the bug this guards would stay
+/// invisible. Only a returned frame is really reusable.
+noinline fn setFromDeadFrame(res: *http.Server.ResponseWriter) !void {
+    var out_buf: [TraceParent.header_len]u8 = undefined;
+    const tp = try TraceParent.parse(sample);
+    try res.setHeader(default_traceparent_header, tp.write(&out_buf));
+}
+
+/// Reuse the frame `setFromDeadFrame` just left, the way the next call down
+/// the stack would have. `noinline` + `doNotOptimizeAway` so neither the
+/// call nor the stores can be optimized out.
+noinline fn clobberDeadFrame() void {
+    var scratch: [2048]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "TraceContext echo: traceparent header survives the caller's dead frame" {
+    // What this pins: `middlewareRun`'s echo block formats the outgoing
+    // traceparent into `out_buf`, a plain local that dies once
+    // `middlewareRun` returns -- well before `end()` runs (`writeHead` runs
+    // inside `end()`, which both servers call only after the whole handler
+    // chain has returned). `out_buf` was `threadlocal` until 2026-08-12
+    // specifically so it would outlive the response regardless of copying;
+    // now that it is a plain local (see the module doc's "Memory /
+    // concurrency" section), this module leans entirely on `http`'s
+    // `ResponseWriter.dupe` copying header bytes into its own storage rather
+    // than borrowing the caller's.
+    //
+    // Nothing else in this module's suite pins that on purpose -- `runWire`
+    // drives `middlewareRun` through the full router/server dispatch with no
+    // seam between the echo block returning and `end()` running in which to
+    // clobber the stack deliberately (a mutation removing the copy can
+    // *happen* to corrupt the header there today by accident, depending on
+    // what the dispatch path's own stack traffic leaves behind, but that is
+    // not a reliable anchor). So the writer is built and driven by hand
+    // here, mirroring `http`'s and `cookies`' own dead-frame tests.
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    try setFromDeadFrame(&rw);
+    clobberDeadFrame();
+
+    try rw.writeAll("ok");
+    try rw.end();
+    const wire = out.buffered();
+
+    // The traceparent header, read back off the wire after every byte of its
+    // source was overwritten.
+    try testing.expect(std.mem.indexOf(u8, wire, "traceparent: " ++ sample ++ "\r\n") != null);
+    // …and not one byte of the clobber pattern anywhere on it.
+    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+}
+
 // See w3c_conformance_test.zig / w3c_vectors.zig / NOTICE.
 test {
     _ = @import("w3c_vectors.zig");
