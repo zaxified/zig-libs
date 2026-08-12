@@ -65,9 +65,9 @@ const engine = try T.init(1073750017); // prime ≡ 1 mod 2048
 const product = engine.mulNegacyclic(a, b); // a·b mod (X^1024 + 1)
 
 // Scheme surface (complete). `io` is a `std.Io`: key generation, encryption and
-// the relin key draw from `std.Io.random` — a CSPRNG by contract, though one
-// that can silently fall back to a weaker seed on failure (see the
-// "Randomness" note in `src/bfv.zig`). Still far better than a bare
+// the relin key draw through `entropy.SecureSource`, the fail-closed adapter
+// over `std.Io.randomSecure` (see the "Randomness" note in `src/bfv.zig`) —
+// not the silently-degrading `std.Io.random`. Still far better than a bare
 // `std.Random` parameter, which would accept `DefaultPrng.init(0)` at a call
 // site that looks identical, and with `u,e0,e1` predictable
 // `c0 − p0·u − e0 = Δ·m` recovers the plaintext WITHOUT the secret key. The

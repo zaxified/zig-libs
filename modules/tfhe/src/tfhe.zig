@@ -28,28 +28,32 @@
 //! ## Randomness — a security contract, not a portability tag
 //!
 //! Every production key-generation and encryption entry point takes
-//! `io: std.Io` and draws from `std.Io.random`, which is **contractually a
-//! CSPRNG** (`std/Io.zig`: "Obtains entropy from a cryptographically secure
-//! pseudo-random number generator") — but that same doc comment documents a
-//! silent fallback to a weaker seed if the CSPRNG source fails; the default
-//! `Io.Threaded` falls back to a pid+clock+ASLR seed if `/dev/urandom` is
-//! unreachable. That is still far better than a `std.Random` parameter, which
-//! would accept `DefaultPrng.init(0)` at a call site that looks identical to
-//! a correct one, and a seeded stream does not weaken this scheme — it
-//! removes it. With `e` and `a` predictable, `b = ⟨a,s⟩ + μ + e` is a linear
-//! system: `dim` ciphertexts recover the secret key `s` by Gaussian
-//! elimination. The bootstrap and key-switch keys are GLWE/GGSW encryptions
-//! of that same key and are *published* to the evaluator, so predictable
-//! masking there hands the key over directly.
+//! `io: std.Io` and draws through `entropy.SecureSource`, the fail-closed
+//! `std.Random` adapter over `std.Io.randomSecure` (`modules/entropy`) — not
+//! `std.Random.IoSource`, which binds `std.Io.random`. `std.Io.random` is
+//! **contractually a CSPRNG** (`std/Io.zig`: "Obtains entropy from a
+//! cryptographically secure pseudo-random number generator") but that same
+//! doc comment documents a silent fallback to a weaker seed if the CSPRNG
+//! source fails; the default `Io.Threaded` falls back to a pid+clock+ASLR
+//! seed if `/dev/urandom` is unreachable. A bare `std.Random` parameter would
+//! be worse still — it would accept `DefaultPrng.init(0)` at a call site that
+//! looks identical to a correct one — and either failure mode here does not
+//! weaken this scheme, it removes it. With `e` and `a` predictable,
+//! `b = ⟨a,s⟩ + μ + e` is a linear system: `dim` ciphertexts recover the
+//! secret key `s` by Gaussian elimination. The bootstrap and key-switch keys
+//! are GLWE/GGSW encryptions of that same key and are *published* to the
+//! evaluator, so predictable masking there hands the key over directly.
+//! `entropy.SecureSource` aborts the process rather than draw from a source
+//! that degraded — see its doc comment for why that is the right trade at a
+//! `void`-returning `std.Random.fillFn`.
 //!
 //! The `…ForTest` twins keep a `std.Random` parameter, because the draw→value
 //! KATs at the bottom of this file and the seeded end-to-end tests must stay
 //! reproducible. They are named so that a production call site cannot use one
 //! by accident. Taking `std.Io` (rather than reading OS entropy directly) keeps
 //! the module `platform = .any`, the same shape `bbs`/`ibe`/`tlock` use.
-//! Whether this module's secret draws should fail closed via
-//! `std.Io.randomSecure` instead of the silently-degrading `std.Io.random`
-//! is an open, tracked decision (B7); this module does not use it yet.
+//! Failing closed via `std.Io.randomSecure` was an open, tracked decision
+//! (B7); it is now closed (`CONVENTIONS.md` §2.2), and this module takes it.
 //!
 //! ## Constant-time posture (key path)
 //!
@@ -66,6 +70,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const entropy = @import("entropy");
 const params = @import("params.zig");
 const torus = @import("torus.zig");
 const polymod = @import("poly.zig");
@@ -259,10 +264,10 @@ pub fn Tfhe(comptime P: params.Params) type {
         //
         // Every randomness-consuming entry point in this file exists twice:
         //
-        //   - `f(…, io: std.Io)`               — PRODUCTION. `std.Io.random` is
-        //     a CSPRNG by contract, but that contract documents a silent
-        //     fallback to a weaker seed on failure — this signature just makes
-        //     the degraded path harder to reach than a bare `DefaultPrng`.
+        //   - `f(…, io: std.Io)`               — PRODUCTION. Draws through
+        //     `entropy.SecureSource`, fail-closed on `std.Io.randomSecure`
+        //     (aborts rather than falling back to the weaker seed
+        //     `std.Random.IoSource`/`std.Io.random` would silently accept).
         //   - `fForTest(…, random: std.Random)` — TEST/KAT ONLY. Reproducible
         //     draws for the KATs and the seeded end-to-end tests. Never call
         //     one of these from production code; the name is the signal.
@@ -273,15 +278,16 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// Generate a binary LWE secret key of dimension `dim` — the module's
         /// most sensitive value — with every bit drawn from `io`'s CSPRNG.
         ///
-        /// `io` must be a real `std.Io` (its `random` is documented as
-        /// cryptographically secure). If the bits were drawn from a seeded PRNG
+        /// `io` must be a real `std.Io`: the draw goes through
+        /// `entropy.SecureSource`, fail-closed on `std.Io.randomSecure`. If the
+        /// bits were drawn from a seeded PRNG
         /// the key would be a deterministic function of that seed: anyone who
         /// guesses it, or reads it out of the consumer's binary, decrypts every
         /// ciphertext the deployment ever produced. That is why this takes
         /// `std.Io` and `lweKeyGenForTest` — which takes anything — is named
         /// the way it is.
         pub fn lweKeyGen(comptime dim: usize, io: std.Io) LweKey(dim) {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return lweKeyGenForTest(dim, src.interface());
         }
 
@@ -309,7 +315,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// `extractGlweKey` reads its coefficients out as a plain LWE key, so a
         /// seeded stream here compromises the whole bootstrapping pipeline.
         pub fn glweKeyGen(io: std.Io) GlweKey {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return glweKeyGenForTest(src.interface());
         }
 
@@ -349,7 +355,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// `s` by Gaussian elimination. Predictable noise is not a weakened LWE
         /// instance, it is no LWE instance.
         pub fn lweEncrypt(comptime dim: usize, key: *const LweKey(dim), mu: T, io: std.Io) Lwe(dim) {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return lweEncryptForTest(dim, key, mu, src.interface());
         }
 
@@ -397,7 +403,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// stream is already an `N`-equation linear system in the `N`
         /// coefficients of the GLWE key.
         pub fn glweEncrypt(key: *const GlweKey, msg: *const Poly, io: std.Io) Glwe {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return glweEncryptForTest(key, msg, src.interface());
         }
 
@@ -425,7 +431,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// predictable masks nothing at all, so every row that adds a gadget
         /// term to it publishes that term in the clear.
         pub fn glweEncryptZero(key: *const GlweKey, io: std.Io) Glwe {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return glweEncryptZeroForTest(key, src.interface());
         }
 
@@ -478,7 +484,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// *published* to whoever evaluates the circuit. Predictable row masks
         /// therefore do not merely leak a plaintext, they hand over the key.
         pub fn ggswEncryptPoly(key: *const GlweKey, msg: *const Poly, io: std.Io) Ggsw {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return ggswEncryptPolyForTest(key, msg, src.interface());
         }
 
@@ -512,7 +518,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// `io`'s CSPRNG. `io` must be a real `std.Io` — see
         /// `ggswEncryptPoly` for what a predictable stream costs here.
         pub fn ggswEncryptScalar(key: *const GlweKey, m: T, io: std.Io) Ggsw {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return ggswEncryptScalarForTest(key, m, src.interface());
         }
 
@@ -539,7 +545,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// key) subtracts the known masks and reads `s` off directly — no
         /// lattice problem is involved.
         pub fn bootstrapKeyGen(lwe_key: *const LweKey(n), glwe_key: *const GlweKey, io: std.Io) BootstrapKey {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return bootstrapKeyGenForTest(lwe_key, glwe_key, src.interface());
         }
 
@@ -566,7 +572,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// published encryption of secret material: predictable masks turn its
         /// `N·ℓ_ks` rows into a solved linear system for the GLWE key.
         pub fn keySwitchKeyGen(glwe_key: *const GlweKey, small_key: *const LweKey(n), io: std.Io) KeySwitchKey {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return keySwitchKeyGenForTest(glwe_key, small_key, src.interface());
         }
 
@@ -1058,11 +1064,11 @@ test "RNG seam: every production keygen/encrypt takes std.Io, only the ForTest t
     // vtable — `DefaultPrng.init(0).random()` and a CSPRNG are indistinguishable
     // at a call site — so as long as a production entry point accepts one, a
     // consumer can silently generate an FHE secret key that is a function of a
-    // seed. `std.Io.random` is a CSPRNG by contract, but that contract
-    // documents a silent fallback to a weaker seed on failure — this
-    // signature just makes that path harder to reach than a bare
-    // `DefaultPrng`. If someone reintroduces a `std.Random` parameter on any
-    // of these, this fails to compile or fails here.
+    // seed. These entry points draw through `entropy.SecureSource`, fail-closed
+    // on `std.Io.randomSecure` — not `std.Random.IoSource`, which would bind
+    // the silently-degrading `std.Io.random`. If someone reintroduces a bare
+    // `std.Random` parameter on any of these, this fails to compile or fails
+    // here.
     inline for (.{
         @TypeOf(Toy.lweKeyGen), // generic in `dim`; the entropy parameter is still concrete
         @TypeOf(Toy.glweKeyGen),

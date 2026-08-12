@@ -44,24 +44,24 @@ pub const KeysError = error{
 /// vtable: `DefaultPrng.init(0)` and a real CSPRNG are indistinguishable at
 /// the call site, and the previous shape of this file printed "seed it for
 /// deterministic tests" next to the parameter — an instruction a consumer can
-/// follow straight into production. `std.Io.random` is a CSPRNG by contract,
-/// but that contract has a documented silent-degrade clause (`std/Io.zig`'s
-/// `random` doc: falls back to a weaker seed on failure) — the default
-/// `Io.Threaded` falls back to a pid+clock+ASLR seed if `/dev/urandom` is
-/// unreachable. So `.io` is weaker than the explicit opt-in unions
-/// `dtls`/`snmp`/`rsa`/`jwe`/`bolt8` use: a consumer gets the degraded path
-/// without asking for it, just not by typing `DefaultPrng.init(0)`. The
-/// seeded arm still exists — this module's own tests need reproducible
-/// issuance, and there is no external byte-exact Coconut vector to anchor
-/// against (SPEC §3) — but it is reachable only through a declaration whose
-/// name says what it is, never as an option on a production entry point.
-/// Whether this module's secret draws should fail closed via
-/// `std.Io.randomSecure` instead is an open, tracked decision (B7).
+/// follow straight into production. The `.io` arm draws through `Fr.random`
+/// (`bls12_381/src/scalar.zig`), which itself draws through `entropy.fill` —
+/// fail-closed on `std.Io.randomSecure`, not the silently-degrading
+/// `std.Io.random` (`std/Io.zig`'s `random` doc: falls back to a weaker seed
+/// on failure; the default `Io.Threaded` falls back to a pid+clock+ASLR seed
+/// if `/dev/urandom` is unreachable). So `.io` already meets the bar
+/// `CONVENTIONS.md` §2.2 sets — transitively, through `bls12_381`, without
+/// this module importing `entropy` itself. The seeded arm still exists —
+/// this module's own tests need reproducible issuance, and there is no
+/// external byte-exact Coconut vector to anchor against (SPEC §3) — but it is
+/// reachable only through a declaration whose name says what it is, never as
+/// an option on a production entry point.
 ///
 /// Mirrors `bbs`/`ibe`/`tlock` (`io: std.Io` for the real draw, an explicitly
 /// named deterministic path for tests).
 pub const Entropy = union(enum) {
-    /// PRODUCTION. `std.Io.random` is a CSPRNG by contract.
+    /// PRODUCTION. Draws through `Fr.random`, which is fail-closed
+    /// (`entropy.fill` → `std.Io.randomSecure`; see above).
     io: std.Io,
     /// **TEST ONLY.** A caller-seeded generator, so this module's own suites
     /// can reproduce an issuance/show. Using this to generate a real
@@ -187,7 +187,9 @@ pub const ThresholdKeys = struct {
 ///
 /// **Entropy.** `io` supplies EVERY scalar this function samples: the master
 /// secret `(x, y₁…y_q)` itself and all `q+1` degree-`t−1` Shamir blinding
-/// polynomials. `std.Io.random` is a CSPRNG by contract, which is the point —
+/// polynomials, each drawn via `Entropy.scalar` through `Fr.random`, which is
+/// fail-closed on `std.Io.randomSecure` (`entropy.fill`; see the `Entropy`
+/// doc comment above). That is the point of the type, not just the source —
 /// if this took a `std.Random`, a consumer could pass `DefaultPrng.init(seed)`
 /// and the authority master secret would be a pure function of that seed.
 /// Anyone who recovers it (a constant in a shipped binary, a PID, a boot
@@ -439,12 +441,11 @@ fn testIo() std.Io.Threaded {
 
 test "keygen takes std.Io; the seeded form exists only under a name that says so" {
     const gen_params = @typeInfo(@TypeOf(keygen)).@"fn".params;
-    // `std.Io.random` is a CSPRNG by contract, but that contract documents a
-    // silent fallback to a weaker seed on failure (`std/Io.zig`'s `random`
-    // doc) — this signature makes the degraded path harder to reach than
-    // `DefaultPrng.init(0)`, not impossible. If this ever flips back to
-    // `std.Random`, `keygen(alloc, prng.random(), …)` compiles again and the
-    // Coldcard-shaped mistake is one line away for every consumer.
+    // `keygen`'s draws go through `Entropy.scalar` → `Fr.random`, fail-closed
+    // on `std.Io.randomSecure` (`entropy.fill`), not the silently-degrading
+    // `std.Io.random`. If this ever flips back to a bare `std.Random`,
+    // `keygen(alloc, prng.random(), …)` compiles again and the Coldcard-shaped
+    // mistake is one line away for every consumer.
     try std.testing.expectEqual(std.Io, gen_params[1].type.?);
     // The seeded form still exists, but only under a name that says out loud
     // what it is — it can never be reached by a consumer who merely followed

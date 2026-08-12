@@ -36,26 +36,28 @@
 //!
 //! ## Randomness
 //!
-//! Key generation and encryption take `io: std.Io` and draw from
-//! `std.Io.random` — a CSPRNG by contract, but one that can silently fall
-//! back to a weaker seed on failure (`std/Io.zig`'s `random` doc). A bare
+//! Key generation and encryption take `io: std.Io` and draw through
+//! `entropy.SecureSource`, the fail-closed `std.Random` adapter over
+//! `std.Io.randomSecure` (`modules/entropy`) — not the silently-degrading
+//! `std.Io.random` a bare `std.Random.IoSource` would bind. A bare
 //! `std.Random` parameter would still be worse — it would let a consumer
 //! pass `DefaultPrng.init(0)` at a call site that looks identical to a
 //! correct one, and a predictable stream does not weaken this scheme — it
 //! removes it (`dim` ciphertexts then recover the secret key by Gaussian
 //! elimination). The `…ForTest` twins keep `std.Random` for the KATs and
 //! seeded end-to-end tests; see `tfhe.zig`'s "Randomness" doc comment for
-//! the fuller picture, including the still-open question of failing closed
-//! via `std.Io.randomSecure` (B7).
+//! the fuller picture, including why failing closed via
+//! `std.Io.randomSecure` is settled policy now, not an open question
+//! (`CONVENTIONS.md` §2.2, formerly tracked as B7).
 
 const std = @import("std");
 
 pub const meta = .{
-    .platform = .any, // pure computation; the entropy seam is a portable std.Io (CSPRNG by contract, with a documented weak-seed fallback), no raw getrandom(2)
+    .platform = .any, // pure computation; the entropy seam is entropy.SecureSource over a portable std.Io, no raw getrandom(2)
     .role = .util,
     .concurrency = .reentrant, // no shared state; caller supplies all inputs
     .model_after = "TFHE (Chillotti–Gama–Georgieva–Izabachène, ePrint 2016/870) + FHEW (Ducas–Micciancio, EUROCRYPT 2015)",
-    .deps = .{}, // std-only
+    .deps = .{"entropy"}, // fail-closed secret draws in every keyGen/encrypt entry point (entropy.SecureSource)
 };
 
 // Mechanical backbone (all REAL, ungated).

@@ -196,8 +196,10 @@ own ~4× memory cost for the prepared key.
   it likes — so the entropy seam below is written for the production case, not
   for `toy`.
 - **The entropy seam is typed, not documented.** Key generation and encryption
-  take `io: std.Io` and draw from `std.Io.random`, which std documents as a
-  CSPRNG. They deliberately do NOT take `std.Random`: that is a vtable, its
+  take `io: std.Io` and draw through `entropy.SecureSource` (`modules/entropy`),
+  the fail-closed `std.Random` adapter over `std.Io.randomSecure` — not
+  `std.Random.IoSource`, which binds the silently-degrading `std.Io.random`.
+  They deliberately do NOT take `std.Random` directly: that is a vtable, its
   quality cannot be read at the call site, and `DefaultPrng.init(0).random()`
   looks exactly like a correct argument. The consequence of getting it wrong is
   not a weakened instance but no instance: with `a` and `e` predictable,

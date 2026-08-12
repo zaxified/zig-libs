@@ -416,8 +416,10 @@ pub fn aggregateCredential(
 /// index/value or the proof is unsound). Caller frees the returned proof.
 ///
 /// **Entropy.** `io` supplies the re-randomisation scalars `r'`/`r` and the
-/// Sigma-protocol witness nonces `r̃`/`m̃ⱼ`. `std.Io.random` is a CSPRNG by
-/// contract, and that is load-bearing here: a stream that REPEATS across two
+/// Sigma-protocol witness nonces `r̃`/`m̃ⱼ`, each drawn via `Entropy.scalar`
+/// through `Fr.random`, which is fail-closed on `std.Io.randomSecure`
+/// (`entropy.fill`; see `keys.zig`'s `Entropy` doc comment). That matters
+/// here: a stream that REPEATS across two
 /// shows (a re-seeded `DefaultPrng`, PRNG state inherited across a `fork`)
 /// produces two transcripts with identical witnesses but different challenges
 /// `c` — different `κ`/`ν`/disclosure set means a different Fiat-Shamir hash.
@@ -794,10 +796,9 @@ test "proveCredential takes std.Io; the seeded form exists only under a name tha
     // witnesses `r̃`/`m̃` but a different challenge `c` — the standard
     // Sigma-protocol two-transcript extraction, which recovers the HIDDEN
     // attributes and the blinding `r`. That is the module's entire purpose,
-    // gone. `std.Io.random` is a CSPRNG by contract, but that contract
-    // documents a silent fallback to a weaker seed on failure — this
-    // signature makes a repeating stream harder to reach than a bare
-    // `DefaultPrng`, not impossible at the type.
+    // gone. `proveCredential`'s draws go through `Entropy.scalar` →
+    // `Fr.random`, fail-closed on `std.Io.randomSecure` (`entropy.fill`), not
+    // the silently-degrading `std.Io.random`.
     try std.testing.expectEqual(std.Io, gen_params[1].type.?);
     const test_params = @typeInfo(@TypeOf(proveCredentialSeededForTest)).@"fn".params;
     try std.testing.expectEqual(std.Random, test_params[1].type.?);

@@ -54,11 +54,15 @@ const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed
 
 ## Randomness
 
-`keygen` and `proveCredential` take `io: std.Io` and draw from
-`std.Io.random` — a CSPRNG by contract, the `bbs`/`ibe`/`tlock` shape, but not
-an unconditional guarantee: `std.Io.random`'s own doc documents a silent
-fallback to a weaker seed if the CSPRNG source is unavailable. That still
-beats a bare `std.Random.DefaultPrng` parameter, which is why it matters here:
+`keygen` and `proveCredential` take `io: std.Io` and draw every secret scalar
+through `Entropy.scalar` (`keys.zig`), which calls `bls12_381`'s
+`Fr.random(io)`. That function is fail-closed: it draws through `entropy`'s
+`fill`, i.e. `std.Io.randomSecure` or an abort, never `std.Io.random` (whose
+own doc documents a silent fallback to a weaker seed if the CSPRNG source is
+unavailable). This module reaches that posture transitively, through
+`bls12_381`, without importing `entropy` itself — the `bbs`/`ibe`/`tlock`
+shape, and stronger than a bare `std.Random.DefaultPrng` parameter, which is
+why it matters here:
 
 - A seed-derived master secret `(x, y₁…y_q)` lets anyone who recovers the seed
   issue arbitrary valid credentials for the entire system. The `t`-of-`n`
@@ -75,8 +79,11 @@ a deterministic issuance. This module's own tests use
 signal, and there is no seeded option on the production functions.
 
 `std.Io.randomSecure` is the fail-closed alternative to `std.Io.random`
-(errors instead of degrading); this module does not use it yet, and whether
-its secret draws should is an open decision tracked in the project backlog.
+(errors/aborts instead of degrading). Whether this module's secret draws
+should fail closed was an open decision tracked in the project backlog; it is
+now closed (`CONVENTIONS.md` §2.2) and, per the paragraph above, this module
+already meets it — through `bls12_381`'s `Fr.random`, not by importing
+`entropy` directly.
 
 ## Verify
 

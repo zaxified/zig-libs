@@ -34,14 +34,17 @@
 //! Both entry points that sample secrets — `keygen` (the authority master
 //! secret `(x, y₁…y_q)` and its Shamir blinding) and `proveCredential` (the
 //! re-randomisation scalars and the Sigma-protocol witness nonces) — take
-//! `io: std.Io` and draw from `std.Io.random` — a CSPRNG by contract, but one
-//! with a documented silent-degrade clause (`std/Io.zig`'s `random` doc:
-//! falls back to a weaker seed on failure). This is the `bbs`/`ibe`/`tlock`
-//! shape: weaker than the explicit opt-in unions `dtls`/`snmp`/`rsa`/`jwe`/
-//! `bolt8` use, but a documented request rather than a bare `std.Random`
-//! parameter a caller could silently pass `DefaultPrng.init(0)` to. Whether
-//! this module's secret draws should fail closed via `std.Io.randomSecure`
-//! is an open, tracked decision (B7).
+//! `io: std.Io` and draw every scalar through `Entropy.scalar` (`keys.zig`),
+//! which calls `bls12_381`'s `Fr.random(io)`. That function is fail-closed:
+//! it draws through `entropy.fill`, which is `std.Io.randomSecure` or an
+//! abort, never the silently-degrading `std.Io.random` (`std/Io.zig`'s
+//! `random` doc documents the fallback; `entropy`'s doc comment has the
+//! measurements). This module reaches that posture transitively, through
+//! `bls12_381`, rather than by importing `entropy` itself — this is the
+//! `bbs`/`ibe`/`tlock` shape (`io: std.Io` for the real draw, an explicitly
+//! named seeded path for tests), and unlike when this note was last written,
+//! failing closed is no longer an open question: it is `CONVENTIONS.md` §2.2,
+//! formerly tracked as B7, now closed.
 //!
 //! It matters because the consequences are total, not marginal. A
 //! seed-derived master secret lets anyone who recovers the seed issue

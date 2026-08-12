@@ -222,12 +222,14 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   "Partially constant-time" below, and no byte codecs — so this is a set to
   benchmark and reason about, not one to deploy behind.
 - **The entropy seam is typed, not documented.** `keyGen`, `encrypt` and
-  `genRelinKey` take `io: std.Io` and draw from `std.Io.random`, which std
-  documents as a CSPRNG. They deliberately do NOT take `std.Random`: that is a
-  vtable, its quality cannot be read at the call site, and
-  `DefaultPrng.init(0).random()` looks exactly like a correct argument. The
-  consequence of getting it wrong is not a weaker instance — with `u,e0,e1`
-  predictable an attacker computes `c0 − p0·u − e0 = Δ·m` and reads the
+  `genRelinKey` take `io: std.Io` and draw through `entropy.SecureSource`
+  (`modules/entropy`), the fail-closed `std.Random` adapter over
+  `std.Io.randomSecure` — not `std.Random.IoSource`, which binds the
+  silently-degrading `std.Io.random`. They deliberately do NOT take
+  `std.Random` directly: that is a vtable, its quality cannot be read at the
+  call site, and `DefaultPrng.init(0).random()` looks exactly like a correct
+  argument. The consequence of getting it wrong is not a weaker instance —
+  with `u,e0,e1` predictable an attacker computes `c0 − p0·u − e0 = Δ·m` and reads the
   plaintext **without the secret key**, and `genRelinKey` publishes `s²` to the
   evaluator under masks the evaluator can reproduce. The `…ForTest` twins keep
   `std.Random` so the KATs (including the scripted-word test that pins which
@@ -248,8 +250,8 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   a public mask, not a secret); `decrypt`/`noiseBudget`/`centerRaw`/
   `auxResidues` branch on reconstructed coefficient values; `relinearize`'s
   digit decomposition is value-shaped; and the entropy source behind
-  `std.Io.random` is the host's, so its timing is outside our control (as is a
-  `std.Random` handed to one of the `…ForTest` twins). Above all this is
+  `std.Io.randomSecure` is the host's, so its timing is outside our control
+  (as is a `std.Random` handed to one of the `…ForTest` twins). Above all this is
   **source-level** CT — the compiler may
   rematerialise a branch from a mask, and nothing here is verified codegen or a
   microarchitectural claim.

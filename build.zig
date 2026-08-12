@@ -266,7 +266,7 @@ const module_list = [_]Module{
     .{ .name = "ecvrf", .deps = &.{"ct25519"} },
     .{ .name = "fss" },
     .{ .name = "pir", .deps = &.{"fss"} },
-    .{ .name = "bfv" },
+    .{ .name = "bfv", .deps = &.{"entropy"} },
     .{ .name = "groth16", .deps = &.{"bn254"} },
     // Not heavy: the parameter derivation + all 30 tests run in 5s under
     // -Dstrict-debug, well under the >15s threshold (and a Debug compile of
@@ -279,7 +279,7 @@ const module_list = [_]Module{
     // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
     // field code), so marking it heavy would cost 5x what it saves.
     .{ .name = "rescue" },
-    .{ .name = "tfhe", .heavy = true },
+    .{ .name = "tfhe", .deps = &.{"entropy"}, .heavy = true },
     .{ .name = "montint", .heavy = true },
     .{ .name = "chachapoly" },
     .{ .name = "k256" },

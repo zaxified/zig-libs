@@ -63,16 +63,18 @@
 //!
 //! ## Randomness
 //!
-//! `keyGen`, `encrypt` and `genRelinKey` take `io: std.Io` and draw from
-//! `std.Io.random` — a CSPRNG by contract, but one that can silently fall
-//! back to a weaker seed on failure (`std/Io.zig`'s `random` doc). A bare
+//! `keyGen`, `encrypt` and `genRelinKey` take `io: std.Io` and draw through
+//! `entropy.SecureSource`, the fail-closed `std.Random` adapter over
+//! `std.Io.randomSecure` (`modules/entropy`) — not the silently-degrading
+//! `std.Io.random` a bare `std.Random.IoSource` would bind. A bare
 //! `std.Random` parameter would let a consumer pass `DefaultPrng.init(0)` at
 //! a call site that looks identical to a correct one — and here that is not
 //! a weakening but a break: with `u,e0,e1` predictable, `c0 − p0·u − e0 = Δ·m`
 //! recovers the plaintext **without the secret key**. The `…ForTest` twins
 //! keep `std.Random` so the KATs stay reproducible; see `bfv.zig`'s
-//! "Randomness" doc comment for the fuller picture, including the still-open
-//! question of failing closed via `std.Io.randomSecure` (B7).
+//! "Randomness" doc comment for the fuller picture, including why failing
+//! closed via `std.Io.randomSecure` is settled policy now, not an open
+//! question (`CONVENTIONS.md` §2.2, formerly tracked as B7).
 //!
 //! Deferred increments: bootstrapping, CKKS (approximate), key rotation /
 //! Galois automorphisms (batching rotations), full CRT-slot SIMD encoding,
@@ -81,11 +83,11 @@
 const std = @import("std");
 
 pub const meta = .{
-    .platform = .any, // pure computation; the entropy seam is a portable std.Io (CSPRNG by contract, with a documented weak-seed fallback), no raw getrandom(2)
+    .platform = .any, // pure computation; the entropy seam is entropy.SecureSource over a portable std.Io, no raw getrandom(2)
     .role = .util,
     .concurrency = .reentrant, // no shared state; caller supplies all inputs
     .model_after = "Fan-Vercauteren BFV (ePrint 2012/144) + Microsoft SEAL RNS/NTT design",
-    .deps = .{}, // std-only
+    .deps = .{"entropy"}, // fail-closed secret draws in keyGen/encrypt/genRelinKey (entropy.SecureSource)
 };
 
 // Arithmetic backbone (all REAL, ungated).

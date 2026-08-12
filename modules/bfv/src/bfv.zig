@@ -58,31 +58,37 @@
 //! ## Randomness — a security contract, not a portability tag
 //!
 //! `keyGen`, `encrypt` and `genRelinKey` — the three production entry points
-//! that consume entropy — take `io: std.Io` and draw from `std.Io.random`,
-//! which is **contractually a CSPRNG** (`std/Io.zig`: "Obtains entropy from a
-//! cryptographically secure pseudo-random number generator") — but that same
-//! doc comment documents a silent fallback to a weaker seed if the CSPRNG
-//! source fails; the default `Io.Threaded` falls back to a pid+clock+ASLR
-//! seed if `/dev/urandom` is unreachable. A bare `std.Random` parameter would
-//! still be worse — it would accept `DefaultPrng.init(0)` at a call site that
-//! looks identical to a correct one — and here that is not a weakening but a
+//! that consume entropy — take `io: std.Io` and draw through
+//! `entropy.SecureSource`, the fail-closed `std.Random` adapter over
+//! `std.Io.randomSecure` (`modules/entropy`). That is deliberately NOT
+//! `std.Random.IoSource`, which binds `std.Io.random` — **contractually a
+//! CSPRNG** (`std/Io.zig`: "Obtains entropy from a cryptographically secure
+//! pseudo-random number generator") but one whose own doc comment documents a
+//! silent fallback to a weaker seed if the CSPRNG source fails; the default
+//! `Io.Threaded` falls back to a pid+clock+ASLR seed if `/dev/urandom` is
+//! unreachable. A bare `std.Random` parameter would still be worse — it would
+//! accept `DefaultPrng.init(0)` at a call site that looks identical to a
+//! correct one — and either failure mode here is not a weakening but a
 //! break: `encrypt`'s `u,e0,e1` are the whole of BFV's IND-CPA claim, so a
 //! predictable stream lets anyone compute `c0 − p0·u − e0 = Δ·m` and read the
 //! plaintext **without the secret key**; `keyGen`'s `s` becomes a function of
 //! the seed; and `genRelinKey` publishes an encryption of `s²` to the
-//! evaluator under masks the evaluator can reproduce.
+//! evaluator under masks the evaluator can reproduce. `entropy.SecureSource`
+//! aborts the process rather than hand back a key drawn from a degraded
+//! source — see its doc comment for why that is the right trade at a
+//! `void`-returning `std.Random.fillFn`.
 //!
 //! The `…ForTest` twins keep a `std.Random` parameter, because the KATs in
 //! `kat_test.zig` (including the scripted-word test that pins WHICH draws
 //! `keyGen` makes, in order) and the seeded end-to-end tests must stay
 //! reproducible. Taking `std.Io` rather than reading OS entropy directly keeps
 //! the module `platform = .any` — the same shape `bbs`/`ibe`/`tlock` use.
-//! Whether this module's secret draws should fail closed via
-//! `std.Io.randomSecure` instead of the silently-degrading `std.Io.random`
-//! is an open, tracked decision (B7); this module does not use it yet.
+//! Failing closed via `std.Io.randomSecure` was an open, tracked decision
+//! (B7); it is now closed (`CONVENTIONS.md` §2.2), and this module takes it.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const entropy = @import("entropy");
 const params = @import("params.zig");
 const ring = @import("ring.zig");
 const encode = @import("encode.zig");
@@ -663,15 +669,16 @@ pub fn Bfv(comptime P: params.Params) type {
         /// key `s`, the uniform public-key mask `a`, and the small error `e`.
         /// `pk = (p0, p1) = (−(a·s + e), a)`.
         ///
-        /// `io` must be a real `std.Io` — `std.Io.random` is documented as a
-        /// CSPRNG, which is why this parameter is not a `std.Random`. All three
+        /// `io` must be a real `std.Io`: the draw goes through
+        /// `entropy.SecureSource`, fail-closed on `std.Io.randomSecure`, which
+        /// is why this parameter is not a `std.Random`. All three
         /// values come off one stream, so a seeded PRNG makes `s` a
         /// deterministic function of the seed: whoever guesses it, or reads it
         /// out of the consumer's binary, decrypts every ciphertext ever
         /// produced under that key. See `keyGenForTest` for the reproducible
         /// twin the KATs use.
         pub fn keyGen(self: *const Self, io: std.Io) KeyPair {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return self.keyGenForTest(src.interface());
         }
 
@@ -708,7 +715,7 @@ pub fn Bfv(comptime P: params.Params) type {
         /// BFV's IND-CPA claim, which is why this takes `std.Io` and not a
         /// `std.Random` a seeded PRNG could satisfy.
         pub fn encrypt(self: *const Self, pk: *const PublicKey, pt: *const Plaintext, io: std.Io) Ciphertext {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return self.encryptForTest(pk, pt, src.interface());
         }
 
@@ -1007,7 +1014,7 @@ pub fn Bfv(comptime P: params.Params) type {
         /// `w^i·s²` off directly, i.e. the key hands the secret key to the
         /// party it was meant to hide it from.
         pub fn genRelinKey(self: *const Self, sk: *const SecretKey, io: std.Io) RelinKey {
-            var src: std.Random.IoSource = .{ .io = io };
+            var src: entropy.SecureSource = .{ .io = io };
             return self.genRelinKeyForTest(sk, src.interface());
         }
 
@@ -1512,11 +1519,11 @@ test "RNG seam: keyGen/encrypt/genRelinKey take std.Io, only the ForTest twins t
     // vtable — `DefaultPrng.init(0).random()` is indistinguishable from a CSPRNG
     // at the call site — and with a predictable stream `encrypt` leaks the
     // plaintext (`c0 − p0·u − e0 = Δ·m`, no secret key needed) and `genRelinKey`
-    // leaks `s²` to the evaluator. `std.Io.random` is a CSPRNG by contract,
-    // but that contract documents a silent fallback to a weaker seed on
-    // failure — this signature just makes the degraded path harder to reach
-    // than typing `DefaultPrng.init(0)`. Reintroducing a `std.Random`
-    // parameter would make it trivial again.
+    // leaks `s²` to the evaluator. These entry points draw through
+    // `entropy.SecureSource`, fail-closed on `std.Io.randomSecure` — not
+    // `std.Random.IoSource`, which would bind the silently-degrading
+    // `std.Io.random`. Reintroducing a bare `std.Random` parameter would make
+    // the whole class of failure trivial again.
     inline for (.{ @TypeOf(B.keyGen), @TypeOf(B.encrypt), @TypeOf(B.genRelinKey) }) |F| {
         try testing.expect(lastParamType(F).? == std.Io);
         try testing.expect(lastParamType(F).? != std.Random);
