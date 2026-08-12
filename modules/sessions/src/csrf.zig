@@ -113,14 +113,13 @@ pub const Csrf = struct {
             .http_only = false, // the client's JS must read it to echo it
             .same_site = c.same_site,
         };
-        // Thread-local: the response writer keeps the header slice uncopied
-        // until writeHead, after this returns — a stack buffer would dangle.
+        // addSetCookie copies the bytes into the writer's own header_buf
+        // before returning, so this local only has to outlive the call.
+        var cookie_buf: [256]u8 = undefined;
         const v = sc.bufPrint(&cookie_buf) catch return;
         res.addSetCookie(v) catch {};
     }
 };
-
-threadlocal var cookie_buf: [256]u8 = undefined;
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const c: *const Csrf = @ptrCast(@alignCast(state.?));

@@ -430,13 +430,6 @@ threadlocal var current_key: []const u8 = &.{};
 // non-null `current_key` always has a matching digest. See `currentDigest`.
 threadlocal var current_digest: ?[digest_len]u8 = null;
 
-// A replayed `Content-Type` value must outlive the middleware call (the
-// ResponseWriter stores header value slices verbatim — no copy — and the head
-// is not flushed until after the handler chain returns), so the decoded value
-// (which borrows the soon-freed cache copy) is staged here. Task-per-connection
-// makes this per-thread buffer valid until the response is flushed.
-threadlocal var replay_ct_buf: [256]u8 = undefined;
-
 /// The scoped idempotency key in effect for the current request, or null when
 /// none is (the request carried no key, the method is not guarded, or the key
 /// was invalid / too long to scope). Call it from the connection thread during
@@ -511,12 +504,15 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
             defer idem.store.cache.alloc.free(blob);
             const rec = decode(blob) orelse return next.run(ctx); // corrupt ⇒ re-run
             ctx.res.setStatus(rec.status);
-            // Stage Content-Type into thread-local storage: setHeader keeps the
-            // slice, but `blob` is freed on return before the head is flushed.
-            if (rec.content_type.len != 0 and rec.content_type.len <= replay_ct_buf.len) {
-                @memcpy(replay_ct_buf[0..rec.content_type.len], rec.content_type);
-                try ctx.res.setHeader("Content-Type", replay_ct_buf[0..rec.content_type.len]);
-            }
+            // Passed straight through: `setHeader` copies, so it does not matter
+            // that `rec.content_type` borrows `blob`, which the `defer` above
+            // frees before the head is flushed. Until 2026-08-12 this had to be
+            // staged in a 256-byte thread-local, which silently DROPPED any
+            // longer value; the cap was an artifact of that buffer, not a policy,
+            // so a replay now reproduces the recorded Content-Type whatever its
+            // length.
+            if (rec.content_type.len != 0)
+                try ctx.res.setHeader("Content-Type", rec.content_type);
             if (idem.options.replay_header.len != 0)
                 try ctx.res.setHeader(idem.options.replay_header, "true");
             try ctx.res.writeAll(rec.body); // writeAll copies, so freeing blob after is safe

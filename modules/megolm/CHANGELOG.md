@@ -1,0 +1,30 @@
+# megolm — changelog
+
+Newest first. See the root [`CHANGELOG.md`](../../CHANGELOG.md) for which
+release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
+
+## Unreleased
+
+- New module: Matrix's Megolm group ratchet, the third real-world
+  group-messaging construction here alongside `signal` (pairwise Double
+  Ratchet) and `mls` (RFC 9420). A one-way four-part HMAC-SHA-256 hash
+  ratchet that fast-forwards to any future index but never rewinds, plus
+  Ed25519 signatures over the message frame; `OutboundSession` /
+  `InboundGroupSession` and the exact session-sharing, session-export and
+  message wire formats. The cipher is not a choice: the spec mandates
+  AES-256-CBC/PKCS#7 + HMAC-SHA-256 truncated to 8 bytes, taken from the
+  sibling `aescbc`. `decrypt` separates four failure causes into distinct
+  typed errors (`InvalidSignature`, `MessageIndexTooOld`, `InvalidMac`,
+  `InvalidPadding`) and verifies signature → MAC → padding in that order,
+  so the padding check is unreachable without a valid MAC. Byte-exact
+  against libolm's own `test_megolm.cpp` ratchet vectors — including the
+  2^24/2^16/2^8 boundary crossings and the 32-bit counter wraparound —
+  and a real libolm-produced session-key + message pair from
+  `test_group_session.cpp`, independently re-derived end to end with a
+  separate Python toolchain (PyNaCl + `cryptography` + stdlib `hmac`) as
+  a non-libolm cross-check. The ratchet advance is a cascade, not a
+  per-part rehash: crossing a boundary rehashes the crossed part and
+  everything to its right **from the same pre-update value** —
+  implementing it as an independent per-part rehash still round-trips,
+  and is caught only by a boundary-crossing vector. Olm, the Matrix
+  event-JSON layer and key backup are out of scope.

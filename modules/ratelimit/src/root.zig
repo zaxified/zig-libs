@@ -419,15 +419,17 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const decision = l.allow(keyOf(l, ctx, &peer_buf));
     if (decision.allowed) return next.run(ctx);
 
-    // Deny. Header values are formatted on this stack frame, so the head
-    // must reach the wire before the frame unwinds — `end()` is idempotent
-    // and the serving loop's own end()+flush still run (same trick as the
+    // Deny. Header values are formatted on this stack frame; `setHeader`
+    // copies them into the response writer's own storage at call time (they
+    // don't need to survive past that call), but the early `end()` below is
+    // kept anyway — removing it would change when the head reaches the wire,
+    // a separate behaviour decision (`end()` is idempotent, so the serving
+    // loop's own end()+flush still run harmlessly, same trick as the
     // router's trailing-slash redirect).
     //
-    // RateLimit-* headers only appear on 429s: on allowed responses the head
-    // is written after this frame is gone, so per-request values would
-    // dangle (`ResponseWriter` retains header slices until the head is
-    // sent).
+    // RateLimit-* headers only appear on 429s: they are formatted fresh in
+    // this branch and set immediately, so allowed responses simply never see
+    // them — nothing here depends on when the head is actually written.
     var retry_buf: [24]u8 = undefined;
     var limit_buf: [24]u8 = undefined;
     var reset_buf: [24]u8 = undefined;

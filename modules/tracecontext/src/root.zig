@@ -192,7 +192,6 @@ pub const TraceContext = struct {
 // Per-connection-thread request-scoped storage (see the module doc).
 threadlocal var current_ctx: ?TraceParent = null;
 threadlocal var current_state: ?[]const u8 = null;
-threadlocal var out_buf: [TraceParent.header_len]u8 = undefined;
 // Scratch for combining multiple `tracestate` header instances (RFC 9110
 // §5.3 field order — see `combinedHeader`) before validation. Sized to
 // `max_state_len` since anything that would overflow it is dropped anyway
@@ -252,6 +251,10 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     };
 
     if (opt.echo) {
+        // Plain local: `setHeader` copies the bytes (`ResponseWriter.header_buf`),
+        // so this buffer only has to outlive the call, not the response. It was
+        // a `threadlocal` until 2026-08-12 for the latter reason.
+        var out_buf: [TraceParent.header_len]u8 = undefined;
         try ctx.res.setHeader(opt.traceparent_header, hop.write(&out_buf));
         if (current_state) |ts| try ctx.res.setHeader(opt.tracestate_header, ts);
     }

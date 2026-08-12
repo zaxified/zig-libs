@@ -360,13 +360,19 @@ pub fn serve(
 
     dispatch(r, &call) catch |err| call.adoptError(err);
     call.finish();
-    // `ResponseWriter.end` has to run HERE, not where the serving loop would
-    // run it. `setHeader`/`setTrailer` store slices without copying, and every
-    // value `finish` just set — the status digits, the percent-encoded
-    // message, the metadata — lives in the arena this function is about to
-    // release. The loop calls `end` after the handler returns, i.e. after the
-    // arena is gone, and serializes freed memory. `end` is idempotent, so the
-    // loop's call becomes a no-op.
+    // `ResponseWriter.end` is called HERE, ahead of where the serving loop
+    // would otherwise call it, so that it runs before `arena_state.deinit()`
+    // (the `defer` above) frees the metadata `finish` just set — the status
+    // digits, the percent-encoded message, the trailers — that `setHeader`/
+    // `setTrailer` were handed. As of the copy-at-call-time fix to those two
+    // (`setHeader`/`setTrailer` now copy the bytes into the writer's own
+    // header_buf immediately, not just keep the slice), that is no longer
+    // true: the arena being freed after this function returns is no longer a
+    // hazard for anything already passed to them. This early call is
+    // therefore no longer load-bearing for that reason, but is left in place
+    // — removing it changes when the response head reaches the wire, a
+    // separate behaviour decision. `end` is idempotent, so the serving loop's
+    // own call becomes a no-op either way.
     rw.end() catch |err| return err;
 }
 
@@ -424,8 +430,11 @@ fn dispatch(r: *const Router, c: *Call) anyerror!void {
 pub const Call = struct {
     router: *const Router,
     gpa: Allocator,
-    /// Request-scoped; everything handed to `ResponseWriter` must live in
-    /// here (header/trailer slices are stored without copying).
+    /// Request-scoped: message buffers, formatted status/trailer text and
+    /// similar per-call scratch live here. `setHeader`/`setTrailer` copy
+    /// their bytes into the `ResponseWriter`'s own storage at call time, so
+    /// values handed to them don't strictly need to live past that call —
+    /// this arena is sized for the call's other allocations regardless.
     arena: Allocator,
     req: *http.Server.Request,
     rw: *http.Server.ResponseWriter,

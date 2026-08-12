@@ -12,670 +12,101 @@ semantic version.
 
 ## Unreleased
 
-The collection grew 77 → 224 modules since v0.1.0. Highlights, by area:
+The collection grew 77 → 224 modules since v0.1.0, spanning pairing/EC
+crypto, Bitcoin/Lightning, post-quantum, FHE/ZK/MPC, protocol security,
+distributed fabric and kernel/networking. Most of that growth is new
+modules with no history yet to record — their existence is what the
+77 → 224 count above already says. Only modules that changed after being
+introduced, or that carry an individually-named audit or performance
+finding, have a changelog file; everything else correctly has none.
 
-- **Pairing / elliptic-curve crypto:** the complete BLS12-381 arc (field tower,
-  pairing, RFC 9380 hash-to-curve, BLS signatures, KZG/EIP-4844, threshold) +
-  `bn254`, `bbs`, `coconut`, `tlock`, `ibe`; native `k256`/`p256` cores;
-  `ed448`/`decaf448`; `montint` big-integer Montgomery arithmetic.
-- **Bitcoin / Lightning:** `bip340` Schnorr, `taproot`, `musig2`, `frost`,
-  `adaptor`, `sphinx` (BOLT#4), `bolt3`, `bolt8` (Noise_XK) — byte-exact
-  against the BIP/BOLT vectors.
-- **Post-quantum:** `slhdsa` (FIPS 205), `falcon` (FN-DSA), `hqc`, `xmss`.
-- **FHE / ZK / MPC:** `bfv`, `tfhe`, `groth16`, `bulletproofs`, `paillier`,
-  `threshold_ecdsa`, `dkg`, `fss`, `vdf`, `ecvrf`.
-- **Protocol security:** `rsa`, `x509` path validation, `dnssec`, `ssh`
-  (client + server transport), `opcua` (full client incl. SecureChannel),
-  `dtls` 1.3 PSK, `quic-crypto` (RFC 9001), `tlsresume`, the `noise`
-  framework, `hpke`, `mls`, `signal`, `opaque`/`voprf`, `spake2plus`,
-  `ctap2pin`, `oscore`, `jwe`, `sealedbox`, `blindrsa`, `otp`.
-- **Fabric / distributed:** `netsim` (deterministic DES + VOPR harness),
-  `raft` (model-checked against the five safety properties), `spf-ect`,
-  `loopfree-reconv`, `df-elect`, `liveness-hyst`, `loopix`, `lockfree`
-  (MPMC queue + epoch reclamation), `ethfrag`, `kvtree` (COW B-tree).
-- **Kernel / networking:** `ebpf` + `xdp-classifier`, `tc` (netem),
-  `genetlink`, `wireguard`, `rawsock`, `stun`, `pping`, `sntp`, `dnp3`,
-  `snmp` (v3/USM auth), `coap`, `mqtt`, `modbus`.
-- **Performance campaign:** SIMD `chachapoly` (beats OpenSSL AVX2 keystream on
-  the reference host), asm/Montgomery cores under `k256`/`p256`/`montint`;
-  audited hot paths within ~≤3× of C peers; several constant-time leaks fixed.
-- **Security audit (collection-wide):** all CRIT/HIGH findings fixed — memory
-  safety in `dnssec`/`opcua`/`x509`/`stun`/`dnp3`, HTTP request-smuggling and
-  `validate` O(n²)-DoS hardening, `dtls` anti-replay window, `zipstream`/
-  `json5`/`mcp`/`csvsafe` fixes.
-- **Tooling/docs:** `zig build check-catalog` consistency gate (found + fixed
-  6 modules missing README catalog rows); versioning + spin-off policy
-  (`CONVENTIONS.md` §8); this changelog.
+### Modules with a changelog
 
-Per-module API changes since v0.1.0 worth calling out:
+Each entry below is a one-line pointer; the detail lives in the linked
+file. A `BREAKING` tag means the module's own changelog flags at least
+one breaking change in its `Unreleased` section.
 
-- **`grpc`** (new): a gRPC **client** over HTTP/2, per the `grpc-over-http2`
-  specification — the layer between the `http` module's multiplexing h2 client
-  and the `protobuf` codec, with no code generation (a method is a path, its
-  messages are Zig structs with a `pb_fields` descriptor). Length-Prefixed-
-  Message framing where "several messages in one DATA frame" and "one message
-  across many DATA frames" are both the normal case; Trailers-Only responses
-  detected as such (the common error path, and what hangs a client that only
-  looks for trailers after a body); status 0–16 as one Zig error per code with
-  the percent-encoded `grpc-message` decoded; `-bin` metadata base64-coded in
-  both directions; all four call shapes from one engine. The LPM length is read
-  from the wire, so the invariant is stronger than "check before allocating" —
-  *the declared length never sizes an allocation at all*, and
-  `max_recv_message_size` (4 MiB, gRPC's own default) is enforced the instant
-  the 5-byte header completes. Anchored live on Python `grpcio`: all four
-  shapes, a real Trailers-Only failure, metadata both ways, a deadline the
-  reference reads back, a 256 KiB reply reassembled across DATA frames — which
-  also makes it the first third-party HTTP/2 peer our h2 client has faced. 14
-  mutations run; three of them (little-endian length, compressed flag
-  misplaced, `-bin` sent raw) stay consistent between our framer and our parser
-  and so survive every self round trip, dying only to the reference. **Client
-  only**: `http`'s h2 server buffers each request to END_STREAM before dispatch
-  and stages the whole response before framing it, so three of the four call
-  shapes cannot be built on it today (`SPEC.md`).
-- **`tsdb`** (new): time-series persistence over `kvtree` — series identity,
-  append, streaming range scans, retention by age. Filed as a layer over `kv`;
-  that premise was wrong and was not followed. `kv` is a Bitcask log with an
-  unordered keydir and no cursor, and a time series is nothing but ordered
-  range scans, so `kvtree`'s COW B-tree (ordered `seek`/`next`, MVCC snapshots,
-  multi-key ACID) is the substrate instead. The module's foundation is one
-  identity — byte-lexicographic order over an encoded key equals logical
-  `(series, timestamp)` order — which forces fixed-width big-endian fields and
-  a flipped sign bit so pre-epoch timestamps sort below the epoch; it is
-  asserted as a property over random + boundary pairs rather than
-  round-tripped, because the strongest codec bug (little-endian on *both*
-  sides) round-trips perfectly and only an ordering assertion sees it. Series
-  ids come from an order-independent, length-prefixed (hence injective)
-  canonicalisation of `(name, labels)`, allocated with their forward index,
-  reverse index and counter in one transaction. Ranges are half-open
-  `[from, to)` and stream. Retention runs as bounded chunks, each ONE
-  transaction that both deletes ≤ N points and advances the durable resume
-  position — so an interrupted sweep is consistent, re-runnable to the same end
-  state, and never leaves the position ahead of the deletions it implies; a
-  changed cutoff restarts rather than resumes. v1 deliberately excludes sample
-  compression, rollups, a query language and aggregation (`SPEC.md` §9).
-- **`decimal`:** the two types can finally exchange values, and `BigDecimal`
-  covers the rest of the `java.math.BigDecimal` / GDA surface.
-  `Decimal.toBigDecimal` is exact and total (a `Decimal` *is* `raw × 10^-12`);
-  `Decimal.fromBigDecimal(allocator, b, mode)` is partial in two independent
-  ways and says so in the type — excess fractional digits are **rounded** with
-  the caller's mode, never truncated, and a magnitude past ±1.7e26 is
-  `error.Overflow` checked *after* the rounding, so rounding that creates the
-  overflow still errors. A value below half an ulp is a rounding decision, not
-  an error. Both the range and below-half-ulp cases are decided from the
-  coefficient's digit count *before* any power of ten is materialised, so
-  `1e2000000000` returns a clean error in constant time. New `BigDecimal`
-  operations: `remainder` (truncated-division remainder — sign of the
-  dividend, exponent `min(ea, eb)`), `min`/`max` (including GDA's rule for
-  resolving a numeric tie by exponent, which flips direction with the sign),
-  `precision`, `signum`, `scaleByPowerOfTen`, `stripTrailingZeros` (an **alias
-  of the existing `normalize`**, not a second implementation), `sqrt` and
-  `pow`. `sqrt` is *correctly rounded* to a caller-given significant-digit
-  count — an exact `⌊√N⌋` on a scaled radicand plus one exact integer
-  comparison against the half-way point, not Newton-until-it-stops-changing,
-  which is right to within an ulp and wrong at every rounding boundary — and
-  reproduces GDA's ideal exponent for exact roots (`√1.00 = 1.0`). `pow` is
-  integer-exponent-only (the `pow(int)` contract: exact, result exponent
-  `a.exponent × n`, negative exponents refused rather than silently wrong);
-  GDA's general `power` over non-integer exponents needs `exp`/`ln` on
-  bignums and is deliberately out of scope. `sqrt`/`pow` are the only
-  operations here that can make a value grow, so both check a new
-  `max_result_digits` (100,000) budget **before allocating** — power.decTest
-  really does contain exponent `1000000007`, and `1.1 ^ 1000000007` is a
-  ~10^8-digit number. Conformance is anchored on the IBM/Cowlishaw decTest
-  v2.62 suite: 279 remainder, 105 min, 105 max, 3268 square-root and 130
-  integer-power cases, extracted mechanically into `src/testdata/*.vec`, each
-  asserting the result's **exponent** as well as its digits (the scale is part
-  of the spec for all five ops), each file's header recording exactly which
-  source cases were skipped and under which rule.
+- [`bip340`](modules/bip340/CHANGELOG.md) — runtime-tag tagged hash,
+  `xonlyBytesOf`.
+- [`brotli`](modules/brotli/CHANGELOG.md) — encoder now actually
+  compresses (LZ77 + Huffman).
+- [`chachapoly`](modules/chachapoly/CHANGELOG.md) — SIMD implementation
+  (performance campaign).
+- [`csvsafe`](modules/csvsafe/CHANGELOG.md) — security-audit fix.
+- [`decimal`](modules/decimal/CHANGELOG.md) — `Decimal`/`BigDecimal`
+  interop, new `BigDecimal` ops.
+- [`dnp3`](modules/dnp3/CHANGELOG.md) — security-audit memory-safety fix.
+- [`dnssec`](modules/dnssec/CHANGELOG.md) — security-audit memory-safety
+  fix.
+- [`dtls`](modules/dtls/CHANGELOG.md) — **BREAKING** — HRR (both sides),
+  fragment reassembly, live wolfSSL interop, negotiated
+  `signature_algorithms`, anti-replay-window fix.
+- [`fss`](modules/fss/CHANGELOG.md) — **BREAKING** — default PRG swapped
+  to fixed-key AES-128; `evalFull` for `Dpf`/`Mpf`.
+- [`grpc`](modules/grpc/CHANGELOG.md) — new: gRPC client over HTTP/2.
+- [`hpke`](modules/hpke/CHANGELOG.md) — **BREAKING** — RFC 9180 Appendix A
+  vectors; PSK length floor.
+- [`http`](modules/http/CHANGELOG.md) — **BREAKING** header/trailer
+  bytes are copied (use-after-scope fix); new
+  `error.HeaderBytesExhausted`.
+- [`json5`](modules/json5/CHANGELOG.md) — security-audit fix.
+- [`k256`](modules/k256/CHANGELOG.md) — new `ecdsa_recover`; asm/Montgomery
+  core (performance campaign).
+- [`lninvoice`](modules/lninvoice/CHANGELOG.md) — ECDSA
+  sign/recover moved to `k256`, re-exported.
+- [`mcp`](modules/mcp/CHANGELOG.md) — server→client requests (sampling,
+  elicitation); JSON-RPC fixes; security-audit fix.
+- [`mcp-http`](modules/mcp-http/CHANGELOG.md) — transport half of `mcp`'s
+  server→client requests; `application/json` body fix.
+- [`megolm`](modules/megolm/CHANGELOG.md) — new: Matrix's Megolm group
+  ratchet.
+- [`minisign`](modules/minisign/CHANGELOG.md) — new: minisign file-format
+  sign/verify.
+- [`mls`](modules/mls/CHANGELOG.md) — external Commits (RFC 9420
+  §12.4.3.2).
+- [`montint`](modules/montint/CHANGELOG.md) — asm/Montgomery core
+  (performance campaign).
+- [`opcua`](modules/opcua/CHANGELOG.md) — security-audit memory-safety
+  fix.
+- [`p256`](modules/p256/CHANGELOG.md) — asm/Montgomery core (performance
+  campaign).
+- [`pir`](modules/pir/CHANGELOG.md) — malicious-server detection
+  (`Verified`); keyword lookup.
+- [`poseidon`](modules/poseidon/CHANGELOG.md) — new: Poseidon ZK-friendly
+  hash over `bn254`/`bls12_381`.
+- [`ramcache`](modules/ramcache/CHANGELOG.md) — new thread-safe `Sharded`
+  option.
+- [`rescue`](modules/rescue/CHANGELOG.md) — new: Rescue-Prime Optimized
+  over Goldilocks.
+- [`saml`](modules/saml/CHANGELOG.md) — **BREAKING** — cross-form
+  Holder-of-Key confirmation.
+- [`snmp`](modules/snmp/CHANGELOG.md) — **BREAKING** — library-generated
+  USM privacy salt.
+- [`stun`](modules/stun/CHANGELOG.md) — security-audit memory-safety fix.
+- [`threshold_ecdsa`](modules/threshold_ecdsa/CHANGELOG.md) —
+  **BREAKING** — Paillier generator bound into Fiat-Shamir transcript.
+- [`tsdb`](modules/tsdb/CHANGELOG.md) — new: time-series persistence over
+  `kvtree`.
+- [`validate`](modules/validate/CHANGELOG.md) — security-audit O(n²)-DoS
+  hardening.
+- [`x509`](modules/x509/CHANGELOG.md) — new `spkiOf`; security-audit
+  memory-safety fix.
+- [`zipstream`](modules/zipstream/CHANGELOG.md) — security-audit fix.
 
-- **`ramcache`:** a thread-safe option, `Sharded` — N independent `Cache`
-  instances, one lock each, picked by a hash of the key. `Cache` is unchanged
-  and stays `single_owner`/lock-free; the five modules that own one from a
-  single thread pay nothing. `Sharded` cannot mirror `Cache.get`, whose
-  returned slice borrows cache storage and would dangle the moment the lock
-  drops, so reads copy under the lock: `getBuf(key, …, buf)` into a
-  caller-supplied buffer (with a distinct `buffer_too_small` result, not a
-  fake miss) or `get` returning an allocator-owned copy freed with `free`.
-  The costs are stated rather than glossed: every piece of W-TinyLFU state is
-  per shard (each sketch sees ~1/N of the traffic), `max_bytes`/`max_entries`
-  are floor-divided so a hot shard evicts while a cold one has room and a
-  single value must fit `max_bytes / N`, and `stats`/`clear`/`drainDirty` walk
-  the shards one lock at a time and are therefore not atomic across them.
-  `on_evict` now fires from any thread with a shard lock held, so it must be
-  thread-safe and must not re-enter the cache; the same restriction on
-  `drainDirty`'s callback withdraws `Cache.drainDirty`'s allowance to call
-  `markClean` from inside it, and the async flusher's ack becomes
-  `markCleanIf(key, flushed)` — a compare-and-clear that will not ack a value
-  another thread has overwritten.
+### Collection-wide notes (belong to no single module)
 
-- **`http`:** response **trailers** — the write side, which was previously
-  documented as out of scope. `ResponseWriter.declareTrailers` +
-  `setTrailer` emit a trailer section after the terminating chunk on
-  HTTP/1.1 (RFC 9112 §7.1.2) and as a trailing HEADERS frame carrying
-  END_STREAM on HTTP/2 (RFC 9113 §8.1 — the last DATA frame therefore does
-  not carry it), from the same handler code. Declaring trailers commits the
-  response to chunked framing, so `Trailer` and `Content-Length` can never
-  coexist, and every framing that cannot carry a trailer section (HTTP/1.0
-  peer, declared `Content-Length`, HEAD/1xx/204/304) is a typed error at set
-  time rather than silently dropped output. Field policy is **deny-list ∧
-  allow-list**: the RFC 9110 §6.5.1 forbidden set (framing, routing, request
-  modifiers, auth, response control data, payload processing, plus
-  connection-specific fields, `Cookie`/`Set-Cookie` and any `:`
-  pseudo-header) is refused unconditionally, *and* a field must have been
-  advertised in `Trailer` first — unconstrained trailers are a
-  request-smuggling and cache-poisoning vector because intermediaries handle
-  them inconsistently. The h2 **read** gaps closed with it: request trailers
-  now reach the handler through the same `Request.trailer` surface as h1, and
-  `h2_client.Response.trailers`/`.trailer(name)` surfaces response trailers
-  (a trailer block containing pseudo-headers is dropped whole, §8.1). Anchored
-  against **live curl 8.18 / nghttp2 1.68** on both protocols
-  (`src/curl_interop.zig`), not only against our own client.
-
-- **`mcp` / `mcp-http`:** server→client requests — `sampling/createMessage`
-  and `elicitation/create`. Both are gated on the capabilities the client
-  declares at `initialize`, which are now *stored* (`Server.client_capabilities`,
-  all-false before a handshake, replaced wholesale on re-`initialize`) rather
-  than parsed and discarded. Because `handleMessage` owns no reader and the HTTP
-  transport receives the client's answer on a *separate POST*, the API is
-  issue-now / correlate-later: `sendSamplingRequest`/`sendElicitationRequest`
-  allocate a never-reused id, write one request line and register it pending;
-  `handleMessage` correlates the inbound response and invokes the registered
-  `ResponseHandler` (a tool that needs the answer is therefore two calls). No
-  handler ever blocks and no async runtime was added. Elicitation schemas are
-  validated against the spec's restricted JSON-Schema subset, and form-mode
-  schemas with credential-shaped fields are **refused** (`SchemaSensitiveField`)
-  — the spec's "MUST NOT ask for secrets" enforced rather than documented, with
-  URL mode as the sanctioned alternative. Request lines are pinned byte-for-byte
-  against the specification's own JSON examples. **Fixes:** a client's JSON-RPC
-  *response* previously hit the "Missing method" branch and got a `-32600` reply
-  (JSON-RPC forbids answering a response); `negotiateVersion` echoed the
-  caller's slice, which lives on the per-message arena; and `mcp-http`'s
-  `application/json` body concatenated every line the server wrote instead of
-  just the response. `mcp-http` also scopes correlation per session, so one
-  session's answer cannot resolve another's request.
-
-- **`brotli`:** the encoder now actually compresses. It was store-mode only
-  (ratio ~1.0); it now does LZ77 backward references plus a per-meta-block
-  Huffman code for literals, insert-and-copy commands and distances, with the
-  store path kept as an automatic per-block fallback whenever a compressed
-  block would not come out smaller. `alice29.txt` 152 089 -> 54 605 bytes
-  (2.8x), between reference `brotli` quality 1 and 5; incompressible input
-  costs the same as it does the reference. `compress` keeps its signature and
-  its "fails only on allocation, output is always a valid `br` body"
-  guarantee. Not implemented (each costing ratio): block splitting, literal
-  context modelling, static-dictionary references, `NPOSTFIX`/`NDIRECT`
-  tuning, and distance short codes. Validation is anchored on the reference
-  implementation rather than on this module's own decoder: `src/
-  reference_interop.zig` decompresses everything the encoder emits with
-  google/brotli (Python `brotli`) across a property sweep of input shapes, and
-  skips loudly when python3 or the package is missing.
-
-- **`dtls`:** handshake-message reassembly across `handleFlight` calls (RFC
-  9147 §5.2). A message split across datagrams — a certificate chain past
-  the path MTU, in practice — is now buffered and reassembled by
-  `fragment_offset` (never arrival order), tolerating out-of-order and
-  duplicate fragments; `error.FragmentedMessageUnsupported` is gone.
-  `HandshakeResult` gains `need_more_data` (defaulted, so existing
-  construction sites are unaffected): while a flight is incomplete the
-  connection is rolled back to its exact pre-call state, so a half-processed
-  flight never leaves the state machine, transcript, key schedule or
-  anti-replay windows half-advanced. The buffered bytes are unauthenticated
-  at handshake time, so the surface is capped: 4 KiB per flight
-  (`error.FlightTooLarge`), exactly one in-progress message
-  (`error.InterleavedFragments`), and a fragment contradicting bytes already
-  received is `error.OverlappingFragment` rather than overwriting them
-  (byte-identical re-delivery stays legal). `handshake.Reassembler` also
-  rejects a mid-message `msg_type` change (`error.InconsistentMessageType`).
-  Certificate mode is no longer self-interop only: the live wolfSSL suite
-  gains a PSK-less `.cert_dhe` handshake against a wolfSSL certificate
-  server, plus the same handshake at a 256-byte peer MTU so the peer's
-  Certificate really is fragmented. That found one more defect of the class
-  only a third party can find — the `.cert_dhe` ClientHello carried no
-  `supported_versions`, so a real DTLS 1.3 server negotiated 1.2.
-  Sending is still single-fragment.
-
-  HelloRetryRequest now works in `.cert_dhe` mode as well, including RFC 8446
-  §4.1.4's (EC)DHE half: a retry naming a different `supported_groups` group
-  is answered with a fresh `key_share` in THAT group, so `secp256r1` is now
-  a real key-exchange group (65-byte uncompressed SEC1 share, shared secret =
-  the X coordinate per RFC 8446 §7.4.2) rather than something advertised and
-  not implemented. `error.HelloRetryRequestUnsupported` no longer covers
-  cert-mode retries; new `error.UnsupportedGroup` (retry named a group we
-  never advertised) and `error.IllegalHelloRetryRequest` (retry named a group
-  we already offered a share in — the peer-driven retry loop; or a
-  ServerHello that switched cipher suite after the retry committed to one).
-  A cookie-only retry deliberately leaves the `key_share` byte-identical:
-  §4.1.2 permits no gratuitous change. Live-anchored against wolfSSL in three
-  shapes (cookie only, group change only, both), and the P-256 ECDH is
-  additionally KAT'd byte-exact against Python `cryptography`/OpenSSL.
-
-  Certificate mode's last two self-interop-only gaps are closed, both live:
-  a wolfSSL server configured with `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` now
-  verifies OUR client certificate (mutual auth), and a real wolfSSL
-  certificate client verifies the chain OUR server presents. The first of
-  those found a sixth wire defect of the same family as the five before it:
-  the client decoded a CertificateRequest's `signature_algorithms` with
-  `decodeU16ListExtension` into a fixed `[8]u16`, so a real peer's list
-  (wolfSSL sends 16) came back `error.TooManyExtensions` → `Malformed`. It
-  now filters to this side's own scheme table, exactly as the ClientHello
-  path already did.
-- **`x509`:** new `x509.spkiOf(certificate_der)` → `x509.Spki` — a
-  certificate's `SubjectPublicKeyInfo` (full TLV + algorithm OID + parameters
-  + key bits) extracted over the defensive `safe.zig` walk, never through
-  `std.crypto.Certificate.parse`. Every returned slice borrows the caller's
-  buffer. Works on RSASSA-PSS-signed certificates, which std cannot parse at
-  all. Adds `safe.oid_*` OID constants.
-- **`saml`:** Holder-of-Key subject confirmation now performs **cross-form**
-  matching (an `<ds:X509Certificate>` confirmation against a configured bare
-  `presented_holder_key`, and a `<ds:KeyValue>` confirmation against a
-  configured `presented_holder_cert_der`) over `x509.spkiOf`, comparing key
-  parameters — RSA modulus/exponent, P-256 affine point — never encodings.
-  **BREAKING (behavioral, not signature):** pairings that previously always
-  returned `error.HolderOfKeyCrossFormUnsupported` can now confirm a subject,
-  and that error's meaning narrows to "key material was named but none of it
-  could be reduced to a comparable key". Same-form matching, and every
-  non-HoK path, are unchanged. New sibling dependency: `x509`.
-- **`fss`: BREAKING — the default PRG is now fixed-key AES-128, which changes
-  the key bytes.** `Dpf`/`Mpf` were SHA-256; they are now `prg.Aes128Mmo`,
-  fixed-key AES in the Matyas–Meyer–Oseas shape with the Guo–Kolesnikov–
-  Rosulek–Roy σ pre-mix (`H_j(x) = AES_k(σ(x ⊕ j)) ⊕ σ(x ⊕ j)`, public fixed
-  key, control bit = the child block's low bit). Measured on the same host, in
-  the same binary: raw expansion **2.00 M/s → 71.8 M/s (36×)**, `Gen` **75.4 k
-  → 1.86 M keys/s (25×)**, full-domain `evalFull` **1.21 M → 30.3 M evals/s
-  (25×)** — more than the "~10×" it was scoped out with, because AES also
-  halves the primitive calls per node (one 128-bit block per child rather than
-  a 256-bit hash for 17 bytes) and the two children pipeline through one
-  `encryptWide`. σ rather than plain MMO because the construction feeds the PRG
-  XOR-correlated inputs by design, which is the setting GKRRR introduced σ for.
-  **What it did NOT buy: interop.** Fixed-key AES removes the primitive as an
-  obstacle to matching Google's DPF vectors, but not that library's own fixed
-  keys, tweak convention, value-correction scheme or protobuf key layout, and
-  there is no published vector file to match — so the module stays
-  self-defined, and the claim that this swap yields byte-exact external
-  agreement is **wrong** and is corrected in `SPEC.md`.
-  **The anchor survived, deliberately.** `Sha256Prg` was kept, not deleted:
-  `DpfWith` is one body of correction-word code shared by both instantiations,
-  so the recorded independent-re-derivation KAT vectors — stated over SHA-256 —
-  still pin that code byte-exact. No vector was regenerated or self-generated.
-  New, and genuinely external as far as it goes: the MMO step is pinned against
-  FIPS-197 Appendix B's AES-128 example, which anchors the AES call and
-  explicitly nothing above it.
-  **Key format.** Both PRGs give keys of the *same length* and different
-  contents, so an old key decodes silently and evaluates to garbage. `Dpf`/
-  `Mpf` gained `DpfWith`/`MpfWith` (PRG chosen explicitly), `Key.key_format`
-  (`"fss.dpf/aes128-mmo/v1"`), and a tagged STORAGE codec
-  `Key.toBytesTagged`/`fromBytesTagged` that rejects the other PRG's key with
-  `error.UnsupportedKeyFormat`. The wire codec `toBytes`/`fromBytes` is
-  unchanged and stays header-free — `pir` asserts a query share carries no
-  structurally-constant bytes, so a tag byte belongs in storage, not on the
-  wire, and on the wire the PRG is out-of-band geometry like `n`, `L`, `k`.
-  Removed: the free `prg.prg`/`prg.convert` functions (now
-  `prg.Aes128Mmo`/`prg.Sha256Prg` methods) — a compile error rather than a
-  silent change of function.
-  **Constant time**, closing the other scoped-out item: `Gen` and every
-  evaluator now drive the α path bit and the running control bit through
-  XOR-masked selects instead of branches. Remaining caveat, in the PRG and not
-  the tree — on targets without hardware AES std falls back to a mitigated but
-  not constant-time T-table; `prg.Aes128Mmo.constant_time` reports it and
-  `DpfWith(prg.Sha256Prg, …)` is the constant-time-everywhere choice.
-- **`fss`:** `Dpf.evalFull` / `evalFullWith` — one tree traversal that emits
-  every leaf, instead of re-walking the tree from the root per point. Cost
-  drops from `O(N log N)` PRG calls to `O(N)`: measured **570 ms → 52 ms**
-  (~10.9×) for a full 2^16 domain, matching the `(2n+1)/3` prediction. It
-  fills a **prefix**, not only a whole domain — `pir`'s server evaluates
-  `x < database.count()` and domains are routinely provisioned far larger
-  than the current record count, so a full-domain-only evaluator would have
-  been a regression for the common case. Subtrees past the requested prefix
-  are pruned **before** the PRG call, so an oversized domain costs nothing:
-  a 500-point prefix of a 2^20 domain is **5.1 ms → 0.36 ms**. The streaming
-  form exists because `pir` has no allocator and no runtime-sized scratch —
-  it lets the server fold each value into its accumulator as the walk
-  produces it, leaving `answer`/`answerSlices` signatures untouched.
-  `evalAll` is deliberately left naive, as a structurally independent
-  differential oracle. Both `pir`'s value channel and `Verified`'s tag
-  channel are wired to it.
-- **`fss`:** `Mpf.evalEachFullWith` / `evalFullWith` / `evalFull` — the
-  multi-point counterpart, and the interleaved walk the `Dpf.evalFull` entry
-  above recorded as the right answer for `Multi(k)`. ONE descent of the
-  domain prefix carries all `k` tree states side by side and emits every
-  instance's share at each index, instead of `k` per-point evaluations
-  (`k·N·n` PRG calls) or `k` separate prefix walks (which would have turned
-  one pass over the consumer's data into `k`). Cost per index drops from
-  `k·n` PRG calls to `~k`: measured **495 ms → 52 ms** (~9.5×) for a full
-  2^14 domain at `k=4`, and **43.1 ms → 3.0 ms** (~14×) for a 500-point
-  prefix of a 2^20 domain at `k=8`. Same construction, same keys, same
-  outputs — a traversal-order change only, with the sum-of-`k`-DPFs
-  construction and its `k·N` evaluation count untouched (the cuckoo/batch-code
-  alternative stays scoped out). `evalEach` stays naive as the differential
-  oracle, and the walk's index-range-only pruning keeps the emission sequence
-  a function of the prefix length alone.
-- **`pir`:** keyword lookup — `keywordIndex` / `queryKeyword`, also under
-  `Verified`. `queryKeyword` is literally `query(keywordIndex(kw), …)`, and
-  that is the point: the map is total, deterministic and unconditional
-  (`LE64(SHA-256(kw)[0..8])` masked to the domain — a mask, not a modulo, so
-  no reduction bias, since domains are powers of two), so **a query for a
-  missing keyword is byte- and shape-identical to one for a present
-  keyword**. Presence never enters the computation, so it cannot leave it.
-  That guarantee carries a caller obligation stated in the README and at the
-  call site, not buried in SPEC: **one lookup, one query, whatever comes
-  back**. A client that consults a local set and skips the query, or retries
-  on a mismatch, puts the presence bit back on the wire — a test demonstrates
-  exactly that wrapper's leak. Collisions are a **correctness** cost, never a
-  privacy one: two keywords may share a slot and the loser becomes a false
-  negative discovered locally, with the provisioning rule
-  `domain_bits >= 2·log2(N) + log2(1/eps) − 1` given for sizing. Under
-  `Verified`, a keyword whose slot lies past the database **rejects**, so
-  "absent" and "the server lied" are indistinguishable there — a deployment
-  wanting verifiable absence must materialise every slot. A published
-  key→index map was rejected because it needs the same always-query
-  discipline *plus* a distribution and freshness pipeline this
-  no-I/O module cannot provide; cuckoo/batch codes stay rejected, and would
-  compose above this layer rather than replace it.
-- **`pir`:** malicious-server detection (`Verified(...)`). The module's model
-  was honest-but-curious: a server learned nothing about the index but was
-  assumed to answer honestly, so a doctored share made the client silently
-  reconstruct a wrong record. It now runs a second DPF for the same index
-  whose payload is a **client-secret odd scalar `m`**, so the tag answer is
-  `m·word` by the protocol's own linearity, checked in a widened ring
-  (SPDZ2k-style) together with a presence word. No new dependency: the tag
-  key is one more DPF key under the same hiding.
-  The security statement, stated exactly because over-claiming here would be
-  worse than not building it: **detection, not robustness** — the client
-  aborts with `error.AnswerRejected`, does not recover the record and cannot
-  say which server lied. Any record-changing deviation by ONE server (or by
-  both, if they do not pool keys) is caught except with probability
-  `≤ 2^(1−8S) + Adv_PRG`, a function of `tag_slack_bytes` alone (2^−63 at the
-  default). **Colluding servers forge undetectably** — the same full-domain
-  scan that recovers the index recovers `m` — and **two servers holding the
-  same wrong database are accepted**, since the MAC binds to the servers'
-  common data rather than to a published digest. Both are asserted as
-  `ATTACK NOT CAUGHT` tests, not left implicit. Privacy is unchanged, and the
-  abort verdict is index-independent, so the check adds no selective-failure
-  oracle. `S = 0` is a `@compileError`: in the un-widened ring
-  `m·2^(8L−1) = 2^(8L−1)` for every odd `m`, so a top-bit forgery would pass
-  with probability 1. Querying past the database now **rejects** rather than
-  reconstructing to zero, because an honest all-zero answer is
-  indistinguishable from the coordinated-zeroing forgery the presence word
-  exists to stop. Authenticated PIR against a published digest (Colombo et
-  al.) is the composable upgrade and is named as such; cross-checking by
-  repetition was rejected outright, since a server adding the same constant
-  every time produces identical wrong reconstructions.
-- **`rescue`:** new module — Rescue-Prime Optimized (RPO) over Goldilocks
-  `p = 2^64 − 2^32 + 1`, at both published instances (`m = 12`, `m = 16`),
-  both sponge framings that exist upstream, and the paper's round order as a
-  separate permutation. The sibling to `poseidon`: same motivation (cheap
-  inside a circuit), opposite trade — Rescue alternates `x^α` with `x^(1/α)`,
-  which is far more expensive in software and cheaper to prove. Measured
-  here: the inverse S-box layer is **15× the forward one and 76% of the whole
-  permutation**; hashing 512 bytes costs 61× SHA-256. The field lives inside
-  the module (~240 lines, canonical, branch-free) rather than becoming a new
-  general-purpose module.
-  **The variant was chosen on anchoring, not deployment**: plain Rescue-Prime's
-  reference implementation publishes **no** test vectors, while RPO publishes
-  38. Constants are derived (SHAKE256) and pinned element-by-element against
-  miden-crypto's embedded values; `1/α` is computed and checked three ways,
-  including replaying its 72-multiply addition chain symbolically over
-  exponents. Three upstream divergences are documented rather than smoothed
-  over: miden-crypto changed its state layout in a `[BREAKING]` PR so every
-  digest changed (a single-value test tells the corpora apart); the two RPO
-  sponges disagree on padding, capacity placement and the empty input, so
-  both ship with a test asserting they never collide; and **Winterfell's
-  Rescue-XLIX round constants could not be re-derived** from the generator
-  its own comment cites, so that one table is an honestly-labelled embedded
-  blob pinned by file digest plus the published KAT — while the same
-  generator reproduces miden's RPO tables exactly. Constant-time throughout
-  (the inverse S-box is a fixed addition chain, not a ladder), not
-  disassembly-verified. Byte-level hashing is grade-2 anchored: no upstream
-  byte KAT exists anywhere in miden-crypto.
-- **`megolm`:** new module — Matrix's Megolm group ratchet, the third
-  real-world group-messaging construction here alongside `signal` (pairwise
-  Double Ratchet) and `mls` (RFC 9420). A one-way four-part HMAC-SHA-256 hash
-  ratchet that fast-forwards to any future index but never rewinds, plus
-  Ed25519 signatures over the message frame; `OutboundSession` /
-  `InboundGroupSession` and the exact session-sharing, session-export and
-  message wire formats. The cipher is not a choice: the spec mandates
-  AES-256-CBC/PKCS#7 + HMAC-SHA-256 truncated to 8 bytes, taken from the
-  sibling `aescbc`. `decrypt` separates four failure causes into distinct
-  typed errors (`InvalidSignature`, `MessageIndexTooOld`, `InvalidMac`,
-  `InvalidPadding`) and verifies signature → MAC → padding in that order, so
-  the padding check is unreachable without a valid MAC. Byte-exact against
-  libolm's own `test_megolm.cpp` ratchet vectors — including the 2^24/2^16/2^8
-  boundary crossings and the 32-bit counter wraparound — and a real
-  libolm-produced session-key + message pair from `test_group_session.cpp`,
-  independently re-derived end to end with a separate Python toolchain
-  (PyNaCl + `cryptography` + stdlib `hmac`) as a non-libolm cross-check. The
-  ratchet advance is a cascade, not a per-part rehash: crossing a boundary
-  rehashes the crossed part and everything to its right **from the same
-  pre-update value** — implementing it as an independent per-part rehash
-  still round-trips, and is caught only by a boundary-crossing vector. Olm,
-  the Matrix event-JSON layer and key backup are out of scope.
-- **`poseidon`:** new module — the Poseidon ZK-friendly hash over `bn254`
-  (circomlib's parameters, `t = 2..17`) and `bls12_381` (the authors'
-  `poseidonperm_x5_255_{3,5}`). `groth16` and `bulletproofs` had no hash that
-  is cheap *inside* a circuit, which left the ZK domain half-covered: SHA-256
-  costs tens of thousands of constraints where Poseidon costs a few hundred.
-  Field arithmetic is reused unchanged from the sibling curve modules.
-  Round constants and MDS matrices are **derived** by a port of the authors'
-  Grain-LFSR generator rather than embedded (~700 KB of hex avoided), and
-  pinned by SHA-256 digests over the upstream constant files so a generator
-  drift is distinguishable from a permutation bug. Anchored byte-exactly
-  against the authors' own `hadeshash` `test_vectors.txt` (all four GF(p)
-  instances, every output word), circomlibjs's published known answers, and a
-  full `t = 2..17` sweep produced by *executing* circomlibjs's reference and
-  optimized implementations and requiring them to agree.
-  Two deployment realities are followed over the paper and documented:
-  circomlib rounds `R_P` up to a multiple of `t`, and it ships Poseidon twice
-  (a folded/optimized form storing the MDS transposed, and the reference
-  form) — this implements the reference form, byte-compatible with both.
-  The generator's MDS subspace-trail security checks
-  (`algorithm_1/2/3` + `check_minpoly_condition`, Grassi-Rechberger-Schofnegger)
-  and the rejection loop around them are now implemented too, on a small
-  `GF(p)` linear-algebra + polynomial layer built for the purpose
-  (`src/linalg.zig`: echelon/rank/kernel, characteristic and order polynomials,
-  pseudo-remainder gcd, Rabin irreducibility, base-field root isolation — all
-  division-free on the hot path, because a field inversion here is ~380
-  multiplications). This **removes the boundary** the module used to carry:
-  `grain.derive` no longer needs a sage run alongside to be trusted on a new
-  `(n, t, R_F, R_P)`. No shipped table changed — all 18 accept their first
-  candidate, now an assertion rather than prose. A rejection is not a no-op
-  (it consumes another `2t` Grain draws, shifting everything after it), and
-  since a 254-bit field rejects with probability ~`2^-236` — zero rejections
-  in a sweep of 816 BN254 parameter sets — that path is exercised over a small
-  prime, where a third of candidates are rejected, and cross-checked against an
-  independent sympy port of the same sage source on the verdict, the sub-code
-  and the failing round. Two provable `O(t^5)` → `O(t^3)` rewrites make it
-  affordable; both ship next to the literal transcription they are tested
-  against. The permutation is constant-time
-  (fixed bounds, no data-dependent branch or index) but not
-  disassembly-verified, unlike `k256`/`montint`; parameter derivation is not
-  constant-time and consumes only public inputs. On BLS12-381 only the
-  permutation is anchored — the `hash`/`compress` framing has no deployed
-  counterpart on that field and differs from `neptune`/dusk/arkworks, which
-  is flagged at the call site. Variable-length sponge, Poseidon2 and
-  Rescue/Rescue-Prime are out of scope; Rescue is named as the follow-up.
-- **`mls`:** external Commits (RFC 9420 §12.4.3.2) — joining a group **without
-  an invitation**. Until now the only way in was a Welcome, which requires an
-  existing member to have added you; an external Commit lets a newcomer join
-  from a published `GroupInfo` alone. New `Group.joinByExternalCommit`
-  (sender) and a `new_member_commit` branch through `processCommit`
-  (receiver), plus `tree.RatchetTree.assignBlankLeaf` — the leftmost blank
-  leaf, expanding right per §7.7 when there is none, which is the one step
-  sender and receiver must compute identically and independently.
-  `createCommit` is now a wrapper over a shared `commitInner`, so the regular
-  and external paths cannot drift apart. §12.2's second validation procedure
-  is a genuine whitelist (exactly one ExternalInit, at most one Remove, PSKs,
-  nothing else) rather than the regular Commit's blacklist, and §8.3's
-  external `init_secret` replaces the previous epoch's on both sides.
-  Two receiver-enforced rules live in §12.4.3.2 rather than §12.2 and are
-  easy to miss when building the whitelist from §12.2 alone: "the Commit MUST
-  NOT include any proposals by reference" (`error.ProposalByReference
-  InExternalCommit`) and "External Commits MUST contain a path field"
-  (`error.ExternalCommitRequiresPath`). The second coincides with §12.4's
-  `needs_path` today but is independent of it, and only the path rule is
-  unconditional — so the distinct error is pinned by its own test, or the
-  unconditional rule would quietly become an accident of proposal typing.
-  **There is no upstream external-Commit test vector**, so this lands
-  round-trip-anchored: a stranger joins from a published `GroupInfo`, every
-  existing member processes the Commit, all three reach the same
-  `epoch_authenticator` by opposite halves of §8.3, and the newcomer then
-  commits again. Reject tests **re-sign** a real external Commit with the
-  joiner's own key after spoiling it, which is what an attacker can actually
-  do — §6.1 verifies a `new_member_commit` with the key carried inside the
-  message — so they reach §12.4.2's validation rather than failing earlier on
-  the signature. Not covered: resumption PSKs in an external join
-  (`error.PskNotAvailable` — there is no history to resolve against), and
-  resync where the receiver is the member being removed.
-- **`dtls`:** **serving** a HelloRetryRequest — RFC 9147 §5.1's stateless
-  return-routability check, the other half of the exchange. Until now this
-  module's server answered a first ClientHello with a full flight, which
-  §5.1 names as an amplification vector: forge a victim's source address,
-  send a small ClientHello, and the server sprays a much larger flight at the
-  victim. New `Config.hello_retry` (`HelloRetryConfig`) turns the check on;
-  `null` (the default) keeps every existing caller byte-for-byte unchanged,
-  though it is **not** the posture §5.1 recommends for anything
-  internet-facing.
-  A cookie-less ClientHello now gets a HelloRetryRequest and the server keeps
-  **nothing** — no transcript, no state transition, no cached flight, and no
-  PSK-binder verification, so an unverified address costs one HMAC rather
-  than a flight or a key schedule. ClientHello2 is finished by a *brand-new*
-  `Connection` reconstructing everything from the cookie: RFC 8446 §4.4.1's
-  `message_hash` rewrite plus a byte-exact re-encoding of the server's own
-  HelloRetryRequest. The cookie is
-  `HMAC-SHA256(cookie_secret, label || peer_binding || version ||
-  cipher_suite || Hash(ClientHello1))`, checked with
-  `std.crypto.timing_safe.eql`; the new `error.CookieVerifyFailed` covers
-  every rejection cause without distinguishing them.
-  `HelloRetryConfig.peer_binding` is **caller-supplied** because the module
-  never touches a socket — the peer's address is an input, like
-  `Config.now_sec` and the `std.Random` arguments — and an empty one is
-  `error.EmptyPeerBinding` rather than a documented footgun, since a cookie
-  bound to nothing verifies from anywhere while still looking like a cookie.
-  Proven against a stock wolfSSL client, with the test structured so that
-  statelessness is what makes it pass. **Behavioral fix on the way through:**
-  the ServerHello no longer echoes the client's `legacy_session_id` — RFC
-  9147 §5 forbids it ("DTLS servers MUST NOT echo the 'legacy_session_id'
-  value from the client"; DTLS has no TLS 1.3 compatibility mode). No DTLS
-  1.3 peer is affected, since such a client sends a zero-length one.
-- **`dtls`:** HelloRetryRequest (RFC 8446 §4.1.4 / RFC 9147 §5.3), client
-  side. A stock DTLS 1.3 server answers the first ClientHello with a cookie
-  and refuses to proceed until it comes back — return-routability without
-  server state — so until now this module could not complete a handshake
-  against a default-configured peer at all. `handleFlight` on a client now
-  answers an HRR with ClientHello2: the cookie echoed, ClientHello1's
-  `random` reused (RFC 8446 §4.1.2 does not list it among the permitted
-  changes), a fresh binder, and a new `message_seq` (it is a new message,
-  not a retransmission). A second HRR is refused (§4.1.4) so a server cannot
-  hold a client in a retry loop. New `Transcript.resetToMessageHash`
-  implements §4.4.1's rewrite — ClientHello1 is replaced by a synthetic
-  `message_hash` message carrying its hash, which is what lets a stateless
-  server rebuild the transcript from its own cookie. Proven against a
-  default-configured wolfSSL server (`server-hrr` peer mode), and the test
-  asserts the retry actually happened rather than trusting the peer to send
-  one. The rewrite is exactly the kind of thing only a live peer can check:
-  replacing it with the naive "CH1 || HRR || CH2" leaves every self-interop
-  test green and fails only the live test. (Serving an HRR was still missing
-  at this point; the entry above closes that half.)
-  `error.HelloRetryRequestUnsupported` narrows to the two cases that remain
-  (an HRR in `.cert_dhe` mode, or one carrying nothing to change). New
-  `Connection.sawHelloRetryRequest`.
-- **`dtls`:** live third-party interop, and the four wire defects it exposed.
-  `src/wolfssl_interop.zig` runs a real DTLS 1.3 PSK handshake over loopback
-  UDP against **wolfSSL 5.9.1** in both roles (our client vs its server, our
-  server vs its client), each with an application-data round trip; the peer
-  is a small C program embedded in the test and compiled by `cc` at test
-  time, skipping loudly when `cc` or wolfSSL is absent. Everything before
-  this was self-interop, which by construction cannot catch a misreading
-  both sides share — and four such defects were live:
-  **(1)** the ClientHello omitted DTLS's `legacy_cookie` field entirely (RFC
-  9147 §5.3 keeps it, present and empty); **(2)** the PSK binder was computed
-  over a transcript two bytes too long — RFC 8446 §4.2.11.2 truncates before
-  the binders *list*, whose own 2-byte length prefix was being left in;
-  **(3)** neither Hello carried `supported_versions`, so nothing on the wire
-  ever said DTLS 1.3; **(4)** the server sent no RFC 9147 §7 ACK for the
-  client's final flight — the one flight §7.1 excludes from implicit
-  acknowledgement — leaving a conforming client blocked forever.
-  **BREAKING (wire):** (1)–(4) all change the bytes this module sends and the
-  transcript it hashes, so a peer built from an older revision no longer
-  interoperates with this one; the binder change in particular makes the
-  mismatch surface as a handshake failure, not silent corruption. **BREAKING
-  (API):** `SendError` gains `ReceivedAck` and `ReceivedPostHandshakeMessage`
-  — `recv` used to call an ACK or a NewSessionTicket `error.Malformed`, and
-  a real peer sends both on the application epoch. `HandshakeError` gains
-  `VersionNotNegotiated`/`UnsupportedVersion`: the client now *requires*
-  `supported_versions` in the ServerHello and rejects any selection other
-  than DTLS 1.3, which is a downgrade guard, not only a compatibility fix.
-  Separately, a peer's `signature_algorithms` list is now filtered against
-  the schemes this module can select (new `messages.filterU16ListExtension`)
-  instead of being decoded whole into a `[8]u16` — wolfSSL advertises 18 and
-  OpenSSL a similar number, so every real client was being rejected with
-  `error.Malformed`. Documented in `SPEC.md`, including the correction that
-  its own oracle ranking was wrong: OpenSSL 3.5.5 and GnuTLS 3.8.12 have no
-  DTLS 1.3 at all, which is why "no peer exists" sat in the backlog until
-  someone checked what was installable.
-- **`dtls`:** `signature_algorithms` is now genuinely negotiated instead of
-  advertised-and-ignored. New `Config.signature_algorithms` drives both what
-  this side offers and what it will accept; the scheme used to sign
-  CertificateVerify is chosen from peer-advertised ∩ self-permitted ∩
-  key-producible. A peer signing with a scheme we never advertised is
-  rejected (`error.SignatureSchemeNotAdvertised`); an empty intersection
-  fails the handshake (`error.NoSignatureSchemeOverlap`). The PSK-mode
-  ClientHello now advertises the extension at all (RFC 8446 §9.2 makes it
-  mandatory; it was omitted), and the server's `CertificateRequest` carries
-  it. **BREAKING:** `CertConfig.signature_scheme` is removed — the scheme is
-  negotiated, no longer configured. New `certverify.candidateSchemes`.
-- **`snmp`:** the USM privacy salt (`msgPrivacyParameters`) is now generated by
-  the library instead of being a caller obligation. **BREAKING:**
-  `priv.encrypt` no longer takes a salt — it takes a `priv.SaltSource` and
-  returns `priv.Encrypted { ciphertext, salt }`, the salt being an *output* for
-  the USM header. The default `SaltSource.counter(seed)` is a never-repeating
-  counter shaped per RFC 3826 §3.3.1 (AES) / RFC 3414 §8.1.1.1 (DES), so no
-  call shape can repeat a salt on live traffic; pinning one for a published KAT
-  or a captured datagram is the explicit opt-in `SaltSource.fixedForInterop`.
-  New errors `error.SaltReuse` (an IV identical to the immediately preceding
-  one — an adjacent-repeat tripwire, not full history) and
-  `error.SaltExhausted` (DES has only 2^32 salts per `snmpEngineBoots` epoch;
-  it refuses rather than wrapping). **BREAKING:** `V3Client.Options.initial_salt`
-  is now `?u64`, defaulting to `null` = seed the counter from the engine's
-  discovered `engineBoots‖engineTime`, so a client restart does not resume the
-  counter from a fixed constant. `priv.decrypt` is unchanged (its salt comes off
-  the wire). Scope and limits documented in `modules/snmp/SPEC.md`.
-- **`hpke`:** `mode_psk`, `mode_auth` and `mode_auth_psk` are now anchored to
-  RFC 9180's own Appendix A vectors (A.1.2/3/4 for X25519, A.3.2/3/4 for
-  P-256) instead of only to this module's round-trip; the implementations
-  needed no correction. New single-shot wrappers `sealPsk`/`openPsk`,
-  `sealAuth`/`openAuth`, `sealAuthPsk`/`openAuthPsk` alongside the existing
-  `sealBase`/`openBase`. **BREAKING (behavioral):** a psk-bearing mode now
-  rejects a PSK shorter than `Nh` with `error.PskTooShort` — deliberately
-  stricter than the RFC's `VerifyPSKInputs` pseudocode, on the grounds that
-  §5.1.2's "MUST have at least 32 bytes of entropy" cannot hold for a PSK
-  shorter than 32 bytes, and length is the only checkable projection of that
-  requirement. Appendix A's own PSK vectors satisfy the floor.
-- **`k256`:** new `k256.ecdsa_recover` — RFC 6979 deterministic-nonce ECDSA
-  signing and public-key recovery (`Q = r⁻¹(sR − eG)`), moved here from
-  `lninvoice`, which had implemented them locally because `k256` shipped only
-  Schnorr and ECDSA *verify*. `lninvoice` re-exports them, so its callers are
-  unaffected; the algorithm is unchanged.
-- **`bip340`:** new `taggedHashRuntime`/`taggedHasherRuntime` — the BIP-340
-  tagged hash with a **runtime** tag assembled from parts, for callers whose
-  tag is not comptime-known (BOLT#12's nonce leaf, BIP-341 leaf hashes). The
-  comptime `taggedHash`/`taggedHasher` remain the fast path. New
-  `xonlyBytesOf` (33-byte compressed → 32-byte x-only), also moved out of
-  `lninvoice`.
-- **`minisign`:** new module — sign/verify in the minisign file format over
-  Ed25519, both legacy (`Ed`) and prehashed-BLAKE2b (`ED`), including
-  scrypt-encrypted secret keys and the trusted-comment global signature.
-  Byte-exact against artifacts produced by the reference `minisign` binary.
-- **`threshold_ecdsa`:** the GG18 Appendix-A Fiat-Shamir transcripts now bind
-  the Paillier **generator** `Γ`, not only the modulus `N` (audit F3 — an
-  unbound public value in the verification equation is a value a prover can
-  still vary after the challenge is fixed). A companion fail-closed check,
-  `root.paillierGeneratorIsStandard`, rejects any received Paillier key whose
-  `Γ != N+1` at every prove and verify entry point, alongside the existing
-  F1/F2 gates. **BREAKING (wire):** absorbing a new value changes every
-  challenge, so proofs minted before this change do not verify after it; the
-  three Fiat-Shamir domain tags were bumped `…/v1` → `…/v2` so the break
-  surfaces as a plain verification failure. No interop is affected — these
-  proofs were never byte-compatible with any other implementation.
+- **Security audit:** all CRIT/HIGH findings from a collection-wide audit
+  were fixed. Findings named for a specific module are indexed above and
+  detailed in that module's own changelog; this line is the pointer for
+  the audit as a whole.
+- **Performance campaign:** in addition to the per-module wins indexed
+  above, audited hot paths across the collection landed within ~≤3× of C
+  peers, and several constant-time leaks were fixed, in modules not
+  individually named for either.
+- **Tooling:** `zig build check-catalog` consistency gate added (found
+  and fixed 6 modules missing README catalog rows).
+- **Policy:** dated-tag versioning + spin-off policy adopted
+  (`CONVENTIONS.md` §8); this changelog split is one product of it.
 
 ## v0.1.0 — 2026-07-10
 

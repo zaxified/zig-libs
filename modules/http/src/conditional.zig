@@ -197,13 +197,16 @@ pub fn ifRangeAllows(req: *const Server.Request, v: Validators) bool {
 /// returns `false` (the handler writes the body). The server core drops the
 /// body of a 304 automatically.
 ///
-/// Only `ETag` is auto-emitted: the response writer stores header value
-/// slices without copying, and `v.etag` is caller-owned so it outlives the
-/// response. `Last-Modified` fully participates in the request-side
-/// evaluation (`If-Modified-Since` / `If-Unmodified-Since`) but is NOT
-/// auto-emitted — a formatted date would live in a dangling local buffer.
-/// Handlers that want `Last-Modified` on the wire set it themselves from
-/// stable memory (`Server.formatHttpDate` into a caller-kept buffer).
+/// Only `ETag` is auto-emitted. `setHeader` copies its `value` bytes into the
+/// writer's own `header_buf` at call time, so `v.etag` needs to be valid only
+/// for the call `apply` makes with it — which a caller-owned slice trivially
+/// is. `Last-Modified` fully participates in the request-side evaluation
+/// (`If-Modified-Since` / `If-Unmodified-Since`) but is NOT auto-emitted —
+/// not because of any dangling-buffer risk (a local buffer formatted right
+/// here would be exactly as safe as `v.etag` is), but because `v.last_modified`
+/// is a timestamp, not formatted text, and `apply` does not do that
+/// formatting for its caller. Handlers that want `Last-Modified` on the wire
+/// format it themselves (`Server.formatHttpDate`) and set it themselves.
 ///
 /// Header emission can only fail if the head was already sent or the table is
 /// full (`SetHeaderError`) — call this before writing the body.

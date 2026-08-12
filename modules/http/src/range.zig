@@ -310,12 +310,6 @@ pub const Applied = struct {
     ranges: []const ResolvedRange,
 };
 
-// Stable backing for the computed `Content-Range` value: `setHeader` stores the
-// slice WITHOUT copying, so a computed header needs memory that outlives the
-// call. Per-thread, overwritten on the next `apply` on this thread (one request
-// is handled to completion per thread, as in `requestid`).
-threadlocal var content_range_buf: [72]u8 = undefined;
-
 /// Read the request's `Range` header, resolve it against `total`, and stage the
 /// 206 / 416 response line + headers — the one-call server integration.
 ///
@@ -339,6 +333,9 @@ pub fn apply(
     const specs = parse(raw, &specbuf) catch return .{ .outcome = .no_range, .ranges = &.{} };
 
     const ranges = resolve(specs, total, out);
+    // Local, not thread-local: setHeader copies the bytes into its own
+    // header_buf at call time, so this only has to outlive the call below.
+    var content_range_buf: [72]u8 = undefined;
     if (ranges.len == 0) {
         // Every range unsatisfiable → 416 with the unsatisfied-range Content-Range.
         rw.setStatus(416);
@@ -397,11 +394,11 @@ pub const MultipartRanges = struct {
 
     /// Set the response `Content-Type: multipart/byteranges; boundary=<boundary>`
     /// header safely — the value is kept in per-thread stable storage. Prefer
-    /// this to `contentType`: `setHeader` stores the value slice WITHOUT copying,
-    /// and the response head is emitted only after the handler returns, so a
-    /// handler-local stack buffer would dangle (Debug may survive it; ReleaseFast
-    /// reuses the slot → a corrupted header). `error.BoundaryTooLong` if the
-    /// boundary exceeds the RFC 2046 §5.1.1 limit of 70 characters.
+    /// this to `contentType`: `setHeader` copies the value bytes into its own
+    /// header_buf at call time, so `ct_header_buf` only needs to be valid for
+    /// this call, but a stable per-thread buffer means callers never have to
+    /// think about that. `error.BoundaryTooLong` if the boundary exceeds the
+    /// RFC 2046 §5.1.1 limit of 70 characters.
     pub fn setContentType(
         self: MultipartRanges,
         rw: *Server.ResponseWriter,
@@ -412,11 +409,14 @@ pub const MultipartRanges = struct {
 
     /// The response `Content-Type` header VALUE:
     /// `multipart/byteranges; boundary=<boundary>`. Written into `buf`, which
-    /// **must outlive the response** — `setHeader` does not copy, and the head is
-    /// emitted after the handler returns (see `setContentType`, which handles the
-    /// lifetime for you; use this only when you own long-lived storage, e.g. a
-    /// streaming responder). Returns `error.BufferTooSmall` when `buf` is shorter
-    /// than `ct_prefix.len + boundary.len`.
+    /// only needs to stay valid up to (and including) the `setHeader` call the
+    /// caller makes with the returned slice — `setHeader` copies it into its
+    /// own storage at call time (see `setContentType`, which uses a
+    /// ready-made stable buffer so callers don't have to think about this;
+    /// use this lower-level form when you want the value without setting the
+    /// header, e.g. to size something else first). Returns
+    /// `error.BufferTooSmall` when `buf` is shorter than `ct_prefix.len +
+    /// boundary.len`.
     pub fn contentType(self: MultipartRanges, buf: []u8) error{BufferTooSmall}![]const u8 {
         var fw = std.Io.Writer.fixed(buf);
         fw.writeAll(ct_prefix) catch return error.BufferTooSmall;
@@ -490,7 +490,8 @@ pub const MultipartRanges = struct {
 // Per-thread stable storage for the multipart Content-Type header value (see
 // `MultipartRanges.setContentType`). Sized for the fixed prefix + the RFC 2046
 // §5.1.1 maximum boundary length (70). One response is served per thread, so a
-// single buffer per thread suffices, as with `apply`'s `content_range_buf`.
+// single buffer per thread suffices (not load-bearing for correctness since
+// `setHeader` copies at call time — kept for caller convenience only).
 threadlocal var ct_header_buf: [MultipartRanges.ct_prefix.len + 70]u8 = undefined;
 
 /// Decimal length of `bytes s-e/total` (the `Content-Range` value for a resolved

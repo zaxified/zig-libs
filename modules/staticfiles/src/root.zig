@@ -498,7 +498,12 @@ pub const Handler = struct {
     fn sendFile(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter, opened: *Opened) Writer.Error!void {
         const total = opened.stat.size;
         const mtime_s = opened.stat.mtime.toSeconds();
-        const etag = buildETag(total, mtime_s);
+        // Locals, not thread-locals: setHeader copies the bytes into its own
+        // header_buf at call time, so these only need to outlive the calls
+        // below, not the response.
+        var etag_buf: [etag_max]u8 = undefined;
+        var lastmod_buf: [http.Server.http_date_len]u8 = undefined;
+        const etag = buildETag(&etag_buf, total, mtime_s);
 
         // Validators first, so a 304/412 short-circuit carries ETag +
         // Last-Modified + Cache-Control (and nothing representation-specific).
@@ -618,25 +623,32 @@ pub fn httpHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) a
 
 // ── response helpers ─────────────────────────────────────────────────────────
 
-// One request is served to completion per thread (as throughout the http
-// stack), so per-thread scratch for the computed header values that the
-// response writer stores WITHOUT copying (and emits after the handler returns)
-// is safe — the same pattern as `http.range`'s content_range_buf.
-threadlocal var etag_buf: [48]u8 = undefined;
-threadlocal var lastmod_buf: [http.Server.http_date_len]u8 = undefined;
-threadlocal var clen_buf: [24]u8 = undefined;
+/// A strong `ETag` from size + mtime: `"<size:x>-<mtime:x>"`, written into
+/// `buf` (the caller's — `setHeader` copies at call time, so `buf` only has
+/// to outlive the calls made with the returned slice, not the response).
+/// Cheap (no file read) and changes on any content edit that moves size or
+/// mtime. Documented alternative (content hash) is intentionally not the
+/// default — see SPEC.md.
+/// Widest `"{x}-{x}"` this can produce: two quotes, a separator, and two u64s
+/// at 16 hex digits each. DERIVED rather than picked, because `bufPrint`'s
+/// failure here is `catch unreachable` — a buffer one byte short would not be
+/// an error, it would be a crash on the first large file. It was a bare 48
+/// until 2026-08-12, which happened to be enough; shrinking it to 24 broke no
+/// test, since nothing exercised a size or mtime big enough to need the room.
+const etag_max = 2 + 1 + 2 * 16;
 
-/// A strong `ETag` from size + mtime: `"<size:x>-<mtime:x>"`. Cheap (no file
-/// read) and changes on any content edit that moves size or mtime. Documented
-/// alternative (content hash) is intentionally not the default — see SPEC.md.
-fn buildETag(size: u64, mtime_s: i64) []const u8 {
+fn buildETag(buf: *[etag_max]u8, size: u64, mtime_s: i64) []const u8 {
     const m: u64 = if (mtime_s < 0) 0 else @intCast(mtime_s);
-    return std.fmt.bufPrint(&etag_buf, "\"{x}-{x}\"", .{ size, m }) catch unreachable;
+    return std.fmt.bufPrint(buf, "\"{x}-{x}\"", .{ size, m }) catch unreachable;
 }
 
-/// Content-Length is consumed immediately by the writer (parsed into an
-/// integer, slice not retained), so a fresh threadlocal buffer is fine.
+/// Content-Length is both consumed immediately by `setHeader` (parsed into an
+/// integer, not retained) and copied at call time for every other header, so
+/// a function-local buffer is fine either way.
 fn setContentLength(rw: *http.Server.ResponseWriter, n: u64) void {
+    // 20 digits is the widest decimal u64; same reasoning as `etag_max`, same
+    // `catch unreachable` consequence for getting it wrong.
+    var clen_buf: [20]u8 = undefined;
     const s = std.fmt.bufPrint(&clen_buf, "{d}", .{n}) catch unreachable;
     rw.setHeader("Content-Length", s) catch {};
 }
@@ -1350,4 +1362,20 @@ test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, 
         "If-Range: \"not-a-real-etag\"\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(no_range));
     try testing.expect(mem.endsWith(u8, no_range, "hello world"));
+}
+
+test "buildETag / setContentLength: the widest possible values still fit" {
+    // The buffers behind both are sized by derivation and their overflow path
+    // is `catch unreachable`, so being wrong is a crash rather than an error.
+    // Nothing exercised that: shrinking the ETag buffer from 48 to 24 broke no
+    // test, because every fixture used small sizes and recent mtimes. These
+    // two calls are the widest inputs the types admit.
+    var etag_buf: [etag_max]u8 = undefined;
+    const widest = buildETag(&etag_buf, std.math.maxInt(u64), std.math.maxInt(i64));
+    try std.testing.expectEqualStrings("\"ffffffffffffffff-7fffffffffffffff\"", widest);
+    try std.testing.expect(widest.len <= etag_max);
+
+    var clen_buf: [20]u8 = undefined;
+    const n = try std.fmt.bufPrint(&clen_buf, "{d}", .{@as(u64, std.math.maxInt(u64))});
+    try std.testing.expectEqualStrings("18446744073709551615", n);
 }

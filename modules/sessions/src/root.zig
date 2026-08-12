@@ -636,9 +636,10 @@ pub const Manager = struct {
             .http_only = true,
             .same_site = m.same_site,
         };
-        // Stage into a thread-local buffer: the response writer keeps the
-        // header slice uncopied and serializes it lazily at writeHead, after
-        // this middleware returns — a stack buffer would dangle.
+        // addSetCookie copies the bytes into the writer's own header_buf
+        // before returning, so this local only has to outlive the call.
+        // Sized for name + 2*max_id_bytes hex + every attribute.
+        var cookie_buf: [512]u8 = undefined;
         const v = sc.bufPrint(&cookie_buf) catch return; // too long / invalid → skip
         res.addSetCookie(v) catch {}; // HeadersSent (early flush) → best-effort
     }
@@ -648,11 +649,6 @@ fn maxAgeSeconds(idle_ns: i64) i64 {
     if (idle_ns <= 0) return default_absolute_timeout_ns / std.time.ns_per_s;
     return @divTrunc(idle_ns, std.time.ns_per_s);
 }
-
-// The Set-Cookie value must outlive the whole request (see `writeCookie`).
-// Task-per-connection makes this per-thread buffer valid until the head is
-// flushed. Sized for name + 2*max_id_bytes hex + every attribute.
-threadlocal var cookie_buf: [512]u8 = undefined;
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const m: *Manager = @ptrCast(@alignCast(state.?));

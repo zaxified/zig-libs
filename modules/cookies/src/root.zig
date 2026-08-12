@@ -249,14 +249,12 @@ pub fn get(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
 }
 
 /// Serialize `sc` and set it as the response's `Set-Cookie` header. `buf` holds
-/// the header value and **must outlive the response flush** — the response
-/// writer stores the header slice without copying, and for a buffered response
-/// the head (this value included) is not serialized until the serving loop
-/// calls `end()`, **after the handler returns**. A buffer on the handler's own
-/// frame is therefore NOT safe (it is popped before the head is written); use
-/// storage that outlives the handler dispatch — request-lifetime memory reached
-/// via `StreamOptions.context`, or a caller buffer owned by the serving loop.
-/// Rejects an invalid cookie (`WriteError`) before touching the response.
+/// the header value; `setHeader` copies those bytes into the response writer's
+/// own storage at call time, so `buf` only needs to be valid for this call —
+/// a plain buffer on the handler's own stack frame is fine, even though the
+/// head (this value included) is not actually serialized onto the wire until
+/// the serving loop calls `end()`, after the handler returns. Rejects an
+/// invalid cookie (`WriteError`) before touching the response.
 ///
 /// NOTE: the server emits at most **one** `Set-Cookie` per response —
 /// `setHeader` replaces by name — so a second `set` overwrites the first.

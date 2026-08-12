@@ -1955,8 +1955,12 @@ pub const ResourceServer = struct {
     pub fn init(gpa: std.mem.Allocator, options: ResourceServer.Options) InitError!ResourceServer {
         if (options.realm) |r| try validateRealm(r);
 
-        // Precompute the challenge strings (stable memory — `router`'s response
-        // writer stores header slices without copying) via the shared helpers.
+        // Precompute the challenge strings via the shared helpers, gpa-owned
+        // for the Guard's whole lifetime (not merely because `setHeader`
+        // needs them to survive a call — it copies its bytes at call time —
+        // but because `challengeFor` hands the same precomputed string back
+        // on every denial, so it needs to outlive many calls, across many
+        // requests).
         const challenge_missing = try allocBearerChallenge(gpa, .{ .realm = options.realm });
         errdefer gpa.free(challenge_missing);
         const challenge_invalid = try allocBearerChallenge(gpa, .{
@@ -2394,8 +2398,11 @@ pub const Guard = struct {
     }
 
     /// The precomputed `WWW-Authenticate` value for a denial (null for
-    /// `OutOfMemory`, which is a 500 and carries no challenge). Stable memory —
-    /// safe to hand to a response writer that stores the slice without copying.
+    /// `OutOfMemory`, which is a 500 and carries no challenge). Stable,
+    /// gpa-owned memory for the Guard's lifetime — needed because the same
+    /// string is handed to `setHeader` on every denial across every request,
+    /// not because `setHeader` itself needs the value to outlive the call
+    /// (it copies the bytes into its own storage at call time).
     pub fn challengeFor(g: *const Guard, err: AuthError) ?[]const u8 {
         return switch (err) {
             error.MissingToken => g.challenge_missing,
