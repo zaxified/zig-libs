@@ -60,20 +60,26 @@
 //! `keyGen`, `encrypt` and `genRelinKey` — the three production entry points
 //! that consume entropy — take `io: std.Io` and draw from `std.Io.random`,
 //! which is **contractually a CSPRNG** (`std/Io.zig`: "Obtains entropy from a
-//! cryptographically secure pseudo-random number generator"). A `std.Random`
-//! parameter would accept `DefaultPrng.init(0)` at a call site that looks
-//! identical to a correct one, and here that is not a weakening but a break:
-//! `encrypt`'s `u,e0,e1` are the whole of BFV's IND-CPA claim, so a predictable
-//! stream lets anyone compute `c0 − p0·u − e0 = Δ·m` and read the plaintext
-//! **without the secret key**; `keyGen`'s `s` becomes a function of the seed;
-//! and `genRelinKey` publishes an encryption of `s²` to the evaluator under
-//! masks the evaluator can reproduce.
+//! cryptographically secure pseudo-random number generator") — but that same
+//! doc comment documents a silent fallback to a weaker seed if the CSPRNG
+//! source fails; the default `Io.Threaded` falls back to a pid+clock+ASLR
+//! seed if `/dev/urandom` is unreachable. A bare `std.Random` parameter would
+//! still be worse — it would accept `DefaultPrng.init(0)` at a call site that
+//! looks identical to a correct one — and here that is not a weakening but a
+//! break: `encrypt`'s `u,e0,e1` are the whole of BFV's IND-CPA claim, so a
+//! predictable stream lets anyone compute `c0 − p0·u − e0 = Δ·m` and read the
+//! plaintext **without the secret key**; `keyGen`'s `s` becomes a function of
+//! the seed; and `genRelinKey` publishes an encryption of `s²` to the
+//! evaluator under masks the evaluator can reproduce.
 //!
 //! The `…ForTest` twins keep a `std.Random` parameter, because the KATs in
 //! `kat_test.zig` (including the scripted-word test that pins WHICH draws
 //! `keyGen` makes, in order) and the seeded end-to-end tests must stay
 //! reproducible. Taking `std.Io` rather than reading OS entropy directly keeps
 //! the module `platform = .any` — the same shape `bbs`/`ibe`/`tlock` use.
+//! Whether this module's secret draws should fail closed via
+//! `std.Io.randomSecure` instead of the silently-degrading `std.Io.random`
+//! is an open, tracked decision (B7); this module does not use it yet.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1506,9 +1512,11 @@ test "RNG seam: keyGen/encrypt/genRelinKey take std.Io, only the ForTest twins t
     // vtable — `DefaultPrng.init(0).random()` is indistinguishable from a CSPRNG
     // at the call site — and with a predictable stream `encrypt` leaks the
     // plaintext (`c0 − p0·u − e0 = Δ·m`, no secret key needed) and `genRelinKey`
-    // leaks `s²` to the evaluator. `std.Io.random` is contractually a CSPRNG and
-    // no `DefaultPrng` can be turned into a `std.Io`, so the degraded input is
-    // not expressible. Reintroducing a `std.Random` parameter fails here.
+    // leaks `s²` to the evaluator. `std.Io.random` is a CSPRNG by contract,
+    // but that contract documents a silent fallback to a weaker seed on
+    // failure — this signature just makes the degraded path harder to reach
+    // than typing `DefaultPrng.init(0)`. Reintroducing a `std.Random`
+    // parameter would make it trivial again.
     inline for (.{ @TypeOf(B.keyGen), @TypeOf(B.encrypt), @TypeOf(B.genRelinKey) }) |F| {
         try testing.expect(lastParamType(F).? == std.Io);
         try testing.expect(lastParamType(F).? != std.Random);

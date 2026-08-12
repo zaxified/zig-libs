@@ -787,15 +787,17 @@ test "fuzz ShowProof.fromBytes never panics" {
 
 // ── RNG-seam pin (B6, 2026-08-12) ───────────────────────────────────────────
 
-test "proveCredential's entropy parameter is std.Io — a repeated witness nonce is not one call away" {
+test "proveCredential takes std.Io; the seeded form exists only under a name that says so" {
     const gen_params = @typeInfo(@TypeOf(proveCredential)).@"fn".params;
     // Two shows under a nonce stream that repeats (a re-seeded PRNG, a forked
     // process inheriting PRNG state) give two transcripts with the same
     // witnesses `r̃`/`m̃` but a different challenge `c` — the standard
     // Sigma-protocol two-transcript extraction, which recovers the HIDDEN
     // attributes and the blinding `r`. That is the module's entire purpose,
-    // gone. `std.Io.random` is contractually a CSPRNG and a `DefaultPrng`
-    // cannot be spelled at this type.
+    // gone. `std.Io.random` is a CSPRNG by contract, but that contract
+    // documents a silent fallback to a weaker seed on failure — this
+    // signature makes a repeating stream harder to reach than a bare
+    // `DefaultPrng`, not impossible at the type.
     try std.testing.expectEqual(std.Io, gen_params[1].type.?);
     const test_params = @typeInfo(@TypeOf(proveCredentialSeededForTest)).@"fn".params;
     try std.testing.expectEqual(std.Random, test_params[1].type.?);

@@ -51,13 +51,14 @@ const tfhe = @import("tfhe");
 const T = tfhe.Tfhe(tfhe.params.toy);
 const inst = try T.init();
 
-// `io` is a `std.Io`: key generation and encryption draw from `std.Io.random`,
-// which is contractually a CSPRNG. That is deliberate — a `std.Random`
-// parameter would accept `DefaultPrng.init(0)` at a call site that looks
-// identical, and with predictable `e`/`a` the LWE problem collapses into linear
-// algebra (`dim` ciphertexts recover `sk`). The `…ForTest` twins take a
-// `std.Random` for KAT reproducibility and are named so you cannot reach for
-// one by accident.
+// `io` is a `std.Io`: key generation and encryption draw from `std.Io.random`
+// — a CSPRNG by contract, though one that can silently fall back to a weaker
+// seed on failure (see the "Randomness" note in `src/tfhe.zig`). Still far
+// better than a `std.Random` parameter, which would accept
+// `DefaultPrng.init(0)` at a call site that looks identical, and with
+// predictable `e`/`a` the LWE problem collapses into linear algebra (`dim`
+// ciphertexts recover `sk`). The `…ForTest` twins take a `std.Random` for KAT
+// reproducibility and are named so you cannot reach for one by accident.
 const sk   = T.lweKeyGen(64, io);
 const gk   = T.glweKeyGen(io);
 const bsk  = T.bootstrapKeyGen(&sk, &gk, io);

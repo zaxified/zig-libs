@@ -44,13 +44,19 @@ pub const KeysError = error{
 /// vtable: `DefaultPrng.init(0)` and a real CSPRNG are indistinguishable at
 /// the call site, and the previous shape of this file printed "seed it for
 /// deterministic tests" next to the parameter — an instruction a consumer can
-/// follow straight into production. `std.Io.random` is CONTRACTUALLY a CSPRNG
-/// (see `std/Io.zig`'s `random` doc), so `.io` cannot be handed a seeded
-/// generator at all: a `DefaultPrng` is not expressible at that type. The
+/// follow straight into production. `std.Io.random` is a CSPRNG by contract,
+/// but that contract has a documented silent-degrade clause (`std/Io.zig`'s
+/// `random` doc: falls back to a weaker seed on failure) — the default
+/// `Io.Threaded` falls back to a pid+clock+ASLR seed if `/dev/urandom` is
+/// unreachable. So `.io` is weaker than the explicit opt-in unions
+/// `dtls`/`snmp`/`rsa`/`jwe`/`bolt8` use: a consumer gets the degraded path
+/// without asking for it, just not by typing `DefaultPrng.init(0)`. The
 /// seeded arm still exists — this module's own tests need reproducible
 /// issuance, and there is no external byte-exact Coconut vector to anchor
 /// against (SPEC §3) — but it is reachable only through a declaration whose
 /// name says what it is, never as an option on a production entry point.
+/// Whether this module's secret draws should fail closed via
+/// `std.Io.randomSecure` instead is an open, tracked decision (B7).
 ///
 /// Mirrors `bbs`/`ibe`/`tlock` (`io: std.Io` for the real draw, an explicitly
 /// named deterministic path for tests).
@@ -431,12 +437,14 @@ fn testIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.testing.allocator, .{});
 }
 
-test "keygen's entropy parameter is std.Io — a seeded PRNG is not expressible at the type" {
+test "keygen takes std.Io; the seeded form exists only under a name that says so" {
     const gen_params = @typeInfo(@TypeOf(keygen)).@"fn".params;
-    // `std.Io.random` is contractually a CSPRNG; `std.Random` is a vtable
-    // whose quality cannot be read at the call site. If this ever flips back,
-    // `keygen(alloc, prng.random(), …)` compiles again and the Coldcard-shaped
-    // mistake is one line away for every consumer.
+    // `std.Io.random` is a CSPRNG by contract, but that contract documents a
+    // silent fallback to a weaker seed on failure (`std/Io.zig`'s `random`
+    // doc) — this signature makes the degraded path harder to reach than
+    // `DefaultPrng.init(0)`, not impossible. If this ever flips back to
+    // `std.Random`, `keygen(alloc, prng.random(), …)` compiles again and the
+    // Coldcard-shaped mistake is one line away for every consumer.
     try std.testing.expectEqual(std.Io, gen_params[1].type.?);
     // The seeded form still exists, but only under a name that says out loud
     // what it is — it can never be reached by a consumer who merely followed

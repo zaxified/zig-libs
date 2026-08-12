@@ -30,21 +30,26 @@
 //! Every production key-generation and encryption entry point takes
 //! `io: std.Io` and draws from `std.Io.random`, which is **contractually a
 //! CSPRNG** (`std/Io.zig`: "Obtains entropy from a cryptographically secure
-//! pseudo-random number generator"). That is deliberate and it is the whole
-//! point of the signature: a `std.Random` parameter would accept
-//! `DefaultPrng.init(0)` at a call site that looks identical to a correct one,
-//! and a seeded stream does not weaken this scheme — it removes it. With `e`
-//! and `a` predictable, `b = ⟨a,s⟩ + μ + e` is a linear system: `dim`
-//! ciphertexts recover the secret key `s` by Gaussian elimination. The
-//! bootstrap and key-switch keys are GLWE/GGSW encryptions of that same key and
-//! are *published* to the evaluator, so predictable masking there hands the key
-//! over directly.
+//! pseudo-random number generator") — but that same doc comment documents a
+//! silent fallback to a weaker seed if the CSPRNG source fails; the default
+//! `Io.Threaded` falls back to a pid+clock+ASLR seed if `/dev/urandom` is
+//! unreachable. That is still far better than a `std.Random` parameter, which
+//! would accept `DefaultPrng.init(0)` at a call site that looks identical to
+//! a correct one, and a seeded stream does not weaken this scheme — it
+//! removes it. With `e` and `a` predictable, `b = ⟨a,s⟩ + μ + e` is a linear
+//! system: `dim` ciphertexts recover the secret key `s` by Gaussian
+//! elimination. The bootstrap and key-switch keys are GLWE/GGSW encryptions
+//! of that same key and are *published* to the evaluator, so predictable
+//! masking there hands the key over directly.
 //!
 //! The `…ForTest` twins keep a `std.Random` parameter, because the draw→value
 //! KATs at the bottom of this file and the seeded end-to-end tests must stay
 //! reproducible. They are named so that a production call site cannot use one
 //! by accident. Taking `std.Io` (rather than reading OS entropy directly) keeps
 //! the module `platform = .any`, the same shape `bbs`/`ibe`/`tlock` use.
+//! Whether this module's secret draws should fail closed via
+//! `std.Io.randomSecure` instead of the silently-degrading `std.Io.random`
+//! is an open, tracked decision (B7); this module does not use it yet.
 //!
 //! ## Constant-time posture (key path)
 //!
@@ -255,8 +260,9 @@ pub fn Tfhe(comptime P: params.Params) type {
         // Every randomness-consuming entry point in this file exists twice:
         //
         //   - `f(…, io: std.Io)`               — PRODUCTION. `std.Io.random` is
-        //     contractually a CSPRNG, so the degraded input is not expressible
-        //     at the type: a consumer cannot hand `std.Io` a `DefaultPrng`.
+        //     a CSPRNG by contract, but that contract documents a silent
+        //     fallback to a weaker seed on failure — this signature just makes
+        //     the degraded path harder to reach than a bare `DefaultPrng`.
         //   - `fForTest(…, random: std.Random)` — TEST/KAT ONLY. Reproducible
         //     draws for the KATs and the seeded end-to-end tests. Never call
         //     one of these from production code; the name is the signal.
@@ -1052,10 +1058,11 @@ test "RNG seam: every production keygen/encrypt takes std.Io, only the ForTest t
     // vtable — `DefaultPrng.init(0).random()` and a CSPRNG are indistinguishable
     // at a call site — so as long as a production entry point accepts one, a
     // consumer can silently generate an FHE secret key that is a function of a
-    // seed. `std.Io.random` is contractually a CSPRNG, and no `DefaultPrng` can
-    // be turned into a `std.Io`, so the degraded input stops being expressible.
-    // If someone reintroduces a `std.Random` parameter on any of these, this
-    // fails to compile or fails here.
+    // seed. `std.Io.random` is a CSPRNG by contract, but that contract
+    // documents a silent fallback to a weaker seed on failure — this
+    // signature just makes that path harder to reach than a bare
+    // `DefaultPrng`. If someone reintroduces a `std.Random` parameter on any
+    // of these, this fails to compile or fails here.
     inline for (.{
         @TypeOf(Toy.lweKeyGen), // generic in `dim`; the entropy parameter is still concrete
         @TypeOf(Toy.glweKeyGen),

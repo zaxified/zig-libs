@@ -55,9 +55,10 @@ const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed
 ## Randomness
 
 `keygen` and `proveCredential` take `io: std.Io` and draw from
-`std.Io.random`, which is **contractually a CSPRNG** — the `bbs`/`ibe`/`tlock`
-shape. A `std.Random.DefaultPrng` is not expressible at that parameter, which
-is the whole point:
+`std.Io.random` — a CSPRNG by contract, the `bbs`/`ibe`/`tlock` shape, but not
+an unconditional guarantee: `std.Io.random`'s own doc documents a silent
+fallback to a weaker seed if the CSPRNG source is unavailable. That still
+beats a bare `std.Random.DefaultPrng` parameter, which is why it matters here:
 
 - A seed-derived master secret `(x, y₁…y_q)` lets anyone who recovers the seed
   issue arbitrary valid credentials for the entire system. The `t`-of-`n`
@@ -72,6 +73,10 @@ Coconut has no published byte-exact vector (`SPEC.md` §3), so no consumer needs
 a deterministic issuance. This module's own tests use
 `keygenSeededForTest` / `proveCredentialSeededForTest`; the names are the
 signal, and there is no seeded option on the production functions.
+
+`std.Io.randomSecure` is the fail-closed alternative to `std.Io.random`
+(errors instead of degrading); this module does not use it yet, and whether
+its secret draws should is an open decision tracked in the project backlog.
 
 ## Verify
 

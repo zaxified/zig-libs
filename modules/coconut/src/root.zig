@@ -34,10 +34,14 @@
 //! Both entry points that sample secrets — `keygen` (the authority master
 //! secret `(x, y₁…y_q)` and its Shamir blinding) and `proveCredential` (the
 //! re-randomisation scalars and the Sigma-protocol witness nonces) — take
-//! `io: std.Io` and draw from `std.Io.random`, which is CONTRACTUALLY a
-//! CSPRNG. This is the `bbs`/`ibe`/`tlock` shape, and it is a TYPE-LEVEL
-//! guarantee rather than a documented request: a `std.Random.DefaultPrng` is
-//! not expressible at that parameter.
+//! `io: std.Io` and draw from `std.Io.random` — a CSPRNG by contract, but one
+//! with a documented silent-degrade clause (`std/Io.zig`'s `random` doc:
+//! falls back to a weaker seed on failure). This is the `bbs`/`ibe`/`tlock`
+//! shape: weaker than the explicit opt-in unions `dtls`/`snmp`/`rsa`/`jwe`/
+//! `bolt8` use, but a documented request rather than a bare `std.Random`
+//! parameter a caller could silently pass `DefaultPrng.init(0)` to. Whether
+//! this module's secret draws should fail closed via `std.Io.randomSecure`
+//! is an open, tracked decision (B7).
 //!
 //! It matters because the consequences are total, not marginal. A
 //! seed-derived master secret lets anyone who recovers the seed issue
