@@ -27,6 +27,7 @@ const testing = std.testing;
 
 const Connection = @import("Connection.zig").Connection;
 const Config = @import("Connection.zig").Config;
+const Entropy = @import("Connection.zig").Entropy;
 const certverify = @import("certverify.zig");
 const messages = @import("messages.zig");
 const cert_kat = @import("certauth_kat_vectors.zig");
@@ -116,8 +117,12 @@ fn deadline(io: std.Io, ms: u32) std.Io.Timeout {
     return t.toDeadline(io);
 }
 
-fn testRandom(csprng: *std.Random.DefaultCsprng) std.Random {
-    return csprng.random();
+/// This harness drives real handshakes against wolfSSL from a FIXED seed, so a
+/// failing interop run can be replayed byte-for-byte. That is the legitimate
+/// use of `Entropy.seeded_for_test`, and naming the arm here is what keeps it
+/// from looking like the shape production code should copy.
+fn seededForTest(csprng: *std.Random.DefaultCsprng) Entropy {
+    return .{ .seeded_for_test = csprng.random() };
 }
 
 /// Prints why the handshake died, including wolfSSL's own diagnosis — it
@@ -233,7 +238,7 @@ fn clientAgainstWolfsslServer(peer_mode: []const u8, expect: Expect) !void {
     defer conn.deinit();
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x2c} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var out: [1500]u8 = undefined;
     var rx: [1500]u8 = undefined;
@@ -325,7 +330,7 @@ test "LIVE wolfSSL peer: our server completes a real DTLS 1.3 PSK handshake agai
     defer conn.deinit();
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x5b} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var out: [1500]u8 = undefined;
     var rx: [1500]u8 = undefined;
@@ -415,7 +420,7 @@ test "LIVE wolfSSL peer: our server serves a HelloRetryRequest, a real wolfSSL c
     defer child.kill(io);
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x6e} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var out: [1500]u8 = undefined;
     var rx: [1500]u8 = undefined;
@@ -710,7 +715,7 @@ fn certClientAgainstWolfssl(case: CertCase) !void {
     defer conn.deinit();
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x3d} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var out: [1500]u8 = undefined;
     var rx: [1500]u8 = undefined;
@@ -849,7 +854,7 @@ test "LIVE wolfSSL peer: a real wolfSSL certificate CLIENT verifies the chain OU
     defer conn.deinit();
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x4e} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var out: [1500]u8 = undefined;
     var rx: [1500]u8 = undefined;

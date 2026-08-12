@@ -5,7 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- The `std.Random` requirement is now stated, not implied. `startHandshake`,
+- **BREAKING:** `startHandshake` and `handleFlight` take a `dtls.Entropy`
+  instead of a `std.Random`. `Entropy` is a two-armed tagged union —
+  `.csprng` (production) and `.seeded_for_test` — so the entropy choice is
+  written out at every call site instead of being whatever generator the caller
+  had in scope. Migration is mechanical: `conn.startHandshake(rnd, …)` becomes
+  `conn.startHandshake(.{ .csprng = rnd }, …)`.
+
+  The documentation-only pass below said what a seeded generator costs (the
+  x25519 / secp256r1 ephemeral PRIVATE key is a function of the seed, so anyone
+  who learns it decrypts every recorded session retroactively) but left the weak
+  path as the ONLY path. It is now a variant a caller has to name. This is not a
+  detector — `std.Random` is still a vtable and this module still cannot judge
+  what is inside either arm; naming `.csprng` is an assertion, and the union
+  makes it a deliberate one rather than an accident. `std.Io` remains refused:
+  `Connection` is a sans-I/O state machine and a capability handle threaded
+  through a per-datagram entry point would contradict that, while a union is a
+  value and costs the invariant nothing. `Entropy` is threaded to
+  `ecdheGenerate` and to every internal step that draws bytes; the arm is erased
+  only at the leaves. A new test pins that the type has exactly two arms, that
+  they are distinct, and that both carry `std.Random`.
+
+- The `std.Random` requirement is now stated, not implied *(superseded by the
+  entry above, which turned the statement into a type — the "no signature
+  changed" note below was true of this pass only)*. `startHandshake`,
   `handleFlight` and `ecdheGenerate` said only *why* the parameter exists
   ("std 0.16 removed `std.crypto.random`") — a migration note a consumer reads
   as "any `std.Random` will do", and `DefaultPrng` is what std's own examples

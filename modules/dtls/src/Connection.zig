@@ -174,7 +174,7 @@ pub const ConfigError = error{
 /// can replay from any address is not a return-routability check. But this
 /// module never touches a socket: the caller owns the datagram I/O, so the
 /// module cannot see the peer's address, in the same way it cannot read a
-/// clock (`Config.now_sec`) or draw randomness (`std.Random` arguments). The
+/// clock (`Config.now_sec`) or draw randomness (the `Entropy` arguments). The
 /// binding is therefore an input, not something discovered. This is the only
 /// honest shape: an API that promised address binding while being unable to
 /// observe an address would be lying.
@@ -870,21 +870,21 @@ const EcdheKeyPair = struct {
 };
 
 /// Generates this side's ephemeral share in `group` from the caller-supplied
-/// RNG (std 0.16 removed `std.crypto.random`, so every source of randomness
-/// in this collection is an argument).
+/// `Entropy` (std 0.16 removed `std.crypto.random`, so every source of
+/// randomness in this collection is an argument).
 ///
-/// `random` MUST be a cryptographically secure source. This is the highest-
-/// consequence use of randomness in the module: the bytes drawn here ARE the
-/// x25519 / secp256r1 ephemeral PRIVATE KEY. Under a predictable generator —
-/// `std.Random.DefaultPrng.init(seed)`, a PID, a boot timestamp — a passive
+/// `entropy` MUST be a cryptographically secure source — `.csprng`. This is
+/// the highest-consequence use of randomness in the module: the bytes drawn
+/// here ARE the x25519 / secp256r1 ephemeral PRIVATE KEY. Under a predictable
+/// generator — the `.seeded_for_test` arm, a PID, a boot timestamp — a passive
 /// eavesdropper who learns the seed derives the same private key, recomputes
 /// the (EC)DHE shared secret, and decrypts every session recorded from that
 /// peer, retroactively; forward secrecy, the entire reason the handshake
-/// generates an ephemeral key at all, is gone. Use `std.Random.DefaultCsprng`
-/// seeded from real OS entropy in production. There is no way for this
+/// generates an ephemeral key at all, is gone. There is no way for this
 /// function to tell a real CSPRNG from a seeded PRNG — `std.Random` is a
-/// vtable — so the guarantee is the caller's, and it is stated at every entry
-/// point that reaches here (`startHandshake`, `handleFlight`).
+/// vtable — which is exactly why the choice is a named union arm the caller
+/// has to write out at every entry point that reaches here
+/// (`startHandshake`, `handleFlight`), rather than a bare parameter.
 ///
 ///   * x25519 (RFC 7748 / RFC 8446 §4.2.8.1): 32 random bytes as the secret
 ///     scalar — `generateDeterministic` clamps — and the 32-byte public key
@@ -895,7 +895,8 @@ const EcdheKeyPair = struct {
 ///     probability is ~2^-32 per draw, so the bounded loop below cannot
 ///     realistically exhaust; it fails closed with a typed error rather than
 ///     looping forever on a broken RNG.
-fn ecdheGenerate(group: u16, random: std.Random) HandshakeError!EcdheKeyPair {
+fn ecdheGenerate(group: u16, entropy: Entropy) HandshakeError!EcdheKeyPair {
+    const random = entropy.source();
     var kp: EcdheKeyPair = .{ .group = group, .secret = undefined, .public = undefined, .public_len = 0 };
     switch (group) {
         x25519_group => {
@@ -1123,6 +1124,66 @@ fn encodeHelloRetryRequest(suite: CipherSuite, cookie: []const u8, body_buf: []u
 /// small extensions, the larger of which is the cookie.
 const max_hrr_body_len = 128 + max_cookie_len;
 
+/// Where a `Connection`'s randomness comes from — and, at every call site,
+/// which of the two possible answers the caller is choosing.
+///
+/// **Why this is a type and not a `std.Random` parameter.** `std.Random` is a
+/// vtable: `DefaultPrng.init(0)` and a real CSPRNG are indistinguishable at the
+/// call site, and nothing in this module can inspect the generator it is
+/// handed. The previous signature (`random: std.Random`) therefore accepted
+/// whatever generator the caller happened to have in scope, and the weak path
+/// was not a variant of the API — it WAS the API; the doc comment asking for a
+/// CSPRNG was the only thing standing between a consumer and a seed-derived
+/// ephemeral key. What a union can do is force the caller to NAME the answer,
+/// so a seeded generator reaches the handshake only through a declaration that
+/// says out loud that it is seeded and for tests. The check is still not
+/// mechanical — it is a claim the caller makes deliberately instead of by
+/// reflex, which is the difference between a hazard and a decision.
+///
+/// This is a VALUE, not a capability handle, and that is why it fits here.
+/// `Connection` is a sans-I/O state machine — no socket, no clock, no
+/// allocator; every external fact arrives as an input value — so the `io:
+/// std.Io` arm the sibling `coconut`/`bbs`/`ibe` modules use is deliberately
+/// absent: `std.Io` is the authority to open sockets and files, precisely what
+/// this design exists to withhold from a protocol engine. A tagged union costs
+/// that invariant nothing.
+pub const Entropy = union(enum) {
+    /// PRODUCTION. A generator the caller asserts is cryptographically secure
+    /// — `std.Random.DefaultCsprng` seeded from real OS entropy
+    /// (`getrandom(2)`), or an equivalent. std 0.16 removed
+    /// `std.crypto.random`, so this module has no hidden RNG of its own and
+    /// cannot verify the assertion: naming this arm IS the assertion.
+    csprng: std.Random,
+
+    /// **TEST ONLY.** A caller-seeded generator, so a handshake can be
+    /// replayed byte-for-byte — this module's own suites and its wolfSSL
+    /// interop harness need exactly that, and there is no other way to get a
+    /// reproducible flight out of a state machine that draws keys.
+    ///
+    /// What choosing this in production costs, concretely: in `.cert_dhe` mode
+    /// the bytes drawn from it ARE the x25519 / secp256r1 ephemeral PRIVATE
+    /// KEY (`ecdheGenerate`). Anyone who learns the seed — a constant in the
+    /// binary, a PID, a boot timestamp — re-derives that key, recomputes the
+    /// (EC)DHE shared secret and decrypts every session recorded from this
+    /// peer, RETROACTIVELY, including traffic captured long before the seed
+    /// leaked; forward secrecy, the entire reason an ephemeral key is
+    /// generated at all, is gone. Smaller and also real: a constant
+    /// ClientHello/ServerHello `random` (byte-identical, linkable handshakes)
+    /// and a repeated RSA-PSS CertificateVerify salt.
+    seeded_for_test: std.Random,
+
+    /// The arm-erased generator, for the leaves in this file that actually
+    /// draw bytes. Deliberately NOT `pub`: the point of the type is that the
+    /// choice is visible at the call site, and a public accessor would hand
+    /// callers back the flat `std.Random` this replaced.
+    fn source(self: Entropy) std.Random {
+        return switch (self) {
+            .csprng => |r| r,
+            .seeded_for_test => |r| r,
+        };
+    }
+};
+
 pub const Connection = struct {
     role: Role,
     config: Config,
@@ -1287,11 +1348,13 @@ pub const Connection = struct {
     /// over the transcript. `now_ms` arms the retransmission timer `poll`
     /// later checks. Transitions `.start` -> `.wait_server_hello`.
     ///
-    /// `random` MUST be a cryptographically secure source: this module has no
-    /// hidden RNG, the same caller-injected seam the `jwt`/`jwe` siblings use
-    /// (std 0.16 removed `std.crypto.random`) — `std.Random.DefaultCsprng`
-    /// seeded from real OS entropy in production. What breaks under a seeded
-    /// PRNG is concrete and not recoverable after the fact:
+    /// `entropy` MUST be a cryptographically secure source — pass
+    /// `.{ .csprng = … }`. This module has no hidden RNG (std 0.16 removed
+    /// `std.crypto.random`), so the generator is the caller's to supply, and
+    /// `Entropy` makes which KIND of generator a thing the caller writes out
+    /// here rather than something inferred from whatever was in scope. What
+    /// breaks under the `.seeded_for_test` arm is concrete and not recoverable
+    /// after the fact:
     ///
     ///   * In `cert_dhe` mode this call draws the x25519 / secp256r1
     ///     ephemeral PRIVATE KEY (`ecdheGenerate`). A passive eavesdropper
@@ -1303,20 +1366,21 @@ pub const Connection = struct {
     ///     trivially linkable across networks. Bounded next to the above (the
     ///     field is public), but it is the symptom that shows first.
     ///
-    /// `std.Random` is a vtable, so this module cannot check the quality of
-    /// what it is handed; a seeded generator and `getrandom(2)` look the same
-    /// at this call site. The requirement is the caller's to meet.
-    pub fn startHandshake(self: *Connection, random: std.Random, now_ms: u64, out: []u8) HandshakeError![]const u8 {
+    /// `std.Random` is a vtable, so this module still cannot check the QUALITY
+    /// of what it is handed inside either arm; a seeded generator and
+    /// `getrandom(2)` look the same to the code. What the type buys is that
+    /// the weak path can no longer be entered by accident.
+    pub fn startHandshake(self: *Connection, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError![]const u8 {
         if (self.role != .client) return error.WrongState;
         if (self.state != .start) return error.WrongState;
 
         var ch_body_buf: [512]u8 = undefined;
         const ch_body = switch (self.config.key_exchange) {
-            .psk => try self.buildClientHello(random, null, &ch_body_buf),
+            .psk => try self.buildClientHello(entropy, null, &ch_body_buf),
             // `advertised_groups[0]` — the group a first ClientHello offers a
             // share in. A server that wants a different one says so with a
             // HelloRetryRequest (`handleHelloRetryRequest`).
-            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(random, null, advertised_groups[0], &ch_body_buf),
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(entropy, null, advertised_groups[0], &ch_body_buf),
         };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
         // ClientHello1 is the first message, so the transcript hash right
@@ -1341,29 +1405,28 @@ pub const Connection = struct {
     /// Both roles: feeds an incoming (possibly multi-record-coalesced)
     /// datagram to the handshake engine and returns whatever this side
     /// needs to send in response (`HandshakeResult.out`, possibly empty).
-    /// `random` is consulted on the server's `.start` step (the ServerHello
+    /// `entropy` is consulted on the server's `.start` step (the ServerHello
     /// `random`) and, in certificate mode, whenever THIS side signs a
     /// CertificateVerify (`certverify.sign`'s PSS salt / ECDSA-Ed25519
     /// noise) — harmless to pass through unconditionally otherwise. Errors
     /// are always typed (a wrong PSK, a tampered record, an out-of-order
     /// message, ...) — never a panic.
     ///
-    /// `random` MUST be a cryptographically secure source — the same
-    /// caller-injected seam as `startHandshake` (std 0.16 removed
-    /// `std.crypto.random`), `std.Random.DefaultCsprng` seeded from real OS
-    /// entropy in production. The consequence is worst on the SERVER side of
-    /// certificate mode, where this call — not `startHandshake` — is what
-    /// draws the ephemeral (EC)DHE private key (`ecdheGenerate`, via
-    /// `serverProcessClientHello`): under a predictable generator a passive
+    /// `entropy` MUST be a cryptographically secure source — pass
+    /// `.{ .csprng = … }`, the same caller-supplied seam as `startHandshake`
+    /// (std 0.16 removed `std.crypto.random`). The consequence is worst on the
+    /// SERVER side of certificate mode, where this call — not `startHandshake`
+    /// — is what draws the ephemeral (EC)DHE private key (`ecdheGenerate`, via
+    /// `serverProcessClientHello`): under the `.seeded_for_test` arm a passive
     /// eavesdropper who knows the seed recomputes the shared secret for every
     /// association this server ever accepted and decrypts them all,
     /// retroactively. It also draws the ServerHello `random` and, whenever
     /// this side signs a CertificateVerify, the RSA-PSS salt — a PSS salt
     /// that repeats weakens the signature's proof, and `certverify.sign`
     /// refuses `null` outright (`error.RandomRequired`) for exactly that
-    /// reason. Passing the same `std.Random` to every call in a connection
-    /// loop is correct and expected; passing a SEEDED one is the hazard.
-    /// `std.Random` is a vtable, so nothing here can tell the two apart.
+    /// reason. Passing the same `Entropy` value to every call in a connection
+    /// loop is correct and expected; passing a SEEDED one is the hazard, and
+    /// it is now a hazard the caller has to spell.
     ///
     /// **Reassembly across calls (RFC 9147 §5.2).** A flight need not arrive
     /// in one datagram, and a single handshake message need not either — a
@@ -1399,7 +1462,7 @@ pub const Connection = struct {
     /// `message_seq`. This is no worse than the pre-reassembly engine (which
     /// answered a retransmitted flight with `error.WrongState`), but it is
     /// not the full RFC 9147 §5.7 receiver either.
-    pub fn handleFlight(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
+    pub fn handleFlight(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         if (datagram.len > self.rx_flight.len - self.rx_flight_len) {
             self.rx_flight_len = 0;
             return error.FlightTooLarge;
@@ -1419,8 +1482,8 @@ pub const Connection = struct {
         // handing a slice of `self` to a `*Connection` method safe here.
         const input = self.rx_flight[0..self.rx_flight_len];
         const result = switch (self.role) {
-            .server => self.handleFlightServer(input, random, now_ms, out),
-            .client => self.handleFlightClient(input, random, now_ms, out),
+            .server => self.handleFlightServer(input, entropy, now_ms, out),
+            .client => self.handleFlightClient(input, entropy, now_ms, out),
         } catch |err| switch (err) {
             error.FlightIncomplete => {
                 self.* = saved;
@@ -1666,14 +1729,14 @@ pub const Connection = struct {
     /// placeholder once the (still-empty-so-far) transcript's truncated hash
     /// is known (RFC 8446 §4.2.11.2).
     /// `cookie` is the HelloRetryRequest cookie to echo (RFC 8446 §4.2.2),
-    /// `null` for the first ClientHello. On a retry the `random` argument is
+    /// `null` for the first ClientHello. On a retry the `entropy` argument is
     /// ignored and `self.client_random` is reused: RFC 8446 §4.1.2 requires
     /// ClientHello2 to be ClientHello1 unmodified except for a short listed
     /// set of changes, and the random is not on that list.
-    fn buildClientHello(self: *Connection, random: std.Random, cookie: ?[]const u8, body_buf: []u8) HandshakeError![]u8 {
+    fn buildClientHello(self: *Connection, entropy: Entropy, cookie: ?[]const u8, body_buf: []u8) HandshakeError![]u8 {
         var random_bytes: [32]u8 = undefined;
         if (cookie == null) {
-            random.bytes(&random_bytes);
+            entropy.source().bytes(&random_bytes);
             self.client_random = random_bytes;
         } else {
             random_bytes = self.client_random;
@@ -1788,14 +1851,14 @@ pub const Connection = struct {
     /// other field is therefore recomputed from the SAME inputs — in
     /// particular `random` is drawn once and reused from `self.client_random`
     /// on the retry, exactly as the PSK builder does.
-    fn buildClientHelloCertDhe(self: *Connection, random: std.Random, cookie: ?[]const u8, group: u16, body_buf: []u8) HandshakeError![]u8 {
+    fn buildClientHelloCertDhe(self: *Connection, entropy: Entropy, cookie: ?[]const u8, group: u16, body_buf: []u8) HandshakeError![]u8 {
         // RFC 8446 §4.1.2: ClientHello2 reuses ClientHello1's `random`
         // verbatim — it is not among the permitted changes. Keyed on "has a
         // HelloRetryRequest been processed", NOT on "is there a cookie": a
         // retry can name a new group WITHOUT a cookie (a server that only
         // wants a different key share), and drawing a fresh random there
         // would make ClientHello2 a different client to the peer.
-        if (!self.saw_hello_retry_request) random.bytes(&self.client_random);
+        if (!self.saw_hello_retry_request) entropy.source().bytes(&self.client_random);
 
         // Ephemeral (EC)DHE key pair for `group` — generated only when there
         // is not already one IN THAT GROUP. Both halves matter:
@@ -1811,7 +1874,7 @@ pub const Connection = struct {
         //     one anyway is a gratuitously different ClientHello2, i.e. the
         //     same class of violation as a fresh `random`.
         if (self.ecdhe_public_len == 0 or self.ecdhe_group != group) {
-            var kp = try ecdheGenerate(group, random);
+            var kp = try ecdheGenerate(group, entropy);
             self.ecdhe_group = kp.group;
             self.ecdhe_secret = kp.secret;
             self.ecdhe_public = kp.public;
@@ -2236,12 +2299,15 @@ pub const Connection = struct {
         cc: CertConfig,
         scheme: certverify.SignatureScheme,
         side: certverify.Side,
-        random: std.Random,
+        entropy: Entropy,
         out: []u8,
     ) HandshakeError!SentRecord {
         const th = self.transcript.currentHash();
         var sig_buf: [max_sig_len]u8 = undefined;
-        const sig = try certverify.sign(scheme, cc.private_key, side, &th, random, &sig_buf);
+        // `certverify.sign` carries its own requirement in its type (`?std.Random`,
+        // fail-closed with `error.RandomRequired` for RSA-PSS), so this is where
+        // the arm is erased: the choice was already made at the entry point.
+        const sig = try certverify.sign(scheme, cc.private_key, side, &th, entropy.source(), &sig_buf);
 
         var cv_body_buf: [max_certverify_body]u8 = undefined;
         const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @intFromEnum(scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;
@@ -2470,9 +2536,9 @@ pub const Connection = struct {
         }
     }
 
-    fn handleFlightServer(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
+    fn handleFlightServer(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         return switch (self.state) {
-            .start => self.serverProcessClientHello(datagram, random, now_ms, out),
+            .start => self.serverProcessClientHello(datagram, entropy, now_ms, out),
             .wait_finished => self.serverProcessClientFinished(datagram, out),
             else => error.WrongState,
         };
@@ -2603,7 +2669,7 @@ pub const Connection = struct {
     /// (epoch 2, AEAD-protected under the freshly-derived handshake traffic
     /// keys). Derives (but does not yet install) the application traffic
     /// secrets. Transitions `.start` -> `.wait_finished`.
-    fn serverProcessClientHello(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
+    fn serverProcessClientHello(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         var msg_buf: [512]u8 = undefined;
         var received_buf: [512]bool = undefined;
         var ch_pos: usize = 0;
@@ -2714,7 +2780,7 @@ pub const Connection = struct {
                 // `deriveHandshakeSecret` the PSK path uses — not a forked
                 // schedule.
                 const peer = try clientHelloShare(dec.extensions);
-                var kp = try ecdheGenerate(peer.group, random);
+                var kp = try ecdheGenerate(peer.group, entropy);
                 const shared = ecdheSharedSecret(peer.group, kp.secret, peer.share) catch |err| {
                     std.crypto.secureZero(u8, &kp.secret);
                     return err;
@@ -2754,7 +2820,7 @@ pub const Connection = struct {
         self.suite = suite;
 
         var random_bytes: [32]u8 = undefined;
-        random.bytes(&random_bytes);
+        entropy.source().bytes(&random_bytes);
         // The single ServerHello extension differs by mode: `pre_shared_key`
         // (selected-identity index) for PSK, `key_share` (this server's
         // ephemeral public share, in the group the client offered) for
@@ -2880,7 +2946,7 @@ pub const Connection = struct {
             // willing to use, AND one `cc.private_key`'s key family can
             // produce — never a hardcoded default.
             const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, client_sig_algs_buf[0..client_sig_algs_len]);
-            const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .server, random, out[cursor..]);
+            const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .server, entropy, out[cursor..]);
             cursor += cv_r.bytes.len;
             extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
             extra_n += 1;
@@ -3007,7 +3073,7 @@ pub const Connection = struct {
         self: *Connection,
         hrr_body: []const u8,
         hrr: messages.DecodedServerHello,
-        random: std.Random,
+        entropy: Entropy,
         now_ms: u64,
         out: []u8,
     ) HandshakeError!HandshakeResult {
@@ -3082,8 +3148,8 @@ pub const Connection = struct {
 
         var ch_body_buf: [512]u8 = undefined;
         const ch_body = switch (self.config.key_exchange) {
-            .psk => try self.buildClientHello(random, cookie orelse return error.HelloRetryRequestUnsupported, &ch_body_buf),
-            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(random, cookie, retry_group, &ch_body_buf),
+            .psk => try self.buildClientHello(entropy, cookie orelse return error.HelloRetryRequestUnsupported, &ch_body_buf),
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(entropy, cookie, retry_group, &ch_body_buf),
         };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
 
@@ -3112,7 +3178,7 @@ pub const Connection = struct {
     /// keys immediately (the client needs no further confirmation once it
     /// has verified the server). Transitions `.wait_server_hello` ->
     /// `.connected`.
-    fn handleFlightClient(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
+    fn handleFlightClient(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         if (self.state != .wait_server_hello) return error.WrongState;
 
         var pos: usize = 0;
@@ -3124,7 +3190,7 @@ pub const Connection = struct {
         var ext_buf: [8]messages.Extension = undefined;
         const sh_dec = messages.decodeServerHello(sh_parsed.body, &ext_buf) catch return error.Malformed;
         if (messages.isHelloRetryRequest(sh_dec.random))
-            return self.handleHelloRetryRequest(sh_parsed.body, sh_dec, random, now_ms, out);
+            return self.handleHelloRetryRequest(sh_parsed.body, sh_dec, entropy, now_ms, out);
 
         // Downgrade guard (RFC 8446 §4.2.1): the negotiated version lives ONLY
         // in `supported_versions` — every version field on the wire says DTLS
@@ -3275,7 +3341,7 @@ pub const Connection = struct {
                 // client itself is willing to use, AND one `cc.private_key`
                 // can produce (see `selectSignatureScheme`).
                 const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, cert_result.peerSigAlgs());
-                const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .client, random, out[cursor..]);
+                const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .client, entropy, out[cursor..]);
                 cursor += cv_r.bytes.len;
                 extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
                 extra_n += 1;
@@ -3631,8 +3697,13 @@ test "send/recv: real guard rejects use before the handshake completes" {
     try testing.expectError(error.NotConnected, conn.recv("datagram", &out));
 }
 
-fn testRandom(csprng: *std.Random.DefaultCsprng) std.Random {
-    return csprng.random();
+/// The one place this file's ~170 test call sites enter `Entropy`'s weak arm.
+/// Named for what it is, and it returns the `.seeded_for_test` VALUE rather
+/// than a `std.Random`, so no test can hand a `Connection` a generator without
+/// the tag travelling with it. Production has no equivalent helper: a real
+/// consumer writes `.{ .csprng = … }` itself.
+fn seededForTest(csprng: *std.Random.DefaultCsprng) Entropy {
+    return .{ .seeded_for_test = csprng.random() };
 }
 
 test "startHandshake: server role is rejected (typed error, not a panic)" {
@@ -3640,7 +3711,7 @@ test "startHandshake: server role is rejected (typed error, not a panic)" {
     var server = try Connection.serverInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x01} ** 32);
     var out: [1500]u8 = undefined;
-    try testing.expectError(error.WrongState, server.startHandshake(testRandom(&csprng), 0, &out));
+    try testing.expectError(error.WrongState, server.startHandshake(seededForTest(&csprng), 0, &out));
 }
 
 test "startHandshake: wrong state (already mid-handshake) is rejected" {
@@ -3648,8 +3719,8 @@ test "startHandshake: wrong state (already mid-handshake) is rejected" {
     var client = try Connection.clientInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x02} ** 32);
     var out: [1500]u8 = undefined;
-    _ = try client.startHandshake(testRandom(&csprng), 0, &out);
-    try testing.expectError(error.WrongState, client.startHandshake(testRandom(&csprng), 0, &out));
+    _ = try client.startHandshake(seededForTest(&csprng), 0, &out);
+    try testing.expectError(error.WrongState, client.startHandshake(seededForTest(&csprng), 0, &out));
 }
 
 test "startHandshake: real ClientHello bytes, not a stub — real DTLS 1.3 flight sent" {
@@ -3657,7 +3728,7 @@ test "startHandshake: real ClientHello bytes, not a stub — real DTLS 1.3 fligh
     var client = try Connection.clientInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x03} ** 32);
     var out: [1500]u8 = undefined;
-    const ch = try client.startHandshake(testRandom(&csprng), 0, &out);
+    const ch = try client.startHandshake(seededForTest(&csprng), 0, &out);
     try testing.expectEqual(State.wait_server_hello, client.state);
     // Legacy DTLSPlaintext header: content_type=22 (handshake), epoch=0.
     try testing.expectEqual(@as(u8, 22), ch[0]);
@@ -3771,7 +3842,7 @@ test "installApplicationKeys: CCM suites are honestly rejected (std nonce gap)" 
 /// Drives `client`/`server` (both already `clientInit`/`serverInit`, both
 /// still `.start`) through a complete PSK handshake, alternating `buf1`/
 /// `buf2` as scratch so no step's input aliases its own output buffer.
-fn driveHandshake(client: *Connection, server: *Connection, rnd: std.Random, buf1: []u8, buf2: []u8) !void {
+fn driveHandshake(client: *Connection, server: *Connection, rnd: Entropy, buf1: []u8, buf2: []u8) !void {
     const ch = try client.startHandshake(rnd, 0, buf1);
     const flight2 = try server.handleFlight(ch, rnd, 0, buf2);
     try testing.expect(!flight2.done);
@@ -3797,7 +3868,7 @@ fn loopbackHandshake(suite: CipherSuite) !void {
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
 
     try testing.expectEqual(suite, client.suite);
     try testing.expectEqual(suite, server.suite);
@@ -3872,7 +3943,7 @@ test "cipher suite negotiation: SERVER's own preference order wins, not the clie
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
 
     try testing.expectEqual(CipherSuite.aes_128_gcm_sha256, server.suite);
     try testing.expectEqual(CipherSuite.aes_128_gcm_sha256, client.suite);
@@ -3991,7 +4062,7 @@ fn fuzzHandleFlight(_: void, smith: *std.testing.Smith) !void {
     const psk_identity = "device-042";
     const psk = "a-shared-pre-shared-key";
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
@@ -4043,7 +4114,7 @@ test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORD
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -4114,7 +4185,7 @@ test "reassembly: a THREE-fragment ClientHello, middle fragment duplicated" {
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x78} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -4162,7 +4233,7 @@ test "reassembly: a CONTRADICTING overlapping fragment is rejected, not last-wri
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x79} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -4201,7 +4272,7 @@ test "reassembly: a fragment that changes msg_type or total length mid-message i
     const cfg_s = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x7d} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4239,7 +4310,7 @@ test "reassembly: a fragment of a LATER message while one is in progress is reje
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x7a} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -4267,7 +4338,7 @@ test "reassembly: buffered bytes are capped — a peer that never completes a me
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x7b} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -4324,7 +4395,7 @@ test "reassembly: an epoch-2 Finished split across datagrams, delivered OUT OF O
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x7c} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -4393,7 +4464,7 @@ fn connectedPair(suite: CipherSuite, seed: u8, client: *Connection, server: *Con
     var csprng = std.Random.DefaultCsprng.init([_]u8{seed} ** 32);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
-    try driveHandshake(client, server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(client, server, seededForTest(&csprng), &buf1, &buf2);
 }
 
 test "recv: a verbatim-replayed record is rejected, not delivered twice" {
@@ -4592,7 +4663,7 @@ test "handshake: wrong PSK -> binder verify fails (typed error, not a panic)" {
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x20} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4606,7 +4677,7 @@ test "handshake: mismatched PSK identity -> typed error, not a panic" {
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x23} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4621,7 +4692,7 @@ test "handshake: corrupted ServerHello -> typed error, not a panic" {
     var client = try Connection.clientInit(cfg);
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x21} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4641,7 +4712,7 @@ test "handshake: a HelloRetryRequest carrying nothing to change is a typed error
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x40} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
 
@@ -4662,7 +4733,7 @@ test "handshake: a second HelloRetryRequest is refused (RFC 8446 §4.1.4 abort)"
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x41} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
 
@@ -4713,7 +4784,7 @@ test "handshake: a HelloRetryRequest negotiating DTLS 1.2 (real legacy value) is
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x43} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
 
@@ -4735,7 +4806,7 @@ test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     const ch1 = try client.startHandshake(rnd, 0, &buf1);
     var ch1_copy: [1500]u8 = undefined;
@@ -4880,7 +4951,7 @@ test "HRR server: the cookie exchange completes — and the connection that answ
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4946,7 +5017,7 @@ test "HRR server: the cookie exchange completes — and the connection that answ
 test "HRR server: a cookie minted for one peer_binding does not verify from another (the return-routability check itself)" {
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4979,7 +5050,7 @@ test "HRR server: a cookie minted for one peer_binding does not verify from anot
 test "HRR server: a cookie minted under a different cookie_secret does not verify" {
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x73} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
     var buf3: [1500]u8 = undefined;
@@ -5004,7 +5075,7 @@ test "HRR server: a cookie minted under a different cookie_secret does not verif
 
 test "HRR server: one flipped bit anywhere in the cookie — MAC or authenticated payload — does not verify" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x74} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     // The cookie is the last `cookie_len` bytes of the HelloRetryRequest
     // datagram (it is the last extension's payload, and the extension list
@@ -5053,7 +5124,7 @@ test "HRR server: a GENUINE cookie with bytes appended is refused (length is exa
     // actually notice when it stops being true.
     const binding = "203.0.113.9:51000";
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x79} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
     defer client.deinit();
@@ -5087,7 +5158,7 @@ test "HRR server: a GENUINE cookie with bytes appended is refused (length is exa
 
 test "HRR server: an attacker-invented cookie is refused, whatever its length" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x75} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     // No real HelloRetryRequest is involved: these are cookies a peer made
     // up, delivered by pointing a client at a forged retry. A server that
@@ -5128,7 +5199,7 @@ test "HRR server: an attacker-invented cookie is refused, whatever its length" {
 test "HRR server: a wrong-PSK ClientHello still gets only a retry — no crypto is spent before return routability is proven" {
     var client = try Connection.clientInit(hrrClientConfig("the-WRONG-psk"));
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x76} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -5160,7 +5231,7 @@ test "HRR server: off by default — an unconfigured server answers ClientHello1
         .cipher_suites = &.{.aes_128_gcm_sha256},
     });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -5245,7 +5316,7 @@ test "handshake: server handleFlight rejects the wrong state" {
     // first would itself error — simpler: directly assert a state this
     // engine never lets `.start` accept, by using `.connected` state.
     server.state = .connected;
-    try testing.expectError(error.WrongState, server.handleFlight("x", testRandom(&csprng), 0, &out));
+    try testing.expectError(error.WrongState, server.handleFlight("x", seededForTest(&csprng), 0, &out));
 }
 
 test "poll: nothing to retransmit before a handshake starts or after it connects" {
@@ -5266,7 +5337,7 @@ test "handshake: dropped ClientHello retransmits via poll (fake clock), then com
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x30} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5410,7 +5481,7 @@ test "cert-mode: server-cert-only handshake completes, derives matching keys, ap
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
 
     // Identical derived application keys on both sides — proves the
     // certificate-mode messages fed the SAME bytes into both sides'
@@ -5455,7 +5526,7 @@ test "cert-mode: CertificateVerify signed with the WRONG key is rejected (typed 
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x61} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5487,7 +5558,7 @@ test "cert-mode: a directly-tampered CertificateVerify signature byte is rejecte
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x62} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5543,7 +5614,7 @@ test "cert-mode: peer chain signed by an UNTRUSTED anchor is rejected" {
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x63} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5570,7 +5641,7 @@ test "cert-mode: require_peer_cert rejects a server that presents no certificate
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x64} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5614,7 +5685,7 @@ test "cert-mode: CertificateRequest -> client presents its own cert -> mutual au
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
 
     try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server.read_keys.key[0..server.read_keys.key_len]);
 
@@ -5651,7 +5722,7 @@ test "cert-mode: server requires a client cert but client has none configured ->
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x66} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5678,7 +5749,7 @@ test "cert-mode: PSK-only Config fields (cert=null, peer_verify=.none) reproduce
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
 }
@@ -5721,7 +5792,7 @@ test "cert-mode: signature_algorithms negotiation picks the mutually-supported s
     // x (server's ECDSA-P256 key's one candidate) is `ecdsa_secp256r1_sha256`
     // — completing at all proves that scheme, and only that scheme, was
     // negotiated end-to-end through the real flight engine.
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
 }
@@ -5750,7 +5821,7 @@ test "cert-mode: no mutually-supported signature scheme for the server's own Cer
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x68} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5788,7 +5859,7 @@ test "cert-mode: no mutually-supported signature scheme for the CLIENT's own Cer
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x69} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5886,7 +5957,7 @@ test "cert-DHE: server-only auth handshake completes, matching keys, app data ro
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
 
     // Both sides derived IDENTICAL directional application keys purely from
     // the ephemeral X25519 exchange (there is NO PSK here) + the transcript.
@@ -5920,7 +5991,7 @@ test "cert-DHE: ChaCha20-Poly1305 suite also completes" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
 }
@@ -5943,7 +6014,7 @@ test "cert-DHE: mutual auth (CertificateRequest -> client cert) completes" {
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
 
@@ -5958,7 +6029,7 @@ test "cert-DHE reject: a tampered ServerHello key_share breaks the handshake (ty
     var client = try Connection.clientInit(certDheClientConfig());
     var server = try Connection.serverInit(certDheServerConfig());
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x73} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -5993,7 +6064,7 @@ test "cert-DHE reject: CertificateVerify signed with the WRONG key is rejected" 
     var client = try Connection.clientInit(certDheClientConfig());
     var server = try Connection.serverInit(cfg_s);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x74} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6008,7 +6079,7 @@ test "cert-DHE reject: untrusted anchor is rejected" {
     var client = try Connection.clientInit(cfg_c);
     var server = try Connection.serverInit(certDheServerConfig());
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x75} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6029,7 +6100,7 @@ test "cert-DHE reject: a cert-DHE server rejects a ClientHello with no key_share
     });
     var server = try Connection.serverInit(certDheServerConfig());
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x76} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6104,7 +6175,7 @@ test "cert-DHE fail-closed: a server that presents NO certificate cannot complet
         .cipher_suites = &.{.aes_128_gcm_sha256},
     });
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x7f} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6136,7 +6207,7 @@ test "cert-DHE: the unauthenticated mode is reachable ONLY by its own name, and 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x80} ** 32);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
-    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
 
@@ -6160,7 +6231,7 @@ test "advertised_groups and the (EC)DHE implementation agree (no group we cannot
     // perfectly ordinary server into an unreachable one. This test is the
     // reason `advertised_groups` is a single list rather than two literals.
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     for (advertised_groups) |g| {
         try testing.expect(groupAdvertised(g));
         const kp = try ecdheGenerate(g, rnd);
@@ -6350,7 +6421,7 @@ test "cert-DHE HRR: a GROUP-CHANGE retry regenerates the key_share in the named 
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x80} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -6393,7 +6464,7 @@ test "cert-DHE HRR: a COOKIE-ONLY retry leaves the key_share byte-identical (§4
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x81} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -6428,7 +6499,7 @@ test "cert-DHE HRR: cookie AND group change in one retry are both applied" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x82} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -6453,7 +6524,7 @@ test "cert-DHE HRR reject: a retry naming a group the client ALREADY offered a s
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x83} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -6483,7 +6554,7 @@ test "cert-DHE HRR reject: a retry naming a group never advertised in supported_
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x84} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -6499,7 +6570,7 @@ test "cert-DHE HRR reject: a retry with neither a cookie nor a group change" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x85} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -6512,7 +6583,7 @@ test "PSK HRR reject: a retry carrying a key_share (psk_ke has no (EC)DHE to upd
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x86} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -6532,7 +6603,7 @@ test "HRR: the ServerHello must select the cipher suite the retry committed to (
     var client = try Connection.clientInit(cfg);
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x87} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -6591,7 +6662,7 @@ test "cert-DHE: a ServerHello answering in a DIFFERENT group than the client off
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x88} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1); // offers x25519
 
@@ -6633,7 +6704,7 @@ test "cert-DHE: a ServerHello negotiating DTLS 1.2 (real legacy value, not garba
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x89} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1); // offers x25519
 
@@ -6678,7 +6749,7 @@ test "cert-DHE HRR self-interop: our own server's stateless cookie exchange work
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x89} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6725,7 +6796,7 @@ test "cert-DHE: our server accepts a secp256r1 client share and answers in the s
     var server = try Connection.serverInit(certDheServerConfig());
     defer server.deinit();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x8a} ** 32);
-    const rnd = testRandom(&csprng);
+    const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6753,25 +6824,57 @@ test "cert-DHE: our server accepts a secp256r1 client share and answers in the s
 
 // ── RNG-seam pins (B6, 2026-08-12) ─────────────────────────────────────────
 //
-// `startHandshake`/`handleFlight` keep taking a `std.Random`: this module is a
-// deliberately sans-I/O state machine (no socket, no clock, no allocator —
-// every external fact is an input VALUE), so handing it a `std.Io` capability
-// handle would contradict the invariant the rest of the file is built on, and
-// `handleFlight` is the ONLY way to drive the engine, so a `…ForTest` twin
-// would make the seeded path the one every test exercises and the production
-// path the untested one. See `../../../CML`-side audit note; the honest
-// consequence is recorded here in code: the hazard below REMAINS REACHABLE,
-// and what changed is the signal, not the structure.
+// `startHandshake`/`handleFlight` take an `Entropy`, not a `std.Random`. The
+// weak path still EXISTS — it has to, these tests need a reproducible
+// handshake — but it is now a named arm a caller has to write out
+// (`.seeded_for_test`), not the shape of the parameter itself. `std.Io` is
+// still refused: this module is a deliberately sans-I/O state machine (no
+// socket, no clock, no allocator — every external fact is an input VALUE), and
+// a capability handle threaded through the per-datagram entry point would
+// contradict the invariant the rest of the file is built on. A tagged union is
+// a value, so it does not.
+//
+// The pins below are in two halves: the TYPE admits exactly two answers and
+// they are distinct (`Entropy`), and the consequence of picking the wrong one
+// is real and measured (`ecdheGenerate` reproducing a private key).
+
+test "Entropy: exactly two arms, production and test are distinct, and nothing else is admitted" {
+    // What the fix IS, pinned as a type property rather than as prose. If a
+    // third arm appears, or the two collapse into one, or the production arm
+    // is renamed out from under the callers, this fails.
+    const info = @typeInfo(Entropy).@"union";
+    try testing.expectEqual(@as(usize, 2), info.fields.len);
+    try testing.expectEqualStrings("csprng", info.fields[0].name);
+    try testing.expectEqualStrings("seeded_for_test", info.fields[1].name);
+
+    // Distinct: the same generator under the two arms is not the same value,
+    // so "which arm" survives being passed around. Without this the test would
+    // still pass if the tag were cosmetic.
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    const production: Entropy = .{ .csprng = csprng.random() };
+    const for_test: Entropy = .{ .seeded_for_test = csprng.random() };
+    try testing.expect(std.meta.activeTag(production) != std.meta.activeTag(for_test));
+
+    // The union is TAGGED (a bare `union` would make the tag unreadable, and
+    // the arms indistinguishable at runtime).
+    try testing.expect(info.tag_type != null);
+
+    // Both arms carry a `std.Random` — the difference is the caller's claim
+    // about it, which is exactly what this module cannot check for itself.
+    try testing.expectEqual(std.Random, info.fields[0].type);
+    try testing.expectEqual(std.Random, info.fields[1].type);
+}
 
 test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE private key exactly" {
-    // This is R1 from the audit, demonstrated rather than asserted. Two
-    // `Connection`s driven from generators in the same state derive the SAME
-    // x25519 ephemeral secret, so a passive eavesdropper who knows the seed
-    // recovers the shared secret and decrypts every session, retroactively.
+    // This is R1 from the audit, demonstrated rather than asserted — it is why
+    // `.seeded_for_test` has the doc comment it has. Two `Connection`s driven
+    // from generators in the same state derive the SAME x25519 ephemeral
+    // secret, so anyone who knows the seed recovers the shared secret and
+    // decrypts every recorded session, retroactively.
     var a = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
     var b = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
-    const ka = try ecdheGenerate(x25519_group, a.random());
-    const kb = try ecdheGenerate(x25519_group, b.random());
+    const ka = try ecdheGenerate(x25519_group, .{ .seeded_for_test = a.random() });
+    const kb = try ecdheGenerate(x25519_group, .{ .seeded_for_test = b.random() });
     try testing.expectEqualSlices(u8, &ka.secret, &kb.secret);
     try testing.expectEqualSlices(u8, ka.public[0..ka.public_len], kb.public[0..kb.public_len]);
 
@@ -6779,15 +6882,23 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     // code: a different seed gives a different key. Both halves are needed —
     // the first alone would also pass if `ecdheGenerate` returned a fixed key.
     var c = std.Random.DefaultCsprng.init([_]u8{0x6B} ** 32);
-    const kc = try ecdheGenerate(x25519_group, c.random());
+    const kc = try ecdheGenerate(x25519_group, .{ .seeded_for_test = c.random() });
     try testing.expect(!std.mem.eql(u8, &ka.secret, &kc.secret));
+
+    // The ARM is not what decides the bytes — `.csprng` over the same seeded
+    // generator gives the identical key. That is the honest statement of what
+    // the type does and does not buy: it makes the choice explicit, it cannot
+    // make a bad generator good.
+    var f = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    const kf = try ecdheGenerate(x25519_group, .{ .csprng = f.random() });
+    try testing.expectEqualSlices(u8, &ka.secret, &kf.secret);
 
     // Same for P-256, whose rejection-sampling loop could plausibly have
     // masked the dependency.
     var d = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
     var e = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
-    const kd = try ecdheGenerate(secp256r1_group, d.random());
-    const ke = try ecdheGenerate(secp256r1_group, e.random());
+    const kd = try ecdheGenerate(secp256r1_group, .{ .seeded_for_test = d.random() });
+    const ke = try ecdheGenerate(secp256r1_group, .{ .seeded_for_test = e.random() });
     try testing.expectEqualSlices(u8, &kd.secret, &ke.secret);
 }
 

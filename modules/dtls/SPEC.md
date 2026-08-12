@@ -211,7 +211,7 @@ unaffected — proven by the untouched existing suite). Summary:
 - **`Connection.zig`:** in `.cert_dhe` mode the ClientHello offers
   `{supported_groups, signature_algorithms, key_share}` with a fresh
   ephemeral X25519 keypair (`std.crypto.dh.X25519`, seeded from the
-  caller-supplied `std.Random`) and **no `pre_shared_key`, no binder**; the
+  caller-supplied `Entropy`) and **no `pre_shared_key`, no binder**; the
   ServerHello returns its own X25519 share. The ECDHE shared secret is fed
   into the **existing, unmodified** `keyschedule.deriveHandshakeSecret` (the
   early secret's IKM is the zero PSK, RFC 8446 §7.1 — the schedule was

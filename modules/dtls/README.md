@@ -139,7 +139,7 @@ version || cipher_suite || Hash(ClientHello1))`. `peer_binding` is
 **caller-supplied** — typically the peer's packed address and port. It has to
 be: this module never touches a socket (the caller owns the datagram I/O), so
 the peer's address is an input in the same way the clock (`Config.now_sec`)
-and randomness (`std.Random` arguments) are. A cookie that is not bound to an
+and randomness (the `Entropy` arguments) are. A cookie that is not bound to an
 address is not a return-routability check, so an empty `peer_binding` is a
 config error rather than a documented footgun.
 
@@ -201,8 +201,9 @@ var conn = try dtls.Connection.clientInit(cfg); // real, validated, no panic
 
 // The handshake flight engine drives a real RFC 9147 §5 PSK handshake:
 var out: [1500]u8 = undefined;
-// `random` MUST be a cryptographically secure source — see "Randomness" below.
-const client_hello = try conn.startHandshake(random, now_ms, &out);
+// The entropy source is NAMED at the call site — see "Randomness" below.
+var csprng = std.Random.DefaultCsprng.init(seed_from_getrandom);
+const client_hello = try conn.startHandshake(.{ .csprng = csprng.random() }, now_ms, &out);
 // send client_hello to the peer, feed its reply to conn.handleFlight(...);
 // see Connection.zig's tests for a full client<->server loopback.
 
@@ -214,13 +215,24 @@ const record = try conn.send("hello", &out);   // AEAD + seq-number encryption
 ```
 
 
-## Randomness — what the caller must supply
+## Randomness — a choice the caller names
 
-`startHandshake` and `handleFlight` take a `std.Random`. It **MUST be a
-cryptographically secure source** (`std.Random.DefaultCsprng` seeded from real
-OS entropy in production); std 0.16 removed `std.crypto.random`, so this module
-has no hidden RNG and cannot obtain one — the same caller-injected seam the
-`jwt`/`jwe` siblings use.
+`startHandshake` and `handleFlight` take a `dtls.Entropy`, a two-armed tagged
+union:
+
+```zig
+pub const Entropy = union(enum) {
+    csprng: std.Random,          // production
+    seeded_for_test: std.Random, // reproducible handshakes, tests only
+};
+```
+
+The production arm **MUST be a cryptographically secure source**
+(`std.Random.DefaultCsprng` seeded from real OS entropy); std 0.16 removed
+`std.crypto.random`, so this module has no hidden RNG and cannot obtain one —
+the same caller-injected seam the `jwt`/`jwe` siblings use. What changed is that
+supplying a seeded generator is no longer something that can happen by reflex:
+the weak path is a variant the caller has to name.
 
 This is not a style note. In `.cert_dhe` mode those two calls draw the
 **x25519 / secp256r1 ephemeral private key**. Under a seeded PRNG a passive
@@ -232,17 +244,22 @@ is what is lost. Lesser but real: the ClientHello/ServerHello 32-byte `random`
 becomes constant (every handshake byte-identical and linkable), and the
 RSA-PSS CertificateVerify salt repeats.
 
-`std.Random` is a vtable, so a seeded generator and `getrandom(2)` are
-indistinguishable at the call site — **this module cannot detect the mistake,
-and does not try to.** The parameter type was kept deliberately: `Connection`
-is a sans-I/O state machine (no socket, no clock, no allocator — every
-external fact arrives as an input value, see the HelloRetryRequest section),
-and `handleFlight` is the only way to drive it, so taking a `std.Io` capability
-handle per datagram would contradict that design and would leave the seeded
-path as the one every test exercises. The consequence is stated plainly rather
-than engineered away: **a caller who passes a seeded PRNG still gets a
-predictable ephemeral key.** `Connection.zig` carries a test that demonstrates
-exactly that, so the warning above is verified rather than asserted.
+`std.Random` is a vtable, so a seeded generator and `getrandom(2)` are still
+indistinguishable INSIDE either arm — **this module cannot judge the quality of
+what it is handed, and does not try to.** Naming `.csprng` is an assertion the
+caller makes, not one the code checks; what the type removes is the accident,
+not the possibility. `Connection.zig` carries a test that demonstrates the cost
+of the wrong choice (two connections from the same seed derive the identical
+ephemeral private key), so the warning above is measured rather than asserted.
+
+The `io: std.Io` arm the sibling `coconut`/`bbs`/`ibe` modules use is
+deliberately absent here: `Connection` is a sans-I/O state machine (no socket,
+no clock, no allocator — every external fact arrives as an input value, see the
+HelloRetryRequest section), and `handleFlight` is the only way to drive it, so
+taking a capability handle per datagram would hand a protocol engine the socket
+authority this design exists to withhold. A tagged union is a value, so it costs
+that invariant nothing — and, unlike a `…ForTest` twin entry point, it does not
+push all 263 tests onto a seeded path and leave production untested.
 
 The `dtls.keyschedule` and `dtls.aead` modules are the KAT-validated crypto
 core; `dtls.record`/`handshake`/`flight`/`messages` are the pure framing

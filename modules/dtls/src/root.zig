@@ -195,18 +195,21 @@
 //! §4.4.1's `message_hash` rewrite is what makes that possible). The cookie
 //! is bound to a caller-supplied `peer_binding` — this module never touches
 //! a socket, so the peer's address is an input, like `Config.now_sec` and
-//! the `std.Random` arguments. Off by default (source compatibility), which
+//! the `Entropy` arguments. Off by default (source compatibility), which
 //! is NOT the posture RFC 9147 §5.1 recommends for an internet-facing
 //! server: without it, a spoofed ClientHello turns the server into an
 //! amplifier.
 //!
-//! ## Randomness — a caller obligation, stated once here and at each entry point
+//! ## Randomness — a choice the caller names, at every call site
 //!
 //! `Connection.startHandshake` and `Connection.handleFlight` take a
-//! `std.Random`. It **MUST be a cryptographically secure source**
-//! (`std.Random.DefaultCsprng` seeded from real OS entropy in production);
-//! std 0.16 removed `std.crypto.random`, so this module has no hidden RNG —
-//! the same caller-injected seam `jwt`/`jwe` use.
+//! `Connection.Entropy`, a two-armed tagged union: `.csprng` (production) and
+//! `.seeded_for_test`. std 0.16 removed `std.crypto.random`, so this module
+//! has no hidden RNG — the generator is the caller's to supply, as in
+//! `jwt`/`jwe` — but WHICH KIND of generator is no longer inferred from
+//! whatever happened to be in scope. It **MUST be a cryptographically secure
+//! source** (`std.Random.DefaultCsprng` seeded from real OS entropy), and
+//! saying so now costs the caller a word they have to type.
 //!
 //! The stake is the ephemeral (EC)DHE private key: in `.cert_dhe` mode those
 //! calls reach `ecdheGenerate`, and under a seeded PRNG a passive eavesdropper
@@ -217,15 +220,19 @@
 //! handshakes) and a repeated RSA-PSS CertificateVerify salt.
 //!
 //! `std.Random` is a vtable: a seeded generator is indistinguishable from
-//! `getrandom(2)` at the call site, so **this module cannot detect the mistake
-//! and does not try to.** The parameter type is deliberate — `Connection` is a
-//! sans-I/O state machine (no socket, no clock, no allocator; every external
-//! fact is an input value) and `handleFlight` is the only way to drive it, so
-//! a `std.Io` capability handle threaded through it per datagram would
-//! contradict that design. `certverify.sign` shows where a type CAN carry the
-//! requirement: it takes `?std.Random` and fails closed with
-//! `error.RandomRequired` for RSA-PSS, while the ECDSA/Ed25519 arms fall back
-//! to RFC 6979/8032 deterministic derivation.
+//! `getrandom(2)` INSIDE either arm, so **this module still cannot judge the
+//! quality of what it is handed and does not try to.** What the type removes is
+//! the accident — the weak path exists (this module's own suites and its
+//! wolfSSL harness need a replayable handshake) but it can only be entered by
+//! writing `.seeded_for_test`. The `io: std.Io` arm that `coconut`/`bbs`/`ibe`
+//! use is deliberately absent: `Connection` is a sans-I/O state machine (no
+//! socket, no clock, no allocator; every external fact is an input value) and
+//! `handleFlight` is the only way to drive it, so a capability handle threaded
+//! through it per datagram would contradict that design. A union is a value, so
+//! it does not. `certverify.sign` keeps its own, different shape: it takes
+//! `?std.Random` and fails closed with `error.RandomRequired` for RSA-PSS,
+//! while the ECDSA/Ed25519 arms fall back to RFC 6979/8032 deterministic
+//! derivation.
 //!
 //! **Out of scope (deliberate, not deferred-as-a-stub):** 0-RTT/early data; session
 //! resumption (`res binder`/NewSessionTicket); key update (RFC 8446
@@ -325,6 +332,10 @@ pub const CipherSuite = connection.CipherSuite;
 /// its unauthenticated `.cert_dhe_insecure_unauthenticated` sibling) mode
 /// selector for `Config.key_exchange` — see `Connection.KeyExchange`.
 pub const KeyExchange = connection.KeyExchange;
+/// Where `startHandshake`/`handleFlight` get their randomness, as a choice the
+/// caller makes by name: `.csprng` for production, `.seeded_for_test` for a
+/// reproducible handshake. See "Randomness" above and `Connection.Entropy`.
+pub const Entropy = connection.Entropy;
 
 pub const meta = .{
     .platform = .any,
