@@ -69,6 +69,7 @@
 
 const std = @import("std");
 const xeddsa = @import("xeddsa.zig");
+const entropy = @import("entropy");
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
@@ -125,6 +126,35 @@ pub const OneTimePreKey = struct {
     key_pair: X25519.KeyPair,
     id: u32,
 };
+
+/// A fresh X25519 keypair for ANY of the four roles above — the one place
+/// this module and `ratchet.zig` mint private keys.
+///
+/// Body-identical to `std.crypto.dh.X25519.KeyPair.generate`, with one
+/// substitution: the seed comes from `entropy.fill` rather than
+/// `io.random`, whose contract permits a silent degrade (CONVENTIONS.md
+/// §2.2). For X25519 the seed IS the secret key, so a weak draw here is a
+/// weak identity/prekey/ephemeral/ratchet key with nothing to report it.
+/// The retry loop is std's and is kept for the same reason std keeps it:
+/// `generateDeterministic` rejects a seed whose public key is the identity
+/// element, and the answer is another draw, not a failure.
+///
+/// This is the module's fail-closed key source and is deliberately NOT the
+/// seam the KAT tests drive. Those pass their randomness in as a value —
+/// `xeddsa.sign`'s `z` parameter — which is why `CONVENTIONS.md` §2.2 can
+/// name signal's KAT seam an `io.random` exception without that exception
+/// reaching any key minted here.
+pub fn generateKeyPair(io: std.Io) X25519.KeyPair {
+    var seed: [X25519.seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    while (true) {
+        entropy.fill(io, &seed);
+        return X25519.KeyPair.generateDeterministic(seed) catch {
+            @branchHint(.unlikely);
+            continue;
+        };
+    }
+}
 
 // ── PreKeyBundle (what Bob publishes) — REAL codec ──────────────────────
 
@@ -374,7 +404,10 @@ pub fn initiateUnverified(
     initial_ciphertext: []const u8,
     io: std.Io,
 ) (AgreementError || std.mem.Allocator.Error)!InitiateOutput {
-    const ek = X25519.KeyPair.generate(io);
+    // `EKA` is single-use and feeds three of the four DHs — it is the only
+    // secret Alice contributes to this session that is not her long-term
+    // identity key, so it carries the run's forward secrecy on its own.
+    const ek = generateKeyPair(io);
 
     const dh1 = try dh(alice_ik.secret_key, bob_bundle.signed_prekey);
     const dh2 = try dh(ek.secret_key, bob_bundle.identity_key);
@@ -455,8 +488,17 @@ pub fn respond(
 /// signed ... with IK_B"). `z` is the 64 bytes of signing randomness
 /// `xeddsa.sign` consumes — fill from `io.random`, like the callers in
 /// `kat_test.zig` do.
+///
+/// Note the asymmetry between the two sources of randomness here, and that
+/// it is deliberate: the KEYPAIR is drawn fail-closed below, while `z`
+/// stays a caller-supplied parameter (XEdDSA tolerates a weak `z` — it is
+/// hashed together with the secret scalar and the message, never used
+/// alone — and passing it in is what makes the published vectors
+/// reproducible).
 pub fn generateSignedPreKey(bob_ik: IdentityKey, id: u32, z: xeddsa.RandomData, io: std.Io) SignedPreKey {
-    const kp = X25519.KeyPair.generate(io);
+    // `SPKB` is medium-term: it signs Bob's bundle for every session opened
+    // between two rotations, so one weak draw compromises all of them.
+    const kp = generateKeyPair(io);
     const sig = xeddsa.sign(bob_ik.secret_key, &kp.public_key, z);
     return .{ .key_pair = kp, .signature = sig, .id = id };
 }

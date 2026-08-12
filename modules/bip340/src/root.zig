@@ -390,11 +390,15 @@ pub const BatchItem = struct {
 /// where `R_i = lift_x(r_i)` (the whole batch fails if any `r_i` does not
 /// lift, any pubkey does not lift, or any `s_i >= n` — per the spec) and
 /// `e_i` is each item's individual challenge hash. `io` supplies the
-/// `a_2..a_u` randomness (`Secp256k1.scalar.Scalar.random`, rejection-
-/// sampled non-zero); BIP340 requires these to be unpredictable to an
+/// `a_2..a_u` randomness (`io.randomSecure`, wide-reduced and
+/// rejection-sampled non-zero — std's `Scalar.random` loop with the
+/// fail-closed draw; see the call site for why not `Scalar.random` and why
+/// not `entropy.fill`); BIP340 requires these to be unpredictable to an
 /// attacker and drawn AFTER all `(pubkey, msg, sig)` triples are fixed —
 /// satisfied here because they are drawn inside this call, from the
-/// caller's CSPRNG, after the full `items` slice is bound.
+/// caller's CSPRNG, after the full `items` slice is bound. If that CSPRNG
+/// cannot deliver, the batch is reported unverified (`false`) rather than
+/// checked against predictable randomizers.
 ///
 /// Implementation note (documented deviation from a maximally-batched
 /// form): the right-hand side is accumulated per item via one
@@ -427,7 +431,34 @@ pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
         const e = reduceToScalar(challenge_hasher.finalResult());
 
         // a_1 = 1; a_2..a_u random non-zero.
-        const a: Scalar = if (i == 0) Scalar.one else Scalar.random(io);
+        //
+        // The randomizers are the ONLY thing standing between this function
+        // and an attacker who submits a batch of invalid signatures chosen
+        // so their errors cancel: predict the `a_i` and the linear
+        // combination can be made to hold with every individual signature
+        // wrong. That is a soundness property, not a secrecy one — but it
+        // still means `io.random`'s documented degrade (a pid-and-clock
+        // seed, CONVENTIONS.md §2.2) is a forgery oracle here, so this is
+        // `randomSecure`, std's `Scalar.random` loop inlined around it.
+        //
+        // On an entropy failure it returns `false` rather than calling
+        // `entropy.fill` and aborting the process. `false` already means
+        // "this batch is not verified" — the function's whole contract is
+        // that every failure path returns it — and unlike a key draw
+        // nothing irreversible is minted: BIP340 single-signature `verify`
+        // needs no randomness at all, so a caller who gets `false` can
+        // re-check the items one by one and lose nothing but the batching
+        // speedup. Aborting the host to avoid that would be the larger
+        // harm, which is exactly the test `entropy.fill`'s doc sets for
+        // whether to use it.
+        const a: Scalar = if (i == 0) Scalar.one else blk: {
+            var wide: [48]u8 = undefined;
+            while (true) {
+                io.randomSecure(&wide) catch return false;
+                const n = Scalar.fromBytes48(wide, .little);
+                if (!n.isZero()) break :blk n;
+            }
+        };
 
         lhs_scalar = lhs_scalar.add(a.mul(s));
 

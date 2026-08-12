@@ -48,6 +48,7 @@
 //! reactive "we already forgot that state" outcome at the session level).
 
 const std = @import("std");
+const entropy = @import("entropy");
 const ratchet_mod = @import("ratchet.zig");
 const cipher_mod = @import("cipher.zig");
 const message_mod = @import("message.zig");
@@ -59,6 +60,23 @@ const Message = message_mod.Message;
 const SessionKey = session_key_mod.SessionKey;
 const ExportedSessionKey = session_key_mod.ExportedSessionKey;
 
+/// `Ed25519.KeyPair.generate` with the seed taken from `entropy.fill`
+/// instead of `io.random` (CONVENTIONS.md §2.2) — otherwise std's function
+/// verbatim, retry loop included, so nothing about the key changes except
+/// where its 32 seed bytes come from. Split out of `OutboundSession.init`
+/// only because a struct-literal field is no place for a loop.
+fn generateSigningKey(io: std.Io) Ed25519.KeyPair {
+    var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    while (true) {
+        entropy.fill(io, &seed);
+        return Ed25519.KeyPair.generateDeterministic(seed) catch {
+            @branchHint(.unlikely);
+            continue;
+        };
+    }
+}
+
 /// The sending side: a fresh random ratchet plus an Ed25519 signing
 /// keypair (megolm.md "Session setup").
 pub const OutboundSession = struct {
@@ -67,8 +85,13 @@ pub const OutboundSession = struct {
 
     pub fn init(io: std.Io) OutboundSession {
         return .{
+            // Fail-closed already — see `Ratchet.generate`.
             .ratchet = Ratchet.generate(io),
-            .signing_key = Ed25519.KeyPair.generate(io),
+            // The other half of the same session, and it had been left on
+            // `io.random`: this key signs every session-sharing blob and
+            // every message frame, so a weak draw here lets an attacker
+            // forge into the group even with a perfect ratchet.
+            .signing_key = generateSigningKey(io),
         };
     }
 

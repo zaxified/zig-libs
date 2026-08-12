@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- Each KEM's `generateKeyPair` now mints its keypair the way RFC 9180 §4
+  defines it — `GenerateKeyPair() = DeriveKeyPair(random(Nsk))` — with
+  `random` being `entropy.fill` (`std.Io.randomSecure`). **Not breaking:**
+  no signature changes, no wire byte changes, and the KAT-driven
+  `deriveKeyPair`/`*Deterministic` entry points are untouched. New dep:
+  `entropy`.
+
+  Previously `X25519Kem` forwarded to `std.crypto.dh.X25519.KeyPair.
+  generate` and the two NIST KEMs called `P{256,384}.scalar.random(io,
+  .big)`. All three take their randomness from `std.Io.random`, whose
+  contract permits a silent fallback to a weaker seed (`std/Io.zig:2462`);
+  the default `Io.Threaded` takes it, seeding from a zeroed buffer plus an
+  ASLR pointer, the pid and a clock. That is the sender's ephemeral key in
+  every `encap`/`setup*S`/`seal*` call, i.e. the key the whole
+  `shared_secret` rests on, and `generateKeyPair` returns a `KeyPair` with
+  no error channel to report a degraded draw on.
+
+  The X25519 KEM could have kept std's shape and swapped only the draw
+  (`KeyPair.generateDeterministic` is public); the NIST KEMs could not,
+  because `scalar.random`'s rejection loop is std-internal and takes the
+  `io` itself. Rather than re-implement that loop, all three now go
+  through this module's own `deriveKeyPair` — which means the keygen path
+  is covered by the RFC 9180 A.1.1/A.3.3 vectors for the first time
+  (`KeyPair.generate` and `scalar.random` never were). `P384Kem` gains no
+  such anchor, since Appendix A publishes no P-384 vector.
+
+  `mls` inherits the change through `S.Kem.generateKeyPair` (its
+  `UpdatePath` leaf key) without any edit of its own.
+
 - `mode_psk`, `mode_auth` and `mode_auth_psk` are now anchored to RFC
   9180's own Appendix A vectors (A.1.2/3/4 for X25519, A.3.2/3/4 for
   P-256) instead of only to this module's round-trip; the implementations

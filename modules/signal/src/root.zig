@@ -52,8 +52,11 @@ pub const meta = .{
     .concurrency = .reentrant, // no globals; every type here is a plain caller-owned value
     .model_after = "Signal X3DH (signal.org/docs/specifications/x3dh) + XEdDSA (signal.org/docs/specifications/xeddsa) + Double Ratchet (signal.org/docs/specifications/doubleratchet); std.crypto.dh.X25519 supplies the DH (agreement + ratchet), std.crypto.ecc.Edwards25519/std.crypto.hash.sha2.Sha512 supply XEdDSA's building blocks, std.crypto.kdf.hkdf.HkdfSha256 supplies the KDFs (X3DH + KDF_RK), std.crypto.auth.hmac.sha2.HmacSha256 supplies KDF_CK, the chachapoly sibling (byte-exact to std.crypto.aead.chacha_poly.ChaCha20Poly1305) supplies the ratchet AEAD",
     // chachapoly: the ratchet AEAD (byte-exact to std; one audited
-    // ChaCha20-Poly1305 across the repo). Everything else is std.
-    .deps = .{ "chachapoly", "ct25519" },
+    // ChaCha20-Poly1305 across the repo). ct25519: the constant-time
+    // secret-scalar ladder XEdDSA signs on. entropy: the seed behind
+    // `x3dh.generateKeyPair`, i.e. every private key this module mints.
+    // Everything else is std.
+    .deps = .{ "chachapoly", "ct25519", "entropy" },
 };
 
 pub const xeddsa = @import("xeddsa.zig");
@@ -92,14 +95,19 @@ test {
     _ = @import("kat_test.zig");
 }
 
-test "meta.deps is exactly {chachapoly, ct25519} (the ratchet AEAD + the CT ladder)" {
+test "meta.deps is exactly {chachapoly, ct25519, entropy} (the ratchet AEAD + the CT ladder + the fail-closed key draw)" {
     // `ct25519` is std's own Edwards25519 window ladder with the trailing
     // `rejectIdentity` removed — XEdDSA multiplies the base point by two
     // SECRET scalars (the sign-0 key scalar and the per-signature nonce),
     // and std's `mul` ends by branching on the result of exactly those.
-    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
+    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[0]);
     try std.testing.expectEqualStrings("ct25519", meta.deps[1]);
+    // `entropy` is the seed in `x3dh.generateKeyPair` — every identity,
+    // signed-prekey, one-time-prekey, X3DH ephemeral and Double Ratchet DH
+    // key this module mints. It does NOT reach the KAT seam, which takes
+    // its randomness (`xeddsa.sign`'s `z`) as a parameter.
+    try std.testing.expectEqualStrings("entropy", meta.deps[2]);
 }
 
 test "meta.role is .util (no owned transport/socket, unlike a .client/.server module)" {

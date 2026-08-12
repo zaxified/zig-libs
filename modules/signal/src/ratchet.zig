@@ -251,7 +251,10 @@ pub const State = struct {
         bob_ratchet_pub: [key_length]u8,
         io: std.Io,
     ) AgreementError!State {
-        const dhs = X25519.KeyPair.generate(io);
+        // Alice's first sending ratchet key. Everything after it is derived
+        // from a chain this DH seeds, so a weak draw here is not recovered
+        // by any later ratchet step.
+        const dhs = x3dh.generateKeyPair(io);
         const dh_out = X25519.scalarmult(dhs.secret_key, bob_ratchet_pub) catch
             return error.KeyAgreementFailed;
         const derived = kdfRk(sk, dh_out);
@@ -493,7 +496,10 @@ fn dhRatchet(work: *Scalars, header: Header, io: std.Io) DecryptError!void {
 
     const dh_recv = X25519.scalarmult(work.dhs.secret_key, header.dh) catch
         return error.KeyAgreementFailed;
-    const new_dhs = X25519.KeyPair.generate(io);
+    // The post-compromise-security half of the ratchet: this is the key
+    // whose freshness is supposed to lock an attacker who learned the old
+    // state back out. Drawn from a degraded seed it locks nobody out.
+    const new_dhs = x3dh.generateKeyPair(io);
     const dh_send = X25519.scalarmult(new_dhs.secret_key, header.dh) catch
         return error.KeyAgreementFailed;
 

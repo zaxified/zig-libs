@@ -73,13 +73,17 @@
 //! algorithm shape — a genuine design reference. See `../NOTICE`.
 
 const std = @import("std");
+const entropy = @import("entropy");
 
 pub const meta = .{
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "jedisct1/minisign (C reference, ISC) + jedisct1/zig-minisign (ISC)",
-    .deps = .{}, // std.crypto.sign.Ed25519, std.crypto.hash.blake2, std.crypto.pwhash.scrypt, std.base64
+    // entropy: the Ed25519 seed in `KeyPair.generate` — the only secret this
+    // module mints. Everything else is std: std.crypto.sign.Ed25519,
+    // std.crypto.hash.blake2, std.crypto.pwhash.scrypt, std.base64.
+    .deps = .{"entropy"},
 };
 
 // ── field sizes (all format facts from minisign.h) ──────────────────────────
@@ -517,10 +521,28 @@ pub const KeyPair = struct {
     ed25519: std.crypto.sign.Ed25519.KeyPair,
 
     /// Generate a fresh random key pair (fresh random key number too).
+    ///
+    /// The two draws below are deliberately NOT the same call. `key_number`
+    /// is published in the clear in every `.pub`/`.sig` file — it is an
+    /// identifier, not a secret, and `io.random` is the right source for
+    /// it. The Ed25519 seed is the signing key for every release this key
+    /// will ever sign, so it is fail-closed (CONVENTIONS.md §2.2).
     pub fn generate(io: std.Io) KeyPair {
         var key_number: [key_number_length]u8 = undefined;
         io.random(&key_number);
-        return .{ .key_number = key_number, .ed25519 = std.crypto.sign.Ed25519.KeyPair.generate(io) };
+
+        // std's `Ed25519.KeyPair.generate`, verbatim except that the seed
+        // comes from `entropy.fill` rather than `io.random`.
+        var seed: [std.crypto.sign.Ed25519.KeyPair.seed_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        while (true) {
+            entropy.fill(io, &seed);
+            const ed25519 = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch {
+                @branchHint(.unlikely);
+                continue;
+            };
+            return .{ .key_number = key_number, .ed25519 = ed25519 };
+        }
     }
 
     pub fn publicKey(self: KeyPair) RawPublicKey {

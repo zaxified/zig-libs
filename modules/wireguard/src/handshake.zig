@@ -97,12 +97,28 @@ pub const Keypair = struct {
     private: PrivateKey,
     public: PublicKey,
 
-    /// Generate a fresh keypair (used for the per-handshake ephemeral).
-    /// `io` supplies entropy, matching the `sealedbox` module's convention
-    /// for std.crypto operations that need randomness.
+    /// Generate a fresh keypair (used for the per-handshake ephemeral, and
+    /// by callers for a peer's static identity).
+    ///
+    /// std's `X25519.KeyPair.generate` seeds from `io.random`; this is the
+    /// same function with `entropy.fill` in its place (CONVENTIONS.md
+    /// §2.2). WireGuard's ephemeral is what makes a session's keys
+    /// unrecoverable from the static keys alone — a predictable one hands a
+    /// passive recorder every packet of that handshake's session, and this
+    /// signature returns a `Keypair`, so there is no error to report a bad
+    /// draw on. The cookie secret and XChaCha nonce elsewhere in this
+    /// module already fail closed; this was the remaining draw that did not.
     pub fn generate(io: std.Io) Keypair {
-        const kp = noise.X25519.KeyPair.generate(io);
-        return .{ .private = kp.secret_key, .public = kp.public_key };
+        var seed: [noise.X25519.seed_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        while (true) {
+            entropy.fill(io, &seed);
+            const kp = noise.X25519.KeyPair.generateDeterministic(seed) catch {
+                @branchHint(.unlikely);
+                continue;
+            };
+            return .{ .private = kp.secret_key, .public = kp.public_key };
+        }
     }
 
     /// Rebuild a keypair from a stored private key (recomputes the public

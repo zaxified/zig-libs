@@ -120,7 +120,8 @@ known-answer vector pinned against BOTH XEdDSA variants; see
   absent, security property for that one session (an attacker who
   compromises `SPKB` after the fact gains slightly more from a 3-DH
   session than a 4-DH one — see the spec's own "Security considerations").
-- **Constant-time**: `X25519.scalarmult`/`X25519.KeyPair.generate` are
+- **Constant-time**: `X25519.scalarmult`/`X25519.KeyPair.generateDeterministic`
+  (which `x3dh.generateKeyPair` wraps around a fail-closed seed draw) are
   std's own constant-time-on-secret-material primitives (RFC 7748
   clamped Montgomery ladder) — this module performs no additional
   secret-dependent branching of its own in the DH/HKDF path.

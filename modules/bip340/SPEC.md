@@ -152,8 +152,13 @@ All three formerly-stubbed cores are implemented and KAT-validated
    `false` on every failure path, never panics/errors, and re-runs the
    lift/range checks itself so it is safe on hand-constructed values.
 3. **`verifyBatch`** — the random-linear-combination equation with `a_1
-   = 1` and `a_2..a_u` drawn from `io` (`Scalar.random`, non-zero by
-   rejection sampling) after the whole `items` slice is bound. The RHS
+   = 1` and `a_2..a_u` drawn from `io.randomSecure` (std's
+   `Scalar.random` loop inlined around the fail-closed draw: wide
+   reduction, non-zero by rejection sampling) after the whole `items`
+   slice is bound. The randomizers are a SOUNDNESS input — predictable
+   `a_i` let an attacker pass a batch of individually-invalid signatures
+   whose errors cancel — so an entropy failure returns `false` (batch not
+   verified) rather than checking against a degraded draw. The RHS
    accumulates per item as one variable-time double-base multiply
    `a_i·R_i + (a_i·e_i)·P_i` plus a complete point addition (std's API
    tops out at two bases per multiply — same equation and acceptance

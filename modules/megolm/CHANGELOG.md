@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- `OutboundSession.init`'s Ed25519 signing keypair now draws its seed from
+  `entropy.fill` (`std.Io.randomSecure`) instead of `io.random`, matching
+  what `Ratchet.generate` already did for R₀. **Not breaking:** no
+  signature changed and no new dep (`entropy` was already one).
+
+  The ratchet half of a session was fail-closed and the signing half was
+  not, which is the wrong place to draw that line: this key signs every
+  session-sharing blob and every message frame, so a weak draw lets an
+  attacker forge into the group no matter how good R₀ was. The generator
+  is std's `Ed25519.KeyPair.generate` verbatim — retry loop included —
+  with one substitution in where its 32 seed bytes come from.
+
 - `Ratchet.generate` draws R₀ through the new `entropy` module
   (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of `io.random`. Not
   breaking: `fill` returns `void`, so no signature changed and `generate`

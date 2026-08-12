@@ -132,8 +132,10 @@ const Directory = struct {
 
 /// `io` must support net + concurrency operations (e.g. `std.Io.Threaded`);
 /// `http_client` stays caller-owned (share it with other subsystems freely).
-/// Generate `account_key` once via `jws.KeyPair.generate(io)` and persist it
+/// Generate `account_key` once via `jws.generateKeyPair(io)` and persist it
 /// with `x509.ecPrivateKeyToPem` — the account key IS the account identity.
+/// Not `jws.KeyPair.generate(io)`: that is std's, and it seeds from
+/// `io.random` (see `jws.generateKeyPair`).
 pub fn init(
     io: std.Io,
     gpa: Allocator,
@@ -314,7 +316,9 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     // itself is transient scratch: the actual output is `key_pem` below
     // (a separate PEM-encoded copy), so the raw in-memory KeyPair is wiped
     // at scope exit rather than left resident for the rest of the request.
-    var cert_key = jws.KeyPair.generate(c.io);
+    // Fail-closed draw: this key is what the issued certificate will
+    // attest to, and it goes on to terminate TLS for the domain.
+    var cert_key = jws.generateKeyPair(c.io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
     const csr_der = x509.csrDer(a, cert_key, domains) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -426,7 +430,9 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
 fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const u8) Error!void {
     const acme_id = jws.acmeIdentifier(token, c.account_key.public_key) catch
         return error.MalformedResponse; // CA sent a non-token
-    var cert_key = jws.KeyPair.generate(c.io);
+    // Short-lived and never published, but it still signs a certificate a
+    // TLS client is about to accept — same draw as the issuance key above.
+    var cert_key = jws.generateKeyPair(c.io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
 
     // Deterministic positive, minimal serial derived from the identifier.

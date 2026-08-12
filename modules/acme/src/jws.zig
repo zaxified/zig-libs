@@ -11,10 +11,38 @@
 //! integration test to check every JWS the client sends.
 
 const std = @import("std");
+const entropy = @import("entropy");
 
 /// The one JWS algorithm ACME accounts use here: ECDSA P-256 + SHA-256.
 pub const Es256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 pub const KeyPair = Es256.KeyPair;
+
+/// Mint an account or certificate key. **Use this, not
+/// `KeyPair.generate(io)`** — they differ only in where the seed comes
+/// from, and std's takes it from `io.random`, whose contract permits a
+/// silent degrade to a pid-and-clock seed (CONVENTIONS.md §2.2).
+///
+/// Everything an ACME deployment is worth hangs off these two keys: the
+/// account key authenticates every request to the CA for the lifetime of
+/// the account, and a certificate key is what a publicly-trusted
+/// certificate ends up attesting to. Neither is recoverable after the
+/// fact — a weak account key is a CA that will happily take orders from
+/// whoever else derives it.
+///
+/// Body-identical to `std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.
+/// generate` otherwise; the retry loop is std's, absorbing the seed whose
+/// derived scalar lands on the identity element.
+pub fn generateKeyPair(io: std.Io) KeyPair {
+    var seed: [KeyPair.seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    while (true) {
+        entropy.fill(io, &seed);
+        return KeyPair.generateDeterministic(seed) catch {
+            @branchHint(.unlikely);
+            continue;
+        };
+    }
+}
 
 const b64 = std.base64.url_safe_no_pad;
 const Sha256 = std.crypto.hash.sha2.Sha256;

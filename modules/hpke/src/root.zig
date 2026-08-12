@@ -139,7 +139,9 @@ pub const meta = .{
     // chachapoly: the RFC 9180 Table 5 `aead_id = 0x0003` AEAD (byte-exact to
     // std). Both are implementation choices behind comptime parameters — no
     // wire byte depends on either.
-    .deps = .{ "p256", "chachapoly" },
+    // entropy: the `random(Nsk)` in each KEM's `generateKeyPair`, i.e. the
+    // ephemeral key behind every `sealBase`/`sealPsk`/`sealAuth`/`encap`.
+    .deps = .{ "p256", "chachapoly", "entropy" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -154,10 +156,15 @@ test {
     _ = @import("kat_rfc9180.zig");
 }
 
-test "meta.deps is exactly {p256, chachapoly} (the P-256 group + the ChaCha AEAD; else std only)" {
-    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
+test "meta.deps is exactly {p256, chachapoly, entropy} (the P-256 group + the ChaCha AEAD + the fail-closed key draw; else std only)" {
+    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
     try std.testing.expectEqualStrings("p256", meta.deps[0]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[1]);
+    // `entropy` is the `random(Nsk)` in RFC 9180 §4's `GenerateKeyPair() =
+    // DeriveKeyPair(random(Nsk))`, i.e. the sender's ephemeral key in every
+    // mode. Unlike the two above it is NOT an inert swap: dropping it puts
+    // that key back on `io.random`'s silent-degrade path.
+    try std.testing.expectEqualStrings("entropy", meta.deps[2]);
 }
 
 test "the ChaCha AEAD swap is inert: chachapoly and std agree on every RFC 9180 Nk/Nn/Nt" {

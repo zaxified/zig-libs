@@ -49,7 +49,7 @@ var transport = http.Client.init(io, gpa, .{});
 defer transport.deinit();
 
 // The account key IS the account identity — generate once, persist:
-const account_key = acme.jws.KeyPair.generate(io);
+const account_key = acme.jws.generateKeyPair(io); // fail-closed; NOT std's KeyPair.generate
 // persist: acme.x509.ecPrivateKeyToPem / load: acme.x509.ecPrivateKeyFromPem
 
 var client = acme.Client.init(io, gpa, &transport, account_key, .{

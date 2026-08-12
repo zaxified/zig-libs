@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- `Keypair.generate` now draws its X25519 seed from `entropy.fill`
+  (`std.Io.randomSecure`) instead of `io.random`, closing the last
+  degrading draw in the module — `CookieChecker`'s secret and nonce were
+  already moved. **Not breaking:** no signature changed and no new dep.
+
+  Both handshake initiators (`createInitiation`, `createResponse`) mint
+  their per-handshake ephemeral here, and callers use it for peer static
+  identities too. The ephemeral is what makes a session's keys
+  unrecoverable from the static keys alone; predictable, it hands a
+  passive recorder every packet of that handshake's session. The body is
+  std's `X25519.KeyPair.generate` with the seed source substituted.
+
 - `CookieChecker`'s three random draws — `init` and `refresh` for the
   rotating secret `Rm`, and `createReply` for the `encrypted_cookie`
   XChaCha20 nonce — go through the new `entropy` module (`entropy.fill`,

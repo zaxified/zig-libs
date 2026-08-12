@@ -52,9 +52,9 @@ const signal = @import("signal");
 
 ```zig
 // Bob publishes a bundle (server-side; this module doesn't touch transport).
-const bob_ik = std.crypto.dh.X25519.KeyPair.generate(io);
+const bob_ik = signal.x3dh.generateKeyPair(io); // fail-closed draw, not std's KeyPair.generate
 const bob_spk = signal.generateSignedPreKey(bob_ik, /* id */ 1, z, io); // z: 64 bytes from io.random
-const bob_opk_kp = std.crypto.dh.X25519.KeyPair.generate(io);
+const bob_opk_kp = signal.x3dh.generateKeyPair(io);
 
 const bundle = signal.PreKeyBundle{
     .identity_key = bob_ik.public_key,
@@ -66,7 +66,7 @@ const bundle = signal.PreKeyBundle{
 };
 
 // Alice fetches `bundle`, then initiates.
-const alice_ik = std.crypto.dh.X25519.KeyPair.generate(io);
+const alice_ik = signal.x3dh.generateKeyPair(io);
 const out = try signal.initiate(allocator, alice_ik, bundle, initial_plaintext_or_ciphertext, io);
 defer out.message.deinit(allocator);
 // out.agreement.shared_secret / out.agreement.associated_data feed Part 2 (Double Ratchet).

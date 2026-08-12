@@ -23,7 +23,7 @@
 //! const acme = @import("acme");
 //!
 //! var transport = http.Client.init(io, gpa, .{});
-//! const account_key = acme.jws.KeyPair.generate(io); // persist via x509.ecPrivateKeyToPem
+//! const account_key = acme.jws.generateKeyPair(io); // persist via x509.ecPrivateKeyToPem
 //! var client = acme.Client.init(io, gpa, &transport, account_key, .{});
 //!
 //! // Serve the challenge (the CA dials port 80 of the ordered domains):
@@ -45,7 +45,9 @@ pub const meta = .{
     // drive register/obtain from one thread at a time.
     .concurrency = .threadsafe,
     .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
-    .deps = .{ "http", "router" }, // also uses std.crypto (ecdsa P-256, Certificate), std.json
+    // entropy: the seed behind `jws.generateKeyPair` — the account key and
+    // every certificate key this client mints.
+    .deps = .{ "http", "router", "entropy" }, // also uses std.crypto (ecdsa P-256, Certificate), std.json
 };
 
 /// The ACME protocol client — see `Client.init` / `Client.obtain`.

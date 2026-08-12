@@ -28,6 +28,11 @@
 
 const std = @import("std");
 const suite = @import("suite.zig");
+// Fail-closed entropy for the three `generateKeyPair`s below (CONVENTIONS.md
+// §2.2). Nothing else in this module draws randomness: every other entry
+// point either takes the ephemeral keypair as a parameter or derives from a
+// caller-supplied `ikm`.
+const entropy = @import("entropy");
 // P-256 curve group for the DHKEM(P-256, …) suite from the asm-accelerated
 // `p256` module (byte-exact to `std.crypto.ecc.P256`). The X25519 KEM path
 // stays on std (p256 covers only the P-256 curve). P-384 has no local
@@ -127,11 +132,23 @@ pub const X25519Kem = struct {
         enc: EncappedKey,
     };
 
-    /// Trivial passthrough — no domain logic beyond calling std's
-    /// CSPRNG-backed `KeyPair.generate` (nothing HPKE-specific to get
-    /// wrong; `deriveKeyPair` below is the ikm-seeded RFC 9180 form).
+    /// RFC 9180 §4's own definition, verbatim: `GenerateKeyPair() =
+    /// DeriveKeyPair(random(Nsk))`. `entropy.fill` supplies `random(Nsk)`
+    /// (CONVENTIONS.md §2.2) — every HPKE sender's ephemeral key is minted
+    /// here, and this signature returns a `KeyPair`, not an error union, so
+    /// a degraded seed would silently become the shared secret of every
+    /// message the sender ever seals.
+    ///
+    /// Was `std.crypto.dh.X25519.KeyPair.generate(io)`, whose seed comes
+    /// from `io.random` — the entry point with the silent-degrade clause.
+    /// Routing through `deriveKeyPair` instead of open-coding std's
+    /// retry loop also puts the KEYGEN path under this file's RFC 9180
+    /// A.1.1 known-answer test, which `KeyPair.generate` never was.
     pub fn generateKeyPair(io: std.Io) KeyPair {
-        return KeyPair.generate(io);
+        var ikm: [Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &ikm);
+        entropy.fill(io, &ikm);
+        return deriveKeyPair(&ikm);
     }
 
     /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for X25519: `dkp_prk =
@@ -300,14 +317,22 @@ pub const P256Kem = struct {
         enc: EncappedKey,
     };
 
-    /// `sk = random scalar in [1, n-1]` via
-    /// `P256.scalar.random(io)` (rejection-sampled
-    /// uniform, not a raw byte draw — std owns the modular-reduction
-    /// correctness), `pk = (P256.basePoint.mul(sk, .big)).toUncompressedSec1()`.
+    /// RFC 9180 §4's `GenerateKeyPair() = DeriveKeyPair(random(Nsk))`, with
+    /// `entropy.fill` as `random` (CONVENTIONS.md §2.2).
+    ///
+    /// Was `P256.scalar.random(io, .big)`, which draws from `io.random`.
+    /// The X25519 KEM above could have kept std's shape and swapped only
+    /// the draw, because `KeyPair.generateDeterministic` is public; the
+    /// NIST KEMs have no such twin — `scalar.random`'s rejection loop is
+    /// std-internal and takes the `io` itself. Rather than re-implement
+    /// that loop here, all three KEMs go through the RFC's own
+    /// `DeriveKeyPair`, whose rejection sampling this file already owns
+    /// and A.3.3 already pins.
     pub fn generateKeyPair(io: std.Io) KeyPair {
-        const sk = P256.scalar.random(io, .big);
-        const pk_point = P256.basePoint.mul(sk, .big) catch unreachable; // basePoint * nonzero scalar never hits the identity
-        return .{ .secret_key = sk, .public_key = pk_point.toUncompressedSec1() };
+        var ikm: [Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &ikm);
+        entropy.fill(io, &ikm);
+        return deriveKeyPair(&ikm);
     }
 
     /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for P-256: same `dkp_prk`/
@@ -472,13 +497,17 @@ pub const P384Kem = struct {
         enc: EncappedKey,
     };
 
-    /// Same composition as `P256Kem.generateKeyPair`: `sk = random scalar
-    /// in [1, n-1]` via `P384.scalar.random(io, .big)`, `pk = (P384.
-    /// basePoint.mul(sk, .big)).toUncompressedSec1()`.
+    /// Same composition as `P256Kem.generateKeyPair` — RFC 9180 §4's
+    /// `DeriveKeyPair(random(Nsk))` over `entropy.fill`, replacing
+    /// `P384.scalar.random(io, .big)`. This KEM has no published Appendix A
+    /// vector (see this type's doc comment), so unlike its two siblings the
+    /// keygen path here gains no external anchor from the move — only the
+    /// fail-closed draw and one shape across all three KEMs.
     pub fn generateKeyPair(io: std.Io) KeyPair {
-        const sk = P384.scalar.random(io, .big);
-        const pk_point = P384.basePoint.mul(sk, .big) catch unreachable; // basePoint * nonzero scalar never hits the identity
-        return .{ .secret_key = sk, .public_key = pk_point.toUncompressedSec1() };
+        var ikm: [Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &ikm);
+        entropy.fill(io, &ikm);
+        return deriveKeyPair(&ikm);
     }
 
     /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for P-384 — the same
