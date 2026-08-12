@@ -1,0 +1,56 @@
+zipstream — provenance note
+
+A record only. This file carries NO condition beyond zig-libs' own MIT license,
+and `zipstream` is deliberately absent from root NOTICE §1 (the exhaustive list
+of condition-bearing files) for that reason.
+
+WHY IT EXISTS AT ALL. The module's implementation is clean-room from the public
+PKWARE ZIP spec (APPNOTE.TXT) and the ECMA-376 OOXML package layout, and owes
+nobody anything. Its TEST DATA is where the honest answer is longer than one
+line, and a provenance statement about source does not answer for data.
+
+  src/testdata/write_golden.zip
+      Produced by this repo's own writer from content this repo authored
+      ("quick brown fox", "stored payload"). `unzip`/`zipinfo` were run against
+      it purely as black-box oracles — the case root NOTICE §0 exempts. Nothing
+      third-party is inside the file.
+
+  src/testdata/xlsx_sample.xlsx
+      Produced by LibreOffice 26.2.4.2 (`--headless --convert-to xlsx`) from a
+      three-line CSV of our own. The CELL CONTENT is therefore ours, but the
+      package is not only cell content: LibreOffice also emits its stock
+      template parts, and those dominate the file.
+
+          xl/styles.xml       4451 B   LibreOffice's default style table
+          xl/theme/theme1.xml 2257 B   LibreOffice's default theme
+                                       (`<a:clrScheme name="LibreOffice">`)
+          xl/sharedStrings.xml 326 B   our strings
+          docProps/app.xml               names the generator explicitly:
+                                       `LibreOffice/26.2.4.2$Linux_X86_64`
+
+      So the fixture is NOT "our data that merely passed through a foreign
+      tool", which is what this module's README claimed until 2026-08-12. It
+      embeds boilerplate XML that LibreOffice authored. Recording that is the
+      point of this file.
+
+WHY THIS IS A RECORD AND NOT A CONDITION. LibreOffice is MPL-2.0, but MPL-2.0
+governs LibreOffice's own source, not documents LibreOffice generates: The
+Document Foundation asserts no copyright over user documents its software
+produces, and a stock style/theme table is in any case functional boilerplate
+rather than expressive authorship. No redistribution condition attaches to this
+fixture, and none is reproduced here. What was wrong was the CLAIM, not the
+file — the README said "no third-party source involved" about a module that
+ships a third party's generated XML, and a reader checking that sentence
+against the artifact would have found it false.
+
+WHY THE FIXTURE IS NOT SIMPLY REGENERATED WITHOUT IT. It cannot be. Every
+OOXML writer emits `styles.xml`, and the reader under test exists precisely to
+handle real-world packages rather than minimal synthetic ones — a fixture
+stripped of the parts a real tool emits would stop testing the thing it is for.
+
+HOW THIS WAS FOUND. Not by reading the fixture's own documentation, which
+described it correctly as "produced by LibreOffice from our CSV" and was taken
+at face value in a first pass. It was found by opening the ZIP and reading the
+XML inside. The lesson is the general one: a file's account of itself is a
+claim, and a claim about provenance is checked against the artifact or not at
+all.

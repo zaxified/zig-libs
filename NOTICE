@@ -44,6 +44,24 @@ closely, is not "derived from" anyone's code. Accordingly:
     output against this module's own encoder/decoder) is neither of the
     above and needs no entry — no source or design was consulted, only
     the program's observable behavior against its own documented format.
+    This covers CAPTURING that output once and committing it as a golden
+    fixture, not only invoking the tool live: `tar`'s `write_golden_*.tar`
+    are GNU tar's bytes wrapped around a `hello.txt` we wrote, and freezing
+    them so the test needs no subprocess changes nothing about who authored
+    what. The clause was written for live invocation and this sentence
+    exists because two independent readings in the 2026-08-12 audit found
+    it did not literally reach the frozen case.
+
+    THE LINE THIS DOES NOT CROSS. The exemption holds when the captured
+    artifact is OUR content in the tool's format. It stops the moment the
+    artifact also carries content the tool itself authored — a stock
+    template, a default stylesheet, a generated boilerplate section — since
+    that is no longer merely "the program's observable behavior" on our
+    input. `zipstream`'s `xlsx_sample.xlsx` is exactly that case and is why
+    the module carries its own provenance note: most of its bytes are
+    LibreOffice's default theme and style tables, not ours. When in doubt,
+    open the artifact; a fixture's description of itself is a claim, not a
+    verification.
 
 ====================================================================
 1. REQUIRED ATTRIBUTION — ported code
@@ -54,7 +72,7 @@ beyond its own MIT license.
 
 Where a module ports third-party code, or reproduces third-party data whose
 notice must be preserved, that module carries its own `NOTICE` file next to its
-source, and the notice travels with the module. TWENTY-ONE modules do, and
+source, and the notice travels with the module. TWENTY-TWO modules do, and
 these are the ONLY files in the repository that carry a condition naming
 anyone other than the zig-libs authors. Each such file's first line says
 `<name> — third-party attribution`:
@@ -62,6 +80,13 @@ anyone other than the zig-libs authors. Each such file's first line says
   bech32   — `modules/bech32/NOTICE` (Bitcoin Core
              `base58_encode_decode.json` plain-base58 conformance corpus,
              MIT; test data only, no source code)
+  brotli   — `modules/brotli/NOTICE` (google/brotli `tests/testdata/*`
+             compression conformance corpus, 17 input/`.compressed` pairs,
+             MIT; test data only, no source code. Added 2026-08-12: the file
+             existed as a no-condition provenance note claiming the vectors
+             had been GENERATED with the C library as an oracle, when they
+             are byte-for-byte copies of upstream's corpus — verified by
+             downloading google/brotli and running `cmp`)
   falcon   — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
              a second copyright holder, no condition beyond MIT's own)
   decimal  — `modules/decimal/NOTICE` (IBM decTest test-case text, reproduced

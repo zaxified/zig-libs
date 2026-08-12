@@ -22,7 +22,12 @@ local-header+data straight to the caller's output as each entry is added.
 
 Provenance: original work of the zig-libs authors (MIT). The wire
 format is the public PKWARE ZIP spec (APPNOTE.TXT) — no third-party source
-involved; no NOTICE entry needed.
+involved. Test data is a different question and is answered separately:
+`src/testdata/write_golden.zip` holds only text this repo wrote, but
+`src/testdata/xlsx_sample.xlsx` is LibreOffice's own output and a majority of
+its bytes are LibreOffice's default theme and style boilerplate, not ours.
+That is recorded in [`NOTICE`](NOTICE) as a provenance note — a record, not a
+condition.
 
 ## Why
 

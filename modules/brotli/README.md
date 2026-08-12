@@ -26,7 +26,10 @@ Brotli, so an HTTPS server that wants `br` needs this.
 Provenance: the decoder logic is clean-room from RFC 7932. `dictionary.bin`, the
 context lookup table, and the transform / prefix-suffix tables are **normative
 RFC 7932 constants** (Appendices A/B/C), reproduced verbatim (byte-identical to
-google/brotli, MIT).
+google/brotli, MIT). Test data: `src/testdata/` reproduces google/brotli's own
+`tests/testdata/` corpus verbatim — 17 input/`.compressed` pairs, copied rather
+than generated — so this module carries required attribution in
+[`NOTICE`](NOTICE) and is listed in the root `NOTICE` §1.
 
 ## API
 
