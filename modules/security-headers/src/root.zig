@@ -73,6 +73,18 @@
 //! Header values are emitted verbatim onto the wire: caller-supplied
 //! strings must outlive the middleware and must not contain CR/LF (checked
 //! with a Debug assert at `init`).
+//!
+//! Header byte budget: `http.Server.ResponseWriter` copies every header's
+//! name and value into a fixed-size per-response buffer, so `apply` (and
+//! therefore `middleware`) can fail with `error.HeaderBytesExhausted` — see
+//! `SetHeaderError`. Registered first as documented above, this middleware
+//! is the *first* thing to touch that buffer, so whether it fails depends
+//! only on this configuration's own header set, never on what other
+//! middleware adds afterward. `init` checks exactly that condition up
+//! front and fails with `InitError.HeaderBudgetExceeded` — see `InitError`
+//! — so an oversized `content_security_policy` is rejected once, at
+//! startup, in every build mode, rather than 500ing every request from
+//! then on with none of this module's headers on that 500 either.
 
 const std = @import("std");
 const router = @import("router");
@@ -166,6 +178,13 @@ const hsts_buf_len = "max-age=".len +
     std.fmt.count("{d}", .{std.math.maxInt(u64)}) +
     "; includeSubDomains".len + "; preload".len;
 
+// `http.Server.ResponseWriter`'s entire per-response header-byte budget
+// (see `header_copy_bytes` in `http/src/Server.zig`), read off the actual
+// field's array length rather than duplicated as a literal so this can
+// never silently drift out of sync with `http`'s real budget. Every
+// `setHeader` call copies BOTH the name and the value into this budget.
+const http_header_budget_bytes = @typeInfo(@FieldType(http.Server.ResponseWriter, "header_buf")).array.len;
+
 // ── the middleware ──────────────────────────────────────────────────────────
 
 /// Immutable, precomputed header set + the `router.Middleware` over it.
@@ -177,10 +196,41 @@ pub const SecurityHeaders = struct {
     hsts_buf: [hsts_buf_len]u8 = undefined,
     hsts_len: usize = 0,
 
+    /// `SecurityHeaders.init` failure modes — config-time only, never
+    /// returned by `apply`/`middleware` (see `SetHeaderError` for those).
+    pub const InitError = error{
+        /// This configuration's own header set (names + values, exactly as
+        /// `apply` would write them) already exceeds `http.Server`'s
+        /// *entire* per-response header-byte budget (`http_header_budget_bytes`,
+        /// currently mirroring `http`'s `header_copy_bytes`) by itself —
+        /// before any other middleware, handler, or trailer gets a single
+        /// byte of it. Registered first (this module's own documented
+        /// contract — see the module doc), `apply` runs before anything
+        /// else has written to the response, so this is the exact
+        /// condition under which `apply`/`middleware` would fail *every*
+        /// request with `error.HeaderBytesExhausted`, deterministically,
+        /// regardless of what else is in the chain. Caught here instead,
+        /// at configuration time, in *every* build mode (this is a real
+        /// error return, not a Debug-only assert) — the alternative is
+        /// discovering it at request time, where `http.Server` answers
+        /// with its automatic 500 and, per this module's "Known
+        /// limitation", that 500 carries none of this module's headers
+        /// either. Almost always caused by an oversized
+        /// `content_security_policy` (and/or its `_report_only` mirror,
+        /// when trialing a second, comparably large policy) — shrink it,
+        /// split it, or grow `http`'s `header_copy_bytes` if the policy is
+        /// genuinely required to be that large.
+        HeaderBudgetExceeded,
+    };
+
     /// Precompute the header set. `SecurityHeaders.init(.{})` = the secure
     /// defaults. Caller-supplied strings are borrowed (must outlive the
     /// returned value) and must not contain CR/LF/NUL (Debug-asserted).
-    pub fn init(options: Options) SecurityHeaders {
+    /// Fails with `InitError.HeaderBudgetExceeded` when this configuration's
+    /// own headers cannot possibly fit `http`'s per-response header budget
+    /// — see `InitError` for why that is checked here rather than left to
+    /// surface as a request-time failure.
+    pub fn init(options: Options) InitError!SecurityHeaders {
         if (std.debug.runtime_safety) {
             if (options.content_security_policy) |v| assertValueClean(v);
             if (options.content_security_policy_report_only) |v| assertValueClean(v);
@@ -201,7 +251,30 @@ pub const SecurityHeaders = struct {
             if (h.preload) w.writeAll("; preload") catch unreachable;
             sh.hsts_len = w.buffered().len;
         }
+        if (appliedHeaderBytes(&sh) > http_header_budget_bytes) return error.HeaderBudgetExceeded;
         return sh;
+    }
+
+    /// Sum of every header's name+value byte length `apply` would copy into
+    /// `http.Server.ResponseWriter.header_buf` for `sh.options` — mirrors
+    /// `apply`'s own field list and conditions exactly (same order doesn't
+    /// matter here, only the same *set*), so it cannot drift out of sync
+    /// with what `apply` actually does short of editing both in lockstep.
+    fn appliedHeaderBytes(sh: *const SecurityHeaders) usize {
+        const o = &sh.options;
+        var total: usize = 0;
+        if (o.hsts != null) total += "Strict-Transport-Security".len + sh.hstsValue().len;
+        if (o.content_security_policy) |v| total += "Content-Security-Policy".len + v.len;
+        if (o.content_security_policy_report_only) |v| total += "Content-Security-Policy-Report-Only".len + v.len;
+        if (o.x_content_type_options) total += "X-Content-Type-Options".len + "nosniff".len;
+        if (o.x_frame_options) |v| total += "X-Frame-Options".len + v.len;
+        if (o.referrer_policy) |v| total += "Referrer-Policy".len + v.len;
+        if (o.permissions_policy) |v| total += "Permissions-Policy".len + v.len;
+        if (o.cross_origin_opener_policy) |v| total += "Cross-Origin-Opener-Policy".len + v.len;
+        if (o.cross_origin_resource_policy) |v| total += "Cross-Origin-Resource-Policy".len + v.len;
+        if (o.cross_origin_embedder_policy) |v| total += "Cross-Origin-Embedder-Policy".len + v.len;
+        if (o.server) |v| total += "Server".len + v.len;
+        return total;
     }
 
     /// The precomputed `Strict-Transport-Security` value ("" when disabled).
@@ -213,6 +286,15 @@ pub const SecurityHeaders = struct {
     /// below). Usable directly on any `ResponseWriter` when not routing
     /// through the middleware. Values set here are defaults in effect: a
     /// later `setHeader` with the same name replaces them (handler wins).
+    ///
+    /// Can fail with `error.HeaderBytesExhausted` (part of `SetHeaderError`)
+    /// if `res` doesn't have enough of its header-byte budget left — `sh`
+    /// was already checked at `init` time to fit the budget on its own (see
+    /// `InitError.HeaderBudgetExceeded`), so reaching this error here means
+    /// `res` arrived with some of that budget already spent, i.e. `sh` was
+    /// applied somewhere other than first in the chain against this
+    /// module's own "register it first" contract (see the module doc), or
+    /// `res` is being reused across more than one logical response.
     pub fn apply(sh: *const SecurityHeaders, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
         const o = &sh.options;
         if (o.hsts != null) try res.setHeader("Strict-Transport-Security", sh.hstsValue());
@@ -311,7 +393,7 @@ fn hFramed(ctx: *router.Ctx) anyerror!void {
 }
 
 test "defaults: exactly the expected header set with expected values (golden wire)" {
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -335,7 +417,7 @@ test "defaults: exactly the expected header set with expected values (golden wir
 
 test "disabling: each header omittable; everything off = a bare response" {
     { // one header off, the rest of the set intact
-        const sh: SecurityHeaders = .init(.{ .hsts = null });
+        const sh: SecurityHeaders = try .init(.{ .hsts = null });
         var r = router.Router.init(testing.allocator);
         defer r.deinit();
         try r.use(sh.middleware());
@@ -351,7 +433,7 @@ test "disabling: each header omittable; everything off = a bare response" {
         try expectHeaderLine(got, "Cross-Origin-Resource-Policy: same-origin");
     }
     { // all off: golden proof that nothing is emitted
-        const sh: SecurityHeaders = .init(.{
+        const sh: SecurityHeaders = try .init(.{
             .hsts = null,
             .x_content_type_options = false,
             .x_frame_options = null,
@@ -374,7 +456,7 @@ test "disabling: each header omittable; everything off = a bare response" {
 }
 
 test "overriding: custom values replace the defaults" {
-    const sh: SecurityHeaders = .init(.{
+    const sh: SecurityHeaders = try .init(.{
         .hsts = .{ .max_age_s = 63_072_000, .include_subdomains = false },
         .x_frame_options = "SAMEORIGIN",
         .referrer_policy = "strict-origin-when-cross-origin",
@@ -399,7 +481,7 @@ test "overriding: custom values replace the defaults" {
 
 test "CSP: absent by default, present exactly as configured; Report-Only independent" {
     // Absence with defaults is proven byte-exactly by the golden test above.
-    const sh: SecurityHeaders = .init(.{
+    const sh: SecurityHeaders = try .init(.{
         .content_security_policy = csp_api,
         .content_security_policy_report_only = "default-src 'self'",
     });
@@ -415,8 +497,100 @@ test "CSP: absent by default, present exactly as configured; Report-Only indepen
     try expectHeaderLine(got, "Content-Security-Policy-Report-Only: default-src 'self'");
 }
 
+test "init: a CSP that alone would exceed http's real response header-byte budget is rejected at config time, not response time" {
+    // The exact set `appliedHeaderBytes` sums for `.init(.{})`'s defaults —
+    // spelled out with `.len` on the same literals `apply` writes, not a
+    // number this test invents, so a change to any default's wording keeps
+    // this test honest instead of silently drifting stale.
+    const defaults_bytes = "Strict-Transport-Security".len + "max-age=31536000; includeSubDomains".len +
+        "X-Content-Type-Options".len + "nosniff".len +
+        "X-Frame-Options".len + "DENY".len +
+        "Referrer-Policy".len + "no-referrer".len +
+        "Cross-Origin-Opener-Policy".len + "same-origin".len +
+        "Cross-Origin-Resource-Policy".len + "same-origin".len;
+    const csp_name_bytes = "Content-Security-Policy".len;
+    // Exactly how much CSP value this configuration has left before it, on
+    // its own — before any other middleware, handler, or trailer touches
+    // the response — exceeds `http`'s entire per-response header budget
+    // (`http_header_budget_bytes`, reflected off the real
+    // `http.Server.ResponseWriter`, not hardcoded).
+    const room = http_header_budget_bytes - defaults_bytes - csp_name_bytes;
+
+    var csp_buf: [room + 1]u8 = undefined;
+    @memset(&csp_buf, 'a');
+
+    // Exactly at the edge: this configuration's headers exactly fill the
+    // budget and `init` accepts it (matches `dupe`'s own `>` — not `>=` —
+    // exhaustion check in http/src/Server.zig).
+    _ = try SecurityHeaders.init(.{ .content_security_policy = csp_buf[0..room] });
+
+    // One byte over: this configuration's own header set no longer fits
+    // `http`'s budget by itself. Registered first per this module's own
+    // contract, `apply`/`middleware` would fail *every* request with
+    // `error.HeaderBytesExhausted` and no way for the caller to have seen
+    // it coming short of doing this arithmetic themselves — `init` does it
+    // instead, once, at startup.
+    try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{ .content_security_policy = &csp_buf }));
+}
+
+test "end-to-end anchor: a config sized to exactly fill http's real header budget survives a real ResponseWriter; `init`'s notion of the budget cannot silently drift from it" {
+    // Same arithmetic as the test above, but this one does not stop at
+    // arithmetic: `http_header_budget_bytes` only ever *claims* to track
+    // `http.Server.ResponseWriter.header_buf`'s real size. A test that only
+    // ever compares against that same constant (like the one above) cannot
+    // tell a correct claim from a wrong one — it would stay green even if
+    // `http_header_budget_bytes` were, say, hardcoded to something other
+    // than `header_buf`'s actual length. This test drives the boundary
+    // configuration through an ACTUAL `http.Server.ResponseWriter` — whose
+    // `header_buf` array size comes from `http`'s own type definition, not
+    // from anything in this file — so a wrong `http_header_budget_bytes`
+    // shows up here as `apply` returning `error.HeaderBytesExhausted`
+    // against the real writer, even though `init` (misled by the wrong
+    // constant) let the same configuration through.
+    const defaults_bytes = "Strict-Transport-Security".len + "max-age=31536000; includeSubDomains".len +
+        "X-Content-Type-Options".len + "nosniff".len +
+        "X-Frame-Options".len + "DENY".len +
+        "Referrer-Policy".len + "no-referrer".len +
+        "Cross-Origin-Opener-Policy".len + "same-origin".len +
+        "Cross-Origin-Resource-Policy".len + "same-origin".len;
+    const csp_name_bytes = "Content-Security-Policy".len;
+    const room = http_header_budget_bytes - defaults_bytes - csp_name_bytes;
+
+    var csp_buf: [room]u8 = undefined;
+    @memset(&csp_buf, 'a');
+
+    // `init` accepts a configuration sized to exactly fill the (claimed)
+    // budget...
+    const sh: SecurityHeaders = try .init(.{ .content_security_policy = &csp_buf });
+
+    // ...and driven through a REAL `http.Server.ResponseWriter` (buffers
+    // sized off the same reflected constant, so this test tracks a future
+    // change to the real budget instead of hardcoding today's 4096), every
+    // configured header actually lands on the wire: `apply` does not
+    // return `error.HeaderBytesExhausted`, which is the disagreement a
+    // wrong `http_header_budget_bytes` (e.g. a literal larger than the
+    // real buffer) would produce right here.
+    var out_buf: [http_header_budget_bytes + 1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try sh.apply(&rw);
+    try rw.end();
+    const got = out.buffered();
+    try expectHeaderLine(got, "X-Content-Type-Options: nosniff");
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Security-Policy: ") != null);
+    try testing.expect(std.mem.indexOf(u8, got, &csp_buf) != null);
+
+    // One byte over: `init` refuses it before a real writer is ever
+    // involved.
+    var too_big: [room + 1]u8 = undefined;
+    @memset(&too_big, 'a');
+    try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{ .content_security_policy = &too_big }));
+}
+
 test "csp_helmet_default: reproduced helmet.js v7 posture, byte-exact through the middleware" {
-    const sh: SecurityHeaders = .init(.{ .content_security_policy = csp_helmet_default });
+    const sh: SecurityHeaders = try .init(.{ .content_security_policy = csp_helmet_default });
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -431,7 +605,7 @@ test "csp_helmet_default: reproduced helmet.js v7 posture, byte-exact through th
 }
 
 test "COEP: off by default, opt-in emits it" {
-    const sh: SecurityHeaders = .init(.{ .cross_origin_embedder_policy = "require-corp" });
+    const sh: SecurityHeaders = try .init(.{ .cross_origin_embedder_policy = "require-corp" });
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -442,29 +616,29 @@ test "COEP: off by default, opt-in emits it" {
 }
 
 test "HSTS: value format for every flag combination" {
-    const a: SecurityHeaders = .init(.{});
+    const a: SecurityHeaders = try .init(.{});
     try testing.expectEqualStrings("max-age=31536000; includeSubDomains", a.hstsValue());
 
-    const b: SecurityHeaders = .init(.{ .hsts = .{ .preload = true } });
+    const b: SecurityHeaders = try .init(.{ .hsts = .{ .preload = true } });
     try testing.expectEqualStrings("max-age=31536000; includeSubDomains; preload", b.hstsValue());
 
-    const c: SecurityHeaders = .init(.{ .hsts = .{ .max_age_s = 0, .include_subdomains = false } });
+    const c: SecurityHeaders = try .init(.{ .hsts = .{ .max_age_s = 0, .include_subdomains = false } });
     try testing.expectEqualStrings("max-age=0", c.hstsValue());
 
-    const d: SecurityHeaders = .init(.{ .hsts = .{ .include_subdomains = false, .preload = true } });
+    const d: SecurityHeaders = try .init(.{ .hsts = .{ .include_subdomains = false, .preload = true } });
     try testing.expectEqualStrings("max-age=31536000; preload", d.hstsValue());
 
     // The longest possible value exactly fills the precomputed buffer.
-    const e: SecurityHeaders = .init(.{ .hsts = .{ .max_age_s = std.math.maxInt(u64), .preload = true } });
+    const e: SecurityHeaders = try .init(.{ .hsts = .{ .max_age_s = std.math.maxInt(u64), .preload = true } });
     try testing.expectEqualStrings("max-age=18446744073709551615; includeSubDomains; preload", e.hstsValue());
     try testing.expectEqual(hsts_buf_len, e.hstsValue().len);
 
-    const off: SecurityHeaders = .init(.{ .hsts = null });
+    const off: SecurityHeaders = try .init(.{ .hsts = null });
     try testing.expectEqualStrings("", off.hstsValue());
 }
 
 test "precedence: a handler's own header replaces the middleware default" {
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -482,7 +656,7 @@ test "precedence: a handler's own header replaces the middleware default" {
 
 test "Server: configured value replaces the server's automatic header" {
     { // control: without the option the server's own name goes out
-        const sh: SecurityHeaders = .init(.{});
+        const sh: SecurityHeaders = try .init(.{});
         var r = router.Router.init(testing.allocator);
         defer r.deinit();
         try r.use(sh.middleware());
@@ -492,7 +666,7 @@ test "Server: configured value replaces the server's automatic header" {
         try expectHeaderLine(runWireNamed(&r, wire("/t"), &buf, "real-server/1.0"), "Server: real-server/1.0");
     }
     { // replacement: the middleware value wins, the auto value never appears
-        const sh: SecurityHeaders = .init(.{ .server = "webserver" });
+        const sh: SecurityHeaders = try .init(.{ .server = "webserver" });
         var r = router.Router.init(testing.allocator);
         defer r.deinit();
         try r.use(sh.middleware());
@@ -506,7 +680,7 @@ test "Server: configured value replaces the server's automatic header" {
 }
 
 test "404/405 fallbacks carry the headers too (router-level chain)" {
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -531,7 +705,7 @@ test "apply: usable directly on a bare ResponseWriter (no router)" {
     var chunk_buf: [64]u8 = undefined;
     var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
 
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     try sh.apply(&rw);
     try rw.end();
     const got = out.buffered();
@@ -550,7 +724,7 @@ test "integration: a 200 over loopback carries the headers; handler override win
     defer threaded.deinit();
     const io = threaded.io();
 
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -631,7 +805,7 @@ test "integration: a 200 over loopback carries the headers; handler override win
 test "external anchor: RFC 7034 2.2.1's own 'X-Frame-Options: DENY' example line matches our default byte-exact" {
     const rfc7034_2_2_1_example_line = "X-Frame-Options: DENY"; // copied verbatim, rfc-editor.org/rfc/rfc7034.txt
 
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -654,7 +828,7 @@ test "external anchor: RFC 6797 6.2's own max-age=31536000 example matches our d
     // section) proves "max-age=<n>; includeSubDomains" (no space before the
     // semicolon) is itself a valid RFC-illustrated form, not this module's
     // own invention.
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -668,7 +842,7 @@ test "external anchor: RFC 6797 6.2's own max-age=31536000 example matches our d
 test "external anchor: OWASP Secure Headers Project's own example lines match our defaults byte-exact" {
     // Copied verbatim from mainsite/01_headers.md, OWASP/www-project-secure-headers
     // (Apache License 2.0), fetched 2026-08-01 — see modules/security-headers/NOTICE.
-    const sh: SecurityHeaders = .init(.{});
+    const sh: SecurityHeaders = try .init(.{});
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());
@@ -686,7 +860,7 @@ test "external anchor: OWASP's own Cross-Origin-Embedder-Policy example matches 
     // Copied verbatim from mainsite/01_headers.md: "Cross-Origin-Embedder-Policy: require-corp"
     const owasp_example_line = "Cross-Origin-Embedder-Policy: require-corp";
 
-    const sh: SecurityHeaders = .init(.{ .cross_origin_embedder_policy = "require-corp" });
+    const sh: SecurityHeaders = try .init(.{ .cross_origin_embedder_policy = "require-corp" });
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.use(sh.middleware());

@@ -85,6 +85,10 @@ one breaking change in its `Unreleased` section.
   over Goldilocks.
 - [`saml`](modules/saml/CHANGELOG.md) — **BREAKING** — cross-form
   Holder-of-Key confirmation.
+- [`security-headers`](modules/security-headers/CHANGELOG.md) —
+  **BREAKING** — `init` now fallible, rejects a CSP that would exceed
+  `http`'s header-byte budget at config time instead of 500ing at
+  request time.
 - [`snmp`](modules/snmp/CHANGELOG.md) — **BREAKING** — library-generated
   USM privacy salt.
 - [`stun`](modules/stun/CHANGELOG.md) — security-audit memory-safety fix.
