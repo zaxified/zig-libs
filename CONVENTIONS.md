@@ -234,6 +234,16 @@ reference, not a re-explanation of everything the README already covers.
    disk) must equal the running count from `zig build test-<m> --summary all`.
 4. `zig build test-<name>` (per module) and `zig build test` (all) — both green in
    **Debug and ReleaseFast**; `zig fmt --check modules/<name>` clean.
+
+   > **Install the commit-time formatting guard once per clone:**
+   > `git config core.hooksPath scripts/hooks`
+   >
+   > It refuses a commit whose **staged** Zig/ZON blobs are not `zig fmt` clean. Three
+   > format gates already exist (`test.sh all`, `test.sh changed`, CI), and all three are
+   > gates you have to remember to reach — `a23a933` is what that costs. Formatting drift
+   > cannot change behaviour; what it breaks is a gate, and a gate that reddens for a
+   > reason nobody caused on purpose is one people learn to ignore. `--no-verify` bypasses
+   > when you mean it.
 5. Update the root `NOTICE` with any third-party design reference + its license. If you
    actually ported third-party source, its terms go in `modules/<name>/NOTICE` instead —
    never in the root file.
