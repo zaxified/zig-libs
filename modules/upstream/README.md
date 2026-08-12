@@ -77,9 +77,13 @@ const Fetch = struct {
 var op: Fetch = .{};
 const status = try pool.call(&op, .{ .max_tries = 3 });
 
-// Active health (e.g. from the accept/event loop, real clock in hand):
-var lc: probe.LiveConnector = .{ .io = io };
-var hc: upstream.ConnectorHealthChecker = .{ .conn = lc.connector() };
+// Active health (e.g. from the accept/event loop, real clock in hand).
+// `PosixConnector`, not `LiveConnector`: `healthTick` runs these checks
+// inline, so a black-holed backend must not hold a worker for the OS
+// default connect timeout (~134 s measured). `.literal_only` keeps name
+// resolution — which no connect timeout can bound — out of the tick.
+var pc: probe.PosixConnector = .{ .resolve = .literal_only };
+var hc: upstream.ConnectorHealthChecker = .{ .conn = pc.connector() };
 // … set Options.health_checker = hc.healthChecker() at init, then:
 pool.healthTick(now_ns);
 ```

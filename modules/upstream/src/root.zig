@@ -174,10 +174,18 @@ pub const HealthChecker = struct {
     }
 };
 
-/// Adapt any `probe.Connector` (e.g. `probe.LiveConnector` for the real
+/// Adapt any `probe.Connector` (use `probe.PosixConnector` for the real
 /// network) into a `HealthChecker`: healthy = the TCP handshake completed
 /// (`.up`) — refused/timeout/error all count as down. Hold one and pass
 /// `healthChecker()` to `Options`; it must outlive the pool.
+///
+/// The connector choice is load-bearing here, not a preference: `healthTick`
+/// runs each check inline, so a connector that cannot abort a connect lets a
+/// handful of black-holed backends occupy workers for the OS default timeout
+/// (measured 134 s per attempt through `probe.LiveConnector`).
+/// `probe.PosixConnector` bounds each attempt to the `timeout_ns` passed here;
+/// its `.literal_only` mode additionally keeps name resolution — which no
+/// connect timeout can bound — out of the tick entirely.
 pub const ConnectorHealthChecker = struct {
     conn: probe.Connector,
 
