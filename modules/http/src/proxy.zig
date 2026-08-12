@@ -255,11 +255,12 @@ pub const ProxyHandler = struct {
             // writer manages `Connection`/`Date`/`Server` itself.
             if (std.ascii.eqlIgnoreCase(entry.name, "connection") or
                 std.ascii.eqlIgnoreCase(entry.name, "via")) continue;
-            rw.setHeader(entry.name, entry.value) catch {};
+            rw.setHeader(entry.name, entry.value) catch return self.relayFailed(rw);
         }
         // Response-side Via (append to the backend's own, if any).
-        const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch null;
-        if (via) |v| rw.setHeader("Via", v) catch {};
+        const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch
+            return self.relayFailed(rw);
+        rw.setHeader("Via", via) catch return self.relayFailed(rw);
 
         // ── stream the response body back (no full buffering) ───────────
         _ = res.reader().streamRemaining(rw.writer()) catch {
@@ -270,12 +271,11 @@ pub const ProxyHandler = struct {
             if (rw.headSent()) return error.ProxyBackendStreamAborted;
             return gatewayError(rw, 502, self.config.via_pseudonym);
         };
-        // Finalize the response *before* the deferred `res.deinit()` frees
-        // the backend head buffer: the relayed header slices point into it,
-        // and `ResponseWriter.writeHead` (fully-buffered path) reads them at
-        // `end()`. `end()` is idempotent, so the serving loop's own call is
-        // then a no-op.
-        try rw.end();
+        // No early `end()`. It used to be forced here so `writeHead` read the
+        // relayed header slices before the deferred `res.deinit()` freed the
+        // backend head buffer they pointed into; `setHeader` copies those
+        // bytes now, and the body is likewise in the writer's own buffer or
+        // already framed onto the wire. The serving loop ends the response.
     }
 
     /// Forward `req` to an HTTP/2 (h2/h2c) backend through the shared
@@ -344,17 +344,19 @@ pub const ProxyHandler = struct {
             if (isHopByHop(f.name, resp_conn)) continue;
             if (std.ascii.eqlIgnoreCase(f.name, "connection") or
                 std.ascii.eqlIgnoreCase(f.name, "via")) continue;
-            rw.setHeader(f.name, f.value) catch {};
+            rw.setHeader(f.name, f.value) catch return self.relayFailed(rw);
         }
-        const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch null;
-        if (via) |v| rw.setHeader("Via", v) catch {};
+        const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch
+            return self.relayFailed(rw);
+        rw.setHeader("Via", via) catch return self.relayFailed(rw);
 
         // ── relay the (buffered) response body ──────────────────────────
+        // `res.body` is copied into the writer, so — as on the h1 path — the
+        // deferred `res.deinit(gpa)` is no longer racing an early `end()`.
         rw.writeAll(res.body) catch {
             if (rw.headSent()) return error.ProxyBackendStreamAborted;
             return gatewayError(rw, 502, self.config.via_pseudonym);
         };
-        try rw.end();
     }
 
     /// Map an `h2_upstream` forward error to a gateway status (or surface a
@@ -371,6 +373,49 @@ pub const ProxyHandler = struct {
     fn pickBackend(self: *ProxyHandler, req: *Server.Request) ?Backend {
         if (self.config.selector) |sel| return sel.select(req);
         return self.config.backend;
+    }
+
+    /// A backend response header would not go onto our response — the
+    /// writer's copied-header byte budget or its field table ran out, the
+    /// `Via` chain outgrew `max_via_len`, or the backend sent a field we
+    /// refuse (an unparseable `Content-Length`, a CR/LF in a value).
+    ///
+    /// This was `catch {}` until 2026-08-13, and a silent drop is the worst
+    /// of the available answers: the client gets a 200 that *looks* complete
+    /// while missing the `Location` of a redirect, the `WWW-Authenticate` of
+    /// a 401, the `Set-Cookie` of a login, or the `Content-Encoding` of a
+    /// compressed body — which it will then decode as plaintext. Neither end
+    /// can tell, so nobody ever finds out.
+    ///
+    /// The alternatives, and why not:
+    ///   * **Propagate the error.** The serving loop turns it into a bare 500
+    ///     and closes the connection, which names neither the hop nor the
+    ///     cause — and on the h1 path costs a connection per occurrence.
+    ///   * **Truncate with a marker header.** There is no marker a client is
+    ///     obliged to read, so the mutilated response still gets consumed as
+    ///     if whole; and the marker wants budget in the one moment there is
+    ///     none.
+    ///   * **Reject up front**, as `security-headers` does for its static
+    ///     configuration. A proxy cannot: it learns the backend's header set
+    ///     only once the backend has answered, and re-deriving "will this
+    ///     fit" here would duplicate the writer's own accounting — the copy
+    ///     store's append-only budget, replace-by-name, the managed headers —
+    ///     which is a second constant to get wrong.
+    ///
+    /// So the proxy reports what happened: it could not faithfully relay the
+    /// backend's answer, which is a gateway failure. Nothing is on the wire
+    /// yet (the head is written when the body starts, and no body byte has
+    /// been relayed), so `reset` discards the half-relayed set and the 502
+    /// goes out clean, carrying `Via` so the failing hop is identifiable.
+    fn relayFailed(self: *ProxyHandler, rw: *Server.ResponseWriter) anyerror!void {
+        if (rw.headSent()) return error.ProxyBackendStreamAborted;
+        rw.reset(); // a partly-relayed header set must not ride the 502
+        return gatewayErrorReason(
+            rw,
+            502,
+            self.config.via_pseudonym,
+            "Bad Gateway: backend response headers could not be relayed\n",
+        );
     }
 
     /// Map a `Client` error to a gateway status, or surface a genuine
@@ -430,12 +475,15 @@ pub const ProxyHandler = struct {
             store[n] = .{ .name = "X-Forwarded-Host", .value = h };
             n += 1;
         }
-        // Via (request side): append to the client's own, if any.
-        if (buildVia(via_buf, req.header("via"), self.config.via_pseudonym) catch null) |v| {
+        // Via (request side): append to the client's own, if any. A chain
+        // too long for `via_buf` omits it rather than failing the forward —
+        // the *response* side is where a header the peer never sees changes
+        // what the client believes, and that one answers 502 (`relayFailed`).
+        if (buildVia(via_buf, req.header("via"), self.config.via_pseudonym)) |v| {
             if (n == store.len) return error.TooManyHeaders;
             store[n] = .{ .name = "Via", .value = v };
             n += 1;
-        }
+        } else |_| {}
         return store[0..n];
     }
 };
@@ -494,7 +542,7 @@ fn ip_shortcut(buf: []u8, ip_text: []const u8) ?[]const u8 {
 
 /// `Via` value: the existing `Via` (if any) with `", 1.1 <pseudonym>"`
 /// appended (RFC 9110 §7.6.3 — received-protocol + pseudonym).
-fn buildVia(buf: []u8, existing: ?[]const u8, pseudonym: []const u8) error{Overflow}!?[]const u8 {
+fn buildVia(buf: []u8, existing: ?[]const u8, pseudonym: []const u8) error{Overflow}![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     if (existing) |e| {
         w.print("{s}, 1.1 {s}", .{ e, pseudonym }) catch return error.Overflow;
@@ -543,17 +591,32 @@ fn buildUrl(buf: []u8, backend: Backend, path: []const u8, query: []const u8) er
 /// Write a small gateway error response (only possible before any response
 /// byte is on the wire; the caller guarantees that).
 fn gatewayError(rw: *Server.ResponseWriter, status: u16, pseudonym: []const u8) anyerror!void {
-    if (rw.headSent()) return error.ProxyBackendStreamAborted;
-    rw.setStatus(status);
-    rw.setHeader("Content-Type", "text/plain") catch {};
-    var via_buf: [max_via_len]u8 = undefined;
-    if (buildVia(&via_buf, null, pseudonym) catch null) |v| rw.setHeader("Via", v) catch {};
-    const msg = switch (status) {
+    return gatewayErrorReason(rw, status, pseudonym, switch (status) {
         502 => "Bad Gateway\n",
         503 => "Service Unavailable\n",
         504 => "Gateway Timeout\n",
         else => "Proxy Error\n",
-    };
+    });
+}
+
+/// `gatewayError` with the reason spelled out in the body — for a failure
+/// whose cause is *this hop*, where a bare "Bad Gateway" would send an
+/// operator hunting an unreachable backend that is in fact answering fine.
+///
+/// The two `catch {}` here are on the error page's own decoration and are
+/// deliberate: the status line and the body already carry the failure, and a
+/// second failure while reporting the first has nowhere left to go.
+fn gatewayErrorReason(
+    rw: *Server.ResponseWriter,
+    status: u16,
+    pseudonym: []const u8,
+    msg: []const u8,
+) anyerror!void {
+    if (rw.headSent()) return error.ProxyBackendStreamAborted;
+    rw.setStatus(status);
+    rw.setHeader("Content-Type", "text/plain") catch {};
+    var via_buf: [max_via_len]u8 = undefined;
+    if (buildVia(&via_buf, null, pseudonym)) |v| rw.setHeader("Via", v) catch {} else |_| {}
     try rw.writeAll(msg);
 }
 
@@ -567,6 +630,7 @@ const max_authority_len = 300; // host (≤253) + brackets + ":port"
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const net = std.Io.net;
 
 test "isHopByHop: fixed set, Proxy-*, and Connection-listed tokens" {
     // Fixed hop-by-hop set (case-insensitive).
@@ -599,11 +663,12 @@ test "statusForBackendError: timeout → 504, everything else → 502" {
 
 test "buildVia: fresh and appended" {
     var buf: [max_via_len]u8 = undefined;
-    try testing.expectEqualStrings("1.1 zig-libs", (try buildVia(&buf, null, "zig-libs")).?);
-    try testing.expectEqualStrings(
-        "1.0 edge, 1.1 gw",
-        (try buildVia(&buf, "1.0 edge", "gw")).?,
-    );
+    try testing.expectEqualStrings("1.1 zig-libs", try buildVia(&buf, null, "zig-libs"));
+    try testing.expectEqualStrings("1.0 edge, 1.1 gw", try buildVia(&buf, "1.0 edge", "gw"));
+    // The chain that does not fit reports it — the response-side caller turns
+    // that into a 502 rather than quietly forwarding an unmarked hop.
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.Overflow, buildVia(&tiny, null, "zig-libs"));
 }
 
 test "buildUrl: authority, path, query, IPv6 brackets, default path" {
@@ -771,6 +836,180 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
         try testing.expectEqual(@as(u16, 502), res.status);
         try testing.expect(std.mem.indexOf(u8, res.header("via").?, "zig-libs") != null);
     }
+}
+
+// ── integration: a backend answer the proxy cannot relay ────────────────────
+
+/// One response header block a `FatHeaderOrigin` answers with.
+const HeaderShape = struct {
+    /// How many `X-Fat-NNN` response headers.
+    count: usize,
+    /// Bytes in each of their values.
+    value_len: usize,
+};
+
+/// An origin that answers with a header block of the caller's choosing —
+/// including blocks past what `ResponseWriter` can hold. Faked at the socket
+/// level (the same `net.Stream` + `h1.readHead` plumbing `Client` and
+/// `Server` are built on) because a real `http.Server` origin *cannot*
+/// produce one: its response writer has the very limits under test, so an
+/// origin able to send these bytes is precisely what an `http.Server` is not.
+///
+/// The schedule is fixed up front and the thread returns when it runs out, so
+/// the origin can never be left parked in `accept` waiting for a request the
+/// test is not going to make.
+const FatHeaderOrigin = struct {
+    io: std.Io,
+    listener: *net.Server,
+    /// One shape per request, in order. Read only by this thread.
+    shapes: []const HeaderShape,
+
+    fn run(o: *FatHeaderOrigin) void {
+        for (o.shapes) |shape| {
+            const s = o.listener.accept(o.io) catch return;
+            defer s.close(o.io);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [1024]u8 = undefined;
+            var sr = s.reader(o.io, &rbuf);
+            var sw = s.writer(o.io, &wbuf);
+            var head_buf: [4096]u8 = undefined;
+            _ = h1.readHead(&sr.interface, &head_buf) catch return;
+
+            var value: [1024]u8 = undefined;
+            @memset(&value, 'v');
+            const w = &sw.interface;
+            // `Connection: close` so every request gets a fresh connection and
+            // the accept count matches the request count exactly.
+            w.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n") catch return;
+            for (0..shape.count) |i|
+                w.print("X-Fat-{d:0>3}: {s}\r\n", .{ i, value[0..shape.value_len] }) catch return;
+            w.writeAll("\r\nok") catch return;
+            w.flush() catch return;
+        }
+    }
+};
+
+/// What one round trip through the proxy left behind, copied out before the
+/// response is released.
+///
+/// All three round trips are captured BEFORE anything is asserted, on
+/// purpose: a `try` that fired in the middle of the sequence would leave the
+/// origin thread blocked in `accept` for a request that never comes, and the
+/// deferred `join` would hang the suite instead of failing it.
+const Relayed = struct {
+    status: u16 = 0,
+    body_buf: [160]u8 = undefined,
+    body_len: usize = 0,
+    /// Value length of the backend's first/last `X-Fat` header, null = the
+    /// header did not reach the client.
+    fat_first: ?usize = null,
+    fat_last: ?usize = null,
+    via_buf: [128]u8 = undefined,
+    via_len: usize = 0,
+
+    fn body(r: *const Relayed) []const u8 {
+        return r.body_buf[0..r.body_len];
+    }
+    fn via(r: *const Relayed) []const u8 {
+        return r.via_buf[0..r.via_len];
+    }
+
+    /// A failed request leaves `status` 0 rather than propagating — see the
+    /// type doc.
+    fn get(client: *Client, url: []const u8) Relayed {
+        var r: Relayed = .{};
+        var res = client.request(.get, url, .{}) catch return r;
+        defer res.deinit();
+        r.status = res.status;
+        if (res.header("x-fat-000")) |v| r.fat_first = v.len;
+        if (res.header("x-fat-007")) |v| r.fat_last = v.len;
+        if (res.header("via")) |v| {
+            r.via_len = @min(v.len, r.via_buf.len);
+            @memcpy(r.via_buf[0..r.via_len], v[0..r.via_len]);
+        }
+        var w: std.Io.Writer = .fixed(&r.body_buf);
+        _ = res.reader().streamRemaining(&w) catch {};
+        r.body_len = w.buffered().len;
+        return r;
+    }
+};
+
+test "integration: a backend header set the proxy cannot relay answers 502, not a mutilated 200" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("fat-header origin listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const origin_port = listener.socket.address.getPort();
+
+    var origin: FatHeaderOrigin = .{
+        .io = io,
+        .listener = &listener,
+        .shapes = &.{
+            // 1. Past the copied-header BYTE budget: 8 × (9 + 600) ≈ 4.9 KB
+            //    of name+value against `header_copy_bytes` (4 KiB), while the
+            //    field COUNT stays well inside `max_response_headers`.
+            .{ .count = 8, .value_len = 600 },
+            // 2. The mirror image: 40 fields, ~0.5 KB of bytes — over the
+            //    count limit, nowhere near the byte one.
+            .{ .count = 40, .value_len = 4 },
+            // 3. Control: fat but relayable, inside both limits.
+            .{ .count = 8, .value_len = 100 },
+        },
+    };
+    const origin_thread = try std.Thread.spawn(.{}, FatHeaderOrigin.run, .{&origin});
+    defer origin_thread.join();
+
+    var proxy_client = Client.init(io, testing.allocator, .{});
+    defer proxy_client.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .backend = .{ .host = "127.0.0.1", .port = origin_port },
+    });
+    var proxy = Server.init(io, testing.allocator, .{ .handler = ProxyHandler.handler, .context = &ph });
+    defer proxy.deinit();
+    proxy.bind() catch return error.SkipZigTest;
+    const proxy_thread = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer proxy_thread.join();
+    defer proxy.shutdown();
+    const proxy_port = proxy.boundAddress().getPort();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{proxy_port});
+
+    const over_bytes = Relayed.get(&client, url);
+    const over_count = Relayed.get(&client, url);
+    const fits = Relayed.get(&client, url);
+
+    // The item this pins: a backend header that will not fit is NOT dropped
+    // behind the client's back. The old `catch {}` produced a 200 that looked
+    // perfectly normal and was missing `X-Fat-005` onward.
+    try testing.expectEqual(@as(u16, 502), over_bytes.status);
+    try testing.expect(std.mem.indexOf(u8, over_bytes.body(), "could not be relayed") != null);
+    // Not even the fields that DID fit before the budget ran out ride along
+    // on the 502 — `reset` drops the half-relayed set.
+    try testing.expectEqual(@as(?usize, null), over_bytes.fat_first);
+    try testing.expectEqual(@as(?usize, null), over_bytes.fat_last);
+    // …and the hop that failed names itself.
+    try testing.expect(std.mem.indexOf(u8, over_bytes.via(), "zig-libs") != null);
+
+    // Same answer when it is the field count rather than the byte budget.
+    try testing.expectEqual(@as(u16, 502), over_count.status);
+    try testing.expectEqual(@as(?usize, null), over_count.fat_first);
+
+    // Control: a fat-but-relayable answer still goes through whole, so the
+    // two 502s above are the limits talking and not the scaffold.
+    try testing.expectEqual(@as(u16, 200), fits.status);
+    try testing.expectEqual(@as(?usize, 100), fits.fat_first);
+    try testing.expectEqual(@as(?usize, 100), fits.fat_last);
+    try testing.expectEqualStrings("ok", fits.body());
 }
 
 // ── integration: h1 proxy forwarding over h2c to an HTTP/2 backend ──────────

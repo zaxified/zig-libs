@@ -5,6 +5,43 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **BEHAVIOURAL, not breaking** (`proxy`) — a backend response header the
+  proxy cannot put on its own response is no longer dropped silently. Both
+  relay loops (h1 and h2) used `catch {}`, so once the writer's copied-header
+  budget or its 32-field table ran out, the client received a response that
+  *looked* complete while missing whatever came after the limit: the
+  `Location` of a redirect, the `WWW-Authenticate` of a 401, the `Set-Cookie`
+  of a login, the `Content-Encoding` of a compressed body (which the client
+  then decodes as plaintext). Neither end could tell. Such a response now
+  answers **502** with the body `Bad Gateway: backend response headers could
+  not be relayed`, carrying `Via` so the failing hop is identifiable; the
+  half-relayed header set is discarded first, so nothing the backend sent
+  rides along on the 502. **What changes for a consumer:** a backend whose
+  response headers exceed this proxy's limits used to yield a mutilated 200
+  and now yields a 502. Everything inside the limits is byte-for-byte
+  unchanged. The injected response-side `Via` is treated the same way (an
+  over-long `Via` chain is a 502, not a silently omitted hop); the *request*
+  side keeps omitting it, since a header the backend never sees does not
+  change what the client believes.
+- **BEHAVIOURAL, not breaking** (`proxy`) — the forced early
+  `ResponseWriter.end()` at the end of both forward paths is gone. It existed
+  so `writeHead` read the relayed header slices before the deferred
+  `res.deinit()` freed the backend head buffer they pointed into; those bytes
+  are copied now. **What changes for a consumer:** the response head reaches
+  the wire when the serving loop ends the response rather than inside the
+  handler, so middleware wrapped *around* the proxy can still touch headers
+  after it returns — which is a gain (`sessions` saves its cookie there,
+  `csrf` issues its token there, and both were silently losing the write on a
+  proxied response), but it is an observable change of ordering.
+- `ResponseWriter.reset` is now **public**. It discards everything composed so
+  far — status, header table, copied bytes, declared trailers, buffered body —
+  and is legal only while nothing is on the wire. A handler that composes a
+  response and only then discovers it cannot finish it (`proxy` above)
+  otherwise has no way to stop the half-built answer from riding along with
+  the error status that replaces it. Purely an addition.
+- Docs: `setTrailer`'s doc still claimed name and value are stored **without**
+  copying and must stay valid until `end`. They have been copied since the
+  fix below; the doc was describing the defect it repaired.
 - **BREAKING** `Client.Error` gains `error.EntropyUnavailable`. An exhaustive
   `switch` over it stops compiling until it handles the new case; a `catch |e|
   switch (e) { ... else => }` is unaffected, and every in-repo consumer

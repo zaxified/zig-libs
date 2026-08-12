@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **BEHAVIOURAL, not breaking** (server) — `handleRequest` no longer calls
+  `ResponseWriter.end()` itself. It did so to beat the per-call arena's
+  `deinit` to the metadata `Call.finish` had just handed `setHeader` /
+  `setTrailer` — the status digits, the percent-encoded `grpc-message`, the
+  trailing metadata — which `http` copies into the writer now, so the arena
+  dying with the frame no longer reaches them. **What changes for a consumer:**
+  the response head (and, on the Trailers-Only path, the whole response) is
+  committed by the serving loop after the handler returns rather than inside
+  it, so a middleware wrapped around the gRPC router can still touch the head.
+  The frames on the wire are unchanged.
+
 - New module: a gRPC **client** over HTTP/2, per the `grpc-over-http2`
   specification — the layer between the `http` module's multiplexing h2
   client and the `protobuf` codec, with no code generation (a method is a

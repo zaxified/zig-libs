@@ -360,20 +360,15 @@ pub fn serve(
 
     dispatch(r, &call) catch |err| call.adoptError(err);
     call.finish();
-    // `ResponseWriter.end` is called HERE, ahead of where the serving loop
-    // would otherwise call it, so that it runs before `arena_state.deinit()`
-    // (the `defer` above) frees the metadata `finish` just set — the status
-    // digits, the percent-encoded message, the trailers — that `setHeader`/
-    // `setTrailer` were handed. As of the copy-at-call-time fix to those two
-    // (`setHeader`/`setTrailer` now copy the bytes into the writer's own
-    // header_buf immediately, not just keep the slice), that is no longer
-    // true: the arena being freed after this function returns is no longer a
-    // hazard for anything already passed to them. This early call is
-    // therefore no longer load-bearing for that reason, but is left in place
-    // — removing it changes when the response head reaches the wire, a
-    // separate behaviour decision. `end` is idempotent, so the serving loop's
-    // own call becomes a no-op either way.
-    rw.end() catch |err| return err;
+    // No `ResponseWriter.end` here. It used to run ahead of the serving
+    // loop's, purely so it beat `arena_state.deinit()` (the `defer` above) to
+    // the metadata `finish` had just handed `setHeader`/`setTrailer` — the
+    // status digits, the percent-encoded message, the trailing metadata.
+    // Those two copy their bytes into the writer now, so the arena dying with
+    // this frame no longer reaches anything already set, and gRPC gains
+    // nothing from committing the head early: the response body is in the
+    // writer's own buffer (or already framed onto the wire), and every
+    // trailer this module cares about is set above, not after.
 }
 
 fn dispatch(r: *const Router, c: *Call) anyerror!void {

@@ -1912,8 +1912,11 @@ pub const ResponseWriter = struct {
     /// (payload checksum, row count, generation time). Emitted by `end`
     /// after the terminating chunk (h1) or as a final HEADERS frame (h2).
     ///
-    /// Name and value slices are stored WITHOUT copying, exactly like
-    /// `setHeader` — they must stay valid until `end`.
+    /// Name and value bytes are COPIED into the writer, exactly like
+    /// `setHeader` — the caller's slices only have to outlive this call.
+    /// (They were borrowed until 2026-08-12, which made this the *most*
+    /// exposed of the three setters: a trailer is read after the whole body,
+    /// so the frame it was formatted in is longest dead by then.)
     ///
     /// ## Which fields are allowed, and why both gates exist
     ///
@@ -2098,9 +2101,18 @@ pub const ResponseWriter = struct {
         }
     }
 
-    /// Revert to a fresh response — only while nothing is on the wire
-    /// (used for the automatic 500 on handler errors).
-    fn reset(rw: *ResponseWriter) void {
+    /// Discard everything composed so far and start the response over —
+    /// status, header table, copied-header bytes, declared trailers and the
+    /// buffered body. Legal only while nothing is on the wire (asserted;
+    /// check `headSent` first).
+    ///
+    /// The serving loop uses it for the automatic 500 on a handler error.
+    /// Public because a handler needs the same move for the same reason: one
+    /// that composes a response and only then discovers it cannot finish it
+    /// — `proxy` relaying a backend's headers until the budget runs out —
+    /// otherwise has no way to stop the half-built answer from riding along
+    /// with the error status it replaces it with.
+    pub fn reset(rw: *ResponseWriter) void {
         std.debug.assert(!rw.sent_head);
         rw.status = 200;
         rw.headers_len = 0;
@@ -2968,32 +2980,69 @@ test "ResponseWriter: header validation and managed headers" {
     try testing.expectError(error.HeadersSent, rw.setHeader("X-Late", "1"));
 }
 
-test "ResponseWriter: header bytes are copied, so a dead caller buffer is harmless" {
+/// The handler half of the dead-frame test below: build a header name, a
+/// header value, a `Set-Cookie` and a trailer in buffers that die with THIS
+/// frame — the obvious way to write a handler — and return.
+///
+/// A separate `noinline` function, not a block inside the test, and that is
+/// the whole point. A block scope does not free anything: Zig gives each
+/// local its own slot for the enclosing function's entire body in Debug, so a
+/// later local never lands on the "dead" buffer and the borrowed-slice bug
+/// stays invisible. Only a returned frame is really reusable.
+noinline fn setFromDeadFrame(rw: *ResponseWriter) !void {
+    var scratch: [128]u8 = undefined;
+    @memset(&scratch, 'v');
+    const name = try std.fmt.bufPrint(scratch[0..16], "X-Doomed-{d}", .{7});
+    try rw.setHeader(name, scratch[16..64]);
+
+    var cookie_buf: [64]u8 = undefined;
+    try rw.addSetCookie(try std.fmt.bufPrint(&cookie_buf, "sid={d}; Path=/", .{4242}));
+
+    var tname_buf: [32]u8 = undefined;
+    var tval_buf: [32]u8 = undefined;
+    const tname = try std.fmt.bufPrint(&tname_buf, "X-Rows-{d}", .{2});
+    try rw.declareTrailers(&.{tname});
+    try rw.setTrailer(tname, try std.fmt.bufPrint(&tval_buf, "{d}", .{987654}));
+}
+
+/// Reuse the frame `setFromDeadFrame` just left, the way the next call down
+/// the stack would have. Bigger than that frame so it covers every slot in
+/// it, and `noinline` + `doNotOptimizeAway` so neither the call nor the
+/// stores can be optimized out.
+noinline fn clobberDeadFrame() void {
+    var scratch: [2048]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "ResponseWriter: header, cookie and trailer bytes survive the caller's dead frame" {
     var out_buf: [1024]u8 = undefined;
     var out: Writer = .fixed(&out_buf);
     var body_buf: [64]u8 = undefined;
     var chunk_buf: [32]u8 = undefined;
     var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
 
-    // The bug this guards: `writeHead` runs inside `end()`, which both servers
-    // call AFTER the handler returns, so a value formatted into the handler's
-    // stack frame was read after that frame died. Reproduced here without any
-    // server at all — the inner block IS the handler's frame, and scribbling
-    // over it afterwards is what the next stack user would have done.
-    {
-        var scratch: [64]u8 = undefined;
-        @memset(&scratch, 'v');
-        const name = try std.fmt.bufPrint(scratch[0..16], "X-Doomed-{d}", .{7});
-        try rw.setHeader(name, scratch[16..]);
-    }
-    var clobber: [64]u8 = undefined;
-    @memset(&clobber, '#');
-    std.mem.doNotOptimizeAway(&clobber);
+    // The bug this guards: `writeHead` runs inside `end()`, and both servers
+    // call `end()` AFTER the handler returns — so a value formatted into the
+    // handler's stack frame was read once that frame was gone. Reproduced
+    // here with no server at all: `setFromDeadFrame` IS the handler, and the
+    // clobber is what the next stack user would have written over it.
+    try setFromDeadFrame(&rw);
+    clobberDeadFrame();
 
+    try rw.writeAll("body");
     try rw.end();
-    // Both halves matter: a copied NAME as well as a copied value.
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "X-Doomed-7: vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv") != null);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "#") == null);
+    const wire = out.buffered();
+
+    // Header name AND value, the cookie, and the trailer — every byte that
+    // went through the copy store, read back off the wire after its source
+    // was overwritten.
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Doomed-7: " ++ "v" ** 48 ++ "\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid=4242; Path=/\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Trailer: X-Rows-2\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Rows-2: 987654\r\n") != null);
+    // …and not one byte of the clobber pattern anywhere on it.
+    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
 }
 
 test "ResponseWriter: the copy store is bounded, and says so instead of truncating" {

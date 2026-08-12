@@ -420,16 +420,15 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     if (decision.allowed) return next.run(ctx);
 
     // Deny. Header values are formatted on this stack frame; `setHeader`
-    // copies them into the response writer's own storage at call time (they
-    // don't need to survive past that call), but the early `end()` below is
-    // kept anyway — removing it would change when the head reaches the wire,
-    // a separate behaviour decision (`end()` is idempotent, so the serving
-    // loop's own end()+flush still run harmlessly, same trick as the
-    // router's trailing-slash redirect).
+    // copies them into the response writer's own storage at call time, so
+    // they only have to outlive the call and this branch no longer forces an
+    // early `end()`. Handing the head back to the serving loop is the point,
+    // not a side effect: this is a middleware, and an OUTER one that works
+    // after `next.run` — `sessions` saves its cookie there, `csrf` issues its
+    // token there — could not touch a 429 whose head had already gone out.
     //
     // RateLimit-* headers only appear on 429s: they are formatted fresh in
-    // this branch and set immediately, so allowed responses simply never see
-    // them — nothing here depends on when the head is actually written.
+    // this branch and set immediately, so allowed responses never see them.
     var retry_buf: [24]u8 = undefined;
     var limit_buf: [24]u8 = undefined;
     var reset_buf: [24]u8 = undefined;
@@ -441,7 +440,6 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     try ctx.res.setHeader("RateLimit-Reset", std.fmt.bufPrint(&reset_buf, "{d}", .{ceilDivMsToS(decision.reset_after_ms)}) catch unreachable);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Too Many Requests\n");
-    try ctx.res.end();
 }
 
 fn ceilDivMsToS(ms: u64) u64 {

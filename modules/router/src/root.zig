@@ -416,11 +416,12 @@ pub const Router = struct {
         if (req.query.len != 0) w.print("?{s}", .{req.query}) catch return false;
 
         rw.setStatus(if (req.method == .get or req.method == .head) 301 else 308);
+        // `setHeader` copies `loc_buf` into the writer, so the head no longer
+        // has to be forced out before this frame dies. Timing is safe to give
+        // up here specifically: the redirect is answered from `dispatch`
+        // *outside* the middleware chain, so there is no post-`next.run` step
+        // that could have been relying on a committed head.
         try rw.setHeader("Location", w.buffered());
-        // The Location value points into this stack frame — put the head on
-        // the wire now (end() is idempotent; the serving loop's end() and
-        // flush still run).
-        try rw.end();
         return true;
     }
 
@@ -1121,6 +1122,69 @@ test "trailing slash: redirect policy (301 GET / 308 other, query preserved)" {
     try expectHeaderLine(gots, "Location: /static/");
     // No redirect when the method wouldn't be served there either.
     try expectStatus(runWire(&r, wire("DELETE", "/docs"), &buf), "404");
+}
+
+/// Dispatch through a frame that is then abandoned — see the test below.
+/// `noinline` so `tryRedirect`'s `loc_buf` really lives in the frame the
+/// clobber reuses.
+noinline fn dispatchInDoomedFrame(
+    r: *Router,
+    req: *http.Server.Request,
+    rw: *http.Server.ResponseWriter,
+) anyerror!void {
+    return r.dispatch(req, rw);
+}
+
+/// Reuse it, bigger than the 4 KiB `loc_buf` the `Location` used to point at.
+noinline fn clobberDoomedFrame() void {
+    var scratch: [8192]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "trailing slash: the redirect's Location outlives the frame it was built in" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/users/:id", hUser);
+
+    // `tryRedirect` used to force an early `end()` because its `Location`
+    // pointed into its own stack frame; `http`'s `setHeader` copies the bytes
+    // now, so the head is left to the serving loop. That makes this router
+    // depend on the copy — and `runWire` cannot see it, because the loop
+    // offers no seam between the handler returning and `end()` in which to
+    // reuse the dead frame. So the request and the writer are built by hand
+    // here and the two are driven in the loop's own order, with the scribble
+    // in between.
+    var in: Reader = .fixed("GET /users/42/?x=1 HTTP/1.1\r\nHost: t\r\n\r\n");
+    var head_buf: [512]u8 = undefined;
+    const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
+    var body_scratch: [64]u8 = undefined;
+    var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
+    const q = std.mem.indexOfScalar(u8, head.target, '?');
+    var req: http.Server.Request = .{
+        .method = .get,
+        .target = head.target,
+        .path = if (q) |i| head.target[0..i] else head.target,
+        .query = if (q) |i| head.target[i + 1 ..] else "",
+        .head = head,
+        .body = &body,
+        .context = &r,
+    };
+
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &response_body_buf, &chunk_buf, .{});
+
+    try dispatchInDoomedFrame(&r, &req, &rw);
+    clobberDoomedFrame();
+    try rw.end();
+
+    const got = out.buffered();
+    try expectStatus(got, "301");
+    try expectHeaderLine(got, "Location: /users/42?x=1");
+    try testing.expect(std.mem.indexOf(u8, got, "#") == null);
 }
 
 test "trailing slash: strict policy and distinct slash routes" {
