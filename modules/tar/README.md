@@ -21,7 +21,11 @@ byte-faithfully through both.
 
 Provenance: original work of the zig-libs authors (MIT). The wire format is
 the public POSIX ustar / GNU tar spec — no third-party source involved; no
-NOTICE entry needed.
+NOTICE entry needed. Test data: the five `src/testdata/write_golden_*.tar`
+fixtures are GNU tar 1.35's output, captured once from a synthetic `hello.txt`
+this repo wrote, so the archive bytes are format (a spec) wrapped around our
+own content — the black-box-oracle case root NOTICE §0 exempts, with no GNU tar
+source involved and nothing owed.
 
 ## API
 

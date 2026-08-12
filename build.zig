@@ -877,6 +877,51 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
                     );
                     failed.* = true;
                 }
+
+                // A statement about SOURCE does not answer for committed DATA.
+                // Every check above is satisfied by "clean-room from the public
+                // spec, no third-party source ported" -- a sentence that can be
+                // entirely true of a module that also ships someone else's test
+                // corpus in `src/testdata/`. Reproduced third-party data owes
+                // attribution exactly like ported code does, and the one real
+                // licence defect the 2026-07-31 sweep found was that shape:
+                // `bitcoinscript` carried ~2000 rows of Bitcoin Core's
+                // `script_tests.json` verbatim with no attribution file, behind
+                // a provenance line that talked only about the script language.
+                //
+                // So: if a module ships a committed file that is neither Zig
+                // source nor documentation, its provenance statement must
+                // ADDRESS data, or the module must carry its own NOTICE. This
+                // does not decide whether the data is clean -- it only refuses
+                // to let the question go unasked.
+                //
+                // LIMIT, stated so nobody mistakes this for more than it is: a
+                // module that HAS a `modules/<m>/NOTICE` is exempt, because a
+                // human wrote a provenance file for it. That file could still
+                // cover only some of the module's data. This gate closes the
+                // "nobody ever wrote anything" hole, not the "what was written
+                // is incomplete" one -- the latter needs a reader, not a check.
+                if (!fileExists(b, io, b.fmt("modules/{s}/NOTICE", .{m.name}))) {
+                    if (firstDataFile(b, io, b.fmt("modules/{s}", .{m.name}), 0)) |witness| {
+                        const covers_data = containsAnyIgnoreCase(claim, &.{
+                            "test data", "testdata",    "test vector", "vectors",
+                            "corpus",    "corpora",     "fixture",     "golden",
+                            "capture",   "litmus",      "data only",   "no source code",
+                            "no data",   "own tooling",
+                        });
+                        if (!covers_data) {
+                            std.log.err(
+                                "modules/{s} ships committed data ({s}) but its Provenance statement " ++
+                                    "speaks only about source — say where the DATA came from (generated " ++
+                                    "by our own tooling / captured from this machine / reproduced from " ++
+                                    "<upstream>, in which case it needs modules/{s}/NOTICE). Reproduced " ++
+                                    "third-party test data owes attribution exactly like ported code does.",
+                                .{ m.name, witness, m.name },
+                            );
+                            failed.* = true;
+                        }
+                    }
+                }
             }
         } else |_| {}
 
@@ -955,6 +1000,41 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
             failed.* = true;
         }
     }
+}
+
+/// The lexicographically first committed data file under `modules/<m>/` --
+/// anything that is neither Zig source nor documentation nor the module's own
+/// NOTICE. Naming the file is what makes claim 6's diagnostic actionable: "say
+/// where `src/testdata/xlsx_sample.xlsx` came from" is a task, "this module
+/// ships data" is a mood.
+///
+/// Lexicographic rather than iteration order on purpose -- readdir order is not
+/// stable across filesystems, and a gate whose error message changes between
+/// machines is a gate people stop trusting.
+fn firstDataFile(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8) ?[]const u8 {
+    // `src/testdata/csv-spectrum/csvs/x.csv` is four levels below the module;
+    // 6 leaves room without letting a symlink cycle run forever.
+    if (depth > 6) return null;
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var best: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (it.next(io) catch return best) |e| {
+        const path = b.fmt("{s}/{s}", .{ dir_path, e.name });
+        const candidate = switch (e.kind) {
+            .directory => firstDataFile(b, io, path, depth + 1) orelse continue,
+            .file => blk: {
+                if (std.mem.endsWith(u8, e.name, ".zig")) continue;
+                if (std.mem.endsWith(u8, e.name, ".md")) continue;
+                if (std.mem.eql(u8, e.name, "NOTICE")) continue;
+                break :blk path;
+            },
+            else => continue,
+        };
+        if (best == null or std.mem.lessThan(u8, candidate, best.?)) best = candidate;
+    }
+    return best;
 }
 
 /// Oracle-provenance gate: `ANCHORS.tsv`'s CLASS/ANCHOR columns record where each

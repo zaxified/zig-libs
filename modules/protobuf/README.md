@@ -17,7 +17,9 @@ a loop, and embedded-message nesting is capped.
 
 Provenance: the protobuf encoding specification is a public specification (merger doctrine —
 CONVENTIONS.md §5); clean-room, no third-party source ported. The Python `protobuf` package is
-run as a black-box test oracle only. No NOTICE entry needed.
+run as a black-box test oracle only. No NOTICE entry needed. Test data:
+`src/testdata/reference.py` is this repo's own script (`SPDX-License-Identifier:
+MIT`) that drives that oracle; it reproduces none of the `protobuf` package.
 
 ## Declaring a message
 

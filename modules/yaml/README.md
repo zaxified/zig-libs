@@ -117,7 +117,10 @@ returned tree copies what it needs.
 
 Provenance: original work of the zig-libs authors (MIT). Clean-room from the
 YAML 1.2.2 spec, so no `NOTICE` entry is required (CONVENTIONS.md §5) — the
-spec citation lives in `SPEC.md`.
+spec citation lives in `SPEC.md`. Test data: `src/testdata/ledger.txt` is this
+repo's own record of verdicts — one line per yaml-test-suite case ID with our
+pass/fail/reject classification. It cites those IDs but reproduces none of the
+suite's documents, so nothing of yaml-test-suite is vendored here.
 
 ## Deferred
 

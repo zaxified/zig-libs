@@ -42,7 +42,37 @@ uncopyrightable ABI facts they document are used (struct layouts, constants,
 instruction encoding), under the same Linux-syscall-note exception `netlink` /
 `genetlink` / `wireguard` / `tc` rely on. `libbpf` is a **design reference** for
 API shape only, no source ported or read while implementing. Both recorded in
-the root [`NOTICE`](../../NOTICE).
+the root [`NOTICE`](../../NOTICE). Test data — the seven `src/testdata/*.bpf.o`
+fixtures and the `.bpf.c` sources beside them — was written and compiled here;
+see the note below, which also explains the `"GPL"` string a licence scanner
+will find inside them.
+
+Test data, and the one thing about it that will make a licence scanner stop:
+the seven `src/testdata/*.bpf.o` objects are **not** kernel `samples/bpf`,
+selftests, or libbpf examples. Each was compiled here from the `.bpf.c` beside
+it — small fixtures written for this module, with the exact build command
+recorded in `src/object.zig` (`clang -target bpf -O2 -g -c $f.bpf.c -o
+$f.bpf.o`). What a scanner will nevertheless find is this line, in all seven:
+
+```c
+char _license[] SEC("license") = "GPL";
+```
+
+That is **not** a copyright notice and confers nothing on anyone. `SEC("license")`
+is a string the kernel verifier reads at load time to decide whether the program
+may call GPL-only helpers; it is a declaration made by whoever writes the
+program, and here that is us. It is also not decorative — `kprobe_hash.bpf.c`
+calls `bpf_get_current_task()`, which the kernel marks GPL-only, so a fixture
+declaring anything else would be rejected if it were ever loaded. In this
+repository they are never loaded: `object.zig` `@embedFile`s them and the tests
+parse them as ELF. The strings are inert bytes in a parser fixture, and the
+module, its sources and these fixtures are all MIT.
+
+One consequence worth knowing before you call the loader: `tracing.zig`'s
+`ProgLoadOptions.license` **defaults to `"GPL"`**, so a caller who does not set
+it declares their own program GPL to the verifier. That is the useful default
+(most tracing programs need it), but it is a declaration about your program, so
+set it deliberately.
 
 ## Status: complete
 

@@ -21,7 +21,8 @@ Pairs with the `whois` module.
 
 Provenance: clean-room from RFCs 7480/7482/7483/7484/9224 (plus their
 9082/9083 renumberings) — original work of the zig-libs authors (MIT). No
-third-party RDAP implementation consulted or copied.
+third-party RDAP implementation consulted or copied. The detail lives in
+[`NOTICE`](NOTICE) beside this file — a provenance note, carrying no condition.
 
 ## API
 

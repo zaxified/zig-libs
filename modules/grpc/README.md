@@ -19,7 +19,9 @@ ordinary Zig structs with a `pb_fields` descriptor.
 Provenance: the `grpc-over-http2` protocol specification and `doc/compression.md` are public
 specifications (merger doctrine — CONVENTIONS.md §5); clean-room, no gRPC implementation source
 ported or studied. The Python `grpcio` package is run as a black-box test oracle only. No NOTICE
-entry needed.
+entry needed. Test data: `src/testdata/reference_client.py` and
+`src/testdata/reference_server.py` are this repo's own scripts
+(`SPDX-License-Identifier: MIT`) that drive that oracle; neither reproduces any part of `grpcio`.
 
 ## Quick start
 

@@ -71,7 +71,10 @@ Options: `max_depth`, `max_attributes`, `max_name_len`, `doctype`
 - **Model after:** W3C XML 1.0 (5th ed.) + Namespaces in XML 1.0; OWASP XXE
   prevention guidance.
 
-Provenance: original work of the zig-libs authors (MIT).
+Provenance: original work of the zig-libs authors (MIT) — for the CODE. The
+test data is a separate matter: this module vendors a slice of the W3C XML
+Conformance Test Suite, which carries required attribution, so see
+[`NOTICE`](NOTICE) beside this file (it is listed in the root `NOTICE` §1).
 
 ## Out of scope
 

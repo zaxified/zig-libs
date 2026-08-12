@@ -60,4 +60,5 @@ const key_shares = try dkg.assembleKeyShares(allocator, outs, 2, paillier_keys, 
 
 Provenance: clean-room implementation of GJKR (J. Cryptology 2007) over
 `std.crypto.ecc.Secp256k1`, reusing this repo's `threshold_ecdsa` key format /
-Shamir+Feldman shape and `paillier`. No third-party code.
+Shamir+Feldman shape and `paillier`. No third-party code. The detail lives in
+[`NOTICE`](NOTICE) beside this file — a provenance note, carrying no condition.

@@ -73,7 +73,12 @@ const v = q.dequeue(me);         // ?u64 (null when empty)
 Provenance: clean-room from published designs — Michael & Scott's non-blocking
 queue (PODC 1996) and Keir Fraser's epoch reclamation (2004) as realized in
 crossbeam-epoch. No third-party source consulted or copied; no NOTICE entry
-required (see CONVENTIONS §5).
+required (see CONVENTIONS §5). Test data: the nine files under `litmus/` are
+written by this repo — `.litmus` programs in herd7's input syntax, which is a
+published notation, plus a `run.sh` that drives an installed `herd7` as a
+black-box oracle (root NOTICE §0). No herdtools7 source or shipped test is
+reproduced; the axiomatic models the tests run against belong to herd7's own
+installation and are not vendored here.
 
 ## Verification
 

@@ -20,7 +20,8 @@ chasing**, and a tiny `key: value` field extractor.
 Provenance: clean-room from RFC 3912 plus the documented IANA/registry
 referral line conventions (IANA `refer:`, ARIN `ReferralServer:`, Verisign
 `Registrar WHOIS Server:`). No third-party whois implementation consulted
-or copied.
+or copied. The detail lives in [`NOTICE`](NOTICE) beside this file — a
+provenance note, carrying no condition.
 
 ## API
 

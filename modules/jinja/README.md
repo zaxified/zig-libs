@@ -29,7 +29,10 @@ the Jinja2 documentation and the observable behaviour of the reference
 implementation, with no Jinja2 or MarkupSafe source read or ported. Python
 Jinja2 is used only as a black-box test oracle in a subprocess (`SPEC.md` §7).
 That entry is a provenance record and carries no condition beyond zig-libs' MIT
-license.
+license. Test data: `src/testdata/reference.py` is this repo's own script
+(`SPDX-License-Identifier: MIT`) — it merely invokes Jinja2, and none of
+Jinja2's source is reproduced in it — and `src/testdata/golden.json` is that
+script's output, so both are our own work.
 
 ## Import
 

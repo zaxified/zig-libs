@@ -42,5 +42,8 @@ Provenance: clean-room from the specifications: IEEE 802.1AB (LLDP) and the
 IEEE 802.1 / 802.3 organizationally-specific TLV definitions, the publicly
 documented Cisco CDP frame format (a Cisco-proprietary but publicly
 described / reverse-engineered format — behaviour reference only), RFC 826
-(ARP), and RFC 2131 / RFC 2132 (DHCP). No third-party dissector source
+(ARP), and RFC 2131 / RFC 2132 (DHCP). Test data is a separate matter and is
+answered in [`NOTICE`](NOTICE) beside this file: the module vendors real
+tcpdump `tests/*.pcap` capture frames (BSD-3-Clause), which carry required
+attribution, and it is listed in the root `NOTICE` §1. No third-party dissector source
 (Wireshark, lldpd, net-snmp, tcpdump) was consulted or copied. License: MIT.
