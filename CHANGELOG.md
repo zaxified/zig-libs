@@ -1,13 +1,18 @@
 # Changelog
 
-Per-release changes, grouped by module. One semver for the whole collection
-(policy: `CONVENTIONS.md` §8 — pre-1.0, a minor bump may break any module's
-API; breaking changes are flagged **BREAKING**). Routine internal refactors
-are not listed.
+**Index only.** This file lists which modules each dated tag touched; the
+detail lives in `modules/<name>/CHANGELOG.md`, so a consumer of three modules
+reads three files instead of scanning every release section here.
+
+Tags are dates (`YYYY-MM-DD`), not semantic versions, and assert one thing:
+every module passed every lane at that commit. Policy and the reasoning —
+why semver would be both unenforceable and uninformative here — are in
+`CONVENTIONS.md` §8. `v0.1.0` remains as history; nothing after it is a
+semantic version.
 
 ## Unreleased
 
-The collection grew 77 → 148 modules since v0.1.0. Highlights, by area:
+The collection grew 77 → 224 modules since v0.1.0. Highlights, by area:
 
 - **Pairing / elliptic-curve crypto:** the complete BLS12-381 arc (field tower,
   pairing, RFC 9380 hash-to-curve, BLS signatures, KZG/EIP-4844, threshold) +

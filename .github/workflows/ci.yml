@@ -3,20 +3,76 @@ name: CI
 on:
   push:
     branches: [main]
+    # Date tags (see CONVENTIONS §8). A tag is a claim that every lane was
+    # green at that commit, so tagging re-runs the full matrix rather than
+    # trusting that main was green when the tag was cut.
+    tags: ["20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"]
   pull_request:
 
 # Linux-only: several modules (procnet, rawsock, netlink, wireguard, …) are
 # raw-syscall Linux members and are compiled by `zig build test`; socket/netns
 # tests SkipZigTest cleanly on a constrained runner.
 #
-# The three optimisation lanes are deliberate. Compute-heavy modules build at
-# ReleaseSafe when Debug is requested (see `heavy` in build.zig — it takes
-# bls12_381 from 182s to 5s and it is the suite's critical path), so the plain
-# lane no longer proves anything about real Debug. `-Dstrict-debug` forces it
-# back, keeping CONVENTIONS §6.4's "green in Debug and ReleaseFast" honest.
+# TWO SHAPES, and the split is the point.
+#
+#   pull_request        -> `test.sh changed`, one lane. Tests the modules the
+#                          branch touched plus their reverse-dependency
+#                          closure, computed from `zig build module-graph`.
+#   push to main / tag  -> `test.sh all`, four optimize lanes.
+#
+# WHY SCOPING IS SOUND, rather than merely cheaper. The driver decides the
+# escalation from the GRAPH, not from which file was edited: it keeps a
+# snapshot of the last known-good `module-graph` and, if any row is missing or
+# altered — a module changed shape or vanished — the reverse-dep closure can no
+# longer be trusted and it runs everything. With no snapshot at all it also
+# runs everything. Both failure directions are fail-closed, which is what makes
+# this safe to put in front of merges.
+#
+# Measured 2026-08-12 on the real graph: the closure is a MEDIAN OF 1 module
+# (147 of 224 modules have no in-repo consumer at all), 6 at the 90th
+# percentile, 61 at worst (`testkit`). A leaf change costs ~5 s against ~540 s
+# for the full gate.
+#
+# THE FOUR LANES are deliberate. Compute-heavy modules build at ReleaseSafe when
+# Debug is requested (see `heavy` in build.zig — it takes bls12_381 from 182s to
+# 5s and it is the suite's critical path), so the plain lane no longer proves
+# anything about real Debug. `-Dstrict-debug` forces it back, keeping
+# CONVENTIONS §6.4's "green in Debug and ReleaseFast" honest. Integrators build
+# in all three release modes; ReleaseSafe was the only one no lane covered — and
+# it earned its place on 2026-08-12 by being the only lane that caught a
+# use-after-scope in http's response path that the other three passed by luck
+# (see `ResponseWriter.header_buf`).
+#
 # They run as separate jobs so the slow one does not gate the fast one.
+#
+# ⚠ CACHE KEYS ARE NOT OPTIONAL HERE. `setup-zig` preserves the Zig cache
+# between runs, but it cannot tell one matrix job from another on its own — its
+# own README says to populate `cache-key` with the matrix variables. Without
+# that, all four lanes shared a single key and clobbered each other's cache
+# every run, so every lane was effectively cold. The default 2 GiB
+# `cache-size-limit` compounded it; this repo's cache runs to tens of GiB
+# locally, so the action was also discarding the cache almost every time.
 jobs:
-  test:
+  scoped:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: changed modules + reverse-dep closure
+    steps:
+      # Full history: `test.sh changed <base>` diffs against the base branch,
+      # and a shallow clone has nothing to diff against.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          cache-key: scoped
+          cache-size-limit: 8192
+      - name: Test changed modules
+        run: bash scripts/test.sh changed "origin/${{ github.base_ref }}"
+
+  full:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,23 +84,28 @@ jobs:
             args: "-Dstrict-debug"
           - name: ReleaseFast
             args: "-Doptimize=ReleaseFast"
-          # Integrators build in all three release modes; ReleaseSafe was the
-          # only one no lane covered. See CONVENTIONS.md 7.1.
-          # Slowest lane by a wide margin — ~1170s locally cold vs ~680s for
-          # strict Debug and ~360s for the default, so it sets the wall clock.
           - name: ReleaseSafe
             args: "-Doptimize=ReleaseSafe"
-    name: test — ${{ matrix.name }}
+    name: full — ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # scripts/test.sh all runs the format check, the catalog gate and every
-      # module, and wraps the netlink-writing modules in `unshare -rn` where
-      # the runner allows it — otherwise those tests skip rather than fight
-      # the runner's own network state. It also prints a capability report
-      # naming anything the runner cannot do, so a lane that silently covers
-      # less than it looks like is visible in the log.
+          # One cache per lane. Four optimize modes cannot share one entry.
+          cache-key: full-${{ matrix.name }}
+          cache-size-limit: 8192
+      # scripts/test.sh all runs the format check, the hook self-test, the
+      # catalog/provenance gates and every module, and wraps the
+      # netlink-writing modules in `unshare -rn` where the runner allows it —
+      # otherwise those tests skip rather than fight the runner's own network
+      # state. It also prints a capability report naming anything the runner
+      # cannot do, so a lane that silently covers less than it looks like is
+      # visible in the log.
+      #
+      # Local wall clock 2026-08-12 with a warm cache: 537 s for the default
+      # lane and 648 s for ReleaseSafe, which sets the pace. Treat both as
+      # lower bounds — a cold lane is materially slower, and the previous
+      # figure in this file (~1170 s) was never rechecked after it was written.
       - name: Test (${{ matrix.name }})
         run: bash scripts/test.sh all ${{ matrix.args }}

@@ -313,12 +313,25 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
 
 ## 8. Versioning, releases & spin-offs
 
-- **One semver for the whole collection.** A release = a git tag (`vX.Y.Z`) on `main` with
-  CI green. Pre-1.0 semantics: a minor bump may break any module's API; a patch bump is
-  fixes-only. There are no per-module version numbers.
-- **CHANGELOG.md per release, grouped by module.** Every release tag gets a section listing
-  added modules and, per existing module, behavior/API changes — breaking changes flagged
-  **BREAKING**. Routine internal refactors need no entry.
+- **Dated tags, not semver.** A release = a git tag `YYYY-MM-DD` on `main`, cut by
+  `scripts/tag.sh`, which refuses unless all four CI lanes are green at that commit. The tag
+  asserts exactly that and nothing more: *every module passed every lane here*. There are no
+  per-module version numbers and no collection-wide semantic version.
+  **Why not semver.** Zig resolves dependencies by URL + hash — no resolver reads a version
+  string — so a semver tag carries no mechanism, only signal, and on a 224-module collection
+  the signal would be false: one number cannot describe modules ranging from externally
+  anchored to never consumed. It is also uninformative in the direction semver exists for.
+  A consumer using three modules learns nothing from "the collection went 2.0"; a major bump
+  tells them "something, somewhere, broke" and they must read the changelog anyway. So the
+  per-module changelog below does not supplement a collection version — it replaces it.
+  Same-day re-tags get `.1`, `.2`, … so names stay sortable and never collide. `v0.1.0`
+  remains as history; nothing after it is a semantic version.
+- **CHANGELOG per module.** A module that changes behaviour or API records it in
+  `modules/<name>/CHANGELOG.md`, newest first, each entry naming the tag it shipped in and
+  flagging breaking changes **BREAKING**. Routine internal refactors need no entry. The root
+  `CHANGELOG.md` stays as the per-release index — which modules a tag touched — and does not
+  restate the detail. A consumer of three modules should be able to answer "what changed for
+  me" by reading three files, not by scanning every release section of one.
 - **Maturity = explicit caveats, not tier labels.** Every module meets the same bar (§6/§7:
   tests green in Debug + ReleaseFast, oracle/KAT verification where one exists). What varies
   is *scope*: anything unfinished or unverified is stated as an explicit caveat in the

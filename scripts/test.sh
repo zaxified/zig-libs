@@ -197,6 +197,7 @@ harness_smoke() {
     # hook that always exits 0 looks exactly like "nothing was ever unformatted".
     # ~0.2 s in a throwaway repo. See scripts/hooks/test-pre-commit.sh.
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
+    step "tag.sh self-test" ./scripts/test-tag.sh
     step "check-catalog" zig build check-catalog
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
@@ -654,6 +655,7 @@ cmd_all() {
     # module was being tested locally at all. The hook stops that landing in a
     # commit -- but only while the hook itself works, which is what this checks.
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
+    step "tag.sh self-test" ./scripts/test-tag.sh
     step "check-catalog" zig build check-catalog
     step "check-testonly" zig build check-testonly
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
