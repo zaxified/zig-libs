@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- `Ratchet.generate` draws R₀ through the new `entropy` module
+  (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of `io.random`. Not
+  breaking: `fill` returns `void`, so no signature changed and `generate`
+  still returns a plain `Ratchet`. `std.Io.random` is a CSPRNG whose
+  contract permits a silent fallback to a weaker seed (`std/Io.zig:2462`)
+  and the default `Io.Threaded` takes it, seeding from pid + wall clock +
+  an ASLR pointer. Those 128 bytes *are* the session key — every message
+  key the group will ever use is a hash of them and they are shared out
+  verbatim in the session-sharing format — so the draw now aborts rather
+  than mint a group history from a degraded seed. The old doc comment
+  justified `io.random` by pointing at `signal` and `std`'s Ed25519
+  keygen; that comparison is gone with it.
 - New module: Matrix's Megolm group ratchet, the third real-world
   group-messaging construction here alongside `signal` (pairwise Double
   Ratchet) and `mls` (RFC 9420). A one-way four-part HMAC-SHA-256 hash

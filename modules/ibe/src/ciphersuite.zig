@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
+const entropy = @import("entropy");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
@@ -158,9 +159,14 @@ pub fn h4(sigma: []const u8) [block_bytes]u8 {
 /// itself takes `sigma` as a plain `[block_bytes]u8` parameter, sourced
 /// from EITHER this function (production) or a fixed KAT value
 /// (deterministic ciphertext reproduction).
+///
+/// Fail-closed (`entropy.fill`, not `io.random`): `sigma` is the FO
+/// transform's only secret input, so IND-CCA rests entirely on it being
+/// unpredictable, and this signature returns a value with no error
+/// channel to say the draw degraded.
 pub fn randomSigma(io: std.Io) [block_bytes]u8 {
     var buf: [block_bytes]u8 = undefined;
-    io.random(&buf);
+    entropy.fill(io, &buf);
     return buf;
 }
 

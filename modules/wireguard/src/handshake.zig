@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const entropy = @import("entropy");
 const noise = @import("noise.zig");
 /// The transport-data (type 4) seal/open data plane the completed handshake
 /// keys. Imported one way only — `transport.zig` knows nothing about the
@@ -799,10 +800,13 @@ pub const CookieChecker = struct {
     /// When `secret` was generated, in the caller's `now_s` epoch.
     secret_born_s: u64,
 
-    /// Fresh checker with a random `Rm`.
+    /// Fresh checker with a random `Rm`. Fail-closed: `initWithSecret`'s
+    /// own doc says it — a predictable `Rm` makes every cookie forgeable,
+    /// which is the whole security of this layer — and this signature
+    /// returns a `CookieChecker`, so a weak draw could not be reported.
     pub fn init(our_static_public: PublicKey, io: std.Io, now_s: u64) CookieChecker {
         var self = initWithSecret(our_static_public, undefined, now_s);
-        io.random(&self.secret);
+        entropy.fill(io, &self.secret);
         return self;
     }
 
@@ -832,7 +836,9 @@ pub const CookieChecker = struct {
     pub fn refresh(self: *CookieChecker, io: std.Io, now_s: u64) void {
         if (now_s >= self.secret_born_s and
             now_s - self.secret_born_s < cookie_secret_lifetime_s) return;
-        io.random(&self.secret);
+        // Same fail-closed reason as `init` — rotating onto a guessable
+        // `Rm` is strictly worse than not rotating at all.
+        entropy.fill(io, &self.secret);
         self.secret_born_s = now_s;
     }
 
@@ -885,7 +891,10 @@ pub const CookieChecker = struct {
         source_address: []const u8,
     ) CookieReply {
         var nonce: [noise.XAead.nonce_length]u8 = undefined;
-        io.random(&nonce);
+        // Fail-closed: this nonce's only job is to never repeat under one
+        // `Rm`, and a repeat leaks the XOR of two cookies (see
+        // `createReplyWithNonce`). Returns a `CookieReply`, no error channel.
+        entropy.fill(io, &nonce);
         return self.createReplyWithNonce(io, now_s, f, source_address, nonce);
     }
 

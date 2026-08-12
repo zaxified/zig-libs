@@ -534,7 +534,10 @@ pub fn Group(comptime S: type) type {
             defer gpa.free(gc_bytes);
 
             var init_secret: [S.Nh]u8 = undefined;
-            params.io.random(&init_secret);
+            // Root of the epoch key schedule: every group key derives from
+            // this. `random`'s fallback on `EntropyUnavailable` is silent and
+            // low-entropy, so this secret needs the fail-closed call instead.
+            try params.io.randomSecure(&init_secret);
             const secrets = try keyschedule.deriveEpoch(
                 S,
                 gpa,
@@ -1514,7 +1517,10 @@ pub fn Group(comptime S: type) type {
             const want_path = external or applied.needs_path or !params.omit_path_when_allowed;
             if (want_path) {
                 var path_secret_0: [S.Nh]u8 = undefined;
-                params.io.random(&path_secret_0);
+                // Commit secret for the UpdatePath: forward secrecy of the
+                // ratchet tree rides on it, so — as with `init_secret` above —
+                // fail closed rather than accept `random`'s silent fallback.
+                try params.io.randomSecure(&path_secret_0);
                 const leaf_kp = S.Kem.generateKeyPair(params.io);
 
                 const st = try treekem.stageUpdatePath(S, arena, &self.ratchet_tree, self.my_leaf_index, .{

@@ -24,6 +24,7 @@
 //! source (different field width, different constant `a24`).
 
 const std = @import("std");
+const entropy = @import("entropy");
 const field = @import("field.zig");
 const Fe = field.Fe;
 
@@ -201,10 +202,13 @@ pub const KeyPair = struct {
         };
     }
 
-    /// Generate a new, random key pair.
+    /// Generate a new, random key pair. The seed IS the X448 private
+    /// scalar, so it fails closed (`entropy.fill`) — `generate` returns a
+    /// `KeyPair`, not an error union, and a predictable seed here hands
+    /// over every DH shared secret this key ever computes.
     pub fn generate(io: std.Io) KeyPair {
         var seed: [seed_length]u8 = undefined;
-        io.random(&seed);
+        entropy.fill(io, &seed);
         // recoverPublicKey/scalarmult cannot fail on a freshly-clamped,
         // freshly-random `u`-coordinate path here (base_u is a fixed
         // canonical constant; the only FieldError source in this call

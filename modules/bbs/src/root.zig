@@ -104,7 +104,7 @@ pub const meta = .{
     .role = .util, // no I/O, no wire framing beyond point/scalar (de)serialization
     .concurrency = .reentrant, // every type is a plain value; no globals
     .model_after = "draft-irtf-cfrg-bbs-signatures-04 (the BLS12-381-SHA-256 ciphersuite); test vectors from mattrglobal/pairing_crypto's bls12_381_sha_256 fixture directory (see SPEC.md for exact version/commit pinning); bls12_381 (this repo) supplies the field/group/pairing/hash-to-curve primitives",
-    .deps = .{"bls12_381"},
+    .deps = .{ "bls12_381", "entropy" }, // entropy: the blinding-scalar draw
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -127,9 +127,10 @@ test "meta.model_after names the bbs-signatures draft" {
     try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "bbs-signatures-04") != null);
 }
 
-test "meta.deps is exactly {bls12_381}" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {bls12_381, entropy}" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("bls12_381", meta.deps[0]);
+    try std.testing.expectEqualStrings("entropy", meta.deps[1]);
 }
 
 test "gate IS flipped (the four Fable cores are implemented)" {

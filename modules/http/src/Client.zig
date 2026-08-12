@@ -196,6 +196,11 @@ pub const Error = error{
     Timeout,
     Canceled,
     OutOfMemory,
+    /// `io.randomSecure` could not obtain entropy for TLS key material
+    /// (`dialConn`'s `tls.Client.Options.entropy`); unlike `io.random` it
+    /// does not fall back to a weaker source, so this is fail-closed rather
+    /// than silently-degraded randomness.
+    EntropyUnavailable,
 };
 
 /// `io` must support the net + async vtable operations (e.g.
@@ -1087,7 +1092,11 @@ fn dialConn(c: *Client, url: http.Url) Error!*Conn {
 
     if (tls_needed) {
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        io.random(&entropy);
+        // The caller handed us `io` for sockets; `random`'s silent fallback
+        // on `EntropyUnavailable` would spend that same capability on TLS key
+        // material too — this seeds the ClientHello random and key share for
+        // every HTTPS request, so fail closed instead.
+        try io.randomSecure(&entropy);
         conn.tls_client = tls.Client.init(&conn.sr.interface, &conn.sw.interface, .{
             .host = switch (o.tls.verify) {
                 .strict => .{ .explicit = url.host },

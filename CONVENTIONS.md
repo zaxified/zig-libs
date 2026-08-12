@@ -108,6 +108,34 @@ scrubbing the very residue the probe wants to see (measured: 2048/2048 bytes ove
 ReleaseFast the residue is gone for a different reason, register and slot reuse). Z1 stack wipes
 are justified by this rule and by review, not by a regression test.
 
+### 2.2 Where secret-bearing randomness comes from
+
+`std.Io.random` is a CSPRNG **with a documented silent-degrade clause** — "seeded by
+`randomSecure`, or a less secure mechanism upon failure" — and `std.Io.Threaded` honours it
+literally: on `error.EntropyUnavailable` it seeds from a zeroed buffer plus an ASLR pointer,
+`getpid()` and a clock. That failure is invisible to every test anything downstream could write.
+`std.Io.randomSecure` is the fail-closed twin. The rule:
+
+- **Draws that become secrets** — keys, private scalars, nonces/IVs, salts, session ids,
+  ephemeral key material: `try io.randomSecure(buf)` where the signature already returns an
+  error; [`entropy.fill(io, buf)`](modules/entropy) where it cannot. Prefer the former — `fill`
+  aborts the process, which is right only when there is no error channel to use instead.
+  `entropy.SecureSource` is the fail-closed `std.Random` adapter (`std.Random.IoSource` binds the
+  degrading call).
+- **Everything else** — jitter, backoff, tiebreaks, hash-table seeds, test fixtures: `io.random`.
+  Do not pay a syscall, let alone an abort, for these.
+
+Deliberate exceptions, which stay as they are:
+
+- `ssh` and `bulletproofs` hand-roll a `getrandom(2)` loop that panics on failure. Same
+  fail-closed posture, reached before `entropy` existed, and both are deliberately
+  `platform = .linux` for it. Not a defect; do not open a task to migrate them.
+- `sealedbox` and `signal`'s KAT seams use `io.random` **on purpose**: feeding a scripted stream
+  into it is what makes their published vectors reproducible. A fail-closed draw there would
+  delete the anchor.
+
+A new module that draws a secret and does neither of the above is a finding.
+
 ## 3. Naming & structure
 
 - **`snake_case`, capability-based, no `zig-` prefix, no platform/role in the name** —

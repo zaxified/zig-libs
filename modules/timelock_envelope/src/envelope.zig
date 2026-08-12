@@ -56,6 +56,7 @@ const std = @import("std");
 const tlock = @import("tlock");
 const hqc = @import("hqc");
 const chachapoly = @import("chachapoly");
+const entropy = @import("entropy");
 
 const bls12_381 = tlock.bls12_381;
 const g1 = bls12_381.g1;
@@ -245,12 +246,17 @@ pub fn Envelope(comptime Kem: type) type {
             /// enforce freshness; the caller must draw a new value (e.g.
             /// via `generate`) for every `seal` call.
             ///
-            /// Draw all three from a portable entropy source.
+            /// Draw all three from a portable, fail-closed entropy source.
+            /// `entropy.fill` and not `io.random` precisely because of the
+            /// reuse consequence above: a degraded seed repeats these three
+            /// values across `seal` calls, which is the break this doc
+            /// comment describes. `generate` returns a value, so the
+            /// alternative to aborting is producing one silently.
             pub fn generate(io: std.Io) SealRandomness {
                 var r: SealRandomness = undefined;
-                io.random(&r.s_time);
-                io.random(&r.tlock_sigma);
-                io.random(&r.kem_coins);
+                entropy.fill(io, &r.s_time);
+                entropy.fill(io, &r.tlock_sigma);
+                entropy.fill(io, &r.kem_coins);
                 return r;
             }
         };

@@ -57,7 +57,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "drand tlock + PQ-KEM hybrid envelope (age-style two-lock KDF)",
-    .deps = .{ "tlock", "hqc", "chachapoly" },
+    .deps = .{ "tlock", "hqc", "chachapoly", "entropy" }, // entropy: `SealRandomness.generate`
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ─────────────────
@@ -70,9 +70,10 @@ test {
     _ = @import("security_test.zig");
 }
 
-test "meta.deps is exactly {tlock, hqc, chachapoly}" {
-    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
+test "meta.deps is exactly {tlock, hqc, chachapoly, entropy}" {
+    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
     try std.testing.expectEqualStrings("tlock", meta.deps[0]);
     try std.testing.expectEqualStrings("hqc", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
+    try std.testing.expectEqualStrings("entropy", meta.deps[3]);
 }

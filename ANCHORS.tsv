@@ -91,6 +91,7 @@ ecvrf	B	EXTERNAL	RFC 9381 Appendix B.3 official ECVRF-EDWARDS25519-SHA512-TAI ve
 ed448	B	EXTERNAL	RFC 8032 / RFC 7748 official test vectors, byte-exact, kat_test.zig
 encoding	A	SELF	hand-authored spot-check fixtures (e.g. windows-1252 euro), no WHATWG table/iconv cross-check
 enip	A	EXTERNAL	61 goldens captured from real traffic between 3rd-party stacks + live round trips
+entropy	D	n/a	own policy binding over std.Io.randomSecure; no algorithm and no wire, so no third party to agree with — tests pin WHICH std entry point is called, not any output value
 ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation
 ethtool	A	EXTERNAL	real ethtool binary as capture oracle under strace, goldens.zig
 falcon	B	EXTERNAL	official NIST Round-3 falcon512/1024-KAT.rsp files, byte-exact

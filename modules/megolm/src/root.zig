@@ -50,7 +50,7 @@ pub const meta = .{
     .role = .util, // pure computation over caller-supplied bytes/keys -- no owned socket/transport
     .concurrency = .reentrant, // no globals; every type here is a plain caller-owned value
     .model_after = "Matrix Megolm (gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md); libolm (megolm.c) and vodozemac (megolm/ratchet.rs) as design references + test-vector source -- see NOTICE",
-    .deps = .{"aescbc"},
+    .deps = .{ "aescbc", "entropy" }, // entropy: the R0 draw in `Ratchet.generate`
 };
 
 pub const ratchet = @import("ratchet.zig");
@@ -84,9 +84,10 @@ test {
     _ = @import("kat_test.zig");
 }
 
-test "meta.deps names aescbc, the AES-CBC/PKCS7 primitive this composes" {
+test "meta.deps names aescbc (the AES-CBC/PKCS7 primitive) and entropy (R0)" {
     try std.testing.expectEqualStrings("aescbc", meta.deps[0]);
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("entropy", meta.deps[1]);
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
 }
 
 test "meta.role is .util (no owned transport/socket)" {

@@ -59,6 +59,7 @@
 
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
+const entropy = @import("entropy");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -271,9 +272,14 @@ pub fn h4(comptime len: usize, sigma: []const u8) [len]u8 {
 /// plain `[block_bytes]u8` parameter, sourced from EITHER this function
 /// (production) or a KAT vector's fixed bytes (deterministic
 /// ciphertext reproduction) — see `tlock.zig`'s `encrypt` doc comment.
+///
+/// Fail-closed (`entropy.fill`, not `io.random`): a guessable `sigma`
+/// unlocks a timelock ciphertext before its round, which is the one
+/// property the whole construction sells. Nothing in this signature can
+/// return an error, so the draw either succeeds or aborts.
 pub fn randomSigma(io: std.Io) [block_bytes]u8 {
     var buf: [block_bytes]u8 = undefined;
-    io.random(&buf);
+    entropy.fill(io, &buf);
     return buf;
 }
 

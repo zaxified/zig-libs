@@ -75,7 +75,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no wire framing beyond point (de)serialization
     .concurrency = .reentrant, // every type is a plain value type; kzg's only global is a write-once atomic memo of the embedded (compile-time-constant) trusted setup
     .model_after = "draft-irtf-cfrg-pairing-friendly-curves (the BLS12-381 parameter set) + the ZCash/IETF BLS12-381 point-serialization convention; std.crypto.ff supplies the constant-time Montgomery modular arithmetic Fp/Fr are built on",
-    .deps = .{}, // std only (std.crypto.ff)
+    .deps = .{"entropy"}, // otherwise std only (std.crypto.ff); entropy backs `Fr.random`
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

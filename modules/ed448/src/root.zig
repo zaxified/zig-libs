@@ -40,7 +40,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "RFC 7748 (X448) + RFC 8032 §5.2 (Ed448/Ed448ph) — the Goldilocks/curve448 family; API shape mirrors std.crypto.ecc.Curve25519/Edwards25519 + std.crypto.dh.X25519 + std.crypto.sign.Ed25519 one curve family up (std has no 448-bit curve of its own)",
-    .deps = .{},
+    .deps = .{"entropy"}, // the two `KeyPair.generate` seed draws
 };
 
 pub const field = @import("field.zig");

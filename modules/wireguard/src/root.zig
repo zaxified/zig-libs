@@ -86,7 +86,8 @@ pub const meta = .{
     // WireGuard transport-data packet is one AEAD seal/open per MTU, so this
     // is the module's only throughput-sensitive primitive. Byte-exact to
     // std; the cookie-reply XChaCha20 variant stays on std (see noise.zig).
-    .deps = .{ "netlink", "genetlink", "chachapoly" },
+    // entropy: the cookie secret `Rm` and the cookie-reply XAEAD nonce.
+    .deps = .{ "netlink", "genetlink", "chachapoly", "entropy" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────

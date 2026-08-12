@@ -11,6 +11,7 @@
 //! `fp.zig` (see that file's convention note above `Fp.add`).
 
 const std = @import("std");
+const entropy = @import("entropy");
 
 /// Container width for `Fr`: 256 bits (32 bytes), the next byte-aligned
 /// width above `r`'s actual 255 bits — mirrors `fp.zig`'s `modulus_bits`
@@ -179,10 +180,16 @@ pub const Fr = struct {
     /// reduction for HASH-DERIVED scalars, but reducing a raw same-width
     /// random sample biases the result the same way `Fp.random`'s doc
     /// comment warns against).
+    ///
+    /// Fail-closed (`entropy.fill`, not `io.random`): this is the draw
+    /// `ibe.Scheme.setup` mints its MASTER secret key from, so a
+    /// degraded seed here forfeits every identity key the authority will
+    /// ever issue. `Fr` is a value, not an error union — there is no
+    /// channel to report a weak draw on, so it aborts instead.
     pub fn random(io: std.Io) Fr {
         var buf: [encoded_bytes]u8 = undefined;
         while (true) {
-            io.random(&buf);
+            entropy.fill(io, &buf);
             return Fr.fromBytes(buf) catch continue; // >= r: reject, redraw
         }
     }

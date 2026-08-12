@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **BREAKING** `Client.Error` gains `error.EntropyUnavailable`. An exhaustive
+  `switch` over it stops compiling until it handles the new case; a `catch |e|
+  switch (e) { ... else => }` is unaffected, and every in-repo consumer
+  (`proxy.statusForBackendError`, `llmclient.mapHttpError`, `h2_upstream`)
+  already uses `else`. It exists because `dialConn` now draws TLS key material
+  with `io.randomSecure` instead of `io.random`. `std.Io.random` is a CSPRNG
+  whose contract permits a silent fallback to a weaker seed
+  (`std/Io.zig:2462`), and the default `Io.Threaded` takes it — seeding from
+  pid + wall clock + an ASLR pointer. This is the one place in the library
+  where that mattered most: the caller hands over `io` because they want
+  **sockets**, and the ClientHello random and key share for every HTTPS
+  request were being drawn from that same capability with no signal at the
+  call site. Now it fails closed instead.
 - **BREAKING** `SetHeaderError` and `TrailerError` gain
   `error.HeaderBytesExhausted`. An exhaustive `switch` over either set stops
   compiling until it handles the new case; a `catch |e| switch (e) { ... else

@@ -105,7 +105,7 @@ pub const meta = .{
     .role = .util, // no I/O, no wire framing beyond the fixed 128-byte Ciphertext codec
     .concurrency = .reentrant, // every type is a plain value; no globals
     .model_after = "drand/tlock (Go, Gailly/Melissaris/Romailler) + drand/kyber's encrypt/ibe package (Boneh-Franklin \"FullIdent\" IBE, CRYPTO 2001 §4.2) — quicknet's SigsOnG1ID/\"bls-unchained-g1-rfc9380\" scheme; bls12_381 (this repo) supplies the field/group/pairing/hash-to-curve primitives",
-    .deps = .{"bls12_381"},
+    .deps = .{ "bls12_381", "entropy" }, // entropy: the fail-closed `sigma` draw
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -128,9 +128,10 @@ test "meta.model_after names drand/tlock and drand/kyber" {
     try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "drand/kyber") != null);
 }
 
-test "meta.deps is exactly {bls12_381}" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {bls12_381, entropy}" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("bls12_381", meta.deps[0]);
+    try std.testing.expectEqualStrings("entropy", meta.deps[1]);
 }
 
 test "gate IS flipped (encrypt/decrypt are real and interop-verified)" {

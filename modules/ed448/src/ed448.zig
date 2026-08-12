@@ -30,6 +30,7 @@
 //! applies).
 
 const std = @import("std");
+const entropy = @import("entropy");
 const field = @import("field.zig");
 const scalar = @import("scalar.zig");
 const Fe = field.Fe;
@@ -531,10 +532,14 @@ pub const KeyPair = struct {
         };
     }
 
-    /// Generate a new, random key pair.
+    /// Generate a new, random key pair. The seed IS the long-term signing
+    /// key (`create` derives both `s` and the nonce `prefix` from it), so
+    /// it fails closed (`entropy.fill`) — this signature returns a
+    /// `KeyPair` with no error channel, and a guessable seed is a forged
+    /// signature under every message.
     pub fn generate(io: std.Io) KeyPair {
         var seed: [57]u8 = undefined;
-        io.random(&seed);
+        entropy.fill(io, &seed);
         return create(seed);
     }
 

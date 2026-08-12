@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- `create` and the commit path draw `init_secret` and `path_secret_0` with
+  `io.randomSecure` rather than `io.random`. Not breaking — both functions
+  already returned an error union, so `error.EntropyUnavailable` joins an
+  inferred set and no signature changed. `std.Io.random` is a CSPRNG whose
+  contract permits a silent fallback to a weaker seed (`std/Io.zig:2462`),
+  and the default `Io.Threaded` takes it, seeding from pid + wall clock + an
+  ASLR pointer. `init_secret` is the root of the epoch key schedule and
+  `path_secret_0` carries the ratchet tree's forward secrecy, so both fail
+  closed now instead of quietly accepting a degraded seed.
+  ⚠ Not covered by this change: `S.Kem.generateKeyPair(params.io)` on the
+  next line bottoms out in `io.random` **inside std**, which no call-site
+  change here can reach.
 - External Commits (RFC 9420 §12.4.3.2) — joining a group **without an
   invitation**. Until now the only way in was a Welcome, which requires
   an existing member to have added you; an external Commit lets a

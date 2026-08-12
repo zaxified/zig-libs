@@ -105,7 +105,7 @@ pub const meta = .{
     .role = .util, // no I/O, no wire framing beyond the fixed Ciphertext codec
     .concurrency = .reentrant, // every type is a plain value; no globals
     .model_after = "Boneh, D. and Franklin, M., \"Identity-Based Encryption from the Weil Pairing\" (CRYPTO 2001, \"FullIdent\", section 4.2); the encrypt/decrypt assembly mirrors this repo's own tlock module (interop-verified against drand/kyber's Go implementation), adapted to a caller-run PKG instead of a drand beacon; bls12_381 (this repo) supplies the field/group/pairing/hash-to-curve primitives",
-    .deps = .{"bls12_381"},
+    .deps = .{ "bls12_381", "entropy" }, // entropy: fail-closed `sigma` / master-key draws
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -127,9 +127,10 @@ test "meta.model_after names Boneh-Franklin CRYPTO 2001" {
     try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "CRYPTO 2001") != null);
 }
 
-test "meta.deps is exactly {bls12_381}" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {bls12_381, entropy}" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("bls12_381", meta.deps[0]);
+    try std.testing.expectEqualStrings("entropy", meta.deps[1]);
 }
 
 test "Ciphertext.encoded_bytes is 160 (96-byte G2 U + 32-byte V + 32-byte W)" {

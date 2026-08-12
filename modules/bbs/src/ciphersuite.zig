@@ -75,6 +75,7 @@
 
 const std = @import("std");
 const bls = @import("bls12_381");
+const entropy = @import("entropy");
 
 pub const G1 = bls.G1;
 pub const G2 = bls.G2;
@@ -286,11 +287,17 @@ pub fn calculateDomain(
 /// section for why this module takes `io`/`random_scalars` as an
 /// explicit parameter rather than reading global/internal entropy,
 /// unlike `bulletproofs`).
+///
+/// Fail-closed (`entropy.fill`, not `io.random`): these are `proofGen`'s
+/// blinding scalars, and predicting them de-anonymises the proof —
+/// linking presentations back to one credential is exactly what this
+/// scheme exists to prevent. The return type is an array, so a degraded
+/// draw has nowhere to surface.
 pub fn calculateRandomScalars(comptime count: usize, io: std.Io) [count]Fr {
     var out: [count]Fr = undefined;
     for (&out) |*r| {
         var buf: [expand_len]u8 = undefined;
-        io.random(&buf);
+        entropy.fill(io, &buf);
         r.* = Fr.reduceWide(&buf);
     }
     return out;

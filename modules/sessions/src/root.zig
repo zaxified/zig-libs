@@ -65,6 +65,7 @@ const router = @import("router");
 const http = @import("http");
 const cookies = @import("cookies");
 const ramcache = @import("ramcache");
+const entropy = @import("entropy");
 
 const csrf = @import("csrf.zig");
 
@@ -75,7 +76,7 @@ pub const meta = .{
     // Store, whose default impl serializes cache access behind its own lock.
     .concurrency = .threadsafe,
     .model_after = "OWASP Session Management + CSRF Prevention Cheat Sheets",
-    .deps = .{ "router", "http", "cookies", "ramcache" },
+    .deps = .{ "router", "http", "cookies", "ramcache", "entropy" }, // entropy: the session-id draw
 };
 
 const Allocator = std.mem.Allocator;
@@ -616,7 +617,11 @@ pub const Manager = struct {
     fn newId(m: *const Manager, out: *Session) void {
         var raw: [max_id_bytes]u8 = undefined;
         const slice = raw[0..m.id_bytes];
-        m.io.random(slice);
+        // The id is the bearer token: guessing one IS the session. Fails
+        // closed — `newId` returns void (it is reached from `middleware`,
+        // which cannot fail either), so there is no way to report a
+        // degraded draw and every id after it would be forgeable.
+        entropy.fill(m.io, slice);
         const hex = "0123456789abcdef";
         for (slice, 0..) |b, i| {
             out.id_buf[2 * i] = hex[b >> 4];

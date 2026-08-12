@@ -56,6 +56,7 @@
 //! about 2^32-message sessions, which is not a real deployment scenario).
 
 const std = @import("std");
+const entropy = @import("entropy");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Bytes per ratchet part (== the HMAC-SHA-256 output length; the spec
@@ -86,15 +87,17 @@ pub const Ratchet = struct {
     }
 
     /// A fresh outbound ratchet: 1024 bits (128 bytes) of randomness at
-    /// index 0, exactly as the spec's "Session setup" specifies. Uses
-    /// `io.random` (not `randomSecure`) to match this repo's other
-    /// randomized-keypair call sites (e.g. `signal`'s
-    /// `X25519.KeyPair.generate(io)`, `std.crypto.sign.Ed25519.KeyPair.
-    /// generate(io)` — both non-error-returning `io.random` under the
-    /// hood).
+    /// index 0, exactly as the spec's "Session setup" specifies.
+    ///
+    /// These 128 bytes ARE the session key — every message key the group
+    /// will ever use is a hash of them, and they are shared out verbatim
+    /// in the session-sharing format. `entropy.fill` rather than
+    /// `io.random` because the signature returns a `Ratchet`, not an
+    /// error union, so a degraded seed would become a whole group's
+    /// history with nothing to report it.
     pub fn generate(io: std.Io) Ratchet {
         var data: [ratchet_len]u8 = undefined;
-        io.random(&data);
+        entropy.fill(io, &data);
         return .{ .data = data, .counter = 0 };
     }
 
