@@ -278,9 +278,19 @@ pub const Cors = struct {
             if (c.options.max_age_s != null)
                 try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
         }
-        // Short-circuit: 204, no body. end() is idempotent — the serving
-        // loop's end() and flush still run.
-        try res.end();
+        // Short-circuit: 204, no body — `next` is never called for a
+        // preflight, so no downstream handler runs. This used to force an
+        // early `end()`, but nothing written above needs it: the reflected
+        // `Access-Control-Allow-Headers` is the *request's* own header
+        // slice (outlives the response head regardless of copying — see the
+        // comment above), and every other value here lives on `c`, not on
+        // this stack frame. The early `end()` bought nothing and cost the
+        // same thing it cost `ratelimit`/`throttle`: this call happens
+        // *inside* the middleware chain (via `next.run`, unlike the
+        // router's trailing-slash redirect, which answers outside it), so
+        // an OUTER middleware doing work after `next.run` — `sessions`
+        // saves its cookie there, `csrf` issues its token there — could not
+        // touch a preflight response whose head had already gone out.
     }
 
     /// Actual request: set the response CORS headers when Origin + method
@@ -490,6 +500,42 @@ test "preflight: golden 204 with the full header set; handler not invoked" {
         "Connection: close\r\n" ++
         "\r\n", runWire(&r, preflight_wire, &buf));
     try testing.expect(!flag.hit);
+}
+
+/// A synthetic "outer" middleware shaped like `sessions`/`csrf`: it lets the
+/// chain run, then tries to write a header afterward, swallowing failure
+/// the way `csrf.issue` swallows `addSetCookie`'s error with `catch {}`.
+/// Registered *before* `cors` in the chain, so it wraps it — its own
+/// `next.run` call is what runs `cors`'s `middlewareRun`, preflight
+/// short-circuit included.
+fn mwOuterCookie(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    try next.run(ctx);
+    ctx.res.addSetCookie("session=abc") catch {};
+}
+
+test "preflight: an OUTER middleware writing after next.run still lands its header" {
+    // Before this task, `handlePreflight` forced an early `end()`, so an
+    // outer middleware working after `next.run` — exactly `sessions`
+    // (save/destroy) and `csrf` (issue) — would have this call return
+    // `error.HeadersSent`, swallowed silently by the `catch {}` both use.
+    // This is the preflight analogue of the defect `6ba5d7d` found and
+    // fixed for `ratelimit`'s 429 and `throttle`'s 503.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{ .get, .post },
+    });
+    defer c.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .run = mwOuterCookie });
+    try r.use(c.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, preflight_wire, &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Set-Cookie: session=abc");
 }
 
 test "preflight: .reflect echoes Access-Control-Request-Headers verbatim; absent ACRH emits none" {

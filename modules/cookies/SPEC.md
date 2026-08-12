@@ -19,6 +19,13 @@ Usage: see ./README.md. Attribution/provenance: see /NOTICE.
   (browsers silently drop such a cookie otherwise), surfaced at build time.
 - **Dateless.** Std-only, no clock: `expires` is a pre-formatted IMF-fixdate string the caller
   supplies (prefer `max_age`). Attributes emitted in RFC 6265 §4.1 order; null/false ones omitted.
+- **`set` owns its formatting buffer.** The `http` helper takes no caller buffer: the response
+  writer copies header bytes into its own storage at `setHeader` time, so nothing has to outlive
+  the call. `set` formats into `max_set_cookie_bytes` = 4096 — RFC 6265 §6.1's "at least 4096
+  bytes per cookie (name + value + attributes)", i.e. the largest cookie a conforming user agent
+  must keep, and the same size as `http`'s whole per-response header copy store, so this buffer
+  is never the binding constraint. Over-long ⇒ `error.BufferTooSmall`; a `Set-Cookie` is never
+  truncated, since a truncated one still parses and would be stored silently corrupted.
 
 ## Threat model / out of scope
 Defends against `Set-Cookie` header/attribute injection via a reflected name/value/Path/Domain, and
@@ -34,7 +41,12 @@ valueless cookies, quoted/unbalanced-quote values (incl. a quoted value containi
 does not end the segment), empty-name/first-`=` splitting, degenerate headers. Builder (10): full
 attribute set in RFC order, minimal `name=value`, Domain + pre-formatted Expires, negative Max-Age,
 `SameSite=Strict`, invalid name/value/Path/Domain rejection, `SameSite=None` both branches,
-`BufferTooSmall`. Plus an end-to-end `get`+`set` over `http.Server.serveStream`. Run:
+`BufferTooSmall`. `http` helpers (3): an end-to-end `get`+`set` over `http.Server.serveStream`;
+an anchor for the copy `set` depends on — a `noinline` helper sets the cookie from its own frame,
+returns, and a second `noinline` deliberately clobbers that frame before `end()` runs, so the
+value read off the wire proves `setHeader` copied rather than borrowed (`serveStream` offers no
+seam between the handler returning and `end()`, so the writer is driven by hand); and an
+over-long cookie refused with `BufferTooSmall`/`HeaderBytesExhausted` rather than truncated. Run:
 `zig build test-cookies`.
 
 **External anchor** (`golden_test.zig`): python3's stdlib `http.cookies` run once as a black-box

@@ -284,9 +284,13 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 }
 
 /// The 503 path, mirroring ratelimit's 429: the `Retry-After` value is
-/// formatted on this stack frame, so the head must reach the wire before the
-/// frame unwinds — `end()` is idempotent and the serving loop's own
-/// end()+flush still run.
+/// formatted on this stack frame; `setHeader` copies it into the response
+/// writer's own storage at call time, so it only has to outlive the call and
+/// this branch no longer forces an early `end()`. Handing the head back to
+/// the serving loop is the point, not a side effect: this is a middleware,
+/// and an OUTER one that works after `next.run` — `sessions` saves its
+/// cookie there, `csrf` issues its token there — could not touch a 503 whose
+/// head had already gone out.
 fn shed(t: *Throttle, ctx: *router.Ctx) anyerror!void {
     var retry_buf: [24]u8 = undefined;
     const retry_s = @max(1, std.math.divCeil(u64, t.options.retry_after_ms, std.time.ms_per_s) catch unreachable);
@@ -294,7 +298,6 @@ fn shed(t: *Throttle, ctx: *router.Ctx) anyerror!void {
     try ctx.res.setHeader("Retry-After", std.fmt.bufPrint(&retry_buf, "{d}", .{retry_s}) catch unreachable);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Service Unavailable\n");
-    try ctx.res.end();
 }
 
 // ── tests: the bare semaphore (no clock, no Io, no HTTP) ────────────────────
@@ -690,6 +693,112 @@ test "middleware: pass-through when free, golden 503 when full, recovery after r
     try expectStatus(runWire(&r, wire("/t"), &buf), "200");
     try testing.expectEqual(2, hits);
     try testing.expectEqual(0, th.inFlight());
+}
+
+/// A synthetic "outer" middleware shaped like `sessions`/`csrf`: it lets the
+/// chain run, then tries to write a header afterward, swallowing failure
+/// the way `csrf.issue` swallows `addSetCookie`'s error with `catch {}`.
+/// Registered *before* `throttle` in the chain, so it wraps it — its own
+/// `next.run` call is what runs `throttle`'s `middlewareRun`, `shed`'s 503
+/// short-circuit included.
+fn mwOuterCookie(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    try next.run(ctx);
+    ctx.res.addSetCookie("session=abc") catch {};
+}
+
+test "shed: an OUTER middleware writing after next.run still lands its header" {
+    // Before this task, `shed` forced an early `end()`, so an outer
+    // middleware working after `next.run` — exactly `sessions` (save/
+    // destroy) and `csrf` (issue) — would have this call return
+    // `error.HeadersSent`, swallowed silently by the `catch {}` both use.
+    // This is the throttle analogue of the defect `6ba5d7d` found and
+    // fixed for `ratelimit`'s 429, and of `cors`'s preflight anchor.
+    var th: Throttle = .init(.{ .max_in_flight = 1 });
+    defer th.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .run = mwOuterCookie });
+    try r.use(th.middleware());
+    try r.get("/t", hCount);
+
+    try testing.expect(th.tryAcquire()); // occupy the only slot so shed() runs
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("/t"), &buf);
+    try expectStatus(got, "503");
+    try expectHeaderLine(got, "Set-Cookie: session=abc");
+
+    th.release(); // balance the manual tryAcquire above
+}
+
+/// Dispatch through a frame that is then abandoned — see the test below.
+/// `noinline` so `shed`'s `retry_buf` really lives in the frame the clobber
+/// reuses.
+noinline fn dispatchInDoomedFrame(
+    r: *router.Router,
+    req: *http.Server.Request,
+    rw: *http.Server.ResponseWriter,
+) anyerror!void {
+    return r.dispatch(req, rw);
+}
+
+/// Reuse it, bigger than the 24-byte `retry_buf` the `Retry-After` value
+/// used to point at.
+noinline fn clobberDoomedFrame() void {
+    var scratch: [8192]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "shed: the Retry-After value outlives the frame it was formatted in" {
+    // `shed` used to force an early `end()` because its `Retry-After` value
+    // pointed into its own stack frame; `http`'s `setHeader` copies the
+    // bytes now, so the head is left to the serving loop. That makes this
+    // dependent on the copy — and `runWire` cannot see it, because the loop
+    // offers no seam between the handler returning and `end()` in which to
+    // reuse the dead frame. So the request and the writer are built by hand
+    // here and the two are driven in the loop's own order, with the
+    // scribble in between.
+    var th: Throttle = .init(.{ .max_in_flight = 1 });
+    defer th.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(th.middleware());
+    try r.get("/t", hCount);
+
+    try testing.expect(th.tryAcquire()); // occupy the only slot so shed() runs
+
+    var in: Reader = .fixed("GET /t HTTP/1.1\r\nHost: t\r\n\r\n");
+    var head_buf: [512]u8 = undefined;
+    const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
+    var body_scratch: [64]u8 = undefined;
+    var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
+    var req: http.Server.Request = .{
+        .method = .get,
+        .target = head.target,
+        .path = head.target,
+        .query = "",
+        .head = head,
+        .body = &body,
+        .context = null,
+    };
+
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &response_body_buf, &chunk_buf, .{});
+
+    try dispatchInDoomedFrame(&r, &req, &rw);
+    clobberDoomedFrame();
+    try rw.end();
+
+    const got = out.buffered();
+    try expectStatus(got, "503");
+    try expectHeaderLine(got, "Retry-After: 1");
+    try testing.expect(std.mem.indexOf(u8, got, "#") == null);
+    th.release(); // balance the manual tryAcquire above
 }
 
 test "middleware: the slot is released even when the handler errors" {

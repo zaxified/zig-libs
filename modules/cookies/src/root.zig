@@ -248,19 +248,43 @@ pub fn get(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
     return find(req.header("cookie") orelse "", name);
 }
 
-/// Serialize `sc` and set it as the response's `Set-Cookie` header. `buf` holds
-/// the header value; `setHeader` copies those bytes into the response writer's
-/// own storage at call time, so `buf` only needs to be valid for this call —
-/// a plain buffer on the handler's own stack frame is fine, even though the
-/// head (this value included) is not actually serialized onto the wire until
-/// the serving loop calls `end()`, after the handler returns. Rejects an
+/// Largest `Set-Cookie` header VALUE `set` will serialize — name, value and
+/// every attribute together. Longer ⇒ `error.BufferTooSmall`, never a silent
+/// truncation (a truncated `Set-Cookie` is worse than a dropped one: it can
+/// still parse, so the client stores a cookie nobody wrote).
+///
+/// WHERE 4096 COMES FROM. RFC 6265 §6.1 requires a user agent to support at
+/// least 4096 bytes per cookie, "as measured by the sum of the length of the
+/// cookie's name, value, and attributes" — so 4096 is the largest cookie any
+/// conforming browser is obliged to keep, and a smaller bound here would
+/// refuse cookies that would have worked in practice.
+///
+/// It is also, deliberately, not a second budget to get wrong. `http`'s
+/// per-response copy store is 4096 bytes for ALL header and trailer bytes, so
+/// any value this buffer could reject is one `setHeader` would have rejected
+/// anyway (`error.HeaderBytesExhausted`, and sooner — the name costs bytes
+/// too). This buffer is therefore never the binding constraint: the refusal a
+/// caller actually meets comes from the writer's own accounting.
+pub const max_set_cookie_bytes = 4096;
+
+/// Serialize `sc` and set it as the response's `Set-Cookie` header. Rejects an
 /// invalid cookie (`WriteError`) before touching the response.
+///
+/// The value is formatted into a `max_set_cookie_bytes` buffer on THIS frame
+/// and handed to `setHeader`, which copies it into the response writer's own
+/// storage before returning — which is why no buffer is asked of the caller.
+/// It used to take one, because the head (this value included) is not
+/// serialized onto the wire until the serving loop calls `end()`, after the
+/// handler returns, and the writer borrowed the caller's slices; a value built
+/// on the handler's frame was then read after that frame died. The writer
+/// copies now, so the parameter bought nothing.
 ///
 /// NOTE: the server emits at most **one** `Set-Cookie` per response —
 /// `setHeader` replaces by name — so a second `set` overwrites the first.
 /// Setting multiple cookies in one response is not supported through this path.
-pub fn set(res: *http.Server.ResponseWriter, sc: SetCookie, buf: []u8) SetError!void {
-    const value = try sc.bufPrint(buf);
+pub fn set(res: *http.Server.ResponseWriter, sc: SetCookie) SetError!void {
+    var buf: [max_set_cookie_bytes]u8 = undefined;
+    const value = try sc.bufPrint(&buf);
     try res.setHeader("Set-Cookie", value);
 }
 
@@ -474,11 +498,6 @@ test "SetCookie: bufPrint into too-small buffer" {
 fn cookieHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
     // Echo the requested "session" cookie back in the body, and set one.
     const sid = get(req, "session") orelse "none";
-    // The Set-Cookie value is borrowed by the response until the serving loop
-    // flushes the head — which happens AFTER this handler returns — so the
-    // buffer must outlive the handler frame. Take it from `context` (here, the
-    // caller's frame), not a local array which would be popped first.
-    const cbuf: *[128]u8 = @ptrCast(@alignCast(req.context.?));
     try set(res, .{
         .name = "session",
         .value = "s3",
@@ -486,7 +505,7 @@ fn cookieHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) an
         .http_only = true,
         .secure = true,
         .same_site = .lax,
-    }, cbuf);
+    });
     try res.writeAll(sid);
 }
 
@@ -501,9 +520,7 @@ test "get + set over serveStream" {
     var req_body: [256]u8 = undefined;
     var res_body: [512]u8 = undefined;
     var chunk: [128]u8 = undefined;
-    // Cookie buffer lives on the test frame → outlives the response flush.
-    var cookie_buf: [128]u8 = undefined;
-    http.Server.serveStream(.{ .handler = cookieHandler, .server_name = null, .context = &cookie_buf }, &in, &out, .{
+    http.Server.serveStream(.{ .handler = cookieHandler, .server_name = null }, &in, &out, .{
         .head = &head_buf,
         .request_body = &req_body,
         .response_body = &res_body,
@@ -514,6 +531,97 @@ test "get + set over serveStream" {
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nabc"));
     // set() emitted the Set-Cookie with attributes.
     try testing.expect(std.mem.indexOf(u8, got, "Set-Cookie: session=s3; Path=/; Secure; HttpOnly; SameSite=Lax\r\n") != null);
+}
+
+/// The handler half of the dead-frame test below: build a cookie name and
+/// value in buffers that die with THIS frame, hand them to `set` — whose own
+/// formatting buffer dies with it too — and return.
+///
+/// A separate `noinline` function, not a block inside the test, and that is
+/// the whole point: Zig gives each local its own slot for the enclosing
+/// function's entire body in Debug, so a block scope frees nothing and a
+/// borrowed-slice bug would stay invisible. Only a returned frame is really
+/// reusable. Mirrors `http`'s `setFromDeadFrame`.
+noinline fn setFromDeadFrame(res: *http.Server.ResponseWriter) !void {
+    var name_buf: [32]u8 = undefined;
+    var value_buf: [32]u8 = undefined;
+    try set(res, .{
+        .name = try std.fmt.bufPrint(&name_buf, "sid{d}", .{9}),
+        .value = try std.fmt.bufPrint(&value_buf, "{d}", .{4242}),
+        .path = "/",
+        .http_only = true,
+    });
+}
+
+/// Reuse the frame `setFromDeadFrame` just left, the way the next call down
+/// the stack would have. Bigger than that frame PLUS the `set` frame nested
+/// under it, so it covers `max_set_cookie_bytes` of formatting buffer as well;
+/// `noinline` + `doNotOptimizeAway` so neither the call nor the stores can be
+/// optimized out.
+noinline fn clobberDeadFrame() void {
+    var scratch: [8192]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "set: the cookie outlives the frame it was formatted in" {
+    // What this pins: `set` no longer takes a caller buffer because
+    // `setHeader` COPIES the value into the response writer's own storage.
+    // Nothing else in this module's suite would notice if that copy went
+    // away — `writeHead` runs inside `end()`, which the serving loop calls
+    // after the handler returns, and `serveStream` offers no seam between the
+    // two in which to reuse the dead frame. So the writer is built by hand
+    // here and driven in the loop's own order, with the scribble in between.
+    const Writer = std.Io.Writer;
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    try setFromDeadFrame(&rw);
+    clobberDeadFrame();
+
+    try rw.writeAll("ok");
+    try rw.end();
+    const wire = out.buffered();
+
+    // Read back off the wire after every byte of its source was overwritten.
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid9=4242; Path=/; HttpOnly\r\n") != null);
+    // …and not one byte of the clobber pattern anywhere on it.
+    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+}
+
+test "set: an over-long cookie is refused, not truncated" {
+    const Writer = std.Io.Writer;
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // Dropping the caller's buffer moved the size limit inside `set`, so the
+    // limit needs its own test: a value past `max_set_cookie_bytes` must fail
+    // loudly. A truncated `Set-Cookie` is worse than none — it still parses,
+    // so the client would store a silently corrupted value.
+    var huge: [max_set_cookie_bytes + 1]u8 = undefined;
+    @memset(&huge, 'x');
+    try testing.expectError(error.BufferTooSmall, set(&rw, .{ .name = "n", .value = &huge }));
+    // Nothing reached the response: no header, and the next `set` still works.
+    try set(&rw, .{ .name = "n", .value = "v" });
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: n=v\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "x") == null);
+
+    // The other refusal a caller can meet is the writer's own copy budget,
+    // which bites first (the header name costs bytes too) — also an error,
+    // also not a truncation.
+    var out2: Writer = .fixed(&out_buf);
+    var rw2: http.Server.ResponseWriter = .init(&out2, &body_buf, &chunk_buf, .{});
+    var big: [max_set_cookie_bytes - 8]u8 = undefined;
+    @memset(&big, 'y');
+    try testing.expectError(error.HeaderBytesExhausted, set(&rw2, .{ .name = "n", .value = &big }));
 }
 
 // External anchor: python3's `http.cookies` used as a black-box oracle for

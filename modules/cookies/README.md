@@ -29,10 +29,14 @@ const sid = cookies.find(req.header("cookie") orelse "", "session") orelse retur
 The parser is deliberately liberal (no charset validation on read); strictness
 belongs on the `Set-Cookie` build side (next part).
 
-- `get(req, name) ?[]const u8` / `set(res, sc, buf) !void` — thin `http`
+- `get(req, name) ?[]const u8` / `set(res, sc) !void` — thin `http`
   helpers: read a cookie off a request, or serialize a `SetCookie` into the
   response's `Set-Cookie` header (the server emits one Set-Cookie per
-  response — `setHeader` replaces by name).
+  response — `setHeader` replaces by name). `set` needs no buffer from the
+  caller: it formats into a `max_set_cookie_bytes` (4096, RFC 6265 §6.1)
+  buffer of its own, and `setHeader` copies the bytes into the response
+  writer before returning. Longer than that ⇒ `BufferTooSmall`, never a
+  truncated cookie.
 
 - **Role:** codec. **Platform:** any. **Deps:** `http`
   (the `get`/`set` helpers; the parser + builder are std-only logic).
@@ -43,8 +47,12 @@ third-party source consulted or copied.
 
 ## Verification
 
-`zig build test-cookies` — 16 offline tests. Parser (6): simple pairs + `find`,
-OWS trimming, valueless cookies, quoted/unbalanced values, empty-name skipping,
-degenerate headers. Builder (10): full attribute set, minimal, Domain+Expires,
-negative Max-Age, Strict, invalid name/value/Path/Domain rejection, SameSite=None
-both branches, BufferTooSmall. Green in Debug + ReleaseFast.
+`zig build test-cookies` — 38 offline tests (22 here + 16 frozen python-oracle
+goldens). Parser (7): simple pairs + `find`, OWS trimming, valueless cookies,
+quoted/unbalanced values, a quoted value containing a `;`, empty-name skipping,
+degenerate headers. Builder (11): full attribute set, `__Host-`/`__Secure-`
+prefix constraints, minimal, Domain+Expires, negative Max-Age, Strict, invalid
+name/value/Path/Domain rejection, SameSite=None both branches, BufferTooSmall.
+`http` helpers (3): `get`+`set` over `http.Server.serveStream`, the cookie
+surviving the dead frame it was formatted in, and an over-long cookie refused
+rather than truncated. Green in Debug + ReleaseFast.
