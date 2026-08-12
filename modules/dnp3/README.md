@@ -68,10 +68,13 @@ Implemented:
     the master's CONFIRM arrives. A response carrying events always sets CON.
     Overflow drops the oldest and latches IIN2.3 until the buffer drains.
     `confirmTimedOut()` puts the in-flight events back on the queue.
-  - **Select-before-operate:** the select is remembered with its arm time and
-    its exact object bytes; an OPERATE with the wrong sequence number or
-    different objects is `NO_SELECT`, one that arrives after
-    `select_timeout_ms` is `TIMEOUT`, and neither executes.
+  - **Select-before-operate:** the select is remembered with its arm time, its
+    exact object bytes and **the peer that armed it**; an OPERATE with the
+    wrong sequence number, different objects, or a different source address is
+    `NO_SELECT`, one that arrives after `select_timeout_ms` is `TIMEOUT`, and
+    neither executes. An OPERATE from the wrong peer also leaves the arm
+    standing, so a foreign station can neither fire another station's select
+    nor cancel it.
   - **Fragmentation:** a response too large for `max_tx_fragment` splits with
     correct FIR/FIN and an **incrementing** application sequence number, each
     non-final fragment asking for a confirm; `next()` produces the following
@@ -186,12 +189,26 @@ if (try session.nextFrames(now_ms, &out)) |more| { /* next response fragment */ 
 if (try session.unsolicitedFrames(now_ms, &out)) |uns| { /* unsolicited response */ }
 ```
 
-`Session.feedFrame` drops any frame whose data-link destination is neither
-`config.address` nor one of the three broadcast addresses (0xFFFD-0xFFFF); a
-broadcast is executed but never answered, per IEEE 1815 §9.2.4.1.4. The
-*source* address is not filtered and an armed SELECT is not bound to the peer
-that armed it, so on a link carrying more than one master-capable station the
-caller still has to authorise the source itself.
+`Session.feedFrame` filters both data-link addresses. A frame whose
+*destination* is neither `config.address` nor one of the three broadcast
+addresses (0xFFFD-0xFFFF) is dropped; a broadcast is executed but never
+answered, per IEEE 1815 §9.2.4.1.4. A frame whose *source* is not
+`config.master_address` is dropped as well — broadcasts included, since a
+broadcast from a station we do not talk to is still not ours. One `Outstation`
+is one DNP3 association (one master, one outstation, one set of addresses), so
+anything from another source belongs to somebody else's.
+
+The source filter can be turned off with `config.require_master_source = false`
+— the same escape hatch opendnp3 spells `respondToAnySource` and Step Function
+I/O's Rust `dnp3` spells `respond_to_any_master`, and, like theirs, it is off by
+default. Turning it off does **not** unbind the select from its peer: an
+armed SELECT records the source address it came from, and an OPERATE from a
+different one is refused whatever this switch says. To serve several masters,
+give each its own `Outstation` over a shared point database — that is the
+association model, and it is what both reference stacks do.
+
+Authorising the peer beyond its claimed link address is still the caller's job
+(or DNP3-SA's): a source address is an addressing field, not a credential.
 
 `Session` frames all three directions the outstation can speak: replies to a
 request (`feedFrame`), the continuation fragments of a multi-fragment response
@@ -219,7 +236,7 @@ zig build test-dnp3 -Doptimize=ReleaseFast
 zig fmt --check modules/dnp3
 ```
 
-139 offline tests: DNP3 CRC-16 known-answer vectors (the reveng
+142 offline tests: DNP3 CRC-16 known-answer vectors (the reveng
 CRC-catalogue "CRC-16/DNP" check value plus additional vectors cross-checked
 against an independent from-scratch bit-serial CRC reference — see SPEC.md),
 data-link frame round-trips (empty/short/exact-block-boundary/multi-block user

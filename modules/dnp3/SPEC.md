@@ -37,8 +37,11 @@ Six allocation-free layers, all offline-testable, mirroring IEEE 1815-2012's own
   range rather than on the variation.
 - `outstation`: the responder. `Outstation.handle(request, now_ms, out) -> ?Reply` is a pure
   function from one application fragment to one application fragment over a caller-owned
-  `Database` (seven slices of point structs) and a caller-owned `EventBuffer`. `Session` composes
-  it with `transport.Reassembler`/`Segmenter` and `link` so a caller can feed whole frames.
+  `Database` (seven slices of point structs) and a caller-owned `EventBuffer`;
+  `handleFrom(request, peer, now_ms, out)` is the same call with the requesting station's data-link
+  address, which is what binds a SELECT to its peer. `Session` composes it with
+  `transport.Reassembler`/`Segmenter` and `link` so a caller can feed whole frames, and it is the
+  layer that knows the peer, so it calls `handleFrom`.
   `Session` frames all three outbound directions — `feedFrame` (a reply to a request),
   `nextFrames` (the continuation of a multi-fragment response) and `unsolicitedFrames` (an
   outstation-initiated unsolicited response) — because all three share `Session.tx_seq`, and a
@@ -73,10 +76,14 @@ which is a local programming mistake.
   sequence number (§5.1.6.2) and clears FIR after the first. Reusing the request's sequence for
   every fragment is a classic interop failure and is exactly what opendnp3 caught in this module's
   first draft.
-- **Select-before-operate.** The SELECT is stored with its arm time and its object bytes verbatim.
-  An OPERATE must carry the SELECT's sequence + 1 and byte-identical objects; otherwise it is
-  `NO_SELECT`. Once the arm window closes the select is dropped and the *next* OPERATE is answered
-  `TIMEOUT` rather than `NO_SELECT`, so the master can tell the two apart.
+- **Select-before-operate.** The SELECT is stored with its arm time, its object bytes verbatim and
+  the peer that sent it. An OPERATE must carry the SELECT's sequence + 1, byte-identical objects
+  and the same peer; otherwise it is `NO_SELECT`. Once the arm window closes the select is dropped
+  and the *next* OPERATE is answered `TIMEOUT` rather than `NO_SELECT`, so the master can tell the
+  two apart — but a *wrong-peer* OPERATE is `NO_SELECT`, never `TIMEOUT`: no window of that peer's
+  closed, and `TIMEOUT` would tell a foreign station that somebody else holds an arm. The
+  wrong-peer case is also the one refusal that does **not** consume the arm, so it cannot be used
+  to cancel another station's select.
 - **Link direction.** §9.2.4.1.2's DIR bit is 1 for master-originated frames and 0 for
   outstation-originated ones. `Session` sends 0. Getting this backwards makes a real master drop
   every reply as "master frame received for master".
@@ -121,11 +128,27 @@ object-instance counts always go through `objects.Range.objectCount()` / `object
 arithmetic is widened to `u64`; a raw `stop - start + 1` on a wire value is a defect, and an index
 that does not fit the 16-bit point space is refused, never truncated onto a different point.
 
-`Session.feedFrame` filters on the data-link destination address: a frame addressed to another
-station is dropped without being decoded further, and the three IEEE 1815 broadcast addresses
-(0xFFFD-0xFFFF) are executed but never answered. It does **not** filter on the source address, and
-an armed SELECT is not bound to the peer that armed it — on a link where more than one station can
-send, authorising the source is still the caller's job (or DNP3-SA's).
+`Session.feedFrame` filters on **both** data-link addresses. A frame addressed to another station is
+dropped without being decoded further, and the three IEEE 1815 broadcast addresses (0xFFFD-0xFFFF)
+are executed but never answered. A frame whose *source* is not `config.master_address` is dropped
+too, and that test has no broadcast exemption: one `Outstation` is one DNP3 association — the
+logical connection between one master and one outstation, identified by the set of addresses it
+uses — so a frame from any other source belongs to a different association. `require_master_source`
+turns the source filter off for the same reason opendnp3 offers `respondToAnySource` and Step
+Function I/O's `dnp3` offers `respond_to_any_master`; like both of those it defaults to on.
+
+The select-before-operate arm is bound to the peer independently of that switch. `Select` records
+the source address the SELECT arrived from, and an OPERATE from any other address is `NO_SELECT`
+and does not disarm what it failed to fire — so on a link carrying more than one master-capable
+station, one station cannot ride or cancel another's arm. `Outstation.handleFrom(request, peer, …)`
+is how the peer reaches the outstation; `Outstation.handle(request, …)` is the same call with no
+peer named, and "no peer" is a distinct value rather than a wildcard — it matches only itself, so
+mixing the two entry points across a SELECT/OPERATE pair is refused rather than waved through.
+
+Neither filter is authentication: a source address is an addressing field, not a credential, and
+authorising the peer remains the caller's job (or DNP3-SA's). Serving several masters properly
+means one `Outstation` per association over a shared point database, which is what both reference
+stacks do.
 
 Four fuzz harnesses back this: two 20 000-iteration loops over uniformly random bytes (application
 fragments, link frames through a `Session`), and two over *structured* draws — function code,
@@ -183,7 +206,7 @@ derivation (the GMAC primitive is provided and KAT-validated; the caller supplie
 
 ## Verification
 
-139 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
+142 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
 Breakdown: `link` (12) — CRC catalogue + KAT vectors, control-octet round-trip, frame round-trips
 (empty/short/multi-block/exact-16-byte-boundary user data), encode/decode error paths including a
 malformed-input sweep; `transport` (9) — transport-octet round-trip, empty-fragment/single-segment/
@@ -208,7 +231,7 @@ master-builds-READ/outstation-parses + outstation-builds-RESPONSE/master-parses 
 `records` (11) — the layout table's wire lengths against the object library, state-in-flags
 encoding for binary and double-bit, absolute-time and float variations, narrow-variation range
 rejection, packed shapes, a short-record sweep, and the point-kind ↔ group mapping both ways;
-`outstation` (51) — IIN (restart set/cleared, need-time, class bits, overflow latch,
+`outstation` (54) — IIN (restart set/cleared, need-time, class bits, overflow latch,
 func-not-supported, object-unknown), READ (class 0 walking all seven point types in order, every
 qualifier shape, variation 0 per-point selection, packed variations, mixed-variation header
 splitting, hostile ranges), events (oldest-first with the right group/variation/index prefix,
@@ -218,8 +241,11 @@ different objects, different index, DIRECT_OPERATE and its no-ack form, all four
 nonexistent and command-less points, analog output bounds, hook veto), DELAY_MEASURE, restart
 (refused and allowed), ENABLE/DISABLE_UNSOLICITED, unsolicited responses, freeze and freeze-clear,
 ASSIGN_CLASS, fragmentation (FIR/FIN/SEQ across a series, and a new request abandoning one),
-`Session` (link-service replies, a frame addressed to another station dropped, a broadcast executed
-but unanswered, a request split across transport segments, out-of-order segments, bad CRC,
+`Session` (link-service replies, a frame addressed to another station dropped, a frame *from*
+another station dropped with its opt-out proved to switch, a SELECT armed by one station refused to
+an OPERATE from another in both directions, "no peer known" proved to be a value rather than a
+wildcard, a broadcast executed but unanswered, a request split across transport segments,
+out-of-order segments, bad CRC,
 `unsolicitedFrames` framing an outstation-initiated response and advancing `tx_seq`), hostile input
 (including a full-width command range and a point index past the 16-bit space), and four fuzz
 harnesses; `goldens` (5) — the captured-session replays.

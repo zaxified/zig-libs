@@ -408,15 +408,35 @@ pub const Config = struct {
     /// `Session` on a shared link (serial multi-drop, or a listener carrying
     /// several link addresses) only acts on what is addressed to it.
     address: u16 = 1024,
-    /// The master's data-link address.
+    /// The master's data-link address: the peer of this association.
     ///
-    /// ⚠ This is the *destination* we address our replies to, **not** an
-    /// inbound source filter — `feedFrame` accepts user data addressed to us
-    /// from any source address, and the armed SELECT is not bound to the peer
-    /// that armed it. On a bus with more than one master-capable station, the
-    /// caller must still authenticate the source (DNP3-SA, or a source check of
-    /// its own) before treating a command as authorised.
+    /// It is both the destination our replies are addressed to and — unless
+    /// `require_master_source` is cleared — the only source address
+    /// `Session.feedFrame` will accept a frame from.
     master_address: u16 = 1,
+
+    /// Accept frames only from `master_address`.
+    ///
+    /// A DNP3 *association* is the logical connection between one master and
+    /// one outstation, identified by the set of addresses it uses — the
+    /// data-link addresses among them. One `Outstation` is one association, so
+    /// a frame from a different source address belongs to a different
+    /// association and is not ours to act on. Both mature reference stacks
+    /// enforce this at the link layer and default it on (opendnp3's
+    /// `LinkContext::OnFrame` compares `header.addresses.source` against
+    /// `config.RemoteAddr`; Step Function I/O's Rust `dnp3` filters on
+    /// `required_master_address`), and both name their opt-out for what it is:
+    /// `respondToAnySource` / `respond_to_any_master`, the latter documented
+    /// upstream as "a hack".
+    ///
+    /// Clear it only for the same reason they offer it — an outstation that
+    /// must answer whatever address a gateway happens to stamp on a frame. It
+    /// does **not** unbind the SELECT from its peer (see `Select.peer`): no
+    /// DNP3 deployment splits a two-pass control across two stations, so that
+    /// binding has no opt-out. To serve several masters properly, give each one
+    /// its own `Outstation` over a shared point database — that is the
+    /// association model, and it is what both reference stacks do.
+    require_master_source: bool = true,
 
     /// Largest application fragment this outstation will emit. §4.1.2 fixes
     /// the *receive* minimum at 249; 2048 is the usual transmit default.
@@ -513,6 +533,14 @@ pub const Outstation = struct {
     /// OPERATE that arrives late can be answered TIMEOUT (§ command status 1)
     /// rather than the much less informative NO_SELECT.
     select_expired: bool = false,
+    /// Which peer the expired arm belonged to (see `Select.peer`). TIMEOUT is
+    /// owed only to that peer: it is the one whose window closed. Telling a
+    /// *foreign* station TIMEOUT would disclose that somebody holds — or held
+    /// — an arm, which is exactly the bit NO_SELECT and TIMEOUT are kept
+    /// distinct to protect. The live arm is peer-checked first for the same
+    /// reason; without this field the expired case leaked what the live case
+    /// does not.
+    select_expired_peer: ?u16 = null,
 
     /// Where a multi-fragment response got to.
     cursor: ?Cursor = null,
@@ -537,6 +565,18 @@ pub const Outstation = struct {
         /// present exactly the same ones.
         object_bytes: [max_select_bytes]u8,
         object_len: usize,
+        /// The data-link address the SELECT arrived from, or `null` when the
+        /// caller drove `handle` directly and so told us nothing about the
+        /// peer. The OPERATE must match it — finding F6(b).
+        ///
+        /// `null` is a **value, not a wildcard**: it equals `null` and nothing
+        /// else. A caller that never names a peer is on a point-to-point link
+        /// with exactly one of them and keeps today's behaviour exactly; a
+        /// caller that names one for the SELECT and not for the OPERATE has
+        /// mixed entry points, and that is refused rather than waved through.
+        /// A sentinel address that matched everything would be the F6(b) hole
+        /// with a new name.
+        peer: ?u16,
     };
 
     /// How many object bytes a SELECT may carry and still be matchable. A
@@ -686,6 +726,7 @@ pub const Outstation = struct {
     pub fn tick(self: *Outstation, now_ms: u64) void {
         if (self.select) |s| {
             if (now_ms -% s.armed_at_ms >= self.config.select_timeout_ms) {
+                self.select_expired_peer = s.peer;
                 self.select = null;
                 self.select_expired = true;
             }
@@ -717,7 +758,29 @@ pub const Outstation = struct {
     /// a response to us), or a request that explicitly asks for no reply.
     /// `out` should be at least `config.max_tx_fragment` bytes; anything
     /// smaller simply caps the fragment size.
+    ///
+    /// This form names no peer, so every SELECT it arms and every OPERATE it
+    /// matches carries `peer = null` (see `Select.peer`) — consistent, and
+    /// therefore behaviourally identical to this module before the peer
+    /// binding existed. A caller that *has* a peer address should call
+    /// `handleFrom`; `Session.feedFrame` does.
     pub fn handle(self: *Outstation, request: []const u8, now_ms: u64, out: []u8) Error!?Reply {
+        return self.handleFrom(request, null, now_ms, out);
+    }
+
+    /// `handle`, plus the data-link address the request arrived from.
+    ///
+    /// The peer is carried into the select-before-operate arm: an OPERATE from
+    /// a different address than the SELECT it would consume is refused, and —
+    /// as importantly — does **not** disarm the select it did not match, so a
+    /// foreign station can neither fire another station's arm nor cancel it.
+    pub fn handleFrom(
+        self: *Outstation,
+        request: []const u8,
+        peer: ?u16,
+        now_ms: u64,
+        out: []u8,
+    ) Error!?Reply {
         self.tick(now_ms);
         if (out.len < application.response_header_len + 2) return error.BufferTooSmall;
 
@@ -749,11 +812,11 @@ pub const Outstation = struct {
         return switch (function) {
             .read => try self.doRead(seq, body, now_ms, out),
             .write => try self.doWrite(seq, body, now_ms, out),
-            .select => try self.doCommand(.select, seq, body, now_ms, out, true),
-            .operate => try self.doCommand(.operate, seq, body, now_ms, out, true),
-            .direct_operate => try self.doCommand(.direct_operate, seq, body, now_ms, out, true),
+            .select => try self.doCommand(.select, seq, body, peer, now_ms, out, true),
+            .operate => try self.doCommand(.operate, seq, body, peer, now_ms, out, true),
+            .direct_operate => try self.doCommand(.direct_operate, seq, body, peer, now_ms, out, true),
             .direct_operate_no_ack => blk: {
-                _ = try self.doCommand(.direct_operate, seq, body, now_ms, out, false);
+                _ = try self.doCommand(.direct_operate, seq, body, peer, now_ms, out, false);
                 break :blk null;
             },
             .cold_restart => try self.doRestart(seq, true, out),
@@ -1339,6 +1402,7 @@ pub const Outstation = struct {
         kind: CommandKind,
         seq: u4,
         body: []const u8,
+        peer: ?u16,
         now_ms: u64,
         out: []u8,
         want_reply: bool,
@@ -1347,13 +1411,31 @@ pub const Outstation = struct {
         var pos: usize = application.response_header_len;
         if (out.len < pos) return error.BufferTooSmall;
 
-        // For OPERATE, the select must be armed, unexpired, for the previous
-        // sequence number, and carry byte-identical objects.
+        // For OPERATE, the select must be armed by *this* peer, unexpired, for
+        // the previous sequence number, and carry byte-identical objects.
         var select_status: ?CommandStatus = null;
+        var wrong_peer = false;
         if (kind == .operate) {
             if (self.select) |s| {
-                if (now_ms -% s.armed_at_ms >= self.config.select_timeout_ms) {
-                    select_status = .timeout;
+                // A LIVE arm cannot also be expired: both entry points
+                // (`handle`, `handleFrom`) call `tick(now_ms)` before
+                // dispatching, and `tick` drops any arm whose window has
+                // closed. This used to carry an expiry branch answering
+                // TIMEOUT; a reachability probe in it was never hit by any
+                // test, and the expired case is handled below — peer-gated,
+                // which the dead branch was not. The assert keeps a future
+                // entry point that forgets to tick from silently reviving
+                // that disclosure.
+                std.debug.assert(now_ms -% s.armed_at_ms < self.config.select_timeout_ms);
+                if (s.peer != peer) {
+                    // F6(b). The arm belongs to another association, so as far
+                    // as this one is concerned there is no select at all —
+                    // NO_SELECT, not TIMEOUT. TIMEOUT would both be a lie (no
+                    // window of ours closed) and tell a foreign station that
+                    // somebody else holds an arm; the two statuses are kept
+                    // distinct precisely so each means what it says.
+                    select_status = .no_select;
+                    wrong_peer = true;
                 } else if (s.seq +% 1 != seq) {
                     select_status = .no_select;
                 } else if (s.object_len != body.len or
@@ -1362,7 +1444,10 @@ pub const Outstation = struct {
                     select_status = .no_select;
                 }
             } else {
-                select_status = if (self.select_expired) .timeout else .no_select;
+                select_status = if (self.select_expired and self.select_expired_peer == peer)
+                    .timeout
+                else
+                    .no_select;
             }
         }
 
@@ -1476,19 +1561,33 @@ pub const Outstation = struct {
 
         // A successful SELECT arms the operate window.
         if (kind == .select and !extra.parameter_error and !extra.object_unknown) {
-            var s = Select{ .seq = seq, .armed_at_ms = now_ms, .object_bytes = undefined, .object_len = 0 };
+            var s = Select{
+                .seq = seq,
+                .armed_at_ms = now_ms,
+                .object_bytes = undefined,
+                .object_len = 0,
+                .peer = peer,
+            };
             if (body.len <= max_select_bytes) {
                 @memcpy(s.object_bytes[0..body.len], body);
                 s.object_len = body.len;
                 self.select = s;
                 self.select_expired = false;
+                self.select_expired_peer = null;
             } else {
                 extra.parameter_error = true;
             }
         }
-        if (kind == .operate) {
+        // An OPERATE consumes the arm, so a select is single-use — but only the
+        // arm's *own* peer may consume it. Letting a foreign OPERATE disarm
+        // would trade actuation for a denial of control: station B could cancel
+        // station A's select at will. In a per-association stack B's frame
+        // never reaches A's session at all, and leaving the arm standing is
+        // what reproduces that.
+        if (kind == .operate and !wrong_peer) {
             self.select = null;
             self.select_expired = false;
+            self.select_expired_peer = null;
         }
 
         _ = application.encodeResponseHeader(.{
@@ -1828,6 +1927,16 @@ pub const Session = struct {
         const broadcast = isBroadcast(decoded.dest);
         if (!broadcast and decoded.dest != self.outstation.config.address) return null;
 
+        // …and the *source* address decides whether it is from our peer. One
+        // `Outstation` is one DNP3 association — one master, one outstation,
+        // one set of addresses — so a frame from any other source belongs to
+        // somebody else's association: finding F6(b). Unlike the destination
+        // test this one has no broadcast exemption, because a broadcast from a
+        // station we do not talk to is still not ours (opendnp3 orders the two
+        // checks the same way).
+        if (self.outstation.config.require_master_source and
+            decoded.src != self.outstation.config.master_address) return null;
+
         // Data-link layer service requests get data-link answers — but never in
         // answer to a broadcast, which would turn one broadcast into a reply
         // from every station on the bus at once.
@@ -1850,7 +1959,9 @@ pub const Session = struct {
         }
 
         const fragment = (try self.rx.feed(self.scratch[0..decoded.user_data_len])) orelse return null;
-        const maybe_reply = try self.outstation.handle(fragment, now_ms, self.tx_fragment);
+        // The peer goes with the fragment: `Session` is the only layer that
+        // knows it, and the select-before-operate arm is bound to it.
+        const maybe_reply = try self.outstation.handleFrom(fragment, decoded.src, now_ms, self.tx_fragment);
         if (broadcast) {
             // A broadcast request is *executed* but never answered. Whatever
             // response the application layer built is dropped here, and any
@@ -3196,13 +3307,18 @@ test "Session: a frame addressed to another outstation is dropped, not executed"
     var out: [512]u8 = undefined;
     var frame_buf: [128]u8 = undefined;
 
+    // Both halves come from the configured master (src = 1), so the *only*
+    // difference between them is the destination. Using a foreign source here
+    // would let the source filter added for F6(b) explain the drop, and the
+    // destination test would pass without being exercised.
+    //
     // Addressed elsewhere: no reply, no actuation, and the reassembler is not
     // even fed (a foreign frame cannot poison a fragment in progress).
     {
         var fix = Fixture{};
         var station = fix.station(.{ .address = 10, .master_address = 1 });
         var session = Session.init(&station, &rx, &scratch, &tx);
-        const foreign = try frameFor(999, 77, command, &frame_buf);
+        const foreign = try frameFor(999, 1, command, &frame_buf);
         try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(foreign, 100, &out));
         try testing.expect(!fix.bouts[2].value);
         try testing.expectEqual(@as(usize, 0), session.rx.len);
@@ -3214,7 +3330,7 @@ test "Session: a frame addressed to another outstation is dropped, not executed"
         var fix = Fixture{};
         var station = fix.station(.{ .address = 10, .master_address = 1 });
         var session = Session.init(&station, &rx, &scratch, &tx);
-        const ours = try frameFor(10, 77, command, &frame_buf);
+        const ours = try frameFor(10, 1, command, &frame_buf);
         const reply = (try session.feedFrame(ours, 100, &out)).?;
         try testing.expect(reply.len > 0);
         try testing.expect(fix.bouts[2].value);
@@ -3289,6 +3405,285 @@ test "Session: a broadcast is executed but never answered" {
         const frame = try frameFor(0xFFFC, 1, command, &frame_buf);
         try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(frame, 100, &out));
         try testing.expect(!fix.bouts[3].value);
+    }
+}
+
+/// The status byte of the first echoed command object in a reply that arrived
+/// as link frames, so a `Session`-level test can read the same verdict a
+/// `handle`-level one reads with `commandStatus`.
+fn frameCommandStatus(frame: []const u8, scratch: []u8) !CommandStatus {
+    const decoded = try link.decodeFrame(frame, scratch);
+    // Byte 0 of the user data is the transport header; the rest is the
+    // application fragment.
+    return try commandStatus(scratch[1..decoded.user_data_len]);
+}
+
+test "Session: the SELECT one station armed cannot be OPERATEd by another" {
+    // F6(b) — the attacker's test. Both stations address *our* address, so the
+    // destination filter (F6(a)) is not what refuses this, and the source
+    // filter is switched off on purpose: this is the multi-master
+    // configuration, the only one in which the hole exists at all.
+    //
+    // What is left is the arm's peer binding, and nothing else in `doCommand`
+    // can account for a refusal here. The attacker replays A's object bytes
+    // verbatim (so the byte-identity check passes), carries the sequence number
+    // A's own OPERATE would have carried (so the `s.seq +% 1 == seq` check
+    // passes), and arrives on the same injected clock tick (so the arm has not
+    // expired). This module answers NO_SELECT for four different reasons; the
+    // point of building the attack this way is that three of them are excluded
+    // by construction.
+    const us: u16 = 10;
+    const a: u16 = 1; // the configured master
+    const b: u16 = 77; // another master-capable station on the same bus
+
+    var req: [64]u8 = undefined;
+    var frame_buf: [128]u8 = undefined;
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var dec: [256]u8 = undefined;
+
+    // ── A arms, B fires ────────────────────────────────────────────────────
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{
+            .address = us,
+            .master_address = a,
+            .require_master_source = false,
+            .select_timeout_ms = 10_000,
+        });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+
+        const armed = (try session.feedFrame(
+            try frameFor(us, a, try buildCrob(&req, 1, .select, 2, .latch_on), &frame_buf),
+            1000,
+            &out,
+        )).?;
+        try testing.expectEqual(CommandStatus.success, try frameCommandStatus(armed, &dec));
+        try testing.expect(!fix.bouts[2].value); // a SELECT actuates nothing
+
+        // The attack: B's OPERATE, matching in every respect except who sent it.
+        const stolen = (try session.feedFrame(
+            try frameFor(us, b, try buildCrob(&req, 2, .operate, 2, .latch_on), &frame_buf),
+            1100,
+            &out,
+        )).?;
+        try testing.expectEqual(CommandStatus.no_select, try frameCommandStatus(stolen, &dec));
+        try testing.expect(!fix.bouts[2].value); // the output did NOT actuate
+
+        // Bystander oracle. A refusal is worth nothing on its own — a station
+        // that had simply lost the arm, or that refuses every OPERATE, would
+        // look identical above. A's own OPERATE must still work, which also
+        // proves B's attempt did not *disarm* what it could not fire.
+        const ours = (try session.feedFrame(
+            try frameFor(us, a, try buildCrob(&req, 2, .operate, 2, .latch_on), &frame_buf),
+            1200,
+            &out,
+        )).?;
+        try testing.expectEqual(CommandStatus.success, try frameCommandStatus(ours, &dec));
+        try testing.expect(fix.bouts[2].value);
+    }
+
+    // ── the mirror: B arms, A fires ────────────────────────────────────────
+    // The arm is bound to *the station that armed it*, not to
+    // `config.master_address`. Without this half, an implementation that
+    // checked `peer == config.master_address` would pass the block above while
+    // still letting any two frames from the configured address ride each
+    // other's arm — and would wrongly refuse a legitimate second master.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{
+            .address = us,
+            .master_address = a,
+            .require_master_source = false,
+            .select_timeout_ms = 10_000,
+        });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+
+        const armed = (try session.feedFrame(
+            try frameFor(us, b, try buildCrob(&req, 1, .select, 3, .latch_on), &frame_buf),
+            1000,
+            &out,
+        )).?;
+        try testing.expectEqual(CommandStatus.success, try frameCommandStatus(armed, &dec));
+
+        const stolen = (try session.feedFrame(
+            try frameFor(us, a, try buildCrob(&req, 2, .operate, 3, .latch_on), &frame_buf),
+            1100,
+            &out,
+        )).?;
+        try testing.expectEqual(CommandStatus.no_select, try frameCommandStatus(stolen, &dec));
+        try testing.expect(!fix.bouts[3].value);
+
+        const ours = (try session.feedFrame(
+            try frameFor(us, b, try buildCrob(&req, 2, .operate, 3, .latch_on), &frame_buf),
+            1200,
+            &out,
+        )).?;
+        try testing.expectEqual(CommandStatus.success, try frameCommandStatus(ours, &dec));
+        try testing.expect(fix.bouts[3].value);
+    }
+}
+
+test "Session: a frame from a station other than our master is dropped by default" {
+    // The coarse half of F6(b), and the one both reference stacks ship: a
+    // frame whose *source* is not our association's master never reaches the
+    // application layer at all. Everything here is addressed to us, so the
+    // destination filter cannot be the explanation.
+    const us: u16 = 10;
+    const a: u16 = 1;
+    const b: u16 = 77;
+
+    var req: [64]u8 = undefined;
+    const command = try buildCrob(&req, 1, .direct_operate, 2, .latch_on);
+
+    var frame_buf: [128]u8 = undefined;
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    // The opt-out is genuinely off: this is the shipped default, not something
+    // the tests below switch on for themselves.
+    try testing.expect((Config{}).require_master_source);
+
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = us, .master_address = a });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const foreign = try frameFor(us, b, command, &frame_buf);
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(foreign, 100, &out));
+        try testing.expect(!fix.bouts[2].value);
+        try testing.expectEqual(@as(usize, 0), session.rx.len);
+    }
+
+    // The same bytes from our master: proof the vector above was live.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = us, .master_address = a });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const ours = try frameFor(us, a, command, &frame_buf);
+        try testing.expect((try session.feedFrame(ours, 100, &out)).?.len > 0);
+        try testing.expect(fix.bouts[2].value);
+    }
+
+    // A link-service request from a foreign station gets no link answer either
+    // — it is answered before the application layer, so it needs its own case.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = us, .master_address = a });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const reset = try link.encodeFrame(
+            .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(link.PrimaryFunction.reset_link_states) },
+            us,
+            b,
+            &.{},
+            &frame_buf,
+        );
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(reset, 100, &out));
+    }
+
+    // A broadcast from a foreign station is still foreign: the source test has
+    // no broadcast exemption, unlike the destination test.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = us, .master_address = a });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const frame = try frameFor(0xFFFF, b, command, &frame_buf);
+        try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(frame, 100, &out));
+        try testing.expect(!fix.bouts[2].value);
+    }
+
+    // …and with the opt-out taken, the very same foreign frame gets through.
+    // Without this the block above could be passing because of something else
+    // entirely; it is what shows the filter is the mechanism, and that the
+    // switch really switches.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .address = us, .master_address = a, .require_master_source = false });
+        var session = Session.init(&station, &rx, &scratch, &tx);
+        const foreign = try frameFor(us, b, command, &frame_buf);
+        try testing.expect((try session.feedFrame(foreign, 100, &out)).?.len > 0);
+        try testing.expect(fix.bouts[2].value);
+    }
+}
+
+test "Outstation: 'no peer known' is a value, not a wildcard" {
+    // `handle` names no peer, so it arms and matches with `peer = null`. That
+    // keeps a direct caller's behaviour exactly as it was — but `null` must
+    // equal `null` and nothing else, or it would be the F6(b) hole under a new
+    // name: an arm that any named peer could fire.
+    var out: [256]u8 = undefined;
+    var req: [64]u8 = undefined;
+
+    // Unnamed throughout: unchanged behaviour.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .select_timeout_ms = 5000 });
+        _ = (try station.handle(try buildCrob(&req, 1, .select, 2, .latch_on), 1000, &out)).?;
+        const reply = (try station.handle(try buildCrob(&req, 2, .operate, 2, .latch_on), 1100, &out)).?;
+        try testing.expectEqual(CommandStatus.success, try commandStatus(reply.fragment));
+        try testing.expect(fix.bouts[2].value);
+    }
+
+    // Armed unnamed, fired by a named peer: refused. Then the unnamed OPERATE
+    // still works, so the arm survived rather than being cleared.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .select_timeout_ms = 5000 });
+        _ = (try station.handle(try buildCrob(&req, 1, .select, 2, .latch_on), 1000, &out)).?;
+        const stolen = (try station.handleFrom(try buildCrob(&req, 2, .operate, 2, .latch_on), 1, 1100, &out)).?;
+        try testing.expectEqual(CommandStatus.no_select, try commandStatus(stolen.fragment));
+        try testing.expect(!fix.bouts[2].value);
+
+        const ours = (try station.handle(try buildCrob(&req, 2, .operate, 2, .latch_on), 1200, &out)).?;
+        try testing.expectEqual(CommandStatus.success, try commandStatus(ours.fragment));
+        try testing.expect(fix.bouts[2].value);
+    }
+
+    // …and the other way round, so neither direction is the wildcard.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .select_timeout_ms = 5000 });
+        _ = (try station.handleFrom(try buildCrob(&req, 1, .select, 2, .latch_on), 1, 1000, &out)).?;
+        const stolen = (try station.handle(try buildCrob(&req, 2, .operate, 2, .latch_on), 1100, &out)).?;
+        try testing.expectEqual(CommandStatus.no_select, try commandStatus(stolen.fragment));
+        try testing.expect(!fix.bouts[2].value);
+
+        const ours = (try station.handleFrom(try buildCrob(&req, 2, .operate, 2, .latch_on), 1, 1200, &out)).?;
+        try testing.expectEqual(CommandStatus.success, try commandStatus(ours.fragment));
+        try testing.expect(fix.bouts[2].value);
+    }
+
+    // The peer check must come FIRST in the chain, not merely be present. An
+    // arm that has also EXPIRED is the case where ordering is observable: the
+    // rightful peer must be told TIMEOUT (its own window closed), while a
+    // foreign station must still be told NO_SELECT — telling it TIMEOUT would
+    // confirm that somebody else holds an arm, which is the one bit the two
+    // statuses exist to keep apart. Without this, moving the peer test below
+    // the expiry test is a silent, test-passing change.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .select_timeout_ms = 5000 });
+        _ = (try station.handle(try buildCrob(&req, 1, .select, 2, .latch_on), 1000, &out)).?;
+        // 6100 - 1000 > 5000: the arm is expired for everyone.
+        const stolen = (try station.handleFrom(try buildCrob(&req, 2, .operate, 2, .latch_on), 1, 6100, &out)).?;
+        try testing.expectEqual(CommandStatus.no_select, try commandStatus(stolen.fragment));
+        try testing.expect(!fix.bouts[2].value);
+    }
+
+    // The bystander that makes the case above discriminating: same expired arm,
+    // same instant, but the RIGHTFUL peer — which must read TIMEOUT. If both
+    // answered alike the test above would pass for the wrong reason, since
+    // `no_select` is what four other paths also return.
+    {
+        var fix = Fixture{};
+        var station = fix.station(.{ .select_timeout_ms = 5000 });
+        _ = (try station.handle(try buildCrob(&req, 1, .select, 2, .latch_on), 1000, &out)).?;
+        const ours = (try station.handle(try buildCrob(&req, 2, .operate, 2, .latch_on), 6100, &out)).?;
+        try testing.expectEqual(CommandStatus.timeout, try commandStatus(ours.fragment));
+        try testing.expect(!fix.bouts[2].value);
     }
 }
 
@@ -3800,6 +4195,7 @@ test "fuzz: structured frames through a Session never panic" {
         const carried = @min(fragment.len, user.len - 1);
         @memcpy(user[1..][0..carried], fragment[0..carried]);
         const dest = dests[d.below(dests.len)];
+        const src: u16 = @intCast(d.below(4));
         const frame = link.encodeFrame(
             .{
                 .dir = true,
@@ -3807,16 +4203,18 @@ test "fuzz: structured frames through a Session never panic" {
                 .function = link_functions[d.below(link_functions.len)],
             },
             dest,
-            @intCast(d.below(4)),
+            src,
             user[0 .. 1 + carried],
             &frame_buf,
         ) catch continue;
-        if (dest == 10 or isBroadcast(dest)) accepted += 1;
+        // Both filters have to be satisfied for a frame to reach the
+        // outstation, so both belong in the aim assertion below.
+        if ((dest == 10 or isBroadcast(dest)) and src == 1) accepted += 1;
         _ = session.feedFrame(frame, i * 3, &out) catch {};
     }
 
-    // A Session fuzzer that only ever draws addresses the filter drops would be
-    // testing the filter, not the outstation behind it.
+    // A Session fuzzer that only ever draws addresses the filters drop would be
+    // testing the filters, not the outstation behind them.
     try testing.expect(accepted > 0);
     try testing.expect(shapes.full_width_range);
     try testing.expect(shapes.index_past_u16);
