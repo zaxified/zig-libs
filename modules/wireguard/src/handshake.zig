@@ -1828,17 +1828,38 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
     try testing.expectEqual(@as(u8, 0), try runCmd(gpa, io, &.{ "ip", "link", "set", ifname, "up" }));
 
     // Responder state: we know the kernel's static public key (Noise IK).
-    var hs: Handshake = .{
-        .static_keypair = our_kp,
-        .remote_static_public = kernel_kp.public,
-        .preshared_key = psk,
-        .local_index = 0x5a5a5a5a,
-    };
+    // A `Handshake` consumes exactly one initiation (`consumeInitiation`
+    // asserts `state == .idle`), so a RETRY needs a fresh one — see the
+    // initiation branch below.
+    const freshHandshake = struct {
+        fn make(kp: Keypair, remote: [32]u8, k: [32]u8) Handshake {
+            return .{
+                .static_keypair = kp,
+                .remote_static_public = remote,
+                .preshared_key = k,
+                .local_index = 0x5a5a5a5a,
+            };
+        }
+    }.make;
+    var hs: Handshake = freshHandshake(our_kp, kernel_kp.public, psk);
     var session: ?transport.Session = null;
+
+    // Exercise the retry path on every run instead of waiting for a loaded
+    // machine to produce it: the FIRST response is deliberately not sent, so
+    // the kernel's rekey timer must fire and re-initiate, and this responder
+    // must handle that second initiation as a new handshake. Without that,
+    // one lost or late response strands the test for its whole budget — which
+    // is exactly how this test failed 1-in-60 under load (see
+    // `~/CML/20260808-zig-libs-audit/modules/wireguard.md`, 2026-08-12).
+    var drop_first_response = true;
 
     // Drive the exchange: initiation in → response out → keepalive in.
     var buf: [2048]u8 = undefined;
-    var polls_left: u32 = 40; // 40 × 500 ms = 20 s overall budget
+    // 60 × 500 ms = 30 s. The old budget was 20 s for a clean exchange; the
+    // injected loss above deliberately costs one kernel REKEY_TIMEOUT (5 s,
+    // plus up to 333 ms of jitter) before the retry arrives, so the budget
+    // covers that on purpose rather than being widened to hide a race.
+    var polls_left: u32 = 60;
     while (polls_left > 0) : (polls_left -= 1) {
         var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
         const prc = linux.poll(&pfd, 1, 500);
@@ -1855,7 +1876,16 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
         switch (std.mem.readInt(u32, buf[0..4], .little)) {
             @intFromEnum(MessageType.handshake_initiation) => {
                 if (n != @sizeOf(MessageInitiation)) continue;
-                if (hs.state != .idle) continue; // kernel retry — already answered
+                // A retry is a NEW handshake, not a duplicate of the one we
+                // already answered: the kernel picks fresh ephemerals, so the
+                // response we sent for the previous initiation is dead to it.
+                // Answering the retry is therefore mandatory, and this code
+                // used to `continue` past it — which meant a single lost or
+                // late response could never be recovered from.
+                if (hs.state != .idle) {
+                    hs = freshHandshake(our_kp, kernel_kp.public, psk);
+                    session = null;
+                }
                 var msg1: MessageInitiation = undefined;
                 @memcpy(std.mem.asBytes(&msg1), buf[0..@sizeOf(MessageInitiation)]);
                 try hs.consumeInitiation(msg1);
@@ -1864,6 +1894,13 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                 // call: this is what makes the kernel an oracle for
                 // `transport.zig`'s framing, not only for the handshake.
                 session = hs.transportSession(false, nowSeconds());
+                if (drop_first_response) {
+                    // The injected loss. Everything above already ran, so the
+                    // kernel's rekey timer is what has to rescue this — the
+                    // very path the retry handling above exists for.
+                    drop_first_response = false;
+                    continue;
+                }
                 const src_len_const: linux.socklen_t = src_len;
                 const wrc = linux.sendto(
                     fd,
