@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Documentation, neither BREAKING nor BEHAVIOURAL.
+  `params.zig` called itself "a line-by-line port" of the authors' sage
+  reference while the same doc comment said everything in it is derived
+  rather than remembered. It reimplements the algorithm and carries no
+  number across, so "reimplementation" is what it says now. The wording is
+  not cosmetic: that reference is Apache-2.0 with no MIT alternative, and
+  "port" is the word that earns a module an attribution file here — it is
+  what `minisign` was attributed for on the same day.
+
 - **2026-08-14** — Licensing record. Not breaking and not behavioural — no code
   changed, and no digest this module produces is different. What changed is
   what the module admits to carrying: its constant tables and part of its

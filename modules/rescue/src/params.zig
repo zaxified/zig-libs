@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-//! RPO parameter generation — a line-by-line port of `get_round_constants`,
+//! RPO parameter generation — a reimplementation of `get_round_constants`,
 //! `get_alphas` and `get_mds` from the authors' reference implementation
 //! (`rescue_prime_optimized.sage`, see `SPEC.md` for the clone command).
+//!
+//! It reimplements the algorithm; it does not port the code. That wording
+//! matters: the sage reference is Apache-2.0 with no MIT alternative, and
+//! "line-by-line port" — which this comment said until 2026-08-14 — is the
+//! phrasing that earns a module a third-party attribution file in this repo.
+//! Nothing here is copied and no number is carried across, which the next
+//! paragraph is the argument for.
 //!
 //! **Everything here is derived, not remembered.** The round constants come out
 //! of SHAKE256 seeded with the spec's own seed string, the S-box exponents come
