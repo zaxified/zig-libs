@@ -10,6 +10,16 @@
 # "dated snapshot"; that is what let the bookkeeping go stale three times
 # (backlog 1B), so the allowance was removed rather than documented further.
 #
+# ⚠ AGREEING WITH ANCHOR-TASKS.tsv IS NOT THE SAME AS BEING RIGHT. Those two
+# checks compare a column against a duplicate of itself, so they are green
+# whenever both copies are wrong the same way — and on 2026-08-14 thirty rows
+# were exactly that: `SELF` in both files while ANCHOR-TASKS.tsv's own NOTE
+# cited the commit that anchored them. All thirty were re-graded from the
+# modules' TESTS and all thirty moved to MIXED. `checkAnchors` now also refuses
+# SOURCE=DONE beside ANCHOR=SELF and SOURCE=NONE beside ANCHOR=EXTERNAL, which
+# are contradictions between two INDEPENDENT facts rather than between copies.
+# A grade in this file is still only worth the test file its EVIDENCE names.
+#
 # CLASS: does this module have an external truth at all?
 #   A  wire / interop format — other implementations must byte-agree with it
 #   B  published cryptographic or algorithmic construction with published vectors
@@ -64,13 +74,13 @@ btcp2p	A	EXTERNAL	published verack/version hex dumps used as byte-exact test vec
 bulletproofs	B	SELF	published vectors tied to producing impl's transcript, unusable; property/soundness KAT only
 bumtree	A	SELF	802.1aq modeled; SPEC.md: "offline only, no live-interop surface", hand-built golden topology
 cbor	A	EXTERNAL	RFC 8949 App. A + RFC 9052 C.2.1 byte-exact vectors, kat_vectors.zig
-coap	A	SELF	hand-built CON GET datagrams round-tripped, no third-party CoAP oracle
+coap	A	MIXED	src/external_goldens.zig replays real aiocoap 0.4.17 client<->server datagrams captured through a byte-logging UDP proxy (plain GET, the full 3-pair Block2 transfer, Block1 PUT with a real Uri-Path/Block1/Size1 delta chain, a live Observe push, multi-byte Block NUM); options/reliability/server scheduling in root.zig stay hand-authored
 coconut	B	SELF	SPEC.md §3: "no external byte-exact vector" for Coconut, explicit Fable tier
 conntrack	A	EXTERNAL	raw ctnetlink frames captured off the wire via nlmon/tcpdump, goldens.zig
-cookies	A	SELF	hand-authored RFC 6265 fixtures, no captured browser traffic
-cors	A	SELF	hand-built preflight/actual tests; rs/cors & expressjs/cors are design refs only
+cookies	A	MIXED	src/golden_test.zig runs CPython 3.14.4's http.cookies as a black-box oracle over the Cookie-header parse direction (16 tests, 5 divergences judged against RFC 6265, one real quote-aware split bug found); the Set-Cookie BUILD direction in root.zig is hand-authored against the RFC only
+cors	A	MIXED	src/root.zig:1176/1203/1225 compare against flask_cors 6.0.5 run once as a black-box oracle, with an 8-item divergence ledger judged against Fetch/RFC 9110; the other 19 preflight/actual tests are still this module's own assertions about its own output
 csvsafe	C	n/a	OWASP CSV-injection escape heuristic, no wire byte-agreement question
-csvstream	A	SELF	RFC 4180 reader/writer, hand-authored fixtures, no captured third-party CSVs
+csvstream	A	MIXED	src/csv_spectrum_test.zig drives the reader through the vendored maxogden/csv-spectrum corpus (src/testdata/csv-spectrum), 8 of 12 pairs asserted and 4 declared out of scope, one of which is broken upstream; writer.zig and the coerce/header layers are self-tested
 ct25519	B	EXTERNAL	RFC 8032 §7.1 TEST 1/2 public keys re-derived byte-exact; bit-exact vs std.crypto.ecc.Edwards25519.mul/Ristretto255.mul
 ctap2pin	A	MIXED	AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only
 dataset	C	n/a	internal tabular Value/Dataset abstraction, no wire format
@@ -89,14 +99,14 @@ dtls	A	EXTERNAL	live interop vs real wolfSSL 5.9.1 peer, both roles, multiple fl
 ebpf	A	EXTERNAL	golden bytecode derived from clang -target bpf output + bpftool verifier dump
 ecvrf	B	EXTERNAL	RFC 9381 Appendix B.3 official ECVRF-EDWARDS25519-SHA512-TAI vectors, byte-exact
 ed448	B	EXTERNAL	RFC 8032 / RFC 7748 official test vectors, byte-exact, kat_test.zig
-encoding	A	SELF	hand-authored spot-check fixtures (e.g. windows-1252 euro), no WHATWG table/iconv cross-check
+encoding	A	MIXED	src/normative_test.zig drives the PUBLIC decode+encode API across all 640 byte/codepoint pairs of the five code pages against independently vendored normative tables (WHATWG index-*.txt, Unicode.org 8859-1.TXT), never against our own table; the label/alias table in parse and the '?' substitution policy are still self-graded
 enip	A	EXTERNAL	61 goldens captured from real traffic between 3rd-party stacks + live round trips
 entropy	D	n/a	own policy binding over std.Io.randomSecure; no algorithm and no wire, so no third party to agree with — tests pin WHICH std entry point is called, not any output value
-ethfrag	A	SELF	round-trip smoke + seeded property test only, no captured real IP-stack fragmentation
+ethfrag	A	MIXED	src/kernel_oracle.zig grades this module's Reassembler verdict against the real Linux kernel's own IPv4/IPv6 fragment reassembly, 6 scenarios x {v4,v6} = 12 captured comparisons; the emit/fragmentation side and the overlap policy beyond those scenarios stay self
 ethtool	A	EXTERNAL	real ethtool binary as capture oracle under strace, goldens.zig
 falcon	B	EXTERNAL	official NIST Round-3 falcon512/1024-KAT.rsp files, byte-exact
 filestore	C	n/a	own JSON snapshot format on disk, no interop; atomic write, no wire (README)
-finstats	B	SELF	empyrical/ffn-modeled formulas; own fixtures only, no external numeric check
+finstats	B	MIXED	src/root.zig:1559 pins annualized vol / max drawdown / VaR95 / CVaR95 to ffn 1.1.5's own output on an 8-day return series; xirr, TWR/Modified-Dietz, beta/alpha, Brinson attribution, Omega and Cornish-Fisher remain hand-computed fixtures with no foreign oracle
 fleetsim	A	EXTERNAL	7 protocols live vs real masters: pymodbus/pycomm3/bacpypes3/opendnp3/c104/snap7/asyncua
 framing	D	n/a	own length-prefix + JSON envelope wire shape invented here, no external spec
 frost	B	EXTERNAL	RFC 9591 Appendix E.5 official KAT, byte-exact (README/SPEC)
@@ -129,34 +139,34 @@ isis-sim	C	n/a	composes siblings over netsim; convergence/determinism invariants
 isis-spf	A	MIXED	5-router topology run once through real isisd 10.3 in-VM, matches vertex-by-vertex modulo documented undirected-engine gap; rest stays SELF
 jinja	A	EXTERNAL	golden.json captured from real Python Jinja2 3.1.6 output + live subprocess oracle
 jobqueue	C	n/a	internal partition-FIFO dispatch queue; original design, no wire format
-json5	A	SELF	hand-authored fixtures; deliberately partial subset, no json5.org test corpus used
+json5	A	MIXED	src/json5_tests_test.zig drives preprocess through the upstream json5/json5-tests corpus (src/testdata/json5-tests) honouring its extension convention in both directions, with one known_disagreement pinned; the error-recovery design ($err_trace_N) that root.zig's 27 tests cover is this module's own invention and has no external answer
 jsonshape	D	n/a	original jq-style bounded path-projection dialect invented here, not full JSONPath
 jwe	A	EXTERNAL	RFC 7516 App A full-token KAT (kat_rfc7516.zig) + RFC 7518 App B/C KATs
 jwt	A	EXTERNAL	RFC 7515 A.1-A.3/8037 A.4 full JWS compact-token vectors + PKCE 7636 App B
 k256	B	EXTERNAL	official BIP340 vectors (kat_vectors.zig) + bit-exact vs std.crypto.ecc.Secp256k1
 kv	C	n/a	embedded Bitcask-style log+keydir store; design references only, no interop target
 kvtree	C	n/a	embedded COW B-tree; LMDB/BoltDB design inspiration only, own format
-l2disco	A	SELF	golden byte KATs hand-transcribed from LLDP/CDP/ARP/DHCP specs, no live capture
+l2disco	A	MIXED	src/capture_test.zig runs 15 real LLDP/CDP/ARP/DHCP frames vendored from tcpdump's own dissector test suite (4 of them upstream crash reproducers) through these decoders; TLV shapes no vendored frame reaches stay hand-transcribed from the specs
 l2encap	A	SELF	golden byte-layout KAT hand-authored from spec layouts; SPEC.md: no live-interop surface
-l2forward	A	SELF	FDB/split-horizon decisions per 802.1D/EVPN; SPEC.md: offline logic only, no live-interop
+l2forward	A	MIXED	narrow and only over defaults: src/root.zig:1304 pins aging_ticks to a live kernel bridge's observed ageing_time (30000 centiseconds) and :1436 pins the MAC-move defaults to RFC 7432 §15.1's stated N=5/M=180. Every FDB/learn/flood/split-horizon DECISION is still graded by this module's own tests; the live bridge's qualitative agreement was not wired in (timing-dependent, SPEC.md)
 latency-stats	C	n/a	in-process stats/histogram; hand-computed KAT + sorted-oracle check, no wire format
-linkheader	A	SELF	hand-authored parse/build fixtures; no RFC 8288 worked examples cited
+linkheader	A	MIXED	src/root.zig:541+ reconstructs RFC 8288 §3.5's own worked examples byte-for-byte from the RFC (errata list checked) and asserts the RFC's own stated reading of each; the build direction and every other parse fixture in the file are hand-authored
 liveness-hyst	C	n/a	local estimator "modeled after" BFD/Babel; scored via trace corpus + invariants, not wire-compat
-llmclient	A	SELF	docs-derived fixtures; the one live API test is unconditionally SkipZigTest, never runs
+llmclient	A	MIXED	src/response.zig:450 parses Anthropic's own published basic-streaming SSE example byte-exact, including a `ping` event no hand-built fixture had; every other fixture is docs-derived and the one live API test is unconditionally SkipZigTest, so it anchors nothing
 lninvoice	A	EXTERNAL	BOLT11 + BOLT12 offer/invoice_request/invoice decode+ENCODE all vs lightning/bolts vectors, byte-exact (NOTICE)
 lnwire	A	EXTERNAL	BigSize/TLV base wire + BOLT#7 announcements/queries + all BOLT#2 messages vs bolts + rust-lightning msgs.rs, byte-exact
 lockfree	C	n/a	canonical class-C case (MPMC queue + EBR); litmus/ = internal weak-memory verification
 loopfree-reconv	C	n/a	ordered-FIB scheduling algorithm proven via own loop-freedom invariant, no wire messages
 loopix	C	n/a	netsim anonymity simulation of Loopix paper; modeled header, not byte-compat with real Loopix/Nym
 mcp	A	MIXED	sampling/elicitation lines byte-identical to spec's own JSON examples; init/tools/resources goldens + peer concept self-only (SPEC.md: "no external anchor")
-mcp-http	A	SELF	own self-contained HTTP/SSE tests; Dart/mcp_dart parity is a prose claim, no captured bytes
+mcp-http	A	MIXED	src/oracle_vectors.zig freezes one real Streamable-HTTP session with the python MCP SDK and root.zig's `oracle:` tests replay it; the unbacked mcp_dart parity claim was retracted rather than counted, and the remaining HTTP/SSE framing paths are self-tested
 megolm	B	MIXED	libolm KAT byte-exact ratchet/message but session.zig 2-sided round-trip is self-only (SPEC grade 3)
-metrics	A	SELF	hand-authored golden exposition bytes; no promtool/Prometheus parser cross-check
+metrics	A	MIXED	src/root.zig:1411 -- the test is literally named `external anchor: exposition text independently parsed by prometheus_client` -- freezes what that independent parser extracted from this module's own writeText bytes (families, labels, escapes, cumulative buckets); :1282 additionally accepts Prometheus's published exposition example. The in-house grammar checker was demoted to a syntax check; registry/scrape paths stay self
 minisign	A	EXTERNAL	byte-exact vs real minisign 0.12 binary, README
 mls	A	EXTERNAL	mlswg/mls-implementations official interop KAT (tree-operations.json etc.)
 modbus	A	EXTERNAL	CAPTURED pymodbus 3.14.0 live session, baked-in bytes in goldens.zig
 montint	C	n/a	internal Montgomery bignum arithmetic; ground truth is brute-force CPython bignum
-mqtt	A	SELF	golden bytes are hand-authored (KAT) per OASIS spec text, no captured broker session
+mqtt	A	MIXED	src/external_goldens.zig freezes real MQTT 3.1.1 sessions captured through a byte-logging proxy between paho and amqtt -- neither side ours -- covering CONNECT/PUBLISH/SUBSCRIBE and the RETAIN bit; broker.zig session state and topic.zig matching stay self
 musig2	B	EXTERNAL	official BIP327 vectors (key_agg/nonce/sig_agg/tweak), NOTICE
 netaddr	C	n/a	local RFC 6724 address-selection logic, no wire peer; self-tested only
 netconf	A	MIXED	framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips
@@ -167,10 +177,10 @@ nl80211	A	EXTERNAL	goldens captured from real iw under strace; live kernel tests
 noise	A	EXTERNAL	official cacophony vectors from rweather/noise-c, byte-exact incl. handshake hash
 numparse	D	n/a	original design, no external spec/vectors; ICU named as loose model only
 ocsp	A	MIXED	request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures
-ocspcache	A	SELF	fixtures constructed offline via ocsp's own der_writer+rsa, no captured real-CA data
+ocspcache	A	MIXED	src/goldens.zig carries a real www.godaddy.com leaf+issuer and the real OCSP response its responder returned, captured 2026-08-01, exercised through fetch/verify/cache; src/ocspcache_test.zig states in its own header that its byte arrays are NOT captured from a public source but constructed via ocsp's der_writer+rsa, so that half stays self
 opaque	A	EXTERNAL	RFC 9807 Appendix C.1 official vectors, full registration/KE1-3/session_key byte-exact
 opcua	A	MIXED	P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable
-openapi	A	SELF	hand-authored golden JSON document; only checked to be valid JSON, no real OpenAPI validator
+openapi	A	MIXED	src/root.zig:749+ freezes openapi_spec_validator's verdict on this module's OWN generated document (accepted) and on a deliberately invalid one (rejected, for the same reason validateOpenApi31 reports) -- teeth in both directions; :595 adds the OAI's published v3.1 example. The generator's route-to-path mapping beyond that document is self-graded
 oscore	A	EXTERNAL	RFC 8613 Appendix C official vectors (key derivation + protected-message C.4-C.8)
 otp	B	EXTERNAL	RFC 4226/6238 appendix vectors embedded byte-exact
 p256	B	EXTERNAL	RFC 6979 Appendix A.2.5 ECDSA-P256 vectors; field ops also cross-checked vs std.crypto
@@ -180,7 +190,7 @@ pbb	A	MIXED	Wireshark sharkd validated encode() B-Tag/I-TAG/B-TCI/relocation/eth
 pir	B	SELF	SPEC.md: no external test vector exists for this DPF construction
 pollworker	C	n/a	internal job/event-loop scheduler (single-owner controller), no wire
 poseidon	B	EXTERNAL	circomlibjs JSON consts byte-identical (constants_test.zig)
-pping	A	SELF	RFC 7323 wire; hand-built KAT/parse fixtures only, no pcap capture
+pping	A	MIXED	src/parse.zig:207-224 anchors the TCP Timestamps option parser on 2 real SYN/SYN-ACK captures taken with tcpdump off a genuine loopback handshake, including the tsecr<-tsval echo. Everything above the parser is NOT anchored today: match.matchEcho is a gated Fable stub, so every KAT in src/kat.zig returns error.SkipZigTest and asserts nothing
 probe	C	n/a	TCP connect timing via std connect(); no wire codec of its own
 procnet	A	EXTERNAL	testdata/*.txt captured from real kernel /proc snapshots (README)
 procrun	C	n/a	process reap/spawn robustness util, no wire format
@@ -190,9 +200,9 @@ quic-crypto	A	EXTERNAL	RFC 9001 Appendix A vectors verbatim in initial/headerpro
 raft	C	n/a	netsim model-checking vs Raft safety properties, no wire byte format
 ramcache	C	n/a	pure in-process W-TinyLFU cache, no wire
 ratelimit	C	n/a	token-bucket internal utility, no wire
-rawsock	A	SELF	Ethernet/ARP codec; frames self-built, loopback round-trip self test only
+rawsock	A	MIXED	src/root.zig:709+ freezes a real ARP exchange and a real Ethernet/IPv4/ICMP frame captured with tcpdump off a veth pair in an unprivileged netns -- loopback cannot do ARP at all, which is why the pre-existing hand-computed fixture had never met a real L2 segment; the socket send/recv wrappers stay self
 rbac	C	n/a	in-process NIST RBAC/XACML decision engine, no wire exchange
-rdap	A	SELF	RFC 7480-9224 JSON client; hand-authored fixtures, no captured registry resp
+rdap	A	MIXED	src/goldens.zig carries a real rdap.publicinterestregistry.org response for iana.org captured live 2026-08-01 (GDPR-redacted handle, nested entities) plus the real IANA bootstrap file; the remaining client fixtures in root.zig are hand-authored
 readthrough	C	n/a	singleflight+cache loader, in-process, no wire
 reconcilable	C	n/a	in-process reconcile loop modeled after k8s controller-runtime, no wire
 requestid	C	n/a	opaque correlation-ID generator/passthrough, no codec
@@ -205,7 +215,7 @@ s7comm	A	MIXED	classic goldens from snap7 live peer; S7CommPlus body self, rawsh
 saml	A	MIXED	core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips
 sandbox	A	EXTERNAL	seccomp/landlock/rlimit enforcement tested against the real running kernel
 sealedbox	B	EXTERNAL	libsodium C lib called via FFI to compute expected ciphertexts (kat_vectors.zig)
-security-headers	A	SELF	golden header fixtures hand-authored; helmet.js value read not executed - SELF
+security-headers	A	MIXED	src/root.zig:780+ pins header values byte-exact to published third-party literal examples (RFC 7034, RFC 6797, OWASP); root.zig:802 states the counter-case explicitly -- csp_helmet_default remains self-anchored because helmet.js's value was READ, not run, which is not an anchor
 seqmap	C	n/a	clean-room internal correlation table (id allocation), no wire format at all
 sessions	D	n/a	own session/CSRF design guided by OWASP cheat sheets, no third-party spec
 shardstore	C	n/a	internal key-sharding composition over single-writer stores, no wire format
@@ -213,15 +223,15 @@ signal	B	MIXED	X3DH agreement+codec only self round-trip; XEdDSA has libsignal K
 slhdsa	B	EXTERNAL	NIST ACVP FIPS 205 KAT vectors, kat_vectors.zig/kat_test.zig
 smtp	A	EXTERNAL	live_golden.zig: byte-exact transcript captured from real aiosmtpd 1.4.6 session
 snmp	A	EXTERNAL	interop.zig: byte-exact goldens captured from real net-snmp 5.9.4 exchange
-sntp	A	SELF	canned server-reply fixtures only; live query test always error.SkipZigTest
+sntp	A	MIXED	src/root.zig:671 decodes one real 48-byte reply captured from time.google.com together with the originate timestamp the request actually sent, so verifyOriginate meets a genuinely echoed value; the live query test is SkipZigTest by design and every other fixture is canned
 spake2plus	B	EXTERNAL	RFC 9383 Appendix C official P-256/SHA-256 vector, kat_vectors.zig
 spbfib	A	SELF	groupDa: hand-derived worked-example bytes from RFC 6329 formula, not captured
 spf-ect	C	n/a	generalized Dijkstra/ECT graph algorithm; brute-force cross-check property tests
 sphinx	A	EXTERNAL	official BOLT#4 onion-test.json vector + independent Python rederivation of secrets
 ssh	A	MIXED	self loopback client<->server baseline; live OpenSSH interop skips if sshd absent
-staticfiles	A	SELF	hand-authored fixtures only, no real client/browser interop test exists
+staticfiles	A	MIXED	src/root.zig:1475+ compares against starlette.staticfiles run once as a black-box Range/ETag/conditional-request oracle (single/open-ended/suffix ranges, multi-range, If-None-Match); If-Range has no oracle available and the path sanitiser is self-graded
 stun	A	EXTERNAL	RFC 5769 sections 2.1-2.3 published test vectors, root.zig
-syslog	A	SELF	hand-authored fixtures/round-trip only; live UDP path always SkipZigTest
+syslog	A	MIXED	src/root.zig:157 freezes what a real rsyslogd received and re-rendered over BOTH transports (UDP and TCP octet-counted) for a message carrying quote/backslash/bracket escaping; bsd.zig and the remainder of message.zig are hand-authored fixtures
 tabular	C	n/a	internal dataset-algebra library (pandas/dplyr-modeled API), no wire format
 taproot	B	EXTERNAL	official BIP341 wallet test vectors, kat_vectors.zig/kat_test.zig
 tar	A	MIXED	read path: real GNU tar 1.35 golden header; write path only via skippable live tar test
@@ -235,26 +245,26 @@ throttle	C	n/a	in-process concurrency-limiter/semaphore algorithm, no wire forma
 timelock_envelope	B	MIXED	drand quicknet vector real+pairing-checked; envelope AND-composition only round-tripped
 tlock	B	EXTERNAL	byte-exact vs genuine drand Go tle ciphertext + live-fetched quicknet beacon sig
 tlsresume	A	EXTERNAL	RFC 8448 KAT byte-exact: ticket/psk-binder/earlydata/replay real vectors
-tracecontext	A	SELF	8 offline hand-authored tests; one traceparent value copied from spec text
+tracecontext	A	MIXED	src/w3c_conformance_test.zig drives the middleware through 73 vendored W3C trace-context conformance vectors (src/w3c_vectors.zig) in both directions over the real offline wire harness; trace-id/parent-id GENERATION and childOf in root.zig have no W3C answer and stay self, as do the forward-compat and STRICT_LEVEL>=2 categories this module does not implement
 traceroute	A	MIXED	canned ICMP fixtures (SELF); loopback live test skips without CAP_NET_RAW
 trie	D	n/a	own frozen-index wire format (ZTR1 magic), invented in-repo, no third party
 tsdb	C	n/a	embedded time-series store; row-key shape Prometheus-like but no wire interop
 tz	A	MIXED	600 zones from real IANA-generated table; Jn/n forms only synthetic hand zones
-uci	A	SELF	golden_network fixture hand-authored, not captured from real OpenWrt config
+uci	A	MIXED	src/root.zig:1110+ asserts against verbatim `uci export` / `uci show` stdout captured from a real uci binary, which is what surfaced two symmetric escape bugs a round trip could not see; the rest of the parse/serialise surface is hand-authored
 upstream	C	n/a	in-process LB/health-check library, no wire format of its own
-validate	A	SELF	JSON Schema 2020-12 semantics; own tests only, no official Test Suite run
+validate	A	MIXED	src/json_schema_format_test.zig runs the official json-schema-org/JSON-Schema-Test-Suite optional/format files (src/testdata/json-schema-test-suite, 12 formats), which is where the isDuration bug was found; the whole 2020-12 CORE vocabulary in root.zig -- type/properties/items/required and the request-body integration -- is still graded only by this module's own tests
 vdf	B	REDERIVED	eval KAT vs independent Python pow() oracle over real RSA-2048 challenge N
 voprf	B	EXTERNAL	RFC 9497 own published test vectors, byte-exact
 webauthn	A	EXTERNAL	W3C sec.16 vectors, cross-checked vs go-webauthn's re-hosting of same vectors
-webhooksig	A	SELF	HMAC-SHA256 sample value hand-cited in test, no named published KAT source
+webhooksig	A	MIXED	src/root.zig:456 asserts GitHub's own published canonical webhook-signature triple (payload, secret, sha256=757107ea0eb2...), which anchors the FRAMING; root.zig:434 records that RFC 4231 was REFUTED as this module's anchor because it exercises std.crypto's HMAC rather than anything here. Timing-safe compare and header parsing stay self
 websocket	A	EXTERNAL	RFC 6455 sec.1.3/sec.5.7 worked-example bytes, byte-exact parse AND write
-whois	A	SELF	scripted/canned transport only; no captured real registry responses
+whois	A	MIXED	src/goldens.zig carries real port-43 replies captured live from IANA and Verisign, including a real referral cycle; root.zig's own canned replies say in their comment that they are only `modeled on the real line conventions`, so the transport and the remaining parse paths stay self
 wireguard	A	MIXED	KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDERIVED(Python); netlink codec SELF, root kernel test skips
 workerpool	C	n/a	internal thread pool over own lockfree MS-queue + EBR, no wire
 writebehind	C	n/a	pure composition of internal cache/queue/pool modules, no wire
 x509	A	EXTERNAL	chains generated by real OpenSSL 3.5, cross-checked with openssl verify
 xdp-classifier	A	MIXED	classifier bytecode clang-cross-checked(EXTERNAL); CAP_BPF kernel-load test skips unprivileged
-xml	A	SELF	own hand-authored fixtures; no W3C XML conformance test suite used
+xml	A	MIXED	src/xmlconf_test.zig runs 130 cases of the W3C XML Conformance Test Suite (src/testdata/xmlconf) through parse; the slice is LICENCE-FILTERED (xmltest excluded on licence grounds, so the suite's largest section is absent) and src/xmlconf_test.zig carries a known_disagreements list -- paths outside the vendored slice remain self-graded
 xmldsig	A	MIXED	C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip
 xmlenc	A	MIXED	primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only
 xmss	B	MIXED	core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only

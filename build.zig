@@ -1517,6 +1517,44 @@ fn firstDataFile(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8) ?[]
 ///   - `ANCHORS.tsv`'s ANCHOR matches `ANCHOR-TASKS.tsv`'s ANCHOR for every
 ///     module in both -- this is the actual fix for the staleness above: what
 ///     used to be a silently tolerated snapshot lag is now a build error
+///   - every `ANCHOR-TASKS.tsv` row HAS a SOURCE column, and SOURCE does not
+///     contradict `ANCHORS.tsv`'s ANCHOR: `DONE` cannot sit beside `SELF`, and
+///     `NONE` cannot sit beside `EXTERNAL`. See below -- this is the only
+///     cross-file claim here that is not a column checked against its own copy
+///
+/// WHY SOURCE vs ANCHOR IS A DIFFERENT KIND OF CHECK, and what it caught.
+/// Every other cross-file claim above compares a column to a DUPLICATE of
+/// itself: `ANCHOR-TASKS.tsv` carries CLASS and ANCHOR only so this gate can
+/// notice the copy drifted. That shape has a known blind spot -- it is green
+/// whenever both copies are wrong the same way -- and on 2026-08-14 that blind
+/// spot was measured, not theorised. THIRTY modules (`coap`, `cookies`,
+/// `cors`, `csvstream`, `encoding`, `ethfrag`, `finstats`, `json5`,
+/// `l2disco`, `l2forward`, `linkheader`, `llmclient`, `mcp-http`, `metrics`,
+/// `mqtt`, `ocspcache`, `openapi`, `pping`, `rawsock`, `rdap`,
+/// `security-headers`, `sntp`, `staticfiles`, `syslog`, `tracecontext`, `uci`,
+/// `validate`, `webhooksig`, `whois`, `xml`) read `SELF` in BOTH files while
+/// their own `ANCHOR-TASKS.tsv` NOTE said the anchoring had landed and cited
+/// the commit. Every one of them was re-graded from the module's tests and
+/// every one moved to `MIXED` -- `metrics` had a test literally named "external
+/// anchor: exposition text independently parsed by prometheus_client",
+/// `xml` had 130 W3C xmlconf cases on disk, `json5` had the upstream corpus.
+/// The agreement checks were green throughout, correctly: the two files agreed
+/// perfectly, and both were wrong.
+///
+/// SOURCE is not a copy of ANCHOR. ANCHOR says what TIER the oracle is;
+/// SOURCE says what would unlock it, or that the work already landed. They are
+/// independent facts that live in different files, which is exactly why a
+/// contradiction between them is information rather than a bookkeeping typo.
+/// `DONE` + `SELF` fired on all thirty of the above at the moment it was
+/// written; `NONE` + `EXTERNAL` fires on nothing today and is kept because it
+/// is the same contradiction read in the other direction (a row cannot claim
+/// that nothing external exists AND that its oracle is external).
+///
+/// This is still bookkeeping, not truth -- see immediately below. It cannot
+/// tell `MIXED` from `EXTERNAL`, and a row that lies in BOTH columns at once
+/// (SOURCE `NONE` beside ANCHOR `SELF`, when a real oracle exists) stays green.
+/// What it removes is the specific failure that actually happened: a task
+/// recorded as closed while the grade it closed still says nobody checked.
 ///
 /// What CANNOT be checked, and this does not pretend to:
 ///   - that a module claiming EXTERNAL/REDERIVED genuinely has one. The KAT
@@ -1627,6 +1665,37 @@ fn checkAnchors(b: *std.Build, io: std.Io, failed: *bool) !void {
             );
             failed.* = true;
         }
+
+        // SOURCE vs ANCHOR -- the only cross-file claim here that is not a
+        // column checked against its own copy. See "WHY SOURCE vs ANCHOR IS A
+        // DIFFERENT KIND OF CHECK" in the doc comment for what these caught.
+        const src = trow.source orelse {
+            std.log.err(
+                "ANCHOR-TASKS.tsv: module '{s}' has no SOURCE column -- every row carries " ++
+                    "module/CLASS/ANCHOR/EVIDENCE/SOURCE/COST/NOTE (see the file's own header)",
+                .{trow.name},
+            );
+            failed.* = true;
+            continue;
+        };
+        if (std.mem.eql(u8, src, "DONE") and std.mem.eql(u8, arow.anchor, "SELF")) {
+            std.log.err(
+                "module '{s}': ANCHOR-TASKS.tsv SOURCE is DONE (the anchoring landed, and the NOTE column " ++
+                    "normally cites the commit) but ANCHORS.tsv still grades the oracle SELF -- a module whose " ++
+                    "anchor task closed cannot still be round-trip/hand-authored only. Re-grade it from what the " ++
+                    "module's TESTS contain (EXTERNAL/REDERIVED/MIXED), not from the NOTE",
+                .{trow.name},
+            );
+            failed.* = true;
+        }
+        if (std.mem.eql(u8, src, "NONE") and std.mem.eql(u8, arow.anchor, "EXTERNAL")) {
+            std.log.err(
+                "module '{s}': ANCHOR-TASKS.tsv SOURCE is NONE (nothing external exists to anchor against) but " ++
+                    "ANCHORS.tsv grades the oracle EXTERNAL -- those two cannot both be true. One of them is wrong",
+                .{trow.name},
+            );
+            failed.* = true;
+        }
     }
 }
 
@@ -1634,6 +1703,11 @@ const AnchorRow = struct {
     name: []const u8,
     class: []const u8,
     anchor: []const u8,
+    /// `ANCHOR-TASKS.tsv`'s 5th column. `null` for an `ANCHORS.tsv` row, which
+    /// has only four columns and no SOURCE at all -- the optionality is the
+    /// type saying which file a row came from, so a check that only makes
+    /// sense on the tasks file cannot silently read garbage off the other one.
+    source: ?[]const u8,
 };
 
 /// Parse the `module<TAB>CLASS<TAB>ANCHOR<TAB>...` rows both `ANCHORS.tsv` and
@@ -1653,7 +1727,14 @@ fn parseAnchorRows(content: []const u8, b: *std.Build) []const AnchorRow {
         const name = cols.next() orelse continue;
         const class = cols.next() orelse continue;
         const anchor = cols.next() orelse continue;
-        out.append(b.allocator, .{ .name = name, .class = class, .anchor = anchor }) catch @panic("OOM");
+        _ = cols.next(); // EVIDENCE -- free text, deliberately not validated.
+        const source = cols.next();
+        out.append(b.allocator, .{
+            .name = name,
+            .class = class,
+            .anchor = anchor,
+            .source = source,
+        }) catch @panic("OOM");
     }
     return out.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
