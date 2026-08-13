@@ -124,7 +124,9 @@ all fail the gate. See `CONVENTIONS.md` §8.
 - [`diagnostics`](modules/diagnostics/CHANGELOG.md) — security audit: no
   findings.
 - [`dkg`](modules/dkg/CHANGELOG.md) — security audit: two findings fixed.
-- [`dnp3`](modules/dnp3/CHANGELOG.md) — security-audit memory-safety fix.
+- [`dnp3`](modules/dnp3/CHANGELOG.md) — security audit: memory-safety and
+  outstation control-path fixes, a data-link address filter and a peer-bound
+  SELECT; new `Range.objectSpanBytes`.
 - [`dns`](modules/dns/CHANGELOG.md) — security audit: one finding fixed.
 - [`dnssec`](modules/dnssec/CHANGELOG.md) — security-audit memory-safety
   fix.
@@ -399,7 +401,8 @@ all fail the gate. See `CONVENTIONS.md` §8.
   points take `std.Io` instead of `std.Random`; the secret draws fail
   closed.
 - [`threshold_ecdsa`](modules/threshold_ecdsa/CHANGELOG.md) —
-  **BREAKING** — Paillier generator bound into Fiat-Shamir transcript.
+  **BREAKING** — Paillier generator bound into Fiat-Shamir transcript;
+  security audit: six findings fixed.
 - [`throttle`](modules/throttle/CHANGELOG.md) — BEHAVIOURAL, not
   breaking: the 503 shed path no longer forces an early
   `ResponseWriter.end()`.
@@ -420,8 +423,8 @@ all fail the gate. See `CONVENTIONS.md` §8.
 - [`uci`](modules/uci/CHANGELOG.md) — security audit: two findings fixed.
 - [`upstream`](modules/upstream/CHANGELOG.md) — security audit: one finding
   fixed.
-- [`validate`](modules/validate/CHANGELOG.md) — security-audit O(n²)-DoS
-  hardening.
+- [`validate`](modules/validate/CHANGELOG.md) — security audit: four findings
+  fixed, headlined by O(n²)-DoS hardening of the error aggregation.
 - [`vdf`](modules/vdf/CHANGELOG.md) — security audit: two findings fixed,
   one accepted as documented trade-offs.
 - [`voprf`](modules/voprf/CHANGELOG.md) — security audit: no findings.
@@ -451,7 +454,10 @@ all fail the gate. See `CONVENTIONS.md` §8.
 - [`xmss`](modules/xmss/CHANGELOG.md) — security audit: two findings fixed,
   one accepted as documented trade-offs.
 - [`yaml`](modules/yaml/CHANGELOG.md) — security audit: five findings fixed.
-- [`zipstream`](modules/zipstream/CHANGELOG.md) — security-audit fix.
+- [`zipstream`](modules/zipstream/CHANGELOG.md) — new: the `ArchiveWriter`
+  writing API; security audit: six findings fixed, including a CRIT
+  central-directory overflow, a decompression-bomb bound and CRC-32
+  verification on read.
 
 ### Collection-wide notes (belong to no single module)
 
