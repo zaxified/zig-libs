@@ -1935,6 +1935,121 @@ test "BYO-TLS dogfood: connectH2Over ↔ serveStream over an in-memory duplex pi
 
 // ── tests (live network — skipped when unavailable) ─────────────────────────
 
+/// A `std.Io` that behaves exactly like `inner` except that `randomSecure`
+/// reports no entropy.
+///
+/// **The shape is the point.** The obvious double — copy the vtable and rebind
+/// `userdata` to a probe struct — is unsound: `std.Io.VTable` has 109 slots at
+/// Zig 0.16, and every slot left unoverridden then holds the inner
+/// implementation's function pointer bound to a FOREIGN `userdata`. Nothing
+/// crashes, so it survives review (see the `CountingIo` doc in `entropy`,
+/// which records that hazard being hit for real). The rule it states — every
+/// reachable `std.Io` function needs its own override — is unaffordable here:
+/// a `Client` dial reaches most of the net, clock and async surface.
+///
+/// So this double inverts it. It keeps the **inner** `userdata` and replaces
+/// exactly one function pointer with `std.Io.failingRandomSecure`, std's own
+/// stateless implementation, whose body is `_ = userdata; return
+/// error.EntropyUnavailable;`. Every other slot keeps the inner function AND
+/// the inner `userdata` that function expects, so the binding is correct
+/// everywhere rather than merely quiet — and the one overridden slot cannot
+/// misread the pointer it is handed because it never looks at it.
+/// Accepts one connection and closes it without saying anything.
+const HangUpPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+
+    fn run(p: *HangUpPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        s.close(p.io);
+    }
+};
+
+const NoEntropyIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    fn init(inner: std.Io) NoEntropyIo {
+        var vt = inner.vtable.*;
+        vt.randomSecure = std.Io.failingRandomSecure;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const NoEntropyIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+};
+
+test "dialConn: TLS key material fails CLOSED when randomSecure has no entropy" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const real_io = threaded.io();
+
+    // A peer that accepts one connection and immediately closes it. `dialConn`
+    // draws the entropy AFTER the socket is up (`:1070` connect, `:1099` draw)
+    // and BEFORE a single TLS byte is written, so the passing run never needs
+    // the peer to say anything — but the MUTATION does, and this is where the
+    // shape was decided by measurement rather than by design:
+    //
+    // The first spelling used a listener that never accepted at all. With
+    // `try io.randomSecure` replaced by the `io.random` this code rejects, the
+    // dial walked on into the TLS handshake and blocked there **past ten
+    // minutes** — and it did so with `.connect_timeout_ms` and
+    // `.total_timeout_ms` both set, so those options did not bound the
+    // handshake read. A mutation that hangs is not a red. Closing the
+    // connection from the peer ends the handshake instead: the mutation then
+    // reports `expected error.EntropyUnavailable, found error.TlsFailed`, in
+    // Debug, ReleaseSafe and ReleaseFast alike.
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(real_io, .{}) catch |err| {
+        std.debug.print("no-entropy listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(real_io);
+    const port = listener.socket.address.getPort();
+
+    // Exactly one connection is made whichever way this goes — `dialConn`
+    // connects before it draws — so the peer thread always terminates.
+    var peer: HangUpPeer = .{ .io = real_io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, HangUpPeer.run, .{&peer});
+    defer peer_thread.join();
+
+    var no_entropy: NoEntropyIo = .init(real_io);
+    // Check what the double actually does before trusting a test built on it.
+    // A double that silently kept working would make everything below pass for
+    // the wrong reason, and the failure mode of the unsound shape above is
+    // precisely "passes quietly".
+    var probe: [4]u8 = undefined;
+    try testing.expectError(error.EntropyUnavailable, no_entropy.io().randomSecure(&probe));
+    // The slots that were NOT overridden still work through it — and that is
+    // proven by the final assertion rather than asserted here: reaching the
+    // entropy draw at all means the socket, the DNS path and the clock all ran
+    // through this `Io` first. A broken one answers `ConnectFailed`, which is
+    // what distinguishes this double from `std.Io.failing` (whose network is
+    // down, so the dial never reaches the draw).
+
+    // `insecure_no_verify` keeps the CA bundle out of it: the claim under test
+    // is the entropy draw, not certificate verification. The timeouts are a
+    // belt-and-braces bound only — measured NOT to bound the handshake read
+    // (see the peer comment above); the peer's hang-up is what does.
+    var client = Client.init(no_entropy.io(), gpa, .{
+        .tls = .{ .verify = .insecure_no_verify },
+        .connect_timeout_ms = 2000,
+        .total_timeout_ms = 3000,
+    });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+
+    // Fail-closed: the documented contract of `Error.EntropyUnavailable`. The
+    // alternative the code rejects is `io.random`, which "is seeded by
+    // `randomSecure`, or a less secure mechanism upon failure" — it returns
+    // void, so a client that used it would hand the ClientHello random and key
+    // share a degraded seed with nothing to check.
+    try testing.expectError(error.EntropyUnavailable, client.request(.get, url, .{}));
+}
+
 test "live: GET https://example.com round-trip" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();

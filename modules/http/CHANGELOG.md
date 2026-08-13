@@ -5,6 +5,40 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — *no behaviour change* — two paths that had never been executed are
+  now covered. (1) `proxy.relayFailed`'s **h2** arm (`forwardH2`, `:347`/`:350`/`:351`):
+  the existing 502-instead-of-mutilated-200 test drove the h1 forward path only,
+  so the second relay loop was asserted by shape alone. The new h2c integration
+  test reaches it with a real `http.Server` backend — which cannot overrun the
+  copy-store *byte* budget (it has the same one) but can overrun the *field
+  count*, because the backend's managed `Date`/`Server`/`Content-Length` cost it
+  no table slot yet arrive at the proxy as ordinary headers that do, and the
+  proxy adds `Via` on top. Restoring the old `catch {}` on the h2 arm alone
+  turns it red (`expected 502, found 200`) while the h1 test stays green.
+  (2) `Client`'s `error.EntropyUnavailable` (`dialConn:1099`) is now driven by a
+  fault-injected `Io`. Replacing `try io.randomSecure` with the `io.random` that
+  line rejects reports `expected error.EntropyUnavailable, found error.TlsFailed`.
+- **2026-08-13** — **BEHAVIOURAL, not breaking** — a **failed** `declareTrailers` /
+  `declareTrailer` no longer leaves the trailer half-declared. Both
+  `trailer_decl_len` and `declared_trailers_len` were advanced *before* the
+  `Trailer` advert was re-registered through `putHeader`, and that call can
+  fail on the copy-store budget; neither error arm restored either counter.
+  The consequence was not counter hygiene. `declared_trailers` **is**
+  `setTrailer`'s allow-list, so after a refused declaration `declaredTrailer`
+  answered *true*: the caller's retry short-circuited as "already declared"
+  and never re-advertised the name, yet `setTrailer` accepted it — putting a
+  trailer field on the wire with no `Trailer` header naming it (**RFC 9110
+  §6.6.2**), after a call that reported failure. The stuck counter also
+  committed the response to chunked framing (`end` branches on
+  `declared_trailers_len` alone) and made `setHeader("Content-Length", …)`
+  return `InvalidHeader`, both for a trailer that was never declared. The
+  second counter had its own effect: the refused name stayed in the generated
+  advert text, so it reappeared in — and inflated the byte cost of — every
+  later declaration, which could then fail for a budget it was not spending.
+  Both are now rewound with an `errdefer`, the same shape `setHeader`'s
+  `Trailer` branch already used; the two no longer disagree about what a
+  refused declaration costs. Pinned by two tests (allow-list + framing, and
+  advert poisoning). No error set or signature changed.
 - **2026-08-13** — **BREAKING** `ResponseWriter.reset` returns `ResetError!void` (`error{HeadersSent}`)
   instead of `void`. Callers must `try` it or handle the error; `rw.reset();`
   stops compiling. It was made public earlier today guarded only by

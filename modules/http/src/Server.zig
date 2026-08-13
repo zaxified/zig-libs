@@ -1905,6 +1905,32 @@ pub const ResponseWriter = struct {
         const sep: usize = if (rw.trailer_decl_len == 0) 0 else 2;
         if (rw.trailer_decl_len + sep + name.len > rw.trailer_decl_buf.len)
             return error.TooManyTrailers;
+        // From here on the writer is mutated before the advert is
+        // re-registered, and that re-registration (`putHeader` below) can
+        // still fail on the copy-store budget. Rewind both counters on that
+        // path — `setHeader`'s `Trailer` branch already does exactly this
+        // (`:1730-1739`) and the two must not disagree about what a refused
+        // declaration costs.
+        //
+        // The cost of not rewinding is not counter hygiene. `declared_trailers`
+        // IS `setTrailer`'s allow-list, so a refused name stays emittable; the
+        // caller's retry short-circuits as "already declared" (`:1903`) and
+        // never re-advertises it; and the field then reaches the wire with no
+        // `Trailer` header naming it (RFC 9110 §6.6.2) — after a call that
+        // reported failure. `trailer_decl_len` is the second half: the refused
+        // name stays in the generated advert text, so it reappears in, and
+        // inflates the budget cost of, every later declaration.
+        //
+        // The header table needs no rewind: `putHeader` appends or replaces
+        // only after both copies succeed, so a failure leaves either no
+        // `Trailer` entry (first declaration) or the previous one (later
+        // declaration) — in both cases the entry these counters now describe.
+        const decl_mark = rw.trailer_decl_len;
+        const names_mark = rw.declared_trailers_len;
+        errdefer {
+            rw.trailer_decl_len = decl_mark;
+            rw.declared_trailers_len = names_mark;
+        }
         if (sep != 0) {
             @memcpy(rw.trailer_decl_buf[rw.trailer_decl_len..][0..2], ", ");
             rw.trailer_decl_len += sep;
@@ -3139,6 +3165,74 @@ test "declareTrailers: byte exhaustion is reported as such, not as TooManyTraile
     // hit — and `TrailerError` carries `HeaderBytesExhausted` to say so.
     try spendCopyStore(&rw, 5);
     try testing.expectError(error.HeaderBytesExhausted, rw.declareTrailers(&.{"X-T"}));
+}
+
+test "declareTrailers: a REJECTED declaration does not widen the setTrailer allow-list" {
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // `declareTrailer` advances `trailer_decl_len` and `declared_trailers_len`
+    // BEFORE it re-registers the `Trailer` advert through `putHeader`, and that
+    // call can fail on the copy-store budget. Without a rewind the counters
+    // keep the name the call reported it had refused, and the damage is not
+    // counter hygiene: `declaredTrailer` is what `setTrailer` uses as its
+    // allow-list, so a trailer the response never advertised becomes emittable.
+    // A trailer field sent without a `Trailer` advert is an RFC 9110 §6.6.2
+    // violation, produced by a call that told the caller it had failed.
+    try spendCopyStore(&rw, 5);
+    try testing.expectError(error.HeaderBytesExhausted, rw.declareTrailers(&.{"X-T"}));
+
+    try testing.expect(!rw.declaredTrailer("X-T"));
+    try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-T", "1"));
+
+    // …and the response is not silently committed to chunked framing by a
+    // declaration that failed: `end` picks chunked purely off
+    // `declared_trailers_len` (`:2097`), so a stuck counter changes the wire
+    // framing of a response with no trailers at all.
+    try rw.writeAll("body");
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, wire, "X-T") == null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Content-Length: 4\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Transfer-Encoding: chunked") == null);
+}
+
+test "declareTrailers: a REJECTED declaration does not poison the advert of a later one" {
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // The other counter, pinned separately. `trailer_decl_buf` holds the
+    // generated advert text and every `declareTrailer` re-registers the WHOLE
+    // string, so a name left in it by a failed call reappears in — and inflates
+    // the cost of — every later advert.
+    //
+    // Budget: 40 free. "X-A" costs `Trailer`(7) + `X-A`(3) = 10, leaving 30.
+    // The 24-char name then needs 7 + len("X-A, " ++ name) = 36 > 30 and is
+    // refused. "X-C" afterwards needs 7 + len("X-A, X-C") = 15 ≤ 30 and must
+    // succeed — with the refused name still in the buffer it would need
+    // 7 + len("X-A, X-0123456789012345678901, X-C") = 41 and fail too. The
+    // remaining 15 bytes cover both `setTrailer` pairs (4 each).
+    try spendCopyStore(&rw, 40);
+    try rw.declareTrailer("X-A");
+    try testing.expectError(
+        error.HeaderBytesExhausted,
+        rw.declareTrailer("X-0123456789012345678901"),
+    );
+    try rw.declareTrailer("X-C");
+
+    try rw.setTrailer("X-A", "1");
+    try rw.setTrailer("X-C", "3");
+    try rw.writeAll("body");
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, wire, "Trailer: X-A, X-C\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-01234567890123456") == null);
 }
 
 test "header_copy_bytes: pinned by value, in both directions" {

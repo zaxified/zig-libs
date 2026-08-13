@@ -1132,6 +1132,100 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
     try testing.expectEqual(@as(usize, 1), up.dialCount());
 }
 
+/// h2c backend for the `relayFailed` test below: answers with `count`
+/// response headers of `value_len` bytes each, both taken from the request
+/// path (`/fat/{count}/{value_len}`).
+///
+/// Unlike the h1 side, this is a REAL `http.Server` rather than a socket-level
+/// fake. `FatHeaderOrigin` had to be a fake because an `http.Server` cannot
+/// overrun the byte budget under test — but it can overrun the FIELD COUNT
+/// one, because the proxy's table is strictly larger than the backend's: the
+/// backend's `Date`/`Server`/`Content-Length` are managed fields that never
+/// occupy a slot in ITS table, yet arrive at the proxy as ordinary response
+/// headers that do occupy one — and the proxy adds its own `Via` on top. So a
+/// backend answering with a table it can just hold produces one the proxy
+/// cannot, and that is the door into the h2 arm of `relayFailed`.
+fn fatH2OriginHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var it = std.mem.tokenizeScalar(u8, req.path, '/');
+    _ = it.next(); // "fat"
+    const count = try std.fmt.parseInt(usize, it.next() orelse "0", 10);
+    const value_len = try std.fmt.parseInt(usize, it.next() orelse "0", 10);
+    var value: [256]u8 = undefined;
+    @memset(&value, 'v');
+    var name_buf: [16]u8 = undefined;
+    for (0..count) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "X-Fat-{d:0>3}", .{i});
+        try rw.setHeader(name, value[0..value_len]);
+    }
+    try rw.writeAll("ok");
+}
+
+test "integration: an h2 backend header set the proxy cannot relay answers 502, not a mutilated 200" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var backend = Server.init(io, gpa, .{ .handler = fatH2OriginHandler, .enable_h2c = true });
+    defer backend.deinit();
+    backend.bind() catch |err| {
+        std.debug.print("h2 fat backend bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{&backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const backend_port = backend.boundAddress().getPort();
+
+    var proxy_client = Client.init(io, gpa, .{});
+    defer proxy_client.deinit();
+    var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
+    defer up.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .h2_upstream = &up,
+        .backend = .{ .host = "127.0.0.1", .port = backend_port, .protocol = .h2c },
+    });
+    var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
+    defer proxy.deinit();
+    proxy.bind() catch return error.SkipZigTest;
+    const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer pt.join();
+    defer proxy.shutdown();
+    const proxy_port = proxy.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+
+    // 32 fields is exactly what the backend's own table holds; the proxy needs
+    // those 32 plus `Via` (plus the backend's now-ordinary `Date`/`Server`),
+    // so `max_response_headers` is overrun no matter how those two are handled.
+    const over_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/fat/32/4", .{proxy_port});
+    const over_count = Relayed.get(&client, over_url);
+    var url_buf2: [64]u8 = undefined;
+    const fits_url = try std.fmt.bufPrint(&url_buf2, "http://127.0.0.1:{d}/fat/8/100", .{proxy_port});
+    const fits = Relayed.get(&client, fits_url);
+
+    // The h1 arm of this claim is pinned by the `FatHeaderOrigin` test above.
+    // This is the second instance, and it is a separate function body
+    // (`forwardH2`) with its own relay loop and its own `relayFailed` calls
+    // (`:347`, `:350`, `:351`) — code-identical in shape is not evidence.
+    try testing.expectEqual(@as(u16, 502), over_count.status);
+    try testing.expect(std.mem.indexOf(u8, over_count.body(), "could not be relayed") != null);
+    // `reset` ran on the h2 path too: not even the fields that fit ride along.
+    try testing.expectEqual(@as(?usize, null), over_count.fat_first);
+    try testing.expectEqual(@as(?usize, null), over_count.fat_last);
+    try testing.expect(std.mem.indexOf(u8, over_count.via(), "zig-libs") != null);
+
+    // Control: a fat-but-relayable h2 answer goes through whole, so the 502 is
+    // the limit talking and not the h2 scaffold failing for its own reasons.
+    try testing.expectEqual(@as(u16, 200), fits.status);
+    try testing.expectEqual(@as(?usize, 100), fits.fat_first);
+    try testing.expectEqual(@as(?usize, 100), fits.fat_last);
+    try testing.expectEqualStrings("ok", fits.body());
+}
+
 test "integration: h2c backend unreachable → 502 Bad Gateway" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
