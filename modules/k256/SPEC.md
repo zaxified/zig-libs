@@ -143,26 +143,38 @@ Every statement above used to rest on disassembly read once by hand. Since
 2026-08-13 it rests on a committed program:
 [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
 `scripts/ctgrind.sh k256`, which marks the secret `MAKE_MEM_UNDEFINED`, forces a
-volatile reload, and drives it through four code paths.
+volatile reload, and drives it through five code paths.
 
 **Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64, ReleaseFast,
-2026-08-13; `in-file` = memcheck CONTEXTS whose stack names a k256 source file —
-see `scripts/ctgrind.sh`'s `PATTERN` map for the exact regex per target):
+re-measured 2026-08-13 after the `ecdsa` target and the driver's fail-closed
+counting rule were added). Three bucket columns, not one, and they sum to
+`total` on every row:
 
-| target | what is tainted | `-fvalgrind` | tainted | total | in-file | exit |
-|---|---|---|---|---|---|---|
-| `field` | element + `cMov` select bit | yes | **yes** | 6 | **0** | 99 |
-| `field` | — | yes | no | 0 | 0 | 0 *(control)* |
-| `field` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `mul` | scalar | yes | **yes** | 8 | **2** | 99 |
-| `mul` | — | yes | no | 0 | 0 | 0 *(control)* |
-| `mul` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `comb` | scalar | yes | **yes** | 7 | **1** | 99 |
-| `comb` | — | yes | no | 0 | 0 | 0 *(control)* |
-| `comb` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `sign` | 32-byte secret key | yes | **yes** | 13 | **11** | 99 |
-| `sign` | — | yes | no | 0 | 0 | 0 *(control)* |
-| `sign` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
+- `in-file` — contexts whose stack names a k256 source file (see
+  `scripts/ctgrind.sh`'s `PATTERN` map for the exact regex per target);
+- `witness` — contexts in the harness's own result formatting, which is not
+  constant-time on purpose: it is what proves the taint arrived;
+- `unattr` — contexts matching NEITHER. **Always a `--check` failure.** Before
+  this column existed the driver silently dropped them, and that is not
+  hypothetical: see the `Fe.cMov` row of the positive-control table below.
+
+| target | what is tainted | `-fvalgrind` | tainted | total | in-file | witness | unattr | exit |
+|---|---|---|---|---|---|---|---|---|
+| `field` | element + `cMov` select bit | yes | **yes** | 6 | **0** | 6 | 0 | 99 |
+| `field` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
+| `field` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
+| `mul` | scalar | yes | **yes** | 8 | **2** | 6 | 0 | 99 |
+| `mul` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
+| `mul` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
+| `comb` | scalar | yes | **yes** | 7 | **1** | 6 | 0 | 99 |
+| `comb` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
+| `comb` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
+| `sign` | 32-byte secret key | yes | **yes** | 13 | **11** | 2 | 0 | 99 |
+| `sign` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
+| `sign` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
+| `ecdsa` | 32-byte private key | yes | **yes** | 15 | **10** | 5 | 0 | 99 |
+| `ecdsa` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
+| `ecdsa` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
 
 **The field layer is zero.** `Fe.cMov` driven by a TAINTED select bit,
 `add`/`sub`/`normalize`, the amd64 `fast_core` `mul`/`sq`, and `invert`'s
@@ -184,8 +196,9 @@ is what makes `error.IdentityElement` reachable. **The per-bit `cMov` select and
 the per-window masked table gather report nothing**, which is the claim the
 `blackBox` barriers exist to hold.
 
-**The 11 `sign` contexts** are those two plus nine input/output validations, all
-on lines that must branch by contract:
+**The 11 `sign` contexts** are **two at `group.zig:346`** — one per
+`combMulBase` call, inlined from `sign.zig:62` and `sign.zig:80` — plus nine
+input/output validations, all on lines that must branch by contract:
 
 - `sign.zig:58` / `:76` — `dp.isZero()` / `k0.isZero()`, the BIP340-mandated
   "fail if d′ = 0 / k′ = 0" checks;
@@ -197,15 +210,50 @@ on lines that must branch by contract:
   std's own scalar field, which `scalar.zig` re-exports verbatim (see "Scope"
   below); k256 adds no branch there.
 
+(An earlier revision of this paragraph said the `sign` row's two group contexts
+were "those two" from the bullets above — i.e. `mul`'s `group.zig:277` and
+`comb`'s `group.zig:346`. Measured: `bip340Sign` never calls `Secp256k1.mul`,
+so `group.zig:277` appears in the `mul` row only, and `sign`'s pair is
+`group.zig:346` twice. The count was right; the attribution was not.)
+
+**The 10 `ecdsa` contexts** — `ecdsa_recover.sign`, RFC 6979 deterministic
+ECDSA, the module's other shipped secret path (in-repo consumer: `lninvoice`'s
+BOLT#11 signer). One is `group.zig:346` again; the rest are validations, with
+one exception that is called out because it is genuinely a branch on secret
+material:
+
+- `ecdsa_recover.zig:126` (via `scalar.zig:87`) / `:127` — canonicality and
+  `isZero` on the caller's private key;
+- `ecdsa_recover.zig:105` (via `scalar.zig:87`) — canonicality of the DRBG
+  output, inside `rfc6979Nonce`;
+- **`ecdsa_recover.zig:106` — `if (!cand.isZero())`, the RFC 6979 §3.2 retry
+  test, a branch on the SECRET nonce candidate.** Retry probability ≈ 2^-127
+  (the rejected set `[n, 2^256) ∪ {0}` has size < 2^129 out of 2^256); kept
+  because there is no rejection-free variant that still yields the RFC's exact
+  nonce, and libsecp256k1's `nonce_function_rfc6979` branches on the same
+  condition. Documented at the source, not silenced;
+- `group.zig:346` — `combMulBaseWithTable`'s `rejectIdentity` on `k·G`;
+- `ecdsa_recover.zig:133` (via `scalar.zig:87`) / `:134` — canonicality and
+  `isZero` on `r`;
+- `ecdsa_recover.zig:136` — `s.isZero()`;
+- `ecdsa_recover.zig:143` — `Ra.x.toInt() >= n`, the recid bit-1 case;
+- `ecdsa_recover.zig:152` — `isLowS(s)`, the BIP-62 canonicalisation.
+
+`recoverPubkey` is deliberately unmeasured: every one of its inputs is public,
+and it ends in the variable-time `mulDoubleBasePublic`.
+
 **The harnesses were shown to have teeth** (positive controls, each reverted and
 `cmp`-verified byte-identical afterwards):
 
 | injected defect | effect |
 |---|---|
-| `blackBox` removed from `Fe.cMov` | `mul` grows a new context at the inlined per-bit select, disassembling to exactly the `test $0x1,%cl; je` the `cMov` doc comment describes; `comb` grows one at the per-window sign select. **The doc comment is now measured, not asserted.** |
+| `blackBox` removed from `Fe.cMov` | `--check` **FAILS**. On the `field` row the leak appears as **1 unattributed** `Conditional jump` context (total 6 → 5, in-file still 0), stack `reloadVolatile (ctgrind_harness.zig:0)` ← `main` — memcheck attributes the inlined select to the harness file, so no k256 pattern matches it. `mul` 8/2 → 1/1, `comb` 7/1 → 8/2, `sign` 13/11 → 17/15. **Until 2026-08-13 the field row read 0/0 and the driver dropped that context silently**; that is why `unattr` exists (`scripts/ctgrind.sh`, "the SECOND trap"). |
+| `blackBox` removed from `normalize`'s three masks AND `Fe.sub`'s, `Fe.cMov`'s kept | `mul` 8/2 → **35/29**: 28 NEW contexts, all at `normalize (field.zig:83)` and `normalize (field.zig:91)` — the carry fold and the conditional subtract, branching on the secret. `normalize`'s barriers are load-bearing and this is the measurement that shows it. (Removing ALL barriers *including* `Fe.cMov`'s does NOT show this: the `cMov` leak resolves the taint first and these contexts never appear, which is the same "total can go down" effect noted below. A whole-file barrier kill is the WRONG control for a per-site question.) |
+| `blackBox` removed from `Fe.sub`'s mask ALONE | `mul` 8/2 → 7/1 and **no new context at `field.zig:229`/`:230`** — the count moved DOWN. `Fe.sub`'s barrier has **no demonstrated teeth** under this harness. It is kept as defence-in-depth against a compiler that would lower the masked add-back to a branch, not because one currently does; nothing here proves it is preventing anything. |
 | `q.cMov(added, bit)` → `if (bit == 1) q = added` | new context at `group.zig:275` |
 | masked comb gather → `g = tab[i][m-1]` | `comb` 1 → 4 contexts, including memcheck's "Use of uninitialised value of size 8" on the *address* — the b199192 secret-indexed-load signature |
 | branch on a byte of the secret scalar `d` in `bip340Sign` | `sign` 11 → 12, new context at the injected line |
+| `rfc6979Nonce` → constant `0x42`×32 | `zig build test-k256` **exit 1**, one failure: the BOLT#11 nonce anchor in `ecdsa_recover.zig`. Before that test existed (2026-08-13) the same mutation left all 34 tests green at **exit 0**, with the only red in the repository being the CONSUMER `lninvoice`. |
 
 Note for anyone re-running these: an injected leak can make the TOTAL go **down**
 (memcheck resolves the branch and the taint stops propagating downstream), so
@@ -248,6 +296,17 @@ bounded. The GLV decomposition and the endomorphism constants ARE k256's own.
   recovers a DIFFERENT (or non-recoverable) key; the low-S boundary. Moved in from
   `lninvoice` (the original, and for a while only, consumer) — general secp256k1
   machinery, not anything BOLT#11-specific.
+- **The deterministic nonce's own anchor** (`ecdsa_recover.zig`, added
+  2026-08-13): BOLT#11's first worked example — the specification's own private
+  key, its own signing-preimage SHA-256, and the `(r, s, recid)` carried by the
+  `lnbc1pvjluez…` string it prints — must be reproduced byte-exact, and the same
+  private key must produce the node ID the spec prints. Note what this fixes:
+  every OTHER test here is self-consistent under any nonce, so replacing
+  `rfc6979Nonce` with a constant left all 34 tests green (exit 0) and reddened
+  only the CONSUMER `lninvoice`. It now reddens this module. **This is a BOLT#11
+  artifact, not an RFC 6979 one** — RFC 6979 Appendix A.2 publishes vectors for
+  DSA and the NIST curves only (A.2.5, P-256, is what `p256` transcribes); it
+  has no secp256k1 section.
 - **Broken positive control** (`kat_test.zig`): a Solinas fold with `c = 2^32 +
   976` (off by one) disagrees with std on >400/500 random inputs — proving the
   reduction constant is load-bearing and the equality checks have teeth.
@@ -293,10 +352,16 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
   the scalar), and the conditional point negation is a masked field-negate.
 - **The portable field `normalize`/`sub` selects are `blackBox`-laundered** too:
   without the barrier LLVM turned the `mask = 0 − carry` field-carry select into a
-  data-dependent `test/jne` — a secret-dependent branch on the k·G path. After
-  laundering, the only branches left on the whole path are the public-trip-count
-  loop control and the standard final `rejectIdentity` endpoint check (reveals
-  only "result == O", always false for a valid nonce, as in std's `basePoint.mul`).
+  data-dependent `test/jne` — a secret-dependent branch on the secret-scalar path.
+  For `normalize` this is now measured, not just disassembled: removing its three
+  barriers (and leaving `Fe.cMov`'s in place) puts **28 new memcheck contexts** at
+  `field.zig:83`/`:91` in the `mul` row. For **`Fe.sub`'s single barrier there is
+  no such measurement**: removing it alone produces no new context anywhere, so it
+  stands as defence-in-depth, not as a barrier shown to be holding a branch back
+  today. After laundering, the only branches left on the whole path are the
+  public-trip-count loop control and the standard final `rejectIdentity` endpoint
+  check (reveals only "result == O", always false for a valid nonce, as in std's
+  `basePoint.mul`).
 
 ## Backlog (the Fable phase + beyond)
 

@@ -78,6 +78,30 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
 
     while (true) {
         HmacSha256.create(&v, &v, &k);
+        // CONSTANT-TIME NOTE (measured, `scripts/ctgrind.sh --stacks k256`,
+        // target `ecdsa`): these two lines are the only branches on this
+        // module's path that are neither an input/output validation nor the
+        // trailing `rejectIdentity`. `Scalar.fromBytes` branches on the DRBG
+        // output being canonical, and `cand.isZero()` on the candidate nonce
+        // itself — both SECRET. They are kept, deliberately:
+        //
+        //   * RFC 6979 §3.2 step h defines the retry as a loop, and there is
+        //     no rejection-free variant that still produces the RFC's exact
+        //     nonce — and the exact nonce is the whole point (it is what makes
+        //     BOLT#11's published invoice strings reproducible, and it is what
+        //     the anchor test at the bottom of this file pins byte-exact).
+        //   * The branch is taken with probability ≈ 2^-127: the DRBG output
+        //     is a uniform 256-bit string and the rejected set is
+        //     `[n, 2^256) ∪ {0}`, of size `2^256 − n + 1 < 2^129`. An attacker
+        //     who observes one retry has learned that one HMAC output landed
+        //     in a set they can already enumerate — and will not observe one.
+        //     libsecp256k1's `nonce_function_rfc6979` retries on exactly the
+        //     same condition for exactly this reason.
+        //
+        // So this is documented rather than silenced: it is a real
+        // secret-dependent branch, it is expected to appear in the harness's
+        // `ecdsa` row, and it is not exploitable. Anything ELSE appearing in
+        // that row is not covered by this note.
         if (Scalar.fromBytes(v, .big)) |cand| {
             if (!cand.isZero()) return cand;
         } else |_| {}
@@ -261,6 +285,77 @@ test "recoverPubkey: r=0 and s=0 are rejected (error.InvalidScalar), not silentl
     const zero = [_]u8{0} ** 32;
     try testing.expectError(error.InvalidScalar, recoverPubkey(hash, zero, sig.s, sig.recid));
     try testing.expectError(error.InvalidScalar, recoverPubkey(hash, sig.r, zero, sig.recid));
+}
+
+// ── the deterministic nonce's external anchor ────────────────────────────
+//
+// WHY THIS TEST EXISTS. Every other test in this file is self-consistent
+// under ANY nonce: the round-trip signs and then recovers with the same
+// code, so replacing `rfc6979Nonce` with a constant — catastrophic, since
+// two signatures under one key then reveal the private key by elementary
+// algebra — left all 34 of k256's tests green (measured 2026-08-13, exit 0).
+// The only thing in the repository that went red was a CONSUMER,
+// `lninvoice`'s BOLT#11 encode KAT. `ecdsa_recover` was moved here FROM
+// `lninvoice`, and its anchor stayed behind; this brings one back.
+//
+// PROVENANCE, precisely. These four constants are the BOLT#11
+// specification's own first worked example ("Please make a donation of any
+// amount…"), from `lightning/bolts` — the spec repository, not any
+// implementation's test suite (a test oracle under NOTICE policy §0, same
+// class as `kat_vectors.zig`'s `bip-0340/test-vectors.csv`):
+//
+//   * `spec_privkey` and `spec_node_id` are printed literally in BOLT#11's
+//     worked-example preamble.
+//   * `spec_hash` is the SHA256 of that example's signing preimage
+//     (`hrp || data-without-signature`), which the spec's breakdown prints.
+//   * `spec_r`/`spec_s`/`spec_recid` are the 65 signature bytes carried by
+//     the `lnbc1pvjluez…` string the spec prints — extracted by bech32
+//     decoding, which is mechanical, and which `lninvoice`'s own
+//     `bolt11.zig` pins in the other direction by rebuilding that literal
+//     published string byte-exact from these same numbers.
+//
+// This is NOT an RFC 6979 vector: RFC 6979's Appendix A.2 publishes
+// deterministic-ECDSA vectors for DSA and the NIST curves only (A.2.5 is
+// P-256, which `p256/src/kat_vectors.zig` transcribes) — it has no
+// secp256k1 section. BOLT#11 is the published secp256k1 RFC-6979 artifact
+// this repository actually has offline, and it pins the nonce just as
+// tightly: the signature is a function of it.
+fn specHex(comptime n: usize, comptime hex: []const u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+const spec_privkey = specHex(32, "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734");
+const spec_node_id = specHex(33, "03e7156ae33b0a208d0744199163177e909e80176e55d97a2f221ede0f934dd9ad");
+const spec_hash = specHex(32, "6daf4d488be41ce7cbb487cab1ef2975e5efcea879b20d421f0ef86b07cbb987");
+const spec_r = specHex(32, "8d3ce9e28357337f62da0162d9454df827f83cfe499aeb1c1db349d4d8112742");
+const spec_s = specHex(32, "5e434ca29929406c23bba1ae8ac6ca32880b38d4bf6ff874024cac34ba9625f1");
+const spec_recid: u2 = 1;
+
+test "RFC 6979 nonce anchor: BOLT#11's own worked example signs to its published r/s/recid" {
+    // (a) The spec's private key really is the spec's node ID — this ties the
+    //     tuple below to a published identity rather than to our own output.
+    const pub_point = try Secp256k1.combMulBase(spec_privkey, .big);
+    try testing.expectEqualSlices(u8, &spec_node_id, &pub_point.toCompressedSec1());
+
+    // (b) THE anchor. `sign` is deterministic, so this is not "a valid
+    //     signature" — it is the literal bytes the specification publishes,
+    //     and they exist only if `rfc6979Nonce` produces the RFC's exact
+    //     nonce for this (key, hash). Any change to the nonce derivation —
+    //     a constant nonce, a different DRBG personalisation, dropping the
+    //     `bits2octets` reduction — moves `r` completely.
+    const sig = try sign(spec_privkey, spec_hash);
+    try testing.expectEqualSlices(u8, &spec_r, &sig.r);
+    try testing.expectEqualSlices(u8, &spec_s, &sig.s);
+    try testing.expectEqual(spec_recid, sig.recid);
+
+    // (c) And the published signature recovers the published node ID, which
+    //     is what makes (b)'s `recid` meaningful. Note this half does NOT
+    //     depend on the nonce: it runs on the stored constants, so it stays
+    //     green under a nonce mutation. Only (b) has teeth there.
+    const recovered = try recoverPubkey(spec_hash, spec_r, spec_s, spec_recid);
+    try testing.expectEqualSlices(u8, &spec_node_id, &recovered.toCompressedSec1());
 }
 
 test "isLowS: half-order boundary" {

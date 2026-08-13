@@ -26,6 +26,41 @@
 # target) triple below is printed as three rows — the claim, an UNTAINTED
 # negative control, and a no-`-fvalgrind` trap — so a zero is only ever read
 # next to the two rows that give it meaning.
+#
+# ── the SECOND trap: a counting rule that drops what it cannot name ─────────
+# Until 2026-08-13 this script computed exactly one number per row, "contexts
+# whose stack matches PATTERN", and threw the rest away. That rule is
+# FAIL-OPEN: a secret-dependent branch that memcheck attributes to a file the
+# pattern does not list simply vanishes, and the row it belongs to reads the
+# same as if the branch did not exist. Measured on k256: deleting the
+# `blackBox` barrier from `Fe.cMov` adds exactly one `Conditional jump …
+# depends on uninitialised value(s)` context, memcheck attributes it to the
+# inlined-into-`main` frame `ctgrind_harness.zig:0`, `k256/field`'s pattern
+# does not match that, and the row stayed at 0 in-file while its total went
+# DOWN (6 → 5) — neither column nor the exit code distinguished the leak.
+#
+# So every context is now classified into exactly one of three buckets, and
+# the third one is fatal:
+#
+#   in-file    — the stack matches PATTERN: a branch in the code the claim is
+#                about. Pinned to an exact count in ctgrind-expected.tsv.
+#   witness    — the stack matches WITNESS and not PATTERN: the harness's own
+#                result formatting (`std.debug.print` is not constant-time by
+#                design, and a tainted byte reaching it is the propagation
+#                witness that makes an in-file zero mean "no branch found"
+#                rather than "the taint never arrived").
+#   unattr     — everything else. ALWAYS a `--check` failure, for every module,
+#                with no per-module opt-out: an unattributed context is either
+#                a leak the pattern cannot see or a pattern that has gone
+#                stale, and both need a human. The offending stacks are
+#                printed by `--check` so it is diagnosable without a re-run.
+#
+# `--check` additionally requires in-file + witness + unattr to account for
+# valgrind's OWN context count, so a block the classifier fails to recognise
+# as an error cannot silently reduce the total either. The one documented
+# exception is a log where memcheck hit its 1000-context reporting limit and
+# stopped printing (chachapoly's ReleaseSafe/Debug positive controls do);
+# there the accounting is skipped and the row says so.
 
 set -euo pipefail
 
@@ -49,6 +84,12 @@ EXPECTED_FILE="$SCRIPT_DIR/ctgrind-expected.tsv"
 # PATTERN  — regex selecting the frames whose file the claim is ABOUT. The
 #            `--pattern` flag overrides it, which is how any attribution in a
 #            SPEC.md can be re-checked rather than believed.
+# WITNESS  — the ONE allowlist, deliberately global and deliberately tiny:
+#            std's formatting path, which every harness reaches on purpose
+#            (see "the SECOND trap" above). It is not per-module, because a
+#            per-module allowlist is how a fail-open rule grows back one
+#            pattern at a time. Widen it only with a measured log showing the
+#            frame belongs to result formatting and to nothing else.
 ALL_MODULES=(chachapoly ct25519 decaf448 ecvrf ed448 k256 montint)
 
 declare -A TARGETS=(
@@ -57,7 +98,7 @@ declare -A TARGETS=(
     [decaf448]="scalarmul"
     [ecvrf]="prove"
     [ed448]="full ladder"
-    [k256]="field mul comb sign"
+    [k256]="field mul comb sign ecdsa"
     [montint]="small portable asmcore"
 )
 declare -A MODES=(
@@ -89,6 +130,7 @@ declare -A PATTERN=(
     [k256/mul]='group[.]zig|field[.]zig|fast_core[.]zig'
     [k256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
     [k256/sign]='sign[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/ecdsa]='ecdsa_recover[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     # montint: `montint.zig` is the portable CIOS + powMont, `asm_core.zig` the
     # gated amd64 core, `limbs.zig` the add/sub/select primitives underneath
     # both. All three are montint's own files; nothing in std shares a basename
@@ -97,6 +139,7 @@ declare -A PATTERN=(
     [montint/portable]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [montint/asmcore]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
 )
+WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 declare -A LABEL=(
     [chachapoly/poly1305]='poly1305.zig'
     [ct25519/ct25519]='ct25519/root.zig'
@@ -109,6 +152,7 @@ declare -A LABEL=(
     [k256/mul]='k256 group+field'
     [k256/comb]='k256 group+field'
     [k256/sign]='k256 src'
+    [k256/ecdsa]='k256 ecdsa src'
     [montint/small]='montint src'
     [montint/portable]='montint src'
     [montint/asmcore]='montint src'
@@ -124,7 +168,7 @@ while [[ $# -gt 0 ]]; do
         --stacks) SHOW_STACKS=1; shift ;;
         --check) DO_CHECK=1; shift ;;
         --pattern) PATTERN_OVERRIDE="${2:?--pattern needs a regex}"; shift 2 ;;
-        -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "ctgrind: unknown flag $1" >&2; exit 2 ;;
         *) MODULES+=("$1"); shift ;;
     esac
@@ -178,12 +222,65 @@ done
 # lines double-counts relative to what "N contexts" means.
 count_contexts_in() {
     local log="$1" pattern="$2"
-    sed -E 's/^==[0-9]+==[[:space:]]*$//' "$log" \
-        | awk -v RS='' -v pat="$pattern" 'BEGIN { c = 0 } $0 ~ pat { c++ } END { print c + 0 }'
+    classify_contexts "$log" "$pattern" count-in
+}
+
+# The fail-closed half of the same paragraph walk. An ERROR block is any
+# paragraph carrying at least one `at 0x…:` stack frame — a property of every
+# memcheck error report regardless of its kind, rather than a list of the
+# kinds we happen to know about, so a new memcheck error kind is classified
+# rather than ignored. Blocks are then bucketed in order: PATTERN wins,
+# WITNESS second, and whatever matches neither is UNATTRIBUTED.
+#
+# `mode` selects the output: count-in / count-witness / count-unattr /
+# show-unattr (the offending blocks themselves, for the failure message).
+classify_contexts() {
+    local log="$1" pattern="$2" mode="$3"
+    # Drop the harness's OWN stdout first: it is interleaved with memcheck's
+    # report, it lands inside an error paragraph, and a harness that happens
+    # to print a matching word would otherwise re-classify a real context.
+    # Only `==pid==` lines survive; the `==pid==`-only separators then become
+    # the paragraph breaks.
+    sed -E -e '/^==[0-9]+==/!d' -e 's/^==[0-9]+==[[:space:]]*$//' "$log" \
+        | awk -v RS='' -v pat="$pattern" -v wit="$WITNESS" -v mode="$mode" '
+            BEGIN { in_c = 0; wit_c = 0; un_c = 0 }
+            # not an error report (banner, HEAP SUMMARY, ERROR SUMMARY, …)
+            $0 !~ /==[0-9]+==[[:space:]]+at 0x[0-9A-Fa-f]+:/ { next }
+            {
+                if ($0 ~ pat)      { in_c++ }
+                else if ($0 ~ wit) { wit_c++ }
+                else {
+                    un_c++
+                    if (mode == "show-unattr") { printf "%s\n\n", $0 }
+                }
+            }
+            END {
+                if (mode == "count-in")      print in_c + 0
+                if (mode == "count-witness") print wit_c + 0
+                if (mode == "count-unattr")  print un_c + 0
+            }'
+}
+
+# memcheck stops printing new contexts once it hits its limit and says so.
+# Past that point the printed blocks no longer account for the reported
+# context total, so the accounting assertion is skipped for such a log —
+# explicitly, and only here.
+#
+# The marker is the "I'm not reporting any more" sentence, NOT "More than N
+# errors detected": memcheck prints the latter at 100 errors and keeps
+# reporting (in less detail), and matching it would switch the accounting
+# assertion off for every noisy row — measured on chachapoly's ReleaseSafe and
+# Debug positive controls, which say it at 214 and 285 contexts and whose
+# buckets in fact account for every one.
+log_hit_error_limit() {
+    grep -qF "I'm not reporting any more" "$1"
 }
 
 # Runs one (module, mode, valgrind-switch, target, taint) combination under
-# memcheck and prints "total_contexts|in_target_contexts|exit_code|logpath".
+# memcheck and prints
+# "total|in_target|witness|unattributed|accounted|exit_code|logpath",
+# where `accounted` is 1 when in+witness+unattr equals valgrind's own context
+# total (0 = the classifier lost a block, or memcheck hit its report limit).
 run_one() {
     local module="$1" mode="$2" vg="$3" target="$4" taint="$5" file_pattern="$6"
     local bin="$WORKDIR/$mode-$vg/ctgrind/ctgrind-$module"
@@ -196,17 +293,26 @@ run_one() {
     local total
     total=$(grep -oE 'errors from [0-9]+ contexts' "$log" | grep -oE '[0-9]+' | head -1 || true)
     total="${total:-0}"
-    local in_target
-    in_target=$(count_contexts_in "$log" "$file_pattern")
-    echo "${total}|${in_target}|${rc}|${log}"
+    local in_target witness unattr accounted
+    in_target=$(classify_contexts "$log" "$file_pattern" count-in)
+    witness=$(classify_contexts "$log" "$file_pattern" count-witness)
+    unattr=$(classify_contexts "$log" "$file_pattern" count-unattr)
+    if log_hit_error_limit "$log"; then
+        accounted=2 # not assertable: memcheck stopped printing
+    elif [[ $((in_target + witness + unattr)) -eq "$total" ]]; then
+        accounted=1
+    else
+        accounted=0
+    fi
+    echo "${total}|${in_target}|${witness}|${unattr}|${accounted}|${rc}|${log}"
 }
 
 ACTUAL="$WORKDIR/actual.tsv"
 : >"$ACTUAL"
 
-printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %5s %s\n' \
-    "module" "build" "-fvalgrind" "tainted" "target" "in" "total" "in-file" "exit" "note"
-printf '%s\n' "--------------------------------------------------------------------------------------------------------"
+printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %8s %7s %5s %s\n' \
+    "module" "build" "-fvalgrind" "tainted" "target" "in" "total" "in-file" "witness" "unattr" "exit" "note"
+printf '%s\n' "------------------------------------------------------------------------------------------------------------------------"
 
 for m in "${MODULES[@]}"; do
     for mode in ${MODES[$m]}; do
@@ -217,11 +323,17 @@ for m in "${MODULES[@]}"; do
             [[ -n "$PATTERN_OVERRIDE" ]] && lbl="(--pattern)"
             for combo in "true yes " "true no control" "false yes trap"; do
                 read -r vg taint note <<<"$combo"
-                IFS='|' read -r total in_file rc log < <(run_one "$m" "$mode" "$vg" "$target" "$taint" "$pat")
-                printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %5s %s\n' \
-                    "$m" "$mode" "$vg" "$taint" "$target" "$lbl" "$total" "$in_file" "$rc" "$note"
-                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                    "$m" "$mode" "$vg" "$taint" "$target" "$total" "$in_file" "$rc" >>"$ACTUAL"
+                IFS='|' read -r total in_file witness unattr accounted rc log \
+                    < <(run_one "$m" "$mode" "$vg" "$target" "$taint" "$pat")
+                rownote="$note"
+                [[ "$accounted" == "0" ]] && rownote="$rownote UNACCOUNTED"
+                [[ "$accounted" == "2" ]] && rownote="$rownote error-limit"
+                printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %8s %7s %5s %s\n' \
+                    "$m" "$mode" "$vg" "$taint" "$target" "$lbl" \
+                    "$total" "$in_file" "$witness" "$unattr" "$rc" "$rownote"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$m" "$mode" "$vg" "$taint" "$target" \
+                    "$total" "$in_file" "$witness" "$unattr" "$accounted" "$rc" "$log" "$pat" >>"$ACTUAL"
                 if [[ $SHOW_STACKS -eq 1 ]]; then
                     echo "----- $m $mode -fvalgrind=$vg taint=$taint target=$target -----"
                     cat "$log"
@@ -249,6 +361,11 @@ done
 #     module documents which validations it keeps)
 #   * the claim row's total is at least `total_min` (>0 wherever a propagation
 #     witness is required, so a zero cannot mean "the taint never arrived")
+#   * EVERY row — claim, control and trap alike — reports 0 UNATTRIBUTED
+#     contexts, and its buckets account for valgrind's own context total.
+#     Unconditional and not expressible in ctgrind-expected.tsv on purpose:
+#     this is the rule that makes the in-file numbers mean anything, so it
+#     must not be something a module can record its way out of.
 echo
 fail=0
 while IFS=$'\t' read -r em emode etarget etotal_min ein_file; do
@@ -260,7 +377,7 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file; do
         # Not measured in this invocation (a module subset was requested).
         continue
     fi
-    IFS=$'\t' read -r _ _ _ _ _ total in_file _ <<<"$line"
+    IFS=$'\t' read -r _ _ _ _ _ total in_file _ _ _ _ _ _ <<<"$line"
     # `N` pins an exact count; `>=N` / `<=N` pin only the direction. Exact is
     # for the numbers a SPEC.md states as a fact about the module (ed448's
     # three `Fe.invert` validations, ecvrf's three try-and-increment
@@ -285,7 +402,7 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file; do
     fi
 done <"$EXPECTED_FILE"
 
-while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _; do
+while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog apat; do
     if [[ "$ataint" == "no" && "$atotal" != "0" ]]; then
         echo "FAIL $am/$amode/$atarget: untainted control reported $atotal contexts, expected 0" >&2
         fail=1
@@ -294,10 +411,20 @@ while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _; do
         echo "FAIL $am/$amode/$atarget: no-fvalgrind trap reported $atotal contexts, expected 0" >&2
         fail=1
     fi
+    # ── fail-closed: nothing is allowed to go uncounted ─────────────────────
+    if [[ "$aun" != "0" ]]; then
+        echo "FAIL $am/$amode/$atarget (tainted=$ataint, -fvalgrind=$avg): $aun UNATTRIBUTED context(s) — matched neither the module pattern '$apat' nor the formatting witness. A context nobody can name is a leak until proven otherwise; do NOT close this by widening the pattern until you know what it is:" >&2
+        classify_contexts "$alog" "$apat" show-unattr >&2
+        fail=1
+    fi
+    if [[ "$aacc" == "0" ]]; then
+        echo "FAIL $am/$amode/$atarget (tainted=$ataint, -fvalgrind=$avg): the classifier accounted for fewer contexts than valgrind reported ($atotal) — the paragraph walk in classify_contexts has gone stale against this memcheck's output format. Fix the walk, not the numbers." >&2
+        fail=1
+    fi
 done <"$ACTUAL"
 
 if [[ $fail -eq 0 ]]; then
-    echo "ctgrind --check: OK (controls 0, traps 0, in-file counts as recorded in scripts/ctgrind-expected.tsv)"
+    echo "ctgrind --check: OK (controls 0, traps 0, unattributed 0, every context accounted for, in-file counts as recorded in scripts/ctgrind-expected.tsv)"
 else
     echo "ctgrind --check: FAILED — see above. Re-measure, then update scripts/ctgrind-expected.tsv AND the module's SPEC.md table together." >&2
 fi

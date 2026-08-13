@@ -39,28 +39,57 @@
 //! * `sign` — `sign.bip340Sign` end to end from a tainted 32-byte secret key:
 //!   the SHIPPED secret path, two `combMulBase` calls plus the scalar
 //!   arithmetic and the two affine conversions around them.
+//! * `ecdsa` — `ecdsa_recover.sign`, RFC 6979 deterministic ECDSA, from a
+//!   tainted 32-byte private key over a PUBLIC message hash. The module's
+//!   OTHER shipped secret path (`lninvoice`'s BOLT#11 signer is its in-repo
+//!   consumer), and the one the harness did not cover when it was added on
+//!   2026-08-13 — an omission that was neither measured nor listed as
+//!   deliberate, which is the same thing as an oversight from the outside.
 //!
 //! ## What the counts mean
 //!
-//! `mul`, `comb` and `sign` are all EXPECTED to report a small non-zero
-//! in-file count, and the point of the measurement is *which* lines. Every one
-//! of them is a `rejectIdentity()` on a value derived from the secret scalar:
+//! `mul`, `comb`, `sign` and `ecdsa` are all EXPECTED to report a small
+//! non-zero in-file count, and the point of the measurement is *which* lines.
+//! The measured attributions (`--stacks`, 2026-08-13; this paragraph used to
+//! say `group.zig:75` and "every one of them is a `rejectIdentity()`", and
+//! both halves were wrong — `rejectIdentity` is INLINED, so its own line
+//! never appears, and the majority of `sign`'s contexts are not it):
 //!
-//!   * `group.zig:75` — `rejectIdentity`'s own `if (is_identity != 0)`, reached
-//!     from `mul`'s trailing `try q.rejectIdentity()` and from
-//!     `combMulBaseWithTable`'s. The branch is on "did the whole scalar
-//!     multiplication land on the neutral element", which for `mul` means
-//!     `s ≡ 0 (mod n)` for a fixed public base and for `combMulBase` means
-//!     exactly `s ≡ 0 (mod n)`. It is the same one-bit validation
-//!     `std.crypto.ecc.Secp256k1.mul` performs (k256's API is a drop-in for
-//!     it), and it is what makes `error.IdentityElement` a reachable outcome
-//!     at all. It is NOT a per-bit or per-window branch: it happens once,
-//!     after the ladder, and the count does not scale with the scalar.
+//!   * `group.zig:277` — `mul`'s trailing `try q.rejectIdentity()`, 2 contexts
+//!     (LLVM splits the `z == 0` test from the affine-identity test).
+//!   * `group.zig:346` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`,
+//!     1 context per call: once in `comb`, twice in `sign`.
 //!
-//! `sign` additionally reaches std's scalar-field canonicality check on the
-//! caller-supplied secret key (`Scalar.fromBytes(secret_key)`, which
-//! `scalar.zig` re-exports from std verbatim); `--pattern` is how that
-//! attribution gets re-checked instead of believed.
+//! Either way the branch is on "did the whole scalar multiplication land on
+//! the neutral element", i.e. `s ≡ 0 (mod n)`. It is the same one-bit
+//! validation `std.crypto.ecc.Secp256k1.mul` performs (k256's API is a
+//! drop-in for it), and it is what makes `error.IdentityElement` a reachable
+//! outcome at all. It is NOT a per-bit or per-window branch: it happens once,
+//! after the ladder, and the count does not scale with the scalar.
+//!
+//! `sign`'s remaining 9 of 11 are input/output validations, not
+//! `rejectIdentity`: `sign.zig:58`/`:76` (the BIP340-mandated `d' = 0` /
+//! `k' = 0` rejections), `sign.zig:64`/`:83` (`Pa.y.isOdd()` / `Ra.y.isOdd()`,
+//! branches on the PUBLIC key and PUBLIC nonce point — memcheck has no notion
+//! of "public function of a secret"), and five at std's scalar-field
+//! canonicality check (`crypto/pcurves/common.zig:75`, reached through
+//! `scalar.zig`, which re-exports std's field verbatim). `--pattern` is how
+//! that attribution gets re-checked instead of believed.
+//!
+//! `ecdsa`'s 10 are the same shape: `ecdsa_recover.zig:126`/`:127` on the
+//! caller's private key, `:105` on the DRBG output, `:106` the RFC 6979 §3.2
+//! retry test (a real branch on the SECRET nonce candidate — probability
+//! ≈2^-127, documented at the source in `ecdsa_recover.zig` rather than
+//! silenced), `group.zig:346`, `:133`/`:134` on `r`, `:136` on `s`, `:143` on
+//! `Ra.x >= n`, and `:152` on low-S. One of `ecdsa`'s five non-in-file
+//! contexts is memcheck's `Syscall param write(buf)` on the tainted output
+//! itself; it reaches `Io.Writer`, so the driver files it under the
+//! formatting witness rather than dropping it.
+//!
+//! Every count above is a measurement, and the driver now REFUSES to leave
+//! any context out of one of its three buckets: see `scripts/ctgrind.sh`
+//! § "the SECOND trap" for why an unattributable context fails the check
+//! instead of vanishing.
 //!
 //! `field`'s zero is the strong claim, and it is only readable next to the
 //! others: `mul`/`comb`/`sign` being non-zero proves the taint propagates
@@ -81,6 +110,14 @@
 //!   `if (v >= field_order)` are validations that branch on their input by
 //!   contract (they return an error set). They are exercised from `sign` on
 //!   PUBLIC values only.
+//! * `ecdsa_recover.recoverPubkey` — every input is public by construction (a
+//!   signature, a message hash and a recovery id), and it ends in
+//!   `mulDoubleBasePublic`, which is on the variable-time list above.
+//!
+//! This list is the reason a missing target is a finding: anything a reader
+//! can name as a shipped secret path and cannot find either in TARGETS or
+//! here is an unanswered question. `ecdsa` was exactly that until it was
+//! added.
 //!
 //! ## The traps
 //!
@@ -89,7 +126,11 @@
 //!    regardless. The driver builds both ways and prints it as a row.
 //! 2. `reloadVolatile` forces a real load from freshly-tainted memory so the
 //!    optimizer cannot feed the code under test a defined register copy.
-//!    Defensive, not demonstrated.
+//!    Defensive, not demonstrated. Note it is also where memcheck lands the
+//!    `field` target's leak when `Fe.cMov`'s barrier is removed — the select
+//!    inlines all the way up here and takes the harness's own file:line with
+//!    it, which is exactly the attribution the driver's `unattr` bucket
+//!    exists to refuse to ignore.
 //! 3. ReleaseFast only. `Debug`/`ReleaseSafe` add integer-overflow checks
 //!    inside the `u256`/`u512` limb arithmetic of `field.zig`, which are
 //!    branches on tainted values and bury the signal — the same reason every
@@ -109,6 +150,7 @@ const root = @import("root.zig");
 const Fe = root.Fe;
 const Secp256k1 = root.Secp256k1;
 const sign = root.sign;
+const ecdsa_recover = root.ecdsa_recover;
 
 /// Deterministic secret material. Computed at runtime (not folded at comptime)
 /// so tainting it marks memory the code under test actually reads.
@@ -139,7 +181,7 @@ fn secretScalar(comptime domain: []const u8) [32]u8 {
     return s;
 }
 
-const Target = enum { field, mul, comb, sign };
+const Target = enum { field, mul, comb, sign, ecdsa };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -147,6 +189,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "mul")) return .mul;
     if (std.mem.eql(u8, s, "comb")) return .comb;
     if (std.mem.eql(u8, s, "sign")) return .sign;
+    if (std.mem.eql(u8, s, "ecdsa")) return .ecdsa;
     return error.UnknownTarget;
 }
 
@@ -246,6 +289,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             const sig = try sign.bip340Sign(secret_key, msg, aux_rand);
             std.debug.print("sig={x}\n", .{sig});
+        },
+        .ecdsa => {
+            // RFC 6979 deterministic ECDSA. The private key is the secret;
+            // the message hash is PUBLIC (the verifier has it), so tainting
+            // it would manufacture contexts that say nothing about the
+            // scheme. The nonce is derived from both inside `rfc6979Nonce`,
+            // so it inherits the taint on its own.
+            var sk = secretScalar("ctgrind-k256-harness-ecdsa-private-key-v1");
+            taintIf(tainted, &sk);
+            const privkey = reloadVolatile(32, &sk);
+
+            const hash32 = secretBytes(32, "ctgrind-k256-harness-ecdsa-message-hash-v1");
+
+            const sig = try ecdsa_recover.sign(privkey, hash32);
+            std.debug.print("r={x} s={x} recid={d}\n", .{ sig.r, sig.s, sig.recid });
         },
     }
 }

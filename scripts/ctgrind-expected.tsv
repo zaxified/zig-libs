@@ -52,12 +52,17 @@ decaf448	ReleaseFast	scalarmul	1	0
 ecvrf	ReleaseFast	prove	1	3
 ed448	ReleaseFast	full	1	3
 ed448	ReleaseFast	ladder	1	0
-# k256 — the field layer is clean; every group/sign context is a `rejectIdentity`
-# or an input validation, itemised line by line in `modules/k256/SPEC.md`.
+# k256 — the field layer is clean; every group/sign/ecdsa context is a
+# `rejectIdentity`, an input/output validation, or (in `ecdsa` alone) the RFC
+# 6979 §3.2 nonce-retry rejection, itemised line by line in
+# `modules/k256/SPEC.md` and documented at the source in `ecdsa_recover.zig`.
+# `ecdsa` was added 2026-08-13: `ecdsa_recover.sign` is a shipped secret path
+# with an in-repo consumer (`lninvoice`) and had no target at all.
 k256	ReleaseFast	field	1	0
 k256	ReleaseFast	mul	1	2
 k256	ReleaseFast	comb	1	1
 k256	ReleaseFast	sign	1	11
+k256	ReleaseFast	ecdsa	1	10
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
