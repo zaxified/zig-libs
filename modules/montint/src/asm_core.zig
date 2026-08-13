@@ -474,8 +474,14 @@ pub inline fn mulRow(tp: [*]u64, vp: [*]const u64, rem: usize, grp: usize, x: u6
 // Constant-time conditional subtract of `m` from the (n+1)-word value
 // (`z` low n words, `top` the 0/1 carry word). Subtracts m iff the full value
 // ≥ m, via a masked limb-select — no branch, no secret-dependent access.
-// Mirrors `condSubTop` in `montint.zig` (two passes instead of a stack diff
-// buffer, because `n` is runtime here).
+// Same two-pass shape as `condSubTop` in `montint.zig`, which adopted it from
+// here. One difference remains, and it is deliberate: `condSubTop` additionally
+// launders `smask` through a `blackBox` barrier, because at its comptime-known
+// `L` the loops fully unroll and LLVM recovers `smask ∈ {0, ~0}` and hoists
+// pass 2 behind a branch on the secret borrow — measured. `n` is a runtime
+// slice length here, this function measures 0 contexts under
+// `scripts/ctgrind.sh montint` (target `asmcore`), and that measurement is the
+// only reason it goes unlaundered. If it ever reads non-zero, add the barrier.
 fn condSub(z: []u64, top: u64, m: []const u64) void {
     // Pass 1: borrow of z - m (value untouched).
     var borrow: u1 = 0;
@@ -495,4 +501,59 @@ fn condSub(z: []u64, top: u64, m: []const u64) void {
         zi.* = s2[0];
         b2 = s[1] | s2[1];
     }
+}
+
+// ── condSub borrow-chain coverage ───────────────────────────────────────────
+
+test "condSub: the borrow must survive a limb where z[i] == m[i]" {
+    // Companion to `montint.zig`'s "condSubTop: the borrow must survive a limb
+    // where v[i] == m[i]". Both implementations of the conditional subtract
+    // carry the same easy-to-drop, hard-to-notice term: the outgoing borrow is
+    // `s[1] | s2[1]`, and `s2[1]` is live ONLY when `z[i] == m[i]` (so `s[1]`
+    // and `s[0]` are both 0) with a borrow already coming in — probability
+    // ~2⁻⁶⁴ per limb under random sampling. Verified by mutation: `b2 = s[1]`
+    // alone left `zig build test-montint` fully green, including the 5000-case
+    // asm-vs-portable differential and the squaring differentials, because
+    // nothing they generate ever lands on an equal limb mid-borrow.
+    //
+    // Built at `n = 32` — 2048-bit, the smallest width the dispatch ever routes
+    // here (`asm_min_limbs`) — against a FULL-WIDTH modulus. Full width also
+    // discharges the `value < 2m` precondition for free: `m ≥ 2^2047` makes
+    // `2m ≥ B^32`, so any `z < B^32` qualifies. Expectations are hand-computed,
+    // not oracle-compared.
+    const n = 32;
+    const ones: u64 = 0xffff_ffff_ffff_ffff;
+    const top_bit: u64 = @as(u64, 1) << 63;
+
+    // (a) top == 1, with the equal limbs being the modulus's interior ZEROS.
+    //     m = 2^2047 + 7; value = B^32 + 3, which is ≥ m and < 2m = B^32 + 14.
+    //     Limbs 1..30 are 0 on both sides with a borrow in from limb 0, so the
+    //     `s2[1]` term has to fire 30 times in a row. Result 2^2047 − 4.
+    var m_a = [_]u64{0} ** n;
+    m_a[0] = 7;
+    m_a[n - 1] = top_bit;
+    var z_a = [_]u64{0} ** n;
+    z_a[0] = 3;
+    condSub(&z_a, 1, &m_a);
+    var want_a = [_]u64{ones} ** n;
+    want_a[0] = ones - 3;
+    want_a[n - 1] = top_bit - 1;
+    try std.testing.expectEqualSlices(u64, &want_a, &z_a);
+
+    // (b) top == 0, and the equal limb is a NONZERO one, so (a) cannot be
+    //     dismissed as an artifact of zero limbs. m and z agree on limbs 3..31;
+    //     z − m = B² − 2, which needs the borrow to cross the equal limb 1.
+    var m_b = [_]u64{0xa5a5_a5a5_a5a5_a5a5} ** n;
+    m_b[0] = 5;
+    m_b[1] = 7;
+    m_b[2] = 9;
+    m_b[n - 1] = top_bit;
+    var z_b = m_b;
+    z_b[0] = 3;
+    z_b[2] = 10; // z > m, so the subtract fires
+    condSub(&z_b, 0, &m_b);
+    var want_b = [_]u64{0} ** n;
+    want_b[0] = ones - 1;
+    want_b[1] = ones;
+    try std.testing.expectEqualSlices(u64, &want_b, &z_b);
 }

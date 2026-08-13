@@ -27,12 +27,14 @@
 #            std's `rejectIdentity` context that ct25519's negative control
 #            needs only to EXIST.
 #
-# A NON-ZERO in_file is NOT automatically "fine". Two of the rows below record
-# a MEASURED DEFECT rather than an accounted-for validation, and they are marked
-# DEFECT in the comment above them. Recording a defect here is deliberate — an
-# unrecorded one is invisible, and a row that goes red when it is FIXED is how
-# the fix gets noticed — but nobody should read a green `--check` as "every
-# constant-time claim in this repo holds". It means "the measurements still say
+# A NON-ZERO in_file is NOT automatically "fine". Every non-zero below is an
+# accounted-for validation, itemised line by line in the owning module's
+# SPEC.md — but the convention when one is NOT is to record it here anyway,
+# marked DEFECT in the comment above the row. Recording a defect is deliberate:
+# an unrecorded one is invisible, and a row that goes red when it is FIXED is
+# how the fix gets noticed. That is exactly how the two montint rows below went
+# from 7 and 5 to 0. Nobody should read a green `--check` as "every
+# constant-time claim in this repo holds": it means "the measurements still say
 # what they said when they were taken".
 #
 # Measured 2026-08-11 (chachapoly…ed448) and 2026-08-13 (k256, montint),
@@ -56,12 +58,15 @@ k256	ReleaseFast	field	1	0
 k256	ReleaseFast	mul	1	2
 k256	ReleaseFast	comb	1	1
 k256	ReleaseFast	sign	1	11
-# montint — `asmcore` (L=32, the amd64 core) is the clean one. `small` (L=4) and
-# `portable` (L=16) are **DEFECT** rows: ReleaseFast lowers `condSubTop`'s masked
-# select, and `sub`'s masked add-back, to a `test`/`jne` on the secret-derived
-# borrow — the Montgomery final-subtraction leak, inside `powMont`. See
-# `modules/montint/SPEC.md` § "Constant-time contract". A fix must drive both to
-# 0 and this file must be updated in the same change.
-montint	ReleaseFast	small	1	7
-montint	ReleaseFast	portable	1	5
+# montint — all three dispatch sizes clean, no residual. `small` (L=4) and
+# `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
+# ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
+# to a `test`/`jne` on the secret-derived borrow — the Montgomery
+# final-subtraction leak, inside `powMont`. Fixed 2026-08-13 by laundering both
+# masks through montint's `blackBox` barrier; re-measured 0 and 0. Note the
+# structural rewrite alone did NOT fix it (7 → 7, 5 → 5) — see
+# `modules/montint/SPEC.md` § "Constant-time contract" for that table. Any
+# non-zero appearing here again is a regression, not a new validation.
+montint	ReleaseFast	small	1	0
+montint	ReleaseFast	portable	1	0
 montint	ReleaseFast	asmcore	1	0

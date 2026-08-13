@@ -69,7 +69,8 @@ one breaking change in its `Unreleased` section.
   sign/verify.
 - [`mls`](modules/mls/CHANGELOG.md) — external Commits (RFC 9420
   §12.4.3.2).
-- [`montint`](modules/montint/CHANGELOG.md) — asm/Montgomery core
+- [`montint`](modules/montint/CHANGELOG.md) — timing fix (Montgomery
+  final-subtraction leak on the portable path); asm/Montgomery core
   (performance campaign).
 - [`opcua`](modules/opcua/CHANGELOG.md) — security-audit memory-safety
   fix.

@@ -172,6 +172,31 @@ U+FFFD itself while reading, so jq cannot be used as the oracle for this). A dep
 feeds Combined or logfmt into a JSON-producing analyser inherits the problem at that boundary;
 using this module's JSON Lines output avoids it at the source.
 
+**Why this is left alone rather than worked around, and what each alternative would cost.**
+Two other options were weighed and rejected:
+
+- *Sanitize `%r`/Referer/User-Agent for Combined and logfmt too, the way JSON Lines already
+  does.* This would make goaccess's own report valid UTF-8, but at the cost of the primary log
+  file itself: Combined and logfmt are what an incident responder reads first, and the exact
+  byte an attacker sent — silently replaced with U+FFFD — can be the detail that identifies the
+  attack (a payload's non-ASCII shape, a specific malformed encoding a scanner is known to send).
+  A log rewritten for a downstream tool's convenience is no longer a faithful record of what was
+  received. JSON Lines pays that price deliberately, for a documented reason (RFC 8259 makes an
+  unparseable record equivalent to a dropped one — see above); Combined/logfmt have no such
+  requirement forcing the trade, so paying it there would be sanitizing without a corresponding
+  gain other than pleasing one specific downstream tool's parser.
+- *Emit a fourth, goaccess-safe view alongside Combined/logfmt.* Rejected as redundant: the
+  sanitized view this would produce already exists under a different name — JSON Lines — so a
+  dedicated view would mean testing and maintaining a near-duplicate output format for one
+  external consumer's limitation, when pointing that consumer at the existing sanitized format
+  solves it with no new surface.
+
+The decision, restated: Combined and logfmt stay byte-exact, unconditionally, including for
+bytes that break a downstream tool's own output. A deployment whose analyser needs a guaranteed-
+UTF-8 artifact gets one by pointing it at this module's JSON Lines output instead — that option
+already exists and was built for a materially identical reason (RFC 8259 conformance), not
+retrofitted for this finding.
+
 ### Not shipped: recovering the original bytes
 
 Keeping the raw value recoverable is cheap and was deliberately **not** made the default: an

@@ -240,12 +240,21 @@ The `--pattern` flag exists so that an attribution written in a `SPEC.md`
 ladder") can be re-checked rather than believed.
 
 **A green `--check` does not mean every constant-time claim holds.** It means
-every recorded number still reads the way it read when it was taken — and one
-module (`montint`, at `L < asm_min_limbs`) has a recorded number that is a
-measured DEFECT, not an accounted-for validation. See the DEFECT comment in
-`ctgrind-expected.tsv` and `modules/montint/SPEC.md`. Recording it is deliberate:
-the alternative is a defect nothing tracks, and a row that goes red when the leak
-is *fixed* is how the fix gets noticed.
+every recorded number still reads the way it read when it was taken. When a
+measurement finds a real DEFECT, the convention is to record the defective count
+here anyway, marked DEFECT in the comment above the row: the alternative is a
+defect nothing tracks, and a row that goes red when the leak is *fixed* is how
+the fix gets noticed. That is exactly how it went for `montint` at
+`L < asm_min_limbs` — recorded at 7 and 5 on 2026-08-13, fixed the same day,
+re-measured 0 and 0 (`modules/montint/SPEC.md`). No DEFECT rows are outstanding
+today.
+
+The montint fix is also the sharpest warning this file can give about reading
+generated code instead of measuring it. The obvious structural repair — rewriting
+the masked select into the sibling asm core's provably-clean two-pass form —
+moved the counts by **exactly zero**, in both targets. Only an explicit
+optimization barrier on the mask worked. A fix that looks right in the source is
+not a fix until `--check` says so.
 
 One trap when adding a harness or a positive control: an injected leak can make
 the reported TOTAL go **down**, because memcheck resolves the branch and the

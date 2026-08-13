@@ -212,9 +212,13 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         pub fn sub(self: *const Self, a: *const Elem, b: *const Elem) Elem {
             var out = a.*;
             const borrow = limbs.subInto(&out, b);
-            // if it underflowed, add m back (CT).
+            // If it underflowed, add m back — unconditionally adding `m & mask`.
+            // `mask` is laundered through `blackBox`: without the barrier LLVM
+            // recovers `mask ∈ {0, ~0}`, sees that adding an all-zero operand is
+            // a no-op, and hoists the whole add-back behind a branch on the
+            // secret-derived borrow (measured — see `condSubTop`).
             var addm = self.m;
-            const mask: u64 = 0 -% @as(u64, borrow);
+            const mask: u64 = blackBox(0 -% @as(u64, borrow));
             for (&addm) |*w| w.* &= mask;
             _ = limbs.addInto(&out, &addm);
             return out;
@@ -467,15 +471,34 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         // ── internal CT helpers ─────────────────────────────────────────────
 
         // Optimization barrier: launder a value through an (empty) inline-asm
-        // so LLVM loses all range/equality knowledge about it. Used on the
-        // per-entry select mask in the `powMont` window gather: without it the
-        // optimizer recognises the "select the one entry where idx == digit"
-        // masked scan and lowers it to a secret-indexed jump table
-        // (`jmp *tbl(,digit,8)`), a real timing/BTB + memory-access-pattern
-        // leak of the secret exponent. Laundering the mask forces the branchless
-        // linear scan to survive — all 2^w entries are touched unconditionally
-        // (verified by disassembly). No-op at runtime (empty asm template).
+        // so LLVM loses all range/equality knowledge about it. No-op at runtime
+        // (empty asm template). Applied to EVERY secret-derived select mask in
+        // this file — all three known leaks here have the same root cause, LLVM
+        // recovering `mask ∈ {0, ~0}` from a 0/1 flag and then rewriting the
+        // masked code as a branch on that flag:
+        //
+        //  * the per-entry mask in `powMont`'s window gather — without it the
+        //    optimizer recognises the "select the one entry where idx == digit"
+        //    masked scan and lowers it to a secret-indexed jump table
+        //    (`jmp *tbl(,digit,8)`), a real timing/BTB + memory-access-pattern
+        //    leak of the secret exponent. Laundering the mask forces the
+        //    branchless linear scan to survive — all 2^w entries are touched
+        //    unconditionally (verified by disassembly).
+        //  * `condSubTop`'s subtract mask, and `sub`'s add-back mask — see
+        //    those two functions. Both were MEASURED leaking before the barrier
+        //    (`scripts/ctgrind.sh montint`) and measured clean after.
+        //
+        // Note what this barrier is NOT interchangeable with: writing the code
+        // in unconditional masked form is not by itself sufficient. `sub`
+        // already added `m & mask` unconditionally and still compiled to a
+        // branch, and rewriting `condSubTop` into the same two-pass shape as
+        // `asm_core.condSub` moved the measured context count by exactly zero.
+        // Only the barrier did.
         inline fn blackBox(x: u64) u64 {
+            // Inline asm cannot run at comptime, and a comptime evaluation has
+            // no timing to protect: `fromElem`/`computeConstants` reach
+            // `condSubTop` and must stay comptime-evaluable.
+            if (@inComptime()) return x;
             return asm volatile (""
                 : [ret] "=r" (-> u64),
                 : [x] "0" (x),
@@ -484,21 +507,44 @@ pub fn Modint(comptime max_bits: comptime_int) type {
 
         // Constant-time conditional subtract of `m` from the (L+1)-word value
         // (`v` low L words, `top` the carry word 0/1). Subtracts m iff the full
-        // value ≥ m. `v < 2m` on entry, so `top ≤ 1` and the result is `< m`.
+        // value ≥ m. `top·B^L + v < 2m` on entry, so `top ≤ 1` and the result
+        // is `< m`. The reduction step of every `montMulCios`, `montSqrCios`,
+        // `add` and `doubleMod`.
+        //
+        // Two passes over the limbs — one to learn the borrow, one to subtract
+        // `m & smask` unconditionally — mirroring `asm_core.condSub`, and with
+        // `smask` laundered through `blackBox`. The barrier is the part that is
+        // load-bearing for constant time: this used to compute a `diff` scratch
+        // buffer and masked-select between `v` and `diff`, and ReleaseFast
+        // lowered that select to `cmp/setb/testb/jne` skipping the store block
+        // — the classic Montgomery final-subtraction leak, revealing per
+        // multiply whether the pre-reduction value was `≥ m`. Rewriting it into
+        // the two-pass form below did NOT fix that (measured: unchanged);
+        // `blackBox` on `smask` did (measured: 7→0 and 5→0 in-file contexts).
+        // Keep both anyway — the two-pass form drops the second `Elem` off the
+        // stack and is the shape the sibling asm core already uses.
         fn condSubTop(v: *Elem, top: u64, m: *const Elem) void {
-            var diff: Elem = undefined;
+            // Pass 1: borrow of v − m, value untouched.
             var borrow: u1 = 0;
-            for (&diff, v, m) |*d, vi, mi| {
+            for (v, m) |vi, mi| {
                 const s = @subWithOverflow(vi, mi);
                 const s2 = @subWithOverflow(s[0], borrow);
-                d.* = s2[0];
                 borrow = s[1] | s2[1];
             }
             // full value ≥ m  ⟺  no underflow when subtracting borrow from top.
-            const under = @subWithOverflow(top, borrow)[1]; // 1 ⇒ value < m
-            const keep_orig: u64 = 0 -% @as(u64, under);
-            for (v, &diff) |*vi, di| {
-                vi.* = (vi.* & keep_orig) | (di & ~keep_orig);
+            const under = @subWithOverflow(top, @as(u64, borrow))[1]; // 1 ⇒ v < m
+            // all-ones ⇒ subtract m. Laundered: without the barrier LLVM
+            // recovers `smask ∈ {0, ~0}`, concludes that subtracting an
+            // all-zero operand is a no-op, and hoists pass 2 behind a branch on
+            // the secret-derived borrow.
+            const smask: u64 = blackBox(@as(u64, under) -% 1);
+            // Pass 2: v −= m & smask, unconditionally.
+            var b2: u1 = 0;
+            for (v, m) |*vi, mi| {
+                const s = @subWithOverflow(vi.*, mi & smask);
+                const s2 = @subWithOverflow(s[0], b2);
+                vi.* = s2[0];
+                b2 = s[1] | s2[1];
             }
         }
 
@@ -582,6 +628,196 @@ test "negInvMod2_64: m·(-m⁻¹) ≡ -1 mod 2^64" {
         const ni = negInvMod2_64(m);
         try std.testing.expectEqual(@as(u64, 0), m *% ni +% 1);
     }
+}
+
+// ── condSubTop boundary coverage ────────────────────────────────────────────
+//
+// `condSubTop` is the reduction step of EVERY `montMulCios`, `montSqrCios`,
+// `add` and `doubleMod`, and its borrow chain is wrong only for inputs near the
+// modulus — the region random KATs almost never sample. `kat_test.zig`'s "CT
+// smoke" boundary test uses `m = 1_000_003` inside a 128-bit element, where
+// `a + b < 2m ≪ B^L` always: the carry word `top` is 0 in every one of its
+// cases, so the `top = 1` half of the chain had NO test at all. These two do.
+
+/// Independent reference reduction of the `(L+1)`-word value `top·B^L + v`
+/// modulo `m`. Deliberately built from a DIFFERENT code path than
+/// `condSubTop`'s own borrow chain — a wide compare plus a wide subtract out of
+/// `limbs.zig` — so agreement is evidence rather than a tautology.
+fn refCondSub(comptime M: type, v: *M.Elem, top: u64, m: *const M.Elem) void {
+    var wide: [M.L + 1]u64 = undefined;
+    @memcpy(wide[0..M.L], v);
+    wide[M.L] = top;
+    var mwide = std.mem.zeroes([M.L + 1]u64);
+    @memcpy(mwide[0..M.L], m);
+    if (limbs.cmp(&wide, &mwide) != .lt) _ = limbs.subWideInto(&wide, &mwide);
+    @memcpy(v, wide[0..M.L]);
+}
+
+test "condSubTop: the boundary cases, hand-checked against a full-width modulus" {
+    const M = Modint(128);
+    // m = 2^127 + 1 — odd, and FULL width, which is what makes `top == 1`
+    // reachable at all (a modulus with a clear top bit can never produce a
+    // carry word, which is exactly how the existing smoke test missed it).
+    var mv = std.mem.zeroes(M.Elem);
+    mv[0] = 1;
+    mv[1] = @as(u64, 1) << 63;
+    const m = try M.fromElem(mv);
+
+    const zero = std.mem.zeroes(M.Elem);
+    const ones = [_]u64{ 0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff };
+    var mm1 = mv; // m − 1 = 2^127
+    mm1[0] = 0;
+    const half = [_]u64{ 0, @as(u64, 1) << 63 }; // 2^127 == m − 1
+    try std.testing.expectEqualSlices(u64, &half, &mm1);
+
+    // (1) v == m exactly, top == 0 → must subtract, giving 0.
+    var c1 = mv;
+    M.condSubTop(&c1, 0, &m.m);
+    try std.testing.expectEqualSlices(u64, &zero, &c1);
+
+    // (2) v == m − 1, top == 0 → must NOT subtract.
+    var c2 = mm1;
+    M.condSubTop(&c2, 0, &m.m);
+    try std.testing.expectEqualSlices(u64, &mm1, &c2);
+
+    // (3) top == 1 with v == 0 (all-zero limbs, v < m): value is B^L = 2^128,
+    //     which IS ≥ m, so the subtract must fire even though the low words
+    //     compare below the modulus. Result 2^128 − m = 2^127 − 1.
+    var c3 = zero;
+    M.condSubTop(&c3, 1, &m.m);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 0xffff_ffff_ffff_ffff, 0x7fff_ffff_ffff_ffff }, &c3);
+
+    // (4) the top of the contract's range: value == 2m − 1 == B^L + 1.
+    //     Result must be m − 1 = 2^127.
+    var c4 = zero;
+    c4[0] = 1;
+    M.condSubTop(&c4, 1, &m.m);
+    try std.testing.expectEqualSlices(u64, &mm1, &c4);
+
+    // (5) all-ones limbs, top == 0: value B^L − 1 < 2m, result B^L − 1 − m.
+    var c5 = ones;
+    M.condSubTop(&c5, 0, &m.m);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 0xffff_ffff_ffff_fffe, 0x7fff_ffff_ffff_ffff }, &c5);
+
+    // (6) all-zero limbs, top == 0: nothing to do.
+    var c6 = zero;
+    M.condSubTop(&c6, 0, &m.m);
+    try std.testing.expectEqualSlices(u64, &zero, &c6);
+
+    // End-to-end through the PUBLIC `add`, which is where a real caller meets
+    // case (3): (m−1) + (m−1) = 2m − 2 = 2^128 carries out of the top limb.
+    const sum = m.add(&mm1, &mm1);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 0xffff_ffff_ffff_ffff, 0x7fff_ffff_ffff_ffff }, &sum);
+    // and case (1): (m−1) + 1 == m → 0.
+    var one = zero;
+    one[0] = 1;
+    try std.testing.expectEqualSlices(u64, &zero, &m.add(&mm1, &one));
+}
+
+test "condSubTop: the borrow must survive a limb where v[i] == m[i]" {
+    // The subtract chain does `s = v[i] − m[i]`, `s2 = s[0] − borrow`, and the
+    // outgoing borrow is `s[1] | s2[1]`. The `s2[1]` term is live ONLY when
+    // `v[i] == m[i]` (so `s[1] == 0` and `s[0] == 0`) with a borrow already
+    // coming in — probability ~2⁻⁶⁴ per limb under random sampling, which is
+    // why dropping that term survives the KATs, both differentials, the
+    // BrokenMont control and the random sweep above. Verified by mutation:
+    // `b2 = s[1] | s2[1]` → `b2 = s[1]` left the whole suite GREEN before these
+    // two cases existed. Both are hand-computed, not oracle-compared.
+    const M = Modint(256);
+    const ones = 0xffff_ffff_ffff_ffff;
+
+    // (a) top == 0. m = 2^255 + 9B² + 7B + 5, v = m + B² − 2 (so `v ≥ m`, the
+    //     subtract fires). Limb 1 of v equals limb 1 of m with a borrow in from
+    //     limb 0, so limb 2 is only correct if that borrow propagates.
+    //     v − m = B² − 2.
+    const mv_a = [_]u64{ 5, 7, 9, @as(u64, 1) << 63 };
+    const m_a = try M.fromElem(mv_a);
+    var v_a = [_]u64{ 3, 7, 10, @as(u64, 1) << 63 };
+    M.condSubTop(&v_a, 0, &m_a.m);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ ones - 1, ones, 0, 0 }, &v_a);
+
+    // (b) top == 1, and the equal limbs are the modulus's interior ZERO limbs
+    //     (`fromElem` documents zero limbs as legal). m = 2^255 + 7, value
+    //     B⁴ + 3, which is ≥ m and < 2m = B⁴ + 14. Result 2^255 − 4.
+    const mv_b = [_]u64{ 7, 0, 0, @as(u64, 1) << 63 };
+    const m_b = try M.fromElem(mv_b);
+    var v_b = [_]u64{ 3, 0, 0, 0 };
+    M.condSubTop(&v_b, 1, &m_b.m);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ ones - 3, ones, ones, ones >> 1 }, &v_b);
+}
+
+test "condSubTop == an independent wide reduction over the whole (top, v) range" {
+    const M = Modint(256);
+    var prng = std.Random.DefaultPrng.init(0xC0_11D5_0B);
+    const rand = prng.random();
+
+    var subtracted: usize = 0; // samples where the reduction had to fire
+    var kept: usize = 0; // samples already below the modulus
+    var mods: usize = 0;
+    while (mods < 32) : (mods += 1) {
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1; // odd
+        mv[M.L - 1] |= @as(u64, 1) << 63; // full width, so `top == 1` is reachable
+        const m = try M.fromElem(mv);
+
+        // 2m as an (L+1)-word value — the exclusive upper bound of the contract.
+        var m2 = std.mem.zeroes([M.L + 1]u64);
+        @memcpy(m2[0..M.L], &m.m);
+        var sh: u64 = 0;
+        for (&m2) |*w| {
+            const nw = (w.* << 1) | sh;
+            sh = w.* >> 63;
+            w.* = nw;
+        }
+
+        var trials: usize = 0;
+        while (trials < 400) : (trials += 1) {
+            var v: M.Elem = undefined;
+            for (&v) |*w| w.* = rand.int(u64);
+            const top: u64 = rand.int(u1);
+            // Bias hard towards the boundary, which is the only place an
+            // off-by-one in the borrow chain shows up: half the samples are
+            // m + delta or m − delta for a tiny delta.
+            if (trials % 2 == 0) {
+                v = m.m;
+                const delta = rand.intRangeAtMost(u64, 0, 3);
+                if (rand.boolean()) {
+                    _ = limbs.addInto(&v, &blk: {
+                        var d = std.mem.zeroes(M.Elem);
+                        d[0] = delta;
+                        break :blk d;
+                    });
+                } else {
+                    _ = limbs.subInto(&v, &blk: {
+                        var d = std.mem.zeroes(M.Elem);
+                        d[0] = delta;
+                        break :blk d;
+                    });
+                }
+            }
+
+            // Enforce the documented precondition `top·B^L + v < 2m`.
+            var wide = std.mem.zeroes([M.L + 1]u64);
+            @memcpy(wide[0..M.L], &v);
+            wide[M.L] = top;
+            if (limbs.cmp(&wide, &m2) != .lt) continue;
+
+            var got = v;
+            M.condSubTop(&got, top, &m.m);
+            var want = v;
+            refCondSub(M, &want, top, &m.m);
+            try std.testing.expectEqualSlices(u64, &want, &got);
+            // The result must also satisfy the postcondition `< m`.
+            try std.testing.expect(limbs.cmp(&got, &m.m) == .lt);
+
+            if (std.mem.eql(u64, &want, &v) and top == 0) kept += 1 else subtracted += 1;
+        }
+    }
+    // Teeth: both arms of the reduction must actually have been taken, or the
+    // agreement above would be vacuous.
+    try std.testing.expect(subtracted > 100);
+    try std.testing.expect(kept > 100);
 }
 
 test "public byte loaders instantiate and round-trip (regression: Modint.Error alias)" {
