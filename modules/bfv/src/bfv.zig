@@ -86,6 +86,28 @@
 //! the module `platform = .any` — the same shape `bbs`/`ibe`/`tlock` use.
 //! Failing closed via `std.Io.randomSecure` was an open, tracked decision
 //! (B7); it is now closed (`CONVENTIONS.md` §2.2), and this module takes it.
+//!
+//! ### Test-only guards and where they may sit
+//!
+//! Each `…ForTest` twin opens with `comptime if (!builtin.is_test)
+//! @compileError(…)`, so a non-test build cannot reach a seeded-PRNG entry
+//! point by typing a longer identifier. That guard may sit ONLY on the public
+//! twin, never on a function the production wrapper calls, and the reason is
+//! mechanical: **Zig analyses a callee through its caller.** A `keyGen` whose
+//! body called `keyGenForTest` would drag the guard's `@compileError` in with
+//! it and fail to compile in exactly the non-test build it exists to serve —
+//! and the guard's own message ("Production code must use the `std.Io` entry
+//! point of the same name") would be pointing at a function it had just
+//! destroyed. That is not hypothetical; it is what this module shipped until
+//! 2026-08-13, invisible to CI because `builtin.is_test` is true for the whole
+//! of `zig build test-bfv`, so the deny branch never compiled.
+//!
+//! Hence the shape below: a PRIVATE `…Inner(random: std.Random)` holds the
+//! body, the `std.Io` wrapper calls `…Inner` directly, and the public
+//! `…ForTest` twin is a guard plus a call to the same `…Inner`. The production
+//! path therefore never passes through the guard, while the guard still bites
+//! on any non-test caller of the public twin. `…Inner` is private, so it is
+//! not itself a way in.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -680,7 +702,19 @@ pub fn Bfv(comptime P: params.Params) type {
         /// twin the KATs use.
         pub fn keyGen(self: *const Self, io: std.Io) KeyPair {
             var src: entropy.SecureSource = .{ .io = io };
-            return self.keyGenForTest(src.interface());
+            return self.keyGenInner(src.interface());
+        }
+
+        /// The key generation itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn keyGenInner(self: *const Self, random: std.Random) KeyPair {
+            const s = self.sampleTernary(random);
+            const a = self.sampleUniform(random);
+            const e = self.sampleTernary(random);
+            var p0 = a.mul(&s, &self.engines); // a·s
+            p0.addAssign(&e, &self.primes); // a·s + e
+            p0.negate(&self.primes); // −(a·s + e)
+            return .{ .sk = .{ .s = s }, .pk = .{ .p0 = p0, .p1 = a } };
         }
 
         /// TEST/KAT ONLY — `keyGen` with caller-chosen draws, so the KATs can
@@ -696,13 +730,7 @@ pub fn Bfv(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            const s = self.sampleTernary(random);
-            const a = self.sampleUniform(random);
-            const e = self.sampleTernary(random);
-            var p0 = a.mul(&s, &self.engines); // a·s
-            p0.addAssign(&e, &self.primes); // a·s + e
-            p0.negate(&self.primes); // −(a·s + e)
-            return .{ .sk = .{ .s = s }, .pk = .{ .p0 = p0, .p1 = a } };
+            return self.keyGenInner(random);
         }
 
         /// Encrypt `pt ∈ R_t`: `c0 = Δ·m + p0·u + e0`, `c1 = p1·u + e1`,
@@ -717,7 +745,22 @@ pub fn Bfv(comptime P: params.Params) type {
         /// `std.Random` a seeded PRNG could satisfy.
         pub fn encrypt(self: *const Self, pk: *const PublicKey, pt: *const Plaintext, io: std.Io) Ciphertext {
             var src: entropy.SecureSource = .{ .io = io };
-            return self.encryptForTest(pk, pt, src.interface());
+            return self.encryptInner(pk, pt, src.interface());
+        }
+
+        /// The encryption itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn encryptInner(self: *const Self, pk: *const PublicKey, pt: *const Plaintext, random: std.Random) Ciphertext {
+            const u = self.sampleTernary(random);
+            const e0 = self.sampleTernary(random);
+            const e1 = self.sampleTernary(random);
+            var c0 = self.scaledPlaintext(pt); // Δ·m
+            var p0u = pk.p0.mul(&u, &self.engines);
+            c0.addAssign(&p0u, &self.primes); // + p0·u
+            c0.addAssign(&e0, &self.primes); // + e0
+            var c1 = pk.p1.mul(&u, &self.engines);
+            c1.addAssign(&e1, &self.primes); // p1·u + e1
+            return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
         }
 
         /// TEST/KAT ONLY — `encrypt` with caller-chosen draws (deterministic
@@ -731,16 +774,7 @@ pub fn Bfv(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            const u = self.sampleTernary(random);
-            const e0 = self.sampleTernary(random);
-            const e1 = self.sampleTernary(random);
-            var c0 = self.scaledPlaintext(pt); // Δ·m
-            var p0u = pk.p0.mul(&u, &self.engines);
-            c0.addAssign(&p0u, &self.primes); // + p0·u
-            c0.addAssign(&e0, &self.primes); // + e0
-            var c1 = pk.p1.mul(&u, &self.engines);
-            c1.addAssign(&e1, &self.primes); // p1·u + e1
-            return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
+            return self.encryptInner(pk, pt, random);
         }
 
         /// Decrypt: `⌊t/q·(Σ_i c_i·s^i)⌉ mod t`, coefficient-wise. The phase
@@ -1016,19 +1050,13 @@ pub fn Bfv(comptime P: params.Params) type {
         /// party it was meant to hide it from.
         pub fn genRelinKey(self: *const Self, sk: *const SecretKey, io: std.Io) RelinKey {
             var src: entropy.SecureSource = .{ .io = io };
-            return self.genRelinKeyForTest(sk, src.interface());
+            return self.genRelinKeyInner(sk, src.interface());
         }
 
-        /// TEST/KAT ONLY — `genRelinKey` with caller-chosen draws.
-        pub fn genRelinKeyForTest(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
-            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
-            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
-            // becomes key material, so production must not be able to reach this
-            // by typing a longer identifier. Tests compile with `is_test`, so the
-            // KATs that need a scripted draw sequence are unaffected.
-            comptime if (!builtin.is_test) @compileError(
-                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
-            );
+        /// The relin-key generation itself. PRIVATE, and private is
+        /// load-bearing: see the `Test-only guards and where they may sit`
+        /// note above.
+        fn genRelinKeyInner(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
             const s2 = sk.s.mul(&sk.s, &self.engines);
             var rlk: RelinKey = undefined;
             var w_pow: QU = 1; // w^i < q for all rows used (see relin_digits)
@@ -1045,6 +1073,19 @@ pub fn Bfv(comptime P: params.Params) type {
                 w_pow = @intCast((@as(WPow, w_pow) << relin_base_log2) % @as(WPow, q_product));
             }
             return rlk;
+        }
+
+        /// TEST/KAT ONLY — `genRelinKey` with caller-chosen draws.
+        pub fn genRelinKeyForTest(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
+            // TEST-ONLY, ENFORCED. The `ForTest` name warns; this makes it true.
+            // Taking a caller-supplied `std.Random` is exactly how a seeded PRNG
+            // becomes key material, so production must not be able to reach this
+            // by typing a longer identifier. Tests compile with `is_test`, so the
+            // KATs that need a scripted draw sequence are unaffected.
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
+            return self.genRelinKeyInner(sk, random);
         }
 
         /// Homomorphic multiply → a 3-component ciphertext (degree 2 in `s`).

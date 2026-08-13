@@ -56,6 +56,31 @@
 //! Failing closed via `std.Io.randomSecure` was an open, tracked decision
 //! (B7); it is now closed (`CONVENTIONS.md` §2.2), and this module takes it.
 //!
+//! ### Test-only guards and where they may sit
+//!
+//! Each `…ForTest` twin opens with `comptime if (!builtin.is_test)
+//! @compileError(…)`, so a non-test build cannot reach a seeded-PRNG entry
+//! point by typing a longer identifier. That guard may sit ONLY on the public
+//! twin, never on a function the production wrapper calls, and the reason is
+//! mechanical: **Zig analyses a callee through its caller.** An `lweKeyGen`
+//! whose body called `lweKeyGenForTest` would drag the guard's `@compileError`
+//! in with it and fail to compile in exactly the non-test build it exists to
+//! serve — and the guard's own message ("Production code must use the
+//! `std.Io` entry point of the same name") would be pointing at a function it
+//! had just destroyed. That is not hypothetical; it is what this module
+//! shipped until 2026-08-13, invisible to CI because `builtin.is_test` is true
+//! for the whole of `zig build test-tfhe`, so the deny branch never compiled.
+//!
+//! Hence the shape below: a PRIVATE `…Inner(…, random: std.Random)` holds the
+//! body, the `std.Io` wrapper calls `…Inner` directly, and the public
+//! `…ForTest` twin is a guard plus a call to the same `…Inner`. Several of
+//! these compose (`ggswEncryptScalar` → `ggswEncryptPoly` → `glweEncryptZero`
+//! → `glweEncrypt`; `bootstrapKeyGen` and `keySwitchKeyGen` on top), so the
+//! rule extends one step further: **an `…Inner` calls `…Inner`, never a
+//! `…ForTest`** — otherwise the guard re-enters the production path one level
+//! down and nothing has been fixed. The `…Inner` functions are private, so
+//! they are not themselves a way in.
+//!
 //! ## Constant-time posture (key path)
 //!
 //! `sampleBit`, and therefore `lweKeyGen`/`glweKeyGen`, are **fixed-cost and
@@ -289,7 +314,15 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// the way it is.
         pub fn lweKeyGen(comptime dim: usize, io: std.Io) LweKey(dim) {
             var src: entropy.SecureSource = .{ .io = io };
-            return lweKeyGenForTest(dim, src.interface());
+            return lweKeyGenInner(dim, src.interface());
+        }
+
+        /// The key generation itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn lweKeyGenInner(comptime dim: usize, random: std.Random) LweKey(dim) {
+            var key: LweKey(dim) = undefined;
+            for (&key.s) |*x| x.* = sampleBit(random);
+            return key;
         }
 
         /// TEST/KAT ONLY — `lweKeyGen` with caller-chosen draws, so the
@@ -305,9 +338,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            var key: LweKey(dim) = undefined;
-            for (&key.s) |*x| x.* = sampleBit(random);
-            return key;
+            return lweKeyGenInner(dim, random);
         }
 
         /// Generate the binary GLWE secret key (one polynomial) from `io`'s
@@ -317,7 +348,15 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// seeded stream here compromises the whole bootstrapping pipeline.
         pub fn glweKeyGen(io: std.Io) GlweKey {
             var src: entropy.SecureSource = .{ .io = io };
-            return glweKeyGenForTest(src.interface());
+            return glweKeyGenInner(src.interface());
+        }
+
+        /// The key generation itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn glweKeyGenInner(random: std.Random) GlweKey {
+            var s = Poly.zero();
+            for (&s.c) |*x| x.* = sampleBit(random);
+            return .{ .s = s };
         }
 
         /// TEST/KAT ONLY — see `lweKeyGenForTest`.
@@ -330,9 +369,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            var s = Poly.zero();
-            for (&s.c) |*x| x.* = sampleBit(random);
-            return .{ .s = s };
+            return glweKeyGenInner(random);
         }
 
         /// The LWE key `s_ext ∈ {0,1}^N` obtained by reading the GLWE key's
@@ -357,7 +394,20 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// instance, it is no LWE instance.
         pub fn lweEncrypt(comptime dim: usize, key: *const LweKey(dim), mu: T, io: std.Io) Lwe(dim) {
             var src: entropy.SecureSource = .{ .io = io };
-            return lweEncryptForTest(dim, key, mu, src.interface());
+            return lweEncryptInner(dim, key, mu, src.interface());
+        }
+
+        /// The encryption itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn lweEncryptInner(comptime dim: usize, key: *const LweKey(dim), mu: T, random: std.Random) Lwe(dim) {
+            var ct: Lwe(dim) = undefined;
+            var b: T = mu +% sampleError(random);
+            for (&ct.a, key.s) |*ai, si| {
+                ai.* = random.int(T);
+                b +%= ai.* *% si;
+            }
+            ct.b = b;
+            return ct;
         }
 
         /// TEST/KAT ONLY — `lweEncrypt` with caller-chosen draws.
@@ -370,14 +420,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            var ct: Lwe(dim) = undefined;
-            var b: T = mu +% sampleError(random);
-            for (&ct.a, key.s) |*ai, si| {
-                ai.* = random.int(T);
-                b +%= ai.* *% si;
-            }
-            ct.b = b;
-            return ct;
+            return lweEncryptInner(dim, key, mu, random);
         }
 
         /// Phase `b − ⟨a,s⟩ = μ + e`.
@@ -405,7 +448,18 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// coefficients of the GLWE key.
         pub fn glweEncrypt(key: *const GlweKey, msg: *const Poly, io: std.Io) Glwe {
             var src: entropy.SecureSource = .{ .io = io };
-            return glweEncryptForTest(key, msg, src.interface());
+            return glweEncryptInner(key, msg, src.interface());
+        }
+
+        /// The encryption itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn glweEncryptInner(key: *const GlweKey, msg: *const Poly, random: std.Random) Glwe {
+            const a = sampleUniformPoly(random);
+            var b = a.mul(&key.s);
+            b.addAssign(msg);
+            const e = sampleErrorPoly(random);
+            b.addAssign(&e);
+            return .{ .a = a, .b = b };
         }
 
         /// TEST/KAT ONLY — `glweEncrypt` with caller-chosen draws.
@@ -418,12 +472,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            const a = sampleUniformPoly(random);
-            var b = a.mul(&key.s);
-            b.addAssign(msg);
-            const e = sampleErrorPoly(random);
-            b.addAssign(&e);
-            return .{ .a = a, .b = b };
+            return glweEncryptInner(key, msg, random);
         }
 
         /// Fresh encryption of the zero polynomial from `io`'s CSPRNG — the
@@ -433,7 +482,17 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// term to it publishes that term in the clear.
         pub fn glweEncryptZero(key: *const GlweKey, io: std.Io) Glwe {
             var src: entropy.SecureSource = .{ .io = io };
-            return glweEncryptZeroForTest(key, src.interface());
+            return glweEncryptZeroInner(key, src.interface());
+        }
+
+        /// The encryption itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above. Note
+        /// it calls `glweEncryptInner`, NOT `glweEncryptForTest` — an `Inner`
+        /// that routed through a guarded twin would re-create the very defect
+        /// the split exists to remove, one level down.
+        fn glweEncryptZeroInner(key: *const GlweKey, random: std.Random) Glwe {
+            const z = Poly.zero();
+            return glweEncryptInner(key, &z, random);
         }
 
         /// TEST/KAT ONLY — `glweEncryptZero` with caller-chosen draws.
@@ -446,8 +505,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            const z = Poly.zero();
-            return glweEncryptForTest(key, &z, random);
+            return glweEncryptZeroInner(key, random);
         }
 
         /// Phase `b − a·s = μ + e`.
@@ -486,7 +544,26 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// therefore do not merely leak a plaintext, they hand over the key.
         pub fn ggswEncryptPoly(key: *const GlweKey, msg: *const Poly, io: std.Io) Ggsw {
             var src: entropy.SecureSource = .{ .io = io };
-            return ggswEncryptPolyForTest(key, msg, src.interface());
+            return ggswEncryptPolyInner(key, msg, src.interface());
+        }
+
+        /// The encryption itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn ggswEncryptPolyInner(key: *const GlweKey, msg: *const Poly, random: std.Random) Ggsw {
+            var g: Ggsw = undefined;
+            for (0..ell) |i| {
+                const w = torus.gadgetWeight(bg_bits, i);
+                const scaled = msg.scalarMul(w);
+                // block A: gadget term in mask component `a`.
+                var ra = glweEncryptZeroInner(key, random);
+                ra.a.addAssign(&scaled);
+                g.rows[i] = ra;
+                // block B: gadget term in body component `b`.
+                var rb = glweEncryptZeroInner(key, random);
+                rb.b.addAssign(&scaled);
+                g.rows[ell + i] = rb;
+            }
+            return g;
         }
 
         /// TEST/KAT ONLY — `ggswEncryptPoly` with caller-chosen draws.
@@ -499,20 +576,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            var g: Ggsw = undefined;
-            for (0..ell) |i| {
-                const w = torus.gadgetWeight(bg_bits, i);
-                const scaled = msg.scalarMul(w);
-                // block A: gadget term in mask component `a`.
-                var ra = glweEncryptZeroForTest(key, random);
-                ra.a.addAssign(&scaled);
-                g.rows[i] = ra;
-                // block B: gadget term in body component `b`.
-                var rb = glweEncryptZeroForTest(key, random);
-                rb.b.addAssign(&scaled);
-                g.rows[ell + i] = rb;
-            }
-            return g;
+            return ggswEncryptPolyInner(key, msg, random);
         }
 
         /// GGSW of a scalar (constant polynomial), e.g. a secret key bit, from
@@ -520,7 +584,14 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// `ggswEncryptPoly` for what a predictable stream costs here.
         pub fn ggswEncryptScalar(key: *const GlweKey, m: T, io: std.Io) Ggsw {
             var src: entropy.SecureSource = .{ .io = io };
-            return ggswEncryptScalarForTest(key, m, src.interface());
+            return ggswEncryptScalarInner(key, m, src.interface());
+        }
+
+        /// The encryption itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn ggswEncryptScalarInner(key: *const GlweKey, m: T, random: std.Random) Ggsw {
+            const c = Poly.constant(m);
+            return ggswEncryptPolyInner(key, &c, random);
         }
 
         /// TEST/KAT ONLY — `ggswEncryptScalar` with caller-chosen draws.
@@ -533,8 +604,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            const c = Poly.constant(m);
-            return ggswEncryptPolyForTest(key, &c, random);
+            return ggswEncryptScalarInner(key, m, random);
         }
 
         /// Bootstrap key: `GGSW(s_i)` for each LWE secret bit, under the GLWE
@@ -547,7 +617,15 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// lattice problem is involved.
         pub fn bootstrapKeyGen(lwe_key: *const LweKey(n), glwe_key: *const GlweKey, io: std.Io) BootstrapKey {
             var src: entropy.SecureSource = .{ .io = io };
-            return bootstrapKeyGenForTest(lwe_key, glwe_key, src.interface());
+            return bootstrapKeyGenInner(lwe_key, glwe_key, src.interface());
+        }
+
+        /// The key generation itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn bootstrapKeyGenInner(lwe_key: *const LweKey(n), glwe_key: *const GlweKey, random: std.Random) BootstrapKey {
+            var bsk: BootstrapKey = undefined;
+            for (0..n) |i| bsk.ggsw[i] = ggswEncryptScalarInner(glwe_key, lwe_key.s[i], random);
+            return bsk;
         }
 
         /// TEST/KAT ONLY — `bootstrapKeyGen` with caller-chosen draws.
@@ -560,9 +638,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            var bsk: BootstrapKey = undefined;
-            for (0..n) |i| bsk.ggsw[i] = ggswEncryptScalarForTest(glwe_key, lwe_key.s[i], random);
-            return bsk;
+            return bootstrapKeyGenInner(lwe_key, glwe_key, random);
         }
 
         /// Key-switch key from the big (extracted) GLWE key to the small LWE
@@ -574,7 +650,21 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// `N·ℓ_ks` rows into a solved linear system for the GLWE key.
         pub fn keySwitchKeyGen(glwe_key: *const GlweKey, small_key: *const LweKey(n), io: std.Io) KeySwitchKey {
             var src: entropy.SecureSource = .{ .io = io };
-            return keySwitchKeyGenForTest(glwe_key, small_key, src.interface());
+            return keySwitchKeyGenInner(glwe_key, small_key, src.interface());
+        }
+
+        /// The key generation itself. PRIVATE, and private is load-bearing:
+        /// see the `Test-only guards and where they may sit` note above.
+        fn keySwitchKeyGenInner(glwe_key: *const GlweKey, small_key: *const LweKey(n), random: std.Random) KeySwitchKey {
+            const big = extractGlweKey(glwe_key);
+            var ksk: KeySwitchKey = undefined;
+            for (0..N) |j| {
+                for (0..ell_ks) |i| {
+                    const msg = big.s[j] *% torus.gadgetWeight(bks_bits, i);
+                    ksk.rows[j][i] = lweEncryptInner(n, small_key, msg, random);
+                }
+            }
+            return ksk;
         }
 
         /// TEST/KAT ONLY — `keySwitchKeyGen` with caller-chosen draws.
@@ -587,15 +677,7 @@ pub fn Tfhe(comptime P: params.Params) type {
             comptime if (!builtin.is_test) @compileError(
                 "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
             );
-            const big = extractGlweKey(glwe_key);
-            var ksk: KeySwitchKey = undefined;
-            for (0..N) |j| {
-                for (0..ell_ks) |i| {
-                    const msg = big.s[j] *% torus.gadgetWeight(bks_bits, i);
-                    ksk.rows[j][i] = lweEncryptForTest(n, small_key, msg, random);
-                }
-            }
-            return ksk;
+            return keySwitchKeyGenInner(glwe_key, small_key, random);
         }
 
         // ── sample extraction / key switching (mechanical) ───────────────────

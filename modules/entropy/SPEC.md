@@ -191,6 +191,91 @@ both on both entry points.
 extreme statement of the degrade, and if either half of that contract changes,
 the test says so.
 
+## What a draw costs, and why the adapter is not where to fix it
+
+`SecureSource` makes one `getrandom(2)` syscall per `std.Random` draw, including
+the four bytes `std.Random.int(u32)` takes. That is the design — every byte came
+out of the OS on this call — and it is expensive. The number belongs here rather
+than in a review comment, and so does where it goes.
+
+Measured 2026-08-13 on this host (Zig 0.16, `-Doptimize=ReleaseFast`, a
+temporary bench added to `src/root.zig` and removed afterwards), 100 000
+iterations per row:
+
+| path | ns per draw |
+|---|---|
+| `SecureSource` → `std.Random.int(u32)` | **816** |
+| `fill(io, buf[0..4])` | 796 |
+| `io.randomSecure(buf[0..4])` | 773 |
+| bare `getrandom(2)` on 4 bytes, no `std.Io` | **771** |
+| the `swapCancelProtection` pair alone | ~0 (27 µs / 100 000) |
+| `std.Random.IoSource` → `int(u32)` (i.e. `io.random`) | 23 |
+
+**94% of a `SecureSource` draw is the syscall itself.** `std.Random`'s own
+machinery costs 20 ns, the `std.Io` vtable hop 2 ns, and the cancel-protection
+pair the 2026-08-13 fix added is not measurable at this resolution. So there is
+nothing in the adapter, in `fill`, or in the vtable to tune: the only lever is
+*fewer, larger* draws. For comparison, one bulk `fill` of 400 000 bytes takes
+1.26 ms, so the per-draw route is **65×** more expensive for the same bytes.
+(An earlier note recorded 872 ns and 85×; both are superseded by the row above,
+which was re-measured rather than carried forward.)
+
+**Buffering inside `SecureSource` is still refused, and the measurement does not
+change that.** A pool of pre-drawn bytes living across calls is a userspace
+CSPRNG wearing this module's name: bytes get *stretched*, one OS draw serves
+several logically independent secrets, and compromising the pool at time T
+compromises secrets drawn after T. That is the exact property `randomSecure`
+exists to deny.
+
+**A per-operation buffer is a different object, and the difference is not
+cosmetic.** One `fill` at the top of an operation, consumed byte-for-byte, then
+`secureZero`d: the map from OS bytes to consumed bytes is the identity (no
+expansion function, so nothing is stretched), no byte serves two operations, and
+no state survives the call. The exposure it adds is raw entropy sitting in a
+frame for the length of one operation — and whoever can read that frame can
+already read the secret being built from it in the same frame, so it puts
+nothing new within reach. A cross-call pool does: it exposes secrets that do not
+exist yet, belonging to callers that have not run. That asymmetry is the whole
+argument, and it is why "buffer per operation" is allowed here and "buffer
+inside the adapter" is not.
+
+**If it is ever done, do it with a small refilling window, not one big buffer.**
+Measured over 393 216 bytes (`bfv.keyGen`'s exact byte budget at N = 8192,
+L = 4), varying the size of each `fill`:
+
+| window | syscalls | total |
+|---|---|---|
+| 8 B (today's per-draw route) | 49 152 | 39.7 ms |
+| 64 B | 6 144 | 5.77 ms |
+| 256 B | 1 536 | 2.36 ms |
+| 1 KiB | 384 | 2.17 ms |
+| **4 KiB** | **96** | **1.84 ms** |
+| 16 KiB | 24 | 1.60 ms |
+| 64 KiB | 6 | 1.62 ms |
+
+A 4 KiB window recovers 95% of the entire available saving. Going to a
+whole-operation buffer buys another 0.24 ms and holds 384 KiB of *unconsumed*
+raw entropy instead of 4 KiB — worse on exposure, negligibly better on time. So
+the shape to reach for is a small window refilled by `fill` as it drains, inside
+one operation, zeroized on the way out.
+
+**No such helper is exported, because there is no caller for it.** All twelve
+`SecureSource` sites in the collection are `pub fn X(io: std.Io)` wrappers whose
+body calls the `XForTest(random: std.Random)` twin — and every one of those
+twins carries `comptime if (!builtin.is_test) @compileError(…)`. Zig analyses the
+twin's body because the wrapper references it, so **the wrappers do not compile
+outside a test build either**. Verified rather than reasoned: a non-test
+`zig build-obj` over a root that calls `Bfv(params.test_tiny).keyGen(io)` fails
+with that `@compileError`, reported through `keyGen` (`bfv.zig:683`), exit 1;
+the same probe against `Tfhe(params.toy).lweKeyGen(16, io)` fails identically
+(`tfhe.zig:292`). Every millisecond in the tables above is therefore paid only
+by test builds. A helper here would be new API surface — on a module whose value
+is having almost none — serving a path production cannot reach. The measurement
+and the idiom are written down; the code is not.
+
+That reachability fact is a defect in `bfv`/`tfhe`, not in this module, and it is
+recorded in their audit files rather than fixed here.
+
 ## Scope
 
 - **No generator.** No pool, no reseed, no DRBG, no state of any kind. Adding

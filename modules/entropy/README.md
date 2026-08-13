@@ -79,7 +79,15 @@ itself.
   cannot be mistaken for "entropy works here".
 - `SecureSource` makes **every** draw a syscall, including the single bytes
   `std.Random.int`/`uintLessThan` take. Correct for key and nonce material;
-  wasteful for anything else.
+  wasteful for anything else. Measured 2026-08-13, ReleaseFast: **816 ns per
+  `int(u32)`**, of which **771 ns is the bare `getrandom(2)`** — so 94% of it is
+  the syscall and there is nothing in the adapter to tune. Against one bulk
+  `fill` of the same bytes it is **65×**. A consumer that needs thousands of
+  small draws must restructure to fewer, larger `fill`s; buffering *inside* the
+  adapter is refused, because a pool that lives across calls is the userspace
+  CSPRNG this module exists to avoid. [SPEC.md](SPEC.md) has the full
+  decomposition, the window-size sweep, and the argument for why a
+  per-operation window is a different object from a cross-call pool.
 - `SecureSource.interface()` hands back a plain `std.Random`, which **erases**
   the fail-closed property: downstream it is indistinguishable from
   `DefaultPrng.init(0).random()`. So swapping `std.Random.IoSource` for
