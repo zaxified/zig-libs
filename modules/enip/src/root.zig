@@ -69,7 +69,7 @@ pub const meta = .{
     // sequence counters; nothing shared or global. Concurrency is the
     // caller's.
     .concurrency = .single_owner,
-    .model_after = "ODVA CIP Volume 1 (Common Industrial Protocol) + Volume 2 (EtherNet/IP Adaptation); wire behaviour cross-checked against captured traffic between independent third-party stacks (see SPEC.md)",
+    .model_after = "ODVA CIP Volume 1 (Common Industrial Protocol) + Volume 2 (EtherNet/IP Adaptation); wire behaviour cross-checked against captured traffic between independent third-party stacks, and the ConnectionParameters reserved-bit layout against Wireshark's CIP dissector source (GPL-2.0, design reference only — see README Provenance and SPEC.md)",
     .deps = .{"netaddr"},
 };
 

@@ -236,6 +236,11 @@ and the adapter's request handler. See SPEC.md for what is third-party
 validated versus self-derived, and what is deferred.
 
 Provenance: clean-room from the published ODVA CIP Volume 1 / Volume 2 frame
-layouts. No third-party source was consulted as a design reference;
-third-party stacks and Wireshark's dissector were used as black-box test
-oracles and as live peers only. See SPEC.md and `/NOTICE`.
+layouts. `cpppo` and `pycomm3` were used as black-box test oracles and as
+live peers only. Wireshark's CIP dissector (GPL-2.0) was used the same way
+for the bulk of verification, but its source was consulted as a design
+reference for one thing: the `ConnectionParameters` reserved-bit layout in
+`src/connmgr.zig`, where the ODVA spec is paywalled and the field map in
+`epan/dissectors/packet-cip.c` was the only available statement of which
+bits are defined. Nothing was copied, and a design reference carries no
+licence condition — GPL-2.0 included. See SPEC.md and `/NOTICE`.

@@ -54,7 +54,7 @@ pub const meta = .{
     .platform = .any, // codec is platform-pure; only packDir is Linux (statx)
     .role = .both, // reader + writer
     .concurrency = .reentrant, // no globals; one Reader/Writer per stream
-    .model_after = "GNU tar / libarchive (behavior only)",
+    .model_after = "POSIX ustar + the documented GNU extension layout; a GNU tar binary was used as a black-box compatibility oracle only, never its source",
     .deps = .{}, // std only — std.compress.flate for gzip
 };
 

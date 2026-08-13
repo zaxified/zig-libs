@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Provenance corrected: README stated that no third-party source
+  had been consulted as a design reference, while `src/connmgr.zig:250` cites
+  `epan/dissectors/packet-cip.c` and the internal `hf_cip_cm_fwo_*` field
+  identifiers — names visible only in Wireshark's source, not in anything
+  `rawshark` prints. The module was genuinely oracle-only when it was written;
+  `5f9685e` later derived the `ConnectionParameters` reserved-bit masks from
+  Wireshark's field map (the ODVA spec being paywalled) and said so in its own
+  message, but the Provenance paragraph was never updated. Now recorded, with
+  the upstream licence (GPL-2.0). Documentation only; no code change, and
+  nothing owed — a design reference carries no condition even from GPL source.
+
 - **2026-08-11** — Security audit: seven findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Modeled on `OpENer` /
   `EIPScanner` (design reference, not a test anchor).

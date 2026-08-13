@@ -9,8 +9,11 @@ byte-faithfully through both.
 - The writer packs device backups (`sysupgrade -b`
   style) and the
   reader ingests them into a content-addressed vault.
-- **Model after:** GNU tar / libarchive (behavior only — headers implemented
-  from the POSIX ustar + GNU extension layout).
+- **Compatible with:** GNU tar / busybox tar — headers implemented from the
+  POSIX ustar + GNU extension layout, with a GNU tar binary used as a
+  black-box compatibility oracle only. (This line said "model after GNU tar /
+  libarchive" until 2026-08-14; `667b29d` retracted that wording in SPEC.md on
+  2026-07-09 and did not reach here.)
 - **Platform:** the codec (`Reader`/`Writer`/`packTarGz`) is platform-pure —
   no I/O beyond the caller's `std.Io.Reader`/`Writer`, compiles and tests
   anywhere; only `packDir` (the filesystem walker) is Linux (raw
