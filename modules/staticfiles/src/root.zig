@@ -522,7 +522,43 @@ pub const Handler = struct {
         // put private content in a shared cache.
         if (h.options.cache_control) |cc|
             rw.setHeader("Cache-Control", cc) catch return failUnsafeResponse(rw);
-        if (http.conditional.apply(req, rw, .{ .etag = etag, .last_modified = mtime_s }) catch false) {
+        // NOT a silent drop, and not an escalation either — see below.
+        // `conditional.apply` stages the 304 status BEFORE it writes the
+        // validator (`http/src/conditional.zig:223-226`), so a `setHeader`
+        // failure there leaves 304 staged while the error sends this handler
+        // down the 200 path: the measured wire was `304 Not Modified` with
+        // `Content-Length: 11` for a body the server core then suppressed,
+        // and no `ETag` for the client to revalidate with next time. Framing
+        // that contradicts itself, and a validator-less 304 that guarantees
+        // the same failure on the next request.
+        //
+        // Reachable through header-TABLE exhaustion (32 slots), not the byte
+        // budget: once a middleware has set `Content-Type`, this handler's
+        // own `setHeader` for it is a replace that needs no slot, so the
+        // `Content-Type` escalation below succeeds and cannot rescue this.
+        //
+        // The answer is NOT `failUnsafeResponse`: a 304 is an optimisation
+        // the origin may always decline (RFC 9110 §15.4.5 — "the server
+        // SHOULD" send 304, never MUST), so the full representation is a
+        // completely conformant answer to a conditional request, and it is
+        // the one the client can use. A 500 would throw away a response that
+        // is correct and safe in order to advertise a lost round trip. That
+        // is the opposite trade from `Content-Type`/`Cache-Control`, where
+        // what would go out is *unsafe* (sniffable body, mis-cached private
+        // file) and no correct response exists. So: un-stage the 304 and
+        // serve the whole file, with `Content-Type` still guarded below.
+        //
+        // The `.proceed` arm fails the same call for the same reason but
+        // stages nothing, and there the lost `ETag` is exactly the lost
+        // `Last-Modified` above — a cache validator, deliberately
+        // best-effort. `rw.status` is what tells the two apart; if `apply`
+        // ever moves its `setHeader` ahead of its `setStatus`, this reads 200
+        // and takes the same (correct) full-representation path.
+        const conditional_done = http.conditional.apply(req, rw, .{ .etag = etag, .last_modified = mtime_s }) catch done: {
+            if (rw.status == 304) rw.setStatus(200);
+            break :done false;
+        };
+        if (conditional_done) {
             return; // 304 / 412 staged (body suppressed by the server core)
         }
 
@@ -672,12 +708,22 @@ fn setContentLength(rw: *http.Server.ResponseWriter, n: u64) void {
     // `catch unreachable` consequence for getting it wrong.
     var clen_buf: [20]u8 = undefined;
     const s = std.fmt.bufPrint(&clen_buf, "{d}", .{n}) catch unreachable;
-    // The only `catch {}` on this surface that cannot drop anything:
     // `setHeader` intercepts `Content-Length` by name, parses it into
-    // `declared_len` and returns before it ever reaches the copy store, so
-    // `HeaderBytesExhausted` and `TooManyHeaders` are unreachable here; `s`
-    // is a formatted integer, so `InvalidHeader` is too. Only `HeadersSent`
-    // remains, and then the framing is already decided.
+    // `declared_len` and returns before it ever reaches the copy store
+    // (`http/src/Server.zig:1703-1711`), so `HeaderBytesExhausted` and
+    // `TooManyHeaders` are unreachable here — budget pressure cannot cost
+    // this response its framing.
+    //
+    // `InvalidHeader` IS reachable, and not through `s`: that same
+    // interception rejects a `Content-Length` on a response which has already
+    // declared trailers (`Server.zig:1709`), since trailers exist only under
+    // chunked framing. Measured (a middleware calling `declareTrailers` and
+    // then delegating here): `200 OK` + `Trailer: X-Checksum` + no
+    // `Content-Length` + `Transfer-Encoding: chunked` + the correct body.
+    // That is why the `catch {}` stays — the drop is not silent breakage but
+    // the server core choosing the only framing left, and escalating would
+    // turn a correct chunked response into a 500. `HeadersSent` is the same:
+    // by then the framing is already decided.
     rw.setHeader("Content-Length", s) catch {};
 }
 
@@ -935,9 +981,9 @@ fn statusOf(resp: []const u8) u16 {
 }
 
 /// A middleware that spends the response writer's 4 KiB header copy store
-/// before `staticfiles` gets to compose anything — four hundred-byte headers
-/// at a time until the store refuses, which leaves ~26 bytes: too few for
-/// `Last-Modified` (42) or `Content-Type` (37).
+/// before `staticfiles` gets to compose anything — one header sized so that
+/// exactly `test_leave_bytes` remain, which at the values used below is too
+/// few for `Last-Modified` (42) or `Content-Type` (37).
 ///
 /// This is what makes `HeaderBytesExhausted` reachable at all. It is not
 /// exotic: one large `Content-Security-Policy` plus a couple of long
@@ -978,6 +1024,113 @@ fn getUnderBudgetPressure(handler: *Handler, path: []const u8, out_buf: []u8) []
     return out.buffered();
 }
 
+/// A middleware that spends the response writer's header **table** — its 32
+/// slots — instead of its 4 KiB byte budget. The two exhaustion routes are
+/// not interchangeable, which is the whole reason this harness exists next to
+/// `budgetEatingHandler`: `putHeader` needs a free slot only when the name is
+/// new, so once an upstream middleware has set `Content-Type`, this handler's
+/// own `setHeader` for it is a *replace* that succeeds on a full table — and
+/// the `Content-Type` escalation, the one thing that could rescue a
+/// half-composed response, never fires.
+///
+/// `test_fill_error` records which exhaustion the fill loop actually hit, so
+/// a test built on this harness can assert it is pinning the table route and
+/// has not silently drifted onto the byte budget.
+var test_fill_table = false;
+var test_preset_content_type = false;
+var test_fill_error: ?anyerror = null;
+
+fn tablePressureHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    if (test_preset_content_type)
+        rw.setHeader("Content-Type", "text/plain; charset=utf-8") catch unreachable;
+    if (test_fill_table) {
+        test_fill_error = null;
+        var name_buf: [16]u8 = undefined;
+        // Bounded far above `max_response_headers` so a table that stopped
+        // refusing could not spin here; the assertion on `test_fill_error` is
+        // what proves the loop ended for the intended reason. Values are one
+        // byte, so the copy store stays nearly untouched: what runs out here
+        // is slots, not bytes.
+        for (0..64) |i| {
+            const n = std.fmt.bufPrint(&name_buf, "X-Fill{d}", .{i}) catch unreachable;
+            rw.setHeader(n, "1") catch |e| {
+                test_fill_error = e;
+                break;
+            };
+        }
+    }
+    const h: *const Handler = @ptrCast(@alignCast(req.context orelse return error.NoStaticFilesContext));
+    return h.serve(req, rw);
+}
+
+/// Drive one request through `Server.serveStream` with `entry` as the top of
+/// the chain (a middleware that then delegates to `staticfiles`).
+fn runVia(entry: http.Server.Handler, handler: *Handler, wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [512]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = entry,
+        .context = handler,
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "serve: a 304 whose ETag cannot be written is not sent as a 304" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    const wire = "GET /hello.txt HTTP/1.1\r\nHost: t\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n";
+
+    // Positive control: the same conditional request with room to answer it —
+    // a real 304, carrying the validator, carrying no body.
+    var out: [8192]u8 = undefined;
+    const ok = runVia(tablePressureHandler, &h, wire, &out);
+    try testing.expectEqual(@as(u16, 304), statusOf(ok));
+    try testing.expect(mem.indexOf(u8, ok, "ETag: \"") != null);
+    try testing.expect(mem.indexOf(u8, ok, "hello world") == null);
+
+    // Now with the header table spent and `Content-Type` already in it, so
+    // that the `Content-Type` escalation cannot stand in for this one.
+    test_preset_content_type = true;
+    test_fill_table = true;
+    defer {
+        test_preset_content_type = false;
+        test_fill_table = false;
+        test_fill_error = null;
+    }
+    var out2: [8192]u8 = undefined;
+    const resp = runVia(tablePressureHandler, &h, wire, &out2);
+
+    // Pin the ROUTE, not a byte count: this must be slot exhaustion. If a
+    // future edit made the fill spend bytes instead, the test would still be
+    // "red on mutation" but for the wrong mechanism.
+    try testing.expectEqual(@as(anyerror, error.TooManyHeaders), test_fill_error.?);
+
+    // The defect this pins: `conditional.apply` stages 304 before it writes
+    // the `ETag`, so swallowing its error used to put a `304 Not Modified`
+    // on the wire with `Content-Length: 11` and no validator at all.
+    try testing.expect(mem.indexOf(u8, resp, "ETag:") == null);
+    if (statusOf(resp) == 304) return error.IncompleteNotModifiedWasSent;
+
+    // What goes out instead: the full representation, which RFC 9110 §15.4.5
+    // always permits in place of a 304 — self-consistent framing, a body the
+    // client can use, and `Content-Type` still on it.
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "Content-Type: text/plain; charset=utf-8\r\n") != null);
+    try testing.expect(mem.indexOf(u8, resp, "Content-Length: 11\r\n") != null);
+    try testing.expect(mem.endsWith(u8, resp, "hello world"));
+}
+
 test "serve: a Content-Type that cannot be set answers 500, never a sniffable body" {
     var fx = try Fixture.init();
     defer fx.deinit();
@@ -1000,7 +1153,13 @@ test "serve: a Content-Type that cannot be set answers 500, never a sniffable bo
     try testing.expectEqual(@as(u16, 500), statusOf(resp));
     // The whole half-composed representation is discarded, not just relabelled.
     try testing.expect(mem.indexOf(u8, resp, "Content-Type:") == null);
-    try testing.expect(mem.indexOf(u8, resp, "X-Pad-") == null);
+    // `X-Pad:` with the colon, as it goes on the wire. This is the ONLY
+    // assertion here that distinguishes `failUnsafeResponse` from a bare
+    // `sendStatus(rw, 500)`: everything else above is equally true of a 500
+    // composed on top of the upstream middleware's headers. Until 2026-08-13
+    // the needle was `X-Pad-`, which the writer can never emit, so dropping
+    // the `rw.reset()` left this test green.
+    try testing.expect(mem.indexOf(u8, resp, "X-Pad:") == null);
     // And above all: not one byte of the file.
     try testing.expect(mem.indexOf(u8, resp, "hello world") == null);
 }
@@ -1037,6 +1196,45 @@ test "serve: a configured Cache-Control that cannot be set answers 500, not a qu
     // escalation this response is a 200 carrying the body and the right
     // Content-Type, silently missing only its Cache-Control.
     try testing.expect(mem.indexOf(u8, resp, cc) == null);
+    // Same `reset()` pin as the Content-Type test, on the second escalation
+    // site: the half-composed representation goes, upstream padding included.
+    try testing.expect(mem.indexOf(u8, resp, "X-Pad:") == null);
+}
+
+test "serveDirectory: a listing that cannot be labelled text/html answers 500, never a sniffable index" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true });
+    const wire = "GET /sub HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+
+    // Positive control: the listing this handler would otherwise emit.
+    var out: [8192]u8 = undefined;
+    const ok = runVia(tablePressureHandler, &h, wire, &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(ok));
+    try testing.expect(mem.indexOf(u8, ok, "Content-Type: text/html; charset=utf-8\r\n") != null);
+    try testing.expect(mem.indexOf(u8, ok, "<li>dir/</li>") != null);
+
+    // With the header table spent — and, unlike the 304 test above, WITHOUT
+    // an upstream `Content-Type`, so this handler's own call needs a slot and
+    // is the one that fails.
+    test_fill_table = true;
+    defer {
+        test_fill_table = false;
+        test_fill_error = null;
+    }
+    var out2: [8192]u8 = undefined;
+    const resp = runVia(tablePressureHandler, &h, wire, &out2);
+    try testing.expectEqual(@as(anyerror, error.TooManyHeaders), test_fill_error.?);
+
+    // This is the strongest of the escalation sites, because the body it
+    // suppresses is HTML built out of attacker-influenced file names: served
+    // unlabelled, a browser sniffs it and the listing becomes stored XSS.
+    try testing.expectEqual(@as(u16, 500), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "<!DOCTYPE html>") == null);
+    try testing.expect(mem.indexOf(u8, resp, "<li>") == null);
+    // `reset()` again: the fill headers are gone, so this is a discarded
+    // response and not a 500 stapled onto a half-composed one.
+    try testing.expect(mem.indexOf(u8, resp, "X-Fill0:") == null);
 }
 
 test "serve: 200 with correct Content-Type, ETag, Last-Modified, body" {
