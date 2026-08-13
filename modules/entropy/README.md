@@ -42,10 +42,17 @@ entropy.fill(io, &key);
 var src: entropy.SecureSource = .{ .io = io };
 const random = src.interface();   // every draw is a randomSecure syscall
 
-// The abort messages are public, so a consumer can pin them in its own tests.
+// The abort message is public, so a consumer can pin it in its own tests.
 _ = entropy.unavailable_message;
-_ = entropy.canceled_message;
 ```
+
+`fill` aborts on **one** thing: `error.EntropyUnavailable`. It does *not* abort
+on cancellation — the draw runs with cancellation blocked
+(`std.Io.swapCancelProtection(.blocked)`, restored on the way out), which is
+what std itself does around its own `randomSecure` call, so a cancel aimed at
+the calling task is observed once `fill` returns instead of killing the process.
+The price is that `io` must implement `swapCancelProtection`: every real
+`std.Io` does, but `std.Io.failing` does not.
 
 ## Which one to call
 
@@ -59,11 +66,12 @@ _ = entropy.canceled_message;
 Repo-wide this is a rule, not a suggestion: see `CONVENTIONS.md` §2.2, which
 also names the deliberate exceptions.
 
-There is **no** error-returning twin here, on purpose.
-`std.Io.RandomSecureError` is `error{EntropyUnavailable} || std.Io.Cancelable`,
-so a `fillOrError` narrowed to `error{EntropyUnavailable}` would report a
-*cancellation* as an entropy failure, and one carrying the full error set is
-`io.randomSecure` with a different name and an extra import.
+There is **no** error-returning twin here, on purpose. One carrying the full
+`std.Io.RandomSecureError` is `io.randomSecure` with a different name and an
+extra import; one narrowed to `error{EntropyUnavailable}` would be truthful
+(cancellation is blocked inside `fill`) but would impose this module's
+cancellation policy on a caller who has an error channel and can decide for
+itself.
 
 ## Notes
 
@@ -72,9 +80,18 @@ so a `fillOrError` narrowed to `error{EntropyUnavailable}` would report a
 - `SecureSource` makes **every** draw a syscall, including the single bytes
   `std.Random.int`/`uintLessThan` take. Correct for key and nonce material;
   wasteful for anything else.
-- The abort paths have no unit test and cannot have one — Zig has no catchable
-  panic. What is tested is everything that decides whether they are reachable
-  and correct; [SPEC.md](SPEC.md) says what that buys and what it does not.
+- `SecureSource.interface()` hands back a plain `std.Random`, which **erases**
+  the fail-closed property: downstream it is indistinguishable from
+  `DefaultPrng.init(0).random()`. So swapping `std.Random.IoSource` for
+  `SecureSource` is only half the change at a call site. The other half is that
+  the `std.Random`-taking function the swap feeds must be unreachable from
+  production, and the way this repo says that is a comptime guard on that
+  function: `comptime if (!builtin.is_test) @compileError("…");`. All twelve
+  existing sites carry it (`modules/tfhe/src/tfhe.zig`, `lweKeyGen` /
+  `lweKeyGenForTest`); the `SecureSource` doc comment has the pattern in full.
+- The abort path has no unit test and cannot have one — Zig has no catchable
+  panic. What is tested is everything that decides whether it is reachable and
+  correct; [SPEC.md](SPEC.md) says what that buys and what it does not.
 
 ## Verify
 

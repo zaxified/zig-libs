@@ -58,21 +58,53 @@
 //! that a portable, `platform = .any` version of the same decision now exists
 //! and does not have to be written a third time.
 //!
+//! ## Cancellation is blocked for the duration of the draw
+//!
+//! `std.Io.RandomSecureError` is `error{EntropyUnavailable} ||
+//! std.Io.Cancelable`, so `randomSecure` can also return `error.Canceled` —
+//! and that is **routine control flow**, not an entropy fault: a cancel already
+//! outstanding on the task makes the call fail before the entropy source is
+//! touched at all, and an EINTR mid-draw routes to the same error. A request
+//! timeout on a peer-driven path is enough to produce it.
+//!
+//! Aborting on that would be a library killing its host over a normal timeout,
+//! so `fill` does what std does at the identical site: it blocks cancellation
+//! around the draw (`std.Io.swapCancelProtection(.blocked)`, restored by
+//! `defer`) and the `error.Canceled` arm becomes `unreachable`. Compare
+//! `std.Io.Threaded`'s `randomMainThread`, which wraps its own `randomSecure`
+//! call the same way; `std.Io.swapCancelProtection`'s doc comment carries this
+//! exact idiom as its worked example.
+//!
+//! What that costs, stated plainly: a cancel aimed at a task that is inside
+//! `fill` is not observed until the draw returns. On a healthy host that is one
+//! non-blocking `getrandom(2)`. It is *not* bounded on a machine whose entropy
+//! pool is not yet initialised (early boot, a fresh VM), where `getrandom(2)`
+//! with `flags = 0` blocks until it is — so do not `fill` a buffer larger than
+//! the secret you are about to use, and do not use `fill` as a bulk random-byte
+//! source. The alternative on that same path is not "cancel promptly", it is
+//! "abort the process", which is strictly worse.
+//!
+//! One consequence worth knowing: `fill` now calls `swapCancelProtection` on
+//! the `std.Io` it is handed, so it requires an implementation that supports
+//! it. `std.Io.failing` does **not** — every cancellation slot on it is
+//! `unreachable` — so `fill(std.Io.failing, buf)` panics with "reached
+//! unreachable code" from inside std rather than with `unavailable_message`.
+//! That `Io` simulates a machine with no `Io` operations at all and a draw on
+//! it was already fatal; the loss is the diagnostic text, on a path no
+//! production consumer takes. `std.Io.Threaded`, `Evented`, `Uring` and
+//! `Dispatch` all implement the slot.
+//!
 //! ## Why there is no `fillOrError`
 //!
-//! A `try`-shaped twin was considered and rejected on a concrete point, not on
-//! taste. `std.Io.RandomSecureError` is `error{EntropyUnavailable} ||
-//! std.Io.Cancelable`, i.e. it also carries `error.Canceled`. So a
-//! `fillOrError(io, buf) error{EntropyUnavailable}!void` would have to report
-//! a **cancellation** as an entropy failure, which is a false statement about
-//! what happened; and the honest signature — one returning the full
-//! `std.Io.RandomSecureError` — is `io.randomSecure` with a different name and
-//! an extra import. Callers that can return an error already have the right
-//! function and it is in std. Nothing here improves on it.
-//!
-//! That same error set is why `fill` does not collapse both failures into one
-//! message: see `unavailable_message` / `canceled_message`, which say
-//! different things because they mean different things.
+//! A `try`-shaped twin was considered and rejected. The honest signature — one
+//! returning the full `std.Io.RandomSecureError` — is `io.randomSecure` with a
+//! different name and an extra import. A narrowed
+//! `fillOrError(io, buf) error{EntropyUnavailable}!void` would now be
+//! *truthful* (cancellation is blocked, so `error.Canceled` cannot come out),
+//! but it would be imposing this module's cancellation policy on a caller who
+//! by construction has an error channel and can make that choice itself.
+//! Callers that can return an error already have the right function and it is
+//! in std. Nothing here improves on it.
 
 const std = @import("std");
 
@@ -99,24 +131,16 @@ pub const meta = .{
 ///
 /// It aborts the host process, so it is written for whoever reads the crash:
 /// what was refused, what was NOT produced, and where to look.
+///
+/// This is the only message `fill` can abort with. There used to be a second
+/// one for `error.Canceled`; that arm is `unreachable` now that the draw runs
+/// under blocked cancellation, so the constant is gone.
 pub const unavailable_message =
     "entropy.fill: std.Io.randomSecure returned error.EntropyUnavailable — " ++
     "the OS entropy source is unreachable, so NO secret was produced and this " ++
     "process aborted rather than mint one from a weak seed. Check whether a " ++
     "sandbox policy (seccomp/Landlock/container profile) is blocking getrandom(2), " ++
     "and on a libc build whether arc4random_buf is reachable.";
-
-/// The message `fill` aborts with when the draw was cancelled.
-///
-/// A different fault entirely from the one above — nothing is wrong with the
-/// machine's entropy; the caller's own `std.Io` cancelled an operation that had
-/// no error channel to report it on.
-pub const canceled_message =
-    "entropy.fill: std.Io.randomSecure returned error.Canceled — a secret-bearing " ++
-    "entropy draw was cancelled mid-flight. entropy.fill returns void and has " ++
-    "nowhere to report that, so it aborts. If cancellation is expected at this " ++
-    "call site, call std.Io.randomSecure directly from a function that can return " ++
-    "an error.";
 
 /// Fail-closed entropy for secret-bearing material. Fills `buf` from
 /// `std.Io.randomSecure`, or aborts the process.
@@ -134,10 +158,26 @@ pub const canceled_message =
 ///
 /// A zero-length `buf` is legal and still makes the call (so a caller cannot
 /// accidentally treat "no entropy needed" as "entropy is fine here").
+///
+/// Cancellation is blocked across the draw, so a cancel aimed at the calling
+/// task is observed after `fill` returns rather than aborting the process. That
+/// means `io` must implement `swapCancelProtection`; `std.Io.failing` does not.
+/// See the module doc comment for both halves of that trade.
 pub fn fill(io: std.Io, buf: []u8) void {
+    // A half-drawn secret is not a thing we can hand back, and `fill` has no
+    // error channel to report a cancellation on. Blocking cancellation for the
+    // length of one draw is what std does at the same site
+    // (`std.Io.Threaded.randomMainThread`) and is the documented use of this
+    // API. It is what reduces `error.Canceled` below to `unreachable`.
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+
     io.randomSecure(buf) catch |err| switch (err) {
         error.EntropyUnavailable => @panic(unavailable_message),
-        error.Canceled => @panic(canceled_message),
+        // Unreachable because of the two lines above, not because it cannot
+        // happen: `randomSecure` returns this whenever a non-blocked cancel is
+        // outstanding. Delete the protection and this becomes live again.
+        error.Canceled => unreachable,
     };
 }
 
@@ -168,6 +208,43 @@ pub fn fill(io: std.Io, buf: []u8) void {
 /// The `std.Random` vtable's `fillFn` returns `void`, so this inherits `fill`'s
 /// abort semantics by construction — there is no error channel to add.
 ///
+/// ## The ceiling: `interface()` erases the property, so guard the twin
+///
+/// What comes back from `interface()` is a plain `std.Random`. It is
+/// structurally indistinguishable from `DefaultPrng.init(0).random()` at every
+/// downstream signature, and nothing in the type system carries the
+/// fail-closedness past this point. So swapping `std.Random.IoSource` for this
+/// type is only **half** the change at a call site. The other half is that the
+/// `std.Random`-taking twin the swap exists to feed must not be reachable from
+/// production code, and the way this repo says that is a comptime guard on the
+/// twin itself:
+///
+/// ```zig
+/// // The production entry point: takes `std.Io`, adapts it here, and the
+/// // caller cannot substitute the source.
+/// pub fn lweKeyGen(comptime dim: usize, io: std.Io) LweKey(dim) {
+///     var src: SecureSource = .{ .io = io };
+///     return lweKeyGenForTest(dim, src.interface());
+/// }
+///
+/// // Its `std.Random`-taking twin, which the swap above exists to feed. The
+/// // `ForTest` name warns; this is what makes it true.
+/// pub fn lweKeyGenForTest(comptime dim: usize, random: std.Random) LweKey(dim) {
+///     comptime if (!builtin.is_test) @compileError(
+///         "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. " ++
+///             "Production code must use the std.Io entry point of the same name, " ++
+///             "which cannot be handed a seeded PRNG.",
+///     );
+///     ...
+/// }
+/// ```
+///
+/// All twelve existing sites carry that guard — `modules/tfhe/src/tfhe.zig`
+/// (`lweKeyGen` / `lweKeyGenForTest`) is the worked example, verbatim above —
+/// so this is a documentation requirement, not an outstanding defect. A
+/// thirteenth consumer that follows the paragraph above without adding the
+/// guard has widened a `std.Random`-shaped hole into a secret-key path.
+///
 /// Not a general-purpose `std.Random`: every draw is a syscall, including the
 /// single bytes `std.Random.int`/`uintLessThan` take. That is correct for key
 /// and nonce material and wasteful for anything else.
@@ -191,24 +268,61 @@ pub const SecureSource = struct {
 
 const testing = std.testing;
 
-/// A `std.Io` that counts which of the two entropy vtable slots was called,
-/// then delegates to a real one.
+/// A `std.Io` that observes the vtable slots `fill` uses, then delegates each
+/// one to a real `std.Io`.
 ///
-/// The whole vtable is copied from the inner `std.Io` and exactly two entries
-/// are replaced, so this stays a fully working `std.Io` (and keeps working if
-/// std grows more vtable entries) while making the choice between `random` and
-/// `randomSecure` directly observable. `userdata` becomes the probe, which is
-/// why the overrides have to carry the inner `std.Io` to delegate through.
+/// ## What this is NOT, and read this before adding a call to `fill`
+///
+/// It is **not** a fully working `std.Io`, and it cannot be made into one. It
+/// copies the inner implementation's whole vtable and then sets
+/// `userdata = self`, because the overriding slots have to find the probe. Every
+/// slot that is *not* overridden therefore holds the inner implementation's
+/// function pointer and will be handed the **probe's** `userdata` — a
+/// `*CountingIo` where a `*std.Io.Threaded` is expected. Calling one is
+/// undefined behaviour.
+///
+/// `std.Io.VTable` has 109 slots at Zig 0.16; the three below are overridden
+/// and the other 106 are mis-bound. Copying the vtable buys compilation
+/// against a moving std, nothing more — so **the rule is: every `std.Io`
+/// function reachable from `fill` or `SecureSource` must have an override
+/// here.** Today that set is exactly `random`, `randomSecure` and
+/// `swapCancelProtection`.
+///
+/// This was not a theoretical hazard. `swapCancelProtection` was added to
+/// `fill` in 2026-08-13 and had no override; it did not crash, because
+/// `std.Io.Threaded.swapCancelProtection` happens to discard its `userdata`
+/// (`_ = t;`) and read a thread-local instead, and because `@alignOf` of both
+/// structs is 8, so even the `@alignCast` safety check stayed quiet. A silent
+/// pass under a mis-bound pointer is exactly the shape that survives an audit,
+/// which is why the constraint is written down here rather than left implied.
 const CountingIo = struct {
     inner: std.Io,
     vtable: std.Io.VTable = undefined,
     random_calls: usize = 0,
     secure_calls: usize = 0,
+    /// How many times the cancel-protection state was swapped (2 per `fill`:
+    /// block, then restore).
+    protection_swaps: usize = 0,
+    /// The probe's own model of the current task's cancel-protection state.
+    ///
+    /// It is modelled here rather than read back off `inner` for a measured
+    /// reason: under the Zig test runner the main thread is not a
+    /// `std.Io.Threaded` task, so `Thread.current` is `null` and
+    /// `Threaded.swapCancelProtection` stores nothing and always answers
+    /// `.unblocked`. Delegating and reading back would therefore report
+    /// `.unblocked` whether or not `fill` blocks anything — an assertion with
+    /// no teeth. The inner `Io` is still driven, so the two stay in step where
+    /// the inner one has any state at all; the probe's copy is authoritative.
+    protection: std.Io.CancelProtection = .unblocked,
+    /// The protection state in force when `randomSecure` was entered. `null`
+    /// until a draw has happened.
+    protection_at_draw: ?std.Io.CancelProtection = null,
 
     fn io(self: *CountingIo) std.Io {
         self.vtable = self.inner.vtable.*;
         self.vtable.random = onRandom;
         self.vtable.randomSecure = onRandomSecure;
+        self.vtable.swapCancelProtection = onSwapCancelProtection;
         return .{ .userdata = self, .vtable = &self.vtable };
     }
 
@@ -221,7 +335,20 @@ const CountingIo = struct {
     fn onRandomSecure(userdata: ?*anyopaque, buffer: []u8) std.Io.RandomSecureError!void {
         const self: *CountingIo = @ptrCast(@alignCast(userdata.?));
         self.secure_calls += 1;
+        self.protection_at_draw = self.protection;
         return self.inner.randomSecure(buffer);
+    }
+
+    fn onSwapCancelProtection(
+        userdata: ?*anyopaque,
+        new: std.Io.CancelProtection,
+    ) std.Io.CancelProtection {
+        const self: *CountingIo = @ptrCast(@alignCast(userdata.?));
+        self.protection_swaps += 1;
+        const prev = self.protection;
+        self.protection = new;
+        _ = self.inner.swapCancelProtection(new);
+        return prev;
     }
 };
 
@@ -255,6 +382,41 @@ test "SecureSource routes every draw through randomSecure" {
 
     try testing.expectEqual(@as(usize, 2), probe.secure_calls);
     try testing.expectEqual(@as(usize, 0), probe.random_calls);
+}
+
+// `error.Canceled` is `unreachable` in `fill` only because the draw runs under
+// blocked cancellation. Nothing about the *output* of a draw can show that, so
+// this asserts the mechanism directly: the state was `.blocked` at the moment
+// `randomSecure` was entered, it was swapped exactly twice, and it came back
+// to where it started. Delete either line of the protection pair in `fill` and
+// this goes red; leave out the `defer` restore and it goes red differently.
+test "fill blocks cancellation across the draw and restores it after" {
+    var probe: CountingIo = .{ .inner = testing.io };
+    const io = probe.io();
+
+    try testing.expectEqual(std.Io.CancelProtection.unblocked, probe.protection);
+
+    var buf: [32]u8 = undefined;
+    fill(io, &buf);
+
+    try testing.expectEqual(std.Io.CancelProtection.blocked, probe.protection_at_draw.?);
+    try testing.expectEqual(@as(usize, 2), probe.protection_swaps);
+    try testing.expectEqual(std.Io.CancelProtection.unblocked, probe.protection);
+}
+
+// The restore is by `defer` off whatever was there before, not a hard reset to
+// `.unblocked`, so a caller that was already inside a protected region gets its
+// own state back rather than having protection silently dropped underneath it.
+test "fill restores an already-blocked protection state rather than clearing it" {
+    var probe: CountingIo = .{ .inner = testing.io };
+    const io = probe.io();
+    probe.protection = .blocked;
+
+    var buf: [32]u8 = undefined;
+    fill(io, &buf);
+
+    try testing.expectEqual(std.Io.CancelProtection.blocked, probe.protection_at_draw.?);
+    try testing.expectEqual(std.Io.CancelProtection.blocked, probe.protection);
 }
 
 // Why the distinction above is worth a syscall, pinned against std itself
@@ -320,16 +482,60 @@ test "fill handles a large buffer in one call" {
     try testing.expect(!std.mem.allEqual(u8, buf[buf.len - 16 ..], 0));
 }
 
-// The abort paths themselves have no in-process test and cannot have one: Zig
-// has no catchable panic, so observing `@panic` needs a child process, and a
-// module test that re-execs the test binary buys a fork per run to assert a
-// two-line `catch`. What IS pinned is everything that decides whether those
-// panics are reachable and correct — that `fill` calls `randomSecure` (above),
-// and that both arms of `std.Io.RandomSecureError` are handled with distinct
-// messages (below; the switch is exhaustive, so std adding an error member
-// breaks the build rather than silently folding into one of these).
-test "the two abort messages are distinct and each names its cause" {
-    try testing.expect(!std.mem.eql(u8, unavailable_message, canceled_message));
+// The route assertions above count syscalls and check no bytes, which leaves a
+// `fillFn` that writes NOTHING — every drawn key left as whatever was on the
+// stack — indistinguishable from a correct one. `fill` has had the sliding-
+// window coverage assertion since the module was written; the adapter that
+// actually carries the bfv/tfhe secret keys did not, and that asymmetry is what
+// these two tests close. Same shape as `fill writes the whole buffer`, on the
+// other entry point.
+test "SecureSource writes the whole buffer, including its last byte" {
+    const sentinel: u8 = 0xa5;
+    var buf: [4096]u8 = @splat(sentinel);
+
+    var src: SecureSource = .{ .io = testing.io };
+    src.interface().bytes(&buf);
+
+    // 16 random bytes all landing on one chosen value is 2^-128, so a window
+    // still holding the sentinel means those bytes were never written. Sliding
+    // it catches a short fill anywhere, including the off-by-one at the tail.
+    var i: usize = 0;
+    while (i + 16 <= buf.len) : (i += 1) {
+        try testing.expect(!std.mem.allEqual(u8, buf[i..][0..16], sentinel));
+    }
+}
+
+test "SecureSource writes a large buffer completely, in one draw" {
+    const sentinel: u8 = 0x5a;
+    const buf = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(buf);
+    @memset(buf, sentinel);
+
+    var probe: CountingIo = .{ .inner = testing.io };
+    var src: SecureSource = .{ .io = probe.io() };
+    src.interface().bytes(buf);
+
+    try testing.expectEqual(@as(usize, 1), probe.secure_calls);
+    try testing.expect(!std.mem.allEqual(u8, buf[0..16], sentinel));
+    try testing.expect(!std.mem.allEqual(u8, buf[buf.len / 2 ..][0..16], sentinel));
+    try testing.expect(!std.mem.allEqual(u8, buf[buf.len - 16 ..], sentinel));
+}
+
+// The abort path itself has no in-process test and cannot have one: Zig has no
+// catchable panic, so observing `@panic` needs a child process, and a module
+// test that re-execs the test binary buys a fork per run to assert a one-line
+// `catch`. What IS pinned is everything that decides whether that panic is
+// reachable and correct — that `fill` calls `randomSecure` (above), that the
+// draw runs under blocked cancellation so the other arm of
+// `std.Io.RandomSecureError` is genuinely `unreachable` (above), and that the
+// one surviving message names its cause (below). The switch is exhaustive, so
+// std adding an error member breaks the build rather than folding into this.
+//
+// Note what this test no longer has to do. There used to be two messages and
+// two `@panic` arms, and no test could tell which message was on which arm —
+// swapping them stayed green. There is one arm now, so the binding is
+// structural: the only `@panic` in the module is the `EntropyUnavailable` one.
+test "the abort message names its cause" {
     try testing.expect(std.mem.indexOf(u8, unavailable_message, "EntropyUnavailable") != null);
-    try testing.expect(std.mem.indexOf(u8, canceled_message, "Canceled") != null);
+    try testing.expect(std.mem.indexOf(u8, unavailable_message, "getrandom(2)") != null);
 }
