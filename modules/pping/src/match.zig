@@ -211,10 +211,59 @@ pub fn matchEcho(
     return sample;
 }
 
-test "match: file is reachable from the build (does not itself invoke the stub)" {
-    // Intentionally does NOT call `matchEcho` — real calls belong to
-    // `kat.zig` / `property.zig`, gated behind `gate.fable_core_implemented`
-    // (see `gate.zig`). This anchors the file + its doc comment in
-    // `zig build test-pping` regardless of the gate's value.
-    try std.testing.expect(true);
+test "match: step 5a ages the SAME-direction table too, so memory is bounded over TIME on a stalled direction" {
+    // What this pins, and why it is here rather than in `kat.zig`: step 5a
+    // sweeps BOTH tables, and every scenario in `kat.zig` only ever observes
+    // the OPPOSITE table's aging indirectly — through a match that no longer
+    // happens. A direction whose TSvals are never echoed (the stalled-flow
+    // case the module doc calls out as failure mode 2) produces no match to
+    // observe, so its table's occupancy is the only visible evidence that the
+    // entries were dropped. Measured before this test was written: deleting
+    // `_ = same_dir.evictOlderThan(...)` from `matchEcho` left all 56 tests
+    // of `zig build test-pping` green.
+    const testing = std.testing;
+    const cfg: root.Config = .{ .capacity = 8, .max_age = 100 };
+
+    var same = try TsTable.init(testing.allocator, cfg.capacity);
+    defer same.deinit(testing.allocator);
+    var opp = try TsTable.init(testing.allocator, cfg.capacity);
+    defer opp.deinit(testing.allocator);
+
+    // Three sends in one direction, nothing ever echoing them back. Well
+    // inside `capacity`, so a capacity-only bound would never touch them.
+    for ([_]u32{ 10, 11, 12 }, 0..) |tsval, i| {
+        const s = matchEcho(&same, &opp, cfg, .{
+            .dir = .a_to_b,
+            .tsval = tsval,
+            .tsecr = 0,
+            .now = @intCast(i),
+        });
+        try testing.expect(s == null);
+    }
+    try testing.expectEqual(@as(usize, 3), same.count());
+
+    // One more send once `max_age` has passed for all three. The aging sweep
+    // must have dropped them BEFORE the insert, leaving only the new entry —
+    // not 4, which is what a capacity-only bound would leave.
+    const s = matchEcho(&same, &opp, cfg, .{
+        .dir = .a_to_b,
+        .tsval = 13,
+        .tsecr = 0,
+        .now = 1_000,
+    });
+    try testing.expect(s == null);
+    try testing.expectEqual(@as(usize, 1), same.count());
+    try testing.expect(same.get(13) != null);
+    try testing.expect(same.get(10) == null);
+
+    // The sweep is unconditional, so a call that neither matches nor inserts
+    // (the tsval is already stored) still ages: nothing here is due yet.
+    _ = matchEcho(&same, &opp, cfg, .{ .dir = .a_to_b, .tsval = 13, .tsecr = 0, .now = 1_050 });
+    try testing.expectEqual(@as(usize, 1), same.count());
+    // …and one that IS due is evicted before the insert side runs, which is
+    // what makes the re-insert land with a fresh `first_seen` rather than the
+    // repeat being swallowed as "already stored".
+    _ = matchEcho(&same, &opp, cfg, .{ .dir = .a_to_b, .tsval = 13, .tsecr = 0, .now = 2_000 });
+    try testing.expectEqual(@as(usize, 1), same.count());
+    try testing.expectEqual(@as(?u64, 2_000), same.get(13));
 }

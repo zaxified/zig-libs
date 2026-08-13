@@ -2649,10 +2649,6 @@ const kat512 = struct {
     const n = hexLit("bd75f1797ee6d06063238fbe5109dd1f3845a4d1cbc138eb5d535c3391447fab5ff634bf7566df51327286a370bae5d4dcefcf914573cf4ba4d285a8d2610709");
 };
 
-test "rsa module compiles" {
-    try testing.expect(true);
-}
-
 test "fromPrimes derives textbook parameters (p=61, q=53, e=17)" {
     const sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
     try testing.expectEqual(3233, try sk.n.v.toPrimitive(u32));

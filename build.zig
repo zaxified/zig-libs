@@ -793,19 +793,45 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
 /// has: it is silently incomplete, and a consumer who reads it concludes their
 /// module did not change.
 ///
-/// Four claims:
+/// Five claims:
 ///
 ///  0. Every entry in a `modules/<m>/CHANGELOG.md` carries its landing date.
 ///     See `checkEntryDates` for the format and its calibration.
-///  1. Every `modules/<m>/CHANGELOG.md` is linked from the root index. Driven
-///     from `module_list`; a `modules/<x>/` that is not in `module_list` is
-///     `check-catalog`'s error, not this one.
+///  1. Every module in `module_list` HAS a `modules/<m>/CHANGELOG.md`, and it is
+///     linked from the root index. Driven from `module_list`; a `modules/<x>/`
+///     that is not in `module_list` is `check-catalog`'s error, not this one,
+///     and `modules/_template/` -- which is not in `module_list` -- is outside
+///     the requirement by construction.
+///  1b. That file is a CHANGELOG and not merely a file at that path. See
+///     `checkChangelogShape` for the two landmarks and their calibration.
 ///  2. Every `modules/<m>/CHANGELOG.md` link IN the root index resolves to a
 ///     file that exists. Driven from the root file's text, so -- unlike (1) --
 ///     it can see an entry that corresponds to nothing. Both directions are
 ///     needed for the same reason `checkProvenance`'s claim 4 is: a check
 ///     driven only from `module_list` is structurally blind to a stale row.
 ///  3. The `BREAKING` tag agrees between the two files.
+///
+/// WHY (1) DEMANDS THE FILE, NOT JUST ITS INDEX LINE. The first version of this
+/// loop read each module changelog with `catch continue`, so a module with NO
+/// `CHANGELOG.md` was skipped entirely and every claim below it was skipped with
+/// it. That is fail-open in exactly the shape a new module arrives in. Measured
+/// on the real tree, not reasoned about: deleting `modules/tlock/CHANGELOG.md`
+/// ALONE is caught -- by (2), as a dangling index link, EXIT=1 -- but deleting
+/// the file AND its one root-index bullet, which is the state of a module added
+/// today, gave EXIT=0. So the root index's own promise ("Every module now
+/// carries a `CHANGELOG.md`, not only the ones with a code change to record")
+/// held over 225 of 225 modules as a fact about that morning and not as an
+/// invariant, and the one case where a gate is worth having -- a module being
+/// added -- was the one case it did not cover. A read failure that is not
+/// `FileNotFound` fails too: the gate cannot verify what it cannot read, and
+/// "skip whatever you could not read" is the exact reflex that produced the
+/// hole in the first place. That fix left the same reflex one layer in, which
+/// is what (1b) closes: measured on the real tree, truncating
+/// `modules/tlock/CHANGELOG.md` to ZERO BYTES gave EXIT=0, because a file that
+/// exists satisfies (1), an empty file has no entries for (0) to date, no
+/// `## Unreleased` for (3) to compare -- `orelse continue` -- and the index
+/// link still resolves for (2). The gate enforced "a file exists", so a module
+/// could hold a zero-byte placeholder and read as fully documented.
 ///
 /// WHY (3) IS IN, GIVEN THAT IT PARSES PROSE. The index's own text promises
 /// exactly this invariant ("a `BREAKING` tag means the module's own changelog
@@ -867,10 +893,29 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
         break :blk "";
     };
 
-    // (1) + (3): every module changelog is indexed, with the right tag.
+    // (1) + (3): every module HAS a changelog, it is indexed, and the tag agrees.
     for (module_list) |m| {
         const path = b.fmt("modules/{s}/CHANGELOG.md", .{m.name});
-        const text = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch continue;
+        const text = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
+            std.log.err(
+                "module '{s}' has no readable {s} ({s}) — every module in `module_list` carries " ++
+                    "one (CONVENTIONS.md §8), including a module whose only history is being " ++
+                    "created. Copy `modules/_template/CHANGELOG.md` to {s}, fill in its heading " ++
+                    "and its dated `New module:` entry, then add the one-line pointer " ++
+                    "`- [`{s}`]({s})` to the root CHANGELOG.md under \"### Modules with a " ++
+                    "changelog\" — the file alone is not enough, the index is what a consumer " ++
+                    "reads. (`modules/_template/` is not in `module_list` and is not asked for " ++
+                    "one.)",
+                .{ m.name, path, @errorName(err), path, m.name, path },
+            );
+            failed = true;
+            continue;
+        };
+
+        // (1b) runs first: the checks below read structure out of this file, so
+        // "is it a changelog at all" is the question that has to be answered
+        // before any of them mean anything.
+        checkChangelogShape(m.name, path, text, &failed);
 
         // (0) runs before the index checks, and outside their `continue`s: an
         // entry with no date is wrong whether or not the index links the file.
@@ -888,6 +933,8 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
             continue;
         }
 
+        // Absent only in a file (1b) has already failed the build over, so this
+        // `continue` no longer skips a module silently.
         const mod_unreleased = unreleasedSection(text) orelse continue;
         // "Has an entry" = has a bullet. A section with only a heading is a
         // module whose history is all under dated tags, and (3) does not ask
@@ -952,6 +999,79 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
     }
 
     if (failed) return step.fail("changelog index drift — see errors above", .{});
+}
+
+/// Claim (1b): the file at `modules/<m>/CHANGELOG.md` is a changelog, not just
+/// a file at that path.
+///
+/// THE HOLE THIS CLOSES, measured and not reasoned about: with (1) demanding
+/// the file, truncating `modules/tlock/CHANGELOG.md` to zero bytes still gave
+/// `zig build check-changelog` EXIT=0. Every other claim is written to read
+/// structure OUT of this file, so an empty one answers all of them vacuously —
+/// no entries to date, no `## Unreleased` to compare against the index, and the
+/// index link resolves because the file is there. "Exists" and "is a changelog"
+/// are different facts and only the first was checked.
+///
+/// THE RULE: two landmarks, both required.
+///
+///   1. The first line is a level-1 markdown title (`# `) that NAMES the module.
+///   2. The file has an `## Unreleased` section heading.
+///
+/// CALIBRATED AGAINST THE WHOLE CORPUS BEFORE ADOPTION, which is the lesson the
+/// `**BREAKING` rule in `checkChangelog` is written from. All 225 files in
+/// `module_list` were checked, not sampled: 225/225 open with exactly
+/// `# <name> — changelog`, 225/225 carry `## Unreleased`, and 225/225 have
+/// exactly one `## ` heading (no tag has been cut in a module changelog yet).
+/// Zero of the 225 have to change to pass.
+///
+/// WHY NOT PIN THE EXACT TITLE, given that 225/225 match `# <name> — changelog`
+/// byte for byte. Because `modules/_template/CHANGELOG.md` — the file the error
+/// messages tell you to copy — writes it as ``# `<name>` — changelog``, with
+/// backticks. A rule that fails the tree's own skeleton the moment its
+/// placeholder is filled in is a rule that gets deleted, so the requirement is
+/// the weaker "a `# ` title mentioning the module": it passes the 225, passes a
+/// filled-in template either way, and still catches a template copied WITHOUT
+/// renaming, because `<name>` does not contain the module's name.
+///
+/// WHY `## Unreleased` IS DEMANDED BUT AN ENTRY UNDER IT IS NOT. The heading is
+/// the file's contract with the root index — (3) compares that section, and
+/// with no heading at all `unreleasedSection` returns null and the module falls
+/// out of the loop through `orelse continue`, which is the fail-open path
+/// itself. A BULLET is deliberately not required even though 225/225 have one
+/// today: the moment a tag is cut those bullets move into the release section
+/// and the heading legitimately stands empty, and a gate that then demanded an
+/// entry would be asking modules to invent one. That is the same distinction
+/// `checkChangelog` already draws at "a section with only a heading".
+///
+/// WHAT IS DELIBERATELY NOT CHECKED: the preamble line pointing back at the
+/// root index (225/225 carry it, but it is prose that says nothing a reader
+/// cannot get from the link they followed), and any minimum length — a byte
+/// count is a proxy for the two facts above, and a worse one.
+fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, failed: *bool) void {
+    const nl = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const title = text[0..nl];
+    if (!std.mem.startsWith(u8, title, "# ") or std.mem.indexOf(u8, title, name) == null) {
+        std.log.err(
+            "{s}:1: this is not a changelog — its first line must be a `# ` title naming the " ++
+                "module, as in `# {s} — changelog`, and it reads `{s}`. An empty or " ++
+                "placeholder file passes `every module has a CHANGELOG.md` while telling a " ++
+                "consumer nothing; copy `modules/_template/CHANGELOG.md` and fill it in. " ++
+                "Module '{s}'; see CONVENTIONS.md §8.",
+            .{ path, name, title[0..@min(title.len, 48)], name },
+        );
+        failed.* = true;
+    }
+    if (unreleasedSection(text) == null) {
+        std.log.err(
+            "{s}: no `## Unreleased` heading — every module changelog has one, and it is the " ++
+                "section the root CHANGELOG.md index is checked against. Without it the module " ++
+                "silently drops out of that comparison. Add the heading (it may stand empty " ++
+                "once a tag is cut; what is not allowed is its absence). Module '{s}'; see " ++
+                "CONVENTIONS.md §8.",
+            .{ path, name },
+        );
+        failed.* = true;
+    }
 }
 
 /// Claim (0): every entry in a module changelog says WHEN it landed.

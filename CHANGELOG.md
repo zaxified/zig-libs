@@ -467,6 +467,27 @@ all fail the gate. See `CONVENTIONS.md` §8.
   and fixed 6 modules missing README catalog rows), and
   `zig build check-changelog` for this index (found 16 module changelogs
   it had never listed — nothing had ever checked it).
+- **Tooling:** `zig build check-changelog` now also requires that every
+  module in `module_list` HAS a `CHANGELOG.md`. It read each one with
+  "skip if unreadable", so a module with no changelog at all was skipped
+  along with every claim about it — measured, not assumed: deleting a
+  module's changelog *and* its bullet above, which is the state a newly
+  added module arrives in, left the gate green. The sentence above about
+  every module carrying one was therefore a fact about a morning and not
+  an invariant; it is one now. **What a module author must do:**
+  `modules/<name>/CHANGELOG.md` and a one-line pointer to it in this file
+  are both required, from the module's first commit (`CONVENTIONS.md` §8;
+  `modules/_template/` now ships the skeleton and the checklist).
+- **Tooling:** `zig build check-changelog` now also requires that the file at
+  `modules/<name>/CHANGELOG.md` **is a changelog** — a `# ` title naming the
+  module, and an `## Unreleased` heading. The previous fix stopped one layer
+  short, and again the hole was measured, not reasoned about: truncating a
+  module changelog to zero bytes still passed, because an empty file has no
+  entries to date, no `## Unreleased` section to compare against this index,
+  and its index link above still resolves. A module could hold a zero-byte
+  placeholder and read here as fully documented. An ENTRY under
+  `## Unreleased` is still not required — after a tag is cut that section is
+  legitimately empty.
 - **Policy:** dated-tag versioning + spin-off policy adopted
   (`CONVENTIONS.md` §8); this changelog split is one product of it.
 

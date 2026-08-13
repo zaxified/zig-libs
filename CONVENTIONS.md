@@ -250,7 +250,8 @@ reference, not a re-explanation of everything the README already covers.
 ## 6. How to add a module
 
 1. `cp -r modules/_template modules/<name>`, fill `src/root.zig` (SPDX line first,
-   `pub const meta`, public API + doc-comments, tests) and `README.md` (incl. a
+   `pub const meta`, public API + doc-comments, tests — the template's placeholder
+   test **fails on purpose** until a real one replaces it) and `README.md` (incl. a
    `Provenance:` line). Add a `SPEC.md` for anything with a real threat model or
    non-obvious design invariant.
 2. Add `.{ .name = "<name>", .deps = &.{ "dep1", ... } }` to `module_list` in
@@ -275,6 +276,13 @@ reference, not a re-explanation of everything the README already covers.
 5. Update the root `NOTICE` with any third-party design reference + its license. If you
    actually ported third-party source, its terms go in `modules/<name>/NOTICE` instead —
    never in the root file.
+6. Fill in the `CHANGELOG.md` the template ships (a dated `New module:` entry) **and add
+   its one-line pointer to the root `CHANGELOG.md`** — both halves are required from the
+   module's first commit, and `zig build check-changelog` fails without either (§8).
+
+`modules/_template/README.md` carries the complete step-by-step list, including the two
+things this narrative does not repeat because a gate owns them: the root README catalog row
++ module count (`zig build check-catalog`) and the module's `ANCHORS.tsv` row.
 
 ### 6.1 Test-only dependencies
 
@@ -354,9 +362,13 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   per-module changelog below does not supplement a collection version — it replaces it.
   Same-day re-tags get `.1`, `.2`, … so names stay sortable and never collide. `v0.1.0`
   remains as history; nothing after it is a semantic version.
-- **CHANGELOG per module.** A module that changes behaviour or API records it in
-  `modules/<name>/CHANGELOG.md`, newest first, each entry naming the tag it shipped in and
-  flagging breaking changes **BREAKING**. Routine internal refactors need no entry. The root
+- **CHANGELOG per module.** **Every module in `module_list` has a
+  `modules/<name>/CHANGELOG.md`** — not only the ones with a code change to record. A module
+  whose only history is being created still gets its dated `New module:` entry, so per-module
+  maturity is answerable from the module itself; `modules/_template/CHANGELOG.md` is the
+  skeleton, and a module without one fails `zig build check-changelog`. Within the file, a
+  change to behaviour or API is recorded newest first, each entry naming the tag it shipped in
+  and flagging breaking changes **BREAKING**. Routine internal refactors need no entry. The root
   `CHANGELOG.md` stays as the per-release index — which modules a tag touched — and does not
   restate the detail. A consumer of three modules should be able to answer "what changed for
   me" by reading three files, not by scanning every release section of one.
@@ -394,10 +406,27 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   SPEC.md, where rot is cheap. **The root index carries no dates either**: the date is owned
   by the module changelog, and an index line one click away is not a second place to keep it.
 - **The index is enforced**: `zig build check-changelog` (run by `scripts/test.sh` in both
-  the `all` and `changed` lanes, so CI runs it) fails when a `modules/<name>/CHANGELOG.md`
+  the `all` and `changed` lanes, so CI runs it) fails when a module in `module_list` has no
+  `CHANGELOG.md` at all, when the file at that path **is not a changelog** — its first line
+  must be a `# ` title naming the module and it must have an `## Unreleased` heading — when a
+  `modules/<name>/CHANGELOG.md`
   has an entry with a missing or malformed date, when it has no entry in the root index,
   when an index entry points at a module changelog that does not exist, or when the
-  `BREAKING` tag disagrees between the two. The date check covers **every** `## ` section,
+  `BREAKING` tag disagrees between the two. The first two were themselves holes, both closed
+  on 2026-08-13 and each measured rather than assumed. The loop read each module changelog
+  with "skip if unreadable", so a module with no changelog was skipped along with every claim
+  about it, and the state a new module arrives in — no file, no index bullet — passed. The fix
+  left the same reflex one layer in: truncating a module changelog to **zero bytes** still
+  passed, because an empty file has no entries to date, no `## Unreleased` to compare, and its
+  index link still resolves. "Exists" and "is a changelog" are different facts, and a
+  placeholder that satisfies only the first reads to a consumer as a fully documented module.
+  Neither rule demands an ENTRY under `## Unreleased`: once a tag is cut that section
+  legitimately stands empty, and a gate that then asked for a bullet would be asking modules
+  to invent one. `modules/_template/` is not in `module_list` and is deliberately outside the
+  requirement — which is also why the title rule is "names the module" and not the exact
+  `# <name> — changelog` that all 225 happen to use: the template writes it with backticks,
+  and a gate that failed the skeleton it tells you to copy is a gate that gets deleted.
+  The date check covers **every** `## ` section,
   not just `## Unreleased` — a rule that stopped applying the moment a tag was cut would be
   a gate switching itself off, and dating an entry is a fact about the past, so a frozen
   release section never needs editing to stay green. Nothing checked this until

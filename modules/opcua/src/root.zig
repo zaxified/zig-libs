@@ -1222,10 +1222,13 @@ pub const Subscription = struct {
 };
 
 // ── tests ──
-
-test "smoke" {
-    try std.testing.expect(true);
-}
+//
+// There was a `test "smoke" { try std.testing.expect(true); }` here. It was
+// deleted rather than given an assertion: a test named for no subject, in the
+// file that IS this module's test root, cannot fail and anchors nothing (the
+// aggregation `test` at the top of this file is what drags the submodules'
+// tests in, and the offline flow below is the real smoke test). Its only
+// effect was to make the module's test count one larger than its coverage.
 
 test "full offline flow: OPN -> CreateSession -> ActivateSession -> CloseSession -> CLO" {
     // No real socket / Docker available in this sandbox for a LIVE

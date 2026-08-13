@@ -206,9 +206,64 @@ pub fn decide(est: *const root.Estimator, now: root.Time) root.Verdict {
     };
 }
 
-test "core: file is reachable from the build" {
-    // Intentionally does NOT call `decide` — real calls belong to the
-    // scoring/property tests. This anchors the file + its doc comment in
-    // `zig build test-liveness-hyst`.
-    try std.testing.expect(true);
+test "core: `since` stamps the last TRANSITION, not the last update" {
+    // The third field of `Verdict` and the only one nothing else in the module
+    // reads: `state` is asserted everywhere, `metric` is the ordering key
+    // `property.zig` pins, and `since` — documented as "caller-clock time of
+    // the most recent state transition (dwell-time / anti-flap accounting)" —
+    // had no assertion anywhere before this test. Dwell time is what a caller
+    // damps ITS OWN failover with, so a `since` that restamped on every probe
+    // would report a permanently new state and defeat that.
+    //
+    // The property is checked over a whole scripted stream rather than at one
+    // point: `since` must change exactly on the steps where `state` changes,
+    // and hold otherwise.
+    const testing = std.testing;
+    var est = root.Estimator.init(.{});
+
+    try testing.expectEqual(root.LinkState.up, est.verdict.state);
+    try testing.expectEqual(@as(root.Time, 0), est.verdict.since);
+
+    // (reply?, time) — two clean replies, a timeout burst that demotes `.up`
+    // to `.suspect` and then holds there, and a long quiet recovery back to
+    // `.up`. Times are chosen so the burst stays short of the fast-down
+    // silence floor (`down_threshold * 2 / 3` = 1000 with defaults).
+    const script = [_]struct { reply: bool, at: root.Time }{
+        .{ .reply = true, .at = 100 },
+        .{ .reply = true, .at = 500 },
+        .{ .reply = false, .at = 1000 },
+        .{ .reply = false, .at = 1200 },
+        .{ .reply = true, .at = 7000 },
+        .{ .reply = true, .at = 7200 },
+        .{ .reply = true, .at = 7400 },
+        .{ .reply = true, .at = 7600 },
+        .{ .reply = true, .at = 7800 },
+        .{ .reply = true, .at = 8000 },
+        .{ .reply = true, .at = 8200 },
+    };
+
+    var expected_since: root.Time = 0;
+    var transitions: usize = 0;
+    var holds: usize = 0;
+    for (script) |step| {
+        const before = est.verdict.state;
+        if (step.reply) est.onProbeReply(step.at, 10) else est.onProbeTimeout(step.at);
+        if (est.verdict.state != before) {
+            expected_since = step.at;
+            transitions += 1;
+        } else {
+            holds += 1;
+        }
+        try testing.expectEqual(expected_since, est.verdict.since);
+    }
+
+    // Vacuity guard: the stream above must actually exercise both sides of the
+    // `if`, or the loop would pass against an implementation that never moves
+    // `since` at all (and against one that always moves it).
+    try testing.expect(transitions >= 2);
+    try testing.expect(holds >= 2);
+    // …and it must have gone somewhere and come back, so the transitions are
+    // real state changes and not one demotion counted twice.
+    try testing.expectEqual(root.LinkState.up, est.verdict.state);
+    try testing.expect(est.verdict.since > 1_000);
 }
