@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — Test-only: `handshake.zig` gained "entropy seam: the keypair
+  seed, the first cookie secret and the reply nonce really draw". **Neither
+  BREAKING nor BEHAVIOURAL** — no production code changed; this adds the
+  coverage that was missing for three of the module's four production
+  draws. Every handshake KAT here supplies `local_ephemeral`,
+  `initWithSecret` or `createReplyWithNonce` deterministically, which is
+  what makes them byte-exact and equally what left the real draws
+  unobserved: hardcoding `Keypair.generate`'s seed left all 68 tests green.
+  The new test covers `Keypair.generate` in BOTH its roles (static
+  identity, and the ephemeral inside `createInitiation` — one draw site,
+  two roles), `CookieChecker.init`'s first `Rm`, and `createReply`'s
+  XChaCha20 nonce, and completes a handshake plus a cookie round trip on
+  the drawn values so the path is a working one. The fourth draw,
+  `CookieChecker.refresh`, is deliberately NOT re-asserted: "cookie secret
+  rotates after two minutes" already goes red on it in isolation
+  (re-measured). Verified by planting `@memset(..., 0x5a/0x42)` after each
+  of the three draws INDEPENDENTLY: three runs, 68/72 each (3 skipped),
+  exactly this test red every time. Its stated limit: it catches a constant
+  and an ignored `io`, not a weak-but-varying PRNG; which vtable slot the
+  bytes come from is pinned in `entropy`'s own suite.
+
 - **2026-08-13** — `Keypair.generate` now draws its X25519 seed from `entropy.fill`
   (`std.Io.randomSecure`) instead of `io.random`, closing the last
   degrading draw in the module — `CookieChecker`'s secret and nonce were

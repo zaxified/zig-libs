@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: `bbs.zig` gained a
+  seam test proving `calculateRandomScalars`'s `entropy.fill` draw is
+  actually read (two draws of the same count from the same `io` must
+  differ) and that the production `sign`/`proofGen`/`proofVerify` path
+  still round-trips with freshly drawn blinding scalars. Before this, the
+  blinding-scalar draw could be replaced by a constant and the suite
+  stayed green — confirmed by mutating the draw (`@memset(&buf, 0x42)`)
+  and watching the new test fail (41 pass, 1 skip, 1 fail), then reverting
+  to green (42/43, 1 skip unchanged). Does not distinguish real entropy
+  from a varying-but-weak PRNG; see the test's own comment.
 - **2026-08-12** — `ciphersuite.calculateRandomScalars` draws through the new `entropy`
   module (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of
   `io.random`. Not breaking: `fill` returns `void`, so the signature still

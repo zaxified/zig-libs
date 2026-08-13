@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: both `x448.zig` and
+  `ed448.zig` gained a seam test proving their `KeyPair.generate`'s
+  `entropy.fill` draw is actually read (two key pairs from the same `io`
+  must differ) and that the production path still round-trips end to end
+  (X448: a two-sided DH shared-secret agreement; Ed448: sign/verify).
+  Before this, either curve's signing/DH key draw could be replaced by a
+  constant and the suite stayed green — confirmed by mutating both draws
+  simultaneously (`@memset(&seed, 0x42)`) and watching both new tests fail,
+  each on its own file's distinctness assertion (`x448.test...`/
+  `ed448.test...`, 54 pass, 2 fail), then reverting to green (56/56). Does
+  not distinguish real entropy from a varying-but-weak PRNG; see the tests'
+  own comments.
 - **2026-08-12** — Both `KeyPair.generate` entry points — `x448.KeyPair.generate` and
   `ed448.KeyPair.generate` — draw their seed through the new `entropy`
   module (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of

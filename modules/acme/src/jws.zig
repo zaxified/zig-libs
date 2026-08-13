@@ -602,6 +602,54 @@ test "sign → verifyFlattened (kid mode + POST-as-GET empty payload)" {
     );
 }
 
+// ── the RNG seam (entropy re-audit 2026-08-13) ──────────────────────────────
+
+test "RNG seam: generateKeyPair really draws entropy, and round-trips end to end" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A signature pin alone would pass over a body that ignores `io`. Two
+    // account keys drawn from the same `io` must differ.
+    //
+    // This catches a constant seed and a seed that is drawn but never read
+    // (both leave `generateKeyPair` minting the same key every call). It
+    // does NOT catch a weak-but-varying PRNG substituted for `entropy.fill`
+    // — two draws from a seeded `DefaultPrng` also differ from each other,
+    // so distinctness alone cannot tell "real entropy" from "some other
+    // stream of varying bytes". `entropy`'s own `CountingIo` pins which
+    // `std.Io` vtable slot a draw goes through, but that probe lives in
+    // `modules/entropy/src/root.zig` as a private test helper (not a public
+    // export) and this module has one call site behind `entropy.fill`
+    // itself, already covered there — duplicating the probe here would
+    // re-test `entropy.fill`, not `jws.generateKeyPair`.
+    //
+    // A third gap, sharper than the second: this also does not catch a
+    // PARTIAL draw — `entropy.fill` writing real entropy into only part of
+    // the 32-byte seed and leaving the rest constant. The surviving bytes
+    // alone are enough to make `generateDeterministic` mint two different
+    // keys, so `!std.mem.eql` below cannot tell "fully drawn" from "mostly
+    // constant". Measured directly in `megolm`'s 128-byte ratchet seed
+    // (`session.zig`): zeroing 96 of the 128 drawn bytes right after
+    // `entropy.fill` left `zig build test-megolm` green. Not re-measured
+    // here, but the seed above is one buffer filled the same way, so the
+    // same failure mode applies.
+    const kp1 = generateKeyPair(io);
+    const kp2 = generateKeyPair(io);
+    try testing.expect(!std.mem.eql(u8, &kp1.secret_key.bytes, &kp2.secret_key.bytes));
+
+    // And the production path is a working path, not just a typed one:
+    // sign with the freshly drawn key, verify with its own embedded jwk.
+    const jws_json = try sign(testing.allocator, kp1, "{}", .{
+        .nonce = "n",
+        .url = "https://ca.example/x",
+    });
+    defer testing.allocator.free(jws_json);
+    var v = try verifyFlattened(testing.allocator, jws_json, null);
+    defer v.deinit();
+    try testing.expectEqualStrings("{}", v.payload);
+}
+
 test "verifyFlattened: malformed and tampered inputs never verify" {
     const kp = try rfc7515KeyPair();
     const jws_json = try sign(testing.allocator, kp, "{\"a\":1}", .{

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: `jws.zig` gained a
+  seam test proving `generateKeyPair`'s `entropy.fill` draw is actually read
+  (two keys from the same `io` must differ) and that the production
+  sign/verify path still round-trips with a freshly drawn key. Before this,
+  the account/certificate key draw could be replaced by a constant and the
+  suite stayed green — confirmed by mutating the draw (`@memset(&seed,
+  0x42)`) and watching the new test fail (34 pass, 1 fail), then reverting
+  to green (35/35). Does not distinguish real entropy from a varying-but-
+  weak PRNG; see the test's own comment.
 - **2026-08-13** — New `jws.generateKeyPair(io)`, and both certificate-key draws
   (`Client.obtain`'s issuance key and `publishTlsAlpn01`'s TLS-ALPN-01
   validation key) now use it. It is

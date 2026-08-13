@@ -111,6 +111,78 @@ test "round trip: sigma sourced from randomSigma (production entropy path)" {
     try std.testing.expectEqualSlices(u8, &message, &recovered);
 }
 
+test "entropy seam: randomSigma really draws, and two encryptions of one message differ" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // WHAT THIS CATCHES: a `sigma` frozen to a constant, and a `randomSigma`
+    // body that ignores its `io` argument entirely. The test above uses
+    // `randomSigma` but never looks at the value, so it stays green under
+    // both.
+    //
+    // WHAT IT DOES NOT CATCH: a weak-but-varying source. Two draws from a
+    // seeded `DefaultPrng` differ just as reliably as two draws from a
+    // CSPRNG, so this is a LIVENESS check on the draw, not a quality check
+    // on the source. The "which vtable slot did the bytes come from"
+    // question (`randomSecure`, or the silently-degrading `random`) is
+    // answered once and centrally by `entropy`'s own `CountingIo` probe
+    // (`entropy/src/root.zig`, test "fill draws from randomSecure and never
+    // from random"). `CountingIo` is private to that module, and this module
+    // draws only through `entropy.fill`, so re-deriving a copy of it here
+    // would add no evidence that is independent of the one already there.
+    //
+    // ALSO NOT COVERED: a PARTIAL draw into the 32-byte `sigma` buffer —
+    // `entropy.fill` writing real entropy into only some of it and leaving
+    // the rest constant would still make `s1` differ from `s2` below, so
+    // this assertion cannot tell that apart from a fully-drawn buffer.
+    // Measured directly in `megolm`'s 128-byte ratchet seed (`session.zig`):
+    // zeroing 96 of the 128 drawn bytes right after `entropy.fill` left
+    // `zig build test-megolm` green on an assertion of this same shape. Not
+    // re-measured here, but `sigma` is one buffer filled the same way.
+    //
+    // NOT COVERED HERE, DELIBERATELY: the master secret key. `setup` draws
+    // it through `bls12_381.Fr.random`, and `bls12_381`'s own suite already
+    // fails when that is frozen, as does this module's own test "setup draws
+    // distinct msk across calls (not a fixed constant)" in `ibe.zig`.
+    // `sigma` was the uncovered half of the two.
+    const s1 = ciphersuite.randomSigma(io);
+    const s2 = ciphersuite.randomSigma(io);
+    try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
+
+    // A liveness pin on `randomSigma` alone would still pass over an
+    // `encrypt` that dropped `sigma` on the floor, so assert the property
+    // `sigma` exists for: `encrypt` is a pure function of
+    // `(mpk, id, message, sigma)` — the neighbouring determinism test pins
+    // exactly that — so with every other input held fixed, a fresh `sigma`
+    // is the ONLY thing that can make two ciphertexts differ. Under a
+    // constant one they are byte-identical, which is the IND-CPA break.
+    const kp = ibe.setup(io);
+    const id = "alice@example.com";
+    const message = [_]u8{0x5a} ** ibe.block_bytes;
+
+    const ct1 = ibe.encrypt(kp.mpk, id, message, ciphersuite.randomSigma(io));
+    const ct2 = ibe.encrypt(kp.mpk, id, message, ciphersuite.randomSigma(io));
+    try std.testing.expect(!std.mem.eql(u8, &ct1.toBytes(), &ct2.toBytes()));
+    // Every component moves, not just one: U (= r·G₂ with r = H3(sigma, M)),
+    // V (the masked `sigma` itself) and W (the message masked by H4(sigma)).
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &g2.toBytesCompressed(ct1.u),
+        &g2.toBytesCompressed(ct2.u),
+    ));
+    try std.testing.expect(!std.mem.eql(u8, &ct1.v, &ct2.v));
+    try std.testing.expect(!std.mem.eql(u8, &ct1.w, &ct2.w));
+
+    // And the production path is a WORKING path, not merely a varying one —
+    // a distinctness assertion over a broken pipeline proves nothing.
+    const d_id = ibe.extract(kp.msk, id);
+    const back1 = try ibe.decrypt(d_id, ct1);
+    const back2 = try ibe.decrypt(d_id, ct2);
+    try std.testing.expectEqualSlices(u8, &message, &back1);
+    try std.testing.expectEqualSlices(u8, &message, &back2);
+}
+
 test "encrypt is deterministic given fixed (mpk, id, message, sigma)" {
     var threaded = testIo();
     defer threaded.deinit();

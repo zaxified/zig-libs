@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: `session.zig` gained a
+  seam test proving `OutboundSession.init`'s two `entropy.fill` draws (the
+  ratchet R₀ and the Ed25519 signing key) are both actually read (two
+  sessions from the same `io` must differ in both secrets) and that the
+  production encrypt/decrypt path still round-trips end to end. Before
+  this, either draw could be replaced by a constant and the suite stayed
+  green — confirmed by mutating both draws simultaneously (`@memset(...,
+  0x42)`) and watching the new test fail (46 pass, 1 fail on the ratchet
+  assertion), then isolating the signing-key draw alone to confirm the
+  second assertion independently catches it too, then reverting to green
+  (47/47). Does not distinguish real entropy from a varying-but-weak PRNG;
+  see the test's own comment.
 - **2026-08-13** — `OutboundSession.init`'s Ed25519 signing keypair now draws its seed from
   `entropy.fill` (`std.Io.randomSecure`) instead of `io.random`, matching
   what `Ratchet.generate` already did for R₀. **Not breaking:** no

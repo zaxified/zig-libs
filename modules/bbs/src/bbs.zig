@@ -972,6 +972,79 @@ test "proofVerify validates disclosed_messages/disclosed_indexes count before to
     ));
 }
 
+// ── the RNG seam (entropy re-audit 2026-08-13) ───────────────────────────
+
+test "RNG seam: calculateRandomScalars really draws entropy, and round-trips through proofGen/proofVerify" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A signature pin alone would pass over a body that ignores `io`. Two
+    // draws of the SAME count from the SAME `io` must differ.
+    //
+    // This catches a constant blinding-scalar buffer and a buffer that is
+    // drawn but never read. It does NOT catch a weak-but-varying PRNG
+    // substituted for `entropy.fill` — two draws from a seeded
+    // `DefaultPrng` also differ from each other, so distinctness alone
+    // cannot tell "real entropy" from "some other varying stream". Pinning
+    // *which* `std.Io` vtable slot is hit (`entropy`'s own `CountingIo`,
+    // `modules/entropy/src/root.zig:298`) is not applied here: that probe
+    // is a private test helper of the `entropy` module, and `bbs` has one
+    // call site — `calculateRandomScalars` — that does nothing but forward
+    // to `entropy.fill`, already covered by `entropy`'s own suite.
+    //
+    // A third gap, sharper than the second: this also does not catch a
+    // PARTIAL draw into any one scalar's 48-byte `expand_len` buffer —
+    // `entropy.fill` covering only part of it before `Fr.reduceWide` still
+    // yields a scalar that differs from the next call's, so the loop below
+    // cannot distinguish that from a fully-drawn buffer. Measured directly
+    // in `megolm`'s 128-byte ratchet seed (`session.zig`): zeroing 96 of the
+    // 128 drawn bytes right after `entropy.fill` left `zig build
+    // test-megolm` green on an assertion of this same shape. Not
+    // re-measured here, but each scalar's buffer is filled the same way.
+    const scalars1 = cs.calculateRandomScalars(3, io);
+    const scalars2 = cs.calculateRandomScalars(3, io);
+    var any_differs = false;
+    for (scalars1, scalars2) |a, b| {
+        if (!a.eql(b)) any_differs = true;
+    }
+    try testing.expect(any_differs);
+
+    // And the production path is a working path, not just a typed one:
+    // sign a message, then prove-and-verify selective disclosure with
+    // random_scalars drawn from the same `io` (U = 0 undisclosed, so 3
+    // scalars — r1, r2, r3 — matches `calculateRandomScalars(3, io)` above).
+    var sk_bytes = [_]u8{0} ** 32;
+    sk_bytes[31] = 1;
+    const sk = try SecretKey.fromBytes(sk_bytes);
+    const pk = keys.skToPk(sk);
+    const messages = [_][]const u8{"only message"};
+    const sig = try sign(testing.allocator, sk, pk, "header", &messages);
+    try testing.expect(try verify(testing.allocator, pk, sig, "header", &messages));
+
+    const random_scalars = cs.calculateRandomScalars(3, io);
+    const proof = try proofGen(
+        testing.allocator,
+        pk,
+        sig,
+        "header",
+        "",
+        &messages,
+        &.{0},
+        &random_scalars,
+    );
+    defer testing.allocator.free(proof);
+    try testing.expect(try proofVerify(
+        testing.allocator,
+        pk,
+        proof,
+        "header",
+        "",
+        &messages,
+        &.{0},
+    ));
+}
+
 // ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
 
 test "fuzz: Signature.fromBytes never crashes on arbitrary bytes" {

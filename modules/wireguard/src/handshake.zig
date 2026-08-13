@@ -1706,6 +1706,139 @@ test "cookie secret rotates after two minutes, on both sides of the exchange" {
     try testing.expectEqual(@as(?noise.Mac, null), (PeerCookie.init(rpub)).current(1_000));
 }
 
+test "entropy seam: the keypair seed, the first cookie secret and the reply nonce really draw" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // This module has FOUR production `entropy.fill` call sites. Three of
+    // them were blind to every test in this file, and this test covers those
+    // three; the fourth is deliberately left alone —
+    //
+    //   1. `Keypair.generate`'s X25519 seed — serves BOTH roles (a caller's
+    //      static identity, and the per-handshake ephemeral). ONE draw site,
+    //      two roles, so both roles are exercised below.
+    //   2. `CookieChecker.init`'s first `Rm`.
+    //   3. `createReply`'s XChaCha20 nonce.
+    //   4. `CookieChecker.refresh`'s rotated `Rm` — ALREADY covered, by
+    //      "cookie secret rotates after two minutes, on both sides of the
+    //      exchange", whose `!std.mem.eql(&rolled, &checker.secret)` goes red
+    //      under a constant. Not re-asserted here.
+    //
+    // WHAT THIS CATCHES: any of those three draws frozen to a constant, and
+    // a draw site that ignores its `io` argument. Every handshake KAT in
+    // this file supplies `local_ephemeral`/`initWithSecret`/
+    // `createReplyWithNonce` deterministically — which is what makes the
+    // KATs byte-exact, and equally what left the real draws unobserved.
+    //
+    // WHAT IT DOES NOT CATCH: a weak-but-varying source. Two draws from a
+    // seeded `DefaultPrng` differ just as reliably as two from a CSPRNG, so
+    // this is a LIVENESS check on the draws, not a quality check on the
+    // source. Which vtable slot the bytes came from (`randomSecure`, or the
+    // silently-degrading `random`) is pinned once and centrally by
+    // `entropy`'s own `CountingIo` probe (test "fill draws from randomSecure
+    // and never from random"); that probe type is private to `entropy` and
+    // every site here draws through `entropy.fill`, so a local copy would
+    // add no independent evidence.
+    //
+    // ALSO NOT COVERED, at all three sites: a PARTIAL draw — real entropy
+    // into only part of the drawn buffer (the 32-byte X25519 seed, the
+    // 32-byte `Rm`, or the 24-byte XChaCha20 nonce) with the rest held
+    // constant. Each site's assertion below only checks that the two draws
+    // differ somewhere, and a surviving fraction of real entropy is enough
+    // for that, so none of the three can tell a partial draw from a full
+    // one. Measured directly in `megolm`'s 128-byte ratchet seed
+    // (`session.zig`): zeroing 96 of the 128 drawn bytes right after
+    // `entropy.fill` left `zig build test-megolm` green on an assertion of
+    // this same shape. Not re-measured here, but all three buffers below
+    // are plain byte arrays filled the same way, with room for a partial
+    // fill — the nonce least of all at 24 bytes, but still room enough.
+
+    // ── site 1a: `Keypair.generate` in its STATIC-identity role ──────────
+    // Both halves: a frozen seed repeats the private key, and
+    // `generateDeterministic` makes the public key a function of it.
+    const si = Keypair.generate(io);
+    const sr = Keypair.generate(io);
+    try testing.expect(!std.mem.eql(u8, &si.private, &sr.private));
+    try testing.expect(!std.mem.eql(u8, &si.public, &sr.public));
+
+    // ── site 1b: the same draw site in its EPHEMERAL role ────────────────
+    // Two initiations from the same static key to the same peer, with the
+    // same index and the same timestamp: every input to `createInitiation`
+    // is byte-identical except the ephemeral it draws internally, so a
+    // frozen seed makes the two messages byte-identical too. This is the
+    // draw that makes a session's keys unrecoverable from the static keys
+    // alone — a repeated one hands a passive recorder the whole session.
+    var ini1: Handshake = .{
+        .static_keypair = si,
+        .remote_static_public = sr.public,
+        .local_index = 7,
+    };
+    var ini2: Handshake = .{
+        .static_keypair = si,
+        .remote_static_public = sr.public,
+        .local_index = 7,
+    };
+    const msg1 = try ini1.createInitiation(io, @splat(0x42));
+    const msg1b = try ini2.createInitiation(io, @splat(0x42));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &msg1.unencrypted_ephemeral,
+        &msg1b.unencrypted_ephemeral,
+    ));
+
+    // …and the production path is a WORKING path, not merely a varying one:
+    // the freshly drawn static + ephemeral keys still complete a handshake
+    // and agree on the transport keys.
+    var rsp: Handshake = .{
+        .static_keypair = sr,
+        .remote_static_public = si.public,
+        .local_index = 9,
+    };
+    try rsp.consumeInitiation(msg1);
+    const msg2 = try rsp.createResponse(io);
+    try ini1.consumeResponse(msg2);
+    try testing.expectEqual(ini1.chaining_key, rsp.chaining_key);
+    const ki = ini1.deriveTransportKeys(true);
+    const kr = rsp.deriveTransportKeys(false);
+    try testing.expectEqual(ki.send, kr.recv);
+    try testing.expectEqual(ki.recv, kr.send);
+
+    // ── site 2: `CookieChecker.init`'s first `Rm` ────────────────────────
+    // Same static public key, same `now_s`, so the drawn secret is the only
+    // input that can differ. A predictable `Rm` makes every cookie forgeable,
+    // which is the whole security of this layer.
+    const rpub = cookie_kat.responder_pub;
+    var c1 = CookieChecker.init(rpub, io, 1_000);
+    var c2 = CookieChecker.init(rpub, io, 1_000);
+    try testing.expect(!std.mem.eql(u8, &c1.secret, &c2.secret));
+    c1.wipe();
+    c2.wipe();
+
+    // ── site 3: `createReply`'s XChaCha20 nonce ──────────────────────────
+    // The checker is built with a FIXED `Rm` at t=1000 and both replies are
+    // made at t=1000, so `cookieFor`'s internal `refresh` is a no-op (site 4
+    // does not fire) and the cookie, the AAD and the XAEAD key are all
+    // identical between the two calls. The nonce is therefore the only
+    // varying input — which is what makes the ciphertext assertion below a
+    // consequence of the draw and not of anything incidental.
+    const f = try macFields(&kat.msg1);
+    var checker = CookieChecker.initWithSecret(rpub, cookie_kat.secret, 1_000);
+    const rep1 = checker.createReply(io, 1_000, f, &cookie_kat.addr);
+    const rep2 = checker.createReply(io, 1_000, f, &cookie_kat.addr);
+    try testing.expectEqual(cookie_kat.secret, checker.secret); // no rotation happened
+    try testing.expect(!std.mem.eql(u8, &rep1.nonce, &rep2.nonce));
+    // The consequence a repeat would have: one `Rm`, one nonce, two replies
+    // ⇒ the XOR of the two cookies falls out of the ciphertexts.
+    try testing.expect(!std.mem.eql(u8, &rep1.encrypted_cookie, &rep2.encrypted_cookie));
+
+    // …and again, a working path: a real peer opens the drawn-nonce reply.
+    var peer = PeerCookie.init(rpub);
+    try peer.recordSent(&kat.msg1);
+    try peer.consumeReply(rep1, 1_000);
+    try testing.expectEqual(cookie_kat.cookie, peer.cookie.?);
+}
+
 test "macFields admits exactly the two handshake message shapes" {
     var buf: [200]u8 = undefined;
     @memset(&buf, 0);

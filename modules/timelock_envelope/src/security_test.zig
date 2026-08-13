@@ -139,6 +139,74 @@ test "empty plaintext round-trips" {
     try testing.expectEqual(@as(usize, 0), opened.len);
 }
 
+test "entropy seam: generate draws all three fields afresh, and two seals differ" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // WHAT THIS CATCHES: any one of `SealRandomness.generate`'s three draws
+    // frozen to a constant, and a `generate` body that ignores its `io`
+    // argument. Every other test in this file feeds `seal` the fixed
+    // `fixedRandomness()` on purpose (deterministic envelopes), so before
+    // this test nothing in the suite ever looked at a drawn value — which is
+    // exactly the reuse `SealRandomness`'s own doc comment calls a full
+    // ChaCha20-Poly1305 break.
+    //
+    // WHAT IT DOES NOT CATCH: a weak-but-varying source. Two draws from a
+    // seeded `DefaultPrng` differ just as reliably as two from a CSPRNG, so
+    // this is a LIVENESS check on the draws, not a quality check on the
+    // source. Which vtable slot the bytes came from (`randomSecure`, or the
+    // silently-degrading `random`) is pinned once and centrally by
+    // `entropy`'s own `CountingIo` probe (test "fill draws from randomSecure
+    // and never from random"); that probe type is private to `entropy` and
+    // this module draws only through `entropy.fill`, so a local copy would
+    // add no independent evidence.
+    //
+    // ALSO NOT COVERED: a PARTIAL draw into any one of the three fields —
+    // `entropy.fill` writing real entropy into only part of `s_time`,
+    // `tlock_sigma` or `kem_coins` and leaving the rest constant would still
+    // make that field differ between `r1` and `r2`, so the per-field
+    // assertions below cannot tell that apart from a fully-drawn field.
+    // Measured directly in `megolm`'s 128-byte ratchet seed (`session.zig`):
+    // zeroing 96 of the 128 drawn bytes right after `entropy.fill` left
+    // `zig build test-megolm` green on an assertion of this same shape. Not
+    // re-measured here, but all three fields here are plain byte arrays
+    // filled the same way, each with room for a partial fill.
+    const r1 = Env.SealRandomness.generate(io);
+    const r2 = Env.SealRandomness.generate(io);
+
+    // All THREE fields are asserted SEPARATELY, and that separation is the
+    // point: a whole-envelope diff stays green with any one of them frozen,
+    // because the other two still vary. Each is its own break —
+    //   s_time      the timelocked secret, and half of `deriveKeys`' input,
+    //               so freezing it repeats the AEAD (key, nonce) pair;
+    //   tlock_sigma the inner tlock ciphertext's FO pad, whose predictability
+    //               opens the time lock before its round;
+    //   kem_coins   HQC `encaps` coins, so freezing them repeats `s_pq` (the
+    //               other half of `deriveKeys`' input) for every recipient.
+    try testing.expect(!std.mem.eql(u8, &r1.s_time, &r2.s_time));
+    try testing.expect(!std.mem.eql(u8, &r1.tlock_sigma, &r2.tlock_sigma));
+    try testing.expect(!std.mem.eql(u8, &r1.kem_coins, &r2.kem_coins));
+
+    // And the production path is a WORKING path, not merely a varying one:
+    // two seals of the SAME plaintext to the SAME recipient and round, under
+    // independently generated randomness, differ on the wire and both still
+    // open.
+    const kp = recipientKeypair(0x09);
+    const env1 = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, r1);
+    defer testing.allocator.free(env1);
+    const env2 = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, r2);
+    defer testing.allocator.free(env2);
+    try testing.expect(!std.mem.eql(u8, env1, env2));
+
+    const opened1 = try Env.open(testing.allocator, env1, kp.dk, round1000Signature());
+    defer testing.allocator.free(opened1);
+    const opened2 = try Env.open(testing.allocator, env2, kp.dk, round1000Signature());
+    defer testing.allocator.free(opened2);
+    try testing.expectEqualSlices(u8, plaintext, opened1);
+    try testing.expectEqualSlices(u8, plaintext, opened2);
+}
+
 // ── AND-composition negatives (each lock is individually necessary) ────
 
 test "AND #1: correct PQ key but the time gate is still closed (wrong signature) → TimeGateClosed" {

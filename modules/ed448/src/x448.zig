@@ -284,3 +284,47 @@ test "KeyPair.deinit zeroizes secret_key in place (regression: fails if secureZe
     // public_key is NOT secret and must survive deinit untouched.
     try std.testing.expect(!std.mem.eql(u8, &kp.public_key, &zero_scalar));
 }
+
+// ── the RNG seam (entropy re-audit 2026-08-13) ──────────────────────────────
+
+test "RNG seam: KeyPair.generate really draws entropy, and round-trips end to end" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A signature pin alone would pass over a body that ignores `io`. Two
+    // private scalars drawn from the same `io` must differ.
+    //
+    // This catches a constant seed and a seed that is drawn but never read
+    // (both leave `generate` minting the same DH scalar every call). It
+    // does NOT catch a weak-but-varying PRNG substituted for
+    // `entropy.fill` — two draws from a seeded `DefaultPrng` also differ
+    // from each other, so distinctness alone cannot tell "real entropy"
+    // from "some other stream of varying bytes". `entropy`'s own
+    // `CountingIo` pins which `std.Io` vtable slot a draw goes through, but
+    // that probe lives in `modules/entropy/src/root.zig` as a private test
+    // helper (not a public export), and this module's one call site is
+    // already covered by `entropy`'s own suite.
+    //
+    // A third gap, sharper than the second: this also does not catch a
+    // PARTIAL draw into the 56-byte seed — real entropy in part of it and a
+    // constant in the rest would still leave `private` differing between
+    // the two calls, so `!std.mem.eql` below cannot tell that apart from a
+    // fully-drawn seed. Measured directly in `megolm`'s 128-byte ratchet
+    // seed (`session.zig`): zeroing 96 of the 128 drawn bytes right after
+    // `entropy.fill` left `zig build test-megolm` green under an assertion
+    // of this same shape. Not re-measured here, but this module's seed is
+    // one buffer filled the same way.
+    const kp1 = KeyPair.generate(io);
+    const kp2 = KeyPair.generate(io);
+    try std.testing.expect(!std.mem.eql(u8, &kp1.secret_key, &kp2.secret_key));
+
+    // And the production path is a working path, not just a typed one: a
+    // freshly drawn key pair on each side of a DH exchange must agree on
+    // the shared secret.
+    const alice = KeyPair.generate(io);
+    const bob = KeyPair.generate(io);
+    const alice_shared = try scalarmult(alice.secret_key, bob.public_key);
+    const bob_shared = try scalarmult(bob.secret_key, alice.public_key);
+    try std.testing.expectEqualSlices(u8, &alice_shared, &bob_shared);
+}

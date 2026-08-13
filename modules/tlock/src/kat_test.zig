@@ -210,6 +210,76 @@ test "encrypt with a fixed sigma is deterministic (pins the ciphertext for a fut
     try std.testing.expectEqualSlices(u8, &ct1.toBytes(), &ct2.toBytes());
 }
 
+test "entropy seam: randomSigma really draws, and two encryptions of one message differ" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // WHAT THIS CATCHES: a `sigma` frozen to a constant, and a `randomSigma`
+    // body that ignores its `io` argument entirely. Every other test in this
+    // file feeds `encrypt` a FIXED `sigma` on purpose (that is what makes the
+    // drand interop vector reproducible), so before this test nothing in the
+    // suite ever looked at a drawn one.
+    //
+    // WHAT IT DOES NOT CATCH: a weak-but-varying source. Two draws from a
+    // seeded `DefaultPrng` differ just as reliably as two from a CSPRNG, so
+    // this is a LIVENESS check on the draw, not a quality check on the
+    // source. Which vtable slot the bytes actually came from
+    // (`randomSecure`, or the silently-degrading `random`) is pinned once
+    // and centrally by `entropy`'s own `CountingIo` probe (test "fill draws
+    // from randomSecure and never from random"); `CountingIo` is private to
+    // that module and this one draws only via `entropy.fill`, so a local
+    // copy would add no independent evidence.
+    //
+    // ALSO NOT COVERED: a PARTIAL draw into `sigma`'s 16-byte buffer —
+    // `entropy.fill` writing real entropy into only some of it (say, the
+    // top or bottom 8 bytes) and leaving the rest constant would still make
+    // `s1` differ from `s2` below, so this assertion cannot tell that apart
+    // from a fully-drawn buffer. Measured directly in `megolm`'s 128-byte
+    // ratchet seed (`session.zig`): zeroing 96 of the 128 drawn bytes right
+    // after `entropy.fill` left `zig build test-megolm` green on an
+    // assertion of this same shape. Not re-measured here, and `sigma` is
+    // smaller than `megolm`'s buffer, but it is still a plain byte array
+    // filled the same way, with room for a partial fill.
+    const s1 = ciphersuite.randomSigma(io);
+    const s2 = ciphersuite.randomSigma(io);
+    try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
+
+    // A liveness pin on `randomSigma` alone would still pass over an
+    // `encrypt` that dropped `sigma`, so assert the property `sigma` exists
+    // for. `encrypt` is a pure function of `(p_pub, round, message, sigma)`
+    // — the test directly above pins exactly that — so with every other
+    // input held fixed, a fresh `sigma` is the ONLY thing that can make two
+    // ciphertexts differ. A constant one makes them byte-identical, and a
+    // guessable one unlocks the ciphertext before its round, which is the
+    // single property the whole construction sells.
+    const p_pub = quicknetPubkey();
+    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
+
+    const ct1 = tlock.encrypt(p_pub, 1000, message, ciphersuite.randomSigma(io));
+    const ct2 = tlock.encrypt(p_pub, 1000, message, ciphersuite.randomSigma(io));
+    try std.testing.expect(!std.mem.eql(u8, &ct1.toBytes(), &ct2.toBytes()));
+    // All three components move, not just one: U (= r·G₂ with
+    // r = H3(sigma, M)), V (the masked `sigma`) and W (M ⊕ H4(sigma)).
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &g2.toBytesCompressed(ct1.u),
+        &g2.toBytesCompressed(ct2.u),
+    ));
+    try std.testing.expect(!std.mem.eql(u8, &ct1.v, &ct2.v));
+    try std.testing.expect(!std.mem.eql(u8, &ct1.w, &ct2.w));
+
+    // And the production path is a WORKING path, not merely a varying one:
+    // both still open under the genuine round-1000 signature.
+    const sig = round1000Signature();
+    const back1 = try tlock.decrypt(sig, ct1);
+    const back2 = try tlock.decrypt(sig, ct2);
+    try std.testing.expectEqualSlices(u8, &message, &back1);
+    try std.testing.expectEqualSlices(u8, &message, &back2);
+}
+
 // ── 3. drand interop vector (GATED — the Gt-serialization arbiter) ──
 //
 // A GENUINE ciphertext produced by drand's own Go implementation (the

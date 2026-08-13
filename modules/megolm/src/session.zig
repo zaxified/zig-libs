@@ -348,6 +348,64 @@ test "outbound encrypt -> inbound decrypt round-trip, several messages" {
     }
 }
 
+// ── the RNG seam (entropy re-audit 2026-08-13) ──────────────────────────────
+
+test "RNG seam: OutboundSession.init really draws entropy for both the ratchet and the signing key, and round-trips end to end" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A signature pin alone would pass over a body that ignores `io`. Two
+    // sessions built from the same `io` must differ in BOTH secrets they
+    // mint: the 128-byte ratchet seed and the Ed25519 signing key.
+    //
+    // This catches a constant draw and a draw that is taken but never read
+    // (both leave `OutboundSession.init` minting the same ratchet/key every
+    // call). It does NOT catch a weak-but-varying PRNG substituted for
+    // `entropy.fill` — two draws from a seeded `DefaultPrng` also differ
+    // from each other, so distinctness alone cannot tell "real entropy"
+    // from "some other stream of varying bytes". `entropy`'s own
+    // `CountingIo` pins which `std.Io` vtable slot a draw goes through, but
+    // that probe lives in `modules/entropy/src/root.zig` as a private test
+    // helper (not a public export), and this module's two call sites are
+    // already covered by `entropy`'s own suite.
+    //
+    // A third gap is sharper than the second, and this one is measured, not
+    // assumed: this assertion also does not catch a PARTIAL draw — real
+    // entropy into only part of a buffer, a constant for the rest.
+    // Injecting `@memset(data[32..], 0)` immediately after
+    // `entropy.fill(io, &data)` in `Ratchet.generate` — zeroing 96 of the
+    // ratchet's 128 drawn bytes, three quarters of the session key's
+    // entropy — left `zig build test-megolm` GREEN, exit 0: the surviving
+    // 32 bytes were still enough to make `out1.ratchet.data` differ from
+    // `out2.ratchet.data`, which is all the assertion below checks. The
+    // same reasoning applies to the 32-byte signing-key seed asserted right
+    // under it, not separately measured but drawn into one buffer the same
+    // way.
+    var out1 = OutboundSession.init(io);
+    defer out1.deinit();
+    var out2 = OutboundSession.init(io);
+    defer out2.deinit();
+    try testing.expect(!std.mem.eql(u8, &out1.ratchet.data, &out2.ratchet.data));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &out1.signing_key.secret_key.bytes,
+        &out2.signing_key.secret_key.bytes,
+    ));
+
+    // And the production path is a working path, not just a typed one:
+    // encrypt under the freshly drawn session and decrypt on the other
+    // side, which also exercises the freshly drawn signing key (the
+    // session-sharing blob and the message frame are both signed with it).
+    var in = try InboundGroupSession.fromSessionKey(try out1.sessionKey());
+    defer in.deinit();
+    var msg = try out1.encrypt(testing.allocator, "entropy seam round-trip");
+    defer msg.deinit(testing.allocator);
+    var decrypted = try in.decrypt(testing.allocator, &msg);
+    defer decrypted.deinit(testing.allocator);
+    try testing.expectEqualStrings("entropy seam round-trip", decrypted.plaintext);
+}
+
 test "out-of-order delivery: inbound session fast-forwards correctly" {
     var threaded = testIo();
     defer threaded.deinit();
