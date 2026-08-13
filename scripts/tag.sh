@@ -7,7 +7,7 @@
 # instead of asking you to remember.
 #
 # WHY NOT SEMVER. Zig resolves dependencies by URL + hash; nothing reads a
-# version string, so a semver tag on a 224-module collection is pure signalling
+# version string, so a semver tag on a 225-module collection is pure signalling
 # with no mechanism behind it — and the signal would be false, since one number
 # cannot describe modules that range from externally anchored to never consumed.
 # A consumer who uses three modules learns nothing from "the collection went
@@ -153,8 +153,8 @@ fi
 
 git tag -a "$tag" -m "$tag
 
-Every module passed every lane at $head_sha: default, strict Debug,
-ReleaseFast and ReleaseSafe. That is the whole claim — this is a dated
+Every module passed every release lane at $head_sha: ReleaseSafe,
+ReleaseFast and strict Debug. That is the whole claim — this is a dated
 snapshot of the collection, not a semantic version. Per-module changes are
 in each module's CHANGELOG; see CONVENTIONS §8."
 

@@ -11,7 +11,8 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 225 modules (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 225 modules (Zig 0.16, green in all three release lanes — `ReleaseSafe`,
+`ReleaseFast`, `-Dstrict-debug`) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -43,7 +44,8 @@ breaking changes flagged `BREAKING`; the root `CHANGELOG.md` is the index of whi
 have one, and `zig build check-changelog` keeps the two in step. Module maturity is carried
 by the explicit caveat lines in the catalog
 below (and each module's `SPEC.md`), not by stability-tier labels — every module meets the
-same bar (tests green in Debug + ReleaseFast, oracle/KAT verification where one exists);
+same bar (tests green in all three release lanes — `ReleaseSafe`, `ReleaseFast`,
+`-Dstrict-debug` — plus oracle/KAT verification where one exists);
 what varies is *scope*, and anything unfinished is stated where it lives. The full
 versioning + spin-off policy is `CONVENTIONS.md` §8.
 
@@ -59,7 +61,7 @@ modules/<name>/README.md     # what it is + a Provenance line
 ```
 
 `CONVENTIONS.md` has the full rules; `modules/_template/` is the starting point for a new module.
-Roadmap notes live in the "Roadmap / not yet built" section above and the git history.
+Roadmap notes live in the "Roadmap / not yet built" section below and the git history.
 
 ## Licensing
 
@@ -166,7 +168,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `stun` | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |
 | `sntp` | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
 | `syslog` | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing | any | — |
-| `ssh` | SSH-2.0 (RFC 4253) **client + server** transport — version exchange, KEXINIT, curve25519-sha256 (RFC 8731) + diffie-hellman-group + ML-KEM-768 hybrid KEX, Binary Packet Protocol, aes-gcm/chacha20-poly1305; live-validated against OpenSSH. **userauth (RFC 4252) publickey/password + channels (RFC 4254) session/exec/subsystem** — one-shot `exec()` and a streaming `Session` seam | any | rsa |
+| `ssh` | SSH-2.0 (RFC 4253) **client + server** transport — version exchange, KEXINIT, curve25519-sha256 (RFC 8731) + diffie-hellman-group + ML-KEM-768 hybrid KEX, Binary Packet Protocol, aes-gcm/chacha20-poly1305; live-validated against OpenSSH. **userauth (RFC 4252) publickey/password + channels (RFC 4254) session/exec/subsystem** — one-shot `exec()` and a streaming `Session` seam. **Caveat:** Linux-only — the transport's internal `getrandom(2)` entropy loop is on the packet-write path and `@compileError`s on any other target | linux | rsa |
 | `netconf` | NETCONF client (RFC 6241) over SSH — RFC 6242 end-of-message + chunked framing, hello/capability exchange, get/get-config/edit-config/commit RPCs with typed replies | any | ssh, xml |
 | `ebpf` | eBPF program generation over `std.os.linux.bpf` — verifier-passing bytecode builders (kprobe counter / XDP bounds-checked filter / ring-buffer emitter, clang-cross-checked goldens); syscall attach + ringbuf consumer scaffolded. Real-kernel verifier acceptance unverified in unprivileged CI | **linux** | netlink |
 | `xdp-classifier` | XDP packet classifier for a LibreQoS-style edge shaper — IPv4 subscriber-prefix → traffic-class handle: verifier-safe Ethernet+IPv4 parse, `BPF_MAP_TYPE_LPM_TRIE` longest-prefix-match lookup, per-CPU scratch-map class handoff, plus `BPF_MAP_TYPE_CPUMAP` steering (redirect a matched flow to a chosen CPU via `bpf_redirect_map`). Mechanical composition of `ebpf`'s already-proven bounds-check/map-lookup patterns — no Fable core | **linux** | ebpf |
@@ -329,10 +331,6 @@ Research-verdicted **DON'T-BUILD-YET** — no consumer demands them today; see e
 module's `SPEC.md` (once built) or the git history for the full reasoning and the
 "when greenlit" path for each:
 
-- **`testkit`** (shared test harness) — deferred; the honest remaining scope (a
-  `runWire` HTTP-wire test wrapper + `expectStatus` family + fake-clocks) needs a
-  `build.zig` test-only-dep mechanism with no precedent in this repo, plus a 19-module
-  refactor to pay off.
 - **`kv` on-disk MVCC / transactions / ordered scans** — shipped as the separate
   `kvtree` module (copy-on-write B-tree; `kv` v0 stays for point-store consumers
   like `jobqueue`). The transactional core (`commit`/`recover`/reclaim gate) is

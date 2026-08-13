@@ -35,11 +35,20 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
   **ADOPT** table (see the Non-goals section of README.md) and lives **consumer-side**, wired over the
   external binding by the application. zig-libs may ship the pure-Zig *policy/validation*
   half of such a thing, never the C enforcement half.
-- **TLS = proxy-terminate / bring-your-own.** No module implements a TLS *server*; the
-  h2 stack (and anything else that wants TLS-terminated transport) takes an
+- **TLS = proxy-terminate / bring-your-own.** No module terminates TLS on a *stream*
+  transport; the h2 stack (and anything else that wants TLS-terminated transport) takes an
   already-terminated stream via a BYO-TLS/ALPN seam. Revisit when std ships a native TLS
   server (gated on `std.Io`, ~0.18/post-1.0) or via an opportunistic spike; until then,
   this is the permanent shape, not a stopgap.
+  **Datagram DTLS is deliberately outside this rule.** `dtls` ships a full RFC 9147
+  DTLS 1.3 *server* (`Connection.serverInit` — PSK and cert modes, optional mutual auth,
+  live-interop'd against wolfSSL), and that is not an exception grudgingly granted: the
+  rule above exists because a TLS-terminating proxy is a mature, ubiquitous thing to put
+  in front of a *stream* server, so shipping our own would duplicate hardened
+  infrastructure for no gain. Neither half holds for datagrams — there is no equivalent
+  DTLS-terminating front end to hand an association to, and `std.crypto.tls` has no DTLS
+  at all, so a consumer has nothing to bring. The line is "don't reimplement what a proxy
+  or std already does safely", not "no handshake code in this repo".
 
 ### 2.1 Zeroization of secret material
 
@@ -259,10 +268,20 @@ reference, not a re-explanation of everything the README already covers.
 3. **Multi-file modules:** add every new submodule to `root.zig`'s `test { _ = …; }`
    aggregator — a bare `pub const x = @import("x.zig")` re-export does **not** pull `x`'s
    tests into the test binary (the dark-tests rule; it hid 92 never-run tests before it
-   was caught). Verify: `cat modules/<m>/src/*.zig | grep -c '^\s*test '` (blocks on
-   disk) must equal the running count from `zig build test-<m> --summary all`.
-4. `zig build test-<name>` (per module) and `zig build test` (all) — both green in
-   **Debug and ReleaseFast**; `zig fmt --check modules/<name>` clean.
+   was caught). Verify with the gate, not by hand: `zig build check-dark-tests
+   -Ddark-module=<name>` (or `scripts/dark-tests.sh <name>`) requires the declared count to
+   EQUAL the `(N total)` field of the run-test summary line. `scripts/test.sh` runs the same
+   check over every module, reading the `--summary all` output its own suite already
+   produced. Do not reconstruct this by hand: the obvious `cat modules/<m>/src/*.zig | grep
+   -c '^\s*test '` is not recursive (it misses `src/testdata/*.zig` and any other
+   subdirectory the compilation does analyse) and invites comparing against the *pass* count
+   rather than the total, which is exactly the bug that let `ratelimit` report `18/18 passed`
+   with 3 tests dark. See `scripts/dark-tests.sh`'s header for why this must ask the compiler
+   instead of matching source statically.
+4. `zig build test-<name>` (per module) and `zig build test` (all) — green in **all three
+   release lanes**: `-Doptimize=ReleaseSafe`, `-Doptimize=ReleaseFast`, `-Dstrict-debug`
+   (§7.1 says what each one proves that the others cannot); `zig fmt --check
+   modules/<name>` clean.
 
    > **Install the commit-time formatting guard once per clone:**
    > `git config core.hooksPath scripts/hooks`
@@ -320,8 +339,10 @@ the distinctions that make the skips correct.
   property/round-trip.
 - **Clients** (`dns`, `whois`, `rdap`, `http` client): a live round-trip against a real
   server when the network is available, plus offline unit tests on parsing.
-- No shared `testkit` harness exists yet — it was scoped and **deferred** (see the Roadmap
-  section of README.md); each module hand-rolls its own wire-test/fake-clock helpers for now.
+- **`testkit`** is the shared harness for what is genuinely duplicated (KAT hex decoding,
+  golden byte-comparison, the verbose-skip convention); it is wired via `test_deps`, so it
+  never reaches the module a consumer imports (§6.1). Anything that legitimately differs per
+  module — netns setup, capability probing, fake clocks — stays hand-rolled locally.
 
 ### 7.1 Optimize modes — what each CI lane proves
 
@@ -335,12 +356,12 @@ lane proves something the others cannot:
 | default (Debug, heavy modules at `ReleaseSafe`) | correctness with every safety check armed, fast enough to run on each change |
 | `-Dstrict-debug` | real Debug for the heavy modules too — the default lane relaxes them for wall-clock, so on its own it no longer proves Debug |
 | `-Doptimize=ReleaseFast` | the code is free of undefined behaviour that the safety checks would otherwise mask, and of anything that only holds because of them |
-| `-Doptimize=ReleaseSafe` | the middle mode is green — integrators build in all three, so all three must pass |
+| `-Doptimize=ReleaseSafe` | the combination the other two never form — optimisations *and* safety checks armed. Not a formality: it is the lane that caught the only real defect of 2026-08-12 (a use-after-scope) while Debug and ReleaseFast both passed it by luck (`f88a102`). Integrators build in all three, so all three must pass |
 
 **A note worth passing to integrators** (belongs in module docs where a parser is
 exposed, not enforced here): every parser that touches bytes it did not produce is
-held to a "never panic on arbitrary input" threat model, backed by **301 fuzz
-harnesses across 84 modules**. Those harnesses assert that arbitrary input never trips
+held to a "never panic on arbitrary input" threat model, backed by **440 fuzz
+harnesses across 144 modules**. Those harnesses assert that arbitrary input never trips
 a safety check — an assertion that only carries meaning in a build where the checks
 exist. Compiled `ReleaseFast`, the bound the fuzzer proved untripped is simply gone,
 and the input that would have panicked reads out of bounds instead. So the fuzz corpus
@@ -448,7 +469,8 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   notes that freeze when a tag is cut. See `checkChangelog` in `build.zig` for the full
   calibration and for what a green run does not prove.
 - **Maturity = explicit caveats, not tier labels.** Every module meets the same bar (§6/§7:
-  tests green in Debug + ReleaseFast, oracle/KAT verification where one exists). What varies
+  tests green in all three release lanes — `ReleaseSafe`, `ReleaseFast`, `-Dstrict-debug` —
+  plus oracle/KAT verification where one exists). What varies
   is *scope*: anything unfinished or unverified is stated as an explicit caveat in the
   module's README-catalog row and SPEC (e.g. dnp3's "Secure Authentication scaffolded only",
   ebpf's "real-kernel verifier acceptance unverified"). A per-module `stability` tier tag

@@ -37,7 +37,9 @@ no skips.
   (curve25519-sha256) / RFC 8332, 8709, 5656 (host+user key algorithms).
   Design reference: ringtailsoftware/misshod (MIT) for architecture *shape*
   only — no source copied.
-- **Platform:** any. **Role:** both (client + server). **Concurrency:**
+- **Platform:** linux — the transport's `fillRandom` is a raw `getrandom(2)`
+  loop on the Binary-Packet-Protocol write path, so a non-Linux target fails to
+  compile, it does not silently degrade. **Role:** both (client + server). **Concurrency:**
   single_owner — one `Transport` instance owns one connection's
   sequence-number/cipher state; no shared/global state.
 - **Deps:** `rsa` (this repo's own module) — for `rsa-sha2-256`/`rsa-sha2-512`

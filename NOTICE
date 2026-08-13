@@ -8,9 +8,13 @@ not the reverse. A module's internal development origin — which of the
 authors' own projects it was first prototyped in — is NOT recorded here: it
 carries no attribution weight and would read backwards once those projects
 import zig-libs. This file records THIRD-PARTY design references — software
-designed with reference to the third parties listed below. All are permissive
-(MIT/BSD-family) and MIT-compatible, and NONE of them imposes a condition
-beyond zig-libs' own MIT license.
+designed with reference to the third parties listed below. NONE of them
+imposes a condition beyond zig-libs' own MIT license -- not because they are
+all permissively licensed (they are not: the references below include GPL-2.0,
+GPL-3.0, LGPL-2.1, LGPL-3.0 and AGPL-3.0 projects), but because a design
+reference carries no license condition at all. Where third-party code was
+actually ported rather than studied, its terms travel with it and live beside
+that code; see section 0.
 
 Where actual third-party code was ported, the required attribution lives in
 that module's own `NOTICE` file beside its source, so it travels with the
@@ -164,7 +168,7 @@ must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`
 beside the files that owe it, not an entry here.
 
 A SECOND, DIFFERENT KIND of `modules/<name>/NOTICE` file also exists, and must
-not be confused with the four above: a **provenance note**, whose first line
+not be confused with the twenty-two above: a **provenance note**, whose first line
 says `<name> — provenance note`. Those are §2-style design-reference records
 that live beside the module instead of in this file — the practice grew up
 around the self-contained crypto/protocol modules, whose provenance runs to
@@ -175,7 +179,7 @@ that the two kinds stay distinguishable by that first line. Which kind a
 module needs is decided by CONVENTIONS.md §5, not by module size.
 
 So: to answer "does consuming zig-libs oblige me to anything beyond MIT?",
-read the four files listed above and nothing else.
+read the twenty-two files listed above and nothing else.
 
 ====================================================================
 2. DESIGN REFERENCES — clean-room (recorded for provenance)

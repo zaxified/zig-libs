@@ -1,5 +1,7 @@
-# Anchor tasks — the 88 modules from ANCHORS.tsv that face outside and are not
-# anchored yet. Generated 2026-08-01. Read ANCHORS.tsv's header first.
+# Anchor tasks — the modules from ANCHORS.tsv that face outside and were not
+# anchored when their row was written. Generated 2026-08-01 with 88 rows; it
+# holds 94 today, of which 54 carry `DONE` in the SOURCE column because the
+# work has since landed. Read ANCHORS.tsv's header first.
 #
 # THE JOB: move the expected values in the tests from "we wrote them, from our
 # own reading of the spec" to "they came from outside". The foreign tool

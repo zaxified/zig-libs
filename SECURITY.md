@@ -46,5 +46,15 @@ released binaries.
   buffer with the wrong lifetime, disabling a documented validation).
 - Issues requiring a compromised build toolchain or a malicious `build.zig`.
 - Missing hardening that is explicitly documented as a consumer
-  responsibility in a module's `SPEC.md` (e.g. TLS termination — no module
-  ships a TLS server by design).
+  responsibility in a module's `SPEC.md` (e.g. stream TLS termination — no
+  module terminates TLS on a stream transport by design; `http`/`h2` and
+  friends take an already-terminated stream through a BYO-TLS/ALPN seam, so
+  the TLS handshake and certificate policy are the consumer's proxy or
+  `std.crypto.tls`, not ours — see CONVENTIONS.md §2).
+
+**Not out of scope, despite the above:** `dtls` implements a real RFC 9147
+DTLS 1.3 endpoint in *both* roles, server included (`Connection.serverInit`).
+Its handshake, key schedule, cookie/anti-amplification and certificate
+verification are ours and are fully in scope for a report. The stream rule
+does not reach it: there is no datagram equivalent of a TLS-terminating proxy
+to delegate to, and `std` ships no DTLS.

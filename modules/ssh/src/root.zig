@@ -44,7 +44,12 @@ pub const userauth = @import("userauth.zig");
 pub const connection = @import("connection.zig");
 
 pub const meta = .{
-    .platform = .any,
+    // `transport.zig`/`server.zig` `fillRandom` is a raw `getrandom(2)` loop
+    // that `@compileError`s on any non-Linux target, and it is on the core
+    // Binary-Packet-Protocol write path — so the whole module is Linux-only,
+    // not just an optional corner. (One of CONVENTIONS §2's two deliberate
+    // hand-rolled-entropy exceptions, alongside `bulletproofs`.)
+    .platform = .linux,
     .role = .both,
     // One Transport instance = one caller-owned connection with its own
     // sequence-number/cipher state; nothing shared/global.
