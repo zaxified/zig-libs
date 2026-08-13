@@ -100,8 +100,22 @@ below for the signer/keygen internals and the constant-time caveat). See
   a footgun that could silently reopen the leak — add it as a separate module
   variant if a fast-path, non-adversarial-timing consumer ever appears.
   **Remaining gate**: no machine-checked side-channel verification
-  (dudect/ctgrind/binsec) has been run on the compiled artifact — run one
-  before production signing. Keygen (`ntru.zig`) likewise preserves the
+  (dudect/ctgrind/binsec) has been run on the compiled artifact — an
+  out-of-toolchain dudect run before production signing remains the honest
+  ask. **Why this module has no in-repo ctgrind harness, and should not get
+  one.** The repo does now have a valgrind lane — `scripts/ctgrind.sh`,
+  `zig build check-ctgrind` and `scripts/ctgrind-expected.tsv` — so "there is
+  no lane" is no longer the reason. The reason is the sampler itself.
+  `gaussian0` is branchless over the full RCDT table, but `sampler`'s reject
+  loop iterates a *value-dependent* number of times and `berExp` keeps one
+  data-dependent early break, both copied deliberately from the reference
+  (see `src/gaussian.zig`'s header): the constant-time argument there is
+  Bernoulli decorrelation, not a fixed trip count. ctgrind measures exactly
+  what those two constructs do — branch on tainted data — so an in-repo row
+  for `falcon` would be a permanent red that measures the reference design
+  rather than a defect, and pinning it green would require excluding the one
+  primitive the whole gate exists to watch. A red that measures nothing is
+  worse than no row. Keygen (`ntru.zig`) likewise preserves the
   reference's structure and now shares the integer `fpr`; it runs once per
   key, so its side-channel exposure is far smaller than the signer's.
 - Verification and public-key handling touch public data only, so no

@@ -255,14 +255,24 @@ pub const Store = struct {
     /// covering every shard, rather than each shard taking its own via
     /// `kvtree.Db.open`'s default `Options.lock == .exclusive`. Per-shard
     /// locking would work too (it is `kvtree`'s default), but it doubles the
-    /// handle count per shard (data file + lock sidecar), and `FsStorage`'s
-    /// handle table is small and fixed (`max_handles == 4`, sized for one
-    /// `kv`/`kvtree` store's own data+lock+compaction-temp needs) — four
-    /// shards alone would then need 8 concurrently open handles over one
-    /// `FsStorage` and fail with `error.Unexpected`. One lock at the `Store`
-    /// level gives the identical guarantee this module's F2 finding asked
-    /// for — a second `Store` over the same paths gets `error.Locked` with
-    /// nothing touched — at the cost of one handle instead of N.
+    /// handle count per shard (data file + lock sidecar). When this was
+    /// written, `FsStorage`'s handle table was fixed at `max_handles == 4`
+    /// (sized for one `kv`/`kvtree` store's own data+lock+compaction-temp
+    /// needs), so four shards alone would have needed 8 concurrently open
+    /// handles over one `FsStorage` and failed. One lock at the `Store` level
+    /// gives the identical guarantee this module's F2 finding asked for — a
+    /// second `Store` over the same paths gets `error.Locked` with nothing
+    /// touched — at the cost of one handle instead of N.
+    ///
+    /// **That handle constraint is gone, and this is still not debt.**
+    /// `a77c388` raised `kv.FsStorage`'s default table to 64 and added
+    /// `FsStorageCapacity(n)`, so per-shard locking is no longer *blocked*.
+    /// It is simply not better: one store-wide lock is fewer handles, fewer
+    /// files, one acquire/release path to reason about, and it already
+    /// delivers the exclusion guarantee in full. **Do not re-propose
+    /// per-shard locking as a cleanup or a follow-up.** It would buy no
+    /// capability this module lacks and would trade a mechanism that works
+    /// for N of them that each have to.
     fn acquireLock(store: Storage, options: Options) InitError!Storage.Handle {
         var buf: [512]u8 = undefined;
         const path = std.fmt.bufPrint(&buf, "{s}.lock", .{options.name_prefix}) catch

@@ -376,3 +376,7 @@ not own, and what to reach for instead.
 - **`roquery`** — C-level SQLite hardening (authorizer/query_only enforcement); lives consumer-side over adopted zig-sqlite.
 - **`taskqueue`** — folded into `jobqueue`. <!-- non-goal-ok: jobqueue -->
 - **`chunkframe`** — too small to be a module: ~20 lines of clamps with no state. Written out instead at its consumer, `poc-wf-analytic/docs/DATA-PLANE.md` ("The chunk-framing pattern"), where both copies of it live. <!-- non-goal-ok: framing -->
+- **Classic McEliece / BIKE** — code-based KEMs with no consumer here; `hqc` already occupies the post-quantum KEM slot. <!-- non-goal-ok: hqc -->
+- **Isogeny-based crypto** — SIKE is broken (Castryck–Decru), and its successors have no consumer here.
+- **Nostr / Matrix / Tor as protocols** — application protocols rather than foundational libraries; the primitives they rest on (`megolm`, `k256`, `bip340`) already ship. <!-- non-goal-ok: megolm, k256, bip340 -->
+- **SQL sink / DL7-style concurrent store** — app-level storage shapes, not library-level ones; `kvtree`, `tsdb` and `shardstore` are the answer here. <!-- non-goal-ok: kvtree, tsdb, shardstore -->

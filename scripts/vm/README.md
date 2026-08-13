@@ -21,6 +21,18 @@ every boot disposable. This lane exists for exactly those three gaps — it is
 because booting a VM (~20-30s) would wreck the fast edit/test loop those
 exist for.
 
+> **Never propose a `NOPASSWD` sudoers rule for `zig build`.** It is the
+> obvious-looking shortcut past every gap above, and it is not a narrow grant:
+> `build.zig` is arbitrary code, so any rule that lets `zig build` run under
+> sudo without a password is passwordless root for anything this repository —
+> or a dependency, or a patch under review — chooses to put in a build script.
+> That is why the gaps are left as gaps and why **this lane exists at all**: a
+> disposable guest gives you real root without anyone ever having to be asked
+> for that grant on their own machine. If a test needs privilege the host
+> cannot give, the answer is this lane, never a widened sudoers file.
+> (`scripts/README.md` and `scripts/test.sh` state the same rule for the one
+> gap that stays interactive.)
+
 ## Quick start
 
 ```
@@ -97,7 +109,7 @@ real test binaries in them (not by reading docs):
 | `nftables` | openwrt | execution-verified (73 tests incl. live round-trip) |
 | `conntrack` | openwrt | execution-verified (28 tests) |
 | `ebpf` | debian | execution-verified, **137/137**. Six live attach tests (kprobe, uprobe, tracepoint, raw tracepoint, cgroup link) need `CAP_BPF` + `CAP_PERFMON` and skip on any normal host; OpenWRT's kernel has no BPF tooling at all, so this one is debian-only |
-| `fleetsim` | debian | execution-verified. **Not a privilege gap — a *counterpart* gap** (see below): **five** real masters drive five simulated devices in one boot — pymodbus 3.14.0 (Modbus), pycomm3 1.2.16 (EtherNet/IP), bacpypes3 0.0.106 (BACnet), python-snap7 3.1.0 (S7comm), asyncua 2.0.1 (OPC UA) — each grading what it decoded and commanding its marks back into the device. ~5m20s (the live tests run one after another, each holding its socket for a 60 s budget) |
+| `fleetsim` | debian | execution-verified. **Not a privilege gap — a *counterpart* gap** (see below): **seven** real masters drive seven simulated devices in one boot — pymodbus 3.14.0 (Modbus), pycomm3 1.2.16 (EtherNet/IP), bacpypes3 0.0.106 (BACnet), python-snap7 3.1.0 (S7comm), asyncua 2.0.1 (OPC UA), c104 2.2.1 (IEC 60870-5-104), opendnp3 3.1.2 (DNP3, built from source) — each grading what it decoded and commanding its marks back into the device. ~5m20s (the live tests run one after another, each holding its socket for a 60 s budget) |
 | everything else | debian (default) | most NETNS_MODULES don't need this lane at all — `unshare -rn` already covers them (see `scripts/test.sh`'s own `NETNS_MODULES` comment); route here only for isolation, not privilege |
 
 Override with `scripts/vm/run.sh <module> openwrt|debian` when the default
@@ -297,9 +309,13 @@ Marks must be sums, differences, bitmaps, checksums, scaled integers or error
 codes the counterpart itself named — **never an echo of the decoded value**. An
 echo is the inverse of the read, so a device whose encoder and decoder share
 the same wrong convention round-trips it cleanly and the fault hides inside it.
-All five masters here were held to that bar by injecting a wrong value into
-their adapter and checking the **test** went red with the presence marker still
-printed; the four measurements are tabulated in `modules/fleetsim/SPEC.md`.
+All seven masters here design their marks to that bar. Six of them were also
+*measured* against it, by injecting a wrong value into their adapter and
+checking the **test** went red with the presence marker still printed: four are
+tabulated in `modules/fleetsim/SPEC.md`'s "Mutation proofs" table (pycomm3,
+bacpypes3, python-snap7, asyncua), and Modbus and IEC 104 carry theirs in their
+own bullets of that file. DNP3 is wired and grading but has no such injection
+measurement recorded — do not read the six as seven.
 
 ### And freeze what the live run said
 

@@ -139,6 +139,17 @@ high-water mark `highest` plus a `u64` `bitmap` where bit *i* records that
 `highest − (i+1)` has been committed. Width `size` (default 64) is clamped to
 64 by the bitmap capacity — a conscious ceiling.
 
+**On the 64-counter ceiling, and why it is not inherited debt.** WireGuard
+reserves a far larger window (2^13 counters) for the same job, so a reader
+coming from `wireguard` may read this `u64` as an under-built version of that.
+It is not. This module is a generic AEAD record framer, not a WireGuard
+implementation, and it makes no claim to WireGuard's window size; 64 is the
+IPsec/DTLS (RFC 6479) default and is sized for the reordering a record stream
+of this kind actually sees. Widening the bitmap is a **design decision for
+this module's owner**, driven by a consumer that measurably needs a deeper
+window — not a defect to be fixed and not a debt inherited from `wireguard`.
+Do not file it as one.
+
 - `accepts(seq)` (read-only): `true` if `seq > highest` (fresh), or within the
   window (`0 < highest − seq ≤ size`) and its bit is clear. A duplicate of
   `highest` (`diff 0`) or a too-old `seq` (`diff > size`) returns `false`.

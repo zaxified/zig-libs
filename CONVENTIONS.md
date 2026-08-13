@@ -350,9 +350,14 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
 ## 8. Versioning, releases & spin-offs
 
 - **Dated tags, not semver.** A release = a git tag `YYYY-MM-DD` on `main`, cut by
-  `scripts/tag.sh`, which refuses unless all four CI lanes are green at that commit. The tag
+  `scripts/tag.sh`, which refuses unless all three CI lanes — `ReleaseSafe`, `ReleaseFast`,
+  `-Dstrict-debug` — are green at that commit. The tag
   asserts exactly that and nothing more: *every module passed every lane here*. There are no
   per-module version numbers and no collection-wide semantic version.
+  **Why three and not four.** The default (Debug) lane was dropped because `heavy_optimize`
+  in `build.zig` substitutes `ReleaseSafe` for Debug on the heavy modules, which makes every
+  (module, mode) pair of the default lane a subset of the other two. It cost gate time and
+  proved nothing the remaining lanes do not already cover.
   **Why not semver.** Zig resolves dependencies by URL + hash — no resolver reads a version
   string — so a semver tag carries no mechanism, only signal, and on a 225-module collection
   the signal would be false: one number cannot describe modules ranging from externally

@@ -69,14 +69,15 @@ head_sha="$(git rev-parse --short HEAD)"
 echo "tag.sh: candidate tag '$tag' at $head_sha"
 echo
 
-# ── the gate, all four lanes, judged by exit code ───────────────────────────
+# ── the gate, all three lanes, judged by exit code ──────────────────────────
 #
-# Four separate `test.sh all` runs rather than one, because that is what CI
+# Three separate `test.sh all` runs rather than one, because that is what CI
 # runs and what the tag claims. They are sequential: this is a release step,
 # not an inner loop, and running them concurrently would make the wall-clock
 # numbers meaningless while contending for the same build cache.
 # Logs go beside the build cache, not into /tmp. `/tmp` is not dependable
-# here — the first real run of this script lost three of four lane logs to it
+# here — the first real run of this script (back when the gate still had a
+# fourth, default lane) lost three of four lane logs to it
 # and left the fourth as 1509 bytes of nothing, so an hour of gate time
 # produced a refusal nobody could explain. Under `.zig-cache/` they sit next
 # to the build they describe and are already gitignored.

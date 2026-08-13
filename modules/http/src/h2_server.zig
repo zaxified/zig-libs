@@ -325,6 +325,14 @@ pub const Limits = struct {
     /// SETTINGS_MAX_CONCURRENT_STREAMS advertised to the peer and enforced:
     /// request streams above it are refused with RST_STREAM(REFUSED_STREAM)
     /// (retryable, §8.7) while the connection keeps serving.
+    ///
+    /// **This is a cap on STATE, not a concurrency limit.** What it bounds is
+    /// the size of the in-flight jobs map (`s.jobs.count()`); it says nothing
+    /// about how many handlers run at once. Do not reach for it as a worker
+    /// or thread count — at the default 100 that manufactures a 100-way
+    /// fan-out per connection, i.e. it OPENS a DoS surface rather than
+    /// closing one. The handler-parallelism knob is
+    /// `Dispatcher.max_concurrent_handlers` (default 8); see its doc comment.
     max_concurrent_streams: u32 = 100,
     /// Total request streams allowed on one connection; once reached the
     /// server finishes what is ready and closes with GOAWAY(NO_ERROR).

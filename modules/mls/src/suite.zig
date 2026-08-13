@@ -2,10 +2,17 @@
 //! mls.suite — RFC 9420 §5.1/§17.1 Cipher Suites: the named bundle of
 //! (KEM, KDF, AEAD, Hash, Signature) algorithms an MLS session picks once
 //! and uses for every group-key computation. `CipherSuite(...)` is a
-//! comptime type constructor so a later part can slot in more suites (the
-//! P-256/P-384/ChaCha20 variants RFC 9420 §17.1 also registers) without
-//! touching this shape — Part 1 only INSTANTIATES the mandatory suite,
-//! `0x0001`.
+//! comptime type constructor, so the shape would accommodate the other
+//! registered suites (the P-256/P-384/ChaCha20 variants of RFC 9420 §17.1).
+//! Only the mandatory suite `0x0001` is INSTANTIATED, and that is a
+//! deliberate end state, not an unfinished one: nothing in this repo
+//! consumes a ChaCha20 or NIST-curve MLS suite. The `Id` enum below names
+//! them because the registry does, which is a wire-decoding concern, not a
+//! promise to instantiate them. **Do not propose adding an instantiation.**
+//! Standing one up only to have something to rewire would add an untested
+//! crypto path and a maintenance surface with no consumer behind it; the
+//! task is to instantiate a suite when a consumer needs it, and there is no
+//! such consumer.
 //!
 //! `0x0001` = `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`: DHKEM(X25519,
 //! HKDF-SHA256) + HKDF-SHA256 + AES-128-GCM (all three supplied by the
