@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — Test-only, no behaviour change: two regression tests close a coverage gap the
+  2026-08-13 `end()` entry below left open. (1) `"middleware: an OUTER middleware writing after
+  next.run still lands its header"` pins the property that entry's prose claims — reverting to the
+  pre-fix early `end()` now turns this test (and only this test) red, 31/32; `throttle` and `cors`
+  got the identical test when they copied the same fix, this module (where the fix originated,
+  `6ba5d7d`) had neither it nor a dead-frame test until now. (2) `"middleware: 429 Retry-After/
+  RateLimit-* values survive the caller's dead frame"` pins that `retry_buf`/`limit_buf`/`reset_buf`
+  — formatted on `middlewareRun`'s stack frame — depend on `http`'s `ResponseWriter.setHeader`
+  copying their bytes rather than borrowing the caller's; verified by fault-injecting `http`'s
+  `dupe` to return the input slice unchanged, which turns this test red alongside 7 sibling
+  dead-frame tests across the collection (`router`, `tracecontext`, `sessions`, `csrf`, `cookies`,
+  `throttle`, `http`'s own). Both mutations reverted, tree confirmed byte-identical (`cmp`).
 - **2026-08-13** — **BEHAVIOURAL, not breaking** — the 429 deny path no longer forces an early
   `ResponseWriter.end()`. The `Retry-After` and `RateLimit-*` values are
   formatted on the middleware's stack frame and the early `end()` existed only

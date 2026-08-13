@@ -850,6 +850,10 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 " ++ status));
 }
 
+fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
+    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+}
+
 fn hCount(ctx: *router.Ctx) anyerror!void {
     const n: *u32 = @ptrCast(@alignCast(ctx.state.?));
     n.* += 1;
@@ -914,6 +918,107 @@ test "middleware: burst then golden 429 with Retry-After; deny skips the handler
     // After Retry-After elapses the original client passes again.
     tc.advanceMs(1000);
     try expectStatus(runWire(&rl.r, wire(caddy_xff), &buf), "200");
+}
+
+/// A synthetic "outer" middleware shaped like `sessions`/`csrf`: it lets the
+/// chain run, then tries to write a header afterward, swallowing failure
+/// the way `csrf.issue` swallows `addSetCookie`'s error with `catch {}`.
+/// Registered *before* `ratelimit` in the chain, so it wraps it — its own
+/// `next.run` call is what runs `ratelimit`'s `middlewareRun`, the 429
+/// branch included.
+fn mwOuterCookie(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    try next.run(ctx);
+    ctx.res.addSetCookie("session=abc") catch {};
+}
+
+test "middleware: an OUTER middleware writing after next.run still lands its header" {
+    // Before this task, the 429 branch forced an early `end()`, so an outer
+    // middleware working after `next.run` — exactly `sessions` (save/
+    // destroy) and `csrf` (issue) — would have this call return
+    // `error.HeadersSent`, swallowed silently by the `catch {}` both use.
+    // `ratelimit` is where this fix originated (`6ba5d7d`); `throttle` and
+    // `cors` copied it a few commits later and each got this same
+    // regression test — this module never did until now.
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .run = mwOuterCookie });
+    try r.use(l.middleware());
+    try r.get("/t", hCount);
+
+    var hits: u32 = 0;
+    r.state = &hits;
+
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire(""), &buf), "200"); // consumes the one burst token
+    const got = runWire(&r, wire(""), &buf); // second request: denied
+    try expectStatus(got, "429");
+    try expectHeaderLine(got, "Set-Cookie: session=abc");
+}
+
+/// The handler half of the dead-frame test below: format the 429's
+/// `Retry-After` / `RateLimit-*` values into buffers that die with THIS
+/// frame — the exact shape of the deny branch in `middlewareRun`
+/// (`root.zig:432-440`, `retry_buf`/`limit_buf`/`reset_buf`) — and hand them
+/// to `setHeader`. Mirrors `http`'s and `tracecontext`'s own
+/// `setFromDeadFrame`.
+///
+/// A separate `noinline` function, not a block inside the test: Zig gives
+/// each local its own slot for the enclosing function's entire body in
+/// Debug, so a block scope frees nothing and the bug this guards would stay
+/// invisible. Only a returned frame is really reusable.
+noinline fn denyFromDeadFrame(res: *http.Server.ResponseWriter) !void {
+    var retry_buf: [24]u8 = undefined;
+    var limit_buf: [24]u8 = undefined;
+    var reset_buf: [24]u8 = undefined;
+    res.setStatus(429);
+    try res.setHeader("Retry-After", std.fmt.bufPrint(&retry_buf, "{d}", .{1}) catch unreachable);
+    try res.setHeader("RateLimit-Limit", std.fmt.bufPrint(&limit_buf, "{d}", .{2}) catch unreachable);
+    try res.setHeader("RateLimit-Remaining", "0");
+    try res.setHeader("RateLimit-Reset", std.fmt.bufPrint(&reset_buf, "{d}", .{2}) catch unreachable);
+}
+
+/// Reuse the frame `denyFromDeadFrame` just left, the way the next call down
+/// the stack would have. Bigger than that frame so it covers every slot in
+/// it, `noinline` + `doNotOptimizeAway` so neither the call nor the stores
+/// can be optimized out.
+noinline fn clobberDeny429DeadFrame() void {
+    var scratch: [2048]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "middleware: 429 Retry-After/RateLimit-* values survive the caller's dead frame" {
+    // What this pins: `middlewareRun`'s deny branch formats
+    // `Retry-After`/`RateLimit-*` into plain locals that die once
+    // `middlewareRun` returns — well before `end()` runs. This leans
+    // entirely on `http`'s `ResponseWriter.setHeader` copying the bytes
+    // into its own storage rather than borrowing the caller's; `runWire`
+    // drives dispatch with no seam in which to clobber the stack on
+    // purpose, so the writer is built and driven by hand here, mirroring
+    // `http`'s and `tracecontext`'s own dead-frame tests.
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    try denyFromDeadFrame(&rw);
+    clobberDeny429DeadFrame();
+
+    try rw.writeAll("Too Many Requests\n");
+    try rw.end();
+    const got = out.buffered();
+
+    try expectHeaderLine(got, "Retry-After: 1");
+    try expectHeaderLine(got, "RateLimit-Limit: 2");
+    try expectHeaderLine(got, "RateLimit-Remaining: 0");
+    try expectHeaderLine(got, "RateLimit-Reset: 2");
+    // …and not one byte of the clobber pattern anywhere on it.
+    try testing.expect(std.mem.indexOf(u8, got, "#") == null);
 }
 
 test "middleware: key extraction — XFF forms, X-Real-IP, fallback key" {
