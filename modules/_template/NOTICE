@@ -1,0 +1,38 @@
+<name> — provenance note
+
+SKELETON — READ THIS BLOCK, THEN DELETE THE FILE OR FILL IT IN.
+
+Most modules must NOT have this file. 64 of 225 do. If this module ports no
+third-party source, reproduces no third-party data, and studied no named
+third-party implementation, delete it: the `Provenance:` line in README.md is
+the whole record, and `zig build check-catalog` requires that line either way.
+
+LINE 1 IS LOAD-BEARING AND THE GATE READS IT. It must be exactly one of:
+
+    <name> — third-party attribution
+    <name> — provenance note
+
+They are not interchangeable, and picking the wrong one is a real mistake with
+precedent: `brotli` shipped this file as a `provenance note` claiming its
+vectors had been GENERATED with the C library as an oracle, when they were
+byte-for-byte copies of upstream's corpus. It was an attribution all along and
+had to be corrected on 2026-08-12.
+
+  third-party attribution — third-party code was ported or translated, OR
+      third-party data is reproduced whose notice must travel with it. This
+      file then CARRIES A CONDITION naming someone other than the zig-libs
+      authors, and the module MUST also appear in the root NOTICE section 1.
+      State the upstream project, its license, exactly what was taken, and
+      whether it is source or data.
+
+  provenance note — a named third-party implementation was studied for
+      behavior, algorithm or API shape, and nothing was copied. This file
+      carries NO condition and the module MUST NOT appear in root section 1.
+      State the upstream project and its license anyway: that is the record of
+      whose terms would apply if a line were ever copied from it later.
+
+If in doubt, it is an attribution. The failure that matters is understating
+what was taken, never overstating it.
+
+Deciding between them is a question about what was actually done, so answer it
+from the diff, not from memory. "We only looked at it" is what everyone says.

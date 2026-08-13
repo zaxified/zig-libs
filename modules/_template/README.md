@@ -27,30 +27,39 @@ live in §2–§8.
    **model-after** (the other-language reference), the **seed** location if
    extracting from an existing project, and how a consumer uses it. The
    `Provenance:` line at the bottom is required by `check-catalog`.
-4. **Root `README.md`** — add the module's catalog table row, whose first cell
+4. **`SPEC.md`** — fill in the copied skeleton. No gate requires it, which is
+   exactly why it rots: 219 of 225 modules have one. Its load-bearing sections
+   are the ones a reader cannot reconstruct from the code — what this module
+   deliberately does **not** do, what the constant-time claim covers and what it
+   does not, and where the test oracle's authority comes from. Delete a heading
+   that does not apply; leave none empty.
+5. **`NOTICE`** — **delete it unless the module needs it.** Most do not (64 of
+   225 have one). If it stays, line 1 must declare its kind exactly — the file
+   explains the two and why picking wrong is a real mistake with precedent.
+6. **Root `README.md`** — add the module's catalog table row, whose first cell
    is the module name in backticks, and bump the `N modules` count in the
    status line. If the Non-goals section names what you just built, remove that
    row.
-5. **`CHANGELOG.md`** — fill in the copied skeleton (dated `New module:` entry)
-   **and add its one-line pointer to the root `CHANGELOG.md`** under
-   "### Modules with a changelog". Both halves are required:
-   `zig build check-changelog` fails on a module with no changelog, a changelog
-   with no index line, an index line pointing at no file, an entry with a
-   missing or malformed date, or a `BREAKING` tag that disagrees between the
-   two. See `CONVENTIONS.md` §8.
-6. **`ANCHORS.tsv`** — add exactly one row: CLASS `A`/`B` (the module faces the
+7. **`CHANGELOG.md`** — fill in the copied skeleton (dated `New module:` entry).
+   Nothing else: the root `CHANGELOG.md` no longer indexes the modules, because
+   225 one-line copies existed only so a gate could notice they had gone stale.
+   `zig build check-changelog` fails on a module with no changelog, a file that
+   is not one (its title must name the module and it needs an `## Unreleased`
+   heading), or an entry with a missing or malformed date. See
+   `CONVENTIONS.md` §8.
+8. **`ANCHORS.tsv`** — add exactly one row: CLASS `A`/`B` (the module faces the
    outside world, so its test oracle must be a real external authority) or
    `C`/`D` (no outside exists, ANCHOR is `n/a`). The file's own header has the
    vocabulary. `check-catalog` fails without the row.
-7. **Multi-file modules** — every submodule needs a `test { _ = <file>; }` line
+9. **Multi-file modules** — every submodule needs a `test { _ = <file>; }` line
    in `root.zig`. A bare `pub const x = @import("x.zig")` re-export does **not**
    pull `x`'s tests into the test binary: they are never compiled, never run,
    and the suite total agrees with itself (`zig build check-dark-tests`;
    `CONVENTIONS.md` §6 step 3).
-8. **Third-party material** — a *studied* design reference gets an entry in the
+10. **Third-party material** — a *studied* design reference gets an entry in the
    root `NOTICE`; *ported* source puts its terms in `modules/<name>/NOTICE`
    instead, never in the root file.
-9. **Run it** — `zig build test-<name>`, then `zig build test` (or
+11. **Run it** — `zig build test-<name>`, then `zig build test` (or
    `scripts/test.sh changed`), green in **Debug and ReleaseFast**, and
    `zig fmt --check modules/<name>` clean. Once per clone:
    `git config core.hooksPath scripts/hooks`, which refuses a commit whose

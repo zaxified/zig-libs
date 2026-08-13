@@ -295,9 +295,10 @@ reference, not a re-explanation of everything the README already covers.
 5. Update the root `NOTICE` with any third-party design reference + its license. If you
    actually ported third-party source, its terms go in `modules/<name>/NOTICE` instead —
    never in the root file.
-6. Fill in the `CHANGELOG.md` the template ships (a dated `New module:` entry) **and add
-   its one-line pointer to the root `CHANGELOG.md`** — both halves are required from the
-   module's first commit, and `zig build check-changelog` fails without either (§8).
+6. Fill in the `CHANGELOG.md` the template ships (a dated `New module:` entry). It is
+   required from the module's first commit and `zig build check-changelog` fails without it
+   (§8). Nothing needs adding to the root `CHANGELOG.md`: it carries no per-module index
+   (removed 2026-08-14, §8).
 
 `modules/_template/README.md` carries the complete step-by-step list, including the two
 things this narrative does not repeat because a gate owns them: the root README catalog row
@@ -398,6 +399,32 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   `CHANGELOG.md` stays as the per-release index — which modules a tag touched — and does not
   restate the detail. A consumer of three modules should be able to answer "what changed for
   me" by reading three files, not by scanning every release section of one.
+- **The root file carries no per-module index** (removed 2026-08-14). It used to: one pointer
+  bullet per module, 225 of them, 437 of the file's 503 lines, each a link plus a one-line
+  summary and some tagged `BREAKING`. It is gone, and so are the two gate checks that existed
+  only to police it — index membership, and the `BREAKING` mirror.
+  **Why.** Once *every* module has a changelog, "which modules have one" is answered by the
+  premise and the list adds nothing; and a summary that restates its own target is a copy, not
+  an index. That was checked before deleting rather than assumed: all 225 bullets were compared
+  against the file each pointed at, and all 225 were derivable — including every one of the 128
+  finding-counts they asserted (125 stated verbatim in the target, 3 countable from its entries)
+  and every specific figure (`isis-flood`'s 256, `netconf`'s 159s→0.015s, `bacnet`'s ~15 sites).
+  Zero contradictions, so nothing was lost.
+  **The one thing the index alone carried** was which modules have a **BREAKING** change
+  pending — not derivable without opening 225 files. Dropping it is deliberate, on three
+  grounds. `## Unreleased` is by definition not released, so the *consumer* the index was
+  justified by never reads it; the mirror served a maintainer during the pending window. For
+  that maintainer it is dominated by asking the tree — `rg -l '\*\*BREAKING' modules/*/CHANGELOG.md`
+  returned exactly the 12 modules the index tagged at the moment of removal, with no second
+  place to keep in sync (it over-reports once a tag is cut and the tag section keeps its
+  `BREAKING` text, so narrow it to the `## Unreleased` section then). And a check whose only
+  subject is a copy is a closed loop: 12 duplicated lines kept so one check can notice those
+  12 lines went stale. **Deleting the copy deletes the drift, and the check with it** — which
+  is the opposite of fail-open, since there is no longer a claim that can be silently wrong.
+  A half-kept index with a half-kept gate would have been the fail-open shape; that is why the
+  choice was all or nothing. `BEHAVIOURAL, not breaking` remains a **third** classification and
+  not a synonym for either — `cors`, `ratelimit`, `router` and `throttle` carry it — and that
+  distinction now lives only in the module changelogs, which is where it was always decided.
 - **Every entry carries the date it landed.** The form is exactly
 
   ```
@@ -429,24 +456,25 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   which rewrites every hash of the extracted module — and a module CHANGELOG is
   consumer-facing (§5), where a hash serves a reader who already has the clone and can find
   the commit from the entry's own wording anyway. Hashes belong in commit messages and in
-  SPEC.md, where rot is cheap. **The root index carries no dates either**: the date is owned
-  by the module changelog, and an index line one click away is not a second place to keep it.
-- **The index is enforced**: `zig build check-changelog` (run by `scripts/test.sh` in both
-  the `all` and `changed` lanes, so CI runs it) fails when a module in `module_list` has no
-  `CHANGELOG.md` at all, when the file at that path **is not a changelog** — its first line
-  must be a `# ` title naming the module and it must have an `## Unreleased` heading — when a
-  `modules/<name>/CHANGELOG.md`
-  has an entry with a missing or malformed date, when it has no entry in the root index,
-  when an index entry points at a module changelog that does not exist, or when the
-  `BREAKING` tag disagrees between the two. The first two were themselves holes, both closed
-  on 2026-08-13 and each measured rather than assumed. The loop read each module changelog
-  with "skip if unreadable", so a module with no changelog was skipped along with every claim
-  about it, and the state a new module arrives in — no file, no index bullet — passed. The fix
+  SPEC.md, where rot is cheap. **The root file carries no per-entry dates either**: the date is
+  owned by the module changelog, and the root file dates *tags*, not the entries beneath them.
+- **The per-module changelog is enforced**: `zig build check-changelog` (run by
+  `scripts/test.sh` in both the `all` and `changed` lanes, so CI runs it) fails when a module
+  in `module_list` has no `CHANGELOG.md` at all, when the file at that path **is not a
+  changelog** — its first line must be a `# ` title naming the module and it must have an
+  `## Unreleased` heading — when a `modules/<name>/CHANGELOG.md` has an entry with a missing
+  or malformed date, or when a module-changelog link in the root `CHANGELOG.md` points at a
+  file that does not exist. The first two were themselves holes, both closed on 2026-08-13 and
+  each measured rather than assumed. The loop read each module changelog with "skip if
+  unreadable", so a module with no changelog was skipped along with every claim about it, and
+  the state a new module arrives in — no file, and (then) no index bullet — passed. The fix
   left the same reflex one layer in: truncating a module changelog to **zero bytes** still
   passed, because an empty file has no entries to date, no `## Unreleased` to compare, and its
-  index link still resolves. "Exists" and "is a changelog" are different facts, and a
+  index link still resolved. "Exists" and "is a changelog" are different facts, and a
   placeholder that satisfies only the first reads to a consumer as a fully documented module.
-  Neither rule demands an ENTRY under `## Unreleased`: once a tag is cut that section
+  Note that with the index gone, the existence check is now the **only** thing behind "every
+  module has a changelog" — there is no dangling-link path that would catch a deleted file by
+  accident. Neither rule demands an ENTRY under `## Unreleased`: once a tag is cut that section
   legitimately stands empty, and a gate that then asked for a bullet would be asking modules
   to invent one. `modules/_template/` is not in `module_list` and is deliberately outside the
   requirement — which is also why the title rule is "names the module" and not the exact
@@ -455,16 +483,13 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   The date check covers **every** `## ` section,
   not just `## Unreleased` — a rule that stopped applying the moment a tag was cut would be
   a gate switching itself off, and dating an entry is a fact about the past, so a frozen
-  release section never needs editing to stay green. Nothing checked this until
-  it existed and the index had drifted by **16 of 55** entries — the failure mode of an index
-  being that it is silently incomplete, so a consumer reads it and concludes their module did
-  not change. The `BREAKING` half matches the literal `**BREAKING` — a bold span that STARTS
-  with the word — because the obvious "does the word appear" rule is wrong on this tree:
-  `montint`'s entry reads "Classified as **neither BREAKING nor BEHAVIOURAL**" and that rule
-  demands the index tag a constant-time fix as breaking. **`BEHAVIOURAL, not breaking` is a
-  third classification, not a synonym for either** — `cors`, `ratelimit`, `router` and
-  `throttle` carry it, it is not tagged `BREAKING` in the index, and the gate agrees. The
-  module-count sentence in the index prose is deliberately NOT checked: `check-catalog`
+  release section never needs editing to stay green. The link check **matches nothing today**,
+  since the root file carries no module link at all once the index is removed; it is kept
+  because its subject is the root file's links rather than the index, and the first dated tag
+  section — which names the modules that tag touched — reintroduces them, where a typo'd module
+  name is exactly what it catches. A check that currently matches nothing makes no claim that
+  can be silently false, which is what separates it from the index checks it outlived.
+  The module-count sentence in the root prose is deliberately NOT checked: `check-catalog`
   already owns that fact against `module_list.len` in the README, and the sentence is release
   notes that freeze when a tag is cut. See `checkChangelog` in `build.zig` for the full
   calibration and for what a green run does not prove.

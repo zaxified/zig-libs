@@ -7,10 +7,9 @@ Every module in `build.zig`'s `module_list` has one of these, including a module
 whose only history is being created, and `zig build check-changelog` fails when
 one is missing. Two things are needed, not one:
 
-  1. this file, at `modules/<name>/CHANGELOG.md`;
-  2. a one-line pointer to it in the root `CHANGELOG.md`, under
-     "### Modules with a changelog" — that index is what a consumer reads, so a
-     module missing from it reads as a module that did not change.
+  this file, at `modules/<name>/CHANGELOG.md`. The root `CHANGELOG.md` carries
+  only collection-wide notes and the release sections; it does not index the
+  modules.
 
 The `YYYY-MM-DD` below is deliberately not a date: leave it unfilled and the
 gate's date check fails naming this file and line. See `CONVENTIONS.md` §8 for

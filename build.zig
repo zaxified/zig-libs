@@ -460,17 +460,18 @@ pub fn build(b: *std.Build) void {
     });
     check.dependOn(check_inner);
 
-    // Changelog-index gate: `zig build check-changelog`. The root CHANGELOG.md
-    // is, by its own first line, an INDEX -- one pointer line per module that
-    // has a `modules/<m>/CHANGELOG.md`. Nothing checked that it was one, and it
-    // had drifted by 16 of 55 entries before this existed. A SEPARATE step
+    // Changelog gate: `zig build check-changelog`. Every module carries a
+    // `modules/<m>/CHANGELOG.md`, it is really a changelog, and its entries are
+    // dated. (It also policed a per-module index in the root CHANGELOG.md,
+    // which had drifted by 16 of 55 entries before this existed; that index was
+    // removed on 2026-08-14 -- see `checkChangelog`.) A SEPARATE step
     // rather than a section of `check-catalog` for one reason: `check-catalog`
     // is driven by `module_list` and reads README/NOTICE, and the change signal
     // that should run THIS one is editing a CHANGELOG -- which `scripts/test.sh`
     // classified as a root doc "with no module impact" and used to run nothing
     // at all for. Its own step is what let that trigger be wired (see
     // `trigger_changelog` there) without widening `check-catalog`'s.
-    const check_changelog = b.step("check-changelog", "Verify the root CHANGELOG index matches the per-module changelogs");
+    const check_changelog = b.step("check-changelog", "Verify every module has a dated, well-formed CHANGELOG.md");
     const check_changelog_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
     check_changelog_inner.* = std.Build.Step.init(.{
         .id = .custom,
@@ -779,106 +780,120 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
     if (failed) return step.fail("catalog drift — see errors above", .{});
 }
 
-/// `zig build check-changelog` — the root CHANGELOG.md is an index, and this
-/// makes it one.
+/// `zig build check-changelog` — every module documents itself, in a file that
+/// is really a changelog, with every entry dated.
 ///
 /// CONVENTIONS §8 splits the changelog: detail lives in
-/// `modules/<m>/CHANGELOG.md`, and the root file carries one pointer line per
-/// module that has one, so a consumer of three modules reads three files. That
-/// split moved the root file from 678 lines to 113 -- and then nothing checked
-/// it. By the time this was written 16 of 55 module changelogs (`acme`, `bbs`,
-/// `bls12_381`, `cookies`, `cors`, `ed448`, `entropy`, `ibe`, `ratelimit`,
-/// `router`, `sessions`, `signal`, `throttle`, `timelock_envelope`, `tlock`,
-/// `wireguard`) had no index line at all, which is the failure mode an index
-/// has: it is silently incomplete, and a consumer who reads it concludes their
-/// module did not change.
+/// `modules/<m>/CHANGELOG.md` and the root file does not restate it, so a
+/// consumer of three modules reads three files.
 ///
-/// Five claims:
+/// HISTORY, because it is what every rule below was bought with. The root file
+/// used to carry a per-module INDEX -- one pointer bullet per module, 225 of
+/// them, 437 of the file's 503 lines -- and this gate spent three of its five
+/// claims enforcing that index against the tree. Nothing had checked it when it
+/// was written, and 16 of 55 module changelogs (`acme`, `bbs`, `bls12_381`,
+/// `cookies`, `cors`, `ed448`, `entropy`, `ibe`, `ratelimit`, `router`,
+/// `sessions`, `signal`, `throttle`, `timelock_envelope`, `tlock`, `wireguard`)
+/// had no index line at all -- the failure mode an index has, being silently
+/// incomplete, so a consumer reads it and concludes their module did not
+/// change. The index was removed on 2026-08-14 and the two claims that existed
+/// only to police it went with it; see "WHY THE INDEX CHECKS ARE GONE" below.
+/// The three claims that survived are about the module files themselves, and
+/// each of them caught a real hole on the real tree.
+///
+/// Four claims:
 ///
 ///  0. Every entry in a `modules/<m>/CHANGELOG.md` carries its landing date.
 ///     See `checkEntryDates` for the format and its calibration.
-///  1. Every module in `module_list` HAS a `modules/<m>/CHANGELOG.md`, and it is
-///     linked from the root index. Driven from `module_list`; a `modules/<x>/`
-///     that is not in `module_list` is `check-catalog`'s error, not this one,
-///     and `modules/_template/` -- which is not in `module_list` -- is outside
-///     the requirement by construction.
+///  1. Every module in `module_list` HAS a `modules/<m>/CHANGELOG.md`. Driven
+///     from `module_list`; a `modules/<x>/` that is not in `module_list` is
+///     `check-catalog`'s error, not this one, and `modules/_template/` -- which
+///     is not in `module_list` -- is outside the requirement by construction.
 ///  1b. That file is a CHANGELOG and not merely a file at that path. See
 ///     `checkChangelogShape` for the two landmarks and their calibration.
-///  2. Every `modules/<m>/CHANGELOG.md` link IN the root index resolves to a
-///     file that exists. Driven from the root file's text, so -- unlike (1) --
-///     it can see an entry that corresponds to nothing. Both directions are
-///     needed for the same reason `checkProvenance`'s claim 4 is: a check
-///     driven only from `module_list` is structurally blind to a stale row.
-///  3. The `BREAKING` tag agrees between the two files.
+///  2. Every `modules/<m>/CHANGELOG.md` link IN the root file resolves to a
+///     file that exists. This is link integrity, not index membership: it does
+///     not ask that any particular module be linked, only that a link the root
+///     file does carry points at something. See its own note below for what it
+///     covers TODAY, which is nothing, and why it is kept anyway.
 ///
-/// WHY (1) DEMANDS THE FILE, NOT JUST ITS INDEX LINE. The first version of this
-/// loop read each module changelog with `catch continue`, so a module with NO
-/// `CHANGELOG.md` was skipped entirely and every claim below it was skipped with
-/// it. That is fail-open in exactly the shape a new module arrives in. Measured
-/// on the real tree, not reasoned about: deleting `modules/tlock/CHANGELOG.md`
-/// ALONE is caught -- by (2), as a dangling index link, EXIT=1 -- but deleting
-/// the file AND its one root-index bullet, which is the state of a module added
-/// today, gave EXIT=0. So the root index's own promise ("Every module now
-/// carries a `CHANGELOG.md`, not only the ones with a code change to record")
-/// held over 225 of 225 modules as a fact about that morning and not as an
-/// invariant, and the one case where a gate is worth having -- a module being
-/// added -- was the one case it did not cover. A read failure that is not
-/// `FileNotFound` fails too: the gate cannot verify what it cannot read, and
-/// "skip whatever you could not read" is the exact reflex that produced the
-/// hole in the first place. That fix left the same reflex one layer in, which
-/// is what (1b) closes: measured on the real tree, truncating
-/// `modules/tlock/CHANGELOG.md` to ZERO BYTES gave EXIT=0, because a file that
-/// exists satisfies (1), an empty file has no entries for (0) to date, no
-/// `## Unreleased` for (3) to compare -- `orelse continue` -- and the index
-/// link still resolves for (2). The gate enforced "a file exists", so a module
-/// could hold a zero-byte placeholder and read as fully documented.
+/// WHY (1) DEMANDS THE FILE. The first version of this loop read each module
+/// changelog with `catch continue`, so a module with NO `CHANGELOG.md` was
+/// skipped entirely and every claim below it was skipped with it. That is
+/// fail-open in exactly the shape a new module arrives in. Measured on the real
+/// tree, not reasoned about: with the index still in place, deleting
+/// `modules/tlock/CHANGELOG.md` ALONE was caught -- as a dangling index link,
+/// EXIT=1 -- but deleting the file AND its one index bullet, which is the state
+/// of a module added today, gave EXIT=0. So the claim "every module carries a
+/// `CHANGELOG.md`" held over 225 of 225 modules as a fact about that morning
+/// and not as an invariant, and the one case where a gate is worth having -- a
+/// module being added -- was the one case it did not cover. Note that this is
+/// now the ONLY thing standing behind that invariant: the index is gone, so
+/// there is no dangling-link path that would catch a deleted changelog by
+/// accident. A read failure that is not `FileNotFound` fails too: the gate
+/// cannot verify what it cannot read, and "skip whatever you could not read" is
+/// the exact reflex that produced the hole in the first place. That fix left
+/// the same reflex one layer in, which is what (1b) closes: measured on the
+/// real tree, truncating `modules/tlock/CHANGELOG.md` to ZERO BYTES gave
+/// EXIT=0, because a file that exists satisfied (1), an empty file has no
+/// entries for (0) to date, and the index link still resolved. The gate
+/// enforced "a file exists", so a module could hold a zero-byte placeholder and
+/// read as fully documented.
 ///
-/// WHY (3) IS IN, GIVEN THAT IT PARSES PROSE. The index's own text promises
-/// exactly this invariant ("a `BREAKING` tag means the module's own changelog
-/// flags at least one breaking change in its `Unreleased` section"), and it is
-/// the one field of an index line a consumer acts on -- an index that says
-/// nothing broke while the module says something did is worse than a missing
-/// line. The risk is a gate that cries wolf, so the rule was calibrated against
-/// the whole corpus before being adopted, not after:
+/// WHY THE INDEX CHECKS ARE GONE. Two claims were dropped with the index: that
+/// every module changelog is linked from it, and that a `**BREAKING` tag in a
+/// module's `Unreleased` section is mirrored in the module's index bullet.
+/// Both were real, both were green, and neither had a subject once the index
+/// did not exist -- their entire subject was the copy the index made of facts
+/// the module files already state. The `BREAKING` mirror is the one worth
+/// spelling out, because it is the only thing the index carried that a reader
+/// could not get without opening 225 files:
 ///
-///   - The obvious rule -- "the word BREAKING appears" -- is WRONG on the real
-///     tree. `montint`'s entry reads "Classified as **neither BREAKING nor
-///     BEHAVIOURAL**", a deliberate negation, and the naive rule demands the
-///     index tag a constant-time fix as breaking. One false failure out of 39
-///     entries on day one, in the direction that makes people delete gates.
-///   - The rule used instead is the literal `**BREAKING` -- the tag is a bold
-///     span that STARTS with the word. Every one of the 22 occurrences across
-///     the module changelogs is of that shape (`**BREAKING:**`, `**BREAKING**`,
-///     `**BREAKING (wire):**`, `**BREAKING (API):**`, `**BREAKING
-///     (behavioral):**`, `**BREAKING — `), and `montint`'s negation is not,
-///     because its bold span starts with "neither". Measured against all 39
-///     pre-existing index lines: 11 tagged, 11 expected, 0 disagreements.
-///   - It fails OPEN on a spelling nobody uses (`**Breaking:**` would read as
-///     "not breaking" and pass). That is the right direction for a gate whose
-///     alternative is being switched off.
+///   - `## Unreleased` is by definition not released, so the consumer the index
+///     was justified by does not read it. The mirror served a MAINTAINER during
+///     the pending window, and for that maintainer it is dominated by asking
+///     the tree directly -- `rg -l '\*\*BREAKING' modules/*/CHANGELOG.md`,
+///     which returned exactly the 12 modules the index tagged (`bfv`,
+///     `coconut`, `cookies`, `dtls`, `fss`, `hpke`, `http`, `saml`,
+///     `security-headers`, `snmp`, `tfhe`, `threshold_ecdsa`) at the moment of
+///     removal, with no second place to keep in sync.
+///   - A check whose only subject is a copy is a closed loop: 12 duplicated
+///     lines kept so that one check can notice those same 12 lines went stale.
+///     Deleting the copy deletes the drift, and the check with it. That is the
+///     opposite of fail-open -- there is no longer a claim that can be silently
+///     wrong -- which is why the remnant was not kept half-enforced.
+///   - Before deleting, all 225 bullets were checked against the file each
+///     pointed at, on the premise that a summary which is not derivable from
+///     its target is content and not an index. All 225 were derivable,
+///     including every one of the 128 finding-counts they asserted (125 stated
+///     verbatim in the target, 3 -- `threshold_ecdsa`, `validate`, `zipstream`
+///     -- countable from its entries) and every specific figure they carried
+///     (`isis-flood`'s 256, `netconf`'s 159s→0.015s, `bacnet`'s ~15 sites).
+///     Zero contradictions. Nothing was lost by deleting it.
 ///
-/// `BEHAVIOURAL, not breaking` -- which `cors`, `ratelimit`, `router` and
-/// `throttle` carry -- is a DIFFERENT classification and deliberately does not
-/// trip this. It contains no `**BREAKING`, so the rule already separates them;
-/// the index states the distinction in prose so nobody re-conflates them.
+/// The `**BREAKING` matching rule and its calibration are not reproduced here
+/// because nothing matches on it any more; CONVENTIONS §8 keeps the one part
+/// that is still live, which is that `BEHAVIOURAL, not breaking` is a third
+/// classification and not a synonym for either.
 ///
-/// WHAT IS DELIBERATELY NOT CHECKED: the module count in the index prose
-/// ("the collection grew 77 → 225 modules"). `check-catalog` already pins a
-/// module count against `module_list.len`, in the README, which is the one
-/// place that fact is owned; a second gate on the same fact in a different
-/// file is a second thing to get wrong. Worse, this sentence is release NOTES,
-/// not a live count -- once a tag is cut it freezes with the rest of the
-/// section, and a check keyed to `module_list.len` would then demand editing
-/// released history to keep itself green. That is the shape of a gate people
-/// disable.
+/// WHAT (2) COVERS TODAY: nothing. With the index gone the root file carries no
+/// `](modules/…/CHANGELOG.md)` link at all, so this loop matches zero times,
+/// and that is stated rather than left for someone to discover. It is kept
+/// because its subject is not the index but the root file's links, and §8 keeps
+/// the root file in the business of naming modules -- a dated tag section says
+/// which modules that tag touched. The first such section reintroduces links,
+/// and a typo'd module name in one is exactly what this catches. A check that
+/// currently matches nothing is not fail-open; it makes no claim that could be
+/// silently false, unlike the index checks it outlived.
 ///
-/// SCOPE OF (3), stated so a green run is not over-read: it compares the
-/// `## Unreleased` section of each file. After a tag is cut both sections are
-/// empty and (3) checks nothing, while (1) and (2) keep working off the whole
-/// file. A module that gains a NEW `Unreleased` entry after a tag is caught,
-/// because (3) requires an `Unreleased` index bullet whenever the module's
-/// `Unreleased` has one -- but a module whose `Unreleased` is empty is not
-/// asked about at all.
+/// WHAT IS DELIBERATELY NOT CHECKED: the module count in the root prose ("the
+/// collection grew 77 → 225 modules"). `check-catalog` already pins a module
+/// count against `module_list.len`, in the README, which is the one place that
+/// fact is owned; a second gate on the same fact in a different file is a
+/// second thing to get wrong. Worse, this sentence is release NOTES, not a live
+/// count -- once a tag is cut it freezes with the rest of the section, and a
+/// check keyed to `module_list.len` would then demand editing released history
+/// to keep itself green. That is the shape of a gate people disable.
 fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
     _ = options;
     const b = step.owner;
@@ -887,97 +902,32 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
 
     var failed = false;
 
-    const root_unreleased = unreleasedSection(root) orelse blk: {
-        std.log.err("CHANGELOG.md has no `## Unreleased` section for the changelog gate to check", .{});
-        failed = true;
-        break :blk "";
-    };
-
-    // (1) + (3): every module HAS a changelog, it is indexed, and the tag agrees.
+    // (1): every module HAS a changelog, (1b) it is one, (0) its entries are dated.
     for (module_list) |m| {
         const path = b.fmt("modules/{s}/CHANGELOG.md", .{m.name});
         const text = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
             std.log.err(
                 "module '{s}' has no readable {s} ({s}) — every module in `module_list` carries " ++
                     "one (CONVENTIONS.md §8), including a module whose only history is being " ++
-                    "created. Copy `modules/_template/CHANGELOG.md` to {s}, fill in its heading " ++
-                    "and its dated `New module:` entry, then add the one-line pointer " ++
-                    "`- [`{s}`]({s})` to the root CHANGELOG.md under \"### Modules with a " ++
-                    "changelog\" — the file alone is not enough, the index is what a consumer " ++
-                    "reads. (`modules/_template/` is not in `module_list` and is not asked for " ++
-                    "one.)",
-                .{ m.name, path, @errorName(err), path, m.name, path },
+                    "created. Copy `modules/_template/CHANGELOG.md` to {s} and fill in its " ++
+                    "heading and its dated `New module:` entry. (`modules/_template/` is not in " ++
+                    "`module_list` and is not asked for one.)",
+                .{ m.name, path, @errorName(err), path },
             );
             failed = true;
             continue;
         };
 
-        // (1b) runs first: the checks below read structure out of this file, so
-        // "is it a changelog at all" is the question that has to be answered
-        // before any of them mean anything.
+        // (1b) runs first: (0) reads structure out of this file, so "is it a
+        // changelog at all" is the question that has to be answered before it
+        // means anything.
         checkChangelogShape(m.name, path, text, &failed);
-
-        // (0) runs before the index checks, and outside their `continue`s: an
-        // entry with no date is wrong whether or not the index links the file.
         checkEntryDates(m.name, path, text, &failed);
-
-        if (std.mem.indexOf(u8, root, b.fmt("]({s})", .{path})) == null) {
-            std.log.err(
-                "module '{s}' has a {s} that the root CHANGELOG.md never links — add a one-line " ++
-                    "pointer `- [`{s}`]({s})` under \"### Modules with a changelog\". The root file " ++
-                    "is an index (CONVENTIONS.md §8); a module missing from it reads to a consumer " ++
-                    "as a module that did not change.",
-                .{ m.name, path, m.name, path },
-            );
-            failed = true;
-            continue;
-        }
-
-        // Absent only in a file (1b) has already failed the build over, so this
-        // `continue` no longer skips a module silently.
-        const mod_unreleased = unreleasedSection(text) orelse continue;
-        // "Has an entry" = has a bullet. A section with only a heading is a
-        // module whose history is all under dated tags, and (3) does not ask
-        // about it.
-        if (std.mem.indexOf(u8, mod_unreleased, "\n- ") == null) continue;
-
-        const bullet_head = b.fmt("- [`{s}`]({s})", .{ m.name, path });
-        const bullet = indexBullet(root_unreleased, bullet_head) orelse {
-            std.log.err(
-                "module '{s}' has an `## Unreleased` entry in {s} but the root CHANGELOG.md's own " ++
-                    "`## Unreleased` index has no `{s}` line for it",
-                .{ m.name, path, bullet_head },
-            );
-            failed = true;
-            continue;
-        };
-
-        // See the rule's calibration in this function's doc comment: the tag is
-        // a bold span STARTING with the word, which is what keeps `montint`'s
-        // "**neither BREAKING nor BEHAVIOURAL**" from being read as a tag.
-        const mod_breaking = std.mem.indexOf(u8, mod_unreleased, "**BREAKING") != null;
-        const idx_breaking = std.mem.indexOf(u8, bullet, "**BREAKING") != null;
-        if (mod_breaking and !idx_breaking) {
-            std.log.err(
-                "module '{s}' flags **BREAKING in its `Unreleased` section but its root CHANGELOG.md " ++
-                    "index line does not — the index promises the tag means exactly this. (If the " ++
-                    "module's entry is `BEHAVIOURAL, not breaking`, it does not carry the tag and " ++
-                    "this would not fire.)",
-                .{m.name},
-            );
-            failed = true;
-        } else if (idx_breaking and !mod_breaking) {
-            std.log.err(
-                "module '{s}' is tagged **BREAKING** in the root CHANGELOG.md index but its own " ++
-                    "`{s}` `Unreleased` section flags no breaking change",
-                .{ m.name, path },
-            );
-            failed = true;
-        }
     }
 
-    // (2): every index link resolves. Driven from the root file's text, which
-    // is the only direction that can see an entry pointing at nothing.
+    // (2): every module-changelog link in the root file resolves. Driven from
+    // the root file's text, which is the only direction that can see a link
+    // pointing at nothing. Matches nothing today -- see the doc comment.
     const tail = "/CHANGELOG.md)";
     const head = "](modules/";
     var i: usize = 0;
@@ -991,14 +941,14 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
         if (name.len == 0 or std.mem.indexOfAny(u8, name, "/()`[] \t\n") != null) continue;
         if (!fileExists(b, io, b.fmt("modules/{s}/CHANGELOG.md", .{name}))) {
             std.log.err(
-                "root CHANGELOG.md indexes `modules/{s}/CHANGELOG.md`, which does not exist",
+                "root CHANGELOG.md links `modules/{s}/CHANGELOG.md`, which does not exist",
                 .{name},
             );
             failed = true;
         }
     }
 
-    if (failed) return step.fail("changelog index drift — see errors above", .{});
+    if (failed) return step.fail("changelog gate failed — see errors above", .{});
 }
 
 /// Claim (1b): the file at `modules/<m>/CHANGELOG.md` is a changelog, not just
@@ -1008,9 +958,10 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
 /// the file, truncating `modules/tlock/CHANGELOG.md` to zero bytes still gave
 /// `zig build check-changelog` EXIT=0. Every other claim is written to read
 /// structure OUT of this file, so an empty one answers all of them vacuously —
-/// no entries to date, no `## Unreleased` to compare against the index, and the
-/// index link resolves because the file is there. "Exists" and "is a changelog"
-/// are different facts and only the first was checked.
+/// no entries to date, and (when the root index still existed) no
+/// `## Unreleased` to compare against it while its index link resolved because
+/// the file was there. "Exists" and "is a changelog" are different facts and
+/// only the first was checked.
 ///
 /// THE RULE: two landmarks, both required.
 ///
@@ -1018,7 +969,7 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
 ///   2. The file has an `## Unreleased` section heading.
 ///
 /// CALIBRATED AGAINST THE WHOLE CORPUS BEFORE ADOPTION, which is the lesson the
-/// `**BREAKING` rule in `checkChangelog` is written from. All 225 files in
+/// since-removed `**BREAKING` index rule was written from. All 225 files in
 /// `module_list` were checked, not sampled: 225/225 open with exactly
 /// `# <name> — changelog`, 225/225 carry `## Unreleased`, and 225/225 have
 /// exactly one `## ` heading (no tag has been cut in a module changelog yet).
@@ -1033,20 +984,28 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
 /// filled-in template either way, and still catches a template copied WITHOUT
 /// renaming, because `<name>` does not contain the module's name.
 ///
-/// WHY `## Unreleased` IS DEMANDED BUT AN ENTRY UNDER IT IS NOT. The heading is
-/// the file's contract with the root index — (3) compares that section, and
-/// with no heading at all `unreleasedSection` returns null and the module falls
-/// out of the loop through `orelse continue`, which is the fail-open path
-/// itself. A BULLET is deliberately not required even though 225/225 have one
-/// today: the moment a tag is cut those bullets move into the release section
-/// and the heading legitimately stands empty, and a gate that then demanded an
-/// entry would be asking modules to invent one. That is the same distinction
-/// `checkChangelog` already draws at "a section with only a heading".
+/// WHY `## Unreleased` IS STILL DEMANDED, AND WHY AN ENTRY UNDER IT IS NOT.
+/// This landmark was originally justified by the root index: (3) compared that
+/// section, and a file with no heading fell out of the comparison through
+/// `orelse continue`, which was the fail-open path itself. That justification
+/// died with the index, so the landmark is re-argued rather than inherited. It
+/// is kept because it is the second half of "this is a changelog": the heading
+/// is where the next entry goes, §8 requires it, and 225/225 carry it — a file
+/// with a title and no `## Unreleased` gives an author nowhere to write and is
+/// the shape a hand-made stub takes. It is NOT load-bearing for the zero-byte
+/// case any more; the title landmark alone catches that, and the two are kept
+/// as independent facts rather than one rule doing double duty. A BULLET is
+/// deliberately not required even though 225/225 have one today: the moment a
+/// tag is cut those bullets move into the release section and the heading
+/// legitimately stands empty, and a gate that then demanded an entry would be
+/// asking modules to invent one.
 ///
 /// WHAT IS DELIBERATELY NOT CHECKED: the preamble line pointing back at the
-/// root index (225/225 carry it, but it is prose that says nothing a reader
-/// cannot get from the link they followed), and any minimum length — a byte
-/// count is a proxy for the two facts above, and a worse one.
+/// root `CHANGELOG.md` (226/226 files carry it; it is prose, and it survived
+/// the index's removal intact because it points at the root file for "which
+/// release tag each entry shipped in" — the release index — and never at the
+/// per-module index that was deleted), and any minimum length — a byte count
+/// is a proxy for the two facts above, and a worse one.
 fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, failed: *bool) void {
     const nl = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
     const title = text[0..nl];
@@ -1063,11 +1022,10 @@ fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, fai
     }
     if (unreleasedSection(text) == null) {
         std.log.err(
-            "{s}: no `## Unreleased` heading — every module changelog has one, and it is the " ++
-                "section the root CHANGELOG.md index is checked against. Without it the module " ++
-                "silently drops out of that comparison. Add the heading (it may stand empty " ++
-                "once a tag is cut; what is not allowed is its absence). Module '{s}'; see " ++
-                "CONVENTIONS.md §8.",
+            "{s}: no `## Unreleased` heading — every module changelog has one, and it is where " ++
+                "the next entry goes; a file with a title and nowhere to write is the shape a " ++
+                "hand-made stub takes. Add the heading (it may stand empty once a tag is cut; " ++
+                "what is not allowed is its absence). Module '{s}'; see CONVENTIONS.md §8.",
             .{ path, name },
         );
         failed.* = true;
@@ -1137,9 +1095,10 @@ fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, fai
 ///
 /// WHAT IS DELIBERATELY NOT CHECKED:
 ///
-///   - The ROOT index carries no dates. The date is owned by the module
-///     changelog, and restating it on the index line would be a second place
-///     to get it wrong for no reader who is not one click away from the first.
+///   - The ROOT file carries no per-entry dates. The date is owned by the
+///     module changelog; the root file dates TAGS, not the entries beneath
+///     them, and restating an entry date there would be a second place to get
+///     it wrong.
 ///   - That an entry's date is <= the date of the release section holding it.
 ///     True by construction, but no released module section exists yet, so the
 ///     rule would ship with zero instances behind it — an untested branch that
@@ -1151,14 +1110,14 @@ fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, fai
 ///     commit that records it, which always exists.
 ///
 /// CALIBRATION, run before the rule was adopted rather than after (the lesson
-/// the `**BREAKING` rule above is written from): dry-run against all 55
+/// the since-removed `**BREAKING` index rule was written from): all 55
 /// existing files after the retrofit — 88 entries, 88 accepted, 0
 /// disagreements. Both failure directions were then proven by planting them: a
 /// stripped date and a `2026-8-13` / `13-08-2026` malformation each turn this
 /// red, naming the file and line.
 fn checkEntryDates(name: []const u8, path: []const u8, text: []const u8, failed: *bool) void {
     // The body starts at the first `## ` heading; the preamble above it is the
-    // file's title and the pointer back to the root index, not entries.
+    // file's title and its pointer back to the root CHANGELOG.md, not entries.
     var body_start: usize = 0;
     if (!std.mem.startsWith(u8, text, "## ")) {
         body_start = (std.mem.indexOf(u8, text, "\n## ") orelse return) + 1;
@@ -1230,19 +1189,6 @@ fn unreleasedSection(text: []const u8) ?[]const u8 {
     const start = std.mem.indexOf(u8, text, heading) orelse return null;
     const rest = text[start + heading.len ..];
     const end = std.mem.indexOf(u8, rest, "\n## ") orelse rest.len;
-    return rest[0..end];
-}
-
-/// One `- […](…)` list item of the index, from `head` to the next item or the
-/// next heading. Index entries are hard-wrapped over several lines, so a
-/// per-line search would only ever see the first of them — and the `BREAKING`
-/// tag is not always on it (`bfv`'s is, `hpke`'s continuation lines are not).
-fn indexBullet(section: []const u8, head: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, section, head) orelse return null;
-    const rest = section[start..];
-    var end = rest.len;
-    if (std.mem.indexOfPos(u8, rest, head.len, "\n- ")) |n| end = @min(end, n);
-    if (std.mem.indexOfPos(u8, rest, head.len, "\n#")) |n| end = @min(end, n);
     return rest[0..end];
 }
 
