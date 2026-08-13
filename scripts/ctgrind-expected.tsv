@@ -27,9 +27,18 @@
 #            std's `rejectIdentity` context that ct25519's negative control
 #            needs only to EXIST.
 #
-# Measured 2026-08-11, zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ),
-# `poly1305.lanes = 4`. Change a number here only together with the module's
-# SPEC.md table, and only after re-running the harness.
+# A NON-ZERO in_file is NOT automatically "fine". Two of the rows below record
+# a MEASURED DEFECT rather than an accounted-for validation, and they are marked
+# DEFECT in the comment above them. Recording a defect here is deliberate — an
+# unrecorded one is invisible, and a row that goes red when it is FIXED is how
+# the fix gets noticed — but nobody should read a green `--check` as "every
+# constant-time claim in this repo holds". It means "the measurements still say
+# what they said when they were taken".
+#
+# Measured 2026-08-11 (chachapoly…ed448) and 2026-08-13 (k256, montint),
+# zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ), `poly1305.lanes = 4`. Change
+# a number here only together with the module's SPEC.md table, and only after
+# re-running the harness.
 #
 # module	mode	target	total_min	in_file
 chachapoly	ReleaseFast	poly1305	1	0
@@ -41,3 +50,18 @@ decaf448	ReleaseFast	scalarmul	1	0
 ecvrf	ReleaseFast	prove	1	3
 ed448	ReleaseFast	full	1	3
 ed448	ReleaseFast	ladder	1	0
+# k256 — the field layer is clean; every group/sign context is a `rejectIdentity`
+# or an input validation, itemised line by line in `modules/k256/SPEC.md`.
+k256	ReleaseFast	field	1	0
+k256	ReleaseFast	mul	1	2
+k256	ReleaseFast	comb	1	1
+k256	ReleaseFast	sign	1	11
+# montint — `asmcore` (L=32, the amd64 core) is the clean one. `small` (L=4) and
+# `portable` (L=16) are **DEFECT** rows: ReleaseFast lowers `condSubTop`'s masked
+# select, and `sub`'s masked add-back, to a `test`/`jne` on the secret-derived
+# borrow — the Montgomery final-subtraction leak, inside `powMont`. See
+# `modules/montint/SPEC.md` § "Constant-time contract". A fix must drive both to
+# 0 and this file must be updated in the same change.
+montint	ReleaseFast	small	1	7
+montint	ReleaseFast	portable	1	5
+montint	ReleaseFast	asmcore	1	0

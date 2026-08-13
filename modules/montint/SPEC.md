@@ -111,6 +111,80 @@ Same guarantee `ff` gives (best-effort CT), enforced structurally:
 The amd64 core inherits the contract — the CIOS instruction schedule is fixed
 and the final subtract must stay a `CMOV`/masked select, not a `Jcc`.
 
+### ⚠ MEASURED 2026-08-13: the PORTABLE path violates two of those bullets
+
+`scripts/ctgrind.sh montint` (harness: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig))
+is the first timing-audit tool ever run against this module, and it contradicts
+the "enforced structurally" claim on the portable path. **This is recorded, not
+fixed** — the fix is a decision for the module owner, and the table below is what
+a fix has to move.
+
+**Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64 + ADX/BMI2,
+ReleaseFast, 2026-08-13; `in-file` = memcheck CONTEXTS whose stack names
+`montint.zig`, `limbs.zig` or `asm_core.zig`):
+
+| target | modulus | dispatch | `-fvalgrind` | tainted | total | in-file | exit |
+|---|---|---|---|---|---|---|---|
+| `small` | `Modint(256)`, L=4 | portable CIOS (both cutoffs missed) | yes | **yes** | 15 | **7** ⚠ | 99 |
+| `small` | | | yes | no | 0 | 0 | 0 *(control)* |
+| `small` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
+| `portable` | `Modint(1024)`, L=16 | portable CIOS + `montSqrCios` | yes | **yes** | 7 | **5** ⚠ | 99 |
+| `portable` | | | yes | no | 0 | 0 | 0 *(control)* |
+| `portable` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
+| `asmcore` | `Modint(2048)`, L=32 | `asm_core.montMul`/`montSqr` | yes | **yes** | 2 | **0** ✅ | 99 |
+| `asmcore` | | | yes | no | 0 | 0 | 0 *(control)* |
+| `asmcore` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
+
+`small` and `portable` taint both operands / both the base and the EXPONENT;
+`portable` and `asmcore` run a full `powMont`.
+
+**What the non-zeros are.** Every one is the same shape — LLVM recovered
+`bit ∈ {0,1}` from the borrow, concluded the mask is `0` or all-ones, and hoisted
+the whole masked select behind a branch:
+
+- `condSubTop` (`montint.zig:485`) — the final conditional subtract of every
+  `montMulCios`, `montSqrCios`, `add` and `doubleMod`. Disassembly at the
+  reported address: `cmp %rdx,%rsi; setb …; testb $0x1,…; jne` skipping the
+  entire store block (and at L=16 the block is an AVX `vmovups` pair, so the
+  branch is unmistakable). This is the **Montgomery final-subtraction leak** —
+  the branch reveals, per multiply, whether the pre-reduction value was `≥ m`.
+- `sub` (`montint.zig:214`, inlined `limbs.subInto`) — the masked add-back of
+  `m` on borrow, compiled to `test $0x1,%dil; je`. The bullet "conditional
+  add/subtract via a mask, no data-dependent branch" does not hold as compiled.
+
+In `powMont` the leak fires on **every** window: 3 contexts via `montMulCios`
+(`toMontgomery`, the table build, the per-window multiply) plus 1 via
+`montSqrCios` (the 5 squarings per window) plus 1 via `fromMontgomery`.
+
+**What is clean.** `asm_core`'s own `condSub` (`asm_core.zig:479`) reports
+**zero** — its second pass subtracts `m & smask` *unconditionally* instead of
+selecting between two buffers, so there is no branch for LLVM to hoist. The fix
+pattern therefore already exists in this module, in the sibling file. The
+`powMont` window logic, the 32-entry `blackBox`-laundered table gather, and
+`getBits` are all clean at every size.
+
+**Blast radius.** The dispatch cutoff `asm_min_limbs = 32` means the leaky path
+is the DEFAULT for: every non-amd64 target (all `L`); every modulus `< 2048-bit`
+on amd64 — which by `rsa`'s own dispatch comment is exactly **RSA-2048 CRT
+signing/decryption, whose mod-p and mod-q halves run at L=16** with the secret
+CRT exponents `dP`/`dQ`; plus `paillier`, `threshold_ecdsa`'s `powCt`, and the
+pairing-field sizes (L=4/6) the small-L comment calls out as ones that "MUST stay
+portable".
+
+**The measurement has teeth** (positive controls, each reverted and `cmp`-verified
+byte-identical afterwards):
+
+| injected defect | effect |
+|---|---|
+| `if (a[j] == 0) continue;` in `montMulCios`'s inner loop | `small` 7 → 27, `portable` 5 → 69, 20 new contexts at the mutated line |
+| `if (digit != 0)` around `powMont`'s window multiply | `portable` 5 → 6 and **`asmcore` 0 → 1**, at the mutated line |
+| `asm_core.condSub`'s masked pass 2 → `if (under == 1) return;` | **`asmcore` 0 → 5**, at `asm_core.zig:491`, reached from both `montMulAmd64` and `montSqrAmd64` — which also proves the taint really propagates *through* the inline-asm Montgomery blocks |
+
+A null result worth recording: replacing `sub`'s masked add-back with an explicit
+`if (borrow == 1)` changed **nothing** (7 → 7) — because that site was already
+compiled to a branch. A control that lands on already-red code proves nothing;
+the useful controls above all land on code that is green at baseline.
+
 ## Verification harness (teeth)
 
 1. **KAT vs an external oracle.** `mul` and `powMont` are byte-exact against
@@ -133,7 +207,14 @@ and the final subtract must stay a `CMOV`/masked select, not a `Jcc`.
    bug during development.)
 4. **CT smoke.** Boundary behavior of the CT reduction (`(m−1)+1 == 0`,
    `0−1 == m−1`, `(m−1)² mod m == 1`) plus the reasoning-anchored no-secret-branch
-   note.
+   note. That note is now known to be WRONG about the portable path — see the
+   ctgrind table under "Constant-time contract". A green boundary test says
+   nothing about branch structure, which is exactly why item 5 exists.
+5. **ctgrind (valgrind/memcheck).** `scripts/ctgrind.sh montint` — three
+   dispatch sizes (L=4 / L=16 / L=32), each as a claim row plus an untainted
+   control and a no-`-fvalgrind` trap. Rows recorded in
+   `scripts/ctgrind-expected.tsv`; `zig build check-ctgrind` compiles the harness
+   so it cannot rot. This is the item that found the `condSubTop` branch.
 
 ## Benchmarks — the zig-vs-OpenSSL table (this host, ReleaseFast)
 
@@ -216,13 +297,19 @@ speed dispatch, not a correctness bound.
   + BMI2 feature flags; every other target (aarch64/armv7/mips/…) runs the
   portable CIOS forever, and even on amd64 the small-L dispatch (see above) keeps
   moduli `< 2048-bit` — including the pairing fields — on the portable path.
-- **Best-effort CT, like `ff`.** The contract is structural; a sufficiently
-  clever optimizer could in principle reintroduce a branch. The ReleaseFast
-  `montMul` disassembly was checked: every conditional branch is on the PUBLIC
-  limb count `n` (asm loop trip counts, the outer limb loop, the `condSub` loop
-  counters + its unrolled-remainder `n`-parity test) and the final subtract is a
-  `setb`+mask masked select — no secret-dependent `Jcc`. No timing audit tool has
-  been run; the guarantee is best-effort, as with `ff`.
+- **Best-effort CT, like `ff` — and on the PORTABLE path, currently NOT met.**
+  The contract is structural, and a sufficiently clever optimizer *did* in fact
+  reintroduce a branch. The hand-read ReleaseFast disassembly quoted here was of
+  `asm_core.montMul`, and for that function it still holds: every conditional
+  branch is on the PUBLIC limb count `n` (asm loop trip counts, the outer limb
+  loop, the `condSub` loop counters + its unrolled-remainder `n`-parity test) and
+  its final subtract really is a `setb`+mask masked select. But `montMul` on an
+  `L < asm_min_limbs` modulus never reaches that code, and the portable
+  `condSubTop` it reaches instead compiles to a secret-dependent `jne`. Measured
+  2026-08-13 by `scripts/ctgrind.sh montint` — see "MEASURED 2026-08-13" under
+  the constant-time contract above for the table, the disassembly and the blast
+  radius. The sentence "no timing audit tool has been run" that used to close
+  this bullet was the reason the defect survived.
 - **No base blinding / fault countermeasures.** This is a modular-arithmetic
   primitive, not a signing scheme; blinding (rsa F2) and CRT fault-checks
   (rsa F3) are the consumer's responsibility, layered on top.

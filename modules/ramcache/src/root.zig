@@ -1953,6 +1953,37 @@ test "seam scripts: parked values released out of order, and reservations that d
     });
 }
 
+test "seam scripts: a live release re-files window, probation AND protected borrows" {
+    // Every borrow released above is released *doomed* — parked by an
+    // intervening remove/put-over/clear, so `release` takes its `freeDoomed`
+    // branch. The other branch, `self.lruPush(e.region, n)` (re-filing a
+    // still-resident entry into its OWN region's heap), never runs above —
+    // for any region, not just a non-window one. That branch is exactly
+    // where `release: release re-files the entry into its OWN region heap,
+    // from every region` (below) pins a real historical bug: a refactor that
+    // re-files into a fixed region instead of `e.region`. This script drives
+    // that branch through the harness's own op vocabulary — not a
+    // hand-written assertion beside it — so `check()`'s generic
+    // `expectRegionHeapsAgree` is what catches a regression, the same way it
+    // would for a shape the fuzzer found on its own.
+    const H = SeamHarness;
+    try H.run(testing.allocator, &.{
+        // Fill all three slots so the third put demotes the first two out of
+        // the window (window cap 1 at max_entries=3): k0, k1 -> probation,
+        // k2 stays in the window.
+        H.op_put,     0x30, H.op_put,     0x31, H.op_put, 0x32,
+        // .window — pin the still-resident k2 and release it live.
+        H.op_pin,     0x32, H.op_release, 0x00,
+        // .probation — pin the still-resident k0 and release it live.
+        H.op_pin, 0x30,
+        H.op_release, 0x00,
+        // Promote k1 out of probation (`get` on an unpinned probation entry
+        // promotes it), then pin and release it live: .protected.
+        H.op_get,     0x31, H.op_pin, 0x31,
+        H.op_release, 0x00,
+    });
+}
+
 fn fuzzSeam(_: void, smith: *std.testing.Smith) !void {
     // One raw-byte draw of a fixed length, read as (op, arg) pairs. Lengths
     // before payloads is moot here because there is exactly one draw; what

@@ -137,6 +137,86 @@ The SCAFFOLD's portable path is the correctness reference, not a hardened
 production target on its own; hardware side-channel review (esp. of the eventual
 addition-chain inverse and the GLV sign handling) is a later-phase obligation.
 
+### MEASURED, not merely asserted (ctgrind)
+
+Every statement above used to rest on disassembly read once by hand. Since
+2026-08-13 it rests on a committed program:
+[`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
+`scripts/ctgrind.sh k256`, which marks the secret `MAKE_MEM_UNDEFINED`, forces a
+volatile reload, and drives it through four code paths.
+
+**Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64, ReleaseFast,
+2026-08-13; `in-file` = memcheck CONTEXTS whose stack names a k256 source file —
+see `scripts/ctgrind.sh`'s `PATTERN` map for the exact regex per target):
+
+| target | what is tainted | `-fvalgrind` | tainted | total | in-file | exit |
+|---|---|---|---|---|---|---|
+| `field` | element + `cMov` select bit | yes | **yes** | 6 | **0** | 99 |
+| `field` | — | yes | no | 0 | 0 | 0 *(control)* |
+| `field` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
+| `mul` | scalar | yes | **yes** | 8 | **2** | 99 |
+| `mul` | — | yes | no | 0 | 0 | 0 *(control)* |
+| `mul` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
+| `comb` | scalar | yes | **yes** | 7 | **1** | 99 |
+| `comb` | — | yes | no | 0 | 0 | 0 *(control)* |
+| `comb` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
+| `sign` | 32-byte secret key | yes | **yes** | 13 | **11** | 99 |
+| `sign` | — | yes | no | 0 | 0 | 0 *(control)* |
+| `sign` | — | **no** | yes | 0 | 0 | 0 *(trap)* |
+
+**The field layer is zero.** `Fe.cMov` driven by a TAINTED select bit,
+`add`/`sub`/`normalize`, the amd64 `fast_core` `mul`/`sq`, and `invert`'s
+public-exponent `powConst` together report **0** contexts in `field.zig` /
+`fast_core.zig`. That zero is readable only because the other three rows are
+non-zero: the taint demonstrably propagates through this module's arithmetic.
+
+**The 2 + 1 group contexts are `rejectIdentity`, not the ladder.** Located
+exactly (`--stacks`):
+
+- `group.zig:277` — `mul`'s trailing `try q.rejectIdentity()` (2 contexts: LLVM
+  splits the `z = 0` test from the affine-identity test);
+- `group.zig:346` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`.
+
+Both branch on "did the whole multiplication land on the neutral element", i.e.
+`s ≡ 0 (mod n)` — one bit, once, after the ladder, not per scalar bit or per
+window. It is the same validation `std.crypto.ecc.Secp256k1.mul` performs and it
+is what makes `error.IdentityElement` reachable. **The per-bit `cMov` select and
+the per-window masked table gather report nothing**, which is the claim the
+`blackBox` barriers exist to hold.
+
+**The 11 `sign` contexts** are those two plus nine input/output validations, all
+on lines that must branch by contract:
+
+- `sign.zig:58` / `:76` — `dp.isZero()` / `k0.isZero()`, the BIP340-mandated
+  "fail if d′ = 0 / k′ = 0" checks;
+- `sign.zig:64` / `:83` — `Pa.y.isOdd()` / `Ra.y.isOdd()`, branches on the
+  PUBLIC key and the PUBLIC nonce point (memcheck has no notion of "public
+  function of a secret", so tainting `sk` taints them too);
+- five contexts at std's `crypto/pcurves/common.zig:75` — `Field.fromBytes`'s
+  canonicality rejection, reached from `scalar.zig:87`/`:202`/`:208`. That is
+  std's own scalar field, which `scalar.zig` re-exports verbatim (see "Scope"
+  below); k256 adds no branch there.
+
+**The harnesses were shown to have teeth** (positive controls, each reverted and
+`cmp`-verified byte-identical afterwards):
+
+| injected defect | effect |
+|---|---|
+| `blackBox` removed from `Fe.cMov` | `mul` grows a new context at the inlined per-bit select, disassembling to exactly the `test $0x1,%cl; je` the `cMov` doc comment describes; `comb` grows one at the per-window sign select. **The doc comment is now measured, not asserted.** |
+| `q.cMov(added, bit)` → `if (bit == 1) q = added` | new context at `group.zig:275` |
+| masked comb gather → `g = tab[i][m-1]` | `comb` 1 → 4 contexts, including memcheck's "Use of uninitialised value of size 8" on the *address* — the b199192 secret-indexed-load signature |
+| branch on a byte of the secret scalar `d` in `bip340Sign` | `sign` 11 → 12, new context at the injected line |
+
+Note for anyone re-running these: an injected leak can make the TOTAL go **down**
+(memcheck resolves the branch and the taint stops propagating downstream), so
+"the number went up" is the wrong pass criterion. The criterion is "a new context
+appeared at the mutated location".
+
+**What is deliberately NOT measured**: `mulPublic` / `mulPublicGlv` /
+`mulDoubleBasePublic` and everything under them are documented VARIABLE-TIME for
+PUBLIC scalars. Tainting a scalar into them would light up memcheck by design and
+would measure nothing about a claim.
+
 ## Scope — the scalar field is intentionally std's
 
 k256 accelerates the **field** and the **point multiply** (the ~hundreds of

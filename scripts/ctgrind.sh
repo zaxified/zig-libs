@@ -49,7 +49,7 @@ EXPECTED_FILE="$SCRIPT_DIR/ctgrind-expected.tsv"
 # PATTERN  — regex selecting the frames whose file the claim is ABOUT. The
 #            `--pattern` flag overrides it, which is how any attribution in a
 #            SPEC.md can be re-checked rather than believed.
-ALL_MODULES=(chachapoly ct25519 decaf448 ecvrf ed448)
+ALL_MODULES=(chachapoly ct25519 decaf448 ecvrf ed448 k256 montint)
 
 declare -A TARGETS=(
     [chachapoly]="poly1305"
@@ -57,6 +57,8 @@ declare -A TARGETS=(
     [decaf448]="scalarmul"
     [ecvrf]="prove"
     [ed448]="full ladder"
+    [k256]="field mul comb sign"
+    [montint]="small portable asmcore"
 )
 declare -A MODES=(
     [chachapoly]="ReleaseFast ReleaseSafe Debug"
@@ -64,6 +66,8 @@ declare -A MODES=(
     [decaf448]="ReleaseFast"
     [ecvrf]="ReleaseFast"
     [ed448]="ReleaseFast"
+    [k256]="ReleaseFast"
+    [montint]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -74,6 +78,24 @@ declare -A PATTERN=(
     [ecvrf/prove]='ecvrf[.]zig'
     [ed448/full]='ed448[.]zig|field[.]zig|x448[.]zig|scalar[.]zig'
     [ed448/ladder]='ed448[.]zig|field[.]zig|scalar[.]zig'
+    # k256's own sources. `fast_core.zig` is in the field/mul/comb/sign
+    # patterns because `field_asm_active` routes every `Fe.mul`/`Fe.sq` into
+    # its inline asm on amd64 — memcheck sees that block as ordinary machine
+    # code, so its "zero branches" contract is measured, not assumed. `sign`
+    # deliberately does NOT list `scalar[.]zig`: k256's scalar.zig is a bare
+    # re-export of std's, whose file has the same basename, and lumping them
+    # together would attribute std's secret-key canonicality check to k256.
+    [k256/field]='field[.]zig|fast_core[.]zig'
+    [k256/mul]='group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/sign]='sign[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    # montint: `montint.zig` is the portable CIOS + powMont, `asm_core.zig` the
+    # gated amd64 core, `limbs.zig` the add/sub/select primitives underneath
+    # both. All three are montint's own files; nothing in std shares a basename
+    # with them.
+    [montint/small]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [montint/portable]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [montint/asmcore]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
 )
 declare -A LABEL=(
     [chachapoly/poly1305]='poly1305.zig'
@@ -83,6 +105,13 @@ declare -A LABEL=(
     [ecvrf/prove]='ecvrf.zig'
     [ed448/full]='ed448 src'
     [ed448/ladder]='ed448 src'
+    [k256/field]='k256 field+asm'
+    [k256/mul]='k256 group+field'
+    [k256/comb]='k256 group+field'
+    [k256/sign]='k256 src'
+    [montint/small]='montint src'
+    [montint/portable]='montint src'
+    [montint/asmcore]='montint src'
 )
 
 # ── arguments ──────────────────────────────────────────────────────────────

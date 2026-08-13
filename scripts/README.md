@@ -230,12 +230,29 @@ modes turn that flag off, so a ReleaseFast binary built **without the switch**
 is a silent no-op under valgrind and reports a clean `0 errors` whatever the
 code does. A ctgrind claim that does not state its **mode**, its **switch** and
 its **context count** is therefore unfalsifiable — indistinguishable from a
-measurement that never happened. Five modules carried exactly such a claim
-(one of them with a seven-row table) before these harnesses existed.
+measurement that never happened. Seven modules carry a harness today; five of
+them carried exactly such a claim (one with a seven-row table) before these
+harnesses existed, and `k256` + `montint` carried claims with **no** numbers at
+all — only disassembly read once by hand.
 
 The `--pattern` flag exists so that an attribution written in a `SPEC.md`
 ("these three contexts are all in `encodeToCurve`", "none are in `ct25519`'s
 ladder") can be re-checked rather than believed.
+
+**A green `--check` does not mean every constant-time claim holds.** It means
+every recorded number still reads the way it read when it was taken — and one
+module (`montint`, at `L < asm_min_limbs`) has a recorded number that is a
+measured DEFECT, not an accounted-for validation. See the DEFECT comment in
+`ctgrind-expected.tsv` and `modules/montint/SPEC.md`. Recording it is deliberate:
+the alternative is a defect nothing tracks, and a row that goes red when the leak
+is *fixed* is how the fix gets noticed.
+
+One trap when adding a harness or a positive control: an injected leak can make
+the reported TOTAL go **down**, because memcheck resolves the branch and the
+taint stops propagating to the downstream witness. "The count went up" is
+therefore the wrong pass criterion; "a new context appeared at the mutated
+location" is the right one. Both were observed while building the `k256`
+harness.
 
 ### What keeps them from rotting
 

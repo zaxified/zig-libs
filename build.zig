@@ -575,9 +575,14 @@ pub fn build(b: *std.Build) void {
             // The harness's root module compiles the module under test from
             // its own sources (`@import("root.zig")`, a sibling path), so the
             // code being measured is built at exactly the optimize mode the
-            // driver asked for. Only cross-module deps come from `mods`; none
-            // of the five modules involved is `heavy`, so there is no
-            // heavy_optimize substitution to reason about.
+            // driver asked for — `-Doptimize` reaches it directly and the
+            // `heavy` flag does NOT, because `heavy_optimize` is substituted
+            // only when a module is taken from `mods`. That distinction is
+            // load-bearing now that `montint` (which IS heavy) has a harness:
+            // a heavy substitution here would silently move the measurement
+            // to a different optimize mode than the row claims. Only
+            // cross-module deps come from `mods`, and none of the seven
+            // modules with a harness has any.
             const hmod = b.createModule(.{
                 .root_source_file = src,
                 .target = target,
@@ -638,6 +643,8 @@ const ctgrind_harnesses = [_][]const u8{
     "decaf448",
     "ecvrf",
     "ed448",
+    "k256",
+    "montint",
 };
 
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
