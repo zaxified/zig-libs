@@ -18,8 +18,10 @@ scheduled visibility (`delay_ns` / `run_at`).
 Provenance: original work of the zig-libs authors (MIT), greenfield over `kv`
 — no third-party source consulted line-level or copied. The
 **partition-FIFO dispatch shape** is original design work. Behavioral
-references (design only): Faktory and Sidekiq (lease/reserve,
-retry-with-backoff, dead-letter). The clock-injection and
+references (design only): Faktory (AGPL or commercial) and Sidekiq
+(LGPL-3.0 or commercial) — lease/reserve, retry-with-backoff, dead-letter.
+Both are dual-licensed, so the open-source term is the one named; either way
+a design reference carries no condition. The clock-injection and
 exponential-jitter-backoff shapes follow the `resilience` sibling.
 
 ## Why an in-memory index over `kv`

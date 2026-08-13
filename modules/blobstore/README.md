@@ -16,9 +16,11 @@ crash-safe by temp-then-atomic-rename.
 - **Deps:** `hashdigest` (SHA-256; nothing cryptographic is reimplemented here).
 
 Provenance: original work of the zig-libs authors (MIT); modeled after the git
-object store / restic content-addressing design (256-way hex fan-out, dedup —
-behavior only, no source consulted or copied). SHA-256 comes from the sibling
-`hashdigest` module. No third-party source involved — no NOTICE entry.
+object store (GPL-2.0) and restic's (BSD-2-Clause) content-addressing design
+(256-way hex fan-out, dedup — behavior only, no source consulted or copied).
+SHA-256 comes from the sibling `hashdigest` module. No third-party source
+involved — no NOTICE entry; a design reference carries no condition, and the
+licences are named because `/NOTICE` §0 requires the record to name them.
 
 ## Layout
 
