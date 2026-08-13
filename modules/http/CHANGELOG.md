@@ -5,6 +5,44 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — **BEHAVIOURAL, not source-breaking** — `Client`'s two timeout
+  options now bound blocking I/O. Neither did before: `connectTimeout()` was
+  `_ = c; return .none;` (the real body commented out behind a
+  `TODO(zig-0.16.0)`, because `Io.Threaded` **panics** — "TODO implement
+  netConnectIpPosix with timeout" — on a non-`.none` `ConnectOptions.timeout`),
+  so `connect_timeout_ms` was read by nothing while being advertised and
+  defaulted to 5000; and `total_timeout_ms` had exactly one enforcement site,
+  `checkDeadline` at the top of the *redirect* loop, so nothing checked it
+  inside the dial, the TLS handshake or any read. Measured against a peer that
+  accepts and then says nothing, a request hung indefinitely (>25 s, killed) in
+  Debug, ReleaseSafe and ReleaseFast alike — over TLS and over plain http, so
+  not a handshake quirk — and the same held for a connect the peer never
+  accepted. No option value avoided it.
+  The fix does not wait for std to grow a per-read deadline; it uses the
+  mechanism std already has. Each blocking phase runs on a concurrent task
+  (`runBounded`), and blowing the deadline **cancels** it: `Io.Threaded`
+  implements cancelation by signalling the task's thread until the in-flight
+  syscall returns `EINTR`, so a blocked `readv`/`connect` unwinds with
+  `error.Canceled` instead of never returning. `connect_timeout_ms` now bounds
+  name resolution + `connect` (`ConnectOptions.timeout` stays `.none`
+  forever — that is the field that panics); `total_timeout_ms` bounds a whole
+  `request` and, from the call, an `Upload.finish`. All four scenarios now
+  return `error.Timeout` at 300–301 ms against a 300 ms budget in all three
+  optimize modes, pinned by four tests that each run the call under a hard
+  8 s watchdog so a regression is RED rather than hung, plus a fifth that
+  drives the no-concurrency fallback on an `Io` with `concurrent_limit =
+  .nothing`.
+  Two consequences worth naming. Response **body** reads are still unbounded
+  (the caller drives them), as is an `H2Session` past its dial and *everything*
+  on an `Io` with no unit of concurrency to give — all three are now stated in
+  `Options`, the module doc and the README instead of being implied by a knob
+  that did nothing. And cancelation had to be made visible to the client:
+  `std.Io.Reader`/`Writer` collapse it into `ReadFailed`/`WriteFailed`, which
+  `isStaleConnError` treats as a dead pooled connection worth retrying — the
+  retry would have absorbed the one cancelation the task gets and blocked
+  again, with `Future.cancel` waiting on it forever. `Conn.readFailure` /
+  `writeFailure` recover `error.Canceled` from the socket reader/writer, and
+  the retry site now re-checks the deadline before starting fresh work.
 - **2026-08-13** — *no behaviour change* — two paths that had never been executed are
   now covered. (1) `proxy.relayFailed`'s **h2** arm (`forwardH2`, `:347`/`:350`/`:351`):
   the existing 502-instead-of-mutilated-200 test drove the h1 forward path only,

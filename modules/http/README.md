@@ -493,11 +493,20 @@ covers the client population; `deflate` adds nothing over it).
   (`Connection: close` on every request).
 - **TLS:** `std.crypto.tls.Client`, system CA bundle loaded lazily once per
   Client; `tls.verify = .insecure_no_verify` opt-out for testing.
-- **Timeouts:** `total_timeout_ms` is checked between phases (connect, head,
-  hops), not inside a blocking body read (TODO: async-race enforcement).
-  `connect_timeout_ms` is currently NOT enforced natively — std 0.16.0's
-  `Io.Threaded` panics ("TODO implement netConnectIpPosix with timeout")
-  when one is passed; re-enable in `connectTimeout` once std lands it.
+- **Timeouts:** both budgets are enforced, and neither by the socket layer —
+  std 0.16.0 has no per-read deadline and `Io.Threaded` panics outright ("TODO
+  implement netConnectIpPosix with timeout") if `ConnectOptions.timeout` is
+  set. What std does offer is cancelation, so each blocking phase runs on a
+  concurrent task and blowing the deadline cancels it, interrupting the
+  syscall it is parked in. `connect_timeout_ms` bounds name resolution +
+  `connect`; `total_timeout_ms` bounds a whole `request` (every redirect hop,
+  the TLS handshake and the response-head read) and, measured from the call,
+  an `Upload.finish`. **Not** bounded: reading a response body through
+  `Response.reader` (the caller drives those reads), an `H2Session` past its
+  dial, and anything at all on an `Io` that cannot supply a unit of
+  concurrency (single-threaded build, or a `Threaded` at its
+  `concurrent_limit`) — there is then nothing to cancel and only the
+  between-phase deadline checks apply.
 - **Decompression is the caller's job** (`Accept-Encoding: identity` is sent
   by default); adopt `std.compress` at the call site if you ask for gzip.
 - 1xx interim responses are skipped (101 returned as-is); HEAD/204/304

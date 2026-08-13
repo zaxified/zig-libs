@@ -23,10 +23,31 @@
 //! hostname resolution via `std.Io.net.HostName` (to be swapped for the
 //! `dns` module when it lands), URL/host splitting via `netaddr`.
 //!
-//! Timeout model (Phase 1): the connect timeout is enforced natively by the
-//! Io implementation; the total timeout is checked between phases (connect,
-//! head read, redirect hops). TODO: enforce deadlines inside body reads via
-//! async races once needed.
+//! Timeout model. Neither timeout is enforced by the socket layer — std
+//! 0.16.0 has no per-read deadline and panics on `ConnectOptions.timeout`
+//! (see `runBounded`). Both are enforced the only way std allows: the
+//! blocking phase runs on a concurrent task, and blowing the deadline
+//! *cancels* it, which interrupts the syscall it is parked in.
+//!
+//!   * `connect_timeout_ms` bounds name resolution + `connect`
+//!     (`connectStream`).
+//!   * `total_timeout_ms` bounds a whole `request` — every redirect hop, the
+//!     TLS handshake and the response-head read included — and, separately,
+//!     an `Upload.finish`.
+//!
+//! What is NOT bounded, deliberately and not for want of a mechanism:
+//!   * reading a response body through `Response.reader`. The caller drives
+//!     those reads and decides how long a slow trickle is acceptable; wrap
+//!     the read in your own `runBounded`-shaped race if you need one.
+//!   * `H2Session` (`connectH2c`/`connectH2Over`) past the dial. Its dial
+//!     gets `connect_timeout_ms` like any other, but the multiplexed session
+//!     that follows has no single "the request" to bound — `h2_client` pumps
+//!     one socket on behalf of every in-flight stream.
+//!   * anything at all when the `Io` cannot supply a unit of concurrency
+//!     (a single-threaded build; a `Threaded` at its `concurrent_limit`).
+//!     There is then nothing to cancel, so the phase runs on the caller's
+//!     thread exactly as it did before and only the between-phase deadline
+//!     checks apply. Both option doc comments say so.
 //!
 //! HTTP/2 (Phase 3.2, opt-in): `connectH2c` opens a **cleartext h2c**
 //! connection via prior knowledge (RFC 9113 §3.3) and returns an
@@ -84,14 +105,26 @@ pool: Pool,
 dial_count: std.atomic.Value(usize) = .init(0),
 
 pub const Options = struct {
-    /// Per-connection connect timeout; 0 = none. NOTE: currently NOT
-    /// enforced natively — std 0.16.0's `Io.Threaded` panics ("TODO
-    /// implement netConnectIpPosix with timeout") when a connect timeout is
-    /// passed, so the client falls back to the OS default until std lands
-    /// the implementation (see `connectTimeout`).
+    /// Budget for one dial — name resolution plus `connect` — after which
+    /// the dial fails with `error.Timeout`; 0 = unbounded. Applies to every
+    /// fresh dial (a pool hit does not dial, so it does not spend this).
+    ///
+    /// Enforced by canceling the task the connect is blocked in, NOT by
+    /// `ConnectOptions.timeout`, which std 0.16.0 panics on — see
+    /// `connectStream`. The one hole: when the `Io` has no unit of
+    /// concurrency to give (single-threaded build, or a `Threaded` already at
+    /// its `concurrent_limit`), the dial runs on the calling thread with
+    /// nothing able to interrupt it, and this budget does not apply.
     connect_timeout_ms: u32 = 5000,
-    /// Whole-request budget (all redirect hops); 0 = none. Checked between
-    /// phases, not inside a blocking body read.
+    /// Whole-exchange budget for a `request` (all redirect hops) or an
+    /// `Upload.finish`, after which it fails with `error.Timeout`; 0 =
+    /// unbounded. Covers the dial, the TLS handshake and the response-head
+    /// read — everything up to the point the `Response` is handed back.
+    ///
+    /// It does NOT cover reading the response body: `Response.reader` is
+    /// pulled by the caller, so a budget there would be a budget on the
+    /// caller. Enforced by cancelation, with the same
+    /// no-concurrency-available hole as `connect_timeout_ms`.
     total_timeout_ms: u32 = 30000,
     /// Redirect-following cap (`error.TooManyRedirects` beyond it).
     max_redirects: u8 = 10,
@@ -251,6 +284,23 @@ pub fn poolSweep(c: *Client) void {
 /// `Response` owns a connection — read the body via `Response.reader` and
 /// always call `Response.deinit`.
 pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
+    const deadline = c.totalDeadline() orelse return c.requestInner(method, url_text, options);
+    return runBounded(c.io, deadline, requestInner, .{ c, method, url_text, options }) catch |err| switch (err) {
+        // See `connectStream` for the same fallback: without a spare unit of
+        // concurrency there is nothing to cancel, so the exchange runs on
+        // this thread with only the between-phase deadline checks below.
+        error.ConcurrencyUnavailable => c.requestInner(method, url_text, options),
+        else => |e| e,
+    };
+}
+
+/// `request`'s body, run either on the caller's thread or on the concurrent
+/// task `request` bounds. The `checkDeadline` calls here are NOT the timeout
+/// mechanism (they cannot interrupt a blocking read — that is what
+/// `runBounded` is for); they are what still holds when no unit of
+/// concurrency was available, and they stop a redirect chain or a stale-conn
+/// retry from starting fresh work on a budget that is already spent.
+fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
     const deadline = c.totalDeadline();
 
     var url = try http.Url.parse(url_text);
@@ -294,6 +344,15 @@ pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: R
             // of this (only before any caller body byte is touched) — see
             // its doc comment for why a blanket retry is not safe there.
             if (!reused or !isStaleConnError(err)) return err;
+            // A retry is fresh work: it must not start on a budget that is
+            // already spent. Without this, a `runBounded` deadline that fires
+            // during the first attempt would be *absorbed* by the retry —
+            // cancelation is delivered to one cancelation point only, so the
+            // second attempt would block with nothing left to interrupt it
+            // and `Future.cancel` would wait on it forever. (`Canceled` is
+            // deliberately absent from `isStaleConnError`, which is the other
+            // half of that guard.)
+            try c.checkDeadline(deadline);
             conn.destroy();
             conn = try c.dialConn(url);
             break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive);
@@ -399,9 +458,25 @@ pub const Upload = struct {
 
     /// Terminate the body (0-chunk when chunked), flush, and read the
     /// response. Consumes the Upload — on error the connection is closed.
+    ///
+    /// Bounded by `Options.total_timeout_ms`, measured from *this call*, not
+    /// from `requestStreaming`: the caller owns the pacing of the body it
+    /// streams, so a budget spanning that would be a budget on the caller.
+    /// What this bounds is the part the peer owns — the final flush and the
+    /// wait for the response head.
     pub fn finish(u: *Upload) Error!Response {
+        const c = u.conn.client;
+        const deadline = c.totalDeadline() orelse return u.finishInner();
+        return runBounded(c.io, deadline, finishInner, .{u}) catch |err| switch (err) {
+            // Same fallback as `Client.request`; see `connectStream`.
+            error.ConcurrencyUnavailable => u.finishInner(),
+            else => |e| e,
+        };
+    }
+
+    fn finishInner(u: *Upload) Error!Response {
         errdefer u.conn.destroy();
-        if (u.chunked) |*cw| cw.finish() catch return error.WriteFailed;
+        if (u.chunked) |*cw| cw.finish() catch return u.conn.writeFailure();
         try u.conn.flushAll();
         const head = try readResponseHead(u.conn);
         setupBody(u.conn, u.method, head);
@@ -593,8 +668,11 @@ pub const H2Session = struct {
 
 /// Open an HTTP/2 cleartext connection to `host:port` via prior knowledge
 /// (RFC 9113 §3.3): the client preface + SETTINGS are sent immediately.
-/// Reuses the client's connect plumbing (`connect_timeout_ms`, buffer
-/// sizing); the returned session multiplexes requests until `close`.
+/// Reuses the client's connect plumbing, so the dial is bounded by
+/// `connect_timeout_ms` (buffer sizing is shared too). The multiplexed
+/// session that follows is NOT bounded by `total_timeout_ms` — see the
+/// module doc's timeout model for why an h2 session has no single exchange
+/// to put a budget on.
 pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Options) Error!*H2Session {
     const url: http.Url = .{ .scheme = .http, .host = host, .port = port, .path = "/", .query = "" };
 
@@ -742,11 +820,32 @@ const Conn = struct {
     }
 
     fn flushAll(conn: *Conn) Error!void {
-        conn.plainWriter().flush() catch return error.WriteFailed;
+        conn.plainWriter().flush() catch return conn.writeFailure();
         // The TLS writer drains ciphertext into the socket writer — flush
         // that too.
         if (conn.tls_client != null)
-            conn.sw.interface.flush() catch return error.WriteFailed;
+            conn.sw.interface.flush() catch return conn.writeFailure();
+    }
+
+    /// `std.Io.Reader`/`Writer` collapse every transport failure into the
+    /// single `error.ReadFailed`/`error.WriteFailed`; the real errno-level
+    /// error is parked on the socket reader/writer. Only one distinction
+    /// matters to this client, and it matters a lot: `error.Canceled` — the
+    /// task was interrupted (a `runBounded` deadline, or the caller canceling
+    /// the whole request) — must NOT be laundered into a transport failure,
+    /// because `isStaleConnError` would then treat it as a dead pooled
+    /// connection and transparently retry the exchange, blocking a second
+    /// time with the cancelation already consumed. Both TLS and plaintext
+    /// funnel through the same socket reader/writer, so one check covers
+    /// both.
+    fn readFailure(conn: *Conn) Error {
+        if (conn.sr.err) |err| if (err == error.Canceled) return error.Canceled;
+        return error.ReadFailed;
+    }
+
+    fn writeFailure(conn: *Conn) Error {
+        if (conn.sw.err) |err| if (err == error.Canceled) return error.Canceled;
+        return error.WriteFailed;
     }
 
     fn destroy(conn: *Conn) void {
@@ -992,7 +1091,7 @@ fn sendAndReadHead(
     strip_sensitive: bool,
 ) Error!h1.ResponseHead {
     try writeRequestHead(conn.plainWriter(), method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled);
-    if (body) |b| conn.plainWriter().writeAll(b) catch return error.WriteFailed;
+    if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
     try conn.flushAll();
     return readResponseHead(conn);
 }
@@ -1127,10 +1226,34 @@ fn dialConn(c: *Client, url: http.Url) Error!*Conn {
     return conn;
 }
 
+/// Resolve + connect, bounded by `Options.connect_timeout_ms`.
+///
+/// The bound is imposed by `runBounded`, NOT by `ConnectOptions.timeout`:
+/// std 0.16.0's `Io.Threaded` panics outright ("TODO implement
+/// netConnectIpPosix with timeout") the moment that field is anything but
+/// `.none`, on POSIX and Windows alike. So the field stays `.none` forever
+/// here and the deadline is enforced one level up, by canceling the task the
+/// `connect` syscall is blocked in. `std.Io.net`'s own resolver is inside
+/// this bound too (name lookup is ordinary cancelable socket I/O), so a
+/// nameserver black hole is bounded by `connect_timeout_ms` as well.
 fn connectStream(c: *Client, url: http.Url) Error!net.Stream {
+    const deadline = c.connectDeadline() orelse return c.connectStreamBlocking(url);
+    return runBounded(c.io, deadline, connectStreamBlocking, .{ c, url }) catch |err| switch (err) {
+        // No spare unit of concurrency (single-threaded build, or a
+        // `Threaded` whose `concurrent_limit` is exhausted). Connecting
+        // anyway on this thread is the pre-existing behavior and keeps such
+        // a caller working; it is unbounded, which `Options.connect_timeout_ms`
+        // says out loud.
+        error.ConcurrencyUnavailable => c.connectStreamBlocking(url),
+        else => |e| e,
+    };
+}
+
+fn connectStreamBlocking(c: *Client, url: http.Url) Error!net.Stream {
     const copts: net.IpAddress.ConnectOptions = .{
         .mode = .stream,
-        .timeout = c.connectTimeout(),
+        // Deliberately `.none` — see `connectStream`'s doc comment.
+        .timeout = .none,
     };
     if (netaddr.parseIp(url.host) != null) {
         const addr = net.IpAddress.parse(url.host, url.port) catch return error.BadUrl;
@@ -1174,16 +1297,99 @@ fn ensureCaBundle(c: *Client) Error!void {
 
 // ── timeouts ────────────────────────────────────────────────────────────────
 
-fn connectTimeout(c: *Client) std.Io.Timeout {
-    // TODO(zig-0.16.0): std.Io.Threaded panics with "TODO implement
-    // netConnectIpPosix with timeout" when ConnectOptions.timeout != .none.
-    // Until std implements it, rely on the OS connect timeout plus the
-    // between-phases total-deadline checks; re-enable the code below then.
-    _ = c;
-    return .none;
-    // const ms = c.options.connect_timeout_ms;
-    // if (ms == 0) return .none;
-    // return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+/// The return type of `runBounded` for `func`: `func`'s own error union,
+/// widened by the one failure only the runner can produce.
+fn BoundedResult(comptime func: anytype) type {
+    const eu = @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union;
+    return (eu.error_set || error{ConcurrencyUnavailable})!eu.payload;
+}
+
+/// Run `func(args)` on its own concurrent task and give it until `deadline`
+/// (null = no bound). This is the client's ONLY way to bound a blocking
+/// phase, and it exists because std 0.16.0 offers no per-read deadline: the
+/// socket read/write/connect syscalls take no timeout, and `net.Stream` has
+/// no `setOption` seam for `SO_RCVTIMEO` (which `Io.Threaded`'s reader could
+/// not report anyway — it treats `EAGAIN` as a bug, not a timeout).
+///
+/// What *is* available is cancelation. `Io.Threaded` runs a task on a real
+/// thread and implements `Future.cancel` by repeatedly signalling that thread
+/// (`SIG.IO`) until the in-flight syscall returns `EINTR` and the wrapper's
+/// cancel check fires, so the blocked `readv`/`connect` returns
+/// `error.Canceled` instead of blocking forever. That only works for a task
+/// the `Io` implementation owns — a syscall made on the caller's own thread
+/// has no cancelation state attached (`Threaded.Syscall.start` no-ops when
+/// `Thread.current` is null) — hence "run it over there, then cancel it",
+/// rather than "ask the read to time out".
+///
+/// Contract:
+///   * finished in time → `func`'s own result, untouched.
+///   * deadline hit → the task is canceled and *waited for* (the frame it
+///     borrows lives on this stack), then `error.Timeout`. If the task
+///     nevertheless completed successfully inside that cancelation window,
+///     its value is returned instead — a race with the deadline must never
+///     drop a connection/response the task already allocated.
+///   * *this* task canceled while waiting → same unwind, then
+///     `error.Canceled`.
+///   * no unit of concurrency available → `error.ConcurrencyUnavailable`,
+///     never a silent unbounded run. Every call site decides what to do with
+///     it, and each one documents the choice.
+fn runBounded(
+    io: std.Io,
+    deadline: ?std.Io.Clock.Timestamp,
+    comptime func: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(func)),
+) BoundedResult(func) {
+    const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+    const Ctx = struct {
+        io: std.Io,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+        result: Result = undefined,
+        /// 0 while the task runs, 1 once `result` is published. Doubles as
+        /// the futex word the waiter parks on, so the normal (in-time) path
+        /// costs one wake, not a poll.
+        state: std.atomic.Value(u32) = .init(0),
+
+        fn run(ctx: *@This()) void {
+            ctx.result = @call(.auto, func, ctx.args);
+            ctx.state.store(1, .release);
+            ctx.io.futexWake(u32, &ctx.state.raw, 1);
+        }
+    };
+
+    var ctx: Ctx = .{ .io = io, .args = args };
+    var future = try io.concurrent(Ctx.run, .{&ctx});
+
+    var canceled = false;
+    var expired = false;
+    while (ctx.state.load(.acquire) == 0) {
+        const timeout: std.Io.Timeout = if (deadline) |d| t: {
+            if (d.durationFromNow(io).raw.nanoseconds <= 0) {
+                expired = true;
+                break;
+            }
+            break :t .{ .deadline = d };
+        } else .none;
+        // Spurious wakeups are allowed here; the loop re-reads `state`.
+        io.futexWaitTimeout(u32, &ctx.state.raw, 0, timeout) catch {
+            canceled = true;
+            break;
+        };
+    }
+    if (!expired and !canceled) {
+        future.await(io);
+        return ctx.result;
+    }
+    future.cancel(io);
+    // `cancel` joined the task, so `result` is written either way. A success
+    // that landed in the cancelation window is still a success.
+    if (ctx.result) |value| return value else |_| {}
+    return if (expired) error.Timeout else error.Canceled;
+}
+
+fn connectDeadline(c: *Client) ?std.Io.Clock.Timestamp {
+    const ms = c.options.connect_timeout_ms;
+    if (ms == 0) return null;
+    return .fromNow(c.io, .{ .raw = .fromMilliseconds(ms), .clock = .awake });
 }
 
 fn totalDeadline(c: *Client) ?std.Io.Clock.Timestamp {
@@ -1299,7 +1505,7 @@ fn writeHead(
 fn readResponseHead(conn: *Conn) Error!h1.ResponseHead {
     while (true) {
         const block = h1.readHead(conn.plainReader(), conn.head_buf) catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
+            error.ReadFailed => return conn.readFailure(),
             error.ConnectionClosed => return error.ConnectionClosed,
             error.HeadTooLarge => return error.HeadTooLarge,
         };
@@ -2048,6 +2254,324 @@ test "dialConn: TLS key material fails CLOSED when randomSecure has no entropy" 
     // void, so a client that used it would hand the ClientHello random and key
     // share a degraded seed with nothing to check.
     try testing.expectError(error.EntropyUnavailable, client.request(.get, url, .{}));
+}
+
+// ── tests (timeout enforcement) ─────────────────────────────────────────────
+//
+// Every test here asserts the SAME property from a different blocking phase:
+// an unresponsive peer must produce `error.Timeout` inside the configured
+// budget. Each one runs the client call on its own task under a hard
+// watchdog several times that budget, so a client that enforces nothing makes
+// these RED rather than making the suite hang — a hung test is worse than a
+// failing one, and every scenario below was measured hanging past 25 s (and
+// once past ten minutes, see the `NoEntropyIo` test's comment) before the
+// enforcement existed.
+
+fn testNowMs(io: std.Io) i64 {
+    const ts = std.Io.Clock.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
+}
+
+/// A peer that completes the TCP handshake and then says nothing at all.
+/// It holds the accepted connection OPEN until released: closing it would
+/// hand the client an end-of-stream and end the wait for the wrong reason
+/// (which is precisely the shape the `NoEntropyIo` test above relies on, from
+/// the other side).
+const StallPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *StallPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        _ = p.accepted.fetchAdd(1, .monotonic);
+        defer s.close(p.io);
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+
+    /// Release the peer thread before joining it. If the client never
+    /// connected at all — a regression that fails before the dial — `accept`
+    /// is still blocked and the join would hang, so poke it with one
+    /// throwaway connection.
+    fn release(p: *StallPeer, port: u16) void {
+        p.stop.store(1, .release);
+        if (p.accepted.load(.acquire) != 0) return;
+        const addr = net.IpAddress.parse("127.0.0.1", port) catch return;
+        const s = addr.connect(p.io, .{ .mode = .stream }) catch return;
+        s.close(p.io);
+    }
+};
+
+fn watchdogGet(c: *Client, url: []const u8) anyerror!void {
+    var res = try c.request(.get, url, .{});
+    res.deinit();
+}
+
+fn watchdogUploadFinish(c: *Client, url: []const u8) anyerror!void {
+    var up = try c.requestStreaming(.post, url, .{}, "ping".len);
+    up.writer().writeAll("ping") catch {
+        up.abort();
+        return error.WriteFailed;
+    };
+    var res = try up.finish();
+    res.deinit();
+}
+
+/// One client call, run on its own task with a HARD outer bound.
+///
+/// The watchdog is many times the client budget under test, so `hung ==
+/// false` is a statement about the client's enforcement rather than about the
+/// watchdog's generosity. Note the watchdog cannot be built out of the thing
+/// it is watching: it races the call from *outside* the client, on the test's
+/// own `Io`, and its verdict (`hung`) is written by the waiter before the
+/// canceled task gets to overwrite `outcome`.
+const Watchdog = struct {
+    io: std.Io,
+    client: *Client,
+    url: []const u8,
+    call: *const fn (*Client, []const u8) anyerror!void,
+
+    /// Written by the task, read only after it has been joined.
+    outcome: ?anyerror = null,
+    elapsed_ms: i64 = 0,
+    state: std.atomic.Value(u32) = .init(0),
+    /// Written by the WAITER, never by the task: the call did not return
+    /// inside the watchdog budget.
+    hung: bool = false,
+
+    fn run(w: *Watchdog) void {
+        const t0 = testNowMs(w.io);
+        w.call(w.client, w.url) catch |err| {
+            w.outcome = err;
+        };
+        w.elapsed_ms = testNowMs(w.io) - t0;
+        w.state.store(1, .release);
+        w.io.futexWake(u32, &w.state.raw, 1);
+    }
+
+    fn go(w: *Watchdog, watchdog_ms: u32) !void {
+        const io = w.io;
+        // Not a skip: the client documents its budgets as unenforceable
+        // without a unit of concurrency, so a host that cannot give the TEST
+        // one has not verified anything and must say so out loud.
+        var future = try io.concurrent(Watchdog.run, .{w});
+        const deadline: std.Io.Clock.Timestamp =
+            .fromNow(io, .{ .raw = .fromMilliseconds(watchdog_ms), .clock = .awake });
+        while (w.state.load(.acquire) == 0) {
+            if (deadline.durationFromNow(io).raw.nanoseconds <= 0) break;
+            io.futexWaitTimeout(u32, &w.state.raw, 0, .{ .deadline = deadline }) catch break;
+        }
+        if (w.state.load(.acquire) != 0) {
+            future.await(io);
+            return;
+        }
+        w.hung = true;
+        // Interrupt the wedged call so the test binary can still finish and
+        // report. The task will go on to write `outcome`; `hung` is what the
+        // assertions read.
+        future.cancel(io);
+    }
+};
+
+/// Assert the shared property: not hung, and `error.Timeout` well inside the
+/// watchdog.
+fn expectTimedOut(w: *const Watchdog, budget_ms: i64) !void {
+    try testing.expect(!w.hung);
+    try testing.expectEqual(@as(?anyerror, error.Timeout), w.outcome);
+    // Enforced, not merely eventual. Ten times the budget is loose enough for
+    // a loaded CI box and still an order of magnitude under the watchdog.
+    try testing.expect(w.elapsed_ms < budget_ms * 10);
+}
+
+test "timeout: total_timeout_ms bounds a stalling peer (plain http)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{});
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: StallPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, StallPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    // `connect_timeout_ms = 0` removes the alternative explanation: the dial
+    // to a listening loopback socket completes instantly and has no budget of
+    // its own, so the only thing that can end this request is the total one.
+    // Plain http also keeps TLS out of it — this is a bare response-head read.
+    var client = Client.init(io, gpa, .{ .connect_timeout_ms = 0, .total_timeout_ms = 300 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogGet };
+    try w.go(8000);
+    try expectTimedOut(&w, 300);
+}
+
+test "timeout: total_timeout_ms bounds a stalling peer during the TLS handshake" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{});
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: StallPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, StallPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    // The peer never answers the ClientHello, so this blocks inside
+    // `tls.Client.init` — a phase with no deadline parameter anywhere in std,
+    // reached before a single byte of HTTP exists. `insecure_no_verify` keeps
+    // the CA bundle out of the measurement.
+    var client = Client.init(io, gpa, .{
+        .tls = .{ .verify = .insecure_no_verify },
+        .connect_timeout_ms = 0,
+        .total_timeout_ms = 300,
+    });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+
+    var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogGet };
+    try w.go(8000);
+    try expectTimedOut(&w, 300);
+}
+
+test "timeout: total_timeout_ms bounds Upload.finish against a stalling peer" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{});
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: StallPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, StallPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    // The streaming path never goes through `request`, so it needed its own
+    // bound: the dial and the head write succeed, and `finish` then waits on
+    // a response head that never comes.
+    var client = Client.init(io, gpa, .{ .connect_timeout_ms = 0, .total_timeout_ms = 300 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogUploadFinish };
+    try w.go(8000);
+    try expectTimedOut(&w, 300);
+}
+
+fn testConnectOnce(io: std.Io, target: net.IpAddress) Error!net.Stream {
+    return target.connect(io, .{ .mode = .stream }) catch |err| mapConnectError(err);
+}
+
+/// Connect to `target` until a further connect genuinely BLOCKS — i.e. until
+/// the listener's accept queue is full and the kernel starts dropping the
+/// SYN. Returns how many sockets the caller must close.
+///
+/// The exact queue depth is a kernel property, not a constant worth
+/// hard-coding: measured here as 2 for `kernel_backlog = 1` on Linux
+/// loopback, but a kernel that behaves differently must make the caller RED,
+/// not quietly test a connect that in fact completed. Hence the error at the
+/// end rather than a `return n`.
+fn fillAcceptQueue(io: std.Io, target: net.IpAddress, held: []net.Stream) !usize {
+    for (held, 0..) |*slot, n| {
+        const d: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(250), .clock = .awake });
+        slot.* = runBounded(io, d, testConnectOnce, .{ io, target }) catch |err| switch (err) {
+            error.Timeout => return n,
+            else => |e| return e,
+        };
+    }
+    return error.AcceptQueueNeverFilled;
+}
+
+test "timeout: connect_timeout_ms bounds a connect the peer never accepts" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .kernel_backlog = 1 });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const target = try net.IpAddress.parse("127.0.0.1", port);
+
+    // Nothing ever calls `accept` on this listener. Once its queue is full
+    // the next `connect` sits in SYN_SENT — measured blocking past 60 s
+    // against std's own `connect`, with no client involved.
+    var held: [16]net.Stream = undefined;
+    const held_n = try fillAcceptQueue(io, target, &held);
+    defer {
+        for (held[0..held_n]) |*s| s.close(io);
+    }
+
+    // `total_timeout_ms = 0` is the whole point: the only budget in play is
+    // the connect one, so `error.Timeout` here cannot come from anywhere
+    // else. If the dial were to complete after all, this peer never speaks
+    // and the request would wedge with nothing left to bound it — the
+    // watchdog would report `hung`, i.e. RED.
+    var client = Client.init(io, gpa, .{ .connect_timeout_ms = 300, .total_timeout_ms = 0 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogGet };
+    try w.go(8000);
+    try expectTimedOut(&w, 300);
+}
+
+test "timeout: an Io with no concurrency to give degrades to unbounded, not to broken" {
+    // The documented hole, exercised rather than asserted. With
+    // `concurrent_limit = .nothing` every `io.concurrent` fails, so NOTHING
+    // here can be bounded — and nothing may be broken either: a request
+    // against a responsive peer must still behave exactly as it did before
+    // any of this existed. A peer that stalls *would* wedge this
+    // configuration, which is why both option doc comments name it.
+    //
+    // `Server.serve` already reacts to the same failure the same way (serve
+    // the connection inline rather than drop it, `Server.zig:455`), which is
+    // also what keeps this loopback server working under that limit.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, testing.allocator, .{
+        .connect_timeout_ms = 5000,
+        .total_timeout_ms = 5000,
+    });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const body = try client.getAlloc(testing.allocator, url, 1 << 16);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("ok", body);
 }
 
 test "live: GET https://example.com round-trip" {
