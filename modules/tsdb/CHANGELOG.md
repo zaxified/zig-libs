@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- New module: time-series persistence over `kvtree` — series identity,
+- **2026-07-30** — New module: time-series persistence over `kvtree` — series identity,
   append, streaming range scans, retention by age. Filed as a layer over
   `kv`; that premise was wrong and was not followed. `kv` is a Bitcask log
   with an unordered keydir and no cursor, and a time series is nothing but

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BREAKING:** `keygen` and `proveCredential` take `io: std.Io` instead of
+- **2026-08-12** — **BREAKING:** `keygen` and `proveCredential` take `io: std.Io` instead of
   `random: std.Random`, and draw from `std.Io.random` — contractually a
   CSPRNG. The old shape did not merely permit the mistake, it *taught* it:
   `keygen`'s doc comment said "seed it for deterministic tests" with nothing

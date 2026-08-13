@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- The entropy seam is now typed instead of documented. **BREAKING:** the three
+- **2026-08-12** — The entropy seam is now typed instead of documented. **BREAKING:** the three
   production entry points that consume entropy — `keyGen`, `encrypt` and
   `genRelinKey` — take `io: std.Io` in place of `random: std.Random` and draw
   through `entropy.SecureSource`, the fail-closed adapter over

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `SealRandomness.generate` draws all three values — `s_time`,
+- **2026-08-12** — `SealRandomness.generate` draws all three values — `s_time`,
   `tlock_sigma` and `kem_coins` — through the new `entropy` module
   (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of `io.random`. Not
   breaking: `fill` returns `void`, so the signature still returns a plain

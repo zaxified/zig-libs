@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BREAKING:** `startHandshake` and `handleFlight` take a `dtls.Entropy`
+- **2026-08-12** — **BREAKING:** `startHandshake` and `handleFlight` take a `dtls.Entropy`
   instead of a `std.Random`. `Entropy` is a two-armed tagged union —
   `.csprng` (production) and `.seeded_for_test` — so the entropy choice is
   written out at every call site instead of being whatever generator the caller
@@ -26,7 +26,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   only at the leaves. A new test pins that the type has exactly two arms, that
   they are distinct, and that both carry `std.Random`.
 
-- The `std.Random` requirement is now stated, not implied *(superseded by the
+- **2026-08-12** — The `std.Random` requirement is now stated, not implied *(superseded by the
   entry above, which turned the statement into a type — the "no signature
   changed" note below was true of this pass only)*. `startHandshake`,
   `handleFlight` and `ecdheGenerate` said only *why* the parameter exists
@@ -49,7 +49,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   hazard is real (same seed ⇒ byte-identical ephemeral private key), one
   asserts the sentence is present at each of the three declarations.
 
-- `signature_algorithms` is now genuinely negotiated instead of
+- **2026-07-28** — `signature_algorithms` is now genuinely negotiated instead of
   advertised-and-ignored. New `Config.signature_algorithms` drives both
   what this side offers and what it will accept; the scheme used to sign
   CertificateVerify is chosen from peer-advertised ∩ self-permitted ∩
@@ -62,7 +62,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   scheme is negotiated, no longer configured. New
   `certverify.candidateSchemes`.
 
-- Live third-party interop, and the four wire defects it exposed.
+- **2026-07-29** — Live third-party interop, and the four wire defects it exposed.
   `src/wolfssl_interop.zig` runs a real DTLS 1.3 PSK handshake over
   loopback UDP against **wolfSSL 5.9.1** in both roles (our client vs its
   server, our server vs its client), each with an application-data round
@@ -99,7 +99,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   all, which is why "no peer exists" sat in the backlog until someone
   checked what was installable.
 
-- HelloRetryRequest (RFC 8446 §4.1.4 / RFC 9147 §5.3), client side. A
+- **2026-07-29** — HelloRetryRequest (RFC 8446 §4.1.4 / RFC 9147 §5.3), client side. A
   stock DTLS 1.3 server answers the first ClientHello with a cookie and
   refuses to proceed until it comes back — return-routability without
   server state — so until now this module could not complete a handshake
@@ -131,7 +131,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   refused, so no trust boundary moves. New
   `Connection.sawHelloRetryRequest`.
 
-- **Serving** a HelloRetryRequest — RFC 9147 §5.1's stateless
+- **2026-07-29** — **Serving** a HelloRetryRequest — RFC 9147 §5.1's stateless
   return-routability check, the other half of the exchange. Until now
   this module's server answered a first ClientHello with a full flight,
   which §5.1 names as an amplification vector: forge a victim's source
@@ -170,7 +170,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   1.3 compatibility mode). No DTLS 1.3 peer is affected, since such a
   client sends a zero-length one.
 
-- Handshake-message reassembly across `handleFlight` calls (RFC 9147
+- **2026-07-29** — Handshake-message reassembly across `handleFlight` calls (RFC 9147
   §5.2). A message split across datagrams — a certificate chain past the
   path MTU, in practice — is now buffered and reassembled by
   `fragment_offset` (never arrival order), tolerating out-of-order and
@@ -242,6 +242,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   It now filters to this side's own scheme table, exactly as the
   ClientHello path already did.
 
-- Security audit: fixed the anti-replay window (part of the
+- **2026-07-19** — Security audit: fixed the anti-replay window (part of the
   collection-wide CRIT/HIGH audit; the root changelog records no further
   detail than this).

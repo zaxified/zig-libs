@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `ciphersuite.calculateRandomScalars` draws through the new `entropy`
+- **2026-08-12** — `ciphersuite.calculateRandomScalars` draws through the new `entropy`
   module (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of
   `io.random`. Not breaking: `fill` returns `void`, so the signature still
   returns a plain `[count]Fr`. `std.Io.random` is a CSPRNG whose contract

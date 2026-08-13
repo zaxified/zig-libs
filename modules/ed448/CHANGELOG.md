@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Both `KeyPair.generate` entry points — `x448.KeyPair.generate` and
+- **2026-08-12** — Both `KeyPair.generate` entry points — `x448.KeyPair.generate` and
   `ed448.KeyPair.generate` — draw their seed through the new `entropy`
   module (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of
   `io.random`. Not breaking: `fill` returns `void`, so both still read

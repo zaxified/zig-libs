@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- The two types can finally exchange values, and `BigDecimal` covers the
+- **2026-07-29** — The two types can finally exchange values, and `BigDecimal` covers the
   rest of the `java.math.BigDecimal` / GDA surface. `Decimal.toBigDecimal`
   is exact and total (a `Decimal` *is* `raw × 10^-12`);
   `Decimal.fromBigDecimal(allocator, b, mode)` is partial in two

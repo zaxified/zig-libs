@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `Manager.newId` — the source of every session id, including the one
+- **2026-08-12** — `Manager.newId` — the source of every session id, including the one
   `regenerate` mints on privilege change — draws through the new `entropy`
   module (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of
   `io.random`. Not breaking: `fill` returns `void`, and `newId` was and

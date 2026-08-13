@@ -5,6 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Security audit: hardened against an O(n²) denial-of-service (part of
+- **2026-07-19** — Security audit: hardened against an O(n²) denial-of-service (part of
   the collection-wide CRIT/HIGH audit; the root changelog records no
   further detail than this).

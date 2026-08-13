@@ -793,8 +793,10 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
 /// has: it is silently incomplete, and a consumer who reads it concludes their
 /// module did not change.
 ///
-/// Three claims:
+/// Four claims:
 ///
+///  0. Every entry in a `modules/<m>/CHANGELOG.md` carries its landing date.
+///     See `checkEntryDates` for the format and its calibration.
 ///  1. Every `modules/<m>/CHANGELOG.md` is linked from the root index. Driven
 ///     from `module_list`; a `modules/<x>/` that is not in `module_list` is
 ///     `check-catalog`'s error, not this one.
@@ -869,6 +871,10 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
     for (module_list) |m| {
         const path = b.fmt("modules/{s}/CHANGELOG.md", .{m.name});
         const text = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch continue;
+
+        // (0) runs before the index checks, and outside their `continue`s: an
+        // entry with no date is wrong whether or not the index links the file.
+        checkEntryDates(m.name, path, text, &failed);
 
         if (std.mem.indexOf(u8, root, b.fmt("]({s})", .{path})) == null) {
             std.log.err(
@@ -946,6 +952,155 @@ fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) an
     }
 
     if (failed) return step.fail("changelog index drift — see errors above", .{});
+}
+
+/// Claim (0): every entry in a module changelog says WHEN it landed.
+///
+/// THE PROBLEM. Entries sat under `## Unreleased` with no date at all, so
+/// "what changed when" was unanswerable from the file — a reader had to run
+/// `git log` against a repository they may not have. The tag a change ships in
+/// (CONVENTIONS §8) answers it only AFTER a tag is cut, and the whole point is
+/// to be able to answer it before.
+///
+/// THE FORMAT: `- **YYYY-MM-DD** — <entry>`, on the top-level bullet only.
+/// Continuation paragraphs and nested bullets belong to the entry above and
+/// carry nothing. The date is `20YY-MM-DD`, the same shape `scripts/tag.sh`
+/// accepts for a tag name, so the repo has ONE date format rather than two.
+///
+/// The date is WHEN THE CHANGE LANDED ON MAIN, not when the entry was typed.
+/// The two differ here by up to three weeks: 37eabe5 backfilled ~40 of these
+/// entries in one commit, describing work that landed as early as 2026-07-18,
+/// and dating them to the backfill would have made the whole retrofit useless
+/// in exactly the direction that matters. Going forward an entry is written
+/// with its change and the two coincide.
+///
+/// WHY A PREFIX AND NOT A SUBSECTION. `### 2026-07-29` headings grouping
+/// entries by date were rejected on what happens when a tag is cut: entries
+/// move into a `## 2026-08-14` release section, and a date heading nested in a
+/// date heading forces the reader to tell "released on" from "landed on" by
+/// heading level alone. A prefix has no such collision — the section says when
+/// it shipped, the bullet says when it landed, and both stay true and
+/// non-redundant (the current Unreleased spans 2026-07-18 to 2026-08-13, so
+/// one release date cannot stand in for 88 landing dates). A subsection is
+/// also a structural edit where a prefix is a line edit, and 38 of the 55
+/// files have exactly one entry, which would each get a heading of their own.
+///
+/// WHY NOT A TRAILING `(2026-08-13, 61f2f9a)`. These entries are not
+/// one-liners — `dtls`'s run past 30 lines each — so a trailing date lands at
+/// the bottom of a wall of prose, which is where a reader scanning a file will
+/// not find it. A prefix puts every date in one column down the left margin.
+/// It is also ambiguous which paragraph of a multi-paragraph entry "trailing"
+/// means, and prose ambiguity is what makes a gate cry wolf.
+///
+/// WHY NO COMMIT HASH, which was the closer call. A hash is exact and a date
+/// is not (five entries here landed on 2026-07-29). It still loses on three
+/// counts. It ROTS: §8 itself prescribes `git filter-repo` for a spin-off,
+/// which rewrites every hash of the extracted module, and this history is not
+/// yet published. It is for the WRONG READER: a module CHANGELOG is
+/// consumer-facing (§5), and a consumer with no clone cannot resolve a hash,
+/// while a reader with one can find the commit from the entry's own wording
+/// via `git log -S` — which is exactly how these 88 dates were recovered. And
+/// it would need a SECOND OWNER: nothing can keep a hand-copied hash agreeing
+/// with the entry beside it, and a gate that verified it would have to shell
+/// out to git — dying in a shallow clone or in the per-module tarball §8
+/// contemplates shipping. Where a hash is genuinely the right tool it goes in
+/// the commit message and in SPEC.md, both of which already carry them, and
+/// where rot costs nothing.
+///
+/// SCOPE: EVERY `## ` section, not only `## Unreleased`. Restricting it to
+/// Unreleased would build in a rule that stops applying the moment a tag is
+/// cut — 88 entries would move into a released section and silently leave the
+/// gate's sight, which is a gate switching itself off. Dating an entry is a
+/// fact about the past, so a frozen release section never needs editing to
+/// stay green; that is what separates this from the module-count sentence the
+/// function above deliberately does not check.
+///
+/// WHAT IS DELIBERATELY NOT CHECKED:
+///
+///   - The ROOT index carries no dates. The date is owned by the module
+///     changelog, and restating it on the index line would be a second place
+///     to get it wrong for no reader who is not one click away from the first.
+///   - That an entry's date is <= the date of the release section holding it.
+///     True by construction, but no released module section exists yet, so the
+///     rule would ship with zero instances behind it — an untested branch that
+///     first runs on the day someone cuts a tag.
+///   - There is no "cannot attribute" escape hatch, because the retrofit
+///     needed none: all 88 entries resolved to a commit. An accepted sentinel
+///     with zero real uses is an untested branch and a standing invitation.
+///     An entry whose landing genuinely cannot be pinned takes the date of the
+///     commit that records it, which always exists.
+///
+/// CALIBRATION, run before the rule was adopted rather than after (the lesson
+/// the `**BREAKING` rule above is written from): dry-run against all 55
+/// existing files after the retrofit — 88 entries, 88 accepted, 0
+/// disagreements. Both failure directions were then proven by planting them: a
+/// stripped date and a `2026-8-13` / `13-08-2026` malformation each turn this
+/// red, naming the file and line.
+fn checkEntryDates(name: []const u8, path: []const u8, text: []const u8, failed: *bool) void {
+    // The body starts at the first `## ` heading; the preamble above it is the
+    // file's title and the pointer back to the root index, not entries.
+    var body_start: usize = 0;
+    if (!std.mem.startsWith(u8, text, "## ")) {
+        body_start = (std.mem.indexOf(u8, text, "\n## ") orelse return) + 1;
+    }
+
+    var line_no = std.mem.count(u8, text[0..body_start], "\n") + 1;
+    var it = std.mem.splitScalar(u8, text[body_start..], '\n');
+    while (it.next()) |line| : (line_no += 1) {
+        // A top-level bullet, i.e. an entry. An indented `- ` is a sub-point of
+        // the entry above it and a blank or indented line is its continuation;
+        // none of those carry a date of their own.
+        if (!std.mem.startsWith(u8, line, "- ")) continue;
+        const rest = line[2..];
+        if (entryDate(rest) != null) continue;
+
+        failed.* = true;
+        if (!std.mem.startsWith(u8, rest, "**")) {
+            std.log.err(
+                "{s}:{d}: changelog entry has no date — write it as " ++
+                    "`- **YYYY-MM-DD** — {s}…`, where the date is the day the change " ++
+                    "landed on main (find it with `git log -S` on a distinctive phrase " ++
+                    "of the entry, not by guessing). Module '{s}'; see CONVENTIONS.md §8.",
+                .{ path, line_no, rest[0..@min(rest.len, 32)], name },
+            );
+        } else {
+            std.log.err(
+                "{s}:{d}: changelog entry opens with a bold span that is not a date — " ++
+                    "`{s}…`. The form is exactly `- **YYYY-MM-DD** — `, zero-padded, " ++
+                    "year first, em dash after (the same shape scripts/tag.sh accepts " ++
+                    "for a tag). A bold tag such as `**BREAKING:**` goes AFTER the date, " ++
+                    "not instead of it. Module '{s}'; see CONVENTIONS.md §8.",
+                .{ path, line_no, rest[0..@min(rest.len, 32)], name },
+            );
+        }
+    }
+}
+
+/// The `**YYYY-MM-DD** — ` opening of an entry, or null if it is absent or
+/// malformed. The date shape mirrors `scripts/tag.sh`'s own
+/// `^20[0-9]{2}-[0-9]{2}-[0-9]{2}$` so a tag name and an entry date are the
+/// same kind of string.
+fn entryDate(rest: []const u8) ?[]const u8 {
+    const close = "** — ";
+    if (!std.mem.startsWith(u8, rest, "**")) return null;
+    const after = rest[2..];
+    if (after.len < 10 + close.len) return null;
+    if (!std.mem.startsWith(u8, after[10..], close)) return null;
+
+    const d = after[0..10];
+    if (!std.mem.startsWith(u8, d, "20")) return null;
+    if (d[4] != '-' or d[7] != '-') return null;
+    for ([_]usize{ 2, 3, 5, 6, 8, 9 }) |i| {
+        if (!std.ascii.isDigit(d[i])) return null;
+    }
+    // Range-checked, so `2026-13-45` is caught as well as `2026-1-5`. A
+    // per-month day count is deliberately not modelled: this is a shape check,
+    // and the date is only ever copied out of `git log`.
+    const month = @as(u16, d[5] - '0') * 10 + (d[6] - '0');
+    const day = @as(u16, d[8] - '0') * 10 + (d[9] - '0');
+    if (month < 1 or month > 12) return null;
+    if (day < 1 or day > 31) return null;
+    return d;
 }
 
 /// The body of a markdown file's `## Unreleased` section: everything after the

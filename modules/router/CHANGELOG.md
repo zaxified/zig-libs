@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BEHAVIOURAL, not breaking** — the trailing-slash redirect no longer forces
+- **2026-08-13** — **BEHAVIOURAL, not breaking** — the trailing-slash redirect no longer forces
   an early `ResponseWriter.end()`. The `Location` value is built in a stack
   buffer and the early `end()` existed only to put the head on the wire before
   that frame died; `http`'s `setHeader` copies those bytes now. **What changes

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- The encoder now actually compresses. It was store-mode only (ratio
+- **2026-07-29** — The encoder now actually compresses. It was store-mode only (ratio
   ~1.0); it now does LZ77 backward references plus a per-meta-block
   Huffman code for literals, insert-and-copy commands and distances, with
   the store path kept as an automatic per-block fallback whenever a

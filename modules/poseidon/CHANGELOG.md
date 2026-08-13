@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- New module: the Poseidon ZK-friendly hash over `bn254` (circomlib's
+- **2026-07-29** — New module: the Poseidon ZK-friendly hash over `bn254` (circomlib's
   parameters, `t = 2..17`) and `bls12_381` (the authors'
   `poseidonperm_x5_255_{3,5}`). The sibling `groth16` and `bulletproofs`
   modules had no hash that is cheap *inside* a circuit, which left the ZK

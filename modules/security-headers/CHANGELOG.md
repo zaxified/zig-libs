@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BREAKING** `SecurityHeaders.init` now returns `InitError!SecurityHeaders`
+- **2026-08-12** — **BREAKING** `SecurityHeaders.init` now returns `InitError!SecurityHeaders`
   instead of `SecurityHeaders`. Every call site needs a `try` (or equivalent
   error handling) added; there were no in-repo consumers outside this
   module's own tests, so nothing else in the collection is affected. It

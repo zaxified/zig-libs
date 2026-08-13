@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `Mpf.evalEachFullWith` / `evalFullWith` / `evalFull` — the multi-point
+- **2026-07-29** — `Mpf.evalEachFullWith` / `evalFullWith` / `evalFull` — the multi-point
   counterpart, and the interleaved walk the `Dpf.evalFull` entry below
   recorded as the right answer for `Multi(k)`. ONE descent of the domain
   prefix carries all `k` tree states side by side and emits every
@@ -22,7 +22,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   pruning keeps the emission sequence a function of the prefix length
   alone.
 
-- `Dpf.evalFull` / `evalFullWith` — one tree traversal that emits every
+- **2026-07-29** — `Dpf.evalFull` / `evalFullWith` — one tree traversal that emits every
   leaf, instead of re-walking the tree from the root per point. Cost
   drops from `O(N log N)` PRG calls to `O(N)`: measured **570 ms → 52
   ms** (~10.9x) for a full 2^16 domain, matching the `(2n+1)/3`
@@ -40,7 +40,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   structurally independent differential oracle. Both `pir`'s value
   channel and `Verified`'s tag channel are wired to it.
 
-- **BREAKING — the default PRG is now fixed-key AES-128, which changes
+- **2026-08-06** — **BREAKING — the default PRG is now fixed-key AES-128, which changes
   the key bytes.** `Dpf`/`Mpf` were SHA-256; they are now
   `prg.Aes128Mmo`, fixed-key AES in the Matyas-Meyer-Oseas shape with the
   Guo-Kolesnikov-Rosulek-Roy σ pre-mix (`H_j(x) = AES_k(σ(x ⊕ j)) ⊕

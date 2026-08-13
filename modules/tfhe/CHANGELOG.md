@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- The entropy seam is now typed instead of documented. **BREAKING:** every
+- **2026-08-12** — The entropy seam is now typed instead of documented. **BREAKING:** every
   production key-generation and encryption entry point — `lweKeyGen`,
   `glweKeyGen`, `lweEncrypt`, `glweEncrypt`, `glweEncryptZero`,
   `ggswEncryptPoly`, `ggswEncryptScalar`, `bootstrapKeyGen`,

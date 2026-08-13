@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- New `jws.generateKeyPair(io)`, and both certificate-key draws
+- **2026-08-13** — New `jws.generateKeyPair(io)`, and both certificate-key draws
   (`Client.obtain`'s issuance key and `publishTlsAlpn01`'s TLS-ALPN-01
   validation key) now use it. It is
   `std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generate` verbatim with

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- A thread-safe option, `Sharded` — N independent `Cache` instances, one
+- **2026-07-29** — A thread-safe option, `Sharded` — N independent `Cache` instances, one
   lock each, picked by a hash of the key. `Cache` is unchanged and stays
   `single_owner`/lock-free; the five modules that own one from a single
   thread pay nothing. `Sharded` cannot mirror `Cache.get`, whose returned

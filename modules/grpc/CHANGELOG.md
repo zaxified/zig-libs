@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BEHAVIOURAL, not breaking** (server) — `handleRequest` no longer calls
+- **2026-08-13** — **BEHAVIOURAL, not breaking** (server) — `handleRequest` no longer calls
   `ResponseWriter.end()` itself. It did so to beat the per-call arena's
   `deinit` to the metadata `Call.finish` had just handed `setHeader` /
   `setTrailer` — the status digits, the percent-encoded `grpc-message`, the
@@ -16,7 +16,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   it, so a middleware wrapped around the gRPC router can still touch the head.
   The frames on the wire are unchanged.
 
-- New module: a gRPC **client** over HTTP/2, per the `grpc-over-http2`
+- **2026-07-30** — New module: a gRPC **client** over HTTP/2, per the `grpc-over-http2`
   specification — the layer between the `http` module's multiplexing h2
   client and the `protobuf` codec, with no code generation (a method is a
   path, its messages are Zig structs with a `pb_fields` descriptor).

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Carries the transport half of `mcp`'s new server→client requests
+- **2026-07-29** — Carries the transport half of `mcp`'s new server→client requests
   (`sampling/createMessage`, `elicitation/create`; see the sibling `mcp`
   changelog for the protocol-level design). Because this transport
   receives the client's answer on a *separate POST* rather than on a

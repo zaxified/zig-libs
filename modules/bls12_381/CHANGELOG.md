@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `scalar.Fr.random` draws through the new `entropy` module
+- **2026-08-12** — `scalar.Fr.random` draws through the new `entropy` module
   (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of `io.random`. Not
   breaking: `fill` returns `void`, so the signature still reads
   `random(io: std.Io) Fr` and no caller changed. `std.Io.random` is a

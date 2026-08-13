@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `ciphersuite.randomSigma` draws through the new `entropy` module
+- **2026-08-12** — `ciphersuite.randomSigma` draws through the new `entropy` module
   (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of `io.random`. Not
   breaking: `fill` returns `void`, so the signature is unchanged and still
   returns a plain `[block_bytes]u8`. `std.Io.random` is a CSPRNG whose

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Each KEM's `generateKeyPair` now mints its keypair the way RFC 9180 §4
+- **2026-08-13** — Each KEM's `generateKeyPair` now mints its keypair the way RFC 9180 §4
   defines it — `GenerateKeyPair() = DeriveKeyPair(random(Nsk))` — with
   `random` being `entropy.fill` (`std.Io.randomSecure`). **Not breaking:**
   no signature changes, no wire byte changes, and the KAT-driven
@@ -34,7 +34,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `mls` inherits the change through `S.Kem.generateKeyPair` (its
   `UpdatePath` leaf key) without any edit of its own.
 
-- `mode_psk`, `mode_auth` and `mode_auth_psk` are now anchored to RFC
+- **2026-07-28** — `mode_psk`, `mode_auth` and `mode_auth_psk` are now anchored to RFC
   9180's own Appendix A vectors (A.1.2/3/4 for X25519, A.3.2/3/4 for
   P-256) instead of only to this module's round-trip; the implementations
   needed no correction. New single-shot wrappers `sealPsk`/`openPsk`,

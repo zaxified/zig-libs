@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Malicious-server detection (`Verified(...)`). The module's model was
+- **2026-07-29** — Malicious-server detection (`Verified(...)`). The module's model was
   honest-but-curious: a server learned nothing about the index but was
   assumed to answer honestly, so a doctored share made the client
   silently reconstruct a wrong record. It now runs a second DPF for the
@@ -38,7 +38,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   adding the same constant every time produces identical wrong
   reconstructions.
 
-- Keyword lookup — `keywordIndex` / `queryKeyword`, also under
+- **2026-07-29** — Keyword lookup — `keywordIndex` / `queryKeyword`, also under
   `Verified`. `queryKeyword` is literally `query(keywordIndex(kw), …)`,
   and that is the point: the map is total, deterministic and
   unconditional (`LE64(SHA-256(kw)[0..8])` masked to the domain — a mask,

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BEHAVIOURAL, not breaking** — the preflight short-circuit no longer
+- **2026-08-13** — **BEHAVIOURAL, not breaking** — the preflight short-circuit no longer
   forces an early `ResponseWriter.end()`. Unlike the sites this mirrors
   (`ratelimit`, `throttle`), none of `handlePreflight`'s header values ever
   needed the early `end()` for their own sake: the reflected

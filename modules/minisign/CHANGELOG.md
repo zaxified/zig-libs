@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `KeyPair.generate`'s Ed25519 seed now comes from `entropy.fill`
+- **2026-08-13** — `KeyPair.generate`'s Ed25519 seed now comes from `entropy.fill`
   (`std.Io.randomSecure`) instead of `io.random`. **Not breaking:** the
   signature is unchanged and so is the on-disk format. New dep:
   `entropy`.
@@ -18,7 +18,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   deliberately stays on `io.random`: it is published in the clear in every
   `.pub` and `.sig` file, so it is an identifier, not a secret.
 
-- New module: sign/verify in the minisign file format over Ed25519, both
+- **2026-07-28** — New module: sign/verify in the minisign file format over Ed25519, both
   legacy (`Ed`) and prehashed-BLAKE2b (`ED`), including scrypt-encrypted
   secret keys and the trusted-comment global signature. Byte-exact
   against artifacts produced by the reference `minisign` binary.

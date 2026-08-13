@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Holder-of-Key subject confirmation now performs **cross-form** matching
+- **2026-07-28** — Holder-of-Key subject confirmation now performs **cross-form** matching
   (an `<ds:X509Certificate>` confirmation against a configured bare
   `presented_holder_key`, and a `<ds:KeyValue>` confirmation against a
   configured `presented_holder_cert_der`) over `x509.spkiOf`, comparing

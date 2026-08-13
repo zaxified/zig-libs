@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `OutboundSession.init`'s Ed25519 signing keypair now draws its seed from
+- **2026-08-13** — `OutboundSession.init`'s Ed25519 signing keypair now draws its seed from
   `entropy.fill` (`std.Io.randomSecure`) instead of `io.random`, matching
   what `Ratchet.generate` already did for R₀. **Not breaking:** no
   signature changed and no new dep (`entropy` was already one).
@@ -17,7 +17,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   is std's `Ed25519.KeyPair.generate` verbatim — retry loop included —
   with one substitution in where its 32 seed bytes come from.
 
-- `Ratchet.generate` draws R₀ through the new `entropy` module
+- **2026-08-12** — `Ratchet.generate` draws R₀ through the new `entropy` module
   (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of `io.random`. Not
   breaking: `fill` returns `void`, so no signature changed and `generate`
   still returns a plain `Ratchet`. `std.Io.random` is a CSPRNG whose
@@ -29,7 +29,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   than mint a group history from a degraded seed. The old doc comment
   justified `io.random` by pointing at `signal` and `std`'s Ed25519
   keygen; that comparison is gone with it.
-- New module: Matrix's Megolm group ratchet, the third real-world
+- **2026-07-29** — New module: Matrix's Megolm group ratchet, the third real-world
   group-messaging construction here alongside `signal` (pairwise Double
   Ratchet) and `mls` (RFC 9420). A one-way four-part HMAC-SHA-256 hash
   ratchet that fast-forwards to any future index but never rewinds, plus

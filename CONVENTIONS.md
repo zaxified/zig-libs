@@ -360,10 +360,47 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   `CHANGELOG.md` stays as the per-release index — which modules a tag touched — and does not
   restate the detail. A consumer of three modules should be able to answer "what changed for
   me" by reading three files, not by scanning every release section of one.
+- **Every entry carries the date it landed.** The form is exactly
+
+  ```
+  - **YYYY-MM-DD** — the entry text…
+  ```
+
+  on the top-level bullet; continuation paragraphs and nested bullets belong to the entry
+  above and carry nothing. The date is `20YY-MM-DD` — the same shape `scripts/tag.sh`
+  accepts for a tag name, so there is one date format in this repo and not two. Any bold
+  tag (`**BREAKING:**`, `**BEHAVIOURAL, not breaking**`) goes *after* the date, never
+  instead of it.
+
+  **It is the day the change landed on `main`, not the day the entry was typed**, and it
+  comes out of git — `git log -S` on a distinctive phrase of the entry — never out of
+  memory. A wrong date is worse than none, because it looks authoritative. An entry written
+  alongside its change makes the two the same day and needs no archaeology; only a backfill
+  has to go looking. An entry whose landing genuinely cannot be pinned takes the date of the
+  commit that records it, which always exists — so there is no "undated" spelling and the
+  gate accepts none.
+
+  **Why a per-entry date at all, given that a tag already dates a release.** The tag answers
+  "when did this ship", and only once it exists; until then the section is `Unreleased` and
+  the file cannot say when anything happened. The two facts also stay distinct after a tag
+  is cut — the section heading says when it shipped, the bullet says when it landed, and a
+  release here spans weeks (the first retrofit covered 2026-07-18 to 2026-08-13 under one
+  `Unreleased`), so one release date cannot stand in for the entries beneath it.
+
+  **No commit hash.** It rots — the spin-off procedure below prescribes `git filter-repo`,
+  which rewrites every hash of the extracted module — and a module CHANGELOG is
+  consumer-facing (§5), where a hash serves a reader who already has the clone and can find
+  the commit from the entry's own wording anyway. Hashes belong in commit messages and in
+  SPEC.md, where rot is cheap. **The root index carries no dates either**: the date is owned
+  by the module changelog, and an index line one click away is not a second place to keep it.
 - **The index is enforced**: `zig build check-changelog` (run by `scripts/test.sh` in both
   the `all` and `changed` lanes, so CI runs it) fails when a `modules/<name>/CHANGELOG.md`
-  has no entry in the root index, when an index entry points at a module changelog that does
-  not exist, or when the `BREAKING` tag disagrees between the two. Nothing checked this until
+  has an entry with a missing or malformed date, when it has no entry in the root index,
+  when an index entry points at a module changelog that does not exist, or when the
+  `BREAKING` tag disagrees between the two. The date check covers **every** `## ` section,
+  not just `## Unreleased` — a rule that stopped applying the moment a tag was cut would be
+  a gate switching itself off, and dating an entry is a fact about the past, so a frozen
+  release section never needs editing to stay green. Nothing checked this until
   it existed and the index had drifted by **16 of 55** entries — the failure mode of an index
   being that it is silently incomplete, so a consumer reads it and concludes their module did
   not change. The `BREAKING` half matches the literal `**BREAKING` — a bold span that STARTS

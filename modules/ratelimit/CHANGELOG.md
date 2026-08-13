@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BEHAVIOURAL, not breaking** — the 429 deny path no longer forces an early
+- **2026-08-13** — **BEHAVIOURAL, not breaking** — the 429 deny path no longer forces an early
   `ResponseWriter.end()`. The `Retry-After` and `RateLimit-*` values are
   formatted on the middleware's stack frame and the early `end()` existed only
   to beat that frame's death; `http`'s `setHeader` copies those bytes now.

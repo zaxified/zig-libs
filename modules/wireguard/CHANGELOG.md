@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `Keypair.generate` now draws its X25519 seed from `entropy.fill`
+- **2026-08-13** — `Keypair.generate` now draws its X25519 seed from `entropy.fill`
   (`std.Io.randomSecure`) instead of `io.random`, closing the last
   degrading draw in the module — `CookieChecker`'s secret and nonce were
   already moved. **Not breaking:** no signature changed and no new dep.
@@ -17,7 +17,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   passive recorder every packet of that handshake's session. The body is
   std's `X25519.KeyPair.generate` with the seed source substituted.
 
-- `CookieChecker`'s three random draws — `init` and `refresh` for the
+- **2026-08-12** — `CookieChecker`'s three random draws — `init` and `refresh` for the
   rotating secret `Rm`, and `createReply` for the `encrypted_cookie`
   XChaCha20 nonce — go through the new `entropy` module (`entropy.fill`,
   i.e. `std.Io.randomSecure`) instead of `io.random`. Not breaking: `fill`

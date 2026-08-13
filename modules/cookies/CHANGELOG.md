@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BREAKING** — `set` no longer takes a caller-supplied buffer.
+- **2026-08-13** — **BREAKING** — `set` no longer takes a caller-supplied buffer.
   **What a consumer must change:** drop the third argument, and the local it
   came from.
 

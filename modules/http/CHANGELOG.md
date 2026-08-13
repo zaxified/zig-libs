@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **BEHAVIOURAL, not breaking** (`proxy`) — a backend response header the
+- **2026-08-13** — **BEHAVIOURAL, not breaking** (`proxy`) — a backend response header the
   proxy cannot put on its own response is no longer dropped silently. Both
   relay loops (h1 and h2) used `catch {}`, so once the writer's copied-header
   budget or its 32-field table ran out, the client received a response that
@@ -23,7 +23,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   over-long `Via` chain is a 502, not a silently omitted hop); the *request*
   side keeps omitting it, since a header the backend never sees does not
   change what the client believes.
-- **BEHAVIOURAL, not breaking** (`proxy`) — the forced early
+- **2026-08-13** — **BEHAVIOURAL, not breaking** (`proxy`) — the forced early
   `ResponseWriter.end()` at the end of both forward paths is gone. It existed
   so `writeHead` read the relayed header slices before the deferred
   `res.deinit()` freed the backend head buffer they pointed into; those bytes
@@ -33,16 +33,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   after it returns — which is a gain (`sessions` saves its cookie there,
   `csrf` issues its token there, and both were silently losing the write on a
   proxied response), but it is an observable change of ordering.
-- `ResponseWriter.reset` is now **public**. It discards everything composed so
+- **2026-08-13** — `ResponseWriter.reset` is now **public**. It discards everything composed so
   far — status, header table, copied bytes, declared trailers, buffered body —
   and is legal only while nothing is on the wire. A handler that composes a
   response and only then discovers it cannot finish it (`proxy` above)
   otherwise has no way to stop the half-built answer from riding along with
   the error status that replaces it. Purely an addition.
-- Docs: `setTrailer`'s doc still claimed name and value are stored **without**
+- **2026-08-12** — Docs: `setTrailer`'s doc still claimed name and value are stored **without**
   copying and must stay valid until `end`. They have been copied since the
   fix below; the doc was describing the defect it repaired.
-- **BREAKING** `Client.Error` gains `error.EntropyUnavailable`. An exhaustive
+- **2026-08-12** — **BREAKING** `Client.Error` gains `error.EntropyUnavailable`. An exhaustive
   `switch` over it stops compiling until it handles the new case; a `catch |e|
   switch (e) { ... else => }` is unaffected, and every in-repo consumer
   (`proxy.statusForBackendError`, `llmclient.mapHttpError`, `h2_upstream`)
@@ -55,13 +55,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   **sockets**, and the ClientHello random and key share for every HTTPS
   request were being drawn from that same capability with no signal at the
   call site. Now it fails closed instead.
-- **BREAKING** `SetHeaderError` and `TrailerError` gain
+- **2026-08-12** — **BREAKING** `SetHeaderError` and `TrailerError` gain
   `error.HeaderBytesExhausted`. An exhaustive `switch` over either set stops
   compiling until it handles the new case; a `catch |e| switch (e) { ... else
   => }` is unaffected. It exists because header and trailer name/value bytes
   are now COPIED into the response writer rather than borrowed from the
   caller, which buys a byte budget the borrowing version did not have.
-- Header and trailer bytes are copied at `setHeader` / `setTrailer` /
+- **2026-08-12** — Header and trailer bytes are copied at `setHeader` / `setTrailer` /
   `addSetCookie` time. **This fixes a use-after-scope**: `writeHead` runs
   inside `end()`, which both servers call after the handler returns, so a
   handler that formatted a value into a stack buffer had those bytes read
@@ -71,7 +71,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   to. Debug and ReleaseFast passed the defect by luck; only ReleaseSafe
   exposed it.
 
-- Response **trailers** — the write side, which was previously documented
+- **2026-07-29** — Response **trailers** — the write side, which was previously documented
   as out of scope. `ResponseWriter.declareTrailers` + `setTrailer` emit a
   trailer section after the terminating chunk on HTTP/1.1 (RFC 9112
   §7.1.2) and as a trailing HEADERS frame carrying END_STREAM on HTTP/2
@@ -94,6 +94,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   dropped whole, §8.1). Anchored against **live curl 8.18 / nghttp2 1.68**
   on both protocols (`src/curl_interop.zig`), not only against our own
   client.
-- Security audit: hardened against HTTP request-smuggling (part of the
+- **2026-07-19** — Security audit: hardened against HTTP request-smuggling (part of the
   collection-wide CRIT/HIGH audit; the root changelog records no further
   detail than this).

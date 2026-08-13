@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- New module: Rescue-Prime Optimized (RPO) over Goldilocks
+- **2026-07-29** — New module: Rescue-Prime Optimized (RPO) over Goldilocks
   `p = 2^64 - 2^32 + 1`, at both published instances (`m = 12`, `m = 16`),
   both sponge framings that exist upstream, and the paper's round order
   as a separate permutation. The sibling to `poseidon`: same motivation

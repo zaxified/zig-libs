@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **Timing fix — neither breaking nor behavioural.** `condSubTop` (the final
+- **2026-08-13** — **Timing fix — neither breaking nor behavioural.** `condSubTop` (the final
   conditional subtract of every `montMulCios`, `montSqrCios`, `add` and
   `doubleMod`) and `sub`'s masked add-back were compiled by ReleaseFast into a
   branch on the secret-derived borrow — the classic Montgomery
@@ -24,13 +24,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   contract said; they now get what it said. `condSubTop` was also rewritten into
   the sibling asm core's two-pass masked form, which drops an `Elem` of stack —
   measurement says that rewrite is NOT what fixed the leak (see SPEC.md).
-- Test coverage for the conditional subtract's boundary behaviour: the existing
+- **2026-08-13** — Test coverage for the conditional subtract's boundary behaviour: the existing
   smoke test could never produce a carry word, so the `top = 1` half of the
   borrow chain was untested, as was the outgoing-borrow term that only fires on
   a limb where `v[i] == m[i]` — dropping that term left the whole suite green.
   Covered now in **both** copies of the routine, `montint.condSubTop` and
   `asm_core.condSub` (the latter at `n = 32`, the smallest width the dispatch
   routes there); each is caught only by its own constructed case.
-- Performance: gained an asm/Montgomery core (part of a collection-wide
+- **2026-07-18** — Performance: gained an asm/Montgomery core (part of a collection-wide
   performance campaign that also covered the sibling `k256`/`p256`
   modules; the root changelog records no further detail than this).

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- `verifyBatch`'s randomizers `a_2..a_u` are now drawn from
+- **2026-08-13** — `verifyBatch`'s randomizers `a_2..a_u` are now drawn from
   `io.randomSecure` instead of `Secp256k1.scalar.Scalar.random`, which
   draws from `io.random`. **Not breaking:** the signature is unchanged and
   so is the accepted set for any batch that verifies.
@@ -24,7 +24,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   one at a time and lose only the batching speedup. That is the test
   `entropy.fill`'s own doc sets for when not to use it.
 
-- New `taggedHashRuntime`/`taggedHasherRuntime` — the BIP-340 tagged hash
+- **2026-07-28** — New `taggedHashRuntime`/`taggedHasherRuntime` — the BIP-340 tagged hash
   with a **runtime** tag assembled from parts, for callers whose tag is
   not comptime-known (BOLT#12's nonce leaf, BIP-341 leaf hashes). The
   comptime `taggedHash`/`taggedHasher` remain the fast path. New

@@ -5,6 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Security audit: a CRIT/HIGH finding was fixed (part of the
+- **2026-07-19** — Security audit: a CRIT/HIGH finding was fixed (part of the
   collection-wide audit; the root changelog records no further detail
   than this).

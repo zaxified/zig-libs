@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- New module. `fill(io, buf)` takes bytes from `std.Io.randomSecure` or aborts
+- **2026-08-12** — New module. `fill(io, buf)` takes bytes from `std.Io.randomSecure` or aborts
   the process — the fail-closed entropy source for secret-bearing draws that
   std 0.16 leaves you to write yourself. `std.Io.random` is a CSPRNG with a
   documented silent-degrade clause and `std.Io.Threaded` honours it literally

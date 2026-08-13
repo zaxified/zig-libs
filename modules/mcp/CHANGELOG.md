@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- Server→client requests — `sampling/createMessage` and
+- **2026-07-29** — Server→client requests — `sampling/createMessage` and
   `elicitation/create`. Both are gated on the capabilities the client
   declares at `initialize`, which are now *stored*
   (`Server.client_capabilities`, all-false before a handshake, replaced
@@ -28,6 +28,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   method" branch and got a `-32600` reply (JSON-RPC forbids answering a
   response); and `negotiateVersion` echoed the caller's slice, which
   lives on the per-message arena.
-- Security audit: a CRIT/HIGH finding was fixed (part of the
+- **2026-07-19** — Security audit: a CRIT/HIGH finding was fixed (part of the
   collection-wide audit; the root changelog records no further detail
   than this).

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- New `x3dh.generateKeyPair(io)` — the module's single source of private
+- **2026-08-13** — New `x3dh.generateKeyPair(io)` — the module's single source of private
   keys — and all four production draws now use it: the X3DH ephemeral
   `EKA` (`x3dh.initiateUnverified`), the signed prekey `SPKB`
   (`x3dh.generateSignedPreKey`), and both Double Ratchet DH keys

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- The GG18 Appendix-A Fiat-Shamir transcripts now bind the Paillier
+- **2026-07-29** — The GG18 Appendix-A Fiat-Shamir transcripts now bind the Paillier
   **generator** `Γ`, not only the modulus `N` (audit F3 — an unbound
   public value in the verification equation is a value a prover can
   still vary after the challenge is fixed). A companion fail-closed
