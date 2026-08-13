@@ -1,0 +1,56 @@
+http — provenance note
+======================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). Moved here from the
+root `NOTICE` §2 on 2026-08-14, unchanged in substance.
+
+Specifications (clean-room)
+---------------------------
+
+RFC 7230/9110 (HTTP/1.1) + RFC 7541 (HPACK header compression; the
+static/Huffman tables and the Appendix C vectors are the RFC's own data) +
+RFC 9113 (HTTP/2 framing + stream state machine + flow control; RFC 7540
+consulted only where it clarifies the same rules) + RFC 7301 (ALPN — consumed
+for h2-over-TLS dispatch, not implemented).
+
+The HTTP/2 DoS mitigations are clean-room from the public CVE-2023-44487 /
+CVE-2024-27316 advisories (behavior only).
+
+Conditional requests (ETag/If-* → 304/412) are clean-room from RFC 9110
+sec 8.8/13; the HTTP-date parser follows RFC 9110 sec 5.6.7 (all three
+formats) with the days-from-civil epoch conversion (Howard Hinnant's public
+algorithm).
+
+Request-body parsing is clean-room from RFC 9110 sec 5.6.6 (Content-Type media
+type + parameters), the WHATWG URL `application/x-www-form-urlencoded` rules,
+and RFC 7578 / RFC 2046 sec 5.1 (multipart/form-data).
+
+The Range request-header parser is clean-room from RFC 7233 sec 2.1
+(byte-range-set); the 206 resolution + Content-Range emitter follows RFC 7233
+sec 4.
+
+The content-negotiation parsers are clean-room from RFC 9110 sec 12.5.1
+(Accept media-range) + sec 12.4.2 (qvalue) + sec 12.5.3 (Accept-Encoding) and
+RFC 4647 sec 3.3.1 (Accept-Language basic filtering).
+
+Clean-room from the RFCs, no HPACK/HTTP-2/nghttp2 source consulted or copied;
+TLS via Zig `std.crypto.tls`.
+
+The reverse-proxy handler (`http.proxy`) is clean-room from RFC 9110 sec 7.6
+(hop-by-hop fields, Via) + the RFC 7239 / de-facto `X-Forwarded-*` headers; the
+`SO_REUSEPORT` thread-per-core accept engine is a standard kernel-load-balancing
+technique (no source consulted).
+
+`http.sse` is clean-room from the WHATWG HTML "server-sent events" standard
+(the `text/event-stream` wire format: event/id/retry/data fields, multi-line
+data, comment lines). No third-party source consulted or copied.
+
+Design references (behavior only, no source copied)
+---------------------------------------------------
+
+  - lalinsky/dusty (**MIT**) — the 1.1 client shape.
+  - Go `net/http` (**BSD-3-Clause**, The Go Authors) — redirect semantics,
+    server shape, gzip handler.
+  - Go `net/http/httputil.ReverseProxy` (**BSD-3-Clause**) and nginx
+    `proxy_pass` (**BSD-2-Clause**) — the reverse-proxy behavior.

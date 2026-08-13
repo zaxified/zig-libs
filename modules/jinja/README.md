@@ -24,12 +24,19 @@ Anything the reference has that this does not — i18n (`{% trans %}`), the
 **compile error naming the tag or name**, never a silent no-op. `SPEC.md` §6
 lists every one.
 
-Provenance: see the `jinja` entry in the repository `NOTICE` — clean-room from
-the Jinja2 documentation and the observable behaviour of the reference
-implementation, with no Jinja2 or MarkupSafe source read or ported. Python
-Jinja2 is used only as a black-box test oracle in a subprocess (`SPEC.md` §7).
-That entry is a provenance record and carries no condition beyond zig-libs' MIT
-license. Test data: `src/testdata/reference.py` is this repo's own script
+Provenance: clean-room from the Jinja2 documentation (the template-designer
+and API docs at jinja.palletsprojects.com) plus the observable behaviour of the
+installed reference implementation. NO Jinja2 (or MarkupSafe) source was read or
+ported. Python Jinja2 3.1.6 is used only as a byte-exact black-box test ORACLE
+in a subprocess (`SPEC.md` §7) — the root `NOTICE` §0 relationship, needing no
+attribution — and is recorded here because the module's behaviour, operator
+precedence, filter/test vocabulary and API shape are deliberately modelled on it
+(pallets/jinja, **BSD-3-Clause**; pallets/markupsafe, **BSD-3-Clause** —
+behaviour only, no source copied). The Python language semantics reproduced
+along the way (floored `//`/`%`, `repr` forms, banker's rounding) are facts of a
+published language specification, not of any implementation. This is a
+provenance record and carries no condition beyond zig-libs' MIT license. Test
+data: `src/testdata/reference.py` is this repo's own script
 (`SPDX-License-Identifier: MIT`) — it merely invokes Jinja2, and none of
 Jinja2's source is reproduced in it — and `src/testdata/golden.json` is that
 script's output, so both are our own work.

@@ -53,23 +53,24 @@ vectors (see "Verification" below).
 ## Provenance
 
 Clean-room implementation from RFC 8017 (PKCS#1 v2.2) — a public IETF
-specification, not a copyrightable work (see `CONVENTIONS.md` §5 / `NOTICE`
-§0 policy). Design references: Zig std's internal `std.crypto.Certificate.rsa`
-(MIT-licensed, part of the Zig standard library the authors already build on)
-— consulted for the `Modulus`/`Fe`/`PublicKey` shape and the RSAEP/RSAVP1
-verification primitive's structure; **no source was copied**, and this
-module's `SecretKey`/CRT/signing surface has no counterpart in std's internal
-type to copy from in the first place (std's `rsa` struct is private and
-verify-only). The OpenSSH `PROTOCOL.key` private-key container format and
-OpenBSD's `bcrypt_pbkdf` (both format/algorithm shape only) are additional
-design references for the P4 key-parsing phase — see `NOTICE` for the full
-design-reference list (RFC 5280, RFC 5208, RFC 7468, RFC 4251 §5, Blowfish's
-published spec).
+specification, not a copyrightable work (see `CONVENTIONS.md` §5 / root
+`NOTICE` §0 policy). Design references: Zig std's internal
+`std.crypto.Certificate.rsa` (MIT-licensed, part of the Zig standard library
+the authors already build on) — consulted for the `Modulus`/`Fe`/`PublicKey`
+shape and the RSAEP/RSAVP1 verification primitive's structure; **no source was
+copied**, and this module's `SecretKey`/CRT/signing surface has no counterpart
+in std's internal type to copy from in the first place (std's `rsa` struct is
+private and verify-only). The OpenSSH `PROTOCOL.key` private-key container
+format and OpenBSD's `bcrypt_pbkdf` (Ted Unangst) — both format/algorithm shape
+only, implemented from their published descriptions — are additional design
+references for the P4 key-parsing phase, as is Schneier's published Blowfish
+paper (FSE '93), whose P-array/S-box pi constants were independently
+recomputed, not copied. See [`NOTICE`](NOTICE) beside this file for the full
+design-reference list (RFC 5280, RFC 5208, RFC 7468, RFC 4251 §5) and for the
+validation-only test-vector sources.
 
 Explicitly: **no GPL/LGPL dependency, no copied foreign source** anywhere in
-this module — spec-derived only, same as `hashdigest`/`sealedbox`. See
-`NOTICE` for the canonical design-reference entry.
-
+this module — spec-derived only, same as `hashdigest`/`sealedbox`.
 ## API
 
 ```zig

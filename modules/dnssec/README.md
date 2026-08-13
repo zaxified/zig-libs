@@ -139,12 +139,16 @@ Reproduce with `scratchpad/dnssec-oracle/` (zone + `extract.py`, ephemeral).
 
 ## Provenance
 
-Clean-room from RFC 4033/4034/4035/5155/6605/8080; the "model after"
-implementations above were consulted for structure/behavior only (no source
-copied), so no `NOTICE` entry is required per this repo's policy (a public
-RFC is not a copyrightable work; a behavioral reference without copied
-source is recorded here, not in `NOTICE`).
-
+Clean-room from the DNSSEC RFCs (4033/4034/4035 core, 5155 NSEC3, 6605 ECDSA,
+8080 Ed25519, 1982 serial arithmetic) — all open, public specifications, so the
+spec citations need no attribution. Reuses Zig std's `std.crypto` (ECDSA
+P-256/P-384, Ed25519, SHA-1/256/384) and this repo's own `rsa` module (RFC 8017
+PKCS#1 v1.5 verify, for algs 8/10) and `dns` module (message/record wire
+parsing); no source ported or copied. The "model after" implementations above
+were consulted for structure/behavior only, no source copied. Validation KATs
+are cross-checked against `ldns` (`ldns-signzone`/`ldns-verify-zone`,
+**BSD-3-Clause**) as an independent oracle — used to generate/verify test zones
+only, not consulted as source.
 ## Tests
 
 `zig build test-dnssec` — all tests run offline. The mechanical unit

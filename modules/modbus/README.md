@@ -142,8 +142,8 @@ Honest list of what this module does **not** do:
 Provenance: clean-room from the public Modbus Application Protocol
 Specification V1.1b3 and Modbus over Serial Line Specification V1.02
 (modbus.org — the protocol is openly published and royalty-free); libmodbus
-(LGPL-2.1+) referenced for behavior only, no source consulted or copied.
-pymodbus (BSD-3-Clause) was used only as a black-box interop peer for the
-captures described above — its master drove this server over a real socket
+(LGPL-2.1+) is cited as a behavior design reference only, no source consulted
+or copied. pymodbus (BSD-3-Clause) was used only as a black-box interop peer for
+the captures described above — its master drove this server over a real socket
 and its server answered this client; no pymodbus source was consulted or
 copied.

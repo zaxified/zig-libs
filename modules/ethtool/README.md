@@ -22,9 +22,13 @@ the kernel's own string tables and pluggable-module (SFP/QSFP) access — no
   needs **CAP_NET_ADMIN**. Joining the `monitor` multicast group needs none.
 
 Provenance: original work of the zig-libs authors (MIT); clean-room from the
-kernel UAPI (GPL-2.0 WITH Linux-syscall-note — the message/attribute constants
-and their layouts are the kernel's OS ABI, not copyrightable interface code).
-See `NOTICE`.
+kernel UAPI `linux/ethtool_netlink_generated.h` and `linux/ethtool.h` (GPL-2.0
+WITH Linux-syscall-note — the message/attribute/flag constants and the bitset
+and nest layouts are the kernel's OS ABI, not copyrightable interface code),
+relying on the same Linux-syscall-note exception as
+`netlink`/`genetlink`/`nl80211`/`wireguard`. The `ethtool` binary (GPL-2.0) was
+run ONLY as a black-box test oracle under `strace`, its request bytes diffed
+against this module's — no `ethtool` source consulted, studied or ported.
 
 ## Scope
 

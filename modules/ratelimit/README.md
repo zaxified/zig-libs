@@ -14,8 +14,9 @@ zero globals.
   std `SmpAllocator` pattern). The bare `TokenBucket` is single-owner.
 - **Deps:** `router`, `http`, `netaddr` (peer-IP key formatting).
 
-Provenance: clean-room (token-bucket + keyed store). Design refs
-(`x/time/rate`, nginx `limit_req`) in [NOTICE](../../NOTICE).
+Provenance: clean-room (token-bucket + keyed store). Design references only, no
+source consulted or copied: `golang.org/x/time/rate` (BSD-3-Clause, The Go
+Authors) and nginx `limit_req` (BSD-2-Clause).
 
 ## Layers
 

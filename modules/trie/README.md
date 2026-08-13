@@ -28,9 +28,10 @@ completion.
 > loader; hand-malformed positive controls prove the checkers have teeth. See
 > `SPEC.md` for the wire format field-by-field and the threat model.
 
-Provenance: clean-room. Design references only — BurntSushi/`fst` and Lucene FST
-(frozen-index autocomplete *approach*); no third-party source consulted or
-copied. See `NOTICE`.
+Provenance: original work of the zig-libs authors (MIT) — the frozen
+autocomplete index. Design references, approach only: BurntSushi's `fst` (Rust,
+**MIT OR Unlicense**) and Lucene's FST (**Apache-2.0**). No source consulted or
+copied.
 
 ## Contracts
 

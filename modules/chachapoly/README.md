@@ -117,9 +117,19 @@ length-by-length Poly1305 differential against `std` for **every** length
 
 ## Provenance
 
-Clean-room from RFC 8439 (a public spec — no NOTICE entry required for the
-construction itself). The block-parallel `@Vector` layout and the use of
-`std.crypto.onetimeauth.Poly1305` as the Poly1305 serial core are recorded in the
-repo `NOTICE`;
-`std.crypto.aead.chacha_poly.ChaCha20Poly1305` is used as a black-box correctness
-oracle (a test relationship, not a design reference).
+Clean-room from RFC 8439 (ChaCha20-Poly1305), a public IETF spec — the
+construction itself needs no attribution (merger doctrine, root `NOTICE` §0).
+Two std relationships are recorded instead:
+
+1. **Design reference** — Zig std `std/crypto/chacha20.zig` (MIT) was studied
+   for the `@Vector` quarter-round shape; this module uses a different,
+   block-parallel (transpose) SIMD layout, no source ported.
+2. **Component** — the Poly1305 MAC is `std.crypto.onetimeauth.Poly1305` (Zig
+   std, MIT) reused verbatim, not reimplemented.
+
+`std.crypto.aead.chacha_poly.ChaCha20Poly1305` and
+`std.crypto.stream.chacha.ChaCha20IETF` (both Zig std, MIT) are ALSO used as
+byte-exact black-box correctness oracles (differential tests), not as design
+references — the black-box-oracle relationship root `NOTICE` §0 describes. The
+RFC 8439 §2.3.2/§2.4.2/§2.5.2/§2.8.2 test vectors are public IETF spec
+artifacts (a test oracle under §0, needing no attribution).

@@ -14,13 +14,15 @@ algorithms (legacy, BIP143 segwit-v0, BIP341 taproot key-path).
   algorithm predates the BIP process and is modeled on Bitcoin Core's reference behavior
   (`SignatureHash()`, `src/script/interpreter.cpp`).
 
-Provenance: the BIPs are public specifications (merger doctrine — see
-[`CONVENTIONS.md`](../../CONVENTIONS.md) §5), so the BIP143/BIP341 paths are
-clean-room. The **legacy** sighash predates the BIP process and has no
-specification: its behavior — including the `SIGHASH_SINGLE` bug, which is
-consensus and must be reproduced — is modeled on Bitcoin Core's reference
-implementation as a **design reference** (behavior only, no source ported).
-Recorded in the root [`NOTICE`](../../NOTICE).
+Provenance: BIP141/143/144/340/341 are public specifications (merger doctrine —
+see [`CONVENTIONS.md`](../../CONVENTIONS.md) §5), so those sighash paths are
+clean-room. The **legacy** sighash predates the BIP process and was never
+specified: its behavior — including the `SIGHASH_SINGLE` bug, which is consensus
+and must be reproduced bit-for-bit — is modeled on Bitcoin Core's reference
+implementation (**MIT**), `SignatureHash()` in `src/script/interpreter.cpp`, as
+a **design reference** for behavior only; no source ported or copied. The
+reproduced Bitcoin Core `sighash.json` conformance rows are a separate matter
+and are answered in [`NOTICE`](NOTICE) beside this file.
 
 ## Scope
 

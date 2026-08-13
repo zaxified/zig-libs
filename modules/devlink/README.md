@@ -25,9 +25,13 @@ inventory and switching the embedded switch's mode — no `devlink` shell-out, n
   multicast group needs none.
 
 Provenance: original work of the zig-libs authors (MIT); clean-room from the
-kernel UAPI (GPL-2.0+ WITH Linux-syscall-note — the command/attribute constants
-and their layouts are the kernel's OS ABI, not copyrightable interface code).
-See `NOTICE`.
+kernel UAPI `linux/devlink.h` (GPL-2.0+ WITH Linux-syscall-note — the
+command/attribute/flag constants and nest layouts are the kernel's OS ABI, not
+copyrightable interface code), relying on the same Linux-syscall-note exception
+as `netlink`/`genetlink`/`ethtool`/`nl80211`/`wireguard`. iproute2's `devlink`
+(GPL-2.0) was run ONLY as a black-box test oracle under `strace`, its request
+bytes diffed against this module's — no iproute2 source consulted, studied or
+ported.
 
 ## Most machines have no devlink device
 

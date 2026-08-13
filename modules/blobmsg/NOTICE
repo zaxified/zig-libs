@@ -1,0 +1,38 @@
+blobmsg — provenance note
+=========================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). Moved here from the
+root `NOTICE` §2 on 2026-08-14, unchanged in substance.
+
+An original Zig implementation
+------------------------------
+
+The blob/blobmsg TLV codec (the bulk of the module) implements the OpenWRT
+libubox wire format from its headers `blob.h`/`blobmsg.h` (**ISC**) as the
+format specification — independent Zig implementation, no libubox code copied.
+
+The ubus message envelope uses the 8-byte `msghdr` struct layout and the ubus
+protocol constants (`MSG_*`/`ATTR_*`) as declared in ubus `ubusmsg.h`
+(**LGPL-2.1**); these are uncopyrightable protocol facts (integer constants +
+a packed struct), re-derivable from the documented header layout.
+
+`libubus-io.c` (**LGPL-2.1**) contributed NO code: the unix-socket transport
+(blocking read/write loops, single-buffer send, fixed-header framing,
+seq-matched request/reply) is an independent implementation — none of
+`libubus-io.c`'s expression (writev/iovec scatter-gather, chunked reader,
+`SCM_RIGHTS` fd-passing, callback request-registry, reconnect state machine) is
+present.
+
+Published under MIT; the only copyleft touchpoint is the uncopyrightable ubus
+protocol facts above.
+
+Black-box test oracle
+---------------------
+
+A real ubusd integration test (connect, list, invoke) passes against a live
+daemon when present. `codec.zig`'s "real ubusd capture" tests freeze wire bytes
+and matching `ubus -S` JSON text from a real `ubus`/`ubusd` pair run once
+inside the `scripts/vm/` OpenWRT VM, exercising it purely as a black-box test
+oracle (root NOTICE §0 — no libubus/ubus source consulted, needing no
+attribution beyond this record); see `SPEC.md` for the byte-parity findings.

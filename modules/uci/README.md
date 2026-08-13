@@ -15,9 +15,15 @@ Configuration Interface) file format — `config` / `option` / `list`.
   **Allocation:** model memory lives in an internal arena — one
   `Package.deinit(gpa)` frees everything.
 
-Provenance: original work of the zig-libs authors (MIT); clean-room from
-the documented OpenWRT UCI file format — libuci (LGPL-2.1) referenced for
-the format only, no source consulted or copied — see NOTICE.
+Provenance: original work of the zig-libs authors (MIT); clean-room from the
+documented OpenWRT UCI (Unified Configuration Interface) file format (OpenWRT
+wiki/docs) — libuci (LGPL-2.1) is referenced for the format only, no libuci
+source was consulted or copied; the file format is the documented interface.
+`root.zig`'s "real uci capture" tests freeze raw config bytes and the real `uci`
+binary's own `export`/`show` stdout for them, run once inside the `scripts/vm/`
+OpenWRT VM, exercising it purely as a black-box test oracle (root `NOTICE` §0 —
+no libuci/uci source consulted, needing no attribution); see SPEC.md for the
+findings.
 
 ## API
 

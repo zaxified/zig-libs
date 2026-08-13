@@ -9,14 +9,14 @@ active health checks (`healthTick`) through `probe`'s connector seam, and
 route with automatic failover via `call()`.
 
 Provenance: original work of the zig-libs authors (MIT); design references
-(behavior only, no source consulted or copied): Envoy
-(Apache-2.0) and HAProxy (documented behavior only) upstream-cluster
-semantics — health-checked member set, pluggable LB policy, per-member
-circuit breaking and concurrency caps; resilience4j (Apache-2.0) Bulkhead
-for the per-upstream concurrency cap (via the `resilience` sibling).
+(behavior only, no source consulted or copied): Envoy (Apache-2.0) and HAProxy
+(GPL-2.0 — documented behavior only, no code consulted or copied)
+upstream-cluster semantics — health-checked member set, pluggable LB policy,
+per-member circuit breaking and concurrency caps; resilience4j (Apache-2.0)
+Bulkhead for the per-upstream concurrency cap (via the `resilience` sibling).
 Round-robin, smooth weighted round-robin (the nginx algorithm),
 least-connections and EWMA latency balancing are public, decades-old
-techniques. See ../../NOTICE.
+techniques.
 
 - **Model after:** Envoy/HAProxy upstream cluster + resilience4j Bulkhead.
 - **Platform:** any — pure logic; active-health I/O goes through the

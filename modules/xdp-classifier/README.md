@@ -182,6 +182,10 @@ ruleset's intended behavior without a kernel).
   per-packet metadata handoff to a downstream `tc` classifier — see
   `SPEC.md`'s backlog for the reasoning behind each.
 
-Provenance: see `../../NOTICE` — clean-room from the public LibreQoS
-architecture description and the kernel UAPI/verifier documentation the
-sibling `ebpf` module already cites; no LibreQoS or libbpf source ported.
+Provenance: clean-room from the public LibreQoS (**GPL-2.0**) architecture
+DESCRIPTION — the classify-then-shape split, where an XDP classification stage
+feeds a downstream tc/CAKE queueing stage — as a design reference for structure
+only. No LibreQoS source was read or ported and this module shares no code with
+it. The wire ABI and instruction emission come from the sibling `ebpf` module
+and the kernel UAPI/verifier documentation it already cites; no libbpf source
+ported.

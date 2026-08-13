@@ -19,10 +19,17 @@ no `ip`/`bridge` shell-outs, no `/proc/net` parsing, no libc.
 
 Provenance: clean-room from the kernel UAPI headers (`linux/netlink.h`,
 `linux/rtnetlink.h`, `linux/if_link.h`, `linux/if_addr.h`,
-`linux/neighbour.h`, `linux/if_bridge.h`, `linux/if.h`) and RFC 3549; design
-references libmnl
-(LGPL-2.1) and vishvananda/netlink (Apache-2.0) — behavior/wire semantics
-only, no source consulted or copied. See `NOTICE`.
+`linux/neighbour.h`, `linux/if_bridge.h`, `linux/if.h`; GPL-2.0 WITH
+Linux-syscall-note) and RFC 3549. No GPL header source is copied — only the
+uncopyrightable ABI facts they document are used (numeric
+message/attribute/flag constants, struct layouts). The operative mechanism is
+the Linux-syscall-note exception itself: it explicitly states that using these
+headers to make syscalls / interface with the kernel does not bring the
+resulting work under the GPL, for userspace of ANY license — which is why this
+module is cleanly MIT despite citing GPL-2.0 headers. Design references libmnl
+(LGPL-2.1; validation/framing behavior only, no source consulted) and
+vishvananda/netlink (Go, Apache-2.0; typed-query shape only) — original pure-Zig
+implementation, no GPL/LGPL source ported.
 
 ## API
 

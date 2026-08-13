@@ -51,8 +51,8 @@ Server side · long-term credential mechanism (RFC 8489 §9.2: SASLprep
 username/realm/nonce, MD5 + SHA-256 PASSWORD-ALGORITHMS, USERHASH) ·
 UNKNOWN-ATTRIBUTES generation · ICE integration · TURN · TCP/TLS transport.
 
-Provenance: clean-room from RFC 8489 (STUN) and the RFC 5769 test vectors —
-original work of the zig-libs authors (MIT); the attribute TLV
-(de)serialization structure is modelled after Corendos/ztun (MIT) — design
-reference only, no source copied — see NOTICE. HMAC-SHA1 and CRC-32 come from
-Zig `std.crypto` / `std.hash`.
+Provenance: clean-room from RFC 8489 (STUN), verified against the RFC 5769
+test vectors — original work of the zig-libs authors (MIT); the attribute-TLV
+(de)serialization *design* is modeled after Corendos/ztun (MIT) — design
+reference only, no source copied. HMAC-SHA1 and CRC-32 come from Zig
+`std.crypto` / `std.hash`.

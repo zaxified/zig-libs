@@ -167,5 +167,5 @@ native path is clean-room from the kernel UAPI headers
 `linux/netfilter.h`) plus byte-exact captures of a stock `nft` binary's netlink
 traffic. No libnftables, libnftnl, libmnl or nftables source was consulted or
 copied; `nft` is used only as a capture subject and a test oracle. libnftables
-itself is GPL: it is referenced solely as the specification of its JSON
+itself is GPL-2.0: it is referenced solely as the specification of its JSON
 input/output format (an interface, not code).

@@ -67,7 +67,13 @@ harness with no teeth is the failure mode this module exists to avoid, so each
 consumer ships a deliberately-broken positive control that MUST trip its
 checker (see `raft`'s `BrokenRaft`).
 
-Provenance: modeled after TigerBeetle's VOPR as a **design reference only** —
-no source consulted or copied; recorded in the root [`NOTICE`](../../NOTICE).
-The splitmix64 mixer is Sebastiano Vigna's public-domain algorithm. The
-methodology is borrowed from this repo's own `kv` VOPR, not its code.
+Provenance: original work of the zig-libs authors (MIT) — the deterministic
+seeded discrete-event simulator, the failure-schedule fuzzer, the byte-exact
+replay oracle and the ddmin counterexample minimizer. The METHODOLOGY — a
+simulator that is a pure function of its seed, driving a real implementation
+under a fuzzed fault schedule with invariants checked after every event —
+follows TigerBeetle's VOPR (**Apache-2.0**), a **design reference only**: no
+TigerBeetle source was consulted or copied, and this module's engine, event
+queue and API are unrelated to it. The splitmix64 mixer is Sebastiano Vigna's
+public-domain algorithm. The methodology is borrowed from this repo's own `kv`
+VOPR, not its code.

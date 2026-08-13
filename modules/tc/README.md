@@ -184,5 +184,7 @@ One asymmetry worth knowing: qdiscs, classes and filters are namespaced, so
 prints `SKIPPED: …` and passes without it.
 
 Provenance: kernel UAPI headers (`linux/rtnetlink.h`, `linux/pkt_sched.h`,
-`linux/pkt_cls.h`) plus iproute2 consulted as a *behaviour* reference for the rate-table
-arithmetic and attribute ordering — see `/NOTICE`.
+`linux/pkt_cls.h`, GPL-2.0 WITH Linux-syscall-note) plus iproute2
+(GPL-2.0-or-later) consulted as a *behaviour* reference for the rate-table
+arithmetic, the default burst/buffer formulas and attribute ordering — no
+source copied. See [`NOTICE`](NOTICE) beside this file.

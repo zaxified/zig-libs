@@ -104,8 +104,18 @@ drift apart unnoticed) and **484 Wycheproof DER vectors** (310 malformed
 encodings) behind `derToRaw`, and two positive controls — a broken-Solinas-constant
 reduction and a corrupted-comb-table gather — the harness flags RED.
 
-Provenance: clean-room from the NIST P-256 domain parameters; OpenSSL's nistz256
-studied as the technique reference (the P-256 Solinas reduction, `MULX/ADX`
-field). Validated bit-exact vs `std.crypto.ecc.P256` + the RFC 6979 ECDSA-P256
-vectors. Asm is amd64-only with a portable fallback everywhere. See the `NOTICE`
-entry.
+Provenance: clean-room from the NIST P-256 domain parameters. Design
+reference: OpenSSL nistz256 (**Apache-2.0**; the Gueron–Krasnov "Fast prime
+field elliptic-curve cryptography with 256-bit primes" technique) — studied for
+the technique shape only: the special-prime (Solinas) field reduction for
+p = 2^256 − 2^224 + 2^192 + 2^96 − 1 (fold the high half by
+M = 2^224 − 2^192 − 2^96 + 1 / the signed s1..s9 word-shuffle), and the amd64
+`MULX/ADX` field multiply the gated core will mirror. No source ported. The NIST
+P-256 domain parameters (p, n, G, the curve constant b, a = −3) are public curve
+facts; the specific integer constants match `std.crypto.ecc.P256` (Zig std,
+MIT), which is ALSO used as the byte-exact correctness oracle (differential
+tests), not as a design reference. The end-to-end ECDSA anchor transcribes the
+ECDSA-P256/SHA-256 vectors from RFC 6979 Appendix A.2.5, a public IETF spec
+artifact used as a test oracle. P-256 has no efficiently-computable
+endomorphism, so — unlike `k256` — there is no GLV construction to attribute.
+Asm is amd64-only with a portable fallback everywhere.

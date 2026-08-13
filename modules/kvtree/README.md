@@ -31,10 +31,12 @@ that see a consistent snapshot without blocking the writer.
 > reuse pool. See `SPEC.md` for the A-vs-B design decision and the
 > verification argument.
 
-Provenance: clean-room. Design references only — LMDB/BoltDB (COW B-tree +
-meta-page double-buffer) and TigerBeetle's VOPR (deterministic fault-injection
-*approach*). Behavior/approach only; no third-party source consulted or copied.
-See `NOTICE`.
+Provenance: clean-room. Design references only — LMDB (OpenLDAP Public
+License) and BoltDB (MIT) for the copy-on-write B-tree with double-buffered
+meta pages (MVCC + atomic commit + crash-safety emergent from COW, no separate
+WAL), and TigerBeetle (Apache-2.0) for the VOPR deterministic fault-injection
+*approach*. Behavior/approach only; no third-party source consulted or
+copied.
 
 ## API
 

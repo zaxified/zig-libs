@@ -111,9 +111,11 @@ authPriv GET + a walk against a real `snmpd`. See `SPEC.md` for the exact
 matrix and how to re-run it.
 
 Provenance: clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c
-protocol operations), RFC 2578 (SMI types), ITU-T X.690 (BER), RFC 3412/3414
-(SNMPv3 + USM), RFC 3826 (AES-CFB privacy), RFC 7860 (SHA-2 auth), FIPS 46-3
-(DES) and NIST SP 800-38A (CFB mode) — original work of the zig-libs authors
-(MIT); net-snmp (BSD-like license) used only as a **black-box interop oracle**
-(run it, capture its packets, compare) — no source consulted or copied, so no
-NOTICE change is required — see NOTICE.
+protocol operations), RFC 2578 (SMI types), ITU-T X.690 (BER), RFC 3412
+(SNMPv3 message processing / ScopedPDU), RFC 3414 (USM: security parameters +
+§8 DES-CBC privacy + §3.2 time-window), RFC 3826 (AES-128-CFB privacy),
+RFC 7860 (SHA-2 auth), FIPS PUB 46-3 (DES, public domain) and NIST SP 800-38A
+(CFB mode), both KAT-verified — original work of the zig-libs authors (MIT).
+net-snmp (BSD-like license) is cited as a behavior reference and is otherwise
+used only as a black-box interop oracle (run it, capture its packets, compare)
+— no source consulted or copied, so it carries no attribution obligation.

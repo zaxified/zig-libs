@@ -16,10 +16,12 @@ workloads (thousands of host checks per cycle).
   async-signal-safe).
 - **Deps:** `seqmap` (reply correlation), `netaddr` (address parse/format).
 
-Provenance: clean-room; the prober's scheduling design references fping
-(schweikert/fping) — recorded in the repository `NOTICE` §2 as provenance, not
-as a license obligation. No fping source is copied. Wire formats per RFC 792
-(ICMP), RFC 4443 (ICMPv6), RFC 1071 (internet checksum).
+Provenance: clean-room; wire formats per RFC 792 (ICMP), RFC 4443 (ICMPv6),
+RFC 1071 (internet checksum), with `ip(7)`/`ipv6(7)` for the socket options.
+The prober's scheduling design references fping (schweikert/fping, Stanford
+BSD-with-advertising) — design and default timing constants only, no fping
+source copied. Recorded as provenance, not as a license obligation, in
+[`NOTICE`](NOTICE) beside this file.
 
 ## API
 

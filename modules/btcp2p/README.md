@@ -14,13 +14,14 @@ handshake, the inventory/data-request messages, `tx`/`block` payload messages (r
   (`src/net.h`, `src/chainparams.cpp`) for the constants actually deployed today (max message size,
   network magic bytes).
 
-Provenance: the message shapes come from the public Bitcoin protocol
-documentation (a public specification — see [`CONVENTIONS.md`](../../CONVENTIONS.md)
-§5), and the published `verack`/`version` hex dumps are used as byte-exact test
-vectors. The constants that are *deployed* rather than documented (max message
-size, network magic) were read from Bitcoin Core's reference client as a
-**design reference** — values and behavior only, no source ported. Recorded in
-the root [`NOTICE`](../../NOTICE).
+Provenance: the message shapes are clean-room from the public Bitcoin protocol
+documentation (en.bitcoin.it/wiki/Protocol_documentation — a public
+specification, see [`CONVENTIONS.md`](../../CONVENTIONS.md) §5), whose published
+`verack`/`version` hex dumps are used as byte-exact test vectors. The constants
+that are *deployed* rather than documented — `MAX_PROTOCOL_MESSAGE_LENGTH`
+(`src/net.h`) and the network magic bytes (`src/chainparams.cpp`) — were read
+from Bitcoin Core (**MIT**) as a **design reference**: values and behavior only,
+no source ported.
 
 ## Scope: a codec, not a node
 

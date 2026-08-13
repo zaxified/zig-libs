@@ -34,8 +34,19 @@ world anyway.
   exponential-backoff-with-jitter policy; this module does not re-derive one).
 
 Provenance: original work of the zig-libs authors (MIT), clean-room from
-**documentation**. See the root `NOTICE` entry for `reconcilable` — no
-controller-runtime or client-go source was read or ported.
+**documentation** only: the Kubernetes controller-runtime docs (the
+`Reconciler`/`Result` contract, `RequeueAfter`, the idempotence requirement) and
+the client-go `workqueue` documentation (dedup,
+`Add`/`AddAfter`/`AddRateLimited`/`Forget`/`Done`, the exponential-failure and
+bucket rate limiters). NO controller-runtime or client-go source was read or
+ported — deliberately, since both are **Apache-2.0** and a port would attach a
+patent grant and a NOTICE-propagation requirement to this repository. Recorded
+because the module's outcome semantics and queue behaviour are modelled on them
+(kubernetes-sigs/controller-runtime and kubernetes/client-go, Apache-2.0 —
+behaviour only, no source copied). The rollback timer follows the documented
+confirm-or-revert behaviour of Juniper `commit confirmed` and Cisco IOS-XE
+`configure replace ... commit timeout` — vendor documentation of a configuration
+workflow, not anyone's code.
 
 ## Use
 

@@ -90,7 +90,17 @@ montint *beats* OpenSSL at 256-bit — versus the 8–29× the `std.crypto.ff`-b
 modules pay. The win is mostly the full-limb Montgomery-resident portable CIOS
 (ff→portable ~3.2× at 2048 modexp); the asm core adds ~1.5× on top.
 
-Provenance: clean-room from public algorithm descriptions (Montgomery CIOS; the
-OpenSSL `x86_64-mont5` `MULX/ADCX/ADOX` technique studied as a design reference;
-`std.crypto.ff` API shape). KAT vectors from an independent CPython-bignum
-re-derivation. See the `NOTICE` entry.
+Provenance: clean-room from public algorithm descriptions. The portable CIOS
+Montgomery multiply is clean-room from Koç, Acar & Kaliski, "Analyzing and
+Comparing Montgomery Multiplication Algorithms" (IEEE Micro 1996), Fig. 6, and
+the API shape follows `std.crypto.ff` (Zig std, MIT). Design references,
+behavior/algorithm only, no source copied: OpenSSL
+`crypto/bn/asm/x86_64-mont5.pl` (**Apache-2.0**; the `MULX/ADCX/ADOX`
+dual-carry-chain amd64 Montgomery-multiply technique the gated asm core will
+mirror) and Gueron & Krasnov, "Fast Prime Field Elliptic Curve Cryptography with
+256-Bit Primes" (the published description of the same two-independent-carry-chain
+method). Test-vector cross-check only, not a design reference: the modmul/modexp
+KATs at 256/512/2048/4096 bits were independently recomputed with CPython's
+arbitrary-precision integers (`(a*b)%m`, `pow(a,e,m)`) — the same black-box
+oracle method the `vdf` module uses — numerically identical to OpenSSL
+`BN_mod_mul`/`BN_mod_exp`. No source ported.

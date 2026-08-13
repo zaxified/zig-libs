@@ -23,9 +23,16 @@ Provenance: ⚠ **this module carries required attribution.** The parameter
 generator and the MDS acceptance checks **port** the Poseidon authors'
 `hadeshash` reference (MIT), whose copyright notice must be preserved in any
 copy — the terms are in this module's own [`NOTICE`](NOTICE), beside the code
-that owes them. `iden3/circomlib` + `circomlibjs` are design references for the
-deployed constants, recorded in the root [`NOTICE`](../../NOTICE). Neither
-imposes a condition beyond MIT's own.
+that owes them. The permutation and its parameter generation otherwise follow
+eprint 2019/458 (Grassi-Khovratovich-Rechberger-Roy-Schofnegger) and the
+subspace-trail analysis of eprint 2020/500 (Grassi-Rechberger-Schofnegger), and
+the GF(p) linear algebra (`linalg.zig`) is the authors' own.
+`iden3/circomlib` + `circomlibjs` (**LGPL-3.0**) are a design/comparison
+reference for the deployed constants, used ONLY as a comparison target:
+`constants_test.zig` pins SHA-256 digests of tables this module derives itself
+and documents how to re-clone circomlibjs and recompute the comparison. No
+circomlib source or data is present, so its copyleft terms do not reach this
+repository, and neither reference imposes a condition beyond MIT's own.
 
 ## Read this first
 

@@ -107,8 +107,17 @@ libsecp256k1** via the fixed-base comb table (`group.combMulBase`) — both
 signature paths land inside the module's ~2–4×-libsecp256k1 target. See
 `SPEC.md`'s Performance status section for the full breakdown.
 
-Provenance: clean-room from the secp256k1 domain parameters + BIP340 public spec;
-libsecp256k1 studied as the technique reference (special-prime reduction, GLV,
-`MULX/ADX` field). Validated bit-exact vs `std.crypto.ecc.Secp256k1` + the
-official BIP340 vectors. Asm is amd64-only with a portable fallback everywhere.
-See the `NOTICE` entry.
+Provenance: clean-room from the secp256k1 domain parameters + the public
+BIP340 specification. Design reference: bitcoin-core/libsecp256k1 (**MIT**,
+Copyright (c) 2013 Pieter Wuille et al.) — studied for the technique shape only:
+the special-prime (Solinas) field reduction for p = 2^256 − 2^32 − 977 (fold the
+high half by 2^32+977), the GLV endomorphism decomposition, and the amd64
+`MULX/ADX` field multiply the gated core mirrors. No source ported. The
+secp256k1 domain parameters (p, n, G, the curve constant b, and the GLV λ/β +
+lattice basis) are public curve facts; the specific integer constants match
+`std.crypto.ecc.Secp256k1` (Zig std, MIT), which is ALSO used as the byte-exact
+correctness oracle (differential tests), not as a design reference. The
+`kat_vectors.zig` transcription of the official `bip-0340/test-vectors.csv` is a
+public BIP spec artifact used as a test oracle, not copied from any
+implementation's test suite. Asm is amd64-only with a portable fallback
+everywhere.

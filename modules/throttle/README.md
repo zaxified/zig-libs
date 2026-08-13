@@ -11,7 +11,7 @@ Provenance: original work of the zig-libs authors (MIT); modeled after Go
 `golang.org/x/sync/semaphore` (BSD-3-Clause, The Go Authors; slot semantics
 only, no source copied), Netflix concurrency-limits (Apache-2.0; design
 notes only) and the SEDA architecture (Welsh et al., SOSP '01; bounded-queue
-load shedding) — see NOTICE. Clock-injection patterns follow the
+load shedding). Design references only. Clock-injection patterns follow the
 `ratelimit` sibling module.
 
 - **Model after:** Go `golang.org/x/sync/semaphore` (tryAcquire never

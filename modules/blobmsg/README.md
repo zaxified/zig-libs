@@ -19,13 +19,16 @@ Provenance: original work of the zig-libs authors (MIT). The blob/blobmsg TLV
 codec is an independent Zig implementation of the OpenWRT libubox wire format
 specified in its headers `blob.h`/`blobmsg.h` (ISC); the ubus envelope reuses
 only the ubus protocol constants + the packed msghdr layout from `ubusmsg.h`
-(LGPL-2.1) as uncopyrightable protocol facts. `libubus-io.c` contributed no
-code — the socket transport is original. The wire format is golden-byte
-tested against hand-derived expected output (from the documented libubox
-spec, not a captured device transcript) and exercised end-to-end against a
-real `ubusd` when one is reachable (see "Testing without hardware" below);
-a textual byte-parity comparison against `ubus -S` output on real hardware
-has **not** been done — no such transcript exists in this repo. See `NOTICE`.
+(LGPL-2.1) as uncopyrightable protocol facts. `libubus-io.c` (LGPL-2.1)
+contributed no code — the socket transport is original. The wire format is
+golden-byte tested against hand-derived expected output (from the documented
+libubox spec, not a captured device transcript), exercised end-to-end against a
+real `ubusd` when one is reachable (see "Testing without hardware" below), and
+`codec.zig`'s "real ubusd capture" tests additionally freeze wire bytes and the
+matching `ubus -S` JSON stdout from a real `ubus`/`ubusd` pair run once inside
+the `scripts/vm/` OpenWRT VM — a genuine textual byte-parity check, closing the
+gap an earlier revision of this note said had not been done; see `SPEC.md` for
+the findings. See [`NOTICE`](NOTICE) beside this file.
 
 ## API
 

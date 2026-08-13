@@ -71,7 +71,13 @@ Provenance: `src/root.zig` is original work of the zig-libs authors (MIT);
 `src/tz_data.zig` is generated data — the UTC-offset transition tables and
 POSIX-TZ footer rule per zone (600 zones, transitions from 1970 onward),
 produced ahead of time by the `tz-gen` tool from the IANA Time Zone Database
-(tzdata 2026a release, public domain). See `NOTICE`.
+(tzdata 2026a release, <https://www.iana.org/time-zones>), which is in the
+PUBLIC DOMAIN ("This file is in the public domain, so clarified as of
+2009-05-17 by Arthur David Olson"). Only UTC-offset transition data and
+POSIX-TZ footer rules are extracted — not the tz database's source code — and
+the offset-lookup logic is the authors' own. Public domain imposes no
+redistribution condition; this is provenance only, and no `NOTICE` entry is
+required.
 
 ## Verify
 

@@ -28,9 +28,11 @@ set that needs typo-tolerant lookup.
 > controls prove the checkers have teeth. See `SPEC.md` for the design decision
 > and the threat model.
 
-Provenance: clean-room. Design references only — Hanov's trie+DP method, Lucene
-`FuzzyQuery`, Schulz–Mihov (the fuzzy-match *approach*); no third-party source
-consulted or copied. See `NOTICE`.
+Provenance: original work of the zig-libs authors (MIT) — the trie index, the
+bounded-edit-distance walk and the ranking. Design references, approach only:
+Steve Hanov's published trie + dynamic-programming Levenshtein walk, Lucene's
+`FuzzyQuery` (**Apache-2.0**), and the Schulz–Mihov Levenshtein-automaton
+papers. No source consulted or copied.
 
 ## The index is a `trie`
 

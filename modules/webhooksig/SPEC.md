@@ -47,7 +47,7 @@ module's actual contribution — the `sha256=<hex>` framing (`computeHex`'s hex 
 publish a canonical secret/payload/signature triple (`secret = "It's a Secret to Everybody"`,
 `body = "Hello, World!"`, `sha256=757107ea0eb2...`) explicitly so third-party implementations can
 self-check against it; independently re-verified here with `openssl dgst -sha256 -hmac` before
-adoption. Recorded as a provenance note in the root NOTICE §2 entry (a short factual test-oracle
+adoption. Recorded as a provenance note in this module's README `Provenance:` statement (a short factual test-oracle
 triple, not a vendored corpus — no dedicated `modules/webhooksig/NOTICE` file).
 
 ## Backlog / deferred

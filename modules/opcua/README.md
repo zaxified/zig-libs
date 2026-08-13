@@ -59,9 +59,15 @@ try conn2.tick(&out_writer, now_ms);                        // the clock: publis
   synchronized and nothing is shared implicitly.
 
 Provenance: clean-room from OPC 10000-6 (OPC UA Binary + opc.tcp),
-OPC 10000-4 (Services) and OPC 10000-3 (Address Space Model); structure
-references open62541 (MPL-2.0) and node-opcua (MIT) — behavioral/API-shape
-only, no source copied. See `NOTICE`.
+OPC 10000-4 (Services) and OPC 10000-3 (Address Space Model); the OPC
+Foundation's `StatusCode.csv` / `NodeIds.csv` / `Opc.Ua.Types.bsd` (MIT
+License 1.00) supply constants and field order. Structure references
+open62541 (MPL-2.0) and node-opcua (MIT) — behavioral/API-shape only, no
+source copied; open62541's `examples/client.c` was read once for which
+services and NodeIds its demo binaries exercise. Python `asyncua` (LGPL-3.0)
+and open62541's stock binaries were additionally driven as black-box oracles
+with no source read, built or linked. See [`NOTICE`](NOTICE) beside this
+file.
 
 ## Built-in type codec (`opcua.encoding`)
 

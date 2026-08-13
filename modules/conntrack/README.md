@@ -120,6 +120,11 @@ Every live test prints `SKIPPED: …` and **passes** when the ctnetlink socket c
 stays green. See SPEC.md for the full verification story (byte-exact captures of real
 conntrack-tools traffic, the capture command, the live proof and the deferred list).
 
-Provenance: clean-room from the kernel UAPI headers (`linux/netfilter/nfnetlink.h`,
-`nfnetlink_conntrack.h`, `nf_conntrack_common.h`, `nf_conntrack_tcp.h`) plus on-the-wire
-captures — no libnetfilter_conntrack or conntrack-tools source was read. See `/NOTICE`.
+Provenance: clean-room from the kernel UAPI headers
+(`linux/netfilter/nfnetlink.h`, `nfnetlink_conntrack.h`,
+`nf_conntrack_common.h`, `nf_conntrack_tcp.h`; GPL-2.0 WITH Linux-syscall-note)
+plus on-the-wire captures — only the uncopyrightable ABI facts they document are
+used, the same Linux-syscall-note mechanism `netlink`/`ebpf`/`tc` rely on.
+`conntrack-tools` / `libnetfilter_conntrack` (**GPL-2.0**) are named for WIRE
+BEHAVIOR observed by capture; no source was read or ported, and this module
+derives nothing from that codebase.

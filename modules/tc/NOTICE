@@ -1,0 +1,39 @@
+tc — provenance note
+====================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). Moved here from the
+root `NOTICE` §2 on 2026-08-14, unchanged in substance.
+
+Kernel UAPI (clean-room)
+------------------------
+
+Original pure-Zig traffic-control (netem qdisc) rtnetlink client, clean-room
+from the documented kernel UAPI headers `linux/rtnetlink.h` (`struct tcmsg`,
+`TCA_*`) and `linux/pkt_sched.h` (`struct tc_netem_qopt` and friends,
+`TCA_NETEM_*`), both **GPL-2.0 WITH Linux-syscall-note**.
+
+No GPL header source is copied — only the uncopyrightable ABI facts they
+document are used (struct layouts, command/attribute/flag constants). The
+operative mechanism is the same Linux-syscall-note exception already relied on
+by `netlink`/`wireguard`: it explicitly permits userspace of ANY license to use
+these headers to interface with the kernel, which is why this module is cleanly
+MIT despite citing GPL-2.0 headers.
+
+Design reference — iproute2
+---------------------------
+
+The v1 (netem-only) client needed no third-party design reference; the v2
+classful/filter work does.
+
+iproute2 (**GPL-2.0-or-later**) — `tc/tc_core.c` (`tc_calc_xmittime`,
+`tc_calc_rtable`, `tc_core_init`), `tc/q_htb.c`, `tc/q_tbf.c`,
+`tc/q_fq_codel.c`, `tc/f_u32.c`, `tc/tc_class.c`, `tc/tc_filter.c` and
+`lib/utils.c` (`__get_hz`) were consulted as a BEHAVIOUR reference for the
+psched rate-table arithmetic, the default burst/buffer formulas, attribute
+emission order and the client-side dump-filter rules.
+
+No source was copied: the algorithms are re-derived and re-expressed (the rate
+tables are evaluated exactly in u128 rather than iproute2's platform-dependent
+double), and the byte-exact goldens captured from a real `tc` binary are the
+independent check that the behaviour matches.

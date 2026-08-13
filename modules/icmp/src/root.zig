@@ -4,7 +4,7 @@
 //!
 //! Clean-room from RFC 792 / RFC 4443 / RFC 1071 and ip(7)/ipv6(7); the
 //! prober's scheduling design references fping (schweikert/fping) — see
-//! NOTICE §2 for the provenance record. Three layers:
+//! this module's own NOTICE for the provenance record. Three layers:
 //!
 //!  * `echo` — pure ICMPv4/v6 echo + timestamp codec with the RFC 1071
 //!    internet checksum; bounds-checked parsing that never panics.

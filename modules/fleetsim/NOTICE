@@ -1,0 +1,88 @@
+fleetsim — provenance note
+==========================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). Moved here from the
+root `NOTICE` §2 on 2026-08-14, unchanged in substance. Several of the third
+parties named below are strongly copyleft; each is named with its licence
+precisely because the argument for why nothing is owed has to be checkable.
+
+Original work
+-------------
+
+The fleet simulator is the authors' own original work, composed over this
+repo's `netsim` (whose own provenance note records the TigerBeetle VOPR
+methodology reference).
+
+The device-behavior envelope follows what SCADA device simulators such as
+ModbusPal (**LGPL-3.0**) and Kepware's simulation driver expose in their PUBLIC
+DOCUMENTATION — observable behavior only, no source consulted or copied.
+
+`src/master_goldens.zig` — frozen conversations with third-party masters
+------------------------------------------------------------------------
+
+`src/master_goldens.zig` freezes a session in which a real third-party Modbus
+master — pymodbus 3.14.0, **BSD-3-Clause** (read off the installed
+distribution's own metadata at capture time, not from memory) — drove a
+simulated slave inside this repo's disposable-VM lane.
+
+Nothing from pymodbus is copied, translated or redistributed: what is frozen is
+the byte output of a conversation between two programs speaking the PUBLIC
+MODBUS Application Protocol specification, plus, in comments, what the master
+reported it decoded. pymodbus is neither vendored nor a build dependency — it
+exists only inside the throwaway guest (`scripts/vm/manifest.sh`), and the
+committed test replays frozen bytes offline with the VM deleted. A permissive
+licence would not have constrained this either way; the statement is recorded
+because the reasoning has to be checkable, not because BSD-3-Clause made it
+close.
+
+The last two exchanges in that file are the master's own VERDICT: numbers
+pymodbus computed from what it decoded (two sums, a bit-packing, the exception
+code it named) and wrote back into the device. Those are equally the output of
+a conversation rather than an expression of pymodbus's — no threshold, table or
+algorithm of theirs is reproduced; what is frozen is arithmetic over values THIS
+repository chose, performed on the far side of a socket.
+
+The same file now freezes sessions recorded the same way against four more
+third-party masters — pycomm3 1.2.16 (**MIT**), bacpypes3 0.0.106 (**MIT**),
+python-snap7 3.1.0 (**MIT**) and **c104 2.2.1**, which wraps lib60870-C and is
+**GPL-3.0-or-later** — and drives a fifth, asyncua 2.0.1 (**LGPL-3.0**), live
+without freezing it.
+
+c104 is the strongest licence in that list and so the one that has to be stated
+exactly: it is installed ONLY inside the disposable VM guest
+(`scripts/vm/manifest.sh`), it is never vendored, never a build dependency,
+never linked against, and no part of it — source, header, binary or
+documentation text — is copied, translated or redistributed by this repository.
+What crosses out of the guest and into `src/master_goldens.zig` is the octet
+stream of a conversation between two separate processes speaking IEC 60870-5-104,
+a public IEC standard, plus the numeric marks c104 computed from what it decoded
+and commanded back as `C_SE_NB_1` set-points. Those numbers are arithmetic over
+values THIS repository chose, performed on the far side of a socket; no
+threshold, table or algorithm of c104's is reproduced. The GPL attaches to
+c104's own work, and none of c104's own work is here.
+
+The seventh and last master is **opendnp3 3.1.2**, the de facto reference DNP3
+(IEEE 1815) stack, **Apache-2.0** (read off the archive's own LICENSE/NOTICE at
+fetch time). It differs from the six above in one way only: it is not
+installable, so the provisioning recipe FETCHES ITS SOURCE AT A PINNED SHA-256
+AND BUILDS IT INSIDE THE GUEST (`scripts/vm/manifest.sh`'s `VM_DEBIAN_SRC`).
+That changes nothing about the posture. Nothing from opendnp3 is vendored into
+this repository — no source, no header, no generated file, no binary; the
+archive is downloaded into the throwaway guest, compiled there, run there as a
+separate process, and discarded with the guest, and no committed test needs it
+to exist. Apache-2.0 would have permitted vendoring; the choice not to is what
+keeps this a clean statement rather than an attribution obligation.
+
+Because DNP3 has no scriptable master binary, the test choreography is a program
+of ours — `scripts/vm/guests/fleetsim-dnp3-master.cpp` — compiled against
+opendnp3's public headers inside the guest. It calls the library; it does not
+reimplement it. Every DNP3 octet in `src/master_goldens.zig` was composed or
+parsed by opendnp3's own stack: that file contains no link framing, no CRC and
+no object parsing written by us, and the driver's only protocol-aware line is a
+length-field read used to cut the recorded byte stream into frames. What is
+frozen is the octet stream of a conversation between two separate processes
+speaking IEEE 1815, a public standard, plus the numeric marks opendnp3 computed
+from what it decoded and commanded back as g41 analog output blocks and g12
+control relay output blocks — arithmetic over values THIS repository chose,
+performed on the far side of a socket.

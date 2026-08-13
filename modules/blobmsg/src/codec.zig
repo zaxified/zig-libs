@@ -6,8 +6,9 @@
 //!
 //! Wire format (big-endian, 4-byte alignment), clean-room from the OpenWRT
 //! header specs (libubox `blob.h`/`blobmsg.h`, ubus `ubusmsg.h`) and pinned
-//! by golden-byte tests derived from those specs; a textual byte-parity
-//! check against `ubus -S` on real hardware has not yet been done — see the
+//! by golden-byte tests derived from those specs, and additionally by a
+//! textual byte-parity check against the real `ubus -S` stdout captured in
+//! the OpenWRT VM lane (see the "real ubusd capture" tests below) — see the
 //! module README/SPEC.md:
 //!
 //! ```text

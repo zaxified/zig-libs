@@ -11,8 +11,8 @@ caller-owned pipeline arena) and returns a new `Dataset`.
   state). **Deps:** `dataset`.
 
 Provenance: original work of the zig-libs authors (MIT); modeled after
-pandas (BSD-3-Clause) and dplyr (MIT) verb-algebra naming/behavior — see
-NOTICE.
+pandas (BSD-3-Clause) and dplyr (MIT) — verb-algebra naming/behavior only, no
+source consulted or copied.
 
 ## Layout
 

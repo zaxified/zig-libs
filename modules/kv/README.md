@@ -17,11 +17,13 @@ storage side effect and proves recovery each time.
   (see the honest caveats below).
 - **Deps:** none (std only).
 
-Provenance: clean-room. Design references only — Bitcask (the Basho paper's
-log+keydir+merge model), LMDB and xitdb (embedded single-writer semantics),
-TigerBeetle's VOPR (the deterministic fault-injection *approach*). Behavior
-and approach only; no third-party source was consulted or copied. See
-`NOTICE`.
+Provenance: clean-room. Design references only — Bitcask (Basho, Apache-2.0;
+the published log-structured model: append-only CRC'd record file + in-memory
+keydir + merge/compaction; paper/design only), LMDB (OpenLDAP Public License)
+and xitdb (MIT) for embedded single-writer semantics, and TigerBeetle
+(Apache-2.0) for the VOPR deterministic fault-injection *approach* (simulate
+storage faults at every I/O step, assert recovery), not its implementation.
+Behavior and approach only; no third-party source was consulted or copied.
 
 ## API
 

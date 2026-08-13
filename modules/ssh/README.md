@@ -50,14 +50,18 @@ no skips.
 
 ## Provenance
 
-Clean-room implementation from RFC 4253/4251/4252/4254 + RFC 8731. The
-`chacha20-poly1305@openssh.com` cipher framing follows the OpenSSH
+Clean-room implementation from RFC 4253 (SSH Transport Layer Protocol),
+RFC 4251 (SSH Protocol Architecture — the mpint/string/name-list wire types),
+RFC 4252 (Authentication Protocol), RFC 4254 (Connection Protocol) and RFC 8731
+(curve25519-sha256 key exchange). The `chacha20-poly1305@openssh.com` cipher
+framing and (when implemented) `aes-gcm`-family framing follow the OpenSSH
 `PROTOCOL`/`PROTOCOL.chacha20poly1305` notes and RFC 5647 — public
-documentation of OpenSSH's own wire-format extensions, not OpenSSH source.
-Design reference: ringtailsoftware/misshod (MIT) — architecture shape only,
-no source consulted or copied. No GPL/LGPL dependency anywhere in this
-module. See `NOTICE` for the canonical design-reference entry.
-
+documentation of OpenSSH's own protocol extensions, not OpenSSH source.
+Design reference: ringtailsoftware/misshod (MIT) — architecture SHAPE only,
+no source copied. Crypto primitives come from Zig `std.crypto` (X25519,
+Ed25519, ChaCha20-Poly1305, P-256, SHA-2, HMAC) plus this repo's own `rsa`
+module for rsa-sha2 (RFC 8332) host-key verification. No GPL/LGPL source
+consulted or copied anywhere in this module.
 ## API
 
 ```zig

@@ -14,12 +14,12 @@
   **Role:** both (codec + client). **Concurrency:** reentrant (no shared
   state). **Allocation:** none — fixed buffers throughout.
 
-Provenance: clean-room from RFC 5424, RFC 6587 and RFC 3164. The
-`Message`/`Sender` *design* (a pure message codec split from the network
-emitter, RFC 3339-ms timestamps, structured-data escaping, field-length
-validation, octet framing) is referenced from `joelreymont/pz` (MIT) — no
-third-party code was copied; all code here targets `std.Io.net` and was
-written from the RFCs. See `NOTICE`.
+Provenance: clean-room from RFC 5424 (syslog protocol), RFC 6587 (TCP octet
+framing) and RFC 3164 (BSD legacy). The `Message`/`Sender` *design* (a pure
+message codec split from the network emitter, RFC 3339-ms timestamps,
+structured-data escaping, field-length validation, octet framing) is modeled
+after `joelreymont/pz` `src/core/syslog.zig` (MIT) — no third-party code was
+copied; all code here targets `std.Io.net` and was written from the RFCs.
 
 ## API
 

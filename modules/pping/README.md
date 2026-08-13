@@ -66,7 +66,13 @@ capacity eviction and for bounded memory under a long stream. The matching core
 is pinned by the property harness: duplicate and delayed echoes must produce
 **no** second sample, and a bounded table must not invent one.
 
-Provenance: the technique and the first-echo-consume rule are from Kathleen
-Nichols' *pping* (Pollere LLC), studied as a **design reference only** — no
-source ported; recorded in the root [`NOTICE`](../../NOTICE). The wire format is
-RFC 7323, a public spec.
+Provenance: the passive-RTT technique (match a TCP TSecr back to the TSval
+that produced it, seen earlier in the opposite direction) and its
+first-echo-match-and-consume rule are Kathleen Nichols' *pping* (Pollere LLC,
+<https://github.com/pollere/pping>, **GPL-3.0-or-later**) — ALGORITHM AND
+BEHAVIOR ONLY, described in its public documentation and papers, studied as a
+**design reference only**. No pping source was consulted, read or ported: this
+module is an independent Zig implementation of a published measurement technique
+(a technique is not a copyrightable work), and it deliberately shares no code
+with, and derives nothing from, that GPL codebase. The wire format is RFC 7323,
+a public spec.

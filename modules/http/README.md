@@ -16,11 +16,14 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
   per-connection tasks — handlers must be thread-safe if they share state.
   **Deps:** `netaddr`, `std.crypto.tls`, `std.Io.net`.
 
-Provenance: original work of the zig-libs authors (MIT); modeled after
-`lalinsky/dusty` (1.1 client shape) and Go `net/http` (redirect/header
-semantics, Server shape) — behavior only, no source copied. The HTTP/1.1
-framing + the server are clean-room from RFC 7230/9110. Design refs in
-[NOTICE](../../NOTICE).
+Provenance: original work of the zig-libs authors (MIT); the HTTP/1.1 framing,
+the server, HPACK, HTTP/2 and the reverse proxy are clean-room from the RFCs.
+Design references (behavior only, no source copied): `lalinsky/dusty` (MIT; the
+1.1 client shape), Go `net/http` (BSD-3-Clause, The Go Authors; redirect
+semantics, server shape, gzip handler), Go `net/http/httputil.ReverseProxy`
+(BSD-3-Clause) and nginx `proxy_pass` (BSD-2-Clause) for the reverse-proxy
+behavior. The full spec list and the design-reference record are in
+[`NOTICE`](NOTICE) beside this file.
 
 ## Phases
 

@@ -40,12 +40,14 @@ Provenance: clean-room from the kernel UAPI headers (`linux/bpf.h`,
 `linux/btf.h`, `linux/perf_event.h`, `linux/if_link.h`) — only the
 uncopyrightable ABI facts they document are used (struct layouts, constants,
 instruction encoding), under the same Linux-syscall-note exception `netlink` /
-`genetlink` / `wireguard` / `tc` rely on. `libbpf` is a **design reference** for
-API shape only, no source ported or read while implementing. Both recorded in
-the root [`NOTICE`](../../NOTICE). Test data — the seven `src/testdata/*.bpf.o`
-fixtures and the `.bpf.c` sources beside them — was written and compiled here;
-see the note below, which also explains the `"GPL"` string a licence scanner
-will find inside them.
+`genetlink` / `wireguard` / `tc` rely on. `libbpf` (LGPL-2.1-or-later OR
+BSD-2-Clause) is a **design reference** for API shape only, no source ported or
+read while implementing. Both are recorded in [`NOTICE`](NOTICE) beside this
+file, together with the algorithm shapes known to match libbpf's documented
+behaviour. Test data — the seven `src/testdata/*.bpf.o` fixtures and the
+`.bpf.c` sources beside them — was written and compiled here; see the note
+below, which also explains the `"GPL"` string a licence scanner will find
+inside them.
 
 Test data, and the one thing about it that will make a licence scanner stop:
 the seven `src/testdata/*.bpf.o` objects are **not** kernel `samples/bpf`,

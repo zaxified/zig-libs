@@ -12,9 +12,13 @@ IP address parse/format + **RFC 6724** destination/source address selection.
   **Role:** util. **Concurrency:** reentrant (no shared state).
   **Allocation:** none, anywhere.
 
-Provenance: clean-room from RFC 6724; design refs (Go `net/addrselect`,
-glibc `getaddrinfo`) recorded in [NOTICE](../../NOTICE) §2. No fping code is
-involved — an earlier note claiming otherwise was a bookkeeping error.
+Provenance: clean-room from RFC 6724 and RFC 5952; cross-checked against Go
+`net/addrselect` (BSD-3-Clause, The Go Authors) and the glibc `getaddrinfo`
+algorithm. The CIDR/prefix operations (`Prefix`, `summarize`, `mergePrefixes`)
+model after Go `net/netip.Prefix` (BSD-3-Clause) and `go4.org/netipx`
+(BSD-3-Clause) — behavior only, clean-room, no source consulted or copied. No
+fping code is involved — an earlier note claiming otherwise was a bookkeeping
+error.
 
 ## API
 

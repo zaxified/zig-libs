@@ -16,9 +16,12 @@ renewal predicate.
   server is `http.Server`), `router` (the challenge responder middleware),
   `std.crypto` (ecdsa P-256, sha2, Certificate), `std.json`, `std.base64`.
 
-Provenance: clean-room implementation from RFC 8555 / RFC 7515 / RFC 7638 /
-RFC 2986 / RFC 5915. Design references only (no code copied):
-`golang.org/x/crypto/acme` (BSD-3-Clause), certbot (Apache-2.0).
+Provenance: clean-room implementation from RFC 8555 (ACME), RFC 7515 (JWS),
+RFC 7638 (JWK thumbprint), RFC 2986 (PKCS#10) and RFC 5915 (EC private keys).
+Design references only, behavior only, no code copied:
+`golang.org/x/crypto/acme` (BSD-3-Clause, The Go Authors; nonce-refill /
+badNonce-retry + POST-as-GET client semantics) and certbot (Apache-2.0; flow
+shape only).
 
 ## ⚠ Staging by default
 

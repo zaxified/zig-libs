@@ -1,0 +1,40 @@
+icmp — provenance note
+======================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`); it is kept for
+honesty and for future auditability, so that any later line-level reuse is
+caught. Moved here from the root `NOTICE` §2 on 2026-08-14, unchanged in
+substance: provenance lives at the module.
+
+Specifications
+--------------
+
+RFC 792 / RFC 4443 / RFC 1071 (echo codec + checksum), `ip(7)` / `ipv6(7)`
+(socket options, `IP_PKTINFO`/`IPV6_PKTINFO`).
+
+Design reference — fping
+------------------------
+
+fping (schweikert/fping, **Stanford BSD-with-advertising**).
+
+The paced ping engine (`pinger.zig`) follows fping's main-loop DESIGN — two
+time-ordered event queues, timeouts serviced first, a global minimum send
+interval, per-host cadence scheduled off nominal event time, retry with
+timeout backoff — and adopts fping's default timing constants (10 ms global
+interval, 1000 ms per-host, 500 ms timeout, 3 retries, 1.5 backoff).
+
+NO fping source was copied: the expression is independent throughout (binary
+heaps vs fping's intrusive linked lists, a hard in-flight cap, per-subnet send
+spacing, first-probe jitter, `sendmmsg` batching, `ppoll` vs `select`, lazy vs
+eager purge of answered timeout events), no C statement sequence and no comment
+text survives, and this is a library with a callback API rather than a CLI's
+main loop.
+
+The `--oiface` `IP_PKTINFO`/`ipi_spec_dst` construction in `Socket.zig` was
+cross-checked against fping's `socket4.c` behavior.
+
+Recorded because architecture and functional default values are not
+copyrightable expression (17 USC 102(b): procedure, process, system, method of
+operation) — this is a provenance record, not an attribution obligation, and
+fping's advertising clause does not reach it.

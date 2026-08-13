@@ -17,7 +17,7 @@ portable fallback. Modes mirror fping: `.alive` (stop at first reply, retry time
 `.count` (exactly N), `.loop` (until `stop()`). The scheduler follows fping's main-loop DESIGN
 (behavior only — no source copied, independent expression: binary heaps vs intrusive lists, ppoll
 vs select, plus an in-flight cap, per-subnet spacing and first-probe jitter). Wire formats per
-RFC 792/4443/1071. See NOTICE §2 — a provenance record, not a license obligation.
+RFC 792/4443/1071. See this module's own `NOTICE` — a provenance record, not a license obligation.
 
 ## Threat model / out of scope
 Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive `ping_group_range`; the module does not

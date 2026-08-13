@@ -1,0 +1,56 @@
+wireguard — provenance note
+===========================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). Moved here from the
+root `NOTICE` §2 on 2026-08-14, unchanged in substance.
+
+Kernel UAPI (clean-room)
+------------------------
+
+Original pure-Zig reimplementation of the WireGuard netlink protocol from the
+documented UAPI headers (`uapi/wireguard.h`; **GPL-2.0 WITH
+Linux-syscall-note**). No GPL header source is copied — only the
+uncopyrightable ABI facts they document are used (command/attribute/flag
+constants, struct layouts).
+
+The operative mechanism is the Linux-syscall-note exception itself: it
+explicitly states that using these headers to make syscalls / interface with
+the kernel does not bring the resulting work under the GPL, for userspace of
+ANY license — which is why this module is cleanly MIT despite citing GPL-2.0
+headers.
+
+The generic-netlink transport (`genlmsghdr` + `nlctrl` family resolve) this
+module sits on is the `genetlink` module — see its own provenance note.
+
+Design references
+-----------------
+
+wgctrl-go (`golang.zx2c4.com/wireguard/wgctrl`, **MIT**) and the `wg` tool's
+protocol usage (message-splitting/continuation behavior) —
+behavior/attribute-shape only, no source consulted or copied.
+
+Black-box test oracles
+----------------------
+
+The real `wg`(8) binary (wireguard-tools, **GPL-2.0**) and the real kernel
+`wireguard.ko` module were run ONLY as black-box test oracles under `strace`
+inside a throwaway network namespace, their request/reply bytes frozen and
+diffed against this module's own codec — no `wg`/kernel source consulted,
+studied or ported (`kernel_goldens.zig`).
+
+Reserved Noise_IKpsk2 handshake
+-------------------------------
+
+The same module's `noise.zig`/`handshake.zig` (currently a compiling scaffold,
+no crypto implemented — see those files' own doc-comments) reserve the
+Noise_IKpsk2 cryptographic handshake: clean-room from the WireGuard protocol
+whitepaper (J. A. Donenfeld, "WireGuard: Next Generation Kernel Network
+Tunnel", NDSS 2017, wireguard.com/papers/wireguard.pdf, and
+wireguard.com/protocol/) and the Noise Protocol Framework spec
+(noiseprotocol.org, pattern IKpsk2).
+
+Design reference: wireguard-go (`golang.zx2c4.com/wireguard`, **MIT**) and the
+Linux kernel WireGuard implementation (**GPL-2.0**) — message layout /
+handshake step order only (the standardized wire protocol, not copyrightable
+expression); no source consulted or copied.

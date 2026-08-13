@@ -25,8 +25,10 @@ Linux-syscall-note — the command/attribute/flag constants and layouts are
 the kernel's OS ABI, not copyrightable interface code) and
 `linux/genetlink.h`. Behavior modeled after wgctrl-go
 (golang.zx2c4.com/wireguard/wgctrl, MIT) and the `wg` tool's protocol usage —
-behavior/attribute-shape reference only, no source consulted or copied.
-See `NOTICE`.
+behavior/attribute-shape reference only, no source consulted or copied. The
+reserved Noise_IKpsk2 scaffold additionally names wireguard-go (MIT) and the
+in-kernel WireGuard implementation (GPL-2.0) for message layout and handshake
+step order only. See [`NOTICE`](NOTICE) beside this file.
 
 ## API
 

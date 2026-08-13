@@ -11,7 +11,10 @@ error-code vocabulary; behavior only), JSON Schema draft 2020-12 (spec —
 keyword semantics: `1.0` is an integer, inclusive `minimum`/`maximum`,
 additional properties allowed, `enum`, `properties`/`items` nesting) and
 go-playground/validator (MIT — struct-tag-style ergonomics, mirrored here as
-comptime reflection; behavior only) — see NOTICE. No source copied.
+comptime reflection; behavior only). The string `format` vocabulary follows
+RFC 5321/3986/1123/3339/6901. No source copied. The reproduced JSON-Schema
+conformance fixtures are a separate matter and are answered in
+[`NOTICE`](NOTICE) beside this file.
 
 - **Model after:** pydantic v2 + JSON Schema 2020-12 + go-playground/validator.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant — the

@@ -5,8 +5,9 @@
 //!
 //! The scheduling design references fping's main loop (two time-ordered event
 //! queues plus a global minimum send interval) — behavior only, no source
-//! consulted at the statement level; see NOTICE §2. The expression here is
-//! independent, with additions aimed at large monitoring deployments (10k+
+//! consulted at the statement level; see this module's own NOTICE. The
+//! expression here is independent, with additions aimed at large monitoring
+//! deployments (10k+
 //! targets per cycle):
 //!
 //!  * binary heaps instead of linked lists for O(log n) scheduling,

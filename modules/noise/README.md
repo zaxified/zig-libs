@@ -59,12 +59,14 @@ zig build test-noise
 
 Clean-room from the Noise Protocol Framework specification rev 34
 (https://noiseprotocol.org/noise.html) — a public spec, not copyrightable
-expression (merger doctrine), so the spec citation alone needs no NOTICE
-entry. This module additionally names design references consulted for
-API/behavior SHAPE only (no source copied): cacophony (Haskell,
-BSD-2-Clause), noise-c (https://github.com/rweather/noise-c,
-BSD-2-Clause), snow (Rust, Apache-2.0 OR MIT) — see `../../NOTICE` for the
-repo-wide provenance ledger entry.
+expression (merger doctrine), so the spec citation alone needs no attribution.
+This module additionally names design references consulted for API/behavior
+SHAPE only (no source copied): cacophony (Haskell, BSD-2-Clause), noise-c
+(https://github.com/rweather/noise-c, BSD-2-Clause), snow (Rust, Apache-2.0 OR
+MIT). It is distinct from — and has zero dependency on — the `wireguard`
+module's `noise.zig`/`handshake.zig`, which hard-wire WireGuard's fixed
+`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` instantiation; this module is the
+generic framework (patterns as data, comptime DH/cipher/hash suite selection).
 
 Test vectors actually consulted: six official `cacophony`-format vectors
 from rweather/noise-c's `vectors/` directory on GitHub, transcribed into

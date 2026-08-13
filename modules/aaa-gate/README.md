@@ -4,9 +4,9 @@ Bearer-token authentication + audit hook + denied-request throttle as a
 `router` middleware — the AAA layer of the Web/API cluster. Wave P1.
 
 Provenance: original work of the zig-libs authors (MIT); modeled after envoy
-ext_authz and oauth2-proxy (bearer-gate behavior only — no source consulted
-or copied); bearer semantics per RFC 6750, auth framework per RFC 9110. See
-`NOTICE`.
+ext_authz (Apache-2.0) and oauth2-proxy (MIT) — bearer-gate behavior only, no
+source consulted or copied; bearer semantics per RFC 6750, auth framework per
+RFC 9110.
 
 - **Model after:** envoy / oauth2-proxy (behavior only).
 - **Platform:** any. **Role:** server. **Concurrency:** threadsafe —

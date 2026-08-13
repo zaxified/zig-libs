@@ -262,7 +262,11 @@ decoder, the SC option walker, the SC node and the SC hub. See SPEC.md for what
 is third-party-validated versus self-derived, what ran live, and what is
 deferred.
 
-Provenance: clean-room from ASHRAE 135's documented encodings. `bacpypes3` and
-`bacnet-stack` were used as black-box test oracles and `bacpypes3` as a live
-peer; one function of `bacpypes3`'s source was read while probing its API — see
-SPEC.md and `/NOTICE`.
+Provenance: clean-room from ASHRAE 135 (BACnet), an openly published standard:
+BVLL/Annex J, the clause 6 NPDU, the clause 20 APDU and tag encodings, and the
+clause 15/13 services. `bacpypes3` (Joel Bender, MIT) and `bacnet-stack` were
+used as black-box test oracles and `bacpypes3` as a live peer — which alone
+needs no record — BUT `bacpypes3`'s `primitivedata.Tag.encode` was read while
+probing the API, which makes it a consulted design reference for `src/tag.zig`
+and is declared here per `CONVENTIONS.md` §5. Nothing was ported and no other
+`bacpypes3` source was read. See SPEC.md.

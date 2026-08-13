@@ -22,11 +22,15 @@ shared foundation any genetlink-family client builds on (`ethtool`,
   `CAP_NET_ADMIN`) is that family module's concern, not this one's.
 
 Provenance: clean-room from the kernel UAPI (`linux/genetlink.h`,
-GPL-2.0 WITH Linux-syscall-note — the command/attribute constants and their
-layouts are the kernel's OS ABI, not copyrightable interface code).
-Extracted from the `wireguard` module (its first consumer, where this layer
-originally lived as a private `genl.zig`) so other genetlink families can
-reuse it without depending on `wireguard`. See `NOTICE`.
+GPL-2.0 WITH Linux-syscall-note — `genlmsghdr` + `nlctrl` `CTRL_CMD_GETFAMILY`
+family resolution; the command/attribute constants and their layouts are the
+kernel's OS ABI, not copyrightable interface code). No GPL header source is
+copied; the operative mechanism is the same Linux-syscall-note exception relied
+on by `netlink`/`wireguard`/`tc`, which permits userspace of ANY license to use
+these headers to interface with the kernel. Extracted from the `wireguard`
+module (its first consumer, where this layer originally lived as a private
+`genl.zig`) so other genetlink families can reuse it without depending on
+`wireguard`; no third-party design reference beyond the kernel header.
 
 ## API
 

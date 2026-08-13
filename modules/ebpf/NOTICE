@@ -1,0 +1,36 @@
+ebpf — provenance note
+======================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). Moved here from the
+root `NOTICE` §2 on 2026-08-14, unchanged in substance.
+
+Kernel UAPI (clean-room)
+------------------------
+
+Original pure-Zig eBPF loader / attach layer / BTF parser / event-ring
+consumers, clean-room from the kernel UAPI headers (`linux/bpf.h`,
+`linux/btf.h`, `linux/perf_event.h`, `linux/if_link.h`; **GPL-2.0 WITH
+Linux-syscall-note**) and the kernel's own BPF and BTF documentation.
+
+No GPL header source is copied — only the uncopyrightable ABI facts they
+document are used (struct layouts, command/attribute/flag constants,
+instruction encoding). The operative mechanism is the same Linux-syscall-note
+exception relied on by `netlink`/`genetlink`/`wireguard`/`tc`.
+
+Design reference
+----------------
+
+libbpf (**LGPL-2.1-or-later OR BSD-2-Clause**) — API SHAPE only, no source
+ported or read while implementing. The module's `meta.model_after` has always
+named it; this record states it explicitly per CONVENTIONS §5.
+
+The following algorithm shapes are known to match libbpf's documented
+behaviour and are declared so rather than left implicit: the CO-RE bitfield
+load-widening and LSHIFT/RSHIFT derivation, the `btf_trace_`/`bpf_lsm_`/
+`bpf_iter_` prefix conventions, `___flavor` suffix stripping in CO-RE target
+matching, a bounded type-resolution depth of 32, and split-BTF detection via
+the base string section's leading NUL. Each was derived from the UAPI
+semantics and verified empirically against this machine's real
+`/sys/kernel/btf/vmlinux` (cross-checked with `bpftool btf dump ... format
+raw`) and against genuine `clang -target bpf -O2 -g` output.

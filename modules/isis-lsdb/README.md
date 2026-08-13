@@ -188,7 +188,14 @@ integration test through the `isis` wire codec; a `std.testing.fuzz` target over
 test; and a `std.testing.allocator` leak check (`deinit` frees all owned bytes).
 Green in Debug and ReleaseFast; `zig fmt` clean.
 
-Provenance: clean-room from ISO/IEC 10589 §7.3; the §7.3.16.1 comparison was
-cross-checked against FRRouting `isis_lsp.c` for the oriented tie-break (no source
-ported). See `/NOTICE` (no entry required — public spec + a behaviour cross-check).
-License: MIT.
+Provenance: clean-room from ISO/IEC 10589 §7.3 (the IS-IS update process), a
+public spec — merger doctrine, so the construction needs no attribution. One
+behavior cross-check is recorded, and it is not a ported source: the §7.3.16.1
+newer-LSP comparison — specifically the *oriented* purge/checksum tie-break (a
+zero-lifetime purge, or a differing checksum, against an ACTIVE stored copy is
+"more recent") — was confirmed against FRRouting isisd
+`isisd/isis_lsp.c:lsp_compare` (**GPL-2.0-or-later**, Copyright the FRRouting
+authors) as a behavior reference for the correct reading of the ISO clause. No
+FRR source was ported or adapted; the code, tests and structure are the
+authors' own and the rule is ISO's. (The sibling `isis` codec + `isis-adj` FSM
+are pure spec-only clean-room and need no record at all.) License: MIT.

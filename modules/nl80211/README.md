@@ -24,9 +24,12 @@ shell-outs, no `wpa_supplicant` linkage, no libc.
 
 Provenance: original work of the zig-libs authors (MIT); clean-room from the
 kernel UAPI (`linux/nl80211.h`, GPL-2.0 WITH Linux-syscall-note — the
-command/attribute constants and their layouts are the kernel's OS ABI, not
-copyrightable interface code) and the IEEE 802.11 element formats. See
-`NOTICE`.
+command/attribute/flag constants and their layouts are the kernel's OS ABI, not
+copyrightable interface code) and the IEEE 802.11 information-element formats,
+relying on the same Linux-syscall-note exception as
+`netlink`/`genetlink`/`wireguard`/`tc`. `iw` (GPL-2.0) was run ONLY as a
+black-box test oracle under `strace`, its request bytes diffed against this
+module's — no `iw` or `wpa_supplicant` source consulted, studied or ported.
 
 ## Scope
 

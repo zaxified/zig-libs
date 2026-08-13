@@ -11,10 +11,11 @@ it with `http.Client` or anything else that can fail).
 Provenance: original work of the zig-libs authors (MIT); modeled after
 resilience4j (Apache-2.0; breaker state machine, composition order, retry
 `maxAttempts`/interval semantics, semaphore Bulkhead —
-`maxConcurrentCalls`/`maxWaitDuration`), Polly (BSD-3-Clause; consecutive-failure
-count breaker), and failsafe-go (Apache-2.0; delay/jitter policy shapes), plus
-the AWS Architecture Blog "Exponential Backoff And Jitter" (Brooker, 2015; the
-full/equal jitter taxonomy) — see NOTICE. Clock/delay-injection and spinlock
+`maxConcurrentCalls`/`maxWaitDuration`/`BulkheadFullException`), Polly
+(BSD-3-Clause; consecutive-failure count breaker), and failsafe-go
+(Apache-2.0; delay/jitter policy shapes), plus the AWS Architecture Blog
+"Exponential Backoff And Jitter" (Brooker, 2015; the full/equal jitter
+taxonomy). Behavior only, no source copied. Clock/delay-injection and spinlock
 patterns follow the `ratelimit`/`throttle` siblings.
 
 - **Model after:** resilience4j + Polly + failsafe-go (see above).

@@ -335,8 +335,13 @@ What was actually run against real third-party masters (all seven protocols,
 with the transcript of what each master did), the determinism proof, the
 measured scale numbers and the deferred list are in [SPEC.md](./SPEC.md).
 Provenance: original work of the zig-libs authors (MIT), composed over
-[`netsim`](../netsim) — which carries its own entry for the TigerBeetle VOPR
+[`netsim`](../netsim) — which carries its own record for the TigerBeetle VOPR
 methodology reference. The device-behavior envelope follows what SCADA device
-simulators (ModbusPal, Kepware's simulation driver) expose in their public
-documentation — observable behavior only, no source consulted. Recorded in the
-root [`NOTICE`](../../NOTICE).
+simulators (ModbusPal, LGPL-3.0; Kepware's simulation driver) expose in their
+public documentation — observable behavior only, no source consulted. The
+`src/master_goldens.zig` captures are conversations with seven third-party
+masters run only inside the disposable VM guest — pymodbus (BSD-3-Clause),
+pycomm3 (MIT), bacpypes3 (MIT), python-snap7 (MIT), c104 (GPL-3.0-or-later),
+asyncua (LGPL-3.0) and opendnp3 (Apache-2.0) — none of them vendored, linked
+or reproduced here. See [`NOTICE`](NOTICE) beside this file for the exact
+statement each of those licences requires.

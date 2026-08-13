@@ -287,4 +287,9 @@ setting the link-layer DIR bit as if it were the master (opendnp3 logged
 fragments were reusing the request's application sequence number instead of
 incrementing it ("Response with bad sequence").
 
-Provenance: see `/NOTICE`.
+Provenance: clean-room from IEEE 1815-2012 (DNP3), an open standard. Design
+references (behavioral/structural only, no source consulted or copied):
+opendnp3 (Apache-2.0) and public DNP3 primers; the g120 Secure-Authentication
+variation numbers and field layouts were cross-checked against the Wireshark
+DNP3 dissector (`packet-dnp.c`, GPL-2.0) as a wire-format reference, no code
+copied or adapted. See [`NOTICE`](NOTICE) beside this file.

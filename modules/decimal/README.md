@@ -13,10 +13,14 @@ format path is pure integer (no `f64`/`f128` anywhere).
   **Concurrency:** reentrant (no shared state). **Allocation:** none —
   `toString` writes into a caller buffer.
 
-Provenance: original work of the zig-libs authors (MIT); rounding modes are
-clean-room from the published Java `BigDecimal.RoundingMode` / IBM General
-Decimal Arithmetic / Python `decimal` definitions (truth-tables only, no
-source consulted or copied) — see NOTICE.
+Provenance: original work of the zig-libs authors (MIT); the rounding modes
+(half_even/half_up/half_down/up/down/ceiling/floor + rescale/quantize/divRound)
+and `BigDecimal` (`big.zig`, arbitrary-precision, built on `std.math.big.int`)
+are clean-room from published definitions — the Java `BigDecimal.RoundingMode`
+javadoc, the IBM General Decimal Arithmetic specification and the Python
+`decimal` docs — definitions and truth-tables only, no source code consulted or
+copied. The module additionally reproduces IBM decTest test-case text; that is a
+required attribution and lives in [`NOTICE`](NOTICE) beside the vectors.
 
 ## Semantics
 

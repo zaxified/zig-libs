@@ -33,12 +33,23 @@ see SPEC.md "Phase-2 boundary".
 
 ## Provenance
 
-Clean-room implementation from the public Paillier 1999 paper (not a
-copyrightable work — see `CONVENTIONS.md` §5 / `NOTICE` §0 policy). No
-third-party source ported. The concrete cross-check test vectors in
-`src/root.zig` were independently recomputed and verified against `phe`
-(python-paillier) 1.5.0 — see `NOTICE` for the exact citation.
+Clean-room implementation from the public Paillier 1999 paper (P. Paillier,
+"Public-Key Cryptosystems Based on Composite Degree Residuosity Classes",
+EUROCRYPT 1999) — a public academic publication, not a copyrightable
+implementation; no third-party source ported or consulted for design (see
+`CONVENTIONS.md` §5 / root `NOTICE` §0 policy).
 
+Test-vector cross-check only, **not** a design reference: the `round-trip` /
+`homomorphic properties` unit tests in `src/root.zig` use a small fixed toy key
+(p=11, q=17) with concrete `(m, r) -> ciphertext` vectors independently
+recomputed in Python and cross-checked against `phe` (python-paillier) 1.5.0,
+PyPI, BSD-licensed (github.com/data61/python-paillier) — specifically
+`PaillierPublicKey.raw_encrypt` / `PaillierPrivateKey.raw_decrypt` called with
+an explicit `r_value`, which implements the same `g = n+1` standard variant this
+module uses. No `phe` source was ported; it was exercised only as a black-box
+vector oracle, the same relationship root `NOTICE` §0 describes for `tar`/`nft`
+— recorded because a specific version and vector-generation method is a fact
+worth pinning for anyone re-deriving the vectors.
 ## API
 
 ```zig

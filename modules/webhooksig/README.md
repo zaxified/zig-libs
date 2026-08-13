@@ -6,11 +6,24 @@ single `<prefix><hex-mac>` header value) on a valid signature header — the
 signature layer of the Web/API cluster. **Stripe's `Stripe-Signature`
 scheme is not implemented** — see "Scope" below.
 
-Provenance: clean-room from the GitHub webhook-HMAC convention
-(`X-Hub-Signature-256: sha256=<hex>`) and RFC 2104 (HMAC) over FIPS 180-4
-SHA-256 — original work of the zig-libs authors (MIT); no third-party
-source consulted or copied — see NOTICE. Constant-time compare and the
-middleware shape mirror the sibling `aaa-gate` module (same repo, MIT).
+Provenance: clean-room from RFC 2104 (HMAC) over FIPS 180-4 SHA-256 and the
+publicly-documented GitHub/Stripe webhook-signature schemes (`sha256=<hex>` over
+the body) — original work of the zig-libs authors (MIT); HMAC via Zig
+`std.crypto`, no third-party source consulted or copied. RFC 4231 (HMAC-SHA-2
+KATs) was evaluated as a test anchor and rejected: the HMAC primitive is
+`std.crypto` directly, already anchored in Zig std's own suite, so RFC 4231
+would anchor nothing this module contributes. Instead, one test transcribes
+GitHub's own webhook-validation docs' published canonical example (secret
+"It's a Secret to Everybody", body "Hello, World!",
+`sha256=757107ea0eb2…`) — a short factual secret/payload/digest triple GitHub
+publishes specifically as a self-check oracle for third-party implementations of
+its `sha256=<hex>` convention, independently re-verified with `openssl dgst
+-sha256 -hmac` before adoption. That is a provenance record, not a vendored
+corpus: three short strings used as a test oracle, the same relationship root
+`NOTICE` §0 describes for a black-box binary, not third-party source or a
+reproduced data table — so **no `modules/webhooksig/NOTICE` is created for it**.
+Constant-time compare and the middleware shape mirror the sibling `aaa-gate`
+module (same repo, MIT).
 
 - **Model after:** GitHub webhook HMAC signatures (`sha256=<hex>`); RFC 2104 HMAC.
 - **Platform:** any. **Role:** server. **Concurrency:** threadsafe — the

@@ -18,8 +18,16 @@ of a whole plan is exercised here (the plan is pure data); the sibling `tc`
 module owns the live-kernel integration tests, and this module proves a
 representative op sample builds valid netlink bytes through tc's real builders.
 
-Provenance: see `/NOTICE` (LibreQoS is a design reference for the
-architecture; no source copied).
+Provenance: original work of the zig-libs authors (MIT) — a pure-Zig compiler
+from a hierarchical shaping topology to an ordered plan of `tc` operations. Design reference: LibreQoS
+(**GPL-2.0-or-later**, github.com/LibreQoE/LibreQoS) — the
+cpumap→MQ→per-CPU-HTB-with-CAKE-leaves shaping ARCHITECTURE (one `mq` root
+fanning out to a per-hardware-TX-queue HTB tree, subscribers as leaf HTB classes
+with CAKE qdiscs, steered by classifier filters) was studied for the plan's
+structure and handle scheme. No source was copied and no wire format is emitted
+here: this module produces only `tc`-module request objects, and the kernel UAPI
+facts it relies on come from the sibling `tc` module. The golden plan test
+(hand-verified handles/ordering) is the independent check.
 
 ## Model after
 

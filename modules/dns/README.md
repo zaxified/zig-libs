@@ -12,10 +12,13 @@ DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports, forward
   RFC 6724 result ordering), `http` (DoH transport), `std.json` (DoH-JSON),
   `std.Io.net` (UDP/TCP).
 
-Provenance: clean-room from RFC 1035 / RFC 8484 throughout, including the
-`/etc/hosts` + UDP-PTR core; design refs (`miekg/dns`, c-ares) recorded in
-[NOTICE](../../NOTICE) §2. No fping code is involved — fping has no resolver at
-all, and an earlier note claiming derivation was a bookkeeping error.
+Provenance: clean-room from RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV)
+and RFC 8659 (CAA) throughout, including the `/etc/hosts` + UDP-PTR core;
+design references `miekg/dns` (BSD-3-Clause) and c-ares (MIT) — behavior only,
+no source copied. Recorded, together with the live-capture reasoning for
+`src/goldens.zig`, in [`NOTICE`](NOTICE) beside this file. No fping code is
+involved — fping has no resolver at all, and an earlier note claiming
+derivation was a bookkeeping error.
 
 ## Layout
 

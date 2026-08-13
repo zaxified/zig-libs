@@ -28,8 +28,9 @@ point" fast, from a read-only snapshot. The module is general — any static
 > the checkers have teeth. See `SPEC.md` for the wire format field-by-field and
 > the threat model.
 
-Provenance: clean-room. Design reference only — Flatbush (packed-Hilbert-R-tree
-*approach*); no third-party source consulted or copied. See `NOTICE`.
+Provenance: original work of the zig-libs authors (MIT) — the spatial index.
+Design reference, approach only: Flatbush (mourner/flatbush, **ISC**) — the
+packed-Hilbert-R-tree bulk-load idea. No source consulted or copied.
 
 ## Contracts
 

@@ -138,5 +138,6 @@ race detection is the real-thread run under Debug and `-Doptimize=ReleaseFast`,
 repeated many times, cross-checked with a valgrind `memcheck` pass (no errors).
 
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 specification
-(open standard, royalty-free); mosquitto (EPL/EDL) and Eclipse Paho
-referenced for behavior only, no source consulted or copied.
+(an open, royalty-free standard); mosquitto (EPL/EDL) and Eclipse Paho are
+cited as behavior design references only, no source was consulted or
+copied.

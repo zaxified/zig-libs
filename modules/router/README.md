@@ -17,9 +17,10 @@ middleware.
 - **Deps:** `http`.
 
 Provenance: original work of the zig-libs authors (MIT); the trie matcher +
-middleware chain are clean-room, modeled after Go `chi` /
-`julienschmidt/httprouter` (segment trie, deterministic precedence, 404/405 +
-`Allow`, trailing-slash redirect) — see [NOTICE](../../NOTICE).
+middleware chain are clean-room, modeled after Go `go-chi/chi` (MIT) and
+`julienschmidt/httprouter` (BSD-3-Clause) — segment trie, deterministic
+precedence, 404/405 + `Allow`, trailing-slash redirect. Design references only,
+no source consulted or copied.
 
 ## Usage
 

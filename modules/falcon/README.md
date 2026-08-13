@@ -103,10 +103,18 @@ only F reproduction from KAT (f, g), and a fresh-key sign → verify round
 trip).
 
 Provenance: verification + codecs are clean-room from the Falcon Round-3
-specification (the reference implementation was a wire-format design
-reference + KAT oracle for those); the signer and keygen internals
-(`fpr`/`fft`/`gaussian`/`ffsampling`/`ntru`) are ports of the MIT-licensed
-Round-3 reference implementation, required for byte-exact KAT
+specification ("Falcon: Fast-Fourier Lattice-based Compact Signatures over
+NTRU", falcon-sign.info — the NIST PQC Round-3 submission document; FIPS 206 /
+FN-DSA is still a draft). The Round-3 reference implementation (MIT, Copyright
+(c) 2017-2019 Falcon Project, Thomas Pornin) was consulted for those parts only
+to pin wire-format/behavior facts (the NIST-API signed-message envelope,
+key/signature header bytes, codec canonicality rules, the `l2bound` norm table);
+the signer and keygen internals (`fpr`/`fft`/`gaussian`/`ffsampling`/`ntru`) are
+a **port** of that same MIT reference, required for byte-exact KAT
 reproduction — the required attribution ships as [NOTICE](NOTICE) in this
-directory; see also SPEC.md. The Falcon-1024 squared-norm acceptance bound (⌊β²⌋ = 70265242) is
-sourced from the reference `common.c` `l2bound` table — see SPEC.md.
+directory and lists the ported files; see also SPEC.md. The submission package's
+`falcon512-KAT.rsp` / `falcon1024-KAT.rsp` vectors are used purely as the test
+oracle (SHA-256 of each `.rsp` recorded in SPEC.md); each embedded vector's
+`seed` field was re-extracted from the same SHA-256-verified mirror. The
+Falcon-1024 squared-norm acceptance bound (⌊β²⌋ = 70265242) is sourced from the
+reference `common.c` `l2bound` table — see SPEC.md.

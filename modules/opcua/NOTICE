@@ -1,0 +1,38 @@
+opcua — provenance note
+=======================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). Moved here from the
+root `NOTICE` §2 on 2026-08-14, unchanged in substance.
+
+Specifications (clean-room)
+---------------------------
+
+Clean-room from OPC 10000-6 (OPC UA Binary encoding + the `opc.tcp`
+transport) and OPC 10000-4 (Services); both are open, royalty-free
+specifications published by the OPC Foundation.
+
+The OPC Foundation's `StatusCode.csv` / `NodeIds.csv` / `Opc.Ua.Types.bsd`
+(**MIT License 1.00**) supply constants and field order.
+
+Security is SecurityPolicy#None or Basic256Sha256 via the `rsa` module, on BOTH
+the client and the server side.
+
+Design references (behavioral/structural only, no source copied)
+----------------------------------------------------------------
+
+  - open62541 (**MPL-2.0**) — module/layering shape.
+  - node-opcua (**MIT**) — client API shape.
+
+For the server side, open62541's EXAMPLE sources (`examples/client.c`) were
+read once to learn which services each demo binary exercises and which NodeIds
+it addresses — behaviour and API shape only, nothing copied, and not used at
+build or run time; its stock binaries were otherwise a black-box live peer.
+
+Black-box oracles
+-----------------
+
+Additional black-box oracles used to validate the server's security: Python
+`asyncua` (**LGPL-3.0**) and open62541's stock binaries — both driven as
+processes whose stdout is the assertion, with no source read, built or linked —
+plus `openssl` as a CLI staging a throwaway test key pair.

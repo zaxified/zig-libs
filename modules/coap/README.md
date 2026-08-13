@@ -40,9 +40,16 @@ the typed registry (Uri-Path = 11, Content-Format = 12, …) is the next part.
   only). **Concurrency:** reentrant — no shared state; results borrow the
   caller's buffers.
 
-Provenance: clean-room from RFC 7252 §3 (the CoAP message format: header /
-token / delta-encoded options / payload). No third-party CoAP source (libcoap,
-aiocoap, Californium, …) consulted or copied.
+Provenance: clean-room from RFC 7252 (the Constrained Application Protocol),
+an open IETF standard: the §3 message format (header / token / delta-encoded
+options / payload), the §5.10 option registry + §5.4.6 class bits + §3.2 uint
+value format, the §6 URI ↔ options mapping (with RFC 3986 percent-encoding),
+the §4 message layer (§4.2 Confirmable retransmission timers, §4.5 message-ID
+deduplication, §4.8 transmission parameters) and the §5 request/response model
+(token/message-id correlation §5.3, piggybacked/separate responses §5.2), plus
+RFC 7959 (block-wise transfer — Block1/Block2 options) and RFC 7641 (Observe).
+No third-party CoAP source (libcoap, aiocoap, Californium, …) consulted or
+copied.
 
 ## Typed options (`coap.options`)
 

@@ -12,9 +12,13 @@ O(1) per sample, zero allocation, no syscalls.
   **Concurrency:** single-owner (one `Accumulator` per probe stream).
   **Allocation:** none.
 
-Provenance: original work of the zig-libs authors (MIT); jitter per RFC 3550,
-variance per Welford (Knuth TAOCP vol 2 §4.2.2); `Histogram` is modeled after
-Gil Tene's HdrHistogram design — see NOTICE.
+Provenance: original work of the zig-libs authors (MIT) — the streaming moment
+stats (min/max/mean/stddev + RFC 3550 jitter), variance per Welford (Knuth
+TAOCP vol 2 §4.2.2). The `Histogram` percentile support is clean-room from Gil
+Tene's HdrHistogram design (logarithmic bucketing with linear sub-buckets,
+bounded relative error); design references HdrHistogram_c (BSD-2-Clause/CC0),
+HdrHistogram Java (CC0-1.0/BSD-2) and the Rust `hdrhistogram` crate (MIT OR
+Apache-2.0) — behavior/format only, no source consulted or copied.
 
 ## API
 
