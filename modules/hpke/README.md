@@ -180,6 +180,7 @@ ReleaseFast.
 
 ## Provenance
 
-Clean-room from RFC 9180 (public IETF specification). See `NOTICE` for
-the full statement (no third-party implementation was consulted as a
-design reference).
+Clean-room from RFC 9180 (public IETF specification); nothing is ported.
+One design reference was consulted afterwards: `jedisct1/zig-hpke` (MIT),
+read in a 2026-07-21 diff audit that produced the `error.InvalidLength`
+hardening in `src/schedule.zig`. See `NOTICE` for the full statement.

@@ -25,6 +25,22 @@ of `std.crypto.dh.X25519`/`std.crypto.ecc.P256`/
 `std.crypto.kdf.hkdf.HkdfSha256`/`std.crypto.aead.aes_gcm`/
 `std.crypto.aead.chacha_poly` only.
 
+ONE DESIGN REFERENCE WAS CONSULTED LATER, and this paragraph exists
+because the sentence above kept being read as though it covered the
+module's whole history rather than its first pass. On 2026-07-21 the
+"I5" audit diffed this module against `jedisct1/zig-hpke` (MIT,
+<https://github.com/jedisct1/zig-hpke>), a pure-Zig RFC 9180
+implementation. Its source was read — closely enough to compare method
+names and error-handling idioms — and the comparison found a real defect:
+`Context.seal`/`.open` guarded the caller's `out` buffer with a
+`std.debug.assert`, which ReleaseFast and ReleaseSmall compile out, while
+`zig-hpke` made the equivalent check unconditionally. Fixed in commit
+`15c6e89` (`error.InvalidLength` in every build mode); the citations are
+at `src/schedule.zig:99` and `:1024` and in `SPEC.md`. No zig-hpke source
+was copied or ported, so this remains a provenance note carrying no
+condition — but "no implementation was consulted" was not true of the
+module as it stands, and saying so in a public repository was the defect.
+
 The RFC 9180 Appendix A known-answer test vectors (`kat_rfc9180.zig`) were
 fetched directly from <https://www.rfc-editor.org/rfc/rfc9180> for this
 pass (A.1 `DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM` embedded

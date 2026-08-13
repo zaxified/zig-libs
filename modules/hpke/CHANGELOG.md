@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Provenance corrected: README and `NOTICE` both claimed no
+  third-party implementation had been consulted as a design reference, while
+  `src/schedule.zig:99`, `:1024` and `SPEC.md` all cite `jedisct1/zig-hpke`
+  by name. It was consulted — the 2026-07-21 "I5" diff against it is what
+  found the ReleaseFast-stripped `std.debug.assert` behind `Context.seal`/
+  `.open` and produced `error.InvalidLength` (`15c6e89`). Recorded now with
+  its licence (MIT). Documentation only; no code change, nothing owed —
+  a design reference carries no condition.
+
 - **2026-08-13** — Each KEM's `generateKeyPair` now mints its keypair the way RFC 9180 §4
   defines it — `GenerateKeyPair() = DeriveKeyPair(random(Nsk))` — with
   `random` being `entropy.fill` (`std.Io.randomSecure`). **Not breaking:**
