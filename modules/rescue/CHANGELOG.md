@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Licensing record. Not breaking and not behavioural — no code
+  changed, and no digest this module produces is different. What changed is
+  what the module admits to carrying: its constant tables and part of its
+  known-answer vectors are numbers a script lifted out of two third parties'
+  Rust source (facebook/winterfell's `rp64_256`, miden-crypto's
+  `rescue`/`rpo`), which is reproduced DATA, not the black-box test-oracle
+  relationship the module had been recorded under. A new
+  `modules/rescue/NOTICE` reproduces both projects' MIT terms in full and is
+  listed in root NOTICE §1. miden-crypto is dual-licensed `MIT OR Apache-2.0`
+  and MIT is elected, so the only condition a consumer sees is still "keep the
+  notice with the files" — the same shape as every other condition in this
+  repository. Two things are recorded as NOT owed, with the argument rather
+  than the verdict: the RPO report's own 38 published test vectors are
+  specification material (cited in `SPEC.md`, not attributed), and the miden
+  ARK tables reproduce from the published generator — all 168 values — so they
+  are this module's own derived numbers rather than upstream's. The README's
+  `Provenance:` line was corrected: it had pointed at `SPEC.md` as the place
+  the tables were "attributed", and `SPEC.md` is the verification-methodology
+  file, not an attribution location.
+
 - **2026-08-06** — Security audit: three findings fixed, two documented as accepted (not
   defects) — part of the collection-wide audit. Verified: byte-exact against three
   independently-verified upstream vector sources (each pinned by commit hash and file

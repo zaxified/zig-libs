@@ -2,24 +2,14 @@ zig-libs
 Copyright (c) 2026 zig-libs contributors
 Licensed under the MIT License (see LICENSE).
 
-These modules are the original work of the zig-libs authors, consolidated
-here as the canonical home. The authors' other projects depend on zig-libs,
-not the reverse. A module's internal development origin — which of the
-authors' own projects it was first prototyped in — is NOT recorded here: it
+This file answers ONE question: does consuming zig-libs oblige you to anything
+beyond MIT? §1 answers it, and §0 says what has to be entered here to get
+there. It is NOT a catalogue of the collection's provenance — design
+references, and the licence arguments behind them, are recorded at the module
+that has them (§2). A module's internal development origin — which of the
+authors' own projects it was first prototyped in — is not recorded anywhere: it
 carries no attribution weight and would read backwards once those projects
 import zig-libs.
-
-This file answers ONE repository-level question: does consuming zig-libs oblige
-you to anything beyond MIT? §1 answers it. It is NOT a catalogue of the
-collection's provenance — THIRD-PARTY DESIGN REFERENCES (software designed with
-reference to a named third-party implementation, no source copied) are recorded
-at the module that has them, in its `README.md` `Provenance:` statement or in a
-`modules/<name>/NOTICE` provenance note. None of those carries a license
-condition — not because the references are all permissively licensed (they are
-not: they include GPL-2.0, GPL-3.0, LGPL-2.1, LGPL-3.0 and AGPL-3.0 projects),
-but because a design reference carries no license condition at all. Where
-third-party code or data was actually ported or reproduced rather than studied,
-its terms travel with it and live beside that code; see section 0 and §1.
 
 ====================================================================
 0. POLICY — what requires an entry here
@@ -31,49 +21,46 @@ expression, and facts/ideas are not protected) — implementing one, however
 closely, is not "derived from" anyone's code. Accordingly:
 
   - A module that is pure clean-room-from-a-public-spec/RFC, with NO
-    third-party source code ported and NO third-party implementation
-    studied as a design reference, needs NO entry in this file. Its
-    RFC/spec citation lives in the module's own SPEC.md ("Verification" /
-    design section) instead — see e.g. whois (RFC 3912), rdap (RFC
-    7480-family), tar (POSIX ustar + documented GNU extensions).
-  - Third-party source actually ported/translated requires its license
-    terms reproduced — in `modules/<name>/NOTICE`, beside the source, so
-    the notice travels with the code that owes it. Never in this file.
-  - A DESIGN REFERENCE — a named third-party implementation that was
-    consulted/studied for behavior, algorithm shape, or API design, even
-    when no source was copied — is recorded for provenance so any future
-    line-level reuse is caught, WITH ITS UPSTREAM LICENSE NAME so that
-    reuse would be attributed correctly. These are records, not license
-    conditions, and since 2026-08-14 they live AT THE MODULE, not here:
-    in `modules/<name>/README.md`'s `Provenance:` statement, or — when the
-    record runs longer than a paragraph — in a `modules/<name>/NOTICE`
-    provenance note (see §1 for the two kinds of module-local NOTICE).
-    Never in this file: a repository-level file that also catalogues 84
-    modules' design references stops being readable as the answer to
-    "what do I owe?", which is the only question it exists to answer.
+    third-party source code ported and NO third-party implementation studied as
+    a design reference, needs NO entry in this file. Its RFC/spec citation
+    lives in the module's own SPEC.md instead — see e.g. whois (RFC 3912),
+    rdap (RFC 7480-family), tar (POSIX ustar + documented GNU extensions).
+  - Third-party source actually ported/translated, or third-party DATA
+    reproduced, requires its license terms reproduced — in
+    `modules/<name>/NOTICE`, beside the files, so the notice travels with what
+    owes it. Never in this file; this file only lists which modules those are.
+  - A DESIGN REFERENCE — a named third-party implementation consulted for
+    behavior, algorithm shape, or API design, with no source copied — is
+    recorded for provenance so any future line-level reuse is caught, WITH ITS
+    UPSTREAM LICENSE NAME. These are records, not conditions, and they live at
+    the module (§2), never here: a repository-level file that also catalogues
+    84 modules' design references stops being readable as the answer to "what
+    do I owe?", which is the only question it exists to answer.
   - Exercising an installed third-party binary purely as a black-box
-    compatibility test oracle (e.g. running `tar`/`nft` and diffing
-    output against this module's own encoder/decoder) is neither of the
-    above and needs no entry — no source or design was consulted, only
-    the program's observable behavior against its own documented format.
-    This covers CAPTURING that output once and committing it as a golden
-    fixture, not only invoking the tool live: `tar`'s `write_golden_*.tar`
-    are GNU tar's bytes wrapped around a `hello.txt` we wrote, and freezing
-    them so the test needs no subprocess changes nothing about who authored
-    what. The clause was written for live invocation and this sentence
-    exists because two independent readings in the 2026-08-12 audit found
-    it did not literally reach the frozen case.
+    compatibility test oracle (e.g. running `tar`/`nft` and diffing output
+    against this module's own encoder/decoder) is neither of the above and
+    needs no entry — no source or design was consulted, only the program's
+    observable behavior against its own documented format. This covers
+    CAPTURING that output once and committing it as a golden fixture, not only
+    invoking the tool live: `tar`'s `write_golden_*.tar` are GNU tar's bytes
+    wrapped around a `hello.txt` we wrote, and freezing them so the test needs
+    no subprocess changes nothing about who authored what. The clause was
+    written for live invocation, and this sentence exists because two
+    independent readings in the 2026-08-12 audit found it did not literally
+    reach the frozen case.
 
     THE LINE THIS DOES NOT CROSS. The exemption holds when the captured
     artifact is OUR content in the tool's format. It stops the moment the
-    artifact also carries content the tool itself authored — a stock
-    template, a default stylesheet, a generated boilerplate section — since
-    that is no longer merely "the program's observable behavior" on our
-    input. `zipstream`'s `xlsx_sample.xlsx` is exactly that case and is why
-    the module carries its own provenance note: most of its bytes are
-    LibreOffice's default theme and style tables, not ours. When in doubt,
-    open the artifact; a fixture's description of itself is a claim, not a
-    verification.
+    artifact also carries content the tool itself authored — a stock template,
+    a default stylesheet, generated boilerplate — since that is no longer
+    merely "the program's observable behavior" on our input. `zipstream`'s
+    `xlsx_sample.xlsx` is exactly that case and is why the module carries its
+    own provenance note: most of its bytes are LibreOffice's default theme and
+    style tables, not ours. It equally stops at data that was never observed
+    from a running program at all — numbers read out of an upstream source file
+    by a script are reproduced data, not oracle output; `rescue` is that case.
+    When in doubt, open the artifact; a fixture's description of itself is a
+    claim, not a verification.
 
 ====================================================================
 1. REQUIRED ATTRIBUTION — ported code
@@ -82,218 +69,54 @@ closely, is not "derived from" anyone's code. Accordingly:
 NONE at the repository level. zig-libs imposes no redistribution condition
 beyond its own MIT license.
 
-Where a module ports third-party code, or reproduces third-party data whose
-notice must be preserved, that module carries its own `NOTICE` file next to its
-source, and the notice travels with the module. TWENTY-TWO modules do, and
-these are the ONLY files in the repository that carry a condition naming
-anyone other than the zig-libs authors. Each such file's first line says
-`<name> — third-party attribution`:
+TWENTY-FOUR modules port third-party code or reproduce third-party data whose
+notice must be preserved. Each carries its own `NOTICE` beside its source —
+first line `<name> — third-party attribution` — stating what was taken and
+reproducing that upstream's terms in full. These are the ONLY files in the
+repository carrying a condition that names anyone other than the zig-libs
+authors, and every one of those conditions is the same: keep the notice with
+the files. To answer "does consuming zig-libs oblige me to anything beyond
+MIT?", read these and nothing else:
 
-  bech32   — `modules/bech32/NOTICE` (Bitcoin Core
-             `base58_encode_decode.json` plain-base58 conformance corpus,
-             MIT; test data only, no source code)
-  brotli   — `modules/brotli/NOTICE` (google/brotli `tests/testdata/*`
-             compression conformance corpus, 17 input/`.compressed` pairs,
-             MIT; test data only, no source code. Added 2026-08-12: the file
-             existed as a no-condition provenance note claiming the vectors
-             had been GENERATED with the C library as an oracle, when they
-             are byte-for-byte copies of upstream's corpus — verified by
-             downloading google/brotli and running `cmp`)
-  falcon   — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
-             a second copyright holder, no condition beyond MIT's own)
-  decimal  — `modules/decimal/NOTICE` (IBM decTest test-case text, reproduced
-             with permission; test vectors only, no source code)
-  poseidon — `modules/poseidon/NOTICE` (hadeshash reference sage script, MIT;
-             the parameter generator and the MDS acceptance checks port it)
-  imap     — `modules/imap/NOTICE` (emersion/go-imap v2, MIT; three further
-             copyright holders, no condition beyond MIT's own)
-  bitcoinscript — `modules/bitcoinscript/NOTICE` (Bitcoin Core
-             `script_tests.json` conformance rows, MIT; test data only, no
-             source code)
-  bitcointx — `modules/bitcointx/NOTICE` (Bitcoin Core `sighash.json` legacy
-             signature-hash conformance rows, MIT; test data only, no source
-             code)
-  json5    — `modules/json5/NOTICE` (json5/json5-tests conformance corpus,
-             MIT; test fixtures only, no source code)
-  encoding — `modules/encoding/NOTICE` (WHATWG Encoding Standard
-             `index-*.txt` normative tables, CC BY 4.0 / BSD-3-Clause, plus
-             Unicode.org `8859-1.TXT`, Unicode License v3; test data only,
-             no source code)
-  validate — `modules/validate/NOTICE` (json-schema-org/JSON-Schema-Test-Suite
-             `optional/format/` conformance corpus, MIT; test fixtures only,
-             no source code)
-  csvstream — `modules/csvstream/NOTICE` (maxogden/csv-spectrum CSV parsing
-             acid-test corpus, BSD-2-Clause as declared in package.json; test
-             fixtures only, no source code)
-  metrics  — `modules/metrics/NOTICE` (Prometheus exposition-format worked
-             example, prometheus.io documentation, Apache License 2.0; a
-             short documentation-text excerpt used as a conformance-checker
-             anchor, no source code)
-  openapi  — `modules/openapi/NOTICE` (OAI/OpenAPI-Specification
-             `examples/v3.1/webhook-example.json`, Apache License 2.0; one
-             example document used as a conformance-checker anchor, no
-             source code)
-  security-headers — `modules/security-headers/NOTICE` (OWASP Secure
-             Headers Project `mainsite/01_headers.md` example header lines,
-             Apache License 2.0; a handful of one-line examples used as an
-             external-anchor golden, no source code)
-  tracecontext — `modules/tracecontext/NOTICE` (w3c/trace-context
-             `test/test.py` conformance-suite cases, W3C 3-clause BSD test
-             license; test-case data hand-transcribed from the suite's
-             Python source, no source code)
-  xml      — `modules/xml/NOTICE` (W3C XML Conformance Test Suite, a
-             license-filtered slice: Sun Microsystems / IBM Corp. / Richard
-             Tobin (Univ. of Edinburgh) sub-suites vendored, no condition
-             beyond MIT's own; the James Clark `xmltest` sub-suite is
-             EXCLUDED ENTIRELY on license grounds — its own terms permit
-             redistribution only as the unmodified xmltest.zip; test
-             fixtures only, no source code)
-  iec62351 — `modules/iec62351/NOTICE` (cutaway-security/goosestalker real
-             IEC 61850-8-1 GOOSE capture frames, MIT; three raw device
-             frames reproduced as test fixtures, no source code)
-  l2disco  — `modules/l2disco/NOTICE` (the-tcpdump-group/tcpdump dissector
-             test-suite capture files, 3-clause BSD; fifteen raw
-             LLDP/CDP/ARP/DHCP frames reproduced as test fixtures, no
-             source code)
-  lninvoice — `modules/lninvoice/NOTICE` (lightning/bolts BOLT#11/BOLT#12
-             `offers-test.json` + `format-string-test.json` official test
-             vectors, plus inline hex from `signature-test.json` /
-             `payer-proof-test.json`, all CC-BY 4.0; test vectors only, no
-             source code)
-  lnwire   — `modules/lnwire/NOTICE` (lightning/bolts BOLT#7
-             `bolt07/extended-queries.json` official test vectors, CC-BY
-             4.0, plus lightningdevkit/rust-lightning `msgs.rs` encode/
-             decode-test hex for channel_announcement/node_announcement/
-             channel_update and for init/error/warning/ping/pong, dual
-             MIT/Apache-2.0; test vectors only, no source code)
-  psbt     — `modules/psbt/NOTICE` (BIP174 "Test Vectors" section worked
-             examples, bitcoin/bips, BSD-2-Clause, plus Bitcoin Core
-             `test/functional/data/rpc_psbt.json` conformance vectors, MIT;
-             test vectors only, no source code)
+  `modules/bech32/NOTICE`, `modules/bitcoinscript/NOTICE`,
+  `modules/bitcointx/NOTICE`, `modules/brotli/NOTICE`,
+  `modules/csvstream/NOTICE`, `modules/decimal/NOTICE`,
+  `modules/encoding/NOTICE`, `modules/falcon/NOTICE`,
+  `modules/iec62351/NOTICE`, `modules/imap/NOTICE`, `modules/json5/NOTICE`,
+  `modules/l2disco/NOTICE`, `modules/lninvoice/NOTICE`,
+  `modules/lnwire/NOTICE`, `modules/metrics/NOTICE`,
+  `modules/minisign/NOTICE`, `modules/openapi/NOTICE`,
+  `modules/poseidon/NOTICE`, `modules/psbt/NOTICE`, `modules/rescue/NOTICE`,
+  `modules/security-headers/NOTICE`, `modules/tracecontext/NOTICE`,
+  `modules/validate/NOTICE`, `modules/xml/NOTICE`
 
-New modules that reproduce third-party code OR third-party data whose notice
-must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`
-beside the files that owe it, not an entry here.
+A new module in that position follows the same pattern: a
+`modules/<name>/NOTICE` beside the files that owe it, and its path added above.
 
-A SECOND, DIFFERENT KIND of `modules/<name>/NOTICE` file also exists, and must
-not be confused with the twenty-two above: a **provenance note**, whose first line
-says `<name> — provenance note`. Those are design-reference records that live
-beside the module rather than in this file — the practice grew up around the
-self-contained crypto/protocol modules, whose provenance runs to hundreds of
-lines per module (`bls12_381` alone is over 800) and would drown this file, and
-as of 2026-08-14 it is the rule for every module whose record needs more than a
-`README.md` paragraph. They record what was consulted and argue why nothing is
-owed; **none of them imposes any condition**, they are NOT listed above, and
-`zig build check-catalog` enforces both that the two kinds stay distinguishable
-by that first line and that only the condition-bearing ones appear in this
-section. Which kind a module needs is decided by CONVENTIONS.md §5, not by
-module size.
-
-So: to answer "does consuming zig-libs oblige me to anything beyond MIT?",
-read the twenty-two files listed above and nothing else.
+A SECOND KIND of `modules/<name>/NOTICE` exists and is deliberately not in that
+list: a **provenance note**, first line `<name> — provenance note`, which
+records design references and argues why nothing is owed. Those impose NO
+condition. `zig build check-catalog` enforces both that the two kinds stay
+distinguishable by that first line and that only the condition-bearing ones are
+listed here; CONVENTIONS.md §5 decides which kind a module needs, not size.
 
 ====================================================================
 2. DESIGN REFERENCES — recorded at the module, not here
 ====================================================================
 
-NOTHING in this section, and nothing in any of the module-level provenance
-records it points at, imposes a redistribution obligation beyond zig-libs' own
-MIT license: they are provenance records kept for honesty and for future
-auditability, not license conditions. A full provenance/license audit was
-completed 2026-07-09 and re-examined 2026-07-29 (both recorded in the project
-git history).
+Design references live at the module that has them: in
+`modules/<name>/README.md`'s `Provenance:` statement — the default, and the
+only provenance location `zig build check-catalog` reads — or, when the record
+needs more than a paragraph or makes a licensing argument that must not be
+compressed, in a `modules/<name>/NOTICE` provenance note. They moved out of
+this file on 2026-08-14, where they had run to ~1000 lines indexing 84 modules.
+`modules/<name>/SPEC.md` is deliberately NOT a destination: it is the
+verification-methodology file, and it is where "studied as a design reference"
+most easily drifts into "verified against".
 
-WHERE THEY LIVE. Until 2026-08-14 this section carried ~1000 lines indexing the
-design references of 84 modules. They now live at the modules that have them:
-
-  - `modules/<name>/README.md`'s `Provenance:` statement — the default, and
-    the only provenance location `zig build check-catalog` reads. Each names
-    the upstream project AND ITS LICENSE, so any future line-level reuse is
-    attributed correctly.
-  - `modules/<name>/NOTICE`, first line `<name> — provenance note` — when the
-    record needs more than one paragraph, names three or more distinct
-    upstream works, or makes a licensing argument that must not be compressed
-    (a GPL-exception or merger-doctrine claim). Ten entries moved there on
-    2026-08-14: `http`, `icmp`, `ebpf`, `wireguard`, `tc`, `blobmsg`, `dnp3`,
-    `opcua`, `rsa`, `fleetsim`. Those files are records; they are NOT listed
-    in §1 and carry no condition.
-  - `modules/<name>/SPEC.md` is deliberately NOT a destination for a licensing
-    record. It is the verification-methodology file, and it is where "studied
-    as a design reference" most easily drifts into "verified against" — a
-    distinction the records above are written to keep.
-
-A module with no such record needs none: pure clean-room from a public
-spec/RFC, per §0.
-
---------------------------------------------------------------------
-UNRESOLVED — two entries deliberately NOT moved (2026-08-14)
---------------------------------------------------------------------
-
-These two were not demoted to a module record, because on re-reading they may
-describe REPRODUCED/PORTED third-party material rather than a studied design
-reference. If that reading is right, each needs a `modules/<name>/NOTICE` whose
-first line is `<name> — third-party attribution` and a row in §1 above — the
-same correction `brotli` needed on 2026-08-12. They are left here, verbatim,
-until their owner rules. Nothing else in this file depends on the outcome.
-
-  rescue     — Rescue-Prime Optimized (RPO). The permutation, its parameters
-               and the constant-derivation rule are public specification facts
-               from the RPO report (github.com/ASDiscreteMathematics/rpo) and
-               eprint 2020/1143. The 38 published test vectors in that report,
-               Winterfell's Rescue-XLIX permutation KAT, and miden-crypto's
-               `EXPECTED` digests are used as byte-exact test ORACLES — policy
-               §0's black-box-oracle relationship, needing no attribution and
-               recorded here only for provenance. Winterfell's Rescue-XLIX
-               round constants could NOT be re-derived from the published
-               generator and are embedded as a pinned blob; that table is the
-               one place where an upstream artifact is carried rather than
-               reproduced, and `modules/rescue/SPEC.md` says so.
-
-               WHY UNRESOLVED: `modules/rescue/src/xlix_constants.zig` commits
-               that table — `mds_row`, `ark1`, `ark2` — extracted by script
-               out of `winterfell/crypto/src/hash/rescue/rp64_256/mod.rs`,
-               with upstream SHA-256s recorded beside it. That is upstream
-               source content transcribed into this repository, which §0 puts
-               on the "reproduced third-party data" side of the line, not the
-               black-box-oracle side (the oracle carve-out covers OUR content
-               in the tool's format, and stops at content the tool itself
-               authored). It is the same shape as `bech32`, `lnwire` and
-               `brotli`, all of which carry attribution. This entry also never
-               names Winterfell's or miden-crypto's license, which an
-               attribution file would have to state exactly rather than guess.
-
-  minisign   — clean-room from the minisign wire-format facts documented in
-               jedisct1/minisign's `minisign.h`/`minisign.c` (ISC License) —
-               the fixed struct layouts (`RawPublicKey`/`RawSecretKey`/
-               `RawSignature`), the 2-byte algorithm tags ("Ed"/"ED" signing,
-               "Sc"/none KDF, "B2" checksum), and the untrusted/trusted
-               comment file framing are uncopyrightable format facts (merger
-               doctrine, policy §0), independently re-derived in Zig and
-               cross-checked byte-exact against the real `minisign` 0.12
-               binary (Debian/Ubuntu package) run as a black-box test oracle
-               (needs no attribution per policy §0 on its own — recorded
-               here anyway because minisign.c/.h WAS read directly for the
-               exact byte layout, which the black-box-oracle policy §0
-               carve-out does not cover). `isPrintableComment` mirrors
-               minisign.c's `is_printable` control-character/UTF-8-validity
-               algorithm shape — a genuine design reference, ported
-               algorithm-for-algorithm (not literally copied C) since it is
-               a small, precisely specified check with no other reasonable
-               expression. Design ref: jedisct1/zig-minisign (ISC License)
-               for the Zig-idiomatic API shape (not read line-by-line, but
-               named as this module's Zig-ecosystem sibling per
-               CONVENTIONS §5). scrypt parameter derivation (ops/mem-limit
-               → N/r/p) reuses Zig std's own
-               `std.crypto.pwhash.scrypt.Params.fromLimits`, which already
-               matches libsodium's `pickparams` algorithm identically — no
-               separate port was needed or done.
-
-               WHY UNRESOLVED: §0 says third-party source actually
-               ported/translated requires its license terms reproduced in
-               `modules/<name>/NOTICE`. `modules/minisign/src/root.zig`'s own
-               doc-comment calls `isPrintableComment` a "Faithful port of
-               minisign.c's `is_printable`". The merger argument above may
-               well hold for a thirty-line predicate, but it is the owner's
-               call, and the precedent cuts the other way: `poseidon` carries
-               a `third-party attribution` file for porting a sage script of
-               comparable size.
+None of those records imposes any obligation beyond zig-libs' own MIT license,
+even though the projects they name include GPL-2.0, GPL-3.0, LGPL-2.1,
+LGPL-3.0 and AGPL-3.0 ones — a design reference carries no license condition at
+all. A module with no such record needs none: pure clean-room from a public
+spec/RFC, per §0. A full provenance/license audit was completed 2026-07-09 and
+re-examined 2026-07-29; both are recorded in the project git history.

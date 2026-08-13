@@ -1,0 +1,75 @@
+minisign — third-party attribution
+
+This file carries a CONDITION. `src/root.zig`'s `isPrintableComment` is a port
+of `is_printable` from jedisct1/minisign, and the ISC license that project
+ships under requires its copyright notice and permission text to be retained.
+That text is reproduced in full below, and root NOTICE §1 lists this file.
+
+WHY THIS FILE EXISTS, 2026-08-14. Until this revision the module argued merger
+doctrine instead: a thirty-line control-character predicate is small and
+precisely specified, so the argument ran, it has no other reasonable
+expression and nothing is owed. That argument may well hold. It is not the one
+this repository acts on, for two reasons. The module's own doc comment calls
+the function a "Faithful port of minisign.c's `is_printable`", and a file that
+argues no-attribution while the code it describes says "port" is a
+contradiction a reader has to resolve. And the precedent cuts the other way:
+`poseidon` carries an attribution file for porting a sage script of comparable
+size. Consistency is cheaper than defending the distinction, and ISC's
+condition — retain the notice — costs a consumer nothing.
+
+Required attribution — minisign `is_printable`
+----------------------------------------------
+
+Ported: ONE function. `isPrintableComment` in `src/root.zig` is
+`minisign.c`'s `is_printable` translated to Zig: the ASCII tab / 0x20-0x7E
+fast path, the 2/3/4-byte UTF-8 length classification, the continuation-byte
+and overlong/surrogate range checks, and the final rejection of code points in
+the C0 and C1 control ranges. It is a port, not a description of behaviour
+re-implemented — the Zig retains a check for a zero continuation byte, which
+is only meaningful against a NUL-terminated C string and is dead on a Zig
+slice. It exists to stop a maliciously-crafted trusted comment from smuggling
+terminal escape sequences into a verifier's output.
+
+Nothing else in this module is ported, and no minisign C source is otherwise
+present; see the provenance section below for what the rest rests on.
+
+    Copyright (c) 2015-2026 Frank Denis <j at pureftpd dot org>
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+    IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+ISC is permissive and imposes nothing on users of zig-libs beyond keeping the
+notice above with the code. It adds no restriction to zig-libs' own MIT terms.
+
+Provenance — the rest of the module
+-----------------------------------
+
+Unchanged and unaffected by the above.
+
+  - The wire format is clean-room from the format facts documented in
+    `minisign.h`/`minisign.c`: the fixed struct layouts
+    (`RawPublicKey`/`RawSecretKey`/`RawSignature`), the 2-byte algorithm tags
+    ("Ed"/"ED" signing, "Sc"/none KDF, "B2" checksum) and the
+    untrusted/trusted comment file framing. A file format has essentially one
+    correct expression, so these are uncopyrightable format facts (merger
+    doctrine; see CONVENTIONS.md §5) — independently re-derived in Zig and
+    cross-checked byte-exact against the real `minisign` 0.12 binary
+    (Debian/Ubuntu package) run as a black-box test oracle. The C source WAS
+    read directly for the exact byte layout, which root NOTICE §0's
+    black-box-oracle carve-out does not cover; that is why it is recorded.
+  - Design reference: jedisct1/zig-minisign (ISC License), named as this
+    module's Zig-ecosystem sibling for API shape per CONVENTIONS §5. Not read
+    line by line; nothing from it is present.
+  - scrypt parameter derivation (ops/mem-limit → N/r/p) reuses Zig std's own
+    `std.crypto.pwhash.scrypt.Params.fromLimits`, which already matches
+    libsodium's `pickparams` algorithm identically. No separate port was
+    needed or done.

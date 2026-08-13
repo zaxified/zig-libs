@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Licensing record. Not breaking and not behavioural — no code
+  changed, only what the module says about one function. `isPrintableComment`
+  is a port of `is_printable` from jedisct1/minisign — its own doc comment has
+  said so all along ("Faithful port of minisign.c's `is_printable`") while the
+  module was recorded as clean-room from format facts. So the module was found
+  to carry extracted upstream material and now attributes it: a new
+  `modules/minisign/NOTICE` reproduces minisign's ISC terms in full and is
+  listed in root NOTICE §1. The condition on a consumer is ISC's only one, keep
+  the notice with the code. The `src/root.zig` module-level doc comment that
+  had reclassified the same function as "a genuine design reference" — the one
+  category that carries no condition — and the README's `Provenance:` line were
+  corrected to match. The merger-doctrine argument the module used to
+  rest on (a thirty-line control-character predicate has few other reasonable
+  expressions) is not disowned; it is recorded in the NOTICE as the argument
+  not taken, because a file arguing no-attribution beside code that calls
+  itself a port is a contradiction a reader has to resolve.
+
 - **2026-08-13** — `KeyPair.generate`'s Ed25519 seed now comes from `entropy.fill`
   (`std.Io.randomSecure`) instead of `io.random`. **Not breaking:** the
   signature is unchanged and so is the on-disk format. New dep:

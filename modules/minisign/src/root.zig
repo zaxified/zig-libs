@@ -68,9 +68,10 @@
 //! jedisct1/minisign's `minisign.h`/`minisign.c` (ISC License) — struct
 //! layouts and algorithm-tag bytes are uncopyrightable format facts (merger
 //! doctrine), independently re-derived and cross-checked byte-exact against
-//! the real `minisign` 0.12 binary. The `isPrintableComment` control-
-//! character/UTF-8 validity check mirrors minisign.c's `is_printable`
-//! algorithm shape — a genuine design reference. See `../NOTICE`.
+//! the real `minisign` 0.12 binary. ONE function is not clean-room: the
+//! `isPrintableComment` control-character/UTF-8 validity check is a port of
+//! minisign.c's `is_printable`, and `../NOTICE` carries the ISC attribution
+//! it owes.
 
 const std = @import("std");
 const entropy = @import("entropy");

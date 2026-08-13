@@ -93,5 +93,7 @@ zig build test-minisign -Doptimize=ReleaseFast --summary all
 
 Provenance: clean-room from the minisign wire-format facts in
 jedisct1/minisign's `minisign.h`/`minisign.c` (ISC License), cross-checked
-byte-exact against the real `minisign` 0.12 binary. See `NOTICE` and
+byte-exact against the real `minisign` 0.12 binary. One function —
+`isPrintableComment` — is a port of minisign.c's `is_printable`; see this
+module's own `NOTICE`, which carries the required ISC attribution, and
 `SPEC.md`.

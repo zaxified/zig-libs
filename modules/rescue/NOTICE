@@ -1,0 +1,209 @@
+rescue — third-party attribution
+
+This file carries a CONDITION. `src/xlix_constants.zig` and
+`src/upstream_vectors.zig` reproduce parameter tables and known-answer values
+extracted from two third-party projects' source — facebook/winterfell and
+miden-crypto — and the MIT terms that material is taken under require each
+project's copyright notice and permission text to travel with it. Both texts
+are reproduced in full below, and root NOTICE §1 lists this file.
+
+WHY THIS FILE EXISTS, 2026-08-14. Until this revision the tables were recorded
+only as provenance — in root NOTICE §2 and in `SPEC.md` — on the reading that
+everything this module takes from Winterfell is a black-box test oracle. That
+reading does not cover the constants. Winterfell's published permutation KAT is
+an oracle; the round-constant tables are not, because they were not observed
+from a running program — they were read out of upstream's Rust source by a
+script and committed here. Reproduced third-party data owes attribution exactly
+as ported source does, the same shape as `bech32` and `brotli`. The RPO half of
+this module is unaffected: those constants are derived, not carried (below).
+
+Required attribution — Winterfell Rescue-XLIX parameters
+--------------------------------------------------------
+
+Files: `src/xlix_constants.zig`, and the Winterfell-sourced values in
+`src/upstream_vectors.zig`.
+
+`ark1` and `ark2` in `src/xlix_constants.zig` — the two 7x12 round-constant
+tables of Winterfell's `Rp64_256` — are reproduced from
+`crypto/src/hash/rescue/rp64_256/mod.rs` in github.com/facebook/winterfell (the
+upstream file's SHA-256 is recorded in the file's own header, alongside the
+extraction command and the commit it was taken at). They are embedded rather
+than derived because they do not reproduce from the published generator: see
+`SPEC.md` §4, "The constants I could not re-derive".
+
+This is DATA extracted from source, not source code: the values are numbers
+lifted out of upstream's Rust literals by script and re-emitted as Zig array
+literals. No Winterfell Rust source — no function, no control flow, no
+comment — is present in this module, and the permutation that consumes these
+tables is this repository's own implementation of the published Rescue-Prime
+construction.
+
+`src/upstream_vectors.zig` carries two further values taken from the same
+project: `winterfell_xlix_perm_in` / `winterfell_xlix_perm_out`, the
+`Rp64_256::apply_permutation` known-answer pair from
+`crypto/src/hash/rescue/rp64_256/tests.rs`, and `published_inv_alpha`, the
+inverse S-box exponent this module also computes for itself. Same character —
+numbers extracted by script, no Rust source — and covered by the same notice.
+
+`mds_row` in `src/xlix_constants.zig` is NOT taken from Winterfell in any
+load-bearing sense: `params.zig` derives that row independently from the RPO
+authors' sage `get_mds`, and `constants_test.zig` asserts the two agree. It is
+listed here only because it sits in the same file and shares its header.
+
+    Copyright (c) Facebook, Inc. and its affiliates.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    THE SOFTWARE.
+
+MIT is permissive and imposes nothing on users of zig-libs beyond keeping the
+notice above with the file. It adds no restriction to zig-libs' own MIT terms.
+
+Required attribution — miden-crypto's RPO-256 known-answer vectors
+------------------------------------------------------------------
+
+File: `src/upstream_vectors.zig`.
+
+`miden_rpo256` — the 19 `Rpo256::hash_elements([0, 1, .., i])` digests — is
+reproduced from the `EXPECTED` constant of `miden-crypto/src/hash/
+algebraic_sponge/rescue/rpo/tests.rs` in github.com/0xMiden/crypto, taken at
+commit 475092a, when that project was still named
+github.com/0xPolygonMiden/crypto (the clone command and the upstream file's
+SHA-256 are in the consuming file's own header, the extraction command sits
+above the table). Same character as the Winterfell values above — numbers lifted out of
+upstream's Rust literals by script and re-emitted as Zig array literals, no
+Rust source of any kind present.
+
+These 19 values are the reason this section exists, and they are the only ones
+in it that are owed. They are not in the RPO report and they do not follow from
+the published specification: they are the digests of miden-crypto's OWN sponge
+framing, whose padding rule and state layout are that project's design
+decisions — upstream changed that layout in a breaking release and every digest
+changed with it (`SPEC.md` records the divergence; `vectors_test.zig` asserts
+that this framing and the report's disagree on every input, as they must).
+Published nowhere but in that project's test source and lifted out of it by
+script, they are reproduced third-party data in root NOTICE §0's sense.
+
+`miden_ark1` / `miden_ark2` sit in the same file and are NOT taken in any
+load-bearing sense — the position `mds_row` holds in the Winterfell section
+above, and for the same reason. All 168 values reproduce from the published
+generator: `params.zig` derives them from SHAKE256 seeded with the
+specification's own seed string, and `constants_test.zig` asserts it equals
+these tables element by element. They are this module's own numbers, which
+upstream's agree with; the copy here is the pin that proves it, not a source of
+truth. `published_inv_alpha` is co-extracted from the same project's
+`rpo/tests.rs` and is likewise computed here (extended Euclid). Neither would
+oblige anything standing alone; both are covered by this notice because they
+share the file with `miden_rpo256`.
+
+LICENSE ELECTION — MIT, not Apache-2.0. miden-crypto is DUAL-licensed: its
+`Cargo.toml` states `license = "MIT OR Apache-2.0"` and the repository ships
+both `LICENSE-MIT` and `LICENSE-APACHE`, at commit 475092a as well as today.
+Which of the two applies is the recipient's choice, and this repository elects
+MIT, reproduced below. Apache-2.0 is deliberately not elected: its §4 attaches
+conditions this repository's notice pattern does not implement — §4(a) requires
+that every recipient of the work be GIVEN a copy of the license, and §4(b) that
+modified files carry prominent notices stating they were changed — whereas root
+NOTICE's whole promise is that every condition in this collection is the same
+MIT-shaped one, keep the notice with the files. Electing MIT keeps that
+promise; electing Apache-2.0 would add conditions for zig-libs consumers when
+upstream offers a licence that adds none. (§4(d), the NOTICE-propagation
+clause, would in any case be moot: upstream ships no `NOTICE` file, only a
+`THIRD_PARTY_NOTICES.txt` covering its own dependencies.)
+
+    The MIT License (MIT)
+
+    Copyright (c) 2025 Miden
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+MIT is permissive and imposes nothing on users of zig-libs beyond keeping the
+notice above with the file. It adds no restriction to zig-libs' own MIT terms.
+
+Provenance — everything else in this module
+-------------------------------------------
+
+Unaffected by the above, and stated here so the boundary is visible.
+
+  - The RPO constants (`params.zig`) are DERIVED at build time by this
+    repository's own implementation of algorithm 5 of eprint 2020/1143, and
+    reproduce miden-crypto's published tables exactly, all 168 values. Nothing
+    is carried into that file; the copies of upstream's tables that live in
+    `upstream_vectors.zig`, as pins, are covered above.
+  - The permutation, its parameters and the constant-derivation rule are public
+    specification facts from the RPO report
+    (github.com/ASDiscreteMathematics/rpo) and eprint 2020/1143 — a public
+    specification is not a copyrightable work (merger doctrine; see
+    CONVENTIONS.md §5).
+  - Running an upstream implementation, or reading a digest it published, as a
+    byte-exact test ORACLE is root NOTICE §0's black-box relationship and needs
+    no attribution. That reading is what this module used to rest on; see the
+    next paragraph for where it stops.
+
+RULED ON 2026-08-14 — the report vectors need no attribution; the miden values
+do. The two upstreams this file previously left open now have answers, and they
+are different answers.
+
+  - `spec_128` / `spec_160` — the 38 published test vectors, 19 per instance —
+    were extracted from `report/report.tex` in
+    github.com/ASDiscreteMathematics/rpo: the LaTeX source of the Rescue-Prime
+    Optimized report (eprint 2022/1577), from its "Test Vectors" listings under
+    "128 Bits Instance" and "160 Bits Instance". That is a published
+    SPECIFICATION, not an implementation — root NOTICE §0's first bullet and
+    CONVENTIONS.md §5 put spec material outside the attribution rule entirely:
+    it is cited, not attributed, and the citation lives in `SPEC.md`. The
+    extraction command above each table parses `report.tex` and the file header
+    records that file's SHA-256, so this is checkable rather than asserted.
+    Nothing is owed to the RPO authors for these values. Note the boundary: the
+    same repository also holds `reference_implementation/
+    rescue_prime_optimized.sage`, which IS an implementation — no table in
+    `upstream_vectors.zig` comes from it (see the open item below).
+  - `miden_rpo256` / `miden_ark1` / `miden_ark2` came out of miden-crypto's
+    Rust source, an implementation, and are attributed above. The licence is
+    now established and is not what the file's previous wording feared unknown:
+    upstream offers MIT or Apache-2.0 and this repository elects MIT.
+
+STILL OPEN, and stated rather than left implicit — a level below this file's
+subject, but visible from it. `params.zig`'s own doc comment describes that
+file as "a line-by-line port of `get_round_constants`, `get_alphas` and
+`get_mds` from the authors' reference implementation
+(`rescue_prime_optimized.sage`)". No numbers are carried from it — the
+constants are generated and the two MDS rows are the report's own published
+table (`params.zig` says so at the literal) — but "port" is the word that made
+`minisign` acquire an attribution file this same day, and
+github.com/ASDiscreteMathematics/rpo is licensed Apache-2.0, which unlike
+miden-crypto offers no MIT alternative. Either the doc comment overstates what
+was taken from the sage (an algorithm published in the report, re-expressed) or
+an attribution is owed there. That is a question about `params.zig`, not about
+the data files this notice covers, and nothing above depends on the outcome.
+

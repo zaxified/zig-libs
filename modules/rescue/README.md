@@ -174,7 +174,10 @@ moved off `@addWithOverflow` tuples (LLVM was spilling them to stack) to
 explicit comparison masks — **27.4 → 18.15 µs**. `SPEC.md` has the rest, plus
 what was deliberately left on the table.
 
-**Provenance:** design references (the RPO authors' sage reference,
-miden-crypto, Winterfell) are named in `SPEC.md`; no third-party source is
-carried into this repo beyond the published constant tables and test vectors
-attributed there.
+**Provenance:** no third-party source code is carried into this repo. Upstream
+constant tables and test vectors ARE reproduced as data, extracted by script —
+`NOTICE` carries the required attribution for the Winterfell- and
+miden-crypto-sourced ones (the RPO report's own published vectors need none,
+being specification material) and says what each is; the design references
+(the RPO authors' sage reference,
+miden-crypto, Winterfell) are named in `SPEC.md`.
