@@ -31,14 +31,17 @@ third-party-derived wire formats & required attributions in `NOTICE`).
 zig build test           # run all module tests
 zig build test-<name>    # run one module's tests
 zig build check-catalog  # verify build.zig's module_list ↔ modules/ ↔ this README agree
+zig build check-changelog # verify the root CHANGELOG index ↔ the per-module changelogs agree
 ```
 
 ## Versioning & stability
 
-One semver for the whole collection — releases are git tags, there are no per-module
-versions. Pre-1.0 semantics: a minor bump may break any module's API; a patch bump is
-fixes-only. Per-release changes live in `CHANGELOG.md`, grouped by module with breaking
-changes flagged. Module maturity is carried by the explicit caveat lines in the catalog
+Releases are dated git tags (`YYYY-MM-DD`), **not** semantic versions, and there are no
+per-module versions; a tag asserts exactly one thing, that every module passed every lane at
+that commit. `v0.1.0` remains as history. Detail lives in `modules/<name>/CHANGELOG.md` with
+breaking changes flagged `BREAKING`; the root `CHANGELOG.md` is the index of which modules
+have one, and `zig build check-changelog` keeps the two in step. Module maturity is carried
+by the explicit caveat lines in the catalog
 below (and each module's `SPEC.md`), not by stability-tier labels — every module meets the
 same bar (tests green in Debug + ReleaseFast, oracle/KAT verification where one exists);
 what varies is *scope*, and anything unfinished is stated where it lives. The full

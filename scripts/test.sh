@@ -199,6 +199,7 @@ harness_smoke() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/test-tag.sh
     step "check-catalog" zig build check-catalog
+    step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
     run_modules "$plain $netns"
@@ -499,7 +500,7 @@ cmd_changed() {
 
     capability_check
 
-    local trigger_all=0 trigger_catalog=0 trigger_graph=0
+    local trigger_all=0 trigger_catalog=0 trigger_graph=0 trigger_changelog=0
     local seeds=" " f name
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
@@ -524,7 +525,16 @@ cmd_changed() {
             README.md)
                 trigger_catalog=1
                 ;;
-            CHANGELOG.md|NOTICE|CONVENTIONS.md)
+            CHANGELOG.md)
+                # NOT "a root doc with no module impact", which is what this
+                # was classified as until `check-changelog` existed: the root
+                # CHANGELOG is an INDEX of the per-module ones, and editing it
+                # is precisely how that index goes out of step with them. A
+                # modules/<m>/CHANGELOG.md edit needs no trigger of its own --
+                # it seeds <m> above, so the unconditional step below runs.
+                trigger_changelog=1
+                ;;
+            NOTICE|CONVENTIONS.md)
                 ;; # root docs with no module impact
             *)
                 ;; # unrecognized root-level file — no module impact
@@ -587,7 +597,7 @@ cmd_changed() {
         fi
     done
 
-    if [[ ${#valid_seeds[@]} -eq 0 && $trigger_catalog -eq 0 ]]; then
+    if [[ ${#valid_seeds[@]} -eq 0 && $trigger_catalog -eq 0 && $trigger_changelog -eq 0 ]]; then
         echo "changed: no modules affected — nothing to test"
         graph_save
         exit 0
@@ -614,6 +624,13 @@ cmd_changed() {
     if [[ $trigger_catalog -eq 1 ]]; then
         step "check-catalog (README.md changed)" zig build check-catalog
     fi
+
+    # Unconditional for the same reason as `check-testonly` below, and reached
+    # by both paths that get here: a changed module (its own CHANGELOG.md is
+    # under modules/, so it seeded the module) and a changed root CHANGELOG.md
+    # (`trigger_changelog`, which is what keeps the early exit above from
+    # skipping this).
+    step "check-changelog" zig build check-changelog
 
     # Always: a testkit leak into published code is introduced by editing a
     # MODULE, not build.zig, so there is no change signal to gate this on --
@@ -657,6 +674,7 @@ cmd_all() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/test-tag.sh
     step "check-catalog" zig build check-catalog
+    step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
     # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
@@ -737,9 +755,9 @@ Usage: scripts/test.sh [subcommand] [args]
                         working-tree/staged/untracked changes — or, with
                         BASE_REF, changes since that ref — plus their
                         reverse-dependency closure.
-  all                   test every module: fmt check + check-catalog + the
-                        full suite + the dark-test check. The pre-commit/CI
-                        gate.
+  all                   test every module: fmt check + check-catalog +
+                        check-changelog + the full suite + the dark-test
+                        check. The pre-commit/CI gate.
                         The dark-test check requires each module's declared
                         `^test ` count to EQUAL the `(N total)` its test binary
                         reports, so a file whose tests were never compiled —

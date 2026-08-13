@@ -65,8 +65,9 @@
 //! CSPRNG** (`std/Io.zig`: "Obtains entropy from a cryptographically secure
 //! pseudo-random number generator") but one whose own doc comment documents a
 //! silent fallback to a weaker seed if the CSPRNG source fails; the default
-//! `Io.Threaded` falls back to a pid+clock+ASLR seed if `/dev/urandom` is
-//! unreachable. A bare `std.Random` parameter would still be worse — it would
+//! `Io.Threaded` falls back to a pid+clock+ASLR seed when `getrandom(2)`
+//! fails, e.g. under a seccomp policy that blocks it. A bare `std.Random`
+//! parameter would still be worse — it would
 //! accept `DefaultPrng.init(0)` at a call site that looks identical to a
 //! correct one — and either failure mode here is not a weakening but a
 //! break: `encrypt`'s `u,e0,e1` are the whole of BFV's IND-CPA claim, so a

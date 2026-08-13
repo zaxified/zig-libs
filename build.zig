@@ -460,6 +460,26 @@ pub fn build(b: *std.Build) void {
     });
     check.dependOn(check_inner);
 
+    // Changelog-index gate: `zig build check-changelog`. The root CHANGELOG.md
+    // is, by its own first line, an INDEX -- one pointer line per module that
+    // has a `modules/<m>/CHANGELOG.md`. Nothing checked that it was one, and it
+    // had drifted by 16 of 55 entries before this existed. A SEPARATE step
+    // rather than a section of `check-catalog` for one reason: `check-catalog`
+    // is driven by `module_list` and reads README/NOTICE, and the change signal
+    // that should run THIS one is editing a CHANGELOG -- which `scripts/test.sh`
+    // classified as a root doc "with no module impact" and used to run nothing
+    // at all for. Its own step is what let that trigger be wired (see
+    // `trigger_changelog` there) without widening `check-catalog`'s.
+    const check_changelog = b.step("check-changelog", "Verify the root CHANGELOG index matches the per-module changelogs");
+    const check_changelog_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_changelog_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-changelog",
+        .owner = b,
+        .makeFn = checkChangelog,
+    });
+    check_changelog.dependOn(check_changelog_inner);
+
     // Fuzz-coverage gate: `zig build check-fuzz`. Deliberately a SEPARATE step
     // from `check-catalog` rather than a section of it -- see `checkFuzz` for
     // why, and for the one-line change that folds it in once the tree is green.
@@ -757,6 +777,198 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
     try checkAnchors(b, io, &failed);
 
     if (failed) return step.fail("catalog drift — see errors above", .{});
+}
+
+/// `zig build check-changelog` — the root CHANGELOG.md is an index, and this
+/// makes it one.
+///
+/// CONVENTIONS §8 splits the changelog: detail lives in
+/// `modules/<m>/CHANGELOG.md`, and the root file carries one pointer line per
+/// module that has one, so a consumer of three modules reads three files. That
+/// split moved the root file from 678 lines to 113 -- and then nothing checked
+/// it. By the time this was written 16 of 55 module changelogs (`acme`, `bbs`,
+/// `bls12_381`, `cookies`, `cors`, `ed448`, `entropy`, `ibe`, `ratelimit`,
+/// `router`, `sessions`, `signal`, `throttle`, `timelock_envelope`, `tlock`,
+/// `wireguard`) had no index line at all, which is the failure mode an index
+/// has: it is silently incomplete, and a consumer who reads it concludes their
+/// module did not change.
+///
+/// Three claims:
+///
+///  1. Every `modules/<m>/CHANGELOG.md` is linked from the root index. Driven
+///     from `module_list`; a `modules/<x>/` that is not in `module_list` is
+///     `check-catalog`'s error, not this one.
+///  2. Every `modules/<m>/CHANGELOG.md` link IN the root index resolves to a
+///     file that exists. Driven from the root file's text, so -- unlike (1) --
+///     it can see an entry that corresponds to nothing. Both directions are
+///     needed for the same reason `checkProvenance`'s claim 4 is: a check
+///     driven only from `module_list` is structurally blind to a stale row.
+///  3. The `BREAKING` tag agrees between the two files.
+///
+/// WHY (3) IS IN, GIVEN THAT IT PARSES PROSE. The index's own text promises
+/// exactly this invariant ("a `BREAKING` tag means the module's own changelog
+/// flags at least one breaking change in its `Unreleased` section"), and it is
+/// the one field of an index line a consumer acts on -- an index that says
+/// nothing broke while the module says something did is worse than a missing
+/// line. The risk is a gate that cries wolf, so the rule was calibrated against
+/// the whole corpus before being adopted, not after:
+///
+///   - The obvious rule -- "the word BREAKING appears" -- is WRONG on the real
+///     tree. `montint`'s entry reads "Classified as **neither BREAKING nor
+///     BEHAVIOURAL**", a deliberate negation, and the naive rule demands the
+///     index tag a constant-time fix as breaking. One false failure out of 39
+///     entries on day one, in the direction that makes people delete gates.
+///   - The rule used instead is the literal `**BREAKING` -- the tag is a bold
+///     span that STARTS with the word. Every one of the 22 occurrences across
+///     the module changelogs is of that shape (`**BREAKING:**`, `**BREAKING**`,
+///     `**BREAKING (wire):**`, `**BREAKING (API):**`, `**BREAKING
+///     (behavioral):**`, `**BREAKING — `), and `montint`'s negation is not,
+///     because its bold span starts with "neither". Measured against all 39
+///     pre-existing index lines: 11 tagged, 11 expected, 0 disagreements.
+///   - It fails OPEN on a spelling nobody uses (`**Breaking:**` would read as
+///     "not breaking" and pass). That is the right direction for a gate whose
+///     alternative is being switched off.
+///
+/// `BEHAVIOURAL, not breaking` -- which `cors`, `ratelimit`, `router` and
+/// `throttle` carry -- is a DIFFERENT classification and deliberately does not
+/// trip this. It contains no `**BREAKING`, so the rule already separates them;
+/// the index states the distinction in prose so nobody re-conflates them.
+///
+/// WHAT IS DELIBERATELY NOT CHECKED: the module count in the index prose
+/// ("the collection grew 77 → 225 modules"). `check-catalog` already pins a
+/// module count against `module_list.len`, in the README, which is the one
+/// place that fact is owned; a second gate on the same fact in a different
+/// file is a second thing to get wrong. Worse, this sentence is release NOTES,
+/// not a live count -- once a tag is cut it freezes with the rest of the
+/// section, and a check keyed to `module_list.len` would then demand editing
+/// released history to keep itself green. That is the shape of a gate people
+/// disable.
+///
+/// SCOPE OF (3), stated so a green run is not over-read: it compares the
+/// `## Unreleased` section of each file. After a tag is cut both sections are
+/// empty and (3) checks nothing, while (1) and (2) keep working off the whole
+/// file. A module that gains a NEW `Unreleased` entry after a tag is caught,
+/// because (3) requires an `Unreleased` index bullet whenever the module's
+/// `Unreleased` has one -- but a module whose `Unreleased` is empty is not
+/// asked about at all.
+fn checkChangelog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    const root = try b.build_root.handle.readFileAlloc(io, "CHANGELOG.md", b.allocator, .limited(4 * 1024 * 1024));
+
+    var failed = false;
+
+    const root_unreleased = unreleasedSection(root) orelse blk: {
+        std.log.err("CHANGELOG.md has no `## Unreleased` section for the changelog gate to check", .{});
+        failed = true;
+        break :blk "";
+    };
+
+    // (1) + (3): every module changelog is indexed, with the right tag.
+    for (module_list) |m| {
+        const path = b.fmt("modules/{s}/CHANGELOG.md", .{m.name});
+        const text = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch continue;
+
+        if (std.mem.indexOf(u8, root, b.fmt("]({s})", .{path})) == null) {
+            std.log.err(
+                "module '{s}' has a {s} that the root CHANGELOG.md never links — add a one-line " ++
+                    "pointer `- [`{s}`]({s})` under \"### Modules with a changelog\". The root file " ++
+                    "is an index (CONVENTIONS.md §8); a module missing from it reads to a consumer " ++
+                    "as a module that did not change.",
+                .{ m.name, path, m.name, path },
+            );
+            failed = true;
+            continue;
+        }
+
+        const mod_unreleased = unreleasedSection(text) orelse continue;
+        // "Has an entry" = has a bullet. A section with only a heading is a
+        // module whose history is all under dated tags, and (3) does not ask
+        // about it.
+        if (std.mem.indexOf(u8, mod_unreleased, "\n- ") == null) continue;
+
+        const bullet_head = b.fmt("- [`{s}`]({s})", .{ m.name, path });
+        const bullet = indexBullet(root_unreleased, bullet_head) orelse {
+            std.log.err(
+                "module '{s}' has an `## Unreleased` entry in {s} but the root CHANGELOG.md's own " ++
+                    "`## Unreleased` index has no `{s}` line for it",
+                .{ m.name, path, bullet_head },
+            );
+            failed = true;
+            continue;
+        };
+
+        // See the rule's calibration in this function's doc comment: the tag is
+        // a bold span STARTING with the word, which is what keeps `montint`'s
+        // "**neither BREAKING nor BEHAVIOURAL**" from being read as a tag.
+        const mod_breaking = std.mem.indexOf(u8, mod_unreleased, "**BREAKING") != null;
+        const idx_breaking = std.mem.indexOf(u8, bullet, "**BREAKING") != null;
+        if (mod_breaking and !idx_breaking) {
+            std.log.err(
+                "module '{s}' flags **BREAKING in its `Unreleased` section but its root CHANGELOG.md " ++
+                    "index line does not — the index promises the tag means exactly this. (If the " ++
+                    "module's entry is `BEHAVIOURAL, not breaking`, it does not carry the tag and " ++
+                    "this would not fire.)",
+                .{m.name},
+            );
+            failed = true;
+        } else if (idx_breaking and !mod_breaking) {
+            std.log.err(
+                "module '{s}' is tagged **BREAKING** in the root CHANGELOG.md index but its own " ++
+                    "`{s}` `Unreleased` section flags no breaking change",
+                .{ m.name, path },
+            );
+            failed = true;
+        }
+    }
+
+    // (2): every index link resolves. Driven from the root file's text, which
+    // is the only direction that can see an entry pointing at nothing.
+    const tail = "/CHANGELOG.md)";
+    const head = "](modules/";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, root, i, tail)) |end| {
+        i = end + tail.len;
+        const before = root[0..end];
+        const p = std.mem.lastIndexOf(u8, before, head) orelse continue;
+        const name = before[p + head.len ..];
+        // A clean module name only. Anything else means this `/CHANGELOG.md)`
+        // did not belong to the `](modules/…` we walked back to.
+        if (name.len == 0 or std.mem.indexOfAny(u8, name, "/()`[] \t\n") != null) continue;
+        if (!fileExists(b, io, b.fmt("modules/{s}/CHANGELOG.md", .{name}))) {
+            std.log.err(
+                "root CHANGELOG.md indexes `modules/{s}/CHANGELOG.md`, which does not exist",
+                .{name},
+            );
+            failed = true;
+        }
+    }
+
+    if (failed) return step.fail("changelog index drift — see errors above", .{});
+}
+
+/// The body of a markdown file's `## Unreleased` section: everything after the
+/// heading up to the next `## `. Null if there is no such heading.
+fn unreleasedSection(text: []const u8) ?[]const u8 {
+    const heading = "## Unreleased";
+    const start = std.mem.indexOf(u8, text, heading) orelse return null;
+    const rest = text[start + heading.len ..];
+    const end = std.mem.indexOf(u8, rest, "\n## ") orelse rest.len;
+    return rest[0..end];
+}
+
+/// One `- […](…)` list item of the index, from `head` to the next item or the
+/// next heading. Index entries are hard-wrapped over several lines, so a
+/// per-line search would only ever see the first of them — and the `BREAKING`
+/// tag is not always on it (`bfv`'s is, `hpke`'s continuation lines are not).
+fn indexBullet(section: []const u8, head: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, section, head) orelse return null;
+    const rest = section[start..];
+    var end = rest.len;
+    if (std.mem.indexOfPos(u8, rest, head.len, "\n- ")) |n| end = @min(end, n);
+    if (std.mem.indexOfPos(u8, rest, head.len, "\n#")) |n| end = @min(end, n);
+    return rest[0..end];
 }
 
 /// Provenance gate: every module says where it came from, and the repository

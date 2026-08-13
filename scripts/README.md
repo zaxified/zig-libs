@@ -49,7 +49,10 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
   run → report path still works, and tells you to run `scripts/test.sh all`
   before committing
 - `scripts/README.md`, `scripts/vm/**` → nothing; neither affects this lane
-- Root docs → no modules, but a `README.md` change still runs `check-catalog`
+- Root docs → no modules, but a `README.md` change still runs `check-catalog`,
+  and a root `CHANGELOG.md` change still runs `check-changelog` (that file is
+  the index of the per-module changelogs, so editing it is exactly how it goes
+  out of step with them)
 
 ### Touching `build.zig` does not mean running everything
 

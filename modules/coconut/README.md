@@ -34,7 +34,7 @@ const coconut = @import("coconut");
 // Setup + trusted-dealer threshold keygen (t-of-n over q attributes).
 const p = try coconut.Parameters.generate(allocator, q);
 defer p.deinit(allocator);
-const keys = try coconut.keygen(allocator, io, q, t, n); // io: std.Io — a CSPRNG by contract
+const keys = try coconut.keygen(allocator, io, q, t, n); // io: std.Io — draws fail closed
 defer keys.deinit(allocator);
 
 // Group verification key from any t vk shares (Lagrange-in-exponent) — REAL.

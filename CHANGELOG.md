@@ -12,11 +12,11 @@ semantic version.
 
 ## Unreleased
 
-The collection grew 77 → 224 modules since v0.1.0, spanning pairing/EC
+The collection grew 77 → 225 modules since v0.1.0, spanning pairing/EC
 crypto, Bitcoin/Lightning, post-quantum, FHE/ZK/MPC, protocol security,
 distributed fabric and kernel/networking. Most of that growth is new
 modules with no history yet to record — their existence is what the
-77 → 224 count above already says. Only modules that changed after being
+77 → 225 count above already says. Only modules that changed after being
 introduced, or that carry an individually-named audit or performance
 finding, have a changelog file; everything else correctly has none.
 
@@ -24,19 +24,37 @@ finding, have a changelog file; everything else correctly has none.
 
 Each entry below is a one-line pointer; the detail lives in the linked
 file. A `BREAKING` tag means the module's own changelog flags at least
-one breaking change in its `Unreleased` section.
+one breaking change in its `Unreleased` section. Note that `BEHAVIOURAL,
+not breaking` — which four of the middleware entries below carry — is a
+different thing and is never tagged `BREAKING` here.
 
+`zig build check-changelog` enforces both halves of this list: a module
+changelog with no entry here, an entry here pointing at no file, and a
+`BREAKING` tag that disagrees with the module's own `Unreleased` section
+all fail the gate. See `CONVENTIONS.md` §8.
+
+- [`acme`](modules/acme/CHANGELOG.md) — new `jws.generateKeyPair(io)`;
+  both certificate-key draws now fail closed.
+- [`bbs`](modules/bbs/CHANGELOG.md) — `proofGen`'s blinding scalars draw
+  fail-closed entropy.
 - [`bfv`](modules/bfv/CHANGELOG.md) — **BREAKING** — `keyGen`/`encrypt`/
-  `genRelinKey` take `std.Io` (a CSPRNG by contract) instead of `std.Random`.
+  `genRelinKey` take `std.Io` instead of `std.Random`; the secret draws
+  fail closed.
 - [`bip340`](modules/bip340/CHANGELOG.md) — runtime-tag tagged hash,
   `xonlyBytesOf`.
+- [`bls12_381`](modules/bls12_381/CHANGELOG.md) — `scalar.Fr.random`
+  draws fail-closed entropy.
 - [`brotli`](modules/brotli/CHANGELOG.md) — encoder now actually
   compresses (LZ77 + Huffman).
 - [`chachapoly`](modules/chachapoly/CHANGELOG.md) — SIMD implementation
   (performance campaign).
 - [`coconut`](modules/coconut/CHANGELOG.md) — **BREAKING** — `keygen`/
-  `proveCredential` take `std.Io` (a CSPRNG by contract) instead of
-  `std.Random`.
+  `proveCredential` take `std.Io` instead of `std.Random`; the secret
+  draws fail closed.
+- [`cookies`](modules/cookies/CHANGELOG.md) — **BREAKING** — `set` no
+  longer takes a caller-supplied buffer; new `max_set_cookie_bytes`.
+- [`cors`](modules/cors/CHANGELOG.md) — BEHAVIOURAL, not breaking: the
+  204 preflight no longer forces an early `ResponseWriter.end()`.
 - [`csvsafe`](modules/csvsafe/CHANGELOG.md) — security-audit fix.
 - [`decimal`](modules/decimal/CHANGELOG.md) — `Decimal`/`BigDecimal`
   interop, new `BigDecimal` ops.
@@ -46,6 +64,11 @@ one breaking change in its `Unreleased` section.
 - [`dtls`](modules/dtls/CHANGELOG.md) — **BREAKING** — HRR (both sides),
   fragment reassembly, live wolfSSL interop, negotiated
   `signature_algorithms`, anti-replay-window fix.
+- [`ed448`](modules/ed448/CHANGELOG.md) — both `KeyPair.generate` entry
+  points draw a fail-closed seed.
+- [`entropy`](modules/entropy/CHANGELOG.md) — new: the fail-closed
+  `fill`/`SecureSource` source for secret-bearing draws
+  (`CONVENTIONS.md` §2.2).
 - [`fss`](modules/fss/CHANGELOG.md) — **BREAKING** — default PRG swapped
   to fixed-key AES-128; `evalFull` for `Dpf`/`Mpf`.
 - [`grpc`](modules/grpc/CHANGELOG.md) — new: gRPC client over HTTP/2.
@@ -54,6 +77,8 @@ one breaking change in its `Unreleased` section.
 - [`http`](modules/http/CHANGELOG.md) — **BREAKING** header/trailer
   bytes are copied (use-after-scope fix); new
   `error.HeaderBytesExhausted`.
+- [`ibe`](modules/ibe/CHANGELOG.md) — `ciphersuite.randomSigma` draws
+  fail-closed entropy; the master secret key follows `bls12_381`.
 - [`json5`](modules/json5/CHANGELOG.md) — security-audit fix.
 - [`k256`](modules/k256/CHANGELOG.md) — new `ecdsa_recover`; asm/Montgomery
   core (performance campaign).
@@ -82,25 +107,45 @@ one breaking change in its `Unreleased` section.
   hash over `bn254`/`bls12_381`.
 - [`ramcache`](modules/ramcache/CHANGELOG.md) — new thread-safe `Sharded`
   option.
+- [`ratelimit`](modules/ratelimit/CHANGELOG.md) — BEHAVIOURAL, not
+  breaking: the 429 deny path no longer forces an early
+  `ResponseWriter.end()`.
 - [`rescue`](modules/rescue/CHANGELOG.md) — new: Rescue-Prime Optimized
   over Goldilocks.
+- [`router`](modules/router/CHANGELOG.md) — BEHAVIOURAL, not breaking:
+  the trailing-slash redirect no longer forces an early
+  `ResponseWriter.end()`.
 - [`saml`](modules/saml/CHANGELOG.md) — **BREAKING** — cross-form
   Holder-of-Key confirmation.
 - [`security-headers`](modules/security-headers/CHANGELOG.md) —
   **BREAKING** — `init` now fallible, rejects a CSP that would exceed
   `http`'s header-byte budget at config time instead of 500ing at
   request time.
+- [`sessions`](modules/sessions/CHANGELOG.md) — `Manager.newId` mints
+  every session id from fail-closed entropy.
+- [`signal`](modules/signal/CHANGELOG.md) — new
+  `x3dh.generateKeyPair(io)`; all four production key draws fail closed.
 - [`snmp`](modules/snmp/CHANGELOG.md) — **BREAKING** — library-generated
   USM privacy salt.
 - [`stun`](modules/stun/CHANGELOG.md) — security-audit memory-safety fix.
 - [`tfhe`](modules/tfhe/CHANGELOG.md) — **BREAKING** — keygen/encrypt entry
-  points take `std.Io` (a CSPRNG by contract) instead of `std.Random`.
+  points take `std.Io` instead of `std.Random`; the secret draws fail
+  closed.
 - [`threshold_ecdsa`](modules/threshold_ecdsa/CHANGELOG.md) —
   **BREAKING** — Paillier generator bound into Fiat-Shamir transcript.
+- [`throttle`](modules/throttle/CHANGELOG.md) — BEHAVIOURAL, not
+  breaking: the 503 shed path no longer forces an early
+  `ResponseWriter.end()`.
+- [`timelock_envelope`](modules/timelock_envelope/CHANGELOG.md) —
+  `SealRandomness.generate` draws all three values fail-closed.
+- [`tlock`](modules/tlock/CHANGELOG.md) — `ciphersuite.randomSigma`
+  draws fail-closed entropy.
 - [`tsdb`](modules/tsdb/CHANGELOG.md) — new: time-series persistence over
   `kvtree`.
 - [`validate`](modules/validate/CHANGELOG.md) — security-audit O(n²)-DoS
   hardening.
+- [`wireguard`](modules/wireguard/CHANGELOG.md) — `Keypair.generate` and
+  `CookieChecker`'s three draws fail closed.
 - [`x509`](modules/x509/CHANGELOG.md) — new `spkiOf`; security-audit
   memory-safety fix.
 - [`zipstream`](modules/zipstream/CHANGELOG.md) — security-audit fix.
@@ -116,7 +161,9 @@ one breaking change in its `Unreleased` section.
   peers, and several constant-time leaks were fixed, in modules not
   individually named for either.
 - **Tooling:** `zig build check-catalog` consistency gate added (found
-  and fixed 6 modules missing README catalog rows).
+  and fixed 6 modules missing README catalog rows), and
+  `zig build check-changelog` for this index (found 16 module changelogs
+  it had never listed — nothing had ever checked it).
 - **Policy:** dated-tag versioning + spin-off policy adopted
   (`CONVENTIONS.md` §8); this changelog split is one product of it.
 

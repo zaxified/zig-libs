@@ -49,7 +49,8 @@ pub const KeysError = error{
 /// fail-closed on `std.Io.randomSecure`, not the silently-degrading
 /// `std.Io.random` (`std/Io.zig`'s `random` doc: falls back to a weaker seed
 /// on failure; the default `Io.Threaded` falls back to a pid+clock+ASLR seed
-/// if `/dev/urandom` is unreachable). So `.io` already meets the bar
+/// when `getrandom(2)` fails, e.g. under a seccomp policy that blocks it).
+/// So `.io` already meets the bar
 /// `CONVENTIONS.md` §2.2 sets — transitively, through `bls12_381`, without
 /// this module importing `entropy` itself. The seeded arm still exists —
 /// this module's own tests need reproducible issuance, and there is no

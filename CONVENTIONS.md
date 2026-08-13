@@ -346,7 +346,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   asserts exactly that and nothing more: *every module passed every lane here*. There are no
   per-module version numbers and no collection-wide semantic version.
   **Why not semver.** Zig resolves dependencies by URL + hash — no resolver reads a version
-  string — so a semver tag carries no mechanism, only signal, and on a 224-module collection
+  string — so a semver tag carries no mechanism, only signal, and on a 225-module collection
   the signal would be false: one number cannot describe modules ranging from externally
   anchored to never consumed. It is also uninformative in the direction semver exists for.
   A consumer using three modules learns nothing from "the collection went 2.0"; a major bump
@@ -360,6 +360,22 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   `CHANGELOG.md` stays as the per-release index — which modules a tag touched — and does not
   restate the detail. A consumer of three modules should be able to answer "what changed for
   me" by reading three files, not by scanning every release section of one.
+- **The index is enforced**: `zig build check-changelog` (run by `scripts/test.sh` in both
+  the `all` and `changed` lanes, so CI runs it) fails when a `modules/<name>/CHANGELOG.md`
+  has no entry in the root index, when an index entry points at a module changelog that does
+  not exist, or when the `BREAKING` tag disagrees between the two. Nothing checked this until
+  it existed and the index had drifted by **16 of 55** entries — the failure mode of an index
+  being that it is silently incomplete, so a consumer reads it and concludes their module did
+  not change. The `BREAKING` half matches the literal `**BREAKING` — a bold span that STARTS
+  with the word — because the obvious "does the word appear" rule is wrong on this tree:
+  `montint`'s entry reads "Classified as **neither BREAKING nor BEHAVIOURAL**" and that rule
+  demands the index tag a constant-time fix as breaking. **`BEHAVIOURAL, not breaking` is a
+  third classification, not a synonym for either** — `cors`, `ratelimit`, `router` and
+  `throttle` carry it, it is not tagged `BREAKING` in the index, and the gate agrees. The
+  module-count sentence in the index prose is deliberately NOT checked: `check-catalog`
+  already owns that fact against `module_list.len` in the README, and the sentence is release
+  notes that freeze when a tag is cut. See `checkChangelog` in `build.zig` for the full
+  calibration and for what a green run does not prove.
 - **Maturity = explicit caveats, not tier labels.** Every module meets the same bar (§6/§7:
   tests green in Debug + ReleaseFast, oracle/KAT verification where one exists). What varies
   is *scope*: anything unfinished or unverified is stated as an explicit caveat in the

@@ -35,7 +35,8 @@
 //! cryptographically secure pseudo-random number generator") but that same
 //! doc comment documents a silent fallback to a weaker seed if the CSPRNG
 //! source fails; the default `Io.Threaded` falls back to a pid+clock+ASLR
-//! seed if `/dev/urandom` is unreachable. A bare `std.Random` parameter would
+//! seed when `getrandom(2)` fails, e.g. under a seccomp policy that blocks
+//! it. A bare `std.Random` parameter would
 //! be worse still — it would accept `DefaultPrng.init(0)` at a call site that
 //! looks identical to a correct one — and either failure mode here does not
 //! weaken this scheme, it removes it. With `e` and `a` predictable,
