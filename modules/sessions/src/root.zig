@@ -987,6 +987,80 @@ test "insecure escape hatch drops Secure; default keeps it" {
     try testing.expect(!insecure.secure);
 }
 
+/// The handler/middleware half of the dead-frame test below: mint a session
+/// with a KNOWN id in a `Session` that lives entirely on THIS frame (mirroring
+/// `middlewareRun`'s own `s: Session` local, which is exactly what happens in
+/// production — `middlewareRun` calls `m.save(ctx.res, &s)` after the handler
+/// returns, and `m.save` runs `writeCookie`, which formats its own `cookie_buf`
+/// too), then call the real `Manager.save` and return.
+///
+/// A separate `noinline` function, not a block inside the test, and that is
+/// the whole point: Zig gives each local its own slot for the enclosing
+/// function's entire body in Debug, so a block scope frees nothing and a
+/// borrowed-slice bug would stay invisible. Only a returned frame is really
+/// reusable. Mirrors `http`'s `setFromDeadFrame` and `cookies`'s.
+noinline fn setFromDeadFrame(m: *const Manager, res: *http.Server.ResponseWriter) void {
+    var s: Session = .{};
+    // A fixed, known id instead of `m.create`'s CSPRNG draw — the wire
+    // assertion below needs an exact expected value, not just "looks like
+    // hex". 64 bytes, all landing inside this frame's `s.id_buf`.
+    const known_id = "deadbeef" ** 8;
+    @memcpy(s.id_buf[0..known_id.len], known_id);
+    s.id_len = known_id.len;
+    s.created_ns = 1;
+    s.last_seen_ns = 1;
+    s.generation = 0; // unstored ⇒ save's CAS is a create, and succeeds
+    m.save(res, &s);
+}
+
+/// Reuse the frame `setFromDeadFrame` just left, the way the next call down
+/// the stack would have. Bigger than `setFromDeadFrame` PLUS `Manager.save` /
+/// `writeCookie` nested under it, so it covers every slot in both; `noinline`
+/// + `doNotOptimizeAway` so neither the call nor the stores can be optimized
+/// out.
+noinline fn clobberDeadFrame() void {
+    var scratch: [16384]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "Manager.save: the session id in the Set-Cookie survives writeCookie's dead frame" {
+    // What this pins: `Manager.writeCookie` formats the `Set-Cookie` value
+    // into its own stack buffer and hands it to `addSetCookie`, which is
+    // `setHeader`'s cousin — both copy into the response writer's own
+    // `header_buf` at call time (see `http`'s `ResponseWriter.dupe`). Without
+    // that copy this would be a borrowed slice into a frame (`writeCookie`'s,
+    // nested inside `setFromDeadFrame`'s) that is gone by the time `end()`
+    // runs: `writeHead` runs inside `end()`, and both servers call `end()`
+    // AFTER `middlewareRun` — which is where `Manager.save` is called from —
+    // has already returned. Reproduced here with no server at all:
+    // `setFromDeadFrame` IS `middlewareRun`'s post-handler half, and the
+    // clobber is what the next stack user would have written over it.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    setFromDeadFrame(&m, &rw);
+    clobberDeadFrame();
+
+    try rw.end();
+    const wire = out.buffered();
+
+    // The id, read back off the wire after every byte of its source frame
+    // was overwritten, plus the hardening attributes `writeCookie` always
+    // sets on a live session cookie.
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: session=" ++ ("deadbeef" ** 8) ++ "; Path=/; Max-Age=10; Secure; HttpOnly; SameSite=Lax\r\n") != null);
+    // …and not one byte of the clobber pattern anywhere on it.
+    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+}
+
 // ── middleware tests (offline — through http.Server.serveStream) ─────────────
 
 const App = struct {

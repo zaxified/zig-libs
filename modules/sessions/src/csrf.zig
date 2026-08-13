@@ -199,6 +199,69 @@ test "token/verify round-trip; wrong session id and tamper fail" {
     try testing.expect(!c.verify("session-A", "zz" ++ ("0" ** 62)));
 }
 
+/// The handler/middleware half of the dead-frame test below: issue a token
+/// cookie for a fixed session id and return. `Csrf.issue` formats the raw
+/// HMAC into a stack `hexbuf`, builds the `Set-Cookie` value into a stack
+/// `cookie_buf`, and hands the result to `addSetCookie` — both buffers live
+/// only inside `issue`'s own frame, which mirrors how `middlewareRun` calls
+/// `c.issue(ctx.res, session_id)` on the trailing side of `next.run`, i.e.
+/// after the handler has already returned.
+///
+/// A separate `noinline` function, not a block inside the test: Zig gives
+/// each local its own slot for the enclosing function's entire body in
+/// Debug, so a block scope frees nothing and a borrowed-slice bug would stay
+/// invisible. Only a returned frame is really reusable. Mirrors `http`'s
+/// `setFromDeadFrame` and `cookies`'s.
+noinline fn setFromDeadFrame(c: *const Csrf, res: *http.Server.ResponseWriter) void {
+    c.issue(res, "sess-dead-frame");
+}
+
+/// Reuse the frame `setFromDeadFrame` just left, the way the next call down
+/// the stack would have. Bigger than `setFromDeadFrame` PLUS `issue` nested
+/// under it; `noinline` + `doNotOptimizeAway` so neither the call nor the
+/// stores can be optimized out.
+noinline fn clobberDeadFrame() void {
+    var scratch: [4096]u8 = undefined;
+    @memset(&scratch, '#');
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "Csrf.issue: the token Set-Cookie survives issue's dead frame" {
+    // What this pins: `addSetCookie` (like `setHeader`) copies its bytes into
+    // the response writer's own `header_buf` at call time — see `http`'s
+    // `ResponseWriter.dupe`. Without that copy, the token `issue` computes
+    // and formats would be a borrowed slice into a frame that is gone by the
+    // time `end()` runs: `writeHead` runs inside `end()`, and both servers
+    // call `end()` AFTER `middlewareRun` (where `c.issue` is called from) has
+    // already returned. Reproduced here with no server at all:
+    // `setFromDeadFrame` IS `middlewareRun`'s trailing half, and the clobber
+    // is what the next stack user would have written over it.
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    const c = Csrf{ .key = @splat(0x99) };
+    setFromDeadFrame(&c, &rw);
+    clobberDeadFrame();
+
+    try rw.writeAll("ok");
+    try rw.end();
+    const wire = out.buffered();
+
+    // The exact expected token, computed independently (not read off the
+    // dead frame), read back off the wire after every byte of its source was
+    // overwritten.
+    var want: [token_hex_len]u8 = undefined;
+    const expect_tok = c.token("sess-dead-frame", &want);
+    var expect_line_buf: [256]u8 = undefined;
+    const expect_line = std.fmt.bufPrint(&expect_line_buf, "Set-Cookie: csrf_token={s}; Path=/; Secure; SameSite=Lax\r\n", .{expect_tok}) catch unreachable;
+    try testing.expect(std.mem.indexOf(u8, wire, expect_line) != null);
+    // …and not one byte of the clobber pattern anywhere on it.
+    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+}
+
 test "different keys produce different (non-cross-verifying) tokens" {
     const c1 = Csrf{ .key = @splat(1) };
     const c2 = Csrf{ .key = @splat(2) };
