@@ -103,6 +103,10 @@ pub fn Modint(comptime max_bits: comptime_int) type {
 
         /// Build a modulus from a big-endian byte string. Rejects even moduli,
         /// moduli < 3, and values that do not fit in `max_bits`.
+        ///
+        /// **NOT constant-time in `bytes`** — see `elemFromBytesBE`. A modulus
+        /// is a public value in every use this module was built for, so that
+        /// is not a defect here, but it is a contract callers must know.
         pub fn fromBytesBE(bytes: []const u8) Self.Error!Self {
             const v = try elemFromBytesBE(Self, bytes);
             return fromElem(v);
@@ -165,6 +169,10 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         // ── domain conversion ───────────────────────────────────────────────
 
         /// Reduce a big-endian byte string into a normal-domain element `< m`.
+        ///
+        /// **NOT constant-time in `bytes`** — see `elemFromBytesBE`. Load
+        /// PUBLIC encodings with this; build secret values through `fromElem`
+        /// from a branchless limb loader, the way `rsa` and `paillier` do.
         pub fn elementFromBytesBE(self: *const Self, bytes: []const u8) Self.Error!Elem {
             const v = try elemFromBytesBE(Self, bytes);
             if (limbs.cmp(&v, &self.m) != .lt) return error.NonCanonical;
@@ -497,7 +505,21 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         inline fn blackBox(x: u64) u64 {
             // Inline asm cannot run at comptime, and a comptime evaluation has
             // no timing to protect: `fromElem`/`computeConstants` reach
-            // `condSubTop` and must stay comptime-evaluable.
+            // `condSubTop`, and this guard is the only reason they can be
+            // evaluated at comptime at all — without it a `comptime
+            // M.fromElem(…)` is a compile error at the `asm volatile` below.
+            //
+            // Necessary, but NOT sufficient, and the missing half is the
+            // CALLER's: `computeConstants` runs `128·L` `doubleMod`s, so a
+            // comptime caller must also raise its own `@setEvalBranchQuota`
+            // (the default 1000 backwards branches is not enough at any
+            // width). Any doc that promises comptime-evaluability has to say
+            // that too. No production caller in this repo evaluates montint at
+            // comptime today — deleting this guard left all 22 modules of the
+            // reverse-dependency closure green — so the test "blackBox: the
+            // `@inComptime` guard …" below is deliberately the only exerciser,
+            // and it is what turns a deletion into a compile error instead of
+            // a silent loss of the property.
             if (@inComptime()) return x;
             return asm volatile (""
                 : [ret] "=r" (-> u64),
@@ -578,6 +600,31 @@ pub fn negInvMod2_64(x: u64) u64 {
     return 0 -% y; // -(x⁻¹)
 }
 
+/// Load a big-endian byte string into `L` little-endian limbs.
+///
+/// **This loader is NOT constant-time in the byte VALUES, by construction.**
+/// Two branches depend on the data rather than on the length: `if (byte == 0)
+/// continue;` skips the whole limb-write for a zero byte, and `if (sh != 0 and
+/// (wide >> 64) != 0)` performs the cross-limb spill only when the shifted byte
+/// actually crosses a limb boundary. Both make the work and the store pattern a
+/// function of the input, so an encoding's zero-byte positions are observable.
+///
+/// That is a deliberate trade, not an oversight, and it is a CONTRACT rather
+/// than a defect only because no secret reaches it:
+///
+///   * `vdf` is the only consumer that calls the public loaders
+///     (`group.zig:102`/`:110`), on the group modulus `N` and on validated
+///     group elements — both public by the construction's own definition.
+///   * `rsa` and `paillier` deliberately do NOT use them: both build their
+///     Montgomery contexts through a branchless `beToLimbs` + `fromElem`
+///     (`paillier/src/root.zig:207-209` says so in as many words), which is
+///     the pattern any caller loading secret material must copy.
+///
+/// The reject paths (`error.Overflow` here, `error.NonCanonical` in
+/// `elementFromBytesBE`) are contract errors on public shape and are branches
+/// this function must take. `scripts/ctgrind.sh` does not measure any of this
+/// — the harness never taints a byte string, precisely because a leak here
+/// would be reporting the documented behaviour rather than a regression.
 fn elemFromBytesBE(comptime M: type, bytes: []const u8) M.Error!M.Elem {
     var v = std.mem.zeroes(M.Elem);
     if (bytes.len == 0) return v;
@@ -628,6 +675,78 @@ test "negInvMod2_64: m·(-m⁻¹) ≡ -1 mod 2^64" {
         const ni = negInvMod2_64(m);
         try std.testing.expectEqual(@as(u64, 0), m *% ni +% 1);
     }
+}
+
+// ── dispatch constants: the VALUE, not just the mechanism ───────────────────
+
+test "asm_min_limbs: the dispatch cutoff is pinned by value, and by what it selects" {
+    // `asm_min_limbs` decides whether a given modulus runs the hand-written
+    // `MULX/ADCX/ADOX` core or the portable CIOS, and until this test nothing
+    // asserted it: raising it to 64 left `zig build test-montint` AND all 22
+    // modules of the reverse-dependency closure green, because the
+    // asm↔portable differentials call `asm_core` DIRECTLY rather than through
+    // this dispatch. The consequence is worse for the audit than for speed —
+    // `scripts/ctgrind.sh`'s `asmcore` target (`Modint(2048)`) would keep
+    // reporting `--check: OK` while silently measuring the portable path, so
+    // the asm core's constant-time claim would quietly stop being measured
+    // with every green light still lit.
+    //
+    // Asserting the VALUE is the point. A test phrased in terms of the
+    // constant (`L >= asm_min_limbs`) re-derives the dispatch rule and passes
+    // for any value it is given; these two rows fail when the value moves.
+    try std.testing.expectEqual(@as(usize, 32), asm_min_limbs);
+    try std.testing.expectEqual(@as(usize, 8), sqr_min_limbs);
+
+    // …and what that value means at the sizes that motivate it. Guarded on
+    // `asm_active` because off amd64 — or with `gate.asm_core_implemented`
+    // false — every size is portable by design, and that is not a regression.
+    if (asm_active) {
+        // Full-width RSA-2048 (verify, blinding) and the RSA-4096 CRT half.
+        // This is also the width `ctgrind_harness.zig`'s `asmcore` target
+        // uses, and its whole claim depends on this being true.
+        try std.testing.expect(Modint(2048).dispatchesToAsm());
+        try std.testing.expect(Modint(4096).dispatchesToAsm());
+        // The RSA-2048 CRT half — the secret `dP`/`dQ` path, and the width the
+        // 2026-08-13 timing fix was about. Portable, by this cutoff.
+        try std.testing.expect(!Modint(1024).dispatchesToAsm());
+        // The pairing fields the cutoff exists to protect from a 2.4×
+        // slowdown: `bls12_381` Fp (L=6) and `bn254` Fp (L=4).
+        try std.testing.expect(!Modint(381).dispatchesToAsm());
+        try std.testing.expect(!Modint(254).dispatchesToAsm());
+    } else {
+        try std.testing.expect(!Modint(4096).dispatchesToAsm());
+    }
+}
+
+test "blackBox: the `@inComptime` guard is what keeps fromElem comptime-evaluable" {
+    // `blackBox` is `asm volatile`, which cannot run at comptime. The guard
+    // `if (@inComptime()) return x;` is the only thing that lets `fromElem` →
+    // `computeConstants` → `doubleMod` → `condSubTop` be evaluated at comptime,
+    // and until this test nothing exercised it: deleting the guard left all 22
+    // modules of the reverse-dependency closure GREEN, because no production
+    // caller evaluates montint at comptime. Verified by mutation, twice:
+    //
+    //   * guard deleted → this file no longer compiles,
+    //     "unable to evaluate comptime expression" at the `asm volatile`.
+    //   * `@setEvalBranchQuota` below removed → this file no longer compiles,
+    //     "evaluation exceeded 1000 backwards branches".
+    //
+    // The second is the point the guard's comment used to omit: the property
+    // holds only with BOTH, and the quota is the caller's responsibility, not
+    // montint's. `128·L` `doubleMod`s is well past the default budget.
+    @setEvalBranchQuota(2_000_000);
+    const M = Modint(128);
+    const mv = [_]u64{ 1_000_003, 0 };
+    const m_ct = comptime (M.fromElem(mv) catch unreachable);
+
+    // Comptime-evaluable is only worth anything if it computes the same thing:
+    // the guard returns `x` unchanged, so the barrier must be semantically
+    // transparent and both paths must agree limb-for-limb.
+    const m_rt = try M.fromElem(mv);
+    try std.testing.expectEqual(m_rt.n0inv, m_ct.n0inv);
+    try std.testing.expectEqualSlices(u64, &m_rt.m, &m_ct.m);
+    try std.testing.expectEqualSlices(u64, &m_rt.r2, &m_ct.r2);
+    try std.testing.expectEqualSlices(u64, &m_rt.one_mont, &m_ct.one_mont);
 }
 
 // ── condSubTop boundary coverage ────────────────────────────────────────────
@@ -826,14 +945,16 @@ test "public byte loaders instantiate and round-trip (regression: Modint.Error a
     // at all (montint's other tests build moduli via `fromElem`, never the
     // byte loaders, so the missing alias was latent). This test both pins the
     // fix and checks the loaders' arithmetic against `elemFromBytesBE`.
+    // Nothing here is a constant-time claim: `elemFromBytesBE` documents its
+    // value-dependent zero-byte skip, and these are public encodings.
     const M = Modint(256);
     // Odd 128-bit-ish modulus with a nonzero high limb (spans >1 limb).
     const m_be = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
     const mod: M.Error!M = M.fromBytesBE(&m_be);
     const modulus = try mod;
 
-    // A reduced element loaded from bytes; must equal the branch-clean loader
-    // and survive a Montgomery round trip.
+    // A reduced element loaded from bytes; must survive a Montgomery round
+    // trip unchanged.
     const a_be = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33 };
     const a: M.Error!M.Elem = modulus.elementFromBytesBE(&a_be);
     const a_elem = try a;

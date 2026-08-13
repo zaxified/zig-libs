@@ -217,10 +217,20 @@ fn montParamsFromModulus(mod: Modulus) MontParams {
     inline while (s <= mont_max_limbs) : (s += mont_step) {
         if (s == slot) {
             const M = montint.Modint(s * 64);
-            // NB: montint's `fromBytesBE`/`elementFromBytesBE` are currently
-            // broken (they reference `Self.Error`, which `Modint` does not
-            // expose — a latent bug, never instantiated by montint's own tests),
-            // so build via `fromElem` from a branchless-loaded limb array.
+            // NB: build via `fromElem` from a branchless-loaded limb array
+            // rather than montint's `fromBytesBE` — that loader skips zero
+            // bytes, so its work depends on the input's byte VALUES (montint
+            // SPEC.md § "Constant-time contract" states this as an explicit
+            // exclusion). This function is called on the SECRET CRT primes
+            // `p` and `q`, not only on the public `n`, so the branchless load
+            // is load-bearing here and not a style preference.
+            //
+            // (The older reason given here — that the loaders were "currently
+            // broken", referencing a `Self.Error` that `Modint` did not
+            // expose — has been stale since before 2026-07-21: the alias is
+            // present, pinned by montint's own regression test, and routing
+            // this call through `M.fromBytesBE` compiles and leaves all 76
+            // `test-rsa` tests green. Verified 2026-08-13, then reverted.)
             const mm = M.fromElem(beToLimbs(s, &be)) catch unreachable; // odd, ≥3, fits
             mp.n0inv = mm.n0inv;
             @memcpy(mp.m[0..s], &mm.m);

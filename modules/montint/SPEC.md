@@ -108,6 +108,19 @@ Same guarantee `ff` gives (best-effort CT), enforced structurally:
 - `limbs.cmp`: inspects every limb regardless of where the values first differ.
 - `add`/`sub`: conditional add/subtract via a mask, no data-dependent branch.
 
+**Explicitly outside the contract: the byte loaders.** `fromBytesBE`,
+`elementFromBytesBE` and the shared `elemFromBytesBE` branch on the byte VALUES,
+not just on the length — `if (byte == 0) continue;` skips a zero byte's limb
+write entirely, and the cross-limb spill fires only when the shifted byte
+actually crosses a boundary. An encoding's zero-byte positions are therefore
+observable. This is a contract, not a defect, because no secret reaches them:
+`vdf` is the only consumer of the public loaders and passes the public modulus
+`N` and validated (public) group elements; `rsa` and `paillier` deliberately
+route around them, building their Montgomery contexts through a branchless
+`beToLimbs` + `fromElem`. **A caller loading secret material must do the same.**
+The ctgrind harness never taints a byte string, so none of this is measured —
+measuring it would only re-report the documented behaviour.
+
 "Structurally" is not enough on its own, and this module has the measurement to
 prove it — see the section below. Every secret-derived mask in `montint.zig`
 (the `powMont` gather mask, `condSubTop`'s subtract mask, `sub`'s add-back mask)
@@ -134,18 +147,33 @@ names `montint.zig`, `limbs.zig` or `asm_core.zig`):
 | `small` | `Modint(256)`, L=4 | portable CIOS (both cutoffs missed) | yes | **yes** | 8 | **0** ✅ *(was 7)* | 99 |
 | `small` | | | yes | no | 0 | 0 | 0 *(control)* |
 | `small` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `portable` | `Modint(1024)`, L=16 | portable CIOS + `montSqrCios` | yes | **yes** | 2 | **0** ✅ *(was 5)* | 99 |
+| `portable` | `Modint(1024)`, L=16 | portable CIOS + `montSqrCios` | yes | **yes** | 4 | **0** ✅ *(was 5)* | 99 |
 | `portable` | | | yes | no | 0 | 0 | 0 *(control)* |
 | `portable` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `asmcore` | `Modint(2048)`, L=32 | `asm_core.montMul`/`montSqr` | yes | **yes** | 2 | **0** ✅ *(was 0)* | 99 |
+| `asmcore` | `Modint(2048)`, L=32 | `asm_core.montMul`/`montSqr` | yes | **yes** | 4 | **0** ✅ *(was 0)* | 99 |
 | `asmcore` | | | yes | no | 0 | 0 | 0 *(control)* |
 | `asmcore` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
 
 `small` and `portable` taint both operands / both the base and the EXPONENT;
-`portable` and `asmcore` run a full `powMont`. The totals stay non-zero (8 / 2 /
-2) because the harness prints its results through a hex formatter that is not
+`portable` and `asmcore` run a full `powMont`. The totals stay non-zero (8 / 4 /
+4) because the harness prints its results through a hex formatter that is not
 constant-time — that is the propagation witness which makes the in-file zeros
 readable, and `total_min` in `scripts/ctgrind-expected.tsv` asserts it fired.
+Under the classifier's `witness`/`unattr` columns every one of those 8 / 4 / 4 is
+accounted for as formatting and **0 are unattributed** — so the in-file zeros are
+zeros of a complete partition, not of a filter that dropped what it could not
+name.
+
+**`sub` at every width, added 2026-08-13.** The `portable` and `asmcore` totals
+read 2 and 2 when this table was first written, because `runPow` did not call
+`sub` — `sub` is not on the `powMont` path, so it was measured at L=4 only, by
+`small`. That was a real gap and not a formality: the leak class here is LLVM
+re-deriving `mask ∈ {0, ~0}` at a comptime-known, fully unrolled `L`, so every
+`L` is separate codegen with its own verdict — and **L=16 is the RSA-2048 CRT
+width this whole fix was about**. `runPow` now drives one `sub`, which covers
+L=16 and L=32 without a fourth target; the totals moved 2 → 4 on both rows (two
+more tainted bytes reaching the formatter) and the in-file counts stayed **0**.
+The teeth for those two new rows are in the control table below.
 
 **What the 7 and the 5 were.** Every one was the same shape — LLVM recovered
 `bit ∈ {0,1}` from a borrow, concluded the mask is `0` or all-ones, and rewrote
@@ -215,6 +243,7 @@ byte-identical afterwards):
 | `if (digit != 0)` around `powMont`'s window multiply | `portable` 5 → 6 and **`asmcore` 0 → 1**, at the mutated line |
 | `asm_core.condSub`'s masked pass 2 → `if (under == 1) return;` | **`asmcore` 0 → 5**, at `asm_core.zig:491`, reached from both `montMulAmd64` and `montSqrAmd64` — which also proves the taint really propagates *through* the inline-asm Montgomery blocks |
 | **after the fix:** `condSubTop` restored to the old select-between-buffers form | `small` 0 → **6**, `portable` 0 → **5**, at `condSubTop` — the defect class is still detectable and the barrier is what removed it (the 7th `small` context stays away because `sub` is separately fixed, which is also how the 7 splits 6 + 1) |
+| **2026-08-13, for the new `sub` rows:** `blackBox` dropped from `sub`'s add-back mask only | `small` 0 → **1**, `portable` 0 → **1**, `asmcore` 0 → **1**, leaf frame `sub` in all three (`montint.zig:214` at L=4; at L=16/32 `sub` is fully inlined into `runPow` and ReleaseFast reports the frame as `sub (montint.zig:0)`, with `runPow (ctgrind_harness.zig:198)` — the new call site — directly below it). This is what makes the two new zeros readable, and it is also the first evidence that `sub`'s barrier is load-bearing at L=16 and L=32 rather than only at L=4 |
 
 A null result worth recording: replacing `sub`'s masked add-back with an explicit
 `if (borrow == 1)` changed **nothing** (7 → 7) — because that site was already
@@ -262,15 +291,49 @@ caught the same way this one was.
    That last one is not decoration: dropping `s2[1]` from the outgoing borrow
    left the KATs, both differentials, the BrokenMont control and the random
    sweep **all green**, and is caught only by the constructed case.
-   **The same term exists in `asm_core.condSub`, and was equally untested** —
-   this conditional subtract is written twice in the module, and in both copies
-   the `s[1] | s2[1]` borrow is easy to drop and nearly impossible to notice:
-   `b2 = s[1]` alone kept the entire suite green in each. `asm_core.zig` now
-   carries the mirror-image constructed pair, built at `n = 32` (the smallest
-   width the dispatch routes there) against a full-width modulus — which also
+   **The same term exists in `asm_core.condSub`** — the conditional subtract is
+   written twice in the module — **and it appears twice within each copy**, once
+   in the borrow-learning pass 1 and once in the subtracting pass 2. That is
+   four instances of `s[1] | s2[1]`, and each needs an input of its own; an
+   earlier revision of this section claimed the routine was covered "in both
+   copies", which was true of pass 2 and false of `condSub`'s pass 1.
+   `asm_core.zig` now carries both, each built at `n = 32` (the smallest width
+   the dispatch routes there) against a full-width modulus — which also
    discharges the `value < 2m` precondition for free, since `m ≥ 2^2047` makes
-   `2m ≥ B^32`. Each test fails under its own copy's mutation and nothing else
-   does.
+   `2m ≥ B^32`:
+   - **pass 2** — the mirror image of `condSubTop`'s case.
+   - **pass 1** (added 2026-08-13, after the re-audit found it open) — the
+     consequential one, because pass 1's outgoing borrow is what `smask` is
+     computed from: dropping `s2[1]` there flips the reduction DECISION rather
+     than corrupting a value, and it is the copy on the amd64 asm path, i.e.
+     the one RSA-2048/4096, `paillier` and `vdf` take at `L >= asm_min_limbs`.
+     The pass-2 case cannot see it — in both of its inputs the subtract fires
+     under the mutation as well — so `borrow = s[1]` in pass 1 kept the whole
+     suite green (28 pass, exit 0) with every other case already committed.
+     The input that catches it is `z = m − 1`, `top = 0`: limb 0 is the only
+     source of a real `s[1]` borrow, every limb above it has `z[i] == m[i]`,
+     so the borrow reaches the top only through `s2[1]`; the mutant reports no
+     borrow, subtracts `m` from a value below it, and returns `B^n − 1`.
+
+   Measured one pass at a time, `borrow`/`b2 = s[1] | s2[1]` → `s[1]`
+   (`zig build test-montint`, judged by exit code, 2026-08-13):
+
+   | mutated | result |
+   |---|---|
+   | `condSubTop` pass 1 | exit 1, **4 red**: the boundary cases, the wide-reduction sweep, the public-loader round-trip, and `kat_test`'s CT smoke |
+   | `condSubTop` pass 2 | exit 1, **1 red**: `condSubTop: the borrow must survive a limb where v[i] == m[i]` |
+   | `condSub` pass 2 | exit 1, **1 red**: `condSub pass 2: …` |
+   | `condSub` pass 1 | exit 1, **1 red**: `condSub pass 1: …` |
+
+   Two things that table says and a summary would hide. The `v[i] == m[i]` cases
+   are strictly pass-specific: neither is red for the other pass's mutation, in
+   either copy. And the reason `condSub` pass 1 was the gap while `condSubTop`
+   pass 1 was never one is that `condSubTop` has GENERAL tests running through
+   it — the sweep, the KAT smoke, the loader round-trip all reduce through it,
+   and a wrong decision shows up as a wrong value. `asm_core.condSub` has no
+   equivalent: the asm↔portable differentials reach it only with random
+   operands, which land on an equal limb mid-borrow with probability ~2⁻⁶⁴ per
+   limb, so nothing there could ever have caught it.
    A green boundary test still says nothing about branch structure, which is
    exactly why item 5 exists.
 5. **ctgrind (valgrind/memcheck).** `scripts/ctgrind.sh montint` — three
@@ -280,6 +343,29 @@ caught the same way this one was.
    so it cannot rot. This is the item that found the `condSubTop` branch, and
    the only item that can tell whether it stays fixed — items 1–4 were all green
    for the entire life of the defect.
+6. **The two constants the other five items are measured *through*** (added
+   2026-08-13). Both were previously pinned by nothing, and both are the kind of
+   change that moves what everything above measures while leaving every light
+   green:
+   - `asm_min_limbs = 32` decides whether a modulus takes the asm core. Raising
+     it to 64 left `test-montint` AND all 22 modules of the reverse-dependency
+     closure green — the asm↔portable differentials call `asm_core` directly,
+     not through the dispatch — and item 5's `asmcore` target would have kept
+     reporting `--check: OK` while measuring the portable path. Now asserted by
+     VALUE (`== 32`, and `sqr_min_limbs == 8`), plus what those values select:
+     `Modint(2048)`/`Modint(4096)` dispatch to asm, `Modint(1024)` (the RSA-2048
+     CRT half) and the pairing widths do not. A test phrased as
+     `L >= asm_min_limbs` would re-derive the rule and pass for any value;
+     these fail when the value moves, verified by mutating each constant.
+   - `blackBox`'s `if (@inComptime()) return x;` guard. Deleting it also left
+     all 22 modules green, because nothing in the repo evaluates montint at
+     comptime. Now exercised by a `comptime M.fromElem(…)` test that both
+     compile-fails without the guard ("unable to evaluate comptime expression")
+     and compile-fails without its own `@setEvalBranchQuota` ("evaluation
+     exceeded 1000 backwards branches"), and that checks the comptime and
+     runtime constants agree limb-for-limb. The quota is the caller's
+     responsibility, and the guard's comment now says so — the property was
+     previously stated without its precondition.
 
 ## Benchmarks — the zig-vs-OpenSSL table (this host, ReleaseFast)
 
@@ -376,6 +462,15 @@ speed dispatch, not a correctness bound.
   the controls and what did *not* fix it. The sentence "no timing audit tool has
   been run" that used to close this bullet was the reason the defect survived,
   and it is now `scripts/ctgrind.sh montint --check` instead.
+- **The byte loaders are outside the CT contract.** `fromBytesBE` /
+  `elementFromBytesBE` / `elemFromBytesBE` branch on byte VALUES (the zero-byte
+  skip), so an encoding's zero-byte positions are observable. No secret reaches
+  them today — `vdf` is the only consumer and passes public values, while `rsa`
+  and `paillier` load through a branchless `beToLimbs` + `fromElem`, which for
+  `rsa` is load-bearing because it runs on the secret CRT primes `p` and `q`. A
+  caller loading secret material must do the same. See "Constant-time contract"
+  above; this is stated, not measured, and deliberately not tainted in the
+  harness.
 - **No base blinding / fault countermeasures.** This is a modular-arithmetic
   primitive, not a signing scheme; blinding (rsa F2) and CRT fault-checks
   (rsa F3) are the consumer's responsibility, layered on top.

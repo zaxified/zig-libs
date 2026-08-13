@@ -61,6 +61,13 @@ const back = m.fromMontgomery(&m.toMontgomery(&a)); // == a
 the modulus must be odd and ≥ 3. Elements are `[L]u64` little-endian; the domain
 (normal vs Montgomery) is tracked by naming convention.
 
+> **The byte loaders are the one part that is not constant-time.**
+> `fromBytesBE`/`elementFromBytesBE` skip zero bytes, so the work depends on the
+> input's byte values. Use them for PUBLIC encodings (a modulus, a validated
+> group element). To load secret material, build the limbs branchlessly and go
+> through `fromElem` — `rsa` and `paillier` both do exactly that. See
+> [`SPEC.md`](SPEC.md) § "Constant-time contract".
+
 ## Verify
 
 ```

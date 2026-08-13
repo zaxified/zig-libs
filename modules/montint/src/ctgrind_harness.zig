@@ -38,7 +38,9 @@
 //!   (`montint.zig:281`) is live, and the asm core is not. Drives `powMont`
 //!   with a tainted EXPONENT and a tainted base — the flagship claim
 //!   (`montint.zig:417`): fixed 5-bit window, a multiply per window, a
-//!   branchless 32-entry gather, all `L·64` exponent bits processed.
+//!   branchless 32-entry gather, all `L·64` exponent bits processed. This is
+//!   also the RSA-2048 CRT width (secret `dP`/`dQ`), so it additionally drives
+//!   one `sub` — see `runPow`.
 //! * `asm` — `Modint(2048)`, `L = 32`. At `asm_min_limbs`, so `montMul` and
 //!   `montSqr` route into `asm_core.montMul`/`montSqr`
 //!   (`asm_core.zig:47`: "no secret-dependent branch, load address, or
@@ -75,6 +77,16 @@
 //!   that returns `error.NonCanonical` — a branch it must take by contract.
 //! * `Modint.bits()` walks limbs with an early `if (self.m[i-1] != 0) return`,
 //!   over the PUBLIC modulus. Never a secret.
+//! * The byte loaders `fromBytesBE` / `elementFromBytesBE` / `elemFromBytesBE`.
+//!   They branch on the byte VALUES (`if (byte == 0) continue;`, plus the
+//!   cross-limb spill), which SPEC.md now states as an explicit exclusion from
+//!   the constant-time contract rather than leaving implicit. No byte string is
+//!   tainted here on purpose: a context reported from a documented
+//!   value-dependent skip is the behaviour, not a regression, and would only
+//!   teach the reader to ignore the row. The property that matters is instead
+//!   enforced at the callers — `rsa` and `paillier` load secret-adjacent
+//!   material through a branchless `beToLimbs` + `fromElem`, and `vdf`, the one
+//!   consumer of the public loaders, passes only public values.
 //! * `limbs.mulSchoolbook` / `mulKaratsuba` carry no constant-time claim
 //!   (`mulKaratsuba` is documented as a correctness anchor for a deferred SOS
 //!   path); they are not on the `montMul` dispatch.
@@ -170,7 +182,8 @@ fn parseTaint(s: []const u8) !Taint {
     return error.UnknownTaint;
 }
 
-/// `powMont` on a tainted base and a tainted exponent, at the given width.
+/// `powMont` on a tainted base and a tainted exponent, at the given width,
+/// plus one `sub` at the same width (see below).
 fn runPow(comptime bits: comptime_int, comptime tag: []const u8, tainted: bool) !void {
     const M = Modint(bits);
     const m = try M.fromElem(publicModulus(M, "ctgrind-montint-harness-modulus-" ++ tag ++ "-v1"));
@@ -181,6 +194,19 @@ fn runPow(comptime bits: comptime_int, comptime tag: []const u8, tainted: bool) 
 
     const r = m.powMont(&base, &exp);
     printElem(M, "pow", &m, &r);
+
+    // `sub` is NOT on the `powMont` path, so without this call it would be
+    // measured at L=4 only — by the `small` target — and its `blackBox`
+    // barrier is instantiated per comptime-known `L`. That matters because the
+    // leak class here is LLVM re-deriving `mask ∈ {0, ~0}` at a fully unrolled
+    // width: each `L` is separate codegen with its own verdict, and L=16 is
+    // exactly the RSA-2048 CRT width the 2026-08-13 fix was about. One call
+    // here covers both remaining widths (L=16 via `portable`, L=32 via
+    // `asmcore`) without a fourth target, and `add`/`mul`/`montSqr` need no
+    // equivalent because `condSubTop` — the thing they all end in — is already
+    // driven at both widths through `powMont`'s multiplies and squarings.
+    const dif = m.sub(&base, &exp);
+    printElem(M, "sub", &m, &dif);
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

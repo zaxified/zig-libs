@@ -505,7 +505,7 @@ fn condSub(z: []u64, top: u64, m: []const u64) void {
 
 // ── condSub borrow-chain coverage ───────────────────────────────────────────
 
-test "condSub: the borrow must survive a limb where z[i] == m[i]" {
+test "condSub pass 2: the borrow must survive a limb where z[i] == m[i]" {
     // Companion to `montint.zig`'s "condSubTop: the borrow must survive a limb
     // where v[i] == m[i]". Both implementations of the conditional subtract
     // carry the same easy-to-drop, hard-to-notice term: the outgoing borrow is
@@ -515,6 +515,12 @@ test "condSub: the borrow must survive a limb where z[i] == m[i]" {
     // alone left `zig build test-montint` fully green, including the 5000-case
     // asm-vs-portable differential and the squaring differentials, because
     // nothing they generate ever lands on an equal limb mid-borrow.
+    //
+    // This case pins PASS 2 only. In both cases below the subtract fires
+    // (`smask` all-ones) and the mutated and correct PASS-1 borrows agree on
+    // that decision — dropping pass 1's `s2[1]` here is masked by a later real
+    // `s[1]`. Pass 1's copy of the term therefore needs its own input, and
+    // gets it in the test that follows.
     //
     // Built at `n = 32` — 2048-bit, the smallest width the dispatch ever routes
     // here (`asm_min_limbs`) — against a FULL-WIDTH modulus. Full width also
@@ -556,4 +562,62 @@ test "condSub: the borrow must survive a limb where z[i] == m[i]" {
     want_b[0] = ones - 1;
     want_b[1] = ones;
     try std.testing.expectEqualSlices(u64, &want_b, &z_b);
+}
+
+test "condSub pass 1: the outgoing borrow must survive a limb where z[i] == m[i]" {
+    // PASS 1 carries its own copy of the same `borrow = s[1] | s2[1]` term, and
+    // it is the copy that decides — `smask` is computed from pass 1's outgoing
+    // borrow, so dropping `s2[1]` there does not corrupt a value, it flips the
+    // reduction DECISION. Verified by mutation: `borrow = s[1]` in pass 1 left
+    // `zig build test-montint` fully green (28 pass, exit 0) with the pass-2
+    // case above already committed, which is why this case exists. This is the
+    // copy on the amd64 asm path, i.e. the one RSA-2048/4096, `paillier` and
+    // `vdf` take at `L >= asm_min_limbs`.
+    //
+    // The shape that isolates pass 1: pick `z = m − 1` with `top == 0`, so the
+    // correct answer is "leave it alone". Limb 0 is the only place a real
+    // `s[1]` borrow is generated; every limb above it has `z[i] == m[i]`, so
+    // the borrow reaches the top ONLY through `s2[1]`. Dropping the term makes
+    // pass 1 report no borrow, `smask` goes all-ones, and the mutant subtracts
+    // `m` from a value below it, returning `B^n − 1`. Both cases below have
+    // `smask == 0` at HEAD, so pass 2's own `s2[1]` term never fires and cannot
+    // be what makes them red.
+    //
+    // Same `n = 32` full-width construction as above: `m ≥ 2^2047` makes
+    // `2m ≥ B^32`, so the `value < 2m` precondition holds for free. Hand-
+    // computed, not oracle-compared.
+    const n = 32;
+    const ones: u64 = 0xffff_ffff_ffff_ffff;
+    const top_bit: u64 = @as(u64, 1) << 63;
+
+    // (a) the equal limbs are the modulus's interior ZEROS. m = 2^2047 + 1,
+    //     z = m − 1 = 2^2047. Limbs 1..31 are equal with a borrow in from
+    //     limb 0, so `s2[1]` has to fire 31 times in a row for pass 1 to see
+    //     that z < m.
+    var m_a = [_]u64{0} ** n;
+    m_a[0] = 1;
+    m_a[n - 1] = top_bit;
+    var z_a = m_a;
+    z_a[0] = 0;
+    const want_a = z_a; // unchanged: z < m
+    condSub(&z_a, 0, &m_a);
+    try std.testing.expectEqualSlices(u64, &want_a, &z_a);
+
+    // (b) the equal limbs are NONZERO, so (a) cannot be dismissed as an
+    //     artifact of zero limbs. m = 0xa5a5… in every limb but limb 0 (top
+    //     bit already set, so it is full width), z = m − 1 again.
+    var m_b = [_]u64{0xa5a5_a5a5_a5a5_a5a5} ** n;
+    m_b[0] = 5;
+    var z_b = m_b;
+    z_b[0] = 4;
+    const want_b = z_b; // unchanged: z < m
+    condSub(&z_b, 0, &m_b);
+    try std.testing.expectEqualSlices(u64, &want_b, &z_b);
+
+    // A guard on the guard: the mutant's answer is `B^n − 1`, so if either
+    // case above ever starts returning that, it is the mutation's signature
+    // and not a new correct behaviour.
+    const all_ones = [_]u64{ones} ** n;
+    try std.testing.expect(!std.mem.eql(u64, &all_ones, &z_a));
+    try std.testing.expect(!std.mem.eql(u64, &all_ones, &z_b));
 }
