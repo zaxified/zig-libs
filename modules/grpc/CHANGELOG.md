@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — **BEHAVIOURAL, not breaking** (server) — response metadata that cannot be
+  written now turns the RPC `INTERNAL` (13) instead of passing as OK. `Call.finish`
+  wrote `initial_md` / `trailing_md` with a bare `catch {}`, so once the
+  response writer's 4 KiB header/trailer copy store ran out, the metadata the
+  handler promised was dropped and the client was told `grpc-status: 0` — a
+  successful RPC that silently lost part of its answer, invisible to both ends.
+  `commitHead` already treats the SAME failure on the SAME `initial_md` as
+  `error.BadMetadata`, so which of two identical failures a client heard about
+  depended only on whether the head had been committed yet. `finish` returns
+  `void` and is the last exit, so the status is the only channel it has, and it
+  now uses it (with `grpc-message: response metadata could not be written`).
+  **What changes for a consumer:** an RPC whose metadata exceeds the writer's
+  copy budget used to report success and now reports INTERNAL; everything
+  inside the budget is unchanged. `grpc-message` itself stays best-effort and
+  is now documented as such — it is optional, and `grpc-status` is already on
+  the wire by the time it is attempted.
 - **2026-08-13** — **BEHAVIOURAL, not breaking** (server) — `handleRequest` no longer calls
   `ResponseWriter.end()` itself. It did so to beat the per-call arena's
   `deinit` to the metadata `Call.finish` had just handed `setHeader` /

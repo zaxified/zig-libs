@@ -117,6 +117,11 @@ pub const Csrf = struct {
         // before returning, so this local only has to outlive the call.
         var cookie_buf: [256]u8 = undefined;
         const v = sc.bufPrint(&cookie_buf) catch return;
+        // Best-effort across the whole of `SetHeaderError` (which now also
+        // carries `HeaderBytesExhausted`), and it fails CLOSED: with no token
+        // cookie the client cannot echo a token, so the guarded methods are
+        // REJECTED rather than let through. A dropped token costs a retry,
+        // never a bypass.
         res.addSetCookie(v) catch {};
     }
 };

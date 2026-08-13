@@ -5,6 +5,47 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — **BREAKING** `ResponseWriter.reset` returns `ResetError!void` (`error{HeadersSent}`)
+  instead of `void`. Callers must `try` it or handle the error; `rw.reset();`
+  stops compiling. It was made public earlier today guarded only by
+  `std.debug.assert(!rw.sent_head)` — **which is compiled out in ReleaseFast
+  and ReleaseSmall**, i.e. a fail-open precondition on a public API in the
+  modes people deploy. Measured: an A/B probe whose two arms differed only by
+  the `reset()` call put **two complete response heads on one connection** in
+  ReleaseFast (`HTTP/1.1 200 OK … Transfer-Encoding: chunked\r\n\r\nHTTP/1.1
+  200 OK\r\nContent-Length: 2\r\n\r\nbb`), with the first, chunked body never
+  terminated — a response-splitting shape reached by ordinary API misuse, not
+  by hostile input. `reset` clears `ended` and sets `body = .buffering` while
+  leaving `sent_head` true, so the next `end()` calls `writeHead` again. Worse,
+  `setHeader` still returned `HeadersSent` throughout, so a caller checking its
+  return values saw nothing wrong. Debug and ReleaseSafe panicked instead. The
+  precondition is now a returned error, so it holds in every optimize mode, and
+  is pinned by a test that counts status lines on the wire.
+- **2026-08-13** — **BEHAVIOURAL, not breaking** — a header or trailer rejected for
+  byte exhaustion no longer keeps its name's bytes. `putHeader` and
+  `setTrailer` dupe the name and *then* the value into a bump allocator that
+  never rewinds, so a rejected pair permanently cost `name.len` of the copy
+  store: a handler that retried with a shorter value had strictly less room
+  than before it asked. Both now rewind to a mark on failure. This budget is
+  what decides `proxy`'s relay-versus-502, so leaking it changed answers.
+- **2026-08-13** — **BEHAVIOURAL, not breaking** — `declareTrailers` reports a byte-budget
+  exhaustion as `error.HeaderBytesExhausted` rather than flattening it into
+  `error.TooManyTrailers`. `TrailerError` carries both members precisely so the
+  two limits can be told apart, and `setTrailer` already kept them apart; this
+  one call site collapsed them and told a caller that declared ONE trailer that
+  it had declared too many. No error set changed, so no exhaustive `switch`
+  breaks — only the value a caller receives.
+- **2026-08-13** — `Server.header_copy_bytes` (4096) is now **public**, and pinned by value.
+  It was a private `const`, which meant `cookies.max_set_cookie_bytes` could
+  not import it and the documented "same size as `http`'s copy store" coupling
+  was a duplicated literal maintained by a comment in each file. `cookies` now
+  imports it and asserts the relation at comptime. The value itself was
+  unpinned downward: measured, 4096 → **2048 left the whole http + cookies
+  suite green, 451/451, exit 0** — the only test that spends the budget is
+  written as `header_copy_bytes / 4` and so follows the constant wherever it
+  goes. Since `proxy.relayFailed` this number decides whether a proxied
+  response relays or answers 502, so it is now pinned in both directions.
+  Purely an addition.
 - **2026-08-13** — **BEHAVIOURAL, not breaking** (`proxy`) — a backend response header the
   proxy cannot put on its own response is no longer dropped silently. Both
   relay loops (h1 and h2) used `catch {}`, so once the writer's copied-header
@@ -32,7 +73,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   handler, so middleware wrapped *around* the proxy can still touch headers
   after it returns — which is a gain (`sessions` saves its cookie there,
   `csrf` issues its token there, and both were silently losing the write on a
-  proxied response), but it is an observable change of ordering.
+  proxied response), but it is an observable change of ordering. **Two halves
+  of that this entry originally left out.** First, the same window lets a
+  wrapping middleware `setStatus` over the *backend's* status and `setHeader`
+  over a relayed backend header; those writes were previously inert
+  `HeadersSent` no-ops, so a middleware that always sets a header now silently
+  overrides the origin instead of losing to it. Second, the gain is
+  conditional: it holds only while the proxied body fits the response buffer.
+  A larger body trips `beginStreaming` → `writeHead` inside `streamRemaining`,
+  so the head goes out inside the handler exactly as before and the
+  post-proxy middleware write is lost again — on precisely the large
+  responses where it is least likely to be noticed.
 - **2026-08-13** — `ResponseWriter.reset` is now **public**. It discards everything composed so
   far — status, header table, copied bytes, declared trailers, buffered body —
   and is legal only while nothing is on the wire. A handler that composes a

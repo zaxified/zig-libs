@@ -477,6 +477,12 @@ pub const Handler = struct {
     pub fn serve(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter) Writer.Error!void {
         if (req.method != .get and req.method != .head) {
             rw.setStatus(405);
+            // Best-effort, deliberately: RFC 9110 §15.5.6 makes `Allow` a
+            // MUST on a 405, but answering 500 instead would throw away the
+            // "method not allowed" answer entirely, which serves the client
+            // worse than a 405 missing its hint. Reachable only if a
+            // middleware already spent the copy budget — this response is
+            // otherwise empty.
             rw.setHeader("Allow", "GET, HEAD") catch {};
             return;
         }
@@ -507,13 +513,25 @@ pub const Handler = struct {
 
         // Validators first, so a 304/412 short-circuit carries ETag +
         // Last-Modified + Cache-Control (and nothing representation-specific).
+        // Best-effort, deliberately: `Last-Modified` is a cache validator.
+        // Losing it costs a conditional-request round trip and nothing else —
+        // the response stays correct, so a 500 would be strictly worse.
         rw.setHeader("Last-Modified", http.Server.formatHttpDate(mtime_s, &lastmod_buf)) catch {};
-        if (h.options.cache_control) |cc| rw.setHeader("Cache-Control", cc) catch {};
+        // NOT best-effort: an operator that configured `Cache-Control` did so
+        // to control where this file may be stored. Dropping it silently can
+        // put private content in a shared cache.
+        if (h.options.cache_control) |cc|
+            rw.setHeader("Cache-Control", cc) catch return failUnsafeResponse(rw);
         if (http.conditional.apply(req, rw, .{ .etag = etag, .last_modified = mtime_s }) catch false) {
             return; // 304 / 412 staged (body suppressed by the server core)
         }
 
-        rw.setHeader("Content-Type", mimeType(opened.mime_name, h.options.mime_overrides, h.options.default_mime)) catch {};
+        // NOT best-effort: a body served without `Content-Type` is sniffed.
+        rw.setHeader("Content-Type", mimeType(opened.mime_name, h.options.mime_overrides, h.options.default_mime)) catch
+            return failUnsafeResponse(rw);
+        // Best-effort, deliberately: `Accept-Ranges` only advertises that
+        // range requests are supported. Losing it costs resumable downloads,
+        // not correctness.
         rw.setHeader("Accept-Ranges", "bytes") catch {};
 
         // Range resolution (RFC 7233): single range → 206 + Content-Range,
@@ -569,7 +587,11 @@ pub const Handler = struct {
         defer if (dh.owned) dh.dir.close(h.io);
 
         rw.setStatus(200);
-        rw.setHeader("Content-Type", "text/html; charset=utf-8") catch {};
+        // NOT best-effort, for the same reason as the file path above: this
+        // body IS HTML, and serving it unlabelled leaves the browser to sniff
+        // it — with attacker-influenced file names inside it.
+        rw.setHeader("Content-Type", "text/html; charset=utf-8") catch
+            return failUnsafeResponse(rw);
         if (req.method == .head) return;
 
         const w = rw.writer();
@@ -650,6 +672,12 @@ fn setContentLength(rw: *http.Server.ResponseWriter, n: u64) void {
     // `catch unreachable` consequence for getting it wrong.
     var clen_buf: [20]u8 = undefined;
     const s = std.fmt.bufPrint(&clen_buf, "{d}", .{n}) catch unreachable;
+    // The only `catch {}` on this surface that cannot drop anything:
+    // `setHeader` intercepts `Content-Length` by name, parses it into
+    // `declared_len` and returns before it ever reaches the copy store, so
+    // `HeaderBytesExhausted` and `TooManyHeaders` are unreachable here; `s`
+    // is a formatted integer, so `InvalidHeader` is too. Only `HeadersSent`
+    // remains, and then the framing is already decided.
     rw.setHeader("Content-Length", s) catch {};
 }
 
@@ -657,6 +685,25 @@ fn setContentLength(rw: *http.Server.ResponseWriter, n: u64) void {
 fn sendStatus(rw: *http.Server.ResponseWriter, status: u16) Writer.Error!void {
     rw.setStatus(status);
     setContentLength(rw, 0);
+}
+
+/// A representation header that could not be set leaves a response it is not
+/// safe to send — discard what was composed and answer 500 instead.
+///
+/// Used only where dropping the header is a downgrade rather than a lost
+/// optimisation: `Content-Type` (a body served without it is MIME-sniffed by
+/// the browser, which turns an uploaded text or image file into stored XSS)
+/// and a configured `Cache-Control` (an operator that set `no-store` on
+/// private files gets it stored by a shared cache instead). The alternative —
+/// `catch {}` — is a 200 with the right body and the wrong, or absent,
+/// safety headers, which is exactly the silent-drop shape this sweep closed.
+fn failUnsafeResponse(rw: *http.Server.ResponseWriter) Writer.Error!void {
+    // Nothing is on the wire at any of the call sites (no body byte has been
+    // written yet), so this discards the half-composed representation. If a
+    // middleware did flush early, `reset` refuses and the 500 below is inert —
+    // there is nothing better available once the head has gone.
+    rw.reset() catch {};
+    return sendStatus(rw, 500);
 }
 
 /// Stream `length` bytes of `file` starting at `start` to the response body,
@@ -885,6 +932,111 @@ fn statusOf(resp: []const u8) u16 {
     // "HTTP/1.1 NNN ..."
     if (resp.len < 12) return 0;
     return std.fmt.parseInt(u16, resp[9..12], 10) catch 0;
+}
+
+/// A middleware that spends the response writer's 4 KiB header copy store
+/// before `staticfiles` gets to compose anything — four hundred-byte headers
+/// at a time until the store refuses, which leaves ~26 bytes: too few for
+/// `Last-Modified` (42) or `Content-Type` (37).
+///
+/// This is what makes `HeaderBytesExhausted` reachable at all. It is not
+/// exotic: one large `Content-Security-Policy` plus a couple of long
+/// `Set-Cookie`s gets to the same place.
+var test_leave_bytes: usize = 0;
+
+fn budgetEatingHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    // One header, sized exactly, so the remaining budget is a known number
+    // rather than whatever a fill loop happened to leave. Reads the real
+    // constant from `http` — the F8 fix is what makes that possible.
+    var pad: [http.Server.header_copy_bytes]u8 = undefined;
+    @memset(&pad, 'x');
+    const name = "X-Pad";
+    rw.setHeader(name, pad[0 .. http.Server.header_copy_bytes - name.len - test_leave_bytes]) catch unreachable;
+    const h: *const Handler = @ptrCast(@alignCast(req.context orelse return error.NoStaticFilesContext));
+    return h.serve(req, rw);
+}
+
+fn getUnderBudgetPressure(handler: *Handler, path: []const u8, out_buf: []u8) []const u8 {
+    var wire_buf: [512]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [512]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = budgetEatingHandler,
+        .context = handler,
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "serve: a Content-Type that cannot be set answers 500, never a sniffable body" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [8192]u8 = undefined;
+
+    // Positive control first: the same file, same handler shape, no budget
+    // pressure — 200 with the label on it.
+    const ok = get(&h, "/hello.txt", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(ok));
+    try testing.expect(mem.indexOf(u8, ok, "Content-Type: text/plain; charset=utf-8\r\n") != null);
+
+    // Now with the copy store spent. `Content-Type` cannot be written, so the
+    // body must NOT go out: an unlabelled `text/plain` file is MIME-sniffed
+    // by the browser, which is how an uploaded .txt becomes stored XSS.
+    test_leave_bytes = 20; // < "Content-Type" + "text/plain; charset=utf-8"
+    defer test_leave_bytes = 0;
+    var out2: [8192]u8 = undefined;
+    const resp = getUnderBudgetPressure(&h, "/hello.txt", &out2);
+    try testing.expectEqual(@as(u16, 500), statusOf(resp));
+    // The whole half-composed representation is discarded, not just relabelled.
+    try testing.expect(mem.indexOf(u8, resp, "Content-Type:") == null);
+    try testing.expect(mem.indexOf(u8, resp, "X-Pad-") == null);
+    // And above all: not one byte of the file.
+    try testing.expect(mem.indexOf(u8, resp, "hello world") == null);
+}
+
+test "serve: a configured Cache-Control that cannot be set answers 500, not a quietly cacheable 200" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    // Long enough that it is the header which does not fit while
+    // `Content-Type` still would — otherwise a 500 here would prove nothing,
+    // since `Content-Type` failing further down produces one anyway.
+    // Deliberately far longer than the budget left below, so that
+    // Cache-Control is the ONLY header that cannot fit. An earlier version of
+    // this test tried to tune the budget to a few bytes and proved nothing:
+    // `conditional.apply` sets `ETag` between Cache-Control and Content-Type,
+    // Content-Type then failed too, and the 500 it produced made the
+    // mutation-with-`catch {}` pass. Generous margins, not tight arithmetic.
+    const cc = "public, max-age=31536000" ++ (", no-transform" ** 30);
+    var h = Handler.init(testing.io, fx.root, .{ .cache_control = cc });
+    var out: [8192]u8 = undefined;
+
+    // ~200 bytes is ample for Last-Modified (42), ETag, Content-Type (37) and
+    // Accept-Ranges together, and hopeless for a 444-byte Cache-Control —
+    // even after the rejected header leaks its own name into the store (the
+    // copy store is a bump allocator that does not rewind; http audit F11).
+    test_leave_bytes = 200;
+    defer test_leave_bytes = 0;
+
+    const resp = getUnderBudgetPressure(&h, "/hello.txt", &out);
+    // Escalated: an operator asked for a specific storage policy and it could
+    // not be applied, so the file is not served under the wrong one.
+    try testing.expectEqual(@as(u16, 500), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "hello world") == null);
+    // The discriminating assertion: Content-Type had room. Without the
+    // escalation this response is a 200 carrying the body and the right
+    // Content-Type, silently missing only its Cache-Control.
+    try testing.expect(mem.indexOf(u8, resp, cc) == null);
 }
 
 test "serve: 200 with correct Content-Type, ETag, Last-Modified, body" {

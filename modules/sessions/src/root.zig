@@ -646,7 +646,24 @@ pub const Manager = struct {
         // Sized for name + 2*max_id_bytes hex + every attribute.
         var cookie_buf: [512]u8 = undefined;
         const v = sc.bufPrint(&cookie_buf) catch return; // too long / invalid → skip
-        res.addSetCookie(v) catch {}; // HeadersSent (early flush) → best-effort
+        // Best-effort across the WHOLE of `SetHeaderError`, not just the
+        // `HeadersSent` this comment used to name — `addSetCookie` also
+        // returns `HeaderBytesExhausted` (a handler that spent the writer's
+        // 4 KiB copy budget), `TooManyHeaders` and `InvalidHeader`.
+        //
+        // Deliberate, and the reason is that every one of them fails CLOSED.
+        // `save` has already persisted the record and `destroy` has already
+        // deleted it, so the store is authoritative either way: a lost
+        // rolling refresh leaves the browser's current cookie working; a lost
+        // new-session cookie means the browser simply has none and the user
+        // is not logged in; a lost `Max-Age=-1` clearing cookie is harmless
+        // because the record behind it is already gone, so the stale cookie
+        // resolves to nothing on the next request. No case leaves a user
+        // holding authority they should not have.
+        //
+        // `save`/`destroy` are `pub fn … void` with best-effort in their
+        // contracts, so this is stated here rather than escalated.
+        res.addSetCookie(v) catch {};
     }
 };
 

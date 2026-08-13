@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — Docs only, no behaviour change: the `addSetCookie` failure handling in
+  `Manager.writeCookie` and `Csrf.issue` is now explicit about the whole of
+  `SetHeaderError`. The comment named only `HeadersSent`, but the set was
+  widened with `error.HeaderBytesExhausted` (a handler that spent the response
+  writer's 4 KiB copy budget) and also carries `TooManyHeaders` and
+  `InvalidHeader`. The swallow is deliberate and stays, because every case
+  fails **closed**: `save` has already persisted the record and `destroy` has
+  already deleted it, so a lost rolling refresh leaves the browser's current
+  cookie working, a lost new-session cookie means the user is simply not
+  logged in, and a lost `Max-Age=-1` clearing cookie is harmless because the
+  record behind it is gone. A lost CSRF token cookie means the client cannot
+  echo a token, so guarded methods are rejected rather than let through. No
+  case leaves a user holding authority they should not have — which is why
+  this is stated rather than escalated.
 - **2026-08-12** — `Manager.newId` — the source of every session id, including the one
   `regenerate` mints on privilege change — draws through the new `entropy`
   module (`entropy.fill`, i.e. `std.Io.randomSecure`) instead of

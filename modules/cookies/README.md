@@ -47,12 +47,14 @@ third-party source consulted or copied.
 
 ## Verification
 
-`zig build test-cookies` — 38 offline tests (22 here + 16 frozen python-oracle
+`zig build test-cookies` — 39 offline tests (23 here + 16 frozen python-oracle
 goldens). Parser (7): simple pairs + `find`, OWS trimming, valueless cookies,
 quoted/unbalanced values, a quoted value containing a `;`, empty-name skipping,
 degenerate headers. Builder (11): full attribute set, `__Host-`/`__Secure-`
 prefix constraints, minimal, Domain+Expires, negative Max-Age, Strict, invalid
 name/value/Path/Domain rejection, SameSite=None both branches, BufferTooSmall.
+Constants (1): `max_set_cookie_bytes` pinned by value and to `http`'s
+`header_copy_bytes`.
 `http` helpers (3): `get`+`set` over `http.Server.serveStream`, the cookie
 surviving the dead frame it was formatted in, and an over-long cookie refused
 rather than truncated. Green in Debug + ReleaseFast.

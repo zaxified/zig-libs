@@ -179,6 +179,21 @@ fn bigImpl(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
     return .{ .text = "big", .index = req.count, .blob = blob };
 }
 
+/// Declares a normal trailing-metadata name and then sets a value sized by
+/// `req.count`. Large enough and it will not fit the response writer's 4 KiB
+/// header/trailer copy store, so `finish`'s `setTrailer` fails on it — the
+/// silent-drop site this fixture exists to reach. The handler itself succeeds,
+/// which is the point: without an escalation the client sees `grpc-status: 0`
+/// on a response whose promised metadata was thrown away.
+fn fatMetaImpl(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
+    const n: usize = @intCast(@max(0, req.count));
+    const big = try c.arena.alloc(u8, n);
+    @memset(big, 'x');
+    try c.declareTrailingMetadata(&.{"x-tail"});
+    try c.setTrailingMetadata(.{ .name = "x-tail", .value = big });
+    return .{ .text = "fat" };
+}
+
 /// The untyped escape hatch: bytes in, bytes out, no protobuf.
 fn rawImpl(c: *server.Call) anyerror!void {
     while (try c.receive()) |msg| {
@@ -201,6 +216,7 @@ const echo_service: server.Service = .{
         M.unary("ReservedMeta", reservedMetaImpl),
         M.unary("Deadline", deadlineImpl),
         M.unary("Big", bigImpl),
+        M.unary("FatMeta", fatMetaImpl),
         server.Method.raw("Raw", rawImpl),
     },
 };
@@ -393,6 +409,47 @@ fn encodeReq(gpa: Allocator, req: EchoRequest) ![]u8 {
 
 fn defaultRouter() server.Router {
     return .{ .gpa = testing.allocator, .services = &.{ echo_service, other_service } };
+}
+
+test "finish: trailing metadata that cannot be written turns the RPC INTERNAL, never a silent OK" {
+    const gpa = testing.allocator;
+
+    // Control arm first: a small trailing-metadata value fits, so the RPC is
+    // OK and the metadata actually arrives. Without this the assertion below
+    // could be satisfied by the fixture simply never working.
+    {
+        var peer: TestPeer = .init(gpa);
+        defer peer.deinit();
+        var router = defaultRouter();
+        try peer.conn.sendPreface(&peer.wire);
+        const req = try encodeReq(gpa, .{ .count = 8 });
+        defer gpa.free(req);
+        const sid = try startCall(&peer, "/echo.Echo/FatMeta", &.{req});
+        try runOffline(&peer, &router);
+        const r = peer.resp(sid);
+        try testing.expectEqualStrings("0", r.trailer("grpc-status").?);
+        try testing.expectEqualStrings("x" ** 8, r.trailer("x-tail").?);
+    }
+
+    // The arm that matters: the value cannot fit the copy store, so
+    // `setTrailer` fails and the metadata is gone. It used to be swallowed by
+    // a bare `catch {}` and the client was told `grpc-status: 0` — a
+    // successful RPC that quietly lost what it promised to send. `commitHead`
+    // already treats the SAME failure on `initial_md` as `error.BadMetadata`;
+    // this makes `finish` agree, through the only channel it has left.
+    {
+        var peer: TestPeer = .init(gpa);
+        defer peer.deinit();
+        var router = defaultRouter();
+        try peer.conn.sendPreface(&peer.wire);
+        const req = try encodeReq(gpa, .{ .count = 4000 });
+        defer gpa.free(req);
+        const sid = try startCall(&peer, "/echo.Echo/FatMeta", &.{req});
+        try runOffline(&peer, &router);
+        const r = peer.resp(sid);
+        try testing.expectEqualStrings("13", r.trailer("grpc-status").?); // INTERNAL
+        try testing.expectEqual(@as(?[]const u8, null), r.trailer("x-tail"));
+    }
 }
 
 // ── the happy path, and where the status lives on it ────────────────────────

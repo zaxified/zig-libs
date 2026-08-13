@@ -693,6 +693,21 @@ pub const Call = struct {
         c.status_set = true;
     }
 
+    /// What the client is told when response metadata could not be written.
+    ///
+    /// `finish` returns `void` — it is the last exit — so the status is the
+    /// only channel left, and an RPC that silently threw away the metadata it
+    /// promised must not read as OK. `commitHead` already takes this line on
+    /// the *same* `initial_md` writes (`catch return error.BadMetadata`);
+    /// before this, `finish` swallowed them, so which of two identical
+    /// failures the client heard about depended only on whether the head had
+    /// been committed yet. Derived from the enum rather than written as "13"
+    /// so a renumbering cannot desync it.
+    const md_lost_code = std.fmt.comptimePrint("{d}", .{@intFromEnum(status_mod.Status.internal)});
+    /// Pure ASCII in 0x20-0x7E with no `%`, so `encodeMessage` is the
+    /// identity on it and it needs no arena allocation to emit.
+    const md_lost_message = "response metadata could not be written";
+
     /// Emit the status — the single exit through which every response,
     /// successful or not, leaves this module.
     fn finish(c: *Call) void {
@@ -715,17 +730,34 @@ pub const Call = struct {
             c.rw.setHeader("content-type", c.content_type) catch return;
             if (c.accept_encoding_in_status)
                 c.rw.setHeader("grpc-accept-encoding", "identity") catch return;
-            for (c.initial_md.items) |e| c.rw.setHeader(e.name, e.value) catch {};
-            for (c.trailing_md.items) |e| c.rw.setHeader(e.name, e.value) catch {};
-            c.rw.setHeader("grpc-status", code) catch return;
-            if (message) |m| c.rw.setHeader("grpc-message", m) catch return;
+            var head_md_lost = false;
+            for (c.initial_md.items) |e|
+                c.rw.setHeader(e.name, e.value) catch {
+                    head_md_lost = true;
+                };
+            for (c.trailing_md.items) |e|
+                c.rw.setHeader(e.name, e.value) catch {
+                    head_md_lost = true;
+                };
+            c.rw.setHeader("grpc-status", if (head_md_lost) md_lost_code else code) catch return;
+            // `grpc-message` is optional (gRPC over HTTP/2: the machine-
+            // readable half is `grpc-status`, which is already on the head by
+            // now). Best-effort DELIBERATELY, and the client still learns
+            // something went wrong from the status itself.
+            const head_msg: ?[]const u8 = if (head_md_lost) md_lost_message else message;
+            if (head_msg) |m| c.rw.setHeader("grpc-message", m) catch {};
             return; // no body: `ResponseWriter.end` frames it bodiless
         }
 
         // ── the normal shape: the status is a TRAILER ──
-        for (c.trailing_md.items) |e| c.rw.setTrailer(e.name, e.value) catch {};
-        c.rw.setTrailer("grpc-status", code) catch return;
-        if (message) |m| c.rw.setTrailer("grpc-message", m) catch {};
+        var trailer_md_lost = false;
+        for (c.trailing_md.items) |e|
+            c.rw.setTrailer(e.name, e.value) catch {
+                trailer_md_lost = true;
+            };
+        c.rw.setTrailer("grpc-status", if (trailer_md_lost) md_lost_code else code) catch return;
+        const trailer_msg: ?[]const u8 = if (trailer_md_lost) md_lost_message else message;
+        if (trailer_msg) |m| c.rw.setTrailer("grpc-message", m) catch {};
     }
 };
 

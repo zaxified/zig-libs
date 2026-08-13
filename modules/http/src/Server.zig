@@ -1134,7 +1134,9 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
             return respondError(opts, out, date, 413);
         if (decode_gzip and gunzip_body.exceeded)
             return respondError(opts, out, date, 413);
-        rw.reset();
+        // `sent_head` was checked above, so this cannot fail; handled rather
+        // than asserted so the guard survives ReleaseFast.
+        rw.reset() catch return .close;
         rw.setStatus(500);
         rw.setHeader("Content-Type", "text/plain") catch return .close;
         rw.writeAll("Internal Server Error\n") catch return .close;
@@ -1491,7 +1493,19 @@ const trailer_decl_bytes = 256;
 /// trailers has ~100 bytes each with room to spare for the handful of headers
 /// that are legitimately long (a `Content-Security-Policy` runs to a kilobyte,
 /// a `Set-Cookie` with attributes to a few hundred bytes).
-const header_copy_bytes = 4096;
+///
+/// **Public because it is a cross-module contract, not an internal buffer
+/// size.** `cookies.max_set_cookie_bytes` is bounded by it — that coupling
+/// used to be a duplicated literal held together by a comment in each file,
+/// which no mutation can test; `cookies` now imports this and asserts the
+/// relation at comptime. It also decides, since `proxy.relayFailed`, whether
+/// a proxied backend response relays or answers 502.
+///
+/// Pinned BY VALUE below (`test "header_copy_bytes …"`). The bounds test
+/// spends `header_copy_bytes / 4`, which follows this number wherever it
+/// goes and therefore cannot see it move: halving this to 2048 was measured
+/// to leave the whole http + cookies suite green, 451/451, exit 0.
+pub const header_copy_bytes = 4096;
 
 /// Response builder + body writer for one request. Buffers the body up to
 /// its buffer's capacity: a handler that finishes within it gets an exact
@@ -1760,6 +1774,13 @@ pub const ResponseWriter = struct {
         } else null;
         if (replacing == null and rw.headers_len == max_response_headers) return error.TooManyHeaders;
 
+        // Rewind the copy store if the pair does not fit as a WHOLE. `dupe`
+        // is a bump allocator, so without this the name of a rejected header
+        // stays spent forever: a handler that retries with a shorter value
+        // has strictly less room than before it asked, and since
+        // `proxy.relayFailed` the same budget decides relay-versus-502.
+        const mark = rw.header_buf_len;
+        errdefer rw.header_buf_len = mark;
         const n = try rw.dupe(name);
         const v = try rw.dupe(value);
         if (replacing) |hd| {
@@ -1895,8 +1916,15 @@ pub const ResponseWriter = struct {
         rw.declared_trailers_len += 1;
         // Re-register the advert every time: the value slice just grew, so
         // the header table's entry has to be replaced, not appended to.
-        rw.putHeader("Trailer", rw.trailer_decl_buf[0..rw.trailer_decl_len]) catch
-            return error.TooManyTrailers;
+        // Report what actually happened: `TrailerError` carries a distinct
+        // `HeaderBytesExhausted` precisely so a byte-budget failure can be
+        // told apart from a count-limit one, and flattening both into
+        // `TooManyTrailers` tells a caller it declared too many trailers when
+        // it declared too many BYTES. `setTrailer` already keeps them apart.
+        rw.putHeader("Trailer", rw.trailer_decl_buf[0..rw.trailer_decl_len]) catch |err| switch (err) {
+            error.TooManyHeaders => return error.TooManyTrailers,
+            error.HeaderBytesExhausted => return error.HeaderBytesExhausted,
+        };
     }
 
     /// Whether `name` was advertised in the `Trailer` header.
@@ -1963,7 +1991,10 @@ pub const ResponseWriter = struct {
         if (replacing == null and rw.trailers_len == max_response_trailers) return error.TooManyTrailers;
 
         // Trailers are read even later than headers — after the body — so the
-        // caller's slices are even less likely to be alive. Same storage.
+        // caller's slices are even less likely to be alive. Same storage, and
+        // the same all-or-nothing rewind as `putHeader`.
+        const mark = rw.header_buf_len;
+        errdefer rw.header_buf_len = mark;
         const n = try rw.dupe(name);
         const v = try rw.dupe(value);
         if (replacing) |t| {
@@ -2101,10 +2132,13 @@ pub const ResponseWriter = struct {
         }
     }
 
+    pub const ResetError = error{HeadersSent};
+
     /// Discard everything composed so far and start the response over —
     /// status, header table, copied-header bytes, declared trailers and the
-    /// buffered body. Legal only while nothing is on the wire (asserted;
-    /// check `headSent` first).
+    /// buffered body. Legal only while nothing is on the wire; returns
+    /// `error.HeadersSent` otherwise (check `headSent` first to avoid the
+    /// error path entirely).
     ///
     /// The serving loop uses it for the automatic 500 on a handler error.
     /// Public because a handler needs the same move for the same reason: one
@@ -2112,8 +2146,22 @@ pub const ResponseWriter = struct {
     /// — `proxy` relaying a backend's headers until the budget runs out —
     /// otherwise has no way to stop the half-built answer from riding along
     /// with the error status it replaces it with.
-    pub fn reset(rw: *ResponseWriter) void {
-        std.debug.assert(!rw.sent_head);
+    ///
+    /// The precondition is a returned error and NOT `std.debug.assert`,
+    /// which is the whole point of this signature. `reset` clears `ended`
+    /// and sets `body = .buffering` while leaving `sent_head` **true** — it
+    /// is the one field `reset` does not touch — so a post-head call makes
+    /// the next `end()` take the `.buffering` arm and call `writeHead` a
+    /// second time: a second status line and header block on the same
+    /// connection, with the first body left unterminated. That is a
+    /// response-splitting shape reachable by ordinary API misuse, and an
+    /// assert is compiled out in exactly the modes people deploy
+    /// (ReleaseFast/ReleaseSmall) — a fail-open guard on a public API.
+    /// Measured before this signature: ReleaseFast put two complete heads on
+    /// the wire, while `setHeader` still returned `HeadersSent`, so a caller
+    /// checking its return values saw nothing wrong.
+    pub fn reset(rw: *ResponseWriter) ResetError!void {
+        if (rw.sent_head) return error.HeadersSent;
         rw.status = 200;
         rw.headers_len = 0;
         rw.header_buf_len = 0;
@@ -3043,6 +3091,116 @@ test "ResponseWriter: header, cookie and trailer bytes survive the caller's dead
     try testing.expect(std.mem.indexOf(u8, wire, "X-Rows-2: 987654\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
     try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+}
+
+/// Spend the copy store down to exactly `leave` free bytes, in one header, so
+/// the arithmetic in the tests below is exact rather than approximate.
+fn spendCopyStore(rw: *ResponseWriter, leave: usize) !void {
+    var pad: [header_copy_bytes]u8 = undefined;
+    @memset(&pad, 'x');
+    const name = "X-Pad";
+    try rw.setHeader(name, pad[0 .. header_copy_bytes - name.len - leave]);
+}
+
+test "ResponseWriter: a REJECTED header returns its name's bytes to the budget" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    try spendCopyStore(&rw, 50);
+
+    // `putHeader` dupes the name and THEN the value. This pair does not fit
+    // (8 + 60 > 50), so it is refused — but the 8 bytes of name were already
+    // committed to a bump allocator that never rewinds, and stayed spent.
+    var value: [60]u8 = undefined;
+    @memset(&value, 'v');
+    try testing.expectError(error.HeaderBytesExhausted, rw.setHeader("X-Reject", &value));
+
+    // The budget must be exactly as it was: a header costing all 50 remaining
+    // bytes still fits. Before the rewind only 42 were left and this failed —
+    // asking for a header and being refused made the response smaller.
+    var v2: [47]u8 = undefined;
+    @memset(&v2, 'w');
+    try rw.setHeader("X-Y", &v2);
+}
+
+test "declareTrailers: byte exhaustion is reported as such, not as TooManyTrailers" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // Five free bytes: far below the count limit (8 trailers), far below the
+    // 10 bytes `Trailer: X-T` needs in the copy store. The caller declared
+    // ONE trailer, so `TooManyTrailers` would be a lie about which limit it
+    // hit — and `TrailerError` carries `HeaderBytesExhausted` to say so.
+    try spendCopyStore(&rw, 5);
+    try testing.expectError(error.HeaderBytesExhausted, rw.declareTrailers(&.{"X-T"}));
+}
+
+test "header_copy_bytes: pinned by value, in both directions" {
+    // The one existing test that spends this budget is written in terms of
+    // `header_copy_bytes / 4` — it verifies the MECHANISM (a rejection
+    // happens, the table survives it) and is blind to the VALUE. Measured:
+    // 4096 → 2048 left http + cookies at 451/451, exit 0. Only 4096 → 16384
+    // went red. So the constant was pinned upward by accident and not at all
+    // downward, while it decides proxy-502-versus-relay and bounds
+    // `cookies.max_set_cookie_bytes`.
+    //
+    // WHERE 4096 COMES FROM: RFC 6265 §6.1 obliges a user agent to accept at
+    // least 4096 bytes per cookie, "as measured by the sum of the length of
+    // the cookie's name, value, and attributes" — i.e. the length of a
+    // `Set-Cookie` header VALUE. That is the largest single header value the
+    // response builder must be able to carry, so the copy store is sized to
+    // it. Note it is sized to the value ALONE: emitting a maximal conforming
+    // cookie also costs the 10 bytes of the `Set-Cookie` header name, so a
+    // 4096-byte cookie does not in fact fit in a 4096-byte store — which is
+    // exactly what `cookies`' "an over-long cookie is refused, not truncated"
+    // test observes at `max_set_cookie_bytes - 8`. Recorded, not silently
+    // rounded up: growing this is a per-response memory decision.
+    try testing.expectEqual(@as(usize, 4096), header_copy_bytes);
+}
+
+test "ResponseWriter: reset after the head is on the wire is refused, not asserted" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [16]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // Outgrow the body buffer so the writer switches to chunked streaming and
+    // puts the head on the wire from INSIDE the handler — the state a
+    // consumer reaches by accident, not by hostile input.
+    try rw.setHeader("X-First", "1");
+    try rw.writeAll("a" ** 26);
+    try testing.expect(rw.headSent());
+
+    // The precondition must hold in every optimize mode. When it was
+    // `std.debug.assert(!rw.sent_head)` this call was a no-op in ReleaseFast:
+    // `reset` cleared `ended` and set `body = .buffering` but left
+    // `sent_head` true, so the `end()` below called `writeHead` a SECOND
+    // time and put a second complete status line + header block on the same
+    // connection, leaving the chunked body above unterminated.
+    // Deliberately captured rather than asserted here: the wire is checked
+    // FIRST below, so that a regression is reported as the response-splitting
+    // defect it is rather than as a missing error code.
+    const reset_result = rw.reset();
+
+    try rw.writeAll("bb");
+    try rw.end();
+    const wire = out.buffered();
+
+    // The response-splitting property, asserted directly: exactly one status
+    // line on this connection. This is the assertion that failed in
+    // ReleaseFast before the signature change (it counted 2).
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire, "HTTP/1.1 200 OK\r\n"));
+    // And the framing is intact: the chunked body is terminated exactly once.
+    try testing.expect(std.mem.endsWith(u8, wire, "0\r\n\r\n"));
+    // Only then the contract itself.
+    try testing.expectError(error.HeadersSent, reset_result);
 }
 
 test "ResponseWriter: the copy store is bounded, and says so instead of truncating" {

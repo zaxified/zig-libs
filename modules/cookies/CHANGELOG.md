@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-13** — **BREAKING** `SetError` gains `error.HeaderBytesExhausted`, by inheritance
+  from `http.Server.ResponseWriter.SetHeaderError`. An exhaustive `switch` over
+  `cookies.SetError` stops compiling until it handles the new case; a `catch
+  |e| switch (e) { … else => }` is unaffected. This shipped in the same release
+  as the `set` signature change below and only `http`'s changelog mentioned it,
+  so it is recorded here as the second, independent source-level break it is.
+- **2026-08-13** — `max_set_cookie_bytes` is now pinned by value AND to `http`'s copy store,
+  instead of being asserted by comment. The doc-comment grounded 4096 in two
+  authorities — RFC 6265 §6.1's "at least 4096 bytes per cookie" and `http`'s
+  `header_copy_bytes` — but `header_copy_bytes` was a private `const` this
+  module could not import, so the "same size" property was a duplicated
+  literal, and the constant was unpinned upward: measured, 4096 → **8192 left
+  38/38 green in Debug and ReleaseSafe**. `header_copy_bytes` is public now and
+  imported here, with a comptime floor (the RFC minimum) and ceiling (the
+  writer's store) so the two cannot drift apart in either direction, plus a
+  test that states the value. Note the RFC basis is exact but the fit is not:
+  a maximal conforming cookie is 4096 bytes of `Set-Cookie` VALUE and the
+  header name costs 10 more, so such a cookie does not fit a 4096-byte copy
+  store — which is what the "refused, not truncated" test observes. Recorded
+  rather than silently rounded up; growing it is a per-response memory
+  decision. Purely an addition.
 - **2026-08-13** — **BREAKING** — `set` no longer takes a caller-supplied buffer.
   **What a consumer must change:** drop the third argument, and the local it
   came from.

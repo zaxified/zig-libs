@@ -409,7 +409,10 @@ pub const ProxyHandler = struct {
     /// goes out clean, carrying `Via` so the failing hop is identifiable.
     fn relayFailed(self: *ProxyHandler, rw: *Server.ResponseWriter) anyerror!void {
         if (rw.headSent()) return error.ProxyBackendStreamAborted;
-        rw.reset(); // a partly-relayed header set must not ride the 502
+        // A partly-relayed header set must not ride the 502. `headSent` was
+        // checked on the line above, so the error path is unreachable here —
+        // `try` rather than an assert so it stays that way in ReleaseFast.
+        try rw.reset();
         return gatewayErrorReason(
             rw,
             502,

@@ -265,7 +265,28 @@ pub fn get(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
 /// anyway (`error.HeaderBytesExhausted`, and sooner — the name costs bytes
 /// too). This buffer is therefore never the binding constraint: the refusal a
 /// caller actually meets comes from the writer's own accounting.
+///
+/// That last paragraph used to be maintained by comment on both sides —
+/// `http`'s `header_copy_bytes` was a private `const`, so this file could not
+/// import it and the "same size" property was a duplicated literal. It is
+/// imported now, and the relation is asserted at comptime below, so the two
+/// cannot drift apart silently in either direction.
 pub const max_set_cookie_bytes = 4096;
+
+comptime {
+    // FLOOR — RFC 6265 §6.1: a conforming user agent must support at least
+    // 4096 bytes per cookie. Refusing below that would reject cookies that
+    // work in every real browser. Catches downward drift.
+    std.debug.assert(max_set_cookie_bytes >= 4096);
+    // CEILING — the doc claim above ("never the binding constraint") is only
+    // true while this buffer cannot outgrow the response writer's copy store.
+    // Raising this alone would make `set` accept a value `setHeader` must
+    // then reject, moving the refusal from a clean `BufferTooSmall` here to a
+    // budget error that depends on what else the handler already set.
+    // Catches upward drift. Measured before this assertion existed: 4096 →
+    // 8192 left 38/38 green in Debug AND ReleaseSafe.
+    std.debug.assert(max_set_cookie_bytes <= http.Server.header_copy_bytes);
+}
 
 /// Serialize `sc` and set it as the response's `Set-Cookie` header. Rejects an
 /// invalid cookie (`WriteError`) before touching the response.
@@ -590,6 +611,21 @@ test "set: the cookie outlives the frame it was formatted in" {
     try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid9=4242; Path=/; HttpOnly\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
     try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+}
+
+test "max_set_cookie_bytes: pinned by value and to http's copy store" {
+    // Both directions, because measurement showed neither was covered:
+    // 4096 → 8192 left this suite 38/38 green in Debug and ReleaseSafe, and
+    // the one test that does spend the buffer is written in terms of
+    // `max_set_cookie_bytes ± k`, so it moves with the constant.
+    //
+    // The floor is RFC 6265 §6.1 (a UA must support ≥ 4096 bytes per cookie,
+    // name + value + attributes — i.e. the length of a `Set-Cookie` value).
+    try testing.expectEqual(@as(usize, 4096), max_set_cookie_bytes);
+    // The ceiling is the coupling itself, read from `http` rather than
+    // restated: this is the assertion that would have caught the two
+    // constants drifting apart while both files still claimed "same size".
+    try testing.expect(max_set_cookie_bytes <= http.Server.header_copy_bytes);
 }
 
 test "set: an over-long cookie is refused, not truncated" {

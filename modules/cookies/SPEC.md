@@ -38,10 +38,12 @@ deliberately non-validating on read.
 ## Verification
 Offline tests, green in Debug + ReleaseFast. Parser (7): simple pairs + `find`, OWS trimming,
 valueless cookies, quoted/unbalanced-quote values (incl. a quoted value containing a `;`, which
-does not end the segment), empty-name/first-`=` splitting, degenerate headers. Builder (10): full
-attribute set in RFC order, minimal `name=value`, Domain + pre-formatted Expires, negative Max-Age,
+does not end the segment), empty-name/first-`=` splitting, degenerate headers. Builder (11): full
+attribute set in RFC order, `__Host-`/`__Secure-` prefix constraints, minimal `name=value`,
+Domain + pre-formatted Expires, negative Max-Age,
 `SameSite=Strict`, invalid name/value/Path/Domain rejection, `SameSite=None` both branches,
-`BufferTooSmall`. `http` helpers (3): an end-to-end `get`+`set` over `http.Server.serveStream`;
+`BufferTooSmall`. Constants (1): `max_set_cookie_bytes` pinned by value and to `http`'s
+`header_copy_bytes`. `http` helpers (3): an end-to-end `get`+`set` over `http.Server.serveStream`;
 an anchor for the copy `set` depends on — a `noinline` helper sets the cookie from its own frame,
 returns, and a second `noinline` deliberately clobbers that frame before `end()` runs, so the
 value read off the wire proves `setHeader` copied rather than borrowed (`serveStream` offers no
