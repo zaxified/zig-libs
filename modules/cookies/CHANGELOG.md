@@ -42,3 +42,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   returns, and a second `noinline` deliberately clobbers that frame before
   `end()` runs. That test fails if the copy in `http` is ever removed — the old
   suite did not.
+- **2026-07-19** — Security audit: one finding fixed (part of the collection-wide audit;
+  the root changelog records no further detail than this). Modeled on RFC 6265 §4.2/§5.4
+  behavior (no single reference implementation named; anchored to the RFC text
+  directly).

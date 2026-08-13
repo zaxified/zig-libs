@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-11** — Security audit: four findings fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Verified: byte-exact against the
+  IBM/Cowlishaw General Decimal Arithmetic `decTest` suite v2.62.
 - **2026-07-29** — The two types can finally exchange values, and `BigDecimal` covers the
   rest of the `java.math.BigDecimal` / GDA surface. `Decimal.toBigDecimal`
   is exact and total (a `Decimal` *is* `raw × 10^-12`);

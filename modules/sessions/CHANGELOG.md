@@ -17,3 +17,5 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   predictable ids mean session hijack across every logged-in user at once.
   It now aborts rather than hand out a guessable id. `id_bytes` and the hex
   encoding are unchanged.
+- **2026-07-18** — Security audit: one finding fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit.

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-06** — Security audit: three findings fixed, two documented as accepted (not
+  defects) — part of the collection-wide audit. Verified: byte-exact against three
+  independently-verified upstream vector sources (each pinned by commit hash and file
+  SHA-256).
 - **2026-07-29** — New module: Rescue-Prime Optimized (RPO) over Goldilocks
   `p = 2^64 - 2^32 + 1`, at both published instances (`m = 12`, `m = 16`),
   both sponge framings that exist upstream, and the paper's round order

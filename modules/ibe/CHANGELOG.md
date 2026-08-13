@@ -16,3 +16,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-08-12** — `Scheme.setup`'s master secret key is covered by the same change one
   layer down — it comes from `bls12_381`'s `Fr.random`, which moved to
   `entropy.fill` in the same sweep. See that module's changelog.
+- **2026-07-18** — Security audit: four findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Byte-exact against a
+  genuine `drand`-produced ciphertext, via the shared `tlock` parameterisation.

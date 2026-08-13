@@ -20,3 +20,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   group primitives still use `io.random`. They were left deliberately —
   they are general-purpose arithmetic helpers with no secret-bearing caller
   in this repo, and `Fr.random` was migrated because it has one.
+- **2026-07-18** — Security audit: five findings fixed, four documented as accepted (not
+  defects) — part of the collection-wide audit. Byte-exact against RFC 9380's published
+  test vectors.

@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-06** — Security audit: five findings fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Modeled on Prometheus TSDB / OpenTSDB /
+  InfluxDB TSM (design ref), over `kvtree` (design reference, not a test anchor).
 - **2026-07-30** — New module: time-series persistence over `kvtree` — series identity,
   append, streaming range scans, retention by age. Filed as a layer over
   `kv`; that premise was wrong and was not followed. `kv` is a Bitcask log

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-07** — Security audit: seven findings fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit.
 - **2026-07-29** — Malicious-server detection (`Verified(...)`). The module's model was
   honest-but-curious: a server learned nothing about the index but was
   assumed to answer honestly, so a doctored share made the client

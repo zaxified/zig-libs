@@ -29,3 +29,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   nonce under one `Rm` leaks the XOR of two cookies. Both now fail closed.
   The deterministic test seams `initWithSecret` and `createReplyWithNonce`
   are untouched, so every KAT and replay test still supplies its own bytes.
+- **2026-08-11** — Security audit: eleven findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified: KDF
+  byte-exact vs the official wireguard-go `device/kdf_test.go` vectors
+  (`noise.zig:234-272`); `Ck0`/`H0` cross-checked vs independent Python BLAKE2s
+  (`:291-306`).

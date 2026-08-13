@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-11** — Security audit: fifteen findings fixed, one documented as accepted
+  (not defects) — part of the collection-wide audit. Modeled on Caffeine (Java,
+  conceptual) (design reference, not a test anchor).
 - **2026-07-29** — A thread-safe option, `Sharded` — N independent `Cache` instances, one
   lock each, picked by a hash of the key. `Cache` is unchanged and stays
   `single_owner`/lock-free; the five modules that own one from a single

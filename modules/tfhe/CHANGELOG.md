@@ -30,3 +30,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   go through `entropy.SecureSource`; see `CONVENTIONS.md` §2.2.
   Two tests pin the shape: one reads the signatures at comptime, one shows the
   `std.Io` path actually draws (two keys from one `io` differ) and round-trips.
+- **2026-07-18** — Security audit: three findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Modeled on TFHE-rs
+  (Rust) / OpenFHE binfhe (C++) (design reference, not a test anchor).

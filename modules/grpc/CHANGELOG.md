@@ -16,6 +16,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   it, so a middleware wrapped around the gRPC router can still touch the head.
   The frames on the wire are unchanged.
 
+- **2026-08-06** — Security audit: five findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified: live
+  bidirectional interop against a real Python `grpcio` server and client.
 - **2026-07-30** — New module: a gRPC **client** over HTTP/2, per the `grpc-over-http2`
   specification — the layer between the `http` module's multiplexing h2
   client and the `protobuf` codec, with no code generation (a method is a

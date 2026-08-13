@@ -29,6 +29,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   than mint a group history from a degraded seed. The old doc comment
   justified `io.random` by pointing at `signal` and `std`'s Ed25519
   keygen; that comparison is gone with it.
+- **2026-08-06** — Security audit: four findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Modeled on
+  `matrix-org/olm` (libolm) + `vodozemac` (design reference, not a test anchor).
 - **2026-07-29** — New module: Matrix's Megolm group ratchet, the third real-world
   group-messaging construction here alongside `signal` (pairwise Double
   Ratchet) and `mls` (RFC 9420). A one-way four-part HMAC-SHA-256 hash

@@ -19,3 +19,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   so. The account key authenticates every request to the CA for the life
   of the account and a certificate key is what a publicly-trusted
   certificate attests to; neither is recoverable after the fact.
+- **2026-07-18** — Security audit: two findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified against RFC
+  8555 §6.2.

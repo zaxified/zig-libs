@@ -19,3 +19,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `csrf` issues its token there; both writes were being swallowed as
   `error.HeadersSent` on every preflight. The status, headers and (absence
   of) body of the 204 are unchanged.
+- **2026-07-19** — Security audit: one finding fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Modeled on rs/cors (Go), expressjs/cors,
+  gin-contrib/cors (design reference, not a test anchor).

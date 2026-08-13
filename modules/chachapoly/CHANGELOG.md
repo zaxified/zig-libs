@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-11** — Security audit: eleven findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Byte-exact against RFC
+  8439's published test vectors.
 - **2026-07-19** — Performance: a SIMD implementation now beats OpenSSL's AVX2 keystream
   throughput on the reference host (part of a collection-wide
   performance campaign; the root changelog records no further detail

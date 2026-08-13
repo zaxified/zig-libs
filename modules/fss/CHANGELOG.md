@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-11** — Security audit: one finding fixed (part of the collection-wide audit;
+  the root changelog records no further detail than this). Verified against an
+  independent Python re-derivation of the same BGI16 construction — a genuine
+  second-implementation oracle, not a self-round-trip.
 - **2026-07-29** — `Mpf.evalEachFullWith` / `evalFullWith` / `evalFull` — the multi-point
   counterpart, and the interleaved walk the `Dpf.evalFull` entry below
   recorded as the right answer for `Multi(k)`. ONE descent of the domain

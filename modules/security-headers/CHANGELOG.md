@@ -32,3 +32,5 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   itself is read off `http.Server.ResponseWriter`'s actual field via
   `@FieldType`, not duplicated as a literal, so it cannot drift out of sync
   with `http`'s real value.
+- **2026-07-19** — Security audit: no findings. Modeled on helmet.js, OWASP Secure
+  Headers Project, gin-contrib/secure (design reference, not a test anchor).

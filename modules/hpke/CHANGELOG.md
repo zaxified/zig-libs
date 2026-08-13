@@ -34,6 +34,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `mls` inherits the change through `S.Kem.generateKeyPair` (its
   `UpdatePath` leaf key) without any edit of its own.
 
+- **2026-08-11** — Security audit: two findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Byte-exact against RFC
+  9180's published test vectors.
 - **2026-07-28** — `mode_psk`, `mode_auth` and `mode_auth_psk` are now anchored to RFC
   9180's own Appendix A vectors (A.1.2/3/4 for X25519, A.3.2/3/4 for
   P-256) instead of only to this module's round-trip; the implementations

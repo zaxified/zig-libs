@@ -17,6 +17,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   ⚠ Not covered by this change: `S.Kem.generateKeyPair(params.io)` on the
   next line bottoms out in `io.random` **inside std**, which no call-site
   change here can reach.
+- **2026-08-11** — Security audit: four findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Byte-exact against the
+  mlswg/mls-implementations official interop test vectors.
 - **2026-07-29** — External Commits (RFC 9420 §12.4.3.2) — joining a group **without an
   invitation**. Until now the only way in was a Welcome, which requires
   an existing member to have added you; an external Commit lets a

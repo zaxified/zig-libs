@@ -16,3 +16,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   one credential, which is precisely what the scheme exists to prevent.
   `mockedRandomScalars` — the draft's deterministic mocked RNG — is
   untouched, and the KAT path never went near `io` in the first place.
+- **2026-07-18** — Security audit: four findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified: byte-exact
+  against `mattrglobal/pairing_crypto`'s official draft-irtf-cfrg-bbs-signatures-04
+  fixtures.

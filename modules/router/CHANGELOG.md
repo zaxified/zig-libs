@@ -15,3 +15,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   the router could: the redirect is answered *outside* the middleware chain,
   so no `next.run` post-step was ever watching. The bytes on the wire are
   unchanged.
+- **2026-07-19** — Security audit: one finding fixed (part of the collection-wide audit;
+  the root changelog records no further detail than this). Modeled on Go chi /
+  julienschmidt/httprouter (design reference, not a test anchor).

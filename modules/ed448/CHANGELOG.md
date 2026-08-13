@@ -17,3 +17,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   from it), so a degraded draw is a recoverable DH secret or a forgeable
   signature. `generateDeterministic` / `create` are untouched — a
   caller-supplied seed stays a caller-supplied seed.
+- **2026-07-18** — Security audit: six findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Byte-exact against RFC
+  8032 §7.4's published test vectors.

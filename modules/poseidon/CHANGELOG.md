@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-06** — Security audit: two findings fixed, two documented as accepted (not
+  defects) — part of the collection-wide audit. Verified: byte-exact against the
+  Poseidon authors' own `hadeshash` test vectors, all four published GF(p) instances.
 - **2026-07-29** — New module: the Poseidon ZK-friendly hash over `bn254` (circomlib's
   parameters, `t = 2..17`) and `bls12_381` (the authors'
   `poseidonperm_x5_255_{3,5}`). The sibling `groth16` and `bulletproofs`

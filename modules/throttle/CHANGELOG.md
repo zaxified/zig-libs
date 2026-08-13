@@ -16,3 +16,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   there, and on a 503 both writes were being swallowed as
   `error.HeadersSent`. The status, headers and body of the 503 are
   unchanged.
+- **2026-07-19** — Security audit: one finding fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Modeled on Go
+  `golang.org/x/sync/semaphore` (slot semantics) + SEDA / Netflix concurrency-limits
+  (bounded queue, shed) (design reference, not a test anchor).

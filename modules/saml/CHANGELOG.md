@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-06** — Security audit: five findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified: against real
+  `xmlsec1`-produced XML-Encryption and OpenSSL-signed fixtures.
 - **2026-07-28** — Holder-of-Key subject confirmation now performs **cross-form** matching
   (an `<ds:X509Certificate>` confirmation against a configured bare
   `presented_holder_key`, and a `<ds:KeyValue>` confirmation against a

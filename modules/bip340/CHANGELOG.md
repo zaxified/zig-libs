@@ -30,3 +30,5 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   comptime `taggedHash`/`taggedHasher` remain the fast path. New
   `xonlyBytesOf` (33-byte compressed → 32-byte x-only), also moved out of
   the sibling `lninvoice` module.
+- **2026-07-18** — Security audit: no findings. Byte-exact against BIP340's published
+  test vectors.

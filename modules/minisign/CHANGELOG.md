@@ -18,6 +18,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   deliberately stays on `io.random`: it is published in the clear in every
   `.pub` and `.sig` file, so it is an identifier, not a secret.
 
+- **2026-08-06** — Security audit: three findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified: live against
+  the real `minisign` 0.12 binary (`minisign -V`).
 - **2026-07-28** — New module: sign/verify in the minisign file format over Ed25519, both
   legacy (`Ed`) and prehashed-BLAKE2b (`ED`), including scrypt-encrypted
   secret keys and the trusted-comment global signature. Byte-exact

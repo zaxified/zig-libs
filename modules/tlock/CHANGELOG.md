@@ -15,3 +15,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   its round, which is the single property the construction sells, so the
   draw now fails closed. The KAT path is untouched — `encrypt` still takes
   `sigma` as an explicit parameter, and every fixture supplies its own.
+- **2026-07-18** — Security audit: two findings fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Verified: byte-exact bidirectional
+  interop against a genuine `drand/tlock` Go `tle` ciphertext.

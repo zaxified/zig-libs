@@ -15,3 +15,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   rather than a side effect: `sessions` saves its cookie there and `csrf`
   issues its token there, and on a 429 both writes were being swallowed as
   `error.HeadersSent`. The status, headers and body of the 429 are unchanged.
+- **2026-07-19** — Security audit: three findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Modeled on Go
+  `golang.org/x/time/rate` (token bucket) + nginx `limit_req` (keyed store) (design
+  reference, not a test anchor).

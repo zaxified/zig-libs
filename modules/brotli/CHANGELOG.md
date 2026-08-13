@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-06** — Security audit: four findings fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Byte-exact against RFC 7932 Appendix A's
+  published test vectors.
 - **2026-07-29** — The encoder now actually compresses. It was store-mode only (ratio
   ~1.0); it now does LZ77 backward references plus a per-meta-block
   Huffman code for literals, insert-and-copy commands and distances, with

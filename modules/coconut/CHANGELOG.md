@@ -28,3 +28,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   deterministic issuance; test suites that do can call the new
   `keygenSeededForTest` / `proveCredentialSeededForTest`, whose names are the
   signal. New public `Entropy` union backs both paths.
+- **2026-07-18** — Security audit: two findings fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Modeled on `asonnino/coconut` (Python) /
+  `nymtech/coconut` (Rust/Go) — no byte-exact vector exists for Coconut; anchored
+  internally on the deterministic PS pairing-verify identity (design reference, not a
+  test anchor).

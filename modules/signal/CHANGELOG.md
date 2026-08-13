@@ -27,3 +27,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   published vectors are reproducible because `xeddsa.sign` takes its
   randomness `z` as a **parameter**, which the tests fill from
   `io.random`; no vector depends on where a keypair's seed came from.
+- **2026-07-18** — Security audit: two findings fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Modeled on `libsignal` (Rust/C, Signal
+  Foundation) (design reference, not a test anchor).

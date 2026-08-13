@@ -14,3 +14,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   session's answer cannot resolve another session's pending request.
   **Fix:** the `application/json` response body previously concatenated
   every line the server wrote instead of emitting just the response.
+- **2026-07-19** — Security audit: two findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Modeled on the
+  official MCP Streamable HTTP transport implementations (TypeScript SDK, `mcp_dart` —
+  cited in the module's own `model_after`) (design reference, not a test anchor).

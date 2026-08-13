@@ -30,3 +30,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   than `std.Io.random`; see `CONVENTIONS.md` §2.2. Two tests pin the shape: one reads the signatures at
   comptime, one shows the `std.Io` path actually draws (two keypairs, and two
   encryptions of the same plaintext, differ) and round-trips.
+- **2026-08-11** — Security audit: six findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified: NTT +
+  RNS/CRT are byte-exact vs an independent Python re-derivation (`kat_vectors.zig` /
+  `kat_test.zig:60-77`).

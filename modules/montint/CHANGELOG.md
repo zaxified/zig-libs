@@ -31,6 +31,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   Covered now in **both** copies of the routine, `montint.condSubTop` and
   `asm_core.condSub` (the latter at `n = 32`, the smallest width the dispatch
   routes there); each is caught only by its own constructed case.
+- **2026-07-21** — Security audit: one finding fixed, one documented as accepted (not
+  defects) — part of the collection-wide audit. Byte-exact against an independent
+  CPython bignum oracle at 256/512/2048/4096-bit.
 - **2026-07-18** — Performance: gained an asm/Montgomery core (part of a collection-wide
   performance campaign that also covered the sibling `k256`/`p256`
   modules; the root changelog records no further detail than this).

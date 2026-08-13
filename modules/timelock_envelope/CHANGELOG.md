@@ -20,3 +20,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `generate` now aborts instead of producing one silently. `seal` still
   takes `SealRandomness` as an explicit parameter; the KAT path is
   unaffected.
+- **2026-08-06** — Security audit: two findings fixed (part of the collection-wide
+  audit; the root changelog records no further detail than this). Verified against
+  genuine League-of-Entropy quicknet data, inherited from `tlock`/`drand`.
