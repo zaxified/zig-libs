@@ -1701,6 +1701,27 @@ fn checkAnchors(b: *std.Build, io: std.Io, failed: *bool) !void {
             );
             failed.* = true;
         }
+        // SOURCE vs NOTE. A row whose NOTE opens `CLOSED`/`DONE` is a closed
+        // task, so its SOURCE must say so; leaving the tool named there reads as
+        // outstanding work. This is the same drift as the SELF case above and it
+        // rots the same way -- the difference is only which column the closer
+        // forgot. It fired on NINETEEN rows when written (2026-08-14), which is
+        // why the file's header had been claiming twenty open tasks for a week
+        // while nineteen of them were finished and written up.
+        if (trow.note) |note| {
+            const closed = std.mem.startsWith(u8, note, "CLOSED") or std.mem.startsWith(u8, note, "DONE");
+            const open_source = !std.mem.eql(u8, src, "DONE") and !std.mem.eql(u8, src, "NONE");
+            if (closed and open_source) {
+                std.log.err(
+                    "module '{s}': ANCHOR-TASKS.tsv NOTE opens with the task closed, but SOURCE still names " ++
+                        "'{s}' -- a reader counting open tasks by SOURCE counts this one. Set SOURCE to DONE " ++
+                        "(the anchoring landed) or NONE (nothing external exists), and re-grade ANCHORS.tsv " ++
+                        "from the module's TESTS while you are there",
+                    .{ trow.name, src },
+                );
+                failed.* = true;
+            }
+        }
     }
 }
 
@@ -1713,6 +1734,11 @@ const AnchorRow = struct {
     /// type saying which file a row came from, so a check that only makes
     /// sense on the tasks file cannot silently read garbage off the other one.
     source: ?[]const u8,
+    /// `ANCHOR-TASKS.tsv`'s 7th column, `null` for an `ANCHORS.tsv` row. Read
+    /// for one thing only: whether it OPENS with `CLOSED` or `DONE`, which is
+    /// how a closed task is written down. Its prose is never parsed further --
+    /// the NOTE is a lead, not evidence.
+    note: ?[]const u8,
 };
 
 /// Parse the `module<TAB>CLASS<TAB>ANCHOR<TAB>...` rows both `ANCHORS.tsv` and
@@ -1734,11 +1760,14 @@ fn parseAnchorRows(content: []const u8, b: *std.Build) []const AnchorRow {
         const anchor = cols.next() orelse continue;
         _ = cols.next(); // EVIDENCE -- free text, deliberately not validated.
         const source = cols.next();
+        _ = cols.next(); // COST -- S/M/L, advisory only.
+        const note = cols.next();
         out.append(b.allocator, .{
             .name = name,
             .class = class,
             .anchor = anchor,
             .source = source,
+            .note = note,
         }) catch @panic("OOM");
     }
     return out.toOwnedSlice(b.allocator) catch @panic("OOM");
