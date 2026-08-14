@@ -3,8 +3,11 @@
 [![CI](https://github.com/zaxified/zig-libs/actions/workflows/ci.yml/badge.svg)](https://github.com/zaxified/zig-libs/actions/workflows/ci.yml)
 
 A curated collection of **foundational Zig modules** — performance-minded, universal where
-possible, each modeled after a proven implementation in another language rather than invented from
-scratch.
+possible, and built against something that already exists: a published specification, a set of
+released test vectors, or a proven implementation in another language, rather than invented from
+scratch. Which of those a module was built against is stated in its own README's `Provenance:`
+line, and they are not interchangeable — many modules here are clean-room from a spec and studied
+no third-party implementation at all.
 
 Not a dumping ground: ship **solid, not many**. Every member is a foundational,
 cross-project-reusable capability — a production-grade implementation of a protocol/format/algorithm,
@@ -12,8 +15,9 @@ or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home
 authors' other projects depend on it, not the reverse.
 
 **Status:** 225 modules (Zig 0.16, green in all three release lanes — `ReleaseSafe`,
-`ReleaseFast`, `-Dstrict-debug`) · **MIT** (see `LICENSE`;
-third-party-derived wire formats & required attributions in `NOTICE`).
+`ReleaseFast`, `-Dstrict-debug`) · **MIT** (see `LICENSE`). `NOTICE` answers one question —
+whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
+carry their own attribution; it does not catalogue provenance.
 
 ## Using a module
 
@@ -32,16 +36,22 @@ third-party-derived wire formats & required attributions in `NOTICE`).
 zig build test           # run all module tests
 zig build test-<name>    # run one module's tests
 zig build check-catalog  # verify build.zig's module_list ↔ modules/ ↔ this README agree
-zig build check-changelog # verify the root CHANGELOG index ↔ the per-module changelogs agree
+zig build check-changelog # verify every module has a dated, well-formed CHANGELOG.md
 ```
+
+`zig build -l` lists the rest, including the other `check-*` gates.
 
 ## Versioning & stability
 
 Releases are dated git tags (`YYYY-MM-DD`), **not** semantic versions, and there are no
 per-module versions; a tag asserts exactly one thing, that every module passed every lane at
-that commit. `v0.1.0` remains as history. Detail lives in `modules/<name>/CHANGELOG.md` with
-breaking changes flagged `BREAKING`; the root `CHANGELOG.md` is the index of which modules
-have one, and `zig build check-changelog` keeps the two in step. Module maturity is carried
+that commit. `scripts/tag.sh` cuts one. `v0.1.0` remains as history and is still the only tag
+in the repository — no dated release has been cut yet, so pin a commit until one is. Detail
+lives in `modules/<name>/CHANGELOG.md` with breaking changes flagged `BREAKING`;
+`zig build check-changelog` enforces that every module has one and that it is dated and
+well-formed. The root `CHANGELOG.md` carries the release policy and per-release notes — it
+stopped indexing which modules have a changelog on 2026-08-14, since all of them do and the
+index was a copy kept only so a gate could notice the copy had gone stale. Module maturity is carried
 by the explicit caveat lines in the catalog
 below (and each module's `SPEC.md`), not by stability-tier labels — every module meets the
 same bar (tests green in all three release lanes — `ReleaseSafe`, `ReleaseFast`,
@@ -58,6 +68,9 @@ CHANGELOG.md   # per-release changes, grouped by module
 CONVENTIONS.md # naming + `meta` tag vocabulary + provenance/SPDX + versioning rules
 modules/<name>/src/root.zig  # `// SPDX-License-Identifier: MIT`, `pub const meta`, API, tests
 modules/<name>/README.md     # what it is + a Provenance line
+modules/<name>/SPEC.md       # wire format, limits, anchoring, what is deliberately not done
+modules/<name>/CHANGELOG.md  # dated entries, breaking changes flagged
+modules/<name>/NOTICE        # only when something is attributed or a provenance argument is needed
 ```
 
 `CONVENTIONS.md` has the full rules; `modules/_template/` is the starting point for a new module.
@@ -327,25 +340,18 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 ## Roadmap / not yet built
 
-Research-verdicted **DON'T-BUILD-YET** — no consumer demands them today; see each
-module's `SPEC.md` (once built) or the git history for the full reasoning and the
-"when greenlit" path for each:
+Work deferred with a reason, not forgotten. A module's own `SPEC.md` carries its
+deferred list; only cross-module scope decisions belong here.
 
 - **`kv` on-disk MVCC / transactions / ordered scans** — shipped as the separate
   `kvtree` module (copy-on-write B-tree; `kv` v0 stays for point-store consumers
-  like `jobqueue`). The transactional core (`commit`/`recover`/reclaim gate) is
-  implemented and its property + crash-sweep tests run for real. Remaining work =
-  grow the crash sweep into a full randomized VOPR (fuzzed op/crash schedules
-  chained across epochs) and add merge/overflow-page/freelist-chaining (backlog).
+  like `jobqueue`). The transactional core, the randomized VOPR and freelist
+  chaining are all implemented. What remains is in `modules/kvtree/SPEC.md`'s
+  deferred list — overflow pages for oversized entries, node merge/rebalance on
+  underflow, and automatic reclamation thresholds — not here.
 
-Researched and **queued to build**, listed here so the Non-goals section below is
-not read as covering them:
-
-- **IMAP client** — no pure-Zig IMAP exists, so this is a port rather than an
-  adopt: `emersion/go-imap` v2 (MIT), chosen for its transport seam — it takes an
-  already-connected socket and runs every protocol path over reader/writer
-  interfaces, which is the shape `http` and `dtls` already have. Previously
-  listed under "Won't build", which stopped being true once the port was scoped.
+Nothing is currently queued to build. The **IMAP client** that stood here was
+built on 2026-07-31 and ships as the `imap` module in the catalog above.
 
 ## Non-goals — deliberately not built here
 
