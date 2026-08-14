@@ -362,10 +362,18 @@ dark_check() {
 
 # ── file -> module mapping ───────────────────────────────────────────────
 
+# ⚠ A BASE REF THAT DOES NOT RESOLVE MUST NOT LOOK LIKE "NOTHING CHANGED".
+# `git diff` against a bad ref fails, `2>/dev/null` hid it, the file list came
+# back empty and the caller printed "nothing to test" and exited 0 — a gate
+# that tested nothing and said so in language nobody reads as a failure. That
+# is reachable in CI: a force-push, a shallow clone with no merge base, or
+# `github.event.before` being all-zeros on a branch's first push. Returns
+# non-zero instead, and the caller escalates to the full run.
 changed_files() {
     local base_ref="$1"
     if [[ -n "$base_ref" ]]; then
-        { git diff --name-only "$base_ref" --
+        git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null || return 1
+        { git diff --name-only "$base_ref" -- || return 1
           git ls-files --others --exclude-standard
         } 2>/dev/null
     else
@@ -492,7 +500,13 @@ capability_check() {
 cmd_changed() {
     local base_ref="${1:-}"
     local files
-    files="$(changed_files "$base_ref" | sort -u)"
+    if ! files="$(changed_files "$base_ref")"; then
+        echo "changed: base ref '$base_ref' does not resolve here — cannot compute a narrower set," >&2
+        echo "         so running everything rather than reporting nothing to do." >&2
+        cmd_all "${@:2}"
+        return
+    fi
+    files="$(printf '%s\n' "$files" | sort -u)"
 
     if [[ -z "$files" ]]; then
         echo "changed: no changed/staged/untracked files$( [[ -n "$base_ref" ]] && echo " vs $base_ref" ) — nothing to test"

@@ -36,7 +36,16 @@ on:
 #   pull_request        -> `test.sh changed`, one lane. Tests the modules the
 #                          branch touched plus their reverse-dependency
 #                          closure, computed from `zig build module-graph`.
-#   push to main / tag  -> `test.sh all`, three optimize lanes.
+#   push to main        -> the same scoped lane, against the previous head.
+#   tag                 -> `test.sh all`, every optimize lane and both
+#                          architectures.
+#
+# THE FULL MATRIX RUNS ON TAGS AND NOT ON EVERY PUSH, decided 2026-08-14 after
+# the first run of it took over 95 minutes per lane. A tag is the only thing in
+# this repository that CLAIMS every module passed every lane, so it is the thing
+# that should pay for the claim; a push to main claims nothing of the sort and
+# should not cost six runner-hours to say so. The scoped lane still gates every
+# push, and it is minutes.
 #
 # WHY SCOPING IS SOUND, rather than merely cheaper. The driver decides the
 # escalation from the GRAPH, not from which file was edited: it keeps a
@@ -96,7 +105,7 @@ on:
 # it the lanes shared one entry and clobbered it every run.
 jobs:
   scoped:
-    if: github.event_name == 'pull_request'
+    if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-latest
     name: changed modules + reverse-dep closure
     steps:
@@ -112,11 +121,22 @@ jobs:
           # Under the 10 GB repository quota with room for the entry to grow
           # rather than be evicted the moment it does.
           cache-size-limit: 6144
+      # The base differs by event, and a base that does not resolve is NOT
+      # allowed to read as "nothing changed" — `changed_files` fails and the
+      # driver escalates to the full run rather than passing having tested
+      # nothing. That matters here: `github.event.before` is all-zeros on a
+      # branch's first push.
       - name: Test changed modules
-        run: bash scripts/test.sh changed "origin/${{ github.base_ref }}"
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          bash scripts/test.sh changed "$base"
 
   full:
-    if: github.event_name == 'push'
+    if: startsWith(github.ref, 'refs/tags/')
     strategy:
       fail-fast: false
       matrix:

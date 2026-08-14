@@ -105,17 +105,53 @@ section() {
 # 13.3 s twice in a row), so re-running the suites just to count their tests
 # would roughly double the gate.
 _ZL_KEEP_OUT=""
+
+# A step prints nothing until it returns. On a terminal that is fine -- you can
+# see the machine working. In CI it is not: `build+test` ran 95 minutes on a
+# GitHub runner with the log frozen on the PREVIOUS step's line, which is
+# indistinguishable from a hang, and the right reaction to a hung run is to kill
+# it. A healthy run that reads as a dead one is a broken gate whatever it
+# verifies.
+#
+# So off a terminal each step announces itself and a heartbeat reports it is
+# still alive while it runs. Deliberately a heartbeat and not streamed output:
+# the command's stdout and stderr are captured to files that the
+# stderr-on-success rule and the failure replay are both built on, and piping
+# them through `tee` to get them into the log at the same time races the reader
+# of those files. The question CI needs answered is "is this alive", not "what
+# is it printing" -- the full output is replayed on failure either way.
+#
+# Locally nothing changes: `-t 1` is true and the aligned one-line-per-step
+# table stays exactly as it was.
+_ZL_HEARTBEAT_S=${_ZL_HEARTBEAT_S:-60}
+_zl_tty() { [[ -t 1 ]]; }
+
 step() {
     local label="$1"; shift
     local out err
     out=$(mktemp)
     err=$(mktemp)
-    local t0 t1 dur rc=0
+    local t0 t1 dur rc=0 hb=""
     t0=$(_now)
+    if ! _zl_tty; then
+        printf '  > %s ... started %s\n' "$label" "$(date -u +%H:%M:%SZ)"
+        # Subshell, so killing it later cannot reach anything else.
+        ( local n=0
+          while sleep "$_ZL_HEARTBEAT_S"; do
+              n=$(( n + _ZL_HEARTBEAT_S ))
+              printf '  . %s ... still running (%ss)\n' "$label" "$n"
+          done ) &
+        hb=$!
+    fi
     # ${arr[@]+"${arr[@]}"} — expands to nothing when _ZL_CAP is empty, on
     # bash 3.2 too, where a bare "${arr[@]}" on an empty array is an error.
     _zl_cap_argv
     ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} "$@" >"$out" 2>"$err" || rc=$?
+    # `|| true` is load-bearing: `wait` on a killed child returns 143, that is
+    # the status of the whole && list, and `set -e` then takes the script down
+    # at the first step it ever runs. Off a TTY only, so a terminal run never
+    # showed it.
+    if [[ -n "$hb" ]]; then kill "$hb" 2>/dev/null || true; wait "$hb" 2>/dev/null || true; fi
     t1=$(_now)
     dur=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
 
