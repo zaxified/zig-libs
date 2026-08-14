@@ -151,7 +151,16 @@ step() {
     # the status of the whole && list, and `set -e` then takes the script down
     # at the first step it ever runs. Off a TTY only, so a terminal run never
     # showed it.
-    if [[ -n "$hb" ]]; then kill "$hb" 2>/dev/null || true; wait "$hb" 2>/dev/null || true; fi
+    # `pkill -P` FIRST: killing the subshell leaves the `sleep` it is blocked
+    # on running as a separate child, and GitHub lists one "Terminate orphan
+    # process: (sleep)" per step at job cleanup. `|| true` on each, because
+    # `wait` on a killed child returns 143 and `set -e` would take the script
+    # down at the first step.
+    if [[ -n "$hb" ]]; then
+        pkill -P "$hb" 2>/dev/null || true
+        kill "$hb" 2>/dev/null || true
+        wait "$hb" 2>/dev/null || true
+    fi
     t1=$(_now)
     dur=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
 
