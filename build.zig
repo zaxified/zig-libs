@@ -1636,26 +1636,71 @@ fn checkAnchors(b: *std.Build, io: std.Io, failed: *bool) !void {
 // `zig build check-fuzz` — the fuzz-coverage gate.
 // ---------------------------------------------------------------------------
 
-/// A row of `FUZZ-EXEMPT.tsv`: `module<TAB>REASON<TAB>EVIDENCE`.
-const FuzzExemptRow = struct {
-    name: []const u8,
+/// A module's fuzz exemption, read from the one line that states it:
+///
+///     **Fuzz exemption:** EMIT-ONLY
+///     **Fuzz exemption:** PRE-PARSED via <sibling>
+///
+/// followed by the argument in prose. It lived in a root-level `FUZZ-EXEMPT.tsv`
+/// until 2026-08-14, where it was one row: a repository-level table holding a
+/// single fact about a single module, which is the shape the anchor tables had
+/// just been retired for. The file's own header had predicted the opposite
+/// failure -- "if this file grows past a handful of rows, the derivation is
+/// wrong" -- and it never grew.
+const FuzzExemption = struct {
+    /// `EMIT-ONLY` or `PRE-PARSED`. Validated by the caller, not here, so a
+    /// malformed reason is reported against the module rather than swallowed.
     reason: []const u8,
+    /// The sibling named after `via`, for `PRE-PARSED`. Empty for `EMIT-ONLY`.
+    sibling: []const u8,
+    /// Everything after the line up to the next `## ` heading -- the argument
+    /// the exemption rests on, which rule 5 requires to be present.
     evidence: []const u8,
+    path: []const u8,
 };
 
-fn parseFuzzExemptRows(content: []const u8, b: *std.Build) []const FuzzExemptRow {
-    var out: std.ArrayList(FuzzExemptRow) = .empty;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        var cols = std.mem.splitScalar(u8, line, '\t');
-        const name = cols.next() orelse continue;
-        const reason = cols.next() orelse continue;
-        const evidence = std.mem.trim(u8, cols.next() orelse "", " ");
-        out.append(b.allocator, .{ .name = name, .reason = reason, .evidence = evidence }) catch @panic("OOM");
+/// Read a module's fuzz exemption, or null when it claims none.
+///
+/// A module with NO exemption is the normal case and null is the right answer
+/// for it: the caller then holds it to the obligation, which is the safe
+/// direction. A module with a PRESENT but malformed line is a different thing
+/// entirely and must not read as "no exemption" -- that would be a silent pass
+/// for whoever typoed it, so it is reported and treated as a failure.
+fn moduleFuzzExemption(b: *std.Build, io: std.Io, name: []const u8, failed: *bool) ?FuzzExemption {
+    const needle = "**Fuzz exemption:** ";
+    var path = b.fmt("modules/{s}/SPEC.md", .{name});
+    b.build_root.handle.access(io, path, .{}) catch {
+        path = b.fmt("modules/{s}/README.md", .{name});
+    };
+    const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch return null;
+
+    const at = std.mem.indexOf(u8, src, needle) orelse return null;
+    if (std.mem.indexOfPos(u8, src, at + needle.len, needle) != null) {
+        std.log.err("module '{s}': {s} states a fuzz exemption twice", .{ name, path });
+        failed.* = true;
+        return null;
     }
-    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+
+    const rest = src[at + needle.len ..];
+    const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
+
+    var reason = line;
+    var sibling: []const u8 = "";
+    const via = " via ";
+    if (std.mem.indexOf(u8, line, via)) |v| {
+        reason = std.mem.trim(u8, line[0..v], " \t");
+        sibling = std.mem.trim(u8, line[v + via.len ..], " \t`");
+    }
+
+    const after = rest[line_end..];
+    const stop = std.mem.indexOf(u8, after, "\n## ") orelse after.len;
+    return .{
+        .reason = reason,
+        .sibling = sibling,
+        .evidence = std.mem.trim(u8, after[0..stop], " \t\r\n"),
+        .path = path,
+    };
 }
 
 /// What `checkFuzz` learns about one module by reading its sources.
@@ -1707,7 +1752,7 @@ const FuzzScan = struct {
 /// bookkeeping that is already independently policed, and then checks coverage
 /// against the code.
 ///
-/// `FUZZ-EXEMPT.tsv` exists for the residue — cases where condition 2 is true
+/// A module's own `**Fuzz exemption:**` line exists for the residue — cases where condition 2 is true
 /// but the bytes are ours (`metrics` takes `[]const u8` metric NAMES, authored
 /// by our own callers, and never parses the exposition format it emits). It has
 /// ONE row, and five rules keep it that way; see `checkFuzzExempt`. It is not
@@ -1850,9 +1895,6 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
     const b = step.owner;
     const io = b.graph.io;
 
-    const exempt_src = try b.build_root.handle.readFileAlloc(io, "FUZZ-EXEMPT.tsv", b.allocator, .limited(1 * 1024 * 1024));
-    const exempt_rows = parseFuzzExemptRows(exempt_src, b);
-
     var failed = false;
     var n_obligated: usize = 0;
     var n_covered: usize = 0;
@@ -1883,7 +1925,7 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
             n_covered += 1;
             continue;
         }
-        if (findFuzzExemptRow(exempt_rows, m.name) != null) {
+        if (moduleFuzzExemption(b, io, m.name, &failed) != null) {
             n_exempt += 1;
             continue;
         }
@@ -1892,13 +1934,13 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
             "module '{s}' is CLASS {c} and exposes a byte-accepting public API in {d} source file(s), " ++
                 "but modules/{s}/src/ contains no `testing.fuzz(` harness — so every repo-wide sweep " ++
                 "skips it and it looks covered from outside. Add a harness on the decode entry point, " ++
-                "or add a justified row to FUZZ-EXEMPT.tsv",
+                "or state a justified `**Fuzz exemption:**` in its SPEC.md",
             .{ m.name, grade.class, scan.surface_files, m.name },
         );
         failed = true;
     }
 
-    try checkFuzzExempt(b, io, exempt_rows, &failed);
+    try checkFuzzExempt(b, io, &failed);
 
     std.log.info(
         "check-fuzz: {d} modules obligated, {d} covered, {d} exempt, {d} FAILING ({d} harnesses total)",
@@ -1908,7 +1950,7 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
     if (failed) return step.fail("fuzz-coverage gap — see errors above", .{});
 }
 
-/// The five rules that keep `FUZZ-EXEMPT.tsv` from becoming the thing that
+/// The five rules that keep a fuzz exemption from becoming the thing that
 /// makes this gate meaningless. Every one of them is a claim the gate can
 /// refute from the tree, which is the whole point: a row survives only while
 /// the code still agrees with it.
@@ -1930,82 +1972,74 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
 ///     in, and is itself covered. `EMIT-ONLY` must still write down why in
 ///     EVIDENCE — it is the one claim only a human can make, so it is the one
 ///     that has to be stated in full.
-fn checkFuzzExempt(
-    b: *std.Build,
-    io: std.Io,
-    exempt_rows: []const FuzzExemptRow,
-    failed: *bool,
-) !void {
-    for (exempt_rows) |row| {
+fn checkFuzzExempt(b: *std.Build, io: std.Io, failed: *bool) !void {
+    for (module_list) |mod| {
+        const row = moduleFuzzExemption(b, io, mod.name, failed) orelse continue;
         if (!containsName(&.{ "EMIT-ONLY", "PRE-PARSED" }, row.reason)) {
             std.log.err(
-                "FUZZ-EXEMPT.tsv: '{s}' has REASON '{s}', not one of EMIT-ONLY/PRE-PARSED",
-                .{ row.name, row.reason },
+                "module '{s}': fuzz exemption reason '{s}' is not EMIT-ONLY or PRE-PARSED ({s})",
+                .{ mod.name, row.reason, row.path },
             );
             failed.* = true;
             continue;
         }
         if (row.evidence.len == 0) {
-            std.log.err("FUZZ-EXEMPT.tsv: '{s}' has an empty EVIDENCE column", .{row.name});
+            std.log.err(
+                "module '{s}': its fuzz exemption states no argument -- the prose after the line is what a " ++
+                    "reader has to overturn, and an exemption nobody can argue with is one nobody will revisit ({s})",
+                .{ mod.name, row.path },
+            );
             failed.* = true;
         }
 
-        const mod = for (module_list) |m| {
-            if (std.mem.eql(u8, m.name, row.name)) break m;
-        } else {
-            std.log.err("FUZZ-EXEMPT.tsv has a row for '{s}' but no such module exists in module_list", .{row.name});
-            failed.* = true;
-            continue;
-        };
-
-        const scan = try scanModuleForFuzz(b, io, row.name);
-        const class: u8 = if (moduleAnchorGrade(b, io, row.name)) |g| g.class else '?';
+        const scan = try scanModuleForFuzz(b, io, mod.name);
+        const class: u8 = if (moduleAnchorGrade(b, io, mod.name)) |g| g.class else '?';
         const faces_outside = class == 'A' or class == 'B';
         if (!faces_outside or scan.surface_files == 0) {
             std.log.err(
-                "FUZZ-EXEMPT.tsv exempts '{s}', but check-fuzz would not have flagged it (CLASS {c}, " ++
-                    "{d} byte-accepting source file(s)) — an exemption that excuses nothing is dead weight; delete the row",
-                .{ row.name, class, scan.surface_files },
+                "module '{s}' claims a fuzz exemption, but check-fuzz would not have flagged it (CLASS {c}, " ++
+                    "{d} byte-accepting source file(s)) — an exemption that excuses nothing is dead weight; delete it",
+                .{ mod.name, class, scan.surface_files },
             );
             failed.* = true;
         }
         if (scan.harnesses > 0) {
             std.log.err(
-                "FUZZ-EXEMPT.tsv exempts '{s}' as {s}, but modules/{s}/src/ now contains {d} fuzz harness(es) — " ++
-                    "the code contradicts the exemption; delete the row",
-                .{ row.name, row.reason, row.name, scan.harnesses },
+                "module '{s}' claims a {s} fuzz exemption, but modules/{s}/src/ now contains {d} fuzz " ++
+                    "harness(es) — the code contradicts the exemption; delete it",
+                .{ mod.name, row.reason, mod.name, scan.harnesses },
             );
             failed.* = true;
         }
 
         if (std.mem.eql(u8, row.reason, "PRE-PARSED")) {
-            if (!containsName(mod.deps, row.evidence)) {
+            if (row.sibling.len == 0) {
                 std.log.err(
-                    "FUZZ-EXEMPT.tsv: '{s}' claims PRE-PARSED by '{s}', but '{s}' is not one of its declared deps " ++
-                        "in build.zig's module_list — the bytes cannot be arriving pre-decoded from a module it does not import",
-                    .{ row.name, row.evidence, row.evidence },
+                    "module '{s}' claims PRE-PARSED but names no sibling — write `**Fuzz exemption:** " ++
+                        "PRE-PARSED via <module>`, since the whole claim is that someone else took the bytes first",
+                    .{mod.name},
+                );
+                failed.* = true;
+            } else if (!containsName(mod.deps, row.sibling)) {
+                std.log.err(
+                    "module '{s}' claims PRE-PARSED via '{s}', but '{s}' is not one of its declared deps in " ++
+                        "build.zig's module_list — the bytes cannot arrive pre-decoded from a module it does not import",
+                    .{ mod.name, row.sibling, row.sibling },
                 );
                 failed.* = true;
             } else {
-                const upstream = try scanModuleForFuzz(b, io, row.evidence);
+                const upstream = try scanModuleForFuzz(b, io, row.sibling);
                 if (upstream.harnesses == 0) {
                     std.log.err(
-                        "FUZZ-EXEMPT.tsv: '{s}' claims PRE-PARSED by '{s}', but '{s}' has no fuzz harness of its own — " ++
+                        "module '{s}' claims PRE-PARSED via '{s}', but '{s}' has no fuzz harness of its own — " ++
                             "the exemption hands the untrusted surface to a module nobody fuzzes",
-                        .{ row.name, row.evidence, row.evidence },
+                        .{ mod.name, row.sibling, row.sibling },
                     );
                     failed.* = true;
                 }
             }
         }
     }
-}
-
-fn findFuzzExemptRow(rows: []const FuzzExemptRow, name: []const u8) ?FuzzExemptRow {
-    for (rows) |r| {
-        if (std.mem.eql(u8, r.name, name)) return r;
-    }
-    return null;
 }
 
 /// Read `modules/<name>/src/*.zig` and count the two things the gate compares:

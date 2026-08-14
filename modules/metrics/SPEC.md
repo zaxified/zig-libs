@@ -88,6 +88,17 @@ over a `Registry`); `Endpoint` is the shipped replacement. No push-gateway/remot
 `gap · posix · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta`
 in src/root.zig.
 
+## Fuzz exemption
+
+**Fuzz exemption:** EMIT-ONLY
+
+Produces the Prometheus text exposition format; it never parses it. Its three
+byte-accepting public functions (`Registry.counter`/`gauge`/`histogram`) take
+metric NAME, HELP and label strings that our own callers author in Zig source —
+there is no path from a socket to any of them. The router middleware it ships
+observes already-parsed `http.Request` values. Overturn this exemption the moment
+a scrape PARSER lands.
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle MIXED
