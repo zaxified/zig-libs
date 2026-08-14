@@ -13,6 +13,16 @@ on:
 # raw-syscall Linux members and are compiled by `zig build test`; socket/netns
 # tests SkipZigTest cleanly on a constrained runner.
 #
+# amd64-only, and that was decided rather than defaulted. A second architecture
+# lane was on the table for the one question that seemed to need one -- whether
+# `lockfree`'s seq_cst discipline costs anything a weaker ordering would not --
+# and it was closed on 2026-08-09 by measuring instead (`86cb149`): the owner
+# deploys linux-amd64 only, and on TSO a maximally relaxed probe of the module
+# compiled BYTE-IDENTICAL to the shipped code at every non-interlock site. An
+# arm64 lane would buy real coverage for a target nobody deploys to; if that
+# changes, the lane is the first thing to add, and the measurement above is what
+# it would be re-running.
+#
 # TWO SHAPES, and the split is the point.
 #
 #   pull_request        -> `test.sh changed`, one lane. Tests the modules the
@@ -28,10 +38,11 @@ on:
 # runs everything. Both failure directions are fail-closed, which is what makes
 # this safe to put in front of merges.
 #
-# Measured 2026-08-12 on the real graph: the closure is a MEDIAN OF 1 module
-# (147 of 224 modules have no in-repo consumer at all), 6 at the 90th
-# percentile, 61 at worst (`testkit`). A leaf change costs ~5 s against ~540 s
-# for the full gate.
+# The shape of the win, measured on the real graph 2026-08-12: the closure is a
+# MEDIAN OF ONE MODULE, because most modules have no in-repo consumer at all. It
+# reaches a few at the 90th percentile and a few dozen at its worst (`testkit`,
+# which half the suite imports). A leaf change therefore costs a small multiple
+# of one module's tests against the whole suite.
 #
 # THREE LANES, and the fourth was dropped on 2026-08-12 with a reason rather
 # than a preference. `heavy_optimize` in build.zig substitutes ReleaseSafe for
@@ -45,9 +56,9 @@ on:
 # The three that remain share nothing: each names one mode for every module, so
 # no ordering saves a compile. They run in parallel anyway.
 #
-# THE LANES THEMSELVES are deliberate. Compute-heavy modules build at ReleaseSafe when
-# Debug is requested (see `heavy` in build.zig — it takes bls12_381 from 182s to
-# 5s and it is the suite's critical path). `-Dstrict-debug` forces it back, keeping
+# THE LANES THEMSELVES are deliberate. Compute-heavy modules build at ReleaseSafe
+# when Debug is requested (see `heavy` in build.zig — it takes `bls12_381`, the
+# suite's critical path, from minutes to seconds). `-Dstrict-debug` forces it back, keeping
 # CONVENTIONS §6.4's "green in Debug and ReleaseFast" honest. Integrators build
 # in all three release modes; ReleaseSafe was the only one no lane covered — and
 # it earned its place on 2026-08-12 by being the only lane that caught a
@@ -112,12 +123,12 @@ jobs:
       # cannot do, so a lane that silently covers less than it looks like is
       # visible in the log.
       #
-      # ⚠ NO RELIABLE WALL-CLOCK FIGURE IS RECORDED HERE ON PURPOSE. Every
-      # local measurement taken on 2026-08-12 was confounded by cache state:
-      # ReleaseSafe 587 s warm, ReleaseFast 2053 s cold, strict Debug 1091 s
-      # in between. Those numbers cannot be compared with each other, and the
-      # figure this file carried before them (~1170 s) had never been
-      # rechecked at all. A CI run with per-lane caches is the first honest
-      # measurement; take it from there rather than from a comment.
+      # ⚠ NO WALL-CLOCK FIGURE BELONGS IN THIS FILE. Not "none is known yet" —
+      # none belongs. A duration here is a number nobody re-measures and every
+      # reader believes: this file carried a ~1170 s figure that had never been
+      # rechecked, and the three that briefly replaced it were confounded by
+      # cache state and could not be compared with each other anyway. The run
+      # log is the measurement, it is per-lane and dated, and it costs nothing
+      # to look at. Read it there.
       - name: Test (${{ matrix.name }})
         run: bash scripts/test.sh all ${{ matrix.args }}
