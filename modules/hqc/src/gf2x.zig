@@ -202,11 +202,18 @@ pub fn Ring(comptime n: u32) type {
             return w;
         }
 
-        /// Deserialize `n_bytes` bytes (LSB-first, see module doc) into a
-        /// canonical Elem. `bytes.len` must be >= n_bytes; only the first
-        /// n_bytes are read.
-        pub fn fromBytes(bytes: []const u8) Elem {
-            std.debug.assert(bytes.len >= n_bytes);
+        /// Deserialize exactly `n_bytes` bytes (LSB-first, see module doc) into
+        /// a canonical Elem.
+        ///
+        /// The parameter is a POINTER TO A FIXED-SIZE ARRAY, not a slice, so the
+        /// length precondition is discharged by the type. It was a slice with a
+        /// `std.debug.assert(bytes.len >= n_bytes)` until 2026-08-14, and this is
+        /// a public entry point (`hqc.gf2x` is re-exported from `root.zig`):
+        /// `std.debug.assert` is compiled out in ReleaseFast and ReleaseSmall, so
+        /// a caller passing a short slice got an out-of-bounds read in exactly the
+        /// build modes a consumer ships. Making it unrepresentable beats checking
+        /// for it, and costs nothing at runtime.
+        pub fn fromBytes(bytes: *const [n_bytes]u8) Elem {
             var out: Elem = zero;
             const dst = std.mem.sliceAsBytes(out[0..]);
             @memcpy(dst[0..n_bytes], bytes[0..n_bytes]);
