@@ -3239,6 +3239,20 @@ fn errnoName(code: i32) []const u8 {
 /// which are the last scope still holding the socket those last two live on.
 fn netnsReport(scope: []const u8, err: anyerror, nl: *const Socket) void {
     const code = nl.lastErrorCode();
+    // EPERM is not a failure here — the caller turns it into a skip — so say
+    // that, and say it only when skips are being shown. Printing "failed" for
+    // an outcome that is a skip is wrong twice over: it misdescribes the run,
+    // and the gate driver treats ANY stderr from a step that exited 0 as a
+    // failure, so this line alone turned a correctly-skipping CI lane red
+    // after the skip itself had already been fixed.
+    if (err == error.AccessDenied) {
+        if (verboseSkip()) std.debug.print(
+            "SKIPPED (netns {s} round-trip): step={s} denied by the kernel (EPERM) — " ++
+                "the namespace was granted but carries no capability here\n",
+            .{ scope, netns_step },
+        );
+        return;
+    }
     std.debug.print(
         "netns {s} round-trip failed: step={s} err={s} errno={d} ({s}) ext_ack='{s}'\n",
         .{ scope, netns_step, @errorName(err), code, errnoName(code), nl.lastErrorMessage() },
@@ -3352,7 +3366,7 @@ fn findLink(nl: *Socket, name: []const u8) !?Link {
 fn netnsRoundTrip() !void {
     netnsStep("Socket.open");
     var nl = Socket.open(std.heap.page_allocator) catch |err| {
-        std.debug.print("netns link/address/route round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
+        if (err != error.AccessDenied) std.debug.print("netns link/address/route round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
         return err;
     };
     defer nl.close();
@@ -3649,7 +3663,7 @@ fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
 fn netnsBridgeRoundTrip() !bool {
     netnsStep("Socket.open");
     var nl = Socket.open(std.heap.page_allocator) catch |err| {
-        std.debug.print("netns bridge round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
+        if (err != error.AccessDenied) std.debug.print("netns bridge round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
         return err;
     };
     defer nl.close();
