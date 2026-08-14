@@ -420,7 +420,7 @@ capability_check() {
         else
             fix='sudo apt install util-linux   # or your distro'"'"'s equivalent'
         fi
-        gaps+=("unshare -rn unavailable|netlink writes in $NETNS_MODULES run unsandboxed (netlink then FAILS, it does not skip)|$fix")
+        gaps+=("unshare -rn unavailable|netlink writes in $NETNS_MODULES run unsandboxed — their privileged tests SKIP, so those modules are reported green while covering less|$fix")
     elif [[ -n "$userns_key" ]] && ! grep -rqs "${userns_key%%=*}" /etc/sysctl.d /etc/sysctl.conf; then
         # Works now, but only because someone ran `sysctl -w` by hand — it
         # reverts on reboot and the netns modules start failing again.
