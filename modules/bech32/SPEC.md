@@ -110,3 +110,14 @@ no-overflow case described above.
 
 `extract · any · codec · reentrant` + deps: `ripemd160` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** BIP173/BIP350 test vectors fetched directly from bitcoin/bips repo
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-08: imported all 21 of Bitcoin Core's official plain-base58 EncodeBase58/DecodeBase58 vectors (fetched from `master`, transcribed by script into base58_vectors.zig, byte-exact-verified against the source JSON programmatically) — the module's base58 layer's first check against anything other than itself. 20 of 21 round-trip through `encode`/`decode`; the 21st (a 256-byte stress payload Core's suite carries but no real Bitcoin base58 payload ever approaches — max is 78 bytes, xprv/xpub) exceeds this module's documented `max_payload_len`/`max_encoded_len` scope headroom and is asserted to be rejected consistently by both directions rather than silently dropped. Mutation-tested: swapping two characters in `alphabet` (a change `encode`/`decode` share, so the pre-existing self-round-trip test stays green) makes the new external-vector test fail (`exit 1, 1/41 fail`) while the round-trip test does not — the exact "nothing would notice a mistyped value" gap this closes. `modules/bech32/NOTICE` added (Bitcoin Core test-case data, MIT); root NOTICE §1 updated.

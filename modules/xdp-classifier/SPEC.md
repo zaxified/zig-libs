@@ -237,3 +237,14 @@ BPF_MOD | BPF_K`) — is trivial scalar arithmetic, not a verifier-hard pattern.
 - A DROP-on-no-match program variant (README "Scope") — a one-instruction
   change, not built since it's not what LibreQoS-style classify-then-shape
   wants by default.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** classifier bytecode clang-cross-checked(EXTERNAL); CAP_BPF kernel-load test skips unprivileged
+
+**How it got there.** Anchored with: BLOCKED. BLOCKED: kernel.unprivileged_bpf_disabled=2, bpf() EPERM even as mapped-root; needs host root

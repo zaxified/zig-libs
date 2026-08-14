@@ -86,7 +86,7 @@ pub const combiner_result_hex = "70736274ff01003f0200000001fffffffffffffffffffff
 // comment below; cross-checked byte-for-byte against that same passage's
 // Base64 sibling line before being committed here.
 //
-// This closes the exact gap `ANCHOR-TASKS.tsv`'s `psbt` row named ("no
+// This closes the exact gap this module's anchor record (`SPEC.md` § Anchoring) named ("no
 // daemon exists yet") -- there was never a need for one: BIP174 already
 // publishes the finalizer's input, its required output, and the extractor's
 // required output as literal bytes.

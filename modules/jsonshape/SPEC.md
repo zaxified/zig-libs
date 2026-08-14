@@ -113,3 +113,12 @@ ReleaseFast; `zig fmt --check modules/jsonshape` clean. Run: `zig build test-jso
 
 `extract · any · codec · reentrant` + deps: `dataset` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** original jq-style bounded path-projection dialect invented here, not full JSONPath

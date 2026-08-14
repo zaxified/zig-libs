@@ -178,3 +178,12 @@ interop vector proved the flag right, in an unexpected place:
   supports — a different curve family entirely (this repo's `bn254`
   module, not `bls12_381`); a separate module extension, not in scope
   here.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** byte-exact vs genuine drand Go tle ciphertext + live-fetched quicknet beacon sig

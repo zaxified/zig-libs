@@ -302,7 +302,7 @@ reference, not a re-explanation of everything the README already covers.
 
 `modules/_template/README.md` carries the complete step-by-step list, including the two
 things this narrative does not repeat because a gate owns them: the root README catalog row
-+ module count (`zig build check-catalog`) and the module's `ANCHORS.tsv` row.
++ module count (`zig build check-catalog`) and the module's own anchor grade in its SPEC.md.
 
 ### 6.1 Test-only dependencies
 

@@ -65,7 +65,7 @@ One file is a test-vector source for this module:
     fields, and — since BOLT#7 never compresses it — `checksums_tlv`'s raw
     content even in an otherwise-`COMPRESSED_ZLIB` row) plus a byte-exact
     decode→re-encode round trip of the opaque blob. See `bolt7.zig`'s test
-    bodies and `ANCHOR-TASKS.tsv`'s `lnwire` row for exactly which rows
+    bodies and this module's anchor record (`SPEC.md` § Anchoring) for exactly which rows
     fall on which side.
 
 ## `lightningdevkit/rust-lightning` — an independent Lightning
@@ -111,7 +111,7 @@ actually emitted, transcribed mechanically, is an anchor).
     4-signature order in `channel_announcement` and the excess/trailing
     data BOLT#7 requires be preserved) and ENCODE (build from the vector's
     own fields, assert byte-exact output) — closing the "round-trip only"
-    gap `ANCHOR-TASKS.tsv`'s `lnwire` row previously recorded for these
+    gap this module's anchor record (`SPEC.md` § Anchoring) previously recorded for these
     three messages. All 22 vectors are fully usable in both directions —
     none exercise a `lnwire`-unimplemented encoding (unlike 4 of the
     `bolt07/extended-queries.json` rows above), since this module's
@@ -126,7 +126,7 @@ actually emitted, transcribed mechanically, is an anchor).
     derivation, so every input byte is the literal field value), plus
     `error`/`warning`'s shared vector and `ping`/`pong`, transcribed
     mechanically into `src/bolt1_kat_vectors.zig`. Closes the gap
-    `ANCHOR-TASKS.tsv`'s `lnwire` row previously mis-recorded as covered:
+    this module's anchor record (`SPEC.md` § Anchoring) previously mis-recorded as covered:
     "BOLT#1 App A/B" (BigSize/TLV) anchors the *primitives* `init`/`error`/
     `ping`/`pong` are built from, not those messages themselves, which had 0
     external vectors before this pass — self round-trip and hostile-

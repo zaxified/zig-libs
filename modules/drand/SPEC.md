@@ -203,3 +203,12 @@ Go source) and reused here.
 - **Round ↔ wall-clock time arithmetic** (`round_at(time)` from
   `genesis_time`/`period`): the inputs are parsed and exposed, but the
   helper itself is not shipped yet.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** quicknet KAT is live-fetched public drand network data, same pins tlock uses

@@ -137,3 +137,12 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
 
 `gap · any · both · threadsafe` + deps: none (std only, I/O via `Storage`/`std.Io`) — canonical
 source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** embedded Bitcask-style log+keydir store; design references only, no interop target

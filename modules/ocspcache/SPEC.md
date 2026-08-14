@@ -253,3 +253,14 @@ Implemented: AIA-based responder discovery, an injectable fetch `Transport`
 `Cache` (`getStapled` / `needsRefresh` / `refresh`) with verify-before-cache
 and the soft-fail posture. `zig build test-ocspcache` — green in
 Debug and ReleaseFast.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/goldens.zig carries a real www.godaddy.com leaf+issuer and the real OCSP response its responder returned, captured 2026-08-01, exercised through fetch/verify/cache; src/ocspcache_test.zig states in its own header that its byte arrays are NOT captured from a public source but constructed via ocsp's der_writer+rsa, so that half stays self
+
+**How it got there.** The anchoring work landed. DONE 6c2d6d9: same real CA fixtures; blind spot shown to propagate through the sibling

@@ -254,3 +254,12 @@ reason the harness is documented here rather than treated as optional:
 **for this module the valgrind run is not a nicety, it is the only oracle
 for the property the module is named after.** Re-run it after any change to
 `mul`, `pcSelect` or `precompute`.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 8032 §7.1 TEST 1/2 public keys re-derived byte-exact; bit-exact vs std.crypto.ecc.Edwards25519.mul/Ristretto255.mul

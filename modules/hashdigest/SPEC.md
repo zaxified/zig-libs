@@ -32,3 +32,12 @@ None.
 ## Status
 `extract · any · util · reentrant` · deps: none (`std.crypto` only) — canonical source is `pub
 const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** thin streaming wrapper over std.crypto Sha256, no custom crypto (README)

@@ -299,3 +299,14 @@ into one `writeAll` where the old escaper wrote byte by byte), a valid-UTF-8 rec
 329.2 ns (−24.5 %), and a record whose fields are mostly ill-formed 363.4 → 456.9 ns (+25.7 %,
 i.e. +93 ns and only for records that actually carry bad bytes). Nothing is allocated and
 nothing is copied when the input is clean.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** Combined anchored by real goaccess 1.10.2 (verdicts frozen as byte literals); JSON/logfmt unanchored, no foreign parser
+
+**How it got there.** The anchoring work landed. DONE(combined). Anchor found a REAL BUG: %h carried host:port, goaccess failed 100% of lines (valid=0/failed=2); 3 in-house tests asserted the same wrong shape. JSON/logfmt still lack a foreign parser — no logfmt oracle installed, python json never run

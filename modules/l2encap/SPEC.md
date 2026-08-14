@@ -238,3 +238,14 @@ election under partition — is intentionally **not** here; it lives in the S1b
 
 `gap · any · codec · reentrant` · deps: none (std only) — canonical source is
 `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle SELF
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** golden byte-layout KAT hand-authored from spec layouts; SPEC.md: no live-interop surface
+
+**How it got there.** No external oracle exists for what remains. REFUTED a58d626: own 8-byte format, shares no wire shape with VXLAN/Geneve (captured)

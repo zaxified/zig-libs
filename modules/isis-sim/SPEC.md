@@ -195,3 +195,12 @@ partition + quiescence + determinism proofs plus the positive control, all under
 `std.testing.allocator` (leak-checked). See `README.md` for the per-test summary.
 Provenance: composes sibling modules over `netsim`; clean-room from ISO/IEC 10589,
 no third-party source ported — no `/NOTICE` entry.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** composes siblings over netsim; convergence/determinism invariants, no wire format of its own

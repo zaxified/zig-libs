@@ -54,3 +54,14 @@ None.
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:1176/1203/1225 compare against flask_cors 6.0.5 run once as a black-box oracle, with an 8-item divergence ledger judged against Fetch/RFC 9110; the other 19 preflight/actual tests are still this module's own assertions about its own output
+
+**How it got there.** The anchoring work landed. DONE 9dee82e: flask_cors oracle; its wildcard+credentials default is the unsafe one

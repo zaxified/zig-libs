@@ -197,3 +197,14 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
 - **Metadata privacy.** `round`, `suite_id`, and `pt_len` are in the
   clear (authenticated, not encrypted) — the envelope hides content, not
   the fact that it targets round `R`.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** drand quicknet vector real+pairing-checked; envelope AND-composition only round-tripped
+
+**How it got there.** No external oracle exists for what remains. AND-composition is this module's own addition on drand; no third party publishes it

@@ -43,3 +43,14 @@ UDP/TCP methods, non-Linux live path, MTU/PMTU discovery).
 ## Status
 `gap · linux · client · single_owner` + deps: `icmp`, `netaddr`, `latency-stats` — canonical source
 is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** canned ICMP fixtures (SELF); loopback live test skips without CAP_NET_RAW
+
+**How it got there.** The anchoring work landed. DONE 466cc70: real 2-hop veth router; Time Exceeded from a real TTL decrement

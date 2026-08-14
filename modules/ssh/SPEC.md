@@ -207,3 +207,14 @@ Parts 1-3 are implemented. What is deliberately *not* here:
 `gap · any · both · single_owner` + deps: `rsa` — canonical source is `pub const meta` in
 `src/root.zig`. ("`gap`" follows this repo's catalog-maturity vocabulary for "no existing
 extraction source — built fresh to fill a catalog gap", not a completion status.)
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** self loopback client<->server baseline; live OpenSSH interop skips if sshd absent
+
+**How it got there.** No external oracle exists for what remains. self-loopback can't be anchored by construction; real anchor already lives in OpenSSH interop

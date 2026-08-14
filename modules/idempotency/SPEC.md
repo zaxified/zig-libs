@@ -74,3 +74,12 @@ distributed lock to close the same race across processes.
 ## Status
 `gap · any · server · threadsafe` · deps: `router`, `http`, `ramcache` — canonical source is `pub
 const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** own design over Stripe/IETF-draft pattern, no byte wire format (SPEC.md)

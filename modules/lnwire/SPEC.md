@@ -203,7 +203,7 @@ module regardless of what they encode, so no vector needed skipping for an unimp
 `option_channel_htlc_max` feature that used to gate it is now mandatory), matching every vector.
 
 This closes the "round-trip only" gap previously recorded here for these three messages; the whole
-BOLT#2 channel-management set remains round-trip-only (needs a live daemon peer, `ANCHOR-TASKS.tsv`).
+BOLT#2 channel-management set remains round-trip-only (needs a live daemon peer, the anchor record in `SPEC.md`).
 
 Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 
@@ -211,3 +211,14 @@ Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 
 `any (pure codec, no I/O) · codec · reentrant` + deps: none (std-only) — canonical source is
 `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** BigSize/TLV base wire + BOLT#7 announcements/queries + all BOLT#2 messages vs bolts + rust-lightning msgs.rs, byte-exact
+
+**How it got there.** The anchoring work landed. DONE: BOLT#1 base wire; BOLT#7 extended queries (447b970) + announcements/updates (6ffc927); BOLT#2 channel management - all 13 implemented messages, every upstream parameter combination, byte-exact both directions. No regtest daemon was needed: rust-lightning's msgs.rs encode tests carry the wire hex and are dual MIT/Apache-2.0. Deferred by SPEC (splicing, announcement_signatures, gossip_timestamp_filter) is not debt. Only zlib-compressed extended-query payloads stay decode-only (no zlib here). CLOSED 2026-08-08 (wave-2 F2): "BOLT#1 App A/B" above covers only the BigSize/TLV *primitives*, not the *message* layer built on them — `init`/`error`/`warning`/`ping`/`pong` had 0 external vectors, self round-trip + hostile-truncation only, until this pass. Imported rust-lightning's `encoding_init`/`encoding_error`/`encoding_warning`/`encoding_ping`/`encoding_pong` (`bolt1_kat_vectors.zig`, `bolt1_kat_test.zig`), byte-exact-verified against the fetched `msgs.rs` programmatically before transcribing. `error`/`warning` share one vendored vector (BOLT#1 defines them with one layout; upstream's own two tests drive identical bytes). CLOSED 2026-08-08 (wave-2 F3): the announcement/update *digests* `channelAnnouncementDigest`/`nodeAnnouncementDigest`/`channelUpdateDigest` compute over — the actual security-relevant output fed to secp256k1 verify — were pinned only by literal offset recomputation inside this module's own tests (`payload[256..]`/`[64..]`, hand-derived from the same BOLT#7 reading as production, so a *consistently* wrong offset would agree with itself and stay green forever). Added one independently-recomputed digest per message (Python `hashlib.sha256`, twice, over the tail of an already-vendored rust-lightning `payload_hex` vector — no new upstream source, since rust-lightning's own tests don't assert digest values, only wire bytes). Mutation-tested the exact failure mode this closes: co-mutated the production offset (256→255) AND the old self-referential test's hardcoded literal (same change, simulating a consistently-wrong-from-the-start reading) — old test stayed green, new test alone caught it (`exit 1, 1/90 fail`); both reverted.

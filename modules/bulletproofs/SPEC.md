@@ -235,3 +235,14 @@ comment.
 - A Pippenger/windowed `multiScalarMul` (performance only, see
   `scalarvec.zig`'s doc comment).
 - `n > 64` bignum witness support (see the `v` is a `u64` note above).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle SELF
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** published vectors tied to producing impl's transcript, unusable; property/soundness KAT only
+
+**How it got there.** No external oracle exists for what remains. SPEC.md: no third-party vector matchable; transcript is implementation-defined

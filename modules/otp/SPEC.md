@@ -59,3 +59,12 @@ HOTP (RFC 4226) + TOTP (RFC 6238) one-time passwords; see
 - `totpVerify`: exact-step accept; ±1/±2 window accept/reject in both
   directions; wrong-code reject across a window; underflow clamp at `t0`;
   non-default `t0`.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 4226/6238 appendix vectors embedded byte-exact

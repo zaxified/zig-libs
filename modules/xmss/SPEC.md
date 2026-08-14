@@ -145,3 +145,14 @@ the auto-resync still reproduces the from-scratch auth path byte-exactly.
 - **OID discipline:** `PublicKey.fromBytes` rejects foreign OIDs; the
   reduced-height test instantiations use private-range OIDs
   (0xDDDDDDDD–0xFFFFFFFF are never IANA-assigned).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only
+
+**How it got there.** The anchoring work landed. DONE 5938bfc: h=2 anchored on XMSS/xmss-reference; leaf 3 = BUG IN THE REFERENCE

@@ -53,3 +53,14 @@ canonical statement of this boundary.
 ## Status
 `extract · any · codec · reentrant` · deps: none — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/normative_test.zig drives the PUBLIC decode+encode API across all 640 byte/codepoint pairs of the five code pages against independently vendored normative tables (WHATWG index-*.txt, Unicode.org 8859-1.TXT), never against our own table; the label/alias table in parse and the '?' substitution policy are still self-graded
+
+**How it got there.** The anchoring work landed. DONE 76f9d9c: exhaustive WHATWG tables, 640 pairs, 5 code pages

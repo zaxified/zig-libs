@@ -879,7 +879,7 @@ test "BOLT#12 KAT: decodeOffer rejects an unknown EVEN TLV type (type 78) — of
 // and are kept as-is (no duplicate anchor removed, per this pass's own
 // instructions) — they happen to be a subset of what the table below now
 // also covers. Everything below is new: it closes the "BOLT#12 offer ENCODE
-// round-trip self-constructed" gap the ANCHOR-TASKS.tsv row named (the
+// round-trip self-constructed" gap this module's anchor record (`SPEC.md` § Anchoring) named (the
 // module could only round-trip its OWN encoder into its OWN decoder before
 // this), and extends the DECODE anchor from 3 hand-picked vectors to every
 // vector the official suite ships a `fields` list for.
@@ -1416,7 +1416,7 @@ test "BOLT#12 KAT: invoice Merkle root + signature verify — payer-proof-test.j
 }
 
 // Byte-exact external KAT for `invoice` ENCODE — closes the last gap
-// ANCHOR-TASKS.tsv named for this module ("invoice_request/invoice's
+// the anchor record in SPEC.md named for this module ("invoice_request/invoice's
 // non-signature TLV-to-wire-string ENCODE is round-trip (build+decode+
 // verify) tested only, not byte-compared against an official lnr1/lni1
 // string"). `invoice_request` ENCODE already had one KAT string available

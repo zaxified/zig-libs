@@ -173,3 +173,12 @@ was needed or made.
   workload shows it.
 - **Metrics beyond the counters** (latency histograms, per-key load timing) —
   left to the consumer's observability layer.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** singleflight+cache loader, in-process, no wire

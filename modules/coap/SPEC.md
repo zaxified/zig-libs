@@ -108,3 +108,14 @@ documented in `block.zig`, not built.
 ## Status
 `gap · any · util(codec)+client+server · reentrant` + deps: none (std only) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/external_goldens.zig replays real aiocoap 0.4.17 client<->server datagrams captured through a byte-logging UDP proxy (plain GET, the full 3-pair Block2 transfer, Block1 PUT with a real Uri-Path/Block1/Size1 delta chain, a live Observe push, multi-byte Block NUM); options/reliability/server scheduling in root.zig stay hand-authored
+
+**How it got there.** The anchoring work landed. DONE 0b466d6: real aiocoap block-wise + observe; self-consistent endianness mutation caught

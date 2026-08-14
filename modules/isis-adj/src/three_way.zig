@@ -253,7 +253,7 @@ test "golden TLV240 11-octet form (Wireshark-anchored): decode matches what Wire
 
 // ── External anchor: the 1-octet (state-only) form, the OTHER direction ─────
 //
-// ANCHOR-TASKS.tsv remnant on this row: every golden above was produced by
+// the anchor record's remnant for this module (`SPEC.md` § Anchoring): every golden above was produced by
 // THIS module's own `buildHello`/`helloFields` and then checked against
 // Wireshark. The 1-octet (state-only) TLV 240 shape is never emitted by that
 // API — `fsm.zig`'s `helloFields` always sets `extended_local_circuit_id` from

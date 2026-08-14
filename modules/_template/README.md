@@ -47,10 +47,12 @@ live in §2–§8.
    is not one (its title must name the module and it needs an `## Unreleased`
    heading), or an entry with a missing or malformed date. See
    `CONVENTIONS.md` §8.
-8. **`ANCHORS.tsv`** — add exactly one row: CLASS `A`/`B` (the module faces the
-   outside world, so its test oracle must be a real external authority) or
-   `C`/`D` (no outside exists, ANCHOR is `n/a`). The file's own header has the
-   vocabulary. `check-catalog` fails without the row.
+8. **Anchor grade** — SPEC.md needs the line `**Anchor grade:** class <A|B|C|D>
+   · oracle <EXTERNAL|REDERIVED|MIXED|SELF|n/a>` exactly once. Class `A`/`B` means
+   the module faces the outside world, so its test oracle must be a real external
+   authority and cannot be `n/a`; `C`/`D` means no outside truth exists and the
+   oracle must be `n/a`. SPEC.md's own Anchoring section has the vocabulary.
+   `check-catalog` fails without the line, and fails again if there are two.
 9. **Multi-file modules** — every submodule needs a `test { _ = <file>; }` line
    in `root.zig`. A bare `pub const x = @import("x.zig")` re-export does **not**
    pull `x`'s tests into the test binary: they are never compiled, never run,

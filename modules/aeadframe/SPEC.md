@@ -254,3 +254,12 @@ arbitrary bytes:
 - **Concurrency.** `single_owner`: a `Sealer`/`Opener` is owned by one
   thread/loop and holds no lock. Sharing one across threads is the caller's to
   synchronise.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** own composed record framing inspired by RFC4303/9147, wire format defined in SPEC.md

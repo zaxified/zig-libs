@@ -184,7 +184,7 @@ independent readings agree (`three_way.zig`'s golden for the shape, with the
 `scripts/dissect.py` command and Wireshark's printed output quoted inline).
 The P2P Hello *header* framing (length-indicator, PDU length, circuit-type
 bits, holding-time, local-circuit-id) is the sibling `isis` codec's own
-already-anchored surface (see `modules/isis/ANCHOR-TASKS.tsv` row) — that part
+already-anchored surface (see this module's anchor record (`SPEC.md` § Anchoring)) — that part
 legitimately IS the sibling's job, since this module calls `isis`'s real
 builder/decoder rather than re-implementing it, so no separate anchor is owed
 for it here.
@@ -215,3 +215,14 @@ green; the sibling `isis` test suite unaffected.
 Provenance: clean-room from ISO/IEC 10589 §8.2 and RFC 5303; no third-party
 implementation ported or studied. See `/NOTICE` (no entry required — public
 specs).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** Wireshark sharkd validated TLV 240 three-way adjacency, all wire states; found+fixed 11-octet BadLength bug
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-05: the 1-octet (state-only) TLV240 form is never emitted by this module's own API, so the anchor runs the reverse direction — a hand-built 1-octet value fed to sharkd AND to ThreeWayTlv.decode independently, confirmed to agree (three_way.zig, mutation-tested); Wireshark's dissector does model this length explicitly, so this is a real (if reverse-direction) anchor, not an unanchorable shape. TLV 6/IS-Neighbours and Area-Addresses (#1) do not apply — this module is P2P-only (LAN Hello + DIS election is a separate deferred module per SPEC §6); the generic P2P Hello header framing (length-indicator, PDU length, circuit-type, holding-time, local-circuit-id) is the sibling isis codec's own already-anchored surface, legitimately not re-anchored here since this module calls isis's real builder/decoder rather than reimplementing it

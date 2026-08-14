@@ -215,3 +215,14 @@ Implemented: request build (SHA-1/SHA-256 CertID + nonce), response parse
 (allocation-free, bounds-safe), and full verification (direct + delegated
 responder, RSA + ECDSA-P256, CertID binding, freshness, nonce). `zig build
 test-ocsp` — green in Debug and ReleaseFast.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures
+
+**How it got there.** The anchoring work landed. DONE 6c2d6d9: real DigiCert + GoDaddy responses captured; delegated responder now exercised

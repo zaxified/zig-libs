@@ -233,3 +233,12 @@ nanoseconds; against a real `read(2)` both are noise.
   during range scans; out of scope for v0 (transparency + bounding first).
 - **Cross-thread sharing.** Inherits `single_owner` from both `ramcache` and
   `kvtree`; a shared deployment must wrap the owner in its own lock.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** internal buffer-pool page cache, no wire, LMDB/Postgres named as concept analogues only

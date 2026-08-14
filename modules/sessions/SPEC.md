@@ -159,3 +159,12 @@ pulling in `csrf.zig`. Run: `zig build test-sessions`.
 
 `gap · any · server · threadsafe` + deps: `router`, `http`, `cookies`, `ramcache` — canonical
 source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** own session/CSRF design guided by OWASP cheat sheets, no third-party spec

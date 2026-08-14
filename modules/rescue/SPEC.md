@@ -267,3 +267,12 @@ Rescue-XLIX constant blob (no derivation recovered).
 * A CT disassembly sweep, to bring this module up to `k256`/`montint`'s
   standard of evidence rather than argument.
 * SIMD S-box layers, if Rescue ever lands on a hot path here.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RPO's 38 published vectors + miden-crypto's own vectors + Winterfell KAT

@@ -227,3 +227,12 @@ binder-key derivations.
    assert the round-tripped PSK matches what a hypothetical peer would have
    derived independently from the same `resumption_master_secret` +
    `ticket_nonce`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 8448 KAT byte-exact: ticket/psk-binder/earlydata/replay real vectors

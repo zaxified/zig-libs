@@ -175,3 +175,12 @@ server must never see a password; `export_key` for client-side vault
 encryption). The wire structs all have fixed-size `toBytes`/
 `fromBytes`, so any transport (HTTP body, MCP, raw TCP) can carry
 them.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9807 Appendix C.1 official vectors, full registration/KE1-3/session_key byte-exact

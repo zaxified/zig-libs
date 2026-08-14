@@ -76,3 +76,14 @@ explicitly out of scope, not planned. Richer path-parameter typing beyond `strin
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http` (+ `std.json`) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:749+ freezes openapi_spec_validator's verdict on this module's OWN generated document (accepted) and on a deliberately invalid one (rejected, for the same reason validateOpenApi31 reports) -- teeth in both directions; :595 adds the OAI's published v3.1 example. The generator's route-to-path mapping beyond that document is self-graded
+
+**How it got there.** The anchoring work landed. DONE 0bbcefe: real validator both directions; found in-house checker blind to path-param rule

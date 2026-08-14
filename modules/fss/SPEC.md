@@ -489,3 +489,14 @@ does not claim constant time. `prg.Aes128Mmo.constant_time` exposes this, and
 `DpfWith(prg.Sha256Prg, …)` is the constant-time-everywhere choice for such a
 target. This is a real cost of the swap and is the second reason the SHA-256
 PRG was kept.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle REDERIVED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle REDERIVED** — an in-house oracle re-deriving the answer by a different route. Catches implementation typos; does NOT catch a shared misreading of the spec.
+
+**What the tests actually contain.** independent Python re-derivation from BGI16 emits KAT vectors, stated over the retained Sha256Prg (SPEC.md); FIPS-197 App. B pins the AES MMO step only
+
+**How it got there.** No external oracle exists for what remains. NOT ANCHOR DEBT - reclassified 2026-08-02, RE-CHECKED 2026-08-06 after the PRG swap landed. The default PRG IS now fixed-key AES (prg.Aes128Mmo) and it did NOT buy byte-exact agreement with Google: that would additionally need Google's own fixed keys, tweak convention, control-bit extraction, packed value-correction and protobuf key layout, and their tests compute expectations inline rather than publishing a vector file. So the earlier note's central claim was WRONG - the PRG was never the only obstacle. What the swap did buy is ~25-36x speed (SPEC.md §'PRG choice'). Tier stays REDERIVED and the vectors were NOT regenerated: they are stated over the retained Sha256Prg instantiation, and DpfWith shares one body of correction-word code, so they still pin the construction byte-exact. Genuinely external and newly added, but narrow: the MMO step is pinned to FIPS-197 App. B - that anchors the AES call, NOT the DPF.

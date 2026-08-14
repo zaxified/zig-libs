@@ -225,3 +225,12 @@ const-time/alg-confusion (see Threat model above) is done — clean, 2026-07-10.
 ## Status
 `gap · any · codec+client · single_owner` + deps: none (std only) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** interop.zig: byte-exact goldens captured from real net-snmp 5.9.4 exchange

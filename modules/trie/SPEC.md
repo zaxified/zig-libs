@@ -205,3 +205,12 @@ stride returns `error.KeyTooLong`. Callers must therefore size `key_buf` as
   module's job, not this one; `trie` stays exact-prefix.
 - **Value payloads wider than `u32`** — callers store a `u32` record id and
   indirect through their own table.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** own frozen-index wire format (ZTR1 magic), invented in-repo, no third party

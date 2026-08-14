@@ -232,3 +232,14 @@ authoritative rather than merely self-consistent:
 The RSA test key is a 2048-bit `openssl genrsa` keypair embedded as PEM (test
 material only); the ECDSA test key is a fixed 32-byte scalar. No real personal
 data or production keys appear.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip
+
+**How it got there.** The anchoring work landed. DONE 9f9d238: xmlsec1 + signxml, two independent oracles; enveloping + ECDSA + tamper

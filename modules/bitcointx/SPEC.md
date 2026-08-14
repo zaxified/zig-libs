@@ -152,3 +152,14 @@ Run: `zig build test-bitcointx` (Debug and `-Doptimize=ReleaseFast`).
 
 `gap · any (pure codec + pure computation, no I/O) · codec · reentrant` + deps: `bip340` —
 canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector
+
+**How it got there.** The anchoring work landed. DONE 4523b96: 7 -> 290 Core sighash.json rows, attribution added

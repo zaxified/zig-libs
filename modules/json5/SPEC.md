@@ -83,3 +83,14 @@ Full JSON5 spec gaps, not covered and not added in this extraction:
 
 `extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/json5_tests_test.zig drives preprocess through the upstream json5/json5-tests corpus (src/testdata/json5-tests) honouring its extension convention in both directions, with one known_disagreement pinned; the error-recovery design ($err_trace_N) that root.zig's 27 tests cover is this module's own invention and has no external answer
+
+**How it got there.** The anchoring work landed. DONE b8d7144: json5-tests corpus adopted, THREE real bugs fixed

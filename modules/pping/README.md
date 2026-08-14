@@ -76,3 +76,14 @@ module is an independent Zig implementation of a published measurement technique
 (a technique is not a copyrightable work), and it deliberately shares no code
 with, and derives nothing from, that GPL codebase. The wire format is RFC 7323,
 a public spec.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/parse.zig:207-224 anchors the TCP Timestamps option parser on 2 real SYN/SYN-ACK captures taken with tcpdump off a genuine loopback handshake, including the tsecr<-tsval echo. Everything above the parser is NOT anchored today: match.matchEcho is a gated Fable stub, so every KAT in src/kat.zig returns error.SkipZigTest and asserts nothing
+
+**How it got there.** The anchoring work landed. DONE a326e4a: real SYN/SYN-ACK timestamp options, tsecr<-tsval correlation anchored

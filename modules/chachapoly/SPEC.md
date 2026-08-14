@@ -322,3 +322,12 @@ Consumers already wired to this module (`@import("chachapoly")`, all using
 `signal`, `aeadframe`, `timelock_envelope`. `bolt8` still uses `std`'s. Any
 change to the delegation thresholds or the MAC is therefore live on those
 paths, not staged behind a rewiring step.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 8439 KATs byte-exact + std oracle differential (README/SPEC)

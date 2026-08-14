@@ -175,3 +175,14 @@ pending a native std TLS server.
 ## Status
 `extract+gap · any · both · single_owner` · deps: `netaddr` (+ `std.crypto.tls`, `std.Io.net`,
 `std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self
+
+**How it got there.** The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments

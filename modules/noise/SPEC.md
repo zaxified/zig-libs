@@ -64,3 +64,12 @@ snow's and cacophony's own vector JSON files (same `cacophony` format)
 were not additionally consulted — the noise-c set already covers every
 pattern/hash/DH combination this module implements, so they would be
 redundant, not a stronger check.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official cacophony vectors from rweather/noise-c, byte-exact incl. handshake hash

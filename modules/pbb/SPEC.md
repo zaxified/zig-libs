@@ -193,3 +193,14 @@ state lives in `l2forward`.
 
 `any · codec · reentrant` · deps: none (std only) — canonical source is
 `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** Wireshark sharkd validated encode() B-Tag/I-TAG/B-TCI/relocation/ethertype/recursion; no wire bug; UCA/NCA naming resolved 2026-08-06 (kept uca, documented — see the anchor record in SPEC.md)
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-06 (naming, not a wire bug — the bit position/encoding were already correct): Wireshark calls I-TCI bit 27 "NCA" (No Customer Addresses) where this module calls it "uca" (Use Customer Addresses). Forced the bit to 1 through sharkd (new golden, decode never previously exercised bit=1 against Wireshark) and found `ieee8021ah.nca == 1` for the SAME raw bit this module reads as `uca == true` — the two names are opposite claims about one wire state, not a spelling variant; confirmed via `strings` on libwireshark.so that the dissector's own field-name string for that state is literally "No Customer Addresses". Decision: kept `uca` (matches this struct's 802.1Q/802.1ah vocabulary — I-PCP/I-DEI/I-SID/B-TCI — and independent Nokia SR OS PBB docs, which also say "UCA"; the primary 802.1Q-2014 text that would adjudicate the semantic direction is paywalled and unavailable here); no public API change; no in-tree consumer of `.uca` exists. Documented the resolution (not "left open") on Fields.uca's doc comment, SPEC.md and README.md. Mutation-tested the new golden (wrong bit mask -> 1/19 tests fail, exit 1; reverted, git diff -U0 shows only the intended addition). FCS, stacked I-TAGs, and customer-tag parsing remain out of scope by design (SPEC) so were not and cannot be wire-validated.

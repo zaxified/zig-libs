@@ -183,3 +183,12 @@ The correctness anchors, in order of strength:
 `pub const meta` in `src/root.zig`. ("`gap`" is this repo's catalog-maturity vocabulary for
 a std-gap module built from scratch, same as `rsa`'s SPEC.md — see CONVENTIONS.md's `meta`
 tag vocabulary discussion for why there's no separate dedicated "status" tag.)
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** cross-checked against phe (python-paillier) 1.5.0 real library output

@@ -292,3 +292,12 @@ One test, one property — which is what a mutation is supposed to show.
 - `WorkQueue` is currently only reachable as a generic function; if a consumer
   wants a scheduler that is not a reconciler, its `Finish` API may want a
   friendlier surface.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** in-process reconcile loop modeled after k8s controller-runtime, no wire

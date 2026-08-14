@@ -621,3 +621,12 @@ What remains beyond this layer is dynamic weak-memory stress on *real* ARM/RISC-
 hardware (§7 item (a)); with the static codegen cert (§7) and this formal cert
 (§7.1) both green, that hardware run is now belt-and-suspenders corroboration
 rather than the only line of evidence.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** canonical class-C case (MPMC queue + EBR); litmus/ = internal weak-memory verification

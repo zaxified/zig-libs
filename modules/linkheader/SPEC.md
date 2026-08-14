@@ -61,3 +61,14 @@ prod-API hardening batch) and the module README has no Deferred section.
 
 `gap · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:541+ reconstructs RFC 8288 §3.5's own worked examples byte-for-byte from the RFC (errata list checked) and asserts the RFC's own stated reading of each; the build direction and every other parse fixture in the file are hand-authored
+
+**How it got there.** The anchoring work landed. DONE 9ca8ed7: RFC 8288 3.5 worked examples transcribed, errata checked

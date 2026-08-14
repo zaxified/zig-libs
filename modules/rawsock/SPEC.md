@@ -69,3 +69,14 @@ for the full socket path).
 `gap (built: from a minimal receive-only core, openPacketCapture/ifNameOf) · linux · both
 (capture + inject) · reentrant` + deps: `netaddr` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:709+ freezes a real ARP exchange and a real Ethernet/IPv4/ICMP frame captured with tcpdump off a veth pair in an unprivileged netns -- loopback cannot do ARP at all, which is why the pre-existing hand-computed fixture had never met a real L2 segment; the socket send/recv wrappers stay self
+
+**How it got there.** The anchoring work landed. DONE a326e4a: real ARP + IPv4 frames off a veth pair (loopback cannot do ARP)

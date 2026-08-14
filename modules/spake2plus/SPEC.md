@@ -219,3 +219,12 @@ independent correctness signal beyond the byte-exact numbers.
 
 - `zig build test-spake2plus` and `-Doptimize=ReleaseFast` both go green;
   `zig fmt --check modules/spake2plus/` clean.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9383 Appendix C official P-256/SHA-256 vector, kat_vectors.zig

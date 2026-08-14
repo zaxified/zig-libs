@@ -525,3 +525,12 @@ makes these bound tests rather than "it errored eventually" tests.
   was assumed to be. See §9; the bench is `src/bench.zig`.
 - A lazy context adapter (§2), if a context ever appears that is too large to
   convert eagerly.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** golden.json captured from real Python Jinja2 3.1.6 output + live subprocess oracle

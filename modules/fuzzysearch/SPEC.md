@@ -182,3 +182,12 @@ thousands-of-keys range so `zig build test-fuzzysearch` never balloons.
   The metric is fixed unit-cost OSA.
 - **Transposition of multi-byte codepoints as a single edit.** Distance is over
   bytes; a codepoint-level metric is the caller's normalization concern.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** in-process trie+DP fuzzy match; brute-force self oracle only (SPEC.md)

@@ -280,3 +280,14 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 - CRT-slot batch encoding (`encode.zig`), needs `t ≡ 1 mod 2N`.
 - A parameter-selection helper (`sec_n8192_logq218` is hand-derived; there is
   no function that picks a chain for a target `N`/`log q`/depth).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle REDERIVED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle REDERIVED** — an in-house oracle re-deriving the answer by a different route. Catches implementation typos; does NOT catch a shared misreading of the spec.
+
+**What the tests actually contain.** NTT/RNS/BFV KAT vectors from independent Python re-derivation (SPEC.md)
+
+**How it got there.** No external oracle exists for what remains. SEAL/OpenFHE ciphertext layout is implementation-defined; no portable vector exists

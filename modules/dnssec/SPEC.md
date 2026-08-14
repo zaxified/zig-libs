@@ -107,3 +107,12 @@ verdict is itself the byte-exactness proof; the matching tampered
 (zone + `extract.py`, using `dnspython`): `scratchpad/dnssec-oracle/`.
 Remaining: corpus-fuzz the parsers; external RFC 6605/8080 published test
 vectors as a second independent cross-check.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** oracle_vectors.zig: real zones signed by ldns-signzone, accepted by ldns-verify-zone

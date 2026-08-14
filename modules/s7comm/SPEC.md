@@ -438,3 +438,14 @@ Honest list of what a full S7 implementation has and this one does not:
 `gap · any (pure codecs + client logic + responder; only the optional TcpTransport touches
 std.Io.net) · both (client + responder) · single_owner` + deps: none (std only) — canonical source
 is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** classic goldens from snap7 live peer; S7CommPlus body self, rawshark envelope only
+
+**How it got there.** No external oracle exists for what remains. no Wireshark dissector for S7CommPlus, no S7-1200/1500 hardware

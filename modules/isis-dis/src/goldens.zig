@@ -2,7 +2,7 @@
 
 //! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/dissect.py`).
 //!
-//! `isis-dis`'s own `ANCHOR-TASKS.tsv` row before this file read `SELF`,
+//! this module's anchor record (`SPEC.md` § Anchoring) read `SELF` before this file existed,
 //! justified as "lan_id/LSP-ID checked via sibling isis only" — i.e. the claim
 //! that because the bytes this module derives pass through the already-
 //! anchored `isis` codec, the codec's anchor covers this module too. Per the

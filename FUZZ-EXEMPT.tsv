@@ -1,6 +1,6 @@
 # Fuzz-coverage exemptions — the ERROR TERM of `zig build check-fuzz`, not its
 # mechanism. Read `checkFuzz` in build.zig first; it explains why obligation is
-# derived (ANCHORS.tsv CLASS A/B  AND  a `pub fn` that accepts caller-supplied
+# derived (anchor class A/B in the module's own SPEC.md  AND  a `pub fn` that accepts caller-supplied
 # bytes) rather than declared, and this file only holds the cases where that
 # derivation is true but the bytes are ours.
 #

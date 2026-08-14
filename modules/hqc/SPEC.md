@@ -414,3 +414,12 @@ value, not a crash, and different from the real shared secret).
   mechanical struct-packing per spec §3.5/§4.2 and this module's already-
   verified byte sizes (params.zig). **The whole HQC arc is now complete
   and usable as a KEM** (`root.zig`'s `Hqc128`/`Hqc192`/`Hqc256`).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official NIST KAT, byte-exact pk/sk/ct/ss (README)

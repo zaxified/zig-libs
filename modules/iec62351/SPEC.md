@@ -561,3 +561,14 @@ profile actually switched on. If either happens, the frozen frame in
 - The root `README.md` catalog row and the `build.zig` entry were pre-wired by
   the coordinator and are correct as written; no change needed.
 - `CHANGELOG.md` wants an "added module" line for the next release.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested
+
+**How it got there.** The anchoring work landed. DONE 941bbfe: header anchored; 493 real frames show NO 62351-6 extension exists in the wild

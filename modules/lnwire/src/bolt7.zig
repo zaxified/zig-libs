@@ -767,7 +767,7 @@ test "official BOLT#7 vector (lightning/bolts bolt07/extended-queries.json): que
 // ── rust-lightning `msgs.rs` vectors: channel_announcement /
 // node_announcement / channel_update (added 2026-08-02) ─────────────────
 //
-// Closes the "round-trip only" gap `ANCHOR-TASKS.tsv` recorded for these
+// Closes the "round-trip only" gap the anchor record in `SPEC.md` recorded for these
 // three messages: `lightning/bolts` (BOLT#7's own spec repo) carries no
 // test vectors for them, but `lightningdevkit/rust-lightning` -- an
 // independent implementation -- has encode/decode tests with full wire hex

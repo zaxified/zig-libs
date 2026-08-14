@@ -217,3 +217,14 @@ green; the sibling `isis` (46) and `isis-lsdb` (24) suites unaffected.
 Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
 spec — merger doctrine); no third-party implementation source consulted or ported.
 Like the sibling `isis` codec + `isis-adj` FSM it carries no `/NOTICE` entry.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** Wireshark sharkd validated CSNP/PSNP content via Scheduler.poll; SRM/SSN flag state + retransmit pace are not wire-observable, stay open
+
+**How it got there.** No external oracle exists for what remains. The SRM/SSN flag state machine, retransmit pacing gate, and CSNP cadence timer (SPEC.md §3/§4/§6) are pure in-memory scheduling decisions with no wire representation — no dissector can grade them, only unit tests do; multi-TLV-per-PDU packing is out of scope (this module always emits one #9 TLV per PDU, SPEC §8 deferred). INVESTIGATED 2026-08-05 (live-FRR feasibility, alongside the isis-dis close): NOT anchorable the way isis-spf/isis-dis were. The one piece that IS wire/state-observable — which interfaces get SRM/SSN set for a given LSP (the actual "flooding direction" decision) — is owned by the sibling isis-lsdb (reconcilePsnp/reconcileCsnp set/clear the flags this module only reads), not by this module; isis-flood's own surface is (a) the retransmit PACE (a timer interval — confirming "FRR also retransmits eventually" over a VM-jittery wall clock is not a byte-exact freeze, it is a flaky tolerance-window assertion, exactly the failure mode CONVENTIONS already rejects) and (b) the CSNP range-chunking scheme (SPEC.md §5's successor-stepped tiling is this module's OWN invented convention for splitting one DB summary across multiple PDUs — FRR chunks by its own unrelated scheme, so a disagreement would prove nothing and an agreement would be coincidence, not validation). No fixture was manufactured to paper over this; the gap is real and stays open.

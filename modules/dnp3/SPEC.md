@@ -317,3 +317,12 @@ class-0 response (0x0102 g1v2, 0x0302 g3v2, 0x0a02 g10v2, 0x1401 g20v1, 0x1501 g
 `gap · any (pure codec + outstation, no I/O) · both (master codecs + a stateful outstation) ·
 reentrant codecs, single-owner Outstation/Session` + deps: none (std only) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** goldens.zig: live captured sessions vs real opendnp3 peer, both directions

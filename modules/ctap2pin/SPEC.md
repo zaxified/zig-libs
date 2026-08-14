@@ -100,3 +100,14 @@ updated; behavior for shared-secret keys is bit-for-bit unchanged.
 - PIN policy (hashing, retries, `pinUvAuthToken` state machines).
 - Protocol One's platform-side per-command key regeneration policy
   (callers regenerate by supplying a fresh scalar).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only
+
+**How it got there.** The anchoring work landed. DONE 0341464: fido2 anchors the FRAMING; found unexpressible protocol-Two pinUvAuthParam

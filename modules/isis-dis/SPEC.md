@@ -175,3 +175,14 @@ green; the sibling `isis` test suite unaffected.
 
 Provenance: clean-room from ISO/IEC 10589 §8.4.5; no third-party implementation
 ported or studied. See `/NOTICE` (no entry required — public spec).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** Wireshark sharkd validated lan_id/priority/Hello codes; DIS election result closed vs 3 real isisd 10.3 instances
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-05: 3 real isisd 10.3 instances, one shared LAN broadcast segment (netns + veth into one Linux bridge, in-VM), two independent priority/SNPA assignments — run A {10,64,64} decided by priority AND the 64/64 tie by SNPA; run B held priority+system-id fixed and swapped the SNPAs between the two priority-64 routers, and the DIS flipped to match, ruling out an incidental (non-SNPA) cause. `elect()` matched FRR's own "show isis interface detail" is/is-not-DIS verdict both times, first try, no adjustment made — frozen in election.zig, "FRR anchor" test. Mutation-tested (SNPA compare .gt -> .lt: 6/21 tests fail, exit 1; reverted, git diff -U0 shows only the intended addition). Remaining gap unchanged: circuit-type bits and generic PDU framing stay the sibling isis codec's own already-anchored surface.

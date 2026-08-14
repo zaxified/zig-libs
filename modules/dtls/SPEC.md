@@ -449,3 +449,12 @@ two `Connection`s written from the same reading of the RFC cannot see.
 - **CCM suites** — unwired (Zig 0.16 std ships only a 13-byte-nonce CCM; the
   DTLS profile needs 12), so the RFC 7925 CoAP default suite is untested
   against any peer.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** live interop vs real wolfSSL 5.9.1 peer, both roles, multiple flows

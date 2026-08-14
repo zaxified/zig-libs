@@ -215,3 +215,12 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
   = `sign.ShakePrng` + `sign.Signer.signWithRng` (the KAT tests replay
   the NIST DRBG's two separate draws through that seam explicitly).
 - FIPS 206 (FN-DSA) rebase once final — applies to the whole module.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official NIST Round-3 falcon512/1024-KAT.rsp files, byte-exact

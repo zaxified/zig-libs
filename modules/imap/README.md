@@ -296,3 +296,12 @@ exposed a test with no teeth: clearing mailbox state on a failed SELECT was
 already covered by clearing it on entry, so the test could not tell the two
 apart. The transcript now emits untagged data before the refusal, which only
 the failure path can clean up.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 3501 worked example, byte-exact, plus a live IMAP server peer (README)

@@ -370,3 +370,14 @@ consulted (root `NOTICE` §0).
 
 `gap · any · util · single_owner` · deps: none (std only) — canonical source is
 `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** narrow and only over defaults: src/root.zig:1304 pins aging_ticks to a live kernel bridge's observed ageing_time (30000 centiseconds) and :1436 pins the MAC-move defaults to RFC 7432 §15.1's stated N=5/M=180. Every FDB/learn/flood/split-horizon DECISION is still graded by this module's own tests; the live bridge's qualitative agreement was not wired in (timing-dependent, SPEC.md)
+
+**How it got there.** The anchoring work landed. DONE a58d626: aging default pinned to live kernel bridge 300s; rest is timing-dependent

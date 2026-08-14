@@ -949,3 +949,12 @@ Still deferred, honestly:
   perf-buffer test's `bpf_perf_event_output` producer is deliberately
   test-local for the same reason: a public builder would need its own
   clang-derived golden vector.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** golden bytecode derived from clang -target bpf output + bpftool verifier dump

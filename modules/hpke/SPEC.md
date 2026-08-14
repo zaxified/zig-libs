@@ -602,3 +602,12 @@ implemented and KAT-verified (order preserved):
    `ChaCha20Poly1305` mode vectors of A.2/A.5, which differ from the
    embedded A.1/A.3/A.4 mode vectors only in the `aead_id`/`kdf_id` bytes
    of `suite_id` — already covered by their respective base headers.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9180 Appendix A KAT, byte-exact in all 4 modes (README)

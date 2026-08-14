@@ -341,3 +341,12 @@ bytes was copied. Per `CONVENTIONS.md` §5 a black-box oracle is neither
 required attribution nor a design reference; the `NOTICE` entry this module
 does need is for the **kernel UAPI headers**, on the same Linux-syscall-note
 basis as `netlink`/`genetlink`/`nl80211` — see `NOTICE`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** real ethtool binary as capture oracle under strace, goldens.zig

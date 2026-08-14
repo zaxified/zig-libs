@@ -96,3 +96,12 @@ implementation for that specific configuration.
 
 `extract · any · util · reentrant` + deps: `montint` (hot-path modexp), `std.crypto.ff` (key
 material/serialization) — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 8017 + OpenSSL/ssh-keygen-generated KATs (root.zig provenance)

@@ -166,3 +166,14 @@ everywhere) are not given typed accessors** — they fall to the generic opaque-
 any other unrecognized key type. They round-trip correctly (preserved byte-for-byte) but have no
 convenience decoder; not exercised by any official BIP174 vector, and add no security-relevant
 validation surface (unlike the mandatory/common fields this module does validate structurally).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** BIP174 vectors + Core rpc_psbt.json + live bitcoind v28 regtest (native P2WPKH/P2WSH captured); every spend shape now anchored
+
+**How it got there.** The anchoring work landed. DONE: finalize+extract byte-exact for bare P2SH multisig and P2SH-P2WSH multisig (BIP174 worked example, c713f6b), Core's rpc_psbt.json corpus (63c6cd1, found the GLOBAL_VERSION bug), NATIVE P2WPKH captured from a live bitcoind v28 regtest, and NATIVE P2WSH 2-of-3 multisig captured from the same (2026-08-05: watch-only wallet + wsh(multi(2,...)) descriptor imported active:false, funded via sendtoaddress not direct mining, two independent signer wallets + combinepsbt; finalize+extract byte-exact against Core's own bytes, extracted tx also confirmed acceptable by testmempoolaccept on the producing node). Every spend shape finalize/extract supports is now anchored -- no shapes left self-authored.

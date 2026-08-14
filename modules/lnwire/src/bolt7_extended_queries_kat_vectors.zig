@@ -9,7 +9,7 @@
 //! DECODE (parse `hex`, assert fields) and ENCODE (build from fields, assert
 //! byte-exact `hex`) checks. Several rows use the `COMPRESSED_ZLIB`
 //! short_channel_id/query_flags encoding this module does not implement (see
-//! README's Scope / `ANCHOR-TASKS.tsv`) -- `bolt7.zig`'s tests skip
+//! README's Scope / the anchor record in `SPEC.md`) -- `bolt7.zig`'s tests skip
 //! reconstructing/verifying the *decoded content* of a `.zlib`-encoded field
 //! (documented per-vector there), while still checking everything this
 //! module's codec does interpret: `chain_hash`, the block-range/complete

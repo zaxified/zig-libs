@@ -77,3 +77,12 @@ TigerBeetle source was consulted or copied, and this module's engine, event
 queue and API are unrelated to it. The splitmix64 mixer is Sebastiano Vigna's
 public-domain algorithm. The methodology is borrowed from this repo's own `kv`
 VOPR, not its code.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** in-process deterministic sim/test harness, no wire; correctness = determinism/invariants

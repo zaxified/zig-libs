@@ -87,3 +87,14 @@ over a `Registry`); `Endpoint` is the shipped replacement. No push-gateway/remot
 ## Status
 `gap · posix · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:1411 -- the test is literally named `external anchor: exposition text independently parsed by prometheus_client` -- freezes what that independent parser extracted from this module's own writeText bytes (families, labels, escapes, cumulative buckets); :1282 additionally accepts Prometheus's published exposition example. The in-house grammar checker was demoted to a syntax check; registry/scrape paths stay self
+
+**How it got there.** The anchoring work landed. DONE 0bbcefe: prometheus_client parser is now the anchor; in-house checker demoted

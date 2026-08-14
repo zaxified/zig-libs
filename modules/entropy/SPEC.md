@@ -294,3 +294,12 @@ recorded in their audit files rather than fixed here.
   `getrandom(2)` loop with the same abort posture, and both are deliberately
   `platform = .linux` for it. Rewriting them onto `std.Io` is a behaviour change
   to working, audited code for no gain; see `CONVENTIONS.md` §2.2.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** own policy binding over std.Io.randomSecure; no algorithm and no wire, so no third party to agree with — tests pin WHICH std entry point is called, not any output value

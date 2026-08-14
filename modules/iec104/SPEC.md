@@ -320,3 +320,14 @@ to file.
 `gap · any (pure codec + state machine; only the optional TcpTransport touches std.Io.net) ·
 both (controlling + controlled station) · single_owner` + deps: none (std only) — canonical source
 is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** 72 byte-exact goldens captured from real c104/lib60870 traffic (SPEC.md)
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-08 (partial — the rollover half only): drove a real `c104` outstation to spontaneously report 33,000 values (paced to avoid overrunning its own internal send queue — an unpaced burst makes it close the connection, a real lib60870-C limitation worth recording) so this module's `Client` processed a genuine 15-bit sequence-number wrap: `monitoring=32773 recv_seq=5 wrapped=true`, this module's `recv_seq` wrapping 32767→0 at exactly the frame the peer's own N(S) did. Captured via an in-process `RawTap` (client.zig) rather than an external proxy — the proxy's added latency was *also* enough to overrun the peer's queue. Froze the last 64 frames straddling the wrap as `goldens.zig`'s `wrap_table`, replayed through a fresh `state.Connection` fast-forwarded to the capture's own starting point. Mutation-tested: a +1/-1 bias in `apci.decode`/`encode`'s I-frame send_seq extraction, paired so encode(decode(x))==x still holds (self round-trip blind) — `exit 1, 11/121 fail`, including both new wrap tests and, since the bias is a real absolute-value error and not merely a round-trip asymmetry, several pre-existing absolute-value assertions too; reverted. NOT closed: driving a real peer to an actual t1 (acknowledgement) timeout — still open, honestly disclosed in SPEC.md.

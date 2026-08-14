@@ -209,3 +209,12 @@ to `ct25519`: `std.crypto.ecc.Edwards25519.mul` ends in a
 `rejectIdentity` branch on a scalar-derived value, but `ed448`'s
 `Point.mul` — which is what decaf448 rides — has no such rejection and
 no error union at all.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9496 Appendix B official test vectors, byte-exact, kat_test.zig

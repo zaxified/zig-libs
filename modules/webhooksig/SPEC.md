@@ -58,3 +58,14 @@ replay-window-is-caller-policy and symmetric-only (no Ed25519) scope notes above
 ## Status
 `gap · any · server · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:456 asserts GitHub's own published canonical webhook-signature triple (payload, secret, sha256=757107ea0eb2...), which anchors the FRAMING; root.zig:434 records that RFC 4231 was REFUTED as this module's anchor because it exercises std.crypto's HMAC rather than anything here. Timing-safe compare and header parsing stay self
+
+**How it got there.** The anchoring work landed. DONE 9ca8ed7: RFC 4231 REFUTED (tests std.crypto); GitHub published triple used

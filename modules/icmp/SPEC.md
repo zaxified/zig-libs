@@ -48,3 +48,14 @@ netlink/wireguard/l2disco/procnet — a deliberate scope decision, not a gap).
 ## Status
 `extract · linux · client · single_owner` · deps: `seqmap`, `netaddr` — canonical source is `pub
 const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** RFC 1071 checksum vector external; v4/v6 wire goldens self; live kernel ping test
+
+**How it got there.** The anchoring work landed. DONE a326e4a: 8 real fixtures via unprivileged netns capture; unreachable types named

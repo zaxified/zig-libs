@@ -100,3 +100,12 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
 - Oracle: NIST ACVP gen-val vectors (github.com/usnistgov/ACVP-Server,
   `gen-val/json-files/`, retrieved 2026-07-11) — the same corpus NIST uses
   for FIPS 205 validation testing.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** NIST ACVP FIPS 205 KAT vectors, kat_vectors.zig/kat_test.zig

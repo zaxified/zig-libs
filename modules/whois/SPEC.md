@@ -51,3 +51,14 @@ None recorded.
 `gap · any (logic over a transport seam; optional TcpTransport is posix) · client · reentrant` +
 deps: `netaddr` (special-use address classification for the referral SSRF guard) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/goldens.zig carries real port-43 replies captured live from IANA and Verisign, including a real referral cycle; root.zig's own canned replies say in their comment that they are only `modeled on the real line conventions`, so the transport and the remaining parse paths stay self
+
+**How it got there.** The anchoring work landed. DONE ea2d000: real IANA+Verisign port-43 replies; real referral CYCLE exercised

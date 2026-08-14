@@ -185,3 +185,12 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   backlog: a tombstone behind a **poisoned** delete is retained forever by design (see "Threat
   model" above) — there is no compaction pass for that residue today, only the existing
   `flushAll`-and-restart workaround.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** pure composition of internal cache/queue/pool modules, no wire

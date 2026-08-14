@@ -66,3 +66,14 @@ None.
 ## Status
 `gap · any · codec · reentrant` + deps: `http` (the `get`/`set` helpers only; parser + builder are
 std-only) — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/golden_test.zig runs CPython 3.14.4's http.cookies as a black-box oracle over the Cookie-header parse direction (16 tests, 5 divergences judged against RFC 6265, one real quote-aware split bug found); the Set-Cookie BUILD direction in root.zig is hand-authored against the RFC only
+
+**How it got there.** The anchoring work landed. DONE be61caa: python http.cookies oracle; quote-aware split BUG fixed; 5 divergences judged

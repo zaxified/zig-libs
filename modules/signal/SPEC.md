@@ -313,3 +313,14 @@ provided.
   (`xeddsa.zig`'s own in-file tests); std-Ed25519 cross-verification;
   X3DH `generateSignedPreKey` -> `initiate` -> `respond` end-to-end plus
   tampered-signature / substituted-prekey fail-closed cases.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** X3DH agreement+codec only self round-trip; XEdDSA has libsignal KAT (kat_test.zig)
+
+**How it got there.** No external oracle exists for what remains. Signal publishes no official X3DH KAT; own Python oracle would be REDERIVED

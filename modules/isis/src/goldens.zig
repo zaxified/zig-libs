@@ -633,7 +633,7 @@ test "encode(decode(golden)) == golden for both PDUs (structural round-trip)" {
 
 // ── Golden 8: L2 CSNP (PDU type 25) — the L2 type code, untested above ──────
 //
-// ANCHOR-TASKS.tsv remnant on this row: goldens 4/5 above drove the CSNP/PSNP
+// the anchor record's remnant for this module (`SPEC.md` § Anchoring): goldens 4/5 above drove the CSNP/PSNP
 // builders only with `is_l2 = false` (type codes 24/26). The body layout is
 // shared between L1 and L2 (only the PDU-type octet differs), but that
 // specific byte was never itself fed to an independent dissector. This golden

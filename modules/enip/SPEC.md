@@ -613,3 +613,14 @@ not:
 TcpTransport/UdpDiscovery touch std.Io.net) · both (client + adapter) ·
 single_owner` + deps: `netaddr` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** 61 goldens captured from real traffic between 3rd-party stacks + live round trips
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-08: captured 32 goldens (`adapter_table`) of pycomm3/cpppo driven as real independent clients against our own `Adapter.init(.{}, &tags)` (the exact configuration root.zig's ENIP_TEST_LISTEN live test builds) through the same encapsulation-aware recording TCP proxy `table` used, then replayed every captured request through a fresh `Adapter.handle` in capture order and required the reply to equal the captured reply byte-for-byte — not decode∘encode agreeing with itself, but pycomm3's/cpppo's own parsers being what accepted these bytes at capture time. Coverage: ListIdentity, ListServices, unconnected Get_Attributes_All, a Large_Forward_Open + connected Get_Attribute_Single + Forward_Close (pycomm3), an array read and a write-then-read-back (cpppo). No disagreement found — the adapter's replies matched both stacks' own parsers on every exchange. Mutation-tested: `Adapter.next_connection_id`'s seed off by one (0x0100_0001→0x0100_0002) — a value no self round-trip test checks past non-zero/distinct — passes the rest of the suite and fails only this table (`exit 1, 1/156 fail`); reverted.

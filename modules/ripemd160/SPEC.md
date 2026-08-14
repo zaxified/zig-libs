@@ -71,3 +71,12 @@ None open.
 
 `extract · any · util · reentrant` · deps: none (std only) — canonical
 source is `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official RIPEMD-160 spec Appendix vectors, incl. million-'a' KAT

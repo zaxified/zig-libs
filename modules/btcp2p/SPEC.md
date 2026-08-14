@@ -187,3 +187,12 @@ Run: `zig build test-btcp2p` (Debug and `-Doptimize=ReleaseFast`).
 
 `gap · any (pure codec, no I/O, no connection state) · codec · reentrant` + deps: `bitcointx` —
 canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** published verack/version hex dumps used as byte-exact test vectors

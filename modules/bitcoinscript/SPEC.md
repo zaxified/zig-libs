@@ -363,3 +363,12 @@ rejects the two legacy scriptCode mutations — `FindAndDelete(vchSig)` removing
 `OP_CODESEPARATOR` appearing in a `SigVersion.base` script at all, executed branch or not. Both
 remain fully implemented at consensus level (flag off); the flag only makes them observable. It is
 `false` in `.none` and `true` in `.standard`, matching Core's `STANDARD_SCRIPT_VERIFY_FLAGS`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** machine-transcribed bitcoin/bitcoin src/test/data/script_tests.json + tx_valid/tx_invalid.json FindAndDelete/CONST_SCRIPTCODE rows + script_tests.cpp script_FindAndDelete

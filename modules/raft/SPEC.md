@@ -279,3 +279,12 @@ contract tested independently.
    the leader propose one distinct `(term, index)` command per heartbeat, which
    is what gives `recordApply` a key that varies.
 5. Log compaction / snapshotting (§7) — out of current scope.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** netsim model-checking vs Raft safety properties, no wire byte format

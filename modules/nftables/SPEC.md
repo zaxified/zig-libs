@@ -265,3 +265,14 @@ Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build te
 ## Status
 `gap · any · codec · reentrant` + deps: `netlink` (Socket's nlmsghdr/nlattr codec is shared) —
 canonical source is `pub const meta` in src/root.zig. `Socket` is Linux-only and `single_owner`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** native path anchored by captured real nft traffic; JSON builder path is self golden
+
+**How it got there.** The anchoring work landed. DONE 5938bfc: 3 rules -> 13 across 4 chains; reject has no builder (documented gap)

@@ -156,3 +156,14 @@ no mutable state, so `serve` is concurrency-safe. Per-request scratch (ETag, Las
 Content-Length buffers) is threadlocal — one request is served to completion per thread, the same
 model `http.range` uses. No dynamic allocation on the serve path; the 64 KiB streaming buffer is
 stack-local per request.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:1475+ compares against starlette.staticfiles run once as a black-box Range/ETag/conditional-request oracle (single/open-ended/suffix ranges, multi-range, If-None-Match); If-Range has no oracle available and the path sanitiser is self-graded
+
+**How it got there.** The anchoring work landed. DONE 9dee82e: starlette oracle; found If-Range NOT IMPLEMENTED -> backlog 1B-bis

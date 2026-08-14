@@ -165,3 +165,12 @@ binary (`kat_vectors.zig` documents the exact commands):
   password, and truncated files at several distinct cut points (missing
   line vs. corrupted base64 length), each asserted against the specific
   typed error it must produce.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** byte-exact vs real minisign 0.12 binary, README

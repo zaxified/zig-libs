@@ -74,3 +74,14 @@ free `periods_per_year` knob; confidence intervals/standard errors on the statis
 ## Status
 `extract · any · util · reentrant` · deps: `dataset` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:1559 pins annualized vol / max drawdown / VaR95 / CVaR95 to ffn 1.1.5's own output on an 8-day return series; xirr, TWR/Modified-Dietz, beta/alpha, Brinson attribution, Omega and Cornish-Fisher remain hand-computed fixtures with no foreign oracle
+
+**How it got there.** The anchoring work landed. DONE 1e757f4: ffn oracle on 8-return series; conventions established first

@@ -162,3 +162,12 @@ executed assertions (byte-exact against `signature001`/`signature004`/
 - A `bbs.Proof`-level "which messages are disclosed" convenience API
   beyond the raw `disclosed_indexes: []const usize` this scaffold
   exposes.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** KAT vectors drawn from published reference implementation (NOTICE)

@@ -241,3 +241,12 @@ above) — no longer listed as a gap.
 
 `extract · any · util · single_owner` + deps: none (std only) — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** pure in-process W-TinyLFU cache, no wire

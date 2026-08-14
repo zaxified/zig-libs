@@ -248,3 +248,14 @@ pairing math, and no unresolved hard problem remain in this module.
   Feldman machinery, not in scope here.
 - Hierarchical IBE (HIBE), anonymous IBE, or any Boneh-Franklin variant
   beyond the base "FullIdent" scheme.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** assembly byte-exact vs a genuine drand Go tle ciphertext: ibe.Scheme (comptime ciphersuite seam) driven with drand's parameters reproduces the fixture in kat_test.zig §5, encrypt and decrypt both directions; own DSTs/tags/h3/no-cube remain self-only and are unanchorable by construction (RFC 9380 §3.1 mandates a per-application DST, so no foreign value exists to match)
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-09: the original NOTE was wrong on its own terms — no external implementation of THIS scheme exists, but this module's assembly is not scheme-specific. Split ibe.zig into an ASSEMBLY (which hash feeds which XOR, the FO consistency check, fp12Pow, the U||V||W encoding) and PARAMETERS (DSTs, tags, block width, Gt representation) via a comptime `Scheme(ciphersuite)` seam — the published API is Scheme(ciphersuite), unchanged. kat_test.zig §5 then instantiates THAT SAME CODE with drand's parameters (tlock's ciphersuite, imported as a test-only dep, plus the gt->gt³ adapter kilic's final exponentiation needs) and requires it to reproduce, byte for byte, the genuine Go-tle-produced ciphertext modules/tlock already had frozen — encrypt direction and decrypt direction, plus rejection under a wrong key, plus a pairing-identity check binding the transcribed pubkey/signature/identity so a typo is a RED. Explicitly NOT the py_ecc re-derivation the audit finding proposed: writing our own assembly a second time in Python would be a sibling, and a sibling for exactly the layer that lacked an oracle. Mutation-tested TWICE, both times consistently on both sides so the self-consistency layer stays blind: (1) V/W swapped in Ciphertext.toBytes+fromBytes, (2) H4 fed ct.V instead of sigma in encrypt+decrypt — each gave exit 1, 40 pass / 2 fail, with the ONLY failures being the two new drand tests while all 40 pre-existing round-trip/tamper/pairing tests stayed green. Reverted; test-ibe exit 0, 42/42. RESIDUAL, stated in SPEC.md/NOTICE/README/kat_test.zig header rather than papered over: the DST strings and the no-cube decision stay self-anchored forever — RFC 9380 §3.1 requires each application to choose its own DST, so an ibe DST matching someone else's would be a defect, not an anchor.

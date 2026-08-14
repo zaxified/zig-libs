@@ -184,3 +184,14 @@ Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
 
 `gap · any · codec · reentrant` · deps: none (std only) — canonical source is
 `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** Wireshark sharkd validated 5 PDU bodies + TLVs incl. L2 CSNP/PSNP (goldens.zig); long-tail raw-TLV escape hatch stays self-tested
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-05: L2 CSNP (25) and L2 PSNP (27) type codes driven through this module's own CsnpBuilder/PsnpBuilder and confirmed by sharkd (goldens 8-9, goldens.zig; mutation-tested). Remaining gap: the long-tail raw-TLV/sub-TLV escape hatch (Auth #10, IP-reach, unmodeled SPB sub-TLVs, non-default id-lengths) stays self-tested only — by design unmodeled, so there is no typed content for Wireshark to validate

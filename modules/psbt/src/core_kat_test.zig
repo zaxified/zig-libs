@@ -6,7 +6,7 @@
 //!
 //! ## What this closes, and what it doesn't
 //!
-//! This was commissioned to close the gap `ANCHOR-TASKS.tsv`'s `psbt` row
+//! This was commissioned to close the gap this module's anchor record (`SPEC.md` § Anchoring)
 //! named: P2WPKH and native P2WSH multisig finalization had no published
 //! vector, only self-authored `finalize_test.zig` coverage. Core's own
 //! `finalizer`/`extractor` entries were checked FIRST, byte-for-byte,
@@ -15,7 +15,7 @@
 //! test simply reuses BIP174's own worked example (bare P2SH 2-of-2 +
 //! P2SH-P2WSH 2-of-2) rather than adding new spend shapes. So: the
 //! P2WPKH/native-P2WSH finalizer gap is **NOT closed by this JSON** --
-//! see `ANCHOR-TASKS.tsv` for the honest re-pricing. What Core's JSON DOES
+//! see the anchor record in `SPEC.md` for the honest re-pricing. What Core's JSON DOES
 //! give this module, for the first time, is external (non-BIP174) coverage
 //! of the raw `parse`/`invalid`/`valid` wire-format surface -- see below.
 //!

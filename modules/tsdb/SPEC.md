@@ -255,3 +255,12 @@ Named as scope decisions, not omissions.
 - **A retention policy per series.** v1 sweeps one global cutoff. Per-series
   retention wants the policy stored beside the reverse index and the sweep
   reading it per series — mechanical, but it changes the sweep's skip rule.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** embedded time-series store; row-key shape Prometheus-like but no wire interop

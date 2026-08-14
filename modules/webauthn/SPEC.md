@@ -188,3 +188,12 @@ string. Run: `zig build test-webauthn`.
 `extract · any · util · reentrant` + deps `cbor`, `rsa`, `p256`, `x509` — canonical source is
 `pub const meta` in `src/root.zig`. Assertion verify: ES256/EdDSA/RS256, complete. Attestation
 verify: `none`/`packed`/`fido-u2f`, complete; `tpm`/`android-key` deferred (see above).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** W3C sec.16 vectors, cross-checked vs go-webauthn's re-hosting of same vectors

@@ -158,3 +158,12 @@ order; `contextString = "OPRFV1-" ‖ I2OSP(mode,1) ‖ "-" ‖
 - **expand_message_xmd with `len_in_bytes > 64`** (`ell > 1`) — this
   ciphersuite only ever asks for 64 bytes; the comptime assert makes the
   limitation explicit.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9497 own published test vectors, byte-exact

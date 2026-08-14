@@ -165,3 +165,12 @@ still using their own hand-rolled CBC loops; rewiring them onto this module
 is tracked as a follow-up so their existing byte-exact RFC KATs (RFC 7518
 Appendix B for `jwe`, NIST SP800-38A + the SAML round-trip suite for
 `xmlenc`) stay green through the swap.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** NIST SP800-38A Appendix F.2.5 byte-exact vector in kat_vectors.zig

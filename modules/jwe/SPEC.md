@@ -193,3 +193,12 @@ canonical source is `pub const meta` in src/root.zig ("gap" = fills a genuine
 ecosystem gap, same category as `jwt`). Everything this module lists is real
 and KAT-validated; the only limitation is the typed AES-192 std gap (see
 Design).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 7516 App A full-token KAT (kat_rfc7516.zig) + RFC 7518 App B/C KATs

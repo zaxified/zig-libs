@@ -270,3 +270,14 @@ was confirmed by direct byte-for-byte comparison of the pre- and
 post-mutation source text instead.
 
 [spec]: https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** libolm KAT byte-exact ratchet/message but session.zig 2-sided round-trip is self-only (SPEC grade 3)
+
+**How it got there.** No external oracle exists for what remains. SPEC.md: no external vector for a full 2-sided session; self round-trip is the ceiling

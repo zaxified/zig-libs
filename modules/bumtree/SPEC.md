@@ -139,3 +139,14 @@ Offline only — pure logic, no live-interop surface. `zig build test-bumtree`
 - **Designated-forwarder election** — the separate `df-elect` module.
 - **Topology extraction** — building the `spf-ect.Graph` from an LSDB is the
   upstream `isis-spf`'s job.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle SELF
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** 802.1aq modeled; SPEC.md: "offline only, no live-interop surface", hand-built golden topology
+
+**How it got there.** No external oracle exists for what remains. No open-source 802.1aq/SPB implementation or freely available worked example exists

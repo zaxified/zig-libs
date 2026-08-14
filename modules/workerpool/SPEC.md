@@ -199,3 +199,12 @@ underlying `seq_cst` reclamation proof lives in `lockfree`).
 - **Panicking jobs.** A job that panics aborts the process (as any thread body
   does). Catching/quarantining a faulty job would need a per-job boundary; not
   attempted — the DL5 flush closures are trusted, non-panicking code.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** internal thread pool over own lockfree MS-queue + EBR, no wire

@@ -90,3 +90,12 @@ ciphertext's length or content, rejects malformed shapes before touching AES, an
 without a plaintext-derived timing or content leak. Not covered: key derivation/agreement (how
 the KEK itself was established — out of this module's scope, same posture as RFC 3394 itself),
 and RFC 5649 padding (see "Scope" above).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 3394 wrap/unwrap KATs (README Provenance)

@@ -215,3 +215,14 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
 
 `extract · any · server · reentrant` + deps: none (std only — `std.json` + `std.Io`) — canonical
 source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** sampling/elicitation lines byte-identical to spec's own JSON examples; init/tools/resources goldens + peer concept self-only (SPEC.md: "no external anchor")
+
+**How it got there.** The anchoring work landed. DONE e3b4a52: 8 literal + 6 partial spec anchors, canary on the classification

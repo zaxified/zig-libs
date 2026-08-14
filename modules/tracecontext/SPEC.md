@@ -65,3 +65,14 @@ test-tracecontext`.
 ## Status
 `gap · any · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/w3c_conformance_test.zig drives the middleware through 73 vendored W3C trace-context conformance vectors (src/w3c_vectors.zig) in both directions over the real offline wire harness; trace-id/parent-id GENERATION and childOf in root.zig have no W3C answer and stay self, as do the forward-compat and STRICT_LEVEL>=2 categories this module does not implement
+
+**How it got there.** The anchoring work landed. DONE e269090: 73 W3C vectors; found MUST-not-parse-tracestate bug; 1 gap logged

@@ -154,3 +154,12 @@ rationale.
 
 `extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 8949 App. A + RFC 9052 C.2.1 byte-exact vectors, kat_vectors.zig

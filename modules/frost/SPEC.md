@@ -217,3 +217,12 @@ construction:
 `kat_test.zig`'s assertions (one per core, against RFC 9591 Appendix E.5's
 published intermediate/final values) are the acceptance check, and all
 pass, Debug and ReleaseFast.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9591 Appendix E.5 official KAT, byte-exact (README/SPEC)

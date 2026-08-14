@@ -59,3 +59,14 @@ search, auth extensions, full schema validation are deliberate non-goals, not v1
 
 `gap · any (logic over a Fetcher seam; HttpFetcher uses http) · client · reentrant` + deps: `http`,
 `netaddr` — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/goldens.zig carries a real rdap.publicinterestregistry.org response for iana.org captured live 2026-08-01 (GDPR-redacted handle, nested entities) plus the real IANA bootstrap file; the remaining client fixtures in root.zig are hand-authored
+
+**How it got there.** The anchoring work landed. DONE ea2d000: real registry response; GDPR-redacted handle + nested entities

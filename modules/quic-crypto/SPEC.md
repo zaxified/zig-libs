@@ -152,3 +152,12 @@ Beyond the App. A KATs, a live wire-interop test (against ngtcp2 / quiche /
 msquic Initial packets) belongs to the eventual `quic` transport consumer,
 not to this crypto seam — this module has no socket and no packet framing to
 drive such a test on its own.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9001 Appendix A vectors verbatim in initial/headerprot/protection.zig

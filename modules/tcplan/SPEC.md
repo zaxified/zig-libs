@@ -159,3 +159,12 @@ goes RED, so a regression that breaks handle uniqueness cannot pass silently.
   class per queue. A caller wanting one adds a single top site per queue.
 - **IPv6 classifier depth.** `Match.ipv6` covers host/prefix matches; flow-label
   and extension-header matching are out of scope.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** pure Topology->Plan compiler, internal data structure, no wire I/O

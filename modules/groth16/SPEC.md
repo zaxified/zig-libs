@@ -145,7 +145,7 @@ accepting a proof from this module's own `setup`/`prove` — first try, no
 serialization deviation found — and rejecting a one-limb-tampered copy. See
 that file's module doc comment for the full transcript (including a Bun
 -runtime crash on the literal CLI invocation, worked around without touching
-snarkjs's own verification logic) and `ANCHOR-TASKS.tsv`'s `groth16` row for
+snarkjs's own verification logic) and this module's anchor record (`SPEC.md` § Anchoring) for
 the bookkeeping. What remains self-oracle, correctly: the QAP/R1CS layer —
 `snarkjs` was only ever shown the final group elements, never our R1CS, so it
 has no opinion on whether a proof corresponds to its circuit's intended
@@ -198,3 +198,14 @@ external datum, the generator `5` and 2-adicity 28, is a property of BN254's
 `Fr` re-derived and asserted by this module's own tests (`domain.zig`), not
 transcribed. The anchor's KAT (Dark Forest v0.3 proof) lives in and is
 accounted for by the `bn254` module, not restated here.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** verifier anchored via bn254 Dark Forest snarkjs KAT; QAP/R1CS layer self-oracle only
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-02: ran our own setup+prove for the module's existing nt fixture (harness_test.zig's 4-constraint/3-public-input circuit, fixed toxic waste + r,s), exported it through a new snarkjs_export.zig (JSON shape reverse-engineered from snarkjs@0.7.6's own bundled source: decimal-string field elements, G1=[x,y,"1"], G2=[[c0,c1],[c0,c1],["1","0"]] MATH order), and ran a REAL snarkjs@0.7.6 (fetched via bunx, Apache-2.0, never vendored) against it. Literal `bunx snarkjs groth16 verify ...` crashed on THIS host (Bun's web-worker shim SIGILLs spawning ffjavascript's WASM thread pool — a Bun/npm-package interop bug, reproduces for ANY input, confirmed unrelated to our data); invoking the SAME unmodified snarkjs@0.7.6 groth16.verify with its own documented single-thread fallback forced on (process.browser=true; delete globalThis.Worker — a condition its own source already branches on, not a patch) worked: RESULT true, exit 0, on the FIRST correctly-invoked try — no serialization deviation found. A one-limb-tampered copy (pi_a.x+1) got RESULT false, exit 1, confirming the oracle has teeth. Frozen as literals in snarkjs_kat_test.zig (JSON text + transcript), re-derivable (not hand-transcribed) since the fixture's toxic waste/r/s are small fixed integers. What this does NOT anchor: QAP/R1CS correctness (snarkjs never saw our R1CS — only the final group elements) — that layer has no external oracle for a custom circuit and stays self-checked (qap.checkDivisible == r1cs.isSatisfied), which is a legitimate end state, not remaining debt.

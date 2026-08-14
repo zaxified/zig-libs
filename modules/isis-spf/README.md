@@ -156,7 +156,7 @@ own comment for the full citation.
 
 What is still not FRR-anchored: the golden-line/4-node-path/diamond/
 two-way-check/reconvergence/old-style-#2/robustness/degenerate/determinism
-tests above remain self-authored (SELF in `ANCHOR-TASKS.tsv`) — they were not
+tests above remain self-authored (SELF in the anchor record in `SPEC.md`) — they were not
 individually re-derived against FRR captures, only the one dedicated FRR
 topology test was added. LAN pseudonodes and multi-level leaking remain out
 of scope (`SPEC.md` §6) and so are not anchored either, by construction

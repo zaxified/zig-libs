@@ -260,3 +260,12 @@ Scope choices, not oversights. None of them is load-bearing for a dump/get/delet
   and ICMPv6 echo). Any other type is copied unchanged — the kernel would not track it as a
   request/reply pair either — but a caller that knows the exact reply tuple should build it
   explicitly rather than rely on the helper.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** raw ctnetlink frames captured off the wire via nlmon/tcpdump, goldens.zig

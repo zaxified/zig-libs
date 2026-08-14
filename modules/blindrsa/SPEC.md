@@ -239,3 +239,12 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
 - To re-derive/re-check `kat_vectors.zig`'s recomputed `r` in Python:
   `r = pow(inv, -1, n)`, then assert `r * inv % n == 1` and
   `blinded_msg == encoded_msg * pow(r, e, n) % n` for both A.1 and A.4.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9474 Appendix A.1/A.4 byte-exact KATs

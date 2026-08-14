@@ -92,3 +92,14 @@ output), and field-count/arity validation (`Header.validateArity`/`validateArity
 ## Status
 `extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/csv_spectrum_test.zig drives the reader through the vendored maxogden/csv-spectrum corpus (src/testdata/csv-spectrum), 8 of 12 pairs asserted and 4 declared out of scope, one of which is broken upstream; writer.zig and the coerce/header layers are self-tested
+
+**How it got there.** The anchoring work landed. DONE 9ca8ed7: csv-spectrum 8/12 asserted, 1 fixture is itself broken upstream

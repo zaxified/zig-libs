@@ -369,3 +369,12 @@ Honest list of what this module does **not** do:
   encoded-word decoder outside the tests, and no address-list parser.
 * **A timeout implementation.** By design (see above) — the seam is there, the policy is the
   caller's.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** live_golden.zig: byte-exact transcript captured from real aiosmtpd 1.4.6 session

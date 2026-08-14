@@ -210,3 +210,14 @@ RSADP, including decoupled-hash OAEP), `aescbc` (CBC core + XML-Enc unpad),
 and `aeskw` (RFC 3394 key unwrap) — this module no longer carries any local
 hand-rolled CBC or key-wrap implementation; those are single-sourced in their
 respective sibling modules. AES-GCM and base64 remain from std.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only
+
+**How it got there.** The anchoring work landed. DONE 9f9d238: real xmlsec1 EncryptedData incl. xenc11 omitted-MGF default path

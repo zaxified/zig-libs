@@ -52,3 +52,14 @@ literal/prefix/suffix/charset matching is the v1 ceiling.
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http`, `netaddr` — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/json_schema_format_test.zig runs the official json-schema-org/JSON-Schema-Test-Suite optional/format files (src/testdata/json-schema-test-suite, 12 formats), which is where the isDuration bug was found; the whole 2020-12 CORE vocabulary in root.zig -- type/properties/items/required and the request-body integration -- is still graded only by this module's own tests
+
+**How it got there.** The anchoring work landed. DONE 76f9d9c: format vocabulary only (rest out of scope), isDuration bug fixed

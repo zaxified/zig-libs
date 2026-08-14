@@ -95,3 +95,14 @@ this repo.
 ## Status
 `gap · any · client · single_owner` + deps: `http` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/response.zig:450 parses Anthropic's own published basic-streaming SSE example byte-exact, including a `ping` event no hand-built fixture had; every other fixture is docs-derived and the one live API test is unconditionally SkipZigTest, so it anchors nothing
+
+**How it got there.** The anchoring work landed. DONE 88eda93: Anthropic published SSE example; S grade was WRONG (paid, nondeterministic)

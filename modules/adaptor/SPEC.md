@@ -206,3 +206,14 @@ independent correctness signal beyond the byte-exact numbers.
 
 - `zig build test-adaptor` and `-Doptimize=ReleaseFast` both go green;
   `zig fmt --check modules/adaptor/` clean.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle REDERIVED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle REDERIVED** — an in-house oracle re-deriving the answer by a different route. Catches implementation typos; does NOT catch a shared misreading of the spec.
+
+**What the tests actually contain.** no official spec/vectors; kat_vectors.zig computed independently in Python (NOTICE)
+
+**How it got there.** No external oracle exists for what remains. No schnorr adaptor vectors exist; DLC's ECDSA-adaptor.json is a different scheme

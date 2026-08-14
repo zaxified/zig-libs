@@ -45,3 +45,12 @@ myriad), and full ICU `NumberFormat` locale coverage.
 ## Status
 `extract · any · util · reentrant` + deps: `decimal` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** original design, no external spec/vectors; ICU named as loose model only

@@ -50,3 +50,12 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 - **Commitment / HTLC transaction construction** — the non-crypto serialization
   (to_local/to_remote/HTLC outputs, scripts, feerate math). Opus/Sonnet, not a
   Fable pocket.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** BOLT#3 Appendix D/E official test vectors, byte-exact (NOTICE)

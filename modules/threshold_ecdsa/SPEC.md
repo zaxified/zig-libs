@@ -811,3 +811,14 @@ scope cut, not an audit question — see the Phase 2d section.)
   "minimum-key-size floor on `fromBytes`" backlog item is unaffected —
   `paillier` stays a general-purpose module and does not impose this
   threshold-ECDSA-specific `q⁷` floor.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle SELF
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** no official KAT exists for GG18/20 (SPEC.md); self-consistency + reject-contract tests
+
+**How it got there.** No external oracle exists for what remains. GG18/20 papers publish no KAT; MPC randomness blocks byte cross-check with foreign libs

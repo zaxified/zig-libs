@@ -348,3 +348,14 @@ never a silent partial answer:
 
 `gap · any · both(client + server) · single_owner` + deps: `rsa`, `x509` —
 canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable
+
+**How it got there.** The anchoring work landed. DONE 02ecea2: real open62541 Sign+SignAndEncrypt handshakes captured and frozen

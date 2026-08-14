@@ -1483,301 +1483,153 @@ fn firstDataFile(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8) ?[]
     return best;
 }
 
-/// Oracle-provenance gate: `ANCHORS.tsv`'s CLASS/ANCHOR columns record where each
-/// module's TEST ORACLE gets its authority from -- see the file's own header for
-/// the A/B/C/D and EXTERNAL/REDERIVED/MIXED/SELF vocabulary. This is deliberately
-/// a separate function from `checkProvenance` above, which guards where
-/// implementation CODE came from (licensing / clean-room). Same word, opposite
-/// question -- conflating them would mean one of the two silently stops being
-/// enforced.
-///
-/// This bookkeeping went stale three times by hand before this gate existed
-/// (backlog 1B), always the same way: closing an anchor task updates
-/// `ANCHOR-TASKS.tsv` -- the one place actually owned while doing the work -- and
-/// `ANCHORS.tsv`, a dated snapshot regenerated separately, is never told. Running
-/// this gate against the repo as it stood found exactly that: 11 modules (`pbb`,
-/// `isis`, `isis-adj`, `isis-dis`, `isis-flood`, `isis-spf`, `lnwire`, `psbt`,
-/// `accesslog`, `lninvoice`, `yaml`) where `ANCHOR-TASKS.tsv` had already moved
-/// past what `ANCHORS.tsv` still said, closed 2026-08-02..2026-08-05 while
-/// `ANCHORS.tsv` was last regenerated 2026-08-01. Fixed by syncing those 11 rows;
-/// this gate is what stops it from happening an eleventh time.
-///
-/// What CAN be checked mechanically, and is:
-///   - every module in `module_list` has exactly one `ANCHORS.tsv` row, and every
-///     `ANCHORS.tsv` row names a real module -- no ghost row for a deleted
-///     module, the same one-directional blind spot `checkProvenance`'s claim 4
-///     documents for NOTICE §1 (driving the check FROM `module_list` alone can
-///     only ever see a module whose row disagrees, never a row with no module)
-///   - CLASS is one of A/B/C/D and ANCHOR is one of
-///     EXTERNAL/REDERIVED/MIXED/SELF/n/a, in both TSVs
-///   - the pairing rule from `ANCHORS.tsv`'s own header: a class A/B module
-///     (faces the outside world) must carry a real ANCHOR value; a class C/D
-///     module (no outside exists) must be `n/a`
-///   - `ANCHOR-TASKS.tsv` only ever lists class A/B modules -- a C/D module
-///     cannot carry anchor debt by construction, so its presence there is a
-///     misclassification somewhere
-///   - `ANCHOR-TASKS.tsv`'s CLASS matches `ANCHORS.tsv`'s CLASS for the same
-///     module -- CLASS records a module's relationship to the outside world,
-///     which the header states does not change, so any disagreement is a bug
-///   - `ANCHORS.tsv`'s ANCHOR matches `ANCHOR-TASKS.tsv`'s ANCHOR for every
-///     module in both -- this is the actual fix for the staleness above: what
-///     used to be a silently tolerated snapshot lag is now a build error
-///   - every `ANCHOR-TASKS.tsv` row HAS a SOURCE column, and SOURCE does not
-///     contradict `ANCHORS.tsv`'s ANCHOR: `DONE` cannot sit beside `SELF`, and
-///     `NONE` cannot sit beside `EXTERNAL`. See below -- this is the only
-///     cross-file claim here that is not a column checked against its own copy
-///
-/// WHY SOURCE vs ANCHOR IS A DIFFERENT KIND OF CHECK, and what it caught.
-/// Every other cross-file claim above compares a column to a DUPLICATE of
-/// itself: `ANCHOR-TASKS.tsv` carries CLASS and ANCHOR only so this gate can
-/// notice the copy drifted. That shape has a known blind spot -- it is green
-/// whenever both copies are wrong the same way -- and on 2026-08-14 that blind
-/// spot was measured, not theorised. THIRTY modules (`coap`, `cookies`,
-/// `cors`, `csvstream`, `encoding`, `ethfrag`, `finstats`, `json5`,
-/// `l2disco`, `l2forward`, `linkheader`, `llmclient`, `mcp-http`, `metrics`,
-/// `mqtt`, `ocspcache`, `openapi`, `pping`, `rawsock`, `rdap`,
-/// `security-headers`, `sntp`, `staticfiles`, `syslog`, `tracecontext`, `uci`,
-/// `validate`, `webhooksig`, `whois`, `xml`) read `SELF` in BOTH files while
-/// their own `ANCHOR-TASKS.tsv` NOTE said the anchoring had landed and cited
-/// the commit. Every one of them was re-graded from the module's tests and
-/// every one moved to `MIXED` -- `metrics` had a test literally named "external
-/// anchor: exposition text independently parsed by prometheus_client",
-/// `xml` had 130 W3C xmlconf cases on disk, `json5` had the upstream corpus.
-/// The agreement checks were green throughout, correctly: the two files agreed
-/// perfectly, and both were wrong.
-///
-/// SOURCE is not a copy of ANCHOR. ANCHOR says what TIER the oracle is;
-/// SOURCE says what would unlock it, or that the work already landed. They are
-/// independent facts that live in different files, which is exactly why a
-/// contradiction between them is information rather than a bookkeeping typo.
-/// `DONE` + `SELF` fired on all thirty of the above at the moment it was
-/// written; `NONE` + `EXTERNAL` fires on nothing today and is kept because it
-/// is the same contradiction read in the other direction (a row cannot claim
-/// that nothing external exists AND that its oracle is external).
-///
-/// This is still bookkeeping, not truth -- see immediately below. It cannot
-/// tell `MIXED` from `EXTERNAL`, and a row that lies in BOTH columns at once
-/// (SOURCE `NONE` beside ANCHOR `SELF`, when a real oracle exists) stays green.
-/// What it removes is the specific failure that actually happened: a task
-/// recorded as closed while the grade it closed still says nobody checked.
-///
-/// What CANNOT be checked, and this does not pretend to:
-///   - that a module claiming EXTERNAL/REDERIVED genuinely has one. The KAT
-///     file, live peer or foreign oracle a row points at could be deleted,
-///     fabricated, or never have existed, and every check above stays green --
-///     "the TSV cell says EXTERNAL" is not the same fact as "bytes in this repo
-///     were produced by a foreign implementation", and nothing short of a human
-///     re-running the foreign oracle (i.e. the anchor-task work itself) can close
-///     that gap. Claiming otherwise here would manufacture false confidence.
-///   - that EVIDENCE prose is accurate -- only the CLASS/ANCHOR/SOURCE columns
-///     are validated; EVIDENCE is free text for a human to judge, same as the
-///     README `Provenance:` note is left to a human elsewhere in this file.
-///
-/// Deliberately NOT built: a "module claims EXTERNAL therefore its tree must
-/// contain a file named like a golden/vector" filename heuristic. It was tried
-/// while designing this gate -- `sandbox` (EXTERNAL: seccomp/landlock tested
-/// against the real running kernel) and `traceroute` (MIXED: real ICMP over a
-/// veth pair) are both single-file modules with no `*golden*`/`*vector*`/`*kat*`
-/// filename anywhere in their tree, so the heuristic would already need a
-/// per-module exemption list on a clean repo, on day one. A check that starts
-/// pre-broken teaches everyone to ignore it, which is worse than not having it --
-/// see `checkNonGoals`'s own exemption mechanism for what that costs when it IS
-/// worth paying for.
-fn checkAnchors(b: *std.Build, io: std.Io, failed: *bool) !void {
-    const anchors_src = try b.build_root.handle.readFileAlloc(io, "ANCHORS.tsv", b.allocator, .limited(1 * 1024 * 1024));
-    const tasks_src = try b.build_root.handle.readFileAlloc(io, "ANCHOR-TASKS.tsv", b.allocator, .limited(1 * 1024 * 1024));
-
-    const anchor_rows = parseAnchorRows(anchors_src, b);
-    const task_rows = parseAnchorRows(tasks_src, b);
-
-    // module_list <-> ANCHORS.tsv, both directions -- the same shape as the
-    // module_list <-> modules/ check earlier in checkCatalog.
-    for (module_list) |m| {
-        if (findAnchorRow(anchor_rows, m.name) == null) {
-            std.log.err("module '{s}' has no ANCHORS.tsv row (CLASS/ANCHOR oracle bookkeeping)", .{m.name});
-            failed.* = true;
-        }
-    }
-    for (anchor_rows) |row| {
-        const known = for (module_list) |m| {
-            if (std.mem.eql(u8, m.name, row.name)) break true;
-        } else false;
-        if (!known) {
-            std.log.err("ANCHORS.tsv has a row for '{s}' but no such module exists in module_list", .{row.name});
-            failed.* = true;
-        }
-    }
-
-    // Schema + the A/B <-> non-n/a pairing rule, on ANCHORS.tsv.
-    for (anchor_rows) |row| {
-        if (!containsName(&.{ "A", "B", "C", "D" }, row.class)) {
-            std.log.err("ANCHORS.tsv: module '{s}' has CLASS '{s}', not one of A/B/C/D", .{ row.name, row.class });
-            failed.* = true;
-        }
-        if (!containsName(&.{ "EXTERNAL", "REDERIVED", "MIXED", "SELF", "n/a" }, row.anchor)) {
-            std.log.err("ANCHORS.tsv: module '{s}' has ANCHOR '{s}', not one of EXTERNAL/REDERIVED/MIXED/SELF/n/a", .{ row.name, row.anchor });
-            failed.* = true;
-        }
-        const faces_outside = std.mem.eql(u8, row.class, "A") or std.mem.eql(u8, row.class, "B");
-        const has_anchor = !std.mem.eql(u8, row.anchor, "n/a");
-        if (faces_outside and !has_anchor) {
-            std.log.err(
-                "ANCHORS.tsv: module '{s}' is CLASS {s} (faces the outside world) but ANCHOR is 'n/a' -- " ++
-                    "an A/B module must record EXTERNAL/REDERIVED/MIXED/SELF",
-                .{ row.name, row.class },
-            );
-            failed.* = true;
-        } else if (!faces_outside and has_anchor) {
-            std.log.err(
-                "ANCHORS.tsv: module '{s}' is CLASS {s} (no outside truth exists for it) but ANCHOR is '{s}', not 'n/a'",
-                .{ row.name, row.class, row.anchor },
-            );
-            failed.* = true;
-        }
-    }
-
-    // ANCHOR-TASKS.tsv: schema, ghost rows, and agreement with ANCHORS.tsv.
-    for (task_rows) |trow| {
-        if (!containsName(&.{ "EXTERNAL", "REDERIVED", "MIXED", "SELF", "n/a" }, trow.anchor)) {
-            std.log.err("ANCHOR-TASKS.tsv: module '{s}' has ANCHOR '{s}', not one of EXTERNAL/REDERIVED/MIXED/SELF/n/a", .{ trow.name, trow.anchor });
-            failed.* = true;
-        }
-        const arow = findAnchorRow(anchor_rows, trow.name) orelse {
-            std.log.err("ANCHOR-TASKS.tsv has a row for '{s}' but ANCHORS.tsv has no such module", .{trow.name});
-            failed.* = true;
-            continue;
-        };
-        if (!std.mem.eql(u8, arow.class, "A") and !std.mem.eql(u8, arow.class, "B")) {
-            std.log.err(
-                "ANCHOR-TASKS.tsv lists '{s}', but ANCHORS.tsv classifies it CLASS {s} -- only class A/B modules can carry anchor debt",
-                .{ trow.name, arow.class },
-            );
-            failed.* = true;
-        }
-        if (!std.mem.eql(u8, arow.class, trow.class)) {
-            std.log.err(
-                "CLASS disagreement for '{s}': ANCHORS.tsv says {s}, ANCHOR-TASKS.tsv says {s} -- CLASS records a " ++
-                    "module's relationship to the outside world and must never change between the two files",
-                .{ trow.name, arow.class, trow.class },
-            );
-            failed.* = true;
-        }
-        if (!std.mem.eql(u8, arow.anchor, trow.anchor)) {
-            std.log.err(
-                "ANCHOR drift for '{s}': ANCHORS.tsv says {s}, ANCHOR-TASKS.tsv (the file owned while closing anchor " ++
-                    "tasks) says {s} -- ANCHORS.tsv was not updated when the task closed",
-                .{ trow.name, arow.anchor, trow.anchor },
-            );
-            failed.* = true;
-        }
-
-        // SOURCE vs ANCHOR -- the only cross-file claim here that is not a
-        // column checked against its own copy. See "WHY SOURCE vs ANCHOR IS A
-        // DIFFERENT KIND OF CHECK" in the doc comment for what these caught.
-        const src = trow.source orelse {
-            std.log.err(
-                "ANCHOR-TASKS.tsv: module '{s}' has no SOURCE column -- every row carries " ++
-                    "module/CLASS/ANCHOR/EVIDENCE/SOURCE/COST/NOTE (see the file's own header)",
-                .{trow.name},
-            );
-            failed.* = true;
-            continue;
-        };
-        if (std.mem.eql(u8, src, "DONE") and std.mem.eql(u8, arow.anchor, "SELF")) {
-            std.log.err(
-                "module '{s}': ANCHOR-TASKS.tsv SOURCE is DONE (the anchoring landed, and the NOTE column " ++
-                    "normally cites the commit) but ANCHORS.tsv still grades the oracle SELF -- a module whose " ++
-                    "anchor task closed cannot still be round-trip/hand-authored only. Re-grade it from what the " ++
-                    "module's TESTS contain (EXTERNAL/REDERIVED/MIXED), not from the NOTE",
-                .{trow.name},
-            );
-            failed.* = true;
-        }
-        if (std.mem.eql(u8, src, "NONE") and std.mem.eql(u8, arow.anchor, "EXTERNAL")) {
-            std.log.err(
-                "module '{s}': ANCHOR-TASKS.tsv SOURCE is NONE (nothing external exists to anchor against) but " ++
-                    "ANCHORS.tsv grades the oracle EXTERNAL -- those two cannot both be true. One of them is wrong",
-                .{trow.name},
-            );
-            failed.* = true;
-        }
-        // SOURCE vs NOTE. A row whose NOTE opens `CLOSED`/`DONE` is a closed
-        // task, so its SOURCE must say so; leaving the tool named there reads as
-        // outstanding work. This is the same drift as the SELF case above and it
-        // rots the same way -- the difference is only which column the closer
-        // forgot. It fired on NINETEEN rows when written (2026-08-14), which is
-        // why the file's header had been claiming twenty open tasks for a week
-        // while nineteen of them were finished and written up.
-        if (trow.note) |note| {
-            const closed = std.mem.startsWith(u8, note, "CLOSED") or std.mem.startsWith(u8, note, "DONE");
-            const open_source = !std.mem.eql(u8, src, "DONE") and !std.mem.eql(u8, src, "NONE");
-            if (closed and open_source) {
-                std.log.err(
-                    "module '{s}': ANCHOR-TASKS.tsv NOTE opens with the task closed, but SOURCE still names " ++
-                        "'{s}' -- a reader counting open tasks by SOURCE counts this one. Set SOURCE to DONE " ++
-                        "(the anchoring landed) or NONE (nothing external exists), and re-grade ANCHORS.tsv " ++
-                        "from the module's TESTS while you are there",
-                    .{ trow.name, src },
-                );
-                failed.* = true;
-            }
-        }
-    }
-}
-
-const AnchorRow = struct {
-    name: []const u8,
-    class: []const u8,
-    anchor: []const u8,
-    /// `ANCHOR-TASKS.tsv`'s 5th column. `null` for an `ANCHORS.tsv` row, which
-    /// has only four columns and no SOURCE at all -- the optionality is the
-    /// type saying which file a row came from, so a check that only makes
-    /// sense on the tasks file cannot silently read garbage off the other one.
-    source: ?[]const u8,
-    /// `ANCHOR-TASKS.tsv`'s 7th column, `null` for an `ANCHORS.tsv` row. Read
-    /// for one thing only: whether it OPENS with `CLOSED` or `DONE`, which is
-    /// how a closed task is written down. Its prose is never parsed further --
-    /// the NOTE is a lead, not evidence.
-    note: ?[]const u8,
+/// A module's anchor grade, read from the one line that states it. Both the gate
+/// that validates the grade and the fuzz gate that acts on it come through here,
+/// so neither can end up reading a different answer than the other.
+const AnchorGrade = struct {
+    class: u8,
+    oracle: []const u8,
+    /// The file it was read from, for error messages that name where to fix it.
+    path: []const u8,
 };
 
-/// Parse the `module<TAB>CLASS<TAB>ANCHOR<TAB>...` rows both `ANCHORS.tsv` and
-/// `ANCHOR-TASKS.tsv` share as their first three columns, skipping `#` comment
-/// lines, blank lines, and any malformed line with fewer than three tab-separated
-/// fields (a row that short is not a data row this gate can make sense of, and
-/// reporting a parse error on it would obscure the real drift this gate exists to
-/// find -- CONVENTIONS.md documents the fuller column set each file adds after
-/// ANCHOR).
-fn parseAnchorRows(content: []const u8, b: *std.Build) []const AnchorRow {
-    var out: std.ArrayList(AnchorRow) = .empty;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        var cols = std.mem.splitScalar(u8, line, '\t');
-        const name = cols.next() orelse continue;
-        const class = cols.next() orelse continue;
-        const anchor = cols.next() orelse continue;
-        _ = cols.next(); // EVIDENCE -- free text, deliberately not validated.
-        const source = cols.next();
-        _ = cols.next(); // COST -- S/M/L, advisory only.
-        const note = cols.next();
-        out.append(b.allocator, .{
-            .name = name,
-            .class = class,
-            .anchor = anchor,
-            .source = source,
-            .note = note,
-        }) catch @panic("OOM");
+/// Read `**Anchor grade:** class <X> · oracle <Y>` from `modules/<name>/SPEC.md`,
+/// or `README.md` for the six modules that have no SPEC.md. Returns null and logs
+/// the reason when the line is missing, doubled or malformed -- callers must treat
+/// null as a failure, never as "no grade, so nothing applies": a module dropping
+/// silently out of an obligation because its grade would not parse is exactly the
+/// fail-open shape this gate exists to prevent.
+fn moduleAnchorGrade(b: *std.Build, io: std.Io, name: []const u8) ?AnchorGrade {
+    const needle = "**Anchor grade:** class ";
+    var path = b.fmt("modules/{s}/SPEC.md", .{name});
+    b.build_root.handle.access(io, path, .{}) catch {
+        path = b.fmt("modules/{s}/README.md", .{name});
+    };
+    const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch {
+        std.log.err("module '{s}': cannot read {s} for its anchor grade", .{ name, path });
+        return null;
+    };
+
+    const first = std.mem.indexOf(u8, src, needle) orelse {
+        std.log.err(
+            "module '{s}': {s} states no anchor grade -- add a line `{s}<A|B|C|D> · oracle " ++
+                "<EXTERNAL|REDERIVED|MIXED|SELF|n/a>` saying where its expected values get their " ++
+                "authority (see modules/_template/SPEC.md)",
+            .{ name, path, needle },
+        );
+        return null;
+    };
+    if (std.mem.indexOfPos(u8, src, first + needle.len, needle) != null) {
+        std.log.err(
+            "module '{s}': {s} states an anchor grade twice -- two copies of one fact is how the " ++
+                "repository-level tables this replaced went stale",
+            .{ name, path },
+        );
+        return null;
     }
-    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+
+    const rest = src[first + needle.len ..];
+    const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
+    const sep = " · oracle ";
+    const sep_at = std.mem.indexOf(u8, line, sep) orelse {
+        std.log.err(
+            "module '{s}': anchor grade line in {s} is malformed -- expected `class <X> · oracle <Y>`, got `{s}`",
+            .{ name, path, line },
+        );
+        return null;
+    };
+    const class = std.mem.trim(u8, line[0..sep_at], " \t");
+    if (class.len != 1) {
+        std.log.err("module '{s}': anchor class '{s}' is not a single letter ({s})", .{ name, class, path });
+        return null;
+    }
+    return .{
+        .class = class[0],
+        .oracle = std.mem.trim(u8, line[sep_at + sep.len ..], " \t"),
+        .path = path,
+    };
 }
 
-fn findAnchorRow(rows: []const AnchorRow, name: []const u8) ?AnchorRow {
-    for (rows) |r| {
-        if (std.mem.eql(u8, r.name, name)) return r;
+/// Oracle-provenance gate: every module states, beside its own tests, where the
+/// authority of its expected values comes from.
+///
+/// WHAT IT READS: the one line `moduleAnchorGrade` above parses. CLASS answers
+/// "does an external truth exist for this module at all?" and ORACLE answers
+/// "where does the test oracle's authority come from?". The vocabulary, and the
+/// five things that look like an anchor and are not (a sibling's anchor; reading
+/// a foreign source rather than running it; a live test that skips on this host;
+/// anchored primitives under unanchored framing; a prose claim of parity), are
+/// in `modules/_template/SPEC.md`.
+///
+/// WHERE THIS LIVED BEFORE, and why it moved on 2026-08-14: two repository-level
+/// files, `ANCHORS.tsv` (a grade per module) and `ANCHOR-TASKS.tsv` (the same
+/// grade again, plus the work). Everything that went wrong with them went wrong
+/// because the fact lived away from the thing it described:
+///
+///   - Eleven rows where the tasks file had moved past what the grades file
+///     still said, closed 2026-08-02..05 against a snapshot regenerated 08-01.
+///   - Thirty rows graded SELF in BOTH files while their own NOTE cited the
+///     commit that had anchored them -- a check comparing a column against its
+///     duplicate is green whenever both copies are wrong the same way.
+///   - Nineteen rows whose NOTE said the task had closed while SOURCE still
+///     named the tool, so the file's own header claimed twenty open tasks for a
+///     week while nineteen of them were finished.
+///
+/// None of those three can recur: there is one copy now, beside the tests, and a
+/// module cannot drift from itself.
+///
+/// WHAT IT CHECKS: that every module in `module_list` carries exactly one
+/// well-formed grade, that CLASS and ORACLE are from the vocabulary, and the
+/// pairing rule -- a class A/B module (an outside truth exists) may not grade its
+/// oracle `n/a`, and a class C/D module (none exists) must.
+///
+/// WHAT IT CANNOT CHECK, stated because a green run here is weaker than it looks:
+/// whether the grade is TRUE. `EXTERNAL` is a claim about what a test file
+/// contains, and only reading the tests settles it. This keeps the claim present,
+/// well-formed and self-consistent; it does not audit it.
+fn checkAnchors(b: *std.Build, io: std.Io, failed: *bool) !void {
+    for (module_list) |m| {
+        const grade = moduleAnchorGrade(b, io, m.name) orelse {
+            failed.* = true;
+            continue;
+        };
+        if (std.mem.indexOfScalar(u8, "ABCD", grade.class) == null) {
+            std.log.err(
+                "module '{s}': anchor class '{c}' is not one of A/B/C/D ({s})",
+                .{ m.name, grade.class, grade.path },
+            );
+            failed.* = true;
+            continue;
+        }
+        if (!containsName(&.{ "EXTERNAL", "REDERIVED", "MIXED", "SELF", "n/a" }, grade.oracle)) {
+            std.log.err(
+                "module '{s}': anchor oracle '{s}' is not one of EXTERNAL/REDERIVED/MIXED/SELF/n/a ({s})",
+                .{ m.name, grade.oracle, grade.path },
+            );
+            failed.* = true;
+            continue;
+        }
+
+        const faces_out = grade.class == 'A' or grade.class == 'B';
+        const na = std.mem.eql(u8, grade.oracle, "n/a");
+        if (faces_out and na) {
+            std.log.err(
+                "module '{s}': class {c} means another implementation can disagree with it, so 'n/a' is not " ++
+                    "an answer -- grade the oracle from what the tests contain",
+                .{ m.name, grade.class },
+            );
+            failed.* = true;
+        }
+        if (!faces_out and !na) {
+            std.log.err(
+                "module '{s}': class {c} means no outside truth exists for it, so the oracle must be 'n/a', " ++
+                    "not '{s}' -- grading a C/D module invents anchor debt that cannot be paid",
+                .{ m.name, grade.class, grade.oracle },
+            );
+            failed.* = true;
+        }
     }
-    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1821,7 +1673,7 @@ const FuzzScan = struct {
 ///
 /// A module is obligated to carry a fuzz harness when BOTH of these hold:
 ///
-///   1. `ANCHORS.tsv` classifies it CLASS **A** (wire / interop format — other
+///   1. its own SPEC.md grades it anchor class **A** (wire / interop format — other
 ///      implementations must byte-agree with it) or **B** (published crypto or
 ///      algorithmic construction). That column is the repo's own, already
 ///      CI-enforced statement that *foreign bytes are the truth for this
@@ -1847,10 +1699,9 @@ const FuzzScan = struct {
 /// being obligated you must either take the byte-accepting function out of the
 /// public API (a real code change that also removes the surface), or downgrade
 /// its CLASS — and CLASS is load-bearing for something else: `checkAnchors`
-/// forces a non-A/B module's ANCHOR to `n/a`, which deletes its recorded
-/// external anchor and drops it out of `ANCHOR-TASKS.tsv`. You cannot buy fuzz
-/// exemption without paying in anchor provenance, in a file whose whole purpose
-/// is to be read. That is the difference between this and the earlier
+/// forces a non-A/B module's oracle grade to `n/a`, which deletes the module's
+/// own recorded external anchor. You cannot buy fuzz exemption without paying in
+/// anchor provenance, in the file a reader of that module actually opens. That is the difference between this and the earlier
 /// "external anchor ⇒ vector file" proxy, which was measured and rejected: this
 /// gate does not infer coverage from bookkeeping, it infers OBLIGATION from
 /// bookkeeping that is already independently policed, and then checks coverage
@@ -1999,8 +1850,6 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
     const b = step.owner;
     const io = b.graph.io;
 
-    const anchors_src = try b.build_root.handle.readFileAlloc(io, "ANCHORS.tsv", b.allocator, .limited(1 * 1024 * 1024));
-    const anchor_rows = parseAnchorRows(anchors_src, b);
     const exempt_src = try b.build_root.handle.readFileAlloc(io, "FUZZ-EXEMPT.tsv", b.allocator, .limited(1 * 1024 * 1024));
     const exempt_rows = parseFuzzExemptRows(exempt_src, b);
 
@@ -2015,17 +1864,18 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
         const scan = try scanModuleForFuzz(b, io, m.name);
         n_harnesses += scan.harnesses;
 
-        const row = findAnchorRow(anchor_rows, m.name) orelse {
-            // checkAnchors reports the missing row itself; repeat it here so a
-            // module cannot dodge THIS gate by simply having no CLASS.
+        // `moduleAnchorGrade` logs why it could not read a grade. Repeated as a
+        // failure here rather than skipped, so a module cannot dodge THIS gate by
+        // having an unreadable class.
+        const grade = moduleAnchorGrade(b, io, m.name) orelse {
             std.log.err(
-                "module '{s}' has no ANCHORS.tsv row, so check-fuzz cannot tell whether foreign bytes are its truth",
+                "module '{s}': check-fuzz cannot tell whether foreign bytes are its truth without an anchor class",
                 .{m.name},
             );
             failed = true;
             continue;
         };
-        const faces_outside = std.mem.eql(u8, row.class, "A") or std.mem.eql(u8, row.class, "B");
+        const faces_outside = grade.class == 'A' or grade.class == 'B';
         if (!faces_outside or scan.surface_files == 0) continue;
 
         n_obligated += 1;
@@ -2039,16 +1889,16 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
         }
         n_failing += 1;
         std.log.err(
-            "module '{s}' is CLASS {s} and exposes a byte-accepting public API in {d} source file(s), " ++
+            "module '{s}' is CLASS {c} and exposes a byte-accepting public API in {d} source file(s), " ++
                 "but modules/{s}/src/ contains no `testing.fuzz(` harness — so every repo-wide sweep " ++
                 "skips it and it looks covered from outside. Add a harness on the decode entry point, " ++
                 "or add a justified row to FUZZ-EXEMPT.tsv",
-            .{ m.name, row.class, scan.surface_files, m.name },
+            .{ m.name, grade.class, scan.surface_files, m.name },
         );
         failed = true;
     }
 
-    try checkFuzzExempt(b, io, exempt_rows, anchor_rows, &failed);
+    try checkFuzzExempt(b, io, exempt_rows, &failed);
 
     std.log.info(
         "check-fuzz: {d} modules obligated, {d} covered, {d} exempt, {d} FAILING ({d} harnesses total)",
@@ -2084,7 +1934,6 @@ fn checkFuzzExempt(
     b: *std.Build,
     io: std.Io,
     exempt_rows: []const FuzzExemptRow,
-    anchor_rows: []const AnchorRow,
     failed: *bool,
 ) !void {
     for (exempt_rows) |row| {
@@ -2110,11 +1959,11 @@ fn checkFuzzExempt(
         };
 
         const scan = try scanModuleForFuzz(b, io, row.name);
-        const class = if (findAnchorRow(anchor_rows, row.name)) |r| r.class else "?";
-        const faces_outside = std.mem.eql(u8, class, "A") or std.mem.eql(u8, class, "B");
+        const class: u8 = if (moduleAnchorGrade(b, io, row.name)) |g| g.class else '?';
+        const faces_outside = class == 'A' or class == 'B';
         if (!faces_outside or scan.surface_files == 0) {
             std.log.err(
-                "FUZZ-EXEMPT.tsv exempts '{s}', but check-fuzz would not have flagged it (CLASS {s}, " ++
+                "FUZZ-EXEMPT.tsv exempts '{s}', but check-fuzz would not have flagged it (CLASS {c}, " ++
                     "{d} byte-accepting source file(s)) — an exemption that excuses nothing is dead weight; delete the row",
                 .{ row.name, class, scan.surface_files },
             );

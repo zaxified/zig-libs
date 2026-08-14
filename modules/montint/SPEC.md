@@ -520,3 +520,12 @@ al. CIOS), the `x86_64-mont5` `MULX/ADCX/ADOX` technique (OpenSSL, studied as a
 design reference — recorded in `NOTICE`), and the `std.crypto.ff` public API for
 shape. KAT vectors from an independent CPython-bignum re-derivation (no
 third-party source ported). See `NOTICE`.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** internal Montgomery bignum arithmetic; ground truth is brute-force CPython bignum

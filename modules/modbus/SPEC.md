@@ -97,3 +97,12 @@ simulated fleet) is the caller's job.
 ## Status
 `gap · any (codec+client+server pure; TcpTransport uses std.Io.net) · client(master)+server(slave)+codec · single-owner`
 + deps: none (std only) — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** CAPTURED pymodbus 3.14.0 live session, baked-in bytes in goldens.zig

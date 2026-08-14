@@ -192,3 +192,12 @@ real):
   this test now runs (not skipped) and drives the real Poisson mix through
   netsim across a seed sweep, asserting `AnonymityBound` holds — see "Part 2
   result" above for the measured separation from the FIFO/no-cover controls.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** netsim anonymity simulation of Loopix paper; modeled header, not byte-compat with real Loopix/Nym

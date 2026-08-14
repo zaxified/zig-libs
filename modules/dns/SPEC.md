@@ -43,3 +43,14 @@ into the security/similarity review pass.
 ## Status
 `extract+gap · any (RFC 6724 result order is Linux-only) · client · blocking` · deps: `netaddr`,
 `http`, `std.json`, `std.Io.net` — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** message.zig goldens hand-built; Resolver has live UDP/TCP/DoH tests vs real 8.8.8.8
+
+**How it got there.** The anchoring work landed. DONE ea2d000: 6 real Google DNS responses incl. compression, CNAME chain, NXDOMAIN

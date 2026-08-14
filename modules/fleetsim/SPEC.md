@@ -744,3 +744,12 @@ and the multi-connection binding. What is still open:
 - **`modules/dnp3` gained one additive public function**
   (`outstation.Session.unsolicitedFrames`) plus its test and doc updates. The
   existing public API is unchanged and source-compatible.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** 7 protocols live vs real masters: pymodbus/pycomm3/bacpypes3/opendnp3/c104/snap7/asyncua

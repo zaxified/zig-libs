@@ -891,3 +891,12 @@ read from `py_ecc`'s source).
 - `G2` cofactor value/`clearCofactor` — deliberately out of scope for
   this arc (see "Design & invariants" above); revisit only if a future
   part adds hash-to-`G2`.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** byte-exact against py_ecc external library (SPEC.md)

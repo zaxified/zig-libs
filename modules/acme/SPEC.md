@@ -70,3 +70,14 @@ ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual stagin
 ## Status
 `gap · any · client · threadsafe` + deps `http`, `router`, `std.crypto` (ECDSA P-256, `Certificate`),
 `std.json` — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** RFC7515/7638 KATs+openssl fixtures EXTERNAL; TLS-ALPN-01 ext encoding self-constructed
+
+**How it got there.** The anchoring work landed. DONE b830ef5: openssl-built TLS-ALPN-01 extension; provenance, not extra detection

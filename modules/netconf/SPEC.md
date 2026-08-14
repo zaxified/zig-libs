@@ -320,3 +320,14 @@ Honest list of what this module does **not** do:
   `n`. A peer with a modest input buffer might want that.
 * **A timeout implementation.** By design (see above) — the seam is there, the policy is
   the caller's.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips
+
+**How it got there.** The anchoring work landed. DONE 0bbcefe: real python-netconf server; hello/rpc-reply/rpc-error frozen

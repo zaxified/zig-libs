@@ -643,3 +643,14 @@ integer-equality path. All RSA keys in these tests are test material only.
   `sp_decrypt_key`/`allow_weak_rsa15`/`decrypt_kek` directly instead of a whole
   `Config` — this is what let the Single-Logout `EncryptedID` path reuse it
   without duplicating the decrypt-then-reparse logic a third time.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips
+
+**How it got there.** The anchoring work landed. DONE 9f9d238: genuine xmlsec1 EncryptedAssertion over the already-anchored signed one

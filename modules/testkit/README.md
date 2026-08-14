@@ -109,3 +109,12 @@ have, and `ethtool`'s `max_error_message` took `.len` of a *type*.
 Provenance: original work of the zig-libs authors (MIT); a thin layer over
 `std.testing`. No third-party source consulted or copied, so no `NOTICE` entry
 is required (root [`NOTICE`](../../NOTICE) §0).
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** in-process test-utility layer over std.testing, no wire/crypto

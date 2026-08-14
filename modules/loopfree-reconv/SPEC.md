@@ -138,3 +138,12 @@ are equivalent — see `fib.zig`).
 `any · util · single_owner` + deps `netsim`, `spf-ect`, model_after
 "ordered-FIB / RPF loop-free convergence (IS-IS/SPB), TTL backstop" — canonical
 source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** ordered-FIB scheduling algorithm proven via own loop-freedom invariant, no wire messages

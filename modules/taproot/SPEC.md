@@ -141,3 +141,12 @@ Design references: none beyond the BIP341 specification text itself,
 - Both `zig build test-taproot` (Debug) and `-Doptimize=ReleaseFast` pass
   — zero skips, no test failures — and `zig fmt --check
   modules/taproot/` is clean.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official BIP341 wallet test vectors, kat_vectors.zig/kat_test.zig

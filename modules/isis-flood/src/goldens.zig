@@ -2,7 +2,7 @@
 
 //! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/dissect.py`).
 //!
-//! `isis-flood`'s own `ANCHOR-TASKS.tsv` row before this file read `SELF`,
+//! this module's anchor record (`SPEC.md` § Anchoring) read `SELF` before this file existed,
 //! justified as "SPEC.md: no external oracle needed, wire exercised via
 //! sibling isis codec only". Per the audit brief a sibling's anchor does not
 //! transfer: the fact that CSNP/PSNP bytes pass through the already-anchored

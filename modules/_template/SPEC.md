@@ -47,7 +47,14 @@ Where the expected values in the tests come from. Distinguish, in these words:
 - **Self** — we wrote the expected values from our own reading.
 
 ⚠ Never record a design reference ("we looked at how X does it") as an anchor.
-Keep this in step with the module's row in `ANCHORS.tsv`.
+State the grade in the machine-checked form `check-catalog` reads:
+
+**Anchor grade:** class <A|B|C|D> · oracle <EXTERNAL|REDERIVED|MIXED|SELF|n/a>
+
+Class A/B means an outside truth exists (a wire format others must agree with, or
+a published construction with vectors) and the oracle may not be `n/a`. Class C/D
+means none exists — an internal algorithm, or our own design — and the oracle must
+be `n/a`, because grading one invents anchor debt that cannot be paid.
 
 ## What is deliberately not done
 

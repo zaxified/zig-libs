@@ -178,3 +178,14 @@ verify with the `h ≠ 1` guard).
   protocol (removes the trusted dealer).
 - **Multi-authority / cross-credential optimizations, SHAKE ciphersuite,
   aggregated-attribute batching.**
+
+## Anchoring
+
+**Anchor grade:** class B · oracle SELF
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** SPEC.md §3: "no external byte-exact vector" for Coconut, explicit Fable tier
+
+**How it got there.** No external oracle exists for what remains. SPEC §3: no public vector; asonnino/nymtech impls use incompatible serialization

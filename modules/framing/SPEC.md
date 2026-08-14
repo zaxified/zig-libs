@@ -59,3 +59,12 @@ Verified green in Debug and ReleaseFast; `zig fmt --check` clean. Run: `zig buil
 
 `extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** own length-prefix + JSON envelope wire shape invented here, no external spec

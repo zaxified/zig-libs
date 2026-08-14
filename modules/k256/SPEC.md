@@ -378,3 +378,12 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 4. Addition-chain field inverse (replace the Fermat square-and-multiply).
 5. Rewire the 8 Bitcoin/Lightning modules from `std.crypto.ecc.Secp256k1` to k256.
 6. Side-channel review of the CT paths (inverse, GLV sign handling).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official BIP340 vectors (kat_vectors.zig) + bit-exact vs std.crypto.ecc.Secp256k1

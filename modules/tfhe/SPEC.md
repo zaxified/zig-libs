@@ -240,3 +240,14 @@ own ~4× memory cost for the prepared key.
 - General `k > 1` GLWE; multi-value / larger-precision LUTs.
 - Security-grade parameter sets + a parameter-selection helper driven by the
   `erfc` ledger.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle SELF
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** no external byte-exact KAT exists (root.zig/gate.zig); cleartext oracle + property tests
+
+**How it got there.** No external oracle exists for what remains. no reference ships byte-exact KATs; noise sampling makes bytes non-reproducible anyway

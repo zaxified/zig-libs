@@ -92,3 +92,12 @@ spawning anything** alongside an accept-and-actually-run case. Run: `zig build t
 POSIX-only) · util · reentrant` + deps: `argsafe` (opt-in argv sanitization via `runValidated`/
 `buildValidatedArgv`; every other entry point is std-only) — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** process reap/spawn robustness util, no wire format

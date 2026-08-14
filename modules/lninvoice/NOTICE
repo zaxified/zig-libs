@@ -88,11 +88,11 @@ this pass did not change):
     (not sidestepped in favor of a vector without the field). See
     `bolt12.zig`'s `appendSignedStream` and SPEC.md's "ENCODE byte-exact
     anchor" note for the fix. Closes the `lninvoice` row of
-    `ANCHOR-TASKS.tsv`.
+    the anchor record in `SPEC.md`.
 
 A fifth file, `bolt12/format-string-test.json`'s sibling
 `bootstrap.bolt12.org`-hosted vector set, was never fetched or used: that
-hostname is NXDOMAIN and was the reason `ANCHOR-TASKS.tsv` previously marked
+hostname is NXDOMAIN and was the reason the anchor record in `SPEC.md` previously marked
 this module BLOCKED. It was never needed — the official vectors live in
 `lightning/bolts` (this file's own source), reachable without it.
 

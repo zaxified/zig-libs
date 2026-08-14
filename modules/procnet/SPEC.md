@@ -65,3 +65,12 @@ beyond `stat`'s scalars, a planned `status.zig` sibling to `process.zig`); `/pro
 ## Status
 `extract · linux · util · reentrant` + deps: `netaddr` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** testdata/*.txt captured from real kernel /proc snapshots (README)

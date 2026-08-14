@@ -257,3 +257,14 @@ wrong bytes. That is the concrete argument for anchoring on bytes and not on val
   would need somewhere to put it, and the messages here are deliberately plain values.
 - **Streaming decode.** The API takes a complete buffer. gRPC frames arrive length-prefixed, so
   the framing layer above this one is the natural place for that.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing
+
+**How it got there.** The anchoring work landed. DONE e080479: live python oracle frozen into committed goldens, survives CI

@@ -345,3 +345,12 @@ icmp/rawsock/wireguard/l2disco/procnet.
 ## Status
 `gap · linux · client · reentrant` + deps: none (std only) — canonical source is `pub const meta`
 in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** golden bytes captured from iproute2 via strace+nlmon/tcpdump, SPEC.md

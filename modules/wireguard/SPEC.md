@@ -269,3 +269,14 @@ tunnel adds a syscall (~1–2 µs) per packet on top, which will dominate.
 `gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly` — canonical source is
 `pub const meta` in src/root.zig. (The handshake + transport half above depends only on
 `chachapoly`/std.crypto, not on either netlink module.)
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** KDF vs real wireguard-go vectors(EXTERNAL); handshake KAT REDERIVED(Python); netlink codec SELF, root kernel test skips
+
+**How it got there.** The anchoring work landed. DONE be61caa: real kernel SET/GET_DEVICE netlink frozen; closes the last self-RT layer

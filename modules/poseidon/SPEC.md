@@ -155,6 +155,13 @@ coverage.
 
 ## Anchoring
 
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** circomlibjs JSON consts byte-identical (constants_test.zig)
+
 Grade 1 (published vectors / reference-implementation output) throughout —
 this repo's strongest tier. Three upstream sources, each with the exact
 retrieval command recorded in `src/vectors_test.zig` and

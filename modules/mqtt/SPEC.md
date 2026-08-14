@@ -186,3 +186,14 @@ fallback). Client: MQTT 5.0 out of scope.
 ## Status
 `gap · any (codec+client pure; TcpTransport uses std.Io.net) · client+codec · single-owner` + deps:
 none (std only) — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/external_goldens.zig freezes real MQTT 3.1.1 sessions captured through a byte-logging proxy between paho and amqtt -- neither side ours -- covering CONNECT/PUBLISH/SUBSCRIBE and the RETAIN bit; broker.zig session state and topic.zig matching stay self
+
+**How it got there.** The anchoring work landed. DONE 0b466d6: 9 real paho/amqtt sessions both directions; amqtt itself violates 3.3.5

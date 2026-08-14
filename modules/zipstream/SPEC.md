@@ -107,3 +107,14 @@ two methods ordinary zip tools and Excel emit, no observed producer needs the re
 ## Status
 `extract · any · codec (reader + writer) · reentrant` + deps: none (std only) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** writer bytes cross-checked live via std.zip.Iterator; real unzip/zipinfo check was ad hoc, not standing
+
+**How it got there.** The anchoring work landed. DONE 23312c0: unzip/zipinfo agreement was PROSE ONLY; now a committed archive

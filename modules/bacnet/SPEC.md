@@ -588,3 +588,12 @@ entry (merger doctrine); its clause citations live in this file and in the modul
   `sc_interop.zig`) and all six are named in `root.zig`'s dark-tests aggregator.
 - **CI**: the two new gated variables (`BACNET_SC_TEST_HUB`, `BACNET_SC_TEST_LISTEN`) are unset in
   CI and skip gracefully, like the existing two.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** bacpypes3/bacnet-stack black-box oracles + bacpypes3 live peer (README)

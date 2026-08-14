@@ -59,3 +59,14 @@ sparse files, per-file compression, encryption/signing, special files).
 ## Status
 `extract · any (packDir: linux) · both (reader+writer) · reentrant` + deps: none (std only —
 `std.compress.flate` for gzip) — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** read path: real GNU tar 1.35 golden header; write path only via skippable live tar test
+
+**How it got there.** The anchoring work landed. DONE 23312c0: 5 real GNU tar archives frozen, write path anchored offline

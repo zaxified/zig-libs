@@ -306,3 +306,12 @@ cross-signer rejection check.
   (untweaked AND tweaked), plus the end-to-end tests. `zig fmt
   --check modules/musig2/` clean; a repo-hygiene grep for
   scratch/home-directory leakage over this module's tree has no hits.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official BIP327 vectors (key_agg/nonce/sig_agg/tweak), NOTICE

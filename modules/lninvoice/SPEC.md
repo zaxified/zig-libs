@@ -149,7 +149,7 @@ as an external byte-exact KAT (`bolt12.zig`, "BOLT#12 KAT: invoice Merkle root +
 **ENCODE byte-exact anchor, added 2026-08-05:** the Merkle/signature *core* being externally
 anchored (previous paragraph) is a different claim from the full `invoice`/`invoice_request`
 TLV-to-wire-string ENCODE producing the spec's own bytes — that was still round-trip
-(build+decode+verify against itself) only, the exact weakness `ANCHOR-TASKS.tsv`'s `lninvoice` row
+(build+decode+verify against itself) only, the exact weakness this module's anchor record (`SPEC.md` § Anchoring)
 named. Closed for both directions: `invoice_request` ENCODE was already checkable against
 `signature-test.json`'s own `"bolt12"` field (a full `lnr1...` string, already used for a decode
 KAT but never fed through `encodeSignedInvoiceRequest`); `invoice` had no such string until
@@ -242,7 +242,7 @@ wire string, not just a self-constructed one.
 
 **BOLT#12 offer ENCODE, externally anchored as of 2026-08-02** (closing the
 gap this section previously flagged — "BOLT12 offer ENCODE round-trip
-self-constructed" in `ANCHOR-TASKS.tsv` — where the only check was feeding
+self-constructed" in the anchor record in `SPEC.md` — where the only check was feeding
 this module's own encode pipeline back into its own decoder): ALL 53 rows of
 `lightning/bolts` `bolt12/offers-test.json` are now vendored
 (`bolt12_offers_kat_vectors.zig`). The 22 rows carrying a `fields` breakdown
@@ -312,3 +312,14 @@ Run: `zig build test-lninvoice` (Debug and `-Doptimize=ReleaseFast`).
 
 `any (pure codec, no I/O) · codec · reentrant` + deps: `bech32`, `k256`, `lnwire`, `bip340` —
 canonical source is `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** BOLT11 + BOLT12 offer/invoice_request/invoice decode+ENCODE all vs lightning/bolts vectors, byte-exact (NOTICE)
+
+**How it got there.** The anchoring work landed. Unblocked 2026-08-02: bootstrap.bolt12.org was a red herring — official vectors live in lightning/bolts (github, CC-BY 4.0), fetched directly, no host needed; found+fixed 2 real bugs (stripContinuation over-stripping `+`, quintetsToBytesStrict missing the <5-bit padding limit) via the sweep. Closed 2026-08-05: verified the remnant claim first (true — no byte comparison existed for invoice_request/invoice ENCODE), then found signature-test.json's own "bolt12" field already had the lnr1 string (was decode-only anchored) and payer-proof-test.json's valid_vectors[].input.invoice carries lni1 strings (previously only its Merkle-root/signature hex fields were read). Anchoring "full_disclosure" surfaced a real bug, not just a test gap: it has a type>240 TLV (3000000001) after the signature (240), and encodeSignedInvoice/encodeSignedInvoiceRequest always appended the signature last — emitting a stream BOLT#12's own ascending-type-order rule forbids. Fixed: shared appendSignedStream helper splits at type 240 instead of assuming everything precedes it (signing itself unchanged, pre-existing Merkle/signature KATs stay byte-identical). "full_disclosure" is now the anchor (not sidestepped); "minimal_disclosure" kept alongside as the ordinary-invoice case. Decoder (lnwire.parseTlvStream, shared with offer decode) already rejects any out-of-order stream via NotStrictlyIncreasing, signature slot included — no decoder-side gap. See SPEC.md's "ENCODE byte-exact anchor" note + modules/lninvoice/NOTICE.

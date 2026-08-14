@@ -258,3 +258,12 @@ real — see "Implementation notes" below.
   caught at `validateKey` — every one rejects cleanly (`error.
   InvalidProof`/`error.InvalidPublicKey`), never a panic on
   attacker-controlled input.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 9381 Appendix B.3 official ECVRF-EDWARDS25519-SHA512-TAI vectors, byte-exact

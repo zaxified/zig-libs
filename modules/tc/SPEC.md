@@ -550,3 +550,12 @@ implementation was consulted no longer holds; `/NOTICE`'s `tc` entry carries the
 
 `gap · linux · client · reentrant` + deps: `netlink` — canonical source is `pub const
 meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** netlink datagrams captured from real iproute2 tc via strace, goldens.zig

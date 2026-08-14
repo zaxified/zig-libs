@@ -2,7 +2,7 @@
 
 //! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/dissect.py`).
 //!
-//! `isis-lsdb`'s own ANCHOR-TASKS.tsv row before this file: the §7.3.16.1
+//! this module's anchor record (`SPEC.md` § Anchoring), before this file: the §7.3.16.1
 //! checksum tie-break was cross-checked against FRRouting `isis_lsp.c`, but the
 //! rest of the KAT table — the LSP-ID/sequence/lifetime/flags/checksum bytes
 //! this module stores and compares — was hand-authored only, with no oracle
@@ -257,7 +257,7 @@ test "golden CSNP LSP-Entry (Wireshark-anchored): Lsdb.reconcileCsnp requests ex
 
 // ── Golden 3: PSNP path + L2 CSNP/PSNP type codes ────────────────────────────
 //
-// The `isis-lsdb` ANCHOR-TASKS.tsv row before this section: golden 2 above
+// This module's anchor record (`SPEC.md` § Anchoring), before this section: golden 2 above
 // exercised only `Lsdb.reconcileCsnp` with an `is_l2 = false` (L1, type 24)
 // CSNP. Two things this module's own API surface exercises were never
 // separately fed to an independent dissector: `Lsdb.reconcilePsnp` (the PSNP

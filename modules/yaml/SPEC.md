@@ -334,3 +334,14 @@ consumer needing bignums has the exact text and can parse it itself.
   diagnostic against.
 - **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; only the UTF-8 BOM
   is handled (and skipped), other encodings are not detected.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution also test-suite covered (VERIFIED 2026-08-01)
+
+**How it got there.** The anchoring work landed. VERIFIED 2026-08-01: survey was WRONG, all 402 cases already execute; teeth-checked

@@ -129,3 +129,14 @@ adversarial-math reasoning.
 
 `extract · any · codec · reentrant` · deps: none (std only) — canonical source is
 `pub const meta` in `src/root.zig`.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/kernel_oracle.zig grades this module's Reassembler verdict against the real Linux kernel's own IPv4/IPv6 fragment reassembly, 6 scenarios x {v4,v6} = 12 captured comparisons; the emit/fragmentation side and the overlap policy beyond those scenarios stay self
+
+**How it got there.** The anchoring work landed. DONE b8612e1: kernel reassembly oracle; UNINITIALISED-MEMORY bug fixed; 1 policy divergence

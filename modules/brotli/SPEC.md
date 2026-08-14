@@ -191,3 +191,12 @@ larger than its input, and `compress` itself never fails except on allocation.
   only by the reference decoder — which is exactly why that anchor exists.
 - All tests pass in **Debug** and **ReleaseFast** (`zig build test-brotli`
   [`-Doptimize=ReleaseFast`]).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** reference_interop.zig round-trips streams through real google/brotli via Python ext

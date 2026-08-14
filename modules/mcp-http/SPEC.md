@@ -141,3 +141,14 @@ asserts every declared test actually runs.) Run: `zig build test-mcp-http`.
 
 `gap · any · server · reentrant (session store: Lock seam)` + deps: `router`, `http`, `mcp` —
 canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/oracle_vectors.zig freezes one real Streamable-HTTP session with the python MCP SDK and root.zig's `oracle:` tests replay it; the unbacked mcp_dart parity claim was retracted rather than counted, and the remaining HTTP/SSE framing paths are self-tested
+
+**How it got there.** The anchoring work landed. DONE 0341464: real MCP Python SDK session; unbacked mcp_dart parity claim RETRACTED

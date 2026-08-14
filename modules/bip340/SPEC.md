@@ -202,3 +202,12 @@ beyond the BIP340 specification text itself and `std.crypto.ecc.Secp256k1`
   rejects the whole batch).
 - Both `zig build test-bip340` (Debug) and `-Doptimize=ReleaseFast` pass;
   no `error.SkipZigTest` remains in the module.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official BIP340 19 test vectors embedded verbatim in kat_vectors.zig

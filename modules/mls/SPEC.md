@@ -1742,3 +1742,12 @@ the choice, and no vector exercises it.
   accepts any order; a later part (or the Fable pass's
   `validateParentHashes`) may want to check this explicitly if a vector
   ever exercises a violation (none of Part 2's KATs do).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** mlswg/mls-implementations official interop KAT (tree-operations.json etc.)

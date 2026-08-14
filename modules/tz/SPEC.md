@@ -59,3 +59,14 @@ than by these tests alone).
 ## Status
 `extract · any · util · reentrant` + deps: `datefmt` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** 600 zones from real IANA-generated table; Jn/n forms only synthetic hand zones
+
+**How it got there.** No external oracle exists for what remains. real zic footers are always M-form; Jn/n is unreachable from any current IANA release

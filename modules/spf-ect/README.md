@@ -102,3 +102,12 @@ the brute-force oracle pin it.
 Provenance: clean-room from the public IEEE 802.1aq / RFC 6329 description of
 ECT — no third-party source ported or studied, so no `NOTICE` entry is required
 (root [`NOTICE`](../../NOTICE) §0).
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** generalized Dijkstra/ECT graph algorithm; brute-force cross-check property tests

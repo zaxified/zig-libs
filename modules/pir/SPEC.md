@@ -881,3 +881,14 @@ protocol modules: bytes in, bytes out, and the transport is the integrator's.
 Clean-room from these public papers; no third-party source ported and no
 third-party implementation consulted, so per `CONVENTIONS.md` §5 no `NOTICE`
 entry is required and the citations live here.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle SELF
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** SPEC.md: no external test vector exists for this DPF construction
+
+**How it got there.** No external oracle exists for what remains. SPEC.md explicit: no published vector for this DPF-PIR composition exists anywhere

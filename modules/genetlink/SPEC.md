@@ -140,3 +140,14 @@ one implementation of the socket discipline — `netlink` (rtnetlink, and the tr
 `conntrack`, `nftables`, `tc` and, with this change, `genetlink` (and through it `nl80211`,
 `ethtool` and `wireguard`). No private copy of socket/bind/portid/`EXT_ACK`/`MSG_PEEK|MSG_TRUNC`
 remains in the repo.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** offline goldens self-built; live nlctrl test vs real Linux kernel is external
+
+**How it got there.** The anchoring work landed. DONE 5938bfc: real nlctrl exchange frozen; CLOSES the audit blind spot, measured

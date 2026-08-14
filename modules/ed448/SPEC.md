@@ -301,3 +301,12 @@ inline (dedicated squaring, windowed scalar mul, `mulSmall`, fused
   signature, verify-accept, tamper-reject each); Ed448ph §7.5 "TEST
   abc"; plus context-binding and Ed448-vs-Ed448ph cross-rejection
   property tests.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 8032 / RFC 7748 official test vectors, byte-exact, kat_test.zig

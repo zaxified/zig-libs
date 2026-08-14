@@ -164,3 +164,14 @@ Green in Debug and ReleaseFast (UB-checked). Composition:
 - **Security** (each with a positive control proving the guard has teeth): XXE,
   billion-laughs, depth cap, attribute-count cap, duplicate ID, invalid UTF-8,
   encoding/version rejection.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/xmlconf_test.zig runs 130 cases of the W3C XML Conformance Test Suite (src/testdata/xmlconf) through parse; the slice is LICENCE-FILTERED (xmltest excluded on licence grounds, so the suite's largest section is absent) and src/xmlconf_test.zig carries a known_disagreements list -- paths outside the vendored slice remain self-graded
+
+**How it got there.** The anchoring work landed. DONE 6cc02e8: 130 xmlconf cases, FIVE real bugs; xmltest excluded on licence grounds

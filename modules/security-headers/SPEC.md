@@ -79,3 +79,14 @@ Run: `zig build test-security-headers`.
 
 `gap · any · util · reentrant` + deps: `router`, `http` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:780+ pins header values byte-exact to published third-party literal examples (RFC 7034, RFC 6797, OWASP); root.zig:802 states the counter-case explicitly -- csp_helmet_default remains self-anchored because helmet.js's value was READ, not run, which is not an anchor
+
+**How it got there.** The anchoring work landed. DONE 88eda93: RFC 7034/6797 + OWASP lines byte-exact; full CSP stays self-anchored

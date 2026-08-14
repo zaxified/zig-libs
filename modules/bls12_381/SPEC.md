@@ -1070,3 +1070,14 @@ panics, Debug AND ReleaseFast.
    scope for this trusted-dealer pass, "Part 6 design"/"Out of scope
    for Part 6" above) would be a genuinely separate follow-up
    module/part, not an extension of `threshold.zig` itself.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle MIXED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** IETF draft/py_ecc byte-exact KATs; KeyGen deliberately NOT KAT-verified, self round-trip only
+
+**How it got there.** No external oracle exists for what remains. VERIFIED: we do BLS-draft KeyGen, EIP-2333 is a DIFFERENT algorithm; no KAT exists (draft-07 App.B = TBA)

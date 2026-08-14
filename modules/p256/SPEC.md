@@ -250,3 +250,12 @@ buys only ~1–2 % more; deferred as low-value. Measured before/after on this ho
    scalarmul cores (masked gather at fixed offsets, public-index loops only) was
    done in the core phase; the recoding/negation selects required `blackBox`
    laundering — without it LLVM lowered them to a secret-dependent CMOV/branch.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 6979 Appendix A.2.5 ECDSA-P256 vectors; field ops also cross-checked vs std.crypto

@@ -163,3 +163,12 @@ rather than passing by default-deny alone.
 - Full XACML protocol surface (obligations/advice/PAP/PDP-PEP wire protocol, multiple-decision
   profile) — only the condition-evaluation + combining-algorithm core is in scope.
 - Pattern/regex/glob matching on string attributes.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** in-process NIST RBAC/XACML decision engine, no wire exchange

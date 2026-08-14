@@ -315,3 +315,12 @@ Both acts are additionally guarded by a linear state machine
 (`start → awaiting_act2 → ready_act3 → done` and the responder's mirror), so a
 second `genAct1` on one object is `error.WrongState` rather than a silent reuse
 of the cached share.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official BOLT#8 Appendix A Transport Test Vectors (NOTICE)

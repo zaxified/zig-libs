@@ -180,3 +180,14 @@ is green in Debug + `-Doptimize=ReleaseFast`:
   `l2forward`'s job.
 - **The multicast distribution tree itself** — that is `bumtree`; `spbfib` only
   constructs the group DA that names it.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle SELF
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** groupDa: hand-derived worked-example bytes from RFC 6329 formula, not captured
+
+**How it got there.** No external oracle exists for what remains. RFC 6329 gives only a bit diagram; only proprietary Avaya/Extreme stacks exist

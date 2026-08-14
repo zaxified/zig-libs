@@ -78,3 +78,12 @@ misreading of the spec on both sides would still pass. Two independent anchors c
 
 `extract · any · util · reentrant` + deps: none (`std.crypto` only) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** libsodium C lib called via FFI to compute expected ciphertexts (kat_vectors.zig)

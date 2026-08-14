@@ -42,3 +42,12 @@ integration; TURN; TCP/TLS transport. (README "Deferred (not in v1)".)
 ## Status
 `gap · any (core pure; optional query helper does I/O) · codec · reentrant` + deps: `netaddr` —
 canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 5769 sections 2.1-2.3 published test vectors, root.zig

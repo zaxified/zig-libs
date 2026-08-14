@@ -154,3 +154,14 @@ here.
 `platform = .any` (pure protocol logic, verified in-process; no OS/network I/O) ·
 `role = .util` · `concurrency = .single_owner` · deps `threshold_ecdsa`,
 `paillier` · `model_after` GJKR (J. Cryptology 2007).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle SELF
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle SELF** — round-trip and/or hand-authored fixtures only — the weakest grade.
+
+**What the tests actually contain.** README/SPEC: "no external byte-exact KAT" for randomized GJKR DKG
+
+**How it got there.** No external oracle exists for what remains. GJKR DKG is randomized; SPEC/README already show no published answer vector can exist

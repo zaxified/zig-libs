@@ -46,3 +46,14 @@ section.
 
 `gap · any · codec · reentrant` + deps: `netaddr` — canonical source is `pub const meta` in
 src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/capture_test.zig runs 15 real LLDP/CDP/ARP/DHCP frames vendored from tcpdump's own dissector test suite (4 of them upstream crash reproducers) through these decoders; TLV shapes no vendored frame reaches stay hand-transcribed from the specs
+
+**How it got there.** The anchoring work landed. DONE 941bbfe: 15 tcpdump-suite frames incl. 4 upstream crash reproducers

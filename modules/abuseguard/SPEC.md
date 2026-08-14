@@ -52,3 +52,12 @@ None found beyond the pre-public security/similarity review pass (repo-wide, not
 ## Status
 `gap · posix · server · threadsafe` + deps `http`, `netaddr`, `router` — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** internal rate-limit/gate store; nginx/fail2ban are design refs only, no wire format

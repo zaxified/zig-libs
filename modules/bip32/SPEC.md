@@ -145,3 +145,14 @@ secp256k1; see [README.md](README.md) for purpose and API.
 - A positive control (`bip39.zig`) tampers a mnemonic's checksum-carrying
   word and asserts `error.InvalidChecksum`, proving the checksum check has
   teeth rather than silently accepting any wordlist-valid phrase.
+
+## Anchoring
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** official BIP-32 Test Vectors 1/2/3/4/5 in bip32_vectors.zig
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-08: imported BIP-32's official Test Vector 4 (seed, master xprv/xpub, m/0H and m/0H/1H xprv/xpub), fetched from `bitcoin/bips` `master` and verified byte-exact against the source `.mediawiki` programmatically before transcribing into `bip32_vectors.zig`. Wired as a new test in `kat_test.zig`. This implementation stores `privkey`/`chain_code` as fixed `[32]u8` throughout (no bignum trimming), so Vector 4 exercises the same code path as the already-present Vector 3, not a distinct one — closes an external-coverage gap (BIP-32's own published answer this module had never actually been run against), not a newly-found latent bug. Mutation-tested by corrupting the last character of the imported `master_xprv` literal: `exit 1, 1/26 fail`; reverted.

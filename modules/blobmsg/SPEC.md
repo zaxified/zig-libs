@@ -83,3 +83,14 @@ OpenWRT build).
 ## Status
 `extract · linux (codec: any) · client · reentrant` + deps: none (std only — `std.json` for the
 JSON↔blobmsg mapping) — canonical source is `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** hand-derived libubox-spec goldens (SELF); live ubusd peer test when reachable (EXTERNAL)
+
+**How it got there.** The anchoring work landed. DONE 463e443: real ubusd captures; ARRAY/TABLE tag swap blind to all 32 old tests

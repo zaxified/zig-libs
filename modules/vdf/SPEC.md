@@ -285,3 +285,14 @@ rather than papered over.
   comment specifies).
 - RSA Factoring Challenge / "RSA numbers" — the source of the RSA-2048
   modulus this module embeds; see [NOTICE](NOTICE).
+
+## Anchoring
+
+**Anchor grade:** class B · oracle REDERIVED
+
+- **Class B** — published cryptographic or algorithmic construction with published vectors.
+- **Oracle REDERIVED** — an in-house oracle re-deriving the answer by a different route. Catches implementation typos; does NOT catch a shared misreading of the spec.
+
+**What the tests actually contain.** eval KAT vs independent Python pow() oracle over real RSA-2048 challenge N
+
+**How it got there.** No external oracle exists for what remains. no VDF paper/impl publishes a worked byte-level example over a real large modulus

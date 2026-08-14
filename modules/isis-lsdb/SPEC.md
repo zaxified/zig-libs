@@ -341,3 +341,14 @@ green; the sibling `isis` suite unaffected.
 Provenance: clean-room from ISO/IEC 10589 §7.3; §7.3.16.1 cross-checked against
 FRRouting `isis_lsp.c` (behaviour reference, no source ported). See `/NOTICE` (no
 entry required — public spec + a black-box behaviour cross-check).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** checksum tie-break (§7.3.16.1) cross-checked vs FRR isis_lsp.c; rest of KAT table hand-authored only
+
+**How it got there.** The anchoring work landed. CLOSED 2026-08-05: the PSNP path (Lsdb.reconcilePsnp) and the L2 CSNP/PSNP (25/27) type codes driven through this module's own builders and Lsdb.reconcileCsnp/reconcilePsnp, confirmed by sharkd (golden 3a-3c, goldens.zig; mutation-tested). Remaining gap: IP-reachability/hostname/IS-Neighbours TLVs a future LSP-generation layer would place in the TLV region are out of this module's scope (never built/emitted here, SPEC §8) so there is no typed content of theirs to validate; the Fletcher checksum computation itself stays out of scope (raw field, per SPEC §2/§8) — only that a real checksum passes cleanly through insert was checked

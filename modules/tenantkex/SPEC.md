@@ -147,3 +147,12 @@ different prologue, so their bytes do not apply to tenantkex's transcript.)
   bump; a fresh handshake is simply a new tenantkex session. No scheduler here.
 * **Retransmission / timeout** of handshake messages — owned by the caller's
   transport (the WG-backed channel), not this module.
+
+## Anchoring
+
+**Anchor grade:** class D · oracle n/a
+
+- **Class D** — our own design — no third party exists to agree with, by construction.
+- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
+
+**What the tests actually contain.** own tenant-isolation composition atop noise; sibling's anchor does not transfer

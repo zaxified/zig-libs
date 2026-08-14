@@ -262,3 +262,12 @@ The RED comes from the foreign corpus and from nothing else.
 
 - permessage-deflate (RFC 7692) extension negotiation + DEFLATE framing — see "Out of scope" above.
 - No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** RFC 6455 sec.1.3/sec.5.7 worked-example bytes, byte-exact parse AND write

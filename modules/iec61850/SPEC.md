@@ -998,3 +998,12 @@ is `pub const meta` in src/root.zig.
 
 The suite runs offline except for a handful of live, env-gated tests (each printing `SKIPPED: …`
 and passing when no peer is present).
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**What the tests actually contain.** 82+15 goldens captured from libiec61850, live peer both directions (SPEC.md)

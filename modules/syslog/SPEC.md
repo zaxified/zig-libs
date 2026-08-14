@@ -101,3 +101,14 @@ only is provided today). (README "Not implemented (DEFER)".)
 ## Status
 `gap · any · both (codec+client) · reentrant` + deps: none (std only) — canonical source is
 `pub const meta` in src/root.zig.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** src/root.zig:157 freezes what a real rsyslogd received and re-rendered over BOTH transports (UDP and TCP octet-counted) for a message carrying quote/backslash/bracket escaping; bsd.zig and the remainder of message.zig are hand-authored fixtures
+
+**How it got there.** The anchoring work landed. DONE a58d626: real rsyslogd receives+re-renders both transports; MSG escaping bug class
