@@ -179,6 +179,15 @@ verify with the `h ≠ 1` guard).
 - **Multi-authority / cross-credential optimizations, SHAKE ciphersuite,
   aggregated-attribute batching.**
 
+## Public test-only entry points, unguarded
+
+`keygenSeededForTest` and `proveCredentialSeededForTest` are public and carry no
+`!builtin.is_test` + `@compileError` guard, so a non-test consumer can call them
+and get deterministic keys and proofs. Recorded rather than fixed: the guard is
+cheap, but adding it is a breaking API change for anything already importing
+them. Do not use either outside a test.
+
+
 ## Anchoring
 
 **Anchor grade:** class B · oracle SELF

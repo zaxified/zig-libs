@@ -245,6 +245,19 @@ BPF_MOD | BPF_K`) — is trivial scalar arithmetic, not a verifier-hard pattern.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** classifier bytecode clang-cross-checked(EXTERNAL); CAP_BPF kernel-load test skips unprivileged
+**What the tests actually contain.** Classifier bytecode cross-checked against
+clang's own emission (EXTERNAL). The CAP_BPF kernel-load path — `createLpmTrieMap`
++ `populateRule` + a real lookup round-trip, judged by the kernel's own verifier
+and map implementation — runs in the privileged VM lane and SKIPS everywhere else.
+The rule-compilation and packet-classification layers above it are self-anchored.
 
-**How it got there.** Anchored with: BLOCKED. BLOCKED: kernel.unprivileged_bpf_disabled=2, bpf() EPERM even as mapped-root; needs host root
+**How it got there.** Anchored with: `scripts/test.sh vm xdp-classifier` (real root
+in a qemu Debian guest, the same lane the sibling `ebpf` uses). Closed 2026-08-14.
+It had been recorded as BLOCKED on `kernel.unprivileged_bpf_disabled=2` making
+`bpf()` return EPERM even as mapped-root, and that was wrong twice over: the sysctl
+restricts UNPRIVILEGED bpf and the lane runs as real root, and the lane already
+existed. ⚠ On any host without it the live test SKIPS, and a Zig skip is a pass —
+demonstrated rather than assumed: injecting a forced failure into that test makes
+the VM lane report `36 passed; 0 skipped; 1 failed`, while `zig build
+test-xdp-classifier` on the host stays green with the same mutation in place. Read
+a green host run as "the kernel never judged this".

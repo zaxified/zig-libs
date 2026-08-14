@@ -270,6 +270,14 @@ tunnel adds a syscall (~1–2 µs) per packet on top, which will dominate.
 `pub const meta` in src/root.zig. (The handshake + transport half above depends only on
 `chachapoly`/std.crypto, not on either netlink module.)
 
+## Public test-only entry points, unguarded
+
+`SendSession.seekUnsafeForTest` is public and carries no `!builtin.is_test` +
+`@compileError` guard, so a non-test consumer can move a session's nonce counter
+by hand. The name says what it is; the compiler does not enforce it. Recorded
+rather than fixed, since adding the guard breaks any existing importer.
+
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle MIXED

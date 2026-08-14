@@ -295,6 +295,18 @@ recorded in their audit files rather than fixed here.
   `platform = .linux` for it. Rewriting them onto `std.Io` is a behaviour change
   to working, audited code for no gain; see `CONVENTIONS.md` §2.2.
 
+## What the distinctness pattern does not catch
+
+The distinctness test used across this collection — two draws from the same `io`
+must differ, and the production path must round-trip — catches a constant and an
+ignored `io`. It is **blind to a partial draw**: zeroing most of a key while
+leaving a few bytes varying keeps every such suite green, because the two draws
+still differ. A cheap patch was considered and refused: it would need a threshold
+on how much of the buffer must change, and no threshold is defensible. Treat
+distinctness as evidence that the source is wired up, never as evidence that it
+filled the whole buffer.
+
+
 ## Anchoring
 
 **Anchor grade:** class D · oracle n/a

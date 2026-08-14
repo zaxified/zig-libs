@@ -176,6 +176,22 @@ pending a native std TLS server.
 `extract+gap · any · both · single_owner` · deps: `netaddr` (+ `std.crypto.tls`, `std.Io.net`,
 `std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.
 
+## Known limits a consumer should size for
+
+**The header budget is per-middleware, never composite.** `http` allows 4096 B of
+response headers, `security-headers` accepts a CSP up to 3863 B and `cookies`
+advertises 4096 B — and each validates only itself, so nothing checks their sum.
+It takes a session cookie carrying roughly 3.4 kB of value to overflow, which is
+not a default-configuration trap, and that is why it is recorded rather than
+fixed. Related: `max_set_cookie_bytes` is unreachable even on an empty response,
+because the cookie name and attributes come out of the same budget.
+
+**Still unbounded after the 2026-08-13 timeout work**, deliberately: reading the
+response body (the caller drives it and owns the deadline), `H2Session` once the
+dial has completed, and an `Io` with no free unit of concurrency. The connect and
+request phases ARE bounded; do not read that as the whole client being bounded.
+
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle MIXED
