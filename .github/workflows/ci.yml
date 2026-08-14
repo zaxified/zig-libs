@@ -13,15 +13,23 @@ on:
 # raw-syscall Linux members and are compiled by `zig build test`; socket/netns
 # tests SkipZigTest cleanly on a constrained runner.
 #
-# amd64-only, and that was decided rather than defaulted. A second architecture
-# lane was on the table for the one question that seemed to need one -- whether
-# `lockfree`'s seq_cst discipline costs anything a weaker ordering would not --
-# and it was closed on 2026-08-09 by measuring instead (`86cb149`): the owner
-# deploys linux-amd64 only, and on TSO a maximally relaxed probe of the module
-# compiled BYTE-IDENTICAL to the shipped code at every non-interlock site. An
-# arm64 lane would buy real coverage for a target nobody deploys to; if that
-# changes, the lane is the first thing to add, and the measurement above is what
-# it would be re-running.
+# TWO ARCHITECTURES, because the README makes a claim only a second one can
+# check. 191 of its 225 catalog rows say Platform `any`, and a consumer reading
+# that is entitled to build on aarch64. Until 2026-08-14 every lane ran on
+# amd64, so `any` was a claim no job had ever tested.
+#
+# Three modules make it concrete rather than theoretical. `montint`, `k256` and
+# `p256` gate their asm fast path on `builtin.cpu.arch == .x86_64` (see
+# `asm_core.zig` / `fast_core.zig`: `pub const supported = ...`), and each
+# advertises "amd64 asm + portable fallback". On an amd64 runner the dispatch
+# never selects the fallback, so the path every non-amd64 consumer would run was
+# the one path no lane exercised.
+#
+# NOT to be confused with the arm64 question closed on 2026-08-09 (`86cb149`),
+# which was about PERFORMANCE -- whether `lockfree`'s seq_cst discipline costs
+# anything a weaker ordering would recover. That was answered by measurement on
+# TSO and needed no hardware. Portability is a different question and hardware
+# is the only thing that answers it.
 #
 # TWO SHAPES, and the split is the point.
 #
@@ -67,13 +75,25 @@ on:
 #
 # They run as separate jobs so the slow one does not gate the fast one.
 #
-# ⚠ CACHE KEYS ARE NOT OPTIONAL HERE. `setup-zig` preserves the Zig cache
-# between runs, but it cannot tell one matrix job from another on its own — its
-# own README says to populate `cache-key` with the matrix variables. Without
-# that, the lanes shared a single key and clobbered each other's cache
-# every run, so every lane was effectively cold. The default 2 GiB
-# `cache-size-limit` compounded it; this repo's cache runs to tens of GiB
-# locally, so the action was also discarding the cache almost every time.
+# ⚠ ONLY THE PR LANE IS CACHED, and the arithmetic is why. GitHub allows 10 GB
+# of Actions cache PER REPOSITORY and evicts least-recently-used entries above
+# it. This repo's own `.zig-cache` runs to tens of GiB, so a lane cannot hold a
+# useful fraction of it and five lanes cannot hold one each: at the 8 GiB limit
+# this file used to request for every job, the five together asked for four
+# times the entire quota. They would have evicted each other on every run and
+# all five would have been cold — the same outcome as the shared-`cache-key`
+# bug this file already records fixing, reached by a different route.
+#
+# So the cache goes where a cold build actually costs someone waiting: the PR
+# lane, which runs on every push to a branch and normally builds a closure of
+# one module. The `full` lanes run on merges to main and on tags, are already
+# parallel, and nobody is watching them. A cold full lane costs wall-clock that
+# is not on anyone's critical path; a thrashing cache costs the same wall-clock
+# AND the pretence of being warm.
+#
+# `cache-key` still names the lane. It is load-bearing whenever more than one
+# job caches: `setup-zig` cannot tell matrix jobs apart on its own, and without
+# it the lanes shared one entry and clobbered it every run.
 jobs:
   scoped:
     if: github.event_name == 'pull_request'
@@ -89,32 +109,49 @@ jobs:
         with:
           version: 0.16.0
           cache-key: scoped
-          cache-size-limit: 8192
+          # Under the 10 GB repository quota with room for the entry to grow
+          # rather than be evicted the moment it does.
+          cache-size-limit: 6144
       - name: Test changed modules
         run: bash scripts/test.sh changed "origin/${{ github.base_ref }}"
 
   full:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: ReleaseSafe
             args: "-Doptimize=ReleaseSafe"
+            runner: ubuntu-latest
           - name: ReleaseFast
             args: "-Doptimize=ReleaseFast"
+            runner: ubuntu-latest
           - name: strict Debug
             args: "-Dstrict-debug"
+            runner: ubuntu-latest
+          # ONE arm64 lane, not three. What a second architecture buys is
+          # portability coverage -- alignment and endianness assumptions, atomics,
+          # and the asm-vs-fallback dispatch above -- and none of that varies by
+          # optimize mode, so the other two would mostly recompile the same
+          # surface. ReleaseSafe is the mode chosen because it is the one that has
+          # already caught a real defect here (see below). The day this lane fails
+          # something the amd64 ReleaseSafe lane passes, add the other two rather
+          # than arguing about it.
+          - name: ReleaseSafe arm64
+            args: "-Doptimize=ReleaseSafe"
+            runner: ubuntu-24.04-arm
     name: full — ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          # One cache per lane. Distinct optimize modes cannot share an entry.
-          cache-key: full-${{ matrix.name }}
-          cache-size-limit: 8192
+          # Deliberately uncached — see the note above. Four lanes cannot each
+          # hold a useful slice of a 10 GB quota, and a cache that is evicted
+          # before it is reused is worse than none: it reads as warm.
+          use-cache: false
       # scripts/test.sh all runs the format check, the hook self-test, the
       # catalog/provenance gates and every module, and wraps the
       # netlink-writing modules in `unshare -rn` where the runner allows it —
