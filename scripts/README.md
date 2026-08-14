@@ -1,7 +1,29 @@
 # scripts/
 
-Test driver for the module collection. `zig build test` runs all 210 modules;
-this exists so you don't have to.
+Test driver for the module collection, plus the tooling around it. `zig build
+test` runs every module; this exists so you don't have to.
+
+## What is in here
+
+Most of this file explains the test driver. This table exists so the rest of the
+directory is not mistaken for leftovers — several of these are single-purpose
+tools that look disposable once the work that needed them landed, and are not.
+
+| File | What it is |
+|------|------------|
+| `test.sh`, `test-lib.sh` | The test driver and its shared shell library. Everything below the next heading is about these. |
+| `test-tag.sh` | Self-test for `tag.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
+| `tag.sh` | Cuts a dated release tag, and re-runs every lane before it does. A tag asserts that every module passed every lane at that commit. |
+| `hooks/` | The commit-time formatting hook and its own self-test. A hook that always exits 0 looks exactly like "nothing was ever unformatted". |
+| `capped` | Memory-capped process wrapper. ⛔ Run fuzzing through it and nothing else — an uncapped sweep has taken this host down. |
+| `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. |
+| `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
+| `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
+| `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. |
+| `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. |
+| `dissect.py` | Drives Wireshark's headless dissector (`sharkd`) as an external oracle for wire-format modules. |
+| `gen-bitcoin-core-vectors.py`, `gen-bitcointx-single-bug.py`, `gen-p256-wycheproof.py`, `gen-ocsp-byname.sh` | Regenerate committed test vectors from their upstream sources (Bitcoin Core, BIP-341, Wycheproof, OCSP). **Keep them.** The vectors are frozen in the tree and the tests do not need these to run — which is exactly why they look deletable. Without them the vectors cannot be re-derived or extended, only trusted. |
+| `vm/` | Boots a qemu guest and runs a module's tests as real root. The only way the live BPF, netlink and 802.11 tests execute rather than skip. |
 
 ## Which do I run?
 
@@ -57,14 +79,14 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
 ### Touching `build.zig` does not mean running everything
 
 Adding a module appends one row to `module_list` and cannot affect any existing
-module, so escalating to the full ~8-minute gate for it is the driver being
+module, so escalating to the full gate for it is the driver being
 wrong, not careful. The decision is made from the **module graph**, not from
 which file was saved: the last verified graph is kept at
 `.zig-cache/ziglibs-graph.tsv` and compared row by row.
 
 | Graph delta | What runs |
 |---|---|
-| Rows only ADDED | just the new modules (adding `yaml`: ~2 s, not ~510 s) |
+| Rows only ADDED | just the new modules — adding `yaml` tests `yaml`, not everything |
 | A row altered (deps moved) | that module, plus its reverse-dep closure |
 | A row removed (module deleted) | nothing extra — either the dependent's own row also changed (covered above), or it now names a module that does not exist and `zig build module-graph` aborts, so no run happens at all |
 | Byte-identical | nothing extra |
@@ -186,7 +208,9 @@ counted on disk and it runs, so it appears on both sides and cancels.
 A module that legitimately owns `.zig` sources its own compilation never
 analyses gets an explicit row in the script's `DECLARED_EXEMPT`, with the count
 and a written reason. That table is **empty**, and that is a measurement: as of
-2026-08-11 all 224 modules satisfy declared == `(N total)` exactly.
+2026-08-11 every module in the collection satisfied declared == `(N total)`
+exactly. Modules have been added since; the gate recomputes live, so a green run
+is the current claim and that date is only when the table was last complete.
 
 ### What it costs
 

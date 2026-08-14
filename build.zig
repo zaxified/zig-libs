@@ -511,7 +511,7 @@ pub fn build(b: *std.Build) void {
     // -- see `checkUapi` below and the script's own header-missing handling.
     // Run it explicitly (or from whatever wires `scripts/check-citations.py`
     // into CI, which has the same host-dependency shape).
-    const check_uapi = b.step("check-uapi", "Diff conntrack/devlink/ethtool/nl80211 constants against installed kernel headers");
+    const check_uapi = b.step("check-uapi", "Diff hardcoded kernel UAPI constants against installed kernel headers");
     const check_uapi_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
     check_uapi_inner.* = std.Build.Step.init(.{
         .id = .custom,

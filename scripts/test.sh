@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Test driver for zig-libs. `zig build test` runs all 210 modules and takes
-# ~5 minutes — fine for CI, absurd in a change/build/test loop where you
-# touched one module and are waiting on 209 unrelated ones. `changed` (the
+# Test driver for zig-libs. `zig build test` runs every module in the
+# collection — fine for CI, absurd in a change/build/test loop where you
+# touched one module and are waiting on the rest. `changed` (the
 # default) works out which modules a change can actually affect, using
 # `zig build module-graph` (the authoritative dependency graph — this
 # script never parses build.zig) plus the reverse-dependency closure of
@@ -99,7 +99,7 @@ graph_load() {
 }
 
 # ── graph snapshot ──────────────────────────────────────────────────────────
-# Touching build.zig used to escalate straight to the full ~510 s run, on the
+# Touching build.zig used to escalate straight to the full run, on the
 # reasoning that the dependency graph might have changed. Usually it has not:
 # ADDING a module appends one row to `module_list` and cannot affect any
 # existing module. Paying the full gate for that is the driver being wrong, not
@@ -771,15 +771,14 @@ Usage: scripts/test.sh [subcommand] [args]
                         reports, so a file whose tests were never compiled —
                         which has no other symptom at all — fails the gate.
                         It reads the `--summary all` output of the run above
-                        rather than making its own, so it costs ~2.4 s of the
-                        ~511 s gate. See scripts/dark-tests.sh.
-                        NOT included: `zig build check-fuzz`, which fails a
-                        module that faces the wire and has no fuzz harness.
-                        It is red on pre-existing debt (27 modules as of
-                        writing) and is deliberately kept out of the gate
-                        every commit runs until that is burned down — see
-                        `checkFuzz` in build.zig for the one-line change
-                        that folds it in. Run it by hand meanwhile.
+                        rather than making its own. See scripts/dark-tests.sh.
+                        `zig build check-fuzz` IS included, in both `changed`
+                        and `all`, unconditionally — it is a static source
+                        scan and costs about a second warm. It was kept out
+                        while it was red on modules with no fuzz harness;
+                        that debt was burned down on 2026-08-14 and it went
+                        in the same day. This paragraph said the opposite for
+                        the few hours in between.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.

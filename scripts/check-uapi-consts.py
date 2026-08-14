@@ -56,7 +56,7 @@ everywhere. Run it by hand, or wire it into whatever this host's CI is (see
 `scripts/check-citations.py` for the same non-gated-build precedent).
 
 Usage:
-    scripts/check-uapi-consts.py                     # all four modules
+    scripts/check-uapi-consts.py                     # every registered module
     scripts/check-uapi-consts.py ethtool nl80211      # just these
     scripts/check-uapi-consts.py --verbose            # print every MATCHED too
 

@@ -59,8 +59,8 @@
 #
 # A module MAY legitimately own `.zig` sources under `src/` that its own
 # compilation never analyses — a generator input, a fixture written in Zig but
-# consumed as text. Nothing in the tree does today (measured 2026-08-11: every
-# one of the 224 modules has declared == `(N total)`), so rather than weaken the
+# consumed as text. Nothing in the tree does today (measured 2026-08-11 across
+# every module in the collection: declared == `(N total)`), so rather than weaken the
 # rule for a hypothesis, such a module gets an explicit row in DECLARED_EXEMPT
 # below, with the count and the reason written down. Silence is the thing to
 # avoid: an unexplained shortfall must not be indistinguishable from a dark file.
@@ -104,7 +104,10 @@ cd "$REPO_ROOT"
 #     <module>|<declared tests not compiled>|<reason>
 #
 # EMPTY ON PURPOSE, and that is a measurement rather than an assumption: as of
-# 2026-08-11 all 224 modules satisfy declared == `(N total)` exactly. A row here
+# 2026-08-11 every module in the collection satisfied declared == `(N total)`
+# exactly. ⚠ Modules have been added since, and this sentence does not cover
+# them — the gate recomputes live per run, so a green run is the current claim
+# and this date is only when the table was last known to be complete. A row here
 # is a claim that must be justified in its reason field; adding one to silence a
 # red gate without understanding why the count moved is the failure mode this
 # whole script exists to prevent.
