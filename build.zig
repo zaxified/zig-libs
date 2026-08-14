@@ -356,9 +356,39 @@ pub fn build(b: *std.Build) void {
             break :blk t;
         };
 
-        const unit_tests = b.addTest(.{ .root_module = test_root, .filters = test_filters });
+        // ⭐ `.name` defaults to "test", which made all 225 compilations
+        // indistinguishable in every place zig names a step: the progress tree
+        // said `compile test` whichever module was building, and so did
+        // `--summary`. Naming them after the module is what makes a build or a
+        // hang self-identifying — without it no amount of log plumbing can say
+        // WHICH module is the slow one.
+        const unit_tests = b.addTest(.{
+            .name = m.name,
+            .root_module = test_root,
+            .filters = test_filters,
+        });
         const run = b.addRunArtifact(unit_tests);
         test_step.dependOn(&run.step);
+
+        // ⭐ `zig build` COMPILES every module's tests and runs none of them.
+        //
+        // The default step used to be empty — nothing in this file installed an
+        // artifact, so `zig build` succeeded in milliseconds having done
+        // nothing, which is a confusing thing for the top-level command of a
+        // library collection to do.
+        //
+        // Giving it the Compile steps splits the gate's one opaque number in
+        // two. `zig build` is then the compile of all 225 test binaries and
+        // `zig build test` is, with that cache warm, close to pure test
+        // execution — and on 2026-08-14 nobody could say which of the two spent
+        // the five hours that got a tag's matrix killed by GitHub's 6h job cap.
+        //
+        // Deliberately NOT `installArtifact`: that adds a Step.InstallArtifact
+        // which COPIES each binary into zig-out/ (225 of them, for nothing) and
+        // it is the copy, not the build, that the install step then names. The
+        // dependency is on the Compile step itself, the same shape
+        // `check-testonly` already uses below for its probe objects.
+        b.getInstallStep().dependOn(&unit_tests.step);
 
         // Per-module test step: `zig build test-<name>`.
         const one = b.step(b.fmt("test-{s}", .{m.name}), b.fmt("Test the {s} module", .{m.name}));

@@ -710,6 +710,25 @@ cmd_all() {
     # runs `test-<module>` per module, so anything hung off the aggregate step
     # alone would never execute in the gate.
     step "check-ctgrind" zig build check-ctgrind
+
+    # ⭐ COMPILE EVERYTHING FIRST, then run. `zig build`'s default step depends
+    # on every module's test Compile (see build.zig), so this is the whole
+    # collection's compile and nothing else; `run_modules` below then finds
+    # those artifacts cached and is close to pure test execution.
+    #
+    # The point is two numbers instead of one. On 2026-08-14 a tag's matrix was
+    # killed by GitHub's 6h job cap after five hours, and nothing in the log
+    # could say whether that was compiling 225 modules or running their tests —
+    # the gate reported one `build+test` figure for both. Two steps, two
+    # durations, and the next long run answers it without instrumentation.
+    #
+    # EXTRA_ZIG_ARGS matters here: the optimize flags have to match the run
+    # phase exactly or the cache keys differ and this compiles a set nothing
+    # below uses — a full extra build, silently.
+    #
+    # `changed` deliberately does NOT do this: the default step builds the whole
+    # collection, and a scoped lane exists precisely to avoid that.
+    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
     run_modules "$all_mods"
     graph_save
     summary

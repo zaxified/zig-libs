@@ -113,18 +113,106 @@ _ZL_KEEP_OUT=""
 # it. A healthy run that reads as a dead one is a broken gate whatever it
 # verifies.
 #
-# So off a terminal each step announces itself and a heartbeat reports it is
-# still alive while it runs. Deliberately a heartbeat and not streamed output:
-# the command's stdout and stderr are captured to files that the
-# stderr-on-success rule and the failure replay are both built on, and piping
-# them through `tee` to get them into the log at the same time races the reader
-# of those files. The question CI needs answered is "is this alive", not "what
-# is it printing" -- the full output is replayed on failure either way.
+# So each step announces itself and a heartbeat reports it is still alive while
+# it runs. Nothing is streamed: the command's stdout and stderr are captured to
+# files that the stderr-on-success rule and the failure replay are both built
+# on, and piping them through `tee` at the same time races the reader of those
+# files.
 #
-# Locally nothing changes: `-t 1` is true and the aligned one-line-per-step
-# table stays exactly as it was.
-_ZL_HEARTBEAT_S=${_ZL_HEARTBEAT_S:-60}
+# ⚠ "is this alive" stopped being the whole question on 2026-08-14, when a tag's
+# full matrix passed FIVE HOURS with every lane showing nothing but its own
+# heartbeat. Alive was never in doubt; WHERE THE TIME WENT was, and a heartbeat
+# renders a 95-minute step and a 5-hour step as the same line.
+#
+# The heartbeat therefore names what is IN FLIGHT, read from the process table.
+# Three channels were measured on identical cold builds before settling there:
+#
+#     --summary all    294 B  end of run only          stderr
+#     --verbose      1 411 B  live, names the module   stderr
+#     ZIG_PROGRESS  31 685 B  live, structured         its own fd, stderr 0 B
+#
+# ⚠ ZIG_PROGRESS CARRIES THE WRONG SUBTREE. Re-measured with the build script
+# already cached, so the only work left was a module's: 3120 B over 25 packets,
+# EVERY node named `Compile Build Script`. A top-level `zig build` forwards its
+# own tree; child compilations report over their own descriptors and it merges
+# them only for TERMINAL drawing. `--verbose` does not enrich it either (still
+# 3120 B, still only the build script). Do not spend the afternoon on it again.
+#
+# ⚠ AND `--verbose` ANSWERS THE WRONG QUESTION. It logs a command BEFORE running
+# it and never reports completion, so its tail is a list of recent STARTS. After
+# two hours the module you want is precisely the one that never came back, which
+# is not in that list. It also costs an exception in the stderr rule below, for
+# a fact the process table already holds exactly.
+#
+# Nor does a terminal help by itself: `std.Progress` has no text mode
+# (`Progress.zig` offers `ansi_escape_codes`, `windows_api`, or `off`), a
+# redirected gate gets `off`, and a PTY renders ~3.8 KB/s of cursor control that
+# is 69 MB over a five-hour lane. This is also why the local run went silent
+# after `check-ctgrind OK` — `step` redirects both streams, so zig saw no
+# terminal there either.
+#
 _zl_tty() { [[ -t 1 ]]; }
+# Off a terminal a heartbeat is a log line and 60 s is already chatty over
+# hours; on one it is a redraw in place, where anything slower than a couple of
+# seconds reads as frozen.
+if [[ -z "${_ZL_HEARTBEAT_S:-}" ]]; then
+    if _zl_tty; then _ZL_HEARTBEAT_S=2; else _ZL_HEARTBEAT_S=60; fi
+fi
+
+# Where this checkout lives, so the process scan cannot report a second worktree
+# or a parallel gate as this run's progress. A plausible wrong name is worse
+# than no name.
+_ZL_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# ⚠ WHAT IS STILL RUNNING, not what started. `--verbose` logs a command BEFORE
+# executing it and never says it finished, so after two hours its tail is a list
+# of the most recent STARTS — and the one thing you want then is the module that
+# never came back, which by definition is not among them. The processes that are
+# still alive ARE the work still in flight, so that is what this reads, with
+# each one's elapsed time, longest first. After two hours the top line is the
+# module to blame.
+#
+# Both phases are nameable, which they were not before `.name = m.name` in
+# build.zig: every test binary used to be called `test`, so a running one was
+# `…/o/<hash>/test` and said nothing.
+#
+#     compile   `zig test … -Mroot=<repo>/modules/<name>/…`
+#     run       `<cache>/o/<hash>/<name>`
+#
+# The snapshot is taken into a variable FIRST and matched afterwards: `ps | grep
+# <pattern>` lists the grep, whose own argv contains the pattern, and matches
+# itself — that shipped once and rendered as `compiling: [^`.
+_zl_inflight_note() {
+    local snap out
+    snap=$(ps -eo etimes=,args= 2>/dev/null) || return 0
+    out=$(awk -v repo="$_ZL_REPO_ROOT" '
+        {
+            et = $1 + 0
+            if (match($0, / -Mroot=[^ ]*\/modules\/[^\/]+\//)) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/.*\/modules\//, "", s); sub(/\/$/, "", s)
+                if (index($0, repo) > 0) print et "\t" s "\tcompile"
+            } else if (match($0, /\/o\/[0-9a-f][0-9a-f]*\/[A-Za-z0-9_]+/)) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/.*\//, "", s)
+                # `build` is the compiled build.zig runner, which lives in the
+                # same cache and matches the same shape. It is present for the
+                # whole run, so left in it would head the list forever and read
+                # as the stuck one.
+                if (s != "build") print et "\t" s "\ttest"
+            }
+        }' <<< "$snap" 2>/dev/null | sort -rn | head -4) || true
+    [[ -z "$out" ]] && return 0
+
+    local et name kind first=1
+    printf ' in flight:'
+    while IFS=$'\t' read -r et name kind; do
+        [[ -z "$name" ]] && continue
+        (( first )) || printf ','
+        first=0
+        printf ' %s %s %ss' "$name" "$kind" "$et"
+    done <<< "$out"
+}
 
 step() {
     local label="$1"; shift
@@ -133,13 +221,23 @@ step() {
     err=$(mktemp)
     local t0 t1 dur rc=0 hb=""
     t0=$(_now)
+    # Subshell in both branches, so killing it later cannot reach anything else.
     if ! _zl_tty; then
         printf '  > %s ... started %s\n' "$label" "$(date -u +%H:%M:%SZ)"
-        # Subshell, so killing it later cannot reach anything else.
         ( local n=0
           while sleep "$_ZL_HEARTBEAT_S"; do
               n=$(( n + _ZL_HEARTBEAT_S ))
-              printf '  . %s ... still running (%ss)\n' "$label" "$n"
+              printf '  . %s ... still running (%ss)%s\n' \
+                     "$label" "$n" "$(_zl_inflight_note)"
+          done ) &
+        hb=$!
+    else
+        # In place, and erased below before the step's own aligned line.
+        ( local n=0
+          while sleep "$_ZL_HEARTBEAT_S"; do
+              n=$(( n + _ZL_HEARTBEAT_S ))
+              printf '\r\033[K  %s ... %ss%s' \
+                     "$label" "$n" "$(_zl_inflight_note)"
           done ) &
         hb=$!
     fi
@@ -160,6 +258,8 @@ step() {
         pkill -P "$hb" 2>/dev/null || true
         kill "$hb" 2>/dev/null || true
         wait "$hb" 2>/dev/null || true
+        # Clear the transient line so the aligned table below starts clean.
+        if _zl_tty; then printf '\r\033[K'; fi
     fi
     t1=$(_now)
     dur=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
