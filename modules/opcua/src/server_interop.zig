@@ -131,6 +131,10 @@ const Driver = struct {
     start_ms: i64,
     start_time: encoding.DateTime,
     connections: usize = 0,
+    /// Connections closed unserved because one was already in flight. See the
+    /// accept branch in `serve` for why they are closed rather than left in
+    /// the backlog.
+    rejected: usize = 0,
     /// Bumped every serve iteration so a monitored `the.answer` actually
     /// changes for a subscribing client.
     counter: i32 = 42,
@@ -330,12 +334,37 @@ const Driver = struct {
             }
             _ = std.posix.poll(fds[0..nfds], 20) catch break;
 
-            if (fds[0].revents & std.posix.POLL.IN != 0 and stream == null) {
-                const accepted = d.listener.accept(d.io) catch continue;
-                stream = accepted;
-                stream_writer = accepted.writer(d.io, &write_buf);
-                conn = try server.Connection.init(&d.srv, d.recv_buf, d.msg_buf);
-                d.connections += 1;
+            if (fds[0].revents & std.posix.POLL.IN != 0) {
+                if (stream == null) {
+                    const accepted = d.listener.accept(d.io) catch continue;
+                    stream = accepted;
+                    stream_writer = accepted.writer(d.io, &write_buf);
+                    conn = try server.Connection.init(&d.srv, d.recv_buf, d.msg_buf);
+                    d.connections += 1;
+                } else {
+                    // ⚠ A SECOND CONNECTION WHILE ONE IS IN FLIGHT IS CLOSED, NOT
+                    // IGNORED. This driver serves one at a time — it owns a single
+                    // `recv_buf`/`msg_buf` pair, unlike `server.Server`, which
+                    // takes a buffer pair per `Connection` and has no such limit.
+                    //
+                    // Leaving the extra in the backlog is the dangerous option and
+                    // it is what this loop used to do. The kernel completes the TCP
+                    // handshake from the backlog on its own, so the peer sees an
+                    // ESTABLISHED socket, sends HEL, and waits for an ACK nobody
+                    // will ever write — a healthy server that reads exactly like a
+                    // hung one. On 2026-08-14 that surfaced as an interop test
+                    // failing under a loaded machine with `Receiving ACK message
+                    // failed with GoodNonCriticalTimeout`, which sent the
+                    // investigation after CPU starvation instead of here.
+                    //
+                    // Closing it immediately turns a silent stall into an instant,
+                    // diagnosable connection close, and `rejected` records that it
+                    // happened so a test can assert on it rather than infer it.
+                    if (d.listener.accept(d.io)) |extra| {
+                        extra.close(d.io);
+                        d.rejected += 1;
+                    } else |_| {}
+                }
             }
 
             if (nfds == 2 and fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
@@ -618,6 +647,100 @@ const LoopbackCtx = struct {
 fn loopbackServeThread(ctx: *LoopbackCtx) void {
     ctx.driver.serve(.{ .deadline_ms = 20_000, .idle_stop_ms = 500, .vary_value = false }) catch {};
     ctx.done.store(true, .release);
+}
+
+// ⭐ The flake this pins was reported as a slow machine and was not one.
+//
+// On 2026-08-14 a LIVE interop test failed once in a full-suite run with
+// open62541's `Receiving ACK message failed with GoodNonCriticalTimeout` five
+// seconds after `TCP connection established`. It did not reproduce alone, and
+// it did not reproduce on a rerun of the whole suite — the shape of a load
+// flake, which is exactly the shape that gets "fixed" by raising a budget or by
+// moving the test somewhere quieter, leaving the cause in place and rarer.
+//
+// The cause is structural and has nothing to do with speed: this driver serves
+// one connection at a time, and a second arriving while the first is open used
+// to be left in the backlog, where the KERNEL completes its TCP handshake. The
+// peer is then connected, sends HEL, and waits forever for an ACK no one will
+// write. No amount of CPU fixes that, and any timeout large enough to hide it
+// is a timeout that hides real hangs too.
+//
+// So the condition is manufactured here rather than waited for: hold one
+// connection open, open a second, and require it to be CLOSED promptly. Without
+// the accept-and-close branch in `serve`, the poll below times out and this
+// test fails — which is the point of it.
+test "a second connection while one is in flight is closed, not left waiting for an ACK" {
+    if (builtin.os.tag != .linux) {
+        if (verboseSkip()) std.debug.print("\nSKIPPED: needs Linux sockets.\n", .{});
+        return error.SkipZigTest;
+    }
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var driver: Driver = undefined;
+    driver.init(gpa, io) catch |err| {
+        if (verboseSkip()) std.debug.print("\nSKIPPED: cannot bind loopback:{d} ({t}).\n", .{ live_port, err });
+        return error.SkipZigTest;
+    };
+    defer driver.deinit();
+
+    var ctx: LoopbackCtx = .{ .driver = &driver };
+    const thread = std.Thread.spawn(.{}, loopbackServeThread, .{&ctx}) catch {
+        if (verboseSkip()) std.debug.print("\nSKIPPED: cannot spawn a thread.\n", .{});
+        return error.SkipZigTest;
+    };
+
+    const addr = std.Io.net.IpAddress.parse(driver.bound_host, live_port) catch unreachable;
+    const connectRetry = struct {
+        fn go(a: std.Io.net.IpAddress, i: std.Io) ?std.Io.net.Stream {
+            var attempt: usize = 0;
+            while (attempt < 40) : (attempt += 1) {
+                if (a.connect(i, .{ .mode = .stream })) |s| return s else |_| {}
+                sleepMs(50);
+            }
+            return null;
+        }
+    }.go;
+
+    // The first connection is opened and deliberately left mid-protocol: no
+    // HEL, nothing to answer, so the driver holds it and its single buffer pair.
+    const first = connectRetry(addr, io) orelse {
+        thread.join();
+        if (verboseSkip()) std.debug.print("\nSKIPPED: could not connect.\n", .{});
+        return error.SkipZigTest;
+    };
+    sleepMs(200); // let the serve loop accept it (it polls at 20 ms)
+
+    const second = connectRetry(addr, io) orelse {
+        first.close(io);
+        thread.join();
+        if (verboseSkip()) std.debug.print("\nSKIPPED: could not open the second connection.\n", .{});
+        return error.SkipZigTest;
+    };
+
+    // The whole assertion: the second socket must become readable — with EOF,
+    // because the driver closed it — rather than sit there. A generous two
+    // seconds, since the failure mode being excluded is an INDEFINITE wait; the
+    // real path answers within one 20 ms poll.
+    var pfd = [_]std.posix.pollfd{.{
+        .fd = second.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&pfd, 2_000) catch 0;
+    var buf: [16]u8 = undefined;
+    const n: usize = if (ready > 0) std.posix.read(second.socket.handle, &buf) catch 0 else 1;
+
+    second.close(io);
+    first.close(io);
+    thread.join();
+
+    try testing.expect(ready > 0); // not left hanging
+    try testing.expectEqual(@as(usize, 0), n); // closed, not answered
+    try testing.expect(driver.rejected >= 1);
+    try testing.expect(driver.connections >= 1);
 }
 
 test "LIVE loopback: this module's own client drives this module's own server over TCP" {
