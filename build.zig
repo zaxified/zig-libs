@@ -728,8 +728,13 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
             root_ok = false;
         };
 
-        if (std.mem.indexOf(u8, readme, b.fmt("| `{s}` |", .{m.name})) == null) {
-            std.log.err("module '{s}' has no README catalog row (`| \\`{s}\\` |`)", .{ m.name, m.name });
+        if (std.mem.indexOf(u8, readme, catalogRowNeedle(b, m.name)) == null) {
+            std.log.err(
+                "module '{s}' has no README catalog row — the first cell must be" ++
+                    " exactly `[`{s}`](modules/{s}/README.md)`, so the table's own" ++
+                    " link is checked rather than trusted",
+                .{ m.name, m.name, m.name },
+            );
             failed = true;
         } else if (readmeDepsCell(readme, m.name, b)) |readme_deps| {
             checkDepsMatch(m.name, "README catalog row's Deps column", m.deps, readme_deps, b, &failed);
@@ -2440,9 +2445,19 @@ fn nonGoalExempt(line: []const u8, name: []const u8) bool {
 /// Row *existence* is checked by the caller before this runs, so `null`
 /// here only means the located row's line was too malformed to have a
 /// trailing cell (should not happen for a well-formed table row).
+/// The catalog row's opening cell, which is also its link to the module. Kept in
+/// one place because both the existence check and the Deps-column reader locate a
+/// row by it: if they ever disagree, a module drops out of one check silently.
+///
+/// The link target is part of the needle deliberately. A row could otherwise
+/// carry a link to the wrong module -- the failure a reader is least likely to
+/// notice, since the text they see is right and only the destination is not.
+fn catalogRowNeedle(b: *std.Build, name: []const u8) []const u8 {
+    return b.fmt("| [`{s}`](modules/{s}/README.md) |", .{ name, name });
+}
+
 fn readmeDepsCell(readme: []const u8, name: []const u8, b: *std.Build) ?[]const []const u8 {
-    const needle = b.fmt("| `{s}` |", .{name});
-    const start = std.mem.indexOf(u8, readme, needle) orelse return null;
+    const start = std.mem.indexOf(u8, readme, catalogRowNeedle(b, name)) orelse return null;
     const line_end = std.mem.indexOfScalarPos(u8, readme, start, '\n') orelse readme.len;
     const line = std.mem.trimEnd(u8, readme[start..line_end], " \t\r");
     if (!std.mem.endsWith(u8, line, "|")) return null;
