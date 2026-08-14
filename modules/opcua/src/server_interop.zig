@@ -1519,16 +1519,25 @@ const asyncua_script =
     \\        v = await c.get_node(ANSWER).read_value()
     \\        print("ZIGLIBS-OK-SIGN-USERNAME", v, flush=True)
     \\
-    \\    # ---- SecurityToken renewal: a 4 s channel lifetime held for ~10 s makes
+    \\    # ---- SecurityToken renewal: a 10 s channel lifetime held for ~30 s makes
     \\    #      asyncua renew at least twice while requests keep flowing.
-    \\    c = await secure_client(cp, kp, "SignAndEncrypt", timeout_ms=4000)
+    \\    #
+    \\    #      The margin is deliberately wide. It was a 4 s lifetime held for
+    \\    #      ~10 s until 2026-08-14, which is a real property proved on an idle
+    \\    #      machine and a coin flip on a busy one: inside a full 215-module
+    \\    #      lane the token expired before the renewal was served and the
+    \\    #      server answered BadSecureChannelTokenUnknown, while the same test
+    \\    #      passed on its own in every optimize mode. A live test that fails
+    \\    #      under load teaches people to re-run the gate, which costs more
+    \\    #      than the seconds this widening spends.
+    \\    c = await secure_client(cp, kp, "SignAndEncrypt", timeout_ms=10000)
     \\    async with c:
     \\        node = c.get_node(ANSWER)
     \\        reads = 0
-    \\        for _ in range(20):
+    \\        for _ in range(30):
     \\            await node.read_value()
     \\            reads += 1
-    \\            await asyncio.sleep(0.5)
+    \\            await asyncio.sleep(1.0)
     \\        print("ZIGLIBS-OK-RENEWAL", reads, flush=True)
     \\
     \\    print("ZIGLIBS-ALL-DONE", flush=True)
@@ -1646,7 +1655,7 @@ test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/writ
         "ZIGLIBS-OK-CALL", // Call
         "ZIGLIBS-OK-SUBSCRIPTION", // CreateSubscription + Publish
         "ZIGLIBS-OK-SIGN-USERNAME", // Sign mode + RSA-OAEP-encrypted UserNameIdentityToken
-        "ZIGLIBS-OK-RENEWAL 20", // 20 reads across ~10 s with a 4 s token: renewals happened mid-stream
+        "ZIGLIBS-OK-RENEWAL 30", // 30 reads across ~30 s with a 10 s token: at least two renewals happened mid-stream
         "ZIGLIBS-ALL-DONE",
     };
     for (expectations) |needle| {
