@@ -74,7 +74,7 @@ modules/<name>/NOTICE        # only when something is attributed or a provenance
 ```
 
 `CONVENTIONS.md` has the full rules; `modules/_template/` is the starting point for a new module.
-Roadmap notes live in the "Roadmap / not yet built" section below and the git history.
+What a module still owes is in its own `SPEC.md`, under "What is deliberately not done".
 
 ## Licensing
 
@@ -338,27 +338,12 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `numparse` | Locale-aware grouped-number parsing (thousands/decimal separators) into an exact `decimal.Decimal`. | any | decimal |
 | `diagnostics` | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
 
-## Roadmap / not yet built
-
-Work deferred with a reason, not forgotten. A module's own `SPEC.md` carries its
-deferred list; only cross-module scope decisions belong here.
-
-- **`kv` on-disk MVCC / transactions / ordered scans** — shipped as the separate
-  `kvtree` module (copy-on-write B-tree; `kv` v0 stays for point-store consumers
-  like `jobqueue`). The transactional core, the randomized VOPR and freelist
-  chaining are all implemented. What remains is in `modules/kvtree/SPEC.md`'s
-  deferred list — overflow pages for oversized entries, node merge/rebalance on
-  underflow, and automatic reclamation thresholds — not here.
-
-Nothing is currently queued to build. The **IMAP client** that stood here was
-built on 2026-07-31 and ships as the `imap` module in the catalog above.
-
 ## Non-goals — deliberately not built here
 
-Durable scope decisions (candidate audit, 2026-07-09): capabilities this collection will
-not own, and what to reach for instead.
-
-### Adopt instead of building
+Capabilities this collection will not own, and what to reach for instead. A row here is a
+scope decision with a reason, not a promise — the reason is what to argue with if it should
+change. `zig build check-catalog` refuses to let this table name a capability that has since
+become a module.
 
 | Capability | Adopt instead | Why not a module |
 |---|---|---|
@@ -372,15 +357,3 @@ not own, and what to reach for instead.
 | S3 | `lobo/aws-sdk-for-zig` | SigV4 built in |
 | Redis/Valkey | `kristoff-it/zig-okredis` (partial/alpha) | Best available design |
 | HTTP/3 transport | `ngtcp2` | The transport (streams, loss detection, ACK logic, flight scheduling) is a bigger arc than SSH or OPC-UA were, and ngtcp2 is crypto-agnostic by design — it takes a TLS backend, which is the shape `quic-crypto` already has. The RFC 9001 crypto seam is ours; the state machine is not <!-- non-goal-ok: http, quic-crypto, ssh --> |
-
-### Won't build
-
-- **`exprcalc`** — app-specific spreadsheet/rules engine, not reused cross-project, and needs external regex.
-- **`unaccent`** — fully dependent on external `uucode` tables; not included.
-- **`roquery`** — C-level SQLite hardening (authorizer/query_only enforcement); lives consumer-side over adopted zig-sqlite.
-- **`taskqueue`** — folded into `jobqueue`. <!-- non-goal-ok: jobqueue -->
-- **`chunkframe`** — too small to be a module: ~20 lines of clamps with no state. Written out instead at its consumer, `poc-wf-analytic/docs/DATA-PLANE.md` ("The chunk-framing pattern"), where both copies of it live. <!-- non-goal-ok: framing -->
-- **Classic McEliece / BIKE** — code-based KEMs with no consumer here; `hqc` already occupies the post-quantum KEM slot. <!-- non-goal-ok: hqc -->
-- **Isogeny-based crypto** — SIKE is broken (Castryck–Decru), and its successors have no consumer here.
-- **Nostr / Matrix / Tor as protocols** — application protocols rather than foundational libraries; the primitives they rest on (`megolm`, `k256`, `bip340`) already ship. <!-- non-goal-ok: megolm, k256, bip340 -->
-- **SQL sink / DL7-style concurrent store** — app-level storage shapes, not library-level ones; `kvtree`, `tsdb` and `shardstore` are the answer here. <!-- non-goal-ok: kvtree, tsdb, shardstore -->
