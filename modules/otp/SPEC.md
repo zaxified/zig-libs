@@ -60,6 +60,24 @@ HOTP (RFC 4226) + TOTP (RFC 6238) one-time passwords; see
   directions; wrong-code reject across a window; underflow clamp at `t0`;
   non-default `t0`.
 
+## Fuzz exemption
+
+**Fuzz exemption:** EMIT-ONLY
+
+Every public function's one byte-accepting parameter is `key: []const
+u8` — the long-lived shared secret RFC 4226/6238 assume is provisioned
+out of band (typically server-generated at enrollment and never
+resubmitted), not a value that arrives per-authentication from an
+untrusted peer. The one thing an attacker DOES submit per attempt —
+`totpVerify`'s `code` — is a decimal integer (`u32`) checked with
+`std.crypto.timing_safe.eql` after `hotp` recomputes the expected value;
+there is no byte-parsing/decoding step anywhere in this module for a
+peer-supplied string to reach. (Base32 secret decoding and
+`otpauth://` URI parsing are explicitly out of scope — see "Out of
+scope" above — and belong in a layer above.) Overturn this exemption if
+`key` is ever threaded from a request body rather than a local
+credential store.
+
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL

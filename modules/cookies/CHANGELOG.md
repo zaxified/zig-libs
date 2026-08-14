@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — `zig build check-fuzz` coverage: a `testing.fuzz` harness on `parse`
+  (the `Cookie`-header decode entry point), generating both arbitrary bytes and
+  cookie-shaped input assembled from the grammar's own alphabet (`=`, `;`,
+  `"`), so the DQUOTE-toggle branch is actually exercised rather than only
+  reachable by chance. `parse`/`Iterator.next` are allocation-free, so this is
+  a never-panics harness, not a leak oracle. No panic, hang or leak found.
 - **2026-08-13** — **BREAKING** `SetError` gains `error.HeaderBytesExhausted`, by inheritance
   from `http.Server.ResponseWriter.SetHeaderError`. An exhaustive `switch` over
   `cookies.SetError` stops compiling until it handles the new case; a `catch

@@ -665,3 +665,69 @@ test "set: an over-long cookie is refused, not truncated" {
 test {
     _ = @import("golden_test.zig");
 }
+
+// ── fuzz: parse never panics on arbitrary or cookie-shaped bytes ───────────
+//
+// `parse`/`Iterator.next` are the decode entry point for a `Cookie` request
+// header — attacker-controlled bytes off the wire. They are allocation-free
+// (results borrow the input), so there is no leak oracle to run here; the
+// property under test is "never panics or reads out of bounds", across both
+// pure garbage and bytes shaped like the grammar the segment scanner actually
+// branches on (`=`, `;`, `"` — the DQUOTE-toggle state machine that a naive
+// version of the scanner got wrong, per the python-oracle test above).
+test "fuzz: parse never panics, arbitrary or cookie-shaped bytes" {
+    try std.testing.fuzz({}, fuzzParseNeverPanics, .{});
+}
+
+fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const header = buildCookieHeader(smith, &buf);
+    var it = parse(header);
+    while (it.next()) |c| {
+        std.mem.doNotOptimizeAway(c.name);
+        std.mem.doNotOptimizeAway(c.value);
+    }
+}
+
+/// One draw in ten is pure arbitrary bytes; the rest are assembled from the
+/// alphabet a real `Cookie:` header uses — `name=value` segments joined by
+/// `; `, with the value sometimes DQUOTE-wrapped. Arbitrary bytes almost
+/// never spell a quoted value containing a `;`, so without this the quote-
+/// toggle branch (in-quotes tracking in `Iterator.next`) would go unexercised
+/// for the length of any bounded run.
+fn buildCookieHeader(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    if (smith.valueRangeAtMost(u8, 0, 9) == 0) {
+        var raw: [512]u8 = undefined;
+        smith.bytes(&raw);
+        const len = smith.valueRangeAtMost(u16, 0, @intCast(raw.len));
+        w.writeAll(raw[0..len]) catch {};
+        return w.buffered();
+    }
+    const n_segments = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < n_segments) : (i += 1) {
+        if (i != 0) w.writeAll("; ") catch {};
+        writeSegment(smith, &w);
+    }
+    return w.buffered();
+}
+
+fn writeSegment(smith: *std.testing.Smith, w: *std.Io.Writer) void {
+    const alphabet = "abcXYZ019=;\" \t\\,";
+    const name_len = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < name_len) : (i += 1) {
+        w.writeByte(alphabet[smith.index(alphabet.len)]) catch return;
+    }
+    if (!smith.value(bool)) return;
+    w.writeByte('=') catch return;
+    const quoted = smith.value(bool);
+    if (quoted) w.writeByte('"') catch return;
+    const value_len = smith.valueRangeAtMost(u8, 0, 8);
+    var j: u8 = 0;
+    while (j < value_len) : (j += 1) {
+        w.writeByte(alphabet[smith.index(alphabet.len)]) catch return;
+    }
+    if (quoted) w.writeByte('"') catch return;
+}

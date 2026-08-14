@@ -222,3 +222,51 @@ test "parseTcp: malformed rows are skipped, not fatal" {
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 1), entries.len);
 }
+
+// ── fuzz: parseTcp/parseUdp never panic, OOB or leak ────────────────────────
+//
+// `/proc/net/{tcp,tcp6,udp,udp6}` is kernel-emitted but the decode entry
+// point is the same hostile-input surface as any wire parser (a bind-
+// mounted/faked `/proc`, a snapshot read from a file). Allocates, so this
+// runs under `std.testing.allocator` with the result freed on every path.
+const socket_corpus = [_][]const u8{ tcp_fixture, tcp6_fixture, udp_fixture, udp6_fixture };
+
+test "fuzz: parseTcp/parseUdp never panic, OOB or leak, arbitrary or mutated-real bytes" {
+    try std.testing.fuzz({}, fuzzParseSocketsNeverLeaks, .{ .corpus = &socket_corpus });
+}
+
+fn fuzzParseSocketsNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const sample = socket_corpus[smith.index(socket_corpus.len)];
+    const text = mutateSample(smith, sample, &buf);
+
+    const tcp_entries = try parseTcp(testing.allocator, text);
+    testing.allocator.free(tcp_entries);
+    const udp_entries = try parseUdp(testing.allocator, text);
+    testing.allocator.free(udp_entries);
+}
+
+/// One draw in five is pure arbitrary bytes; the rest starts from a real
+/// `/proc/net/{tcp,tcp6,udp,udp6}` fixture and applies a handful of
+/// byte-level mutations — arbitrary bytes essentially never spell an
+/// `addr:port` column with the exact 8- or 32-hex-char address length both
+/// `parseLocalAddr`'s v4/v6 branches require, so mutating a known-good table
+/// reaches that decode logic far more often than a from-scratch random blob
+/// would.
+fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
+        smith.bytes(buf);
+        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+        return buf[0..len];
+    }
+    const len = @min(sample.len, buf.len);
+    @memcpy(buf[0..len], sample[0..len]);
+    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
+    var i: u8 = 0;
+    while (i < n_mutations) : (i += 1) {
+        if (len == 0) break;
+        buf[smith.index(len)] = smith.value(u8);
+    }
+    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
+    return buf[0..out_len];
+}

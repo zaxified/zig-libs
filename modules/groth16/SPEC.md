@@ -199,6 +199,23 @@ external datum, the generator `5` and 2-adicity 28, is a property of BN254's
 transcribed. The anchor's KAT (Dark Forest v0.3 proof) lives in and is
 accounted for by the `bn254` module, not restated here.
 
+## Fuzz exemption
+
+**Fuzz exemption:** EMIT-ONLY
+
+This module is the PROVER half of the Groth16 arc (see §2) — it never
+verifies anything; `verify` lives in the sibling `bn254` module, over
+`bn254`'s own `Groth16Proof`/`Groth16VerifyingKey` types, and is fuzzed
+there. Every byte-accepting `pub fn` in `groth16`'s own sources
+(`snarkjs_export.zig`'s `decimalBytes`/`fpDecimal`/`frDecimal`) converts
+field elements THIS module just computed — a proof/verifying-key/public-
+input it produced internally — into decimal-ASCII text for a snarkjs-
+compatible JSON export. There is no decode step anywhere in this module:
+nothing here ever parses a proof, key, or witness that arrived from a
+peer. Overturn this exemption the moment `groth16` grows a `.zkey`/
+witness-file ingestion path (§7's deferred increment) — that would be a
+genuine foreign-bytes decode surface.
+
 ## Anchoring
 
 **Anchor grade:** class B · oracle MIXED

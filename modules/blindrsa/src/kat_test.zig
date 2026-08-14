@@ -377,3 +377,33 @@ test "blind gives up and reports InvalidBlindingFactor rather than proceed with 
         blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, random, &ctx, &blinded_msg),
     );
 }
+
+// ── fuzz: verify on hostile signature bytes ─────────────────────────────
+//
+// `verify` is the module's untrusted-input entry point: a signer (or an
+// attacker impersonating one) hands back a `blind_sig`/`sig` the client
+// unblinds and checks with THIS function, against the client's own fixed
+// `(pk, prepared_msg, salt_len)`. It must reduce to a typed
+// `rsa.VerifyPssError` for any signature bytes at all — never panic —
+// including lengths that don't match the 512-byte RFC 9474 modulus.
+// Biased toward "nearly valid" by corrupting a handful of bytes of the
+// RFC's own real published signature rather than drawing pure random
+// bytes, which the first `OS2IP`/range check would reject on almost every
+// draw.
+fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    const pk = kat.publicKey() catch return;
+
+    var bytes: [kat.a1.sig.len]u8 = kat.a1.sig;
+    const n_flips = smith.valueRangeAtMost(u8, 0, 8);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(bytes.len);
+        bytes[pos] = smith.value(u8);
+    }
+
+    blindrsa.verify(pk, Sha384, &kat.a1.prepared_msg, &bytes, kat.a1.salt.len) catch return;
+}
+
+test "fuzz: verify never panics on corrupted signature bytes" {
+    try std.testing.fuzz({}, fuzzVerify, .{});
+}

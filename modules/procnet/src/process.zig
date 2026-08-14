@@ -155,3 +155,54 @@ test "parseProcStat: near-maxInt(u64) rss field saturates instead of panicking" 
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), e.rss_kb);
     try testing.expectEqual(@as(u32, 9), e.pid);
 }
+
+// ── fuzz: parseProcStat never panics, arbitrary or real-shaped bytes ───────
+//
+// `/proc/<pid>/stat` is emitted by the kernel, but this decode entry point
+// is exactly as hostile-input-facing as any wire parser: a container's
+// `/proc` can be bind-mounted/faked, and the process's own name (`comm`) is
+// attacker-influenced (any process can name itself anything, including more
+// parens than the format's own outside-in scan expects). Allocation-free —
+// the result lives in a fixed buffer — so the property is "never panics or
+// reads OOB", not a leak oracle.
+const proc_stat_corpus = [_][]const u8{
+    "1 (systemd) S 0 1 1 0 -1 4194560 55321 3271011 40 4482 106 88 1058 621 20 0 1 0 3 170939904 2237 18446744073709551615 0 0 0 0 0 0 671173123 4096 1260 1 0 0 17 3 0 0 0 0 0 0 0 0 0 0",
+    "1234 ((sd-pam)) S 1233 1233 1233 0 -1 1077936384 10 0 0 0 0 0 0 0 20 0 1 0 5 170000000 200 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0",
+    "42 (my weird) name) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 300 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0",
+    "",
+    "no-parens-here S 1 1",
+};
+
+test "fuzz: parseProcStat never panics, arbitrary or mutated-real bytes" {
+    try std.testing.fuzz({}, fuzzParseProcStatNeverPanics, .{ .corpus = &proc_stat_corpus });
+}
+
+fn fuzzParseProcStatNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const line = mutateSample(smith, proc_stat_corpus[0], &buf);
+    _ = parseProcStat(line);
+}
+
+/// One draw in five is pure arbitrary bytes; the rest starts from a real
+/// `/proc/<pid>/stat` line and applies a handful of byte-level mutations —
+/// arbitrary bytes essentially never spell a balanced `(...)` around a
+/// plausible `comm`, so mutating a known-good sample reaches the parser's
+/// interior (the field-counting loop past `comm`) far more often than a
+/// from-scratch random string would.
+fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
+        smith.bytes(buf);
+        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+        return buf[0..len];
+    }
+    const len = @min(sample.len, buf.len);
+    @memcpy(buf[0..len], sample[0..len]);
+    const n_mutations = smith.valueRangeAtMost(u8, 0, 16);
+    var i: u8 = 0;
+    while (i < n_mutations) : (i += 1) {
+        if (len == 0) break;
+        buf[smith.index(len)] = smith.value(u8);
+    }
+    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
+    return buf[0..out_len];
+}

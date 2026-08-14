@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Test-only: `kat_test.zig` gained a `testing.fuzz` harness on
+  `Ciphertext.fromBytes`/`decrypt` (corrupted ciphertext bytes against a fixed
+  self-issued PKG keypair) — `zig build check-fuzz` no longer names this
+  module. No panic/OOB found; **neither breaking nor behavioural**.
 - **2026-08-13** — Test-only: `kat_test.zig` gained "entropy seam: randomSigma
   really draws, and two encryptions of one message differ". **Neither
   BREAKING nor BEHAVIOURAL** — no production code changed; this adds the

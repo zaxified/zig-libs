@@ -189,3 +189,45 @@ test "parseRoutes: interface name longer than IFNAMSIZ is truncated, not dropped
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(usize, procnet.if_name_max), entries[0].iface().len);
 }
+
+// ── fuzz: parseRoutes never panics, OOB or leaks ────────────────────────────
+//
+// `/proc/net/route` is kernel-emitted but the decode entry point is the same
+// hostile-input surface as any wire parser (a bind-mounted/faked `/proc`, a
+// snapshot read from a file). Allocates (`ArrayList` + `copyClamped` into a
+// fixed buffer), so this runs under `std.testing.allocator` with the result
+// freed on every path — a leak on a skipped-row error path is a real finding.
+test "fuzz: parseRoutes never panics, OOB or leaks, arbitrary or mutated-real bytes" {
+    try std.testing.fuzz({}, fuzzParseRoutesNeverLeaks, .{ .corpus = &.{fixture} });
+}
+
+fn fuzzParseRoutesNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const text = mutateSample(smith, fixture, &buf);
+    const entries = try parseRoutes(testing.allocator, text);
+    testing.allocator.free(entries);
+}
+
+/// One draw in five is pure arbitrary bytes; the rest starts from the real
+/// `/proc/net/route` fixture and applies a handful of byte-level mutations —
+/// arbitrary bytes essentially never spell the right column count with
+/// 8-hex-char addresses, so mutating a known-good table reaches the row
+/// decode logic (the little-endian hex, the contiguous-mask check) far more
+/// often than a from-scratch random blob would.
+fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
+        smith.bytes(buf);
+        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+        return buf[0..len];
+    }
+    const len = @min(sample.len, buf.len);
+    @memcpy(buf[0..len], sample[0..len]);
+    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
+    var i: u8 = 0;
+    while (i < n_mutations) : (i += 1) {
+        if (len == 0) break;
+        buf[smith.index(len)] = smith.value(u8);
+    }
+    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
+    return buf[0..out_len];
+}

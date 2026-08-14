@@ -650,3 +650,50 @@ test "end-to-end: 3 signers with an x-only (Taproot-style) tweak — aggregate v
     const untweaked_pk = try bip340.XOnlyPublicKey.fromBytes(base_ctx.getXonlyPubkey());
     try std.testing.expect(!bip340.verify(untweaked_pk, msg, try bip340.Signature.fromBytes(sig)));
 }
+
+// ── fuzz: partialSigVerify on hostile partial-signature bytes ───────────
+//
+// `partialSigVerify` is a co-signer's untrusted-input entry point: any
+// other participant in the session can hand it a `PartialSignature` over
+// a fixed, already-agreed `(pubnonces, pubkeys, msg, signer_index)`, and
+// it must reduce to a typed error — never panic, never read out of
+// bounds — for any 32 bytes. Pinned to `sign_verify.valid_test_cases[0]`
+// (a real, valid session); only the partial-signature bytes are mutated,
+// starting from that case's own real published `expected` value and
+// flipping a handful of bytes, so the fuzzer lands near the `s < n`
+// boundary and the group equation rather than being rejected by the
+// first range check on nearly every draw.
+fn fuzzPartialSigVerify(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    const case = v.sign_verify.valid_test_cases[0];
+
+    var pk_buf: [8]musig2.PlainPublicKey = undefined;
+    for (case.key_indices, 0..) |idx, i| {
+        pk_buf[i] = musig2.PlainPublicKey.fromBytes(hexN(33, v.sign_verify.pubkeys[idx])) catch return;
+    }
+    const pks = pk_buf[0..case.key_indices.len];
+
+    var pn_buf: [8]musig2.PubNonce = undefined;
+    for (case.nonce_indices, 0..) |idx, i| {
+        pn_buf[i] = musig2.PubNonce.fromBytes(hexN(66, v.sign_verify.pnonces[idx])) catch return;
+    }
+    const pns = pn_buf[0..case.nonce_indices.len];
+
+    const msg = hexAlloc(gpa, v.sign_verify.msgs[case.msg_index]) catch return;
+    defer gpa.free(msg);
+
+    var bytes = hexN(32, case.expected);
+    const n_flips = smith.valueRangeAtMost(u8, 0, 4);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(bytes.len);
+        bytes[pos] = smith.value(u8);
+    }
+
+    const psig = musig2.PartialSignature.fromBytes(bytes) catch return;
+    _ = musig2.partialSigVerify(psig, pns, pks, &.{}, msg, case.signer_index) catch return;
+}
+
+test "fuzz: partialSigVerify never panics on corrupted partial-signature bytes" {
+    try std.testing.fuzz({}, fuzzPartialSigVerify, .{});
+}

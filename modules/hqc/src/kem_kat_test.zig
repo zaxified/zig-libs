@@ -154,3 +154,30 @@ test "implicit reject: corrupted ciphertext decaps returns a differing, determin
     try testImplicitReject(Kem192, 101);
     try testImplicitReject(Kem256, 102);
 }
+
+// ── fuzz: decaps on arbitrary ciphertext bytes ──────────────────────────
+//
+// `decaps` is the module's untrusted-input entry point: a `Ciphertext`
+// arrives from a peer and MUST NEVER panic or read out of bounds,
+// however its bits are set — that is HQC-KEM's whole implicit-rejection
+// contract (see `kem.zig`'s module doc and the property test above,
+// which only ever flips one bit). This drives fully arbitrary bytes
+// through the concatenated Reed-Muller/Reed-Solomon DECODE path (this
+// arc's Fable-hard core — `code.zig`'s `decode`, syndromes, Berlekamp-
+// Massey, Gao-Mateer root-finding) against a fixed keypair, rather than
+// the property test's single-bit-flip corruption. HQC-128 only (the
+// smallest parameter set): the decoder cost is the same shape at every
+// security level, and the gate only requires one harness to exist
+// per module.
+fn fuzzDecaps(_: void, smith: *std.testing.Smith) !void {
+    const seed_kem = [_]u8{0x37} ** params.seed_bytes;
+    const kp = Kem128.keypair(&seed_kem);
+
+    var ct: Kem128.Ciphertext = undefined;
+    smith.bytes(&ct);
+    _ = Kem128.decaps(kp.dk, ct);
+}
+
+test "fuzz: decaps never panics on arbitrary ciphertext bytes" {
+    try std.testing.fuzz({}, fuzzDecaps, .{});
+}

@@ -386,3 +386,43 @@ test "Falcon-512 verify entry rejects a Falcon-1024 signature envelope" {
         falcon.PublicKey.fromBytes(d.pk_bytes[0..falcon.PublicKey.encoded_length]),
     );
 }
+
+// ── fuzz: PublicKey.verify on hostile compressed signature bytes ────────
+//
+// `verify` is the module's real untrusted-input surface: a compressed
+// signature field arrives from whoever produced it, over a fixed public
+// key/message/nonce, and must reduce to `VerifyError` alone — never panic,
+// never read out of bounds — however the Golomb-Rice compression is
+// corrupted. Biased toward "nearly valid" by starting from a real NIST-KAT
+// signature field and flipping a handful of bytes; pure random bytes are
+// rejected by `compDecode`'s canonical-encoding check almost every time,
+// never reaching the NTT/norm-check machinery this exists to exercise.
+fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    const d = Decoded.init(gpa, v.falcon512[0]) catch return;
+    defer d.deinit(gpa);
+    const pk = falcon.PublicKey.fromBytes(d.pk_bytes[0..897]) catch return;
+
+    const sig_len = (@as(usize, d.sm[0]) << 8) | d.sm[1];
+    if (sig_len < 1 or sig_len > d.sm.len - 2 - falcon.nonce_length) return;
+    const nonce = d.sm[2 .. 2 + falcon.nonce_length];
+    const msg = d.sm[2 + falcon.nonce_length .. d.sm.len - sig_len];
+    const real_sig = d.sm[d.sm.len - sig_len ..];
+
+    var buf: [falcon.max_sig_field_length]u8 = undefined;
+    const len = @min(real_sig.len, buf.len);
+    @memcpy(buf[0..len], real_sig[0..len]);
+
+    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(len);
+        buf[pos] = smith.value(u8);
+    }
+
+    pk.verify(msg, nonce[0..falcon.nonce_length], buf[0..len]) catch return;
+}
+
+test "fuzz: PublicKey.verify never panics on corrupted compressed signatures" {
+    try std.testing.fuzz({}, fuzzVerify, .{});
+}

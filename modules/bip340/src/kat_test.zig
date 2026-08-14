@@ -238,3 +238,36 @@ test "KAT: hexAlloc helper decodes variable-length messages (sanity for the sign
         try std.testing.expectEqual(vec.message.len / 2, msg.len);
     }
 }
+
+// ── fuzz: verify on hostile signature bytes ─────────────────────────────
+//
+// `verify` is the module's untrusted-input entry point: any peer can hand
+// it 64 arbitrary bytes claiming to be a signature over a fixed, known
+// pubkey/message, and it must return `false` — never panic, never read out
+// of bounds. Vector 0 (a real, valid `(pubkey, message, signature)` triple)
+// supplies the fixed pubkey/message; only the signature bytes are mutated,
+// starting from the real published signature and flipping a handful of
+// bytes, so the fuzzer spends its budget near the `r < p`/`s < n` boundary
+// and the curve-equation check rather than being rejected by the first
+// range check on almost every draw.
+fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    const vec0 = v.vectors[0];
+    const pk = bip340.XOnlyPublicKey.fromBytes(hex32(vec0.public_key) catch unreachable) catch return;
+    var msg_buf: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&msg_buf, vec0.message) catch unreachable;
+
+    var bytes: [64]u8 = hex64(vec0.signature) catch unreachable;
+    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(bytes.len);
+        bytes[pos] = smith.value(u8);
+    }
+
+    const sig = bip340.Signature.fromBytes(bytes) catch return;
+    _ = bip340.verify(pk, &msg_buf, sig);
+}
+
+test "fuzz: verify never panics on corrupted signature bytes" {
+    try std.testing.fuzz({}, fuzzVerify, .{});
+}

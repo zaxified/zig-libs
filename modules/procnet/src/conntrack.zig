@@ -181,3 +181,47 @@ test "parseConntrack: malformed lines count toward total but are skipped" {
     try testing.expectEqual(@as(usize, 1), result.flows.len);
     try testing.expectEqualStrings("udp", result.flows[0].proto());
 }
+
+// ── fuzz: parseConntrack never panics, OOB or leaks ─────────────────────────
+//
+// `/proc/net/nf_conntrack` is kernel-emitted but the decode entry point is
+// the same hostile-input surface as any wire parser (a bind-mounted/faked
+// `/proc`, a snapshot read from a file) — and its `src=`/`dst=`/`sport=`/
+// `dport=` key=value scan is the most free-form grammar of any table in this
+// module, unlike the others' fixed column order. Allocates, so this runs
+// under `std.testing.allocator` with the result freed on every path (via
+// `ConntrackResult.deinit`, the module's own free path).
+test "fuzz: parseConntrack never panics, OOB or leaks, arbitrary or mutated-real bytes" {
+    try std.testing.fuzz({}, fuzzParseConntrackNeverLeaks, .{ .corpus = &.{fixture} });
+}
+
+fn fuzzParseConntrackNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const text = mutateSample(smith, fixture, &buf);
+    var result = try parseConntrack(testing.allocator, text, 50);
+    result.deinit(testing.allocator);
+}
+
+/// One draw in five is pure arbitrary bytes; the rest starts from the real
+/// `/proc/net/nf_conntrack` fixture and applies a handful of byte-level
+/// mutations — arbitrary bytes essentially never spell a `key=value` token
+/// the free-form `kvField` scan recognizes, so mutating a known-good table
+/// reaches the src/dst/sport/dport decode logic far more often than a
+/// from-scratch random blob would.
+fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
+        smith.bytes(buf);
+        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+        return buf[0..len];
+    }
+    const len = @min(sample.len, buf.len);
+    @memcpy(buf[0..len], sample[0..len]);
+    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
+    var i: u8 = 0;
+    while (i < n_mutations) : (i += 1) {
+        if (len == 0) break;
+        buf[smith.index(len)] = smith.value(u8);
+    }
+    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
+    return buf[0..out_len];
+}

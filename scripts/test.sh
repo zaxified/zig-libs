@@ -202,6 +202,7 @@ harness_smoke() {
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
+    step "check-fuzz" zig build check-fuzz
     run_modules "$plain $netns"
     graph_save
     summary
@@ -642,6 +643,12 @@ cmd_changed() {
     # measures) is exactly what a developer is doing when it matters.
     step "check-ctgrind" zig build check-ctgrind
 
+    # Unconditional for the same reason, and sub-second warm. It was absent
+    # from this driver until 2026-08-14, which is why nobody noticed it had
+    # been red for weeks on 21 modules: a gate that exists and is never invoked
+    # makes the same claim a skipped test makes, which is that someone looked.
+    step "check-fuzz" zig build check-fuzz
+
     if [[ -z "$closure" ]]; then
         graph_save
         summary
@@ -676,6 +683,7 @@ cmd_all() {
     step "check-catalog" zig build check-catalog
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
+    step "check-fuzz" zig build check-fuzz
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
     # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
     # -- which needs valgrind -- is deliberately NOT in this gate. Left alone

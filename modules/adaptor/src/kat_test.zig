@@ -302,3 +302,41 @@ test "property: preVerify REJECTS a non-canonical (>= n) re-encoding of an other
     };
     try std.testing.expect(!adaptor.preVerify(px, msg, t_point, presig_noncanonical));
 }
+
+// ── fuzz: preVerify on hostile pre-signature bytes ──────────────────────
+//
+// `preVerify` is the untrusted-input entry point: a counterparty hands the
+// presigner's own public key a `(PreSignature, AdaptorPoint)` pair over the
+// wire and it must accept/reject via `PreSignatureError`/`bool` alone —
+// never panic, never read out of bounds — for ANY 65 bytes, not just the
+// six self-authored vectors. `pubkey`/`msg`/`adaptor_point` are pinned to
+// vector 0 (a real, valid triple) and only the `PreSignature` wire bytes
+// are mutated, biased toward "nearly valid" by starting from vector 0's
+// real `r || s_prime || flag` encoding and flipping a handful of bytes —
+// pure random 65-byte strings almost never survive `Fe`/`Scalar`'s
+// canonical-range checks far enough to reach the group-equation math this
+// exists to exercise.
+fn fuzzPreVerify(_: void, smith: *std.testing.Smith) !void {
+    const vec0 = v.vectors[0];
+    const px = try bip340.XOnlyPublicKey.fromBytes(hexN(32, vec0.px));
+    const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec0.adaptor_point));
+
+    var bytes: [65]u8 = undefined;
+    bytes[0..32].* = hexN(32, vec0.r);
+    bytes[32..64].* = hexN(32, vec0.s_prime);
+    bytes[64] = @intFromBool(vec0.needs_negation);
+
+    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(bytes.len);
+        bytes[pos] = smith.value(u8);
+    }
+
+    const presig = adaptor.PreSignature.fromBytes(bytes) catch return;
+    _ = adaptor.preVerify(px, vec0.msg, t_point, presig);
+}
+
+test "fuzz: preVerify never panics on corrupted pre-signature bytes" {
+    try std.testing.fuzz({}, fuzzPreVerify, .{});
+}

@@ -389,3 +389,134 @@ test "posix footer: leap-year positive control — Jn and n resolve to different
     try testing.expect(!offsetAt(&yd, feb28_2024).dst);
     try testing.expect(offsetAt(&yd, feb29_2024).dst);
 }
+
+// ---------------------------------------------------------------------------
+// fuzz: find (zone-name lookup) and the POSIX-TZ footer grammar
+// ---------------------------------------------------------------------------
+//
+// Two decode entry points take caller-supplied bytes: `find`'s zone-name
+// binary search (what `check-fuzz`'s static scan actually flagged), and the
+// module's real parsing logic — the POSIX-TZ footer grammar
+// (`posixOffset`/`parseRule`/`ruleDateUnix`) reachable through the fully
+// public `Zone.posix` field feeding the public `offsetAt`. A caller that
+// reads a `TZ` environment variable or an untrusted footer string and builds
+// its own `Zone` literal (exactly the pattern the synthetic-zone tests above
+// use) hands this parser bytes it did not author.
+
+test "fuzz: find never panics, arbitrary or real zone-name bytes" {
+    try std.testing.fuzz({}, fuzzFindNeverPanics, .{});
+}
+
+fn fuzzFindNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const name = buildZoneName(smith, &buf);
+    _ = find(name);
+}
+
+/// One draw in three copies a real zone name verbatim (or truncated) —
+/// exercising exact-match hits and the binary search's boundary, which
+/// arbitrary bytes essentially never do on their own; the rest is arbitrary
+/// bytes.
+fn buildZoneName(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    if (tz_data.zones.len != 0 and smith.valueRangeAtMost(u8, 0, 2) == 0) {
+        const z = tz_data.zones[smith.index(tz_data.zones.len)];
+        const len = @min(z.name.len, buf.len);
+        @memcpy(buf[0..len], z.name[0..len]);
+        return buf[0..len];
+    }
+    smith.bytes(buf);
+    const len = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+    return buf[0..len];
+}
+
+const posix_footer_corpus = [_][]const u8{
+    "CET-1CEST,M3.5.0,M10.5.0/3",
+    "EST5EDT,M3.2.0,M11.1.0",
+    "UTC0",
+    "<+05>-5",
+    "XST0XDT,J59/0,J300/0",
+    "YST0YDT,59/0,300/0",
+};
+
+test "fuzz: offsetAt's POSIX-TZ footer parser never panics, arbitrary or footer-shaped bytes" {
+    try std.testing.fuzz({}, fuzzPosixFooterNeverPanics, .{ .corpus = &posix_footer_corpus });
+}
+
+fn fuzzPosixFooterNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const posix = buildPosixFooter(smith, &buf);
+    const z = Zone{
+        .name = "Fuzz/Zone",
+        .init_off = 0,
+        .init_dst = false,
+        .trans = &[_]Transition{},
+        .posix = posix,
+    };
+    // A wide but bounded instant range — far enough past/before epoch to
+    // reach every rule form's year math without courting unrelated i64*86400
+    // overflow in datefmt, which is not this module's decode surface.
+    const unix = smith.valueRangeAtMost(i64, -100 * 365 * 86400, 100 * 365 * 86400);
+    _ = offsetAt(&z, unix);
+}
+
+/// One draw in six is pure arbitrary bytes; the rest assembles
+/// `stdoffset[dst[offset][,start[/time],end[/time]]]` — the grammar
+/// `posixOffset` walks — with each optional piece independently present or
+/// absent, so both the "no DST" short-circuit and the full two-rule path get
+/// exercised, not just whichever one arbitrary bytes happen to stumble into.
+fn buildPosixFooter(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 5) == 0) {
+        smith.bytes(buf);
+        const len = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+        return buf[0..len];
+    }
+    var w: std.Io.Writer = .fixed(buf);
+    writeAbbrev(smith, &w);
+    writeFooterOffset(smith, &w);
+    if (!smith.value(bool)) return w.buffered();
+    writeAbbrev(smith, &w);
+    if (smith.value(bool)) writeFooterOffset(smith, &w);
+    if (!smith.value(bool)) return w.buffered();
+    w.writeByte(',') catch return w.buffered();
+    writeRuleText(smith, &w);
+    writeRuleTimeText(smith, &w);
+    w.writeByte(',') catch return w.buffered();
+    writeRuleText(smith, &w);
+    writeRuleTimeText(smith, &w);
+    return w.buffered();
+}
+
+fn writeAbbrev(smith: *std.testing.Smith, w: *std.Io.Writer) void {
+    const letters = "ABCXYZ";
+    const len = smith.valueRangeAtMost(u8, 1, 4);
+    var i: u8 = 0;
+    while (i < len) : (i += 1) {
+        w.writeByte(letters[smith.index(letters.len)]) catch return;
+    }
+}
+
+fn writeFooterOffset(smith: *std.testing.Smith, w: *std.Io.Writer) void {
+    if (smith.value(bool)) w.writeByte(if (smith.value(bool)) '+' else '-') catch return;
+    w.print("{d}", .{smith.valueRangeAtMost(u8, 0, 23)}) catch return;
+    if (!smith.value(bool)) return;
+    w.print(":{d:0>2}", .{smith.valueRangeAtMost(u8, 0, 59)}) catch return;
+    if (smith.value(bool)) w.print(":{d:0>2}", .{smith.valueRangeAtMost(u8, 0, 59)}) catch return;
+}
+
+fn writeRuleText(smith: *std.testing.Smith, w: *std.Io.Writer) void {
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => w.print("M{d}.{d}.{d}", .{
+            smith.valueRangeAtMost(u8, 1, 12),
+            smith.valueRangeAtMost(u8, 1, 5),
+            smith.valueRangeAtMost(u8, 0, 6),
+        }) catch {},
+        1 => w.print("J{d}", .{smith.valueRangeAtMost(u16, 1, 365)}) catch {},
+        else => w.print("{d}", .{smith.valueRangeAtMost(u16, 0, 365)}) catch {},
+    }
+}
+
+fn writeRuleTimeText(smith: *std.testing.Smith, w: *std.Io.Writer) void {
+    if (!smith.value(bool)) return;
+    w.writeByte('/') catch return;
+    writeFooterOffset(smith, w);
+}

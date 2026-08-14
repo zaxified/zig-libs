@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Test-only: `kem_kat_test.zig` gained a `testing.fuzz` harness
+  on `Hqc128.decaps` (arbitrary ciphertext bytes against a fixed keypair,
+  driving the Reed-Muller/Reed-Solomon decode path) — `zig build check-fuzz`
+  no longer names this module. No panic/OOB found; **neither breaking nor
+  behavioural**.
 - **2026-07-18** — Security audit: two findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Verified: Byte-exact
   vs official NIST v5.0.0 `.rsp` (`kat_vectors_kem.zig`, curl-fetched from `pqc-hqc/hqc`

@@ -574,3 +574,43 @@ test "drand anchor: the genuine fixture is rejected under a wrong private key (F
     const wrong = g1.Jacobian.fromAffine(interopRoundSignature()).double().toAffine();
     try std.testing.expectError(error.FoCheckFailed, DrandIbe.decrypt(wrong, ct));
 }
+
+// ── fuzz: Ciphertext.fromBytes / decrypt on hostile ciphertext bytes ────
+//
+// `decrypt` (and the `Ciphertext.fromBytes` decode step in front of it)
+// is `ibe`'s untrusted-input entry point: whoever holds `d_id` receives a
+// `Ciphertext` from an arbitrary sender and must reduce any 160 bytes to
+// `g2.G2Error`/`DecryptError` alone — never panic, never read out of
+// bounds. `d_id` is a fixed, self-issued PKG key (`msk` a small canonical
+// scalar, matching `fp12Pow`'s own test convention above); a real
+// ciphertext for that identity is built once and its bytes corrupted, so
+// the fuzzer is biased toward the `U` point's compressed-encoding
+// boundary and the FO consistency check rather than being rejected by
+// the first flag-byte check on nearly every draw.
+fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
+    var msk_bytes = [_]u8{0} ** 32;
+    msk_bytes[31] = 0x07;
+    const msk = Fr.fromBytes(msk_bytes) catch unreachable;
+    const mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk).toAffine();
+    const id = "fuzz@example.com";
+    const d_id = ibe.extract(msk, id);
+
+    const message = [_]u8{0xAB} ** ibe.block_bytes;
+    const sigma = [_]u8{0x11} ** ibe.block_bytes;
+    const ct = ibe.encrypt(mpk, id, message, sigma);
+    var bytes = ct.toBytes();
+
+    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(bytes.len);
+        bytes[pos] = smith.value(u8);
+    }
+
+    const corrupted = ibe.Ciphertext.fromBytes(bytes) catch return;
+    _ = ibe.decrypt(d_id, corrupted) catch return;
+}
+
+test "fuzz: Ciphertext.fromBytes/decrypt never panics on corrupted ciphertext bytes" {
+    try std.testing.fuzz({}, fuzzDecrypt, .{});
+}

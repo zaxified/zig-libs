@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — `zig build check-fuzz` coverage: a `testing.fuzz` harness on
+  `parse.parseTcpTimestamps` (the TCP-options TLV decode entry point), TLV-shaped so
+  most draws are well-formed-ish option sequences (END/NOP/genuine Timestamps/opaque
+  options with a possibly-malformed length byte) rather than bytes rejected at the
+  first kind byte. The module already had two 20k/5k-trial LCG-based "fuzz-style"
+  tests covering the same never-panics/never-reads-OOB property, but they predate
+  `std.testing.Smith` and are invisible to the gate (which greps for `testing.fuzz(`)
+  and to `--fuzz`'s coverage-guided corpus growth — left in place, not superseded. No
+  panic, hang or OOB read found.
 - **2026-08-13** — Test-only: `src/match.zig`'s single test — `test "match:
   file is reachable from the build"`, body `try std.testing.expect(true);` —
   was replaced by one that pins step 5a's aging sweep of the SAME-direction

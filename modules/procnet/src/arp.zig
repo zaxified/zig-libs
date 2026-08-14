@@ -144,3 +144,45 @@ test "parseArp: device name longer than IFNAMSIZ is truncated, not dropped" {
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(usize, procnet.if_name_max), entries[0].device().len);
 }
+
+// ── fuzz: parseArp never panics, OOB or leaks ───────────────────────────────
+//
+// `/proc/net/arp` is kernel-emitted but the decode entry point is the same
+// hostile-input surface as any wire parser (a bind-mounted/faked `/proc`, a
+// snapshot read from a file). Allocates, so this runs under
+// `std.testing.allocator` with the result freed on every path.
+test "fuzz: parseArp never panics, OOB or leaks, arbitrary or mutated-real bytes" {
+    try std.testing.fuzz({}, fuzzParseArpNeverLeaks, .{ .corpus = &.{fixture} });
+}
+
+fn fuzzParseArpNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const text = mutateSample(smith, fixture, &buf);
+    const entries = try parseArp(testing.allocator, text);
+    testing.allocator.free(entries);
+}
+
+/// One draw in five is pure arbitrary bytes; the rest starts from the real
+/// `/proc/net/arp` fixture and applies a handful of byte-level mutations —
+/// arbitrary bytes essentially never spell a well-formed `hh:hh:hh:hh:hh:hh`
+/// MAC or a valid dotted IP, so mutating a known-good table reaches
+/// `parseMac`'s per-group bounds check (audit-found: a 7th colon group is
+/// the only thing standing between this and an OOB write) far more often
+/// than a from-scratch random blob would.
+fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
+        smith.bytes(buf);
+        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+        return buf[0..len];
+    }
+    const len = @min(sample.len, buf.len);
+    @memcpy(buf[0..len], sample[0..len]);
+    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
+    var i: u8 = 0;
+    while (i < n_mutations) : (i += 1) {
+        if (len == 0) break;
+        buf[smith.index(len)] = smith.value(u8);
+    }
+    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
+    return buf[0..out_len];
+}

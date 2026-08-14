@@ -468,3 +468,35 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
     const sig = try frost.aggregate(gpa, &commitment_list, msg, keygen.group_public_key, &sig_shares);
     try std.testing.expect(frost.verify(msg, sig, keygen.group_public_key));
 }
+
+// ── fuzz: verify on hostile signature bytes ─────────────────────────────
+//
+// `verify` is the module's untrusted-input entry point: a coordinator (or
+// an attacker) hands out a `Signature` claiming to cover a fixed, known
+// `(msg, group_public_key)`, and it must return `false` — never panic,
+// never read out of bounds — for any 65 bytes. `group_public_key`/`msg`
+// are pinned to the RFC 9591 Appendix E.5 vector; only the signature
+// bytes are mutated, starting from the vector's own real published
+// `final_signature` and flipping a handful of bytes, so the fuzzer lands
+// near the `Element`/`Scalar` canonical-range boundary and the group
+// equation rather than being rejected by the first parse check on nearly
+// every draw.
+fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    const group_public_key = elementFromHex(v.group.public_key);
+    const msg = hexN(4, v.group.message);
+
+    var bytes = hexN(65, v.final_signature);
+    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(bytes.len);
+        bytes[pos] = smith.value(u8);
+    }
+
+    const sig = frost.Signature.fromBytes(bytes) catch return;
+    _ = frost.verify(&msg, sig, group_public_key);
+}
+
+test "fuzz: verify never panics on corrupted signature bytes" {
+    try std.testing.fuzz({}, fuzzVerify, .{});
+}

@@ -1942,12 +1942,25 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
 
     try checkFuzzExempt(b, io, &failed);
 
-    std.log.info(
-        "check-fuzz: {d} modules obligated, {d} covered, {d} exempt, {d} FAILING ({d} harnesses total)",
-        .{ n_obligated, n_covered, n_exempt, n_failing, n_harnesses },
-    );
-
-    if (failed) return step.fail("fuzz-coverage gap — see errors above", .{});
+    // Printed only when something is wrong, and printed as a WARNING beside the
+    // errors it summarises. Two reasons, both learned on 2026-08-14 when this
+    // step was first wired into `scripts/test.sh`:
+    //
+    //   - `std.log` writes to stderr, and the driver treats a step that exits 0
+    //     while writing to stderr as a failure -- the rule that catches tools
+    //     which fail quietly. A gate chatting on success breaks it. The other
+    //     four gates say nothing when they pass, and now so does this one.
+    //   - `n_failing` counts only the missing-harness case, so on a run that
+    //     failed on a BAD EXEMPTION the line said "0 FAILING" directly under
+    //     the error that failed the build. A summary that contradicts the
+    //     verdict beside it is worse than no summary.
+    if (failed) {
+        std.log.warn(
+            "check-fuzz: {d} modules obligated, {d} covered, {d} exempt, {d} missing a harness ({d} harnesses total)",
+            .{ n_obligated, n_covered, n_exempt, n_failing, n_harnesses },
+        );
+        return step.fail("fuzz-coverage gap — see errors above", .{});
+    }
 }
 
 /// The five rules that keep a fuzz exemption from becoming the thing that
@@ -2067,12 +2080,32 @@ fn scanModuleForFuzz(b: *std.Build, io: std.Io, name: []const u8) !FuzzScan {
     return out;
 }
 
+/// Count fuzz harnesses in one file.
+///
+/// Matches `.fuzz(` preceded by an identifier character, which catches
+/// `std.testing.fuzz(`, `testing.fuzz(` and an aliased `t.fuzz(` alike. It used
+/// to require the literal `testing.fuzz(`, and that missed real harnesses: on
+/// 2026-08-14 `csvstream` and `pping` each had genuine, running harnesses on
+/// their decode entry points written through a `const t = std.testing;` alias,
+/// and the gate reported both modules as having none. It was demanding a
+/// spelling rather than a call -- the same defect class as a test that asserts
+/// the wording of a claim instead of the claim.
+///
+/// Still text, not semantics, so a differently-shaped call can still hide. The
+/// direction of that failure is the safe one: an unseen harness makes the gate
+/// demand another, never excuse a missing one.
 fn countFuzzCalls(src: []const u8) usize {
+    const needle = ".fuzz(";
     var n: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, "testing.fuzz(")) |at| {
-        n += 1;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
         i = at + 1;
+        if (at == 0) continue;
+        const before = src[at - 1];
+        // An identifier character before the dot: `testing`, `std.testing`, an
+        // alias. Anything else (whitespace, `(`, an operator) is not a call.
+        if (!std.ascii.isAlphanumeric(before) and before != '_') continue;
+        n += 1;
     }
     return n;
 }

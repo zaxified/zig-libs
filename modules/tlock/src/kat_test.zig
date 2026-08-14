@@ -409,3 +409,48 @@ test "drand interop: the fixture rejects under a mismatched round signature (FO 
     const ct = try tlock.Ciphertext.fromBytes(hexBytes(128, interop_ct_hex));
     try std.testing.expectError(error.FoCheckFailed, tlock.decrypt(round1000Signature(), ct));
 }
+
+// ── fuzz: Ciphertext.fromBytes / decrypt on hostile ciphertext bytes ────
+//
+// `decrypt` (and the `Ciphertext.fromBytes` decode step in front of it)
+// is `tlock`'s untrusted-input entry point: `root.zig`'s own doc comment
+// says it plainly — "every `round_signature`… is CALLER-SUPPLIED", and so
+// is the `Ciphertext` it decrypts. Any 128 bytes must reduce to
+// `g2.G2Error`/`DecryptError` alone — never panic, never read out of
+// bounds. `p_pub`/`round_signature` are a fixed, self-consistent
+// beacon-shaped keypair (a small canonical `Fr` scalar, matching this
+// file's own `fp12Pow` test convention above — no live network fetch
+// needed for a fuzz harness); a real ciphertext for that round is built
+// once and its bytes corrupted, so the fuzzer is biased toward the `U`
+// point's compressed-encoding boundary and the FO consistency check
+// rather than being rejected by the first flag-byte check on nearly
+// every draw.
+fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
+    var sk_bytes = [_]u8{0} ** 32;
+    sk_bytes[31] = 0x07;
+    const sk = bls12_381.Fr.fromBytes(sk_bytes) catch unreachable;
+    const p_pub = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(sk).toAffine();
+
+    const round: u64 = 12345;
+    const id = ciphersuite.beaconId(round);
+    const round_signature = g1.Jacobian.fromAffine(ciphersuite.h1(id)).scalarMul(sk).toAffine();
+
+    const message = [_]u8{0xCD} ** tlock.block_bytes;
+    const sigma = [_]u8{0x22} ** tlock.block_bytes;
+    const ct = tlock.encrypt(p_pub, round, message, sigma);
+    var bytes = ct.toBytes();
+
+    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(bytes.len);
+        bytes[pos] = smith.value(u8);
+    }
+
+    const corrupted = tlock.Ciphertext.fromBytes(bytes) catch return;
+    _ = tlock.decrypt(round_signature, corrupted) catch return;
+}
+
+test "fuzz: Ciphertext.fromBytes/decrypt never panics on corrupted ciphertext bytes" {
+    try std.testing.fuzz({}, fuzzDecrypt, .{});
+}

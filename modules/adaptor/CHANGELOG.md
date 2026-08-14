@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — Test-only: `kat_test.zig` gained a `testing.fuzz` harness on
+  `preVerify` (corrupted `PreSignature` bytes against a fixed valid pubkey/
+  message/adaptor point) — `zig build check-fuzz` no longer names this module.
+  No panic/OOB found; **neither breaking nor behavioural**.
 - **2026-07-18** — Security audit: two findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Modeled on
   `secp256kfun schnorr_fun::adaptor` (Rust, named design ref) (design reference, not a

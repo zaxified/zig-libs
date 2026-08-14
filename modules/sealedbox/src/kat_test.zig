@@ -117,3 +117,35 @@ test "TEETH CHECK: corrupting the classic box vector's expected ciphertext makes
     try std.crypto.nacl.Box.seal(c, msg, nonce, bob_pk, alice_sk);
     try testing.expect(!std.mem.eql(u8, expected_ct, c));
 }
+
+// ── fuzz: open on hostile ciphertext bytes ──────────────────────────────
+//
+// `open` is the module's untrusted-input entry point: an anonymous sender
+// hands the recipient an arbitrary byte string claiming to be a sealed
+// box, and it must return an error (`InvalidCiphertext`/
+// `AuthenticationFailed`) — never panic, never read out of bounds — for
+// any length or content. `kp` is pinned to the module's own KAT keypair
+// (`recipient_pk_hex`/`recipient_sk_hex`); the ciphertext bytes and
+// output-buffer length are both fully fuzzed (unlike the other harnesses
+// in this repo, there is no "nearly valid" bias to lean on here — the
+// AEAD tag makes every byte equally load-bearing, so pure random input
+// already reaches the interesting authentication-failure path).
+fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
+    const kp = sealedbox.KeyPair{
+        .public_key = hexDecode32(kat.recipient_pk_hex),
+        .secret_key = hexDecode32(kat.recipient_sk_hex),
+    };
+
+    var sealed_buf: [256]u8 = undefined;
+    const sealed_len = smith.valueRangeAtMost(u16, 0, sealed_buf.len);
+    smith.bytes(sealed_buf[0..sealed_len]);
+    const sealed = sealed_buf[0..sealed_len];
+
+    var out_buf: [256]u8 = undefined;
+    const out_len = if (sealed_len >= sealedbox.overhead) sealed_len - sealedbox.overhead else 0;
+    sealedbox.open(out_buf[0..out_len], sealed, kp) catch return;
+}
+
+test "fuzz: open never panics on arbitrary ciphertext bytes" {
+    try std.testing.fuzz({}, fuzzOpen, .{});
+}

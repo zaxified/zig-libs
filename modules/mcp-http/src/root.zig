@@ -1972,3 +1972,124 @@ test "oracle: tools/call \"work\" (real client bytes) reproduces the real progre
         ours.value.object.get("result").?.object.get("structuredContent").?.object.get("result").?.string,
     );
 }
+
+// ── fuzz: the pre-parse scanners never panic, OOB, or leak ─────────────────
+//
+// `isInitialize` and `correlatableResponse` are the decode entry point that
+// sees a POST body BEFORE `mcp.Server.handleMessageFrom`'s authoritative
+// parse — a single-pass `std.json.Scanner` walk over attacker-controlled
+// bytes, hand-written (not delegated to a library parse call) specifically
+// to avoid a second full tree parse. That hand-written loop is exactly the
+// kind of code this gate exists for: the doc comments on both functions
+// already argue "a malformed body surfaces its real error later", which is
+// true for VALIDITY but says nothing about whether the scan loop itself can
+// panic, run out of bounds, or leak the `.allocated_string`/`.allocated_number`
+// it frees on every branch. `handleMessageFrom` itself lives in `mcp`, whose
+// own decode surface is that module's obligation, not this one's.
+const jsonrpc_corpus = [_][]const u8{
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+    "{\"a\":{\"nested\":[1,2,{\"x\":3}]},\"b\":[1,[2,3],{}],\"c\":null,\"d\":true,\"method\":\"initialize\"}",
+    "{\"method\":\"in\\u0069tialize\"}",
+    "{\"jsonrpc\":\"2.0\",\"id\":1}",
+    "not json",
+    "[1,2,3]",
+    "{",
+    "{}",
+    "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-1,\"message\":\"x\"}}",
+    "{\"method\":\"" ++ "x" ** 100 ++ "\"}",
+};
+
+test "fuzz: isInitialize / correlatableResponse never panic, OOB or leak on arbitrary JSON-RPC-shaped bytes" {
+    try std.testing.fuzz({}, fuzzPreParseNeverLeaks, .{ .corpus = &jsonrpc_corpus });
+}
+
+fn fuzzPreParseNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [2048]u8 = undefined;
+    const body = buildJsonRpcish(smith, &buf);
+    const gpa = std.testing.allocator;
+    _ = isInitialize(gpa, body);
+    _ = correlatableResponse(gpa, body);
+}
+
+/// One draw in six is pure arbitrary bytes; the rest are a JSON object built
+/// from the field names the two scanners actually branch on (`method`,
+/// `id`, `result`, `error`, plus one filler key), with scalar/nested/long/
+/// escaped values — arbitrary bytes essentially never spell a well-formed
+/// JSON object, so without this the scan loop past `object_begin` would
+/// almost never run.
+fn buildJsonRpcish(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 5) == 0) {
+        var raw: [2048]u8 = undefined;
+        smith.bytes(&raw);
+        const len = smith.valueRangeAtMost(u16, 0, @intCast(raw.len));
+        @memcpy(buf[0..len], raw[0..len]);
+        return buf[0..len];
+    }
+    var w: std.Io.Writer = .fixed(buf);
+    writeJsonObject(smith, &w, 3);
+    return w.buffered();
+}
+
+fn writeJsonObject(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
+    w.writeByte('{') catch return;
+    const n = smith.valueRangeAtMost(u8, 0, 3);
+    var k: u8 = 0;
+    while (k < n) : (k += 1) {
+        if (k != 0) w.writeByte(',') catch return;
+        writeJsonField(smith, w, depth_left);
+    }
+    w.writeByte('}') catch {};
+}
+
+fn writeJsonArray(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
+    w.writeByte('[') catch return;
+    const n = smith.valueRangeAtMost(u8, 0, 3);
+    var k: u8 = 0;
+    while (k < n) : (k += 1) {
+        if (k != 0) w.writeByte(',') catch return;
+        writeJsonValue(smith, w, depth_left);
+    }
+    w.writeByte(']') catch {};
+}
+
+fn writeJsonField(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
+    const keys = [_][]const u8{ "method", "id", "result", "error", "jsonrpc", "params", "x" };
+    w.print("\"{s}\":", .{keys[smith.index(keys.len)]}) catch return;
+    writeJsonValue(smith, w, depth_left);
+}
+
+fn writeJsonValue(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
+    const kind: u8 = if (depth_left == 0) smith.valueRangeAtMost(u8, 0, 3) else smith.valueRangeAtMost(u8, 0, 5);
+    switch (kind) {
+        0 => w.writeAll("\"initialize\"") catch {},
+        1 => writeJsonString(smith, w),
+        2 => w.print("{d}", .{smith.value(i32)}) catch {},
+        3 => w.writeAll(switch (smith.index(3)) {
+            0 => "null",
+            1 => "true",
+            else => "false",
+        }) catch {},
+        4 => writeJsonObject(smith, w, depth_left - 1),
+        else => writeJsonArray(smith, w, depth_left - 1),
+    }
+}
+
+/// A short plain string, a long one (past `max_field_len`, forcing the
+/// `.allocated_string` path both scanners must free), or one containing a
+/// `\u` escape (same forced-allocation path via a different route).
+fn writeJsonString(smith: *std.testing.Smith, w: *std.Io.Writer) void {
+    const long = smith.value(bool);
+    const len = if (long) smith.valueRangeAtMost(u8, 60, 120) else smith.valueRangeAtMost(u8, 0, 8);
+    w.writeByte('"') catch return;
+    var j: u8 = 0;
+    while (j < len) : (j += 1) {
+        switch (smith.index(3)) {
+            0 => w.writeByte('a') catch return,
+            1 => w.writeAll("\\u0069") catch return,
+            else => w.writeByte('x') catch return,
+        }
+    }
+    w.writeByte('"') catch {};
+}

@@ -273,3 +273,78 @@ test "parseTcpTimestamps: fuzz — a genuine Timestamps option embedded in rando
         try testing.expectEqual(tsecr, ts.tsecr);
     }
 }
+
+// ── check-fuzz coverage: a real `testing.fuzz` harness ──────────────────────
+//
+// The two tests above predate `zig build check-fuzz` and already cover the
+// "never panics / never reads OOB" property with 25,000 deterministic LCG
+// trials — genuinely fuzz-STYLE, just not built on `std.testing.Smith`, so
+// the gate (which greps for `testing.fuzz(`) cannot see them and neither can
+// `--fuzz`'s coverage-guided corpus growth. This harness is the gate-visible
+// form, TLV-shaped so it spends most of its budget on well-formed-ish option
+// sequences (kind/length pairs, NOPs, END, an occasional genuine Timestamps
+// option) rather than the "rejected at the first kind byte" case pure random
+// bytes would mostly produce.
+test "fuzz: parseTcpTimestamps never panics or reads OOB, arbitrary or TLV-shaped bytes" {
+    try std.testing.fuzz({}, fuzzParseNeverPanics, .{ .corpus = &fuzz_corpus });
+}
+
+const fuzz_corpus = [_][]const u8{
+    &syn_tcp_options,
+    &synack_tcp_options,
+};
+
+fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const opts = buildTcpOptions(smith, &buf);
+    _ = parseTcpTimestamps(opts);
+}
+
+/// One draw in six is pure arbitrary bytes; the rest assemble a sequence of
+/// TLV-ish entries: END (stops the list), NOP (single byte), a genuine
+/// `kind=8 len=10` Timestamps option with random TSval/TSecr, or an opaque
+/// option with an arbitrary (possibly malformed — too short, overrunning the
+/// buffer) length byte.
+fn buildTcpOptions(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 5) == 0) {
+        smith.bytes(buf);
+        const len = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+        return buf[0..len];
+    }
+    var pos: usize = 0;
+    const n_entries = smith.valueRangeAtMost(u8, 0, 8);
+    var i: u8 = 0;
+    while (i < n_entries and pos < buf.len) : (i += 1) {
+        switch (smith.valueRangeAtMost(u8, 0, 4)) {
+            0 => {
+                buf[pos] = 0; // End of Option List
+                pos += 1;
+                break;
+            },
+            1 => {
+                buf[pos] = 1; // NOP
+                pos += 1;
+            },
+            2 => {
+                if (pos + 10 > buf.len) break;
+                buf[pos] = 8;
+                buf[pos + 1] = 10;
+                smith.bytes(buf[pos + 2 .. pos + 10]);
+                pos += 10;
+            },
+            else => {
+                if (pos + 1 >= buf.len) break;
+                buf[pos] = smith.value(u8); // kind
+                const len = smith.value(u8); // possibly malformed length
+                buf[pos + 1] = len;
+                pos += 2;
+                const value_len = @min(@as(usize, if (len >= 2) len - 2 else 0), buf.len - pos);
+                if (value_len > 0) {
+                    smith.bytes(buf[pos..][0..value_len]);
+                    pos += value_len;
+                }
+            },
+        }
+    }
+    return buf[0..pos];
+}

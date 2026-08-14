@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-14** — `zig build check-fuzz` coverage: a `testing.fuzz` harness on
+  `TraceParent.parse` (the `traceparent`-header decode entry point), generating both
+  arbitrary bytes and traceparent-shaped input with each field's length, hex-ness and
+  delimiter independently perturbed, plus a small corpus of the known edge cases
+  (all-zero trace-id/parent-id, reserved version `ff`, future-version extension).
+  Allocation-free, so this is a never-panics harness, not a leak oracle. No panic, hang
+  or leak found.
 - **2026-07-19** — Security audit: two findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Modeled on
   OpenTelemetry propagators (Go `go.opentelemetry.io/otel/propagation`), W3C Trace

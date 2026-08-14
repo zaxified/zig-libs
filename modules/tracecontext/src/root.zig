@@ -794,3 +794,88 @@ test {
     _ = @import("w3c_vectors.zig");
     _ = @import("w3c_conformance_test.zig");
 }
+
+// ── fuzz: TraceParent.parse never panics on arbitrary or shaped bytes ──────
+//
+// `TraceParent.parse` is the decode entry point for a `traceparent` header —
+// attacker-controlled bytes off the wire. It is allocation-free (the result
+// is a fixed-size value), so there is no leak oracle to run here; the
+// property under test is "never panics or reads out of bounds" across pure
+// garbage, plus input shaped like `version-traceid-parentid-flags` with each
+// field's length, hex-ness and delimiter independently perturbed — arbitrary
+// bytes essentially never land on `header_len` (55) with dashes in the right
+// three places, so without shaping this harness would only ever exercise the
+// very first length check.
+const traceparent_corpus = [_][]const u8{
+    sample,
+    "00-00000000000000000000000000000000-00f067aa0ba902b7-01", // all-zero trace-id
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01", // all-zero parent-id
+    "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", // reserved version
+    "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-somethingnew", // future ext
+};
+
+test "fuzz: TraceParent.parse never panics, arbitrary or traceparent-shaped bytes" {
+    try std.testing.fuzz({}, fuzzParseNeverPanics, .{ .corpus = &traceparent_corpus });
+}
+
+fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const input = buildTraceparent(smith, &buf);
+    _ = TraceParent.parse(input) catch return;
+}
+
+/// One draw in eight is pure arbitrary bytes; the rest assemble
+/// `version-traceid-parentid-flags` field by field, each field independently
+/// its nominal length / off by one, and each delimiter usually `-` but
+/// sometimes not.
+fn buildTraceparent(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 7) == 0) {
+        var raw: [128]u8 = undefined;
+        smith.bytes(&raw);
+        const len = smith.valueRangeAtMost(u8, 0, @intCast(raw.len));
+        @memcpy(buf[0..len], raw[0..len]);
+        return buf[0..len];
+    }
+    var w: std.Io.Writer = .fixed(buf);
+    writeField(smith, &w, 2); // version
+    writeDelim(smith, &w);
+    writeField(smith, &w, 32); // trace-id
+    writeDelim(smith, &w);
+    writeField(smith, &w, 16); // parent-id
+    writeDelim(smith, &w);
+    writeField(smith, &w, 2); // flags
+    // Occasionally a trailing extension, as a future version may carry.
+    if (smith.value(bool)) {
+        w.writeByte('-') catch return w.buffered();
+        writeField(smith, &w, smith.valueRangeAtMost(u8, 0, 12));
+    }
+    return w.buffered();
+}
+
+fn writeDelim(smith: *std.testing.Smith, w: *std.Io.Writer) void {
+    const c: u8 = if (smith.valueRangeAtMost(u8, 0, 9) == 0) '_' else '-';
+    w.writeByte(c) catch {};
+}
+
+fn writeField(smith: *std.testing.Smith, w: *std.Io.Writer, nominal_len: u8) void {
+    const delta: i16 = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+        0 => -1,
+        1 => 1,
+        else => 0,
+    };
+    const len: u8 = @intCast(std.math.clamp(@as(i16, nominal_len) + delta, 0, 48));
+    var i: u8 = 0;
+    while (i < len) : (i += 1) {
+        w.writeByte(fieldByte(smith)) catch return;
+    }
+}
+
+/// Mostly a valid lowercase hex digit; sometimes uppercase hex (invalid per
+/// spec — lowercase is mandated) or a fully arbitrary byte.
+fn fieldByte(smith: *std.testing.Smith) u8 {
+    return switch (smith.valueRangeAtMost(u8, 0, 9)) {
+        0...6 => hex_digits[smith.index(hex_digits.len)],
+        7 => std.ascii.toUpper(hex_digits[smith.index(hex_digits.len)]),
+        else => smith.value(u8),
+    };
+}

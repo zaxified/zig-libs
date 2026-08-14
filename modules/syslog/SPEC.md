@@ -102,6 +102,24 @@ only is provided today). (README "Not implemented (DEFER)".)
 `gap · any · both (codec+client) · reentrant` + deps: none (std only) — canonical source is
 `pub const meta` in src/root.zig.
 
+## Fuzz exemption
+
+**Fuzz exemption:** EMIT-ONLY
+
+This module formats and sends syslog messages; it never parses one — the
+module doc, the `Threat model / out of scope` section above, and `meta.role
+= .client` all already say so ("no receiver — there is no parser and no
+listener in its public surface"). Its one byte-accepting public function
+(`writeOctetCounted(w, payload: []const u8)`, the RFC 6587 `"<len> <msg>"`
+TCP framer) never interprets structure in `payload` — it length-prefixes
+whatever bytes it is handed, and every call site in this module's own tests
+and the README example passes it *this module's own* `bufPrint`/`format`
+output, not bytes read off a socket or out of a file. `buildDatagram` and
+`bufPrint` take a caller-built `Message`/output buffer, not raw wire bytes,
+so they do not even match the gate's byte-accepting-parameter scan. Overturn
+this exemption the moment a `syslog` message PARSER (the "Backlog / deferred"
+item above) lands.
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle MIXED

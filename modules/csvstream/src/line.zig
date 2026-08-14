@@ -450,7 +450,13 @@ test "stripBom composes with LineIterator: BOM-prefixed buffer yields a clean fi
 // out of bounds, only yield records/fields or drop silently.
 
 test "fuzz: LineIterator never panics or loops on arbitrary bytes" {
-    try t.fuzz({}, fuzzLineIterator, .{});
+    // `std.testing.fuzz`, spelled out rather than through this file's `t`
+    // alias: `zig build check-fuzz` greps the SOURCE TEXT for the literal
+    // substring "testing.fuzz(" to find harnesses, so `t.fuzz(` — this
+    // harness's original form — was structurally invisible to the gate
+    // despite genuinely running, which is why this module was flagged as
+    // uncovered even though it already had two working harnesses.
+    try std.testing.fuzz({}, fuzzLineIterator, .{});
 }
 
 fn fuzzLineIterator(_: void, smith: *std.testing.Smith) !void {
@@ -470,7 +476,9 @@ fn fuzzLineIterator(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: splitFields never panics on arbitrary bytes" {
-    try t.fuzz({}, fuzzSplitFields, .{});
+    // See the sibling harness above for why this is spelled out rather than
+    // through the `t` alias.
+    try std.testing.fuzz({}, fuzzSplitFields, .{});
 }
 
 fn fuzzSplitFields(_: void, smith: *std.testing.Smith) !void {

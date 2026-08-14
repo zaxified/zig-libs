@@ -379,3 +379,39 @@ test {
     _ = @import("normative_vectors.zig");
     _ = @import("normative_test.zig");
 }
+
+// ── fuzz: decode/encode never panic, OOB or leak on arbitrary bytes ────────
+//
+// `decodeToUtf8` is the module's decode entry point — legacy code-page bytes
+// off the read edge (a broker/Excel export saved in an unknown encoding).
+// It is data-lenient by design (never errors on malformed input, an
+// unmappable codepoint is emitted verbatim), so unlike a rejecting parser
+// there is no structure to bias toward: every byte value takes the same
+// bounded per-byte path (ASCII passthrough, table lookup, or the
+// `utf8Encode` fallback), so plain arbitrary bytes already reach all of it.
+// `encodeFromUtf8` (the write edge) is fuzzed alongside it — the more
+// branchy of the two (invalid leading byte / truncated trailing sequence /
+// malformed continuation, each with its own audit-found edge case above) —
+// over the SAME bytes, since malformed UTF-8 is exactly what a lenient
+// encoder must also tolerate. Both allocate, so this runs under
+// `std.testing.allocator` with the result freed on every path — a leak here
+// is a real finding, not a lenient no-op.
+test "fuzz: decodeToUtf8 / encodeFromUtf8 never panic, OOB or leak on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzCodecNeverLeaks, .{});
+}
+
+fn fuzzCodecNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    const input = buf[0..len];
+
+    const encs = [_]Encoding{ .utf8, .windows_1250, .windows_1252, .iso_8859_1, .iso_8859_2, .iso_8859_15 };
+    const enc = encs[smith.index(encs.len)];
+
+    const a = std.testing.allocator;
+    const decoded = try decodeToUtf8(a, input, enc);
+    defer a.free(decoded);
+    const encoded = try encodeFromUtf8(a, input, enc);
+    defer a.free(encoded);
+}
