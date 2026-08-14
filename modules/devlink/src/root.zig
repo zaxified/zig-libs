@@ -320,7 +320,14 @@ test "live: PARAM_GET / REGION_GET / HEALTH_REPORTER_GET dumps" {
 
     if (params.len == 0 and regions.len == 0 and reporters.len == 0)
         return skip("no devlink parameters, regions or health reporters on this machine");
-    std.debug.print(
+    // Behind `verboseSkip()` like the inventory line at the top of this file.
+    // An informational print on a PASSING test is not free: the gate driver
+    // treats any stderr from a step that exited 0 as a failure, so this line
+    // turned a green CI lane red on a runner that happens to have a devlink
+    // instance. This host has none, so the path never ran here — which is why
+    // it took CI to find it and why it cannot be reproduced by dropping
+    // `unshare` locally.
+    if (verboseSkip()) std.debug.print(
         "  ({d} param(s), {d} region(s), {d} reporter(s))\n",
         .{ params.len, regions.len, reporters.len },
     );
@@ -341,7 +348,7 @@ test "live: INFO_GET and RESOURCE_DUMP on a real instance" {
         for (i.versions) |*v| try testing.expect(v.name_len > 0);
     } else |e| switch (e) {
         error.NotSupported, error.NoSuchDevice, error.AccessDenied => {
-            std.debug.print("  (INFO_GET refused: {s})\n", .{@errorName(e)});
+            if (verboseSkip()) std.debug.print("  (INFO_GET refused: {s})\n", .{@errorName(e)});
         },
         else => return e,
     }
@@ -359,7 +366,7 @@ test "live: INFO_GET and RESOURCE_DUMP on a real instance" {
         }
     } else |e| switch (e) {
         error.NotSupported, error.NoSuchDevice, error.AccessDenied => {
-            std.debug.print("  (RESOURCE_DUMP refused: {s})\n", .{@errorName(e)});
+            if (verboseSkip()) std.debug.print("  (RESOURCE_DUMP refused: {s})\n", .{@errorName(e)});
         },
         else => return e,
     }
