@@ -3259,11 +3259,21 @@ test "integration (netns): link/address/route/neighbor write→read round-trip" 
         // Child. Exits without unwinding, so it never touches the parent's
         // test state or allocator.
         var code: u8 = netns_skip;
+        // A namespace this process was ALLOWED TO CREATE but has no
+        // capability inside is still "no privilege here", not a defect. CI
+        // found this: a GitHub runner lets `enterNetns` succeed and then
+        // denies `linkAdd(dummy)` and `bridgeAdd` with EPERM, so both tests
+        // failed the build for lack of privilege — the one thing the comment
+        // above `netns_skip` promises they never do. Clone-time refusal was
+        // mapped to a skip; refusal one call later was not.
         if (enterNetns()) {
             if (netnsRoundTrip()) |_| {
                 code = 0;
-            } else |_| {
-                code = netns_fail;
+            } else |err| {
+                code = switch (err) {
+                    error.AccessDenied => netns_skip,
+                    else => netns_fail,
+                };
             }
         }
         linux.exit_group(code);
@@ -3523,8 +3533,13 @@ test "integration (netns): bridge/FDB/VLAN/brport write→read round-trip" {
             // and the reason string live on.
             if (netnsBridgeRoundTrip()) |ok| {
                 code = if (ok) 0 else netns_skip;
-            } else |_| {
-                code = netns_fail;
+            } else |err| {
+                // Same as the round-trip test above: a namespace we were let
+                // into but hold no capability in is "no privilege here".
+                code = switch (err) {
+                    error.AccessDenied => netns_skip,
+                    else => netns_fail,
+                };
             }
         }
         linux.exit_group(code);
