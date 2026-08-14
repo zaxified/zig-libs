@@ -19,6 +19,33 @@ authors' other projects depend on it, not the reverse.
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
 
+> ### ⚠ Written by an AI agent. Read this before a sensitive deployment.
+>
+> Every module here was implemented by an LLM agent working under human direction, then
+> reviewed, tested and audited the same way. That is worth knowing because the failure
+> mode differs from human code: it is fluent, it is consistent, and it is confident in
+> exactly the places it is wrong. Several defects found here had passed a green suite for
+> weeks — a guard compiled out in `ReleaseFast`, a test asserting the shape of the bug it
+> was meant to catch, a public entry point no non-test consumer could compile.
+>
+> **What has been done about it**, so you can judge rather than take a word for it:
+> tests run in three release modes; mutation audits across the collection ask whether each
+> test would actually go red; constant-time claims are machine-checked where a row in
+> `scripts/ctgrind-expected.tsv` says so; `zig build check-fuzz` requires a fuzz harness on
+> every module that parses foreign bytes; and each module's `SPEC.md` carries an
+> **anchor grade** saying where its expected values come from — `EXTERNAL` (published
+> vectors, bytes captured from a foreign implementation, or a live foreign peer) down to
+> `SELF` (we wrote them from our own reading of the spec).
+>
+> **What that still cannot tell you.** A green gate means nothing contradicted the code, not
+> that the code is right; a grade of `EXTERNAL` on one path says nothing about the others,
+> which is what `MIXED` is for. **Nothing here has been through third-party review or a
+> security audit.** If you are putting a module in front of untrusted input or in anything
+> safety- or money-critical, read that module's `SPEC.md` first — start with its anchor
+> grade, its constant-time section and its "deliberately not done" list — and review the
+> code yourself. The documentation is written to make that possible, including where it
+> says the evidence is weak.
+
 ## Using a module
 
 - **Local path (dev, no tags/push):** in the consumer's `build.zig.zon`,
