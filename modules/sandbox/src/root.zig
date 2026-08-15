@@ -1106,10 +1106,34 @@ fn tsyncWorker(ready: *std.atomic.Value(bool), release: *std.atomic.Value(bool))
     linux.exit(1);
 }
 
+/// `SIGALRM` after `seconds`, whatever the process is doing.
+///
+/// ⚠ NOT `alarm(2)`. That syscall exists only in the x86 tables; the "generic"
+/// syscall ABI every other architecture uses (arm64 included) has no
+/// `SYS_alarm` at all, so `linux.syscall1(.alarm, …)` is not a portability
+/// wart — it fails to COMPILE on arm64 with "enum 'Arm64' has no member named
+/// 'alarm'". Caught by the arm64 lane on 2026-08-15, the first run of this
+/// module on anything but x86_64. `setitimer(ITIMER_REAL, …)` is the portable
+/// spelling and is what glibc's `alarm()` itself calls there.
+///
+/// ⚠ The syscall is issued directly rather than through `linux.setitimer`,
+/// which declares `*const itimerspec` — NANOseconds. The kernel reads
+/// `struct itimerval` — MICROseconds. Both are two pairs of longs, so they
+/// agree byte for byte only while the sub-second field is zero; through that
+/// declaration any future sub-second value would silently mean 1000× less.
+fn armWatchdog(seconds: isize) void {
+    const itimerval = extern struct { interval: linux.timeval, value: linux.timeval };
+    var it: itimerval = .{
+        .interval = .{ .sec = 0, .usec = 0 },
+        .value = .{ .sec = seconds, .usec = 0 },
+    };
+    _ = linux.syscall3(.setitimer, @intCast(@intFromEnum(linux.ITIMER.REAL)), @intFromPtr(&it), 0);
+}
+
 fn childTsyncPropagation() void {
     // Watchdog: if the join/propagation logic below ever wedges, self-
     // terminate rather than hang the test runner's waitpid forever.
-    _ = linux.syscall1(.alarm, 5);
+    armWatchdog(5);
 
     var ready = std.atomic.Value(bool).init(false);
     var release = std.atomic.Value(bool).init(false);

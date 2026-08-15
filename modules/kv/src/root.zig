@@ -1853,7 +1853,31 @@ test "lock: real filesystem, two open descriptions on one store contend" {
 
 /// Seconds after which a child self-terminates with `SIGALRM` no matter what
 /// it is doing. The upper bound on how long any of this can take.
-const child_watchdog_s: usize = 10;
+const child_watchdog_s: isize = 10;
+
+/// Arm the watchdog above.
+///
+/// ⚠ NOT `alarm(2)`. That syscall exists only in the x86 tables; the "generic"
+/// syscall ABI every other architecture uses (arm64 included) has no
+/// `SYS_alarm` at all, so `linux.syscall1(.alarm, …)` is not a portability
+/// wart — it fails to COMPILE on arm64 with "enum 'Arm64' has no member named
+/// 'alarm'". Caught by the arm64 lane on 2026-08-15, the first run of this
+/// module on anything but x86_64. `setitimer(ITIMER_REAL, …)` is the portable
+/// spelling and is what glibc's `alarm()` itself calls there.
+///
+/// ⚠ The syscall is issued directly rather than through `linux.setitimer`,
+/// which declares `*const itimerspec` — NANOseconds. The kernel reads
+/// `struct itimerval` — MICROseconds. Both are two pairs of longs, so they
+/// agree byte for byte only while the sub-second field is zero; through that
+/// declaration any future sub-second value would silently mean 1000× less.
+fn armWatchdog(seconds: isize) void {
+    const itimerval = extern struct { interval: linux.timeval, value: linux.timeval };
+    var it: itimerval = .{
+        .interval = .{ .sec = 0, .usec = 0 },
+        .value = .{ .sec = seconds, .usec = 0 },
+    };
+    _ = linux.syscall3(.setitimer, @intCast(@intFromEnum(linux.ITIMER.REAL)), @intFromPtr(&it), 0);
+}
 
 /// Child exit codes (0 = the expected outcome).
 const child_no_lock: i32 = 71; // opened a store it should have been refused
@@ -1905,7 +1929,7 @@ test "lock: a REAL second process is refused by the holder's flock" {
         // CHILD: a separate process with its own fd table. It never returns
         // into the test runner — `exit_group` only — so the parent's
         // allocator, io and test state are never touched.
-        _ = linux.syscall1(.alarm, child_watchdog_s);
+        armWatchdog(child_watchdog_s);
         var child_fs = FsStorage.init(testing.io, tmp.dir);
         if (Db.open(std.heap.page_allocator, child_fs.storage(), "shared.kv", .{})) |_| {
             linux.exit_group(child_no_lock);
@@ -1940,7 +1964,7 @@ test "lock: the lock dies with the holding process (SIGKILL, zero cleanup)" {
     const pid: i32 = @intCast(@as(isize, @bitCast(forked)));
     if (pid == 0) {
         _ = linux.close(fds[0]);
-        _ = linux.syscall1(.alarm, child_watchdog_s);
+        armWatchdog(child_watchdog_s);
         var child_fs = FsStorage.init(testing.io, tmp.dir);
         var cdb = Db.open(std.heap.page_allocator, child_fs.storage(), "shared.kv", .{}) catch
             linux.exit_group(child_open_failed);
