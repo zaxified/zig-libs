@@ -41,6 +41,28 @@ echo 'kernel.apparmor_restrict_unprivileged_userns=0' \
     | sudo tee /etc/sysctl.d/60-zig-libs-userns.conf >/dev/null || true
 sudo sysctl --system >/dev/null 2>&1 || true
 unshare -rn true && echo "userns: OK" || echo "userns: still unavailable"
+
+# Unprivileged ICMP sockets. The kernel default is the EMPTY range `1 0`, which
+# is why icmp's three live tests — the ones that put a real echo request on the
+# wire rather than encode one — skipped on every runner since CI existed.
+echo 'net.ipv4.ping_group_range=0 2147483647' \
+    | sudo tee /etc/sysctl.d/61-zig-libs-ping.conf >/dev/null || true
+sudo sysctl --system >/dev/null 2>&1 || true
+echo "ping_group_range: $(cat /proc/sys/net/ipv4/ping_group_range 2>/dev/null || echo unknown)"
+echo "::endgroup::"
+
+echo "::group::yaml conformance suite"
+# yaml/yaml-test-suite is the LANGUAGE's own conformance corpus, written by
+# people who did not write our parser. Without it the whole suite collapses into
+# a single skipped test and the module is checked only against itself.
+#
+# ⚠ A network fetch at gate time, which nothing else here is. It is bounded
+# (--depth 1, one branch) and failure is a reported gap rather than a red lane,
+# but if this ever becomes flaky the honest fix is to cache the checkout, not to
+# retry it.
+git clone -q -b data --depth 1 https://github.com/yaml/yaml-test-suite \
+    "$HOME/.cache/zig-libs-yaml/yaml-test-suite-data" 2>/dev/null \
+    && echo "yaml-test-suite: OK" || echo "yaml-test-suite: clone failed or already present"
 echo "::endgroup::"
 
 echo "::group::apt"

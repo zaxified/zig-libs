@@ -717,6 +717,33 @@ capability_check() {
             || gaps+=("python lacks $pkg|up to $cost skip|$fix")
     done
 
+    # ⭐ TWO MORE, FOUND BY READING THE UNCAPPED SKIP LIST. The digest's tail —
+    # the part the terminal used to truncate — showed the runner skipping 114
+    # tests in 43 modules against this host's 110 in 41, and the difference was
+    # exactly `icmp 3` and `yaml 1`. Both had been skipping on every runner
+    # since CI existed, under a report that said "1 gap".
+    #
+    # icmp: unprivileged ICMP sockets need a `net.ipv4.ping_group_range` that
+    # contains one of our groups. The kernel default is the EMPTY range `1 0`
+    # (start > end), so the tests get PermissionDenied and skip. Reading the
+    # sysctl says so without needing to open a socket.
+    if [[ -r /proc/sys/net/ipv4/ping_group_range ]]; then
+        local pgr_lo pgr_hi
+        read -r pgr_lo pgr_hi < /proc/sys/net/ipv4/ping_group_range
+        if [[ -n "$pgr_hi" ]] && (( pgr_lo > pgr_hi )); then
+            gaps+=("no unprivileged ICMP sockets (ping_group_range is $pgr_lo $pgr_hi, an empty range)|3 icmp live tests skip — the ones that send a real echo request rather than encode one|echo 'net.ipv4.ping_group_range=0 2147483647' | sudo tee /etc/sysctl.d/61-zig-libs-ping.conf >/dev/null && sudo sysctl --system >/dev/null")
+        fi
+    fi
+
+    # yaml: the module is checked against yaml/yaml-test-suite, the LANGUAGE's
+    # own conformance corpus — an oracle written by people who did not write
+    # this parser, which makes it the most valuable single test the module has
+    # and the easiest to lose, since the whole suite collapses to one skip.
+    local yaml_suite="${ZIG_LIBS_YAML_SUITE:-$HOME/.cache/zig-libs-yaml/yaml-test-suite-data}"
+    if [[ ! -d "$yaml_suite" ]]; then
+        gaps+=("no yaml-test-suite checkout|the entire yaml conformance suite collapses into 1 skipped test — the module is then checked only against itself|git clone -b data --depth 1 https://github.com/yaml/yaml-test-suite ~/.cache/zig-libs-yaml/yaml-test-suite-data")
+    fi
+
     # Always present: RTM_NEWACTION checks CAP_NET_ADMIN in the INITIAL user
     # namespace, so `unshare -rn` cannot grant it however userns is configured.
     #
