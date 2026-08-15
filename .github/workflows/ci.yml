@@ -106,21 +106,33 @@ on:
 #
 # They run as separate jobs so the slow one does not gate the fast one.
 #
-# ⚠ ONLY THE PR LANE IS CACHED, and the arithmetic is why. GitHub allows 10 GB
-# of Actions cache PER REPOSITORY and evicts least-recently-used entries above
-# it. This repo's own `.zig-cache` runs to tens of GiB, so a lane cannot hold a
-# useful fraction of it and five lanes cannot hold one each: at the 8 GiB limit
-# this file used to request for every job, the five together asked for four
-# times the entire quota. They would have evicted each other on every run and
-# all five would have been cold — the same outcome as the shared-`cache-key`
-# bug this file already records fixing, reached by a different route.
+# ⚠ EVERY LANE IS CACHED, and each one measures itself. GitHub allows 10 GB of
+# Actions cache PER REPOSITORY and evicts least-recently-used entries above it,
+# so whether five lanes fit is an arithmetic question — and until 2026-08-15 it
+# was answered with the wrong number.
 #
-# So the cache goes where a cold build actually costs someone waiting: the PR
-# lane, which runs on every push to a branch and normally builds a closure of
-# one module. The `full` lanes run on merges to main and on tags, are already
-# parallel, and nobody is watching them. A cold full lane costs wall-clock that
-# is not on anyone's critical path; a thrashing cache costs the same wall-clock
-# AND the pretence of being warm.
+# The retired argument ran: this repo's own `.zig-cache` is tens of GiB, so a
+# lane cannot hold a useful fraction and five cannot hold one each. That
+# compared a DEVELOPMENT tree against a CI job, and they are not the same
+# object. The local one accumulates every optimize mode across every run ever
+# made; a lane builds ONE mode, ONCE, into a fresh checkout. The real per-lane
+# figure was never measured, and a cache was ruled out on an estimate that
+# described something else.
+#
+# So the lanes cache, and each prints the size of the tree it is about to save
+# (see "Report the cache footprint"). Two runs settle it: if the five together
+# fit under the quota, this stays; if they evict each other, the logs will say
+# so in bytes rather than in argument. A thrashing cache is worse than none —
+# it costs the same wall-clock AND the pretence of being warm — so the decision
+# needs a number, which is the one thing it has never had.
+#
+# The keys are per-lane by construction (`cachekey` in the matrix). Matrix jobs
+# sharing one key clobber each other on every run; this file already records
+# fixing that once, and five caching jobs is precisely when it recurs.
+#
+# ⚠ A red lane saves NOTHING — `actions/cache` skips its post step when the job
+# fails — so the first green run is when any of this starts working, and a
+# permanently red lane stays permanently cold.
 #
 # ⚠ AND THE PR LANE NO LONGER USES setup-zig's CACHE EITHER — it manages
 # `.zig-cache` itself through `actions/cache`. Not a preference: bxp measured
@@ -199,10 +211,12 @@ jobs:
           - name: ReleaseSafe
             args: "-Doptimize=ReleaseSafe"
             cmd: all
+            cachekey: relsafe
             runner: ubuntu-26.04
           - name: ReleaseFast
             args: "-Doptimize=ReleaseFast"
             cmd: all
+            cachekey: relfast
             runner: ubuntu-26.04
           # ⚠ `build`, NOT `all` — this lane COMPILES every module in real Debug
           # and runs no test, and that is the whole claim it can support. Nobody
@@ -223,6 +237,7 @@ jobs:
           - name: strict Debug (compile only)
             args: "-Dstrict-debug"
             cmd: build
+            cachekey: strictdebug
             runner: ubuntu-26.04
           # ONE arm64 lane, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions, atomics,
@@ -235,6 +250,7 @@ jobs:
           - name: ReleaseSafe arm64
             args: "-Doptimize=ReleaseSafe"
             cmd: all
+            cachekey: relsafe-arm64
             runner: ubuntu-26.04-arm
     name: full — ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -243,10 +259,22 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          # Deliberately uncached — see the note above. Four lanes cannot each
-          # hold a useful slice of a 10 GB quota, and a cache that is evicted
-          # before it is reused is worse than none: it reads as warm.
+          # setup-zig's own build cache stays off here for the same reason as
+          # in the scoped job: bxp measured it dropping the compiled `o/`
+          # outputs. The toolchain download is still cached by it.
           use-cache: false
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          # ⚠ `matrix.cachekey` is load-bearing. Each lane compiles EVERY module
+          # in ONE optimize mode, so the four trees share nothing; on a single
+          # key they would overwrite each other every run and every lane would
+          # restore someone else's mode. This file already records that bug
+          # once, under setup-zig's `cache-key`.
+          key: zig-full-${{ matrix.cachekey }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-full-${{ matrix.cachekey }}-
       # scripts/test.sh all runs the format check, the hook self-test, the
       # catalog/provenance gates and every module, and wraps the
       # netlink-writing modules in `unshare -rn` where the runner allows it —
@@ -323,3 +351,17 @@ jobs:
           # and reports the gap.
           export OPCUA_PYTHON="$HOME/.cache/zig-libs-opcua/bin/python3"
           bash scripts/test.sh ${{ matrix.cmd }} ${{ matrix.args }}
+      - name: Report the cache footprint
+        # The number the cache decision has never had. Whether five lanes fit
+        # under a 10 GB repository quota is arithmetic, and until this line
+        # existed the only figure anyone had was the DEVELOPMENT tree's — which
+        # accumulates every optimize mode across every run ever made and so
+        # describes a different object entirely.
+        #
+        # `if: always()` because a RED lane's footprint is worth just as much:
+        # actions/cache will not save it, and knowing the size anyway is how a
+        # permanently cold lane gets explained rather than guessed at.
+        if: always()
+        run: |
+          du -sh "$GITHUB_WORKSPACE/.zig-cache" 2>/dev/null || echo "no .zig-cache"
+          du -sh "$GITHUB_WORKSPACE/.zig-cache/o" 2>/dev/null || true
