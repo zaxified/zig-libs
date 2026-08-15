@@ -408,32 +408,50 @@ summary_digest() {
             if (t ~ /^[0-9.]+m$/)               { sub(/m$/, "", t); return t * 60000 }
             return 0
         }
+        # ⚠⚠ PRINT ZIG-S OWN TOKEN, NEVER A RE-RENDERING OF IT. `ms()` exists to
+        # RANK, and nothing more. Zig reports anything past a minute coarsely:
+        # a module that ran 177 s prints as `2m`, which this parsed to 120000 ms
+        # and then re-rendered as "120s" — a number that looks measured, is 32 %
+        # low, and is IDENTICAL for every run between 2m and 3m.
+        #
+        # That cost real work on 2026-08-15. Four lanes across three optimize
+        # modes and two architectures all reported `opcua 120s`, and a figure
+        # that stable across such different machines reads as a fixed wait
+        # rather than as computation — which is exactly how it was read, against
+        # a `deadline_ms = 120_000` that turned out to have nothing to do with
+        # it. `threshold_ecdsa 60s` and `k256/p256 180s` were the same illusion:
+        # `1m` and `3m`.
+        #
+        # So the display keeps the source token. `opcua 2m` is less precise and
+        # cannot mislead; the ordering stays exact because it still sorts on the
+        # parsed value. If a real duration is wanted, time the module — Zig will
+        # not give a finer one here.
         function human(v) { return (v >= 1000) ? sprintf("%.0fs", v / 1000) : sprintf("%dms", v) }
         /^Build Summary:/ { totals = totals (totals ? "; " : "") substr($0, 16) }
         # "+- run test <name> <n> pass[, <n> skip][, <n> fail] (<n> total) <time> MaxRSS:.."
         /\+- run test / {
             name = $4
-            for (i = 1; i <= NF; i++) if ($i ~ /^MaxRSS:/) { t = ms($(i - 1)); break }
-            if (t > run[name]) run[name] = t
+            for (i = 1; i <= NF; i++) if ($i ~ /^MaxRSS:/) { t = ms($(i - 1)); raw = $(i - 1); break }
+            if (t > run[name]) { run[name] = t; runtxt[name] = raw }
             for (i = 1; i <= NF; i++) if ($i ~ /^skip/) skipped[name] += $(i - 1) + 0
         }
-        /\+- compile test / { name = $4; for (i = 1; i <= NF; i++) if ($i ~ /^MaxRSS:/) { t = ms($(i - 1)); break }
-                              if (t > comp[name]) comp[name] = t }
-        function top(arr, label,   k, best, bn, n, out, i) {
+        /\+- compile test / { name = $4; for (i = 1; i <= NF; i++) if ($i ~ /^MaxRSS:/) { t = ms($(i - 1)); raw = $(i - 1); break }
+                              if (t > comp[name]) { comp[name] = t; comptxt[name] = raw } }
+        function top(arr, txt, label,   k, best, bn, n, out, i) {
             out = ""
             for (n = 0; n < 8; n++) {
                 best = -1; bn = ""
                 for (k in arr) if (arr[k] > best) { best = arr[k]; bn = k }
                 if (bn == "" || best <= 0) break
-                out = out (out ? " · " : "") bn " " human(best)
+                out = out (out ? " · " : "") bn " " (bn in txt ? txt[bn] : human(best))
                 delete arr[bn]
             }
             if (out != "") printf("  %-16s %s\n", label, out)
         }
         END {
             if (totals != "") printf("  %-16s %s\n", "totals:", totals)
-            top(run, "slowest run:")
-            top(comp, "slowest compile:")
+            top(run, runtxt, "slowest run:")
+            top(comp, comptxt, "slowest compile:")
             # The COUNT is the finding; the worst dozen names are enough to
             # act on. Forty-one modules on one line wraps into unreadability,
             # which is how a number stops being read at all.
