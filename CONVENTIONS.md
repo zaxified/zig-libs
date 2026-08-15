@@ -389,6 +389,16 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   per-module changelog below does not supplement a collection version — it replaces it.
   Same-day re-tags get `.1`, `.2`, … so names stay sortable and never collide. `v0.1.0`
   remains as history; nothing after it is a semantic version.
+- **A tag is not a GitHub Release, and that is deliberate.** They are separate objects: a
+  tag is git, a Release is a GitHub record someone creates explicitly. Nothing here creates
+  one — `tag.sh` pushes a tag, and CI holds `contents: read` precisely so the gate cannot
+  publish anything. So `v0.1.0` has a Release and no dated tag does, which looks like an
+  omission and is not: **Releases are cut BY HAND over selected tags** (owner's decision,
+  2026-08-15). A dated tag says "every module passed every lane at this commit" and is cut
+  whenever that becomes true, several times a day when the day goes badly; a Release is an
+  announcement, and announcing every green matrix would make the announcement worthless.
+  Automating it would also mean handing the gate `contents: write`, which trades the whole
+  point of least privilege for a convenience nobody asked for.
 - **CHANGELOG per module.** **Every module in `module_list` has a
   `modules/<name>/CHANGELOG.md`** — not only the ones with a code change to record. A module
   whose only history is being created still gets its dated `New module:` entry, so per-module
