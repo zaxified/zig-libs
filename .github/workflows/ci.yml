@@ -13,6 +13,28 @@ on:
 # raw-syscall Linux members and are compiled by `zig build test`; socket/netns
 # tests SkipZigTest cleanly on a constrained runner.
 #
+# ⭐ UBUNTU 26.04, PINNED, NOT `ubuntu-latest`. Two reasons, and the second is
+# the one that cost real time.
+#
+# Pinned because `ubuntu-latest` moves under us: the image is the OTHER half of
+# every live-interop test in this repository, and a gate whose oracle changes
+# without a commit cannot say whether a red lane is our code or the runner's
+# week. Bump this line deliberately, the way a dependency is bumped.
+#
+# 26.04 rather than 24.04 because of what 24.04 shipped. Its `openssh-client` is
+# 9.6p1 and `mlkem768x25519-sha256` arrived in OpenSSH 9.9, so both of ssh's
+# live post-quantum KEX tests could never run there — one skipped, and the other
+# spawned a client that refused the algorithm, exited before connecting, and
+# left our `accept` blocked until GitHub killed the job at its six-hour limit.
+# That single test is what made the 2026-08-14 and 2026-08-15 matrices
+# unfinishable. 26.04 ships 10.2p1, the same version as the development host,
+# which both runs those tests for real and removes a whole class of
+# passes-locally-fails-in-CI.
+#
+# ⚠ The corollary is that the runner image is now a DEPENDENCY with a version.
+# When a live test starts failing, the image's release notes are the first place
+# to look, not the last.
+#
 # TWO ARCHITECTURES, because the README makes a claim only a second one can
 # check. 191 of its 225 catalog rows say Platform `any`, and a consumer reading
 # that is entitled to build on aarch64. Until 2026-08-14 every lane ran on
@@ -119,7 +141,7 @@ on:
 jobs:
   scoped:
     if: "!startsWith(github.ref, 'refs/tags/')"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: changed modules + reverse-dep closure
     steps:
       # Full history: `test.sh changed <base>` diffs against the base branch,
@@ -146,9 +168,14 @@ jobs:
           # an epoch: Zig bakes the target and CPU into its own cache key, so an
           # entry built under different build flags can never hit. Bump it
           # (base2, …) when this lane's flags change, to drop the dead entries.
-          key: zig-${{ runner.os }}-base-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          # `base2` because the lanes moved from Ubuntu 24.04 to 26.04 on
+          # 2026-08-15. `runner.os` is "Linux" for both, so without a bump the
+          # restore-keys fallback would hand a 26.04 job a cache built against a
+          # different glibc and toolchain surface — a hit that is worse than a
+          # miss, since it is the kind that reads as warm.
+          key: zig-${{ runner.os }}-base2-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-${{ runner.os }}-base-
+            zig-${{ runner.os }}-base2-
       # The base differs by event, and a base that does not resolve is NOT
       # allowed to read as "nothing changed" — `changed_files` fails and the
       # driver escalates to the full run rather than passing having tested
@@ -171,13 +198,32 @@ jobs:
         include:
           - name: ReleaseSafe
             args: "-Doptimize=ReleaseSafe"
-            runner: ubuntu-latest
+            cmd: all
+            runner: ubuntu-26.04
           - name: ReleaseFast
             args: "-Doptimize=ReleaseFast"
-            runner: ubuntu-latest
-          - name: strict Debug
+            cmd: all
+            runner: ubuntu-26.04
+          # ⚠ `build`, NOT `all` — this lane COMPILES every module in real Debug
+          # and runs no test, and that is the whole claim it can support. Nobody
+          # consumes this collection in Debug: it ships source, and the mode is
+          # the integrator's decision. What is worth asking of Debug is that the
+          # code compiles there, which is a live question, because an integrator
+          # developing against these modules does build them in Debug -- heavy
+          # ones included, and this is the only lane that ever compiles those in
+          # real Debug at all.
+          #
+          # Running the tests here proved nothing measurable. Debug and
+          # ReleaseSafe arm the same safety checks; Debug merely does not
+          # optimise, which makes it weaker at exposing UB, and the one
+          # documented cross-mode catch went the other way. Tests that run only
+          # in Debug: zero. Tests that SKIP in Debug: fifteen, so this lane gave
+          # 48/63 where its siblings gave 63/63. See `cmd_build` in
+          # scripts/test.sh for the measurement.
+          - name: strict Debug (compile only)
             args: "-Dstrict-debug"
-            runner: ubuntu-latest
+            cmd: build
+            runner: ubuntu-26.04
           # ONE arm64 lane, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions, atomics,
           # and the asm-vs-fallback dispatch above -- and none of that varies by
@@ -188,7 +234,8 @@ jobs:
           # than arguing about it.
           - name: ReleaseSafe arm64
             args: "-Doptimize=ReleaseSafe"
-            runner: ubuntu-24.04-arm
+            cmd: all
+            runner: ubuntu-26.04-arm
     name: full — ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
@@ -250,6 +297,20 @@ jobs:
           # 4/5. Two Python peers, each an INDEPENDENT implementation of the
           #      protocol its module speaks. Default paths, so scripts/test.sh
           #      finds them with no environment variable.
+          # 3b. jinja's oracle is a REAL Python Jinja2, and its version is part
+          #     of the claim, not an implementation detail. The committed
+          #     golden records `"jinja2": "3.1.6"`; the runner shipped a
+          #     different one, and on 2026-08-15 two of 337 corpus cases came
+          #     out differently for `replace` and `trim` with Markup arguments.
+          #     Our output matched the golden byte for byte in both — the
+          #     ORACLE had moved, which is exactly what the golden-vs-live test
+          #     is there to catch. A gate must go red for our reasons, so pin
+          #     the oracle here and bump it deliberately.
+          #     PEP 668 marks the system interpreter externally-managed, and
+          #     the test invokes a bare `python3`, so this has to land there.
+          sudo pip3 install --break-system-packages -q "jinja2==3.1.6" || true
+          python3 -c 'import jinja2; print("jinja2:", jinja2.__version__)' || true
+
           python3 -m venv ~/.cache/zig-libs-opcua || true
           ~/.cache/zig-libs-opcua/bin/pip -q install asyncua cryptography || true
           python3 -m venv ~/.cache/zig-libs-imap || true
@@ -261,4 +322,4 @@ jobs:
           # A path that does not exist is not a silent loss: test.sh probes it
           # and reports the gap.
           export OPCUA_PYTHON="$HOME/.cache/zig-libs-opcua/bin/python3"
-          bash scripts/test.sh all ${{ matrix.args }}
+          bash scripts/test.sh ${{ matrix.cmd }} ${{ matrix.args }}
