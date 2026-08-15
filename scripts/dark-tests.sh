@@ -133,10 +133,18 @@ if [[ -z "$summary_file" ]]; then
     # Same plain/netns partition scripts/test.sh uses, from the same list, for
     # the same reason: `zig build test-netlink` on a bare dev host FAILS rather
     # than skipping, and a module whose build failed produces no count line.
-    plain=(); netns=()
+    #
+    # LIVE_MODULES is split off for a related reason: those tests talk to a real
+    # third-party peer and can fail under contention, and a module whose tests
+    # FAILED prints no count line either — which this check would then report as
+    # a phantom dark test. Serial, same as the gate.
+    plain=(); netns=(); live=()
     for m in "${mods[@]}"; do
         case " $NETNS_MODULES " in
-            *" $m "*) netns+=("test-$m") ;;
+            *" $m "*) netns+=("test-$m"); continue ;;
+        esac
+        case " $LIVE_MODULES " in
+            *" $m "*) live+=("test-$m") ;;
             *) plain+=("test-$m") ;;
         esac
     done
@@ -152,6 +160,9 @@ if [[ -z "$summary_file" ]]; then
         else
             "$SCRIPT_DIR/capped" zig build "${netns[@]}" --summary all >>"$summary_file" 2>&1
         fi
+    fi
+    if [[ ${#live[@]} -gt 0 ]]; then
+        "$SCRIPT_DIR/capped" zig build "${live[@]}" -j1 --summary all >>"$summary_file" 2>&1
     fi
 fi
 

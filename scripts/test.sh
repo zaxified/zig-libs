@@ -316,11 +316,14 @@ run_modules() {
     local mods="$1"
     [[ -z "${mods// /}" ]] && return 0
 
-    local -a rest=() netns=()
+    local -a rest=() netns=() live=()
     local m
     for m in $mods; do
         case " $NETNS_MODULES " in
-            *" $m "*) netns+=("$m") ;;
+            *" $m "*) netns+=("$m"); continue ;;
+        esac
+        case " $LIVE_MODULES " in
+            *" $m "*) live+=("$m") ;;
             *) rest+=("$m") ;;
         esac
     done
@@ -344,9 +347,20 @@ run_modules() {
         fi
     fi
 
+    # ⭐ LAST, AND ONE AT A TIME (`-j1`). These talk to a real peer with a clock
+    # on both ends; running them beside 215 other test binaries measures the
+    # scheduler rather than the interop. See LIVE_MODULES in test-lib.sh for the
+    # full reasoning, including what this deliberately stops covering.
+    if [[ ${#live[@]} -gt 0 ]]; then
+        local -a targets=()
+        for m in "${live[@]}"; do targets+=("test-$m"); done
+        step "live interop (${#live[@]} modules, serial)" zig build "${targets[@]}" -j1 --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+    fi
+
     local log="$_ZL_KEEP_OUT"
     _ZL_KEEP_OUT=""
     dark_check "$mods" "$log"
+    summary_digest "$log"
     rm -f "$log"
 }
 
@@ -362,6 +376,97 @@ run_modules() {
 # `--summary all` output the run above already produced, so it costs a few
 # milliseconds of awk rather than a second full suite run — Zig does not cache
 # test run steps, so building the summary again would roughly double this gate.
+# ⭐ The `--summary all` output, which used to be read once and deleted.
+#
+# `step` prints a step's stdout only when it FAILS, so on a green lane the
+# per-module summary — the one place that carries a time and a skip count for
+# every module — went to a temp file, was parsed by `dark_check` for its test
+# counts, and was removed. The numbers existed, were read, and were thrown away.
+#
+# That cost a day. On 2026-08-15 the per-module timings needed to size the CI
+# work had to be reconstructed from the heartbeat's process sampling, which by
+# construction sees only what is running at the instant it looks and is blind to
+# every module that starts and finishes between two ticks.
+#
+# ⚠ THE SKIP LINE MATTERS MORE THAN THE TIMES. A green lane reporting "148
+# skipped" and a green lane reporting none look identical in every other part of
+# this log, and the difference is whole modules' worth of coverage. Naming which
+# modules skipped is the only way that stays visible — see the `skip = pass`
+# family of findings for why a silent skip is the expensive kind.
+summary_digest() {
+    local log="$1" text
+    [[ -s "$log" ]] || return 0
+    text=$(awk '
+        # "12s" / "786ms" / "1m3s" -> milliseconds. `ms` must be tested before
+        # `m`, or every millisecond figure reads as minutes.
+        function ms(t,   n) {
+            if (t ~ /^[0-9.]+ms$/)              { sub(/ms$/, "", t); return t + 0 }
+            if (t ~ /^[0-9.]+m[0-9.]+s$/)       { n = t; sub(/m.*/, "", n); sub(/^[0-9.]+m/, "", t); sub(/s$/, "", t); return n * 60000 + t * 1000 }
+            if (t ~ /^[0-9.]+s$/)               { sub(/s$/, "", t); return t * 1000 }
+            if (t ~ /^[0-9.]+m$/)               { sub(/m$/, "", t); return t * 60000 }
+            return 0
+        }
+        function human(v) { return (v >= 1000) ? sprintf("%.0fs", v / 1000) : sprintf("%dms", v) }
+        /^Build Summary:/ { totals = totals (totals ? "; " : "") substr($0, 16) }
+        # "+- run test <name> <n> pass[, <n> skip][, <n> fail] (<n> total) <time> MaxRSS:.."
+        /\+- run test / {
+            name = $4
+            for (i = 1; i <= NF; i++) if ($i ~ /^MaxRSS:/) { t = ms($(i - 1)); break }
+            if (t > run[name]) run[name] = t
+            for (i = 1; i <= NF; i++) if ($i ~ /^skip/) skipped[name] += $(i - 1) + 0
+        }
+        /\+- compile test / { name = $4; for (i = 1; i <= NF; i++) if ($i ~ /^MaxRSS:/) { t = ms($(i - 1)); break }
+                              if (t > comp[name]) comp[name] = t }
+        function top(arr, label,   k, best, bn, n, out, i) {
+            out = ""
+            for (n = 0; n < 8; n++) {
+                best = -1; bn = ""
+                for (k in arr) if (arr[k] > best) { best = arr[k]; bn = k }
+                if (bn == "" || best <= 0) break
+                out = out (out ? " · " : "") bn " " human(best)
+                delete arr[bn]
+            }
+            if (out != "") printf("  %-16s %s\n", label, out)
+        }
+        END {
+            if (totals != "") printf("  %-16s %s\n", "totals:", totals)
+            top(run, "slowest run:")
+            top(comp, "slowest compile:")
+            # The COUNT is the finding; the worst dozen names are enough to
+            # act on. Forty-one modules on one line wraps into unreadability,
+            # which is how a number stops being read at all.
+            total_skips = 0; shown = 0; out = ""
+            for (k in skipped) total_skips += skipped[k]
+            for (n = 0; n < 12; n++) {
+                best = -1; bn = ""
+                for (k in skipped) if (skipped[k] > best) { best = skipped[k]; bn = k }
+                if (bn == "" || best <= 0) break
+                out = out (out ? " · " : "") bn " " best
+                delete skipped[bn]; shown++
+            }
+            more = 0
+            for (k in skipped) if (skipped[k] > 0) more++
+            if (total_skips > 0)
+                printf("  %-16s %d in %d module(s) — %s%s\n", "skipped:", total_skips, shown + more, out,
+                       more > 0 ? sprintf(" · +%d more", more) : "")
+        }
+    ' "$log") || return 0
+    [[ -n "$text" ]] || return 0
+    printf '%s\n' "$text"
+
+    # ⭐ …and onto the run's own page, so comparing lanes does not mean
+    # downloading four logs. That is not a hypothetical chore: it is exactly how
+    # every question on 2026-08-15 was answered, one `gh api …/logs` at a time.
+    #
+    # ⚠ The only CI-aware line in this driver, and deliberately the mildest
+    # shape available: a WRITE to a path the environment names, not GitHub
+    # markup emitted on stdout. Off CI the variable is unset and this is inert,
+    # so a local run reads exactly as before.
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        printf '### %s\n\n```\n%s\n```\n\n' "${ZIGLIBS_LANE:-gate}" "$text" >> "$GITHUB_STEP_SUMMARY"
+    fi
+}
+
 dark_check() {
     local mods="$1" log="$2"
 
@@ -783,7 +888,12 @@ cmd_all() {
     EXTRA_ZIG_ARGS=()
     local a
     for a in "$@"; do [[ -n "$a" ]] && EXTRA_ZIG_ARGS+=("$a"); done
-    capability_check
+    # ⚠ The capability report answers "which TESTS will silently cover less on
+    # this host", so it has nothing to say about a run that executes none. In
+    # build-only mode it listed six gaps against a lane that could not have used
+    # any of them — noise shaped exactly like a coverage warning, which is the
+    # one thing that report must never be.
+    (( GATE_BUILD_ONLY )) || capability_check
     graph_load
     local all_mods="${G_NAMES[*]}"
     local n=${#G_NAMES[@]}

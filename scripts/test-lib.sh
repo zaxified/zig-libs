@@ -20,6 +20,34 @@
 # and a second copy of this list would rot.
 NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables wireguard rawsock"
 
+# ⭐ MODULES WHOSE TESTS HOLD A CONVERSATION WITH A REAL THIRD-PARTY PEER, and
+# which therefore run SERIALLY, in their own step, after everything else.
+#
+# `opcua` drives an open62541 container and a Python asyncua client, `ssh` a
+# real sshd and a real ssh client, `dtls` a wolfSSL responder, `imap` a pymap
+# server. Each is a live protocol exchange with timeouts on BOTH ends, and none
+# of them claims to hold those timings while 215 other test binaries saturate
+# every core. That is not the property being tested — "our server interoperates
+# with open62541" says nothing about eight-fold CPU oversubscription — so
+# measuring it there measures the scheduler.
+#
+# Same reasoning as NETNS_MODULES above, which is split out because it needs a
+# namespace; these need a machine that will schedule them.
+#
+# ⚠ WHAT THIS DOES NOT DO is make the harness robust under contention. Under
+# load on 2026-08-15 these tests failed in shifting combinations, and the four
+# defects found while chasing that were all in `server_interop.zig`'s
+# hand-rolled accept loop — test-only code, none of it in the module that
+# ships. Moving them out of the parallel bulk removes ACCIDENTAL stress
+# coverage; the driver's behaviour under concurrent connections deserves a
+# DELIBERATE test instead, and one exists (see the second-connection test added
+# 2026-08-14). Do not read a green serial step as "the contention bug is gone".
+#
+# `jinja` is deliberately absent: its live peer is a Python script it runs to
+# completion, not a network peer with a clock, and its one failure this week was
+# a version drift in the oracle.
+LIVE_MODULES="opcua ssh dtls imap"
+
 # Sub-second timing via bash 5+ EPOCHREALTIME; fall back to whole seconds.
 # EPOCHREALTIME honours the locale's decimal point (e.g. "1.234,56" in
 # cs_CZ), which awk would parse as an integer — normalise comma -> period.
