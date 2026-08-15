@@ -294,16 +294,23 @@ EXTRA_ZIG_ARGS=()
 # the remaining tests in that binary run. A hang becomes a red test with an
 # address instead of a wall-clock mystery.
 #
-# ⚠ THE VALUE IS A CEILING ON PATHOLOGY, NOT A TARGET. Measured locally under
-# `-Dstrict-debug`, the slowest lane: the longest legitimate single tests run
-# just over a minute (dkg's end-to-end anchor, p256's differential-vs-std and
-# comb oracle). Ten minutes leaves an order of magnitude for a loaded or
-# slower runner — arm64 included — while still bounding a wedged test to
-# minutes. Raise it only against a MEASUREMENT that a real test needs more.
+# ⭐ THREE MINUTES IS A DESIGN RULE, NOT A SAFETY MARGIN. A single unit test
+# that needs longer than this is not a test that deserves a bigger budget — it
+# is a test that has to be restructured, and tripping the deadline is how that
+# gets noticed. Owner's call, 2026-08-15. Do not raise it to make a red test
+# green; that inverts what it is for.
+#
+# The margin is real all the same. Measured across the sixteen heaviest modules
+# under `-Dstrict-debug`, the slowest lane, exactly four single tests exceed a
+# minute and none reaches seventy seconds: dkg's end-to-end anchor, p256's
+# differential-vs-std, its comb oracle, and group's differential. Nothing else
+# in 1279 tests comes close. Nor is CI slower where it matters — the 2026-08-15
+# strict-debug lane had `p256` at 119 s of module time where this host took
+# 182 s — so the same headroom holds there.
 #
 # ⛔ NOT a substitute for a test that cannot hang. It is the backstop that makes
 # the hang findable; the test still has to be fixed.
-TEST_TIMEOUT="${TEST_TIMEOUT:-10m}"
+TEST_TIMEOUT="${TEST_TIMEOUT:-3m}"
 
 run_modules() {
     local mods="$1"
