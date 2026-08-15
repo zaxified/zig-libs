@@ -298,14 +298,46 @@ const Driver = struct {
         d.out.clearRetainingCapacity();
     }
 
+    /// Answers "is the peer finished?" with a fact instead of a stopwatch.
+    ///
+    /// ⭐ WHY THIS EXISTS. `idle_stop_ms` infers that the client is done from a
+    /// gap between connections, and every live client here reconnects at least
+    /// once mid-run: open62541's `client` example dials `GetEndpoints`, hangs
+    /// up, and dials the endpoint it was told about; the asyncua driver makes
+    /// FOUR separate connections, the last of which is the token renewal. The
+    /// gap between them is a property of the machine, not of the protocol.
+    ///
+    /// Under seven of eight cores of load on 2026-08-15 those gaps outgrew the
+    /// 1.5-2 s windows, so the server stopped listening mid-conversation and
+    /// the client's next connect got `BadConnectionClosed` — reported for a
+    /// year as a slow machine, and it never was. Raising the numbers only moves
+    /// the load at which it happens; asking whether the peer is still there
+    /// removes the guess.
+    const PeerAlive = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque) bool,
+    };
+
     const ServeOptions = struct {
         /// Give up after this long no matter what.
+        ///
+        /// ⚠ A BACKSTOP, NOT A BUDGET, and only once `peer_alive` is supplied.
+        /// Before it existed this number also decided how long a PASSING test
+        /// took, so it was kept tight and doubled as a second wall-clock
+        /// assumption — the container tests died on it under load exactly as
+        /// they died on `idle_stop_ms`. With the peer's liveness driving normal
+        /// termination the loop exits the moment the client is gone, so a
+        /// generous ceiling costs a slow machine nothing and buys it room.
         deadline_ms: i64 = 30_000,
-        /// Stop this long after the last connection closed (the peer is done).
+        /// FALLBACK ONLY, used when `peer_alive` is null: stop this long after
+        /// the last connection closed. A timing assumption — see `PeerAlive`.
         idle_stop_ms: i64 = 1_500,
         /// Advance `the.answer` on every iteration so a subscribing client
         /// sees data changes.
         vary_value: bool = true,
+        /// When set, the idle window is consulted only to decide WHEN TO ASK,
+        /// never to decide the answer.
+        peer_alive: ?PeerAlive = null,
     };
 
     /// The whole runtime contract of this module, in one loop: poll, feed
@@ -322,7 +354,15 @@ const Driver = struct {
         var last_close_ms: ?i64 = null;
         while (monotonicMs() - started < options.deadline_ms) {
             if (last_close_ms) |closed_at| {
-                if (stream == null and monotonicMs() - closed_at > options.idle_stop_ms) break;
+                if (stream == null and monotonicMs() - closed_at > options.idle_stop_ms) {
+                    // The window expiring is a prompt to ask, not a verdict. A
+                    // peer still running is simply between connections, so the
+                    // clock restarts and serving continues; only a peer that
+                    // has actually gone ends the loop.
+                    if (options.peer_alive) |p| {
+                        if (p.call(p.ctx)) last_close_ms = monotonicMs() else break;
+                    } else break;
+                }
             }
 
             var fds: [2]std.posix.pollfd = undefined;
@@ -333,6 +373,44 @@ const Driver = struct {
                 nfds = 2;
             }
             _ = std.posix.poll(fds[0..nfds], 20) catch break;
+
+            // ⚠ THE CLOSED PEER IS HANDLED BEFORE A NEW ONE IS ACCEPTED, and the
+            // order is the whole point. One `poll` can report BOTH that the
+            // current peer hung up and that another connection is waiting —
+            // which is not an edge case but the ordinary shape of a client that
+            // disconnects and immediately reconnects. open62541's own `client`
+            // example does exactly that: it connects once to `GetEndpoints`,
+            // drops the connection, and dials the endpoint it was told about.
+            //
+            // With the accept first, `stream` was still non-null when the new
+            // connection arrived, so the reject-and-close branch below shut the
+            // door on a peer that was merely next in line, and only afterwards
+            // did the close branch clear `stream`. The client saw
+            // `BadConnectionClosed` on its ACK. Introduced on 2026-08-14 by the
+            // fix for the opposite failure — a second connection left in the
+            // backlog looking like a hang — and it survived several green gate
+            // runs because whether the two events land in the same `poll` is a
+            // race. Closing one hole opened another in the same commit.
+            //
+            // Reordered, both cases are right: a peer that has left frees the
+            // slot in the same iteration, and a peer arriving while one is
+            // genuinely live still gets an immediate, diagnosable close.
+            if (nfds == 2 and fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                var buf: [16 * 1024]u8 = undefined;
+                const n = std.posix.read(stream.?.socket.handle, &buf) catch 0;
+                if (n == 0) {
+                    stream.?.close(d.io);
+                    stream = null;
+                    stream_writer = null;
+                    if (conn) |*c| c.deinit(); // frees the peer certificate, wipes the keys
+                    conn = null;
+                    last_close_ms = monotonicMs();
+                    continue;
+                }
+                try d.capture_c2s.appendSlice(d.gpa, buf[0..n]);
+                try conn.?.feed(buf[0..n], &d.out.writer, d.nowMs());
+                try d.flush(&stream_writer.?.interface);
+            }
 
             if (fds[0].revents & std.posix.POLL.IN != 0) {
                 if (stream == null) {
@@ -365,23 +443,6 @@ const Driver = struct {
                         d.rejected += 1;
                     } else |_| {}
                 }
-            }
-
-            if (nfds == 2 and fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
-                var buf: [16 * 1024]u8 = undefined;
-                const n = std.posix.read(stream.?.socket.handle, &buf) catch 0;
-                if (n == 0) {
-                    stream.?.close(d.io);
-                    stream = null;
-                    stream_writer = null;
-                    if (conn) |*c| c.deinit(); // frees the peer certificate, wipes the keys
-                    conn = null;
-                    last_close_ms = monotonicMs();
-                    continue;
-                }
-                try d.capture_c2s.appendSlice(d.gpa, buf[0..n]);
-                try conn.?.feed(buf[0..n], &d.out.writer, d.nowMs());
-                try d.flush(&stream_writer.?.interface);
             }
 
             // The clock side: refresh the server's own time-bearing nodes,
@@ -490,6 +551,48 @@ fn stopContainer(gpa: std.mem.Allocator, io: std.Io, name: []const u8) void {
     result.deinit(gpa);
 }
 
+/// `Driver.PeerAlive` for a client that runs as a detached container: ask
+/// podman whether it is still running.
+///
+/// ⚠ ANSWERS TRUE WHEN IT CANNOT TELL. A probe that fails — podman busy, the
+/// inspect racing container startup — is not evidence the client has finished,
+/// and treating it as such would reintroduce exactly the early stop this
+/// replaces. The `deadline_ms` in `serve` is what bounds the loop; this only
+/// ever decides whether to stop EARLY, so erring towards "still there" costs at
+/// most a few seconds and never a false failure.
+const ContainerPeer = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+
+    fn alive(ctx: *anyopaque) bool {
+        const self: *ContainerPeer = @ptrCast(@alignCast(ctx));
+        var res = runPodman(self.gpa, self.io, &.{ "container", "inspect", "-f", "{{.State.Running}}", self.name }) catch return true;
+        defer res.deinit(self.gpa);
+        if (res.exit_code != 0) return true;
+        return std.mem.startsWith(u8, std.mem.trim(u8, res.stdout, " \t\r\n"), "true");
+    }
+
+    fn peerAlive(self: *ContainerPeer) Driver.PeerAlive {
+        return .{ .ctx = @ptrCast(self), .call = alive };
+    }
+};
+
+/// `Driver.PeerAlive` for a client the test itself runs and waits on: a flag
+/// the waiting thread sets when the process has actually exited.
+const FlagPeer = struct {
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn alive(ctx: *anyopaque) bool {
+        const self: *FlagPeer = @ptrCast(@alignCast(ctx));
+        return !self.done.load(.acquire);
+    }
+
+    fn peerAlive(self: *FlagPeer) Driver.PeerAlive {
+        return .{ .ctx = @ptrCast(self), .call = alive };
+    }
+};
+
 const LiveClient = struct {
     driver: Driver,
     logs: []u8,
@@ -534,7 +637,13 @@ fn runLiveClient(gpa: std.mem.Allocator, io: std.Io, name: []const u8, example: 
     }
     defer stopContainer(gpa, io, name);
 
-    try driver.serve(options);
+    // The container IS the client, so its liveness is the only honest answer to
+    // "has the peer finished" — the idle window alone stopped this server
+    // mid-conversation whenever the machine was busy.
+    var peer = ContainerPeer{ .gpa = gpa, .io = io, .name = name };
+    var opts = options;
+    opts.peer_alive = peer.peerAlive();
+    try driver.serve(opts);
     driver.dumpCapture(example);
 
     // No connection at all means the client never reached this server — the
@@ -560,7 +669,7 @@ test "LIVE open62541 -> our server: tutorial_client_firststeps connects, reads i
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     var live = try runLiveClient(gpa, threaded.io(), "opcua-zig-libs-server-firststeps", "tutorial_client_firststeps", .{
-        .deadline_ms = 30_000,
+        .deadline_ms = 120_000,
         .vary_value = false,
     });
     defer live.deinit();
@@ -584,7 +693,7 @@ test "LIVE open62541 -> our server: client_subscription_loop receives DataChange
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     var live = try runLiveClient(gpa, threaded.io(), "opcua-zig-libs-server-subs", "client_subscription_loop", .{
-        .deadline_ms = 25_000,
+        .deadline_ms = 120_000,
         .idle_stop_ms = 1_000,
     });
     defer live.deinit();
@@ -610,7 +719,7 @@ test "LIVE open62541 -> our server: the `client` example browses, reads, writes,
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     var live = try runLiveClient(gpa, threaded.io(), "opcua-zig-libs-server-client", "client", .{
-        .deadline_ms = 30_000,
+        .deadline_ms = 120_000,
         .idle_stop_ms = 2_000,
     });
     defer live.deinit();
@@ -642,6 +751,9 @@ test "LIVE open62541 -> our server: the `client` example browses, reads, writes,
 const LoopbackCtx = struct {
     driver: *Driver,
     done: std.atomic.Value(bool) = .init(false),
+    /// Raised by whoever waits on the client process. `done` above runs the
+    /// other way — the serving thread telling the test it has stopped.
+    client: FlagPeer = .{},
 };
 
 fn loopbackServeThread(ctx: *LoopbackCtx) void {
@@ -1752,11 +1864,17 @@ test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/writ
     };
 
     var result = runProcess(gpa, io, &.{ python, "-c", asyncua_script }) catch |err| {
-        ctx.done.store(true, .release);
+        ctx.client.done.store(true, .release);
         thread.join();
         return err;
     };
     defer result.deinit(gpa);
+    // ⚠ RAISED HERE AND NOWHERE EARLIER. `runProcess` returns only once the
+    // client process has exited, so this is the first instant at which "the
+    // peer is finished" is a fact rather than a guess — and it is what lets the
+    // serving thread ride out the gaps between the client's four connections
+    // however long a loaded machine makes them.
+    ctx.client.done.store(true, .release);
     thread.join();
     driver.dumpCapture("asyncua-basic256sha256");
 
@@ -1796,7 +1914,20 @@ test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/writ
 fn secureServeThread(ctx: *LoopbackCtx) void {
     // `vary_value = false`: the write/read-back assertion in the driver script
     // would race a server that keeps bumping the same node.
-    ctx.driver.serve(.{ .deadline_ms = 120_000, .idle_stop_ms = 3_000, .vary_value = false }) catch {};
+    //
+    // ⭐ The asyncua driver makes FOUR separate connections — endpoint
+    // discovery, SignAndEncrypt, Sign, and the token renewal — and the pauses
+    // between them belong to the machine, not to the protocol. On a loaded host
+    // they outgrew the 3 s idle window, this thread stopped serving before the
+    // renewal run, and the test failed for missing `ZIGLIBS-OK-RENEWAL`. The
+    // flag below is set by the thread that WAITS on the python process, so the
+    // server now outlives its client by construction rather than by luck.
+    ctx.driver.serve(.{
+        .deadline_ms = 120_000,
+        .idle_stop_ms = 3_000,
+        .vary_value = false,
+        .peer_alive = ctx.client.peerAlive(),
+    }) catch {};
     ctx.done.store(true, .release);
 }
 
@@ -1923,7 +2054,15 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
     }
     defer stopContainer(gpa, io, name);
 
-    try driver.serve(.{ .deadline_ms = 40_000, .idle_stop_ms = 2_000, .vary_value = false });
+    // The same peer-liveness rule as `runLiveClient`; this call site is
+    // separate only because the encrypted variant stages its own PKI first.
+    var peer = ContainerPeer{ .gpa = gpa, .io = io, .name = name };
+    try driver.serve(.{
+        .deadline_ms = 120_000,
+        .idle_stop_ms = 2_000,
+        .vary_value = false,
+        .peer_alive = peer.peerAlive(),
+    });
     driver.dumpCapture("open62541-client_encryption");
 
     if (driver.connections == 0) {
