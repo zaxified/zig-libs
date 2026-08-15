@@ -6,7 +6,19 @@ on:
     # Date tags (see CONVENTIONS §8). A tag is a claim that every lane was
     # green at that commit, so tagging re-runs the full matrix rather than
     # trusting that main was green when the tag was cut.
-    tags: ["20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"]
+    # ⚠ BOTH FORMS, because CONVENTIONS §8 and `tag.sh` mint both. A second tag
+    # on the same day gets `.1`, `.2`, … so names stay sortable and never
+    # collide — and this filter, without the second pattern, could not match
+    # one. `2026-08-15.1` was the first such tag ever cut here; it pushed
+    # cleanly and started NO run at all, which is the worst shape a tag can
+    # have: it asserts every lane was green while no lane ran.
+    #
+    # A trailing `*` on the first pattern would have covered it and would also
+    # have matched `2026-08-15-experiment`. Two explicit patterns say what is
+    # meant.
+    tags:
+      - "20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
+      - "20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].[0-9]*"
   pull_request:
 
 # Least privilege. The gate reads the repository and nothing else — it opens no
