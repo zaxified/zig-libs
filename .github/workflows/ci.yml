@@ -236,6 +236,32 @@ jobs:
       # driver escalates to the full run rather than passing having tested
       # nothing. That matters here: `github.event.before` is all-zeros on a
       # branch's first push.
+      # ⭐ THE SAME THREE FACTS THE `full` JOB PRINTS, because this lane just
+      # produced the question they answer. Two escalated runs of this job, same
+      # sources and therefore the same GitHub cache key, one restoring an older
+      # generation and the other hitting its primary key EXACTLY:
+      #
+      #   b58ccac  restore-key fallback   build (all modules)  46.6 s
+      #   dfad841  primary key, exact     build (all modules) 482.9 s
+      #
+      # The exact hit was ten times slower, which cannot be explained by what
+      # GitHub restored — it restored more. What Zig then did with it depends on
+      # Zig's OWN cache key, and `native` folds a kernel range, a glibc version
+      # and a detected CPU into that. GitHub's amd64 pool mixes vendors: on tag
+      # 2026-08-15 one lane reported an AMD EPYC 7763 and two an Intel Xeon
+      # 8573C, in the same run.
+      #
+      # That is still a hypothesis. This job runs on every push, so putting the
+      # three lines here answers it in days rather than waiting for two warm tags
+      # to line up.
+      - name: What this runner is
+        if: always()
+        run: |
+          echo "kernel:     $(uname -srm)"
+          cpu="$(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          [ -n "$cpu" ] || cpu="$(grep -m1 'CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          echo "cpu:        ${cpu:-unknown}"
+          echo "zig target: $(zig env 2>/dev/null | grep -m1 '\.target' | cut -d'"' -f2 || echo unknown)"
       - name: Test changed modules
         env:
           ZIGLIBS_LANE: changed modules + reverse-dep closure
