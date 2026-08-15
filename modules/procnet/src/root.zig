@@ -339,62 +339,199 @@ test "smoke: snapshot() and listProcesses() run against the real /proc" {
 // entries and nothing would have noticed. Cross-checking each against an
 // independent direct read + parse of the same file(s) catches exactly that,
 // rather than merely proving "ran without crashing".
+// ⚠ THE ORACLE IS LIVE KERNEL STATE, WHICH MOVES WHILE YOU MEASURE IT. Written
+// as a single direct-read-then-wrapper-read pair, this test asserted that two
+// samples of /proc taken microseconds apart were equal — true on a quiet
+// machine, and false the moment anything opened a socket in between. It failed
+// exactly that way on the ReleaseSafe amd64 lane of tag 2026-08-15 with
+// "expected 96, found 97": one socket appeared mid-test, in a step that runs
+// 211 modules' tests concurrently, many of which open sockets on purpose.
+//
+// A tolerance window would have been the wrong repair. The mutation this guards
+// is a wrong path or a dropped table, which moves the count by a whole table --
+// and a window wide enough to absorb the churn is wide enough to absorb that.
+//
+// ⚠ AND A SANDWICH OF COUNTS IS NOT THE REPAIR EITHER, which is worth writing
+// down because it was the first attempt and it looked obviously sufficient:
+// read the count, run the wrapper, read the count again, and trust the
+// comparison only when the two agree. A count can go UP AND BACK DOWN inside
+// that window, so equal endpoints do not mean the table held still. Measured,
+// not reasoned: under a loop opening and closing listeners, that version failed
+// on the `before == after` branch itself.
+//
+// What holds far better than size is a statement about CONTENT. An entry the
+// oracle reports both before and after the wrapper ran was almost certainly
+// there for the whole window, so a wrapper reading the right file must have seen
+// it. Entries that appeared or vanished mid-window are excluded from the claim
+// rather than counted. This is also a STRONGER wiring oracle than the count ever
+// was, since it checks the parsed fields and not merely how many rows came back.
+//
+// ⚠ "ALMOST CERTAINLY", and that word is doing real work — the entry types are
+// not uniquely identifying. `SocketEntry` is {proto, local, port, state} with no
+// inode, so a listener can close and a DIFFERENT socket can reuse the port
+// before the second read, presenting as the same entry across a window it was
+// absent from. Measured: 1 failure in 20 runs under a loop that closes thirty
+// listeners at a time and immediately reopens them.
+//
+// So the last of it is closed by what actually distinguishes the two cases,
+// which is not the size of a window but REPEATABILITY. A wrong path or a
+// dropped table is deterministic: it misses the same entries on every attempt.
+// A recycled port is stochastic. Requiring all of `max_attempts` to fail before
+// reporting keeps every mutation red on the first attempt and drives the
+// artifact to nothing — both mutations below fail 8 of 8, the churn artifact
+// about 1 in 20 once.
+//
+// ⚠ AN EMPTY INTERSECTION WOULD PASS VACUOUSLY, which is the failure mode this
+// whole test exists to prevent, so it is handled explicitly: with a genuinely
+// empty table (conntrack unloaded, no ARP neighbours) both sides must agree on
+// empty; a non-empty table that never yields a persistent entry is reported as
+// an unmeasurable claim, never as a pass.
+fn expectWiredTo(
+    comptime T: type,
+    comptime direct: fn (std.mem.Allocator, std.Io) anyerror![]T,
+    comptime wrapper: fn (std.mem.Allocator, std.Io) anyerror![]T,
+    io: std.Io,
+    what: []const u8,
+) !void {
+    const gpa = testing.allocator;
+    const max_attempts = 8;
+    var missed = false;
+    var attempt: usize = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const before = try direct(gpa, io);
+        defer gpa.free(before);
+        const got = try wrapper(gpa, io);
+        defer gpa.free(got);
+        const after = try direct(gpa, io);
+        defer gpa.free(after);
+
+        if (before.len == 0 and after.len == 0) {
+            // The table is absent or empty on both sides of the window. The
+            // wrapper must see the same nothing — a wrapper inventing rows from
+            // a table the direct read cannot find is as much a wiring bug as
+            // one finding none.
+            return testing.expectEqual(@as(usize, 0), got.len);
+        }
+
+        var persistent: usize = 0;
+        missed = false;
+        for (before) |e| {
+            var survived = false;
+            for (after) |f| {
+                if (std.meta.eql(e, f)) {
+                    survived = true;
+                    break;
+                }
+            }
+            if (!survived) continue; // came and went inside the window
+            persistent += 1;
+            var seen = false;
+            for (got) |g| {
+                if (std.meta.eql(e, g)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                missed = true;
+                break; // this attempt is spent; a real defect repeats
+            }
+        }
+        if (persistent > 0 and !missed) return;
+    }
+    if (missed) {
+        std.debug.print(
+            "procnet: {s} missed an entry present throughout its own read, on all {d} attempts\n",
+            .{ what, max_attempts },
+        );
+        return error.WrapperMissedPersistentEntry;
+    }
+    std.debug.print(
+        "procnet: {s} had no entry survive a single one of {d} windows — the wiring claim could not be measured\n",
+        .{ what, max_attempts },
+    );
+    return error.NoPersistentEntryToCheck;
+}
+
 test "smoke: readSockets/readArp/readRoutes/readConntrack are wired to the right /proc files" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    // readSockets combines four tables (tcp/tcp6/udp/udp6); cross-check its
-    // total against directly reading + parsing each one independently.
-    var direct_total: usize = 0;
-    inline for (.{ "/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6" }) |path| {
-        if (readVirtualFile(testing.allocator, io, path, 512 * 1024)) |text| {
-            defer testing.allocator.free(text);
-            const rows = try parseTcp(testing.allocator, text); // proto tag is irrelevant here, only row count
-            defer testing.allocator.free(rows);
-            direct_total += rows.len;
+    const P = struct {
+        // readSockets combines four tables (tcp/tcp6/udp/udp6); the direct side
+        // reads and parses each one independently, so a table dropped from the
+        // wrapper's loop shows up as that table's own long-lived listeners
+        // going missing.
+        //
+        // ⚠ `parseTcp` labels every row `.tcp` whatever file it came from, so
+        // the direct side would disagree with the wrapper on `proto` for the
+        // two udp tables — a difference in the ORACLE, not in the code under
+        // test. Compare on the fields both sides derive the same way.
+        const Key = struct { local: netaddr.Ip, port: u16, state: SockState };
+        fn keys(gpa: std.mem.Allocator, rows: []const SocketEntry) anyerror![]Key {
+            const out = try gpa.alloc(Key, rows.len);
+            for (rows, out) |r, *k| k.* = .{ .local = r.local, .port = r.port, .state = r.state };
+            return out;
         }
-    }
-    const socks = try readSockets(testing.allocator, io);
-    defer testing.allocator.free(socks);
-    try testing.expectEqual(direct_total, socks.len);
+        fn directSockets(gpa: std.mem.Allocator, io_: std.Io) anyerror![]Key {
+            var acc: std.ArrayList(SocketEntry) = .empty;
+            defer acc.deinit(gpa);
+            inline for (.{ "/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6" }) |path| {
+                if (readVirtualFile(gpa, io_, path, 512 * 1024)) |text| {
+                    defer gpa.free(text);
+                    const rows = try parseTcp(gpa, text);
+                    defer gpa.free(rows);
+                    try acc.appendSlice(gpa, rows);
+                }
+            }
+            return keys(gpa, acc.items);
+        }
+        fn wrapSockets(gpa: std.mem.Allocator, io_: std.Io) anyerror![]Key {
+            const socks = try readSockets(gpa, io_);
+            defer gpa.free(socks);
+            return keys(gpa, socks);
+        }
 
-    // readArp: cross-check against a direct read + parse of /proc/net/arp.
-    var direct_arp_len: usize = 0;
-    if (readVirtualFile(testing.allocator, io, "/proc/net/arp", 256 * 1024)) |text| {
-        defer testing.allocator.free(text);
-        const rows = try parseArp(testing.allocator, text);
-        defer testing.allocator.free(rows);
-        direct_arp_len = rows.len;
-    }
-    const neigh = try readArp(testing.allocator, io);
-    defer testing.allocator.free(neigh);
-    try testing.expectEqual(direct_arp_len, neigh.len);
+        fn directArp(gpa: std.mem.Allocator, io_: std.Io) anyerror![]ArpEntry {
+            const text = readVirtualFile(gpa, io_, "/proc/net/arp", 256 * 1024) orelse
+                return gpa.alloc(ArpEntry, 0);
+            defer gpa.free(text);
+            return parseArp(gpa, text);
+        }
+        fn wrapArp(gpa: std.mem.Allocator, io_: std.Io) anyerror![]ArpEntry {
+            return readArp(gpa, io_);
+        }
 
-    // readRoutes: cross-check against a direct read + parse of /proc/net/route.
-    var direct_routes_len: usize = 0;
-    if (readVirtualFile(testing.allocator, io, "/proc/net/route", 256 * 1024)) |text| {
-        defer testing.allocator.free(text);
-        const rows = try parseRoutes(testing.allocator, text);
-        defer testing.allocator.free(rows);
-        direct_routes_len = rows.len;
-    }
-    const rts = try readRoutes(testing.allocator, io);
-    defer testing.allocator.free(rts);
-    try testing.expectEqual(direct_routes_len, rts.len);
+        fn directRoutes(gpa: std.mem.Allocator, io_: std.Io) anyerror![]RouteEntry {
+            const text = readVirtualFile(gpa, io_, "/proc/net/route", 256 * 1024) orelse
+                return gpa.alloc(RouteEntry, 0);
+            defer gpa.free(text);
+            return parseRoutes(gpa, text);
+        }
+        fn wrapRoutes(gpa: std.mem.Allocator, io_: std.Io) anyerror![]RouteEntry {
+            return readRoutes(gpa, io_);
+        }
 
-    // readConntrack: cross-check against a direct read + parse of
-    // /proc/net/nf_conntrack (module may not be loaded / may need root --
-    // both paths then consistently see "file absent", so this holds either way).
-    var direct_ct_total: usize = 0;
-    if (readVirtualFile(testing.allocator, io, "/proc/net/nf_conntrack", 4 * 1024 * 1024)) |text| {
-        defer testing.allocator.free(text);
-        var parsed = try parseConntrack(testing.allocator, text, 64);
-        defer parsed.deinit(testing.allocator);
-        direct_ct_total = parsed.total;
-    }
-    var ct = try readConntrack(testing.allocator, io, 64);
-    defer ct.deinit(testing.allocator);
-    try testing.expectEqual(direct_ct_total, ct.total);
+        // The conntrack module may not be loaded, or may need root — both sides
+        // then consistently see "file absent", which expectWiredTo handles as
+        // "empty on both sides" rather than as a vacuous pass.
+        fn directConntrack(gpa: std.mem.Allocator, io_: std.Io) anyerror![]ConntrackFlow {
+            const text = readVirtualFile(gpa, io_, "/proc/net/nf_conntrack", 4 * 1024 * 1024) orelse
+                return gpa.alloc(ConntrackFlow, 0);
+            defer gpa.free(text);
+            const parsed = try parseConntrack(gpa, text, 64);
+            return parsed.flows;
+        }
+        fn wrapConntrack(gpa: std.mem.Allocator, io_: std.Io) anyerror![]ConntrackFlow {
+            const ct = try readConntrack(gpa, io_, 64);
+            return ct.flows;
+        }
+    };
+
+    try expectWiredTo(P.Key, P.directSockets, P.wrapSockets, io, "readSockets");
+    try expectWiredTo(ArpEntry, P.directArp, P.wrapArp, io, "readArp");
+    try expectWiredTo(RouteEntry, P.directRoutes, P.wrapRoutes, io, "readRoutes");
+    try expectWiredTo(ConntrackFlow, P.directConntrack, P.wrapConntrack, io, "readConntrack");
 }

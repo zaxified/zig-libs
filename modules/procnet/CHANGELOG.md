@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-15** — Fixed a flaky live smoke test (test-only; no change to the module).
+  The `readSockets`/`readArp`/`readRoutes`/`readConntrack` wiring test compared the
+  ROW COUNT from a direct `/proc` read against the count the wrapper returned, i.e. two
+  samples of live kernel state taken microseconds apart. It failed on CI's ReleaseSafe
+  amd64 lane with `expected 96, found 97` — one socket appeared mid-test, in a step
+  that runs 211 modules' tests concurrently. It now compares CONTENT: every entry the
+  oracle reports both before and after the wrapper ran must appear in the wrapper's
+  output, which is a stronger wiring claim than a count and does not depend on the
+  table holding still. A tolerance window was rejected — the mutation this guards
+  (wrong path, dropped table) moves the count by a whole table, so a window wide
+  enough to absorb the churn absorbs the defect too. Verified by mutation (dropping
+  `/proc/net/udp6` from the wrapper's loop, and typo'ing the `arp`/`route` paths: red
+  on 8 of 8 attempts each) and by 40 consecutive green runs under a loop opening and
+  closing listeners, which failed the previous version 4 times in 5.
 - **2026-08-14** — `zig build check-fuzz` coverage: a `testing.fuzz` harness on each of
   the five `/proc` table decode entry points — `parseProcStat`, `parseRoutes`,
   `parseTcp`/`parseUdp`, `parseArp`, `parseConntrack`. Kernel-emitted is not
