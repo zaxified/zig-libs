@@ -318,6 +318,37 @@ const Driver = struct {
         call: *const fn (ctx: *anyopaque) bool,
     };
 
+    /// ⭐ "WE HAVE WHAT WE CAME FOR" — asked on a timer, independently of the
+    /// connection.
+    ///
+    /// `PeerAlive` above closes the loop for a client that HANGS UP: it is only
+    /// consulted once the stream is gone and the idle window has expired. A
+    /// client that never hangs up is invisible to it, and one of these tests is
+    /// exactly that — open62541's `client_subscription_loop` opens one
+    /// connection, subscribes, and stays. The question "is the peer still
+    /// there" is then permanently "yes" and the only remaining exit is
+    /// `deadline_ms`.
+    ///
+    /// Measured on 2026-08-15 by watching the container: it lived from t=12 s
+    /// to t≈120 s of a 177 s module, so ONE test spent two minutes waiting out a
+    /// backstop it was never meant to reach, on every lane and every local gate
+    /// run since it was written.
+    ///
+    /// ⚠ The evidence, not the clock, and not the peer's lifetime. What that
+    /// test asserts is two `currentTime has changed` lines in the client's own
+    /// output — so the loop should end when those lines exist, which is a fact
+    /// about the conversation rather than a guess about the machine. Everything
+    /// else in this file that shortened a wait by lowering a number was wrong
+    /// for the same reason and had to be undone.
+    const StopWhen = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque) bool,
+        /// Asking costs a subprocess, so it is asked on a timer rather than on
+        /// every 20 ms poll. Fine-grained enough that the saving is the two
+        /// minutes and not the last half second of it.
+        every_ms: i64 = 500,
+    };
+
     const ServeOptions = struct {
         /// Give up after this long no matter what.
         ///
@@ -338,6 +369,10 @@ const Driver = struct {
         /// When set, the idle window is consulted only to decide WHEN TO ASK,
         /// never to decide the answer.
         peer_alive: ?PeerAlive = null,
+        /// When set, ends the loop as soon as the test's evidence exists —
+        /// independently of whether the client is still connected. Required for
+        /// any client that does not hang up on its own; see `StopWhen`.
+        stop_when: ?StopWhen = null,
     };
 
     /// The whole runtime contract of this module, in one loop: poll, feed
@@ -352,7 +387,18 @@ const Driver = struct {
 
         const started = monotonicMs();
         var last_close_ms: ?i64 = null;
+        var last_ask_ms: i64 = started;
         while (monotonicMs() - started < options.deadline_ms) {
+            // Asked whatever the connection is doing — that is the whole point
+            // of it, and why it cannot live inside the `last_close_ms` branch
+            // below with the liveness check.
+            if (options.stop_when) |sw| {
+                const now = monotonicMs();
+                if (now - last_ask_ms >= sw.every_ms) {
+                    last_ask_ms = now;
+                    if (sw.call(sw.ctx)) break;
+                }
+            }
             if (last_close_ms) |closed_at| {
                 if (stream == null and monotonicMs() - closed_at > options.idle_stop_ms) {
                     // The window expiring is a prompt to ask, not a verdict. A
@@ -410,6 +456,36 @@ const Driver = struct {
                 try d.capture_c2s.appendSlice(d.gpa, buf[0..n]);
                 try conn.?.feed(buf[0..n], &d.out.writer, d.nowMs());
                 try d.flush(&stream_writer.?.interface);
+
+                // ⚠⚠ AND IF THAT WAS THE CLIENT SAYING GOODBYE, THE SLOT IS FREE
+                // NOW — not after the accept branch below, which is where this
+                // check used to live.
+                //
+                // The reorder above handles a close that shows up as a 0-byte
+                // read in the SAME poll as the next connection. It does not
+                // handle the ordinary case that contention makes likely: the
+                // client's last bytes (`CloseSecureChannel`) and its FIN land in
+                // DIFFERENT iterations. Then this branch reads data, does not
+                // `continue`, and falls into the accept branch with a `stream`
+                // that is finished but not yet torn down — so the reconnect got
+                // reject-and-closed and the client reported
+                // `Receiving ACK message failed with BadConnectionClosed`.
+                //
+                // Reproduced 3 of 3 rounds on 2026-08-15 by running the four
+                // live modules concurrently under 7-of-8 cores of load, which is
+                // the condition the serial LIVE_MODULES step had been hiding.
+                // open62541's `client` and `client_encryption` examples both do
+                // exactly this: connect, GetEndpoints, disconnect, reconnect.
+                if (conn) |*c| {
+                    if (c.isClosed()) {
+                        stream.?.close(d.io);
+                        stream = null;
+                        stream_writer = null;
+                        c.deinit();
+                        conn = null;
+                        last_close_ms = monotonicMs();
+                    }
+                }
             }
 
             if (fds[0].revents & std.posix.POLL.IN != 0) {
@@ -578,6 +654,47 @@ const ContainerPeer = struct {
     }
 };
 
+/// `Driver.StopWhen` for a container client that never exits: watch its own
+/// stdout for the line the test is going to assert on, and stop serving once
+/// there are enough of them.
+///
+/// ⚠ THE SAME BYTES THE TEST JUDGES BY, deliberately. Counting Publish
+/// responses on the server side would be cheaper and would prove less: the
+/// point of driving a third-party client is that it UNDERSTOOD what we sent,
+/// and only its own output says that. Stopping on the server's count would
+/// declare victory on the strength of what we ourselves emitted.
+///
+/// `min_count` is the test's own threshold, so serving ends exactly when the
+/// assertion would pass and not one publish earlier.
+const LogMarkerPeer = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+    marker: []const u8,
+    min_count: usize,
+
+    fn satisfied(ctx: *anyopaque) bool {
+        const self: *LogMarkerPeer = @ptrCast(@alignCast(ctx));
+        // Unreadable logs are NOT evidence of completion — same reasoning as
+        // ContainerPeer answering true when it cannot tell. Erring towards
+        // "keep serving" costs seconds; erring the other way fails the test.
+        var res = runPodman(self.gpa, self.io, &.{ "logs", self.name }) catch return false;
+        defer res.deinit(self.gpa);
+        var seen: usize = 0;
+        var rest = res.stdout;
+        while (std.mem.indexOf(u8, rest, self.marker)) |i| {
+            seen += 1;
+            if (seen >= self.min_count) return true;
+            rest = rest[i + self.marker.len ..];
+        }
+        return false;
+    }
+
+    fn stopWhen(self: *LogMarkerPeer) Driver.StopWhen {
+        return .{ .ctx = @ptrCast(self), .call = satisfied };
+    }
+};
+
 /// `Driver.PeerAlive` for a client the test itself runs and waits on: a flag
 /// the waiting thread sets when the process has actually exited.
 const FlagPeer = struct {
@@ -606,7 +723,19 @@ const LiveClient = struct {
 /// Stand the server up, run `example` from the open62541 image against it, and
 /// return the driver (for assertions on server state) plus the client's
 /// stdout. Skips loudly when podman/the image/the port is unavailable.
-fn runLiveClient(gpa: std.mem.Allocator, io: std.Io, name: []const u8, example: []const u8, options: Driver.ServeOptions) !LiveClient {
+/// The line a non-exiting client prints once it has understood us, and how many
+/// of them the caller's assertion needs. Null for clients that exit on their
+/// own — their container going away is the signal.
+const StopMarker = struct { text: []const u8, count: usize };
+
+fn runLiveClient(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+    example: []const u8,
+    options: Driver.ServeOptions,
+    stop_marker: ?StopMarker,
+) !LiveClient {
     if (builtin.os.tag != .linux) {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE opcua server interop needs Linux (podman --network host).\n", .{});
         return error.SkipZigTest;
@@ -643,6 +772,13 @@ fn runLiveClient(gpa: std.mem.Allocator, io: std.Io, name: []const u8, example: 
     var peer = ContainerPeer{ .gpa = gpa, .io = io, .name = name };
     var opts = options;
     opts.peer_alive = peer.peerAlive();
+    // A client that never hangs up is invisible to the liveness check above,
+    // so the caller may name the line it is waiting for instead. See StopWhen.
+    var marker_peer: LogMarkerPeer = undefined;
+    if (stop_marker) |m| {
+        marker_peer = .{ .gpa = gpa, .io = io, .name = name, .marker = m.text, .min_count = m.count };
+        opts.stop_when = marker_peer.stopWhen();
+    }
     try driver.serve(opts);
     driver.dumpCapture(example);
 
@@ -671,7 +807,7 @@ test "LIVE open62541 -> our server: tutorial_client_firststeps connects, reads i
     var live = try runLiveClient(gpa, threaded.io(), "opcua-zig-libs-server-firststeps", "tutorial_client_firststeps", .{
         .deadline_ms = 120_000,
         .vary_value = false,
-    });
+    }, null);
     defer live.deinit();
 
     // The example prints `date is: DD-MM-YYYY` after reading
@@ -695,7 +831,10 @@ test "LIVE open62541 -> our server: client_subscription_loop receives DataChange
     var live = try runLiveClient(gpa, threaded.io(), "opcua-zig-libs-server-subs", "client_subscription_loop", .{
         .deadline_ms = 120_000,
         .idle_stop_ms = 1_000,
-    });
+        // ⭐ This client subscribes and STAYS. Without a marker it holds one
+        // connection open until `deadline_ms`, which measured at ~120 s of a
+        // 177 s module. Two changes is what the assertion below needs.
+    }, .{ .text = "currentTime has changed", .count = 2 });
     defer live.deinit();
 
     // The example subscribes to Server_ServerStatus_CurrentTime (i=2258) and
@@ -721,7 +860,7 @@ test "LIVE open62541 -> our server: the `client` example browses, reads, writes,
     var live = try runLiveClient(gpa, threaded.io(), "opcua-zig-libs-server-client", "client", .{
         .deadline_ms = 120_000,
         .idle_stop_ms = 2_000,
-    });
+    }, null);
     defer live.deinit();
 
     const logs = live.logs;

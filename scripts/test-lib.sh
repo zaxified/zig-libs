@@ -34,14 +34,39 @@ NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables w
 # Same reasoning as NETNS_MODULES above, which is split out because it needs a
 # namespace; these need a machine that will schedule them.
 #
-# ⚠ WHAT THIS DOES NOT DO is make the harness robust under contention. Under
-# load on 2026-08-15 these tests failed in shifting combinations, and the four
-# defects found while chasing that were all in `server_interop.zig`'s
-# hand-rolled accept loop — test-only code, none of it in the module that
-# ships. Moving them out of the parallel bulk removes ACCIDENTAL stress
-# coverage; the driver's behaviour under concurrent connections deserves a
-# DELIBERATE test instead, and one exists (see the second-connection test added
-# 2026-08-14). Do not read a green serial step as "the contention bug is gone".
+# ⚠ WHAT THIS DOES NOT DO is make the harness robust under contention. Moving
+# these out of the parallel bulk removes ACCIDENTAL stress coverage, and a green
+# serial step is not evidence that anything was fixed.
+#
+# ⭐ AND THREE OF THESE FOUR HAVE NO EVIDENCE AGAINST THEM. This list was drawn
+# by CATEGORY — "live peer with its own clock" — and on 2026-08-15 the category
+# was finally tested instead of assumed: all four run CONCURRENTLY under seven
+# of eight cores of load, three rounds.
+#
+#   opcua   failed 3 of 3 rounds (2, 3 and 2 failures of 176)
+#   ssh     98/98,   every round
+#   dtls    263/263, every round
+#   imap    132/132, every round
+#
+# `ssh` is here because of the six-hour wall of 2026-08-14, whose cause turned
+# out to be an OpenSSH version predating `mlkem768x25519-sha256` — diagnosed and
+# closed, and nothing to do with contention. `dtls` and `imap` are here because
+# they resemble `opcua`.
+#
+# That experiment also FOUND a defect the serial step had been hiding: the
+# driver tore a finished connection down AFTER deciding whether to accept the
+# next one, so a client that disconnects and reconnects — which open62541's
+# `client` and `client_encryption` both do — got its reconnect closed. Fixed;
+# the same reproduction now passes 4 of 4.
+#
+# ⛔ ALL FOUR STAY SERIAL ANYWAY (owner's decision, 2026-08-15), to be revisited
+# once this has been quiet for a while. The serial step costs ~65 s and makes
+# the gate's verdict a statement about our protocol rather than about the
+# scheduler. What it does NOT do is reduce risk: it reduces DETECTION, and the
+# defect above sat in the tree for a day because of it. The reproduction is one
+# command — run the four `zig build test-*` targets together with `nproc - 1`
+# busy loops — and it belongs in a session that is looking for this, not in
+# every gate run.
 #
 # `jinja` is deliberately absent: its live peer is a Python script it runs to
 # completion, not a network peer with a clock, and its one failure this week was
