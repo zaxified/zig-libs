@@ -19,6 +19,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. |
 | `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
 | `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
+| `check-ci-cache-keys.sh` | Refuses a CI config where one lane's cache restore-key prefix can match another lane's entry. `restore-keys` matches by prefix, so distinct names are not enough — they must not be prefixes of each other. An amd64 lane restored an aarch64 tree this way and recompiled everything, green throughout. |
 | `ci-environment.sh` | Installs the live peers a hosted runner lacks — wolfSSL, the open62541 container, five Python oracles. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. |
 | `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. |
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. |
@@ -66,7 +67,8 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
 - `build.zig`, `build.zig.zon` → **ask the graph** (see below), not "all"
 - `.github/**` and any script the gate itself executes — `test.sh`,
   `test-lib.sh`, `capped`, `dark-tests.sh`, `ci-environment.sh`, `test-tag.sh`,
-  `hooks/**` → **locally, a smoke set** plus a loud note that this is not the
+  `check-ci-cache-keys.sh`, `hooks/**` → **locally, a smoke set** plus a loud
+  note that this is not the
   gate. The harness is the very thing that decides a narrower set, so it cannot
   vouch for its own narrowing; instead it runs one plain and one netns-wrapped
   module — the two classes `run_modules` actually distinguishes — to prove the

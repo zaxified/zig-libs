@@ -198,6 +198,7 @@ harness_smoke() {
     # ~0.2 s in a throwaway repo. See scripts/hooks/test-pre-commit.sh.
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/test-tag.sh
+    step "check-ci-cache-keys" ./scripts/check-ci-cache-keys.sh
     step "check-catalog" zig build check-catalog
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
@@ -779,7 +780,7 @@ cmd_changed() {
                 # Might have changed the graph — ask the graph, do not assume.
                 trigger_graph=1
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1031,6 +1032,7 @@ cmd_all() {
     # commit -- but only while the hook itself works, which is what this checks.
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/test-tag.sh
+    step "check-ci-cache-keys" ./scripts/check-ci-cache-keys.sh
     step "check-catalog" zig build check-catalog
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly

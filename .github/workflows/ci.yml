@@ -301,7 +301,11 @@ jobs:
           - name: ReleaseSafe arm64
             args: "-Doptimize=ReleaseSafe"
             cmd: all
-            cachekey: relsafe-arm64
+            # ⚠ NOT `relsafe-arm64`. The architecture is in the key template
+            # now (see the cache step), and carrying it here as well is what
+            # made this entry's key an extension of the amd64 lane's restore
+            # prefix — which is how an amd64 job came to restore this tree.
+            cachekey: relsafe
             cache: true
             runner: ubuntu-26.04-arm
     name: full — ${{ matrix.name }}
@@ -358,9 +362,41 @@ jobs:
           # key they would overwrite each other every run and every lane would
           # restore someone else's mode. This file already records that bug
           # once, under setup-zig's `cache-key`.
-          key: zig-full-${{ matrix.cachekey }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          #
+          # ⭐⭐ AND DISTINCT NAMES ARE NOT ENOUGH — THEY MUST NOT BE PREFIXES OF
+          # EACH OTHER, which is a different rule and cost 42 minutes before it
+          # was noticed. `restore-keys` matches by PREFIX and returns the most
+          # recent entry that matches. The keys were `relsafe` and
+          # `relsafe-arm64`, so `zig-full-relsafe-` matched the ARM64 lane's
+          # entry, and on tag 2026-08-15 the amd64 ReleaseSafe lane restored an
+          # aarch64 object tree:
+          #
+          #   Cache hit for restore-key: zig-full-relsafe-arm64-d9ef…
+          #
+          # Nothing was corrupt and nothing failed; the artifacts were simply for
+          # another architecture, so Zig rebuilt all 225 modules. That lane
+          # compiled for 2540 s while ReleaseFast — same runner image, same
+          # kernel, same CPU, same resolved target, its own uncontested key —
+          # compiled in 91 s. Both figures are in the same run's logs.
+          #
+          # ⚠ THIS REFUTES WHAT THIS FILE SAID ONE COMMIT AGO. The amd64 lanes
+          # were rebuilding despite a restore, and the explanation offered was
+          # that `native` bakes a kernel range, a glibc version and a CPU model
+          # into Zig's cache key while GitHub's amd64 pool is heterogeneous. The
+          # diagnostics added to prove it disproved it instead: both amd64 lanes
+          # report Linux 7.0.0-1011-azure, an AMD EPYC 7763, and
+          # x86_64-linux.7.0...7.0-gnu.2.43 — identical, and one of them was
+          # fast. A guess that survives because nobody measured it is worse than
+          # no guess, which is why that step prints three lines it does not use.
+          #
+          # The arch is therefore part of the key for EVERY lane, not a suffix on
+          # one of them: `relsafe-X64-` and `relsafe-ARM64-` cannot be prefixes
+          # of one another, whereas `relsafe-` was a prefix of `relsafe-arm64-`.
+          # Adding a lane means checking that its key is not a prefix of any
+          # other, and no longer merely that it differs.
+          key: zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-full-${{ matrix.cachekey }}-
+            zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-
       # scripts/test.sh all runs the format check, the hook self-test, the
       # catalog/provenance gates and every module, and wraps the
       # netlink-writing modules in `unshare -rn` where the runner allows it —
@@ -448,42 +484,44 @@ jobs:
         # actions/cache will not save it, and knowing the size anyway is how a
         # permanently cold lane gets explained rather than guessed at.
         #
-        # ⭐ AND THE CPU, because the first warm run split the lanes in two and
-        # the reason is not yet established. Tag 2026-08-15, every lane restoring
-        # from the same previous generation, one module changed between them:
+        # ⭐ AND THE KERNEL, CPU AND RESOLVED ZIG TARGET, which is how the cache
+        # question got answered — by refuting the explanation these lines were
+        # added to support.
         #
-        #   lane                restored   compile   tree    saved
-        #   ReleaseSafe arm64     656 MB      42 s   2.7 GB   698 MB
-        #   ReleaseSafe amd64     700 MB    1812 s   (red, saved nothing)
-        #   ReleaseFast amd64     721 MB    2035 s   6.0 GB  1457 MB
+        # The first warm run split the lanes in two: arm64 restored, rebuilt the
+        # one module that had changed, and finished its compile in 42 s, while
+        # both amd64 lanes restored a cache of the same size and then recompiled
+        # essentially everything. The explanation offered was that `native` is
+        # not one thing — `zig env` resolves it to a kernel version range, a
+        # glibc version and a detected CPU, all of which feed Zig's own cache key
+        # — and that GitHub's amd64 pool is heterogeneous where its arm64 pool is
+        # not. Plausible, and wrong.
         #
-        # arm64 reused its artifacts and rebuilt the one module that moved. Both
-        # amd64 lanes restored a cache of the same size and then recompiled
-        # essentially everything, ending with BOTH generations on disk — which is
-        # how ReleaseFast's saved archive went from 756 MB to 1457 MB in a single
-        # run. A cache that grows every generation while saving a quarter of the
-        # compile is the shape this file already warns about: it costs the quota
-        # AND the pretence of being warm.
+        # These three lines said so on their first run. Both amd64 lanes reported
+        # Linux 7.0.0-1011-azure, an AMD EPYC 7763 and
+        # x86_64-linux.7.0...7.0-gnu.2.43 — identical in every respect — and one
+        # of them compiled in 91 s while the other took 2540 s. Nothing about the
+        # machine differed. What differed was which cache entry each restored,
+        # and that is a prefix-matching bug in the keys above, fixed there.
         #
-        # Nothing here pins the target, and `native` is not one thing. `zig env`
-        # resolves it to something like `x86_64-linux.7.0...7.0-gnu.2.43` — a
-        # KERNEL VERSION RANGE and a glibc version — on top of the CPU model that
-        # Zig detects for codegen. All of it feeds Zig's own cache key, and any
-        # of it can differ between two runners drawn from the same pool.
-        #
-        # That is a hypothesis, not a finding, so this prints the three
-        # candidates rather than acting on them. The next warm run settles it: if
-        # a lane that missed reports a different target string or CPU than the
-        # run that saved the cache, the cause is named, and pinning a baseline
-        # becomes a deliberate trade — portability of the artifact against native
-        # codegen — instead of a hunch. If they all match, the cause is elsewhere
-        # and this file should stop implying otherwise.
+        # Keep printing them. They cost nothing, they are what turned a confident
+        # story into a measurement, and the next surprise will want the same
+        # three facts about the machine that produced it.
         if: always()
         run: |
           du -sh "$GITHUB_WORKSPACE/.zig-cache" 2>/dev/null || echo "no .zig-cache"
           du -sh "$GITHUB_WORKSPACE/.zig-cache/o" 2>/dev/null || true
           echo "kernel:     $(uname -srm)"
-          echo "cpu:        $(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo unknown)"
+          # aarch64 /proc/cpuinfo has no "model name" line at all — it carries
+          # "CPU implementer"/"CPU part" instead — so the first run of this
+          # printed an empty CPU for the one lane whose hardware differs.
+          #
+          # ⚠ Tested on emptiness, NOT on the pipeline's exit status: `grep |
+          # cut | xargs` exits 0 even when grep matched nothing, because the
+          # status belongs to xargs. A `||` fallback there would never fire.
+          cpu="$(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          [ -n "$cpu" ] || cpu="$(grep -m1 'CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          echo "cpu:        ${cpu:-unknown}"
           echo "zig target: $(zig env 2>/dev/null | grep -m1 '\.target' | cut -d'"' -f2 || echo unknown)"
 
   # ⭐ THE ONE CHECK WHOSE GREEN MEANS SOMETHING.
