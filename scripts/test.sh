@@ -348,14 +348,29 @@ run_modules() {
         fi
     fi
 
-    # ⭐ LAST, AND ONE AT A TIME (`-j1`). These talk to a real peer with a clock
-    # on both ends; running them beside 215 other test binaries measures the
-    # scheduler rather than the interop. See LIVE_MODULES in test-lib.sh for the
-    # full reasoning, including what this deliberately stops covering.
+    # ⭐ LAST, AND GENUINELY ONE AT A TIME — one `zig build` per module. These
+    # talk to a real peer with a clock on both ends; running them beside 215
+    # other test binaries measures the scheduler rather than the interop. See
+    # LIVE_MODULES in test-lib.sh for the full reasoning, including what this
+    # deliberately stops covering.
+    #
+    # ⚠⚠ `-j1` DID NOT DO THIS, and the step carried the word "serial" in its
+    # own label while not delivering it. Measured 2026-08-15 by sampling argv[0]
+    # during the step: `dtls` and `ssh` ran together at t=4 s, `imap` and `opcua`
+    # at t=10 s — two live peers at once, every run. The CI heartbeat had been
+    # printing `in flight: ssh test 3s, dtls test 3s` for weeks and it read as a
+    # sampling artefact.
+    #
+    # Whatever `-j1` bounds, it is not concurrent RUN steps. Four separate build
+    # invocations cost four build-runner startups, about a second each, and are
+    # the only spelling that cannot quietly stop being true. That matters here
+    # more than the second: the whole point of this step is a claim about what
+    # is NOT running at the same time.
     if [[ ${#live[@]} -gt 0 ]]; then
-        local -a targets=()
-        for m in "${live[@]}"; do targets+=("test-$m"); done
-        step "live interop (${#live[@]} modules, serial)" zig build "${targets[@]}" -j1 --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+        local m
+        for m in "${live[@]}"; do
+            step "live interop: $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+        done
     fi
 
     local log="$_ZL_KEEP_OUT"

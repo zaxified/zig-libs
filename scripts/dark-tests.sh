@@ -161,8 +161,15 @@ if [[ -z "$summary_file" ]]; then
             "$SCRIPT_DIR/capped" zig build "${netns[@]}" --summary all >>"$summary_file" 2>&1
         fi
     fi
+    # One invocation per module, for the reason spelled out in test.sh's
+    # run_modules: `-j1` bounds something, but not concurrent RUN steps. Sampled
+    # 2026-08-15, it let two live peers run at once while the step called itself
+    # serial. Separate processes are the only spelling that cannot stop being
+    # true without anyone noticing.
     if [[ ${#live[@]} -gt 0 ]]; then
-        "$SCRIPT_DIR/capped" zig build "${live[@]}" -j1 --summary all >>"$summary_file" 2>&1
+        for t in "${live[@]}"; do
+            "$SCRIPT_DIR/capped" zig build "$t" --summary all >>"$summary_file" 2>&1
+        done
     fi
 fi
 
