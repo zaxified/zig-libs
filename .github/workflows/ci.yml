@@ -420,6 +420,26 @@ jobs:
           # of one another, whereas `relsafe-` was a prefix of `relsafe-arm64-`.
           # Adding a lane means checking that its key is not a prefix of any
           # other, and no longer merely that it differs.
+          #
+          # ⛔ AND WHOEVER CHANGES THE SHAPE OF A KEY MUST DELETE THE OLD
+          # ENTRIES. An orphaned cache does not clean itself up — it simply
+          # stops being reachable while still counting against the repository's
+          # 10 GB, so a rename pays for both generations at once.
+          #
+          # Fixing the collision above did exactly that, and by the same evening
+          # this repository was at 9.53 GB with 6.01 GB of it unreachable: two
+          # generations under `zig-full-relsafe-`, `zig-full-relfast-` and
+          # `zig-full-relsafe-arm64-` that no `restore-keys` prefix would ever
+          # look for again. With ~480 MB of headroom left, every save evicted
+          # something, LRU took the least recently used — which between pushes
+          # is the scoped lane's entry — and a lane whose key was present an
+          # hour earlier missed it.
+          #
+          #     gh cache list                      # what is actually stored
+          #     gh cache delete '<old-key>'        # per entry; there is no glob
+          #
+          # Deleting the six brought it to 3.53 GB. Nothing was lost: a build
+          # cache regenerates, and these were already unreachable by design.
           key: zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-
