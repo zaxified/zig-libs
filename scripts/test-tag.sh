@@ -137,7 +137,13 @@ check "semver-shaped argument -> refuse" 1 $?
 # blind spot the size of the feature.
 git reset -q --hard >/dev/null 2>&1
 RED_LANE="-Dstrict-debug" bash scripts/tag.sh 2026-10-01 >"$OUT/out.txt" 2>&1
-logf="$WORK/.zig-cache/tag-logs/_Dstrict_debug.log"
+# ⚠ The name is derived from the WHOLE lane string, which now carries the
+# subcommand too ("build -Dstrict-debug"), because the Debug lane compiles and
+# runs no tests. Hard-coding the old spelling made these three cases pass on a
+# file that no longer existed — they went red the moment the lane was renamed,
+# which is the self-test working, but the fix belongs here rather than in a
+# lane name chosen to keep it quiet.
+logf="$WORK/.zig-cache/tag-logs/build__Dstrict_debug.log"
 # Say what was actually seen on failure. A self-test that reports FAIL without
 # the observed value sends its reader to do the measuring again by hand, which
 # is how the first version of these three cases cost an afternoon.

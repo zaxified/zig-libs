@@ -501,6 +501,23 @@ capability_check() {
         gaps+=("OpenSSH missing: ${ssh_missing[*]}|ssh live interop tests skip — the only ones that prove the transport against a real peer rather than against our own encoder|sudo apt install openssh-server openssh-client")
     fi
 
+    # jinja's oracle is a real Python Jinja2, and its VERSION is part of the
+    # claim rather than an implementation detail: the committed golden records
+    # the version that produced it, and on 2026-08-15 a runner carrying a
+    # different one turned two of 337 corpus cases red for `replace` and `trim`
+    # with Markup arguments — our output matched the golden byte for byte in
+    # both, so what had moved was the oracle. Report the version, not just its
+    # presence, because "jinja2 is installed" is not the question.
+    local golden_j2 live_j2
+    golden_j2="$(sed -n 's/.*"jinja2"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        modules/jinja/src/testdata/golden.json 2>/dev/null | head -1)"
+    live_j2="$(python3 -c 'import jinja2; print(jinja2.__version__)' 2>/dev/null)"
+    if [[ -z "$live_j2" ]]; then
+        gaps+=("python lacks jinja2|the whole jinja live-reference suite skips — 337 corpus cases stop being checked against the real engine|pip install 'jinja2==${golden_j2:-3.1.6}'")
+    elif [[ -n "$golden_j2" && "$live_j2" != "$golden_j2" ]]; then
+        gaps+=("jinja2 $live_j2 != golden's $golden_j2|the live oracle is not the one the committed golden was generated from, so a red jinja case may be drift rather than a defect|pip install 'jinja2==$golden_j2'")
+    fi
+
     # opcua's asyncua interop drives a Python client; the interpreter needs
     # asyncua + cryptography. This is a separate gate from podman — the
     # container-backed tests pass without it.
@@ -723,6 +740,41 @@ cmd_changed() {
     summary
 }
 
+# ⭐ COMPILE-ONLY GATE. Same gate as `all`, stopping after the compile.
+#
+# Nobody consumes this collection in Debug. It ships SOURCE (CONVENTIONS §7.1),
+# and an integrator picks the optimize mode in their own build — small, safe or
+# fast. So what a Debug lane is worth asking is whether the code COMPILES
+# there, which is a real question: a downstream developer running their app in
+# Debug compiles our modules in Debug, heavy ones included, and this is the only
+# lane that ever does that (the default lane relaxes heavy modules to
+# ReleaseSafe for wall-clock, see `heavy_optimize` in build.zig).
+#
+# What running the tests there is worth is nothing that can be pointed at, and
+# that was measured on 2026-08-15 rather than assumed:
+#
+#   * Debug and ReleaseSafe arm the SAME safety checks. Debug's only difference
+#     is that it does not optimise, which makes it WEAKER at exposing undefined
+#     behaviour, not stronger — the one documented cross-mode catch went the
+#     other way (ReleaseSafe found a use-after-scope in `http` that Debug
+#     passed by luck, `f88a102`).
+#   * tests in this repo that run ONLY in Debug: zero.
+#   * tests that SKIP in Debug: fifteen, all in `threshold_ecdsa`, gated on
+#     `builtin.mode == .Debug` because they are too slow there. Measured:
+#     `-Dstrict-debug` gives 48/63 with 15 skipped where every other lane gives
+#     63/63. The lane proved LESS than its siblings, not more.
+#   * no finding in the audit corpus is attributed to this lane.
+#
+# ⚠ This is not a shortcut to make a slow lane fit. It is narrowing a lane to
+# the claim it can actually support. If a Debug-only test ever exists, this
+# stops being the right shape and the count above is how you would notice.
+cmd_build() {
+    GATE_BUILD_ONLY=1
+    cmd_all "$@"
+}
+
+GATE_BUILD_ONLY=0
+
 cmd_all() {
     # Drop empty arguments rather than passing them on: main dispatches with
     # "${rest[@]:-}", which expands an EMPTY array to one empty string, and
@@ -735,7 +787,11 @@ cmd_all() {
     graph_load
     local all_mods="${G_NAMES[*]}"
     local n=${#G_NAMES[@]}
-    echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
+    if (( GATE_BUILD_ONLY )); then
+        echo "build: COMPILING every module ($n total) and running NO tests — see cmd_build for why"
+    else
+        echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
+    fi
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     # `af6a148` is why the fmt step is first and why the hook exists: six files
     # had drifted out of fmt, the gate stops on the first failure, and so NO
@@ -778,6 +834,13 @@ cmd_all() {
     # `changed` deliberately does NOT do this: the default step builds the whole
     # collection, and a scoped lane exists precisely to avoid that.
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
+    if (( GATE_BUILD_ONLY )); then
+        # ⚠ The graph snapshot is NOT saved here. It is what `changed` uses to
+        # decide it may run a narrow set, and a run that executed no test has no
+        # business telling the next one that anything was covered.
+        summary
+        return
+    fi
     run_modules "$all_mods"
     graph_save
     summary
@@ -861,6 +924,18 @@ Usage: scripts/test.sh [subcommand] [args]
                         that debt was burned down on 2026-08-14 and it went
                         in the same day. This paragraph said the opposite for
                         the few hours in between.
+  build [FLAGS]         the same gate as `all`, stopping after the compile:
+                        every static check, then every module compiled, and no
+                        test run at all. For the Debug lane, whose whole claim
+                        is that this collection COMPILES in a mode nobody ships
+                        in — an integrator developing against it does build in
+                        Debug, and heavy modules are compiled in real Debug
+                        nowhere else. Running the tests there was measured to
+                        prove nothing the ReleaseSafe lane does not; see the
+                        comment on cmd_build for the numbers.
+                        ⚠ Does NOT update the module-graph snapshot: a run that
+                        executed no test must not tell `changed` that anything
+                        was covered.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.
@@ -893,6 +968,7 @@ main() {
     case "$cmd" in
         changed) cmd_changed "${rest[@]:-}" ;;
         all) cmd_all "${rest[@]:-}" ;;
+        build) cmd_build "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
         vm) cmd_vm "${rest[@]:-}" ;;
         -h|--help|help) usage ;;

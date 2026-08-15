@@ -355,7 +355,7 @@ lane proves something the others cannot:
 | Lane | What it proves |
 |------|----------------|
 | default (Debug, heavy modules at `ReleaseSafe`) | correctness with every safety check armed, fast enough to run on each change |
-| `-Dstrict-debug` | real Debug for the heavy modules too — the default lane relaxes them for wall-clock, so on its own it no longer proves Debug |
+| `-Dstrict-debug` | **compile only, no tests run.** That the collection *builds* in real Debug, heavy modules included — the default lane relaxes those to `ReleaseSafe` for wall-clock, so nothing else compiles them in Debug at all. It is a live question because an integrator developing against these modules builds them in Debug even though nobody ships that way. Running the tests here was measured (2026-08-15) to prove nothing the `ReleaseSafe` lane does not: Debug arms the same safety checks and merely skips optimisation, which makes it *weaker* at exposing UB; tests that run only in Debug: **0**; tests that skip in Debug: **15**, so the lane returned 48/63 where its siblings returned 63/63. If a Debug-only test is ever written, this lane has to go back to running them — that count is how you would notice |
 | `-Doptimize=ReleaseFast` | the code is free of undefined behaviour that the safety checks would otherwise mask, and of anything that only holds because of them |
 | `-Doptimize=ReleaseSafe` | the combination the other two never form — optimisations *and* safety checks armed. Not a formality: it is the lane that caught the only real defect of 2026-08-12 (a use-after-scope) while Debug and ReleaseFast both passed it by luck (`f88a102`). Integrators build in all three, so all three must pass |
 

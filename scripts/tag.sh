@@ -103,14 +103,19 @@ mkdir -p "$LOG_DIR"
 # other two do not already cover. Locally it is nearly free to add after them
 # — its artifacts are already built — but it proves nothing new, so it is not
 # worth the test-run time here.
-lanes=("-Doptimize=ReleaseSafe" "-Doptimize=ReleaseFast" "-Dstrict-debug")
+# Each entry is `<subcommand> <flags>`. Debug is COMPILE-ONLY, matching CI:
+# nothing consumes this collection in Debug, so what that lane can honestly
+# claim is that the code builds there — and running its tests was measured to
+# prove nothing ReleaseSafe does not, while skipping fifteen that its siblings
+# run. See `cmd_build` in scripts/test.sh.
+lanes=("all -Doptimize=ReleaseSafe" "all -Doptimize=ReleaseFast" "build -Dstrict-debug")
 failed=()
 for lane in "${lanes[@]}"; do
     label="${lane:-default}"
     log="$LOG_DIR/${label//[^a-zA-Z0-9]/_}.log"
     printf 'tag.sh: lane %-24s ... ' "$label"
     start=$(date +%s)
-    if bash scripts/test.sh all $lane >"$log" 2>&1; then
+    if bash scripts/test.sh $lane >"$log" 2>&1; then
         printf 'OK   %ss\n' "$(($(date +%s) - start))"
     else
         printf 'FAILED %ss\n' "$(($(date +%s) - start))"
@@ -153,9 +158,9 @@ fi
 
 git tag -a "$tag" -m "$tag
 
-Every module passed every release lane at $head_sha: ReleaseSafe,
-ReleaseFast and strict Debug. That is the whole claim — this is a dated
-snapshot of the collection, not a semantic version. Per-module changes are
-in each module's CHANGELOG; see CONVENTIONS §8."
+Every module passed every release lane at $head_sha: ReleaseSafe and
+ReleaseFast, and compiled in strict Debug. That is the whole claim — this
+is a dated snapshot of the collection, not a semantic version. Per-module
+changes are in each module's CHANGELOG; see CONVENTIONS §8."
 
 echo "tag.sh: created '$tag'. Not pushed — that is the owner's call."
