@@ -1284,6 +1284,33 @@ fn acceptBounded(io: std.Io, listener: *std.Io.net.Server, timeout_ms: i32) !std
 /// this replaces.
 const accept_timeout_ms: i32 = 30_000;
 
+/// Does the LOCAL OpenSSH client know this key-exchange algorithm?
+///
+/// `ssh -Q kex` lists exactly what the installed client can negotiate, so this
+/// asks the peer rather than assuming a version. Answering `false` on any
+/// hiccup is deliberate: a probe that cannot run is not evidence the algorithm
+/// is present, and skipping is the honest verdict.
+fn opensshKnowsKex(io: std.Io, gpa: std.mem.Allocator, kex_name: []const u8) bool {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "/usr/bin/ssh", "-Q", "kex" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return false;
+    var out_reader = child.stdout.?.readerStreaming(io, &.{});
+    const listing = out_reader.interface.allocRemaining(gpa, .limited(64 * 1024)) catch {
+        _ = child.wait(io) catch {};
+        return false;
+    };
+    defer gpa.free(listing);
+    _ = child.wait(io) catch return false;
+    // Whole-line match: `ssh -Q kex` prints one algorithm per line, and a
+    // substring test would accept `sntrup761x25519-sha512` as evidence for
+    // `sntrup761x25519-sha512@openssh.com`.
+    var it = std.mem.tokenizeAny(u8, listing, "\r\n");
+    while (it.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " \t"), kex_name)) return true;
+    return false;
+}
+
 const SelfTestClient = struct {
     port: u16,
     err: ?anyerror = null,
@@ -1609,6 +1636,20 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
 
     // Gate on a runnable OpenSSH client.
     cwd.access(io, "/usr/bin/ssh", .{}) catch return error.SkipZigTest;
+
+    // ⭐ …AND on that client actually knowing the algorithm under test. This is
+    // not defensive tidiness: `mlkem768x25519-sha256` arrived in OpenSSH 9.9,
+    // this host runs 10.2p1 and the GitHub ubuntu-24.04 runner runs 9.6, so on
+    // 2026-08-15 the runner's `ssh` refused the `-o KexAlgorithms` line and
+    // exited before opening a socket. Four sibling tests naming other KEX
+    // algorithms passed on that same runner, which is what isolates the cause.
+    //
+    // The old shape then blocked in `accept` for the life of the process: it
+    // was the whole reason every CI lane ran into the six-hour job limit. The
+    // bounded accept turns that into a failure, but a failure is still the
+    // wrong verdict — an algorithm the local client cannot speak is an
+    // ENVIRONMENT gap, not a defect in our server. Ask, and skip loudly.
+    if (!opensshKnowsKex(io, gpa, kex_name)) return error.SkipZigTest;
 
     // Throwaway temp dir (same pattern as transport.zig's sshd interop test).
     var rnd: [8]u8 = undefined;
