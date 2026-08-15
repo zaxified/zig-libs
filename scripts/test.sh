@@ -690,9 +690,16 @@ capability_check() {
     # four reported a grpcio gap on a host where grpc's tests were running fine
     # from its venv — a false gap, which spends the reader's trust in exactly
     # the report that most needs it.
+    #
+    # ⚠ AND IT MUST IMPORT EVERYTHING THAT INTERPRETER WILL BE ASKED TO IMPORT.
+    # `grpc` is one entry with two packages: both of its oracle scripts import
+    # `google.protobuf` as well as `grpc`, and a venv sees no system
+    # site-packages, so "grpcio is installed" is not the question. Probing only
+    # `grpc` reported no gap on a runner whose venv had exactly that, and the
+    # test then failed on the missing import rather than skipping.
     local oracle
     for oracle in \
-        "grpc|grpcio|zig-libs-grpc|15 grpc reference-interop tests (the gRPC wire format against a real grpcio peer)" \
+        "grpc, google.protobuf|grpcio protobuf|zig-libs-grpc|15 grpc reference-interop tests (the gRPC wire format against a real grpcio peer)" \
         "sympy|sympy||5 poseidon subspace-trail tests (the algebraic attack bound, recomputed rather than trusted)" \
         "brotli|brotli||4 brotli reference-interop tests (round-trips against google/brotli itself)" \
         "google.protobuf|protobuf||9 protobuf reference-interop tests (our encoding against the upstream Python runtime)"

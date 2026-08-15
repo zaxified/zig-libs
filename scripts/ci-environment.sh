@@ -97,7 +97,12 @@ PY
 # Four venvs, because each of these modules looks for one at a fixed path
 # before falling back to a bare `python3` (or, for opcua, is pointed at one by
 # OPCUA_PYTHON). Keep the paths in step with the probes in test.sh.
-for spec in "grpc:grpcio" "opcua:asyncua cryptography" "imap:pymap"; do
+# ⚠ `grpc` takes protobuf TOO, and a venv does not see system site-packages.
+# The first run of this script installed protobuf system-wide and grpcio into
+# the venv, so the venv's interpreter — the one grpc's tests actually spawn —
+# had grpcio and no `google.protobuf`, and the oracle script died on an import.
+# List everything a venv's own scripts import; nothing outside it will help.
+for spec in "grpc:grpcio protobuf" "opcua:asyncua cryptography" "imap:pymap"; do
     name="${spec%%:*}"
     pkgs="${spec#*:}"
     python3 -m venv "$HOME/.cache/zig-libs-$name" >/dev/null 2>&1 || true

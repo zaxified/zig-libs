@@ -118,9 +118,22 @@ fn interpreter(buf: []u8) []const u8 {
     return "python3";
 }
 
+/// ⚠ THIS MUST NAME EVERYTHING THE ORACLE SCRIPTS IMPORT, not just the one the
+/// module is named after. It checked `grpc` alone until 2026-08-15, and both
+/// `reference_client.py` and `reference_server.py` also import
+/// `google.protobuf` — so on an interpreter carrying grpcio without protobuf
+/// the gate said "peer available", the test ran, and the client died on
+/// `ModuleNotFoundError: No module named 'google'`. That turned a gap in the
+/// environment into a RED GATE with a Python traceback in it, which is the one
+/// thing a gate must not do: it has to go red for our reasons.
+///
+/// The failure mode is invisible on a development machine, where whatever
+/// installed grpcio pulled protobuf in alongside it. It surfaced the first time
+/// a runner had grpcio installed deliberately and protobuf not — i.e. the first
+/// time these tests ran in CI at all.
 fn requireGrpcio(io: std.Io, python: []const u8) error{SkipZigTest}!void {
     var child = std.process.spawn(io, .{
-        .argv = &.{ python, "-c", "import grpc" },
+        .argv = &.{ python, "-c", "import grpc, google.protobuf" },
         .stdin = .close,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -128,7 +141,7 @@ fn requireGrpcio(io: std.Io, python: []const u8) error{SkipZigTest}!void {
     const term = child.wait(io) catch return skip("python could not be waited on");
     switch (term) {
         .exited => |code| if (code != 0)
-            return skip("python has no `grpcio` module (pip install grpcio)"),
+            return skip("python lacks `grpcio` or `protobuf` — the oracle scripts import both (pip install grpcio protobuf)"),
         else => return skip("python terminated abnormally"),
     }
 }
