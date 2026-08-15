@@ -394,9 +394,10 @@ run_modules() {
 # modules skipped is the only way that stays visible — see the `skip = pass`
 # family of findings for why a silent skip is the expensive kind.
 summary_digest() {
-    local log="$1" text
+    local log="$1" text full prog
     [[ -s "$log" ]] || return 0
-    text=$(awk '
+    # One program, rendered twice — see `skip_cap` in the END block for why.
+    prog='
         # "12s" / "786ms" / "1m3s" -> milliseconds. `ms` must be tested before
         # `m`, or every millisecond figure reads as minutes.
         function ms(t,   n) {
@@ -435,9 +436,16 @@ summary_digest() {
             # The COUNT is the finding; the worst dozen names are enough to
             # act on. Forty-one modules on one line wraps into unreadability,
             # which is how a number stops being read at all.
+            #
+            # ⚠ …in a TERMINAL. `skip_cap` exists because the summary page of a run
+            # is a different medium with different readers, and on 2026-08-15 the
+            # cap truncated exactly the information the arm64 lane exists to
+            # produce: it reported "150 in 48 modules" with "+36 more", and the
+            # tail was where the architecture-specific skips lived. Same digest,
+            # rendered twice — capped for the log, whole for the page.
             total_skips = 0; shown = 0; out = ""
             for (k in skipped) total_skips += skipped[k]
-            for (n = 0; n < 12; n++) {
+            for (n = 0; skip_cap <= 0 || n < skip_cap; n++) {
                 best = -1; bn = ""
                 for (k in skipped) if (skipped[k] > best) { best = skipped[k]; bn = k }
                 if (bn == "" || best <= 0) break
@@ -450,7 +458,9 @@ summary_digest() {
                 printf("  %-16s %d in %d module(s) — %s%s\n", "skipped:", total_skips, shown + more, out,
                        more > 0 ? sprintf(" · +%d more", more) : "")
         }
-    ' "$log") || return 0
+    '
+    text=$(awk -v skip_cap=12 "$prog" "$log") || return 0
+    full=$(awk -v skip_cap=0 "$prog" "$log") || full="$text"
     [[ -n "$text" ]] || return 0
     printf '%s\n' "$text"
 
@@ -463,7 +473,7 @@ summary_digest() {
     # markup emitted on stdout. Off CI the variable is unset and this is inert,
     # so a local run reads exactly as before.
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-        printf '### %s\n\n```\n%s\n```\n\n' "${ZIGLIBS_LANE:-gate}" "$text" >> "$GITHUB_STEP_SUMMARY"
+        printf '### %s\n\n```\n%s\n```\n\n' "${ZIGLIBS_LANE:-gate}" "${full:-$text}" >> "$GITHUB_STEP_SUMMARY"
     fi
 }
 
@@ -569,6 +579,26 @@ capability_check() {
     else
         if ! podman image exists docker.io/open62541/open62541:latest 2>/dev/null; then
             gaps+=("open62541 image not pulled|opcua live server-interop tests skip|podman pull docker.io/open62541/open62541:latest")
+        else
+            # ⚠ THE PEER'S ARCHITECTURE IS PART OF WHAT THIS COSTS, and nothing
+            # said so until the arm64 lane of tag 2026-08-15. open62541 publishes
+            # no aarch64 image, so `podman pull` there fetched the amd64 one,
+            # printed one warning line, and ran it under emulation: opcua took
+            # 540 s of a 724 s lane — 4.5x its amd64 figure — and skipped 7 tests.
+            #
+            # Deliberately NOT an automatic downgrade to "skip the container
+            # tests on arm64". An emulated peer is still a real third-party
+            # implementation, and interop correctness does not depend on the
+            # peer's ISA; what it costs is wall-clock. That trade is the owner's
+            # call, so this states the fact and the price instead of deciding.
+            local img_arch host_arch
+            img_arch="$(podman image inspect --format '{{.Architecture}}' \
+                docker.io/open62541/open62541:latest 2>/dev/null)"
+            host_arch="$(uname -m)"
+            case "$host_arch" in x86_64) host_arch=amd64 ;; aarch64) host_arch=arm64 ;; esac
+            if [[ -n "$img_arch" && "$img_arch" != "$host_arch" ]]; then
+                gaps+=("open62541 image is $img_arch on a $host_arch host|opcua's container tests run EMULATED — they still exercise a real peer, but at several times the wall-clock (540 s vs 120 s, tag 2026-08-15)|nothing to run: open62541 publishes no $host_arch image. Decide whether the coverage is worth the minutes")
+            fi
         fi
         # Rootless podman needs a userspace network backend. Nothing today
         # depends on container networking, but without one any container that
@@ -637,6 +667,48 @@ capability_check() {
         gaps+=("no pymap IMAP server|1 imap live interop test skips (the only test that proves the client's SEQUENCING, not just its parsing)|python3 -m venv ~/.cache/zig-libs-imap && ~/.cache/zig-libs-imap/bin/pip -q install pymap")
     fi
 
+    # ⭐ FOUR MORE PYTHON ORACLES, and they were invisible until 2026-08-15.
+    #
+    # Every module below is checked against an INDEPENDENT implementation of the
+    # thing it implements — the highest-value tests in this collection, because
+    # they are the only ones that can fail for a reason our own encoder does NOT
+    # share. Each skips loudly in its own log line when its interpreter cannot import
+    # the package, and every one of those lines lands in a per-module summary
+    # this driver used to delete.
+    #
+    # The consequence, measured on the arm64 lane of tag 2026-08-15: the report
+    # said "1 gap" while 22 of these tests skipped. A capability report that
+    # names four of six oracles is not a report, it is a subset that reads like
+    # one — and the modules it misses stay green. `capability_check` is where
+    # this is fixed, NOT the individual tests: they already say what they need,
+    # in the right words, to a reader who is looking at the right module.
+    #
+    # ⚠ A PROBE MUST USE THE INTERPRETER THE TEST USES, and the first draft of
+    # this loop did not. Three of the four spawn a bare `python3`; `grpc` tries
+    # `~/.cache/zig-libs-grpc/bin/python` first and falls back (see
+    # `interpreter()` in its reference_interop.zig). Probing `python3` for all
+    # four reported a grpcio gap on a host where grpc's tests were running fine
+    # from its venv — a false gap, which spends the reader's trust in exactly
+    # the report that most needs it.
+    local oracle
+    for oracle in \
+        "grpc|grpcio|zig-libs-grpc|15 grpc reference-interop tests (the gRPC wire format against a real grpcio peer)" \
+        "sympy|sympy||5 poseidon subspace-trail tests (the algebraic attack bound, recomputed rather than trusted)" \
+        "brotli|brotli||4 brotli reference-interop tests (round-trips against google/brotli itself)" \
+        "google.protobuf|protobuf||9 protobuf reference-interop tests (our encoding against the upstream Python runtime)"
+    do
+        local mod="${oracle%%|*}" rest2="${oracle#*|}"
+        local pkg="${rest2%%|*}"; rest2="${rest2#*|}"
+        local venv="${rest2%%|*}" cost="${rest2#*|}"
+        local py=python3 fix="pip install $pkg"
+        if [[ -n "$venv" ]]; then
+            [[ -x "$HOME/.cache/$venv/bin/python" ]] && py="$HOME/.cache/$venv/bin/python"
+            fix="python3 -m venv ~/.cache/$venv && ~/.cache/$venv/bin/pip -q install $pkg"
+        fi
+        "$py" -c "import $mod" >/dev/null 2>&1 \
+            || gaps+=("python lacks $pkg|up to $cost skip|$fix")
+    done
+
     # Always present: RTM_NEWACTION checks CAP_NET_ADMIN in the INITIAL user
     # namespace, so `unshare -rn` cannot grant it however userns is configured.
     #
@@ -700,14 +772,25 @@ cmd_changed() {
                 # Might have changed the graph — ask the graph, do not assume.
                 trigger_graph=1
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped)
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
+                #
+                # ⚠ The membership rule is "the gate EXECUTES it", not "it lives
+                # in scripts/". Four of these were missing until 2026-08-15 and
+                # each was the same hole: `dark-tests.sh` decides which tests
+                # count as dark, `ci-environment.sh` decides which live peers
+                # exist on a runner, and `test-tag.sh` plus `hooks/*` are run as
+                # gate steps in their own right. Editing any of them changes
+                # what a green run means while leaving the narrowing untouched.
+                #
+                # Everything else under scripts/ is a tool the gate never calls
+                # (generators, dissect.py, vm/**), so it stays below.
                 trigger_all=1
                 ;;
             scripts/*)
-                ;; # scripts/README.md, scripts/vm/** — no effect on this lane
+                ;; # scripts/README.md, scripts/vm/**, generators — not gate steps
             README.md)
                 trigger_catalog=1
                 ;;
@@ -733,8 +816,14 @@ cmd_changed() {
     # change-aware path used to skip fmt entirely — so a commit verified only
     # this way could ship unformatted code, and one did (f76f360,
     # modules/decimal/src/root.zig). Per-file, so it costs milliseconds.
-    local zig_changed
-    zig_changed=$(printf '%s\n' "$files" | grep -E '\.zig$' || true)
+    #
+    # Skipped when the harness moved, because both escalations below open with a
+    # whole-tree `zig fmt --check` that strictly contains this one. Running it
+    # anyway printed two fmt steps in one log, which reads as two different
+    # checks rather than one done twice — and a step list that misrepresents
+    # itself is the thing this driver spends the most comments guarding against.
+    local zig_changed=""
+    [[ $trigger_all -eq 1 ]] || zig_changed=$(printf '%s\n' "$files" | grep -E '\.zig$' || true)
     if [[ -n "$zig_changed" ]]; then
         local existing=()
         local f
@@ -747,6 +836,32 @@ cmd_changed() {
     graph_load
 
     if [[ $trigger_all -eq 1 ]]; then
+        # ⭐ ON CI THE SMOKE SET IS NOT ENOUGH, and 2026-08-15 is why.
+        #
+        # `eef1e28` changed scripts/test.sh, test-lib.sh, dark-tests.sh, ci.yml
+        # AND modules/opcua/src/server_interop.zig — 191 lines of the driver two
+        # days of work had gone into. The harness had moved, so this branch ran
+        # the smoke set: `netlink` and `testkit`. opcua was not built, let alone
+        # tested. The job exited 0, the aggregate `gate` job read `success`, and
+        # the push went green having tested none of what it changed.
+        #
+        # The message below is the right answer AT A KEYBOARD, where "run
+        # scripts/test.sh all before committing" is advice a person can take.
+        # In CI there is nobody to take it and a runner already standing idle,
+        # so the honest thing is to spend the runner rather than print advice
+        # into a log nobody reads on a green run.
+        #
+        # ⚠ Fail-closed, like every other escalation in this driver: unable to
+        # narrow means run everything, never run less. The cost is that a push
+        # touching the harness pays a full lane — which is exactly what a change
+        # to the thing that decides coverage should cost.
+        if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+            echo "changed: the harness or a CI lane definition changed, and this is CI."
+            echo "  What narrows the module set is what moved, so it cannot narrow itself."
+            echo "  Escalating to the full gate rather than to a smoke set — see cmd_changed."
+            cmd_all
+            return
+        fi
         harness_smoke
         return
     fi
@@ -945,6 +1060,15 @@ cmd_all() {
     # collection, and a scoped lane exists precisely to avoid that.
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
     if (( GATE_BUILD_ONLY )); then
+        # This lane runs no test, so there is no `--summary all` to digest and
+        # nothing lands on the run's page. A lane that contributes NOTHING there
+        # reads as one that failed to report, not as one with nothing to report,
+        # and on 2026-08-15 three of four lanes had a block and this one did not.
+        # One line, saying what it did and what that is worth.
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            printf '### %s\n\n```\n  %-16s %d modules compiled, 0 tests run (see cmd_build)\n```\n\n' \
+                "${ZIGLIBS_LANE:-gate}" "compile only:" "$n" >> "$GITHUB_STEP_SUMMARY"
+        fi
         # ⚠ The graph snapshot is NOT saved here. It is what `changed` uses to
         # decide it may run a narrow set, and a run that executed no test has no
         # business telling the next one that anything was covered.

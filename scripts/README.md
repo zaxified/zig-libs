@@ -19,6 +19,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. |
 | `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
 | `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
+| `ci-environment.sh` | Installs the live peers a hosted runner lacks — wolfSSL, the open62541 container, five Python oracles. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. |
 | `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. |
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. |
 | `dissect.py` | Drives Wireshark's headless dissector (`sharkd`) as an external oracle for wire-format modules. |
@@ -63,14 +64,21 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
 
 - `modules/<name>/**` → module `<name>`
 - `build.zig`, `build.zig.zon` → **ask the graph** (see below), not "all"
-- `.github/**`, `scripts/test.sh`, `scripts/test-lib.sh`, `scripts/capped` → a
-  **smoke set**, plus a loud note that this is not the gate. The harness is the
-  very thing that decides a narrower set, so it cannot vouch for its own
-  narrowing; instead it runs one plain and one netns-wrapped module — the two
-  classes `run_modules` actually distinguishes — to prove the select → build →
-  run → report path still works, and tells you to run `scripts/test.sh all`
-  before committing
-- `scripts/README.md`, `scripts/vm/**` → nothing; neither affects this lane
+- `.github/**` and any script the gate itself executes — `test.sh`,
+  `test-lib.sh`, `capped`, `dark-tests.sh`, `ci-environment.sh`, `test-tag.sh`,
+  `hooks/**` → **locally, a smoke set** plus a loud note that this is not the
+  gate. The harness is the very thing that decides a narrower set, so it cannot
+  vouch for its own narrowing; instead it runs one plain and one netns-wrapped
+  module — the two classes `run_modules` actually distinguishes — to prove the
+  select → build → run → report path still works, and tells you to run
+  `scripts/test.sh all` before committing.
+  **On CI (`GITHUB_ACTIONS` set) it escalates to the full gate instead.** The
+  advice above is something a person at a keyboard can act on; a runner cannot,
+  and on 2026-08-15 a push that rewrote 191 lines of opcua's driver went green
+  having never built the module. The membership rule is "the gate executes it",
+  not "it lives in `scripts/`" — four of those entries were missing until then
+- `scripts/README.md`, `scripts/vm/**`, the generators → nothing; none is a gate
+  step
 - Root docs → no modules, but a `README.md` change still runs `check-catalog`,
   and a root `CHANGELOG.md` change still runs `check-changelog` (that file is
   the index of the per-module changelogs, so editing it is exactly how it goes

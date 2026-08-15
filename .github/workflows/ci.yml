@@ -172,8 +172,13 @@ jobs:
   scoped:
     if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-26.04
-    # A scoped lane is minutes; anything approaching this is wedged, not slow.
-    timeout-minutes: 30
+    # A scoped lane is minutes — but this job is no longer always scoped. When
+    # the harness moves, `test.sh changed` escalates to the full gate here (see
+    # cmd_changed), and that is a run of all 225 modules whose cold-cache figure
+    # on a comparable lane was ~45 minutes. Thirty would have turned a correct
+    # escalation into a timeout, which is the worst of both: the coverage is
+    # paid for and then thrown away.
+    timeout-minutes: 75
     name: changed modules + reverse-dep closure
     steps:
       # Full history: `test.sh changed <base>` diffs against the base branch,
@@ -213,6 +218,19 @@ jobs:
           key: zig-${{ runner.os }}-base2-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-${{ runner.os }}-base2-
+      # ⚠ THE SCOPED LANE NEEDS THE PEERS TOO, which it did not have until
+      # 2026-08-15. It gates every push, and until this step existed it opened
+      # every run with the same six-gap report the `full` job had learned to
+      # close — so a push touching `wireguard` or `dtls` was gated by a lane
+      # whose privileged and live tests skipped.
+      #
+      # It became load-bearing the moment `test.sh changed` learned to escalate
+      # to the FULL gate on CI when the harness moves: this job now sometimes
+      # runs all 225 modules, and doing that with no peers installed would
+      # report green over every live test in the collection.
+      - name: Close the environment gaps the gate reports
+        continue-on-error: true
+        run: bash scripts/ci-environment.sh
       # The base differs by event, and a base that does not resolve is NOT
       # allowed to read as "nothing changed" — `changed_files` fails and the
       # driver escalates to the full run rather than passing having tested
@@ -222,6 +240,9 @@ jobs:
         env:
           ZIGLIBS_LANE: changed modules + reverse-dep closure
         run: |
+          # Same as the `full` job: the imap peer is found at its default path,
+          # the opcua one is named by an environment variable.
+          export OPCUA_PYTHON="$HOME/.cache/zig-libs-opcua/bin/python3"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="origin/${{ github.base_ref }}"
           else
@@ -362,59 +383,12 @@ jobs:
         # at all. Measured on 2026-08-15: 26 s of a 271 s lane spent installing
         # things nothing would touch.
         if: matrix.cmd != 'build'
-        # Every lane of 2026-08-15 opened with the SAME six-gap report, and one
-        # of them is expensive: without `unshare -rn` the privileged tests of
-        # ten netlink-writing modules skip, and the gate's own words for that
-        # are "reported green while covering less". A hosted runner can close
-        # all of them — it has sudo — so the only reason they were open is that
-        # nobody had installed anything.
-        #
-        # ⚠ EVERY LINE IS ALLOWED TO FAIL, and that is not fail-open. The gate
-        # re-probes the environment itself and prints what is still missing
-        # with what it costs, so a failed install downgrades coverage LOUDLY
-        # instead of failing a lane over a package mirror. The arm64 lane is
-        # the case that needs this: not every one of these ships for aarch64.
-        # What must never happen is a gap closing silently, and the report is
-        # what prevents that — read it, do not assume this step worked.
+        # ⚠ SHARED WITH THE `scoped` JOB, deliberately. This was inline here
+        # until 2026-08-15, which is precisely why the lane that gates every
+        # push had none of it. Two copies of an install list drift; one script
+        # that both jobs run cannot.
         continue-on-error: true
-        run: |
-          # 1. unprivileged user namespaces — Ubuntu restricts them via
-          #    AppArmor (24.04 and 26.04 alike), which is what makes
-          #    `unshare -rn` fail on a stock runner.
-          echo 'kernel.apparmor_restrict_unprivileged_userns=0' \
-            | sudo tee /etc/sysctl.d/60-zig-libs-userns.conf >/dev/null || true
-          sudo sysctl --system >/dev/null 2>&1 || true
-          unshare -rn true && echo "userns: OK" || echo "userns: still unavailable"
-
-          # 2. dtls's live DTLS 1.3 peer. wolfSSL, because OpenSSL 3.5 and
-          #    GnuTLS 3.8 have no DTLS 1.3 at all.
-          sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libwolfssl-dev || true
-
-          # 3. opcua's container-backed live server interop.
-          podman pull -q docker.io/open62541/open62541:latest || true
-
-          # 4/5. Two Python peers, each an INDEPENDENT implementation of the
-          #      protocol its module speaks. Default paths, so scripts/test.sh
-          #      finds them with no environment variable.
-          # 3b. jinja's oracle is a REAL Python Jinja2, and its version is part
-          #     of the claim, not an implementation detail. The committed
-          #     golden records `"jinja2": "3.1.6"`; the runner shipped a
-          #     different one, and on 2026-08-15 two of 337 corpus cases came
-          #     out differently for `replace` and `trim` with Markup arguments.
-          #     Our output matched the golden byte for byte in both — the
-          #     ORACLE had moved, which is exactly what the golden-vs-live test
-          #     is there to catch. A gate must go red for our reasons, so pin
-          #     the oracle here and bump it deliberately.
-          #     PEP 668 marks the system interpreter externally-managed, and
-          #     the test invokes a bare `python3`, so this has to land there.
-          sudo pip3 install --break-system-packages -q "jinja2==3.1.6" || true
-          python3 -c 'import jinja2; print("jinja2:", jinja2.__version__)' || true
-
-          python3 -m venv ~/.cache/zig-libs-opcua || true
-          ~/.cache/zig-libs-opcua/bin/pip -q install asyncua cryptography || true
-          python3 -m venv ~/.cache/zig-libs-imap || true
-          ~/.cache/zig-libs-imap/bin/pip -q install pymap || true
+        run: bash scripts/ci-environment.sh
       - name: Test (${{ matrix.name }})
         env:
           # Names this lane's block on the run's summary page, where the four
@@ -424,7 +398,9 @@ jobs:
           # The imap peer is found at its default path; the opcua one is named
           # by an environment variable, so point it at the venv built above.
           # A path that does not exist is not a silent loss: test.sh probes it
-          # and reports the gap.
+          # and reports the gap — on the lanes that run tests. The compile-only
+          # lane builds no venv and runs no probe, so on that one this line is
+          # inert, not a safety net.
           export OPCUA_PYTHON="$HOME/.cache/zig-libs-opcua/bin/python3"
           bash scripts/test.sh ${{ matrix.cmd }} ${{ matrix.args }}
       - name: tc action tests, as real root
@@ -448,11 +424,20 @@ jobs:
         # ⚠ This has never run anywhere. If it goes red, that is a finding about
         # tc, not about this step — those tests have been skipping since the
         # module was written.
+        #
+        # ⭐ `--summary all`, and it is the whole point of the step rather than
+        # decoration. Its first run anywhere, on tag 2026-08-15, printed NOT ONE
+        # LINE in thirty-five seconds and exited 0 — which is what `zig build`
+        # does on success, and which is indistinguishable from the tests
+        # skipping exactly as they always had. A step that exists to close a
+        # coverage gap and cannot say whether it closed it is the same fail-open
+        # shape it was written to fix.
         if: matrix.cmd != 'build'
         run: |
           sudo unshare -n "$(command -v zig)" build test-tc ${{ matrix.args }} \
+            --summary all \
             --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root
-      - name: Report the cache footprint
+      - name: Report the cache footprint and what this runner is
         # The number the cache decision has never had. Whether five lanes fit
         # under a 10 GB repository quota is arithmetic, and until this line
         # existed the only figure anyone had was the DEVELOPMENT tree's — which
@@ -462,10 +447,44 @@ jobs:
         # `if: always()` because a RED lane's footprint is worth just as much:
         # actions/cache will not save it, and knowing the size anyway is how a
         # permanently cold lane gets explained rather than guessed at.
+        #
+        # ⭐ AND THE CPU, because the first warm run split the lanes in two and
+        # the reason is not yet established. Tag 2026-08-15, every lane restoring
+        # from the same previous generation, one module changed between them:
+        #
+        #   lane                restored   compile   tree    saved
+        #   ReleaseSafe arm64     656 MB      42 s   2.7 GB   698 MB
+        #   ReleaseSafe amd64     700 MB    1812 s   (red, saved nothing)
+        #   ReleaseFast amd64     721 MB    2035 s   6.0 GB  1457 MB
+        #
+        # arm64 reused its artifacts and rebuilt the one module that moved. Both
+        # amd64 lanes restored a cache of the same size and then recompiled
+        # essentially everything, ending with BOTH generations on disk — which is
+        # how ReleaseFast's saved archive went from 756 MB to 1457 MB in a single
+        # run. A cache that grows every generation while saving a quarter of the
+        # compile is the shape this file already warns about: it costs the quota
+        # AND the pretence of being warm.
+        #
+        # Nothing here pins the target, and `native` is not one thing. `zig env`
+        # resolves it to something like `x86_64-linux.7.0...7.0-gnu.2.43` — a
+        # KERNEL VERSION RANGE and a glibc version — on top of the CPU model that
+        # Zig detects for codegen. All of it feeds Zig's own cache key, and any
+        # of it can differ between two runners drawn from the same pool.
+        #
+        # That is a hypothesis, not a finding, so this prints the three
+        # candidates rather than acting on them. The next warm run settles it: if
+        # a lane that missed reports a different target string or CPU than the
+        # run that saved the cache, the cause is named, and pinning a baseline
+        # becomes a deliberate trade — portability of the artifact against native
+        # codegen — instead of a hunch. If they all match, the cause is elsewhere
+        # and this file should stop implying otherwise.
         if: always()
         run: |
           du -sh "$GITHUB_WORKSPACE/.zig-cache" 2>/dev/null || echo "no .zig-cache"
           du -sh "$GITHUB_WORKSPACE/.zig-cache/o" 2>/dev/null || true
+          echo "kernel:     $(uname -srm)"
+          echo "cpu:        $(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo unknown)"
+          echo "zig target: $(zig env 2>/dev/null | grep -m1 '\.target' | cut -d'"' -f2 || echo unknown)"
 
   # ⭐ THE ONE CHECK WHOSE GREEN MEANS SOMETHING.
   #
@@ -485,10 +504,18 @@ jobs:
   # be misread. Borrowed from vercel-labs/native, which keeps a stable
   # required-check name the same way.
   #
-  # ⚠ WHAT THIS DOES NOT CATCH, so nobody retires the concern by pointing here:
-  # a `scoped` run that detects a harness change, prints "this is NOT the gate"
-  # and runs a smoke set still exits 0, so it is `success` and this job is
-  # happy. That gap is real and separate.
+  # ⚠ THE GAP THIS USED TO CARRY IS CLOSED UPSTREAM OF HERE, and the fix is not
+  # in this job. A `scoped` run that detected a harness change used to print
+  # "this is NOT the gate", run a two-module smoke set, and exit 0 — `success`,
+  # and this job was happy. It happened for real on `eef1e28`, which changed
+  # 191 lines of opcua's driver and never built the module.
+  #
+  # `test.sh changed` now escalates to the FULL gate when it sees a harness
+  # change AND `GITHUB_ACTIONS` is set (see cmd_changed), so the shape this job
+  # cannot detect no longer occurs. That is the right place for it: this job
+  # reads job RESULTS, and "ran less than it should have" is not visible in a
+  # result. Which is worth remembering the next time something here needs
+  # asserting — the answer may again be in the driver rather than in this file.
   gate:
     name: gate
     if: always()
