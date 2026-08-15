@@ -280,6 +280,31 @@ EXTRA_ZIG_ARGS=()
 #
 # `--summary all` is passed unconditionally and the output is kept, because the
 # dark-test check below reads it. See `dark_check`.
+# ⭐ PER-TEST DEADLINE. The one thing that turns a hang into a finding.
+#
+# On 2026-08-15 the tag matrix died at GitHub's six-hour job limit, and the
+# cause was not the size of the collection: in EVERY lane a single module —
+# `ssh` — was the only process still alive, for 23 to 64 minutes, while the
+# other 214 finished in one to eight. Nothing in the run could say which TEST
+# inside it was stuck, so the lane simply burned to the wall and was cancelled,
+# taking every other lane's verdict with it. The same tests pass locally in 4 s.
+#
+# `zig build --test-timeout` is per-TEST, not per-module, and it names the
+# culprit exactly — `error: 'root.test.<name>' timed out after …` — then lets
+# the remaining tests in that binary run. A hang becomes a red test with an
+# address instead of a wall-clock mystery.
+#
+# ⚠ THE VALUE IS A CEILING ON PATHOLOGY, NOT A TARGET. Measured locally under
+# `-Dstrict-debug`, the slowest lane: the longest legitimate single tests run
+# just over a minute (dkg's end-to-end anchor, p256's differential-vs-std and
+# comb oracle). Ten minutes leaves an order of magnitude for a loaded or
+# slower runner — arm64 included — while still bounding a wedged test to
+# minutes. Raise it only against a MEASUREMENT that a real test needs more.
+#
+# ⛔ NOT a substitute for a test that cannot hang. It is the backstop that makes
+# the hang findable; the test still has to be fixed.
+TEST_TIMEOUT="${TEST_TIMEOUT:-10m}"
+
 run_modules() {
     local mods="$1"
     [[ -z "${mods// /}" ]] && return 0
@@ -298,17 +323,17 @@ run_modules() {
     if [[ ${#rest[@]} -gt 0 ]]; then
         local -a targets=()
         for m in "${rest[@]}"; do targets+=("test-$m"); done
-        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all "${EXTRA_ZIG_ARGS[@]}"
+        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
     fi
 
     if [[ ${#netns[@]} -gt 0 ]]; then
         local -a targets=()
         for m in "${netns[@]}"; do targets+=("test-$m"); done
         if have_unshare; then
-            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}" --summary all "${EXTRA_ZIG_ARGS[@]}"
+            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
         else
             echo "note: unshare -rn unavailable — running netns-gated modules plainly; their privileged tests will SKIP" >&2
-            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}" --summary all "${EXTRA_ZIG_ARGS[@]}"
+            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
         fi
     fi
 
@@ -450,6 +475,23 @@ capability_check() {
         gaps+=("no C compiler (cc)|2 dtls live wolfSSL interop tests skip|sudo apt install build-essential")
     elif [[ ! -e /usr/include/wolfssl/ssl.h ]]; then
         gaps+=("wolfSSL headers missing|2 dtls live wolfSSL interop tests skip|sudo apt install libwolfssl-dev")
+    fi
+
+    # ssh's live interop needs BOTH directions of a real OpenSSH: `sshd` for
+    # the tests that drive our client against a real server, and the `ssh`
+    # client for the ones that drive a real client against our server.
+    # `ssh-keygen` mints the ephemeral host and client keys for both.
+    #
+    # ⚠ This probe was missing until 2026-08-15, and its absence is exactly the
+    # shape the report exists to prevent: `ssh` carries 46 `SkipZigTest` paths,
+    # so on a host without these the module reports a green module having
+    # proved nothing against a real peer, and nothing anywhere said so.
+    local ssh_missing=()
+    [[ -x /usr/sbin/sshd ]] || ssh_missing+=("sshd")
+    command -v ssh >/dev/null 2>&1 || ssh_missing+=("ssh")
+    command -v ssh-keygen >/dev/null 2>&1 || ssh_missing+=("ssh-keygen")
+    if [[ ${#ssh_missing[@]} -gt 0 ]]; then
+        gaps+=("OpenSSH missing: ${ssh_missing[*]}|ssh live interop tests skip — the only ones that prove the transport against a real peer rather than against our own encoder|sudo apt install openssh-server openssh-client")
     fi
 
     # opcua's asyncua interop drives a Python client; the interpreter needs

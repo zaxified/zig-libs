@@ -1247,6 +1247,43 @@ fn listenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
     return error.SkipZigTest;
 }
 
+/// ⭐ `accept`, but it cannot wait forever. Every accept in this module's tests
+/// goes through here.
+///
+/// THE FAILURE MODE IS NOT A SLOW PEER, IT IS A PEER THAT ALREADY GAVE UP. The
+/// live tests below spawn a real `/usr/bin/ssh` and then block in `accept`
+/// waiting for it. A client that exits before connecting — a version that
+/// rejects one of our `-o` options, a key it declines to load, anything —
+/// leaves nobody to connect, and a bare `accept` then blocks for as long as the
+/// process lives. That is not a hypothetical: on 2026-08-15 `ssh` was the only
+/// module still running in every CI lane, alone for 23 to 64 minutes, and took
+/// the six-hour job limit and every other lane's verdict with it. The same
+/// tests pass locally in four seconds.
+///
+/// ⛔ `SO_RCVTIMEO` is NOT the way to do this, though it is the obvious one:
+/// `accept` honours it, but `std.Io.Threaded` treats the resulting `EAGAIN` as
+/// impossible and panics with "programmer bug caused syscall error: AGAIN".
+/// Measured, not guessed. `poll(2)` on the raw handle stays outside `std.Io`
+/// entirely, which is why it works — and it is what `opcua`'s interop driver
+/// already uses for the same reason.
+fn acceptBounded(io: std.Io, listener: *std.Io.net.Server, timeout_ms: i32) !std.Io.net.Stream {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = listener.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const n = std.posix.poll(&fds, timeout_ms) catch return error.AcceptPollFailed;
+    // A connection that never arrives is a FAILURE, not a skip: the peer was
+    // present enough to be spawned, so "it did not connect" is a finding.
+    if (n == 0) return error.PeerNeverConnected;
+    return listener.accept(io);
+}
+
+/// How long any test here waits for a peer it has already started. Generous
+/// against a loaded runner, and still four orders of magnitude below the wall
+/// this replaces.
+const accept_timeout_ms: i32 = 30_000;
+
 const SelfTestClient = struct {
     port: u16,
     err: ?anyerror = null,
@@ -1316,7 +1353,7 @@ fn selfConsistency(host_key: HostKey) !void {
     var joined = false;
     defer if (!joined) th.join(); // runs after stream.close -> client unblocks
 
-    var stream = try listener.accept(io);
+    var stream = try acceptBounded(io, &listener, accept_timeout_ms);
     defer stream.close(io);
     var rbuf: [32 * 1024]u8 = undefined;
     var wbuf: [32 * 1024]u8 = undefined;
@@ -1440,7 +1477,7 @@ fn directDhConsistency(kex_name: []const u8) !void {
     var joined = false;
     defer if (!joined) th.join();
 
-    var stream = try listener.accept(io);
+    var stream = try acceptBounded(io, &listener, accept_timeout_ms);
     defer stream.close(io);
     var rbuf: [32 * 1024]u8 = undefined;
     var wbuf: [32 * 1024]u8 = undefined;
@@ -1497,7 +1534,7 @@ test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature whe
     var joined = false;
     defer if (!joined) th.join();
 
-    var stream = try listener.accept(io);
+    var stream = try acceptBounded(io, &listener, accept_timeout_ms);
     defer stream.close(io);
     var rbuf: [32 * 1024]u8 = undefined;
     var wbuf: [32 * 1024]u8 = undefined;
@@ -1636,7 +1673,7 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
     }) catch return error.SkipZigTest;
     defer ssh_child.kill(io);
 
-    var stream = try listener.accept(io);
+    var stream = try acceptBounded(io, &listener, accept_timeout_ms);
     defer stream.close(io);
     var rbuf: [32 * 1024]u8 = undefined;
     var wbuf: [32 * 1024]u8 = undefined;

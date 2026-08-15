@@ -1027,6 +1027,31 @@ fn testListenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
     return error.SkipZigTest;
 }
 
+/// ⭐ `accept` that cannot wait forever — see the twin in `server.zig` for the
+/// full account. Short version: the live tests spawn a real `/usr/bin/ssh` and
+/// then block waiting for it to connect, and a client that exits first leaves
+/// the accept blocked for the life of the process. That is what wedged every
+/// CI lane on 2026-08-15 into the six-hour job limit.
+///
+/// ⛔ Not `SO_RCVTIMEO`: `std.Io.Threaded` panics on the `EAGAIN` it produces
+/// ("programmer bug caused syscall error: AGAIN"). `poll(2)` on the raw handle
+/// sidesteps `std.Io` and is what `opcua`'s driver uses for the same reason.
+fn acceptBounded(io: std.Io, listener: *std.Io.net.Server, timeout_ms: i32) !std.Io.net.Stream {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = listener.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const n = std.posix.poll(&fds, timeout_ms) catch return error.AcceptPollFailed;
+    // A peer this test started itself and that never arrived is a FINDING, not
+    // a reason to skip.
+    if (n == 0) return error.PeerNeverConnected;
+    return listener.accept(io);
+}
+
+/// How long any test here waits for a peer it has already started.
+const accept_timeout_ms: i32 = 30_000;
+
 fn acceptAnyHostKey(key_type: []const u8, key_blob: []const u8) bool {
     _ = key_type;
     _ = key_blob;
@@ -1244,7 +1269,7 @@ fn serverSide(
     host_key: server_mod.HostKey,
     case: Case,
 ) !void {
-    var stream = try listener.accept(io);
+    var stream = try acceptBounded(io, listener, accept_timeout_ms);
     defer stream.close(io);
     var rbuf: [32 * 1024]u8 = undefined;
     var wbuf: [32 * 1024]u8 = undefined;
@@ -1616,7 +1641,7 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
     }) catch return error.SkipZigTest;
     defer ssh_child.kill(io);
 
-    var stream = try listener.accept(io);
+    var stream = try acceptBounded(io, &listener, accept_timeout_ms);
     defer stream.close(io);
     var rbuf: [64 * 1024]u8 = undefined;
     var wbuf: [64 * 1024]u8 = undefined;
