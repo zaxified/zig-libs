@@ -9,6 +9,24 @@ on:
     tags: ["20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"]
   pull_request:
 
+# Least privilege. The gate reads the repository and nothing else — it opens no
+# issue, pushes no tag, publishes no package — so saying so here means a
+# compromised action in the chain cannot do those things either. Borrowed from
+# vercel-labs/native's Zig CI, which declares the same.
+permissions:
+  contents: read
+
+# One run per ref, and the superseded one is cancelled. Re-cutting a tag
+# happened four times on 2026-08-15 alone, and each time the previous matrix
+# kept burning four runners for work whose commit no longer existed — cancelled
+# by hand, when it was noticed at all.
+#
+# ⚠ Deliberately keyed on the REF, not on the workflow alone: a tag run and a
+# main-push run test different things and must not cancel each other.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 # Linux-only: several modules (procnet, rawsock, netlink, wireguard, …) are
 # raw-syscall Linux members and are compiled by `zig build test`; socket/netns
 # tests SkipZigTest cleanly on a constrained runner.
@@ -154,13 +172,20 @@ jobs:
   scoped:
     if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-26.04
+    # A scoped lane is minutes; anything approaching this is wedged, not slow.
+    timeout-minutes: 30
     name: changed modules + reverse-dep closure
     steps:
       # Full history: `test.sh changed <base>` diffs against the base branch,
       # and a shallow clone has nothing to diff against.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # ⚠ THE ONE ACTION STILL ON NODE 20, and not for want of bumping: v2.2.1
+      # is the newest `setup-zig` and its `action.yml` still says `node20`.
+      # `checkout` and `cache` were moved to their node24 majors on 2026-08-15;
+      # GitHub's deprecation warning will keep naming this one until upstream
+      # ships a release that does not. Nothing to do here but know why it stays.
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
@@ -172,7 +197,7 @@ jobs:
           # TOOLCHAIN download stays cached either way; that part works.
           use-cache: false
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.zig-cache
           # Exact key on the sources; restore-keys falls back to the newest
@@ -194,6 +219,8 @@ jobs:
       # nothing. That matters here: `github.event.before` is all-zeros on a
       # branch's first push.
       - name: Test changed modules
+        env:
+          ZIGLIBS_LANE: changed modules + reverse-dep closure
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="origin/${{ github.base_ref }}"
@@ -208,15 +235,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: ReleaseSafe
+          - name: ReleaseSafe amd64
             args: "-Doptimize=ReleaseSafe"
             cmd: all
             cachekey: relsafe
+            cache: true
             runner: ubuntu-26.04
-          - name: ReleaseFast
+          - name: ReleaseFast amd64
             args: "-Doptimize=ReleaseFast"
             cmd: all
             cachekey: relfast
+            cache: true
             runner: ubuntu-26.04
           # ⚠ `build`, NOT `all` — this lane COMPILES every module in real Debug
           # and runs no test, and that is the whole claim it can support. Nobody
@@ -234,10 +263,11 @@ jobs:
           # in Debug: zero. Tests that SKIP in Debug: fifteen, so this lane gave
           # 48/63 where its siblings gave 63/63. See `cmd_build` in
           # scripts/test.sh for the measurement.
-          - name: strict Debug (compile only)
+          - name: strict Debug amd64 (compile only)
             args: "-Dstrict-debug"
             cmd: build
             cachekey: strictdebug
+            cache: false
             runner: ubuntu-26.04
           # ONE arm64 lane, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions, atomics,
@@ -251,11 +281,29 @@ jobs:
             args: "-Doptimize=ReleaseSafe"
             cmd: all
             cachekey: relsafe-arm64
+            cache: true
             runner: ubuntu-26.04-arm
     name: full — ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    # ⭐ A CEILING WE CHOOSE, instead of the one GitHub imposes. Twice — on
+    # 2026-08-14 and again on 2026-08-15 — a single wedged test held every lane
+    # open until the six-hour job limit killed it, burning about twenty
+    # runner-hours per matrix to learn nothing. The first finished matrix took
+    # 48 minutes wall-clock, so 90 is generous for a cold cache on either
+    # architecture and still fails in a tenth of the time a runaway used to.
+    #
+    # ⚠ This does NOT replace `--test-timeout` in the gate, and must not be
+    # thought of as doing so. A job timeout says "something here never
+    # finished"; the per-test deadline says WHICH test. The first is a
+    # backstop, the second is a diagnosis.
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # ⚠ THE ONE ACTION STILL ON NODE 20, and not for want of bumping: v2.2.1
+      # is the newest `setup-zig` and its `action.yml` still says `node20`.
+      # `checkout` and `cache` were moved to their node24 majors on 2026-08-15;
+      # GitHub's deprecation warning will keep naming this one until upstream
+      # ships a release that does not. Nothing to do here but know why it stays.
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
@@ -264,7 +312,24 @@ jobs:
           # outputs. The toolchain download is still cached by it.
           use-cache: false
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        # ⚠ OFF FOR THE DEBUG LANE, and the measurement is why. One cold run
+        # each, 2026-08-15:
+        #
+        #   lane                 tree     saved     lane total
+        #   strict Debug         4.0 GB   706 MB      271 s
+        #   ReleaseSafe arm64    2.7 GB   687 MB     2003 s
+        #   ReleaseSafe          2.9 GB   733 MB     2681 s
+        #   ReleaseFast          3.1 GB   756 MB     3038 s
+        #
+        # The Debug lane holds the LARGEST tree — 225 unoptimised objects — and
+        # is by an order of magnitude the CHEAPEST to rebuild, because it only
+        # compiles and runs no test. Caching it would spend a quarter of the
+        # repository's quota to save about three minutes on a four-minute job,
+        # while the lanes that take 33 to 51 minutes compete for the remainder.
+        # Those three are 87-89 % compile by wall-clock, which is precisely what
+        # a build cache is for.
+        if: matrix.cache
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.zig-cache
           # ⚠ `matrix.cachekey` is load-bearing. Each lane compiles EVERY module
@@ -291,6 +356,12 @@ jobs:
       # log is the measurement, it is per-lane and dated, and it costs nothing
       # to look at. Read it there.
       - name: Close the environment gaps the gate reports
+        # ⚠ NOT on the compile-only lane. Every one of these installs exists to
+        # let a LIVE test reach a real peer — a wolfSSL DTLS responder, an
+        # open62541 container, two Python servers — and that lane runs no test
+        # at all. Measured on 2026-08-15: 26 s of a 271 s lane spent installing
+        # things nothing would touch.
+        if: matrix.cmd != 'build'
         # Every lane of 2026-08-15 opened with the SAME six-gap report, and one
         # of them is expensive: without `unshare -rn` the privileged tests of
         # ten netlink-writing modules skip, and the gate's own words for that
@@ -307,8 +378,9 @@ jobs:
         # what prevents that — read it, do not assume this step worked.
         continue-on-error: true
         run: |
-          # 1. unprivileged user namespaces — Ubuntu 24.04 restricts them via
-          #    AppArmor, which is what makes `unshare -rn` fail on the runner.
+          # 1. unprivileged user namespaces — Ubuntu restricts them via
+          #    AppArmor (24.04 and 26.04 alike), which is what makes
+          #    `unshare -rn` fail on a stock runner.
           echo 'kernel.apparmor_restrict_unprivileged_userns=0' \
             | sudo tee /etc/sysctl.d/60-zig-libs-userns.conf >/dev/null || true
           sudo sysctl --system >/dev/null 2>&1 || true
@@ -344,6 +416,10 @@ jobs:
           python3 -m venv ~/.cache/zig-libs-imap || true
           ~/.cache/zig-libs-imap/bin/pip -q install pymap || true
       - name: Test (${{ matrix.name }})
+        env:
+          # Names this lane's block on the run's summary page, where the four
+          # digests land side by side instead of in four downloadable logs.
+          ZIGLIBS_LANE: ${{ matrix.name }}
         run: |
           # The imap peer is found at its default path; the opcua one is named
           # by an environment variable, so point it at the venv built above.
@@ -351,6 +427,31 @@ jobs:
           # and reports the gap.
           export OPCUA_PYTHON="$HOME/.cache/zig-libs-opcua/bin/python3"
           bash scripts/test.sh ${{ matrix.cmd }} ${{ matrix.args }}
+      - name: tc action tests, as real root
+        # ⭐ THE LAST GAP, and the only one `unshare -rn` cannot close.
+        # RTM_NEWACTION checks CAP_NET_ADMIN against the INITIAL user namespace,
+        # so the sysctl that fixed every other netns module here does nothing
+        # for this one — no amount of userns permission substitutes for real
+        # root. scripts/test.sh therefore only PRINTS this command.
+        #
+        # That refusal is right on a development machine: `zig build` executes
+        # build.zig, which is arbitrary code, so a NOPASSWD rule for it would be
+        # passwordless root rather than a narrow grant. A hosted runner is a
+        # different machine — ephemeral, already executing this repository's
+        # code, discarded when the job ends — so the reasoning does not carry
+        # over, and the coverage is taken here instead of written off forever.
+        #
+        # ⚠ SEPARATE CACHE DIRECTORIES, not tidiness. Building as root into the
+        # job's own `.zig-cache` leaves root-owned entries that `actions/cache`
+        # would then save, and the next run could not write them.
+        #
+        # ⚠ This has never run anywhere. If it goes red, that is a finding about
+        # tc, not about this step — those tests have been skipping since the
+        # module was written.
+        if: matrix.cmd != 'build'
+        run: |
+          sudo unshare -n "$(command -v zig)" build test-tc ${{ matrix.args }} \
+            --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root
       - name: Report the cache footprint
         # The number the cache decision has never had. Whether five lanes fit
         # under a 10 GB repository quota is arithmetic, and until this line
@@ -365,3 +466,61 @@ jobs:
         run: |
           du -sh "$GITHUB_WORKSPACE/.zig-cache" 2>/dev/null || echo "no .zig-cache"
           du -sh "$GITHUB_WORKSPACE/.zig-cache/o" 2>/dev/null || true
+
+  # ⭐ THE ONE CHECK WHOSE GREEN MEANS SOMETHING.
+  #
+  # A green tick on GitHub does not say the gate ran. A SKIPPED job also shows
+  # as a tick, and the two shapes here exclude each other by design — `scoped`
+  # is skipped on tags, `full` is skipped everywhere else — so on any given ref
+  # roughly half the ticks are for work that never happened. Reading the run
+  # therefore meant knowing which jobs were supposed to run, which is exactly
+  # the knowledge a status check exists to spare its reader.
+  #
+  # So one job asserts the rule instead of leaving it implicit: on a tag, `full`
+  # passed and `scoped` did not run; on anything else, the reverse. It fails on
+  # `skipped` as loudly as on `failure`, because "did not run" and "ran and
+  # broke" are the same answer to "is this commit gated".
+  #
+  # Written down here, the rule can be argued with. Left implicit, it could only
+  # be misread. Borrowed from vercel-labs/native, which keeps a stable
+  # required-check name the same way.
+  #
+  # ⚠ WHAT THIS DOES NOT CATCH, so nobody retires the concern by pointing here:
+  # a `scoped` run that detects a harness change, prints "this is NOT the gate"
+  # and runs a smoke set still exits 0, so it is `success` and this job is
+  # happy. That gap is real and separate.
+  gate:
+    name: gate
+    if: always()
+    needs: [scoped, full]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Exactly one shape must have run, and it must have passed
+        env:
+          SCOPED: ${{ needs.scoped.result }}
+          FULL: ${{ needs.full.result }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          echo "scoped=$SCOPED  full=$FULL  tag=$IS_TAG"
+          if [ "$IS_TAG" = true ]; then
+            ran_name=full;   ran=$FULL;   idle_name=scoped; idle=$SCOPED
+          else
+            ran_name=scoped; ran=$SCOPED; idle_name=full;   idle=$FULL
+          fi
+          rc=0
+          if [ "$ran" != success ]; then
+            echo "::error::$ran_name is '$ran', not success — this commit is NOT gated"
+            rc=1
+          fi
+          # A shape that ran when it should not have means the routing above is
+          # wrong, and a gate whose own routing is wrong cannot vouch for
+          # anything it reports.
+          if [ "$idle" != skipped ]; then
+            echo "::error::$idle_name is '$idle' — it should not have run on this ref at all"
+            rc=1
+          fi
+          if [ "$rc" -eq 0 ]; then
+            echo "gate: $ran_name passed, $idle_name correctly did not run"
+          fi
+          exit "$rc"
