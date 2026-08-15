@@ -192,8 +192,15 @@ _zl_inflight_note() {
                 s = substr($0, RSTART, RLENGTH)
                 sub(/.*\/modules\//, "", s); sub(/\/$/, "", s)
                 if (index($0, repo) > 0) print et "\t" s "\tcompile"
-            } else if (match($0, /\/o\/[0-9a-f][0-9a-f]*\/[A-Za-z0-9_]+/)) {
-                s = substr($0, RSTART, RLENGTH)
+            } else if ($2 ~ /\/o\/[0-9a-f][0-9a-f]*\/[A-Za-z0-9_]+$/) {
+                # ⚠ argv[0] ONLY ($2), not anywhere in the command line. A test
+                # binary is EXECUTED as `<cache>/o/<hash>/<name> --listen=-`; a
+                # compile of the same module merely NAMES that path further
+                # along its own argv as an output. Matching the whole line
+                # therefore labelled compiles as runs, and the 2026-08-15 arm64
+                # log said `bacnet test` during a phase whose own Build Summary
+                # (226 steps = 225 compiles + install) proves no test ran.
+                s = $2
                 sub(/.*\//, "", s)
                 # `build` is the compiled build.zig runner, which lives in the
                 # same cache and matches the same shape. It is present for the
