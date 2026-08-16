@@ -410,7 +410,12 @@ const BitWriter = struct {
     buf: []u8,
     bit: usize = 0,
 
-    fn put(self: *BitWriter, value: usize, bits: u6) void {
+    /// `value` is u64 rather than usize on purpose: the shift amount below has
+    /// to be valid for the widest value this ever carries, and on a 32-bit
+    /// target (wasm32, arm32) `usize` shifts want a u5 while the bit widths here
+    /// go to 16. Typing the value instead of the shift keeps one definition
+    /// that is correct on both.
+    fn put(self: *BitWriter, value: u64, bits: u6) void {
         var i: u6 = bits;
         while (i > 0) {
             i -= 1;
@@ -1131,7 +1136,7 @@ fn parseSegments(data: []const u8, version: u6, out: []u8) DecodeError![]u8 {
 
         switch (mode) {
             .numeric => {
-                var left = count;
+                var left: usize = count;
                 while (left >= 3) : (left -= 3) {
                     const v = r.take(10) orelse return DecodeError.BadData;
                     if (v > 999) return DecodeError.BadData;
@@ -1157,7 +1162,7 @@ fn parseSegments(data: []const u8, version: u6, out: []u8) DecodeError![]u8 {
                 }
             },
             .alphanumeric => {
-                var left = count;
+                var left: usize = count;
                 while (left >= 2) : (left -= 2) {
                     const v = r.take(11) orelse return DecodeError.BadData;
                     if (v >= 45 * 45) return DecodeError.BadData;
