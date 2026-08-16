@@ -14,8 +14,8 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 225 modules (Zig 0.16, green in all three release lanes — `ReleaseSafe`,
-`ReleaseFast`, `-Dstrict-debug`) · **MIT** (see `LICENSE`). `NOTICE` answers one question —
+**Status:** 225 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`, compiling
+clean in `-Dstrict-debug`) · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
 
