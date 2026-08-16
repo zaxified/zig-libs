@@ -48,23 +48,72 @@ carry their own attribution; it does not catalogue provenance.
 
 ## Using a module
 
-- **Local path (dev, no tags/push):** in the consumer's `build.zig.zon`,
-  `.zig_libs = .{ .path = "../zig-libs" }`, then in `build.zig`
-  ```zig
-  const libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
-  exe.root_module.addImport("http", libs.module("http"));
-  ```
-  Pass `.target` and `.optimize` through. The modules are declared with this build's
-  own `standardTargetOptions`/`standardOptimizeOption`, so an empty `.{}` resolves them
-  against *this* package's defaults rather than yours. Resolve the dependency once and
-  hand the same module object to everyone who needs it — two `dependency()` graphs make
-  one module's types two incompatible types.
-- **Fetch:** `zig fetch --save git+https://github.com/zaxified/zig-libs` then the same
-  `dependency().module(...)`.
-  (`zig fetch` can't target a subdirectory — ziglang/zig#23012 — so the whole repo is one package;
-  you still import only the module you name. Unused modules aren't compiled.)
-- **Pin for reproducible builds:** `zig fetch --save git+https://github.com/zaxified/zig-libs?ref=<tag>#<commit>`
-  — pin a release tag or commit, never a branch; `CHANGELOG.md` says what each release changed.
+Three ways to declare the dependency; the `build.zig` half is identical for all three.
+
+**1. Local path** — developing against an unpushed checkout. Relative, so the manifest
+carries no home-dir path:
+
+```zig
+// build.zig.zon
+.zig_libs = .{ .path = "../zig-libs" },
+```
+
+**2. Fetch, unpinned** — `zig fetch` writes the entry for you, resolving the default branch
+to whatever it points at today:
+
+```
+zig fetch --save git+https://github.com/zaxified/zig-libs
+```
+
+```zig
+// build.zig.zon — what --save leaves behind
+.zig_libs = .{
+    .url = "git+https://github.com/zaxified/zig-libs#<resolved-commit>",
+    .hash = "zig_libs-0.0.0-<content-hash>",
+},
+```
+
+**3. Fetch, pinned to a release** — what every consumer here uses. `?ref=` records *which*
+tag was meant, the `#` fragment is the commit it stood for:
+
+```
+zig fetch --save "git+https://github.com/zaxified/zig-libs?ref=2026-08-15#84332afefbbc22f2e6254ee9412cd5e9f91f27fd"
+```
+
+```zig
+// build.zig.zon
+.zig_libs = .{
+    .url = "git+https://github.com/zaxified/zig-libs?ref=2026-08-15#84332afefbbc22f2e6254ee9412cd5e9f91f27fd",
+    .hash = "zig_libs-0.0.0-WiQ0Gkuq3gJ9oVeW_X5KH_WCwedy4T3uXFl5-DAcgr3J",
+},
+```
+
+Pin a tag or commit, never a branch. `hash` is mandatory and content-addressed, so upstream
+movement can only ever arrive as a deliberate re-run of the command above — there is no
+floating "latest". `CHANGELOG.md` says what each release changed.
+
+Then, in `build.zig`, whichever of the three you chose:
+
+```zig
+const libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("http", libs.module("http"));
+exe.root_module.addImport("jwt", libs.module("jwt"));
+```
+
+Two things that bite if skipped:
+
+- **Pass `.target` and `.optimize` through.** The modules are declared with this build's own
+  `standardTargetOptions`/`standardOptimizeOption`, so an empty `.{}` resolves them against
+  *this* package's defaults instead of yours.
+- **Resolve the dependency once** and hand the same module object to everyone who needs it.
+  Two `dependency()` graphs make one module's types two incompatible types — and this bites
+  transitively: a module that imports a sibling (`tz` imports `datefmt`) resolves that
+  sibling within its own graph, so a consumer wanting both must take both from the one
+  handle or end up with two date cores.
+
+`zig fetch` can't target a subdirectory (ziglang/zig#23012), so the whole collection is one
+package however you declare it. You still import only the modules you name; the rest are
+never compiled.
 
 ## Build
 
