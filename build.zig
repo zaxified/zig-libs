@@ -187,6 +187,7 @@ const module_list = [_]Module{
     .{ .name = "webauthn", .deps = &.{ "cbor", "rsa", "p256", "x509" } },
     .{ .name = "zipstream" },
     .{ .name = "qr" },
+    .{ .name = "qrscan", .deps = &.{"qr"} },
     .{ .name = "tz", .deps = &.{"datefmt"} },
     .{ .name = "pollworker" },
     .{ .name = "ipcbus", .deps = &.{"framing"} },
