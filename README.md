@@ -50,30 +50,47 @@ carry their own attribution; it does not catalogue provenance.
 
 - **Local path (dev, no tags/push):** in the consumer's `build.zig.zon`,
   `.zig_libs = .{ .path = "../zig-libs" }`, then in `build.zig`
-  `exe.root_module.addImport("http", b.dependency("zig_libs", .{}).module("http"));`
-- **Fetch:** `zig fetch --save git+https://github.com/.../zig-libs` then the same `dependency().module(...)`.
+  ```zig
+  const libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
+  exe.root_module.addImport("http", libs.module("http"));
+  ```
+  Pass `.target` and `.optimize` through. The modules are declared with this build's
+  own `standardTargetOptions`/`standardOptimizeOption`, so an empty `.{}` resolves them
+  against *this* package's defaults rather than yours. Resolve the dependency once and
+  hand the same module object to everyone who needs it — two `dependency()` graphs make
+  one module's types two incompatible types.
+- **Fetch:** `zig fetch --save git+https://github.com/zaxified/zig-libs` then the same
+  `dependency().module(...)`.
   (`zig fetch` can't target a subdirectory — ziglang/zig#23012 — so the whole repo is one package;
   you still import only the module you name. Unused modules aren't compiled.)
-- **Pin for reproducible builds:** `zig fetch --save git+https://github.com/.../zig-libs#<tag-or-commit>`
+- **Pin for reproducible builds:** `zig fetch --save git+https://github.com/zaxified/zig-libs?ref=<tag>#<commit>`
   — pin a release tag or commit, never a branch; `CHANGELOG.md` says what each release changed.
 
 ## Build
 
 ```
+scripts/test.sh          # the gate — tests what changed, escalates on its own
+scripts/test.sh all      # every module; what CI and the pre-commit hook run
 zig build test           # run all module tests
 zig build test-<name>    # run one module's tests
 zig build check-catalog  # verify build.zig's module_list ↔ modules/ ↔ this README agree
 zig build check-changelog # verify every module has a dated, well-formed CHANGELOG.md
 ```
 
+`scripts/test.sh` is the entry point for contributors: it maps changed files onto the
+modules they affect, runs the `check-*` gates alongside them, and widens to the full set by
+itself when the change is one that warrants it (`build.zig`, the harness). Reach for
+`zig build test` when you actually want everything regardless of what changed.
+
 `zig build -l` lists the rest, including the other `check-*` gates.
 
 ## Versioning & stability
 
 Releases are dated git tags (`YYYY-MM-DD`), **not** semantic versions, and there are no
-per-module versions; a tag asserts exactly one thing, that every module passed every lane at
-that commit. `scripts/tag.sh` cuts one. `v0.1.0` remains as history and is still the only tag
-in the repository — no dated release has been cut yet, so pin a commit until one is. Detail
+per-module versions; a tag asserts exactly one thing, that every module cleared every lane at
+that commit (see the bar below — two lanes run the tests, the third only compiles). `scripts/tag.sh` cuts one. `v0.1.0` remains as history and is not a version
+anything after it follows; dated releases exist, so pin the newest one that suits you
+(`git tag`, or the tags page) rather than a bare commit. Detail
 lives in `modules/<name>/CHANGELOG.md` with breaking changes flagged `BREAKING`;
 `zig build check-changelog` enforces that every module has one and that it is dated and
 well-formed. The root `CHANGELOG.md` carries the release policy and per-release notes — it
@@ -81,8 +98,9 @@ stopped indexing which modules have a changelog on 2026-08-14, since all of them
 index was a copy kept only so a gate could notice the copy had gone stale. Module maturity is carried
 by the explicit caveat lines in the catalog
 below (and each module's `SPEC.md`), not by stability-tier labels — every module meets the
-same bar (tests green in all three release lanes — `ReleaseSafe`, `ReleaseFast`,
-`-Dstrict-debug` — plus oracle/KAT verification where one exists);
+same bar (tests green in both test lanes — `ReleaseSafe` and `ReleaseFast` — and compiling
+clean in the third, `-Dstrict-debug`, which builds every module in real Debug but runs no
+tests; plus oracle/KAT verification where one exists);
 what varies is *scope*, and anything unfinished is stated where it lives. The full
 versioning + spin-off policy is `CONVENTIONS.md` §8.
 
