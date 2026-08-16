@@ -1,8 +1,8 @@
 # `qr`
 
-QR Code symbol encoder — ISO/IEC 18004 model 2, versions 1–40, error-correction
-levels L/M/Q/H, numeric/alphanumeric/byte modes. No allocator, no I/O, no
-syscalls: the caller owns the only buffer.
+QR Code symbol **encoder and decoder** — ISO/IEC 18004 model 2, versions 1–40,
+error-correction levels L/M/Q/H, numeric/alphanumeric/byte modes. No allocator,
+no I/O, no syscalls: the caller owns the only buffer.
 
 ```zig
 const qr = @import("qr");
@@ -15,6 +15,26 @@ try qr.encode(&m, "https://example.com", .{ .ecc = .quartile });
 `encode` picks the most compact mode the input allows, the smallest version that
 fits, and the mask with the lowest penalty. `Options` forces any of the three
 when you need a specific symbol rather than the best one.
+
+## Reading one back
+
+```zig
+var out: [4096]u8 = undefined;
+const text = try qr.decode(&m, &out);
+```
+
+`decode` reads the format information, unmasks, de-interleaves and runs
+Reed-Solomon **error correction** — up to the level's declared capability, which
+is what makes a scratched or partly obscured symbol still readable. Past that
+capability it returns `error.Uncorrectable` rather than a plausible wrong string;
+a QR library that confidently returns the wrong URL is worse than one that
+declines.
+
+**Input is a matrix, not an image.** Building that matrix from a photograph —
+binarisation, locating the symbol, perspective correction, grid sampling — is
+image processing, and both mature ecosystems split it out the same way (Rust
+pairs an encoder crate with `rqrr`; Go pairs `skip2` with `gozxing`). Use
+`Matrix.setDark` to fill a grid your own scanner produced, then call `decode`.
 
 ## The output is a matrix
 
@@ -105,9 +125,11 @@ as UTF-8 in the same or fewer bits for anything short of near-pure Japanese.
 needed by a caller that wants "put this text in a QR code", and each is a
 separable addition rather than something this design forecloses.
 
-**Decoding.** This is an encoder. Reading a symbol back means image
-binarisation, perspective correction and error *correction* — a different
-problem, roughly the size of this module again.
+**Reading from an image.** `decode` takes a matrix; producing that matrix from a
+photograph is binarisation, symbol location, perspective correction and grid
+sampling. That is image processing rather than coding, it would drag a pixel
+format and a `platform` tag into a module that has neither, and every mature
+ecosystem ships it separately.
 
 Provenance: original work of the zig-libs authors (MIT), clean-room from
 ISO/IEC 18004. Verification, including the two independent oracles, is in

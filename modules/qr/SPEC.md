@@ -31,6 +31,18 @@ is an exception in the table and not a rule the derivation is missing. Pinned by
 a test that also pins versions 31 and 33 as *derived*, so the exception cannot
 quietly widen.
 
+**One walk, two directions.** The zigzag that places codewords is a single
+`Walk` used by both the encoder and the decoder. A decoder that re-derived the
+order would be a second chance to get it wrong, and the two would disagree only
+on inputs neither test covers.
+
+**A correction that satisfies the locator is still re-checked.** After Forney
+applies the magnitudes, the syndromes are recomputed and a non-zero result
+returns `Uncorrectable`. Berlekamp-Massey can converge on a locator that
+"corrects" a block into different wrong data when the error count exceeds
+capability; without the re-check that comes back as a confident wrong message,
+which is the single worst outcome this module could produce.
+
 **Masking is scored with the format information present.** Three of the four
 penalty rules can see those 31 modules, so evaluating a bare data region and
 writing the format bits afterwards scores a symbol that never exists. `pickMask`
@@ -52,7 +64,17 @@ against 1–40, and a length that does not fit is refused rather than truncated,
 which matters because a truncated QR code still scans and reads as a shorter
 message.
 
-There is no decoder here, so nothing parses attacker-controlled data.
+**The decoder is the attacker-facing half.** A matrix handed to `decode` came
+from an image someone else chose, so its size, format bits and every codeword are
+untrusted. Three things bound that: the size must be 17 + 4v for v in 1..40 or it
+is refused before anything is indexed; the format information must land within
+the BCH code's 3-bit correction radius or it is refused; and a Reed-Solomon
+correction whose syndromes do not clear afterwards is reported rather than
+returned. Two fuzz harnesses cover the surface — one over arbitrary grids, one
+over valid symbols with modules flipped, since random noise rarely reaches
+Berlekamp-Massey but real damage does. The damage harness also asserts the
+message when decoding succeeds, so "returns confident nonsense" is a fuzz failure
+and not merely a missing panic.
 
 ## Verification
 
@@ -68,6 +90,13 @@ There is no decoder here, so nothing parses attacker-controlled data.
    reads. 84 symbols, every one read back as the exact input. This catches a
    class the encoder comparison cannot: two encoders agreeing on a matrix that
    no reader accepts.
+
+**Decoding is verified in both directions too.** Round trips cover every mode,
+level and a spread of versions; correction is tested at exactly the capability
+boundary — eight corrupted codewords in a version 1-H block succeed, nine are
+refused — by damaging one module per codeword so the count is exact rather than
+estimated. And the foreign encoder's matrices are fed to **our** decoder: 120
+symbols over 6 inputs x 4 levels x 5 versions, all read back exactly.
 
 The oracle comparison found one real defect — the version 32 alignment centres
 above — after the module's own tests were green, which is the reason to have it.
