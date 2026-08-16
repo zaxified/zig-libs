@@ -1,0 +1,8 @@
+.{
+    .name = .tz_gen,
+    .version = "0.0.0",
+    .fingerprint = 0xfe6507f691fb6bb2,
+    .dependencies = .{},
+    .minimum_zig_version = "0.16.0",
+    .paths = .{"."},
+}

@@ -60,12 +60,14 @@ spelling exactly). `offsetAt`:
   every zone uses `Mm.w.d` — so this is forward cover, exercised by
   synthetic-zone tests rather than a real IANA entry.
 - Regenerating `tz_data.zig` from a newer IANA tzdata release: the generator
-  (`tz-gen`) is a separate tool, not ported into this module — it is not
-  included here, only referenced. There is no runtime loader to redirect
-  (the table is compile-time-embedded, by design — see the module's
-  no-filesystem/no-syscalls model) and no version accessor to add; the
-  pinned release and regeneration path are documented in `tz_data.zig`'s
-  header comment.
+  (`tz-gen`) is deliberately not part of this module — it reads the host's
+  `/usr/share/zoneinfo` and is the one place `std.Tz` is used, neither of
+  which belongs behind the module's no-filesystem/no-syscalls model. It lives
+  at [`scripts/tz-gen/`](../../scripts/tz-gen), outside `build.zig.zon`'s
+  `.paths`, so it never reaches a consumer. There is still no runtime loader
+  to redirect (the table is compile-time-embedded, by design) and no version
+  accessor to add; the pinned release and the regeneration command are
+  recorded in `tz_data.zig`'s own header comment.
 
 Provenance: `src/root.zig` is original work of the zig-libs authors (MIT);
 `src/tz_data.zig` is generated data — the UTC-offset transition tables and

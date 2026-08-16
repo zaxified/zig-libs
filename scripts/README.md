@@ -25,6 +25,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. |
 | `dissect.py` | Drives Wireshark's headless dissector (`sharkd`) as an external oracle for wire-format modules. |
 | `gen-bitcoin-core-vectors.py`, `gen-bitcointx-single-bug.py`, `gen-p256-wycheproof.py`, `gen-ocsp-byname.sh` | Regenerate committed test vectors from their upstream sources (Bitcoin Core, BIP-341, Wycheproof, OCSP). **Keep them.** The vectors are frozen in the tree and the tests do not need these to run — which is exactly why they look deletable. Without them the vectors cannot be re-derived or extended, only trusted. |
+| `tz-gen/` | Regenerates `modules/tz/src/tz_data.zig` — the 600-zone UTC-offset table — from the host's `/usr/share/zoneinfo`. Same reasoning as the row above: the table is frozen in the tree and `tz`'s tests pass without this, which is exactly why it looks deletable. It is the only place `std.Tz` is used, and without it the pinned tzdata release can never be bumped, only trusted. Writes the tzdata version into the generated header, so the committed file records its own pin. A Zig package rather than a script, hence the directory. |
 | `vm/` | Boots a qemu guest and runs a module's tests as real root. The only way the live BPF, netlink and 802.11 tests execute rather than skip. |
 
 ## Which do I run?

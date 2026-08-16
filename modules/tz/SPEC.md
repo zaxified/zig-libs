@@ -47,14 +47,15 @@ than by these tests alone).
   Feb 29 exist. (Note: the *POSIX day-number* that lands on Feb 29 is 59, not 60 — Jn is 1-based so
   `J60`≡March 1 always, and the zero-based `n` only reaches Feb 29 at index 59; `n=60` is March 1 in a
   leap year too, so `59` is the number that actually demonstrates the divergence.)
-- **Deferred — tzdata refresh cadence tooling:** out of scope for this extraction. Regenerating
-  `tz_data.zig` from a newer IANA tzdata release requires the `tz-gen` generator, a separate tool not
-  ported into this module (see README "Defer"); this module has no loader to redirect and no version
-  accessor to add — `tz_data.zig`'s header comment already states the pinned release (tzdata 2026a) and
-  the regeneration path (`tz-gen`, `zig build run`). A "point the loader at a fresh tzdata dir" helper
-  doesn't apply here (there is no runtime loader — the table is compile-time-embedded, by design, per
-  the module's no-filesystem/no-syscalls threat model above). Refreshing the pinned release is a
-  `tz-gen`-tool concern, not a `tz` (this module)-API concern.
+- **tzdata refresh cadence tooling:** the `tz-gen` generator now lives in this repo at
+  `scripts/tz-gen/`, so the pinned release can be re-derived rather than only trusted. It stays out of
+  `modules/` on purpose — it reads the host's `/usr/share/zoneinfo` and is the sole user of `std.Tz`,
+  both of which the module's no-filesystem/no-syscalls threat model above rules out — and `scripts/` is
+  outside `build.zig.zon`'s `.paths`, so a consumer still fetches nothing but the generated table. This
+  module still has no loader to redirect and no version accessor to add; `tz_data.zig`'s header comment
+  states the pinned release (tzdata 2026a) and the regeneration command. A "point the loader at a fresh
+  tzdata dir" helper does not apply (the table is compile-time-embedded, by design). Refreshing the
+  pinned release remains a `tz-gen`-tool concern, not a `tz` (this module)-API concern.
 
 ## Status
 `extract · any · util · reentrant` + deps: `datefmt` — canonical source is `pub const meta` in
