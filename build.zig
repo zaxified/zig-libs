@@ -186,6 +186,7 @@ const module_list = [_]Module{
     .{ .name = "grpc", .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"} },
     .{ .name = "webauthn", .deps = &.{ "cbor", "rsa", "p256", "x509" } },
     .{ .name = "zipstream" },
+    .{ .name = "qr" },
     .{ .name = "tz", .deps = &.{"datefmt"} },
     .{ .name = "pollworker" },
     .{ .name = "ipcbus", .deps = &.{"framing"} },
