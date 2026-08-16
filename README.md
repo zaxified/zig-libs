@@ -48,7 +48,8 @@ carry their own attribution; it does not catalogue provenance.
 
 ## Using a module
 
-Three ways to declare the dependency; the `build.zig` half is identical for all three.
+Three ways to declare the dependency, and a fourth that overrides whichever you picked. The
+`build.zig` half is identical for all of them.
 
 **1. Local path** — developing against an unpushed checkout. Relative, so the manifest
 carries no home-dir path:
@@ -88,11 +89,28 @@ zig fetch --save "git+https://github.com/zaxified/zig-libs?ref=2026-08-15#84332a
 },
 ```
 
-Pin a tag or commit, never a branch. `hash` is mandatory and content-addressed, so upstream
-movement can only ever arrive as a deliberate re-run of the command above — there is no
-floating "latest". `CHANGELOG.md` says what each release changed.
+Pin a tag or commit, never a branch. Both halves are enforced, not conventions: a `?ref=`
+naming a branch is rejected outright (*url field is missing an explicit ref*), and a url
+naming a commit but carrying no `hash` is too (*dependency is missing hash field*). There is
+no floating "latest" to opt into — upstream movement can only ever arrive as a deliberate
+re-run of the command above, which is what makes a bump reviewable. `CHANGELOG.md` says what
+each release changed.
 
-Then, in `build.zig`, whichever of the three you chose:
+**4. `--fork`, on top of any of the above** — build against a live checkout without touching
+the manifest. Useful when you are changing a module and its consumer together, and the
+honest alternative to editing a pinned entry down to a `.path` and remembering to put it
+back:
+
+```
+zig build --fork=../zig-libs
+→ info: fork ../zig-libs matched 1 zig_libs packages
+```
+
+It overrides every package matching that project across the whole dependency tree, so a
+module reached only transitively is covered too. The manifest stays pinned and reproducible;
+the override lives in the command that asked for it.
+
+Then, in `build.zig`, whichever declaration you chose:
 
 ```zig
 const libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
