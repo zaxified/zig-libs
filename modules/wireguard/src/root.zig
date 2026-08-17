@@ -57,6 +57,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
+const netaddr = @import("netaddr");
 const native_endian = builtin.cpu.arch.endian();
 
 /// The generic-netlink plumbing (genlmsghdr + nlctrl family resolve + a
@@ -87,7 +88,9 @@ pub const meta = .{
     // is the module's only throughput-sensitive primitive. Byte-exact to
     // std; the cookie-reply XChaCha20 variant stays on std (see noise.zig).
     // entropy: the cookie secret `Rm` and the cookie-reply XAEAD nonce.
-    .deps = .{ "netlink", "genetlink", "chachapoly", "entropy" },
+    // netaddr: `AllowedIp.parse`'s CIDR-text parsing delegates to
+    // `netaddr.parsePrefix`/`parseIp` rather than duplicating it.
+    .deps = .{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────
@@ -177,6 +180,9 @@ pub fn keyToBase64(key: Key) [key_b64_len]u8 {
 
 pub const KeyParseError = error{InvalidKey};
 
+/// Error set for `AllowedIp.parse`.
+pub const AllowedIpParseError = error{InvalidAllowedIp};
+
 /// Parse a wg base64 key string into raw bytes. Strict: exactly 44 chars
 /// and canonical encoding (re-encodes to the same string), like `wg` itself.
 pub fn keyFromBase64(s: []const u8) KeyParseError!Key {
@@ -231,6 +237,33 @@ pub const AllowedIp = struct {
 
     pub fn v6(addr: [16]u8, cidr: u8) AllowedIp {
         return .{ .family = AF.INET6, .addr = addr, .addr_len = 16, .cidr = cidr };
+    }
+
+    /// Parse the `wg`-tool text form of an allowed-ip: CIDR notation
+    /// (`"10.0.0.0/24"`, `"2001:db8::/32"`) or a bare address with no `/`,
+    /// which `wg` expands to a single-address prefix (`/32` for IPv4, `/128`
+    /// for IPv6) — the same expansion `wg set … allowed-ips 10.0.0.5`
+    /// performs. The address-plus-prefix-length parsing itself is not
+    /// reimplemented here: it delegates to `netaddr.parsePrefix`/`parseIp`,
+    /// this collection's one CIDR-text parser (see CONVENTIONS.md's
+    /// no-duplication rule), and only converts the result to this module's
+    /// wire-shaped `AllowedIp`. Returns `error.InvalidAllowedIp` on
+    /// malformed input; never panics.
+    pub fn parse(text: []const u8) AllowedIpParseError!AllowedIp {
+        const prefix = netaddr.parsePrefix(text) orelse blk: {
+            const ip = netaddr.parseIp(text) orelse return error.InvalidAllowedIp;
+            break :blk netaddr.Prefix{
+                .addr = ip,
+                .bits = switch (ip) {
+                    .v4 => 32,
+                    .v6 => 128,
+                },
+            };
+        };
+        return switch (prefix.addr) {
+            .v4 => |a| AllowedIp.v4(a, prefix.bits),
+            .v6 => |a| AllowedIp.v6(a, prefix.bits),
+        };
     }
 
     /// The address bytes (4 or 16).
@@ -980,6 +1013,48 @@ test "key base64: zero-key vector, round-trip, malformed inputs" {
     // Non-canonical: nonzero trailing bits in the final symbol.
     const noncanon = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=";
     try testing.expectError(error.InvalidKey, keyFromBase64(noncanon));
+}
+
+test "AllowedIp.parse: CIDR notation, bare-address /32 and /128 expansion, malformed input" {
+    // CIDR notation, delegated to netaddr.parsePrefix.
+    const v4_cidr = try AllowedIp.parse("10.0.0.0/24");
+    try testing.expectEqual(AF.INET, v4_cidr.family);
+    try testing.expectEqual(@as(u8, 4), v4_cidr.addr_len);
+    try testing.expectEqual(@as(u8, 24), v4_cidr.cidr);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0 }, v4_cidr.bytes());
+    try testing.expectEqual(v4_cidr, AllowedIp.v4(.{ 10, 0, 0, 0 }, 24));
+
+    const v6_cidr = try AllowedIp.parse("2001:db8::/32");
+    try testing.expectEqual(AF.INET6, v6_cidr.family);
+    try testing.expectEqual(@as(u8, 16), v6_cidr.addr_len);
+    try testing.expectEqual(@as(u8, 32), v6_cidr.cidr);
+    const want_v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    try testing.expectEqualSlices(u8, &want_v6, v6_cidr.bytes());
+
+    // Host bits are tolerated and kept (netaddr.parsePrefix's own contract;
+    // this module doesn't mask), matching `192.0.2.5/24` staying `.5` there.
+    const with_host_bits = try AllowedIp.parse("192.0.2.5/24");
+    try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 5 }, with_host_bits.bytes());
+
+    // Bare address, no `/` — the `wg` tool expands this to a single-address
+    // prefix: /32 for IPv4, /128 for IPv6.
+    const v4_bare = try AllowedIp.parse("192.0.2.7");
+    try testing.expectEqual(v4_bare, AllowedIp.v4(.{ 192, 0, 2, 7 }, 32));
+
+    const v6_bare = try AllowedIp.parse("::1");
+    try testing.expectEqual(AF.INET6, v6_bare.family);
+    try testing.expectEqual(@as(u8, 128), v6_bare.cidr);
+    var want_loopback: [16]u8 = @splat(0);
+    want_loopback[15] = 1;
+    try testing.expectEqualSlices(u8, &want_loopback, v6_bare.bytes());
+
+    // Malformed input never panics; typed error only.
+    const bad = [_][]const u8{
+        "",            "not-an-ip",   "10.0.0.0/",      "/24",
+        "10.0.0.0/33", "10.0.0.0/-1", "2001:db8::/129", "10.0.0.0/24/",
+        "999.0.0.1",
+    };
+    for (bad) |t| try testing.expectError(error.InvalidAllowedIp, AllowedIp.parse(t));
 }
 
 fn patternKey(comptime base: u8) Key {

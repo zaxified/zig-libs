@@ -14,7 +14,7 @@ API: get/set devices, peers and allowed-ips — no `wg` shell-outs.
   (`genlmsghdr`, nlctrl family resolve, `NETLINK_GENERIC` socket), extracted
   into its own module so other genetlink families (ethtool, devlink,
   nl80211, …) can reuse it too. Re-exported here as `wireguard.genl` for
-  source compatibility.
+  source compatibility; `netaddr` — `AllowedIp.parse`'s CIDR-text parsing.
 - **Privileges:** CAP_NET_ADMIN for both `getDevice` and `setDevice` (the
   kernel registers the family with `GENL_UNS_ADMIN_PERM`). Family *resolve*
   is unprivileged.
@@ -68,7 +68,20 @@ try wg.setDevice(.{ .ifname = "wg0", .peers = &.{
 ```
 
 Keys are raw `[32]u8`; `keyToBase64` / `keyFromBase64` convert to/from the
-`wg` text format (strict 44-char canonical base64). Low-level, for custom
+`wg` text format (strict 44-char canonical base64). `AllowedIp.parse` accepts
+the same text the `wg` tool does — CIDR notation (`"10.0.0.0/24"`) or a bare
+address, which expands to `/32` (IPv4) or `/128` (IPv6):
+
+```zig
+const ip = try wireguard.AllowedIp.parse("10.0.0.0/24");
+const single = try wireguard.AllowedIp.parse("192.0.2.7"); // -> /32
+```
+
+It delegates the address/prefix-length parsing itself to the sibling
+`netaddr` module (`parsePrefix` / `parseIp`) rather than duplicating it, and
+only converts the result to this module's wire-shaped `AllowedIp`.
+
+Low-level, for custom
 use (all `pub`): the UAPI constant tables (`WG_CMD`, `WGDEVICE_A`,
 `WGPEER_A`, `WGALLOWEDIP_A`, `WGDEVICE_F`, `WGPEER_F`), the pure
 `DeviceParser` / `buildSetRequests` codec pair, and `genl`

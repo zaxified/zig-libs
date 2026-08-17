@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — New: `AllowedIp.parse` — the `wg`-tool text form of an allowed-ip
+  (CIDR notation, or a bare address expanded to `/32`/`/128` the way `wg` does). Delegates
+  the address/prefix-length parsing to the new sibling dependency `netaddr`
+  (`parsePrefix`/`parseIp`) rather than duplicating it, and only converts the result to
+  this module's wire-shaped `AllowedIp`. New error set `AllowedIpParseError`. Purely
+  additive; no existing behavior changed.
 - **2026-08-13** — Test-only: `handshake.zig` gained "entropy seam: the keypair
   seed, the first cookie secret and the reply nonce really draw". **Neither
   BREAKING nor BEHAVIOURAL** — no production code changed; this adds the

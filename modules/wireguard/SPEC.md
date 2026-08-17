@@ -22,7 +22,9 @@ bounds-checked nlmsghdr+nlattr codec and on `genetlink` for the generic-netlink 
 nlctrl `CTRL_CMD_GETFAMILY` resolve, `NETLINK_GENERIC` socket) — re-exported here as `genl` for
 source compatibility with when it lived locally in `src/genl.zig`; that layer was extracted into its
 own module (`../genetlink/`) so other genetlink families (ethtool, devlink, nl80211, …) can reuse it
-without depending on `wireguard`. Clean-room from the documented WireGuard netlink UAPI
+without depending on `wireguard`. `AllowedIp.parse` depends on `netaddr` for CIDR-text parsing
+(`parsePrefix`/`parseIp`) rather than duplicating it — this module only converts the result to its
+own wire-shaped `AllowedIp`. Clean-room from the documented WireGuard netlink UAPI
 (`uapi/wireguard.h`) and the genetlink UAPI (`linux/genetlink.h`); behavior modeled after wgctrl-go
 and the `wg` tool's protocol usage — attribute-shape and config-splitting reference only, no source
 consulted or copied — see NOTICE.
@@ -266,9 +268,10 @@ and 2.4–2.5× at 1420 B. Still no socket, no routing table and no queue in the
 tunnel adds a syscall (~1–2 µs) per packet on top, which will dominate.
 
 ## Status
-`gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly` — canonical source is
-`pub const meta` in src/root.zig. (The handshake + transport half above depends only on
-`chachapoly`/std.crypto, not on either netlink module.)
+`gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly`, `netaddr` —
+canonical source is `pub const meta` in src/root.zig. (The handshake + transport half above depends
+only on `chachapoly`/std.crypto, not on either netlink module; `netaddr` is used only by
+`AllowedIp.parse`.)
 
 ## Public test-only entry points, unguarded
 

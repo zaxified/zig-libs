@@ -150,7 +150,7 @@ const module_list = [_]Module{
     .{ .name = "uci" },
     .{ .name = "mqtt" },
     .{ .name = "snmp", .test_deps = &.{"testkit"} },
-    .{ .name = "wireguard", .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy" } },
+    .{ .name = "wireguard", .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" } },
     .{ .name = "tc", .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
