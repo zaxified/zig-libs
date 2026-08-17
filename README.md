@@ -444,7 +444,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | [`cbor`](modules/cbor/README.md) | CBOR (RFC 8949) codec — all 8 major types, canonical encoding option, untrusted-input hardened; plus a minimal COSE (RFC 9052) layer. | any | — |
 | [`protobuf`](modules/protobuf/README.md) | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | — |
-| [`qrscan`](modules/qrscan/README.md) | Locate a QR symbol in a grayscale image (luma + stride, camera or canvas) and sample it into a `qr.Matrix`; block-adaptive binarisation, allocation-free. | any | qr |
+| [`qrscan`](modules/qrscan/README.md) | Locate a QR symbol in a grayscale image (luma + stride, camera or canvas) at any rotation and sample it into a `qr.Matrix`; block-adaptive binarisation, allocation-free. | any | qr |
 | [`qr`](modules/qr/README.md) | QR Code encoder and decoder (ISO/IEC 18004 model 2) — versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes, Reed-Solomon error correction; SVG and terminal renderers, allocation-free. | any | — |
 | [`encoding`](modules/encoding/README.md) | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15). | any | — |
 | [`datefmt`](modules/datefmt/README.md) | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |

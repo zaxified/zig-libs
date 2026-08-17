@@ -12,6 +12,13 @@
 //! images; putting it here would drag a pixel-format zoo and a `platform` tag
 //! into something that is otherwise pure arithmetic.
 //!
+//! **Any rotation.** The finder pattern's 1:1:3:1:1 ratio holds along a line
+//! through its centre at any angle, so a row scan locates finders on a symbol
+//! held sideways as readily as an upright one. The length that comes with the
+//! ratio does not hold — see `orient`, where the tilt is taken back out of it,
+//! because that single factor is the difference between a symbol that reads and
+//! one whose every intermediate step looks correct.
+//!
 //! **Allocation-free.** The caller passes a scratch buffer sized by
 //! `scratchSize`, which is where the binarised bitmap lives. That keeps this
 //! usable at 30 fps on a device with no allocator, and in wasm32 where the
@@ -86,12 +93,12 @@ pub fn scan(img: Image, scratch: []u8) Error!Found {
     var bits: Bitmap = .{ .bits = scratch, .width = img.width, .height = img.height };
     binarize(img, &bits);
 
-    var finders: [16]Finder = undefined;
+    var finders: [max_candidates]Finder = undefined;
     const found = locateFinders(&bits, &finders);
     if (found.len < 3) return Error.NotFound;
 
     const corners = orient(found) orelse return Error.NotFound;
-    return sample(&bits, corners);
+    return sampleBestDimension(&bits, corners);
 }
 
 // ── binarisation ────────────────────────────────────────────────────────────
@@ -208,7 +215,26 @@ fn binarize(img: Image, out: *Bitmap) void {
 // on the column through each candidate. Confirming is what rejects the ordinary
 // run of five bands that any picture of a fence produces.
 
-const Finder = struct { x: f32, y: f32, module: f32, hits: u32 = 1 };
+const Finder = struct {
+    x: f32,
+    y: f32,
+    /// Mean of the scan-line unit over every row that hit this pattern. Stable,
+    /// and what the triple search compares between candidates.
+    module: f32,
+    /// Largest unit any single row measured. That row is the one through the
+    /// centre, which is the only chord whose length is a fixed function of the
+    /// tilt; see `orient`.
+    peak: f32,
+    hits: u32 = 1,
+};
+
+/// How many candidates are kept. The 1:1:3:1:1 run occurs inside the data
+/// region too, and it occurs more often the larger the symbol is — at version
+/// 13 a list of sixteen fills with false positives before the third real finder
+/// is reached, and the symbol is then missed for want of a slot rather than for
+/// anything to do with the picture. Sixty-four holds every case measured; the
+/// cost of the ceiling is the triple search below, which is cubic.
+const max_candidates = 64;
 
 fn ratioOk(runs: [5]u32) ?f32 {
     var total: u32 = 0;
@@ -258,7 +284,7 @@ fn confirmVertical(b: *const Bitmap, cx: u32, cy: u32) ?struct { unit: f32, cent
     return .{ .unit = unit, .centre = centre };
 }
 
-fn locateFinders(b: *const Bitmap, out: *[16]Finder) []Finder {
+fn locateFinders(b: *const Bitmap, out: *[max_candidates]Finder) []Finder {
     var n: usize = 0;
 
     var y: u32 = 0;
@@ -298,7 +324,7 @@ fn locateFinders(b: *const Bitmap, out: *[16]Finder) []Finder {
 
 /// Check one completed five-band window, confirm it vertically, and merge it
 /// into the candidate list. `x_end` is one past the last dark pixel of band 4.
-fn consider(b: *const Bitmap, out: *[16]Finder, n_in: usize, count: [5]u32, x_end: u32, y: u32) usize {
+fn consider(b: *const Bitmap, out: *[max_candidates]Finder, n_in: usize, count: [5]u32, x_end: u32, y: u32) usize {
     var n = n_in;
     const unit = ratioOk(count) orelse return n;
 
@@ -324,12 +350,13 @@ fn consider(b: *const Bitmap, out: *[16]Finder, n_in: usize, count: [5]u32, x_en
             f.x = (f.x * k + fx) / (k + 1);
             f.y = (f.y * k + fy) / (k + 1);
             f.module = (f.module * k + unit) / (k + 1);
+            f.peak = @max(f.peak, unit);
             f.hits += 1;
             return n;
         }
     }
     if (n < out.len) {
-        out[n] = .{ .x = fx, .y = fy, .module = unit, .hits = 1 };
+        out[n] = .{ .x = fx, .y = fy, .module = unit, .peak = unit, .hits = 1 };
         n += 1;
     }
     return n;
@@ -342,6 +369,9 @@ const Corners = struct {
     tr: Finder,
     bl: Finder,
     dimension: u32,
+    /// Module size in pixels, corrected for the symbol's tilt — not the average
+    /// of the three finders' estimates, which is what the scan lines measured.
+    module: f32,
 };
 
 /// Of three finder centres, the top-left one is the corner of the right angle:
@@ -407,7 +437,22 @@ fn orient(f: []Finder) ?Corners {
     const tr = if (cross > 0) p else q;
     const bl = if (cross > 0) q else p;
 
-    const module = (tl.module + tr.module + bl.module) / 3;
+    // The module estimates arrive from horizontal and vertical scan lines, and
+    // those chords are longer than a module whenever the symbol is rotated: a
+    // line through the centre of a square whose sides sit at angle t to the
+    // axes crosses it in s / cos(t), for every one of the concentric rings
+    // alike. So the 1:1:3:1:1 ratio survives any rotation — which is why the
+    // finders are still located — while the SIZE that comes with it is
+    // inflated by 1 / cos(t), and it is the size that sets the version.
+    //
+    // t is the angle of the top edge, which is the direction tl -> tr. A square
+    // is unchanged by a quarter turn, so wrap into [-45, 45]: past that the
+    // scan line is crossing what is now the other pair of sides.
+    const quarter: f32 = std.math.pi / 2.0;
+    const raw = std.math.atan2(tr.y - tl.y, tr.x - tl.x);
+    const tilt = @mod(raw + quarter / 2.0, quarter) - quarter / 2.0;
+
+    const module = (tl.peak + tr.peak + bl.peak) / 3 * @cos(tilt);
     if (module <= 0.5) return null;
 
     // Centre-to-centre spans (dimension - 7) modules.
@@ -419,7 +464,7 @@ fn orient(f: []Finder) ?Corners {
     dimension = dimension -% ((dimension -% 17) % 4);
     if (dimension < 21 or dimension > qr.max_size) return null;
 
-    return .{ .tl = tl, .tr = tr, .bl = bl, .dimension = dimension };
+    return .{ .tl = tl, .tr = tr, .bl = bl, .dimension = dimension, .module = module };
 }
 
 /// How much a triple deviates from three corners of a square: the two legs
@@ -486,7 +531,63 @@ fn sample(b: *const Bitmap, c: Corners) Error!Found {
         }
     }
 
-    return .{ .matrix = m, .module_px = (c.tl.module + c.tr.module + c.bl.module) / 3 };
+    return .{ .matrix = m, .module_px = c.module };
+}
+
+/// The dimension out of `orient` is a measurement rounded to the nearest legal
+/// symbol size, and a measurement that lands one version out still samples
+/// cleanly: every module gets a value, the grid looks like a QR code, and
+/// `qr.decode` reports a format error that reads like a problem with the
+/// picture. So sample the neighbouring legal sizes as well and keep the one the
+/// symbol agrees with.
+///
+/// The timing patterns are the referee. They are the one part of a symbol whose
+/// content is fixed by the standard rather than by the message — row 6 and
+/// column 6 alternate, dark on even coordinates — so they say whether the grid
+/// was laid over the modules or across them, and they say it before any
+/// error correction gets a chance to hide the answer.
+fn sampleBestDimension(b: *const Bitmap, c: Corners) Error!Found {
+    var best: ?Found = null;
+    var best_score: f32 = -1;
+
+    // Nearest first, so an exact tie keeps the measured dimension.
+    for ([_]i32{ 0, -4, 4, -8, 8 }) |delta| {
+        const dim = @as(i32, @intCast(c.dimension)) + delta;
+        if (dim < 21 or dim > qr.max_size) continue;
+
+        var candidate = c;
+        candidate.dimension = @intCast(dim);
+        const got = sample(b, candidate) catch continue;
+
+        const score = timingScore(&got.matrix);
+        if (score > best_score) {
+            best_score = score;
+            best = got;
+        }
+        if (score == 1.0) break;
+    }
+
+    // Deliberately no minimum score. A real symbol with a damaged timing pattern
+    // still decodes — the data is protected and the timing is not — so a
+    // threshold here would reject reads that currently succeed. The score picks
+    // between candidates; it does not get a veto.
+    return best orelse Error.NotFound;
+}
+
+/// How much of the two timing patterns alternates the way the standard says.
+fn timingScore(m: *const qr.Matrix) f32 {
+    const dim = m.size;
+    var ok: u32 = 0;
+    var total: u32 = 0;
+    var i: u16 = 8;
+    while (i + 9 <= dim) : (i += 1) {
+        const want = i % 2 == 0;
+        if (m.isDark(i, 6) == want) ok += 1;
+        if (m.isDark(6, i) == want) ok += 1;
+        total += 2;
+    }
+    if (total == 0) return 0;
+    return @as(f32, @floatFromInt(ok)) / @as(f32, @floatFromInt(total));
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -576,32 +677,125 @@ fn renderRotated(m: *const qr.Matrix, scale: u32, deg: f32, buf: []u8, side_out:
     return .{ .luma = buf, .width = side, .height = side, .stride = side };
 }
 
-test "rotation: upright and quarter turns read; steep angles are the known limit" {
+test "rotation: a symbol reads at any angle" {
+    const t = std.testing;
+    var pixels: [900 * 900]u8 = undefined;
+    var scratch: [900 * 900 / 8]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var m: qr.Matrix = undefined;
+
+    // Two sizes, because the two things that break under rotation break at
+    // different scales: the module estimate is wrong at every size, and the
+    // candidate list overflows only once the data region is large enough to
+    // hold false positives of its own.
+    const texts = [_][]const u8{
+        "ROTATED SYMBOL",
+        "https://example.com/a-longer-url-that-needs-a-considerably-bigger-symbol/12345",
+    };
+    for (texts) |text| {
+        try qr.encode(&m, text, .{ .ecc = .quartile });
+        var deg: f32 = 0;
+        while (deg < 360) : (deg += 15) {
+            var side: u32 = 0;
+            const img = renderRotated(&m, 4, deg, &pixels, &side);
+            const found = scan(img, &scratch) catch |e| {
+                std.debug.print("scan failed at {d} degrees, version {d}: {s}\n", .{ deg, m.version, @errorName(e) });
+                return e;
+            };
+            var fm = found.matrix;
+            const got = qr.decode(&fm, &out) catch |e| {
+                std.debug.print("decode failed at {d} degrees, version {d}: {s}\n", .{ deg, m.version, @errorName(e) });
+                return e;
+            };
+            try t.expectEqualStrings(text, got);
+        }
+    }
+}
+
+test "the module size a scan line measures is inflated by the tilt" {
     const t = std.testing;
     var m: qr.Matrix = undefined;
-    try qr.encode(&m, "ROTATED SYMBOL", .{ .ecc = .quartile });
+    try qr.encode(&m, "TILT", .{ .ecc = .quartile });
 
     var pixels: [900 * 900]u8 = undefined;
     var scratch: [900 * 900 / 8]u8 = undefined;
-    var out: [128]u8 = undefined;
 
-    // What works today: a symbol that is upright, slightly tilted, or turned by
-    // a quarter. Row-scanning finds the finder bands at any angle, but
-    // `confirmVertical` walks a strictly vertical column, so past roughly ten
-    // degrees the bands it crosses no longer hold the 1:1:3:1:1 ratio and the
-    // candidate is dropped. Lifting that means locating finders by connected
-    // components instead of run lengths — rotation-invariant by construction —
-    // which is the top item in SPEC's backlog, not a tweak to this function.
-    //
-    // Asserted as a minimum rather than an exact set, so that fixing the limit
-    // does not fail this test.
-    for ([_]f32{ 0, 7, 90, 180, 270 }) |deg| {
-        var side: u32 = 0;
-        const img = renderRotated(&m, 6, deg, &pixels, &side);
-        const found = try scan(img, &scratch);
-        var fm = found.matrix;
-        try t.expectEqualStrings("ROTATED SYMBOL", try qr.decode(&fm, &out));
-    }
+    // 45 degrees is the worst case: a horizontal line through the centre of a
+    // square tilted that far crosses it in side / cos(45) = 1.41 sides, and the
+    // same factor applies to every concentric ring, which is exactly why the
+    // 1:1:3:1:1 ratio still holds and the finder is still found. Uncorrected,
+    // the version comes out four sizes small and the symbol is unreadable while
+    // every intermediate step looks fine.
+    var side: u32 = 0;
+    const img = renderRotated(&m, 6, 45, &pixels, &side);
+    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
+    binarize(img, &bits);
+
+    var finders: [max_candidates]Finder = undefined;
+    const found = locateFinders(&bits, &finders);
+    try t.expect(found.len >= 3);
+
+    const c = orient(found) orelse return error.NoCorners;
+    try t.expectEqual(@as(u32, m.size), c.dimension);
+    // The corrected module is the rendered one, not the 1.41x the scan measured.
+    // Corrected, the estimate is the module that was rendered; raw, it is that
+    // module times 1 / cos(45) = 1.41, which is where the four versions went.
+    try t.expect(@abs(c.module - 6.0) < 0.5);
+    try t.expect((c.tl.peak + c.tr.peak + c.bl.peak) / 3 > 7.5);
+}
+
+test "a dimension one version out is rejected by the timing pattern" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "https://example.com/dimension-check", .{ .ecc = .quartile });
+
+    var pixels: [512 * 512]u8 = undefined;
+    var scratch: [512 * 512 / 8]u8 = undefined;
+    const img = render(&m, 4, &pixels);
+    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
+    binarize(img, &bits);
+
+    var finders: [max_candidates]Finder = undefined;
+    const found = locateFinders(&bits, &finders);
+    var c = orient(found) orelse return error.NoCorners;
+    try t.expectEqual(@as(u32, m.size), c.dimension);
+
+    // Hand the sampler a dimension one version too large, the way a module
+    // estimate half a percent off would. The wrong grid samples perfectly well
+    // — this is the failure mode that looks like a picture problem — so the
+    // timing pattern has to be what rejects it.
+    const wrong = sample(&bits, .{ .tl = c.tl, .tr = c.tr, .bl = c.bl, .module = c.module, .dimension = c.dimension + 4 }) catch
+        return error.WrongDimensionDidNotEvenSample;
+    try t.expect(timingScore(&wrong.matrix) < 0.9);
+
+    c.dimension += 4;
+    const best = try sampleBestDimension(&bits, c);
+    try t.expectEqual(m.size, best.matrix.size);
+
+    var fm = best.matrix;
+    var out: [128]u8 = undefined;
+    try t.expectEqualStrings("https://example.com/dimension-check", try qr.decode(&fm, &out));
+}
+
+test "a large symbol produces more finder candidates than a list of sixteen holds" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "N" ** 300, .{ .ecc = .quartile });
+
+    var pixels: [900 * 900]u8 = undefined;
+    var scratch: [900 * 900 / 8]u8 = undefined;
+    var side: u32 = 0;
+    const img = renderRotated(&m, 4, 20, &pixels, &side);
+    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
+    binarize(img, &bits);
+
+    var finders: [max_candidates]Finder = undefined;
+    const found = locateFinders(&bits, &finders);
+    // The number itself is incidental; what is pinned is that it is past the
+    // ceiling this list used to have, so `max_candidates = 16` would drop real
+    // finders and the symbol would be missed for want of a slot.
+    try t.expect(found.len > 16);
+    try t.expect(orient(found) != null);
 }
 
 // ── fuzz: the image is entirely attacker-chosen ─────────────────────────────

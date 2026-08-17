@@ -30,6 +30,35 @@ triple by how well it forms three corners of a square — equal legs, hypotenuse
 three is what the first implementation did, and one false positive ruined an
 otherwise perfect read.
 
+**How many candidates the list holds is a detection limit, not a memory
+setting.** False positives scale with the data region, so a large symbol
+produces them faster than the real finders are reached: a rotated version 13
+yields more than sixteen candidates, and with a list of sixteen the third real
+finder has nowhere to go. The symbol is then missed for want of a slot, which
+presents as "not found" with nothing in the picture to blame. Sixty-four covers
+every case measured; the cost is the triple search, which is cubic.
+
+**The ratio is rotation-invariant; the length that comes with it is not.** A line
+through the centre of a square crosses every concentric ring in proportion at any
+angle, which is why finders are located at any rotation — but a horizontal chord
+across a square tilted by `t` measures `side / cos(t)`. At 45° that reports 1.41
+pixels of module for every one, the version lands four sizes out, and the symbol
+is unreadable while the finders, the triple score and the sampling all look
+correct. `orient` recovers `t` from the top edge (`tl → tr`, wrapped into ±45°
+because a square is unchanged by a quarter turn) and multiplies it back out.
+The estimate used is each finder's **largest** scan-line unit rather than its
+mean: only the chord through the centre has a length that is a fixed function of
+the tilt, and averaging over the rows either side undercuts it by 13 % at 45°.
+
+**The version is checked, not trusted.** A dimension one version out samples
+perfectly well — every module gets a value and the grid looks like a QR code —
+and `qr.decode` then reports a format error that reads like a problem with the
+picture. So the neighbouring legal sizes are sampled too and scored on the timing
+patterns, which are the one part of a symbol whose content the standard fixes
+rather than the message. Deliberately no minimum score: a real symbol with a
+damaged timing pattern still decodes, because the data is protected and the
+timing is not, so the score chooses between candidates and does not get a veto.
+
 **The finder centre comes from the vertical extent, not from the row that found
 it.** A row-scan hits the same finder on every row it spans; the triggering row
 is somewhere inside the pattern, not at its middle. Merging candidates with
@@ -51,7 +80,8 @@ untrusted. Bounds are checked before anything is indexed: `luma` must cover
 `stride * height`, the scratch must meet `scratchSize`, and each sampling point is
 range-checked against the bitmap rather than assumed to land inside it. There is
 no allocation, so there is no allocation to exhaust; work is linear in pixels
-except the triple search, which is cubic in candidates and therefore capped at 16.
+except the triple search, which is cubic in candidates and therefore capped at
+64, and the dimension search, which samples at most five grids.
 
 Failing to find a symbol returns `NotFound`. Deciding whether a located symbol is
 *readable* is `qr.decode`'s job, and the split matters: a scanner that reports
@@ -67,9 +97,18 @@ weaker evidence than a grid that is identical, because error correction hides
 sampling mistakes up to its capability.
 
 Covered: three texts across three module scales; a padded-stride buffer with junk
-in the padding; upright, slightly tilted and quarter-turn rotations; and a
+in the padding; **two symbols swept through a full turn in 15° steps**; and a
 contrast-rich image with no symbol in it, which must return `NotFound` rather
-than a guess.
+than a guess. The rotation sweep is the regression net, but three tests pin the
+mechanisms underneath it individually, because a sweep that goes red says only
+that something moved: that the tilt correction turns a 1.41× scan-line estimate
+back into the rendered module size, that a dimension one version out is rejected
+by its timing pattern, and that a large rotated symbol really does produce more
+than sixteen candidates.
+
+A wider sweep than the tests keep — five versions × three module scales × 5°
+steps — reads at every angle up to version 24. Version 37 at 3 pixels per module
+is where it stops, at about 40 %.
 
 The three defects above were all found this way rather than by reading the code,
 which is the argument for rendering the input instead of hand-writing bitmaps.
@@ -88,16 +127,22 @@ comparison is internal.
 
 ## Backlog
 
-- **Rotation-invariant finder location.** The top item. Row-scanning finds the
-  bands at any angle, but confirmation walks a strictly vertical column, so past
-  roughly ten degrees the ratio no longer holds and candidates are dropped.
-  Locating finders as connected components is rotation-invariant by construction
-  and is the approach a robust reader takes; it replaces `confirmVertical` rather
-  than adjusting it.
+- **Sampling accuracy at large versions.** The top item, and what the old
+  "rotation-invariant finder location" entry was really pointing at: rotation
+  itself is handled, but a rotated version 37 at 3 pixels per module reads about
+  40 % of the time. The cause is accumulated error in an affine map fitted to
+  three points 158 modules apart, which is precisely what alignment patterns
+  exist to correct — so this and perspective correction are the same piece of
+  work.
+- **Connected-component finder location.** Was assumed to be the fix for
+  rotation, and is not: the run-length scan finds finders at every angle already.
+  It remains the more robust approach for a *damaged* finder, where a run-length
+  scan needs the bands to survive intact along one line, and it would remove the
+  candidate-list ceiling. Not scheduled — no measured failure currently points at
+  it.
 - **Perspective correction.** The affine map from three finder centres is exact
   for a flat symbol square to the camera. Off-plane needs the bottom-right
-  alignment pattern and a projective map — which also raises the largest version
-  that samples accurately, since alignment patterns exist to correct exactly this.
+  alignment pattern and a projective map.
 - **Multiple symbols per frame.** Candidates for several are already found; only
   the best triple is sampled. A wallet showing two codes at once is the case.
 - **Sub-pixel sampling.** Each module is read from a single pixel at its centre.

@@ -42,19 +42,33 @@ not to one that is otherwise pure arithmetic over a buffer.
    ordinary five bands that a fence or a line of text produces.
 3. **Orientation** — of the candidates, the triple that best forms three corners
    of a square wins. More than three candidates is normal, not exceptional: the
-   finder ratio occurs inside the data region too.
-4. **Sampling** — an affine map from the three finder centres, each of which sits
+   finder ratio occurs inside the data region too, and the larger the symbol the
+   more often, which is why the candidate list holds sixty-four rather than a
+   handful.
+4. **Sizing** — the module size a scan line measures is inflated by the symbol's
+   tilt, so it is corrected before it decides the version, and the version is
+   then checked against the timing patterns rather than trusted.
+5. **Sampling** — an affine map from the three finder centres, each of which sits
    3.5 modules in from its corner.
+
+## Rotation
+
+Any angle. The 1:1:3:1:1 ratio is rotation-invariant — a line through the centre
+of a square crosses every concentric ring in proportion, whatever the angle — so
+finders are located at any rotation. What is *not* invariant is the length that
+comes with the ratio: a horizontal chord across a square tilted by `t` measures
+`side / cos(t)`, and at 45° that is 1.41 modules reported for every one, which
+sets the version four sizes out and reads as a symbol nobody can decode. `orient`
+takes the tilt from the top edge and corrects for it.
 
 ## Limits, stated plainly
 
-- **Steep rotation is not handled.** Upright, slightly tilted and quarter turns
-  read; past roughly ten degrees the vertical confirmation stops recognising the
-  finder. Fixing it means locating finders by connected components rather than
-  run lengths. Tests cover what does work.
 - **No perspective correction.** The affine map from three finders is exact for a
   flat, square-on symbol. A symbol photographed at an angle to the plane needs
-  the bottom-right alignment pattern and a projective map.
+  the bottom-right alignment pattern and a projective map. The same missing
+  refinement is what limits large symbols at small module sizes: a rotated
+  version 37 at 3 pixels per module reads about 40 % of the time, because half a
+  module of error accumulated over 158 of them is a wrong sample.
 - **One symbol per image.** The candidate search finds several, but only the best
   triple is sampled.
 
