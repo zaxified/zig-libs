@@ -17,8 +17,14 @@ pub const ProcessEntry = struct {
     name_buf: [procnet.comm_max]u8 = @splat(0),
     name_len: u8 = 0,
 
-    /// The process name (`comm`) — kernel-truncated to 15 chars + NUL, so
-    /// this is never the full argv0 for a long command name.
+    /// The process name as `/proc/<pid>/stat` renders it — truncated to
+    /// `procnet.comm_max` (64) bytes if the kernel's own render is longer
+    /// still (e.g. an adversarial `comm` set via `prctl(PR_SET_NAME)`-then
+    /// -argv-rewrite games). This is never necessarily the full argv0 of a
+    /// long command line — `comm` itself is a separate, shorter kernel
+    /// field — but for `PF_WQ_WORKER` kernel threads it does include the
+    /// full workqueue-suffixed name (`kworker/0:0H-kblockd`), which the
+    /// old 16-byte bound used to cut off.
     pub fn name(e: *const ProcessEntry) []const u8 {
         return e.name_buf[0..e.name_len];
     }
@@ -124,10 +130,15 @@ test "parseProcStat: name containing spaces and a lone close-paren" {
     try testing.expectEqual(@as(u64, 300 * 4), e.rss_kb);
 }
 
-test "parseProcStat: name longer than TASK_COMM_LEN is truncated, not dropped" {
-    const line = "7 (this-process-name-is-way-too-long-for-the-kernel) Z 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0";
+test "parseProcStat: name longer than comm_max is truncated, not dropped" {
+    // 105 bytes — past `comm_max` (64) — asserted against a concrete
+    // expected string, not a length derived from the constant under test:
+    // that form passes vacuously whatever `comm_max` happens to be (it did,
+    // silently, when this test read `procnet.comm_max` on both sides before
+    // this fix — see the CHANGELOG entry for `comm_max` 16→64).
+    const line = "7 (this-process-name-is-way-too-long-for-the-kernel-and-then-some-padding-to-exceed-the-64-byte-parse-buffer) Z 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0";
     const e = parseProcStat(line).?;
-    try testing.expectEqual(@as(usize, procnet.comm_max), e.name().len);
+    try testing.expectEqualStrings("this-process-name-is-way-too-long-for-the-kernel-and-then-some-p", e.name());
     try testing.expectEqual(@as(u8, 'Z'), e.state);
 }
 
@@ -137,6 +148,22 @@ test "parseProcStat: malformed lines return null, not a panic" {
     try testing.expectEqual(@as(?ProcessEntry, null), parseProcStat("1 (ok S 1 1")); // no close paren
     try testing.expectEqual(@as(?ProcessEntry, null), parseProcStat("bad-pid (ok) S 1 1"));
     try testing.expectEqual(@as(?ProcessEntry, null), parseProcStat("1 (ok) S")); // missing ppid
+}
+
+test "parseProcStat: real long kernel-thread line, full workqueue name survives" {
+    // Captured verbatim from a live host: `/proc/10/stat`, a PF_WQ_WORKER
+    // kernel thread whose comm is "kworker/0:0H-kblockd" (20 bytes) — the
+    // kernel's proc_task_name() (fs/proc/array.c) appends the workqueue
+    // description past TASK_COMM_LEN (16), so this is legitimately longer
+    // than the kernel-internal comm bound. `comm_max` sizes the *parse*
+    // buffer, not the kernel-internal one, and must be big enough to hold
+    // this without truncating.
+    const line = "10 (kworker/0:0H-kblockd) I 2 0 0 0 -1 69238880 0 0 0 0 0 0 0 0 0 -20 1 0 18 0 0 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+    const e = parseProcStat(line).?;
+    try testing.expectEqual(@as(u32, 10), e.pid);
+    try testing.expectEqualStrings("kworker/0:0H-kblockd", e.name());
+    try testing.expectEqual(@as(u8, 'I'), e.state);
+    try testing.expectEqual(@as(u32, 2), e.ppid);
 }
 
 test "parseProcStat: too few trailing fields still yields rss 0, not an error" {

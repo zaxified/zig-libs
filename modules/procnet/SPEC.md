@@ -15,8 +15,13 @@ default positional whole-file read would come back empty; streaming to EOF is th
 read strategy, bounded by a caller-supplied `limit`. A missing or unreadable file yields an empty
 result, not an error — these tables are legitimately absent (module not loaded, feature disabled,
 no permission) often enough that "no data" beats "hard failure". Result types use fixed inline
-buffers for kernel-bounded strings (`if_name_max` = `IFNAMSIZ` = 16, `comm_max` = `TASK_COMM_LEN` =
-16), so a whole result slice frees with one `gpa.free(slice)`, no arena required (same shape as the
+buffers for kernel-bounded strings (`if_name_max` = `IFNAMSIZ` = 16, `comm_max` = 64, anchored on the
+kernel's `fs/proc/array.c` — `proc_task_name()` renders `/proc/<pid>/stat`'s `comm` field into a local
+`char tcomm[64]`, and for `PF_WQ_WORKER` kernel threads appends the workqueue description via
+`wq_worker_comm()`, past the kernel-internal `TASK_COMM_LEN` (16, kept as `task_comm_len` for the
+bound it actually names). A parser sized to `TASK_COMM_LEN` truncates every such kernel-thread name —
+e.g. `kworker/0:0H-kblockd`, verified on a real host — which is why `comm_max` is 64, not 16), so a
+whole result slice frees with one `gpa.free(slice)`, no arena required (same shape as the
 `netlink` module's typed results); `copyClamped` truncates rather than fails when copying into
 these buffers as a defensive belt-and-braces measure (inputs are already kernel-bounded, so this
 is not the expected path). Addresses are returned as typed `netaddr.Ip`/`Prefix`, not allocated

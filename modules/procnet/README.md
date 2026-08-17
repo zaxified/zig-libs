@@ -20,7 +20,9 @@ reads to full dual-stack coverage.
 - **Platform:** linux (raw `/proc`+`/sys` reads). **Role:** util.
   **Concurrency:** reentrant (no shared state).
 - **Deps:** `netaddr` (`Ip`/`Prefix` — typed addresses instead of allocated
-  strings).
+  strings), re-exported as `procnet.netaddr` so a consumer that imports only
+  `procnet` can format/inspect the addresses it gets back without a
+  separate import.
 
 ## API
 

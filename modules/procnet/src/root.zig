@@ -17,10 +17,12 @@
 //! permission) often enough that "no data" beats "hard failure".
 //!
 //! Result types use fixed inline buffers for their (kernel-bounded) strings
-//! — device/interface names (`IFNAMSIZ` = 16), process names
-//! (`TASK_COMM_LEN` = 16) — so a whole result slice frees with one
-//! `gpa.free(slice)`, no arena required (same shape as the `netlink`
-//! module's typed results).
+//! — device/interface names (`IFNAMSIZ` = 16), process names as rendered by
+//! `/proc/<pid>/stat` (`comm_max` = 64, `fs/proc/array.c`'s `tcomm[64]` —
+//! NOT the kernel-internal `TASK_COMM_LEN` = 16, which bounds a task's
+//! `comm` in the kernel but not what `/proc` prints for it) — so a whole
+//! result slice frees with one `gpa.free(slice)`, no arena required (same
+//! shape as the `netlink` module's typed results).
 //!
 //! ```zig
 //! var threaded = std.Io.Threaded.init(gpa, .{});
@@ -37,7 +39,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const netaddr = @import("netaddr");
+
+/// Re-exported so a consumer that imports only `procnet` can format/inspect
+/// addresses (`netaddr.Ip`/`Prefix`) without a separate structural-match
+/// import of `netaddr` — this module already depends on it, and every typed
+/// address field in `procnet` (`SocketEntry.local`, `RouteEntry.dest`, …) is
+/// this exact `netaddr.Ip`/`Prefix`, not a look-alike.
+pub const netaddr = @import("netaddr");
 
 pub const meta = .{
     .platform = .linux,
@@ -52,9 +60,24 @@ pub const meta = .{
 /// `routes.zig` for their inline device/iface buffers.
 pub const if_name_max = 16;
 
-/// The kernel's `TASK_COMM_LEN` (`linux/sched.h`) — `/proc/<pid>/stat`'s
-/// `comm` field (including NUL) never exceeds this. Shared with `process.zig`.
-pub const comm_max = 16;
+/// The kernel's `TASK_COMM_LEN` (`linux/sched.h`) — the hard bound on a
+/// task's `comm` *inside the kernel*. This is NOT the bound on what
+/// `/proc/<pid>/stat` prints: see `comm_max` below. Kept as its own named
+/// constant so a caller who genuinely means the kernel-internal bound (not
+/// a parse-buffer size) has a correctly-named constant to reach for.
+pub const task_comm_len = 16;
+
+/// The bound on what `/proc/<pid>/stat` actually *renders* for `comm` —
+/// anchored on the kernel's `fs/proc/array.c`: `proc_task_name()` writes
+/// into a local `char tcomm[64]` and, for `PF_WQ_WORKER` kernel threads,
+/// calls `wq_worker_comm()` first, which appends the workqueue description
+/// after the raw `comm` — e.g. `kworker/0:0H-kblockd` (20 bytes), well past
+/// `task_comm_len` (16). A parser sized to `task_comm_len` silently
+/// truncates every such kernel-thread name; `comm_max` is the bound this
+/// module's parse buffers (`process.zig`'s `Entry.name_buf`) actually use,
+/// and the name external consumers should reach for. Shared with
+/// `process.zig`.
+pub const comm_max = 64;
 
 pub const arp = @import("arp.zig");
 pub const routes = @import("routes.zig");
@@ -306,6 +329,18 @@ test "copyClamped truncates instead of overflowing" {
     const n = copyClamped(&buf, "hello");
     try testing.expectEqual(@as(u8, 4), n);
     try testing.expectEqualStrings("hell", buf[0..n]);
+}
+
+test "netaddr is re-exported and is the exact type SocketEntry.local returns" {
+    // A consumer that imports only `procnet` must be able to reach
+    // `netaddr` through it (`procnet.netaddr.Ip`) without a separate,
+    // structurally-matching import of `netaddr` itself. `@This().netaddr`
+    // fails to compile if the `pub const netaddr = @import("netaddr");`
+    // re-export line above is ever removed or renamed, which is the load
+    // -bearing part of this test; the equality check then confirms it is
+    // the SAME type `SocketEntry.local` uses, not a look-alike copy.
+    const ReexportedIp = @This().netaddr.Ip;
+    try testing.expect(ReexportedIp == @TypeOf(@as(SocketEntry, undefined).local));
 }
 
 // Gated live smoke test: exercises the real `/proc` + `/sys` tree end to end.

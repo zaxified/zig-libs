@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — **BREAKING:** `comm_max` 16 → 64. It was documented as `TASK_COMM_LEN`
+  (`linux/sched.h`), but that constant bounds a task's `comm` *inside the kernel* — it does
+  NOT bound what `/proc/<pid>/stat` prints. The kernel's `fs/proc/array.c` renders `comm`
+  via `proc_task_name()` into a local `char tcomm[64]`, and for `PF_WQ_WORKER` kernel
+  threads calls `wq_worker_comm()` first, which appends the workqueue description — e.g.
+  `kworker/0:0H-kblockd` (20 bytes), observed on a live host at `/proc/10/stat`, which the
+  old 16-byte bound silently truncated to `kworker/0:0H-kbl`. Added `task_comm_len` (16) as
+  the correctly-named constant for the kernel-internal bound; `comm_max` (now 64, anchored
+  on `tcomm[64]`) stays the name callers use for the parse buffer
+  (`ProcessEntry.name_buf`), so `comm_max` silently getting the wrong value was the actual
+  defect — this is that fix, not a cosmetic rename. Also re-exported `netaddr` as
+  `procnet.netaddr` so a consumer importing only `procnet` can format the `Ip`/`Prefix`
+  values it gets back without a separate structural-match import.
 - **2026-08-15** — Fixed a flaky live smoke test (test-only; no change to the module).
   The `readSockets`/`readArp`/`readRoutes`/`readConntrack` wiring test compared the
   ROW COUNT from a direct `/proc` read against the count the wrapper returned, i.e. two
