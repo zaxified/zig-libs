@@ -2,12 +2,15 @@
 //! blobstore — content-addressed blob store (git-object / restic style):
 //! atomic rename-on-commit, sha256 fan-out layout, dedup, namespaced blobs.
 //!
-//! Layout under `base`:
+//! Layout under `base` (each subdirectory below is created lazily, on that
+//! layer's first write, not at `Store.init` time — a store that never
+//! touches a layer never creates its directory):
 //!  - `cas/<hh>/<hex>`   content-addressed store; a blob's bytes live once,
 //!    keyed by their SHA-256 (`hh` = first two hex chars = 256-way fan-out so
 //!    no directory holds the whole corpus, repeated per `Options.fanout`
 //!    level for deeper nesting). Identical content dedups. A `<hex>.rc`
-//!    sidecar next to each blob tracks its reference count.
+//!    sidecar next to each blob tracks its reference count, unless the store
+//!    was opened with `Options.refcount = false` (see below).
 //!  - `raw/<ns>/<key>`   a plain namespaced blob layer (name-addressed, not
 //!    dedup'd) for when the caller owns the key.
 //!  - `named/<ns>/<key>` small opaque byte records (manifests, indexes) under
@@ -33,7 +36,12 @@
 //! all (written before this feature, never `delete`d since) is treated as
 //! still-referenced and left alone — see `gc`'s doc comment for the full
 //! reachability contract and why refcounting (not pure mark-sweep) was
-//! chosen.
+//! chosen. `Options.refcount = false` opts a store out of sidecars entirely
+//! (rename-only `casCommit`, for a caller that never deletes and never calls
+//! `gc`): every blob then permanently has the "no sidecar" always-referenced
+//! status above, so `gc`'s CAS sweep is a true no-op on such a store and
+//! `casDelete`/`delete` refuse with `error.RefcountDisabled` rather than
+//! fabricating a sidecar on demand — see `Options.refcount`'s doc comment.
 //!
 //! **Cross-process ingest locking.** The commit-and-refcount-mutate section
 //! of `put`/`casDelete`/`gc` is serialized across processes with an advisory
@@ -68,6 +76,13 @@ pub const Error = error{
     NotFound,
     /// `Options.fanout` is 0 or too large to leave room in a 64-char hex digest.
     InvalidFanout,
+    /// `casDelete`/`delete` called on a store opened with `Options.refcount =
+    /// false`. There is no sidecar to decrement, and writing one on demand
+    /// would silently defeat the option (see `Options.refcount`'s doc
+    /// comment) — a store that opts out of bookkeeping never gets a
+    /// half-bookkept blob. Callers who never delete (the intended use of
+    /// `refcount = false`) never hit this.
+    RefcountDisabled,
 };
 
 /// Store construction options. Default matches the on-disk layout every
@@ -83,6 +98,26 @@ pub const Options = struct {
     /// already has blobs on disk does *not* migrate them — pick it once at
     /// creation time.
     fanout: u8 = 1,
+    /// Whether `casCommit` maintains a `<hex>.rc` refcount sidecar next to
+    /// every blob. Default `true` matches every store this module has ever
+    /// written. Set `false` for a store that never deletes and never calls
+    /// `gc` — `casCommit` becomes rename-only (no sidecar write, no extra
+    /// inode per blob) and behaves exactly like the pre-refcount `casCommit`
+    /// this module shipped before refcounting existed.
+    ///
+    /// This is contract-compatible with the rest of the module, not a
+    /// special case bolted on: `gc` already treats a CAS blob with **no**
+    /// `.rc` sidecar at all as still-referenced and leaves it alone (see
+    /// `gc`'s doc comment) — that rule predates this option and exists for
+    /// stores written before refcounting shipped. `refcount = false` simply
+    /// keeps every blob in that state permanently, so `gc` on such a store
+    /// is a true, documented no-op on the CAS sweep (it still reaps stale
+    /// ingest temps, which is unrelated bookkeeping) and reports it
+    /// truthfully via `GcStats{ .blobs_removed = 0 }` rather than silently
+    /// claiming success. `casDelete`/`delete` refuse with
+    /// `error.RefcountDisabled` instead of fabricating a sidecar on demand —
+    /// see `Error.RefcountDisabled`.
+    refcount: bool = true,
 };
 
 /// A content address: the lowercase-hex SHA-256 of a blob's bytes.
@@ -129,24 +164,29 @@ pub const Store = struct {
     base: []const u8,
     /// CAS fan-out depth (2-hex-char directory levels); see `Options.fanout`.
     fanout: u8,
+    /// Whether `casCommit` maintains `.rc` sidecars; see `Options.refcount`.
+    refcount: bool,
 
-    /// Ensure `base` and its `cas/`, `raw/`, `named/`, `tmp/` subdirs exist,
-    /// with the default (historical) fan-out. Equivalent to
-    /// `initOptions(io, base, .{})`.
+    /// Ensure `base` exists, with the default (historical) fan-out and
+    /// refcounting on. Equivalent to `initOptions(io, base, .{})`.
+    ///
+    /// The `cas/`, `raw/`, `named/` and `tmp/` layer subdirectories are
+    /// **not** created here — each is created lazily on its own first write
+    /// (see e.g. `ensureCasTopDir`, `createTemp`, `putNamed`, `lockIngest`),
+    /// so a store that only ever uses some of the four layers never leaves
+    /// an empty directory on disk for the layers it doesn't touch. Every
+    /// read path already tolerates a missing layer directory (treats it the
+    /// same as "empty"/"not found"), so this costs nothing on read.
     pub fn init(io: std.Io, base: []const u8) !Store {
         return initOptions(io, base, .{});
     }
 
-    /// Like `init`, but with configurable CAS fan-out depth (see `Options`).
+    /// Like `init`, but with configurable CAS fan-out depth and refcounting
+    /// (see `Options`).
     pub fn initOptions(io: std.Io, base: []const u8, options: Options) !Store {
         if (options.fanout < 1 or options.fanout > 32) return error.InvalidFanout;
         try ensureDir(io, base);
-        var buf: [512]u8 = undefined;
-        try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/cas", .{base}));
-        try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/raw", .{base}));
-        try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/named", .{base}));
-        try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/tmp", .{base}));
-        return .{ .io = io, .base = base, .fanout = options.fanout };
+        return .{ .io = io, .base = base, .fanout = options.fanout, .refcount = options.refcount };
     }
 
     // ── content-addressed store (dedup at the file level) ──────────────────────
@@ -181,10 +221,21 @@ pub const Store = struct {
         return buf[0 .. dir.len + rest.len];
     }
 
-    /// Create every fan-out directory level for `hex` if missing.
+    /// Ensure `<base>/cas` itself exists. Lazy: created on the first CAS
+    /// write (`casCreateTemp`/`ensureCasDir`) rather than at `Store.init`
+    /// time, so a store that never uses the CAS layer never creates the
+    /// directory (see `init`'s doc comment).
+    fn ensureCasTopDir(self: Store) !void {
+        var buf: [512]u8 = undefined;
+        try ensureDir(self.io, try std.fmt.bufPrint(&buf, "{s}/cas", .{self.base}));
+    }
+
+    /// Create every fan-out directory level for `hex` if missing (including
+    /// `<base>/cas` itself, lazily).
     fn ensureCasDir(self: Store, hex: []const u8) !void {
         var buf: [640]u8 = undefined;
         var n = (try std.fmt.bufPrint(&buf, "{s}/cas", .{self.base})).len;
+        try ensureDir(self.io, buf[0..n]);
         var i: u8 = 0;
         while (i < self.fanout) : (i += 1) {
             const seg = try std.fmt.bufPrint(buf[n..], "/{s}", .{hex[2 * i .. 2 * i + 2]});
@@ -237,25 +288,33 @@ pub const Store = struct {
     /// Create a uniquely-named temp under `cas/` to stream one blob's content
     /// into while hashing it (the content hash is unknown until the stream ends).
     pub fn casCreateTemp(self: Store, uniq: []const u8, tmp_buf: []u8) !Temp {
+        try self.ensureCasTopDir();
         const tmp = try std.fmt.bufPrint(tmp_buf, "{s}/cas/.ingest-{s}.part", .{ self.base, uniq });
         const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
         return .{ .file = file, .tmp = tmp };
     }
 
-    /// Commit a hashed temp into the CAS as `<hex>` and bump its refcount
-    /// (creating it at 1 if new, incrementing it if this is a dedup hit —
-    /// every `put` of the same content counts as a live reference). Returns
-    /// true if newly stored, false if the content already existed (dedup —
-    /// the temp is removed). Runs under the cross-process ingest lock (see
-    /// `lockIngest`) so the has-check, rename, and refcount bump are atomic
-    /// with respect to another process's `put`/`casDelete`/`gc`.
+    /// Commit a hashed temp into the CAS as `<hex>`. Returns true if newly
+    /// stored, false if the content already existed (dedup — the temp is
+    /// removed). Runs under the cross-process ingest lock (see
+    /// `lockIngest`) so the has-check and rename are atomic with respect to
+    /// another process's `put`/`casDelete`/`gc`.
+    ///
+    /// When `self.refcount` is true (the default, `Options.refcount`), also
+    /// bumps the blob's `.rc` sidecar (creating it at 1 if new, incrementing
+    /// it if this is a dedup hit — every `put` of the same content counts as
+    /// a live reference), atomically with the has-check/rename. When false,
+    /// this is rename-only: no sidecar is read or written, matching the
+    /// pre-refcount `casCommit` this module shipped before refcounting
+    /// existed (see `Options.refcount`'s doc comment for why that is
+    /// contract-compatible with `gc`).
     pub fn casCommit(self: Store, hex: []const u8, tmp: []const u8) !bool {
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
 
         if (self.casHas(hex)) {
             self.discardTemp(tmp);
-            try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
+            if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
             return false;
         }
         try self.ensureCasDir(hex);
@@ -263,7 +322,7 @@ pub const Store = struct {
         const path = try self.casPath(&pbuf, hex);
         const cwd = std.Io.Dir.cwd();
         try cwd.rename(tmp, cwd, path, self.io);
-        try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
+        if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
         return true;
     }
 
@@ -277,7 +336,15 @@ pub const Store = struct {
     /// legacy blob to zero, matching the old unconditional-delete behavior
     /// for the common single-owner case. Runs under the cross-process
     /// ingest lock — see `casCommit`.
+    ///
+    /// Returns `error.RefcountDisabled` when `self.refcount` is false: there
+    /// is no sidecar to decrement, and writing one on demand would silently
+    /// defeat `Options.refcount = false` for every blob it ever touches. A
+    /// caller that opted into rename-only `casCommit` because it never
+    /// deletes should never reach this; one that does is told so loudly
+    /// instead of getting a half-bookkept blob.
     pub fn casDelete(self: Store, hex: []const u8) !bool {
+        if (!self.refcount) return error.RefcountDisabled;
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
 
@@ -384,6 +451,10 @@ pub const Store = struct {
     /// failed/partial upload never leaves a live blob).
     pub fn createTemp(self: Store, ns: []const u8, key: []const u8, tmp_buf: []u8) !Temp {
         if (!segmentSafe(ns) or !segmentSafe(key)) return error.InvalidName;
+        // Lazy: `<base>/raw` itself is created here, on first raw-layer
+        // write, not at `Store.init` time — see `init`'s doc comment.
+        var rbuf: [512]u8 = undefined;
+        try ensureDir(self.io, try std.fmt.bufPrint(&rbuf, "{s}/raw", .{self.base}));
         var dbuf: [640]u8 = undefined;
         const dir = try self.nsDir(&dbuf, ns);
         try ensureDir(self.io, dir);
@@ -452,6 +523,10 @@ pub const Store = struct {
     /// mid-write never leaves a torn record (matches the cas/raw layers).
     pub fn putNamed(self: Store, ns: []const u8, key: []const u8, bytes: []const u8) !void {
         if (!segmentSafe(ns) or !segmentSafe(key)) return error.InvalidName;
+        // Lazy: `<base>/named` itself is created here, on first named-record
+        // write, not at `Store.init` time — see `init`'s doc comment.
+        var nbuf: [512]u8 = undefined;
+        try ensureDir(self.io, try std.fmt.bufPrint(&nbuf, "{s}/named", .{self.base}));
         var dbuf: [640]u8 = undefined;
         const dir = try self.namedDir(&dbuf, ns);
         try ensureDir(self.io, dir);
@@ -506,6 +581,7 @@ pub const Store = struct {
     /// Create a uniquely-named scratch file under `<base>/tmp/`. Returns the open
     /// file + its path (clean up with `discardTemp`).
     pub fn scratchCreate(self: Store, uniq: []const u8, path_buf: []u8) !Temp {
+        try self.ensureTmpTopDir();
         const path = try std.fmt.bufPrint(path_buf, "{s}/tmp/{s}", .{ self.base, uniq });
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
         return .{ .file = file, .tmp = path };
@@ -523,9 +599,22 @@ pub const Store = struct {
     // panic/early-return inside the critical section still drops it rather
     // than wedging every other process open on this store.
 
+    /// Ensure `<base>/tmp` itself exists. Lazy: created on first use of the
+    /// scratch/ingest-lock layer (`lockIngest`/`scratchCreate`) rather than
+    /// at `Store.init` time — see `init`'s doc comment. In practice this
+    /// directory is created by almost every store, since `casCommit`,
+    /// `casDelete` and `gc` all take the ingest lock — but a store that uses
+    /// only the `raw`/`named` layers (via `createTemp`/`putNamed`, neither
+    /// of which locks) never creates it.
+    fn ensureTmpTopDir(self: Store) !void {
+        var buf: [512]u8 = undefined;
+        try ensureDir(self.io, try std.fmt.bufPrint(&buf, "{s}/tmp", .{self.base}));
+    }
+
     /// Open (creating if needed) and exclusively lock `tmp/.ingest.lock`,
     /// blocking until any other process's/thread's lock on it is released.
     fn lockIngest(self: Store) !std.Io.File {
+        try self.ensureTmpTopDir();
         var buf: [768]u8 = undefined;
         const path = try std.fmt.bufPrint(&buf, "{s}/tmp/.ingest.lock", .{self.base});
         return std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false, .lock = .exclusive });
@@ -586,17 +675,28 @@ pub const Store = struct {
     /// `allocator` is used only for a scratch lookup table built and freed
     /// entirely within this call (to hold `keep`) — any allocator works,
     /// not just an arena; `gc` never leaks or retains it.
+    ///
+    /// On a store opened with `Options.refcount = false`, the CAS sweep is
+    /// skipped entirely: no blob in such a store ever has a `.rc` sidecar,
+    /// and (per the doc comment above) a sidecar-less blob is always treated
+    /// as still-referenced, so the sweep could never find anything to
+    /// collect. This is a documented, truthful no-op — `GcStats.blobs_removed`
+    /// and `.bytes_reclaimed` come back `0` rather than a fabricated
+    /// non-zero count — not a silent skip that would let a caller believe
+    /// collection happened. The stale-ingest-temp reap still runs: it is
+    /// unrelated to refcounting.
     pub fn gc(self: Store, allocator: std.mem.Allocator, keep: []const Digest, options: GcOptions) !GcStats {
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
+
+        var stats: GcStats = .{};
+        stats.temps_removed = try self.reapStaleIngestTemps(options.stale_after_ns);
+        if (!self.refcount) return stats;
 
         var keep_set: std.StringHashMapUnmanaged(void) = .empty;
         defer keep_set.deinit(allocator);
         try keep_set.ensureTotalCapacity(allocator, @intCast(keep.len));
         for (keep) |*d| keep_set.putAssumeCapacity(d.slice(), {});
-
-        var stats: GcStats = .{};
-        stats.temps_removed = try self.reapStaleIngestTemps(options.stale_after_ns);
 
         var dbuf: [768]u8 = undefined;
         const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
@@ -1170,4 +1270,131 @@ test "cross-process ingest lock: repeated put/delete/gc from one writer never de
     const store2 = try Store.init(std.testing.io, store.base);
     const d2 = try store2.putBytes("second handle, same base");
     try t.expect(store2.has(d2));
+}
+
+test "Options.refcount = false: casCommit is rename-only — one file, no sidecar, still readable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const store = try Store.initOptions(std.testing.io, base, .{ .refcount = false });
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const d = try store.putBytes("no bookkeeping wanted here");
+
+    // exactly ONE file in the fan-out dir: the blob itself, no `<hex>.rc`.
+    var fbuf: [300]u8 = undefined;
+    const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, d.hex[0..2] });
+    var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file) continue;
+        try names.append(gpa, try gpa.dupe(u8, e.name));
+    }
+    try t.expectEqual(@as(usize, 1), names.items.len);
+    try t.expectEqualStrings(&d.hex, names.items[0]);
+
+    // still readable via the normal read path, byte-identical.
+    try t.expect(store.has(d));
+    var f = (try store.open(d)).?;
+    var rbuf: [64]u8 = undefined;
+    var fr = std.Io.File.Reader.initStreaming(f, io, &rbuf);
+    const got = try fr.interface.allocRemaining(gpa, .unlimited);
+    f.close(io);
+    defer gpa.free(got);
+    try t.expectEqualStrings("no bookkeeping wanted here", got);
+    try t.expect(try store.verify(d));
+}
+
+test "Options default (no Options passed): casCommit still writes a sidecar — regression guard" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf); // Store.init: no Options at all
+    const io = std.testing.io;
+
+    const d = try store.putBytes("historical behaviour must not change");
+
+    var fbuf: [300]u8 = undefined;
+    const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, d.hex[0..2] });
+    var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
+    defer dir.close(io);
+    var blob_count: usize = 0;
+    var rc_count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file) continue;
+        if (std.mem.endsWith(u8, e.name, ".rc")) rc_count += 1 else blob_count += 1;
+    }
+    try t.expectEqual(@as(usize, 1), blob_count);
+    try t.expectEqual(@as(usize, 1), rc_count);
+    try t.expectEqual(@as(u64, 1), store.casRefRead(&d.hex, 0));
+}
+
+test "Options.refcount = false: gc's CAS sweep is a documented no-op; casDelete refuses" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const store = try Store.initOptions(std.testing.io, base, .{ .refcount = false });
+    const gpa = std.testing.allocator;
+
+    const d = try store.putBytes("never deleted, never gc'd by design");
+    try t.expect(store.has(d));
+
+    // gc must not collect it (no sidecar ⇒ always-referenced) and must
+    // truthfully report zero collected, not silently skip and stay quiet
+    // about what it did.
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expectEqual(@as(u64, 0), stats.bytes_reclaimed);
+    try t.expect(store.has(d)); // still there
+
+    // casDelete/delete refuse loudly instead of fabricating a sidecar.
+    try t.expectError(error.RefcountDisabled, store.delete(d));
+    try t.expect(store.has(d)); // untouched by the refused call
+}
+
+test "lazy layer creation: a store that never touches a layer never creates its directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const io = std.testing.io;
+
+    // right after Store.init: base exists, but none of the four layer
+    // subdirectories do — nothing has been written yet.
+    const store = try Store.init(io, base);
+    var pbuf: [512]u8 = undefined;
+    inline for (.{ "cas", "raw", "named", "tmp" }) |layer| {
+        const p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ base, layer });
+        try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, p, .{}));
+    }
+
+    // touch only the raw layer (createTemp/commit) — this also proves the
+    // parent `<base>/raw` gets created lazily, not just the `<ns>` subdir.
+    var tbuf: [768]u8 = undefined;
+    const w = try store.createTemp("dev1", "backup.bin", &tbuf);
+    w.file.close(io);
+    try store.commit("dev1", "backup.bin", w.tmp);
+
+    // `raw/` now exists ...
+    const raw_p = try std.fmt.bufPrint(&pbuf, "{s}/raw", .{base});
+    try std.Io.Dir.cwd().access(io, raw_p, .{});
+    // ... but `cas/`, `named/` and `tmp/` still do not: nothing touched them.
+    inline for (.{ "cas", "named", "tmp" }) |layer| {
+        const p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ base, layer });
+        try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, p, .{}));
+    }
+
+    // and the raw blob itself is genuinely there and readable.
+    var f = (try store.openBlob("dev1", "backup.bin")).?;
+    f.close(io);
 }

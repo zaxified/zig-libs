@@ -6,9 +6,11 @@ named records. Usage: see ./README.md. Attribution/provenance: see this module's
 ## Design & invariants
 - **Layout:** `<base>/cas/<hh...>/<hex>` (content-addressed, dedup, `hh...` = `Options.fanout`
   levels of hex[0..2] fan-out, default 1 level = the historical layout) plus a `<hex>.rc` refcount
-  sidecar next to each blob, `<base>/raw/<ns>/<key>` (name-addressed, caller-owned key),
-  `<base>/named/<ns>/<key>` (opaque byte records), `<base>/tmp/` (scratch + in-flight ingest temps +
-  the `tmp/.ingest.lock` cross-process lock file).
+  sidecar next to each blob (unless `Options.refcount = false`, see below), `<base>/raw/<ns>/<key>`
+  (name-addressed, caller-owned key), `<base>/named/<ns>/<key>` (opaque byte records), `<base>/tmp/`
+  (scratch + in-flight ingest temps + the `tmp/.ingest.lock` cross-process lock file). Each of these
+  four subdirectories is created lazily, on that layer's first write, not at `Store.init` time — a
+  store that never uses a layer (e.g. never calls `putNamed`) never creates its directory.
 - **Crash safety:** every write lands in a hidden `.part` temp, is fsync'd, made visible by a single
   `rename(2)`. A crash mid-write leaves only an orphaned temp; a live blob is never torn or partial.
 - **Dedup:** `put` hashes while streaming (single pass, bounded memory); `casCommit` skips the
@@ -24,6 +26,21 @@ named records. Usage: see ./README.md. Attribution/provenance: see this module's
   additive escape hatch for callers who want to double-check against their own root set. A blob
   with no `.rc` sidecar at all (written before this feature, never `delete`d since) is treated as
   still-referenced and left alone.
+- **`Options.refcount = false` — opting out of sidecars entirely:** for a store that never deletes
+  and never calls `gc` (a frozen append-only CAS layout, e.g. a consumer with its own pre-refcount
+  test harness asserting an exact file count), `casCommit` becomes rename-only: no `.rc` sidecar is
+  ever read or written, so the CAS directory holds exactly one file per blob. This is
+  contract-compatible with the rule directly above, not a special case: a sidecar-less blob is
+  already, unconditionally, "still-referenced and left alone" from `gc`'s point of view, and
+  `refcount = false` just keeps every blob in that state permanently instead of only until the first
+  `put`/`delete` touches it. Concretely: `gc`'s CAS sweep is skipped outright (it would find nothing
+  to collect — every blob is sidecar-less — so skipping it is an optimization, not a behavior
+  change) and reports `GcStats{ .blobs_removed = 0, .bytes_reclaimed = 0 }` truthfully rather than
+  silently pretending nothing was asked; `reapStaleIngestTemps` still runs, since ingest-temp reap is
+  unrelated to refcounting. `casDelete`/`delete` return `error.RefcountDisabled` instead of
+  fabricating a sidecar on demand — a caller that opted into "never delete" should never reach this
+  path, and one that does is told so loudly rather than getting a half-bookkept blob that
+  contradicts the option it set.
 - **Configurable fan-out:** `Options.fanout` (`1..=32`, default 1) sets how many 2-hex-char
   directory levels the CAS uses before the blob file. Only affects newly-created stores/paths at
   the depth chosen at `Store.initOptions` time — an existing store's on-disk fan-out is not migrated
@@ -64,7 +81,7 @@ still streaming into its own temp. Cross-process locking covers only blobstore's
 path — it is not a general-purpose file lock for caller-defined concurrent access patterns.
 
 ## Verification
-`zig build test-blobstore` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/blobstore`). 13
+`zig build test-blobstore` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/blobstore`). 17
 tests covering CAS put/dedup/has/open/verify(intact + bit-rot)/delete, `Digest.fromHex` round-trip,
 the raw createTemp→commit→openBlob→list crash-safe path, named put/read/list, `segmentSafe`
 rejecting `..`/leading-dot/traversal attempts on every public entry point, `gc` sweeping a
@@ -72,8 +89,12 @@ zero-refcount orphan while keeping both a live-refcount blob and an explicitly-`
 zero-refcount blob (positive control on both), refcount surviving repeated dedup'd puts and only
 becoming collectible at zero, configurable fan-out (1/2/3) round-tripping bytes and landing at the
 expected nested path, `Store.init` still opening a plain (no-`Options`) store at the default
-fan-out, and a single writer doing repeated put/delete/gc/reopen cycles never deadlocking on the
-ingest flock.
+fan-out, a single writer doing repeated put/delete/gc/reopen cycles never deadlocking on the
+ingest flock, `Options.refcount = false` producing exactly one CAS file with no `.rc` sidecar and a
+still-readable blob, the no-`Options` default still writing a sidecar (regression guard for the
+consumers that pin the historical layout), `gc`'s CAS sweep being a truthful (zero-stats) no-op
+under `refcount = false` while `casDelete` refuses with `error.RefcountDisabled`, and lazy layer
+creation leaving `cas/`/`named/`/`tmp/` absent from a store that only ever wrote to `raw/`.
 
 ## Backlog / deferred
 None outstanding from the original three-item backlog (garbage collection, reference counting,

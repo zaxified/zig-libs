@@ -24,10 +24,14 @@ licences are named because `/NOTICE` §0 requires the record to name them.
 
 ## Layout
 
+Each subdirectory below is created **lazily**, on that layer's first write — a store
+that never uses a layer (e.g. never calls `putNamed`) never creates its directory.
+
 ```
 <base>/cas/<hh...>/<hex>  content-addressed blobs (dedup); hh... = Options.fanout
                           levels of hex[0..2] (default 1 level, i.e. hex[0..2])
-<base>/cas/<hh...>/<hex>.rc  refcount sidecar for that blob
+<base>/cas/<hh...>/<hex>.rc  refcount sidecar for that blob (omitted entirely when
+                          the store is opened with Options.refcount = false)
 <base>/raw/<ns>/<key>     name-addressed blobs (caller owns the key)
 <base>/named/<ns>/<key>   small opaque byte records (manifests, indexes)
 <base>/tmp/               scratch space + in-flight ingest temps +
@@ -44,6 +48,10 @@ var store = try blobstore.Store.init(io, "/var/lib/mystore");
 // objects (default fanout=1 matches every store created before this option
 // existed — pick fanout once, at creation time, it is not migrated later):
 var store2 = try blobstore.Store.initOptions(io, "/var/lib/bigstore", .{ .fanout = 2 });
+// or, for a store that never deletes and never calls gc, opt out of the
+// refcount sidecar entirely (rename-only casCommit, matching this module's
+// pre-refcount on-disk layout — see "Reference counting + GC" below):
+var store3 = try blobstore.Store.initOptions(io, "/var/lib/frozenstore", .{ .refcount = false });
 
 // content-addressed: stream in, get the digest back; dedup is automatic
 var reader: std.Io.Reader = ...;         // any *std.Io.Reader
@@ -111,6 +119,18 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   written before this feature, never `delete`d since) is left untouched by
   `gc` — refcount tracking only starts once `put`/`delete` first touches that
   digest.
+- **Opting out of refcounting (`Options.refcount = false`).** For a store
+  that never deletes and never calls `gc`, `casCommit` becomes rename-only:
+  no `.rc` sidecar is ever read or written, so the CAS directory holds
+  exactly one file per blob — the pre-refcount on-disk layout this module
+  shipped before refcounting existed. This is contract-compatible with the
+  no-sidecar rule above, not a special case: `gc` already treats a
+  sidecar-less blob as permanently still-referenced, and `refcount = false`
+  simply keeps every blob in that state forever instead of only until the
+  first `put`/`delete`. `gc`'s CAS sweep is therefore skipped outright on
+  such a store (it truthfully reports zero blobs/bytes reclaimed rather than
+  silently doing nothing), and `casDelete`/`delete` return
+  `error.RefcountDisabled` instead of creating a sidecar on demand.
 - **Configurable fan-out.** `Options.fanout` (`Store.initOptions`, `1..=32`,
   default `1`) sets how many 2-hex-char CAS directory levels precede the
   blob file — `cas/<hh>/<hex>` at the default, `cas/<hh>/<hh>/<hex>` at
