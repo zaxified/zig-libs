@@ -389,7 +389,12 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
         .stdout = toStdIo(spec.stdout),
         .stderr = toStdIo(spec.stderr),
         .create_no_window = true,
-        .pgid = if (spec.new_process_group) 0 else null,
+        // `pgid` is `?posix.pid_t` — an integer on POSIX, but a HANDLE
+        // (`?*anyopaque`) on Windows, where the POSIX "0 = lead your own
+        // group" literal does not typecheck. `Spec.new_process_group` is
+        // documented as a no-op on Windows anyway, so branch at comptime and
+        // keep that promise rather than failing to build there.
+        .pgid = if (builtin.os.tag == .windows) null else if (spec.new_process_group) 0 else null,
     });
 }
 
@@ -1265,28 +1270,37 @@ test "waitTolerant: ECHILD after out-of-band reap yields .unknown (no panic)" {
 }
 
 test "statusToTerm: decodes every wait-status shape from raw bits" {
-    // Every OTHER Term test drives a real subprocess, which only ever
-    // produces `.exited` or `.signal` statuses (nothing here ever sends
-    // SIGSTOP to a child). `.stopped` and the unmatched-status `.unknown`
-    // fallback have no coverage without hand-built status words — build
-    // them directly per the raw wait(2) encoding (low byte 0x7f = stopped;
-    // stop/term signal in the next byte up).
-    const posix = std.posix;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // Unlike every other skip in this file, the runtime `SkipZigTest` above is
+    // not enough on its own: `statusToTerm` decodes a POSIX wait(2) status word
+    // and does not TYPE-CHECK on Windows (`std.posix.W` is `void` there), and a
+    // runtime return still leaves the body to be analysed. The comptime branch
+    // below is what keeps this test out of a Windows compile — do not collapse
+    // it back into the plain skip the other tests use.
+    if (builtin.os.tag != .windows) {
+        // Every OTHER Term test drives a real subprocess, which only ever
+        // produces `.exited` or `.signal` statuses (nothing here ever sends
+        // SIGSTOP to a child). `.stopped` and the unmatched-status `.unknown`
+        // fallback have no coverage without hand-built status words — build
+        // them directly per the raw wait(2) encoding (low byte 0x7f = stopped;
+        // stop/term signal in the next byte up).
+        const posix = std.posix;
 
-    // WIFEXITED: low byte 0, exit code in bits 8-15.
-    try testing.expectEqual(Term{ .exited = 7 }, statusToTerm(7 << 8));
+        // WIFEXITED: low byte 0, exit code in bits 8-15.
+        try testing.expectEqual(Term{ .exited = 7 }, statusToTerm(7 << 8));
 
-    // WIFSIGNALED: low 7 bits carry the signal, top bit is the core-dump flag.
-    try testing.expectEqual(Term{ .signal = posix.SIG.KILL }, statusToTerm(@intFromEnum(posix.SIG.KILL)));
+        // WIFSIGNALED: low 7 bits carry the signal, top bit is the core-dump flag.
+        try testing.expectEqual(Term{ .signal = posix.SIG.KILL }, statusToTerm(@intFromEnum(posix.SIG.KILL)));
 
-    // WIFSTOPPED: low byte exactly 0x7f, stop signal in bits 8-15.
-    const stopped_status: u32 = 0x7f | (@as(u32, @intFromEnum(posix.SIG.STOP)) << 8);
-    try testing.expectEqual(Term{ .stopped = posix.SIG.STOP }, statusToTerm(stopped_status));
+        // WIFSTOPPED: low byte exactly 0x7f, stop signal in bits 8-15.
+        const stopped_status: u32 = 0x7f | (@as(u32, @intFromEnum(posix.SIG.STOP)) << 8);
+        try testing.expectEqual(Term{ .stopped = posix.SIG.STOP }, statusToTerm(stopped_status));
 
-    // None of IFEXITED/IFSIGNALED/IFSTOPPED match this status word: falls
-    // to `.unknown` carrying the raw status, not misparsed as one of the
-    // other three.
-    try testing.expectEqual(Term{ .unknown = 0x101 }, statusToTerm(0x101));
+        // None of IFEXITED/IFSIGNALED/IFSTOPPED match this status word: falls
+        // to `.unknown` carrying the raw status, not misparsed as one of the
+        // other three.
+        try testing.expectEqual(Term{ .unknown = 0x101 }, statusToTerm(0x101));
+    }
 }
 
 test "ensureChildReaping: idempotent and leaves a real disposition alone" {
