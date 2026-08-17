@@ -854,6 +854,104 @@ test "actual: a handler's own Vary CLOBBERS Vary: Origin — pinned, and the saf
     }
 }
 
+/// A handler that denies with a plain-text body — the exact shape the
+/// README/SPEC.md `ResponseWriter.reset()` recipe describes: a route that
+/// answers a plain-text denial an outer middleware wants to rewrite as JSON.
+fn hDenyPlain(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(403);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Forbidden");
+}
+
+/// Outer middleware that reproduces the hazard verbatim: on a 403 it calls
+/// `reset()` to swap the body for JSON, but — unlike the documented recipe —
+/// does NOT call `applyActual` again afterward. `reset()` wipes the whole
+/// header table, `cors`'s Access-Control-* headers included, since they were
+/// set by `cors`'s own `middlewareRun` *before* `next.run` reached this
+/// handler (see SPEC.md "Header timing vs. `ResponseWriter.reset()`").
+fn mwRewriteDenialNoReapply(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    try next.run(ctx);
+    if (ctx.res.status == 403) {
+        try ctx.res.reset();
+        ctx.res.setStatus(403);
+        try ctx.res.setHeader("Content-Type", "application/json");
+        try ctx.res.writeAll("{\"error\":\"forbidden\"}");
+    }
+}
+
+/// The documented fix (README "Header timing vs. `ResponseWriter.reset()`"):
+/// identical to `mwRewriteDenialNoReapply` except it calls
+/// `your_cors.applyActual(ctx.req, ctx.res)` again immediately after
+/// `reset()`, before writing the new body. `state` is the `*const Cors`
+/// (registered via the middleware's own `state`, the same mechanism `cors`
+/// uses for itself).
+fn mwRewriteDenialWithReapply(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const c: *const Cors = @ptrCast(@alignCast(state.?));
+    try next.run(ctx);
+    if (ctx.res.status == 403) {
+        try ctx.res.reset();
+        try c.applyActual(ctx.req, ctx.res); // the documented recipe
+        ctx.res.setStatus(403);
+        try ctx.res.setHeader("Content-Type", "application/json");
+        try ctx.res.writeAll("{\"error\":\"forbidden\"}");
+    }
+}
+
+test "actual: outer middleware's ResponseWriter.reset() wipes CORS headers; the documented applyActual re-call restores them" {
+    // Reproduces the real consumer scenario the README/SPEC.md recipe
+    // describes end to end through a real middleware chain — not a
+    // synthetic call sequence that happens to touch the same two
+    // functions: `cors` (registered global, so it runs before the route
+    // and sets Access-Control-* on the way in) wraps a handler that denies
+    // with a `text/plain` body; an OUTER middleware lets the chain run,
+    // then rewrites that denial as JSON via `reset()`, exactly the
+    // consumer's motivating case named in the doc comment on `applyActual`.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allow_credentials = true,
+    });
+    defer c.deinit();
+    var buf: [2048]u8 = undefined;
+    const req_wire = wire("GET", "/deny", "Origin: https://app.example\r\n");
+
+    { // THE HAZARD, proven real: bare reset() with no re-apply. Without
+        // this half, "the CORS headers survive reset()+applyActual" would
+        // be unfalsifiable — a test that only checked the fixed path could
+        // never distinguish "the recipe works" from "reset() never
+        // actually touched the headers in the first place".
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(.{ .run = mwRewriteDenialNoReapply });
+        try r.use(c.middleware());
+        try r.get("/deny", hDenyPlain);
+
+        const got = runWire(&r, req_wire, &buf);
+        try expectStatus(got, "403");
+        try expectHeaderLine(got, "Content-Type: application/json");
+        // The headers `cors` set before `next.run` are GONE: `reset()`
+        // cleared the header table wholesale and nothing put them back.
+        try expectNoCorsHeaders(got);
+        try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n{\"error\":\"forbidden\"}"));
+    }
+    { // THE DOCUMENTED FIX: reset() followed by a fresh applyActual() call.
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(.{ .state = @constCast(&c), .run = mwRewriteDenialWithReapply });
+        try r.use(c.middleware());
+        try r.get("/deny", hDenyPlain);
+
+        const got = runWire(&r, req_wire, &buf);
+        try expectStatus(got, "403");
+        try expectHeaderLine(got, "Content-Type: application/json");
+        // PRESENT again: the re-applied gate restores exactly what the
+        // first pass set (same origin, same credentials flag).
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectHeaderLine(got, "Vary: Origin");
+        try expectHeaderLine(got, "Access-Control-Allow-Credentials: true");
+        try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n{\"error\":\"forbidden\"}"));
+    }
+}
+
 test "actual: .any emits literal * and no Vary; no credentials header unless enabled" {
     var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .any });
     defer c.deinit();
