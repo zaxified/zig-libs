@@ -36,66 +36,41 @@ image processing, and both mature ecosystems split it out the same way (Rust
 pairs an encoder crate with `rqrr`; Go pairs `skip2` with `gozxing`). Use
 `Matrix.setDark` to fill a grid your own scanner produced, then call `decode`.
 
-## The output is a matrix
+## Rendering
 
-A QR symbol is a grid of dark and light modules. Rendering it involves choices
-that belong to the caller — scale, colours, output format, whether the quiet zone
-is drawn or provided by the surrounding page — so the module hands over the grid
-and stops. `qr.quiet_zone` is the one rendering-adjacent constant it does export,
-because that number comes from the standard (§6.3.8, four modules on every side)
-and every renderer needs it.
-
-Both renderers below are complete. That they are this short is the argument for
-not shipping them.
-
-**SVG**
+The symbol itself is a grid; two renderers cover the two places one actually
+leaves a program.
 
 ```zig
-fn writeSvg(m: *const qr.Matrix, w: *std.Io.Writer, scale: u32) !void {
-    const q = qr.quiet_zone;
-    const side = (m.size + 2 * q) * scale;
-    try w.print(
-        \\<svg xmlns="http://www.w3.org/2000/svg" width="{d}" height="{d}" shape-rendering="crispEdges">
-        \\<rect width="100%" height="100%" fill="#fff"/>
-        \\
-    , .{ side, side });
-    for (0..m.size) |y| {
-        for (0..m.size) |x| {
-            if (!m.isDark(@intCast(x), @intCast(y))) continue;
-            try w.print("<rect x=\"{d}\" y=\"{d}\" width=\"{d}\" height=\"{d}\" fill=\"#000\"/>\n", .{
-                (x + q) * scale, (y + q) * scale, scale, scale,
-            });
-        }
-    }
-    try w.writeAll("</svg>\n");
-}
+try qr.writeSvg(response_writer, &m, .{ .scale = 8 });
+try qr.writeTerminal(stdout, &m, .{});
 ```
 
-**Terminal** — two rows per line via half-block characters, so the symbol comes
-out square in a normal font and stays scannable off the screen.
+Both take a `*std.Io.Writer`, so a program with no allocator can point them at a
+`std.Io.Writer.fixed` buffer and one with an allocator at
+`std.Io.Writer.Allocating`. Neither can affect what a symbol says — they live in
+`render.zig`, nothing in the codec calls them, and the codec has no pixel format
+anywhere in it.
 
-```zig
-fn writeTerminal(m: *const qr.Matrix, w: *std.Io.Writer) !void {
-    const q = qr.quiet_zone;
-    const n = m.size + 2 * q;
-    var y: u16 = 0;
-    while (y < n) : (y += 2) {
-        for (0..n) |x| {
-            const top = inSymbol(m, @intCast(x), y, q);
-            const bot = inSymbol(m, @intCast(x), y + 1, q);
-            // Inverted: a dark module must print as a light cell on a dark
-            // terminal, or scanners read the negative and refuse it.
-            try w.writeAll(if (top and bot) " " else if (top) "▄" else if (bot) "▀" else "█");
-        }
-        try w.writeAll("\n");
-    }
-}
+**SVG.** Dark modules come out as a single `<path>` of horizontal runs under a
+`viewBox` in module units, so `scale` changes the rendered size without changing
+any geometry. `SvgOptions` covers the quiet zone, both colours and a `<title>`
+for screen readers; every one of those strings is XML-escaped on the way out, so
+a title taken from a request body cannot close the element and continue as
+markup. `light = null` drops the background rectangle — worth doing only when
+the surface behind is known to be light, because a QR code on a dark page does
+not scan.
 
-fn inSymbol(m: *const qr.Matrix, x: u16, y: u16, q: u8) bool {
-    if (x < q or y < q or x >= m.size + q or y >= m.size + q) return false;
-    return m.isDark(x - q, y - q);
-}
-```
+**Terminal.** Two module rows per line via half-block characters, so the symbol
+is square in a normal font and scannable off the screen. `dark_background` is
+not cosmetic: glyphs are drawn in the foreground colour, so on a dark terminal
+the *light* module is the one that gets a glyph. Set it wrong and what is on
+screen is a photographic negative, which scanners refuse.
+
+Anything else — PNG, a framebuffer, a print pipeline — is a few lines over
+`m.isDark(x, y)` plus `qr.quiet_zone`, which is exported because the number is
+the standard's (§6.3.8, four modules on every side) and no renderer should pick
+its own.
 
 ## Choosing a level and a mode
 

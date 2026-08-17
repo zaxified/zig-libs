@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-17** — Rendering: `writeSvg` and `writeTerminal`, in a `render.zig`
+  the codec does not call. They were previously copy-paste snippets in
+  `README.md`, on the argument that being short is a reason not to ship them;
+  what changed is consumption — five candidate consumers (a web API, two CLIs, a
+  GUI, an agent) would each have pasted them, which is five copies of the two
+  details that are easy to get wrong: a dark module has to print as a *light*
+  cell on a dark terminal or the symbol on screen is a negative that no scanner
+  accepts, and caller-supplied strings in the SVG have to be XML-escaped or a
+  title from a request body is markup injection. The SVG is now one `<path>` of
+  horizontal runs under a `viewBox` in module units instead of one `<rect>` per
+  module. Both renderers are verified by parsing their output back into a grid
+  and comparing module for module against the source matrix — rendering and then
+  *decoding* would be the weaker test, because error correction hides sampling
+  mistakes up to its capability and a transposed rendering still reads correctly.
 - **2026-08-17** — Decoding: `decode` takes a matrix and returns the message,
   including Reed-Solomon error *correction* (syndromes → Berlekamp-Massey →
   Chien → Forney), which is the half an encoder never needs. Reaches parity with
@@ -23,8 +37,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-08-17** — New module: QR Code symbol encoder (ISO/IEC 18004 model 2),
   versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes. Clean-room
   from the standard; no third-party QR implementation was read. Output is the
-  module matrix rather than an image — rendering is the caller's choice and
-  `README.md` carries complete SVG and terminal renderers to make that cheap.
+  module matrix rather than an image.
   Verified against two independent oracles that share no author with this
   module: an encoder, compared byte-for-byte over all 40 versions x 4 levels
   (320 matrices) plus 672 more across masks and inputs, and a decoder, which

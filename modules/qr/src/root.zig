@@ -4,13 +4,13 @@
 //! Decoding includes Reed-Solomon error correction, which is the half an
 //! encoder never needs and the reason this is not simply `encode` run backwards.
 //!
-//! **Matrices in and out, not pictures.** A QR symbol *is* a grid of
-//! dark and light modules; turning that into SVG, PNG or terminal output is a
-//! presentation choice with its own opinions — scale, quiet-zone width, colours,
-//! viewBox — none of which belong to the encoding. `role = .codec` in the meta
-//! block above is meant literally. `README.md` carries copy-paste renderers for
-//! SVG and for a terminal, and they are short precisely because the matrix is
-//! the right handoff point.
+//! **Matrices in and out, not pictures.** A QR symbol *is* a grid of dark and
+//! light modules, and that grid is what `encode` produces and `decode` consumes;
+//! the codec has no pixel format anywhere in it. `writeSvg` and `writeTerminal`
+//! sit on top in `render.zig` as a convenience for the two places a symbol
+//! actually leaves a program — an HTTP response and a terminal — and they are
+//! separable by construction: nothing in the codec calls them, and neither can
+//! change what a symbol says.
 //!
 //! **Provenance.** Clean-room from ISO/IEC 18004. No third-party QR
 //! implementation was read while writing this. Two independent implementations
@@ -96,6 +96,17 @@ pub const max_size: u16 = 177;
 /// (ISO/IEC 18004 §6.3.8). Renderers need this and should not each pick a
 /// number; it is four, and it is four for every version.
 pub const quiet_zone: u8 = 4;
+
+// ── rendering (render.zig) ──────────────────────────────────────────────────
+
+const render = @import("render.zig");
+
+/// Write a symbol as a standalone SVG document.
+pub const writeSvg = render.writeSvg;
+pub const SvgOptions = render.SvgOptions;
+/// Write a symbol as UTF-8 half-block text, two module rows per line.
+pub const writeTerminal = render.writeTerminal;
+pub const TerminalOptions = render.TerminalOptions;
 
 /// A finished symbol. `size` is the side length; module (x, y) is dark when
 /// `isDark(x, y)` — x across, y down, origin top-left, which is the order the
@@ -1193,6 +1204,12 @@ fn parseSegments(data: []const u8, version: u6, out: []u8) DecodeError![]u8 {
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
+
+// A bare re-export does NOT pull a submodule's tests into the test binary
+// (CONVENTIONS.md §6 step 3); every submodule has to be named here.
+test {
+    _ = render;
+}
 
 test "GF(2^8) is the field the standard names" {
     const t = std.testing;

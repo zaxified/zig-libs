@@ -445,7 +445,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | [`protobuf`](modules/protobuf/README.md) | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | — |
 | [`qrscan`](modules/qrscan/README.md) | Locate a QR symbol in a grayscale image (luma + stride, camera or canvas) and sample it into a `qr.Matrix`; block-adaptive binarisation, allocation-free. | any | qr |
-| [`qr`](modules/qr/README.md) | QR Code encoder (ISO/IEC 18004 model 2) — versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes; outputs the module matrix, not an image. | any | — |
+| [`qr`](modules/qr/README.md) | QR Code encoder and decoder (ISO/IEC 18004 model 2) — versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes, Reed-Solomon error correction; SVG and terminal renderers, allocation-free. | any | — |
 | [`encoding`](modules/encoding/README.md) | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15). | any | — |
 | [`datefmt`](modules/datefmt/README.md) | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |
 | [`tz`](modules/tz/README.md) | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (600 zones + POSIX-TZ footer). | any | datefmt |

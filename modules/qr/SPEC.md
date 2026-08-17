@@ -43,6 +43,12 @@ returns `Uncorrectable`. Berlekamp-Massey can converge on a locator that
 capability; without the re-check that comes back as a confident wrong message,
 which is the single worst outcome this module could produce.
 
+**Rendering is bolted on, not built in.** `writeSvg` and `writeTerminal` live in
+`render.zig`; the codec does not call them and has no pixel format in it. They
+exist because five candidate consumers would otherwise each have pasted the same
+two easy-to-miss details — the terminal inversion, and XML-escaping caller
+strings in the SVG — not because the codec grew an opinion about pictures.
+
 **Masking is scored with the format information present.** Three of the four
 penalty rules can see those 31 modules, so evaluating a bare data region and
 writing the format bits afterwards scores a symbol that never exists. `pickMask`
@@ -63,6 +69,12 @@ are wrong output rather than compromise. Untrusted input is bounded by
 against 1–40, and a length that does not fit is refused rather than truncated,
 which matters because a truncated QR code still scans and reads as a shorter
 message.
+
+**The SVG renderer emits caller strings into a document.** The two colours and
+the `<title>` are XML-escaped, because the expected shape of this module in a web
+service is "text arrives in a request, comes back as a code" and the title is
+where that text naturally lands. Unescaped, a title is markup injection into a
+document the browser will render.
 
 **The decoder is the attacker-facing half.** A matrix handed to `decode` came
 from an image someone else chose, so its size, format bits and every codeword are
@@ -97,6 +109,14 @@ boundary — eight corrupted codewords in a version 1-H block succeed, nine are
 refused — by damaging one module per codeword so the count is exact rather than
 estimated. And the foreign encoder's matrices are fed to **our** decoder: 120
 symbols over 6 inputs x 4 levels x 5 versions, all read back exactly.
+
+**The renderers are checked against the grid, not against a decoder.** Each one's
+output is parsed back into a matrix and compared module for module with the
+source. Rendering and then decoding the picture is the weaker test: error
+correction absorbs sampling mistakes up to its capability, so a transposed or
+half-module-offset rendering still reads back as the right string. The SVG parser
+in the test also checks the shape of each run rather than skipping to the next
+`M`, so a run drawn in the wrong direction is a failure and not a shrug.
 
 The oracle comparison found one real defect — the version 32 alignment centres
 above — after the module's own tests were green, which is the reason to have it.
