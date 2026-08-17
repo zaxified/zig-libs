@@ -147,6 +147,14 @@ pub const Digest = struct {
 /// (rename into place) or `discardTemp` (remove) it.
 pub const Temp = struct { file: std.Io.File, tmp: []const u8 };
 
+/// An open scratch file plus its path — what `scratchCreate` returns. Unlike
+/// `Temp`, a `Scratch` is never staged for `commit`/`casCommit`: it is not a
+/// draft of something that gets renamed into another layer, it IS the thing —
+/// the caller writes into `file` and then reads back (or streams out) `path`
+/// directly. The caller owns it for as long as it's useful and removes it with
+/// `discardTemp` (which only ever unlinks a path, so it works for either type).
+pub const Scratch = struct { file: std.Io.File, path: []const u8 };
+
 /// A raw-layer directory listing entry.
 pub const Entry = struct { key: []const u8, bytes: u64 };
 
@@ -578,13 +586,13 @@ pub const Store = struct {
 
     // ── scratch space (reassemble large artifacts, then stream them out) ───────
 
-    /// Create a uniquely-named scratch file under `<base>/tmp/`. Returns the open
-    /// file + its path (clean up with `discardTemp`).
-    pub fn scratchCreate(self: Store, uniq: []const u8, path_buf: []u8) !Temp {
+    /// Create a uniquely-named scratch file under `<base>/tmp/`. Returns a
+    /// `Scratch` (open file + its path); clean up with `discardTemp` when done.
+    pub fn scratchCreate(self: Store, uniq: []const u8, path_buf: []u8) !Scratch {
         try self.ensureTmpTopDir();
         const path = try std.fmt.bufPrint(path_buf, "{s}/tmp/{s}", .{ self.base, uniq });
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
-        return .{ .file = file, .tmp = path };
+        return .{ .file = file, .path = path };
     }
 
     // ── cross-process ingest lock ───────────────────────────────────────────────
@@ -1397,4 +1405,32 @@ test "lazy layer creation: a store that never touches a layer never creates its 
     // and the raw blob itself is genuinely there and readable.
     var f = (try store.openBlob("dev1", "backup.bin")).?;
     f.close(io);
+}
+
+test "scratchCreate: returns a Scratch, not a Temp — write, read back via .path, discard" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const io = std.testing.io;
+
+    var pbuf: [768]u8 = undefined;
+    const s: Scratch = try store.scratchCreate("reassembly-1", &pbuf);
+
+    // write into `.file`, then read the same bytes back through `.path`
+    // directly — a scratch file is used in place, never renamed elsewhere.
+    {
+        var wbuf: [64]u8 = undefined;
+        var fw = s.file.writer(io, &wbuf);
+        try fw.interface.writeAll("reassembled artifact");
+        try fw.interface.flush();
+        s.file.close(io);
+    }
+    var rbuf: [64]u8 = undefined;
+    const got = try std.Io.Dir.cwd().readFile(io, s.path, &rbuf);
+    try t.expectEqualStrings("reassembled artifact", got);
+
+    // `discardTemp` cleans up a `Scratch` too — it only ever unlinks a path.
+    store.discardTemp(s.path);
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, s.path, .{}));
 }

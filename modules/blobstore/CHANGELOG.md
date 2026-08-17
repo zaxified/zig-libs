@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — **BREAKING:** `scratchCreate` now returns `Scratch` (fields `file`,
+  `path`) instead of `Temp` (fields `file`, `tmp`). A scratch file is never staged for
+  `commit`/`casCommit` — it is read back or streamed out in place, not renamed elsewhere
+  — and naming its return type `Temp` with a `.tmp` field told the reader the opposite.
+  `Temp` itself is unchanged and keeps meaning what it always meant for `createTemp` /
+  `casCreateTemp`, both of which genuinely do rename their result into place. Migration:
+  replace `.tmp` with `.path` on `scratchCreate`'s return value (`store.discardTemp(s.tmp)`
+  → `store.discardTemp(s.path)`); no other call site changes.
 - **2026-08-18** — **BEHAVIOURAL, not breaking:** `init`/`initOptions` no longer eagerly
   create the `cas/`/`raw/`/`named/`/`tmp/` subdirectories; each is now created lazily on
   that layer's first write, so a store that never uses a layer never creates its
