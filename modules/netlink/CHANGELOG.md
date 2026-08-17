@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — `Socket.neighborFlush(NeighborFlushFilter)`: the dump-then-delete loop
+  behind `ip neigh flush`, which iproute2 has no single message for. Default state mask
+  `NEIGHBOR_FLUSH_DEFAULT_STATE` (pinned by a unit test) reproduces iproute2's
+  `filter.state = ~(NUD_PERMANENT|NUD_NOARP)` baseline (`ip/ipneigh.c`
+  `do_show_or_flush()`), so `NUD.PERMANENT`/`NUD.NOARP` entries are exempt by default —
+  `NeighborFlushFilter.state_mask` overrides this on purpose (`ip neigh flush`'s `nud`
+  selector does the same). An entry vanishing between the dump and the delete
+  (`error.NotFound`) is counted in `FlushResult.raced`, not raised; any other delete
+  failure aborts and propagates, matching every other write op in this module. See
+  SPEC.md "Neighbour flush" for the two points where this deliberately does not
+  replicate iproute2 (both in the safer direction).
 - **2026-08-11** — Security audit: three findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Modeled on `libmnl` /
   `libnl` (framing + `mnl_nlmsg_ok`/`mnl_attr_ok`) (design reference, not a test

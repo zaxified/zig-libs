@@ -64,6 +64,13 @@ try nl.neighborAdd(.{ .ifindex = ifindex, .dst = &.{ 10, 11, 12, 55 },
                       .lladdr = &.{ 0xde, 0xad, 0xbe, 0xef, 0, 1 } }, .{});
 // …and the RTM_DEL* mirrors: addressDel / routeDel / neighborDel / linkDel.
 
+// Bulk neighbour delete — the loop behind `ip neigh flush`, which iproute2
+// has no single message for. Default state mask exempts PERMANENT/NOARP
+// entries (static ARP), matching `ip neigh flush`'s own default; pass
+// `state_mask` to reach them on purpose. See SPEC.md "Neighbour flush".
+const flushed = try nl.neighborFlush(.{ .ifindex = ifindex, .family = netlink.AF.INET });
+std.log.info("flushed {d} neighbours ({d} already gone)", .{ flushed.deleted, flushed.raced });
+
 nl.routeAdd(bad_spec, .{}) catch |err| switch (err) {
     error.Exists, error.NoSuchDevice, error.NetworkUnreachable => {
         std.log.err("kernel said: {s}", .{nl.lastErrorMessage()}); // extended ACK
@@ -198,6 +205,14 @@ Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
   *only* `IFF_UP` in the mask, attribute-only changes (MTU/name/MAC) send
   `ifi_change = 0`, and `flags`/`flags_mask` is the explicit escape hatch. An
   empty change is rejected (`error.NothingToChange`) rather than sent.
+- **`neighborFlush` reproduces `ip neigh flush`'s default state exemption,
+  not a blank slate.** iproute2 has no flush message — it dumps, then deletes
+  one entry at a time, skipping any entry whose state is entirely
+  `NUD.PERMANENT`/`NUD.NOARP` unless told otherwise
+  (`NEIGHBOR_FLUSH_DEFAULT_STATE`, read from iproute2's own source — see
+  SPEC.md). This module's `neighborFlush` does the same loop with the same
+  default; an entry that vanishes mid-flush (`error.NotFound`) is counted in
+  `FlushResult.raced`, not treated as a failure.
 - **AF_BRIDGE has three different message shapes**, and getting them wrong is
   the usual source of `EINVAL`. FDB entries are `RTM_*NEIGH` with
   `ndm_family = AF_BRIDGE` (`NDA_LLADDR`/`NDA_VLAN`/`NDA_MASTER`, and

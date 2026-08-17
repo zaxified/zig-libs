@@ -159,6 +159,85 @@ yields an empty message, never an over-read. Requests are validated *before* any
 The write+ACK engine is public (`Socket.nextSeq` + `Socket.requestAck`) so sibling modules can send
 their own hand-built rtnetlink messages through the same socket discipline.
 
+## Neighbour flush
+
+`Socket.neighborFlush(NeighborFlushFilter) FlushError!FlushResult` is the dump-then-delete loop
+behind `ip neigh flush`. iproute2 has **no flush message** — `RTM_DELNEIGH` deletes one entry —
+so every consumer that wants a bulk flush has to dump `RTM_GETNEIGH` and issue one delete per
+matching entry itself, and getting the default state exemption wrong means silently deleting
+static ARP entries. This function encapsulates that loop plus iproute2's default exemption.
+
+**Where the state mask came from.** Not derived from the NUD_* semantics in the kernel headers —
+read directly from iproute2's own source, `ip/ipneigh.c` (`iproute2/iproute2`, `main` branch,
+fetched 2026-08-18): `do_show_or_flush()` sets, for a flush with no `nud` argument,
+
+```c
+filter.state = ~(NUD_PERMANENT|NUD_NOARP);
+```
+
+and `print_neigh()`'s flush branch keeps an entry only when `filter.state & r->ndm_state` is
+nonzero (plus two exceptions noted below). Ported verbatim as `NEIGHBOR_FLUSH_DEFAULT_STATE: u16 =
+~(NUD.PERMANENT | NUD.NOARP)` (`0xFF3F`) and a plain bitwise-AND eligibility test
+(`neighborFlushEligible`): an entry is eligible when ANY of its NUD.* bits intersect the mask, so
+it is exempt only when its *entire* state is built from PERMANENT and/or NOARP bits — a static ARP
+entry (`NUD.PERMANENT`) or a static/no-ARP entry (`NUD.NOARP`, or the `PERMANENT|NOARP` combination
+`bridge fdb add … master` uses, see "Bridges" below) is never touched by default. An entry that
+also carries a non-exempt bit — e.g. `bridge fdb add … master static` = `REACHABLE|NOARP` — is
+still eligible, because REACHABLE alone survives the mask; NOARP does not blanket-protect an entry
+that also reports a real reachability state. `NEIGHBOR_FLUSH_DEFAULT_STATE` is pinned by a unit
+test (`root.zig`, "NEIGHBOR_FLUSH_DEFAULT_STATE: pins the iproute2-parity mask") asserting the
+concrete `0xFF3F` bit pattern — the executable form of this parity claim, and it fails if anyone
+edits the mask.
+
+**Two things this deliberately does NOT reproduce from iproute2 — both in the safer direction:**
+
+1. **Flags bypass the state exemption in iproute2; not here.** `print_neigh()`'s flush filter also
+   matches (i.e. flushes) any entry flagged `NTF_PROXY` or `NTF_EXT_LEARNED`, *regardless* of its
+   NUD state — a permanent proxy-ARP or externally-learned entry is flushed by iproute2's default
+   pass. This module has no such bypass: it tests state only. The divergence only makes the
+   function more conservative (it spares a few entries iproute2's default would delete; it never
+   deletes one iproute2's default would spare).
+2. **A bare `NUD.NONE` (state == 0) entry is flushed by iproute2's default pass; not here.**
+   iproute2's C computes `filter.state` as a plain `~` on an `int`, which leaves a high bit
+   (`0x100`) set as a side effect; `print_neigh()` special-cases `ndm_state == 0` against that bit
+   to decide whether a stateless entry counts as matched. That bit is otherwise only set
+   deliberately when the CLI's `nud all`/`nud none` parsing wants it — it is a CLI-parser artifact,
+   not a considered NUD_* semantic. This module has no such special case: `state & mask` is `0`
+   for `state == 0` under *any* mask, so a `NUD.NONE` entry is never eligible by default. Again,
+   strictly more conservative.
+
+**Filter surface.** `NeighborFlushFilter` selects on exactly what `ip neigh flush` accepts and this
+module already exposes elsewhere — interface (`ifindex`, client-side, matching `Filter`), address
+family (`family`, kernel-side + client re-check, matching `Filter`) — plus `state_mask` for the
+`nud <state>` selector. `ip neigh flush`'s other selectors (`master`/`vrf`/`nomaster`, `unused`,
+`protocol`, `to PREFIX`, `proxy`) are not modeled; a caller needing them can still reach for
+`neighbors()` + `neighborDel()` directly, which is exactly the loop this function wraps. The
+exemption is a *default*, not a refusal: passing `state_mask = NUD.PERMANENT` (or
+`~@as(u16, 0)` for "every state") reaches entries the default spares on purpose, mirroring how
+`ip neigh flush nud permanent` can name a normally-exempt state explicitly.
+
+**Return value and the dump-then-delete race.** `FlushResult` carries `deleted` (kernel-confirmed
+deletions) and `raced` — entries the filter matched but that had already vanished by the time the
+delete reached the kernel (`error.NotFound`, ENOENT/ESRCH). That race is normal: the neighbour
+table is live, and another actor (or the kernel's own cache eviction) can remove an entry between
+the dump and the delete. `neighborFlush` catches exactly `error.NotFound` and counts it in `raced`
+rather than aborting the loop. Any other delete failure — `error.AccessDenied` if `CAP_NET_ADMIN`
+is lost mid-flush, `error.Busy`, `error.Unexpected` — is raised immediately and aborts the
+remaining loop, matching the "no silent write failure" discipline of every other write op here;
+`FlushResult` on that path is discarded along with the error, same as any other `try`-propagated
+failure in this module. A degenerate dumped entry with no `NDA_DST` (never seen from a real kernel
+for `RTM_GETNEIGH`, but not assumed impossible) is skipped rather than let a delete-build error
+abort the whole flush over one entry that was never a real key.
+
+**Verification.** `neighborFlushEligible` is exercised directly against every named `NUD.*` state
+(unit test "neighborFlushEligible: exempts only PERMANENT/NOARP under the default mask"), including
+the REACHABLE|NOARP non-exemption case and both documented NUD.NONE/flags divergences. The netns
+live round-trip (see "Verification" below) adds a second, `NUD.STALE` neighbour beside the
+existing `NUD.PERMANENT` one, calls `neighborFlush` scoped to the test interface, and asserts the
+PERMANENT entry survives while the STALE one is gone and `raced == 0` — the one assertion that
+actually exercises the kernel's own NUD state semantics rather than this module's arithmetic on
+them.
+
 ## Bridges (AF_BRIDGE) — `src/bridge.zig`
 Bridge support is a pure builder/parser layer on the existing engine: nothing about sending, ACK
 handling, extended ACKs or dump assembly is duplicated. Three message shapes, each with its own
@@ -307,7 +386,9 @@ programmatic `unshare -rn`, no privilege needed on a stock kernel; falls back to
 unshare when already root), creates a `dummy` device (falling back to `lo` if the driver is
 missing), brings it up, sets the MTU, adds an address, a route and a neighbour, reads each one back
 through this module's *own* dump path, checks EXCL/ENODEV/EOPNOTSUPP/EADDRNOTAVAIL error mapping,
-then deletes everything and verifies the removals. A **second live round-trip** covers the bridge
+adds a second `NUD.STALE` neighbour and runs `neighborFlush` scoped to the test interface —
+asserting the `NUD.PERMANENT` entry survives, the `NUD.STALE` one is gone, and nothing raced — then
+deletes everything and verifies the removals. A **second live round-trip** covers the bridge
 surface in its own namespace: create a VLAN-filtering bridge and a veth pair, bring both ends up
 (a carrier-down port cannot be moved to `FORWARDING`), enslave and verify `IFLA_MASTER` through
 `brportInfo`, set state/learning/flood/isolated and read every one back from `IFLA_PROTINFO`, add a

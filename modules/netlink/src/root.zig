@@ -248,6 +248,22 @@ pub const NUD = struct {
     pub const PERMANENT: u16 = 0x80;
 };
 
+/// Default eligible-state mask for `Socket.neighborFlush` — established from
+/// iproute2's own source, not guessed: `ip/ipneigh.c` `do_show_or_flush()`
+/// sets `filter.state = ~(NUD_PERMANENT|NUD_NOARP);` as the baseline (no
+/// `nud` argument) before the flush dump-and-delete loop runs. Ported
+/// verbatim as a bitmask: every NUD.* state is eligible EXCEPT an entry whose
+/// ENTIRE state is made up of PERMANENT and/or NOARP bits — a static ARP
+/// entry (PERMANENT) or a static/no-ARP entry (NOARP, or the PERMANENT|NOARP
+/// combination `bridge fdb add … master` uses) is therefore never touched by
+/// the default flush. This is the mask that stops a naive bulk flush from
+/// silently deleting static ARP entries — see SPEC.md "Neighbour flush" for
+/// the full provenance and the two points where this module deliberately
+/// does NOT replicate iproute2's CLI-only behaviour (both in the safer
+/// direction: this module deletes a strict subset of what iproute2's default
+/// pass would).
+pub const NEIGHBOR_FLUSH_DEFAULT_STATE: u16 = ~(NUD.PERMANENT | NUD.NOARP);
+
 /// Routing table ids for `Route.table` (linux/rtnetlink.h rt_class_t).
 pub const RT_TABLE = struct {
     pub const UNSPEC: u32 = 0;
@@ -652,6 +668,19 @@ fn matchNeighbor(n: Neighbor, f: Filter) bool {
     return true;
 }
 
+/// `Socket.neighborFlush`'s per-entry verdict: plain bitwise-AND against
+/// `mask`, matching iproute2's `filter.state & r->ndm_state` test in
+/// `ip/ipneigh.c print_neigh()`. An entry is eligible when ANY of its NUD.*
+/// bits intersect `mask` — so an entry is exempt only when its state is
+/// entirely made up of bits `mask` excludes (PERMANENT/NOARP, under the
+/// default mask). A bare NUD.NONE (state == 0) entry is never eligible under
+/// this test regardless of `mask` — see `NEIGHBOR_FLUSH_DEFAULT_STATE`'s doc
+/// comment for why that is a deliberate, safe divergence from iproute2's
+/// default CLI pass rather than an oversight.
+fn neighborFlushEligible(state: u16, mask: u16) bool {
+    return state & mask != 0;
+}
+
 // ── write requests: specs ───────────────────────────────────────────────────
 // Input structs for the RTM_NEW*/RTM_DEL* builders. Addresses are raw byte
 // slices (4 = IPv4, 16 = IPv6) for the same reason the result types are: no
@@ -807,6 +836,38 @@ pub const NeighborSpec = struct {
     /// AF.INET/AF.INET6; derived from `dst.len` when null.
     family: ?u8 = null,
 };
+
+/// Scoping + state selector for `Socket.neighborFlush`. `family`/`ifindex`
+/// have the same client/kernel-side split as `Filter`. `state_mask` is what
+/// `ip neigh flush`'s `nud <state>` selector overrides — the default is
+/// `NEIGHBOR_FLUSH_DEFAULT_STATE` (iproute2 parity: PERMANENT/NOARP
+/// exempted), but nothing forces that: pass `NUD.PERMANENT` (or any other
+/// explicit combination, including `~@as(u16, 0)` for "every state") to
+/// reach entries the default deliberately spares. The exemption is a
+/// *default*, not a refusal.
+pub const NeighborFlushFilter = struct {
+    family: ?u8 = null,
+    ifindex: ?u32 = null,
+    state_mask: u16 = NEIGHBOR_FLUSH_DEFAULT_STATE,
+};
+
+/// Outcome of `Socket.neighborFlush`.
+pub const FlushResult = struct {
+    /// Entries the kernel confirmed deleted.
+    deleted: usize = 0,
+    /// Entries that matched the filter but were already gone by the time the
+    /// delete reached the kernel (`error.NotFound` — ENOENT/ESRCH). Normal:
+    /// the neighbour table is live and can change between the dump and the
+    /// delete. Counted, not raised, so it never fails the flush.
+    raced: usize = 0,
+};
+
+/// Everything `Socket.neighborFlush` can fail with: the dump
+/// (`Socket.neighbors`) can fail with `DumpError`, and a delete can fail with
+/// `WriteError` for a reason OTHER than the entry having already vanished
+/// (that specific case is `error.NotFound`, folded into `FlushResult.raced`
+/// instead of being raised — see `Socket.neighborFlush`).
+pub const FlushError = DumpError || WriteError;
 
 // ── write requests: builders (pure, offline-testable) ───────────────────────
 
@@ -1575,6 +1636,52 @@ pub const Socket = struct {
         ));
     }
 
+    /// Bulk-delete neighbour entries: dump the table, then `neighborDel`
+    /// every entry `filter` selects. This is what `ip neigh flush` is —
+    /// iproute2 has no flush *message*, only this loop, and getting its
+    /// default state exemption wrong means silently deleting static ARP
+    /// entries (see `NEIGHBOR_FLUSH_DEFAULT_STATE`). `filter.family`/
+    /// `.ifindex` scope the dump exactly like `neighbors()`;
+    /// `filter.state_mask` (default `NEIGHBOR_FLUSH_DEFAULT_STATE`) decides
+    /// which NUD.* states are eligible — pass `NUD.PERMANENT` explicitly to
+    /// reach entries the default spares on purpose.
+    ///
+    /// An entry vanishing between the dump and the delete (another actor
+    /// deleting it, the kernel's own cache eviction) is a normal race, not a
+    /// failure: it surfaces as `error.NotFound` from the delete, which this
+    /// loop catches and counts in `FlushResult.raced` instead of aborting.
+    /// Any other delete failure (e.g. `error.AccessDenied` if CAP_NET_ADMIN
+    /// is lost mid-flush) is a real problem and is raised immediately —
+    /// matching every other write op in this module, none of which fail
+    /// silently.
+    pub fn neighborFlush(self: *Socket, filter: NeighborFlushFilter) FlushError!FlushResult {
+        const entries = try self.neighbors(.{ .family = filter.family, .ifindex = filter.ifindex });
+        defer self.gpa.free(entries);
+
+        var result: FlushResult = .{};
+        for (entries) |n| {
+            if (!neighborFlushEligible(n.state, filter.state_mask)) continue;
+            // A dumped entry with no NDA_DST is degenerate (never seen from a
+            // real kernel for RTM_GETNEIGH, but the codec does not assume
+            // that) — skip it rather than letting a delete-build error abort
+            // the whole flush over one entry that was never a real key.
+            if (n.dst_len == 0) continue;
+            self.neighborDel(.{
+                .ifindex = n.ifindex,
+                .dst = n.dstBytes(),
+                .family = n.family,
+            }) catch |err| switch (err) {
+                error.NotFound => {
+                    result.raced += 1;
+                    continue;
+                },
+                else => return err,
+            };
+            result.deleted += 1;
+        }
+        return result;
+    }
+
     // ── AF_BRIDGE ops (see bridge.zig for the wire encoding) ────────────────
 
     /// Create a bridge device (`RTM_NEWLINK` + `IFLA_INFO_KIND = "bridge"`),
@@ -2327,6 +2434,48 @@ test "filters: family and ifindex predicates" {
     const n: Neighbor = .{ .family = AF.INET, .ifindex = 2, .state = NUD.STALE, .flags = 0, .ntype = 0 };
     try testing.expect(matchNeighbor(n, .{ .ifindex = 2 }));
     try testing.expect(!matchNeighbor(n, .{ .family = AF.INET6 }));
+}
+
+test "NEIGHBOR_FLUSH_DEFAULT_STATE: pins the iproute2-parity mask" {
+    // Established from iproute2 ip/ipneigh.c do_show_or_flush():
+    // `filter.state = ~(NUD_PERMANENT|NUD_NOARP);` is the default flush
+    // filter (no `nud` argument given). This test is the executable form of
+    // that parity claim — it must fail if anyone edits the mask.
+    try testing.expectEqual(@as(u16, 0xFF3F), NEIGHBOR_FLUSH_DEFAULT_STATE);
+    try testing.expectEqual(~@as(u16, NUD.PERMANENT | NUD.NOARP), NEIGHBOR_FLUSH_DEFAULT_STATE);
+}
+
+test "neighborFlushEligible: exempts only PERMANENT/NOARP under the default mask" {
+    const mask = NEIGHBOR_FLUSH_DEFAULT_STATE;
+
+    // Exempt: entries whose entire state is PERMANENT and/or NOARP —
+    // exactly the static-ARP and static-FDB shapes this function exists to
+    // protect (SPEC.md: `bridge fdb add … master` = PERMANENT|NOARP).
+    try testing.expect(!neighborFlushEligible(NUD.PERMANENT, mask));
+    try testing.expect(!neighborFlushEligible(NUD.NOARP, mask));
+    try testing.expect(!neighborFlushEligible(NUD.PERMANENT | NUD.NOARP, mask));
+
+    // Eligible: every other named NUD.* state, including a state that also
+    // carries the NOARP bit alongside a non-exempt one (`bridge fdb add …
+    // master static` = REACHABLE|NOARP — the NOARP bit alone does not save
+    // it because REACHABLE still intersects the mask).
+    try testing.expect(neighborFlushEligible(NUD.INCOMPLETE, mask));
+    try testing.expect(neighborFlushEligible(NUD.REACHABLE, mask));
+    try testing.expect(neighborFlushEligible(NUD.STALE, mask));
+    try testing.expect(neighborFlushEligible(NUD.DELAY, mask));
+    try testing.expect(neighborFlushEligible(NUD.PROBE, mask));
+    try testing.expect(neighborFlushEligible(NUD.FAILED, mask));
+    try testing.expect(neighborFlushEligible(NUD.REACHABLE | NUD.NOARP, mask));
+
+    // NUD.NONE (state == 0) is never eligible under a plain bitwise-AND test,
+    // regardless of mask — the documented, deliberate (and safe) divergence
+    // from iproute2's default CLI pass; see NEIGHBOR_FLUSH_DEFAULT_STATE.
+    try testing.expect(!neighborFlushEligible(NUD.NONE, mask));
+    try testing.expect(!neighborFlushEligible(NUD.NONE, ~@as(u16, 0)));
+
+    // An explicit override CAN target what the default exempts — the
+    // exemption is a default, not a refusal.
+    try testing.expect(neighborFlushEligible(NUD.PERMANENT, NUD.PERMANENT));
 }
 
 test "errorFromCode maps NLMSG_ERROR errnos" {
@@ -3467,6 +3616,42 @@ fn netnsRoundTripOn(nl: *Socket) !void {
                 std.mem.eql(u8, n.lladdrBytes(), &lladdr)) found = true;
         }
         if (!found) return error.TestNeighborNotFound;
+
+        // 5b. neighborFlush: a second, STALE entry must be deleted by the
+        //     default flush filter; the PERMANENT entry added above must
+        //     survive it — the exact behaviour NEIGHBOR_FLUSH_DEFAULT_STATE
+        //     exists to guarantee (see SPEC.md "Neighbour flush").
+        const stale_ip: [4]u8 = .{ 10, 11, 12, 57 };
+        const stale_lladdr: [6]u8 = .{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x02 };
+        var stale_supported = true;
+        netnsStep("neighborAdd(STALE, for flush)");
+        nl.neighborAdd(.{
+            .ifindex = ifindex,
+            .dst = &stale_ip,
+            .lladdr = &stale_lladdr,
+            .state = NUD.STALE,
+        }, .{}) catch |err| switch (err) {
+            error.NotSupported, error.InvalidRequest => stale_supported = false,
+            else => return err,
+        };
+        if (stale_supported) {
+            netnsStep("neighborFlush");
+            const flushed = try nl.neighborFlush(.{ .ifindex = ifindex, .family = AF.INET });
+            if (flushed.deleted == 0) return error.TestFlushDeletedNothing;
+            if (flushed.raced != 0) return error.TestFlushUnexpectedRace;
+
+            const after = try nl.neighbors(.{ .ifindex = ifindex, .family = AF.INET });
+            defer gpa.free(after);
+            var permanent_survived = false;
+            var stale_gone = true;
+            for (after) |n| {
+                if (std.mem.eql(u8, n.dstBytes(), &neigh_ip)) permanent_survived = true;
+                if (std.mem.eql(u8, n.dstBytes(), &stale_ip)) stale_gone = false;
+            }
+            if (!permanent_survived) return error.TestFlushDeletedPermanent;
+            if (!stale_gone) return error.TestFlushLeftStaleEntry;
+        }
+
         try nl.neighborDel(.{ .ifindex = ifindex, .dst = &neigh_ip });
     }
 
