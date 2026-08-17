@@ -23,6 +23,23 @@ the zig-libs authors (MIT).
   list-change notifications and pagination (`nextCursor`) are deliberately not implemented (the
   advertised capabilities say so). Modeled after MCP spec revision 2025-11-25 + JSON-RPC 2.0; the
   JSON-RPC core is the zig-libs authors' original work (MIT).
+- **Advertised capabilities track the registered catalog, per-capability.** `tools` is present
+  unconditionally in every `initialize` result, empty catalog or not — this module's original
+  behavior, unchanged. `resources` and `prompts` are each present **only when their own catalog is
+  non-empty** at the moment `initialize` is answered (`resources` also counts resource *templates*,
+  since `resources/templates/list` is part of what the capability promises); a server that registers
+  neither omits both keys entirely rather than advertising an object nobody can use. This is not a
+  style choice: `ServerCapabilities` in the spec's schema marks every one of these fields optional
+  and documents each with "Present if the server offers \[prompt templates / resources / tools\]",
+  and basic/lifecycle.mdx's Operation phase says both parties **MUST** "only use capabilities that
+  were successfully negotiated" — so advertising `prompts`/`resources` unconditionally told a
+  spec-conformant client it could call `prompts/list`/`resources/list` and get real content, which a
+  tools-only server can never provide. The catalog is read from `self.{resources,resource_templates,
+  prompts}.items.len` at the point `buildInitializeResult` runs, i.e. against whatever is registered
+  by the time a given `initialize` is answered — there is no separate "declared capability" flag to
+  keep in sync, and nothing here assumes registration is finished before the first handshake, only
+  that each `initialize` call is truthful about the catalog as it stands *then*. This is a
+  **BREAKING** wire change for any existing tools-only server: see CHANGELOG.md.
 - **Dispatch + ctx.** Tools dispatch by name; resources resolve by uri (exact static match first,
   then each registered template handler in order); prompts dispatch by name with declared required
   arguments validated by the server (-32602) before the handler runs. Every handler receives the
@@ -119,8 +136,10 @@ that the user who opens it is the user it was minted for) is the application's, 
 
 Offline tests: JSON-RPC parse/encode for every standard error code, malformed JSON/non-object/
 missing-or-bad method → the right error only when an id is present, unknown method dropped when
-id-less; version negotiation + golden `initialize` (capabilities/serverInfo) and `tools/list` JSON;
-`tools/call` param validation, ctx-threading to app state, structuredContent gating, `isError` on
+id-less; version negotiation + golden `initialize` (capabilities/serverInfo) and `tools/list` JSON —
+including the `resources`/`prompts` capability keys each toggling on independently the moment their
+own catalog stops being empty (a resource-template-only server counts too), and all three present
+together once every catalog is non-empty; `tools/call` param validation, ctx-threading to app state, structuredContent gating, `isError` on
 handler failure, and progress notifications interleaving before the result; golden
 `resources/list`/`templates/list`/`prompts/list`, `resources/read` text + base64-blob +
 template-uri resolution + -32002 on an unresolvable uri, `prompts/get` argument substitution +

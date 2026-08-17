@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — **BREAKING:** `initialize` no longer advertises the `resources`/`prompts`
+  capability keys unconditionally. Each is now present only when its own catalog is non-empty at
+  the moment `initialize` is answered (`resources` also counts resource templates); `tools` is
+  unchanged — still present in every result, empty catalog or not. A server that registers only
+  tools now serves an `initialize.capabilities` object with a single `tools` key instead of three.
+  Per the spec's `ServerCapabilities` schema ("Present if the server offers any …") and
+  basic/lifecycle.mdx's Operation-phase MUST ("only use capabilities that were successfully
+  negotiated"), the old behavior was misleading: a tools-only server was telling a
+  spec-conformant client it could call `resources/list`/`prompts/list` for real content. See
+  SPEC.md's "Advertised capabilities track the registered catalog" for the design note.
 - **2026-07-29** — Server→client requests — `sampling/createMessage` and
   `elicitation/create`. Both are gated on the capabilities the client
   declares at `initialize`, which are now *stored*

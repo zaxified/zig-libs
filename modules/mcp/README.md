@@ -40,8 +40,12 @@ MCP spec 2025-11-25.
 - **Prompts:** `prompts/list` and `prompts/get` (argument-validated, rendered
   messages) — register with `addPrompt`; a bad argument answers `-32602`.
 - `initialize` advertises the tools / resources / prompts capabilities it
-  actually serves. (Resource `subscribe` is not implemented —
-  `subscribe:false` is advertised.) It also **records what the client
+  actually serves. `tools` is always present; `resources` and `prompts` are
+  each omitted entirely when their catalog is empty (no resource/template, or
+  no prompt, registered) — per the spec, a capability key is "present if the
+  server offers any", so an empty catalog must not claim one. (Resource
+  `subscribe` is not implemented — `subscribe:false` is advertised whenever
+  `resources` itself is.) It also **records what the client
   advertised** in `server.client_capabilities` — the gate on the two
   server→client requests below.
 - **Sampling / elicitation (server→client requests):**

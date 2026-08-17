@@ -22,7 +22,9 @@
 //! Protocol surface (per the MCP spec revision 2025-11-25):
 //!   * `initialize` — protocol-version negotiation (echo the client's
 //!     requested revision when supported, else answer with our latest) +
-//!     server capabilities (`tools`) + serverInfo + optional instructions.
+//!     server capabilities (`tools` always; `resources`/`prompts` only when
+//!     at least one is registered — the spec's own "present if the server
+//!     offers any" reading) + serverInfo + optional instructions.
 //!   * `notifications/initialized` — accepted, sets `client_initialized`.
 //!   * `tools/list` — built from the registered tool catalog (name,
 //!     description, inputSchema, optional outputSchema).
@@ -2084,18 +2086,29 @@ pub const Server = struct {
         try jw.objectField("listChanged");
         try jw.write(false);
         try jw.endObject();
-        try jw.objectField("resources");
-        try jw.beginObject();
-        try jw.objectField("subscribe");
-        try jw.write(false);
-        try jw.objectField("listChanged");
-        try jw.write(false);
-        try jw.endObject();
-        try jw.objectField("prompts");
-        try jw.beginObject();
-        try jw.objectField("listChanged");
-        try jw.write(false);
-        try jw.endObject();
+        // Spec (basic/lifecycle.mdx capability table + the ServerCapabilities
+        // schema doc comments): `resources`/`prompts` are "present if the
+        // server offers any" -- so a server with an empty catalog must not
+        // advertise the capability at all, or a spec-conformant client (which
+        // "MUST only use capabilities that were successfully negotiated") may
+        // call `resources/list`/`prompts/list` expecting real content. `tools`
+        // is left unconditional on purpose (unchanged behavior); see SPEC.md.
+        if (self.resources.items.len != 0 or self.resource_templates.items.len != 0) {
+            try jw.objectField("resources");
+            try jw.beginObject();
+            try jw.objectField("subscribe");
+            try jw.write(false);
+            try jw.objectField("listChanged");
+            try jw.write(false);
+            try jw.endObject();
+        }
+        if (self.prompts.items.len != 0) {
+            try jw.objectField("prompts");
+            try jw.beginObject();
+            try jw.objectField("listChanged");
+            try jw.write(false);
+            try jw.endObject();
+        }
         try jw.endObject();
         try jw.objectField("serverInfo");
         try jw.beginObject();
@@ -2820,21 +2833,21 @@ test "initialize: version negotiation + capabilities + serverInfo golden" {
     try expectResponse(&s,
         \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
     ,
-        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
+        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
         \\
     );
     // Unsupported revision -> answer with our latest.
     try expectResponse(&s,
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}
     ,
-        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
         \\
     );
     // No params at all -> latest, no crash.
     try expectResponse(&s,
         \\{"jsonrpc":"2.0","id":2,"method":"initialize"}
     ,
-        \\{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
+        \\{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
         \\
     );
 }
@@ -2845,7 +2858,84 @@ test "initialize: instructions omitted when null; title override" {
     try expectResponse(&s,
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
     ,
-        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"bare","title":"Bare Server","version":"0.1.0"}}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"bare","title":"Bare Server","version":"0.1.0"}}}
+        \\
+    );
+}
+
+test "initialize: resources capability advertised only when a resource is registered" {
+    var lib = TestLibrary{};
+    var s = Server.init(testing.allocator, .{ .name = "res-srv", .version = "0.1.0" });
+    defer s.deinit();
+    try s.addResource(.{
+        .uri = "mem://readme",
+        .name = "readme",
+        .handler = &readmeReader,
+        .ctx = &lib,
+    });
+    // No tool, no prompt registered: `tools` stays unconditional (unchanged
+    // behavior), `resources` now appears because the catalog is non-empty,
+    // `prompts` stays absent because that catalog is empty.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false}},"serverInfo":{"name":"res-srv","title":"res-srv","version":"0.1.0"}}}
+        \\
+    );
+}
+
+test "initialize: resources capability advertised when only a resource TEMPLATE is registered" {
+    // A server may offer nothing but a resource template (no static
+    // resource) -- the `resources` capability must still appear, since
+    // `resources/templates/list` is part of what it promises.
+    var s = Server.init(testing.allocator, .{ .name = "tmpl-srv", .version = "0.1.0" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{
+        .uri_template = "mem://file/{name}",
+        .name = "file",
+        .handler = &fileTemplateReader,
+    });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false}},"serverInfo":{"name":"tmpl-srv","title":"tmpl-srv","version":"0.1.0"}}}
+        \\
+    );
+}
+
+test "initialize: prompts capability advertised only when a prompt is registered" {
+    var lib = TestLibrary{};
+    var s = Server.init(testing.allocator, .{ .name = "prompt-srv", .version = "0.1.0" });
+    defer s.deinit();
+    try s.addPrompt(.{
+        .name = "greet",
+        .description = "Render a greeting request.",
+        .arguments = &greet_args,
+        .handler = &greetPromptHandler,
+        .ctx = &lib,
+    });
+    // No tool, no resource registered: `resources` stays absent, `prompts`
+    // now appears because the catalog is non-empty.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"prompt-srv","title":"prompt-srv","version":"0.1.0"}}}
+        \\
+    );
+}
+
+test "initialize: all three capabilities advertised together when all three catalogs are non-empty" {
+    var app = TestApp{};
+    var lib = TestLibrary{};
+    var s = try libraryServer(&lib); // resources + resource templates + prompts
+    defer s.deinit();
+    var tool = echo_tool;
+    tool.ctx = &app;
+    try s.addTool(tool);
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"lib-srv","title":"lib-srv","version":"0.1.0"}}}
         \\
     );
 }
@@ -3093,7 +3183,7 @@ test "integration: full round-trip over an in-memory pipe (serve)" {
     try s.serve(&in, &aw.writer);
 
     const expected =
-        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
+        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"test-srv","title":"test-srv","version":"1.2.3"},"instructions":"use echo"}}
         \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo the 'text' argument back.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"outputSchema":{"type":"object","properties":{"echo":{"type":"string"},"calls":{"type":"integer"}}}}]}}
         \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
         \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"echo\":\"round-trip\",\"calls\":1}"}],"structuredContent":{"echo":"round-trip","calls":1},"isError":false}}
@@ -4839,7 +4929,7 @@ test "integration: ask on one call, act on the next (the two-call shape)" {
     try s.serve(&in, &aw.writer);
 
     const expected =
-        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"t","title":"t","version":"0"}}}
+        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"t","title":"t","version":"0"}}}
         \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"error: not answered yet"}],"isError":true}}
         \\{"jsonrpc":"2.0","id":1,"method":"elicitation/create","params":{"mode":"form","message":"Please provide your GitHub username","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}}
         \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"asked\":true}"}],"structuredContent":{"asked":true},"isError":false}}
