@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-17** — Nothing beyond 1024 pixels existed. `binarize` kept its
+  per-block means in a fixed `[128 x 128]u8` on the stack and clamped its loops
+  to it, so only the first 1024 x 1024 pixels of any image were binarised at
+  all: the rest of the bitmap was never written, and the finder scan then read
+  whatever the caller's scratch buffer already contained. The same symbol read
+  at (100, 100) of a 1200 x 1200 frame and was `NotFound` at (1000, 1000) — and
+  the module's README opened with a 1920 x 1080 example, so the documented use
+  was blind over 47 % of the frame and its bottom 56 rows. The row scanner had
+  the same shape of bug at 512 runs per row.
+  Both are now sized from the image out of the caller's scratch, so
+  `scratchSize` covers the bitmap, the block means (+12.5 %) and two rows of
+  runs, and the stack loses 28 KB. Tests size their buffers with `scratchSize`
+  instead of open-coding a layout that has now changed twice.
+  The test that would have caught it puts a symbol in **each corner** of a
+  frame larger than 1024 in both axes, with the scratch pre-filled `0x00` and
+  `0xFF` in turn: one position cannot find "a region of the frame is not
+  processed", and identical answers from opposite fills is what "no
+  uninitialised memory is read" means from outside.
+
 - **2026-08-17** — Two things that were the same thing. Finders are now located
   with **connected components**: each row's dark runs are labelled as the scan
   goes, and a candidate is required to be a *ring* — the outer band either side

@@ -10,10 +10,22 @@ explicit `stride` serves the first natively and the second after
 camera — that is the detail this design is built around, and there is a test that
 lays a symbol into a padded buffer with junk in the padding.
 
-**Allocation-free by construction.** The one working buffer is the binarised
-bitmap, sized by `scratchSize` and owned by the caller. This has to hold at 30 fps
-on a device with no allocator, and in wasm32 where a static footprint is the
-point.
+**Allocation-free by construction.** The working memory is one buffer, sized by
+`scratchSize` and owned by the caller. This has to hold at 30 fps on a device
+with no allocator, and in wasm32 where a static footprint is the point.
+
+**Every region of it is sized from the image, and that is a correctness
+property.** The bitmap, the per-8x8-block means and the labeller's two rows of
+runs all scale with the picture. They did not: the block means were a fixed
+`[128 x 128]u8` on the stack with the loops clamped to it, so **only the first
+1024 x 1024 pixels of any image were binarised** — the rest of the bitmap was
+never written and was scanned as whatever the caller's buffer already held. The
+same symbol read at (100, 100) of a 1200 x 1200 frame and was `NotFound` at
+(1000, 1000), and this file's own example was 1920 x 1080. A fixed cap on a
+working buffer is a cap on the picture, and it fails silently at the far end of
+the frame, which is the end nobody puts the test symbol in. The run buffer had
+the same shape (512 runs per row, rest of the row dropped) and is gone the same
+way.
 
 **Binarisation is block-adaptive because a global threshold cannot survive a
 real capture.** Every hand-held photograph has a gradient or a shadow across it.

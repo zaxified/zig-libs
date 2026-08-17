@@ -60,8 +60,66 @@ pub const Error = error{
 };
 
 /// Bytes of scratch `scan` needs for an image of this size.
+///
+/// Three regions, all sized from the image rather than fixed: the binarised
+/// bitmap, one byte of block mean per 8x8 block, and two rows of runs for the
+/// component labeller. Everything here used to be a fixed stack array with a
+/// ceiling, and a ceiling on a working buffer is a ceiling on the picture —
+/// beyond 1024 pixels the bitmap was simply never written, so a symbol in the
+/// bottom-right of a 1080p frame did not exist. Deriving the sizes from the
+/// image is what makes that unrepresentable rather than merely fixed.
 pub fn scratchSize(width: u32, height: u32) usize {
-    return (@as(usize, width) * height + 7) / 8;
+    return bitmapBytes(width, height) +
+        blockCount(width) * blockCount(height) +
+        // Slack so the run array can be aligned inside a `[]u8` the caller
+        // declared with no alignment of its own.
+        runBytes(width) + @alignOf(Run) - 1;
+}
+
+fn bitmapBytes(width: u32, height: u32) usize {
+    return (@as(usize, width) * @as(usize, height) + 7) / 8;
+}
+
+fn blockCount(n: u32) usize {
+    return (@as(usize, n) + 7) >> block_shift;
+}
+
+/// Two rows of runs. A row of `w` pixels cannot hold more than `w / 2 + 1`
+/// maximal same-colour runs, so this cannot overflow whatever the picture is.
+fn runBytes(width: u32) usize {
+    return 2 * (@as(usize, width) / 2 + 1) * @sizeOf(Run);
+}
+
+/// The caller's scratch, divided up. One place decides the layout, so the tests
+/// that drive the stages separately cannot drift from what `scan` does.
+const Workspace = struct {
+    bits: Bitmap,
+    means: []u8,
+    runs: []Run,
+
+    fn carve(img: Image, scratch: []u8) Workspace {
+        var off: usize = 0;
+        const bitmap_mem = scratch[off..][0..bitmapBytes(img.width, img.height)];
+        off += bitmap_mem.len;
+        const means = scratch[off..][0 .. blockCount(img.width) * blockCount(img.height)];
+        off += means.len;
+        return .{
+            .bits = .{ .bits = bitmap_mem, .width = img.width, .height = img.height },
+            .means = means,
+            .runs = carveRuns(scratch[off..], (@as(usize, img.width) / 2 + 1) * 2),
+        };
+    }
+};
+
+/// Carve `count` `Run`s out of the front of `buf`, skipping however many bytes
+/// it takes to reach the alignment `Run` needs. The caller's scratch is a plain
+/// `[]u8` and may start anywhere; the padding is proven at runtime rather than
+/// assumed, which is what makes the `@alignCast` sound.
+fn carveRuns(buf: []u8, count: usize) []Run {
+    const addr = @intFromPtr(buf.ptr);
+    const pad = std.mem.alignForward(usize, addr, @alignOf(Run)) - addr;
+    const bytes = buf[pad..][0 .. count * @sizeOf(Run)];
+    return @as([*]Run, @ptrCast(@alignCast(bytes.ptr)))[0..count];
 }
 
 /// Convert packed RGBA (4 bytes per pixel, the shape `getImageData` returns)
@@ -90,8 +148,9 @@ pub fn scan(img: Image, scratch: []u8) Error!Found {
     if (img.luma.len < @as(usize, img.stride) * img.height) return Error.BadImage;
     if (scratch.len < scratchSize(img.width, img.height)) return Error.ScratchTooSmall;
 
-    var bits: Bitmap = .{ .bits = scratch, .width = img.width, .height = img.height };
-    binarize(img, &bits);
+    var ws = Workspace.carve(img, scratch);
+    binarize(img, &ws.bits, ws.means);
+    const bits = &ws.bits;
 
     var finders: [max_candidates]Finder = undefined;
 
@@ -109,10 +168,10 @@ pub fn scan(img: Image, scratch: []u8) Error!Found {
     var best: ?Found = null;
     var best_score: f32 = -1;
     for ([_]bool{ true, false }) |strict| {
-        const found = locateFinders(&bits, &finders, strict);
+        const found = locateFinders(bits, &finders, strict, ws.runs);
         if (found.len < 3) continue;
         const corners = orient(found) orelse continue;
-        const got = sampleBestDimension(&bits, corners) catch continue;
+        const got = sampleBestDimension(bits, corners) catch continue;
         // The timing patterns can tell a grid that is one version out from one
         // that is not; at version 1 they are five modules long and can barely
         // tell anything. So the pass that wins is the one whose grid actually
@@ -173,20 +232,22 @@ const Bitmap = struct {
     }
 };
 
-fn binarize(img: Image, out: *Bitmap) void {
-    const bw = (img.width + 7) >> block_shift;
-    const bh = (img.height + 7) >> block_shift;
-
-    // Per-block mean, plus a global mean as the fallback for flat blocks.
-    var means: [128 * 128]u8 = undefined;
-    const cap_w = @min(bw, 128);
-    const cap_h = @min(bh, 128);
+/// `means` is one byte per 8x8 block, from the caller's scratch. It used to be a
+/// fixed `[128 * 128]u8` on the stack with the loops clamped to it, which meant
+/// only the first 1024x1024 pixels of any image were binarised at all: the rest
+/// of `out` was never written and was then scanned as whatever the caller's
+/// buffer happened to contain. The same symbol read at (100, 100) of a 1200x1200
+/// frame and was NotFound at (1000, 1000), and the module's own README opened
+/// with a 1920x1080 example.
+fn binarize(img: Image, out: *Bitmap, means: []u8) void {
+    const bw = blockCount(img.width);
+    const bh = blockCount(img.height);
 
     var global_sum: u64 = 0;
     var global_n: u64 = 0;
 
-    for (0..cap_h) |by| {
-        for (0..cap_w) |bx| {
+    for (0..bh) |by| {
+        for (0..bw) |bx| {
             const x0: u32 = @intCast(bx << block_shift);
             const y0: u32 = @intCast(by << block_shift);
             const x1 = @min(x0 + 8, img.width);
@@ -210,7 +271,7 @@ fn binarize(img: Image, out: *Bitmap) void {
             // A flat block carries no edge; marking it as such lets the smoothing
             // pass below give it a neighbour's threshold rather than splitting
             // noise into modules.
-            means[by * cap_w + bx] = if (hi - lo >= min_contrast) mean else 0;
+            means[by * bw + bx] = if (hi - lo >= min_contrast) mean else 0;
             if (hi - lo >= min_contrast) {
                 global_sum += mean;
                 global_n += 1;
@@ -219,8 +280,8 @@ fn binarize(img: Image, out: *Bitmap) void {
     }
     const global: u8 = if (global_n > 0) @intCast(global_sum / global_n) else 128;
 
-    for (0..cap_h) |by| {
-        for (0..cap_w) |bx| {
+    for (0..bh) |by| {
+        for (0..bw) |bx| {
             // 5x5 neighbourhood average over the blocks that had contrast.
             var sum: u32 = 0;
             var n: u32 = 0;
@@ -230,8 +291,8 @@ fn binarize(img: Image, out: *Bitmap) void {
                 while (dx <= 2) : (dx += 1) {
                     const nx = @as(i32, @intCast(bx)) + dx;
                     const ny = @as(i32, @intCast(by)) + dy;
-                    if (nx < 0 or ny < 0 or nx >= cap_w or ny >= cap_h) continue;
-                    const v = means[@as(usize, @intCast(ny)) * cap_w + @as(usize, @intCast(nx))];
+                    if (nx < 0 or ny < 0 or nx >= bw or ny >= bh) continue;
+                    const v = means[@as(usize, @intCast(ny)) * bw + @as(usize, @intCast(nx))];
                     if (v == 0) continue;
                     sum += v;
                     n += 1;
@@ -346,7 +407,6 @@ fn confirmVertical(b: *const Bitmap, cx: u32, cy: u32) ?struct { unit: f32, cent
 // in the same pass, with nothing stored per pixel at all.
 
 const max_labels = 4096;
-const max_runs = 512;
 
 const Run = struct {
     x0: u32,
@@ -400,10 +460,10 @@ const Labels = struct {
 };
 
 /// Dark runs of one row, labelled by overlap with the row above.
-fn scanRow(b: *const Bitmap, y: u32, out: *[max_runs]Run) []Run {
+fn scanRow(b: *const Bitmap, y: u32, out: []Run) []Run {
     var n: usize = 0;
     var x: u32 = 0;
-    while (x < b.width and n < max_runs) {
+    while (x < b.width) {
         if (!b.get(x, y)) {
             x += 1;
             continue;
@@ -430,15 +490,18 @@ fn labelRow(labels: *Labels, prev: []const Run, cur: []Run) void {
     }
 }
 
-fn locateFinders(b: *const Bitmap, out: *[max_candidates]Finder, strict: bool) []Finder {
+/// `runs` is two rows' worth, from the caller's scratch: `scanRow` fills one
+/// while the other still holds the row above, which is what the labels are
+/// assigned by. Sized from the image width rather than capped, because a cap
+/// here is a cap on how much of a row is looked at.
+fn locateFinders(b: *const Bitmap, out: *[max_candidates]Finder, strict: bool, runs: []Run) []Finder {
     var n: usize = 0;
 
     var labels: Labels = .{};
-    var buf_a: [max_runs]Run = undefined;
-    var buf_b: [max_runs]Run = undefined;
-    var prev: []Run = buf_a[0..0];
-    var cur_buf = &buf_b;
-    var prev_buf = &buf_a;
+    const half = runs.len / 2;
+    var prev: []Run = runs[0..0];
+    var cur_buf = runs[0..half];
+    var prev_buf = runs[half..][0..half];
 
     var y: u32 = 0;
     while (y < b.height) : (y += 1) {
@@ -1041,7 +1104,7 @@ test "scan finds and samples a rendered symbol, and decode reads it back" {
     const texts = [_][]const u8{ "HELLO WORLD", "https://example.com/x", "0123456789" };
     var m: qr.Matrix = undefined;
     var pixels: [512 * 512]u8 = undefined;
-    var scratch: [512 * 512 / 8]u8 = undefined;
+    var scratch: [scratchSize(512, 512)]u8 = undefined;
     var out: [256]u8 = undefined;
 
     for (texts) |text| {
@@ -1103,7 +1166,7 @@ fn renderRotated(m: *const qr.Matrix, scale: u32, deg: f32, buf: []u8, side_out:
 test "rotation: a symbol reads at any angle" {
     const t = std.testing;
     var pixels: [900 * 900]u8 = undefined;
-    var scratch: [900 * 900 / 8]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
     var out: [512]u8 = undefined;
     var m: qr.Matrix = undefined;
 
@@ -1141,7 +1204,7 @@ test "the module size a scan line measures is inflated by the tilt" {
     try qr.encode(&m, "TILT", .{ .ecc = .quartile });
 
     var pixels: [900 * 900]u8 = undefined;
-    var scratch: [900 * 900 / 8]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
 
     // 45 degrees is the worst case: a horizontal line through the centre of a
     // square tilted that far crosses it in side / cos(45) = 1.41 sides, and the
@@ -1151,11 +1214,12 @@ test "the module size a scan line measures is inflated by the tilt" {
     // every intermediate step looks fine.
     var side: u32 = 0;
     const img = renderRotated(&m, 6, 45, &pixels, &side);
-    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
-    binarize(img, &bits);
+    var ws = Workspace.carve(img, &scratch);
+    binarize(img, &ws.bits, ws.means);
+    const bits = &ws.bits;
 
     var finders: [max_candidates]Finder = undefined;
-    const found = locateFinders(&bits, &finders, true);
+    const found = locateFinders(bits, &finders, true, ws.runs);
     try t.expect(found.len >= 3);
 
     const c = orient(found) orelse return error.NoCorners;
@@ -1173,13 +1237,14 @@ test "a dimension one version out is rejected by the timing pattern" {
     try qr.encode(&m, "https://example.com/dimension-check", .{ .ecc = .quartile });
 
     var pixels: [512 * 512]u8 = undefined;
-    var scratch: [512 * 512 / 8]u8 = undefined;
+    var scratch: [scratchSize(512, 512)]u8 = undefined;
     const img = render(&m, 4, &pixels);
-    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
-    binarize(img, &bits);
+    var ws = Workspace.carve(img, &scratch);
+    binarize(img, &ws.bits, ws.means);
+    const bits = &ws.bits;
 
     var finders: [max_candidates]Finder = undefined;
-    const found = locateFinders(&bits, &finders, true);
+    const found = locateFinders(bits, &finders, true, ws.runs);
     var c = orient(found) orelse return error.NoCorners;
     try t.expectEqual(@as(u32, m.size), c.dimension);
 
@@ -1188,12 +1253,12 @@ test "a dimension one version out is rejected by the timing pattern" {
     // — this is the failure mode that looks like a picture problem — so the
     // timing pattern has to be what rejects it.
     const off_by_one: Corners = .{ .tl = c.tl, .tr = c.tr, .bl = c.bl, .module = c.module, .dimension = c.dimension + 4 };
-    const wrong = sample(&bits, off_by_one, gridFromCorners(off_by_one)) catch
+    const wrong = sample(bits, off_by_one, gridFromCorners(off_by_one)) catch
         return error.WrongDimensionDidNotEvenSample;
     try t.expect(timingScore(&wrong.matrix) < 0.9);
 
     c.dimension += 4;
-    const best = (try sampleBestDimension(&bits, c)).found;
+    const best = (try sampleBestDimension(bits, c)).found;
     try t.expectEqual(m.size, best.matrix.size);
 
     var fm = best.matrix;
@@ -1207,15 +1272,16 @@ test "the ring test is what keeps a large symbol's own data from crowding it out
     try qr.encode(&m, "N" ** 300, .{ .ecc = .quartile });
 
     var pixels: [900 * 900]u8 = undefined;
-    var scratch: [900 * 900 / 8]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
     var side: u32 = 0;
     const img = renderRotated(&m, 4, 20, &pixels, &side);
-    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
-    binarize(img, &bits);
+    var ws = Workspace.carve(img, &scratch);
+    binarize(img, &ws.bits, ws.means);
+    const bits = &ws.bits;
 
     var finders: [max_candidates]Finder = undefined;
-    const relaxed = locateFinders(&bits, &finders, false).len;
-    const strict = locateFinders(&bits, &finders, true).len;
+    const relaxed = locateFinders(bits, &finders, false, ws.runs).len;
+    const strict = locateFinders(bits, &finders, true, ws.runs).len;
 
     // The numbers are incidental (3 against 15 as measured); the relationship
     // is not. Without the ring requirement this symbol's own data region
@@ -1223,7 +1289,7 @@ test "the ring test is what keeps a large symbol's own data from crowding it out
     // one of them is something the triple search has to be talked out of.
     try t.expect(strict >= 3);
     try t.expect(relaxed >= strict * 3);
-    try t.expect(orient(locateFinders(&bits, &finders, true)) != null);
+    try t.expect(orient(locateFinders(bits, &finders, true, ws.runs)) != null);
 }
 
 test "the least-squares fit reproduces the grid it was sampled from" {
@@ -1280,13 +1346,14 @@ test "a broken ring has the finder ratio in both axes and is still not a finder"
         }
     }
     const img: Image = .{ .luma = &pixels, .width = 200, .height = 200, .stride = 200 };
-    var scratch: [200 * 200 / 8]u8 = undefined;
-    var bits: Bitmap = .{ .bits = &scratch, .width = 200, .height = 200 };
-    binarize(img, &bits);
+    var scratch: [scratchSize(200, 200)]u8 = undefined;
+    var ws = Workspace.carve(img, &scratch);
+    binarize(img, &ws.bits, ws.means);
+    const bits = &ws.bits;
 
     var finders: [max_candidates]Finder = undefined;
-    try t.expect(locateFinders(&bits, &finders, false).len > 0);
-    try t.expectEqual(@as(usize, 0), locateFinders(&bits, &finders, true).len);
+    try t.expect(locateFinders(bits, &finders, false, ws.runs).len > 0);
+    try t.expectEqual(@as(usize, 0), locateFinders(bits, &finders, true, ws.runs).len);
 }
 
 test "a large symbol needs the alignment patterns, not just its corners" {
@@ -1296,11 +1363,12 @@ test "a large symbol needs the alignment patterns, not just its corners" {
     try t.expect(m.size >= 145); // version 33 or larger
 
     var pixels: [900 * 900]u8 = undefined;
-    var scratch: [900 * 900 / 8]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
     var side: u32 = 0;
     const img = renderRotated(&m, 3, 20, &pixels, &side);
-    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
-    binarize(img, &bits);
+    var ws = Workspace.carve(img, &scratch);
+    binarize(img, &ws.bits, ws.means);
+    const bits = &ws.bits;
 
     // What the scanner settles on, so the comparison below is about the grid
     // and not about the dimension search.
@@ -1308,11 +1376,11 @@ test "a large symbol needs the alignment patterns, not just its corners" {
     try t.expectEqual(@as(u16, m.size), found.matrix.size);
 
     var finders: [max_candidates]Finder = undefined;
-    var c = orient(locateFinders(&bits, &finders, true)) orelse return error.NoCorners;
+    var c = orient(locateFinders(bits, &finders, true, ws.runs)) orelse return error.NoCorners;
     c.dimension = m.size;
 
     const coarse = gridFromCorners(c);
-    const refined = refine(&bits, c, coarse);
+    const refined = refine(bits, c, coarse);
 
     // The refinement moved the far corner by enough to change which module it
     // samples, which is the whole point: three corner points fix an affine map
@@ -1323,7 +1391,7 @@ test "a large symbol needs the alignment patterns, not just its corners" {
     try t.expect(moved > 0.5);
 
     // And it moved it the right way.
-    const with = try sample(&bits, c, refined);
+    const with = try sample(bits, c, refined);
     var fm = with.matrix;
     var out: [3000]u8 = undefined;
     try t.expectEqualStrings("N" ** 2000, try qr.decode(&fm, &out));
@@ -1335,7 +1403,7 @@ test "rotation holds at the largest versions, where the grid has furthest to dri
     try qr.encode(&m, "N" ** 2000, .{ .ecc = .quartile });
 
     var pixels: [900 * 900]u8 = undefined;
-    var scratch: [900 * 900 / 8]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
     var out: [3000]u8 = undefined;
 
     var ok: u32 = 0;
@@ -1358,6 +1426,60 @@ test "rotation holds at the largest versions, where the grid has furthest to dri
     try t.expect(ok * 4 >= total * 3);
 }
 
+test "a symbol is found wherever in the frame it happens to be" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "ANY CORNER", .{ .ecc = .quartile });
+
+    // Larger than 1024 in both axes, which is where the block-mean table used
+    // to stop: past it the bitmap was never written and the scan read whatever
+    // the caller's buffer already held. A single position cannot catch that —
+    // the defect is "one region of the frame is not processed" — so the symbol
+    // is placed in each corner in turn.
+    const w = 1200;
+    const h = 1200;
+    const scale = 6;
+    const span = @as(usize, m.size) * scale;
+    const pixels = try t.allocator.alloc(u8, w * h);
+    defer t.allocator.free(pixels);
+    const scratch = try t.allocator.alloc(u8, scratchSize(w, h));
+    defer t.allocator.free(scratch);
+
+    const margin = 20;
+    for ([_][2]usize{
+        .{ margin, margin },
+        .{ w - span - margin, margin },
+        .{ margin, h - span - margin },
+        .{ w - span - margin, h - span - margin },
+    }) |origin| {
+        // Both fills, because "reads uninitialised scratch" and "reads the
+        // wrong thing" are the same symptom from the outside: the answer has to
+        // be the same whatever was in the buffer before.
+        for ([_]u8{ 0x00, 0xFF }) |fill| {
+            @memset(pixels, 255);
+            @memset(scratch, fill);
+            for (0..m.size) |my| {
+                for (0..m.size) |mx| {
+                    if (!m.isDark(@intCast(mx), @intCast(my))) continue;
+                    for (0..scale) |dy| {
+                        for (0..scale) |dx| {
+                            pixels[(origin[1] + my * scale + dy) * w + origin[0] + mx * scale + dx] = 0;
+                        }
+                    }
+                }
+            }
+            const img: Image = .{ .luma = pixels, .width = w, .height = h, .stride = w };
+            const found = scan(img, scratch) catch |e| {
+                std.debug.print("corner ({d}, {d}) fill 0x{X:0>2}: {s}\n", .{ origin[0], origin[1], fill, @errorName(e) });
+                return e;
+            };
+            var fm = found.matrix;
+            var out: [64]u8 = undefined;
+            try t.expectEqualStrings("ANY CORNER", try qr.decode(&fm, &out));
+        }
+    }
+}
+
 // ── fuzz: the image is entirely attacker-chosen ─────────────────────────────
 
 test "fuzz: scan never panics on an arbitrary image" {
@@ -1378,7 +1500,7 @@ fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
     const stride = w + extra;
     if (@as(usize, stride) * h > pixels.len) return;
 
-    var scratch: [128 * 128 / 8]u8 = undefined;
+    var scratch: [scratchSize(128, 128)]u8 = undefined;
     const img: Image = .{ .luma = &pixels, .width = w, .height = h, .stride = stride };
     const found = scan(img, &scratch) catch return;
     // A returned grid must be a legal symbol size, or the caller is handed
@@ -1408,7 +1530,7 @@ fn fuzzDamaged(_: void, smith: *std.testing.Smith) !void {
         pixels[y * img.width + x] = smith.valueRangeAtMost(u8, 0, 255);
     }
 
-    var scratch: [400 * 400 / 8]u8 = undefined;
+    var scratch: [scratchSize(400, 400)]u8 = undefined;
     _ = scan(img, &scratch) catch return;
 }
 
@@ -1425,7 +1547,7 @@ test "lumaFromRgba uses the standard weights" {
 test "a picture with no symbol in it is reported, not guessed at" {
     const t = std.testing;
     var pixels: [128 * 128]u8 = undefined;
-    var scratch: [128 * 128 / 8]u8 = undefined;
+    var scratch: [scratchSize(128, 128)]u8 = undefined;
     // A gradient: plenty of contrast, no finder patterns anywhere.
     for (0..128) |y| {
         for (0..128) |x| pixels[y * 128 + x] = @intCast((x * 2) % 256);
@@ -1459,7 +1581,7 @@ test "stride is honoured, because a camera plane is padded" {
         .stride = img.width + pad,
     };
 
-    var scratch: [512 * 512 / 8]u8 = undefined;
+    var scratch: [scratchSize(512, 512)]u8 = undefined;
     const found = try scan(padded_img, &scratch);
     var fm = found.matrix;
     var out: [64]u8 = undefined;

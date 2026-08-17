@@ -2,13 +2,15 @@
 
 Find a QR symbol in a grayscale image and sample it into a `qr.Matrix`, which
 [`qr`](../qr/README.md) then decodes. No allocator: the caller supplies one
-scratch buffer.
+scratch buffer, sized by `scratchSize` — call it rather than working the number
+out, since it covers the bitmap, the block means and the labeller's runs, and
+what it covers has changed.
 
 ```zig
 const qrscan = @import("qrscan");
 const qr = @import("qr");
 
-var scratch: [1920 * 1080 / 8]u8 = undefined;   // qrscan.scratchSize(w, h)
+var scratch: [qrscan.scratchSize(1920, 1080)]u8 = undefined;
 const img: qrscan.Image = .{ .luma = plane, .width = 1920, .height = 1080, .stride = 2048 };
 
 const found = try qrscan.scan(img, &scratch);
