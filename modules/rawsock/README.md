@@ -60,10 +60,13 @@ try inj.send(idx, dst_mac, rawsock.eth_p.ip, payload); // header prepended by th
 // or, on a SOCK_RAW socket, transmit a complete frame yourself:
 // try cap.sendRaw(idx, full_ethernet_frame);
 
-// Interface helpers (SIOCGIFINDEX / SIOCGIFNAME / SIOCGIFHWADDR).
+// Interface helpers (SIOCGIFINDEX / SIOCGIFNAME / SIOCGIFHWADDR /
+// SIOCGIFADDR / SIOCGIFNETMASK).
 const mac = try rawsock.hwaddr(inj.fd, idx);        // [6]u8
 var namebuf: [16]u8 = undefined;
 const name = try rawsock.ifaceName(inj.fd, idx, &namebuf); // "eth0"
+const addr = try rawsock.ipv4Addr(inj.fd, idx);     // [4]u8, e.g. own subnet for an ARP sweep
+const mask = try rawsock.ipv4Netmask(inj.fd, idx);  // [4]u8
 ```
 
 ### Pure helpers (no socket, no privileges)

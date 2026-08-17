@@ -6,7 +6,7 @@
 //! typed `Frame`, attach an in-kernel classic-BPF filter, toggle promiscuous
 //! mode, and cook-inject frames on a named interface via a `SOCK_DGRAM`
 //! socket. Interface enumeration (`SIOCGIFINDEX` / `SIOCGIFNAME` /
-//! `SIOCGIFHWADDR`) rounds it out.
+//! `SIOCGIFHWADDR` / `SIOCGIFADDR` / `SIOCGIFNETMASK`) rounds it out.
 //!
 //! Two layers, so the wire code is testable without privileges:
 //!
@@ -528,7 +528,50 @@ pub fn hwaddr(fd: i32, ifindex: i32) IfaceError![hwaddr_len]u8 {
     return mac;
 }
 
+/// Read an interface's IPv4 address by index (`SIOCGIFNAME` then
+/// `SIOCGIFADDR`; ioctls on `fd`). Unprivileged, like `hwaddr` — any open
+/// socket works as `fd`. Returns `error.NoSuchInterface` both when the
+/// interface doesn't exist and when it has no IPv4 address configured (the
+/// kernel reports both as an ioctl failure; this module doesn't need to tell
+/// them apart, matching the other wrappers' error shape).
+pub fn ipv4Addr(fd: i32, ifindex: i32) IfaceError![4]u8 {
+    var namebuf: [16]u8 = undefined;
+    const name = try ifaceName(fd, ifindex, &namebuf);
+    var req: ifreq = .{};
+    @memcpy(req.name[0..name.len], name);
+    if (linux.errno(linux.ioctl(fd, linux.SIOCGIFADDR, @intFromPtr(&req))) != .SUCCESS)
+        return error.NoSuchInterface;
+    return sockaddrInAddr(req);
+}
+
+/// Read an interface's IPv4 netmask by index (`SIOCGIFNAME` then
+/// `SIOCGIFNETMASK`; ioctls on `fd`). Deliberately shipped alongside
+/// `ipv4Addr` rather than left for the caller to hand-roll: the kernel
+/// exposes address and netmask as two separate ioctls, but a consumer that
+/// wants the *subnet* (an ARP sweep needs the host range, not just this
+/// host's own address) needs both — `netaddr.Prefix`/`AddrIterator` can take
+/// it from here once the caller turns the mask into a prefix length.
+pub fn ipv4Netmask(fd: i32, ifindex: i32) IfaceError![4]u8 {
+    var namebuf: [16]u8 = undefined;
+    const name = try ifaceName(fd, ifindex, &namebuf);
+    var req: ifreq = .{};
+    @memcpy(req.name[0..name.len], name);
+    if (linux.errno(linux.ioctl(fd, linux.SIOCGIFNETMASK, @intFromPtr(&req))) != .SUCCESS)
+        return error.NoSuchInterface;
+    return sockaddrInAddr(req);
+}
+
 // ── internals ─────────────────────────────────────────────────────────────────
+
+/// Extract the IPv4 address from an `ifreq` union filled by `SIOCGIFADDR` /
+/// `SIOCGIFNETMASK`: the kernel writes a `struct sockaddr_in` there — family
+/// (2 bytes), port (2 bytes, always zero for these two ioctls), address (4
+/// bytes) — so the address sits at byte offset 4, one word deeper than
+/// `hwaddr`'s bare `struct sockaddr` MAC at offset 2 (no port field in
+/// `sockaddr_ll`/the generic hwaddr sockaddr).
+fn sockaddrInAddr(req: ifreq) [4]u8 {
+    return req.un[4..8].*;
+}
 
 /// `struct ifreq`: a 16-byte name followed by a 24-byte union (40 bytes total).
 const ifreq = extern struct {
@@ -676,6 +719,23 @@ test "struct sizes match the kernel ABI" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(BpfInsn)); // sock_filter
     try testing.expectEqual(@as(usize, 16), @sizeOf(PacketMreq)); // packet_mreq
     try testing.expectEqual(@as(usize, 40), @sizeOf(ifreq)); // ifreq
+}
+
+test "sockaddrInAddr decodes a real SIOCGIFADDR/SIOCGIFNETMASK ifreq layout" {
+    // A real SIOCGIFADDR reply for 192.0.2.1: ifr_addr is a sockaddr_in —
+    // family AF_INET (2, native-endian u16) at [0..2), port 0 at [2..4),
+    // address at [4..8), the sin_zero padding after (untouched, left 0).
+    var req: ifreq = .{};
+    req.un[0..2].* = @bitCast(@as(u16, linux.AF.INET));
+    req.un[4..8].* = .{ 192, 0, 2, 1 };
+    try testing.expectEqual([_]u8{ 192, 0, 2, 1 }, sockaddrInAddr(req));
+
+    // A real SIOCGIFNETMASK reply for a /24 (255.255.255.0): same layout,
+    // different address bytes — the two ioctls share one wire shape.
+    var mreq: ifreq = .{};
+    mreq.un[0..2].* = @bitCast(@as(u16, linux.AF.INET));
+    mreq.un[4..8].* = .{ 255, 255, 255, 0 };
+    try testing.expectEqual([_]u8{ 255, 255, 255, 0 }, sockaddrInAddr(mreq));
 }
 
 test "arp build/parse round-trip (surfaces netaddr.Ip)" {
@@ -883,6 +943,35 @@ fn bringLoopbackUp() void {
     flags |= 0x1; // IFF_UP
     std.mem.writeInt(u16, req.un[0..2], flags, .little);
     _ = linux.ioctl(fd, linux.SIOCSIFFLAGS, @intFromPtr(&req));
+}
+
+test "ipv4Addr / ipv4Netmask: real ioctl on `lo` (unprivileged — no CAP_NET_RAW needed)" {
+    // Unlike the Socket.open tests below, ipv4Addr/ipv4Netmask (like hwaddr
+    // and ifaceName) only need a throwaway AF_INET/SOCK_DGRAM socket for the
+    // ioctl, so this runs unconditionally rather than SkipZigTest-ing on a
+    // missing capability. `lo` is 127.0.0.1/8 once up — the host's default
+    // netns already has it up, but a fresh netns (`unshare -rn`) starts `lo`
+    // DOWN and *without* that address (measured: SIOCGIFADDR fails until
+    // `ip link set lo up`, which is also why the loopback round-trip test
+    // below calls the same helper) — Linux autoconfigures 127.0.0.1/8 only
+    // once the link comes up.
+    bringLoopbackUp(); // best-effort; needs CAP_NET_ADMIN, which `unshare -rn` grants
+
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(.SUCCESS, linux.errno(rc));
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    const lo = try ifaceByName("lo");
+    const addr = ipv4Addr(fd, lo) catch |e| switch (e) {
+        // Only reachable in an unprivileged fresh netns, where `lo` can
+        // never be brought up (no CAP_NET_ADMIN) and so never gets an
+        // address — an environment limitation, not a missing feature.
+        error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    try testing.expectEqual([_]u8{ 127, 0, 0, 1 }, addr);
+    try testing.expectEqual([_]u8{ 255, 0, 0, 0 }, try ipv4Netmask(fd, lo));
 }
 
 test "capture socket: open + setFilter + setPromisc (needs CAP_NET_RAW)" {
