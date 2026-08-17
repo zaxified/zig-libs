@@ -86,6 +86,12 @@ try server.listen();
   or a typed `SanitizeError` (the layer-1 traversal check).
 - `openWithinRoot(root, io, rel, opts)` / `resolveFile(root, io, raw_path, opts)` — resolve to an
   open regular file within the root, or a typed `ResolveError` (the layer-2 guarantee).
+- `Handler.sendFile(req, rw, *Opened)` — serve an already-resolved/opened file (headers,
+  conditional/range handling, body) without a second `resolveFile`. Use this to compose an
+  app-specific 404 or similar: `resolveFile` once yourself, and on `error.NotFound` serve your own
+  page instead of falling through to `serve`'s built-in 404; on success, hand the `Opened` straight
+  to `sendFile`. `sendFile` only borrows `opened` — closing it (`opened.close(io)`) stays the
+  caller's job, exactly as it is for `serve`'s own internal call.
 
 ## Options
 

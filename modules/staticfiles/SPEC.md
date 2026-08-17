@@ -149,6 +149,17 @@ or an HTML listing when `directory_listing = true`. Listing entry names are HTML
 | Real I/O / filesystem failure | 500 |
 | 304 / 412 | per conditional evaluation |
 
+## 3.5. Serving an already-opened file
+
+`Handler.sendFile(req, rw, *Opened)` is the internal second half of `serve` — everything after
+`resolveFile` succeeds (validators, conditional evaluation, range handling, body) — made public. It
+exists so a caller who resolved/opened the file itself (typically: `resolveFile` up front to
+compose an app-specific 404 instead of `serve`'s built-in one) does not pay a second resolve. It
+borrows `opened`; it never closes it, matching `serve`'s own `defer opened.close(h.io)` at its one
+internal call site. Status-mapping for a *failed* resolve is entirely the caller's problem —
+`sendFile` starts from an already-successful `Opened` and only covers what `serve` does from that
+point on.
+
 ## 4. Concurrency & memory
 
 A `Handler` is created once and shared read-only across the server's connection threads; it holds

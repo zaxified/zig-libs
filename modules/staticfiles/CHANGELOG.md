@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — `Handler.sendFile` is now `pub` (was `fn`, internal-only). A caller
+  who already holds a resolved/opened file — e.g. it called `resolveFile` itself to
+  compose an app-specific 404 page before falling back to the static handler — can
+  now serve it directly (`h.sendFile(req, rw, &opened)`) instead of paying a second
+  `resolveFile` inside `serve`. Ownership unchanged: `sendFile` still just borrows
+  `opened` and never closes it, same as the internal call site in `serve`.
 - **2026-08-13** — **BEHAVIOURAL, not breaking** — a `304 Not Modified` that cannot
   carry its `ETag` is no longer sent as a 304. `http.conditional.apply` stages the
   304 status *before* it writes the validator, so the `catch false` on that call

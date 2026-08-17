@@ -501,7 +501,18 @@ pub const Handler = struct {
 
     /// Emit the representation headers + body (or 304/412/206/416) for an
     /// already-opened file.
-    fn sendFile(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter, opened: *Opened) Writer.Error!void {
+    ///
+    /// Public so a caller who already holds a resolved `Opened` (e.g.
+    /// `resolveFile`'d up front to compose an app-specific 404 page, or one
+    /// opened by some other means entirely) can serve it directly without a
+    /// second resolve inside `serve`. Ownership: `opened` is borrowed —
+    /// `sendFile` never closes it, exactly like the internal `serve` call
+    /// site above (`defer opened.close(h.io)` stays the caller's job).
+    /// Same status-mapping and never-panics contract as `serve`, but the
+    /// 403/404/etc. mapping for a *failed resolve* is the caller's own
+    /// responsibility — this only covers what happens after a resolve
+    /// already succeeded.
+    pub fn sendFile(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter, opened: *Opened) Writer.Error!void {
         const total = opened.stat.size;
         const mtime_s = opened.stat.mtime.toSeconds();
         // Locals, not thread-locals: setHeader copies the bytes into its own
@@ -1249,6 +1260,52 @@ test "serve: 200 with correct Content-Type, ETag, Last-Modified, body" {
     try testing.expect(mem.indexOf(u8, resp, "Last-Modified: ") != null);
     try testing.expect(mem.indexOf(u8, resp, "Accept-Ranges: bytes\r\n") != null);
     try testing.expect(mem.endsWith(u8, resp, "hello world"));
+}
+
+/// Stand-in for an app that already resolved/opened the file itself (e.g. to
+/// compose an app-specific 404 page) and wants to serve it without paying a
+/// second `resolveFile` inside `serve` — exactly the `sendFile` use case.
+fn resolvedSendFileHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    const h: *const Handler = @ptrCast(@alignCast(req.context orelse return error.NoStaticFilesContext));
+    var opened = resolveFile(h.root, h.io, req.path, h.options) catch return sendStatus(rw, 404);
+    defer opened.close(h.io);
+    return h.sendFile(req, rw, &opened);
+}
+
+test "sendFile: serving an already-resolved Opened is byte-identical to the resolve-inside-serve path" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+
+    var buf_serve: [4096]u8 = undefined;
+    const via_serve = get(&h, "/sub/dir/file.txt", &buf_serve);
+    try testing.expectEqual(@as(u16, 200), statusOf(via_serve));
+    try testing.expect(mem.endsWith(u8, via_serve, "nested"));
+
+    var buf_sendfile: [4096]u8 = undefined;
+    var in: std.Io.Reader = .fixed("GET /sub/dir/file.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    var out: std.Io.Writer = .fixed(&buf_sendfile);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [512]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = resolvedSendFileHandler,
+        .context = &h,
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    const via_sendfile = out.buffered();
+
+    // Identical response bytes: same status, same headers (Content-Type,
+    // ETag, Last-Modified, Accept-Ranges), same body — proving `sendFile`
+    // called directly on a caller-held `Opened` behaves exactly like the
+    // resolve done internally by `serve`.
+    try testing.expectEqualStrings(via_serve, via_sendfile);
 }
 
 test "serve: directory request serves index.html" {
