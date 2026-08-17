@@ -112,6 +112,12 @@ group: std.Io.Group,
 /// `activeConnections`). Atomic: touched by the accept loop and every
 /// connection task.
 active_conns: std.atomic.Value(usize),
+/// The Zig error name behind the most recent `BadAddress`/`ListenFailed`
+/// from `bind` — see `bindErrorName`. Same shape as `probe.ConnectOutcome.
+/// err_name`: `std.Io.net` reports an `anyerror`, not an errno, so there is
+/// no numeric code to carry, only `@errorName`'s static string. Null before
+/// the first failing `bind` call and after a successful one.
+last_bind_error: ?[]const u8,
 
 /// Called once per request, from the connection's thread. Errors turn into
 /// a 500 when nothing was sent yet, otherwise the connection is closed.
@@ -216,10 +222,24 @@ pub const Options = struct {
     /// handler's body reader fails once decoded bytes cross the limit, and
     /// the connection closes. Bodies are never buffered either way; this
     /// cap protects handlers that buffer and bounds bandwidth, not server
-    /// memory. null = unlimited.
+    /// memory. **null = unlimited — set this for any route that accepts
+    /// real uploads**, or every body over 1 MiB gets a 413 (see README
+    /// "Direct-internet posture"). Applies to `enable_h2c` requests too:
+    /// `connMain` forwards this exact value into `h2_server.Options` when
+    /// dispatching an h2 connection, so a `Server`-based consumer is
+    /// hardened identically on both protocols by default — the lower-level
+    /// `h2_server.Options.max_body_bytes` (like `StreamOptions.max_body_bytes`)
+    /// defaults to null only because that struct is the permissive
+    /// composable-codec layer this one wraps, not because h2 is
+    /// intentionally left uncapped when served through `Server`.
     max_body_bytes: ?u64 = 1 << 20,
     /// Response body buffering: bodies fully written within this get an
-    /// exact Content-Length, larger ones stream chunked.
+    /// exact Content-Length, larger ones stream chunked. **A response
+    /// larger than this switches to chunked framing silently** — a peer
+    /// whose HTTP client does not decode chunked transfer coding (a minimal
+    /// hand-rolled client is the common case) needs an explicit
+    /// `rw.setHeader("Content-Length", …)` on every such response instead
+    /// of relying on the auto framing.
     response_buffer_size: usize = 4 * 1024,
     /// Max requests served on a single keep-alive connection before it is
     /// closed gracefully: the response to the last permitted request carries
@@ -245,8 +265,24 @@ pub const Options = struct {
     /// regardless of this knob. Costs an extra ~68 KiB (decoder window) per
     /// connection while enabled.
     max_decompressed_request_bytes: u64 = 0,
-    /// Auto `Server` response header, overridable per response.
-    server_name: []const u8 = "zig-libs-http/0.1",
+    /// Auto `Server` response header, overridable per response. null =
+    /// omit the header entirely (matches `StreamOptions.server_name`'s
+    /// null-means-omit shape — see `emit_date` for why the socket path
+    /// needed this and did not have it).
+    server_name: ?[]const u8 = "zig-libs-http/0.1",
+    /// Auto `Date` header (IMF-fixdate) on every response. true (default)
+    /// installs the server's own wall clock, exactly as before this field
+    /// existed; false omits the header. This mirrors
+    /// `StreamOptions.now`/`h2_server.Options.now` being `?Now` with
+    /// null = omit, but stays a plain bool here — `Server.Options` only
+    /// ever wants "the server's clock or nothing", never a caller-supplied
+    /// `Now`, so there is no reason to spend the `Now` type on this surface.
+    /// Before this field existed, the socket path (`connMain`) always built
+    /// a non-null `Now`, so a consumer moving from a header-free bespoke
+    /// server onto this one saw a new `Date` on every response with no way
+    /// to turn it off — this field, and `server_name` becoming optional
+    /// above, close that gap.
+    emit_date: bool = true,
     kernel_backlog: u31 = 128,
     reuse_address: bool = false,
     /// Multicore accept engine (SO_REUSEPORT thread-per-core). 1 (the
@@ -326,6 +362,7 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Server {
         .aux_listeners = &.{},
         .group = .init,
         .active_conns = .init(0),
+        .last_bind_error = null,
     };
 }
 
@@ -357,21 +394,36 @@ pub const BindError = error{ BadAddress, ListenFailed, Canceled };
 /// Bind + listen on `options.addr:port`. `boundAddress` is valid afterwards
 /// (an ephemeral port is resolved). Split from `serve` so callers can learn
 /// the port before serving; `listen` does both.
+///
+/// `BadAddress`/`ListenFailed` collapse `std.Io.net`'s real error (a parse
+/// failure or a `ListenError` tag like `AddressInUse`/`AddressUnavailable`)
+/// into one of two tags — the underlying name is not lost, it lands in
+/// `last_bind_error`/`bindErrorName()` (set right before each such return,
+/// cleared at the top of `bind`), the same "classified tag + `@errorName`
+/// alongside it" shape `probe.ConnectOutcome.err_name` uses for the same
+/// reason: `std.Io.net` reports an `anyerror` here, not an errno, so there
+/// is no numeric code to carry.
 pub fn bind(s: *Server) BindError!void {
     std.debug.assert(s.listener == null);
+    s.last_bind_error = null;
     const n = @max(1, s.options.accept_threads);
     // The multicore engine needs SO_REUSEPORT on every listener; the kernel
     // refuses a second bind on the same address otherwise.
     const reuse = s.options.reuse_address or n > 1;
 
-    const addr0 = net.IpAddress.parse(s.options.addr, s.options.port) catch
+    const addr0 = net.IpAddress.parse(s.options.addr, s.options.port) catch |err| {
+        s.last_bind_error = @errorName(err);
         return error.BadAddress;
+    };
     s.listener = addr0.listen(s.io, .{
         .kernel_backlog = s.options.kernel_backlog,
         .reuse_address = reuse,
     }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => return error.ListenFailed,
+        else => {
+            s.last_bind_error = @errorName(err);
+            return error.ListenFailed;
+        },
     };
     if (n == 1) return;
 
@@ -379,9 +431,14 @@ pub fn bind(s: *Server) BindError!void {
     // each listener would otherwise be handed a different ephemeral port and
     // the SO_REUSEPORT group would never form.
     const resolved_port = s.listener.?.socket.address.getPort();
-    const addr = net.IpAddress.parse(s.options.addr, resolved_port) catch
+    const addr = net.IpAddress.parse(s.options.addr, resolved_port) catch |err| {
+        s.last_bind_error = @errorName(err);
         return error.BadAddress;
-    const aux = s.gpa.alloc(net.Server, n - 1) catch return error.ListenFailed;
+    };
+    const aux = s.gpa.alloc(net.Server, n - 1) catch |err| {
+        s.last_bind_error = @errorName(err);
+        return error.ListenFailed;
+    };
     errdefer s.gpa.free(aux);
     var bound: usize = 0;
     errdefer for (aux[0..bound]) |*l| l.deinit(s.io);
@@ -391,10 +448,64 @@ pub fn bind(s: *Server) BindError!void {
             .reuse_address = true,
         }) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            else => return error.ListenFailed,
+            else => {
+                s.last_bind_error = @errorName(err);
+                return error.ListenFailed;
+            },
         };
     }
     s.aux_listeners = aux;
+}
+
+/// The Zig error name behind the most recent failing `bind()` call (e.g.
+/// `"AddressInUse"`, `"AddressFamilyUnsupported"`, an `IpAddress.parse`
+/// error like `"InvalidCharacter"`, or `"OutOfMemory"` from the multicore
+/// listener array). Null before any `bind` call, after a successful one, or
+/// after a `Canceled` `bind` (cancellation is not itself a diagnostic — the
+/// error tag already says what happened). An `@errorName` result: a static
+/// string, never allocated or freed.
+pub fn bindErrorName(s: *const Server) ?[]const u8 {
+    return s.last_bind_error;
+}
+
+test "bind: ListenFailed carries the underlying AddressInUse error name" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Bind #1 on an ephemeral port, so the exact port is known but held.
+    var first = init(io, testing.allocator, .{ .handler = testHandler });
+    defer first.deinit();
+    first.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    try testing.expectEqual(@as(?[]const u8, null), first.bindErrorName());
+    const held_port = first.boundAddress().getPort();
+
+    // Bind #2 on the exact same address:port, without SO_REUSEADDR — the
+    // kernel refuses it, and the old two-error-tag `bind` discarded exactly
+    // which failure that was (the SPEC report this fixes).
+    var second = init(io, testing.allocator, .{ .handler = testHandler, .port = held_port });
+    defer second.deinit();
+    try testing.expectError(error.ListenFailed, second.bind());
+    try testing.expectEqualStrings("AddressInUse", second.bindErrorName().?);
+}
+
+test "bind: BadAddress carries the underlying parse-error name" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = init(io, testing.allocator, .{ .handler = testHandler, .addr = "not-an-ip" });
+    defer server.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), server.bindErrorName());
+    try testing.expectError(error.BadAddress, server.bind());
+    // Not pinned to a specific std parse-error tag (IPv4 vs IPv6 parsers
+    // may change which one std picks) — the load-bearing assertion is that
+    // *some* real error name survived instead of being discarded.
+    const name = server.bindErrorName() orelse return error.TestExpectedNonNull;
+    try testing.expect(name.len > 0);
 }
 
 /// The address actually bound, with the resolved port — for ephemeral-port
@@ -654,7 +765,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .handler = o.handler,
                 .context = o.context,
                 .server_name = o.server_name,
-                .now = .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds },
+                .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
                 .peer = stream.socket.address,
                 .max_header_bytes = o.max_header_bytes,
                 .max_body_bytes = o.max_body_bytes,
@@ -675,7 +786,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .handler = o.handler,
         .context = o.context,
         .server_name = o.server_name,
-        .now = .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds },
+        .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
         .peer = stream.socket.address,
         .max_request_line_bytes = o.max_request_line_bytes,
         .max_body_bytes = o.max_body_bytes,
@@ -2754,6 +2865,12 @@ const StreamTweaks = struct {
     compression: ?Compression = null,
     max_decompressed_request_bytes: u64 = 0,
     max_requests_per_conn: u32 = 0,
+    /// Matches `runStream`'s historical fixed value; override to null to
+    /// prove the `Server` auto-header can be suppressed.
+    server_name: ?[]const u8 = "test",
+    /// Matches `runStream`'s historical fixed clock; override to null to
+    /// prove the `Date` auto-header can be suppressed.
+    now: ?StreamOptions.Now = .{ .epochSeconds = fixedEpoch },
 };
 
 /// Run `serveStream` over canned wire bytes with small test buffers
@@ -2778,8 +2895,8 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
     serveStream(.{
         .handler = testHandler,
         .context = ctx,
-        .server_name = "test",
-        .now = .{ .epochSeconds = fixedEpoch },
+        .server_name = tweaks.server_name,
+        .now = tweaks.now,
         .peer = tweaks.peer,
         .max_request_line_bytes = tweaks.max_request_line_bytes,
         .max_body_bytes = tweaks.max_body_bytes,
@@ -2815,6 +2932,51 @@ test "serveStream: golden fixed-length response" {
         "Content-Length: 5\r\n" ++
         "\r\n" ++
         "hello", got);
+}
+
+test "serveStream: server_name = null omits Server, Date stays" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .server_name = null }, null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Date: " ++ test_date ++ "\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello", got);
+}
+
+test "serveStream: now = null omits Date, Server stays" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .now = null }, null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello", got);
+}
+
+/// The exact head `/hello` produces with both auto-headers suppressed —
+/// reused by the live-socket agreement test below to prove `Server.Options`
+/// (`server_name = null`, `emit_date = false`) and `StreamOptions`
+/// (`server_name = null`, `now = null`) now emit byte-identical wire output
+/// for the same request. That agreement — not either suppression alone — is
+/// the finding: before `Options` gained these fields, the socket path could
+/// not produce this string at all.
+/// Head only (no blank-line terminator, no body) — the shape
+/// `h1.readHead` returns, for the live-socket comparison.
+const both_suppressed_head_only = "HTTP/1.1 200 OK\r\n" ++
+    "Content-Type: text/plain\r\n" ++
+    "Connection: close\r\n" ++
+    "Content-Length: 5\r\n";
+const both_suppressed_head = both_suppressed_head_only ++ "\r\n" ++ "hello";
+
+test "serveStream: server_name = null and now = null omit both auto-headers" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .server_name = null, .now = null }, null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings(both_suppressed_head, got);
 }
 
 test "serveStream: golden chunked response when the body outgrows the buffer" {
@@ -4252,6 +4414,90 @@ test "integration: keep-alive — two requests on one TCP connection" {
     // …and the server actually closes.
     try testing.expectError(error.EndOfStream, sr.interface.take(1));
     try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
+}
+
+test "integration: Server.Options defaults emit Server and Date on the wire" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Default `Options` — no `server_name`/`emit_date` override.
+    var server = init(io, testing.allocator, .{ .handler = testHandler });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    var head_buf: [2048]u8 = undefined;
+
+    try sw.interface.writeAll("GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    const head = try h1.readHead(&sr.interface, &head_buf);
+
+    // Byte-level: the literal default `Server` line is on the wire …
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nServer: zig-libs-http/0.1\r\n") != null);
+    // … and so is a `Date:` line (value is real wall-clock, so only the
+    // literal field name + colon-space is asserted, not the timestamp).
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nDate: ") != null);
+}
+
+test "integration: Server.Options suppression agrees byte-for-byte with StreamOptions suppression" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The socket path expressing the same suppression `serveStream` already
+    // could — this is the finding: before `server_name`/`emit_date`
+    // existed on `Options`, `connMain` always built a non-null `Now` and a
+    // non-optional name, so the socket path could NOT reach this string no
+    // matter what a caller passed.
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .server_name = null,
+        .emit_date = false,
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    var head_buf: [2048]u8 = undefined;
+
+    try sw.interface.writeAll("GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    const head = try h1.readHead(&sr.interface, &head_buf);
+
+    // Byte-identical to `both_suppressed_head_only`, produced offline by
+    // `serveStream` with `server_name = null, now = null` — the two entry
+    // points now agree exactly rather than one being structurally unable
+    // to omit what the other always could.
+    try testing.expectEqualStrings(both_suppressed_head_only, head);
 }
 
 test "integration: stalled client is dropped after the read timeout" {

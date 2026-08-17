@@ -5,6 +5,50 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — **BREAKING (narrow) + additive** — three fixes from the same audit report,
+  landed together: this module has the most consumers in the collection (three, two outside
+  the repo), so every change was checked for "does an existing caller passing no new options
+  still get the same bytes on the wire".
+  **(1) `Options.server_name`/`Date` can now be suppressed through `Server`, not only through
+  `serveStream`.** `StreamOptions.server_name` was always `?[]const u8` and `.now` was always
+  `?Now` (null = omit), because `serveStream` is the composable codec layer meant to be driven
+  with no `Server` at all — but `Server.Options.server_name` was a non-optional `[]const u8` and
+  `connMain` always synthesized a non-null `Now`, so a caller going through `Server` (the entry
+  point almost everyone uses) had no way to reach the header-free state the socket-free path
+  always could. `Options.server_name` is now `?[]const u8` (default unchanged: `"zig-libs-http/0.1"`;
+  null = omit `Server`) and `Options.emit_date: bool = true` governs `Date` the same way `false` =
+  omit, matching `StreamOptions.now = null`'s effect without spending the `Now` type on a surface
+  that only ever wants "the server's own clock or nothing". Pinned by three new `serveStream`
+  goldens (each suppression alone, then both together) and two live-loopback `Server` tests, one
+  of which asserts the socket path's suppressed head is byte-identical to the socket-free one —
+  that agreement is the fix. **Source-breaking, narrowly:** any caller constructing `Options` with
+  a string literal or a `[]const u8` value for `server_name` is unaffected (still coerces); a
+  caller that *reads* `options.server_name` back out and treats it as non-optional (e.g. passes it
+  directly where `[]const u8` is expected) stops compiling. No in-workspace consumer does this —
+  verified before landing — and none sets `server_name` at all today.
+  **(2) `Server.bind` no longer discards the underlying `std.Io.net` error.** `BindError` stays the
+  same two-tag shape (`BadAddress`/`ListenFailed`/`Canceled` — no exhaustive `switch` breaks), but
+  the real error each collapsed (`IpAddress.parse`'s `ParseError`, or `IpAddress.listen`'s
+  `ListenError` such as `AddressInUse`/`AddressUnavailable`) now survives in the new
+  `bindErrorName()` accessor (`@errorName`, a static string — same shape `probe.ConnectOutcome`
+  uses for the same reason: `std.Io.net` reports an `anyerror` here, not an errno, so there is no
+  numeric code to carry). Purely additive. Pinned by two new tests: a forced `AddressInUse` (a
+  second listener on an already-bound port, no `SO_REUSEADDR`) asserts the exact tag survives; a
+  forced address-parse failure asserts *a* name survives without pinning which std parse-error tag
+  produced it.
+  **(3) Documentation only, no code change:** `Options.max_body_bytes` defaults to 1 MiB — any route
+  that streams or accepts real uploads must set it to `null` or every body over 1 MiB gets a 413
+  before the handler runs, now stated in README where a new consumer meets the option, not only in
+  SPEC. Its struct-level asymmetry with `h2_server.Options.max_body_bytes` (`null`) is now documented
+  rather than left implicit: `connMain` forwards `Options.max_body_bytes` verbatim into
+  `h2_server.Options` for an `enable_h2c` connection, so a `Server`-based consumer gets the same
+  hardened default on both protocols — the null default only matters for a caller invoking
+  `h2_server.serve`/`.serveStream` directly (BYO-TLS, same permissive-by-default reasoning as
+  `StreamOptions.max_body_bytes`). Both defaults are unchanged; nothing was silently uncapped or
+  capped as part of this. Also documented: a response over `response_buffer_size` (default 4 KiB)
+  switches to chunked framing silently, which has bitten a consumer whose own minimal HTTP client
+  does not decode chunked — it now sets an explicit `Content-Length` on every such reply, and the
+  README says so next to the option instead of only in a SPEC bullet.
 - **2026-08-13** — **BEHAVIOURAL, not source-breaking** — `Client`'s two timeout
   options now bound blocking I/O. Neither did before: `connectTimeout()` was
   `_ = c; return .none;` (the real body commented out behind a

@@ -157,7 +157,13 @@ var server = http.Server.init(threaded.io(), gpa, .{
     // .compression = .{},   // negotiated gzip; off when omitted (see below)
 });
 defer server.deinit();
-try server.bind();                    // boundAddress() valid from here
+server.bind() catch |err| {           // boundAddress() valid from here
+    // BindError is still just { BadAddress, ListenFailed, Canceled }; the
+    // underlying std.Io.net error (e.g. "AddressInUse") survives in
+    // bindErrorName() for logging, since the tag alone often is not enough.
+    std.log.err("bind failed: {s} ({s})", .{ @errorName(err), server.bindErrorName() orelse "?" });
+    return err;
+};
 try server.serve();                   // accept loop; or server.listen() = bind+serve
 // From another thread: server.shutdown() → serve() drains and returns;
 // server.activeConnections() = admitted, not-yet-closed connections.
@@ -290,16 +296,25 @@ HEADERS frame is materialized into it once the body ends.
   use identity-until-close instead of chunked.
 - **Response framing (Go-like):** bodies that fit the response buffer
   (`response_buffer_size`, default 4 KiB) get an exact auto
-  `Content-Length`; larger bodies switch to chunked streaming. A
-  `Content-Length` set via `setHeader` selects identity framing and the
-  byte count is enforced (mismatch → connection close; before the head is
-  sent it degrades to a 500). HEAD/204/304 never send a body; HEAD mirrors
-  GET's Content-Length when known.
+  `Content-Length`; larger bodies switch to chunked streaming — **silently**,
+  which has bitten a consumer whose own minimal HTTP client on the other end
+  does not decode `Transfer-Encoding: chunked`. If a response can exceed the
+  buffer and the peer is such a client, set an explicit
+  `rw.setHeader("Content-Length", …)` on it instead of relying on the auto
+  framing. A `Content-Length` set via `setHeader` selects identity framing
+  and the byte count is enforced (mismatch → connection close; before the
+  head is sent it degrades to a 500). HEAD/204/304 never send a body; HEAD
+  mirrors GET's Content-Length when known.
 - **Auto headers:** `Date` (IMF-fixdate) + `Server` on every response,
   overridable via `setHeader`; `Connection`/`Transfer-Encoding` are managed
   by the writer (`setHeader("Connection", "close")` requests a close,
   Transfer-Encoding is ignored). `setHeader` replaces same-named headers —
-  repeated fields (multiple Set-Cookie) are not supported yet.
+  repeated fields (multiple Set-Cookie) are not supported yet. To omit
+  either auto header instead of overriding it, set `Options.server_name =
+  null` (`Server`) — omits `Server`; `.emit_date = false` — omits `Date`.
+  Both default to their historical always-on behavior, and both are also
+  available on the socket-free codec (`StreamOptions.server_name = null` /
+  `.now = null`), which the socket path now agrees with byte-for-byte.
 - **Errors:** malformed head → 400; oversized head → 431; over-long
   request line → 414; oversized body → 413; unsupported HTTP version →
   505; unknown method token → 501; missing Host on 1.1 → 400;
@@ -415,6 +430,13 @@ cap, the server answers 413 (if nothing was sent) and closes. Bodies are
 never buffered — memory per connection is a fixed buffer slab regardless
 of body size; the cap protects body-buffering handlers and bandwidth, not
 server memory.
+
+**`max_body_bytes` defaults to 1 MiB — set it to `null` for any route that
+streams or accepts real uploads,** or every request body over 1 MiB gets a
+413 before the handler ever runs. This is the single most likely first-run
+failure for a new consumer moving real traffic onto this server. It applies
+to `enable_h2c` requests identically (`Server` forwards the same value into
+the HTTP/2 path), so raising or nulling it once covers both protocols.
 
 **Timeouts** (poll(2)-based; compile-time disabled on platforms without
 poll — then none of these fire):

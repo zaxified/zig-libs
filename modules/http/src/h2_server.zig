@@ -204,7 +204,17 @@ pub const Options = struct {
     /// the h2 shape of the h1 431).
     max_header_bytes: usize = 16 * 1024,
     /// Request body cap (h1 `max_body_bytes` parity): a body crossing it
-    /// answers 413 and the connection closes. null = unlimited.
+    /// answers 413 and the connection closes. null = unlimited — this
+    /// struct is the low-level, socket-free codec layer (parity with
+    /// `Server.StreamOptions`, which defaults the same field to null for
+    /// the same reason: a plain-codec/BYO-TLS caller composing this
+    /// directly should not be silently capped). A `Server`-owned h2c
+    /// connection (`Options.enable_h2c`) does NOT get this default — see
+    /// `Server.Options.max_body_bytes`'s doc: `connMain` forwards the
+    /// hardened `1 << 20` (or whatever the caller set) into this field, so
+    /// h1 and h2 are capped identically when driven through `Server`. Only
+    /// a caller invoking `serve`/`serveStream` here directly (BYO-TLS) sees
+    /// this null default.
     max_body_bytes: ?u64 = null,
     /// `ResponseWriter` body-buffer size (h1 parity; framing is re-derived
     /// here so it only affects gzip's buffered-vs-streaming decision).

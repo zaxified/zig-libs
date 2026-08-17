@@ -65,6 +65,29 @@ lalinsky/dusty (1.1 client), Go net/http (redirect semantics, server shape, gzip
 7230/9110 (1.1), 7541 (HPACK), 9113 (h2), 7301 (ALPN), 7233 (Range), 9110 §8.8/12 (conditional/
 content-negotiation), 7578 (multipart); TLS via `std.crypto.tls`. See NOTICE.
 
+**Auto-header suppression now agrees between the socket and socket-free
+paths.** `StreamOptions.server_name`/`.now` were always `?[]const u8`/`?Now`
+(null = omit), because `serveStream` is the composable codec layer a caller
+can drive with no `Server` at all. `Server.Options.server_name` was
+non-optional and `connMain` always synthesized a `Now`, so a caller could
+not omit `Server`/`Date` through `Server` no matter what they passed — the
+socket-owning entry point was structurally unable to reach a state the
+socket-free one always could. `Options.server_name` is now `?[]const u8`
+(null = omit, default unchanged) and `Options.emit_date: bool = true`
+governs the same suppression `StreamOptions.now = null` gives directly — a
+plain bool rather than exposing `StreamOptions.Now` on `Options`, since
+`Server` only ever wants "the server's own clock, or nothing" and never a
+caller-supplied clock source at this layer.
+
+**`Server.bind` no longer discards the underlying failure.** `BindError`
+stays the two-tag `{ BadAddress, ListenFailed, Canceled }` shape (unchanged,
+so no exhaustive `switch` breaks), but the `std.Io.net` error each tag
+collapsed — `IpAddress.parse`'s `ParseError` or `IpAddress.listen`'s
+`ListenError` (e.g. `AddressInUse`) — now survives in `last_bind_error`,
+read via `bindErrorName()`. Same shape as `probe.ConnectOutcome.err_name`
+and for the same reason: `std.Io.net` reports an `anyerror`, not an errno,
+so there is no numeric code to carry, only `@errorName`'s static string.
+
 ## Threat model / out of scope
 Hardened for direct internet exposure (no reverse proxy required):
 - **Request smuggling:** duplicate/disagreeing Content-Length → 400; Content-Length **and**
@@ -96,6 +119,13 @@ HPACK vs RFC 7541 Appendix C vectors (bytes + decoded fields + dynamic-table sta
 offline scripted client↔server pipe exchanges + h2spec-style negatives; h2 DoS attack-sim tests
 (rapid-reset proves no handler runs); serveStream goldens for conditional/range/multipart/content-
 neg; smuggling/timeout/size negatives; a BYO-TLS in-memory dogfood (connectH2Over ↔ serveStream).
+Auto-header suppression: byte-exact `serveStream` goldens for `server_name = null`, `now = null`
+and both together, plus a live-loopback `Server` pair proving `Options` defaults put both headers
+on the wire and `Options{ server_name = null, emit_date = false }` produces a head byte-identical
+to the socket-free suppressed golden — the agreement between the two entry points is the assertion,
+not either suppression alone. `bind`: a forced `AddressInUse` (second listener on an already-bound
+port) pins `bindErrorName()` to the exact underlying tag; a forced parse failure asserts a name
+survives without pinning which std tag it is.
 **Trailers are anchored against a live third party, not only against ourselves**
 (`src/curl_interop.zig`): a real `Server` on loopback answered by `curl` 8.18 / nghttp2 1.68 on both
 `--http1.1` and `--http2-prior-knowledge`, asserting curl's own header dump carries the trailer
@@ -177,6 +207,33 @@ pending a native std TLS server.
 `std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.
 
 ## Known limits a consumer should size for
+
+**`Options.max_body_bytes` defaults to 1 MiB.** Any route that accepts a real
+upload (no natural size ceiling) must set it to `null` or every body over
+1 MiB gets a 413 before the handler runs — the single most likely first-run
+failure for a new consumer, and documented in README where one meets the
+option. The h1 and h2 *struct-level* defaults look asymmetric —
+`Server.Options.max_body_bytes` is `1 << 20`, `h2_server.Options.max_body_bytes`
+is `null` — but this is not a live behavioral gap for a `Server`-based
+consumer: `connMain` forwards `Options.max_body_bytes` verbatim into
+`h2_server.Options` when dispatching an `enable_h2c` connection, so h1 and h2
+are capped identically by default when both are driven through `Server`. The
+null default on `h2_server.Options` exists for the same reason
+`StreamOptions.max_body_bytes` is also null — both are the low-level,
+socket-free/composable codec layer `Server` wraps, meant to stay permissive
+for a caller composing them directly (tests, or a BYO-TLS h2 server that
+never goes through `Server` at all) rather than a caller silently inheriting
+a cap they did not ask for. That direct-`h2_server` caller — unlike a
+`Server`-based one — does see an uncapped body by default; this is
+established from the forwarding code in `Server.connMain`, not assumed.
+
+**A response over `response_buffer_size` (default 4 KiB) switches to
+chunked framing silently** — correct per RFC 9112, and it has bitten a
+consumer across a component boundary: a minimal hand-rolled HTTP client on
+the other end that does not decode `Transfer-Encoding: chunked` needs an
+explicit `Content-Length` on every reply from a route whose body can exceed
+the buffer, set via `rw.setHeader("Content-Length", …)` rather than relying
+on the auto framing.
 
 **The header budget is per-middleware, never composite.** `http` allows 4096 B of
 response headers, `security-headers` accepts a CSP up to 3863 B and `cookies`
