@@ -33,7 +33,13 @@ address. Sits alongside the rest of the `netaddr`-based network family.
   - **ERROR-CODE** (`0x0009`) → `{ code = class*100 + number, reason }`.
 - **`query`** (optional) — sends one Binding request over `std.Io.net` UDP and
   returns the reflexive address; a convenience only, the pure codec is the real
-  interface. Its unit test skips (needs a reachable server).
+  interface. `QueryOptions.timeout_ms` bounds the wait for a reply (`0` = wait
+  indefinitely, the default — matches `query`'s original unbounded behavior,
+  so existing callers are unaffected); on expiry it returns `error.Timeout`,
+  mirroring `sntp.query`'s identical option shape for the same UDP
+  request/response bound. Covered by two loopback-only tests — a
+  no-responder timeout and a normal answered exchange — neither needs a live
+  network.
 
 ## Tests
 

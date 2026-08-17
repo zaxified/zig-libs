@@ -492,6 +492,18 @@ fn decodeErrorCode(value: []const u8) DecodeError!ErrorCode {
 
 // ── optional live query over std.Io.net UDP ──────────────────────────────────
 
+/// Options for `query`. Shape mirrors `sntp.QueryOptions` — same field name,
+/// same unit, same "0 = wait indefinitely" convention — since both are one
+/// UDP request/response exchange with the identical bounding need.
+pub const QueryOptions = struct {
+    /// Receive budget; 0 = wait indefinitely. Default is 0, NOT `sntp`'s
+    /// 5000 ms: this preserves `query`'s original unbounded behavior so
+    /// existing callers of the collection are unaffected by this option's
+    /// introduction (three consumers pin this collection). Pass an explicit
+    /// non-zero value for a bounded probe.
+    timeout_ms: u32 = 0,
+};
+
 /// Send one Binding request to `server` over UDP and return the reflexive
 /// address the server reflects back (its view of our public transport address).
 ///
@@ -499,13 +511,20 @@ fn decodeErrorCode(value: []const u8) DecodeError!ErrorCode {
 /// address; the pure `Builder` / `Message` API above is the real interface and
 /// needs no `Io`. `buf` receives the raw response bytes and must outlive the
 /// returned `AddressPort` only if you keep the (unrelated) reason slices — the
-/// address is copied out. The tests never exercise this path (it needs a
-/// reachable server); a `query` unit test skips via `error.SkipZigTest`.
+/// address is copied out.
+///
+/// `options.timeout_ms` bounds the wait for the reply (0 = wait indefinitely,
+/// the default — matching the original unbounded behavior of this function).
+/// On expiry this returns `error.Timeout`, the same error name `sntp.query`
+/// uses for the same condition. Exercised by two loopback tests below (a
+/// dark/no-responder timeout, and a normal answered exchange) — neither needs
+/// live network access.
 pub fn query(
     io: std.Io,
     server: std.Io.net.IpAddress,
     txid: TransactionId,
     buf: []u8,
+    options: QueryOptions,
 ) !AddressPort {
     const IpAddress = std.Io.net.IpAddress;
     const local: IpAddress = switch (server) {
@@ -519,10 +538,19 @@ pub fn query(
     const req = try bindingRequest(txid, &req_buf);
     try sock.send(io, &server, req);
 
-    const msg = try sock.receive(io, buf);
+    const deadline = deadlineFromMs(io, options.timeout_ms);
+    const msg = try sock.receiveTimeout(io, buf, deadline);
     const parsed = try decode(msg.data);
     if (!std.mem.eql(u8, &parsed.transaction_id, &txid)) return error.TransactionMismatch;
     return (try parsed.mappedAddress()) orelse error.NoMappedAddress;
+}
+
+/// Turn a millisecond budget into an `Io.Timeout` deadline; `0` means wait
+/// indefinitely. Mirrors `sntp`'s helper of the same name and shape.
+fn deadlineFromMs(io: std.Io, ms: u32) std.Io.Timeout {
+    if (ms == 0) return .none;
+    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+    return t.toDeadline(io);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -867,10 +895,116 @@ test "decode: length near u16 max does not overflow header_len + length" {
     try testing.expectEqual(length, msg.length);
 }
 
-test "query() type-checks (skipped — needs a live STUN server and Io)" {
-    // Force semantic analysis of the optional live path without any I/O.
-    _ = &query;
-    return error.SkipZigTest;
+// ── query bounded-wait tests (loopback only, no live network needed) ───────
+//
+// Before this, `query` called `sock.receive` with no timeout at all — a
+// consumer that needed a bounded probe against a dark/unresponsive STUN
+// server could not use it and kept its own UDP plumbing instead. `timeout_ms`
+// (mirroring `sntp.QueryOptions`) fixes that; these two tests prove the fix
+// without needing internet access: a "dark server" is just a UDP socket this
+// process itself binds and never answers from.
+
+/// Deadlock guard: panics if `done` is not set within `timeout_ms`, converting
+/// a regression that makes `query` ignore its bound into a loud, bounded test
+/// failure instead of a silent CI hang. Same shape as `workerpool`'s test
+/// watchdog (`modules/workerpool/src/root.zig`).
+const Watchdog = struct {
+    io: std.Io,
+    timeout_ms: i64,
+    done: std.atomic.Value(u32) = .init(0),
+    thread: std.Thread = undefined,
+
+    fn run(wd: *Watchdog) void {
+        const start_ns = std.Io.Timestamp.now(wd.io, .awake).nanoseconds;
+        const deadline = start_ns + @as(i96, wd.timeout_ms) * std.time.ns_per_ms;
+        while (wd.done.load(.seq_cst) == 0) {
+            wd.io.futexWaitTimeout(u32, &wd.done.raw, 0, .{ .duration = .{
+                .raw = .fromMilliseconds(50),
+                .clock = .awake,
+            } }) catch {};
+            if (wd.done.load(.seq_cst) != 0) return;
+            if (std.Io.Timestamp.now(wd.io, .awake).nanoseconds >= deadline)
+                @panic("stun query test watchdog: no-responder query did not return within the bound (regressed to unbounded receive?)");
+        }
+    }
+    fn start(wd: *Watchdog) !void {
+        wd.thread = try std.Thread.spawn(.{}, run, .{wd});
+    }
+    fn finish(wd: *Watchdog) void {
+        wd.done.store(1, .seq_cst);
+        wd.io.futexWake(u32, &wd.done.raw, std.math.maxInt(u32));
+        wd.thread.join();
+    }
+};
+
+test "query: no responder returns error.Timeout, bounded (cannot hang the suite)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A live but silent UDP endpoint: this process binds it but never calls
+    // receive on it or replies — the "dark server" a bounded probe needs to
+    // survive.
+    const dark_local = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var dark = try dark_local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer dark.close(io);
+
+    // Watchdog bounds the test itself: if `query` regressed to the old
+    // unbounded `sock.receive` and ignored `timeout_ms`, this panics loudly
+    // well before the test binary would otherwise hang forever.
+    var wd: Watchdog = .{ .io = io, .timeout_ms = 5000 };
+    try wd.start();
+    defer wd.finish();
+
+    var buf: [512]u8 = undefined;
+    const txid: TransactionId = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const result = query(io, dark.address, txid, &buf, .{ .timeout_ms = 150 });
+    try testing.expectError(error.Timeout, result);
+}
+
+/// Context for the loopback fake-server thread used by the answered-path
+/// test below.
+const FakeStunServer = struct {
+    io: std.Io,
+    sock: std.Io.net.Socket,
+    reply_ip: netaddr.Ip,
+    reply_port: u16,
+
+    /// Receive one Binding request, echo its transaction id back inside a
+    /// success response carrying `reply_ip`/`reply_port` as an XOR-MAPPED-ADDRESS.
+    fn respondOnce(self: *FakeStunServer) void {
+        var req_buf: [512]u8 = undefined;
+        const incoming = self.sock.receive(self.io, &req_buf) catch return;
+        const req_msg = decode(incoming.data) catch return;
+
+        var resp_buf: [64]u8 = undefined;
+        var b = Builder.init(&resp_buf, .success_response, .binding, req_msg.transaction_id) catch return;
+        b.addMappedAddress(self.reply_ip, self.reply_port, true) catch return;
+        self.sock.send(self.io, &incoming.from, b.finish()) catch return;
+    }
+};
+
+test "query: normal answered path still works, unaffected by the bound" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bind_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const server_sock = try bind_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_sock.close(io);
+
+    const want_ip = netaddr.parseIp("203.0.113.9").?;
+    var fake: FakeStunServer = .{ .io = io, .sock = server_sock, .reply_ip = want_ip, .reply_port = 4989 };
+    var th = try std.Thread.spawn(.{}, FakeStunServer.respondOnce, .{&fake});
+    defer th.join();
+
+    var buf: [512]u8 = undefined;
+    const txid: TransactionId = .{ 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 22 };
+    // A generous but still-bounded timeout — the point of this test is that
+    // an answered exchange behaves exactly as before, not that it is fast.
+    const result = try query(io, server_sock.address, txid, &buf, .{ .timeout_ms = 5000 });
+    try testing.expect(result.ip.eql(want_ip));
+    try testing.expectEqual(@as(u16, 4989), result.port);
 }
 
 test "fuzz: decode + every accessor never crash on arbitrary bytes" {
