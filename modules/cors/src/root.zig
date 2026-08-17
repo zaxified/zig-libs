@@ -146,6 +146,25 @@ pub const Options = struct {
     /// preflight, in seconds. null (default) = omit the header (browsers
     /// then use their own default, typically 5 s); 0 = disable caching.
     max_age_s: ?u32 = null,
+    /// **Deviation from spec-correct CORS — off by default.** See SPEC.md
+    /// "Unconditional wildcard CORS" for the full rationale. Requires
+    /// `allowed_origins = .any` (`Cors.init` rejects any other combination
+    /// with `error.UnconditionalWildcardRequiresAnyOrigin`): this is not a
+    /// generic "skip the gates" switch, it is the one named posture "wide
+    /// open, always" that lets an existing always-open API adopt this
+    /// module without changing what's on the wire. When true:
+    ///   - every actual (non-preflight) response gets
+    ///     `Access-Control-Allow-Origin: *`, even when `Origin` is absent or
+    ///     the method isn't in `allowed_methods`;
+    ///   - every `OPTIONS` request is intercepted and answered `204` with
+    ///     the same wildcard header — not only a true preflight (one that
+    ///     carries `Access-Control-Request-Method`).
+    /// The two behaviours are one field, not two: both are facets of the
+    /// same legacy posture (a CORS gate that never conditioned on `Origin`),
+    /// and a consumer enabling only one half would still change the wire
+    /// shape for the other kind of request — exactly the problem this
+    /// option exists to avoid.
+    allow_unconditional_wildcard: bool = false,
 };
 
 pub const InitError = error{
@@ -154,6 +173,11 @@ pub const InitError = error{
     /// spec forbids `Access-Control-Allow-Origin: *` with credentials.
     /// List the origins (or use a predicate) instead.
     CredentialsWithWildcardOrigin,
+    /// `allow_unconditional_wildcard = true` with `allowed_origins != .any`:
+    /// the option means "wildcard on every response" — it has nothing to
+    /// gate on without `.any`, so it is rejected rather than silently
+    /// downgraded to a no-op.
+    UnconditionalWildcardRequiresAnyOrigin,
 };
 
 // Digits of maxInt(u32) — the precomputed Access-Control-Max-Age value.
@@ -186,6 +210,8 @@ pub const Cors = struct {
     pub fn init(gpa: Allocator, options: Options) InitError!Cors {
         if (options.allowed_origins == .any and options.allow_credentials)
             return error.CredentialsWithWildcardOrigin;
+        if (options.allow_unconditional_wildcard and options.allowed_origins != .any)
+            return error.UnconditionalWildcardRequiresAnyOrigin;
         if (std.debug.runtime_safety) {
             switch (options.allowed_origins) {
                 .list => |l| for (l) |o| assertValueClean(o),
@@ -251,10 +277,25 @@ pub const Cors = struct {
         const res = ctx.res;
         res.setStatus(204);
         try res.setHeader("Vary", preflight_vary);
+
+        // The `allow_unconditional_wildcard` deviation: every intercepted
+        // OPTIONS — preflight or bare — gets the wildcard, unconditionally.
+        // `allowed_origins = .any` is enforced at init, so there is exactly
+        // one value to emit and no origin/method/header gate to run; a bare
+        // OPTIONS (no ACRM) only ever reaches here because of this flag
+        // (see `middlewareRun`), and it has no requested method/headers to
+        // gate on regardless.
+        if (c.options.allow_unconditional_wildcard) {
+            try res.setHeader("Access-Control-Allow-Origin", "*");
+            return;
+        }
+
         emit: {
             const origin = req.header("Origin") orelse break :emit;
             const acao = c.allowOriginValue(origin) orelse break :emit;
-            // Present by the preflight definition in middlewareRun.
+            // Present: the `allow_unconditional_wildcard` early-return above
+            // is the only way to reach this block with ACRM possibly absent,
+            // and it already returned.
             const req_method = req.header("Access-Control-Request-Method").?;
             if (!c.methodTokenAllowed(req_method)) break :emit;
             const acrh = req.header("Access-Control-Request-Headers");
@@ -296,7 +337,30 @@ pub const Cors = struct {
     /// Actual request: set the response CORS headers when Origin + method
     /// pass; otherwise leave the response untouched. The chain runs either
     /// way (CORS withholds readability, it never blocks handling).
-    fn applyActual(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+    ///
+    /// **Public on purpose, beyond `middlewareRun`'s automatic call before
+    /// `next.run`.** `cors` sets these headers *before* the handler chain
+    /// runs (see SPEC.md "Header timing vs. `ResponseWriter.reset()`" for
+    /// why: setting them after `next.run` would error `HeadersSent` on any
+    /// handler that has already started streaming). A response-rewriting
+    /// middleware that calls `ResponseWriter.reset()` *after* `next.run` —
+    /// e.g. to replace a `text/plain` denial body with JSON — wipes
+    /// everything `cors` set, `reset` included, since it clears the header
+    /// list wholesale. Call `your_cors.applyActual(ctx.req, ctx.res)` again
+    /// right after your `reset()`, before writing the new body: it re-runs
+    /// the exact same gate (idempotent, safe to call twice).
+    pub fn applyActual(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+        if (c.options.allow_unconditional_wildcard) {
+            // Deviation (SPEC.md): every actual response gets the wildcard,
+            // regardless of Origin presence or the method gate.
+            // `allow_credentials` is unreachable here — rejected together
+            // with `.any` at init — so there is nothing to gate on it either.
+            try res.setHeader("Access-Control-Allow-Origin", "*");
+            if (c.expose_headers_value.len != 0)
+                try res.setHeader("Access-Control-Expose-Headers", c.expose_headers_value);
+            return;
+        }
+
         const origin = req.header("Origin") orelse return;
         const acao = c.allowOriginValue(origin) orelse return;
         // rs/cors gate: an actual method outside allowed_methods gets no
@@ -362,7 +426,10 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const c: *const Cors = @ptrCast(@alignCast(state.?));
     // A preflight is OPTIONS *with* Access-Control-Request-Method — a plain
     // OPTIONS request (no ACRM) is an actual request and routes normally.
-    if (ctx.req.method == .options and ctx.req.header("Access-Control-Request-Method") != null)
+    // `allow_unconditional_wildcard` deviates: it treats EVERY OPTIONS as
+    // interceptable, ACRM or not (see the module doc + SPEC.md).
+    if (ctx.req.method == .options and
+        (ctx.req.header("Access-Control-Request-Method") != null or c.options.allow_unconditional_wildcard))
         return c.handlePreflight(ctx); // short-circuit: next is never called
     try c.applyActual(ctx.req, ctx.res);
     return next.run(ctx);
@@ -853,6 +920,89 @@ test "actual: method outside allowed_methods gets no CORS headers (rs/cors gate)
     try expectNoCorsHeaders(got);
     const got2 = runWire(&r, wire("GET", "/t", "Origin: https://app.example\r\n"), &buf);
     try expectHeaderLine(got2, "Access-Control-Allow-Origin: https://app.example");
+}
+
+test "allow_unconditional_wildcard requires .any (rejected at init otherwise)" {
+    try testing.expectError(error.UnconditionalWildcardRequiresAnyOrigin, Cors.init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allow_unconditional_wildcard = true,
+    }));
+    try testing.expectError(error.UnconditionalWildcardRequiresAnyOrigin, Cors.init(testing.allocator, .{
+        .allow_unconditional_wildcard = true, // default allowed_origins = .none
+    }));
+    // The .any pairing is what it exists for.
+    var ok: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .any,
+        .allow_unconditional_wildcard = true,
+    });
+    ok.deinit();
+}
+
+test "actual: allow_unconditional_wildcard emits the wildcard on every response, Origin absent or not (default withholds it)" {
+    var buf: [2048]u8 = undefined;
+    { // default posture: absent Origin is a same-origin/non-browser request
+        // and gets nothing, same as the existing "absent Origin" coverage —
+        // reproduced here so the two postures sit side by side.
+        var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .any });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWire(&r, wire("GET", "/t", ""), &buf);
+        try expectStatus(got, "200");
+        try expectNoCorsHeaders(got);
+    }
+    { // allow_unconditional_wildcard: the deviation — every response gets it.
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .any,
+            .allow_unconditional_wildcard = true,
+            .exposed_headers = &.{"X-Request-Id"},
+        });
+        defer c.deinit();
+        var flag: Flag = .{};
+        var r = try testRouter(&c, &flag);
+        defer r.deinit();
+        const got = runWire(&r, wire("GET", "/t", ""), &buf);
+        try expectStatus(got, "200");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: *");
+        try expectHeaderLine(got, "Access-Control-Expose-Headers: X-Request-Id");
+        try testing.expect(flag.hit); // the chain still runs
+        // A literal `*` never varies, deviation or not.
+        try expectNoHeader(got, "Vary");
+    }
+}
+
+test "OPTIONS interception: default requires Access-Control-Request-Method; allow_unconditional_wildcard intercepts every OPTIONS" {
+    var buf: [2048]u8 = undefined;
+    { // default: a bare OPTIONS (no ACRM) is not a preflight, routes normally.
+        var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .any });
+        defer c.deinit();
+        var flag: Flag = .{};
+        var r = try testRouter(&c, &flag);
+        defer r.deinit();
+        const got = runWire(&r, wire("OPTIONS", "/t", ""), &buf);
+        try expectStatus(got, "405"); // no OPTIONS route registered on /t
+        try testing.expect(!flag.hit); // OPTIONS isn't GET/POST either
+    }
+    { // allow_unconditional_wildcard: a bare OPTIONS is intercepted too.
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .any,
+            .allow_unconditional_wildcard = true,
+        });
+        defer c.deinit();
+        var flag: Flag = .{};
+        var r = try testRouter(&c, &flag);
+        defer r.deinit();
+        const got = runWire(&r, wire("OPTIONS", "/t", ""), &buf);
+        try expectStatus(got, "204");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: *");
+        try testing.expect(!flag.hit); // short-circuited like a real preflight
+
+        // A true preflight (ACRM present) still works, through the same
+        // early-return — no origin/method/header gate to fail either.
+        const got2 = runWire(&r, wire("OPTIONS", "/t", "Access-Control-Request-Method: POST\r\n"), &buf);
+        try expectStatus(got2, "204");
+        try expectHeaderLine(got2, "Access-Control-Allow-Origin: *");
+    }
 }
 
 fn allowDevOrigins(_: ?*anyopaque, origin: []const u8) bool {

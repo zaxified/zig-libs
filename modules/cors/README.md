@@ -85,6 +85,42 @@ instead of silently downgrading. If you genuinely need reflect-any with
 credentials, write a `.predicate` that returns true — an explicit,
 greppable opt-in to the footgun.
 
+## Unconditional wildcard CORS (`allow_unconditional_wildcard`, opt-in deviation)
+
+Everything above is spec-correct CORS and stays the default: no `Origin`
+header means no CORS headers, and a plain `OPTIONS` (no
+`Access-Control-Request-Method`) is not a preflight — it routes normally.
+That is the wrong shape for exactly one migration case: an existing API
+that has always answered *every* `OPTIONS` with 204 and put
+`Access-Control-Allow-Origin: *` on *every* response, and cannot change what
+is on the wire to adopt this module.
+
+```zig
+var c = try cors.Cors.init(gpa, .{
+    .allowed_origins = .any,               // required — see below
+    .allow_unconditional_wildcard = true,  // the deviation, spelled out
+});
+```
+
+The field name says what it costs: turning it on means leaving spec-correct
+CORS behind, not just enabling a feature. It requires `allowed_origins =
+.any` — any other value fails `Cors.init` with
+`error.UnconditionalWildcardRequiresAnyOrigin`, since the option's whole
+meaning is "wildcard on every response" and nothing else is coherent to
+gate on. Once set:
+
+- every actual (non-preflight) response gets `Access-Control-Allow-Origin: *`,
+  `Origin` present or not, method allowed or not;
+- every `OPTIONS` request — not just a true preflight — is intercepted and
+  answered `204` with the same wildcard header.
+
+Both behaviours live behind the one field rather than two, on purpose: they
+are two symptoms of the same legacy posture (a CORS gate that never
+conditioned on `Origin`), and enabling only one half would still change the
+wire shape for the other kind of request — the exact problem the option
+exists to avoid. See SPEC.md "Unconditional wildcard CORS" for the full
+reasoning.
+
 ## Semantics (rs/cors)
 
 - **Preflight** = `OPTIONS` **with** `Access-Control-Request-Method`
@@ -119,6 +155,42 @@ that sets `Vary` on a CORS route must include `Origin` in its own list**
 `OPTIONS` routes) and `Access-Control-Allow-Private-Network` are out of
 scope for now.
 
+## Header timing vs. `ResponseWriter.reset()`
+
+`cors` sets its actual-request headers **before** `next.run` — i.e. before
+your handler (and any inner middleware) runs. If an *outer* middleware
+does response-rewriting work **after** `next.run` — e.g. to replace a
+`text/plain` denial body with JSON — and calls `ResponseWriter.reset()` to
+do it, `reset()` clears the whole header list, `cors`'s included. Nothing
+puts them back automatically: `cors` cannot see the reset happen, and
+`http.Server.ResponseWriter` has no snapshot/restore.
+
+**The rule:** if your outer middleware calls `reset()` after `next.run`,
+call `your_cors.applyActual(ctx.req, ctx.res)` again immediately
+afterward, before writing the new body:
+
+```zig
+fn rewriteDenials(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    try next.run(ctx);
+    if (yourDenialCondition(ctx)) { // e.g. the handler set a plain-text 403
+        try ctx.res.reset();
+        try my_cors.applyActual(ctx.req, ctx.res); // re-apply — reset() wiped it
+        ctx.res.setStatus(403);
+        try ctx.res.setHeader("Content-Type", "application/json");
+        try ctx.res.writeAll("{\"error\":\"forbidden\"}");
+    }
+}
+```
+
+`applyActual` re-runs the exact same origin/method gate `cors` used the
+first time — it is idempotent, safe to call twice, and stays correct if
+`cors`'s gate logic ever changes (your middleware does not reimplement it).
+This does not apply to preflights: a preflight never calls `next.run` at
+all (`cors` short-circuits it), so there is no downstream middleware to
+wrap it and nothing to reapply. See SPEC.md "Header timing vs.
+`ResponseWriter.reset()`" for why the ordering itself was not changed
+instead.
+
 ## Verification
 
 `zig build test-cors` — offline goldens over the socket-free
@@ -131,7 +203,10 @@ headers; actual-request echo + `Vary: Origin` + credentials + exposed
 headers; `.any` → `*` without `Vary`; disallowed/absent Origin and `.none`
 passthrough with the handler still running; the actual-request method
 gate; predicate origins on both request shapes; `*`+credentials init
-rejection; `max_age_s` 0/max formatting and the join precomputations),
+rejection; `allow_unconditional_wildcard` requires `.any` at init and, once
+set, emits the wildcard on an Origin-absent request and intercepts a bare
+`OPTIONS` with 204 (both sit beside the unchanged default in the same
+test); `max_age_s` 0/max formatting and the join precomputations),
 plus an in-process integration run (`router` + `http.Server` +
 `http.Client` over loopback: preflight `OPTIONS` → 204 + CORS headers with
 the handler never invoked; `GET` with an allowed `Origin` →

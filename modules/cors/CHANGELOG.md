@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — New opt-in `Options.allow_unconditional_wildcard` (default `false`, unchanged
+  behavior) — a named, deliberate deviation from spec-correct CORS for one migration shape: an
+  existing API that has always answered every `OPTIONS` with 204 and put
+  `Access-Control-Allow-Origin: *` on every response, and cannot change what's on the wire to adopt
+  this module. Requires `allowed_origins = .any` (`Cors.init` rejects any other combination with the
+  new `error.UnconditionalWildcardRequiresAnyOrigin`). `applyActual` is now `pub` — it was always
+  called automatically before `next.run`, and is now also documented as the concrete fix for an
+  outer response-rewriting middleware that calls `ResponseWriter.reset()` after `next.run` and needs
+  to re-apply the CORS headers `reset()` wiped (see README's "Header timing vs.
+  `ResponseWriter.reset()`" and SPEC.md for why the default ordering itself was evaluated and kept).
 - **2026-08-13** — **BEHAVIOURAL, not breaking** — the preflight short-circuit no longer
   forces an early `ResponseWriter.end()`. Unlike the sites this mirrors
   (`ratelimit`, `throttle`), none of `handlePreflight`'s header values ever
