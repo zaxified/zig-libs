@@ -63,6 +63,47 @@ A third, smaller one: the kernel sets `NLM_F_MULTI` even on the single-message a
 non-dump `IPCTNL_MSG_CT_GET`, so that flag cannot be used to tell a GET reply from a dump. The
 module matches replies on `(portid, seq)` instead; a golden test pins the observed flag word.
 
+### EINVAL vs subsystem absent
+
+`nfnetlink_rcv_msg` looks a message's subsystem id up in a table and answers plain `EINVAL` when
+nothing is registered for it — the *identical* errno a well-formed request's own `.doit`/`.dumpit`
+callback returns for genuinely malformed content. Stock OpenWRT 25.12.4 is exactly this case: it
+ships `nfnetlink.ko` (nf_tables needs it) but never builds/loads `nf_conntrack_netlink` at all, so
+every ctnetlink request answers `EINVAL` regardless of shape. A consumer's first VM run of a
+migrated `flush` failed with an opaque `error.InvalidRequest` and needed a `modprobe`
+investigation to learn the real cause — and for a *mutating* op, reporting "malformed" instead of
+"not present" is a real operational bug, not just an unclear message.
+
+**Remapped to `error.SubsystemUnavailable` — `dump`/`dumpEach` and `flush` only.** Their requests
+(`buildDumpRequest(seq, family)`, `buildFlushRequest(seq, family)`) carry the `Family` enum and
+nothing else — no caller-controlled content reaches the kernel — so they are well-formed by
+construction and `EINVAL` on them cannot mean "you sent nonsense". `dumpFailure` (used by both
+`dumpOver` and `dumpEachOver`) checks the raw NLMSG_ERROR code for exactly `EINVAL` before it would
+otherwise fold into `error.InvalidRequest` via `netlink.errorFromCode` (which also folds
+`EOPNOTSUPP` — left alone, since that fold is unrelated to this ambiguity). `flushFailure` remaps
+`flush`'s already-mapped `error.InvalidRequest` from `netlink.writeErrorFromCode`, which — unlike
+the dump path's mapper — puts `EOPNOTSUPP`/`EAFNOSUPPORT`/`EPROTONOSUPPORT` on a *separate*
+`error.NotSupported`, so `InvalidRequest` out of it is `EINVAL` alone; no raw code needed there.
+
+**Left ambiguous, deliberately — `get`, `delete`, `insert`, `update`.** Every one of these sends a
+caller-supplied `Tuple` (`get`/`delete`) or `NewSpec` (`insert`/`update`), and the kernel's own
+tuple/attribute parser can answer `EINVAL` for content that is syntactically valid TLVs but
+semantically wrong — the documented case is `NewSpec.timeout == null` on an insert, which the
+kernel rejects with `EINVAL` (see `NewSpec.status`'s sibling doc comment on `.timeout`). A module
+that remapped `EINVAL` here to `SubsystemUnavailable` would be wrong exactly when a caller left out
+a mandatory field, which is worse than the ambiguity it would "fix". These four keep reporting
+`error.InvalidRequest`/`error.NotSupported` as before this change.
+
+**Tested by:** `flushFailure`/`dumpFailure` are ordinary functions, so the remapped paths are
+pinned directly — `dumpOver`/`dumpEachOver` accept `transport: anytype` already (the seam their own
+`NLM_F_DUMP_INTR`-restart tests use), so an `NLMSG_ERROR{-EINVAL}` datagram is scripted through
+`ScriptedTransport` exactly like the existing EPERM test. `flush`'s ACK has no equivalent seam — it
+delegates its whole reply loop to `netlink.Socket.awaitAckStrict` (the transport-unification DRY
+candidate above), so `flushFailure` is unit-tested directly as the pure mapping it is, the same
+style `netlink`'s own `errorFromCode`/`writeErrorFromCode` tests use. The ambiguous `get` path is
+pinned too, on the same `ScriptedTransport`+`EINVAL` datagram, asserting it still yields
+`error.InvalidRequest` unchanged.
+
 ### Decoder safety
 
 The decoder is the module's whole attack surface: it consumes kernel-supplied bytes that a

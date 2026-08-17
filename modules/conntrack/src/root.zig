@@ -148,7 +148,17 @@ pub const RecvError = error{
 
 /// Errors of the multi-part dump path. A superset of `netlink.DumpError`, so
 /// `netlink.errorFromCode` is reused verbatim.
-pub const DumpError = netlink.DumpError || RecvError || SendError;
+///
+/// `SubsystemUnavailable` is this module's own addition, distinct from
+/// `InvalidRequest`: `dump`/`dumpEach` send `buildDumpRequest(seq, family)`,
+/// which carries only the `Family` enum and no caller-controlled tuple, so it
+/// is well-formed by construction. `nfnetlink_rcv_msg` answers `EINVAL` both
+/// when a request is malformed *and* when `NFNL_SUBSYS_CTNETLINK` is simply
+/// not registered (stock OpenWRT 25.12.4 ships `nfnetlink.ko` for nf_tables
+/// but not `nf_conntrack_netlink` at all) — since this module's own dump
+/// request cannot be the former, `EINVAL` here is remapped to the latter. See
+/// SPEC.md "EINVAL vs subsystem absent".
+pub const DumpError = netlink.DumpError || RecvError || SendError || error{SubsystemUnavailable};
 
 /// Errors of the single-reply paths (get/delete/flush/insert/update). A
 /// superset of `netlink.RequestError`, so `netlink.writeErrorFromCode` is
@@ -160,7 +170,14 @@ pub const DumpError = netlink.DumpError || RecvError || SendError;
 /// `recvDatagram` until a message matching `(portid, seq)` arrived, with no
 /// upper bound — a kernel that answers neither `NLMSG_ERROR` nor
 /// `IPCTNL_MSG_CT_NEW` on that sequence spun the caller forever.
-pub const RequestError = netlink.RequestError || RecvError || SendError || error{TooManyMessages};
+///
+/// `SubsystemUnavailable` is a second addition, produced **only by `flush`**
+/// (see `flushFailure`) for the same well-formed-by-construction reasoning as
+/// `DumpError` above — `get`/`delete`/`insert`/`update` carry a caller-supplied
+/// `Tuple`/`NewSpec`, so `EINVAL` on those stays genuinely ambiguous with a
+/// malformed request (e.g. an insert missing `NewSpec.timeout`) and is left as
+/// `InvalidRequest`. See SPEC.md "EINVAL vs subsystem absent".
+pub const RequestError = netlink.RequestError || RecvError || SendError || error{ TooManyMessages, SubsystemUnavailable };
 
 /// Everything a write op can fail with: request construction + transport +
 /// the kernel's mapped errno.
@@ -315,12 +332,16 @@ pub const Socket = struct {
     /// Drop **every** entry of `family` (`.unspec` = the whole table). This is
     /// what a tuple-less `IPCTNL_MSG_CT_DELETE` does in the kernel; it carries
     /// its own name here so that no caller can trigger it by accident.
+    ///
+    /// `error.SubsystemUnavailable` (rather than `error.InvalidRequest`) means
+    /// the kernel does not have `nf_conntrack_netlink` registered at all — see
+    /// `flushFailure`.
     pub fn flush(self: *Socket, family: Family) WriteError!void {
         const seq = self.nextSeq();
         const req = try wire.buildFlushRequest(self.nl.gpa, seq, family);
         defer self.nl.gpa.free(req);
         try self.send(req);
-        return self.awaitAck(seq);
+        self.awaitAck(seq) catch |err| return flushFailure(err);
     }
 
     /// Insert a new entry (`IPCTNL_MSG_CT_NEW` with `NLM_F_CREATE|NLM_F_EXCL`,
@@ -401,6 +422,55 @@ pub const Socket = struct {
     }
 };
 
+// ── EINVAL vs subsystem absent ──────────────────────────────────────────────
+//
+// `nfnetlink_rcv_msg` looks the subsystem up by id and answers plain `EINVAL`
+// when nothing is registered for it — the identical errno a well-formed
+// request's `.doit`/`.dumpit` callback would return for genuinely malformed
+// content. Stock OpenWRT 25.12.4 is exactly this case: it ships `nfnetlink.ko`
+// (for nf_tables) but never loads `nf_conntrack_netlink`. A caller cannot tell
+// "no ctnetlink here" from "you sent nonsense" without inspecting `dmesg` —
+// and for a *mutating* request (flush) reporting the wrong one is a real
+// operational bug, not just an unclear message.
+//
+// The two functions below remap `EINVAL` to `error.SubsystemUnavailable` only
+// on the two request shapes this module builds with **no caller-controlled
+// content**: `buildDumpRequest`/`buildFlushRequest` carry the `Family` enum
+// and nothing else. `get`/`delete` carry a caller-supplied `Tuple` and
+// `insert`/`update` a caller-supplied `NewSpec` — the kernel's tuple/attribute
+// parser can itself answer `EINVAL` for those (`NewSpec.timeout` missing is
+// the documented example), so `EINVAL` there stays genuinely ambiguous and is
+// left as `error.InvalidRequest`/`error.NotSupported` exactly as before.
+
+/// `.failed` handler shared by `dumpOver`/`dumpEachOver`. `netlink.errorFromCode`
+/// folds `EINVAL` *and* `EOPNOTSUPP` onto `error.InvalidRequest`, so the raw
+/// `code` is checked here — before that fold — for the exact errno that means
+/// "subsystem not registered".
+fn dumpFailure(code: i32) DumpError {
+    if (code == -@as(i32, @intFromEnum(linux.E.INVAL))) return error.SubsystemUnavailable;
+    return netlink.errorFromCode(code);
+}
+
+/// Remap for `Socket.flush`'s ACK. Unlike `dumpFailure`, this works off the
+/// already-mapped `RequestError`, not a raw code: `netlink.writeErrorFromCode`
+/// (which `awaitAck` uses internally) maps `EOPNOTSUPP`/`EAFNOSUPPORT`/
+/// `EPROTONOSUPPORT` to the separate `error.NotSupported`, so `InvalidRequest`
+/// out of that function is `EINVAL` and nothing else — no raw code needed to
+/// tell them apart.
+///
+/// A standalone function rather than an inline `catch` because `awaitAck`
+/// delegates its whole reply loop to `netlink.Socket.awaitAckStrict` (the
+/// "DRY candidates" transport unification in SPEC.md) — there is no local
+/// seam like `ScriptedTransport` to script a fake ACK through, so this is
+/// tested directly as the pure mapping it is, the same way `netlink`'s own
+/// `errorFromCode`/`writeErrorFromCode` are.
+fn flushFailure(err: RequestError) RequestError {
+    return switch (err) {
+        error.InvalidRequest => error.SubsystemUnavailable,
+        else => |e| e,
+    };
+}
+
 /// The body of `Socket.awaitFlow`, taking `transport: anytype` for the same
 /// reason `dumpOver` does: `Socket` already defines `recvDatagram()`,
 /// `portId()` and `captureExtAck(msg)` (see below `dump`, above) precisely so
@@ -478,7 +548,7 @@ fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpErro
                     .done => return out.toOwnedSlice(gpa),
                     .failed => |code| {
                         transport.captureExtAck(m);
-                        return netlink.errorFromCode(code);
+                        return dumpFailure(code);
                     },
                     .overrun => return error.Overrun,
                     .malformed => return error.MalformedReply,
@@ -532,7 +602,7 @@ fn dumpEachOver(
                 .done => return,
                 .failed => |code| {
                     transport.captureExtAck(m);
-                    return netlink.errorFromCode(code);
+                    return dumpFailure(code);
                 },
                 .overrun => return error.Overrun,
                 .malformed => return error.MalformedReply,
@@ -854,6 +924,77 @@ test "dump engine: a kernel error reply is mapped and stops the dump" {
     try testing.expectError(error.AccessDenied, dumpOver(testing.allocator, &t, .unspec));
 }
 
+// ── EINVAL vs subsystem absent: remapped paths vs the one left ambiguous ───
+// The real kernel condition (nf_conntrack_netlink genuinely unregistered) is
+// not reproducible in this test binary — it needs a kernel built without the
+// module, which is a host property, not something a netns can fake. Per
+// `dumpFailure`/`flushFailure`'s doc comments: `dumpOver`/`dumpEachOver`
+// already take `transport: anytype`, so an EINVAL reply is scripted through
+// the existing `ScriptedTransport` fixture exactly like the EPERM test above.
+// `flush`'s ACK has no such seam (it delegates wholesale to
+// `netlink.Socket.awaitAckStrict`), so `flushFailure` is tested directly as
+// the pure mapping it is — the same style `netlink`'s own `errorFromCode`/
+// `writeErrorFromCode` tests use.
+
+/// An `NLMSG_ERROR` datagram carrying `-EINVAL`, addressed to `(pid, seq)`.
+fn einvalErrorDatagram(pid: u32, seq: u32) [codec.header_len + 4]u8 {
+    var d: [codec.header_len + 4]u8 = @splat(0);
+    std.mem.writeInt(u32, d[0..4], d.len, native_endian);
+    std.mem.writeInt(u16, d[4..6], codec.NLMSG_ERROR, native_endian);
+    std.mem.writeInt(u32, d[8..12], seq, native_endian);
+    std.mem.writeInt(u32, d[12..16], pid, native_endian);
+    std.mem.writeInt(i32, d[16..20], -@as(i32, @intFromEnum(linux.E.INVAL)), native_endian);
+    return d;
+}
+
+test "dump engine: EINVAL is remapped to SubsystemUnavailable, not InvalidRequest" {
+    // dump's request is buildDumpRequest(seq, family) — Family only, no
+    // caller tuple — so it is well-formed by construction (dumpFailure).
+    const id = goldenDumpIdentity();
+    const einval = einvalErrorDatagram(id.pid, id.seq);
+    var t: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, &einval },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    try testing.expectError(error.SubsystemUnavailable, dumpOver(testing.allocator, &t, .unspec));
+}
+
+test "F4: dumpEach also remaps EINVAL to SubsystemUnavailable" {
+    const id = goldenDumpIdentity();
+    const einval = einvalErrorDatagram(id.pid, id.seq);
+    var t: ScriptedTransport = .{
+        .script = &.{&einval},
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    var v: CollectingVisitor = .{};
+    defer v.deinit();
+    try testing.expectError(
+        error.SubsystemUnavailable,
+        dumpEachOver(&t, .unspec, &v, CollectingVisitor.visit),
+    );
+}
+
+test "get (awaitFlowOver) leaves EINVAL as InvalidRequest — a Tuple is caller data" {
+    // get/delete carry a caller-supplied Tuple the kernel's own parser can
+    // reject, so EINVAL stays genuinely ambiguous with a malformed request —
+    // deliberately NOT remapped, unlike the dump path above.
+    const einval = einvalErrorDatagram(7, 42);
+    var t: ScriptedTransport = .{ .script = &.{&einval}, .pid = 7, .seq = 42 };
+    try testing.expectError(error.InvalidRequest, awaitFlowOver(&t, 42));
+}
+
+test "flushFailure remaps InvalidRequest and passes every other error through" {
+    try testing.expectEqual(error.SubsystemUnavailable, flushFailure(error.InvalidRequest));
+    // A representative sample of the errors flush's ACK can otherwise carry —
+    // none of them are EINVAL, so none should be touched.
+    try testing.expectEqual(error.AccessDenied, flushFailure(error.AccessDenied));
+    try testing.expectEqual(error.NotSupported, flushFailure(error.NotSupported));
+    try testing.expectEqual(error.SystemResources, flushFailure(error.SystemResources));
+    try testing.expectEqual(error.Unexpected, flushFailure(error.Unexpected));
+}
+
 // ── C-06 regression: awaitFlow must not spin forever ───────────────────────
 // W2-nn (`conntrack` F6, campaign C-06): `awaitFlow` looped on `recvDatagram`
 // until a message matching `(portid, seq)` arrived, with no upper bound — a
@@ -950,9 +1091,13 @@ test "live: dump the conntrack table over a real ctnetlink socket" {
     defer sock.close();
 
     const flows = sock.dump(.unspec) catch |err| switch (err) {
-        // EPERM (no CAP_NET_ADMIN) / EOPNOTSUPP (nf_conntrack absent).
+        // EPERM (no CAP_NET_ADMIN) / EOPNOTSUPP (nf_conntrack absent, folded
+        // into InvalidRequest by netlink.errorFromCode) / EINVAL (nf_conntrack
+        // absent too, but distinguished as SubsystemUnavailable — see
+        // `dumpFailure`; both spellings mean the same "not loaded here").
         error.AccessDenied,
         error.InvalidRequest,
+        error.SubsystemUnavailable,
         error.WouldBlock,
         error.Unexpected,
         => return testkit.skip(

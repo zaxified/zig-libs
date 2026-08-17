@@ -107,6 +107,12 @@ Two kernel behaviours worth knowing, both verified live and covered by tests:
   therefore include `IPS.CONFIRMED`; sending no status is always safe.
 - **`CTA_ID` is not a lookup key.** The kernel finds the entry by tuple and only then compares
   the id — so a delete still needs a tuple, and the id turns it into a compare-and-delete.
+- **`error.SubsystemUnavailable` means "no ctnetlink here", not "malformed request".** `dump`/
+  `dumpEach`/`flush` send no caller-controlled content (`Family` only), so the kernel's `EINVAL`
+  for "no `nf_conntrack_netlink` registered" (e.g. stock OpenWRT) is distinguished from
+  `error.InvalidRequest`. `get`/`delete`/`insert`/`update` carry a caller-supplied `Tuple`/
+  `NewSpec`, so `EINVAL` there stays `error.InvalidRequest` — it can still mean a malformed
+  request (e.g. an insert with no `timeout`). See SPEC.md "EINVAL vs subsystem absent".
 
 ## Verify
 
