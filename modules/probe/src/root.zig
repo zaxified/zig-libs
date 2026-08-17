@@ -101,10 +101,16 @@ pub const meta = .{
 pub const Status = enum { up, refused, timeout, @"error" };
 
 /// One probe attempt's result. `rtt_ns` is the connect round-trip and is
-/// non-null only for `.up`.
+/// non-null only for `.up`. `errno`/`err_name` carry whichever connector's
+/// underlying-error representation produced a non-`.up` `Result` — see
+/// `ConnectOutcome` for what each means and when it is set. Both are null
+/// for `.up`, and for an `app_check`-downgraded `.error` (the socket
+/// connected fine; nothing at the OS/transport level failed).
 pub const Result = struct {
     kind: Status,
     rtt_ns: ?u64 = null,
+    errno: ?i32 = null,
+    err_name: ?[]const u8 = null,
 };
 
 /// What a `Connector` reports for one connect attempt. Same shape as `Result`;
@@ -112,6 +118,20 @@ pub const Result = struct {
 pub const ConnectOutcome = struct {
     status: Status,
     rtt_ns: ?u64 = null,
+    /// The raw `SO_ERROR`/`connect()` errno behind a non-`.up` outcome from
+    /// `PosixConnector` — e.g. `111` = `ECONNREFUSED`, `110` = `ETIMEDOUT`.
+    /// `classifyErrno` already folds this into `Status`; this keeps the
+    /// value the classification was computed FROM, since distinct errnos can
+    /// classify the same way (`EHOSTUNREACH`/`ENETUNREACH`/`EACCES` are all
+    /// `.error`). Null for `.up`, and for outcomes `LiveConnector` produced —
+    /// see `err_name` for that path.
+    errno: ?i32 = null,
+    /// The Zig error name behind a non-`.up` outcome from `LiveConnector`
+    /// (`std.Io.net` reports an `anyerror`, not an errno, so there is no
+    /// numeric code to carry). An `@errorName` result: a static string, never
+    /// allocated or freed. Null for `.up`, and for outcomes `PosixConnector`
+    /// produced — see `errno` for that path.
+    err_name: ?[]const u8 = null,
 };
 
 /// A `host:port` target. `host` is borrowed (a name or an IP/`[v6]` literal);
@@ -244,11 +264,14 @@ pub fn probeTcp(target: Target, opts: Options) Result {
     const out = opts.connector.connect(target, timeout_ns);
     if (out.status == .up) {
         if (opts.app_check) |ac| {
+            // Nothing at the OS level failed here — the handshake completed
+            // and the app-level check is what rejected it — so there is no
+            // underlying errno/err_name to carry.
             if (!ac.check(target)) return .{ .kind = .@"error", .rtt_ns = null };
         }
         return .{ .kind = .up, .rtt_ns = out.rtt_ns };
     }
-    return .{ .kind = out.status, .rtt_ns = null };
+    return .{ .kind = out.status, .rtt_ns = null, .errno = out.errno, .err_name = out.err_name };
 }
 
 /// Run `effectiveCount(opts)` repetitions of one target and aggregate. The
@@ -442,11 +465,15 @@ pub const LiveConnector = struct {
     }
 
     fn classifyErr(e: anyerror) ConnectOutcome {
-        return switch (e) {
-            error.ConnectionRefused => .{ .status = .refused },
-            error.Timeout => .{ .status = .timeout },
-            else => .{ .status = .@"error" },
+        const status: Status = switch (e) {
+            error.ConnectionRefused => .refused,
+            error.Timeout => .timeout,
+            else => .@"error",
         };
+        // The classification above is unchanged; this only adds what
+        // produced it. `@errorName` is a static, program-lifetime string —
+        // nothing to allocate or free.
+        return .{ .status = status, .err_name = @errorName(e) };
     }
 };
 
@@ -588,20 +615,27 @@ pub const PosixConnector = struct {
         else
             timeout_ns - spent;
 
-        const status = connectBounded(ip, target.port, remaining);
+        const v = connectBounded(ip, target.port, remaining);
         const rtt = monoNs() -| start;
-        return switch (status) {
+        return switch (v.status) {
             // `overBudget` still guards the success path: a connect that
-            // completed synchronously after a slow resolution is a budget miss.
+            // completed synchronously after a slow resolution is a budget
+            // miss, not an OS-level error — no errno to carry either way.
             .up => overBudget(rtt, timeout_ns),
-            .timeout => .{ .status = .timeout, .rtt_ns = rtt },
-            .refused, .@"error" => .{ .status = status },
+            .timeout => .{ .status = .timeout, .rtt_ns = rtt, .errno = v.errno },
+            .refused, .@"error" => .{ .status = v.status, .errno = v.errno },
         };
     }
 
+    /// `connectBounded`'s verdict: the classified `Status` plus the raw errno
+    /// it was classified FROM, when one is known. `null` on `.up` (nothing
+    /// failed) and on the handful of exits with no specific errno to name
+    /// (`POLLNVAL`, "writable check came back clear but not writable").
+    const Verdict = struct { status: Status, errno: ?i32 = null };
+
     /// One non-blocking connect bounded by `budget_ns` (0 = unbounded).
     /// Never allocates; closes its descriptor on every exit path.
-    fn connectBounded(ip: netaddr.Ip, port: u16, budget_ns: u64) Status {
+    fn connectBounded(ip: netaddr.Ip, port: u16, budget_ns: u64) Verdict {
         if (comptime builtin.os.tag != .linux)
             @compileError("probe.PosixConnector is Linux-only (raw socket syscalls, no libc)");
         const linux = std.os.linux;
@@ -615,7 +649,7 @@ pub const PosixConnector = struct {
             linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
             0,
         );
-        if (linux.errno(sock_rc) != .SUCCESS) return .@"error";
+        if (linux.errno(sock_rc) != .SUCCESS) return .{ .status = .@"error" };
         const fd: i32 = @intCast(sock_rc);
         // The only descriptor this function owns, released on every path.
         defer _ = linux.close(fd);
@@ -641,12 +675,12 @@ pub const PosixConnector = struct {
         };
         switch (linux.errno(conn_rc)) {
             // Loopback and same-host connects frequently complete right here.
-            .SUCCESS => return .up,
+            .SUCCESS => return .{ .status = .up },
             // The handshake is under way; EINTR means the same thing — POSIX
             // requires polling for completion, NOT a second connect().
             .INPROGRESS, .INTR => {},
             // Everything definitive arrives synchronously, ECONNREFUSED included.
-            else => |e| return classifyErrno(@intFromEnum(e)),
+            else => |e| return .{ .status = classifyErrno(@intFromEnum(e)), .errno = @intFromEnum(e) },
         }
 
         var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
@@ -656,7 +690,7 @@ pub const PosixConnector = struct {
             const wait_ms: i32 = blk: {
                 const d = deadline orelse break :blk -1;
                 const now = monoNs();
-                if (now >= d) return .timeout;
+                if (now >= d) return .{ .status = .timeout };
                 const left_ms = (d - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
                 break :blk @intCast(@min(left_ms, @as(u64, std.math.maxInt(i32))));
             };
@@ -665,14 +699,14 @@ pub const PosixConnector = struct {
             switch (linux.errno(poll_rc)) {
                 .SUCCESS => {},
                 .INTR => continue, // budget recomputed at the top of the loop
-                else => return .@"error",
+                else => |e| return .{ .status = .@"error", .errno = @intFromEnum(e) },
             }
             if (poll_rc == 0) continue; // timed out (or short) — the top decides
             break;
         }
 
         const revents = pfd[0].revents;
-        if (revents & linux.POLL.NVAL != 0) return .@"error";
+        if (revents & linux.POLL.NVAL != 0) return .{ .status = .@"error" };
 
         // SO_ERROR decides, not POLLOUT: a refusal is POLLOUT|POLLERR|POLLHUP
         // with SO_ERROR = ECONNREFUSED (measured: revents 0x1c, SO_ERROR 111).
@@ -685,11 +719,12 @@ pub const PosixConnector = struct {
             @ptrCast(&so_error),
             &so_len,
         );
-        if (linux.errno(opt_rc) != .SUCCESS) return .@"error";
+        if (linux.errno(opt_rc) != .SUCCESS)
+            return .{ .status = .@"error", .errno = @intFromEnum(linux.errno(opt_rc)) };
         // No pending error and not writable: POLLERR/POLLHUP on their own do
         // not mean a completed handshake.
-        if (so_error == 0 and revents & linux.POLL.OUT == 0) return .@"error";
-        return classifyErrno(so_error);
+        if (so_error == 0 and revents & linux.POLL.OUT == 0) return .{ .status = .@"error" };
+        return .{ .status = classifyErrno(so_error), .errno = so_error };
     }
 
     /// First address `std.Io.net`'s resolver returns for `host`, or null.
@@ -815,6 +850,27 @@ test "LiveConnector.classifyErr: refused/timeout/other map to distinct Status" {
         LiveConnector.classifyErr(error.Timeout).status);
 }
 
+test "LiveConnector.classifyErr carries the Zig error name, not just the Status" {
+    // The classification (asserted above) is unchanged; this pins that the
+    // underlying error survives alongside it instead of being discarded.
+    try testing.expectEqualStrings(
+        "ConnectionRefused",
+        LiveConnector.classifyErr(error.ConnectionRefused).err_name.?,
+    );
+    try testing.expectEqualStrings("Timeout", LiveConnector.classifyErr(error.Timeout).err_name.?);
+    try testing.expectEqualStrings(
+        "NameResolutionFailed",
+        LiveConnector.classifyErr(error.NameResolutionFailed).err_name.?,
+    );
+    // `PosixConnector`'s side of the same contract, not `LiveConnector`'s:
+    // this outcome never went through `classifyErr`, so `err_name` must stay
+    // null even though `errno` is set.
+    try testing.expectEqual(@as(?[]const u8, null), (ConnectOutcome{
+        .status = .refused,
+        .errno = 111,
+    }).err_name);
+}
+
 test "Target.parse KATs" {
     {
         const t = try Target.parse("example.com:443");
@@ -862,6 +918,44 @@ test "probeTcp classifies each outcome" {
     try testing.expectEqual(Status.@"error", probeTcp(.{ .host = "err", .port = 80 }, opts).kind);
     // unknown host → error (script fallthrough)
     try testing.expectEqual(Status.@"error", probeTcp(.{ .host = "nope", .port = 80 }, opts).kind);
+}
+
+test "probeTcp carries the connector's underlying error through to Result, unclassified" {
+    // Before this, ConnectOutcome's errno/err_name never reached probeTcp's
+    // Result at all — the classification into Status was right, but a caller
+    // that wanted to know WHY (not just THAT) a connect was refused had
+    // nothing to read. This pins that the value survives the copy, and that
+    // it does so without changing which Status it carries.
+    const E = std.os.linux.E;
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "refused", .outcomes = &.{.{ .status = .refused, .errno = @intFromEnum(E.CONNREFUSED) }} },
+        .{ .host = "posix-timeout", .outcomes = &.{.{ .status = .timeout, .errno = @intFromEnum(E.TIMEDOUT) }} },
+        .{ .host = "live-refused", .outcomes = &.{.{ .status = .refused, .err_name = "ConnectionRefused" }} },
+        .{ .host = "up", .outcomes = &.{.{ .status = .up, .rtt_ns = 5 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    const opts: Options = .{ .connector = fake.connector() };
+
+    const ref = probeTcp(.{ .host = "refused", .port = 80 }, opts);
+    try testing.expectEqual(Status.refused, ref.kind); // classification unchanged
+    try testing.expectEqual(@as(?i32, @intFromEnum(E.CONNREFUSED)), ref.errno);
+    try testing.expectEqual(@as(?[]const u8, null), ref.err_name);
+
+    const to = probeTcp(.{ .host = "posix-timeout", .port = 80 }, opts);
+    try testing.expectEqual(Status.timeout, to.kind);
+    try testing.expectEqual(@as(?i32, @intFromEnum(E.TIMEDOUT)), to.errno);
+
+    const live_ref = probeTcp(.{ .host = "live-refused", .port = 80 }, opts);
+    try testing.expectEqual(Status.refused, live_ref.kind);
+    try testing.expectEqual(@as(?i32, null), live_ref.errno);
+    try testing.expectEqualStrings("ConnectionRefused", live_ref.err_name.?);
+
+    // `.up` never carries either field, whatever the connector set — probeTcp
+    // only reaches for rtt_ns on that path.
+    const up = probeTcp(.{ .host = "up", .port = 80 }, opts);
+    try testing.expectEqual(Status.up, up.kind);
+    try testing.expectEqual(@as(?i32, null), up.errno);
+    try testing.expectEqual(@as(?[]const u8, null), up.err_name);
 }
 
 test "N repetitions aggregate to min/avg/max and loss%" {
@@ -1367,6 +1461,10 @@ test "live: a closed loopback port is refused fast, and is never reported as a t
     const el = monoNs() -| t0;
     try testing.expectEqual(Status.refused, out.status);
     try testing.expect(el < std.time.ns_per_s);
+    // The classification is `.refused`, and the concrete errno it was
+    // classified from also survives — measured on this kernel as SO_ERROR
+    // 111 (see `classifyErrno`'s own pinned constant test).
+    try testing.expectEqual(@as(?i32, @intFromEnum(std.os.linux.E.CONNREFUSED)), out.errno);
 }
 
 test "live: a listening loopback port is up, with a measured rtt" {

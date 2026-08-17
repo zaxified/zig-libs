@@ -36,6 +36,20 @@ decades-old approach (nmap's `-sT`, fping's parallel sweep) — behavior modeled
 third-party source consulted or copied; there is no `probe` entry in NOTICE (nothing derived
 requires attribution). Deps `netaddr` + `latency-stats` are sibling modules.
 
+### Underlying error alongside `Status`
+
+`ConnectOutcome`/`Result` classify every connect into `up`/`refused`/`timeout`/`error`, and that
+classification is unchanged by this — but two different failures can classify the same way
+(`EHOSTUNREACH`/`ENETUNREACH`/`EACCES` are all `.error`), and the classification alone throws away
+which one actually happened. `errno: ?i32` and `err_name: ?[]const u8` carry it: `PosixConnector`
+sets `errno` to the raw `SO_ERROR`/`connect()` code (`classifyErrno`'s input, preserved rather than
+discarded after use); `LiveConnector` sets `err_name` to `@errorName` of the `std.Io.net` error,
+since that connector has no numeric errno to report. Exactly one of the two is ever set — never
+both, since exactly one connector produced any given outcome — and both are null for `.up` and for
+an `app_check`-downgraded `.error` (nothing at the OS/transport level failed there). `@errorName`
+returns a static, program-lifetime string, so `err_name` needs no allocation or ownership story, the
+same as every other string this module hands back.
+
 ## Threat model / out of scope
 Not a security scanner and not privileged (an ordinary TCP connect; no raw sockets, no SYN/stealth
 scan). Does not authenticate the peer — `up` means a handshake completed, not that the intended

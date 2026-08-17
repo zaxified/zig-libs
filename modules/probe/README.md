@@ -41,11 +41,18 @@ never reaches the resolver in either mode.
 - **Deps:** `netaddr` (target address parse/format, incl. `[v6]:port`),
   `latency-stats` (per-target min/avg/max/loss).
 
-Layers: `probeTcp` — one connect attempt → `Result { kind, rtt_ns }`;
+Layers: `probeTcp` — one connect attempt → `Result { kind, rtt_ns, errno, err_name }`;
 `probeTarget` — N reps of one target → aggregated min/avg/max/loss;
 `probeMany` — fan out a target list with bounded concurrency, order-stable.
 An optional app-level check hook runs after the handshake. `Target.parse`
 accepts `host:port` and `[v6]:port`.
+
+`Result`'s classification into `Status` (`up`/`refused`/`timeout`/`error`) stays the
+whole decision surface, but a non-`up` result also carries the connector's underlying
+error: `errno` (the raw `SO_ERROR`/`connect()` code) from `PosixConnector`, `err_name`
+(a `@errorName` string) from `LiveConnector` — never both, and both null for `.up`.
+Useful when the four-way classification alone is not enough, e.g. logging
+`EHOSTUNREACH` vs `ENETUNREACH` even though both are `.error`.
 
 ```zig
 const probe = @import("probe");
