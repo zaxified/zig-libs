@@ -22,6 +22,15 @@ tar binary was used only as a black-box compatibility test oracle (see Verificat
 was never consulted, and no GPL code is involved — no NOTICE entry needed (own code, no third-party
 source).
 
+## API surface additions (2026-08-18)
+`packDirToPath(io, gpa, roots, out_path)` wraps `packDir` with the create-file/wrap-writer/flush
+steps a caller otherwise repeats for every call site; `packDir` is unchanged and still writes to a
+caller-owned `*std.Io.Writer`. `Entry.dupe(allocator) -> OwnedEntry` copies the borrowed
+`path`/`link_target` (valid only until the next `Reader.next()`/`deinit()`, per the `Entry` doc
+comment) into the caller's allocator; `OwnedEntry` is a distinct type with its own `deinit`, so a
+caller building a manifest across multiple entries has an unmistakable ownership signal at the call
+site rather than relying on remembering the doc comment.
+
 ## Threat model / out of scope
 Untrusted archives: the reader never panics or over-reads on malformed input, and caps name buffers
 — but it does **not** sanitize paths: `../` escapes, absolute paths and symlink targets are returned
@@ -50,7 +59,17 @@ design) cover the writer's header field padding/octal formatting, the checksum f
 (file/dir/symlink/hardlink), the GNU 'L' long-name extension, and — read back through this module's own
 `Reader` — the real 10240-byte record-blocking-factor padding GNU tar itself emits (which this module's
 `Writer.finish()` deliberately does not replicate; a design choice, not a gap — see that file's doc
-comment). No subprocess, no skip path. Run: `zig build test-tar`.
+comment). No subprocess, no skip path.
+
+`packDirToPath` is verified by a real round-trip through disk: pack a tree into a path, then reopen and
+decompress+read that exact file back with `Reader`, asserting the same content and stats `packDir`
+itself would produce. `Entry.dupe`/`OwnedEntry` is verified by a test that duped an entry's fields,
+then called `Reader.next()` again (the operation that invalidates a plain `Entry`'s borrowed
+`path`/`link_target`) and only then asserted the duped copy's content — a test shaped so it would
+fail if `dupe` forgot to actually copy the bytes, unlike a test that asserts before advancing (which
+the un-duped path would also pass).
+
+Run: `zig build test-tar`.
 
 ## Backlog / deferred
 None beyond the documented out-of-scope list (pax interpretation,

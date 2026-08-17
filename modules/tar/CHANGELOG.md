@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — New `packDirToPath(io, gpa, roots, out_path)`: the create-file /
+  wrap-writer / call-`packDir` / flush dance every caller was repeating verbatim,
+  collapsed into one call with the same `PackStats` return. `packDir` itself is
+  unchanged (still writes to a caller-owned `*std.Io.Writer`).
+- **2026-08-18** — New `Entry.dupe(allocator) -> OwnedEntry`: `Entry.path`/
+  `link_target` are borrowed from the `Reader` and valid only until the next
+  `next()`/`deinit()` — documented, but easy to trip over when building a manifest
+  across multiple entries. `dupe` copies both into the caller's allocator and returns
+  a distinctly-typed `OwnedEntry` (its own `deinit(allocator)`, not `Entry`'s, since
+  `Entry` never owns anything) so ownership is visible at the call site rather than
+  inferred from the doc comment.
 - **2026-08-14** — Finished a retraction that stopped halfway on 2026-07-09.
   `667b29d` judged "modeled after GNU tar / libarchive" an overstatement —
   the headers come from the POSIX ustar + documented GNU extension layout and

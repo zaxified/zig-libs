@@ -58,6 +58,12 @@ while (try tr.next()) |e| {
         if (n == 0) break;
     }
     // unread content is auto-skipped by the following next()
+
+    // e.path / e.link_target are the Reader's own buffers -- valid only
+    // until the next next()/deinit(). Building a manifest across entries?
+    // Dupe into your own allocator first:
+    // var owned = try e.dupe(gpa);
+    // defer owned.deinit(gpa);
 }
 
 // gzip packer (portable): entries -> gzip-compressed tar, streaming.
@@ -68,6 +74,10 @@ try tar.packTarGz(gpa, dst, &.{
 // Filesystem packer (Linux): walk roots, real uid/gid/mtime via statx.
 const stats = try tar.packDir(io, gpa, &.{"/etc/config"}, dst);
 // stats: .files/.dirs/.symlinks/.bytes; skips unreadable entries best-effort
+
+// ...or skip the create-file/wrap-writer/flush dance and write straight to
+// a path (same stats, same walk):
+const stats2 = try tar.packDirToPath(io, gpa, &.{"/etc/config"}, "/backups/config.tar.gz");
 ```
 
 ## Format support (as implemented)
@@ -94,6 +104,15 @@ const stats = try tar.packDir(io, gpa, &.{"/etc/config"}, dst);
 - **Streaming/bounded memory.** Content is never buffered — `read()` streams
   it; only path/link-target strings are allocated (64 KiB cap, allocator
   explicit). `packTarGz`/`packDir` allocate one flate window.
+- **`Entry` ownership.** `path`/`link_target` are the `Reader`'s own buffers —
+  valid only until the next `next()`/`deinit()`. `Entry.dupe(allocator)`
+  copies both into a distinctly-typed `OwnedEntry` (its own `deinit`, unlike
+  plain `Entry`, which never owns anything) for a caller that needs an entry
+  to survive past the next iteration, e.g. building a manifest.
+- **`packDirToPath`** wraps `packDir` with the create-file/wrap-writer/flush
+  steps every direct caller otherwise repeats; `packDir` itself still writes
+  to a caller-owned `*std.Io.Writer` for callers who want to compose it
+  differently (e.g. streaming straight to a network socket).
 - **Hardening choices** (wire format untouched): every header is
   checksum-verified; the ustar `prefix` is honored only under the POSIX magic
   (never under GNU magic, where those bytes mean atime/ctime); hard links

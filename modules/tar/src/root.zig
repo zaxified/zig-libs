@@ -84,6 +84,53 @@ pub const Entry = struct {
     /// Raw header typeflag as read; informative for `.other` entries.
     /// Ignored by the writer (derived from `kind`).
     typeflag: u8 = 0,
+
+    /// Copy `path`/`link_target` into `allocator` and return an `OwnedEntry`
+    /// that outlives the next `Reader.next()`/`deinit()` call — for a caller
+    /// building a manifest (or anything else that needs an `Entry` to
+    /// survive past the next iteration) instead of consuming it immediately.
+    /// The distinct return type (not `Entry`) is deliberate: `OwnedEntry`'s
+    /// own `deinit` is the tell at the call site that these two string
+    /// fields are now the caller's to free, unlike a plain `Entry`, which
+    /// never owns anything and has no `deinit` at all.
+    pub fn dupe(self: Entry, allocator: Allocator) Allocator.Error!OwnedEntry {
+        const path = try allocator.dupe(u8, self.path);
+        errdefer allocator.free(path);
+        const link_target = try allocator.dupe(u8, self.link_target);
+        return .{
+            .path = path,
+            .kind = self.kind,
+            .mode = self.mode,
+            .uid = self.uid,
+            .gid = self.gid,
+            .mtime = self.mtime,
+            .size = self.size,
+            .link_target = link_target,
+            .typeflag = self.typeflag,
+        };
+    }
+};
+
+/// An `Entry` whose `path`/`link_target` are independently owned (see
+/// `Entry.dupe`) — safe to keep across a `Reader.next()` call, unlike the
+/// borrowed slices on a plain `Entry`. Must be `deinit`'d by the same
+/// allocator passed to `dupe`.
+pub const OwnedEntry = struct {
+    path: []u8,
+    kind: Kind = .file,
+    mode: u32 = 0,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    mtime: i64 = 0,
+    size: u64 = 0,
+    link_target: []u8 = &.{},
+    typeflag: u8 = 0,
+
+    pub fn deinit(self: *OwnedEntry, allocator: Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.link_target);
+        self.* = undefined;
+    }
 };
 
 const gnu_longlink_name = "././@LongLink";
@@ -572,6 +619,26 @@ pub fn packDir(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.
     return stats;
 }
 
+pub const PackDirToPathError = PackDirError || std.Io.File.OpenError;
+
+/// Convenience over `packDir`: create (or truncate) `out_path` and write the
+/// gzip tar straight into it — the create-file/wrap-writer/call/flush dance
+/// every `packDir` caller otherwise repeats verbatim. Same walk, same
+/// `PackStats`, same Linux-only ceiling (see `packDir`'s doc comment); this
+/// only adds the destination-file plumbing.
+pub fn packDirToPath(io: std.Io, gpa: Allocator, roots: []const []const u8, out_path: []const u8) PackDirToPathError!PackStats {
+    if (comptime builtin.os.tag != .linux)
+        @compileError("tar.packDirToPath is Linux-only (statx numeric attrs)");
+
+    const file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    defer file.close(io);
+    var wbuf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &wbuf);
+    const stats = try packDir(io, gpa, roots, &fw.interface);
+    try fw.interface.flush();
+    return stats;
+}
+
 fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, stats: *PackStats) PackDirError!void {
     const linux = std.os.linux;
     var pathz: [std.fs.max_path_bytes]u8 = undefined;
@@ -894,6 +961,39 @@ test "next() auto-skips unread content" {
     try testing.expectEqual(@as(?Entry, null), try tr.next());
 }
 
+test "Entry.dupe: an OwnedEntry's path/link_target survive a subsequent next() call" {
+    const gpa = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const tw = Writer.init(&aw.writer);
+    try tw.writeEntry(.{ .path = "first-entry.txt", .kind = .symlink, .link_target = "first-target" }, "");
+    try tw.writeEntry(.{ .path = "second-entry.txt" }, "");
+    try tw.finish();
+
+    var src: std.Io.Reader = .fixed(aw.writer.buffered());
+    var tr = Reader.init(gpa, &src);
+    defer tr.deinit();
+
+    const first = (try tr.next()).?;
+    try testing.expectEqualStrings("first-entry.txt", first.path);
+    var owned = try first.dupe(gpa);
+    defer owned.deinit(gpa);
+
+    // Advance the reader — this is exactly what invalidates `first.path` /
+    // `first.link_target` (they are the Reader's own borrowed buffers, and
+    // the doc comment on `Entry` says so). If `dupe` didn't actually copy
+    // the bytes, `owned.path`/`owned.link_target` would now read back as
+    // "second-entry.txt"/"" (or garbage) instead of the first entry's data —
+    // this assertion is only meaningful because it runs AFTER the call that
+    // would corrupt an un-duped borrow.
+    const second = (try tr.next()).?;
+    try testing.expectEqualStrings("second-entry.txt", second.path);
+
+    try testing.expectEqualStrings("first-entry.txt", owned.path);
+    try testing.expectEqualStrings("first-target", owned.link_target);
+    try testing.expectEqual(Kind.symlink, owned.kind);
+}
+
 test "gzip round-trip: packTarGz -> flate.Decompress -> Reader" {
     const gpa = testing.allocator;
     const long_path = "dir-with-a-rather-long-name/" ** 5 ++ "file.dat"; // 148 bytes
@@ -1193,6 +1293,57 @@ test "packDir: statx numeric attrs survive the round-trip (Linux)" {
     try testing.expectEqual(@as(usize, 4), count);
     try testing.expect(seen_file);
     try testing.expect(seen_link);
+}
+
+test "packDirToPath: round-trips through the reader, same stats as packDir" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "tree");
+    try tmp.dir.writeFile(io, .{ .sub_path = "tree/hello.txt", .data = "packed via packDirToPath\n" });
+
+    var rootbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(io, &rootbuf);
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try std.fmt.bufPrint(&root, "{s}/tree", .{rootbuf[0..tmp_len]});
+
+    var outbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const out_path = try std.fmt.bufPrint(&outbuf, "{s}/out.tar.gz", .{rootbuf[0..tmp_len]});
+
+    const stats = try packDirToPath(io, gpa, &.{root_path}, out_path);
+    try testing.expectEqual(@as(usize, 1), stats.files);
+    try testing.expectEqual(@as(usize, 1), stats.dirs); // tree
+    try testing.expectEqual(@as(u64, 25), stats.bytes);
+
+    // Read it back off disk exactly like a real consumer would: open the
+    // written file, decompress, and walk it with `Reader`.
+    const written = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .limited(1024 * 1024));
+    defer gpa.free(written);
+
+    var src: std.Io.Reader = .fixed(written);
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    var decomp = flate.Decompress.init(&src, .gzip, window);
+    var tr = Reader.init(gpa, &decomp.reader);
+    defer tr.deinit();
+
+    var seen_file = false;
+    var count: usize = 0;
+    while (try tr.next()) |e| {
+        count += 1;
+        if (std.mem.endsWith(u8, e.path, "/hello.txt")) {
+            seen_file = true;
+            try testing.expectEqual(Kind.file, e.kind);
+            const content = try readAllContent(&tr, gpa);
+            defer gpa.free(content);
+            try testing.expectEqualStrings("packed via packDirToPath\n", content);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), count); // tree/ + tree/hello.txt
+    try testing.expect(seen_file);
 }
 
 // ── tests: cross-check against system GNU tar (skips if absent) ─────────────
