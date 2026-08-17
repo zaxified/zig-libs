@@ -316,7 +316,7 @@ const lldp_mtu_oobr_value = [_]u8{
 };
 
 test "real capture: Ubuntu/lldpd LLDPDU decodes — chassis, port, caps, dual mgmt-address, 3 org-TLVs" {
-    const du = try lldp.Lldpdu.parse(&lldpdu_mudurl);
+    const du = try lldp.Lldpdu.parse(&lldpdu_mudurl, .{});
 
     try testing.expectEqual(lldp.ChassisIdSubtype.mac_address, du.chassis_id.subtype);
     try testing.expect(du.chassis_id.mac().?.eql(Mac.parse("00:23:54:c2:57:02").?));
@@ -383,7 +383,7 @@ test "real capture: Ubuntu/lldpd LLDPDU decodes — chassis, port, caps, dual mg
 }
 
 test "real capture: Cisco IOS LLDPDU (S1) decodes — 'local' Port ID subtype, org VLAN + MAC/PHY" {
-    const du = try lldp.Lldpdu.parse(&lldpdu_cisco_s1);
+    const du = try lldp.Lldpdu.parse(&lldpdu_cisco_s1, .{});
     try testing.expectEqual(lldp.PortIdSubtype.local, du.port_id.subtype);
     try testing.expectEqualStrings("Fa0/13", du.port_id.text().?);
     try testing.expectEqualStrings("S1.cisco.com", du.system_name.?);
@@ -404,7 +404,7 @@ test "real capture: Cisco IOS LLDPDU (S1) decodes — 'local' Port ID subtype, o
 }
 
 test "real capture: Cisco IOS LLDPDU (S2) decodes — 'interface-alias' Port ID subtype" {
-    const du = try lldp.Lldpdu.parse(&lldpdu_cisco_s2);
+    const du = try lldp.Lldpdu.parse(&lldpdu_cisco_s2, .{});
     try testing.expectEqual(lldp.PortIdSubtype.interface_alias, du.port_id.subtype);
     try testing.expectEqualStrings("Uplink to S1", du.port_id.text().?);
     try testing.expectEqualStrings("S2.cisco.com", du.system_name.?);
@@ -415,7 +415,7 @@ test "real capture: a genuine LLDP infinite-loop fixture parses to completion, n
     // The point is structural: `TlvIterator.next` cannot fail to advance, so
     // this always terminates -- confirmed against the actual bytes that once
     // hung another implementation's walk, not a hypothetical.
-    const du = try lldp.Lldpdu.parse(&lldpdu_infinite_loop);
+    const du = try lldp.Lldpdu.parse(&lldpdu_infinite_loop, .{});
     var it = du.tlvIterator();
     var count: usize = 0;
     while (try it.next()) |_| {

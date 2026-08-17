@@ -9,9 +9,12 @@
 //! - `TlvIterator` — bounds-checked raw walk yielding `{type, value}`
 //!   until the End TLV; never allocates, never panics.
 //! - `Lldpdu.parse` — a typed model. The three mandatory TLVs (Chassis ID,
-//!   Port ID, Time To Live) are required first, in order; the optional
-//!   TLVs (Port Description, System Name, System Description, System
-//!   Capabilities, Management Address) are extracted as they appear.
+//!   Port ID, Time To Live) are required first, in order, and a malformed
+//!   one always aborts the parse; the optional TLVs (Port Description,
+//!   System Name, System Description, System Capabilities, Management
+//!   Address) are extracted as they appear. A malformed optional TLV also
+//!   aborts the parse by default, but `ParseOptions.tolerant_optionals` (see
+//!   its doc comment) opts into skipping it and keeping the rest.
 //!   Organizationally-specific TLVs (type 127) and any unrecognized
 //!   optional TLVs are reachable through `tlvIterator` / `orgIterator`.
 //! - Chassis ID / Port ID expose their subtype and helpers (`mac`, `ip`,
@@ -369,6 +372,27 @@ pub const ManagementAddressIterator = struct {
 
 // ── typed model ─────────────────────────────────────────────────────────────
 
+pub const ParseOptions = struct {
+    /// The three mandatory TLVs (Chassis ID, Port ID, TTL) always have to be
+    /// present, in order, and well-formed -- that never changes. This
+    /// governs only the *optional* TLVs (System Capabilities, Management
+    /// Address) that carry their own internal length/consistency checks.
+    ///
+    /// `false` (default): a malformed optional TLV aborts the whole parse,
+    /// same as a malformed mandatory one. This is correct for anything that
+    /// treats a wrong answer as worse than no answer.
+    ///
+    /// `true`: a malformed optional TLV is skipped -- the LLDPDU is still
+    /// returned with every field that *did* parse (including a later,
+    /// well-formed repeat of the same optional TLV type). Use this when
+    /// losing a neighbour's Chassis ID / Port ID over one cheap switch
+    /// botching an unrelated optional TLV is the real loss -- e.g. "which
+    /// switch and port am I wired to" topology discovery. `skipped_optionals`
+    /// reports how many were dropped, so a caller that cares can tell a
+    /// clean neighbour record from a partially-recovered one.
+    tolerant_optionals: bool = false,
+};
+
 pub const Lldpdu = struct {
     // Mandatory.
     chassis_id: ChassisId,
@@ -382,14 +406,21 @@ pub const Lldpdu = struct {
     capabilities: ?SystemCapabilitiesTlv = null,
     management_address: ?ManagementAddress = null,
 
+    /// Count of optional TLVs skipped under `ParseOptions.tolerant_optionals`
+    /// because they were internally malformed. Always 0 in strict mode
+    /// (`tolerant_optionals = false`) -- a malformed optional TLV aborts the
+    /// parse there instead of being counted.
+    skipped_optionals: u16 = 0,
+
     /// The whole TLV stream, for re-iteration (org-specific, extra
     /// management addresses, unknown TLVs).
     raw: []const u8,
 
-    pub fn parse(bytes: []const u8) ParseError!Lldpdu {
+    pub fn parse(bytes: []const u8, opts: ParseOptions) ParseError!Lldpdu {
         var it = TlvIterator.init(bytes);
 
-        // The three mandatory TLVs, in order.
+        // The three mandatory TLVs, in order. Never relaxed by `opts` --
+        // ordering and presence of these is the whole point of this parser.
         const c = (try it.next()) orelse return ParseError.MissingMandatory;
         if (c.type != .chassis_id or c.value.len < 2) return ParseError.MissingMandatory;
         const p = (try it.next()) orelse return ParseError.MissingMandatory;
@@ -417,14 +448,26 @@ pub const Lldpdu = struct {
                     du.system_description = tlv.value;
                 },
                 .system_capabilities => {
-                    if (tlv.value.len != 4) return ParseError.BadTlvLength;
+                    if (tlv.value.len != 4) {
+                        if (opts.tolerant_optionals) {
+                            du.skipped_optionals += 1;
+                            continue;
+                        }
+                        return ParseError.BadTlvLength;
+                    }
                     if (du.capabilities == null) du.capabilities = .{
                         .capabilities = .fromWire(std.mem.readInt(u16, tlv.value[0..2], .big)),
                         .enabled = .fromWire(std.mem.readInt(u16, tlv.value[2..4], .big)),
                     };
                 },
                 .management_address => if (du.management_address == null) {
-                    du.management_address = try ManagementAddress.parse(tlv.value);
+                    du.management_address = ManagementAddress.parse(tlv.value) catch |err| {
+                        if (opts.tolerant_optionals) {
+                            du.skipped_optionals += 1;
+                            continue;
+                        }
+                        return err;
+                    };
                 },
                 else => {}, // org-specific / unknown: via iterators below
             }
@@ -607,7 +650,7 @@ const kat = [_]u8{ 0x02, 0x07, 0x04 } ++ kat_mac.octets // Chassis ID: (1<<9)|7
 ++ [_]u8{ 0x00, 0x00 }; // End-of-LLDPDU
 
 test "LLDP KAT: parse the full LLDPDU" {
-    const du = try Lldpdu.parse(&kat);
+    const du = try Lldpdu.parse(&kat, .{});
 
     // Chassis ID: MAC.
     try testing.expectEqual(ChassisIdSubtype.mac_address, du.chassis_id.subtype);
@@ -669,7 +712,7 @@ test "LLDP round-trip: builder reproduces the golden bytes" {
     try testing.expectEqualSlices(u8, &kat, bytes);
 
     // build → parse agrees with the model.
-    const du = try Lldpdu.parse(bytes);
+    const du = try Lldpdu.parse(bytes, .{});
     try testing.expect(du.chassis_id.mac().?.eql(kat_mac));
     try testing.expectEqual(@as(u16, 120), du.ttl_s);
 }
@@ -685,7 +728,7 @@ test "LLDP: network-address chassis id + IPv6 management address" {
     try b.addMaxFrameSize(1522);
     const bytes = try b.finish();
 
-    const du = try Lldpdu.parse(bytes);
+    const du = try Lldpdu.parse(bytes, .{});
     var ipbuf: [netaddr.max_ip_text_len]u8 = undefined;
     try testing.expectEqualStrings("10.0.0.1", netaddr.formatIp(du.chassis_id.ip().?, &ipbuf));
     try testing.expect(du.port_id.mac().?.eql(kat_mac));
@@ -729,7 +772,7 @@ test "LLDP: unknown optional TLV passes through, never fails parse" {
     try b.addTlv(@enumFromInt(100), &.{ 0xde, 0xad, 0xbe, 0xef }); // reserved/unknown type
     const bytes = try b.finish();
 
-    const du = try Lldpdu.parse(bytes); // must not error
+    const du = try Lldpdu.parse(bytes, .{}); // must not error
     var it = du.tlvIterator();
     var saw_unknown = false;
     while (try it.next()) |tlv| {
@@ -765,7 +808,7 @@ test "LLDP: a repeated optional TLV keeps the FIRST occurrence in the typed fiel
     try b.addManagementAddress(.{ .ip = .{ .v4 = .{ 10, 0, 0, 2 } } });
     const bytes = try b.finish();
 
-    const du = try Lldpdu.parse(bytes);
+    const du = try Lldpdu.parse(bytes, .{});
     try testing.expectEqualStrings("first-desc", du.port_description.?);
     try testing.expectEqualStrings("first-name", du.system_name.?);
     try testing.expectEqualStrings("first-sysdesc", du.system_description.?);
@@ -802,20 +845,27 @@ test "LLDP malformed: typed errors, no panic" {
     var buf: [64]u8 = undefined;
     var b = Builder.init(&buf);
     try b.addSystemName("x");
-    try testing.expectError(ParseError.MissingMandatory, Lldpdu.parse(try b.finish()));
+    try testing.expectError(ParseError.MissingMandatory, Lldpdu.parse(try b.finish(), .{}));
 
     // TLV length overruns the buffer.
-    try testing.expectError(ParseError.TruncatedTlv, Lldpdu.parse(&.{ 0x02, 0x07, 0x04 }));
+    try testing.expectError(ParseError.TruncatedTlv, Lldpdu.parse(&.{ 0x02, 0x07, 0x04 }, .{}));
 
     // Truncated header (one byte).
-    try testing.expectError(ParseError.Truncated, Lldpdu.parse(&.{0x02}));
+    try testing.expectError(ParseError.Truncated, Lldpdu.parse(&.{0x02}, .{}));
 
-    // TTL with the wrong length.
+    // TTL with the wrong length -- a malformed MANDATORY TLV, so this fails
+    // under both settings; `tolerant_optionals` only ever governs optional
+    // TLVs, never the mandatory Chassis ID / Port ID / TTL trio or their
+    // ordering.
     const bad_ttl = [_]u8{ 0x02, 0x07, 0x04 } ++ kat_mac.octets ++
         [_]u8{ 0x04, 0x03, 0x05 } ++ "e0".* ++
         [_]u8{ 0x06, 0x01, 0x78 } ++ // TTL length 1 (illegal)
         [_]u8{ 0x00, 0x00 };
-    try testing.expectError(ParseError.MissingMandatory, Lldpdu.parse(&bad_ttl));
+    try testing.expectError(ParseError.MissingMandatory, Lldpdu.parse(&bad_ttl, .{}));
+    try testing.expectError(
+        ParseError.MissingMandatory,
+        Lldpdu.parse(&bad_ttl, .{ .tolerant_optionals = true }),
+    );
 
     // Management Address with an inconsistent internal length.
     var mbuf: [64]u8 = undefined;
@@ -824,7 +874,50 @@ test "LLDP malformed: typed errors, no panic" {
     try mb.addPortIdIfName("e0");
     try mb.addTtl(1);
     try mb.addTlv(.management_address, &.{ 0xff, 0x01, 0xc0 }); // addr-str-len 255
-    try testing.expectError(ParseError.BadManagementAddress, Lldpdu.parse(try mb.finish()));
+    try testing.expectError(ParseError.BadManagementAddress, Lldpdu.parse(try mb.finish(), .{}));
+}
+
+test "LLDP tolerant: a malformed optional System Capabilities TLV is skipped, chassis/port/TTL survive" {
+    var buf: [128]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.addChassisIdMac(kat_mac);
+    try b.addPortIdIfName("Gi0/1");
+    try b.addTtl(120);
+    // System Capabilities must be exactly 4 bytes; 3 is malformed.
+    try b.addTlv(.system_capabilities, &.{ 0x00, 0x14, 0x00 });
+    const bytes = try b.finish();
+
+    // Strict (default): the malformed optional aborts the whole parse --
+    // this is the finding: a cheap switch botching one optional TLV must
+    // not, by default, lose an otherwise-good neighbour record either, so
+    // the fix is an opt-in, not a relaxed default.
+    try testing.expectError(ParseError.BadTlvLength, Lldpdu.parse(bytes, .{}));
+
+    // Tolerant: the malformed optional is skipped and counted; everything
+    // that did parse -- including the mandatory trio -- comes back intact.
+    const du = try Lldpdu.parse(bytes, .{ .tolerant_optionals = true });
+    try testing.expect(du.chassis_id.mac().?.eql(kat_mac));
+    try testing.expectEqualStrings("Gi0/1", du.port_id.text().?);
+    try testing.expectEqual(@as(u16, 120), du.ttl_s);
+    try testing.expectEqual(@as(?SystemCapabilitiesTlv, null), du.capabilities);
+    try testing.expectEqual(@as(u16, 1), du.skipped_optionals);
+}
+
+test "LLDP tolerant: an inconsistent Management Address is skipped the same way" {
+    var buf: [128]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.addChassisIdMac(kat_mac);
+    try b.addPortIdIfName("e0");
+    try b.addTtl(60);
+    try b.addTlv(.management_address, &.{ 0xff, 0x01, 0xc0 }); // addr-str-len 255: BadManagementAddress
+    const bytes = try b.finish();
+
+    try testing.expectError(ParseError.BadManagementAddress, Lldpdu.parse(bytes, .{}));
+
+    const du = try Lldpdu.parse(bytes, .{ .tolerant_optionals = true });
+    try testing.expect(du.chassis_id.mac().?.eql(kat_mac));
+    try testing.expectEqual(@as(?ManagementAddress, null), du.management_address);
+    try testing.expectEqual(@as(u16, 1), du.skipped_optionals);
 }
 
 test "LLDP garbage sweep: no panics on random input" {
@@ -835,7 +928,7 @@ test "LLDP garbage sweep: no panics on random input" {
     while (i < 1000) : (i += 1) {
         const len = random.uintAtMost(usize, buf.len);
         random.bytes(buf[0..len]);
-        if (Lldpdu.parse(buf[0..len])) |du| {
+        if (Lldpdu.parse(buf[0..len], .{})) |du| {
             var it = du.tlvIterator();
             while (it.next() catch null) |_| {}
             var org = du.orgIterator();
@@ -863,7 +956,7 @@ fn fuzzLldpParse(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
 
-    const du = Lldpdu.parse(buf[0..len]) catch return;
+    const du = Lldpdu.parse(buf[0..len], .{}) catch return;
     var it = du.tlvIterator();
     while (it.next() catch null) |_| {}
     var org = du.orgIterator();

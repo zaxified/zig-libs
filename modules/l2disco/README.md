@@ -23,6 +23,30 @@ Everything is bounds-checked: malformed or truncated input is a typed
 error, never a panic. Parsing allocates nothing (iterators slice the input
 buffer); builders write into a caller-provided buffer.
 
+**`cdp.Frame.parse` verifies the RFC 1071 checksum by default.** That is correct — this codec
+should catch corrupted or spoofed traffic — but a lot of real gear, and virtually every hand-rolled
+test injector, emits a zero checksum. If parsing is failing with `ParseError.BadChecksum` on a
+frame you built by hand or captured from an odd device, pass `.{ .verify_checksum = false }`; the
+default itself is not going to change.
+
+## Tolerant parsing (opt-in)
+
+Both `lldp` and `cdp` are strict by default: a malformed TLV anywhere in the input discards the
+whole parse. That is the right default — a codec that silently drops bytes it disagrees with is
+not trustworthy — but for on-the-wire neighbour discovery ("which switch and port am I wired to?"),
+losing an entire neighbour because one non-identifying TLV from a cheap device is malformed is a
+real loss too. Two options exist for that, both opt-in, both defaulting to the strict behaviour:
+
+- **`lldp.ParseOptions.tolerant_optionals`** (default `false`): when `true`, a malformed *optional*
+  TLV (System Capabilities of the wrong length, an internally-inconsistent Management Address) is
+  skipped instead of aborting the parse; `Lldpdu.skipped_optionals` counts how many were dropped.
+  The mandatory Chassis ID / Port ID / TTL trio — and its ordering — is never relaxed by this option
+  and always still fails the parse if malformed, in both modes.
+- **`cdp.ParseOptions.tolerant_trailing_tlv`** (default `false`): when `true`, a truncated or
+  malformed *trailing* TLV — the shape real 802.3 zero-padding to the 60-byte Ethernet minimum
+  produces once the TLV walk reaches it — stops the walk and returns what parsed instead of failing
+  the whole frame; `Frame.trailing_tlv_truncated` reports whether this happened.
+
 ## Depends on
 
 - `netaddr` — `Ip` parse/format for LLDP/CDP management, ARP and DHCP

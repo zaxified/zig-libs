@@ -18,6 +18,20 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   parse; every length is bounds-checked against the buffer.
 - **Concurrency:** reentrant — no shared state; safe if instances are not shared.
 - **Error policy:** malformed or truncated input is a typed error, never a panic.
+- **Opt-in tolerance, strict by default:** `lldp.ParseOptions.tolerant_optionals` and
+  `cdp.ParseOptions.tolerant_trailing_tlv` (both default `false`) let a caller keep a frame whose
+  data loss is confined to a TLV that was never load-bearing for identifying the neighbour, instead
+  of discarding the whole record. `lldp`: a malformed *optional* TLV (System Capabilities of the
+  wrong length, an internally-inconsistent Management Address) is skipped and
+  `Lldpdu.skipped_optionals` counts how many; the mandatory trio (Chassis ID, Port ID, TTL) and its
+  ordering always still fail the parse outright, in both modes — that is the actual identity of the
+  neighbour and losing it silently would be worse than losing the frame. `cdp`: a truncated/malformed
+  *trailing* TLV — the shape real 802.3 zero-padding to the 60-byte minimum frame produces once the
+  walk reaches it — stops the walk and keeps what parsed instead of failing the whole frame;
+  `Frame.trailing_tlv_truncated` reports whether this happened. Both flags surface *that* something
+  was dropped (a count / a bool) rather than dropping it silently, on the reasoning that the finding
+  which motivated them was itself "the module silently threw away a good neighbour" — the fix must
+  not create the same failure mode in the other direction for a caller that cares.
 
 ## Threat model / out of scope
 
@@ -41,6 +55,13 @@ garbage-sweep (never panics). Run: `zig build test-l2disco`.
 None recorded — no deferred-gap note beyond the general Linux-only-members-accepted
 scope note (raw-syscall nature, not a functional gap), and the module README has no Deferred
 section.
+
+**Deliberately out of scope:** relaxing LLDP mandatory-TLV *ordering* (Chassis ID, Port ID, TTL
+must appear first, in that order). A consumer that asked for `lldp.ParseOptions.tolerant_optionals`
+separately flagged ordering as something it could imagine wanting relaxed too, but called it out as
+its own, distinct decision rather than bundling it into the optional-TLV finding — so it was left
+alone here. Revisit only on a fresh, explicit ask; do not fold it into `tolerant_optionals` as a
+"while we're at it."
 
 ## Status
 

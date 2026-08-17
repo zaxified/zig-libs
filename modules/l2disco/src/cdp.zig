@@ -11,7 +11,11 @@
 //! - `Frame.parse` — typed model for the common TLVs: Device ID,
 //!   Addresses, Port ID, Capabilities, Software Version, Platform, VTP
 //!   Management Domain, Native VLAN, Duplex. Unknown TLVs pass through
-//!   via `tlvIterator`. All slices point into the caller's buffer.
+//!   via `tlvIterator`. All slices point into the caller's buffer. A
+//!   truncated or malformed trailing TLV aborts the parse by default;
+//!   `ParseOptions.tolerant_trailing_tlv` (see its doc comment) opts into
+//!   stopping the walk there and keeping what parsed instead -- the shape
+//!   real 802.3 zero-padding to the 60-byte minimum frame produces.
 //! - `AddressIterator` — walks the Addresses TLV block (count-prefixed
 //!   list of protocol + address pairs) and decodes IPv4 (NLPID 0xCC) and
 //!   IPv6 (802.2 SNAP with EtherType 0x86DD) into `netaddr.Ip`.
@@ -19,10 +23,14 @@
 //!   checksum in `finish`.
 //!
 //! The checksum is the standard RFC 1071 ones'-complement sum over the
-//! whole payload. Note: for *odd-length* frames, real Cisco IOS is known
-//! to deviate from RFC 1071 padding; frames built here use the standard
-//! form, and `ParseOptions.verify_checksum = false` lets a caller accept
-//! odd-length frames from devices regardless.
+//! whole payload, and `Frame.parse` verifies it **by default** -- correct,
+//! and worth calling out here because a lot of real gear and virtually
+//! every hand-rolled test injector emits a zero checksum, which then fails
+//! with `ParseError.BadChecksum` until the caller passes
+//! `ParseOptions.verify_checksum = false`. Note also: for *odd-length*
+//! frames, real Cisco IOS is known to deviate from RFC 1071 padding; frames
+//! built here use the standard form, and `verify_checksum = false` lets a
+//! caller accept odd-length frames from devices regardless.
 //!
 //! Provenance: clean-room from the publicly documented CDP frame format
 //! (Cisco documentation; CDP is a Cisco-proprietary but publicly described
@@ -184,6 +192,23 @@ pub const ParseOptions = struct {
     /// Verify the RFC 1071 checksum (see the module note on odd-length
     /// frames from real devices).
     verify_checksum: bool = true,
+
+    /// `false` (default): a truncated or malformed trailing TLV -- the
+    /// declared length not fitting the header, or not fitting the buffer --
+    /// aborts the whole parse, same as any other malformed input.
+    ///
+    /// `true`: when the TLV walk hits exactly that shape, stop and return
+    /// the frame with whatever TLVs parsed before it, instead of failing.
+    /// This is the real-world case: real CDP frames are carried inside an
+    /// Ethernet frame padded with zero bytes to the 802.3 60-byte minimum,
+    /// and this codec never sees the 802.3 length field that would let it
+    /// tell "padding" from "truncated" on its own -- the caller has to
+    /// bound the payload itself to avoid it, or opt into this. Only the
+    /// TLV *walk* is affected: the fixed 4-byte header (version/holdtime/
+    /// checksum) still always has to be present and, if `verify_checksum`
+    /// is on, still always has to verify. `Frame.trailing_tlv_truncated`
+    /// reports whether this happened.
+    tolerant_trailing_tlv: bool = false,
 };
 
 /// A parsed CDP frame. All slices point into the parsed buffer.
@@ -206,6 +231,12 @@ pub const Frame = struct {
     /// Raw value block of the Addresses TLV (walk with `addressIterator`).
     addresses_raw: ?[]const u8 = null,
 
+    /// Set when `ParseOptions.tolerant_trailing_tlv` stopped the TLV walk
+    /// early because the trailing TLV was truncated or malformed. Always
+    /// `false` when that option is off (such input aborts the parse there
+    /// instead) or when no truncation was hit.
+    trailing_tlv_truncated: bool = false,
+
     pub fn parse(bytes: []const u8, opts: ParseOptions) ParseError!Frame {
         if (bytes.len < header_len) return ParseError.Truncated;
         if (opts.verify_checksum and !verify(bytes)) return ParseError.BadChecksum;
@@ -218,7 +249,16 @@ pub const Frame = struct {
         };
 
         var it = TlvIterator.init(f.tlvs_raw);
-        while (try it.next()) |tlv| {
+        while (true) {
+            const tlv = it.next() catch |err| {
+                if (opts.tolerant_trailing_tlv and
+                    (err == ParseError.TruncatedTlv or err == ParseError.BadTlvLength))
+                {
+                    f.trailing_tlv_truncated = true;
+                    break;
+                }
+                return err;
+            } orelse break;
             switch (@as(TlvType, @enumFromInt(tlv.type))) {
                 .device_id => f.device_id = tlv.value,
                 .port_id => f.port_id = tlv.value,
@@ -501,6 +541,35 @@ test "CDP malformed: typed errors, no panic" {
     const f = try Frame.parse(&badaddr, .{ .verify_checksum = false });
     var it = (try f.addressIterator()).?;
     try testing.expectError(ParseError.TruncatedAddress, it.next());
+}
+
+test "CDP tolerant: 802.3 zero-padding to the 60-byte minimum truncates the trailing TLV; default fails, option keeps what parsed" {
+    // Real CDP frames are usually well over the 60-byte Ethernet minimum,
+    // but a small one -- Device ID only, as built here -- is not, so a real
+    // capture layer zero-pads it to 60 bytes. That padding lands inside the
+    // TLV region this codec walks: the first padding "TLV" decodes as type
+    // 0 / declared total length 0, shorter than its own 4-byte header
+    // (`BadTlvLength`). Checksum verification is disabled here, the same
+    // way the malformed-TLV cases above isolate the TLV walk from checksum
+    // concerns -- a real checksum covers only the true payload, never the
+    // padding, so a caller facing this for real also has to keep the two
+    // concerns separate (bound the payload before checksumming it).
+    var buf: [64]u8 = undefined;
+    var b = try Builder.init(&buf, .{});
+    try b.addDeviceId("edge-sw1");
+    const payload = b.finish(); // real CDP payload only, no padding yet
+
+    var padded: [60]u8 = [_]u8{0} ** 60;
+    @memcpy(padded[0..payload.len], payload);
+
+    try testing.expectError(
+        ParseError.BadTlvLength,
+        Frame.parse(&padded, .{ .verify_checksum = false }),
+    );
+
+    const f = try Frame.parse(&padded, .{ .verify_checksum = false, .tolerant_trailing_tlv = true });
+    try testing.expectEqualStrings("edge-sw1", f.device_id.?);
+    try testing.expect(f.trailing_tlv_truncated);
 }
 
 test "CDP garbage sweep: no panics on random input" {
