@@ -10,7 +10,25 @@ Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Att
   `Authorization`).
 - **Open plane:** an empty credential set fails **closed** (denies) by default; set
   `allow_when_unconfigured = true` to disable auth entirely (`Identity.scheme == .open`, the old
-  dev/demo behavior). Configuring any token/key closes the plane regardless.
+  dev/demo behavior). Configuring any token/key closes the plane regardless — and so does
+  configuring a **verifier** (`token_verify` / `api_key_verify`) with an empty static set: a
+  callback is a credential source the gate cannot enumerate, so "the static set is empty" must not
+  be read as "nothing is configured". Both schemes decide this identically; the bearer half gained
+  it second (2026-08-17) and the asymmetry was the defect.
+- **Dynamic verifiers** are consulted only after the static digest scan misses, and **outside the
+  gate's lock** (caller code may take its own locks and must not deadlock against ours; it may also
+  race a concurrent `addToken`, which is the same window `addToken` already has against a request
+  in flight). The module cannot enforce the callback's timing discipline — it exports `secretEqual`
+  so the caller has no reason to reach for `std.mem.eql`, and that is the whole of the mechanism.
+- **Route exemption** (`Options.exempt`, an `ExemptFn` predicate) removes a request from the
+  protected scope entirely — no credential check, no `Identity`, no audit entry, no throttle touch:
+  identical to a method `protect` never covered. It is evaluated **before** any credential is read,
+  so an exempt route costs nothing and reveals nothing.
+- **Denial response** (`deny_body`/`deny_content_type`, copied into the gate at `init`): the body
+  and its media type are the only configurable part of a 401. Status, `WWW-Authenticate`, the audit
+  entry and the denied-request throttle are fixed — a consumer changing the body cannot
+  accidentally change the security-relevant half, which is why this is two data fields and not an
+  `on_deny` hook holding the `ResponseWriter`.
 - **Audit** is a synchronous hook (`on_audit(entry)`), never a logger: fires on every authenticated
   mutation and every denial; authenticated reads are not audited. Entry slices borrow request-scoped
   memory.
@@ -40,8 +58,15 @@ Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Att
   sanitizes/sets them; directly reachable, an attacker can pick any key value (subject to the
   `client_key_len_max` clamp) to split across many audit-coalescing buckets or collide with a
   victim's key.
+- Does **NOT** defend against what a `token_verify`/`api_key_verify` callback or an `exempt`
+  predicate decides: both are caller code running with the gate's authority. A verifier that
+  compares with `std.mem.eql` reintroduces the timing oracle the gate exists to close, and an
+  exempt predicate matching more than intended (a prefix where an exact path was meant) is an
+  unauthenticated hole in the protected plane. The gate audits neither — an exempt request is
+  out of scope by definition, so it produces no entry to notice it by.
 - Static shared-secret credentials only — not token issuance, not OAuth2/OIDC (use `jwt`), not
-  session management; storage/rotation/zeroization is the caller's.
+  session management; storage/rotation/zeroization is the caller's. A verifier moves *storage*
+  outside the gate, not the threat model: the external store's own hardening is the caller's.
 - AuthZ is coarse (authenticates + can gate); fine-grained scopes/RBAC are the application's or
   `jwt`'s job.
 - Out of scope: TLS (server/proxy), rate limiting of successful traffic (`ratelimit`), and
@@ -49,10 +74,16 @@ Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Att
 
 ## Verification
 `zig build test-aaa-gate`. Offline unit tests (constant-time verify both branches incl. length
-mismatch; open plane; rotation via `extra_tokens`/`addToken`/`removeToken`; throttle
-coalescing/fold/reset, window-0 disable, max-keys bound, OOM fail-open) plus wire-level goldens over
+mismatch; open plane; rotation via `extra_tokens`/`addToken`/`removeToken`; `token_verify`
+accept/reject, a call counter proving the static set is scanned first, and the plane-closing case
+paired with the bare-`allow_when_unconfigured` gate that *does* admit; throttle
+coalescing/fold/reset, window-0 disable, max-keys bound, OOM fail-open; `init` unwinding proven
+leak-free at every allocation-failure index) plus wire-level goldens over
 the socket-free `http.Server.serveStream` (401 + challenge, valid/wrong/missing token, malformed
-`Authorization` corpus never panics, `.mutations` split, audit-entry fields, throttle keying) and a
+`Authorization` corpus never panics, `.mutations` split, an external token store rotated between
+requests, the `deny_body`/`deny_content_type` override asserted byte-exact with audit + throttle
+unchanged, `exempt` routes admitted without identity or audit, audit-entry fields, throttle keying)
+and a
 loopback integration (`router`+`http.Server`+`http.Client`), skipping only when loopback binding is
 unavailable.
 

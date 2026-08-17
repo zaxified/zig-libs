@@ -64,6 +64,28 @@ var gate = try aaa_gate.Gate.init(gpa, .{
 });
 ```
 
+A bearer store the gate cannot mirror (an operator token file another
+process rewrites), a JSON denial body, and one open endpoint:
+
+```zig
+var gate = try aaa_gate.Gate.init(gpa, .{
+    .token_verify = tokenFileVerify,      // tried after the static set
+    .token_verify_ctx = &token_file,      // its presence closes the open plane
+    .deny_body = "{\"error\":\"unauthorized\"}", // copied into the gate
+    .deny_content_type = "application/json",
+    .exempt = .{ .isExempt = liveness },  // /healthz needs no credential
+});
+
+fn tokenFileVerify(ctx: ?*anyopaque, presented: []const u8) bool {
+    const store: *TokenFile = @ptrCast(@alignCast(ctx.?));
+    return aaa_gate.secretEqual(presented, store.current); // never std.mem.eql
+}
+
+fn liveness(_: ?*anyopaque, ctx: *router.Ctx) bool {
+    return std.mem.eql(u8, ctx.req.path, "/healthz");
+}
+```
+
 In a handler behind the gate:
 
 ```zig
@@ -85,10 +107,23 @@ middleware's `state` points at it).
   are hashed (SHA-256) and the fixed-size digests compared with
   `std.crypto.timing_safe.eql`, scanning the whole token set without
   early exit — constant-time in token content, candidate length and
-  which slot matched. Deny → **401** + `WWW-Authenticate: Bearer`
-  (`realm="…"` when configured), plain-text body, chain short-circuited.
-  Pass → an `Identity` on `ctx.data` (the slot `router` reserved for
-  this module; restored after the chain), then `next`.
+  which slot matched. A miss falls through to the optional
+  `token_verify` callback (below). Deny → **401** +
+  `WWW-Authenticate: Bearer` (`realm="…"` when configured), plain-text
+  body by default, chain short-circuited. Pass → an `Identity` on
+  `ctx.data` (the slot `router` reserved for this module; restored after
+  the chain), then `next`.
+- **Dynamic token store (`token_verify`).** The exact mirror of
+  `api_key_verify` for bearer: a `TokenVerifyFn` consulted **after** the
+  static set misses and **outside** the gate's lock, for a store the gate
+  cannot mirror — an operator token file rewritten at runtime, an external
+  secret store. It must compare in constant time; use the exported
+  `secretEqual` (the module's SHA-256 + `timing_safe.eql` compare), never
+  `std.mem.eql`. **Its presence alone closes the bearer open plane**: a
+  gate with no static tokens but a verifier denies on a wrong token even
+  under `allow_when_unconfigured = true`, because the verifier *is* the
+  configuration. Rotation then needs no `addToken`/`removeToken` call and
+  no plaintext kept around to diff into the gate.
 - **API-key scheme (`auth_mode`).** Besides bearer, the gate accepts an
   API key. `Options.auth_mode` selects `.bearer` (default — unchanged),
   `.api_key`, or `.either`. The key arrives in the `X-Api-Key` header
@@ -112,6 +147,23 @@ middleware's `state` points at it).
   open (out-of-scope requests get no identity and no audit). Under
   `.all`, register `cors` **before** the gate — browser preflights
   cannot carry `Authorization` and would otherwise 401.
+- **Route exemption (`exempt`).** A predicate over the request
+  (`ExemptFn`, the shape of `throttle_key`'s `KeyFn`) that takes
+  individual routes out of the protected scope whatever `protect` says —
+  the liveness probe of a service whose reads must otherwise stay gated,
+  where `.mutations` would wrongly open every read. An exempt request is
+  handled exactly like an out-of-scope one: no credential check, no
+  `Identity`, no audit, no throttle. Null (default) ⇒ nothing is exempt.
+  `ctx.matchedPattern()` is the bounded-cardinality way to name a route;
+  `ctx.req.path` is the raw one.
+- **Denial response (`deny_body` / `deny_content_type`).** The 401 body
+  defaults to `Unauthorized\n` as `text/plain`; both are configurable
+  (copied into the gate at `init`, so the deny path still writes stable
+  memory and formats nothing per request), which is how a JSON API answers
+  denials in its own `{"error":"…"}` shape without an outer middleware
+  rewriting the response. The body may be empty (a bodiless 401). The
+  status, the `WWW-Authenticate` challenge, the audit entry and the
+  denied-request throttle are unaffected by the override.
 - **Open plane.** An empty credential set fails **closed** (denies
   everything) by default. To disable auth entirely so everything passes
   with `Identity.scheme == .open` (the old dev/demo default), set
@@ -152,13 +204,21 @@ middleware's `state` points at it).
 
 `zig build test-aaa-gate` — offline unit tests (constant-time verify on
 both branches incl. length mismatches; open plane; rotation via
-`extra_tokens`/`addToken`/`removeToken`; throttle coalescing/fold/reset,
-window-0 disable, max-keys bound, lossless idle sweep, OOM fail-open)
-plus wire-level goldens over the socket-free `http.Server.serveStream`
-(byte-exact 401 with `WWW-Authenticate`; valid/wrong/missing token;
-case-insensitive scheme; malformed-Authorization corpus never panics;
-`protect=.mutations` read/write split with identity-absence proof; open
-plane; realm challenge; audit-entry fields for authed/denied/erroring
+`extra_tokens`/`addToken`/`removeToken`; `token_verify` accepted/rejected,
+consulted only after a static miss, and closing the open plane a bare
+`allow_when_unconfigured` would have opened; throttle
+coalescing/fold/reset, window-0 disable, max-keys bound, lossless idle
+sweep, OOM fail-open; `init` leak-free at every allocation-failure index)
+plus wire-level goldens over the socket-free
+`http.Server.serveStream` (byte-exact 401 with `WWW-Authenticate`;
+valid/wrong/missing token; case-insensitive scheme;
+malformed-Authorization corpus never panics; `protect=.mutations`
+read/write split with identity-absence proof; open plane; realm
+challenge; a dynamic token store rotating behind the gate's back;
+byte-exact JSON `deny_body`/`deny_content_type` override with audit +
+throttle proven unchanged, and the empty-body case; `exempt` routes
+bypassing the gate with no identity and no audit while the rest stays
+gated; audit-entry fields for authed/denied/erroring
 handlers; throttle coalescing + XFF/X-Real-IP/peer/fallback keying), and
 an in-process integration test (`router` + `http.Server` + `http.Client`
 over loopback: no token → 401 + challenge, valid `Bearer` → 200/201 with

@@ -15,11 +15,20 @@
 //!   tokens. Verification hashes both sides (SHA-256) and compares the
 //!   fixed-size digests with `std.crypto.timing_safe.eql`, scanning the
 //!   whole token set without early exit — constant-time in the token
-//!   content, the candidate length and which slot matched. Missing,
-//!   malformed or wrong credentials answer **401** with
-//!   `WWW-Authenticate: Bearer` and the chain is short-circuited (`next`
-//!   never runs). A valid request gets an `Identity` attached to
-//!   `ctx.data` (the slot `router` reserves for this module) and flows on.
+//!   content, the candidate length and which slot matched. A miss falls
+//!   through to the optional `token_verify` callback (the dynamic-store
+//!   escape hatch — an operator token file edited at runtime; use
+//!   `secretEqual` inside it, never `std.mem.eql`), the exact mirror of
+//!   `api_key_verify`. Missing, malformed or wrong credentials answer
+//!   **401** with `WWW-Authenticate: Bearer` and the chain is
+//!   short-circuited (`next` never runs). A valid request gets an
+//!   `Identity` attached to `ctx.data` (the slot `router` reserves for
+//!   this module) and flows on.
+//! - **Denial response.** The 401 body defaults to `Unauthorized\n` as
+//!   `text/plain`; `Options.deny_body` / `deny_content_type` replace both
+//!   (a JSON API answers denials in its own error shape without an outer
+//!   middleware rewriting the response). Status, challenge header, audit
+//!   and throttle are unaffected by the override.
 //! - **API-key scheme.** `Options.auth_mode` selects the accepted
 //!   scheme(s): `.bearer` (default — the behavior above, unchanged),
 //!   `.api_key`, or `.either`. The API key arrives in the `X-Api-Key`
@@ -44,7 +53,11 @@
 //!   stay open).
 //!   Under `.all`, register `cors` *before* the gate so browser
 //!   preflights (which cannot carry Authorization) are intercepted
-//!   before they would 401.
+//!   before they would 401. `Options.exempt` is a per-request predicate
+//!   that takes individual routes out of the protected scope whatever
+//!   `protect` says (a liveness probe on an otherwise fully gated
+//!   service): an exempt request is handled exactly like an out-of-scope
+//!   one — no credential check, no identity, no audit.
 //! - **Open plane.** An empty credential set fails **closed** (denies
 //!   everything) by default — a config mistake never silently exposes a
 //!   protected plane. To get the old dev/demo behavior where an
@@ -72,7 +85,10 @@
 //! - **Rotation.** The token set = `Options.token` ∪
 //!   `Options.extra_tokens`, mutable at runtime via `addToken` /
 //!   `removeToken` — token-file rotation as an API (add the new token,
-//!   migrate clients, remove the old; no file, no restart).
+//!   migrate clients, remove the old; no file, no restart). A store the
+//!   gate cannot mirror (a token file another process rewrites) is
+//!   answered by `token_verify` instead, so the secrets never have to be
+//!   kept in plaintext just to diff them into the gate.
 //!
 //! ## Thread-safety
 //!
@@ -172,6 +188,12 @@ pub const AuthMode = enum {
 /// Default header carrying the API key (`Options.api_key_header`).
 pub const default_api_key_header = "X-Api-Key";
 
+/// Default 401 body (`Options.deny_body`).
+pub const default_deny_body = "Unauthorized\n";
+
+/// Default 401 body media type (`Options.deny_content_type`).
+pub const default_deny_content_type = "text/plain";
+
 /// Caller-supplied API-key verifier — the escape hatch mirroring the
 /// bearer set for a dynamic key store. Receives the presented key
 /// verbatim; returns whether it is valid. **Must** compare in constant
@@ -179,6 +201,16 @@ pub const default_api_key_header = "X-Api-Key";
 /// the serving thread, after the static key set misses. `ctx` is
 /// `Options.api_key_verify_ctx` verbatim.
 pub const ApiKeyVerifyFn = *const fn (ctx: ?*anyopaque, presented_key: []const u8) bool;
+
+/// Caller-supplied bearer-token verifier — the exact mirror of
+/// `ApiKeyVerifyFn` for a dynamic token store (an operator token file
+/// rewritten at runtime, an external secret store). Receives the presented
+/// token verbatim; returns whether it is valid. **Must** compare in
+/// constant time (see `secretEqual`); never `std.mem.eql` on the secret.
+/// Called on the serving thread, after the static token set misses, and
+/// outside the gate's lock — so it may take its own locks. `ctx` is
+/// `Options.token_verify_ctx` verbatim.
+pub const TokenVerifyFn = *const fn (ctx: ?*anyopaque, presented_token: []const u8) bool;
 
 /// Constant-time equality for secret material (compares fixed-size
 /// SHA-256 digests via `std.crypto.timing_safe.eql`, so neither content
@@ -259,6 +291,20 @@ pub const KeyFn = struct {
     keyFor: *const fn (?*anyopaque, *router.Ctx) []const u8,
 };
 
+/// Route exemption: a predicate over the request (same shape as `KeyFn`).
+/// Returning true takes the request out of the protected scope whatever
+/// `Options.protect` says — no credential check, no `Identity`, no audit,
+/// exactly as for a method `protect` never covered. Called on the serving
+/// thread, before any credential is looked at; `ctx.matchedPattern()` is
+/// the bounded-cardinality way to name a route (`ctx.req.path` is the raw
+/// one). This is the escape hatch for a service that needs ONE open
+/// endpoint — a liveness probe on a store whose reads must stay gated,
+/// where `.mutations` would wrongly open every read.
+pub const ExemptFn = struct {
+    ctx: ?*anyopaque = null,
+    isExempt: *const fn (?*anyopaque, *router.Ctx) bool,
+};
+
 /// Throttle key when neither a forwarded/real-IP header nor a socket peer
 /// address exists — only possible when the codec is driven socket-free
 /// (`http.Server.serveStream` without `StreamOptions.peer`).
@@ -269,13 +315,22 @@ pub const client_key_len_max = 48;
 
 pub const Options = struct {
     /// The primary bearer token. Not retained — only its SHA-256 digest
-    /// is stored. Null + empty `extra_tokens` ⇒ **open plane** (documented
-    /// above). Must be non-empty when set.
+    /// is stored. Null + empty `extra_tokens` + no `token_verify` ⇒
+    /// **open plane** (documented above). Must be non-empty when set.
     token: ?[]const u8 = null,
     /// Additional valid tokens (rotation set). Not retained.
     extra_tokens: []const []const u8 = &.{},
+    /// Caller-supplied bearer verifier (dynamic store); tried after the
+    /// static token set. See `TokenVerifyFn` — must compare in constant
+    /// time. Its presence alone closes the bearer open plane.
+    token_verify: ?TokenVerifyFn = null,
+    /// Opaque pointer handed to every `token_verify` call.
+    token_verify_ctx: ?*anyopaque = null,
     /// Which methods require auth. Default `.all` (see `Protect`).
     protect: Protect = .all,
+    /// Per-request exemption from the protected scope, whatever `protect`
+    /// says; null = nothing is exempt. See `ExemptFn`.
+    exempt: ?ExemptFn = null,
     /// Accepted authentication scheme(s). Default `.bearer` (existing
     /// behavior). See `AuthMode`; the `api_key*` options below apply when
     /// this is `.api_key` or `.either`.
@@ -312,6 +367,16 @@ pub const Options = struct {
     /// realm="<realm>"`. Must be quoted-string-safe (no `"` or `\`).
     /// Null ⇒ plain `WWW-Authenticate: Bearer`.
     realm: ?[]const u8 = null,
+    /// Body of the 401 response. Copied into the gate (so a caller's
+    /// buffer need not outlive `init`). Default `Unauthorized\n`; set it
+    /// to e.g. `{"error":"unauthorized"}` so a JSON API answers denials in
+    /// its own error shape. May be empty (a bodiless 401). The status,
+    /// the `WWW-Authenticate` challenge, the audit entry and the
+    /// denied-request throttle are unaffected.
+    deny_body: []const u8 = default_deny_body,
+    /// `Content-Type` of the 401 response. Copied into the gate. Default
+    /// `text/plain`; must be non-empty.
+    deny_content_type: []const u8 = default_deny_content_type,
     /// Audit hook; null disables auditing (and the throttle with it).
     on_audit: ?AuditFn = null,
     /// Opaque pointer handed to every `on_audit` call.
@@ -351,6 +416,16 @@ pub const Gate = struct {
     /// Precomputed `WWW-Authenticate` value, gpa-owned (stable across the
     /// response lifetime — no per-request formatting on the deny path).
     challenge: []const u8,
+    /// Denial body + its media type — gpa-owned copies when the gate was
+    /// built by `init`, so the deny path writes stable memory and formats
+    /// nothing per request.
+    deny_body: []const u8 = default_deny_body,
+    deny_content_type: []const u8 = default_deny_content_type,
+    /// Route-exemption predicate, or null when nothing is exempt.
+    exempt: ?ExemptFn = null,
+    /// Bearer-token verifier callback (dynamic store) + its ctx.
+    token_verify: ?TokenVerifyFn = null,
+    token_verify_ctx: ?*anyopaque = null,
     /// API-key verifier callback (dynamic store) + its ctx.
     api_key_verify: ?ApiKeyVerifyFn = null,
     api_key_verify_ctx: ?*anyopaque = null,
@@ -403,9 +478,15 @@ pub const Gate = struct {
             std.debug.assert(q.len != 0);
             break :blk try gpa.dupe(u8, q);
         } else null;
+        errdefer if (api_key_query_param) |q| gpa.free(q);
+        const deny_body = try gpa.dupe(u8, options.deny_body);
+        errdefer gpa.free(deny_body);
+        std.debug.assert(options.deny_content_type.len != 0);
+        const deny_content_type = try gpa.dupe(u8, options.deny_content_type);
         return .{
             .gpa = gpa,
             .protect = options.protect,
+            .exempt = options.exempt,
             .auth_mode = options.auth_mode,
             .allow_when_unconfigured = options.allow_when_unconfigured,
             .on_audit = options.on_audit,
@@ -415,6 +496,10 @@ pub const Gate = struct {
             .clock = options.clock,
             .throttle_key = options.throttle_key,
             .challenge = challenge,
+            .deny_body = deny_body,
+            .deny_content_type = deny_content_type,
+            .token_verify = options.token_verify,
+            .token_verify_ctx = options.token_verify_ctx,
             .api_key_verify = options.api_key_verify,
             .api_key_verify_ctx = options.api_key_verify_ctx,
             .api_key_header = api_key_header,
@@ -426,6 +511,8 @@ pub const Gate = struct {
 
     pub fn deinit(g: *Gate) void {
         g.gpa.free(g.challenge);
+        g.gpa.free(g.deny_body);
+        g.gpa.free(g.deny_content_type);
         g.gpa.free(g.api_key_header);
         if (g.api_key_query_param) |q| g.gpa.free(q);
         g.tokens.deinit(g.gpa);
@@ -453,18 +540,30 @@ pub const Gate = struct {
 
     /// The pure auth decision for a presented bearer token (null = none
     /// presented). Thread-safe; hashing happens outside the lock, the
-    /// digest scan visits every configured token without early exit.
+    /// digest scan visits every configured token without early exit. On a
+    /// miss the `token_verify` callback (if any) is consulted outside the
+    /// lock. With no token set and no callback, returns `.ok_open` only
+    /// when `allow_when_unconfigured` is set, else `.denied` (fail closed).
     pub fn verify(g: *Gate, presented: ?[]const u8) Verdict {
+        const has_verify = g.token_verify != null;
         const fp: ?[Sha256.digest_length]u8 = if (presented) |p| fingerprint(p) else null;
-        lockSpin(&g.lock);
-        defer g.lock.unlock();
-        if (g.tokens.items.len == 0)
-            return if (g.allow_when_unconfigured) .ok_open else .denied;
-        const got = fp orelse return .denied;
-        var ok = false;
-        for (g.tokens.items) |want|
-            ok = std.crypto.timing_safe.eql([Sha256.digest_length]u8, want, got) or ok;
-        return if (ok) .ok_bearer else .denied;
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            if (g.tokens.items.len == 0 and !has_verify)
+                return if (g.allow_when_unconfigured) .ok_open else .denied;
+            if (fp) |got| {
+                if (containsFp(g.tokens.items, got)) return .ok_bearer;
+            }
+        }
+        // Static set missed; consult the dynamic verifier (caller code —
+        // kept outside the lock). Its own compare must be constant-time.
+        if (has_verify) {
+            if (presented) |p| {
+                if (g.token_verify.?(g.token_verify_ctx, p)) return .ok_bearer;
+            }
+        }
+        return .denied;
     }
 
     /// The pure auth decision for a presented API key (null = none
@@ -542,7 +641,8 @@ pub const Gate = struct {
     }
 
     /// Remove a token from the valid set (no-op when absent). Removing
-    /// the last token reopens the plane — see the open-plane note.
+    /// the last token reopens the plane — see the open-plane note (unless
+    /// a `token_verify` callback is configured, which keeps it closed).
     pub fn removeToken(g: *Gate, token: []const u8) void {
         const fp = fingerprint(token);
         lockSpin(&g.lock);
@@ -818,14 +918,21 @@ fn authorize(g: *Gate, req: *const http.Server.Request) ?Identity.Scheme {
         .bearer => return schemeOf(g.verify(bearerToken(req))),
         .api_key => return schemeOf(g.verifyApiKey(apiKeyPresented(g, req))),
         .either => {
-            const bearer_v = g.verify(bearerToken(req)); // ok_open ⇒ no tokens
-            const key_v = g.verifyApiKey(apiKeyPresented(g, req)); // ok_open ⇒ no keys
+            const bearer_v = g.verify(bearerToken(req)); // ok_open ⇒ no tokens/verifier
+            const key_v = g.verifyApiKey(apiKeyPresented(g, req)); // ok_open ⇒ no keys/verifier
             if (bearer_v == .ok_open and key_v == .ok_open) return .open;
             if (bearer_v == .ok_bearer) return .bearer; // precedence
             if (key_v == .ok_api_key) return .api_key;
             return null;
         },
     }
+}
+
+/// Whether the caller's exemption predicate takes this request out of the
+/// protected scope (null predicate ⇒ nothing is exempt).
+fn isExempt(g: *Gate, ctx: *router.Ctx) bool {
+    const e = g.exempt orelse return false;
+    return e.isExempt(e.ctx, ctx);
 }
 
 /// Map a single-scheme `Verdict` to the identity scheme it admits, or null
@@ -845,16 +952,16 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const in_scope = switch (g.protect) {
         .all => true,
         .mutations => isMutating(ctx.req.method),
-    };
-    if (!in_scope) return next.run(ctx); // open read: no auth, no audit
+    } and !isExempt(g, ctx);
+    if (!in_scope) return next.run(ctx); // open read / exempt route: no auth, no audit
 
     const scheme = authorize(g, ctx.req) orelse {
-        // Denied: 401, chain short-circuited. Header values are gate-owned
-        // stable memory, so no early end() is needed.
+        // Denied: 401, chain short-circuited. Header values and the body
+        // are gate-owned stable memory, so no early end() is needed.
         ctx.res.setStatus(401);
         try ctx.res.setHeader("WWW-Authenticate", g.challenge);
-        try ctx.res.setHeader("Content-Type", "text/plain");
-        try ctx.res.writeAll("Unauthorized\n");
+        try ctx.res.setHeader("Content-Type", g.deny_content_type);
+        try ctx.res.writeAll(g.deny_body);
         auditDenied(g, ctx);
         return;
     };
@@ -978,6 +1085,98 @@ test "rotation: extra tokens, addToken/removeToken, old works until removed" {
     try testing.expectEqual(@as(usize, 3), g.tokenCount());
     try testing.expectEqual(Gate.Verdict.denied, g.verify("primary"));
     try testing.expectEqual(Gate.Verdict.ok_bearer, g.verify("fresh"));
+}
+
+/// A dynamic verifier that records how often it was consulted, so a test
+/// can prove the static set is scanned FIRST (a static hit must never
+/// reach the callback). Compares with the module's constant-time helper —
+/// the escape hatch must not reintroduce a timing leak via
+/// `std.mem.eql`.
+const CountingVerifier = struct {
+    want: []const u8,
+    calls: usize = 0,
+
+    fn verify(ctx: ?*anyopaque, presented: []const u8) bool {
+        const v: *CountingVerifier = @ptrCast(@alignCast(ctx.?));
+        v.calls += 1;
+        return secretEqual(presented, v.want);
+    }
+};
+
+test "verify: caller-supplied token verifier (escape hatch), consulted only after the static set misses" {
+    var dyn: CountingVerifier = .{ .want = "rotated-elsewhere" };
+    var g = try Gate.init(testing.allocator, .{
+        .token = "static-tok",
+        .token_verify = CountingVerifier.verify,
+        .token_verify_ctx = &dyn,
+    });
+    defer g.deinit();
+
+    // Static hit: admitted without the callback being consulted at all.
+    try testing.expectEqual(Gate.Verdict.ok_bearer, g.verify("static-tok"));
+    try testing.expectEqual(@as(usize, 0), dyn.calls);
+
+    // Static miss → the dynamic store decides: accept, then reject.
+    try testing.expectEqual(Gate.Verdict.ok_bearer, g.verify("rotated-elsewhere"));
+    try testing.expectEqual(@as(usize, 1), dyn.calls);
+    try testing.expectEqual(Gate.Verdict.denied, g.verify("rotated-elsewherE")); // same length
+    try testing.expectEqual(@as(usize, 2), dyn.calls);
+
+    // Nothing presented: no candidate to hand the store → denied, uncalled.
+    try testing.expectEqual(Gate.Verdict.denied, g.verify(null));
+    try testing.expectEqual(@as(usize, 2), dyn.calls);
+}
+
+test "verify: a token verifier alone closes the bearer open plane" {
+    // The consumer case: no static tokens at all, every token living in an
+    // external store. `allow_when_unconfigured` must NOT reopen the plane
+    // just because the static set is empty — the verifier IS the
+    // configuration (mirrors `api_key_verify`).
+    var dyn: CountingVerifier = .{ .want = "from-the-store" };
+    var g = try Gate.init(testing.allocator, .{
+        .allow_when_unconfigured = true, // would admit everything on its own…
+        .token_verify = CountingVerifier.verify,
+        .token_verify_ctx = &dyn,
+    });
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 0), g.tokenCount());
+    try testing.expectEqual(Gate.Verdict.denied, g.verify("wrong")); // …and does not
+    try testing.expectEqual(Gate.Verdict.denied, g.verify(null));
+    try testing.expectEqual(Gate.Verdict.ok_bearer, g.verify("from-the-store"));
+
+    // The same gate WITHOUT the verifier admits everything — that
+    // difference is exactly what the verifier's presence buys.
+    var open = try Gate.init(testing.allocator, .{ .allow_when_unconfigured = true });
+    defer open.deinit();
+    try testing.expectEqual(Gate.Verdict.ok_open, open.verify("wrong"));
+}
+
+test "init: every allocation failure unwinds the ones before it (no leak on any path)" {
+    // `init` performs six independent allocations in sequence (tokens, api
+    // keys, challenge, api_key_header, api_key_query_param, deny_body,
+    // deny_content_type); each needs an `errdefer` covering everything
+    // already taken. Nothing but this notices a missing one -- the ordinary
+    // tests never fail an allocation, so the unwinding path is only ever
+    // executed here. Verified decisive by deleting the `deny_body` errdefer:
+    // this test then reports the leak and no other test moves.
+    //
+    // Options deliberately maximal: every optional allocation is taken, so
+    // the failure index sweeps across all of them.
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        var g = Gate.init(failing.allocator(), .{
+            .token = "t",
+            .extra_tokens = &.{ "t2", "t3" },
+            .api_key = "k",
+            .extra_api_keys = &.{"k2"},
+            .realm = "r",
+            .api_key_query_param = "q",
+            .deny_body = "{\"error\":\"unauthorized\"}",
+            .deny_content_type = "application/json",
+        }) catch continue; // OOM at step i — errdefers must have freed steps < i
+        g.deinit();
+    }
 }
 
 test "throttle: coalesces one key within the window, folds the suppressed count (seed semantics)" {
@@ -1715,6 +1914,136 @@ test "rotation over the wire: new token works, old works until removed" {
     g.removeToken("old-tok");
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer old-tok\r\n"), &buf), "401");
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer new-tok\r\n"), &buf), "200");
+}
+
+/// A token store the gate does not own — the operator token file another
+/// process rewrites. The gate never holds these secrets; it asks.
+const FileTokenStore = struct {
+    current: []const u8,
+
+    fn verify(ctx: ?*anyopaque, presented: []const u8) bool {
+        const s: *FileTokenStore = @ptrCast(@alignCast(ctx.?));
+        return secretEqual(presented, s.current);
+    }
+};
+
+test "dynamic token store over the wire: rotation behind the gate's back, no addToken/removeToken" {
+    var store: FileTokenStore = .{ .current = "tok-v1" };
+    var g = try Gate.init(testing.allocator, .{
+        // No static token at all, and the open plane explicitly opted into:
+        // the verifier's presence still closes it.
+        .allow_when_unconfigured = true,
+        .token_verify = FileTokenStore.verify,
+        .token_verify_ctx = &store,
+    });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer tok-v1\r\n"), &buf), "200");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", ""), &buf), "401"); // plane stayed closed
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer tok-v2\r\n"), &buf), "401");
+
+    // The external store rotates; the gate is never told and never held
+    // the plaintext to diff.
+    store.current = "tok-v2";
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer tok-v1\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer tok-v2\r\n"), &buf), "200");
+    try testing.expectEqual(@as(usize, 0), g.tokenCount());
+}
+
+test "deny response: body/content-type override is byte-exact and leaves audit + throttle untouched" {
+    var tc: TestClock = .{};
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{
+        .token = "s3cr3t",
+        .deny_body = "{\"error\":\"unauthorized\"}",
+        .deny_content_type = "application/json",
+        .on_audit = Sink.hook,
+        .on_audit_ctx = &sink,
+        .throttle_window_ms = 5_000,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, &sink);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+
+    tc.ns = std.time.ns_per_s;
+    // Only the body and its media type move — status, challenge and framing
+    // are the same bytes the default golden asserts.
+    try testing.expectEqualStrings("HTTP/1.1 401 Unauthorized\r\n" ++
+        "WWW-Authenticate: Bearer\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 24\r\n" ++
+        "\r\n" ++
+        "{\"error\":\"unauthorized\"}", runWire(&gr.r, wire("POST", "/t", "X-Real-IP: 4.4.4.4\r\n"), &buf));
+
+    // Audit unchanged: still one unauthenticated 401 entry…
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expect(!sink.recs[0].authed);
+    try testing.expectEqual(@as(u16, 401), sink.recs[0].status);
+    try testing.expectEqual(@as(u32, 0), sink.hits); // handler never ran
+    // …and the throttle still coalesces the next denial from that client.
+    try expectStatus(runWire(&gr.r, wire("POST", "/t", "X-Real-IP: 4.4.4.4\r\n"), &buf), "401");
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    // An authenticated request is untouched by the override.
+    try expectStatus(runWire(&gr.r, wire("POST", "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "201");
+}
+
+test "deny response: an empty body is allowed (bodiless 401)" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .deny_body = "" });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+
+    const got = runWire(&gr.r, wire("GET", "/t", ""), &buf);
+    try expectStatus(got, "401");
+    try expectHeaderLine(got, "WWW-Authenticate: Bearer");
+    try testing.expectEqualStrings("", bodyOf(got));
+}
+
+/// Exempt every request under `/healthz` — the liveness probe of an
+/// otherwise fully gated service.
+fn exemptHealthz(_: ?*anyopaque, ctx: *router.Ctx) bool {
+    return std.mem.startsWith(u8, ctx.req.path, "/healthz");
+}
+
+test "middleware: exempt routes bypass the gate entirely (no identity, no audit); the rest stays gated" {
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{
+        .token = "s3cr3t",
+        .protect = .all,
+        .exempt = .{ .isExempt = exemptHealthz },
+        .on_audit = Sink.hook,
+        .on_audit_ctx = &sink,
+    });
+    defer g.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &sink;
+    try r.use(g.middleware());
+    try r.get("/healthz", hNoIdentity); // asserts ctx.data stayed null
+    try r.post("/healthz", hNoIdentity);
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+
+    // Exempt read: passes with no credentials and gets no identity…
+    const got = runWire(&r, wire("GET", "/healthz", ""), &buf);
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("open", bodyOf(got));
+    // …and an exempt MUTATION is neither gated nor audited.
+    try expectStatus(runWire(&r, wire("POST", "/healthz", ""), &buf), "200");
+    try testing.expectEqual(@as(usize, 0), sink.len);
+
+    // Everything else is still gated — which `.mutations` could not have
+    // achieved without opening every read.
+    try expectStatus(runWire(&r, wire("GET", "/t", ""), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "200");
 }
 
 /// Handler requiring the API-key identity (like `hSecretMutation` but for
