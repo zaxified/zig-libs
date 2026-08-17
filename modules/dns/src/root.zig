@@ -55,6 +55,9 @@ pub const Record = message.Record;
 pub const Message = message.Message;
 pub const encodeQuery = message.encodeQuery;
 pub const decode = message.decode;
+pub const max_query_len = message.max_query_len;
+pub const QueryOptions = message.QueryOptions;
+pub const EncodeError = message.EncodeError;
 
 // ── netaddr bridges ─────────────────────────────────────────────────────────
 
@@ -158,6 +161,25 @@ test "reverseName round-trips through the codec" {
     defer msg.deinit();
     try testing.expectEqualStrings(rev, msg.questions[0].name);
     try testing.expectEqual(Type.ptr, msg.questions[0].ty);
+}
+
+test "codec-only consumer never names the message submodule" {
+    // max_query_len / QueryOptions / EncodeError reachable straight off the
+    // root import — a size-sensitive codec consumer must not have to name
+    // `dns.message` (which would put `Resolver`, and thus `http`, in reach).
+    var buf: [max_query_len]u8 = undefined;
+    const options: QueryOptions = .{ .id = 42, .edns_udp_size = null };
+    const packet: []const u8 = try encodeQuery(&buf, "example.com", .a, options);
+    try testing.expect(packet.len > 0 and packet.len <= max_query_len);
+
+    // A too-long name (> 253 text chars, RFC 1035 §3.1) surfaces the
+    // EncodeError variant through the root type.
+    var long_name_buf: [300]u8 = undefined;
+    @memset(&long_name_buf, 'a');
+    const bad_result = encodeQuery(&buf, &long_name_buf, .a, .{});
+    try testing.expectError(error.NameTooLong, bad_result);
+    const err_value: EncodeError = error.NameTooLong;
+    try testing.expectEqual(EncodeError.NameTooLong, err_value);
 }
 
 test "recordIp extracts A/AAAA only" {

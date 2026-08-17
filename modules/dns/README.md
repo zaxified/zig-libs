@@ -60,8 +60,9 @@ defer doh.deinit();
 var m2 = try doh.query("example.com", .aaaa);
 defer m2.deinit();
 
-// Low-level codec, transport-agnostic:
-var buf: [dns.message.max_query_len]u8 = undefined;
+// Low-level codec, transport-agnostic — a codec-only consumer never needs
+// to name `dns.message` (which would pull in `Resolver`, and with it `http`):
+var buf: [dns.max_query_len]u8 = undefined;
 const packet = try dns.encodeQuery(&buf, "example.com", .a, .{ .id = 1 });
 var decoded = try dns.decode(gpa, response_bytes);
 defer decoded.deinit();
