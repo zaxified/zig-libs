@@ -397,6 +397,58 @@ pub fn build(b: *std.Build) void {
         one.dependOn(&run.step);
     }
 
+    // `zig build check-portable` — compile every `platform = .any` module for a
+    // 32-bit target.
+    //
+    // WHY A BUILD STEP AND NOT A COMPTIME CHECK. The obvious idea is a
+    // `comptime` assertion inside the module, and it cannot work: comptime is
+    // evaluated FOR the target being built, so on an x86_64 build `usize` is 64
+    // bits at comptime too and there is nothing for an assertion to notice. The
+    // bug this catches -- `qr`'s BitWriter shifting a `usize` by a `u6`, legal
+    // on a 64-bit target and a compile error on a 32-bit one -- is invisible
+    // until something actually compiles for 32 bits. Nothing did: every lane in
+    // the CI matrix is 64-bit, arm64 included, so a module can claim
+    // `platform = .any` for months while being unbuildable on half of what that
+    // claim covers.
+    //
+    // Compile-only on purpose: `zig build-obj` type-checks and generates code
+    // for the whole module without a wasm runtime in the loop, which is what
+    // makes it cheap enough for the change-aware gate.
+    //
+    // The list is read from the sources rather than repeated here. `pub const
+    // meta` is the canonical declaration (CONVENTIONS.md), and a second list in
+    // this file would drift from it silently -- the failure mode being a module
+    // that quietly stops being checked.
+    const portable = b.step("check-portable", "Compile every platform=.any module for wasm32");
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    var wasm_mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
+    for (module_list) |m| {
+        wasm_mods.put(m.name, b.createModule(.{
+            .root_source_file = b.path(b.fmt("modules/{s}/src/root.zig", .{m.name})),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        })) catch @panic("OOM");
+    }
+    for (module_list) |m| {
+        const mod = wasm_mods.get(m.name).?;
+        for (m.deps) |dep| mod.addImport(dep, wasm_mods.get(dep).?);
+    }
+    for (module_list) |m| {
+        if (!declaresAnyPlatform(b, b.graph.io, m.name)) continue;
+        const obj = b.addObject(.{
+            .name = b.fmt("portable-{s}", .{m.name}),
+            .root_module = wasm_mods.get(m.name).?,
+        });
+        portable.dependOn(&obj.step);
+        // Per-module step, the same shape as `test-<name>`: a red 196-module
+        // step that does not say which module is red is one nobody runs twice.
+        const one = b.step(
+            b.fmt("portable-{s}", .{m.name}),
+            b.fmt("Compile {s} for wasm32", .{m.name}),
+        );
+        one.dependOn(&obj.step);
+    }
+
     // `zig build check-testonly` — prove a test-only dep really is test-only.
     //
     // The claim `test_deps` makes is that the PUBLISHED module never needs
@@ -2540,4 +2592,17 @@ fn checkDepsMatch(
         );
     }
     failed.* = true;
+}
+
+/// Whether a module's `pub const meta` claims `platform = .any`. Read from the
+/// source because that block is the canonical declaration; a duplicate list in
+/// this file would be a second thing to keep in step.
+fn declaresAnyPlatform(b: *std.Build, io: std.Io, name: []const u8) bool {
+    const src = b.build_root.handle.readFileAlloc(
+        io,
+        b.fmt("modules/{s}/src/root.zig", .{name}),
+        b.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return false;
+    return std.mem.indexOf(u8, src, ".platform = .any") != null;
 }

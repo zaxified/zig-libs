@@ -204,6 +204,7 @@ harness_smoke() {
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
     step "check-fuzz" zig build check-fuzz
+    step "check-portable" zig build check-portable
     run_modules "$plain $netns"
     graph_save
     summary
@@ -1017,6 +1018,14 @@ cmd_changed() {
     # makes the same claim a skipped test makes, which is that someone looked.
     step "check-fuzz" zig build check-fuzz
 
+    # 32-bit compile of every `platform = .any` module. ~6s cold for all 195,
+    # near-free warm, and it is the only thing in this gate that can see a class
+    # the whole CI matrix is blind to: every lane is 64-bit, arm64 included, so
+    # `usize` is 64 bits everywhere the suite has ever run. `platform = .any`
+    # covers wasm32 and arm32 too, and until this step existed nothing had ever
+    # compiled for either.
+    step "check-portable" zig build check-portable
+
     if [[ -z "$closure" ]]; then
         graph_save
         summary
@@ -1097,6 +1106,7 @@ cmd_all() {
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
     step "check-fuzz" zig build check-fuzz
+    step "check-portable" zig build check-portable
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
     # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
     # -- which needs valgrind -- is deliberately NOT in this gate. Left alone
@@ -1227,6 +1237,11 @@ Usage: scripts/test.sh [subcommand] [args]
                         that debt was burned down on 2026-08-14 and it went
                         in the same day. This paragraph said the opposite for
                         the few hours in between.
+                        `zig build check-portable` likewise: it compiles every
+                        `platform = .any` module for wasm32-freestanding, ~6s
+                        cold for all 195 and near-free warm. It is the only
+                        check here that can see a 32-bit-only failure, because
+                        every lane in the CI matrix is 64-bit, arm64 included.
   build [FLAGS]         the same gate as `all`, stopping after the compile:
                         every static check, then every module compiled, and no
                         test run at all. For the Debug lane, whose whole claim

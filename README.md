@@ -32,7 +32,9 @@ carry their own attribution; it does not catalogue provenance.
 > tests run in three release modes; mutation audits across the collection ask whether each
 > test would actually go red; constant-time claims are machine-checked where a row in
 > `scripts/ctgrind-expected.tsv` says so; `zig build check-fuzz` requires a fuzz harness on
-> every module that parses foreign bytes; and each module's `SPEC.md` carries an
+> every module that parses foreign bytes; `zig build check-portable` compiles every
+> `platform = .any` module for a 32-bit target, which the CI matrix cannot do since every
+> lane in it is 64-bit; and each module's `SPEC.md` carries an
 > **anchor grade** saying where its expected values come from — `EXTERNAL` (published
 > vectors, bytes captured from a foreign implementation, or a live foreign peer) down to
 > `SELF` (we wrote them from our own reading of the spec).
