@@ -4,6 +4,16 @@ Online round-trip-time statistics for probe/ping engines — running
 min / max / mean / population-stddev / **RFC 3550 jitter** / packet-loss %,
 O(1) per sample, zero allocation, no syscalls.
 
+> **Before you adopt this — two numbers will not match a naive implementation, on purpose:**
+> - `jitter_ns` is **RFC 3550 §6.4.1's smoothed interarrival jitter**, `J += (|D| - J)/16` applied
+>   to successive RTT differences — not a mean absolute delta. If you are replacing a
+>   mean-absolute-delta jitter calculation, the published numbers **will move**. That is this
+>   module computing a different, spec-defined quantity, not a bug in either implementation.
+> - `mean_ns` is an **f64 Welford running mean**, computed incrementally in floating point. It
+>   differs from an exact integer divide (`sum / n` truncated to an integer) by up to one
+>   nanosecond, in the direction of keeping the fractional part a truncating integer divide throws
+>   away.
+
 - Probe-path latency accounting, generalized as a
   standalone module.
 - **Model after:** fping / iputils-ping summary stats + RFC 3550 §6.4.1
