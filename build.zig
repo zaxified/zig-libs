@@ -579,6 +579,54 @@ pub fn build(b: *std.Build) void {
     });
     check_fuzz.dependOn(check_fuzz_inner);
 
+    // Global-allocator gate: `zig build check-global-alloc`. CONVENTIONS.md
+    // §1.2 says "caller-supplied allocators, no hidden globals" for the whole
+    // collection; nothing enforced it until a caller-supplied-allocator bug
+    // in `filestore.readExpiry` reached for `std.heap.page_allocator` instead
+    // of the allocator its own caller had already passed in. The fix guarded
+    // that ONE call site; nothing stopped the same shortcut from reappearing
+    // there or anywhere else, because no test can observe which allocator a
+    // function reached for -- only a source-level gate can.
+    //
+    // Ground truth (measured 2026-08-18 across every `modules/*/src/*.zig`,
+    // `bench.zig` files excluded from the scan entirely): 30 process-global
+    // allocator uses. 9 sit lexically inside a `test { ... }` block -- always
+    // fine, a test's own allocator choice is the test's business, and this
+    // gate does not even look at those. The remaining 21 needed a human
+    // verdict: 16 are legitimate but NOT inside a literal `test` block (a
+    // detached thread body a test spawns, a fork()'d child that never returns
+    // to the parent's test state, a fixture cache deliberately outliving
+    // `testing.allocator`'s per-test teardown, or -- `bls12_381`'s trusted-
+    // setup cache and `bulletproofs`' allocator-less-by-signature verifiers --
+    // a documented, deliberate part of the module's own API) and now carry an
+    // inline `global-alloc-ok:` marker recording why, right next to the call
+    // it exempts. The other 5 were bench-file uses, exempted by filename
+    // rather than by marker since a benchmark is never the published module.
+    //
+    // Deliberately NOT gating `std.testing.allocator`'s location: unlike
+    // `std.heap.page_allocator`, `std.testing.allocator` carries its own
+    // `@compileError("testing allocator used when not testing")` inside `std`
+    // itself (see `lib/std/testing.zig`) -- it is physically impossible to
+    // compile a reference to it outside `builtin.is_test`, so there is no
+    // production code path for this gate to catch. What IS common is fuzz
+    // harnesses (`fn fuzzFoo(...)`, called via `testing.fuzz(fuzzFoo)` from an
+    // actual `test` block) reading `testing.allocator` from a plain top-level
+    // `fn`, not literal `test` syntax -- measured at 85 such sites across
+    // ~40 modules. That is the repo's own blessed idiom for fuzz-harness
+    // leak-checking (`check-fuzz`, above, already audits harness coverage),
+    // not a hidden-global bug class, and 85 sites is exactly the "large,
+    // scattered, and impossible to distinguish mechanically from a violation"
+    // shape CONVENTIONS says not to gate -- so it stays out of this gate.
+    const check_global_alloc = b.step("check-global-alloc", "Verify every process-global allocator use outside a test/bench is marked and justified");
+    const check_global_alloc_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_global_alloc_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-global-alloc",
+        .owner = b,
+        .makeFn = checkGlobalAlloc,
+    });
+    check_global_alloc.dependOn(check_global_alloc_inner);
+
     // Kernel-UAPI constant-drift gate: `zig build check-uapi` (campaign
     // C-09, wave-2 audit K3). `conntrack`/`devlink`/`ethtool`/`nl80211` each
     // transcribe hundreds of kernel netlink constants by hand; the audit
@@ -2045,6 +2093,154 @@ fn checkFuzz(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
             .{ n_obligated, n_covered, n_exempt, n_failing, n_harnesses },
         );
         return step.fail("fuzz-coverage gap — see errors above", .{});
+    }
+}
+
+/// The identifiers this gate treats as a process-global allocator -- the
+/// class CONVENTIONS.md §1.2 calls a "hidden global", as opposed to one a
+/// caller passed in. `std.testing.allocator` is deliberately absent; see the
+/// long comment above `check_global_alloc`'s `b.step` call for why.
+const global_alloc_needles = [_][]const u8{
+    "std.heap.page_allocator",
+    "std.heap.smp_allocator",
+    "std.heap.c_allocator",
+    "std.heap.GeneralPurposeAllocator(",
+    "std.heap.DebugAllocator(",
+};
+
+const global_alloc_marker = "global-alloc-ok:";
+
+/// True when `line` starts, at column 0, a top-level declaration -- the unit
+/// this gate tracks "am I inside a `test` block" against. Zig fmt never
+/// indents a top-level declaration, so column 0 is a reliable boundary; it is
+/// deliberately NOT full brace-depth tracking, which `.{}` struct literals and
+/// `"{d}"`-style format strings would corrupt (the same "text, not semantics"
+/// tradeoff `check-fuzz`'s `fileHasByteAcceptingPubFn` documents).
+fn isTopLevelDecl(line: []const u8) bool {
+    if (line.len == 0 or line[0] == ' ' or line[0] == '\t') return false;
+    const starts = [_][]const u8{
+        "test ",      "test\"",     "test{",
+        "pub fn ",    "fn ",        "pub inline fn ",
+        "inline fn ", "pub const ", "const ",
+        "pub var ",   "var ",
+    };
+    for (starts) |s| if (std.mem.startsWith(u8, line, s)) return true;
+    return false;
+}
+
+fn isTopLevelTestDecl(line: []const u8) bool {
+    if (line.len == 0 or line[0] == ' ' or line[0] == '\t') return false;
+    return std.mem.startsWith(u8, line, "test ") or
+        std.mem.startsWith(u8, line, "test\"") or
+        std.mem.startsWith(u8, line, "test{");
+}
+
+/// The text after `global-alloc-ok:` on a line, trimmed. Empty when the
+/// marker is not present.
+fn globalAllocMarkerReason(line: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, line, global_alloc_marker) orelse return "";
+    return std.mem.trim(u8, line[at + global_alloc_marker.len ..], " \t\r");
+}
+
+/// `zig build check-global-alloc` -- see the long comment above the `b.step`
+/// call for what this enforces and the measured ground truth behind it.
+///
+/// Per module, per `.zig` file directly under `modules/<name>/src/` (one
+/// level, matching `scanModuleForFuzz`; `bench.zig` files are skipped
+/// entirely -- a benchmark is never the published module, and always wants
+/// its own allocator, not a caller's). For each line NOT inside a literal
+/// `test { ... }` block (tracked via `isTopLevelDecl`/`isTopLevelTestDecl`)
+/// and not a full-line comment, a `global_alloc_needles` match must carry a
+/// same-line `// global-alloc-ok: <reason>` marker, or the gate fails. A
+/// marker with no reason, or a marker on a line that matches no needle
+/// (a stale exemption -- CONVENTIONS' "exemptions cannot quietly outlive
+/// their reason", same rule `checkNonGoals` enforces for `non-goal-ok`), is
+/// itself an error.
+fn checkGlobalAlloc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+
+    var failed = false;
+    var n_checked: usize = 0;
+    var n_in_test: usize = 0;
+    var n_exempt: usize = 0;
+
+    for (module_list) |m| {
+        const dir_path = b.fmt("modules/{s}/src", .{m.name});
+        var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".zig")) continue;
+            if (std.mem.endsWith(u8, e.name, "bench.zig")) continue;
+            const path = b.fmt("{s}/{s}", .{ dir_path, e.name });
+            const src = try b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(8 * 1024 * 1024));
+
+            var in_test = false;
+            var lines = std.mem.splitScalar(u8, src, '\n');
+            var line_no: usize = 0;
+            while (lines.next()) |line| {
+                line_no += 1;
+                if (isTopLevelDecl(line)) in_test = isTopLevelTestDecl(line);
+
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (std.mem.startsWith(u8, trimmed, "//")) continue; // prose mention, not a use
+
+                var matched: ?[]const u8 = null;
+                for (global_alloc_needles) |needle| {
+                    if (std.mem.indexOf(u8, line, needle) != null) {
+                        matched = needle;
+                        break;
+                    }
+                }
+                const reason = globalAllocMarkerReason(line);
+
+                if (matched) |needle| {
+                    n_checked += 1;
+                    if (in_test) {
+                        n_in_test += 1;
+                        continue;
+                    }
+                    if (reason.len == 0) {
+                        std.log.err(
+                            "{s}:{d}: {s} reaches for a process-global allocator outside a `test` block, " ++
+                                "with no `// global-alloc-ok: <reason>` marker -- CONVENTIONS.md §1.2 wants " ++
+                                "caller-supplied allocators; take one as a parameter, or justify the exception " ++
+                                "inline",
+                            .{ path, line_no, needle },
+                        );
+                        failed = true;
+                        continue;
+                    }
+                    if (reason.len < 4) {
+                        std.log.err(
+                            "{s}:{d}: `global-alloc-ok:` states no real reason -- an exemption nobody can " ++
+                                "argue with is one nobody will revisit",
+                            .{ path, line_no },
+                        );
+                        failed = true;
+                        continue;
+                    }
+                    n_exempt += 1;
+                } else if (reason.len != 0) {
+                    std.log.err(
+                        "{s}:{d}: `global-alloc-ok:` marker present but this line uses no global allocator " ++
+                            "it could exempt -- stale exemption, delete it",
+                        .{ path, line_no },
+                    );
+                    failed = true;
+                }
+            }
+        }
+    }
+
+    if (failed) {
+        std.log.warn(
+            "check-global-alloc: {d} uses checked, {d} inside test blocks, {d} exempted",
+            .{ n_checked, n_in_test, n_exempt },
+        );
+        return step.fail("global-allocator gate failed -- see errors above", .{});
     }
 }
 

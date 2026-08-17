@@ -595,7 +595,7 @@ fn mockServe(ctx: *MockCtx) void {
 }
 
 fn mockConnThread(ctx: *MockCtx, fd: i32, client_id: u32) void {
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body (mockServe's std.Thread.spawn target), not the published module; no caller-supplied allocator reaches a spawned thread
     defer _ = linux.close(fd);
     sendMessage(fd, gpa, codec.MSG.HELLO, 0, client_id, &.{}) catch return;
     while (true) {

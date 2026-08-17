@@ -204,6 +204,7 @@ harness_smoke() {
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
     step "check-fuzz" zig build check-fuzz
+    step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     run_modules "$plain $netns"
     graph_save
@@ -1017,6 +1018,7 @@ cmd_changed() {
     # been red for weeks on 21 modules: a gate that exists and is never invoked
     # makes the same claim a skipped test makes, which is that someone looked.
     step "check-fuzz" zig build check-fuzz
+    step "check-global-alloc" zig build check-global-alloc
 
     # 32-bit compile of every `platform = .any` module. ~6s cold for all 195,
     # near-free warm, and it is the only thing in this gate that can see a class
@@ -1106,6 +1108,7 @@ cmd_all() {
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
     step "check-fuzz" zig build check-fuzz
+    step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
     # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
@@ -1242,6 +1245,10 @@ Usage: scripts/test.sh [subcommand] [args]
                         cold for all 195 and near-free warm. It is the only
                         check here that can see a 32-bit-only failure, because
                         every lane in the CI matrix is 64-bit, arm64 included.
+                        `zig build check-global-alloc` likewise: a static
+                        source scan for `std.heap.page_allocator` and its
+                        siblings reaching outside a caller-supplied allocator
+                        (CONVENTIONS.md §1.2), sub-second warm.
   build [FLAGS]         the same gate as `all`, stopping after the compile:
                         every static check, then every module compiled, and no
                         test run at all. For the Debug lane, whose whole claim

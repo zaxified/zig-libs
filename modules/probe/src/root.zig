@@ -1399,7 +1399,7 @@ const LiveRace = struct {
         // page_allocator, not `testing.allocator`: this thread is abandoned
         // mid-syscall and never joined, so nothing may be checked for leaks
         // against it, and `threaded` is deliberately never deinitialized.
-        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: abandoned test-only thread, never joined, never deinit'd (see doc comment above)
         var lc: LiveConnector = .{ .io = threaded.io() };
         var buf: [24]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{self.port}) catch return;

@@ -480,7 +480,7 @@ fn echoDispatch(_: void, req: []const u8, gpa: std.mem.Allocator) anyerror![]con
 }
 
 fn echoServerLoop(srv: *Server, iterations: usize) void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // global-alloc-ok: test-only echo-server thread body (std.Thread.spawn target below), not the published module; no caller-supplied allocator reaches a spawned thread
     defer arena.deinit();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {

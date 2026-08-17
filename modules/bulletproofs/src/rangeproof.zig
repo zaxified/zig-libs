@@ -541,7 +541,7 @@ pub fn verify(
     // page allocator and EVERY failure — including OOM — rejects
     // (fail-closed), never panics. All inputs here are public, so no
     // constant-time concern applies.
-    const scratch = std.heap.page_allocator;
+    const scratch = std.heap.page_allocator; // global-alloc-ok: verifier is allocator-less by signature; scratch only, fail-closed on OOM (see doc comment above)
 
     // Replay step 4's transcript ops from the proof's own fields (and the
     // public V) to recover the prover's y, z, x.

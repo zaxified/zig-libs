@@ -3503,7 +3503,7 @@ fn writeProcFile(path: [*:0]const u8, data: []const u8) void {
 
 fn findLink(nl: *Socket, name: []const u8) !?Link {
     const ls = try nl.links();
-    defer std.heap.page_allocator.free(ls);
+    defer std.heap.page_allocator.free(ls); // global-alloc-ok: called only from the fork()'d child of the netns integration tests below, which never returns into the parent's test/allocator state
     for (ls) |l| if (std.mem.eql(u8, l.name(), name)) return l;
     return null;
 }
@@ -3514,7 +3514,7 @@ fn findLink(nl: *Socket, name: []const u8) !?Link {
 /// mid-flight.
 fn netnsRoundTrip() !void {
     netnsStep("Socket.open");
-    var nl = Socket.open(std.heap.page_allocator) catch |err| {
+    var nl = Socket.open(std.heap.page_allocator) catch |err| { // global-alloc-ok: fork()'d child, never returns into the parent's test/allocator state (see doc comment above)
         if (err != error.AccessDenied) std.debug.print("netns link/address/route round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
         return err;
     };
@@ -3528,7 +3528,7 @@ fn netnsRoundTrip() !void {
 }
 
 fn netnsRoundTripOn(nl: *Socket) !void {
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: called only from netnsRoundTrip, the fork()'d child of a netns integration test
 
     // 1. Create a dummy device. If the kernel has no dummy driver, fall back
     //    to `lo` — which exists in every fresh namespace, down and unaddressed.
@@ -3803,7 +3803,7 @@ fn waitOperUp(nl: *Socket, ifindex: u32) !void {
     var polls: u32 = 0;
     while (polls < oper_up_max_polls) : (polls += 1) {
         const ls = try nl.links();
-        defer std.heap.page_allocator.free(ls);
+        defer std.heap.page_allocator.free(ls); // global-alloc-ok: called only from the fork()'d child of a netns bridge integration test
         for (ls) |l| {
             if (l.index == ifindex and l.flags & IFF.RUNNING != 0) return;
         }
@@ -3830,7 +3830,7 @@ fn monotonicNanos() i128 {
 /// something about the wrong device.
 fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
     const ls = try nl.links();
-    defer std.heap.page_allocator.free(ls);
+    defer std.heap.page_allocator.free(ls); // global-alloc-ok: called only from the fork()'d child of a netns bridge integration test
     var peer: ?u32 = null;
     for (ls) |l| {
         if (l.flags & IFF.LOOPBACK != 0) continue;
@@ -3847,7 +3847,7 @@ fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
 /// an error means a real failure of this module.
 fn netnsBridgeRoundTrip() !bool {
     netnsStep("Socket.open");
-    var nl = Socket.open(std.heap.page_allocator) catch |err| {
+    var nl = Socket.open(std.heap.page_allocator) catch |err| { // global-alloc-ok: fork()'d child, never returns into the parent's test/allocator state
         if (err != error.AccessDenied) std.debug.print("netns bridge round-trip failed: step={s} err={s}\n", .{ netns_step, @errorName(err) });
         return err;
     };
@@ -3859,7 +3859,7 @@ fn netnsBridgeRoundTrip() !bool {
 }
 
 fn netnsBridgeRoundTripOn(nl: *Socket) !bool {
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: called only from netnsBridgeRoundTrip, the fork()'d child of a netns integration test
 
     // 1. Bridge with VLAN filtering on, plus a veth pair to enslave.
     netnsStep("bridgeAdd");

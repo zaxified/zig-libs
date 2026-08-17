@@ -428,7 +428,7 @@ const SetupParseTask = struct {
 /// spawning fails. Result arrays are `page_allocator`-owned (they back
 /// the process-wide cache).
 fn parseAndValidateEmbeddedSetup() KzgError!TrustedSetup {
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: backs validated_setup_cache, a documented process-wide cache (see its doc comment above)
     var lines = std.mem.tokenizeScalar(u8, trusted_setup_txt, '\n');
 
     const n_g1 = try parseLineCount(lines.next());
@@ -520,7 +520,7 @@ pub fn loadTrustedSetup(allocator: std.mem.Allocator) KzgError!TrustedSetup {
     if (validated_setup_cache.load(.acquire)) |cached| return dupeSetup(allocator, cached);
 
     var fresh = try parseAndValidateEmbeddedSetup();
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: publishes into validated_setup_cache, the same process-wide cache
     const boxed = gpa.create(TrustedSetup) catch return error.OutOfMemory;
     boxed.* = fresh;
     if (validated_setup_cache.cmpxchgStrong(null, boxed, .acq_rel, .acquire)) |raced| {
@@ -1398,7 +1398,7 @@ var test_setup_cache: ?TrustedSetup = null;
 /// checker should track.
 fn testSetup() *const TrustedSetup {
     if (test_setup_cache == null) {
-        test_setup_cache = loadTrustedSetup(std.heap.page_allocator) catch
+        test_setup_cache = loadTrustedSetup(std.heap.page_allocator) catch // global-alloc-ok: process-lifetime test fixture, outlives testing.allocator's per-test teardown (see doc comment above)
             @panic("failed to load the embedded trusted setup for tests");
     }
     return &test_setup_cache.?;

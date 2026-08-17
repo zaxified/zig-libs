@@ -1366,7 +1366,7 @@ var fuzz_signed_doc: ?[]u8 = null;
 
 fn fuzzSignedDoc() ![]const u8 {
     if (fuzz_signed_doc) |d| return d;
-    const sd = try buildSignedRsaDoc(std.heap.page_allocator, false, false);
+    const sd = try buildSignedRsaDoc(std.heap.page_allocator, false, false); // global-alloc-ok: test/fuzz fixture cache outliving testing.allocator's per-test teardown (see doc comment above)
     fuzz_signed_doc = sd.xml;
     return sd.xml;
 }

@@ -380,7 +380,7 @@ pub fn verifyIpa(
     // the page allocator and every failure — including OOM — returns false
     // (fail-closed), never panics; all of it is public, so no constant-time
     // concern applies (matching `rangeproof.verify`).
-    const alloc = std.heap.page_allocator;
+    const alloc = std.heap.page_allocator; // global-alloc-ok: verifier is allocator-less by signature; scratch only, fail-closed on OOM (see doc comment above)
 
     var allinv = scalarvec.one;
     for (0..rounds) |j| allinv = scalar.mul(allinv, u_inv[j]);
