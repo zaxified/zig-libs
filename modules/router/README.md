@@ -87,7 +87,62 @@ OpenAPI 3.1 document.
 | 404 / 405 | overridable `not_found` / `method_not_allowed` handlers; on 405 the router sets `Allow` (registered methods in `http.Method` order, HEAD implied by GET) before the handler runs |
 | HEAD | auto-routes to GET when no explicit HEAD route (the `ResponseWriter` suppresses the body and keeps GET framing) |
 | Trailing slash | `.redirect` (default, httprouter): 301 for GET/HEAD, 308 otherwise, toward the slash variant that has the route, query preserved; `.strict` (chi): 404. `/x` and `/x/` are always registrable as two distinct routes |
+| Path normalization | `normalize_path`, see below. Default `.remove_dot_segments`: today's behavior, unchanged |
+| Auto OPTIONS | `auto_options` (default off), see the worked example below |
 | Errors | handler/middleware errors propagate to `http.Server` → clean 500 when nothing was sent |
+
+## Auto OPTIONS — a worked precedence example
+
+`auto_options` (default `false`) answers an `OPTIONS` request `204 No Content`
+with `Allow` set, but only on a path that already has *other* routes and no
+explicit `OPTIONS` handler. It is **not** a catch-all, and a root wildcard
+registered for `OPTIONS` is not one either — both share the same precedence
+rule above the table (static > param > wildcard, with backtracking only
+when the matched node has *no* endpoint at all, for any method). Concretely:
+
+```zig
+try r.get("/thing", getThing);
+try r.options("/*catchall", corsPreflight); // meant as "catch every OPTIONS"
+
+// OPTIONS /thing       -> 405 (Allow: GET, HEAD) — corsPreflight NEVER runs
+// OPTIONS /nope/at/all -> corsPreflight runs (no other route exists there)
+```
+
+Why: `matchRec` finds `/thing` via its static child, which already has a GET
+endpoint — so it returns that node immediately, *without ever looking at the
+request's method*. Backtracking to the wildcard sibling only happens when
+the matched node has no endpoint for *any* method, and `/thing` has one
+(GET). So a root `OPTIONS /*path` route never intercepts `OPTIONS` on a path
+that has other methods registered — set `auto_options = true` (or register
+an explicit `OPTIONS` route per path) instead of relying on a wildcard
+catch-all for CORS-style preflight handling.
+
+## Path normalization (`normalize_path`)
+
+`http.Server` runs RFC 3986 §5.2.4 dot-segment removal on the request path
+**before** this module (or any handler) ever sees it, silently and
+unconditionally — `/a/../b` arrives at `dispatch` already rewritten to `/b`.
+That is invisible, and for most APIs exactly right. It is wrong for an API
+where a path segment is caller data rather than route structure — a blob
+store keyed by device/backup name, say — because a `..` segment then
+silently becomes a *different, valid route* instead of an error.
+`normalize_path` picks the posture:
+
+```zig
+var r = router.Router.init(gpa);
+r.normalize_path = .reject_non_canonical; // or .off — see below
+```
+
+| Value | Behavior |
+|---|---|
+| `.remove_dot_segments` (default) | Trust `http.Server`'s rewrite — today's behavior, unchanged |
+| `.reject_non_canonical` | 400, before any route matches, whenever the raw target's path isn't already canonical (`..`/`.`/`/..` etc. would have changed it) |
+| `.off` | Bypass the rewrite for routing: dispatch on — and hand the handler — the raw, un-rewritten path (`ctx.req.path` reads the same raw value) |
+
+`.reject_non_canonical` is the right choice for a key-in-path API: it turns
+the silent reroute into a 400 instead. `.off` is for a caller that wants to
+interpret the raw bytes itself (e.g. reject `..` as an invalid key, rather
+than as an invalid *path*).
 
 ## Verification
 

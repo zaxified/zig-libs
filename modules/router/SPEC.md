@@ -28,12 +28,25 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 ## Threat model / out of scope
 
-Not a security primitive: raw byte matching means no path normalization, so anything relying on
-percent-decoding or case-insensitive routing for safety must handle it itself (or ahead of the
-router). `router` does not authenticate or authorize — identity attaches via a `Ctx.data` slot
-middleware (e.g. an auth layer) points at, not via router state. Handler/middleware errors
-propagate to `http.Server`, which produces a plain 500 when nothing was sent; the router does not
-catch or classify errors itself.
+Not a security primitive: raw byte matching means no percent-decoding and no case folding — ever,
+regardless of `normalize_path` — so anything relying on either for safety must handle it itself (or
+ahead of the router). `router` does not authenticate or authorize — identity attaches via a
+`Ctx.data` slot middleware (e.g. an auth layer) points at, not via router state. Handler/middleware
+errors propagate to `http.Server`, which produces a plain 500 when nothing was sent; the router does
+not catch or classify errors itself.
+
+**`normalize_path` (dot-segment posture) — what this module can and cannot control.** The actual
+RFC 3986 §5.2.4 rewrite runs in `http.Server.serveOne`, upstream of `dispatch`, unconditionally —
+that call site is off-limits to this module. `req.target` is preserved raw there specifically so a
+private copy could be normalized without losing it, which is what makes all three `normalize_path`
+postures implementable entirely inside `router`: `.remove_dot_segments` (default) does nothing —
+`req.path` already carries the rewrite, unchanged from before this option existed.
+`.reject_non_canonical` recomputes the raw path from `req.target` (strip anything from `?` on) and
+byte-compares it against `req.path`; a mismatch means `removeDotSegments` changed something, so the
+request 400s before `matchRec` ever runs. `.off` overwrites `req.path` with that same raw
+recomputation before matching, so both the matcher and the handler see the un-rewritten bytes. None
+of this reaches into `http` — it is all a consequence of `req.target`/`req.path` already being two
+separate, mutable fields on a `Request` the router receives by pointer.
 
 **Match depth is bounded by this module.** `matchRec` descends one frame per path segment, and
 `max_path_segments` (256) refuses anything deeper — a 404, since nothing that deep is routable.

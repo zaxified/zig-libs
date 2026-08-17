@@ -30,7 +30,10 @@
 //!   OPTIONS handler, the router answers `204 No Content` with the same
 //!   `Allow` set the 405 path computes (runs behind the router-level
 //!   middleware, like the 404/405 fallbacks). An explicit OPTIONS route
-//!   always wins.
+//!   always wins. A root `OPTIONS /*path` route does NOT substitute for
+//!   this: precedence never backtracks across methods, only across
+//!   segments, so a path with any other route registered never falls
+//!   through to the wildcard — see README's worked example.
 //! - **Trailing slash:** `.redirect` (default, httprouter semantics)
 //!   answers 301 for GET/HEAD and 308 for other methods toward the slash
 //!   variant that has the route, preserving the query string; `.strict`
@@ -39,6 +42,13 @@
 //! - **Raw matching:** paths match byte-for-byte — no percent-decoding, no
 //!   case folding. `:param` never matches an empty segment; `*wildcard`
 //!   matches the whole remainder (without the leading slash), possibly "".
+//! - **Path normalization:** `normalize_path` (default `.remove_dot_segments`)
+//!   decides how `dispatch` treats `http.Server`'s silent, unconditional
+//!   dot-segment rewrite of `req.path` — trust it (default, unchanged),
+//!   reject a non-canonical target with 400 before matching
+//!   (`.reject_non_canonical`), or bypass it and dispatch on the raw,
+//!   un-rewritten path (`.off`). See `NormalizePath` and README's "Path
+//!   normalization" section.
 //!
 //! Introspection (what `openapi`/`metrics` build on): `Router.routes()`
 //! enumerates the registered route table in registration order, `addDoc`
@@ -175,6 +185,34 @@ pub const TrailingSlash = enum {
     strict,
 };
 
+/// How `dispatch` treats `req.path` relative to `req.target`. `http.Server`
+/// runs RFC 3986 §5.2.4 dot-segment removal on `req.path` unconditionally
+/// and silently before this module (or any handler) ever sees the request —
+/// see the module doc and README's "Path normalization" section for the
+/// full story, including why that is invisible and why it matters for a
+/// route whose path segments are caller data (an object key, a device
+/// name) rather than route structure.
+pub const NormalizePath = enum {
+    /// Trust `http.Server`'s already-normalized `req.path` (today's
+    /// behavior, unchanged): `/a/../b` dispatches exactly like `/b`. Right
+    /// when path segments are route structure and a `..` walking a prefix
+    /// is meaningless anyway.
+    remove_dot_segments,
+    /// Refuse a request whose target path is not already canonical (i.e.
+    /// `removeDotSegments` would have rewritten it) with 400, before any
+    /// route is matched or handler runs. The right posture for a key-in-path
+    /// API: a `..` segment must be an error, never a silent reroute to a
+    /// different resource.
+    reject_non_canonical,
+    /// Bypass the rewrite for routing purposes: dispatch on — and hand the
+    /// handler — the raw, un-rewritten path straight off the wire (`req.path`
+    /// is overwritten to match, so a handler reading `ctx.req.path` sees the
+    /// same value dispatch matched on). No canonicalization and no
+    /// rejection; a `..` segment is just bytes, and the handler owns
+    /// deciding what they mean.
+    off,
+};
+
 pub const AddError = error{
     OutOfMemory,
     /// Pattern must start with '/'; `:`/`*` only introduce whole segments;
@@ -253,6 +291,10 @@ pub const Router = struct {
     /// Overridable wrong-method handler; `Allow` is already set on the
     /// response when it runs.
     method_not_allowed: Handler = defaultMethodNotAllowed,
+    /// Overridable handler for a `normalize_path = .reject_non_canonical`
+    /// rejection (runs behind the router-level chain, like 404/405). Unused
+    /// under the other two `normalize_path` postures.
+    bad_request: Handler = defaultBadRequest,
     /// Opt-in automatic OPTIONS: when true, an `OPTIONS` request on a path
     /// that has registered routes but no explicit OPTIONS handler is
     /// answered `204 No Content` with the same `Allow` the 405 path builds.
@@ -260,6 +302,10 @@ pub const Router = struct {
     /// with an explicit OPTIONS route keeps using that handler.
     auto_options: bool = false,
     trailing_slash: TrailingSlash = .redirect,
+    /// See `NormalizePath`. Default `.remove_dot_segments` reproduces
+    /// today's behavior exactly: `http.Server` already ran the rewrite
+    /// before `dispatch` is ever called, and this posture just trusts it.
+    normalize_path: NormalizePath = .remove_dot_segments,
     routes_added: bool = false,
     /// Registered routes in registration order (see `routes`).
     route_list: std.ArrayList(Route),
@@ -354,6 +400,20 @@ pub const Router = struct {
         // Non-origin-form targets ("*" from OPTIONS) route nowhere.
         if (req.path.len == 0 or req.path[0] != '/')
             return r.runFallback(req, rw, r.not_found);
+
+        // `req.path` already reflects `http.Server`'s silent dot-segment
+        // rewrite by the time it reaches here — `normalize_path` decides
+        // whether that is trusted (default, below is a no-op), rejected, or
+        // bypassed by recomputing the raw path from the preserved
+        // `req.target` (see `NormalizePath`).
+        switch (r.normalize_path) {
+            .remove_dot_segments => {},
+            .reject_non_canonical => {
+                if (!std.mem.eql(u8, rawPath(req.target), req.path))
+                    return r.runFallback(req, rw, r.bad_request);
+            },
+            .off => req.path = rawPath(req.target),
+        }
 
         var params: Params = .{};
         if (matchRec(&r.root, req.path[1..], false, &params)) |node| {
@@ -659,6 +719,21 @@ fn defaultMethodNotAllowed(ctx: *Ctx) anyerror!void {
     try ctx.res.writeAll("Method Not Allowed\n");
 }
 
+fn defaultBadRequest(ctx: *Ctx) anyerror!void {
+    ctx.res.setStatus(400);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Bad Request\n");
+}
+
+/// The target's path portion — up to '?', or the whole target when there is
+/// none — i.e. `req.path` as it stood *before* `http.Server`'s dot-segment
+/// rewrite ran. `req.target` is preserved raw by `http.Server` specifically
+/// so a private copy could be normalized without losing this.
+fn rawPath(target: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, target, '?')) |i| return target[0..i];
+    return target;
+}
+
 fn defaultAutoOptions(ctx: *Ctx) anyerror!void {
     // dispatch already set the Allow header; 204 carries no body.
     ctx.res.setStatus(204);
@@ -845,6 +920,13 @@ fn hNfCustom(ctx: *Ctx) anyerror!void {
 fn hMnaCustom(ctx: *Ctx) anyerror!void {
     ctx.res.setStatus(405);
     try ctx.res.writeAll("custom-mna");
+}
+fn hRewritten(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("rewritten");
+}
+fn hRawCatch(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("raw:");
+    try ctx.res.writeAll(ctx.params.get("rest").?);
 }
 
 // Middleware order recording — via Ctx.state, zero process globals.
@@ -1222,6 +1304,73 @@ test "params never match empty segments" {
     // exists ("/users" is endpoint-less) → 404.
     try expectStatus(runWire(&r, wire("GET", "/users/"), &buf), "404");
     try expectStatus(runWire(&r, wire("GET", "/users//"), &buf), "404");
+}
+
+test "normalize_path: default dispatches the rewritten route; reject_non_canonical answers 400; off reaches the raw path" {
+    // The blob-store scenario from the module doc: a raw target containing
+    // `..` is silently rewritten by http.Server before this module ever
+    // sees it. `/v1/blob/../other` RFC-3986-normalizes to `/v1/other` — a
+    // DIFFERENT registered route, not an error.
+    var buf: [1024]u8 = undefined;
+
+    { // .remove_dot_segments (default): trust the rewrite, same as before
+        // this option existed.
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        try r.get("/v1/other", hRewritten);
+        try r.get("/v1/blob/*rest", hRawCatch);
+        const got = runWire(&r, wire("GET", "/v1/blob/../other"), &buf);
+        try expectStatus(got, "200");
+        try testing.expectEqualStrings("rewritten", bodyOf(got));
+    }
+    { // .reject_non_canonical: not already canonical → 400, no route hit.
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.normalize_path = .reject_non_canonical;
+        try r.get("/v1/other", hRewritten);
+        try r.get("/v1/blob/*rest", hRawCatch);
+        const got = runWire(&r, wire("GET", "/v1/blob/../other"), &buf);
+        try expectStatus(got, "400");
+        // A target that was already canonical still dispatches normally.
+        const ok = runWire(&r, wire("GET", "/v1/other"), &buf);
+        try expectStatus(ok, "200");
+        try testing.expectEqualStrings("rewritten", bodyOf(ok));
+    }
+    { // .off: dispatch on — and hand the handler — the raw, un-rewritten
+        // path; the wildcard capture is the literal, un-collapsed bytes.
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.normalize_path = .off;
+        try r.get("/v1/other", hRewritten);
+        try r.get("/v1/blob/*rest", hRawCatch);
+        const got = runWire(&r, wire("GET", "/v1/blob/../other"), &buf);
+        try expectStatus(got, "200");
+        try testing.expectEqualStrings("raw:../other", bodyOf(got));
+    }
+}
+
+test "documented: a root OPTIONS wildcard does NOT catch OPTIONS on a path with other methods registered" {
+    // No backtracking on a method miss (finding worked out in README's
+    // "Auto OPTIONS" section): matchRec commits to the "/thing" node — it
+    // already has a GET endpoint — before dispatch even looks at the
+    // request's method, so the OPTIONS-only wildcard sibling below is never
+    // tried for this path.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/thing", hHello);
+    try r.options("/*catchall", hCreated); // a "catch every OPTIONS" attempt
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("OPTIONS", "/thing"), &buf);
+    try expectStatus(got, "405");
+    try expectHeaderLine(got, "Allow: GET, HEAD");
+
+    // A path with no other routes at all DOES fall through to the wildcard
+    // — the catch-all itself works, it just never backtracks INTO a node
+    // that already has an endpoint for some other method.
+    const got2 = runWire(&r, wire("OPTIONS", "/nope/at/all"), &buf);
+    try expectStatus(got2, "201");
+    try testing.expectEqualStrings("created", bodyOf(got2));
 }
 
 test "middleware: outer→inner deterministic order, recorded via ctx.state" {
