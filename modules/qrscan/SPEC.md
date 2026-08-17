@@ -30,13 +30,64 @@ triple by how well it forms three corners of a square — equal legs, hypotenuse
 three is what the first implementation did, and one false positive ruined an
 otherwise perfect read.
 
+**A finder is a ring, and "ring" is a statement about connectivity.** The outer
+band left of the centre and the outer band right of it are one dark region,
+joined above and below where the scan line cannot see. Everything else that
+produces a 1:1:3:1:1 run — a fence, a line of text, a symbol's own data region —
+is three separate regions. Testing that is what makes detection tolerant of
+rotation and damage in a way the old column walk was not: it is a fact about the
+shape rather than about a second scan line staying intact.
+
+**Labelling by runs, not by pixels, is what makes it affordable.** A label per
+pixel is 16x this module's entire scratch buffer. Labelling *runs* needs one row
+of them plus a union-find over the labels, and the row scan already produces the
+runs — so the candidate test reads the labels of the three dark runs it is
+looking at, in the same pass, with nothing stored per pixel at all. Label 0 means
+the table ran out, and the test then falls back rather than rejecting: an
+unlabelled finder is still a finder.
+
+**Two passes, strict first.** The ring requirement fails on a *small* symbol,
+where the light band between ring and centre is three pixels wide and
+binarisation can weld it shut or break the ring. So the scan runs again without
+it when the first pass does not produce a readable grid. Order matters: relaxed
+first would let a version 37's own data outvote its finders, which is the failure
+the ring test exists to prevent.
+
+**"Readable" as the tie-break, without becoming a decoder.** Which pass won is
+decided by asking `qr.decode` whether the grid reads, because at version 1 the
+timing patterns are five modules long and can barely discriminate. This does not
+move the detect/decode split: the caller still gets a grid and still has to
+decode it, and a symbol that scans but cannot be read is still `qr.decode`'s
+verdict to give. What the check chooses between is two grids of this module's own
+making.
+
+**Three points fix an affine map exactly, and that is the problem.** Exactly
+means every measurement error in the three finder centres lands undiluted in the
+map, which is then extrapolated across the symbol. At version 37 the far corner
+is 158 modules out, so half a pixel of error in a centre is half a module where
+it matters and the sampler reads the neighbour. The alignment patterns are the
+fix and are the reason they exist: landmarks with known module coordinates spread
+over the whole symbol. The grid is fitted to all of them by least squares, which
+anchors the far corner and averages the noise down instead of extrapolating it
+up. Measured: a rotated version 37 at 3 pixels per module went from 9 in 72 to
+68 in 72.
+
+⚠ **The fit and the sampler must agree on where a module is.** `Fit` takes module
+*indices* and `Grid.at` samples module *centres*; fitting on one and sampling on
+the other is half a module of error everywhere. Uniformly — so the finders, the
+triple score, the dimension and the residuals all still look right, and only the
+decode fails. It cost an afternoon; there is a test that fits a known grid and
+demands it back.
+
 **How many candidates the list holds is a detection limit, not a memory
 setting.** False positives scale with the data region, so a large symbol
-produces them faster than the real finders are reached: a rotated version 13
-yields more than sixteen candidates, and with a list of sixteen the third real
-finder has nowhere to go. The symbol is then missed for want of a slot, which
-presents as "not found" with nothing in the picture to blame. Sixty-four covers
-every case measured; the cost is the triple search, which is cubic.
+produces them faster than the real finders are reached, and with a list of
+sixteen the third real finder has nowhere to go. The symbol is then missed for
+want of a slot, which presents as "not found" with nothing in the picture to
+blame. The ring test removes most of them — measured on a rotated version 13,
+3 candidates against 15 — but the relaxed pass has no such filter and is exactly
+the pass a marginal symbol depends on. Sixty-four covers every case measured; the
+cost is the triple search, which is cubic.
 
 **The ratio is rotation-invariant; the length that comes with it is not.** A line
 through the centre of a square crosses every concentric ring in proportion at any
@@ -81,7 +132,8 @@ untrusted. Bounds are checked before anything is indexed: `luma` must cover
 range-checked against the bitmap rather than assumed to land inside it. There is
 no allocation, so there is no allocation to exhaust; work is linear in pixels
 except the triple search, which is cubic in candidates and therefore capped at
-64, and the dimension search, which samples at most five grids.
+64; the dimension search, which samples at most five grids; and the label table,
+which is a fixed 4096 entries and degrades to "no label" rather than growing.
 
 Failing to find a symbol returns `NotFound`. Deciding whether a located symbol is
 *readable* is `qr.decode`'s job, and the split matters: a scanner that reports
@@ -106,9 +158,11 @@ back into the rendered module size, that a dimension one version out is rejected
 by its timing pattern, and that a large rotated symbol really does produce more
 than sixteen candidates.
 
-A wider sweep than the tests keep — five versions × three module scales × 5°
-steps — reads at every angle up to version 24. Version 37 at 3 pixels per module
-is where it stops, at about 40 %.
+A wider sweep than the tests keep — five versions × two module scales × 5° steps
+— reads at every angle at 4 pixels per module from version 1 to 24, and at 3
+pixels per module reads 68 of 72 angles at version 37 and 57 of 72 at version 1.
+The small-symbol end is the weaker one now: 21 modules at 3 pixels each is where
+binarisation is deciding a module from a pixel or two.
 
 The three defects above were all found this way rather than by reading the code,
 which is the argument for rendering the input instead of hand-writing bitmaps.
@@ -127,27 +181,20 @@ comparison is internal.
 
 ## Backlog
 
-- **Sampling accuracy at large versions.** The top item, and what the old
-  "rotation-invariant finder location" entry was really pointing at: rotation
-  itself is handled, but a rotated version 37 at 3 pixels per module reads about
-  40 % of the time. The cause is accumulated error in an affine map fitted to
-  three points 158 modules apart, which is precisely what alignment patterns
-  exist to correct — so this and perspective correction are the same piece of
-  work.
-- **Connected-component finder location.** Was assumed to be the fix for
-  rotation, and is not: the run-length scan finds finders at every angle already.
-  It remains the more robust approach for a *damaged* finder, where a run-length
-  scan needs the bands to survive intact along one line, and it would remove the
-  candidate-list ceiling. Not scheduled — no measured failure currently points at
-  it.
+- **Perspective correction.** The one substantial thing left. The grid is fitted
+  to many points but is still affine; an off-axis photograph is a projective
+  image. The alignment patterns are already located, which is most of the work —
+  what is missing is a projective fit and the numerics to keep it stable.
+- **Small symbols at three pixels per module.** A version 1 reads at about 79 %
+  of angles there, against 100 % at four pixels. Sub-pixel sampling — averaging a
+  small neighbourhood instead of reading the single centre pixel — is the
+  cheapest thing that would help, and it helps precisely where one noisy pixel
+  currently decides a module.
 - **Perspective correction.** The affine map from three finder centres is exact
   for a flat symbol square to the camera. Off-plane needs the bottom-right
   alignment pattern and a projective map.
 - **Multiple symbols per frame.** Candidates for several are already found; only
   the best triple is sampled. A wallet showing two codes at once is the case.
-- **Sub-pixel sampling.** Each module is read from a single pixel at its centre.
-  Averaging a small neighbourhood costs little and would help at small module
-  sizes, where one noisy pixel currently decides a module.
 
 ## Status
 

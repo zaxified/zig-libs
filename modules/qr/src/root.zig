@@ -364,7 +364,13 @@ fn sideFor(version: u6) u16 {
     return 17 + 4 * @as(u16, version);
 }
 
-/// Alignment-pattern centre coordinates (ISO/IEC 18004 §6.3.6). The standard
+/// Alignment-pattern centre coordinates (ISO/IEC 18004 §6.3.6), one axis; a
+/// pattern sits at every pair of these except the three that would collide with
+/// a finder. Public because a scanner needs them: they are the only landmarks
+/// inside the symbol, and a grid fitted to the three finder corners alone drifts
+/// by half a module across a large version.
+///
+/// The standard
 /// prints these as a table; they follow a rule, so the rule is what is here —
 /// with one exception the rule does not cover. Version 1 has none.
 ///
@@ -375,7 +381,7 @@ fn sideFor(version: u6) u16 {
 /// too — one rounds down, the other up. Checked against an independent encoder
 /// for every version from 2 to 40; 32 is the only one that disagrees, so it is
 /// an outlier in the standard's table rather than a rule this code is missing.
-fn alignmentCentres(version: u6, out: *[7]u16) []const u16 {
+pub fn alignmentCentres(version: u6, out: *[7]u16) []const u16 {
     if (version == 1) return out[0..0];
     if (version == 32) {
         out[0..6].* = .{ 6, 34, 60, 86, 112, 138 };

@@ -37,19 +37,27 @@ not to one that is otherwise pure arithmetic over a buffer.
 1. **Block-adaptive binarisation** — 8×8 blocks, each threshold smoothed over its
    neighbours. A global threshold cannot survive a gradient across the frame or a
    shadow across the symbol, which every hand-held capture has.
-2. **Finder location** — the 1:1:3:1:1 run scanned along rows, then confirmed
-   down the column through each candidate. Confirmation is what rejects the
-   ordinary five bands that a fence or a line of text produces.
+2. **Finder location** — the 1:1:3:1:1 run scanned along rows, with each row's
+   dark runs labelled into connected components as it goes. A finder's outer
+   band either side of its centre is **one region**, joined above and below
+   where the scan line cannot see; a fence, a line of text and a symbol's own
+   data are three separate regions. That test rejects nearly everything the
+   ratio alone accepts, and needs no second scan line to be intact — so it
+   survives rotation and damage that a column walk does not.
 3. **Orientation** — of the candidates, the triple that best forms three corners
-   of a square wins. More than three candidates is normal, not exceptional: the
-   finder ratio occurs inside the data region too, and the larger the symbol the
-   more often, which is why the candidate list holds sixty-four rather than a
-   handful.
+   of a square wins.
 4. **Sizing** — the module size a scan line measures is inflated by the symbol's
    tilt, so it is corrected before it decides the version, and the version is
    then checked against the timing patterns rather than trusted.
-5. **Sampling** — an affine map from the three finder centres, each of which sits
-   3.5 modules in from its corner.
+5. **Sampling** — a grid fitted by least squares to the three finder centres
+   **and every alignment pattern it can find**. Three points fix an affine map
+   exactly, and exactly is the problem: every measurement error in them lands
+   undiluted in the map and is then extrapolated across the whole symbol.
+
+If that pass does not produce a readable grid, the scan is repeated without the
+connected-region requirement — which is what a small symbol needs, since at
+three pixels per module the light band between ring and centre is three pixels
+wide and binarisation can weld it shut.
 
 ## Rotation
 
@@ -63,12 +71,13 @@ takes the tilt from the top edge and corrects for it.
 
 ## Limits, stated plainly
 
-- **No perspective correction.** The affine map from three finders is exact for a
-  flat, square-on symbol. A symbol photographed at an angle to the plane needs
-  the bottom-right alignment pattern and a projective map. The same missing
-  refinement is what limits large symbols at small module sizes: a rotated
-  version 37 at 3 pixels per module reads about 40 % of the time, because half a
-  module of error accumulated over 158 of them is a wrong sample.
+- **No perspective correction.** The grid is affine — fitted to many points, but
+  still affine. A symbol photographed at an angle to the plane is a projective
+  image and needs a projective map; the alignment patterns this already locates
+  are most of what such a map would be fitted to.
+- **Three pixels per module is the floor.** There, a version 37 reads at about
+  94 % of angles and a version 1 at about 79 %; at four pixels per module both
+  are 100 %. Below three, binarisation is deciding modules from single pixels.
 - **One symbol per image.** The candidate search finds several, but only the best
   triple is sampled.
 

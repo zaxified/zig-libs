@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-17** — Two things that were the same thing. Finders are now located
+  with **connected components**: each row's dark runs are labelled as the scan
+  goes, and a candidate is required to be a *ring* — the outer band either side
+  of the centre one region, joined where the scan line cannot see it. A fence, a
+  line of text and a symbol's own data region are three separate regions, so the
+  test throws away nearly everything the ratio alone accepts, and it needs no
+  second scan line to be intact, which a scratched finder may not have. Labelling
+  is by runs rather than pixels — a label per pixel would be 16x this module's
+  whole scratch buffer, a row of runs plus a union-find is a few kilobytes.
+  And the grid is now **fitted by least squares to every alignment pattern it can
+  find**, not just to the three finder corners. Three points fix an affine map
+  exactly, which sounds sufficient and is the problem: every error in them lands
+  undiluted in the map and is extrapolated across the symbol, so at version 37
+  the far corner is 158 modules away and half a pixel becomes half a module.
+  Together: a rotated version 37 at 3 pixels per module went from **9 of 72
+  angles to 68**, and version 24 at 4 pixels from 4 of 72 to 71. The small end
+  moved the other way — a version 1 at 3 pixels went from 63 to 57 — and 3 pixels
+  per module is now stated as the floor rather than implied.
+  The ring test fails on a small symbol, where a three-pixel light band can be
+  welded shut by binarisation, so the whole scan repeats without it when the
+  first pass produces nothing readable. Which pass won is settled by asking
+  `qr.decode`, because at version 1 the timing patterns are five modules long and
+  cannot discriminate; that does not make this a decoder — the caller still gets
+  a grid and still has to decode it — it chooses between two grids of our own.
+  One defect worth recording: `Fit` takes module indices, `Grid.at` samples
+  module centres, and fitting on one while sampling on the other is half a module
+  of error **everywhere**. Uniform error leaves the finders, the triple score,
+  the dimension and every intermediate value looking correct, and only the decode
+  fails.
+
 - **2026-08-17** — Rotation at any angle. The module shipped a documented limit
   of "about ten degrees", attributed to `confirmVertical` walking a strictly
   vertical column. That attribution was wrong, and measuring instead of reading

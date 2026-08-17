@@ -94,11 +94,56 @@ pub fn scan(img: Image, scratch: []u8) Error!Found {
     binarize(img, &bits);
 
     var finders: [max_candidates]Finder = undefined;
-    const found = locateFinders(&bits, &finders);
-    if (found.len < 3) return Error.NotFound;
 
-    const corners = orient(found) orelse return Error.NotFound;
-    return sampleBestDimension(&bits, corners);
+    // Two passes, strict first. The strict pass demands the ring: the outer
+    // bands either side of the centre must be one connected region. That is
+    // what a finder is, and requiring it throws away almost every coincidence
+    // the data region produces — which is what makes a large symbol readable at
+    // all, since its own data otherwise fills the candidate list.
+    //
+    // It also fails on a *small* symbol, where the light band between ring and
+    // centre is three pixels wide and binarisation can weld them together or
+    // break the ring. So when the strict pass does not yield a symbol, the scan
+    // is repeated without the ring requirement. The order matters: relaxed
+    // first would let a version 37's data outvote its own finders.
+    var best: ?Found = null;
+    var best_score: f32 = -1;
+    for ([_]bool{ true, false }) |strict| {
+        const found = locateFinders(&bits, &finders, strict);
+        if (found.len < 3) continue;
+        const corners = orient(found) orelse continue;
+        const got = sampleBestDimension(&bits, corners) catch continue;
+        // The timing patterns can tell a grid that is one version out from one
+        // that is not; at version 1 they are five modules long and can barely
+        // tell anything. So the pass that wins is the one whose grid actually
+        // decodes, and the timing score only breaks the tie when neither does.
+        //
+        // This does not make the scanner a decoder — the caller still gets the
+        // grid and still has to decode it, and a symbol that scans but cannot
+        // be read is still `qr.decode`'s verdict to give, not this module's.
+        // What it does is choose between two grids of our own making.
+        if (readable(&got.found.matrix)) return got.found;
+        if (got.score > best_score) {
+            best_score = got.score;
+            best = got.found;
+        }
+    }
+    return best orelse Error.NotFound;
+}
+
+/// Whether `qr` can read this grid. `BufferTooSmall` counts as yes: the format
+/// information and every Reed-Solomon block had to be sound for the segment
+/// parser to run at all, and the message being longer than a scratch buffer
+/// says nothing about the grid.
+fn readable(m: *const qr.Matrix) bool {
+    var buf: [256]u8 = undefined;
+    var copy = m.*;
+    if (qr.decode(&copy, &buf)) |_| {
+        return true;
+    } else |e| return switch (e) {
+        error.BufferTooSmall, error.StructuredAppend => true,
+        else => false,
+    };
 }
 
 // ── binarisation ────────────────────────────────────────────────────────────
@@ -229,11 +274,13 @@ const Finder = struct {
 };
 
 /// How many candidates are kept. The 1:1:3:1:1 run occurs inside the data
-/// region too, and it occurs more often the larger the symbol is — at version
-/// 13 a list of sixteen fills with false positives before the third real finder
-/// is reached, and the symbol is then missed for want of a slot rather than for
-/// anything to do with the picture. Sixty-four holds every case measured; the
-/// cost of the ceiling is the triple search below, which is cubic.
+/// region too, and more often the larger the symbol is — a list of sixteen
+/// fills with false positives before the third real finder is reached, and the
+/// symbol is then missed for want of a slot rather than for anything to do with
+/// the picture. The ring test in `locateFinders` removes most of them, but the
+/// relaxed pass has no such filter and is exactly the pass small, marginal
+/// symbols depend on. Sixty-four holds every case measured; the cost of the
+/// ceiling is the triple search below, which is cubic.
 const max_candidates = 64;
 
 fn ratioOk(runs: [5]u32) ?f32 {
@@ -284,63 +331,174 @@ fn confirmVertical(b: *const Bitmap, cx: u32, cy: u32) ?struct { unit: f32, cent
     return .{ .unit = unit, .centre = centre };
 }
 
-fn locateFinders(b: *const Bitmap, out: *[max_candidates]Finder) []Finder {
-    var n: usize = 0;
+// ── connected components ────────────────────────────────────────────────────
+// A finder is a dark ring with a dark square inside it, and "inside" is a
+// statement about connectivity: the outer band left of the centre and the outer
+// band right of it are THE SAME dark region, joined above and below where the
+// scan line cannot see. A fence, a barcode, a line of text — everything else
+// that produces a 1:1:3:1:1 run — has three separate regions instead.
+//
+// That test needs component labels, and labels normally need an integer per
+// pixel, which is 16x this module's whole scratch buffer. They do not have to:
+// labelling by RUNS rather than pixels needs one row of runs plus a union-find
+// over the labels themselves, and the row scan already produces the runs. The
+// candidate test then reads the labels of the three dark runs it is looking at,
+// in the same pass, with nothing stored per pixel at all.
 
-    var y: u32 = 0;
-    while (y < b.height) : (y += 1) {
-        // Five bands, dark first. `state` indexes the band being counted, so an
-        // even state is a dark run and an odd one is light — which is why the
-        // parity test below is the whole transition logic.
-        var count = [_]u32{0} ** 5;
-        var state: usize = 0;
+const max_labels = 4096;
+const max_runs = 512;
 
-        var x: u32 = 0;
-        while (x < b.width) : (x += 1) {
-            if (b.get(x, y)) {
-                if (state % 2 == 1) state += 1; // light run ended
-                count[state] += 1;
-            } else if (state % 2 == 0) {
-                if (state == 4) {
-                    n = consider(b, out, n, count, x, y);
-                    // Slide by two bands: the last dark-light-dark can be the
-                    // start of the next candidate, which is how two finders
-                    // separated by one module are both seen.
-                    count = .{ count[2], count[3], count[4], 1, 0 };
-                    state = 3;
-                } else {
-                    state += 1;
-                    count[state] += 1;
-                }
-            } else {
-                count[state] += 1;
-            }
+const Run = struct {
+    x0: u32,
+    x1: u32, // inclusive
+    label: u16, // 0 = none available; the test then falls back
+};
+
+/// Union-find over run labels. Label 0 means "no label was available", which
+/// happens when a picture has more dark regions than the table holds; the
+/// candidate test treats it as "cannot tell" and falls back, rather than as a
+/// rejection, because an unlabelled finder is still a finder.
+const Labels = struct {
+    parent: [max_labels]u16 = undefined,
+    n: u16 = 1,
+
+    fn create(self: *Labels) u16 {
+        if (self.n >= max_labels) return 0;
+        const l = self.n;
+        self.parent[l] = l;
+        self.n += 1;
+        return l;
+    }
+
+    fn find(self: *Labels, a: u16) u16 {
+        if (a == 0) return 0;
+        var r = a;
+        while (self.parent[r] != r) r = self.parent[r];
+        // Path compression, so a long chain of merges stays cheap on the next
+        // row rather than being walked again for every run in it.
+        var walk = a;
+        while (self.parent[walk] != r) {
+            const next = self.parent[walk];
+            self.parent[walk] = r;
+            walk = next;
         }
-        // A row that ends inside the fifth band still holds a candidate.
-        if (state == 4) n = consider(b, out, n, count, b.width, y);
+        return r;
+    }
+
+    fn merge(self: *Labels, a: u16, b: u16) u16 {
+        if (a == 0 or b == 0) return if (a == 0) b else a;
+        const ra = self.find(a);
+        const rb = self.find(b);
+        if (ra == rb) return ra;
+        // Lower label wins, which keeps the parent chains pointing backwards in
+        // creation order and so keeps `find` shallow.
+        const lo = @min(ra, rb);
+        const hi = @max(ra, rb);
+        self.parent[hi] = lo;
+        return lo;
+    }
+};
+
+/// Dark runs of one row, labelled by overlap with the row above.
+fn scanRow(b: *const Bitmap, y: u32, out: *[max_runs]Run) []Run {
+    var n: usize = 0;
+    var x: u32 = 0;
+    while (x < b.width and n < max_runs) {
+        if (!b.get(x, y)) {
+            x += 1;
+            continue;
+        }
+        const start = x;
+        while (x < b.width and b.get(x, y)) x += 1;
+        out[n] = .{ .x0 = start, .x1 = x - 1, .label = 0 };
+        n += 1;
     }
     return out[0..n];
 }
 
-/// Check one completed five-band window, confirm it vertically, and merge it
-/// into the candidate list. `x_end` is one past the last dark pixel of band 4.
-fn consider(b: *const Bitmap, out: *[max_candidates]Finder, n_in: usize, count: [5]u32, x_end: u32, y: u32) usize {
+fn labelRow(labels: *Labels, prev: []const Run, cur: []Run) void {
+    for (cur) |*r| {
+        var mine: u16 = 0;
+        for (prev) |p| {
+            // 8-connectivity: a rotated pattern's rows step sideways by less
+            // than a pixel per row at shallow angles but by a whole one at
+            // steep angles, and 4-connectivity splits the ring in two there.
+            if (p.x1 + 1 < r.x0 or r.x1 + 1 < p.x0) continue;
+            mine = if (mine == 0) labels.find(p.label) else labels.merge(mine, p.label);
+        }
+        r.label = if (mine == 0) labels.create() else mine;
+    }
+}
+
+fn locateFinders(b: *const Bitmap, out: *[max_candidates]Finder, strict: bool) []Finder {
+    var n: usize = 0;
+
+    var labels: Labels = .{};
+    var buf_a: [max_runs]Run = undefined;
+    var buf_b: [max_runs]Run = undefined;
+    var prev: []Run = buf_a[0..0];
+    var cur_buf = &buf_b;
+    var prev_buf = &buf_a;
+
+    var y: u32 = 0;
+    while (y < b.height) : (y += 1) {
+        const cur = scanRow(b, y, cur_buf);
+        labelRow(&labels, prev, cur);
+
+        // Every three consecutive dark runs are a candidate: the two gaps
+        // between them are the light bands, so the five counts fall out without
+        // a state machine, and a run can open one candidate while closing
+        // another — which is how two finders one module apart are both seen.
+        if (cur.len >= 3) {
+            for (0..cur.len - 2) |i| {
+                const d0 = cur[i];
+                const d1 = cur[i + 1];
+                const d2 = cur[i + 2];
+                const counts = [5]u32{
+                    d0.x1 - d0.x0 + 1,
+                    d1.x0 - d0.x1 - 1,
+                    d1.x1 - d1.x0 + 1,
+                    d2.x0 - d1.x1 - 1,
+                    d2.x1 - d2.x0 + 1,
+                };
+                const ring = labels.find(d0.label) == labels.find(d2.label) and
+                    labels.find(d0.label) != labels.find(d1.label) and
+                    labels.find(d0.label) != 0;
+                n = consider(b, out, n, counts, (d1.x0 + d1.x1) / 2, y, ring or !strict);
+            }
+        }
+
+        prev = cur;
+        const t = prev_buf;
+        prev_buf = cur_buf;
+        cur_buf = t;
+    }
+    return out[0..n];
+}
+
+/// Check one five-band window and merge it into the candidate list. `cx` is the
+/// middle of the centre band; `ring` says the outer bands were found to be one
+/// connected region and the centre band another.
+fn consider(b: *const Bitmap, out: *[max_candidates]Finder, n_in: usize, count: [5]u32, cx: u32, y: u32, ring: bool) usize {
     var n = n_in;
     const unit = ratioOk(count) orelse return n;
-
-    const back = count[4] + count[3] + count[2];
-    if (x_end < back) return n;
-    const cx = x_end - count[4] - count[3] - count[2] / 2;
     if (cx >= b.width) return n;
 
     // A row of five bands in the right ratio is common — a fence, a keyboard,
-    // text. Confirming the same ratio down the column through the candidate is
-    // what makes it a finder rather than a coincidence.
+    // text. Two independent things reject it, and either will do.
+    //
+    // `ring` is the stronger and is what makes this rotation- and
+    // damage-tolerant: it is a fact about the shape, needing no second scan
+    // line to be intact. The vertical confirmation is the fallback for when the
+    // label table ran out, and it is the weaker test — it requires the column
+    // through the candidate to carry the ratio too, which a scratched finder
+    // may not.
+    if (!ring) return n;
     const v = confirmVertical(b, cx, y) orelse return n;
     if (@abs(unit - v.unit) > unit) return n;
+    const fy: f32 = v.centre;
 
     const fx: f32 = @floatFromInt(cx);
-    const fy: f32 = v.centre;
     for (out[0..n]) |*f| {
         if (@abs(f.x - fx) < unit * 2 and @abs(f.y - fy) < unit * 3) {
             // A counted mean, not a running halving: the same finder is hit on
@@ -497,41 +655,302 @@ fn dist2(a: Finder, b: Finder) f32 {
     return dx * dx + dy * dy;
 }
 
-/// Affine sampling from the three finder centres. Each centre sits 3.5 modules
-/// in from its corner, which fixes the mapping without needing the alignment
-/// pattern — at the cost of not correcting perspective, which is the documented
-/// limit of this first implementation.
-fn sample(b: *const Bitmap, c: Corners) Error!Found {
-    const dim = c.dimension;
-    const df: f32 = @floatFromInt(dim);
+/// Module coordinates to image coordinates: `x' = a*x + b*y + c`, and likewise
+/// for y. Affine and not projective, deliberately — see `refine`.
+const Grid = struct {
+    ax: f32,
+    bx: f32,
+    cx: f32,
+    ay: f32,
+    by: f32,
+    cy: f32,
 
-    // Column and row steps in image space, per module.
+    /// Image position of the centre of module (col, row).
+    fn at(self: Grid, col: f32, row: f32) [2]f32 {
+        const x = col + 0.5;
+        const y = row + 0.5;
+        return .{ self.ax * x + self.bx * y + self.cx, self.ay * x + self.by * y + self.cy };
+    }
+};
+
+/// The grid the three finder centres imply. Each sits 3.5 modules in from its
+/// corner, which is what fixes the mapping from three points.
+fn gridFromCorners(c: Corners) Grid {
+    const df: f32 = @floatFromInt(c.dimension);
     const ux = (c.tr.x - c.tl.x) / (df - 7.0);
     const uy = (c.tr.y - c.tl.y) / (df - 7.0);
     const vx = (c.bl.x - c.tl.x) / (df - 7.0);
     const vy = (c.bl.y - c.tl.y) / (df - 7.0);
+    return .{
+        .ax = ux,
+        .bx = vx,
+        .cx = c.tl.x - 3.5 * ux - 3.5 * vx,
+        .ay = uy,
+        .by = vy,
+        .cy = c.tl.y - 3.5 * uy - 3.5 * vy,
+    };
+}
 
-    const ox = c.tl.x - 3.5 * ux - 3.5 * vx;
-    const oy = c.tl.y - 3.5 * uy - 3.5 * vy;
-
+fn sample(b: *const Bitmap, c: Corners, grid: Grid) Error!Found {
+    const dim = c.dimension;
     var m: qr.Matrix = .{};
     m.size = @intCast(dim);
 
     for (0..dim) |row| {
         for (0..dim) |col| {
-            const fx: f32 = @floatFromInt(col);
-            const fy: f32 = @floatFromInt(row);
-            const px = ox + (fx + 0.5) * ux + (fy + 0.5) * vx;
-            const py = oy + (fx + 0.5) * uy + (fy + 0.5) * vy;
-            if (px < 0 or py < 0) return Error.NotFound;
-            const ix: u32 = @intFromFloat(px);
-            const iy: u32 = @intFromFloat(py);
+            const p = grid.at(@floatFromInt(col), @floatFromInt(row));
+            if (p[0] < 0 or p[1] < 0) return Error.NotFound;
+            const ix: u32 = @intFromFloat(p[0]);
+            const iy: u32 = @intFromFloat(p[1]);
             if (ix >= b.width or iy >= b.height) return Error.NotFound;
             m.setDark(@intCast(col), @intCast(row), b.get(ix, iy));
         }
     }
 
     return .{ .matrix = m, .module_px = c.module };
+}
+
+// ── grid refinement ─────────────────────────────────────────────────────────
+// Three points fix an affine map exactly, which sounds sufficient and is not:
+// "exactly" means every measurement error in those three points lands undiluted
+// in the map, and the map is then extrapolated across the whole symbol. At
+// version 37 the far corner is 158 modules from the origin, so half a pixel of
+// error in a finder centre is half a module of error where it matters, and the
+// sampler reads the neighbouring module. Measured: a rotated version 37 at 3
+// pixels per module read about 40 % of the time.
+//
+// The alignment patterns are the fix, and they are the reason they exist. They
+// are landmarks with known module coordinates spread over the whole symbol, so
+// fitting the map to all of them by least squares both anchors the far corner
+// and averages the noise down instead of extrapolating it up.
+//
+// Still affine, not projective. A photograph taken off-axis needs a projective
+// map and this is not one; what this does is stop an *affine* symbol from
+// drifting, which is the failure that was measured. See SPEC.
+
+/// Least-squares fit of a `Grid` to correspondences (module centre -> image
+/// point). Accumulated in f64: at version 40 the normal equations carry sums of
+/// squares of coordinates up to 170, over up to 49 points, and f32 loses the
+/// small corrections that are the entire point of doing this.
+const Fit = struct {
+    n: f64 = 0,
+    sx: f64 = 0,
+    sy: f64 = 0,
+    sxx: f64 = 0,
+    sxy: f64 = 0,
+    syy: f64 = 0,
+    tx: f64 = 0,
+    ty: f64 = 0,
+    txx: f64 = 0,
+    txy: f64 = 0,
+    tyx: f64 = 0,
+    tyy: f64 = 0,
+
+    /// `mx`, `my` are module indices; the +0.5 is what makes them module
+    /// *centres*, which is the convention `Grid.at` samples on. Fitting on the
+    /// index and sampling on the centre differ by half a module in both axes —
+    /// a grid that is uniformly wrong, which decodes exactly never and looks
+    /// like a detection problem.
+    fn add(self: *Fit, mx: f32, my: f32, ix: f32, iy: f32) void {
+        const x: f64 = mx + 0.5;
+        const y: f64 = my + 0.5;
+        const u: f64 = ix;
+        const v: f64 = iy;
+        self.n += 1;
+        self.sx += x;
+        self.sy += y;
+        self.sxx += x * x;
+        self.sxy += x * y;
+        self.syy += y * y;
+        self.tx += u;
+        self.ty += v;
+        self.txx += x * u;
+        self.txy += y * u;
+        self.tyx += x * v;
+        self.tyy += y * v;
+    }
+
+    /// Solve both 3x3 normal-equation systems. They share a matrix, so it is
+    /// inverted once by cofactors; null when the points are collinear, which
+    /// makes the determinant vanish and any "solution" arbitrary.
+    fn solve(self: Fit) ?Grid {
+        const m = [3][3]f64{
+            .{ self.sxx, self.sxy, self.sx },
+            .{ self.sxy, self.syy, self.sy },
+            .{ self.sx, self.sy, self.n },
+        };
+        const c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
+        const c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2];
+        const c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
+        const det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
+        if (@abs(det) < 1e-9) return null;
+
+        const c10 = m[0][2] * m[2][1] - m[0][1] * m[2][2];
+        const c11 = m[0][0] * m[2][2] - m[0][2] * m[2][0];
+        const c12 = m[0][1] * m[2][0] - m[0][0] * m[2][1];
+        const c20 = m[0][1] * m[1][2] - m[0][2] * m[1][1];
+        const c21 = m[0][2] * m[1][0] - m[0][0] * m[1][2];
+        const c22 = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+
+        const inv = [3][3]f64{
+            .{ c00 / det, c10 / det, c20 / det },
+            .{ c01 / det, c11 / det, c21 / det },
+            .{ c02 / det, c12 / det, c22 / det },
+        };
+        const rx = [3]f64{ self.txx, self.txy, self.tx };
+        const ry = [3]f64{ self.tyx, self.tyy, self.ty };
+
+        var g: Grid = undefined;
+        g.ax = @floatCast(inv[0][0] * rx[0] + inv[0][1] * rx[1] + inv[0][2] * rx[2]);
+        g.bx = @floatCast(inv[1][0] * rx[0] + inv[1][1] * rx[1] + inv[1][2] * rx[2]);
+        g.cx = @floatCast(inv[2][0] * rx[0] + inv[2][1] * rx[1] + inv[2][2] * rx[2]);
+        g.ay = @floatCast(inv[0][0] * ry[0] + inv[0][1] * ry[1] + inv[0][2] * ry[2]);
+        g.by = @floatCast(inv[1][0] * ry[0] + inv[1][1] * ry[1] + inv[1][2] * ry[2]);
+        g.cy = @floatCast(inv[2][0] * ry[0] + inv[2][1] * ry[1] + inv[2][2] * ry[2]);
+        return g;
+    }
+};
+
+/// Refit the grid to every alignment pattern that can be found. Returns the
+/// original grid when there are too few to improve on it — version 1 has none
+/// at all, and a symbol whose alignment patterns are unreadable is better served
+/// by the finder-only grid than by a fit to two points.
+fn refine(b: *const Bitmap, c: Corners, grid: Grid) Grid {
+    const version: u6 = @intCast((c.dimension - 17) / 4);
+    var centres_buf: [7]u16 = undefined;
+    const centres = qr.alignmentCentres(version, &centres_buf);
+    if (centres.len == 0) return grid;
+
+    var fit: Fit = .{};
+    // The finder centres are measurements too, and good ones — they anchor the
+    // three corners no alignment pattern reaches.
+    const dim_f: f32 = @floatFromInt(c.dimension);
+    fit.add(3.0, 3.0, c.tl.x, c.tl.y);
+    fit.add(dim_f - 4.0, 3.0, c.tr.x, c.tr.y);
+    fit.add(3.0, dim_f - 4.0, c.bl.x, c.bl.y);
+
+    var found: u32 = 0;
+    for (centres) |ay| {
+        for (centres) |ax| {
+            // The three corners carry finders, not alignment patterns.
+            const first = centres[0];
+            const last = centres[centres.len - 1];
+            if ((ax == first and ay == first) or
+                (ax == last and ay == first) or
+                (ax == first and ay == last)) continue;
+
+            const mx: f32 = @floatFromInt(ax);
+            const my: f32 = @floatFromInt(ay);
+            const predicted = grid.at(mx, my);
+            const hit = findAlignment(b, predicted, c.module) orelse continue;
+            fit.add(mx, my, hit[0], hit[1]);
+            found += 1;
+        }
+    }
+
+    if (found < 2) return grid;
+    return fit.solve() orelse grid;
+}
+
+/// Locate one alignment pattern near where the grid says it should be.
+///
+/// The pattern is 5x5: a dark ring, a light ring, one dark module in the middle.
+/// What is looked for is that middle module — a dark run about one module wide
+/// with light either side — because it is the only feature whose centre is a
+/// point rather than an edge, and because finding it re-uses no assumption about
+/// the ring the sampler is about to rely on.
+fn findAlignment(b: *const Bitmap, predicted: [2]f32, module: f32) ?[2]f32 {
+    if (predicted[0] < 0 or predicted[1] < 0) return null;
+    const px: i32 = @intFromFloat(predicted[0]);
+    const py: i32 = @intFromFloat(predicted[1]);
+
+    // Search a window of about +-1.5 modules: further than the drift this is
+    // correcting, and closer than the neighbouring dark ring.
+    const reach: i32 = @max(2, @as(i32, @intFromFloat(module * 1.5)));
+    const w: i32 = @intCast(b.width);
+    const h: i32 = @intCast(b.height);
+
+    var best: ?[2]f32 = null;
+    var best_d2: f32 = std.math.floatMax(f32);
+
+    var dy: i32 = -reach;
+    while (dy <= reach) : (dy += 1) {
+        var dx: i32 = -reach;
+        while (dx <= reach) : (dx += 1) {
+            const x = px + dx;
+            const y = py + dy;
+            if (x < 0 or y < 0 or x >= w or y >= h) continue;
+            if (!b.get(@intCast(x), @intCast(y))) continue;
+
+            const hx = alignmentRun(b, x, y, .horizontal, module) orelse continue;
+            const hy = alignmentRun(b, x, y, .vertical, module) orelse continue;
+            const cand = [2]f32{ hx, hy };
+            const ddx = cand[0] - predicted[0];
+            const ddy = cand[1] - predicted[1];
+            const d2 = ddx * ddx + ddy * ddy;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = cand;
+            }
+        }
+    }
+    return best;
+}
+
+const Axis = enum { horizontal, vertical };
+
+/// Centre of the alignment pattern's middle module, if the line through (x, y)
+/// crosses a whole one.
+///
+/// A one-module dark run is not evidence of anything — the data region is full
+/// of them, and the search window reaches into it. What is checked is the whole
+/// dark-light-dark-light-dark crossing, five runs of one module each, which is
+/// what an alignment pattern is and what a data module is not. Getting this
+/// wrong is not a missed pattern but a *wrong* one: a stray data module fed to
+/// the least-squares fit drags the grid instead of anchoring it.
+fn alignmentRun(b: *const Bitmap, x: i32, y: i32, axis: Axis, module: f32) ?f32 {
+    const limit: i32 = @intCast(if (axis == .horizontal) b.width else b.height);
+    const start: i32 = if (axis == .horizontal) x else y;
+
+    // The centre run first, then one light and one dark run either side.
+    var lo = start;
+    while (lo - 1 >= 0 and isDarkAt(b, x, y, axis, lo - 1)) lo -= 1;
+    var hi = start;
+    while (hi + 1 < limit and isDarkAt(b, x, y, axis, hi + 1)) hi += 1;
+    if (lo == 0 or hi == limit - 1) return null;
+
+    var runs: [5]f32 = undefined;
+    runs[2] = @floatFromInt(hi - lo + 1);
+
+    var p = lo - 1;
+    var light: i32 = 0;
+    while (p >= 0 and !isDarkAt(b, x, y, axis, p)) : (p -= 1) light += 1;
+    runs[1] = @floatFromInt(light);
+    var dark: i32 = 0;
+    while (p >= 0 and isDarkAt(b, x, y, axis, p)) : (p -= 1) dark += 1;
+    runs[0] = @floatFromInt(dark);
+
+    p = hi + 1;
+    light = 0;
+    while (p < limit and !isDarkAt(b, x, y, axis, p)) : (p += 1) light += 1;
+    runs[3] = @floatFromInt(light);
+    dark = 0;
+    while (p < limit and isDarkAt(b, x, y, axis, p)) : (p += 1) dark += 1;
+    runs[4] = @floatFromInt(dark);
+
+    // Half a module of slack per run: the same tolerance the finder ratio uses,
+    // and it is what a symbol photographed small still satisfies.
+    for (runs) |r| {
+        if (r < module * 0.5 or r > module * 1.5) return null;
+    }
+    return (@as(f32, @floatFromInt(lo)) + @as(f32, @floatFromInt(hi)) + 1) / 2;
+}
+
+fn isDarkAt(b: *const Bitmap, x: i32, y: i32, axis: Axis, at: i32) bool {
+    return switch (axis) {
+        .horizontal => b.get(@intCast(at), @intCast(y)),
+        .vertical => b.get(@intCast(x), @intCast(at)),
+    };
 }
 
 /// The dimension out of `orient` is a measurement rounded to the nearest legal
@@ -546,7 +965,7 @@ fn sample(b: *const Bitmap, c: Corners) Error!Found {
 /// column 6 alternate, dark on even coordinates — so they say whether the grid
 /// was laid over the modules or across them, and they say it before any
 /// error correction gets a chance to hide the answer.
-fn sampleBestDimension(b: *const Bitmap, c: Corners) Error!Found {
+fn sampleBestDimension(b: *const Bitmap, c: Corners) Error!struct { found: Found, score: f32 } {
     var best: ?Found = null;
     var best_score: f32 = -1;
 
@@ -557,7 +976,11 @@ fn sampleBestDimension(b: *const Bitmap, c: Corners) Error!Found {
 
         var candidate = c;
         candidate.dimension = @intCast(dim);
-        const got = sample(b, candidate) catch continue;
+        const coarse = gridFromCorners(candidate);
+        // Refine against the alignment patterns before scoring: a wrong
+        // dimension predicts alignment patterns where there are none, so the
+        // refinement quietly declines to make a wrong grid look better.
+        const got = sample(b, candidate, refine(b, candidate, coarse)) catch continue;
 
         const score = timingScore(&got.matrix);
         if (score > best_score) {
@@ -571,7 +994,7 @@ fn sampleBestDimension(b: *const Bitmap, c: Corners) Error!Found {
     // still decodes — the data is protected and the timing is not — so a
     // threshold here would reject reads that currently succeed. The score picks
     // between candidates; it does not get a veto.
-    return best orelse Error.NotFound;
+    return .{ .found = best orelse return Error.NotFound, .score = best_score };
 }
 
 /// How much of the two timing patterns alternates the way the standard says.
@@ -732,7 +1155,7 @@ test "the module size a scan line measures is inflated by the tilt" {
     binarize(img, &bits);
 
     var finders: [max_candidates]Finder = undefined;
-    const found = locateFinders(&bits, &finders);
+    const found = locateFinders(&bits, &finders, true);
     try t.expect(found.len >= 3);
 
     const c = orient(found) orelse return error.NoCorners;
@@ -756,7 +1179,7 @@ test "a dimension one version out is rejected by the timing pattern" {
     binarize(img, &bits);
 
     var finders: [max_candidates]Finder = undefined;
-    const found = locateFinders(&bits, &finders);
+    const found = locateFinders(&bits, &finders, true);
     var c = orient(found) orelse return error.NoCorners;
     try t.expectEqual(@as(u32, m.size), c.dimension);
 
@@ -764,12 +1187,13 @@ test "a dimension one version out is rejected by the timing pattern" {
     // estimate half a percent off would. The wrong grid samples perfectly well
     // — this is the failure mode that looks like a picture problem — so the
     // timing pattern has to be what rejects it.
-    const wrong = sample(&bits, .{ .tl = c.tl, .tr = c.tr, .bl = c.bl, .module = c.module, .dimension = c.dimension + 4 }) catch
+    const off_by_one: Corners = .{ .tl = c.tl, .tr = c.tr, .bl = c.bl, .module = c.module, .dimension = c.dimension + 4 };
+    const wrong = sample(&bits, off_by_one, gridFromCorners(off_by_one)) catch
         return error.WrongDimensionDidNotEvenSample;
     try t.expect(timingScore(&wrong.matrix) < 0.9);
 
     c.dimension += 4;
-    const best = try sampleBestDimension(&bits, c);
+    const best = (try sampleBestDimension(&bits, c)).found;
     try t.expectEqual(m.size, best.matrix.size);
 
     var fm = best.matrix;
@@ -777,7 +1201,7 @@ test "a dimension one version out is rejected by the timing pattern" {
     try t.expectEqualStrings("https://example.com/dimension-check", try qr.decode(&fm, &out));
 }
 
-test "a large symbol produces more finder candidates than a list of sixteen holds" {
+test "the ring test is what keeps a large symbol's own data from crowding it out" {
     const t = std.testing;
     var m: qr.Matrix = undefined;
     try qr.encode(&m, "N" ** 300, .{ .ecc = .quartile });
@@ -790,12 +1214,148 @@ test "a large symbol produces more finder candidates than a list of sixteen hold
     binarize(img, &bits);
 
     var finders: [max_candidates]Finder = undefined;
-    const found = locateFinders(&bits, &finders);
-    // The number itself is incidental; what is pinned is that it is past the
-    // ceiling this list used to have, so `max_candidates = 16` would drop real
-    // finders and the symbol would be missed for want of a slot.
-    try t.expect(found.len > 16);
-    try t.expect(orient(found) != null);
+    const relaxed = locateFinders(&bits, &finders, false).len;
+    const strict = locateFinders(&bits, &finders, true).len;
+
+    // The numbers are incidental (3 against 15 as measured); the relationship
+    // is not. Without the ring requirement this symbol's own data region
+    // produces several times as many candidates as there are finders, and every
+    // one of them is something the triple search has to be talked out of.
+    try t.expect(strict >= 3);
+    try t.expect(relaxed >= strict * 3);
+    try t.expect(orient(locateFinders(&bits, &finders, true)) != null);
+}
+
+test "the least-squares fit reproduces the grid it was sampled from" {
+    const t = std.testing;
+    // A grid with rotation, scale and translation in it, so a fit that is right
+    // only for the axis-aligned case cannot pass.
+    const truth: Grid = .{ .ax = 4.1, .bx = -1.7, .cx = 31.5, .ay = 1.6, .by = 4.3, .cy = -12.25 };
+
+    var fit: Fit = .{};
+    for ([_][2]f32{ .{ 3, 3 }, .{ 60, 3 }, .{ 3, 60 }, .{ 30, 30 }, .{ 58, 46 }, .{ 12, 51 } }) |mp| {
+        const p = truth.at(mp[0], mp[1]);
+        fit.add(mp[0], mp[1], p[0], p[1]);
+    }
+    const got = fit.solve() orelse return error.Singular;
+
+    // The half-module offset is the trap: `Fit.add` takes module indices and
+    // `Grid.at` samples module centres, so a fit built on one convention and
+    // sampled on the other is out by half a module everywhere — uniformly, so
+    // every intermediate value still looks reasonable.
+    for ([_][2]f32{ .{ 0, 0 }, .{ 40, 7 }, .{ 64, 64 } }) |mp| {
+        const want = truth.at(mp[0], mp[1]);
+        const have = got.at(mp[0], mp[1]);
+        try t.expect(@abs(want[0] - have[0]) < 0.01);
+        try t.expect(@abs(want[1] - have[1]) < 0.01);
+    }
+}
+
+test "a broken ring has the finder ratio in both axes and is still not a finder" {
+    const t = std.testing;
+    // A finder pattern with the four corners of its outer ring erased. Every
+    // run-length test a scanner can apply still passes — the middle row is
+    // 1:1:3:1:1 and so is the middle column — and it is not a finder, because
+    // the outer band is four separate bars rather than one ring. This is the
+    // shape that separates the two tests; a fence cannot, since a fence fails
+    // the vertical check anyway.
+    const s = 6;
+    var pixels: [200 * 200]u8 = undefined;
+    @memset(&pixels, 255);
+    for (0..7) |my| {
+        for (0..7) |mx| {
+            const ring = mx == 0 or mx == 6 or my == 0 or my == 6;
+            // Erase the corner of the ring far enough that the bars do not
+            // touch even diagonally — the labelling is 8-connected, so a single
+            // erased module leaves them joined at the corner and the ring
+            // intact.
+            const corner = @min(mx, 6 - mx) + @min(my, 6 - my) <= 1;
+            const centre = mx >= 2 and mx <= 4 and my >= 2 and my <= 4;
+            if (!((ring and !corner) or centre)) continue;
+            for (0..s) |dy| {
+                for (0..s) |dx| {
+                    pixels[(40 + my * s + dy) * 200 + (40 + mx * s + dx)] = 0;
+                }
+            }
+        }
+    }
+    const img: Image = .{ .luma = &pixels, .width = 200, .height = 200, .stride = 200 };
+    var scratch: [200 * 200 / 8]u8 = undefined;
+    var bits: Bitmap = .{ .bits = &scratch, .width = 200, .height = 200 };
+    binarize(img, &bits);
+
+    var finders: [max_candidates]Finder = undefined;
+    try t.expect(locateFinders(&bits, &finders, false).len > 0);
+    try t.expectEqual(@as(usize, 0), locateFinders(&bits, &finders, true).len);
+}
+
+test "a large symbol needs the alignment patterns, not just its corners" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "N" ** 2000, .{ .ecc = .quartile });
+    try t.expect(m.size >= 145); // version 33 or larger
+
+    var pixels: [900 * 900]u8 = undefined;
+    var scratch: [900 * 900 / 8]u8 = undefined;
+    var side: u32 = 0;
+    const img = renderRotated(&m, 3, 20, &pixels, &side);
+    var bits: Bitmap = .{ .bits = &scratch, .width = img.width, .height = img.height };
+    binarize(img, &bits);
+
+    // What the scanner settles on, so the comparison below is about the grid
+    // and not about the dimension search.
+    const found = try scan(img, &scratch);
+    try t.expectEqual(@as(u16, m.size), found.matrix.size);
+
+    var finders: [max_candidates]Finder = undefined;
+    var c = orient(locateFinders(&bits, &finders, true)) orelse return error.NoCorners;
+    c.dimension = m.size;
+
+    const coarse = gridFromCorners(c);
+    const refined = refine(&bits, c, coarse);
+
+    // The refinement moved the far corner by enough to change which module it
+    // samples, which is the whole point: three corner points fix an affine map
+    // exactly and then extrapolate every measurement error across the symbol.
+    const far_coarse = coarse.at(@floatFromInt(m.size - 1), @floatFromInt(m.size - 1));
+    const far_refined = refined.at(@floatFromInt(m.size - 1), @floatFromInt(m.size - 1));
+    const moved = @abs(far_coarse[0] - far_refined[0]) + @abs(far_coarse[1] - far_refined[1]);
+    try t.expect(moved > 0.5);
+
+    // And it moved it the right way.
+    const with = try sample(&bits, c, refined);
+    var fm = with.matrix;
+    var out: [3000]u8 = undefined;
+    try t.expectEqualStrings("N" ** 2000, try qr.decode(&fm, &out));
+}
+
+test "rotation holds at the largest versions, where the grid has furthest to drift" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "N" ** 2000, .{ .ecc = .quartile });
+
+    var pixels: [900 * 900]u8 = undefined;
+    var scratch: [900 * 900 / 8]u8 = undefined;
+    var out: [3000]u8 = undefined;
+
+    var ok: u32 = 0;
+    var total: u32 = 0;
+    var deg: f32 = 0;
+    while (deg < 360) : (deg += 15) {
+        var side: u32 = 0;
+        const img = renderRotated(&m, 3, deg, &pixels, &side);
+        total += 1;
+        const found = scan(img, &scratch) catch continue;
+        var fm = found.matrix;
+        const got = qr.decode(&fm, &out) catch continue;
+        if (std.mem.eql(u8, got, "N" ** 2000)) ok += 1;
+    }
+
+    // Three pixels per module across 165 of them is the bottom of what this
+    // samples, so it is asserted as a floor rather than as a rate — improving
+    // it must not fail the test. Before the grid was fitted to the alignment
+    // patterns and the ring test cleared the candidate list, it was 9 in 72.
+    try t.expect(ok * 4 >= total * 3);
 }
 
 // ── fuzz: the image is entirely attacker-chosen ─────────────────────────────
