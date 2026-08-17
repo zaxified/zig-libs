@@ -63,6 +63,13 @@ pub const Error = error{
     /// `casPutBytes`: the record's current version did not match `expected`
     /// (or existed/didn't-exist opposite of what `expected` implied).
     VersionMismatch,
+    /// `putWithTTL` called on a store opened with `Store.ttl = false`: that
+    /// store's own `getBytes` never checks the `.expiry` sidecar this call
+    /// would create, so the record it just wrote would never expire from
+    /// this store's point of view — refused loudly instead of silently
+    /// writing a sidecar the store will then ignore. See `Store.ttl`'s doc
+    /// comment.
+    TtlDisabled,
 };
 
 /// Process-local monotonically increasing counter for collision-free ingest
@@ -120,6 +127,34 @@ pub const Store = struct {
     /// Time source for TTL accounting (injected in tests). Wall-clock by
     /// default — see `Clock`.
     clock: Clock = .wall_clock,
+    /// Whether `getBytes` (and everything built on it — `get`/`listTyped`)
+    /// checks the `.expiry` sidecar at all. Defaults to `true`, reproducing
+    /// the original behaviour: every `getBytes` call opens/reads
+    /// `.{key}.expiry` (an extra syscall that fails with `FileNotFound` for
+    /// a key that was never `putWithTTL`'d) before it reads the record.
+    ///
+    /// Set `ttl = false` on a store that **never calls `putWithTTL`** to
+    /// skip that probe on every `getBytes` — for a `list`-then-`get` sweep
+    /// over a large roster this halves the syscall count. `putWithTTL`
+    /// refuses with `error.TtlDisabled` on a `ttl = false` store (see its
+    /// doc comment) rather than creating a sidecar the store's own
+    /// `getBytes` would then never check — this closes off the "opted-out
+    /// store resurrects its own TTL'd record" case by construction; it is
+    /// not reachable. `sweep` is still unaffected either way (it does not
+    /// consult this flag), so a store that already has TTL'd records from
+    /// before it was reconfigured keeps its exact existing `sweep` behaviour.
+    ///
+    /// **Hazard, still reachable:** `ttl = false` does not delete or ignore
+    /// an *existing* `.expiry` sidecar, it only stops `getBytes` from
+    /// looking for one. A record TTL'd while `ttl` was `true` (or by a
+    /// differently configured writer sharing the same `base`) and then read
+    /// through a store later reconfigured to `ttl = false` will keep being
+    /// returned by `getBytes` **after its deadline has passed** — silently,
+    /// since the check that would report it absent never runs. Only opt out
+    /// on a store you are certain has no pre-existing TTL'd records; `sweep`
+    /// still physically removes expired records if called, but nothing
+    /// calls it automatically.
+    ttl: bool = true,
 
     /// Ensure `base` exists.
     pub fn init(io: std.Io, base: []const u8) !Store {
@@ -200,10 +235,14 @@ pub const Store = struct {
     /// *or expired* (a live `.expiry` sidecar whose deadline has passed,
     /// per `self.clock.now()`). Read-only: an expired record is reported as
     /// absent but not removed — see `sweep`.
+    ///
+    /// Skips the `.expiry` sidecar probe entirely when `self.ttl == false`
+    /// — see the doc comment on `Store.ttl` for what that means for
+    /// already-expired data.
     pub fn getBytes(self: Store, arena: std.mem.Allocator, kind: []const u8, key: []const u8) !?[]u8 {
         var pbuf: [768]u8 = undefined;
         const path = try self.recordPath(&pbuf, kind, key);
-        if (try self.isExpired(kind, key)) return null;
+        if (self.ttl and try self.isExpired(kind, key)) return null;
         return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
@@ -289,7 +328,15 @@ pub const Store = struct {
     /// blocked by that lock (readers stay lock-free) — it can observe the
     /// new blob a moment before or after the new deadline, which only
     /// affects expiry precision at the nanosecond scale, never torn bytes.
+    ///
+    /// Returns `error.TtlDisabled` when `self.ttl` is `false`: that store's
+    /// own `getBytes` never checks the `.expiry` sidecar this call would
+    /// create, so the record would be written with a deadline this store
+    /// can never observe — refused instead of silently creating a sidecar
+    /// that only makes the record resurrectable if the store is later
+    /// reconfigured back to `ttl = true`. See `Store.ttl`.
     pub fn putWithTTL(self: Store, kind: []const u8, key: []const u8, bytes: []const u8, ttl_ns: i64) !void {
+        if (!self.ttl) return error.TtlDisabled;
         if (!segmentSafe(kind) or !segmentSafe(key)) return error.InvalidName;
         var kl = try self.lockKey(kind, key);
         defer kl.unlock();
@@ -766,6 +813,90 @@ test "sweep: removes only expired keys, leaves live-TTL and no-TTL keys untouche
 
     // a second sweep is a no-op — nothing left to reap
     try t.expectEqual(@as(usize, 0), try store.sweep(arena, "cache"));
+}
+
+test "ttl=false: getBytes never opens the .expiry sidecar (observable via a corrupt sidecar the default path would choke on)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    store.ttl = false;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    try store.putBytes("sessions", "s1", "alive");
+
+    // Write a sidecar directly (bypassing putWithTTL) whose content is not a
+    // parseable i64 at all. If getBytes ever opened+read this file, parsing
+    // it would error — so a plain success here is direct evidence the file
+    // was never touched, not just that the deadline logic was skipped.
+    var pbuf: [900]u8 = undefined;
+    const sidecar_path = try store.sidecarPath(&pbuf, "sessions", "s1", ".expiry");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sidecar_path, .data = "not-a-number-at-all" });
+
+    const got = (try store.getBytes(gpa, "sessions", "s1")).?;
+    defer gpa.free(got);
+    try t.expectEqualStrings("alive", got);
+
+    // Control: the identical store with ttl=true (the default) DOES open and
+    // parse the sidecar, and this corrupt content makes it fail — proving the
+    // opt-out above genuinely skipped the probe rather than happening to
+    // tolerate it.
+    var control = store;
+    control.ttl = true;
+    try t.expectError(error.InvalidCharacter, control.getBytes(gpa, "sessions", "s1"));
+}
+
+test "putWithTTL refuses with error.TtlDisabled on a ttl=false store — no sidecar the store would then never check" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    store.ttl = false;
+    const gpa = std.testing.allocator;
+
+    try t.expectError(error.TtlDisabled, store.putWithTTL("sessions", "s3", "nope", 500));
+
+    // No record and no sidecar were created by the refused call.
+    try t.expect((try store.getBytes(gpa, "sessions", "s3")) == null);
+    var pbuf: [900]u8 = undefined;
+    const sidecar_path = try store.sidecarPath(&pbuf, "sessions", "s3", ".expiry");
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, sidecar_path, .{}));
+}
+
+test "ttl=false hazard, still reachable: a record TTL'd BEFORE the store opted out keeps being served past its deadline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    var clk = ManualClock{ .now_ns = 1_000 };
+    store.clock = clk.clock();
+    const gpa = std.testing.allocator;
+
+    // ttl is still true here — this is the only way a `.expiry` sidecar can
+    // come to exist at all now that putWithTTL refuses outright on a
+    // ttl=false store (see the test above). Models a store TTL'd under one
+    // configuration and later reconfigured, or a sidecar left by a
+    // differently configured writer sharing the same base.
+    try store.putWithTTL("sessions", "s2", "still-around", 500); // deadline 1500
+    clk.now_ns = 2_000; // well past the deadline, never swept
+
+    // Default (ttl=true): correctly reports it as absent.
+    try t.expect((try store.getBytes(gpa, "sessions", "s2")) == null);
+
+    // Opted out AFTER the sidecar already existed: the exact same on-disk
+    // state, but getBytes resurrects the expired record instead of
+    // reporting it absent — the one hazard `ttl = false` still carries,
+    // since it cannot retroactively erase a pre-existing sidecar.
+    store.ttl = false;
+    const got = (try store.getBytes(gpa, "sessions", "s2")).?;
+    defer gpa.free(got);
+    try t.expectEqualStrings("still-around", got);
+
+    // sweep is unaffected by the flag — it still reaps the expired record.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try t.expectEqual(@as(usize, 1), try store.sweep(arena_state.allocator(), "sessions"));
 }
 
 // ── ETag / version CAS ───────────────────────────────────────────────────

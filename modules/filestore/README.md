@@ -52,6 +52,9 @@ const rec = try store.get(MyRecord, arena, "devices", "dev-1");         // ?MyRe
 const all = try store.listTyped(MyRecord, arena, "devices");            // struct{ items: []MyRecord, skipped: usize }
 
 // TTL / expiry — wall-clock via store.clock (injectable in tests)
+// store.ttl = false;  // opt out: skip the .expiry probe on every getBytes
+//                     // (only safe on a store that never calls putWithTTL —
+//                     // see "TTL, CAS and locking" below)
 try store.putWithTTL("sessions", "s1", bytes, 3600 * std.time.ns_per_s); // 1h
 _ = try store.getBytes(arena, "sessions", "s1");   // null once expired (read-only check)
 const swept = try store.sweep(arena, "sessions");  // actually deletes expired records
@@ -97,6 +100,20 @@ defer kl.unlock();
 
 ## TTL, CAS and locking
 
+- **Skipping the TTL check.** Every `getBytes` probes the `.expiry` sidecar
+  before reading the record, even for a store that never calls `putWithTTL` —
+  an extra syscall per get, which doubles the cost of a `list`-then-`get`
+  sweep over a large roster. Set `store.ttl = false` on a store that never
+  uses TTLs to skip that probe entirely. `putWithTTL` refuses with
+  `error.TtlDisabled` on such a store, rather than creating a sidecar the
+  store's own `getBytes` would then never check — a store that opts out
+  cannot itself create a resurrectable TTL'd record. `sweep` is unaffected
+  either way. **Hazard, still reachable:** `ttl = false` does not retroactively
+  erase a *pre-existing* `.expiry` sidecar — one written while the store had
+  `ttl = true`, or by a differently configured writer sharing the same
+  `base`. `getBytes` on such a key keeps returning the record *after its
+  deadline has passed*, silently. Only opt out on a store you are certain
+  has no pre-existing TTL'd records.
 - **TTL / expiry.** `putWithTTL(kind, key, bytes, ttl_ns)` records a deadline
   in a hidden sidecar `.<key>.expiry` next to the record (decimal
   ns-since-epoch, wall-clock via `Store.clock` — injectable for tests, real
