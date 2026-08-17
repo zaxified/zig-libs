@@ -51,10 +51,12 @@ not to one that is otherwise pure arithmetic over a buffer.
 4. **Sizing** — the module size a scan line measures is inflated by the symbol's
    tilt, so it is corrected before it decides the version, and the version is
    then checked against the timing patterns rather than trusted.
-5. **Sampling** — a grid fitted by least squares to the three finder centres
-   **and every alignment pattern it can find**. Three points fix an affine map
-   exactly, and exactly is the problem: every measurement error in them lands
-   undiluted in the map and is then extrapolated across the whole symbol.
+5. **Sampling** — a grid fitted to the three finder centres **and every
+   alignment pattern it can find**, affine and projective both, with the timing
+   patterns choosing between them. Three points fix an affine map exactly, and
+   exactly is the problem: every measurement error in them lands undiluted in
+   the map and is then extrapolated across the whole symbol. Two more terms make
+   the map projective, which is what a symbol photographed off-axis needs.
 
 If that pass does not produce a readable grid, the scan is repeated without the
 connected-region requirement — which is what a small symbol needs, since at
@@ -73,10 +75,18 @@ takes the tilt from the top edge and corrects for it.
 
 ## Limits, stated plainly
 
-- **No perspective correction.** The grid is affine — fitted to many points, but
-  still affine. A symbol photographed at an angle to the plane is a projective
-  image and needs a projective map; the alignment patterns this already locates
-  are most of what such a map would be fitted to.
+- **Tilt is handled to about 15–25°, not to 60.** A symbol photographed
+  off-axis is a projective image and gets a projective grid, fitted to the
+  alignment patterns. Measured at six pixels per module: a version 6 reads to
+  25° about the vertical axis and 15° about the horizontal, a version 13 to
+  15°/20°, a version 1 to 10° — it has no alignment patterns at all, so there is
+  nothing a projective fit could be built from. Before there was a projective
+  grid, those were 5°, 0° and 10°.
+- **Curvature is not modelled**, and matters less than you would think: a
+  version 1 still reads wrapped on a cylinder 18 modules across, a version 6
+  down to 45 and a version 13 down to 200. A label on a can is fine; a large
+  symbol round a small bottle is not. Correcting it needs a mesh over the
+  alignment patterns rather than one global map.
 - **Three pixels per module is the floor.** There, a version 37 reads at about
   94 % of angles and a version 1 at about 79 %; at four pixels per module both
   are 100 %. Below three, binarisation is deciding modules from single pixels.

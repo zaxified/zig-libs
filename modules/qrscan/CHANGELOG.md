@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-17** — Off-axis symbols. The grid can now be projective: a plane
+  photographed at an angle maps to the image by a homography, and no affine map
+  approximates one across a whole symbol. Measured before the change, at six
+  pixels per module, a version 13 stopped reading at **0°** of tilt and a
+  version 6 at 5°; after, they read to 15–25° depending on the axis. A version 1
+  is unchanged at 10°, and always will be — it carries no alignment patterns, so
+  there is nothing a projective fit could be built from.
+  What made the measurement possible came first: `renderProjective` and
+  `renderCylindrical` in the tests, both checked at their own identity against
+  the flat renderer. "Perspective is a limitation" had never been measured; it
+  was a claim about the shape of the code, which is the kind that was wrong
+  about rotation earlier the same day.
+  Three defects found on the way, each of which made the fix look ineffective
+  rather than broken: the alignment-pattern check bounded the **outer** ring runs
+  from above, and an outer ring touching a dark data module reads as two modules
+  wide — so a version 2–6 symbol's single alignment pattern was never found and
+  the projective fit had nothing to fit. The search widens its window across
+  passes, but the loop stopped as soon as a pass found nothing new, which is
+  precisely how a too-narrow window fails, so the wider passes never ran. And
+  the first fitter alternated between the affine and perspective halves; it
+  minimises the right thing and converges, forty rounds getting a fifth of the
+  way to what a normalised direct solve gets exactly.
+  Also: landmarks the fit cannot account for are dropped rather than averaged
+  in, since a widened window over a data region will eventually return a dark
+  module that crosses like an alignment pattern. That alone took plain rotation
+  at version 37 and three pixels per module from 68 of 72 angles to 72.
+  Curvature is not modelled and is not the problem it sounds like: a version 1
+  reads wrapped on a cylinder 18 modules across, a version 6 to 45. A mesh over
+  the alignment patterns would cover it, and is now the one item in the backlog.
+
 - **2026-08-17** — Nothing beyond 1024 pixels existed. `binarize` kept its
   per-block means in a fixed `[128 x 128]u8` on the stack and clamped its loops
   to it, so only the first 1024 x 1024 pixels of any image were binarised at

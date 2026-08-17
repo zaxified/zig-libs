@@ -718,8 +718,16 @@ fn dist2(a: Finder, b: Finder) f32 {
     return dx * dx + dy * dy;
 }
 
-/// Module coordinates to image coordinates: `x' = a*x + b*y + c`, and likewise
-/// for y. Affine and not projective, deliberately — see `refine`.
+/// Module coordinates to image coordinates:
+///
+///     x' = (ax*x + bx*y + cx) / w,   y' = (ay*x + by*y + cy) / w,
+///     w  = gx*x + gy*y + 1
+///
+/// With `gx = gy = 0` that is an affine map, which is what three finder centres
+/// can determine and what this was until the tilt was measured. The two extra
+/// terms are what a plane seen off-axis needs: they are the reason the far edge
+/// of a tilted symbol is narrower than the near one, and no amount of fitting an
+/// affine map to good landmarks can express it.
 const Grid = struct {
     ax: f32,
     bx: f32,
@@ -727,12 +735,22 @@ const Grid = struct {
     ay: f32,
     by: f32,
     cy: f32,
+    gx: f32 = 0,
+    gy: f32 = 0,
 
     /// Image position of the centre of module (col, row).
     fn at(self: Grid, col: f32, row: f32) [2]f32 {
         const x = col + 0.5;
         const y = row + 0.5;
-        return .{ self.ax * x + self.bx * y + self.cx, self.ay * x + self.by * y + self.cy };
+        const w = self.gx * x + self.gy * y + 1;
+        // A vanishing denominator is a point on the horizon: it has no image,
+        // and returning something enormous lets the bounds check in `sample`
+        // reject it instead of producing a plausible wrong pixel.
+        if (@abs(w) < 1e-6) return .{ 1e30, 1e30 };
+        return .{
+            (self.ax * x + self.bx * y + self.cx) / w,
+            (self.ay * x + self.by * y + self.cy) / w,
+        };
     }
 };
 
@@ -762,10 +780,9 @@ fn sample(b: *const Bitmap, c: Corners, grid: Grid) Error!Found {
     for (0..dim) |row| {
         for (0..dim) |col| {
             const p = grid.at(@floatFromInt(col), @floatFromInt(row));
-            if (p[0] < 0 or p[1] < 0) return Error.NotFound;
+            if (!insideImage(b, p)) return Error.NotFound;
             const ix: u32 = @intFromFloat(p[0]);
             const iy: u32 = @intFromFloat(p[1]);
-            if (ix >= b.width or iy >= b.height) return Error.NotFound;
             m.setDark(@intCast(col), @intCast(row), b.get(ix, iy));
         }
     }
@@ -874,45 +891,358 @@ const Fit = struct {
     }
 };
 
-/// Refit the grid to every alignment pattern that can be found. Returns the
-/// original grid when there are too few to improve on it — version 1 has none
-/// at all, and a symbol whose alignment patterns are unreadable is better served
-/// by the finder-only grid than by a fit to two points.
-fn refine(b: *const Bitmap, c: Corners, grid: Grid) Grid {
+/// One measured correspondence: where a module is, and where its centre was
+/// found in the image.
+const Landmark = struct { mx: f32, my: f32, ix: f32, iy: f32 };
+
+/// Three finder centres and every alignment pattern: 3 + 7*7 - 3 at the largest
+/// version.
+const max_landmarks = 52;
+
+/// The two grids a set of landmarks supports. Both are offered rather than one
+/// chosen, because which is better is a question about the picture — a
+/// projective fit to landmarks that are all slightly wrong is worse than an
+/// affine one — and the module already has a referee for exactly that kind of
+/// question in `sampleBestDimension`.
+const Grids = struct {
+    affine: Grid,
+    projective: ?Grid,
+};
+
+/// Collect landmarks and fit. Returns the finder-only grid when there is nothing
+/// better: version 1 has no alignment patterns at all, and a symbol whose
+/// patterns are unreadable is better served by the corners than by a fit to two
+/// points.
+fn refine(b: *const Bitmap, c: Corners, grid: Grid) Grids {
     const version: u6 = @intCast((c.dimension - 17) / 4);
     var centres_buf: [7]u16 = undefined;
     const centres = qr.alignmentCentres(version, &centres_buf);
-    if (centres.len == 0) return grid;
+    if (centres.len == 0) return .{ .affine = grid, .projective = null };
 
-    var fit: Fit = .{};
+    var marks: [max_landmarks]Landmark = undefined;
+    var n: usize = 0;
+
     // The finder centres are measurements too, and good ones — they anchor the
     // three corners no alignment pattern reaches.
     const dim_f: f32 = @floatFromInt(c.dimension);
-    fit.add(3.0, 3.0, c.tl.x, c.tl.y);
-    fit.add(dim_f - 4.0, 3.0, c.tr.x, c.tr.y);
-    fit.add(3.0, dim_f - 4.0, c.bl.x, c.bl.y);
+    marks[0] = .{ .mx = 3.0, .my = 3.0, .ix = c.tl.x, .iy = c.tl.y };
+    marks[1] = .{ .mx = dim_f - 4.0, .my = 3.0, .ix = c.tr.x, .iy = c.tr.y };
+    marks[2] = .{ .mx = 3.0, .my = dim_f - 4.0, .ix = c.bl.x, .iy = c.bl.y };
+    n = 3;
 
-    var found: u32 = 0;
-    for (centres) |ay| {
-        for (centres) |ax| {
-            // The three corners carry finders, not alignment patterns.
-            const first = centres[0];
-            const last = centres[centres.len - 1];
-            if ((ax == first and ay == first) or
-                (ax == last and ay == first) or
-                (ax == first and ay == last)) continue;
+    // Search, refit, search again. `findAlignment` looks within about 1.5
+    // modules of where the current grid predicts, and under perspective a grid
+    // fitted to the near landmarks mispredicts the far ones by more than that.
+    // Each pass therefore reaches patterns the last one could not, and stops
+    // when a pass finds nothing new. Two passes is usually enough; the third is
+    // for the steep cases.
+    // Every intersection of the centre lines carries a pattern except the three
+    // that would sit under a finder.
+    const expected = centres.len * centres.len - 3;
 
-            const mx: f32 = @floatFromInt(ax);
-            const my: f32 = @floatFromInt(ay);
-            const predicted = grid.at(mx, my);
-            const hit = findAlignment(b, predicted, c.module) orelse continue;
-            fit.add(mx, my, hit[0], hit[1]);
-            found += 1;
+    var current = grid;
+    for (0..4) |pass| {
+        const before = n;
+        // The window widens as the passes go on. A first pass looking five
+        // modules out would find dark specks in the data; a first pass looking
+        // 1.5 modules out cannot reach where a 20-degree tilt puts the far
+        // pattern. So look close while the grid is only a guess, and further
+        // once the guess has been corrected by whatever the close look found.
+        const reach_modules = 1.5 + 4.0 * @as(f32, @floatFromInt(pass));
+        for (centres) |ay| {
+            for (centres) |ax| {
+                // The three corners carry finders, not alignment patterns.
+                const first = centres[0];
+                const last = centres[centres.len - 1];
+                if ((ax == first and ay == first) or
+                    (ax == last and ay == first) or
+                    (ax == first and ay == last)) continue;
+
+                const mx: f32 = @floatFromInt(ax);
+                const my: f32 = @floatFromInt(ay);
+                if (alreadyFound(marks[0..n], mx, my)) continue;
+                const hit = findAlignment(b, current.at(mx, my), c.module, reach_modules) orelse continue;
+                if (n < marks.len) {
+                    marks[n] = .{ .mx = mx, .my = my, .ix = hit[0], .iy = hit[1] };
+                    n += 1;
+                }
+            }
         }
+        if (n != before) {
+            // Drop what the fit cannot account for before refitting, not after
+            // the loop: a false landmark from a wide window would otherwise
+            // steer the very prediction the next pass searches around.
+            n = dropOutliers(&marks, n, c.module);
+            // Refit with everything found so far, projectively once there is
+            // enough to support it — the next pass predicts through this grid,
+            // and under tilt an affine prediction is exactly what put the far
+            // patterns out of reach in the first place.
+            const affine = fitAffine(marks[0..n]) orelse current;
+            current = fitProjective(marks[0..n]) orelse affine;
+        }
+        // Stop when there is nothing left to look for — NOT when a pass found
+        // nothing new. Those are different: a pass that finds nothing is the
+        // normal way a narrow window fails, and stopping there is what kept the
+        // widening from ever happening. A version 2-6 symbol's one alignment
+        // pattern sits more than 1.5 modules from where an affine grid predicts
+        // it past about 15 degrees of tilt, and was found at 3 modules by a
+        // pass this loop used to return before reaching.
+        if (n - 3 == expected) break;
     }
 
-    if (found < 2) return grid;
-    return fit.solve() orelse grid;
+    // Four landmarks is what a projective map needs and no fewer: three finder
+    // centres plus the one alignment pattern a version 2-6 symbol carries. That
+    // case is exactly determined rather than fitted, which is fine — it is the
+    // classic four-corner arrangement — and it is also the commonest symbol
+    // size there is, so refusing it would leave the fix for large symbols only.
+    if (n < 4) return .{ .affine = current, .projective = null };
+
+    n = dropOutliers(&marks, n, c.module);
+    if (n < 4) return .{ .affine = fitAffine(marks[0..n]) orelse current, .projective = null };
+
+    const affine = fitAffine(marks[0..n]) orelse current;
+
+    // Only offer a projective grid when there is something for it to explain.
+    // Two extra degrees of freedom always fit the landmarks at least as well,
+    // and the timing patterns — the referee downstream — run along two lines
+    // near the edges, so a grid bent to satisfy them can be wrong in the middle
+    // where nothing is watching. Measured: a version 7 at 135 degrees, flat,
+    // read with the affine grid and failed with the projective one that scored
+    // higher on timing.
+    //
+    // The test is physical rather than statistical: if the flat model already
+    // places every landmark to within a quarter of a module, the symbol is flat.
+    const rms = @sqrt(residual(affine, marks[0..n]) / @as(f32, @floatFromInt(n)));
+    if (rms < 0.25 * c.module) return .{ .affine = affine, .projective = null };
+
+    return .{ .affine = affine, .projective = fitProjective(marks[0..n]) };
+}
+
+/// Drop landmarks an affine fit cannot account for, and repeat. The search
+/// window widens with each pass, and a wide window over a data region can return
+/// a dark module that crosses like an alignment pattern; one such landmark drags
+/// a least-squares fit by rather more than nothing. A module of error is far
+/// more than a real pattern shows and far less than a false one does.
+///
+/// Affine deliberately, even though the map may be projective: the question here
+/// is "is this landmark like the others", and a model with two spare degrees of
+/// freedom is exactly the one that can bend to accommodate the odd one out.
+///
+/// The three finder centres are never dropped — they are what the orientation
+/// was built on, and a fit that excludes them is a fit to a different symbol.
+fn dropOutliers(marks: *[max_landmarks]Landmark, n_in: usize, module: f32) usize {
+    var n = n_in;
+    for (0..2) |_| {
+        if (n < 4) break;
+        const fitted = fitAffine(marks[0..n]) orelse break;
+        var kept: usize = 3;
+        for (marks[3..n]) |k| {
+            const p = fitted.at(k.mx, k.my);
+            const dx = p[0] - k.ix;
+            const dy = p[1] - k.iy;
+            if (dx * dx + dy * dy > module * module) continue;
+            marks[kept] = k;
+            kept += 1;
+        }
+        if (kept == n) break;
+        n = kept;
+    }
+    return n;
+}
+
+fn alreadyFound(marks: []const Landmark, mx: f32, my: f32) bool {
+    for (marks) |k| {
+        if (k.mx == mx and k.my == my) return true;
+    }
+    return false;
+}
+
+fn fitAffine(marks: []const Landmark) ?Grid {
+    var fit: Fit = .{};
+    for (marks) |k| fit.add(k.mx, k.my, k.ix, k.iy);
+    return fit.solve();
+}
+
+/// Fit the full projective map, perspective terms and all.
+///
+/// The direct linear transform: each correspondence gives two equations that are
+/// linear in the eight unknowns once the map is written as
+/// `u * (gx*x + gy*y + 1) = ax*x + bx*y + cx`, so eight unknowns come out of a
+/// normal-equation solve over however many landmarks there are.
+///
+/// **Both point sets are normalised first**, and that is not a nicety. Module
+/// coordinates run to 177 and image coordinates to a couple of thousand, so the
+/// design matrix carries entries from 1 to `x*u`, around 1e5, and squaring that
+/// into normal equations costs more digits than the answer has. Translating each
+/// set to its centroid and scaling it to a mean radius of sqrt(2) — Hartley's
+/// normalisation — brings every entry to order 1, and the map is transformed
+/// back afterwards.
+///
+/// An alternating scheme was tried first, holding the perspective terms while
+/// refitting the affine part and vice versa, because it reuses the 3x3 solver
+/// already here. It minimises the right objective and it converges, at a rate
+/// that made it useless: on exact synthetic data, forty rounds still had it a
+/// fifth of the way to the answer.
+fn fitProjective(marks: []const Landmark) ?Grid {
+    if (marks.len < 4) return null;
+
+    // ── normalisation ───────────────────────────────────────────────────────
+    var mx_mean: f64 = 0;
+    var my_mean: f64 = 0;
+    var ix_mean: f64 = 0;
+    var iy_mean: f64 = 0;
+    for (marks) |k| {
+        mx_mean += k.mx + 0.5;
+        my_mean += k.my + 0.5;
+        ix_mean += k.ix;
+        iy_mean += k.iy;
+    }
+    const count: f64 = @floatFromInt(marks.len);
+    mx_mean /= count;
+    my_mean /= count;
+    ix_mean /= count;
+    iy_mean /= count;
+
+    var m_rad: f64 = 0;
+    var i_rad: f64 = 0;
+    for (marks) |k| {
+        m_rad += @sqrt(sq(k.mx + 0.5 - mx_mean) + sq(k.my + 0.5 - my_mean));
+        i_rad += @sqrt(sq(@as(f64, k.ix) - ix_mean) + sq(@as(f64, k.iy) - iy_mean));
+    }
+    m_rad /= count;
+    i_rad /= count;
+    if (m_rad < 1e-9 or i_rad < 1e-9) return null; // every landmark in one place
+    const sm = @sqrt(2.0) / m_rad;
+    const si = @sqrt(2.0) / i_rad;
+
+    // ── normal equations ────────────────────────────────────────────────────
+    var ata: [8][8]f64 = @splat(@splat(0));
+    var atb: [8]f64 = @splat(0);
+    for (marks) |k| {
+        const x = (k.mx + 0.5 - mx_mean) * sm;
+        const y = (k.my + 0.5 - my_mean) * sm;
+        const u = (@as(f64, k.ix) - ix_mean) * si;
+        const v = (@as(f64, k.iy) - iy_mean) * si;
+
+        const rows = [2][9]f64{
+            .{ x, y, 1, 0, 0, 0, -x * u, -y * u, u },
+            .{ 0, 0, 0, x, y, 1, -x * v, -y * v, v },
+        };
+        for (rows) |row| {
+            for (0..8) |a| {
+                for (0..8) |bb| ata[a][bb] += row[a] * row[bb];
+                atb[a] += row[a] * row[8];
+            }
+        }
+    }
+    const h = solve8(&ata, &atb) orelse return null;
+
+    // ── back out of the normalised frame ────────────────────────────────────
+    // H = inv(Ti) * Hn * Tm, with both T a translation followed by a scale.
+    const hn = [3][3]f64{
+        .{ h[0], h[1], h[2] },
+        .{ h[3], h[4], h[5] },
+        .{ h[6], h[7], 1 },
+    };
+    const tm = [3][3]f64{
+        .{ sm, 0, -sm * mx_mean },
+        .{ 0, sm, -sm * my_mean },
+        .{ 0, 0, 1 },
+    };
+    const ti_inv = [3][3]f64{
+        .{ 1 / si, 0, ix_mean },
+        .{ 0, 1 / si, iy_mean },
+        .{ 0, 0, 1 },
+    };
+    const full = mul3(ti_inv, mul3(hn, tm));
+    if (@abs(full[2][2]) < 1e-12) return null;
+    const w = full[2][2];
+
+    return .{
+        .ax = @floatCast(full[0][0] / w),
+        .bx = @floatCast(full[0][1] / w),
+        .cx = @floatCast(full[0][2] / w),
+        .ay = @floatCast(full[1][0] / w),
+        .by = @floatCast(full[1][1] / w),
+        .cy = @floatCast(full[1][2] / w),
+        .gx = @floatCast(full[2][0] / w),
+        .gy = @floatCast(full[2][1] / w),
+    };
+}
+
+fn sq(x: f64) f64 {
+    return x * x;
+}
+
+fn mul3(a: [3][3]f64, b: [3][3]f64) [3][3]f64 {
+    var out: [3][3]f64 = @splat(@splat(0));
+    for (0..3) |i| {
+        for (0..3) |j| {
+            for (0..3) |k| out[i][j] += a[i][k] * b[k][j];
+        }
+    }
+    return out;
+}
+
+/// Gaussian elimination with partial pivoting. Eight unknowns is small enough
+/// that nothing cleverer earns its place, and pivoting is what keeps it honest
+/// when a column happens to be nearly empty — which is the degenerate landmark
+/// set, and the case that must return null rather than a number.
+fn solve8(a: *[8][8]f64, b: *[8]f64) ?[8]f64 {
+    for (0..8) |col| {
+        var pivot = col;
+        for (col + 1..8) |r| {
+            if (@abs(a[r][col]) > @abs(a[pivot][col])) pivot = r;
+        }
+        if (@abs(a[pivot][col]) < 1e-12) return null;
+        if (pivot != col) {
+            std.mem.swap([8]f64, &a[pivot], &a[col]);
+            std.mem.swap(f64, &b[pivot], &b[col]);
+        }
+        for (col + 1..8) |r| {
+            const f = a[r][col] / a[col][col];
+            if (f == 0) continue;
+            for (col..8) |cc| a[r][cc] -= f * a[col][cc];
+            b[r] -= f * b[col];
+        }
+    }
+    var out: [8]f64 = @splat(0);
+    var i: usize = 8;
+    while (i > 0) {
+        i -= 1;
+        var acc = b[i];
+        for (i + 1..8) |j| acc -= a[i][j] * out[j];
+        out[i] = acc / a[i][i];
+    }
+    return out;
+}
+
+/// Sum of squared distances between where the landmarks are and where a grid
+/// says they should be. Used to reject a projective fit that went somewhere
+/// silly rather than to choose between grids — that is the referee's job.
+fn residual(g: Grid, marks: []const Landmark) f32 {
+    var total: f32 = 0;
+    for (marks) |k| {
+        const p = g.at(k.mx, k.my);
+        const dx = p[0] - k.ix;
+        const dy = p[1] - k.iy;
+        total += dx * dx + dy * dy;
+    }
+    return total;
+}
+
+/// Whether a predicted point can be turned into a pixel index at all.
+///
+/// A projective grid can send a module to the horizon, where the denominator
+/// vanishes: `Grid.at` returns a deliberately enormous coordinate there, and a
+/// badly conditioned fit can overflow f32 into an infinity on its own. Either
+/// way `@intFromFloat` **panics** rather than producing a large integer that a
+/// range check would then catch, so the check has to come first. This is the
+/// difference between a grid that is rejected and a process that dies.
+fn insideImage(b: *const Bitmap, p: [2]f32) bool {
+    if (!std.math.isFinite(p[0]) or !std.math.isFinite(p[1])) return false;
+    if (p[0] < 0 or p[1] < 0) return false;
+    return p[0] < @as(f32, @floatFromInt(b.width)) and p[1] < @as(f32, @floatFromInt(b.height));
 }
 
 /// Locate one alignment pattern near where the grid says it should be.
@@ -922,14 +1252,12 @@ fn refine(b: *const Bitmap, c: Corners, grid: Grid) Grid {
 /// with light either side — because it is the only feature whose centre is a
 /// point rather than an edge, and because finding it re-uses no assumption about
 /// the ring the sampler is about to rely on.
-fn findAlignment(b: *const Bitmap, predicted: [2]f32, module: f32) ?[2]f32 {
-    if (predicted[0] < 0 or predicted[1] < 0) return null;
+fn findAlignment(b: *const Bitmap, predicted: [2]f32, module: f32, reach_modules: f32) ?[2]f32 {
+    if (!insideImage(b, predicted)) return null;
     const px: i32 = @intFromFloat(predicted[0]);
     const py: i32 = @intFromFloat(predicted[1]);
 
-    // Search a window of about +-1.5 modules: further than the drift this is
-    // correcting, and closer than the neighbouring dark ring.
-    const reach: i32 = @max(2, @as(i32, @intFromFloat(module * 1.5)));
+    const reach: i32 = @max(2, @as(i32, @intFromFloat(module * reach_modules)));
     const w: i32 = @intCast(b.width);
     const h: i32 = @intCast(b.height);
 
@@ -1001,11 +1329,17 @@ fn alignmentRun(b: *const Bitmap, x: i32, y: i32, axis: Axis, module: f32) ?f32 
     while (p < limit and isDarkAt(b, x, y, axis, p)) : (p += 1) dark += 1;
     runs[4] = @floatFromInt(dark);
 
-    // Half a module of slack per run: the same tolerance the finder ratio uses,
-    // and it is what a symbol photographed small still satisfies.
-    for (runs) |r| {
+    // The middle three runs are the pattern and are measured against a module
+    // each. The outer two are NOT: an alignment pattern's outer ring touches the
+    // data region, so a dark module next to it merges into that run and it
+    // reads as two or three modules wide — through no fault of the pattern.
+    // Bounding them above is what stopped the single alignment pattern of a
+    // version 2-6 symbol from ever being found, which in turn is why the
+    // projective fit had nothing to fit.
+    for (runs[1..4]) |r| {
         if (r < module * 0.5 or r > module * 1.5) return null;
     }
+    if (runs[0] < module * 0.5 or runs[4] < module * 0.5) return null;
     return (@as(f32, @floatFromInt(lo)) + @as(f32, @floatFromInt(hi)) + 1) / 2;
 }
 
@@ -1043,14 +1377,29 @@ fn sampleBestDimension(b: *const Bitmap, c: Corners) Error!struct { found: Found
         // Refine against the alignment patterns before scoring: a wrong
         // dimension predicts alignment patterns where there are none, so the
         // refinement quietly declines to make a wrong grid look better.
-        const got = sample(b, candidate, refine(b, candidate, coarse)) catch continue;
+        const grids = refine(b, candidate, coarse);
 
-        const score = timingScore(&got.matrix);
-        if (score > best_score) {
-            best_score = score;
-            best = got;
+        // Both grids are tried and the timing patterns decide. A projective fit
+        // is the right model for a tilted plane and the wrong one for landmarks
+        // that are each a little off — it has two more degrees of freedom to
+        // spend on the noise. Rather than guess which case this is, sample both
+        // and let the part of the symbol whose content the standard fixes say
+        // which grid laid over the modules and which laid across them.
+        // Affine first, so that a tie goes to it. Two more degrees of freedom
+        // will never score worse on the landmarks they were fitted to, and the
+        // timing patterns are a coarse referee — 40-odd modules at version 7.
+        // When the evidence does not distinguish the two models, the simpler
+        // one is the answer.
+        for ([_]?Grid{ grids.affine, grids.projective }) |maybe_grid| {
+            const g = maybe_grid orelse continue;
+            const got = sample(b, candidate, g) catch continue;
+            const score = timingScore(&got.matrix);
+            if (score > best_score) {
+                best_score = score;
+                best = got;
+            }
         }
-        if (score == 1.0) break;
+        if (best_score == 1.0) break;
     }
 
     // Deliberately no minimum score. A real symbol with a damaged timing pattern
@@ -1161,6 +1510,145 @@ fn renderRotated(m: *const qr.Matrix, scale: u32, deg: f32, buf: []u8, side_out:
         }
     }
     return .{ .luma = buf, .width = side, .height = side, .stride = side };
+}
+
+/// Render the symbol on a plane tilted `deg` out of the image plane and seen
+/// through a pinhole — a photograph taken from the side rather than square on.
+///
+/// Inverse-mapped like `renderRotated`, and the inverse is closed form. With the
+/// plane rotated about the vertical axis by `t`, a surface point `u` across maps
+/// to `X = f*u*cos(t) / (d - u*sin(t))`, which rearranges to
+/// `u = X*d / (f*cos(t) + X*sin(t))`; the other axis then follows from the depth
+/// that `u` implies. `f = d` makes `deg = 0` the identity, so the renderer is
+/// checked against `render` rather than trusted.
+fn renderProjective(m: *const qr.Matrix, scale: u32, deg: f32, vertical_axis: bool, buf: []u8, side_out: *u32) Image {
+    const q = qr.quiet_zone;
+    const src_side = (m.size + 2 * q) * scale;
+    const side: u32 = @intFromFloat(@as(f32, @floatFromInt(src_side)) * 1.5);
+    side_out.* = side;
+    @memset(buf[0 .. @as(usize, side) * side], 255);
+
+    const rad = deg * std.math.pi / 180.0;
+    const cs = @cos(rad);
+    const sn = @sin(rad);
+    // Three symbol widths away: close enough that the far edge is visibly
+    // smaller, far enough to be a photograph rather than a fisheye.
+    const d: f32 = @as(f32, @floatFromInt(src_side)) * 3.0;
+    const f = d;
+
+    const cd: f32 = @floatFromInt(side / 2);
+    const half_src: f32 = @as(f32, @floatFromInt(src_side)) / 2.0;
+
+    for (0..side) |dy| {
+        for (0..side) |dx| {
+            var x = @as(f32, @floatFromInt(dx)) - cd;
+            var y = @as(f32, @floatFromInt(dy)) - cd;
+            if (!vertical_axis) std.mem.swap(f32, &x, &y);
+
+            const den = f * cs + x * sn;
+            if (@abs(den) < 1e-6) continue;
+            const u = x * d / den;
+            const depth = d - u * sn;
+            if (depth <= 1e-6) continue;
+            const v = y * depth / f;
+
+            var sx = u + half_src;
+            var sy = v + half_src;
+            if (!vertical_axis) std.mem.swap(f32, &sx, &sy);
+            if (sx < 0 or sy < 0) continue;
+            const ix: u32 = @intFromFloat(sx);
+            const iy: u32 = @intFromFloat(sy);
+            if (ix >= src_side or iy >= src_side) continue;
+            const mx = ix / scale;
+            const my = iy / scale;
+            if (mx < q or my < q or mx >= m.size + q or my >= m.size + q) continue;
+            if (m.isDark(@intCast(mx - q), @intCast(my - q))) buf[dy * side + dx] = 0;
+        }
+    }
+    return .{ .luma = buf, .width = side, .height = side, .stride = side };
+}
+
+/// Render the symbol wrapped round a cylinder of `radius_modules` seen head-on —
+/// a label on a bottle or a can.
+///
+/// `X` depends only on the angle round the cylinder and not on the height, so
+/// the inverse is one bisection per destination COLUMN rather than per pixel.
+/// It has no closed form, which is the whole reason curvature is a different
+/// problem from perspective rather than a harder case of it.
+fn renderCylindrical(m: *const qr.Matrix, scale: u32, radius_modules: f32, buf: []u8, side_out: *u32) Image {
+    const q = qr.quiet_zone;
+    const src_side = (m.size + 2 * q) * scale;
+    const side: u32 = @intFromFloat(@as(f32, @floatFromInt(src_side)) * 1.5);
+    side_out.* = side;
+    @memset(buf[0 .. @as(usize, side) * side], 255);
+
+    const r = radius_modules * @as(f32, @floatFromInt(scale));
+    const d: f32 = @as(f32, @floatFromInt(src_side)) * 3.0;
+    const f = d;
+    const cd: f32 = @floatFromInt(side / 2);
+    const half_src: f32 = @as(f32, @floatFromInt(src_side)) / 2.0;
+
+    for (0..side) |dx| {
+        const x = @as(f32, @floatFromInt(dx)) - cd;
+
+        // X(phi) = f*R*sin(phi) / (d + R*(1 - cos(phi))) is monotonic over the
+        // visible half, so bisection converges and cannot pick the wrong branch.
+        var lo: f32 = -1.3;
+        var hi: f32 = 1.3;
+        var phi: f32 = 0;
+        for (0..40) |_| {
+            phi = (lo + hi) / 2;
+            const depth = d + r * (1 - @cos(phi));
+            const proj = f * r * @sin(phi) / depth;
+            if (proj < x) lo = phi else hi = phi;
+        }
+        const depth = d + r * (1 - @cos(phi));
+        const u = r * phi;
+        const sx = u + half_src;
+        if (sx < 0) continue;
+        const ix: u32 = @intFromFloat(sx);
+        if (ix >= src_side) continue;
+        const mx = ix / scale;
+        if (mx < q or mx >= m.size + q) continue;
+
+        for (0..side) |dy| {
+            const y = @as(f32, @floatFromInt(dy)) - cd;
+            const v = y * depth / f;
+            const sy = v + half_src;
+            if (sy < 0) continue;
+            const iy: u32 = @intFromFloat(sy);
+            if (iy >= src_side) continue;
+            const my = iy / scale;
+            if (my < q or my >= m.size + q) continue;
+            if (m.isDark(@intCast(mx - q), @intCast(my - q))) buf[dy * side + dx] = 0;
+        }
+    }
+    return .{ .luma = buf, .width = side, .height = side, .stride = side };
+}
+
+test "the warp renderers degenerate to the flat one, so they can be trusted" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "WARP HARNESS", .{ .ecc = .quartile });
+
+    var pixels: [900 * 900]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
+    var out: [64]u8 = undefined;
+
+    // Zero tilt, and a cylinder the size of a planet. If either renderer were
+    // wrong at its own identity, every number measured with it would be a
+    // statement about the renderer instead of about the scanner.
+    var side: u32 = 0;
+    for ([_]Image{
+        renderProjective(&m, 5, 0, true, &pixels, &side),
+        renderProjective(&m, 5, 0, false, &pixels, &side),
+        renderCylindrical(&m, 5, 100000, &pixels, &side),
+    }) |img| {
+        const found = try scan(img, &scratch);
+        try t.expectEqual(m.size, found.matrix.size);
+        var fm = found.matrix;
+        try t.expectEqualStrings("WARP HARNESS", try qr.decode(&fm, &out));
+    }
 }
 
 test "rotation: a symbol reads at any angle" {
@@ -1380,7 +1868,7 @@ test "a large symbol needs the alignment patterns, not just its corners" {
     c.dimension = m.size;
 
     const coarse = gridFromCorners(c);
-    const refined = refine(bits, c, coarse);
+    const refined = refine(bits, c, coarse).affine;
 
     // The refinement moved the far corner by enough to change which module it
     // samples, which is the whole point: three corner points fix an affine map
@@ -1478,6 +1966,122 @@ test "a symbol is found wherever in the frame it happens to be" {
             try t.expectEqualStrings("ANY CORNER", try qr.decode(&fm, &out));
         }
     }
+}
+
+test "the projective fitter recovers a map it was sampled from, exactly" {
+    const t = std.testing;
+    // Perspective terms of a few thousandths: about what a 20-degree tilt puts
+    // there, and enough that an affine fit cannot come close.
+    const truth: Grid = .{
+        .ax = 4.1,
+        .bx = -1.7,
+        .cx = 231.5,
+        .ay = 1.6,
+        .by = 4.3,
+        .cy = 112.25,
+        .gx = 0.004,
+        .gy = -0.002,
+    };
+
+    var marks: [9]Landmark = undefined;
+    var i: usize = 0;
+    for ([_]f32{ 3, 34, 65 }) |my| {
+        for ([_]f32{ 3, 34, 65 }) |mx| {
+            const p = truth.at(mx, my);
+            marks[i] = .{ .mx = mx, .my = my, .ix = p[0], .iy = p[1] };
+            i += 1;
+        }
+    }
+
+    const affine = fitAffine(&marks) orelse return error.Singular;
+    const proj = fitProjective(&marks) orelse return error.NoProjectiveFit;
+
+    // The affine fit cannot express these landmarks at all; the projective one
+    // reproduces them. That gap is the whole reason the second fit exists, and
+    // it is also what a normalised solve buys — an alternating scheme that
+    // minimises the same objective was a fifth of the way there after forty
+    // rounds.
+    try t.expect(residual(affine, &marks) > 100.0);
+    try t.expect(residual(proj, &marks) < 0.01);
+    try t.expect(@abs(proj.gx - truth.gx) < 1e-5);
+    try t.expect(@abs(proj.gy - truth.gy) < 1e-5);
+}
+
+test "a symbol photographed off-axis reads" {
+    const t = std.testing;
+    var pixels: [900 * 900]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var m: qr.Matrix = undefined;
+
+    // Both axes, asserted as a floor rather than as the limit: measured, a tilt
+    // about the vertical axis reads to 25 degrees and about the horizontal axis
+    // to 15, and before there was a projective grid to fit, this symbol read to
+    // 5 degrees and stopped. The asymmetry is real and unexplained — the scan
+    // that finds the finders runs along rows, so the two axes are not the same
+    // thing to it.
+    const text = "https://example.com/a-longer-url-that-needs-a-bigger-symbol/12345";
+    try qr.encode(&m, text, .{ .ecc = .quartile });
+    for ([_]bool{ true, false }) |vertical_axis| {
+        for ([_]f32{ 10, 15 }) |deg| {
+            var side: u32 = 0;
+            const img = renderProjective(&m, 6, deg, vertical_axis, &pixels, &side);
+            const found = scan(img, &scratch) catch |e| {
+                std.debug.print("tilt {d} deg, vertical={}: scan {s}\n", .{ deg, vertical_axis, @errorName(e) });
+                return e;
+            };
+            var fm = found.matrix;
+            const got = qr.decode(&fm, &out) catch |e| {
+                std.debug.print("tilt {d} deg, vertical={}: decode {s}\n", .{ deg, vertical_axis, @errorName(e) });
+                return e;
+            };
+            try t.expectEqualStrings(text, got);
+        }
+    }
+}
+
+test "one landmark in the wrong place is dropped, not averaged in" {
+    const t = std.testing;
+    const truth: Grid = .{ .ax = 5, .bx = 0, .cx = 40, .ay = 0, .by = 5, .cy = 40 };
+    var marks: [max_landmarks]Landmark = undefined;
+    var n: usize = 0;
+    for ([_][2]f32{ .{ 3, 3 }, .{ 65, 3 }, .{ 3, 65 }, .{ 34, 34 }, .{ 34, 6 }, .{ 6, 34 } }) |mp| {
+        const p = truth.at(mp[0], mp[1]);
+        marks[n] = .{ .mx = mp[0], .my = mp[1], .ix = p[0], .iy = p[1] };
+        n += 1;
+    }
+    // A dark module three modules from where the pattern should be — what a
+    // widened search window finds in a data region.
+    marks[n] = .{ .mx = 65, .my = 65, .ix = truth.at(65, 65)[0] + 15, .iy = truth.at(65, 65)[1] + 15 };
+    n += 1;
+
+    const kept = dropOutliers(&marks, n, 5.0);
+    try t.expectEqual(@as(usize, 6), kept);
+    const fitted = fitAffine(marks[0..kept]) orelse return error.Singular;
+    try t.expect(residual(fitted, marks[0..kept]) < 0.01);
+}
+
+test "a grid that points at the horizon is refused, not indexed with" {
+    const t = std.testing;
+    var pixels: [64 * 64]u8 = undefined;
+    @memset(&pixels, 255);
+    var scratch: [scratchSize(64, 64)]u8 = undefined;
+    var bits: Bitmap = .{ .bits = scratch[0..bitmapBytes(64, 64)], .width = 64, .height = 64 };
+    @memset(bits.bits, 0);
+
+    // A projective map whose denominator crosses zero inside the symbol. The
+    // coordinates it produces are infinite or NaN, and `@intFromFloat` panics on
+    // those rather than producing a large integer a range check would catch — so
+    // the check has to happen first.
+    const horizon: Grid = .{ .ax = 3, .bx = 0, .cx = 5, .ay = 0, .by = 3, .cy = 5, .gx = -0.1, .gy = 0 };
+    const c: Corners = .{
+        .tl = .{ .x = 5, .y = 5, .module = 3, .peak = 3 },
+        .tr = .{ .x = 50, .y = 5, .module = 3, .peak = 3 },
+        .bl = .{ .x = 5, .y = 50, .module = 3, .peak = 3 },
+        .dimension = 21,
+        .module = 3,
+    };
+    try t.expectError(Error.NotFound, sample(&bits, c, horizon));
 }
 
 // ── fuzz: the image is entirely attacker-chosen ─────────────────────────────

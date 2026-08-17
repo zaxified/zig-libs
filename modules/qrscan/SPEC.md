@@ -73,6 +73,53 @@ decode it, and a symbol that scans but cannot be read is still `qr.decode`'s
 verdict to give. What the check chooses between is two grids of this module's own
 making.
 
+**The grid is projective when the symbol says it should be.** A plane
+photographed off-axis maps to the image by a homography, and no affine map
+approximates one across a whole symbol — measured, a version 13 at 5° of tilt
+did not read at all. `fitProjective` solves the eight-parameter direct linear
+transform over every landmark, and the answer is offered alongside the affine
+fit rather than instead of it: `sampleBestDimension` samples both and the timing
+patterns decide. Affine is tried first so that a tie goes to the simpler model,
+and the projective fit is only offered when the affine one leaves more than a
+quarter of a module of RMS error — two spare degrees of freedom always fit the
+landmarks better, and a grid bent to satisfy a referee that only looks along two
+lines near the edges can be wrong in the middle where nothing is watching.
+
+⚠ **Both point sets are normalised before the solve, and that is not a nicety.**
+Module coordinates run to 177 and image coordinates to a couple of thousand, so
+the design matrix carries entries around 1e5 and squaring those into normal
+equations costs more digits than the answer has. Hartley normalisation — centre
+each set, scale to a mean radius of √2 — brings every entry to order 1.
+
+⚠ **An alternating scheme was tried first and is a trap worth recording.** Hold
+the perspective terms, refit the affine part; hold the affine part, solve a 2×2
+for the perspective terms. It reuses the 3×3 solver already here, it minimises
+the correct objective, and it converges — at a rate that made it useless: on
+exact synthetic data, forty rounds had it a fifth of the way to an answer the
+direct solve gets exactly. A test fits a known projective map and demands it
+back, which is what turned "it seems not to help" into "the fitter is wrong".
+
+**Landmarks that do not fit are dropped rather than averaged in.** The search
+window widens with each pass, and a wide window over a data region can return a
+dark module that crosses like an alignment pattern. One such landmark drags a
+least-squares fit; a module of error is far more than a real pattern shows and
+far less than a false one does. The outlier test uses the *affine* fit
+deliberately — the question is whether a landmark is like the others, and the
+model with two spare degrees of freedom is exactly the one that can bend to
+accommodate the odd one out. The three finder centres are never dropped.
+
+⚠ **The pattern search widens across passes, and the loop must not stop when a
+pass finds nothing.** Those are different conditions, and conflating them cost
+an hour: the first pass looks 1.5 modules out, a version 2–6 symbol's single
+alignment pattern sits further than that past about 15° of tilt, and a loop that
+returns as soon as a pass adds nothing never reaches the wider window that would
+have found it. It stops when everything expected has been found.
+
+⚠ **`@intFromFloat` panics rather than saturating.** A projective grid can send a
+module to the horizon and a badly conditioned fit can overflow f32 to an
+infinity; both must be rejected *before* the conversion, not by the range check
+after it. The difference is a grid that is refused and a process that dies.
+
 **Three points fix an affine map exactly, and that is the problem.** Exactly
 means every measurement error in the three finder centres lands undiluted in the
 map, which is then extrapolated across the symbol. At version 37 the far corner
@@ -170,6 +217,21 @@ back into the rendered module size, that a dimension one version out is rejected
 by its timing pattern, and that a large rotated symbol really does produce more
 than sixteen candidates.
 
+**Tilt and curvature are rendered, not reasoned about.** `renderProjective` puts
+the symbol on a plane rotated out of the image plane and projects it through a
+pinhole; `renderCylindrical` wraps it round a cylinder, which has no closed-form
+inverse and needs a bisection per destination column — which is itself the
+answer to why curvature is a different problem from perspective rather than a
+harder case of it. Both are checked at their own identity (zero tilt, infinite
+radius) against the flat renderer, because a warp renderer that is wrong turns
+every number measured with it into a statement about the renderer.
+
+Measured at six pixels per module, tilt about each axis: version 6 reads to
+25°/15°, version 13 to 15°/20°, version 1 to 10°. Before the projective fit:
+5°, 0°, 10°. Curvature, unchanged by this work since the map is still a single
+global one: a version 1 reads wrapped on a cylinder 18 modules across, a version
+6 to 45, a version 13 to 200.
+
 A wider sweep than the tests keep — five versions × two module scales × 5° steps
 — reads at every angle at 4 pixels per module from version 1 to 24, and at 3
 pixels per module reads 68 of 72 angles at version 37 and 57 of 72 at version 1.
@@ -193,10 +255,17 @@ comparison is internal.
 
 ## Backlog
 
-- **Perspective correction.** The one substantial thing left. The grid is fitted
-  to many points but is still affine; an off-axis photograph is a projective
-  image. The alignment patterns are already located, which is most of the work —
-  what is missing is a projective fit and the numerics to keep it stable.
+- **A mesh instead of one global map.** The grid is a single projective map, so
+  it models a flat plane at an angle and nothing else. Interpolating between the
+  alignment patterns instead — each cell of the lattice carrying its own local
+  map — would handle curvature as well, and would raise the tilt limit too,
+  since it stops assuming the whole symbol is one plane. The landmarks are
+  already collected; what is missing is the lattice and the extrapolation for
+  the margins outside it.
+- **Tilt about the horizontal axis lags the vertical one** — 15° against 25° at
+  version 6. Unexplained. The scan that finds the finders runs along rows, so
+  the two axes are not the same thing to it, but that is a hypothesis and this
+  file has been wrong with one of those before.
 - **Small symbols at three pixels per module.** A version 1 reads at about 79 %
   of angles there, against 100 % at four pixels. Sub-pixel sampling — averaging a
   small neighbourhood instead of reading the single centre pixel — is the
