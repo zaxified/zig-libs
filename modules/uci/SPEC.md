@@ -19,7 +19,14 @@ control char that has no UCI escape → `error.UnserializableValue`. Bounded: in
 `error.InputTooLarge`; a line over 16 KiB → `error.LineTooLong`. Canonical output: optional `package
 '<name>'` header, blank line between section blocks, tab-indented options, values single-quoted
 (double-quoted with escapes only when they contain `'` or a control char). Accessors: `section(type,
-name)`, `get`/`getList`, `iterate(type)`, deep `eql`. Clean-room from the documented OpenWRT UCI file
+name)`, `get`/`getList`, `iterate(type)`, deep `eql`. Two more resolve the addressing forms a UCI key
+path uses: `sectionByName(name)` resolves `pkg.<name>.<opt>` (libuci indexes section names in one
+namespace per package, not one per type — `uci_lookup_list` in list.c has no type filter, verified
+against source); `nth(type, index)` resolves `@type[N]` positional addressing including libuci's
+negative-index-from-the-end form (verified against `uci_lookup_ext_section` in list.c: a negative
+index adds the matching-section count to itself; out of range either direction — including a still-
+negative result — is "not found", returned here as `null` rather than an error; anonymous and named
+sections of `type` both count). Clean-room from the documented OpenWRT UCI file
 format (libuci referenced for the *format* only, no source consulted or copied) — see NOTICE.
 
 ## Threat model / out of scope
@@ -31,6 +38,23 @@ represented in UCI text and fail serialization. Out of scope: the UCI CLI layer 
 `/etc/config` discovery, the transactional delta/state files under `/var/state`, and typed value
 coercion. This is the file codec only.
 
+**The concrete trap in "this is the file codec only": a file-only reader loses staged-but-uncommitted
+state.** `uci set` without a following `commit` never touches `/etc/config/<pkg>` — it appends a
+delta line to `/tmp/.uci/<pkg>` (libuci's `UCI_SAVEDIR`), and `uci get`/`uci show` return that staged
+value while the on-disk config file still holds the old one. This is exactly LuCI's "Save" without
+"Apply" (routers commonly sit in this state — a webUI change staged but not yet applied), and it is
+the concrete trap for anyone replacing a shelled-out `uci get` with `parse(gpa,
+readFile("/etc/config/<pkg>"))`: the read is silently stale for any package with a pending delta,
+with no error to catch it. Verified against libuci's own source (`uci.h`'s `UCI_SAVEDIR
+"/tmp/.uci"`; `uci_load_delta`/`file.c`'s config-path resolution) rather than assumed.
+
+`uci revert` truncates the delta file (`ftruncate(fd, 0)` in `delta.c`'s `uci_load_delta`/
+`uci_filter_delta`) rather than deleting it — the file keeps existing, empty, after every pending
+change for a package is reverted. A caller that checks for the delta file's existence as a
+"has staged changes" fallback (an understandable move if it can't call into libuci itself) latches
+that fallback permanently true the first time anything is staged and reverted, even with zero
+changes actually pending — check the file's contents/size, not merely whether it exists.
+
 ## Verification
 Golden tests: parse a realistic `network` config into the model and assert its structure; round-trip
 stability (`parse∘serialize` equal, second pass byte-identical) and the exact canonical serialization
@@ -38,7 +62,9 @@ bytes. Quoting: double-quote escapes, single-quote literalness, bare words, mid-
 concatenation of quoted segments, comments/blank lines, empty quoted value. Semantics: anonymous
 sections, list accumulation, duplicate-option last-wins, mixed option/list rejected. Errors (with
 asserted line numbers): unterminated single/double quote, option before any section, bad keyword,
-missing/too-many arguments, line-too-long, input-too-large. Plus accessor lookups, CRLF input,
+missing/too-many arguments, line-too-long, input-too-large. Plus accessor lookups (incl.
+`sectionByName`/`nth` against the real-`uci`-capture fixture below — name-across-types resolution,
+`@type[N]` positive/negative/out-of-range/no-match), CRLF input,
 `package` header serialization, and quoted keys/types round-tripping. Run: `zig build
 test-uci`.
 

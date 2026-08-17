@@ -186,6 +186,56 @@ pub const Package = struct {
         return .{ .remaining = self.sections, .section_type = section_type };
     }
 
+    /// Resolve `pkg.<name>.<opt>` addressing: a section by name alone,
+    /// across every type — UCI section names share one namespace per
+    /// package, not one per type, matching libuci's own lookup
+    /// (`uci_lookup_list`/`uci_lookup_next` in list.c, a plain linear scan by
+    /// `e->name` with no type filter). Unlike `section`, the caller does not
+    /// need to already know the section's type. Anonymous sections have no
+    /// name and are never matched here — use `nth` for `@type[N]`
+    /// addressing.
+    pub fn sectionByName(self: *const Package, name: []const u8) ?*const Section {
+        for (self.sections) |*s| {
+            const n = s.name orelse continue;
+            if (std.mem.eql(u8, n, name)) return s;
+        }
+        return null;
+    }
+
+    /// Resolve `@type[N]` positional addressing, matching libuci exactly
+    /// (`uci_lookup_ext_section` in list.c, verified against its source):
+    /// `index` counts sections of `section_type` in file order — anonymous
+    /// *and* named sections of that type both count, the same set `iterate`
+    /// walks, not anonymous-only. A negative index counts from the end
+    /// (`-1` = last matching section): libuci first counts the matching
+    /// sections, then adds that count to the negative index, converting it
+    /// to the equivalent non-negative position; `nth` does the same. Both an
+    /// out-of-range positive index and a negative index whose magnitude
+    /// exceeds the match count return `null` — libuci's lookup falls through
+    /// its scan and reports "not found" rather than erroring, so `nth`
+    /// mirrors that with `null` rather than an error union. `-0` behaves
+    /// exactly like `0` (the first matching section): libuci parses the
+    /// index text with `strtol`, which has no signed zero, so `"-0"` never
+    /// even reaches the negative-index branch — and there is no way to
+    /// construct a distinct "negative zero" `i64` either, so that case isn't
+    /// separately representable here.
+    pub fn nth(self: *const Package, section_type: []const u8, index: i64) ?*const Section {
+        var count: i64 = 0;
+        for (self.sections) |*s| {
+            if (std.mem.eql(u8, s.type, section_type)) count += 1;
+        }
+        var idx = index;
+        if (idx < 0) idx += count;
+        if (idx < 0 or idx >= count) return null;
+        var c: i64 = 0;
+        for (self.sections) |*s| {
+            if (!std.mem.eql(u8, s.type, section_type)) continue;
+            if (c == idx) return s;
+            c += 1;
+        }
+        return null; // unreachable given the bounds check above
+    }
+
     pub fn eql(a: *const Package, b: *const Package) bool {
         if (!optStrEql(a.name, b.name)) return false;
         if (a.sections.len != b.sections.len) return false;
@@ -1192,9 +1242,10 @@ const captured_testcfg_export = "package testcfg\n" ++
 // Real `uci show testcfg` stdout for the SAME config — dotted notation,
 // revealing the generated anonymous-section addressing (`@rule[0]`,
 // `@rule[1]`: a per-type, 0-based, file-order index — NOT a random/hashed
-// name). This module's own model doesn't expose `@type[N]` addressing
-// (out of scope, CLI layer — see SPEC.md), so the test below checks the
-// same file-order/per-type semantics through `Package.iterate`.
+// name). The test below checks that same file-order/per-type semantics
+// through `Package.iterate`, and a further test below checks it through
+// `Package.nth`, which does expose `@type[N]` addressing directly (matching
+// libuci's `uci_lookup_ext_section` in list.c).
 const captured_testcfg_show = "testcfg.lan=interface\n" ++
     "testcfg.lan.proto='static'\n" ++
     "testcfg.lan.ipaddr='192.168.1.1'\n" ++
@@ -1255,6 +1306,76 @@ test "real uci capture: parse(raw file) matches the real `uci show` structure �
     // reflects (0 then 1, for the two `rule` sections above).
     try testing.expect(std.mem.indexOf(u8, captured_testcfg_show, "testcfg.@rule[0]=rule\n") != null);
     try testing.expect(std.mem.indexOf(u8, captured_testcfg_show, "testcfg.@rule[1]=rule\n") != null);
+}
+
+test "Package.sectionByName: pkg.<name> addressing by name alone, across types (real uci capture)" {
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, captured_testcfg_raw);
+    defer pkg.deinit(gpa);
+
+    // "lan" is type `interface`; sectionByName finds it without being told
+    // the type, and agrees with the type-qualified lookup.
+    const lan = pkg.sectionByName("lan").?;
+    try testing.expectEqual(pkg.section("interface", "lan").?, lan);
+    try testing.expectEqualStrings("static", lan.get("proto").?);
+
+    // "globals" is type `switch` — a different type from "lan", still found
+    // by name alone.
+    const globals = pkg.sectionByName("globals").?;
+    try testing.expectEqualStrings("switch", globals.type);
+    try testing.expectEqualStrings("1", globals.get("bare_word_value_here").?);
+
+    // A name that doesn't exist, and the anonymous `rule` sections (which
+    // have no name to match), both miss.
+    try testing.expect(pkg.sectionByName("nope") == null);
+    try testing.expect(pkg.sectionByName("rule") == null);
+}
+
+test "Package.nth: @type[N] addressing, matching libuci's negative-index and out-of-range semantics (real uci capture)" {
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, captured_testcfg_raw);
+    defer pkg.deinit(gpa);
+
+    // Two `rule` sections in file order (both anonymous, per the capture
+    // above) — @rule[0] and @rule[1] in real `uci show` output.
+    const r0 = pkg.nth("rule", 0).?;
+    try testing.expectEqualStrings("weird \"quote\" and back\\slash", r0.get("name").?);
+    const r1 = pkg.nth("rule", 1).?;
+    try testing.expectEqualStrings("second anon rule, with a comma and # not-a-comment", r1.get("name").?);
+
+    // Negative index counts from the end: libuci first counts matching
+    // sections (2), then adds that count to the index (-1 + 2 = 1, -2 + 2 =
+    // 0) — so -1 is the last and -2 is the first, same sections as above.
+    try testing.expectEqual(r1, pkg.nth("rule", -1).?);
+    try testing.expectEqual(r0, pkg.nth("rule", -2).?);
+
+    // Out of range, both directions: a positive index at or past the match
+    // count, and a negative index whose magnitude exceeds it (-3 + 2 = -1,
+    // still negative after the libuci adjustment) — libuci's own lookup
+    // falls through its scan for both and reports "not found", so this
+    // returns null rather than an error.
+    try testing.expect(pkg.nth("rule", 2) == null);
+    try testing.expect(pkg.nth("rule", 100) == null);
+    try testing.expect(pkg.nth("rule", -3) == null);
+    try testing.expect(pkg.nth("rule", -100) == null);
+
+    // A type with exactly one match: index 0 and -1 both resolve to it.
+    const globals = pkg.nth("switch", 0).?;
+    try testing.expectEqualStrings("globals", globals.name.?);
+    try testing.expectEqual(globals, pkg.nth("switch", -1).?);
+    try testing.expect(pkg.nth("switch", 1) == null);
+    try testing.expect(pkg.nth("switch", -2) == null);
+
+    // A type with no matches at all: every index misses, index 0 included.
+    try testing.expect(pkg.nth("nonexistent", 0) == null);
+    try testing.expect(pkg.nth("nonexistent", -1) == null);
+
+    // `nth(type, 0)` addresses the same section libuci's `@type[N]`
+    // addresses at N=0, which `-0` also does — there's no separate `i64`
+    // value for "-0" to test differently (see the doc-comment; `-0` isn't
+    // even writable as a distinct i64 literal, which is the same point).
+    const negative_zero: i64 = -@as(i64, 0);
+    try testing.expectEqual(r0, pkg.nth("rule", negative_zero).?);
 }
 
 test "real uci capture: our serialize() reproduces real `uci export`'s canonical bytes exactly (package header, quoting, blank lines)" {

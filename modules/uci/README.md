@@ -44,11 +44,22 @@ _ = uci.parseDiag(gpa, bytes, &diag) catch |e| {
 // Option{ key, kind: .single | .list, values: [][]const u8 }
 
 // Accessors
-const lan = pkg.section("interface", "lan").?;  // named lookup
+const lan = pkg.section("interface", "lan").?;  // named lookup (type + name)
 _ = lan.get("proto");                           // ?[]const u8 (first value)
 _ = lan.getList("ports");                       // all values, &.{} if absent
 var it = pkg.iterate("interface");              // sections by type, file order
 while (it.next()) |sec| { ... }
+
+// Resolve a `pkg.<name>.<opt>` key path when you only have the name, not
+// the type (unlike `section`, which needs both).
+_ = pkg.sectionByName("lan");                   // ?*const Section
+
+// Resolve `@type[N]` positional addressing, incl. libuci's negative-index-
+// from-the-end form (`-1` = last matching section of that type). Anonymous
+// and named sections of `type` both count, in file order. Out-of-range
+// (either direction) returns null, matching libuci's own "not found".
+_ = pkg.nth("rule", 0);                         // ?*const Section, first
+_ = pkg.nth("rule", -1);                        // ?*const Section, last
 
 // Serialize to canonical UCI text (round-trip stable)
 const text = try uci.serialize(gpa, &pkg);      // SerializeError![]u8
@@ -80,4 +91,8 @@ _ = pkg.eql(&other);
 - Values containing control characters other than `\n` `\t` `\r` cannot be
   represented in UCI text and serialize to `error.UnserializableValue`.
 - UCI CLI-level features (`uci set/commit`, `/etc/config` discovery, state
-  files) are out of scope — this is the file codec only.
+  files) are out of scope — this is the file codec only. In particular: a
+  file-only reader loses staged-but-uncommitted state (`uci set` without
+  `commit`, common on live devices — LuCI's "Save" without "Apply"); see
+  SPEC.md's threat-model section for the concrete trap and for `uci
+  revert`'s truncate-not-delete delta-file behavior.
