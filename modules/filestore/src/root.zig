@@ -336,16 +336,18 @@ pub const Store = struct {
     fn readExpiry(self: Store, kind: []const u8, key: []const u8) !?i64 {
         var pbuf: [900]u8 = undefined;
         const path = try self.sidecarPath(&pbuf, kind, key, ".expiry");
-        // A tiny, throwaway read (a decimal i64 fits in ~20 bytes) — a real
-        // allocator, not a `FixedBufferAllocator`, since `readFileAlloc`'s
-        // internal growth strategy allocates ahead of what it ends up
-        // needing and a tightly-sized fixed buffer spuriously OOMs.
-        const text = std.Io.Dir.cwd().readFileAlloc(self.io, path, std.heap.page_allocator, .limited(32)) catch |e| switch (e) {
+        // A tiny, throwaway read (a decimal i64 fits in ~20 bytes): a fixed
+        // stack buffer and a direct positional read, no allocator at all —
+        // CONVENTIONS.md §1.2 rules out a hidden global allocator here, and
+        // this size never needed one in the first place.
+        var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
-        defer std.heap.page_allocator.free(text);
-        return try std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t\r\n"), 10);
+        defer file.close(self.io);
+        var buf: [32]u8 = undefined;
+        const n = try file.readPositionalAll(self.io, &buf, 0);
+        return try std.fmt.parseInt(i64, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10);
     }
 
     fn isExpired(self: Store, kind: []const u8, key: []const u8) !bool {
