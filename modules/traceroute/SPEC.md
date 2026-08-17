@@ -20,6 +20,49 @@ Clean-room from the classic traceroute(8)/mtr ICMP method (Van Jacobson's TTL-st
 ICMP Echo — a public technique) and RFC 792 ICMP formats via the sibling `icmp.echo` codec — see
 NOTICE.
 
+### A transport failure returns a partial `Trace`, not just an error
+
+`traceWith` used to propagate a `sendFn`/`recvFn` failure with `try`, which discarded every
+hop already collected — for a traceroute, eight good hops then a broken socket is most of the
+answer, not a failure to report as opaquely as a caller mistake. Zig has no error payloads, so
+carrying the partial result out alongside the error needed a shape decision:
+
+- **Considered and rejected: an out-parameter** (`traceWith(gpa, t, dest, opts, partial: ?*Trace)`).
+  Works, but it is a second way to receive a `Trace` bolted onto the existing one, and every
+  caller — including every offline test in this file — would need to thread a pointer through
+  whether or not it cares.
+- **Considered and rejected: split the return into `struct { trace: Trace, err: ?TransportError }`
+  with no Zig error at all.** This erases the real distinction between "a partial trace, because
+  the transport broke mid-run" and "no trace at all, because `Options` were invalid or the initial
+  allocation failed" — `InvalidOptions`/`OutOfMemory` happen before a single probe is sent, so
+  there is nothing to hand back for them, and forcing every caller to unwrap a `Trace` value for
+  those cases too would manufacture a fake one.
+- **Chosen: extend `Trace` with a `transport_err: ?TransportError` field, and narrow `TraceError`
+  to `error{ InvalidOptions, OutOfMemory }`.** This follows the module's own existing shape:
+  `Trace` already records *how* a trace stopped as data (`reached`, `unreachable_code`), not as a
+  distinct error per termination mode — a transport failure is simply a third way to stop early,
+  and was the odd one out for using the `!` channel instead of a field. `sendFn`/`recvFn` failures
+  are now caught inside `traceWith` (`catch |err| { transport_err = err; break :outer; }`) instead
+  of propagated with `try`, so the function falls through to the same hop-packing code every other
+  termination path already uses, and returns a `Trace` whose `hops`/`probes` hold whatever was
+  collected up to the failure. The genuine no-partial-data cases (`InvalidOptions`, the initial
+  `gpa.alloc` before any probe exists) keep the ordinary Zig error channel — nothing to carry
+  alongside them either way.
+
+**`hops_used` on a send failure.** A failure on a hop's first probe (`pi == 0`) means nothing
+about that hop was ever attempted, so it is excluded from `hops_used` (set to `hi`, not `hi + 1`)
+— otherwise the returned `Trace` would contain a hop whose every probe reads `.timeout` despite
+none of them having been sent, indistinguishable from a hop that really was probed and got no
+answer. A failure on a *later* probe of the same hop (or any `recvFn` failure, which by
+definition follows a successful send) leaves `hops_used` as already set — that hop did get at
+least one real attempt, the same way an `unreachable_code` stop mid-hop keeps the hop it stopped
+in (see `wire.zig`'s sibling test "destination unreachable terminates and records the code").
+
+**BREAKING for a caller that matched `TraceError`/`TransportError` on `traceWith`'s return.** A
+`try traceWith(...)` or `catch |err| switch (err) { error.SendFailed, error.RecvFailed => ... }`
+no longer compiles/fires for those two — the same failure now arrives as `tr.transport_err` on a
+successful return. See CHANGELOG.md.
+
 ## Threat model / out of scope
 The live trace needs CAP_NET_RAW (raw ICMP socket). Responses are **not authenticated**: only
 ident/seq quoted in the ICMP error are checked, so a spoofed router response with the right ident/seq

@@ -162,15 +162,25 @@ pub const Hop = struct {
     }
 };
 
-/// A completed trace. Free with `deinit`.
+/// A completed (or partial) trace. Free with `deinit`.
 pub const Trace = struct {
     dest: netaddr.Ip,
     /// True when the destination sent an Echo Reply.
     reached: bool,
     /// Set when the trace terminated on ICMP Destination Unreachable.
     unreachable_code: ?u8,
+    /// Set when the trace stopped early because the transport itself failed
+    /// — `sendFn`/`recvFn` returning an error, not a per-probe timeout (a
+    /// normal outcome, recorded on the `Probe` instead). `hops`/`probes`
+    /// still hold whatever was collected before the failure: eight good hops
+    /// then a send failure is a useful partial path, not nothing, and this
+    /// is how a caller tells "stopped early, here is what I have" apart from
+    /// "reached the destination" or "hit Destination Unreachable" — the
+    /// same way those two are already told apart from each other.
+    transport_err: ?TransportError = null,
     /// The probed hops, first_ttl first. Ends at the hop that reached the
-    /// destination (or terminated the trace), or at max_hops.
+    /// destination, terminated the trace (`unreachable_code`,
+    /// `transport_err`), or at max_hops.
     hops: []Hop,
     /// Backing storage for every hop's probes.
     probes: []Probe,
@@ -243,12 +253,17 @@ pub const Transport = struct {
 
 // ── the hop state machine ───────────────────────────────────────────────────
 
-pub const TraceError = error{ InvalidOptions, OutOfMemory } || TransportError;
+/// What has no partial `Trace` to show for it: neither happens after any
+/// probe has been sent, so there is nothing yet to return alongside the
+/// error. A transport failure mid-trace is different — see `Trace.transport_err`.
+pub const TraceError = error{ InvalidOptions, OutOfMemory };
 
 /// Trace the path to `dest` through an injected transport. Sequential:
 /// one probe in flight; each TTL gets `probes_per_hop` probes; the trace
-/// stops after the hop where the destination replied (`reached`) or a
-/// Destination Unreachable arrived (`unreachable_code`), or at `max_hops`.
+/// stops after the hop where the destination replied (`reached`), a
+/// Destination Unreachable arrived (`unreachable_code`), the transport
+/// itself failed (`transport_err` — the returned `Trace` still holds
+/// whatever hops were collected before that), or at `max_hops`.
 pub fn traceWith(
     gpa: std.mem.Allocator,
     t: Transport,
@@ -281,6 +296,7 @@ pub fn traceWith(
 
     var reached = false;
     var unreachable_code: ?u8 = null;
+    var transport_err: ?TransportError = null;
     var hops_used: usize = 0;
 
     outer: for (0..hop_capacity) |hi| {
@@ -295,7 +311,23 @@ pub fn traceWith(
             @memset(packet, 0);
             echo.writeEchoRequest(family, packet, opts.ident, seq);
 
-            try t.sendFn(t.ctx, ttl, packet);
+            // A transport failure stops the trace here, but — unlike
+            // InvalidOptions/OutOfMemory above, which happen before any probe
+            // is sent — hops already collected are real data. `break :outer`
+            // rather than `try`/`return`, so the packing below still runs and
+            // hands back a partial `Trace` with `transport_err` set.
+            t.sendFn(t.ctx, ttl, packet) catch |err| {
+                transport_err = err;
+                // If this was the hop's very first probe, nothing about this
+                // hop was ever attempted — exclude it, matching what
+                // `hops_used` means everywhere else here (a hop with at
+                // least one attempted probe). A failure on a LATER probe of
+                // the same hop leaves `hops_used` as already set: that hop
+                // did get at least one real attempt, the same way an
+                // `unreachable_code` stop mid-hop keeps the hop it stopped in.
+                if (pi == 0) hops_used = hi;
+                break :outer;
+            };
             const sent_at = t.nowFn(t.ctx);
             send_times[slot] = sent_at;
             const deadline = sent_at + timeout_ns;
@@ -303,8 +335,14 @@ pub fn traceWith(
             recv: while (true) {
                 const now = t.nowFn(t.ctx);
                 if (now >= deadline) break :recv; // timeout → the slot stays `*`
-                const resp = (try t.recvFn(t.ctx, &rbuf, deadline - now)) orelse break :recv;
-                if (resp.len > rbuf.len) return error.RecvFailed;
+                const resp = (t.recvFn(t.ctx, &rbuf, deadline - now) catch |err| {
+                    transport_err = err;
+                    break :outer;
+                }) orelse break :recv;
+                if (resp.len > rbuf.len) {
+                    transport_err = error.RecvFailed;
+                    break :outer;
+                }
                 const rcv_at = t.nowFn(t.ctx);
 
                 // Reuse the icmp codec: bounds-checked, never panics;
@@ -377,6 +415,7 @@ pub fn traceWith(
         .dest = dest,
         .reached = reached,
         .unreachable_code = unreachable_code,
+        .transport_err = transport_err,
         .hops = out_hops,
         .probes = out_probes,
     };
@@ -571,6 +610,13 @@ const FakeTransport = struct {
     sent: std.ArrayList(Sent) = .empty,
     queue: std.ArrayList(Canned) = .empty,
     gpa: std.mem.Allocator = testing.allocator,
+    /// If set, `sendFn` fails with `error.SendFailed` the first time a probe
+    /// at this TTL is sent — never recorded into `sent`. Models the
+    /// transport itself breaking mid-trace (a socket error, not a missing
+    /// reply), which is otherwise unreachable from the canned-bytes fixtures
+    /// below: every `Behavior` controls how the fake network answers, none
+    /// of them controls whether the send call itself succeeds.
+    fail_send_at_ttl: ?u8 = null,
 
     const Sent = struct { ttl: u8, ident: u16, seq: u16, len: usize };
     const Canned = struct { arrival: u64, from: ?netaddr.Ip, bytes: []u8 };
@@ -598,6 +644,7 @@ const FakeTransport = struct {
 
     fn sendImpl(ctx: *anyopaque, ttl: u8, packet: []const u8) TransportError!void {
         const f: *FakeTransport = @ptrCast(@alignCast(ctx));
+        if (f.fail_send_at_ttl) |bad_ttl| if (ttl == bad_ttl) return error.SendFailed;
         const ident = std.mem.readInt(u16, packet[4..6][0..2], .big);
         const seq = std.mem.readInt(u16, packet[6..8][0..2], .big);
         f.sent.append(f.gpa, .{ .ttl = ttl, .ident = ident, .seq = seq, .len = packet.len }) catch return error.SendFailed;
@@ -1045,6 +1092,69 @@ test "first_ttl offsets the hop window" {
     try testing.expectEqual(@as(u8, 2), tr.hops[0].ttl);
     try testing.expect(tr.hops[0].address().?.eql(router_b));
     try testing.expectEqual(@as(u8, 2), f.sent.items[0].ttl);
+}
+
+// ── SendFailed/RecvFailed: the partial Trace survives a transport error ────
+
+test "a send failure after two good hops returns the partial Trace, not nothing" {
+    // Before this, traceWith propagated a transport error with `try`/`return`,
+    // discarding hops[0]/hops[1] entirely — an eight-good-hops-then-a-failure
+    // trace is most of a traceroute's value, not a failure to report as
+    // opaquely as InvalidOptions/OutOfMemory (which really do have nothing to
+    // show, because they happen before any probe is sent).
+    var f: FakeTransport = .{
+        .behaviors = &.{
+            .{ .time_exceeded = router_a },
+            .{ .time_exceeded = router_b },
+            .reply, // never reached: TTL 3 never gets to send
+        },
+        .fail_send_at_ttl = 3,
+    };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1 });
+    defer tr.deinit(testing.allocator);
+
+    // The failure is reported, distinctly from "reached"/"unreachable"...
+    try testing.expectEqual(@as(?TransportError, error.SendFailed), tr.transport_err);
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(@as(?u8, null), tr.unreachable_code);
+    // ...and the two good hops collected before it are still there, correct.
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+    try testing.expectEqual(Probe.Kind.time_exceeded, tr.hops[0].probes[0].kind);
+    try testing.expect(tr.hops[0].probes[0].address.?.eql(router_a));
+    try testing.expectEqual(Probe.Kind.time_exceeded, tr.hops[1].probes[0].kind);
+    try testing.expect(tr.hops[1].probes[0].address.?.eql(router_b));
+    // The failed TTL's probe was never recorded as sent.
+    try testing.expectEqual(@as(usize, 2), f.sent.items.len);
+}
+
+test "a recv-layer failure also returns the partial Trace, not nothing" {
+    // Symmetric with the send-failure case above: `recvFn` returning an
+    // error mid-trace must not discard what came before it either. A reply
+    // larger than traceWith's internal receive buffer (2048 B) makes
+    // FakeTransport's own `recvImpl` report `error.RecvFailed`, exercising
+    // the same `catch` path a real socket's read error would.
+    var big: [3000]u8 = undefined;
+    var f: FakeTransport = .{
+        .behaviors = &.{
+            .{ .time_exceeded = router_a },
+            .{ .garbage = &big },
+            .reply, // never reached
+        },
+    };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .timeout_ms = 500 });
+    defer tr.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(?TransportError, error.RecvFailed), tr.transport_err);
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+    try testing.expectEqual(Probe.Kind.time_exceeded, tr.hops[0].probes[0].kind);
+    try testing.expect(tr.hops[0].probes[0].address.?.eql(router_a));
+    // Hop 2's probe: the send succeeded (it is what triggered the failing
+    // recv), so it still counts as a "used" hop, same as an unreachable_code
+    // stop mid-hop does — but with no answer, its slot stays the default `*`.
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[1].probes[0].kind);
 }
 
 // ── real-capture goldens (veth 2-hop router sandbox, 2026-08-02) ───────────

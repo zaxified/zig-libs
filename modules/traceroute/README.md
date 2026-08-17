@@ -16,11 +16,19 @@ ICMP error, so late answers still land in the right hop slot.
 - **Deps:** `icmp` (echo codec + error parsing + raw socket), `netaddr`
   (address type/parse/format), `latency-stats` (per-hop min/avg/max/loss).
 
-Result model: `Trace { hops, reached, unreachable_code, dest }`;
+Result model: `Trace { hops, reached, unreachable_code, transport_err, dest }`;
 `Hop { ttl, probes }` with `stats()` (via latency-stats) and
 `distinctAddresses()` (load-balanced hops answer from more than one
 address); `Probe { kind: reply|time_exceeded|dest_unreachable|timeout,
 address, rtt_ns, code }` — a `timeout` probe is traceroute's `*`.
+
+A transport failure (the socket itself breaking, not a missing reply) does not discard
+the trace: `traceWith`/`trace` still return a `Trace`, with `transport_err` set and
+`hops`/`probes` holding whatever was collected before the failure — eight good hops
+then a broken socket is a useful partial path, the same way `reached`/`unreachable_code`
+already tell you the other two ways a trace can stop early. Only `error.InvalidOptions`
+and `error.OutOfMemory` are real Zig errors, because neither has a partial trace to
+show for it — they happen before any probe is sent.
 
 ```zig
 const traceroute = @import("traceroute");
