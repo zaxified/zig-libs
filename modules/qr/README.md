@@ -72,6 +72,36 @@ Anything else — PNG, a framebuffer, a print pipeline — is a few lines over
 the standard's (§6.3.8, four modules on every side) and no renderer should pick
 its own.
 
+## Messages too big for one symbol
+
+Structured append (ISO/IEC 18004 §8.4.6) splits a message across up to sixteen
+symbols that a reader puts back together.
+
+```zig
+var symbols: [16]qr.Matrix = undefined;
+const seq = try qr.encodeSequence(&symbols, psbt, .{ .ecc = .medium, .version = 10 });
+// show seq[0], seq[1], ... in turn
+
+const part = try qr.decodePart(&m, &buf);
+if (part.sequence) |s| {
+    // s.index, s.total, s.parity — append part.data in index order
+}
+```
+
+`opts.version` fixes the size of every symbol, which is what an animated display
+wants; without it the smallest version that fits the message in `out.len`
+symbols is chosen. Reassembly stays with the caller — this module allocates
+nothing and cannot hold sixteen fragments for you — and `qr.sequenceParity` is
+the check that makes it safe: the parity byte is the same in every symbol of a
+sequence and different between sequences, which is the only way to tell "a
+symbol is missing" from "two different messages were scanned into one buffer".
+
+Plain `decode` **refuses** a symbol that is part of a sequence, with
+`error.StructuredAppend`, rather than returning the fragment. A caller handed
+part two of three and told nothing would act on a truncated message, and the
+payloads that need splitting — a signing request, a PSBT, a certificate — are
+exactly the ones where that is expensive.
+
 ## Choosing a level and a mode
 
 `Ecc` trades capacity for damage tolerance — the standard's own recovery figures
@@ -95,10 +125,9 @@ widening if the input cannot be expressed that way.
 to transcode into that encoding before calling; byte mode carries the same text
 as UTF-8 in the same or fewer bits for anything short of near-pure Japanese.
 
-**Structured append** (splitting one message across up to 16 symbols), **ECI**
-(declaring a character set other than the default), and **Micro QR**. None are
-needed by a caller that wants "put this text in a QR code", and each is a
-separable addition rather than something this design forecloses.
+**ECI** (declaring a character set other than the default) and **Micro QR**.
+Neither is needed by a caller that wants "put this text in a QR code", and each
+is a separable addition rather than something this design forecloses.
 
 **Reading from an image.** `decode` takes a matrix; producing that matrix from a
 photograph is binarisation, symbol location, perspective correction and grid

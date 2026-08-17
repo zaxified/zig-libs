@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-17** — Structured append (§8.4.6), both directions: `encodeSequence`
+  splits a message across up to sixteen symbols, `decodePart` reports which one
+  it is holding. Added because the wallet payloads this repo already has modules
+  for — `psbt`, `lninvoice` — do not fit in one symbol, and a QR library that
+  cannot split is not usable for them.
+  Plain `decode` now **refuses** a sequence symbol with `error.StructuredAppend`
+  instead of returning the fragment: a caller handed part two of three and told
+  nothing would act on a truncated message, and for a signing request that is
+  the expensive failure. Reassembly stays with the caller, since this module
+  allocates nothing, and `sequenceParity` is exported because the parity byte is
+  what separates "a symbol is missing" from "two sequences were scanned into the
+  same buffer" — an index and a count cannot.
+  Verified in both directions against implementations that are not ours: an
+  independent encoder's sequences (12 of them, 30 symbols) read back with index,
+  count and parity all matching and the rejoined messages byte-identical, and
+  our own sequences read by an independent decoder, whose concatenation is the
+  original message. The first direction is what pins the *semantics* — a
+  round trip of our own cannot tell whether the four-bit position and the
+  four-bit count are the right way round, since swapping them shifts nothing.
 - **2026-08-17** — Rendering: `writeSvg` and `writeTerminal`, in a `render.zig`
   the codec does not call. They were previously copy-paste snippets in
   `README.md`, on the argument that being short is a reason not to ship them;

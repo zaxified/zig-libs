@@ -49,6 +49,21 @@ exist because five candidate consumers would otherwise each have pasted the same
 two easy-to-miss details — the terminal inversion, and XML-escaping caller
 strings in the SVG — not because the codec grew an opinion about pictures.
 
+**A structured-append symbol is refused by `decode`, not returned.** The header
+is a fragment marker, and a caller that asked for a message and got a fragment
+has no way to tell. `decodePart` is the API that can express "this is part two
+of three"; `decode` reports `StructuredAppend` and returns nothing, because the
+payloads that need splitting are signing requests and PSBTs, where acting on
+two-thirds of a message is the failure worth engineering against.
+
+**Reassembly is the caller's, and the parity byte is why that is safe.** Holding
+sixteen decoded fragments needs storage this module does not have. What it does
+export is `sequenceParity`, the XOR over the whole message that every symbol of a
+sequence carries: an index and a count can tell you a symbol is missing, but only
+the parity can tell you that the symbol you just scanned belongs to a *different*
+sequence — which is the case a phone camera pointed at a table of printed codes
+actually produces.
+
 **Masking is scored with the format information present.** Three of the four
 penalty rules can see those 31 modules, so evaluating a bare data region and
 writing the format bits afterwards scores a symbol that never exists. `pickMask`
@@ -103,6 +118,17 @@ and not merely a missing panic.
    class the encoder comparison cannot: two encoders agreeing on a matrix that
    no reader accepts.
 
+**Structured append is anchored on an independent encoder, because a round trip
+cannot see the mistake.** The position and the count are four bits each, so
+swapping them shifts nothing in the stream: our own encoder and decoder would
+agree with each other perfectly while disagreeing with every reader in the world.
+So the anchor runs the other way — 12 sequences and 30 symbols produced by an
+independent encoder are read by this module, and the index, the count and the
+parity must each match what that encoder recorded, with the rejoined messages
+byte-identical. The reverse direction (our sequences, read by the independent
+decoder, concatenating to the original) is checked too, and is the weaker of the
+two for exactly the reason above.
+
 **Decoding is verified in both directions too.** Round trips cover every mode,
 level and a spread of versions; correction is tested at exactly the capability
 boundary — eight corrupted codewords in a version 1-H block succeed, nine are
@@ -148,9 +174,8 @@ matches or does not.
 
 ## Backlog
 
-- **Kanji mode, ECI, structured append, Micro QR** — separable additions, none
-  foreclosed by this design. See README "Not implemented" for why none is
-  scheduled.
+- **Kanji mode, ECI, Micro QR** — separable additions, none foreclosed by this
+  design. See README "Not implemented" for why none is scheduled.
 - **Segment mixing.** A single mode is chosen for the whole input, so
   `"HELLO WORLD 2026"` pays alphanumeric rates throughout rather than switching
   to numeric for the tail. The standard allows mixed segments and the optimal

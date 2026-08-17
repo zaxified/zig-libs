@@ -79,9 +79,36 @@ pub const Options = struct {
     mask: ?u3 = null,
 };
 
+/// One symbol's place in a structured-append sequence (ISO/IEC 18004 §8.4.6):
+/// a message too big for one symbol, split across up to sixteen that a reader
+/// puts back together. `encodeSequence` fills these in; `decodePart` reports
+/// them.
+pub const Sequence = struct {
+    /// Position of this symbol, counting from zero.
+    index: u4,
+    /// How many symbols the message was split into, 1–16.
+    total: u5,
+    /// XOR of every byte of the *whole* message, the same value in every symbol
+    /// of the sequence. It is what lets a reader notice that it has mixed two
+    /// sequences together, or is missing a symbol it never saw — an index and a
+    /// count alone cannot tell a foreign symbol from a missing one.
+    parity: u8,
+};
+
+/// The parity byte a structured-append sequence carries: XOR of every byte of
+/// the message. Exposed because reassembly happens in the caller — this module
+/// allocates nothing and cannot hold sixteen decoded parts for you — and the
+/// check is the point of the field.
+pub fn sequenceParity(message: []const u8) u8 {
+    var p: u8 = 0;
+    for (message) |c| p ^= c;
+    return p;
+}
+
 pub const Error = error{
-    /// The input does not fit any version at the requested level, or does not
-    /// fit the version that was forced.
+    /// The input does not fit any version at the requested level, does not fit
+    /// the version that was forced, or — for `encodeSequence` — needs more
+    /// symbols than `out` holds or more than the sixteen the standard allows.
     TooLong,
     /// `Options.mode` was forced to one the input cannot be expressed in.
     ModeMismatch,
@@ -137,20 +164,116 @@ pub const Matrix = struct {
 /// Encode `text` into `out`. Allocates nothing: `out` is the only storage the
 /// caller provides, and everything else lives on this frame.
 pub fn encode(out: *Matrix, text: []const u8, opts: Options) Error!void {
+    return encodeOne(out, text, opts, null);
+}
+
+/// Split `text` across a structured-append sequence and encode every symbol
+/// into `out`, returning the prefix that was filled.
+///
+/// `opts.version` fixes the size of *every* symbol; without it the smallest
+/// version that fits the message in `out.len` symbols is chosen. Every symbol
+/// in the sequence gets the same version either way, which the standard does
+/// not require but a reader displaying them one after another very much
+/// appreciates — and it keeps the last, short symbol from silently coming out a
+/// different size from the rest.
+///
+/// The 20-bit header each symbol carries (mode, position, count, parity) is
+/// pure overhead, so splitting a message that fits in one symbol makes it
+/// bigger. This is for messages that do not fit: a signing request, a PSBT, a
+/// certificate — anything a phone has to receive through a camera.
+pub fn encodeSequence(out: []Matrix, text: []const u8, opts: Options) Error![]Matrix {
+    if (out.len == 0) return Error.TooLong;
+
     const mode = if (opts.mode) |m| blk: {
         if (!modeFits(m, text)) return Error.ModeMismatch;
         break :blk m;
     } else pickMode(text);
 
+    const room = @min(out.len, max_sequence);
+    var version: u6 = 0;
+    var chunk: usize = 0;
+    if (opts.version) |v| {
+        if (v < 1 or v > 40) return Error.BadVersion;
+        version = v;
+        chunk = maxChunk(mode, v, opts.ecc);
+        if (chunk == 0 or symbolsNeeded(text.len, chunk) > room) return Error.TooLong;
+    } else {
+        var v: u6 = 1;
+        while (v <= 40) : (v += 1) {
+            const c = maxChunk(mode, v, opts.ecc);
+            if (c > 0 and symbolsNeeded(text.len, c) <= room) {
+                version = v;
+                chunk = c;
+                break;
+            }
+        } else return Error.TooLong;
+    }
+
+    const n = symbolsNeeded(text.len, chunk);
+    const parity = sequenceParity(text);
+    var sub = opts;
+    sub.version = version;
+    sub.mode = mode;
+
+    for (0..n) |i| {
+        const start = i * chunk;
+        const end = @min(start + chunk, text.len);
+        try encodeOne(&out[i], text[start..end], sub, .{
+            .index = @intCast(i),
+            .total = @intCast(n),
+            .parity = parity,
+        });
+    }
+    return out[0..n];
+}
+
+/// Sixteen, because the position and count are four bits each (§8.4.6).
+const max_sequence = 16;
+
+fn symbolsNeeded(len: usize, chunk: usize) usize {
+    if (len == 0) return 1;
+    return (len + chunk - 1) / chunk;
+}
+
+/// Longest chunk, in characters, that still fits once the structured-append
+/// header has taken its 20 bits. Monotonic in the length, so a binary search is
+/// exact and does not need `dataBits` inverted per mode.
+fn maxChunk(mode: Mode, version: u6, ecc: Ecc) usize {
+    const cap = dataCapacityBits(version, ecc);
+    if (cap <= sequence_header_bits) return 0;
+
+    var lo: usize = 0;
+    var hi: usize = cap; // any length needs at least a bit per character
+    while (lo < hi) {
+        const mid = (lo + hi + 1) / 2;
+        if (sequence_header_bits + dataBits(mode, mid, version) <= cap) lo = mid else hi = mid - 1;
+    }
+    // The character-count field is finite too, and for a short numeric symbol it
+    // is the binding constraint rather than the capacity.
+    const count_max = (@as(usize, 1) << countBits(mode, version)) - 1;
+    return @min(lo, count_max);
+}
+
+/// Mode indicator, position, count, parity (§8.4.6).
+const sequence_header_bits = 4 + 4 + 4 + 8;
+const sequence_mode: u4 = 0b0011;
+
+fn encodeOne(out: *Matrix, text: []const u8, opts: Options, seq: ?Sequence) Error!void {
+    const mode = if (opts.mode) |m| blk: {
+        if (!modeFits(m, text)) return Error.ModeMismatch;
+        break :blk m;
+    } else pickMode(text);
+
+    const extra: usize = if (seq == null) 0 else sequence_header_bits;
     const version = if (opts.version) |v| blk: {
         if (v < 1 or v > 40) return Error.BadVersion;
-        if (dataBits(mode, text.len, v) > dataCapacityBits(v, opts.ecc)) return Error.TooLong;
+        if (extra + dataBits(mode, text.len, v) > dataCapacityBits(v, opts.ecc)) return Error.TooLong;
         break :blk v;
-    } else pickVersion(mode, text.len, opts.ecc) orelse return Error.TooLong;
+    } else pickVersion(mode, text.len, opts.ecc, extra) orelse return Error.TooLong;
 
     var codewords: [max_codewords]u8 = undefined;
     const total = totalCodewords(version);
-    buildCodewords(codewords[0..total], mode, text, version, opts.ecc);
+    buildCodewords(codewords[0..total], mode, text, version, opts.ecc, seq);
 
     out.* = .{ .size = sideFor(version), .version = version, .ecc = opts.ecc };
     @memset(&out.bits, 0);
@@ -409,10 +532,10 @@ fn dataBits(mode: Mode, len: usize, version: u6) usize {
     };
 }
 
-fn pickVersion(mode: Mode, len: usize, ecc: Ecc) ?u6 {
+fn pickVersion(mode: Mode, len: usize, ecc: Ecc, extra_bits: usize) ?u6 {
     var v: u6 = 1;
     while (v <= 40) : (v += 1) {
-        if (dataBits(mode, len, v) <= dataCapacityBits(v, ecc)) return v;
+        if (extra_bits + dataBits(mode, len, v) <= dataCapacityBits(v, ecc)) return v;
     }
     return null;
 }
@@ -438,13 +561,23 @@ const BitWriter = struct {
 };
 
 /// Bitstream → blocks → EC → interleave, all in one pass over `out`.
-fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc) void {
+fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc, seq: ?Sequence) void {
     const spec = ecSpec(version, ecc);
     const data_len = out.len - @as(usize, spec.ec_per_block) * spec.blocks;
 
     var data: [max_codewords]u8 = undefined;
     @memset(data[0..data_len], 0);
     var w: BitWriter = .{ .buf = data[0..data_len] };
+
+    // The structured-append header is a segment of its own and comes first
+    // (§8.4.6): a reader has to know it is holding a fragment before it reads
+    // anything that looks like a message.
+    if (seq) |q| {
+        w.put(sequence_mode, 4);
+        w.put(q.index, 4);
+        w.put(@as(u64, q.total) - 1, 4);
+        w.put(q.parity, 8);
+    }
 
     w.put(@intFromEnum(mode), 4);
     w.put(text.len, countBits(mode, version));
@@ -877,6 +1010,21 @@ pub const DecodeError = error{
     BadData,
     /// `out` is shorter than the decoded message.
     BufferTooSmall,
+    /// The symbol is one part of a structured-append sequence, and `decode`
+    /// returns only whole messages. Use `decodePart`. This is an error rather
+    /// than a silent fragment on purpose: a caller handed part two of three and
+    /// told nothing would act on a truncated message, and for the payloads that
+    /// need splitting — a signing request, a PSBT — that is the expensive
+    /// failure.
+    StructuredAppend,
+};
+
+/// One decoded symbol. `sequence` is null for an ordinary symbol and present
+/// for one part of a structured-append message; in the second case `data` is
+/// that part's fragment, not the message.
+pub const Part = struct {
+    data: []u8,
+    sequence: ?Sequence,
 };
 
 /// Decode `m` into `out`, returning the message. Corrects up to the symbol's
@@ -884,6 +1032,20 @@ pub const DecodeError = error{
 /// returning plausible rubbish, which is the failure mode that matters — a
 /// silently mis-corrected QR code is worse than one that refuses to read.
 pub fn decode(m: *const Matrix, out: []u8) DecodeError![]u8 {
+    const part = try decodePart(m, out);
+    if (part.sequence != null) return DecodeError.StructuredAppend;
+    return part.data;
+}
+
+/// Decode a symbol that may be one part of a structured-append sequence.
+///
+/// Reassembly is the caller's: concatenate the parts in index order and check
+/// `qr.sequenceParity` of the result against the `parity` every part carries.
+/// This module allocates nothing, so it cannot hold sixteen fragments for you —
+/// and the parity check is what distinguishes "a symbol is missing" from "two
+/// different sequences were scanned into the same buffer", which an index and a
+/// count cannot.
+pub fn decodePart(m: *const Matrix, out: []u8) DecodeError!Part {
     if (m.size < 21 or m.size > max_size or (m.size - 17) % 4 != 0) return DecodeError.BadSize;
     const version: u6 = @intCast((m.size - 17) / 4);
 
@@ -947,7 +1109,9 @@ pub fn decode(m: *const Matrix, out: []u8) DecodeError![]u8 {
         o += n;
     }
 
-    return parseSegments(data[0..data_len], version, out);
+    var seq: ?Sequence = null;
+    const text = try parseSegments(data[0..data_len], version, out, &seq);
+    return .{ .data = text, .sequence = seq };
 }
 
 /// Both copies of the format information are read and the nearer valid codeword
@@ -1130,18 +1294,34 @@ const BitReader = struct {
     }
 };
 
-fn parseSegments(data: []const u8, version: u6, out: []u8) DecodeError![]u8 {
+fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence) DecodeError![]u8 {
     var r: BitReader = .{ .buf = data };
     var n: usize = 0;
+    var first = true;
 
-    while (true) {
+    while (true) : (first = false) {
         const raw_mode = r.take(4) orelse break;
         if (raw_mode == 0) break; // terminator
+        if (raw_mode == sequence_mode) {
+            // Only as the opening segment. A second one, or one after data, is
+            // not a sequence this module will guess the meaning of.
+            if (!first) return DecodeError.BadData;
+            const index = r.take(4) orelse return DecodeError.BadData;
+            const total = r.take(4) orelse return DecodeError.BadData;
+            const parity = r.take(8) orelse return DecodeError.BadData;
+            if (index > total) return DecodeError.BadData;
+            seq_out.* = .{
+                .index = @intCast(index),
+                .total = @intCast(total + 1),
+                .parity = @intCast(parity),
+            };
+            continue;
+        }
         const mode: Mode = switch (raw_mode) {
             0b0001 => .numeric,
             0b0010 => .alphanumeric,
             0b0100 => .byte,
-            else => return DecodeError.BadData, // incl. ECI/kanji/structured append
+            else => return DecodeError.BadData, // incl. ECI and kanji
         };
         const count = r.take(countBits(mode, version)) orelse return DecodeError.BadData;
 
@@ -1490,4 +1670,138 @@ test "input that cannot fit is refused rather than truncated" {
 
     try t.expectError(Error.ModeMismatch, encode(&m, "hello", .{ .mode = .numeric }));
     try t.expectError(Error.BadVersion, encode(&m, "x", .{ .version = 41 }));
+}
+
+// ── structured append ───────────────────────────────────────────────────────
+
+test "a sequence round-trips: split, read each part, put it back together" {
+    const t = std.testing;
+    // Long enough to need several symbols at a size a phone screen shows well.
+    const message = "signed-payload:" ++ ("0123456789abcdef" ** 40);
+
+    var symbols: [16]Matrix = undefined;
+    const seq = try encodeSequence(&symbols, message, .{ .ecc = .quartile, .version = 6 });
+    try t.expect(seq.len > 1);
+
+    var joined: [1024]u8 = undefined;
+    var n: usize = 0;
+    for (seq, 0..) |*sym, i| {
+        // Every symbol in the sequence is the size that was asked for, including
+        // the last and short one.
+        try t.expectEqual(sideFor(6), sym.size);
+
+        var buf: [512]u8 = undefined;
+        const part = try decodePart(sym, &buf);
+        const q = part.sequence orelse return error.NotASequence;
+        try t.expectEqual(@as(u4, @intCast(i)), q.index);
+        try t.expectEqual(@as(u5, @intCast(seq.len)), q.total);
+        try t.expectEqual(sequenceParity(message), q.parity);
+
+        @memcpy(joined[n..][0..part.data.len], part.data);
+        n += part.data.len;
+    }
+    try t.expectEqualStrings(message, joined[0..n]);
+    try t.expectEqual(sequenceParity(message), sequenceParity(joined[0..n]));
+}
+
+test "a part is refused by decode rather than returned as a message" {
+    const t = std.testing;
+    var symbols: [8]Matrix = undefined;
+    const seq = try encodeSequence(&symbols, "N" ** 200, .{ .version = 2, .ecc = .low });
+    try t.expect(seq.len > 1);
+
+    var buf: [256]u8 = undefined;
+    // This is the whole reason the error exists: the fragment decodes perfectly
+    // well, and a caller handed it would act on a truncated message.
+    try t.expectError(DecodeError.StructuredAppend, decode(&seq[0], &buf));
+    const part = try decodePart(&seq[0], &buf);
+    try t.expect(part.data.len > 0);
+    try t.expect(part.data.len < 200);
+}
+
+test "parity separates two sequences that arrive interleaved" {
+    const t = std.testing;
+    var a: [8]Matrix = undefined;
+    var b: [8]Matrix = undefined;
+    const sa = try encodeSequence(&a, "the first message, split in two or more", .{ .version = 1, .ecc = .low });
+    const sb = try encodeSequence(&b, "a different message, also split up here", .{ .version = 1, .ecc = .low });
+    try t.expect(sa.len > 1 and sb.len > 1);
+
+    var buf: [128]u8 = undefined;
+    const pa = (try decodePart(&sa[0], &buf)).sequence.?;
+    const pb = (try decodePart(&sb[0], &buf)).sequence.?;
+    // Index and count are identical between the two; only the parity is not,
+    // which is exactly the case the field exists for.
+    try t.expectEqual(pa.index, pb.index);
+    try t.expect(pa.parity != pb.parity);
+}
+
+test "a message that needs more symbols than there is room for is refused" {
+    const t = std.testing;
+    var two: [2]Matrix = undefined;
+    try t.expectError(Error.TooLong, encodeSequence(&two, "N" ** 400, .{ .version = 1, .ecc = .high }));
+    // Room is what is missing, not capacity: the same message splits happily
+    // once there are symbols to put it in.
+    var plenty: [16]Matrix = undefined;
+    _ = try encodeSequence(&plenty, "N" ** 400, .{ .version = 6, .ecc = .high });
+
+    // Sixteen is the standard's ceiling, not ours, so a message that needs a
+    // seventeenth symbol at the forced version is refused even with room.
+    var many: [16]Matrix = undefined;
+    try t.expectError(Error.TooLong, encodeSequence(&many, "N" ** 5000, .{ .version = 1, .ecc = .high }));
+
+    // Without a forced version the encoder grows the symbol instead of the count.
+    const seq = try encodeSequence(&many, "N" ** 5000, .{ .ecc = .high });
+    try t.expect(seq.len <= 16);
+    try t.expect(seq[0].version > 1);
+}
+
+test "the header costs capacity, and the accounting says so" {
+    const t = std.testing;
+    // A message that exactly fills a version 1-L symbol on its own cannot also
+    // carry a 20-bit sequence header, and the split has to notice.
+    const chunk = maxChunk(.byte, 1, .low);
+    var text: [64]u8 = undefined;
+    @memset(&text, 'x');
+    const fits_alone = text[0 .. chunk + 2];
+
+    var m: Matrix = undefined;
+    try encode(&m, fits_alone, .{ .version = 1, .ecc = .low });
+
+    var symbols: [16]Matrix = undefined;
+    const seq = try encodeSequence(&symbols, fits_alone, .{ .version = 1, .ecc = .low });
+    try t.expectEqual(@as(usize, 2), seq.len);
+}
+
+test "fuzz: a sequence survives the round trip whatever the message" {
+    try std.testing.fuzz({}, fuzzSequence, .{});
+}
+
+fn fuzzSequence(_: void, smith: *std.testing.Smith) !void {
+    var message: [600]u8 = undefined;
+    const len = smith.valueRangeAtMost(u16, 0, message.len);
+    for (0..len) |i| message[i] = smith.valueRangeAtMost(u8, 0, 255);
+    const text = message[0..len];
+
+    var symbols: [16]Matrix = undefined;
+    const seq = encodeSequence(&symbols, text, .{
+        .ecc = @enumFromInt(smith.valueRangeAtMost(u8, 0, 3)),
+    }) catch return;
+
+    var joined: [600]u8 = undefined;
+    var n: usize = 0;
+    for (seq, 0..) |*sym, i| {
+        var buf: [600]u8 = undefined;
+        const part = try decodePart(sym, &buf);
+        // A one-symbol sequence is a legal thing to produce, so the header is
+        // present or absent consistently — never present with the wrong place
+        // in it.
+        const q = part.sequence orelse return error.SequenceHeaderMissing;
+        try std.testing.expectEqual(@as(u4, @intCast(i)), q.index);
+        try std.testing.expectEqual(@as(u5, @intCast(seq.len)), q.total);
+        try std.testing.expectEqual(sequenceParity(text), q.parity);
+        @memcpy(joined[n..][0..part.data.len], part.data);
+        n += part.data.len;
+    }
+    try std.testing.expectEqualSlices(u8, text, joined[0..n]);
 }
