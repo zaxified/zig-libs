@@ -267,10 +267,14 @@ comparison is internal.
   the two axes are not the same thing to it, but that is a hypothesis and this
   file has been wrong with one of those before.
 - **Small symbols at three pixels per module.** A version 1 reads at about 79 %
-  of angles there, against 100 % at four pixels. Sub-pixel sampling — averaging a
-  small neighbourhood instead of reading the single centre pixel — is the
-  cheapest thing that would help, and it helps precisely where one noisy pixel
-  currently decides a module.
+  of angles there, against 100 % at four pixels.
+  ⛔ **Neighbourhood sampling is not the answer, measured.** Reading each module
+  as the majority of the 3×3 around its centre — the obvious fix, on the theory
+  that one noisy pixel decides a module — makes it *worse*: version 1 went from
+  31 of 36 angles to 22 and version 6 from 36 to 29. At three pixels per module
+  a 3×3 neighbourhood is a whole module wide, so it averages the neighbours in.
+  Whatever helps here has to happen in binarisation, which is what is actually
+  deciding those pixels, not in sampling.
 - **Perspective correction.** The affine map from three finder centres is exact
   for a flat symbol square to the camera. Off-plane needs the bottom-right
   alignment pattern and a projective map.

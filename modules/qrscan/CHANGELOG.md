@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-17** — Tried and rejected, recorded so it is not tried again:
+  reading each module as the majority of the 3x3 neighbourhood around its centre,
+  to help the one case still below 100 % — a version 1 at three pixels per
+  module. It makes it worse, 31 of 36 angles down to 22, and version 6 from 36 to
+  29. At three pixels per module a 3x3 neighbourhood is a whole module wide, so
+  it averages in the neighbours. Whatever helps there has to happen in
+  binarisation, which is what decides those pixels.
 - **2026-08-17** — Off-axis symbols. The grid can now be projective: a plane
   photographed at an angle maps to the image by a homography, and no affine map
   approximates one across a whole symbol. Measured before the change, at six
