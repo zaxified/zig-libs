@@ -136,5 +136,10 @@ format and a `platform` tag into a module that has neither, and every mature
 ecosystem ships it separately.
 
 Provenance: original work of the zig-libs authors (MIT), clean-room from
-ISO/IEC 18004. Verification, including the two independent oracles, is in
-[`SPEC.md`](SPEC.md).
+ISO/IEC 18004. Verification, including the external encoder oracle, is in
+[`SPEC.md`](SPEC.md). The Python `segno` package is run as a black-box test
+oracle only, never read as a design reference — no NOTICE entry needed. Test
+data: `src/testdata/golden_matrices.zig` is captured, byte-for-byte, from
+that oracle running on this machine (not reproduced from any upstream test
+corpus); `src/testdata/reference.py` is this repo's own script (`SPDX-License-Identifier:
+MIT`) that drives it and reproduces none of `segno`'s own source.

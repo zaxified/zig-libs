@@ -25,11 +25,15 @@ disagrees with the standard's Table 1, which a test checks directly.
 alignment centres are 6, 34, 60, 86, 112, 138; even spacing over the same span
 gives 6, 26, 54, 82, 110, 138. No rounding rule reconciles it: version 32 spans
 132 over 5 gaps (26.4, table takes 26) while version 36 spans 148 over 6 (24.67,
-table takes 26) — one rounds down, the other up. Every version from 2 to 40 was
-checked against an independent encoder and 32 is the only disagreement, so this
-is an exception in the table and not a rule the derivation is missing. Pinned by
-a test that also pins versions 31 and 33 as *derived*, so the exception cannot
-quietly widen.
+table takes 26) — one rounds down, the other up. This is an exception
+transcribed from the standard's own table, not a rule the derivation is
+missing, and it is one of the ten versions in the external-oracle "spread"
+set (`SPEC.md` "Verification"): our encoder's version-32 matrix matches
+segno's independently-computed one byte-for-byte, at four ECC levels, which
+is real (2026-08-18) evidence for the exception rather than the "checked
+against an independent encoder" prose this sentence used to assert with
+nothing behind it. Pinned by a test that also pins versions 31 and 33 as
+*derived*, so the exception cannot quietly widen.
 
 **One walk, two directions.** The zigzag that places codewords is a single
 `Walk` used by both the encoder and the decoder. A decoder that re-derived the
@@ -105,72 +109,169 @@ and not merely a missing panic.
 
 ## Verification
 
-**Two independent oracles, neither of which shares an author with this module.**
+**Corrected 2026-08-18.** This section used to open with "two independent
+oracles, neither of which shares an author with this module" and go on to
+claim specific byte-identical comparisons — 672 matrices, 320 matrices, 84
+symbols read back by an independent decoder, 12 sequences/30 symbols and 120
+symbols cross-checked against a foreign encoder/decoder — concluding "Anchor
+grade: class A · oracle EXTERNAL". None of it was true: `find modules/qr`
+had five files, no `testdata/`, no embedded golden bytes, and grepping the
+module for every one of those numbers and for `oracle`/`independent`/
+`byte-identical` found the same prose and no executable test behind any of
+it. The claim was present verbatim in the module's first commit — it was
+never regression-tested away, because it never had a test. What follows
+replaces it with what the module's tests actually do today, checked by
+reading them.
 
-1. **An independent encoder**, compared matrix-for-matrix with the mask forced so
-   that both implementations are answering the same question. 672 matrices over
-   7 inputs x 4 levels x 3 versions x 8 masks, byte-identical; plus a sweep of
-   **all 40 versions x 4 levels x 2 fill levels = 320 matrices**, byte-identical.
-   The sweep is what exercises the transcribed block-structure table: a wrong
-   entry changes the interleave and the matrix stops matching.
-2. **An independent decoder**, handed this module's output and asked what it
-   reads. 84 symbols, every one read back as the exact input. This catches a
-   class the encoder comparison cannot: two encoders agreeing on a matrix that
-   no reader accepts.
+**The module's own tests are self-consistency: 31 tests (`root.zig`'s 23
+plus `render.zig`'s 7 plus the test-aggregator block) including four fuzz
+harnesses, all authored alongside the code they check.** Round trips
+(`root.zig`'s "round trip: every mode, every level, across the version
+range", the structured-append round trip, the renderer round trips) encode
+and then decode with this module's own inverse of whatever it just did, so a
+consistent mistake in **both** halves — the zigzag `Walk` order, the
+transcribed error-correction block-structure table, a masking-formula bug —
+is invisible to them by construction: decode just undoes whatever encode
+did, correctly or not. Literal pins (the generator polynomial for ten EC
+codewords against the standard's printed coefficients, codeword capacity
+against Table 1, the tabulated alignment centres including the version-32
+exception, finder-pattern geometry on the diagonal, the field's
+multiplicative inverse over all 255 non-zero elements) check specific values
+against the spec text, not against an outside implementation. The four fuzz
+harnesses (arbitrary encoder input, arbitrary decoder grids, valid symbols
+with modules flipped, arbitrary structured-append messages) check that
+untrusted input never panics and that a "successful" decode is never wrong
+— solid ground, but none of it is an external oracle, and none of it was
+ever claimed to need one until the paragraph above invented the claim.
 
-**Structured append is anchored on an independent encoder, because a round trip
-cannot see the mistake.** The position and the count are four bits each, so
-swapping them shifts nothing in the stream: our own encoder and decoder would
-agree with each other perfectly while disagreeing with every reader in the world.
-So the anchor runs the other way — 12 sequences and 30 symbols produced by an
-independent encoder are read by this module, and the index, the count and the
-parity must each match what that encoder recorded, with the rejoined messages
-byte-identical. The reverse direction (our sequences, read by the independent
-decoder, concatenating to the original) is checked too, and is the weaker of the
-two for exactly the reason above.
+**A real external oracle, added 2026-08-18, closes part of that gap.**
+`testdata/reference.py` drives [segno](https://github.com/heuer/segno) (a
+pure-Python, independently-authored ISO/IEC 18004 encoder; version 1.6.6 at
+capture time) to produce QR matrices for a fixed (content, mode, version,
+ecc, mask) tuple, and `testdata/golden_matrices.zig` freezes the resulting
+module grids as checked-in bytes — genuinely produced by segno's own
+placement and interleaving logic, not by our reading of the spec, and not
+recomputed by python at test time. `golden_test.zig` asserts our own encoder
+reproduces every one of them byte-for-byte, with no python or subprocess
+involved in the test run itself (so it runs in CI, which never has segno
+installed). This is exactly what the encoder-comparison half of the old
+claim described, done for real: forcing the same version/ecc/mask on both
+sides means both implementations are answering the identical question, so
+module-for-module disagreement is a real defect rather than a difference in
+auto-selection heuristics.
 
-**Decoding is verified in both directions too.** Round trips cover every mode,
-level and a spread of versions; correction is tested at exactly the capability
-boundary — eight corrupted codewords in a version 1-H block succeed, nine are
-refused — by damaging one module per codeword so the count is exact rather than
-estimated. And the foreign encoder's matrices are fed to **our** decoder: 120
-symbols over 6 inputs x 4 levels x 5 versions, all read back exactly.
+**What it covers, and why this is the piece self-consistency structurally
+cannot check:** 51 vectors —
 
-**The renderers are checked against the grid, not against a decoder.** Each one's
-output is parsed back into a matrix and compared module for module with the
-source. Rendering and then decoding the picture is the weaker test: error
-correction absorbs sampling mistakes up to its capability, so a transposed or
-half-module-offset rendering still reads back as the right string. The SVG parser
-in the test also checks the shape of each run rather than skipping to the next
-`M`, so a run drawn in the wrong direction is a failure and not a shrug.
+- **"spread"** (40 vectors): 10 versions across the 1–40 range (1, 2, 5, 7,
+  10, 14, 20, 27, 32, 40 — including version 32, the documented exception to
+  the alignment-centre spacing rule above) × all 4 ECC levels, numeric mode,
+  mask forced to 0, content sized to nearly fill each version's tightest
+  (H) capacity. Exercises the transcribed error-correction block-structure
+  table broadly: a wrong entry changes the interleave and the matrix stops
+  matching.
+- **"masks"** (8 vectors): version 5, level Q, every one of the 8 mask
+  patterns forced in turn. A masking-formula bug (e.g. two patterns'
+  conditions swapped) does not change what this module's own decoder reads
+  back — unmask always undoes whatever mask encode applied, by construction
+  — so only an oracle that computes the mask pattern independently catches
+  it (proven below).
+- **"modes"** (3 vectors): version 3, level M, one vector each for numeric,
+  alphanumeric and byte mode, exercising the mode-indicator and count-field
+  bits the other two sets (numeric only) do not.
 
-The oracle comparison found one real defect — the version 32 alignment centres
-above — after the module's own tests were green, which is the reason to have it.
+The count is pinned by a canary test (`golden_test.zig`) so the two tables
+cannot silently drift apart.
 
-Neither oracle's source was read, and no third-party QR implementation
-contributed to the design; the relationship is testing, not provenance
-(`CONVENTIONS.md` §5: a black-box oracle needs no NOTICE entry, an implementation
-studied as a design reference does).
+**Proven able to fail, not merely passing (2026-08-18):** two mutations were
+applied to `root.zig`, the suite run, and the source restored.
 
-**The module's own tests** pin values rather than mechanisms: the generator
-polynomial for ten EC codewords against the coefficients the standard prints,
-codeword capacity against Table 1, alignment centres against the tabulated ones,
-and finder-pattern geometry on the diagonal so a single wrong ring cannot average
-out. The field is checked by exhaustive multiplicative inverse over all 255
-non-zero elements.
+| Mutation | Golden test (`golden_test.zig`) | The other 31 self-consistency tests |
+|---|---|---|
+| `Walk.next`: swapped which of the two columns in a pair is visited first (placement order) | **RED** — `spread_v1_l` mismatched at the very first byte the finder pattern doesn't own | all green |
+| `maskAt`: patterns 3 and 4's formula bodies swapped | **RED** — `mask_v5_q_m3` mismatched | all green |
+
+Both mutations were reverted and the suite confirmed green again. In both
+directions, only the golden oracle noticed — every round trip, all four fuzz
+harnesses, and every literal pin passed with the mutation active, which is
+the concrete demonstration of the blind spot described above, not just an
+assertion of it.
+
+**The oracle itself had a real defect, found while building this anchor, and
+that is worth recording rather than quietly routing around.** segno 1.6.6's
+`write_padding_bits` computes the padding-to-byte-boundary amount as
+`8 - (length % 8)` unconditionally, which — per ISO/IEC 18004:2015 §7.4.10 —
+is wrong when the bit stream is *already* byte-aligned after the terminator:
+it should add zero bits, and segno's formula adds a spurious full byte
+instead. The very first capture run of this oracle hit exactly that case (a
+version-5-quartile vector) and disagreed with this module's own encoder in
+roughly a third of the matrix's data-region bytes. Hand-tracing both
+implementations' pre-mask, pre-interleave data codewords isolated the one
+extra byte and confirmed **this module's encoder was the one matching ISO
+7.4.10, not segno** — `pyzbar`/`zbar` decoded both the segno-buggy matrix and
+this module's matrix for that case to the correct message anyway, because a
+lenient decoder never validates padding content, which is exactly why a
+byte-identical golden comparison (and not a decode round-trip against a
+third tool) is what caught this at all. `reference.py` monkeypatches a
+one-line corrected `write_padding_bits` at generation time, documented in
+full there, so the captured vectors reflect segno's real encoding logic and
+not this one bug in it.
+
+**What the external oracle does not yet cover.** It anchors the encoder's
+placement and block-structure/interleave logic. It does not anchor decoding,
+error correction, structured append, or the renderers — those remain
+self-consistency only, same as before this section was corrected. Extending
+the oracle to decoding (e.g. segno's matrices fed to this module's decoder,
+or this module's matrices fed to an independent decoder) is future work, not
+something this pass claims to have done.
+
+Neither `render.zig`'s renderers nor structured append gained an external
+oracle in this pass; both are still checked by parsing rendered output back
+into a matrix (renderers) or by round trip (structured append).
+
+**A related but separate fix, same day:** `root.zig`'s "damage beyond
+capability is refused, not mis-corrected" test asserted
+`r == DecodeError.Uncorrectable or r == DecodeError.BadData or r ==
+DecodeError.BadFormat` where the specific corruption it applies (a
+contiguous wipe of the data region) only ever reaches `Uncorrectable` — the
+format-information area is untouched, so `BadFormat` is unreachable, and the
+damage is heavy enough that Reed-Solomon fails before `parseSegments` ever
+runs, so `BadData` is unreachable too. An assertion with two dead branches
+is the same class of claim this whole section exists to stop making — it
+reads as "any of three failure modes is exercised here" when only one is.
+The test now asserts `Uncorrectable` alone, and `BadFormat`/`BadData` each
+gained their own dedicated test reaching them with their own input (clearing
+both copies of the format information; feeding `parseSegments` a malformed
+mode indicator directly) — narrowing the original assertion actually
+increased coverage, since neither of the other two errors had a reachable
+test anywhere in the suite before.
 
 ## Anchoring
 
-**External.** Expected values come from outside this repo in both directions: an
-independent encoder's matrices, compared byte-for-byte, and an independent
-decoder's reading of ours. Neither is ours and neither was read; both can fail
-us, and one already did — the version 32 alignment centres. The transcribed
-values (the standard's block-structure table, the Table 1 capacities, the printed
-generator polynomial for ten EC codewords) are self-anchored *as transcriptions*
-but every one of them is downstream of a matrix the external encoder either
-matches or does not.
+**Mixed.** The module-placement order and the error-correction block
+structure — the two things self-consistency structurally cannot check,
+because a decode that undoes the same wrong order or the same
+mistranscribed table as the encode that produced it still reports success —
+are now anchored against segno, an independently-authored external encoder,
+via checked-in golden matrix bytes (`testdata/golden_matrices.zig`),
+byte-identical, with the failure mode proven both ways (see the mutation
+table above). Decoding, error correction, structured append and rendering
+remain self-consistency: round trips, literal pins against the standard's
+printed values, and four fuzz harnesses. Building this anchor turned up one
+real, independent defect — not in this module, but in the oracle itself
+(segno's `write_padding_bits` boundary bug, above) — which is the concrete
+argument for keeping an external comparison at all rather than trusting
+either side's prose; this module's own version-32 alignment-centre exception
+("Design & invariants" above) is now covered by the same 2026-08-18 oracle
+rather than by the unverified "checked against an independent encoder"
+claim that used to justify it.
 
-**Anchor grade:** class A · oracle EXTERNAL
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths (encoder placement and block structure,
+  against segno), self for others (decoding, structured append, rendering) — the
+  "Verification" section above names which.
 
 ## Backlog
 

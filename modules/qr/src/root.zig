@@ -1396,6 +1396,7 @@ fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence) 
 // (CONVENTIONS.md §6 step 3); every submodule has to be named here.
 test {
     _ = render;
+    _ = @import("golden_test.zig");
 }
 
 test "GF(2^8) is the field the standard names" {
@@ -1595,14 +1596,82 @@ test "damage beyond capability is refused, not mis-corrected" {
     // Returning a plausible wrong string here is the worst outcome a QR library
     // has, and it is the one a syndrome check alone does not rule out — hence
     // the re-check after Forney correction.
+    //
+    // The wipe (rows 9-20 of a 21x21 symbol) is chosen to land on the data
+    // region and leave the format-information area readable: copy 0 of the
+    // format bits lives entirely in rows 0-8, so it survives untouched and
+    // `readFormatInfo` still succeeds via that copy even though copy 1's
+    // second half (column 8, rows 6-12) is partly overwritten — the decoder
+    // only needs ONE readable copy. That makes `BadFormat` unreachable from
+    // this specific corruption, and the corruption is heavy enough (12 of 21
+    // data+EC rows) that Berlekamp-Massey fails the block before
+    // `parseSegments` ever runs, so `BadData` is unreachable too. Only
+    // `Uncorrectable` is exercised here; `BadFormat` and `BadData` each have
+    // their own dedicated, independently-reachable test below.
     try encode(&m, "HELLO WORLD", .{ .ecc = .low, .version = 1 });
     for (9..21) |y| {
         for (0..21) |x| {
             m.setDark(@intCast(x), @intCast(y), (x + y) % 2 == 0);
         }
     }
-    const r = decode(&m, &out);
-    try t.expect(r == DecodeError.Uncorrectable or r == DecodeError.BadData or r == DecodeError.BadFormat);
+    try t.expectError(DecodeError.Uncorrectable, decode(&m, &out));
+}
+
+test "decode reports BadFormat when neither copy of the format info is readable" {
+    const t = std.testing;
+    var m: Matrix = undefined;
+    var out: [64]u8 = undefined;
+
+    try encode(&m, "TEST", .{});
+
+    // Clear every module either copy of the format information occupies —
+    // mirroring `drawFormatInfo`'s own write loop, so this touches exactly
+    // the 15+15 bits `readFormatInfo` reads and nothing else. The resulting
+    // 15-bit value (all zero) sits at Hamming distance 5 from every one of
+    // the 32 valid BCH(15,5) codewords (checked exhaustively offline —
+    // `bch(0, 0x537, 10) ^ 0x5412` and its 31 siblings), which is beyond the
+    // format code's declared 3-bit correction radius, so both copies are
+    // unreadable and `BadFormat` is the only possible outcome — unlike the
+    // "damage beyond capability" test above, which corrupts data and leaves
+    // one format copy intact.
+    for (0..15) |k| {
+        const x1: u16 = switch (k) {
+            0...7 => 8,
+            8 => 7,
+            else => @intCast(14 - k),
+        };
+        const y1: u16 = switch (k) {
+            0...5 => @intCast(k),
+            6 => 7,
+            else => 8,
+        };
+        m.setDark(x1, y1, false);
+
+        if (k < 8) {
+            m.setDark(m.size - 1 - @as(u16, @intCast(k)), 8, false);
+        } else {
+            m.setDark(8, m.size - 15 + @as(u16, @intCast(k)), false);
+        }
+    }
+    try t.expectError(DecodeError.BadFormat, decode(&m, &out));
+}
+
+test "decode reports BadData when the corrected codewords are not a well-formed segment stream" {
+    const t = std.testing;
+    var out: [16]u8 = undefined;
+    var seq: ?Sequence = null;
+
+    // `parseSegments` directly, bypassing the matrix/RS-correction machinery
+    // entirely: an RS-corrected block that happens to decode to this byte is
+    // indistinguishable from one that was never damaged, so there is no
+    // module-level corruption that reliably reaches this path (any single
+    // flipped module is either undone by error correction or pushes the
+    // block past capability into `Uncorrectable` instead — see the
+    // "damage beyond capability" test above). Mode indicator 0b0011 is ECI,
+    // which this module does not implement and rejects as malformed data
+    // rather than silently mishandling.
+    const data = [_]u8{0b0011_0000};
+    try t.expectError(DecodeError.BadData, parseSegments(&data, 1, &out, &seq));
 }
 
 test "decode rejects a malformed symbol rather than guessing" {

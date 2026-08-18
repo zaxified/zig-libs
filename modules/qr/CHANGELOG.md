@@ -5,6 +5,54 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — `SPEC.md` claimed an external verification that did not exist: "672
+  matrices... byte-identical", "320 matrices... byte-identical", "84 symbols" read back
+  by an independent decoder, "12 sequences and 30 symbols" and "120 symbols"
+  cross-checked against a foreign encoder/decoder, concluding "Anchor grade: class A
+  · oracle EXTERNAL". `find modules/qr` had five files and no `testdata/`; grepping the
+  module for every one of those numbers and for `oracle`/`independent`/`byte-identical`
+  found the same prose and no executable test behind any of it, present verbatim since
+  the module's first commit. `SPEC.md`'s "Verification" and "Anchoring" sections, and
+  the version-32 alignment-centre paragraph in "Design & invariants" that made the same
+  kind of claim, now describe what the suite actually does: 31 self-consistency tests
+  (round trips, literal pins against the standard, four fuzz harnesses) plus, new in
+  this entry, a real external oracle.
+  The real oracle: `testdata/reference.py` drives [segno](https://github.com/heuer/segno)
+  1.6.6 (an independently-authored ISO/IEC 18004 encoder) to produce 51 QR matrices —
+  10 versions × 4 ECC levels ("spread", including version 32, the documented
+  alignment-centre exception), 8 forced mask patterns at one version/level ("masks"),
+  and all 3 implemented modes at one version/level ("modes") — frozen as checked-in
+  bytes in `testdata/golden_matrices.zig`. `golden_test.zig` asserts this module's own
+  encoder reproduces every one of them byte-for-byte, with no python at test run time.
+  This anchors what self-consistency structurally cannot see: a round trip decodes with
+  the same `Walk` placement order and the same (possibly mistranscribed)
+  error-correction block-structure table the encode used, so a bug shared by both
+  halves is invisible to it — only an independently-placed grid catches that.
+  **The oracle itself had a real bug**, found building this: segno 1.6.6's
+  `write_padding_bits` adds a spurious 8-bit zero byte when the bitstream is already
+  byte-aligned after the terminator (ISO/IEC 18004:2015 §7.4.10 says to add zero bits
+  in that case). The first capture run hit this at version 5/quartile and disagreed
+  with this module's own encoder in roughly a third of the matrix; hand-tracing both
+  implementations' pre-mask data codewords confirmed this module was the one matching
+  the standard, not segno. `reference.py` monkeypatches a one-line corrected version at
+  generation time so the captured vectors reflect segno's real behaviour.
+  **Proven able to fail, both directions:** two mutations (`Walk.next`'s column-pair
+  order swapped; `maskAt` patterns 3 and 4's formulas swapped) were each applied, run,
+  and reverted. Both went red in the golden test alone — every one of the 31
+  self-consistency tests, including all four fuzz harnesses, stayed green throughout,
+  which is the blind spot demonstrated rather than merely asserted. New anchor grade:
+  class A · oracle MIXED (anchored for encoder placement/block-structure, self for
+  decoding/structured-append/rendering — down from the fabricated "oracle EXTERNAL",
+  which covered nothing).
+  Also fixed while in there: `root.zig`'s "damage beyond capability is refused, not
+  mis-corrected" test asserted `Uncorrectable or BadData or BadFormat` where the
+  corruption it applies only ever reaches `Uncorrectable` (the format-information area
+  is untouched, and Reed-Solomon fails before `parseSegments` runs) — an assertion with
+  two dead branches, the same class of unverified claim as the SPEC.md defect above.
+  Narrowed to `Uncorrectable`, and `BadFormat`/`BadData` each gained their own
+  dedicated, independently-reachable test — neither error had a reachable test
+  anywhere in the suite before, so the narrowing increased coverage rather than
+  reducing it.
 - **2026-08-17** — Structured append (§8.4.6), both directions: `encodeSequence`
   splits a message across up to sixteen symbols, `decodePart` reports which one
   it is holding. Added because the wallet payloads this repo already has modules
