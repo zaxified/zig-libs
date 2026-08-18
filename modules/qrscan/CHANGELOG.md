@@ -5,6 +5,48 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Two integer-width defects, both from an audit, both invisible
+  to every native test that existed: `linux64`'s `usize` is 64 bits, so nothing
+  here could actually wrap on this collection's own runner.
+  `scratchSize`/`bitmapBytes`/`blockCount`/`runBytes` computed in plain `usize`,
+  which is 32 bits on this module's own declared `.wasm32` target
+  (`meta.targets`). A 100,000 x 100,000 image — nothing stopped a caller from
+  handing one in, only a `< 21` floor existed — has a true `bitmapBytes` of
+  1,250,000,000, which a 32-bit `usize` multiply wraps to 176,258,176 before the
+  division that follows it even runs: a buffer about a seventh the size the
+  image actually needs, allocated without complaint. Fixed two ways, both
+  needed: the arithmetic now runs in `u64` throughout (`u32 * u32` cannot
+  overflow it) with the final narrowing to `usize` *saturating* rather than
+  wrapping, and `scan` now enforces `max_dimension = 8192` on `width`/`height`
+  — chosen as comfortably past the highest resolution either real source (a
+  V4L2 camera plane or a browser canvas; 8K/7680x4320 is the current practical
+  ceiling for both) produces, while keeping `width * height` 64x below the
+  2^32 wrap point and `scratchSize` at that ceiling to about 9.5 MB, a buffer a
+  caller can actually allocate. An oversized image now gets `Error.BadImage`
+  before any of the arithmetic above runs.
+  Separately, `Image.at`'s index computation left `y * stride + x` in `u32`,
+  where `Bitmap.get`/`set` deliberately widen to `usize` first — the one path
+  through binarisation that did not match the pattern the rest of the module
+  uses. On `scan`'s hot path (`binarize`, called from every pixel of every
+  scan) that is live on 64-bit targets too, not only `wasm32`: it needs a
+  multi-gigabyte real buffer, not a 32-bit `usize`, to actually overflow.
+  Fixed by widening the same way `Bitmap.get`/`set` already do; the arithmetic
+  was pulled out into a small `Image.index` so it is unit-testable without
+  allocating the multi-gigabyte buffer a full repro would otherwise need.
+  Tests: the `max_dimension` rejection is target-independent and asserts the
+  concrete `Error.BadImage` (and that `max_dimension` itself, not
+  `max_dimension - 1`, is the accepted edge); `scratchSize` is checked against
+  an independently computed `u64` byte count at the auditor's own
+  100,000 x 100,000 case, alongside the literal 176,258,176 a 32-bit `usize`
+  would have produced, so the historical defect is pinned as a number rather
+  than described; and `Image.index`'s widening is checked directly against a
+  `stride`/`y`/`x` combination that overflows `u32` — meaningful on this
+  64-bit host, and explicitly not claimed to mean anything if ever executed on
+  `.wasm32`, whose 32-bit address space cannot hold the value being checked
+  either way. `zig build test-qrscan` (all three release lanes) and
+  `zig build portable-qrscan-wasm32` (compile-only — no wasm32 runtime was
+  available to execute it) both green.
+
 - **2026-08-17** — Tried and rejected, recorded so it is not tried again:
   reading each module as the majority of the 3x3 neighbourhood around its centre,
   to help the one case still below 100 % — a version 1 at three pixels per

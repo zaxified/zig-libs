@@ -92,6 +92,11 @@ takes the tilt from the top edge and corrects for it.
   are 100 %. Below three, binarisation is deciding modules from single pixels.
 - **One symbol per image.** The candidate search finds several, but only the best
   triple is sampled.
+- **`width`/`height` above `qrscan.max_dimension` (8192) are refused with
+  `Error.BadImage`**, checked before `scratchSize`'s arithmetic ever runs. 8192
+  is comfortably past the highest resolution either real source (a V4L2 camera
+  plane or a browser canvas) produces today — 8K/7680x4320 is the current
+  practical ceiling for both.
 
 Provenance: original work of the zig-libs authors (MIT). Symbol geometry is from
 ISO/IEC 18004; the block-adaptive binarisation follows the approach the ZXing

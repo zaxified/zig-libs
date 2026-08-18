@@ -46,19 +46,63 @@ pub const Image = struct {
     stride: u32,
 
     fn at(self: Image, x: u32, y: u32) u8 {
-        return self.luma[y * self.stride + x];
+        return self.luma[self.index(x, y)];
+    }
+
+    /// Pixel offset of (x, y) into `luma`. Split out of `at` so the arithmetic
+    /// itself — the part the auditor found wrong — is callable, and testable,
+    /// without needing a real backing buffer the size of the index it produces.
+    ///
+    /// Widened deliberately, matching `Bitmap.get`/`set` below: computed as
+    /// plain `u32` (as this was before), `y * stride` alone can already exceed
+    /// `u32`'s range for a real multi-gigabyte buffer, and Zig traps that as an
+    /// integer-overflow panic in Debug/ReleaseSafe (or wraps to an
+    /// in-bounds-looking wrong index under `ReleaseFast`) regardless of how
+    /// wide the host's own `usize` is — the ceiling belonged to the
+    /// computation's *type*, not to the target. Casting `y` up before
+    /// multiplying moves the arithmetic into `usize`, matching the target's
+    /// real width. That still has a ceiling — `stride * height` can exceed even
+    /// a 64-bit `usize` for a large enough (if implausible) buffer, and a
+    /// 32-bit `usize` target sooner still — but nothing here claims `stride` is
+    /// bounded: `max_dimension` bounds `width`/`height`, not `stride`, which is
+    /// not otherwise validated. This widening fixes the *type* of the defect
+    /// the auditor found — computing in `u32` where `Bitmap.get`/`set`
+    /// deliberately widen — not every buffer size that could theoretically
+    /// still overflow a real `usize`.
+    fn index(self: Image, x: u32, y: u32) usize {
+        return @as(usize, y) * self.stride + x;
     }
 };
 
 pub const Error = error{
     /// The scratch buffer is smaller than `scratchSize` says.
     ScratchTooSmall,
-    /// `luma` is shorter than `stride * height`, or the dimensions are absurd.
+    /// `luma` is shorter than `stride * height`, or the dimensions are absurd
+    /// — below 21 (no legal QR symbol is smaller), or above `max_dimension`.
     BadImage,
     /// No symbol was located. Not the same as one that was found and failed to
     /// decode — that is `qr.decode`'s answer to give.
     NotFound,
 };
+
+/// Ceiling `scan` enforces on `width` and `height`. The image is untrusted
+/// input (SPEC's threat model) and, before this existed, had no upper bound at
+/// all — only the `< 21` lower bound below. `width * height` at 100,000 x
+/// 100,000 is 10,000,000,000: on a 32-bit `usize` target (this module's own
+/// declared `.wasm32`, `meta.targets` above) that wraps to 1,410,065,408
+/// before `bitmapBytes` even divides by 8, and the resulting scratch requirement
+/// silently shrinks to about a seventh of what the image actually needs.
+///
+/// 8192 (8K) is chosen deliberately rather than pushed to the edge of what the
+/// arithmetic can survive: it is comfortably past the highest resolution either
+/// of this module's actual sources produces today (a V4L2 camera plane or a
+/// browser canvas — 7680x4320 / 8K UHD is the current practical ceiling for
+/// both), while keeping `width * height` at most 67,108,864 — 64 times below
+/// the 2^32 wrap point, not merely under it — and keeping `scratchSize` at that
+/// ceiling to about 9.5 MB, a buffer a caller can actually allocate. Raising it
+/// is a deliberate act of editing this constant and re-checking the arithmetic
+/// below at the new ceiling, not something to do implicitly.
+pub const max_dimension: u32 = 8192;
 
 /// Bytes of scratch `scan` needs for an image of this size.
 ///
@@ -69,26 +113,61 @@ pub const Error = error{
 /// beyond 1024 pixels the bitmap was simply never written, so a symbol in the
 /// bottom-right of a 1080p frame did not exist. Deriving the sizes from the
 /// image is what makes that unrepresentable rather than merely fixed.
+///
+/// Computed in `u64` throughout, not `usize`: `usize` is 32 bits on this
+/// module's declared `.wasm32` target, and `width * height` alone overflows a
+/// 32-bit product well within the range `u32` dimensions can express (any pair
+/// whose product reaches 2^32 — 65536x65536 is one, but so is 100,000x100,000,
+/// which is what the auditor's worked case used). `u32 * u32` can never
+/// overflow `u64` — the largest possible product is under 2^64 — so every term
+/// below is exact regardless of target. Only the final sum is narrowed back to
+/// `usize`, and narrowed by *saturating* rather than wrapping: a caller (or
+/// `scan`, before `max_dimension` existed) asking for a size that does not fit
+/// gets `maxInt(usize)` back — a request no real buffer or allocator satisfies
+/// — rather than a small number indistinguishable from a legitimate one. `scan`
+/// additionally refuses such an image outright via `max_dimension` before this
+/// function is ever reached from inside it, so this saturation is what protects
+/// a caller who calls `scratchSize` directly, ahead of `scan`, with a size it
+/// has not yet validated.
 pub fn scratchSize(width: u32, height: u32) usize {
-    return bitmapBytes(width, height) +
-        blockCount(width) * blockCount(height) +
+    const total: u64 = bitmapBytesU64(width, height) +
+        blockCountU64(width) * blockCountU64(height) +
         // Slack so the run array can be aligned inside a `[]u8` the caller
         // declared with no alignment of its own.
-        runBytes(width) + @alignOf(Run) - 1;
+        runBytesU64(width) + (@alignOf(Run) - 1);
+    return saturateUsize(total);
+}
+
+fn saturateUsize(v: u64) usize {
+    return std.math.cast(usize, v) orelse std.math.maxInt(usize);
+}
+
+fn bitmapBytesU64(width: u32, height: u32) u64 {
+    return (@as(u64, width) * @as(u64, height) + 7) / 8;
 }
 
 fn bitmapBytes(width: u32, height: u32) usize {
-    return (@as(usize, width) * @as(usize, height) + 7) / 8;
+    return saturateUsize(bitmapBytesU64(width, height));
+}
+
+fn blockCountU64(n: u32) u64 {
+    return (@as(u64, n) + 7) >> block_shift;
 }
 
 fn blockCount(n: u32) usize {
-    return (@as(usize, n) + 7) >> block_shift;
+    return saturateUsize(blockCountU64(n));
 }
 
 /// Two rows of runs. A row of `w` pixels cannot hold more than `w / 2 + 1`
-/// maximal same-colour runs, so this cannot overflow whatever the picture is.
+/// maximal same-colour runs, so this cannot overflow whatever the picture is
+/// — in the `u64` this is now computed in; see `scratchSize`'s doc comment for
+/// why `usize` itself is not wide enough to make that claim on every target.
+fn runBytesU64(width: u32) u64 {
+    return 2 * (@as(u64, width) / 2 + 1) * @sizeOf(Run);
+}
+
 fn runBytes(width: u32) usize {
-    return 2 * (@as(usize, width) / 2 + 1) * @sizeOf(Run);
+    return saturateUsize(runBytesU64(width));
 }
 
 /// The caller's scratch, divided up. One place decides the layout, so the tests
@@ -146,6 +225,12 @@ pub const Found = struct {
 /// Locate one symbol and sample it. Returns the grid; hand it to `qr.decode`.
 pub fn scan(img: Image, scratch: []u8) Error!Found {
     if (img.width < 21 or img.height < 21) return Error.BadImage;
+    // Checked before anything below does size arithmetic on `img.width` /
+    // `img.height`: this is the one gate standing between an untrusted
+    // dimension and `scratchSize`'s internals, and it must reject the image
+    // before, not after, `bitmapBytes`/`blockCount`/`runBytes` run. See
+    // `max_dimension`'s doc comment for why 8192 and not something else.
+    if (img.width > max_dimension or img.height > max_dimension) return Error.BadImage;
     if (img.luma.len < @as(usize, img.stride) * img.height) return Error.BadImage;
     if (scratch.len < scratchSize(img.width, img.height)) return Error.ScratchTooSmall;
 
@@ -2191,4 +2276,118 @@ test "stride is honoured, because a camera plane is padded" {
     var fm = found.matrix;
     var out: [64]u8 = undefined;
     try t.expectEqualStrings("STRIDE", try qr.decode(&fm, &out));
+}
+
+// ── dimension bound and wide arithmetic ─────────────────────────────────────
+// Neither defect below could be seen from a native test before: `usize` is
+// 64-bit on `linux64`, so a `u32 * u32` product this module already computes
+// (`bitmapBytes`) or an index it builds from two `u32`s (`Image.index`) never
+// actually wraps here, regardless of whether the arithmetic was written to be
+// safe against it or not. These tests are written to be meaningful anyway --
+// see each one's comment for how.
+
+test "an image over max_dimension is refused with a concrete error, on any target" {
+    const t = std.testing;
+    // No real oversized buffer is needed: `scan` checks width/height against
+    // `max_dimension` before it reads `luma` or touches `scratchSize`, so an
+    // empty slice is enough to prove the rejection happens where it should.
+    // Unlike the two tests below, this one does not depend on `usize` being
+    // wide -- it is the same comparison, `> max_dimension`, on every target
+    // `meta.targets` declares, `.wasm32` included.
+    var no_scratch: [0]u8 = undefined;
+
+    const too_wide: Image = .{ .luma = &[_]u8{}, .width = max_dimension + 1, .height = 21, .stride = max_dimension + 1 };
+    try t.expectError(Error.BadImage, scan(too_wide, &no_scratch));
+
+    const too_tall: Image = .{ .luma = &[_]u8{}, .width = 21, .height = max_dimension + 1, .stride = 21 };
+    try t.expectError(Error.BadImage, scan(too_tall, &no_scratch));
+
+    // max_dimension itself is accepted by this check -- the bound is
+    // "> max_dimension", not "> max_dimension - 1". `luma` has to actually be
+    // `stride * height` long here (172,032 bytes at this width) or the very
+    // next check in `scan` rejects it as BadImage too, for an unrelated
+    // reason, and the assertion below would pass for the wrong cause; an
+    // empty `scratch` then forces ScratchTooSmall, not BadImage, proving the
+    // dimension check itself let this one through.
+    var at_edge_luma: [max_dimension * 21]u8 = undefined;
+    @memset(&at_edge_luma, 128);
+    const at_the_edge: Image = .{ .luma = &at_edge_luma, .width = max_dimension, .height = 21, .stride = max_dimension };
+    try t.expectError(Error.ScratchTooSmall, scan(at_the_edge, &no_scratch));
+}
+
+test "scratchSize matches an independently computed byte count, including one that would have wrapped a 32-bit usize" {
+    const t = std.testing;
+    // The auditor's worked case: width = height = 100_000. True bitmapBytes is
+    // 1_250_000_000; wrapped through a 32-bit `usize` multiply-then-divide it
+    // becomes 176_258_176 -- a buffer about a seventh of the size actually
+    // needed. This is meaningful on this 64-bit host precisely because
+    // `usize` here does NOT wrap at that width: the assertion below is a
+    // literal byte count, computed independently (in `u64`, mirroring what
+    // `scratchSize` itself now does) rather than derived from `scratchSize`'s
+    // own arithmetic, so a regression back to plain `usize` math would still
+    // be caught -- native `usize` is 64-bit, so the *symptom* here would not
+    // be a wrong number close to the right one, it would be exactly the wrong
+    // number the auditor measured, which this test pins.
+    const width: u32 = 100_000;
+    const height: u32 = 100_000;
+
+    const bitmap_bytes: u64 = (@as(u64, width) * @as(u64, height) + 7) / 8;
+    try t.expectEqual(@as(u64, 1_250_000_000), bitmap_bytes);
+
+    const bw: u64 = (@as(u64, width) + 7) >> block_shift;
+    const bh: u64 = (@as(u64, height) + 7) >> block_shift;
+    const block_bytes: u64 = bw * bh;
+
+    const run_bytes: u64 = 2 * (@as(u64, width) / 2 + 1) * @sizeOf(Run);
+
+    const expected: u64 = bitmap_bytes + block_bytes + run_bytes + (@alignOf(Run) - 1);
+    try t.expectEqual(@as(usize, @intCast(expected)), scratchSize(width, height));
+
+    // The value a 32-bit `usize` implementation would have wrapped
+    // `bitmapBytes` alone to, per the auditor's own arithmetic -- documented
+    // here as a fact about the historical defect, not exercised (this host's
+    // `usize` is 64-bit, so the module's own arithmetic cannot reproduce a
+    // 32-bit wrap), so a reader can check the claim in `max_dimension`'s doc
+    // comment against a real number. Faithful to where the wrap actually
+    // happened: in the multiplication, before the `+7`/`/8` that follow it —
+    // truncating the already-correct 64-bit *result* instead would not
+    // reproduce it (1_250_000_000 fits in a u32 with no wrap at all).
+    const mult_wrapped_32bit: u32 = @truncate(@as(u64, width) * @as(u64, height));
+    const wrapped_32bit_bitmap_bytes: u32 = (mult_wrapped_32bit + 7) / 8;
+    try t.expectEqual(@as(u32, 176_258_176), wrapped_32bit_bitmap_bytes);
+}
+
+test "Image.index widens before multiplying, so it cannot wrap where Bitmap.get/set do not" {
+    const t = std.testing;
+    // A real repro of this needs the multi-gigabyte buffer the auditor's own
+    // description names -- `luma` is never read here, only `index`'s
+    // arithmetic, so no such buffer has to exist for the test to mean
+    // something. `stride` sits at the top of `u32`'s range (nothing bounds
+    // `stride` the way `max_dimension` bounds `width`/`height` -- see
+    // `Image.index`'s doc comment), and `y = 1` is enough to push
+    // `y * stride + x` past what `u32` alone can hold.
+    const img: Image = .{ .luma = &[_]u8{}, .width = 1, .height = 1, .stride = std.math.maxInt(u32) };
+    const idx = img.index(10, 1);
+
+    // Compared by widening `idx` UP to `u64`, deliberately, rather than
+    // narrowing `want` down to `usize`: `want` does not fit a 32-bit `usize`
+    // at all (see the `.wasm32` note below), and `@intCast`-ing a
+    // comptime-known value that provably cannot fit its destination is a
+    // *compile* error in Zig, not a runtime one -- it would fail
+    // `check-portable`'s wasm32 compile step, which this test must not do
+    // even though it never runs there.
+    const want: u64 = @as(u64, std.math.maxInt(u32)) + 10;
+    try t.expectEqual(want, @as(u64, idx));
+    // The old, unwidened computation (`y * self.stride + x` entirely in
+    // `u32`) would have overflowed `u32` right here -- `4294967295 + 10`
+    // wraps to `9` modulo 2^32 -- which is what this guards against: not a
+    // value close to `want`, but a small one nowhere near it.
+    try t.expect(idx > std.math.maxInt(u32));
+
+    // Meaningful on this 64-bit host, where `usize` has room for `want`. It
+    // is not meaningful on `.wasm32`: `want` itself does not fit a 32-bit
+    // `usize` (wasm32's entire linear address space is capped at 4 GiB), so
+    // this specific input is a statement about `linux64`, and `wasm32` stays
+    // a compile-only claim for this test the way it does for the module as a
+    // whole -- see the verification notes in CHANGELOG.md.
 }

@@ -186,13 +186,34 @@ as "decodes to nothing" rather than as anything pointing at orientation.
 ## Threat model & out of scope
 
 Input is an image someone else chose, so every dimension and every pixel is
-untrusted. Bounds are checked before anything is indexed: `luma` must cover
-`stride * height`, the scratch must meet `scratchSize`, and each sampling point is
-range-checked against the bitmap rather than assumed to land inside it. There is
-no allocation, so there is no allocation to exhaust; work is linear in pixels
-except the triple search, which is cubic in candidates and therefore capped at
-64; the dimension search, which samples at most five grids; and the label table,
-which is a fixed 4096 entries and degrades to "no label" rather than growing.
+untrusted. Bounds are checked before anything is indexed: `width`/`height` must
+be at most `max_dimension` (8192, checked *before* `luma` or `scratchSize`),
+`luma` must cover `stride * height`, the scratch must meet `scratchSize`, and
+each sampling point is range-checked against the bitmap rather than assumed to
+land inside it. There is no allocation, so there is no allocation to exhaust;
+work is linear in pixels except the triple search, which is cubic in candidates
+and therefore capped at 64; the dimension search, which samples at most five
+grids; and the label table, which is a fixed 4096 entries and degrades to "no
+label" rather than growing.
+
+⚠ **The dimension bound exists because the size arithmetic it guards has a
+narrower ceiling than the image does.** `scratchSize` and its helpers used to
+compute in plain `usize`, which is 32 bits on this module's own declared
+`.wasm32` target (`meta.targets`); a 100,000 x 100,000 image — nothing capped
+`width`/`height` before this, only the `< 21` floor did — wraps `bitmapBytes`
+from a true 1,250,000,000 to 176,258,176 before the arithmetic even finishes,
+under-allocating by a factor of about seven with no error raised anywhere. Two
+independent fixes, not one: the arithmetic itself now runs in `u64` (`u32 * u32`
+cannot overflow it) and saturates rather than wraps on the way back to `usize`,
+*and* `scan` refuses an oversized image outright via `max_dimension` — chosen
+comfortably past the highest resolution either real source (a V4L2 camera plane
+or a browser canvas; 8K/7680x4320 is the current practical ceiling for both)
+produces, while leaving `width * height` 64x below the point where a 32-bit
+`usize` product would wrap. `Image.at`'s own index arithmetic had the matching
+defect at smaller scale — `y * stride + x` left in `u32` where `Bitmap.get`/`set`
+deliberately widen to `usize` first — fixed the same way, by widening; unlike
+the scratch-size arithmetic this one is live on 64-bit targets too, since it
+only needs a multi-gigabyte real buffer, not a 32-bit `usize`, to overflow.
 
 Failing to find a symbol returns `NotFound`. Deciding whether a located symbol is
 *readable* is `qr.decode`'s job, and the split matters: a scanner that reports
@@ -216,6 +237,25 @@ that something moved: that the tilt correction turns a 1.41× scan-line estimate
 back into the rendered module size, that a dimension one version out is rejected
 by its timing pattern, and that a large rotated symbol really does produce more
 than sixteen candidates.
+
+**The dimension bound and the wide arithmetic behind it are each tested against
+what makes them meaningful, not against what this host happens to be.** Native
+`usize` is 64 bits, so nothing about the original wrap could ever reproduce
+itself on `linux64` by accident — a test built the way the rest of this module's
+tests are (call the real function, compare the real result) would pass whether
+the fix existed or not. `max_dimension`'s rejection sidesteps that: it is a
+target-independent comparison (`> max_dimension`), asserted directly against
+`Error.BadImage`, on both an over-wide and an over-tall image, plus a check that
+`max_dimension` itself is still accepted. `scratchSize`'s fix is pinned as a
+literal number instead: the auditor's own 100,000 x 100,000 case, checked
+against an independently computed `u64` byte count *and* against the specific
+176,258,176 a 32-bit `usize` implementation would have produced, so a reader can
+verify the claim in `max_dimension`'s doc comment rather than take it on faith.
+`Image.at`'s widening is pulled out into `Image.index` so it is callable without
+the multi-gigabyte real buffer a full repro would need, and is checked against a
+`stride`/`y`/`x` combination that overflows `u32` — explicitly on this 64-bit
+host, since the value being checked does not fit a 32-bit `usize` at all, so the
+same assertion would be meaningless (and does not run) on `.wasm32`.
 
 **Tilt and curvature are rendered, not reasoned about.** `renderProjective` puts
 the symbol on a plane rotated out of the image plane and projects it through a
