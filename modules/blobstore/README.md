@@ -67,6 +67,10 @@ _ = try store.delete(d);                 // bool; decrements refcount, does NOT 
 // reclaim every zero-refcount blob not in `keep`, plus stale ingest temps
 const stats = try store.gc(arena, &.{}, .{}); // -> GcStats{blobs_removed,bytes_reclaimed,temps_removed}
 
+// opt-in check before trusting a `refcount` toggle on an existing store — see
+// "Opting out of refcounting" below
+_ = try store.hasOrphanedRcSidecars();   // bool
+
 // digests round-trip through hex text
 const parsed = try blobstore.Digest.fromHex(hex64);
 
@@ -131,6 +135,15 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   such a store (it truthfully reports zero blobs/bytes reclaimed rather than
   silently doing nothing), and `casDelete`/`delete` return
   `error.RefcountDisabled` instead of creating a sidecar on demand.
+  **Do not flip `refcount` to `false` on a store that has ever run with
+  `refcount = true`.** It may already have `.rc` sidecars on disk, some
+  possibly at zero and already collectible; reopening with `refcount = false`
+  makes `gc`'s CAS sweep skip the whole store, so those sidecars are never
+  collected again — fail-safe (nothing is deleted that shouldn't be), but
+  permanent. `false` is for a store created that way from the start, not a
+  runtime switch on an established one. `Store.hasOrphanedRcSidecars()` is an
+  opt-in check for exactly this situation — see its doc comment for why it
+  is opt-in rather than automatic.
 - **Configurable fan-out.** `Options.fanout` (`Store.initOptions`, `1..=32`,
   default `1`) sets how many 2-hex-char CAS directory levels precede the
   blob file — `cas/<hh>/<hex>` at the default, `cas/<hh>/<hh>/<hex>` at

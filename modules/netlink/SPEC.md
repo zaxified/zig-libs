@@ -217,17 +217,33 @@ exemption is a *default*, not a refusal: passing `state_mask = NUD.PERMANENT` (o
 `ip neigh flush nud permanent` can name a normally-exempt state explicitly.
 
 **Return value and the dump-then-delete race.** `FlushResult` carries `deleted` (kernel-confirmed
-deletions) and `raced` — entries the filter matched but that had already vanished by the time the
-delete reached the kernel (`error.NotFound`, ENOENT/ESRCH). That race is normal: the neighbour
-table is live, and another actor (or the kernel's own cache eviction) can remove an entry between
-the dump and the delete. `neighborFlush` catches exactly `error.NotFound` and counts it in `raced`
-rather than aborting the loop. Any other delete failure — `error.AccessDenied` if `CAP_NET_ADMIN`
-is lost mid-flush, `error.Busy`, `error.Unexpected` — is raised immediately and aborts the
-remaining loop, matching the "no silent write failure" discipline of every other write op here;
-`FlushResult` on that path is discarded along with the error, same as any other `try`-propagated
-failure in this module. A degenerate dumped entry with no `NDA_DST` (never seen from a real kernel
-for `RTM_GETNEIGH`, but not assumed impossible) is skipped rather than let a delete-build error
-abort the whole flush over one entry that was never a real key.
+deletions), `raced` — entries the filter matched but that had already vanished by the time the
+delete reached the kernel (`error.NotFound`, ENOENT/ESRCH) — and `stopped` — set when a delete
+failed for any other reason. The `raced` case is normal: the neighbour table is live, and another
+actor (or the kernel's own cache eviction) can remove an entry between the dump and the delete.
+`neighborFlush` catches exactly `error.NotFound` and counts it in `raced` rather than aborting the
+loop. Any other delete failure — `error.AccessDenied` if `CAP_NET_ADMIN` is lost mid-flush,
+`error.Busy`, `error.Unexpected` — stops the loop, but as of 2026-08-18 is recorded in
+`FlushResult.stopped` and returned as a normal (non-error) result, rather than raised and
+discarded. **Why not raise, matching every other write op's "no silent write failure"
+discipline:** those other ops are single writes with nothing accumulated to lose. `neighborFlush`
+is a *destructive bulk* operation — by the time a delete fails, some number of entries this same
+call already deleted are gone for real, and a caller that catches a raised error learns "something
+failed" but has no way to learn how many deletions already happened, which is an operational
+hazard for anyone auditing or retrying after a lost capability. This is the same shape as
+`traceroute`'s `Trace.transport_err`: "eight good hops then a send failure" is a useful partial
+result, not nothing, and `traceroute`'s `TraceError` narrows out `TransportError` for exactly this
+reason (a transport failure mid-trace never discards the hops already collected). `neighborFlush`
+follows that precedent rather than an out-parameter or a wrapper return type: `FlushError` now
+covers only failures with nothing yet to report (`DumpError`, from the initial dump — nothing has
+been deleted before that call), and every failure that happens once the delete loop is already
+running becomes data on the `FlushResult` the function still returns `Ok`. A caller that only
+checks for a raised error and ignores `stopped` gets the same information a caller of `traceroute`
+who ignores `transport_err` gets: silently incomplete, but never silently *wrong* — `deleted` and
+`raced` are exact counts of real, confirmed outcomes either way. A degenerate dumped entry with no
+`NDA_DST` (never seen from a real kernel for `RTM_GETNEIGH`, but not assumed impossible) is skipped
+rather than let a delete-build error abort the whole flush over one entry that was never a real
+key.
 
 **Verification.** `neighborFlushEligible` is exercised directly against every named `NUD.*` state
 (unit test "neighborFlushEligible: exempts only PERMANENT/NOARP under the default mask"), including

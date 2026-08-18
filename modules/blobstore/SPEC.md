@@ -41,6 +41,34 @@ named records. Usage: see ./README.md. Attribution/provenance: see this module's
   fabricating a sidecar on demand — a caller that opted into "never delete" should never reach this
   path, and one that does is told so loudly rather than getting a half-bookkept blob that
   contradicts the option it set.
+  **Toggling `refcount` on a store with history is a documented footgun, not a supported migration.**
+  A store that ran with `refcount = true` may already carry `.rc` sidecars, some possibly at zero
+  and already collectible by `gc`. Reopening the same `base` with `refcount = false` does not remove
+  or ignore those sidecars selectively — it makes `gc`'s CAS sweep skip the entire store (the
+  `if (!self.refcount) return stats;` short-circuit in `gc`, before any directory walk), so every
+  pre-existing sidecar, including ones at zero, is never swept again. The direction is fail-safe:
+  nothing is deleted that `refcount = true` semantics would have kept, so this cannot corrupt data or
+  drop something live — but it silently converts what would have been reclaimable disk space into
+  permanent retention, for as long as the store stays open with `refcount = false`. This was
+  undocumented before 2026-08-18; it is now stated on `Options.refcount`'s doc comment (source of
+  truth) and in README, next to the option itself, per §5's doc-ownership rule. `false` is meant for
+  a store created that way from the start — "never deletes, never calls `gc`" is the option's stated
+  precondition, not a runtime switch to flip on an established store.
+  **Why this got a check (`Store.hasOrphanedRcSidecars`) instead of only a warning, and why that
+  check is opt-in rather than automatic at `init`/`gc` time.** A pure prose warning is easy to miss
+  at the moment it matters (reopening an existing `base` with different `Options`, months after the
+  store was created), so an opt-in existence probe gives a caller a concrete way to check before
+  trusting a toggle is safe. It is deliberately **not** run automatically: `Store.init`/`initOptions`
+  do zero CAS-tree I/O today (every layer directory is created lazily, per the module doc comment),
+  and folding a directory walk into construction would tax every caller's "opening a store is cheap"
+  assumption, not only the ones toggling `refcount`. Running it inside `gc` instead would tax exactly
+  the callers `refcount = false` is meant to exempt — since "never calls `gc`" is the flag's own
+  precondition, a store using it as intended mostly never reaches `gc` at all, and `gc`'s existing
+  `refcount = false` path is a *true*, zero-cost no-op specifically so a caller that does call it
+  anyway is not surprised by hidden work. Given the failure mode is already fail-safe in direction
+  (permanent retention, never a wrong delete), there is no correctness argument for forcing the cost
+  onto a path every consumer pays for — only a discoverability one, which the doc-comment pointer and
+  the opt-in function both address without the cost.
 - **Configurable fan-out:** `Options.fanout` (`1..=32`, default 1) sets how many 2-hex-char
   directory levels the CAS uses before the blob file. Only affects newly-created stores/paths at
   the depth chosen at `Store.initOptions` time — an existing store's on-disk fan-out is not migrated
@@ -81,7 +109,7 @@ still streaming into its own temp. Cross-process locking covers only blobstore's
 path — it is not a general-purpose file lock for caller-defined concurrent access patterns.
 
 ## Verification
-`zig build test-blobstore` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/blobstore`). 17
+`zig build test-blobstore` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/blobstore`). 20
 tests covering CAS put/dedup/has/open/verify(intact + bit-rot)/delete, `Digest.fromHex` round-trip,
 the raw createTemp→commit→openBlob→list crash-safe path, named put/read/list, `segmentSafe`
 rejecting `..`/leading-dot/traversal attempts on every public entry point, `gc` sweeping a
@@ -93,8 +121,13 @@ fan-out, a single writer doing repeated put/delete/gc/reopen cycles never deadlo
 ingest flock, `Options.refcount = false` producing exactly one CAS file with no `.rc` sidecar and a
 still-readable blob, the no-`Options` default still writing a sidecar (regression guard for the
 consumers that pin the historical layout), `gc`'s CAS sweep being a truthful (zero-stats) no-op
-under `refcount = false` while `casDelete` refuses with `error.RefcountDisabled`, and lazy layer
-creation leaving `cas/`/`named/`/`tmp/` absent from a store that only ever wrote to `raw/`.
+under `refcount = false` while `casDelete` refuses with `error.RefcountDisabled`, lazy layer
+creation leaving `cas/`/`named/`/`tmp/` absent from a store that only ever wrote to `raw/`, and
+(2026-08-18) `hasOrphanedRcSidecars` returning `false` on a fresh store and under normal
+`refcount = true` use, plus the refcount-toggle footgun end to end: a store run with
+`refcount = true`, a blob deleted down to a zero sidecar `gc` has not yet swept, the same `base`
+reopened with `refcount = false`, `hasOrphanedRcSidecars` finding the stale sidecar, and `gc`
+confirming it is truthfully untouched (`blobs_removed == 0`).
 
 ## Backlog / deferred
 None outstanding from the original three-item backlog (garbage collection, reference counting,

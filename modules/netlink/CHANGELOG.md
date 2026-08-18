@@ -12,10 +12,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `do_show_or_flush()`), so `NUD.PERMANENT`/`NUD.NOARP` entries are exempt by default —
   `NeighborFlushFilter.state_mask` overrides this on purpose (`ip neigh flush`'s `nud`
   selector does the same). An entry vanishing between the dump and the delete
-  (`error.NotFound`) is counted in `FlushResult.raced`, not raised; any other delete
-  failure aborts and propagates, matching every other write op in this module. See
-  SPEC.md "Neighbour flush" for the two points where this deliberately does not
-  replicate iproute2 (both in the safer direction).
+  (`error.NotFound`) is counted in `FlushResult.raced`, not raised. Security audit,
+  same day: any other delete failure (e.g. `error.AccessDenied` if `CAP_NET_ADMIN` is
+  lost mid-flush) used to abort and propagate, discarding `FlushResult` — a destructive
+  bulk operation that could not say how far it got. Fixed to match `traceroute`'s
+  `Trace.transport_err` precedent instead: `FlushError` now covers only failures with
+  nothing yet deleted (the initial dump), and a mid-loop delete failure stops the loop
+  and is recorded in the new `FlushResult.stopped` field alongside the real
+  `deleted`/`raced` counts already accumulated, returned as a normal result rather than
+  raised. See SPEC.md "Neighbour flush" for the two points where this deliberately does
+  not replicate iproute2 (both in the safer direction), and for the full reasoning
+  behind `stopped`.
 - **2026-08-11** — Security audit: three findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Modeled on `libmnl` /
   `libnl` (framing + `mnl_nlmsg_ok`/`mnl_attr_ok`) (design reference, not a test

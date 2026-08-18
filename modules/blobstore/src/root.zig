@@ -118,6 +118,24 @@ pub const Options = struct {
     /// claiming success. `casDelete`/`delete` refuse with
     /// `error.RefcountDisabled` instead of fabricating a sidecar on demand —
     /// see `Error.RefcountDisabled`.
+    ///
+    /// **Do not flip this to `false` on a store that has ever been opened
+    /// with `refcount = true`.** Such a store may already have `.rc`
+    /// sidecars on disk — including some sitting at zero, already eligible
+    /// for `gc` to reclaim. Reopening with `refcount = false` makes every
+    /// blob permanently "no sidecar ⇒ still-referenced" (see above), so
+    /// `gc`'s CAS sweep is skipped outright and those existing sidecars, zero
+    /// or not, are **never collected again** — not a bug in the sweep, but a
+    /// direct consequence of what `refcount = false` means, applied to a
+    /// store it was not designed for. The direction is fail-safe (indefinite
+    /// retention, never a premature delete), so this cannot corrupt data or
+    /// delete something live, but it silently defeats `gc` on the store from
+    /// then on. `false` is for a store created that way from the start —
+    /// "never deletes, never calls `gc`" is the intended usage this option
+    /// is designed around, not a runtime switch on an established store.
+    /// `Store.hasOrphanedRcSidecars` is an opt-in check for exactly this
+    /// situation — see its doc comment for why it is opt-in rather than
+    /// automatic at `init`/`gc` time.
     refcount: bool = true,
 };
 
@@ -711,6 +729,62 @@ pub const Store = struct {
         const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
         try self.gcWalk(casdir, self.fanout, &keep_set, &stats);
         return stats;
+    }
+
+    /// Opt-in check for the footgun documented on `Options.refcount`: a
+    /// store opened with `refcount = false` that was previously opened with
+    /// `refcount = true` may already carry `.rc` sidecars on disk, and once
+    /// opened this way `gc`'s CAS sweep will never look at them again.
+    /// Returns `true` the moment it finds any `<hex>.rc` file anywhere under
+    /// `cas/` — a short-circuiting existence probe, not a count, so a single
+    /// stray sidecar on an otherwise-huge store is found without walking the
+    /// rest of the tree. `false` also on a store with no `cas/` directory yet
+    /// (nothing ever committed).
+    ///
+    /// **Why this is opt-in rather than automatic at `Store.init`/`gc`
+    /// time.** `init`/`initOptions` currently do no CAS-tree I/O at all —
+    /// every subdirectory is created lazily on first write (see the module
+    /// doc comment) — and making construction pay for a directory walk would
+    /// break that "opening a store is cheap" property for every caller, not
+    /// only the ones toggling `refcount`. Running it inside `gc` instead
+    /// would tax exactly the callers `refcount = false` is documented to
+    /// exempt: "never deletes, never calls `gc`" is the stated precondition
+    /// for the flag, so a store using it as intended mostly never calls `gc`
+    /// at all, and `gc`'s existing `refcount = false` path is a *true*
+    /// no-op specifically so a caller that does call it anyway is not
+    /// surprised by hidden cost. The failure mode this guards against is
+    /// also directionally safe already (indefinite retention, never a
+    /// premature delete — see `Options.refcount`), so there is no
+    /// correctness reason to force the check onto a path every consumer
+    /// pays for; a caller who has reason to suspect a toggle happened (e.g.
+    /// migrating an existing store's `Options`) can call this once,
+    /// explicitly, instead.
+    pub fn hasOrphanedRcSidecars(self: Store) !bool {
+        var dbuf: [768]u8 = undefined;
+        const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
+        return self.anyRcSidecarUnder(casdir, self.fanout);
+    }
+
+    fn anyRcSidecarUnder(self: Store, dir_path: []const u8, depth_remaining: u8) !bool {
+        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => return false,
+            else => return e,
+        };
+        defer dir.close(self.io);
+
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (depth_remaining > 0) {
+                if (entry.kind != .directory) continue;
+                var pbuf: [768]u8 = undefined;
+                const sub = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir_path, entry.name });
+                if (try self.anyRcSidecarUnder(sub, depth_remaining - 1)) return true;
+                continue;
+            }
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".rc")) return true;
+        }
+        return false;
     }
 
     /// Recursively walk `self.fanout` levels of CAS fan-out directories,
@@ -1369,6 +1443,48 @@ test "Options.refcount = false: gc's CAS sweep is a documented no-op; casDelete 
     // casDelete/delete refuse loudly instead of fabricating a sidecar.
     try t.expectError(error.RefcountDisabled, store.delete(d));
     try t.expect(store.has(d)); // untouched by the refused call
+}
+
+test "hasOrphanedRcSidecars: false on a fresh store, false under normal refcount=true use" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+
+    // no cas/ directory at all yet.
+    try t.expect(!(try store.hasOrphanedRcSidecars()));
+
+    // a live, referenced blob is not "orphaned" in the sense this checks —
+    // hasOrphanedRcSidecars only answers "is there a .rc file on disk", which
+    // is expected and fine under normal refcount = true use.
+    _ = try store.putBytes("normal refcounted blob");
+    try t.expect(try store.hasOrphanedRcSidecars());
+}
+
+test "hasOrphanedRcSidecars: catches the Options.refcount toggle footgun documented on the option" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+
+    // Phase 1: a store run with refcount = true (the default), then a blob
+    // deleted down to a zero-refcount .rc sidecar that gc has not yet swept.
+    const d = blk: {
+        const store1 = try Store.initOptions(std.testing.io, base, .{});
+        const d1 = try store1.putBytes("blob whose refcount will hit zero");
+        try t.expect(try store1.delete(d1)); // 1 -> 0, sidecar stays, unswept
+        break :blk d1;
+    };
+
+    // Phase 2: the SAME base path reopened with refcount = false — the
+    // documented footgun. The pre-existing zero sidecar is now permanently
+    // invisible to gc's CAS sweep, but hasOrphanedRcSidecars still finds it.
+    const store2 = try Store.initOptions(std.testing.io, base, .{ .refcount = false });
+    try t.expect(try store2.hasOrphanedRcSidecars());
+
+    const stats = try store2.gc(std.testing.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed); // true no-op, sidecar untouched
+    try t.expect(store2.has(d)); // blob (and its stale sidecar) still on disk
 }
 
 test "lazy layer creation: a store that never touches a layer never creates its directory" {

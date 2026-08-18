@@ -861,14 +861,27 @@ pub const FlushResult = struct {
     /// the neighbour table is live and can change between the dump and the
     /// delete. Counted, not raised, so it never fails the flush.
     raced: usize = 0,
+    /// Set when a delete failed for a reason OTHER than the entry having
+    /// already vanished (`raced` covers that case) — e.g. `error.AccessDenied`
+    /// if CAP_NET_ADMIN is lost partway through, or `error.Busy`. The loop
+    /// stops at that entry, but `deleted`/`raced` above still count real
+    /// deletions that already happened by then — those are not undone by the
+    /// entry that failed. Same shape as `traceroute`'s `Trace.transport_err`:
+    /// "eight good hops then a send failure" is an answer, not nothing, and a
+    /// caller that only checks the return value for success/failure (instead
+    /// of also reading `stopped`) would otherwise have no way to learn how
+    /// far a destructive bulk operation actually got. `null` means every
+    /// eligible entry was reached (deleted or raced) with no delete failure.
+    stopped: ?WriteError = null,
 };
 
-/// Everything `Socket.neighborFlush` can fail with: the dump
-/// (`Socket.neighbors`) can fail with `DumpError`, and a delete can fail with
-/// `WriteError` for a reason OTHER than the entry having already vanished
-/// (that specific case is `error.NotFound`, folded into `FlushResult.raced`
-/// instead of being raised — see `Socket.neighborFlush`).
-pub const FlushError = DumpError || WriteError;
+/// `Socket.neighborFlush` fails outright only before it has deleted
+/// anything: the initial dump (`Socket.neighbors`). Once the delete loop is
+/// running, an entry's delete failure — other than `error.NotFound`, which
+/// is a normal dump/delete race folded into `FlushResult.raced` — is
+/// recorded in `FlushResult.stopped` instead of being raised, so the counts
+/// already accumulated are never discarded. See `FlushResult.stopped`.
+pub const FlushError = DumpError;
 
 // ── write requests: builders (pure, offline-testable) ───────────────────────
 
@@ -1652,9 +1665,11 @@ pub const Socket = struct {
     /// failure: it surfaces as `error.NotFound` from the delete, which this
     /// loop catches and counts in `FlushResult.raced` instead of aborting.
     /// Any other delete failure (e.g. `error.AccessDenied` if CAP_NET_ADMIN
-    /// is lost mid-flush) is a real problem and is raised immediately —
-    /// matching every other write op in this module, none of which fail
-    /// silently.
+    /// is lost mid-flush) stops the loop but is recorded in
+    /// `FlushResult.stopped` rather than raised — see that field, and
+    /// `FlushError`, for why: this is a destructive bulk operation, and a
+    /// caller that lost CAP_NET_ADMIN partway through needs to know how many
+    /// entries were already deleted, not just that something went wrong.
     pub fn neighborFlush(self: *Socket, filter: NeighborFlushFilter) FlushError!FlushResult {
         const entries = try self.neighbors(.{ .family = filter.family, .ifindex = filter.ifindex });
         defer self.gpa.free(entries);
@@ -1676,7 +1691,10 @@ pub const Socket = struct {
                     result.raced += 1;
                     continue;
                 },
-                else => return err,
+                else => {
+                    result.stopped = err;
+                    break;
+                },
             };
             result.deleted += 1;
         }
@@ -3640,6 +3658,7 @@ fn netnsRoundTripOn(nl: *Socket) !void {
             const flushed = try nl.neighborFlush(.{ .ifindex = ifindex, .family = AF.INET });
             if (flushed.deleted == 0) return error.TestFlushDeletedNothing;
             if (flushed.raced != 0) return error.TestFlushUnexpectedRace;
+            if (flushed.stopped != null) return error.TestFlushUnexpectedStop;
 
             const after = try nl.neighbors(.{ .ifindex = ifindex, .family = AF.INET });
             defer gpa.free(after);

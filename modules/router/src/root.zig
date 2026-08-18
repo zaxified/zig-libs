@@ -1350,6 +1350,22 @@ test "normalize_path: default dispatches the rewritten route; reject_non_canonic
     }
 }
 
+test "documented: reject_non_canonical does not decode percent-encoding, so %2e%2e dispatches instead of 400" {
+    // README's caveat, pinned: `.reject_non_canonical` byte-compares the raw
+    // target against `removeDotSegments`'s literal-byte rewrite. Neither side
+    // of that comparison percent-decodes, so a percent-encoded traversal is
+    // already "canonical" and is dispatched — the literal bytes `%2e%2e` land
+    // in the wildcard capture, unlike the literal `..` case above which 400s.
+    var buf: [1024]u8 = undefined;
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.normalize_path = .reject_non_canonical;
+    try r.get("/v1/blob/*rest", hRawCatch);
+    const got = runWire(&r, wire("GET", "/v1/blob/%2e%2e/other"), &buf);
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("raw:%2e%2e/other", bodyOf(got));
+}
+
 test "documented: a root OPTIONS wildcard does NOT catch OPTIONS on a path with other methods registered" {
     // No backtracking on a method miss (finding worked out in README's
     // "Auto OPTIONS" section): matchRec commits to the "/thing" node — it

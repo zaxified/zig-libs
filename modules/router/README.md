@@ -144,6 +144,18 @@ the silent reroute into a 400 instead. `.off` is for a caller that wants to
 interpret the raw bytes itself (e.g. reject `..` as an invalid key, rather
 than as an invalid *path*).
 
+**`.reject_non_canonical` does not decode percent-encoding — same as every
+other posture (see "Matching" above).** It compares the raw target against
+`removeDotSegments`'s *literal-byte* rewrite, so a percent-encoded traversal
+such as `/v1/blob/%2e%2e/other` is already "canonical" by that comparison —
+`%2e%2e` never becomes `..` — and passes straight through to `matchRec`,
+landing in a wildcard capture as the literal bytes `%2e%2e`. This option
+closes the silent-reroute case (`..`), not the percent-encoding case; a
+handler that percent-decodes a captured segment before using it as a key
+(e.g. as a filesystem path or object-store key) must still treat the decoded
+result as untrusted and re-validate it (see `filestore`'s `segmentSafe`
+allowlist for one way to do that).
+
 ## Verification
 
 - Offline: the full matrix (matching, precedence, backtracking, params,

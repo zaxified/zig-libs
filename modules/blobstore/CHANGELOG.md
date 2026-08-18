@@ -27,6 +27,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   treated as still-referenced — see SPEC.md); `casDelete`/`delete` return the new
   `error.RefcountDisabled` rather than fabricating a sidecar on demand. Default
   (`refcount = true`) is unchanged from every prior release — not a breaking change.
+  Security audit, same day: documented (on `Options.refcount`'s doc comment, README and
+  SPEC.md) that flipping this to `false` on a store that has ever run with
+  `refcount = true` is a footgun, not a migration — existing `.rc` sidecars, some
+  possibly already at zero, are then permanently invisible to `gc`'s CAS sweep (fail-safe
+  direction: nothing wrongly deleted, but nothing reclaimed either). Added the new,
+  opt-in `Store.hasOrphanedRcSidecars()` for a caller to check before trusting such a
+  toggle; deliberately not automatic at `init`/`gc` time — see SPEC.md for why.
 
 - **2026-08-14** — Provenance record completed: the git object store (GPL-2.0)
   and restic (BSD-2-Clause) were already named as design references, without

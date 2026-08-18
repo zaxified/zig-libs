@@ -212,7 +212,13 @@ Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
   (`NEIGHBOR_FLUSH_DEFAULT_STATE`, read from iproute2's own source — see
   SPEC.md). This module's `neighborFlush` does the same loop with the same
   default; an entry that vanishes mid-flush (`error.NotFound`) is counted in
-  `FlushResult.raced`, not treated as a failure.
+  `FlushResult.raced`, not treated as a failure. A delete that fails for any
+  other reason (e.g. `error.AccessDenied` if CAP_NET_ADMIN is lost partway
+  through) stops the loop but does not lose the count: it is recorded in
+  `FlushResult.stopped` alongside whatever `deleted`/`raced` already
+  happened, instead of being raised and discarding the result — a lost
+  capability mid-flush still leaves real deletions behind, and the caller
+  needs to know how many.
 - **AF_BRIDGE has three different message shapes**, and getting them wrong is
   the usual source of `EINVAL`. FDB entries are `RTM_*NEIGH` with
   `ndm_family = AF_BRIDGE` (`NDA_LLADDR`/`NDA_VLAN`/`NDA_MASTER`, and

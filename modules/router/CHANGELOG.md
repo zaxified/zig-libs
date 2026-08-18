@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Security audit: README now states, next to `.reject_non_canonical` itself
+  (not only in SPEC.md's threat model), that the option does not decode percent-encoding —
+  `/v1/blob/%2e%2e/other` is already "canonical" by its raw-byte comparison and dispatches with
+  the literal bytes `%2e%2e` in the wildcard capture, instead of the 400 a literal `..` gets. Not
+  a code change: SPEC.md already disclosed "no percent-decoding … ever, regardless of
+  `normalize_path`" — the gap was that README marketed `.reject_non_canonical` as the right
+  posture for a key-in-path API without repeating the limit where that choice is made. Added a
+  test pinning the current dispatch-not-reject behavior so it is a documented decision, not an
+  accident that could silently change.
 - **2026-08-18** — New opt-in `normalize_path: NormalizePath` (default `.remove_dot_segments`,
   unchanged behavior). `http.Server` already runs RFC 3986 §5.2.4 dot-segment removal on the
   request path before `dispatch` ever sees it, silently and unconditionally — invisible, and wrong
